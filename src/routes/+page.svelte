@@ -1,16 +1,21 @@
 <script>
-	import { tick } from 'svelte';
-	import Cell from '$lib/Cell.svelte';
+	import { onMount, tick } from 'svelte';
+	import Navbar from '$lib/Navbar.svelte';
+	import Sidebar from '$lib/Sidebar.svelte';
+	import Notebook from '$lib/Notebook.svelte';
+	import FileTab from '$lib/FileTab.svelte';
+	import Settings from '$lib/Settings.svelte';
 
 	let { data } = $props();
 
+	// ---- Notebook state (owned here so the sidebar can read the same cells) --
 	let cells = $state(data.notebook.cells);
 	const workspace = data.notebook.workspace;
-	const path = data.notebook.path;
+	const notebookPath = data.notebook.path;
+	const notebookName = notebookPath.split('/').pop();
 
 	let kernelState = $state('idle');
 	let runningId = $state(null); // single kernel → one cell runs at a time
-	const kernelReady = $derived(kernelState === 'idle' || kernelState === 'kernel ready');
 
 	// Each Cell registers a focus fn (by id) so Shift+Enter can advance focus.
 	const focusers = {};
@@ -27,7 +32,6 @@
 		const cell = findCell(id);
 		if (!cell) return;
 		// Markdown "runs" by rendering client-side (in the Cell) — no kernel.
-		// Just persist the source.
 		if (cell.cell_type === 'markdown') {
 			await editCell(id, source);
 			return;
@@ -73,6 +77,9 @@
 		} finally {
 			if (replace) cell.outputs = []; // ran with no output → clear
 			runningId = null;
+			// A run may have created/changed kernel variables → refresh sidebar.
+			refreshKernel();
+			refreshVariables();
 		}
 	}
 
@@ -151,39 +158,146 @@
 			const created = await addCell(id);
 			nextId = created.id;
 		}
-		await tick(); // let the (possibly new) cell mount + register its focuser
+		await tick();
 		focusers[nextId]?.();
 	}
+
+	// ---- Shell state ---------------------------------------------------------
+	let sidebarOpen = $state(true);
+	let settingsOpen = $state(false);
+	let theme = $state('dim');
+
+	let tabs = $state([{ id: 'notebook', kind: 'notebook', title: notebookName, closable: false, dirty: false }]);
+	let activeTabId = $state('notebook');
+	const fileTabs = $derived(tabs.filter((t) => t.kind === 'file'));
+
+	function selectTab(id) {
+		activeTabId = id;
+	}
+
+	function openFile(path) {
+		const id = 'file:' + path;
+		if (!tabs.find((t) => t.id === id)) {
+			tabs = [...tabs, { id, kind: 'file', title: path.split('/').pop(), path, closable: true, dirty: false }];
+		}
+		activeTabId = id;
+	}
+
+	function closeTab(id) {
+		const idx = tabs.findIndex((t) => t.id === id);
+		tabs = tabs.filter((t) => t.id !== id);
+		if (activeTabId === id) {
+			activeTabId = (tabs[idx - 1] ?? tabs[0] ?? { id: 'notebook' }).id;
+		}
+	}
+
+	function onFileDirty(path, dirty) {
+		const id = 'file:' + path;
+		tabs = tabs.map((t) => (t.id === id ? { ...t, dirty } : t));
+	}
+
+	async function scrollToCell(id) {
+		activeTabId = 'notebook';
+		await tick();
+		const el = document.querySelector(`[data-cell-id="${id}"]`);
+		if (!el) return;
+		el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+		el.classList.add('cellar-flash');
+		setTimeout(() => el.classList.remove('cellar-flash'), 1200);
+	}
+
+	// ---- Kernel + variables (sidebar) ---------------------------------------
+	let kernelInfo = $state({ started: false, id: null, name: 'python3', status: 'not started' });
+	let variables = $state([]);
+	let varsLoading = $state(false);
+	let varsError = $state('');
+
+	const displayKernel = $derived(runningId ? { ...kernelInfo, started: true, status: 'busy' } : kernelInfo);
+
+	async function refreshKernel() {
+		try {
+			const res = await fetch('/api/kernel');
+			if (res.ok) kernelInfo = await res.json();
+		} catch {}
+	}
+
+	async function refreshVariables() {
+		varsLoading = true;
+		varsError = '';
+		try {
+			const res = await fetch('/api/kernel/variables');
+			const body = await res.json();
+			if (!res.ok) throw new Error(body?.message || 'inspect failed');
+			variables = body.variables;
+		} catch (err) {
+			varsError = String(err?.message ?? err);
+		} finally {
+			varsLoading = false;
+		}
+	}
+
+	// ---- Theme ---------------------------------------------------------------
+	function applyTheme(t) {
+		theme = t;
+		if (typeof document !== 'undefined') document.documentElement.dataset.theme = t;
+		try {
+			localStorage.setItem('cellar-theme', t);
+		} catch {}
+	}
+
+	onMount(() => {
+		const saved = (() => {
+			try {
+				return localStorage.getItem('cellar-theme');
+			} catch {
+				return null;
+			}
+		})();
+		applyTheme(saved || document.documentElement.dataset.theme || 'dim');
+		// Restore live kernel + variables after a reload — but only inspect if a
+		// kernel already exists, so a fresh page load never boots one on its own.
+		refreshKernel().then(() => {
+			if (kernelInfo.started) refreshVariables();
+		});
+	});
 </script>
 
-<div class="min-h-screen bg-base-200 text-base-content">
-	<div class="mx-auto max-w-3xl px-4 py-8">
-		<!-- Header -->
-		<header class="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-base-300 pb-4">
-			<h1 class="flex items-center gap-2 text-xl font-semibold">
-				<span>🍷 Cellar</span>
-				<span class="badge badge-warning badge-sm">MVP</span>
-			</h1>
-			<div class="flex flex-wrap items-center gap-4 text-xs text-base-content/60">
-				<span class="flex items-center gap-1.5">
-					kernel
-					<span class="badge badge-sm gap-1.5 badge-soft {kernelReady ? 'badge-success' : 'badge-error'}">
-						<span class="inline-block h-1.5 w-1.5 rounded-full {kernelReady ? 'bg-success' : 'bg-error'}"></span>
-						{kernelState}
-					</span>
-				</span>
-				<span class="truncate">notebook <code class="rounded bg-base-300 px-1.5 py-0.5 font-mono">{path}</code></span>
-			</div>
-		</header>
+<div class="flex h-screen flex-col overflow-hidden bg-base-200 text-base-content">
+	<Navbar
+		{tabs}
+		{activeTabId}
+		{sidebarOpen}
+		kernelInfo={displayKernel}
+		onSelectTab={selectTab}
+		onCloseTab={closeTab}
+		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
+		onOpenSettings={() => (settingsOpen = true)}
+	/>
 
-		<!-- Notebook -->
-		<div class="space-y-4">
-			{#each cells as cell, i (cell.id)}
-				<Cell
-					{cell}
-					index={i}
-					count={cells.length}
-					running={runningId === cell.id}
+	<div class="flex min-h-0 flex-1">
+		{#if sidebarOpen}
+			<div class="w-64 shrink-0 border-r border-base-300">
+				<Sidebar
+					{cells}
+					kernelInfo={displayKernel}
+					{notebookName}
+					{variables}
+					{varsLoading}
+					{varsError}
+					onRefreshVars={refreshVariables}
+					onRefreshKernel={refreshKernel}
+					onOpenFile={openFile}
+					onScrollToCell={scrollToCell}
+				/>
+			</div>
+		{/if}
+
+		<main class="min-w-0 flex-1 overflow-hidden">
+			<!-- Notebook stays mounted (editor + run state preserved) — just hidden. -->
+			<div class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}">
+				<Notebook
+					{cells}
+					{runningId}
 					onRun={runCell}
 					onRunAdvance={runAndAdvance}
 					onClear={clearCell}
@@ -192,21 +306,36 @@
 					onEdit={editCell}
 					onSetType={setType}
 					onReady={registerFocus}
+					onAddCell={addCell}
 				/>
+			</div>
+
+			{#each fileTabs as tab (tab.id)}
+				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
+					<FileTab path={tab.path} onDirty={onFileDirty} />
+				</div>
 			{/each}
-		</div>
-
-		<div class="mt-4 flex justify-center gap-2">
-			<button class="btn btn-ghost btn-sm gap-1" onclick={() => addCell(cells.at(-1)?.id, 'code')} data-testid="add-cell">
-				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-				Code
-			</button>
-			<button class="btn btn-ghost btn-sm gap-1" onclick={() => addCell(cells.at(-1)?.id, 'markdown')} data-testid="add-markdown">
-				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-				Markdown
-			</button>
-		</div>
-
-		<p class="mt-6 text-center text-xs text-base-content/30">workspace: {workspace}</p>
+		</main>
 	</div>
+
+	<footer class="flex items-center justify-between border-t border-base-300 bg-base-100 px-3 py-1 text-[11px] text-base-content/40">
+		<span class="truncate">workspace: <span class="font-mono">{workspace}</span></span>
+		<span class="font-mono">{cells.length} cells</span>
+	</footer>
 </div>
+
+<Settings open={settingsOpen} {theme} onClose={() => (settingsOpen = false)} onSetTheme={applyTheme} />
+
+<style>
+	:global(.cellar-flash) {
+		animation: cellar-flash 1.2s ease-out;
+	}
+	@keyframes cellar-flash {
+		0% {
+			box-shadow: 0 0 0 2px var(--color-primary, #7dd3fc);
+		}
+		100% {
+			box-shadow: 0 0 0 2px transparent;
+		}
+	}
+</style>

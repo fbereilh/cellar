@@ -15,6 +15,7 @@
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
 
 let kernelPromise = null;
+let liveKernel = null; // last-resolved kernel, for read-only status introspection
 
 function makeSettings() {
 	const baseUrl = process.env.CELLAR_JUPYTER_URL || 'http://127.0.0.1:8888';
@@ -38,7 +39,9 @@ async function getKernel() {
 		const serverSettings = makeSettings();
 		const manager = new KernelManager({ serverSettings });
 		await manager.ready;
-		return manager.startNew({ name: 'python3' });
+		const kernel = await manager.startNew({ name: 'python3' });
+		liveKernel = kernel;
+		return kernel;
 	})();
 	// If startup fails, allow a later retry.
 	kernelPromise.catch(() => {
@@ -104,4 +107,20 @@ export async function execute(code, onEvent) {
 	const reply = await future.done;
 	onEvent({ type: 'done', status: reply.content.status, execution_count: reply.content.execution_count });
 	return reply.content;
+}
+
+/**
+ * Read-only snapshot of the current kernel for the sidebar's Kernels section.
+ * Does NOT start a kernel — reports `started: false` until the first execute().
+ */
+export function getKernelInfo() {
+	if (!liveKernel) {
+		return { started: false, id: null, name: 'python3', status: 'not started' };
+	}
+	return {
+		started: true,
+		id: liveKernel.id,
+		name: liveKernel.name || 'python3',
+		status: liveKernel.status // 'idle' | 'busy' | 'starting' | 'dead' | …
+	};
 }
