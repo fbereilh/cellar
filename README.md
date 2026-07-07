@@ -1,40 +1,45 @@
-# Cellar — bridge spike (Phase 0)
+# Cellar — MVP Step 1 (notebook document + save pipeline)
 
-A **throwaway proof-of-concept** proving the riskiest wiring for Cellar works
-end-to-end:
+Built on the Phase 0 bridge spike (SvelteKit ↔ Jupyter kernel ↔ browser, which
+works as-is — `@jupyterlab/services` in Node over Jupyter's REST+WebSocket, no
+fallback needed). Step 1 turns the single cell into a real **notebook document**
+with a **git-friendly clean-on-save pipeline**.
 
-> **SvelteKit (Node backend + Svelte UI) ↔ a headless Jupyter kernel ↔ the browser**
+You run one command in a folder; a browser opens the notebook (a real
+`notebook.ipynb` in that folder). Add/run/reorder/delete code cells; outputs
+stream live and persist. The file is a real Jupyter notebook that opens in
+vanilla Jupyter, and re-running with identical results produces **no git diff**.
 
-You run one command in a folder, a browser opens with a single code cell, you
-type Python, hit **Run**, and outputs (stdout/stderr, results, tracebacks)
-**stream live** back into the page.
-
-This is **not** the product. No save pipeline, stable cell IDs, MCP/agent
-interface, multi-cell management, Databricks, or `.py` view — those come later
-(see `data/cellar-spec.md`). This just de-risks the bridge.
+Deferred to later steps: MCP/agent interface, extract-to-`.py`, `.py` view,
+Databricks, the git merge driver, polished editing UX (see `data/cellar-spec.md`).
 
 ## Architecture (as built)
 
 ```
-Browser (Svelte UI)                     one code cell, Run button, live output
+Browser (Svelte UI)                     src/lib/Cell.svelte + src/routes/+page.svelte
+  - one CodeMirror editor per cell; add / run / reorder / delete
   │  ▲
-  │  │  POST /api/execute   (send code)
-  │  │  GET  /api/stream    (SSE: outputs stream back live)
+  │  │  /api/cells… (add, PATCH source, delete, move, clear)
+  │  │  POST /api/cells/:id/run   (NDJSON: outputs stream back live)
   ▼  │
-SvelteKit app (Node)                    src/lib/server/kernel.js
-  - single kernel connection via @jupyterlab/services (official JS client)
-  - fans IOPub messages out to SSE subscribers
-  │  ▲
-  │  │  Jupyter REST + WebSocket protocol (token auth)
-  ▼  │
-Jupyter kernel service (Python sidecar) headless `jupyter_server`, one kernel
+SvelteKit app (Node) — owns the CANONICAL notebook document
+  - src/lib/server/notebook.js  in-memory doc, stable cell IDs, load/save
+  - src/lib/server/clean.js     clean-on-save field policy (nbdev port)
+  - src/lib/server/ipynb.js     deterministic nbformat 4.5 (de)serialization
+  - src/lib/server/kernel.js    kernel client via @jupyterlab/services
+  │  ▲                                    │
+  │  │ Jupyter REST + WebSocket           ▼  writes notebook.ipynb (workspace)
+  ▼  │                                  real .ipynb (opens in vanilla Jupyter)
+Jupyter kernel service (Python sidecar) headless jupyter_server, one kernel
   │  ▲
   ▼  │  ZMQ
 ipykernel (Python 3)
 ```
 
-The committed architecture from spec §2/§4 — `@jupyterlab/services` in Node over
-Jupyter's REST+WebSocket — works as-is. No fallback was needed.
+**Clean-on-save** (spec §3, nbdev port): every save nulls all `execution_count`,
+keeps outputs, strips all metadata except an allowlist (cell: the `cellar`
+namespace; notebook: `kernelspec` — drops `language_info`/`widgets`), normalizes
+`kernelspec.display_name`, and scrubs `<… at 0x…>` memory addresses. Idempotent.
 
 ## Requirements
 
@@ -80,10 +85,18 @@ the Vite dev server.
 
 ## What was verified
 
-Driven end-to-end in a real browser:
+Driven end-to-end in a real browser (and the saved `.ipynb` inspected):
 
-- `print('hello'); 6*7` → stdout `hello` and result `42` appear live.
-- `1/0` → a `ZeroDivisionError` traceback renders.
-- State persists across runs: `a = 6*7` then, in a second run, `a*2` → `84`.
+- Multiple code cells run; outputs (stdout/stderr, results, tracebacks) stream
+  live and persist to `notebook.ipynb`.
+- Restarting `cellar` in the same folder restores all cells **and** outputs.
+- Cross-cell state persists (`a = 6*7` in one cell, `a*2` → `84` in another).
+- Saved `.ipynb`: valid nbformat 4.5, no `execution_count`, outputs present,
+  stable unique cell IDs, the `cellar` cell-metadata placeholder preserved, no
+  `language_info`.
+- Idempotent clean-on-save: re-running all cells with identical results yields
+  an empty `git diff` (a fresh `<… at 0x…>` address each run scrubs to the same
+  value).
+- Duplicate/missing cell IDs in a loaded file are re-keyed to unique slugs.
 
 See the commit message / status report for captured evidence.

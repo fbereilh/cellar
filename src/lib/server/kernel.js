@@ -60,6 +60,9 @@ export async function execute(code, onEvent) {
 
 	const future = kernel.requestExecute({ code, stop_on_error: false });
 
+	// Output events carry a real nbformat output object under `output`, so the
+	// caller can both stream them live to the browser AND accumulate them into
+	// the cell's `outputs` for persistence — one shape, no divergence.
 	future.onIOPub = (msg) => {
 		const t = msg.header.msg_type;
 		const c = msg.content;
@@ -68,20 +71,30 @@ export async function execute(code, onEvent) {
 				onEvent({ type: 'status', execution_state: c.execution_state });
 				break;
 			case 'stream':
-				onEvent({ type: 'stream', name: c.name, text: c.text });
+				onEvent({ type: 'output', output: { output_type: 'stream', name: c.name, text: c.text } });
 				break;
 			case 'execute_result':
 				onEvent({
-					type: 'execute_result',
-					text: c.data?.['text/plain'] ?? '',
-					execution_count: c.execution_count
+					type: 'output',
+					output: {
+						output_type: 'execute_result',
+						data: c.data,
+						metadata: c.metadata ?? {},
+						execution_count: c.execution_count
+					}
 				});
 				break;
 			case 'display_data':
-				onEvent({ type: 'display_data', text: c.data?.['text/plain'] ?? '[display_data]' });
+				onEvent({
+					type: 'output',
+					output: { output_type: 'display_data', data: c.data, metadata: c.metadata ?? {} }
+				});
 				break;
 			case 'error':
-				onEvent({ type: 'error', ename: c.ename, evalue: c.evalue, traceback: c.traceback });
+				onEvent({
+					type: 'output',
+					output: { output_type: 'error', ename: c.ename, evalue: c.evalue, traceback: c.traceback }
+				});
 				break;
 			default:
 				break;

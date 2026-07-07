@@ -1,125 +1,32 @@
 <script>
-	import { onMount } from 'svelte';
-	import { EditorView, keymap } from '@codemirror/view';
-	import { EditorState, Prec } from '@codemirror/state';
-	import { basicSetup } from 'codemirror';
-	import { python } from '@codemirror/lang-python';
-	import { oneDark } from '@codemirror/theme-one-dark';
+	import Cell from '$lib/Cell.svelte';
 
-	// Stable per-cell id (nbformat-4.5-style) — the addressing spine in the full
-	// product. Owned by the server (see +page.server.js) so it stays fixed
-	// across page refreshes.
 	let { data } = $props();
-	const cellId = data.cellId;
 
-	let code = $state("print('hello')\n6 * 7");
-	let outputs = $state([]); // {kind, text, tone}
-	let running = $state(false);
+	let cells = $state(data.notebook.cells);
+	const workspace = data.notebook.workspace;
+	const path = data.notebook.path;
+
 	let kernelState = $state('idle');
-	let workspace = $state('');
-
-	// CodeMirror editor (Python syntax highlighting) — the editor the real
-	// product will use too (JupyterLab is built on CodeMirror).
-	let editorEl;
-	let view;
-
-	// Strip ANSI SGR color codes (ESC[…m) that Jupyter puts in tracebacks.
-	const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
-	const stripAnsi = (s) => s.replace(ANSI, '');
-
-	// When true, the next write replaces the previous run's output. Deferring the
-	// clear until output actually arrives avoids a flash of the empty state.
-	let freshRun = false;
-
-	function push(kind, text, tone) {
-		if (freshRun) {
-			outputs = [];
-			freshRun = false;
-		}
-		outputs = [...outputs, { kind, text, tone }];
-	}
-
-	$effect(() => {
-		workspace = new URLSearchParams(location.search).get('ws') || '';
-	});
-
-	onMount(() => {
-		view = new EditorView({
-			parent: editorEl,
-			state: EditorState.create({
-				doc: code,
-				extensions: [
-					basicSetup,
-					python(),
-					oneDark,
-					// ⌘/Ctrl+Enter runs the cell; take precedence over defaults.
-					Prec.highest(
-						keymap.of([{ key: 'Mod-Enter', run: () => (run(), true) }])
-					),
-					EditorView.updateListener.of((v) => {
-						if (v.docChanged) code = v.state.doc.toString();
-					}),
-					// Blend the editor into the DaisyUI card while keeping oneDark colors.
-					EditorView.theme({
-						'&': { backgroundColor: 'transparent', fontSize: '13.5px' },
-						'.cm-content': {
-							fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
-							padding: '10px 0'
-						},
-						'.cm-gutters': { backgroundColor: 'transparent', border: 'none' },
-						'&.cm-focused': { outline: 'none' }
-					})
-				]
-			})
-		});
-		if (import.meta.env.DEV) window.cellarView = view; // spike test aid
-		return () => view?.destroy();
-	});
-
+	let runningId = $state(null); // single kernel → one cell runs at a time
 	const kernelReady = $derived(kernelState === 'idle' || kernelState === 'kernel ready');
 
-	function handle(ev) {
-		switch (ev.type) {
-			case 'kernel':
-				kernelState = 'kernel ready';
-				break;
-			case 'status':
-				kernelState = ev.execution_state;
-				break;
-			case 'stream':
-				push('stream', ev.text, ev.name === 'stderr' ? 'stderr' : 'stdout');
-				break;
-			case 'execute_result':
-				push('result', ev.text, 'result');
-				break;
-			case 'display_data':
-				push('display', ev.text, 'result');
-				break;
-			case 'error':
-				push('error', stripAnsi((ev.traceback || [ev.ename + ': ' + ev.evalue]).join('\n')), 'error');
-				break;
-			case 'done':
-				// A run that produced no output (e.g. a bare assignment) clears
-				// the previous output only now, at the end.
-				if (freshRun) {
-					outputs = [];
-					freshRun = false;
-				}
-				break;
-		}
+	function findCell(id) {
+		return cells.find((c) => c.id === id);
 	}
 
-	async function run() {
-		if (running) return;
-		running = true;
-		freshRun = true; // replace the previous run's output when new output arrives
+	async function runCell(id, source) {
+		if (runningId) return;
+		runningId = id;
+		const cell = findCell(id);
+		cell.source = source;
+		let replace = true; // replace prior output only when new output arrives (no flash)
 		try {
-			const res = await fetch('/api/execute', {
+			const res = await fetch(`/api/cells/${id}/run`, {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ code })
+				body: JSON.stringify({ source })
 			});
-			// Read the NDJSON stream incrementally so outputs appear live.
 			const reader = res.body.getReader();
 			const decoder = new TextDecoder();
 			let buf = '';
@@ -131,26 +38,79 @@
 				while ((nl = buf.indexOf('\n')) !== -1) {
 					const line = buf.slice(0, nl).trim();
 					buf = buf.slice(nl + 1);
-					if (line) handle(JSON.parse(line));
+					if (!line) continue;
+					const ev = JSON.parse(line);
+					if (ev.type === 'kernel') kernelState = 'kernel ready';
+					else if (ev.type === 'status') kernelState = ev.execution_state;
+					else if (ev.type === 'output') {
+						if (replace) {
+							cell.outputs = [ev.output];
+							replace = false;
+						} else {
+							cell.outputs = [...cell.outputs, ev.output];
+						}
+					}
 				}
 			}
 		} catch (err) {
-			push('error', 'Request failed: ' + err, 'error');
+			cell.outputs = [{ output_type: 'error', ename: 'CellarError', evalue: String(err), traceback: [String(err)] }];
+			replace = false;
 		} finally {
-			running = false;
+			if (replace) cell.outputs = []; // ran with no output → clear
+			runningId = null;
 		}
 	}
 
-	function clearOutput() {
-		outputs = [];
+	async function editCell(id, source) {
+		const cell = findCell(id);
+		if (cell) cell.source = source;
+		await fetch(`/api/cells/${id}`, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ source })
+		});
 	}
 
-	const toneClass = {
-		stdout: 'text-base-content border-transparent',
-		stderr: 'text-warning border-warning/40',
-		result: 'text-success font-semibold border-success/40',
-		error: 'text-error border-error bg-error/10'
-	};
+	async function clearCell(id) {
+		const cell = findCell(id);
+		if (cell) cell.outputs = [];
+		await fetch(`/api/cells/${id}/clear`, { method: 'POST' });
+	}
+
+	async function deleteCell(id) {
+		cells = cells.filter((c) => c.id !== id);
+		await fetch(`/api/cells/${id}`, { method: 'DELETE' });
+	}
+
+	async function moveCell(id, dir) {
+		const i = cells.findIndex((c) => c.id === id);
+		const j = dir === 'up' ? i - 1 : i + 1;
+		if (j < 0 || j >= cells.length) return;
+		const next = [...cells];
+		[next[i], next[j]] = [next[j], next[i]];
+		cells = next;
+		await fetch(`/api/cells/${id}/move`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ dir })
+		});
+	}
+
+	async function addCell(afterId) {
+		const res = await fetch('/api/cells', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ afterId })
+		});
+		const { cell } = await res.json();
+		const view = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs };
+		if (afterId) {
+			const i = cells.findIndex((c) => c.id === afterId);
+			cells = [...cells.slice(0, i + 1), view, ...cells.slice(i + 1)];
+		} else {
+			cells = [...cells, view];
+		}
+	}
 </script>
 
 <div class="min-h-screen bg-base-200 text-base-content">
@@ -159,7 +119,7 @@
 		<header class="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-base-300 pb-4">
 			<h1 class="flex items-center gap-2 text-xl font-semibold">
 				<span>🍷 Cellar</span>
-				<span class="badge badge-warning badge-sm">spike</span>
+				<span class="badge badge-warning badge-sm">MVP</span>
 			</h1>
 			<div class="flex flex-wrap items-center gap-4 text-xs text-base-content/60">
 				<span class="flex items-center gap-1.5">
@@ -169,78 +129,34 @@
 						{kernelState}
 					</span>
 				</span>
-				{#if workspace}
-					<span>workspace <code class="rounded bg-base-300 px-1.5 py-0.5 font-mono">{workspace}</code></span>
-				{/if}
+				<span class="truncate">notebook <code class="rounded bg-base-300 px-1.5 py-0.5 font-mono">{path}</code></span>
 			</div>
 		</header>
 
-		<!-- Code cell -->
-		<div class="card border border-base-300 bg-base-100 shadow-sm">
-			<div class="card-body gap-0 p-0">
-				<div class="flex items-center justify-between border-b border-base-300 px-2 py-1">
-					<div class="flex items-center gap-0.5">
-						<button
-							class="btn btn-ghost btn-xs btn-square text-success"
-							onclick={run}
-							disabled={running}
-							title="Run cell (⌘/Ctrl+Enter)"
-							aria-label="Run cell"
-							data-testid="run"
-						>
-							{#if running}
-								<span class="loading loading-spinner loading-xs"></span>
-							{:else}
-								<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-									<path d="M8 5v14l11-7z" />
-								</svg>
-							{/if}
-						</button>
-						<button
-							class="btn btn-ghost btn-xs btn-square text-base-content/60"
-							onclick={clearOutput}
-							title="Clear output"
-							aria-label="Clear output"
-							data-testid="clear"
-						>
-							<svg
-								class="h-3.5 w-3.5"
-								viewBox="0 0 24 24"
-								fill="none"
-								stroke="currentColor"
-								stroke-width="2"
-								stroke-linecap="round"
-								stroke-linejoin="round"
-								aria-hidden="true"
-							>
-								<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" />
-								<path d="M22 21H7" />
-								<path d="m5 11 9 9" />
-							</svg>
-						</button>
-						<span class="ml-1.5 font-mono text-xs text-base-content/50">cell <span class="text-base-content/70">#{cellId}</span></span>
-					</div>
-					<span class="font-mono text-[11px] text-base-content/30">python3</span>
-				</div>
-				<div
-					bind:this={editorEl}
-					aria-label="code cell"
-					class="max-h-96 overflow-auto px-3"
-				></div>
-			</div>
+		<!-- Notebook -->
+		<div class="space-y-4">
+			{#each cells as cell, i (cell.id)}
+				<Cell
+					{cell}
+					index={i}
+					count={cells.length}
+					running={runningId === cell.id}
+					onRun={runCell}
+					onClear={clearCell}
+					onDelete={deleteCell}
+					onMove={moveCell}
+					onEdit={editCell}
+				/>
+			{/each}
 		</div>
 
-		<!-- Output -->
-		<section class="mt-6" data-testid="output">
-			{#if outputs.length === 0}
-				<p class="text-sm text-base-content/40">No output yet. Type some Python and hit Run.</p>
-			{:else}
-				<div class="space-y-0.5">
-					{#each outputs as o}
-						<pre class="overflow-x-auto whitespace-pre-wrap break-words rounded border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{o.text}</pre>
-					{/each}
-				</div>
-			{/if}
-		</section>
+		<div class="mt-4 flex justify-center">
+			<button class="btn btn-ghost btn-sm gap-1" onclick={() => addCell(cells.at(-1)?.id)} data-testid="add-cell">
+				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+				Add cell
+			</button>
+		</div>
+
+		<p class="mt-6 text-center text-xs text-base-content/30">workspace: {workspace}</p>
 	</div>
 </div>

@@ -4,18 +4,18 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - Add durable project-specific notes here as they are discovered through real work.
 
-## Current state: Phase 0 bridge spike
+## Current state: MVP Step 1 — notebook document + save pipeline
 
-This repo currently holds only the **throwaway bridge spike** (spec Phase 0), not the product. Full product/tech spec lives outside the repo at `firstmate/data/cellar-spec.md`. See `README.md` for run/verify details.
+Built on the Phase 0 bridge spike. Full product/tech spec lives outside the repo at `firstmate/data/cellar-spec.md` (read §3 for the versioning model); nbdev field-policy detail at `firstmate/data/nbdev-study-n8/report.md`. See `README.md` for run/verify details.
 
 - **Two runtimes.** Node (SvelteKit) + a Python sidecar (Jupyter kernel service) in `.venv/`. Both are booted by the CLI launcher `bin/cellar.js` (one command → both servers up → browser opens, workspace = cwd). `.venv/` is gitignored; recreate it via the setup steps in `README.md`.
-- **Kernel bridge = the de-risked core.** `src/lib/server/kernel.js` connects to Jupyter over REST+WebSocket using `@jupyterlab/services` (the committed path from spec §2). Node 18+ global `fetch`/`WebSocket` are passed into `ServerConnection.makeSettings` — no `ws`/`node-fetch` polyfill needed.
-- **Output streaming design.** `POST /api/execute` streams that run's IOPub events back as NDJSON in its own response body (one request = one execution = one stream). Deliberately no global SSE broadcast/subscriber set — an earlier broadcast design duplicated outputs across dev reconnects.
+- **Kernel bridge = the de-risked core.** `src/lib/server/kernel.js` connects to Jupyter over REST+WebSocket using `@jupyterlab/services` (spec §2). Node 18+ global `fetch`/`WebSocket` are passed into `ServerConnection.makeSettings` — no polyfill. `execute()` emits real nbformat output objects so the same shape streams live to the browser and is persisted.
 - **Kernelspec.** `python3` kernelspec must be registered into the venv (`ipykernel install --sys-prefix --name python3`), or `startNew({name:'python3'})` fails.
-- **UI stack.** Tailwind v4 (`@tailwindcss/vite` plugin, config-free; theme in `src/app.css`) + DaisyUI v5 (`dim` theme). Code editor is **CodeMirror 6** (`@codemirror/lang-python` + `oneDark`) instantiated client-only in `onMount` — SSR-safe because the `EditorView` is never constructed on the server. In dev the view is exposed as `window.cellarView` for automation.
-- **Cell id.** The single cell's stable id is **server-owned** (`src/lib/server/notebook.js`, surfaced via `+page.server.js` `load`) so it survives browser refreshes — modeling spec §3 "Cellar owns id generation." Session-stable only (no file persistence yet).
-- **Output UX.** Each run replaces the previous run's output; the clear is deferred until the new output arrives (or the run finishes with none) to avoid an empty-state flash. Run button keeps a fixed width across idle/running to avoid layout-shift flicker.
-- **Not yet built (deferred by design):** save pipeline / `.ipynb` (so cell id is not yet persisted to disk), MCP/agent interface, multi-cell UI, Databricks, `.py` view.
+- **Canonical document (server-owned).** `src/lib/server/notebook.js` holds the in-memory notebook (one per workspace folder, `notebook.ipynb`), loaded on startup and persisted on every mutation. Cellar owns cell IDs — readable `cell-N` slugs from a monotonic counter, never reused/regenerated, uniqueness enforced on load (`enforceUniqueIds` re-keys missing/duplicate; it does NOT rely on nbformat's auto-rename, spec §3).
+- **Persistence + clean-on-save.** `src/lib/server/ipynb.js` (de)serializes canonical doc ↔ real nbformat 4.5 with **deterministic** output (fixed key order, 1-space indent) so identical re-runs produce zero git diff. `src/lib/server/clean.js` is the nbdev field-policy port: nulls all `execution_count`, deny-by-default metadata allowlist (cell keeps only the `cellar` namespace; notebook keeps only `kernelspec` — drops `language_info`/`widgets`), normalizes `kernelspec.display_name`→`name`, scrubs `<… at 0x…>` memory addresses. Must stay **idempotent**.
+- **API.** `+page.server.js` load returns the notebook; cell ops under `src/routes/api/cells/…` (`POST` add, `PATCH` source, `DELETE`, `POST …/run` streams NDJSON + persists, `…/move`, `…/clear`).
+- **UI.** `src/lib/Cell.svelte` = one cell (own CodeMirror editor, per-cell toolbar, renders nbformat outputs). `+page.svelte` = notebook view (add/delete/reorder, single-kernel one-run-at-a-time). Editor source autosaves via debounced `PATCH`. Dev exposes `window.cellarViews[id]` for automation.
+- **Not yet built (deferred by design):** MCP/agent interface, extract-to-`.py`, `.py` view, Databricks, git merge driver, per-output size threshold, polished multi-cell editing UX.
 
 ## Maintaining this file
 

@@ -1,6 +1,6 @@
-import { getCellId } from '$lib/server/notebook.js';
+import { getNotebook } from '$lib/server/notebook.js';
 
-/** Hand the browser the notebook's stable cell id (fixed across refreshes). */
+/** Load the canonical notebook (cells + outputs) for the workspace. */
 export function load() {
-	return { cellId: getCellId() };
+	return { notebook: getNotebook() };
 }
