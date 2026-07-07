@@ -12,7 +12,10 @@ This repo currently holds only the **throwaway bridge spike** (spec Phase 0), no
 - **Kernel bridge = the de-risked core.** `src/lib/server/kernel.js` connects to Jupyter over REST+WebSocket using `@jupyterlab/services` (the committed path from spec §2). Node 18+ global `fetch`/`WebSocket` are passed into `ServerConnection.makeSettings` — no `ws`/`node-fetch` polyfill needed.
 - **Output streaming design.** `POST /api/execute` streams that run's IOPub events back as NDJSON in its own response body (one request = one execution = one stream). Deliberately no global SSE broadcast/subscriber set — an earlier broadcast design duplicated outputs across dev reconnects.
 - **Kernelspec.** `python3` kernelspec must be registered into the venv (`ipykernel install --sys-prefix --name python3`), or `startNew({name:'python3'})` fails.
-- **Not yet built (deferred by design):** save pipeline / `.ipynb`, stable cell IDs, MCP/agent interface, multi-cell UI, Databricks, `.py` view.
+- **UI stack.** Tailwind v4 (`@tailwindcss/vite` plugin, config-free; theme in `src/app.css`) + DaisyUI v5 (`dim` theme). Code editor is **CodeMirror 6** (`@codemirror/lang-python` + `oneDark`) instantiated client-only in `onMount` — SSR-safe because the `EditorView` is never constructed on the server. In dev the view is exposed as `window.cellarView` for automation.
+- **Cell id.** The single cell's stable id is **server-owned** (`src/lib/server/notebook.js`, surfaced via `+page.server.js` `load`) so it survives browser refreshes — modeling spec §3 "Cellar owns id generation." Session-stable only (no file persistence yet).
+- **Output UX.** Each run replaces the previous run's output; the clear is deferred until the new output arrives (or the run finishes with none) to avoid an empty-state flash. Run button keeps a fixed width across idle/running to avoid layout-shift flicker.
+- **Not yet built (deferred by design):** save pipeline / `.ipynb` (so cell id is not yet persisted to disk), MCP/agent interface, multi-cell UI, Databricks, `.py` view.
 
 ## Maintaining this file
 

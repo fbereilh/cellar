@@ -1,20 +1,79 @@
 <script>
+	import { onMount } from 'svelte';
+	import { EditorView, keymap } from '@codemirror/view';
+	import { EditorState, Prec } from '@codemirror/state';
+	import { basicSetup } from 'codemirror';
+	import { python } from '@codemirror/lang-python';
+	import { oneDark } from '@codemirror/theme-one-dark';
+
+	// Stable per-cell id (nbformat-4.5-style) — the addressing spine in the full
+	// product. Owned by the server (see +page.server.js) so it stays fixed
+	// across page refreshes.
+	let { data } = $props();
+	const cellId = data.cellId;
+
 	let code = $state("print('hello')\n6 * 7");
 	let outputs = $state([]); // {kind, text, tone}
 	let running = $state(false);
 	let kernelState = $state('idle');
 	let workspace = $state('');
 
+	// CodeMirror editor (Python syntax highlighting) — the editor the real
+	// product will use too (JupyterLab is built on CodeMirror).
+	let editorEl;
+	let view;
+
 	// Strip ANSI SGR color codes (ESC[…m) that Jupyter puts in tracebacks.
 	const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
 	const stripAnsi = (s) => s.replace(ANSI, '');
 
+	// When true, the next write replaces the previous run's output. Deferring the
+	// clear until output actually arrives avoids a flash of the empty state.
+	let freshRun = false;
+
 	function push(kind, text, tone) {
+		if (freshRun) {
+			outputs = [];
+			freshRun = false;
+		}
 		outputs = [...outputs, { kind, text, tone }];
 	}
 
 	$effect(() => {
 		workspace = new URLSearchParams(location.search).get('ws') || '';
+	});
+
+	onMount(() => {
+		view = new EditorView({
+			parent: editorEl,
+			state: EditorState.create({
+				doc: code,
+				extensions: [
+					basicSetup,
+					python(),
+					oneDark,
+					// ⌘/Ctrl+Enter runs the cell; take precedence over defaults.
+					Prec.highest(
+						keymap.of([{ key: 'Mod-Enter', run: () => (run(), true) }])
+					),
+					EditorView.updateListener.of((v) => {
+						if (v.docChanged) code = v.state.doc.toString();
+					}),
+					// Blend the editor into the DaisyUI card while keeping oneDark colors.
+					EditorView.theme({
+						'&': { backgroundColor: 'transparent', fontSize: '13.5px' },
+						'.cm-content': {
+							fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+							padding: '10px 0'
+						},
+						'.cm-gutters': { backgroundColor: 'transparent', border: 'none' },
+						'&.cm-focused': { outline: 'none' }
+					})
+				]
+			})
+		});
+		if (import.meta.env.DEV) window.cellarView = view; // spike test aid
+		return () => view?.destroy();
 	});
 
 	const kernelReady = $derived(kernelState === 'idle' || kernelState === 'kernel ready');
@@ -39,13 +98,21 @@
 			case 'error':
 				push('error', stripAnsi((ev.traceback || [ev.ename + ': ' + ev.evalue]).join('\n')), 'error');
 				break;
+			case 'done':
+				// A run that produced no output (e.g. a bare assignment) clears
+				// the previous output only now, at the end.
+				if (freshRun) {
+					outputs = [];
+					freshRun = false;
+				}
+				break;
 		}
 	}
 
 	async function run() {
 		if (running) return;
 		running = true;
-		push('input', code, 'input');
+		freshRun = true; // replace the previous run's output when new output arrives
 		try {
 			const res = await fetch('/api/execute', {
 				method: 'POST',
@@ -78,15 +145,7 @@
 		outputs = [];
 	}
 
-	function onKeydown(e) {
-		if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-			e.preventDefault();
-			run();
-		}
-	}
-
 	const toneClass = {
-		input: 'text-info/80 border-info/40',
 		stdout: 'text-base-content border-transparent',
 		stderr: 'text-warning border-warning/40',
 		result: 'text-success font-semibold border-success/40',
@@ -119,22 +178,25 @@
 		<!-- Code cell -->
 		<div class="card border border-base-300 bg-base-100 shadow-sm">
 			<div class="card-body gap-0 p-0">
-				<textarea
-					bind:value={code}
-					onkeydown={onKeydown}
-					spellcheck="false"
-					rows="6"
+				<div class="flex items-center justify-between border-b border-base-300 px-3 py-1.5">
+					<span class="font-mono text-xs text-base-content/50">cell <span class="text-base-content/70">#{cellId}</span></span>
+					<span class="font-mono text-[11px] text-base-content/30">python3</span>
+				</div>
+				<div
+					bind:this={editorEl}
 					aria-label="code cell"
-					class="textarea w-full resize-y rounded-b-none border-0 bg-base-100 font-mono text-sm leading-relaxed focus:outline-none"
-				></textarea>
+					class="max-h-96 overflow-auto px-3"
+				></div>
 				<div class="flex items-center gap-2 border-t border-base-300 bg-base-100 px-3 py-2.5">
 					<button class="btn btn-primary btn-sm gap-1" onclick={run} disabled={running} data-testid="run">
-						{#if running}
-							<span class="loading loading-spinner loading-xs"></span>
-							Running…
-						{:else}
-							▶ Run
-						{/if}
+						<span class="inline-flex w-3 justify-center">
+							{#if running}
+								<span class="loading loading-spinner loading-xs"></span>
+							{:else}
+								▶
+							{/if}
+						</span>
+						Run
 						<kbd class="kbd kbd-xs opacity-70">⌘/Ctrl+↵</kbd>
 					</button>
 					<button class="btn btn-ghost btn-sm" onclick={clearOutput}>Clear output</button>
@@ -149,11 +211,7 @@
 			{:else}
 				<div class="space-y-0.5">
 					{#each outputs as o}
-						{#if o.kind === 'input'}
-							<pre class="mt-3 overflow-x-auto whitespace-pre-wrap break-words border-l-2 py-1 pl-3 font-mono text-sm {toneClass.input}"><span class="mr-2 select-none opacity-50">In [·]</span>{o.text}</pre>
-						{:else}
-							<pre class="overflow-x-auto whitespace-pre-wrap break-words rounded border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{o.text}</pre>
-						{/if}
+						<pre class="overflow-x-auto whitespace-pre-wrap break-words rounded border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{o.text}</pre>
 					{/each}
 				</div>
 			{/if}
