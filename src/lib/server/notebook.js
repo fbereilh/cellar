@@ -52,10 +52,10 @@ function starterCell() {
 	};
 }
 
-function newCell() {
+function newCell(cellType = 'code') {
 	return {
 		id: mintId(),
-		cell_type: 'code',
+		cell_type: cellType === 'markdown' ? 'markdown' : 'code',
 		source: '',
 		outputs: [],
 		metadata: { cellar: { extract: false, visible: true } }
@@ -103,14 +103,24 @@ function find(id) {
 	return doc.cells.find((c) => c.id === id);
 }
 
-export function addCell(afterId) {
+export function addCell(afterId, cellType = 'code') {
 	ensure();
-	const cell = newCell();
+	const cell = newCell(cellType);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
 	if (idx >= 0) doc.cells.splice(idx + 1, 0, cell);
 	else doc.cells.push(cell);
 	persist();
 	return cell;
+}
+
+/** Switch a cell between 'code' and 'markdown'. Markdown cells carry no outputs. */
+export function setCellType(id, cellType) {
+	ensure();
+	const cell = find(id);
+	if (!cell) return;
+	cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
+	if (cell.cell_type === 'markdown') cell.outputs = [];
+	persist();
 }
 
 export function deleteCell(id) {

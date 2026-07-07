@@ -24,9 +24,16 @@
 	}
 
 	async function runCell(id, source) {
+		const cell = findCell(id);
+		if (!cell) return;
+		// Markdown "runs" by rendering client-side (in the Cell) — no kernel.
+		// Just persist the source.
+		if (cell.cell_type === 'markdown') {
+			await editCell(id, source);
+			return;
+		}
 		if (runningId) return;
 		runningId = id;
-		const cell = findCell(id);
 		cell.source = source;
 		let replace = true; // replace prior output only when new output arrives (no flash)
 		try {
@@ -85,6 +92,19 @@
 		await fetch(`/api/cells/${id}/clear`, { method: 'POST' });
 	}
 
+	async function setType(id, cellType) {
+		const cell = findCell(id);
+		if (cell) {
+			cell.cell_type = cellType;
+			if (cellType === 'markdown') cell.outputs = [];
+		}
+		await fetch(`/api/cells/${id}`, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ cell_type: cellType })
+		});
+	}
+
 	async function deleteCell(id) {
 		cells = cells.filter((c) => c.id !== id);
 		await fetch(`/api/cells/${id}`, { method: 'DELETE' });
@@ -104,11 +124,11 @@
 		});
 	}
 
-	async function addCell(afterId) {
+	async function addCell(afterId, cellType = 'code') {
 		const res = await fetch('/api/cells', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ afterId })
+			body: JSON.stringify({ afterId, cellType })
 		});
 		const { cell } = await res.json();
 		const view = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs };
@@ -170,15 +190,20 @@
 					onDelete={deleteCell}
 					onMove={moveCell}
 					onEdit={editCell}
+					onSetType={setType}
 					onReady={registerFocus}
 				/>
 			{/each}
 		</div>
 
-		<div class="mt-4 flex justify-center">
-			<button class="btn btn-ghost btn-sm gap-1" onclick={() => addCell(cells.at(-1)?.id)} data-testid="add-cell">
+		<div class="mt-4 flex justify-center gap-2">
+			<button class="btn btn-ghost btn-sm gap-1" onclick={() => addCell(cells.at(-1)?.id, 'code')} data-testid="add-cell">
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-				Add cell
+				Code
+			</button>
+			<button class="btn btn-ghost btn-sm gap-1" onclick={() => addCell(cells.at(-1)?.id, 'markdown')} data-testid="add-markdown">
+				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+				Markdown
 			</button>
 		</div>
 

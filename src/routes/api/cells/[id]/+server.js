@@ -1,10 +1,11 @@
 import { json } from '@sveltejs/kit';
-import { setSource, deleteCell } from '$lib/server/notebook.js';
+import { setSource, setCellType, deleteCell } from '$lib/server/notebook.js';
 
-/** Edit a cell's source. */
+/** Edit a cell's source and/or its type ('code' | 'markdown'). */
 export async function PATCH({ params, request }) {
-	const { source } = await request.json();
-	setSource(params.id, source ?? '');
+	const body = await request.json();
+	if (typeof body.source === 'string') setSource(params.id, body.source);
+	if (body.cell_type) setCellType(params.id, body.cell_type);
 	return json({ ok: true });
 }
 
