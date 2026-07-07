@@ -10,42 +10,39 @@
  * never regenerated on edit/run/reorder.
  */
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { readNotebook, deserialize, writeNotebook } from './ipynb.js';
 
 const FILENAME = 'notebook.ipynb';
 
-let doc = null; // { path, cells, metadata, counter }
+let doc = null; // { path, cells, metadata }
 
 function workspace() {
 	return process.env.CELLAR_WORKSPACE || process.cwd();
 }
 
-/** Mint a fresh, unique, readable cell id. */
+/**
+ * Mint a fresh, unique cell id. UUIDs satisfy the nbformat id pattern
+ * (`^[a-zA-Z0-9-_]+$`, ≤64 chars); Cellar still owns generation + uniqueness.
+ */
 function mintId() {
-	return `cell-${++doc.counter}`;
+	return randomUUID();
 }
 
 /** Ensure every cell has a unique id; re-key missing/duplicate ones. */
 function enforceUniqueIds(cells) {
 	const seen = new Set();
-	let maxN = 0;
-	for (const c of cells) {
-		const m = /^cell-(\d+)$/.exec(c.id || '');
-		if (m) maxN = Math.max(maxN, Number(m[1]));
-	}
-	let counter = maxN;
 	for (const c of cells) {
 		if (!c.id || seen.has(c.id)) {
-			c.id = `cell-${++counter}`;
+			c.id = mintId();
 		}
 		seen.add(c.id);
 	}
-	return counter;
 }
 
-function starterCell(counter) {
+function starterCell() {
 	return {
-		id: `cell-${counter}`,
+		id: mintId(),
 		cell_type: 'code',
 		source: "print('hello')\n6 * 7",
 		outputs: [],
@@ -76,12 +73,12 @@ function ensure() {
 	const raw = readNotebook(path);
 	if (raw) {
 		const parsed = deserialize(raw);
-		const counter = enforceUniqueIds(parsed.cells);
-		doc = { path, cells: parsed.cells, metadata: parsed.metadata, counter };
+		enforceUniqueIds(parsed.cells);
+		doc = { path, cells: parsed.cells, metadata: parsed.metadata };
 		// Re-persist so a foreign/edited-outside file is normalized + cleaned.
 		persist();
 	} else {
-		doc = { path, cells: [starterCell(1)], metadata: undefined, counter: 1 };
+		doc = { path, cells: [starterCell()], metadata: undefined };
 		persist();
 	}
 	return doc;

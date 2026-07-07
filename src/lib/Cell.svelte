@@ -6,11 +6,25 @@
 	import { python } from '@codemirror/lang-python';
 	import { oneDark } from '@codemirror/theme-one-dark';
 
-	let { cell, index, count, running, onRun, onClear, onDelete, onMove, onEdit } = $props();
+	let { cell, index, count, running, onRun, onRunAdvance, onClear, onDelete, onMove, onEdit, onReady } = $props();
 
 	let editorEl;
 	let view;
 	let editTimer;
+
+	// Running indicator: only reveal after a short delay so fast cells never
+	// flash it (avoids the flicker the play-button spinner had).
+	let showRunning = $state(false);
+	let runIndicatorTimer;
+	$effect(() => {
+		if (running) {
+			runIndicatorTimer = setTimeout(() => (showRunning = true), 180);
+		} else {
+			clearTimeout(runIndicatorTimer);
+			showRunning = false;
+		}
+		return () => clearTimeout(runIndicatorTimer);
+	});
 
 	// Strip ANSI SGR color codes (ESC[…m) that Jupyter puts in tracebacks.
 	const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
@@ -61,7 +75,13 @@
 					basicSetup,
 					python(),
 					oneDark,
-					Prec.highest(keymap.of([{ key: 'Mod-Enter', run: () => (onRun(cell.id, currentSource()), true) }])),
+					// ⌘/Ctrl+Enter runs in place; Shift+Enter runs and advances.
+					Prec.highest(
+						keymap.of([
+							{ key: 'Mod-Enter', run: () => (onRun(cell.id, currentSource()), true) },
+							{ key: 'Shift-Enter', run: () => (onRunAdvance(cell.id, currentSource()), true) }
+						])
+					),
 					EditorView.updateListener.of((v) => {
 						if (!v.docChanged) return;
 						clearTimeout(editTimer);
@@ -78,8 +98,11 @@
 			})
 		});
 		if (import.meta.env.DEV) (window.cellarViews ??= {})[cell.id] = view;
+		// Let the parent focus this cell's editor (Shift+Enter advance).
+		onReady?.(cell.id, () => view.focus());
 		return () => {
 			clearTimeout(editTimer);
+			onReady?.(cell.id, null);
 			view?.destroy();
 		};
 	});
@@ -94,15 +117,11 @@
 					class="btn btn-ghost btn-xs btn-square text-success"
 					onclick={() => onRun(cell.id, currentSource())}
 					disabled={running}
-					title="Run cell (⌘/Ctrl+Enter)"
+					title="Run cell (⌘/Ctrl+Enter · Shift+Enter to advance)"
 					aria-label="Run cell"
 					data-testid="run"
 				>
-					{#if running}
-						<span class="loading loading-spinner loading-xs"></span>
-					{:else}
-						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
-					{/if}
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
 				</button>
 				<button
 					class="btn btn-ghost btn-xs btn-square text-base-content/60"
@@ -115,9 +134,9 @@
 						<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" />
 					</svg>
 				</button>
-				<span class="ml-1.5 font-mono text-xs text-base-content/50">cell <span class="text-base-content/70">#{cell.id}</span></span>
+				<span class="ml-1.5 font-mono text-xs text-base-content/50" title={cell.id}>cell <span class="text-base-content/70">#{cell.id.slice(0, 8)}</span></span>
 			</div>
-			<div class="flex items-center gap-0.5">
+			<div class="flex items-center gap-1">
 				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'up')} disabled={index === 0} title="Move up" aria-label="Move cell up" data-testid="move-up">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6" /></svg>
 				</button>
@@ -127,7 +146,17 @@
 				<button class="btn btn-ghost btn-xs btn-square text-error/70 hover:text-error" onclick={() => onDelete(cell.id)} disabled={count === 1} title="Delete cell" aria-label="Delete cell" data-testid="delete">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m-1 0v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V6" /></svg>
 				</button>
-				<span class="ml-1 font-mono text-[11px] text-base-content/30">python3</span>
+				<!-- Fixed-width slot at the far right: reserved so toggling the running
+				     indicator never shifts the toolbar layout. -->
+				<span class="ml-1 flex w-[68px] justify-end">
+					{#if showRunning}
+						<span class="flex items-center gap-1 text-[11px] text-warning" data-testid="running-indicator">
+							<span class="loading loading-spinner loading-xs"></span> running
+						</span>
+					{:else}
+						<span class="font-mono text-[11px] text-base-content/30">python3</span>
+					{/if}
+				</span>
 			</div>
 		</div>
 

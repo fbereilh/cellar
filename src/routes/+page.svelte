@@ -1,4 +1,5 @@
 <script>
+	import { tick } from 'svelte';
 	import Cell from '$lib/Cell.svelte';
 
 	let { data } = $props();
@@ -10,6 +11,13 @@
 	let kernelState = $state('idle');
 	let runningId = $state(null); // single kernel → one cell runs at a time
 	const kernelReady = $derived(kernelState === 'idle' || kernelState === 'kernel ready');
+
+	// Each Cell registers a focus fn (by id) so Shift+Enter can advance focus.
+	const focusers = {};
+	function registerFocus(id, fn) {
+		if (fn) focusers[id] = fn;
+		else delete focusers[id];
+	}
 
 	function findCell(id) {
 		return cells.find((c) => c.id === id);
@@ -110,6 +118,21 @@
 		} else {
 			cells = [...cells, view];
 		}
+		return view;
+	}
+
+	// Shift+Enter: run in place, then move focus to the next cell (creating and
+	// focusing a fresh empty cell if this is the last one) — Jupyter behavior.
+	async function runAndAdvance(id, source) {
+		runCell(id, source); // fire; advancing focus shouldn't wait for completion
+		const i = cells.findIndex((c) => c.id === id);
+		let nextId = i >= 0 && i < cells.length - 1 ? cells[i + 1].id : null;
+		if (!nextId) {
+			const created = await addCell(id);
+			nextId = created.id;
+		}
+		await tick(); // let the (possibly new) cell mount + register its focuser
+		focusers[nextId]?.();
 	}
 </script>
 
@@ -142,10 +165,12 @@
 					count={cells.length}
 					running={runningId === cell.id}
 					onRun={runCell}
+					onRunAdvance={runAndAdvance}
 					onClear={clearCell}
 					onDelete={deleteCell}
 					onMove={moveCell}
 					onEdit={editCell}
+					onReady={registerFocus}
 				/>
 			{/each}
 		</div>

@@ -3,3 +3,6 @@ node_modules/
 .svelte-kit/
 build/
 *.log
+
+# workspace notebook artifact (created when cellar runs in this folder)
+notebook.ipynb
