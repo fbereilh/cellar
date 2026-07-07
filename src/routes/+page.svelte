@@ -178,8 +178,48 @@
 		<!-- Code cell -->
 		<div class="card border border-base-300 bg-base-100 shadow-sm">
 			<div class="card-body gap-0 p-0">
-				<div class="flex items-center justify-between border-b border-base-300 px-3 py-1.5">
-					<span class="font-mono text-xs text-base-content/50">cell <span class="text-base-content/70">#{cellId}</span></span>
+				<div class="flex items-center justify-between border-b border-base-300 px-2 py-1">
+					<div class="flex items-center gap-0.5">
+						<button
+							class="btn btn-ghost btn-xs btn-square text-success"
+							onclick={run}
+							disabled={running}
+							title="Run cell (⌘/Ctrl+Enter)"
+							aria-label="Run cell"
+							data-testid="run"
+						>
+							{#if running}
+								<span class="loading loading-spinner loading-xs"></span>
+							{:else}
+								<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+									<path d="M8 5v14l11-7z" />
+								</svg>
+							{/if}
+						</button>
+						<button
+							class="btn btn-ghost btn-xs btn-square text-base-content/60"
+							onclick={clearOutput}
+							title="Clear output"
+							aria-label="Clear output"
+							data-testid="clear"
+						>
+							<svg
+								class="h-3.5 w-3.5"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+								stroke-linecap="round"
+								stroke-linejoin="round"
+								aria-hidden="true"
+							>
+								<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" />
+								<path d="M22 21H7" />
+								<path d="m5 11 9 9" />
+							</svg>
+						</button>
+						<span class="ml-1.5 font-mono text-xs text-base-content/50">cell <span class="text-base-content/70">#{cellId}</span></span>
+					</div>
 					<span class="font-mono text-[11px] text-base-content/30">python3</span>
 				</div>
 				<div
@@ -187,20 +227,6 @@
 					aria-label="code cell"
 					class="max-h-96 overflow-auto px-3"
 				></div>
-				<div class="flex items-center gap-2 border-t border-base-300 bg-base-100 px-3 py-2.5">
-					<button class="btn btn-primary btn-sm gap-1" onclick={run} disabled={running} data-testid="run">
-						<span class="inline-flex w-3 justify-center">
-							{#if running}
-								<span class="loading loading-spinner loading-xs"></span>
-							{:else}
-								▶
-							{/if}
-						</span>
-						Run
-						<kbd class="kbd kbd-xs opacity-70">⌘/Ctrl+↵</kbd>
-					</button>
-					<button class="btn btn-ghost btn-sm" onclick={clearOutput}>Clear output</button>
-				</div>
 			</div>
 		</div>
 
