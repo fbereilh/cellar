@@ -83,6 +83,30 @@ Ctrl-C stops both servers.
 Add `--build` to serve the production build (`npm run build` first) instead of
 the Vite dev server.
 
+## Agent interface (MCP)
+
+Cellar exposes an **MCP server** (the agent interface, spec §4) in-process in the
+backend, over Streamable HTTP:
+
+```
+http://127.0.0.1:39587/mcp          # override the port with CELLAR_MCP_PORT
+```
+
+Because it shares the live notebook document + kernel with the UI and is
+independent of the kernel connection, **restarting the kernel never drops the
+MCP session or the document**. Connect any MCP client (e.g. the MCP Inspector,
+or `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`) to that URL.
+
+Tools (all UUID-addressed; all honor per-cell `cellar.hidden_from_agent`):
+lifecycle (`restart_kernel`, `interrupt_kernel`, `kernel_status`,
+`list_notebooks`, `open_notebook`, `create_notebook`); read (`get_notebook_map`
+= section tree from markdown headers, `read_cell`/`read_cells`,
+`read_by_location`, `read_section`, `search_cells`, `get_errors`,
+`get_full_output` with medium/full tiering); write (`add_cell`/`add_cells`,
+`edit_cell`, `delete_cell`, `move_cell`, `set_cell_type`,
+`set_cell_visibility`); execute (`run_cell`, `run_cells`, `run_all`,
+`run_range`).
+
 ## What was verified
 
 Driven end-to-end in a real browser (and the saved `.ipynb` inspected):

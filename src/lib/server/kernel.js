@@ -15,6 +15,8 @@
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
 
 let kernelPromise = null;
+let manager = null;
+let currentKernel = null;
 
 function makeSettings() {
 	const baseUrl = process.env.CELLAR_JUPYTER_URL || 'http://127.0.0.1:8888';
@@ -36,15 +38,40 @@ async function getKernel() {
 	if (kernelPromise) return kernelPromise;
 	kernelPromise = (async () => {
 		const serverSettings = makeSettings();
-		const manager = new KernelManager({ serverSettings });
+		manager = new KernelManager({ serverSettings });
 		await manager.ready;
-		return manager.startNew({ name: 'python3' });
+		currentKernel = await manager.startNew({ name: 'python3' });
+		return currentKernel;
 	})();
 	// If startup fails, allow a later retry.
 	kernelPromise.catch(() => {
 		kernelPromise = null;
 	});
 	return kernelPromise;
+}
+
+/**
+ * Restart the kernel process (clears the namespace) while KEEPING the same
+ * connection. Cellar's backend, MCP server, and document are untouched — this
+ * is what makes the agent interface kernel-restart-proof.
+ */
+export async function restartKernel() {
+	const kernel = await getKernel();
+	await kernel.restart();
+	return { status: kernel.status, id: kernel.id };
+}
+
+/** Interrupt the running kernel (SIGINT equivalent). */
+export async function interruptKernel() {
+	const kernel = await getKernel();
+	await kernel.interrupt();
+	return { status: kernel.status, id: kernel.id };
+}
+
+/** Current kernel status without forcing a start. */
+export function kernelStatus() {
+	if (!currentKernel) return { status: 'not_started', id: null };
+	return { status: currentKernel.status, id: currentKernel.id };
 }
 
 /**

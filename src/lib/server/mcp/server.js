@@ -1,0 +1,139 @@
+/**
+ * Cellar — MCP server (agent interface).
+ *
+ * Runs IN-PROCESS inside Cellar's backend over Streamable HTTP on its own port,
+ * so it shares the live notebook document + kernel with the UI. Because the MCP
+ * server, its sessions, and the document are all independent of the kernel
+ * connection, restarting/replacing/killing the kernel never drops the MCP
+ * connection or the agent session (spec §4, hard requirement #1).
+ *
+ * Connect an agent to:  http://127.0.0.1:<CELLAR_MCP_PORT>/mcp   (default 39587)
+ */
+import http from 'node:http';
+import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import * as svc from './service.js';
+
+const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
+const notFound = (msg) => ({ content: [{ type: 'text', text: msg }], isError: true });
+
+function registerTools(server) {
+	// --- lifecycle ---
+	server.registerTool('restart_kernel', { description: 'Restart the kernel (clears namespace). Does NOT affect the MCP connection or document.', inputSchema: {} }, async () => text(await svc.kernel.restart()));
+	server.registerTool('interrupt_kernel', { description: 'Interrupt the running kernel.', inputSchema: {} }, async () => text(await svc.kernel.interrupt()));
+	server.registerTool('kernel_status', { description: 'Current kernel status.', inputSchema: {} }, async () => text(svc.kernel.status()));
+	server.registerTool('list_notebooks', { description: 'List notebooks in the workspace.', inputSchema: {} }, async () => text(svc.listNotebooks()));
+	server.registerTool('open_notebook', { description: 'Open (the workspace) notebook.', inputSchema: {} }, async () => text(svc.openNotebook()));
+	server.registerTool('create_notebook', { description: 'Create a notebook (single-notebook workspace today; returns the current one).', inputSchema: {} }, async () => text(svc.openNotebook()));
+
+	// --- read ---
+	server.registerTool('get_notebook_map', { description: 'Compact hierarchical section tree (from markdown headers): id, type, header level/title, one-line summary, run status, has-output, visibility. Not full content.', inputSchema: {} }, async () => text(svc.getNotebookMap()));
+	server.registerTool('read_cell', { description: 'Read one cell by UUID (source + summarized outputs).', inputSchema: { id: z.string() } }, async ({ id }) => { const r = svc.readCell(id); return r ? text(r) : notFound(`cell ${id} not found or hidden`); });
+	server.registerTool('read_cells', { description: 'Read multiple cells by UUID.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(svc.readCells(ids)));
+	server.registerTool('read_by_location', { description: 'Read a cell by location: index (0-based over visible cells), position first/last, or next/prev of a cell.', inputSchema: { index: z.number().int().optional(), position: z.enum(['first', 'last']).optional(), relative_to: z.string().optional(), direction: z.enum(['next', 'prev']).optional() } }, async ({ index, position, relative_to, direction }) => { const r = svc.readByLocation({ index, position, relativeTo: relative_to, direction }); return r ? text(r) : notFound('no cell at that location'); });
+	server.registerTool('read_section', { description: 'Read all cells under a markdown header (until the next same-or-higher header).', inputSchema: { header_id: z.string() } }, async ({ header_id }) => { const r = svc.readSection(header_id); return r ? text(r) : notFound(`${header_id} is not a visible header cell`); });
+	server.registerTool('search_cells', { description: 'Search cells; returns ids + snippets.', inputSchema: { query: z.string(), in: z.enum(['input', 'output', 'both']).optional() } }, async ({ query, in: where }) => text(svc.searchCells(query, where ?? 'both')));
+	server.registerTool('get_errors', { description: 'List cells whose latest output is an error (ename/evalue/traceback).', inputSchema: {} }, async () => text(svc.getErrors()));
+	server.registerTool('get_full_output', { description: 'Fuller cell outputs. Medium-capped by default; size=full returns everything. Images passed through.', inputSchema: { id: z.string(), size: z.enum(['medium', 'full']).optional() } }, async ({ id, size }) => {
+		const r = svc.getFullOutput(id, size ?? 'medium');
+		if (!r) return notFound(`cell ${id} not found or hidden`);
+		const content = [{ type: 'text', text: JSON.stringify({ id: r.id, size: r.size, outputs: r.outputs.map((o) => (o.data ? { type: o.type, image: o.image } : o)) }, null, 2) }];
+		for (const o of r.outputs) if (o.data) content.push({ type: 'image', data: o.data, mimeType: o.image });
+		return { content };
+	});
+
+	// --- write ---
+	server.registerTool('add_cell', { description: 'Add a cell (optionally after a cell), of type code|markdown, with optional source.', inputSchema: { after_id: z.string().optional(), cell_type: z.enum(['code', 'markdown']).optional(), source: z.string().optional() } }, async ({ after_id, cell_type, source }) => text({ id: svc.addCells([{ cell_type, source }], after_id)[0] }));
+	server.registerTool('add_cells', { description: 'Add multiple cells in order (optionally after a cell).', inputSchema: { cells: z.array(z.object({ cell_type: z.enum(['code', 'markdown']).optional(), source: z.string().optional() })), after_id: z.string().optional() } }, async ({ cells, after_id }) => text({ ids: svc.addCells(cells, after_id) }));
+	server.registerTool('edit_cell', { description: 'Replace a cell source in place.', inputSchema: { id: z.string(), source: z.string() } }, async ({ id, source }) => (svc.editCell(id, source) ? text({ ok: true, id }) : notFound(`cell ${id} not found`)));
+	server.registerTool('delete_cell', { description: 'Delete a cell.', inputSchema: { id: z.string() } }, async ({ id }) => (svc.removeCell(id) ? text({ ok: true }) : notFound(`cell ${id} not found`)));
+	server.registerTool('move_cell', { description: 'Move a cell to an absolute index.', inputSchema: { id: z.string(), position: z.number().int() } }, async ({ id, position }) => (svc.moveCell(id, position) ? text({ ok: true }) : notFound(`cell ${id} not found`)));
+	server.registerTool('set_cell_type', { description: 'Set a cell type to code or markdown.', inputSchema: { id: z.string(), cell_type: z.enum(['code', 'markdown']) } }, async ({ id, cell_type }) => (svc.setType(id, cell_type) ? text({ ok: true }) : notFound(`cell ${id} not found`)));
+	server.registerTool('set_cell_visibility', { description: 'Show/hide a cell from the agent (cellar.hidden_from_agent).', inputSchema: { id: z.string(), hidden: z.boolean() } }, async ({ id, hidden }) => (svc.setCellVisibility(id, hidden) ? text({ ok: true, id, hidden }) : notFound(`cell ${id} not found`)));
+
+	// --- execute ---
+	server.registerTool('run_cell', { description: 'Run one cell by UUID (markdown cells are skipped).', inputSchema: { id: z.string() } }, async ({ id }) => { const r = await svc.runCell(id); return r ? text(r) : notFound(`cell ${id} not found`); });
+	server.registerTool('run_cells', { description: 'Run multiple cells in order.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(await svc.runCells(ids)));
+	server.registerTool('run_all', { description: 'Run all code cells in document order.', inputSchema: {} }, async () => text(await svc.runAll()));
+	server.registerTool('run_range', { description: 'Run code cells in the inclusive range from one cell to another.', inputSchema: { from_id: z.string(), to_id: z.string() } }, async ({ from_id, to_id }) => text(await svc.runRange(from_id, to_id)));
+}
+
+/** Read and JSON-parse a Node request body. */
+function readBody(req) {
+	return new Promise((resolve, reject) => {
+		let data = '';
+		req.on('data', (c) => (data += c));
+		req.on('end', () => {
+			try {
+				resolve(data ? JSON.parse(data) : undefined);
+			} catch (e) {
+				reject(e);
+			}
+		});
+		req.on('error', reject);
+	});
+}
+
+let started = false;
+
+/** Start the in-process MCP HTTP server once. */
+export function startMcpServer() {
+	if (started || globalThis.__cellarMcpStarted) return;
+	started = true;
+	globalThis.__cellarMcpStarted = true;
+
+	const port = Number(process.env.CELLAR_MCP_PORT || 39587);
+	const transports = {}; // sessionId -> transport
+
+	const httpServer = http.createServer(async (req, res) => {
+		const url = new URL(req.url, 'http://localhost');
+		if (url.pathname !== '/mcp') {
+			res.writeHead(404).end('not found');
+			return;
+		}
+		try {
+			if (req.method === 'POST') {
+				const body = await readBody(req);
+				const sid = req.headers['mcp-session-id'];
+				let transport = sid ? transports[sid] : undefined;
+				if (!transport && isInitializeRequest(body)) {
+					transport = new StreamableHTTPServerTransport({
+						sessionIdGenerator: () => randomUUID(),
+						onsessioninitialized: (id) => (transports[id] = transport)
+					});
+					transport.onclose = () => {
+						if (transport.sessionId) delete transports[transport.sessionId];
+					};
+					const server = new McpServer({ name: 'cellar', version: '0.1.0' });
+					registerTools(server);
+					await server.connect(transport);
+				}
+				if (!transport) {
+					res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'No valid session; send an initialize request first.' }, id: null }));
+					return;
+				}
+				await transport.handleRequest(req, res, body);
+			} else if (req.method === 'GET' || req.method === 'DELETE') {
+				const sid = req.headers['mcp-session-id'];
+				const transport = sid ? transports[sid] : undefined;
+				if (!transport) {
+					res.writeHead(400).end('missing or unknown session');
+					return;
+				}
+				await transport.handleRequest(req, res);
+			} else {
+				res.writeHead(405).end('method not allowed');
+			}
+		} catch (err) {
+			if (!res.headersSent) res.writeHead(500).end('mcp error: ' + err);
+		}
+	});
+
+	httpServer.on('error', (err) => console.error('[cellar-mcp] server error:', err));
+	httpServer.listen(port, '127.0.0.1', () => {
+		console.log(`[cellar-mcp] MCP agent interface on http://127.0.0.1:${port}/mcp`);
+	});
+}

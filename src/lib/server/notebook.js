@@ -103,6 +103,52 @@ function find(id) {
 	return doc.cells.find((c) => c.id === id);
 }
 
+// --- richer read/write surface (used by the MCP agent interface) -----------
+
+/** Full cell views including metadata, in document order. */
+export function listCells() {
+	ensure();
+	return doc.cells.map((c) => ({
+		id: c.id,
+		cell_type: c.cell_type,
+		source: c.source,
+		outputs: c.outputs ?? [],
+		metadata: c.metadata ?? {}
+	}));
+}
+
+/** A single full cell view (or null). */
+export function getCell(id) {
+	ensure();
+	const c = find(id);
+	if (!c) return null;
+	return { id: c.id, cell_type: c.cell_type, source: c.source, outputs: c.outputs ?? [], metadata: c.metadata ?? {} };
+}
+
+/** Set the agent-visibility flag in the allowlisted `cellar` namespace. */
+export function setVisibility(id, hidden) {
+	ensure();
+	const cell = find(id);
+	if (!cell) return false;
+	cell.metadata = cell.metadata ?? {};
+	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	cell.metadata.cellar.hidden_from_agent = !!hidden;
+	persist();
+	return true;
+}
+
+/** Move a cell to an absolute index (clamped). */
+export function moveCellTo(id, index) {
+	ensure();
+	const from = doc.cells.findIndex((c) => c.id === id);
+	if (from < 0) return false;
+	const [cell] = doc.cells.splice(from, 1);
+	const to = Math.max(0, Math.min(index, doc.cells.length));
+	doc.cells.splice(to, 0, cell);
+	persist();
+	return true;
+}
+
 export function addCell(afterId, cellType = 'code') {
 	ensure();
 	const cell = newCell(cellType);
