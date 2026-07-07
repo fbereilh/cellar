@@ -16,7 +16,10 @@
     "@sveltejs/adapter-node": "^5.2.9",
     "@sveltejs/kit": "^2.8.0",
     "@sveltejs/vite-plugin-svelte": "^4.0.0",
+    "@tailwindcss/vite": "^4.3.2",
+    "daisyui": "^5.6.14",
     "svelte": "^5.1.0",
+    "tailwindcss": "^4.3.2",
     "vite": "^5.4.0"
   },
   "dependencies": {
