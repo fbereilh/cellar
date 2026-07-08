@@ -4,6 +4,7 @@
 	import Sidebar from '$lib/Sidebar.svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import FileTab from '$lib/FileTab.svelte';
+	import NotebookFileView from '$lib/NotebookFileView.svelte';
 	import Settings from '$lib/Settings.svelte';
 
 	let { data } = $props();
@@ -166,38 +167,166 @@
 	let sidebarOpen = $state(true);
 	let settingsOpen = $state(false);
 	let theme = $state('dim');
+	const mcp = data.mcp;
 
-	let tabs = $state([{ id: 'notebook', kind: 'notebook', title: notebookName, closable: false, dirty: false }]);
-	let activeTabId = $state('notebook');
+	// Workspace-relative path of the canonical (live) notebook — opening it from
+	// the file tree routes to the live notebook tab, not a read-only render.
+	const canonicalNotebookRel = notebookPath.startsWith(workspace)
+		? notebookPath.slice(workspace.length).replace(/^[/\\]+/, '')
+		: notebookName;
+
+	// Tabs are restored from per-workspace session memory on mount; a first-ever
+	// open starts empty (no tab → empty state). Each tab may be a transient
+	// `preview` (VS Code single-click) until promoted (double-click / edit).
+	let tabs = $state([]);
+	let activeTabId = $state(null);
+	let tabsRestored = $state(false);
 	const fileTabs = $derived(tabs.filter((t) => t.kind === 'file'));
+	const ipynbTabs = $derived(tabs.filter((t) => t.kind === 'ipynb'));
+	const notebookOpen = $derived(tabs.some((t) => t.kind === 'notebook'));
+	const activeTab = $derived(tabs.find((t) => t.id === activeTabId) ?? null);
+	const activeFilePath = $derived(activeTab && activeTab.kind !== 'notebook' ? activeTab.path : null);
+
+	function tabIdFor(path) {
+		return path === canonicalNotebookRel ? 'notebook' : 'file:' + path;
+	}
+	function makeTab(path, preview) {
+		if (path === canonicalNotebookRel) {
+			return { id: 'notebook', kind: 'notebook', title: notebookName, path, closable: true, dirty: false, preview };
+		}
+		const kind = /\.ipynb$/i.test(path) ? 'ipynb' : 'file';
+		return { id: 'file:' + path, kind, title: path.split('/').pop(), path, closable: true, dirty: false, preview };
+	}
 
 	function selectTab(id) {
 		activeTabId = id;
 	}
 
+	// Single-click a tree file → open in the single shared preview slot. If a tab
+	// for it already exists (preview or pinned) just focus it; otherwise reuse the
+	// existing preview tab's slot, or append one.
 	function openFile(path) {
-		const id = 'file:' + path;
-		if (!tabs.find((t) => t.id === id)) {
-			tabs = [...tabs, { id, kind: 'file', title: path.split('/').pop(), path, closable: true, dirty: false }];
+		const id = tabIdFor(path);
+		if (tabs.find((t) => t.id === id)) {
+			activeTabId = id;
+			return;
+		}
+		const tab = makeTab(path, true);
+		const pv = tabs.findIndex((t) => t.preview);
+		if (pv >= 0) {
+			const next = [...tabs];
+			next[pv] = tab;
+			tabs = next;
+		} else {
+			tabs = [...tabs, tab];
 		}
 		activeTabId = id;
+	}
+
+	// Double-click / edit → open (or promote) as a permanent (pinned) tab.
+	function openFilePermanent(path) {
+		const id = tabIdFor(path);
+		const existing = tabs.find((t) => t.id === id);
+		if (existing) {
+			if (existing.preview) tabs = tabs.map((t) => (t.id === id ? { ...t, preview: false } : t));
+			activeTabId = id;
+			return;
+		}
+		tabs = [...tabs, makeTab(path, false)];
+		activeTabId = id;
+	}
+
+	function promoteTab(id) {
+		tabs = tabs.map((t) => (t.id === id ? { ...t, preview: false } : t));
+	}
+
+	function openNotebook() {
+		openFilePermanent(canonicalNotebookRel);
 	}
 
 	function closeTab(id) {
 		const idx = tabs.findIndex((t) => t.id === id);
 		tabs = tabs.filter((t) => t.id !== id);
 		if (activeTabId === id) {
-			activeTabId = (tabs[idx - 1] ?? tabs[0] ?? { id: 'notebook' }).id;
+			activeTabId = (tabs[idx - 1] ?? tabs[0] ?? null)?.id ?? null;
 		}
 	}
 
 	function onFileDirty(path, dirty) {
 		const id = 'file:' + path;
-		tabs = tabs.map((t) => (t.id === id ? { ...t, dirty } : t));
+		// Editing a previewed file promotes it to a permanent tab, like VS Code.
+		tabs = tabs.map((t) => (t.id === id ? { ...t, dirty, preview: dirty ? false : t.preview } : t));
+		// A save (dirty→false) may change git status → refresh decorations.
+		if (!dirty) fsRefreshSignal++;
 	}
 
+	// ---- Tab session memory (per workspace) ---------------------------------
+	const TABS_KEY = 'cellar-tabs:' + workspace;
+	function restoreTabs() {
+		let saved = null;
+		try {
+			saved = localStorage.getItem(TABS_KEY);
+		} catch {}
+		if (saved == null) {
+			// First-ever open of this workspace → empty state, no tabs.
+			tabs = [];
+			activeTabId = null;
+		} else {
+			try {
+				const parsed = JSON.parse(saved);
+				tabs = (parsed.tabs ?? []).map((t) => makeTab(t.path, !!t.preview));
+				const ids = new Set(tabs.map((t) => t.id));
+				activeTabId = ids.has(parsed.activeTabId) ? parsed.activeTabId : (tabs[0]?.id ?? null);
+			} catch {
+				tabs = [];
+				activeTabId = null;
+			}
+		}
+		tabsRestored = true;
+	}
+	$effect(() => {
+		if (!tabsRestored) return;
+		const snapshot = JSON.stringify({
+			tabs: tabs.map((t) => ({ path: t.path, preview: t.preview })),
+			activeTabId
+		});
+		try {
+			localStorage.setItem(TABS_KEY, snapshot);
+		} catch {}
+	});
+
+	// ---- Resizable sidebar (persisted width) --------------------------------
+	const SIDEBAR_WIDTH_KEY = 'cellar-sidebar-width';
+	const SIDEBAR_MIN = 180;
+	const SIDEBAR_MAX = 560;
+	let sidebarWidth = $state(256);
+	let resizing = $state(false);
+	function startResize(e) {
+		resizing = true;
+		const startX = e.clientX;
+		const startW = sidebarWidth;
+		e.preventDefault();
+		function onMove(ev) {
+			const w = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, startW + (ev.clientX - startX)));
+			sidebarWidth = w;
+		}
+		function onUp() {
+			resizing = false;
+			window.removeEventListener('pointermove', onMove);
+			window.removeEventListener('pointerup', onUp);
+			try {
+				localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+			} catch {}
+		}
+		window.addEventListener('pointermove', onMove);
+		window.addEventListener('pointerup', onUp);
+	}
+
+	// Bump to make the sidebar re-read the file tree + git status (after saves).
+	let fsRefreshSignal = $state(0);
+
 	async function scrollToCell(id) {
-		activeTabId = 'notebook';
+		openNotebook();
 		await tick();
 		const el = document.querySelector(`[data-cell-id="${id}"]`);
 		if (!el) return;
@@ -306,6 +435,12 @@
 			}
 		})();
 		applyTheme(saved || document.documentElement.dataset.theme || 'dim');
+		// Restore per-workspace tab session + sidebar width.
+		restoreTabs();
+		try {
+			const w = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+			if (w) sidebarWidth = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, w));
+		} catch {}
 		// Restore live kernel + variables after a reload — but only inspect if a
 		// kernel already exists, so a fresh page load never boots one on its own.
 		refreshKernel().then(() => {
@@ -324,54 +459,87 @@
 		kernelInfo={displayKernel}
 		onSelectTab={selectTab}
 		onCloseTab={closeTab}
+		onPromoteTab={promoteTab}
 		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
 		onOpenSettings={() => (settingsOpen = true)}
 	/>
 
 	<div class="flex min-h-0 flex-1">
 		{#if sidebarOpen}
-			<div class="w-64 shrink-0 border-r border-base-300">
+			<div class="shrink-0 border-r border-base-300" style="width: {sidebarWidth}px">
 				<Sidebar
 					{cells}
+					{mcp}
 					kernelInfo={displayKernel}
 					{kernelBusy}
 					{notebookName}
 					{variables}
 					{varsLoading}
 					{varsError}
+					{activeFilePath}
+					{fsRefreshSignal}
 					onRefreshVars={refreshVariables}
 					onRefreshKernel={refreshKernel}
 					onInterruptKernel={interruptKernel}
 					onRestartKernel={restartKernel}
 					onOpenFile={openFile}
+					onOpenFilePermanent={openFilePermanent}
+					onOpenNotebook={openNotebook}
 					onScrollToCell={scrollToCell}
 				/>
 			</div>
+			<!-- Drag handle to resize the sidebar (persisted width). -->
+			<div
+				class="relative w-1 shrink-0 cursor-col-resize bg-base-300/40 hover:bg-primary/50 {resizing ? 'bg-primary/60' : ''}"
+				onpointerdown={startResize}
+				role="separator"
+				aria-orientation="vertical"
+				aria-label="Resize sidebar"
+				data-testid="sidebar-resizer"
+			></div>
 		{/if}
 
-		<main class="min-w-0 flex-1 overflow-hidden">
+		<main class="relative min-w-0 flex-1 overflow-hidden">
 			<!-- Notebook stays mounted (editor + run state preserved) — just hidden. -->
-			<div class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}">
-				<Notebook
-					{cells}
-					{runningId}
-					onRun={runCell}
-					onRunAdvance={runAndAdvance}
-					onClear={clearCell}
-					onDelete={deleteCell}
-					onMove={moveCell}
-					onEdit={editCell}
-					onSetType={setType}
-					onReady={registerFocus}
-					onAddCell={addCell}
-				/>
-			</div>
+			{#if notebookOpen}
+				<div class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}">
+					<Notebook
+						{cells}
+						{runningId}
+						onRun={runCell}
+						onRunAdvance={runAndAdvance}
+						onClear={clearCell}
+						onDelete={deleteCell}
+						onMove={moveCell}
+						onEdit={editCell}
+						onSetType={setType}
+						onReady={registerFocus}
+						onAddCell={addCell}
+					/>
+				</div>
+			{/if}
 
 			{#each fileTabs as tab (tab.id)}
 				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
 					<FileTab path={tab.path} onDirty={onFileDirty} />
 				</div>
 			{/each}
+
+			{#each ipynbTabs as tab (tab.id)}
+				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
+					<NotebookFileView path={tab.path} />
+				</div>
+			{/each}
+
+			{#if tabsRestored && !activeTab}
+				<!-- Empty state: no tab open (first-ever open, or all tabs closed). -->
+				<div class="flex h-full flex-col items-center justify-center gap-4 text-center" data-testid="empty-state">
+					<div class="text-5xl opacity-30">🍷</div>
+					<div class="text-sm text-base-content/50">No open files</div>
+					<p class="max-w-xs text-xs text-base-content/40">Open a file from the sidebar, or open this workspace's notebook.</p>
+					<button class="btn btn-sm btn-primary" onclick={openNotebook} data-testid="empty-open-notebook">Open notebook</button>
+				</div>
+			{/if}
 		</main>
 	</div>
 
