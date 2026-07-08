@@ -124,10 +124,17 @@ independent of the kernel connection, **restarting the kernel never drops the
 MCP session or the document**. Connect any MCP client (e.g. the MCP Inspector,
 or `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`) to that URL.
 
+On connect the server hands the agent a house-style **coherence doctrine** (the
+MCP `instructions`, delivered once) that frames the work as building one coherent
+notebook — imports at the top, check `kernel_state` before writing, continue the
+narrative via `get_notebook_map`, structure with markdown. The same text is also
+exposed as the `cellar_notebook_style` prompt.
+
 Tools (all UUID-addressed; all honor per-cell `cellar.hidden_from_agent`):
 lifecycle (`restart_kernel`, `interrupt_kernel`, `kernel_status`,
 `list_notebooks`, `open_notebook`, `create_notebook`); read (`get_notebook_map`
-= section tree from markdown headers, `read_cell`/`read_cells`,
+= section tree from markdown headers, `kernel_state` = live namespace bucketed
+into imports/functions/classes/variables, `read_cell`/`read_cells`,
 `read_by_location`, `read_section`, `search_cells`, `get_errors`,
 `get_full_output` with medium/full tiering); write (`add_cell`/`add_cells`,
 `edit_cell`, `delete_cell`, `move_cell`, `set_cell_type`,
