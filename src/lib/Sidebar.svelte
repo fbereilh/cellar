@@ -224,14 +224,21 @@
 		return out;
 	});
 
-	// ---- Connect an agent (live MCP endpoint) -------------------------------
-	// A ready-to-paste config snippet for MCP-speaking agents (Claude Code etc.).
+	// ---- Connect an agent (zero-config MCP) ---------------------------------
+	// The recommended path is zero-config: `cellar` writes a project `.mcp.json`
+	// so an agent opened in this repo auto-connects over the `cellar mcp` stdio
+	// bridge (the port is discovered at runtime, never hardcoded). The one-time
+	// manual registration and the raw Streamable-HTTP endpoint are secondary.
+	const addCommand = 'claude mcp add cellar -- cellar mcp';
+	// Config snippet for a generic MCP client pointed straight at the raw HTTP
+	// endpoint (MCP Inspector, a custom SDK client). Demoted under "Advanced".
 	const mcpSnippet = $derived(
 		mcp?.url
 			? JSON.stringify({ mcpServers: { cellar: { type: 'http', url: mcp.url } } }, null, 2)
 			: ''
 	);
-	let copied = $state(''); // 'url' | 'snippet' | ''
+	let advancedOpen = $state(false);
+	let copied = $state(''); // 'add' | 'url' | 'snippet' | ''
 	let copyTimer;
 	async function copy(kind, textVal) {
 		try {
@@ -364,36 +371,88 @@
 	</div>
 	{#if open.agent}
 		<div class="px-3 pb-3" data-testid="agent-body">
-			{#if mcp?.url}
-				<p class="pb-1.5 text-[11px] leading-relaxed text-base-content/50">
-					Point an MCP-speaking agent at this Cellar instance's live endpoint:
-				</p>
-				<div class="flex items-center gap-1 rounded-lg border border-base-300 bg-base-100 p-1.5">
-					<code class="min-w-0 flex-1 truncate px-1 font-mono text-xs text-primary" title={mcp.url} data-testid="mcp-url">{mcp.url}</code>
-					<button
-						class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
-						onclick={() => copy('url', mcp.url)}
-						title="Copy MCP URL"
-						aria-label="Copy MCP URL"
-						data-testid="mcp-copy-url"
-					>
-						{#if copied === 'url'}
-							<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
-						{:else}
-							<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
-						{/if}
-					</button>
+			<!-- Lead: zero-config. `cellar` wrote a project .mcp.json, so an agent
+			     opened in this repo auto-connects with no setup. -->
+			{#if mcp?.projectConfigured}
+				<div class="flex items-start gap-1.5 rounded-lg border border-success/30 bg-success/10 p-2" data-testid="mcp-zeroconfig">
+					<svg class="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+					<p class="text-[11px] leading-relaxed text-base-content/70">
+						<span class="font-semibold text-base-content/80">This project is agent-ready.</span>
+						Cellar wrote a <code class="font-mono text-[10px] text-primary">.mcp.json</code> here, so an agent
+						(e.g. Claude Code) opened in this repo auto-connects - no setup.
+					</p>
 				</div>
-
-				<div class="mt-2 flex items-center justify-between">
-					<span class="text-[10px] uppercase tracking-wide text-base-content/40">config snippet</span>
-					<button class="btn btn-ghost btn-xs h-5 min-h-0 gap-1 px-1.5 text-[11px] font-normal text-base-content/50 hover:text-base-content" onclick={() => copy('snippet', mcpSnippet)} data-testid="mcp-copy-snippet">
-						{copied === 'snippet' ? 'copied' : 'copy'}
-					</button>
-				</div>
-				<pre class="mt-1 overflow-x-auto rounded-lg border border-base-300 bg-base-100 p-2 font-mono text-[11px] leading-relaxed text-base-content/70" data-testid="mcp-snippet">{mcpSnippet}</pre>
 			{:else}
-				<p class="px-1 text-xs text-base-content/40">MCP endpoint unavailable</p>
+				<div class="flex items-start gap-1.5 rounded-lg border border-base-300 bg-base-100 p-2" data-testid="mcp-zeroconfig">
+					<svg class="mt-0.5 h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M12 16v-4" /><path d="M12 8h.01" /></svg>
+					<p class="text-[11px] leading-relaxed text-base-content/60">
+						No project <code class="font-mono text-[10px]">.mcp.json</code> here (launched with
+						<code class="font-mono text-[10px]">--no-mcp-config</code>). Register the agent once with the command below.
+					</p>
+				</div>
+			{/if}
+
+			<!-- One-time manual registration, from any project. -->
+			<p class="pt-2.5 pb-1 text-[10px] uppercase tracking-wide text-base-content/40">Register once (any project)</p>
+			<div class="flex items-center gap-1 rounded-lg border border-base-300 bg-base-100 p-1.5">
+				<code class="min-w-0 flex-1 truncate px-1 font-mono text-xs text-primary" title={addCommand} data-testid="mcp-add-command">{addCommand}</code>
+				<button
+					class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
+					onclick={() => copy('add', addCommand)}
+					title="Copy command"
+					aria-label="Copy command"
+					data-testid="mcp-copy-add"
+				>
+					{#if copied === 'add'}
+						<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+					{:else}
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+					{/if}
+				</button>
+			</div>
+
+			<!-- Demoted: raw Streamable-HTTP endpoint for a generic MCP client. -->
+			{#if mcp?.url}
+				<button
+					class="mt-2.5 flex w-full items-center gap-1 py-0.5 text-left text-[10px] uppercase tracking-wide text-base-content/40 hover:text-base-content/70"
+					onclick={() => (advancedOpen = !advancedOpen)}
+					data-testid="mcp-advanced-toggle"
+				>
+					<svg class="h-2.5 w-2.5 transition-transform {advancedOpen ? 'rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+					Advanced · raw endpoint
+				</button>
+				{#if advancedOpen}
+					<div data-testid="mcp-advanced-body">
+						<p class="pt-1 pb-1.5 text-[11px] leading-relaxed text-base-content/50">
+							For a generic MCP client (MCP Inspector, a custom SDK client) pointed straight at
+							this instance's live Streamable-HTTP endpoint. The port changes every launch.
+						</p>
+						<div class="flex items-center gap-1 rounded-lg border border-base-300 bg-base-100 p-1.5">
+							<code class="min-w-0 flex-1 truncate px-1 font-mono text-xs text-primary" title={mcp.url} data-testid="mcp-url">{mcp.url}</code>
+							<button
+								class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
+								onclick={() => copy('url', mcp.url)}
+								title="Copy MCP URL"
+								aria-label="Copy MCP URL"
+								data-testid="mcp-copy-url"
+							>
+								{#if copied === 'url'}
+									<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+								{:else}
+									<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+								{/if}
+							</button>
+						</div>
+
+						<div class="mt-2 flex items-center justify-between">
+							<span class="text-[10px] uppercase tracking-wide text-base-content/40">config snippet</span>
+							<button class="btn btn-ghost btn-xs h-5 min-h-0 gap-1 px-1.5 text-[11px] font-normal text-base-content/50 hover:text-base-content" onclick={() => copy('snippet', mcpSnippet)} data-testid="mcp-copy-snippet">
+								{copied === 'snippet' ? 'copied' : 'copy'}
+							</button>
+						</div>
+						<pre class="mt-1 overflow-x-auto rounded-lg border border-base-300 bg-base-100 p-2 font-mono text-[11px] leading-relaxed text-base-content/70" data-testid="mcp-snippet">{mcpSnippet}</pre>
+					</div>
+				{/if}
 			{/if}
 		</div>
 	{/if}
