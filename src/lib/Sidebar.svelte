@@ -201,7 +201,7 @@
 		const walk = (nodes, depth) => {
 			for (const n of nodes) {
 				const isCollapsed = collapsed.has(n.key);
-				rows.push({ text: n.text, level: n.level, cellId: n.cellId, key: n.key, depth, hasChildren: n.children.length > 0, collapsed: isCollapsed });
+				rows.push({ text: n.text, level: n.level, cellId: n.cellId, key: n.key, rowKey: `${rows.length}:${n.key}`, depth, hasChildren: n.children.length > 0, collapsed: isCollapsed });
 				if (n.children.length && !isCollapsed) walk(n.children, depth + 1);
 			}
 		};
@@ -405,7 +405,7 @@
 	</div>
 	{#if open.outline}
 		<div class="px-2 pb-2" data-testid="outline-body">
-			{#each outlineRows as item (item.key)}
+			{#each outlineRows as item (item.rowKey)}
 				<div class="flex items-center" style="padding-left: {item.depth * 12}px">
 					{#if item.hasChildren}
 						<button

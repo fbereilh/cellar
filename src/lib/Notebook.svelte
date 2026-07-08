@@ -76,7 +76,7 @@
 		{#each cells as cell, i (cell.id)}
 			<div
 				role="presentation"
-				class="relative {dragId === cell.id ? 'opacity-40' : ''}"
+				class="relative"
 				ondragover={(e) => onDragOverCell(e, i)}
 				ondrop={(e) => onDropCell(e, i)}
 			>
