@@ -1,9 +1,14 @@
 import { json } from '@sveltejs/kit';
-import { moveCell } from '$lib/server/notebook.js';
+import { moveCell, moveCellTo } from '$lib/server/notebook.js';
 
-/** Move a cell up or down. Body: { dir: 'up' | 'down', nb?: string }. */
+/**
+ * Move a cell. Body: { toIndex: number, nb? } for an absolute-index move
+ * (drag-to-reorder), or { dir: 'up' | 'down', nb? } for a step move
+ * (keyboard / toolbar buttons). Both persist via the shared move logic.
+ */
 export async function POST({ params, request }) {
-	const { dir, nb } = await request.json();
-	moveCell(params.id, dir === 'up' ? 'up' : 'down', nb);
+	const { dir, toIndex, nb } = await request.json();
+	if (Number.isInteger(toIndex)) moveCellTo(params.id, toIndex, nb);
+	else moveCell(params.id, dir === 'up' ? 'up' : 'down', nb);
 	return json({ ok: true });
 }

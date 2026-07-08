@@ -132,7 +132,7 @@ function docFor(nb) {
 	return doc;
 }
 
-const cellView = (c) => ({ id: c.id, cell_type: c.cell_type, source: c.source, outputs: c.outputs });
+const cellView = (c) => ({ id: c.id, cell_type: c.cell_type, source: c.source, outputs: c.outputs, metadata: c.metadata ?? {} });
 
 /** Serializable view of a notebook for the browser. */
 export function getNotebook(nb) {
@@ -204,6 +204,23 @@ export function setVisibility(id, hidden, nb) {
 	cell.metadata = cell.metadata ?? {};
 	cell.metadata.cellar = cell.metadata.cellar ?? {};
 	cell.metadata.cellar.hidden_from_agent = !!hidden;
+	persist(doc);
+	return true;
+}
+
+/**
+ * Persist a cell's "scroll outputs" choice in the allowlisted `cellar`
+ * namespace so it round-trips through clean-on-save. `null`/`undefined` clears
+ * the explicit choice (falls back to the UI's auto height heuristic).
+ */
+export function setOutputScrolled(id, scrolled, nb) {
+	const doc = docFor(nb);
+	const cell = find(doc, id);
+	if (!cell) return false;
+	cell.metadata = cell.metadata ?? {};
+	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	if (scrolled === null || scrolled === undefined) delete cell.metadata.cellar.output_scrolled;
+	else cell.metadata.cellar.output_scrolled = !!scrolled;
 	persist(doc);
 	return true;
 }
