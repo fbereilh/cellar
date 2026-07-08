@@ -401,7 +401,7 @@
 
 			{#each fileTabs as tab (tab.id)}
 				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
-					<FileTab path={tab.path} onDirty={onFileDirty} />
+					<FileTab path={tab.path} onDirty={onFileDirty} {theme} />
 				</div>
 			{/each}
 
