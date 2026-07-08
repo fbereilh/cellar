@@ -39,7 +39,7 @@ function runStatus(root) {
 	return new Promise((resolve) => {
 		execFile(
 			'git',
-			['-C', root, 'status', '--porcelain=v1', '--untracked-files=all', '-z'],
+			['-C', root, 'status', '--porcelain=v1', '--untracked-files=all', '-z', '--', '.'],
 			{ maxBuffer: 8 * 1024 * 1024 },
 			(err, stdout) => {
 				if (err) {
