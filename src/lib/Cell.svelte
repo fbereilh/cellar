@@ -59,7 +59,27 @@
 	import MarkdownIt from 'markdown-it';
 	import DOMPurify from 'dompurify';
 
-	let { cell, index, count, running, theme = 'dim', onRun, onRunAdvance, onClear, onDelete, onMove, onEdit, onSetType, onReady } = $props();
+	let {
+		cell,
+		index,
+		count,
+		running,
+		active = false,
+		dragging = false,
+		theme = 'dim',
+		onRun,
+		onRunAdvance,
+		onClear,
+		onDelete,
+		onMove,
+		onEdit,
+		onSetType,
+		onSetScrolled,
+		onActivate,
+		onReady,
+		onDragStart,
+		onDragEnd
+	} = $props();
 
 	let editorEl;
 	let view;
@@ -98,25 +118,92 @@
 	const stripAnsi = (s) => s.replace(ANSI, '');
 	const asText = (s) => (Array.isArray(s) ? s.join('') : (s ?? ''));
 
-	// Map an nbformat output object to a renderable line {tone, text}.
+	// A markdown-table separator row: pipes, dashes, colons, spaces, ≥1 dash.
+	const TABLE_SEP = /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/;
+	const isTableRow = (l) => l.includes('|') && l.trim() !== '';
+	// Split plain text into segments: contiguous markdown tables (header row +
+	// separator row + body rows) become {type:'table'}; everything else stays
+	// {type:'text'}. A table needs a header line immediately followed by a
+	// separator line, so ordinary pipe-containing text is left untouched.
+	function textSegments(text) {
+		const lines = text.split('\n');
+		const segs = [];
+		let buf = [];
+		const flush = () => {
+			if (buf.length) segs.push({ type: 'text', text: buf.join('\n') });
+			buf = [];
+		};
+		for (let i = 0; i < lines.length; i++) {
+			if (isTableRow(lines[i]) && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]) && lines[i + 1].includes('|')) {
+				let j = i + 2;
+				while (j < lines.length && isTableRow(lines[j])) j++;
+				flush();
+				segs.push({ type: 'table', html: renderTable(lines.slice(i, j).join('\n')) });
+				i = j - 1;
+			} else {
+				buf.push(lines[i]);
+			}
+		}
+		flush();
+		return segs;
+	}
+	// Render a markdown table to sanitized HTML, then apply daisyUI table classes.
+	function renderTable(src) {
+		if (!browser) return '';
+		const html = DOMPurify.sanitize(md.render(src));
+		return html.replace(/<table>/g, '<table class="table table-zebra table-xs">');
+	}
+
+	// Map an nbformat output object to a renderable {tone, text, segments}. Text
+	// outputs (stdout / stderr / result) carry parsed segments so embedded
+	// markdown tables render as real tables; errors stay raw monospace.
 	function renderOutput(o) {
+		let tone, text;
 		switch (o.output_type) {
 			case 'stream':
-				return { tone: o.name === 'stderr' ? 'stderr' : 'stdout', text: asText(o.text) };
+				tone = o.name === 'stderr' ? 'stderr' : 'stdout';
+				text = asText(o.text);
+				break;
 			case 'execute_result':
 			case 'display_data': {
 				const d = o.data || {};
-				if (d['text/plain']) return { tone: 'result', text: asText(d['text/plain']) };
-				const img = Object.keys(d).find((k) => k.startsWith('image/'));
-				return { tone: 'result', text: img ? `[${img} output]` : '[rich output]' };
+				if (d['text/plain']) {
+					tone = 'result';
+					text = asText(d['text/plain']);
+				} else {
+					const img = Object.keys(d).find((k) => k.startsWith('image/'));
+					return { tone: 'result', text: img ? `[${img} output]` : '[rich output]', segments: null };
+				}
+				break;
 			}
 			case 'error':
-				return { tone: 'error', text: stripAnsi((o.traceback || [o.ename + ': ' + o.evalue]).join('\n')) };
+				return { tone: 'error', text: stripAnsi((o.traceback || [o.ename + ': ' + o.evalue]).join('\n')), segments: null };
 			default:
-				return { tone: 'stdout', text: '' };
+				return { tone: 'stdout', text: '', segments: null };
 		}
+		const segments = textSegments(text);
+		// Only keep segment rendering when a table was actually found; otherwise a
+		// single plain-text segment renders identically to the old monospace pre.
+		return { tone, text, segments: segments.some((s) => s.type === 'table') ? segments : null };
 	}
 	const outputs = $derived((cell.outputs || []).map(renderOutput));
+
+	// ---- Scrollable / contracted outputs ------------------------------------
+	// Per-cell choice persisted in `cell.metadata.cellar.output_scrolled`
+	// (undefined = auto, true = force scrolled, false = force full). Above a
+	// height threshold we auto-scroll unless the user set an explicit choice.
+	const SCROLL_THRESHOLD = 360; // px of output beyond which we contract by default
+	let outputInner = $state(null);
+	let outputTall = $state(false);
+	const explicitScrolled = $derived(cell.metadata?.cellar?.output_scrolled);
+	const scrolled = $derived(explicitScrolled ?? outputTall);
+	$effect(() => {
+		cell.outputs; // re-measure whenever outputs change
+		if (outputInner) outputTall = outputInner.scrollHeight > SCROLL_THRESHOLD;
+	});
+	function toggleScrolled() {
+		onSetScrolled?.(cell.id, !scrolled);
+	}
 
 	const toneClass = {
 		stdout: 'text-base-content border-transparent',
@@ -206,11 +293,35 @@
 	});
 </script>
 
-<div class="card border border-base-300 bg-base-100 shadow-sm" data-testid="cell" data-cell-id={cell.id} data-cell-type={cell.cell_type}>
+<div
+	class="card relative overflow-hidden border bg-base-100 shadow-sm transition-colors {active ? 'border-primary/50 ring-1 ring-primary/40' : 'border-base-300'} {dragging ? 'opacity-40' : ''}"
+	data-testid="cell"
+	data-cell-id={cell.id}
+	data-cell-type={cell.cell_type}
+	data-active={active ? 'true' : undefined}
+	role="presentation"
+	onfocusin={() => onActivate?.(cell.id)}
+	onpointerdown={() => onActivate?.(cell.id)}
+>
+	<!-- Active-cell accent bar (VS Code / Jupyter style); no layout shift. -->
+	{#if active}
+		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 bg-primary" data-testid="active-bar"></div>
+	{/if}
 	<div class="card-body gap-0 p-0">
 		<!-- Cell toolbar -->
 		<div class="flex items-center justify-between border-b border-base-300 px-2 py-1">
 			<div class="flex items-center gap-0.5">
+				<button
+					class="btn btn-ghost btn-xs btn-square cursor-grab text-base-content/30 hover:text-base-content/70 active:cursor-grabbing"
+					draggable="true"
+					ondragstart={(e) => onDragStart?.(e, cell.id)}
+					ondragend={onDragEnd}
+					title="Drag to reorder cell"
+					aria-label="Drag to reorder cell"
+					data-testid="drag-handle"
+				>
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6" /><circle cx="15" cy="6" r="1.6" /><circle cx="9" cy="12" r="1.6" /><circle cx="15" cy="12" r="1.6" /><circle cx="9" cy="18" r="1.6" /><circle cx="15" cy="18" r="1.6" /></svg>
+				</button>
 				<button
 					class="btn btn-ghost btn-xs btn-square text-success"
 					onclick={() => doRun(false)}
@@ -294,10 +405,40 @@
 
 		<!-- Output (code cells only) -->
 		{#if !isMarkdown && outputs.length}
-			<div class="space-y-0.5 border-t border-base-300 py-2" data-testid="output">
-				{#each outputs as o}
-					<pre class="overflow-x-auto whitespace-pre-wrap break-words border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{o.text}</pre>
-				{/each}
+			<div class="relative border-t border-base-300" data-testid="output">
+				<!-- Scroll-outputs toggle (Jupyter "Enable Scrolling for Outputs"). -->
+				<button
+					class="btn btn-ghost btn-xs absolute right-1 top-1 z-10 h-5 min-h-0 gap-1 px-1.5 text-[10px] font-normal text-base-content/40 hover:text-base-content/80"
+					onclick={toggleScrolled}
+					title={scrolled ? 'Expand output (show full height)' : 'Scroll output (contract to a fixed height)'}
+					data-testid="output-scroll-toggle"
+					aria-pressed={scrolled}
+				>
+					{#if scrolled}
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 15l5 5 5-5M7 9l5-5 5 5" /></svg>
+						expand
+					{:else}
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 8l-5-5-5 5M17 16l-5 5-5-5" /></svg>
+						scroll
+					{/if}
+				</button>
+				<div class="{scrolled ? 'max-h-[22rem] overflow-y-auto' : ''}" data-testid="output-scroll" data-scrolled={scrolled ? 'true' : undefined}>
+					<div bind:this={outputInner} class="space-y-0.5 py-2">
+						{#each outputs as o}
+							{#if o.segments}
+								{#each o.segments as seg}
+									{#if seg.type === 'table'}
+										<div class="cellar-output-table overflow-x-auto px-3 py-1" data-testid="output-table">{@html seg.html}</div>
+									{:else if seg.text.trim()}
+										<pre class="overflow-x-auto whitespace-pre-wrap break-words border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{seg.text}</pre>
+									{/if}
+								{/each}
+							{:else}
+								<pre class="overflow-x-auto whitespace-pre-wrap break-words border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{o.text}</pre>
+							{/if}
+						{/each}
+					</div>
+				</div>
 			</div>
 		{/if}
 	</div>

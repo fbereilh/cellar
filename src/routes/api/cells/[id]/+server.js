@@ -1,12 +1,14 @@
 import { json } from '@sveltejs/kit';
-import { setSource, setCellType, deleteCell } from '$lib/server/notebook.js';
+import { setSource, setCellType, deleteCell, setOutputScrolled } from '$lib/server/notebook.js';
 
-/** Edit a cell's source and/or its type ('code' | 'markdown') in notebook `nb`
- *  (body field; workspace-relative path, defaults to the active notebook). */
+/** Edit a cell's source, type ('code' | 'markdown'), and/or its output-scroll
+ *  choice in notebook `nb` (body field; workspace-relative path, defaults to
+ *  the active notebook). */
 export async function PATCH({ params, request }) {
 	const body = await request.json();
 	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb);
 	if (body.cell_type) setCellType(params.id, body.cell_type, body.nb);
+	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
 	return json({ ok: true });
 }
 

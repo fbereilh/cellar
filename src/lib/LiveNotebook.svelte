@@ -14,6 +14,11 @@
 	let fetching = $state(true); // loading the notebook's cells from the server
 	let loadError = $state('');
 	let runningId = $state(null); // the cell running in THIS notebook (≤1)
+	let activeId = $state(null); // the selected/focused cell (visual emphasis)
+
+	function setActive(id) {
+		activeId = id;
+	}
 
 	// Each Cell registers a focus fn (by id) so Shift+Enter / move can advance focus.
 	const focusers = {};
@@ -168,6 +173,42 @@
 		});
 	}
 
+	// Drag-to-reorder: move a cell to an absolute index. Reuses the server's
+	// `moveCellTo` (via the move route's `toIndex`) so a drag persists exactly
+	// like a keyboard/toolbar move and stays git-clean on save.
+	async function moveCellToIndex(id, toIndex) {
+		const from = cells.findIndex((c) => c.id === id);
+		if (from < 0) return;
+		let to = Math.max(0, Math.min(toIndex, cells.length - 1));
+		if (to === from) return;
+		const next = [...cells];
+		const [cell] = next.splice(from, 1);
+		next.splice(to, 0, cell);
+		cells = next;
+		await fetch(`/api/cells/${id}/move`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ toIndex: cells.findIndex((c) => c.id === id), nb: path })
+		});
+	}
+
+	// Persist a cell's "scroll outputs" choice (undefined = auto height, true =
+	// force scrolled, false = force full) in the `cellar` metadata namespace.
+	async function setScrolled(id, scrolled) {
+		const cell = findCell(id);
+		if (cell) {
+			cell.metadata = cell.metadata ?? {};
+			cell.metadata.cellar = cell.metadata.cellar ?? {};
+			if (scrolled === null || scrolled === undefined) delete cell.metadata.cellar.output_scrolled;
+			else cell.metadata.cellar.output_scrolled = scrolled;
+		}
+		await fetch(`/api/cells/${id}`, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ scrolled: scrolled ?? null, nb: path })
+		});
+	}
+
 	async function addCell(afterId, cellType = 'code') {
 		const res = await fetch('/api/cells', {
 			method: 'POST',
@@ -175,7 +216,7 @@
 			body: JSON.stringify({ afterId, cellType, nb: path })
 		});
 		const { cell } = await res.json();
-		const view = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs };
+		const view = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs, metadata: cell.metadata ?? {} };
 		if (afterId) {
 			const i = cells.findIndex((c) => c.id === afterId);
 			cells = [...cells.slice(0, i + 1), view, ...cells.slice(i + 1)];
@@ -213,6 +254,7 @@
 		e.preventDefault();
 		e.stopPropagation();
 		const id = host.dataset.cellId;
+		setActive(id);
 		moveCell(id, e.key === 'ArrowUp' ? 'up' : 'down');
 		// Reordering moves the editor's DOM node and drops focus; restore it so
 		// moves chain and the shortcut keeps acting on "the selected cell".
@@ -236,13 +278,17 @@
 		{cells}
 		{theme}
 		runningId={runningId}
+		{activeId}
 		onRun={runCell}
 		onRunAdvance={runAndAdvance}
 		onClear={clearCell}
 		onDelete={deleteCell}
 		onMove={moveCell}
+		onMoveToIndex={moveCellToIndex}
 		onEdit={editCell}
 		onSetType={setType}
+		onSetScrolled={setScrolled}
+		onActivate={setActive}
 		onReady={registerFocus}
 		onAddCell={addCell}
 	/>
