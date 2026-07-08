@@ -18,10 +18,12 @@ import {
 	setOutputs,
 	deleteCell,
 	moveCellTo,
-	setVisibility
+	setVisibility,
+	getActiveNotebookPath
 } from '../notebook.js';
 import { execute, restartKernel, interruptKernel, kernelStatus } from '../kernel.js';
 import { kernelState } from '../inspect.js';
+import { publish } from '../events.js';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -312,21 +314,47 @@ export function setCellVisibility(id, hidden) {
 
 // --- execute ----------------------------------------------------------------
 
-async function runSource(source) {
+async function runSource(source, onOutput) {
 	const outputs = [];
 	const reply = await execute(source, (ev) => {
-		if (ev.type === 'output') outputs.push(ev.output);
+		if (ev.type === 'output') {
+			outputs.push(ev.output);
+			onOutput?.(ev.output);
+		}
 	});
 	return { outputs, status: reply?.status ?? 'ok' };
 }
 
-/** Run one cell by id; markdown cells are skipped (no kernel). */
+/**
+ * Run one cell by id; markdown cells are skipped (no kernel).
+ *
+ * Broadcasts the run lifecycle (`run:start` / `run:output` per streamed chunk /
+ * `run:end`) over the event bus tagged `actor:'agent'`, so an already-open
+ * browser shows this agent-driven run — running indicator + streaming outputs —
+ * with no reload. `runCells`/`runAll`/`runRange` all funnel through here, so
+ * every MCP run path broadcasts.
+ */
 export async function runCell(id) {
 	const c = getCell(id);
 	if (!c) return null;
 	if (c.cell_type !== 'code') return { id, status: 'skipped', note: 'not a code cell' };
-	const { outputs, status } = await runSource(c.source || '');
+	const nb = getActiveNotebookPath();
+	const startedAt = Date.now();
+	publish({ type: 'run:start', nb, cellId: id, actor: 'agent', at: startedAt });
+	let outputs = [];
+	let status = 'ok';
+	try {
+		const res = await runSource(c.source || '', (output) => publish({ type: 'run:output', nb, cellId: id, output }));
+		outputs = res.outputs;
+		status = res.status;
+	} catch (err) {
+		const output = { output_type: 'error', ename: 'CellarError', evalue: String(err?.message ?? err), traceback: [String(err?.message ?? err)] };
+		outputs = [output];
+		publish({ type: 'run:output', nb, cellId: id, output });
+		status = 'error';
+	}
 	setOutputs(id, outputs);
+	publish({ type: 'run:end', nb, cellId: id, actor: 'agent', at: Date.now(), durationMs: Date.now() - startedAt, status });
 	const hiddenNote = isHidden(c) ? { hidden: true } : {};
 	return { id, status, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 }

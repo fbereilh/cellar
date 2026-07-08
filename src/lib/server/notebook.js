@@ -170,6 +170,16 @@ export function getActiveNotebookPath() {
 	return activePath || canonicalPath();
 }
 
+/**
+ * Resolve a notebook path argument (workspace-relative or absolute, or nullish
+ * for the active notebook) to its canonical absolute id — the same key the
+ * `docs` Map uses and that `getNotebook().path` reports. Callers publishing live
+ * events use this so the `nb` tag matches the id the browser filters on.
+ */
+export function resolveNotebookPath(nb) {
+	return resolveAbs(nb);
+}
+
 function find(doc, id) {
 	return doc.cells.find((c) => c.id === id);
 }
