@@ -65,6 +65,19 @@ npm link          # makes `cellar` available on your PATH (or: npx .)
 `npm run build` also runs automatically on `npm pack`/`npm publish`
 (`prepack`/`prepublishOnly`).
 
+### Quick start / updating (Makefile)
+
+A root `Makefile` wraps the commands above. Run `make` (no target) to list them.
+
+```sh
+make setup     # first-time install: npm install + build + npm link
+make update    # pull the latest, reinstall deps, and rebuild
+```
+
+`make setup` links `cellar` onto your PATH once; that link persists across
+rebuilds, so `make update` (pull → install → build) is all you need to move the
+already-linked `cellar` to the new version. See `make run` / `make dev` to run.
+
 ## Run it
 
 From **any project directory** you want to open as the workspace:
