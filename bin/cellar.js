@@ -287,7 +287,13 @@ async function main() {
 			`--ServerApp.root_dir=${WORKSPACE}`,
 			'--ServerApp.disable_check_xsrf=True'
 		],
-		{ cwd: REPO, env: { ...process.env, JUPYTER_PATH: jupyterDir }, stdio: ['ignore', 'inherit', 'inherit'] }
+		// cwd must agree with root_dir: a kernel started without a notebook path
+		// (kernel.js `startNew({name:'python3'})`) inherits the sidecar's process
+		// cwd, so anchoring it at WORKSPACE (not REPO) is what makes os.getcwd(),
+		// relative reads/writes, and repo-root walks resolve in the user's project
+		// rather than Cellar's install dir. All args/env here are absolute paths
+		// (host python, JUPYTER_PATH temp dir), so they still resolve.
+		{ cwd: WORKSPACE, env: { ...process.env, JUPYTER_PATH: jupyterDir }, stdio: ['ignore', 'inherit', 'inherit'] }
 	);
 	children.push(jupyter);
 	jupyter.on('exit', (c) => {
