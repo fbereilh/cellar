@@ -64,6 +64,36 @@ export async function restartKernel() {
 	return { status: kernel.status, id: kernel.id };
 }
 
+/**
+ * Rebind onto a freshly-written kernelspec (e.g. after the Settings venv
+ * control points the `python3` spec at a different interpreter). A plain
+ * `restart()` reuses the kernel's original launch argv, so it would NOT switch
+ * interpreters — we must tear the kernel down so the next start re-reads the
+ * kernelspec from disk and launches the newly-bound python. The connection,
+ * backend, MCP session, and document are untouched.
+ *
+ * If no kernel is running yet, we only clear cached state; the next execute()
+ * naturally picks up the new spec.
+ */
+export async function rebindKernel() {
+	const wasRunning = !!currentKernel;
+	if (currentKernel) {
+		try {
+			await currentKernel.shutdown();
+		} catch {}
+	}
+	try {
+		manager?.dispose();
+	} catch {}
+	manager = null;
+	kernelPromise = null;
+	currentKernel = null;
+	liveKernel = null;
+	if (!wasRunning) return { status: 'not_started', id: null };
+	const kernel = await getKernel();
+	return { status: kernel.status, id: kernel.id };
+}
+
 /** Interrupt the running kernel (SIGINT equivalent). */
 export async function interruptKernel() {
 	const kernel = await getKernel();

@@ -45,43 +45,68 @@ namespace; notebook: `kernelspec` — drops `language_info`/`widgets`), normaliz
 
 - Node 18+ (built/tested on Node 26; uses global `fetch`/`WebSocket`)
 - Python 3.9+
+- [`uv`](https://docs.astral.sh/uv/) on your `PATH` — Cellar uses it for **all**
+  virtualenv creation and package installs (`uv venv`, `uv pip install`). It is
+  a hard requirement; if it is missing, `cellar` fails fast with an install
+  hint rather than falling back to `python -m venv`/`pip`. `uv` discovers or
+  downloads a suitable CPython itself, so you do not need a system `python3` for
+  the created venvs.
 
-## First-time setup
+## Install
+
+Cellar ships as an npm package. From a clone:
 
 ```sh
-# 1. Node deps
 npm install
-
-# 2. Python sidecar (Jupyter kernel service) in a local venv
-python3 -m venv .venv
-./.venv/bin/pip install jupyter-server ipykernel
-./.venv/bin/python -m ipykernel install --sys-prefix --name python3 --display-name "Python 3 (Cellar)"
+npm run build     # emits the adapter-node production server into build/
+npm link          # makes `cellar` available on your PATH (or: npx .)
 ```
+
+`npm run build` also runs automatically on `npm pack`/`npm publish`
+(`prepack`/`prepublishOnly`).
 
 ## Run it
 
-From any folder you want as the workspace:
+From **any project directory** you want to open as the workspace:
 
 ```sh
-node /path/to/cellar/bin/cellar.js
-```
-
-or, from within this repo:
-
-```sh
-npm run cellar
+cellar                    # opens the current directory
+cellar ../other-repo      # or: cellar --workspace ../other-repo
 ```
 
 That single command:
 
-1. starts the Jupyter kernel sidecar (headless, scoped to the current folder),
-2. starts the SvelteKit server, and
-3. opens your default browser to the UI.
+1. **Resolves the project's Python venv** — first match wins:
+   `--venv`/`$CELLAR_VENV` → active `$VIRTUAL_ENV` → `<workspace>/.venv` → else
+   **create** `<workspace>/.venv` (with `uv`). It ensures `ipykernel` is present
+   there, installing it if missing. The kernel then runs in **that** interpreter.
+2. Ensures Cellar's own private Jupyter host env (`~/.cellar/host-venv`, holding
+   the heavy `jupyter-server`), created and cached on first run — so your project
+   `.venv` only ever gets the lightweight `ipykernel`.
+3. Starts the Jupyter sidecar (host env, kernel bound to the project python via a
+   per-run kernelspec) and the SvelteKit server, then opens the browser. The
+   app, Jupyter, and MCP ports are all allocated dynamically, so multiple
+   `cellar` instances in different repos run side by side. The resolved app +
+   MCP URLs are printed on startup.
+
+Creating a `.venv` or installing `ipykernel` into your project **prompts for
+confirmation** on a TTY (printing exactly what will run); reusing an existing
+venv that already has `ipykernel` is silent.
+
+Flags:
+
+| Flag | Effect |
+|---|---|
+| `[path]` / `--workspace <dir>` | Open another directory without `cd`-ing |
+| `--venv <dir>` (or `$CELLAR_VENV`) | Use this venv verbatim (created if missing) |
+| `--python <path>` | Escape hatch: bind an arbitrary interpreter, no create/install |
+| `--yes` / `-y` | Auto-approve venv create / ipykernel install (implied when non-interactive / `$CI`) |
+| `--dev` | Run the Vite dev server instead of the production build |
+
+You can also switch or create the bound venv at runtime from **Settings → Python
+environment** in the app; it re-resolves/creates via `uv` and rebinds the kernel.
 
 Ctrl-C stops both servers.
-
-Add `--build` to serve the production build (`npm run build` first) instead of
-the Vite dev server.
 
 ## Agent interface (MCP)
 
@@ -89,7 +114,9 @@ Cellar exposes an **MCP server** (the agent interface, spec §4) in-process in t
 backend, over Streamable HTTP:
 
 ```
-http://127.0.0.1:39587/mcp          # override the port with CELLAR_MCP_PORT
+http://127.0.0.1:<mcpPort>/mcp      # port printed on startup; the launcher
+                                    # allocates a free one per instance and
+                                    # passes it via CELLAR_MCP_PORT
 ```
 
 Because it shares the live notebook document + kernel with the UI and is

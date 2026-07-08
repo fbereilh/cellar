@@ -381,7 +381,17 @@
 	</footer>
 </div>
 
-<Settings open={settingsOpen} {theme} onClose={() => (settingsOpen = false)} onSetTheme={applyTheme} />
+<Settings
+	open={settingsOpen}
+	{theme}
+	onClose={() => (settingsOpen = false)}
+	onSetTheme={applyTheme}
+	onVenvRebound={() => {
+		// New interpreter → namespace is empty; drop stale inspector rows and refresh status.
+		variables = [];
+		refreshKernel();
+	}}
+/>
 
 <style>
 	:global(.cellar-flash) {

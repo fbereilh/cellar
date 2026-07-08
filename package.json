@@ -1,16 +1,25 @@
 {
   "name": "cellar",
-  "version": "0.0.1-spike",
-  "private": true,
+  "version": "0.1.0",
   "type": "module",
   "bin": {
     "cellar": "bin/cellar.js"
+  },
+  "files": [
+    "build/",
+    "bin/",
+    "src/lib/server/venv.js"
+  ],
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
-    "cellar": "node bin/cellar.js"
+    "cellar": "node bin/cellar.js",
+    "prepack": "vite build",
+    "prepublishOnly": "vite build"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.2.9",
