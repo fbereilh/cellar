@@ -126,6 +126,18 @@
 		tabs = tabs.filter((t) => t.id !== id);
 		if (activeTabId === id) {
 			activeTabId = (tabs[idx - 1] ?? tabs[0] ?? null)?.id ?? null;
+			// If no notebook tab is active now (a file tab, or nothing), no
+			// LiveNotebook `active` effect fires to move the server active pointer,
+			// so the agent-facing MCP tools would keep defaulting to the just-closed
+			// notebook. Reset the active notebook to the canonical default.
+			const nextTab = tabs.find((t) => t.id === activeTabId) ?? null;
+			if (nextTab?.kind !== 'notebook' && nextTab?.kind !== 'ipynb') {
+				fetch('/api/notebooks', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ path: canonicalNotebookRel })
+				}).catch(() => {});
+			}
 		}
 	}
 

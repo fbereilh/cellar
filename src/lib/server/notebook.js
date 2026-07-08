@@ -145,6 +145,15 @@ export function getNotebook(nb) {
 }
 
 /**
+ * Serializable view of the canonical default notebook (`notebook.ipynb`),
+ * regardless of the current active pointer. SSR seeds the shell (notebook tab,
+ * path/name) from this, so it must never follow `activePath`.
+ */
+export function getDefaultNotebook() {
+	return getNotebook(canonicalPath());
+}
+
+/**
  * Make `nb` the active notebook the agent-facing tools default to (loading it
  * if needed) and return its view. The UI calls this when a notebook tab is
  * focused so the MCP interface follows the human's attention.

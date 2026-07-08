@@ -73,7 +73,10 @@
 			await editCell(id, source);
 			return;
 		}
-		if (busy) return; // single shared kernel → one cell runs at a time, app-wide
+		// Single shared kernel → one cell runs at a time, app-wide. `runningId` is
+		// set synchronously below so a rapid double run can't slip through before
+		// `busy` (an async-propagated prop) reflects this notebook's own run.
+		if (busy || runningId) return;
 		runningId = id;
 		onRunStart?.(path, id);
 		cell.source = source;
