@@ -236,6 +236,35 @@
 		}
 	}
 
+	// Interrupt / restart the active kernel. Both reuse the exact kernel.js path
+	// the MCP agent interface proved: restart keeps the same session (document
+	// intact) while clearing the namespace.
+	let kernelBusy = $state(false);
+	async function interruptKernel() {
+		if (kernelBusy) return;
+		kernelBusy = true;
+		try {
+			await fetch('/api/kernel/interrupt', { method: 'POST' });
+		} catch {}
+		finally {
+			kernelBusy = false;
+			refreshKernel();
+		}
+	}
+	async function restartKernel() {
+		if (kernelBusy) return;
+		kernelBusy = true;
+		try {
+			await fetch('/api/kernel/restart', { method: 'POST' });
+			// Namespace is cleared on restart — drop the now-stale inspector rows.
+			variables = [];
+		} catch {}
+		finally {
+			kernelBusy = false;
+			refreshKernel();
+		}
+	}
+
 	// ---- Theme ---------------------------------------------------------------
 	function applyTheme(t) {
 		theme = t;
@@ -243,6 +272,29 @@
 		try {
 			localStorage.setItem('cellar-theme', t);
 		} catch {}
+	}
+
+	// Cmd+Shift+Arrow (Ctrl+Shift+Arrow off mac) moves the focused cell up/down.
+	// Handled in the capture phase so it wins over CodeMirror's own arrow
+	// bindings and the browser default before they can act.
+	const isMac = typeof navigator !== 'undefined' && /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
+	async function onKeydown(e) {
+		if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+		const primary = isMac ? e.metaKey : e.ctrlKey;
+		const other = isMac ? e.ctrlKey : e.metaKey;
+		if (!primary || !e.shiftKey || e.altKey || other) return;
+		// Act only on the cell that currently holds focus (its editor or chrome).
+		const host = e.target?.closest?.('[data-cell-id]');
+		if (!host) return;
+		e.preventDefault();
+		e.stopPropagation();
+		const id = host.dataset.cellId;
+		moveCell(id, e.key === 'ArrowUp' ? 'up' : 'down');
+		// Reordering the list moves the editor's DOM node and drops focus, so
+		// restore it to the same cell — this is what lets moves chain and keeps
+		// the shortcut acting on "the selected cell" across repeated presses.
+		await tick();
+		focusers[id]?.();
 	}
 
 	onMount(() => {
@@ -259,6 +311,8 @@
 		refreshKernel().then(() => {
 			if (kernelInfo.started) refreshVariables();
 		});
+		window.addEventListener('keydown', onKeydown, true);
+		return () => window.removeEventListener('keydown', onKeydown, true);
 	});
 </script>
 
@@ -280,12 +334,15 @@
 				<Sidebar
 					{cells}
 					kernelInfo={displayKernel}
+					{kernelBusy}
 					{notebookName}
 					{variables}
 					{varsLoading}
 					{varsError}
 					onRefreshVars={refreshVariables}
 					onRefreshKernel={refreshKernel}
+					onInterruptKernel={interruptKernel}
+					onRestartKernel={restartKernel}
 					onOpenFile={openFile}
 					onScrollToCell={scrollToCell}
 				/>

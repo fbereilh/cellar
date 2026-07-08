@@ -7,7 +7,10 @@
 	let { cells, runningId, onRun, onRunAdvance, onClear, onDelete, onMove, onEdit, onSetType, onReady, onAddCell } = $props();
 </script>
 
-<div class="mx-auto max-w-3xl px-4 py-6" data-testid="notebook">
+<!-- Fluid content column: fills the available width up to a readable cap, so
+     cells use more horizontal space on wide monitors without going full-bleed
+     on ultrawide. -->
+<div class="mx-auto w-full max-w-[clamp(48rem,92%,88rem)] px-4 py-6" data-testid="notebook">
 	<div class="space-y-4">
 		{#each cells as cell, i (cell.id)}
 			<Cell

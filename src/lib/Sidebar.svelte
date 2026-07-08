@@ -5,12 +5,15 @@
 	let {
 		cells,
 		kernelInfo,
+		kernelBusy,
 		notebookName,
 		variables,
 		varsLoading,
 		varsError,
 		onRefreshVars,
 		onRefreshKernel,
+		onInterruptKernel,
+		onRestartKernel,
 		onOpenFile,
 		onScrollToCell
 	} = $props();
@@ -139,6 +142,30 @@
 								<svg class="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
 								<span class="truncate font-mono">{notebookName}</span>
 							</div>
+						</div>
+						<!-- Active-kernel controls: stop a running cell / restart the process
+						     (clears the namespace, keeps the session + document). -->
+						<div class="mt-2 flex gap-1.5 border-t border-base-300 pt-2" data-testid="kernel-controls">
+							<button
+								class="btn btn-outline btn-xs flex-1 gap-1"
+								onclick={onInterruptKernel}
+								disabled={!kernelInfo?.started || kernelBusy}
+								title="Interrupt the kernel (stop the running cell)"
+								data-testid="kernel-interrupt"
+							>
+								<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
+								Interrupt
+							</button>
+							<button
+								class="btn btn-outline btn-xs flex-1 gap-1"
+								onclick={onRestartKernel}
+								disabled={!kernelInfo?.started || kernelBusy}
+								title="Restart the kernel (clear the namespace, keep the notebook)"
+								data-testid="kernel-restart"
+							>
+								<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
+								Restart
+							</button>
 						</div>
 					</div>
 				</div>
