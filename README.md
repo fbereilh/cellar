@@ -70,7 +70,7 @@ npm link          # makes `cellar` available on your PATH (or: npx .)
 A root `Makefile` wraps the commands above. Run `make` (no target) to list them.
 
 ```sh
-make setup     # first-time install: npm install + build + npm link
+make setup     # first-time install: npm install + build + chmod +x bin/cellar.js + npm link
 make update    # pull the latest, reinstall deps, and rebuild
 ```
 
