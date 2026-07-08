@@ -30,6 +30,8 @@
 			case 'display_data': {
 				const d = o.data || {};
 				const imgKey = Object.keys(d).find((k) => k.startsWith('image/'));
+				if (imgKey === 'image/svg+xml')
+					return { image: `data:image/svg+xml;utf8,${encodeURIComponent(asText(d[imgKey]))}` };
 				if (imgKey) return { image: `data:${imgKey};base64,${asText(d[imgKey])}` };
 				if (d['text/plain']) return { tone: 'result', text: asText(d['text/plain']) };
 				return { tone: 'result', text: '[rich output]' };

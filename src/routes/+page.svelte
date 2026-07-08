@@ -531,7 +531,7 @@
 				</div>
 			{/each}
 
-			{#if !activeTab}
+			{#if tabsRestored && !activeTab}
 				<!-- Empty state: no tab open (first-ever open, or all tabs closed). -->
 				<div class="flex h-full flex-col items-center justify-center gap-4 text-center" data-testid="empty-state">
 					<div class="text-5xl opacity-30">🍷</div>
