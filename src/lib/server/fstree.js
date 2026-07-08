@@ -99,14 +99,3 @@ export function writeWorkspaceFile(relPath, content) {
 	const abs = resolveInWorkspace(relPath);
 	writeFileSync(abs, content ?? '', 'utf8');
 }
-
-const MAX_NOTEBOOK_BYTES = 16 * 1024 * 1024; // .ipynb can be large (embedded outputs)
-
-/** Read + JSON-parse a workspace `.ipynb` (for the rendered-notebook file view). */
-export function readWorkspaceNotebook(relPath) {
-	const abs = resolveInWorkspace(relPath);
-	const st = statSync(abs);
-	if (!st.isFile()) throw new Error('not a file');
-	if (st.size > MAX_NOTEBOOK_BYTES) throw new Error('notebook too large to open');
-	return JSON.parse(readFileSync(abs, 'utf8'));
-}

@@ -1,4 +1,4 @@
-import { getNotebook } from '$lib/server/notebook.js';
+import { getDefaultNotebook } from '$lib/server/notebook.js';
 
 /** Load the canonical notebook (cells + outputs) for the workspace. */
 export function load() {
@@ -8,7 +8,7 @@ export function load() {
 	// running value rather than a hardcoded port.
 	const mcpPort = Number(process.env.CELLAR_MCP_PORT || 39587);
 	return {
-		notebook: getNotebook(),
+		notebook: getDefaultNotebook(),
 		mcp: { port: mcpPort, url: `http://127.0.0.1:${mcpPort}/mcp` }
 	};
 }

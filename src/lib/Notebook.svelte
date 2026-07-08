@@ -4,7 +4,7 @@
 	// The shell owns the cell array + all cell operations (so the sidebar's
 	// outline/search/inspector can read the same live state); this component is
 	// the pure notebook renderer.
-	let { cells, runningId, onRun, onRunAdvance, onClear, onDelete, onMove, onEdit, onSetType, onReady, onAddCell } = $props();
+	let { cells, runningId, theme = 'dim', onRun, onRunAdvance, onClear, onDelete, onMove, onEdit, onSetType, onReady, onAddCell } = $props();
 </script>
 
 <!-- Fluid content column: fills the available width up to a readable cap, so
@@ -18,6 +18,7 @@
 				index={i}
 				count={cells.length}
 				running={runningId === cell.id}
+				{theme}
 				onRun={onRun}
 				onRunAdvance={onRunAdvance}
 				onClear={onClear}

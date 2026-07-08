@@ -16,19 +16,21 @@ Databricks, the git merge driver, polished editing UX (see `data/cellar-spec.md`
 ## Architecture (as built)
 
 ```
-Browser (Svelte UI)                     src/lib/Cell.svelte + src/routes/+page.svelte
+Browser (Svelte UI)                     +page.svelte shell → LiveNotebook → Cell.svelte
   - one CodeMirror editor per cell; add / run / reorder / delete
   │  ▲
-  │  │  /api/cells… (add, PATCH source, delete, move, clear)
+  │  │  /api/notebooks (open live doc / set active), /api/cells… (add,
+  │  │  PATCH source, delete, move, clear) — each carries the target `nb` path
   │  │  POST /api/cells/:id/run   (NDJSON: outputs stream back live)
   ▼  │
-SvelteKit app (Node) — owns the CANONICAL notebook document
-  - src/lib/server/notebook.js  in-memory doc, stable cell IDs, load/save
+SvelteKit app (Node) — owns the notebook document(s)
+  - src/lib/server/notebook.js  in-memory docs keyed by path (default + any
+                                opened .ipynb), stable cell IDs, load/save
   - src/lib/server/clean.js     clean-on-save field policy (nbdev port)
   - src/lib/server/ipynb.js     deterministic nbformat 4.5 (de)serialization
   - src/lib/server/kernel.js    kernel client via @jupyterlab/services
   │  ▲                                    │
-  │  │ Jupyter REST + WebSocket           ▼  writes notebook.ipynb (workspace)
+  │  │ Jupyter REST + WebSocket           ▼  writes each doc to its own .ipynb
   ▼  │                                  real .ipynb (opens in vanilla Jupyter)
 Jupyter kernel service (Python sidecar) headless jupyter_server, one kernel
   │  ▲
