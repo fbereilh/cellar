@@ -55,7 +55,7 @@
 	const ipynbTabs = $derived(tabs.filter((t) => t.kind === 'ipynb'));
 	const notebookOpen = $derived(tabs.some((t) => t.kind === 'notebook'));
 	const activeTab = $derived(tabs.find((t) => t.id === activeTabId) ?? null);
-	const activeFilePath = $derived(activeTab && activeTab.kind === 'file' ? activeTab.path : null);
+	const activeFilePath = $derived(activeTab && activeTab.kind !== 'notebook' ? activeTab.path : null);
 
 	// Which notebook the sidebar (outline / search / variables) reflects: the
 	// active notebook tab, else the default when a plain file / nothing is active.
