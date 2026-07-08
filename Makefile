@@ -22,6 +22,8 @@ help: ## List available targets
 	@echo "  make help     Show this help (default)"
 
 setup: build ## First-time setup: build, then link 'cellar' onto PATH
+	@echo "==> Ensuring launcher is executable (chmod +x bin/cellar.js)"
+	chmod +x bin/cellar.js
 	@echo "==> Linking 'cellar' onto your PATH (npm link)"
 	npm link
 	@echo "==> Done. Run 'cellar' in any project directory."
