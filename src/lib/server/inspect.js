@@ -157,7 +157,9 @@ export async function inspectVariables() {
  * from-import has no safely reconstructable statement).
  */
 export async function kernelState() {
-	if (kernelStatus().status === 'not_started') return { started: false };
+	const status = kernelStatus().status;
+	if (status === 'not_started') return { started: false };
+	if (status === 'busy') return { started: true, busy: true };
 	const state = await runProbe();
 	const seen = new Set();
 	const imports = [];
