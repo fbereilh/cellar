@@ -54,22 +54,50 @@ function runStatus(root) {
 }
 
 /**
+ * The workspace path relative to the git repo root (e.g. `sub/deep/`, with a
+ * trailing slash, or `''` when the workspace *is* the repo root). Porcelain
+ * paths are repo-root-relative, so we strip this to key the map by the same
+ * workspace-relative paths the file tree uses.
+ */
+function runPrefix(root) {
+	return new Promise((resolve) => {
+		execFile('git', ['-C', root, 'rev-parse', '--show-prefix'], (err, stdout) => {
+			if (err) {
+				resolve('');
+				return;
+			}
+			resolve(stdout.trim());
+		});
+	});
+}
+
+/**
  * Parse NUL-delimited porcelain v1 output into a { relPath: letter } map.
  * Rename entries in `-z` mode emit two NUL-separated fields (new, then orig);
  * we key the new path and skip the trailing original.
+ *
+ * @param {string} stdout NUL-delimited porcelain output.
+ * @param {string} prefix Workspace path relative to the repo root (trailing
+ *   slash), stripped so keys are workspace-relative. Paths outside the
+ *   workspace subtree are dropped.
  */
-function parse(stdout) {
+function parse(stdout, prefix) {
 	const map = {};
 	const parts = stdout.split('\0');
 	for (let i = 0; i < parts.length; i++) {
 		const entry = parts[i];
 		if (!entry) continue;
 		const xy = entry.slice(0, 2);
-		const path = entry.slice(3); // skip "XY "
-		if (!path) continue;
-		map[path] = classify(xy);
+		let path = entry.slice(3); // skip "XY "
 		// A rename/copy carries the original path in the next field — consume it.
 		if (xy[0] === 'R' || xy[0] === 'C') i++;
+		if (!path) continue;
+		if (prefix) {
+			if (!path.startsWith(prefix)) continue; // outside the workspace subtree
+			path = path.slice(prefix.length);
+		}
+		if (!path) continue;
+		map[path] = classify(xy);
 	}
 	return map;
 }
@@ -82,5 +110,6 @@ export async function gitStatus() {
 	const root = workspaceRoot();
 	const stdout = await runStatus(root);
 	if (stdout == null) return { isRepo: false, files: {} };
-	return { isRepo: true, files: parse(stdout) };
+	const prefix = await runPrefix(root);
+	return { isRepo: true, files: parse(stdout, prefix) };
 }
