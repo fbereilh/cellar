@@ -21,6 +21,7 @@ import {
 	setVisibility
 } from '../notebook.js';
 import { execute, restartKernel, interruptKernel, kernelStatus } from '../kernel.js';
+import { kernelState } from '../inspect.js';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -162,6 +163,15 @@ export function getNotebookMap() {
 	}
 	const nb = getNotebook();
 	return { notebook: nb.path, cell_count: cells.length, sections: root };
+}
+
+/**
+ * Live kernel namespace, bucketed into imports / functions / classes /
+ * variables. Returns `{ started: false }` when no kernel is running rather than
+ * forcing a boot.
+ */
+export function getKernelState() {
+	return kernelState();
 }
 
 export function readCell(id) {
