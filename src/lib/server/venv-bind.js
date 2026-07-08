@@ -9,7 +9,7 @@
  * rebinds the kernel (kernel.js `rebindKernel`) so a fresh kernel launches the
  * new interpreter.
  */
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import {
 	hasUv,
 	isValidVenv,
@@ -34,6 +34,7 @@ export async function getVenvInfo() {
 	const python = currentPython();
 	return {
 		python,
+		venvDir: python ? dirname(dirname(python)) : '',
 		workspace: workspace(),
 		defaultVenv: resolve(workspace(), '.venv'),
 		valid: !!python,

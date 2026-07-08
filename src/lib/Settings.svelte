@@ -20,7 +20,7 @@
 		try {
 			const res = await fetch('/api/venv');
 			venv = await res.json();
-			venvPath = venv?.python || '';
+			venvPath = venv?.venvDir || venv?.defaultVenv || '';
 		} catch (err) {
 			error = String(err?.message ?? err);
 		}
@@ -47,7 +47,7 @@
 			const body = await res.json();
 			if (!res.ok || !body.ok) throw new Error(body?.message || 'failed to bind venv');
 			venv = body.info;
-			venvPath = venv?.python || path;
+			venvPath = venv?.venvDir || path;
 			notice = body.created
 				? `Created venv and bound the kernel to it${body.installedIpykernel ? ' (installed ipykernel)' : ''}.`
 				: `Bound the kernel to the selected venv${body.installedIpykernel ? ' (installed ipykernel)' : ''}.`;

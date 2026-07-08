@@ -82,6 +82,10 @@ export async function rebindKernel() {
 			await currentKernel.shutdown();
 		} catch {}
 	}
+	try {
+		manager?.dispose();
+	} catch {}
+	manager = null;
 	kernelPromise = null;
 	currentKernel = null;
 	liveKernel = null;
