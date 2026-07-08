@@ -1,4 +1,6 @@
 <script>
+	import { iconSvg } from '$lib/fileIcons.js';
+
 	let {
 		tabs,
 		activeTabId,
@@ -6,6 +8,7 @@
 		kernelInfo,
 		onSelectTab,
 		onCloseTab,
+		onPromoteTab,
 		onToggleSidebar,
 		onOpenSettings
 	} = $props();
@@ -14,7 +17,7 @@
 	const kernelLabel = $derived(kernelInfo?.started ? kernelInfo.status : 'idle');
 </script>
 
-<header class="flex h-11 items-stretch border-b border-base-300 bg-base-100 text-base-content" data-testid="navbar">
+<header class="flex min-h-11 items-stretch border-b border-base-300 bg-base-100 text-base-content" data-testid="navbar">
 	<!-- Left cluster: sidebar toggle, brand, app menu -->
 	<div class="flex items-center gap-1 border-r border-base-300 px-2">
 		<button
@@ -49,22 +52,20 @@
 		</div>
 	</div>
 
-	<!-- Tab bar -->
-	<div class="flex min-w-0 flex-1 items-stretch overflow-x-auto" data-testid="tabbar">
+	<!-- Tab bar: wraps onto additional rows when the open tabs overflow. -->
+	<div class="flex min-w-0 flex-1 flex-wrap content-start items-stretch" data-testid="tabbar">
 		{#each tabs as tab (tab.id)}
 			<div
-				class="group flex max-w-[220px] shrink-0 items-center gap-1.5 border-r border-base-300 px-3 text-sm {tab.id === activeTabId ? 'bg-base-200 text-base-content' : 'bg-base-100 text-base-content/60 hover:bg-base-200/50'}"
+				class="group flex max-w-[220px] shrink-0 items-center gap-1.5 border-b border-r border-base-300 px-3 text-sm {tab.id === activeTabId ? 'bg-base-200 text-base-content' : 'bg-base-100 text-base-content/60 hover:bg-base-200/50'}"
 				data-testid="tab"
 				data-tab-id={tab.id}
 				data-active={tab.id === activeTabId}
+				data-preview={tab.preview || undefined}
+				ondblclick={() => tab.preview && onPromoteTab?.(tab.id)}
 			>
 				<button class="flex min-w-0 items-center gap-1.5 py-2" onclick={() => onSelectTab(tab.id)}>
-					{#if tab.kind === 'notebook'}
-						<svg class="h-3.5 w-3.5 shrink-0 text-primary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
-					{:else}
-						<svg class="h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg>
-					{/if}
-					<span class="truncate">{tab.title}</span>
+					<span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center">{@html iconSvg(tab.title, { dir: false })}</span>
+					<span class="truncate {tab.preview ? 'italic' : ''}">{tab.title}</span>
 				</button>
 				{#if tab.dirty}
 					<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-warning" title="Unsaved changes" data-testid="tab-dirty"></span>

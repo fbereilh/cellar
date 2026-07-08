@@ -4,6 +4,7 @@
 
 	let {
 		cells,
+		mcp = null,
 		kernelInfo,
 		kernelBusy,
 		notebookName,
@@ -15,11 +16,15 @@
 		onInterruptKernel,
 		onRestartKernel,
 		onOpenFile,
+		onOpenFilePermanent,
+		onOpenNotebook,
+		activeFilePath = null,
+		fsRefreshSignal = 0,
 		onScrollToCell
 	} = $props();
 
-	// Which foldable sections are open. All start expanded.
-	let open = $state({ files: true, kernels: true, outline: true, vars: true, search: false });
+	// Which foldable sections are open. All start expanded (agent panel collapsed).
+	let open = $state({ files: true, kernels: true, agent: false, outline: true, vars: true, search: false });
 	function toggle(k) {
 		open[k] = !open[k];
 	}
@@ -27,6 +32,8 @@
 	// ---- File tree ----------------------------------------------------------
 	let treeRoot = $state(null);
 	let treeError = $state('');
+	// Per-file git status (VS Code-style decorations); {} when not a git repo.
+	let gitFiles = $state({});
 	async function loadTree() {
 		try {
 			const res = await fetch('/api/fs/tree');
@@ -37,7 +44,37 @@
 			treeError = String(err?.message ?? err);
 		}
 	}
-	onMount(loadTree);
+	async function loadGit() {
+		try {
+			const res = await fetch('/api/fs/git');
+			if (!res.ok) return;
+			const body = await res.json();
+			gitFiles = body.isRepo ? body.files : {};
+		} catch {
+			gitFiles = {}; // degrade silently in a non-git workspace
+		}
+	}
+	function refreshFiles() {
+		loadTree();
+		loadGit();
+	}
+	// Refresh git decorations on: mount, manual refresh, saves (parent bumps
+	// fsRefreshSignal), and window focus — matches how VS Code re-reads status.
+	onMount(() => {
+		refreshFiles();
+		const onFocus = () => loadGit();
+		window.addEventListener('focus', onFocus);
+		return () => window.removeEventListener('focus', onFocus);
+	});
+	let firstSignal = true;
+	$effect(() => {
+		fsRefreshSignal; // track
+		if (firstSignal) {
+			firstSignal = false;
+			return;
+		}
+		refreshFiles();
+	});
 
 	// ---- Outline (markdown-header section tree, derived from cells) ---------
 	const HEADING = /^(#{1,6})\s+(.+?)\s*#*\s*$/;
@@ -73,6 +110,24 @@
 		return out;
 	});
 
+	// ---- Connect an agent (live MCP endpoint) -------------------------------
+	// A ready-to-paste config snippet for MCP-speaking agents (Claude Code etc.).
+	const mcpSnippet = $derived(
+		mcp?.url
+			? JSON.stringify({ mcpServers: { cellar: { type: 'http', url: mcp.url } } }, null, 2)
+			: ''
+	);
+	let copied = $state(''); // 'url' | 'snippet' | ''
+	let copyTimer;
+	async function copy(kind, textVal) {
+		try {
+			await navigator.clipboard.writeText(textVal);
+			copied = kind;
+			clearTimeout(copyTimer);
+			copyTimer = setTimeout(() => (copied = ''), 1400);
+		} catch {}
+	}
+
 	function kernelBadge(info) {
 		if (!info?.started) return 'badge-ghost';
 		if (info.status === 'busy' || info.status === 'starting') return 'badge-warning';
@@ -90,7 +145,7 @@
 					<svg class="h-3 w-3 transition-transform {open.files ? 'rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
 					Files
 				</button>
-				<button class="btn btn-ghost btn-xs btn-square mr-1 text-base-content/40" onclick={loadTree} title="Refresh file tree" aria-label="Refresh file tree">
+				<button class="btn btn-ghost btn-xs btn-square mr-1 text-base-content/40" onclick={refreshFiles} title="Refresh file tree" aria-label="Refresh file tree">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
 				</button>
 			</div>
@@ -101,7 +156,7 @@
 					{:else if treeRoot}
 						<p class="truncate px-1 pb-1 text-[11px] text-base-content/40" title={treeRoot.root}>{treeRoot.name}</p>
 						{#each treeRoot.tree as node (node.path)}
-							<FileTreeNode {node} onOpen={onOpenFile} />
+							<FileTreeNode {node} onOpen={onOpenFile} onOpenPermanent={onOpenFilePermanent} {gitFiles} activePath={activeFilePath} />
 						{:else}
 							<p class="px-2 text-xs text-base-content/40">empty workspace</p>
 						{/each}
@@ -138,10 +193,10 @@
 						</div>
 						<div class="mt-2 border-t border-base-300 pt-2 text-xs text-base-content/60">
 							<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40">attached</div>
-							<div class="flex items-center gap-1.5" data-testid="attached-notebook">
+							<button class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-base-300/50" onclick={() => onOpenNotebook?.()} title="Open the notebook" data-testid="attached-notebook">
 								<svg class="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
 								<span class="truncate font-mono">{notebookName}</span>
-							</div>
+							</button>
 						</div>
 						<!-- Active-kernel controls: stop a running cell / restart the process
 						     (clears the namespace, keeps the session + document). -->
@@ -168,6 +223,49 @@
 							</button>
 						</div>
 					</div>
+				</div>
+			{/if}
+		</section>
+
+		<!-- Connect an agent (live MCP endpoint) ------------------------------->
+		<section class="border-b border-base-300">
+			<button class="flex w-full items-center gap-1.5 px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-base-content/60 hover:text-base-content" onclick={() => toggle('agent')} data-testid="section-agent">
+				<svg class="h-3 w-3 transition-transform {open.agent ? 'rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+				Connect an agent
+			</button>
+			{#if open.agent}
+				<div class="px-3 pb-3" data-testid="agent-body">
+					{#if mcp?.url}
+						<p class="pb-1.5 text-[11px] leading-relaxed text-base-content/50">
+							Point an MCP-speaking agent at this Cellar instance's live endpoint:
+						</p>
+						<div class="flex items-center gap-1 rounded-lg border border-base-300 bg-base-100 p-1.5">
+							<code class="min-w-0 flex-1 truncate px-1 font-mono text-xs text-primary" title={mcp.url} data-testid="mcp-url">{mcp.url}</code>
+							<button
+								class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
+								onclick={() => copy('url', mcp.url)}
+								title="Copy MCP URL"
+								aria-label="Copy MCP URL"
+								data-testid="mcp-copy-url"
+							>
+								{#if copied === 'url'}
+									<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+								{:else}
+									<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+								{/if}
+							</button>
+						</div>
+
+						<div class="mt-2 flex items-center justify-between">
+							<span class="text-[10px] uppercase tracking-wide text-base-content/40">config snippet</span>
+							<button class="btn btn-ghost btn-xs h-5 min-h-0 gap-1 px-1.5 text-[11px] font-normal text-base-content/50 hover:text-base-content" onclick={() => copy('snippet', mcpSnippet)} data-testid="mcp-copy-snippet">
+								{copied === 'snippet' ? 'copied' : 'copy'}
+							</button>
+						</div>
+						<pre class="mt-1 overflow-x-auto rounded-lg border border-base-300 bg-base-100 p-2 font-mono text-[11px] leading-relaxed text-base-content/70" data-testid="mcp-snippet">{mcpSnippet}</pre>
+					{:else}
+						<p class="px-1 text-xs text-base-content/40">MCP endpoint unavailable</p>
+					{/if}
 				</div>
 			{/if}
 		</section>
