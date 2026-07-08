@@ -53,8 +53,15 @@ export function readRuntime(workspace) {
 	}
 }
 
-/** Remove the runtime discovery file (best effort). */
-export function clearRuntime(workspace) {
+/**
+ * Remove the runtime discovery file (best effort), but only if it still points
+ * at us. Two `cellar` instances in the same workspace share one runtime.json
+ * (last writer wins); the first to exit must not delete a file the surviving
+ * instance now owns, or `cellar mcp` could no longer discover it.
+ */
+export function clearRuntime(workspace, pid = process.pid) {
+	const current = readRuntime(workspace);
+	if (current && current.pid !== pid) return;
 	try {
 		rmSync(runtimeFilePath(workspace), { force: true });
 	} catch {}
