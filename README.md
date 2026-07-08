@@ -117,6 +117,10 @@ Flags:
 | `--python <path>` | Escape hatch: bind an arbitrary interpreter, no create/install |
 | `--yes` / `-y` | Auto-approve venv create / ipykernel install (implied when non-interactive / `$CI`) |
 | `--dev` | Run the Vite dev server instead of the production build |
+| `--no-mcp-config` | Do not write/merge `<workspace>/.mcp.json` (see [Zero-config agent connection](#zero-config-agent-connection-cellar-mcp)) |
+
+There is also a `cellar mcp` subcommand (the stdio ↔ HTTP MCP bridge) — see
+[Zero-config agent connection](#zero-config-agent-connection-cellar-mcp).
 
 You can also switch or create the bound venv at runtime from **Settings → Python
 environment** in the app; it re-resolves/creates via `uv` and rebinds the kernel.
@@ -138,6 +142,24 @@ Because it shares the live notebook document + kernel with the UI and is
 independent of the kernel connection, **restarting the kernel never drops the
 MCP session or the document**. Connect any MCP client (e.g. the MCP Inspector,
 or `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`) to that URL.
+
+### Zero-config agent connection (`cellar mcp`)
+
+The HTTP port changes every launch, so a URL in agent config goes stale. Instead
+point the agent at the **stdio command `cellar mcp`**, which never carries a port:
+
+- On launch, `cellar` writes `<workspace>/.cellar/runtime.json` (the live
+  `{ mcpPort, appPort, pid }`, ephemeral — gitignored, removed on shutdown) and
+  writes/merges `<workspace>/.mcp.json` with a `cellar` stdio server entry. So
+  **just run `cellar`, then an agent opened in that repo (e.g. Claude Code)
+  auto-connects** via the written `.mcp.json` — no config editing, ever. The
+  merge preserves any other servers you already have; pass `--no-mcp-config` to
+  opt out of writing it.
+- To register once by hand (any project): `claude mcp add cellar -- cellar mcp`.
+- `cellar mcp` discovers the running instance from `.cellar/runtime.json`,
+  verifies it is alive, and transparently bridges stdio ↔ the live HTTP `/mcp`
+  server. With no running cellar in the directory it fails fast with a clear
+  error and non-zero exit (it never launches a headless instance).
 
 On connect the server hands the agent a house-style **coherence doctrine** (the
 MCP `instructions`, delivered once) that frames the work as building one coherent

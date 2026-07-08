@@ -8,7 +8,9 @@
   "files": [
     "build/",
     "bin/",
-    "src/lib/server/venv.js"
+    "src/lib/server/venv.js",
+    "src/lib/server/runtime.js",
+    "src/lib/server/mcp-bridge.js"
   ],
   "engines": {
     "node": ">=18"

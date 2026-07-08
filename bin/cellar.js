@@ -14,6 +14,12 @@
  * Distribution: npm package (see package.json `files`/`prepublishOnly`).
  * Default serves the production build (`build/index.js`); `--dev` uses Vite.
  *
+ * Subcommands:
+ *   cellar mcp [--workspace <dir>]  stdio ↔ HTTP MCP bridge for the running
+ *                                   instance (zero-config agent connection; see
+ *                                   src/lib/server/mcp-bridge.js). Fails fast if
+ *                                   no cellar is running in the workspace.
+ *
  * Flags:
  *   [path] / --workspace <dir>  open another repo without cd-ing (default cwd)
  *   --venv <dir>                explicit project venv (or CELLAR_VENV)
@@ -21,6 +27,7 @@
  *                               no venv create / ipykernel install
  *   --yes / -y                  auto-approve venv create / ipykernel install
  *   --dev                       run the Vite dev server instead of the build
+ *   --no-mcp-config             do not write/merge <workspace>/.mcp.json
  */
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
@@ -41,11 +48,27 @@ import {
 	venvPython,
 	UvMissingError
 } from '../src/lib/server/venv.js';
+import { writeRuntime, clearRuntime, writeMcpConfig } from '../src/lib/server/runtime.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // ---- Arg parsing ----------------------------------------------------------
 const argv = process.argv.slice(2);
+
+// `cellar mcp` — stdio bridge to the running instance. Handled before the
+// normal launcher arg parsing so its own flags never trip the unknown-flag
+// guard, and it never boots servers.
+if (argv[0] === 'mcp') {
+	const sub = argv.slice(1);
+	const wsIdx = sub.findIndex((a) => a === '--workspace' || a === '-w');
+	const wsArg = wsIdx !== -1 ? sub[wsIdx + 1] : undefined;
+	const workspace = resolve(wsArg || process.cwd());
+	const { runMcpBridge } = await import('../src/lib/server/mcp-bridge.js');
+	// Resolves only on clean shutdown (stdin close / signal / upstream close).
+	await runMcpBridge({ workspace });
+	process.exit(0);
+}
+
 function flagValue(...names) {
 	for (const name of names) {
 		const i = argv.indexOf(name);
@@ -56,7 +79,7 @@ function flagValue(...names) {
 function hasFlag(...names) {
 	return names.some((n) => argv.includes(n));
 }
-const KNOWN_FLAGS = new Set(['--workspace', '-w', '--venv', '--python', '--yes', '-y', '--dev', '--build']);
+const KNOWN_FLAGS = new Set(['--workspace', '-w', '--venv', '--python', '--yes', '-y', '--dev', '--build', '--no-mcp-config']);
 const VALUE_FLAGS = new Set(['--workspace', '-w', '--venv', '--python']);
 // First non-flag, non-flag-value token is the positional workspace path.
 let positional;
@@ -83,16 +106,22 @@ const pythonOverride = flagValue('--python');
 const autoYes = hasFlag('--yes', '-y') || !!process.env.CI || !process.stdin.isTTY;
 // Production build is the default; --dev opts into Vite (--build kept as alias).
 const useDev = hasFlag('--dev') && !hasFlag('--build');
+const writeMcpConfigOptIn = !hasFlag('--no-mcp-config');
 
 // ---- Lifecycle ------------------------------------------------------------
 const children = [];
 let jupyterDir = null;
+let runtimeWorkspace = null;
 function cleanup() {
 	if (jupyterDir) {
 		try {
 			rmSync(jupyterDir, { recursive: true, force: true });
 		} catch {}
 		jupyterDir = null;
+	}
+	if (runtimeWorkspace) {
+		clearRuntime(runtimeWorkspace);
+		runtimeWorkspace = null;
 	}
 }
 function shutdown(code = 0) {
@@ -234,6 +263,16 @@ async function main() {
 	const mcpPort = await freePort();
 	const token = randomBytes(24).toString('hex');
 	const jupyterUrl = `http://127.0.0.1:${jupyterPort}`;
+
+	// Zero-config agent wiring: record the live port map so `cellar mcp` can
+	// discover this instance, and point the project's .mcp.json at that bridge
+	// (a stdio command, not a URL) so the dynamic port never leaks into config.
+	runtimeWorkspace = WORKSPACE;
+	writeRuntime(WORKSPACE, { mcpPort, appPort, jupyterPort });
+	if (writeMcpConfigOptIn) {
+		const status = writeMcpConfig(WORKSPACE);
+		console.log(`[cellar] .mcp.json: ${status} (agent connects via \`cellar mcp\`)`);
+	}
 
 	// 5) Jupyter sidecar (host env), discovering our kernelspec via JUPYTER_PATH.
 	const jupyter = spawn(
