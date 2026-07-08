@@ -20,6 +20,41 @@ import * as svc from './service.js';
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
 const notFound = (msg) => ({ content: [{ type: 'text', text: msg }], isError: true });
 
+/**
+ * House-style doctrine handed to the agent once at connect (MCP server
+ * `instructions`). Sets the frame — build ONE coherent notebook, not a pile of
+ * snippets — before the first tool call. Advisory: the host injects it into the
+ * model's context. Reference only tools that ship today.
+ */
+const INSTRUCTIONS = `You are authoring ONE coherent, human-readable Python notebook in Cellar — not a
+pile of independent snippets. Notebooks here read top-to-bottom as a single
+narrative where each cell builds on the last.
+
+Follow this house style:
+
+1. IMPORTS GO AT THE TOP, ONCE. By convention, keep all imports in the first
+   code cell and do not repeat import lines inside narrative cells. Before adding
+   an import, check kernel_state (below) to see whether the module is already
+   loaded.
+
+2. CHECK STATE BEFORE YOU WRITE. Call kernel_state to see what is already
+   imported and which variables/functions/classes already exist in the live
+   kernel. Do not re-import a module that is already loaded, and do not recompute
+   or redefine a value that already exists — build on it.
+
+3. CONTINUE THE STORY. Before adding a cell, call get_notebook_map to see the
+   narrative so far. A new cell should advance it — reuse existing variables,
+   reference earlier results, and add a short markdown header when you start a new
+   section. Do not answer a question in isolation as if the notebook were empty.
+
+4. STRUCTURE WITH MARKDOWN. Use markdown header cells to divide the notebook into
+   sections (Setup, Load data, Explore, Model, Results). Keep code cells focused:
+   one idea per cell.
+
+The goal: a notebook a human would be happy to have written — imports up top,
+shared state, a clean section outline, and a continuous line of reasoning from
+first cell to last.`;
+
 function registerTools(server) {
 	// --- lifecycle ---
 	server.registerTool('restart_kernel', { description: 'Restart the kernel (clears namespace). Does NOT affect the MCP connection or document.', inputSchema: {} }, async () => text(await svc.kernel.restart()));
@@ -31,6 +66,7 @@ function registerTools(server) {
 
 	// --- read ---
 	server.registerTool('get_notebook_map', { description: 'Compact hierarchical section tree (from markdown headers): id, type, header level/title, one-line summary, run status, has-output, visibility. Not full content.', inputSchema: {} }, async () => text(svc.getNotebookMap()));
+	server.registerTool('kernel_state', { description: 'Live kernel namespace: imports already loaded, user-defined functions/classes, and variables (with types, shapes, dataframe columns). Returns {started:false} if no kernel is running (does not boot one). Call this BEFORE writing code so you do not re-import modules or redefine names that already exist.', inputSchema: {} }, async () => text(await svc.getKernelState()));
 	server.registerTool('read_cell', { description: 'Read one cell by UUID (source + summarized outputs).', inputSchema: { id: z.string() } }, async ({ id }) => { const r = svc.readCell(id); return r ? text(r) : notFound(`cell ${id} not found or hidden`); });
 	server.registerTool('read_cells', { description: 'Read multiple cells by UUID.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(svc.readCells(ids)));
 	server.registerTool('read_by_location', { description: 'Read a cell by location: index (0-based over visible cells), position first/last, or next/prev of a cell.', inputSchema: { index: z.number().int().optional(), position: z.enum(['first', 'last']).optional(), relative_to: z.string().optional(), direction: z.enum(['next', 'prev']).optional() } }, async ({ index, position, relative_to, direction }) => { const r = svc.readByLocation({ index, position, relativeTo: relative_to, direction }); return r ? text(r) : notFound('no cell at that location'); });
@@ -59,6 +95,11 @@ function registerTools(server) {
 	server.registerTool('run_cells', { description: 'Run multiple cells in order.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(await svc.runCells(ids)));
 	server.registerTool('run_all', { description: 'Run all code cells in document order.', inputSchema: {} }, async () => text(await svc.runAll()));
 	server.registerTool('run_range', { description: 'Run code cells in the inclusive range from one cell to another.', inputSchema: { from_id: z.string(), to_id: z.string() } }, async ({ from_id, to_id }) => text(await svc.runRange(from_id, to_id)));
+
+	// --- prompt: the house style as a surfaceable slash-command ---
+	server.registerPrompt('cellar_notebook_style', { description: "Cellar's house style for building one coherent notebook." }, () => ({
+		messages: [{ role: 'user', content: { type: 'text', text: INSTRUCTIONS } }]
+	}));
 }
 
 /** Read and JSON-parse a Node request body. */
@@ -107,7 +148,7 @@ export function startMcpServer() {
 					transport.onclose = () => {
 						if (transport.sessionId) delete transports[transport.sessionId];
 					};
-					const server = new McpServer({ name: 'cellar', version: '0.1.0' });
+					const server = new McpServer({ name: 'cellar', version: '0.1.0' }, { instructions: INSTRUCTIONS });
 					registerTools(server);
 					await server.connect(transport);
 				}
