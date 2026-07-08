@@ -386,8 +386,8 @@
 				<div class="flex items-start gap-1.5 rounded-lg border border-base-300 bg-base-100 p-2" data-testid="mcp-zeroconfig">
 					<svg class="mt-0.5 h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M12 16v-4" /><path d="M12 8h.01" /></svg>
 					<p class="text-[11px] leading-relaxed text-base-content/60">
-						No project <code class="font-mono text-[10px]">.mcp.json</code> here (launched with
-						<code class="font-mono text-[10px]">--no-mcp-config</code>). Register the agent once with the command below.
+						No project <code class="font-mono text-[10px]">.mcp.json</code> registers
+						<code class="font-mono text-[10px]">cellar</code> here. Register the agent once with the command below.
 					</p>
 				</div>
 			{/if}
