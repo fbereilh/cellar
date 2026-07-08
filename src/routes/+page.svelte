@@ -326,7 +326,7 @@
 	let fsRefreshSignal = $state(0);
 
 	async function scrollToCell(id) {
-		activeTabId = 'notebook';
+		openNotebook();
 		await tick();
 		const el = document.querySelector(`[data-cell-id="${id}"]`);
 		if (!el) return;
