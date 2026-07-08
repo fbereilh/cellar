@@ -2,165 +2,41 @@
 	import { onMount, tick } from 'svelte';
 	import Navbar from '$lib/Navbar.svelte';
 	import Sidebar from '$lib/Sidebar.svelte';
-	import Notebook from '$lib/Notebook.svelte';
+	import LiveNotebook from '$lib/LiveNotebook.svelte';
 	import FileTab from '$lib/FileTab.svelte';
-	import NotebookFileView from '$lib/NotebookFileView.svelte';
 	import Settings from '$lib/Settings.svelte';
 
 	let { data } = $props();
 
-	// ---- Notebook state (owned here so the sidebar can read the same cells) --
-	let cells = $state(data.notebook.cells);
 	const workspace = data.notebook.workspace;
 	const notebookPath = data.notebook.path;
 	const notebookName = notebookPath.split('/').pop();
 
-	let kernelState = $state('idle');
-	let runningId = $state(null); // single kernel → one cell runs at a time
+	// Workspace-relative path of the canonical (default) notebook. Opening it from
+	// the file tree routes to the live notebook tab (id 'notebook').
+	const canonicalNotebookRel = notebookPath.startsWith(workspace)
+		? notebookPath.slice(workspace.length).replace(/^[/\\]+/, '')
+		: notebookName;
 
-	// Each Cell registers a focus fn (by id) so Shift+Enter can advance focus.
-	const focusers = {};
-	function registerFocus(id, fn) {
-		if (fn) focusers[id] = fn;
-		else delete focusers[id];
+	// Live cells per open notebook (path → the notebook's reactive cell array),
+	// reported up by each LiveNotebook so the sidebar (outline / search) can read
+	// whichever notebook is active. Seeded with the default notebook's SSR cells
+	// so the sidebar reflects it even before its tab is mounted.
+	let notebooksCells = $state({ [canonicalNotebookRel]: data.notebook.cells });
+	function handleCellsChange(path, cells) {
+		notebooksCells[path] = cells;
 	}
 
-	function findCell(id) {
-		return cells.find((c) => c.id === id);
+	// Single shared kernel → at most one cell runs at a time across ALL notebooks.
+	let runBusy = $state(false);
+	function onRunStart() {
+		runBusy = true;
 	}
-
-	async function runCell(id, source) {
-		const cell = findCell(id);
-		if (!cell) return;
-		// Markdown "runs" by rendering client-side (in the Cell) — no kernel.
-		if (cell.cell_type === 'markdown') {
-			await editCell(id, source);
-			return;
-		}
-		if (runningId) return;
-		runningId = id;
-		cell.source = source;
-		let replace = true; // replace prior output only when new output arrives (no flash)
-		try {
-			const res = await fetch(`/api/cells/${id}/run`, {
-				method: 'POST',
-				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ source })
-			});
-			const reader = res.body.getReader();
-			const decoder = new TextDecoder();
-			let buf = '';
-			for (;;) {
-				const { value, done } = await reader.read();
-				if (done) break;
-				buf += decoder.decode(value, { stream: true });
-				let nl;
-				while ((nl = buf.indexOf('\n')) !== -1) {
-					const line = buf.slice(0, nl).trim();
-					buf = buf.slice(nl + 1);
-					if (!line) continue;
-					const ev = JSON.parse(line);
-					if (ev.type === 'kernel') kernelState = 'kernel ready';
-					else if (ev.type === 'status') kernelState = ev.execution_state;
-					else if (ev.type === 'output') {
-						if (replace) {
-							cell.outputs = [ev.output];
-							replace = false;
-						} else {
-							cell.outputs = [...cell.outputs, ev.output];
-						}
-					}
-				}
-			}
-		} catch (err) {
-			cell.outputs = [{ output_type: 'error', ename: 'CellarError', evalue: String(err), traceback: [String(err)] }];
-			replace = false;
-		} finally {
-			if (replace) cell.outputs = []; // ran with no output → clear
-			runningId = null;
-			// A run may have created/changed kernel variables → refresh sidebar.
-			refreshKernel();
-			refreshVariables();
-		}
-	}
-
-	async function editCell(id, source) {
-		const cell = findCell(id);
-		if (cell) cell.source = source;
-		await fetch(`/api/cells/${id}`, {
-			method: 'PATCH',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ source })
-		});
-	}
-
-	async function clearCell(id) {
-		const cell = findCell(id);
-		if (cell) cell.outputs = [];
-		await fetch(`/api/cells/${id}/clear`, { method: 'POST' });
-	}
-
-	async function setType(id, cellType) {
-		const cell = findCell(id);
-		if (cell) {
-			cell.cell_type = cellType;
-			if (cellType === 'markdown') cell.outputs = [];
-		}
-		await fetch(`/api/cells/${id}`, {
-			method: 'PATCH',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ cell_type: cellType })
-		});
-	}
-
-	async function deleteCell(id) {
-		cells = cells.filter((c) => c.id !== id);
-		await fetch(`/api/cells/${id}`, { method: 'DELETE' });
-	}
-
-	async function moveCell(id, dir) {
-		const i = cells.findIndex((c) => c.id === id);
-		const j = dir === 'up' ? i - 1 : i + 1;
-		if (j < 0 || j >= cells.length) return;
-		const next = [...cells];
-		[next[i], next[j]] = [next[j], next[i]];
-		cells = next;
-		await fetch(`/api/cells/${id}/move`, {
-			method: 'POST',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ dir })
-		});
-	}
-
-	async function addCell(afterId, cellType = 'code') {
-		const res = await fetch('/api/cells', {
-			method: 'POST',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ afterId, cellType })
-		});
-		const { cell } = await res.json();
-		const view = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs };
-		if (afterId) {
-			const i = cells.findIndex((c) => c.id === afterId);
-			cells = [...cells.slice(0, i + 1), view, ...cells.slice(i + 1)];
-		} else {
-			cells = [...cells, view];
-		}
-		return view;
-	}
-
-	// Shift+Enter: run in place, then move focus to the next cell (creating and
-	// focusing a fresh empty cell if this is the last one) — Jupyter behavior.
-	async function runAndAdvance(id, source) {
-		runCell(id, source); // fire; advancing focus shouldn't wait for completion
-		const i = cells.findIndex((c) => c.id === id);
-		let nextId = i >= 0 && i < cells.length - 1 ? cells[i + 1].id : null;
-		if (!nextId) {
-			const created = await addCell(id);
-			nextId = created.id;
-		}
-		await tick();
-		focusers[nextId]?.();
+	function onRunEnd() {
+		runBusy = false;
+		// A run may have created/changed kernel variables → refresh sidebar.
+		refreshKernel();
+		refreshVariables();
 	}
 
 	// ---- Shell state ---------------------------------------------------------
@@ -168,12 +44,6 @@
 	let settingsOpen = $state(false);
 	let theme = $state('dim');
 	const mcp = data.mcp;
-
-	// Workspace-relative path of the canonical (live) notebook — opening it from
-	// the file tree routes to the live notebook tab, not a read-only render.
-	const canonicalNotebookRel = notebookPath.startsWith(workspace)
-		? notebookPath.slice(workspace.length).replace(/^[/\\]+/, '')
-		: notebookName;
 
 	// Tabs are restored from per-workspace session memory on mount; a first-ever
 	// open starts empty (no tab → empty state). Each tab may be a transient
@@ -185,7 +55,14 @@
 	const ipynbTabs = $derived(tabs.filter((t) => t.kind === 'ipynb'));
 	const notebookOpen = $derived(tabs.some((t) => t.kind === 'notebook'));
 	const activeTab = $derived(tabs.find((t) => t.id === activeTabId) ?? null);
-	const activeFilePath = $derived(activeTab && activeTab.kind !== 'notebook' ? activeTab.path : null);
+	const activeFilePath = $derived(activeTab && activeTab.kind === 'file' ? activeTab.path : null);
+
+	// Which notebook the sidebar (outline / search / variables) reflects: the
+	// active notebook tab, else the default when a plain file / nothing is active.
+	const activeNotebookPath = $derived(
+		activeTab?.kind === 'notebook' ? canonicalNotebookRel : activeTab?.kind === 'ipynb' ? activeTab.path : canonicalNotebookRel
+	);
+	const activeCells = $derived(notebooksCells[activeNotebookPath] ?? []);
 
 	function tabIdFor(path) {
 		return path === canonicalNotebookRel ? 'notebook' : 'file:' + path;
@@ -326,9 +203,13 @@
 	let fsRefreshSignal = $state(0);
 
 	async function scrollToCell(id) {
-		openNotebook();
+		// Open + focus the notebook the outline currently reflects, then scroll.
+		if (activeNotebookPath === canonicalNotebookRel) openNotebook();
+		else openFilePermanent(activeNotebookPath);
 		await tick();
-		const el = document.querySelector(`[data-cell-id="${id}"]`);
+		// Multiple notebooks stay mounted (hidden); pick the visible cell.
+		const els = document.querySelectorAll(`[data-cell-id="${id}"]`);
+		const el = [...els].find((e) => e.offsetParent !== null) ?? els[0];
 		if (!el) return;
 		el.scrollIntoView({ behavior: 'smooth', block: 'center' });
 		el.classList.add('cellar-flash');
@@ -341,7 +222,7 @@
 	let varsLoading = $state(false);
 	let varsError = $state('');
 
-	const displayKernel = $derived(runningId ? { ...kernelInfo, started: true, status: 'busy' } : kernelInfo);
+	const displayKernel = $derived(runBusy ? { ...kernelInfo, started: true, status: 'busy' } : kernelInfo);
 
 	async function refreshKernel() {
 		try {
@@ -403,29 +284,6 @@
 		} catch {}
 	}
 
-	// Cmd+Shift+Arrow (Ctrl+Shift+Arrow off mac) moves the focused cell up/down.
-	// Handled in the capture phase so it wins over CodeMirror's own arrow
-	// bindings and the browser default before they can act.
-	const isMac = typeof navigator !== 'undefined' && /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
-	async function onKeydown(e) {
-		if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
-		const primary = isMac ? e.metaKey : e.ctrlKey;
-		const other = isMac ? e.ctrlKey : e.metaKey;
-		if (!primary || !e.shiftKey || e.altKey || other) return;
-		// Act only on the cell that currently holds focus (its editor or chrome).
-		const host = e.target?.closest?.('[data-cell-id]');
-		if (!host) return;
-		e.preventDefault();
-		e.stopPropagation();
-		const id = host.dataset.cellId;
-		moveCell(id, e.key === 'ArrowUp' ? 'up' : 'down');
-		// Reordering the list moves the editor's DOM node and drops focus, so
-		// restore it to the same cell — this is what lets moves chain and keeps
-		// the shortcut acting on "the selected cell" across repeated presses.
-		await tick();
-		focusers[id]?.();
-	}
-
 	onMount(() => {
 		const saved = (() => {
 			try {
@@ -446,8 +304,6 @@
 		refreshKernel().then(() => {
 			if (kernelInfo.started) refreshVariables();
 		});
-		window.addEventListener('keydown', onKeydown, true);
-		return () => window.removeEventListener('keydown', onKeydown, true);
 	});
 </script>
 
@@ -468,7 +324,7 @@
 		{#if sidebarOpen}
 			<div class="shrink-0 border-r border-base-300" style="width: {sidebarWidth}px">
 				<Sidebar
-					{cells}
+					cells={activeCells}
 					{mcp}
 					kernelInfo={displayKernel}
 					{kernelBusy}
@@ -500,34 +356,40 @@
 		{/if}
 
 		<main class="relative min-w-0 flex-1 overflow-hidden">
-			<!-- Notebook stays mounted (editor + run state preserved) — just hidden. -->
+			<!-- Every open notebook stays mounted (editor + run state preserved),
+			     just hidden. The default notebook and opened `.ipynb` files use the
+			     same live component; each persists to its own file. -->
 			{#if notebookOpen}
 				<div class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}">
-					<Notebook
-						{cells}
-						{runningId}
-						onRun={runCell}
-						onRunAdvance={runAndAdvance}
-						onClear={clearCell}
-						onDelete={deleteCell}
-						onMove={moveCell}
-						onEdit={editCell}
-						onSetType={setType}
-						onReady={registerFocus}
-						onAddCell={addCell}
+					<LiveNotebook
+						path={canonicalNotebookRel}
+						active={activeTabId === 'notebook'}
+						busy={runBusy}
+						{theme}
+						onCellsChange={handleCellsChange}
+						onRunStart={onRunStart}
+						onRunEnd={onRunEnd}
 					/>
 				</div>
 			{/if}
 
-			{#each fileTabs as tab (tab.id)}
-				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
-					<FileTab path={tab.path} onDirty={onFileDirty} />
+			{#each ipynbTabs as tab (tab.id)}
+				<div class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}">
+					<LiveNotebook
+						path={tab.path}
+						active={activeTabId === tab.id}
+						busy={runBusy}
+						{theme}
+						onCellsChange={handleCellsChange}
+						onRunStart={onRunStart}
+						onRunEnd={onRunEnd}
+					/>
 				</div>
 			{/each}
 
-			{#each ipynbTabs as tab (tab.id)}
+			{#each fileTabs as tab (tab.id)}
 				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
-					<NotebookFileView path={tab.path} />
+					<FileTab path={tab.path} onDirty={onFileDirty} />
 				</div>
 			{/each}
 
@@ -545,7 +407,7 @@
 
 	<footer class="flex items-center justify-between border-t border-base-300 bg-base-100 px-3 py-1 text-[11px] text-base-content/40">
 		<span class="truncate">workspace: <span class="font-mono">{workspace}</span></span>
-		<span class="font-mono">{cells.length} cells</span>
+		<span class="font-mono">{activeCells.length} cells</span>
 	</footer>
 </div>
 

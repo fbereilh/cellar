@@ -7,8 +7,8 @@ import { setSource, setOutputs } from '$lib/server/notebook.js';
  * accumulated into the cell's `outputs` and persisted to the `.ipynb` on done.
  */
 export async function POST({ params, request }) {
-	const { source } = await request.json();
-	setSource(params.id, source ?? '');
+	const { source, nb } = await request.json();
+	setSource(params.id, source ?? '', nb);
 
 	const encoder = new TextEncoder();
 	const outputs = [];
@@ -31,7 +31,7 @@ export async function POST({ params, request }) {
 				outputs.push(output);
 				send({ type: 'output', output });
 			} finally {
-				setOutputs(params.id, outputs); // clean-on-save persists the .ipynb
+				setOutputs(params.id, outputs, nb); // clean-on-save persists the .ipynb
 				controller.close();
 			}
 		}
