@@ -144,7 +144,7 @@ export function openNotebook() {
  * surfaces the new notebook in a tab live. Returns its path + cell count.
  */
 export function createNotebook(name) {
-	let rel = (name || 'untitled').trim();
+	let rel = (name ?? '').trim() || 'untitled';
 	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
 	const nb = createNotebookDoc(rel);
 	return { path: nb.path, workspace: nb.workspace, cells: nb.cells.length };
