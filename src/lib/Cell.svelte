@@ -1,8 +1,8 @@
 <script>
 	import { onMount, tick } from 'svelte';
 	import { browser } from '$app/environment';
-	import { EditorView, keymap } from '@codemirror/view';
-	import { EditorState, Prec, Compartment } from '@codemirror/state';
+	import { EditorView } from '@codemirror/view';
+	import { EditorState, Compartment } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
@@ -18,6 +18,7 @@
 		count,
 		running,
 		active = false,
+		keyMode = 'command', // notebook mode ('command' | 'edit'); only meaningful while `active`
 		dragging = false,
 		folded = false, // this header cell's section is collapsed
 		hiddenCount = 0, // cells hidden by this header while folded (for the hint)
@@ -34,7 +35,9 @@
 		editorCollapsed, // per-cell code-editor collapse choice (undefined = auto / true / false)
 		onSetEditorCollapsed,
 		onActivate,
-		onReady,
+		onRegister, // (id, api|null): hands the notebook this cell's imperative API
+		onEditorFocus,
+		onEditorBlur,
 		onDragStart,
 		onDragEnd
 	} = $props();
@@ -250,6 +253,20 @@
 		onSetEditorCollapsed?.(cell.id, !collapsed);
 	}
 
+	// ---- Modal selection emphasis --------------------------------------------
+	// Jupyter's convention: the selected cell carries a colored gutter bar whose
+	// hue says which mode you are in. Mapped onto the app's semantic palette
+	// rather than hardcoded hues, so any theme stays coherent: `info` for command,
+	// `success` for edit. (Both are distinct from `error` in every shipped theme.)
+	const editing = $derived(active && keyMode === 'edit');
+	const shellClass = $derived(
+		!active
+			? 'border-base-300'
+			: editing
+				? 'border-success ring-1 ring-success/50'
+				: 'border-info ring-1 ring-info/60'
+	);
+
 	const toneClass = {
 		stdout: 'text-base-content border-transparent',
 		stderr: 'text-warning border-warning/40',
@@ -308,13 +325,16 @@
 	}
 
 	// Run/render. For markdown this just renders (parent persists source, no
-	// kernel); for code the parent runs it on the kernel.
-	function doRun(advance) {
+	// kernel); for code the parent runs it on the kernel. `focusNext` lets a
+	// command-mode Shift+Enter advance the *selection* without dropping into the
+	// next cell's editor, while an edit-mode one keeps typing there (Jupyter).
+	function doRun(advance, { focusNext = true } = {}) {
 		const src = currentSource();
 		liveSource = src;
 		savedSource = src;
 		if (isMarkdown) mode = 'rendered';
-		(advance ? onRunAdvance : onRun)(cell.id, src);
+		if (advance) onRunAdvance(cell.id, src, { focusNext });
+		else onRun(cell.id, src);
 	}
 
 	async function enterEdit() {
@@ -358,13 +378,10 @@
 					basicSetup,
 					language.of(langFor(cell.cell_type)),
 					editorTheme.of(editorThemeExtensions(theme)),
-					// ⌘/Ctrl+Enter runs/renders in place; Shift+Enter runs and advances.
-					Prec.highest(
-						keymap.of([
-							{ key: 'Mod-Enter', run: () => (doRun(false), true) },
-							{ key: 'Shift-Enter', run: () => (doRun(true), true) }
-						])
-					),
+					// No run/escape keymap here on purpose: every notebook shortcut,
+					// edit-mode ones included, is declared in `shortcuts.svelte.js` and
+					// dispatched by LiveNotebook's capture-phase handler (which runs
+					// before CodeMirror sees the key). One source of truth.
 					EditorView.updateListener.of((v) => {
 						if (!v.docChanged) return;
 						liveSource = v.state.doc.toString();
@@ -385,8 +402,13 @@
 						}, 500);
 					}),
 					// Leaving the editor flushes any pending edit at once, so a save
-					// never waits on the debounce when focus moves away.
-					EditorView.domEventHandlers({ blur: () => (flushEdit(), false) }),
+					// never waits on the debounce when focus moves away. Focus/blur also
+					// drive the notebook's edit-vs-command mode: the editor holding
+					// focus *is* edit mode, so the indicator can never drift from reality.
+					EditorView.domEventHandlers({
+						focus: () => (onEditorFocus?.(cell.id), false),
+						blur: () => (flushEdit(), onEditorBlur?.(cell.id), false)
+					}),
 					EditorView.theme({
 						'&': { backgroundColor: 'transparent', fontSize: '13.5px' },
 						'.cm-content': { fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace', padding: '10px 0' },
@@ -397,7 +419,16 @@
 			})
 		});
 		if (import.meta.env.DEV) (window.cellarViews ??= {})[cell.id] = view;
-		onReady?.(cell.id, () => view.focus());
+		// The imperative surface the notebook's shortcut actions drive. `run` goes
+		// through `doRun` so it always uses the editor's *live* text, even when the
+		// 500ms edit debounce has not fired yet.
+		onRegister?.(cell.id, {
+			focus: () => view?.focus(),
+			blur: () => view?.contentDOM.blur(),
+			enterEdit,
+			run: doRun,
+			isMarkdown: () => isMarkdown
+		});
 		// Measure editor content height so a tall code cell auto-collapses. A
 		// ResizeObserver re-measures on content growth AND on the hidden→visible
 		// transition (a background tab measures 0 until shown), so the auto-cap
@@ -418,25 +449,30 @@
 			flushEdit();
 			editorResizeObserver?.disconnect();
 			window.removeEventListener('pagehide', flushOnUnload);
-			onReady?.(cell.id, null);
+			onRegister?.(cell.id, null);
 			view?.destroy();
 		};
 	});
 </script>
 
 <div
-	class="card relative overflow-hidden border bg-base-100 shadow-sm transition-colors {active ? 'border-primary/50 ring-1 ring-primary/40' : 'border-base-300'} {dragging ? 'opacity-40' : ''}"
+	class="card relative overflow-hidden border bg-base-100 shadow-sm transition-colors {shellClass} {dragging ? 'opacity-40' : ''}"
 	data-testid="cell"
 	data-cell-id={cell.id}
 	data-cell-type={cell.cell_type}
 	data-active={active ? 'true' : undefined}
+	data-mode={active ? keyMode : undefined}
 	role="presentation"
 	onfocusin={() => onActivate?.(cell.id)}
 	onpointerdown={() => onActivate?.(cell.id)}
 >
-	<!-- Active-cell accent bar (VS Code / Jupyter style); no layout shift. -->
+	<!-- Selected-cell gutter bar (Jupyter style): its color is the mode. -->
 	{#if active}
-		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 bg-primary" data-testid="active-bar"></div>
+		<div
+			class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 {editing ? 'bg-success' : 'bg-info'}"
+			data-testid="active-bar"
+			data-mode={keyMode}
+		></div>
 	{/if}
 	<div class="card-body gap-0 p-0">
 		<!-- Cell toolbar -->
@@ -522,6 +558,23 @@
 				{/if}
 			</div>
 			<div class="flex items-center gap-1">
+				<!-- Mode indicator for the selected cell: pencil = edit, dot = command. -->
+				{#if active}
+					<span
+						class="mr-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide {editing ? 'text-success' : 'text-info'}"
+						data-testid="cell-mode"
+						data-mode={keyMode}
+						title={editing ? 'Edit mode - Esc for command mode' : 'Command mode - Enter to edit'}
+					>
+						{#if editing}
+							<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg>
+							edit
+						{:else}
+							<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="12" r="6" /></svg>
+							cmd
+						{/if}
+					</span>
+				{/if}
 				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'up')} disabled={index === 0} title="Move up" aria-label="Move cell up" data-testid="move-up">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6" /></svg>
 				</button>

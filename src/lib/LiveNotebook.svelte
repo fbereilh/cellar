@@ -2,7 +2,8 @@
 	import { onMount, tick } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
-	import { computeFolding } from '$lib/headings.js';
+	import { computeFolding, headerLevel } from '$lib/headings.js';
+	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte.js';
 
 	// A live, kernel-attached notebook document addressed by its workspace path.
 	// Owns its own cell array + all cell operations (every request carries
@@ -16,7 +17,13 @@
 	let fetching = $state(true); // loading the notebook's cells from the server
 	let loadError = $state('');
 	let runningId = $state(null); // the cell running in THIS notebook (≤1)
-	let activeId = $state(null); // the selected/focused cell (visual emphasis)
+	let activeId = $state(null); // the selected cell (Jupyter's "selection")
+	// Jupyter's modal keyboard: 'edit' means the selected cell's editor holds
+	// focus and keystrokes are text; 'command' means they are notebook commands.
+	// Driven purely by the editor's own focus/blur events, so it can never claim
+	// a mode the DOM disagrees with.
+	let keyMode = $state('command');
+	let root = $state(null); // this notebook's DOM subtree (scopes key handling + scroll lookups)
 
 	// Canonical (absolute) notebook id, learned from the server on load. The shell
 	// addresses this component by a workspace-relative `path` (fine for the REST
@@ -112,14 +119,24 @@
 		activeId = id;
 	}
 
-	// Each Cell registers a focus fn (by id) so Shift+Enter / move can advance focus.
-	const focusers = {};
-	function registerFocus(id, fn) {
-		if (fn) focusers[id] = fn;
-		else delete focusers[id];
+	// Each Cell registers its imperative API (by id) so the shortcut actions can
+	// focus/blur its editor, enter edit mode, and run its *live* editor text.
+	const cellApis = {};
+	function registerCell(id, api) {
+		if (api) cellApis[id] = api;
+		else delete cellApis[id];
 	}
 	function findCell(id) {
 		return cells.find((c) => c.id === id);
+	}
+
+	// The editor holding focus IS edit mode; losing it drops back to command mode.
+	function onEditorFocus(id) {
+		activeId = id;
+		keyMode = 'edit';
+	}
+	function onEditorBlur(id) {
+		if (activeId === id) keyMode = 'command';
 	}
 
 	// Report the live cells array (a reactive proxy) upward so the shell's
@@ -138,6 +155,9 @@
 			if (!res.ok) throw new Error(body?.message || 'could not open notebook');
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
+			// A notebook always has a selected cell (command mode acts on it), so
+			// j/k and the rest work the moment the notebook opens.
+			if (!activeId || !cells.some((c) => c.id === activeId)) activeId = cells[0]?.id ?? null;
 			loadFolds(); // restore this notebook's collapsed sections (runtime-only, per notebook)
 			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
 			// This refetch is the correctness backstop (reconnect / seq gap): the
@@ -183,9 +203,10 @@
 			if (i >= 0) cells = [...cells.slice(0, i + 1), view, ...cells.slice(i + 1)];
 			else cells = [...cells, view];
 		} else if (ev.type === 'cell:deleted') {
+			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
 			if (runningId === ev.cellId) runningId = null;
-			if (activeId === ev.cellId) activeId = null;
+			if (activeId === ev.cellId) selectAfterRemoval(i);
 		} else if (ev.type === 'cell:moved') {
 			const from = cells.findIndex((c) => c.id === ev.cellId);
 			if (from < 0) return;
@@ -265,7 +286,7 @@
 	);
 
 	// When this notebook is focused, make it the active notebook the agent-facing
-	// (MCP) tools default to, and own the move-cell keyboard shortcut.
+	// (MCP) tools default to, and own the modal keyboard.
 	$effect(() => {
 		if (!active) return;
 		fetch('/api/notebooks', {
@@ -275,6 +296,15 @@
 		}).catch(() => {});
 		window.addEventListener('keydown', onKeydown, true);
 		return () => window.removeEventListener('keydown', onKeydown, true);
+	});
+
+	// Command-mode keys only fire for keystrokes aimed at this notebook, so a
+	// freshly activated notebook tab must take the keyboard: otherwise focus is
+	// still on whatever opened it (a file-tree button) and `j`/`k` do nothing
+	// until the user clicks a cell. Never steals focus from an editor in use.
+	$effect(() => {
+		if (!active || fetching || !root) return;
+		if (!root.contains(document.activeElement)) root.focus({ preventScroll: true });
 	});
 
 	async function runCell(id, source) {
@@ -369,8 +399,17 @@
 	}
 
 	async function deleteCell(id) {
+		const i = cells.findIndex((c) => c.id === id);
 		cells = cells.filter((c) => c.id !== id);
+		// Keep a cell selected: command mode acts on the selection, so deleting the
+		// selected cell must hand the selection to its neighbor, not drop it.
+		if (activeId === id) selectAfterRemoval(i);
 		await fetch(`/api/cells/${id}?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, { method: 'DELETE' });
+	}
+
+	/** After removing the cell at `index`, select whatever slid into its place. */
+	function selectAfterRemoval(index) {
+		activeId = cells[Math.min(Math.max(index, 0), cells.length - 1)]?.id ?? null;
 	}
 
 	async function moveCell(id, dir) {
@@ -440,40 +479,129 @@
 		return view;
 	}
 
-	// Shift+Enter: run in place, then move focus to the next cell (creating and
-	// focusing a fresh empty cell if this is the last one) — Jupyter behavior.
-	async function runAndAdvance(id, source) {
-		runCell(id, source); // fire; advancing focus shouldn't wait for completion
+	// Shift+Enter: run in place, then advance. From edit mode we focus the next
+	// cell's editor (keep typing); from command mode we only move the selection,
+	// which is Jupyter's behavior. Creates a fresh cell when run on the last one.
+	async function runAndAdvance(id, source, { focusNext = true } = {}) {
+		runCell(id, source); // fire; advancing shouldn't wait for completion
 		const i = cells.findIndex((c) => c.id === id);
 		let nextId = i >= 0 && i < cells.length - 1 ? cells[i + 1].id : null;
 		if (!nextId) {
 			const created = await addCell(id);
 			nextId = created.id;
 		}
+		setActive(nextId);
 		await tick();
-		focusers[nextId]?.();
+		if (focusNext) cellApis[nextId]?.focus();
+		else scrollCellIntoView(nextId);
 	}
 
-	// Cmd+Shift+Arrow (Ctrl+Shift+Arrow off mac) moves the focused cell up/down.
-	// Capture phase so it wins over CodeMirror's arrow bindings + the browser
-	// default. Only registered while this notebook is the active tab.
-	const isMac = typeof navigator !== 'undefined' && /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
-	async function onKeydown(e) {
-		if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
-		const primary = isMac ? e.metaKey : e.ctrlKey;
-		const other = isMac ? e.ctrlKey : e.metaKey;
-		if (!primary || !e.shiftKey || e.altKey || other) return;
-		const host = e.target?.closest?.('[data-cell-id]');
-		if (!host) return;
+	// ---- Modal keyboard ------------------------------------------------------
+	// Every notebook shortcut lives in the registry (`shortcuts.svelte.js`) and is
+	// dispatched here, in one capture-phase handler, so it wins over CodeMirror's
+	// own keymap and the browser default. Registered only while this notebook is
+	// the active tab. The action map below is the other half of the registry: an
+	// entry with no action is inert, and an action with no entry is unreachable.
+
+	// Cells the user can actually select: the ones a folded heading isn't hiding.
+	const selectable = $derived(cells.filter((c) => !folding.hidden.has(c.id)));
+
+	function scrollCellIntoView(id) {
+		// Scope to this notebook: several notebooks stay mounted (hidden), and a
+		// cell id is only unique *within* a document.
+		const el = root?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
+		el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+	}
+
+	function selectRelative(delta) {
+		const list = selectable;
+		if (!list.length) return;
+		const i = list.findIndex((c) => c.id === activeId);
+		const next = list[i < 0 ? 0 : Math.min(list.length - 1, Math.max(0, i + delta))];
+		setActive(next.id);
+		scrollCellIntoView(next.id);
+	}
+
+	// Fold/unfold act on the selected cell only when it is a markdown header, and
+	// reuse the same `toggleFold` the chevron button calls (one fold API).
+	function setFolded(id, folded) {
+		if (!id || headerLevel(findCell(id)) == null) return;
+		if (foldedIds.has(id) !== folded) toggleFold(id);
+	}
+
+	async function insertCell(where) {
+		const i = cells.findIndex((c) => c.id === activeId);
+		if (where === 'below' || i < 0) {
+			const created = await addCell(activeId ?? cells.at(-1)?.id);
+			setActive(created.id);
+			return;
+		}
+		if (i > 0) {
+			const created = await addCell(cells[i - 1].id);
+			setActive(created.id);
+			return;
+		}
+		// Above the first cell: the API can only insert *after* an id, so append
+		// and move it to the top (one extra persist, same clean-on-save result).
+		const created = await addCell(cells.at(-1)?.id);
+		await moveCellToIndex(created.id, 0);
+		setActive(created.id);
+	}
+
+	// Reordering moves the editor's DOM node and drops focus; restore it (edit
+	// mode) or just keep the moved cell in view (command mode) so moves chain.
+	async function moveActive(dir, mode) {
+		const id = activeId;
+		if (!id) return;
+		moveCell(id, dir);
+		await tick();
+		if (mode === 'edit') cellApis[id]?.focus();
+		else scrollCellIntoView(id);
+	}
+
+	/** shortcut id → what it does. `mode` is the mode the keystroke fired in. */
+	const actions = {
+		'command-mode': () => cellApis[activeId]?.blur(),
+		'edit-mode': () => cellApis[activeId]?.enterEdit(),
+		'run-cell': () => cellApis[activeId]?.run(false),
+		'run-advance': (mode) => cellApis[activeId]?.run(true, { focusNext: mode === 'edit' }),
+		'select-prev': () => selectRelative(-1),
+		'select-next': () => selectRelative(1),
+		'fold-section': () => setFolded(activeId, true),
+		'unfold-section': () => setFolded(activeId, false),
+		'move-cell-up': (mode) => moveActive('up', mode),
+		'move-cell-down': (mode) => moveActive('down', mode),
+		'insert-above': () => insertCell('above'),
+		'insert-below': () => insertCell('below'),
+		'to-markdown': () => activeId && setType(activeId, 'markdown'),
+		'to-code': () => activeId && setType(activeId, 'code')
+	};
+
+	function onKeydown(e) {
+		// A modal (settings, delete-confirm) owns the keyboard while it is open.
+		if (document.querySelector('.modal-open')) return;
+		const chord = chordFromEvent(e);
+		if (!chord) return;
+
+		const t = e.target;
+		const inEditor = !!t?.closest?.('.cm-editor');
+		// The keystroke's mode is read off the DOM, not off `keyMode`: whatever has
+		// focus decides. That is what guarantees a command-mode letter (`j`, `a`)
+		// can never fire while the user is typing in an editor.
+		if (!inEditor && t?.closest?.('input, textarea, select, [contenteditable="true"]')) return;
+		// Only keystrokes aimed at this notebook (or at no element at all, which is
+		// where focus lands after Escape) are ours; the sidebar keeps its own keys.
+		if (!(t === document.body || root?.contains(t))) return;
+		const mode = inEditor ? 'edit' : 'command';
+		// Let a focused control keep its native activation keys.
+		if (mode === 'command' && (chord === 'Enter' || chord === 'Space') && t?.closest?.('button, a, [role="button"]')) return;
+
+		const shortcut = shortcuts.lookup(mode, chord);
+		const action = shortcut && actions[shortcut.id];
+		if (!action) return;
 		e.preventDefault();
 		e.stopPropagation();
-		const id = host.dataset.cellId;
-		setActive(id);
-		moveCell(id, e.key === 'ArrowUp' ? 'up' : 'down');
-		// Reordering moves the editor's DOM node and drops focus; restore it so
-		// moves chain and the shortcut keeps acting on "the selected cell".
-		await tick();
-		focusers[id]?.();
+		action(mode);
 	}
 </script>
 
@@ -488,28 +616,37 @@
 		<p class="px-2 text-sm text-base-content/40">loading…</p>
 	</div>
 {:else}
-	<Notebook
-		{cells}
-		{theme}
-		runningId={runningId}
-		{activeId}
-		hidden={folding.hidden}
-		foldedIds={foldedIds}
-		hiddenCounts={folding.counts}
-		onToggleFold={toggleFold}
-		onRun={runCell}
-		onRunAdvance={runAndAdvance}
-		onClear={clearCell}
-		onDelete={deleteCell}
-		onMove={moveCell}
-		onMoveToIndex={moveCellToIndex}
-		onEdit={editCell}
-		onSetType={setType}
-		onSetScrolled={setScrolled}
-		editorCollapsed={editorCollapsed}
-		onSetEditorCollapsed={setEditorCollapsed}
-		onActivate={setActive}
-		onReady={registerFocus}
-		onAddCell={addCell}
-	/>
+	<!-- `root` scopes the modal-keyboard handler and cell scroll lookups to THIS
+	     notebook: several notebooks stay mounted (hidden) and a cell id is only
+	     unique within one document. -->
+	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+	<div bind:this={root} tabindex="-1" class="outline-none" data-testid="notebook-root">
+		<Notebook
+			{cells}
+			{theme}
+			{activeId}
+			{keyMode}
+			runningId={runningId}
+			hidden={folding.hidden}
+			foldedIds={foldedIds}
+			hiddenCounts={folding.counts}
+			onToggleFold={toggleFold}
+			onRun={runCell}
+			onRunAdvance={runAndAdvance}
+			onClear={clearCell}
+			onDelete={deleteCell}
+			onMove={moveCell}
+			onMoveToIndex={moveCellToIndex}
+			onEdit={editCell}
+			onSetType={setType}
+			onSetScrolled={setScrolled}
+			editorCollapsed={editorCollapsed}
+			onSetEditorCollapsed={setEditorCollapsed}
+			onActivate={setActive}
+			onRegister={registerCell}
+			onEditorFocus={onEditorFocus}
+			onEditorBlur={onEditorBlur}
+			onAddCell={addCell}
+		/>
+	</div>
 {/if}
