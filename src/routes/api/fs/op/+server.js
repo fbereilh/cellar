@@ -6,6 +6,7 @@ import {
 	moveEntry,
 	copyEntry
 } from '$lib/server/fstree.js';
+import { dropDocs, rekeyDocs } from '$lib/server/notebook.js';
 
 /**
  * File-management operations for the sidebar file explorer. A single POST
@@ -26,12 +27,21 @@ export async function POST({ request }) {
 		switch (op) {
 			case 'create':
 				return json({ ok: true, ...createEntry(body.parent ?? '', body.name, body.kind) });
-			case 'rename':
-				return json({ ok: true, ...renameEntry(body.path, body.name) });
-			case 'delete':
-				return json({ ok: true, ...deleteEntry(body.path) });
-			case 'move':
-				return json({ ok: true, ...moveEntry(body.path, body.dest ?? '') });
+			case 'rename': {
+				const res = renameEntry(body.path, body.name);
+				if (res.from && res.from !== res.path) rekeyDocs(res.from, res.path);
+				return json({ ok: true, ...res });
+			}
+			case 'delete': {
+				const res = deleteEntry(body.path);
+				dropDocs(res.path);
+				return json({ ok: true, ...res });
+			}
+			case 'move': {
+				const res = moveEntry(body.path, body.dest ?? '');
+				if (res.from && res.from !== res.path) rekeyDocs(res.from, res.path);
+				return json({ ok: true, ...res });
+			}
 			case 'copy':
 				return json({ ok: true, ...copyEntry(body.path, body.dest ?? '') });
 			default:
