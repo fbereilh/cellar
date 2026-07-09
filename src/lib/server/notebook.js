@@ -21,6 +21,7 @@
 import { join, resolve, isAbsolute, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { readNotebook, deserialize, writeNotebook } from './ipynb.js';
+import { publish } from './events.js';
 
 const FILENAME = 'notebook.ipynb';
 
@@ -134,6 +135,23 @@ function docFor(nb) {
 
 const cellView = (c) => ({ id: c.id, cell_type: c.cell_type, source: c.source, outputs: c.outputs, metadata: c.metadata ?? {} });
 
+/**
+ * Broadcast a structural document change over the event bus so every open tab
+ * reflects an agent-driven (or other-tab) mutation with no reload. This is the
+ * single chokepoint: all mutations flow through the exported ops below, so a
+ * `publish()` here reaches the browser regardless of whether the caller was the
+ * UI REST routes or the in-process MCP tools.
+ *
+ * Events are tagged with the document's canonical absolute path (`doc.path`) —
+ * the same id the browser filters on — and carry the caller's `originId` when
+ * one was threaded through (a UI action); the initiating tab drops its own echo
+ * so a user's own structural action never double-applies. Agent (MCP) calls
+ * pass no `originId`, so every tab renders them.
+ */
+function emit(doc, type, extra, originId) {
+	publish({ type, nb: doc.path, ...extra, originId });
+}
+
 /** Serializable view of a notebook for the browser. */
 export function getNotebook(nb) {
 	const doc = docFor(nb);
@@ -168,6 +186,38 @@ export function setActiveNotebook(nb) {
 /** Absolute path of the active notebook (defaults to the workspace notebook). */
 export function getActiveNotebookPath() {
 	return activePath || canonicalPath();
+}
+
+/**
+ * Create a new workspace notebook (or open an existing one at that path), make
+ * it the active notebook, and broadcast `notebook:opened` so an already-open
+ * shell surfaces it in a tab with no reload. `nb` is a workspace-relative path
+ * (a `.ipynb` name); if a file already exists there it is opened rather than
+ * overwritten (never clobbers a user's notebook). New notebooks seed with one
+ * empty code cell so the kernel-attached view is immediately usable.
+ */
+export function createNotebook(nb, originId) {
+	const abs = resolveAbs(nb);
+	let doc = docs.get(abs);
+	if (!doc) {
+		const raw = readNotebook(abs);
+		if (raw) {
+			doc = loadDoc(abs);
+		} else {
+			doc = { path: abs, cells: [newCell('code')], metadata: undefined };
+			docs.set(abs, doc);
+			persist(doc);
+		}
+	}
+	activePath = abs;
+	publish({
+		type: 'notebook:opened',
+		nb: abs,
+		relPath: relative(workspace(), abs),
+		name: abs.split(/[/\\]/).pop(),
+		originId
+	});
+	return getNotebook(abs);
 }
 
 /**
@@ -236,7 +286,7 @@ export function setOutputScrolled(id, scrolled, nb) {
 }
 
 /** Move a cell to an absolute index (clamped). */
-export function moveCellTo(id, index, nb) {
+export function moveCellTo(id, index, nb, originId) {
 	const doc = docFor(nb);
 	const from = doc.cells.findIndex((c) => c.id === id);
 	if (from < 0) return false;
@@ -244,41 +294,47 @@ export function moveCellTo(id, index, nb) {
 	const to = Math.max(0, Math.min(index, doc.cells.length));
 	doc.cells.splice(to, 0, cell);
 	persist(doc);
+	emit(doc, 'cell:moved', { cellId: id, toIndex: to }, originId);
 	return true;
 }
 
-export function addCell(afterId, cellType = 'code', nb) {
+export function addCell(afterId, cellType = 'code', nb, originId) {
 	const doc = docFor(nb);
 	const cell = newCell(cellType);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
 	if (idx >= 0) doc.cells.splice(idx + 1, 0, cell);
 	else doc.cells.push(cell);
 	persist(doc);
+	emit(doc, 'cell:added', { cell: cellView(cell), afterId: idx >= 0 ? afterId : null }, originId);
 	return cell;
 }
 
 /** Switch a cell between 'code' and 'markdown'. Markdown cells carry no outputs. */
-export function setCellType(id, cellType, nb) {
+export function setCellType(id, cellType, nb, originId) {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return;
 	cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
 	if (cell.cell_type === 'markdown') cell.outputs = [];
 	persist(doc);
+	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type }, originId);
 }
 
-export function deleteCell(id, nb) {
+export function deleteCell(id, nb, originId) {
 	const doc = docFor(nb);
+	const existed = doc.cells.some((c) => c.id === id);
 	doc.cells = doc.cells.filter((c) => c.id !== id);
 	persist(doc);
+	if (existed) emit(doc, 'cell:deleted', { cellId: id }, originId);
 }
 
-export function setSource(id, source, nb) {
+export function setSource(id, source, nb, originId) {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell) {
 		cell.source = source;
 		persist(doc);
+		emit(doc, 'cell:edited', { cellId: id, source }, originId);
 	}
 }
 
@@ -291,16 +347,17 @@ export function setOutputs(id, outputs, nb) {
 	}
 }
 
-export function clearOutputs(id, nb) {
+export function clearOutputs(id, nb, originId) {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell) {
 		cell.outputs = [];
 		persist(doc);
+		emit(doc, 'cell:cleared', { cellId: id }, originId);
 	}
 }
 
-export function moveCell(id, dir, nb) {
+export function moveCell(id, dir, nb, originId) {
 	const doc = docFor(nb);
 	const i = doc.cells.findIndex((c) => c.id === id);
 	if (i < 0) return;
@@ -308,4 +365,5 @@ export function moveCell(id, dir, nb) {
 	if (j < 0 || j >= doc.cells.length) return;
 	[doc.cells[i], doc.cells[j]] = [doc.cells[j], doc.cells[i]];
 	persist(doc);
+	emit(doc, 'cell:moved', { cellId: id, toIndex: j }, originId);
 }

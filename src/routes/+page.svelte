@@ -5,6 +5,7 @@
 	import LiveNotebook from '$lib/LiveNotebook.svelte';
 	import FileTab from '$lib/FileTab.svelte';
 	import Settings from '$lib/Settings.svelte';
+	import { subscribeEvents, originId } from '$lib/events-client.js';
 
 	let { data } = $props();
 
@@ -317,6 +318,21 @@
 			if (kernelInfo.started) refreshVariables();
 		});
 	});
+
+	// Surface an agent-created / newly-active notebook live: when the MCP
+	// `create_notebook` tool runs, the server broadcasts `notebook:opened` so we
+	// open (or focus) a permanent tab for it with no reload. Our own actions carry
+	// this tab's `originId` and are skipped. `openFilePermanent` maps the default
+	// notebook's relative path to the canonical 'notebook' tab and any other
+	// `.ipynb` to a live `ipynb` tab — the same paths a tree double-click uses.
+	onMount(() =>
+		subscribeEvents((ev) => {
+			if (ev.type !== 'notebook:opened') return;
+			if (ev.originId && ev.originId === originId) return;
+			if (!ev.relPath) return;
+			openFilePermanent(ev.relPath);
+		})
+	);
 </script>
 
 <div class="flex h-screen flex-col overflow-hidden bg-base-200 text-base-content">

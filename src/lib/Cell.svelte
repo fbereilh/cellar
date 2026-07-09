@@ -35,8 +35,22 @@
 	let editorEl;
 	let view;
 	let editTimer;
+	// True while the user has uncommitted local typing (a debounced save pending).
+	// Together with editor focus this gates whether a remote source edit may
+	// overwrite the editor (the editor-safety rule).
+	let editPending = false;
+	// True only while WE programmatically replace the doc (applying a remote
+	// edit); the update listener checks it so a remote apply is never echoed back
+	// to the server as a local edit.
+	let applyingRemote = false;
 
 	const isMarkdown = $derived(cell.cell_type === 'markdown');
+
+	// A remote (agent / other-tab) source edit that arrived while the user was
+	// editing this cell, held until they choose to load it (the affordance below).
+	let remoteChanged = $state(false);
+	let pendingRemoteSource = null;
+	let appliedRemote = null; // the last cell.remoteEdit object we processed
 
 	// Markdown cells render to HTML by default; double-click / edit → raw source.
 	let mode = $state(cell.cell_type === 'markdown' && cell.source.trim() ? 'rendered' : 'edit');
@@ -167,6 +181,46 @@
 		return view ? view.state.doc.toString() : cell.source;
 	}
 
+	// Replace the editor's whole document with `src` without echoing it back to
+	// the server as a local edit (the update listener honors `applyingRemote`).
+	function applySourceToEditor(src) {
+		if (!view) return;
+		applyingRemote = true;
+		try {
+			view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: src } });
+		} finally {
+			applyingRemote = false;
+		}
+		liveSource = src;
+		cell.source = src;
+	}
+
+	// The editor-safety rule (report §3.4): a remote source edit updates the
+	// editor in place ONLY when the user isn't actively editing this cell
+	// (unfocused and no pending local change). Otherwise we stash it and surface a
+	// subtle "changed on server" affordance so the user's typing is never clobbered.
+	$effect(() => {
+		const re = cell.remoteEdit;
+		if (!re || re === appliedRemote) return;
+		appliedRemote = re;
+		const editing = (view && view.hasFocus) || editPending;
+		if (view && !editing) {
+			applySourceToEditor(re.source);
+			remoteChanged = false;
+			pendingRemoteSource = null;
+			if (isMarkdown && mode === 'rendered') liveSource = re.source; // refresh the rendered view
+		} else {
+			pendingRemoteSource = re.source;
+			remoteChanged = true;
+		}
+	});
+
+	function loadRemote() {
+		if (pendingRemoteSource != null) applySourceToEditor(pendingRemoteSource);
+		remoteChanged = false;
+		pendingRemoteSource = null;
+	}
+
 	// Run/render. For markdown this just renders (parent persists source, no
 	// kernel); for code the parent runs it on the kernel.
 	function doRun(advance) {
@@ -227,8 +281,13 @@
 					EditorView.updateListener.of((v) => {
 						if (!v.docChanged) return;
 						liveSource = v.state.doc.toString();
+						if (applyingRemote) return; // programmatic remote apply → don't save/echo
+						editPending = true;
 						clearTimeout(editTimer);
-						editTimer = setTimeout(() => onEdit(cell.id, liveSource), 500);
+						editTimer = setTimeout(() => {
+							editPending = false;
+							onEdit(cell.id, liveSource);
+						}, 500);
 					}),
 					EditorView.theme({
 						'&': { backgroundColor: 'transparent', fontSize: '13.5px' },
@@ -349,6 +408,16 @@
 				{:else}
 					<span class="text-base-content/30">Empty markdown cell — double-click to edit</span>
 				{/if}
+			</div>
+		{/if}
+
+		<!-- "Changed on server" affordance: a remote (agent / other-tab) edit
+		     arrived while you were editing this cell, so it was held back rather
+		     than clobbering your typing. Load applies it to the editor. -->
+		{#if remoteChanged}
+			<div class="flex items-center justify-between gap-2 border-b border-warning/40 bg-warning/10 px-3 py-1 text-[11px] text-warning" data-testid="remote-changed">
+				<span>Changed on server while you were editing.</span>
+				<button class="btn btn-ghost btn-xs h-5 min-h-0 px-2 text-warning hover:bg-warning/20" onclick={loadRemote} data-testid="remote-changed-load">Load</button>
 			</div>
 		{/if}
 
