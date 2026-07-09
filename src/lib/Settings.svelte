@@ -1,7 +1,7 @@
 <script>
 	// Settings panel (modal): theme toggle, the project-venv (Python kernel)
 	// control, and the keyboard-shortcut registry (view + rebind).
-	import { shortcuts, chordFromEvent, chordTokens, formatChord, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte.js';
+	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte.js';
 
 	let { open, theme, onClose, onSetTheme, onVenvRebound } = $props();
 
@@ -21,12 +21,20 @@
 	let capturing = $state(null);
 	const isCapturing = (id, i) => capturing?.id === id && capturing.index === i;
 
+	// A captured chord that would shadow a typable character, held for the user to
+	// confirm: `{id, index, chord}`. Binding `k` to an edit-mode or global command
+	// really does make `k` untypable in every cell, so we say so in as many words,
+	// and then, if they still want it, we do it. The freedom is the point; the
+	// surprise is what we refuse.
+	let pendingHazard = $state(null);
+
 	// While capturing, swallow every keystroke and turn the first real chord into
 	// the new binding. Escape cancels (its own binding is reachable via Reset).
 	// LiveNotebook's handler already stands down whenever a modal is open, so the
 	// notebook can't act on the keys being captured here.
 	$effect(() => {
 		if (!capturing) return;
+		const slot = capturing;
 		function onKey(e) {
 			e.preventDefault();
 			e.stopPropagation();
@@ -36,17 +44,40 @@
 			}
 			const chord = chordFromEvent(e);
 			if (!chord) return; // a bare modifier press: keep listening
-			shortcuts.rebind(capturing.id, capturing.index, chord);
 			capturing = null;
+			const target = shortcuts.list.find((s) => s.id === slot.id);
+			// Outside command mode, a bare printable chord steals a character from
+			// every editor. Allowed, but only once the user has seen what it costs.
+			if (target && target.mode !== 'command' && typesACharacter(chord)) {
+				pendingHazard = { ...slot, chord };
+				return;
+			}
+			shortcuts.rebind(slot.id, slot.index, chord);
 		}
 		window.addEventListener('keydown', onKey, true);
 		return () => window.removeEventListener('keydown', onKey, true);
 	});
 
-	// Leaving the modal must never strand the capture listener.
+	function confirmHazard() {
+		if (pendingHazard) shortcuts.rebind(pendingHazard.id, pendingHazard.index, pendingHazard.chord);
+		pendingHazard = null;
+	}
+
+	// Leaving the modal must never strand the capture listener or a half-answered
+	// confirmation.
 	$effect(() => {
-		if (!open) capturing = null;
+		if (!open) {
+			capturing = null;
+			pendingHazard = null;
+		}
 	});
+
+	// Starting a new capture supersedes any unanswered hazard confirmation, so the
+	// two prompts can never be on screen at once.
+	function startCapture(id, index) {
+		pendingHazard = null;
+		capturing = { id, index };
+	}
 
 	// ---- Venv control --------------------------------------------------------
 	let venv = $state(null);
@@ -212,50 +243,75 @@
 								<div class="mb-1 text-xs font-semibold uppercase tracking-wide text-base-content/40">{group.category}</div>
 								<ul class="space-y-0.5">
 									{#each group.items as s (s.id)}
+										{@const hazards = typingHazards(s)}
 										<li
-											class="flex items-center justify-between gap-3 rounded px-1.5 py-1 hover:bg-base-200 {conflicts.has(s.id) ? 'ring-1 ring-warning/50' : ''}"
+											class="rounded px-1.5 py-1 hover:bg-base-200 {conflicts.has(s.id) || hazards.length ? 'ring-1 ring-warning/50' : ''}"
 											data-testid="shortcut-row"
 											data-shortcut-id={s.id}
 										>
-											<div class="min-w-0">
-												<div class="truncate text-xs">{s.description}</div>
-												<div class="text-[10px] text-base-content/40">{MODE_LABEL[s.mode]}</div>
-											</div>
-											<div class="flex shrink-0 items-center gap-1">
-												{#each s.keys as chord, i (i)}
-													<!-- Alternate bindings for the same command read as one run of
-													     keys without this separator. -->
-													{#if i > 0}
-														<span class="text-[10px] text-base-content/30">or</span>
-													{/if}
-													<button
-														class="btn btn-ghost btn-xs h-6 min-h-0 gap-0.5 px-1 {isCapturing(s.id, i) ? 'text-warning' : ''}"
-														onclick={() => (capturing = { id: s.id, index: i })}
-														title={isCapturing(s.id, i) ? 'Press the new key combination (Esc cancels)' : `Rebind ${formatChord(chord)}`}
-														data-testid="shortcut-key"
-														data-chord={chord}
-													>
-														{#if isCapturing(s.id, i)}
-															<span class="px-1 text-[11px]">Press keys…</span>
-														{:else}
-															{#each chordTokens(chord) as token}
-																<kbd class="kbd kbd-sm">{token}</kbd>
-															{/each}
+											<div class="flex items-center justify-between gap-3">
+												<div class="min-w-0">
+													<div class="truncate text-xs">{s.description}</div>
+													<div class="text-[10px] text-base-content/40">{MODE_LABEL[s.mode]}</div>
+												</div>
+												<div class="flex shrink-0 items-center gap-1">
+													{#each s.keys as chord, i (i)}
+														<!-- Alternate bindings for the same command read as one run of
+														     keys without this separator. -->
+														{#if i > 0}
+															<span class="text-[10px] text-base-content/30">or</span>
 														{/if}
-													</button>
-												{/each}
-												{#if s.customized}
-													<button
-														class="btn btn-ghost btn-xs btn-square h-6 min-h-0 text-base-content/40 hover:text-base-content"
-														onclick={() => shortcuts.reset(s.id)}
-														title="Reset to the default binding"
-														aria-label="Reset {s.description} to its default binding"
-														data-testid="shortcut-reset"
-													>
-														<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /></svg>
-													</button>
-												{/if}
+														<button
+															class="btn btn-ghost btn-xs h-6 min-h-0 gap-0.5 px-1 {isCapturing(s.id, i) ? 'text-warning' : ''}"
+															onclick={() => startCapture(s.id, i)}
+															title={isCapturing(s.id, i) ? 'Press the new key combination (Esc cancels)' : `Rebind ${formatChord(chord)}`}
+															data-testid="shortcut-key"
+															data-chord={chord}
+														>
+															{#if isCapturing(s.id, i)}
+																<span class="px-1 text-[11px]">Press keys…</span>
+															{:else}
+																{#each chordTokens(chord) as token}
+																	<kbd class="kbd kbd-sm">{token}</kbd>
+																{/each}
+															{/if}
+														</button>
+													{/each}
+													{#if s.customized}
+														<button
+															class="btn btn-ghost btn-xs btn-square h-6 min-h-0 text-base-content/40 hover:text-base-content"
+															onclick={() => shortcuts.reset(s.id)}
+															title="Reset to the default binding"
+															aria-label="Reset {s.description} to its default binding"
+															data-testid="shortcut-reset"
+														>
+															<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /></svg>
+														</button>
+													{/if}
+												</div>
 											</div>
+
+											<!-- Confirm a binding that shadows a typable character. Allowed, never
+											     silently: the user is told exactly which character they are giving up. -->
+											{#if pendingHazard?.id === s.id}
+												<div class="mt-1 rounded border border-warning/50 bg-warning/10 px-2 py-1.5 text-[11px] text-warning" data-testid="shortcut-hazard-confirm">
+													<div>
+														<span class="font-semibold">{formatChord(pendingHazard.chord)}</span> is a key you type. This command
+														fires while a cell editor has focus, so binding it here means
+														<span class="font-semibold">{formatChord(pendingHazard.chord)}</span> can no longer be typed into a cell.
+													</div>
+													<div class="mt-1 flex gap-1">
+														<button class="btn btn-warning btn-xs h-5 min-h-0" onclick={confirmHazard} data-testid="shortcut-hazard-confirm-ok">Bind anyway</button>
+														<button class="btn btn-ghost btn-xs h-5 min-h-0" onclick={() => (pendingHazard = null)} data-testid="shortcut-hazard-cancel">Cancel</button>
+													</div>
+												</div>
+											{:else if hazards.length}
+												<!-- A standing warning: this binding is already shadowing a character. -->
+												<div class="mt-0.5 flex items-center gap-1 text-[10px] font-medium text-warning" data-testid="shortcut-hazard-warning">
+													<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+													<span>{hazards.map(formatChord).join(', ')} can no longer be typed into a cell editor.</span>
+												</div>
+											{/if}
 										</li>
 									{/each}
 								</ul>

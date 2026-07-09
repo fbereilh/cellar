@@ -167,6 +167,35 @@ export function chordFromEvent(e) {
 	return parts.join('-');
 }
 
+/**
+ * A chord split into its modifier tokens and its key token.
+ * `Mod--` → `{mods:['Mod'], key:'-'}`; `-` → `{mods:[], key:'-'}`; `k` → `{mods:[], key:'k'}`.
+ */
+export function parseChord(chord) {
+	const parts = chord.split('-');
+	// A trailing '-' key (e.g. `Mod--`, or the bare `-`) leaves an empty last part.
+	const key = parts.pop() || '-';
+	return { mods: parts.filter(Boolean), key };
+}
+
+/**
+ * True when a chord is a keystroke that would otherwise type a character into a
+ * text editor. Binding one to a shortcut that fires outside command mode makes
+ * that character untypable in every cell. Settings warns loudly, but still lets
+ * the user do it (they may well have remapped the mode keys to suit).
+ */
+export function typesACharacter(chord) {
+	const { mods, key } = parseChord(chord);
+	if (mods.some((m) => m !== 'Shift')) return false; // Shift-a still types "A"
+	return key.length === 1 || key === 'Space';
+}
+
+/** The bindings of `shortcut` that shadow a typable character (empty when none). */
+export function typingHazards(shortcut) {
+	if (shortcut.mode === 'command') return []; // command mode is exactly where bare letters belong
+	return shortcut.keys.filter(typesACharacter);
+}
+
 const MAC_MODS = { Mod: '⌘', Shift: '⇧', Alt: '⌥', Ctrl: '⌃', Meta: '⌘' };
 const PC_MODS = { Mod: 'Ctrl', Shift: 'Shift', Alt: 'Alt', Ctrl: 'Ctrl', Meta: 'Win' };
 const KEY_LABELS = {
@@ -183,11 +212,9 @@ const KEY_LABELS = {
 
 /** A chord as display tokens, one per `<kbd>`: `Shift-Enter` → ['⇧','⏎']. */
 export function chordTokens(chord) {
-	const mods = isMac ? MAC_MODS : PC_MODS;
-	const parts = chord.split('-');
-	// A trailing '-' key (e.g. `Mod--`) leaves an empty last part; restore it.
-	const key = parts.pop() || '-';
-	return [...parts.map((p) => mods[p] ?? p), KEY_LABELS[key] ?? key];
+	const labels = isMac ? MAC_MODS : PC_MODS;
+	const { mods, key } = parseChord(chord);
+	return [...mods.map((m) => labels[m] ?? m), KEY_LABELS[key] ?? key];
 }
 
 /** A chord as one readable string, for titles and aria labels. */

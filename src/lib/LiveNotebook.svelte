@@ -70,6 +70,10 @@
 		else next.add(id);
 		foldedIds = next;
 		saveFolds();
+		// Command mode always acts on the selected cell, so the selection can never
+		// be a cell the user cannot see: a fold that hides it hands it to the header
+		// that swallowed it. (`folding` is derived, so it already reflects `next`.)
+		if (activeId && folding.hidden.has(activeId)) activeId = id;
 	}
 
 	// ---- Collapsible code editors --------------------------------------------
@@ -402,14 +406,21 @@
 		const i = cells.findIndex((c) => c.id === id);
 		cells = cells.filter((c) => c.id !== id);
 		// Keep a cell selected: command mode acts on the selection, so deleting the
-		// selected cell must hand the selection to its neighbor, not drop it.
-		if (activeId === id) selectAfterRemoval(i);
+		// selected cell must hand the selection to its neighbor, not drop it. Focus
+		// follows, because the delete button that had it is gone with the cell.
+		if (activeId === id) selectAfterRemoval(i, { focus: true });
 		await fetch(`/api/cells/${id}?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, { method: 'DELETE' });
 	}
 
-	/** After removing the cell at `index`, select whatever slid into its place. */
-	function selectAfterRemoval(index) {
-		activeId = cells[Math.min(Math.max(index, 0), cells.length - 1)]?.id ?? null;
+	/**
+	 * After removing the cell at `index`, select whatever slid into its place.
+	 * Only a local delete takes focus with it: an agent (or other-tab) delete must
+	 * not yank the caret out of a cell this user is typing in.
+	 */
+	function selectAfterRemoval(index, { focus = false } = {}) {
+		const id = cells[Math.min(Math.max(index, 0), cells.length - 1)]?.id ?? null;
+		activeId = id;
+		if (focus && id) selectAndFocus(id);
 	}
 
 	async function moveCell(id, dir) {
@@ -479,9 +490,12 @@
 		return view;
 	}
 
-	// Shift+Enter: run in place, then advance. From edit mode we focus the next
-	// cell's editor (keep typing); from command mode we only move the selection,
-	// which is Jupyter's behavior. Creates a fresh cell when run on the last one.
+	// Shift+Enter: run in place, then advance, identically for code and markdown
+	// (a markdown cell "runs" by rendering, and `Cell.doRun` has already switched it
+	// to its rendered view by the time we get here). From edit mode we focus the
+	// next cell's editor (keep typing); from command mode we move the selection and
+	// its focus. Either way focus lands on the next cell, never back in the cell
+	// that just ran. Creates a fresh cell when run on the last one.
 	async function runAndAdvance(id, source, { focusNext = true } = {}) {
 		runCell(id, source); // fire; advancing shouldn't wait for completion
 		const i = cells.findIndex((c) => c.id === id);
@@ -490,10 +504,16 @@
 			const created = await addCell(id);
 			nextId = created.id;
 		}
+		if (!focusNext) {
+			await selectAndFocus(nextId);
+			return;
+		}
 		setActive(nextId);
 		await tick();
-		if (focusNext) cellApis[nextId]?.focus();
-		else scrollCellIntoView(nextId);
+		// `focus()` lands on the next cell's editor, or on the cell itself when that
+		// cell is rendered markdown (whose editor is display:none and unfocusable).
+		cellApis[nextId]?.focus();
+		scrollCellIntoView(nextId);
 	}
 
 	// ---- Modal keyboard ------------------------------------------------------
@@ -513,13 +533,27 @@
 		el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 	}
 
+	/**
+	 * Select `id` and give it DOM focus (command mode). The dispatcher decides both
+	 * a keystroke's mode and its target from the focused element, so a selection the
+	 * focus doesn't follow is a selection the next keystroke doesn't act on: the
+	 * next key would instead reach whatever button or rendered cell the user last
+	 * clicked. Awaits `tick()` so a just-created cell has registered its API.
+	 */
+	async function selectAndFocus(id) {
+		if (!id) return;
+		setActive(id);
+		await tick();
+		cellApis[id]?.focusCell();
+		scrollCellIntoView(id);
+	}
+
 	function selectRelative(delta) {
 		const list = selectable;
 		if (!list.length) return;
 		const i = list.findIndex((c) => c.id === activeId);
 		const next = list[i < 0 ? 0 : Math.min(list.length - 1, Math.max(0, i + delta))];
-		setActive(next.id);
-		scrollCellIntoView(next.id);
+		selectAndFocus(next.id);
 	}
 
 	// Fold/unfold act on the selected cell only when it is a markdown header, and
@@ -533,30 +567,30 @@
 		const i = cells.findIndex((c) => c.id === activeId);
 		if (where === 'below' || i < 0) {
 			const created = await addCell(activeId ?? cells.at(-1)?.id);
-			setActive(created.id);
+			await selectAndFocus(created.id);
 			return;
 		}
 		if (i > 0) {
 			const created = await addCell(cells[i - 1].id);
-			setActive(created.id);
+			await selectAndFocus(created.id);
 			return;
 		}
 		// Above the first cell: the API can only insert *after* an id, so append
 		// and move it to the top (one extra persist, same clean-on-save result).
 		const created = await addCell(cells.at(-1)?.id);
 		await moveCellToIndex(created.id, 0);
-		setActive(created.id);
+		await selectAndFocus(created.id);
 	}
 
-	// Reordering moves the editor's DOM node and drops focus; restore it (edit
-	// mode) or just keep the moved cell in view (command mode) so moves chain.
+	// Reordering moves the cell's DOM node and drops focus; restore it onto the
+	// editor (edit mode) or onto the cell (command mode), so moves chain.
 	async function moveActive(dir, mode) {
 		const id = activeId;
 		if (!id) return;
 		moveCell(id, dir);
 		await tick();
 		if (mode === 'edit') cellApis[id]?.focus();
-		else scrollCellIntoView(id);
+		else await selectAndFocus(id);
 	}
 
 	/** shortcut id → what it does. `mode` is the mode the keystroke fired in. */
@@ -584,6 +618,10 @@
 		if (!chord) return;
 
 		const t = e.target;
+		// CodeMirror's own panels (the search/replace bar) are its keyboard, not
+		// ours: they live inside `.cm-editor`, so the `inEditor` test alone would
+		// hand their Enter and Mod-Enter to the notebook.
+		if (t?.closest?.('.cm-panel')) return;
 		const inEditor = !!t?.closest?.('.cm-editor');
 		// The keystroke's mode is read off the DOM, not off `keyMode`: whatever has
 		// focus decides. That is what guarantees a command-mode letter (`j`, `a`)
@@ -595,6 +633,16 @@
 		const mode = inEditor ? 'edit' : 'command';
 		// Let a focused control keep its native activation keys.
 		if (mode === 'command' && (chord === 'Enter' || chord === 'Space') && t?.closest?.('button, a, [role="button"]')) return;
+		// Escape belongs to CodeMirror while CodeMirror has something to close (its
+		// completion tooltip, its search panel). That is Jupyter's behavior, and
+		// preempting it would strand the tooltip on screen. Only once the editor has
+		// nothing of its own open does Escape leave for command mode. Keyed off the
+		// *focused* cell rather than `activeId`, which is the same cell in edit mode
+		// but need not be if a focus event is still in flight.
+		if (mode === 'edit' && chord === 'Escape') {
+			const focusedId = t.closest('[data-cell-id]')?.dataset.cellId;
+			if (cellApis[focusedId]?.editorOverlayOpen?.()) return;
+		}
 
 		const shortcut = shortcuts.lookup(mode, chord);
 		const action = shortcut && actions[shortcut.id];

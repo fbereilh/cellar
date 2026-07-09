@@ -3,6 +3,8 @@
 	import { browser } from '$app/environment';
 	import { EditorView } from '@codemirror/view';
 	import { EditorState, Compartment } from '@codemirror/state';
+	import { completionStatus } from '@codemirror/autocomplete';
+	import { searchPanelOpen } from '@codemirror/search';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
@@ -42,6 +44,7 @@
 		onDragEnd
 	} = $props();
 
+	let cardEl; // the cell's outer card: what holds focus in command mode
 	let editorEl;
 	let view;
 	let editorResizeObserver;
@@ -343,6 +346,37 @@
 		view?.focus();
 	}
 
+	/**
+	 * Put DOM focus on the cell itself (command mode). Jupyter keeps focus on the
+	 * selected cell, and so must we: the notebook's dispatcher reads a keystroke's
+	 * mode (and its target) off the focused element, so a selection the focus
+	 * doesn't follow means the next key acts on whatever the user last clicked.
+	 */
+	function focusCell() {
+		cardEl?.focus({ preventScroll: true });
+	}
+
+	/**
+	 * Focus for "advance to this cell": its editor, unless it is a markdown cell
+	 * showing rendered HTML: that editor is `display:none` and cannot take focus,
+	 * so the cell itself does (which is command mode, as Jupyter does it).
+	 */
+	function focusEditorOrCell() {
+		if (isMarkdown && mode === 'rendered') focusCell();
+		else view?.focus();
+	}
+
+	/**
+	 * True while CodeMirror has an overlay of its own open: the completion tooltip
+	 * or the search panel. Escape belongs to whichever of those is showing (Jupyter
+	 * parity: Escape only drops you back to command mode once the editor has
+	 * nothing of its own left to close).
+	 */
+	function editorOverlayOpen() {
+		if (!view) return false;
+		return completionStatus(view.state) != null || searchPanelOpen(view.state);
+	}
+
 	const language = new Compartment();
 	const editorTheme = new Compartment();
 	const langFor = (type) => (type === 'markdown' ? markdown() : python());
@@ -423,9 +457,16 @@
 		// through `doRun` so it always uses the editor's *live* text, even when the
 		// 500ms edit debounce has not fired yet.
 		onRegister?.(cell.id, {
-			focus: () => view?.focus(),
-			blur: () => view?.contentDOM.blur(),
+			focus: focusEditorOrCell,
+			focusCell,
+			// Leaving the editor hands focus to the cell, not to `document.body`:
+			// command mode keeps acting on the cell you just left.
+			blur: () => {
+				view?.contentDOM.blur();
+				focusCell();
+			},
 			enterEdit,
+			editorOverlayOpen,
 			run: doRun,
 			isMarkdown: () => isMarkdown
 		});
@@ -455,8 +496,15 @@
 	});
 </script>
 
+<!-- `tabindex="-1"` makes the cell itself focusable: in command mode the selected
+     cell holds focus, so the notebook's key dispatcher always sees a keystroke
+     aimed at the cell it is about to act on. Its own ring already marks the
+     selection, so the browser's focus outline is suppressed. -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <div
-	class="card relative overflow-hidden border bg-base-100 shadow-sm transition-colors {shellClass} {dragging ? 'opacity-40' : ''}"
+	bind:this={cardEl}
+	tabindex="-1"
+	class="card relative overflow-hidden border bg-base-100 shadow-sm outline-none transition-colors {shellClass} {dragging ? 'opacity-40' : ''}"
 	data-testid="cell"
 	data-cell-id={cell.id}
 	data-cell-type={cell.cell_type}
