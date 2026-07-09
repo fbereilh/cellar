@@ -1,6 +1,7 @@
 <script>
 	import { onMount, tick } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
+	import { subscribeEvents, originId } from '$lib/events-client.js';
 
 	// A live, kernel-attached notebook document addressed by its workspace path.
 	// Owns its own cell array + all cell operations (every request carries
@@ -15,6 +16,20 @@
 	let loadError = $state('');
 	let runningId = $state(null); // the cell running in THIS notebook (≤1)
 	let activeId = $state(null); // the selected/focused cell (visual emphasis)
+
+	// Canonical (absolute) notebook id, learned from the server on load. The shell
+	// addresses this component by a workspace-relative `path` (fine for the REST
+	// API, which resolves it server-side), but SSE events are tagged with the
+	// server's absolute doc key — so we filter on this, the one id both sides
+	// agree on. `null` until the first load resolves; events are ignored until then
+	// (the load itself is the initial sync).
+	let canonicalId = null;
+	let lastSeq = null; // last per-notebook `seq` seen (gap detection → refetch)
+	// Cell ids awaiting the first streamed chunk of an SSE run — that chunk
+	// replaces the prior output (no flash). Tracked per-cell (not one shared flag)
+	// so interleaved run:start events for different cells can't consume each other's
+	// replace state (MCP runs aren't serialized against UI runs on the wire).
+	const sseReplace = new Set();
 
 	function setActive(id) {
 		activeId = id;
@@ -45,6 +60,15 @@
 			const body = await res.json();
 			if (!res.ok) throw new Error(body?.message || 'could not open notebook');
 			cells = body.notebook.cells;
+			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
+			// This refetch is the correctness backstop (reconnect / seq gap): the
+			// freshly loaded cells carry authoritative outputs, so drop any stale live
+			// run state. Otherwise a lost run:end (tab disconnected while an agent run
+			// finished server-side) would leave the spinner stuck and permanently block
+			// this tab's own runs via the `busy || runningId` guard in runCell.
+			runningId = null;
+			sseReplace.clear();
+			lastSeq = null; // reconnect refetches once here; don't also trip the seq-gap check
 		} catch (err) {
 			loadError = String(err?.message ?? err);
 		} finally {
@@ -56,6 +80,50 @@
 	// edits (rather than a stale snapshot), and cells are only created once the
 	// real source is known — so each Cell's editor seeds with correct content.
 	onMount(load);
+
+	// Live server→client sync. Subscribe to the shared per-tab event stream and
+	// apply run-lifecycle events that target THIS notebook, so an agent-driven run
+	// (or a run from another tab) shows the running indicator + streaming outputs
+	// with no reload. Our own UI runs are skipped here (we render them from the
+	// `/run` NDJSON response) via the per-tab `originId`, so they never double-apply.
+	function applyRunEvent(ev) {
+		const cell = ev.cellId && findCell(ev.cellId);
+		if (ev.type === 'run:start') {
+			if (cell) {
+				runningId = ev.cellId;
+				sseReplace.add(ev.cellId); // first streamed chunk replaces the prior output (no flash)
+			}
+		} else if (ev.type === 'run:output') {
+			if (cell) {
+				if (sseReplace.has(ev.cellId)) {
+					cell.outputs = [ev.output];
+					sseReplace.delete(ev.cellId);
+				} else {
+					cell.outputs = [...cell.outputs, ev.output];
+				}
+			}
+		} else if (ev.type === 'run:end') {
+			if (cell && sseReplace.delete(ev.cellId)) cell.outputs = []; // ran with no output → clear stale
+			if (runningId === ev.cellId) runningId = null;
+		}
+	}
+	onMount(() =>
+		subscribeEvents((ev) => {
+			// (Re)connect → refetch as the correctness backstop (covers events missed
+			// while disconnected). `canonicalId` gates until the first load resolves.
+			if (ev.type === 'sse:open') {
+				if (canonicalId) load();
+				return;
+			}
+			if (ev.type === 'hello') return;
+			if (!canonicalId || ev.nb !== canonicalId) return;
+			// A gap in this notebook's monotonic seq means we missed events → refetch.
+			if (lastSeq !== null && ev.seq > lastSeq + 1) load();
+			lastSeq = ev.seq; // advance even for our own echo, so it isn't seen as a gap
+			if (ev.originId && ev.originId === originId) return; // our own UI run
+			applyRunEvent(ev);
+		})
+	);
 
 	// When this notebook is focused, make it the active notebook the agent-facing
 	// (MCP) tools default to, and own the move-cell keyboard shortcut.
@@ -90,7 +158,7 @@
 			const res = await fetch(`/api/cells/${id}/run`, {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ source, nb: path })
+				body: JSON.stringify({ source, nb: path, originId })
 			});
 			const reader = res.body.getReader();
 			const decoder = new TextDecoder();
@@ -120,7 +188,7 @@
 			replace = false;
 		} finally {
 			if (replace) cell.outputs = []; // ran with no output → clear
-			runningId = null;
+			if (runningId === id) runningId = null; // don't clear a spinner an overlapping run moved elsewhere
 			onRunEnd?.();
 		}
 	}
