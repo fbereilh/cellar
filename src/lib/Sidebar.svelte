@@ -1,6 +1,7 @@
 <script>
-	import { onMount } from 'svelte';
+	import { onMount, setContext } from 'svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
+	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 
 	let {
 		cells,
@@ -20,7 +21,8 @@
 		onOpenNotebook,
 		activeFilePath = null,
 		fsRefreshSignal = 0,
-		onScrollToCell
+		onScrollToCell,
+		onFsChange
 	} = $props();
 
 	// ---- Persisted section collapse state -----------------------------------
@@ -147,6 +149,176 @@
 			return;
 		}
 		refreshFiles();
+	});
+
+	// ---- File management (context menu, clipboard, inline rename/new) -------
+	// A VS Code-style file explorer over the workspace tree. All mutations go
+	// through the path-guarded /api/fs/op route; the tree + git decorations are
+	// refreshed after each op, and tab impact (rename/move/delete) is reported up
+	// via onFsChange so no tab is left pointing at a gone/moved file.
+	let clipboard = $state(null); // { op: 'cut' | 'copy', path }
+	let renaming = $state(null); // relPath being renamed inline
+	let newEntry = $state(null); // { parentPath, kind: 'file' | 'dir' }
+	let selectedNode = $state(null); // { type, path, name }
+	let ctxMenu = $state(null); // { x, y, node }
+	let deleteTarget = $state(null); // { type, path, name }
+	let opError = $state('');
+
+	function parentDir(p) {
+		const i = p.lastIndexOf('/');
+		return i >= 0 ? p.slice(0, i) : '';
+	}
+	// The folder a "new" / "paste" targets: a dir uses itself, a file its parent,
+	// the tree root the workspace root ('').
+	function targetDirFor(node) {
+		if (!node || node.type === 'root') return '';
+		return node.type === 'dir' ? node.path : parentDir(node.path);
+	}
+
+	async function runOp(payload) {
+		opError = '';
+		try {
+			const res = await fetch('/api/fs/op', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify(payload)
+			});
+			const body = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(body?.message || 'operation failed');
+			refreshFiles();
+			return body;
+		} catch (err) {
+			opError = String(err?.message ?? err);
+			return null;
+		}
+	}
+
+	function openMenu(e, node) {
+		selectedNode = node;
+		ctxMenu = { x: e.clientX, y: e.clientY, node };
+	}
+	function closeMenu() {
+		ctxMenu = null;
+	}
+	// Escape dismisses the open context menu (click / scroll dismiss via backdrop).
+	$effect(() => {
+		if (!ctxMenu) return;
+		const onKey = (e) => {
+			if (e.key === 'Escape') closeMenu();
+		};
+		window.addEventListener('keydown', onKey);
+		return () => window.removeEventListener('keydown', onKey);
+	});
+	function onRootContext(e) {
+		e.preventDefault();
+		openMenu(e, { type: 'root', path: '', name: treeRoot?.name ?? '' });
+	}
+
+	function startNew(kind, node) {
+		closeMenu();
+		renaming = null;
+		newEntry = { parentPath: targetDirFor(node), kind };
+	}
+	function cancelNew() {
+		newEntry = null;
+	}
+	async function submitNew(name) {
+		const entry = newEntry;
+		newEntry = null;
+		if (!entry) return;
+		await runOp({ op: 'create', parent: entry.parentPath, name, kind: entry.kind });
+	}
+
+	function startRename(node) {
+		closeMenu();
+		newEntry = null;
+		renaming = node.path;
+	}
+	function cancelRename() {
+		renaming = null;
+	}
+	async function submitRename(path, name) {
+		renaming = null;
+		const res = await runOp({ op: 'rename', path, name });
+		if (res?.path && res.path !== path) onFsChange?.({ type: 'rename', from: path, path: res.path });
+	}
+
+	function cutEntry(node) {
+		closeMenu();
+		clipboard = { op: 'cut', path: node.path };
+	}
+	function copyEntry(node) {
+		closeMenu();
+		clipboard = { op: 'copy', path: node.path };
+	}
+	async function pasteEntry(node) {
+		closeMenu();
+		if (!clipboard) return;
+		const dest = targetDirFor(node);
+		const op = clipboard.op === 'cut' ? 'move' : 'copy';
+		const from = clipboard.path;
+		const res = await runOp({ op, path: from, dest });
+		if (res && op === 'move') {
+			onFsChange?.({ type: 'move', from, path: res.path });
+			clipboard = null; // a cut is consumed; a copy stays for repeat pastes
+		}
+	}
+
+	function askDelete(node) {
+		closeMenu();
+		deleteTarget = { type: node.type, path: node.path, name: node.name };
+	}
+	async function doDelete() {
+		const t = deleteTarget;
+		deleteTarget = null;
+		if (!t) return;
+		const res = await runOp({ op: 'delete', path: t.path });
+		if (res) onFsChange?.({ type: 'delete', path: t.path });
+	}
+
+	// Keyboard shortcuts while a tree node is focused/selected (ignored while an
+	// inline rename/new input is being typed into).
+	function onFilesKeydown(e) {
+		if (e.target?.tagName === 'INPUT') return;
+		const n = selectedNode;
+		if (!n || n.type === 'root') return;
+		const meta = e.metaKey || e.ctrlKey;
+		if (e.key === 'F2') {
+			e.preventDefault();
+			startRename(n);
+		} else if (e.key === 'Delete' || e.key === 'Backspace') {
+			e.preventDefault();
+			askDelete(n);
+		} else if (meta && (e.key === 'c' || e.key === 'C')) {
+			copyEntry(n);
+		} else if (meta && (e.key === 'x' || e.key === 'X')) {
+			cutEntry(n);
+		} else if (meta && (e.key === 'v' || e.key === 'V') && clipboard && (n.type === 'dir' || n.type === 'root')) {
+			pasteEntry(n);
+		}
+	}
+
+	// Shared file-ops surface for the recursive tree nodes (avoids prop-drilling
+	// through FileTreeNode). Getters forward reactive $state so nodes stay live.
+	setContext('cellarFileOps', {
+		get clipboard() {
+			return clipboard;
+		},
+		get renaming() {
+			return renaming;
+		},
+		get newEntry() {
+			return newEntry;
+		},
+		get selectedPath() {
+			return selectedNode?.path ?? null;
+		},
+		openMenu,
+		select: (node) => (selectedNode = node),
+		submitRename,
+		cancelRename,
+		submitNew,
+		cancelNew
 	});
 
 	// ---- Outline (nested markdown-header tree, derived from cells) ----------
@@ -291,21 +463,48 @@
 {#snippet filesSection()}
 	<div class="flex items-center">
 		{@render header('files', 'Files', 'section-files')}
+		<button
+			class="btn btn-ghost btn-xs btn-square text-base-content/40"
+			onclick={() => startNew('file', { type: 'root', path: '' })}
+			title="New file"
+			aria-label="New file"
+			data-testid="files-new-file"
+		>
+			<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><path d="M12 12v6M9 15h6" /></svg>
+		</button>
+		<button
+			class="btn btn-ghost btn-xs btn-square mr-1 text-base-content/40"
+			onclick={() => startNew('dir', { type: 'root', path: '' })}
+			title="New folder"
+			aria-label="New folder"
+			data-testid="files-new-folder"
+		>
+			<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2z" /><path d="M12 11v6M9 14h6" /></svg>
+		</button>
 		{@render refreshBtn(refreshFiles, 'Refresh file tree')}
 	</div>
 	{#if open.files}
-		<div class="px-2 pb-2">
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="px-2 pb-2" oncontextmenu={onRootContext} onkeydown={onFilesKeydown} data-testid="files-body">
 			{#if treeError}
 				<p class="px-2 text-xs text-error">{treeError}</p>
 			{:else if treeRoot}
 				<p class="truncate px-1 pb-1 text-[11px] text-base-content/40" title={treeRoot.root}>{treeRoot.name}</p>
+				{#if newEntry?.parentPath === ''}
+					<TreeEntryInput depth={0} kind={newEntry.kind} onSubmit={submitNew} onCancel={cancelNew} />
+				{/if}
 				{#each treeRoot.tree as node (node.path)}
 					<FileTreeNode {node} onOpen={onOpenFile} onOpenPermanent={onOpenFilePermanent} {gitFiles} activePath={activeFilePath} />
 				{:else}
-					<p class="px-2 text-xs text-base-content/40">empty workspace</p>
+					{#if newEntry?.parentPath !== ''}
+						<p class="px-2 text-xs text-base-content/40">empty workspace</p>
+					{/if}
 				{/each}
 			{:else}
 				<p class="px-2 text-xs text-base-content/40">loading…</p>
+			{/if}
+			{#if opError}
+				<p class="mt-1 px-2 text-xs text-error" data-testid="files-op-error">{opError}</p>
 			{/if}
 		</div>
 	{/if}
@@ -586,3 +785,68 @@
 		{/each}
 	</div>
 </aside>
+
+<!-- ==== File-tree context menu =========================================== -->
+{#snippet menuItem(label, testid, action, danger = false)}
+	<button
+		class="flex w-full items-center px-3 py-1 text-left hover:bg-base-300/70 {danger ? 'text-error' : 'text-base-content/90'}"
+		onclick={action}
+		data-testid={testid}
+	>
+		{label}
+	</button>
+{/snippet}
+{#snippet menuSep()}
+	<div class="my-1 border-t border-base-300"></div>
+{/snippet}
+
+{#if ctxMenu}
+	{@const node = ctxMenu.node}
+	{@const canPaste = clipboard && (node.type === 'dir' || node.type === 'root')}
+	<!-- Backdrop: any click / right-click / scroll dismisses the menu. -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div
+		class="fixed inset-0 z-40"
+		onclick={closeMenu}
+		oncontextmenu={(e) => { e.preventDefault(); closeMenu(); }}
+		onwheel={closeMenu}
+	></div>
+	<div
+		class="fixed z-50 min-w-44 rounded-md border border-base-300 bg-base-100 py-1 text-xs shadow-lg"
+		style="left: {ctxMenu.x}px; top: {ctxMenu.y}px"
+		data-testid="tree-context-menu"
+	>
+		{@render menuItem('New File', 'ctx-new-file', () => startNew('file', node))}
+		{@render menuItem('New Folder', 'ctx-new-folder', () => startNew('dir', node))}
+		{#if node.type !== 'root'}
+			{@render menuSep()}
+			{@render menuItem('Rename', 'ctx-rename', () => startRename(node))}
+			{@render menuItem('Delete', 'ctx-delete', () => askDelete(node), true)}
+			{@render menuSep()}
+			{@render menuItem('Cut', 'ctx-cut', () => cutEntry(node))}
+			{@render menuItem('Copy', 'ctx-copy', () => copyEntry(node))}
+		{/if}
+		{#if canPaste}
+			{#if node.type === 'root'}{@render menuSep()}{/if}
+			{@render menuItem('Paste', 'ctx-paste', () => pasteEntry(node))}
+		{/if}
+	</div>
+{/if}
+
+<!-- ==== Delete confirmation ============================================== -->
+{#if deleteTarget}
+	<div class="modal modal-open" data-testid="delete-modal">
+		<div class="modal-box max-w-sm">
+			<h3 class="text-sm font-semibold">Delete {deleteTarget.type === 'dir' ? 'folder' : 'file'}</h3>
+			<p class="mt-2 text-sm text-base-content/70">
+				Are you sure you want to delete <code class="font-mono text-primary">{deleteTarget.name}</code>{deleteTarget.type === 'dir' ? ' and all its contents' : ''}? This cannot be undone.
+			</p>
+			<div class="modal-action mt-4">
+				<button class="btn btn-sm btn-ghost" onclick={() => (deleteTarget = null)} data-testid="delete-cancel">Cancel</button>
+				<button class="btn btn-sm btn-error" onclick={doDelete} data-testid="delete-confirm">Delete</button>
+			</div>
+		</div>
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="modal-backdrop" onclick={() => (deleteTarget = null)}></div>
+	</div>
+{/if}

@@ -142,6 +142,35 @@
 		}
 	}
 
+	// A file-management op in the sidebar tree changed the workspace. Keep open
+	// tabs consistent: close tabs pointing at a deleted path (or anything under a
+	// deleted folder), and remap tabs when a file/folder is renamed or moved so no
+	// tab is left dangling at a gone path.
+	function remapRel(p, from, to) {
+		if (p === from) return to;
+		if (p.startsWith(from + '/')) return to + p.slice(from.length);
+		return null;
+	}
+	function handleFsChange(change) {
+		if (change.type === 'delete') {
+			const gone = tabs.filter((t) => t.path === change.path || t.path.startsWith(change.path + '/'));
+			for (const t of gone) closeTab(t.id);
+			return;
+		}
+		if (change.type === 'rename' || change.type === 'move') {
+			let nextActive = activeTabId;
+			tabs = tabs.map((t) => {
+				const np = remapRel(t.path, change.from, change.path);
+				if (np == null) return t;
+				const nt = makeTab(np, t.preview);
+				nt.dirty = t.dirty;
+				if (activeTabId === t.id) nextActive = nt.id;
+				return nt;
+			});
+			activeTabId = nextActive;
+		}
+	}
+
 	function onFileDirty(path, dirty) {
 		const id = 'file:' + path;
 		// Editing a previewed file promotes it to a permanent tab, like VS Code.
@@ -370,6 +399,7 @@
 					onOpenFilePermanent={openFilePermanent}
 					onOpenNotebook={openNotebook}
 					onScrollToCell={scrollToCell}
+					onFsChange={handleFsChange}
 				/>
 			</div>
 			<!-- Drag handle to resize the sidebar (persisted width). -->
