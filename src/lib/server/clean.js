@@ -53,22 +53,37 @@ function cleanOutput(output) {
 	return output;
 }
 
+/**
+ * Return a copy of cell metadata without the runtime-only `cellar.lastRun` run
+ * record (volatile at/durationMs, plus the kernel-session epoch that is the sole
+ * evidence a cell ran against the live namespace).
+ *
+ * This is one half of a two-sided forgery guard, and the two halves must stay in
+ * lockstep, so they share this helper: `cleanCell` strips it on the way to disk
+ * (so a run never dirties the .ipynb), and ipynb.js's `deserialize` strips it on
+ * the way back in (so a hand-edited notebook cannot forge `ok_session`: epochs
+ * are small monotonic integers and would otherwise be trivial to guess).
+ *
+ * An emptied `cellar` namespace is dropped so a foreign cell that never had one
+ * stays byte-identical, preserving zero-diff-on-re-run and idempotency.
+ */
+export function stripLastRun(metadata) {
+	const md = { ...(metadata ?? {}) };
+	if (md.cellar) {
+		const { lastRun, ...rest } = md.cellar;
+		if (Object.keys(rest).length) md.cellar = rest;
+		else delete md.cellar;
+	}
+	return md;
+}
+
 function cleanCell(cell) {
 	if (cell.cell_type === 'code') {
 		cell.execution_count = null;
 		if (Array.isArray(cell.outputs)) cell.outputs = cell.outputs.map(cleanOutput);
 	}
 	// deny-by-default metadata allowlist (keeps the `cellar` namespace intact)
-	cell.metadata = pick(cell.metadata, ALLOWED_CELL_METADATA);
-	// `cellar.lastRun` is runtime-only run metadata (volatile at/durationMs, held
-	// in the in-memory doc + pushed to the UI). Strip it before disk so it never
-	// dirties the .ipynb — same spirit as nulling execution_count (report §4.2).
-	// Drop an emptied `cellar` too so a foreign cell that never had one stays
-	// byte-identical (preserves the zero-diff-on-re-run guarantee + idempotency).
-	if (cell.metadata.cellar) {
-		delete cell.metadata.cellar.lastRun;
-		if (Object.keys(cell.metadata.cellar).length === 0) delete cell.metadata.cellar;
-	}
+	cell.metadata = stripLastRun(pick(cell.metadata, ALLOWED_CELL_METADATA));
 	return cell;
 }
 

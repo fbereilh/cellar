@@ -87,28 +87,43 @@ function ranThisSession(cell, sid) {
 }
 
 /**
+ * Did the last run attempt fail because no kernel could be reached? Recorded by
+ * the run entry points on the runtime-only lastRun stamp, so it can never be
+ * read off disk.
+ */
+const kernelUnavailable = (cell) => cell.metadata?.cellar?.lastRun?.kernel_unavailable === true;
+
+/**
  * Per-cell run status, with persisted and live-session execution kept strictly
  * apart — conflating them is what lets an agent build on variables that were
  * never defined this session:
  *
- *   n/a              markdown cell
- *   unrun            no saved outputs, and it has not run this session
- *   ok_session       ran this session, no error
- *   error_session    ran this session and raised
- *   ok_persisted     saved outputs from a PREVIOUS session; nothing it defines exists now
- *   error_persisted  saved error output from a PREVIOUS session
+ *   n/a                       markdown cell
+ *   unrun                     no saved outputs, and it has not run this session
+ *   ok_session                ran this session, no error
+ *   error_session             ran this session and raised
+ *   ok_persisted              saved outputs from a PREVIOUS session; nothing it defines exists now
+ *   error_persisted           saved error output from a PREVIOUS session
+ *   error_kernel_unavailable  the kernel could not be reached; this failure is LIVE, not leftover
  *
  * For a cell that ran this session the recorded run status is authoritative — a
  * cell can run successfully and emit no outputs at all (`lp = load()`), which
  * output inspection alone would misreport as `unrun`. Only an explicit `ok`
  * counts as success; jupyter's `abort` (and anything else) reads as an error, so
  * an agent is never told a run succeeded when it did not.
+ *
+ * `error_kernel_unavailable` is a status about the RUN ATTEMPT and is orthogonal
+ * to `ran_this_session`, which stays false: no code executed in any session. It
+ * exists so a failure raised seconds ago by the run the agent just requested is
+ * never mislabelled `error_persisted`, which the doctrine tells agents to ignore
+ * as leftover.
  */
 function runStatus(cell, sid) {
 	if (cell.cell_type !== 'code') return 'n/a';
 	if (ranThisSession(cell, sid)) {
 		return cell.metadata.cellar.lastRun.status === 'ok' ? 'ok_session' : 'error_session';
 	}
+	if (kernelUnavailable(cell)) return 'error_kernel_unavailable';
 	const outs = cell.outputs || [];
 	if (!outs.length) return 'unrun';
 	return outs.some((o) => o.output_type === 'error') ? 'error_persisted' : 'ok_persisted';
@@ -365,7 +380,9 @@ export function searchCells(query, where = 'both') {
 /**
  * Cells whose saved outputs contain an error. `ran_this_session` separates an
  * error the current kernel really raised from one deserialized out of the
- * `.ipynb` — chasing the latter debugs a previous session.
+ * `.ipynb` — chasing the latter debugs a previous session. `kernel_unavailable`
+ * marks the third case: the run could not reach a kernel at all, so despite
+ * `ran_this_session: false` the failure is LIVE and blocking, not leftover.
  */
 export function getErrors() {
 	const sid = currentSessionId();
@@ -376,6 +393,8 @@ export function getErrors() {
 				errs.push({
 					id: c.id,
 					ran_this_session: ranThisSession(c, sid),
+					run_status: runStatus(c, sid),
+					...(kernelUnavailable(c) ? { kernel_unavailable: true } : {}),
 					ename: o.ename,
 					evalue: o.evalue,
 					traceback: capText(stripAnsi((o.traceback || []).join('\n')), MEDIUM_CAP).text
@@ -487,6 +506,7 @@ export async function runCell(id) {
 	// never re-read afterwards: an autorestart mid-run bumps the live epoch, and
 	// this cell must then read as not-this-session.
 	let session = null;
+	let kernelDown = false;
 	try {
 		const res = await runSource(
 			c.source || '',
@@ -500,15 +520,18 @@ export async function runCell(id) {
 		outputs = [output];
 		publish({ type: 'run:output', nb, cellId: id, output });
 		status = 'error';
+		// execute() threw before it ever had a kernel in hand, so no session exists
+		// to stamp. Mark the attempt: this error is live, not saved from a prior run.
+		if (session === null) kernelDown = true;
 	}
 	setOutputs(id, outputs);
 	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,
 	// `session` = the kernel-session epoch this run executed in (see setLastRun).
-	const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent', status, session };
+	const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent', status, session, ...(kernelDown ? { kernel_unavailable: true } : {}) };
 	setLastRun(id, lastRun, nb);
 	publish({ type: 'run:end', nb, cellId: id, ...lastRun });
 	const hiddenNote = isHidden(c) ? { hidden: true } : {};
-	return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+	return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 }
 
 /**

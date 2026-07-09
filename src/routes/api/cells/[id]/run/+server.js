@@ -37,6 +37,7 @@ export async function POST({ params, request }) {
 			// autorestart mid-run bumps the live epoch, and this cell must then read as
 			// not-this-session.
 			let session = null;
+			let kernelDown = false;
 			try {
 				const reply = await execute(source ?? '', (ev) => {
 					if (ev.type === 'output') {
@@ -59,11 +60,16 @@ export async function POST({ params, request }) {
 				publish({ type: 'run:output', nb: canonicalNb, cellId, output, originId });
 				send({ type: 'output', output });
 				status = 'error';
+				// execute() threw before it ever had a kernel in hand, so no session
+				// exists to stamp. Mark the attempt so the agent-facing run_status reads
+				// `error_kernel_unavailable` (a LIVE failure) rather than
+				// `error_persisted` (leftover, which the doctrine says to ignore).
+				if (session === null) kernelDown = true;
 			} finally {
 				setOutputs(cellId, outputs, nb); // clean-on-save persists the .ipynb
 				// Runtime-only run metadata; `at` = run start so "ran X ago" reads as
 				// when the run began. Stripped from disk by clean.js (report §4.2).
-				const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'user', status, session };
+				const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'user', status, session, ...(kernelDown ? { kernel_unavailable: true } : {}) };
 				setLastRun(cellId, lastRun, nb);
 				// Also send it on the initiating tab's NDJSON stream: that tab drops
 				// its own `run:end` SSE echo (originId match), so this is how it learns

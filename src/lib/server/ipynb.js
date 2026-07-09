@@ -8,7 +8,7 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { cleanNotebook } from './clean.js';
+import { cleanNotebook, stripLastRun } from './clean.js';
 
 const NBFORMAT = 4;
 const NBFORMAT_MINOR = 5;
@@ -62,35 +62,20 @@ export function serialize(doc) {
 }
 
 /**
- * Cell metadata as loaded from disk, minus the runtime-only `cellar.lastRun`.
+ * Parse an nbformat notebook object into canonical cells.
  *
- * That stamp records the kernel-session epoch a cell executed in, and it is the
- * sole evidence that a cell ran against the namespace that is live *now*. It
- * must therefore only ever originate from an in-process run: a hand-edited or
- * externally-authored `.ipynb` could otherwise carry a `session` matching the
- * live epoch (they are small monotonic integers) and forge `ok_session` /
- * `ran_this_session: true` for a cell that never executed. `clean.js` strips it
- * on write; this is the matching strip on read. An emptied `cellar` namespace is
- * dropped too, mirroring clean.js so a foreign cell stays byte-identical.
+ * `stripLastRun` is the read-side half of the run-stamp forgery guard: a
+ * `cellar.lastRun` read off disk must never reach the document, or an
+ * externally-authored `.ipynb` could claim a cell ran in the live kernel
+ * session. Only an in-process run may originate that stamp. See clean.js.
  */
-function loadCellMetadata(metadata) {
-	const md = { ...(metadata ?? {}) };
-	if (md.cellar) {
-		const { lastRun, ...rest } = md.cellar;
-		if (Object.keys(rest).length) md.cellar = rest;
-		else delete md.cellar;
-	}
-	return md;
-}
-
-/** Parse an nbformat notebook object into canonical cells. */
 export function deserialize(nb) {
 	const cells = (nb.cells || []).map((c) => ({
 		id: c.id,
 		cell_type: c.cell_type || 'code',
 		source: fromLines(c.source),
 		outputs: c.outputs ?? [],
-		metadata: loadCellMetadata(c.metadata)
+		metadata: stripLastRun(c.metadata)
 	}));
 	return { cells, metadata: nb.metadata ?? defaultMetadata() };
 }

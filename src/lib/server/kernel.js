@@ -18,6 +18,7 @@ let kernelPromise = null;
 let liveKernel = null; // last-resolved kernel, for read-only status introspection
 let manager = null;
 let currentKernel = null;
+let statusHandler = null;
 
 /**
  * Kernel session epoch. Every fresh namespace gets a new id: a first start, a
@@ -99,9 +100,19 @@ async function getKernel() {
 		// stamped before the crash never reads as "ran this session" after it.
 		// Our own restart() reports 'restarting', not 'autorestarting', so this
 		// cannot double-bump restartKernel().
-		kernel.statusChanged.connect((_sender, status) => {
-			if (status === 'autorestarting') beginSession();
-		});
+		//
+		// The identity guard is load-bearing: a late emission from an OUTGOING
+		// kernel must not bump the epoch of the one that replaced it, which would
+		// wrongly demote cells that legitimately ran in the new session.
+		//
+		// Re-injecting the startup code keeps parity with restartKernel(): an
+		// autorestart clears the namespace AND the matplotlib backend.
+		statusHandler = (_sender, status) => {
+			if (status !== 'autorestarting' || currentKernel !== kernel) return;
+			beginSession();
+			void initKernel(kernel);
+		};
+		kernel.statusChanged.connect(statusHandler);
 		await initKernel(kernel);
 		return kernel;
 	})();
@@ -119,10 +130,16 @@ async function getKernel() {
  */
 export async function restartKernel() {
 	const kernel = await getKernel();
-	await kernel.restart();
-	// A restart clears the namespace, so nothing that ran before it counts as
-	// having run against the live kernel any more.
-	beginSession();
+	try {
+		await kernel.restart();
+	} finally {
+		// Once the REST restart is issued the kernel process is restarted and the
+		// namespace is cleared, even if the websocket reconnect afterwards rejects.
+		// The epoch must be bumped on BOTH paths: it is monotonic and opaque, so an
+		// extra bump is harmless, while a missing one leaves cells falsely reading
+		// as `ok_session` against a namespace that no longer exists.
+		beginSession();
+	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
 	await initKernel(kernel);
 	return { status: kernel.status, id: kernel.id, session_id: sessionId };
@@ -143,6 +160,9 @@ export async function rebindKernel() {
 	const wasRunning = !!currentKernel;
 	if (currentKernel) {
 		try {
+			currentKernel.statusChanged.disconnect(statusHandler);
+		} catch {}
+		try {
 			await currentKernel.shutdown();
 		} catch {}
 	}
@@ -150,10 +170,15 @@ export async function rebindKernel() {
 		manager?.dispose();
 	} catch {}
 	manager = null;
+	statusHandler = null;
 	kernelPromise = null;
 	currentKernel = null;
 	liveKernel = null;
 	if (!wasRunning) return { status: 'not_started', id: null, session_id: null };
+	// The old namespace is gone the moment the kernel was torn down, whether or not
+	// the replacement comes up. Bump now so a getKernel() failure below cannot leave
+	// the previous epoch reachable.
+	beginSession();
 	// getKernel() starts a brand-new kernel process, so it opens a new session.
 	const kernel = await getKernel();
 	return { status: kernel.status, id: kernel.id, session_id: sessionId };
