@@ -64,6 +64,44 @@
 		foldedIds = next;
 		saveFolds();
 	}
+
+	// ---- Collapsible code editors --------------------------------------------
+	// Per-cell "collapse the code editor to a fixed scrollable height" choice.
+	// Like the fold state above, kept runtime-only (localStorage keyed by this
+	// notebook), never written to the `.ipynb` — a pure view preference with zero
+	// git-diff (the deliberate contrast with `output_scrolled`, which does
+	// round-trip to disk). A cell id maps to an explicit boolean (true = force
+	// collapsed, false = force full height); an absent id means auto (the Cell
+	// collapses it only when the editor is taller than the cap).
+	let editorCollapsed = $state({});
+
+	function editorCollapsedKey() {
+		return canonicalId ? `cellar-editor-collapsed:${canonicalId}` : null;
+	}
+	function loadEditorCollapsed() {
+		const key = editorCollapsedKey();
+		if (!key || typeof localStorage === 'undefined') return;
+		try {
+			const raw = localStorage.getItem(key);
+			editorCollapsed = raw ? JSON.parse(raw) : {};
+		} catch {
+			editorCollapsed = {};
+		}
+	}
+	function saveEditorCollapsed() {
+		const key = editorCollapsedKey();
+		if (!key || typeof localStorage === 'undefined') return;
+		try {
+			localStorage.setItem(key, JSON.stringify(editorCollapsed));
+		} catch {}
+	}
+	function setEditorCollapsed(id, collapsed) {
+		const next = { ...editorCollapsed };
+		if (collapsed === null || collapsed === undefined) delete next[id];
+		else next[id] = collapsed;
+		editorCollapsed = next;
+		saveEditorCollapsed();
+	}
 	// Cell ids awaiting the first streamed chunk of an SSE run — that chunk
 	// replaces the prior output (no flash). Tracked per-cell (not one shared flag)
 	// so interleaved run:start events for different cells can't consume each other's
@@ -101,6 +139,7 @@
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
 			loadFolds(); // restore this notebook's collapsed sections (runtime-only, per notebook)
+			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
@@ -467,6 +506,8 @@
 		onEdit={editCell}
 		onSetType={setType}
 		onSetScrolled={setScrolled}
+		editorCollapsed={editorCollapsed}
+		onSetEditorCollapsed={setEditorCollapsed}
 		onActivate={setActive}
 		onReady={registerFocus}
 		onAddCell={addCell}

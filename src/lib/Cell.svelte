@@ -31,6 +31,8 @@
 		onEdit,
 		onSetType,
 		onSetScrolled,
+		editorCollapsed, // per-cell code-editor collapse choice (undefined = auto / true / false)
+		onSetEditorCollapsed,
 		onActivate,
 		onReady,
 		onDragStart,
@@ -39,6 +41,7 @@
 
 	let editorEl;
 	let view;
+	let editorResizeObserver;
 	let editTimer;
 	// True while the user has uncommitted local typing (a debounced save pending).
 	// Together with editor focus this gates whether a remote source edit may
@@ -224,6 +227,29 @@
 		onSetScrolled?.(cell.id, !scrolled);
 	}
 
+	// ---- Collapsible / scrollable code editor -------------------------------
+	// Mirrors the scrollable-outputs UX: a tall code editor can be contracted to
+	// a fixed-height scroll box instead of growing the cell. The per-cell choice
+	// is a tri-state (undefined = auto, true = force collapsed, false = force
+	// full) persisted runtime-only by LiveNotebook (localStorage, git-clean) via
+	// `onSetEditorCollapsed` — never written to the `.ipynb`, the deliberate
+	// contrast with `output_scrolled`. Above the cap we auto-collapse unless the
+	// user set an explicit choice.
+	const EDITOR_MAX_PX = 576; // px (= max-h-[36rem]); 50% taller than the former 384 cap
+	let editorTall = $state(false);
+	const collapsed = $derived(!isMarkdown && (editorCollapsed ?? editorTall));
+	// Only surface the toggle once there's something to collapse (a tall editor)
+	// or an explicit choice already exists — short cells stay uncluttered.
+	const canCollapse = $derived(!isMarkdown && (editorTall || editorCollapsed != null));
+	// scrollHeight is the full content height regardless of the max-height clamp,
+	// so this reads true whether or not the box is currently contracted.
+	function measureEditor() {
+		if (editorEl) editorTall = editorEl.scrollHeight > EDITOR_MAX_PX;
+	}
+	function toggleEditorCollapsed() {
+		onSetEditorCollapsed?.(cell.id, !collapsed);
+	}
+
 	const toneClass = {
 		stdout: 'text-base-content border-transparent',
 		stderr: 'text-warning border-warning/40',
@@ -372,6 +398,17 @@
 		});
 		if (import.meta.env.DEV) (window.cellarViews ??= {})[cell.id] = view;
 		onReady?.(cell.id, () => view.focus());
+		// Measure editor content height so a tall code cell auto-collapses. A
+		// ResizeObserver re-measures on content growth AND on the hidden→visible
+		// transition (a background tab measures 0 until shown), so the auto-cap
+		// applies whenever the editor is actually laid out. `measureEditor` reads
+		// scrollHeight (unclamped) and only assigns when the value changes, so the
+		// clamp it may trigger doesn't feed back into a loop.
+		if (typeof ResizeObserver !== 'undefined' && editorEl) {
+			editorResizeObserver = new ResizeObserver(() => measureEditor());
+			editorResizeObserver.observe(editorEl);
+		}
+		measureEditor();
 		// Closing the tab/window can fire before the 500ms debounce; flush on
 		// `pagehide` so an in-progress edit is persisted (the PATCH uses
 		// `keepalive` so it survives unload).
@@ -379,6 +416,7 @@
 		window.addEventListener('pagehide', flushOnUnload);
 		return () => {
 			flushEdit();
+			editorResizeObserver?.disconnect();
 			window.removeEventListener('pagehide', flushOnUnload);
 			onReady?.(cell.id, null);
 			view?.destroy();
@@ -542,12 +580,37 @@
 			</div>
 		{/if}
 
-		<!-- Editor (hidden while a markdown cell shows its rendered view) -->
-		<div
-			bind:this={editorEl}
-			aria-label="cell source"
-			class="max-h-96 overflow-auto px-3 {isMarkdown && mode === 'rendered' ? 'hidden' : ''}"
-		></div>
+		<!-- Editor (hidden while a markdown cell shows its rendered view). A code
+		     editor can be collapsed to a fixed-height scroll box (mirrors the
+		     scrollable-outputs toggle); the choice is persisted runtime-only. A
+		     markdown edit view keeps its original cap unchanged. -->
+		<div class="relative {isMarkdown && mode === 'rendered' ? 'hidden' : ''}">
+			{#if canCollapse}
+				<!-- Collapse-editor toggle (mirrors the "Enable Scrolling for Outputs" control). -->
+				<button
+					class="btn btn-ghost btn-xs absolute right-1 top-1 z-10 h-5 min-h-0 gap-1 px-1.5 text-[10px] font-normal text-base-content/40 hover:text-base-content/80"
+					onclick={toggleEditorCollapsed}
+					title={collapsed ? 'Expand editor (show full height)' : 'Collapse editor (contract to a fixed height)'}
+					data-testid="editor-collapse-toggle"
+					aria-pressed={collapsed}
+				>
+					{#if collapsed}
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 15l5 5 5-5M7 9l5-5 5 5" /></svg>
+						expand
+					{:else}
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 8l-5-5-5 5M17 16l-5 5-5-5" /></svg>
+						collapse
+					{/if}
+				</button>
+			{/if}
+			<div
+				bind:this={editorEl}
+				aria-label="cell source"
+				class="overflow-auto px-3 {isMarkdown ? 'max-h-96' : collapsed ? 'max-h-[36rem]' : ''}"
+				data-testid="editor-scroll"
+				data-collapsed={collapsed ? 'true' : undefined}
+			></div>
+		</div>
 
 		<!-- Output (code cells only) -->
 		{#if !isMarkdown && outputs.length}

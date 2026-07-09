@@ -22,6 +22,8 @@
 		onEdit,
 		onSetType,
 		onSetScrolled,
+		editorCollapsed = {}, // cell id → explicit code-editor collapse choice (runtime-only)
+		onSetEditorCollapsed,
 		onActivate,
 		onReady,
 		onAddCell
@@ -111,6 +113,8 @@
 					onEdit={onEdit}
 					onSetType={onSetType}
 					onSetScrolled={onSetScrolled}
+					editorCollapsed={editorCollapsed[cell.id]}
+					onSetEditorCollapsed={onSetEditorCollapsed}
 					onActivate={onActivate}
 					onReady={onReady}
 					onDragStart={onDragStart}
