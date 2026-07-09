@@ -32,10 +32,20 @@
 	let runBusy = $state(false);
 	function onRunStart() {
 		runBusy = true;
+		// A run implies a live kernel, and the first run is what boots it (`/api/kernel`
+		// only reads, never boots). Record that optimistically so the kernel card and
+		// navbar badge stay truthful once `runBusy` clears below, without waiting on a
+		// status round-trip. This also supersedes any `/api/kernel` read still in flight
+		// - notably the mount-time one, which legitimately answers "not started".
+		markKernelStarted();
 	}
 	function onRunEnd() {
+		// Clear the run gate synchronously. `runBusy` serializes runs across notebooks,
+		// so holding it across a status round-trip would silently swallow the next Run
+		// click / ⌘Enter - and would strand the gate open entirely if the refresh threw.
 		runBusy = false;
-		// A run may have created/changed kernel variables → refresh sidebar.
+		// A run may have booted the kernel or changed variables → refresh the sidebar
+		// in the background; neither is on the critical path for the next run.
 		refreshKernel();
 		refreshVariables();
 	}
@@ -58,12 +68,37 @@
 	const activeTab = $derived(tabs.find((t) => t.id === activeTabId) ?? null);
 	const activeFilePath = $derived(activeTab && activeTab.kind !== 'notebook' ? activeTab.path : null);
 
-	// Which notebook the sidebar (outline / search / variables) reflects: the
-	// active notebook tab, else the default when a plain file / nothing is active.
+	// Which notebook the sidebar (outline / search / Kernels dot) reflects: the
+	// active notebook tab, else the default - but only while the default actually
+	// has an open tab. `notebooksCells` is seeded with the default notebook's SSR
+	// cells, so falling back to it unconditionally would let a *closed* notebook's
+	// stale snapshot fill the outline while a plain file tab holds focus. Null
+	// means "no notebook is active": the outline and search render empty and the
+	// Kernels list dots nothing, so every sidebar section agrees.
 	const activeNotebookPath = $derived(
-		activeTab?.kind === 'notebook' ? canonicalNotebookRel : activeTab?.kind === 'ipynb' ? activeTab.path : canonicalNotebookRel
+		activeTab?.kind === 'notebook'
+			? canonicalNotebookRel
+			: activeTab?.kind === 'ipynb'
+				? activeTab.path
+				: notebookOpen
+					? canonicalNotebookRel
+					: null
 	);
-	const activeCells = $derived(notebooksCells[activeNotebookPath] ?? []);
+	const activeCells = $derived((activeNotebookPath && notebooksCells[activeNotebookPath]) || []);
+
+	// Notebooks currently open in the shell (the default notebook tab + every
+	// opened `.ipynb`). With the single-shared-kernel model these are exactly the
+	// notebooks loaded against that one kernel, so the sidebar Kernels section
+	// lists them under it. Derived from tabs → updates live as notebooks open/close.
+	// The dot reads `activeNotebookPath`, the same source of truth the outline and
+	// search sections use, so every sidebar section agrees on which notebook is
+	// active - including agreeing on "none" while a plain file tab holds focus and
+	// no notebook tab is open.
+	const openNotebooks = $derived(
+		tabs
+			.filter((t) => t.kind === 'notebook' || t.kind === 'ipynb')
+			.map((t) => ({ id: t.id, path: t.path, name: t.title, active: t.path === activeNotebookPath }))
+	);
 
 	function tabIdFor(path) {
 		return path === canonicalNotebookRel ? 'notebook' : 'file:' + path;
@@ -262,7 +297,10 @@
 	let fsRefreshSignal = $state(0);
 
 	async function scrollToCell(id) {
-		// Open + focus the notebook the outline currently reflects, then scroll.
+		// Open + focus the notebook the outline currently reflects, then scroll. With
+		// no active notebook the outline and search are empty, so there is no row to
+		// click - but never let a null path mint a tab if one ever gets here.
+		if (!activeNotebookPath) return;
 		if (activeNotebookPath === canonicalNotebookRel) openNotebook();
 		else openFilePermanent(activeNotebookPath);
 		await tick();
@@ -283,10 +321,28 @@
 
 	const displayKernel = $derived(runBusy ? { ...kernelInfo, started: true, status: 'busy' } : kernelInfo);
 
+	// Monotonic generation for writes to `kernelInfo`. A fetched status is applied
+	// only while it is still the newest word on the kernel's state: any newer read,
+	// or a newer local write, supersedes an in-flight response. Without this, a
+	// `/api/kernel` read issued before the kernel booted can resolve *after* the run
+	// began and clobber the live state back to "not started" - the responses are
+	// unordered, so the last one to land, not the last one issued, would win.
+	let kernelReqSeq = 0;
+
+	// A run proves the kernel is up; assert it locally and invalidate stale reads.
+	function markKernelStarted() {
+		kernelReqSeq++;
+		kernelInfo = { ...kernelInfo, started: true, status: 'busy' };
+	}
+
 	async function refreshKernel() {
+		const seq = ++kernelReqSeq;
 		try {
 			const res = await fetch('/api/kernel');
-			if (res.ok) kernelInfo = await res.json();
+			if (!res.ok) return;
+			const info = await res.json();
+			if (seq !== kernelReqSeq) return; // superseded while in flight → drop it
+			kernelInfo = info;
 		} catch {}
 	}
 
@@ -402,7 +458,7 @@
 					{mcp}
 					kernelInfo={displayKernel}
 					{kernelBusy}
-					{notebookName}
+					{openNotebooks}
 					{variables}
 					{varsLoading}
 					{varsError}
@@ -414,7 +470,7 @@
 					onRestartKernel={restartKernel}
 					onOpenFile={openFile}
 					onOpenFilePermanent={openFilePermanent}
-					onOpenNotebook={openNotebook}
+					onFocusNotebook={selectTab}
 					onScrollToCell={scrollToCell}
 					onFsChange={handleFsChange}
 				/>

@@ -1,5 +1,6 @@
 <script>
 	import { iconSvg } from '$lib/fileIcons.js';
+	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
 
 	let {
 		tabs,
@@ -13,8 +14,10 @@
 		onOpenSettings
 	} = $props();
 
-	const kernelReady = $derived(!kernelInfo?.started || kernelInfo.status === 'idle');
-	const kernelLabel = $derived(kernelInfo?.started ? kernelInfo.status : 'idle');
+	// Reflect the real kernel state, not a phantom: no kernel started → a neutral
+	// "not started", never a green idle badge.
+	const kernelLabel = $derived(kernelStatusLabel(kernelInfo));
+	const kernelBadge = $derived(kernelBadgeClass(kernelInfo));
 </script>
 
 <header class="flex min-h-11 items-stretch border-b border-base-300 bg-base-100 text-base-content" data-testid="navbar">
@@ -88,8 +91,8 @@
 	<!-- Right cluster: kernel status -->
 	<div class="flex items-center gap-2 border-l border-base-300 px-3 text-xs text-base-content/60">
 		<span>kernel</span>
-		<span class="badge badge-sm gap-1.5 badge-soft {kernelReady ? 'badge-success' : 'badge-warning'}" data-testid="kernel-status">
-			<span class="inline-block h-1.5 w-1.5 rounded-full {kernelReady ? 'bg-success' : 'bg-warning'}"></span>
+		<span class="badge badge-sm gap-1.5 badge-soft {kernelBadge}" data-testid="kernel-status">
+			<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
 			{kernelLabel}
 		</span>
 	</div>
