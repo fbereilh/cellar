@@ -28,6 +28,16 @@
  *   --yes / -y                  auto-approve venv create / ipykernel install
  *   --dev                       run the Vite dev server instead of the build
  *   --no-mcp-config             do not write/merge <workspace>/.mcp.json
+ *   --new / --force             start a second instance in a folder that
+ *                               already has a live one (power-user escape hatch;
+ *                               normally a relaunch attaches to the running one)
+ *
+ * Single-instance-per-folder: a relaunch in a folder that already has a live
+ * cellar does NOT start a rival server (two servers persist the same
+ * notebook.ipynb from independent in-memory docs → last-writer-wins clobber).
+ * An `O_EXCL` lockfile (`.cellar/instance.lock`) atomically gates ownership, so
+ * even a rapid double-launch inside the boot window can't start two; the loser
+ * attaches by opening the browser to the running instance and exits 0.
  */
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
@@ -48,7 +58,15 @@ import {
 	venvPython,
 	UvMissingError
 } from '../src/lib/server/venv.js';
-import { writeRuntime, clearRuntime, writeMcpConfig } from '../src/lib/server/runtime.js';
+import {
+	writeRuntime,
+	clearRuntime,
+	writeMcpConfig,
+	readRuntime,
+	acquireInstanceLock,
+	releaseInstanceLock,
+	waitForInstanceUrl
+} from '../src/lib/server/runtime.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -79,7 +97,7 @@ function flagValue(...names) {
 function hasFlag(...names) {
 	return names.some((n) => argv.includes(n));
 }
-const KNOWN_FLAGS = new Set(['--workspace', '-w', '--venv', '--python', '--yes', '-y', '--dev', '--build', '--no-mcp-config']);
+const KNOWN_FLAGS = new Set(['--workspace', '-w', '--venv', '--python', '--yes', '-y', '--dev', '--build', '--no-mcp-config', '--new', '--force']);
 const VALUE_FLAGS = new Set(['--workspace', '-w', '--venv', '--python']);
 // First non-flag, non-flag-value token is the positional workspace path.
 let positional;
@@ -107,11 +125,15 @@ const autoYes = hasFlag('--yes', '-y') || !!process.env.CI || !process.stdin.isT
 // Production build is the default; --dev opts into Vite (--build kept as alias).
 const useDev = hasFlag('--dev') && !hasFlag('--build');
 const writeMcpConfigOptIn = !hasFlag('--no-mcp-config');
+// Power-user escape hatch: start a second, independent instance even if one is
+// already live for this folder (normally a relaunch attaches to the running one).
+const forceNew = hasFlag('--new', '--force');
 
 // ---- Lifecycle ------------------------------------------------------------
 const children = [];
 let jupyterDir = null;
 let runtimeWorkspace = null;
+let lockWorkspace = null;
 function cleanup() {
 	if (jupyterDir) {
 		try {
@@ -122,6 +144,12 @@ function cleanup() {
 	if (runtimeWorkspace) {
 		clearRuntime(runtimeWorkspace);
 		runtimeWorkspace = null;
+	}
+	// Release the single-instance lock only if we took it (never under --new,
+	// where the first instance still owns the folder). Pid-guarded in releaseInstanceLock.
+	if (lockWorkspace) {
+		releaseInstanceLock(lockWorkspace);
+		lockWorkspace = null;
 	}
 }
 function shutdown(code = 0) {
@@ -228,6 +256,48 @@ async function resolveInterpreter() {
 }
 
 async function main() {
+	console.log(`[cellar] workspace: ${WORKSPACE}`);
+
+	// 0) Single-instance-per-folder (unless --new/--force). Atomically claim the
+	//    folder via an O_EXCL lockfile BEFORE any slow toolchain work, so a rapid
+	//    double-launch inside the boot window can't start two rival servers (they
+	//    would both persist notebook.ipynb from independent docs and clobber each
+	//    other). The launcher that loses the lock attaches: it opens the browser
+	//    to the running instance and exits, needing no venv/uv of its own. Runs
+	//    before the uv check for exactly that reason — attaching is browser-only.
+	if (!forceNew) {
+		let lock = acquireInstanceLock(WORKSPACE);
+		if (!lock.acquired) {
+			// A live (or still-booting) instance owns this folder. Attach to it:
+			// wait for its app to be reachable, then open the browser and exit.
+			console.log(`[cellar] a cellar instance (pid ${lock.ownerPid}) already owns ${WORKSPACE}.`);
+			const url = await waitForInstanceUrl(WORKSPACE, lock.ownerPid);
+			if (url) {
+				console.log(`[cellar] cellar is already running for ${WORKSPACE} at ${url} - opening it`);
+				console.log('[cellar] (pass --new to start a second, independent instance for this folder.)');
+				await openBrowser(url);
+				process.exit(0);
+			}
+			// The owner vanished mid-boot (crashed) or never became reachable.
+			// Retry the lock: a dead owner's lock is stale and gets reclaimed here.
+			lock = acquireInstanceLock(WORKSPACE);
+			if (!lock.acquired) {
+				console.error(
+					`[cellar] a cellar instance (pid ${lock.ownerPid}) is holding ${WORKSPACE} but its app never became reachable.`
+				);
+				console.error('[cellar] Stop that process, or pass --new to start a separate instance.');
+				process.exit(1);
+			}
+			console.log('[cellar] previous instance is gone - starting fresh.');
+		}
+		lockWorkspace = WORKSPACE; // cleanup() releases it on shutdown
+		// We own the folder now; drop any stale runtime.json a prior crashed run
+		// left behind so discovery is clean while we boot (writeRuntime overwrites
+		// it below regardless, but this avoids a misleading stale entry meanwhile).
+		const stale = readRuntime(WORKSPACE);
+		if (stale) clearRuntime(WORKSPACE, stale.pid);
+	}
+
 	// uv is mandatory — fail fast with an actionable message, no silent fallback.
 	try {
 		await requireUv();
@@ -238,8 +308,6 @@ async function main() {
 		}
 		throw err;
 	}
-
-	console.log(`[cellar] workspace: ${WORKSPACE}`);
 
 	// 1) Project interpreter (reuse/create the venv, ensure ipykernel).
 	const { python: projectPython } = await resolveInterpreter();

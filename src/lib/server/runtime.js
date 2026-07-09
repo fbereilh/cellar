@@ -18,11 +18,24 @@
  * server (`$lib`). Nothing here throws on the happy path; callers stay simple.
  */
 import { join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	writeFileSync,
+	rmSync,
+	linkSync,
+	unlinkSync
+} from 'node:fs';
 
 /** Absolute path of the runtime discovery file for a workspace. */
 export function runtimeFilePath(workspace) {
 	return join(workspace, '.cellar', 'runtime.json');
+}
+
+/** Absolute path of the single-instance lockfile for a workspace. */
+export function instanceLockPath(workspace) {
+	return join(workspace, '.cellar', 'instance.lock');
 }
 
 /** Absolute path of the project-scoped MCP config file for a workspace. */
@@ -65,6 +78,114 @@ export function clearRuntime(workspace, pid = process.pid) {
 	try {
 		rmSync(runtimeFilePath(workspace), { force: true });
 	} catch {}
+}
+
+/** Read the owner pid recorded in a lockfile, or null if missing/garbage. */
+function readLockPid(file) {
+	try {
+		const n = parseInt(readFileSync(file, 'utf8').trim(), 10);
+		return Number.isInteger(n) && n > 0 ? n : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Atomically claim this workspace for a single cellar instance.
+ *
+ * The lockfile is created with `O_EXCL`, so only ONE launcher can win the
+ * folder even when two `cellar` commands race inside the multi-second boot
+ * window (before either has written runtime.json). This is the piece that
+ * closes the boot-window clobber: liveness probes alone can't, because a
+ * genuinely simultaneous double-launch has both processes see "no instance"
+ * before either records one.
+ *
+ * A lockfile whose owner pid is dead is stale (a hard-killed instance never
+ * released it) — it is removed and acquisition retried. Returns:
+ *   { acquired: true }             — we hold the folder; boot.
+ *   { acquired: false, ownerPid }  — a live instance holds it; attach to it.
+ */
+export function acquireInstanceLock(workspace, pid = process.pid) {
+	const dir = join(workspace, '.cellar');
+	mkdirSync(dir, { recursive: true });
+	const file = instanceLockPath(workspace);
+	// Stage the pid in a per-pid temp file first, then atomically link it into
+	// place. linkSync fails with EEXIST if the lock already exists, so the lock
+	// is never visible on disk without its pid already written — closing the
+	// create-then-write window where a racer could read an empty lock and
+	// wrongly reclaim it.
+	const temp = file + '.' + pid + '.tmp';
+	writeFileSync(temp, String(pid) + '\n');
+	try {
+		for (let attempt = 0; attempt < 5; attempt++) {
+			try {
+				linkSync(temp, file); // fails EEXIST if a lock already exists
+				return { acquired: true };
+			} catch (err) {
+				if (err?.code !== 'EEXIST') throw err;
+				const ownerPid = readLockPid(file);
+				if (ownerPid && ownerPid !== pid && pidAlive(ownerPid)) {
+					return { acquired: false, ownerPid };
+				}
+				// Stale lock (dead owner, or our own leftover) — clear + retry.
+				try {
+					rmSync(file, { force: true });
+				} catch {}
+			}
+		}
+	} finally {
+		try {
+			unlinkSync(temp);
+		} catch {}
+	}
+	// Lost every race to another launcher — treat the folder as owned (never
+	// clobber). The caller attaches to whoever currently holds it.
+	return { acquired: false, ownerPid: readLockPid(file) };
+}
+
+/** Release the single-instance lock, but only if we still own it. */
+export function releaseInstanceLock(workspace, pid = process.pid) {
+	const file = instanceLockPath(workspace);
+	const ownerPid = readLockPid(file);
+	if (ownerPid && ownerPid !== pid) return; // held by someone else now
+	try {
+		rmSync(file, { force: true });
+	} catch {}
+}
+
+/** Quick liveness probe of the app HTTP port (any response = listening). */
+async function appPortResponds(appPort, timeoutMs = 1500) {
+	if (!appPort) return false;
+	const ctrl = new AbortController();
+	const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+	try {
+		await fetch(`http://localhost:${appPort}/`, { signal: ctrl.signal });
+		return true;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * Wait for the instance that holds this folder to finish booting, then return
+ * the browser URL to attach to. Polls runtime.json + the app port, because the
+ * owner may still be booting (runtime.json is written mid-launch, before the
+ * app is listening). Returns null if the owner dies before it comes up (crashed
+ * during boot → caller should take over) or the timeout elapses (hung).
+ */
+export async function waitForInstanceUrl(workspace, ownerPid, { timeoutMs = 120000 } = {}) {
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		if (ownerPid && !pidAlive(ownerPid)) return null; // owner gone → take over
+		const rt = readRuntime(workspace);
+		if (rt && rt.appPort && (await appPortResponds(rt.appPort))) {
+			return `http://localhost:${rt.appPort}/?ws=${encodeURIComponent(workspace)}`;
+		}
+		await new Promise((r) => setTimeout(r, 300));
+	}
+	return null;
 }
 
 /** True if a process with `pid` is currently alive. */
