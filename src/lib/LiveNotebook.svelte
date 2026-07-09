@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
+	import { computeFolding } from '$lib/headings.js';
 
 	// A live, kernel-attached notebook document addressed by its workspace path.
 	// Owns its own cell array + all cell operations (every request carries
@@ -25,6 +26,44 @@
 	// (the load itself is the initial sync).
 	let canonicalId = null;
 	let lastSeq = null; // last per-notebook `seq` seen (gap detection → refetch)
+
+	// ---- Collapsible headings ------------------------------------------------
+	// Fold state = the set of markdown-header cell ids whose section is folded.
+	// Kept runtime-only (localStorage keyed by this notebook), never written to
+	// the `.ipynb`, so folding a section produces zero git-diff noise. Folded
+	// cells stay in `cells` (they run/persist normally); we only hide them from
+	// the rendered flow. `computeFolding` decides which cells are hidden and how
+	// many each folded header hides, using the shared header-level logic.
+	let foldedIds = $state(new Set());
+	const folding = $derived(computeFolding(cells, foldedIds));
+
+	function foldStorageKey() {
+		return canonicalId ? `cellar-folds:${canonicalId}` : null;
+	}
+	function loadFolds() {
+		const key = foldStorageKey();
+		if (!key || typeof localStorage === 'undefined') return;
+		try {
+			const raw = localStorage.getItem(key);
+			foldedIds = new Set(raw ? JSON.parse(raw) : []);
+		} catch {
+			foldedIds = new Set();
+		}
+	}
+	function saveFolds() {
+		const key = foldStorageKey();
+		if (!key || typeof localStorage === 'undefined') return;
+		try {
+			localStorage.setItem(key, JSON.stringify([...foldedIds]));
+		} catch {}
+	}
+	function toggleFold(id) {
+		const next = new Set(foldedIds);
+		if (next.has(id)) next.delete(id);
+		else next.add(id);
+		foldedIds = next;
+		saveFolds();
+	}
 	// Cell ids awaiting the first streamed chunk of an SSE run — that chunk
 	// replaces the prior output (no flash). Tracked per-cell (not one shared flag)
 	// so interleaved run:start events for different cells can't consume each other's
@@ -61,6 +100,7 @@
 			if (!res.ok) throw new Error(body?.message || 'could not open notebook');
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
+			loadFolds(); // restore this notebook's collapsed sections (runtime-only, per notebook)
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
@@ -396,6 +436,10 @@
 		{theme}
 		runningId={runningId}
 		{activeId}
+		hidden={folding.hidden}
+		foldedIds={foldedIds}
+		hiddenCounts={folding.counts}
+		onToggleFold={toggleFold}
 		onRun={runCell}
 		onRunAdvance={runAndAdvance}
 		onClear={clearCell}
