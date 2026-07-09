@@ -19,6 +19,7 @@
  * single document (two open notebooks may legitimately share an id).
  */
 import { join, resolve, isAbsolute, relative } from 'node:path';
+import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { readNotebook, deserialize, writeNotebook } from './ipynb.js';
 import { publish } from './events.js';
@@ -200,8 +201,7 @@ export function createNotebook(nb, originId) {
 	const abs = resolveAbs(nb);
 	let doc = docs.get(abs);
 	if (!doc) {
-		const raw = readNotebook(abs);
-		if (raw) {
+		if (existsSync(abs)) {
 			doc = loadDoc(abs);
 		} else {
 			doc = { path: abs, cells: [newCell('code')], metadata: undefined };
@@ -331,7 +331,7 @@ export function deleteCell(id, nb, originId) {
 export function setSource(id, source, nb, originId) {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
-	if (cell) {
+	if (cell && cell.source !== source) {
 		cell.source = source;
 		persist(doc);
 		emit(doc, 'cell:edited', { cellId: id, source }, originId);

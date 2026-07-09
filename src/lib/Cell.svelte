@@ -216,7 +216,9 @@
 	});
 
 	function loadRemote() {
-		if (pendingRemoteSource != null) applySourceToEditor(pendingRemoteSource);
+		if (pendingRemoteSource != null && pendingRemoteSource !== currentSource()) {
+			applySourceToEditor(pendingRemoteSource);
+		}
 		remoteChanged = false;
 		pendingRemoteSource = null;
 	}
@@ -282,6 +284,13 @@
 						if (!v.docChanged) return;
 						liveSource = v.state.doc.toString();
 						if (applyingRemote) return; // programmatic remote apply → don't save/echo
+						// A genuine local edit supersedes any stashed remote snapshot: drop
+						// it (and the banner) once the buffer diverges, so Load can never
+						// clobber newer local content with a now-stale remote source.
+						if (remoteChanged && liveSource !== pendingRemoteSource) {
+							remoteChanged = false;
+							pendingRemoteSource = null;
+						}
 						editPending = true;
 						clearTimeout(editTimer);
 						editTimer = setTimeout(() => {
