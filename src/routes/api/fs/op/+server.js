@@ -1,0 +1,54 @@
+import { json, error } from '@sveltejs/kit';
+import {
+	createEntry,
+	renameEntry,
+	deleteEntry,
+	moveEntry,
+	copyEntry
+} from '$lib/server/fstree.js';
+import { dropDocs, rekeyDocs } from '$lib/server/notebook.js';
+
+/**
+ * File-management operations for the sidebar file explorer. A single POST
+ * dispatched on `op`; every underlying helper is path-guarded to the workspace
+ * and refuses to touch the workspace root. Returns `{ ok, ...result }` where
+ * `result` carries the affected workspace-relative path(s) so the client can
+ * refresh and update any open tab.
+ */
+export async function POST({ request }) {
+	let body;
+	try {
+		body = await request.json();
+	} catch {
+		throw error(400, 'invalid JSON body');
+	}
+	const { op } = body ?? {};
+	try {
+		switch (op) {
+			case 'create':
+				return json({ ok: true, ...createEntry(body.parent ?? '', body.name, body.kind) });
+			case 'rename': {
+				const res = renameEntry(body.path, body.name);
+				if (res.from && res.from !== res.path) rekeyDocs(res.from, res.path);
+				return json({ ok: true, ...res });
+			}
+			case 'delete': {
+				const res = deleteEntry(body.path);
+				dropDocs(res.path);
+				return json({ ok: true, ...res });
+			}
+			case 'move': {
+				const res = moveEntry(body.path, body.dest ?? '');
+				if (res.from && res.from !== res.path) rekeyDocs(res.from, res.path);
+				return json({ ok: true, ...res });
+			}
+			case 'copy':
+				return json({ ok: true, ...copyEntry(body.path, body.dest ?? '') });
+			default:
+				throw error(400, `unknown op: ${op}`);
+		}
+	} catch (err) {
+		if (err?.status) throw err; // a SvelteKit error() from the default case
+		throw error(400, String(err?.message ?? err));
+	}
+}

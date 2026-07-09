@@ -18,7 +18,7 @@
  * regenerated on edit/run/reorder. Cell ids only need to be unique within a
  * single document (two open notebooks may legitimately share an id).
  */
-import { join, resolve, isAbsolute, relative } from 'node:path';
+import { join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { readNotebook, deserialize, writeNotebook } from './ipynb.js';
@@ -218,6 +218,49 @@ export function createNotebook(nb, originId) {
 		originId
 	});
 	return getNotebook(abs);
+}
+
+/**
+ * A sidebar file-management op deleted a workspace path. Drop every live doc at
+ * that path (or, when a folder was deleted, any doc nested under it) from the
+ * `docs` Map so a later UI/MCP persist can't `writeFileSync`-resurrect a file
+ * the user just removed. When the active pointer referenced a dropped doc it is
+ * reset to null, so it falls back to the default notebook. A no-op when no live
+ * doc matches (non-notebook files, closed notebooks).
+ */
+export function dropDocs(nb) {
+	const abs = resolveAbs(nb);
+	const prefix = abs + sep;
+	for (const key of [...docs.keys()]) {
+		if (key !== abs && !key.startsWith(prefix)) continue;
+		docs.delete(key);
+		if (activePath === key) activePath = null;
+	}
+}
+
+/**
+ * A sidebar file-management op renamed/moved a workspace path. Rekey every live
+ * doc from its old absolute path to the new one (folder renames/moves rekey any
+ * nested notebook docs too) so edits keep landing in the live doc and the old
+ * path isn't recreated on the next persist. Updates the active pointer when it
+ * referenced a rekeyed doc. A no-op when no live doc matches.
+ */
+export function rekeyDocs(fromNb, toNb) {
+	const fromAbs = resolveAbs(fromNb);
+	const toAbs = resolveAbs(toNb);
+	if (fromAbs === toAbs) return;
+	const prefix = fromAbs + sep;
+	for (const key of [...docs.keys()]) {
+		let newKey = null;
+		if (key === fromAbs) newKey = toAbs;
+		else if (key.startsWith(prefix)) newKey = toAbs + key.slice(fromAbs.length);
+		if (newKey == null) continue;
+		const doc = docs.get(key);
+		docs.delete(key);
+		doc.path = newKey;
+		docs.set(newKey, doc);
+		if (activePath === key) activePath = newKey;
+	}
 }
 
 /**
