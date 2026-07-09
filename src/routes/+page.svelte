@@ -65,6 +65,16 @@
 	);
 	const activeCells = $derived(notebooksCells[activeNotebookPath] ?? []);
 
+	// Notebooks currently open in the shell (the default notebook tab + every
+	// opened `.ipynb`). With the single-shared-kernel model these are exactly the
+	// notebooks loaded against that one kernel, so the sidebar Kernels section
+	// lists them under it. Derived from tabs → updates live as notebooks open/close.
+	const openNotebooks = $derived(
+		tabs
+			.filter((t) => t.kind === 'notebook' || t.kind === 'ipynb')
+			.map((t) => ({ id: t.id, path: t.path, name: t.title, active: t.id === activeTabId }))
+	);
+
 	function tabIdFor(path) {
 		return path === canonicalNotebookRel ? 'notebook' : 'file:' + path;
 	}
@@ -118,8 +128,11 @@
 		tabs = tabs.map((t) => (t.id === id ? { ...t, preview: false } : t));
 	}
 
-	function openNotebook() {
-		openFilePermanent(canonicalNotebookRel);
+	// Focus (or open) a notebook tab by workspace-relative path. Defaults to the
+	// canonical notebook so existing callers (`newNotebook`) keep working; the
+	// sidebar Kernels section passes a specific path to focus any open notebook.
+	function openNotebook(path = canonicalNotebookRel) {
+		openFilePermanent(path);
 	}
 
 	// Explicitly create (or open) the workspace's default notebook. On a fresh
@@ -402,7 +415,7 @@
 					{mcp}
 					kernelInfo={displayKernel}
 					{kernelBusy}
-					{notebookName}
+					{openNotebooks}
 					{variables}
 					{varsLoading}
 					{varsError}

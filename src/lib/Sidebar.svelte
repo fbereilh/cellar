@@ -8,7 +8,7 @@
 		mcp = null,
 		kernelInfo,
 		kernelBusy,
-		notebookName,
+		openNotebooks = [],
 		variables,
 		varsLoading,
 		varsError,
@@ -510,56 +510,106 @@
 	{/if}
 {/snippet}
 
+<!-- One open notebook loaded against the shared kernel. Clicking focuses its
+     tab; the active notebook is marked with a primary dot. -->
+{#snippet notebookRow(nb)}
+	<button class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50 {nb.active ? 'text-base-content' : 'text-base-content/60'}" onclick={() => onOpenNotebook?.(nb.path)} title="Open {nb.name}" data-testid="kernel-notebook">
+		<svg class="h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
+		<span class="truncate font-mono">{nb.name}</span>
+		{#if nb.active}<span class="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
+	</button>
+{/snippet}
+
+<!-- Interrupt / restart the shared kernel; disabled until it is started (and
+     while a control is already in flight). -->
+{#snippet kernelControls()}
+	<div class="mt-2 flex gap-1.5 border-t border-base-300 pt-2" data-testid="kernel-controls">
+		<button
+			class="btn btn-outline btn-xs flex-1 gap-1"
+			onclick={onInterruptKernel}
+			disabled={!kernelInfo?.started || kernelBusy}
+			title="Interrupt the kernel (stop the running cell)"
+			data-testid="kernel-interrupt"
+		>
+			<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
+			Interrupt
+		</button>
+		<button
+			class="btn btn-outline btn-xs flex-1 gap-1"
+			onclick={onRestartKernel}
+			disabled={!kernelInfo?.started || kernelBusy}
+			title="Restart the kernel (clear the namespace, keep the notebook)"
+			data-testid="kernel-restart"
+		>
+			<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
+			Restart
+		</button>
+	</div>
+{/snippet}
+
 {#snippet kernelsSection()}
 	<div class="flex items-center">
 		{@render header('kernels', 'Kernels', 'section-kernels')}
 		{@render refreshBtn(onRefreshKernel, 'Refresh kernel status')}
 	</div>
 	{#if open.kernels}
+		<!-- Cellar runs ONE shared kernel across every open notebook. So the live
+		     picture is: at most one kernel (started only after the first run), with
+		     every open notebook listed under it. Before the first run there is no
+		     kernel — show that, not a phantom `python3`. -->
 		<div class="px-3 pb-3" data-testid="kernels-body">
-			<div class="rounded-lg border border-base-300 bg-base-100 p-2.5">
-				<div class="flex items-center justify-between gap-2">
-					<span class="flex items-center gap-1.5 text-sm font-medium">
-						<svg class="h-3.5 w-3.5 text-primary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
-						{kernelInfo?.name || 'python3'}
-					</span>
-					<span class="badge badge-sm {kernelBadge(kernelInfo)} gap-1">
-						<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
-						{kernelInfo?.started ? kernelInfo.status : 'not started'}
-					</span>
+			{#if kernelInfo?.started}
+				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="kernel-card">
+					<div class="flex items-center justify-between gap-2">
+						<span class="flex items-center gap-1.5 text-sm font-medium">
+							<svg class="h-3.5 w-3.5 text-primary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+							{kernelInfo.name || 'python3'}
+						</span>
+						<span class="badge badge-sm {kernelBadge(kernelInfo)} gap-1" data-testid="kernel-card-status">
+							<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
+							{kernelInfo.status}
+						</span>
+					</div>
+					<div class="mt-2 border-t border-base-300 pt-2">
+						<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40" data-testid="kernel-notebooks-label">
+							notebooks{openNotebooks.length ? ` · ${openNotebooks.length}` : ''}
+						</div>
+						{#each openNotebooks as nb (nb.id)}
+							{@render notebookRow(nb)}
+						{:else}
+							<p class="px-1 text-xs text-base-content/40">no notebooks open</p>
+						{/each}
+					</div>
+					{@render kernelControls()}
 				</div>
-				<div class="mt-2 border-t border-base-300 pt-2 text-xs text-base-content/60">
-					<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40">attached</div>
-					<button class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-base-300/50" onclick={() => onOpenNotebook?.()} title="Open the notebook" data-testid="attached-notebook">
-						<svg class="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
-						<span class="truncate font-mono">{notebookName}</span>
-					</button>
+			{:else}
+				<div class="rounded-lg border border-dashed border-base-300 bg-base-100 p-2.5" data-testid="kernel-card">
+					<div class="flex items-center justify-between gap-2">
+						<span class="flex items-center gap-1.5 text-sm font-medium text-base-content/50">
+							<svg class="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+							No kernel running
+						</span>
+						<span class="badge badge-sm badge-ghost gap-1" data-testid="kernel-card-status">
+							<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
+							not started
+						</span>
+					</div>
+					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">
+						Run a cell to start the <span class="font-mono">{kernelInfo?.name || 'python3'}</span> kernel.
+					</p>
+					{#if openNotebooks.length}
+						<div class="mt-2 border-t border-base-300 pt-2">
+							<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40" data-testid="kernel-notebooks-label">
+								open notebooks · {openNotebooks.length} · no live kernel yet
+							</div>
+							{#each openNotebooks as nb (nb.id)}
+								{@render notebookRow(nb)}
+							{/each}
+						</div>
+					{/if}
+					{@render kernelControls()}
 				</div>
-				<!-- Active-kernel controls: stop a running cell / restart the process
-				     (clears the namespace, keeps the session + document). -->
-				<div class="mt-2 flex gap-1.5 border-t border-base-300 pt-2" data-testid="kernel-controls">
-					<button
-						class="btn btn-outline btn-xs flex-1 gap-1"
-						onclick={onInterruptKernel}
-						disabled={!kernelInfo?.started || kernelBusy}
-						title="Interrupt the kernel (stop the running cell)"
-						data-testid="kernel-interrupt"
-					>
-						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
-						Interrupt
-					</button>
-					<button
-						class="btn btn-outline btn-xs flex-1 gap-1"
-						onclick={onRestartKernel}
-						disabled={!kernelInfo?.started || kernelBusy}
-						title="Restart the kernel (clear the namespace, keep the notebook)"
-						data-testid="kernel-restart"
-					>
-						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
-						Restart
-					</button>
-				</div>
-			</div>
+			{/if}
 		</div>
 	{/if}
 {/snippet}
