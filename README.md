@@ -148,9 +148,10 @@ running indicator and streaming outputs appear with no reload, pushed over a
 Server-Sent Events stream (`src/lib/server/events.js` → `/api/events`). Runs
 from another browser tab sync the same way. **Structural changes sync live too**:
 an agent adding, editing, deleting, moving, or retyping a cell patches the open
-notebook in place, and `create_notebook` opens the new notebook in a tab with no
-reload. A remote edit to a cell you are actively typing in never clobbers your
-input — it surfaces a "Changed on server" affordance with a Load button instead.
+notebook in place, and `open_notebook`/`create_notebook` surface (or focus) the
+target notebook in a tab with no reload. A remote edit to a cell you are
+actively typing in never clobbers your input — it surfaces a "Changed on
+server" affordance with a Load button instead.
 
 ### Zero-config agent connection (`cellar mcp`)
 
