@@ -1,63 +1,14 @@
-<script module>
-	import { EditorView } from '@codemirror/view';
-	import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
-	import { tags as t } from '@lezer/highlight';
-	import { oneDark } from '@codemirror/theme-one-dark';
-
-	// Cellar's app themes (persisted to `localStorage['cellar-theme']`, applied as
-	// `<html data-theme>`): 'dim' is dark, 'nord' is light. The code editor must
-	// follow suit — a dark editor on a light page (and vice-versa) reads as a bug.
-	const LIGHT_THEMES = new Set(['nord']);
-
-	// Light editor palette = pygments "default" (the standard Jupyter light syntax
-	// scheme), on the card's own light background (no editor background of its own).
-	const jupyterLightHighlight = HighlightStyle.define([
-		{ tag: [t.comment, t.lineComment, t.blockComment], color: '#408080', fontStyle: 'italic' },
-		{ tag: [t.keyword, t.modifier, t.controlKeyword, t.operatorKeyword], color: '#008000', fontWeight: 'bold' },
-		{ tag: [t.string, t.special(t.string), t.regexp], color: '#ba2121' },
-		{ tag: [t.number, t.integer, t.float], color: '#666666' },
-		{ tag: [t.bool, t.null, t.atom], color: '#008000', fontWeight: 'bold' },
-		{ tag: [t.function(t.variableName), t.function(t.definition(t.variableName))], color: '#0000ff' },
-		{ tag: [t.definition(t.variableName)], color: '#19177c' },
-		{ tag: [t.className, t.typeName, t.namespace], color: '#0000ff', fontWeight: 'bold' },
-		{ tag: [t.standard(t.variableName), t.self], color: '#008000' },
-		{ tag: [t.operator], color: '#666666' },
-		{ tag: [t.meta], color: '#aa22ff' },
-		{ tag: [t.heading], color: '#000080', fontWeight: 'bold' },
-		{ tag: [t.link, t.url], color: '#0000ff', textDecoration: 'underline' },
-		{ tag: [t.emphasis], fontStyle: 'italic' },
-		{ tag: [t.strong], fontWeight: 'bold' }
-	]);
-	const jupyterLightTheme = EditorView.theme(
-		{
-			'&': { color: '#1a1a1a' },
-			'.cm-cursor, .cm-dropCursor': { borderLeftColor: '#1a1a1a' },
-			'.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: '#d7d4f0' },
-			'.cm-activeLine': { backgroundColor: 'rgba(0, 0, 0, 0.035)' },
-			'.cm-activeLineGutter': { backgroundColor: 'transparent' },
-			'.cm-lineNumbers .cm-gutterElement': { color: '#b8b8c0' },
-			'.cm-matchingBracket': { backgroundColor: '#c2f0c2', color: 'inherit' }
-		},
-		{ dark: false }
-	);
-
-	// Editor theme extensions for the current app theme: bundled oneDark for dark
-	// themes, the Jupyter light scheme for light ones.
-	function editorThemeExtensions(appTheme) {
-		return LIGHT_THEMES.has(appTheme) ? [jupyterLightTheme, syntaxHighlighting(jupyterLightHighlight)] : [oneDark];
-	}
-</script>
-
 <script>
 	import { onMount, tick } from 'svelte';
 	import { browser } from '$app/environment';
-	import { keymap } from '@codemirror/view';
+	import { EditorView, keymap } from '@codemirror/view';
 	import { EditorState, Prec, Compartment } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
 	import MarkdownIt from 'markdown-it';
 	import DOMPurify from 'dompurify';
+	import { editorThemeExtensions } from '$lib/editorTheme.js';
 
 	let {
 		cell,
@@ -248,8 +199,13 @@
 	});
 
 	// Follow the app's light/dark theme so the editor never renders dark-on-light.
+	// Compute the extensions unconditionally: reading `theme` outside the `if
+	// (view)` guard is what registers it as a dependency, so this re-runs on every
+	// theme toggle even when `view` was still unset on the effect's first pass
+	// (onMount, which assigns `view`, may run after the first effect).
 	$effect(() => {
-		if (view) view.dispatch({ effects: editorTheme.reconfigure(editorThemeExtensions(theme)) });
+		const extensions = editorThemeExtensions(theme);
+		if (view) view.dispatch({ effects: editorTheme.reconfigure(extensions) });
 	});
 
 	onMount(() => {

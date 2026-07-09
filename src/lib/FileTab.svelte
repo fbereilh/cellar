@@ -1,16 +1,18 @@
 <script>
 	import { onMount } from 'svelte';
 	import { EditorView, keymap } from '@codemirror/view';
-	import { EditorState, Prec } from '@codemirror/state';
+	import { EditorState, Prec, Compartment } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
 	import { json as jsonLang } from '@codemirror/lang-json';
-	import { oneDark } from '@codemirror/theme-one-dark';
+	import { editorThemeExtensions } from '$lib/editorTheme.js';
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports
 	// dirty state up so the tab bar can show the unsaved indicator.
-	let { path, onDirty } = $props();
+	let { path, onDirty, theme = 'dim' } = $props();
+
+	const editorTheme = new Compartment();
 
 	let editorEl;
 	let view;
@@ -55,6 +57,14 @@
 		}
 	}
 
+	// Follow the app's light/dark theme (same pattern as Cell.svelte): read `theme`
+	// unconditionally so it stays a tracked dependency even before `view` exists,
+	// and reconfigure live on every toggle.
+	$effect(() => {
+		const extensions = editorThemeExtensions(theme);
+		if (view) view.dispatch({ effects: editorTheme.reconfigure(extensions) });
+	});
+
 	onMount(async () => {
 		let content = '';
 		try {
@@ -76,7 +86,7 @@
 				extensions: [
 					basicSetup,
 					langFor(path),
-					oneDark,
+					editorTheme.of(editorThemeExtensions(theme)),
 					Prec.highest(keymap.of([{ key: 'Mod-s', run: () => (save(), true) }])),
 					EditorView.updateListener.of((v) => {
 						if (v.docChanged) setDirty(true);
