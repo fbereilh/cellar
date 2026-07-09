@@ -198,7 +198,8 @@ into imports/functions/classes/variables, `read_cell`/`read_cells`,
 `read_by_location`, `read_section`, `search_cells`, `get_errors`,
 `get_full_output` with medium/full tiering); write (`add_cell`/`add_cells`,
 `edit_cell`, `delete_cell`, `move_cell`, `set_cell_type`,
-`set_cell_visibility`); execute (`run_cell`, `run_cells`, `run_all`,
+`set_cell_visibility`); execute (`add_and_run` = add a cell and run it in one
+call, the preferred write-and-execute flow; `run_cell`, `run_cells`, `run_all`,
 `run_range`).
 
 ## What was verified
