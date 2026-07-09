@@ -5,10 +5,13 @@ works as-is — `@jupyterlab/services` in Node over Jupyter's REST+WebSocket, no
 fallback needed). Step 1 turns the single cell into a real **notebook document**
 with a **git-friendly clean-on-save pipeline**.
 
-You run one command in a folder; a browser opens the notebook (a real
-`notebook.ipynb` in that folder). Add/run/reorder/delete code cells; outputs
-stream live and persist. The file is a real Jupyter notebook that opens in
-vanilla Jupyter, and re-running with identical results produces **no git diff**.
+You run one command in a folder; a browser opens to a clean empty state (a
+fresh folder gets **no** uninvited `notebook.ipynb`). Click **New notebook** to
+create the workspace notebook, or open an existing `.ipynb` from the sidebar;
+the file is written only when you create it or first mutate a cell. Add/run/
+reorder/delete code cells; outputs stream live and persist. The file is a real
+Jupyter notebook that opens in vanilla Jupyter, and re-running with identical
+results produces **no git diff**.
 
 Deferred to later steps: MCP/agent interface, extract-to-`.py`, `.py` view,
 Databricks, the git merge driver, polished editing UX (see `data/cellar-spec.md`).
