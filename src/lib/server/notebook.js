@@ -190,6 +190,29 @@ export function getActiveNotebookPath() {
 }
 
 /**
+ * Make `abs` the active notebook and broadcast `notebook:opened` so an
+ * already-open shell surfaces/focuses it in a tab with no reload. Shared by
+ * `createNotebook` and `openNotebook` so both take the exact same UI path.
+ */
+function activateAndBroadcast(abs, originId) {
+	activePath = abs;
+	publish({
+		type: 'notebook:opened',
+		nb: abs,
+		relPath: relative(workspace(), abs),
+		name: abs.split(/[/\\]/).pop(),
+		originId
+	});
+	return getNotebook(abs);
+}
+
+/** True if `nb` resolves to a live doc or an on-disk `.ipynb` in the workspace. */
+export function notebookExists(nb) {
+	const abs = resolveAbs(nb);
+	return docs.has(abs) || existsSync(abs);
+}
+
+/**
  * Create a new workspace notebook (or open an existing one at that path), make
  * it the active notebook, and broadcast `notebook:opened` so an already-open
  * shell surfaces it in a tab with no reload. `nb` is a workspace-relative path
@@ -209,15 +232,22 @@ export function createNotebook(nb, originId) {
 			persist(doc);
 		}
 	}
-	activePath = abs;
-	publish({
-		type: 'notebook:opened',
-		nb: abs,
-		relPath: relative(workspace(), abs),
-		name: abs.split(/[/\\]/).pop(),
-		originId
-	});
-	return getNotebook(abs);
+	return activateAndBroadcast(abs, originId);
+}
+
+/**
+ * Open an EXISTING workspace notebook, make it active, and broadcast
+ * `notebook:opened` (same UI path as `createNotebook`). `nb` is a
+ * workspace-relative `.ipynb` path. Throws `notebook not found` when no live
+ * doc and no on-disk file exist — opening never creates (use `createNotebook`).
+ */
+export function openNotebook(nb, originId) {
+	const abs = resolveAbs(nb);
+	if (!docs.has(abs) && !existsSync(abs)) {
+		throw new Error('notebook not found: ' + relative(workspace(), abs));
+	}
+	loadDoc(abs);
+	return activateAndBroadcast(abs, originId);
 }
 
 /**

@@ -51,6 +51,12 @@ Follow this house style:
    sections (Setup, Load data, Explore, Model, Results). Keep code cells focused:
    one idea per cell.
 
+5. PICK THE RIGHT NOTEBOOK. Your read/write/run tools target the active notebook.
+   Call list_notebooks to discover the workspace's notebooks; open_notebook(name)
+   to open and focus an EXISTING one (this makes it active and surfaces it in the
+   UI); create_notebook(name) only for a genuinely NEW notebook. Do not reach for
+   create_notebook to open something that already exists.
+
 The goal: a notebook a human would be happy to have written — imports up top,
 shared state, a clean section outline, and a continuous line of reasoning from
 first cell to last.`;
@@ -60,9 +66,9 @@ function registerTools(server) {
 	server.registerTool('restart_kernel', { description: 'Restart the kernel (clears namespace). Does NOT affect the MCP connection or document.', inputSchema: {} }, async () => text(await svc.kernel.restart()));
 	server.registerTool('interrupt_kernel', { description: 'Interrupt the running kernel.', inputSchema: {} }, async () => text(await svc.kernel.interrupt()));
 	server.registerTool('kernel_status', { description: 'Current kernel status.', inputSchema: {} }, async () => text(svc.kernel.status()));
-	server.registerTool('list_notebooks', { description: 'List notebooks in the workspace.', inputSchema: {} }, async () => text(svc.listNotebooks()));
-	server.registerTool('open_notebook', { description: 'Open (the workspace) notebook.', inputSchema: {} }, async () => text(svc.openNotebook()));
-	server.registerTool('create_notebook', { description: 'Create (or open) a workspace notebook by name (a .ipynb file), make it active, and surface it live in the open UI. Omit name for an untitled notebook.', inputSchema: { name: z.string().optional() } }, async ({ name }) => text(svc.createNotebook(name)));
+	server.registerTool('list_notebooks', { description: 'List every .ipynb in the workspace (workspace-relative paths) so you can discover notebook names to open, and which one is currently active. Use open_notebook to focus one of these.', inputSchema: {} }, async () => text(svc.listNotebooks()));
+	server.registerTool('open_notebook', { description: 'Open and focus an existing workspace notebook by name; surfaces it live in the UI. Use create_notebook to make a new one.', inputSchema: { name: z.string() } }, async ({ name }) => { try { return text(svc.openNotebook(name)); } catch (e) { return notFound(String(e?.message ?? e)); } });
+	server.registerTool('create_notebook', { description: 'Create a NEW workspace notebook by name (a .ipynb file), make it active, and surface it live in the open UI. Omit name for an untitled notebook. To open a notebook that already exists, use open_notebook instead.', inputSchema: { name: z.string().optional() } }, async ({ name }) => text(svc.createNotebook(name)));
 
 	// --- read ---
 	server.registerTool('get_notebook_map', { description: 'Compact hierarchical section tree (from markdown headers): id, type, header level/title, one-line summary, run status, has-output, visibility. Not full content.', inputSchema: {} }, async () => text(svc.getNotebookMap()));
