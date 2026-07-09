@@ -6,6 +6,7 @@
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
 	import { json as jsonLang } from '@codemirror/lang-json';
+	import { yaml as yamlLang } from '@codemirror/lang-yaml';
 	import { editorThemeExtensions } from '$lib/editorTheme.js';
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports
@@ -26,6 +27,7 @@
 		if (p.endsWith('.py')) return python();
 		if (p.endsWith('.md') || p.endsWith('.markdown')) return markdown();
 		if (p.endsWith('.json') || p.endsWith('.ipynb')) return jsonLang();
+		if (p.endsWith('.yml') || p.endsWith('.yaml')) return yamlLang();
 		return [];
 	}
 
