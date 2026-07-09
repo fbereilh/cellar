@@ -42,22 +42,45 @@ Follow this house style:
    kernel. Do not re-import a module that is already loaded, and do not recompute
    or redefine a value that already exists — build on it.
 
-3. CONTINUE THE STORY. Before adding a cell, call get_notebook_map to see the
+3. KERNEL_STATE IS THE LIVE TRUTH; SAVED OUTPUTS ARE NOT. A cell's outputs are
+   saved in the .ipynb file and outlive both the kernel and previous sessions, so
+   "this cell has output" NEVER means "this cell has run in the kernel you are
+   talking to". Only kernel_state says what is actually defined right now.
+
+   get_notebook_map and read_cell make the difference explicit:
+     - run_status "ok_session" / "error_session", ran_this_session: true
+       — the cell really executed in the current kernel session.
+     - run_status "ok_persisted" / "error_persisted", ran_this_session: false
+       — those outputs are LEFTOVER from a previous session. Nothing that cell
+       defines exists in the kernel.
+     - run_status "error_kernel_unavailable" - the kernel could not be reached;
+       this failure is LIVE, not leftover. Nothing executed (ran_this_session is
+       still false), so do not ignore it as stale: fix the kernel, then re-run.
+   The map's kernel header ({started, session_id, execs_this_session}) tells you
+   whether any of it ran this session at all.
+
+   So: before you depend on a variable an earlier cell defines, confirm it in
+   kernel_state. If it is missing, RE-RUN the upstream cells that define it
+   (run_cell / run_range / run_all) before running anything downstream — otherwise
+   you get a NameError on a cell whose saved output looked perfectly fine.
+   Restarting the kernel resets every cell to "not run this session".
+
+4. CONTINUE THE STORY. Before adding a cell, call get_notebook_map to see the
    narrative so far. A new cell should advance it — reuse existing variables,
    reference earlier results, and add a short markdown header when you start a new
    section. Do not answer a question in isolation as if the notebook were empty.
 
-4. STRUCTURE WITH MARKDOWN. Use markdown header cells to divide the notebook into
+5. STRUCTURE WITH MARKDOWN. Use markdown header cells to divide the notebook into
    sections (Setup, Load data, Explore, Model, Results). Keep code cells focused:
    one idea per cell.
 
-5. PICK THE RIGHT NOTEBOOK. Your read/write/run tools target the active notebook.
+6. PICK THE RIGHT NOTEBOOK. Your read/write/run tools target the active notebook.
    Call list_notebooks to discover the workspace's notebooks; open_notebook(name)
    to open and focus an EXISTING one (this makes it active and surfaces it in the
    UI); create_notebook(name) only for a genuinely NEW notebook. Do not reach for
    create_notebook to open something that already exists.
 
-6. WRITE AND RUN TOGETHER. When you add a code cell you intend to execute, use
+7. WRITE AND RUN TOGETHER. When you add a code cell you intend to execute, use
    add_and_run — it creates the cell and runs it in one call, returning the new
    cell id and the run result (outputs/errors) together, with fewer round-trips
    than add_cell followed by run_cell. Reserve add_cell for cells you are adding
@@ -69,26 +92,26 @@ first cell to last.`;
 
 function registerTools(server) {
 	// --- lifecycle ---
-	server.registerTool('restart_kernel', { description: 'Restart the kernel (clears namespace). Does NOT affect the MCP connection or document.', inputSchema: {} }, async () => text(await svc.kernel.restart()));
+	server.registerTool('restart_kernel', { description: 'Restart the kernel (clears the namespace and opens a new kernel session, so every cell reverts to ran_this_session:false). Does NOT affect the MCP connection or document.', inputSchema: {} }, async () => text(await svc.kernel.restart()));
 	server.registerTool('interrupt_kernel', { description: 'Interrupt the running kernel.', inputSchema: {} }, async () => text(await svc.kernel.interrupt()));
-	server.registerTool('kernel_status', { description: 'Current kernel status.', inputSchema: {} }, async () => text(svc.kernel.status()));
+	server.registerTool('kernel_status', { description: 'Current kernel status, plus the live kernel session: {started, session_id, execs_this_session}. execs_this_session:0 means no cell has run against this namespace yet, whatever the notebook\'s saved outputs suggest.', inputSchema: {} }, async () => text(svc.kernel.status()));
 	server.registerTool('list_notebooks', { description: 'List every .ipynb in the workspace (workspace-relative paths) so you can discover notebook names to open, and which one is currently active. Use open_notebook to focus one of these.', inputSchema: {} }, async () => text(svc.listNotebooks()));
 	server.registerTool('open_notebook', { description: 'Open and focus an existing workspace notebook by name; surfaces it live in the UI. Use create_notebook to make a new one.', inputSchema: { name: z.string() } }, async ({ name }) => { try { return text(svc.openNotebook(name)); } catch (e) { return notFound(String(e?.message ?? e)); } });
 	server.registerTool('create_notebook', { description: 'Create a NEW workspace notebook by name (a .ipynb file), make it active, and surface it live in the open UI. Omit name for an untitled notebook. To open a notebook that already exists, use open_notebook instead.', inputSchema: { name: z.string().optional() } }, async ({ name }) => text(svc.createNotebook(name)));
 
 	// --- read ---
-	server.registerTool('get_notebook_map', { description: 'Compact hierarchical section tree (from markdown headers): id, type, header level/title, one-line summary, run status, has-output, visibility. Not full content.', inputSchema: {} }, async () => text(svc.getNotebookMap()));
-	server.registerTool('kernel_state', { description: 'Live kernel namespace: imports already loaded, user-defined functions/classes, and variables (with types, shapes, dataframe columns). Returns {started:false} if no kernel is running (does not boot one). Call this BEFORE writing code so you do not re-import modules or redefine names that already exist.', inputSchema: {} }, async () => text(await svc.getKernelState()));
-	server.registerTool('read_cell', { description: 'Read one cell by UUID (source + summarized outputs).', inputSchema: { id: z.string() } }, async ({ id }) => { const r = svc.readCell(id); return r ? text(r) : notFound(`cell ${id} not found or hidden`); });
-	server.registerTool('read_cells', { description: 'Read multiple cells by UUID.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(svc.readCells(ids)));
+	server.registerTool('get_notebook_map', { description: 'Compact hierarchical section tree (from markdown headers): id, type, header level/title, one-line summary, run status, has-output, visibility, plus a `kernel` header {started, session_id, execs_this_session}. Not full content. run_status separates LIVE from SAVED execution: ok_session/error_session = the cell ran in the CURRENT kernel session (ran_this_session:true); ok_persisted/error_persisted = the outputs were loaded from the .ipynb and are LEFTOVER from a previous session (ran_this_session:false) — nothing those cells define exists in the kernel. error_kernel_unavailable = the run could not reach a kernel at all, so this failure is LIVE, not leftover (nothing executed, so ran_this_session stays false). has_output means a cell has saved output, never that it ran. Trust kernel_state, not saved outputs, for what is actually defined.', inputSchema: {} }, async () => text(svc.getNotebookMap()));
+	server.registerTool('kernel_state', { description: 'THE LIVE TRUTH about what is defined right now: the kernel namespace — imports already loaded, user-defined functions/classes, and variables (with types, shapes, dataframe columns). Returns {started:false} if no kernel is running (does not boot one); stale:true means the kernel restarted while reading, so the namespace below belongs to session_id and is already gone. Call this BEFORE writing code so you do not re-import modules or redefine names that already exist, and BEFORE depending on a variable an earlier cell defines — a cell can show saved outputs (run_status ok_persisted) yet never have run in this session. If a name is missing here, re-run the cell that defines it.', inputSchema: {} }, async () => text(await svc.getKernelState()));
+	server.registerTool('read_cell', { description: 'Read one cell by UUID (source + summarized outputs). ran_this_session/run_status tell you whether the outputs came from the CURRENT kernel session (ok_session) or are saved leftovers from a previous one (ok_persisted). run_status error_kernel_unavailable means the kernel could not be reached; that failure is LIVE, not leftover.', inputSchema: { id: z.string() } }, async ({ id }) => { const r = svc.readCell(id); return r ? text(r) : notFound(`cell ${id} not found or hidden`); });
+	server.registerTool('read_cells', { description: 'Read multiple cells by UUID (same per-cell ran_this_session/run_status semantics as read_cell).', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(svc.readCells(ids)));
 	server.registerTool('read_by_location', { description: 'Read a cell by location: index (0-based over visible cells), position first/last, or next/prev of a cell.', inputSchema: { index: z.number().int().optional(), position: z.enum(['first', 'last']).optional(), relative_to: z.string().optional(), direction: z.enum(['next', 'prev']).optional() } }, async ({ index, position, relative_to, direction }) => { const r = svc.readByLocation({ index, position, relativeTo: relative_to, direction }); return r ? text(r) : notFound('no cell at that location'); });
 	server.registerTool('read_section', { description: 'Read all cells under a markdown header (until the next same-or-higher header).', inputSchema: { header_id: z.string() } }, async ({ header_id }) => { const r = svc.readSection(header_id); return r ? text(r) : notFound(`${header_id} is not a visible header cell`); });
-	server.registerTool('search_cells', { description: 'Search cells; returns ids + snippets.', inputSchema: { query: z.string(), in: z.enum(['input', 'output', 'both']).optional() } }, async ({ query, in: where }) => text(svc.searchCells(query, where ?? 'both')));
-	server.registerTool('get_errors', { description: 'List cells whose latest output is an error (ename/evalue/traceback).', inputSchema: {} }, async () => text(svc.getErrors()));
-	server.registerTool('get_full_output', { description: 'Fuller cell outputs. Medium-capped by default; size=full returns everything. Images passed through.', inputSchema: { id: z.string(), size: z.enum(['medium', 'full']).optional() } }, async ({ id, size }) => {
+	server.registerTool('search_cells', { description: 'Search cells; returns ids + snippets. An output snippet from a cell with ran_this_session:false was loaded from the .ipynb and is LEFTOVER from a previous session - kernel_state is the live truth about what is defined now.', inputSchema: { query: z.string(), in: z.enum(['input', 'output', 'both']).optional() } }, async ({ query, in: where }) => text(svc.searchCells(query, where ?? 'both')));
+	server.registerTool('get_errors', { description: 'List cells whose latest output is an error (ename/evalue/traceback). ran_this_session:false means the error was loaded from the .ipynb and was raised by a PREVIOUS session, not the live kernel. The exception is kernel_unavailable:true (run_status error_kernel_unavailable): the kernel could not be reached, so this failure is LIVE, not leftover - fix the kernel rather than ignoring it as stale.', inputSchema: {} }, async () => text(svc.getErrors()));
+	server.registerTool('get_full_output', { description: 'Fuller cell outputs. Medium-capped by default; size=full returns everything. Images passed through. ran_this_session:false means these outputs were loaded from the .ipynb and are LEFTOVER from a previous session - kernel_state is the live truth about what is defined now.', inputSchema: { id: z.string(), size: z.enum(['medium', 'full']).optional() } }, async ({ id, size }) => {
 		const r = svc.getFullOutput(id, size ?? 'medium');
 		if (!r) return notFound(`cell ${id} not found or hidden`);
-		const content = [{ type: 'text', text: JSON.stringify({ id: r.id, size: r.size, outputs: r.outputs.map((o) => (o.data ? { type: o.type, image: o.image } : o)) }, null, 2) }];
+		const content = [{ type: 'text', text: JSON.stringify({ id: r.id, size: r.size, ran_this_session: r.ran_this_session, outputs: r.outputs.map((o) => (o.data ? { type: o.type, image: o.image } : o)) }, null, 2) }];
 		for (const o of r.outputs) if (o.data) content.push({ type: 'image', data: o.data, mimeType: o.image });
 		return { content };
 	});

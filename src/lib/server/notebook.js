@@ -370,17 +370,25 @@ export function setOutputScrolled(id, scrolled, nb) {
 
 /**
  * Stamp runtime-only run metadata on a cell in the allowlisted `cellar`
- * namespace: `lastRun = { at, durationMs, actor }`. Both run entry points (the
- * UI `/run` route → `actor:'user'`, the MCP run tools → `actor:'agent'`) call
- * this so the badge in `Cell.svelte` shows who last ran the cell, when, and how
- * long it took.
+ * namespace: `lastRun = { at, durationMs, actor, status, session }`.
+ * Both run entry points (the UI `/run` route → `actor:'user'`, the MCP run tools
+ * → `actor:'agent'`) call this so the badge in `Cell.svelte` shows who last ran
+ * the cell, when, and how long it took.
+ *
+ * `session` is the kernel-session epoch the run STARTED in (see kernel.js). It
+ * is the only record of whether a cell executed against the namespace that is
+ * live right now: a cell's saved `outputs` survive kernel restarts and process
+ * restarts, so outputs alone can never answer that. The MCP layer compares it
+ * with `currentSessionId()` to report `ran_this_session` — never infer "ran"
+ * from `outputs.length`.
  *
  * NOT persisted: `at`/`durationMs` change every run, so writing them would make
  * the `.ipynb` byte-different on each run (a git diff), violating Cellar's
  * zero-diff-on-re-run rule. It lives only in the in-memory doc and is surfaced
  * to the browser via `cellView` (load/refetch) + the `run:end` SSE event, and
- * `clean.js` strips it before any disk write (report §4.2). Resets on
- * kernel/server restart — "last run this session", which is correct.
+ * `clean.js` strips it before any disk write (report §4.2). Cleared on a server
+ * restart; a kernel restart leaves it in place but bumps the epoch, so the stamp
+ * then correctly reads as "did not run this session".
  */
 export function setLastRun(id, lastRun, nb) {
 	const doc = docFor(nb);

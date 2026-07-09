@@ -26,7 +26,7 @@ import {
 	openNotebook as openNotebookDoc,
 	notebookExists
 } from '../notebook.js';
-import { execute, restartKernel, interruptKernel, kernelStatus } from '../kernel.js';
+import { execute, restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel.js';
 import { kernelState } from '../inspect.js';
 import { publish } from '../events.js';
 import { buildTree } from '../fstree.js';
@@ -60,11 +60,90 @@ function hasOutput(cell) {
 	return cell.cell_type === 'code' && (cell.outputs || []).length > 0;
 }
 
-function runStatus(cell) {
+/**
+ * The one definition of "ran this session": a recorded run epoch identifies the
+ * live namespace only when a kernel is up and the epochs match.
+ *
+ * @param {number|null|undefined} session epoch a run was stamped with
+ * @param {number|null} sid current epoch, or null when no kernel is running
+ */
+const isLiveSession = (session, sid) => sid != null && session === sid;
+
+/**
+ * Did this cell execute against the kernel namespace that is live right now?
+ *
+ * A cell's `outputs` are persisted in the `.ipynb` and outlive both the kernel
+ * and the server process, so they say nothing about the current session. The
+ * runtime-only `cellar.lastRun.session` stamp (see notebook.js `setLastRun`)
+ * does: it equals the kernel-session epoch the run started in, and a restart /
+ * rebind / autorestart bumps that epoch.
+ *
+ * @param {object} cell
+ * @param {number|null} sid current epoch, or null when no kernel is running
+ */
+function ranThisSession(cell, sid) {
+	if (cell.cell_type !== 'code') return false;
+	return isLiveSession(cell.metadata?.cellar?.lastRun?.session, sid);
+}
+
+/**
+ * Did the last run attempt fail because no kernel could be reached, AND is the
+ * kernel still unreachable? Recorded by the run entry points on the runtime-only
+ * lastRun stamp, so it can never be read off disk.
+ *
+ * The liveness check (`sid == null` — no kernel is running) is what keeps the
+ * signal honest. The stamp alone is sticky: only re-running that one cell clears
+ * it, so the boot race — MCP serves before the Jupyter sidecar finishes starting,
+ * an agent's first `run_cell` is rejected, the sidecar comes up moments later —
+ * would leave that cell claiming a LIVE kernel-down failure forever while every
+ * other cell runs fine. Deriving it means the marker expires by itself the instant
+ * a kernel exists, and the cell falls back to `error_persisted`: its saved
+ * CellarError really is leftover from an attempt that executed in no session.
+ * Same shape as `ran_this_session`, likewise derived by comparing epochs rather
+ * than stored as a boolean.
+ *
+ * @param {object} cell
+ * @param {number|null} sid current epoch, or null when no kernel is running
+ */
+const kernelUnavailable = (cell, sid) =>
+	sid == null && cell.metadata?.cellar?.lastRun?.kernel_unavailable === true;
+
+/**
+ * Per-cell run status, with persisted and live-session execution kept strictly
+ * apart — conflating them is what lets an agent build on variables that were
+ * never defined this session:
+ *
+ *   n/a                       markdown cell
+ *   unrun                     no saved outputs, and it has not run this session
+ *   ok_session                ran this session, no error
+ *   error_session             ran this session and raised
+ *   ok_persisted              saved outputs from a PREVIOUS session; nothing it defines exists now
+ *   error_persisted           saved error output from a PREVIOUS session
+ *   error_kernel_unavailable  the kernel could not be reached; this failure is LIVE, not leftover
+ *
+ * For a cell that ran this session the recorded run status is authoritative — a
+ * cell can run successfully and emit no outputs at all (`lp = load()`), which
+ * output inspection alone would misreport as `unrun`. Only an explicit `ok`
+ * counts as success; jupyter's `abort` (and anything else) reads as an error, so
+ * an agent is never told a run succeeded when it did not.
+ *
+ * `error_kernel_unavailable` is a status about the RUN ATTEMPT and is orthogonal
+ * to `ran_this_session`, which stays false: no code executed in any session. It
+ * exists so a failure raised seconds ago by the run the agent just requested is
+ * never mislabelled `error_persisted`, which the doctrine tells agents to ignore
+ * as leftover. It reports only while the kernel is still unreachable — once one
+ * is up, the saved CellarError genuinely is leftover and reads as
+ * `error_persisted` (see `kernelUnavailable`).
+ */
+function runStatus(cell, sid) {
 	if (cell.cell_type !== 'code') return 'n/a';
+	if (ranThisSession(cell, sid)) {
+		return cell.metadata.cellar.lastRun.status === 'ok' ? 'ok_session' : 'error_session';
+	}
+	if (kernelUnavailable(cell, sid)) return 'error_kernel_unavailable';
 	const outs = cell.outputs || [];
-	if (outs.some((o) => o.output_type === 'error')) return 'error';
-	return outs.length ? 'ok' : 'unrun';
+	if (!outs.length) return 'unrun';
+	return outs.some((o) => o.output_type === 'error') ? 'error_persisted' : 'ok_persisted';
 }
 
 const imageKey = (o) => o.data && Object.keys(o.data).find((k) => k.startsWith('image/'));
@@ -112,12 +191,13 @@ function summarizeOutput(o, cap) {
 
 const summarizeOutputs = (cell, cap) => (cell.outputs || []).map((o) => summarizeOutput(o, cap));
 
-function readForm(cell, cap = READ_CAP) {
+function readForm(cell, cap = READ_CAP, sid = currentSessionId()) {
 	return {
 		id: cell.id,
 		type: cell.cell_type,
 		source: cell.source,
-		run_status: runStatus(cell),
+		run_status: runStatus(cell, sid),
+		ran_this_session: ranThisSession(cell, sid),
 		has_output: hasOutput(cell),
 		visible: !isHidden(cell),
 		outputs: summarizeOutputs(cell, cap)
@@ -129,7 +209,9 @@ function readForm(cell, cap = READ_CAP) {
 export const kernel = {
 	restart: () => restartKernel(),
 	interrupt: () => interruptKernel(),
-	status: () => kernelStatus()
+	// `id` is the only field unique to kernelStatus(); both report the same
+	// `status`, so let kernelSession() be its single source of truth.
+	status: () => ({ id: kernelStatus().id, ...kernelSession() })
 };
 
 /**
@@ -193,9 +275,18 @@ export function createNotebook(name) {
 
 // --- read -------------------------------------------------------------------
 
-/** Hierarchical section tree derived from markdown headers (spec §4). */
+/**
+ * Hierarchical section tree derived from markdown headers (spec §4).
+ *
+ * The `kernel` header reports the live session, so a consumer can see at a
+ * glance that the WHOLE map predates the current kernel: with
+ * `kernel.started: false` (or `execs_this_session: 0`) every `*_persisted`
+ * status is saved output from an earlier session and nothing those cells define
+ * exists in the namespace. `kernel_state` remains the live truth.
+ */
 export function getNotebookMap() {
 	const cells = visibleCells();
+	const sid = currentSessionId();
 	const root = [];
 	const stack = [];
 	const leaf = (c) => ({
@@ -203,7 +294,8 @@ export function getNotebookMap() {
 		kind: 'cell',
 		type: c.cell_type,
 		summary: firstLine(c.source),
-		run_status: runStatus(c),
+		run_status: runStatus(c, sid),
+		ran_this_session: ranThisSession(c, sid),
 		has_output: hasOutput(c),
 		visible: true
 	});
@@ -219,7 +311,7 @@ export function getNotebookMap() {
 		}
 	}
 	const nb = getNotebook();
-	return { notebook: nb.path, cell_count: cells.length, sections: root };
+	return { notebook: nb.path, kernel: kernelSession(), cell_count: cells.length, sections: root };
 }
 
 /**
@@ -231,14 +323,21 @@ export function getKernelState() {
 	return kernelState();
 }
 
-export function readCell(id) {
+export function readCell(id, sid = currentSessionId()) {
 	const c = getCell(id);
 	if (!c || isHidden(c)) return null;
-	return readForm(c);
+	return readForm(c, READ_CAP, sid);
 }
 
+/**
+ * Read many cells against ONE sampled epoch. Letting `readForm` re-sample per
+ * cell would let a restart landing mid-loop classify a single response against
+ * two different kernel sessions — some cells `ok_session`, some `ok_persisted`,
+ * for the same kernel state.
+ */
 export function readCells(ids) {
-	return ids.map((id) => readCell(id)).filter(Boolean);
+	const sid = currentSessionId();
+	return ids.map((id) => readCell(id, sid)).filter(Boolean);
 }
 
 /** index (0-based over visible cells), position first/last, or next/prev of an id. */
@@ -270,12 +369,20 @@ export function readSection(headerId) {
 		if (hi && hi.level <= h.level) break;
 		out.push(cells[i]);
 	}
-	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c)) };
+	// One sampled epoch for the whole section (see readCells).
+	const sid = currentSessionId();
+	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid)) };
 }
 
+/**
+ * Search cell sources and saved outputs. Every row carries `ran_this_session`:
+ * an output snippet from a cell that has not run this session was deserialized
+ * from the `.ipynb` and describes a namespace that no longer exists.
+ */
 export function searchCells(query, where = 'both') {
 	const q = (query || '').toLowerCase();
 	if (!q) return [];
+	const sid = currentSessionId();
 	const results = [];
 	const snippet = (text) => {
 		const i = text.toLowerCase().indexOf(q);
@@ -284,26 +391,38 @@ export function searchCells(query, where = 'both') {
 		return (start > 0 ? '…' : '') + text.slice(start, i + q.length + 40).replace(/\n/g, ' ') + '…';
 	};
 	for (const c of visibleCells()) {
+		const live = ranThisSession(c, sid);
 		if (where === 'input' || where === 'both') {
 			const s = snippet(c.source || '');
-			if (s) results.push({ id: c.id, where: 'input', snippet: s });
+			if (s) results.push({ id: c.id, where: 'input', ran_this_session: live, snippet: s });
 		}
 		if (where === 'output' || where === 'both') {
 			const otext = (c.outputs || []).map(outputText).join('\n');
 			const s = snippet(otext);
-			if (s) results.push({ id: c.id, where: 'output', snippet: s });
+			if (s) results.push({ id: c.id, where: 'output', ran_this_session: live, snippet: s });
 		}
 	}
 	return results;
 }
 
+/**
+ * Cells whose saved outputs contain an error. `ran_this_session` separates an
+ * error the current kernel really raised from one deserialized out of the
+ * `.ipynb` — chasing the latter debugs a previous session. `kernel_unavailable`
+ * marks the third case: the run could not reach a kernel at all, so despite
+ * `ran_this_session: false` the failure is LIVE and blocking, not leftover.
+ */
 export function getErrors() {
+	const sid = currentSessionId();
 	const errs = [];
 	for (const c of visibleCells()) {
 		for (const o of c.outputs || []) {
 			if (o.output_type === 'error') {
 				errs.push({
 					id: c.id,
+					ran_this_session: ranThisSession(c, sid),
+					run_status: runStatus(c, sid),
+					...(kernelUnavailable(c, sid) ? { kernel_unavailable: true } : {}),
 					ename: o.ename,
 					evalue: o.evalue,
 					traceback: capText(stripAnsi((o.traceback || []).join('\n')), MEDIUM_CAP).text
@@ -314,7 +433,11 @@ export function getErrors() {
 	return errs;
 }
 
-/** Tiered: medium cap by default; full only on size='full'. Images passed through. */
+/**
+ * Tiered: medium cap by default; full only on size='full'. Images passed through.
+ * `ran_this_session: false` means these outputs were saved by a PREVIOUS session
+ * - they describe a namespace that no longer exists.
+ */
 export function getFullOutput(id, size = 'medium') {
 	const c = getCell(id);
 	if (!c || isHidden(c)) return null;
@@ -324,7 +447,7 @@ export function getFullOutput(id, size = 'medium') {
 		if (img) return { type: o.output_type, image: img, data: o.data[img] };
 		return summarizeOutput(o, cap);
 	});
-	return { id: c.id, size, outputs };
+	return { id: c.id, size, ran_this_session: ranThisSession(c, currentSessionId()), outputs };
 }
 
 // --- write ------------------------------------------------------------------
@@ -369,12 +492,20 @@ export function setCellVisibility(id, hidden) {
 
 // --- execute ----------------------------------------------------------------
 
-async function runSource(source, onOutput) {
+/**
+ * Run code, collecting its outputs and handing the caller - via `onSession`, so
+ * it survives the throw path - the kernel-session epoch the run STARTED in.
+ * Stamping that (rather than reading the epoch after the run) means a kernel
+ * restart mid-run leaves the cell correctly marked as not-this-session.
+ */
+async function runSource(source, onOutput, onSession) {
 	const outputs = [];
 	const reply = await execute(source, (ev) => {
 		if (ev.type === 'output') {
 			outputs.push(ev.output);
 			onOutput?.(ev.output);
+		} else if (ev.type === 'kernel') {
+			onSession?.(ev.session);
 		}
 	});
 	return { outputs, status: reply?.status ?? 'ok' };
@@ -398,8 +529,18 @@ export async function runCell(id) {
 	publish({ type: 'run:start', nb, cellId: id, actor: 'agent', at: startedAt });
 	let outputs = [];
 	let status = 'ok';
+	// The epoch the run STARTED in, captured as soon as the kernel is in hand.
+	// It stays null when execute() failed before any kernel existed, and it is
+	// never re-read afterwards: an autorestart mid-run bumps the live epoch, and
+	// this cell must then read as not-this-session.
+	let session = null;
+	let kernelDown = false;
 	try {
-		const res = await runSource(c.source || '', (output) => publish({ type: 'run:output', nb, cellId: id, output }));
+		const res = await runSource(
+			c.source || '',
+			(output) => publish({ type: 'run:output', nb, cellId: id, output }),
+			(sid) => { session = sid; }
+		);
 		outputs = res.outputs;
 		status = res.status;
 	} catch (err) {
@@ -407,14 +548,18 @@ export async function runCell(id) {
 		outputs = [output];
 		publish({ type: 'run:output', nb, cellId: id, output });
 		status = 'error';
+		// execute() threw before it ever had a kernel in hand, so no session exists
+		// to stamp. Mark the attempt: this error is live, not saved from a prior run.
+		if (session === null) kernelDown = true;
 	}
 	setOutputs(id, outputs);
-	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start.
-	const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent' };
+	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,
+	// `session` = the kernel-session epoch this run executed in (see setLastRun).
+	const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent', status, session, ...(kernelDown ? { kernel_unavailable: true } : {}) };
 	setLastRun(id, lastRun, nb);
-	publish({ type: 'run:end', nb, cellId: id, ...lastRun, status });
+	publish({ type: 'run:end', nb, cellId: id, ...lastRun });
 	const hiddenNote = isHidden(c) ? { hidden: true } : {};
-	return { id, status, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+	return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 }
 
 /**
