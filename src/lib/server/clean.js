@@ -9,6 +9,7 @@
  * Rules (KEEPS outputs by default):
  *  - null every `execution_count` (cell level + inside each output)
  *  - strip all cell metadata except the allowlisted `cellar` namespace
+ *  - drop runtime-only `cellar.lastRun` run metadata (volatile at/durationMs)
  *  - strip all notebook metadata except `kernelspec` (+ `cellar` if present);
  *    this drops `language_info` and the volatile `widgets` state
  *  - normalize `kernelspec.display_name` → `kernelspec.name`
@@ -59,6 +60,15 @@ function cleanCell(cell) {
 	}
 	// deny-by-default metadata allowlist (keeps the `cellar` namespace intact)
 	cell.metadata = pick(cell.metadata, ALLOWED_CELL_METADATA);
+	// `cellar.lastRun` is runtime-only run metadata (volatile at/durationMs, held
+	// in the in-memory doc + pushed to the UI). Strip it before disk so it never
+	// dirties the .ipynb — same spirit as nulling execution_count (report §4.2).
+	// Drop an emptied `cellar` too so a foreign cell that never had one stays
+	// byte-identical (preserves the zero-diff-on-re-run guarantee + idempotency).
+	if (cell.metadata.cellar) {
+		delete cell.metadata.cellar.lastRun;
+		if (Object.keys(cell.metadata.cellar).length === 0) delete cell.metadata.cellar;
+	}
 	return cell;
 }
 

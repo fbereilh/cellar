@@ -16,15 +16,20 @@ import {
 	setSource,
 	setCellType,
 	setOutputs,
+	setLastRun,
 	deleteCell,
 	moveCellTo,
 	setVisibility,
 	getActiveNotebookPath,
-	createNotebook as createNotebookDoc
+	resolveNotebookPath,
+	createNotebook as createNotebookDoc,
+	openNotebook as openNotebookDoc,
+	notebookExists
 } from '../notebook.js';
 import { execute, restartKernel, interruptKernel, kernelStatus } from '../kernel.js';
 import { kernelState } from '../inspect.js';
 import { publish } from '../events.js';
+import { buildTree } from '../fstree.js';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -127,27 +132,63 @@ export const kernel = {
 	status: () => kernelStatus()
 };
 
+/**
+ * List every `.ipynb` in the workspace so the agent can discover names to open.
+ * Walks the workspace file tree (skipping noise dirs) and marks which notebook
+ * is currently active. Paths are workspace-relative (what `open_notebook` and
+ * `create_notebook` accept).
+ */
 export function listNotebooks() {
-	const nb = getNotebook();
-	return [{ path: nb.path, workspace: nb.workspace, open: true }];
+	const activeAbs = getActiveNotebookPath();
+	const paths = [];
+	const walk = (nodes) => {
+		for (const n of nodes) {
+			if (n.type === 'dir') walk(n.children || []);
+			else if (n.type === 'file' && /\.ipynb$/i.test(n.name)) paths.push(n.path);
+		}
+	};
+	const { root, tree } = buildTree();
+	walk(tree);
+	paths.sort();
+	return {
+		workspace: root,
+		notebooks: paths.map((rel) => ({ path: rel, active: resolveNotebookPath(rel) === activeAbs }))
+	};
 }
 
-export function openNotebook() {
-	const nb = getNotebook();
-	return { path: nb.path, workspace: nb.workspace, cells: nb.cells.length };
+const cellCount = (nb) => (nb.cells ? nb.cells.length : 0);
+
+/**
+ * Open and focus an EXISTING workspace notebook by name, making it the active
+ * notebook and broadcasting `notebook:opened` so an open browser surfaces/
+ * focuses its tab live. `name` is a workspace `.ipynb` path (extension
+ * optional). Throws with a create_notebook pointer when it does not exist —
+ * open never creates.
+ */
+export function openNotebook(name) {
+	let rel = (name ?? '').trim();
+	if (!rel) throw new Error('open_notebook requires a notebook name. Use list_notebooks to see available notebooks, or create_notebook to make a new one.');
+	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
+	if (!notebookExists(rel)) {
+		throw new Error(`Notebook "${rel}" does not exist. Use list_notebooks to see workspace notebooks, or create_notebook("${rel}") to make a new one.`);
+	}
+	const nb = openNotebookDoc(rel);
+	return { path: nb.path, workspace: nb.workspace, cells: cellCount(nb) };
 }
 
 /**
- * Create (or open) a workspace notebook and make it active. `name` is an
- * optional `.ipynb` filename (defaults to `untitled.ipynb`); the `.ipynb`
- * suffix is added if missing. Broadcasts `notebook:opened` so an open browser
- * surfaces the new notebook in a tab live. Returns its path + cell count.
+ * Create a NEW workspace notebook (or open one if the name already exists) and
+ * make it active. `name` is an optional `.ipynb` filename (defaults to
+ * `untitled.ipynb`); the `.ipynb` suffix is added if missing. Broadcasts
+ * `notebook:opened` so an open browser surfaces the notebook in a tab live.
+ * For opening a notebook you know already exists, prefer open_notebook.
+ * Returns its path + cell count.
  */
 export function createNotebook(name) {
 	let rel = (name ?? '').trim() || 'untitled';
 	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
 	const nb = createNotebookDoc(rel);
-	return { path: nb.path, workspace: nb.workspace, cells: nb.cells.length };
+	return { path: nb.path, workspace: nb.workspace, cells: cellCount(nb) };
 }
 
 // --- read -------------------------------------------------------------------
@@ -368,7 +409,10 @@ export async function runCell(id) {
 		status = 'error';
 	}
 	setOutputs(id, outputs);
-	publish({ type: 'run:end', nb, cellId: id, actor: 'agent', at: Date.now(), durationMs: Date.now() - startedAt, status });
+	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start.
+	const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent' };
+	setLastRun(id, lastRun, nb);
+	publish({ type: 'run:end', nb, cellId: id, ...lastRun, status });
 	const hiddenNote = isHidden(c) ? { hidden: true } : {};
 	return { id, status, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 }

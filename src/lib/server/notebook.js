@@ -193,6 +193,29 @@ export function getActiveNotebookPath() {
 }
 
 /**
+ * Make `abs` the active notebook and broadcast `notebook:opened` so an
+ * already-open shell surfaces/focuses it in a tab with no reload. Shared by
+ * `createNotebook` and `openNotebook` so both take the exact same UI path.
+ */
+function activateAndBroadcast(abs, originId) {
+	activePath = abs;
+	publish({
+		type: 'notebook:opened',
+		nb: abs,
+		relPath: relative(workspace(), abs),
+		name: abs.split(/[/\\]/).pop(),
+		originId
+	});
+	return getNotebook(abs);
+}
+
+/** True if `nb` resolves to a live doc or an on-disk `.ipynb` in the workspace. */
+export function notebookExists(nb) {
+	const abs = resolveAbs(nb);
+	return docs.has(abs) || existsSync(abs);
+}
+
+/**
  * Create a new workspace notebook (or open an existing one at that path), make
  * it the active notebook, and broadcast `notebook:opened` so an already-open
  * shell surfaces it in a tab with no reload. `nb` is a workspace-relative path
@@ -216,17 +239,25 @@ export function createNotebook(nb, originId) {
 		}
 	}
 	// Write the file if it isn't on disk yet (fresh create, or a default doc that
-	// only existed in memory). An existing file is left untouched.
+	// only existed in memory — loadDoc no longer persists on open). An existing
+	// file is left untouched.
 	if (!existsSync(abs)) persist(doc);
-	activePath = abs;
-	publish({
-		type: 'notebook:opened',
-		nb: abs,
-		relPath: relative(workspace(), abs),
-		name: abs.split(/[/\\]/).pop(),
-		originId
-	});
-	return getNotebook(abs);
+	return activateAndBroadcast(abs, originId);
+}
+
+/**
+ * Open an EXISTING workspace notebook, make it active, and broadcast
+ * `notebook:opened` (same UI path as `createNotebook`). `nb` is a
+ * workspace-relative `.ipynb` path. Throws `notebook not found` when no live
+ * doc and no on-disk file exist — opening never creates (use `createNotebook`).
+ */
+export function openNotebook(nb, originId) {
+	const abs = resolveAbs(nb);
+	if (!docs.has(abs) && !existsSync(abs)) {
+		throw new Error('notebook not found: ' + relative(workspace(), abs));
+	}
+	loadDoc(abs);
+	return activateAndBroadcast(abs, originId);
 }
 
 /**
@@ -334,6 +365,30 @@ export function setOutputScrolled(id, scrolled, nb) {
 	if (scrolled === null || scrolled === undefined) delete cell.metadata.cellar.output_scrolled;
 	else cell.metadata.cellar.output_scrolled = !!scrolled;
 	persist(doc);
+	return true;
+}
+
+/**
+ * Stamp runtime-only run metadata on a cell in the allowlisted `cellar`
+ * namespace: `lastRun = { at, durationMs, actor }`. Both run entry points (the
+ * UI `/run` route → `actor:'user'`, the MCP run tools → `actor:'agent'`) call
+ * this so the badge in `Cell.svelte` shows who last ran the cell, when, and how
+ * long it took.
+ *
+ * NOT persisted: `at`/`durationMs` change every run, so writing them would make
+ * the `.ipynb` byte-different on each run (a git diff), violating Cellar's
+ * zero-diff-on-re-run rule. It lives only in the in-memory doc and is surfaced
+ * to the browser via `cellView` (load/refetch) + the `run:end` SSE event, and
+ * `clean.js` strips it before any disk write (report §4.2). Resets on
+ * kernel/server restart — "last run this session", which is correct.
+ */
+export function setLastRun(id, lastRun, nb) {
+	const doc = docFor(nb);
+	const cell = find(doc, id);
+	if (!cell) return false;
+	cell.metadata = cell.metadata ?? {};
+	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	cell.metadata.cellar.lastRun = lastRun;
 	return true;
 }
 

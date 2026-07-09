@@ -10,6 +10,7 @@
 	import DOMPurify from 'dompurify';
 	import { editorThemeExtensions } from '$lib/editorTheme.js';
 	import { headerLevel } from '$lib/headings.js';
+	import { relativeTime, formatDuration } from '$lib/relativeTime.js';
 
 	let {
 		cell,
@@ -103,6 +104,19 @@
 		}
 		return () => clearTimeout(runIndicatorTimer);
 	});
+
+	// ---- Per-cell run metadata badge ("ran 2m ago · 1.2s · agent") ----------
+	// Runtime-only `{ at, durationMs, actor }` stamped by both run paths, stripped
+	// from disk by clean.js. `now` ticks so the relative time stays fresh.
+	const lastRun = $derived(cell.metadata?.cellar?.lastRun);
+	let now = $state(Date.now());
+	$effect(() => {
+		if (!lastRun) return;
+		const t = setInterval(() => (now = Date.now()), 15000);
+		return () => clearInterval(t);
+	});
+	const ranText = $derived(lastRun ? `ran ${relativeTime(lastRun.at, now)} · ${formatDuration(lastRun.durationMs)}` : '');
+	const isAgentRun = $derived(lastRun?.actor === 'agent');
 
 	// Strip ANSI SGR color codes (ESC[…m) that Jupyter puts in tracebacks.
 	const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
@@ -438,6 +452,31 @@
 					</button>
 				{/if}
 				<span class="ml-1.5 font-mono text-xs text-base-content/50" title={cell.id}>cell <span class="text-base-content/70">#{cell.id.slice(0, 8)}</span></span>
+				{#if !isMarkdown && lastRun && !showRunning}
+					<span
+						class="ml-2 flex items-center gap-1 text-[11px] text-base-content/45"
+						data-testid="run-meta"
+						title={`${ranText} · ${isAgentRun ? 'run by an agent (MCP)' : 'run by you (UI)'}`}
+					>
+						<span>{ranText}</span>
+						<span class="opacity-50">·</span>
+						<span
+							class="inline-flex items-center gap-0.5 font-medium {isAgentRun ? 'text-secondary' : 'text-info'}"
+							data-testid="run-actor"
+							data-actor={lastRun.actor}
+						>
+							{#if isAgentRun}
+								<!-- agent: sparkle -->
+								<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2l1.9 5.6L19.5 9l-4.6 1.7L12 16l-2.9-5.3L4.5 9l5.6-1.4L12 2z" /></svg>
+								agent
+							{:else}
+								<!-- user: person -->
+								<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg>
+								user
+							{/if}
+						</span>
+					</span>
+				{/if}
 				{#if isHeader && folded}
 					<span class="badge badge-ghost badge-sm ml-1.5 gap-1 text-[11px] text-base-content/60" data-testid="fold-hidden-count">
 						{hiddenCount} {hiddenCount === 1 ? 'cell' : 'cells'} hidden
