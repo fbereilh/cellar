@@ -1,5 +1,5 @@
 import { execute } from '$lib/server/kernel.js';
-import { setSource, setOutputs, resolveNotebookPath } from '$lib/server/notebook.js';
+import { setSource, setOutputs, setLastRun, resolveNotebookPath } from '$lib/server/notebook.js';
 import { publish } from '$lib/server/events.js';
 
 /**
@@ -52,7 +52,15 @@ export async function POST({ params, request }) {
 				status = 'error';
 			} finally {
 				setOutputs(cellId, outputs, nb); // clean-on-save persists the .ipynb
-				publish({ type: 'run:end', nb: canonicalNb, cellId, actor: 'user', at: Date.now(), durationMs: Date.now() - startedAt, status, originId });
+				// Runtime-only run metadata; `at` = run start so "ran X ago" reads as
+				// when the run began. Stripped from disk by clean.js (report §4.2).
+				const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'user' };
+				setLastRun(cellId, lastRun, nb);
+				// Also send it on the initiating tab's NDJSON stream: that tab drops
+				// its own `run:end` SSE echo (originId match), so this is how it learns
+				// the metadata to render its own badge.
+				send({ type: 'run:end', ...lastRun });
+				publish({ type: 'run:end', nb: canonicalNb, cellId, ...lastRun, status, originId });
 				controller.close();
 			}
 		}

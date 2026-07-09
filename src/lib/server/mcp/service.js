@@ -16,6 +16,7 @@ import {
 	setSource,
 	setCellType,
 	setOutputs,
+	setLastRun,
 	deleteCell,
 	moveCellTo,
 	setVisibility,
@@ -368,7 +369,10 @@ export async function runCell(id) {
 		status = 'error';
 	}
 	setOutputs(id, outputs);
-	publish({ type: 'run:end', nb, cellId: id, actor: 'agent', at: Date.now(), durationMs: Date.now() - startedAt, status });
+	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start.
+	const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent' };
+	setLastRun(id, lastRun, nb);
+	publish({ type: 'run:end', nb, cellId: id, ...lastRun, status });
 	const hiddenNote = isHidden(c) ? { hidden: true } : {};
 	return { id, status, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 }

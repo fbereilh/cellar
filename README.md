@@ -161,6 +161,10 @@ an agent adding, editing, deleting, moving, or retyping a cell patches the open
 notebook in place, and `create_notebook` opens the new notebook in a tab with no
 reload. A remote edit to a cell you are actively typing in never clobbers your
 input — it surfaces a "Changed on server" affordance with a Load button instead.
+Each cell also carries a badge of when it last ran, how long the run took, and
+who ran it (you via the UI or an agent via MCP), updated live from the same
+stream; this metadata is runtime-only ("last run this session") and never
+written to the `.ipynb`.
 
 ### Zero-config agent connection (`cellar mcp`)
 
