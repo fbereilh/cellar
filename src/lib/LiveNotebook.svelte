@@ -68,6 +68,7 @@
 			// this tab's own runs via the `busy || runningId` guard in runCell.
 			runningId = null;
 			sseReplace.clear();
+			lastSeq = null; // reconnect refetches once here; don't also trip the seq-gap check
 		} catch (err) {
 			loadError = String(err?.message ?? err);
 		} finally {
@@ -187,7 +188,7 @@
 			replace = false;
 		} finally {
 			if (replace) cell.outputs = []; // ran with no output → clear
-			runningId = null;
+			if (runningId === id) runningId = null; // don't clear a spinner an overlapping run moved elsewhere
 			onRunEnd?.();
 		}
 	}
