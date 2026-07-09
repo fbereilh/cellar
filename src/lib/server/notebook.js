@@ -358,6 +358,30 @@ export function setOutputScrolled(id, scrolled, nb) {
 	return true;
 }
 
+/**
+ * Stamp runtime-only run metadata on a cell in the allowlisted `cellar`
+ * namespace: `lastRun = { at, durationMs, actor }`. Both run entry points (the
+ * UI `/run` route → `actor:'user'`, the MCP run tools → `actor:'agent'`) call
+ * this so the badge in `Cell.svelte` shows who last ran the cell, when, and how
+ * long it took.
+ *
+ * NOT persisted: `at`/`durationMs` change every run, so writing them would make
+ * the `.ipynb` byte-different on each run (a git diff), violating Cellar's
+ * zero-diff-on-re-run rule. It lives only in the in-memory doc and is surfaced
+ * to the browser via `cellView` (load/refetch) + the `run:end` SSE event, and
+ * `clean.js` strips it before any disk write (report §4.2). Resets on
+ * kernel/server restart — "last run this session", which is correct.
+ */
+export function setLastRun(id, lastRun, nb) {
+	const doc = docFor(nb);
+	const cell = find(doc, id);
+	if (!cell) return false;
+	cell.metadata = cell.metadata ?? {};
+	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	cell.metadata.cellar.lastRun = lastRun;
+	return true;
+}
+
 /** Move a cell to an absolute index (clamped). */
 export function moveCellTo(id, index, nb, originId) {
 	const doc = docFor(nb);

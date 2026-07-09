@@ -104,6 +104,15 @@ That single command:
    `cellar` instances in different repos run side by side. The resolved app +
    MCP URLs are printed on startup.
 
+**One instance per folder.** Rerunning `cellar` in a folder that already has a
+live instance does **not** start a rival server - two servers would each persist
+`notebook.ipynb` from independent in-memory docs and silently clobber each
+other's edits. Instead the second launch attaches to the running one (opens the
+browser to it and exits). Ownership is claimed atomically via a
+`.cellar/instance.lock` file, so even a rapid double-launch can't start two.
+Pass `--new` (alias `--force`) to deliberately start a second, independent
+instance for the same folder (power-user escape hatch).
+
 Creating a `.venv` or installing `ipykernel` into your project **prompts for
 confirmation** on a TTY (printing exactly what will run); reusing an existing
 venv that already has `ipykernel` is silent.
@@ -118,6 +127,7 @@ Flags:
 | `--yes` / `-y` | Auto-approve venv create / ipykernel install (implied when non-interactive / `$CI`) |
 | `--dev` | Run the Vite dev server instead of the production build |
 | `--no-mcp-config` | Do not write/merge `<workspace>/.mcp.json` (see [Zero-config agent connection](#zero-config-agent-connection-cellar-mcp)) |
+| `--new` / `--force` | Start a second, independent instance in a folder that already has a live one (normally a relaunch attaches to the running instance) |
 
 There is also a `cellar mcp` subcommand (the stdio ↔ HTTP MCP bridge) — see
 [Zero-config agent connection](#zero-config-agent-connection-cellar-mcp).
@@ -148,10 +158,13 @@ running indicator and streaming outputs appear with no reload, pushed over a
 Server-Sent Events stream (`src/lib/server/events.js` → `/api/events`). Runs
 from another browser tab sync the same way. **Structural changes sync live too**:
 an agent adding, editing, deleting, moving, or retyping a cell patches the open
-notebook in place, and `open_notebook`/`create_notebook` surface (or focus) the
-target notebook in a tab with no reload. A remote edit to a cell you are
-actively typing in never clobbers your input — it surfaces a "Changed on
-server" affordance with a Load button instead.
+notebook in place, and `create_notebook` opens the new notebook in a tab with no
+reload. A remote edit to a cell you are actively typing in never clobbers your
+input — it surfaces a "Changed on server" affordance with a Load button instead.
+Each cell also carries a badge of when it last ran, how long the run took, and
+who ran it (you via the UI or an agent via MCP), updated live from the same
+stream; this metadata is runtime-only ("last run this session") and never
+written to the `.ipynb`.
 
 ### Zero-config agent connection (`cellar mcp`)
 

@@ -192,8 +192,19 @@
 			}
 		} else if (ev.type === 'run:end') {
 			if (cell && sseReplace.delete(ev.cellId)) cell.outputs = []; // ran with no output → clear stale
+			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;
 		}
+	}
+
+	// Store runtime-only run metadata on a cell so `Cell.svelte` renders its badge.
+	// Reassigns `metadata` (not a deep mutation) to trigger reactivity even when
+	// the cell had no `cellar` namespace yet. Ignores events without `at` (older
+	// run:end shapes / non-run events).
+	function stampLastRun(cell, ev) {
+		if (!cell || ev.at == null) return;
+		const cellar = { ...(cell.metadata?.cellar ?? {}), lastRun: { at: ev.at, durationMs: ev.durationMs, actor: ev.actor } };
+		cell.metadata = { ...(cell.metadata ?? {}), cellar };
 	}
 	onMount(() =>
 		subscribeEvents((ev) => {
@@ -269,6 +280,8 @@
 						} else {
 							cell.outputs = [...cell.outputs, ev.output];
 						}
+					} else if (ev.type === 'run:end') {
+						stampLastRun(cell, ev); // this tab's own user run → its badge
 					}
 				}
 			}
@@ -282,14 +295,19 @@
 		}
 	}
 
-	async function editCell(id, source) {
+	async function editCell(id, source, { keepalive = false } = {}) {
 		const cell = findCell(id);
 		if (cell) cell.source = source;
+		// Only the page-unload flush opts into `keepalive`: the browser caps the
+		// combined keepalive body at ~64KB and rejects past it, so normal
+		// (page-alive) autosaves stay plain fetch. `.catch` keeps a rejected PATCH
+		// from surfacing as an unhandled rejection either way.
 		await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ source, nb: path, originId })
-		});
+			body: JSON.stringify({ source, nb: path, originId }),
+			keepalive
+		}).catch(() => {});
 	}
 
 	async function clearCell(id) {
