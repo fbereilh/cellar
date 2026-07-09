@@ -137,6 +137,7 @@ function assertSimpleName(name) {
 	if (n === '.' || n === '..' || n.includes('/') || n.includes('\\') || n.includes('\0')) {
 		throw new Error('invalid name');
 	}
+	if (n.startsWith('.')) throw new Error('hidden files are not shown in the explorer');
 	return n;
 }
 
@@ -207,8 +208,8 @@ export function moveEntry(fromRel, destDirRel) {
 	if (destDirAbs === fromAbs || destDirAbs.startsWith(fromAbs + sep)) {
 		throw new Error('cannot move a folder into itself');
 	}
+	if (dirname(fromAbs) === destDirAbs) return { from: toRel(fromAbs), path: toRel(fromAbs) };
 	const destAbs = dedupeDest(join(destDirAbs, basename(fromAbs)));
-	if (destAbs === fromAbs) return { from: toRel(fromAbs), path: toRel(fromAbs) }; // same place
 	renameSync(fromAbs, destAbs);
 	return { from: toRel(fromAbs), path: toRel(destAbs) };
 }
