@@ -370,7 +370,7 @@ export function setOutputScrolled(id, scrolled, nb) {
 
 /**
  * Stamp runtime-only run metadata on a cell in the allowlisted `cellar`
- * namespace: `lastRun = { at, durationMs, actor, status, session, executionCount }`.
+ * namespace: `lastRun = { at, durationMs, actor, status, session }`.
  * Both run entry points (the UI `/run` route → `actor:'user'`, the MCP run tools
  * → `actor:'agent'`) call this so the badge in `Cell.svelte` shows who last ran
  * the cell, when, and how long it took.

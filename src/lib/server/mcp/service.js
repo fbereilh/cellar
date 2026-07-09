@@ -91,12 +91,14 @@ function ranThisSession(cell, sid) {
  *
  * For a cell that ran this session the recorded run status is authoritative — a
  * cell can run successfully and emit no outputs at all (`lp = load()`), which
- * output inspection alone would misreport as `unrun`.
+ * output inspection alone would misreport as `unrun`. Only an explicit `ok`
+ * counts as success; jupyter's `abort` (and anything else) reads as an error, so
+ * an agent is never told a run succeeded when it did not.
  */
 function runStatus(cell, sid) {
 	if (cell.cell_type !== 'code') return 'n/a';
 	if (ranThisSession(cell, sid)) {
-		return cell.metadata.cellar.lastRun.status === 'error' ? 'error_session' : 'ok_session';
+		return cell.metadata.cellar.lastRun.status === 'ok' ? 'ok_session' : 'error_session';
 	}
 	const outs = cell.outputs || [];
 	if (!outs.length) return 'unrun';
@@ -428,21 +430,19 @@ export function setCellVisibility(id, hidden) {
  * STARTED in. Stamping that (rather than reading the epoch after the run) means
  * a kernel restart mid-run leaves the cell correctly marked as not-this-session.
  */
-async function runSource(source, onOutput) {
+async function runSource(source, onOutput, onSession) {
 	const outputs = [];
 	let session = null;
-	let executionCount = null;
 	const reply = await execute(source, (ev) => {
 		if (ev.type === 'output') {
 			outputs.push(ev.output);
 			onOutput?.(ev.output);
 		} else if (ev.type === 'kernel') {
 			session = ev.session;
-		} else if (ev.type === 'done') {
-			executionCount = ev.execution_count ?? null;
+			onSession?.(ev.session);
 		}
 	});
-	return { outputs, status: reply?.status ?? 'ok', session, executionCount };
+	return { outputs, status: reply?.status ?? 'ok', session };
 }
 
 /**
@@ -463,25 +463,29 @@ export async function runCell(id) {
 	publish({ type: 'run:start', nb, cellId: id, actor: 'agent', at: startedAt });
 	let outputs = [];
 	let status = 'ok';
+	// The epoch the run STARTED in, captured as soon as the kernel is in hand.
+	// It stays null when execute() failed before any kernel existed, and it is
+	// never re-read afterwards: an autorestart mid-run bumps the live epoch, and
+	// this cell must then read as not-this-session.
 	let session = null;
-	let executionCount = null;
 	try {
-		const res = await runSource(c.source || '', (output) => publish({ type: 'run:output', nb, cellId: id, output }));
+		const res = await runSource(
+			c.source || '',
+			(output) => publish({ type: 'run:output', nb, cellId: id, output }),
+			(sid) => { session = sid; }
+		);
 		outputs = res.outputs;
 		status = res.status;
-		session = res.session;
-		executionCount = res.executionCount;
 	} catch (err) {
 		const output = { output_type: 'error', ename: 'CellarError', evalue: String(err?.message ?? err), traceback: [String(err?.message ?? err)] };
 		outputs = [output];
 		publish({ type: 'run:output', nb, cellId: id, output });
 		status = 'error';
-		session = currentSessionId();
 	}
 	setOutputs(id, outputs);
 	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,
 	// `session` = the kernel-session epoch this run executed in (see setLastRun).
-	const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent', status, session, executionCount };
+	const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent', status, session };
 	setLastRun(id, lastRun, nb);
 	publish({ type: 'run:end', nb, cellId: id, ...lastRun });
 	const hiddenNote = isHidden(c) ? { hidden: true } : {};

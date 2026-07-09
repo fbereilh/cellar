@@ -61,6 +61,28 @@ export function serialize(doc) {
 	return cleanNotebook(nb);
 }
 
+/**
+ * Cell metadata as loaded from disk, minus the runtime-only `cellar.lastRun`.
+ *
+ * That stamp records the kernel-session epoch a cell executed in, and it is the
+ * sole evidence that a cell ran against the namespace that is live *now*. It
+ * must therefore only ever originate from an in-process run: a hand-edited or
+ * externally-authored `.ipynb` could otherwise carry a `session` matching the
+ * live epoch (they are small monotonic integers) and forge `ok_session` /
+ * `ran_this_session: true` for a cell that never executed. `clean.js` strips it
+ * on write; this is the matching strip on read. An emptied `cellar` namespace is
+ * dropped too, mirroring clean.js so a foreign cell stays byte-identical.
+ */
+function loadCellMetadata(metadata) {
+	const md = { ...(metadata ?? {}) };
+	if (md.cellar) {
+		const { lastRun, ...rest } = md.cellar;
+		if (Object.keys(rest).length) md.cellar = rest;
+		else delete md.cellar;
+	}
+	return md;
+}
+
 /** Parse an nbformat notebook object into canonical cells. */
 export function deserialize(nb) {
 	const cells = (nb.cells || []).map((c) => ({
@@ -68,7 +90,7 @@ export function deserialize(nb) {
 		cell_type: c.cell_type || 'code',
 		source: fromLines(c.source),
 		outputs: c.outputs ?? [],
-		metadata: c.metadata ?? {}
+		metadata: loadCellMetadata(c.metadata)
 	}));
 	return { cells, metadata: nb.metadata ?? defaultMetadata() };
 }
