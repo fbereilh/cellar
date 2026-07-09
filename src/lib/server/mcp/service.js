@@ -417,6 +417,24 @@ export async function runCell(id) {
 	return { id, status, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 }
 
+/**
+ * Create a cell and (if it's code) run it in one call — the common
+ * write-and-execute flow, without a separate add_cell + run_cell round-trip.
+ * Composes addCells + runCell (no reimplementation), so structural sync
+ * (`cell:added`) and the run lifecycle (`run:start`/`run:output`/`run:end`,
+ * `actor:'agent'`) both fire and the new cell surfaces + streams live in an
+ * open UI exactly like run_cell. Returns run_cell's result shape (id / status /
+ * summarized outputs) — the created cell's id is that same `id`. Code that
+ * raises returns the error as its result (never throws); a markdown cell is
+ * created (surfaced live in the UI) but not run, returning `status:'skipped'`
+ * to mirror run_cell.
+ */
+export async function addAndRun({ source, cellType = 'code', afterId } = {}) {
+	const [id] = addCells([{ cell_type: cellType, source }], afterId);
+	const result = await runCell(id);
+	return { id, ...result };
+}
+
 export async function runCells(ids) {
 	const results = [];
 	for (const id of ids) {

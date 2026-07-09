@@ -57,6 +57,12 @@ Follow this house style:
    UI); create_notebook(name) only for a genuinely NEW notebook. Do not reach for
    create_notebook to open something that already exists.
 
+6. WRITE AND RUN TOGETHER. When you add a code cell you intend to execute, use
+   add_and_run — it creates the cell and runs it in one call, returning the new
+   cell id and the run result (outputs/errors) together, with fewer round-trips
+   than add_cell followed by run_cell. Reserve add_cell for cells you are adding
+   without running yet (e.g. markdown headers, or code you will run later).
+
 The goal: a notebook a human would be happy to have written — imports up top,
 shared state, a clean section outline, and a continuous line of reasoning from
 first cell to last.`;
@@ -97,6 +103,7 @@ function registerTools(server) {
 	server.registerTool('set_cell_visibility', { description: 'Show/hide a cell from the agent (cellar.hidden_from_agent).', inputSchema: { id: z.string(), hidden: z.boolean() } }, async ({ id, hidden }) => (svc.setCellVisibility(id, hidden) ? text({ ok: true, id, hidden }) : notFound(`cell ${id} not found`)));
 
 	// --- execute ---
+	server.registerTool('add_and_run', { description: 'PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|markdown cell (default code) with the given source, after a cell (after_id) or appended at the end, runs it, and returns run_cell\'s result (status + outputs) plus the new cell id. Code that raises returns the error as the result (does not fail — the cell still exists). A markdown cell_type is created but not run (status "skipped"), same as run_cell — for markdown use add_cell. Use add_cell (no run) only when you want to add a cell WITHOUT running it.', inputSchema: { source: z.string(), cell_type: z.enum(['code', 'markdown']).optional(), after_id: z.string().optional() } }, async ({ source, cell_type, after_id }) => text(await svc.addAndRun({ source, cellType: cell_type, afterId: after_id })));
 	server.registerTool('run_cell', { description: 'Run one cell by UUID (markdown cells are skipped).', inputSchema: { id: z.string() } }, async ({ id }) => { const r = await svc.runCell(id); return r ? text(r) : notFound(`cell ${id} not found`); });
 	server.registerTool('run_cells', { description: 'Run multiple cells in order.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(await svc.runCells(ids)));
 	server.registerTool('run_all', { description: 'Run all code cells in document order.', inputSchema: {} }, async () => text(await svc.runAll()));
