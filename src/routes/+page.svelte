@@ -33,10 +33,16 @@
 	function onRunStart() {
 		runBusy = true;
 	}
-	function onRunEnd() {
-		runBusy = false;
+	async function onRunEnd() {
+		// `runBusy` is the only thing keeping `displayKernel` started while a first
+		// run boots the kernel, so it must outlive the status refresh: clearing it
+		// first would render the stale not-started card for one round-trip.
+		try {
+			await refreshKernel();
+		} finally {
+			runBusy = false;
+		}
 		// A run may have created/changed kernel variables → refresh sidebar.
-		refreshKernel();
 		refreshVariables();
 	}
 

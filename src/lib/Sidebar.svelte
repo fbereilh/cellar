@@ -36,6 +36,11 @@
 		persist(OPEN_KEY, open);
 	}
 
+	const notebooksLabel = $derived(openNotebooks.length ? `notebooks · ${openNotebooks.length}` : 'notebooks');
+	const pendingNotebooksLabel = $derived(
+		openNotebooks.length ? `open notebooks · ${openNotebooks.length} · no live kernel yet` : 'open notebooks'
+	);
+
 	// ---- Persisted section order (drag to reorder) --------------------------
 	const ORDER_KEY = 'cellar-sidebar-order';
 	const DEFAULT_ORDER = ['files', 'kernels', 'agent', 'outline', 'vars', 'search'];
@@ -515,6 +520,37 @@
 	</button>
 {/snippet}
 
+<!-- Card header: title on the left, live status badge on the right. Shared by the
+     started and not-started cards so both read their badge from `kernelBadge.js`.
+     The badge never wraps; at narrow sidebar widths the title gives way instead. -->
+{#snippet kernelHeader(title, muted)}
+	<div class="flex items-center justify-between gap-2">
+		<span class="flex min-w-0 items-center gap-1.5 text-sm font-medium {muted ? 'text-base-content/50' : ''}">
+			<svg class="h-3.5 w-3.5 shrink-0 {muted ? 'text-base-content/40' : 'text-primary'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+			<span class="min-w-0 break-words">{title}</span>
+		</span>
+		<span class="badge badge-sm shrink-0 whitespace-nowrap {kernelBadgeClass(kernelInfo)} gap-1" data-testid="kernel-card-status">
+			<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
+			{kernelStatusLabel(kernelInfo)}
+		</span>
+	</div>
+{/snippet}
+
+<!-- The open notebooks loaded against the shared kernel. Rendered by both the
+     started and the not-started card so the two stay structurally identical. -->
+{#snippet notebookList(label)}
+	<div class="mt-2 border-t border-base-300 pt-2">
+		<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40" data-testid="kernel-notebooks-label">
+			{label}
+		</div>
+		{#each openNotebooks as nb (nb.id)}
+			{@render notebookRow(nb)}
+		{:else}
+			<p class="px-1 text-xs text-base-content/40">no notebooks open</p>
+		{/each}
+	</div>
+{/snippet}
+
 <!-- Interrupt / restart the shared kernel; disabled until it is started (and
      while a control is already in flight). -->
 {#snippet kernelControls()}
@@ -555,53 +591,17 @@
 		<div class="px-3 pb-3" data-testid="kernels-body">
 			{#if kernelInfo?.started}
 				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="kernel-card">
-					<div class="flex items-center justify-between gap-2">
-						<span class="flex items-center gap-1.5 text-sm font-medium">
-							<svg class="h-3.5 w-3.5 text-primary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
-							{kernelInfo.name || 'python3'}
-						</span>
-						<span class="badge badge-sm {kernelBadgeClass(kernelInfo)} gap-1" data-testid="kernel-card-status">
-							<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
-							{kernelStatusLabel(kernelInfo)}
-						</span>
-					</div>
-					<div class="mt-2 border-t border-base-300 pt-2">
-						<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40" data-testid="kernel-notebooks-label">
-							notebooks{openNotebooks.length ? ` · ${openNotebooks.length}` : ''}
-						</div>
-						{#each openNotebooks as nb (nb.id)}
-							{@render notebookRow(nb)}
-						{:else}
-							<p class="px-1 text-xs text-base-content/40">no notebooks open</p>
-						{/each}
-					</div>
+					{@render kernelHeader(kernelInfo.name || 'python3', false)}
+					{@render notebookList(notebooksLabel)}
 					{@render kernelControls()}
 				</div>
 			{:else}
 				<div class="rounded-lg border border-dashed border-base-300 bg-base-100 p-2.5" data-testid="kernel-card">
-					<div class="flex items-center justify-between gap-2">
-						<span class="flex items-center gap-1.5 text-sm font-medium text-base-content/50">
-							<svg class="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
-							No kernel running
-						</span>
-						<span class="badge badge-sm badge-ghost gap-1" data-testid="kernel-card-status">
-							<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
-							not started
-						</span>
-					</div>
+					{@render kernelHeader('No kernel running', true)}
 					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">
 						Run a cell to start the <span class="font-mono">{kernelInfo?.name || 'python3'}</span> kernel.
 					</p>
-					{#if openNotebooks.length}
-						<div class="mt-2 border-t border-base-300 pt-2">
-							<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40" data-testid="kernel-notebooks-label">
-								open notebooks · {openNotebooks.length} · no live kernel yet
-							</div>
-							{#each openNotebooks as nb (nb.id)}
-								{@render notebookRow(nb)}
-							{/each}
-						</div>
-					{/if}
+					{@render notebookList(pendingNotebooksLabel)}
 					{@render kernelControls()}
 				</div>
 			{/if}
