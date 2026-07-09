@@ -87,11 +87,26 @@ function ranThisSession(cell, sid) {
 }
 
 /**
- * Did the last run attempt fail because no kernel could be reached? Recorded by
- * the run entry points on the runtime-only lastRun stamp, so it can never be
- * read off disk.
+ * Did the last run attempt fail because no kernel could be reached, AND is the
+ * kernel still unreachable? Recorded by the run entry points on the runtime-only
+ * lastRun stamp, so it can never be read off disk.
+ *
+ * The liveness check (`sid == null` — no kernel is running) is what keeps the
+ * signal honest. The stamp alone is sticky: only re-running that one cell clears
+ * it, so the boot race — MCP serves before the Jupyter sidecar finishes starting,
+ * an agent's first `run_cell` is rejected, the sidecar comes up moments later —
+ * would leave that cell claiming a LIVE kernel-down failure forever while every
+ * other cell runs fine. Deriving it means the marker expires by itself the instant
+ * a kernel exists, and the cell falls back to `error_persisted`: its saved
+ * CellarError really is leftover from an attempt that executed in no session.
+ * Same shape as `ran_this_session`, likewise derived by comparing epochs rather
+ * than stored as a boolean.
+ *
+ * @param {object} cell
+ * @param {number|null} sid current epoch, or null when no kernel is running
  */
-const kernelUnavailable = (cell) => cell.metadata?.cellar?.lastRun?.kernel_unavailable === true;
+const kernelUnavailable = (cell, sid) =>
+	sid == null && cell.metadata?.cellar?.lastRun?.kernel_unavailable === true;
 
 /**
  * Per-cell run status, with persisted and live-session execution kept strictly
@@ -116,14 +131,16 @@ const kernelUnavailable = (cell) => cell.metadata?.cellar?.lastRun?.kernel_unava
  * to `ran_this_session`, which stays false: no code executed in any session. It
  * exists so a failure raised seconds ago by the run the agent just requested is
  * never mislabelled `error_persisted`, which the doctrine tells agents to ignore
- * as leftover.
+ * as leftover. It reports only while the kernel is still unreachable — once one
+ * is up, the saved CellarError genuinely is leftover and reads as
+ * `error_persisted` (see `kernelUnavailable`).
  */
 function runStatus(cell, sid) {
 	if (cell.cell_type !== 'code') return 'n/a';
 	if (ranThisSession(cell, sid)) {
 		return cell.metadata.cellar.lastRun.status === 'ok' ? 'ok_session' : 'error_session';
 	}
-	if (kernelUnavailable(cell)) return 'error_kernel_unavailable';
+	if (kernelUnavailable(cell, sid)) return 'error_kernel_unavailable';
 	const outs = cell.outputs || [];
 	if (!outs.length) return 'unrun';
 	return outs.some((o) => o.output_type === 'error') ? 'error_persisted' : 'ok_persisted';
@@ -192,7 +209,9 @@ function readForm(cell, cap = READ_CAP, sid = currentSessionId()) {
 export const kernel = {
 	restart: () => restartKernel(),
 	interrupt: () => interruptKernel(),
-	status: () => ({ ...kernelStatus(), ...kernelSession() })
+	// `id` is the only field unique to kernelStatus(); both report the same
+	// `status`, so let kernelSession() be its single source of truth.
+	status: () => ({ id: kernelStatus().id, ...kernelSession() })
 };
 
 /**
@@ -304,14 +323,21 @@ export function getKernelState() {
 	return kernelState();
 }
 
-export function readCell(id) {
+export function readCell(id, sid = currentSessionId()) {
 	const c = getCell(id);
 	if (!c || isHidden(c)) return null;
-	return readForm(c);
+	return readForm(c, READ_CAP, sid);
 }
 
+/**
+ * Read many cells against ONE sampled epoch. Letting `readForm` re-sample per
+ * cell would let a restart landing mid-loop classify a single response against
+ * two different kernel sessions — some cells `ok_session`, some `ok_persisted`,
+ * for the same kernel state.
+ */
 export function readCells(ids) {
-	return ids.map((id) => readCell(id)).filter(Boolean);
+	const sid = currentSessionId();
+	return ids.map((id) => readCell(id, sid)).filter(Boolean);
 }
 
 /** index (0-based over visible cells), position first/last, or next/prev of an id. */
@@ -343,7 +369,9 @@ export function readSection(headerId) {
 		if (hi && hi.level <= h.level) break;
 		out.push(cells[i]);
 	}
-	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c)) };
+	// One sampled epoch for the whole section (see readCells).
+	const sid = currentSessionId();
+	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid)) };
 }
 
 /**
@@ -394,7 +422,7 @@ export function getErrors() {
 					id: c.id,
 					ran_this_session: ranThisSession(c, sid),
 					run_status: runStatus(c, sid),
-					...(kernelUnavailable(c) ? { kernel_unavailable: true } : {}),
+					...(kernelUnavailable(c, sid) ? { kernel_unavailable: true } : {}),
 					ename: o.ename,
 					evalue: o.evalue,
 					traceback: capText(stripAnsi((o.traceback || []).join('\n')), MEDIUM_CAP).text
