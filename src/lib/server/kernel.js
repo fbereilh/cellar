@@ -34,6 +34,36 @@ function makeSettings() {
 	});
 }
 
+/**
+ * Kernel startup injection: activate matplotlib's inline backend so a Figure
+ * renders as an `image/png` in the display bundle instead of falling back to its
+ * `<Figure …>` text repr — exactly what a classic notebook's `%matplotlib
+ * inline` does, but without the user typing it. Runs silently (no history, no
+ * broadcast) and is a no-op when matplotlib/ipykernel's inline backend is not
+ * installed (it ships with ipykernel, but we guard anyway). Must run on every
+ * fresh start AND after a restart(), which clears the namespace and backend.
+ */
+const STARTUP_CODE = [
+	'try:',
+	"    get_ipython().run_line_magic('matplotlib', 'inline')",
+	'except Exception:',
+	'    pass'
+].join('\n');
+
+async function initKernel(kernel) {
+	try {
+		const future = kernel.requestExecute({
+			code: STARTUP_CODE,
+			silent: true,
+			store_history: false,
+			stop_on_error: false
+		});
+		await future.done;
+	} catch {
+		// A failed startup injection must never break kernel bring-up.
+	}
+}
+
 /** Start (or reuse) the single kernel. */
 async function getKernel() {
 	if (kernelPromise) return kernelPromise;
@@ -44,6 +74,7 @@ async function getKernel() {
 		const kernel = await manager.startNew({ name: 'python3' });
 		liveKernel = kernel;
 		currentKernel = kernel;
+		await initKernel(kernel);
 		return kernel;
 	})();
 	// If startup fails, allow a later retry.
@@ -61,6 +92,8 @@ async function getKernel() {
 export async function restartKernel() {
 	const kernel = await getKernel();
 	await kernel.restart();
+	// restart() clears the namespace and the inline-backend config, so re-inject.
+	await initKernel(kernel);
 	return { status: kernel.status, id: kernel.id };
 }
 
