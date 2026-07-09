@@ -143,6 +143,11 @@ independent of the kernel connection, **restarting the kernel never drops the
 MCP session or the document**. Connect any MCP client (e.g. the MCP Inspector,
 or `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`) to that URL.
 
+An **agent-driven run reflects live in any already-open browser tab** — the
+running indicator and streaming outputs appear with no reload, pushed over a
+Server-Sent Events stream (`src/lib/server/events.js` → `/api/events`). Runs
+from another browser tab sync the same way.
+
 ### Zero-config agent connection (`cellar mcp`)
 
 The HTTP port changes every launch, so a URL in agent config goes stale. Instead
