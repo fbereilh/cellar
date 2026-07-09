@@ -233,6 +233,10 @@
 		}
 		liveSource = src;
 		cell.source = src;
+		// A remote apply IS already the server's source, so treat it as saved: this
+		// keeps flushEdit (blur / unload) from re-PATCHing the identical content back
+		// as a spurious local edit (and echoing a needless cell:edited to other tabs).
+		savedSource = src;
 	}
 
 	// The editor-safety rule (report §3.4): a remote source edit updates the
