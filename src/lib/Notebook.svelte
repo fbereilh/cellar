@@ -9,6 +9,10 @@
 		runningId,
 		activeId = null,
 		theme = 'dim',
+		hidden = new Set(), // cell ids hidden because a folded heading collapsed their section
+		foldedIds = new Set(), // markdown-header cell ids whose section is folded
+		hiddenCounts = {}, // folded-header cell id → number of cells it hides
+		onToggleFold,
 		onRun,
 		onRunAdvance,
 		onClear,
@@ -77,6 +81,7 @@
 			<div
 				role="presentation"
 				class="relative"
+				class:hidden={hidden.has(cell.id)}
 				ondragover={(e) => onDragOverCell(e, i)}
 				ondrop={(e) => onDropCell(e, i)}
 			>
@@ -94,6 +99,9 @@
 					running={runningId === cell.id}
 					active={activeId === cell.id}
 					dragging={dragId === cell.id}
+					folded={foldedIds.has(cell.id)}
+					hiddenCount={hiddenCounts[cell.id] ?? 0}
+					onToggleFold={onToggleFold}
 					{theme}
 					onRun={onRun}
 					onRunAdvance={onRunAdvance}

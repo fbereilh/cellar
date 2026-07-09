@@ -9,6 +9,7 @@
 	import MarkdownIt from 'markdown-it';
 	import DOMPurify from 'dompurify';
 	import { editorThemeExtensions } from '$lib/editorTheme.js';
+	import { headerLevel } from '$lib/headings.js';
 
 	let {
 		cell,
@@ -17,6 +18,9 @@
 		running,
 		active = false,
 		dragging = false,
+		folded = false, // this header cell's section is collapsed
+		hiddenCount = 0, // cells hidden by this header while folded (for the hint)
+		onToggleFold,
 		theme = 'dim',
 		onRun,
 		onRunAdvance,
@@ -45,6 +49,8 @@
 	let applyingRemote = false;
 
 	const isMarkdown = $derived(cell.cell_type === 'markdown');
+	// A markdown cell whose first non-empty line is a heading can fold its section.
+	const isHeader = $derived(headerLevel(cell) != null);
 
 	// A remote (agent / other-tab) source edit that arrived while the user was
 	// editing this cell, held until they choose to load it (the affordance below).
@@ -360,6 +366,19 @@
 				>
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6" /><circle cx="15" cy="6" r="1.6" /><circle cx="9" cy="12" r="1.6" /><circle cx="15" cy="12" r="1.6" /><circle cx="9" cy="18" r="1.6" /><circle cx="15" cy="18" r="1.6" /></svg>
 				</button>
+				{#if isHeader}
+					<button
+						class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-base-content/90"
+						onclick={() => onToggleFold?.(cell.id)}
+						title={folded ? 'Expand section' : 'Collapse section'}
+						aria-label={folded ? 'Expand section' : 'Collapse section'}
+						aria-expanded={!folded}
+						data-testid="fold-toggle"
+						data-folded={folded ? 'true' : undefined}
+					>
+						<svg class="h-3.5 w-3.5 transition-transform {folded ? '-rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+					</button>
+				{/if}
 				<button
 					class="btn btn-ghost btn-xs btn-square text-success"
 					onclick={() => doRun(false)}
@@ -384,6 +403,11 @@
 					</button>
 				{/if}
 				<span class="ml-1.5 font-mono text-xs text-base-content/50" title={cell.id}>cell <span class="text-base-content/70">#{cell.id.slice(0, 8)}</span></span>
+				{#if isHeader && folded}
+					<span class="badge badge-ghost badge-sm ml-1.5 gap-1 text-[11px] text-base-content/60" data-testid="fold-hidden-count">
+						{hiddenCount} {hiddenCount === 1 ? 'cell' : 'cells'} hidden
+					</span>
+				{/if}
 			</div>
 			<div class="flex items-center gap-1">
 				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'up')} disabled={index === 0} title="Move up" aria-label="Move cell up" data-testid="move-up">
