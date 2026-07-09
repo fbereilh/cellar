@@ -19,6 +19,25 @@ let liveKernel = null; // last-resolved kernel, for read-only status introspecti
 let manager = null;
 let currentKernel = null;
 
+/**
+ * Kernel session epoch. Every fresh namespace gets a new id: a first start, a
+ * restart, a rebind onto another interpreter, and a server-side autorestart all
+ * bump it. Callers stamp the epoch a cell ran in, so "this cell has saved
+ * outputs" (persisted, possibly from a previous session) can be told apart from
+ * "this cell actually executed against the namespace that is live right now".
+ *
+ * Monotonic and starts at 0, which means "no kernel has ever started" — so a
+ * stamp can never accidentally match the current epoch before a kernel exists.
+ */
+let sessionId = 0;
+/** Cell executions run in the current epoch (internal probes excluded). */
+let execsThisSession = 0;
+
+function beginSession() {
+	sessionId += 1;
+	execsThisSession = 0;
+}
+
 function makeSettings() {
 	const baseUrl = process.env.CELLAR_JUPYTER_URL || 'http://127.0.0.1:8888';
 	const token = process.env.CELLAR_JUPYTER_TOKEN || '';
@@ -74,6 +93,15 @@ async function getKernel() {
 		const kernel = await manager.startNew({ name: 'python3' });
 		liveKernel = kernel;
 		currentKernel = kernel;
+		beginSession();
+		// A kernel that dies is restarted by jupyter_server behind our back, which
+		// clears the namespace without any Cellar call. Catch that too, so a cell
+		// stamped before the crash never reads as "ran this session" after it.
+		// Our own restart() reports 'restarting', not 'autorestarting', so this
+		// cannot double-bump restartKernel().
+		kernel.statusChanged.connect((_sender, status) => {
+			if (status === 'autorestarting') beginSession();
+		});
 		await initKernel(kernel);
 		return kernel;
 	})();
@@ -92,9 +120,12 @@ async function getKernel() {
 export async function restartKernel() {
 	const kernel = await getKernel();
 	await kernel.restart();
+	// A restart clears the namespace, so nothing that ran before it counts as
+	// having run against the live kernel any more.
+	beginSession();
 	// restart() clears the namespace and the inline-backend config, so re-inject.
 	await initKernel(kernel);
-	return { status: kernel.status, id: kernel.id };
+	return { status: kernel.status, id: kernel.id, session_id: sessionId };
 }
 
 /**
@@ -122,9 +153,10 @@ export async function rebindKernel() {
 	kernelPromise = null;
 	currentKernel = null;
 	liveKernel = null;
-	if (!wasRunning) return { status: 'not_started', id: null };
+	if (!wasRunning) return { status: 'not_started', id: null, session_id: null };
+	// getKernel() starts a brand-new kernel process, so it opens a new session.
 	const kernel = await getKernel();
-	return { status: kernel.status, id: kernel.id };
+	return { status: kernel.status, id: kernel.id, session_id: sessionId };
 }
 
 /** Interrupt the running kernel (SIGINT equivalent). */
@@ -141,15 +173,49 @@ export function kernelStatus() {
 }
 
 /**
+ * Live kernel-session snapshot, without forcing a start. `session_id` is the
+ * current epoch (null when no kernel is running); a cell whose recorded run
+ * epoch equals it genuinely executed against the namespace that exists now.
+ * Everything else — however good its saved outputs look — did not.
+ */
+export function kernelSession() {
+	if (!currentKernel) {
+		return { started: false, session_id: null, status: 'not_started', execs_this_session: 0 };
+	}
+	return {
+		started: true,
+		session_id: sessionId,
+		status: currentKernel.status,
+		execs_this_session: execsThisSession
+	};
+}
+
+/** The epoch a run should be stamped with, or null when no kernel is running. */
+export function currentSessionId() {
+	return currentKernel ? sessionId : null;
+}
+
+/**
  * Execute one chunk of code. Each IOPub message is delivered live via onEvent
  * as it arrives from the kernel. Resolves with the execute reply when done.
  *
+ * The `kernel` and `done` events both carry the kernel-session epoch this run
+ * *started* in. Callers stamp that epoch on the cell rather than reading the
+ * epoch afterwards: if the kernel restarted mid-run the namespace is gone, and
+ * the stale stamp correctly reads as "did not run this session".
+ *
+ * `internal: true` marks a Cellar-issued probe (see inspect.js) so it does not
+ * inflate `execs_this_session`, which counts cell executions the agent can see.
+ *
  * @param {string} code
  * @param {(event: object) => void} onEvent
+ * @param {{ internal?: boolean }} [opts]
  */
-export async function execute(code, onEvent) {
+export async function execute(code, onEvent, { internal = false } = {}) {
 	const kernel = await getKernel();
-	onEvent({ type: 'kernel', id: kernel.id });
+	const session = sessionId;
+	if (!internal) execsThisSession += 1;
+	onEvent({ type: 'kernel', id: kernel.id, session });
 
 	const future = kernel.requestExecute({ code, stop_on_error: false });
 
@@ -195,7 +261,7 @@ export async function execute(code, onEvent) {
 	};
 
 	const reply = await future.done;
-	onEvent({ type: 'done', status: reply.content.status, execution_count: reply.content.execution_count });
+	onEvent({ type: 'done', status: reply.content.status, execution_count: reply.content.execution_count, session });
 	return reply.content;
 }
 

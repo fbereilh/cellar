@@ -9,7 +9,7 @@
  * only underscore-prefixed temporaries and deletes them, so it neither shows up
  * in nor pollutes the inspected namespace.
  */
-import { execute, kernelStatus } from './kernel.js';
+import { execute, kernelStatus, kernelSession } from './kernel.js';
 
 // One probe, four buckets. We start from IPython's user namespace minus the
 // names it already marks hidden (its injected builtins) and classify each name:
@@ -117,7 +117,7 @@ del _cellar_kernel_state
 async function runProbe() {
 	let stdout = '';
 	let errored = null;
-	await execute(PROBE, (ev) => {
+	const onEvent = (ev) => {
 		if (ev.type === 'output') {
 			const o = ev.output;
 			if (o.output_type === 'stream' && o.name === 'stdout') {
@@ -126,7 +126,10 @@ async function runProbe() {
 				errored = `${o.ename}: ${o.evalue}`;
 			}
 		}
-	});
+	};
+	// `internal` — a probe is Cellar's own bookkeeping, not a cell the agent ran,
+	// so it must not inflate `execs_this_session`.
+	await execute(PROBE, onEvent, { internal: true });
 	if (errored) throw new Error(errored);
 	// The probe prints exactly one JSON line; take the last non-empty line to be
 	// robust against any stray output.
@@ -155,11 +158,16 @@ export async function inspectVariables() {
  * has started — never force-boots one (mirrors getKernelInfo()). Imports are
  * deduped by normalized statement (falling back to module+alias when a
  * from-import has no safely reconstructable statement).
+ *
+ * This is the LIVE truth about what is defined. It carries the same `session_id`
+ * that `get_notebook_map`'s kernel header and each cell's `ran_this_session`
+ * flag are computed against, so the two views can be correlated.
  */
 export async function kernelState() {
 	const status = kernelStatus().status;
-	if (status === 'not_started') return { started: false };
-	if (status === 'busy') return { started: true, busy: true };
+	const { session_id } = kernelSession();
+	if (status === 'not_started') return { started: false, session_id: null };
+	if (status === 'busy') return { started: true, busy: true, session_id };
 	const state = await runProbe();
 	const seen = new Set();
 	const imports = [];
@@ -171,6 +179,7 @@ export async function kernelState() {
 	}
 	return {
 		started: true,
+		session_id,
 		imports,
 		functions: state.functions || [],
 		classes: state.classes || [],
