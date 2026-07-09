@@ -9,7 +9,10 @@ import { tags as t } from '@lezer/highlight';
 import { oneDark } from '@codemirror/theme-one-dark';
 
 // Light editor palette = pygments "default" (the standard Jupyter light syntax
-// scheme), on the card's own light background (no editor background of its own).
+// scheme), on a subtle light-grey editor surface (stark white reads as too harsh
+// against the app's light theme; this soft grey keeps the code area distinct
+// while preserving syntax-color contrast).
+const LIGHT_EDITOR_BG = '#f6f6f6';
 const jupyterLightHighlight = HighlightStyle.define([
 	{ tag: [t.comment, t.lineComment, t.blockComment], color: '#408080', fontStyle: 'italic' },
 	{ tag: [t.keyword, t.modifier, t.controlKeyword, t.operatorKeyword], color: '#008000', fontWeight: 'bold' },
@@ -29,10 +32,12 @@ const jupyterLightHighlight = HighlightStyle.define([
 ]);
 const jupyterLightTheme = EditorView.theme(
 	{
-		'&': { color: '#1a1a1a' },
+		'&': { color: '#1a1a1a', backgroundColor: LIGHT_EDITOR_BG },
+		'.cm-content': { backgroundColor: LIGHT_EDITOR_BG },
+		'.cm-gutters': { backgroundColor: LIGHT_EDITOR_BG, border: 'none' },
 		'.cm-cursor, .cm-dropCursor': { borderLeftColor: '#1a1a1a' },
 		'.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: '#d7d4f0' },
-		'.cm-activeLine': { backgroundColor: 'rgba(0, 0, 0, 0.035)' },
+		'.cm-activeLine': { backgroundColor: 'rgba(0, 0, 0, 0.045)' },
 		'.cm-activeLineGutter': { backgroundColor: 'transparent' },
 		'.cm-lineNumbers .cm-gutterElement': { color: '#b8b8c0' },
 		'.cm-matchingBracket': { backgroundColor: '#c2f0c2', color: 'inherit' }
