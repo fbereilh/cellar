@@ -425,17 +425,27 @@
 </script>
 
 <div
-	class="card relative overflow-hidden border bg-base-100 shadow-sm transition-colors {active ? 'border-primary/50 ring-1 ring-primary/40' : 'border-base-300'} {dragging ? 'opacity-40' : ''}"
+	class="card relative overflow-hidden border bg-base-100 shadow-sm transition-colors {showRunning
+		? 'border-warning/60 ring-1 ring-warning/40'
+		: active
+			? 'border-primary/50 ring-1 ring-primary/40'
+			: 'border-base-300'} {dragging ? 'opacity-40' : ''}"
 	data-testid="cell"
 	data-cell-id={cell.id}
 	data-cell-type={cell.cell_type}
 	data-active={active ? 'true' : undefined}
+	data-running={showRunning ? 'true' : undefined}
 	role="presentation"
 	onfocusin={() => onActivate?.(cell.id)}
 	onpointerdown={() => onActivate?.(cell.id)}
 >
-	<!-- Active-cell accent bar (VS Code / Jupyter style); no layout shift. -->
-	{#if active}
+	<!-- Left accent bar (VS Code / Jupyter style); no layout shift. The running
+	     accent deliberately outranks the selection accent and uses `warning` (the
+	     same hue as the running indicator) so "what is executing" is never confused
+	     with "what is selected" - the cue that makes an agent's run legible. -->
+	{#if showRunning}
+		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 animate-pulse bg-warning" data-testid="running-bar"></div>
+	{:else if active}
 		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 bg-primary" data-testid="active-bar"></div>
 	{/if}
 	<div class="card-body gap-0 p-0">
