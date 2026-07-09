@@ -86,6 +86,54 @@
 	// (or a run from another tab) shows the running indicator + streaming outputs
 	// with no reload. Our own UI runs are skipped here (we render them from the
 	// `/run` NDJSON response) via the per-tab `originId`, so they never double-apply.
+	// Apply a structural document event (agent-driven, or from another tab) as a
+	// live patch to `cells`. Insert/remove/reorder/retype in place — cheap and
+	// reload-free; the seq-gap backstop refetches if we ever miss one. Each patch
+	// is idempotent enough to tolerate an out-of-order or duplicate delivery.
+	function applyStructuralEvent(ev) {
+		if (ev.type === 'cell:added') {
+			if (!ev.cell || findCell(ev.cell.id)) return; // already present → no double-insert
+			const view = {
+				id: ev.cell.id,
+				cell_type: ev.cell.cell_type,
+				source: ev.cell.source,
+				outputs: ev.cell.outputs ?? [],
+				metadata: ev.cell.metadata ?? {}
+			};
+			const i = ev.afterId ? cells.findIndex((c) => c.id === ev.afterId) : -1;
+			if (i >= 0) cells = [...cells.slice(0, i + 1), view, ...cells.slice(i + 1)];
+			else cells = [...cells, view];
+		} else if (ev.type === 'cell:deleted') {
+			cells = cells.filter((c) => c.id !== ev.cellId);
+			if (runningId === ev.cellId) runningId = null;
+			if (activeId === ev.cellId) activeId = null;
+		} else if (ev.type === 'cell:moved') {
+			const from = cells.findIndex((c) => c.id === ev.cellId);
+			if (from < 0) return;
+			const next = [...cells];
+			const [cell] = next.splice(from, 1);
+			const to = Math.max(0, Math.min(ev.toIndex, next.length));
+			next.splice(to, 0, cell);
+			cells = next;
+		} else if (ev.type === 'cell:type') {
+			const cell = findCell(ev.cellId);
+			if (cell) {
+				cell.cell_type = ev.cell_type;
+				if (ev.cell_type === 'markdown') cell.outputs = [];
+			}
+		} else if (ev.type === 'cell:cleared') {
+			const cell = findCell(ev.cellId);
+			if (cell) cell.outputs = [];
+		} else if (ev.type === 'cell:edited') {
+			// Don't blindly overwrite the editor: hand the new source to the Cell,
+			// which applies it only when the user isn't actively editing that cell
+			// (else it surfaces a "changed on server" affordance). A fresh object
+			// each time so the Cell's effect fires even on a same-source re-edit.
+			const cell = findCell(ev.cellId);
+			if (cell) cell.remoteEdit = { source: ev.source };
+		}
+	}
+
 	function applyRunEvent(ev) {
 		const cell = ev.cellId && findCell(ev.cellId);
 		if (ev.type === 'run:start') {
@@ -120,8 +168,9 @@
 			// A gap in this notebook's monotonic seq means we missed events → refetch.
 			if (lastSeq !== null && ev.seq > lastSeq + 1) load();
 			lastSeq = ev.seq; // advance even for our own echo, so it isn't seen as a gap
-			if (ev.originId && ev.originId === originId) return; // our own UI run
-			applyRunEvent(ev);
+			if (ev.originId && ev.originId === originId) return; // our own UI action
+			if (ev.type?.startsWith('cell:')) applyStructuralEvent(ev);
+			else applyRunEvent(ev);
 		})
 	);
 
@@ -199,14 +248,14 @@
 		await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ source, nb: path })
+			body: JSON.stringify({ source, nb: path, originId })
 		});
 	}
 
 	async function clearCell(id) {
 		const cell = findCell(id);
 		if (cell) cell.outputs = [];
-		await fetch(`/api/cells/${id}/clear?nb=${encodeURIComponent(path)}`, { method: 'POST' });
+		await fetch(`/api/cells/${id}/clear?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, { method: 'POST' });
 	}
 
 	async function setType(id, cellType) {
@@ -218,13 +267,13 @@
 		await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ cell_type: cellType, nb: path })
+			body: JSON.stringify({ cell_type: cellType, nb: path, originId })
 		});
 	}
 
 	async function deleteCell(id) {
 		cells = cells.filter((c) => c.id !== id);
-		await fetch(`/api/cells/${id}?nb=${encodeURIComponent(path)}`, { method: 'DELETE' });
+		await fetch(`/api/cells/${id}?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, { method: 'DELETE' });
 	}
 
 	async function moveCell(id, dir) {
@@ -237,7 +286,7 @@
 		await fetch(`/api/cells/${id}/move`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ dir, nb: path })
+			body: JSON.stringify({ dir, nb: path, originId })
 		});
 	}
 
@@ -256,7 +305,7 @@
 		await fetch(`/api/cells/${id}/move`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ toIndex: cells.findIndex((c) => c.id === id), nb: path })
+			body: JSON.stringify({ toIndex: cells.findIndex((c) => c.id === id), nb: path, originId })
 		});
 	}
 
@@ -281,7 +330,7 @@
 		const res = await fetch('/api/cells', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ afterId, cellType, nb: path })
+			body: JSON.stringify({ afterId, cellType, nb: path, originId })
 		});
 		const { cell } = await res.json();
 		const view = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs, metadata: cell.metadata ?? {} };

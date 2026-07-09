@@ -19,7 +19,8 @@ import {
 	deleteCell,
 	moveCellTo,
 	setVisibility,
-	getActiveNotebookPath
+	getActiveNotebookPath,
+	createNotebook as createNotebookDoc
 } from '../notebook.js';
 import { execute, restartKernel, interruptKernel, kernelStatus } from '../kernel.js';
 import { kernelState } from '../inspect.js';
@@ -133,6 +134,19 @@ export function listNotebooks() {
 
 export function openNotebook() {
 	const nb = getNotebook();
+	return { path: nb.path, workspace: nb.workspace, cells: nb.cells.length };
+}
+
+/**
+ * Create (or open) a workspace notebook and make it active. `name` is an
+ * optional `.ipynb` filename (defaults to `untitled.ipynb`); the `.ipynb`
+ * suffix is added if missing. Broadcasts `notebook:opened` so an open browser
+ * surfaces the new notebook in a tab live. Returns its path + cell count.
+ */
+export function createNotebook(name) {
+	let rel = (name ?? '').trim() || 'untitled';
+	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
+	const nb = createNotebookDoc(rel);
 	return { path: nb.path, workspace: nb.workspace, cells: nb.cells.length };
 }
 

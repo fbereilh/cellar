@@ -6,7 +6,8 @@
  * (fixed key order, stable formatting) and runs the clean-on-save policy, so
  * an identical re-run produces a byte-identical file (no git diff).
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { cleanNotebook } from './clean.js';
 
 const NBFORMAT = 4;
@@ -84,5 +85,6 @@ export function readNotebook(path) {
 
 /** Clean, serialize deterministically, and write to disk. */
 export function writeNotebook(path, doc) {
+	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, stringify(serialize(doc)));
 }

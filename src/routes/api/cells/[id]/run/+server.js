@@ -16,7 +16,7 @@ import { publish } from '$lib/server/events.js';
  */
 export async function POST({ params, request }) {
 	const { source, nb, originId } = await request.json();
-	setSource(params.id, source ?? '', nb);
+	setSource(params.id, source ?? '', nb, originId);
 
 	const canonicalNb = resolveNotebookPath(nb);
 	const cellId = params.id;

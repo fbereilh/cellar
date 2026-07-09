@@ -62,7 +62,7 @@ function registerTools(server) {
 	server.registerTool('kernel_status', { description: 'Current kernel status.', inputSchema: {} }, async () => text(svc.kernel.status()));
 	server.registerTool('list_notebooks', { description: 'List notebooks in the workspace.', inputSchema: {} }, async () => text(svc.listNotebooks()));
 	server.registerTool('open_notebook', { description: 'Open (the workspace) notebook.', inputSchema: {} }, async () => text(svc.openNotebook()));
-	server.registerTool('create_notebook', { description: 'Create a notebook (single-notebook workspace today; returns the current one).', inputSchema: {} }, async () => text(svc.openNotebook()));
+	server.registerTool('create_notebook', { description: 'Create (or open) a workspace notebook by name (a .ipynb file), make it active, and surface it live in the open UI. Omit name for an untitled notebook.', inputSchema: { name: z.string().optional() } }, async ({ name }) => text(svc.createNotebook(name)));
 
 	// --- read ---
 	server.registerTool('get_notebook_map', { description: 'Compact hierarchical section tree (from markdown headers): id, type, header level/title, one-line summary, run status, has-output, visibility. Not full content.', inputSchema: {} }, async () => text(svc.getNotebookMap()));
