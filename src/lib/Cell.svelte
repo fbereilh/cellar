@@ -69,6 +69,14 @@
 	const stripAnsi = (s) => s.replace(ANSI, '');
 	const asText = (s) => (Array.isArray(s) ? s.join('') : (s ?? ''));
 
+	// Build a data: URL for an nbformat image bundle. Raster mimes (png/jpeg/gif)
+	// carry base64 text; image/svg+xml carries raw XML, so it is URI-encoded.
+	function imageDataUrl(mime, payload) {
+		const data = asText(payload);
+		if (mime === 'image/svg+xml') return `data:image/svg+xml;utf8,${encodeURIComponent(data)}`;
+		return `data:${mime};base64,${data.replace(/\s+/g, '')}`;
+	}
+
 	// A markdown-table separator row: pipes, dashes, colons, spaces, ≥1 dash.
 	const TABLE_SEP = /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/;
 	const isTableRow = (l) => l.includes('|') && l.trim() !== '';
@@ -118,12 +126,18 @@
 			case 'execute_result':
 			case 'display_data': {
 				const d = o.data || {};
+				// Prefer a rich image over the text/plain repr: a matplotlib figure
+				// emits BOTH an image/png and its `<Figure … with N Axes>` text repr,
+				// and (like Jupyter) we show the image, not the placeholder text.
+				const imgMime = Object.keys(d).find((k) => k.startsWith('image/'));
+				if (imgMime) {
+					return { tone: 'result', image: imageDataUrl(imgMime, d[imgMime]), segments: null };
+				}
 				if (d['text/plain']) {
 					tone = 'result';
 					text = asText(d['text/plain']);
 				} else {
-					const img = Object.keys(d).find((k) => k.startsWith('image/'));
-					return { tone: 'result', text: img ? `[${img} output]` : '[rich output]', segments: null };
+					return { tone: 'result', text: '[rich output]', segments: null };
 				}
 				break;
 			}
@@ -381,7 +395,14 @@
 				<div class="{scrolled ? 'max-h-[22rem] overflow-y-auto' : ''}" data-testid="output-scroll" data-scrolled={scrolled ? 'true' : undefined}>
 					<div bind:this={outputInner} class="space-y-0.5 py-2">
 						{#each outputs as o}
-							{#if o.segments}
+							{#if o.image}
+								<img
+									class="max-w-full px-3 py-1"
+									src={o.image}
+									alt="cell image output"
+									data-testid="output-image"
+								/>
+							{:else if o.segments}
 								{#each o.segments as seg}
 									{#if seg.type === 'table'}
 										<div class="cellar-output-table overflow-x-auto px-3 py-1" data-testid="output-table">{@html seg.html}</div>
