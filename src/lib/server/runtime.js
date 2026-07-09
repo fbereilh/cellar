@@ -24,9 +24,8 @@ import {
 	readFileSync,
 	writeFileSync,
 	rmSync,
-	openSync,
-	writeSync,
-	closeSync
+	linkSync,
+	unlinkSync
 } from 'node:fs';
 
 /** Absolute path of the runtime discovery file for a workspace. */
@@ -110,23 +109,34 @@ export function acquireInstanceLock(workspace, pid = process.pid) {
 	const dir = join(workspace, '.cellar');
 	mkdirSync(dir, { recursive: true });
 	const file = instanceLockPath(workspace);
-	for (let attempt = 0; attempt < 5; attempt++) {
-		try {
-			const fd = openSync(file, 'wx'); // O_CREAT | O_EXCL — atomic create-or-fail
-			writeSync(fd, String(pid) + '\n');
-			closeSync(fd);
-			return { acquired: true };
-		} catch (err) {
-			if (err?.code !== 'EEXIST') throw err;
-			const ownerPid = readLockPid(file);
-			if (ownerPid && ownerPid !== pid && pidAlive(ownerPid)) {
-				return { acquired: false, ownerPid };
-			}
-			// Stale lock (dead/unreadable owner, or our own leftover) — clear + retry.
+	// Stage the pid in a per-pid temp file first, then atomically link it into
+	// place. linkSync fails with EEXIST if the lock already exists, so the lock
+	// is never visible on disk without its pid already written — closing the
+	// create-then-write window where a racer could read an empty lock and
+	// wrongly reclaim it.
+	const temp = file + '.' + pid + '.tmp';
+	writeFileSync(temp, String(pid) + '\n');
+	try {
+		for (let attempt = 0; attempt < 5; attempt++) {
 			try {
-				rmSync(file, { force: true });
-			} catch {}
+				linkSync(temp, file); // fails EEXIST if a lock already exists
+				return { acquired: true };
+			} catch (err) {
+				if (err?.code !== 'EEXIST') throw err;
+				const ownerPid = readLockPid(file);
+				if (ownerPid && ownerPid !== pid && pidAlive(ownerPid)) {
+					return { acquired: false, ownerPid };
+				}
+				// Stale lock (dead owner, or our own leftover) — clear + retry.
+				try {
+					rmSync(file, { force: true });
+				} catch {}
+			}
 		}
+	} finally {
+		try {
+			unlinkSync(temp);
+		} catch {}
 	}
 	// Lost every race to another launcher — treat the folder as owned (never
 	// clobber). The caller attaches to whoever currently holds it.
@@ -165,7 +175,7 @@ async function appPortResponds(appPort, timeoutMs = 1500) {
  * app is listening). Returns null if the owner dies before it comes up (crashed
  * during boot → caller should take over) or the timeout elapses (hung).
  */
-export async function waitForInstanceUrl(workspace, ownerPid, { timeoutMs = 60000 } = {}) {
+export async function waitForInstanceUrl(workspace, ownerPid, { timeoutMs = 120000 } = {}) {
 	const start = Date.now();
 	while (Date.now() - start < timeoutMs) {
 		if (ownerPid && !pidAlive(ownerPid)) return null; // owner gone → take over

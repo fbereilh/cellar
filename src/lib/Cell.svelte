@@ -272,6 +272,7 @@
 	function doRun(advance) {
 		const src = currentSource();
 		liveSource = src;
+		savedSource = src;
 		if (isMarkdown) mode = 'rendered';
 		(advance ? onRunAdvance : onRun)(cell.id, src);
 	}
