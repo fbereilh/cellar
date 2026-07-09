@@ -130,7 +130,7 @@ function resolveInside(relPath) {
 	return abs;
 }
 
-/** Reject names that would traverse or nest (a single path segment only). */
+/** Reject names that would traverse or nest (a single path segment only), or that are hidden (`.`-prefixed, which the explorer never lists). */
 function assertSimpleName(name) {
 	const n = (name ?? '').trim();
 	if (!n) throw new Error('name required');
