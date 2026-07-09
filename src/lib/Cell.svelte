@@ -47,6 +47,26 @@
 	// edit); the update listener checks it so a remote apply is never echoed back
 	// to the server as a local edit.
 	let applyingRemote = false;
+	// Last source already handed to `onEdit`. Lets us flush a pending debounced
+	// edit immediately on blur / page unload, so an edit is never lost in the
+	// sub-debounce window when the tab or the whole app closes.
+	let savedSource = cell.source;
+
+	/**
+	 * Persist any pending edit right now, cancelling the debounce. Called on
+	 * editor blur (focus leaves the cell) and on page unload (`pagehide`), so a
+	 * cell edit is saved without requiring a run and survives closing Cellar.
+	 * `keepalive` is only set from the unload path (the browser caps a keepalive
+	 * request body at ~64KB, so normal page-alive saves must not use it).
+	 */
+	function flushEdit({ keepalive = false } = {}) {
+		clearTimeout(editTimer);
+		if (view && liveSource !== savedSource) {
+			savedSource = liveSource;
+			editPending = false;
+			onEdit(cell.id, liveSource, { keepalive });
+		}
+	}
 
 	const isMarkdown = $derived(cell.cell_type === 'markdown');
 	// A markdown cell whose first non-empty line is a heading can fold its section.
@@ -315,9 +335,13 @@
 						clearTimeout(editTimer);
 						editTimer = setTimeout(() => {
 							editPending = false;
+							savedSource = liveSource;
 							onEdit(cell.id, liveSource);
 						}, 500);
 					}),
+					// Leaving the editor flushes any pending edit at once, so a save
+					// never waits on the debounce when focus moves away.
+					EditorView.domEventHandlers({ blur: () => (flushEdit(), false) }),
 					EditorView.theme({
 						'&': { backgroundColor: 'transparent', fontSize: '13.5px' },
 						'.cm-content': { fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace', padding: '10px 0' },
@@ -329,8 +353,14 @@
 		});
 		if (import.meta.env.DEV) (window.cellarViews ??= {})[cell.id] = view;
 		onReady?.(cell.id, () => view.focus());
+		// Closing the tab/window can fire before the 500ms debounce; flush on
+		// `pagehide` so an in-progress edit is persisted (the PATCH uses
+		// `keepalive` so it survives unload).
+		const flushOnUnload = () => flushEdit({ keepalive: true });
+		window.addEventListener('pagehide', flushOnUnload);
 		return () => {
-			clearTimeout(editTimer);
+			flushEdit();
+			window.removeEventListener('pagehide', flushOnUnload);
 			onReady?.(cell.id, null);
 			view?.destroy();
 		};
