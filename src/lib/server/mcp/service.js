@@ -61,6 +61,15 @@ function hasOutput(cell) {
 }
 
 /**
+ * The one definition of "ran this session": a recorded run epoch identifies the
+ * live namespace only when a kernel is up and the epochs match.
+ *
+ * @param {number|null|undefined} session epoch a run was stamped with
+ * @param {number|null} sid current epoch, or null when no kernel is running
+ */
+const isLiveSession = (session, sid) => sid != null && session === sid;
+
+/**
  * Did this cell execute against the kernel namespace that is live right now?
  *
  * A cell's `outputs` are persisted in the `.ipynb` and outlive both the kernel
@@ -73,8 +82,8 @@ function hasOutput(cell) {
  * @param {number|null} sid current epoch, or null when no kernel is running
  */
 function ranThisSession(cell, sid) {
-	if (cell.cell_type !== 'code' || sid == null) return false;
-	return cell.metadata?.cellar?.lastRun?.session === sid;
+	if (cell.cell_type !== 'code') return false;
+	return isLiveSession(cell.metadata?.cellar?.lastRun?.session, sid);
 }
 
 /**
@@ -322,9 +331,15 @@ export function readSection(headerId) {
 	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c)) };
 }
 
+/**
+ * Search cell sources and saved outputs. Every row carries `ran_this_session`:
+ * an output snippet from a cell that has not run this session was deserialized
+ * from the `.ipynb` and describes a namespace that no longer exists.
+ */
 export function searchCells(query, where = 'both') {
 	const q = (query || '').toLowerCase();
 	if (!q) return [];
+	const sid = currentSessionId();
 	const results = [];
 	const snippet = (text) => {
 		const i = text.toLowerCase().indexOf(q);
@@ -333,14 +348,15 @@ export function searchCells(query, where = 'both') {
 		return (start > 0 ? '…' : '') + text.slice(start, i + q.length + 40).replace(/\n/g, ' ') + '…';
 	};
 	for (const c of visibleCells()) {
+		const live = ranThisSession(c, sid);
 		if (where === 'input' || where === 'both') {
 			const s = snippet(c.source || '');
-			if (s) results.push({ id: c.id, where: 'input', snippet: s });
+			if (s) results.push({ id: c.id, where: 'input', ran_this_session: live, snippet: s });
 		}
 		if (where === 'output' || where === 'both') {
 			const otext = (c.outputs || []).map(outputText).join('\n');
 			const s = snippet(otext);
-			if (s) results.push({ id: c.id, where: 'output', snippet: s });
+			if (s) results.push({ id: c.id, where: 'output', ran_this_session: live, snippet: s });
 		}
 	}
 	return results;
@@ -370,7 +386,11 @@ export function getErrors() {
 	return errs;
 }
 
-/** Tiered: medium cap by default; full only on size='full'. Images passed through. */
+/**
+ * Tiered: medium cap by default; full only on size='full'. Images passed through.
+ * `ran_this_session: false` means these outputs were saved by a PREVIOUS session
+ * - they describe a namespace that no longer exists.
+ */
 export function getFullOutput(id, size = 'medium') {
 	const c = getCell(id);
 	if (!c || isHidden(c)) return null;
@@ -380,7 +400,7 @@ export function getFullOutput(id, size = 'medium') {
 		if (img) return { type: o.output_type, image: img, data: o.data[img] };
 		return summarizeOutput(o, cap);
 	});
-	return { id: c.id, size, outputs };
+	return { id: c.id, size, ran_this_session: ranThisSession(c, currentSessionId()), outputs };
 }
 
 // --- write ------------------------------------------------------------------
@@ -426,23 +446,22 @@ export function setCellVisibility(id, hidden) {
 // --- execute ----------------------------------------------------------------
 
 /**
- * Run code and capture, alongside its outputs, the kernel-session epoch the run
- * STARTED in. Stamping that (rather than reading the epoch after the run) means
- * a kernel restart mid-run leaves the cell correctly marked as not-this-session.
+ * Run code, collecting its outputs and handing the caller - via `onSession`, so
+ * it survives the throw path - the kernel-session epoch the run STARTED in.
+ * Stamping that (rather than reading the epoch after the run) means a kernel
+ * restart mid-run leaves the cell correctly marked as not-this-session.
  */
 async function runSource(source, onOutput, onSession) {
 	const outputs = [];
-	let session = null;
 	const reply = await execute(source, (ev) => {
 		if (ev.type === 'output') {
 			outputs.push(ev.output);
 			onOutput?.(ev.output);
 		} else if (ev.type === 'kernel') {
-			session = ev.session;
 			onSession?.(ev.session);
 		}
 	});
-	return { outputs, status: reply?.status ?? 'ok', session };
+	return { outputs, status: reply?.status ?? 'ok' };
 }
 
 /**
@@ -489,7 +508,7 @@ export async function runCell(id) {
 	setLastRun(id, lastRun, nb);
 	publish({ type: 'run:end', nb, cellId: id, ...lastRun });
 	const hiddenNote = isHidden(c) ? { hidden: true } : {};
-	return { id, status, ran_this_session: session != null && session === currentSessionId(), ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+	return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 }
 
 /**

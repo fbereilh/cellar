@@ -9,7 +9,7 @@
  * only underscore-prefixed temporaries and deletes them, so it neither shows up
  * in nor pollutes the inspected namespace.
  */
-import { execute, kernelStatus, kernelSession } from './kernel.js';
+import { execute, kernelStatus, kernelSession, currentSessionId } from './kernel.js';
 
 // One probe, four buckets. We start from IPython's user namespace minus the
 // names it already marks hidden (its injected builtins) and classify each name:
@@ -113,12 +113,20 @@ print(_cellar_json.dumps(_cellar_kernel_state()))
 del _cellar_kernel_state
 `;
 
-/** Run the shared probe on the kernel and return the parsed bucketed state. */
+/**
+ * Run the shared probe on the kernel and return the parsed bucketed state,
+ * tagged with `session` - the kernel-session epoch the probe actually executed
+ * in, taken from execute()'s `kernel` event. That epoch, not one sampled around
+ * the await, is the one this namespace snapshot belongs to.
+ */
 async function runProbe() {
 	let stdout = '';
 	let errored = null;
+	let session = null;
 	const onEvent = (ev) => {
-		if (ev.type === 'output') {
+		if (ev.type === 'kernel') {
+			session = ev.session;
+		} else if (ev.type === 'output') {
 			const o = ev.output;
 			if (o.output_type === 'stream' && o.name === 'stdout') {
 				stdout += Array.isArray(o.text) ? o.text.join('') : o.text;
@@ -134,8 +142,8 @@ async function runProbe() {
 	// The probe prints exactly one JSON line; take the last non-empty line to be
 	// robust against any stray output.
 	const line = stdout.trim().split('\n').filter(Boolean).at(-1);
-	if (!line) return { imports: [], functions: [], classes: [], variables: [] };
-	return JSON.parse(line);
+	if (!line) return { session, imports: [], functions: [], classes: [], variables: [] };
+	return { session, ...JSON.parse(line) };
 }
 
 /**
@@ -159,15 +167,18 @@ export async function inspectVariables() {
  * deduped by normalized statement (falling back to module+alias when a
  * from-import has no safely reconstructable statement).
  *
- * This is the LIVE truth about what is defined. It carries the same `session_id`
- * that `get_notebook_map`'s kernel header and each cell's `ran_this_session`
- * flag are computed against, so the two views can be correlated.
+ * This is the LIVE truth about what is defined. `session_id` is the epoch of the
+ * kernel session the returned namespace was read from - the same epoch
+ * `get_notebook_map`'s kernel header and each cell's `ran_this_session` flag are
+ * computed against, so the two views can always be correlated. If the kernel is
+ * restarted (or autorestarts) between the probe and the reply, `stale: true` is
+ * set: the namespace below belongs to `session_id`, which is no longer live, so
+ * nothing in it is defined any more.
  */
 export async function kernelState() {
 	const status = kernelStatus().status;
-	const { session_id } = kernelSession();
 	if (status === 'not_started') return { started: false, session_id: null };
-	if (status === 'busy') return { started: true, busy: true, session_id };
+	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession().session_id };
 	const state = await runProbe();
 	const seen = new Set();
 	const imports = [];
@@ -177,9 +188,11 @@ export async function kernelState() {
 		seen.add(key);
 		imports.push(imp);
 	}
+	const stale = state.session !== currentSessionId();
 	return {
 		started: true,
-		session_id,
+		session_id: state.session,
+		...(stale ? { stale: true } : {}),
 		imports,
 		functions: state.functions || [],
 		classes: state.classes || [],
