@@ -104,6 +104,15 @@ That single command:
    `cellar` instances in different repos run side by side. The resolved app +
    MCP URLs are printed on startup.
 
+**One instance per folder.** Rerunning `cellar` in a folder that already has a
+live instance does **not** start a rival server - two servers would each persist
+`notebook.ipynb` from independent in-memory docs and silently clobber each
+other's edits. Instead the second launch attaches to the running one (opens the
+browser to it and exits). Ownership is claimed atomically via a
+`.cellar/instance.lock` file, so even a rapid double-launch can't start two.
+Pass `--new` (alias `--force`) to deliberately start a second, independent
+instance for the same folder (power-user escape hatch).
+
 Creating a `.venv` or installing `ipykernel` into your project **prompts for
 confirmation** on a TTY (printing exactly what will run); reusing an existing
 venv that already has `ipykernel` is silent.
@@ -118,6 +127,7 @@ Flags:
 | `--yes` / `-y` | Auto-approve venv create / ipykernel install (implied when non-interactive / `$CI`) |
 | `--dev` | Run the Vite dev server instead of the production build |
 | `--no-mcp-config` | Do not write/merge `<workspace>/.mcp.json` (see [Zero-config agent connection](#zero-config-agent-connection-cellar-mcp)) |
+| `--new` / `--force` | Start a second, independent instance in a folder that already has a live one (normally a relaunch attaches to the running instance) |
 
 There is also a `cellar mcp` subcommand (the stdio ↔ HTTP MCP bridge) — see
 [Zero-config agent connection](#zero-config-agent-connection-cellar-mcp).

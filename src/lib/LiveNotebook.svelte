@@ -295,14 +295,19 @@
 		}
 	}
 
-	async function editCell(id, source) {
+	async function editCell(id, source, { keepalive = false } = {}) {
 		const cell = findCell(id);
 		if (cell) cell.source = source;
+		// Only the page-unload flush opts into `keepalive`: the browser caps the
+		// combined keepalive body at ~64KB and rejects past it, so normal
+		// (page-alive) autosaves stay plain fetch. `.catch` keeps a rejected PATCH
+		// from surfacing as an unhandled rejection either way.
 		await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ source, nb: path, originId })
-		});
+			body: JSON.stringify({ source, nb: path, originId }),
+			keepalive
+		}).catch(() => {});
 	}
 
 	async function clearCell(id) {

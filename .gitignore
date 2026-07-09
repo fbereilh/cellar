@@ -7,5 +7,6 @@ build/
 # workspace notebook artifact (created when cellar runs in this folder)
 notebook.ipynb
 
-# ephemeral per-run instance state (live port map for `cellar mcp` discovery)
+# ephemeral per-run instance state (live port map for `cellar mcp` discovery +
+# single-instance lock)
 .cellar/
