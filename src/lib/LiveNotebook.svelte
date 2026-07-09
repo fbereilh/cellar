@@ -25,7 +25,11 @@
 	// (the load itself is the initial sync).
 	let canonicalId = null;
 	let lastSeq = null; // last per-notebook `seq` seen (gap detection → refetch)
-	let sseReplace = false; // replace prior output on the first streamed chunk of an SSE run
+	// Cell ids awaiting the first streamed chunk of an SSE run — that chunk
+	// replaces the prior output (no flash). Tracked per-cell (not one shared flag)
+	// so interleaved run:start events for different cells can't consume each other's
+	// replace state (MCP runs aren't serialized against UI runs on the wire).
+	const sseReplace = new Set();
 
 	function setActive(id) {
 		activeId = id;
@@ -57,6 +61,13 @@
 			if (!res.ok) throw new Error(body?.message || 'could not open notebook');
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
+			// This refetch is the correctness backstop (reconnect / seq gap): the
+			// freshly loaded cells carry authoritative outputs, so drop any stale live
+			// run state. Otherwise a lost run:end (tab disconnected while an agent run
+			// finished server-side) would leave the spinner stuck and permanently block
+			// this tab's own runs via the `busy || runningId` guard in runCell.
+			runningId = null;
+			sseReplace.clear();
 		} catch (err) {
 			loadError = String(err?.message ?? err);
 		} finally {
@@ -79,20 +90,19 @@
 		if (ev.type === 'run:start') {
 			if (cell) {
 				runningId = ev.cellId;
-				sseReplace = true; // first streamed chunk replaces the prior output (no flash)
+				sseReplace.add(ev.cellId); // first streamed chunk replaces the prior output (no flash)
 			}
 		} else if (ev.type === 'run:output') {
 			if (cell) {
-				if (sseReplace) {
+				if (sseReplace.has(ev.cellId)) {
 					cell.outputs = [ev.output];
-					sseReplace = false;
+					sseReplace.delete(ev.cellId);
 				} else {
 					cell.outputs = [...cell.outputs, ev.output];
 				}
 			}
 		} else if (ev.type === 'run:end') {
-			if (cell && sseReplace) cell.outputs = []; // ran with no output → clear stale
-			sseReplace = false;
+			if (cell && sseReplace.delete(ev.cellId)) cell.outputs = []; // ran with no output → clear stale
 			if (runningId === ev.cellId) runningId = null;
 		}
 	}
