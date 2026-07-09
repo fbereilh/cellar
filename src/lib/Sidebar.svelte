@@ -2,6 +2,7 @@
 	import { onMount, setContext } from 'svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
+	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
 
 	let {
 		cells,
@@ -18,7 +19,7 @@
 		onRestartKernel,
 		onOpenFile,
 		onOpenFilePermanent,
-		onOpenNotebook,
+		onFocusNotebook,
 		activeFilePath = null,
 		fsRefreshSignal = 0,
 		onScrollToCell,
@@ -420,13 +421,6 @@
 			copyTimer = setTimeout(() => (copied = ''), 1400);
 		} catch {}
 	}
-
-	function kernelBadge(info) {
-		if (!info?.started) return 'badge-ghost';
-		if (info.status === 'busy' || info.status === 'starting') return 'badge-warning';
-		if (info.status === 'dead') return 'badge-error';
-		return 'badge-success';
-	}
 </script>
 
 <!-- Section drag handle + collapse header, shared by every section. -->
@@ -510,10 +504,11 @@
 	{/if}
 {/snippet}
 
-<!-- One open notebook loaded against the shared kernel. Clicking focuses its
-     tab; the active notebook is marked with a primary dot. -->
+<!-- One open notebook loaded against the shared kernel. Clicking only focuses
+     its existing tab - a preview tab stays a preview, so the file tree's single-
+     click slot is untouched. The active notebook is marked with a primary dot. -->
 {#snippet notebookRow(nb)}
-	<button class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50 {nb.active ? 'text-base-content' : 'text-base-content/60'}" onclick={() => onOpenNotebook?.(nb.path)} title="Open {nb.name}" data-testid="kernel-notebook">
+	<button class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50 {nb.active ? 'text-base-content' : 'text-base-content/60'}" onclick={() => onFocusNotebook?.(nb.id)} title="Focus {nb.name}" data-testid="kernel-notebook">
 		<svg class="h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
 		<span class="truncate font-mono">{nb.name}</span>
 		{#if nb.active}<span class="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
@@ -565,9 +560,9 @@
 							<svg class="h-3.5 w-3.5 text-primary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
 							{kernelInfo.name || 'python3'}
 						</span>
-						<span class="badge badge-sm {kernelBadge(kernelInfo)} gap-1" data-testid="kernel-card-status">
+						<span class="badge badge-sm {kernelBadgeClass(kernelInfo)} gap-1" data-testid="kernel-card-status">
 							<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
-							{kernelInfo.status}
+							{kernelStatusLabel(kernelInfo)}
 						</span>
 					</div>
 					<div class="mt-2 border-t border-base-300 pt-2">

@@ -1,5 +1,6 @@
 <script>
 	import { iconSvg } from '$lib/fileIcons.js';
+	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
 
 	let {
 		tabs,
@@ -14,18 +15,9 @@
 	} = $props();
 
 	// Reflect the real kernel state, not a phantom: no kernel started → a neutral
-	// "not started", never a green idle badge. Busy/starting → warning, dead →
-	// error, idle → success.
-	const kernelLabel = $derived(kernelInfo?.started ? kernelInfo.status : 'not started');
-	const kernelBadge = $derived(
-		!kernelInfo?.started
-			? 'badge-ghost'
-			: kernelInfo.status === 'busy' || kernelInfo.status === 'starting'
-				? 'badge-warning'
-				: kernelInfo.status === 'dead'
-					? 'badge-error'
-					: 'badge-success'
-	);
+	// "not started", never a green idle badge.
+	const kernelLabel = $derived(kernelStatusLabel(kernelInfo));
+	const kernelBadge = $derived(kernelBadgeClass(kernelInfo));
 </script>
 
 <header class="flex min-h-11 items-stretch border-b border-base-300 bg-base-100 text-base-content" data-testid="navbar">
