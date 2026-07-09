@@ -100,11 +100,16 @@ function persist(doc) {
 }
 
 /**
- * Load (or lazily create) the document for an absolute path. The default
- * notebook is created if missing and re-persisted on load so a foreign/edited
- * file is normalized + cleaned. An arbitrary opened `.ipynb` must exist and is
- * NOT rewritten on mere open — only actual mutations persist it, so opening a
- * file never produces a surprise git diff.
+ * Load (or lazily create) the document for an absolute path. Loading NEVER
+ * writes to disk — a `.ipynb` is persisted only on a genuine mutation (create /
+ * add / edit / run / …), so opening Cellar in a folder drops no uninvited file
+ * and opening an existing notebook produces no surprise git diff. Normalization
+ * (clean-on-save) therefore happens on the first real mutation, not on open.
+ *
+ * The default notebook (`notebook.ipynb`) is materialized in memory if missing
+ * so callers always get a valid document shape (SSR seeds the shell from it),
+ * but that in-memory doc is not written until the user actually creates it or
+ * mutates a cell. An arbitrary opened `.ipynb` must already exist on disk.
  */
 function loadDoc(abs) {
 	let doc = docs.get(abs);
@@ -115,11 +120,9 @@ function loadDoc(abs) {
 		enforceUniqueIds(parsed.cells);
 		doc = { path: abs, cells: parsed.cells, metadata: parsed.metadata };
 		docs.set(abs, doc);
-		if (abs === canonicalPath()) persist(doc);
 	} else if (abs === canonicalPath()) {
 		doc = { path: abs, cells: [starterCell()], metadata: undefined };
 		docs.set(abs, doc);
-		persist(doc);
 	} else {
 		throw new Error('notebook not found: ' + abs);
 	}
@@ -196,6 +199,10 @@ export function getActiveNotebookPath() {
  * (a `.ipynb` name); if a file already exists there it is opened rather than
  * overwritten (never clobbers a user's notebook). New notebooks seed with one
  * empty code cell so the kernel-attached view is immediately usable.
+ *
+ * Creating is a genuine "make this notebook exist" action, so it materializes
+ * the file on disk — including the default notebook, which may exist only in
+ * memory from a bare load (loadDoc no longer persists on open).
  */
 export function createNotebook(nb, originId) {
 	const abs = resolveAbs(nb);
@@ -206,9 +213,11 @@ export function createNotebook(nb, originId) {
 		} else {
 			doc = { path: abs, cells: [newCell('code')], metadata: undefined };
 			docs.set(abs, doc);
-			persist(doc);
 		}
 	}
+	// Write the file if it isn't on disk yet (fresh create, or a default doc that
+	// only existed in memory). An existing file is left untouched.
+	if (!existsSync(abs)) persist(doc);
 	activePath = abs;
 	publish({
 		type: 'notebook:opened',
