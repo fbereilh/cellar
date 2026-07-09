@@ -122,6 +122,23 @@
 		openFilePermanent(canonicalNotebookRel);
 	}
 
+	// Explicitly create (or open) the workspace's default notebook. On a fresh
+	// workspace the file isn't on disk yet (startup never writes one); this POST
+	// materializes it, then opens its live tab. If it already exists it is opened
+	// untouched. We pass our `originId` so the `notebook:opened` broadcast the
+	// server emits is dropped as our own echo (we open the tab here directly).
+	async function newNotebook() {
+		try {
+			await fetch('/api/notebooks', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ path: canonicalNotebookRel, create: true, originId })
+			});
+		} catch {}
+		openNotebook();
+		fsRefreshSignal++; // a new file on disk → refresh the tree + git decorations
+	}
+
 	function closeTab(id) {
 		const idx = tabs.findIndex((t) => t.id === id);
 		tabs = tabs.filter((t) => t.id !== id);
@@ -455,9 +472,9 @@
 				<!-- Empty state: no tab open (first-ever open, or all tabs closed). -->
 				<div class="flex h-full flex-col items-center justify-center gap-4 text-center" data-testid="empty-state">
 					<div class="text-5xl opacity-30">🍷</div>
-					<div class="text-sm text-base-content/50">No open files</div>
-					<p class="max-w-xs text-xs text-base-content/40">Open a file from the sidebar, or open this workspace's notebook.</p>
-					<button class="btn btn-sm btn-primary" onclick={openNotebook} data-testid="empty-open-notebook">Open notebook</button>
+					<div class="text-sm text-base-content/50">No notebook open</div>
+					<p class="max-w-xs text-xs text-base-content/40">Open a file from the sidebar, or create a notebook for this workspace.</p>
+					<button class="btn btn-sm btn-primary" onclick={newNotebook} data-testid="empty-open-notebook">New notebook</button>
 				</div>
 			{/if}
 		</main>
