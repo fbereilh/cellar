@@ -2,7 +2,7 @@
 	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
-	import { computeFolding, headerLevel } from '$lib/headings.js';
+	import { cellIdOfKey, computeFolding, headerLevel } from '$lib/headings.js';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff.js';
 	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte.js';
 
@@ -14,7 +14,18 @@
 	// kernel; the parent serializes runs across notebooks via `busy`.
 	// `gitRefresh` is the shell's `fsRefreshSignal`: a bump means the workspace's
 	// git state may have moved, so re-fetch the HEAD baseline the cells diff against.
-	let { path, active = false, busy = false, theme = 'dim', gitRefresh = 0, onCellsChange, onRunStart, onRunEnd } = $props();
+	let {
+		path,
+		active = false,
+		busy = false,
+		theme = 'dim',
+		gitRefresh = 0,
+		onCellsChange,
+		onFoldsChange, // (path, foldedIds, folding): the sidebar Outline renders from this
+		onRegisterFolds, // (path, toggleFold|null): lets the Outline drive this notebook's folds
+		onRunStart,
+		onRunEnd
+	} = $props();
 
 	let cells = $state([]);
 	let fetching = $state(true); // loading the notebook's cells from the server
@@ -43,14 +54,28 @@
 	let lastSeq = null; // last per-notebook `seq` seen (gap detection → refetch)
 
 	// ---- Collapsible headings ------------------------------------------------
-	// Fold state = the set of markdown-header cell ids whose section is folded.
+	// THE per-notebook fold state: the set of folded heading keys (see
+	// `headings.js` - a key addresses one heading occurrence, since a markdown cell
+	// can hold several headings and each folds its own section). The sidebar
+	// Outline reads and writes this same set through `onFoldsChange` /
+	// `onRegisterFolds`, so the outline's chevrons and the notebook's chevrons are
+	// one control over one state and cannot diverge.
+	//
 	// Kept runtime-only (localStorage keyed by this notebook), never written to
 	// the `.ipynb`, so folding a section produces zero git-diff noise. Folded
 	// cells stay in `cells` (they run/persist normally); we only hide them from
-	// the rendered flow. `computeFolding` decides which cells are hidden and how
-	// many each folded header hides, using the shared header-level logic.
+	// the rendered flow.
 	let foldedIds = $state(new Set());
 	const folding = $derived(computeFolding(cells, foldedIds));
+
+	// Publish the fold state (and let the Outline toggle it) - see `+page.svelte`.
+	$effect(() => {
+		onFoldsChange?.(path, foldedIds, folding);
+	});
+	$effect(() => {
+		onRegisterFolds?.(path, toggleFold);
+		return () => onRegisterFolds?.(path, null);
+	});
 
 	function foldStorageKey() {
 		return canonicalId ? `cellar-folds:${canonicalId}` : null;
@@ -72,16 +97,17 @@
 			localStorage.setItem(key, JSON.stringify([...foldedIds]));
 		} catch {}
 	}
-	function toggleFold(id) {
+	function toggleFold(key) {
 		const next = new Set(foldedIds);
-		if (next.has(id)) next.delete(id);
-		else next.add(id);
+		if (next.has(key)) next.delete(key);
+		else next.add(key);
 		foldedIds = next;
 		saveFolds();
 		// Command mode always acts on the selected cell, so the selection can never
-		// be a cell the user cannot see: a fold that hides it hands it to the header
-		// that swallowed it. (`folding` is derived, so it already reflects `next`.)
-		if (activeId && folding.hidden.has(activeId)) activeId = id;
+		// be a cell the user cannot see: a fold that hides it hands it to the cell
+		// holding the header that swallowed it. (`folding` is derived, so it already
+		// reflects `next`.)
+		if (activeId && folding.hidden.has(activeId)) activeId = cellIdOfKey(key);
 	}
 
 	// ---- Collapsible code editors --------------------------------------------
@@ -239,8 +265,8 @@
 	function revealCell(id) {
 		if (!folding.hidden.has(id)) return;
 		const next = new Set(foldedIds);
-		for (const headerId of foldedIds) {
-			if (computeFolding(cells, new Set([headerId])).hidden.has(id)) next.delete(headerId);
+		for (const key of foldedIds) {
+			if (computeFolding(cells, new Set([key])).hidden.has(id)) next.delete(key);
 		}
 		foldedIds = next;
 		saveFolds();
@@ -847,6 +873,7 @@
 			{keyMode}
 			hidden={folding.hidden}
 			foldedIds={foldedIds}
+			hiddenSegs={folding.segs}
 			hiddenCounts={folding.counts}
 			gitStatus={gitChanges.status}
 			gitRemovedBefore={gitChanges.removedBefore}

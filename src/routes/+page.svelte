@@ -9,6 +9,8 @@
 
 	let { data } = $props();
 
+	const EMPTY_FOLDS = new Set(); // no notebook active → the Outline folds nothing
+
 	const workspace = data.notebook.workspace;
 	const notebookPath = data.notebook.path;
 	const notebookName = notebookPath.split('/').pop();
@@ -26,6 +28,26 @@
 	let notebooksCells = $state({ [canonicalNotebookRel]: data.notebook.cells });
 	function handleCellsChange(path, cells) {
 		notebooksCells[path] = cells;
+	}
+
+	// Collapsible-heading state per open notebook, reported up by each LiveNotebook
+	// (which owns it and persists it). The sidebar Outline renders its chevrons from
+	// exactly this state and toggles it through the notebook's own `toggleFold`, so
+	// outline and notebook are one fold state, not two that must be kept in step.
+	// Assign into the key, never rebuild the map: a spread would *read* this state
+	// inside the reporting effect that writes it, and Svelte would loop forever.
+	let notebooksFolds = $state({}); // path → { foldedIds, folding }
+	function handleFoldsChange(path, foldedIds, folding) {
+		notebooksFolds[path] = { foldedIds, folding };
+	}
+	// Imperative, not reactive: a plain map of path → the notebook's toggleFold.
+	const foldTogglers = new Map();
+	function registerFolds(path, toggle) {
+		if (toggle) foldTogglers.set(path, toggle);
+		else foldTogglers.delete(path);
+	}
+	function toggleActiveFold(key) {
+		if (activeNotebookPath) foldTogglers.get(activeNotebookPath)?.(key);
 	}
 
 	// Single shared kernel → at most one cell runs at a time across ALL notebooks.
@@ -85,6 +107,7 @@
 					: null
 	);
 	const activeCells = $derived((activeNotebookPath && notebooksCells[activeNotebookPath]) || []);
+	const activeFolds = $derived((activeNotebookPath && notebooksFolds[activeNotebookPath]) || null);
 
 	// Notebooks currently open in the shell (the default notebook tab + every
 	// opened `.ipynb`). With the single-shared-kernel model these are exactly the
@@ -296,7 +319,7 @@
 	// Bump to make the sidebar re-read the file tree + git status (after saves).
 	let fsRefreshSignal = $state(0);
 
-	async function scrollToCell(id) {
+	async function scrollToCell(id, foldKey = null) {
 		// Open + focus the notebook the outline currently reflects, then scroll. With
 		// no active notebook the outline and search are empty, so there is no row to
 		// click - but never let a null path mint a tab if one ever gets here.
@@ -308,7 +331,10 @@
 		const els = document.querySelectorAll(`[data-cell-id="${id}"]`);
 		const el = [...els].find((e) => e.offsetParent !== null) ?? els[0];
 		if (!el) return;
-		el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+		// An outline row addresses a heading, and a cell can hold several - scroll to
+		// the heading itself when we know which, but flash the whole cell.
+		const target = (foldKey && el.querySelector(`[data-fold-key="${CSS.escape(foldKey)}"]`)?.closest('[data-testid="heading-row"]')) || el;
+		target.scrollIntoView({ behavior: 'smooth', block: 'center' });
 		el.classList.add('cellar-flash');
 		setTimeout(() => el.classList.remove('cellar-flash'), 1200);
 	}
@@ -455,6 +481,9 @@
 			<div class="shrink-0 border-r border-base-300" style="width: {sidebarWidth}px">
 				<Sidebar
 					cells={activeCells}
+					foldedIds={activeFolds?.foldedIds ?? EMPTY_FOLDS}
+					foldCounts={activeFolds?.folding?.counts ?? {}}
+					onToggleFold={toggleActiveFold}
 					{mcp}
 					kernelInfo={displayKernel}
 					{kernelBusy}
@@ -499,6 +528,8 @@
 						{theme}
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
+						onFoldsChange={handleFoldsChange}
+						onRegisterFolds={registerFolds}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 					/>
@@ -514,6 +545,8 @@
 						{theme}
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
+						onFoldsChange={handleFoldsChange}
+						onRegisterFolds={registerFolds}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 					/>

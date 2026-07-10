@@ -11,8 +11,10 @@
 	import MarkdownIt from 'markdown-it';
 	import DOMPurify from 'dompurify';
 	import { editorThemeExtensions } from '$lib/editorTheme.js';
-	import { headerLevel } from '$lib/headings.js';
+	import { foldKey, splitHeadingSegments } from '$lib/headings.js';
 	import { relativeTime, formatDuration } from '$lib/relativeTime.js';
+
+	const NO_SEGS_HIDDEN = { headings: new Set(), bodies: new Set() };
 
 	let {
 		cell,
@@ -22,8 +24,9 @@
 		active = false,
 		keyMode = 'command', // notebook mode ('command' | 'edit'); only meaningful while `active`
 		dragging = false,
-		folded = false, // this header cell's section is collapsed
-		hiddenCount = 0, // cells hidden by this header while folded (for the hint)
+		foldedIds = new Set(), // fold keys of every collapsed heading in the notebook
+		segHidden = NO_SEGS_HIDDEN, // segment indices of THIS cell an outer fold hides
+		foldCounts = {}, // fold key → whole cells that fold hides (the "N cells hidden" hint)
 		onToggleFold,
 		theme = 'dim',
 		onRun,
@@ -79,8 +82,6 @@
 	}
 
 	const isMarkdown = $derived(cell.cell_type === 'markdown');
-	// A markdown cell whose first non-empty line is a heading can fold its section.
-	const isHeader = $derived(headerLevel(cell) != null);
 
 	// A remote (agent / other-tab) source edit that arrived while the user was
 	// editing this cell, held until they choose to load it (the affordance below).
@@ -98,7 +99,20 @@
 	function renderMarkdown(src) {
 		return DOMPurify.sanitize(md.render(src || ''));
 	}
-	const renderedHtml = $derived(isMarkdown && browser ? renderMarkdown(liveSource) : '');
+	// A markdown cell renders one block per heading segment rather than one blob,
+	// because each heading is independently foldable (a cell may hold several) and
+	// a fold hides the heading's body while leaving the heading itself in view.
+	const hasMarkdown = $derived(isMarkdown && liveSource.trim().length > 0);
+	const segments = $derived(
+		isMarkdown && browser
+			? splitHeadingSegments(liveSource).map((s) => ({
+					...s,
+					key: foldKey(cell.id, s.index),
+					headingHtml: s.level != null ? renderMarkdown(s.heading) : '',
+					bodyHtml: s.body.trim() ? renderMarkdown(s.body) : ''
+				}))
+			: []
+	);
 
 	// Running indicator: only reveal after a short delay so fast cells never
 	// flash it (avoids the flicker the play-button spinner had).
@@ -540,19 +554,6 @@
 				>
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6" /><circle cx="15" cy="6" r="1.6" /><circle cx="9" cy="12" r="1.6" /><circle cx="15" cy="12" r="1.6" /><circle cx="9" cy="18" r="1.6" /><circle cx="15" cy="18" r="1.6" /></svg>
 				</button>
-				{#if isHeader}
-					<button
-						class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-base-content/90"
-						onclick={() => onToggleFold?.(cell.id)}
-						title={folded ? 'Expand section' : 'Collapse section'}
-						aria-label={folded ? 'Expand section' : 'Collapse section'}
-						aria-expanded={!folded}
-						data-testid="fold-toggle"
-						data-folded={folded ? 'true' : undefined}
-					>
-						<svg class="h-3.5 w-3.5 transition-transform {folded ? '-rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
-					</button>
-				{/if}
 				<button
 					class="btn btn-ghost btn-xs btn-square text-success"
 					onclick={() => doRun(false)}
@@ -600,11 +601,6 @@
 								user
 							{/if}
 						</span>
-					</span>
-				{/if}
-				{#if isHeader && folded}
-					<span class="badge badge-ghost badge-sm ml-1.5 gap-1 text-[11px] text-base-content/60" data-testid="fold-hidden-count">
-						{hiddenCount} {hiddenCount === 1 ? 'cell' : 'cells'} hidden
 					</span>
 				{/if}
 			</div>
@@ -655,7 +651,13 @@
 			</div>
 		</div>
 
-		<!-- Rendered markdown (double-click or the edit button to edit) -->
+		<!-- Rendered markdown (double-click or the edit button to edit). Every heading
+		     carries its own fold chevron - a cell may hold several headings, and each
+		     one owns the section that runs until the next same-or-higher heading,
+		     wherever that lives. A folded heading keeps its own line (tinted, with a
+		     hidden-cell count) so a collapsed section reads as collapsed at a glance;
+		     its body and everything under it disappears. `segHidden` is what an OUTER
+		     fold hides inside this cell. -->
 		{#if isMarkdown && mode === 'rendered'}
 			<div
 				class="cellar-md px-4 py-3 text-sm leading-relaxed"
@@ -666,10 +668,46 @@
 				ondblclick={enterEdit}
 				onkeydown={(e) => (e.key === 'Enter' ? enterEdit() : null)}
 			>
-				{#if renderedHtml.trim()}
-					{@html renderedHtml}
+				{#if hasMarkdown}
+					{#each segments as seg (seg.index)}
+						{#if seg.level != null && !segHidden.headings.has(seg.index)}
+							{@const folded = foldedIds.has(seg.key)}
+							{@const hiddenCount = foldCounts[seg.key] ?? 0}
+							<div
+								class="md-heading -mx-1.5 flex items-center gap-1 rounded px-1.5 {folded ? 'bg-base-200/80 ring-1 ring-base-300' : ''}"
+								data-testid="heading-row"
+								data-folded={folded ? 'true' : undefined}
+							>
+								<button
+									class="shrink-0 text-base-content/40 hover:text-base-content"
+									onclick={(e) => {
+										e.stopPropagation();
+										onToggleFold?.(seg.key);
+									}}
+									ondblclick={(e) => e.stopPropagation()}
+									title={folded ? 'Expand section' : 'Collapse section'}
+									aria-label={folded ? 'Expand section' : 'Collapse section'}
+									aria-expanded={!folded}
+									data-testid="fold-toggle"
+									data-fold-key={seg.key}
+									data-folded={folded ? 'true' : undefined}
+								>
+									<svg class="h-3.5 w-3.5 transition-transform {folded ? '-rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+								</button>
+								<div class="min-w-0 flex-1">{@html seg.headingHtml}</div>
+								{#if folded}
+									<span class="shrink-0 whitespace-nowrap rounded bg-base-300/70 px-1.5 py-0.5 text-[11px] font-normal text-base-content/60" data-testid="fold-hidden-count">
+										…{hiddenCount > 0 ? ` ${hiddenCount} ${hiddenCount === 1 ? 'cell' : 'cells'} hidden` : ''}
+									</span>
+								{/if}
+							</div>
+						{/if}
+						{#if seg.bodyHtml && !segHidden.bodies.has(seg.index)}
+							<div class="md-body">{@html seg.bodyHtml}</div>
+						{/if}
+					{/each}
 				{:else}
-					<span class="text-base-content/30">Empty markdown cell — double-click to edit</span>
+					<span class="text-base-content/30">Empty markdown cell - double-click to edit</span>
 				{/if}
 			</div>
 		{/if}
@@ -771,18 +809,34 @@
 	:global(.cellar-md > *:last-child) {
 		margin-bottom: 0;
 	}
+	/* The heading and the body it introduces are separate blocks (each heading is
+	   independently foldable), so the vertical rhythm lives on the wrappers and
+	   the heading elements themselves are flush - that also keeps the fold chevron
+	   centred on the heading's line. */
+	:global(.cellar-md .md-heading) {
+		margin: 0.6em 0 0.25em;
+	}
+	:global(.cellar-md .md-heading:first-child) {
+		margin-top: 0;
+	}
+	:global(.cellar-md .md-body:last-child > *:last-child) {
+		margin-bottom: 0;
+	}
+	:global(.cellar-md .md-heading :is(h1, h2, h3, h4, h5, h6)) {
+		margin: 0;
+	}
 	:global(.cellar-md h1) {
 		font-size: 1.5em;
 		font-weight: 700;
 		margin: 0.5em 0 0.3em;
-		border-bottom: 1px solid #313244;
+		border-bottom: 1px solid var(--color-base-300);
 		padding-bottom: 0.2em;
 	}
 	:global(.cellar-md h2) {
 		font-size: 1.3em;
 		font-weight: 700;
 		margin: 0.5em 0 0.3em;
-		border-bottom: 1px solid #313244;
+		border-bottom: 1px solid var(--color-base-300);
 		padding-bottom: 0.2em;
 	}
 	:global(.cellar-md h3) {
@@ -807,7 +861,7 @@
 		margin: 0.2em 0;
 	}
 	:global(.cellar-md a) {
-		color: #89b4fa;
+		color: var(--color-primary);
 		text-decoration: underline;
 	}
 	:global(.cellar-md code) {
@@ -818,7 +872,7 @@
 		border-radius: 0.25em;
 	}
 	:global(.cellar-md pre) {
-		background: #11111b;
+		background: var(--color-base-200);
 		padding: 0.75em 1em;
 		border-radius: 0.4em;
 		overflow-x: auto;
@@ -829,9 +883,9 @@
 		padding: 0;
 	}
 	:global(.cellar-md blockquote) {
-		border-left: 3px solid #45475a;
+		border-left: 3px solid var(--color-base-300);
 		padding-left: 1em;
-		color: #a6adc8;
+		color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
 		margin: 0.6em 0;
 	}
 	:global(.cellar-md table) {
@@ -840,7 +894,7 @@
 	}
 	:global(.cellar-md th),
 	:global(.cellar-md td) {
-		border: 1px solid #45475a;
+		border: 1px solid var(--color-base-300);
 		padding: 0.3em 0.6em;
 	}
 </style>

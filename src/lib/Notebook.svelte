@@ -1,6 +1,8 @@
 <script>
 	import Cell from '$lib/Cell.svelte';
 
+	const NO_SEGS_HIDDEN = { headings: new Set(), bodies: new Set() };
+
 	// The shell owns the cell array + all cell operations (so the sidebar's
 	// outline/search/inspector can read the same live state); this component is
 	// the pure notebook renderer.
@@ -11,8 +13,9 @@
 		keyMode = 'command', // 'command' | 'edit' (Jupyter-style modal keyboard)
 		theme = 'dim',
 		hidden = new Set(), // cell ids hidden because a folded heading collapsed their section
-		foldedIds = new Set(), // markdown-header cell ids whose section is folded
-		hiddenCounts = {}, // folded-header cell id → number of cells it hides
+		foldedIds = new Set(), // fold keys of the headings whose section is folded
+		hiddenSegs = new Map(), // cell id → segment indices an outer fold hides inside it
+		hiddenCounts = {}, // fold key → number of whole cells that heading hides
 		gitStatus = {}, // cell id → 'added' | 'modified' | 'moved' (vs git HEAD)
 		gitRemovedBefore = {}, // cell id → cells deleted from HEAD immediately above it
 		gitRemovedAtEnd = 0, // cells deleted from the end of HEAD's notebook
@@ -154,8 +157,9 @@
 					active={activeId === cell.id}
 					{keyMode}
 					dragging={dragId === cell.id}
-					folded={foldedIds.has(cell.id)}
-					hiddenCount={hiddenCounts[cell.id] ?? 0}
+					{foldedIds}
+					segHidden={hiddenSegs.get(cell.id) ?? NO_SEGS_HIDDEN}
+					foldCounts={hiddenCounts}
 					onToggleFold={onToggleFold}
 					{theme}
 					onRun={onRun}
