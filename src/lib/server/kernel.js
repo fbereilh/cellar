@@ -71,10 +71,90 @@ const STARTUP_CODE = [
 	'    pass'
 ].join('\n');
 
-async function initKernel(kernel) {
+/**
+ * Kernel startup injection: register a Cellar display formatter for pandas
+ * DataFrame/Series that emits a bounded, structured payload under our own
+ * mimetype `application/vnd.cellar.dataframe+json` — column names + dtypes, a
+ * capped page of rows, and the true row/column counts. The frontend renders that
+ * payload as an interactive data grid (sort / filter / paginate) instead of the
+ * static text/HTML repr; a bare `df` in a cell "just works", like pandas'
+ * `_repr_html_` but ours.
+ *
+ * The payload is bounded (MAX_ROWS × MAX_COLS) so a million-row DataFrame never
+ * lands in the output (nor the DOM); the grid shows "first N of TOTAL". Values
+ * are serialized with pandas' own `to_json(orient='split')` (deterministic —
+ * NaN→null, dates→ISO, numpy scalars→native, anything else via `default_handler`)
+ * so an identical re-run yields an identical payload. Cellar's clean-on-save
+ * strips this mimetype from the persisted `.ipynb`, so it never bloats the file
+ * or dirties git; it is a purely live render of the output. pandas' text/plain
+ * and text/html reprs are untouched, so a bare `df` degrades gracefully anywhere
+ * the mimetype isn't understood.
+ *
+ * Spark DataFrames are deliberately NOT auto-collected: a bare `df` must not
+ * trigger a hidden distributed job. Use `.toPandas()` (or the Databricks table
+ * preview, which already does `.limit(N).toPandas()`) to get the grid.
+ *
+ * Guarded end-to-end: no pandas, an old IPython, or any failure is a silent
+ * no-op. Must run on every fresh start AND after a restart (which drops the
+ * registration along with the namespace).
+ */
+const DATAFRAME_FORMATTER_CODE = [
+	'def _cellar_register_df_formatter():',
+	'    try:',
+	'        import json as _json',
+	'        from IPython.core.formatters import BaseFormatter',
+	'        from traitlets import Unicode, ObjectName',
+	'    except Exception:',
+	'        return',
+	'    _ip = get_ipython()',
+	'    if _ip is None:',
+	'        return',
+	"    _MIME = 'application/vnd.cellar.dataframe+json'",
+	'    _MAX_ROWS = 500',
+	'    _MAX_COLS = 100',
+	'    def _payload(_df):',
+	'        _total_rows = int(_df.shape[0])',
+	'        _total_cols = int(_df.shape[1])',
+	'        _sub = _df.iloc[:_MAX_ROWS, :_MAX_COLS]',
+	"        _split = _json.loads(_sub.to_json(orient='split', date_format='iso', default_handler=str))",
+	'        try:',
+	'            _idx_name = None if _sub.index.name is None else str(_sub.index.name)',
+	'        except Exception:',
+	'            _idx_name = None',
+	'        return {',
+	"            'columns': [str(_c) for _c in _sub.columns],",
+	"            'dtypes': [str(_t) for _t in _sub.dtypes],",
+	"            'index': _split.get('index', []),",
+	"            'index_name': _idx_name,",
+	"            'data': _split.get('data', []),",
+	"            'total_rows': _total_rows,",
+	"            'total_cols': _total_cols,",
+	"            'shown_rows': int(_sub.shape[0]),",
+	"            'shown_cols': int(_sub.shape[1]),",
+	"            'truncated_rows': _total_rows > _MAX_ROWS,",
+	"            'truncated_cols': _total_cols > _MAX_COLS,",
+	'        }',
+	'    try:',
+	'        _fmts = _ip.display_formatter.formatters',
+	'        if _MIME not in _fmts:',
+	'            class _CellarDFFormatter(BaseFormatter):',
+	'                format_type = Unicode(_MIME)',
+	"                print_method = ObjectName('_repr_cellar_df_')",
+	'                _return_type = (dict, str)',
+	'            _fmts[_MIME] = _CellarDFFormatter(parent=_ip.display_formatter)',
+	'        import pandas as _pd',
+	'        _fmts[_MIME].for_type(_pd.DataFrame, _payload)',
+	'        _fmts[_MIME].for_type(_pd.Series, lambda _s: _payload(_s.to_frame()))',
+	'    except Exception:',
+	'        pass',
+	'_cellar_register_df_formatter()',
+	'del _cellar_register_df_formatter'
+].join('\n');
+
+async function runSilent(kernel, code) {
 	try {
 		const future = kernel.requestExecute({
-			code: STARTUP_CODE,
+			code,
 			silent: true,
 			store_history: false,
 			stop_on_error: false
@@ -83,6 +163,11 @@ async function initKernel(kernel) {
 	} catch {
 		// A failed startup injection must never break kernel bring-up.
 	}
+}
+
+async function initKernel(kernel) {
+	await runSilent(kernel, STARTUP_CODE);
+	await runSilent(kernel, DATAFRAME_FORMATTER_CODE);
 }
 
 /** Start (or reuse) the single kernel. */

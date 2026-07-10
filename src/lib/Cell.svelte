@@ -11,6 +11,7 @@
 	import MarkdownIt from 'markdown-it';
 	import DOMPurify from 'dompurify';
 	import { EDITOR_THEME } from '$lib/editorTheme.js';
+	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
 	import { foldKey, splitHeadingSegments } from '$lib/headings.js';
 	import { isImportsCell } from '$lib/importsRole.js';
 	import { relativeTime, formatDuration } from '$lib/relativeTime.js';
@@ -214,6 +215,13 @@
 			case 'execute_result':
 			case 'display_data': {
 				const d = o.data || {};
+				// Prefer Cellar's structured DataFrame payload: a pandas DataFrame emits
+				// it (see kernel.js) alongside its text/plain + text/html reprs, and we
+				// render it as an interactive grid instead of the static repr.
+				const df = d['application/vnd.cellar.dataframe+json'];
+				if (df) {
+					return { tone: 'result', dataframe: df, segments: null };
+				}
 				// Prefer a rich image over the text/plain repr: a matplotlib figure
 				// emits BOTH an image/png and its `<Figure … with N Axes>` text repr,
 				// and (like Jupyter) we show the image, not the placeholder text.
@@ -248,11 +256,16 @@
 	const SCROLL_THRESHOLD = 360; // px of output beyond which we contract by default
 	let outputInner = $state(null);
 	let outputTall = $state(false);
+	// The DataFrame grid manages its own fixed height + scroll, so it must not be
+	// wrapped in the outer output-scroll box (that would double-scroll and clip the
+	// grid's pagination footer). When a grid is present, skip auto-contraction and
+	// hide the toggle entirely.
+	const hasDataframe = $derived(outputs.some((o) => o.dataframe));
 	const explicitScrolled = $derived(cell.metadata?.cellar?.output_scrolled);
-	const scrolled = $derived(explicitScrolled ?? outputTall);
+	const scrolled = $derived(hasDataframe ? false : (explicitScrolled ?? outputTall));
 	$effect(() => {
 		cell.outputs; // re-measure whenever outputs change
-		if (outputInner) outputTall = outputInner.scrollHeight > SCROLL_THRESHOLD;
+		if (outputInner) outputTall = !hasDataframe && outputInner.scrollHeight > SCROLL_THRESHOLD;
 	});
 	function toggleScrolled() {
 		onSetScrolled?.(cell.id, !scrolled);
@@ -822,7 +835,9 @@
 		<!-- Output (code cells only) -->
 		{#if !isMarkdown && outputs.length}
 			<div class="relative border-t border-base-300 bg-(--cellar-surface-output)" data-testid="output">
-				<!-- Scroll-outputs toggle (Jupyter "Enable Scrolling for Outputs"). -->
+				<!-- Scroll-outputs toggle (Jupyter "Enable Scrolling for Outputs"). The
+				     DataFrame grid owns its own scroll, so the toggle is hidden for it. -->
+				{#if !hasDataframe}
 				<button
 					class="btn btn-ghost btn-xs absolute right-1 top-1 z-10 h-5 min-h-0 gap-1 px-1.5 text-[10px] font-normal text-base-content/40 hover:text-base-content/80"
 					onclick={toggleScrolled}
@@ -838,10 +853,15 @@
 						scroll
 					{/if}
 				</button>
+				{/if}
 				<div class="{scrolled ? 'max-h-[22rem] overflow-y-auto' : ''}" data-testid="output-scroll" data-scrolled={scrolled ? 'true' : undefined}>
 					<div bind:this={outputInner} class="space-y-0.5 py-2">
 						{#each outputs as o}
-							{#if o.image}
+							{#if o.dataframe}
+								<div class="px-3 py-1" data-testid="output-dataframe">
+									<DataFrameGrid payload={o.dataframe} />
+								</div>
+							{:else if o.image}
 								<img
 									class="max-w-full px-3 py-1"
 									src={o.image}

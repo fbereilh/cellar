@@ -25,6 +25,14 @@ export const ALLOWED_NB_METADATA = ['kernelspec', 'cellar'];
 
 const ADDRESS_RE = /(<[^<>]*?) at 0x[0-9a-fA-F]+(?=[>\s])/g;
 
+/**
+ * Cellar's live-only DataFrame grid payload (see kernel.js). It is a render of
+ * the output, not part of it: kept in the in-memory doc so open tabs show the
+ * grid, but stripped here so it never bloats the persisted `.ipynb` or dirties
+ * git. pandas' text/plain + text/html reprs remain as the on-disk fallback.
+ */
+const DATAFRAME_MIME = 'application/vnd.cellar.dataframe+json';
+
 /** Scrub `<... at 0x…>`-style memory addresses from a string or list of strings. */
 export function scrubAddresses(text) {
 	if (Array.isArray(text)) return text.map(scrubAddresses);
@@ -49,6 +57,11 @@ function cleanOutput(output) {
 	// text/plain reprs inside execute_result / display_data
 	if (output.data && 'text/plain' in output.data) {
 		output.data['text/plain'] = scrubAddresses(output.data['text/plain']);
+	}
+	// Drop the live-only DataFrame grid payload — a render of the output, never
+	// persisted (keeps the .ipynb git-clean; pandas' own reprs stay as fallback).
+	if (output.data && DATAFRAME_MIME in output.data) {
+		delete output.data[DATAFRAME_MIME];
 	}
 	return output;
 }
