@@ -1,0 +1,119 @@
+/**
+ * Client-side accessor for the per-project UI-preference store.
+ *
+ * The server owns the preferences (`$lib/server/ui-state.js`, a JSON file under
+ * the workspace's `.cellar/`). They are delivered to the browser via SSR
+ * (`+page.server.js` → `data.uiState`) and handed here through `hydrateUiState`
+ * during `+page.svelte`'s init, so every consumer reads them **synchronously**
+ * from the in-memory `cache` with no fetch and no flash - the fix for the
+ * dynamic-port bug where a per-origin `localStorage` reset every preference on
+ * each relaunch.
+ *
+ * Reads are `getUi(key, fallback)`; writes are `setUi(key, value)`, which update
+ * the cache immediately and PUT back to the server, debounced so a rapid burst
+ * (dragging a resizer) coalesces into one request. The server store is the
+ * cross-launch source of truth; there is deliberately no `localStorage` mirror.
+ */
+
+import { browser } from '$app/environment';
+
+const FLUSH_DEBOUNCE_MS = 300;
+/** localStorage keys we one-time migrate; everything under this prefix except… */
+const LS_PREFIX = 'cellar-';
+/**
+ * …the keys deliberately left on `localStorage`. Keybinding rebindings are a
+ * global user preference (about the person, not this project's layout), so they
+ * do not belong in the per-project `.cellar/` store - see the PR notes.
+ */
+const LS_SKIP = new Set(['cellar-shortcuts']);
+
+/** @type {Record<string, unknown>} */
+let cache = {};
+let hydrated = false;
+
+/** @type {Record<string, unknown>} */
+let pending = {};
+/** @type {ReturnType<typeof setTimeout> | null} */
+let flushTimer = null;
+
+/**
+ * Seed the cache from the SSR-provided store, then one-time migrate any prefs a
+ * returning same-port user still has in `localStorage`. Called once from
+ * `+page.svelte` before any child reads a preference.
+ */
+export function hydrateUiState(initial) {
+	if (initial && typeof initial === 'object' && !Array.isArray(initial)) {
+		cache = { ...initial };
+	}
+	hydrated = true;
+	if (browser) {
+		migrateFromLocalStorage();
+		// A preference changed just before the tab closes must still reach the
+		// server; flush synchronously past the debounce window.
+		window.addEventListener('pagehide', () => flushNow(true));
+	}
+}
+
+/** Current value for `key`, or `fallback` if unset / before hydration. */
+export function getUi(key, fallback) {
+	return hydrated && Object.prototype.hasOwnProperty.call(cache, key) ? cache[key] : fallback;
+}
+
+/** Set `key` to `value` (pass `null` to delete) and schedule a server write. */
+export function setUi(key, value) {
+	if (value === null) delete cache[key];
+	else cache[key] = value;
+	pending[key] = value;
+	scheduleFlush();
+}
+
+/**
+ * The server store is the cross-launch source of truth, so a value that only
+ * exists in a returning same-port user's `localStorage` is seeded into it once.
+ * A key the server already knows always wins (it is never overwritten).
+ */
+function migrateFromLocalStorage() {
+	let seeded = false;
+	try {
+		for (let i = 0; i < localStorage.length; i++) {
+			const key = localStorage.key(i);
+			if (!key || !key.startsWith(LS_PREFIX) || LS_SKIP.has(key)) continue;
+			if (Object.prototype.hasOwnProperty.call(cache, key)) continue;
+			const raw = localStorage.getItem(key);
+			if (raw == null) continue;
+			let value;
+			try {
+				value = JSON.parse(raw);
+			} catch {
+				value = raw; // legacy non-JSON value (e.g. the raw theme name)
+			}
+			cache[key] = value;
+			pending[key] = value;
+			seeded = true;
+		}
+	} catch {}
+	if (seeded) scheduleFlush();
+}
+
+function scheduleFlush() {
+	if (!browser || flushTimer) return;
+	flushTimer = setTimeout(() => flushNow(false), FLUSH_DEBOUNCE_MS);
+}
+
+function flushNow(keepalive) {
+	if (flushTimer) {
+		clearTimeout(flushTimer);
+		flushTimer = null;
+	}
+	const body = pending;
+	if (Object.keys(body).length === 0) return;
+	pending = {};
+	try {
+		fetch('/api/ui-state', {
+			method: 'PUT',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(body),
+			keepalive
+		}).catch(() => {});
+	} catch {}
+}
