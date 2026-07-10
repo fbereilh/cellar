@@ -6,8 +6,14 @@
 	import FileTab from '$lib/FileTab.svelte';
 	import Settings from '$lib/Settings.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
+	import { hydrateUiState, getUi, setUi } from '$lib/uiState.js';
 
 	let { data } = $props();
+
+	// Seed the per-project UI-preference cache from SSR before any child reads a
+	// preference (this runs during init, ahead of every onMount). Port-independent:
+	// this is what survives the dynamic app port that empties `localStorage`.
+	hydrateUiState(data.uiState);
 
 	const EMPTY_FOLDS = new Set(); // no notebook active → the Outline folds nothing
 
@@ -289,17 +295,13 @@
 	// ---- Tab session memory (per workspace) ---------------------------------
 	const TABS_KEY = 'cellar-tabs:' + workspace;
 	function restoreTabs() {
-		let saved = null;
-		try {
-			saved = localStorage.getItem(TABS_KEY);
-		} catch {}
-		if (saved == null) {
+		const parsed = getUi(TABS_KEY, null);
+		if (parsed == null) {
 			// First-ever open of this workspace → empty state, no tabs.
 			tabs = [];
 			activeTabId = null;
 		} else {
 			try {
-				const parsed = JSON.parse(saved);
 				tabs = (parsed.tabs ?? []).map((t) => makeTab(t.path, !!t.preview));
 				const ids = new Set(tabs.map((t) => t.id));
 				activeTabId = ids.has(parsed.activeTabId) ? parsed.activeTabId : (tabs[0]?.id ?? null);
@@ -312,13 +314,10 @@
 	}
 	$effect(() => {
 		if (!tabsRestored) return;
-		const snapshot = JSON.stringify({
+		setUi(TABS_KEY, {
 			tabs: tabs.map((t) => ({ path: t.path, preview: t.preview })),
 			activeTabId
 		});
-		try {
-			localStorage.setItem(TABS_KEY, snapshot);
-		} catch {}
 	});
 
 	// ---- Resizable sidebar (persisted width) --------------------------------
@@ -340,9 +339,7 @@
 			resizing = false;
 			window.removeEventListener('pointermove', onMove);
 			window.removeEventListener('pointerup', onUp);
-			try {
-				localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
-			} catch {}
+			setUi(SIDEBAR_WIDTH_KEY, sidebarWidth);
 		}
 		window.addEventListener('pointermove', onMove);
 		window.addEventListener('pointerup', onUp);
@@ -496,26 +493,16 @@
 			root.dataset.theme = t;
 			root.dataset.colorScheme = getComputedStyle(root).colorScheme === 'light' ? 'light' : 'dark';
 		}
-		try {
-			localStorage.setItem('cellar-theme', t);
-		} catch {}
+		setUi('cellar-theme', t);
 	}
 
 	onMount(() => {
-		const saved = (() => {
-			try {
-				return localStorage.getItem('cellar-theme');
-			} catch {
-				return null;
-			}
-		})();
+		const saved = getUi('cellar-theme', null);
 		applyTheme(saved || document.documentElement.dataset.theme || 'dim');
 		// Restore per-workspace tab session + sidebar width.
 		restoreTabs();
-		try {
-			const w = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
-			if (w) sidebarWidth = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, w));
-		} catch {}
+		const w = Number(getUi(SIDEBAR_WIDTH_KEY, 0));
+		if (w) sidebarWidth = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, w));
 		// Restore live kernel + variables after a reload — but only inspect if a
 		// kernel already exists, so a fresh page load never boots one on its own.
 		refreshKernel().then(() => {

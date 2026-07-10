@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { getDefaultNotebook } from '$lib/server/notebook.js';
 import { workspaceRoot } from '$lib/server/fstree.js';
 import { mcpConfigPath } from '$lib/server/runtime.js';
+import { getUiState } from '$lib/server/ui-state.js';
 
 /**
  * Whether `<workspace>/.mcp.json` currently registers the `cellar` stdio server.
@@ -30,6 +31,10 @@ export function load() {
 	const mcpPort = Number(process.env.CELLAR_MCP_PORT || 39587);
 	return {
 		notebook: getDefaultNotebook(),
+		// Per-project UI preferences, port-independent (see `$lib/server/ui-state.js`).
+		// Delivered via SSR so the client seeds them synchronously - no flash, and
+		// they survive the dynamic app port that resets `localStorage` each launch.
+		uiState: getUiState(),
 		mcp: {
 			port: mcpPort,
 			url: `http://127.0.0.1:${mcpPort}/mcp`,

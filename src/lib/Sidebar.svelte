@@ -6,6 +6,7 @@
 	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections.js';
 	import { outlineRows as buildOutlineRows } from '$lib/headings.js';
+	import { getUi, setUi } from '$lib/uiState.js';
 
 	let {
 		cells,
@@ -65,19 +66,15 @@
 	const ORDER_KEY = 'cellar-sidebar-order';
 	let sectionOrder = $state([...DEFAULT_SECTION_ORDER]);
 
+	// Persisted in the per-project UI-state store (port-independent), not
+	// `localStorage` - see `$lib/uiState.js`.
 	function persist(key, value) {
-		try {
-			localStorage.setItem(key, JSON.stringify(value));
-		} catch {}
+		setUi(key, value);
 	}
 	onMount(() => {
-		try {
-			const savedOpen = JSON.parse(localStorage.getItem(OPEN_KEY) || 'null');
-			if (savedOpen) open = { ...open, ...savedOpen };
-		} catch {}
-		try {
-			sectionOrder = reconcileSectionOrder(JSON.parse(localStorage.getItem(ORDER_KEY) || 'null'));
-		} catch {}
+		const savedOpen = getUi(OPEN_KEY, null);
+		if (savedOpen && typeof savedOpen === 'object') open = { ...open, ...savedOpen };
+		sectionOrder = reconcileSectionOrder(getUi(ORDER_KEY, null));
 	});
 
 	// Native HTML5 drag-and-drop to reorder sections (no external library).

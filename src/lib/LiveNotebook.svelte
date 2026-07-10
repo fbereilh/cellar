@@ -7,6 +7,7 @@
 	import { cellClipboard } from '$lib/cellClipboard.js';
 	import { clampMoveIndex } from '$lib/importsRole.js';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte.js';
+	import { getUi, setUi } from '$lib/uiState.js';
 
 	// A live, kernel-attached notebook document addressed by its workspace path.
 	// Owns its own cell array + all cell operations (every request carries
@@ -97,20 +98,14 @@
 	}
 	function loadFolds() {
 		const key = foldStorageKey();
-		if (!key || typeof localStorage === 'undefined') return;
-		try {
-			const raw = localStorage.getItem(key);
-			foldedIds = new Set(raw ? JSON.parse(raw) : []);
-		} catch {
-			foldedIds = new Set();
-		}
+		if (!key) return;
+		const saved = getUi(key, null);
+		foldedIds = new Set(Array.isArray(saved) ? saved : []);
 	}
 	function saveFolds() {
 		const key = foldStorageKey();
-		if (!key || typeof localStorage === 'undefined') return;
-		try {
-			localStorage.setItem(key, JSON.stringify([...foldedIds]));
-		} catch {}
+		if (!key) return;
+		setUi(key, [...foldedIds]);
 	}
 	function toggleFold(key) {
 		const next = new Set(foldedIds);
@@ -140,20 +135,14 @@
 	}
 	function loadEditorCollapsed() {
 		const key = editorCollapsedKey();
-		if (!key || typeof localStorage === 'undefined') return;
-		try {
-			const raw = localStorage.getItem(key);
-			editorCollapsed = raw ? JSON.parse(raw) : {};
-		} catch {
-			editorCollapsed = {};
-		}
+		if (!key) return;
+		const saved = getUi(key, null);
+		editorCollapsed = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
 	}
 	function saveEditorCollapsed() {
 		const key = editorCollapsedKey();
-		if (!key || typeof localStorage === 'undefined') return;
-		try {
-			localStorage.setItem(key, JSON.stringify(editorCollapsed));
-		} catch {}
+		if (!key) return;
+		setUi(key, editorCollapsed);
 	}
 	function setEditorCollapsed(id, collapsed) {
 		const next = { ...editorCollapsed };
