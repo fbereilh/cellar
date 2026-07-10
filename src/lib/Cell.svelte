@@ -35,6 +35,7 @@
 		onToggleFold,
 		onRun,
 		onRunAdvance,
+		onInterrupt, // interrupt the shared kernel (reuses the Kernels-section handler)
 		onClear,
 		onDelete,
 		onMove,
@@ -756,11 +757,23 @@
 				</button>
 				<!-- Far-right slot: running indicator, queue position (code), or the
 				     cell-type toggle. -->
-				<span class="ml-1 flex min-w-[76px] justify-end">
+				<span class="ml-1 flex min-w-[76px] items-center justify-end gap-1">
 					{#if showRunning}
 						<span class="flex items-center gap-1 text-[11px] text-warning" data-testid="running-indicator">
 							<span class="loading loading-spinner loading-xs"></span> running
 						</span>
+						<!-- Stop control: interrupts the one shared kernel (KeyboardInterrupt),
+						     which halts the currently-executing cell. Same handler as the
+						     Kernels sidebar's Interrupt button; shown only while running. -->
+						<button
+							class="btn btn-ghost btn-xs h-5 min-h-0 w-5 p-0 text-error hover:bg-error/10 hover:text-error"
+							onclick={() => onInterrupt?.()}
+							title="Interrupt kernel"
+							aria-label="Interrupt kernel"
+							data-testid="cell-interrupt"
+						>
+							<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
+						</button>
 					{:else if isQueued}
 						<!-- Two-tone, like the run-meta badge beside it: the clock carries the
 						     kernel's `warning` hue (tying it to the running indicator), the label

@@ -883,6 +883,7 @@
 						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
+						onInterruptKernel={interruptKernel}
 					/>
 				</div>
 			{/if}
@@ -899,6 +900,7 @@
 						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
+						onInterruptKernel={interruptKernel}
 					/>
 				</div>
 			{/each}

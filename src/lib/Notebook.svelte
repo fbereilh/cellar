@@ -24,6 +24,7 @@
 		onToggleFold,
 		onRun,
 		onRunAdvance,
+		onInterrupt,
 		onClear,
 		onDelete,
 		onMove,
@@ -179,6 +180,7 @@
 						onToggleFold={onToggleFold}
 						onRun={onRun}
 						onRunAdvance={onRunAdvance}
+						onInterrupt={onInterrupt}
 						onClear={onClear}
 						onDelete={onDelete}
 						onMove={onMove}
