@@ -149,11 +149,20 @@ export async function createVenv(venvPath, { python, stdio = 'pipe' } = {}) {
 	return r;
 }
 
-/** Install `ipykernel` into the given interpreter's environment via `uv pip`. */
-export async function installIpykernel(python, { stdio = 'pipe' } = {}) {
-	const r = await run('uv', ['pip', 'install', '--python', python, 'ipykernel'], { stdio });
-	if (r.code !== 0) throw new Error(`installing ipykernel into ${python} failed:\n${r.out}`);
+/**
+ * Install packages into the given interpreter's environment via `uv pip`.
+ * The one place Cellar adds anything to a project venv - `ipykernel` at bind
+ * time, the Databricks packages when the user asks for them.
+ */
+export async function installPackages(python, packages, { stdio = 'pipe' } = {}) {
+	const r = await run('uv', ['pip', 'install', '--python', python, ...packages], { stdio });
+	if (r.code !== 0) throw new Error(`installing ${packages.join(', ')} into ${python} failed:\n${r.out}`);
 	return r;
+}
+
+/** Install `ipykernel` into the given interpreter's environment via `uv pip`. */
+export async function installIpykernel(python, opts = {}) {
+	return installPackages(python, ['ipykernel'], opts);
 }
 
 /** Probe for ipykernel; install only if missing. Returns `{ installed }`. */

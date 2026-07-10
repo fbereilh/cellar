@@ -8,7 +8,7 @@
  */
 
 /** Section keys in the order they ship. `sectionBody` in Sidebar.svelte renders exactly these. */
-export const DEFAULT_SECTION_ORDER = Object.freeze(['files', 'kernels', 'agent', 'outline', 'vars', 'search']);
+export const DEFAULT_SECTION_ORDER = Object.freeze(['files', 'kernels', 'databricks', 'agent', 'outline', 'vars', 'search']);
 
 /**
  * Merge a persisted order with the defaults.

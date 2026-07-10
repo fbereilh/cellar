@@ -50,6 +50,35 @@
 		if (activeNotebookPath) foldTogglers.get(activeNotebookPath)?.(key);
 	}
 
+	// Imperative handles from each mounted LiveNotebook, same shape as `foldTogglers`.
+	// The Databricks data browser reaches the active notebook through this.
+	const notebookApis = new Map();
+	function registerNotebookApi(path, api) {
+		if (api) notebookApis.set(path, api);
+		else notebookApis.delete(path);
+	}
+
+	/**
+	 * Append a code cell to the active notebook and run it - the sidebar's
+	 * point-and-click table preview. Focus the notebook's tab first: a hidden pane
+	 * is `display:none`, so it has no geometry and the new cell could not be
+	 * scrolled into view.
+	 */
+	async function insertAndRunInActiveNotebook(code) {
+		const path = activeNotebookPath;
+		const api = path && notebookApis.get(path);
+		if (!api) return; // no notebook open (or one still mounting)
+		if (path === canonicalNotebookRel) openNotebook();
+		else openFilePermanent(path);
+		await tick();
+		await api.insertAndRunCode(code);
+	}
+
+	// Null disables the sidebar's preview affordance rather than minting a tab
+	// behind the user's back. `notebookApis` is a plain Map (not reactive), so the
+	// gate reads `activeNotebookPath`, which is - the api is looked up at call time.
+	const canInsertAndRun = $derived(activeNotebookPath ? insertAndRunInActiveNotebook : null);
+
 	// Single shared kernel → at most one cell runs at a time across ALL notebooks.
 	// Serializing them is the SERVER's job (`run-queue.js`): a run requested while
 	// the kernel is busy is queued, not dropped, so this is no longer a gate — it
@@ -375,6 +404,16 @@
 		} catch {}
 	}
 
+	/**
+	 * A Databricks connect/disconnect ran code in the kernel: it may have booted it,
+	 * and it binds or unbinds `spark` + `w`. Refresh both sidebar views of the
+	 * kernel so the badge and the variable inspector agree with what just happened.
+	 */
+	function onDatabricksSessionChange() {
+		refreshKernel();
+		refreshVariables();
+	}
+
 	async function refreshVariables() {
 		varsLoading = true;
 		varsError = '';
@@ -514,6 +553,8 @@
 					onRefreshKernel={refreshKernel}
 					onInterruptKernel={interruptKernel}
 					onRestartKernel={restartKernel}
+					onInsertAndRun={canInsertAndRun}
+					onDatabricksSessionChange={onDatabricksSessionChange}
 					onOpenFile={openFile}
 					onOpenFilePermanent={openFilePermanent}
 					onFocusNotebook={selectTab}
@@ -545,6 +586,7 @@
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
 						onRegisterFolds={registerFolds}
+						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 					/>
@@ -560,6 +602,7 @@
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
 						onRegisterFolds={registerFolds}
+						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 					/>

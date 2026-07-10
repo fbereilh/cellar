@@ -205,6 +205,59 @@ into imports/functions/classes/variables, `read_cell`/`read_cells`,
 call, the preferred write-and-execute flow; `run_cell`, `run_cells`, `run_all`,
 `run_range`).
 
+## Databricks
+
+The sidebar's **Databricks** section replaces the connection boilerplate: pick a
+profile, pick a cluster, click Connect, and `spark` (a Databricks Connect
+session) plus `w` (a `databricks.sdk.WorkspaceClient`) are bound in the kernel
+namespace, ready for `spark.read.table(...)` in any cell.
+
+**Auth is the SDK's own profile auth**, nothing else. `WorkspaceClient(profile=…)`
+and `DatabricksSession.builder.profile(…)` read `~/.databrickscfg` directly (PAT
+or OAuth), so Cellar needs no `databricks` CLI on `PATH` and never looks for the
+VS Code extension's bundled binary. Set `DATABRICKS_CONFIG_FILE` to move the
+config; every other `DATABRICKS_*` / `SPARK_CONNECT_*` variable is scrubbed
+before a connection is built, so a stale shell export cannot silently win.
+
+Two runtimes, split by job (`src/lib/server/databricks.js`):
+
+- **Listing** (profiles, clusters, catalogs, schemas, tables) runs *server-side*
+  in a short-lived subprocess of the project venv's python, behind
+  `/api/databricks/*`. Metadata reads never occupy the single shared kernel.
+- **The session** (`spark`, `w`) is built *inside the kernel*, because that is
+  the only place your cells can reach it.
+
+Connection state is scoped to the kernel-session epoch, so restarting the kernel
+correctly reports the session as gone rather than leaving `spark` looking alive.
+
+**Setup.** `databricks-sdk` and `databricks-connect` go in the *project* venv
+(the kernel's own environment). The section installs them for you with `uv`, or:
+
+```bash
+uv pip install --python .venv/bin/python databricks-sdk 'databricks-connect==16.1.*'
+```
+
+Pin `databricks-connect` to your cluster's Databricks Runtime major.minor;
+unpinned installs the latest, which only talks to the latest DBR.
+
+**Unity Catalog browser.** Once connected, a lazy `catalog > schema > table` tree
+appears. Clicking a table appends and runs a cell holding
+`spark.read.table("catalog.schema.table").limit(N).toPandas()` — point-and-click,
+but what lands in the notebook is ordinary code you can edit, re-run, and commit.
+
+**Agents see it too.** `kernel_state` and `get_notebook_map` carry a `databricks`
+block (connected? which profile/cluster? `spark` and `w` are bound), and the MCP
+server's house-style instructions tell an agent to use that session rather than
+write its own boilerplate. Five read-only tools mirror the UI browser:
+`databricks_status`, `databricks_list_catalogs`, `databricks_list_schemas`,
+`databricks_list_tables`, and `databricks_preview_table` (reads rows through the
+kernel's `spark` without touching the notebook). Connecting stays a human action:
+every tool fails with `not_connected` and tells the agent to ask you.
+
+Every unconfigured path degrades to a friendly panel rather than a crash: no
+`~/.databrickscfg`, no packages, no `uv`, no bound interpreter, an unreachable
+workspace, a permission-denied catalog.
+
 ## What was verified
 
 Driven end-to-end in a real browser (and the saved `.ipynb` inspected):

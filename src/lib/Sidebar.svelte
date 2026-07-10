@@ -1,5 +1,6 @@
 <script>
 	import { onMount, setContext } from 'svelte';
+	import Databricks from '$lib/Databricks.svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
@@ -25,6 +26,10 @@
 		onRefreshKernel,
 		onInterruptKernel,
 		onRestartKernel,
+		// Databricks: `spark` lives in the kernel, so a new kernel session epoch means
+		// the session is gone. `onInsertAndRun` is null when no notebook is open.
+		onInsertAndRun = null,
+		onDatabricksSessionChange,
 		onOpenFile,
 		onOpenFilePermanent,
 		onFocusNotebook,
@@ -38,11 +43,18 @@
 	// Which foldable sections are open. All start expanded (agent panel collapsed),
 	// then overridden by the persisted state on mount.
 	const OPEN_KEY = 'cellar-sidebar-open';
-	let open = $state({ files: true, kernels: true, agent: false, outline: true, vars: true, search: false });
+	let open = $state({ files: true, kernels: true, databricks: false, agent: false, outline: true, vars: true, search: false });
 	function toggle(k) {
 		open[k] = !open[k];
 		persist(OPEN_KEY, open);
 	}
+
+	// The Databricks panel mounts the first time its section is opened and stays
+	// mounted from then on (see `databricksSection`). A latch, never un-set.
+	let databricksMounted = $state(false);
+	$effect(() => {
+		if (open.databricks) databricksMounted = true;
+	});
 
 	const notebooksLabel = $derived(openNotebooks.length ? `notebooks · ${openNotebooks.length}` : 'notebooks');
 	const pendingNotebooksLabel = $derived(
@@ -554,6 +566,21 @@
 	{/if}
 {/snippet}
 
+{#snippet databricksSection()}
+	<div class="flex items-center">
+		{@render header('databricks', 'Databricks', 'section-databricks')}
+	</div>
+	<!-- Mounted lazily on first open, then kept mounted (hidden) so collapsing the
+	     section does not throw away the connection state, the cluster list, or a
+	     half-expanded catalog tree. Until then it costs nothing: its status probe
+	     spawns a python subprocess, which a user who never opens this should not pay. -->
+	{#if databricksMounted}
+		<div class:hidden={!open.databricks}>
+			<Databricks kernelSessionId={kernelInfo?.session_id ?? null} {onInsertAndRun} onSessionChange={onDatabricksSessionChange} />
+		</div>
+	{/if}
+{/snippet}
+
 {#snippet agentSection()}
 	<div class="flex items-center">
 		{@render header('agent', 'Connect an agent', 'section-agent')}
@@ -762,6 +789,7 @@
 {#snippet sectionBody(key)}
 	{#if key === 'files'}{@render filesSection()}
 	{:else if key === 'kernels'}{@render kernelsSection()}
+	{:else if key === 'databricks'}{@render databricksSection()}
 	{:else if key === 'agent'}{@render agentSection()}
 	{:else if key === 'outline'}{@render outlineSection()}
 	{:else if key === 'vars'}{@render varsSection()}

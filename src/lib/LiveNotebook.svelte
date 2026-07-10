@@ -23,6 +23,7 @@
 		onCellsChange,
 		onFoldsChange, // (path, foldedIds, folding): the sidebar Outline renders from this
 		onRegisterFolds, // (path, toggleFold|null): lets the Outline drive this notebook's folds
+		onRegisterApi, // (path, {insertAndRunCode}|null): lets the sidebar drop a cell in here
 		onRunStart,
 		onRunEnd
 	} = $props();
@@ -82,6 +83,12 @@
 	$effect(() => {
 		onRegisterFolds?.(path, toggleFold);
 		return () => onRegisterFolds?.(path, null);
+	});
+	// Same shape as the fold registry: an imperative handle the shell hands to the
+	// sidebar, so the Databricks data browser can append + run a preview cell here.
+	$effect(() => {
+		onRegisterApi?.(path, { insertAndRunCode });
+		return () => onRegisterApi?.(path, null);
 	});
 
 	function foldStorageKey() {
@@ -709,6 +716,26 @@
 		if (!afterId && cells.length > 1) await moveCellToIndex(created.id, 0);
 		if (spec.output_scrolled !== undefined) await setScrolled(created.id, spec.output_scrolled);
 		return created;
+	}
+
+	/**
+	 * Append a code cell carrying `source` and run it. The entry point for the
+	 * sidebar's Databricks table preview: point-and-click, but what lands in the
+	 * notebook is an ordinary cell holding ordinary code the user can edit, re-run,
+	 * and commit.
+	 *
+	 * Deliberately does NOT touch `activeId`. Selection and DOM focus must move
+	 * together (the keyboard dispatcher reads a keystroke's mode off the focused
+	 * element), and the user's focus is in the sidebar right now - selecting the new
+	 * cell without focusing it would leave the next `j`/`k` acting on a cell the
+	 * caret is nowhere near. So we scroll it into view and leave the selection be.
+	 */
+	async function insertAndRunCode(source) {
+		const created = await insertCellAt(cells.length, { cell_type: 'code', source });
+		await tick();
+		scrollCellIntoView(created.id);
+		await runCell(created.id, source);
+		return created.id;
 	}
 
 	function copyActive() {
