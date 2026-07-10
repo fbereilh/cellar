@@ -35,6 +35,19 @@ export function publish(event) {
 	return full;
 }
 
+/**
+ * Publish an event that belongs to no single notebook — today, the kernel run
+ * queue, which spans every open notebook because the kernel does. It carries no
+ * `seq`: each such event is a FULL state snapshot, so a missed one is corrected
+ * by the next rather than needing gap detection. The client dispatches these
+ * before its per-notebook `nb`/`seq` filter.
+ */
+export function publishGlobal(event) {
+	const full = { ...event, global: true };
+	emitter.emit('event', full);
+	return full;
+}
+
 /** Subscribe to all events; returns an unsubscribe function. */
 export function subscribe(listener) {
 	emitter.on('event', listener);

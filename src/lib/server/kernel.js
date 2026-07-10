@@ -13,6 +13,7 @@
  * so there is no way for outputs to be duplicated or cross runs.
  */
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
+import { clearRunQueue } from './run-queue.js';
 
 let kernelPromise = null;
 let liveKernel = null; // last-resolved kernel, for read-only status introspection
@@ -110,6 +111,8 @@ async function getKernel() {
 		statusHandler = (_sender, status) => {
 			if (status !== 'autorestarting' || currentKernel !== kernel) return;
 			beginSession();
+			// The namespace queued work was submitted against is gone (see clearRunQueue).
+			clearRunQueue('kernel_autorestart');
 			void initKernel(kernel);
 		};
 		kernel.statusChanged.connect(statusHandler);
@@ -129,6 +132,9 @@ async function getKernel() {
  * is what makes the agent interface kernel-restart-proof.
  */
 export async function restartKernel() {
+	// Drop pending runs BEFORE the restart is issued, so nothing can dequeue into
+	// the kernel that is about to lose its namespace.
+	clearRunQueue('kernel_restart');
 	const kernel = await getKernel();
 	try {
 		await kernel.restart();
@@ -157,6 +163,8 @@ export async function restartKernel() {
  * naturally picks up the new spec.
  */
 export async function rebindKernel() {
+	// Queued runs were submitted against the OLD interpreter's namespace.
+	clearRunQueue('kernel_rebind');
 	const wasRunning = !!currentKernel;
 	if (currentKernel) {
 		try {
@@ -184,8 +192,13 @@ export async function rebindKernel() {
 	return { status: kernel.status, id: kernel.id, session_id: sessionId };
 }
 
-/** Interrupt the running kernel (SIGINT equivalent). */
+/**
+ * Interrupt the running kernel (SIGINT equivalent). Also drops the pending run
+ * queue: "stop" must mean stop, not "stop this cell and start the next one" —
+ * and jupyter aborts its own queued execute requests on an interrupt anyway.
+ */
 export async function interruptKernel() {
+	clearRunQueue('kernel_interrupt');
 	const kernel = await getKernel();
 	await kernel.interrupt();
 	return { status: kernel.status, id: kernel.id };

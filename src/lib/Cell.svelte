@@ -21,6 +21,7 @@
 		index,
 		count,
 		running,
+		queuedPosition = null, // 1-based place in the kernel's run queue, or null
 		active = false,
 		keyMode = 'command', // notebook mode ('command' | 'edit'); only meaningful while `active`
 		dragging = false,
@@ -127,6 +128,12 @@
 		}
 		return () => clearTimeout(runIndicatorTimer);
 	});
+
+	// Queued = submitted, waiting for the shared kernel to free. Deliberately a
+	// *quieter* sibling of the running affordance (same `warning` hue, no pulse,
+	// no spinner): the eye should still land on the one cell that is executing.
+	// A run that starts before its queue event lands would otherwise show both.
+	const isQueued = $derived(queuedPosition != null && !running);
 
 	// ---- Per-cell run metadata badge ("ran 2m ago · 1.2s · agent") ----------
 	// Runtime-only `{ at, durationMs, actor }` stamped by both run paths, stripped
@@ -518,14 +525,17 @@
 <div
 	class="card relative overflow-hidden border bg-base-100 shadow-sm transition-colors {showRunning
 		? 'border-warning/60 ring-1 ring-warning/40'
-		: active
-			? 'border-primary/50 ring-1 ring-primary/40'
-			: 'border-base-300'} {dragging ? 'opacity-40' : ''}"
+		: isQueued
+			? 'border-warning/30'
+			: active
+				? 'border-primary/50 ring-1 ring-primary/40'
+				: 'border-base-300'} {dragging ? 'opacity-40' : ''}"
 	data-testid="cell"
 	data-cell-id={cell.id}
 	data-cell-type={cell.cell_type}
 	data-active={active ? 'true' : undefined}
 	data-running={showRunning ? 'true' : undefined}
+	data-queued={isQueued ? 'true' : undefined}
 	role="presentation"
 	onfocusin={() => onActivate?.(cell.id)}
 	onpointerdown={() => onActivate?.(cell.id)}
@@ -533,9 +543,14 @@
 	<!-- Left accent bar (VS Code / Jupyter style); no layout shift. The running
 	     accent deliberately outranks the selection accent and uses `warning` (the
 	     same hue as the running indicator) so "what is executing" is never confused
-	     with "what is selected" - the cue that makes an agent's run legible. -->
+	     with "what is selected" - the cue that makes an agent's run legible. A
+	     queued cell gets the same hue at a fraction of the opacity and without the
+	     pulse: same story ("the kernel"), lower voice. All three are daisyUI
+	     semantic tokens, so light and dark themes stay coherent for free. -->
 	{#if showRunning}
 		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 animate-pulse bg-warning" data-testid="running-bar"></div>
+	{:else if isQueued}
+		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 bg-warning/50" data-testid="queued-bar"></div>
 	{:else if active}
 		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 bg-primary" data-testid="active-bar"></div>
 	{/if}
@@ -557,7 +572,7 @@
 				<button
 					class="btn btn-ghost btn-xs btn-square text-success"
 					onclick={() => doRun(false)}
-					disabled={running}
+					disabled={running || isQueued}
 					title={isMarkdown ? 'Render (⌘/Ctrl+Enter · Shift+Enter to advance)' : 'Run cell (⌘/Ctrl+Enter · Shift+Enter to advance)'}
 					aria-label={isMarkdown ? 'Render cell' : 'Run cell'}
 					data-testid="run"
@@ -631,11 +646,27 @@
 				<button class="btn btn-ghost btn-xs btn-square text-error/70 hover:text-error" onclick={() => onDelete(cell.id)} disabled={count === 1} title="Delete cell" aria-label="Delete cell" data-testid="delete">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m-1 0v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V6" /></svg>
 				</button>
-				<!-- Far-right slot: running indicator (code) or the cell-type toggle. -->
+				<!-- Far-right slot: running indicator, queue position (code), or the
+				     cell-type toggle. -->
 				<span class="ml-1 flex min-w-[76px] justify-end">
 					{#if showRunning}
 						<span class="flex items-center gap-1 text-[11px] text-warning" data-testid="running-indicator">
 							<span class="loading loading-spinner loading-xs"></span> running
+						</span>
+					{:else if isQueued}
+						<!-- Two-tone, like the run-meta badge beside it: the clock carries the
+						     kernel's `warning` hue (tying it to the running indicator), the label
+						     stays on `base-content` so it is legible on a light theme, where a
+						     dimmed `warning` washes out to nearly nothing. -->
+						<span
+							class="flex items-center gap-1 text-[11px] text-base-content/70"
+							data-testid="queued-indicator"
+							data-queue-position={queuedPosition}
+							title={`Waiting for the shared kernel — ${queuedPosition === 1 ? 'next to run' : `${queuedPosition - 1} run${queuedPosition === 2 ? '' : 's'} ahead`}`}
+						>
+							<!-- clock: waiting, not working -->
+							<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>
+							queued · {queuedPosition}
 						</span>
 					{:else}
 						<button

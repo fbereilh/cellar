@@ -23,6 +23,14 @@ export const originId = browser && globalThis.crypto?.randomUUID ? globalThis.cr
 
 let source = null;
 const listeners = new Set();
+/**
+ * The most recent `queue:changed` snapshot. The kernel's run queue only
+ * broadcasts on a change, so a notebook mounted while a cell is already queued
+ * (a second tab, or a notebook opened mid-run) would show no queue badge until
+ * the next enqueue. Replaying the latest snapshot to a new subscriber closes
+ * that window — it is a full snapshot, so replaying it is always safe.
+ */
+let lastQueue = null;
 
 function ensureSource() {
 	if (source || !browser) return;
@@ -34,6 +42,7 @@ function ensureSource() {
 		} catch {
 			return;
 		}
+		if (ev.type === 'queue:changed') lastQueue = ev;
 		for (const listener of listeners) listener(ev);
 	});
 	// Fires on the initial connect and on every automatic reconnect.
@@ -50,11 +59,13 @@ export function subscribeEvents(listener) {
 	if (!browser) return () => {};
 	listeners.add(listener);
 	ensureSource();
+	if (lastQueue) listener(lastQueue); // catch a late subscriber up on the run queue
 	return () => {
 		listeners.delete(listener);
 		if (listeners.size === 0 && source) {
 			source.close();
 			source = null;
+			lastQueue = null; // the next connect re-seeds it (the SSE stream sends a snapshot)
 		}
 	};
 }

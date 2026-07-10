@@ -1,4 +1,5 @@
 import { subscribe } from '$lib/server/events.js';
+import { queueState } from '$lib/server/run-queue.js';
 
 /**
  * Server-Sent Events stream — one per browser tab, carrying live document/run
@@ -42,9 +43,16 @@ export function GET({ request }) {
 					return false;
 				}
 			};
-			const send = (event) => enqueue(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+			// Global events (the kernel run queue) carry no per-notebook `seq`, so they
+			// carry no SSE `id:` either — there is no gap to detect in a full snapshot.
+			const send = (event) =>
+				enqueue((event.seq == null ? '' : `id: ${event.seq}\n`) + `data: ${JSON.stringify(event)}\n\n`);
 
 			enqueue(`data: ${JSON.stringify({ type: 'hello', at: Date.now() })}\n\n`);
+			// Seed the run queue on every (re)connect: `queue:changed` only fires on a
+			// change, so a tab that connects mid-queue would otherwise show no badges
+			// until the next enqueue.
+			send({ type: 'queue:changed', global: true, ...queueState() });
 			unsubscribe = subscribe(send);
 			heartbeat = setInterval(() => enqueue(': heartbeat\n\n'), HEARTBEAT_MS);
 

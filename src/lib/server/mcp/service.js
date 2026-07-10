@@ -29,6 +29,7 @@ import {
 import { execute, restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel.js';
 import { kernelState } from '../inspect.js';
 import { publish } from '../events.js';
+import { enqueueRun, queueState, queuePosition } from '../run-queue.js';
 import { buildTree } from '../fstree.js';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
@@ -512,6 +513,14 @@ async function runSource(source, onOutput, onSession) {
 }
 
 /**
+ * The kernel's run queue: what is executing and what is waiting behind it,
+ * across every open notebook (there is one kernel, so there is one queue).
+ */
+export function getRunQueue() {
+	return queueState();
+}
+
+/**
  * Run one cell by id; markdown cells are skipped (no kernel).
  *
  * Broadcasts the run lifecycle (`run:start` / `run:output` per streamed chunk /
@@ -519,47 +528,101 @@ async function runSource(source, onOutput, onSession) {
  * browser shows this agent-driven run — running indicator + streaming outputs —
  * with no reload. `runCells`/`runAll`/`runRange` all funnel through here, so
  * every MCP run path broadcasts.
+ *
+ * QUEUEING. One kernel means one run at a time app-wide, so an agent's run
+ * requested while a user's (or another agent call's) cell is executing takes a
+ * ticket in the kernel-global FIFO instead of being dropped or racing into the
+ * kernel. Two shapes tell the agent what happened, and neither ever claims a run
+ * finished when it did not:
+ *
+ *   - The cell is already queued (or already running) → returns immediately with
+ *     `status: "queued"` (or `"running"`) and its `queue_position`. A pending run
+ *     has its source refreshed; nothing is ever enqueued twice.
+ *   - It had to wait its turn → the call BLOCKS until the kernel frees, then runs
+ *     and returns the real outputs, annotated `queued: true` + the
+ *     `queue_position` it was accepted at + `waited_ms`.
+ *
+ * Waiting (rather than returning `queued` and making the agent poll) is what
+ * keeps `run_cells` / `run_all` / `run_range` meaning "these cells ran, here is
+ * what they printed": they drive this function sequentially and depend on its
+ * outputs. `run_queue` shows the pending list at any time; `interrupt_kernel` /
+ * `restart_kernel` drop it, and a dropped run returns `status: "cancelled"`.
  */
 export async function runCell(id) {
-	const c = getCell(id);
+	const nbAtCall = getActiveNotebookPath();
+	const c = getCell(id, nbAtCall);
 	if (!c) return null;
 	if (c.cell_type !== 'code') return { id, status: 'skipped', note: 'not a code cell' };
-	const nb = getActiveNotebookPath();
-	const startedAt = Date.now();
-	publish({ type: 'run:start', nb, cellId: id, actor: 'agent', at: startedAt });
-	let outputs = [];
-	let status = 'ok';
-	// The epoch the run STARTED in, captured as soon as the kernel is in hand.
-	// It stays null when execute() failed before any kernel existed, and it is
-	// never re-read afterwards: an autorestart mid-run bumps the live epoch, and
-	// this cell must then read as not-this-session.
-	let session = null;
-	let kernelDown = false;
-	try {
-		const res = await runSource(
-			c.source || '',
-			(output) => publish({ type: 'run:output', nb, cellId: id, output }),
-			(sid) => { session = sid; }
-		);
-		outputs = res.outputs;
-		status = res.status;
-	} catch (err) {
-		const output = { output_type: 'error', ename: 'CellarError', evalue: String(err?.message ?? err), traceback: [String(err?.message ?? err)] };
-		outputs = [output];
-		publish({ type: 'run:output', nb, cellId: id, output });
-		status = 'error';
-		// execute() threw before it ever had a kernel in hand, so no session exists
-		// to stamp. Mark the attempt: this error is live, not saved from a prior run.
-		if (session === null) kernelDown = true;
+	// Pin the notebook now: the UI may focus another one while we wait in the
+	// queue, and this run must land in the document it was requested against.
+	const nb = nbAtCall;
+
+	const ticket = enqueueRun({ nb, cellId: id, actor: 'agent', source: c.source || '' });
+	if (ticket.duplicate) {
+		// This cell is already in the kernel's hands. Say which — "queued" and
+		// "running" are both "accepted, not finished", and neither is an error.
+		const position = queuePosition(nb, id);
+		return position
+			? { id, status: 'queued', queue_position: position, note: `already queued at position ${position}; its source was refreshed to the current one. It will run when the kernel frees.` }
+			: { id, status: 'running', queue_position: 0, note: 'already executing in the kernel right now; not enqueued again.' };
 	}
-	setOutputs(id, outputs);
-	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,
-	// `session` = the kernel-session epoch this run executed in (see setLastRun).
-	const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent', status, session, ...(kernelDown ? { kernel_unavailable: true } : {}) };
-	setLastRun(id, lastRun, nb);
-	publish({ type: 'run:end', nb, cellId: id, ...lastRun });
-	const hiddenNote = isHidden(c) ? { hidden: true } : {};
-	return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+	const queuedAt = ticket.queued ? Date.now() : 0;
+	const acceptedPosition = ticket.position;
+	try {
+		await ticket.wait();
+	} catch (err) {
+		// A restart / interrupt / rebind dropped this pending run before any kernel
+		// touched it: nothing executed, nothing to persist, no lastRun stamp.
+		return { id, status: 'cancelled', reason: err?.reason ?? 'cancelled', ran_this_session: false, note: 'the queued run was dropped before it started (the kernel was interrupted or restarted).' };
+	}
+	const queuedInfo = queuedAt ? { queued: true, queue_position: acceptedPosition, waited_ms: Date.now() - queuedAt } : {};
+
+	try {
+		// Re-read the cell: it may have been edited (or deleted) while queued.
+		const cell = getCell(id, nb);
+		if (!cell) return { id, status: 'cancelled', reason: 'cell_removed', ran_this_session: false, ...queuedInfo };
+		const source = ticket.source() ?? cell.source ?? '';
+
+		const startedAt = Date.now();
+		publish({ type: 'run:start', nb, cellId: id, actor: 'agent', at: startedAt });
+		let outputs = [];
+		let status = 'ok';
+		// The epoch the run STARTED in, captured as soon as the kernel is in hand.
+		// It stays null when execute() failed before any kernel existed, and it is
+		// never re-read afterwards: an autorestart mid-run bumps the live epoch, and
+		// this cell must then read as not-this-session.
+		let session = null;
+		let kernelDown = false;
+		try {
+			const res = await runSource(
+				source,
+				(output) => publish({ type: 'run:output', nb, cellId: id, output }),
+				(sid) => { session = sid; }
+			);
+			outputs = res.outputs;
+			status = res.status;
+		} catch (err) {
+			const output = { output_type: 'error', ename: 'CellarError', evalue: String(err?.message ?? err), traceback: [String(err?.message ?? err)] };
+			outputs = [output];
+			publish({ type: 'run:output', nb, cellId: id, output });
+			status = 'error';
+			// execute() threw before it ever had a kernel in hand, so no session exists
+			// to stamp. Mark the attempt: this error is live, not saved from a prior run.
+			if (session === null) kernelDown = true;
+		}
+		setOutputs(id, outputs, nb);
+		// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,
+		// `session` = the kernel-session epoch this run executed in (see setLastRun).
+		const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent', status, session, ...(kernelDown ? { kernel_unavailable: true } : {}) };
+		setLastRun(id, lastRun, nb);
+		publish({ type: 'run:end', nb, cellId: id, ...lastRun });
+		const hiddenNote = isHidden(cell) ? { hidden: true } : {};
+		return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+	} finally {
+		// Hand the kernel to the next queued run only once this one has persisted and
+		// broadcast, so the wire order stays run:end → run:start.
+		ticket.done();
+	}
 }
 
 /**
@@ -580,11 +643,18 @@ export async function addAndRun({ source, cellType = 'code', afterId } = {}) {
 	return { id, ...result };
 }
 
+/**
+ * Run cells one at a time, in order, each waiting its turn in the kernel queue.
+ * Stops at the first run a restart/interrupt cancelled: the rest of the sequence
+ * was written against a namespace that no longer exists, so running it would
+ * execute cell N+1 without cell N's definitions.
+ */
 export async function runCells(ids) {
 	const results = [];
 	for (const id of ids) {
 		const r = await runCell(id);
 		if (r && !isHidden(getCell(id) || {})) results.push(r);
+		if (r?.status === 'cancelled') break;
 	}
 	return results;
 }

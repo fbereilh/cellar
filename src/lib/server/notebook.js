@@ -23,6 +23,7 @@ import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { readNotebook, deserialize, writeNotebook } from './ipynb.js';
 import { publish } from './events.js';
+import { cancelRun } from './run-queue.js';
 
 const FILENAME = 'notebook.ipynb';
 
@@ -440,6 +441,8 @@ export function deleteCell(id, nb, originId) {
 	const existed = doc.cells.some((c) => c.id === id);
 	doc.cells = doc.cells.filter((c) => c.id !== id);
 	persist(doc);
+	// A deleted cell must not later dequeue and run: drop any pending run for it.
+	cancelRun(doc.path, id);
 	if (existed) emit(doc, 'cell:deleted', { cellId: id }, originId);
 }
 

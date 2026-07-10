@@ -9,6 +9,7 @@
 	let {
 		cells,
 		runningId,
+		queued = {}, // cell id → 1-based position in the kernel's global run queue
 		activeId = null,
 		keyMode = 'command', // 'command' | 'edit' (Jupyter-style modal keyboard)
 		theme = 'dim',
@@ -154,6 +155,7 @@
 					index={i}
 					count={cells.length}
 					running={runningId === cell.id}
+					queuedPosition={queued[cell.id] ?? null}
 					active={activeId === cell.id}
 					{keyMode}
 					dragging={dragId === cell.id}
