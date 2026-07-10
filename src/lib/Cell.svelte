@@ -99,9 +99,26 @@
 	let pendingRemoteSource = null;
 	let appliedRemote = null; // the last cell.remoteEdit object we processed
 
-	// Markdown cells render to HTML by default; double-click / edit → raw source.
-	let mode = $state(cell.cell_type === 'markdown' && cell.source.trim() ? 'rendered' : 'edit');
+	// The editor's live text. Declared before `mode` because `mode` derives from it.
 	let liveSource = $state(cell.source);
+
+	// User intent to edit this markdown cell's raw source. A markdown cell with
+	// content that the user has NOT opened for editing shows RENDERED by default;
+	// opening it (double-click / pencil / keyboard enter-edit / a type-toggle to
+	// markdown / focusing its editor) sets this and shows the raw source.
+	//
+	// `mode` is DERIVED from this + the live source, deliberately NOT a one-shot
+	// mount-time snapshot: an agent-created markdown cell (add_cell / add_and_run /
+	// run_cell) renders reliably even if the Cell mounts before its source is
+	// populated or the `cell:rendered` event races the mount — the rule re-evaluates
+	// as `liveSource` fills in, so it can never get stuck in `edit` the way the old
+	// `$state`-init-plus-one-shot-event design did (the bug this fixes). Reopening a
+	// notebook already rendered because those cells mount with source; this makes
+	// live agent-created cells behave identically.
+	let rawEdit = $state(false);
+	const mode = $derived(
+		isMarkdown && !rawEdit && liveSource.trim().length > 0 ? 'rendered' : 'edit'
+	);
 
 	// Markdown is rendered through the shared engine in `$lib/markdown.js` (safe
 	// mode + DOMPurify), so cells and the file preview parse identically.
@@ -444,13 +461,13 @@
 		const src = currentSource();
 		liveSource = src;
 		savedSource = src;
-		if (isMarkdown) mode = 'rendered';
+		if (isMarkdown) rawEdit = false;
 		if (advance) onRunAdvance(cell.id, src, { focusNext });
 		else onRun(cell.id, src);
 	}
 
 	async function enterEdit() {
-		mode = 'edit';
+		rawEdit = true;
 		await tick();
 		view?.focus();
 	}
@@ -497,7 +514,9 @@
 		if (view) view.dispatch({ effects: language.reconfigure(langFor(type)) });
 		if (type !== prevType) {
 			prevType = type;
-			mode = 'edit';
+			// A manual type toggle drops into edit mode so the user sees the source
+			// (a code→markdown conversion that rendered immediately would hide it).
+			rawEdit = true;
 		}
 	});
 
@@ -538,7 +557,16 @@
 					// drive the notebook's edit-vs-command mode: the editor holding
 					// focus *is* edit mode, so the indicator can never drift from reality.
 					EditorView.domEventHandlers({
-						focus: () => (onEditorFocus?.(cell.id), false),
+						focus: () => {
+							// Focusing a visible markdown editor means the user is editing its
+							// raw source; latch that so the derived `mode` can't flip to rendered
+							// while they type into a fresh empty cell. A rendered markdown cell's
+							// editor is display:none and unfocusable, so this only ever fires
+							// when edit mode is already showing.
+							if (isMarkdown) rawEdit = true;
+							onEditorFocus?.(cell.id);
+							return false;
+						},
 						blur: () => (flushEdit(), onEditorBlur?.(cell.id), false)
 					}),
 					EditorView.theme({
@@ -572,7 +600,7 @@
 			showRendered: () => {
 				if (!isMarkdown) return;
 				liveSource = currentSource();
-				mode = 'rendered';
+				rawEdit = false;
 			},
 			isMarkdown: () => isMarkdown,
 			// Primitives the notebook's cut/copy, heading and split actions compose.
