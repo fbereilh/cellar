@@ -10,7 +10,7 @@
 	import { markdown } from '@codemirror/lang-markdown';
 	import MarkdownIt from 'markdown-it';
 	import DOMPurify from 'dompurify';
-	import { editorThemeExtensions } from '$lib/editorTheme.js';
+	import { EDITOR_THEME } from '$lib/editorTheme.js';
 	import { foldKey, splitHeadingSegments } from '$lib/headings.js';
 	import { relativeTime, formatDuration } from '$lib/relativeTime.js';
 
@@ -29,7 +29,6 @@
 		segHidden = NO_SEGS_HIDDEN, // segment indices of THIS cell an outer fold hides
 		foldCounts = {}, // fold key → whole cells that fold hides (the "N cells hidden" hint)
 		onToggleFold,
-		theme = 'dim',
 		onRun,
 		onRunAdvance,
 		onClear,
@@ -411,7 +410,6 @@
 	}
 
 	const language = new Compartment();
-	const editorTheme = new Compartment();
 	const langFor = (type) => (type === 'markdown' ? markdown() : python());
 
 	// Reconfigure the editor language when the cell type toggles; after a manual
@@ -426,16 +424,6 @@
 		}
 	});
 
-	// Follow the app's light/dark theme so the editor never renders dark-on-light.
-	// Compute the extensions unconditionally: reading `theme` outside the `if
-	// (view)` guard is what registers it as a dependency, so this re-runs on every
-	// theme toggle even when `view` was still unset on the effect's first pass
-	// (onMount, which assigns `view`, may run after the first effect).
-	$effect(() => {
-		const extensions = editorThemeExtensions(theme);
-		if (view) view.dispatch({ effects: editorTheme.reconfigure(extensions) });
-	});
-
 	onMount(() => {
 		view = new EditorView({
 			parent: editorEl,
@@ -444,7 +432,7 @@
 				extensions: [
 					basicSetup,
 					language.of(langFor(cell.cell_type)),
-					editorTheme.of(editorThemeExtensions(theme)),
+					EDITOR_THEME,
 					// No run/escape keymap here on purpose: every notebook shortcut,
 					// edit-mode ones included, is declared in `shortcuts.svelte.js` and
 					// dispatched by LiveNotebook's capture-phase handler (which runs
@@ -477,9 +465,8 @@
 						blur: () => (flushEdit(), onEditorBlur?.(cell.id), false)
 					}),
 					EditorView.theme({
-						'&': { backgroundColor: 'transparent', fontSize: '13.5px' },
+						'&': { fontSize: '13.5px' },
 						'.cm-content': { fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace', padding: '10px 0' },
-						'.cm-gutters': { backgroundColor: 'transparent', border: 'none' },
 						'&.cm-focused': { outline: 'none' }
 					})
 				]
@@ -543,7 +530,7 @@
 <div
 	bind:this={cardEl}
 	tabindex="-1"
-	class="card relative overflow-hidden border bg-base-100 shadow-sm outline-none transition-colors {showRunning
+	class="card relative overflow-hidden border bg-(--cellar-surface-cell) shadow-sm outline-none transition-colors {showRunning
 		? 'border-warning/60 ring-1 ring-warning/40'
 		: isQueued
 			? 'border-warning/30'
@@ -807,7 +794,7 @@
 
 		<!-- Output (code cells only) -->
 		{#if !isMarkdown && outputs.length}
-			<div class="relative border-t border-base-300" data-testid="output">
+			<div class="relative border-t border-base-300 bg-(--cellar-surface-output)" data-testid="output">
 				<!-- Scroll-outputs toggle (Jupyter "Enable Scrolling for Outputs"). -->
 				<button
 					class="btn btn-ghost btn-xs absolute right-1 top-1 z-10 h-5 min-h-0 gap-1 px-1.5 text-[10px] font-normal text-base-content/40 hover:text-base-content/80"
@@ -876,24 +863,31 @@
 	:global(.cellar-md .md-heading :is(h1, h2, h3, h4, h5, h6)) {
 		margin: 0;
 	}
+	/* Headings are plain: no rules, no underline. h1 and h2 once carried a
+	   `border-bottom` in `--color-base-300`, near-invisible against `dim`'s
+	   surface but a hard grey underline on any light theme - so rendered markdown
+	   did not read the same in both. Size and weight carry the hierarchy. */
+	:global(.cellar-md :is(h1, h2, h3, h4, h5, h6)) {
+		margin: 0.5em 0 0.3em;
+	}
 	:global(.cellar-md h1) {
 		font-size: 1.5em;
 		font-weight: 700;
-		margin: 0.5em 0 0.3em;
-		border-bottom: 1px solid var(--color-base-300);
-		padding-bottom: 0.2em;
 	}
 	:global(.cellar-md h2) {
 		font-size: 1.3em;
 		font-weight: 700;
-		margin: 0.5em 0 0.3em;
-		border-bottom: 1px solid var(--color-base-300);
-		padding-bottom: 0.2em;
 	}
 	:global(.cellar-md h3) {
 		font-size: 1.1em;
 		font-weight: 600;
-		margin: 0.5em 0 0.3em;
+	}
+	/* Tailwind's preflight resets h4-h6 to plain body text, leaving them
+	   indistinguishable from the paragraph beneath. Weight alone separates them,
+	   identically in both themes. */
+	:global(.cellar-md :is(h4, h5, h6)) {
+		font-size: 1em;
+		font-weight: 600;
 	}
 	:global(.cellar-md p) {
 		margin: 0.5em 0;
