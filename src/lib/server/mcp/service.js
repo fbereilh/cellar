@@ -34,6 +34,7 @@ import { consolidateImports, routeImports, runImportsCell } from '../imports-cel
 import { buildTree } from '../fstree.js';
 import { getNotebookStaleness } from '../dataflow.js';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness.js';
+import { isSqlCell } from '../../cellLanguage.js';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -216,6 +217,7 @@ function readForm(cell, cap = READ_CAP, sid = currentSessionId(), staleEntry = n
 	return {
 		id: cell.id,
 		type: cell.cell_type,
+		...(isSqlCell(cell) ? { language: 'sql' } : {}),
 		source: cell.source,
 		run_status: runStatus(cell, sid),
 		ran_this_session: ranThisSession(cell, sid),
@@ -315,6 +317,7 @@ export async function getNotebookMap() {
 		id: c.id,
 		kind: 'cell',
 		type: c.cell_type,
+		...(isSqlCell(c) ? { language: 'sql' } : {}),
 		summary: firstLine(c.source),
 		run_status: runStatus(c, sid),
 		ran_this_session: ranThisSession(c, sid),
@@ -639,7 +642,10 @@ export async function editCell(id, source, { routeImports: routeEnabled = true }
 	const nb = getActiveNotebookPath();
 	const cell = getCell(id, nb);
 	if (!cell) return null;
-	const routed = routeOne(source, nb, { routeEnabled, cellType: cell.cell_type, skipCellId: id });
+	// A SQL cell is a `code` cell on disk, but its source is SQL - never route
+	// "imports" out of it. Pass the LOGICAL type so routeOne's `!== 'code'` guard skips it.
+	const logicalType = isSqlCell(cell) ? 'sql' : cell.cell_type;
+	const routed = routeOne(source, nb, { routeEnabled, cellType: logicalType, skipCellId: id });
 	setSource(id, routed ? routed.source : source, nb);
 	const imports = routed ? await finishImportRouting(nb, routed.importsCellId, routed.added) : null;
 	return { ok: true, id, ...(imports ? { imports } : {}) };

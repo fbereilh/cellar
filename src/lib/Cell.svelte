@@ -8,6 +8,7 @@
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
+	import { sql } from '@codemirror/lang-sql';
 	import DOMPurify from 'dompurify';
 	import { md, renderMarkdown } from '$lib/markdown.js';
 	import { EDITOR_THEME } from '$lib/editorTheme.js';
@@ -16,6 +17,7 @@
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
 	import { foldKey, splitHeadingSegments } from '$lib/headings.js';
 	import { isImportsCell } from '$lib/importsRole.js';
+	import { isSqlCell, logicalCellType } from '$lib/cellLanguage.js';
 	import { relativeTime, formatDuration } from '$lib/relativeTime.js';
 
 	const NO_SEGS_HIDDEN = { headings: new Set(), bodies: new Set() };
@@ -89,6 +91,12 @@
 	}
 
 	const isMarkdown = $derived(cell.cell_type === 'markdown');
+	// A SQL cell: a code cell tagged cellar.language='sql'. Its source is SQL, run
+	// against `spark` (see server/sql.js); the editor highlights it as SQL.
+	const isSql = $derived(isSqlCell(cell));
+	// The logical cell type the type menu speaks: 'code' | 'sql' | 'markdown'.
+	const logicalType = $derived(logicalCellType(cell));
+	const typeLabel = $derived(logicalType === 'sql' ? 'SQL' : logicalType === 'markdown' ? 'markdown' : 'python3');
 	// The notebook's designated imports cell: pinned at the top, marked in the
 	// toolbar, and immovable (`clampMoveIndex` enforces the same rule server-side).
 	const isImports = $derived(isImportsCell(cell));
@@ -374,6 +382,24 @@
 		error: 'text-error border-error bg-error/10'
 	};
 
+	// ---- Cell-type menu (Python / SQL / Markdown) ---------------------------
+	// A native popover so the menu renders in the top layer, unclipped by the
+	// card's `overflow-hidden`. Positioned under its trigger button on open.
+	let typeMenuEl = $state(null);
+	let typeBtnEl = $state(null);
+	function openTypeMenu() {
+		if (!typeMenuEl || !typeBtnEl) return;
+		typeMenuEl.showPopover();
+		const r = typeBtnEl.getBoundingClientRect();
+		const mw = typeMenuEl.offsetWidth || 150;
+		typeMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
+		typeMenuEl.style.top = r.bottom + 4 + 'px';
+	}
+	function chooseType(type) {
+		typeMenuEl?.hidePopover();
+		if (type !== logicalType) onSetType(cell.id, type);
+	}
+
 	function currentSource() {
 		return view ? view.state.doc.toString() : cell.source;
 	}
@@ -487,14 +513,20 @@
 	}
 
 	const language = new Compartment();
-	const langFor = (type) => (type === 'markdown' ? markdown() : python());
+	// Editor grammar by LOGICAL type: markdown, SQL (spark queries), or python.
+	function langFor() {
+		if (cell.cell_type === 'markdown') return markdown();
+		return isSql ? sql() : python();
+	}
 
-	// Reconfigure the editor language when the cell type toggles; after a manual
-	// toggle, drop into edit mode so the user sees the source.
+	// Reconfigure the editor language when the cell type OR its SQL/Python language
+	// toggles; after a manual cell_type toggle, drop into edit mode so the user sees
+	// the source. `isSql` is read so a code↔sql switch re-applies the grammar too.
 	let prevType = cell.cell_type;
 	$effect(() => {
 		const type = cell.cell_type;
-		if (view) view.dispatch({ effects: language.reconfigure(langFor(type)) });
+		isSql; // track: code↔sql keeps cell_type 'code' but changes the grammar
+		if (view) view.dispatch({ effects: language.reconfigure(langFor()) });
 		if (type !== prevType) {
 			prevType = type;
 			mode = 'edit';
@@ -508,7 +540,7 @@
 				doc: cell.source,
 				extensions: [
 					basicSetup,
-					language.of(langFor(cell.cell_type)),
+					language.of(langFor()),
 					EDITOR_THEME,
 					// No run/escape keymap here on purpose: every notebook shortcut,
 					// edit-mode ones included, is declared in `shortcuts.svelte.js` and
@@ -706,6 +738,14 @@
 						data-testid="imports-badge">imports</span
 					>
 				{/if}
+				{#if isSql}
+					<!-- SQL indicator: this code cell holds a SQL query run against `spark`. -->
+					<span
+						class="badge badge-xs ml-1.5 badge-soft badge-info font-medium"
+						title="SQL cell - runs against the connected Databricks spark session and shows the result as a table"
+						data-testid="sql-badge">SQL</span
+					>
+				{/if}
 				<span class="ml-1.5 font-mono text-xs text-base-content/50" title={cell.id}>cell <span class="text-base-content/70">#{cell.id.slice(0, 8)}</span></span>
 				{#if !isMarkdown && lastRun && !showRunning}
 					<span
@@ -826,13 +866,35 @@
 						</span>
 					{:else}
 						<button
-							class="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 font-mono text-[11px] font-normal text-base-content/40 hover:text-base-content/80"
-							onclick={() => onSetType(cell.id, isMarkdown ? 'code' : 'markdown')}
-							title={isMarkdown ? 'Convert to code cell' : 'Convert to Markdown cell'}
+							bind:this={typeBtnEl}
+							class="btn btn-ghost btn-xs flex h-5 min-h-0 items-center gap-0.5 px-1.5 font-mono text-[11px] font-normal text-base-content/40 hover:text-base-content/80"
+							onclick={openTypeMenu}
+							title="Change cell type (Python · SQL · Markdown)"
 							data-testid="type-toggle"
 						>
-							{isMarkdown ? 'markdown' : 'python3'}
+							{typeLabel}
+							<svg class="h-2.5 w-2.5 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 						</button>
+						<!-- Popover (top layer, so the card's overflow-hidden never clips it). -->
+						<div
+							bind:this={typeMenuEl}
+							popover="auto"
+							class="menu m-0 w-36 gap-0.5 rounded-box border border-base-300 bg-base-100 p-1 text-sm shadow-lg"
+							style="position: fixed; inset: auto; margin: 0;"
+							data-testid="type-menu"
+						>
+							{#each [{ v: 'code', label: 'Python', hint: 'python3' }, { v: 'sql', label: 'SQL', hint: 'spark.sql' }, { v: 'markdown', label: 'Markdown', hint: 'text' }] as opt}
+								<button
+									class="flex items-center justify-between rounded px-2 py-1 text-left hover:bg-base-200 {logicalType === opt.v ? 'font-semibold text-primary' : 'text-base-content'}"
+									onclick={() => chooseType(opt.v)}
+									data-testid="type-option-{opt.v}"
+									aria-current={logicalType === opt.v}
+								>
+									<span>{opt.label}</span>
+									<span class="font-mono text-[10px] text-base-content/40">{opt.hint}</span>
+								</button>
+							{/each}
+						</div>
 					{/if}
 				</span>
 			</div>

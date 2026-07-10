@@ -31,6 +31,7 @@ import { currentSessionId } from './kernel.js';
 import { listCells } from './notebook.js';
 import { projectPython } from './databricks.js';
 import { computeStaleness } from '../staleness.js';
+import { isSqlCell } from '../cellLanguage.js';
 
 const SENTINEL = '__CELLAR_DF__';
 const PROBE_TIMEOUT_MS = 10000;
@@ -140,7 +141,11 @@ function runProbe(items) {
  * @returns {Promise<Record<string, {defines:string[], uses:string[]}>>}
  */
 export async function analyzeDataflow(cells) {
-	const code = cells.filter((c) => c.cell_type === 'code');
+	// SQL cells are code cells on disk but their source is SQL, not Python - a
+	// `symtable` pass would misparse them. Skip them: they get no defines/uses, so
+	// they never join the Python dependency graph (self-edit staleness still works
+	// via lastRun/editedAt, since they run and stamp like any code cell).
+	const code = cells.filter((c) => c.cell_type === 'code' && !isSqlCell(c));
 	const missing = [];
 	for (const c of code) {
 		const src = c.source ?? '';
