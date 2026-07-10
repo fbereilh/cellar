@@ -87,9 +87,11 @@
 		return () => onRegisterFolds?.(path, null);
 	});
 	// Same shape as the fold registry: an imperative handle the shell hands to the
-	// sidebar, so the Databricks data browser can append + run a preview cell here.
+	// sidebar (Databricks preview) and the command palette. `dispatch` runs the very
+	// action the modal keyboard runs for a registry shortcut id, so the palette and
+	// the keyboard share one handler and cannot diverge.
 	$effect(() => {
-		onRegisterApi?.(path, { insertAndRunCode });
+		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll });
 		return () => onRegisterApi?.(path, null);
 	});
 
@@ -1061,6 +1063,29 @@
 		'split-cell': () => splitActiveCell(),
 		...Object.fromEntries([1, 2, 3, 4, 5, 6].map((level) => [`heading-${level}`, () => setHeadingLevel(level)]))
 	};
+
+	// The command palette dispatches a registry shortcut by id into the same action
+	// the keyboard runs, always in command mode (the palette isn't a cell editor).
+	// An unknown id is a harmless no-op.
+	function dispatchCommand(shortcutId) {
+		actions[shortcutId]?.('command');
+	}
+
+	// Run every code cell top-to-bottom. Fire without awaiting: the shared kernel's
+	// server-side FIFO serializes them in submission order, and `runCell` uses each
+	// cell's live editor text. Palette "Run all cells".
+	function runAll() {
+		for (const c of cells) {
+			if (c.cell_type === 'code') runCell(c.id, cellApis[c.id]?.currentSource?.() ?? c.source);
+		}
+	}
+
+	// Clear every cell's outputs. Palette "Clear all outputs".
+	async function clearAll() {
+		for (const c of cells) {
+			if (c.outputs?.length) await clearCell(c.id);
+		}
+	}
 
 	// ---- Key sequences (`d d`) -----------------------------------------------
 	// A binding may be several chords long. The leading chords are held here as a

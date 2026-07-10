@@ -5,6 +5,9 @@
 	import LiveNotebook from '$lib/LiveNotebook.svelte';
 	import FileTab from '$lib/FileTab.svelte';
 	import Settings from '$lib/Settings.svelte';
+	import CommandPalette from '$lib/CommandPalette.svelte';
+	import { buildCommands } from '$lib/commands.js';
+	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte.js';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState.js';
 
@@ -113,6 +116,7 @@
 	// ---- Shell state ---------------------------------------------------------
 	let sidebarOpen = $state(true);
 	let settingsOpen = $state(false);
+	let paletteOpen = $state(false);
 	let theme = $state('dim');
 	const mcp = data.mcp;
 
@@ -524,6 +528,62 @@
 			openFilePermanent(ev.relPath);
 		})
 	);
+
+	// ---- Command palette (Cmd/Ctrl+K) ---------------------------------------
+	// The palette invokes notebook commands through the active notebook's
+	// registered api (`dispatch` runs the same action the keyboard runs) and
+	// app/kernel commands through these shell handlers. Notebook commands are
+	// disabled while no notebook tab is active; the api is resolved at call time
+	// (`notebookApis` is a plain Map, so the reactive gate is `activeNotebookPath`).
+	function toggleTheme() {
+		applyTheme(theme === 'dim' ? 'nord' : 'dim');
+	}
+	function activeNotebookApi() {
+		return (activeNotebookPath && notebookApis.get(activeNotebookPath)) || null;
+	}
+	const notebookCommandHandle = $derived(
+		activeNotebookPath
+			? {
+					dispatch: (id) => activeNotebookApi()?.dispatch(id),
+					runAll: () => activeNotebookApi()?.runAll(),
+					clearAll: () => activeNotebookApi()?.clearAll()
+				}
+			: null
+	);
+	const paletteCommands = $derived(
+		buildCommands({
+			notebook: notebookCommandHandle,
+			app: {
+				toggleTheme,
+				toggleSidebar: () => (sidebarOpen = !sidebarOpen),
+				openSettings: () => (settingsOpen = true),
+				interruptKernel,
+				restartKernel,
+				newNotebook,
+				consolidateImports
+			}
+		})
+	);
+
+	// Open (toggle) the palette on the registry's `command-palette` binding, from
+	// anywhere in the app. Handled here, not in LiveNotebook, because the palette is
+	// shell-level and must open even with no notebook focused. Capture phase so it
+	// beats CodeMirror; it defers to another open modal (e.g. Settings) which owns
+	// the keyboard while up.
+	onMount(() => {
+		function onKey(e) {
+			const chord = chordFromEvent(e);
+			if (!chord) return;
+			const keys = shortcuts.list.find((s) => s.id === 'command-palette')?.keys ?? [];
+			if (!keys.includes(chord)) return;
+			if (!paletteOpen && document.querySelector('.modal-open')) return; // another modal owns the keyboard
+			e.preventDefault();
+			e.stopPropagation();
+			paletteOpen = !paletteOpen;
+		}
+		window.addEventListener('keydown', onKey, true);
+		return () => window.removeEventListener('keydown', onKey, true);
+	});
 </script>
 
 <div class="flex h-screen flex-col overflow-hidden bg-base-200 text-base-content">
@@ -642,6 +702,8 @@
 		<span class="font-mono">{activeCells.length} cells</span>
 	</footer>
 </div>
+
+<CommandPalette open={paletteOpen} commands={paletteCommands} onClose={() => (paletteOpen = false)} />
 
 <Settings
 	open={settingsOpen}

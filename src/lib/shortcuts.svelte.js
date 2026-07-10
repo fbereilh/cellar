@@ -46,6 +46,15 @@ const SPLIT_CELL_CHORD = isMac ? 'Ctrl-Shift--' : 'Mod-Shift--';
 
 /** @type {Shortcut[]} */
 export const DEFAULT_SHORTCUTS = [
+	// ---- Application -------------------------------------------------------
+	{
+		id: 'command-palette',
+		keys: ['Mod-k'],
+		mode: 'global',
+		category: 'Application',
+		description: 'Open the command palette'
+	},
+
 	// ---- Modes -------------------------------------------------------------
 	{
 		id: 'command-mode',
@@ -222,7 +231,7 @@ export const DEFAULT_SHORTCUTS = [
 	}))
 ];
 
-export const CATEGORIES = ['Modes', 'Running', 'Navigation', 'Structure', 'Editing', 'Headings'];
+export const CATEGORIES = ['Application', 'Modes', 'Running', 'Navigation', 'Structure', 'Editing', 'Headings'];
 
 export const MODE_LABEL = { command: 'Command mode', edit: 'Edit mode', global: 'Anywhere' };
 
