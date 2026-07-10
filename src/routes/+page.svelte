@@ -49,14 +49,21 @@
 	function handleFoldsChange(path, foldedIds, folding) {
 		notebooksFolds[path] = { foldedIds, folding };
 	}
-	// Imperative, not reactive: a plain map of path → the notebook's toggleFold.
+	// Imperative, not reactive: a plain map of path → the notebook's fold API
+	// ({toggle, collapseAll, expandAll}). The Outline drives every fold through this.
 	const foldTogglers = new Map();
-	function registerFolds(path, toggle) {
-		if (toggle) foldTogglers.set(path, toggle);
+	function registerFolds(path, api) {
+		if (api) foldTogglers.set(path, api);
 		else foldTogglers.delete(path);
 	}
 	function toggleActiveFold(key) {
-		if (activeNotebookPath) foldTogglers.get(activeNotebookPath)?.(key);
+		if (activeNotebookPath) foldTogglers.get(activeNotebookPath)?.toggle(key);
+	}
+	function collapseAllActiveFolds() {
+		if (activeNotebookPath) foldTogglers.get(activeNotebookPath)?.collapseAll();
+	}
+	function expandAllActiveFolds() {
+		if (activeNotebookPath) foldTogglers.get(activeNotebookPath)?.expandAll();
 	}
 
 	// Imperative handles from each mounted LiveNotebook, same shape as `foldTogglers`.
@@ -610,6 +617,8 @@
 					foldedIds={activeFolds?.foldedIds ?? EMPTY_FOLDS}
 					foldCounts={activeFolds?.folding?.counts ?? {}}
 					onToggleFold={toggleActiveFold}
+					onCollapseAllFolds={collapseAllActiveFolds}
+					onExpandAllFolds={expandAllActiveFolds}
 					{mcp}
 					kernelInfo={displayKernel}
 					{kernelBusy}

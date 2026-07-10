@@ -16,6 +16,10 @@
 		foldedIds = new Set(),
 		foldCounts = {},
 		onToggleFold,
+		// Collapse/expand every heading section at once (the Outline header buttons).
+		// Same shared fold state as `onToggleFold`, driven through the notebook.
+		onCollapseAllFolds,
+		onExpandAllFolds,
 		mcp = null,
 		kernelInfo,
 		kernelBusy,
@@ -674,6 +678,26 @@
 {#snippet outlineSection()}
 	<div class="flex items-center">
 		{@render header('outline', 'Outline', 'section-outline')}
+		{#if open.outline && outlineRows.length}
+			<button
+				class="btn btn-ghost btn-xs btn-square text-base-content/40 hover:text-base-content"
+				onclick={() => onCollapseAllFolds?.()}
+				title="Collapse all headings"
+				aria-label="Collapse all headings"
+				data-testid="outline-collapse-all"
+			>
+				<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6" /><path d="m18 8-6-6-6 6" /></svg>
+			</button>
+			<button
+				class="btn btn-ghost btn-xs btn-square mr-1 text-base-content/40 hover:text-base-content"
+				onclick={() => onExpandAllFolds?.()}
+				title="Expand all headings"
+				aria-label="Expand all headings"
+				data-testid="outline-expand-all"
+			>
+				<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /><path d="m6 16 6 6 6-6" /></svg>
+			</button>
+		{/if}
 	</div>
 	{#if open.outline}
 		<div class="px-2 pb-2" data-testid="outline-body">
