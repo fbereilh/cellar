@@ -12,6 +12,7 @@
 		canSaveAsPy = false, // a notebook is active → it can be exported to a .py
 		canConvertToIpynb = false, // the active notebook is a .py → it can be run into an .ipynb
 		converting = false,
+		canExportHtml = false, // a notebook is active, so there's something to export
 		onSelectTab,
 		onCloseTab,
 		onPromoteTab,
@@ -19,6 +20,7 @@
 		onConsolidateImports,
 		onSaveAsPy,
 		onConvertToIpynb,
+		onExportHtml,
 		onOpenSettings
 	} = $props();
 
@@ -74,6 +76,17 @@
 							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6" /><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M3 22v-6h6" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /></svg>
 						{/if}
 						Convert to .ipynb…
+					</button>
+				</li>
+				<li>
+					<button
+						onclick={onExportHtml}
+						disabled={!canExportHtml}
+						title="Export this notebook as a single self-contained HTML file (rendered markdown, code, and its saved outputs) you can share with anyone"
+						data-testid="export-html"
+					>
+						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="m7 10 5 5 5-5" /><path d="M12 15V3" /></svg>
+						Export to HTML
 					</button>
 				</li>
 				<li>

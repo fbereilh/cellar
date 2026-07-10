@@ -531,6 +531,19 @@
 		}
 	}
 
+	// Download the active notebook as a single self-contained HTML file. The server
+	// route renders the notebook model + its persisted outputs and returns an
+	// attachment; a hidden <a download> click saves it next to the user's choosing.
+	function exportHtml() {
+		if (!activeNotebookPath) return;
+		const a = document.createElement('a');
+		a.href = '/api/notebooks/export?path=' + encodeURIComponent(activeNotebookPath);
+		a.download = '';
+		document.body.appendChild(a);
+		a.click();
+		a.remove();
+	}
+
 	async function scrollToCell(id, foldKey = null) {
 		// Open + focus the notebook the outline currently reflects, then scroll. With
 		// no active notebook the outline and search are empty, so there is no row to
@@ -766,6 +779,7 @@
 		canSaveAsPy={!!activeNotebookPath}
 		canConvertToIpynb={activeNotebookIsPy}
 		{converting}
+		canExportHtml={!!activeNotebookPath}
 		onSelectTab={selectTab}
 		onCloseTab={closeTab}
 		onPromoteTab={promoteTab}
@@ -773,6 +787,7 @@
 		onConsolidateImports={consolidateImports}
 		onSaveAsPy={openSaveAsPy}
 		onConvertToIpynb={convertToIpynb}
+		onExportHtml={exportHtml}
 		onOpenSettings={() => (settingsOpen = true)}
 	/>
 
