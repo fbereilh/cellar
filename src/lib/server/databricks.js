@@ -242,6 +242,13 @@ import json, sys
 
 MAX_ROWS = 500
 
+# A per-request read timeout so a wedged socket read fails fast (and the SDK
+# retries) instead of hanging until the parent SIGKILLs us at PROBE_TIMEOUT_MS -
+# which is exactly what surfaced as the silent "no result and no stderr". Every
+# listing call is small, so this only ever trips on a genuinely stalled
+# connection, never on a legitimately large-but-flowing response.
+HTTP_TIMEOUT = 30
+
 def classify(e):
     n = type(e).__name__
     m = str(e)
@@ -298,10 +305,23 @@ def enum_value(v):
 
 def clusters(w):
     # Job / pipeline clusters are transient and cannot be attached to, so they
-    # would only ever be dead rows in the picker.
+    # would only ever be dead rows in the picker. Filter them out SERVER-SIDE:
+    # a busy workspace accumulates thousands of one-shot job/pipeline run
+    # clusters, and listing them all means the SDK pages through hundreds of
+    # responses - slow, and prone to stall on a single wedged socket read, which
+    # is what SIGKILLed the probe at PROBE_TIMEOUT_MS and produced the silent
+    # "no result and no stderr". Asking the server for only the attachable
+    # (UI/API) clusters keeps the result to a handful of rows and one page.
+    # Fall back to the unfiltered walk if the installed SDK predates filter_by.
     skip = ('JOB', 'PIPELINE', 'MODELS', 'SQL')
+    try:
+        from databricks.sdk.service.compute import ListClustersFilterBy, ClusterSource
+        it = w.clusters.list(
+            filter_by=ListClustersFilterBy(cluster_sources=[ClusterSource.UI, ClusterSource.API]))
+    except Exception:
+        it = w.clusters.list()
     rows = []
-    for c in w.clusters.list():
+    for c in it:
         source = (enum_value(getattr(c, 'cluster_source', None)) or '').upper()
         if any(s in source for s in skip):
             continue
@@ -364,9 +384,9 @@ def build_client(auth):
     from databricks.sdk.core import Config
     mode = auth.get('mode')
     if mode == 'pat':
-        cfg = Config(profile=auth['profile'])
+        cfg = Config(profile=auth['profile'], http_timeout_seconds=HTTP_TIMEOUT)
     elif mode == 'oauth':
-        cfg = Config(host=auth['host'], auth_type='external-browser')
+        cfg = Config(host=auth['host'], auth_type='external-browser', http_timeout_seconds=HTTP_TIMEOUT)
     else:
         raise ValueError('unknown auth mode: %r' % (mode,))
     return WorkspaceClient(config=cfg)
@@ -477,7 +497,9 @@ function probe(request, timeoutMs = PROBE_TIMEOUT_MS) {
 		});
 		let stdout = '';
 		let stderr = '';
+		let killedByTimeout = false;
 		const timer = setTimeout(() => {
+			killedByTimeout = true;
 			child.kill('SIGKILL');
 			reject(
 				request.op === 'login'
@@ -499,7 +521,7 @@ function probe(request, timeoutMs = PROBE_TIMEOUT_MS) {
 			logError('databricks', `could not run probe (${request.op}): ${err.message}`);
 			reject(new DatabricksError('no_python', `could not run ${python}: ${err.message}`));
 		});
-		child.on('exit', () => {
+		child.on('exit', (code, signal) => {
 			clearTimeout(timer);
 			// The subprocess's raw stderr is exactly the underlying detail the friendly
 			// UI copy hides (a traceback, a TLS/connection error, an SDK deprecation),
@@ -508,9 +530,22 @@ function probe(request, timeoutMs = PROBE_TIMEOUT_MS) {
 			if (err) logWarn('databricks', `probe stderr (${request.op}): ${err}`);
 			const line = stdout.split('\n').find((l) => l.startsWith(SENTINEL));
 			if (!line) {
-				// The script always prints one; getting here means python itself died.
-				logError('databricks', `probe (${request.op}) produced no result${err ? '' : ' and no stderr'}`);
-				reject(new DatabricksError('error', stderr.trim() || 'the Databricks probe produced no result'));
+				// The timeout path already rejected with a clear message and killed the
+				// child itself, so this SIGKILL is ours - don't mislabel it as a crash.
+				if (killedByTimeout) return;
+				// The script always prints one; getting here means python itself died
+				// before it could. Surface HOW it died (a hard crash must read as a hard
+				// crash, not a silent "no result") - the signal/code is the whole clue.
+				const how = signal ? `signal=${signal}` : `code=${code}`;
+				const hint =
+					signal === 'SIGSEGV' ? ' (segfault)' : code === 137 ? ' (killed, likely OOM)' : '';
+				logError(
+					'databricks',
+					`probe (${request.op}) produced no result: python exited ${how}${hint}${err ? '' : ' with no stderr'}`
+				);
+				reject(
+					new DatabricksError('error', err || `the Databricks probe crashed: python exited ${how}${hint}`)
+				);
 				return;
 			}
 			try {
