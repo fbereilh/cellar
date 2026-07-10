@@ -12,13 +12,13 @@
 	// `nb: path` so it mutates *this* notebook's file, not the active one). The
 	// default workspace notebook and every opened `.ipynb` use this same
 	// component — one code path, one behavior. Runs go through the single shared
-	// kernel; the parent serializes runs across notebooks via `busy`.
+	// kernel, which serializes them itself: a run requested while it is busy is
+	// queued server-side (`run-queue.js`), so this component never gates a run.
 	// `gitRefresh` is the shell's `fsRefreshSignal`: a bump means the workspace's
 	// git state may have moved, so re-fetch the HEAD baseline the cells diff against.
 	let {
 		path,
 		active = false,
-		busy = false,
 		theme = 'dim',
 		gitRefresh = 0,
 		onCellsChange,
@@ -32,6 +32,13 @@
 	let fetching = $state(true); // loading the notebook's cells from the server
 	let loadError = $state('');
 	let runningId = $state(null); // the cell running in THIS notebook (≤1)
+	// Cells of THIS notebook waiting in the kernel's global FIFO → their 1-based
+	// position in that queue (1 = next up). The positions are global on purpose:
+	// a cell queued here may be waiting behind a cell in another notebook, and
+	// "queued · 3" should say so. Mirrored from the server's `queue:changed`
+	// snapshot, never derived locally — the queue spans notebooks and tabs, so no
+	// single client can compute it.
+	let queued = $state({});
 	let activeId = $state(null); // the selected/focused cell (visual emphasis)
 	// The cell an AGENT (MCP) is currently running here, or null. Distinct from
 	// `runningId` - which is set for every run, including this tab's own and other
@@ -356,12 +363,19 @@
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
-			// finished server-side) would leave the spinner stuck and permanently block
-			// this tab's own runs via the `busy || runningId` guard in runCell.
+			// finished server-side) would leave the spinner stuck and, via runCell's
+			// `runningId === id` double-submit guard, permanently refuse to re-run it.
 			runningId = null;
 			agentRunningId = null;
 			sseReplace.clear();
 			lastSeq = null; // reconnect refetches once here; don't also trip the seq-gap check
+			// `queued` is NOT reset: the queue lives on the server and outlives this
+			// refetch. Apply any snapshot that arrived before we knew our absolute id.
+			if (pendingQueueEvent) {
+				const ev = pendingQueueEvent;
+				pendingQueueEvent = null;
+				applyQueueEvent(ev);
+			}
 		} catch (err) {
 			loadError = String(err?.message ?? err);
 		} finally {
@@ -429,6 +443,37 @@
 		}
 	}
 
+	// The kernel's queue, rebroadcast in full on every change (and replayed to us
+	// on subscribe / SSE connect). Keep only this notebook's entries, but preserve
+	// their GLOBAL position so the badge tells the truth about how many runs are
+	// ahead. A snapshot that lands before `load()` has told us our absolute id is
+	// held, not dropped: it may be the only one until the queue next changes.
+	let pendingQueueEvent = null;
+	function applyQueueEvent(ev) {
+		if (!canonicalId) {
+			pendingQueueEvent = ev;
+			return;
+		}
+		const next = {};
+		for (const item of ev.queue ?? []) {
+			if (item.nb === canonicalId) next[item.cellId] = item.position;
+		}
+		queued = next;
+
+		// The snapshot also names the cell holding the kernel, which is how a tab that
+		// connects mid-run learns what is executing — `run:start` fired before it was
+		// listening. Without this, such a tab renders cells "queued · 1" behind a cell
+		// it shows as idle. `run:start` still owns `agentRunningId`: adopting a
+		// running cell must not scroll a tab that never saw the agent start it.
+		const running = ev.running?.nb === canonicalId ? ev.running.cellId : null;
+		if (running) {
+			if (findCell(running)) runningId = running;
+		} else if (runningId) {
+			// The kernel is idle, or busy with another notebook: nothing of ours runs.
+			runningId = null;
+		}
+	}
+
 	function applyRunEvent(ev) {
 		const cell = ev.cellId && findCell(ev.cellId);
 		if (ev.type === 'run:start') {
@@ -474,6 +519,14 @@
 				return;
 			}
 			if (ev.type === 'hello') return;
+			// The run queue spans every notebook (one kernel), so its events carry no
+			// `nb` and no `seq`: each is a full snapshot. Dispatch before the
+			// per-notebook filter, and without the `originId` echo suppression below —
+			// the queue is shared state, not one tab's action, so every tab renders it.
+			if (ev.type === 'queue:changed') {
+				applyQueueEvent(ev);
+				return;
+			}
 			if (!canonicalId || ev.nb !== canonicalId) return;
 			// A gap in this notebook's monotonic seq means we missed events → refetch.
 			if (lastSeq !== null && ev.seq > lastSeq + 1) load();
@@ -509,6 +562,18 @@
 		if (!rootEl.contains(document.activeElement)) rootEl.focus({ preventScroll: true });
 	});
 
+	/**
+	 * Request a run. The single shared kernel runs one cell at a time app-wide,
+	 * but the serialization lives on the SERVER (`run-queue.js`): a run requested
+	 * while the kernel is busy waits its turn in a kernel-global FIFO instead of
+	 * being dropped, and the `/run` response stream simply stays open across the
+	 * wait. So this function no longer gates on a busy flag — it POSTs, and the
+	 * server decides when the cell actually executes.
+	 *
+	 * The only local guard left is against enqueueing the same cell twice from the
+	 * same click; the server dedupes authoritatively (`run:duplicate`), because a
+	 * second tab or an agent can ask for the same cell at the same moment.
+	 */
 	async function runCell(id, source) {
 		const cell = findCell(id);
 		if (!cell) return;
@@ -517,13 +582,14 @@
 			await editCell(id, source);
 			return;
 		}
-		// Single shared kernel → one cell runs at a time, app-wide. `runningId` is
-		// set synchronously below so a rapid double run can't slip through before
-		// `busy` (an async-propagated prop) reflects this notebook's own run.
-		if (busy || runningId) return;
-		runningId = id;
+		if (runningId === id || queued[id] != null) return;
 		onRunStart?.(path, id);
 		cell.source = source;
+		// The run's own lifecycle, learned from the server: `started` flips on the
+		// `run:start` frame. Everything that mutates this cell's outputs is gated on
+		// it, so a request the server refused (duplicate) or dropped (a restart
+		// cancelled the queued run) never touches what is on screen.
+		let started = false;
 		let replace = true; // replace prior output only when new output arrives (no flash)
 		try {
 			const res = await fetch(`/api/cells/${id}/run`, {
@@ -544,7 +610,11 @@
 					buf = buf.slice(nl + 1);
 					if (!line) continue;
 					const ev = JSON.parse(line);
-					if (ev.type === 'output') {
+					if (ev.type === 'run:start') {
+						// The kernel is ours now (immediately, or after a wait in the queue).
+						started = true;
+						runningId = id;
+					} else if (ev.type === 'output') {
 						if (replace) {
 							cell.outputs = [ev.output];
 							replace = false;
@@ -554,14 +624,23 @@
 					} else if (ev.type === 'run:end') {
 						stampLastRun(cell, ev); // this tab's own user run → its badge
 					}
+					// `run:duplicate` / `run:cancelled` close the stream without a run:start:
+					// the cell keeps its outputs untouched and the queue badge (if any) is
+					// cleared by the `queue:changed` broadcast, not from here.
 				}
 			}
 		} catch (err) {
+			// The request itself failed (the server is gone). That IS this cell's
+			// result; `replace = false` keeps the `finally` below from clearing it.
 			cell.outputs = [{ output_type: 'error', ename: 'CellarError', evalue: String(err), traceback: [String(err)] }];
 			replace = false;
 		} finally {
-			if (replace) cell.outputs = []; // ran with no output → clear
-			if (runningId === id) runningId = null; // don't clear a spinner an overlapping run moved elsewhere
+			if (started && replace) cell.outputs = []; // ran with no output → clear
+			// Only a run WE actually started may clear the spinner: a request the server
+			// answered `run:duplicate` was refused precisely because that cell is running
+			// (here or in another tab), and clearing then would erase a live indicator.
+			// The `=== id` test additionally keeps an overlapping run's spinner alone.
+			if (started && runningId === id) runningId = null;
 			onRunEnd?.();
 		}
 	}
@@ -1055,6 +1134,7 @@
 			{cells}
 			{theme}
 			runningId={runningId}
+			{queued}
 			{activeId}
 			{keyMode}
 			hidden={folding.hidden}

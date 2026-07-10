@@ -86,15 +86,24 @@ Follow this house style:
    than add_cell followed by run_cell. Reserve add_cell for cells you are adding
    without running yet (e.g. markdown headers, or code you will run later).
 
+8. ONE KERNEL, ONE RUN AT A TIME. Every open notebook shares a single kernel, and
+   a human may be running a cell in it right now. Your run is never dropped: it
+   joins a FIFO queue, so run_cell simply takes longer to return when the kernel
+   is busy (its result then carries queued:true and the position it waited at).
+   run_queue shows what is running and what is waiting. Do not interrupt or
+   restart the kernel just because a run is slow to come back — that also drops
+   every queued run, the user's included.
+
 The goal: a notebook a human would be happy to have written — imports up top,
 shared state, a clean section outline, and a continuous line of reasoning from
 first cell to last.`;
 
 function registerTools(server) {
 	// --- lifecycle ---
-	server.registerTool('restart_kernel', { description: 'Restart the kernel (clears the namespace and opens a new kernel session, so every cell reverts to ran_this_session:false). Does NOT affect the MCP connection or document.', inputSchema: {} }, async () => text(await svc.kernel.restart()));
-	server.registerTool('interrupt_kernel', { description: 'Interrupt the running kernel.', inputSchema: {} }, async () => text(await svc.kernel.interrupt()));
+	server.registerTool('restart_kernel', { description: 'Restart the kernel (clears the namespace and opens a new kernel session, so every cell reverts to ran_this_session:false). Also DROPS every queued run: queued work was submitted against the namespace you are clearing. Does NOT affect the MCP connection or document.', inputSchema: {} }, async () => text(await svc.kernel.restart()));
+	server.registerTool('interrupt_kernel', { description: 'Interrupt the running kernel, and drop every queued run (stop means stop).', inputSchema: {} }, async () => text(await svc.kernel.interrupt()));
 	server.registerTool('kernel_status', { description: 'Current kernel status, plus the live kernel session: {started, session_id, execs_this_session}. execs_this_session:0 means no cell has run against this namespace yet, whatever the notebook\'s saved outputs suggest.', inputSchema: {} }, async () => text(svc.kernel.status()));
+	server.registerTool('run_queue', { description: 'The kernel run queue: {running, queue}. There is ONE kernel behind every open notebook, so one cell runs at a time app-wide and everything else waits in a FIFO - a run you request while a user\'s (or another notebook\'s) cell is executing is QUEUED, never dropped. Each entry carries {nb, cellId, actor, position} (position 1 = next up). Reads only; it never boots a kernel.', inputSchema: {} }, async () => text(svc.getRunQueue()));
 	server.registerTool('list_notebooks', { description: 'List every .ipynb in the workspace (workspace-relative paths) so you can discover notebook names to open, and which one is currently active. Use open_notebook to focus one of these.', inputSchema: {} }, async () => text(svc.listNotebooks()));
 	server.registerTool('open_notebook', { description: 'Open and focus an existing workspace notebook by name; surfaces it live in the UI. Use create_notebook to make a new one.', inputSchema: { name: z.string() } }, async ({ name }) => { try { return text(svc.openNotebook(name)); } catch (e) { return notFound(String(e?.message ?? e)); } });
 	server.registerTool('create_notebook', { description: 'Create a NEW workspace notebook by name (a .ipynb file), make it active, and surface it live in the open UI. Omit name for an untitled notebook. To open a notebook that already exists, use open_notebook instead.', inputSchema: { name: z.string().optional() } }, async ({ name }) => text(svc.createNotebook(name)));
@@ -127,10 +136,10 @@ function registerTools(server) {
 
 	// --- execute ---
 	server.registerTool('add_and_run', { description: 'PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|markdown cell (default code) with the given source, after a cell (after_id) or appended at the end, runs it, and returns run_cell\'s result (status + outputs) plus the new cell id. Code that raises returns the error as the result (does not fail — the cell still exists). A markdown cell_type is created but not run (status "skipped"), same as run_cell — for markdown use add_cell. Use add_cell (no run) only when you want to add a cell WITHOUT running it.', inputSchema: { source: z.string(), cell_type: z.enum(['code', 'markdown']).optional(), after_id: z.string().optional() } }, async ({ source, cell_type, after_id }) => text(await svc.addAndRun({ source, cellType: cell_type, afterId: after_id })));
-	server.registerTool('run_cell', { description: 'Run one cell by UUID (markdown cells are skipped).', inputSchema: { id: z.string() } }, async ({ id }) => { const r = await svc.runCell(id); return r ? text(r) : notFound(`cell ${id} not found`); });
-	server.registerTool('run_cells', { description: 'Run multiple cells in order.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(await svc.runCells(ids)));
-	server.registerTool('run_all', { description: 'Run all code cells in document order.', inputSchema: {} }, async () => text(await svc.runAll()));
-	server.registerTool('run_range', { description: 'Run code cells in the inclusive range from one cell to another.', inputSchema: { from_id: z.string(), to_id: z.string() } }, async ({ from_id, to_id }) => text(await svc.runRange(from_id, to_id)));
+	server.registerTool('run_cell', { description: 'Run one cell by UUID (markdown cells are skipped). One shared kernel means one run at a time app-wide: if the kernel is busy your run is QUEUED (never dropped) and this call waits its turn, then returns the real outputs annotated queued:true + queue_position + waited_ms. If that cell is ALREADY queued (or running) it is not enqueued twice - the call returns immediately with status "queued" (or "running") and its queue_position; a pending run has its source refreshed to the current one. status "cancelled" means an interrupt/restart dropped the queued run before it started; nothing executed. See run_queue.', inputSchema: { id: z.string() } }, async ({ id }) => { const r = await svc.runCell(id); return r ? text(r) : notFound(`cell ${id} not found`); });
+	server.registerTool('run_cells', { description: 'Run multiple cells in order, each waiting its turn in the kernel queue. Stops at the first cell whose queued run an interrupt/restart cancelled (status "cancelled") - the rest would run against a namespace their predecessors never populated.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(await svc.runCells(ids)));
+	server.registerTool('run_all', { description: 'Run all code cells in document order (same queueing + cancellation semantics as run_cells).', inputSchema: {} }, async () => text(await svc.runAll()));
+	server.registerTool('run_range', { description: 'Run code cells in the inclusive range from one cell to another (same queueing + cancellation semantics as run_cells).', inputSchema: { from_id: z.string(), to_id: z.string() } }, async ({ from_id, to_id }) => text(await svc.runRange(from_id, to_id)));
 
 	// --- prompt: the house style as a surfaceable slash-command ---
 	server.registerPrompt('cellar_notebook_style', { description: "Cellar's house style for building one coherent notebook." }, () => ({

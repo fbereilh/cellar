@@ -51,21 +51,24 @@
 	}
 
 	// Single shared kernel → at most one cell runs at a time across ALL notebooks.
-	let runBusy = $state(false);
+	// Serializing them is the SERVER's job (`run-queue.js`): a run requested while
+	// the kernel is busy is queued, not dropped, so this is no longer a gate — it
+	// is a count of runs this browser has in flight (a queued one included), used
+	// only to keep the kernel badge reading "busy" while they resolve. A count,
+	// not a boolean, because several runs can now legitimately overlap here.
+	let runsInFlight = $state(0);
+	const runBusy = $derived(runsInFlight > 0);
 	function onRunStart() {
-		runBusy = true;
+		runsInFlight += 1;
 		// A run implies a live kernel, and the first run is what boots it (`/api/kernel`
 		// only reads, never boots). Record that optimistically so the kernel card and
-		// navbar badge stay truthful once `runBusy` clears below, without waiting on a
-		// status round-trip. This also supersedes any `/api/kernel` read still in flight
+		// navbar badge stay truthful once the runs drain, without waiting on a status
+		// round-trip. This also supersedes any `/api/kernel` read still in flight
 		// - notably the mount-time one, which legitimately answers "not started".
 		markKernelStarted();
 	}
 	function onRunEnd() {
-		// Clear the run gate synchronously. `runBusy` serializes runs across notebooks,
-		// so holding it across a status round-trip would silently swallow the next Run
-		// click / ⌘Enter - and would strand the gate open entirely if the refresh threw.
-		runBusy = false;
+		runsInFlight = Math.max(0, runsInFlight - 1);
 		// A run may have booted the kernel or changed variables → refresh the sidebar
 		// in the background; neither is on the critical path for the next run.
 		refreshKernel();
@@ -524,7 +527,6 @@
 					<LiveNotebook
 						path={canonicalNotebookRel}
 						active={activeTabId === 'notebook'}
-						busy={runBusy}
 						{theme}
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
@@ -541,7 +543,6 @@
 					<LiveNotebook
 						path={tab.path}
 						active={activeTabId === tab.id}
-						busy={runBusy}
 						{theme}
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
