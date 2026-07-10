@@ -333,6 +333,18 @@
 		}
 	});
 
+	/**
+	 * Replace the editor's text with a deliberate *local* rewrite (a heading
+	 * toggle, the upper half of a split). Cancels any pending debounce, because
+	 * the caller persists the new source itself, and reuses the remote-apply path
+	 * so the update listener doesn't echo the same text back as a second save.
+	 */
+	function replaceSource(src) {
+		clearTimeout(editTimer);
+		editPending = false;
+		applySourceToEditor(src);
+	}
+
 	function loadRemote() {
 		if (pendingRemoteSource != null && pendingRemoteSource !== currentSource()) {
 			applySourceToEditor(pendingRemoteSource);
@@ -482,7 +494,13 @@
 			enterEdit,
 			editorOverlayOpen,
 			run: doRun,
-			isMarkdown: () => isMarkdown
+			isMarkdown: () => isMarkdown,
+			// Primitives the notebook's cut/copy, heading and split actions compose.
+			// `currentSource` is the editor's live text (never the debounced
+			// `cell.source`), and `cursorOffset` is where a split divides it.
+			currentSource,
+			cursorOffset: () => (view ? view.state.selection.main.head : 0),
+			replaceSource
 		});
 		// Measure editor content height so a tall code cell auto-collapses. A
 		// ResizeObserver re-measures on content growth AND on the hidden→visible
@@ -516,7 +534,9 @@
      selection, so the browser's focus outline is suppressed. -->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <div
-	class="card relative overflow-hidden border bg-base-100 shadow-sm transition-colors {showRunning
+	bind:this={cardEl}
+	tabindex="-1"
+	class="card relative overflow-hidden border bg-base-100 shadow-sm outline-none transition-colors {showRunning
 		? 'border-warning/60 ring-1 ring-warning/40'
 		: active
 			? 'border-primary/50 ring-1 ring-primary/40'

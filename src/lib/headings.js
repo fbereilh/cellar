@@ -73,6 +73,27 @@ export function headerLevel(cell) {
 	return splitHeadingSegments(cell.source)[0]?.level ?? null;
 }
 
+// A heading line's leading `#`s and the whitespace around them. The `#`s are
+// optional, so the indentation of a plain (or code) line is stripped too - a
+// heading never carries the indentation of the line it was made from.
+const HEADING_PREFIX = /^\s*(?:#{1,6}[ \t]*)?/;
+
+/**
+ * `source` rewritten so its first non-empty line is an H`level` heading: the
+ * line's existing heading prefix (if any) is replaced, so pressing 2 after 1
+ * demotes rather than nesting. Everything below the first line is untouched.
+ * The inverse of `headerLevel`, which reads that same first non-empty line off
+ * the cell's leading segment.
+ */
+export function withHeadingLevel(source, level) {
+	const hashes = '#'.repeat(Math.min(Math.max(level, 1), 6));
+	const lines = String(source ?? '').split('\n');
+	const i = lines.findIndex((l) => l.trim() !== '');
+	if (i < 0) return `${hashes} `; // an empty cell becomes an empty heading to type into
+	lines[i] = `${hashes} ${lines[i].replace(HEADING_PREFIX, '')}`;
+	return lines.join('\n');
+}
+
 /** Every heading in the notebook, in document order (the Outline's rows). */
 export function outlineHeadings(cells) {
 	const out = [];
