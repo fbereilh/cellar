@@ -86,11 +86,11 @@ function starterCell() {
 	};
 }
 
-function newCell(cellType = 'code') {
+function newCell(cellType = 'code', source = '') {
 	return {
 		id: mintId(),
 		cell_type: cellType === 'markdown' ? 'markdown' : 'code',
-		source: '',
+		source: typeof source === 'string' ? source : '',
 		outputs: [],
 		metadata: { cellar: { extract: false, visible: true } }
 	};
@@ -414,9 +414,15 @@ export function moveCellTo(id, index, nb, originId) {
 	return true;
 }
 
-export function addCell(afterId, cellType = 'code', nb, originId) {
+/**
+ * Add a cell after `afterId` (appended when it is absent or unknown).
+ * `source` seeds the new cell, so a paste / split / undo-delete lands as ONE
+ * persist and ONE `cell:added` event carrying the real text - rather than an
+ * empty cell that a follow-up edit fills in.
+ */
+export function addCell(afterId, cellType = 'code', nb, originId, source = '') {
 	const doc = docFor(nb);
-	const cell = newCell(cellType);
+	const cell = newCell(cellType, source);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
 	if (idx >= 0) doc.cells.splice(idx + 1, 0, cell);
 	else doc.cells.push(cell);

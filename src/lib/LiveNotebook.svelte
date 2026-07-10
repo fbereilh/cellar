@@ -2,9 +2,10 @@
 	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
-	import { cellIdOfKey, computeFolding, headerLevel } from '$lib/headings.js';
+	import { cellIdOfKey, computeFolding, headerLevel, withHeadingLevel } from '$lib/headings.js';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff.js';
-	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte.js';
+	import { cellClipboard } from '$lib/cellClipboard.js';
+	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte.js';
 
 	// A live, kernel-attached notebook document addressed by its workspace path.
 	// Owns its own cell array + all cell operations (every request carries
@@ -546,7 +547,10 @@
 			body: JSON.stringify({ path })
 		}).catch(() => {});
 		window.addEventListener('keydown', onKeydown, true);
-		return () => window.removeEventListener('keydown', onKeydown, true);
+		return () => {
+			window.removeEventListener('keydown', onKeydown, true);
+			clearPending(); // a half-typed `d` must not survive into the next tab
+		};
 	});
 
 	// Command-mode keys only fire for keystrokes aimed at this notebook, so a
@@ -675,8 +679,83 @@
 		});
 	}
 
+	// ---- Cut / copy / paste / undo-delete ------------------------------------
+	// The clipboard is shared across notebooks (`cellClipboard`); the undo stack is
+	// per-notebook and local: it records the cells THIS user deleted here, so `z`
+	// can never resurrect a cell an agent (or another tab) deliberately removed.
+	const UNDO_LIMIT = 20;
+	/** @type {{index:number, cell_type:string, source:string, output_scrolled?:boolean}[]} */
+	let deletedCells = [];
+
+	/** A cell as the clipboard and the undo stack store it: live source, no outputs. */
+	function snapshotCell(cell) {
+		return {
+			cell_type: cell.cell_type,
+			source: cellApis[cell.id]?.currentSource?.() ?? cell.source,
+			output_scrolled: cell.metadata?.cellar?.output_scrolled
+		};
+	}
+
+	/**
+	 * Insert a cell carrying `spec`'s type + source at `index`, and return it.
+	 * The caller selects it: paste selects the last pasted cell, undo the restored
+	 * one.
+	 */
+	async function insertCellAt(index, spec) {
+		const at = Math.max(0, Math.min(index, cells.length));
+		const afterId = at > 0 ? cells[at - 1]?.id : null;
+		// The add API can only insert *after* an id, so an insert at the very top
+		// appends and then hoists (one extra persist, identical clean-on-save result).
+		const created = await addCell(afterId ?? cells.at(-1)?.id, spec.cell_type, spec.source);
+		if (!afterId && cells.length > 1) await moveCellToIndex(created.id, 0);
+		if (spec.output_scrolled !== undefined) await setScrolled(created.id, spec.output_scrolled);
+		return created;
+	}
+
+	function copyActive() {
+		const cell = findCell(activeId);
+		if (cell) cellClipboard.copy([snapshotCell(cell)]);
+	}
+
+	function cutActive() {
+		const cell = findCell(activeId);
+		// A lone cell can't be deleted (below), so it can't be cut either: half a cut
+		// - copied but still there - would be worse than doing nothing.
+		if (!cell || cells.length <= 1) return;
+		cellClipboard.copy([snapshotCell(cell)]);
+		deleteCell(cell.id);
+	}
+
+	async function pasteCells(where) {
+		const entries = cellClipboard.read();
+		if (!entries.length) return;
+		const i = cells.findIndex((c) => c.id === activeId);
+		// No selection (an empty notebook) → paste at the end.
+		let index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
+		let last = null;
+		for (const entry of entries) {
+			last = await insertCellAt(index, entry);
+			index++;
+		}
+		if (last) await selectAndFocus(last.id);
+	}
+
+	async function undoDelete() {
+		const record = deletedCells.pop();
+		if (!record) return;
+		const restored = await insertCellAt(record.index, record);
+		await selectAndFocus(restored.id);
+	}
+
 	async function deleteCell(id) {
 		const i = cells.findIndex((c) => c.id === id);
+		const cell = cells[i];
+		// A notebook always keeps at least one cell - the same invariant the toolbar's
+		// delete button enforces by disabling itself at one cell - so there is always
+		// somewhere to type. `dd` and cut honor it rather than quietly diverging.
+		if (!cell || cells.length <= 1) return;
+		deletedCells.push({ index: i, ...snapshotCell(cell) });
+		if (deletedCells.length > UNDO_LIMIT) deletedCells.shift();
 		cells = cells.filter((c) => c.id !== id);
 		// Keep a cell selected: command mode acts on the selection, so deleting the
 		// selected cell must hand the selection to its neighbor, not drop it. Focus
@@ -746,11 +825,13 @@
 		});
 	}
 
-	async function addCell(afterId, cellType = 'code') {
+	// `source` seeds the new cell server-side, so a paste / split / undo-delete is
+	// one request, one persist and one `cell:added` event carrying the real text.
+	async function addCell(afterId, cellType = 'code', source = '') {
 		const res = await fetch('/api/cells', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ afterId, cellType, nb: path, originId })
+			body: JSON.stringify({ afterId, cellType, source, nb: path, originId })
 		});
 		const { cell } = await res.json();
 		const view = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs, metadata: cell.metadata ?? {} };
@@ -866,6 +947,56 @@
 		else await selectAndFocus(id);
 	}
 
+	// Alt+Enter: run in place, then insert a fresh cell below and start typing in
+	// it (Jupyter lands in edit mode there, whichever mode the run came from).
+	async function runAndInsertBelow() {
+		const id = activeId;
+		if (!id) return;
+		cellApis[id]?.run(false); // fire; the insert shouldn't wait for the kernel
+		const created = await addCell(id);
+		setActive(created.id);
+		await tick();
+		cellApis[created.id]?.enterEdit();
+		scrollCellIntoView(created.id);
+	}
+
+	// Ctrl+Shift+-: split the focused cell at the cursor. The text above the cursor
+	// stays, the text below moves into a new cell of the same type, and (Jupyter)
+	// the lower cell becomes the selected one, still in edit mode.
+	async function splitActiveCell() {
+		const id = activeId;
+		const cell = findCell(id);
+		const api = cellApis[id];
+		if (!cell || !api) return;
+		const source = api.currentSource();
+		const at = api.cursorOffset();
+		api.replaceSource(source.slice(0, at));
+		await editCell(id, source.slice(0, at));
+		const created = await addCell(id, cell.cell_type, source.slice(at));
+		setActive(created.id);
+		await tick();
+		// `enterEdit`, not `focus`: a markdown cell created with text mounts in its
+		// rendered view, whose editor is `display:none` and cannot take the caret.
+		cellApis[created.id]?.enterEdit();
+		scrollCellIntoView(created.id);
+	}
+
+	// 1-6: make the selected cell a markdown heading of that level, converting a
+	// code cell on the way (Jupyter). An existing heading prefix is replaced, so
+	// pressing 2 after 1 demotes the heading rather than nesting a second one.
+	async function setHeadingLevel(level) {
+		const id = activeId;
+		const cell = findCell(id);
+		if (!cell) return;
+		if (cell.cell_type !== 'markdown') await setType(id, 'markdown');
+		const api = cellApis[id];
+		const source = api?.currentSource?.() ?? cell.source;
+		const next = withHeadingLevel(source, level);
+		if (next === source) return;
+		api?.replaceSource(next);
+		await editCell(id, next);
+	}
+
 	/** shortcut id → what it does. `mode` is the mode the keystroke fired in. */
 	const actions = {
 		'command-mode': () => cellApis[activeId]?.blur(),
@@ -881,8 +1012,55 @@
 		'insert-above': () => insertCell('above'),
 		'insert-below': () => insertCell('below'),
 		'to-markdown': () => activeId && setType(activeId, 'markdown'),
-		'to-code': () => activeId && setType(activeId, 'code')
+		'to-code': () => activeId && setType(activeId, 'code'),
+		'run-insert-below': () => runAndInsertBelow(),
+		'delete-cell': () => activeId && deleteCell(activeId),
+		'undo-delete': () => undoDelete(),
+		'cut-cell': () => cutActive(),
+		'copy-cell': () => copyActive(),
+		'paste-below': () => pasteCells('below'),
+		'paste-above': () => pasteCells('above'),
+		'split-cell': () => splitActiveCell(),
+		...Object.fromEntries([1, 2, 3, 4, 5, 6].map((level) => [`heading-${level}`, () => setHeadingLevel(level)]))
 	};
+
+	// ---- Key sequences (`d d`) -----------------------------------------------
+	// A binding may be several chords long. The leading chords are held here as a
+	// pending prefix until the sequence completes, a foreign key ends it, or it
+	// times out - so a lone `d` does nothing at all.
+	let pendingChords = [];
+	let pendingMode = null; // the mode the prefix was typed in
+	let pendingTimer;
+
+	function clearPending() {
+		clearTimeout(pendingTimer);
+		pendingChords = [];
+		pendingMode = null;
+	}
+
+	function armPending(chords, mode) {
+		clearTimeout(pendingTimer);
+		pendingChords = chords;
+		pendingMode = mode;
+		pendingTimer = setTimeout(clearPending, SEQUENCE_TIMEOUT_MS);
+	}
+
+	/**
+	 * What `chord` means, given any prefix already pending: the shortcut to fire,
+	 * or the prefix to keep waiting on. Always consumes the pending prefix - a
+	 * prefix typed in command mode can never combine with a keystroke in an editor,
+	 * which is what keeps `d` from leaking into typing.
+	 */
+	function resolveChord(mode, chord) {
+		const seq = pendingMode === mode ? [...pendingChords, chord] : [chord];
+		clearPending();
+		const shortcut = shortcuts.lookup(mode, seq.join(' '));
+		if (shortcut) return { shortcut };
+		if (shortcuts.isPrefix(mode, seq)) return { prefix: seq };
+		// The sequence dead-ends (`d` then `j`): let this keystroke stand on its own.
+		if (seq.length > 1) return resolveChord(mode, chord);
+		return {};
+	}
 
 	function onKeydown(e) {
 		// A modal (settings, delete-confirm) owns the keyboard while it is open.
@@ -917,7 +1095,15 @@
 			if (cellApis[focusedId]?.editorOverlayOpen?.()) return;
 		}
 
-		const shortcut = shortcuts.lookup(mode, chord);
+		const { shortcut, prefix } = resolveChord(mode, chord);
+		// The first chord of a sequence is swallowed while we wait for the rest. It
+		// only ever reaches here in a mode where it isn't a character being typed.
+		if (prefix) {
+			e.preventDefault();
+			e.stopPropagation();
+			armPending(prefix, mode);
+			return;
+		}
 		const action = shortcut && actions[shortcut.id];
 		if (!action) return;
 		e.preventDefault();
