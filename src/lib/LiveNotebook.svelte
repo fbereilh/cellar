@@ -1,5 +1,5 @@
 <script>
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
 	import { computeFolding, headerLevel } from '$lib/headings.js';
@@ -17,13 +17,14 @@
 	let fetching = $state(true); // loading the notebook's cells from the server
 	let loadError = $state('');
 	let runningId = $state(null); // the cell running in THIS notebook (≤1)
-	let activeId = $state(null); // the selected cell (Jupyter's "selection")
-	// Jupyter's modal keyboard: 'edit' means the selected cell's editor holds
-	// focus and keystrokes are text; 'command' means they are notebook commands.
-	// Driven purely by the editor's own focus/blur events, so it can never claim
-	// a mode the DOM disagrees with.
-	let keyMode = $state('command');
-	let root = $state(null); // this notebook's DOM subtree (scopes key handling + scroll lookups)
+	let activeId = $state(null); // the selected/focused cell (visual emphasis)
+	// The cell an AGENT (MCP) is currently running here, or null. Distinct from
+	// `runningId` - which is set for every run, including this tab's own and other
+	// tabs' user runs - because only an agent run may move the viewport (see
+	// "Follow the agent" below). Never used for visuals; the running affordance
+	// keys off `runningId` for all runs alike.
+	let agentRunningId = $state(null);
+	let rootEl = $state(null); // this notebook's DOM subtree; cell ids repeat across notebooks
 
 	// Canonical (absolute) notebook id, learned from the server on load. The shell
 	// addresses this component by a workspace-relative `path` (fine for the REST
@@ -113,6 +114,123 @@
 		editorCollapsed = next;
 		saveEditorCollapsed();
 	}
+	// ---- Follow the agent ----------------------------------------------------
+	// When an agent runs a cell we bring that cell into view, so a human watching
+	// can keep up with what is executing. Three rules keep it from being hostile:
+	//
+	//   1. Agent runs only. `run:start` already carries `actor`; a user's own run
+	//      (this tab or another) never moves anyone's viewport.
+	//   2. Follow-tail, not fight-the-user: we scroll only when the running cell
+	//      isn't already on screen, and never while the user is typing in this
+	//      notebook (a viewport jump mid-keystroke is the hostile case).
+	//   3. Selection is untouched - `activeId` stays where the user left it. The
+	//      running cell is marked by its own (warning-hued) accent in `Cell.svelte`.
+
+	let followedId = null; // last agent-run cell we scrolled to (one scroll per run)
+	let lastTypedAt = 0; // last keystroke inside this notebook (see `userIsTyping`)
+
+	// Typing guard. Focus alone is too coarse - a cell keeps editor focus long
+	// after the user stopped typing, and following would silently never happen.
+	const TYPING_GRACE_MS = 3000;
+	function userIsTyping() {
+		if (Date.now() - lastTypedAt > TYPING_GRACE_MS) return false;
+		const el = document.activeElement;
+		return !!(el && rootEl?.contains(el));
+	}
+
+	$effect(() => {
+		const el = rootEl;
+		if (!el) return;
+		const onType = () => (lastTypedAt = Date.now());
+		el.addEventListener('keydown', onType, true);
+		return () => el.removeEventListener('keydown', onType, true);
+	});
+
+	// The scrollable ancestor the notebook lives in (the shell gives each notebook
+	// tab its own `overflow-y-auto` pane). Falls back to the viewport.
+	function scrollParent(el) {
+		for (let p = el.parentElement; p; p = p.parentElement) {
+			const oy = getComputedStyle(p).overflowY;
+			if (oy === 'auto' || oy === 'scroll') return p;
+		}
+		return null;
+	}
+
+	// "Already visible" means the cell's TOP edge is on screen with room to spare:
+	// the run affordance (accent bar, spinner) lives at the top, so a tall cell
+	// scrolled past its header is not actually showing the user anything.
+	function cellIsVisible(el) {
+		const parent = scrollParent(el);
+		const view = parent ? parent.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+		const r = el.getBoundingClientRect();
+		return r.top >= view.top - 4 && r.top <= view.bottom - Math.min(r.height, 96);
+	}
+
+	function scrollCellIntoView(el) {
+		const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+		const behavior = reduce ? 'auto' : 'smooth';
+		const parent = scrollParent(el);
+		if (!parent) {
+			el.scrollIntoView({ behavior, block: 'center' });
+			return;
+		}
+		const view = parent.getBoundingClientRect();
+		const r = el.getBoundingClientRect();
+		const margin = 24;
+		// Center a cell that fits; otherwise pin its top near the pane's top so the
+		// header + first outputs are what the user sees (centering a tall cell would
+		// push its top off screen).
+		const delta =
+			r.height + margin * 2 <= view.height
+				? r.top - view.top - (view.height - r.height) / 2
+				: r.top - view.top - margin;
+		parent.scrollTo({ top: parent.scrollTop + delta, behavior });
+	}
+
+	// Unfold whatever collapsed sections hide `id`, so a cell the agent is running
+	// is actually rendered (a `display:none` cell can neither be scrolled to nor
+	// show its running accent). Fold state is runtime-only, so this costs the user
+	// nothing but a re-fold. Removes exactly the folded headers whose own section
+	// contains the cell - nested outer folds included, unrelated folds untouched.
+	function revealCell(id) {
+		if (!folding.hidden.has(id)) return;
+		const next = new Set(foldedIds);
+		for (const headerId of foldedIds) {
+			if (computeFolding(cells, new Set([headerId])).hidden.has(id)) next.delete(headerId);
+		}
+		foldedIds = next;
+		saveFolds();
+	}
+
+	async function followCell(id) {
+		if (userIsTyping()) return;
+		revealCell(id);
+		await tick(); // an `add_and_run` cell (or a just-revealed one) needs its DOM node
+		// Scope the lookup to THIS notebook: cell ids are unique per document, not
+		// across documents, and every open notebook stays mounted (hidden).
+		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
+		if (!el || cellIsVisible(el)) return;
+		scrollCellIntoView(el);
+	}
+
+	// Follow on agent `run:start`, and also when the user switches to this tab
+	// while an agent run is already in flight (a hidden pane has no geometry to
+	// scroll). One scroll per run: `followedId` clears when the run ends.
+	$effect(() => {
+		const id = agentRunningId;
+		const visible = active;
+		if (!id) {
+			followedId = null;
+			return;
+		}
+		if (!visible || id === followedId) return;
+		followedId = id;
+		// `untrack`: followCell reads (and revealCell writes) fold state - tracking
+		// those would re-run this effect on every cell edit, and turn the unfold
+		// into a write-what-you-read loop.
+		untrack(() => followCell(id));
+	});
+
 	// Cell ids awaiting the first streamed chunk of an SSE run — that chunk
 	// replaces the prior output (no flash). Tracked per-cell (not one shared flag)
 	// so interleaved run:start events for different cells can't consume each other's
@@ -170,6 +288,7 @@
 			// finished server-side) would leave the spinner stuck and permanently block
 			// this tab's own runs via the `busy || runningId` guard in runCell.
 			runningId = null;
+			agentRunningId = null;
 			sseReplace.clear();
 			lastSeq = null; // reconnect refetches once here; don't also trip the seq-gap check
 		} catch (err) {
@@ -210,7 +329,8 @@
 			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
 			if (runningId === ev.cellId) runningId = null;
-			if (activeId === ev.cellId) selectAfterRemoval(i);
+			if (agentRunningId === ev.cellId) agentRunningId = null;
+			if (activeId === ev.cellId) activeId = null;
 		} else if (ev.type === 'cell:moved') {
 			const from = cells.findIndex((c) => c.id === ev.cellId);
 			if (from < 0) return;
@@ -243,6 +363,9 @@
 		if (ev.type === 'run:start') {
 			if (cell) {
 				runningId = ev.cellId;
+				// Only an agent's run earns the viewport; a user run in another tab
+				// must not scroll this one.
+				if (ev.actor === 'agent') agentRunningId = ev.cellId;
 				sseReplace.add(ev.cellId); // first streamed chunk replaces the prior output (no flash)
 			}
 		} else if (ev.type === 'run:output') {
@@ -258,6 +381,7 @@
 			if (cell && sseReplace.delete(ev.cellId)) cell.outputs = []; // ran with no output → clear stale
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;
+			if (agentRunningId === ev.cellId) agentRunningId = null;
 		}
 	}
 
@@ -664,17 +788,15 @@
 		<p class="px-2 text-sm text-base-content/40">loading…</p>
 	</div>
 {:else}
-	<!-- `root` scopes the modal-keyboard handler and cell scroll lookups to THIS
-	     notebook: several notebooks stay mounted (hidden) and a cell id is only
-	     unique within one document. -->
-	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-	<div bind:this={root} tabindex="-1" class="outline-none" data-testid="notebook-root">
+	<!-- `display:contents` - a layout-neutral handle on this notebook's subtree,
+	     used to scope cell lookups (ids repeat across open notebooks) and the
+	     typing guard. -->
+	<div class="contents" bind:this={rootEl}>
 		<Notebook
 			{cells}
 			{theme}
-			{activeId}
-			{keyMode}
 			runningId={runningId}
+			{activeId}
 			hidden={folding.hidden}
 			foldedIds={foldedIds}
 			hiddenCounts={folding.counts}
@@ -691,9 +813,7 @@
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}
 			onActivate={setActive}
-			onRegister={registerCell}
-			onEditorFocus={onEditorFocus}
-			onEditorBlur={onEditorBlur}
+			onReady={registerFocus}
 			onAddCell={addCell}
 		/>
 	</div>
