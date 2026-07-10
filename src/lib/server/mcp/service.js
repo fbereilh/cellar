@@ -25,7 +25,7 @@ import {
 	notebookExists
 } from '../notebook.js';
 import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel.js';
-import { kernelState } from '../inspect.js';
+import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect.js';
 import { agentStatus as databricksStatus, forAgent as databricksCatalog, previewTable } from '../databricks.js';
 import { publish } from '../events.js';
 import { enqueueRun, queueState, queuePosition } from '../run-queue.js';
@@ -352,6 +352,19 @@ export async function getNotebookMap() {
 export async function getKernelState() {
 	const [state, stale] = await Promise.all([kernelState(), staleCells()]);
 	return { ...state, databricks: databricksStatus(), stale_cells: stale };
+}
+
+/**
+ * MCP `list_variables` / `inspect_variable`. Thin pass-throughs to the shared
+ * kernel introspection (`inspect.js`) - the SAME internal-execute probe plumbing
+ * the Variables sidebar and `kernel_state` use, so no user code runs and exec
+ * counts are untouched. Read-only; reflect only the live kernel session.
+ */
+export function getVariables() {
+	return _listVariables();
+}
+export function inspectVariable(name) {
+	return _inspectVariable(name);
 }
 
 /**
