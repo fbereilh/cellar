@@ -3,6 +3,7 @@
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
+	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections.js';
 
 	let {
 		cells,
@@ -43,8 +44,7 @@
 
 	// ---- Persisted section order (drag to reorder) --------------------------
 	const ORDER_KEY = 'cellar-sidebar-order';
-	const DEFAULT_ORDER = ['files', 'kernels', 'agent', 'outline', 'vars', 'search'];
-	let sectionOrder = $state([...DEFAULT_ORDER]);
+	let sectionOrder = $state([...DEFAULT_SECTION_ORDER]);
 
 	function persist(key, value) {
 		try {
@@ -57,12 +57,7 @@
 			if (savedOpen) open = { ...open, ...savedOpen };
 		} catch {}
 		try {
-			const savedOrder = JSON.parse(localStorage.getItem(ORDER_KEY) || 'null');
-			if (Array.isArray(savedOrder)) {
-				// Keep known keys in the saved order, then append any new sections.
-				const known = savedOrder.filter((k) => DEFAULT_ORDER.includes(k));
-				sectionOrder = [...known, ...DEFAULT_ORDER.filter((k) => !known.includes(k))];
-			}
+			sectionOrder = reconcileSectionOrder(JSON.parse(localStorage.getItem(ORDER_KEY) || 'null'));
 		} catch {}
 		try {
 			const savedCollapsed = JSON.parse(localStorage.getItem(OUTLINE_KEY) || 'null');
