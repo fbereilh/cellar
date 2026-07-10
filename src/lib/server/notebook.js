@@ -26,6 +26,7 @@ import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext.js';
 import { publish } from './events.js';
 import { cancelRun } from './run-queue.js';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole.js';
+import { SQL_LANGUAGE } from '../cellLanguage.js';
 
 const FILENAME = 'notebook.ipynb';
 
@@ -89,12 +90,15 @@ function starterCell() {
 }
 
 function newCell(cellType = 'code', source = '') {
+	// 'sql' is a LOGICAL type: an nbformat `code` cell tagged cellar.language='sql'
+	// (see $lib/cellLanguage.js). markdown/code map to their nbformat cell_type.
+	const isSql = cellType === 'sql';
 	return {
 		id: mintId(),
 		cell_type: cellType === 'markdown' ? 'markdown' : 'code',
 		source: typeof source === 'string' ? source : '',
 		outputs: [],
-		metadata: { cellar: { extract: false, visible: true } }
+		metadata: { cellar: { extract: false, visible: true, ...(isSql ? { language: SQL_LANGUAGE } : {}) } }
 	};
 }
 
@@ -509,21 +513,35 @@ export function addCell(afterId, cellType = 'code', nb, originId, source = '') {
 }
 
 /**
- * Switch a cell between 'code' and 'markdown'. Markdown cells carry no outputs —
- * nor the imports role: a markdown cell cannot run, so leaving the designation on
- * one would strand every future routed import in a cell the kernel never sees.
+ * Switch a cell's LOGICAL type between 'code', 'sql', and 'markdown'. 'sql' is a
+ * code cell tagged `cellar.language = 'sql'` ($lib/cellLanguage.js), so it shares
+ * the nbformat `code` type on disk; 'code' clears that tag back to Python.
+ *
+ * Markdown cells carry no outputs - nor the imports role: a markdown cell cannot
+ * run, so leaving the designation on one would strand every future routed import
+ * in a cell the kernel never sees. A SQL cell likewise can't hold Python imports,
+ * so converting to SQL drops the imports role too.
+ *
+ * The `cell:type` event carries the new `language` so live sync updates the
+ * editor's syntax highlighting (SQL ↔ Python) without a reload.
  */
 export function setCellType(id, cellType, nb, originId) {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return;
+	const isSql = cellType === 'sql';
 	cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
-	if (cell.cell_type === 'markdown') {
-		cell.outputs = [];
-		if (cell.metadata?.cellar?.role === IMPORTS_ROLE) delete cell.metadata.cellar.role;
+	cell.metadata = cell.metadata ?? {};
+	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	if (isSql) cell.metadata.cellar.language = SQL_LANGUAGE;
+	else delete cell.metadata.cellar.language;
+	if (cell.cell_type === 'markdown') cell.outputs = [];
+	// SQL and markdown cells cannot be the Python imports cell.
+	if ((cell.cell_type === 'markdown' || isSql) && cell.metadata.cellar.role === IMPORTS_ROLE) {
+		delete cell.metadata.cellar.role;
 	}
 	persist(doc);
-	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type }, originId);
+	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: isSql ? SQL_LANGUAGE : null }, originId);
 }
 
 export function deleteCell(id, nb, originId) {

@@ -18,8 +18,10 @@
  *   finally { ticket.done(); }
  */
 import { execute } from './kernel.js';
-import { setOutputs, setLastRun, clearOutputsLive } from './notebook.js';
+import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook.js';
 import { publish } from './events.js';
+import { isSqlCell } from '../cellLanguage.js';
+import { sqlToPython } from './sql.js';
 
 /**
  * Execute `source` as cell `cellId` of notebook `nb` (an ABSOLUTE path): stream
@@ -49,12 +51,18 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	publish({ type: 'run:start', nb, cellId, actor, at: startedAt, originId });
 	onEvent?.({ type: 'run:start', cellId, at: startedAt });
 
+	// A SQL cell stores raw SQL but the kernel is Python: compile it to the
+	// `spark.sql(...)` wrapper at run time (source on disk stays SQL). Everything
+	// downstream - persist, stamp, broadcast - is identical to a code cell.
+	const cell = getCell(cellId, nb);
+	const execSource = isSqlCell(cell) ? sqlToPython(source) : source;
+
 	const outputs = [];
 	let status = 'ok';
 	let session = null;
 	let kernelDown = false;
 	try {
-		const reply = await execute(source, (ev) => {
+		const reply = await execute(execSource, (ev) => {
 			if (ev.type === 'output') {
 				outputs.push(ev.output);
 				publish({ type: 'run:output', nb, cellId, output: ev.output, originId });

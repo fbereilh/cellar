@@ -478,6 +478,12 @@
 			if (cell) {
 				cell.cell_type = ev.cell_type;
 				if (ev.cell_type === 'markdown') cell.outputs = [];
+				// The event carries the new language (sql | null) so a remote code↔sql
+				// switch re-highlights the editor live. Reassign metadata for reactivity.
+				const cellar = { ...(cell.metadata?.cellar ?? {}) };
+				if (ev.language === 'sql') cellar.language = 'sql';
+				else delete cellar.language;
+				cell.metadata = { ...(cell.metadata ?? {}), cellar };
 			}
 		} else if (ev.type === 'cell:cleared') {
 			const cell = findCell(ev.cellId);
@@ -758,8 +764,15 @@
 	async function setType(id, cellType) {
 		const cell = findCell(id);
 		if (cell) {
-			cell.cell_type = cellType;
-			if (cellType === 'markdown') cell.outputs = [];
+			// 'sql' is a code cell tagged cellar.language='sql' ($lib/cellLanguage.js);
+			// 'code' clears that tag. Reassign metadata (the cell may have had no cellar
+			// namespace) so the SQL/Python grammar switch in Cell.svelte reacts.
+			cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
+			const cellar = { ...(cell.metadata?.cellar ?? {}) };
+			if (cellType === 'sql') cellar.language = 'sql';
+			else delete cellar.language;
+			cell.metadata = { ...(cell.metadata ?? {}), cellar };
+			if (cell.cell_type === 'markdown') cell.outputs = [];
 		}
 		await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
