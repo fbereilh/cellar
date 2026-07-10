@@ -11,6 +11,7 @@
 	import { toml as tomlMode } from '@codemirror/legacy-modes/mode/toml';
 	import { EDITOR_THEME } from '$lib/editorTheme.js';
 	import { gitGutterExtension, setGitBaseline } from '$lib/gitGutter.js';
+	import MarkdownView from '$lib/MarkdownView.svelte';
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports
 	// dirty state up so the tab bar can show the unsaved indicator. `gitRefresh`
@@ -27,6 +28,23 @@
 	let dirty = $state(false);
 	let saving = $state(false);
 	let savedFlash = $state(false);
+
+	// ---- Markdown preview -----------------------------------------------------
+	// A `.md`/`.markdown` file can toggle between the raw source editor and a
+	// rendered view (reusing the notebook markdown renderer). `liveSource` mirrors
+	// the editor buffer so the preview reflects unsaved edits. The view choice is
+	// remembered across files (session-wide preference; source is the default).
+	const isMarkdownFile = /\.(md|markdown)$/i.test(path);
+	const VIEW_KEY = 'cellar-md-view';
+	let mdMode = $state('source'); // 'source' | 'preview'
+	let liveSource = $state('');
+
+	function setMdMode(m) {
+		mdMode = m;
+		try {
+			localStorage.setItem(VIEW_KEY, m);
+		} catch {}
+	}
 
 	// TOML ships no lezer grammar; the official legacy stream mode is the supported
 	// path. Its tokens map onto the same highlight tags every other language uses,
@@ -111,7 +129,14 @@
 			const body = await res.json();
 			if (!res.ok) throw new Error(body?.message || 'could not open file');
 			content = body.content;
+			liveSource = content;
 			status = 'ready';
+			if (isMarkdownFile) {
+				try {
+					const saved = localStorage.getItem(VIEW_KEY);
+					if (saved === 'preview' || saved === 'source') mdMode = saved;
+				} catch {}
+			}
 		} catch (err) {
 			status = 'error';
 			errorMsg = String(err?.message ?? err);
@@ -131,7 +156,10 @@
 					EDITOR_THEME,
 					Prec.highest(keymap.of([{ key: 'Mod-s', run: () => (save(), true) }])),
 					EditorView.updateListener.of((v) => {
-						if (v.docChanged) setDirty(true);
+						if (v.docChanged) {
+							setDirty(true);
+							if (isMarkdownFile) liveSource = v.state.doc.toString();
+						}
 					}),
 					EditorView.theme({
 						'&': { fontSize: '13.5px', height: '100%' },
@@ -152,6 +180,23 @@
 			{#if dirty}<span class="text-warning" title="Unsaved changes">●</span>{/if}
 		</span>
 		<div class="flex items-center gap-2">
+			{#if isMarkdownFile}
+				<!-- Source ↔ rendered toggle (VS Code-style), markdown files only. -->
+				<div class="join" role="group" aria-label="Markdown view">
+					<button
+						class="btn btn-xs join-item {mdMode === 'source' ? 'btn-active' : 'btn-ghost'}"
+						onclick={() => setMdMode('source')}
+						aria-pressed={mdMode === 'source'}
+						data-testid="md-view-source"
+					>Source</button>
+					<button
+						class="btn btn-xs join-item {mdMode === 'preview' ? 'btn-active' : 'btn-ghost'}"
+						onclick={() => setMdMode('preview')}
+						aria-pressed={mdMode === 'preview'}
+						data-testid="md-view-preview"
+					>Preview</button>
+				</div>
+			{/if}
 			{#if savedFlash}<span class="text-success">saved</span>{/if}
 			<button class="btn btn-xs btn-ghost gap-1" onclick={save} disabled={saving || status !== 'ready'} data-testid="file-save">
 				{saving ? 'saving…' : 'Save'}
@@ -163,5 +208,15 @@
 	{#if status === 'error'}
 		<div class="p-6 text-sm text-error" data-testid="file-error">Could not open <code class="font-mono">{path}</code>: {errorMsg}</div>
 	{/if}
-	<div bind:this={editorEl} class="min-h-0 flex-1 overflow-auto bg-base-100 {status === 'error' ? 'hidden' : ''}"></div>
+	<!-- Rendered preview (markdown only). Editor stays mounted-but-hidden beneath
+	     so its CodeMirror state, git baseline and unsaved edits survive toggling. -->
+	{#if isMarkdownFile && mdMode === 'preview' && status !== 'error'}
+		<div class="min-h-0 flex-1 overflow-auto bg-base-100">
+			<MarkdownView source={liveSource} />
+		</div>
+	{/if}
+	<div
+		bind:this={editorEl}
+		class="min-h-0 flex-1 overflow-auto bg-base-100 {status === 'error' || (isMarkdownFile && mdMode === 'preview') ? 'hidden' : ''}"
+	></div>
 </div>
