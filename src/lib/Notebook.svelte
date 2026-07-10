@@ -8,6 +8,7 @@
 		cells,
 		runningId,
 		activeId = null,
+		keyMode = 'command', // 'command' | 'edit' (Jupyter-style modal keyboard)
 		theme = 'dim',
 		hidden = new Set(), // cell ids hidden because a folded heading collapsed their section
 		foldedIds = new Set(), // markdown-header cell ids whose section is folded
@@ -25,7 +26,9 @@
 		editorCollapsed = {}, // cell id → explicit code-editor collapse choice (runtime-only)
 		onSetEditorCollapsed,
 		onActivate,
-		onReady,
+		onRegister,
+		onEditorFocus,
+		onEditorBlur,
 		onAddCell
 	} = $props();
 
@@ -100,6 +103,7 @@
 					count={cells.length}
 					running={runningId === cell.id}
 					active={activeId === cell.id}
+					{keyMode}
 					dragging={dragId === cell.id}
 					folded={foldedIds.has(cell.id)}
 					hiddenCount={hiddenCounts[cell.id] ?? 0}
@@ -116,7 +120,9 @@
 					editorCollapsed={editorCollapsed[cell.id]}
 					onSetEditorCollapsed={onSetEditorCollapsed}
 					onActivate={onActivate}
-					onReady={onReady}
+					onRegister={onRegister}
+					onEditorFocus={onEditorFocus}
+					onEditorBlur={onEditorBlur}
 					onDragStart={onDragStart}
 					onDragEnd={endDrag}
 				/>
