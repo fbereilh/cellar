@@ -19,7 +19,6 @@
 	let {
 		path,
 		active = false,
-		theme = 'dim',
 		gitRefresh = 0,
 		onCellsChange,
 		onFoldsChange, // (path, foldedIds, folding): the sidebar Outline renders from this
@@ -1132,7 +1131,6 @@
 	<div bind:this={rootEl} tabindex="-1" class="outline-none" data-testid="notebook-root">
 		<Notebook
 			{cells}
-			{theme}
 			runningId={runningId}
 			{queued}
 			{activeId}

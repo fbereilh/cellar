@@ -5,24 +5,137 @@
 }
 
 /*
- * Git change decoration palette — the editor gutter bars (`gitGutter.js`) and
- * the notebook cell bars (`Notebook.svelte`) share it.
+ * Cellar's fixed palettes.
  *
- * Deliberately NOT the daisyUI semantic tokens: those are accent colors, and
- * their hues are not stable across themes (in `dim`, `secondary` and `error`
- * are both salmon; in `nord`, `info` is pink), so "added / modified / removed"
- * would stop reading as added / modified / removed. Diff colors are a
- * convention rather than a brand — VS Code and GitHub both fix them
- * independently of the theme accent, and so do we.
+ * These are the colors that must NOT come from the daisyUI semantic tokens.
+ * Those are accent colors, and their hues are not stable across themes (in
+ * `dim`, `secondary` and `error` are both salmon; in `nord`, `info` is pink),
+ * so "added / modified / removed" would stop reading as added / modified /
+ * removed, and a syntax palette would stop being a syntax palette. Diff and
+ * code colors are conventions rather than brand — VS Code, GitHub and Jupyter
+ * all fix them independently of the theme accent, and so do we.
  *
  * `light-dark()` resolves against the `color-scheme` daisyUI puts on
- * `<html data-theme>` — the same source of truth `editorTheme.js` uses to pick
- * the light vs dark editor scheme — so every theme, present or future, is
- * handled here with no per-theme work.
+ * `<html data-theme>`, so every theme, present or future, is handled here with
+ * no per-theme work. It is defined for colors only; the handful of non-color
+ * values that differ by scheme (font weights and styles in the syntax palette)
+ * hang off `<html data-color-scheme>` instead — an attribute `+page.svelte`
+ * derives from that same resolved `color-scheme`, never from a theme-name
+ * allowlist. The `:root` values are the dark ones, matching the app's default
+ * theme, so a document that has not been hydrated yet is already correct.
  */
 :root {
+	/* --- Git decorations ---------------------------------------------------
+	 * The editor gutter bars (`gitGutter.js`) and the notebook cell bars
+	 * (`Notebook.svelte`) share this set. */
 	--cellar-git-added: light-dark(#1a7f37, #3fb950);
 	--cellar-git-modified: light-dark(#0969da, #58a6ff);
 	--cellar-git-moved: light-dark(#8250df, #bc8cff);
 	--cellar-git-removed: light-dark(#cf222e, #f85149);
+
+	/* The file tree's status letters and names (`FileTreeNode.svelte`) use VS
+	 * Code's *explorer* convention, which is a different set from the diff bars
+	 * above: untracked/added are green, modified is gold, deleted is red. Each
+	 * side is VS Code's own value for that scheme — the dark hues are far too
+	 * light to read on a light background, which is why they are split. */
+	--cellar-git-tree-added: light-dark(#007100, #73c991);
+	--cellar-git-tree-modified: light-dark(#895503, #e2c08d);
+	--cellar-git-tree-deleted: light-dark(#ad0707, #c74e39);
+
+	/* --- Notebook surfaces --------------------------------------------------
+	 * Three distinct planes, so a code cell reads as a grey editor and a white
+	 * output sitting on a faintly-grey page. In dark themes each token resolves
+	 * to the daisyUI surface that was already in use, leaving dark untouched. */
+	--cellar-surface-page: light-dark(#f1f2f5, var(--color-base-200));
+	--cellar-surface-cell: light-dark(#ffffff, var(--color-base-100));
+	--cellar-surface-output: light-dark(#ffffff, var(--color-base-100));
+
+	/* --- CodeMirror ---------------------------------------------------------
+	 * Consumed by the single static theme in `editorTheme.js`. Light is pygments
+	 * "default" (the Jupyter light scheme) on the grey editor surface; dark is
+	 * One Dark, verbatim. Because the theme is static, a theme toggle repaints
+	 * rather than reconfiguring every mounted editor — see `editorTheme.js`. */
+	--cellar-cm-fg: light-dark(#1a1a1a, #abb2bf);
+	--cellar-cm-bg: light-dark(#e7e9ee, #282c34);
+	--cellar-cm-cursor: light-dark(#1a1a1a, #528bff);
+	--cellar-cm-selection: light-dark(#d7d4f0, #3e4451);
+	--cellar-cm-selection-match: light-dark(#99ff7780, #aafe661a);
+	--cellar-cm-active-line: light-dark(#0000000c, #6699ff0b);
+	--cellar-cm-special-char: light-dark(#dd0000, #ff7788);
+	--cellar-cm-gutter-fg: light-dark(#6c6c6c, #7d8799);
+	--cellar-cm-line-number-fg: light-dark(#b8b8c0, #7d8799);
+	--cellar-cm-active-line-gutter: light-dark(transparent, #2c313a);
+	--cellar-cm-fold-placeholder: light-dark(#888888, #dddddd);
+	--cellar-cm-matching-bracket: light-dark(#c2f0c2, #bad0f847);
+	--cellar-cm-nonmatching-bracket: light-dark(#f5c4c4, #bad0f847);
+
+	/* Search panel + its controls. */
+	--cellar-cm-panel-bg: light-dark(#f5f5f5, #21252b);
+	--cellar-cm-panel-fg: light-dark(#1a1a1a, #abb2bf);
+	--cellar-cm-panel-border: light-dark(#dddddd, #000000);
+	--cellar-cm-search-match: light-dark(#ffff0054, #72a1ff59);
+	--cellar-cm-search-match-outline: light-dark(transparent, #457dff);
+	--cellar-cm-search-match-selected: light-dark(#ff6a0054, #6199ff2f);
+	--cellar-cm-button-bg-top: light-dark(#eff1f5, #393939);
+	--cellar-cm-button-bg-bottom: light-dark(#d9d9df, #111111);
+	--cellar-cm-button-border: light-dark(#888888, #888888);
+	--cellar-cm-textfield-bg: light-dark(#ffffff, #21252b);
+	--cellar-cm-textfield-border: light-dark(#888888, #555555);
+
+	/* Tooltips + the autocomplete popup. */
+	--cellar-cm-tooltip-bg: light-dark(#f5f5f5, #353a42);
+	--cellar-cm-tooltip-fg: light-dark(#1a1a1a, #abb2bf);
+	--cellar-cm-tooltip-border: light-dark(#bbbbbb, transparent);
+	--cellar-cm-autocomplete-selected-bg: light-dark(#1177cc, #2c313a);
+	--cellar-cm-autocomplete-selected-fg: light-dark(#ffffff, #abb2bf);
+	--cellar-cm-autocomplete-disabled-bg: light-dark(#777777, #444444);
+	--cellar-cm-snippet-field: light-dark(#00000022, #ffffff22);
+
+	/* Syntax tokens. A tag gets its own var wherever the two palettes group tags
+	 * differently; where one palette leaves a tag unstyled its value is that
+	 * palette's plain foreground, i.e. exactly what the tag inherits today. */
+	--cellar-cm-tok-comment: light-dark(#408080, #7d8799);
+	--cellar-cm-tok-meta: light-dark(#aa22ff, #7d8799);
+	--cellar-cm-tok-annotation: light-dark(#aa22ff, #e5c07b);
+	--cellar-cm-tok-keyword: light-dark(#008000, #c678dd);
+	--cellar-cm-tok-operator-keyword: light-dark(#008000, #56b6c2);
+	--cellar-cm-tok-modifier: light-dark(#008000, #e5c07b);
+	--cellar-cm-tok-string: light-dark(#ba2121, #98c379);
+	--cellar-cm-tok-regexp: light-dark(#ba2121, #56b6c2);
+	--cellar-cm-tok-number: light-dark(#666666, #e5c07b);
+	--cellar-cm-tok-atom: light-dark(#008000, #d19a66);
+	--cellar-cm-tok-constant: light-dark(#1a1a1a, #d19a66);
+	--cellar-cm-tok-name: light-dark(#1a1a1a, #e06c75);
+	--cellar-cm-tok-function: light-dark(#0000ff, #61afef);
+	--cellar-cm-tok-label: light-dark(#1a1a1a, #61afef);
+	--cellar-cm-tok-definition: light-dark(#19177c, #abb2bf);
+	--cellar-cm-tok-type: light-dark(#0000ff, #e5c07b);
+	--cellar-cm-tok-builtin: light-dark(#008000, #d19a66);
+	--cellar-cm-tok-self: light-dark(#008000, #e5c07b);
+	--cellar-cm-tok-operator: light-dark(#666666, #56b6c2);
+	--cellar-cm-tok-inserted: light-dark(#00a000, #98c379);
+	--cellar-cm-tok-deleted: light-dark(#a00000, #e06c75);
+	--cellar-cm-tok-changed: light-dark(#a0a000, #e5c07b);
+	--cellar-cm-tok-invalid: light-dark(#ff0000, #ffffff);
+	--cellar-cm-tok-heading: light-dark(#000080, #e06c75);
+	--cellar-cm-tok-link: light-dark(#0000ff, #7d8799);
+	--cellar-cm-tok-url: light-dark(#0000ff, #56b6c2);
+
+	/* Non-color syntax values. `light-dark()` takes colors only, so these are
+	 * keyed off the derived `data-color-scheme` attribute instead. Defaults are
+	 * One Dark's (no bold keywords, no italic comments). */
+	--cellar-cm-tok-comment-style: normal;
+	--cellar-cm-tok-keyword-weight: normal;
+	--cellar-cm-tok-atom-weight: normal;
+	--cellar-cm-tok-type-weight: normal;
+}
+
+:root[data-color-scheme='light'] {
+	/* pygments emphasises keywords, builtins constants and type names in bold and
+	 * comments in italic; that weight is a large part of why the Jupyter light
+	 * scheme reads the way it does. */
+	--cellar-cm-tok-comment-style: italic;
+	--cellar-cm-tok-keyword-weight: bold;
+	--cellar-cm-tok-atom-weight: bold;
+	--cellar-cm-tok-type-weight: bold;
 }

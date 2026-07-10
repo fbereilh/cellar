@@ -1,10 +1,12 @@
 <script module>
-	// VS Code-style git decoration colors (theme-independent hues), shared by
-	// every tree node. U/A = green, M/R = gold, D/C = red.
+	// VS Code-style git decoration colors, shared by every tree node.
+	// U/A = green, M/R = gold, D/C = red. Each token resolves per color-scheme in
+	// `app.css` - VS Code's dark decoration hues are far too light to read against
+	// a light background, so light and dark carry different values.
 	export function gitColor(letter) {
-		if (letter === 'U' || letter === 'A') return '#73c991';
-		if (letter === 'D' || letter === 'C') return '#c74e39';
-		if (letter) return '#e2c08d'; // M, R, T
+		if (letter === 'U' || letter === 'A') return 'var(--cellar-git-tree-added)';
+		if (letter === 'D' || letter === 'C') return 'var(--cellar-git-tree-deleted)';
+		if (letter) return 'var(--cellar-git-tree-modified)'; // M, R, T
 		return '';
 	}
 	// Precedence for rolling child statuses up to a collapsed folder.

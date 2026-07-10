@@ -1,7 +1,7 @@
 <script>
 	import { onMount, onDestroy } from 'svelte';
 	import { EditorView, keymap } from '@codemirror/view';
-	import { EditorState, Prec, Compartment } from '@codemirror/state';
+	import { EditorState, Prec } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
@@ -9,16 +9,14 @@
 	import { yaml as yamlLang } from '@codemirror/lang-yaml';
 	import { StreamLanguage } from '@codemirror/language';
 	import { toml as tomlMode } from '@codemirror/legacy-modes/mode/toml';
-	import { editorThemeExtensions } from '$lib/editorTheme.js';
+	import { EDITOR_THEME } from '$lib/editorTheme.js';
 	import { gitGutterExtension, setGitBaseline } from '$lib/gitGutter.js';
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports
 	// dirty state up so the tab bar can show the unsaved indicator. `gitRefresh`
 	// is the shell's `fsRefreshSignal`: a bump means the workspace's git state may
 	// have moved, so re-fetch the HEAD baseline the gutter diffs against.
-	let { path, onDirty, theme = 'dim', gitRefresh = 0 } = $props();
-
-	const editorTheme = new Compartment();
+	let { path, onDirty, gitRefresh = 0 } = $props();
 
 	let editorEl;
 	// `$state.raw` so the git-baseline effect below re-runs once the editor exists,
@@ -71,14 +69,6 @@
 			saving = false;
 		}
 	}
-
-	// Follow the app's light/dark theme (same pattern as Cell.svelte): read `theme`
-	// unconditionally so it stays a tracked dependency even before `view` exists,
-	// and reconfigure live on every toggle.
-	$effect(() => {
-		const extensions = editorThemeExtensions(theme);
-		if (view) view.dispatch({ effects: editorTheme.reconfigure(extensions) });
-	});
 
 	// ---- Git change bars (gutter) --------------------------------------------
 	// Fetch the file's git-HEAD text and hand it to the gutter extension, which
@@ -138,7 +128,7 @@
 					// After `basicSetup` so the change bar is the rightmost gutter, hard
 					// against the code (VS Code's placement).
 					gitGutterExtension(),
-					editorTheme.of(editorThemeExtensions(theme)),
+					EDITOR_THEME,
 					Prec.highest(keymap.of([{ key: 'Mod-s', run: () => (save(), true) }])),
 					EditorView.updateListener.of((v) => {
 						if (v.docChanged) setDirty(true);

@@ -420,9 +420,23 @@
 	}
 
 	// ---- Theme ---------------------------------------------------------------
+	// Setting `data-theme` is the whole toggle: daisyUI restyles the app and, via
+	// the `color-scheme` it puts on `<html>`, every `light-dark()` token in
+	// `app.css` (git decorations, notebook surfaces, the CodeMirror palette)
+	// re-resolves. Nothing is dispatched into any editor - see `editorTheme.js`.
+	//
+	// `data-color-scheme` mirrors the *resolved* scheme for the few theme values
+	// `light-dark()` cannot carry, because they are not colors (the syntax
+	// palette's font weights and styles). It is read back off `color-scheme`
+	// rather than derived from the theme's name, so a new theme needs no change
+	// here.
 	function applyTheme(t) {
 		theme = t;
-		if (typeof document !== 'undefined') document.documentElement.dataset.theme = t;
+		if (typeof document !== 'undefined') {
+			const root = document.documentElement;
+			root.dataset.theme = t;
+			root.dataset.colorScheme = getComputedStyle(root).colorScheme === 'light' ? 'light' : 'dark';
+		}
 		try {
 			localStorage.setItem('cellar-theme', t);
 		} catch {}
@@ -527,7 +541,6 @@
 					<LiveNotebook
 						path={canonicalNotebookRel}
 						active={activeTabId === 'notebook'}
-						{theme}
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
@@ -543,7 +556,6 @@
 					<LiveNotebook
 						path={tab.path}
 						active={activeTabId === tab.id}
-						{theme}
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
@@ -556,7 +568,7 @@
 
 			{#each fileTabs as tab (tab.id)}
 				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
-					<FileTab path={tab.path} onDirty={onFileDirty} {theme} gitRefresh={fsRefreshSignal} />
+					<FileTab path={tab.path} onDirty={onFileDirty} gitRefresh={fsRefreshSignal} />
 				</div>
 			{/each}
 
