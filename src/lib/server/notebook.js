@@ -607,6 +607,34 @@ export function clearOutputs(id, nb, originId) {
 	}
 }
 
+/**
+ * Replace a notebook's entire cell array with `cells` (a checkpoint snapshot),
+ * persist, and broadcast `notebook:restored` so every open tab refetches the
+ * authoritative document. The input is deep-cloned so the live doc never aliases
+ * the stored snapshot (a later edit would otherwise corrupt the checkpoint), and
+ * ids are re-checked for uniqueness defensively. Used by the checkpoint restore
+ * path (`checkpoints.js`); `clean.js` strips runtime metadata on persist, so a
+ * restore leaves the `.ipynb` git-clean.
+ */
+export function replaceCells(nb, cells, originId) {
+	const doc = docFor(nb);
+	const cloned = (Array.isArray(cells) ? cells : []).map((c) => ({
+		id: c.id,
+		cell_type: c.cell_type === 'markdown' ? 'markdown' : 'code',
+		source: typeof c.source === 'string' ? c.source : '',
+		outputs: Array.isArray(c.outputs) ? structuredClone(c.outputs) : [],
+		metadata: c.metadata ? structuredClone(c.metadata) : {}
+	}));
+	// A checkpoint of an empty notebook can't leave the doc with zero cells (command
+	// mode always needs one to act on); fall back to a fresh starter cell.
+	if (cloned.length === 0) cloned.push(newCell('code'));
+	enforceUniqueIds(cloned);
+	doc.cells = cloned;
+	persist(doc);
+	publish({ type: 'notebook:restored', nb: doc.path, originId });
+	return getNotebook(doc.path);
+}
+
 /** Swap a cell with its neighbour. Honors the imports cell's pin (`clampMoveIndex`). */
 export function moveCell(id, dir, nb, originId) {
 	const doc = docFor(nb);

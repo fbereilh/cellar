@@ -35,6 +35,7 @@ import { buildTree } from '../fstree.js';
 import { getNotebookStaleness } from '../dataflow.js';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness.js';
 import { isSqlCell } from '../../cellLanguage.js';
+import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints.js';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -599,7 +600,22 @@ async function finishImportRouting(nb, cellId, added) {
  * cell and run it. Idempotent; see `imports-cell.js`.
  */
 export async function consolidate() {
-	return consolidateImports(getActiveNotebookPath(), { actor: 'agent' });
+	const nb = getActiveNotebookPath();
+	autoCheckpointBeforeAgentAction(nb);
+	return consolidateImports(nb, { actor: 'agent' });
+}
+
+/**
+ * Snapshot the active notebook to a restorable checkpoint (agent-facing). The
+ * agent can call this to deliberately mark a good state; it is a manual save
+ * point (trigger `manual`), distinct from the automatic pre-action `agent`
+ * snapshots Cellar takes before each agent mutation/run. Keeping it `manual`
+ * means "undo last agent action" targets only those automatic pre-action
+ * snapshots — never a save point the agent chose to keep.
+ */
+export function checkpoint(label) {
+	const nb = getActiveNotebookPath();
+	return createCheckpoint(nb, { trigger: 'manual', label: label || 'Agent checkpoint' });
 }
 
 /**
@@ -612,6 +628,7 @@ export async function consolidate() {
  */
 export async function addCells(specs, afterId, { routeImports: routeEnabled = true } = {}) {
 	const nb = getActiveNotebookPath();
+	autoCheckpointBeforeAgentAction(nb);
 	const bodies = [];
 	const added = [];
 	let importsCellId = null;
@@ -642,6 +659,7 @@ export async function editCell(id, source, { routeImports: routeEnabled = true }
 	const nb = getActiveNotebookPath();
 	const cell = getCell(id, nb);
 	if (!cell) return null;
+	autoCheckpointBeforeAgentAction(nb);
 	// A SQL cell is a `code` cell on disk, but its source is SQL - never route
 	// "imports" out of it. Pass the LOGICAL type so routeOne's `!== 'code'` guard skips it.
 	const logicalType = isSqlCell(cell) ? 'sql' : cell.cell_type;
@@ -653,16 +671,19 @@ export async function editCell(id, source, { routeImports: routeEnabled = true }
 
 export function removeCell(id) {
 	if (!getCell(id)) return false;
+	autoCheckpointBeforeAgentAction(getActiveNotebookPath());
 	deleteCell(id);
 	return true;
 }
 
 export function moveCell(id, pos) {
+	autoCheckpointBeforeAgentAction(getActiveNotebookPath());
 	return moveCellTo(id, pos);
 }
 
 export function setType(id, type) {
 	if (!getCell(id)) return false;
+	autoCheckpointBeforeAgentAction(getActiveNotebookPath());
 	setCellType(id, type);
 	return true;
 }
@@ -715,6 +736,9 @@ export async function runCell(id) {
 	const nbAtCall = getActiveNotebookPath();
 	const c = getCell(id, nbAtCall);
 	if (!c) return null;
+	// Snapshot before this agent run so it can be undone (coalesced: a run_all is one
+	// pre-burst checkpoint, not one per cell). Captures the pre-run outputs.
+	autoCheckpointBeforeAgentAction(nbAtCall);
 	if (c.cell_type === 'markdown') {
 		// Markdown doesn't execute on the kernel; "running" it RENDERS it (the same
 		// state the UI's Shift+Enter produces). No queue, no persist: rendered-ness

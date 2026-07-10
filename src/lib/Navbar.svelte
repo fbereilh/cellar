@@ -14,6 +14,7 @@
 		converting = false,
 		canExportHtml = false, // a notebook is active, so there's something to export
 		canRunActions = false, // a notebook is active, so the bulk-run actions have a target
+		canCheckpoint = false, // a notebook is active, so it can be snapshotted / reverted
 		onSelectTab,
 		onCloseTab,
 		onPromoteTab,
@@ -25,6 +26,8 @@
 		onRunStale,
 		onRunAbove,
 		onRunBelow,
+		onCheckpointNow,
+		onUndoAgent,
 		onOpenSettings
 	} = $props();
 
@@ -141,6 +144,30 @@
 					>
 						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 						Run cells below
+					</button>
+				</li>
+				<div class="divider my-1"></div>
+				<li class="menu-title text-[11px]">History</li>
+				<li>
+					<button
+						onclick={onCheckpointNow}
+						disabled={!canCheckpoint}
+						title="Snapshot this notebook (cells + outputs) to a restorable checkpoint"
+						data-testid="menu-checkpoint-now"
+					>
+						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 8v4l3 2" /><circle cx="12" cy="12" r="9" /></svg>
+						Checkpoint now
+					</button>
+				</li>
+				<li>
+					<button
+						onclick={onUndoAgent}
+						disabled={!canCheckpoint}
+						title="Restore this notebook to just before the last agent action"
+						data-testid="menu-undo-agent"
+					>
+						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5" /><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11" /></svg>
+						Undo last agent action
 					</button>
 				</li>
 				<div class="divider my-1"></div>
