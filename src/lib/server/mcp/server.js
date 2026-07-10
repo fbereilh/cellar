@@ -35,6 +35,12 @@ async function databricksTool(fn) {
 }
 
 /**
+ * The `route_imports` contract, appended verbatim to every write tool that
+ * accepts it. One string so the four descriptions cannot drift apart.
+ */
+const ROUTE_IMPORTS_DOC = ` IMPORT ROUTING (default ON): any MODULE-LEVEL import in your source is moved into the notebook's single pinned "imports" cell at the top (created on demand), deduplicated against what is already there, removed from the code you submitted, and the imports cell is RUN so the kernel has it immediately. Imports nested inside a def/class/if/try body are never touched. The result carries an "imports" report {cell_id, added, run_status}. Pass route_imports:false to keep the import lines inline in this cell instead — do that when the import is deliberately local (a lazy or conditional import, or a cell demonstrating an import).`;
+
+/**
  * House-style doctrine handed to the agent once at connect (MCP server
  * `instructions`). Sets the frame — build ONE coherent notebook, not a pile of
  * snippets — before the first tool call. Advisory: the host injects it into the
@@ -46,10 +52,17 @@ narrative where each cell builds on the last.
 
 Follow this house style:
 
-1. IMPORTS GO AT THE TOP, ONCE. By convention, keep all imports in the first
-   code cell and do not repeat import lines inside narrative cells. Before adding
-   an import, check kernel_state (below) to see whether the module is already
-   loaded.
+1. IMPORTS GO AT THE TOP, ONCE — AND CELLAR PUTS THEM THERE FOR YOU. The notebook
+   has one pinned "imports" cell at index 0. When you write code through add_cell,
+   add_cells, edit_cell or add_and_run, any module-level import in it is moved into
+   that cell, deduplicated, and the cell is run — so just write the import where
+   the code needs it and let it be routed. Your cell keeps only the real work.
+   Imports inside a def/class/if/try body are left exactly where you put them.
+   Pass route_imports:false when you mean an import to stay inline (a lazy or
+   conditional import, or a cell whose subject IS the import). consolidate_imports
+   sweeps an existing notebook's scattered imports into that cell in one call.
+   Before adding an import, check kernel_state (below) to see whether the module is
+   already loaded.
 
 2. CHECK STATE BEFORE YOU WRITE. Call kernel_state to see what is already
    imported and which variables/functions/classes already exist in the live
@@ -162,16 +175,27 @@ function registerTools(server) {
 	});
 
 	// --- write ---
-	server.registerTool('add_cell', { description: 'Add a cell (optionally after a cell), of type code|markdown, with optional source.', inputSchema: { after_id: z.string().optional(), cell_type: z.enum(['code', 'markdown']).optional(), source: z.string().optional() } }, async ({ after_id, cell_type, source }) => text({ id: svc.addCells([{ cell_type, source }], after_id)[0] }));
-	server.registerTool('add_cells', { description: 'Add multiple cells in order (optionally after a cell).', inputSchema: { cells: z.array(z.object({ cell_type: z.enum(['code', 'markdown']).optional(), source: z.string().optional() })), after_id: z.string().optional() } }, async ({ cells, after_id }) => text({ ids: svc.addCells(cells, after_id) }));
-	server.registerTool('edit_cell', { description: 'Replace a cell source in place.', inputSchema: { id: z.string(), source: z.string() } }, async ({ id, source }) => (svc.editCell(id, source) ? text({ ok: true, id }) : notFound(`cell ${id} not found`)));
+	server.registerTool('add_cell', { description: `Add a cell (optionally after a cell), of type code|markdown, with optional source.${ROUTE_IMPORTS_DOC}`, inputSchema: { after_id: z.string().optional(), cell_type: z.enum(['code', 'markdown']).optional(), source: z.string().optional(), route_imports: z.boolean().optional() } }, async ({ after_id, cell_type, source, route_imports }) => {
+		const { ids, imports } = await svc.addCells([{ cell_type, source }], after_id, { routeImports: route_imports ?? true });
+		// Source that was nothing but imports creates no cell of its own — they went
+		// straight to the imports cell, which is then the cell this call produced.
+		return ids.length
+			? text({ id: ids[0], ...(imports ? { imports } : {}) })
+			: text({ id: imports.cell_id, routed_to_imports: true, imports });
+	});
+	server.registerTool('add_cells', { description: `Add multiple cells in order (optionally after a cell).${ROUTE_IMPORTS_DOC}`, inputSchema: { cells: z.array(z.object({ cell_type: z.enum(['code', 'markdown']).optional(), source: z.string().optional() })), after_id: z.string().optional(), route_imports: z.boolean().optional() } }, async ({ cells, after_id, route_imports }) => text(await svc.addCells(cells, after_id, { routeImports: route_imports ?? true })));
+	server.registerTool('edit_cell', { description: `Replace a cell source in place.${ROUTE_IMPORTS_DOC} (Editing the imports cell itself never routes — you are already writing into it.)`, inputSchema: { id: z.string(), source: z.string(), route_imports: z.boolean().optional() } }, async ({ id, source, route_imports }) => {
+		const r = await svc.editCell(id, source, { routeImports: route_imports ?? true });
+		return r ? text(r) : notFound(`cell ${id} not found`);
+	});
+	server.registerTool('consolidate_imports', { description: 'Sweep every MODULE-LEVEL import in the active notebook into one pinned "imports" cell at the top (deduplicated, __future__ first, canonically ordered), strip those lines from the cells they came from, and run the imports cell so the kernel has them. Imports nested inside a def/class/if/try body are deliberately left alone — a nested import is a choice (lazy loading, TYPE_CHECKING), not an accident. Idempotent: running it twice changes nothing and re-runs nothing.', inputSchema: {} }, async () => text(await svc.consolidate()));
 	server.registerTool('delete_cell', { description: 'Delete a cell.', inputSchema: { id: z.string() } }, async ({ id }) => (svc.removeCell(id) ? text({ ok: true }) : notFound(`cell ${id} not found`)));
 	server.registerTool('move_cell', { description: 'Move a cell to an absolute index.', inputSchema: { id: z.string(), position: z.number().int() } }, async ({ id, position }) => (svc.moveCell(id, position) ? text({ ok: true }) : notFound(`cell ${id} not found`)));
 	server.registerTool('set_cell_type', { description: 'Set a cell type to code or markdown.', inputSchema: { id: z.string(), cell_type: z.enum(['code', 'markdown']) } }, async ({ id, cell_type }) => (svc.setType(id, cell_type) ? text({ ok: true }) : notFound(`cell ${id} not found`)));
 	server.registerTool('set_cell_visibility', { description: 'Show/hide a cell from the agent (cellar.hidden_from_agent).', inputSchema: { id: z.string(), hidden: z.boolean() } }, async ({ id, hidden }) => (svc.setCellVisibility(id, hidden) ? text({ ok: true, id, hidden }) : notFound(`cell ${id} not found`)));
 
 	// --- execute ---
-	server.registerTool('add_and_run', { description: 'PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|markdown cell (default code) with the given source, after a cell (after_id) or appended at the end, runs it, and returns run_cell\'s result (status + outputs) plus the new cell id. Code that raises returns the error as the result (does not fail — the cell still exists). A markdown cell_type is created but not run (status "skipped"), same as run_cell — for markdown use add_cell. Use add_cell (no run) only when you want to add a cell WITHOUT running it.', inputSchema: { source: z.string(), cell_type: z.enum(['code', 'markdown']).optional(), after_id: z.string().optional() } }, async ({ source, cell_type, after_id }) => text(await svc.addAndRun({ source, cellType: cell_type, afterId: after_id })));
+	server.registerTool('add_and_run', { description: `PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|markdown cell (default code) with the given source, after a cell (after_id) or appended at the end, runs it, and returns run_cell's result (status + outputs) plus the new cell id. Code that raises returns the error as the result (does not fail — the cell still exists). A markdown cell_type is created but not run (status "skipped"), same as run_cell — for markdown use add_cell. Use add_cell (no run) only when you want to add a cell WITHOUT running it.${ROUTE_IMPORTS_DOC} Routing happens BEFORE this cell runs, so an import it needs is already in the kernel. Source that is ONLY imports creates no cell at all (they go straight to the imports cell) and returns routed_to_imports:true.`, inputSchema: { source: z.string(), cell_type: z.enum(['code', 'markdown']).optional(), after_id: z.string().optional(), route_imports: z.boolean().optional() } }, async ({ source, cell_type, after_id, route_imports }) => text(await svc.addAndRun({ source, cellType: cell_type, afterId: after_id, routeImports: route_imports ?? true })));
 	server.registerTool('run_cell', { description: 'Run one cell by UUID (markdown cells are skipped). One shared kernel means one run at a time app-wide: if the kernel is busy your run is QUEUED (never dropped) and this call waits its turn, then returns the real outputs annotated queued:true + queue_position + waited_ms. If that cell is ALREADY queued (or running) it is not enqueued twice - the call returns immediately with status "queued" (or "running") and its queue_position; a pending run has its source refreshed to the current one. status "cancelled" means an interrupt/restart dropped the queued run before it started; nothing executed. See run_queue.', inputSchema: { id: z.string() } }, async ({ id }) => { const r = await svc.runCell(id); return r ? text(r) : notFound(`cell ${id} not found`); });
 	server.registerTool('run_cells', { description: 'Run multiple cells in order, each waiting its turn in the kernel queue. Stops at the first cell whose queued run an interrupt/restart cancelled (status "cancelled") - the rest would run against a namespace their predecessors never populated.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(await svc.runCells(ids)));
 	server.registerTool('run_all', { description: 'Run all code cells in document order (same queueing + cancellation semantics as run_cells).', inputSchema: {} }, async () => text(await svc.runAll()));

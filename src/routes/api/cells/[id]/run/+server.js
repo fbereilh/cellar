@@ -1,7 +1,6 @@
-import { execute } from '$lib/server/kernel.js';
-import { getCell, setSource, setOutputs, setLastRun, resolveNotebookPath } from '$lib/server/notebook.js';
-import { publish } from '$lib/server/events.js';
+import { getCell, setSource, resolveNotebookPath } from '$lib/server/notebook.js';
 import { enqueueRun } from '$lib/server/run-queue.js';
+import { executeCellRun } from '$lib/server/run.js';
 
 /**
  * Run one cell. The given source is saved to the document, executed, and its
@@ -17,13 +16,12 @@ import { enqueueRun } from '$lib/server/run-queue.js';
  * stream stays open across the wait, so the tab that asked for the run is still
  * the tab that renders it.
  *
- * The same run lifecycle is broadcast over the event bus (`run:start` /
- * `run:output` / `run:end`, tagged `actor:'user'`) so *other* open tabs stay in
- * sync. The event carries the caller's `originId`; the initiating tab drops its
- * own echo (it renders from the NDJSON stream below), so a user's run never
- * double-renders. The "queued" affordance instead rides the queue's own
- * `queue:changed` broadcast, which every tab applies — a queue is global state,
- * not one tab's action, so it has no echo to suppress.
+ * The execution itself — persist, stamp, broadcast — belongs to `executeCellRun`
+ * (`run.js`), shared with the MCP `run_cell` tool and the imports cell, so what
+ * "running a cell" means cannot drift between them. This route owns only the
+ * queue ticket and the NDJSON stream: `onEvent` forwards the run lifecycle to the
+ * initiating tab, which drops its own `originId`-tagged SSE echo and would
+ * otherwise never learn its run started.
  */
 export async function POST({ params, request }) {
 	const { source, nb, originId } = await request.json();
@@ -33,7 +31,6 @@ export async function POST({ params, request }) {
 	const cellId = params.id;
 
 	const encoder = new TextEncoder();
-	const outputs = [];
 
 	// Claim the kernel before opening the stream, so the queue reflects submission
 	// order rather than the order the streams happen to start in.
@@ -78,60 +75,17 @@ export async function POST({ params, request }) {
 				controller.close();
 				return;
 			}
-			const code = ticket.source() ?? cell.source ?? '';
 
-			const startedAt = Date.now();
-			publish({ type: 'run:start', nb: canonicalNb, cellId, actor: 'user', at: startedAt, originId });
-			// The initiating tab drops the SSE echo above, so this is how it learns its
-			// own run actually STARTED (rather than merely being accepted into the queue).
-			send({ type: 'run:start', cellId, at: startedAt });
-			let status = 'ok';
-			// The kernel-session epoch this run STARTED in - the only record that this
-			// cell ran against the namespace that exists now (see notebook.js
-			// `setLastRun`). It arrives on execute()'s `kernel` event, stays null when
-			// no kernel could be started, and is never re-read afterwards: an
-			// autorestart mid-run bumps the live epoch, and this cell must then read as
-			// not-this-session.
-			let session = null;
-			let kernelDown = false;
 			try {
-				const reply = await execute(code, (ev) => {
-					if (ev.type === 'output') {
-						outputs.push(ev.output);
-						publish({ type: 'run:output', nb: canonicalNb, cellId, output: ev.output, originId });
-					} else if (ev.type === 'kernel') {
-						session = ev.session;
-					}
-					send(ev);
+				await executeCellRun({
+					nb: canonicalNb,
+					cellId,
+					actor: 'user',
+					source: ticket.source() ?? cell.source ?? '',
+					originId,
+					onEvent: send
 				});
-				status = reply?.status ?? 'ok';
-			} catch (err) {
-				const output = {
-					output_type: 'error',
-					ename: 'CellarError',
-					evalue: String(err?.message ?? err),
-					traceback: [String(err?.message ?? err)]
-				};
-				outputs.push(output);
-				publish({ type: 'run:output', nb: canonicalNb, cellId, output, originId });
-				send({ type: 'output', output });
-				status = 'error';
-				// execute() threw before it ever had a kernel in hand, so no session
-				// exists to stamp. Mark the attempt so the agent-facing run_status reads
-				// `error_kernel_unavailable` (a LIVE failure) rather than
-				// `error_persisted` (leftover, which the doctrine says to ignore).
-				if (session === null) kernelDown = true;
 			} finally {
-				setOutputs(cellId, outputs, nb); // clean-on-save persists the .ipynb
-				// Runtime-only run metadata; `at` = run start so "ran X ago" reads as
-				// when the run began. Stripped from disk by clean.js (report §4.2).
-				const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'user', status, session, ...(kernelDown ? { kernel_unavailable: true } : {}) };
-				setLastRun(cellId, lastRun, nb);
-				// Also send it on the initiating tab's NDJSON stream: that tab drops
-				// its own `run:end` SSE echo (originId match), so this is how it learns
-				// the metadata to render its own badge.
-				send({ type: 'run:end', ...lastRun });
-				publish({ type: 'run:end', nb: canonicalNb, cellId, ...lastRun, originId });
 				// Hand the kernel to the next queued run only once this one is fully
 				// persisted and broadcast, so the wire order stays run:end → run:start.
 				ticket.done();

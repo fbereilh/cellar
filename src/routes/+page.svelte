@@ -351,6 +351,26 @@
 	// Bump to make the sidebar re-read the file tree + git status (after saves).
 	let fsRefreshSignal = $state(0);
 
+	// ---- Consolidate imports --------------------------------------------------
+	// Sweep the active notebook's module-level imports into one pinned cell at the
+	// top and run it. The server does the whole sweep and broadcasts the resulting
+	// `cell:*` events with NO originId, so this tab renders it exactly as any other
+	// tab does - there is nothing to apply locally.
+	let consolidating = $state(false);
+
+	async function consolidateImports() {
+		if (!activeNotebookPath || consolidating) return;
+		consolidating = true;
+		try {
+			await fetch('/api/notebooks/imports', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ path: activeNotebookPath })
+			});
+		} catch {}
+		consolidating = false;
+	}
+
 	async function scrollToCell(id, foldKey = null) {
 		// Open + focus the notebook the outline currently reflects, then scroll. With
 		// no active notebook the outline and search are empty, so there is no row to
@@ -525,10 +545,13 @@
 		{activeTabId}
 		{sidebarOpen}
 		kernelInfo={displayKernel}
+		canConsolidateImports={!!activeNotebookPath}
+		{consolidating}
 		onSelectTab={selectTab}
 		onCloseTab={closeTab}
 		onPromoteTab={promoteTab}
 		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
+		onConsolidateImports={consolidateImports}
 		onOpenSettings={() => (settingsOpen = true)}
 	/>
 

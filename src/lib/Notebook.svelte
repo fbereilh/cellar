@@ -1,5 +1,6 @@
 <script>
 	import Cell from '$lib/Cell.svelte';
+	import { isImportsCell } from '$lib/importsRole.js';
 
 	const NO_SEGS_HIDDEN = { headings: new Set(), bodies: new Set() };
 
@@ -47,6 +48,11 @@
 	let dropIndex = $state(null); // insertion index the drop would land at
 	let dropAtEnd = $state(false); // insertion line drawn below the last hovered cell
 
+	// Cell 0 is the pinned imports cell: nothing may be dropped above it, and it is
+	// not draggable itself. Drawing an insertion line there would promise a drop the
+	// clamp would then refuse, so the line snaps below it instead.
+	const pinnedTop = $derived(isImportsCell(cells[0]));
+
 	function onDragStart(e, id) {
 		dragId = id;
 		e.dataTransfer.effectAllowed = 'move';
@@ -54,20 +60,23 @@
 			e.dataTransfer.setData('text/plain', id);
 		} catch {}
 	}
+	/** Which edge of cell `index` the pointer is nearest — never above a pinned top cell. */
+	function dropsAfter(e, index) {
+		const r = e.currentTarget.getBoundingClientRect();
+		if (index === 0 && pinnedTop) return true;
+		return e.clientY > r.top + r.height / 2;
+	}
 	function onDragOverCell(e, index) {
 		if (dragId == null) return;
 		e.preventDefault();
 		e.dataTransfer.dropEffect = 'move';
-		const r = e.currentTarget.getBoundingClientRect();
-		const after = e.clientY > r.top + r.height / 2;
 		dropIndex = index;
-		dropAtEnd = after;
+		dropAtEnd = dropsAfter(e, index);
 	}
 	function onDropCell(e, index) {
 		if (dragId == null) return;
 		e.preventDefault();
-		const r = e.currentTarget.getBoundingClientRect();
-		const after = e.clientY > r.top + r.height / 2;
+		const after = dropsAfter(e, index);
 		// Target index in the array as it currently stands (before removal); the
 		// LiveNotebook normalizes/clamps and recomputes the real index server-side.
 		let target = after ? index + 1 : index;
@@ -160,6 +169,7 @@
 						queuedPosition={queued[cell.id] ?? null}
 						active={activeId === cell.id}
 						{keyMode}
+						{pinnedTop}
 						dragging={dragId === cell.id}
 						{foldedIds}
 						segHidden={hiddenSegs.get(cell.id) ?? NO_SEGS_HIDDEN}

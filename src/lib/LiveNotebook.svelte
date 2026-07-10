@@ -5,6 +5,7 @@
 	import { cellIdOfKey, computeFolding, headerLevel, withHeadingLevel } from '$lib/headings.js';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff.js';
 	import { cellClipboard } from '$lib/cellClipboard.js';
+	import { clampMoveIndex } from '$lib/importsRole.js';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte.js';
 
 	// A live, kernel-attached notebook document addressed by its workspace path.
@@ -413,9 +414,25 @@
 				outputs: ev.cell.outputs ?? [],
 				metadata: ev.cell.metadata ?? {}
 			};
+			// `index` is authoritative when present (an insert at the very top - the
+			// imports cell - has no `afterId` to hang off, and appending would be wrong).
 			const i = ev.afterId ? cells.findIndex((c) => c.id === ev.afterId) : -1;
-			if (i >= 0) cells = [...cells.slice(0, i + 1), view, ...cells.slice(i + 1)];
+			if (typeof ev.index === 'number') {
+				const at = Math.max(0, Math.min(ev.index, cells.length));
+				cells = [...cells.slice(0, at), view, ...cells.slice(at)];
+			} else if (i >= 0) cells = [...cells.slice(0, i + 1), view, ...cells.slice(i + 1)];
 			else cells = [...cells, view];
+		} else if (ev.type === 'cell:role') {
+			// A cell was designated (or un-designated) the notebook's imports cell.
+			// Reassign `metadata` rather than mutating it: the cell may have had no
+			// `cellar` namespace at all, and a deep write would not be seen.
+			const cell = findCell(ev.cellId);
+			if (cell) {
+				const cellar = { ...(cell.metadata?.cellar ?? {}) };
+				if (ev.role) cellar.role = ev.role;
+				else delete cellar.role;
+				cell.metadata = { ...(cell.metadata ?? {}), cellar };
+			}
 		} else if (ev.type === 'cell:deleted') {
 			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
@@ -801,10 +818,14 @@
 		if (focus && id) selectAndFocus(id);
 	}
 
+	// The optimistic half of the imports cell's pin: the server applies the very
+	// same `clampMoveIndex`, so a refused move is refused here too rather than
+	// being rendered and then silently reverted by the next refetch.
 	async function moveCell(id, dir) {
 		const i = cells.findIndex((c) => c.id === id);
 		const j = dir === 'up' ? i - 1 : i + 1;
 		if (j < 0 || j >= cells.length) return;
+		if (clampMoveIndex(cells, i, j) !== j) return;
 		const next = [...cells];
 		[next[i], next[j]] = [next[j], next[i]];
 		cells = next;
@@ -821,7 +842,9 @@
 	async function moveCellToIndex(id, toIndex) {
 		const from = cells.findIndex((c) => c.id === id);
 		if (from < 0) return;
-		let to = Math.max(0, Math.min(toIndex, cells.length - 1));
+		const allowed = clampMoveIndex(cells, from, toIndex);
+		if (allowed < 0) return; // the pinned imports cell never moves
+		let to = Math.max(0, Math.min(allowed, cells.length - 1));
 		if (to === from) return;
 		const next = [...cells];
 		const [cell] = next.splice(from, 1);

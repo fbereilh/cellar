@@ -15,8 +15,6 @@ import {
 	addCell,
 	setSource,
 	setCellType,
-	setOutputs,
-	setLastRun,
 	deleteCell,
 	moveCellTo,
 	setVisibility,
@@ -26,11 +24,13 @@ import {
 	openNotebook as openNotebookDoc,
 	notebookExists
 } from '../notebook.js';
-import { execute, restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel.js';
+import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel.js';
 import { kernelState } from '../inspect.js';
 import { agentStatus as databricksStatus, forAgent as databricksCatalog, previewTable } from '../databricks.js';
 import { publish } from '../events.js';
 import { enqueueRun, queueState, queuePosition } from '../run-queue.js';
+import { executeCellRun } from '../run.js';
+import { consolidateImports, routeImports, runImportsCell } from '../imports-cell.js';
 import { buildTree } from '../fstree.js';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
@@ -480,22 +480,107 @@ export function getFullOutput(id, size = 'medium') {
 
 // --- write ------------------------------------------------------------------
 
-export function addCells(specs, afterId) {
+/**
+ * Lift the module-level imports out of code an agent is writing into a cell and
+ * merge them into the pinned imports cell.
+ *
+ * This is a pure DOCUMENT edit; it never runs the kernel. Running the imports
+ * cell is the caller's job (`finishImportRouting`) precisely because a write tool
+ * may route several cells' worth of code at once: they merge into one cell, so
+ * they must produce exactly one run, not one run per cell.
+ *
+ * Routing is the default for every write tool and opt-out-able per call
+ * (`route_imports: false`). Only agent writes are routed: a human typing an
+ * import into their own cell is never touched (see `imports-cell.js`).
+ *
+ * Returns the code with its imports removed and the statements that were new, or
+ * `null` when nothing was routed — so a tool that routed nothing says nothing
+ * about imports.
+ */
+function routeOne(source, nb, { routeEnabled, cellType = 'code', skipCellId = null } = {}) {
+	if (!routeEnabled || cellType !== 'code') return null;
+	const routed = routeImports(source ?? '', nb, undefined, { skipCellId });
+	// No imports at all (or none we could parse): the source is untouched, so say so.
+	if (routed.source === source && !routed.added.length) return null;
+	return routed;
+}
+
+/**
+ * Run the imports cell once for a write that routed something, and build the
+ * `imports` report the tool result carries. `added` empty means every routed
+ * import was already in the cell — the kernel has them, so there is nothing to
+ * run; the lines were still stripped, because a duplicate import helps nobody.
+ *
+ * `nb` is pinned by the caller at the start of the write, not re-read here: the
+ * UI may focus another notebook while the imports cell waits in the run queue,
+ * and this run belongs to the notebook the code was written into.
+ */
+async function finishImportRouting(nb, cellId, added) {
+	if (!added.length) return { cell_id: cellId, added: [], note: 'already present in the imports cell; removed from your code' };
+	const run = await runImportsCell(nb, 'agent');
+	return {
+		cell_id: cellId,
+		added,
+		run_status: run?.status ?? 'not_run',
+		// A failed imports cell (a missing package) is surfaced, never swallowed:
+		// every cell the agent writes next depends on it.
+		...(run?.status === 'error' ? { outputs: run.outputs.map((o) => summarizeOutput(o, READ_CAP)) } : {}),
+		...(run?.note ? { note: run.note } : {})
+	};
+}
+
+/**
+ * Sweep every module-level import in the active notebook into the pinned imports
+ * cell and run it. Idempotent; see `imports-cell.js`.
+ */
+export async function consolidate() {
+	return consolidateImports(getActiveNotebookPath(), { actor: 'agent' });
+}
+
+/**
+ * Add cells, routing their imports first. Every spec routes into the SAME imports
+ * cell, so they merge once and the cell runs once — not once per cell.
+ *
+ * A spec that routing empties (its source was nothing but imports) creates no
+ * cell: its imports are in the imports cell, and an empty cell beside them is
+ * litter. An explicitly empty source still creates its empty cell.
+ */
+export async function addCells(specs, afterId, { routeImports: routeEnabled = true } = {}) {
+	const nb = getActiveNotebookPath();
+	const bodies = [];
+	const added = [];
+	let importsCellId = null;
+	for (const spec of specs) {
+		const cellType = spec.cell_type || 'code';
+		const routed = routeOne(spec.source ?? '', nb, { routeEnabled, cellType });
+		if (routed) {
+			added.push(...routed.added);
+			importsCellId = routed.importsCellId ?? importsCellId;
+			if (!routed.source.trim()) continue; // wholly routed away
+		}
+		bodies.push({ cellType, source: routed ? routed.source : (spec.source ?? '') });
+	}
+
 	let anchor = afterId;
 	const created = [];
-	for (const spec of specs) {
-		const cell = addCell(anchor, spec.cell_type || 'code');
-		if (spec.source) setSource(cell.id, spec.source);
+	for (const body of bodies) {
+		const cell = addCell(anchor, body.cellType);
+		if (body.source) setSource(cell.id, body.source);
 		created.push(cell.id);
 		anchor = cell.id;
 	}
-	return created;
+	const imports = importsCellId ? await finishImportRouting(nb, importsCellId, added) : null;
+	return { ids: created, ...(imports ? { imports } : {}) };
 }
 
-export function editCell(id, source) {
-	if (!getCell(id)) return false;
-	setSource(id, source);
-	return true;
+export async function editCell(id, source, { routeImports: routeEnabled = true } = {}) {
+	const nb = getActiveNotebookPath();
+	const cell = getCell(id, nb);
+	if (!cell) return null;
+	const routed = routeOne(source, nb, { routeEnabled, cellType: cell.cell_type, skipCellId: id });
+	setSource(id, routed ? routed.source : source, nb);
+	const imports = routed ? await finishImportRouting(nb, routed.importsCellId, routed.added) : null;
+	return { ok: true, id, ...(imports ? { imports } : {}) };
 }
 
 export function removeCell(id) {
@@ -519,25 +604,6 @@ export function setCellVisibility(id, hidden) {
 }
 
 // --- execute ----------------------------------------------------------------
-
-/**
- * Run code, collecting its outputs and handing the caller - via `onSession`, so
- * it survives the throw path - the kernel-session epoch the run STARTED in.
- * Stamping that (rather than reading the epoch after the run) means a kernel
- * restart mid-run leaves the cell correctly marked as not-this-session.
- */
-async function runSource(source, onOutput, onSession) {
-	const outputs = [];
-	const reply = await execute(source, (ev) => {
-		if (ev.type === 'output') {
-			outputs.push(ev.output);
-			onOutput?.(ev.output);
-		} else if (ev.type === 'kernel') {
-			onSession?.(ev.session);
-		}
-	});
-	return { outputs, status: reply?.status ?? 'ok' };
-}
 
 /**
  * The kernel's run queue: what is executing and what is waiting behind it,
@@ -608,41 +674,14 @@ export async function runCell(id) {
 		// Re-read the cell: it may have been edited (or deleted) while queued.
 		const cell = getCell(id, nb);
 		if (!cell) return { id, status: 'cancelled', reason: 'cell_removed', ran_this_session: false, ...queuedInfo };
-		const source = ticket.source() ?? cell.source ?? '';
-
-		const startedAt = Date.now();
-		publish({ type: 'run:start', nb, cellId: id, actor: 'agent', at: startedAt });
-		let outputs = [];
-		let status = 'ok';
-		// The epoch the run STARTED in, captured as soon as the kernel is in hand.
-		// It stays null when execute() failed before any kernel existed, and it is
-		// never re-read afterwards: an autorestart mid-run bumps the live epoch, and
-		// this cell must then read as not-this-session.
-		let session = null;
-		let kernelDown = false;
-		try {
-			const res = await runSource(
-				source,
-				(output) => publish({ type: 'run:output', nb, cellId: id, output }),
-				(sid) => { session = sid; }
-			);
-			outputs = res.outputs;
-			status = res.status;
-		} catch (err) {
-			const output = { output_type: 'error', ename: 'CellarError', evalue: String(err?.message ?? err), traceback: [String(err?.message ?? err)] };
-			outputs = [output];
-			publish({ type: 'run:output', nb, cellId: id, output });
-			status = 'error';
-			// execute() threw before it ever had a kernel in hand, so no session exists
-			// to stamp. Mark the attempt: this error is live, not saved from a prior run.
-			if (session === null) kernelDown = true;
-		}
-		setOutputs(id, outputs, nb);
-		// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,
-		// `session` = the kernel-session epoch this run executed in (see setLastRun).
-		const lastRun = { at: startedAt, durationMs: Date.now() - startedAt, actor: 'agent', status, session, ...(kernelDown ? { kernel_unavailable: true } : {}) };
-		setLastRun(id, lastRun, nb);
-		publish({ type: 'run:end', nb, cellId: id, ...lastRun });
+		// One shared execution core with the UI route and the imports cell (`run.js`):
+		// execute, persist, stamp the kernel-session epoch, broadcast the lifecycle.
+		const { outputs, status, session, kernelDown } = await executeCellRun({
+			nb,
+			cellId: id,
+			actor: 'agent',
+			source: ticket.source() ?? cell.source ?? ''
+		});
 		const hiddenNote = isHidden(cell) ? { hidden: true } : {};
 		return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 	} finally {
@@ -663,11 +702,38 @@ export async function runCell(id) {
  * raises returns the error as its result (never throws); a markdown cell is
  * created (surfaced live in the UI) but not run, returning `status:'skipped'`
  * to mirror run_cell.
+ *
+ * Import routing (the default) happens BEFORE the cell is created, so the imports
+ * cell has already run by the time this cell executes and the code that needed
+ * `pd` finds it. Source that is nothing BUT imports creates no cell at all: its
+ * imports are in the imports cell, and an empty cell beside them is litter.
  */
-export async function addAndRun({ source, cellType = 'code', afterId } = {}) {
-	const [id] = addCells([{ cell_type: cellType, source }], afterId);
+export async function addAndRun({ source, cellType = 'code', afterId, routeImports: routeEnabled = true } = {}) {
+	const nb = getActiveNotebookPath();
+	const routed = routeOne(source ?? '', nb, { routeEnabled, cellType });
+	const body = routed ? routed.source : (source ?? '');
+	// Run the imports cell BEFORE the new cell, so the code that needs `pd` finds it.
+	const imports = routed ? await finishImportRouting(nb, routed.importsCellId, routed.added) : null;
+
+	if (routed && !body.trim()) {
+		// The submitted code was nothing but imports. They now live in the imports
+		// cell; an empty cell beside it would be litter, so report that cell instead.
+		const cell = getCell(imports.cell_id, nb);
+		return {
+			id: imports.cell_id,
+			status: imports.run_status ?? 'skipped',
+			routed_to_imports: true,
+			note: "the submitted code was only imports; they were merged into the notebook's imports cell and no new cell was created.",
+			ran_this_session: cell ? ranThisSession(cell, currentSessionId()) : false,
+			imports,
+			outputs: cell ? summarizeOutputs(cell, READ_CAP) : []
+		};
+	}
+	// Routing already happened (once), so the add must not route a second time.
+	const { ids } = await addCells([{ cell_type: cellType, source: body }], afterId, { routeImports: false });
+	const id = ids[0];
 	const result = await runCell(id);
-	return { id, ...result };
+	return { id, ...result, ...(imports ? { imports } : {}) };
 }
 
 /**

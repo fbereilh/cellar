@@ -7,10 +7,13 @@
 		activeTabId,
 		sidebarOpen,
 		kernelInfo,
+		canConsolidateImports = false, // a notebook is active, so the sweep has a target
+		consolidating = false,
 		onSelectTab,
 		onCloseTab,
 		onPromoteTab,
 		onToggleSidebar,
+		onConsolidateImports,
 		onOpenSettings
 	} = $props();
 
@@ -40,10 +43,25 @@
 				<svg class="h-3 w-3 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 			</div>
 			<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-			<ul tabindex="0" class="menu dropdown-content z-50 mt-1 w-52 rounded-box border border-base-300 bg-base-100 p-2 shadow-lg">
+			<ul tabindex="0" class="menu dropdown-content z-50 mt-1 w-60 rounded-box border border-base-300 bg-base-100 p-2 shadow-lg">
 				<li class="menu-title text-[11px]">Options</li>
 				<li><button class="justify-between" disabled>New notebook <kbd class="kbd kbd-xs">soon</kbd></button></li>
 				<li><button class="justify-between" disabled>Export .py view <kbd class="kbd kbd-xs">soon</kbd></button></li>
+				<li>
+					<button
+						onclick={onConsolidateImports}
+						disabled={!canConsolidateImports || consolidating}
+						title="Move every top-level import into one pinned cell at the top of the notebook, and run it"
+						data-testid="consolidate-imports"
+					>
+						{#if consolidating}
+							<span class="loading loading-spinner loading-xs"></span>
+						{:else}
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+						{/if}
+						Consolidate imports
+					</button>
+				</li>
 				<div class="divider my-1"></div>
 				<li>
 					<button onclick={onOpenSettings} data-testid="open-settings">
