@@ -114,6 +114,20 @@ export const DEFAULT_SHORTCUTS = [
 		category: 'Navigation',
 		description: "Expand the selected heading's section"
 	},
+	{
+		id: 'collapse-all-headings',
+		keys: ['Shift-ArrowLeft'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Collapse every heading section'
+	},
+	{
+		id: 'expand-all-headings',
+		keys: ['Shift-ArrowRight'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Expand every heading section'
+	},
 
 	// ---- Structure ---------------------------------------------------------
 	{

@@ -2,7 +2,7 @@
 	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
-	import { cellIdOfKey, computeFolding, headerLevel, withHeadingLevel } from '$lib/headings.js';
+	import { cellIdOfKey, computeFolding, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings.js';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff.js';
 	import { cellClipboard } from '$lib/cellClipboard.js';
 	import { clampMoveIndex } from '$lib/importsRole.js';
@@ -23,7 +23,7 @@
 		gitRefresh = 0,
 		onCellsChange,
 		onFoldsChange, // (path, foldedIds, folding): the sidebar Outline renders from this
-		onRegisterFolds, // (path, toggleFold|null): lets the Outline drive this notebook's folds
+		onRegisterFolds, // (path, {toggle,collapseAll,expandAll}|null): lets the Outline drive this notebook's folds
 		onRegisterApi, // (path, {insertAndRunCode}|null): lets the sidebar drop a cell in here
 		onRunStart,
 		onRunEnd
@@ -82,7 +82,7 @@
 		onFoldsChange?.(path, foldedIds, folding);
 	});
 	$effect(() => {
-		onRegisterFolds?.(path, toggleFold);
+		onRegisterFolds?.(path, { toggle: toggleFold, collapseAll: () => setAllFolded(true), expandAll: () => setAllFolded(false) });
 		return () => onRegisterFolds?.(path, null);
 	});
 	// Same shape as the fold registry: an imperative handle the shell hands to the
@@ -123,6 +123,24 @@
 		// holding the header that swallowed it. (`folding` is derived, so it already
 		// reflects `next`.)
 		if (activeId && folding.hidden.has(activeId)) activeId = cellIdOfKey(key);
+	}
+
+	// Collapse/expand every heading section in one go, writing the same shared fold
+	// state the chevrons do (so the notebook and the Outline stay one view of one
+	// state). Idempotent: `folded=true` yields the full set of heading keys, `false`
+	// the empty set, regardless of the starting state.
+	function setAllFolded(folded) {
+		const next = folded ? new Set(outlineHeadings(cells).map((h) => h.key)) : new Set();
+		foldedIds = next;
+		saveFolds();
+		// A collapse-all can hide the selected cell; hand the selection to the
+		// nearest header that still owns it (the same rule `toggleFold` applies).
+		if (activeId && computeFolding(cells, next).hidden.has(activeId)) {
+			const owner = outlineHeadings(cells).find((h) =>
+				computeFolding(cells, new Set([h.key])).hidden.has(activeId)
+			);
+			if (owner) activeId = owner.cellId;
+		}
 	}
 
 	// ---- Collapsible code editors --------------------------------------------
@@ -1056,6 +1074,8 @@
 		'select-next': () => selectRelative(1),
 		'fold-section': () => setFolded(activeId, true),
 		'unfold-section': () => setFolded(activeId, false),
+		'collapse-all-headings': () => setAllFolded(true),
+		'expand-all-headings': () => setAllFolded(false),
 		'move-cell-up': (mode) => moveActive('up', mode),
 		'move-cell-down': (mode) => moveActive('down', mode),
 		'insert-above': () => insertCell('above'),
