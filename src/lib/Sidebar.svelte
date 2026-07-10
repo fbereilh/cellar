@@ -4,9 +4,16 @@
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections.js';
+	import { outlineRows as buildOutlineRows } from '$lib/headings.js';
 
 	let {
 		cells,
+		// The active notebook's collapsible-heading state, owned by its LiveNotebook.
+		// The Outline is a second view of it, never a second copy: a chevron here
+		// calls straight into the notebook's `toggleFold`.
+		foldedIds = new Set(),
+		foldCounts = {},
+		onToggleFold,
 		mcp = null,
 		kernelInfo,
 		kernelBusy,
@@ -58,10 +65,6 @@
 		} catch {}
 		try {
 			sectionOrder = reconcileSectionOrder(JSON.parse(localStorage.getItem(ORDER_KEY) || 'null'));
-		} catch {}
-		try {
-			const savedCollapsed = JSON.parse(localStorage.getItem(OUTLINE_KEY) || 'null');
-			if (Array.isArray(savedCollapsed)) collapsed = new Set(savedCollapsed);
 		} catch {}
 	});
 
@@ -322,65 +325,12 @@
 		cancelNew
 	});
 
-	// ---- Outline (nested markdown-header tree, derived from cells) ----------
-	const HEADING = /^(#{1,6})\s+(.+?)\s*#*\s*$/;
-	const outlineItems = $derived.by(() => {
-		const items = [];
-		for (const cell of cells) {
-			if (cell.cell_type !== 'markdown') continue;
-			const lines = (cell.source || '').split('\n');
-			let inFence = false;
-			for (const line of lines) {
-				if (/^\s*```/.test(line)) inFence = !inFence;
-				if (inFence) continue;
-				const m = HEADING.exec(line);
-				if (m) items.push({ level: m[1].length, text: m[2], cellId: cell.id });
-			}
-		}
-		return items;
-	});
-	// Build a nested tree from the flat heading list using header levels.
-	const outlineTree = $derived.by(() => {
-		const root = [];
-		const stack = []; // { node, level }
-		for (const it of outlineItems) {
-			const node = { text: it.text, level: it.level, cellId: it.cellId, children: [] };
-			while (stack.length && stack[stack.length - 1].level >= it.level) stack.pop();
-			if (stack.length) {
-				const parent = stack[stack.length - 1].node;
-				node.key = parent.key + ' / ' + it.text;
-				parent.children.push(node);
-			} else {
-				node.key = it.text;
-				root.push(node);
-			}
-			stack.push({ node, level: it.level });
-		}
-		return root;
-	});
-	// Collapsed outline nodes, keyed by heading path (stable across reloads).
-	const OUTLINE_KEY = 'cellar-outline-collapsed';
-	let collapsed = $state(new Set());
-	function toggleNode(key) {
-		const next = new Set(collapsed);
-		if (next.has(key)) next.delete(key);
-		else next.add(key);
-		collapsed = next;
-		persist(OUTLINE_KEY, [...collapsed]);
-	}
-	// Flatten the tree to visible rows, hiding children of collapsed nodes.
-	const outlineRows = $derived.by(() => {
-		const rows = [];
-		const walk = (nodes, depth) => {
-			for (const n of nodes) {
-				const isCollapsed = collapsed.has(n.key);
-				rows.push({ text: n.text, level: n.level, cellId: n.cellId, key: n.key, rowKey: `${rows.length}:${n.key}`, depth, hasChildren: n.children.length > 0, collapsed: isCollapsed });
-				if (n.children.length && !isCollapsed) walk(n.children, depth + 1);
-			}
-		};
-		walk(outlineTree, 0);
-		return rows;
-	});
+	// ---- Outline (the notebook's headings, nested by level) ------------------
+	// Rows come from the same `headings.js` model the notebook renders from, and
+	// carry the same fold keys - so every heading level gets a chevron here exactly
+	// as it does in the notebook, a folded heading hides its subtree in both, and
+	// the two can never disagree about what is collapsed.
+	const outlineRows = $derived(buildOutlineRows(cells, foldedIds, foldCounts));
 
 	// ---- Search (over cell content) -----------------------------------------
 	let query = $state('');
@@ -703,30 +653,42 @@
 	</div>
 	{#if open.outline}
 		<div class="px-2 pb-2" data-testid="outline-body">
-			{#each outlineRows as item (item.rowKey)}
-				<div class="flex items-center" style="padding-left: {item.depth * 12}px">
-					{#if item.hasChildren}
-						<button
-							class="flex h-5 w-4 shrink-0 items-center justify-center text-base-content/40 hover:text-base-content"
-							onclick={() => toggleNode(item.key)}
-							title={item.collapsed ? 'Expand' : 'Collapse'}
-							aria-label={item.collapsed ? 'Expand section' : 'Collapse section'}
-							data-testid="outline-toggle"
-						>
-							<svg class="h-3 w-3 transition-transform {item.collapsed ? '' : 'rotate-90'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
-						</button>
-					{:else}
-						<span class="h-5 w-4 shrink-0"></span>
-					{/if}
+			{#each outlineRows as item (item.key)}
+				<div
+					class="flex items-center rounded {item.folded ? 'bg-base-300/50' : ''}"
+					style="margin-left: {item.depth * 12}px"
+					data-testid="outline-row"
+					data-folded={item.folded ? 'true' : undefined}
+				>
 					<button
-						class="block flex-1 truncate rounded px-1 py-0.5 text-left text-xs text-base-content/80 hover:bg-base-300/60"
-						onclick={() => onScrollToCell(item.cellId)}
+						class="flex h-5 w-4 shrink-0 items-center justify-center text-base-content/40 hover:text-base-content"
+						onclick={() => onToggleFold?.(item.key)}
+						title={item.folded ? 'Expand section' : 'Collapse section'}
+						aria-label={item.folded ? 'Expand section' : 'Collapse section'}
+						aria-expanded={!item.folded}
+						data-testid="outline-toggle"
+						data-folded={item.folded ? 'true' : undefined}
+					>
+						<svg class="h-3 w-3 transition-transform {item.folded ? '' : 'rotate-90'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+					</button>
+					<button
+						class="block min-w-0 flex-1 truncate rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {item.folded ? 'text-base-content/60' : 'text-base-content/80'}"
+						onclick={() => onScrollToCell(item.cellId, item.key)}
 						data-testid="outline-item"
-						title={item.text}
+						title={item.title}
 					>
 						<span class="text-base-content/30">{'#'.repeat(item.level)}</span>
-						{item.text}
+						{item.title}
 					</button>
+					{#if item.folded}
+						<span
+							class="mr-1 shrink-0 whitespace-nowrap text-[10px] text-base-content/45"
+							data-testid="outline-folded-count"
+							title={item.hiddenCount > 0 ? `${item.hiddenCount} ${item.hiddenCount === 1 ? 'cell' : 'cells'} hidden` : 'section collapsed'}
+						>
+							…{item.hiddenCount > 0 ? ` ${item.hiddenCount}` : ''}
+						</span>
+					{/if}
 				</div>
 			{:else}
 				<p class="px-2 text-xs text-base-content/40">no markdown headings</p>
