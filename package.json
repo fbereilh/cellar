@@ -49,6 +49,7 @@
     "codemirror": "^6.0.2",
     "dompurify": "^3.4.11",
     "markdown-it": "^14.3.0",
+    "plotly.js-dist-min": "^3.7.0",
     "zod": "^4.4.3"
   }
 }
