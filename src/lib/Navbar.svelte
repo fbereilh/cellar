@@ -13,6 +13,7 @@
 		canConvertToIpynb = false, // the active notebook is a .py → it can be run into an .ipynb
 		converting = false,
 		canExportHtml = false, // a notebook is active, so there's something to export
+		canRunActions = false, // a notebook is active, so the bulk-run actions have a target
 		onSelectTab,
 		onCloseTab,
 		onPromoteTab,
@@ -21,6 +22,9 @@
 		onSaveAsPy,
 		onConvertToIpynb,
 		onExportHtml,
+		onRunStale,
+		onRunAbove,
+		onRunBelow,
 		onOpenSettings
 	} = $props();
 
@@ -102,6 +106,41 @@
 							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
 						{/if}
 						Consolidate imports
+					</button>
+				</li>
+				<div class="divider my-1"></div>
+				<li class="menu-title text-[11px]">Run</li>
+				<li>
+					<button
+						onclick={onRunStale}
+						disabled={!canRunActions}
+						title="Re-run every cell whose result is out of date (a cell it depends on changed since it ran), in dependency order"
+						data-testid="run-stale"
+					>
+						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
+						Run stale cells
+					</button>
+				</li>
+				<li>
+					<button
+						onclick={onRunAbove}
+						disabled={!canRunActions}
+						title="Run every code cell above the selected cell"
+						data-testid="run-above"
+					>
+						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6" /></svg>
+						Run cells above
+					</button>
+				</li>
+				<li>
+					<button
+						onclick={onRunBelow}
+						disabled={!canRunActions}
+						title="Run the selected cell and every code cell below it"
+						data-testid="run-below"
+					>
+						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+						Run cells below
 					</button>
 				</li>
 				<div class="divider my-1"></div>

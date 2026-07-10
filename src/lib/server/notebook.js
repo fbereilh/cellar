@@ -541,6 +541,13 @@ export function setSource(id, source, nb, originId) {
 	const cell = find(doc, id);
 	if (cell && cell.source !== source) {
 		cell.source = source;
+		// Runtime-only edit stamp for the staleness rule ($lib/staleness.js): a cell
+		// (and everything downstream of it) is stale once its source changes after it
+		// last ran. Stripped from disk by clean.js like `lastRun`, so an edit never
+		// dirties the .ipynb. Set BEFORE persist so it rides the same in-memory doc.
+		cell.metadata = cell.metadata ?? {};
+		cell.metadata.cellar = cell.metadata.cellar ?? {};
+		cell.metadata.cellar.editedAt = Date.now();
 		persist(doc);
 		emit(doc, 'cell:edited', { cellId: id, source }, originId);
 	}

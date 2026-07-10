@@ -9,7 +9,7 @@
  * Rules (KEEPS outputs by default):
  *  - null every `execution_count` (cell level + inside each output)
  *  - strip all cell metadata except the allowlisted `cellar` namespace
- *  - drop runtime-only `cellar.lastRun` run metadata (volatile at/durationMs)
+ *  - drop runtime-only `cellar` run metadata (`lastRun`, `editedAt`)
  *  - strip all notebook metadata except `kernelspec` (+ `cellar` if present);
  *    this drops `language_info` and the volatile `widgets` state
  *  - normalize `kernelspec.display_name` → `kernelspec.name`
@@ -66,24 +66,32 @@ function cleanOutput(output) {
 	return output;
 }
 
+/** Runtime-only `cellar` keys — never persisted, stripped symmetrically on read + write. */
+const RUNTIME_CELLAR_KEYS = ['lastRun', 'editedAt'];
+
 /**
- * Return a copy of cell metadata without the runtime-only `cellar.lastRun` run
- * record (volatile at/durationMs, plus the kernel-session epoch that is the sole
- * evidence a cell ran against the live namespace).
+ * Return a copy of cell metadata without the runtime-only `cellar` records:
+ *  - `lastRun` — the run stamp (volatile at/durationMs, plus the kernel-session
+ *    epoch that is the sole evidence a cell ran against the live namespace).
+ *  - `editedAt` — the wall-clock time the source last changed, which feeds the
+ *    staleness rule ($lib/staleness.js) and, like the epoch, would churn a git
+ *    diff on every keystroke if persisted.
  *
- * This is one half of a two-sided forgery guard, and the two halves must stay in
- * lockstep, so they share this helper: `cleanCell` strips it on the way to disk
- * (so a run never dirties the .ipynb), and ipynb.js's `deserialize` strips it on
- * the way back in (so a hand-edited notebook cannot forge `ok_session`: epochs
- * are small monotonic integers and would otherwise be trivial to guess).
+ * This is one half of a two-sided forgery/zero-diff guard, and the two halves
+ * must stay in lockstep, so they share this helper: `cleanCell` strips it on the
+ * way to disk (so a run or an edit never dirties the .ipynb), and ipynb.js's
+ * `deserialize` strips it on the way back in (so a hand-edited notebook cannot
+ * forge `ok_session`: epochs are small monotonic integers and would otherwise be
+ * trivial to guess).
  *
  * An emptied `cellar` namespace is dropped so a foreign cell that never had one
  * stays byte-identical, preserving zero-diff-on-re-run and idempotency.
  */
-export function stripLastRun(metadata) {
+export function stripRuntimeMeta(metadata) {
 	const md = { ...(metadata ?? {}) };
 	if (md.cellar) {
-		const { lastRun, ...rest } = md.cellar;
+		const rest = { ...md.cellar };
+		for (const k of RUNTIME_CELLAR_KEYS) delete rest[k];
 		if (Object.keys(rest).length) md.cellar = rest;
 		else delete md.cellar;
 	}
@@ -96,7 +104,7 @@ function cleanCell(cell) {
 		if (Array.isArray(cell.outputs)) cell.outputs = cell.outputs.map(cleanOutput);
 	}
 	// deny-by-default metadata allowlist (keeps the `cellar` namespace intact)
-	cell.metadata = stripLastRun(pick(cell.metadata, ALLOWED_CELL_METADATA));
+	cell.metadata = stripRuntimeMeta(pick(cell.metadata, ALLOWED_CELL_METADATA));
 	return cell;
 }
 

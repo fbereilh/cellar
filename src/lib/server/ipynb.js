@@ -8,7 +8,7 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { cleanNotebook, stripLastRun } from './clean.js';
+import { cleanNotebook, stripRuntimeMeta } from './clean.js';
 
 const NBFORMAT = 4;
 const NBFORMAT_MINOR = 5;
@@ -64,10 +64,10 @@ export function serialize(doc) {
 /**
  * Parse an nbformat notebook object into canonical cells.
  *
- * `stripLastRun` is the read-side half of the run-stamp forgery guard: a
- * `cellar.lastRun` read off disk must never reach the document, or an
- * externally-authored `.ipynb` could claim a cell ran in the live kernel
- * session. Only an in-process run may originate that stamp. See clean.js.
+ * `stripRuntimeMeta` is the read-side half of the run-stamp forgery guard: a
+ * `cellar.lastRun` (or `.editedAt`) read off disk must never reach the document,
+ * or an externally-authored `.ipynb` could claim a cell ran in the live kernel
+ * session. Only an in-process run/edit may originate those stamps. See clean.js.
  */
 export function deserialize(nb) {
 	const cells = (nb.cells || []).map((c) => ({
@@ -75,7 +75,7 @@ export function deserialize(nb) {
 		cell_type: c.cell_type || 'code',
 		source: fromLines(c.source),
 		outputs: c.outputs ?? [],
-		metadata: stripLastRun(c.metadata)
+		metadata: stripRuntimeMeta(c.metadata)
 	}));
 	return { cells, metadata: nb.metadata ?? defaultMetadata() };
 }

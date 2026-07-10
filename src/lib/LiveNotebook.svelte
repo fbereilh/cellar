@@ -63,6 +63,28 @@
 	let canonicalId = null;
 	let lastSeq = null; // last per-notebook `seq` seen (gap detection → refetch)
 
+	// ---- Staleness -----------------------------------------------------------
+	// Per-cell staleness verdict (id → {state, reason, upstream}), computed on the
+	// SERVER (it owns the dependency graph + the run epochs) and fetched here, so
+	// the UI and the MCP agent surface render the exact same verdict. Refetched
+	// (debounced) whenever something that could change it happens: a run ends, a
+	// cell is edited, the notebook structure changes, or the kernel is reset.
+	let staleness = $state({});
+	let stalenessTimer;
+	async function refreshStaleness() {
+		try {
+			const res = await fetch(`/api/notebooks/staleness?path=${encodeURIComponent(path)}`);
+			if (!res.ok) return;
+			const body = await res.json();
+			staleness = body.cells ?? {};
+		} catch {}
+	}
+	function scheduleStaleness() {
+		clearTimeout(stalenessTimer);
+		stalenessTimer = setTimeout(refreshStaleness, 250);
+	}
+	$effect(() => () => clearTimeout(stalenessTimer));
+
 	// ---- Collapsible headings ------------------------------------------------
 	// THE per-notebook fold state: the set of folded heading keys (see
 	// `headings.js` - a key addresses one heading occurrence, since a markdown cell
@@ -91,7 +113,7 @@
 	// action the modal keyboard runs for a registry shortcut id, so the palette and
 	// the keyboard share one handler and cannot diverge.
 	$effect(() => {
-		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll });
+		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale });
 		return () => onRegisterApi?.(path, null);
 	});
 
@@ -392,6 +414,7 @@
 				pendingQueueEvent = null;
 				applyQueueEvent(ev);
 			}
+			refreshStaleness();
 		} catch (err) {
 			loadError = String(err?.message ?? err);
 		} finally {
@@ -473,6 +496,9 @@
 			const cell = findCell(ev.cellId);
 			if (cell) cell.remoteEdit = { source: ev.source };
 		}
+		// Any structural change (add/edit/type/delete/move/clear) can shift the
+		// dependency graph or the run/edit stamps — recompute staleness.
+		scheduleStaleness();
 	}
 
 	// The kernel's queue, rebroadcast in full on every change (and replayed to us
@@ -530,6 +556,7 @@
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;
 			if (agentRunningId === ev.cellId) agentRunningId = null;
+			scheduleStaleness(); // a finished run clears/creates staleness downstream
 		}
 	}
 
@@ -674,7 +701,43 @@
 			// The `=== id` test additionally keeps an overlapping run's spinner alone.
 			if (started && runningId === id) runningId = null;
 			onRunEnd?.();
+			scheduleStaleness(); // this cell (and its dependents) may have changed staleness
 		}
+	}
+
+	// ---- Bulk run actions (Run above / below / stale) ------------------------
+	// Run a set of code cells one at a time, in the given (document) order. `runCell`
+	// awaits the whole run before returning, so awaiting it in sequence keeps the
+	// execution order — which is dependency order for these actions (a cell's
+	// upstreams always precede it), so downstream cells run against fresh inputs.
+	async function runCodeIds(ids) {
+		for (const id of ids) {
+			const cell = findCell(id);
+			if (!cell || cell.cell_type !== 'code') continue;
+			// Use the editor's LIVE text, not the debounced `cell.source`.
+			const src = cellApis[id]?.currentSource?.() ?? cell.source;
+			await runCell(id, src);
+		}
+		refreshStaleness();
+	}
+	function codeIdsInRange(from, to) {
+		return cells.slice(from, to).filter((c) => c.cell_type === 'code').map((c) => c.id);
+	}
+	/** Run every code cell above the selected one (exclusive). */
+	function runAbove() {
+		const i = cells.findIndex((c) => c.id === activeId);
+		if (i < 0) return;
+		runCodeIds(codeIdsInRange(0, i));
+	}
+	/** Run the selected cell and every code cell below it (Jupyter's "run all below"). */
+	function runBelow() {
+		const i = cells.findIndex((c) => c.id === activeId);
+		if (i < 0) return;
+		runCodeIds(codeIdsInRange(i, cells.length));
+	}
+	/** Run every STALE code cell, in document (dependency) order — clears staleness. */
+	function runStale() {
+		runCodeIds(cells.filter((c) => staleness[c.id]?.state === 'stale').map((c) => c.id));
 	}
 
 	async function editCell(id, source, { keepalive = false } = {}) {
@@ -690,12 +753,16 @@
 			body: JSON.stringify({ source, nb: path, originId }),
 			keepalive
 		}).catch(() => {});
+		// The edit stamped `editedAt` server-side, so this cell (and everything that
+		// uses its names) may now be stale — recompute from the server's view.
+		scheduleStaleness();
 	}
 
 	async function clearCell(id) {
 		const cell = findCell(id);
 		if (cell) cell.outputs = [];
 		await fetch(`/api/cells/${id}/clear?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, { method: 'POST' });
+		scheduleStaleness();
 	}
 
 	async function setType(id, cellType) {
@@ -709,6 +776,7 @@
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ cell_type: cellType, nb: path, originId })
 		});
+		scheduleStaleness();
 	}
 
 	// ---- Cut / copy / paste / undo-delete ------------------------------------
@@ -814,6 +882,7 @@
 		// follows, because the delete button that had it is gone with the cell.
 		if (activeId === id) selectAfterRemoval(i, { focus: true });
 		await fetch(`/api/cells/${id}?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, { method: 'DELETE' });
+		scheduleStaleness();
 	}
 
 	/**
@@ -843,6 +912,7 @@
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ dir, nb: path, originId })
 		});
+		scheduleStaleness(); // reordering changes the preceding-definer graph
 	}
 
 	// Drag-to-reorder: move a cell to an absolute index. Reuses the server's
@@ -864,6 +934,7 @@
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ toIndex: cells.findIndex((c) => c.id === id), nb: path, originId })
 		});
+		scheduleStaleness(); // reordering changes the preceding-definer graph
 	}
 
 	// Persist a cell's "scroll outputs" choice (undefined = auto height, true =
@@ -899,6 +970,7 @@
 		} else {
 			cells = [...cells, view];
 		}
+		scheduleStaleness();
 		return view;
 	}
 
@@ -1219,6 +1291,7 @@
 			{queued}
 			{activeId}
 			{keyMode}
+			{staleness}
 			hidden={folding.hidden}
 			foldedIds={foldedIds}
 			hiddenSegs={folding.segs}
