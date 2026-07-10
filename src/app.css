@@ -43,20 +43,24 @@
 	--cellar-git-tree-deleted: light-dark(#ad0707, #c74e39);
 
 	/* --- Notebook surfaces --------------------------------------------------
-	 * Three distinct planes, so a code cell reads as a grey editor and a white
-	 * output sitting on a faintly-grey page. In dark themes each token resolves
-	 * to the daisyUI surface that was already in use, leaving dark untouched. */
-	--cellar-surface-page: light-dark(#f1f2f5, var(--color-base-200));
+	 * Three distinct planes. In light themes the page is the *greyest* plane and
+	 * every plane above it gets lighter: a grey page, a white cell card, a faintly
+	 * tinted editor (`--cellar-cm-bg`) and a white output. The page grey and the
+	 * editor grey are deliberately the way round they are - inverting them (the
+	 * innermost surface darkest) makes a cell read as a hole punched in the page
+	 * rather than a card resting on it. In dark themes each token resolves to the
+	 * daisyUI surface that was already in use, leaving dark untouched. */
+	--cellar-surface-page: light-dark(#e7e9ee, var(--color-base-200));
 	--cellar-surface-cell: light-dark(#ffffff, var(--color-base-100));
 	--cellar-surface-output: light-dark(#ffffff, var(--color-base-100));
 
 	/* --- CodeMirror ---------------------------------------------------------
 	 * Consumed by the single static theme in `editorTheme.js`. Light is pygments
-	 * "default" (the Jupyter light scheme) on the grey editor surface; dark is
+	 * "default" (the Jupyter light scheme) on the tinted editor surface; dark is
 	 * One Dark, verbatim. Because the theme is static, a theme toggle repaints
 	 * rather than reconfiguring every mounted editor — see `editorTheme.js`. */
 	--cellar-cm-fg: light-dark(#1a1a1a, #abb2bf);
-	--cellar-cm-bg: light-dark(#e7e9ee, #282c34);
+	--cellar-cm-bg: light-dark(#f1f2f5, #282c34);
 	--cellar-cm-cursor: light-dark(#1a1a1a, #528bff);
 	--cellar-cm-selection: light-dark(#d7d4f0, #3e4451);
 	--cellar-cm-selection-match: light-dark(#99ff7780, #aafe661a);
