@@ -27,7 +27,8 @@
 		onRegisterFolds, // (path, {toggle,collapseAll,expandAll}|null): lets the Outline drive this notebook's folds
 		onRegisterApi, // (path, {insertAndRunCode}|null): lets the sidebar drop a cell in here
 		onRunStart,
-		onRunEnd
+		onRunEnd,
+		onInterruptKernel // interrupt the shared kernel (same handler the Kernels sidebar uses)
 	} = $props();
 
 	let cells = $state([]);
@@ -1302,6 +1303,7 @@
 			onToggleFold={toggleFold}
 			onRun={runCell}
 			onRunAdvance={runAndAdvance}
+			onInterrupt={onInterruptKernel}
 			onClear={clearCell}
 			onDelete={deleteCell}
 			onMove={moveCell}
