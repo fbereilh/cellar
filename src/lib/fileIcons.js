@@ -25,6 +25,9 @@ const ICONS = {
 	// Markdown: the classic "M▾" mark in a rounded outline.
 	markdown:
 		'<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="1" y="3.5" width="14" height="9" rx="1.5" fill="none" stroke="#42a5f5" stroke-width="1.3"/><path d="M3.4 10.6V6.2l2 2 2-2v4.4" fill="none" stroke="#42a5f5" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/><path d="M10.6 6.4v3.4m0 0-1.3-1.4m1.3 1.4 1.3-1.4" fill="none" stroke="#42a5f5" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/></svg>',
+	// Config (yaml/toml): a violet gear, the way icon themes mark settings files.
+	config:
+		'<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 1.9l1.05 1.36 1.7-.28.32 1.7 1.55.76-.84 1.5.84 1.5-1.55.76-.32 1.7-1.7-.28L8 14.1l-1.05-1.36-1.7.28-.32-1.7-1.55-.76.84-1.5-.84-1.5 1.55-.76.32-1.7 1.7.28z" fill="none" stroke="#a074c4" stroke-width="1.2" stroke-linejoin="round"/><circle cx="8" cy="8" r="1.9" fill="none" stroke="#a074c4" stroke-width="1.2"/></svg>',
 	// Image: a teal picture frame with sun + mountain.
 	image:
 		'<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.5" fill="none" stroke="#26a69a" stroke-width="1.3"/><circle cx="5.6" cy="6" r="1.15" fill="#26a69a"/><path d="M3 12.2l3-3 2 2 2.6-3.2 2.4 3.4" fill="none" stroke="#26a69a" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/></svg>',
@@ -52,6 +55,9 @@ const EXT_MAP = {
 	md: 'markdown',
 	markdown: 'markdown',
 	svelte: 'svelte',
+	yml: 'config',
+	yaml: 'config',
+	toml: 'config',
 	png: 'image',
 	jpg: 'image',
 	jpeg: 'image',

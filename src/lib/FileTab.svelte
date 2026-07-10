@@ -7,6 +7,8 @@
 	import { markdown } from '@codemirror/lang-markdown';
 	import { json as jsonLang } from '@codemirror/lang-json';
 	import { yaml as yamlLang } from '@codemirror/lang-yaml';
+	import { StreamLanguage } from '@codemirror/language';
+	import { toml as tomlMode } from '@codemirror/legacy-modes/mode/toml';
 	import { editorThemeExtensions } from '$lib/editorTheme.js';
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports
@@ -23,11 +25,17 @@
 	let saving = $state(false);
 	let savedFlash = $state(false);
 
+	// TOML ships no lezer grammar; the official legacy stream mode is the supported
+	// path. Its tokens map onto the same highlight tags every other language uses,
+	// so both editor themes style it without any theme-side work.
+	const tomlLang = () => StreamLanguage.define(tomlMode);
+
 	function langFor(p) {
 		if (p.endsWith('.py')) return python();
 		if (p.endsWith('.md') || p.endsWith('.markdown')) return markdown();
 		if (p.endsWith('.json') || p.endsWith('.ipynb')) return jsonLang();
 		if (p.endsWith('.yml') || p.endsWith('.yaml')) return yamlLang();
+		if (p.endsWith('.toml')) return tomlLang();
 		return [];
 	}
 
