@@ -544,6 +544,24 @@
 		a.remove();
 	}
 
+	// ---- Bulk run actions (navbar) -------------------------------------------
+	// Delegate to the active notebook's registered API (the same `notebookApis`
+	// registry the Databricks preview uses). Run above/below act on that notebook's
+	// own selected cell; run-stale re-runs everything its dependency graph marks
+	// stale, in order. The notebook must be focused first: a hidden pane has no
+	// geometry, so a scrolled-into-view running cell would have nowhere to land.
+	function runNotebookAction(name) {
+		const path = activeNotebookPath;
+		const api = path && notebookApis.get(path);
+		if (!api?.[name]) return;
+		if (path === canonicalNotebookRel) openNotebook();
+		else openFilePermanent(path);
+		api[name]();
+	}
+	const runStaleActive = () => runNotebookAction('runStale');
+	const runAboveActive = () => runNotebookAction('runAbove');
+	const runBelowActive = () => runNotebookAction('runBelow');
+
 	async function scrollToCell(id, foldKey = null) {
 		// Open + focus the notebook the outline currently reflects, then scroll. With
 		// no active notebook the outline and search are empty, so there is no row to
@@ -780,6 +798,7 @@
 		canConvertToIpynb={activeNotebookIsPy}
 		{converting}
 		canExportHtml={!!activeNotebookPath}
+		canRunActions={!!activeNotebookPath}
 		onSelectTab={selectTab}
 		onCloseTab={closeTab}
 		onPromoteTab={promoteTab}
@@ -788,6 +807,9 @@
 		onSaveAsPy={openSaveAsPy}
 		onConvertToIpynb={convertToIpynb}
 		onExportHtml={exportHtml}
+		onRunStale={runStaleActive}
+		onRunAbove={runAboveActive}
+		onRunBelow={runBelowActive}
 		onOpenSettings={() => (settingsOpen = true)}
 	/>
 

@@ -32,6 +32,8 @@ import { enqueueRun, queueState, queuePosition } from '../run-queue.js';
 import { executeCellRun } from '../run.js';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell.js';
 import { buildTree } from '../fstree.js';
+import { getNotebookStaleness } from '../dataflow.js';
+import { STALE_STATE, staleIdsInOrder } from '../../staleness.js';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -193,13 +195,31 @@ function summarizeOutput(o, cap) {
 
 const summarizeOutputs = (cell, cap) => (cell.outputs || []).map((o) => summarizeOutput(o, cap));
 
-function readForm(cell, cap = READ_CAP, sid = currentSessionId()) {
+/**
+ * The staleness annotation for a read/run result, from a per-cell verdict
+ * (`$lib/staleness.js`). Always carries `stale_state` (not_run / fresh / stale /
+ * n/a); a stale cell additionally carries WHY and the upstream cell ids that made
+ * it stale, so an agent knows exactly what to re-run before trusting the output.
+ */
+function staleFields(entry) {
+	if (!entry) return {};
+	const out = { stale_state: entry.state };
+	if (entry.state === STALE_STATE.STALE) {
+		out.stale = true;
+		out.stale_reason = entry.reason;
+		if (entry.upstream?.length) out.stale_upstream = entry.upstream;
+	}
+	return out;
+}
+
+function readForm(cell, cap = READ_CAP, sid = currentSessionId(), staleEntry = null) {
 	return {
 		id: cell.id,
 		type: cell.cell_type,
 		source: cell.source,
 		run_status: runStatus(cell, sid),
 		ran_this_session: ranThisSession(cell, sid),
+		...staleFields(staleEntry),
 		has_output: hasOutput(cell),
 		visible: !isHidden(cell),
 		outputs: summarizeOutputs(cell, cap)
@@ -286,9 +306,9 @@ export function createNotebook(name) {
  * status is saved output from an earlier session and nothing those cells define
  * exists in the namespace. `kernel_state` remains the live truth.
  */
-export function getNotebookMap() {
+export async function getNotebookMap() {
 	const cells = visibleCells();
-	const sid = currentSessionId();
+	const { sid, cells: stale } = await getNotebookStaleness();
 	const root = [];
 	const stack = [];
 	const leaf = (c) => ({
@@ -298,6 +318,7 @@ export function getNotebookMap() {
 		summary: firstLine(c.source),
 		run_status: runStatus(c, sid),
 		ran_this_session: ranThisSession(c, sid),
+		...staleFields(stale[c.id]),
 		has_output: hasOutput(c),
 		visible: true
 	});
@@ -329,7 +350,26 @@ export function getNotebookMap() {
  * destroyed `spark` reads as disconnected here too.
  */
 export async function getKernelState() {
-	return { ...(await kernelState()), databricks: databricksStatus() };
+	const [state, stale] = await Promise.all([kernelState(), staleCells()]);
+	return { ...state, databricks: databricksStatus(), stale_cells: stale };
+}
+
+/**
+ * The visible cells whose live result is STALE — their inputs changed since they
+ * last ran — as `[{ id, reason, upstream }]` in document order. Handed to the
+ * agent in kernel_state so it can re-run (or distrust) them before relying on
+ * their outputs, the same way the UI's stale indicator warns a human.
+ */
+async function staleCells() {
+	const { cells } = await getNotebookStaleness();
+	const out = [];
+	for (const c of visibleCells()) {
+		const e = cells[c.id];
+		if (e?.state === STALE_STATE.STALE) {
+			out.push({ id: c.id, reason: e.reason, ...(e.upstream?.length ? { upstream: e.upstream } : {}) });
+		}
+	}
+	return out;
 }
 
 /**
@@ -351,25 +391,32 @@ export const databricks = {
 	preview: (name, limit) => previewTable({ name, limit })
 };
 
-export function readCell(id, sid = currentSessionId()) {
+export async function readCell(id) {
 	const c = getCell(id);
 	if (!c || isHidden(c)) return null;
-	return readForm(c, READ_CAP, sid);
+	const { sid, cells: stale } = await getNotebookStaleness();
+	return readForm(c, READ_CAP, sid, stale[id]);
 }
 
 /**
- * Read many cells against ONE sampled epoch. Letting `readForm` re-sample per
- * cell would let a restart landing mid-loop classify a single response against
- * two different kernel sessions — some cells `ok_session`, some `ok_persisted`,
- * for the same kernel state.
+ * Read many cells against ONE sampled epoch + one staleness pass. Letting
+ * `readForm` re-sample per cell would let a restart landing mid-loop classify a
+ * single response against two different kernel sessions — some cells `ok_session`,
+ * some `ok_persisted` — for the same kernel state.
  */
-export function readCells(ids) {
-	const sid = currentSessionId();
-	return ids.map((id) => readCell(id, sid)).filter(Boolean);
+export async function readCells(ids) {
+	const { sid, cells: stale } = await getNotebookStaleness();
+	return ids
+		.map((id) => {
+			const c = getCell(id);
+			if (!c || isHidden(c)) return null;
+			return readForm(c, READ_CAP, sid, stale[id]);
+		})
+		.filter(Boolean);
 }
 
 /** index (0-based over visible cells), position first/last, or next/prev of an id. */
-export function readByLocation({ index, position, relativeTo, direction }) {
+export async function readByLocation({ index, position, relativeTo, direction }) {
 	const cells = visibleCells();
 	if (!cells.length) return null;
 	let target = null;
@@ -381,11 +428,13 @@ export function readByLocation({ index, position, relativeTo, direction }) {
 		if (i < 0) return null;
 		target = direction === 'prev' ? cells[i - 1] : cells[i + 1];
 	}
-	return target ? readForm(target) : null;
+	if (!target) return null;
+	const { sid, cells: stale } = await getNotebookStaleness();
+	return readForm(target, READ_CAP, sid, stale[target.id]);
 }
 
 /** Cells under a markdown header (until the next same-or-higher header). */
-export function readSection(headerId) {
+export async function readSection(headerId) {
 	const cells = visibleCells();
 	const idx = cells.findIndex((c) => c.id === headerId);
 	if (idx < 0) return null;
@@ -397,9 +446,9 @@ export function readSection(headerId) {
 		if (hi && hi.level <= h.level) break;
 		out.push(cells[i]);
 	}
-	// One sampled epoch for the whole section (see readCells).
-	const sid = currentSessionId();
-	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid)) };
+	// One sampled epoch + staleness pass for the whole section (see readCells).
+	const { sid, cells: stale } = await getNotebookStaleness();
+	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid, stale[c.id])) };
 }
 
 /**
@@ -683,7 +732,11 @@ export async function runCell(id) {
 			source: ticket.source() ?? cell.source ?? ''
 		});
 		const hiddenNote = isHidden(cell) ? { hidden: true } : {};
-		return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+		// The run may have made downstream cells stale (this one just re-ran) or
+		// cleared this cell's own staleness — surface its fresh verdict so a follow-up
+		// read is not needed just to see whether the run settled it.
+		const { cells: stale } = await getNotebookStaleness();
+		return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id]), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and
 		// broadcast, so the wire order stays run:end → run:start.
@@ -756,6 +809,21 @@ export async function runCells(ids) {
 export async function runAll() {
 	const ids = listCells().filter((c) => c.cell_type === 'code').map((c) => c.id);
 	return runCells(ids);
+}
+
+/**
+ * Run every STALE code cell, in document order — which is dependency
+ * (topological) order for the preceding-definer graph, so a cell always runs
+ * after the upstreams that made it stale. This is the agent-side counterpart of
+ * the UI's "Run all stale" action: one call to bring the whole notebook back in
+ * sync with its current code. Hidden cells run but are omitted from results
+ * (same as run_all). Returns the run results plus which cells were run.
+ */
+export async function runStale() {
+	const { cells: stale } = await getNotebookStaleness();
+	const ids = staleIdsInOrder(listCells(), stale);
+	const results = await runCells(ids);
+	return { ran: ids, results };
 }
 
 /** Run code cells in the inclusive document range from→to. */

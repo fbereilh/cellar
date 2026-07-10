@@ -42,6 +42,17 @@
 	--cellar-git-tree-modified: light-dark(#895503, #e2c08d);
 	--cellar-git-tree-deleted: light-dark(#ad0707, #c74e39);
 
+	/* --- Staleness ----------------------------------------------------------
+	 * The per-cell "out of date" indicator (`Cell.svelte`): a cell that ran this
+	 * session but whose inputs changed since. Amber, the universal "stale" cue -
+	 * deliberately its OWN token, not daisyUI `warning`, because the running/queued
+	 * affordances already own the `warning` hue: those are transient (a pulsing bar
+	 * + spinner), a stale chip is a persistent static badge, and giving staleness a
+	 * fixed light/dark pair (like the git tokens) keeps it legible in both themes.
+	 * `-soft` is the low-alpha fill behind the chip. */
+	--cellar-stale: light-dark(#b45309, #f0b429);
+	--cellar-stale-soft: light-dark(#b4530918, #f0b42920);
+
 	/* --- Notebook surfaces --------------------------------------------------
 	 * Three distinct planes. In light themes the page is the *greyest* plane and
 	 * every plane above it gets lighter: a grey page, a white cell card, a faintly

@@ -13,6 +13,7 @@
 		queued = {}, // cell id → 1-based position in the kernel's global run queue
 		activeId = null,
 		keyMode = 'command', // 'command' | 'edit' (Jupyter-style modal keyboard)
+		staleness = {}, // cell id → staleness verdict ($lib/staleness.js)
 		hidden = new Set(), // cell ids hidden because a folded heading collapsed their section
 		foldedIds = new Set(), // fold keys of the headings whose section is folded
 		hiddenSegs = new Map(), // cell id → segment indices an outer fold hides inside it
@@ -169,6 +170,7 @@
 						queuedPosition={queued[cell.id] ?? null}
 						active={activeId === cell.id}
 						{keyMode}
+						staleState={staleness[cell.id] ?? null}
 						{pinnedTop}
 						dragging={dragId === cell.id}
 						{foldedIds}

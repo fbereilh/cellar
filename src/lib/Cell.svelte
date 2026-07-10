@@ -26,6 +26,7 @@
 		queuedPosition = null, // 1-based place in the kernel's run queue, or null
 		active = false,
 		keyMode = 'command', // notebook mode ('command' | 'edit'); only meaningful while `active`
+		staleState = null, // staleness verdict {state, reason, upstream} ($lib/staleness.js), or null
 		dragging = false,
 		pinnedTop = false, // the notebook's cell 0 is the pinned imports cell
 		foldedIds = new Set(), // fold keys of every collapsed heading in the notebook
@@ -152,6 +153,23 @@
 	});
 	const ranText = $derived(lastRun ? `ran ${relativeTime(lastRun.at, now)} · ${formatDuration(lastRun.durationMs)}` : '');
 	const isAgentRun = $derived(lastRun?.actor === 'agent');
+
+	// ---- Staleness indicator -------------------------------------------------
+	// A code cell that ran this session but whose inputs changed since is STALE:
+	// its output no longer matches its current code (self-edit) or an upstream
+	// cell it depends on (edited / re-run). Distinct from running/queued/selected -
+	// a persistent amber chip, not a bar. A cell that ran in a PREVIOUS session
+	// shows a quieter "not run" hint, but only when it looks like it has a result
+	// to distrust (saved outputs, or a run badge). Suppressed while running/queued,
+	// which are the louder, more immediate states.
+	const staleState_ = $derived(staleState?.state ?? null);
+	const isStale = $derived(!isMarkdown && staleState_ === 'stale' && !showRunning && !isQueued);
+	const notRunThisSession = $derived(
+		!isMarkdown && staleState_ === 'not_run' && !showRunning && !isQueued && (lastRun || (cell.outputs || []).length > 0)
+	);
+	const staleTitle = $derived(
+		staleState?.reason ? `Stale — ${staleState.reason}. Re-run to refresh.` : 'Stale — an input changed after this cell ran. Re-run to refresh.'
+	);
 
 	// Strip ANSI SGR color codes (ESC[…m) that Jupyter puts in tracebacks.
 	const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
@@ -561,6 +579,7 @@
 	data-active={active ? 'true' : undefined}
 	data-running={showRunning ? 'true' : undefined}
 	data-queued={isQueued ? 'true' : undefined}
+	data-stale={isStale ? 'true' : undefined}
 	role="presentation"
 	onfocusin={() => onActivate?.(cell.id)}
 	onpointerdown={() => onActivate?.(cell.id)}
@@ -661,6 +680,34 @@
 								user
 							{/if}
 						</span>
+					</span>
+				{/if}
+				{#if isStale}
+					<!-- Persistent amber "stale" chip: the cell ran, but an input changed
+					     since. Its own token (`--cellar-stale`), not the `warning` hue the
+					     transient running/queued affordances own, so the two never blur. -->
+					<span
+						class="ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium"
+						style="color: var(--cellar-stale); background: var(--cellar-stale-soft);"
+						data-testid="stale-badge"
+						data-stale-state="stale"
+						title={staleTitle}
+					>
+						<!-- circular arrows: out of date, re-run to refresh -->
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
+						stale
+					</span>
+				{:else if notRunThisSession}
+					<!-- Quieter than stale: the cell's saved output is from a PREVIOUS
+					     kernel session, so nothing it defines exists in the kernel now. -->
+					<span
+						class="ml-2 inline-flex items-center gap-1 text-[11px] font-medium text-base-content/40"
+						data-testid="not-run-badge"
+						data-stale-state="not_run"
+						title="This cell has not run in the current kernel session — its saved output is from a previous session."
+					>
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 8v4" /><path d="M12 16h.01" /></svg>
+						not run
 					</span>
 				{/if}
 			</div>
