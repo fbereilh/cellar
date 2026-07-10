@@ -555,6 +555,42 @@
 		a.remove();
 	}
 
+	// ---- Checkpoints (navbar) ------------------------------------------------
+	// Snapshot / undo for the active notebook. The sidebar History panel owns the
+	// full list + restore UI; these two navbar entries are the quick paths. The
+	// server broadcasts `notebook:restored` on an undo, so every tab refetches.
+	async function checkpointNow() {
+		if (!activeNotebookPath) return;
+		try {
+			const res = await fetch('/api/checkpoints', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ path: activeNotebookPath, action: 'create' })
+			});
+			const body = await res.json().catch(() => ({}));
+			notice = res.ok ? 'Checkpoint saved.' : `Checkpoint failed: ${body?.message ?? ''}`;
+		} catch (err) {
+			notice = `Checkpoint failed: ${err?.message ?? err}`;
+		}
+	}
+
+	async function undoLastAgentAction() {
+		if (!activeNotebookPath) return;
+		try {
+			const res = await fetch('/api/checkpoints', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ path: activeNotebookPath, action: 'undo-agent', originId })
+			});
+			const body = await res.json().catch(() => ({}));
+			if (!res.ok) notice = `Undo failed: ${body?.message ?? ''}`;
+			else if (body.ok) notice = 'Reverted to before the last agent action.';
+			else notice = 'Nothing to undo - no agent action has been checkpointed yet.';
+		} catch (err) {
+			notice = `Undo failed: ${err?.message ?? err}`;
+		}
+	}
+
 	// ---- Bulk run actions (navbar) -------------------------------------------
 	// Delegate to the active notebook's registered API (the same `notebookApis`
 	// registry the Databricks preview uses). Run above/below act on that notebook's
@@ -810,6 +846,7 @@
 		{converting}
 		canExportHtml={!!activeNotebookPath}
 		canRunActions={!!activeNotebookPath}
+		canCheckpoint={!!activeNotebookPath}
 		onSelectTab={selectTab}
 		onCloseTab={closeTab}
 		onPromoteTab={promoteTab}
@@ -821,6 +858,8 @@
 		onRunStale={runStaleActive}
 		onRunAbove={runAboveActive}
 		onRunBelow={runBelowActive}
+		onCheckpointNow={checkpointNow}
+		onUndoAgent={undoLastAgentAction}
 		onOpenSettings={() => (settingsOpen = true)}
 	/>
 
@@ -842,6 +881,7 @@
 					{varsLoading}
 					{varsError}
 					{activeFilePath}
+					{activeNotebookPath}
 					{fsRefreshSignal}
 					onRefreshVars={refreshVariables}
 					onRefreshKernel={refreshKernel}

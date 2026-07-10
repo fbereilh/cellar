@@ -592,6 +592,12 @@
 			// A gap in this notebook's monotonic seq means we missed events → refetch.
 			if (lastSeq !== null && ev.seq > lastSeq + 1) load();
 			lastSeq = ev.seq; // advance even for our own echo, so it isn't seen as a gap
+			// A checkpoint restore replaces the whole document; every tab (the initiating
+			// one included, since it applies no optimistic local change) refetches.
+			if (ev.type === 'notebook:restored') {
+				load();
+				return;
+			}
 			if (ev.originId && ev.originId === originId) return; // our own UI action
 			if (ev.type?.startsWith('cell:')) applyStructuralEvent(ev);
 			else applyRunEvent(ev);

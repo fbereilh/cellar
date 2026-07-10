@@ -2,6 +2,7 @@
 	import { onMount, setContext } from 'svelte';
 	import Databricks from '$lib/Databricks.svelte';
 	import Environment from '$lib/Environment.svelte';
+	import Checkpoints from '$lib/Checkpoints.svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
@@ -42,14 +43,17 @@
 		activeFilePath = null,
 		fsRefreshSignal = 0,
 		onScrollToCell,
-		onFsChange
+		onFsChange,
+		// The active notebook (workspace-relative path, or null). Drives the History
+		// (checkpoints) panel, which is per-notebook.
+		activeNotebookPath = null
 	} = $props();
 
 	// ---- Persisted section collapse state -----------------------------------
 	// Which foldable sections are open. All start expanded (agent panel collapsed),
 	// then overridden by the persisted state on mount.
 	const OPEN_KEY = 'cellar-sidebar-open';
-	let open = $state({ files: true, kernels: true, databricks: false, environment: false, agent: false, outline: true, vars: true, search: false });
+	let open = $state({ files: true, kernels: true, databricks: false, environment: false, agent: false, outline: true, history: false, vars: true, search: false });
 	function toggle(k) {
 		open[k] = !open[k];
 		persist(OPEN_KEY, open);
@@ -66,6 +70,9 @@
 	// subprocess to list packages, so a user who never opens it never pays for it.
 	let environmentMounted = $state(false);
 	let environmentComp = $state(null);
+	// The History (checkpoints) panel component, for its header's "Checkpoint now" +
+	// refresh buttons. Mounted with the section (it's cheap: one metadata GET).
+	let checkpointsComp = $state(null);
 	$effect(() => {
 		if (open.environment) environmentMounted = true;
 	});
@@ -769,6 +776,26 @@
 	{/if}
 {/snippet}
 
+{#snippet checkpointsSection()}
+	<div class="flex items-center">
+		{@render header('history', 'History', 'section-history')}
+		<button
+			class="btn btn-ghost btn-xs btn-square text-base-content/40 hover:text-base-content"
+			onclick={() => checkpointsComp?.checkpointNow()}
+			disabled={!activeNotebookPath}
+			title="Snapshot the notebook now"
+			aria-label="Checkpoint now"
+			data-testid="checkpoint-now"
+		>
+			<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14" /><path d="M12 5v14" /></svg>
+		</button>
+		{@render refreshBtn(() => checkpointsComp?.refresh(), 'Refresh checkpoints')}
+	</div>
+	{#if open.history}
+		<Checkpoints bind:this={checkpointsComp} notebookPath={activeNotebookPath} />
+	{/if}
+{/snippet}
+
 {#snippet varsSection()}
 	<div class="flex items-center">
 		{@render header('vars', 'Variables', 'section-vars')}
@@ -838,6 +865,7 @@
 	{:else if key === 'environment'}{@render environmentSection()}
 	{:else if key === 'agent'}{@render agentSection()}
 	{:else if key === 'outline'}{@render outlineSection()}
+	{:else if key === 'history'}{@render checkpointsSection()}
 	{:else if key === 'vars'}{@render varsSection()}
 	{:else if key === 'search'}{@render searchSection()}
 	{/if}
