@@ -875,25 +875,31 @@
 							{typeLabel}
 							<svg class="h-2.5 w-2.5 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 						</button>
-						<!-- Popover (top layer, so the card's overflow-hidden never clips it). -->
+						<!-- Popover (top layer, so the card's overflow-hidden never clips it).
+							 The popover element must NOT carry a `display` (no `menu`/`flex`
+							 class): a `display` rule overrides the UA
+							 `[popover]:not(:popover-open){display:none}` and the menu renders
+							 open on every cell. Layout lives on the inner wrapper below. -->
 						<div
 							bind:this={typeMenuEl}
 							popover="auto"
-							class="menu m-0 w-36 gap-0.5 rounded-box border border-base-300 bg-base-100 p-1 text-sm shadow-lg"
+							class="m-0 rounded-box border border-base-300 bg-base-100 p-1 text-sm shadow-lg"
 							style="position: fixed; inset: auto; margin: 0;"
 							data-testid="type-menu"
 						>
-							{#each [{ v: 'code', label: 'Python', hint: 'python3' }, { v: 'sql', label: 'SQL', hint: 'spark.sql' }, { v: 'markdown', label: 'Markdown', hint: 'text' }] as opt}
-								<button
-									class="flex items-center justify-between rounded px-2 py-1 text-left hover:bg-base-200 {logicalType === opt.v ? 'font-semibold text-primary' : 'text-base-content'}"
-									onclick={() => chooseType(opt.v)}
-									data-testid="type-option-{opt.v}"
-									aria-current={logicalType === opt.v}
-								>
-									<span>{opt.label}</span>
-									<span class="font-mono text-[10px] text-base-content/40">{opt.hint}</span>
-								</button>
-							{/each}
+							<div class="flex w-36 flex-col gap-0.5">
+								{#each [{ v: 'code', label: 'Python', hint: 'python3' }, { v: 'sql', label: 'SQL', hint: 'spark.sql' }, { v: 'markdown', label: 'Markdown', hint: 'text' }] as opt}
+									<button
+										class="flex items-center justify-between rounded px-2 py-1 text-left hover:bg-base-200 {logicalType === opt.v ? 'font-semibold text-primary' : 'text-base-content'}"
+										onclick={() => chooseType(opt.v)}
+										data-testid="type-option-{opt.v}"
+										aria-current={logicalType === opt.v}
+									>
+										<span>{opt.label}</span>
+										<span class="font-mono text-[10px] text-base-content/40">{opt.hint}</span>
+									</button>
+								{/each}
+							</div>
 						</div>
 					{/if}
 				</span>
