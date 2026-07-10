@@ -263,6 +263,23 @@
 	}
 	const outputs = $derived((cell.outputs || []).map(renderOutput));
 
+	// ---- Full-size image outputs (JupyterLab double-click) -------------------
+	// Double-clicking an image output toggles it between fit-to-width and its
+	// natural pixel size, matching JupyterLab. In full size the image is wrapped
+	// in an overflow-auto box (bounded height) so it scrolls within the output
+	// area rather than widening the notebook. View-only runtime state keyed by
+	// output index; a re-run rebuilds `outputs` and resets the choice, which is
+	// the honest default (a new render is a fresh image), so it never touches the
+	// `.ipynb`.
+	let fullImages = $state(new Set());
+	const hasFullImage = $derived(fullImages.size > 0);
+	function toggleFullImage(i) {
+		const next = new Set(fullImages);
+		if (next.has(i)) next.delete(i);
+		else next.add(i);
+		fullImages = next;
+	}
+
 	// ---- Scrollable / contracted outputs ------------------------------------
 	// Per-cell choice persisted in `cell.metadata.cellar.output_scrolled`
 	// (undefined = auto, true = force scrolled, false = force full). Above a
@@ -270,16 +287,17 @@
 	const SCROLL_THRESHOLD = 360; // px of output beyond which we contract by default
 	let outputInner = $state(null);
 	let outputTall = $state(false);
-	// The DataFrame grid manages its own fixed height + scroll, so it must not be
-	// wrapped in the outer output-scroll box (that would double-scroll and clip the
-	// grid's pagination footer). When a grid is present, skip auto-contraction and
-	// hide the toggle entirely.
+	// The DataFrame grid — and a full-size image — manage their own fixed height +
+	// scroll, so they must not also be wrapped in the outer output-scroll box (that
+	// would double-scroll and clip content). When either is present, skip
+	// auto-contraction and hide the toggle entirely.
 	const hasDataframe = $derived(outputs.some((o) => o.dataframe));
+	const ownsScroll = $derived(hasDataframe || hasFullImage);
 	const explicitScrolled = $derived(cell.metadata?.cellar?.output_scrolled);
-	const scrolled = $derived(hasDataframe ? false : (explicitScrolled ?? outputTall));
+	const scrolled = $derived(ownsScroll ? false : (explicitScrolled ?? outputTall));
 	$effect(() => {
 		cell.outputs; // re-measure whenever outputs change
-		if (outputInner) outputTall = !hasDataframe && outputInner.scrollHeight > SCROLL_THRESHOLD;
+		if (outputInner) outputTall = !ownsScroll && outputInner.scrollHeight > SCROLL_THRESHOLD;
 	});
 	function toggleScrolled() {
 		onSetScrolled?.(cell.id, !scrolled);
@@ -879,8 +897,9 @@
 		{#if !isMarkdown && outputs.length}
 			<div class="relative border-t border-base-300 bg-(--cellar-surface-output)" data-testid="output">
 				<!-- Scroll-outputs toggle (Jupyter "Enable Scrolling for Outputs"). The
-				     DataFrame grid owns its own scroll, so the toggle is hidden for it. -->
-				{#if !hasDataframe}
+				     DataFrame grid and a full-size image own their own scroll, so the
+				     toggle is hidden for them. -->
+				{#if !ownsScroll}
 				<button
 					class="btn btn-ghost btn-xs absolute right-1 top-1 z-10 h-5 min-h-0 gap-1 px-1.5 text-[10px] font-normal text-base-content/40 hover:text-base-content/80"
 					onclick={toggleScrolled}
@@ -899,18 +918,27 @@
 				{/if}
 				<div class="{scrolled ? 'max-h-[22rem] overflow-y-auto' : ''}" data-testid="output-scroll" data-scrolled={scrolled ? 'true' : undefined}>
 					<div bind:this={outputInner} class="space-y-0.5 py-2">
-						{#each outputs as o}
+						{#each outputs as o, i}
 							{#if o.dataframe}
 								<div class="px-3 py-1" data-testid="output-dataframe">
 									<DataFrameGrid payload={o.dataframe} />
 								</div>
 							{:else if o.image}
-								<img
-									class="max-w-full px-3 py-1"
-									src={o.image}
-									alt="cell image output"
-									data-testid="output-image"
-								/>
+								{@const full = fullImages.has(i)}
+								<div
+									class="px-3 py-1 {full ? 'max-h-[80vh] overflow-auto' : ''}"
+									data-testid="output-image-wrap"
+									data-fullsize={full ? 'true' : undefined}
+								>
+									<img
+										class="{full ? 'max-w-none cursor-zoom-out' : 'max-w-full cursor-zoom-in'}"
+										src={o.image}
+										alt="cell image output"
+										data-testid="output-image"
+										title={full ? 'Double-click to fit to width' : 'Double-click for full size'}
+										ondblclick={() => toggleFullImage(i)}
+									/>
+								</div>
 							{:else if o.segments}
 								{#each o.segments as seg}
 									{#if seg.type === 'table'}
