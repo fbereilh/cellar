@@ -11,9 +11,9 @@ import { connect, disconnect, statusFor } from '$lib/server/databricks.js';
  * for it), so the client shows a spinner rather than a timeout.
  */
 export async function POST({ request }) {
-	const { profile, clusterId, clusterName } = await request.json();
+	const { profile, host, clusterId, clusterName } = await request.json();
 	try {
-		return json(await connect({ profile, clusterId, clusterName }));
+		return json(await connect({ profile, host, clusterId, clusterName }));
 	} catch (err) {
 		const code = err?.code ?? 'error';
 		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
