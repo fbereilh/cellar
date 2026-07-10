@@ -663,7 +663,9 @@ export function getRunQueue() {
 }
 
 /**
- * Run one cell by id; markdown cells are skipped (no kernel).
+ * Run one cell by id. A markdown cell doesn't execute on the kernel; running it
+ * RENDERS it (flips every open tab to its rendered view via `cell:rendered`) and
+ * returns `status:'rendered'`; no queue, no persist (rendered-ness is view-only).
  *
  * Broadcasts the run lifecycle (`run:start` / `run:output` per streamed chunk /
  * `run:end`) over the event bus tagged `actor:'agent'`, so an already-open
@@ -694,6 +696,15 @@ export async function runCell(id) {
 	const nbAtCall = getActiveNotebookPath();
 	const c = getCell(id, nbAtCall);
 	if (!c) return null;
+	if (c.cell_type === 'markdown') {
+		// Markdown doesn't execute on the kernel; "running" it RENDERS it (the same
+		// state the UI's Shift+Enter produces). No queue, no persist: rendered-ness
+		// is a view concern, so the .ipynb stays clean. Broadcast `cell:rendered` so
+		// every open tab flips this cell to its rendered view (no originId: an agent
+		// run has none, so every tab renders it).
+		publish({ type: 'cell:rendered', nb: nbAtCall, cellId: id });
+		return { id, status: 'rendered', note: 'markdown cell rendered (no kernel execution)' };
+	}
 	if (c.cell_type !== 'code') return { id, status: 'skipped', note: 'not a code cell' };
 	// Pin the notebook now: the UI may focus another one while we wait in the
 	// queue, and this run must land in the document it was requested against.
@@ -753,8 +764,9 @@ export async function runCell(id) {
  * open UI exactly like run_cell. Returns run_cell's result shape (id / status /
  * summarized outputs) — the created cell's id is that same `id`. Code that
  * raises returns the error as its result (never throws); a markdown cell is
- * created (surfaced live in the UI) but not run, returning `status:'skipped'`
- * to mirror run_cell.
+ * created AND rendered (markdown doesn't execute on the kernel, so running it
+ * renders it), returning `status:'rendered'` to mirror run_cell; this is the
+ * intended way to add markdown, so it shows rendered rather than raw source.
  *
  * Import routing (the default) happens BEFORE the cell is created, so the imports
  * cell has already run by the time this cell executes and the code that needed
