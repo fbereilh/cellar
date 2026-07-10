@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto';
 import { readNotebook, deserialize, writeNotebook } from './ipynb.js';
 import { publish } from './events.js';
 import { cancelRun } from './run-queue.js';
+import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole.js';
 
 const FILENAME = 'notebook.ipynb';
 
@@ -401,13 +402,70 @@ export function setLastRun(id, lastRun, nb) {
 	return true;
 }
 
-/** Move a cell to an absolute index (clamped). */
+/** The notebook's designated imports cell, or null. */
+export function getImportsCell(nb) {
+	const doc = docFor(nb);
+	const cell = doc.cells.find(isImportsCell);
+	return cell ? cellView(cell) : null;
+}
+
+/**
+ * Designate (or un-designate) a cell as the notebook's imports cell, in the
+ * allowlisted `cellar` namespace so it round-trips through clean-on-save. Only
+ * one cell may hold the role, so designating a cell strips it from any other.
+ */
+export function setCellRole(id, role, nb, originId) {
+	const doc = docFor(nb);
+	const cell = find(doc, id);
+	if (!cell) return false;
+	for (const c of doc.cells) {
+		if (c !== cell && c.metadata?.cellar?.role) {
+			delete c.metadata.cellar.role;
+			emit(doc, 'cell:role', { cellId: c.id, role: null }, originId);
+		}
+	}
+	cell.metadata = cell.metadata ?? {};
+	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	if (role) cell.metadata.cellar.role = role;
+	else delete cell.metadata.cellar.role;
+	persist(doc);
+	emit(doc, 'cell:role', { cellId: id, role: role ?? null }, originId);
+	return true;
+}
+
+/**
+ * Insert a cell at an absolute index. `addCell` can only insert AFTER a known id,
+ * which cannot express "at the very top" — the one position the imports cell must
+ * occupy. The `cell:added` event therefore carries an explicit `index` so the
+ * browser inserts where the server did rather than appending.
+ */
+export function addCellAt(index, cellType = 'code', nb, originId, source = '', role) {
+	const doc = docFor(nb);
+	const cell = newCell(cellType, source);
+	if (role) cell.metadata.cellar.role = role;
+	const at = Math.max(0, Math.min(index, doc.cells.length));
+	doc.cells.splice(at, 0, cell);
+	persist(doc);
+	emit(doc, 'cell:added', { cell: cellView(cell), afterId: doc.cells[at - 1]?.id ?? null, index: at }, originId);
+	return cell;
+}
+
+/**
+ * Move a cell to an absolute index (clamped). `index` addresses the array with
+ * the moved cell already removed.
+ *
+ * The imports cell is PINNED at the top: it never moves, and nothing may be
+ * inserted above it (`clampMoveIndex`). The browser applies the identical rule
+ * optimistically, so the two never disagree about where a dragged cell landed.
+ */
 export function moveCellTo(id, index, nb, originId) {
 	const doc = docFor(nb);
 	const from = doc.cells.findIndex((c) => c.id === id);
 	if (from < 0) return false;
+	const allowed = clampMoveIndex(doc.cells, from, index);
+	if (allowed < 0) return false;
 	const [cell] = doc.cells.splice(from, 1);
-	const to = Math.max(0, Math.min(index, doc.cells.length));
+	const to = Math.max(0, Math.min(allowed, doc.cells.length));
 	doc.cells.splice(to, 0, cell);
 	persist(doc);
 	emit(doc, 'cell:moved', { cellId: id, toIndex: to }, originId);
@@ -431,13 +489,20 @@ export function addCell(afterId, cellType = 'code', nb, originId, source = '') {
 	return cell;
 }
 
-/** Switch a cell between 'code' and 'markdown'. Markdown cells carry no outputs. */
+/**
+ * Switch a cell between 'code' and 'markdown'. Markdown cells carry no outputs —
+ * nor the imports role: a markdown cell cannot run, so leaving the designation on
+ * one would strand every future routed import in a cell the kernel never sees.
+ */
 export function setCellType(id, cellType, nb, originId) {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return;
 	cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
-	if (cell.cell_type === 'markdown') cell.outputs = [];
+	if (cell.cell_type === 'markdown') {
+		cell.outputs = [];
+		if (cell.metadata?.cellar?.role === IMPORTS_ROLE) delete cell.metadata.cellar.role;
+	}
 	persist(doc);
 	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type }, originId);
 }
@@ -481,12 +546,14 @@ export function clearOutputs(id, nb, originId) {
 	}
 }
 
+/** Swap a cell with its neighbour. Honors the imports cell's pin (`clampMoveIndex`). */
 export function moveCell(id, dir, nb, originId) {
 	const doc = docFor(nb);
 	const i = doc.cells.findIndex((c) => c.id === id);
 	if (i < 0) return;
 	const j = dir === 'up' ? i - 1 : i + 1;
 	if (j < 0 || j >= doc.cells.length) return;
+	if (clampMoveIndex(doc.cells, i, j) !== j) return; // the pinned top cell, or a move above it
 	[doc.cells[i], doc.cells[j]] = [doc.cells[j], doc.cells[i]];
 	persist(doc);
 	emit(doc, 'cell:moved', { cellId: id, toIndex: j }, originId);

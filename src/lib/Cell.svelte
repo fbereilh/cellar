@@ -12,6 +12,7 @@
 	import DOMPurify from 'dompurify';
 	import { EDITOR_THEME } from '$lib/editorTheme.js';
 	import { foldKey, splitHeadingSegments } from '$lib/headings.js';
+	import { isImportsCell } from '$lib/importsRole.js';
 	import { relativeTime, formatDuration } from '$lib/relativeTime.js';
 
 	const NO_SEGS_HIDDEN = { headings: new Set(), bodies: new Set() };
@@ -25,6 +26,7 @@
 		active = false,
 		keyMode = 'command', // notebook mode ('command' | 'edit'); only meaningful while `active`
 		dragging = false,
+		pinnedTop = false, // the notebook's cell 0 is the pinned imports cell
 		foldedIds = new Set(), // fold keys of every collapsed heading in the notebook
 		segHidden = NO_SEGS_HIDDEN, // segment indices of THIS cell an outer fold hides
 		foldCounts = {}, // fold key → whole cells that fold hides (the "N cells hidden" hint)
@@ -82,6 +84,9 @@
 	}
 
 	const isMarkdown = $derived(cell.cell_type === 'markdown');
+	// The notebook's designated imports cell: pinned at the top, marked in the
+	// toolbar, and immovable (`clampMoveIndex` enforces the same rule server-side).
+	const isImports = $derived(isImportsCell(cell));
 
 	// A remote (agent / other-tab) source edit that arrived while the user was
 	// editing this cell, held until they choose to load it (the affordance below).
@@ -565,17 +570,30 @@
 		<!-- Cell toolbar -->
 		<div class="flex items-center justify-between border-b border-base-300 px-2 py-1">
 			<div class="flex items-center gap-0.5">
-				<button
-					class="btn btn-ghost btn-xs btn-square cursor-grab text-base-content/30 hover:text-base-content/70 active:cursor-grabbing"
-					draggable="true"
-					ondragstart={(e) => onDragStart?.(e, cell.id)}
-					ondragend={onDragEnd}
-					title="Drag to reorder cell"
-					aria-label="Drag to reorder cell"
-					data-testid="drag-handle"
-				>
-					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6" /><circle cx="15" cy="6" r="1.6" /><circle cx="9" cy="12" r="1.6" /><circle cx="15" cy="12" r="1.6" /><circle cx="9" cy="18" r="1.6" /><circle cx="15" cy="18" r="1.6" /></svg>
-				</button>
+				{#if isImports}
+					<!-- The imports cell is pinned at the top, so it has nowhere to be
+					     dragged to. A pin sits where every other cell's grip handle does,
+					     keeping the toolbar's columns aligned. -->
+					<span
+						class="flex h-6 w-6 items-center justify-center text-primary"
+						title="Pinned imports cell - Cellar keeps the notebook's imports here, at the top"
+						data-testid="imports-pin"
+					>
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>
+					</span>
+				{:else}
+					<button
+						class="btn btn-ghost btn-xs btn-square cursor-grab text-base-content/30 hover:text-base-content/70 active:cursor-grabbing"
+						draggable="true"
+						ondragstart={(e) => onDragStart?.(e, cell.id)}
+						ondragend={onDragEnd}
+						title="Drag to reorder cell"
+						aria-label="Drag to reorder cell"
+						data-testid="drag-handle"
+					>
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6" /><circle cx="15" cy="6" r="1.6" /><circle cx="9" cy="12" r="1.6" /><circle cx="15" cy="12" r="1.6" /><circle cx="9" cy="18" r="1.6" /><circle cx="15" cy="18" r="1.6" /></svg>
+					</button>
+				{/if}
 				<button
 					class="btn btn-ghost btn-xs btn-square text-success"
 					onclick={() => doRun(false)}
@@ -598,6 +616,13 @@
 							<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" />
 						</svg>
 					</button>
+				{/if}
+				{#if isImports}
+					<span
+						class="badge badge-xs ml-1.5 badge-soft badge-primary font-medium"
+						title="Consolidate imports, and imports an agent writes, are collected here"
+						data-testid="imports-badge">imports</span
+					>
 				{/if}
 				<span class="ml-1.5 font-mono text-xs text-base-content/50" title={cell.id}>cell <span class="text-base-content/70">#{cell.id.slice(0, 8)}</span></span>
 				{#if !isMarkdown && lastRun && !showRunning}
@@ -644,10 +669,12 @@
 						{/if}
 					</span>
 				{/if}
-				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'up')} disabled={index === 0} title="Move up" aria-label="Move cell up" data-testid="move-up">
+				<!-- The imports cell is pinned at index 0, so neither it nor the cell below
+				     it may swap across the top (`clampMoveIndex`, applied on both sides). -->
+				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'up')} disabled={index === 0 || isImports || (pinnedTop && index === 1)} title={isImports ? 'The imports cell stays at the top' : 'Move up'} aria-label="Move cell up" data-testid="move-up">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6" /></svg>
 				</button>
-				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'down')} disabled={index === count - 1} title="Move down" aria-label="Move cell down" data-testid="move-down">
+				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'down')} disabled={index === count - 1 || isImports} title={isImports ? 'The imports cell stays at the top' : 'Move down'} aria-label="Move cell down" data-testid="move-down">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 				</button>
 				<button class="btn btn-ghost btn-xs btn-square text-error/70 hover:text-error" onclick={() => onDelete(cell.id)} disabled={count === 1} title="Delete cell" aria-label="Delete cell" data-testid="delete">
