@@ -3,6 +3,7 @@
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
 	import { computeFolding, headerLevel } from '$lib/headings.js';
+	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff.js';
 	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte.js';
 
 	// A live, kernel-attached notebook document addressed by its workspace path.
@@ -11,7 +12,9 @@
 	// default workspace notebook and every opened `.ipynb` use this same
 	// component — one code path, one behavior. Runs go through the single shared
 	// kernel; the parent serializes runs across notebooks via `busy`.
-	let { path, active = false, busy = false, theme = 'dim', onCellsChange, onRunStart, onRunEnd } = $props();
+	// `gitRefresh` is the shell's `fsRefreshSignal`: a bump means the workspace's
+	// git state may have moved, so re-fetch the HEAD baseline the cells diff against.
+	let { path, active = false, busy = false, theme = 'dim', gitRefresh = 0, onCellsChange, onRunStart, onRunEnd } = $props();
 
 	let cells = $state([]);
 	let fetching = $state(true); // loading the notebook's cells from the server
@@ -118,6 +121,40 @@
 		editorCollapsed = next;
 		saveEditorCollapsed();
 	}
+
+	// ---- Git cell decorations ------------------------------------------------
+	// The notebook-level counterpart of the editor's gutter change bars: mark
+	// which *cells* differ from the notebook's git-HEAD version. The server hands
+	// out HEAD's cells once (normalized through the same `deserialize` the live
+	// doc uses); the diff itself is a `$derived` over the live cells, so a cell
+	// lights up the moment its edit lands and goes quiet again when it is undone.
+	// An untracked notebook has no baseline → no decorations.
+	let gitBaselineCells = $state.raw(null);
+
+	async function loadGitBaseline() {
+		let baseline = null;
+		try {
+			const res = await fetch(`/api/fs/git/head?path=${encodeURIComponent(path)}&kind=notebook`);
+			const body = await res.json();
+			if (res.ok && body.tracked) baseline = body.cells;
+		} catch {}
+		gitBaselineCells = baseline;
+	}
+
+	// Re-baseline on mount and whenever the shell signals the workspace's git
+	// state may have moved; `focus` covers a commit/checkout made outside Cellar.
+	$effect(() => {
+		gitRefresh;
+		loadGitBaseline();
+	});
+	onMount(() => {
+		const onFocus = () => loadGitBaseline();
+		window.addEventListener('focus', onFocus);
+		return () => window.removeEventListener('focus', onFocus);
+	});
+
+	const gitChanges = $derived(gitBaselineCells ? notebookCellChanges(gitBaselineCells, cells) : NO_CELL_CHANGES);
+
 	// ---- Follow the agent ----------------------------------------------------
 	// When an agent runs a cell we bring that cell into view, so a human watching
 	// can keep up with what is executing. Three rules keep it from being hostile:
@@ -811,6 +848,9 @@
 			hidden={folding.hidden}
 			foldedIds={foldedIds}
 			hiddenCounts={folding.counts}
+			gitStatus={gitChanges.status}
+			gitRemovedBefore={gitChanges.removedBefore}
+			gitRemovedAtEnd={gitChanges.removedAtEnd}
 			onToggleFold={toggleFold}
 			onRun={runCell}
 			onRunAdvance={runAndAdvance}

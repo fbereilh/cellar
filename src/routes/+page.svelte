@@ -497,6 +497,7 @@
 						active={activeTabId === 'notebook'}
 						busy={runBusy}
 						{theme}
+						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
@@ -511,6 +512,7 @@
 						active={activeTabId === tab.id}
 						busy={runBusy}
 						{theme}
+						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
@@ -520,7 +522,7 @@
 
 			{#each fileTabs as tab (tab.id)}
 				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
-					<FileTab path={tab.path} onDirty={onFileDirty} {theme} />
+					<FileTab path={tab.path} onDirty={onFileDirty} {theme} gitRefresh={fsRefreshSignal} />
 				</div>
 			{/each}
 

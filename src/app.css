@@ -3,3 +3,26 @@
 @plugin 'daisyui' {
 	themes: dim --default, nord --prefersdark;
 }
+
+/*
+ * Git change decoration palette — the editor gutter bars (`gitGutter.js`) and
+ * the notebook cell bars (`Notebook.svelte`) share it.
+ *
+ * Deliberately NOT the daisyUI semantic tokens: those are accent colors, and
+ * their hues are not stable across themes (in `dim`, `secondary` and `error`
+ * are both salmon; in `nord`, `info` is pink), so "added / modified / removed"
+ * would stop reading as added / modified / removed. Diff colors are a
+ * convention rather than a brand — VS Code and GitHub both fix them
+ * independently of the theme accent, and so do we.
+ *
+ * `light-dark()` resolves against the `color-scheme` daisyUI puts on
+ * `<html data-theme>` — the same source of truth `editorTheme.js` uses to pick
+ * the light vs dark editor scheme — so every theme, present or future, is
+ * handled here with no per-theme work.
+ */
+:root {
+	--cellar-git-added: light-dark(#1a7f37, #3fb950);
+	--cellar-git-modified: light-dark(#0969da, #58a6ff);
+	--cellar-git-moved: light-dark(#8250df, #bc8cff);
+	--cellar-git-removed: light-dark(#cf222e, #f85149);
+}
