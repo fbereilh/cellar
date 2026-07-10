@@ -114,12 +114,17 @@ del _cellar_kernel_state
 `;
 
 /**
- * Run the shared probe on the kernel and return the parsed bucketed state,
- * tagged with `session` - the kernel-session epoch the probe actually executed
+ * Run an arbitrary read-only Python probe on the kernel and return its single
+ * printed JSON line (the last non-empty stdout line, to be robust against stray
+ * output) plus `session` - the kernel-session epoch the probe actually executed
  * in, taken from execute()'s `kernel` event. That epoch, not one sampled around
- * the await, is the one this namespace snapshot belongs to.
+ * the await, is the one this namespace snapshot belongs to. Every namespace
+ * introspection in Cellar goes through this one runner, so "run user code" and
+ * "inspect the namespace" can never diverge. `internal` keeps the probe out of
+ * `execs_this_session` and the run queue - it is Cellar's own bookkeeping, not a
+ * cell the agent ran.
  */
-async function runProbe() {
+async function execProbe(code) {
 	let stdout = '';
 	let errored = null;
 	let session = null;
@@ -135,13 +140,18 @@ async function runProbe() {
 			}
 		}
 	};
-	// `internal` — a probe is Cellar's own bookkeeping, not a cell the agent ran,
-	// so it must not inflate `execs_this_session`.
-	await execute(PROBE, onEvent, { internal: true });
+	await execute(code, onEvent, { internal: true });
 	if (errored) throw new Error(errored);
-	// The probe prints exactly one JSON line; take the last non-empty line to be
-	// robust against any stray output.
 	const line = stdout.trim().split('\n').filter(Boolean).at(-1);
+	return { session, line };
+}
+
+/**
+ * Run the shared bucketed-namespace probe and return the parsed state, tagged
+ * with `session`.
+ */
+async function runProbe() {
+	const { session, line } = await execProbe(PROBE);
 	if (!line) return { session, imports: [], functions: [], classes: [], variables: [] };
 	return { session, ...JSON.parse(line) };
 }
@@ -198,4 +208,247 @@ export async function kernelState() {
 		classes: state.classes || [],
 		variables: state.variables || []
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Agent variable inspection (MCP `list_variables` / `inspect_variable`).
+//
+// These need richer, schema-level detail than the bucketed `kernel_state` probe
+// carries — per-column dtypes for a DataFrame, a small head sample for one
+// variable — so they run their own probes. They still go through the SAME
+// execProbe() runner and the same {internal:true} contract as every other
+// introspection, so no user code is ever executed and exec counts are untouched.
+// Detection is duck-typed on the type's module name (pandas / numpy / pyspark)
+// so the probe is a harmless no-op when those libraries are absent, and never
+// imports them itself. Spark DataFrames are described from `.schema` only — never
+// collected — so inspecting one cannot trigger a job.
+// ---------------------------------------------------------------------------
+
+// Shared classifier that turns one (name, value) into a compact descriptor:
+// {name, type, [module], repr_short, [size], [kind + schema]}.
+const DESCRIBE_HELPER = `
+def _cellar_describe(_k, _v):
+    _t = type(_v)
+    _tn = _t.__name__
+    _mod = getattr(_t, '__module__', '') or ''
+    _entry = {'name': _k, 'type': _tn}
+    if _mod and _mod != 'builtins':
+        _entry['module'] = _mod
+    try:
+        _r = repr(_v)
+    except Exception:
+        _r = '<unreprable>'
+    _r = ' '.join(_r.split())
+    if len(_r) > 140:
+        _r = _r[:137] + '...'
+    _entry['repr_short'] = _r
+    try:
+        if hasattr(_v, '__len__') and not (_mod.startswith('pyspark')):
+            _entry['size'] = len(_v)
+    except Exception:
+        pass
+    _pkg = _mod.split('.')[0]
+    try:
+        if _pkg == 'pandas' and _tn == 'DataFrame':
+            _entry['kind'] = 'dataframe'
+            _entry['shape'] = [int(_v.shape[0]), int(_v.shape[1])]
+            _entry['columns'] = [{'name': str(_c), 'dtype': str(_dt)}
+                                 for _c, _dt in list(zip(_v.columns, _v.dtypes))[:100]]
+            if _v.shape[1] > 100:
+                _entry['columns_truncated'] = True
+        elif _pkg == 'pandas' and _tn == 'Series':
+            _entry['kind'] = 'series'
+            _entry['dtype'] = str(_v.dtype)
+            _entry['shape'] = [int(_v.shape[0])]
+        elif _pkg == 'numpy' and _tn == 'ndarray':
+            _entry['kind'] = 'ndarray'
+            _entry['dtype'] = str(_v.dtype)
+            _entry['shape'] = [int(_d) for _d in _v.shape]
+        elif _mod.startswith('pyspark') and _tn == 'DataFrame':
+            _entry['kind'] = 'spark_dataframe'
+            _entry['columns'] = [{'name': _f.name, 'dtype': _f.dataType.simpleString()}
+                                 for _f in list(_v.schema.fields)[:200]]
+    except Exception:
+        pass
+    return _entry
+`;
+
+// list_variables: every user DATA variable (skipping modules/functions/classes/
+// dunders/library scaffolding — the same filter kernel_state uses) with its type
+// and, for frames/arrays, its schema.
+const LIST_VARS_PROBE = `
+import json as _cj, inspect as _cellar_ins
+${DESCRIBE_HELPER}
+def _cellar_list_vars():
+    try:
+        _ip = get_ipython(); _ns = _ip.user_ns; _hidden = set(_ip.user_ns_hidden)
+    except Exception:
+        _ns = globals(); _hidden = set()
+    _skip_type_mods = {'typing', 'abc', 'IPython.core.magic'}
+    _out = []
+    for _k, _v in list(_ns.items()):
+        if _k.startswith('_') or _k in _hidden:
+            continue
+        if _k in ('In', 'Out', 'exit', 'quit', 'get_ipython'):
+            continue
+        try:
+            if (_cellar_ins.ismodule(_v) or _cellar_ins.isfunction(_v)
+                    or _cellar_ins.isbuiltin(_v) or _cellar_ins.isroutine(_v)
+                    or _cellar_ins.isclass(_v)):
+                continue
+        except Exception:
+            continue
+        if getattr(type(_v), '__module__', '') in _skip_type_mods:
+            continue
+        try:
+            _out.append(_cellar_describe(_k, _v))
+        except Exception:
+            pass
+    _out.sort(key=lambda _r: _r['name'])
+    return _out
+print(_cj.dumps(_cellar_list_vars()))
+del _cellar_list_vars, _cellar_describe
+`;
+
+// inspect_variable: one variable in detail. Bounded — a DataFrame/Series head is
+// the first HEAD_ROWS rows, dict keys and sequence items are capped, an array's
+// head is the first HEAD_ROWS flattened values. Prints {found:false} when the
+// name is unset. The target name is injected as a JSON literal (valid Python).
+const INSPECT_PROBE_HEAD = `
+import json as _cj
+def _cellar_inspect(_target):
+    try:
+        _ip = get_ipython(); _ns = _ip.user_ns
+    except Exception:
+        _ns = globals()
+    _MISS = object()
+    _v = _ns.get(_target, _MISS)
+    if _v is _MISS:
+        return {'found': False, 'name': _target}
+    _N = 10
+    _t = type(_v)
+    _tn = _t.__name__
+    _mod = getattr(_t, '__module__', '') or ''
+    _pkg = _mod.split('.')[0]
+    _entry = {'found': True, 'name': _target, 'type': _tn}
+    if _mod and _mod != 'builtins':
+        _entry['module'] = _mod
+    try:
+        _r = repr(_v)
+    except Exception:
+        _r = '<unreprable>'
+    _r = ' '.join(_r.split())
+    if len(_r) > 2000:
+        _r = _r[:1997] + '...'
+    _entry['repr'] = _r
+    try:
+        if _pkg == 'pandas' and _tn == 'DataFrame':
+            _entry['kind'] = 'dataframe'
+            _entry['shape'] = [int(_v.shape[0]), int(_v.shape[1])]
+            _entry['columns'] = [{'name': str(_c), 'dtype': str(_dt)}
+                                 for _c, _dt in list(zip(_v.columns, _v.dtypes))[:200]]
+            _entry['index_names'] = [None if _n is None else str(_n) for _n in _v.index.names]
+            _entry['head'] = _cj.loads(_v.head(_N).to_json(orient='records', date_format='iso', default_handler=str))
+            _entry['head_rows'] = int(min(_N, _v.shape[0]))
+        elif _pkg == 'pandas' and _tn == 'Series':
+            _entry['kind'] = 'series'
+            _entry['dtype'] = str(_v.dtype)
+            _entry['size'] = int(_v.shape[0])
+            _entry['head'] = _cj.loads(_v.head(_N).to_json(date_format='iso', default_handler=str))
+        elif _pkg == 'numpy' and _tn == 'ndarray':
+            _entry['kind'] = 'ndarray'
+            _entry['dtype'] = str(_v.dtype)
+            _entry['shape'] = [int(_d) for _d in _v.shape]
+            _entry['size'] = int(_v.size)
+            try:
+                import numpy as _np
+                if _v.size and _np.issubdtype(_v.dtype, _np.number):
+                    _entry['stats'] = {'min': float(_np.nanmin(_v)),
+                                       'max': float(_np.nanmax(_v)),
+                                       'mean': float(_np.nanmean(_v))}
+            except Exception:
+                pass
+            try:
+                _entry['head'] = _cj.loads(_cj.dumps(_v.ravel()[:_N].tolist(), default=str))
+            except Exception:
+                pass
+        elif _mod.startswith('pyspark') and _tn == 'DataFrame':
+            _entry['kind'] = 'spark_dataframe'
+            _entry['columns'] = [{'name': _f.name, 'dtype': _f.dataType.simpleString()}
+                                 for _f in list(_v.schema.fields)[:200]]
+            _entry['note'] = 'schema only; not collected to avoid triggering a Spark job. Use databricks_preview_table or .limit(N).toPandas().'
+        elif isinstance(_v, dict):
+            _entry['kind'] = 'dict'
+            _entry['size'] = len(_v)
+            _entry['keys'] = [str(_key) for _key in list(_v.keys())[:100]]
+            if len(_v) > 100:
+                _entry['keys_truncated'] = True
+        elif isinstance(_v, (list, tuple, set, frozenset)):
+            _entry['kind'] = 'sequence'
+            _entry['size'] = len(_v)
+            _head = []
+            for _it in list(_v)[:_N]:
+                try:
+                    _ir = repr(_it)
+                except Exception:
+                    _ir = '<unreprable>'
+                _ir = ' '.join(_ir.split())
+                if len(_ir) > 200:
+                    _ir = _ir[:197] + '...'
+                _head.append(_ir)
+            _entry['head'] = _head
+        else:
+            _entry['kind'] = 'scalar'
+            try:
+                if hasattr(_v, '__len__'):
+                    _entry['size'] = len(_v)
+            except Exception:
+                pass
+    except Exception as _e:
+        _entry['detail_error'] = str(_e)
+    return _entry
+`;
+
+/** Guard shared by the two agent inspection tools: never boot a kernel, never
+ *  queue a probe behind a running cell. Returns a short-circuit payload or null. */
+function inspectionGuard() {
+	const status = kernelStatus().status;
+	if (status === 'not_started') return { started: false, session_id: null };
+	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession().session_id };
+	return null;
+}
+
+/**
+ * MCP `list_variables`: the live kernel's data variables with type + schema
+ * (DataFrame shape/columns/dtypes, numpy dtype/shape, container sizes). Read-only
+ * introspection; reflects only the LIVE session (`session_id`, `stale`). Returns
+ * `{ started: false }` when no kernel is running (never boots one).
+ */
+export async function listVariables() {
+	const guard = inspectionGuard();
+	if (guard) return guard;
+	const { session, line } = await execProbe(LIST_VARS_PROBE);
+	const stale = session !== currentSessionId();
+	return {
+		started: true,
+		session_id: session,
+		...(stale ? { stale: true } : {}),
+		variables: line ? JSON.parse(line) : []
+	};
+}
+
+/**
+ * MCP `inspect_variable`: one variable in detail (full type, shape/len,
+ * DataFrame columns + a small head sample, array stats, dict keys, …), bounded so
+ * a huge object never floods the output. `found:false` when the name is unset in
+ * the live namespace. Reflects only the LIVE session.
+ */
+export async function inspectVariable(name) {
+	const guard = inspectionGuard();
+	if (guard) return guard;
+	const code = INSPECT_PROBE_HEAD + `\nprint(_cj.dumps(_cellar_inspect(${JSON.stringify(String(name))})))\ndel _cellar_inspect\n`;
+	const { session, line } = await execProbe(code);
+	const stale = session !== currentSessionId();
+	const detail = line ? JSON.parse(line) : { found: false, name };
+	return { started: true, session_id: session, ...(stale ? { stale: true } : {}), ...detail };
 }
