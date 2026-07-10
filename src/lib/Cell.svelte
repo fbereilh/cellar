@@ -8,8 +8,8 @@
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
-	import MarkdownIt from 'markdown-it';
 	import DOMPurify from 'dompurify';
+	import { md, renderMarkdown } from '$lib/markdown.js';
 	import { EDITOR_THEME } from '$lib/editorTheme.js';
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
 	import { foldKey, splitHeadingSegments } from '$lib/headings.js';
@@ -100,12 +100,8 @@
 	let mode = $state(cell.cell_type === 'markdown' && cell.source.trim() ? 'rendered' : 'edit');
 	let liveSource = $state(cell.source);
 
-	// markdown-it in safe mode (html:false escapes raw HTML) + DOMPurify (client
-	// only) so notebook content can't inject script.
-	const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
-	function renderMarkdown(src) {
-		return DOMPurify.sanitize(md.render(src || ''));
-	}
+	// Markdown is rendered through the shared engine in `$lib/markdown.js` (safe
+	// mode + DOMPurify), so cells and the file preview parse identically.
 	// A markdown cell renders one block per heading segment rather than one blob,
 	// because each heading is independently foldable (a cell may hold several) and
 	// a fold hides the heading's body while leaving the heading itself in view.
@@ -933,107 +929,3 @@
 		{/if}
 	</div>
 </div>
-
-<style>
-	:global(.cellar-md > *:first-child) {
-		margin-top: 0;
-	}
-	:global(.cellar-md > *:last-child) {
-		margin-bottom: 0;
-	}
-	/* The heading and the body it introduces are separate blocks (each heading is
-	   independently foldable), so the vertical rhythm lives on the wrappers and
-	   the heading elements themselves are flush - that also keeps the fold chevron
-	   centred on the heading's line. */
-	:global(.cellar-md .md-heading) {
-		margin: 0.6em 0 0.25em;
-	}
-	:global(.cellar-md .md-heading:first-child) {
-		margin-top: 0;
-	}
-	:global(.cellar-md .md-body:last-child > *:last-child) {
-		margin-bottom: 0;
-	}
-	:global(.cellar-md .md-heading :is(h1, h2, h3, h4, h5, h6)) {
-		margin: 0;
-	}
-	/* Headings are plain: no rules, no underline. h1 and h2 once carried a
-	   `border-bottom` in `--color-base-300`, near-invisible against `dim`'s
-	   surface but a hard grey underline on any light theme - so rendered markdown
-	   did not read the same in both. Size and weight carry the hierarchy. */
-	:global(.cellar-md :is(h1, h2, h3, h4, h5, h6)) {
-		margin: 0.5em 0 0.3em;
-	}
-	:global(.cellar-md h1) {
-		font-size: 1.5em;
-		font-weight: 700;
-	}
-	:global(.cellar-md h2) {
-		font-size: 1.3em;
-		font-weight: 700;
-	}
-	:global(.cellar-md h3) {
-		font-size: 1.1em;
-		font-weight: 600;
-	}
-	/* Tailwind's preflight resets h4-h6 to plain body text, leaving them
-	   indistinguishable from the paragraph beneath. Weight alone separates them,
-	   identically in both themes. */
-	:global(.cellar-md :is(h4, h5, h6)) {
-		font-size: 1em;
-		font-weight: 600;
-	}
-	:global(.cellar-md p) {
-		margin: 0.5em 0;
-	}
-	:global(.cellar-md ul) {
-		list-style: disc;
-		padding-left: 1.5em;
-		margin: 0.5em 0;
-	}
-	:global(.cellar-md ol) {
-		list-style: decimal;
-		padding-left: 1.5em;
-		margin: 0.5em 0;
-	}
-	:global(.cellar-md li) {
-		margin: 0.2em 0;
-	}
-	:global(.cellar-md a) {
-		color: var(--color-primary);
-		text-decoration: underline;
-	}
-	:global(.cellar-md code) {
-		font-family: ui-monospace, Menlo, monospace;
-		font-size: 0.9em;
-		background: rgba(127, 127, 127, 0.2);
-		padding: 0.1em 0.35em;
-		border-radius: 0.25em;
-	}
-	:global(.cellar-md pre) {
-		background: var(--color-base-200);
-		padding: 0.75em 1em;
-		border-radius: 0.4em;
-		overflow-x: auto;
-		margin: 0.6em 0;
-	}
-	:global(.cellar-md pre code) {
-		background: none;
-		padding: 0;
-	}
-	:global(.cellar-md blockquote) {
-		border-left: 3px solid var(--color-base-300);
-		padding-left: 1em;
-		color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
-		margin: 0.6em 0;
-	}
-	:global(.cellar-md table) {
-		border-collapse: collapse;
-		margin: 0.6em 0;
-	}
-	:global(.cellar-md th),
-	:global(.cellar-md td) {
-		border: 1px solid var(--color-base-300);
-		padding: 0.3em 0.6em;
-	}
-</style>

@@ -154,3 +154,111 @@
 	--cellar-cm-tok-atom-weight: bold;
 	--cellar-cm-tok-type-weight: bold;
 }
+
+/*
+ * Rendered markdown (`.cellar-md`).
+ *
+ * Shared by notebook markdown cells (`Cell.svelte`) and the `.md` file preview
+ * (`MarkdownView.svelte`), so both surfaces render identically. Lived in
+ * `Cell.svelte`'s `:global` block originally; moved here when the file preview
+ * needed the same look, to keep one source of truth. Headings are deliberately
+ * plain (no underline rule): size and weight carry the hierarchy so rendered
+ * markdown reads the same in every theme.
+ */
+.cellar-md > *:first-child {
+	margin-top: 0;
+}
+.cellar-md > *:last-child {
+	margin-bottom: 0;
+}
+/* The heading and the body it introduces are separate blocks (each heading is
+   independently foldable), so the vertical rhythm lives on the wrappers and the
+   heading elements themselves are flush - that also keeps the fold chevron
+   centred on the heading's line. */
+.cellar-md .md-heading {
+	margin: 0.6em 0 0.25em;
+}
+.cellar-md .md-heading:first-child {
+	margin-top: 0;
+}
+.cellar-md .md-body:last-child > *:last-child {
+	margin-bottom: 0;
+}
+.cellar-md .md-heading :is(h1, h2, h3, h4, h5, h6) {
+	margin: 0;
+}
+.cellar-md :is(h1, h2, h3, h4, h5, h6) {
+	margin: 0.5em 0 0.3em;
+}
+.cellar-md h1 {
+	font-size: 1.5em;
+	font-weight: 700;
+}
+.cellar-md h2 {
+	font-size: 1.3em;
+	font-weight: 700;
+}
+.cellar-md h3 {
+	font-size: 1.1em;
+	font-weight: 600;
+}
+/* Tailwind's preflight resets h4-h6 to plain body text, leaving them
+   indistinguishable from the paragraph beneath. Weight alone separates them,
+   identically in both themes. */
+.cellar-md :is(h4, h5, h6) {
+	font-size: 1em;
+	font-weight: 600;
+}
+.cellar-md p {
+	margin: 0.5em 0;
+}
+.cellar-md ul {
+	list-style: disc;
+	padding-left: 1.5em;
+	margin: 0.5em 0;
+}
+.cellar-md ol {
+	list-style: decimal;
+	padding-left: 1.5em;
+	margin: 0.5em 0;
+}
+.cellar-md li {
+	margin: 0.2em 0;
+}
+.cellar-md a {
+	color: var(--color-primary);
+	text-decoration: underline;
+}
+.cellar-md code {
+	font-family: ui-monospace, Menlo, monospace;
+	font-size: 0.9em;
+	background: rgba(127, 127, 127, 0.2);
+	padding: 0.1em 0.35em;
+	border-radius: 0.25em;
+}
+.cellar-md pre {
+	background: var(--color-base-200);
+	padding: 0.75em 1em;
+	border-radius: 0.4em;
+	overflow-x: auto;
+	margin: 0.6em 0;
+}
+.cellar-md pre code {
+	background: none;
+	padding: 0;
+}
+.cellar-md blockquote {
+	border-left: 3px solid var(--color-base-300);
+	padding-left: 1em;
+	color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
+	margin: 0.6em 0;
+}
+.cellar-md table {
+	border-collapse: collapse;
+	margin: 0.6em 0;
+}
+.cellar-md th,
+.cellar-md td {
+	border: 1px solid var(--color-base-300);
+	padding: 0.3em 0.6em;
+}
