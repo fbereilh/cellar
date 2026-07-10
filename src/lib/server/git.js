@@ -160,3 +160,72 @@ export async function gitHeadFile(relPath) {
 	if (content.includes('\0')) return { isRepo: true, tracked: false, content: null };
 	return { isRepo: true, tracked: true, content };
 }
+
+/** The 40-char all-zero SHA git blame uses for not-yet-committed local lines. */
+const ZERO_SHA = '0000000000000000000000000000000000000000';
+
+/**
+ * Parse `git blame --line-porcelain` into one record per line, in file order.
+ * `--line-porcelain` repeats the full commit header for every line, so we never
+ * have to remember a commit block across lines — each line is self-describing.
+ *
+ * A line with local (uncommitted) modifications is blamed against the all-zero
+ * SHA with author `Not Committed Yet`; we flag it `notCommitted` so the UI can
+ * say "You · uncommitted" instead of a bogus author/date.
+ */
+function parseBlame(stdout) {
+	const lines = [];
+	let cur = null;
+	for (const raw of stdout.split('\n')) {
+		// A header line "<sha> <orig> <final> [count]" opens a new line's block.
+		if (/^[0-9a-f]{40} \d+ \d+/.test(raw)) {
+			const sha = raw.slice(0, 40);
+			cur = { commit: sha, author: '', authorTime: 0, summary: '', notCommitted: sha === ZERO_SHA };
+			continue;
+		}
+		if (!cur) continue;
+		if (raw.startsWith('author ')) cur.author = raw.slice(7);
+		else if (raw.startsWith('author-time ')) cur.authorTime = Number(raw.slice(12)) * 1000;
+		else if (raw.startsWith('summary ')) cur.summary = raw.slice(8);
+		else if (raw.startsWith('\t')) {
+			// The tab-prefixed content line closes the block — commit the record.
+			lines.push({
+				commit: cur.commit,
+				shortSha: cur.notCommitted ? null : cur.commit.slice(0, 7),
+				author: cur.author,
+				authorTime: cur.authorTime || null,
+				summary: cur.summary,
+				notCommitted: cur.notCommitted
+			});
+			cur = null;
+		}
+	}
+	return lines;
+}
+
+/**
+ * Per-line git blame for one workspace file — who last touched each line and when.
+ * Blames the working-tree file, so locally-modified (unsaved-to-git) lines come
+ * back flagged `notCommitted` ("Not Committed Yet"), matching VS Code/GitLens.
+ *
+ * `tracked:false` (empty `lines`) covers every no-blame case: not a repo, no
+ * commits, an untracked file, or a binary blob — the caller then shows nothing.
+ *
+ * @param {string} relPath Workspace-relative path (path-guarded).
+ * @returns {Promise<{isRepo: boolean, tracked: boolean, lines: Array<object>}>}
+ */
+export async function gitBlameFile(relPath) {
+	const root = workspaceRoot();
+	resolveInWorkspace(relPath); // throws if the path escapes the workspace
+	const rel = String(relPath ?? '').replace(/\\/g, '/');
+	if (!rel) throw new Error('path required');
+
+	if ((await runGit(root, ['rev-parse', '--is-inside-work-tree'])) == null) {
+		return { isRepo: false, tracked: false, lines: [] };
+	}
+	// `--incremental` off; `-w` ignores whitespace-only reblame noise. A file with
+	// no HEAD blob (untracked / newly added) makes blame fail → tracked:false.
+	const out = await runGit(root, ['blame', '--line-porcelain', '-w', '--', rel]);
+	if (out == null) return { isRepo: true, tracked: false, lines: [] };
+	return { isRepo: true, tracked: true, lines: parseBlame(out) };
+}

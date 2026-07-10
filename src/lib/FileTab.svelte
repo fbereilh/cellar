@@ -17,7 +17,10 @@
 	// dirty state up so the tab bar can show the unsaved indicator. `gitRefresh`
 	// is the shell's `fsRefreshSignal`: a bump means the workspace's git state may
 	// have moved, so re-fetch the HEAD baseline the gutter diffs against.
-	let { path, onDirty, gitRefresh = 0 } = $props();
+	// `onBlame(path, record|null)` reports the git-blame record for the line the
+	// cursor sits on, so the shell's bottom status bar can show "who last edited
+	// this line, and when" (GitLens-style). `null` = no blame (untracked / non-repo).
+	let { path, onDirty, gitRefresh = 0, onBlame } = $props();
 
 	let editorEl;
 	// `$state.raw` so the git-baseline effect below re-runs once the editor exists,
@@ -81,6 +84,9 @@
 			setDirty(false);
 			savedFlash = true;
 			setTimeout(() => (savedFlash = false), 1200);
+			// The working-tree file just changed → re-blame so newly-saved lines
+			// stop reading "Not Committed Yet" only where git agrees they moved.
+			loadBlame();
 		} catch (err) {
 			errorMsg = String(err?.message ?? err);
 		} finally {
@@ -111,12 +117,58 @@
 		if (view) loadGitBaseline();
 	});
 
+	// ---- Git blame (bottom status bar) ---------------------------------------
+	// Blame the whole file once (cached), then map the cursor's line to a record
+	// as it moves — cheap: no `git` process per keystroke, refreshed only on save
+	// / git-state changes. An untracked file or non-repo reports null (no blame).
+	let blameLines = null; // Array<record> | null, 0-indexed by file line
+	let blameTimer;
+
+	async function loadBlame() {
+		blameLines = null;
+		try {
+			const res = await fetch(`/api/fs/git/blame?path=${encodeURIComponent(path)}`);
+			const body = await res.json();
+			if (res.ok && body.tracked) blameLines = body.lines;
+		} catch {}
+		reportBlame();
+	}
+
+	function reportBlame() {
+		if (!onBlame) return;
+		if (!view || !blameLines) {
+			onBlame(path, null);
+			return;
+		}
+		const head = view.state.selection.main.head;
+		const ln = view.state.doc.lineAt(head).number; // 1-based
+		onBlame(path, blameLines[ln - 1] ?? null);
+	}
+
+	// Debounce cursor moves so a held arrow key doesn't spam the shell.
+	function scheduleBlame() {
+		clearTimeout(blameTimer);
+		blameTimer = setTimeout(reportBlame, 90);
+	}
+
 	// A commit / checkout / stash made outside Cellar changes HEAD under us.
 	onMount(() => {
-		const onFocus = () => loadGitBaseline();
+		const onFocus = () => {
+			loadGitBaseline();
+			loadBlame();
+		};
 		window.addEventListener('focus', onFocus);
 		return () => window.removeEventListener('focus', onFocus);
 	});
+
+	// Refresh the blame cache when the workspace's git state may have moved (a
+	// save, a file op) — same signal the gutter baseline listens to.
+	$effect(() => {
+		gitRefresh;
+		if (view) loadBlame();
+	});
+
+	onDestroy(() => clearTimeout(blameTimer));
 
 	// An `async` onMount returns a promise, so its return value is never used as a
 	// cleanup — the editor is torn down here instead.
@@ -160,6 +212,8 @@
 							setDirty(true);
 							if (isMarkdownFile) liveSource = v.state.doc.toString();
 						}
+						// Cursor moved (or the doc shifted the line under it) → re-map blame.
+						if (v.selectionSet || v.docChanged) scheduleBlame();
 					}),
 					EditorView.theme({
 						'&': { fontSize: '13.5px', height: '100%' },
