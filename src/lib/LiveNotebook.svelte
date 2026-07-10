@@ -348,12 +348,6 @@
 		untrack(() => followCell(id));
 	});
 
-	// Cell ids awaiting the first streamed chunk of an SSE run — that chunk
-	// replaces the prior output (no flash). Tracked per-cell (not one shared flag)
-	// so interleaved run:start events for different cells can't consume each other's
-	// replace state (MCP runs aren't serialized against UI runs on the wire).
-	const sseReplace = new Set();
-
 	function setActive(id) {
 		activeId = id;
 	}
@@ -406,7 +400,6 @@
 			// `runningId === id` double-submit guard, permanently refuse to re-run it.
 			runningId = null;
 			agentRunningId = null;
-			sseReplace.clear();
 			lastSeq = null; // reconnect refetches once here; don't also trip the seq-gap check
 			// `queued` is NOT reset: the queue lives on the server and outlives this
 			// refetch. Apply any snapshot that arrived before we knew our absolute id.
@@ -541,19 +534,15 @@
 				// Only an agent's run earns the viewport; a user run in another tab
 				// must not scroll this one.
 				if (ev.actor === 'agent') agentRunningId = ev.cellId;
-				sseReplace.add(ev.cellId); // first streamed chunk replaces the prior output (no flash)
+				// Clear stale output the moment execution starts (the server fires
+				// run:start when the kernel is actually claimed, after any queue wait),
+				// so a re-run reads as "running, no output yet" until fresh output
+				// streams in — not the prior run's result lingering under a spinner.
+				cell.outputs = [];
 			}
 		} else if (ev.type === 'run:output') {
-			if (cell) {
-				if (sseReplace.has(ev.cellId)) {
-					cell.outputs = [ev.output];
-					sseReplace.delete(ev.cellId);
-				} else {
-					cell.outputs = [...cell.outputs, ev.output];
-				}
-			}
+			if (cell) cell.outputs = [...cell.outputs, ev.output];
 		} else if (ev.type === 'run:end') {
-			if (cell && sseReplace.delete(ev.cellId)) cell.outputs = []; // ran with no output → clear stale
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;
 			if (agentRunningId === ev.cellId) agentRunningId = null;
@@ -650,7 +639,6 @@
 		// it, so a request the server refused (duplicate) or dropped (a restart
 		// cancelled the queued run) never touches what is on screen.
 		let started = false;
-		let replace = true; // replace prior output only when new output arrives (no flash)
 		try {
 			const res = await fetch(`/api/cells/${id}/run`, {
 				method: 'POST',
@@ -672,30 +660,25 @@
 					const ev = JSON.parse(line);
 					if (ev.type === 'run:start') {
 						// The kernel is ours now (immediately, or after a wait in the queue).
+						// Clear stale output at execution start so the cell reads as
+						// "running, no output yet" until fresh output streams in.
 						started = true;
 						runningId = id;
+						cell.outputs = [];
 					} else if (ev.type === 'output') {
-						if (replace) {
-							cell.outputs = [ev.output];
-							replace = false;
-						} else {
-							cell.outputs = [...cell.outputs, ev.output];
-						}
+						cell.outputs = [...cell.outputs, ev.output];
 					} else if (ev.type === 'run:end') {
 						stampLastRun(cell, ev); // this tab's own user run → its badge
 					}
 					// `run:duplicate` / `run:cancelled` close the stream without a run:start:
-					// the cell keeps its outputs untouched and the queue badge (if any) is
-					// cleared by the `queue:changed` broadcast, not from here.
+					// the cell keeps its outputs untouched (we only clear on run:start) and
+					// the queue badge (if any) is cleared by the `queue:changed` broadcast.
 				}
 			}
 		} catch (err) {
-			// The request itself failed (the server is gone). That IS this cell's
-			// result; `replace = false` keeps the `finally` below from clearing it.
+			// The request itself failed (the server is gone). That IS this cell's result.
 			cell.outputs = [{ output_type: 'error', ename: 'CellarError', evalue: String(err), traceback: [String(err)] }];
-			replace = false;
 		} finally {
-			if (started && replace) cell.outputs = []; // ran with no output → clear
 			// Only a run WE actually started may clear the spinner: a request the server
 			// answered `run:duplicate` was refused precisely because that cell is running
 			// (here or in another tab), and clearing then would erase a live indicator.

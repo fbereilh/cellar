@@ -566,6 +566,19 @@ export function setOutputs(id, outputs, nb) {
 	}
 }
 
+/**
+ * Clear a cell's outputs in the LIVE in-memory doc only — no persist, no event.
+ * Called at execution start (`run.js`) so the authoritative model reads empty the
+ * moment a re-run begins: a tab that loads mid-run then gets no output and appends
+ * the fresh stream, instead of concatenating it onto the prior run's result. Disk
+ * is untouched (persist happens once, at run:end via `setOutputs`), so there is no
+ * transient empty-output `.ipynb` write.
+ */
+export function clearOutputsLive(id, nb) {
+	const cell = find(docFor(nb), id);
+	if (cell) cell.outputs = [];
+}
+
 export function clearOutputs(id, nb, originId) {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
