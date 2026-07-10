@@ -9,11 +9,16 @@
 		kernelInfo,
 		canConsolidateImports = false, // a notebook is active, so the sweep has a target
 		consolidating = false,
+		canSaveAsPy = false, // a notebook is active → it can be exported to a .py
+		canConvertToIpynb = false, // the active notebook is a .py → it can be run into an .ipynb
+		converting = false,
 		onSelectTab,
 		onCloseTab,
 		onPromoteTab,
 		onToggleSidebar,
 		onConsolidateImports,
+		onSaveAsPy,
+		onConvertToIpynb,
 		onOpenSettings
 	} = $props();
 
@@ -45,8 +50,32 @@
 			<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 			<ul tabindex="0" class="menu dropdown-content z-50 mt-1 w-60 rounded-box border border-base-300 bg-base-100 p-2 shadow-lg">
 				<li class="menu-title text-[11px]">Options</li>
-				<li><button class="justify-between" disabled>New notebook <kbd class="kbd kbd-xs">soon</kbd></button></li>
-				<li><button class="justify-between" disabled>Export .py view <kbd class="kbd kbd-xs">soon</kbd></button></li>
+				<li>
+					<button
+						onclick={onSaveAsPy}
+						disabled={!canSaveAsPy}
+						title="Export this notebook to a jupytext .py file (Databricks or percent format)"
+						data-testid="save-as-py"
+					>
+						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg>
+						Save as .py…
+					</button>
+				</li>
+				<li>
+					<button
+						onclick={onConvertToIpynb}
+						disabled={!canConvertToIpynb || converting}
+						title="Run every cell of this .py notebook and write an .ipynb with the outputs beside it"
+						data-testid="convert-to-ipynb"
+					>
+						{#if converting}
+							<span class="loading loading-spinner loading-xs"></span>
+						{:else}
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6" /><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M3 22v-6h6" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /></svg>
+						{/if}
+						Convert to .ipynb…
+					</button>
+				</li>
 				<li>
 					<button
 						onclick={onConsolidateImports}

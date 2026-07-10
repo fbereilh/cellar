@@ -12,6 +12,8 @@
 	import { subscribeEvents, originId } from '$lib/events-client.js';
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState.js';
 
+	const isPyPath = (p) => /\.py$/i.test(p);
+
 	let { data } = $props();
 
 	// Seed the per-project UI-preference cache from SSR before any child reads a
@@ -125,6 +127,8 @@
 	let sidebarOpen = $state(true);
 	let settingsOpen = $state(false);
 	let paletteOpen = $state(false);
+	// Transient, dismissable status line (jupytext env not ready, convert result, …).
+	let notice = $state('');
 	let theme = $state('dim');
 	const mcp = data.mcp;
 
@@ -210,12 +214,37 @@
 	function tabIdFor(path) {
 		return path === canonicalNotebookRel ? 'notebook' : 'file:' + path;
 	}
-	function makeTab(path, preview) {
+	// A `.py` is a live notebook only when content-detection says so; the kind is
+	// resolved once (server GET) and cached so it survives tab restore without a
+	// re-probe. `.ipynb` is always a notebook; everything else opens as text.
+	const pyKindCache = new Map(); // rel path → 'ipynb' | 'file'
+	function baseKindFor(path) {
+		if (/\.ipynb$/i.test(path)) return 'ipynb';
+		if (isPyPath(path)) return pyKindCache.get(path) ?? 'file';
+		return 'file';
+	}
+	async function resolveTabKind(path) {
+		if (!isPyPath(path)) return baseKindFor(path);
+		if (pyKindCache.has(path)) return pyKindCache.get(path);
+		let kind = 'file';
+		try {
+			const res = await fetch('/api/notebooks/jupytext?path=' + encodeURIComponent(path));
+			if (res.ok) {
+				const b = await res.json();
+				kind = b.notebook && b.ready ? 'ipynb' : 'file';
+				if (b.notebook && !b.ready && b.message) {
+					notice = `Open as notebook needs jupytext: ${b.message}`;
+				}
+			}
+		} catch {}
+		pyKindCache.set(path, kind);
+		return kind;
+	}
+	function makeTab(path, preview, kind) {
 		if (path === canonicalNotebookRel) {
 			return { id: 'notebook', kind: 'notebook', title: notebookName, path, closable: true, dirty: false, preview };
 		}
-		const kind = /\.ipynb$/i.test(path) ? 'ipynb' : 'file';
-		return { id: 'file:' + path, kind, title: path.split('/').pop(), path, closable: true, dirty: false, preview };
+		return { id: 'file:' + path, kind: kind ?? baseKindFor(path), title: path.split('/').pop(), path, closable: true, dirty: false, preview };
 	}
 
 	function selectTab(id) {
@@ -224,14 +253,20 @@
 
 	// Single-click a tree file → open in the single shared preview slot. If a tab
 	// for it already exists (preview or pinned) just focus it; otherwise reuse the
-	// existing preview tab's slot, or append one.
-	function openFile(path) {
+	// existing preview tab's slot, or append one. A `.py` is content-probed first
+	// (async) so it opens as a live notebook or as text, per detection.
+	async function openFile(path) {
 		const id = tabIdFor(path);
 		if (tabs.find((t) => t.id === id)) {
 			activeTabId = id;
 			return;
 		}
-		const tab = makeTab(path, true);
+		const kind = await resolveTabKind(path);
+		if (tabs.find((t) => t.id === id)) {
+			activeTabId = id;
+			return;
+		}
+		const tab = makeTab(path, true, kind);
 		const pv = tabs.findIndex((t) => t.preview);
 		if (pv >= 0) {
 			const next = [...tabs];
@@ -244,7 +279,7 @@
 	}
 
 	// Double-click / edit → open (or promote) as a permanent (pinned) tab.
-	function openFilePermanent(path) {
+	async function openFilePermanent(path) {
 		const id = tabIdFor(path);
 		const existing = tabs.find((t) => t.id === id);
 		if (existing) {
@@ -252,7 +287,12 @@
 			activeTabId = id;
 			return;
 		}
-		tabs = [...tabs, makeTab(path, false)];
+		const kind = await resolveTabKind(path);
+		if (tabs.find((t) => t.id === id)) {
+			activeTabId = id;
+			return;
+		}
+		tabs = [...tabs, makeTab(path, false, kind)];
 		activeTabId = id;
 	}
 
@@ -321,7 +361,10 @@
 			tabs = tabs.map((t) => {
 				const np = remapRel(t.path, change.from, change.path);
 				if (np == null) return t;
-				const nt = makeTab(np, t.preview);
+				// Preserve the tab's kind across a rename (a `.py` notebook stays a
+				// notebook); seed the cache at the new path so a later re-open matches.
+				if (isPyPath(np) && (t.kind === 'ipynb' || t.kind === 'file')) pyKindCache.set(np, t.kind);
+				const nt = makeTab(np, t.preview, t.kind === 'notebook' ? undefined : t.kind);
 				nt.dirty = t.dirty;
 				if (activeTabId === t.id) nextActive = nt.id;
 				return nt;
@@ -348,7 +391,12 @@
 			activeTabId = null;
 		} else {
 			try {
-				tabs = (parsed.tabs ?? []).map((t) => makeTab(t.path, !!t.preview));
+				// Seed the `.py` kind cache from the saved kind so restore is synchronous
+				// and a re-open matches — a `.py` opened as a notebook stays one.
+				for (const t of parsed.tabs ?? []) {
+					if (t.kind && isPyPath(t.path)) pyKindCache.set(t.path, t.kind === 'ipynb' ? 'ipynb' : 'file');
+				}
+				tabs = (parsed.tabs ?? []).map((t) => makeTab(t.path, !!t.preview, t.kind));
 				const ids = new Set(tabs.map((t) => t.id));
 				activeTabId = ids.has(parsed.activeTabId) ? parsed.activeTabId : (tabs[0]?.id ?? null);
 			} catch {
@@ -361,7 +409,7 @@
 	$effect(() => {
 		if (!tabsRestored) return;
 		setUi(TABS_KEY, {
-			tabs: tabs.map((t) => ({ path: t.path, preview: t.preview })),
+			tabs: tabs.map((t) => ({ path: t.path, preview: t.preview, kind: t.kind })),
 			activeTabId
 		});
 	});
@@ -412,6 +460,75 @@
 			});
 		} catch {}
 		consolidating = false;
+	}
+
+	// ---- jupytext: save as .py / convert .py → .ipynb -------------------------
+	// The active notebook (the one the sidebar reflects), and whether it is a `.py`
+	// text notebook (the only source a "Convert to .ipynb" makes sense for).
+	const activeNotebookIsPy = $derived(activeTab?.kind === 'ipynb' && isPyPath(activeTab.path));
+
+	let saveAsPyOpen = $state(false);
+	let saveAsPyFormat = $state('databricks');
+	let saveAsPyName = $state('');
+	let saveAsPyBusy = $state(false);
+	let converting = $state(false);
+
+	function openSaveAsPy() {
+		if (!activeNotebookPath) return;
+		// Default the target to <notebook-basename>.py beside the source.
+		const base = activeNotebookPath.replace(/\.(ipynb|py)$/i, '');
+		saveAsPyName = base + '.py';
+		saveAsPyFormat = 'databricks';
+		saveAsPyOpen = true;
+	}
+
+	async function doSaveAsPy() {
+		if (saveAsPyBusy || !activeNotebookPath) return;
+		saveAsPyBusy = true;
+		notice = '';
+		try {
+			const res = await fetch('/api/notebooks/jupytext', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ op: 'export', source: activeNotebookPath, target: saveAsPyName, format: saveAsPyFormat })
+			});
+			const body = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(body?.message || 'export failed');
+			saveAsPyOpen = false;
+			fsRefreshSignal++; // a new file on disk → refresh the tree + git decorations
+			notice = `Saved ${body.path} (${body.format}).`;
+		} catch (err) {
+			notice = `Save as .py failed: ${err?.message ?? err}`;
+		} finally {
+			saveAsPyBusy = false;
+		}
+	}
+
+	// Convert the active `.py` notebook to an `.ipynb` with outputs: the server runs
+	// every cell then writes <base>.ipynb, which we then open as a live notebook.
+	async function convertToIpynb() {
+		if (converting || !activeNotebookIsPy) return;
+		const source = activeTab.path;
+		const target = source.replace(/\.py$/i, '.ipynb');
+		converting = true;
+		notice = 'Converting: running all cells…';
+		try {
+			const res = await fetch('/api/notebooks/jupytext', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ op: 'convert', source, target, originId })
+			});
+			const body = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(body?.message || 'convert failed');
+			fsRefreshSignal++;
+			const r = body.ran ?? {};
+			notice = `Converted to ${body.path} — ran ${r.ok ?? 0}/${r.total ?? 0} cells${r.errors ? `, ${r.errors} with errors` : ''}.`;
+			await openFilePermanent(body.path);
+		} catch (err) {
+			notice = `Convert failed: ${err?.message ?? err}`;
+		} finally {
+			converting = false;
+		}
 	}
 
 	async function scrollToCell(id, foldKey = null) {
@@ -646,11 +763,16 @@
 		kernelInfo={displayKernel}
 		canConsolidateImports={!!activeNotebookPath}
 		{consolidating}
+		canSaveAsPy={!!activeNotebookPath}
+		canConvertToIpynb={activeNotebookIsPy}
+		{converting}
 		onSelectTab={selectTab}
 		onCloseTab={closeTab}
 		onPromoteTab={promoteTab}
 		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
 		onConsolidateImports={consolidateImports}
+		onSaveAsPy={openSaveAsPy}
+		onConvertToIpynb={convertToIpynb}
 		onOpenSettings={() => (settingsOpen = true)}
 	/>
 
@@ -798,6 +920,44 @@
 		refreshKernel();
 	}}
 />
+
+<!-- Save as .py — jupytext/Databricks export with a format picker (Databricks default). -->
+{#if saveAsPyOpen}
+	<div class="modal modal-open" data-testid="save-as-py-modal">
+		<div class="modal-box max-w-md">
+			<h3 class="text-base font-semibold">Save notebook as .py</h3>
+			<p class="mt-1 text-xs text-base-content/50">A jupytext text notebook — source only, no outputs. Ideal for git and Databricks.</p>
+
+			<label class="mt-4 block text-xs font-medium text-base-content/70" for="save-as-py-format">Format</label>
+			<select id="save-as-py-format" class="select select-bordered select-sm mt-1 w-full" bind:value={saveAsPyFormat} data-testid="save-as-py-format">
+				<option value="databricks">Databricks source (# COMMAND / # MAGIC)</option>
+				<option value="percent">Percent (# %%)</option>
+			</select>
+
+			<label class="mt-3 block text-xs font-medium text-base-content/70" for="save-as-py-name">File path</label>
+			<input id="save-as-py-name" class="input input-bordered input-sm mt-1 w-full font-mono" bind:value={saveAsPyName} spellcheck="false" data-testid="save-as-py-name" />
+
+			<div class="modal-action mt-5">
+				<button class="btn btn-sm btn-ghost" onclick={() => (saveAsPyOpen = false)} disabled={saveAsPyBusy}>Cancel</button>
+				<button class="btn btn-sm btn-primary" onclick={doSaveAsPy} disabled={saveAsPyBusy || !saveAsPyName.trim()} data-testid="save-as-py-confirm">
+					{#if saveAsPyBusy}<span class="loading loading-spinner loading-xs"></span>{/if}
+					Save
+				</button>
+			</div>
+		</div>
+		<button class="modal-backdrop" onclick={() => (saveAsPyOpen = false)} aria-label="Close">close</button>
+	</div>
+{/if}
+
+<!-- Transient status line for jupytext actions (dismissable). -->
+{#if notice}
+	<div class="toast toast-end toast-bottom z-[100]" data-testid="jupytext-notice">
+		<div class="alert alert-info max-w-md text-sm shadow-lg">
+			<span class="min-w-0 break-words">{notice}</span>
+			<button class="btn btn-ghost btn-xs btn-square" onclick={() => (notice = '')} aria-label="Dismiss">✕</button>
+		</div>
+	</div>
+{/if}
 
 <style>
 	:global(.cellar-flash) {

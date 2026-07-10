@@ -22,6 +22,7 @@ import { join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { readNotebook, deserialize, writeNotebook } from './ipynb.js';
+import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext.js';
 import { publish } from './events.js';
 import { cancelRun } from './run-queue.js';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole.js';
@@ -97,8 +98,16 @@ function newCell(cellType = 'code', source = '') {
 	};
 }
 
+/**
+ * Write a doc back to its file in its native format: a `.py` notebook round-trips
+ * through jupytext / the Databricks converter in the format it was opened in (no
+ * outputs — text notebooks carry none), everything else through nbformat. A doc
+ * whose `.py` format could not be determined on load (`jpFormat` unset) is never
+ * silently rewritten as `.ipynb`.
+ */
 function persist(doc) {
-	writeNotebook(doc.path, doc);
+	if (doc.jpFormat) writePyNotebook(doc.path, doc.cells, doc.jpFormat);
+	else writeNotebook(doc.path, doc);
 }
 
 /**
@@ -116,6 +125,16 @@ function persist(doc) {
 function loadDoc(abs) {
 	let doc = docs.get(abs);
 	if (doc) return doc;
+	if (isPyPath(abs)) {
+		// A `.py` notebook (jupytext percent/light or Databricks source). `jpFormat`
+		// records which format to write it back in; the cells carry no outputs.
+		if (!existsSync(abs)) throw new Error('notebook not found: ' + abs);
+		const parsed = readPyNotebook(abs);
+		enforceUniqueIds(parsed.cells);
+		doc = { path: abs, cells: parsed.cells, metadata: undefined, jpFormat: parsed.format };
+		docs.set(abs, doc);
+		return doc;
+	}
 	const raw = readNotebook(abs);
 	if (raw) {
 		const parsed = deserialize(raw);
@@ -532,7 +551,11 @@ export function setOutputs(id, outputs, nb) {
 	const cell = find(doc, id);
 	if (cell) {
 		cell.outputs = outputs;
-		persist(doc);
+		// A `.py` notebook stores no outputs on disk (text has none), so a run only
+		// updates the in-memory doc for live display — writing would re-run the whole
+		// jupytext conversion to produce a byte-identical file. Persist only formats
+		// that actually carry outputs.
+		if (!doc.jpFormat) persist(doc);
 	}
 }
 
