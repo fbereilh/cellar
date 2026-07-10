@@ -1,6 +1,7 @@
 <script>
 	import { onMount, setContext } from 'svelte';
 	import Databricks from '$lib/Databricks.svelte';
+	import Environment from '$lib/Environment.svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
@@ -43,7 +44,7 @@
 	// Which foldable sections are open. All start expanded (agent panel collapsed),
 	// then overridden by the persisted state on mount.
 	const OPEN_KEY = 'cellar-sidebar-open';
-	let open = $state({ files: true, kernels: true, databricks: false, agent: false, outline: true, vars: true, search: false });
+	let open = $state({ files: true, kernels: true, databricks: false, environment: false, agent: false, outline: true, vars: true, search: false });
 	function toggle(k) {
 		open[k] = !open[k];
 		persist(OPEN_KEY, open);
@@ -54,6 +55,14 @@
 	let databricksMounted = $state(false);
 	$effect(() => {
 		if (open.databricks) databricksMounted = true;
+	});
+
+	// Same lazy-mount latch for the Environment panel: it spawns a python
+	// subprocess to list packages, so a user who never opens it never pays for it.
+	let environmentMounted = $state(false);
+	let environmentComp = $state(null);
+	$effect(() => {
+		if (open.environment) environmentMounted = true;
 	});
 
 	const notebooksLabel = $derived(openNotebooks.length ? `notebooks · ${openNotebooks.length}` : 'notebooks');
@@ -581,6 +590,21 @@
 	{/if}
 {/snippet}
 
+{#snippet environmentSection()}
+	<div class="flex items-center">
+		{@render header('environment', 'Environment', 'section-environment')}
+		{@render refreshBtn(() => environmentComp?.refresh?.(), 'Refresh environment')}
+	</div>
+	<!-- Mounted lazily on first open, then kept mounted (hidden) so collapsing the
+	     section does not throw away the loaded package list. Its data comes from a
+	     python subprocess, which a user who never opens this should not pay for. -->
+	{#if environmentMounted}
+		<div class:hidden={!open.environment}>
+			<Environment bind:this={environmentComp} />
+		</div>
+	{/if}
+{/snippet}
+
 {#snippet agentSection()}
 	<div class="flex items-center">
 		{@render header('agent', 'Connect an agent', 'section-agent')}
@@ -790,6 +814,7 @@
 	{#if key === 'files'}{@render filesSection()}
 	{:else if key === 'kernels'}{@render kernelsSection()}
 	{:else if key === 'databricks'}{@render databricksSection()}
+	{:else if key === 'environment'}{@render environmentSection()}
 	{:else if key === 'agent'}{@render agentSection()}
 	{:else if key === 'outline'}{@render outlineSection()}
 	{:else if key === 'vars'}{@render varsSection()}
