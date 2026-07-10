@@ -11,6 +11,7 @@
 	import LogsPanel from '$lib/LogsPanel.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState.js';
+	import { relativeTimeLong } from '$lib/relativeTime.js';
 
 	const isPyPath = (p) => /\.py$/i.test(p);
 
@@ -196,6 +197,16 @@
 	);
 	const activeCells = $derived((activeNotebookPath && notebooksCells[activeNotebookPath]) || []);
 	const activeFolds = $derived((activeNotebookPath && notebooksFolds[activeNotebookPath]) || null);
+
+	// Git blame for the active file's cursor line, shown in the bottom status bar.
+	// Each mounted FileTab reports its own path's line record; the footer reads the
+	// active file's. Notebooks/`.ipynb` never report (blaming JSON lines is
+	// meaningless), so `activeBlame` is null for them and the bar hides gracefully.
+	let blameByPath = $state({});
+	function handleBlame(path, record) {
+		blameByPath = { ...blameByPath, [path]: record };
+	}
+	const activeBlame = $derived((activeFilePath && blameByPath[activeFilePath]) || null);
 
 	// Notebooks currently open in the shell (the default notebook tab + every
 	// opened `.ipynb`). With the single-shared-kernel model these are exactly the
@@ -894,7 +905,7 @@
 
 			{#each fileTabs as tab (tab.id)}
 				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
-					<FileTab path={tab.path} onDirty={onFileDirty} gitRefresh={fsRefreshSignal} />
+					<FileTab path={tab.path} onDirty={onFileDirty} gitRefresh={fsRefreshSignal} onBlame={handleBlame} />
 				</div>
 			{/each}
 
@@ -940,6 +951,29 @@
 			</button>
 			<span class="truncate">workspace: <span class="font-mono">{workspace}</span></span>
 		</div>
+
+		<!-- Git blame for the active file's cursor line (GitLens-style): who last
+		     touched it and when; commit summary + short SHA on hover. Hidden when
+		     there's no blame (notebook active, untracked file, or non-git). -->
+		{#if activeBlame}
+			<span
+				class="flex min-w-0 items-center gap-1 truncate text-base-content/55"
+				title={activeBlame.notCommitted
+					? 'Not committed yet'
+					: `${activeBlame.shortSha} · ${activeBlame.summary}`}
+				data-testid="blame-status"
+			>
+				<svg class="h-3 w-3 shrink-0 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><line x1="1.5" y1="12" x2="8" y2="12" /><line x1="16" y1="12" x2="22.5" y2="12" /></svg>
+				<span class="truncate">
+					{#if activeBlame.notCommitted}
+						You, uncommitted
+					{:else}
+						{activeBlame.author}, {relativeTimeLong(activeBlame.authorTime)}
+					{/if}
+				</span>
+			</span>
+		{/if}
+
 		<span class="font-mono">{activeCells.length} cells</span>
 	</footer>
 </div>
