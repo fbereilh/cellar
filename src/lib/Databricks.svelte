@@ -39,14 +39,44 @@
 	const connection = $derived(status?.connection ?? { connected: false });
 	const connected = $derived(!!connection.connected);
 	const profiles = $derived(status?.config?.profiles ?? []);
-	const configured = $derived(!!status?.config?.exists && profiles.length > 0);
+	const hasProfiles = $derived(profiles.length > 0);
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
 	const installed = $derived(!!install.sdk && !!install.connect);
-	/** Everything needed before a single SDK call can be attempted. */
-	const ready = $derived(configured && installed);
+	/**
+	 * Everything needed before a single SDK call can be attempted. A profile is
+	 * NOT required: a teammate with no `~/.databrickscfg` can still type a host
+	 * and sign in with OAuth, so readiness is only "the packages are importable".
+	 */
+	const ready = $derived(installed);
 
 	let profile = $state('');
 	let profileTouched = false;
+
+	// ---- Auth source: a config profile, or a typed workspace host -------------
+	// `useHost` lets someone override the profile picker; with no profiles at all
+	// the host field is the only way in.
+	let useHost = $state(false);
+	let hostInput = $state('');
+	/** Signed in for the current selection this session (an OAuth token is usable). */
+	let authed = $state(false);
+	let authError = $state(null);
+
+	const selectionMode = $derived(useHost || !hasProfiles ? 'host' : 'profile');
+	const selectedProfile = $derived(profiles.find((p) => p.name === profile) ?? null);
+	/** A profile carrying a token authenticates with no browser; everything else is OAuth. */
+	const selectionHasToken = $derived(selectionMode === 'profile' && !!selectedProfile?.hasToken);
+	const hostTrimmed = $derived(hostInput.trim());
+	const hostLooksValid = $derived(/^(https?:\/\/)?[a-z0-9-]+(\.[a-z0-9-]+)+/i.test(hostTrimmed));
+	const haveSelection = $derived(selectionMode === 'profile' ? !!profile : hostLooksValid);
+	/** OAuth selection that has not signed in yet: show the sign-in button, not clusters. */
+	const needsAuth = $derived(!connected && haveSelection && !selectionHasToken && !authed);
+	/** Identifies the current selection, so a change resets sign-in + cluster state. */
+	const selectionKey = $derived(selectionMode === 'profile' ? `p:${profile}` : `h:${hostTrimmed}`);
+
+	/** The `{profile}|{host}` body/query a request should carry for the current selection. */
+	function selectionParams() {
+		return selectionMode === 'profile' ? { profile } : { host: hostTrimmed };
+	}
 
 	// Monotonic generations, one per loader. Responses are unordered: a status read
 	// issued before a disconnect can resolve *after* it and clobber the UI back to
@@ -111,31 +141,38 @@
 	/** Switch-cluster: show the picker again while a session is live. */
 	let switching = $state(false);
 
-	const showClusters = $derived(ready && (!connected || switching));
-	/** Plain (non-reactive) memo of the profile the cluster list belongs to. */
+	// Clusters load only once a selection is authenticated - never while the
+	// sign-in button is still showing (`needsAuth`), so a listing subprocess can
+	// never be the thing that pops the OAuth browser.
+	const showClusters = $derived(ready && haveSelection && !needsAuth && (!connected || switching));
+	/** Plain (non-reactive) memo of the selection the cluster list belongs to. */
 	let clustersFor = null;
 
 	$effect(() => {
-		const p = profile;
-		if (!showClusters || !p || clustersFor === p) return;
-		clustersFor = p;
-		loadClusters(p);
+		const key = selectionKey;
+		if (!showClusters || clustersFor === key) return;
+		clustersFor = key;
+		loadClusters();
 	});
 
-	async function loadClusters(p) {
+	async function loadClusters() {
 		const seq = ++clustersSeq;
 		clustersLoading = true;
 		clustersError = null;
 		try {
-			const res = await fetch(`/api/databricks/clusters?profile=${encodeURIComponent(p)}`);
+			const q = new URLSearchParams(selectionParams());
+			const res = await fetch(`/api/databricks/clusters?${q}`);
 			const body = await res.json();
 			if (!res.ok) throw body;
-			if (seq !== clustersSeq) return; // a newer profile's list superseded this one
+			if (seq !== clustersSeq) return; // a newer selection's list superseded this one
 			clusters = body.clusters;
 		} catch (err) {
 			if (seq !== clustersSeq) return;
 			clusters = null;
 			clustersError = { code: err?.code ?? 'error', message: err?.message ?? String(err) };
+			// The server says this OAuth selection is not signed in (e.g. Cellar
+			// restarted and lost the in-process flag): fall back to the sign-in button.
+			if (err?.code === 'oauth_login_required') authed = false;
 		} finally {
 			if (seq === clustersSeq) clustersLoading = false;
 		}
@@ -143,17 +180,51 @@
 
 	function refreshClusters() {
 		clustersFor = null;
-		if (profile) {
-			clustersFor = profile;
-			loadClusters(profile);
+		if (haveSelection) {
+			clustersFor = selectionKey;
+			loadClusters();
 		}
+	}
+
+	/** A new selection: forget the old sign-in + cluster list. */
+	function resetSelection() {
+		authed = false;
+		authError = null;
+		clusters = null;
+		clustersError = null;
+		clustersFor = null;
 	}
 
 	function pickProfile(name) {
 		profileTouched = true;
 		profile = name;
-		clusters = null;
-		clustersError = null;
+		resetSelection();
+	}
+
+	function toggleUseHost() {
+		useHost = !useHost;
+		resetSelection();
+	}
+
+	// ---- Sign in (OAuth U2M via the SDK; instant for a PAT profile) -----------
+	async function signIn() {
+		if (busy) return;
+		busy = 'login';
+		authError = null;
+		try {
+			const res = await fetch('/api/databricks/login', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify(selectionParams())
+			});
+			const body = await res.json();
+			if (!res.ok) throw body;
+			authed = true; // the cluster effect fires now that `needsAuth` is false
+		} catch (err) {
+			authError = { code: err?.code ?? 'error', message: err?.message ?? String(err) };
+		} finally {
+			busy = '';
+		}
 	}
 
 	// ---- Connect / disconnect ------------------------------------------------
@@ -168,7 +239,7 @@
 			const res = await fetch('/api/databricks/connect', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ profile, clusterId: cluster.cluster_id, clusterName: cluster.name })
+				body: JSON.stringify({ ...selectionParams(), clusterId: cluster.cluster_id, clusterName: cluster.name })
 			});
 			const body = await res.json();
 			if (!res.ok) throw body;
@@ -247,11 +318,16 @@
 	}
 
 	$effect(() => {
-		const key = connected ? `${connection.profile}:${connection.clusterId}` : null;
+		const key = connected ? `${connection.profile ?? connection.host}:${connection.clusterId}` : null;
 		if (!key || catalogsFor === key) return;
 		catalogsFor = key;
 		loadCatalogs();
 	});
+
+	/** The `{profile}|{host}` the live connection used, for its Unity Catalog listings. */
+	function connectionParams() {
+		return connection.profile ? { profile: connection.profile } : { host: connection.host ?? '' };
+	}
 
 	async function loadCatalogs() {
 		// Bumping the generation also invalidates every child fetch still in flight
@@ -278,7 +354,7 @@
 	}
 
 	async function getLevel(params) {
-		const q = new URLSearchParams({ profile: connection.profile ?? profile, ...params });
+		const q = new URLSearchParams({ ...connectionParams(), ...params });
 		const res = await fetch(`/api/databricks/catalog?${q}`);
 		const body = await res.json();
 		if (!res.ok) throw { code: body?.code ?? 'error', message: body?.message ?? 'request failed' };
@@ -346,7 +422,9 @@
 		sdk_missing: 'Install databricks-sdk into this workspace’s Python environment.',
 		connect_missing: 'Install databricks-connect into this workspace’s Python environment.',
 		profile_missing: 'That profile is not in your ~/.databrickscfg. Pick another, or add it.',
-		auth_failed: 'Databricks rejected the credentials in this profile. Refresh your token (or re-run `databricks auth login`), then try again.',
+		oauth_login_required: 'Sign in to Databricks first - click “Sign in with Databricks” to authenticate in your browser.',
+		login_failed: 'Sign-in did not complete. Click “Sign in with Databricks” to try again.',
+		auth_failed: 'Databricks rejected these credentials. For a token profile, refresh the token; for OAuth, sign in again.',
 		permission_denied: 'Your account cannot see this. Ask a workspace admin for access.',
 		not_found: 'Not found in this workspace.',
 		timeout: 'The workspace did not respond. Check the host in this profile, and your VPN.',
@@ -376,27 +454,10 @@
 	{#if statusError}
 		{@render errorBox({ code: 'error', message: statusError }, 'databricks-status-error')}
 
-		<!-- 1. No ~/.databrickscfg (or no profiles in it). -->
+		<!-- 1. Loading, then: the kernel's venv cannot import the SDK. A profile is
+		     NOT required to get past here - a host can be typed in step 3. -->
 	{:else if !status}
 		<p class="px-1 text-xs text-base-content/40">loading…</p>
-	{:else if !configured}
-		<div class="rounded-lg border border-dashed border-base-300 bg-base-100 p-2.5" data-testid="databricks-not-configured">
-			<div class="text-sm font-medium text-base-content/50">Not configured</div>
-			{@render hint(
-				status.config.exists
-					? `No profiles found in ${status.config.path}.`
-					: `No Databricks config at ${status.config.path}.`
-			)}
-			<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">
-				Add a profile with the Databricks CLI (<code class="font-mono text-[10px] text-primary">databricks auth login</code>),
-				or write one by hand:
-			</p>
-			<pre class="mt-1 whitespace-pre-wrap break-all rounded border border-base-300 p-2 font-mono text-[10px] leading-relaxed text-base-content/60">[DEFAULT]
-host  = https://your-workspace.cloud.databricks.com
-token = dapi...</pre>
-		</div>
-
-		<!-- 2. Configured, but the kernel's venv cannot import the SDK. -->
 	{:else if !installed}
 		<div class="rounded-lg border border-dashed border-base-300 bg-base-100 p-2.5" data-testid="databricks-not-installed">
 			<div class="text-sm font-medium text-base-content/50">Packages missing</div>
@@ -444,7 +505,9 @@ token = dapi...</pre>
 					</span>
 				</div>
 				<dl class="mt-2 space-y-0.5 text-[11px] text-base-content/50">
-					<div class="flex justify-between gap-2"><dt>profile</dt><dd class="truncate font-mono text-base-content/70">{connection.profile}</dd></div>
+					{#if connection.profile}
+						<div class="flex justify-between gap-2"><dt>profile</dt><dd class="truncate font-mono text-base-content/70">{connection.profile}</dd></div>
+					{/if}
 					{#if connection.host}
 						<div class="flex justify-between gap-2"><dt>host</dt><dd class="truncate font-mono text-base-content/70" title={connection.host}>{connection.host.replace(/^https?:\/\//, '')}</dd></div>
 					{/if}
@@ -473,65 +536,107 @@ token = dapi...</pre>
 
 		{#if !connected || switching}
 			<div class="{connected ? 'mt-2 border-t border-base-300 pt-2' : ''}">
-				{#if profiles.length > 1}
-					<label class="block">
-						<span class="text-[10px] uppercase tracking-wide text-base-content/40">profile</span>
-						<select
-							class="select select-xs select-bordered mt-0.5 w-full font-mono text-[11px]"
-							value={profile}
-							onchange={(e) => pickProfile(e.currentTarget.value)}
-							disabled={!!busy}
-							data-testid="databricks-profile"
-						>
-							{#each profiles as p (p.name)}
-								<option value={p.name}>{p.name}</option>
-							{/each}
-						</select>
-					</label>
+				<!-- 3a. Auth source: a config profile, or a workspace host typed by hand. -->
+				{#if selectionMode === 'profile'}
+					{#if profiles.length > 1}
+						<label class="block">
+							<span class="text-[10px] uppercase tracking-wide text-base-content/40">profile</span>
+							<select
+								class="select select-xs select-bordered mt-0.5 w-full font-mono text-[11px]"
+								value={profile}
+								onchange={(e) => pickProfile(e.currentTarget.value)}
+								disabled={!!busy}
+								data-testid="databricks-profile"
+							>
+								{#each profiles as p (p.name)}
+									<option value={p.name}>{p.name}{p.hasToken ? '' : ' (OAuth)'}</option>
+								{/each}
+							</select>
+						</label>
+					{:else}
+						<p class="text-[11px] text-base-content/40">
+							profile <span class="font-mono text-base-content/60" data-testid="databricks-profile">{profile}</span>
+						</p>
+					{/if}
+					{#if hasProfiles}
+						<button class="mt-1 text-[10px] text-primary/70 hover:text-primary hover:underline" onclick={toggleUseHost} disabled={!!busy} data-testid="databricks-use-host">
+							or connect to a workspace host…
+						</button>
+					{/if}
 				{:else}
-					<p class="text-[11px] text-base-content/40">
-						profile <span class="font-mono text-base-content/60" data-testid="databricks-profile">{profile}</span>
-					</p>
+					<label class="block">
+						<span class="text-[10px] uppercase tracking-wide text-base-content/40">workspace host</span>
+						<input
+							type="text"
+							class="input input-xs input-bordered mt-0.5 w-full font-mono text-[11px]"
+							placeholder="https://dbc-….cloud.databricks.com"
+							bind:value={hostInput}
+							oninput={() => resetSelection()}
+							disabled={!!busy}
+							data-testid="databricks-host"
+						/>
+					</label>
+					{#if hasProfiles}
+						<button class="mt-1 text-[10px] text-primary/70 hover:text-primary hover:underline" onclick={toggleUseHost} disabled={!!busy} data-testid="databricks-use-profile">
+							use a saved profile instead
+						</button>
+					{:else}
+						{@render hint('No profile in ~/.databrickscfg. Enter your workspace URL and sign in - Cellar authenticates you through your browser, no token needed.')}
+					{/if}
 				{/if}
 
-				<div class="mt-2 flex items-center justify-between">
-					<span class="text-[10px] uppercase tracking-wide text-base-content/40">clusters</span>
-					<button class="btn btn-ghost btn-xs h-5 min-h-0 px-1 text-[11px] font-normal text-base-content/50 hover:text-base-content" onclick={refreshClusters} disabled={clustersLoading} data-testid="databricks-refresh-clusters">
-						{clustersLoading ? 'loading…' : 'refresh'}
+				<!-- 3b. OAuth selections sign in first; PAT profiles go straight to clusters. -->
+				{#if needsAuth}
+					<button
+						class="btn btn-primary btn-xs mt-2 w-full gap-1"
+						onclick={signIn}
+						disabled={!!busy || !haveSelection}
+						data-testid="databricks-signin"
+					>
+						{#if busy === 'login'}<span class="loading loading-spinner loading-xs"></span>Opening browser…{:else}Sign in with Databricks{/if}
 					</button>
-				</div>
-
-				{#if clustersError}
-					{@render errorBox(clustersError, 'databricks-clusters-error')}
-				{:else if clustersLoading && !clusters}
-					<p class="px-1 py-2 text-xs text-base-content/40">loading clusters…</p>
-				{:else if clusters?.length}
-					<div class="max-h-56 space-y-1 overflow-y-auto">
-						{#each clusters as c (c.cluster_id)}
-							<button
-								class="flex w-full items-center gap-1.5 rounded border border-base-300 px-1.5 py-1 text-left hover:border-primary/50 hover:bg-base-300/40 disabled:opacity-50"
-								onclick={() => connect(c)}
-								disabled={!!busy}
-								title="Connect `spark` to {c.name}"
-								data-testid="databricks-cluster"
-							>
-								<span class="min-w-0 flex-1">
-									<span class="block truncate text-xs text-base-content/80">{c.name}</span>
-									{#if c.spark_version}<span class="block truncate font-mono text-[10px] text-base-content/40">{c.spark_version}</span>{/if}
-								</span>
-								{#if connectingId === c.cluster_id}
-									<span class="loading loading-spinner loading-xs shrink-0 text-primary"></span>
-								{:else}
-									<span class="badge badge-xs shrink-0 {clusterBadge(c.state)}">{c.state.toLowerCase()}</span>
-								{/if}
-							</button>
-						{/each}
+					{@render hint('Opens your browser to authenticate with Databricks (OAuth). No access token required, and Cellar stores nothing.')}
+					{#if authError}{@render errorBox(authError, 'databricks-auth-error')}{/if}
+				{:else if haveSelection}
+					<div class="mt-2 flex items-center justify-between">
+						<span class="text-[10px] uppercase tracking-wide text-base-content/40">clusters</span>
+						<button class="btn btn-ghost btn-xs h-5 min-h-0 px-1 text-[11px] font-normal text-base-content/50 hover:text-base-content" onclick={refreshClusters} disabled={clustersLoading} data-testid="databricks-refresh-clusters">
+							{clustersLoading ? 'loading…' : 'refresh'}
+						</button>
 					</div>
-					{#if busy === 'connect'}
-						{@render hint('Connecting… starting a terminated cluster can take a few minutes.')}
+
+					{#if clustersError}
+						{@render errorBox(clustersError, 'databricks-clusters-error')}
+					{:else if clustersLoading && !clusters}
+						<p class="px-1 py-2 text-xs text-base-content/40">loading clusters…</p>
+					{:else if clusters?.length}
+						<div class="max-h-56 space-y-1 overflow-y-auto">
+							{#each clusters as c (c.cluster_id)}
+								<button
+									class="flex w-full items-center gap-1.5 rounded border border-base-300 px-1.5 py-1 text-left hover:border-primary/50 hover:bg-base-300/40 disabled:opacity-50"
+									onclick={() => connect(c)}
+									disabled={!!busy}
+									title="Connect `spark` to {c.name}"
+									data-testid="databricks-cluster"
+								>
+									<span class="min-w-0 flex-1">
+										<span class="block truncate text-xs text-base-content/80">{c.name}</span>
+										{#if c.spark_version}<span class="block truncate font-mono text-[10px] text-base-content/40">{c.spark_version}</span>{/if}
+									</span>
+									{#if connectingId === c.cluster_id}
+										<span class="loading loading-spinner loading-xs shrink-0 text-primary"></span>
+									{:else}
+										<span class="badge badge-xs shrink-0 {clusterBadge(c.state)}">{c.state.toLowerCase()}</span>
+									{/if}
+								</button>
+							{/each}
+						</div>
+						{#if busy === 'connect'}
+							{@render hint('Connecting… starting a terminated cluster can take a few minutes.')}
+						{/if}
+					{:else if clusters}
+						<p class="px-1 py-2 text-xs text-base-content/40">no clusters in this workspace</p>
 					{/if}
-				{:else if clusters}
-					<p class="px-1 py-2 text-xs text-base-content/40">no clusters in this workspace</p>
 				{/if}
 
 				{#if connectError}{@render errorBox(connectError, 'databricks-connect-error')}{/if}

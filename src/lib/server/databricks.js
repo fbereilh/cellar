@@ -7,12 +7,33 @@
  * `DatabricksSession`) with a one-click sidebar flow.
  *
  * ## Auth
- * Profile auth through the **databricks SDK**, nothing else. `WorkspaceClient(
- * profile=…)` and `DatabricksSession.builder.profile(…)` read `~/.databrickscfg`
- * directly (PAT or OAuth/U2M), so Cellar never needs the `databricks` CLI on
- * PATH and never goes looking for the VS Code extension's bundled binary. The
- * profile list below is parsed from that same file so the picker works before
- * anything is installed.
+ * Auth is the **databricks SDK's own** auth, nothing else - never the
+ * `databricks` CLI on PATH and never the VS Code extension's bundled binary.
+ * Cellar resolves each connection to one of two SDK `Config`s and hands the
+ * *same* one to the listing subprocess and the kernel session, so the two can
+ * never authenticate differently:
+ *
+ *   - **PAT** - a `~/.databrickscfg` profile that carries a `token`. The SDK
+ *     reads it directly (`Config(profile=…)`); no browser, no CLI.
+ *   - **OAuth U2M (`external-browser`)** - everything else (a profile with a
+ *     `host` but no token - the common `auth_type = databricks-cli` shape - or a
+ *     workspace host the user typed by hand). `Config(host=…,
+ *     auth_type='external-browser')` runs the SDK's *own* OAuth flow: it opens
+ *     the system browser, the user signs in as themselves, and the SDK mints and
+ *     caches the token under `~/.config/databricks-sdk-py/oauth/`. This needs no
+ *     pre-cached `databricks auth login` and no CLI on PATH, so any teammate can
+ *     connect from a bare host. The cache is keyed by (host, client_id, scopes,
+ *     profile), so once the interactive `login` subprocess has minted it, every
+ *     later listing subprocess and the kernel session load it silently - which is
+ *     why they all build the Config the same way (host only, profile unset).
+ *
+ * The interactive browser step runs in a short-lived **`login` subprocess** (not
+ * the kernel, so it never blocks a running cell) with a long timeout; an
+ * in-process `signedInHosts` gate then lets the fast listing subprocesses run
+ * without ever risking a surprise second browser. The workspace *host* comes
+ * from a profile's `host` or is typed directly - a cached profile is never
+ * required. The profile list below is parsed from `~/.databrickscfg` so the
+ * picker works before anything is installed.
  *
  * ## The server / kernel split
  * Two very different jobs, so two runtimes:
@@ -28,10 +49,10 @@
  *     and `w` bound in the user namespace.
  *
  * Both halves scrub the environment the same way (`scrubEnv` / the same rule in
- * `CONNECT_CODE`) so the subprocess and the kernel resolve the *same* profile.
- * One deliberate divergence from the boilerplate: `DATABRICKS_CONFIG_FILE` is
- * preserved rather than deleted, since it is what tells the SDK where the config
- * we just read the profiles from actually lives.
+ * `CONNECT_CODE`) so a stale `DATABRICKS_*` / `SPARK_CONNECT_*` var cannot
+ * override the Config we just built. One deliberate divergence from the
+ * boilerplate: `DATABRICKS_CONFIG_FILE` is preserved rather than deleted, since
+ * it is what tells the SDK where the config we read the profiles from lives.
  *
  * ## Connection state is epoch-scoped
  * `spark` lives in the kernel namespace, so a kernel restart destroys it. This
@@ -53,7 +74,15 @@ import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
 const SENTINEL = '__CELLAR_DBX__';
 
 /** How long a metadata subprocess may run before it is killed. */
-const PROBE_TIMEOUT_MS = 60_000;
+const PROBE_TIMEOUT_MS = 45_000;
+
+/**
+ * How long the interactive `login` subprocess may run: it opens the browser and
+ * blocks on the localhost OAuth redirect, so it has to outlast a human signing
+ * in (approve the app, pick an account, MFA). A kill here reads as "sign-in was
+ * not completed", not "the workspace is down".
+ */
+const LOGIN_TIMEOUT_MS = 300_000;
 
 /** Env vars the boilerplate clears. `DATABRICKS_CONFIG_FILE` is deliberately kept. */
 const KEEP_ENV = new Set(['DATABRICKS_CONFIG_FILE']);
@@ -62,6 +91,8 @@ const isStaleEnv = (k) =>
 
 /** A profile name as `~/.databrickscfg` and the SDK accept it. */
 const PROFILE_RE = /^[A-Za-z0-9._-]+$/;
+/** A workspace host the user may type by hand, once `https://` is prepended. */
+const HOST_RE = /^https:\/\/[A-Za-z0-9.-]+(:\d+)?(\/[^\s]*)?$/;
 /** A Databricks cluster id, e.g. `0725-123456-abcd1234`. */
 const CLUSTER_RE = /^[A-Za-z0-9-]+$/;
 /** A Unity Catalog identifier part. */
@@ -102,6 +133,11 @@ export function configPath() {
  * writes bookkeeping sections into this same file (`[__settings__]`), and a
  * profile with no host is not one the SDK could authenticate with anyway - so
  * host-less sections are dropped rather than offered as something to connect to.
+ *
+ * Each profile also reports `hasToken` (a `token` key ⇒ PAT auth, no browser)
+ * and its declared `authType`, so the UI can tell a one-click PAT profile from
+ * one that needs the interactive OAuth sign-in. The token *value* is never
+ * exposed - only whether one is present.
  */
 export function readProfiles() {
 	const path = configPath();
@@ -119,7 +155,7 @@ export function readProfiles() {
 		if (!line || line.startsWith('#') || line.startsWith(';')) continue;
 		const section = /^\[(.+)]$/.exec(line);
 		if (section) {
-			current = { name: section[1].trim(), host: '' };
+			current = { name: section[1].trim(), host: '', hasToken: false, authType: null };
 			sections.push(current);
 			continue;
 		}
@@ -127,18 +163,61 @@ export function readProfiles() {
 		const eq = line.indexOf('=');
 		if (eq === -1) continue;
 		const key = line.slice(0, eq).trim().toLowerCase();
-		if (key === 'host') current.host = line.slice(eq + 1).trim();
+		const value = line.slice(eq + 1).trim();
+		if (key === 'host') current.host = value;
+		else if (key === 'token') current.hasToken = !!value;
+		else if (key === 'auth_type') current.authType = value;
 	}
 	// Also drop anything the SDK could not accept as a `profile=` value.
 	const profiles = sections.filter((s) => s.host && PROFILE_RE.test(s.name));
 	return { configPath: path, exists: true, profiles };
 }
 
-/** The process env with the stale Databricks/Spark vars removed and the profile pinned. */
-function scrubEnv(profile) {
+/** Normalize a user-typed workspace host: trim, drop a trailing slash, force https. */
+function normalizeHost(host) {
+	let h = String(host ?? '').trim().replace(/\/+$/, '');
+	if (!h) return '';
+	if (!/^https?:\/\//i.test(h)) h = `https://${h}`;
+	return h.replace(/^http:\/\//i, 'https://');
+}
+
+/**
+ * Resolve a UI selection - a `profile` name, or a typed `host` - to the auth
+ * descriptor both the subprocess and the kernel build their `Config` from:
+ *
+ *   - `{ mode: 'pat', profile }`   - profile with a token; SDK reads it.
+ *   - `{ mode: 'oauth', host }`    - external-browser OAuth against `host`.
+ *
+ * A profile without a token resolves to OAuth against the profile's own host, so
+ * the ubiquitous `auth_type = databricks-cli` profile just works via the SDK's
+ * native U2M flow - no CLI, no pre-cached login.
+ */
+export function resolveAuth({ profile, host } = {}) {
+	if (profile) {
+		assertMatches(profile, PROFILE_RE, 'profile');
+		const found = readProfiles().profiles.find((p) => p.name === profile);
+		if (!found) {
+			throw new DatabricksError('profile_missing', `profile "${profile}" is not in ${configPath()}`);
+		}
+		if (found.hasToken) return { mode: 'pat', profile, host: normalizeHost(found.host) };
+		return { mode: 'oauth', host: normalizeHost(found.host) };
+	}
+	const h = normalizeHost(host);
+	if (!h || !HOST_RE.test(h)) {
+		throw new DatabricksError('bad_request', `invalid workspace host: ${JSON.stringify(host)}`);
+	}
+	return { mode: 'oauth', host: h };
+}
+
+/**
+ * The process env with the stale Databricks/Spark vars removed. The auth
+ * descriptor is passed to the probe as an explicit `Config`, so there is no
+ * `DATABRICKS_CONFIG_PROFILE` to set here - a leftover one would only override
+ * the host/profile we just resolved, which is exactly what `isStaleEnv` clears.
+ */
+function scrubEnv() {
 	const env = { ...process.env };
 	for (const key of Object.keys(env)) if (isStaleEnv(key)) delete env[key];
-	if (profile) env.DATABRICKS_CONFIG_PROFILE = profile;
 	return env;
 }
 
@@ -170,6 +249,13 @@ def classify(e):
         return 'sdk_missing'
     if 'profile' in low and 'not found' in low:
         return 'profile_missing'
+    # The OAuth U2M flow failing/being cancelled: the token could not be minted,
+    # so the remedy is "sign in again", not "check your token". The SDK phrases
+    # these as "default auth: external-browser: ..." (a port already bound when a
+    # prior sign-in is still waiting, a cancelled consent, an unreachable IdP).
+    if ('external-browser' in low or 'consent' in low or 'oauth' in low
+            or 'authorization code' in low or 'address already in use' in low):
+        return 'oauth_login_required'
     if n == 'Unauthenticated' or 'cannot configure default credentials' in low or 'authenticate' in low:
         return 'auth_failed'
     if n == 'PermissionDenied':
@@ -268,21 +354,43 @@ def tables(w, catalog, schema):
     rows.sort(key=lambda r: r['name'].lower())
     return {'ok': True, 'tables': rows, 'truncated': truncated}
 
+def build_client(auth):
+    # One place that turns the resolved auth descriptor into a WorkspaceClient, so
+    # the listing subprocess and (mirrored in CONNECT_CODE) the kernel session
+    # build byte-identical Configs -> the OAuth token cache key matches -> a token
+    # minted by 'login' is reused everywhere with no second browser.
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.core import Config
+    mode = auth.get('mode')
+    if mode == 'pat':
+        cfg = Config(profile=auth['profile'])
+    elif mode == 'oauth':
+        cfg = Config(host=auth['host'], auth_type='external-browser')
+    else:
+        raise ValueError('unknown auth mode: %r' % (mode,))
+    return WorkspaceClient(config=cfg)
+
 def main():
     req = json.loads(sys.argv[1])
     op = req.get('op')
     if op == 'check':
         return check()
     try:
-        from databricks.sdk import WorkspaceClient
+        import databricks.sdk  # noqa: F401 - fail with a clear code before we touch auth
     except Exception as e:
         return fail(e, 'sdk_missing')
-    profile = req.get('profile') or 'DEFAULT'
+    auth = req.get('auth') or {}
     try:
-        w = WorkspaceClient(profile=profile)
+        w = build_client(auth)
     except Exception as e:
         return fail(e)
     try:
+        if op == 'login':
+            # Force the credential to materialize: for external-browser this opens
+            # the browser, waits for the redirect, and caches the token. The
+            # round-trip to the workspace also proves the host is reachable.
+            me = w.current_user.me()
+            return {'ok': True, 'host': w.config.host, 'user': getattr(me, 'user_name', None)}
         if op == 'clusters':
             return clusters(w)
         if op == 'catalogs':
@@ -321,6 +429,8 @@ export function statusFor(code) {
 			return 400;
 		case 'auth_failed':
 		case 'profile_missing':
+		case 'oauth_login_required':
+		case 'login_failed':
 			return 401;
 		case 'permission_denied':
 			return 403;
@@ -356,11 +466,11 @@ function requirePython() {
 }
 
 /** Run one `PROBE` command in the project venv and return its parsed result. */
-function probe(request) {
+function probe(request, timeoutMs = PROBE_TIMEOUT_MS) {
 	const python = requirePython();
 	return new Promise((resolve, reject) => {
 		const child = spawn(python, ['-c', PROBE, JSON.stringify(request)], {
-			env: scrubEnv(request.profile),
+			env: scrubEnv(),
 			cwd: workspace(),
 			stdio: ['ignore', 'pipe', 'pipe']
 		});
@@ -369,12 +479,17 @@ function probe(request) {
 		const timer = setTimeout(() => {
 			child.kill('SIGKILL');
 			reject(
-				new DatabricksError(
-					'timeout',
-					`Databricks did not respond within ${PROBE_TIMEOUT_MS / 1000}s. Check that the workspace host in your \`${request.profile}\` profile is reachable.`
-				)
+				request.op === 'login'
+					? new DatabricksError(
+							'login_failed',
+							`Databricks sign-in was not completed within ${timeoutMs / 1000}s. Try signing in again.`
+						)
+					: new DatabricksError(
+							'timeout',
+							`Databricks did not respond within ${timeoutMs / 1000}s. Check that the workspace host is reachable.`
+						)
 			);
-		}, PROBE_TIMEOUT_MS);
+		}, timeoutMs);
 
 		child.stdout.on('data', (d) => (stdout += d));
 		child.stderr.on('data', (d) => (stderr += d));
@@ -416,6 +531,50 @@ function assertMatches(value, re, label) {
 // Read APIs (server-side)
 // ---------------------------------------------------------------------------
 
+/**
+ * Hosts this server process has completed an OAuth sign-in for (or bound via
+ * PAT). It gates the listing subprocesses: they may only run once we know a
+ * usable token exists on disk, so a listing can never be the thing that pops an
+ * unexpected browser - the deliberate, long-lived `login` subprocess is. Lost on
+ * a server restart, which is safe: the on-disk token cache survives, so the next
+ * `login` is silent (cache hit) and just re-populates this set.
+ */
+const signedInHosts = new Set();
+
+/** Throw `oauth_login_required` if an OAuth selection has not signed in yet. */
+function assertSignedIn(auth) {
+	if (auth.mode === 'oauth' && !signedInHosts.has(auth.host)) {
+		throw new DatabricksError(
+			'oauth_login_required',
+			`Sign in to ${auth.host} first (this opens your browser to authenticate).`
+		);
+	}
+}
+
+/** Resolve a `{profile}|{host}` selection to an auth descriptor and gate listing on sign-in. */
+function authForListing(sel) {
+	const auth = resolveAuth(sel);
+	assertSignedIn(auth);
+	return auth;
+}
+
+/**
+ * Complete the SDK's auth for a selection so later listings/sessions run
+ * silently. For PAT there is nothing interactive to do (the token is already in
+ * the config), so this is a no-op that just records the host. For OAuth it runs
+ * the interactive `login` subprocess (opens the browser, caches the token).
+ */
+export async function login(sel) {
+	const auth = resolveAuth(sel);
+	if (auth.mode === 'pat') {
+		signedInHosts.add(auth.host);
+		return { ok: true, mode: 'pat', host: auth.host };
+	}
+	const result = unwrap(await probe({ op: 'login', auth }, LOGIN_TIMEOUT_MS));
+	signedInHosts.add(auth.host);
+	return { ok: true, mode: 'oauth', host: result.host ?? auth.host, user: result.user ?? null };
+}
+
 /** Are `databricks-sdk` / `databricks-connect` importable by the kernel's interpreter? */
 export async function checkInstall() {
 	const python = projectPython();
@@ -439,31 +598,32 @@ export async function getStatus() {
 		install,
 		installError,
 		uv: await hasUv(),
+		signedInHosts: [...signedInHosts],
 		connection: connectionStatus()
 	};
 }
 
-export async function listClusters(profile) {
-	assertMatches(profile, PROFILE_RE, 'profile');
-	return unwrap(await probe({ op: 'clusters', profile })).clusters;
+export async function listClusters(sel) {
+	const auth = authForListing(sel);
+	return unwrap(await probe({ op: 'clusters', auth })).clusters;
 }
 
-export async function listCatalogs(profile) {
-	assertMatches(profile, PROFILE_RE, 'profile');
-	return unwrap(await probe({ op: 'catalogs', profile }));
+export async function listCatalogs(sel) {
+	const auth = authForListing(sel);
+	return unwrap(await probe({ op: 'catalogs', auth }));
 }
 
-export async function listSchemas(profile, catalog) {
-	assertMatches(profile, PROFILE_RE, 'profile');
+export async function listSchemas(sel, catalog) {
+	const auth = authForListing(sel);
 	assertMatches(catalog, UC_NAME_RE, 'catalog');
-	return unwrap(await probe({ op: 'schemas', profile, catalog }));
+	return unwrap(await probe({ op: 'schemas', auth, catalog }));
 }
 
-export async function listTables(profile, catalog, schema) {
-	assertMatches(profile, PROFILE_RE, 'profile');
+export async function listTables(sel, catalog, schema) {
+	const auth = authForListing(sel);
 	assertMatches(catalog, UC_NAME_RE, 'catalog');
 	assertMatches(schema, UC_NAME_RE, 'schema');
-	return unwrap(await probe({ op: 'tables', profile, catalog, schema }));
+	return unwrap(await probe({ op: 'tables', auth, catalog, schema }));
 }
 
 // ---------------------------------------------------------------------------
@@ -474,8 +634,8 @@ export async function listTables(profile, catalog, schema) {
  * Embed `cfg` as a python literal. `JSON.stringify` of a JSON string yields a
  * double-quoted literal whose escapes (`\\"`, `\\\\`, `\\n`, `\\uXXXX`) are all
  * valid python - so the kernel parses exactly the bytes we sent, whatever the
- * profile name contains. The regex validation above is the real guard; this is
- * the belt to its braces.
+ * host or profile name contains. The regex validation above is the real guard;
+ * this is the belt to its braces.
  */
 const pyLiteral = (cfg) => JSON.stringify(JSON.stringify(cfg));
 
@@ -483,6 +643,12 @@ const pyLiteral = (cfg) => JSON.stringify(JSON.stringify(cfg));
  * The boilerplate, run once inside the kernel. Everything is underscore-prefixed
  * or deleted afterwards, so the only names it leaves behind are the two the user
  * asked for: `spark` and `w`.
+ *
+ * Auth mirrors `build_client()` in the PROBE exactly: one `Config` (PAT via
+ * profile, or external-browser OAuth via host) drives both the `WorkspaceClient`
+ * and the `DatabricksSession` through `.sdkConfig(...)`, so the session and the
+ * server-side listings authenticate identically. For OAuth the token was already
+ * minted + cached by the `login` subprocess, so nothing here opens a browser.
  *
  * An existing session is stopped first - `getOrCreate()` would otherwise hand
  * back the *old* cluster's session and silently ignore the cluster just picked.
@@ -496,7 +662,7 @@ def _cellar_dbx_connect(_cfg):
     for _k in [_k for _k in list(os.environ)
                if (_k.startswith('DATABRICKS_') or _k.startswith('SPARK_CONNECT_')) and _k not in _keep]:
         os.environ.pop(_k, None)
-    os.environ['DATABRICKS_CONFIG_PROFILE'] = _cfg['profile']
+    _auth = _cfg['auth']
     _g = globals()
     _old = _g.pop('spark', None)
     if _old is not None:
@@ -506,6 +672,7 @@ def _cellar_dbx_connect(_cfg):
             pass
     try:
         from databricks.sdk import WorkspaceClient
+        from databricks.sdk.core import Config
     except Exception as _e:
         return {'ok': False, 'code': 'sdk_missing', 'message': '%s: %s' % (type(_e).__name__, _e)}
     try:
@@ -513,13 +680,17 @@ def _cellar_dbx_connect(_cfg):
     except Exception as _e:
         return {'ok': False, 'code': 'connect_missing', 'message': '%s: %s' % (type(_e).__name__, _e)}
     try:
-        _w = WorkspaceClient(profile=_cfg['profile'])
+        if _auth['mode'] == 'pat':
+            _sdk = Config(profile=_auth['profile'])
+        else:
+            _sdk = Config(host=_auth['host'], auth_type='external-browser')
+        _w = WorkspaceClient(config=_sdk)
         _host = _w.config.host
     except Exception as _e:
         return {'ok': False, 'code': 'auth_failed', 'message': '%s: %s' % (type(_e).__name__, _e)}
     try:
         _spark = (DatabricksSession.builder
-                  .profile(_cfg['profile'])
+                  .sdkConfig(_sdk)
                   .clusterId(_cfg['cluster_id'])
                   .getOrCreate())
     except Exception as _e:
@@ -615,6 +786,8 @@ async function runInKernel(code) {
  * from "connected before someone restarted the kernel".
  */
 let connection = null;
+/** The `{profile}|{host}` selection the live connection was built from (for `forAgent` listings). */
+let connectedSel = null;
 /** The connection a kernel restart took from us, kept so the UI can say so. */
 let lost = null;
 /** One connect/disconnect at a time: both mutate the same kernel namespace. */
@@ -629,36 +802,44 @@ export function connectionStatus() {
 	if (connection && connection.session !== currentSessionId()) {
 		lost = { profile: connection.profile, clusterName: connection.clusterName };
 		connection = null;
+		connectedSel = null;
 	}
 	if (!connection) return { connected: false, ...(lost ? { lost } : {}) };
 	return { connected: true, ...connection };
 }
 
 /**
- * Build `spark` + `w` in the kernel against `clusterId` using `profile`.
- * Resolves with `{ok:true, connection}` or throws a `DatabricksError` whose
- * `code` the sidebar turns into actionable copy.
+ * Build `spark` + `w` in the kernel against `clusterId`, using the resolved auth
+ * for the chosen `profile` OR typed `host`. Resolves with `{ok:true, connection}`
+ * or throws a `DatabricksError` whose `code` the sidebar turns into actionable
+ * copy. `assertSignedIn` guarantees an OAuth connect never opens a browser in the
+ * kernel: the interactive login already happened in its own subprocess.
  */
-export async function connect({ profile, clusterId, clusterName }) {
-	assertMatches(profile, PROFILE_RE, 'profile');
+export async function connect({ profile, host, clusterId, clusterName }) {
 	assertMatches(clusterId, CLUSTER_RE, 'cluster id');
+	const sel = profile ? { profile } : { host };
+	const auth = resolveAuth(sel);
+	assertSignedIn(auth);
 	if (inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
 	inFlight = true;
 	try {
-		const { result, session } = await runInKernel(CONNECT_CODE({ profile, cluster_id: clusterId }));
+		const { result, session } = await runInKernel(CONNECT_CODE({ auth, cluster_id: clusterId }));
 		if (!result.ok) {
 			connection = null;
+			connectedSel = null;
 			publishGlobal({ type: 'databricks:changed' });
 			throw new DatabricksError(result.code || 'error', result.message);
 		}
 		connection = {
-			profile,
+			profile: profile ?? null,
 			clusterId,
 			clusterName: clusterName || clusterId,
-			host: result.host ?? null,
+			host: result.host ?? auth.host ?? null,
 			sparkVersion: result.spark_version ?? null,
 			session
 		};
+		// Re-query catalogs against the same auth, using the SDK's canonical host.
+		connectedSel = auth.mode === 'pat' ? { profile } : { host: connection.host };
 		lost = null;
 		publishGlobal({ type: 'databricks:changed' });
 		return { ok: true, connection: connectionStatus() };
@@ -696,23 +877,23 @@ export function agentStatus() {
 	};
 }
 
-/** The profile of the live connection, or a `not_connected` error an agent can act on. */
-function requireConnectedProfile() {
+/** The `{profile}|{host}` selection of the live connection, or a `not_connected` error an agent can act on. */
+function requireConnectedSel() {
 	const status = connectionStatus();
-	if (!status.connected) {
+	if (!status.connected || !connectedSel) {
 		throw new DatabricksError(
 			'not_connected',
 			'Not connected to Databricks. Ask the user to connect from the Databricks section of the Cellar sidebar (agents cannot connect on their own).'
 		);
 	}
-	return status.profile;
+	return connectedSel;
 }
 
-/** Unity Catalog listings for the agent, against the profile of the live connection. */
+/** Unity Catalog listings for the agent, against the auth of the live connection. */
 export const forAgent = {
-	catalogs: async () => listCatalogs(requireConnectedProfile()),
-	schemas: async (catalog) => listSchemas(requireConnectedProfile(), catalog),
-	tables: async (catalog, schema) => listTables(requireConnectedProfile(), catalog, schema)
+	catalogs: async () => listCatalogs(requireConnectedSel()),
+	schemas: async (catalog) => listSchemas(requireConnectedSel(), catalog),
+	tables: async (catalog, schema) => listTables(requireConnectedSel(), catalog, schema)
 };
 
 /** `catalog.schema.table`, or the two-part `schema.table` a legacy metastore uses. */
@@ -766,7 +947,7 @@ finally:
 /** Agent-facing table preview: `{name, limit, schema, rows}`. Requires a live session. */
 export async function previewTable({ name, limit = 20 }) {
 	assertTableName(name);
-	requireConnectedProfile();
+	requireConnectedSel();
 	const n = Number(limit);
 	if (!Number.isInteger(n) || n < 1 || n > 1000) {
 		throw new DatabricksError('bad_request', `invalid limit: ${JSON.stringify(limit)} (1-1000)`);
@@ -783,6 +964,7 @@ export async function disconnect() {
 		// Nothing to stop if the kernel that held it is gone; just clear our state.
 		if (connectionStatus().connected) await runInKernel(DISCONNECT_CODE);
 		connection = null;
+		connectedSel = null;
 		lost = null;
 		publishGlobal({ type: 'databricks:changed' });
 		return { ok: true };
