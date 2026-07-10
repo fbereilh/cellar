@@ -953,7 +953,7 @@
 									data-fullsize={full ? 'true' : undefined}
 								>
 									<img
-										class="{full ? 'max-w-none cursor-zoom-out' : 'max-w-full cursor-zoom-in'}"
+										class="{full ? 'max-w-none' : 'max-w-full'}"
 										src={o.image}
 										alt="cell image output"
 										data-testid="output-image"
