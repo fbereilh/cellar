@@ -111,7 +111,10 @@ Follow this house style:
 
 5. STRUCTURE WITH MARKDOWN. Use markdown header cells to divide the notebook into
    sections (Setup, Load data, Explore, Model, Results). Keep code cells focused:
-   one idea per cell.
+   one idea per cell. Add markdown cells with add_and_run (NOT add_cell): markdown
+   does not render on its own, and "running" a markdown cell renders it (no kernel
+   executes); add_and_run creates it AND shows it rendered, so a header never sits
+   as raw source in the notebook.
 
 6. PICK THE RIGHT NOTEBOOK. Your read/write/run tools target the active notebook.
    Call list_notebooks to discover the workspace's notebooks; open_notebook(name)
@@ -122,8 +125,9 @@ Follow this house style:
 7. WRITE AND RUN TOGETHER. When you add a code cell you intend to execute, use
    add_and_run — it creates the cell and runs it in one call, returning the new
    cell id and the run result (outputs/errors) together, with fewer round-trips
-   than add_cell followed by run_cell. Reserve add_cell for cells you are adding
-   without running yet (e.g. markdown headers, or code you will run later).
+   than add_cell followed by run_cell. Use add_and_run for markdown cells too, so
+   they render instead of sitting as raw source. Reserve add_cell for code you are
+   adding but will run later (a cell you want left un-run).
 
 8. ONE KERNEL, ONE RUN AT A TIME. Every open notebook shares a single kernel, and
    a human may be running a cell in it right now. Your run is never dropped: it
@@ -187,7 +191,7 @@ function registerTools(server) {
 	});
 
 	// --- write ---
-	server.registerTool('add_cell', { description: `Add a cell (optionally after a cell), of type code|markdown, with optional source.${ROUTE_IMPORTS_DOC}`, inputSchema: { after_id: z.string().optional(), cell_type: z.enum(['code', 'markdown']).optional(), source: z.string().optional(), route_imports: z.boolean().optional() } }, async ({ after_id, cell_type, source, route_imports }) => {
+	server.registerTool('add_cell', { description: `Add a cell (optionally after a cell), of type code|markdown, with optional source. Adds only - it does NOT run or render the cell (a markdown cell added this way stays raw source until rendered; prefer add_and_run for markdown).${ROUTE_IMPORTS_DOC}`, inputSchema: { after_id: z.string().optional(), cell_type: z.enum(['code', 'markdown']).optional(), source: z.string().optional(), route_imports: z.boolean().optional() } }, async ({ after_id, cell_type, source, route_imports }) => {
 		const { ids, imports } = await svc.addCells([{ cell_type, source }], after_id, { routeImports: route_imports ?? true });
 		// Source that was nothing but imports creates no cell of its own — they went
 		// straight to the imports cell, which is then the cell this call produced.
@@ -207,8 +211,8 @@ function registerTools(server) {
 	server.registerTool('set_cell_visibility', { description: 'Show/hide a cell from the agent (cellar.hidden_from_agent).', inputSchema: { id: z.string(), hidden: z.boolean() } }, async ({ id, hidden }) => (svc.setCellVisibility(id, hidden) ? text({ ok: true, id, hidden }) : notFound(`cell ${id} not found`)));
 
 	// --- execute ---
-	server.registerTool('add_and_run', { description: `PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|markdown cell (default code) with the given source, after a cell (after_id) or appended at the end, runs it, and returns run_cell's result (status + outputs) plus the new cell id. Code that raises returns the error as the result (does not fail — the cell still exists). A markdown cell_type is created but not run (status "skipped"), same as run_cell — for markdown use add_cell. Use add_cell (no run) only when you want to add a cell WITHOUT running it.${ROUTE_IMPORTS_DOC} Routing happens BEFORE this cell runs, so an import it needs is already in the kernel. Source that is ONLY imports creates no cell at all (they go straight to the imports cell) and returns routed_to_imports:true.`, inputSchema: { source: z.string(), cell_type: z.enum(['code', 'markdown']).optional(), after_id: z.string().optional(), route_imports: z.boolean().optional() } }, async ({ source, cell_type, after_id, route_imports }) => text(await svc.addAndRun({ source, cellType: cell_type, afterId: after_id, routeImports: route_imports ?? true })));
-	server.registerTool('run_cell', { description: 'Run one cell by UUID (markdown cells are skipped). One shared kernel means one run at a time app-wide: if the kernel is busy your run is QUEUED (never dropped) and this call waits its turn, then returns the real outputs annotated queued:true + queue_position + waited_ms. If that cell is ALREADY queued (or running) it is not enqueued twice - the call returns immediately with status "queued" (or "running") and its queue_position; a pending run has its source refreshed to the current one. status "cancelled" means an interrupt/restart dropped the queued run before it started; nothing executed. See run_queue.', inputSchema: { id: z.string() } }, async ({ id }) => { const r = await svc.runCell(id); return r ? text(r) : notFound(`cell ${id} not found`); });
+	server.registerTool('add_and_run', { description: `PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|markdown cell (default code) with the given source, after a cell (after_id) or appended at the end, runs it, and returns run_cell's result (status + outputs) plus the new cell id. Code that raises returns the error as the result (does not fail — the cell still exists). A markdown cell_type is created AND rendered (markdown does not execute on the kernel - running it renders it, status "rendered"); this is the way to add markdown so it shows rendered rather than raw source. Use add_cell (no run) only when you want to add a cell WITHOUT running/rendering it.${ROUTE_IMPORTS_DOC} Routing happens BEFORE this cell runs, so an import it needs is already in the kernel. Source that is ONLY imports creates no cell at all (they go straight to the imports cell) and returns routed_to_imports:true.`, inputSchema: { source: z.string(), cell_type: z.enum(['code', 'markdown']).optional(), after_id: z.string().optional(), route_imports: z.boolean().optional() } }, async ({ source, cell_type, after_id, route_imports }) => text(await svc.addAndRun({ source, cellType: cell_type, afterId: after_id, routeImports: route_imports ?? true })));
+	server.registerTool('run_cell', { description: 'Run one cell by UUID. Running a markdown cell RENDERS it (no code executes) and returns status "rendered"; use this (or add_and_run) so markdown shows rendered rather than raw source. One shared kernel means one run at a time app-wide: if the kernel is busy your run is QUEUED (never dropped) and this call waits its turn, then returns the real outputs annotated queued:true + queue_position + waited_ms. If that cell is ALREADY queued (or running) it is not enqueued twice - the call returns immediately with status "queued" (or "running") and its queue_position; a pending run has its source refreshed to the current one. status "cancelled" means an interrupt/restart dropped the queued run before it started; nothing executed. See run_queue.', inputSchema: { id: z.string() } }, async ({ id }) => { const r = await svc.runCell(id); return r ? text(r) : notFound(`cell ${id} not found`); });
 	server.registerTool('run_cells', { description: 'Run multiple cells in order, each waiting its turn in the kernel queue. Stops at the first cell whose queued run an interrupt/restart cancelled (status "cancelled") - the rest would run against a namespace their predecessors never populated.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(await svc.runCells(ids)));
 	server.registerTool('run_all', { description: 'Run all code cells in document order (same queueing + cancellation semantics as run_cells).', inputSchema: {} }, async () => text(await svc.runAll()));
 	server.registerTool('run_stale', { description: 'Re-run every STALE code cell (a cell that ran this session but whose inputs changed since) in dependency order, bringing the notebook back in sync with its current code. Returns {ran:[ids], results}. Use this after editing an upstream cell instead of hunting down every downstream cell by hand; see stale_cells in kernel_state / stale_state in get_notebook_map for what is stale. Same queueing + cancellation semantics as run_cells.', inputSchema: {} }, async () => text(await svc.runStale()));

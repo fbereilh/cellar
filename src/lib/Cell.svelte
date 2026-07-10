@@ -539,6 +539,15 @@
 			enterEdit,
 			editorOverlayOpen,
 			run: doRun,
+			// Flip a markdown cell to its rendered view. Markdown never executes on the
+			// kernel, so "running" it (agent run_cell / add_and_run) means rendering it;
+			// LiveNotebook invokes this from the server's `cell:rendered` event. View-only
+			// (no persist, no run) so it never touches the .ipynb. No-op for code cells.
+			showRendered: () => {
+				if (!isMarkdown) return;
+				liveSource = currentSource();
+				mode = 'rendered';
+			},
 			isMarkdown: () => isMarkdown,
 			// Primitives the notebook's cut/copy, heading and split actions compose.
 			// `currentSource` is the editor's live text (never the debounced

@@ -482,6 +482,12 @@
 		} else if (ev.type === 'cell:cleared') {
 			const cell = findCell(ev.cellId);
 			if (cell) cell.outputs = [];
+		} else if (ev.type === 'cell:rendered') {
+			// A markdown cell was "run" (agent run_cell / add_and_run). Markdown doesn't
+			// execute on the kernel; running it renders it, so flip the cell to its
+			// rendered view. View-only (no doc mutation, no staleness recompute).
+			cellApis[ev.cellId]?.showRendered?.();
+			return;
 		} else if (ev.type === 'cell:edited') {
 			// Don't blindly overwrite the editor: hand the new source to the Cell,
 			// which applies it only when the user isn't actively editing that cell
