@@ -1,16 +1,23 @@
 /**
- * Cellar — workspace git status (shell sidebar file tree decorations).
+ * Cellar — workspace git status (shell sidebar file tree decorations) and
+ * git-HEAD baselines (editor gutter + notebook cell change decorations).
  *
- * Reports per-file git status for the workspace so the file tree can decorate
- * entries the way VS Code does (colored name + status letter, folder rollup).
+ * `gitStatus()` reports per-file status so the file tree can decorate entries
+ * the way VS Code does (colored name + status letter, folder rollup).
+ * `gitHeadFile()` hands out one file's content at HEAD, which the browser diffs
+ * the live buffer against (see `src/lib/gitdiff.js`) — diffing client-side keeps
+ * the markers live as you type without a `git` process per keystroke.
+ *
  * Everything degrades gracefully when the workspace is not a git repository:
- * `isRepo:false` and an empty map, never an error.
+ * `isRepo:false`, never an error.
  *
  * Independent of the notebook document/kernel — this only shells out to `git`
  * with the workspace root as the working directory.
  */
 import { execFile } from 'node:child_process';
-import { workspaceRoot } from './fstree.js';
+import { workspaceRoot, resolveInWorkspace } from './fstree.js';
+
+const MAX_GIT_BUFFER = 8 * 1024 * 1024;
 
 /**
  * Collapse a two-char porcelain XY code into a single display letter, matching
@@ -112,4 +119,44 @@ export async function gitStatus() {
 	if (stdout == null) return { isRepo: false, files: {} };
 	const prefix = await runPrefix(root);
 	return { isRepo: true, files: parse(stdout, prefix) };
+}
+
+/** Run a git subcommand at the workspace root; `null` on any failure. */
+function runGit(root, args) {
+	return new Promise((resolve) => {
+		execFile('git', ['-C', root, ...args], { maxBuffer: MAX_GIT_BUFFER }, (err, stdout) => {
+			resolve(err ? null : stdout);
+		});
+	});
+}
+
+/**
+ * One workspace file's content as of git HEAD — the baseline the editor and the
+ * notebook diff against.
+ *
+ * `tracked:false` (with `content:null`) covers every case where HEAD has nothing
+ * to compare against: not a repo, no commits yet, an untracked or newly-added
+ * file, or a binary blob. Callers show no decorations then, exactly as VS Code
+ * leaves a brand-new file's gutter empty — the file tree's `U`/`A` letter is
+ * already the whole story.
+ *
+ * @param {string} relPath Workspace-relative path (path-guarded).
+ * @returns {Promise<{isRepo: boolean, tracked: boolean, content: string|null}>}
+ */
+export async function gitHeadFile(relPath) {
+	const root = workspaceRoot();
+	resolveInWorkspace(relPath); // throws if the path escapes the workspace
+	const rel = String(relPath ?? '').replace(/\\/g, '/');
+	if (!rel) throw new Error('path required');
+
+	if ((await runGit(root, ['rev-parse', '--is-inside-work-tree'])) == null) {
+		return { isRepo: false, tracked: false, content: null };
+	}
+	// Porcelain paths (and `git show`'s object syntax) are repo-root-relative.
+	const prefix = await runPrefix(root);
+	const content = await runGit(root, ['show', `HEAD:${prefix}${rel}`]);
+	if (content == null) return { isRepo: true, tracked: false, content: null };
+	// A NUL byte means a binary blob; there is no line diff to draw.
+	if (content.includes('\0')) return { isRepo: true, tracked: false, content: null };
+	return { isRepo: true, tracked: true, content };
 }

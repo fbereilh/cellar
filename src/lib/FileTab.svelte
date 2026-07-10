@@ -1,5 +1,5 @@
 <script>
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { EditorView, keymap } from '@codemirror/view';
 	import { EditorState, Prec, Compartment } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
@@ -10,15 +10,20 @@
 	import { StreamLanguage } from '@codemirror/language';
 	import { toml as tomlMode } from '@codemirror/legacy-modes/mode/toml';
 	import { editorThemeExtensions } from '$lib/editorTheme.js';
+	import { gitGutterExtension, setGitBaseline } from '$lib/gitGutter.js';
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports
-	// dirty state up so the tab bar can show the unsaved indicator.
-	let { path, onDirty, theme = 'dim' } = $props();
+	// dirty state up so the tab bar can show the unsaved indicator. `gitRefresh`
+	// is the shell's `fsRefreshSignal`: a bump means the workspace's git state may
+	// have moved, so re-fetch the HEAD baseline the gutter diffs against.
+	let { path, onDirty, theme = 'dim', gitRefresh = 0 } = $props();
 
 	const editorTheme = new Compartment();
 
 	let editorEl;
-	let view;
+	// `$state.raw` so the git-baseline effect below re-runs once the editor exists,
+	// without Svelte proxying the EditorView itself.
+	let view = $state.raw(null);
 	let status = $state('loading'); // 'loading' | 'ready' | 'error'
 	let errorMsg = $state('');
 	let dirty = $state(false);
@@ -75,6 +80,40 @@
 		if (view) view.dispatch({ effects: editorTheme.reconfigure(extensions) });
 	});
 
+	// ---- Git change bars (gutter) --------------------------------------------
+	// Fetch the file's git-HEAD text and hand it to the gutter extension, which
+	// re-diffs the live document against it on every edit. An untracked file (or a
+	// workspace that isn't a repo) has no baseline → no bars, like VS Code.
+	async function loadGitBaseline() {
+		if (!view) return;
+		let baseline = null;
+		try {
+			const res = await fetch(`/api/fs/git/head?path=${encodeURIComponent(path)}`);
+			const body = await res.json();
+			if (res.ok && body.tracked) baseline = body.content;
+		} catch {}
+		// The editor may have been torn down while the request was in flight.
+		view?.dispatch({ effects: setGitBaseline.of(baseline) });
+	}
+
+	// Re-baseline when the editor appears, and whenever the shell signals that the
+	// workspace's git state may have moved (a save, a file op, a tree refresh).
+	$effect(() => {
+		gitRefresh;
+		if (view) loadGitBaseline();
+	});
+
+	// A commit / checkout / stash made outside Cellar changes HEAD under us.
+	onMount(() => {
+		const onFocus = () => loadGitBaseline();
+		window.addEventListener('focus', onFocus);
+		return () => window.removeEventListener('focus', onFocus);
+	});
+
+	// An `async` onMount returns a promise, so its return value is never used as a
+	// cleanup — the editor is torn down here instead.
+	onDestroy(() => view?.destroy());
+
 	onMount(async () => {
 		let content = '';
 		try {
@@ -96,6 +135,9 @@
 				extensions: [
 					basicSetup,
 					langFor(path),
+					// After `basicSetup` so the change bar is the rightmost gutter, hard
+					// against the code (VS Code's placement).
+					gitGutterExtension(),
 					editorTheme.of(editorThemeExtensions(theme)),
 					Prec.highest(keymap.of([{ key: 'Mod-s', run: () => (save(), true) }])),
 					EditorView.updateListener.of((v) => {
@@ -109,8 +151,6 @@
 				]
 			})
 		});
-
-		return () => view?.destroy();
 	});
 </script>
 

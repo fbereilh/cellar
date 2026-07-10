@@ -13,6 +13,9 @@
 		hidden = new Set(), // cell ids hidden because a folded heading collapsed their section
 		foldedIds = new Set(), // markdown-header cell ids whose section is folded
 		hiddenCounts = {}, // folded-header cell id → number of cells it hides
+		gitStatus = {}, // cell id → 'added' | 'modified' | 'moved' (vs git HEAD)
+		gitRemovedBefore = {}, // cell id → cells deleted from HEAD immediately above it
+		gitRemovedAtEnd = 0, // cells deleted from the end of HEAD's notebook
 		onToggleFold,
 		onRun,
 		onRunAdvance,
@@ -75,7 +78,39 @@
 		dropIndex = null;
 		dropAtEnd = false;
 	}
+
+	// ---- Git cell decorations -------------------------------------------------
+	// A per-cell accent bar in the notebook's left margin: the cell-level analogue
+	// of VS Code's editor gutter change bars. Green = a cell HEAD doesn't have,
+	// blue = its source (or type) changed, violet = same content, new position.
+	// A deleted cell has no cell of its own to decorate, so it surfaces as a
+	// dashed seam at the gap it left behind. Colors come from the shared
+	// `--cellar-git-*` palette (`app.css`), which follows the light/dark theme.
+	const GIT_COLOR = {
+		added: 'var(--cellar-git-added)',
+		modified: 'var(--cellar-git-modified)',
+		moved: 'var(--cellar-git-moved)'
+	};
+	const GIT_TITLE = {
+		added: 'Added since the last commit',
+		modified: 'Modified since the last commit',
+		moved: 'Moved since the last commit'
+	};
+	const removedLabel = (n) => `${n} ${n === 1 ? 'cell' : 'cells'} removed`;
 </script>
+
+{#snippet removedSeam(n)}
+	<div
+		class="flex items-center gap-2 text-[11px]"
+		style="color: var(--cellar-git-removed)"
+		data-testid="cell-removed-seam"
+		title={`${removedLabel(n)} since the last commit`}
+	>
+		<span class="h-0 flex-1 border-t border-dashed opacity-50" style="border-color: var(--cellar-git-removed)"></span>
+		<span class="whitespace-nowrap opacity-80">{removedLabel(n)}</span>
+		<span class="h-0 flex-1 border-t border-dashed opacity-50" style="border-color: var(--cellar-git-removed)"></span>
+	</div>
+{/snippet}
 
 <!-- Fluid content column: fills the available width up to a readable cap, so
      cells use more horizontal space on wide monitors without going full-bleed
@@ -83,6 +118,9 @@
 <div class="mx-auto w-full max-w-[clamp(48rem,92%,88rem)] px-4 py-6" data-testid="notebook">
 	<div class="space-y-4">
 		{#each cells as cell, i (cell.id)}
+			{#if gitRemovedBefore[cell.id] && !hidden.has(cell.id)}
+				{@render removedSeam(gitRemovedBefore[cell.id])}
+			{/if}
 			<div
 				role="presentation"
 				class="relative"
@@ -90,6 +128,17 @@
 				ondragover={(e) => onDragOverCell(e, i)}
 				ondrop={(e) => onDropCell(e, i)}
 			>
+				<!-- Git change bar: sits in the content column's left padding, outside
+				     the card (whose own left accent already means selected / running). -->
+				{#if gitStatus[cell.id]}
+					<div
+						class="absolute inset-y-0 -left-3 w-1 rounded-full"
+						style="background-color: {GIT_COLOR[gitStatus[cell.id]]}"
+						title={GIT_TITLE[gitStatus[cell.id]]}
+						data-testid="cell-git-bar"
+						data-git={gitStatus[cell.id]}
+					></div>
+				{/if}
 				<!-- Insertion indicator (top or bottom edge of the hovered cell). -->
 				{#if dragId != null && dropIndex === i}
 					<div
@@ -128,6 +177,9 @@
 				/>
 			</div>
 		{/each}
+		{#if gitRemovedAtEnd}
+			{@render removedSeam(gitRemovedAtEnd)}
+		{/if}
 	</div>
 
 	<div class="mt-4 flex justify-center gap-2">
