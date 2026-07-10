@@ -19,13 +19,19 @@
 //      `light-dark()` reads the resolved `color-scheme`, never a theme-name
 //      allowlist.
 //
-// The palettes are unchanged: light is pygments "default" (the standard Jupyter
-// light syntax scheme) on the grey editor surface; dark is One Dark, ported
+// The palettes: light is pygments "default" (the standard Jupyter light syntax
+// scheme) on the faintly-tinted editor surface; dark is One Dark, ported
 // verbatim from `@codemirror/theme-one-dark`. Because both now live in one
 // static theme, the editor never sets CodeMirror's `dark` flag, so this theme
 // must supply every color the library's own `&light`/`&dark` base rules would
 // otherwise have picked - hence the long list below (panels, tooltips, buttons
 // and text fields are the search panel and the autocomplete popup).
+//
+// One rule about backgrounds: paint the editor surface on `&` (`.cm-editor`)
+// and NOWHERE below it. `drawSelection` renders the selection into
+// `.cm-selectionLayer`, a sibling of `.cm-content` at `z-index: -2`, so any
+// opaque background on `.cm-content` (or `.cm-scroller`) hides every selection
+// rectangle behind it.
 
 import { EditorView } from '@codemirror/view';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
@@ -35,7 +41,13 @@ const c = (name) => `var(--cellar-cm-${name})`;
 
 const cellarEditorTheme = EditorView.theme({
 	'&': { color: c('fg'), backgroundColor: c('bg') },
-	'.cm-content': { backgroundColor: c('bg'), caretColor: c('cursor') },
+	// No `backgroundColor` here. `drawSelection` paints the selection into
+	// `.cm-selectionLayer`, a *sibling* of `.cm-content` at `z-index: -2`, so an
+	// opaque `.cm-content` background paints straight over every selection
+	// rectangle. What survived was `.cm-activeLine`, a full-width tint on a child
+	// of `.cm-content` - so dragging across a few characters looked like the whole
+	// line highlighting. `&` above already paints the editor surface.
+	'.cm-content': { caretColor: c('cursor') },
 	'.cm-cursor, .cm-dropCursor': { borderLeftColor: c('cursor') },
 	'&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection':
 		{ backgroundColor: c('selection') },

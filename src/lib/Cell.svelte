@@ -786,7 +786,7 @@
 			<div
 				bind:this={editorEl}
 				aria-label="cell source"
-				class="overflow-auto px-3 {isMarkdown ? 'max-h-96' : collapsed ? 'max-h-[36rem]' : ''}"
+				class="overflow-auto {isMarkdown ? 'max-h-96' : collapsed ? 'max-h-[36rem]' : ''}"
 				data-testid="editor-scroll"
 				data-collapsed={collapsed ? 'true' : undefined}
 			></div>
