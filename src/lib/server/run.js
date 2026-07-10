@@ -18,7 +18,7 @@
  *   finally { ticket.done(); }
  */
 import { execute } from './kernel.js';
-import { setOutputs, setLastRun } from './notebook.js';
+import { setOutputs, setLastRun, clearOutputsLive } from './notebook.js';
 import { publish } from './events.js';
 
 /**
@@ -41,6 +41,11 @@ import { publish } from './events.js';
  */
 export async function executeCellRun({ nb, cellId, actor, source, originId, onEvent }) {
 	const startedAt = Date.now();
+	// Clear stale output the moment execution starts (the caller already holds the
+	// kernel, so this is post-queue): the browser clears on the `run:start` frame
+	// below, and this keeps the live in-memory model in step so a tab loading
+	// mid-run reads an empty cell rather than the prior run's outputs.
+	clearOutputsLive(cellId, nb);
 	publish({ type: 'run:start', nb, cellId, actor, at: startedAt, originId });
 	onEvent?.({ type: 'run:start', cellId, at: startedAt });
 
