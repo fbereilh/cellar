@@ -68,6 +68,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execute, currentSessionId } from './kernel.js';
 import { publishGlobal } from './events.js';
+import { logInfo, logWarn, logError } from './logs.js';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
 
 /** Line prefix both the subprocess and the kernel bootstrap print their JSON result on. */
@@ -495,19 +496,34 @@ function probe(request, timeoutMs = PROBE_TIMEOUT_MS) {
 		child.stderr.on('data', (d) => (stderr += d));
 		child.on('error', (err) => {
 			clearTimeout(timer);
+			logError('databricks', `could not run probe (${request.op}): ${err.message}`);
 			reject(new DatabricksError('no_python', `could not run ${python}: ${err.message}`));
 		});
 		child.on('exit', () => {
 			clearTimeout(timer);
+			// The subprocess's raw stderr is exactly the underlying detail the friendly
+			// UI copy hides (a traceback, a TLS/connection error, an SDK deprecation),
+			// so surface it in the log panel even on an otherwise "ok" result.
+			const err = stderr.trim();
+			if (err) logWarn('databricks', `probe stderr (${request.op}): ${err}`);
 			const line = stdout.split('\n').find((l) => l.startsWith(SENTINEL));
 			if (!line) {
 				// The script always prints one; getting here means python itself died.
+				logError('databricks', `probe (${request.op}) produced no result${err ? '' : ' and no stderr'}`);
 				reject(new DatabricksError('error', stderr.trim() || 'the Databricks probe produced no result'));
 				return;
 			}
 			try {
-				resolve(JSON.parse(line.slice(SENTINEL.length)));
+				const result = JSON.parse(line.slice(SENTINEL.length));
+				// The probe never raises; a failure comes back as {ok:false, code, message}.
+				// That message carries the REAL cause (`Exc: detail`) - record it so the
+				// user sees why the op failed, beyond the friendly sidebar text.
+				if (result && result.ok === false) {
+					logError('databricks', `${request.op} failed [${result.code || 'error'}]: ${result.message || 'unknown error'}`);
+				}
+				resolve(result);
 			} catch (err) {
+				logError('databricks', `unparseable probe result (${request.op}): ${err.message}`);
 				reject(new DatabricksError('error', `unparseable probe result: ${err.message}`));
 			}
 		});
@@ -773,10 +789,14 @@ async function runInKernel(code) {
 		// unreachable. That is a Cellar problem, not a Databricks one, and saying so
 		// is the difference between the user restarting Cellar and them re-checking a
 		// token that was never the issue.
+		logError('databricks', `kernel unreachable during Databricks op: ${err?.message ?? err}`);
 		throw new DatabricksError('kernel_unavailable', `the Python kernel could not be reached: ${err?.message ?? err}`);
 	}
 	const line = stdout.split('\n').find((l) => l.startsWith(SENTINEL));
-	if (!line) throw new DatabricksError('error', kernelError || 'the kernel returned no result');
+	if (!line) {
+		if (kernelError) logError('databricks', `kernel error during Databricks op: ${kernelError}`);
+		throw new DatabricksError('error', kernelError || 'the kernel returned no result');
+	}
 	return { result: JSON.parse(line.slice(SENTINEL.length)), session };
 }
 
@@ -823,11 +843,13 @@ export async function connect({ profile, host, clusterId, clusterName }) {
 	if (inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
 	inFlight = true;
 	try {
+		logInfo('databricks', `connecting: profile "${profile}", cluster "${clusterName || clusterId}"`);
 		const { result, session } = await runInKernel(CONNECT_CODE({ auth, cluster_id: clusterId }));
 		if (!result.ok) {
 			connection = null;
 			connectedSel = null;
 			publishGlobal({ type: 'databricks:changed' });
+			logError('databricks', `connect failed [${result.code || 'error'}]: ${result.message || 'unknown error'}`);
 			throw new DatabricksError(result.code || 'error', result.message);
 		}
 		connection = {
@@ -842,6 +864,7 @@ export async function connect({ profile, host, clusterId, clusterName }) {
 		connectedSel = auth.mode === 'pat' ? { profile } : { host: connection.host };
 		lost = null;
 		publishGlobal({ type: 'databricks:changed' });
+		logInfo('databricks', `connected: host ${result.host ?? '?'}, spark ${result.spark_version ?? '?'}`);
 		return { ok: true, connection: connectionStatus() };
 	} finally {
 		inFlight = false;

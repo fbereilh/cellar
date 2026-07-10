@@ -8,6 +8,7 @@
 	import CommandPalette from '$lib/CommandPalette.svelte';
 	import { buildCommands } from '$lib/commands.js';
 	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte.js';
+	import LogsPanel from '$lib/LogsPanel.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client.js';
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState.js';
 
@@ -126,6 +127,40 @@
 	let paletteOpen = $state(false);
 	let theme = $state('dim');
 	const mcp = data.mcp;
+
+	// ---- Logs drawer (bottom console) ---------------------------------------
+	const LOGS_OPEN_KEY = 'cellar-logs-open';
+	const LOGS_HEIGHT_KEY = 'cellar-logs-height';
+	const LOGS_MIN = 120;
+	const LOGS_MAX = 640;
+	let logsOpen = $state(false);
+	let logsHeight = $state(220);
+	let logsResizing = $state(false);
+	// Errors that streamed in while the drawer was closed → a red dot on the toggle.
+	let logsUnseenErrors = $state(0);
+	function toggleLogs() {
+		logsOpen = !logsOpen;
+		if (logsOpen) logsUnseenErrors = 0;
+		setUi(LOGS_OPEN_KEY, logsOpen ? '1' : '0');
+	}
+	function startLogsResize(e) {
+		logsResizing = true;
+		const startY = e.clientY;
+		const startH = logsHeight;
+		e.preventDefault();
+		function onMove(ev) {
+			// Drag up (smaller clientY) grows the drawer.
+			logsHeight = Math.min(LOGS_MAX, Math.max(LOGS_MIN, startH + (startY - ev.clientY)));
+		}
+		function onUp() {
+			logsResizing = false;
+			window.removeEventListener('pointermove', onMove);
+			window.removeEventListener('pointerup', onUp);
+			setUi(LOGS_HEIGHT_KEY, String(logsHeight));
+		}
+		window.addEventListener('pointermove', onMove);
+		window.addEventListener('pointerup', onUp);
+	}
 
 	// Tabs are restored from per-workspace session memory on mount; a first-ever
 	// open starts empty (no tab → empty state). Each tab may be a transient
@@ -514,6 +549,11 @@
 		restoreTabs();
 		const w = Number(getUi(SIDEBAR_WIDTH_KEY, 0));
 		if (w) sidebarWidth = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, w));
+		// Restore the logs drawer (open state + height) from the same
+		// port-independent UI-state store as every other layout preference.
+		logsOpen = getUi(LOGS_OPEN_KEY, '0') === '1';
+		const h = Number(getUi(LOGS_HEIGHT_KEY, 0));
+		if (h) logsHeight = Math.min(LOGS_MAX, Math.max(LOGS_MIN, h));
 		// Restore live kernel + variables after a reload — but only inspect if a
 		// kernel already exists, so a fresh page load never boots one on its own.
 		refreshKernel().then(() => {
@@ -529,6 +569,11 @@
 	// `.ipynb` to a live `ipynb` tab — the same paths a tree double-click uses.
 	onMount(() =>
 		subscribeEvents((ev) => {
+			// Flag errors that arrive while the logs drawer is closed, so the status-bar
+			// toggle can show a red dot the user can act on.
+			if (ev.type === 'log' && ev.entry?.level === 'error' && !logsOpen) {
+				logsUnseenErrors += 1;
+			}
 			if (ev.type !== 'notebook:opened') return;
 			if (ev.originId && ev.originId === originId) return;
 			if (!ev.relPath) return;
@@ -706,8 +751,36 @@
 		</main>
 	</div>
 
+	<!-- Logs drawer: a resizable bottom console streaming server-side log lines. -->
+	{#if logsOpen}
+		<div
+			class="h-1 shrink-0 cursor-row-resize bg-base-300/40 hover:bg-primary/50 {logsResizing ? 'bg-primary/60' : ''}"
+			onpointerdown={startLogsResize}
+			role="separator"
+			aria-orientation="horizontal"
+			aria-label="Resize logs"
+			data-testid="logs-resizer"
+		></div>
+		<div class="shrink-0" style="height: {logsHeight}px">
+			<LogsPanel open={logsOpen} onClose={toggleLogs} />
+		</div>
+	{/if}
+
 	<footer class="flex items-center justify-between border-t border-base-300 bg-base-100 px-3 py-1 text-[11px] text-base-content/40">
-		<span class="truncate">workspace: <span class="font-mono">{workspace}</span></span>
+		<div class="flex items-center gap-3">
+			<button
+				class="flex items-center gap-1 rounded px-1 hover:bg-base-300/50 hover:text-base-content/70 {logsOpen ? 'text-base-content/70' : ''}"
+				onclick={toggleLogs}
+				data-testid="logs-toggle"
+				title="Toggle logs console"
+			>
+				<span>Logs</span>
+				{#if logsUnseenErrors > 0}
+					<span class="inline-flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-error px-1 text-[9px] font-semibold leading-none text-error-content" data-testid="logs-unseen">{logsUnseenErrors > 99 ? '99+' : logsUnseenErrors}</span>
+				{/if}
+			</button>
+			<span class="truncate">workspace: <span class="font-mono">{workspace}</span></span>
+		</div>
 		<span class="font-mono">{activeCells.length} cells</span>
 	</footer>
 </div>

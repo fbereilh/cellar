@@ -14,6 +14,7 @@
  */
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue.js';
+import { logInfo, logWarn, logError } from './logs.js';
 
 let kernelPromise = null;
 let liveKernel = null; // last-resolved kernel, for read-only status introspection
@@ -195,6 +196,7 @@ async function getKernel() {
 		// autorestart clears the namespace AND the matplotlib backend.
 		statusHandler = (_sender, status) => {
 			if (status !== 'autorestarting' || currentKernel !== kernel) return;
+			logWarn('kernel', 'kernel died and was autorestarted by jupyter_server; namespace cleared');
 			beginSession();
 			// The namespace queued work was submitted against is gone (see clearRunQueue).
 			clearRunQueue('kernel_autorestart');
@@ -202,10 +204,12 @@ async function getKernel() {
 		};
 		kernel.statusChanged.connect(statusHandler);
 		await initKernel(kernel);
+		logInfo('kernel', `kernel started (session ${sessionId})`);
 		return kernel;
 	})();
 	// If startup fails, allow a later retry.
-	kernelPromise.catch(() => {
+	kernelPromise.catch((err) => {
+		logError('kernel', `kernel failed to start: ${err?.message ?? err}`);
 		kernelPromise = null;
 	});
 	return kernelPromise;
