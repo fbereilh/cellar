@@ -12,6 +12,8 @@
 	import { md, renderMarkdown } from '$lib/markdown.js';
 	import { EDITOR_THEME } from '$lib/editorTheme.js';
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
+	import PlotlyOutput from '$lib/PlotlyOutput.svelte';
+	import HtmlOutput from '$lib/HtmlOutput.svelte';
 	import { foldKey, splitHeadingSegments } from '$lib/headings.js';
 	import { isImportsCell } from '$lib/importsRole.js';
 	import { relativeTime, formatDuration } from '$lib/relativeTime.js';
@@ -237,6 +239,17 @@
 				if (df) {
 					return { tone: 'result', dataframe: df, segments: null };
 				}
+				// Mimetype priority mirrors Jupyter: a rich bundle usually ships a
+				// text/plain fallback alongside its real payload, so the richer
+				// representation is chosen first.
+				//
+				// Plotly figures (`fig.show()` / the default renderer) emit
+				// `application/vnd.plotly.v1+json` = {data, layout, config}; render it
+				// as a live interactive chart (preferred over any text/html fallback).
+				const plotly = d['application/vnd.plotly.v1+json'];
+				if (plotly) {
+					return { tone: 'result', plotly, segments: null };
+				}
 				// Prefer a rich image over the text/plain repr: a matplotlib figure
 				// emits BOTH an image/png and its `<Figure … with N Axes>` text repr,
 				// and (like Jupyter) we show the image, not the placeholder text.
@@ -244,11 +257,20 @@
 				if (imgMime) {
 					return { tone: 'result', image: imageDataUrl(imgMime, d[imgMime]), segments: null };
 				}
+				// Rich text/html (Bokeh, Altair, folium, styled DataFrames, plotly's
+				// HTML renderer, …) renders in a sandboxed iframe so its embedded JS
+				// runs safely without touching the app.
+				if (d['text/html']) {
+					return { tone: 'result', html: asText(d['text/html']), segments: null };
+				}
 				if (d['text/plain']) {
 					tone = 'result';
 					text = asText(d['text/plain']);
 				} else {
-					return { tone: 'result', text: '[rich output]', segments: null };
+					// Last resort for a genuinely unhandled mimetype — name it so the
+					// gap is visible instead of a mute "[rich output]".
+					const mime = Object.keys(d)[0] || 'unknown';
+					return { tone: 'result', text: `[unsupported output: ${mime}]`, segments: null };
 				}
 				break;
 			}
@@ -293,7 +315,11 @@
 	// would double-scroll and clip content). When either is present, skip
 	// auto-contraction and hide the toggle entirely.
 	const hasDataframe = $derived(outputs.some((o) => o.dataframe));
-	const ownsScroll = $derived(hasDataframe || hasFullImage);
+	// Plotly charts and sandboxed HTML iframes own their own height/scroll (the
+	// chart resizes to its container, the iframe scrolls internally past its cap),
+	// so they must not also sit inside the outer output-scroll box.
+	const hasSelfSized = $derived(outputs.some((o) => o.plotly || o.html != null));
+	const ownsScroll = $derived(hasDataframe || hasFullImage || hasSelfSized);
 	const explicitScrolled = $derived(cell.metadata?.cellar?.output_scrolled);
 	const scrolled = $derived(ownsScroll ? false : (explicitScrolled ?? outputTall));
 	$effect(() => {
@@ -944,6 +970,14 @@
 							{#if o.dataframe}
 								<div class="px-3 py-1" data-testid="output-dataframe">
 									<DataFrameGrid payload={o.dataframe} />
+								</div>
+							{:else if o.plotly}
+								<div class="px-3 py-1" data-testid="output-plotly-wrap">
+									<PlotlyOutput figure={o.plotly} />
+								</div>
+							{:else if o.html != null}
+								<div class="px-3 py-1" data-testid="output-html-wrap">
+									<HtmlOutput html={o.html} />
 								</div>
 							{:else if o.image}
 								{@const full = fullImages.has(i)}
