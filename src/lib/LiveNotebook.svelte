@@ -24,7 +24,11 @@
 	// "Follow the agent" below). Never used for visuals; the running affordance
 	// keys off `runningId` for all runs alike.
 	let agentRunningId = $state(null);
-	let rootEl = $state(null); // this notebook's DOM subtree; cell ids repeat across notebooks
+	let keyMode = $state('command'); // 'command' | 'edit' (visuals only; the dispatcher reads the DOM)
+	// This notebook's DOM subtree. Scopes the modal-keyboard handler and cell
+	// lookups (ids repeat across the open, still-mounted notebooks), and takes
+	// focus when the tab activates - so it must be a real, focusable box.
+	let rootEl = $state(null);
 
 	// Canonical (absolute) notebook id, learned from the server on load. The shell
 	// addresses this component by a workspace-relative `path` (fine for the REST
@@ -166,7 +170,10 @@
 		return r.top >= view.top - 4 && r.top <= view.bottom - Math.min(r.height, 96);
 	}
 
-	function scrollCellIntoView(el) {
+	// Bring a cell the *agent* is running into view: center it when it fits, else
+	// pin its top. Distinct from `scrollCellIntoView` (keyboard selection), which
+	// wants the smallest possible movement, not a deliberate reframing.
+	function scrollElementIntoView(el) {
 		const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 		const behavior = reduce ? 'auto' : 'smooth';
 		const parent = scrollParent(el);
@@ -210,7 +217,7 @@
 		// across documents, and every open notebook stays mounted (hidden).
 		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
 		if (!el || cellIsVisible(el)) return;
-		scrollCellIntoView(el);
+		scrollElementIntoView(el);
 	}
 
 	// Follow on agent `run:start`, and also when the user switches to this tab
@@ -431,8 +438,8 @@
 	// still on whatever opened it (a file-tree button) and `j`/`k` do nothing
 	// until the user clicks a cell. Never steals focus from an editor in use.
 	$effect(() => {
-		if (!active || fetching || !root) return;
-		if (!root.contains(document.activeElement)) root.focus({ preventScroll: true });
+		if (!active || fetching || !rootEl) return;
+		if (!rootEl.contains(document.activeElement)) rootEl.focus({ preventScroll: true });
 	});
 
 	async function runCell(id, source) {
@@ -653,7 +660,7 @@
 	function scrollCellIntoView(id) {
 		// Scope to this notebook: several notebooks stay mounted (hidden), and a
 		// cell id is only unique *within* a document.
-		const el = root?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
+		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
 		el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 	}
 
@@ -753,7 +760,7 @@
 		if (!inEditor && t?.closest?.('input, textarea, select, [contenteditable="true"]')) return;
 		// Only keystrokes aimed at this notebook (or at no element at all, which is
 		// where focus lands after Escape) are ours; the sidebar keeps its own keys.
-		if (!(t === document.body || root?.contains(t))) return;
+		if (!(t === document.body || rootEl?.contains(t))) return;
 		const mode = inEditor ? 'edit' : 'command';
 		// Let a focused control keep its native activation keys.
 		if (mode === 'command' && (chord === 'Enter' || chord === 'Space') && t?.closest?.('button, a, [role="button"]')) return;
@@ -788,15 +795,19 @@
 		<p class="px-2 text-sm text-base-content/40">loading…</p>
 	</div>
 {:else}
-	<!-- `display:contents` - a layout-neutral handle on this notebook's subtree,
-	     used to scope cell lookups (ids repeat across open notebooks) and the
-	     typing guard. -->
-	<div class="contents" bind:this={rootEl}>
+	<!-- `rootEl` scopes the modal-keyboard handler, the typing guard and cell
+	     lookups to THIS notebook: several notebooks stay mounted (hidden) and a
+	     cell id is only unique within one document. It also takes focus when the
+	     tab activates, so it is a real box, not `display:contents`. The scroll
+	     pane is the shell's `overflow-y-auto` ancestor, so this stays layout-neutral. -->
+	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+	<div bind:this={rootEl} tabindex="-1" class="outline-none" data-testid="notebook-root">
 		<Notebook
 			{cells}
 			{theme}
 			runningId={runningId}
 			{activeId}
+			{keyMode}
 			hidden={folding.hidden}
 			foldedIds={foldedIds}
 			hiddenCounts={folding.counts}
@@ -813,7 +824,9 @@
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}
 			onActivate={setActive}
-			onReady={registerFocus}
+			onRegister={registerCell}
+			onEditorFocus={onEditorFocus}
+			onEditorBlur={onEditorBlur}
 			onAddCell={addCell}
 		/>
 	</div>
