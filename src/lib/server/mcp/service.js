@@ -28,6 +28,7 @@ import {
 } from '../notebook.js';
 import { execute, restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel.js';
 import { kernelState } from '../inspect.js';
+import { agentStatus as databricksStatus, forAgent as databricksCatalog, previewTable } from '../databricks.js';
 import { publish } from '../events.js';
 import { enqueueRun, queueState, queuePosition } from '../run-queue.js';
 import { buildTree } from '../fstree.js';
@@ -312,17 +313,43 @@ export function getNotebookMap() {
 		}
 	}
 	const nb = getNotebook();
-	return { notebook: nb.path, kernel: kernelSession(), cell_count: cells.length, sections: root };
+	return { notebook: nb.path, kernel: kernelSession(), databricks: databricksStatus(), cell_count: cells.length, sections: root };
 }
 
 /**
  * Live kernel namespace, bucketed into imports / functions / classes /
  * variables. Returns `{ started: false }` when no kernel is running rather than
  * forcing a boot.
+ *
+ * Carries the Databricks connection alongside it, because `spark` and `w` are
+ * exactly the kind of namespace fact this tool exists to report - and an agent
+ * that knows a live cluster session is bound will use it instead of writing the
+ * connection boilerplate this integration replaces. The flag is epoch-checked
+ * against the same kernel session the namespace was read from, so a restart that
+ * destroyed `spark` reads as disconnected here too.
  */
-export function getKernelState() {
-	return kernelState();
+export async function getKernelState() {
+	return { ...(await kernelState()), databricks: databricksStatus() };
 }
+
+/**
+ * Agent-facing Databricks tools. The Unity Catalog listings reuse the *same*
+ * server-side SDK plumbing as the UI's data browser (`databricks.js`), so the
+ * two views can never disagree; `preview` reads through the kernel's `spark`
+ * without touching the notebook - an agent peeking at a table must not append a
+ * cell to the human's document (the UI's own preview deliberately does, since
+ * there the cell IS the deliverable).
+ *
+ * Every one of these throws a `DatabricksError` with code `not_connected` when
+ * there is no live session. Connecting stays a human action, in the sidebar.
+ */
+export const databricks = {
+	status: () => databricksStatus(),
+	catalogs: () => databricksCatalog.catalogs(),
+	schemas: (catalog) => databricksCatalog.schemas(catalog),
+	tables: (catalog, schema) => databricksCatalog.tables(catalog, schema),
+	preview: (name, limit) => previewTable({ name, limit })
+};
 
 export function readCell(id, sid = currentSessionId()) {
 	const c = getCell(id);

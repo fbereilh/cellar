@@ -306,15 +306,21 @@ export async function execute(code, onEvent, { internal = false } = {}) {
 /**
  * Read-only snapshot of the current kernel for the sidebar's Kernels section.
  * Does NOT start a kernel — reports `started: false` until the first execute().
+ *
+ * `session_id` is the epoch (see above). It is what lets a client notice that a
+ * restart replaced the namespace - the kernel id survives a `restart()`, so it
+ * cannot answer that question. The Databricks section re-checks its `spark`
+ * session on every change to it.
  */
 export function getKernelInfo() {
 	if (!liveKernel) {
-		return { started: false, id: null, name: 'python3', status: 'not started' };
+		return { started: false, id: null, name: 'python3', status: 'not started', session_id: null };
 	}
 	return {
 		started: true,
 		id: liveKernel.id,
 		name: liveKernel.name || 'python3',
-		status: liveKernel.status // 'idle' | 'busy' | 'starting' | 'dead' | …
+		status: liveKernel.status, // 'idle' | 'busy' | 'starting' | 'dead' | …
+		session_id: currentSessionId()
 	};
 }

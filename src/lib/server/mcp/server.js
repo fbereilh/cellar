@@ -21,6 +21,20 @@ const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, nul
 const notFound = (msg) => ({ content: [{ type: 'text', text: msg }], isError: true });
 
 /**
+ * Run a Databricks tool, turning its structured failure into a structured tool
+ * error. `code` (`not_connected`, `sdk_missing`, `permission_denied`, …) is the
+ * part an agent can act on - losing it to a bare string would leave "ask the
+ * user to connect" indistinguishable from "that catalog does not exist".
+ */
+async function databricksTool(fn) {
+	try {
+		return text(await fn());
+	} catch (err) {
+		return { content: [{ type: 'text', text: JSON.stringify({ error: err?.code ?? 'error', message: String(err?.message ?? err) }, null, 2) }], isError: true };
+	}
+}
+
+/**
  * House-style doctrine handed to the agent once at connect (MCP server
  * `instructions`). Sets the frame — build ONE coherent notebook, not a pile of
  * snippets — before the first tool call. Advisory: the host injects it into the
@@ -94,6 +108,28 @@ Follow this house style:
    restart the kernel just because a run is slow to come back — that also drops
    every queued run, the user's included.
 
+9. DATABRICKS: USE THE SESSION, DO NOT BUILD ONE. kernel_state and
+   get_notebook_map both carry a "databricks" block. When it says connected:true,
+   a live Databricks Connect session is ALREADY bound in the kernel namespace:
+     - spark - a Spark session against the named cluster
+     - w     - a databricks.sdk WorkspaceClient against the named profile
+   Use those names directly. Never write connection boilerplate (no
+   DatabricksSession.builder, no WorkspaceClient(...), no fiddling with
+   DATABRICKS_* environment variables) - Cellar already did it, and a second
+   session would fight the first.
+
+   Explore data with the databricks_* tools (databricks_list_catalogs,
+   databricks_list_schemas, databricks_list_tables, databricks_preview_table).
+   They read Unity Catalog directly and return structured JSON, so prefer them
+   over adding a cell just to look at a table. Add a cell when the query is part
+   of the notebook's story; use the tools when you are only orienting yourself.
+
+   When databricks says connected:false, spark does not exist and every
+   databricks_* tool fails with error "not_connected". Connecting is a HUMAN
+   action: ask the user to connect from the Databricks section of the Cellar
+   sidebar. Do not try to connect yourself, and do not restart the kernel while a
+   session is connected - that destroys it.
+
 The goal: a notebook a human would be happy to have written — imports up top,
 shared state, a clean section outline, and a continuous line of reasoning from
 first cell to last.`;
@@ -110,7 +146,7 @@ function registerTools(server) {
 
 	// --- read ---
 	server.registerTool('get_notebook_map', { description: 'Compact hierarchical section tree (from markdown headers): id, type, header level/title, one-line summary, run status, has-output, visibility, plus a `kernel` header {started, session_id, execs_this_session}. Not full content. run_status separates LIVE from SAVED execution: ok_session/error_session = the cell ran in the CURRENT kernel session (ran_this_session:true); ok_persisted/error_persisted = the outputs were loaded from the .ipynb and are LEFTOVER from a previous session (ran_this_session:false) — nothing those cells define exists in the kernel. error_kernel_unavailable = the run could not reach a kernel at all, so this failure is LIVE, not leftover (nothing executed, so ran_this_session stays false). has_output means a cell has saved output, never that it ran. Trust kernel_state, not saved outputs, for what is actually defined.', inputSchema: {} }, async () => text(svc.getNotebookMap()));
-	server.registerTool('kernel_state', { description: 'THE LIVE TRUTH about what is defined right now: the kernel namespace — imports already loaded, user-defined functions/classes, and variables (with types, shapes, dataframe columns). Returns {started:false} if no kernel is running (does not boot one); stale:true means the kernel restarted while reading, so the namespace below belongs to session_id and is already gone. Call this BEFORE writing code so you do not re-import modules or redefine names that already exist, and BEFORE depending on a variable an earlier cell defines — a cell can show saved outputs (run_status ok_persisted) yet never have run in this session. If a name is missing here, re-run the cell that defines it.', inputSchema: {} }, async () => text(await svc.getKernelState()));
+	server.registerTool('kernel_state', { description: 'THE LIVE TRUTH about what is defined right now: the kernel namespace - imports already loaded, user-defined functions/classes, and variables (with types, shapes, dataframe columns), plus a `databricks` block saying whether a Databricks Connect session is bound (and to which profile/cluster). Returns {started:false} if no kernel is running (does not boot one); stale:true means the kernel restarted while reading, so the namespace below belongs to session_id and is already gone. Call this BEFORE writing code so you do not re-import modules or redefine names that already exist, and BEFORE depending on a variable an earlier cell defines - a cell can show saved outputs (run_status ok_persisted) yet never have run in this session. If a name is missing here, re-run the cell that defines it. If databricks.connected is true, `spark` and `w` are live: use them, never re-create them.', inputSchema: {} }, async () => text(await svc.getKernelState()));
 	server.registerTool('read_cell', { description: 'Read one cell by UUID (source + summarized outputs). ran_this_session/run_status tell you whether the outputs came from the CURRENT kernel session (ok_session) or are saved leftovers from a previous one (ok_persisted). run_status error_kernel_unavailable means the kernel could not be reached; that failure is LIVE, not leftover.', inputSchema: { id: z.string() } }, async ({ id }) => { const r = svc.readCell(id); return r ? text(r) : notFound(`cell ${id} not found or hidden`); });
 	server.registerTool('read_cells', { description: 'Read multiple cells by UUID (same per-cell ran_this_session/run_status semantics as read_cell).', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(svc.readCells(ids)));
 	server.registerTool('read_by_location', { description: 'Read a cell by location: index (0-based over visible cells), position first/last, or next/prev of a cell.', inputSchema: { index: z.number().int().optional(), position: z.enum(['first', 'last']).optional(), relative_to: z.string().optional(), direction: z.enum(['next', 'prev']).optional() } }, async ({ index, position, relative_to, direction }) => { const r = svc.readByLocation({ index, position, relativeTo: relative_to, direction }); return r ? text(r) : notFound('no cell at that location'); });
@@ -140,6 +176,13 @@ function registerTools(server) {
 	server.registerTool('run_cells', { description: 'Run multiple cells in order, each waiting its turn in the kernel queue. Stops at the first cell whose queued run an interrupt/restart cancelled (status "cancelled") - the rest would run against a namespace their predecessors never populated.', inputSchema: { ids: z.array(z.string()) } }, async ({ ids }) => text(await svc.runCells(ids)));
 	server.registerTool('run_all', { description: 'Run all code cells in document order (same queueing + cancellation semantics as run_cells).', inputSchema: {} }, async () => text(await svc.runAll()));
 	server.registerTool('run_range', { description: 'Run code cells in the inclusive range from one cell to another (same queueing + cancellation semantics as run_cells).', inputSchema: { from_id: z.string(), to_id: z.string() } }, async ({ from_id, to_id }) => text(await svc.runRange(from_id, to_id)));
+
+	// --- databricks (read-only; connecting stays a human action in the sidebar) ---
+	server.registerTool('databricks_status', { description: 'Whether a Databricks Connect session is live in the kernel, and against which profile/cluster/host. When connected:true, `spark` (a Spark session on that cluster) and `w` (a databricks.sdk WorkspaceClient) are ALREADY bound in the kernel namespace - use them directly instead of writing connection boilerplate. When connected:false, `spark` does not exist: ask the user to connect from the Databricks section of the Cellar sidebar. Reads only; never boots a kernel and never contacts the workspace. The same block appears in kernel_state and get_notebook_map.', inputSchema: {} }, async () => text(svc.databricks.status()));
+	server.registerTool('databricks_list_catalogs', { description: 'List the Unity Catalog catalogs the connected workspace exposes: [{name, comment}]. Runs the Databricks SDK server-side (not in the kernel), so it never queues behind a running cell. Fails with error "not_connected" when there is no live session.', inputSchema: {} }, async () => databricksTool(() => svc.databricks.catalogs()));
+	server.registerTool('databricks_list_schemas', { description: 'List the schemas in one Unity Catalog catalog: [{name, comment}]. Server-side SDK call. Fails with error "not_connected" when there is no live session, "not_found" when the catalog does not exist, "permission_denied" when you cannot see it.', inputSchema: { catalog: z.string() } }, async ({ catalog }) => databricksTool(() => svc.databricks.schemas(catalog)));
+	server.registerTool('databricks_list_tables', { description: 'List the tables in one Unity Catalog schema: [{name, full_name, table_type, format}]. Use full_name with databricks_preview_table or spark.read.table(). Server-side SDK call. Fails with error "not_connected" when there is no live session.', inputSchema: { catalog: z.string(), schema: z.string() } }, async ({ catalog, schema }) => databricksTool(() => svc.databricks.tables(catalog, schema)));
+	server.registerTool('databricks_preview_table', { description: 'Read the first `limit` rows of a table (default 20, max 1000) through the kernel\'s live `spark`, and return {name, limit, schema:[{name,type}], rows:[{column: value}]}. Prefer this over adding a cell when you are only orienting yourself: it reads the table WITHOUT touching the notebook. When the query belongs in the notebook\'s story, add_and_run a cell with spark.read.table(...) instead. `name` is catalog.schema.table (a two-part schema.table is accepted for legacy metastores). Fails with error "not_connected" when there is no live session, "read_failed" when Spark rejects the read.', inputSchema: { name: z.string(), limit: z.number().int().min(1).max(1000).optional() } }, async ({ name, limit }) => databricksTool(() => svc.databricks.preview(name, limit ?? 20)));
 
 	// --- prompt: the house style as a surfaceable slash-command ---
 	server.registerPrompt('cellar_notebook_style', { description: "Cellar's house style for building one coherent notebook." }, () => ({
