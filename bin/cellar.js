@@ -21,6 +21,10 @@
  *                                   no cellar is running in the workspace.
  *
  * Flags:
+ *   --version / -v              print the version + build/git-sha and exit
+ *   --update                    fetch + install the latest cellar and exit
+ *                               (install-method aware: Homebrew or git clone;
+ *                               see src/lib/server/selfupdate.js). Never launches.
  *   [path] / --workspace <dir>  open another repo without cd-ing (default cwd)
  *   --venv <dir>                explicit project venv (or CELLAR_VENV)
  *   --python <path>             escape hatch: bind an arbitrary interpreter,
@@ -87,6 +91,20 @@ if (argv[0] === 'mcp') {
 	process.exit(0);
 }
 
+// `cellar --version` / `cellar --update` — handled before the normal launcher
+// arg parsing (like `mcp`) so they never boot servers and their handling can't
+// trip the unknown-flag guard. REPO (the launcher's own install dir) is what the
+// version/update logic inspects to detect install method and rebuild in place.
+if (argv.includes('--version') || argv.includes('-v')) {
+	const { printVersion } = await import('../src/lib/server/selfupdate.js');
+	printVersion(REPO);
+	process.exit(0);
+}
+if (argv.includes('--update')) {
+	const { runUpdate } = await import('../src/lib/server/selfupdate.js');
+	process.exit(runUpdate(REPO));
+}
+
 function flagValue(...names) {
 	for (const name of names) {
 		const i = argv.indexOf(name);
@@ -97,7 +115,7 @@ function flagValue(...names) {
 function hasFlag(...names) {
 	return names.some((n) => argv.includes(n));
 }
-const KNOWN_FLAGS = new Set(['--workspace', '-w', '--venv', '--python', '--yes', '-y', '--dev', '--build', '--no-mcp-config', '--new', '--force']);
+const KNOWN_FLAGS = new Set(['--version', '-v', '--update', '--workspace', '-w', '--venv', '--python', '--yes', '-y', '--dev', '--build', '--no-mcp-config', '--new', '--force']);
 const VALUE_FLAGS = new Set(['--workspace', '-w', '--venv', '--python']);
 // First non-flag, non-flag-value token is the positional workspace path.
 let positional;
