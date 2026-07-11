@@ -19,14 +19,19 @@ It saves ordinary `.ipynb` files that open in vanilla Jupyter, and it keeps them
 
 ## Install
 
-**Homebrew (recommended).** Two commands - trust the formula once, then install:
+**Homebrew (recommended).** Trust the formula once, then pick a channel:
 
 ```sh
-brew trust --formula fbereilh/cellar/cellar
+brew trust --formula fbereilh/cellar/cellar    # one-time
+```
+
+**Stable** - the latest tagged release. Recommended for most people:
+
+```sh
 brew install fbereilh/cellar/cellar
 ```
 
-Want the bleeding edge instead of the latest release? Add `--HEAD` to track `main`:
+**Latest** - tracks `main` for the newest work, for the adventurous:
 
 ```sh
 brew install --HEAD fbereilh/cellar/cellar
