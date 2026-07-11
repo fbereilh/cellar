@@ -1,0 +1,41 @@
+name: CI
+
+# Build + type-check on every PR into main and every push to main.
+# The app needs `uv` + Python only at RUNTIME (to boot the kernel); building
+# and type-checking are pure Node, so CI installs Node alone and stays fast.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel a superseded run when a new commit lands on the same ref
+# (e.g. a force-push to a PR branch), so only the latest run finishes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Single Node version for now (a matrix can be added here later if we
+      # ever need to support multiple). Pinned to current LTS.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Type-check
+        run: npm run check
+
+      # Follow-up: a `test` step goes here once the smoke-test suite lands
+      # (no `test` script exists in package.json yet).
