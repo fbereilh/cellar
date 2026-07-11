@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { connect, disconnect, statusFor } from '$lib/server/databricks.js';
+import { connect, disconnect, statusFor } from '$lib/server/databricks';
 
 /**
  * Connect: build `spark` + `w` inside the shared kernel against the chosen

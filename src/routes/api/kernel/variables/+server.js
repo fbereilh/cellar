@@ -1,5 +1,5 @@
 import { json, error } from '@sveltejs/kit';
-import { inspectVariables } from '$lib/server/inspect.js';
+import { inspectVariables } from '$lib/server/inspect';
 
 /** Introspect the live kernel and return its user variables as JSON. */
 export async function GET() {

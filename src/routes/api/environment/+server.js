@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { getEnvironment, saveRequirements } from '$lib/server/environment.js';
+import { getEnvironment, saveRequirements } from '$lib/server/environment';
 
 /**
  * The Environment sidebar section's one read: the bound interpreter, its venv,

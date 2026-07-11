@@ -27,16 +27,30 @@
  * a live debugging aid (v1).
  */
 import { format } from 'node:util';
-import { scrubAddresses } from './clean.js';
-import { publishGlobal } from './events.js';
+import { scrubAddresses } from './clean';
+import { publishGlobal } from './events';
 
 /** How many recent entries to keep. Old entries fall off the front. */
 export const MAX_ENTRIES = 1000;
 
-/** Levels, ordered by severity, for the panel's level filter. */
-export const LEVELS = ['info', 'warn', 'error'];
+/** A log severity, as stored on an entry / used for the panel's level filter. */
+export type LogLevel = 'info' | 'warn' | 'error';
 
-const buffer = [];
+/** Levels, ordered by severity, for the panel's level filter. */
+export const LEVELS: LogLevel[] = ['info', 'warn', 'error'];
+
+/** One recorded log-panel entry. */
+export interface LogEntry {
+	seq: number;
+	ts: number;
+	level: LogLevel;
+	source: string;
+	message: string;
+	/** Bumped when an identical line repeats within DEDUPE_WINDOW_MS instead of duplicating. */
+	count?: number;
+}
+
+const buffer: LogEntry[] = [];
 let seq = 0;
 
 /**
@@ -59,7 +73,7 @@ const DEDUPE_WINDOW_MS = 1000;
 // Order matters: the token-shaped patterns run BEFORE the key=value collapse, so
 // `Authorization: Bearer <tok>` has its credential redacted rather than having the
 // key=value rule consume only the scheme word ("Bearer") and leave the token.
-const SECRET_PATTERNS = [
+const SECRET_PATTERNS: [RegExp, string][] = [
 	// `Bearer <credential>` / `token <credential>` in an auth header
 	[/\b(Bearer|token)(\s+)([A-Za-z0-9._~+/=-]{8,})/gi, '$1$2***'],
 	// Databricks personal access tokens (`dapi…`) and OAuth (`dose…`) wherever they appear
@@ -71,7 +85,7 @@ const SECRET_PATTERNS = [
 ];
 
 /** Redact obvious credentials from a string. Exported for testing/reuse. */
-export function scrubSecrets(text) {
+export function scrubSecrets(text: string): string {
 	if (typeof text !== 'string') return text;
 	let out = text;
 	for (const [re, repl] of SECRET_PATTERNS) out = out.replace(re, repl);
@@ -79,7 +93,7 @@ export function scrubSecrets(text) {
 }
 
 /** Full scrub applied to every captured message: memory addresses + credentials. */
-function scrub(message) {
+function scrub(message: string): string {
 	return scrubSecrets(scrubAddresses(message));
 }
 
@@ -94,8 +108,8 @@ function scrub(message) {
  * `level` is one of `LEVELS`; `source` is a short category tag (e.g. `databricks`,
  * `kernel`, `mcp`, `server`). Returns the stored entry.
  */
-export function record(level, source, message) {
-	const lvl = LEVELS.includes(level) ? level : 'info';
+export function record(level: unknown, source: unknown, message: unknown): LogEntry | null {
+	const lvl: LogLevel = (LEVELS as unknown as string[]).includes(level as string) ? (level as LogLevel) : 'info';
 	const src = String(source || 'server');
 	const msg = scrub(String(message ?? '')).trimEnd();
 	if (!msg) return null;
@@ -110,24 +124,24 @@ export function record(level, source, message) {
 		return prev;
 	}
 
-	const entry = { seq: ++seq, ts: Date.now(), level: lvl, source: src, message: msg };
+	const entry: LogEntry = { seq: ++seq, ts: Date.now(), level: lvl, source: src, message: msg };
 	buffer.push(entry);
 	if (buffer.length > MAX_ENTRIES) buffer.shift();
 	publishGlobal({ type: 'log', entry });
 	return entry;
 }
 
-export const logInfo = (source, message) => record('info', source, message);
-export const logWarn = (source, message) => record('warn', source, message);
-export const logError = (source, message) => record('error', source, message);
+export const logInfo = (source: unknown, message: unknown): LogEntry | null => record('info', source, message);
+export const logWarn = (source: unknown, message: unknown): LogEntry | null => record('warn', source, message);
+export const logError = (source: unknown, message: unknown): LogEntry | null => record('error', source, message);
 
 /** The current buffer, oldest first — used to backfill a freshly-opened panel. */
-export function getLogs() {
+export function getLogs(): LogEntry[] {
 	return buffer.slice();
 }
 
 /** Empty the buffer and tell open panels to clear (the panel's Clear button). */
-export function clearLogs() {
+export function clearLogs(): void {
 	buffer.length = 0;
 	publishGlobal({ type: 'log:cleared' });
 }
@@ -141,13 +155,22 @@ let consolePatched = false;
 // publish that logged would loop). Records are plain data, but be defensive.
 let capturing = false;
 
-const CONSOLE_LEVEL = { log: 'info', info: 'info', debug: 'info', warn: 'warn', error: 'error' };
+/** The console methods captured, and the log level each maps to. */
+type ConsoleMethod = 'log' | 'info' | 'debug' | 'warn' | 'error';
+
+const CONSOLE_LEVEL: Record<ConsoleMethod, LogLevel> = {
+	log: 'info',
+	info: 'info',
+	debug: 'info',
+	warn: 'warn',
+	error: 'error'
+};
 
 /**
  * Pull a `[source]` tag off the front of a formatted console line, e.g.
  * `[cellar-mcp] up` → source `cellar-mcp`, message `up`. Falls back to `server`.
  */
-function splitSource(text) {
+function splitSource(text: string): { source: string; message: string } {
 	const m = /^\s*\[([a-z0-9:_-]+)\]\s*(.*)$/is.exec(text);
 	if (m) return { source: m[1], message: m[2] };
 	return { source: 'server', message: text };
@@ -158,17 +181,19 @@ function splitSource(text) {
  * recorded into the ring buffer, without losing the original terminal output.
  * Idempotent; safe to call once at server boot (`hooks.server.js`).
  */
-export function installConsoleCapture() {
+export function installConsoleCapture(): void {
 	if (consolePatched) return;
 	consolePatched = true;
-	for (const method of Object.keys(CONSOLE_LEVEL)) {
+	for (const method of Object.keys(CONSOLE_LEVEL) as ConsoleMethod[]) {
 		const original = console[method].bind(console);
-		console[method] = (...args) => {
+		console[method] = (...args: unknown[]) => {
 			original(...args); // keep the terminal log intact
 			if (capturing) return;
 			capturing = true;
 			try {
-				const text = format(...args);
+				// util.format's own signature is (...args: any[]) - a genuine dynamic
+				// boundary, since console methods accept anything.
+				const text = format(...(args as any[]));
 				const { source, message } = splitSource(text);
 				record(CONSOLE_LEVEL[method], source, message);
 			} catch {

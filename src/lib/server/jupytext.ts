@@ -35,6 +35,26 @@ import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join, resolve, extname, sep } from 'node:path';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
+import type { Cell } from './types';
+
+/** A request handed to the embedded Python helper (one JSON arg in argv[1]). */
+interface HelperRequest {
+	op: 'check' | 'read' | 'write';
+	path?: string;
+	format?: string | null;
+	cells?: Array<{ cell_type: string; source: string }>;
+}
+
+/** The single `SENTINEL`-prefixed JSON line the helper always prints. */
+interface HelperResult {
+	ok: boolean;
+	code?: string;
+	message?: string;
+	format?: string;
+	cells?: Array<{ cell_type?: string; source?: unknown }>;
+	path?: string;
+	jupytext?: boolean;
+}
 
 const SENTINEL = '__CELLAR_JPT__';
 const HELPER_TIMEOUT_MS = 30_000;
@@ -46,7 +66,7 @@ const DBX_HEADER = '# Databricks notebook source';
 /** Formats offered in the "Save as .py" picker. Databricks is the captain's default. */
 export const SAVE_FORMATS = ['databricks', 'percent'];
 
-function workspace() {
+function workspace(): string {
 	return process.env.CELLAR_WORKSPACE || process.cwd();
 }
 
@@ -56,7 +76,7 @@ function workspace() {
  * our converter should import. Mirrors `databricks.js`'s `projectPython()`
  * (kept local so the two features stay decoupled).
  */
-export function projectPython() {
+export function projectPython(): string | null {
 	const bound = process.env.CELLAR_PROJECT_VENV;
 	if (bound && existsSync(bound)) return bound;
 	const local = join(workspace(), '.venv');
@@ -65,7 +85,8 @@ export function projectPython() {
 
 /** A structured failure the routes turn into an HTTP status + clear copy. */
 export class JupytextError extends Error {
-	constructor(code, message) {
+	code: string;
+	constructor(code: string, message: string) {
 		super(message);
 		this.name = 'JupytextError';
 		this.code = code;
@@ -73,7 +94,7 @@ export class JupytextError extends Error {
 }
 
 /** True for a `.py` path (the only extension Cellar treats as a possible text notebook). */
-export function isPyPath(path) {
+export function isPyPath(path: string): boolean {
 	return extname(path).toLowerCase() === '.py';
 }
 
@@ -88,7 +109,7 @@ export function isPyPath(path) {
  * is deliberately NOT treated as a notebook. The returned `format` is a hint; the
  * Python helper re-detects authoritatively on read and reports the real one.
  */
-export function detectPyNotebook(text) {
+export function detectPyNotebook(text: string): { notebook: boolean; format: string | null } {
 	const firstNonBlank = (text.split('\n').find((l) => l.trim() !== '') ?? '').trim();
 	if (firstNonBlank === DBX_HEADER) return { notebook: true, format: 'databricks' };
 	if (/^# %%/m.test(text)) return { notebook: true, format: 'percent' };
@@ -234,7 +255,7 @@ sys.stdout.write(SENTINEL + json.dumps(result) + "\\n")
 `;
 
 /** No project interpreter bound at all — nothing can import jupytext. */
-function requirePython() {
+function requirePython(): string {
 	const python = projectPython();
 	if (!python) {
 		throw new JupytextError(
@@ -246,7 +267,7 @@ function requirePython() {
 }
 
 /** Run one helper command SYNCHRONOUSLY in the project venv and return its parsed result. */
-function runHelperSync(request) {
+function runHelperSync(request: HelperRequest): HelperResult {
 	const python = requirePython();
 	const res = spawnSync(python, ['-c', HELPER, JSON.stringify(request)], {
 		cwd: workspace(),
@@ -255,18 +276,20 @@ function runHelperSync(request) {
 		maxBuffer: HELPER_MAX_BUFFER
 	});
 	if (res.error) {
-		if (res.error.code === 'ETIMEDOUT') throw new JupytextError('timeout', 'the jupytext helper timed out');
+		const errCode = (res.error as NodeJS.ErrnoException).code;
+		if (errCode === 'ETIMEDOUT') throw new JupytextError('timeout', 'the jupytext helper timed out');
 		throw new JupytextError('error', `could not run ${python}: ${res.error.message}`);
 	}
 	const line = (res.stdout || '').split('\n').find((l) => l.startsWith(SENTINEL));
 	if (!line) {
 		throw new JupytextError('error', (res.stderr || '').trim() || 'the jupytext helper produced no result');
 	}
-	let result;
+	let result: HelperResult;
 	try {
-		result = JSON.parse(line.slice(SENTINEL.length));
+		// The helper contract: exactly one SENTINEL-prefixed JSON line, shaped as HelperResult.
+		result = JSON.parse(line.slice(SENTINEL.length)) as HelperResult;
 	} catch (err) {
-		throw new JupytextError('error', `unparseable helper result: ${err.message}`);
+		throw new JupytextError('error', `unparseable helper result: ${err instanceof Error ? err.message : String(err)}`);
 	}
 	if (!result.ok) throw new JupytextError(result.code || 'error', result.message || 'jupytext helper failed');
 	return result;
@@ -279,23 +302,27 @@ function runHelperSync(request) {
  * canonical shape (id minted by the caller, no outputs, empty metadata) — text
  * notebooks carry neither outputs nor cell metadata.
  */
-export function readPyNotebook(absPath, format) {
+export function readPyNotebook(absPath: string, format?: string): { cells: Cell[]; format: string } {
 	const result = runHelperSync({ op: 'read', path: absPath, format });
-	const cells = (result.cells || []).map((c) => ({
-		id: null,
-		cell_type: c.cell_type === 'markdown' ? 'markdown' : 'code',
-		source: typeof c.source === 'string' ? c.source : '',
-		outputs: [],
-		metadata: {}
-	}));
-	return { format: result.format, cells };
+	// id is minted by the caller (notebook.js `enforceUniqueIds`); null here.
+	const cells = (result.cells || []).map(
+		(c) =>
+			({
+				id: null,
+				cell_type: c.cell_type === 'markdown' ? 'markdown' : 'code',
+				source: typeof c.source === 'string' ? c.source : '',
+				outputs: [],
+				metadata: {}
+			}) as unknown as Cell
+	);
+	return { format: result.format ?? 'percent', cells };
 }
 
 /**
  * Write canonical cells to a `.py` file in the given jupytext/Databricks format.
  * Only source + cell type are written (a text notebook has no outputs).
  */
-export function writePyNotebook(absPath, cells, format) {
+export function writePyNotebook(absPath: string, cells: Cell[], format: string): void {
 	const payload = cells.map((c) => ({
 		cell_type: c.cell_type === 'markdown' ? 'markdown' : 'code',
 		source: typeof c.source === 'string' ? c.source : ''
@@ -308,7 +335,7 @@ export function writePyNotebook(absPath, cells, format) {
 // ---------------------------------------------------------------------------
 
 /** Can the project interpreter import jupytext? */
-export async function checkJupytext() {
+export async function checkJupytext(): Promise<{ python: string | null; jupytext: boolean }> {
 	const python = projectPython();
 	if (!python) return { python: null, jupytext: false };
 	const res = spawnSync(python, ['-c', 'import jupytext'], { encoding: 'utf8', timeout: HELPER_TIMEOUT_MS });
@@ -321,7 +348,7 @@ export async function checkJupytext() {
  * Cellar adds to a project venv). Throws a clear `JupytextError` when it cannot —
  * a missing package must never surface as a crash.
  */
-export async function ensureJupytext() {
+export async function ensureJupytext(): Promise<{ installed: boolean; python: string }> {
 	const python = requirePython();
 	const { jupytext } = await checkJupytext();
 	if (jupytext) return { installed: false, python };
@@ -336,14 +363,14 @@ export async function ensureJupytext() {
 	} catch (err) {
 		throw new JupytextError(
 			'jupytext_missing',
-			`could not install jupytext into ${python}: ${err?.message ?? err}. Install it manually (\`uv pip install jupytext\`).`
+			`could not install jupytext into ${python}: ${err instanceof Error ? err.message : String(err)}. Install it manually (\`uv pip install jupytext\`).`
 		);
 	}
 	return { installed: true, python };
 }
 
 /** HTTP status for a `JupytextError.code`. */
-export function statusFor(code) {
+export function statusFor(code: string): number {
 	switch (code) {
 		case 'bad_request':
 			return 400;
@@ -360,7 +387,7 @@ export function statusFor(code) {
 }
 
 /** Resolve a workspace-relative path to an absolute path (guarded to the workspace). */
-export function resolveInWorkspace(relPath) {
+export function resolveInWorkspace(relPath: string): string {
 	const root = resolve(workspace());
 	const abs = resolve(root, relPath ?? '');
 	if (abs !== root && !abs.startsWith(root + sep)) {

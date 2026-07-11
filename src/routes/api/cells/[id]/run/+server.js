@@ -1,6 +1,6 @@
-import { getCell, setSource, resolveNotebookPath } from '$lib/server/notebook.js';
-import { enqueueRun } from '$lib/server/run-queue.js';
-import { executeCellRun } from '$lib/server/run.js';
+import { getCell, setSource, resolveNotebookPath } from '$lib/server/notebook';
+import { enqueueRun } from '$lib/server/run-queue';
+import { executeCellRun } from '$lib/server/run';
 
 /**
  * Run one cell. The given source is saved to the document, executed, and its

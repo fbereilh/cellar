@@ -23,46 +23,55 @@ import {
 	createNotebook as createNotebookDoc,
 	openNotebook as openNotebookDoc,
 	notebookExists
-} from '../notebook.js';
-import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel.js';
-import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect.js';
-import { agentStatus as databricksStatus, forAgent as databricksCatalog, previewTable } from '../databricks.js';
-import { publish } from '../events.js';
-import { enqueueRun, queueState, queuePosition } from '../run-queue.js';
-import { executeCellRun } from '../run.js';
-import { consolidateImports, routeImports, runImportsCell } from '../imports-cell.js';
-import { buildTree } from '../fstree.js';
-import { getNotebookStaleness } from '../dataflow.js';
+} from '../notebook';
+import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel';
+import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
+import { agentStatus as databricksStatus, forAgent as databricksCatalog, previewTable } from '../databricks';
+import { publish } from '../events';
+import { enqueueRun, queueState, queuePosition } from '../run-queue';
+import { executeCellRun } from '../run';
+import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
+import { buildTree } from '../fstree';
+import { getNotebookStaleness } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness.js';
 import { isSqlCell } from '../../cellLanguage.js';
-import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints.js';
+import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
+import type { CellView, CellOutput, SessionId, LogicalCellType } from '../types';
+
+/** A per-cell staleness verdict from `$lib/staleness.js` (via dataflow.js). */
+interface StaleEntry {
+	state: string;
+	reason?: string;
+	upstream?: string[];
+}
+type StaleMap = Record<string, StaleEntry | undefined>;
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
 const READ_CAP = 800;
 const MEDIUM_CAP = 4000;
 
-const asText = (s) => (Array.isArray(s) ? s.join('') : (s ?? ''));
+const asText = (s: unknown): string => (Array.isArray(s) ? s.join('') : ((s as string) ?? ''));
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
-const stripAnsi = (s) => (typeof s === 'string' ? s.replace(ANSI, '') : s);
+const stripAnsi = (s: string): string => (typeof s === 'string' ? s.replace(ANSI, '') : s);
 
-const isHidden = (c) => c.metadata?.cellar?.hidden_from_agent === true;
-const visibleCells = () => listCells().filter((c) => !isHidden(c));
+const isHidden = (c: CellView): boolean => c.metadata?.cellar?.hidden_from_agent === true;
+const visibleCells = (): CellView[] => listCells().filter((c) => !isHidden(c));
 
-function firstLine(src, cap = 80) {
+function firstLine(src: string, cap = 80): string {
 	const line = (src || '').split('\n').find((l) => l.trim()) ?? '';
 	return line.length > cap ? line.slice(0, cap) + '…' : line;
 }
 
 /** Markdown header info (level 1-6 + title) or null. */
-function headerInfo(cell) {
+function headerInfo(cell: CellView): { level: number; title: string } | null {
 	if (cell.cell_type !== 'markdown') return null;
 	const line = (cell.source || '').split('\n').find((l) => l.trim()) ?? '';
 	const m = /^(#{1,6})\s+(.*)$/.exec(line.trim());
 	return m ? { level: m[1].length, title: m[2].trim() } : null;
 }
 
-function hasOutput(cell) {
+function hasOutput(cell: CellView): boolean {
 	return cell.cell_type === 'code' && (cell.outputs || []).length > 0;
 }
 
@@ -73,7 +82,8 @@ function hasOutput(cell) {
  * @param {number|null|undefined} session epoch a run was stamped with
  * @param {number|null} sid current epoch, or null when no kernel is running
  */
-const isLiveSession = (session, sid) => sid != null && session === sid;
+const isLiveSession = (session: SessionId | null | undefined, sid: SessionId | null): boolean =>
+	sid != null && session === sid;
 
 /**
  * Did this cell execute against the kernel namespace that is live right now?
@@ -87,7 +97,7 @@ const isLiveSession = (session, sid) => sid != null && session === sid;
  * @param {object} cell
  * @param {number|null} sid current epoch, or null when no kernel is running
  */
-function ranThisSession(cell, sid) {
+function ranThisSession(cell: CellView, sid: SessionId | null): boolean {
 	if (cell.cell_type !== 'code') return false;
 	return isLiveSession(cell.metadata?.cellar?.lastRun?.session, sid);
 }
@@ -111,7 +121,7 @@ function ranThisSession(cell, sid) {
  * @param {object} cell
  * @param {number|null} sid current epoch, or null when no kernel is running
  */
-const kernelUnavailable = (cell, sid) =>
+const kernelUnavailable = (cell: CellView, sid: SessionId | null): boolean =>
 	sid == null && cell.metadata?.cellar?.lastRun?.kernel_unavailable === true;
 
 /**
@@ -141,10 +151,10 @@ const kernelUnavailable = (cell, sid) =>
  * is up, the saved CellarError genuinely is leftover and reads as
  * `error_persisted` (see `kernelUnavailable`).
  */
-function runStatus(cell, sid) {
+function runStatus(cell: CellView, sid: SessionId | null): string {
 	if (cell.cell_type !== 'code') return 'n/a';
 	if (ranThisSession(cell, sid)) {
-		return cell.metadata.cellar.lastRun.status === 'ok' ? 'ok_session' : 'error_session';
+		return cell.metadata?.cellar?.lastRun?.status === 'ok' ? 'ok_session' : 'error_session';
 	}
 	if (kernelUnavailable(cell, sid)) return 'error_kernel_unavailable';
 	const outs = cell.outputs || [];
@@ -152,9 +162,13 @@ function runStatus(cell, sid) {
 	return outs.some((o) => o.output_type === 'error') ? 'error_persisted' : 'ok_persisted';
 }
 
-const imageKey = (o) => o.data && Object.keys(o.data).find((k) => k.startsWith('image/'));
+// Outputs carry `data` only on execute_result/display_data; guard before probing.
+const imageKey = (o: CellOutput): string | undefined => {
+	const data = 'data' in o ? o.data : undefined;
+	return data ? Object.keys(data).find((k) => k.startsWith('image/')) : undefined;
+};
 
-function outputText(o) {
+function outputText(o: CellOutput): string {
 	switch (o.output_type) {
 		case 'stream':
 			return asText(o.text);
@@ -173,7 +187,7 @@ function outputText(o) {
 }
 
 /** Cap text, with a dataframe-aware shape+head summary for pandas reprs. */
-function capText(text, cap) {
+function capText(text: string, cap: number): { text: string; truncated: boolean } {
 	const df = text.match(/\[(\d+) rows x (\d+) columns\]/);
 	if (df) {
 		const lines = text.split('\n');
@@ -187,15 +201,15 @@ function capText(text, cap) {
 	return { text, truncated: false };
 }
 
-function summarizeOutput(o, cap) {
-	const base = { type: o.output_type };
+function summarizeOutput(o: CellOutput, cap: number) {
+	const base: Record<string, unknown> = { type: o.output_type };
 	if (o.output_type === 'error') Object.assign(base, { ename: o.ename, evalue: o.evalue });
 	const img = imageKey(o);
 	if (img) base.image = img;
 	return { ...base, ...capText(outputText(o), cap) };
 }
 
-const summarizeOutputs = (cell, cap) => (cell.outputs || []).map((o) => summarizeOutput(o, cap));
+const summarizeOutputs = (cell: CellView, cap: number) => (cell.outputs || []).map((o) => summarizeOutput(o, cap));
 
 /**
  * The staleness annotation for a read/run result, from a per-cell verdict
@@ -203,9 +217,9 @@ const summarizeOutputs = (cell, cap) => (cell.outputs || []).map((o) => summariz
  * n/a); a stale cell additionally carries WHY and the upstream cell ids that made
  * it stale, so an agent knows exactly what to re-run before trusting the output.
  */
-function staleFields(entry) {
+function staleFields(entry: StaleEntry | undefined | null): Record<string, unknown> {
 	if (!entry) return {};
-	const out = { stale_state: entry.state };
+	const out: Record<string, unknown> = { stale_state: entry.state };
 	if (entry.state === STALE_STATE.STALE) {
 		out.stale = true;
 		out.stale_reason = entry.reason;
@@ -214,7 +228,7 @@ function staleFields(entry) {
 	return out;
 }
 
-function readForm(cell, cap = READ_CAP, sid = currentSessionId(), staleEntry = null) {
+function readForm(cell: CellView, cap = READ_CAP, sid: SessionId | null = currentSessionId(), staleEntry: StaleEntry | null = null) {
 	return {
 		id: cell.id,
 		type: cell.cell_type,
@@ -247,15 +261,22 @@ export const kernel = {
  */
 export function listNotebooks() {
 	const activeAbs = getActiveNotebookPath();
-	const paths = [];
-	const walk = (nodes) => {
+	const paths: string[] = [];
+	// Structural view of an fstree node; the walk only needs these fields.
+	interface TreeNodeLike {
+		type: string;
+		name: string;
+		path: string;
+		children?: TreeNodeLike[];
+	}
+	const walk = (nodes: TreeNodeLike[]) => {
 		for (const n of nodes) {
 			if (n.type === 'dir') walk(n.children || []);
 			else if (n.type === 'file' && /\.ipynb$/i.test(n.name)) paths.push(n.path);
 		}
 	};
 	const { root, tree } = buildTree();
-	walk(tree);
+	walk(tree as TreeNodeLike[]);
 	paths.sort();
 	return {
 		workspace: root,
@@ -263,7 +284,7 @@ export function listNotebooks() {
 	};
 }
 
-const cellCount = (nb) => (nb.cells ? nb.cells.length : 0);
+const cellCount = (nb: { cells?: unknown[] }) => (nb.cells ? nb.cells.length : 0);
 
 /**
  * Open and focus an EXISTING workspace notebook by name, making it the active
@@ -272,7 +293,7 @@ const cellCount = (nb) => (nb.cells ? nb.cells.length : 0);
  * optional). Throws with a create_notebook pointer when it does not exist —
  * open never creates.
  */
-export function openNotebook(name) {
+export function openNotebook(name: string) {
 	let rel = (name ?? '').trim();
 	if (!rel) throw new Error('open_notebook requires a notebook name. Use list_notebooks to see available notebooks, or create_notebook to make a new one.');
 	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
@@ -291,7 +312,7 @@ export function openNotebook(name) {
  * For opening a notebook you know already exists, prefer open_notebook.
  * Returns its path + cell count.
  */
-export function createNotebook(name) {
+export function createNotebook(name?: string) {
 	let rel = (name ?? '').trim() || 'untitled';
 	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
 	const nb = createNotebookDoc(rel);
@@ -311,10 +332,21 @@ export function createNotebook(name) {
  */
 export async function getNotebookMap() {
 	const cells = visibleCells();
-	const { sid, cells: stale } = await getNotebookStaleness();
-	const root = [];
-	const stack = [];
-	const leaf = (c) => ({
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
+	// A section node holds nested cell/section entries; a cell leaf is a plain record.
+	interface MapSection {
+		id: string;
+		kind: 'section';
+		type: 'markdown';
+		level: number;
+		title: string;
+		summary: string;
+		visible: boolean;
+		children: unknown[];
+	}
+	const root: unknown[] = [];
+	const stack: { node: MapSection; level: number }[] = [];
+	const leaf = (c: CellView) => ({
 		id: c.id,
 		kind: 'cell',
 		type: c.cell_type,
@@ -329,7 +361,7 @@ export async function getNotebookMap() {
 	for (const c of cells) {
 		const h = headerInfo(c);
 		if (h) {
-			const node = { id: c.id, kind: 'section', type: 'markdown', level: h.level, title: h.title, summary: h.title, visible: true, children: [] };
+			const node: MapSection = { id: c.id, kind: 'section', type: 'markdown', level: h.level, title: h.title, summary: h.title, visible: true, children: [] };
 			while (stack.length && stack[stack.length - 1].level >= h.level) stack.pop();
 			(stack.length ? stack[stack.length - 1].node.children : root).push(node);
 			stack.push({ node, level: h.level });
@@ -367,7 +399,7 @@ export async function getKernelState() {
 export function getVariables() {
 	return _listVariables();
 }
-export function inspectVariable(name) {
+export function inspectVariable(name: string) {
 	return _inspectVariable(name);
 }
 
@@ -378,8 +410,8 @@ export function inspectVariable(name) {
  * their outputs, the same way the UI's stale indicator warns a human.
  */
 async function staleCells() {
-	const { cells } = await getNotebookStaleness();
-	const out = [];
+	const { cells }: { cells: StaleMap } = await getNotebookStaleness();
+	const out: Array<{ id: string; reason?: string; upstream?: string[] }> = [];
 	for (const c of visibleCells()) {
 		const e = cells[c.id];
 		if (e?.state === STALE_STATE.STALE) {
@@ -403,15 +435,15 @@ async function staleCells() {
 export const databricks = {
 	status: () => databricksStatus(),
 	catalogs: () => databricksCatalog.catalogs(),
-	schemas: (catalog) => databricksCatalog.schemas(catalog),
-	tables: (catalog, schema) => databricksCatalog.tables(catalog, schema),
-	preview: (name, limit) => previewTable({ name, limit })
+	schemas: (catalog: string) => databricksCatalog.schemas(catalog),
+	tables: (catalog: string, schema: string) => databricksCatalog.tables(catalog, schema),
+	preview: (name: string, limit?: number) => previewTable({ name, limit })
 };
 
-export async function readCell(id) {
+export async function readCell(id: string) {
 	const c = getCell(id);
 	if (!c || isHidden(c)) return null;
-	const { sid, cells: stale } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
 	return readForm(c, READ_CAP, sid, stale[id]);
 }
 
@@ -421,8 +453,8 @@ export async function readCell(id) {
  * single response against two different kernel sessions — some cells `ok_session`,
  * some `ok_persisted` — for the same kernel state.
  */
-export async function readCells(ids) {
-	const { sid, cells: stale } = await getNotebookStaleness();
+export async function readCells(ids: string[]) {
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
 	return ids
 		.map((id) => {
 			const c = getCell(id);
@@ -433,10 +465,15 @@ export async function readCells(ids) {
 }
 
 /** index (0-based over visible cells), position first/last, or next/prev of an id. */
-export async function readByLocation({ index, position, relativeTo, direction }) {
+export async function readByLocation({ index, position, relativeTo, direction }: {
+	index?: number;
+	position?: 'first' | 'last';
+	relativeTo?: string;
+	direction?: 'prev' | 'next';
+}) {
 	const cells = visibleCells();
 	if (!cells.length) return null;
-	let target = null;
+	let target: CellView | null | undefined = null;
 	if (typeof index === 'number') target = cells[index];
 	else if (position === 'first') target = cells[0];
 	else if (position === 'last') target = cells[cells.length - 1];
@@ -446,12 +483,12 @@ export async function readByLocation({ index, position, relativeTo, direction })
 		target = direction === 'prev' ? cells[i - 1] : cells[i + 1];
 	}
 	if (!target) return null;
-	const { sid, cells: stale } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
 	return readForm(target, READ_CAP, sid, stale[target.id]);
 }
 
 /** Cells under a markdown header (until the next same-or-higher header). */
-export async function readSection(headerId) {
+export async function readSection(headerId: string) {
 	const cells = visibleCells();
 	const idx = cells.findIndex((c) => c.id === headerId);
 	if (idx < 0) return null;
@@ -464,7 +501,7 @@ export async function readSection(headerId) {
 		out.push(cells[i]);
 	}
 	// One sampled epoch + staleness pass for the whole section (see readCells).
-	const { sid, cells: stale } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
 	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid, stale[c.id])) };
 }
 
@@ -473,12 +510,12 @@ export async function readSection(headerId) {
  * an output snippet from a cell that has not run this session was deserialized
  * from the `.ipynb` and describes a namespace that no longer exists.
  */
-export function searchCells(query, where = 'both') {
+export function searchCells(query: string, where: 'input' | 'output' | 'both' = 'both') {
 	const q = (query || '').toLowerCase();
 	if (!q) return [];
 	const sid = currentSessionId();
-	const results = [];
-	const snippet = (text) => {
+	const results: Array<{ id: string; where: string; ran_this_session: boolean; snippet: string }> = [];
+	const snippet = (text: string): string | null => {
 		const i = text.toLowerCase().indexOf(q);
 		if (i < 0) return null;
 		const start = Math.max(0, i - 40);
@@ -508,7 +545,7 @@ export function searchCells(query, where = 'both') {
  */
 export function getErrors() {
 	const sid = currentSessionId();
-	const errs = [];
+	const errs: Array<Record<string, unknown>> = [];
 	for (const c of visibleCells()) {
 		for (const o of c.outputs || []) {
 			if (o.output_type === 'error') {
@@ -532,13 +569,13 @@ export function getErrors() {
  * `ran_this_session: false` means these outputs were saved by a PREVIOUS session
  * - they describe a namespace that no longer exists.
  */
-export function getFullOutput(id, size = 'medium') {
+export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium') {
 	const c = getCell(id);
 	if (!c || isHidden(c)) return null;
 	const cap = size === 'full' ? Infinity : MEDIUM_CAP;
-	const outputs = (c.outputs || []).map((o) => {
+	const outputs: Array<Record<string, unknown>> = (c.outputs || []).map((o) => {
 		const img = imageKey(o);
-		if (img) return { type: o.output_type, image: img, data: o.data[img] };
+		if (img && 'data' in o) return { type: o.output_type, image: img, data: o.data[img] };
 		return summarizeOutput(o, cap);
 	});
 	return { id: c.id, size, ran_this_session: ranThisSession(c, currentSessionId()), outputs };
@@ -563,7 +600,11 @@ export function getFullOutput(id, size = 'medium') {
  * `null` when nothing was routed — so a tool that routed nothing says nothing
  * about imports.
  */
-function routeOne(source, nb, { routeEnabled, cellType = 'code', skipCellId = null } = {}) {
+function routeOne(
+	source: string,
+	nb: string,
+	{ routeEnabled, cellType = 'code', skipCellId = null }: { routeEnabled?: boolean; cellType?: string; skipCellId?: string | null } = {}
+) {
 	if (!routeEnabled || cellType !== 'code') return null;
 	const routed = routeImports(source ?? '', nb, undefined, { skipCellId });
 	// No imports at all (or none we could parse): the source is untouched, so say so.
@@ -581,8 +622,8 @@ function routeOne(source, nb, { routeEnabled, cellType = 'code', skipCellId = nu
  * UI may focus another notebook while the imports cell waits in the run queue,
  * and this run belongs to the notebook the code was written into.
  */
-async function finishImportRouting(nb, cellId, added) {
-	if (!added.length) return { cell_id: cellId, added: [], note: 'already present in the imports cell; removed from your code' };
+async function finishImportRouting(nb: string, cellId: string | null, added: string[]) {
+	if (!added.length) return { cell_id: cellId, added: [] as string[], note: 'already present in the imports cell; removed from your code' };
 	const run = await runImportsCell(nb, 'agent');
 	return {
 		cell_id: cellId,
@@ -590,7 +631,7 @@ async function finishImportRouting(nb, cellId, added) {
 		run_status: run?.status ?? 'not_run',
 		// A failed imports cell (a missing package) is surfaced, never swallowed:
 		// every cell the agent writes next depends on it.
-		...(run?.status === 'error' ? { outputs: run.outputs.map((o) => summarizeOutput(o, READ_CAP)) } : {}),
+		...(run?.status === 'error' ? { outputs: (run.outputs ?? []).map((o) => summarizeOutput(o, READ_CAP)) } : {}),
 		...(run?.note ? { note: run.note } : {})
 	};
 }
@@ -613,7 +654,7 @@ export async function consolidate() {
  * means "undo last agent action" targets only those automatic pre-action
  * snapshots — never a save point the agent chose to keep.
  */
-export function checkpoint(label) {
+export function checkpoint(label?: string) {
 	const nb = getActiveNotebookPath();
 	return createCheckpoint(nb, { trigger: 'manual', label: label || 'Agent checkpoint' });
 }
@@ -626,12 +667,16 @@ export function checkpoint(label) {
  * cell: its imports are in the imports cell, and an empty cell beside them is
  * litter. An explicitly empty source still creates its empty cell.
  */
-export async function addCells(specs, afterId, { routeImports: routeEnabled = true } = {}) {
+export async function addCells(
+	specs: Array<{ cell_type?: string; source?: string }>,
+	afterId?: string | null,
+	{ routeImports: routeEnabled = true }: { routeImports?: boolean } = {}
+) {
 	const nb = getActiveNotebookPath();
 	autoCheckpointBeforeAgentAction(nb);
-	const bodies = [];
-	const added = [];
-	let importsCellId = null;
+	const bodies: Array<{ cellType: string; source: string }> = [];
+	const added: string[] = [];
+	let importsCellId: string | null = null;
 	for (const spec of specs) {
 		const cellType = spec.cell_type || 'code';
 		const routed = routeOne(spec.source ?? '', nb, { routeEnabled, cellType });
@@ -644,9 +689,9 @@ export async function addCells(specs, afterId, { routeImports: routeEnabled = tr
 	}
 
 	let anchor = afterId;
-	const created = [];
+	const created: string[] = [];
 	for (const body of bodies) {
-		const cell = addCell(anchor, body.cellType);
+		const cell = addCell(anchor, body.cellType as LogicalCellType);
 		if (body.source) setSource(cell.id, body.source);
 		created.push(cell.id);
 		anchor = cell.id;
@@ -655,7 +700,7 @@ export async function addCells(specs, afterId, { routeImports: routeEnabled = tr
 	return { ids: created, ...(imports ? { imports } : {}) };
 }
 
-export async function editCell(id, source, { routeImports: routeEnabled = true } = {}) {
+export async function editCell(id: string, source: string, { routeImports: routeEnabled = true }: { routeImports?: boolean } = {}) {
 	const nb = getActiveNotebookPath();
 	const cell = getCell(id, nb);
 	if (!cell) return null;
@@ -669,26 +714,26 @@ export async function editCell(id, source, { routeImports: routeEnabled = true }
 	return { ok: true, id, ...(imports ? { imports } : {}) };
 }
 
-export function removeCell(id) {
+export function removeCell(id: string) {
 	if (!getCell(id)) return false;
 	autoCheckpointBeforeAgentAction(getActiveNotebookPath());
 	deleteCell(id);
 	return true;
 }
 
-export function moveCell(id, pos) {
+export function moveCell(id: string, pos: number) {
 	autoCheckpointBeforeAgentAction(getActiveNotebookPath());
 	return moveCellTo(id, pos);
 }
 
-export function setType(id, type) {
+export function setType(id: string, type: LogicalCellType) {
 	if (!getCell(id)) return false;
 	autoCheckpointBeforeAgentAction(getActiveNotebookPath());
 	setCellType(id, type);
 	return true;
 }
 
-export function setCellVisibility(id, hidden) {
+export function setCellVisibility(id: string, hidden: boolean) {
 	return setVisibility(id, hidden);
 }
 
@@ -732,7 +777,7 @@ export function getRunQueue() {
  * outputs. `run_queue` shows the pending list at any time; `interrupt_kernel` /
  * `restart_kernel` drop it, and a dropped run returns `status: "cancelled"`.
  */
-export async function runCell(id) {
+export async function runCell(id: string): Promise<Record<string, unknown> | null> {
 	const nbAtCall = getActiveNotebookPath();
 	const c = getCell(id, nbAtCall);
 	if (!c) return null;
@@ -769,7 +814,8 @@ export async function runCell(id) {
 	} catch (err) {
 		// A restart / interrupt / rebind dropped this pending run before any kernel
 		// touched it: nothing executed, nothing to persist, no lastRun stamp.
-		return { id, status: 'cancelled', reason: err?.reason ?? 'cancelled', ran_this_session: false, note: 'the queued run was dropped before it started (the kernel was interrupted or restarted).' };
+		const reason = (err as { reason?: string })?.reason ?? 'cancelled';
+		return { id, status: 'cancelled', reason, ran_this_session: false, note: 'the queued run was dropped before it started (the kernel was interrupted or restarted).' };
 	}
 	const queuedInfo = queuedAt ? { queued: true, queue_position: acceptedPosition, waited_ms: Date.now() - queuedAt } : {};
 
@@ -789,7 +835,7 @@ export async function runCell(id) {
 		// The run may have made downstream cells stale (this one just re-ran) or
 		// cleared this cell's own staleness — surface its fresh verdict so a follow-up
 		// read is not needed just to see whether the run settled it.
-		const { cells: stale } = await getNotebookStaleness();
+		const { cells: stale }: { cells: StaleMap } = await getNotebookStaleness();
 		return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id]), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and
@@ -816,20 +862,25 @@ export async function runCell(id) {
  * `pd` finds it. Source that is nothing BUT imports creates no cell at all: its
  * imports are in the imports cell, and an empty cell beside them is litter.
  */
-export async function addAndRun({ source, cellType = 'code', afterId, routeImports: routeEnabled = true } = {}) {
+export async function addAndRun({ source, cellType = 'code', afterId, routeImports: routeEnabled = true }: {
+	source?: string;
+	cellType?: LogicalCellType;
+	afterId?: string | null;
+	routeImports?: boolean;
+} = {}) {
 	const nb = getActiveNotebookPath();
 	const routed = routeOne(source ?? '', nb, { routeEnabled, cellType });
 	const body = routed ? routed.source : (source ?? '');
 	// Run the imports cell BEFORE the new cell, so the code that needs `pd` finds it.
 	const imports = routed ? await finishImportRouting(nb, routed.importsCellId, routed.added) : null;
 
-	if (routed && !body.trim()) {
+	if (routed && imports && !body.trim()) {
 		// The submitted code was nothing but imports. They now live in the imports
 		// cell; an empty cell beside it would be litter, so report that cell instead.
-		const cell = getCell(imports.cell_id, nb);
+		const cell = imports.cell_id ? getCell(imports.cell_id, nb) : null;
 		return {
 			id: imports.cell_id,
-			status: imports.run_status ?? 'skipped',
+			status: ('run_status' in imports ? imports.run_status : undefined) ?? 'skipped',
 			routed_to_imports: true,
 			note: "the submitted code was only imports; they were merged into the notebook's imports cell and no new cell was created.",
 			ran_this_session: cell ? ranThisSession(cell, currentSessionId()) : false,
@@ -850,11 +901,12 @@ export async function addAndRun({ source, cellType = 'code', afterId, routeImpor
  * was written against a namespace that no longer exists, so running it would
  * execute cell N+1 without cell N's definitions.
  */
-export async function runCells(ids) {
-	const results = [];
+export async function runCells(ids: string[]) {
+	const results: Array<Record<string, unknown>> = [];
 	for (const id of ids) {
 		const r = await runCell(id);
-		if (r && !isHidden(getCell(id) || {})) results.push(r);
+		const cell = getCell(id);
+		if (r && !(cell && isHidden(cell))) results.push(r);
 		if (r?.status === 'cancelled') break;
 	}
 	return results;
@@ -875,14 +927,14 @@ export async function runAll() {
  * (same as run_all). Returns the run results plus which cells were run.
  */
 export async function runStale() {
-	const { cells: stale } = await getNotebookStaleness();
+	const { cells: stale }: { cells: StaleMap } = await getNotebookStaleness();
 	const ids = staleIdsInOrder(listCells(), stale);
 	const results = await runCells(ids);
 	return { ran: ids, results };
 }
 
 /** Run code cells in the inclusive document range from→to. */
-export async function runRange(fromId, toId) {
+export async function runRange(fromId: string, toId: string) {
 	const all = listCells();
 	const i = all.findIndex((c) => c.id === fromId);
 	const j = all.findIndex((c) => c.id === toId);

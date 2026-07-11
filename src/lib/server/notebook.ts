@@ -21,10 +21,10 @@
 import { join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { readNotebook, deserialize, writeNotebook } from './ipynb.js';
-import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext.js';
-import { publish } from './events.js';
-import { cancelRun } from './run-queue.js';
+import { readNotebook, deserialize, writeNotebook } from './ipynb';
+import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
+import { publish } from './events';
+import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole.js';
 import { SQL_LANGUAGE } from '../cellLanguage.js';
 import type {
@@ -37,7 +37,7 @@ import type {
 	LastRun,
 	NotebookDoc,
 	NotebookView
-} from './types.js';
+} from './types';
 
 /** A freshly-minted cell always carries an initialized `cellar` namespace. */
 type CellWithCellar = Cell & { metadata: CellMetadata & { cellar: CellarNamespace } };

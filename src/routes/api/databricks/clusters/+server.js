@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { listClusters, statusFor } from '$lib/server/databricks.js';
+import { listClusters, statusFor } from '$lib/server/databricks';
 import { selectionFrom } from '../selection.js';
 
 /**

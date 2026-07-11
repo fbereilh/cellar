@@ -14,9 +14,9 @@
  */
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
-import { clearRunQueue } from './run-queue.js';
-import { logInfo, logWarn, logError } from './logs.js';
-import type { RunStreamEvent, ExecuteOptions, SessionId } from './types.js';
+import { clearRunQueue } from './run-queue';
+import { logInfo, logWarn, logError } from './logs';
+import type { RunStreamEvent, ExecuteOptions, SessionId } from './types';
 
 type KernelConnection = Kernel.IKernelConnection;
 type StatusListener = (sender: KernelConnection, status: Kernel.Status) => void;

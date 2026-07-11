@@ -35,9 +35,42 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname, relative, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { workspaceRoot } from '$lib/server/fstree.js';
-import { listCells, replaceCells, resolveNotebookPath } from '$lib/server/notebook.js';
-import { publishGlobal } from '$lib/server/events.js';
+import { workspaceRoot } from '$lib/server/fstree';
+import { listCells, replaceCells, resolveNotebookPath } from '$lib/server/notebook';
+import { publishGlobal } from '$lib/server/events';
+import type { CellView } from './types';
+
+/** Why a checkpoint was taken. */
+export type CheckpointTrigger = 'manual' | 'agent' | 'restore';
+
+/** A full point-in-time snapshot of a notebook's cells (source + outputs + metadata). */
+export interface Checkpoint {
+	id: string;
+	at: number;
+	trigger: CheckpointTrigger;
+	label: string;
+	cellCount: number;
+	/** Set when outputs were dropped to keep the snapshot under the size cap. */
+	outputsTruncated?: boolean;
+	cells: CellView[];
+}
+
+/** The metadata view of a checkpoint (everything but the heavy `cells` payload). */
+export interface CheckpointMeta {
+	id: string;
+	at: number;
+	trigger: CheckpointTrigger;
+	label: string;
+	cellCount: number;
+	outputsTruncated: boolean;
+}
+
+/** The outcome of a restore / undo. */
+export interface RestoreResult {
+	ok: boolean;
+	error?: string;
+	restored?: CheckpointMeta;
+}
 
 const WRITE_DEBOUNCE_MS = 250;
 /** Max checkpoints retained per notebook (oldest evicted first). */
@@ -47,27 +80,20 @@ const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 /** A fresh agent action within this window of the last one folds into the same pre-burst checkpoint. */
 const COALESCE_MS = 4000;
 
-/** @type {Record<string, Checkpoint[]> | null} */
-let cache = null;
-/** @type {ReturnType<typeof setTimeout> | null} */
-let writeTimer = null;
+let cache: Record<string, Checkpoint[]> | null = null;
+let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let dirty = false;
 let exitHookInstalled = false;
 
 /** Per-notebook timestamp of the last agent action, for auto-checkpoint coalescing (in-memory only). */
-const lastAgentAt = new Map();
+const lastAgentAt = new Map<string, number>();
 
-/**
- * @typedef {{ id:string, at:number, trigger:string, label:string, cellCount:number,
- *   outputsTruncated?:boolean, cells:any[] }} Checkpoint
- */
-
-function storePath() {
+function storePath(): string {
 	return join(workspaceRoot(), '.cellar', 'checkpoints.json');
 }
 
 /** Workspace-relative key for a notebook path (absolute, relative, or nullish → active). */
-function keyFor(nb) {
+function keyFor(nb?: string | null): string {
 	const abs = resolveNotebookPath(nb); // canonical absolute id
 	const rel = relative(workspaceRoot(), abs);
 	// A path outside the workspace (shouldn't happen for a notebook) falls back to
@@ -76,12 +102,17 @@ function keyFor(nb) {
 }
 
 /** Load the store once; a missing / unparseable file is an empty store. */
-function ensureLoaded() {
+function ensureLoaded(): Record<string, Checkpoint[]> {
 	if (cache !== null) return cache;
 	try {
 		const p = storePath();
-		const parsed = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {};
-		cache = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+		// Dynamic disk boundary: JSON.parse is `any`. Shape-guard to a plain object,
+		// then cast to the store type (individual entries are trusted as written).
+		const parsed: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {};
+		cache =
+			parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+				? (parsed as Record<string, Checkpoint[]>)
+				: {};
 	} catch {
 		cache = {};
 	}
@@ -89,7 +120,7 @@ function ensureLoaded() {
 }
 
 /** Metadata view of a checkpoint (everything but the heavy `cells` payload). */
-function metaOf(cp) {
+function metaOf(cp: Checkpoint): CheckpointMeta {
 	return {
 		id: cp.id,
 		at: cp.at,
@@ -101,7 +132,7 @@ function metaOf(cp) {
 }
 
 /** Checkpoints for a notebook, newest first, metadata only. */
-export function listCheckpoints(nb) {
+export function listCheckpoints(nb?: string | null): CheckpointMeta[] {
 	const store = ensureLoaded();
 	const list = store[keyFor(nb)] ?? [];
 	return list.map(metaOf).reverse();
@@ -111,15 +142,18 @@ export function listCheckpoints(nb) {
  * Snapshot the notebook's current cells into a new checkpoint and return its
  * metadata. `trigger` labels why it was taken (`manual` / `agent` / `restore`).
  */
-export function createCheckpoint(nb, { trigger = 'manual', label } = {}) {
+export function createCheckpoint(
+	nb?: string | null,
+	{ trigger = 'manual', label }: { trigger?: CheckpointTrigger; label?: string } = {}
+): CheckpointMeta {
 	const store = ensureLoaded();
 	const key = keyFor(nb);
 	// Deep-clone the live cells so later document mutations can't corrupt the stored
 	// snapshot. Runtime metadata (lastRun/editedAt) rides along — it lives only in
 	// this ephemeral `.cellar` file, never the `.ipynb`, and restoring it keeps
 	// run-status honest (the kernel-session epoch check still gates ran_this_session).
-	let cells = structuredClone(listCells(nb));
-	const cp = {
+	const cells = structuredClone(listCells(nb));
+	const cp: Checkpoint = {
 		id: randomUUID(),
 		at: Date.now(),
 		trigger,
@@ -140,7 +174,7 @@ export function createCheckpoint(nb, { trigger = 'manual', label } = {}) {
 	return metaOf(cp);
 }
 
-function defaultLabel(trigger) {
+function defaultLabel(trigger: string): string {
 	if (trigger === 'agent') return 'Before agent action';
 	if (trigger === 'restore') return 'Before restore';
 	return 'Manual checkpoint';
@@ -152,7 +186,7 @@ function defaultLabel(trigger) {
  * Returns the checkpoint metadata when one was taken, else null (folded into the
  * burst already in progress). Called from the MCP service layer.
  */
-export function autoCheckpointBeforeAgentAction(nb) {
+export function autoCheckpointBeforeAgentAction(nb?: string | null): CheckpointMeta | null {
 	const key = keyFor(nb);
 	const now = Date.now();
 	const prev = lastAgentAt.get(key) ?? 0;
@@ -162,7 +196,7 @@ export function autoCheckpointBeforeAgentAction(nb) {
 }
 
 /** Find a stored checkpoint (with its cells) by id, or null. */
-function findCheckpoint(key, id) {
+function findCheckpoint(key: string, id: string): Checkpoint | null {
 	const store = ensureLoaded();
 	return (store[key] ?? []).find((c) => c.id === id) ?? null;
 }
@@ -173,7 +207,7 @@ function findCheckpoint(key, id) {
  * `notebook:restored` so every open tab refetches. The pre-restore state is
  * snapshotted first (trigger `restore`), so a restore is itself undoable.
  */
-export function restoreCheckpoint(nb, id, originId) {
+export function restoreCheckpoint(nb: string | null | undefined, id: string, originId?: string | null): RestoreResult {
 	const key = keyFor(nb);
 	const cp = findCheckpoint(key, id);
 	if (!cp) return { ok: false, error: 'not_found' };
@@ -188,7 +222,7 @@ export function restoreCheckpoint(nb, id, originId) {
  * headline flow. Returns `{ok:false, error:'no_agent_checkpoint'}` when the agent
  * has not acted (so there is nothing to undo).
  */
-export function undoLastAgentAction(nb, originId) {
+export function undoLastAgentAction(nb: string | null | undefined, originId?: string | null): RestoreResult {
 	const store = ensureLoaded();
 	const list = store[keyFor(nb)] ?? [];
 	for (let i = list.length - 1; i >= 0; i--) {
@@ -197,7 +231,7 @@ export function undoLastAgentAction(nb, originId) {
 	return { ok: false, error: 'no_agent_checkpoint' };
 }
 
-function scheduleWrite() {
+function scheduleWrite(): void {
 	dirty = true;
 	installExitHook();
 	if (writeTimer) return;
@@ -205,7 +239,7 @@ function scheduleWrite() {
 	if (typeof writeTimer.unref === 'function') writeTimer.unref();
 }
 
-function flush() {
+function flush(): void {
 	if (writeTimer) {
 		clearTimeout(writeTimer);
 		writeTimer = null;
@@ -219,7 +253,7 @@ function flush() {
 	} catch {}
 }
 
-function installExitHook() {
+function installExitHook(): void {
 	if (exitHookInstalled) return;
 	exitHookInstalled = true;
 	process.once('exit', flush);

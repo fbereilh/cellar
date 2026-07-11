@@ -10,9 +10,9 @@
  * 3. Self-exit if orphaned: if our launcher dies uncleanly we would otherwise keep
  *    running (reparented to init) and serve stale code to agents (parent-watch.js).
  */
-import { installConsoleCapture } from '$lib/server/logs.js';
-import { startMcpServer } from '$lib/server/mcp/server.js';
-import { startParentWatch } from '$lib/server/parent-watch.js';
+import { installConsoleCapture } from '$lib/server/logs';
+import { startMcpServer } from '$lib/server/mcp/server';
+import { startParentWatch } from '$lib/server/parent-watch';
 
 installConsoleCapture();
 startMcpServer();

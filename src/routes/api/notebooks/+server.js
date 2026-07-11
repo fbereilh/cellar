@@ -1,5 +1,5 @@
 import { json, error } from '@sveltejs/kit';
-import { getNotebook, setActiveNotebook, createNotebook } from '$lib/server/notebook.js';
+import { getNotebook, setActiveNotebook, createNotebook } from '$lib/server/notebook';
 
 /**
  * Live notebook documents. GET loads a workspace `.ipynb` as a live,

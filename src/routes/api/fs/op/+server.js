@@ -5,8 +5,8 @@ import {
 	deleteEntry,
 	moveEntry,
 	copyEntry
-} from '$lib/server/fstree.js';
-import { dropDocs, rekeyDocs } from '$lib/server/notebook.js';
+} from '$lib/server/fstree';
+import { dropDocs, rekeyDocs } from '$lib/server/notebook';
 
 /**
  * File-management operations for the sidebar file explorer. A single POST

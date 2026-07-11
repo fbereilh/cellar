@@ -37,7 +37,27 @@ const IGNORE_DIRS = new Set([
 const MAX_DEPTH = 8; // guard against pathological deep trees
 const MAX_FILE_BYTES = 2 * 1024 * 1024; // don't stream giant files into a tab
 
-export function workspaceRoot() {
+/**
+ * One node in the workspace file tree (`buildTree`'s recursive shape). The
+ * on-the-wire property is `type` (kept verbatim — the browser's file-tree
+ * consumer reads `node.type`), typed here as a 'file' | 'dir' union.
+ */
+export interface TreeNode {
+	name: string;
+	path: string;
+	type: 'file' | 'dir';
+	/** Present (possibly empty) only on directory nodes. */
+	children?: TreeNode[];
+}
+
+/** Result of `buildTree()`. */
+export interface WorkspaceTree {
+	root: string;
+	name: string;
+	tree: TreeNode[];
+}
+
+export function workspaceRoot(): string {
 	return process.env.CELLAR_WORKSPACE || process.cwd();
 }
 
@@ -45,7 +65,7 @@ export function workspaceRoot() {
  * Resolve a workspace-relative path to an absolute one, guaranteeing it stays
  * inside the workspace. Throws on traversal (`..`) or absolute escapes.
  */
-export function resolveInWorkspace(relPath) {
+export function resolveInWorkspace(relPath: string): string {
 	const root = resolve(workspaceRoot());
 	const abs = resolve(root, relPath ?? '');
 	if (abs !== root && !abs.startsWith(root + sep)) {
@@ -55,16 +75,16 @@ export function resolveInWorkspace(relPath) {
 }
 
 /** Build a nested {name, path, type, children?} tree of the workspace. */
-export function buildTree() {
+export function buildTree(): WorkspaceTree {
 	const root = resolve(workspaceRoot());
-	function walk(absDir, depth) {
+	function walk(absDir: string, depth: number): TreeNode[] {
 		let entries;
 		try {
 			entries = readdirSync(absDir, { withFileTypes: true });
 		} catch {
 			return [];
 		}
-		const nodes = [];
+		const nodes: TreeNode[] = [];
 		for (const e of entries) {
 			if (e.name.startsWith('.') && e.name !== '.gitignore') continue;
 			if (e.isDirectory() && IGNORE_DIRS.has(e.name)) continue;
@@ -92,7 +112,7 @@ export function buildTree() {
 }
 
 /** Read a workspace file's text content. Throws on escape / too-large / binary. */
-export function readWorkspaceFile(relPath) {
+export function readWorkspaceFile(relPath: string): string {
 	const abs = resolveInWorkspace(relPath);
 	const st = statSync(abs);
 	if (!st.isFile()) throw new Error('not a file');
@@ -105,7 +125,7 @@ export function readWorkspaceFile(relPath) {
 }
 
 /** Write text content to a workspace file (used by editor-tab save). */
-export function writeWorkspaceFile(relPath, content) {
+export function writeWorkspaceFile(relPath: string, content: string | null | undefined): void {
 	const abs = resolveInWorkspace(relPath);
 	writeFileSync(abs, content ?? '', 'utf8');
 }
@@ -116,14 +136,25 @@ export function writeWorkspaceFile(relPath, content) {
 // workspace root itself. Paths returned are workspace-relative (forward-slash),
 // matching the tree/git keys, so the caller can refresh + reveal.
 
+/** A single-path result from a file op that has no distinct "from". */
+export interface FsOpPathResult {
+	path: string;
+}
+
+/** A result from a file op that moved/renamed/copied something. */
+export interface FsOpFromResult {
+	from: string;
+	path: string;
+}
+
 /** Normalize an absolute path back to a workspace-relative, forward-slash key. */
-function toRel(abs) {
+function toRel(abs: string): string {
 	const root = resolve(workspaceRoot());
 	return relative(root, abs).split(sep).join('/');
 }
 
 /** Guard: resolve a path that must stay strictly *inside* the workspace root. */
-function resolveInside(relPath) {
+function resolveInside(relPath: string): string {
 	const root = resolve(workspaceRoot());
 	const abs = resolveInWorkspace(relPath);
 	if (abs === root) throw new Error('cannot operate on the workspace root');
@@ -131,7 +162,7 @@ function resolveInside(relPath) {
 }
 
 /** Reject names that would traverse or nest (a single path segment only), or that are hidden (`.`-prefixed, which the explorer never lists). */
-function assertSimpleName(name) {
+function assertSimpleName(name: string | null | undefined): string {
 	const n = (name ?? '').trim();
 	if (!n) throw new Error('name required');
 	if (n === '.' || n === '..' || n.includes('/') || n.includes('\\') || n.includes('\0')) {
@@ -146,7 +177,7 @@ function assertSimpleName(name) {
  * appending " copy", " copy 2", … before the extension (VS Code-style). Used on
  * paste so a move/copy into an occupied name never clobbers the existing entry.
  */
-function dedupeDest(destAbs) {
+function dedupeDest(destAbs: string): string {
 	if (!existsSync(destAbs)) return destAbs;
 	const dir = dirname(destAbs);
 	const base = basename(destAbs);
@@ -160,7 +191,7 @@ function dedupeDest(destAbs) {
 }
 
 /** Create an empty file (or an empty folder) inside a workspace directory. */
-export function createEntry(parentRel, name, kind) {
+export function createEntry(parentRel: string, name: string, kind: 'file' | 'dir'): FsOpPathResult {
 	const cleanName = assertSimpleName(name);
 	// Resolve the parent (may be '' for the workspace root) and the target.
 	const parentAbs = resolveInWorkspace(parentRel);
@@ -177,7 +208,7 @@ export function createEntry(parentRel, name, kind) {
 }
 
 /** Rename a file/folder in place (same parent, new base name). */
-export function renameEntry(relPath, newName) {
+export function renameEntry(relPath: string, newName: string): FsOpPathResult | FsOpFromResult {
 	const cleanName = assertSimpleName(newName);
 	const abs = resolveInside(relPath);
 	if (!existsSync(abs)) throw new Error('not found');
@@ -189,7 +220,7 @@ export function renameEntry(relPath, newName) {
 }
 
 /** Delete a file, or a folder recursively. */
-export function deleteEntry(relPath) {
+export function deleteEntry(relPath: string): FsOpPathResult {
 	const abs = resolveInside(relPath);
 	if (!existsSync(abs)) throw new Error('not found');
 	rmSync(abs, { recursive: true, force: true });
@@ -200,7 +231,7 @@ export function deleteEntry(relPath) {
  * Move a file/folder into a destination folder (cut → paste). Auto-suffixes on
  * a name collision. Rejects moving a folder into itself or a descendant.
  */
-export function moveEntry(fromRel, destDirRel) {
+export function moveEntry(fromRel: string, destDirRel: string): FsOpFromResult {
 	const fromAbs = resolveInside(fromRel);
 	if (!existsSync(fromAbs)) throw new Error('not found');
 	const destDirAbs = resolveInWorkspace(destDirRel);
@@ -219,7 +250,7 @@ export function moveEntry(fromRel, destDirRel) {
  * paste). Auto-suffixes on a name collision. Rejects copying a folder into
  * itself or a descendant.
  */
-export function copyEntry(fromRel, destDirRel) {
+export function copyEntry(fromRel: string, destDirRel: string): FsOpFromResult {
 	const fromAbs = resolveInside(fromRel);
 	if (!existsSync(fromAbs)) throw new Error('not found');
 	const destDirAbs = resolveInWorkspace(destDirRel);

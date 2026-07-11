@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { getVenvInfo, bindVenv } from '$lib/server/venv-bind.js';
-import { rebindKernel } from '$lib/server/kernel.js';
+import { getVenvInfo, bindVenv } from '$lib/server/venv-bind';
+import { rebindKernel } from '$lib/server/kernel';
 
 /** Current venv binding for the Settings control. */
 export async function GET() {

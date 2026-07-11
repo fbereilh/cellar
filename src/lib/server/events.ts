@@ -15,7 +15,7 @@
  * and refetches that notebook on a detected gap (the correctness backstop).
  */
 import { EventEmitter } from 'node:events';
-import type { CellarEvent, PublishedEvent, GlobalEvent, DispatchedEvent } from './types.js';
+import type { CellarEvent, PublishedEvent, GlobalEvent, DispatchedEvent } from './types';
 
 const emitter = new EventEmitter();
 // One listener per open SSE stream; a browser may hold several tabs open.

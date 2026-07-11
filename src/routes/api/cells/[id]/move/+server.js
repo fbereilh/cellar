@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { moveCell, moveCellTo } from '$lib/server/notebook.js';
+import { moveCell, moveCellTo } from '$lib/server/notebook';
 
 /**
  * Move a cell. Body: { toIndex: number, nb? } for an absolute-index move

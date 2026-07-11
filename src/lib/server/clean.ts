@@ -18,7 +18,7 @@
  * MUST be idempotent: cleaning an already-clean notebook yields zero change.
  */
 
-import type { CellMetadata } from './types.js';
+import type { CellMetadata } from './types';
 
 /** Cell-metadata keys preserved through a clean. Everything else is dropped. */
 export const ALLOWED_CELL_METADATA = ['cellar'];

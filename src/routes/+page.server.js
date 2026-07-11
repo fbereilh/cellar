@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { getDefaultNotebook } from '$lib/server/notebook.js';
-import { workspaceRoot } from '$lib/server/fstree.js';
+import { getDefaultNotebook } from '$lib/server/notebook';
+import { workspaceRoot } from '$lib/server/fstree';
 import { mcpConfigPath } from '$lib/server/runtime.js';
-import { getUiState } from '$lib/server/ui-state.js';
+import { getUiState } from '$lib/server/ui-state';
 
 /**
  * Whether `<workspace>/.mcp.json` currently registers the `cellar` stdio server.

@@ -17,12 +17,12 @@
  *   try { return await executeCellRun({ nb, cellId, actor, source: ticket.source() }); }
  *   finally { ticket.done(); }
  */
-import { execute, markNotebookLoaded } from './kernel.js';
-import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook.js';
-import { publish } from './events.js';
+import { execute, markNotebookLoaded } from './kernel';
+import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook';
+import { publish } from './events';
 import { isSqlCell } from '../cellLanguage.js';
-import { sqlToPython } from './sql.js';
-import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types.js';
+import { sqlToPython } from './sql';
+import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types';
 
 /** Arguments to `executeCellRun`. */
 export interface CellRunArgs {

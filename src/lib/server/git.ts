@@ -15,16 +15,49 @@
  * with the workspace root as the working directory.
  */
 import { execFile } from 'node:child_process';
-import { workspaceRoot, resolveInWorkspace } from './fstree.js';
+import { workspaceRoot, resolveInWorkspace } from './fstree';
 
 const MAX_GIT_BUFFER = 8 * 1024 * 1024;
+
+/** Single-letter git decoration, matching VS Code's convention. */
+export type GitStatusLetter = 'M' | 'A' | 'D' | 'R' | 'U' | 'C';
+
+/** Result of `gitStatus()`: whether the workspace is a repo + its file decorations. */
+export interface GitStatusResult {
+	isRepo: boolean;
+	files: Record<string, GitStatusLetter>;
+}
+
+/** Result of `gitHeadFile()`: one file's content as of git HEAD. */
+export interface GitHeadFileResult {
+	isRepo: boolean;
+	tracked: boolean;
+	content: string | null;
+}
+
+/** One parsed `git blame --line-porcelain` line record. */
+export interface BlameLine {
+	commit: string;
+	shortSha: string | null;
+	author: string;
+	authorTime: number | null;
+	summary: string;
+	notCommitted: boolean;
+}
+
+/** Result of `gitBlameFile()`. */
+export interface GitBlameFileResult {
+	isRepo: boolean;
+	tracked: boolean;
+	lines: BlameLine[];
+}
 
 /**
  * Collapse a two-char porcelain XY code into a single display letter, matching
  * VS Code's git decorations:
  *   M modified · A added · D deleted · R renamed · U untracked · C conflict
  */
-function classify(xy) {
+function classify(xy: string): GitStatusLetter {
 	const x = xy[0];
 	const y = xy[1];
 	if (xy === '??') return 'U'; // untracked
@@ -42,7 +75,7 @@ function classify(xy) {
 }
 
 /** Run `git status --porcelain` at the workspace root (NUL-delimited). */
-function runStatus(root) {
+function runStatus(root: string): Promise<string | null> {
 	return new Promise((resolve) => {
 		execFile(
 			'git',
@@ -66,7 +99,7 @@ function runStatus(root) {
  * paths are repo-root-relative, so we strip this to key the map by the same
  * workspace-relative paths the file tree uses.
  */
-function runPrefix(root) {
+function runPrefix(root: string): Promise<string> {
 	return new Promise((resolve) => {
 		execFile('git', ['-C', root, 'rev-parse', '--show-prefix'], (err, stdout) => {
 			if (err) {
@@ -88,8 +121,8 @@ function runPrefix(root) {
  *   slash), stripped so keys are workspace-relative. Paths outside the
  *   workspace subtree are dropped.
  */
-function parse(stdout, prefix) {
-	const map = {};
+function parse(stdout: string, prefix: string): Record<string, GitStatusLetter> {
+	const map: Record<string, GitStatusLetter> = {};
 	const parts = stdout.split('\0');
 	for (let i = 0; i < parts.length; i++) {
 		const entry = parts[i];
@@ -113,7 +146,7 @@ function parse(stdout, prefix) {
  * Git status for the workspace.
  * @returns {Promise<{isRepo: boolean, files: Record<string,string>}>}
  */
-export async function gitStatus() {
+export async function gitStatus(): Promise<GitStatusResult> {
 	const root = workspaceRoot();
 	const stdout = await runStatus(root);
 	if (stdout == null) return { isRepo: false, files: {} };
@@ -122,7 +155,7 @@ export async function gitStatus() {
 }
 
 /** Run a git subcommand at the workspace root; `null` on any failure. */
-function runGit(root, args) {
+function runGit(root: string, args: string[]): Promise<string | null> {
 	return new Promise((resolve) => {
 		execFile('git', ['-C', root, ...args], { maxBuffer: MAX_GIT_BUFFER }, (err, stdout) => {
 			resolve(err ? null : stdout);
@@ -143,7 +176,7 @@ function runGit(root, args) {
  * @param {string} relPath Workspace-relative path (path-guarded).
  * @returns {Promise<{isRepo: boolean, tracked: boolean, content: string|null}>}
  */
-export async function gitHeadFile(relPath) {
+export async function gitHeadFile(relPath: string): Promise<GitHeadFileResult> {
 	const root = workspaceRoot();
 	resolveInWorkspace(relPath); // throws if the path escapes the workspace
 	const rel = String(relPath ?? '').replace(/\\/g, '/');
@@ -173,9 +206,10 @@ const ZERO_SHA = '0000000000000000000000000000000000000000';
  * SHA with author `Not Committed Yet`; we flag it `notCommitted` so the UI can
  * say "You · uncommitted" instead of a bogus author/date.
  */
-function parseBlame(stdout) {
-	const lines = [];
-	let cur = null;
+function parseBlame(stdout: string): BlameLine[] {
+	const lines: BlameLine[] = [];
+	let cur: { commit: string; author: string; authorTime: number; summary: string; notCommitted: boolean } | null =
+		null;
 	for (const raw of stdout.split('\n')) {
 		// A header line "<sha> <orig> <final> [count]" opens a new line's block.
 		if (/^[0-9a-f]{40} \d+ \d+/.test(raw)) {
@@ -214,7 +248,7 @@ function parseBlame(stdout) {
  * @param {string} relPath Workspace-relative path (path-guarded).
  * @returns {Promise<{isRepo: boolean, tracked: boolean, lines: Array<object>}>}
  */
-export async function gitBlameFile(relPath) {
+export async function gitBlameFile(relPath: string): Promise<GitBlameFileResult> {
 	const root = workspaceRoot();
 	resolveInWorkspace(relPath); // throws if the path escapes the workspace
 	const rel = String(relPath ?? '').replace(/\\/g, '/');

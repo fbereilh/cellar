@@ -1,6 +1,6 @@
 import { error } from '@sveltejs/kit';
-import { listCells, resolveNotebookPath } from '$lib/server/notebook.js';
-import { renderNotebookHtml, exportFilename } from '$lib/server/export-html.js';
+import { listCells, resolveNotebookPath } from '$lib/server/notebook';
+import { renderNotebookHtml, exportFilename } from '$lib/server/export-html';
 
 /**
  * Export a notebook to a single self-contained HTML file.

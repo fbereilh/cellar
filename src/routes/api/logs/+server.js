@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { getLogs, clearLogs, MAX_ENTRIES } from '$lib/server/logs.js';
+import { getLogs, clearLogs, MAX_ENTRIES } from '$lib/server/logs';
 
 /**
  * Backfill the Logs panel with the current ring buffer. New entries after this

@@ -1,7 +1,7 @@
 import { json, error } from '@sveltejs/kit';
-import { readWorkspaceFile } from '$lib/server/fstree.js';
-import { JupytextError, detectPyNotebook, ensureJupytext, isPyPath, statusFor } from '$lib/server/jupytext.js';
-import { exportNotebookAsPy, convertPyToIpynb } from '$lib/server/jupytext-actions.js';
+import { readWorkspaceFile } from '$lib/server/fstree';
+import { JupytextError, detectPyNotebook, ensureJupytext, isPyPath, statusFor } from '$lib/server/jupytext';
+import { exportNotebookAsPy, convertPyToIpynb } from '$lib/server/jupytext-actions';
 
 /**
  * jupytext / Databricks `.py` notebook support.

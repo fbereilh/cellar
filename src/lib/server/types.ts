@@ -1,5 +1,5 @@
 /**
- * Cellar — shared server-side domain types.
+ * Cellar - shared server-side domain types.
  *
  * One cohesive home for the types that cross module boundaries: the canonical
  * notebook document + cell shapes, nbformat output objects, the kernel session /
@@ -30,7 +30,7 @@ export type SessionId = number;
 
 /**
  * Runtime-only run stamp recorded in `metadata.cellar.lastRun`. Never persisted
- * to disk (clean.js strips it) — the `session` epoch is the sole evidence a cell
+ * to disk (clean.js strips it) - the `session` epoch is the sole evidence a cell
  * ran against the namespace that is live right now.
  */
 export interface LastRun {
@@ -247,7 +247,7 @@ export type PublishedEvent = CellarEvent & { seq: number };
 
 /**
  * A global event that belongs to no single notebook (the kernel run queue). It
- * is a FULL state snapshot, so it carries no `seq` — a missed one self-heals on
+ * is a FULL state snapshot, so it carries no `seq` - a missed one self-heals on
  * the next. Dispatched before the per-notebook `nb`/`seq` filter.
  */
 export interface GlobalEvent {

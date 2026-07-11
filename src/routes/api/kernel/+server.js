@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit';
 import { basename } from 'node:path';
-import { getKernelInfo, loadedNotebookPaths } from '$lib/server/kernel.js';
-import { workspaceRelative } from '$lib/server/notebook.js';
+import { getKernelInfo, loadedNotebookPaths } from '$lib/server/kernel';
+import { workspaceRelative } from '$lib/server/notebook';
 
 /**
  * Current kernel status for the sidebar Kernels section (does not start one).

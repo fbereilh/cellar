@@ -8,8 +8,8 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { cleanNotebook, stripRuntimeMeta } from './clean.js';
-import type { Cell, NotebookDoc, NotebookMetadata, NbNotebook } from './types.js';
+import { cleanNotebook, stripRuntimeMeta } from './clean';
+import type { Cell, NotebookDoc, NotebookMetadata, NbNotebook } from './types';
 
 const NBFORMAT = 4;
 const NBFORMAT_MINOR = 5;
@@ -80,7 +80,7 @@ export function serialize(doc: { cells: Cell[]; metadata?: NotebookMetadata }): 
  * session. Only an in-process run/edit may originate those stamps. See clean.js.
  */
 export function deserialize(nb: {
-	cells?: Array<{ id?: string; cell_type?: string; source?: string | string[]; outputs?: unknown; metadata?: import('./types.js').CellMetadata }>;
+	cells?: Array<{ id?: string; cell_type?: string; source?: string | string[]; outputs?: unknown; metadata?: import('./types').CellMetadata }>;
 	metadata?: NotebookMetadata;
 }): { cells: Cell[]; metadata: NotebookMetadata } {
 	const cells: Cell[] = (nb.cells || []).map((c) => ({

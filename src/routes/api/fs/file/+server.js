@@ -1,5 +1,5 @@
 import { json, error } from '@sveltejs/kit';
-import { readWorkspaceFile, writeWorkspaceFile } from '$lib/server/fstree.js';
+import { readWorkspaceFile, writeWorkspaceFile } from '$lib/server/fstree';
 
 /** Read a workspace file's text content (for opening it into an editor tab). */
 export function GET({ url }) {

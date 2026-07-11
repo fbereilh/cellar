@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { login, statusFor } from '$lib/server/databricks.js';
+import { login, statusFor } from '$lib/server/databricks';
 
 /**
  * Sign in to a workspace so the fast listing subprocesses (and the kernel

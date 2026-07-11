@@ -12,24 +12,40 @@
  *      cell that errors still lands its error output in the `.ipynb`, exactly as
  *      a normal run would; convert never aborts on a bad cell.
  */
-import { listCells, resolveNotebookPath } from './notebook.js';
-import { writeNotebook } from './ipynb.js';
-import { enqueueRun } from './run-queue.js';
-import { executeCellRun } from './run.js';
+import { listCells, resolveNotebookPath } from './notebook';
+import { writeNotebook } from './ipynb';
+import { enqueueRun } from './run-queue';
+import { executeCellRun } from './run';
 import {
 	JupytextError,
 	SAVE_FORMATS,
 	ensureJupytext,
 	resolveInWorkspace,
 	writePyNotebook
-} from './jupytext.js';
+} from './jupytext';
+import type { Actor } from './types';
+
+/** Result of running every code cell of a `.py` notebook during a convert. */
+interface RunSummary {
+	total: number;
+	ok: number;
+	errors: number;
+}
 
 /**
  * Write `source` notebook's cells to `target` (`.py`) in `format`. `source` may
  * be an `.ipynb` or another `.py`; only source + cell type are written (no
  * outputs). Returns the workspace-relative target path.
  */
-export async function exportNotebookAsPy({ source, target, format }) {
+export async function exportNotebookAsPy({
+	source,
+	target,
+	format
+}: {
+	source?: string;
+	target: string;
+	format: string;
+}): Promise<{ path: string; format: string }> {
 	if (!SAVE_FORMATS.includes(format)) {
 		throw new JupytextError('bad_request', `unsupported format: ${JSON.stringify(format)} (use one of ${SAVE_FORMATS.join(', ')})`);
 	}
@@ -50,7 +66,7 @@ export async function exportNotebookAsPy({ source, target, format }) {
  * a `{ total, ok, errors }` summary. Errors are not fatal — the whole point of
  * convert is to capture them as outputs.
  */
-async function runAllCells(nb, actor, originId) {
+async function runAllCells(nb: string, actor: Actor, originId?: string | null): Promise<RunSummary> {
 	const cells = listCells(nb).filter((c) => c.cell_type === 'code');
 	let ok = 0;
 	let errors = 0;
@@ -78,7 +94,17 @@ async function runAllCells(nb, actor, originId) {
  * (with outputs) to `target`. Returns `{ path, ran }` where `ran` is the run
  * summary. The `.py` itself is untouched (a run does not rewrite a text notebook).
  */
-export async function convertPyToIpynb({ source, target, actor = 'user', originId }) {
+export async function convertPyToIpynb({
+	source,
+	target,
+	actor = 'user',
+	originId
+}: {
+	source?: string;
+	target: string;
+	actor?: Actor;
+	originId?: string | null;
+}): Promise<{ path: string; ran: RunSummary }> {
 	if (!source || !/\.py$/i.test(source)) throw new JupytextError('bad_request', 'source must be a .py notebook');
 	if (!target || !/\.ipynb$/i.test(target)) throw new JupytextError('bad_request', 'target must be a .ipynb path');
 	// Loads the `.py` as a live doc (needs jupytext for percent/light); Databricks
@@ -88,6 +114,6 @@ export async function convertPyToIpynb({ source, target, actor = 'user', originI
 	listCells(abs); // force-load the doc so a bad `.py` fails here, before running anything
 	const ran = await runAllCells(abs, actor, originId);
 	const targetAbs = resolveInWorkspace(target);
-	writeNotebook(targetAbs, { cells: listCells(abs), metadata: undefined });
+	writeNotebook(targetAbs, { path: targetAbs, cells: listCells(abs), metadata: undefined });
 	return { path: target, ran };
 }

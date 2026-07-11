@@ -4,7 +4,7 @@ import {
 	createCheckpoint,
 	restoreCheckpoint,
 	undoLastAgentAction
-} from '$lib/server/checkpoints.js';
+} from '$lib/server/checkpoints';
 
 /**
  * Notebook checkpoints — the human-facing snapshot/restore surface.

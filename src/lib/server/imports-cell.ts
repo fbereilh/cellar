@@ -31,11 +31,41 @@ import {
 	setCellRole,
 	getImportsCell,
 	resolveNotebookPath
-} from './notebook.js';
+} from './notebook';
 import { IMPORTS_ROLE, isImportsCell } from '../importsRole.js';
-import { extractTopLevelImports, mergeImportSources, isImportsOnly, hasTopLevelImports } from './imports.js';
-import { enqueueRun, queuePosition } from './run-queue.js';
-import { executeCellRun } from './run.js';
+import { extractTopLevelImports, mergeImportSources, isImportsOnly, hasTopLevelImports } from './imports';
+import { enqueueRun, queuePosition, RunCancelled } from './run-queue';
+import { executeCellRun } from './run';
+import type { Actor, Cell, CellView, CellOutput, SessionId } from './types';
+
+/** The imports cell's run outcome: a run result, or a non-executing status when
+ * the kernel queue refused (duplicate/running) or dropped (cancelled) the ticket. */
+export interface ImportsRunResult {
+	id: string;
+	status: string;
+	queue_position?: number;
+	note?: string;
+	reason?: string;
+	session?: SessionId | null;
+	outputs?: CellOutput[];
+}
+
+/** The result of routing an agent's module-level imports into the imports cell. */
+export interface RouteImportsResult {
+	source: string;
+	added: string[];
+	importsCellId: string | null;
+}
+
+/** The result of a full-notebook consolidate sweep. */
+export interface ConsolidateResult {
+	changed: boolean;
+	imports_cell_id: string | null;
+	added: string[];
+	edited: number;
+	removed: number;
+	run: ImportsRunResult | null;
+}
 
 /**
  * The notebook's imports cell, creating it if needed.
@@ -50,18 +80,19 @@ import { executeCellRun } from './run.js';
  * To look one up WITHOUT creating it, use `getImportsCell` — this function always
  * leaves the notebook with an imports cell at index 0.
  */
-export function ensureImportsCell(nb, originId) {
+export function ensureImportsCell(nb?: string | null, originId?: string | null): Cell | CellView {
 	const cells = listCells(nb);
 	const existing = cells.find(isImportsCell);
 	if (existing) {
 		if (cells[0].id !== existing.id) moveCellTo(existing.id, 0, nb, originId);
-		return getCell(existing.id, nb);
+		// The cell was just located in this doc, so getCell cannot miss it.
+		return getCell(existing.id, nb)!;
 	}
 
 	const first = cells[0];
 	if (first && first.cell_type === 'code' && isImportsOnly(first.source)) {
 		setCellRole(first.id, IMPORTS_ROLE, nb, originId);
-		return getCell(first.id, nb);
+		return getCell(first.id, nb)!;
 	}
 	return addCellAt(0, 'code', nb, originId, '', IMPORTS_ROLE);
 }
@@ -79,7 +110,11 @@ export function ensureImportsCell(nb, originId) {
  * comes. Only a cell already EXECUTING right now cannot pick them up — the caller
  * is told so rather than being left to assume the kernel has them.
  */
-export async function runImportsCell(nb, actor = 'agent', originId) {
+export async function runImportsCell(
+	nb?: string | null,
+	actor: Actor = 'agent',
+	originId?: string | null
+): Promise<ImportsRunResult | null> {
 	const abs = resolveNotebookPath(nb);
 	const cell = listCells(abs).find(isImportsCell);
 	if (!cell) return null;
@@ -92,21 +127,21 @@ export async function runImportsCell(nb, actor = 'agent', originId) {
 			: { id: cell.id, status: 'running', note: 'the imports cell is executing right now, so it did not pick up the new imports; re-run it once it finishes.' };
 	}
 	try {
-		await ticket.wait();
+		await ticket.wait!();
 	} catch (err) {
-		return { id: cell.id, status: 'cancelled', reason: err?.reason ?? 'cancelled' };
+		return { id: cell.id, status: 'cancelled', reason: err instanceof RunCancelled ? err.reason : 'cancelled' };
 	}
 	try {
 		const res = await executeCellRun({
 			nb: abs,
 			cellId: cell.id,
 			actor,
-			source: ticket.source() ?? cell.source ?? '',
+			source: ticket.source!() ?? cell.source ?? '',
 			originId
 		});
 		return { id: cell.id, status: res.status, session: res.session, outputs: res.outputs };
 	} finally {
-		ticket.done();
+		ticket.done!();
 	}
 }
 
@@ -120,8 +155,13 @@ export async function runImportsCell(nb, actor = 'agent', originId) {
  * No import in the code (or an unparseable one) means no imports cell is created:
  * an agent writing `x = 1` must not conjure an empty pinned cell.
  */
-export function routeImports(source, nb, originId, { skipCellId = null } = {}) {
-	const none = { source, added: [], importsCellId: null };
+export function routeImports(
+	source: string,
+	nb?: string | null,
+	originId?: string | null,
+	{ skipCellId = null }: { skipCellId?: string | null } = {}
+): RouteImportsResult {
+	const none: RouteImportsResult = { source, added: [], importsCellId: null };
 	if (skipCellId && getImportsCell(nb)?.id === skipCellId) return none;
 	if (!hasTopLevelImports(source)) return none;
 
@@ -149,7 +189,10 @@ export function routeImports(source, nb, originId, { skipCellId = null } = {}) {
  * edits, deletions and insert rendered like any other tab's, rather than having to
  * replay a whole multi-cell sweep locally.
  */
-export async function consolidateImports(nb, { actor = 'user' } = {}) {
+export async function consolidateImports(
+	nb?: string | null,
+	{ actor = 'user' }: { actor?: Actor } = {}
+): Promise<ConsolidateResult> {
 	const abs = resolveNotebookPath(nb);
 	const cells = listCells(abs);
 	const existing = cells.find(isImportsCell);
@@ -160,9 +203,9 @@ export async function consolidateImports(nb, { actor = 'user' } = {}) {
 	const adoptable = !existing && cells[0]?.cell_type === 'code' && isImportsOnly(cells[0].source);
 	const importsSourceCell = existing ?? (adoptable ? cells[0] : null);
 
-	const collected = [];
-	const edits = [];
-	const removals = [];
+	const collected: string[] = [];
+	const edits: { id: string; source: string }[] = [];
+	const removals: string[] = [];
 	for (const cell of cells) {
 		if (cell.cell_type !== 'code' || cell.id === importsSourceCell?.id) continue;
 		const { statements, source, changed } = extractTopLevelImports(cell.source);

@@ -1,5 +1,5 @@
 import { json, error } from '@sveltejs/kit';
-import { consolidateImports } from '$lib/server/imports-cell.js';
+import { consolidateImports } from '$lib/server/imports-cell';
 
 /**
  * Consolidate a notebook's imports: sweep every module-level import into the
