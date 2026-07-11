@@ -59,7 +59,39 @@ namespace; notebook: `kernelspec` — drops `language_info`/`widgets`), normaliz
 
 ## Install
 
-Cellar ships as an npm package. From a clone:
+### Homebrew (recommended)
+
+Cellar is distributed through a Homebrew tap. It tracks **latest** (git `main`),
+not tagged releases, so it installs `--HEAD`:
+
+```sh
+brew tap fbereilh/cellar          # adds the fbereilh/homebrew-cellar tap
+brew install --HEAD cellar        # or: brew install --HEAD fbereilh/cellar/cellar
+```
+
+The `cellar` command is then on your PATH. Because `fbereilh/cellar` is a
+**private** repo, Homebrew clones `main` using your own GitHub git credentials
+(`gh auth`, SSH, or a PAT with repo access) — make sure you can `git clone` the
+repo before installing.
+
+**Update** to the newest `main` at any time:
+
+```sh
+cellar --update                   # install-method aware; runs brew upgrade for you
+```
+
+(Under the hood a Homebrew install runs `brew update && brew upgrade --fetch-HEAD
+cellar`; `--fetch-HEAD` is what makes a HEAD keg actually move to the new tip.)
+
+**Version / build** you are running:
+
+```sh
+cellar --version                  # prints the version + git short-sha + install method
+```
+
+### From a git clone (dev alternative)
+
+Cellar also ships as a plain npm package; from a clone:
 
 ```sh
 npm install
@@ -70,9 +102,7 @@ npm link          # makes `cellar` available on your PATH (or: npx .)
 `npm run build` also runs automatically on `npm pack`/`npm publish`
 (`prepack`/`prepublishOnly`).
 
-### Quick start / updating (Makefile)
-
-A root `Makefile` wraps the commands above. Run `make` (no target) to list them.
+A root `Makefile` wraps these. Run `make` (no target) to list them:
 
 ```sh
 make setup     # first-time install: npm install + build + chmod +x bin/cellar.js + npm link
@@ -82,6 +112,10 @@ make update    # pull the latest, reinstall deps, and rebuild
 `make setup` links `cellar` onto your PATH once; that link persists across
 rebuilds, so `make update` (pull → install → build) is all you need to move the
 already-linked `cellar` to the new version. See `make run` / `make dev` to run.
+
+On a git-clone install, `cellar --update` runs those same steps for you
+(`git pull --ff-only` → `npm ci` → `npm run build`), so `cellar --update` is the
+single update command regardless of how cellar was installed.
 
 ## Run it
 
