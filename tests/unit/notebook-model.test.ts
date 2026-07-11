@@ -1,0 +1,115 @@
+import { describe, it, expect, beforeAll } from 'vitest';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+/**
+ * Notebook-model basics against the real server-owned document (`notebook.ts`):
+ * stable cell IDs, add/move/delete, and duplicate-ID re-keying on load. The
+ * module reads its workspace from `CELLAR_WORKSPACE` at call time, so we point
+ * it at a scratch dir and address every op by an explicit notebook path (the
+ * module keeps a `docs` Map keyed by absolute path, so distinct filenames keep
+ * the tests isolated). Mutations persist to that scratch dir — never the repo.
+ */
+
+let WS: string;
+// Imported lazily after CELLAR_WORKSPACE is set so the module's first workspace
+// read resolves to the scratch dir.
+let nb: typeof import('../../src/lib/server/notebook');
+
+beforeAll(async () => {
+	WS = mkdtempSync(join(tmpdir(), 'cellar-nb-'));
+	process.env.CELLAR_WORKSPACE = WS;
+	nb = await import('../../src/lib/server/notebook');
+});
+
+describe('cell ids are stable and unique', () => {
+	it('mints a distinct id per cell and preserves it across edit/move', () => {
+		const path = 'ids.ipynb';
+		nb.createNotebook(path);
+		const a = nb.addCell(null, 'code', path, null, 'a = 1');
+		const b = nb.addCell(a.id, 'code', path, null, 'b = 2');
+		expect(a.id).not.toBe(b.id);
+
+		// Editing and moving must never regenerate an id (spec §3).
+		nb.setSource(a.id, 'a = 11', path);
+		nb.moveCell(b.id, 'up', path);
+		const ids = nb.listCells(path).map((c) => c.id);
+		expect(ids).toContain(a.id);
+		expect(ids).toContain(b.id);
+		expect(new Set(ids).size).toBe(ids.length);
+	});
+});
+
+describe('add / move / delete', () => {
+	it('adds after a given cell, moves, and deletes in order', () => {
+		const path = 'ops.ipynb';
+		nb.createNotebook(path); // seeds one empty code cell
+		const seed = nb.listCells(path)[0];
+
+		const c1 = nb.addCell(seed.id, 'code', path, null, 'one');
+		const c2 = nb.addCell(c1.id, 'markdown', path, null, '# two');
+		let order = nb.listCells(path).map((c) => c.id);
+		expect(order).toEqual([seed.id, c1.id, c2.id]);
+
+		// Move c2 to the top (index 0) and confirm.
+		nb.moveCellTo(c2.id, 0, path);
+		order = nb.listCells(path).map((c) => c.id);
+		expect(order).toEqual([c2.id, seed.id, c1.id]);
+
+		// Delete the middle cell.
+		nb.deleteCell(seed.id, path);
+		order = nb.listCells(path).map((c) => c.id);
+		expect(order).toEqual([c2.id, c1.id]);
+	});
+
+	it('reflects an edit in the persisted document', () => {
+		const path = 'edit.ipynb';
+		nb.createNotebook(path);
+		const c = nb.addCell(null, 'code', path, null, 'first');
+		nb.setSource(c.id, 'second', path);
+		expect(nb.getCell(c.id, path)?.source).toBe('second');
+		// And it hit disk (clean-on-save).
+		const raw = JSON.parse(readFileSync(join(WS, path), 'utf8'));
+		const onDisk = raw.cells.find((x: any) => x.id === c.id);
+		expect(onDisk.source.join('')).toBe('second');
+	});
+});
+
+describe('duplicate-ID re-keying on load', () => {
+	it('re-keys colliding and missing ids so every cell is unique', () => {
+		const path = join(WS, 'dupes.ipynb');
+		// A foreign notebook with two cells sharing an id and one with none.
+		writeFileSync(
+			path,
+			JSON.stringify({
+				nbformat: 4,
+				nbformat_minor: 5,
+				metadata: { kernelspec: { name: 'python3', display_name: 'python3' } },
+				cells: [
+					{ cell_type: 'code', id: 'dup', source: ['a'], outputs: [], metadata: {} },
+					{ cell_type: 'code', id: 'dup', source: ['b'], outputs: [], metadata: {} },
+					{ cell_type: 'code', source: ['c'], outputs: [], metadata: {} }
+				]
+			})
+		);
+		const cells = nb.listCells(path);
+		const ids = cells.map((c) => c.id);
+		expect(ids).toHaveLength(3);
+		expect(new Set(ids).size).toBe(3); // all unique after re-keying
+		expect(ids.every((id) => id && id.length > 0)).toBe(true);
+	});
+});
+
+describe('loading never writes an uninvited file', () => {
+	it('opening a non-existent default notebook drops no file on disk', async () => {
+		// A bare workspace with no notebook.ipynb: getDefaultNotebook materializes
+		// the shape in memory but must not create the file.
+		const bareWs = mkdtempSync(join(tmpdir(), 'cellar-bare-'));
+		process.env.CELLAR_WORKSPACE = bareWs;
+		const view = nb.getDefaultNotebook();
+		expect(view.cells.length).toBeGreaterThan(0);
+		expect(existsSync(join(bareWs, 'notebook.ipynb'))).toBe(false);
+		process.env.CELLAR_WORKSPACE = WS; // restore for any later tests
+	});
+});

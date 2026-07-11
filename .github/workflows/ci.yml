@@ -37,5 +37,10 @@ jobs:
       - name: Type-check
         run: npm run check
 
-      # Follow-up: a `test` step goes here once the smoke-test suite lands
-      # (no `test` script exists in package.json yet).
+      # Unit smoke tests (vitest) — pure Node, no browser, no kernel. These are
+      # the must-pass gate: clean-on-save idempotency/correctness + the notebook
+      # model. The Playwright E2E (`npm run test:e2e`) needs the full kernel
+      # runtime (uv + python3 + a cached host-venv) and is deliberately kept as a
+      # local, best-effort check — it is NOT run here (see the PR / README).
+      - name: Unit tests
+        run: npm run test
