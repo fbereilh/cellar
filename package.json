@@ -2,6 +2,13 @@
   "name": "cellar",
   "version": "0.1.0",
   "type": "module",
+  "license": "MIT",
+  "author": "Felipe Bereilh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fbereilh/cellar.git"
+  },
+  "homepage": "https://github.com/fbereilh/cellar#readme",
   "bin": {
     "cellar": "bin/cellar.js"
   },

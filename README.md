@@ -69,10 +69,8 @@ brew tap fbereilh/cellar          # adds the fbereilh/homebrew-cellar tap
 brew install --HEAD cellar        # or: brew install --HEAD fbereilh/cellar/cellar
 ```
 
-The `cellar` command is then on your PATH. Because `fbereilh/cellar` is a
-**private** repo, Homebrew clones `main` using your own GitHub git credentials
-(`gh auth`, SSH, or a PAT with repo access) — make sure you can `git clone` the
-repo before installing.
+The `cellar` command is then on your PATH. Homebrew clones `main` directly from
+the public `fbereilh/cellar` repo — no credentials required.
 
 **Update** to the newest `main` at any time:
 
@@ -309,3 +307,7 @@ Driven end-to-end in a real browser (and the saved `.ipynb` inspected):
 - Duplicate/missing cell IDs in a loaded file are re-keyed to unique slugs.
 
 See the commit message / status report for captured evidence.
+
+## License
+
+Released under the [MIT License](LICENSE).

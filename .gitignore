@@ -10,3 +10,9 @@ notebook.ipynb
 # ephemeral per-run instance state (live port map for `cellar mcp` discovery +
 # single-instance lock)
 .cellar/
+
+# secrets & local machine state (never commit)
+.env
+.env.*
+.databrickscfg
+.DS_Store
