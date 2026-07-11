@@ -69,8 +69,12 @@ export interface CellRegisterApi {
 	enterEdit: () => void;
 	/** True while CodeMirror owns an overlay (completion tooltip / search panel). */
 	editorOverlayOpen: () => boolean;
-	/** Run this cell (code) or render it (markdown), using the editor's live text. */
-	run: () => void;
+	/**
+	 * Run this cell (code) or render it (markdown), using the editor's live text.
+	 * `advance` moves focus to the next cell (Shift+Enter); `focusNext` picks
+	 * whether that focus lands in the next editor or on the cell (command mode).
+	 */
+	run: (advance?: boolean, opts?: { focusNext?: boolean }) => void;
 	/** Flip a markdown cell to its rendered view (no-op for code cells). */
 	showRendered: () => void;
 	isMarkdown: () => boolean;
