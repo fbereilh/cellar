@@ -47,7 +47,26 @@ function gitInfo(repoDir) {
 	const branch = capture('git', ['rev-parse', '--abbrev-ref', 'HEAD'], opts);
 	const date = capture('git', ['show', '-s', '--format=%cs', 'HEAD'], opts);
 	const dirty = capture('git', ['status', '--porcelain'], opts);
-	return { sha, branch: branch && branch !== 'HEAD' ? branch : null, date, dirty: !!dirty };
+	return { sha, branch: branch && branch !== 'HEAD' ? branch : null, date, dirty: !!dirty, source: 'git' };
+}
+
+/**
+ * Build identity stamped at BUILD time into build/build-info.json
+ * (scripts/gen-build-info.js runs as the `postbuild` hook). This is the source
+ * of truth for `--version` on a shipped build: it works even when there is no
+ * `.git` and no `git` on PATH (a Homebrew *stable* tarball install), where a
+ * runtime `git rev-parse` would return blank. Returns null for a dev checkout
+ * that has never been built, so callers fall back to live git.
+ */
+function buildInfo(repoDir) {
+	try {
+		const raw = readFileSync(join(repoDir, 'build', 'build-info.json'), 'utf8');
+		const info = JSON.parse(raw);
+		if (!info || typeof info !== 'object' || !info.version) return null;
+		return info;
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -84,19 +103,22 @@ export function detectInstall(repoDir) {
 
 /** Print `cellar --version` output. */
 export function printVersion(repoDir) {
-	const version = readVersion(repoDir);
 	const method = detectInstall(repoDir);
-	const g = gitInfo(repoDir);
+
+	// Prefer the build-time stamp (works with no `.git` — e.g. a Homebrew stable
+	// install); only fall back to live git for an unbuilt dev checkout.
+	const b = buildInfo(repoDir) || gitInfo(repoDir);
+	const version = (b && b.version) || readVersion(repoDir);
 
 	console.log(`cellar ${version}`);
-	if (g) {
-		const bits = [g.sha];
-		if (g.branch) bits.push(`(${g.branch})`);
-		if (g.date) bits.push(g.date);
-		if (g.dirty) bits.push('[dirty]');
+	if (b) {
+		const bits = [b.sha];
+		if (b.branch) bits.push(`(${b.branch})`);
+		if (b.date) bits.push(b.date);
+		if (b.dirty) bits.push('[dirty]');
 		console.log(`build: ${bits.join(' ')}`);
 	} else {
-		console.log('build: (no git metadata)');
+		console.log('build: (no build metadata)');
 	}
 	console.log(`install: ${method}${method === 'git' ? ` (${repoDir})` : ''}`);
 }

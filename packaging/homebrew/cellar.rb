@@ -20,6 +20,13 @@ class Cellar < Formula
   depends_on "uv"
 
   def install
+    # Stamp the build identity so `cellar --version` is meaningful even on a
+    # STABLE install (a source tarball with no `.git`, where a runtime
+    # `git rev-parse` returns blank). scripts/gen-build-info.js takes the version
+    # from here and, on a `--HEAD` build (which has a `.git`), still resolves the
+    # real git sha itself; a stable tarball has no git, so its sha is "release".
+    ENV["CELLAR_BUILD_VERSION"] = version.to_s
+
     # Build the adapter-node production server (build/index.js).
     system "npm", "ci"
     system "npm", "run", "build"
