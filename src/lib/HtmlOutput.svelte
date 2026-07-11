@@ -20,7 +20,7 @@
 	// safe.
 	import { browser } from '$app/environment';
 
-	let { html } = $props();
+	let { html }: { html: string | null | undefined } = $props();
 
 	let height = $state(120); // sensible pre-measurement default
 	const MAX = 600; // px; taller content scrolls within the iframe
@@ -30,7 +30,7 @@
 
 	// Wrap the user HTML in a minimal white document (viz libs assume a light
 	// background) plus the height reporter.
-	function buildSrcdoc(userHtml) {
+	function buildSrcdoc(userHtml: string): string {
 		return `<!doctype html><html><head><meta charset="utf-8"><base target="_blank"><style>
 html,body{margin:0;padding:8px;background:#ffffff;color:#1f2937;font-family:system-ui,-apple-system,sans-serif;font-size:14px;}
 img,svg,canvas,table{max-width:100%;}
@@ -48,7 +48,7 @@ img,svg,canvas,table{max-width:100%;}
 
 	$effect(() => {
 		if (!browser) return;
-		function onMessage(e) {
+		function onMessage(e: MessageEvent) {
 			const d = e.data;
 			if (d && d.__cellarHtml === token && typeof d.height === 'number') {
 				height = Math.max(40, Math.min(MAX, d.height));

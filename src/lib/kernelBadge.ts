@@ -7,11 +7,22 @@
 // Only a genuinely usable kernel may read green, so `idle` is the sole success
 // case and every other started status falls back to a non-green badge.
 
-export function kernelStatusLabel(info) {
+import type { KernelStatus, SessionId } from '$lib/server/types';
+
+/** Read-only kernel runtime state as returned by `getKernelInfo()` / `/api/kernel`. */
+export interface KernelInfo {
+	started: boolean;
+	id: string | null;
+	name: string;
+	status: KernelStatus;
+	session_id: SessionId | null;
+}
+
+export function kernelStatusLabel(info: KernelInfo | null | undefined): string {
 	return info?.started ? info.status : 'not started';
 }
 
-export function kernelBadgeClass(info) {
+export function kernelBadgeClass(info: KernelInfo | null | undefined): string {
 	if (!info?.started) return 'badge-ghost';
 	if (info.status === 'idle') return 'badge-success';
 	if (info.status === 'dead') return 'badge-error';

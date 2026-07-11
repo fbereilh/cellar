@@ -12,6 +12,14 @@
  * browser-safe module rather than a predicate copied on each side.
  */
 
+import type { CellMetadata } from '$lib/server/types';
+
+/**
+ * The minimal cell shape this rule reads. `Cell`/`CellView` are structurally
+ * assignable, so server and browser callers pass their own cells without a cast.
+ */
+type RoleCell = { cell_type?: string; metadata?: CellMetadata | null } | null | undefined;
+
 /** The `metadata.cellar.role` value that designates the imports cell. */
 export const IMPORTS_ROLE = 'imports';
 
@@ -20,12 +28,12 @@ export const IMPORTS_ROLE = 'imports';
  * the cell to markdown demotes it (see `setCellType`) rather than leaving an
  * un-runnable cell claiming to hold the imports.
  */
-export function isImportsCell(cell) {
+export function isImportsCell(cell: RoleCell): boolean {
 	return !!cell && cell.cell_type === 'code' && cell.metadata?.cellar?.role === IMPORTS_ROLE;
 }
 
 /** Index of the notebook's imports cell, or -1. */
-export function importsCellIndex(cells) {
+export function importsCellIndex(cells: readonly RoleCell[] | null | undefined): number {
 	return (cells ?? []).findIndex(isImportsCell);
 }
 
@@ -42,7 +50,11 @@ export function importsCellIndex(cells) {
  * an `.ipynb` written elsewhere) is left free to move until `ensureImportsCell`
  * hoists it — the pin is a rule about the cell at the top, not a lock on a role.
  */
-export function clampMoveIndex(cells, fromIndex, toIndex) {
+export function clampMoveIndex(
+	cells: readonly RoleCell[] | null | undefined,
+	fromIndex: number,
+	toIndex: number
+): number {
 	if (!isImportsCell(cells?.[0])) return toIndex;
 	if (fromIndex === 0) return -1; // the pinned imports cell never moves
 	return Math.max(1, toIndex);

@@ -27,23 +27,20 @@ const LS_PREFIX = 'cellar-';
  */
 const LS_SKIP = new Set(['cellar-shortcuts']);
 
-/** @type {Record<string, unknown>} */
-let cache = {};
+let cache: Record<string, unknown> = {};
 let hydrated = false;
 
-/** @type {Record<string, unknown>} */
-let pending = {};
-/** @type {ReturnType<typeof setTimeout> | null} */
-let flushTimer = null;
+let pending: Record<string, unknown> = {};
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * Seed the cache from the SSR-provided store, then one-time migrate any prefs a
  * returning same-port user still has in `localStorage`. Called once from
  * `+page.svelte` before any child reads a preference.
  */
-export function hydrateUiState(initial) {
+export function hydrateUiState(initial: unknown): void {
 	if (initial && typeof initial === 'object' && !Array.isArray(initial)) {
-		cache = { ...initial };
+		cache = { ...(initial as Record<string, unknown>) };
 	}
 	hydrated = true;
 	if (browser) {
@@ -54,13 +51,16 @@ export function hydrateUiState(initial) {
 	}
 }
 
-/** Current value for `key`, or `fallback` if unset / before hydration. */
-export function getUi(key, fallback) {
-	return hydrated && Object.prototype.hasOwnProperty.call(cache, key) ? cache[key] : fallback;
+/** Current value for `key`, or `fallback` if unset / before hydration. The store
+ * is untyped JSON, so the caller states the expected shape via `fallback`. */
+export function getUi<T>(key: string, fallback: T): T {
+	return hydrated && Object.prototype.hasOwnProperty.call(cache, key)
+		? (cache[key] as T)
+		: fallback;
 }
 
 /** Set `key` to `value` (pass `null` to delete) and schedule a server write. */
-export function setUi(key, value) {
+export function setUi(key: string, value: unknown): void {
 	if (value === null) delete cache[key];
 	else cache[key] = value;
 	pending[key] = value;
@@ -81,7 +81,7 @@ function migrateFromLocalStorage() {
 			if (Object.prototype.hasOwnProperty.call(cache, key)) continue;
 			const raw = localStorage.getItem(key);
 			if (raw == null) continue;
-			let value;
+			let value: unknown;
 			try {
 				value = JSON.parse(raw);
 			} catch {
@@ -95,12 +95,12 @@ function migrateFromLocalStorage() {
 	if (seeded) scheduleFlush();
 }
 
-function scheduleFlush() {
+function scheduleFlush(): void {
 	if (!browser || flushTimer) return;
 	flushTimer = setTimeout(() => flushNow(false), FLUSH_DEBOUNCE_MS);
 }
 
-function flushNow(keepalive) {
+function flushNow(keepalive: boolean): void {
 	if (flushTimer) {
 		clearTimeout(flushTimer);
 		flushTimer = null;

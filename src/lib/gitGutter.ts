@@ -12,30 +12,37 @@
  * the app theme toggles.
  */
 import { EditorView, gutter, GutterMarker } from '@codemirror/view';
-import { RangeSet, RangeSetBuilder, StateEffect, StateField } from '@codemirror/state';
-import { lineChanges } from '$lib/gitdiff';
+import {
+	EditorState,
+	type Extension,
+	RangeSet,
+	RangeSetBuilder,
+	StateEffect,
+	StateField
+} from '@codemirror/state';
+import { lineChanges, type LineChangeType } from '$lib/gitdiff';
 
 /** Set (or clear, with `null`) the git-HEAD text this editor diffs against. */
-export const setGitBaseline = StateEffect.define();
+export const setGitBaseline = StateEffect.define<string | null>();
 
 /** One marker per distinct class string; identity is what `RangeSet` dedupes on. */
-const markers = new Map();
+const markers = new Map<string, GitMarker>();
 class GitMarker extends GutterMarker {
-	constructor(cls) {
+	constructor(cls: string) {
 		super();
 		this.elementClass = cls;
 	}
 }
-function marker(cls) {
+function marker(cls: string): GitMarker {
 	let m = markers.get(cls);
 	if (!m) markers.set(cls, (m = new GitMarker(cls)));
 	return m;
 }
 
-const CLASS = { add: 'cm-gitChange-add', mod: 'cm-gitChange-mod' };
+const CLASS: Record<LineChangeType, string> = { add: 'cm-gitChange-add', mod: 'cm-gitChange-mod' };
 
 /** Point markers at the start of every decorated line, in ascending position. */
-function buildMarkers(state, baseline) {
+function buildMarkers(state: EditorState, baseline: string | null): RangeSet<GitMarker> {
 	if (baseline == null) return RangeSet.empty;
 	const doc = state.doc.toString();
 	if (doc === baseline) return RangeSet.empty;
@@ -44,8 +51,8 @@ function buildMarkers(state, baseline) {
 	const total = state.doc.lines;
 	// A line can carry both a change bar and a deletion seam (a run deleted at the
 	// end of a modified block), so classes accumulate per line.
-	const classes = new Map();
-	const add = (line, cls) => {
+	const classes = new Map<number, string>();
+	const add = (line: number, cls: string) => {
 		if (line < 1 || line > total) return;
 		const cur = classes.get(line);
 		classes.set(line, cur ? `${cur} ${cls}` : cls);
@@ -54,15 +61,21 @@ function buildMarkers(state, baseline) {
 	for (const [line] of deletedBefore) add(line, 'cm-gitChange-delBefore');
 	if (deletedAtEnd) add(total, 'cm-gitChange-delAfter');
 
-	const builder = new RangeSetBuilder();
+	const builder = new RangeSetBuilder<GitMarker>();
 	for (const line of [...classes.keys()].sort((a, b) => a - b)) {
 		const at = state.doc.line(line).from;
-		builder.add(at, at, marker(classes.get(line)));
+		builder.add(at, at, marker(classes.get(line)!));
 	}
 	return builder.finish();
 }
 
-const gitChanges = StateField.define({
+/** The `gitChanges` state field value: the current baseline + its computed markers. */
+interface GitChangesState {
+	baseline: string | null;
+	markers: RangeSet<GitMarker>;
+}
+
+const gitChanges = StateField.define<GitChangesState>({
 	create: () => ({ baseline: null, markers: RangeSet.empty }),
 	update(value, tr) {
 		let baseline = value.baseline;
@@ -82,7 +95,7 @@ const gitChanges = StateField.define({
 // isn't tracked), so the code column never shifts as markers come and go.
 const gitGutter = gutter({
 	class: 'cm-gitGutter',
-	markers: (view) => view.state.field(gitChanges).markers,
+	markers: (view: EditorView) => view.state.field(gitChanges).markers,
 	initialSpacer: () => marker('cm-gitChange-spacer')
 });
 
@@ -130,6 +143,6 @@ const gitGutterTheme = EditorView.baseTheme({
  * The extension. Listed *after* `basicSetup` so the bar renders as the rightmost
  * gutter, hard against the code — where VS Code puts it.
  */
-export function gitGutterExtension() {
+export function gitGutterExtension(): Extension[] {
 	return [gitChanges, gitGutter, gitGutterTheme];
 }

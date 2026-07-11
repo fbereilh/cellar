@@ -12,6 +12,18 @@
  * backstop (`EventSource` reconnects on its own).
  */
 import { browser } from '$app/environment';
+import type { DispatchedEvent } from '$lib/server/types';
+
+/** A synthetic frame emitted on every (re)connect so a notebook can resync. */
+export interface SseOpenEvent {
+	type: 'sse:open';
+}
+
+/** Anything a subscriber receives: a bus event, or the synthetic open frame. */
+export type ClientEvent = DispatchedEvent | SseOpenEvent;
+
+/** A subscriber callback. */
+export type EventListener = (ev: ClientEvent) => void;
 
 /**
  * Per-tab origin id. A UI run's POST carries this; the server echoes it on the
@@ -21,8 +33,8 @@ import { browser } from '$app/environment';
  */
 export const originId = browser && globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID() : 'ssr';
 
-let source = null;
-const listeners = new Set();
+let source: EventSource | null = null;
+const listeners = new Set<EventListener>();
 /**
  * The most recent `queue:changed` snapshot. The kernel's run queue only
  * broadcasts on a change, so a notebook mounted while a cell is already queued
@@ -30,13 +42,13 @@ const listeners = new Set();
  * the next enqueue. Replaying the latest snapshot to a new subscriber closes
  * that window — it is a full snapshot, so replaying it is always safe.
  */
-let lastQueue = null;
+let lastQueue: ClientEvent | null = null;
 
-function ensureSource() {
+function ensureSource(): void {
 	if (source || !browser) return;
 	source = new EventSource('/api/events');
-	source.addEventListener('message', (msg) => {
-		let ev;
+	source.addEventListener('message', (msg: MessageEvent) => {
+		let ev: ClientEvent;
 		try {
 			ev = JSON.parse(msg.data);
 		} catch {
@@ -55,7 +67,7 @@ function ensureSource() {
  * Subscribe to the shared event stream. Returns an unsubscribe function; the
  * underlying `EventSource` closes once the last subscriber unsubscribes.
  */
-export function subscribeEvents(listener) {
+export function subscribeEvents(listener: EventListener): () => void {
 	if (!browser) return () => {};
 	listeners.add(listener);
 	ensureSource();

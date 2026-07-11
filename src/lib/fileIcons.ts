@@ -9,11 +9,25 @@
  */
 
 // A colored rounded-square badge with a 1-2 char monogram (JS/TS/Py/etc.).
-function badge(bg, text, label, size = 7) {
+function badge(bg: string, text: string, label: string, size: number = 7): string {
 	return `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true"><rect x="1.5" y="1.5" width="13" height="13" rx="2.5" fill="${bg}"/><text x="8" y="11.2" text-anchor="middle" font-family="ui-sans-serif,system-ui,-apple-system,sans-serif" font-size="${size}" font-weight="700" fill="${text}">${label}</text></svg>`;
 }
 
-const ICONS = {
+type IconKind =
+	| 'python'
+	| 'jupyter'
+	| 'js'
+	| 'ts'
+	| 'json'
+	| 'svelte'
+	| 'markdown'
+	| 'config'
+	| 'image'
+	| 'folder'
+	| 'folderOpen'
+	| 'file';
+
+const ICONS: Record<IconKind, string> = {
 	python: badge('#3776ab', '#ffd43b', 'Py'),
 	// Jupyter: an orange notebook glyph (distinct shape from the orange Svelte badge).
 	jupyter:
@@ -40,7 +54,7 @@ const ICONS = {
 		'<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M3.8 1.8h5.2l3.4 3.4v8.9a.5.5 0 0 1-.5.5H3.8a.5.5 0 0 1-.5-.5V2.3a.5.5 0 0 1 .5-.5z" fill="none" stroke="#9aa3b2" stroke-width="1.2" stroke-linejoin="round"/><path d="M8.9 1.9v3.4h3.3" fill="none" stroke="#9aa3b2" stroke-width="1.2" stroke-linejoin="round"/></svg>'
 };
 
-const EXT_MAP = {
+const EXT_MAP: Record<string, IconKind> = {
 	py: 'python',
 	pyi: 'python',
 	ipynb: 'jupyter',
@@ -68,8 +82,13 @@ const EXT_MAP = {
 	ico: 'image'
 };
 
+export interface IconOpts {
+	dir?: boolean;
+	open?: boolean;
+}
+
 /** Icon key for a filename (or 'folder'/'folderOpen' for directories). */
-export function iconKind(name, { dir = false, open = false } = {}) {
+export function iconKind(name: string, { dir = false, open = false }: IconOpts = {}): IconKind {
 	if (dir) return open ? 'folderOpen' : 'folder';
 	const dot = name.lastIndexOf('.');
 	const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : '';
@@ -77,6 +96,6 @@ export function iconKind(name, { dir = false, open = false } = {}) {
 }
 
 /** Trusted static SVG string for a filename (for `{@html}`). */
-export function iconSvg(name, opts) {
+export function iconSvg(name: string, opts?: IconOpts): string {
 	return ICONS[iconKind(name, opts)];
 }

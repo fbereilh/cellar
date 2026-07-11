@@ -7,7 +7,7 @@
 	// looks exactly like a rendered notebook markdown cell. Unlike a cell it does
 	// not split on headings (no folding here), so the whole source renders as one
 	// blob. DOMPurify needs a DOM, hence the `browser` guard.
-	let { source = '' } = $props();
+	let { source = '' }: { source?: string } = $props();
 
 	const html = $derived(browser ? renderMarkdown(source) : '');
 	const isEmpty = $derived(!source.trim());

@@ -16,16 +16,25 @@
  * `markdown`), shared by the server and the browser so the two never disagree.
  */
 
+import type { CellMetadata, LogicalCellType } from '$lib/server/types';
+
+/**
+ * The minimal cell shape these helpers read. Every canonical cell shape
+ * (`Cell`, `CellView`, `NbCell`) is structurally assignable, so callers on both
+ * the server and the browser pass their own cells without a cast.
+ */
+type LanguageCell = { cell_type?: string; metadata?: CellMetadata | null } | null | undefined;
+
 /** The `cellar.language` value that marks a code cell as SQL. */
 export const SQL_LANGUAGE = 'sql';
 
 /** The editor language of a code cell: 'sql' when tagged, else 'python'. */
-export function cellLanguage(cell) {
+export function cellLanguage(cell: LanguageCell): 'sql' | 'python' {
 	return cell?.metadata?.cellar?.language === SQL_LANGUAGE ? SQL_LANGUAGE : 'python';
 }
 
 /** True for a code cell whose source is SQL (`cellar.language === 'sql'`). */
-export function isSqlCell(cell) {
+export function isSqlCell(cell: LanguageCell): boolean {
 	return cell?.cell_type === 'code' && cellLanguage(cell) === SQL_LANGUAGE;
 }
 
@@ -34,7 +43,7 @@ export function isSqlCell(cell) {
  * use: `markdown`, `sql`, or `code`. Distinct from the nbformat `cell_type`
  * (`code`/`markdown`) because SQL and Python share the `code` type on disk.
  */
-export function logicalCellType(cell) {
+export function logicalCellType(cell: LanguageCell): LogicalCellType {
 	if (cell?.cell_type === 'markdown') return 'markdown';
 	return isSqlCell(cell) ? 'sql' : 'code';
 }

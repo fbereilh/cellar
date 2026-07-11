@@ -9,6 +9,6 @@ import DOMPurify from 'dompurify';
 // markdown-it emits, so notebook / file content can't inject script.
 export const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
 
-export function renderMarkdown(src) {
+export function renderMarkdown(src: string | null | undefined): string {
 	return DOMPurify.sanitize(md.render(src || ''));
 }

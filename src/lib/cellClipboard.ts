@@ -11,19 +11,24 @@
 // a pasted cell would then show a saved result the live kernel never produced,
 // the exact stale-output trap the run-metadata design elsewhere avoids.
 
-/** @typedef {{cell_type:string, source:string, output_scrolled?:boolean}} ClipboardCell */
+import type { CellType } from '$lib/server/types';
 
-/** @type {ClipboardCell[]} */
-let entries = [];
+export interface ClipboardCell {
+	cell_type: CellType;
+	source: string;
+	output_scrolled?: boolean;
+}
+
+let entries: ClipboardCell[] = [];
 
 export const cellClipboard = {
 	/** Replace the clipboard contents (an array, so multi-cell copy can land later). */
-	copy(cells) {
+	copy(cells: ClipboardCell[]): void {
 		entries = cells.map((c) => ({ ...c }));
 	},
 
 	/** A fresh copy of the clipboard, so a paste can never mutate it. */
-	read() {
+	read(): ClipboardCell[] {
 		return entries.map((c) => ({ ...c }));
 	},
 

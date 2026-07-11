@@ -37,7 +37,7 @@ import { EditorView } from '@codemirror/view';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { tags as t } from '@lezer/highlight';
 
-const c = (name) => `var(--cellar-cm-${name})`;
+const c = (name: string): string => `var(--cellar-cm-${name})`;
 
 const cellarEditorTheme = EditorView.theme({
 	'&': { color: c('fg'), backgroundColor: c('bg') },

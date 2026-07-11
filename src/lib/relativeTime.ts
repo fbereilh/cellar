@@ -8,7 +8,7 @@
  * Human "time ago" for a past timestamp `at` relative to `now` (both ms epoch).
  * `just now` under 5s, then s / m / h / d. Future or missing → `just now`.
  */
-export function relativeTime(at, now = Date.now()) {
+export function relativeTime(at: number | null | undefined, now: number = Date.now()): string {
 	if (at == null) return '';
 	const diff = Math.max(0, now - at);
 	const s = Math.floor(diff / 1000);
@@ -27,12 +27,12 @@ export function relativeTime(at, now = Date.now()) {
  * years, with weeks/months/years so a line last touched long ago reads sensibly
  * ("3 days ago", "2 weeks ago", "5 months ago"). Future or missing → `just now`.
  */
-export function relativeTimeLong(at, now = Date.now()) {
+export function relativeTimeLong(at: number | null | undefined, now: number = Date.now()): string {
 	if (at == null) return '';
 	const s = Math.max(0, Math.floor((now - at) / 1000));
 	if (s < 30) return 'just now';
 	if (s < 60) return `${s} seconds ago`;
-	const units = [
+	const units: [number, string][] = [
 		[60, 'minute'],
 		[60, 'hour'],
 		[24, 'day'],
@@ -55,7 +55,7 @@ export function relativeTimeLong(at, now = Date.now()) {
  * Compact wall-clock duration for a run: `820ms` under a second, `1.2s` under a
  * minute, `1m 5s` beyond. Used for the `· 1.2s` segment of the run badge.
  */
-export function formatDuration(ms) {
+export function formatDuration(ms: number | null | undefined): string {
 	if (ms == null || !Number.isFinite(ms)) return '';
 	if (ms < 1000) return `${Math.round(ms)}ms`;
 	const s = ms / 1000;
