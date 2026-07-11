@@ -11,7 +11,8 @@
     "src/lib/server/venv.js",
     "src/lib/server/runtime.js",
     "src/lib/server/mcp-bridge.js",
-    "src/lib/server/selfupdate.js"
+    "src/lib/server/selfupdate.js",
+    "src/lib/server/instances.js"
   ],
   "engines": {
     "node": ">=18"
