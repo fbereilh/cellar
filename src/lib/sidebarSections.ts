@@ -8,7 +8,17 @@
  */
 
 /** Section keys in the order they ship. `sectionBody` in Sidebar.svelte renders exactly these. */
-export const DEFAULT_SECTION_ORDER = Object.freeze(['files', 'kernels', 'databricks', 'environment', 'agent', 'outline', 'history', 'vars', 'search']);
+export const DEFAULT_SECTION_ORDER: readonly string[] = Object.freeze([
+	'files',
+	'kernels',
+	'databricks',
+	'environment',
+	'agent',
+	'outline',
+	'history',
+	'vars',
+	'search'
+]);
 
 /**
  * Merge a persisted order with the defaults.
@@ -24,13 +34,14 @@ export const DEFAULT_SECTION_ORDER = Object.freeze(['files', 'kernels', 'databri
  *
  * Every default section always comes back exactly once, whatever `saved` holds.
  *
- * @param {unknown} saved value parsed out of localStorage (anything at all)
- * @param {readonly string[]} defaults
- * @returns {string[]}
+ * @param saved value parsed out of localStorage (anything at all)
  */
-export function reconcileSectionOrder(saved, defaults = DEFAULT_SECTION_ORDER) {
-	const order = [];
-	const placed = new Set();
+export function reconcileSectionOrder(
+	saved: unknown,
+	defaults: readonly string[] = DEFAULT_SECTION_ORDER
+): string[] {
+	const order: string[] = [];
+	const placed = new Set<string>();
 
 	if (Array.isArray(saved)) {
 		for (const key of saved) {
@@ -50,7 +61,7 @@ export function reconcileSectionOrder(saved, defaults = DEFAULT_SECTION_ORDER) {
 }
 
 /** Index in `order` where `defaults[i]` belongs, judged by its surviving default neighbours. */
-function defaultSlot(order, defaults, i) {
+function defaultSlot(order: string[], defaults: readonly string[], i: number): number {
 	for (let j = i - 1; j >= 0; j--) {
 		const at = order.indexOf(defaults[j]);
 		if (at !== -1) return at + 1;

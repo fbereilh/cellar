@@ -1,6 +1,46 @@
-<script>
-	import { iconSvg } from '$lib/fileIcons.js';
-	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
+<script lang="ts">
+	import { iconSvg } from '$lib/fileIcons';
+	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge';
+	import type { KernelInfo } from '$lib/kernelBadge';
+
+	// The tab fields the navbar renders. The shell (+page) holds richer tab
+	// objects (path/kind/…); structural typing lets it pass those here.
+	interface Tab {
+		id: string;
+		title: string;
+		preview?: boolean;
+		dirty?: boolean;
+		closable?: boolean;
+	}
+
+	interface Props {
+		tabs: Tab[];
+		activeTabId: string | null;
+		sidebarOpen: boolean;
+		kernelInfo: KernelInfo | null;
+		canConsolidateImports?: boolean;
+		consolidating?: boolean;
+		canSaveAsPy?: boolean;
+		canConvertToIpynb?: boolean;
+		converting?: boolean;
+		canExportHtml?: boolean;
+		canRunActions?: boolean;
+		canCheckpoint?: boolean;
+		onSelectTab: (id: string) => void;
+		onCloseTab: (id: string) => void;
+		onPromoteTab?: (id: string) => void;
+		onToggleSidebar: () => void;
+		onConsolidateImports: () => void;
+		onSaveAsPy: () => void;
+		onConvertToIpynb: () => void;
+		onExportHtml: () => void;
+		onRunStale: () => void;
+		onRunAbove: () => void;
+		onRunBelow: () => void;
+		onCheckpointNow: () => void;
+		onUndoAgent: () => void;
+		onOpenSettings: () => void;
+	}
 
 	let {
 		tabs,
@@ -29,7 +69,7 @@
 		onCheckpointNow,
 		onUndoAgent,
 		onOpenSettings
-	} = $props();
+	}: Props = $props();
 
 	// Reflect the real kernel state, not a phantom: no kernel started → a neutral
 	// "not started", never a green idle badge.

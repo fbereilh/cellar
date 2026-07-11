@@ -13,29 +13,58 @@
 // calling it inside a `$derived` keeps the palette in sync with rebindings and
 // with which notebook is active.
 
-import { shortcuts } from '$lib/shortcuts.svelte.js';
+import { shortcuts } from '$lib/shortcuts.svelte';
+
+/** One entry in the command palette. */
+export interface PaletteCommand {
+	id: string;
+	title: string;
+	category: string;
+	keys: string[];
+	run: () => void;
+	disabled: boolean;
+}
+
+/** The active notebook's action handle, exposed to the palette. */
+export interface NotebookCommandHandle {
+	dispatch: (shortcutId: string) => void;
+	runAll: () => void;
+	clearAll: () => void;
+}
+
+/** Shell-level handlers the palette invokes (theme, settings, kernel, …). */
+export interface AppCommandHandlers {
+	toggleTheme: () => void;
+	toggleSidebar: () => void;
+	interruptKernel: () => void;
+	restartKernel: () => void;
+	newNotebook: () => void;
+	consolidateImports: () => void;
+	openSettings: () => void;
+}
+
+/** Context passed to `buildCommands`. */
+export interface CommandContext {
+	notebook: NotebookCommandHandle | null;
+	app: AppCommandHandlers;
+}
 
 /** The live bindings of a registry shortcut (respects user rebindings). */
-export function keysForShortcut(id) {
+export function keysForShortcut(id: string): string[] {
 	return shortcuts.list.find((s) => s.id === id)?.keys ?? [];
 }
 
 /**
  * Build the palette's command list from the registry plus app/kernel/notebook
- * actions.
- *
- * @param {object} ctx
- * @param {null | {dispatch:(shortcutId:string)=>void, runAll:()=>void, clearAll:()=>void}} ctx.notebook
- *        The active notebook's action handle, or null when no notebook is open.
- * @param {object} ctx.app  Shell-level handlers (theme, settings, kernel, …).
- * @returns {{id:string,title:string,category:string,keys:string[],run:()=>void,disabled:boolean}[]}
+ * actions. Pure: reads the current binding of each shortcut and the app context,
+ * so calling it inside a `$derived` keeps the palette in sync.
  */
-export function buildCommands({ notebook, app }) {
+export function buildCommands({ notebook, app }: CommandContext): PaletteCommand[] {
 	const hasNotebook = !!notebook;
 
 	// A registry-backed notebook command: keybinding from the registry, handler
 	// dispatched into the notebook's own action for that same shortcut id.
-	const nb = (shortcutId, title, category) => ({
+	const nb = (shortcutId: string, title: string, category: string): PaletteCommand => ({
 		id: `nb:${shortcutId}`,
 		title,
 		category,
@@ -45,7 +74,13 @@ export function buildCommands({ notebook, app }) {
 	});
 
 	// A plain command with its own handler (no registry binding by default).
-	const cmd = (id, title, category, run, { keys = [], disabled = false } = {}) => ({
+	const cmd = (
+		id: string,
+		title: string,
+		category: string,
+		run: () => void,
+		{ keys = [], disabled = false }: { keys?: string[]; disabled?: boolean } = {}
+	): PaletteCommand => ({
 		id,
 		title,
 		category,
@@ -102,17 +137,18 @@ export function buildCommands({ notebook, app }) {
 // consecutive matches, so "rc" ranks "Run cell" above "Reorder … c…". Returns
 // the matched character positions so the UI can bold them.
 
-/**
- * @param {string} query
- * @param {string} text
- * @returns {{matched:boolean, score:number, positions:number[]}}
- */
-export function fuzzyMatch(query, text) {
+export interface FuzzyResult {
+	matched: boolean;
+	score: number;
+	positions: number[];
+}
+
+export function fuzzyMatch(query: string, text: string): FuzzyResult {
 	const q = query.trim().toLowerCase();
 	if (!q) return { matched: true, score: 0, positions: [] };
 	const t = text.toLowerCase();
 
-	const positions = [];
+	const positions: number[] = [];
 	let score = 0;
 	let ti = 0;
 	let prevMatch = -2;
@@ -148,10 +184,16 @@ export function fuzzyMatch(query, text) {
  * palette shows what you can do right now. Ties keep the source order (which is
  * grouped by category), so an empty query renders the full grouped list.
  */
-export function filterCommands(commands, query) {
+export interface ScoredCommand {
+	command: PaletteCommand;
+	positions: number[];
+	score?: number;
+}
+
+export function filterCommands(commands: PaletteCommand[], query: string): ScoredCommand[] {
 	const enabled = commands.filter((c) => !c.disabled);
 	if (!query.trim()) return enabled.map((command) => ({ command, positions: [] }));
-	const scored = [];
+	const scored: ScoredCommand[] = [];
 	for (const command of enabled) {
 		const m = fuzzyMatch(query, command.title);
 		if (m.matched) scored.push({ command, positions: m.positions, score: m.score });
@@ -162,6 +204,6 @@ export function filterCommands(commands, query) {
 			if (cm.matched) scored.push({ command, positions: [], score: cm.score - 100 });
 		}
 	}
-	scored.sort((a, b) => b.score - a.score);
+	scored.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 	return scored;
 }

@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	// Renders a Plotly figure output (mimetype `application/vnd.plotly.v1+json`,
 	// whose payload is `{data, layout, config}`) as a live, interactive chart.
 	//
@@ -13,9 +13,17 @@
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
 
-	let { figure } = $props();
+	// The plotly payload `{data, layout, config}`. plotly.js ships no types we
+	// depend on here, so the figure is a loose structural shape.
+	interface PlotlyFigure {
+		data?: unknown[];
+		layout?: Record<string, any>;
+		config?: Record<string, unknown>;
+	}
 
-	let el = $state(null);
+	let { figure }: { figure: PlotlyFigure | null | undefined } = $props();
+
+	let el = $state<HTMLDivElement | null>(null);
 	let error = $state('');
 
 	// The container needs an explicit height: plotly's `responsive` mode sizes the
@@ -25,20 +33,22 @@
 	const plotHeight = $derived(Number(figure?.layout?.height) || 450);
 
 	// One shared, lazily-triggered import of the bundled plotly.js.
-	let plotlyPromise;
-	function loadPlotly() {
+	// plotly.js-dist-min ships no type declarations, so the module is `any` at
+	// this dynamic-import boundary.
+	let plotlyPromise: Promise<any> | undefined;
+	function loadPlotly(): Promise<any> {
 		if (!plotlyPromise) {
-			plotlyPromise = import('plotly.js-dist-min').then((m) => m.default ?? m);
+			plotlyPromise = import('plotly.js-dist-min' as any).then((m) => m.default ?? m);
 		}
 		return plotlyPromise;
 	}
 
 	// Resolve the app's active scheme so plotly text/gridlines stay legible in both
 	// themes. The figure's own layout always wins over these defaults.
-	function isDark() {
+	function isDark(): boolean {
 		return browser && document.documentElement.getAttribute('data-color-scheme') === 'dark';
 	}
-	function themedLayout(layout) {
+	function themedLayout(layout: Record<string, any> | undefined): Record<string, any> {
 		const dark = isDark();
 		const base = layout || {};
 		// Transparent backgrounds so the plot sits on the app's output surface;
@@ -59,9 +69,10 @@
 		};
 	}
 
-	let Plotly;
-	let resizeObs;
-	let themeObs;
+	// plotly.js-dist-min is untyped; the module handle is `any` at this boundary.
+	let Plotly: any;
+	let resizeObs: ResizeObserver | undefined;
+	let themeObs: MutationObserver | undefined;
 
 	async function draw() {
 		if (!browser || !el) return;
@@ -73,7 +84,7 @@
 			await Plotly.react(el, data, layout, config);
 			error = '';
 		} catch (e) {
-			error = String(e?.message || e);
+			error = String((e as Error)?.message || e);
 		}
 	}
 

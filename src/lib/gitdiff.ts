@@ -12,12 +12,53 @@
  * than hanging the editor.
  */
 
+import type { Cell } from '$lib/server/types';
+
+/** One step of a Myers edit script: keep / delete-from-a / insert-from-b. */
+type EditOp = '=' | '-' | '+';
+
+/** A changed region of a line diff (0-based indices into the full arrays). */
+export interface Hunk {
+	oldStart: number;
+	oldCount: number;
+	newStart: number;
+	newCount: number;
+}
+
+/** How a surviving line changed relative to the baseline. */
+export type LineChangeType = 'add' | 'mod';
+
+/** Result of {@link lineChanges}: per-line classification plus deletion markers. */
+export interface LineChanges {
+	/** 1-based line number → 'add' | 'mod'. */
+	lines: Map<number, LineChangeType>;
+	/** 1-based line number → how many lines vanished just above it. */
+	deletedBefore: Map<number, number>;
+	/** Lines that vanished off the end of the document. */
+	deletedAtEnd: number;
+}
+
+/** How a surviving cell changed relative to the baseline. */
+export type CellChangeStatus = 'added' | 'modified' | 'moved';
+
+/** The minimal cell shape the notebook diff needs (a structural subset of {@link Cell}). */
+type DiffCell = Pick<Cell, 'id' | 'cell_type' | 'source'>;
+
+/** Result of {@link notebookCellChanges}. */
+export interface NotebookCellChanges {
+	status: Record<string, CellChangeStatus>;
+	/** cell id → how many HEAD cells were removed just above it. */
+	removedBefore: Record<string, number>;
+	/** HEAD cells removed past the last surviving cell. */
+	removedAtEnd: number;
+}
+
 // Max edit distance (changed lines) we will trace. Beyond this the diff is not
 // interesting for a gutter, and the trace's O(D²) memory stops being free.
 const MAX_EDIT_DISTANCE = 1000;
 
 /** Split text into lines the way CodeMirror counts them (a trailing \n adds an empty last line). */
-export function splitLines(text) {
+export function splitLines(text: string | null | undefined): string[] {
 	return (text ?? '').split('\n');
 }
 
@@ -26,16 +67,16 @@ export function splitLines(text) {
  * Returns the edit script as `'='` (keep) / `'-'` (delete from a) / `'+'`
  * (insert from b), or `null` when the edit distance exceeds the bound.
  */
-function myers(a, b) {
+function myers<T>(a: T[], b: T[]): EditOp[] | null {
 	const N = a.length;
 	const M = b.length;
-	if (!N) return new Array(M).fill('+');
-	if (!M) return new Array(N).fill('-');
+	if (!N) return new Array<EditOp>(M).fill('+');
+	if (!M) return new Array<EditOp>(N).fill('-');
 
 	const maxD = Math.min(N + M, MAX_EDIT_DISTANCE);
 	const off = maxD + 1; // k ∈ [-d, d] ⊂ [-maxD, maxD] → index off+k stays in range
 	const v = new Int32Array(2 * maxD + 3);
-	const trace = [];
+	const trace: Int32Array[] = [];
 
 	for (let d = 0; d <= maxD; d++) {
 		trace.push(Int32Array.from(v)); // state *before* iteration d — what backtrack replays
@@ -56,10 +97,10 @@ function myers(a, b) {
 }
 
 /** Walk the recorded V-snapshots back from (N,M) to (0,0), emitting the edit script. */
-function backtrack(trace, off, N, M) {
+function backtrack(trace: Int32Array[], off: number, N: number, M: number): EditOp[] {
 	let x = N;
 	let y = M;
-	const ops = [];
+	const ops: EditOp[] = [];
 	for (let d = trace.length - 1; d > 0; d--) {
 		const v = trace[d];
 		const k = x - y;
@@ -90,7 +131,7 @@ function backtrack(trace, off, N, M) {
  * first, which is what makes the common "one line edited in a big file" case
  * essentially free.
  */
-export function diffLines(a, b) {
+export function diffLines(a: string[], b: string[]): Hunk[] {
 	let start = 0;
 	while (start < a.length && start < b.length && a[start] === b[start]) start++;
 	let endA = a.length;
@@ -107,10 +148,10 @@ export function diffLines(a, b) {
 		return [{ oldStart: start, oldCount: endA - start, newStart: start, newCount: endB - start }];
 	}
 
-	const hunks = [];
+	const hunks: Hunk[] = [];
 	let x = 0;
 	let y = 0;
-	let hunk = null;
+	let hunk: Hunk | null = null;
 	for (const op of ops) {
 		if (op === '=') {
 			if (hunk) {
@@ -141,11 +182,11 @@ export function diffLines(a, b) {
  *   deletedBefore 1-based line number → how many lines vanished just above it
  *   deletedAtEnd  lines that vanished off the end of the document
  */
-export function lineChanges(oldText, newText) {
+export function lineChanges(oldText: string, newText: string): LineChanges {
 	const before = splitLines(oldText);
 	const after = splitLines(newText);
-	const lines = new Map();
-	const deletedBefore = new Map();
+	const lines = new Map<number, LineChangeType>();
+	const deletedBefore = new Map<number, number>();
 	let deletedAtEnd = 0;
 
 	for (const h of diffLines(before, after)) {
@@ -158,7 +199,7 @@ export function lineChanges(oldText, newText) {
 			}
 			continue;
 		}
-		const type = h.oldCount === 0 ? 'add' : 'mod';
+		const type: LineChangeType = h.oldCount === 0 ? 'add' : 'mod';
 		for (let i = 0; i < h.newCount; i++) lines.set(h.newStart + 1 + i, type);
 	}
 	return { lines, deletedBefore, deletedAtEnd };
@@ -167,7 +208,11 @@ export function lineChanges(oldText, newText) {
 // ---- Notebook cell-level diff ---------------------------------------------
 
 /** No baseline / nothing changed. Frozen so callers can share one reference. */
-export const NO_CELL_CHANGES = Object.freeze({ status: {}, removedBefore: {}, removedAtEnd: 0 });
+export const NO_CELL_CHANGES: NotebookCellChanges = Object.freeze<NotebookCellChanges>({
+	status: {},
+	removedBefore: {},
+	removedAtEnd: 0
+});
 
 /**
  * Diff a notebook's live cells against its git-HEAD cells.
@@ -183,12 +228,11 @@ export const NO_CELL_CHANGES = Object.freeze({ status: {}, removedBefore: {}, re
  * result should not light up the gutter. Both sides come through the same
  * normalization (`ipynb.js`'s `deserialize`, which joins nbformat's multiline
  * source arrays), so formatting noise never registers as a change.
- *
- * @param {Array<{id:string, cell_type:string, source:string}>} headCells
- * @param {Array<{id:string, cell_type:string, source:string}>} cells
- * @returns {{status: Record<string,'added'|'modified'|'moved'>, removedBefore: Record<string,number>, removedAtEnd: number}}
  */
-export function notebookCellChanges(headCells, cells) {
+export function notebookCellChanges(
+	headCells: DiffCell[],
+	cells: DiffCell[]
+): NotebookCellChanges {
 	if (!Array.isArray(headCells) || !Array.isArray(cells)) return NO_CELL_CHANGES;
 	const idsUsable =
 		headCells.every((c) => c.id) &&
@@ -197,12 +241,12 @@ export function notebookCellChanges(headCells, cells) {
 	return idsUsable ? matchById(headCells, cells) : matchByIndex(headCells, cells);
 }
 
-function differs(head, cell) {
+function differs(head: DiffCell, cell: DiffCell): boolean {
 	return head.source !== cell.source || head.cell_type !== cell.cell_type;
 }
 
-function matchByIndex(head, cells) {
-	const status = {};
+function matchByIndex(head: DiffCell[], cells: DiffCell[]): NotebookCellChanges {
+	const status: Record<string, CellChangeStatus> = {};
 	for (let i = 0; i < cells.length; i++) {
 		if (!head[i]) status[cells[i].id] = 'added';
 		else if (differs(head[i], cells[i])) status[cells[i].id] = 'modified';
@@ -210,11 +254,11 @@ function matchByIndex(head, cells) {
 	return { status, removedBefore: {}, removedAtEnd: Math.max(0, head.length - cells.length) };
 }
 
-function matchById(head, cells) {
+function matchById(head: DiffCell[], cells: DiffCell[]): NotebookCellChanges {
 	const headById = new Map(head.map((c) => [c.id, c]));
 	const liveIds = new Set(cells.map((c) => c.id));
 
-	const status = {};
+	const status: Record<string, CellChangeStatus> = {};
 	for (const cell of cells) {
 		const h = headById.get(cell.id);
 		if (!h) status[cell.id] = 'added';
@@ -224,7 +268,7 @@ function matchById(head, cells) {
 	// A removed cell has no cell of its own to decorate, so its marker is anchored
 	// to the next HEAD cell that survived — the place the gap now sits. Removals
 	// past the last surviving cell fall off the end.
-	const removedBefore = {};
+	const removedBefore: Record<string, number> = {};
 	let pending = 0;
 	for (const h of head) {
 		if (!liveIds.has(h.id)) {
@@ -247,13 +291,15 @@ function matchById(head, cells) {
 }
 
 /** Ids of the common cells that are out of HEAD order (complement of the LIS). */
-function movedIds(head, cells) {
+function movedIds(head: DiffCell[], cells: DiffCell[]): string[] {
 	const rank = new Map(head.map((c, i) => [c.id, i]));
-	const seq = cells.filter((c) => rank.has(c.id)).map((c) => ({ id: c.id, r: rank.get(c.id) }));
+	const seq = cells
+		.filter((c) => rank.has(c.id))
+		.map((c) => ({ id: c.id, r: rank.get(c.id)! }));
 	if (seq.length < 2) return [];
 
-	const tails = []; // tails[l] = index into seq of the smallest tail of an LIS of length l+1
-	const prev = new Array(seq.length).fill(-1);
+	const tails: number[] = []; // tails[l] = index into seq of the smallest tail of an LIS of length l+1
+	const prev = new Array<number>(seq.length).fill(-1);
 	for (let i = 0; i < seq.length; i++) {
 		let lo = 0;
 		let hi = tails.length;
@@ -267,7 +313,7 @@ function movedIds(head, cells) {
 		else tails[lo] = i;
 	}
 
-	const inOrder = new Set();
+	const inOrder = new Set<string>();
 	for (let i = tails.length ? tails[tails.length - 1] : -1; i >= 0; i = prev[i]) inOrder.add(seq[i].id);
 	return seq.filter((s) => !inOrder.has(s.id)).map((s) => s.id);
 }

@@ -34,21 +34,46 @@
  *    for the common top-to-bottom notebook and approximate for out-of-order runs.
  */
 
+import type { Cell, LastRun, SessionId } from '$lib/server/types';
+
 /** state values a cell can carry. */
 export const STALE_STATE = {
 	NA: 'n/a', // markdown (or otherwise not a code cell)
 	NOT_RUN: 'not_run', // a code cell that has not run in the current kernel session
 	FRESH: 'fresh', // ran this session and every input is older than that run
 	STALE: 'stale' // ran this session but an input changed since
-};
+} as const;
 
-const shortId = (id) => (typeof id === 'string' ? id.slice(0, 8) : String(id));
+/** One of the four staleness states. */
+export type StaleState = (typeof STALE_STATE)[keyof typeof STALE_STATE];
 
-const lastRunOf = (cell) => cell?.metadata?.cellar?.lastRun ?? null;
-const editedAtOf = (cell) => cell?.metadata?.cellar?.editedAt ?? null;
+/** Per-cell dataflow (what each cell defines / uses); missing entry ⇒ no dataflow. */
+export type Dataflow = Record<string, { defines?: string[]; uses?: string[] } | undefined>;
+
+/** A single cell's staleness verdict. */
+export interface StalenessEntry {
+	state: StaleState;
+	reason?: string;
+	upstream?: string[];
+	self?: boolean;
+}
+
+/** cellId → verdict, for every cell in the notebook. */
+export type StalenessMap = Record<string, StalenessEntry>;
+
+/** The staleness rule reads only these fields; `Cell`/`CellView` are assignable. */
+type StaleCell = Cell;
+
+const shortId = (id: string | undefined): string =>
+	typeof id === 'string' ? id.slice(0, 8) : String(id);
+
+const lastRunOf = (cell: StaleCell | undefined | null): LastRun | null =>
+	cell?.metadata?.cellar?.lastRun ?? null;
+const editedAtOf = (cell: StaleCell | undefined | null): number | null =>
+	cell?.metadata?.cellar?.editedAt ?? null;
 
 /** Did this cell execute against the kernel session that is live right now? */
-function ranThisSession(cell, sid) {
+function ranThisSession(cell: StaleCell | undefined | null, sid: SessionId | null): boolean {
 	if (!cell || cell.cell_type !== 'code') return false;
 	const lr = lastRunOf(cell);
 	return sid != null && lr != null && lr.session === sid;
@@ -57,31 +82,31 @@ function ranThisSession(cell, sid) {
 /**
  * Compute per-cell staleness for a whole notebook.
  *
- * @param {Array<{id:string, cell_type:string, source?:string, metadata?:object}>} cells
- *        cells in document order, carrying `metadata.cellar.lastRun` + `.editedAt`
- * @param {Record<string, {defines?:string[], uses?:string[]}>} dataflow
- *        per-cell defined/used names (code cells; missing entry ⇒ no dataflow)
- * @param {number|null} sid current kernel-session epoch, or null when no kernel runs
- * @returns {Record<string, {state:string, reason?:string, upstream?:string[], self?:boolean}>}
+ * @param cells cells in document order, carrying `metadata.cellar.lastRun` + `.editedAt`
+ * @param dataflow per-cell defined/used names (code cells; missing entry ⇒ no dataflow)
+ * @param sid current kernel-session epoch, or null when no kernel runs
  */
-export function computeStaleness(cells, dataflow, sid) {
-	const df = dataflow || {};
-	const result = {};
+export function computeStaleness(
+	cells: readonly StaleCell[],
+	dataflow: Dataflow | null | undefined,
+	sid: SessionId | null
+): StalenessMap {
+	const df: Dataflow = dataflow || {};
+	const result: StalenessMap = {};
 
 	// The graph is over CODE cells only. Build, per name, the document-ordered list
 	// of the cells that define it, so a use resolves to its nearest preceding definer.
 	const codeCells = cells.filter((c) => c.cell_type === 'code');
-	const indexOfId = new Map(codeCells.map((c, i) => [c.id, i]));
-	const definers = new Map(); // name -> [codeCell indices, ascending]
+	const definers = new Map<string, number[]>(); // name -> [codeCell indices, ascending]
 	codeCells.forEach((c, i) => {
 		for (const name of df[c.id]?.defines ?? []) {
 			if (!definers.has(name)) definers.set(name, []);
-			definers.get(name).push(i);
+			definers.get(name)!.push(i);
 		}
 	});
 
 	/** The nearest code-cell index < `i` that defines `name`, or -1. */
-	function definerBefore(name, i) {
+	function definerBefore(name: string, i: number): number {
 		const list = definers.get(name);
 		if (!list) return -1;
 		let best = -1;
@@ -94,7 +119,7 @@ export function computeStaleness(cells, dataflow, sid) {
 
 	// The set of upstream code-cell indices each code cell directly depends on.
 	const directUpstream = codeCells.map((c, i) => {
-		const ups = new Set();
+		const ups = new Set<number>();
 		for (const name of df[c.id]?.uses ?? []) {
 			const j = definerBefore(name, i);
 			if (j >= 0) ups.add(j);
@@ -106,15 +131,15 @@ export function computeStaleness(cells, dataflow, sid) {
 	// a smaller index, so its verdict is already known — transitive staleness
 	// propagates in one pass, and the preceding-definer graph is acyclic by
 	// construction (no need to guard against cycles).
-	const stale = new Array(codeCells.length).fill(false);
+	const stale: boolean[] = new Array(codeCells.length).fill(false);
 	codeCells.forEach((cell, i) => {
 		if (!ranThisSession(cell, sid)) {
 			result[cell.id] = { state: STALE_STATE.NOT_RUN };
 			return;
 		}
 		const at = lastRunOf(cell)?.at ?? 0;
-		const reasons = []; // { kind, id? }
-		const upstreamIds = new Set();
+		const reasons: Reason[] = [];
+		const upstreamIds = new Set<string>();
 
 		const selfEdited = editedAtOf(cell);
 		if (selfEdited != null && selfEdited > at) reasons.push({ kind: 'self_edited' });
@@ -123,7 +148,7 @@ export function computeStaleness(cells, dataflow, sid) {
 			const up = codeCells[j];
 			const upEdited = editedAtOf(up);
 			const upAt = lastRunOf(up)?.at ?? 0;
-			let kind = null;
+			let kind: ReasonKind | null = null;
 			if (upEdited != null && upEdited > at) kind = 'upstream_edited';
 			else if (ranThisSession(up, sid) && upAt > at) kind = 'upstream_reran';
 			else if (!ranThisSession(up, sid)) kind = 'upstream_unrun';
@@ -155,8 +180,22 @@ export function computeStaleness(cells, dataflow, sid) {
 	return result;
 }
 
+/** Why a cell is stale. */
+type ReasonKind =
+	| 'self_edited'
+	| 'upstream_edited'
+	| 'upstream_reran'
+	| 'upstream_unrun'
+	| 'upstream_stale';
+
+interface Reason {
+	kind: ReasonKind;
+	/** The upstream cell id (absent for `self_edited`). */
+	id?: string;
+}
+
 /** Reason priority (lowest = most salient): a direct change beats an inherited one. */
-const REASON_RANK = {
+const REASON_RANK: Record<ReasonKind, number> = {
 	self_edited: 0,
 	upstream_edited: 1,
 	upstream_reran: 2,
@@ -165,7 +204,7 @@ const REASON_RANK = {
 };
 
 /** The primary human-readable reason (the first, highest-priority, reason). */
-function reasonText(r) {
+function reasonText(r: Reason): string {
 	switch (r.kind) {
 		case 'self_edited':
 			return 'edited after it last ran';
@@ -183,6 +222,6 @@ function reasonText(r) {
 }
 
 /** Ids of the stale code cells, in document order — what "Run all stale" runs. */
-export function staleIdsInOrder(cells, staleness) {
+export function staleIdsInOrder(cells: readonly StaleCell[], staleness: StalenessMap): string[] {
 	return cells.filter((c) => staleness[c.id]?.state === STALE_STATE.STALE).map((c) => c.id);
 }

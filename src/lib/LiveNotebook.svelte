@@ -1,13 +1,63 @@
-<script>
+<script lang="ts">
 	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
-	import { subscribeEvents, originId } from '$lib/events-client.js';
-	import { cellIdOfKey, computeFolding, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings.js';
-	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff.js';
-	import { cellClipboard } from '$lib/cellClipboard.js';
-	import { clampMoveIndex } from '$lib/importsRole.js';
-	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte.js';
-	import { getUi, setUi } from '$lib/uiState.js';
+	import { subscribeEvents, originId } from '$lib/events-client';
+	import { cellIdOfKey, computeFolding, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
+	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
+	import { cellClipboard } from '$lib/cellClipboard';
+	import { clampMoveIndex } from '$lib/importsRole';
+	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
+	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
+	import { getUi, setUi } from '$lib/uiState';
+	import type { CellView, CellOutput, CellType, LogicalCellType, Actor, RunningView, QueueEntryView, LastRun, CellarNamespace, PublishedEvent } from '$lib/server/types';
+	import type { UICell, KeyMode, FoldRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
+	import type { ClientEvent } from '$lib/events-client';
+	import type { Folding } from '$lib/headings';
+	import type { StalenessMap } from '$lib/staleness';
+	import type { ClipboardCell } from '$lib/cellClipboard';
+
+	interface Props {
+		/** Workspace path addressing this notebook (the REST API resolves it server-side). */
+		path: string;
+		active?: boolean;
+		/** The shell's `fsRefreshSignal`: a bump re-fetches the git HEAD baseline. */
+		gitRefresh?: number;
+		onCellsChange?: (path: string, cells: UICell[]) => void;
+		/** (path, foldedIds, folding): the sidebar Outline renders from this. */
+		onFoldsChange?: (path: string, foldedIds: Set<string>, folding: Folding) => void;
+		/** (path, handle|null): lets the Outline drive this notebook's folds. */
+		onRegisterFolds?: (path: string, handle: FoldRegistryHandle | null) => void;
+		/** (path, api|null): lets the sidebar drop a cell in here. */
+		onRegisterApi?: (path: string, api: NotebookApiHandle | null) => void;
+		onRunStart?: (path: string, id: string) => void;
+		onRunEnd?: () => void;
+		/** Interrupt the shared kernel (same handler the Kernels sidebar uses). */
+		onInterruptKernel?: () => void;
+	}
+
+	/** A structural document event as this component reads it (see events.js). */
+	type StructuralEvent =
+		| { type: 'cell:added'; cell?: CellView; afterId?: string | null; index?: number }
+		| { type: 'cell:role'; cellId: string; role?: string | null }
+		| { type: 'cell:deleted'; cellId: string }
+		| { type: 'cell:moved'; cellId: string; toIndex: number }
+		| { type: 'cell:type'; cellId: string; cell_type: CellType; language?: string | null }
+		| { type: 'cell:cleared'; cellId: string }
+		| { type: 'cell:rendered'; cellId: string }
+		| { type: 'cell:edited'; cellId: string; source: string };
+
+	/** A run-lifecycle event (run:start / run:output / run:end). */
+	type RunEvent =
+		| { type: 'run:start'; cellId?: string; actor?: Actor }
+		| { type: 'run:output'; cellId?: string; output: CellOutput }
+		| { type: 'run:end'; cellId?: string; at?: number; durationMs?: number; actor?: Actor };
+
+	/** A kernel run-queue snapshot (queue:changed). */
+	interface QueueChangedEvent {
+		type?: string;
+		running?: RunningView | null;
+		queue?: QueueEntryView[];
+	}
 
 	// A live, kernel-attached notebook document addressed by its workspace path.
 	// Owns its own cell array + all cell operations (every request carries
@@ -23,37 +73,37 @@
 		active = false,
 		gitRefresh = 0,
 		onCellsChange,
-		onFoldsChange, // (path, foldedIds, folding): the sidebar Outline renders from this
-		onRegisterFolds, // (path, {toggle,collapseAll,expandAll}|null): lets the Outline drive this notebook's folds
-		onRegisterApi, // (path, {insertAndRunCode}|null): lets the sidebar drop a cell in here
+		onFoldsChange,
+		onRegisterFolds,
+		onRegisterApi,
 		onRunStart,
 		onRunEnd,
-		onInterruptKernel // interrupt the shared kernel (same handler the Kernels sidebar uses)
-	} = $props();
+		onInterruptKernel
+	}: Props = $props();
 
-	let cells = $state([]);
+	let cells = $state<UICell[]>([]);
 	let fetching = $state(true); // loading the notebook's cells from the server
 	let loadError = $state('');
-	let runningId = $state(null); // the cell running in THIS notebook (≤1)
+	let runningId = $state<string | null>(null); // the cell running in THIS notebook (≤1)
 	// Cells of THIS notebook waiting in the kernel's global FIFO → their 1-based
 	// position in that queue (1 = next up). The positions are global on purpose:
 	// a cell queued here may be waiting behind a cell in another notebook, and
 	// "queued · 3" should say so. Mirrored from the server's `queue:changed`
 	// snapshot, never derived locally — the queue spans notebooks and tabs, so no
 	// single client can compute it.
-	let queued = $state({});
-	let activeId = $state(null); // the selected/focused cell (visual emphasis)
+	let queued = $state<Record<string, number>>({});
+	let activeId = $state<string | null>(null); // the selected/focused cell (visual emphasis)
 	// The cell an AGENT (MCP) is currently running here, or null. Distinct from
 	// `runningId` - which is set for every run, including this tab's own and other
 	// tabs' user runs - because only an agent run may move the viewport (see
 	// "Follow the agent" below). Never used for visuals; the running affordance
 	// keys off `runningId` for all runs alike.
-	let agentRunningId = $state(null);
-	let keyMode = $state('command'); // 'command' | 'edit' (visuals only; the dispatcher reads the DOM)
+	let agentRunningId = $state<string | null>(null);
+	let keyMode = $state<KeyMode>('command'); // 'command' | 'edit' (visuals only; the dispatcher reads the DOM)
 	// This notebook's DOM subtree. Scopes the modal-keyboard handler and cell
 	// lookups (ids repeat across the open, still-mounted notebooks), and takes
 	// focus when the tab activates - so it must be a real, focusable box.
-	let rootEl = $state(null);
+	let rootEl = $state<HTMLElement | null>(null);
 
 	// Canonical (absolute) notebook id, learned from the server on load. The shell
 	// addresses this component by a workspace-relative `path` (fine for the REST
@@ -61,8 +111,8 @@
 	// server's absolute doc key — so we filter on this, the one id both sides
 	// agree on. `null` until the first load resolves; events are ignored until then
 	// (the load itself is the initial sync).
-	let canonicalId = null;
-	let lastSeq = null; // last per-notebook `seq` seen (gap detection → refetch)
+	let canonicalId: string | null = null;
+	let lastSeq: number | null = null; // last per-notebook `seq` seen (gap detection → refetch)
 
 	// ---- Staleness -----------------------------------------------------------
 	// Per-cell staleness verdict (id → {state, reason, upstream}), computed on the
@@ -70,8 +120,8 @@
 	// the UI and the MCP agent surface render the exact same verdict. Refetched
 	// (debounced) whenever something that could change it happens: a run ends, a
 	// cell is edited, the notebook structure changes, or the kernel is reset.
-	let staleness = $state({});
-	let stalenessTimer;
+	let staleness = $state<StalenessMap>({});
+	let stalenessTimer: ReturnType<typeof setTimeout>;
 	async function refreshStaleness() {
 		try {
 			const res = await fetch(`/api/notebooks/staleness?path=${encodeURIComponent(path)}`);
@@ -98,7 +148,7 @@
 	// the `.ipynb`, so folding a section produces zero git-diff noise. Folded
 	// cells stay in `cells` (they run/persist normally); we only hide them from
 	// the rendered flow.
-	let foldedIds = $state(new Set());
+	let foldedIds = $state<Set<string>>(new Set());
 	const folding = $derived(computeFolding(cells, foldedIds));
 
 	// Publish the fold state (and let the Outline toggle it) - see `+page.svelte`.
@@ -118,7 +168,7 @@
 		return () => onRegisterApi?.(path, null);
 	});
 
-	function foldStorageKey() {
+	function foldStorageKey(): string | null {
 		return canonicalId ? `cellar-folds:${canonicalId}` : null;
 	}
 	function loadFolds() {
@@ -132,7 +182,7 @@
 		if (!key) return;
 		setUi(key, [...foldedIds]);
 	}
-	function toggleFold(key) {
+	function toggleFold(key: string) {
 		const next = new Set(foldedIds);
 		if (next.has(key)) next.delete(key);
 		else next.add(key);
@@ -149,15 +199,16 @@
 	// state the chevrons do (so the notebook and the Outline stay one view of one
 	// state). Idempotent: `folded=true` yields the full set of heading keys, `false`
 	// the empty set, regardless of the starting state.
-	function setAllFolded(folded) {
-		const next = folded ? new Set(outlineHeadings(cells).map((h) => h.key)) : new Set();
+	function setAllFolded(folded: boolean) {
+		const next = folded ? new Set(outlineHeadings(cells).map((h) => h.key)) : new Set<string>();
 		foldedIds = next;
 		saveFolds();
 		// A collapse-all can hide the selected cell; hand the selection to the
 		// nearest header that still owns it (the same rule `toggleFold` applies).
 		if (activeId && computeFolding(cells, next).hidden.has(activeId)) {
+			const id = activeId;
 			const owner = outlineHeadings(cells).find((h) =>
-				computeFolding(cells, new Set([h.key])).hidden.has(activeId)
+				computeFolding(cells, new Set([h.key])).hidden.has(id)
 			);
 			if (owner) activeId = owner.cellId;
 		}
@@ -171,9 +222,9 @@
 	// round-trip to disk). A cell id maps to an explicit boolean (true = force
 	// collapsed, false = force full height); an absent id means auto (the Cell
 	// collapses it only when the editor is taller than the cap).
-	let editorCollapsed = $state({});
+	let editorCollapsed = $state<Record<string, boolean | undefined>>({});
 
-	function editorCollapsedKey() {
+	function editorCollapsedKey(): string | null {
 		return canonicalId ? `cellar-editor-collapsed:${canonicalId}` : null;
 	}
 	function loadEditorCollapsed() {
@@ -187,7 +238,7 @@
 		if (!key) return;
 		setUi(key, editorCollapsed);
 	}
-	function setEditorCollapsed(id, collapsed) {
+	function setEditorCollapsed(id: string, collapsed: boolean | null | undefined) {
 		const next = { ...editorCollapsed };
 		if (collapsed === null || collapsed === undefined) delete next[id];
 		else next[id] = collapsed;
@@ -202,10 +253,10 @@
 	// doc uses); the diff itself is a `$derived` over the live cells, so a cell
 	// lights up the moment its edit lands and goes quiet again when it is undone.
 	// An untracked notebook has no baseline → no decorations.
-	let gitBaselineCells = $state.raw(null);
+	let gitBaselineCells = $state.raw<CellView[] | null>(null);
 
 	async function loadGitBaseline() {
-		let baseline = null;
+		let baseline: CellView[] | null = null;
 		try {
 			const res = await fetch(`/api/fs/git/head?path=${encodeURIComponent(path)}&kind=notebook`);
 			const body = await res.json();
@@ -240,7 +291,7 @@
 	//   3. Selection is untouched - `activeId` stays where the user left it. The
 	//      running cell is marked by its own (warning-hued) accent in `Cell.svelte`.
 
-	let followedId = null; // last agent-run cell we scrolled to (one scroll per run)
+	let followedId: string | null = null; // last agent-run cell we scrolled to (one scroll per run)
 	let lastTypedAt = 0; // last keystroke inside this notebook (see `userIsTyping`)
 
 	// Typing guard. Focus alone is too coarse - a cell keeps editor focus long
@@ -262,7 +313,7 @@
 
 	// The scrollable ancestor the notebook lives in (the shell gives each notebook
 	// tab its own `overflow-y-auto` pane). Falls back to the viewport.
-	function scrollParent(el) {
+	function scrollParent(el: HTMLElement): HTMLElement | null {
 		for (let p = el.parentElement; p; p = p.parentElement) {
 			const oy = getComputedStyle(p).overflowY;
 			if (oy === 'auto' || oy === 'scroll') return p;
@@ -273,7 +324,7 @@
 	// "Already visible" means the cell's TOP edge is on screen with room to spare:
 	// the run affordance (accent bar, spinner) lives at the top, so a tall cell
 	// scrolled past its header is not actually showing the user anything.
-	function cellIsVisible(el) {
+	function cellIsVisible(el: HTMLElement): boolean {
 		const parent = scrollParent(el);
 		const view = parent ? parent.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
 		const r = el.getBoundingClientRect();
@@ -283,7 +334,7 @@
 	// Bring a cell the *agent* is running into view: center it when it fits, else
 	// pin its top. Distinct from `scrollCellIntoView` (keyboard selection), which
 	// wants the smallest possible movement, not a deliberate reframing.
-	function scrollElementIntoView(el) {
+	function scrollElementIntoView(el: HTMLElement) {
 		const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 		const behavior = reduce ? 'auto' : 'smooth';
 		const parent = scrollParent(el);
@@ -309,7 +360,7 @@
 	// show its running accent). Fold state is runtime-only, so this costs the user
 	// nothing but a re-fold. Removes exactly the folded headers whose own section
 	// contains the cell - nested outer folds included, unrelated folds untouched.
-	function revealCell(id) {
+	function revealCell(id: string) {
 		if (!folding.hidden.has(id)) return;
 		const next = new Set(foldedIds);
 		for (const key of foldedIds) {
@@ -319,13 +370,13 @@
 		saveFolds();
 	}
 
-	async function followCell(id) {
+	async function followCell(id: string) {
 		if (userIsTyping()) return;
 		revealCell(id);
 		await tick(); // an `add_and_run` cell (or a just-revealed one) needs its DOM node
 		// Scope the lookup to THIS notebook: cell ids are unique per document, not
 		// across documents, and every open notebook stays mounted (hidden).
-		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
+		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null;
 		if (!el || cellIsVisible(el)) return;
 		scrollElementIntoView(el);
 	}
@@ -348,27 +399,31 @@
 		untrack(() => followCell(id));
 	});
 
-	function setActive(id) {
+	function setActive(id: string | null) {
 		activeId = id;
 	}
 
 	// Each Cell registers its imperative API (by id) so the shortcut actions can
 	// focus/blur its editor, enter edit mode, and run its *live* editor text.
-	const cellApis = {};
-	function registerCell(id, api) {
+	const cellApis: Record<string, CellRegisterApi> = {};
+	function registerCell(id: string, api: CellRegisterApi | null) {
 		if (api) cellApis[id] = api;
 		else delete cellApis[id];
 	}
-	function findCell(id) {
+	function findCell(id: string | null | undefined): UICell | undefined {
 		return cells.find((c) => c.id === id);
+	}
+	/** The per-cell API for `id`, or undefined (safe for a null/absent selection). */
+	function apiOf(id: string | null | undefined): CellRegisterApi | undefined {
+		return id ? cellApis[id] : undefined;
 	}
 
 	// The editor holding focus IS edit mode; losing it drops back to command mode.
-	function onEditorFocus(id) {
+	function onEditorFocus(id: string) {
 		activeId = id;
 		keyMode = 'edit';
 	}
-	function onEditorBlur(id) {
+	function onEditorBlur(id: string) {
 		if (activeId === id) keyMode = 'command';
 	}
 
@@ -410,7 +465,7 @@
 			}
 			refreshStaleness();
 		} catch (err) {
-			loadError = String(err?.message ?? err);
+			loadError = String((err as Error)?.message ?? err);
 		} finally {
 			fetching = false;
 		}
@@ -430,10 +485,10 @@
 	// live patch to `cells`. Insert/remove/reorder/retype in place — cheap and
 	// reload-free; the seq-gap backstop refetches if we ever miss one. Each patch
 	// is idempotent enough to tolerate an out-of-order or duplicate delivery.
-	function applyStructuralEvent(ev) {
+	function applyStructuralEvent(ev: StructuralEvent) {
 		if (ev.type === 'cell:added') {
 			if (!ev.cell || findCell(ev.cell.id)) return; // already present → no double-insert
-			const view = {
+			const view: UICell = {
 				id: ev.cell.id,
 				cell_type: ev.cell.cell_type,
 				source: ev.cell.source,
@@ -512,13 +567,13 @@
 	// their GLOBAL position so the badge tells the truth about how many runs are
 	// ahead. A snapshot that lands before `load()` has told us our absolute id is
 	// held, not dropped: it may be the only one until the queue next changes.
-	let pendingQueueEvent = null;
-	function applyQueueEvent(ev) {
+	let pendingQueueEvent: QueueChangedEvent | null = null;
+	function applyQueueEvent(ev: QueueChangedEvent) {
 		if (!canonicalId) {
 			pendingQueueEvent = ev;
 			return;
 		}
-		const next = {};
+		const next: Record<string, number> = {};
 		for (const item of ev.queue ?? []) {
 			if (item.nb === canonicalId) next[item.cellId] = item.position;
 		}
@@ -538,14 +593,14 @@
 		}
 	}
 
-	function applyRunEvent(ev) {
-		const cell = ev.cellId && findCell(ev.cellId);
+	function applyRunEvent(ev: RunEvent) {
+		const cell = ev.cellId ? findCell(ev.cellId) : undefined;
 		if (ev.type === 'run:start') {
 			if (cell) {
-				runningId = ev.cellId;
+				runningId = ev.cellId ?? null;
 				// Only an agent's run earns the viewport; a user run in another tab
 				// must not scroll this one.
-				if (ev.actor === 'agent') agentRunningId = ev.cellId;
+				if (ev.actor === 'agent') agentRunningId = ev.cellId ?? null;
 				// Clear stale output the moment execution starts (the server fires
 				// run:start when the kernel is actually claimed, after any queue wait),
 				// so a re-run reads as "running, no output yet" until fresh output
@@ -553,7 +608,7 @@
 				cell.outputs = [];
 			}
 		} else if (ev.type === 'run:output') {
-			if (cell) cell.outputs = [...cell.outputs, ev.output];
+			if (cell) cell.outputs = [...(cell.outputs ?? []), ev.output];
 		} else if (ev.type === 'run:end') {
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;
@@ -566,13 +621,16 @@
 	// Reassigns `metadata` (not a deep mutation) to trigger reactivity even when
 	// the cell had no `cellar` namespace yet. Ignores events without `at` (older
 	// run:end shapes / non-run events).
-	function stampLastRun(cell, ev) {
+	function stampLastRun(cell: UICell | undefined, ev: { at?: number; durationMs?: number; actor?: Actor }) {
 		if (!cell || ev.at == null) return;
-		const cellar = { ...(cell.metadata?.cellar ?? {}), lastRun: { at: ev.at, durationMs: ev.durationMs, actor: ev.actor } };
+		const cellar: CellarNamespace = {
+			...(cell.metadata?.cellar ?? {}),
+			lastRun: { at: ev.at, durationMs: ev.durationMs, actor: ev.actor } as LastRun
+		};
 		cell.metadata = { ...(cell.metadata ?? {}), cellar };
 	}
 	onMount(() =>
-		subscribeEvents((ev) => {
+		subscribeEvents((ev: ClientEvent) => {
 			// (Re)connect → refetch as the correctness backstop (covers events missed
 			// while disconnected). `canonicalId` gates until the first load resolves.
 			if (ev.type === 'sse:open') {
@@ -585,22 +643,24 @@
 			// per-notebook filter, and without the `originId` echo suppression below —
 			// the queue is shared state, not one tab's action, so every tab renders it.
 			if (ev.type === 'queue:changed') {
-				applyQueueEvent(ev);
+				applyQueueEvent(ev as unknown as QueueChangedEvent);
 				return;
 			}
-			if (!canonicalId || ev.nb !== canonicalId) return;
+			// Past this point every event is a per-notebook `PublishedEvent`.
+			const pe = ev as PublishedEvent;
+			if (!canonicalId || pe.nb !== canonicalId) return;
 			// A gap in this notebook's monotonic seq means we missed events → refetch.
-			if (lastSeq !== null && ev.seq > lastSeq + 1) load();
-			lastSeq = ev.seq; // advance even for our own echo, so it isn't seen as a gap
+			if (lastSeq !== null && pe.seq > lastSeq + 1) load();
+			lastSeq = pe.seq; // advance even for our own echo, so it isn't seen as a gap
 			// A checkpoint restore replaces the whole document; every tab (the initiating
 			// one included, since it applies no optimistic local change) refetches.
-			if (ev.type === 'notebook:restored') {
+			if (pe.type === 'notebook:restored') {
 				load();
 				return;
 			}
-			if (ev.originId && ev.originId === originId) return; // our own UI action
-			if (ev.type?.startsWith('cell:')) applyStructuralEvent(ev);
-			else applyRunEvent(ev);
+			if (pe.originId && pe.originId === originId) return; // our own UI action
+			if (pe.type?.startsWith('cell:')) applyStructuralEvent(pe as unknown as StructuralEvent);
+			else applyRunEvent(pe as unknown as RunEvent);
 		})
 	);
 
@@ -641,7 +701,7 @@
 	 * same click; the server dedupes authoritatively (`run:duplicate`), because a
 	 * second tab or an agent can ask for the same cell at the same moment.
 	 */
-	async function runCell(id, source) {
+	async function runCell(id: string, source: string) {
 		const cell = findCell(id);
 		if (!cell) return;
 		// Markdown "runs" by rendering client-side (in the Cell) — no kernel.
@@ -663,7 +723,7 @@
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ source, nb: path, originId })
 			});
-			const reader = res.body.getReader();
+			const reader = res.body!.getReader();
 			const decoder = new TextDecoder();
 			let buf = '';
 			for (;;) {
@@ -684,7 +744,7 @@
 						runningId = id;
 						cell.outputs = [];
 					} else if (ev.type === 'output') {
-						cell.outputs = [...cell.outputs, ev.output];
+						cell.outputs = [...(cell.outputs ?? []), ev.output];
 					} else if (ev.type === 'run:end') {
 						stampLastRun(cell, ev); // this tab's own user run → its badge
 					}
@@ -712,7 +772,7 @@
 	// awaits the whole run before returning, so awaiting it in sequence keeps the
 	// execution order — which is dependency order for these actions (a cell's
 	// upstreams always precede it), so downstream cells run against fresh inputs.
-	async function runCodeIds(ids) {
+	async function runCodeIds(ids: string[]) {
 		for (const id of ids) {
 			const cell = findCell(id);
 			if (!cell || cell.cell_type !== 'code') continue;
@@ -722,7 +782,7 @@
 		}
 		refreshStaleness();
 	}
-	function codeIdsInRange(from, to) {
+	function codeIdsInRange(from: number, to: number): string[] {
 		return cells.slice(from, to).filter((c) => c.cell_type === 'code').map((c) => c.id);
 	}
 	/** Run every code cell above the selected one (exclusive). */
@@ -742,7 +802,7 @@
 		runCodeIds(cells.filter((c) => staleness[c.id]?.state === 'stale').map((c) => c.id));
 	}
 
-	async function editCell(id, source, { keepalive = false } = {}) {
+	async function editCell(id: string, source: string, { keepalive = false }: { keepalive?: boolean } = {}) {
 		const cell = findCell(id);
 		if (cell) cell.source = source;
 		// Only the page-unload flush opts into `keepalive`: the browser caps the
@@ -760,14 +820,14 @@
 		scheduleStaleness();
 	}
 
-	async function clearCell(id) {
+	async function clearCell(id: string) {
 		const cell = findCell(id);
 		if (cell) cell.outputs = [];
 		await fetch(`/api/cells/${id}/clear?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, { method: 'POST' });
 		scheduleStaleness();
 	}
 
-	async function setType(id, cellType) {
+	async function setType(id: string, cellType: LogicalCellType) {
 		const cell = findCell(id);
 		if (cell) {
 			// 'sql' is a code cell tagged cellar.language='sql' ($lib/cellLanguage.js);
@@ -793,11 +853,10 @@
 	// per-notebook and local: it records the cells THIS user deleted here, so `z`
 	// can never resurrect a cell an agent (or another tab) deliberately removed.
 	const UNDO_LIMIT = 20;
-	/** @type {{index:number, cell_type:string, source:string, output_scrolled?:boolean}[]} */
-	let deletedCells = [];
+	let deletedCells: (ClipboardCell & { index: number })[] = [];
 
 	/** A cell as the clipboard and the undo stack store it: live source, no outputs. */
-	function snapshotCell(cell) {
+	function snapshotCell(cell: UICell): ClipboardCell {
 		return {
 			cell_type: cell.cell_type,
 			source: cellApis[cell.id]?.currentSource?.() ?? cell.source,
@@ -810,7 +869,7 @@
 	 * The caller selects it: paste selects the last pasted cell, undo the restored
 	 * one.
 	 */
-	async function insertCellAt(index, spec) {
+	async function insertCellAt(index: number, spec: ClipboardCell): Promise<UICell> {
 		const at = Math.max(0, Math.min(index, cells.length));
 		const afterId = at > 0 ? cells[at - 1]?.id : null;
 		// The add API can only insert *after* an id, so an insert at the very top
@@ -833,7 +892,7 @@
 	 * cell without focusing it would leave the next `j`/`k` acting on a cell the
 	 * caret is nowhere near. So we scroll it into view and leave the selection be.
 	 */
-	async function insertAndRunCode(source) {
+	async function insertAndRunCode(source: string) {
 		const created = await insertCellAt(cells.length, { cell_type: 'code', source });
 		await tick();
 		scrollCellIntoView(created.id);
@@ -855,13 +914,13 @@
 		deleteCell(cell.id);
 	}
 
-	async function pasteCells(where) {
+	async function pasteCells(where: 'above' | 'below') {
 		const entries = cellClipboard.read();
 		if (!entries.length) return;
 		const i = cells.findIndex((c) => c.id === activeId);
 		// No selection (an empty notebook) → paste at the end.
 		let index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
-		let last = null;
+		let last: UICell | null = null;
 		for (const entry of entries) {
 			last = await insertCellAt(index, entry);
 			index++;
@@ -876,7 +935,7 @@
 		await selectAndFocus(restored.id);
 	}
 
-	async function deleteCell(id) {
+	async function deleteCell(id: string) {
 		const i = cells.findIndex((c) => c.id === id);
 		const cell = cells[i];
 		// A notebook always keeps at least one cell - the same invariant the toolbar's
@@ -899,7 +958,7 @@
 	 * Only a local delete takes focus with it: an agent (or other-tab) delete must
 	 * not yank the caret out of a cell this user is typing in.
 	 */
-	function selectAfterRemoval(index, { focus = false } = {}) {
+	function selectAfterRemoval(index: number, { focus = false }: { focus?: boolean } = {}) {
 		const id = cells[Math.min(Math.max(index, 0), cells.length - 1)]?.id ?? null;
 		activeId = id;
 		if (focus && id) selectAndFocus(id);
@@ -908,7 +967,7 @@
 	// The optimistic half of the imports cell's pin: the server applies the very
 	// same `clampMoveIndex`, so a refused move is refused here too rather than
 	// being rendered and then silently reverted by the next refetch.
-	async function moveCell(id, dir) {
+	async function moveCell(id: string, dir: 'up' | 'down') {
 		const i = cells.findIndex((c) => c.id === id);
 		const j = dir === 'up' ? i - 1 : i + 1;
 		if (j < 0 || j >= cells.length) return;
@@ -927,12 +986,12 @@
 	// Drag-to-reorder: move a cell to an absolute index. Reuses the server's
 	// `moveCellTo` (via the move route's `toIndex`) so a drag persists exactly
 	// like a keyboard/toolbar move and stays git-clean on save.
-	async function moveCellToIndex(id, toIndex) {
+	async function moveCellToIndex(id: string, toIndex: number) {
 		const from = cells.findIndex((c) => c.id === id);
 		if (from < 0) return;
 		const allowed = clampMoveIndex(cells, from, toIndex);
 		if (allowed < 0) return; // the pinned imports cell never moves
-		let to = Math.max(0, Math.min(allowed, cells.length - 1));
+		const to = Math.max(0, Math.min(allowed, cells.length - 1));
 		if (to === from) return;
 		const next = [...cells];
 		const [cell] = next.splice(from, 1);
@@ -948,7 +1007,7 @@
 
 	// Persist a cell's "scroll outputs" choice (undefined = auto height, true =
 	// force scrolled, false = force full) in the `cellar` metadata namespace.
-	async function setScrolled(id, scrolled) {
+	async function setScrolled(id: string, scrolled: boolean | null | undefined) {
 		const cell = findCell(id);
 		if (cell) {
 			cell.metadata = cell.metadata ?? {};
@@ -965,14 +1024,14 @@
 
 	// `source` seeds the new cell server-side, so a paste / split / undo-delete is
 	// one request, one persist and one `cell:added` event carrying the real text.
-	async function addCell(afterId, cellType = 'code', source = '') {
+	async function addCell(afterId: string | null | undefined, cellType: CellType = 'code', source = ''): Promise<UICell> {
 		const res = await fetch('/api/cells', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ afterId, cellType, source, nb: path, originId })
 		});
 		const { cell } = await res.json();
-		const view = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs, metadata: cell.metadata ?? {} };
+		const view: UICell = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs, metadata: cell.metadata ?? {} };
 		if (afterId) {
 			const i = cells.findIndex((c) => c.id === afterId);
 			cells = [...cells.slice(0, i + 1), view, ...cells.slice(i + 1)];
@@ -989,10 +1048,10 @@
 	// next cell's editor (keep typing); from command mode we move the selection and
 	// its focus. Either way focus lands on the next cell, never back in the cell
 	// that just ran. Creates a fresh cell when run on the last one.
-	async function runAndAdvance(id, source, { focusNext = true } = {}) {
+	async function runAndAdvance(id: string, source: string, { focusNext = true }: { focusNext?: boolean } = {}) {
 		runCell(id, source); // fire; advancing shouldn't wait for completion
 		const i = cells.findIndex((c) => c.id === id);
-		let nextId = i >= 0 && i < cells.length - 1 ? cells[i + 1].id : null;
+		let nextId: string | null = i >= 0 && i < cells.length - 1 ? cells[i + 1].id : null;
 		if (!nextId) {
 			const created = await addCell(id);
 			nextId = created.id;
@@ -1005,7 +1064,7 @@
 		await tick();
 		// `focus()` lands on the next cell's editor, or on the cell itself when that
 		// cell is rendered markdown (whose editor is display:none and unfocusable).
-		cellApis[nextId]?.focus();
+		apiOf(nextId)?.focus();
 		scrollCellIntoView(nextId);
 	}
 
@@ -1019,7 +1078,8 @@
 	// Cells the user can actually select: the ones a folded heading isn't hiding.
 	const selectable = $derived(cells.filter((c) => !folding.hidden.has(c.id)));
 
-	function scrollCellIntoView(id) {
+	function scrollCellIntoView(id: string | null) {
+		if (!id) return;
 		// Scope to this notebook: several notebooks stay mounted (hidden), and a
 		// cell id is only unique *within* a document.
 		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
@@ -1033,7 +1093,7 @@
 	 * next key would instead reach whatever button or rendered cell the user last
 	 * clicked. Awaits `tick()` so a just-created cell has registered its API.
 	 */
-	async function selectAndFocus(id) {
+	async function selectAndFocus(id: string | null) {
 		if (!id) return;
 		setActive(id);
 		await tick();
@@ -1041,7 +1101,7 @@
 		scrollCellIntoView(id);
 	}
 
-	function selectRelative(delta) {
+	function selectRelative(delta: number) {
 		const list = selectable;
 		if (!list.length) return;
 		const i = list.findIndex((c) => c.id === activeId);
@@ -1051,12 +1111,12 @@
 
 	// Fold/unfold act on the selected cell only when it is a markdown header, and
 	// reuse the same `toggleFold` the chevron button calls (one fold API).
-	function setFolded(id, folded) {
+	function setFolded(id: string | null, folded: boolean) {
 		if (!id || headerLevel(findCell(id)) == null) return;
 		if (foldedIds.has(id) !== folded) toggleFold(id);
 	}
 
-	async function insertCell(where) {
+	async function insertCell(where: 'above' | 'below') {
 		const i = cells.findIndex((c) => c.id === activeId);
 		if (where === 'below' || i < 0) {
 			const created = await addCell(activeId ?? cells.at(-1)?.id);
@@ -1077,12 +1137,12 @@
 
 	// Reordering moves the cell's DOM node and drops focus; restore it onto the
 	// editor (edit mode) or onto the cell (command mode), so moves chain.
-	async function moveActive(dir, mode) {
+	async function moveActive(dir: 'up' | 'down', mode: KeyMode) {
 		const id = activeId;
 		if (!id) return;
 		moveCell(id, dir);
 		await tick();
-		if (mode === 'edit') cellApis[id]?.focus();
+		if (mode === 'edit') apiOf(id)?.focus();
 		else await selectAndFocus(id);
 	}
 
@@ -1091,7 +1151,7 @@
 	async function runAndInsertBelow() {
 		const id = activeId;
 		if (!id) return;
-		cellApis[id]?.run(false); // fire; the insert shouldn't wait for the kernel
+		apiOf(id)?.run(false); // fire; the insert shouldn't wait for the kernel
 		const created = await addCell(id);
 		setActive(created.id);
 		await tick();
@@ -1105,8 +1165,8 @@
 	async function splitActiveCell() {
 		const id = activeId;
 		const cell = findCell(id);
-		const api = cellApis[id];
-		if (!cell || !api) return;
+		const api = apiOf(id);
+		if (!cell || !api || !id) return;
 		const source = api.currentSource();
 		const at = api.cursorOffset();
 		api.replaceSource(source.slice(0, at));
@@ -1123,12 +1183,12 @@
 	// 1-6: make the selected cell a markdown heading of that level, converting a
 	// code cell on the way (Jupyter). An existing heading prefix is replaced, so
 	// pressing 2 after 1 demotes the heading rather than nesting a second one.
-	async function setHeadingLevel(level) {
+	async function setHeadingLevel(level: number) {
 		const id = activeId;
 		const cell = findCell(id);
-		if (!cell) return;
+		if (!cell || !id) return;
 		if (cell.cell_type !== 'markdown') await setType(id, 'markdown');
-		const api = cellApis[id];
+		const api = apiOf(id);
 		const source = api?.currentSource?.() ?? cell.source;
 		const next = withHeadingLevel(source, level);
 		if (next === source) return;
@@ -1137,11 +1197,11 @@
 	}
 
 	/** shortcut id → what it does. `mode` is the mode the keystroke fired in. */
-	const actions = {
-		'command-mode': () => cellApis[activeId]?.blur(),
-		'edit-mode': () => cellApis[activeId]?.enterEdit(),
-		'run-cell': () => cellApis[activeId]?.run(false),
-		'run-advance': (mode) => cellApis[activeId]?.run(true, { focusNext: mode === 'edit' }),
+	const actions: Record<string, (mode: KeyMode) => void> = {
+		'command-mode': () => apiOf(activeId)?.blur(),
+		'edit-mode': () => apiOf(activeId)?.enterEdit(),
+		'run-cell': () => apiOf(activeId)?.run(false),
+		'run-advance': (mode) => apiOf(activeId)?.run(true, { focusNext: mode === 'edit' }),
 		'select-prev': () => selectRelative(-1),
 		'select-next': () => selectRelative(1),
 		'fold-section': () => setFolded(activeId, true),
@@ -1168,7 +1228,7 @@
 	// The command palette dispatches a registry shortcut by id into the same action
 	// the keyboard runs, always in command mode (the palette isn't a cell editor).
 	// An unknown id is a harmless no-op.
-	function dispatchCommand(shortcutId) {
+	function dispatchCommand(shortcutId: string) {
 		actions[shortcutId]?.('command');
 	}
 
@@ -1192,9 +1252,9 @@
 	// A binding may be several chords long. The leading chords are held here as a
 	// pending prefix until the sequence completes, a foreign key ends it, or it
 	// times out - so a lone `d` does nothing at all.
-	let pendingChords = [];
-	let pendingMode = null; // the mode the prefix was typed in
-	let pendingTimer;
+	let pendingChords: string[] = [];
+	let pendingMode: ShortcutMode | null = null; // the mode the prefix was typed in
+	let pendingTimer: ReturnType<typeof setTimeout>;
 
 	function clearPending() {
 		clearTimeout(pendingTimer);
@@ -1202,7 +1262,7 @@
 		pendingMode = null;
 	}
 
-	function armPending(chords, mode) {
+	function armPending(chords: string[], mode: ShortcutMode) {
 		clearTimeout(pendingTimer);
 		pendingChords = chords;
 		pendingMode = mode;
@@ -1215,7 +1275,7 @@
 	 * prefix typed in command mode can never combine with a keystroke in an editor,
 	 * which is what keeps `d` from leaking into typing.
 	 */
-	function resolveChord(mode, chord) {
+	function resolveChord(mode: ShortcutMode, chord: string): { shortcut?: EffectiveShortcut; prefix?: string[] } {
 		const seq = pendingMode === mode ? [...pendingChords, chord] : [chord];
 		clearPending();
 		const shortcut = shortcuts.lookup(mode, seq.join(' '));
@@ -1226,13 +1286,13 @@
 		return {};
 	}
 
-	function onKeydown(e) {
+	function onKeydown(e: KeyboardEvent) {
 		// A modal (settings, delete-confirm) owns the keyboard while it is open.
 		if (document.querySelector('.modal-open')) return;
 		const chord = chordFromEvent(e);
 		if (!chord) return;
 
-		const t = e.target;
+		const t = e.target as HTMLElement | null;
 		// CodeMirror's own panels (the search/replace bar) are its keyboard, not
 		// ours: they live inside `.cm-editor`, so the `inEditor` test alone would
 		// hand their Enter and Mod-Enter to the notebook.
@@ -1255,8 +1315,8 @@
 		// *focused* cell rather than `activeId`, which is the same cell in edit mode
 		// but need not be if a focus event is still in flight.
 		if (mode === 'edit' && chord === 'Escape') {
-			const focusedId = t.closest('[data-cell-id]')?.dataset.cellId;
-			if (cellApis[focusedId]?.editorOverlayOpen?.()) return;
+			const focusedId = (t?.closest('[data-cell-id]') as HTMLElement | null)?.dataset.cellId;
+			if (apiOf(focusedId)?.editorOverlayOpen?.()) return;
 		}
 
 		const { shortcut, prefix } = resolveChord(mode, chord);

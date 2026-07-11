@@ -25,8 +25,8 @@ import { readNotebook, deserialize, writeNotebook } from './ipynb';
 import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
-import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole.js';
-import { SQL_LANGUAGE } from '../cellLanguage.js';
+import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
+import { SQL_LANGUAGE } from '../cellLanguage';
 import type {
 	Cell,
 	CellView,

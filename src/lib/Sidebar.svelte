@@ -1,14 +1,83 @@
-<script>
+<script lang="ts">
 	import { onMount, setContext } from 'svelte';
 	import Databricks from '$lib/Databricks.svelte';
 	import Environment from '$lib/Environment.svelte';
 	import Checkpoints from '$lib/Checkpoints.svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
-	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
-	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections.js';
-	import { outlineRows as buildOutlineRows } from '$lib/headings.js';
-	import { getUi, setUi } from '$lib/uiState.js';
+	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge';
+	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
+	import { outlineRows as buildOutlineRows } from '$lib/headings';
+	import { getUi, setUi } from '$lib/uiState';
+	import type { Cell } from '$lib/server/types';
+	import type { TreeNode } from '$lib/server/fstree';
+	import type { GitStatusLetter } from '$lib/server/git';
+	import type { KernelInfo } from '$lib/kernelBadge';
+	import type { CellarFileOps, FileClipboard, NewEntry, FileDescriptor } from '$lib/fileOps';
+
+	/** A file/dir/root descriptor the context menu + selection act on. */
+	type MenuNode = { type: 'file' | 'dir' | 'root'; path: string; name?: string; children?: TreeNode[] };
+	/** The workspace tree payload from /api/fs/tree. */
+	interface TreeRoot {
+		name: string;
+		root: string;
+		tree: TreeNode[];
+	}
+	/** One open/loaded notebook shown under the Kernels section. */
+	interface NotebookTab {
+		id: string;
+		name?: string;
+		open?: boolean;
+		active?: boolean;
+	}
+	/** A kernel-namespace variable row (from the inspector probe). */
+	interface VariableInfo {
+		name: string;
+		type?: string;
+		shape?: string;
+		preview?: string;
+	}
+	/** MCP connection info the shell load resolves. */
+	interface McpInfo {
+		url?: string | null;
+		projectConfigured?: boolean;
+	}
+	/** A tab-impacting file-system change reported up to the shell. */
+	interface FsChange {
+		type: 'rename' | 'move' | 'delete';
+		from?: string;
+		path: string;
+	}
+
+	interface Props {
+		cells: Cell[];
+		foldedIds?: Set<string>;
+		foldCounts?: Record<string, number>;
+		onToggleFold?: (key: string) => void;
+		onCollapseAllFolds?: () => void;
+		onExpandAllFolds?: () => void;
+		mcp?: McpInfo | null;
+		kernelInfo?: KernelInfo | null;
+		kernelBusy?: boolean;
+		loadedNotebooks?: NotebookTab[];
+		variables?: VariableInfo[];
+		varsLoading?: boolean;
+		varsError?: string;
+		onRefreshVars?: () => void;
+		onRefreshKernel?: () => void;
+		onInterruptKernel?: () => void;
+		onRestartKernel?: () => void;
+		onInsertAndRun?: ((source: string) => void) | null;
+		onDatabricksSessionChange?: () => void;
+		onOpenFile: (path: string) => void;
+		onOpenFilePermanent: (path: string) => void;
+		onFocusNotebook?: (id: string) => void;
+		activeFilePath?: string | null;
+		fsRefreshSignal?: number;
+		onScrollToCell: (cellId: string, key?: string) => void;
+		onFsChange?: (change: FsChange) => void;
+		activeNotebookPath?: string | null;
+	}
 
 	let {
 		cells,
@@ -47,14 +116,14 @@
 		// The active notebook (workspace-relative path, or null). Drives the History
 		// (checkpoints) panel, which is per-notebook.
 		activeNotebookPath = null
-	} = $props();
+	}: Props = $props();
 
 	// ---- Persisted section collapse state -----------------------------------
 	// Which foldable sections are open. All start expanded (agent panel collapsed),
 	// then overridden by the persisted state on mount.
 	const OPEN_KEY = 'cellar-sidebar-open';
-	let open = $state({ files: true, kernels: true, databricks: false, environment: false, agent: false, outline: true, history: false, vars: true, search: false });
-	function toggle(k) {
+	let open = $state<Record<string, boolean>>({ files: true, kernels: true, databricks: false, environment: false, agent: false, outline: true, history: false, vars: true, search: false });
+	function toggle(k: string) {
 		open[k] = !open[k];
 		persist(OPEN_KEY, open);
 	}
@@ -69,10 +138,12 @@
 	// Same lazy-mount latch for the Environment panel: it spawns a python
 	// subprocess to list packages, so a user who never opens it never pays for it.
 	let environmentMounted = $state(false);
-	let environmentComp = $state(null);
+	// Component instance handles (bind:this). Typed structurally by the exported
+	// methods the header buttons call.
+	let environmentComp = $state<{ refresh: () => void } | null>(null);
 	// The History (checkpoints) panel component, for its header's "Checkpoint now" +
 	// refresh buttons. Mounted with the section (it's cheap: one metadata GET).
-	let checkpointsComp = $state(null);
+	let checkpointsComp = $state<{ refresh: () => void; checkpointNow: () => void } | null>(null);
 	$effect(() => {
 		if (open.environment) environmentMounted = true;
 	});
@@ -87,35 +158,37 @@
 
 	// Persisted in the per-project UI-state store (port-independent), not
 	// `localStorage` - see `$lib/uiState.js`.
-	function persist(key, value) {
+	function persist(key: string, value: unknown) {
 		setUi(key, value);
 	}
 	onMount(() => {
-		const savedOpen = getUi(OPEN_KEY, null);
+		const savedOpen = getUi<Record<string, boolean> | null>(OPEN_KEY, null);
 		if (savedOpen && typeof savedOpen === 'object') open = { ...open, ...savedOpen };
-		sectionOrder = reconcileSectionOrder(getUi(ORDER_KEY, null));
+		sectionOrder = reconcileSectionOrder(getUi<string[] | null>(ORDER_KEY, null));
 	});
 
 	// Native HTML5 drag-and-drop to reorder sections (no external library).
-	let dragKey = $state(null);
-	let dropKey = $state(null);
+	let dragKey = $state<string | null>(null);
+	let dropKey = $state<string | null>(null);
 	let dropAfter = $state(false);
-	function onSecDragStart(e, key) {
+	function onSecDragStart(e: DragEvent, key: string) {
 		dragKey = key;
-		e.dataTransfer.effectAllowed = 'move';
-		try {
-			e.dataTransfer.setData('text/plain', key);
-		} catch {}
+		if (e.dataTransfer) {
+			e.dataTransfer.effectAllowed = 'move';
+			try {
+				e.dataTransfer.setData('text/plain', key);
+			} catch {}
+		}
 	}
-	function onSecDragOver(e, key) {
+	function onSecDragOver(e: DragEvent, key: string) {
 		if (dragKey == null) return;
 		e.preventDefault();
-		e.dataTransfer.dropEffect = 'move';
-		const r = e.currentTarget.getBoundingClientRect();
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		dropKey = key;
 		dropAfter = e.clientY > r.top + r.height / 2;
 	}
-	function onSecDrop(e, key) {
+	function onSecDrop(e: DragEvent, key: string) {
 		if (dragKey == null) return;
 		e.preventDefault();
 		reorderSection(dragKey, key, dropAfter);
@@ -126,7 +199,7 @@
 		dropKey = null;
 		dropAfter = false;
 	}
-	function reorderSection(from, to, after) {
+	function reorderSection(from: string, to: string, after: boolean) {
 		if (from === to) return;
 		const arr = sectionOrder.filter((k) => k !== from);
 		let idx = arr.indexOf(to);
@@ -137,10 +210,10 @@
 	}
 
 	// ---- File tree ----------------------------------------------------------
-	let treeRoot = $state(null);
+	let treeRoot = $state<TreeRoot | null>(null);
 	let treeError = $state('');
 	// Per-file git status (VS Code-style decorations); {} when not a git repo.
-	let gitFiles = $state({});
+	let gitFiles = $state<Record<string, GitStatusLetter>>({});
 	async function loadTree() {
 		try {
 			const res = await fetch('/api/fs/tree');
@@ -148,7 +221,7 @@
 			treeRoot = await res.json();
 			treeError = '';
 		} catch (err) {
-			treeError = String(err?.message ?? err);
+			treeError = String((err as Error)?.message ?? err);
 		}
 	}
 	async function loadGit() {
@@ -188,26 +261,26 @@
 	// through the path-guarded /api/fs/op route; the tree + git decorations are
 	// refreshed after each op, and tab impact (rename/move/delete) is reported up
 	// via onFsChange so no tab is left pointing at a gone/moved file.
-	let clipboard = $state(null); // { op: 'cut' | 'copy', path }
-	let renaming = $state(null); // relPath being renamed inline
-	let newEntry = $state(null); // { parentPath, kind: 'file' | 'dir' }
-	let selectedNode = $state(null); // { type, path, name }
-	let ctxMenu = $state(null); // { x, y, node }
-	let deleteTarget = $state(null); // { type, path, name }
+	let clipboard = $state<FileClipboard | null>(null);
+	let renaming = $state<string | null>(null); // relPath being renamed inline
+	let newEntry = $state<NewEntry | null>(null);
+	let selectedNode = $state<MenuNode | null>(null);
+	let ctxMenu = $state<{ x: number; y: number; node: MenuNode } | null>(null);
+	let deleteTarget = $state<{ type: string; path: string; name: string } | null>(null);
 	let opError = $state('');
 
-	function parentDir(p) {
+	function parentDir(p: string): string {
 		const i = p.lastIndexOf('/');
 		return i >= 0 ? p.slice(0, i) : '';
 	}
 	// The folder a "new" / "paste" targets: a dir uses itself, a file its parent,
 	// the tree root the workspace root ('').
-	function targetDirFor(node) {
+	function targetDirFor(node: MenuNode | null): string {
 		if (!node || node.type === 'root') return '';
 		return node.type === 'dir' ? node.path : parentDir(node.path);
 	}
 
-	async function runOp(payload) {
+	async function runOp(payload: Record<string, unknown>) {
 		opError = '';
 		try {
 			const res = await fetch('/api/fs/op', {
@@ -218,14 +291,14 @@
 			const body = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(body?.message || 'operation failed');
 			refreshFiles();
-			return body;
+			return body as { path?: string };
 		} catch (err) {
-			opError = String(err?.message ?? err);
+			opError = String((err as Error)?.message ?? err);
 			return null;
 		}
 	}
 
-	function openMenu(e, node) {
+	function openMenu(e: MouseEvent, node: MenuNode) {
 		selectedNode = node;
 		ctxMenu = { x: e.clientX, y: e.clientY, node };
 	}
@@ -235,18 +308,18 @@
 	// Escape dismisses the open context menu (click / scroll dismiss via backdrop).
 	$effect(() => {
 		if (!ctxMenu) return;
-		const onKey = (e) => {
+		const onKey = (e: KeyboardEvent) => {
 			if (e.key === 'Escape') closeMenu();
 		};
 		window.addEventListener('keydown', onKey);
 		return () => window.removeEventListener('keydown', onKey);
 	});
-	function onRootContext(e) {
+	function onRootContext(e: MouseEvent) {
 		e.preventDefault();
 		openMenu(e, { type: 'root', path: '', name: treeRoot?.name ?? '' });
 	}
 
-	function startNew(kind, node) {
+	function startNew(kind: 'file' | 'dir', node: MenuNode | null) {
 		closeMenu();
 		renaming = null;
 		newEntry = { parentPath: targetDirFor(node), kind };
@@ -254,14 +327,14 @@
 	function cancelNew() {
 		newEntry = null;
 	}
-	async function submitNew(name) {
+	async function submitNew(name: string) {
 		const entry = newEntry;
 		newEntry = null;
 		if (!entry) return;
 		await runOp({ op: 'create', parent: entry.parentPath, name, kind: entry.kind });
 	}
 
-	function startRename(node) {
+	function startRename(node: MenuNode) {
 		closeMenu();
 		newEntry = null;
 		renaming = node.path;
@@ -269,36 +342,36 @@
 	function cancelRename() {
 		renaming = null;
 	}
-	async function submitRename(path, name) {
+	async function submitRename(path: string, name: string) {
 		renaming = null;
 		const res = await runOp({ op: 'rename', path, name });
 		if (res?.path && res.path !== path) onFsChange?.({ type: 'rename', from: path, path: res.path });
 	}
 
-	function cutEntry(node) {
+	function cutEntry(node: MenuNode) {
 		closeMenu();
 		clipboard = { op: 'cut', path: node.path };
 	}
-	function copyEntry(node) {
+	function copyEntry(node: MenuNode) {
 		closeMenu();
 		clipboard = { op: 'copy', path: node.path };
 	}
-	async function pasteEntry(node) {
+	async function pasteEntry(node: MenuNode) {
 		closeMenu();
 		if (!clipboard) return;
 		const dest = targetDirFor(node);
 		const op = clipboard.op === 'cut' ? 'move' : 'copy';
 		const from = clipboard.path;
 		const res = await runOp({ op, path: from, dest });
-		if (res && op === 'move') {
+		if (res && op === 'move' && res.path) {
 			onFsChange?.({ type: 'move', from, path: res.path });
 			clipboard = null; // a cut is consumed; a copy stays for repeat pastes
 		}
 	}
 
-	function askDelete(node) {
+	function askDelete(node: MenuNode) {
 		closeMenu();
-		deleteTarget = { type: node.type, path: node.path, name: node.name };
+		deleteTarget = { type: node.type, path: node.path, name: node.name ?? '' };
 	}
 	async function doDelete() {
 		const t = deleteTarget;
@@ -310,8 +383,8 @@
 
 	// Keyboard shortcuts while a tree node is focused/selected (ignored while an
 	// inline rename/new input is being typed into).
-	function onFilesKeydown(e) {
-		if (e.target?.tagName === 'INPUT') return;
+	function onFilesKeydown(e: KeyboardEvent) {
+		if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
 		const n = selectedNode;
 		if (!n || n.type === 'root') return;
 		const meta = e.metaKey || e.ctrlKey;
@@ -325,14 +398,14 @@
 			copyEntry(n);
 		} else if (meta && (e.key === 'x' || e.key === 'X')) {
 			cutEntry(n);
-		} else if (meta && (e.key === 'v' || e.key === 'V') && clipboard && (n.type === 'dir' || n.type === 'root')) {
+		} else if (meta && (e.key === 'v' || e.key === 'V') && clipboard && n.type === 'dir') {
 			pasteEntry(n);
 		}
 	}
 
 	// Shared file-ops surface for the recursive tree nodes (avoids prop-drilling
 	// through FileTreeNode). Getters forward reactive $state so nodes stay live.
-	setContext('cellarFileOps', {
+	setContext<CellarFileOps>('cellarFileOps', {
 		get clipboard() {
 			return clipboard;
 		},
@@ -346,7 +419,7 @@
 			return selectedNode?.path ?? null;
 		},
 		openMenu,
-		select: (node) => (selectedNode = node),
+		select: (node: FileDescriptor) => (selectedNode = node),
 		submitRename,
 		cancelRename,
 		submitNew,
@@ -365,7 +438,7 @@
 	const matches = $derived.by(() => {
 		const q = query.trim().toLowerCase();
 		if (!q) return [];
-		const out = [];
+		const out: { cellId: string; cellType: string; snippet: string }[] = [];
 		for (const cell of cells) {
 			const src = cell.source || '';
 			if (!src.toLowerCase().includes(q)) continue;
@@ -390,8 +463,9 @@
 	);
 	let advancedOpen = $state(false);
 	let copied = $state(''); // 'add' | 'url' | 'snippet' | ''
-	let copyTimer;
-	async function copy(kind, textVal) {
+	let copyTimer: ReturnType<typeof setTimeout>;
+	async function copy(kind: string, textVal: string | null | undefined) {
+		if (!textVal) return;
 		try {
 			await navigator.clipboard.writeText(textVal);
 			copied = kind;
@@ -402,7 +476,7 @@
 </script>
 
 <!-- Section drag handle + collapse header, shared by every section. -->
-{#snippet header(key, label, testid)}
+{#snippet header(key: string, label: string, testid: string)}
 	<button
 		class="flex shrink-0 cursor-grab items-center px-1.5 py-2 text-base-content/25 hover:text-base-content/60 active:cursor-grabbing"
 		draggable="true"
@@ -420,7 +494,7 @@
 	</button>
 {/snippet}
 
-{#snippet refreshBtn(onClick, title, loading = false, testid = undefined)}
+{#snippet refreshBtn(onClick: (() => void) | undefined, title: string, loading = false, testid: string | undefined = undefined)}
 	<button class="btn btn-ghost btn-xs btn-square mr-1 text-base-content/40" onclick={onClick} {title} aria-label={title} data-testid={testid}>
 		{#if loading}
 			<span class="loading loading-spinner loading-xs"></span>
@@ -489,7 +563,7 @@
      active one is dotted; if the tab was closed the notebook is still loaded in the
      kernel (its state lives in the shared namespace), so it shows as a dimmed,
      non-clickable row tagged "closed". -->
-{#snippet notebookRow(nb)}
+{#snippet notebookRow(nb: NotebookTab)}
 	{#if nb.open}
 		<button class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50 {nb.active ? 'text-base-content' : 'text-base-content/60'}" onclick={() => onFocusNotebook?.(nb.id)} title="Focus {nb.name}" data-testid="kernel-notebook">
 			<svg class="h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
@@ -508,7 +582,7 @@
 <!-- Card header: title on the left, live status badge on the right. Shared by the
      started and not-started cards so both read their badge from `kernelBadge.js`.
      The badge never wraps; at narrow sidebar widths the title gives way instead. -->
-{#snippet kernelHeader(title, muted)}
+{#snippet kernelHeader(title: string, muted: boolean)}
 	<div class="flex items-center justify-between gap-2">
 		<span class="flex min-w-0 items-center gap-1.5 text-sm font-medium {muted ? 'text-base-content/50' : ''}">
 			<svg class="h-3.5 w-3.5 shrink-0 {muted ? 'text-base-content/40' : 'text-primary'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
@@ -523,7 +597,7 @@
 
 <!-- The notebooks loaded in the shared kernel (ran >=1 cell this session). Only
      the started card renders this — nothing is loaded before the first run. -->
-{#snippet notebookList(label)}
+{#snippet notebookList(label: string)}
 	<div class="mt-2 border-t border-base-300 pt-2">
 		<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40" data-testid="kernel-notebooks-label">
 			{label}
@@ -871,7 +945,7 @@
 	{/if}
 {/snippet}
 
-{#snippet sectionBody(key)}
+{#snippet sectionBody(key: string)}
 	{#if key === 'files'}{@render filesSection()}
 	{:else if key === 'kernels'}{@render kernelsSection()}
 	{:else if key === 'databricks'}{@render databricksSection()}
@@ -904,7 +978,7 @@
 </aside>
 
 <!-- ==== File-tree context menu =========================================== -->
-{#snippet menuItem(label, testid, action, danger = false)}
+{#snippet menuItem(label: string, testid: string, action: () => void, danger = false)}
 	<button
 		class="flex w-full items-center px-3 py-1 text-left hover:bg-base-300/70 {danger ? 'text-error' : 'text-base-content/90'}"
 		onclick={action}

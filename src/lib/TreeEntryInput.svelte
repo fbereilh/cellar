@@ -1,17 +1,27 @@
-<script>
-	import { iconSvg } from '$lib/fileIcons.js';
+<script lang="ts">
+	import { iconSvg } from '$lib/fileIcons';
 
 	// Inline editable row used by the file tree for renaming an entry and for
 	// creating a new file/folder. Enter submits, Escape (or blur) cancels. Kept
 	// deliberately dumb: the parent owns what happens on submit/cancel.
+	interface Props {
+		depth?: number;
+		initial?: string;
+		/** For a new entry, picks the placeholder icon ('file' | 'dir'). */
+		kind?: string;
+		/** Explicit icon html (rename passes the entry's own icon). */
+		icon?: string | null;
+		onSubmit?: (name: string) => void;
+		onCancel?: () => void;
+	}
 	let {
 		depth = 0,
 		initial = '',
-		kind = 'file', // for a new entry, picks the placeholder icon
-		icon = null, // explicit icon html (rename passes the entry's own icon)
+		kind = 'file',
+		icon = null,
 		onSubmit,
 		onCancel
-	} = $props();
+	}: Props = $props();
 
 	let value = $state(initial);
 	let done = false; // guard so blur after Enter/Escape doesn't double-fire
@@ -30,7 +40,7 @@
 		done = true;
 		onCancel?.();
 	}
-	function onKeydown(e) {
+	function onKeydown(e: KeyboardEvent) {
 		if (e.key === 'Enter') {
 			e.preventDefault();
 			submit();
@@ -40,7 +50,7 @@
 		}
 	}
 	// Autofocus + select the name stem (before the extension) on mount.
-	function init(el) {
+	function init(el: HTMLInputElement) {
 		el.focus();
 		const dot = value.lastIndexOf('.');
 		if (dot > 0) el.setSelectionRange(0, dot);

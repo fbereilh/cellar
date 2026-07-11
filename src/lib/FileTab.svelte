@@ -1,7 +1,7 @@
-<script>
+<script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { EditorView, keymap } from '@codemirror/view';
-	import { EditorState, Prec } from '@codemirror/state';
+	import { EditorView, keymap, type ViewUpdate } from '@codemirror/view';
+	import { EditorState, Prec, type Extension } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
@@ -9,9 +9,20 @@
 	import { yaml as yamlLang } from '@codemirror/lang-yaml';
 	import { StreamLanguage } from '@codemirror/language';
 	import { toml as tomlMode } from '@codemirror/legacy-modes/mode/toml';
-	import { EDITOR_THEME } from '$lib/editorTheme.js';
-	import { gitGutterExtension, setGitBaseline } from '$lib/gitGutter.js';
+	import { EDITOR_THEME } from '$lib/editorTheme';
+	import { gitGutterExtension, setGitBaseline } from '$lib/gitGutter';
 	import MarkdownView from '$lib/MarkdownView.svelte';
+	import type { BlameLine } from '$lib/server/git';
+
+	interface Props {
+		path: string;
+		/** Reports (path, dirty) so the tab bar can show the unsaved indicator. */
+		onDirty?: (path: string, dirty: boolean) => void;
+		/** The shell's fsRefreshSignal: a bump re-fetches the git-HEAD baseline. */
+		gitRefresh?: number;
+		/** Reports the git-blame record for the cursor's line (null = untracked). */
+		onBlame?: (path: string, record: BlameLine | null) => void;
+	}
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports
 	// dirty state up so the tab bar can show the unsaved indicator. `gitRefresh`
@@ -20,13 +31,13 @@
 	// `onBlame(path, record|null)` reports the git-blame record for the line the
 	// cursor sits on, so the shell's bottom status bar can show "who last edited
 	// this line, and when" (GitLens-style). `null` = no blame (untracked / non-repo).
-	let { path, onDirty, gitRefresh = 0, onBlame } = $props();
+	let { path, onDirty, gitRefresh = 0, onBlame }: Props = $props();
 
-	let editorEl;
+	let editorEl: HTMLDivElement;
 	// `$state.raw` so the git-baseline effect below re-runs once the editor exists,
 	// without Svelte proxying the EditorView itself.
-	let view = $state.raw(null);
-	let status = $state('loading'); // 'loading' | 'ready' | 'error'
+	let view = $state.raw<EditorView | null>(null);
+	let status = $state<'loading' | 'ready' | 'error'>('loading');
 	let errorMsg = $state('');
 	let dirty = $state(false);
 	let saving = $state(false);
@@ -39,10 +50,10 @@
 	// remembered across files (session-wide preference; source is the default).
 	const isMarkdownFile = /\.(md|markdown)$/i.test(path);
 	const VIEW_KEY = 'cellar-md-view';
-	let mdMode = $state('source'); // 'source' | 'preview'
+	let mdMode = $state<'source' | 'preview'>('source');
 	let liveSource = $state('');
 
-	function setMdMode(m) {
+	function setMdMode(m: 'source' | 'preview') {
 		mdMode = m;
 		try {
 			localStorage.setItem(VIEW_KEY, m);
@@ -54,7 +65,7 @@
 	// so both editor themes style it without any theme-side work.
 	const tomlLang = () => StreamLanguage.define(tomlMode);
 
-	function langFor(p) {
+	function langFor(p: string): Extension {
 		if (p.endsWith('.py')) return python();
 		if (p.endsWith('.md') || p.endsWith('.markdown')) return markdown();
 		if (p.endsWith('.json') || p.endsWith('.ipynb')) return jsonLang();
@@ -63,7 +74,7 @@
 		return [];
 	}
 
-	function setDirty(v) {
+	function setDirty(v: boolean) {
 		if (v !== dirty) {
 			dirty = v;
 			onDirty?.(path, v);
@@ -80,7 +91,10 @@
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ path, content })
 			});
-			if (!res.ok) throw new Error((await res.json().catch(() => ({})))?.message || 'save failed');
+			if (!res.ok) {
+				const body = (await res.json().catch(() => ({}))) as { message?: string };
+				throw new Error(body?.message || 'save failed');
+			}
 			setDirty(false);
 			savedFlash = true;
 			setTimeout(() => (savedFlash = false), 1200);
@@ -88,7 +102,7 @@
 			// stop reading "Not Committed Yet" only where git agrees they moved.
 			loadBlame();
 		} catch (err) {
-			errorMsg = String(err?.message ?? err);
+			errorMsg = String((err as Error)?.message ?? err);
 		} finally {
 			saving = false;
 		}
@@ -100,7 +114,7 @@
 	// workspace that isn't a repo) has no baseline → no bars, like VS Code.
 	async function loadGitBaseline() {
 		if (!view) return;
-		let baseline = null;
+		let baseline: string | null = null;
 		try {
 			const res = await fetch(`/api/fs/git/head?path=${encodeURIComponent(path)}`);
 			const body = await res.json();
@@ -121,8 +135,8 @@
 	// Blame the whole file once (cached), then map the cursor's line to a record
 	// as it moves — cheap: no `git` process per keystroke, refreshed only on save
 	// / git-state changes. An untracked file or non-repo reports null (no blame).
-	let blameLines = null; // Array<record> | null, 0-indexed by file line
-	let blameTimer;
+	let blameLines: BlameLine[] | null = null; // 0-indexed by file line
+	let blameTimer: ReturnType<typeof setTimeout>;
 
 	async function loadBlame() {
 		blameLines = null;
@@ -191,7 +205,7 @@
 			}
 		} catch (err) {
 			status = 'error';
-			errorMsg = String(err?.message ?? err);
+			errorMsg = String((err as Error)?.message ?? err);
 			return;
 		}
 
@@ -207,7 +221,7 @@
 					gitGutterExtension(),
 					EDITOR_THEME,
 					Prec.highest(keymap.of([{ key: 'Mod-s', run: () => (save(), true) }])),
-					EditorView.updateListener.of((v) => {
+					EditorView.updateListener.of((v: ViewUpdate) => {
 						if (v.docChanged) {
 							setDirty(true);
 							if (isMarkdownFile) liveSource = v.state.doc.toString();

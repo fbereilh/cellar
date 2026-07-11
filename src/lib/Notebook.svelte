@@ -1,8 +1,56 @@
-<script>
+<script lang="ts">
 	import Cell from '$lib/Cell.svelte';
-	import { isImportsCell } from '$lib/importsRole.js';
+	import { isImportsCell } from '$lib/importsRole';
+	import type { CellType, LogicalCellType } from '$lib/server/types';
+	import type { KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
+	import type { StalenessEntry } from '$lib/staleness';
+	import type { CellChangeStatus } from '$lib/gitdiff';
 
-	const NO_SEGS_HIDDEN = { headings: new Set(), bodies: new Set() };
+	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
+
+	interface Props {
+		cells: UICell[];
+		runningId: string | null;
+		/** cell id → 1-based position in the kernel's global run queue */
+		queued?: Record<string, number>;
+		activeId?: string | null;
+		keyMode?: KeyMode;
+		/** cell id → staleness verdict ($lib/staleness) */
+		staleness?: Record<string, StalenessEntry>;
+		/** cell ids hidden because a folded heading collapsed their section */
+		hidden?: Set<string>;
+		/** fold keys of the headings whose section is folded */
+		foldedIds?: Set<string>;
+		/** cell id → segment indices an outer fold hides inside it */
+		hiddenSegs?: Map<string, SegHidden>;
+		/** fold key → number of whole cells that heading hides */
+		hiddenCounts?: Record<string, number>;
+		/** cell id → change status vs git HEAD */
+		gitStatus?: Record<string, CellChangeStatus>;
+		/** cell id → cells deleted from HEAD immediately above it */
+		gitRemovedBefore?: Record<string, number>;
+		/** cells deleted from the end of HEAD's notebook */
+		gitRemovedAtEnd?: number;
+		onToggleFold?: (key: string) => void;
+		onRun: (id: string, source: string) => void;
+		onRunAdvance: (id: string, source: string, opts: { focusNext: boolean }) => void;
+		onInterrupt?: () => void;
+		onClear: (id: string) => void;
+		onDelete: (id: string) => void;
+		onMove: (id: string, dir: 'up' | 'down') => void;
+		onMoveToIndex?: (id: string, toIndex: number) => void;
+		onEdit: (id: string, source: string, opts?: { keepalive?: boolean }) => void;
+		onSetType: (id: string, type: LogicalCellType) => void;
+		onSetScrolled?: (id: string, scrolled: boolean) => void;
+		/** cell id → explicit code-editor collapse choice (runtime-only) */
+		editorCollapsed?: Record<string, boolean | undefined>;
+		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
+		onActivate?: (id: string) => void;
+		onRegister?: (id: string, api: CellRegisterApi | null) => void;
+		onEditorFocus?: (id: string) => void;
+		onEditorBlur?: (id: string) => void;
+		onAddCell: (afterId: string | undefined, cellType: CellType) => void;
+	}
 
 	// The shell owns the cell array + all cell operations (so the sidebar's
 	// outline/search/inspector can read the same live state); this component is
@@ -10,17 +58,17 @@
 	let {
 		cells,
 		runningId,
-		queued = {}, // cell id → 1-based position in the kernel's global run queue
+		queued = {},
 		activeId = null,
-		keyMode = 'command', // 'command' | 'edit' (Jupyter-style modal keyboard)
-		staleness = {}, // cell id → staleness verdict ($lib/staleness.js)
-		hidden = new Set(), // cell ids hidden because a folded heading collapsed their section
-		foldedIds = new Set(), // fold keys of the headings whose section is folded
-		hiddenSegs = new Map(), // cell id → segment indices an outer fold hides inside it
-		hiddenCounts = {}, // fold key → number of whole cells that heading hides
-		gitStatus = {}, // cell id → 'added' | 'modified' | 'moved' (vs git HEAD)
-		gitRemovedBefore = {}, // cell id → cells deleted from HEAD immediately above it
-		gitRemovedAtEnd = 0, // cells deleted from the end of HEAD's notebook
+		keyMode = 'command',
+		staleness = {},
+		hidden = new Set(),
+		foldedIds = new Set(),
+		hiddenSegs = new Map(),
+		hiddenCounts = {},
+		gitStatus = {},
+		gitRemovedBefore = {},
+		gitRemovedAtEnd = 0,
 		onToggleFold,
 		onRun,
 		onRunAdvance,
@@ -32,22 +80,22 @@
 		onEdit,
 		onSetType,
 		onSetScrolled,
-		editorCollapsed = {}, // cell id → explicit code-editor collapse choice (runtime-only)
+		editorCollapsed = {},
 		onSetEditorCollapsed,
 		onActivate,
 		onRegister,
 		onEditorFocus,
 		onEditorBlur,
 		onAddCell
-	} = $props();
+	}: Props = $props();
 
 	// ---- Drag to reorder cells ----------------------------------------------
 	// A per-cell drag handle sets `draggable`; the editor stays non-draggable so
 	// text selection is never hijacked. During a drag we show a thin insertion
 	// line at the top or bottom edge of the hovered cell, then commit the move to
 	// an absolute index via `onMoveToIndex` (which reuses the server move API).
-	let dragId = $state(null); // id of the cell being dragged
-	let dropIndex = $state(null); // insertion index the drop would land at
+	let dragId = $state<string | null>(null); // id of the cell being dragged
+	let dropIndex = $state<number | null>(null); // insertion index the drop would land at
 	let dropAtEnd = $state(false); // insertion line drawn below the last hovered cell
 
 	// Cell 0 is the pinned imports cell: nothing may be dropped above it, and it is
@@ -55,27 +103,29 @@
 	// clamp would then refuse, so the line snaps below it instead.
 	const pinnedTop = $derived(isImportsCell(cells[0]));
 
-	function onDragStart(e, id) {
+	function onDragStart(e: DragEvent, id: string) {
 		dragId = id;
-		e.dataTransfer.effectAllowed = 'move';
-		try {
-			e.dataTransfer.setData('text/plain', id);
-		} catch {}
+		if (e.dataTransfer) {
+			e.dataTransfer.effectAllowed = 'move';
+			try {
+				e.dataTransfer.setData('text/plain', id);
+			} catch {}
+		}
 	}
 	/** Which edge of cell `index` the pointer is nearest — never above a pinned top cell. */
-	function dropsAfter(e, index) {
-		const r = e.currentTarget.getBoundingClientRect();
+	function dropsAfter(e: DragEvent, index: number): boolean {
+		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		if (index === 0 && pinnedTop) return true;
 		return e.clientY > r.top + r.height / 2;
 	}
-	function onDragOverCell(e, index) {
+	function onDragOverCell(e: DragEvent, index: number) {
 		if (dragId == null) return;
 		e.preventDefault();
-		e.dataTransfer.dropEffect = 'move';
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
 		dropIndex = index;
 		dropAtEnd = dropsAfter(e, index);
 	}
-	function onDropCell(e, index) {
+	function onDropCell(e: DragEvent, index: number) {
 		if (dragId == null) return;
 		e.preventDefault();
 		const after = dropsAfter(e, index);
@@ -100,20 +150,20 @@
 	// A deleted cell has no cell of its own to decorate, so it surfaces as a
 	// dashed seam at the gap it left behind. Colors come from the shared
 	// `--cellar-git-*` palette (`app.css`), which follows the light/dark theme.
-	const GIT_COLOR = {
+	const GIT_COLOR: Record<CellChangeStatus, string> = {
 		added: 'var(--cellar-git-added)',
 		modified: 'var(--cellar-git-modified)',
 		moved: 'var(--cellar-git-moved)'
 	};
-	const GIT_TITLE = {
+	const GIT_TITLE: Record<CellChangeStatus, string> = {
 		added: 'Added since the last commit',
 		modified: 'Modified since the last commit',
 		moved: 'Moved since the last commit'
 	};
-	const removedLabel = (n) => `${n} ${n === 1 ? 'cell' : 'cells'} removed`;
+	const removedLabel = (n: number): string => `${n} ${n === 1 ? 'cell' : 'cells'} removed`;
 </script>
 
-{#snippet removedSeam(n)}
+{#snippet removedSeam(n: number)}
 	<div
 		class="flex items-center gap-2 text-[11px]"
 		style="color: var(--cellar-git-removed)"

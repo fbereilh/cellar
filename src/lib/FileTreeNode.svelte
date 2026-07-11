@@ -1,17 +1,17 @@
-<script module>
+<script module lang="ts">
 	// VS Code-style git decoration colors, shared by every tree node.
 	// U/A = green, M/R = gold, D/C = red. Each token resolves per color-scheme in
 	// `app.css` - VS Code's dark decoration hues are far too light to read against
 	// a light background, so light and dark carry different values.
-	export function gitColor(letter) {
+	export function gitColor(letter: string): string {
 		if (letter === 'U' || letter === 'A') return 'var(--cellar-git-tree-added)';
 		if (letter === 'D' || letter === 'C') return 'var(--cellar-git-tree-deleted)';
 		if (letter) return 'var(--cellar-git-tree-modified)'; // M, R, T
 		return '';
 	}
 	// Precedence for rolling child statuses up to a collapsed folder.
-	const RANK = { C: 5, D: 4, M: 3, R: 3, T: 3, A: 2, U: 1 };
-	export function rollupStatus(gitFiles, dirPath) {
+	const RANK: Record<string, number> = { C: 5, D: 4, M: 3, R: 3, T: 3, A: 2, U: 1 };
+	export function rollupStatus(gitFiles: Record<string, string>, dirPath: string): string {
 		const prefix = dirPath + '/';
 		let best = '';
 		for (const p in gitFiles) {
@@ -23,11 +23,26 @@
 	}
 </script>
 
-<script>
+<script lang="ts">
 	import Self from '$lib/FileTreeNode.svelte';
-	import { iconSvg } from '$lib/fileIcons.js';
+	import { iconSvg } from '$lib/fileIcons';
 	import { getContext } from 'svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
+	import type { TreeNode } from '$lib/server/fstree';
+	import type { GitStatusLetter } from '$lib/server/git';
+	import type { CellarFileOps, FileDescriptor } from '$lib/fileOps';
+
+	interface Props {
+		node: TreeNode;
+		depth?: number;
+		/** Single-click a file → preview it. */
+		onOpen: (path: string) => void;
+		/** Double-click a file → pin it as a permanent tab. */
+		onOpenPermanent?: (path: string) => void;
+		/** Workspace-relative path → git status letter. */
+		gitFiles?: Record<string, GitStatusLetter>;
+		activePath?: string | null;
+	}
 
 	// One node of the workspace file tree. Directories toggle open/closed
 	// (collapsed by default so only the root level shows on open); files invoke
@@ -35,10 +50,10 @@
 	// File-management state (context menu, clipboard, inline rename/new) flows
 	// via the shared `cellarFileOps` context so it need not drill through the
 	// recursive tree.
-	let { node, depth = 0, onOpen, onOpenPermanent, gitFiles = {}, activePath = null } = $props();
+	let { node, depth = 0, onOpen, onOpenPermanent, gitFiles = {}, activePath = null }: Props = $props();
 	let open = $state(false); // folders start collapsed
 
-	const ops = getContext('cellarFileOps');
+	const ops = getContext<CellarFileOps>('cellarFileOps');
 
 	const status = $derived(node.type === 'dir' ? rollupStatus(gitFiles, node.path) : gitFiles[node.path] || '');
 	const color = $derived(gitColor(status));
@@ -61,9 +76,9 @@
 		if (isNewTarget) open = true;
 	});
 
-	const descriptor = $derived({ type: node.type, path: node.path, name: node.name });
+	const descriptor: FileDescriptor = $derived({ type: node.type, path: node.path, name: node.name });
 
-	function onContext(e) {
+	function onContext(e: MouseEvent) {
 		if (!ops) return;
 		e.preventDefault();
 		e.stopPropagation();
@@ -77,7 +92,7 @@
 			{depth}
 			initial={node.name}
 			icon={iconSvg(node.name, { dir: true, open })}
-			onSubmit={(name) => ops.submitRename(node.path, name)}
+			onSubmit={(name: string) => ops.submitRename(node.path, name)}
 			onCancel={() => ops.cancelRename()}
 		/>
 	{:else}
@@ -102,8 +117,8 @@
 		{#if isNewTarget}
 			<TreeEntryInput
 				depth={depth + 1}
-				kind={ops.newEntry.kind}
-				onSubmit={(name) => ops.submitNew(name)}
+				kind={ops.newEntry?.kind}
+				onSubmit={(name: string) => ops.submitNew(name)}
 				onCancel={() => ops.cancelNew()}
 			/>
 		{/if}
@@ -116,7 +131,7 @@
 		{depth}
 		initial={node.name}
 		icon={iconSvg(node.name)}
-		onSubmit={(name) => ops.submitRename(node.path, name)}
+		onSubmit={(name: string) => ops.submitRename(node.path, name)}
 		onCancel={() => ops.cancelRename()}
 	/>
 {:else}

@@ -32,7 +32,7 @@ import {
 	getImportsCell,
 	resolveNotebookPath
 } from './notebook';
-import { IMPORTS_ROLE, isImportsCell } from '../importsRole.js';
+import { IMPORTS_ROLE, isImportsCell } from '../importsRole';
 import { extractTopLevelImports, mergeImportSources, isImportsOnly, hasTopLevelImports } from './imports';
 import { enqueueRun, queuePosition, RunCancelled } from './run-queue';
 import { executeCellRun } from './run';

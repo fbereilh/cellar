@@ -30,8 +30,8 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { currentSessionId } from './kernel';
 import { listCells } from './notebook';
 import { projectPython } from './databricks';
-import { computeStaleness } from '../staleness.js';
-import { isSqlCell } from '../cellLanguage.js';
+import { computeStaleness } from '../staleness';
+import { isSqlCell } from '../cellLanguage';
 import type { CellView, SessionId } from './types';
 
 /** The names a cell binds at module scope, and the module globals it reads. */

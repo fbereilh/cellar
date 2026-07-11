@@ -14,16 +14,58 @@
 // cell's leading heading (the overwhelmingly common case, and what the keyboard
 // fold shortcuts + `revealCell` address), `<cellId>#<segmentIndex>` otherwise.
 
+import type { Cell } from '$lib/server/types';
+
+/** The minimal cell shape these helpers read; `Cell`/`CellView` are assignable. */
+type HeadingCell = { id: string; cell_type: string; source: string };
+
+/** One segment of a split markdown source (`level` null = the leading non-heading run). */
+export interface HeadingSegment {
+	index: number;
+	level: number | null;
+	title: string | null;
+	heading: string;
+	body: string;
+}
+
+/** A heading occurrence, in document order. */
+export interface OutlineHeading {
+	key: string;
+	cellId: string;
+	level: number;
+	title: string | null;
+}
+
+/** An Outline row: a heading plus its render state. */
+export interface OutlineRow extends OutlineHeading {
+	depth: number;
+	folded: boolean;
+	hiddenCount: number;
+}
+
+/** Per-cell hidden segment indices inside a still-visible cell. */
+export interface FoldSegs {
+	headings: Set<number>;
+	bodies: Set<number>;
+}
+
+/** What the notebook hides for a given set of folded heading keys. */
+export interface Folding {
+	hidden: Set<string>;
+	segs: Map<string, FoldSegs>;
+	counts: Record<string, number>;
+}
+
 const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
 const FENCE = /^\s{0,3}(```|~~~)/;
 
 /** Fold-state key for the heading at `segIndex` of cell `cellId`. */
-export function foldKey(cellId, segIndex) {
+export function foldKey(cellId: string, segIndex: number): string {
 	return segIndex === 0 ? cellId : `${cellId}#${segIndex}`;
 }
 
 /** The cell a fold key addresses. */
-export function cellIdOfKey(key) {
+export function cellIdOfKey(key: string): string {
 	const i = String(key).indexOf('#');
 	return i === -1 ? key : String(key).slice(0, i);
 }
@@ -36,12 +78,12 @@ export function cellIdOfKey(key) {
  * null for the non-heading segment. Always returns at least one segment, so
  * every markdown cell has something to hide.
  */
-export function splitHeadingSegments(source) {
-	const segs = [];
-	let level = null;
-	let title = null;
+export function splitHeadingSegments(source: string | null | undefined): HeadingSegment[] {
+	const segs: HeadingSegment[] = [];
+	let level: number | null = null;
+	let title: string | null = null;
 	let heading = '';
-	let body = [];
+	let body: string[] = [];
 	let inFence = false;
 
 	const flush = () => {
@@ -68,7 +110,7 @@ export function splitHeadingSegments(source) {
 }
 
 /** Header level (1-6) of a markdown cell's *leading* heading, or null. */
-export function headerLevel(cell) {
+export function headerLevel(cell: HeadingCell | null | undefined): number | null {
 	if (!cell || cell.cell_type !== 'markdown') return null;
 	return splitHeadingSegments(cell.source)[0]?.level ?? null;
 }
@@ -85,7 +127,7 @@ const HEADING_PREFIX = /^\s*(?:#{1,6}[ \t]*)?/;
  * The inverse of `headerLevel`, which reads that same first non-empty line off
  * the cell's leading segment.
  */
-export function withHeadingLevel(source, level) {
+export function withHeadingLevel(source: string | null | undefined, level: number): string {
 	const hashes = '#'.repeat(Math.min(Math.max(level, 1), 6));
 	const lines = String(source ?? '').split('\n');
 	const i = lines.findIndex((l) => l.trim() !== '');
@@ -95,8 +137,8 @@ export function withHeadingLevel(source, level) {
 }
 
 /** Every heading in the notebook, in document order (the Outline's rows). */
-export function outlineHeadings(cells) {
-	const out = [];
+export function outlineHeadings(cells: readonly HeadingCell[] | null | undefined): OutlineHeading[] {
+	const out: OutlineHeading[] = [];
 	for (const cell of cells ?? []) {
 		if (cell.cell_type !== 'markdown') continue;
 		for (const s of splitHeadingSegments(cell.source)) {
@@ -106,11 +148,16 @@ export function outlineHeadings(cells) {
 	return out;
 }
 
+// A single fold unit: a foldable heading (carries a level + key) or a body run.
+type FoldUnit =
+	| { cellId: string; seg: number; kind: 'heading'; level: number; key: string }
+	| { cellId: string; seg: number; kind: 'body'; level: null };
+
 // The notebook flattened to fold *units*, in document order. A code cell is one
 // unit; a markdown cell contributes a heading unit (foldable) and a body unit
 // per segment. Only heading units carry a level, so only they end a section.
-function foldUnits(cells) {
-	const units = [];
+function foldUnits(cells: readonly HeadingCell[] | null | undefined): FoldUnit[] {
+	const units: FoldUnit[] = [];
 	for (const cell of cells ?? []) {
 		if (cell.cell_type === 'markdown') {
 			for (const s of splitHeadingSegments(cell.source)) {
@@ -136,19 +183,19 @@ function foldUnits(cells) {
  *   counts — fold key → number of whole cells that fold hides (the "N cells
  *            hidden" hint; in-cell content is reported by the fold cue itself)
  */
-export function computeFolding(cells, foldedIds) {
+export function computeFolding(cells: readonly HeadingCell[] | null | undefined, foldedIds: Set<string>): Folding {
 	const units = foldUnits(cells);
 
 	// Units of a cell are contiguous, so a cell is a [first,last] index range.
-	const range = new Map();
+	const range = new Map<string, { first: number; last: number }>();
 	units.forEach((u, i) => {
 		const r = range.get(u.cellId);
 		if (r) r.last = i;
 		else range.set(u.cellId, { first: i, last: i });
 	});
 
-	const hiddenUnits = new Set();
-	const counts = {};
+	const hiddenUnits = new Set<number>();
+	const counts: Record<string, number> = {};
 	for (let i = 0; i < units.length; i++) {
 		const u = units[i];
 		if (u.kind !== 'heading' || !foldedIds.has(u.key)) continue;
@@ -166,15 +213,15 @@ export function computeFolding(cells, foldedIds) {
 		counts[u.key] = cellsHidden;
 	}
 
-	const segs = new Map();
+	const segs = new Map<string, FoldSegs>();
 	units.forEach((u, i) => {
 		if (!hiddenUnits.has(i)) return;
 		let s = segs.get(u.cellId);
-		if (!s) segs.set(u.cellId, (s = { headings: new Set(), bodies: new Set() }));
+		if (!s) segs.set(u.cellId, (s = { headings: new Set<number>(), bodies: new Set<number>() }));
 		(u.kind === 'heading' ? s.headings : s.bodies).add(u.seg);
 	});
 
-	const hidden = new Set();
+	const hidden = new Set<string>();
 	for (const [cellId, r] of range) {
 		let all = true;
 		for (let i = r.first; i <= r.last && all; i++) all = hiddenUnits.has(i);
@@ -189,9 +236,13 @@ export function computeFolding(cells, foldedIds) {
  * ancestor hides dropped. Reads the same `foldedIds` the notebook renders from,
  * so outline and notebook can never disagree about what is collapsed.
  */
-export function outlineRows(cells, foldedIds, counts = {}) {
-	const rows = [];
-	const stack = []; // open ancestors: { level, folded }
+export function outlineRows(
+	cells: readonly HeadingCell[] | null | undefined,
+	foldedIds: Set<string>,
+	counts: Record<string, number> = {}
+): OutlineRow[] {
+	const rows: OutlineRow[] = [];
+	const stack: { level: number; folded: boolean }[] = []; // open ancestors
 	for (const h of outlineHeadings(cells)) {
 		while (stack.length && stack[stack.length - 1].level >= h.level) stack.pop();
 		const hiddenByAncestor = stack.some((s) => s.folded);

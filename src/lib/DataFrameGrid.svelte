@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	// Interactive DataFrame grid for cell outputs. Renders the bounded, structured
 	// payload emitted by the kernel-side formatter (see kernel.js): column names +
 	// dtypes, a capped page of rows, and the true row/column counts. All sort /
@@ -6,7 +6,26 @@
 	// it never round-trips to the kernel and never dumps an unbounded table into
 	// the DOM — a large DataFrame is truncated to `shown_rows`, flagged in the
 	// header. Purely a render of the output; carries no state into the .ipynb.
-	let { payload } = $props();
+	// A single grid value. The kernel formatter emits JSON scalars (NaN → null).
+	type DfValue = string | number | boolean | null;
+
+	// The bounded, structured payload emitted by the kernel-side formatter
+	// (kernel.js DATAFRAME_FORMATTER_CODE, mimetype application/vnd.cellar.dataframe+json).
+	interface DataFramePayload {
+		columns: string[];
+		dtypes: string[];
+		index: DfValue[];
+		index_name: string;
+		data: DfValue[][];
+		total_rows: number;
+		total_cols: number;
+		shown_rows: number;
+		shown_cols: number;
+		truncated_rows: boolean;
+		truncated_cols: boolean;
+	}
+
+	let { payload }: { payload: DataFramePayload | null | undefined } = $props();
 
 	const columns = $derived(payload?.columns ?? []);
 	const dtypes = $derived(payload?.dtypes ?? []);
@@ -32,9 +51,9 @@
 
 	// ---- Sort ----------------------------------------------------------------
 	// -1 = the index column; 0..n-1 = data columns. dir cycles none → asc → desc.
-	let sortCol = $state(null);
-	let sortDir = $state('asc');
-	function toggleSort(col) {
+	let sortCol = $state<number | null>(null);
+	let sortDir = $state<'asc' | 'desc'>('asc');
+	function toggleSort(col: number) {
 		if (sortCol !== col) {
 			sortCol = col;
 			sortDir = 'asc';
@@ -46,7 +65,7 @@
 		}
 	}
 	// Numeric-aware comparison: numbers sort numerically, nulls sink last.
-	function compare(a, b) {
+	function compare(a: DfValue, b: DfValue): number {
 		if (a == null && b == null) return 0;
 		if (a == null) return 1;
 		if (b == null) return -1;
@@ -56,9 +75,13 @@
 		return String(a).localeCompare(String(b));
 	}
 	const sorted = $derived.by(() => {
-		if (sortCol == null) return filtered;
+		const col = sortCol;
+		if (col == null) return filtered;
 		const dir = sortDir === 'asc' ? 1 : -1;
-		const get = sortCol === -1 ? (r) => r.idx : (r) => r.cells[sortCol];
+		const get =
+			col === -1
+				? (r: { idx: DfValue; cells: DfValue[] }) => r.idx
+				: (r: { idx: DfValue; cells: DfValue[] }) => r.cells[col];
 		// Copy before sort: never mutate the derived `filtered` array in place.
 		return [...filtered].sort((ra, rb) => dir * compare(get(ra), get(rb)));
 	});
@@ -83,11 +106,11 @@
 		page = 0;
 	});
 
-	function fmt(v) {
+	function fmt(v: DfValue): string {
 		if (v == null) return '';
 		return String(v);
 	}
-	const isNull = (v) => v == null;
+	const isNull = (v: DfValue): boolean => v == null;
 </script>
 
 <div

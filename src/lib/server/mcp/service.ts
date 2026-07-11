@@ -33,18 +33,11 @@ import { executeCellRun } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree } from '../fstree';
 import { getNotebookStaleness } from '../dataflow';
-import { STALE_STATE, staleIdsInOrder } from '../../staleness.js';
-import { isSqlCell } from '../../cellLanguage.js';
+import { STALE_STATE, staleIdsInOrder } from '../../staleness';
+import type { StalenessEntry, StalenessMap } from '../../staleness';
+import { isSqlCell } from '../../cellLanguage';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
 import type { CellView, CellOutput, SessionId, LogicalCellType } from '../types';
-
-/** A per-cell staleness verdict from `$lib/staleness.js` (via dataflow.js). */
-interface StaleEntry {
-	state: string;
-	reason?: string;
-	upstream?: string[];
-}
-type StaleMap = Record<string, StaleEntry | undefined>;
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -217,7 +210,7 @@ const summarizeOutputs = (cell: CellView, cap: number) => (cell.outputs || []).m
  * n/a); a stale cell additionally carries WHY and the upstream cell ids that made
  * it stale, so an agent knows exactly what to re-run before trusting the output.
  */
-function staleFields(entry: StaleEntry | undefined | null): Record<string, unknown> {
+function staleFields(entry: StalenessEntry | undefined | null): Record<string, unknown> {
 	if (!entry) return {};
 	const out: Record<string, unknown> = { stale_state: entry.state };
 	if (entry.state === STALE_STATE.STALE) {
@@ -228,7 +221,7 @@ function staleFields(entry: StaleEntry | undefined | null): Record<string, unkno
 	return out;
 }
 
-function readForm(cell: CellView, cap = READ_CAP, sid: SessionId | null = currentSessionId(), staleEntry: StaleEntry | null = null) {
+function readForm(cell: CellView, cap = READ_CAP, sid: SessionId | null = currentSessionId(), staleEntry: StalenessEntry | null = null) {
 	return {
 		id: cell.id,
 		type: cell.cell_type,
@@ -332,7 +325,7 @@ export function createNotebook(name?: string) {
  */
 export async function getNotebookMap() {
 	const cells = visibleCells();
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
 	// A section node holds nested cell/section entries; a cell leaf is a plain record.
 	interface MapSection {
 		id: string;
@@ -410,7 +403,7 @@ export function inspectVariable(name: string) {
  * their outputs, the same way the UI's stale indicator warns a human.
  */
 async function staleCells() {
-	const { cells }: { cells: StaleMap } = await getNotebookStaleness();
+	const { cells }: { cells: StalenessMap } = await getNotebookStaleness();
 	const out: Array<{ id: string; reason?: string; upstream?: string[] }> = [];
 	for (const c of visibleCells()) {
 		const e = cells[c.id];
@@ -443,7 +436,7 @@ export const databricks = {
 export async function readCell(id: string) {
 	const c = getCell(id);
 	if (!c || isHidden(c)) return null;
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
 	return readForm(c, READ_CAP, sid, stale[id]);
 }
 
@@ -454,7 +447,7 @@ export async function readCell(id: string) {
  * some `ok_persisted` — for the same kernel state.
  */
 export async function readCells(ids: string[]) {
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
 	return ids
 		.map((id) => {
 			const c = getCell(id);
@@ -483,7 +476,7 @@ export async function readByLocation({ index, position, relativeTo, direction }:
 		target = direction === 'prev' ? cells[i - 1] : cells[i + 1];
 	}
 	if (!target) return null;
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
 	return readForm(target, READ_CAP, sid, stale[target.id]);
 }
 
@@ -501,7 +494,7 @@ export async function readSection(headerId: string) {
 		out.push(cells[i]);
 	}
 	// One sampled epoch + staleness pass for the whole section (see readCells).
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StaleMap } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
 	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid, stale[c.id])) };
 }
 
@@ -835,7 +828,7 @@ export async function runCell(id: string): Promise<Record<string, unknown> | nul
 		// The run may have made downstream cells stale (this one just re-ran) or
 		// cleared this cell's own staleness — surface its fresh verdict so a follow-up
 		// read is not needed just to see whether the run settled it.
-		const { cells: stale }: { cells: StaleMap } = await getNotebookStaleness();
+		const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness();
 		return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id]), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and
@@ -927,7 +920,7 @@ export async function runAll() {
  * (same as run_all). Returns the run results plus which cells were run.
  */
 export async function runStale() {
-	const { cells: stale }: { cells: StaleMap } = await getNotebookStaleness();
+	const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness();
 	const ids = staleIdsInOrder(listCells(), stale);
 	const results = await runCells(ids);
 	return { ran: ids, results };

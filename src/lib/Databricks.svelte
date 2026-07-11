@@ -14,9 +14,64 @@
   Listing (profiles/clusters/catalogs/schemas/tables) is a server call; the
   session itself is built in the kernel. See `src/lib/server/databricks.js`.
 -->
-<script>
+<script lang="ts">
 	import { onMount } from 'svelte';
-	import { subscribeEvents } from '$lib/events-client.js';
+	import { subscribeEvents } from '$lib/events-client';
+	import type { SessionId } from '$lib/server/types';
+
+	// ---- Response shapes from src/routes/api/databricks/* --------------------
+	// The routes are still .js and the server module doesn't export these, so the
+	// shapes are declared locally and `res.json()` is narrowed into them at each
+	// fetch boundary.
+	/** The `{code, message}` error every failing Databricks route returns. */
+	interface DbxError {
+		code: string;
+		message: string;
+	}
+	interface DbxProfile {
+		name: string;
+		host?: string;
+		hasToken?: boolean;
+	}
+	interface DbxConnection {
+		connected: boolean;
+		profile?: string;
+		host?: string;
+		clusterId?: string;
+		clusterName?: string;
+		sparkVersion?: string;
+		/** Present when a live session ended because the kernel restarted. */
+		lost?: { clusterName?: string };
+	}
+	interface DbxInstall {
+		python: string | null;
+		sdk: boolean;
+		connect: boolean;
+	}
+	interface DbxStatus {
+		connection?: DbxConnection;
+		config?: { profiles?: DbxProfile[] };
+		install?: DbxInstall;
+		/** Whether uv is available to install packages. */
+		uv?: boolean;
+	}
+	interface DbxCluster {
+		cluster_id: string;
+		name: string;
+		state: string;
+		spark_version?: string;
+	}
+	/** A Unity Catalog child entry (a catalog/schema name, or a table with its full name). */
+	interface DbxCatalogEntry {
+		name: string;
+		full_name?: string;
+	}
+	/** A lazily-loaded Unity Catalog tree node's child list + load state. */
+	interface DbxNodeState {
+		loading: boolean;
+		error: DbxError | null;
+		items: DbxCatalogEntry[] | null;
+	}
 
 	let {
 		/** Kernel session epoch. A change means a restart replaced the namespace → `spark` is gone. */
@@ -25,18 +80,31 @@
 		onInsertAndRun = null,
 		/** Called after a successful connect/disconnect so the shell refreshes its kernel + variables. */
 		onSessionChange = null
+	}: {
+		kernelSessionId?: SessionId | null;
+		onInsertAndRun?: ((source: string) => void) | null;
+		onSessionChange?: (() => void) | null;
 	} = $props();
+
+	/** Normalize a thrown value (a route body, or an Error) into `{code, message}`. */
+	function toDbxError(err: unknown): DbxError {
+		const e = err as { code?: unknown; message?: unknown } | null | undefined;
+		return {
+			code: typeof e?.code === 'string' ? e.code : 'error',
+			message: typeof e?.message === 'string' ? e.message : String(err)
+		};
+	}
 
 	/** Rows a table preview asks for. Kept small: this is a look, not a load. */
 	const LIMITS = [10, 50, 100, 500];
 	let limit = $state(50);
 
 	// ---- Status (profiles + install + connection) ----------------------------
-	let status = $state(null);
+	let status = $state<DbxStatus | null>(null);
 	let statusError = $state('');
 	let busy = $state(''); // 'connect' | 'disconnect' | 'install' | ''
 
-	const connection = $derived(status?.connection ?? { connected: false });
+	const connection = $derived<DbxConnection>(status?.connection ?? { connected: false });
 	const connected = $derived(!!connection.connected);
 	const profiles = $derived(status?.config?.profiles ?? []);
 	const hasProfiles = $derived(profiles.length > 0);
@@ -51,6 +119,7 @@
 
 	let profile = $state('');
 	let profileTouched = false;
+	// (auth error shape declared with its $state below)
 
 	// ---- Auth source: a config profile, or a typed workspace host -------------
 	// `useHost` lets someone override the profile picker; with no profiles at all
@@ -59,10 +128,10 @@
 	let hostInput = $state('');
 	/** Signed in for the current selection this session (an OAuth token is usable). */
 	let authed = $state(false);
-	let authError = $state(null);
+	let authError = $state<DbxError | null>(null);
 
 	const selectionMode = $derived(useHost || !hasProfiles ? 'host' : 'profile');
-	const selectedProfile = $derived(profiles.find((p) => p.name === profile) ?? null);
+	const selectedProfile = $derived(profiles.find((p: DbxProfile) => p.name === profile) ?? null);
 	/** A profile carrying a token authenticates with no browser; everything else is OAuth. */
 	const selectionHasToken = $derived(selectionMode === 'profile' && !!selectedProfile?.hasToken);
 	const hostTrimmed = $derived(hostInput.trim());
@@ -74,7 +143,7 @@
 	const selectionKey = $derived(selectionMode === 'profile' ? `p:${profile}` : `h:${hostTrimmed}`);
 
 	/** The `{profile}|{host}` body/query a request should carry for the current selection. */
-	function selectionParams() {
+	function selectionParams(): Record<string, string> {
 		return selectionMode === 'profile' ? { profile } : { host: hostTrimmed };
 	}
 
@@ -99,12 +168,12 @@
 			statusError = '';
 			// Default to DEFAULT, else the first profile - until the user picks one.
 			if (!profileTouched) {
-				const names = (body.config?.profiles ?? []).map((p) => p.name);
+				const names: string[] = (body.config?.profiles ?? []).map((p: DbxProfile) => p.name);
 				profile = body.connection?.profile || (names.includes('DEFAULT') ? 'DEFAULT' : (names[0] ?? ''));
 			}
 		} catch (err) {
 			if (seq !== statusSeq) return;
-			statusError = String(err?.message ?? err);
+			statusError = toDbxError(err).message;
 		}
 	}
 
@@ -121,7 +190,7 @@
 	// gone. Re-read rather than guess - the server decides, from the same epoch.
 	// `lastSession` is deliberately NOT `$state`: this effect must depend on the
 	// epoch alone. Reading `status` here (which `loadStatus` writes) would loop.
-	let lastSession;
+	let lastSession: SessionId | null | undefined;
 	$effect(() => {
 		const sid = kernelSessionId;
 		if (lastSession === undefined) {
@@ -134,8 +203,8 @@
 	});
 
 	// ---- Clusters ------------------------------------------------------------
-	let clusters = $state(null);
-	let clustersError = $state(null); // {code, message}
+	let clusters = $state<DbxCluster[] | null>(null);
+	let clustersError = $state<DbxError | null>(null);
 	let clustersLoading = $state(false);
 	let connectingId = $state('');
 	/** Switch-cluster: show the picker again while a session is live. */
@@ -146,7 +215,7 @@
 	// never be the thing that pops the OAuth browser.
 	const showClusters = $derived(ready && haveSelection && !needsAuth && (!connected || switching));
 	/** Plain (non-reactive) memo of the selection the cluster list belongs to. */
-	let clustersFor = null;
+	let clustersFor: string | null = null;
 
 	$effect(() => {
 		const key = selectionKey;
@@ -169,10 +238,11 @@
 		} catch (err) {
 			if (seq !== clustersSeq) return;
 			clusters = null;
-			clustersError = { code: err?.code ?? 'error', message: err?.message ?? String(err) };
+			const e = toDbxError(err);
+			clustersError = e;
 			// The server says this OAuth selection is not signed in (e.g. Cellar
 			// restarted and lost the in-process flag): fall back to the sign-in button.
-			if (err?.code === 'oauth_login_required') authed = false;
+			if (e.code === 'oauth_login_required') authed = false;
 		} finally {
 			if (seq === clustersSeq) clustersLoading = false;
 		}
@@ -195,7 +265,7 @@
 		clustersFor = null;
 	}
 
-	function pickProfile(name) {
+	function pickProfile(name: string) {
 		profileTouched = true;
 		profile = name;
 		resetSelection();
@@ -221,16 +291,16 @@
 			if (!res.ok) throw body;
 			authed = true; // the cluster effect fires now that `needsAuth` is false
 		} catch (err) {
-			authError = { code: err?.code ?? 'error', message: err?.message ?? String(err) };
+			authError = toDbxError(err);
 		} finally {
 			busy = '';
 		}
 	}
 
 	// ---- Connect / disconnect ------------------------------------------------
-	let connectError = $state(null);
+	let connectError = $state<DbxError | null>(null);
 
-	async function connect(cluster) {
+	async function connect(cluster: DbxCluster) {
 		if (busy) return;
 		busy = 'connect';
 		connectingId = cluster.cluster_id;
@@ -247,7 +317,7 @@
 			await loadStatus();
 			onSessionChange?.();
 		} catch (err) {
-			connectError = { code: err?.code ?? 'error', message: err?.message ?? String(err) };
+			connectError = toDbxError(err);
 		} finally {
 			busy = '';
 			connectingId = '';
@@ -265,7 +335,7 @@
 			await loadStatus();
 			onSessionChange?.();
 		} catch (err) {
-			connectError = { code: err?.code ?? 'error', message: err?.message ?? String(err) };
+			connectError = toDbxError(err);
 		} finally {
 			busy = '';
 		}
@@ -273,7 +343,7 @@
 
 	// ---- Install -------------------------------------------------------------
 	let version = $state('');
-	let installError = $state(null);
+	let installError = $state<DbxError | null>(null);
 
 	async function installDeps() {
 		if (busy) return;
@@ -289,7 +359,7 @@
 			if (!res.ok) throw body;
 			await loadStatus();
 		} catch (err) {
-			installError = { code: err?.code ?? 'error', message: err?.message ?? String(err) };
+			installError = toDbxError(err);
 		} finally {
 			busy = '';
 		}
@@ -302,12 +372,12 @@
 	// ---- Unity Catalog browser (lazy: one level per expand) -------------------
 	// `nodes[id]` is the loaded child list for an expanded node; `open[id]` is
 	// whether it is expanded. Ids are `c:<catalog>` and `s:<catalog>.<schema>`.
-	let catalogs = $state(null);
-	let catalogsError = $state(null);
+	let catalogs = $state<DbxCatalogEntry[] | null>(null);
+	let catalogsError = $state<DbxError | null>(null);
 	let catalogsLoading = $state(false);
-	let nodes = $state({});
-	let openNodes = $state({});
-	let catalogsFor = null;
+	let nodes = $state<Record<string, DbxNodeState>>({});
+	let openNodes = $state<Record<string, boolean>>({});
+	let catalogsFor: string | null = null;
 
 	function resetBrowser() {
 		catalogs = null;
@@ -325,7 +395,7 @@
 	});
 
 	/** The `{profile}|{host}` the live connection used, for its Unity Catalog listings. */
-	function connectionParams() {
+	function connectionParams(): Record<string, string> {
 		return connection.profile ? { profile: connection.profile } : { host: connection.host ?? '' };
 	}
 
@@ -347,22 +417,22 @@
 		} catch (err) {
 			if (seq !== catalogsSeq) return;
 			catalogs = null;
-			catalogsError = err;
+			catalogsError = toDbxError(err);
 		} finally {
 			if (seq === catalogsSeq) catalogsLoading = false;
 		}
 	}
 
-	async function getLevel(params) {
+	async function getLevel(params: Record<string, string>) {
 		const q = new URLSearchParams({ ...connectionParams(), ...params });
 		const res = await fetch(`/api/databricks/catalog?${q}`);
 		const body = await res.json();
-		if (!res.ok) throw { code: body?.code ?? 'error', message: body?.message ?? 'request failed' };
+		if (!res.ok) throw { code: body?.code ?? 'error', message: body?.message ?? 'request failed' } as DbxError;
 		return body;
 	}
 
 	/** Expand/collapse a node, fetching its children the first time it opens. */
-	async function toggleNode(id, fetcher) {
+	async function toggleNode(id: string, fetcher: () => Promise<DbxCatalogEntry[]>) {
 		if (openNodes[id]) {
 			openNodes[id] = false;
 			return;
@@ -382,13 +452,13 @@
 			nodes[id] = { loading: false, error: null, items };
 		} catch (err) {
 			if (gen !== catalogsSeq) return;
-			nodes[id] = { loading: false, error: err, items: null };
+			nodes[id] = { loading: false, error: toDbxError(err), items: null };
 		}
 	}
 
-	const toggleCatalog = (name) =>
+	const toggleCatalog = (name: string) =>
 		toggleNode(`c:${name}`, async () => (await getLevel({ level: 'schemas', catalog: name })).schemas);
-	const toggleSchema = (catalog, schema) =>
+	const toggleSchema = (catalog: string, schema: string) =>
 		toggleNode(`s:${catalog}.${schema}`, async () => (await getLevel({ level: 'tables', catalog, schema })).tables);
 
 	/**
@@ -401,15 +471,16 @@
 	 * uses server-side. For an ordinary name the output is byte-identical to naive
 	 * interpolation; for a hostile one it stays inside the string.
 	 */
-	const previewCode = (fullName) => `spark.read.table(${JSON.stringify(fullName)}).limit(${limit}).toPandas()`;
+	const previewCode = (fullName: string) => `spark.read.table(${JSON.stringify(fullName)}).limit(${limit}).toPandas()`;
 
-	function previewTable(fullName) {
+	function previewTable(fullName: string | undefined) {
+		if (!fullName) return;
 		onInsertAndRun?.(previewCode(fullName));
 	}
 
 	// ---- Presentation --------------------------------------------------------
 	/** RUNNING is the only state you can attach to right away; PENDING will get there. */
-	function clusterBadge(state) {
+	function clusterBadge(state: string | undefined) {
 		if (state === 'RUNNING') return 'badge-success';
 		if (state === 'PENDING' || state === 'RESTARTING' || state === 'RESIZING') return 'badge-warning';
 		if (state === 'ERROR') return 'badge-error';
@@ -417,7 +488,7 @@
 	}
 
 	/** What the user should DO about a failure. The server's own message follows it. */
-	const REMEDY = {
+	const REMEDY: Record<string, string> = {
 		not_connected: 'Connect to a cluster first.',
 		sdk_missing: 'Install databricks-sdk into this workspace’s Python environment.',
 		connect_missing: 'Install databricks-connect into this workspace’s Python environment.',
@@ -437,7 +508,7 @@
 	};
 </script>
 
-{#snippet errorBox(err, testid)}
+{#snippet errorBox(err: DbxError, testid: string)}
 	<div class="mt-2 rounded-lg border border-error/30 bg-error/10 p-2" data-testid={testid}>
 		{#if REMEDY[err.code]}
 			<p class="text-[11px] font-medium leading-relaxed text-base-content/80">{REMEDY[err.code]}</p>
@@ -446,7 +517,7 @@
 	</div>
 {/snippet}
 
-{#snippet hint(text)}
+{#snippet hint(text: string)}
 	<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">{text}</p>
 {/snippet}
 
