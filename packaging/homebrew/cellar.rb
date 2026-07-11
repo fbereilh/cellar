@@ -1,19 +1,23 @@
 # Homebrew formula for Cellar.
 #
-# Cellar tracks LATEST (git main), not tagged semver releases, so this is a
-# HEAD-only formula: `brew install --HEAD cellar` builds from the current tip of
-# fbereilh/cellar, and `cellar --update` runs `brew upgrade --fetch-HEAD cellar`
-# to move to the newest main.
+# Two install channels:
+#   brew install cellar          -> latest STABLE tagged release (url + sha256)
+#   brew install --HEAD cellar   -> current git main (bleeding edge)
+# `cellar --update` is install-method aware (brew upgrade vs git pull).
 #
 # The canonical copy of this file lives in the app repo at
 # packaging/homebrew/cellar.rb; the installable copy lives in the tap repo
 # fbereilh/homebrew-cellar at Formula/cellar.rb. Keep the two in sync.
 #
-# NOTE: fbereilh/cellar is a PRIVATE repo, so `brew install` needs the invoking
-# user's GitHub git credentials (gh auth / SSH / a PAT) to clone main.
+# On each release: point `url` at the new tag tarball and update `sha256`
+# (`shasum -a 256` of archive/refs/tags/vX.Y.Z.tar.gz). Both repos are public,
+# so no credentials are needed to install.
 class Cellar < Formula
   desc "Agent-first notebook: a live Jupyter workspace with an MCP agent interface"
   homepage "https://github.com/fbereilh/cellar"
+  url "https://github.com/fbereilh/cellar/archive/refs/tags/v0.1.0.tar.gz"
+  sha256 "3db6eae6f5dc06991d4fe37c0be296338124abcab13ca20046a720bbff568794"
+  license "MIT"
   head "https://github.com/fbereilh/cellar.git", branch: "main"
 
   depends_on "node"
@@ -35,8 +39,7 @@ class Cellar < Formula
 
   test do
     # `cellar --version` prints "cellar <pkg-version>" + build metadata and exits 0
-    # without booting a server. (The pkg version is package.json's, not the brew
-    # HEAD version, so match on the program name rather than `version`.)
+    # without booting a server.
     assert_match(/^cellar \d/, shell_output("#{bin}/cellar --version"))
   end
 end
