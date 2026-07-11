@@ -9,6 +9,12 @@
 
 import type { KernelStatus, SessionId } from '$lib/server/types';
 
+/** A notebook whose state is loaded in the shared kernel session (from `/api/kernel`). */
+export interface LoadedNotebook {
+	path: string;
+	name: string;
+}
+
 /** Read-only kernel runtime state as returned by `getKernelInfo()` / `/api/kernel`. */
 export interface KernelInfo {
 	started: boolean;
@@ -16,6 +22,8 @@ export interface KernelInfo {
 	name: string;
 	status: KernelStatus;
 	session_id: SessionId | null;
+	/** Notebooks loaded in the live session (only the `/api/kernel` route adds this). */
+	loaded_notebooks?: LoadedNotebook[];
 }
 
 export function kernelStatusLabel(info: KernelInfo | null | undefined): string {

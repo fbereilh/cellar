@@ -10,23 +10,56 @@
 	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte';
 	import LogsPanel from '$lib/LogsPanel.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client';
+	import type { ClientEvent } from '$lib/events-client';
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState';
 	import { relativeTimeLong } from '$lib/relativeTime';
+	import type { PageData } from './$types';
+	import type { Cell } from '$lib/server/types';
+	import type { UICell, FoldRegistryHandle, NotebookApiHandle } from '$lib/types';
+	import type { Folding } from '$lib/headings';
+	import type { KernelInfo } from '$lib/kernelBadge';
+	import type { BlameLine } from '$lib/server/git';
 
-	const isPyPath = (p) => /\.py$/i.test(p);
+	/** Kind of an open tab: the canonical notebook, an opened `.ipynb`/`.py`, or a text file. */
+	type TabKind = 'notebook' | 'ipynb' | 'file';
+	/** An open tab in the shell. Structurally a superset of what Navbar renders. */
+	interface Tab {
+		id: string;
+		kind: TabKind;
+		title: string;
+		path: string;
+		closable: boolean;
+		dirty: boolean;
+		preview: boolean;
+	}
+	/** A tab-impacting workspace change reported up from the sidebar file tree. */
+	interface FsChange {
+		type: 'rename' | 'move' | 'delete';
+		from?: string;
+		path: string;
+	}
+	/** A kernel-namespace variable row (from the inspector probe). */
+	interface VariableInfo {
+		name: string;
+		type?: string;
+		shape?: string;
+		preview?: string;
+	}
 
-	let { data } = $props();
+	const isPyPath = (p: string) => /\.py$/i.test(p);
+
+	let { data }: { data: PageData } = $props();
 
 	// Seed the per-project UI-preference cache from SSR before any child reads a
 	// preference (this runs during init, ahead of every onMount). Port-independent:
 	// this is what survives the dynamic app port that empties `localStorage`.
 	hydrateUiState(data.uiState);
 
-	const EMPTY_FOLDS = new Set(); // no notebook active → the Outline folds nothing
+	const EMPTY_FOLDS = new Set<string>(); // no notebook active → the Outline folds nothing
 
 	const workspace = data.notebook.workspace;
 	const notebookPath = data.notebook.path;
-	const notebookName = notebookPath.split('/').pop();
+	const notebookName = notebookPath.split('/').pop() ?? notebookPath;
 
 	// Workspace-relative path of the canonical (default) notebook. Opening it from
 	// the file tree routes to the live notebook tab (id 'notebook').
@@ -38,8 +71,8 @@
 	// reported up by each LiveNotebook so the sidebar (outline / search) can read
 	// whichever notebook is active. Seeded with the default notebook's SSR cells
 	// so the sidebar reflects it even before its tab is mounted.
-	let notebooksCells = $state({ [canonicalNotebookRel]: data.notebook.cells });
-	function handleCellsChange(path, cells) {
+	let notebooksCells = $state<Record<string, Cell[]>>({ [canonicalNotebookRel]: data.notebook.cells });
+	function handleCellsChange(path: string, cells: UICell[]) {
 		notebooksCells[path] = cells;
 	}
 
@@ -49,18 +82,18 @@
 	// outline and notebook are one fold state, not two that must be kept in step.
 	// Assign into the key, never rebuild the map: a spread would *read* this state
 	// inside the reporting effect that writes it, and Svelte would loop forever.
-	let notebooksFolds = $state({}); // path → { foldedIds, folding }
-	function handleFoldsChange(path, foldedIds, folding) {
+	let notebooksFolds = $state<Record<string, { foldedIds: Set<string>; folding: Folding }>>({}); // path → { foldedIds, folding }
+	function handleFoldsChange(path: string, foldedIds: Set<string>, folding: Folding) {
 		notebooksFolds[path] = { foldedIds, folding };
 	}
 	// Imperative, not reactive: a plain map of path → the notebook's fold API
 	// ({toggle, collapseAll, expandAll}). The Outline drives every fold through this.
-	const foldTogglers = new Map();
-	function registerFolds(path, api) {
+	const foldTogglers = new Map<string, FoldRegistryHandle>();
+	function registerFolds(path: string, api: FoldRegistryHandle | null) {
 		if (api) foldTogglers.set(path, api);
 		else foldTogglers.delete(path);
 	}
-	function toggleActiveFold(key) {
+	function toggleActiveFold(key: string) {
 		if (activeNotebookPath) foldTogglers.get(activeNotebookPath)?.toggle(key);
 	}
 	function collapseAllActiveFolds() {
@@ -72,8 +105,8 @@
 
 	// Imperative handles from each mounted LiveNotebook, same shape as `foldTogglers`.
 	// The Databricks data browser reaches the active notebook through this.
-	const notebookApis = new Map();
-	function registerNotebookApi(path, api) {
+	const notebookApis = new Map<string, NotebookApiHandle>();
+	function registerNotebookApi(path: string, api: NotebookApiHandle | null) {
 		if (api) notebookApis.set(path, api);
 		else notebookApis.delete(path);
 	}
@@ -84,10 +117,10 @@
 	 * is `display:none`, so it has no geometry and the new cell could not be
 	 * scrolled into view.
 	 */
-	async function insertAndRunInActiveNotebook(code) {
+	async function insertAndRunInActiveNotebook(code: string) {
 		const path = activeNotebookPath;
-		const api = path && notebookApis.get(path);
-		if (!api) return; // no notebook open (or one still mounting)
+		const api = path ? notebookApis.get(path) : null;
+		if (!api || !path) return; // no notebook open (or one still mounting)
 		if (path === canonicalNotebookRel) openNotebook();
 		else openFilePermanent(path);
 		await tick();
@@ -97,7 +130,7 @@
 	// Null disables the sidebar's preview affordance rather than minting a tab
 	// behind the user's back. `notebookApis` is a plain Map (not reactive), so the
 	// gate reads `activeNotebookPath`, which is - the api is looked up at call time.
-	const canInsertAndRun = $derived(activeNotebookPath ? insertAndRunInActiveNotebook : null);
+	const canInsertAndRun = $derived.by(() => (activeNotebookPath ? insertAndRunInActiveNotebook : null));
 
 	// Single shared kernel → at most one cell runs at a time across ALL notebooks.
 	// Serializing them is the SERVER's job (`run-queue.js`): a run requested while
@@ -148,12 +181,12 @@
 		if (logsOpen) logsUnseenErrors = 0;
 		setUi(LOGS_OPEN_KEY, logsOpen ? '1' : '0');
 	}
-	function startLogsResize(e) {
+	function startLogsResize(e: PointerEvent) {
 		logsResizing = true;
 		const startY = e.clientY;
 		const startH = logsHeight;
 		e.preventDefault();
-		function onMove(ev) {
+		function onMove(ev: PointerEvent) {
 			// Drag up (smaller clientY) grows the drawer.
 			logsHeight = Math.min(LOGS_MAX, Math.max(LOGS_MIN, startH + (startY - ev.clientY)));
 		}
@@ -170,8 +203,8 @@
 	// Tabs are restored from per-workspace session memory on mount; a first-ever
 	// open starts empty (no tab → empty state). Each tab may be a transient
 	// `preview` (VS Code single-click) until promoted (double-click / edit).
-	let tabs = $state([]);
-	let activeTabId = $state(null);
+	let tabs = $state<Tab[]>([]);
+	let activeTabId = $state<string | null>(null);
 	let tabsRestored = $state(false);
 	const fileTabs = $derived(tabs.filter((t) => t.kind === 'file'));
 	const ipynbTabs = $derived(tabs.filter((t) => t.kind === 'ipynb'));
@@ -202,8 +235,8 @@
 	// Each mounted FileTab reports its own path's line record; the footer reads the
 	// active file's. Notebooks/`.ipynb` never report (blaming JSON lines is
 	// meaningless), so `activeBlame` is null for them and the bar hides gracefully.
-	let blameByPath = $state({});
-	function handleBlame(path, record) {
+	let blameByPath = $state<Record<string, BlameLine | null>>({});
+	function handleBlame(path: string, record: BlameLine | null) {
 		blameByPath = { ...blameByPath, [path]: record };
 	}
 	const activeBlame = $derived((activeFilePath && blameByPath[activeFilePath]) || null);
@@ -219,7 +252,7 @@
 	// Each server entry is enriched with the matching open tab (if any): `open`
 	// lets a still-open row focus its tab, and `active` (reading `activeNotebookPath`,
 	// the same source the outline/search sections use) dots the focused notebook.
-	const loadedNotebooks = $derived(
+	const loadedNotebooks = $derived.by(() =>
 		(kernelInfo.loaded_notebooks ?? []).map((n) => {
 			const tab = tabs.find(
 				(t) => (t.kind === 'notebook' || t.kind === 'ipynb') && t.path === n.path
@@ -234,22 +267,22 @@
 		})
 	);
 
-	function tabIdFor(path) {
+	function tabIdFor(path: string) {
 		return path === canonicalNotebookRel ? 'notebook' : 'file:' + path;
 	}
 	// A `.py` is a live notebook only when content-detection says so; the kind is
 	// resolved once (server GET) and cached so it survives tab restore without a
 	// re-probe. `.ipynb` is always a notebook; everything else opens as text.
-	const pyKindCache = new Map(); // rel path → 'ipynb' | 'file'
-	function baseKindFor(path) {
+	const pyKindCache = new Map<string, TabKind>(); // rel path → 'ipynb' | 'file'
+	function baseKindFor(path: string): TabKind {
 		if (/\.ipynb$/i.test(path)) return 'ipynb';
 		if (isPyPath(path)) return pyKindCache.get(path) ?? 'file';
 		return 'file';
 	}
-	async function resolveTabKind(path) {
+	async function resolveTabKind(path: string): Promise<TabKind> {
 		if (!isPyPath(path)) return baseKindFor(path);
-		if (pyKindCache.has(path)) return pyKindCache.get(path);
-		let kind = 'file';
+		if (pyKindCache.has(path)) return pyKindCache.get(path)!;
+		let kind: TabKind = 'file';
 		try {
 			const res = await fetch('/api/notebooks/jupytext?path=' + encodeURIComponent(path));
 			if (res.ok) {
@@ -263,14 +296,14 @@
 		pyKindCache.set(path, kind);
 		return kind;
 	}
-	function makeTab(path, preview, kind) {
+	function makeTab(path: string, preview: boolean, kind?: TabKind): Tab {
 		if (path === canonicalNotebookRel) {
 			return { id: 'notebook', kind: 'notebook', title: notebookName, path, closable: true, dirty: false, preview };
 		}
-		return { id: 'file:' + path, kind: kind ?? baseKindFor(path), title: path.split('/').pop(), path, closable: true, dirty: false, preview };
+		return { id: 'file:' + path, kind: kind ?? baseKindFor(path), title: path.split('/').pop() ?? path, path, closable: true, dirty: false, preview };
 	}
 
-	function selectTab(id) {
+	function selectTab(id: string) {
 		activeTabId = id;
 	}
 
@@ -278,7 +311,7 @@
 	// for it already exists (preview or pinned) just focus it; otherwise reuse the
 	// existing preview tab's slot, or append one. A `.py` is content-probed first
 	// (async) so it opens as a live notebook or as text, per detection.
-	async function openFile(path) {
+	async function openFile(path: string) {
 		const id = tabIdFor(path);
 		if (tabs.find((t) => t.id === id)) {
 			activeTabId = id;
@@ -302,7 +335,7 @@
 	}
 
 	// Double-click / edit → open (or promote) as a permanent (pinned) tab.
-	async function openFilePermanent(path) {
+	async function openFilePermanent(path: string) {
 		const id = tabIdFor(path);
 		const existing = tabs.find((t) => t.id === id);
 		if (existing) {
@@ -319,7 +352,7 @@
 		activeTabId = id;
 	}
 
-	function promoteTab(id) {
+	function promoteTab(id: string) {
 		tabs = tabs.map((t) => (t.id === id ? { ...t, preview: false } : t));
 	}
 
@@ -344,7 +377,7 @@
 		fsRefreshSignal++; // a new file on disk → refresh the tree + git decorations
 	}
 
-	function closeTab(id) {
+	function closeTab(id: string) {
 		const idx = tabs.findIndex((t) => t.id === id);
 		tabs = tabs.filter((t) => t.id !== id);
 		if (activeTabId === id) {
@@ -368,21 +401,23 @@
 	// tabs consistent: close tabs pointing at a deleted path (or anything under a
 	// deleted folder), and remap tabs when a file/folder is renamed or moved so no
 	// tab is left dangling at a gone path.
-	function remapRel(p, from, to) {
+	function remapRel(p: string, from: string, to: string): string | null {
 		if (p === from) return to;
 		if (p.startsWith(from + '/')) return to + p.slice(from.length);
 		return null;
 	}
-	function handleFsChange(change) {
+	function handleFsChange(change: FsChange) {
 		if (change.type === 'delete') {
 			const gone = tabs.filter((t) => t.path === change.path || t.path.startsWith(change.path + '/'));
 			for (const t of gone) closeTab(t.id);
 			return;
 		}
 		if (change.type === 'rename' || change.type === 'move') {
+			const from = change.from;
+			if (from == null) return;
 			let nextActive = activeTabId;
 			tabs = tabs.map((t) => {
-				const np = remapRel(t.path, change.from, change.path);
+				const np = remapRel(t.path, from, change.path);
 				if (np == null) return t;
 				// Preserve the tab's kind across a rename (a `.py` notebook stays a
 				// notebook); seed the cache at the new path so a later re-open matches.
@@ -396,7 +431,7 @@
 		}
 	}
 
-	function onFileDirty(path, dirty) {
+	function onFileDirty(path: string, dirty: boolean) {
 		const id = 'file:' + path;
 		// Editing a previewed file promotes it to a permanent tab, like VS Code.
 		tabs = tabs.map((t) => (t.id === id ? { ...t, dirty, preview: dirty ? false : t.preview } : t));
@@ -406,8 +441,18 @@
 
 	// ---- Tab session memory (per workspace) ---------------------------------
 	const TABS_KEY = 'cellar-tabs:' + workspace;
+	/** The persisted tab-session shape. */
+	interface SavedTab {
+		path: string;
+		preview?: boolean;
+		kind?: TabKind;
+	}
+	interface SavedTabs {
+		tabs?: SavedTab[];
+		activeTabId?: string | null;
+	}
 	function restoreTabs() {
-		const parsed = getUi(TABS_KEY, null);
+		const parsed = getUi<SavedTabs | null>(TABS_KEY, null);
 		if (parsed == null) {
 			// First-ever open of this workspace → empty state, no tabs.
 			tabs = [];
@@ -421,7 +466,8 @@
 				}
 				tabs = (parsed.tabs ?? []).map((t) => makeTab(t.path, !!t.preview, t.kind));
 				const ids = new Set(tabs.map((t) => t.id));
-				activeTabId = ids.has(parsed.activeTabId) ? parsed.activeTabId : (tabs[0]?.id ?? null);
+				const savedActive = parsed.activeTabId;
+				activeTabId = savedActive && ids.has(savedActive) ? savedActive : (tabs[0]?.id ?? null);
 			} catch {
 				tabs = [];
 				activeTabId = null;
@@ -443,12 +489,12 @@
 	const SIDEBAR_MAX = 560;
 	let sidebarWidth = $state(256);
 	let resizing = $state(false);
-	function startResize(e) {
+	function startResize(e: PointerEvent) {
 		resizing = true;
 		const startX = e.clientX;
 		const startW = sidebarWidth;
 		e.preventDefault();
-		function onMove(ev) {
+		function onMove(ev: PointerEvent) {
 			const w = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, startW + (ev.clientX - startX)));
 			sidebarWidth = w;
 		}
@@ -521,7 +567,7 @@
 			fsRefreshSignal++; // a new file on disk → refresh the tree + git decorations
 			notice = `Saved ${body.path} (${body.format}).`;
 		} catch (err) {
-			notice = `Save as .py failed: ${err?.message ?? err}`;
+			notice = `Save as .py failed: ${(err as Error)?.message ?? err}`;
 		} finally {
 			saveAsPyBusy = false;
 		}
@@ -530,7 +576,7 @@
 	// Convert the active `.py` notebook to an `.ipynb` with outputs: the server runs
 	// every cell then writes <base>.ipynb, which we then open as a live notebook.
 	async function convertToIpynb() {
-		if (converting || !activeNotebookIsPy) return;
+		if (converting || !activeNotebookIsPy || !activeTab) return;
 		const source = activeTab.path;
 		const target = source.replace(/\.py$/i, '.ipynb');
 		converting = true;
@@ -548,7 +594,7 @@
 			notice = `Converted to ${body.path} — ran ${r.ok ?? 0}/${r.total ?? 0} cells${r.errors ? `, ${r.errors} with errors` : ''}.`;
 			await openFilePermanent(body.path);
 		} catch (err) {
-			notice = `Convert failed: ${err?.message ?? err}`;
+			notice = `Convert failed: ${(err as Error)?.message ?? err}`;
 		} finally {
 			converting = false;
 		}
@@ -582,7 +628,7 @@
 			const body = await res.json().catch(() => ({}));
 			notice = res.ok ? 'Checkpoint saved.' : `Checkpoint failed: ${body?.message ?? ''}`;
 		} catch (err) {
-			notice = `Checkpoint failed: ${err?.message ?? err}`;
+			notice = `Checkpoint failed: ${(err as Error)?.message ?? err}`;
 		}
 	}
 
@@ -599,7 +645,7 @@
 			else if (body.ok) notice = 'Reverted to before the last agent action.';
 			else notice = 'Nothing to undo - no agent action has been checkpointed yet.';
 		} catch (err) {
-			notice = `Undo failed: ${err?.message ?? err}`;
+			notice = `Undo failed: ${(err as Error)?.message ?? err}`;
 		}
 	}
 
@@ -609,10 +655,10 @@
 	// own selected cell; run-stale re-runs everything its dependency graph marks
 	// stale, in order. The notebook must be focused first: a hidden pane has no
 	// geometry, so a scrolled-into-view running cell would have nowhere to land.
-	function runNotebookAction(name) {
+	function runNotebookAction(name: 'runStale' | 'runAbove' | 'runBelow') {
 		const path = activeNotebookPath;
-		const api = path && notebookApis.get(path);
-		if (!api?.[name]) return;
+		const api = path ? notebookApis.get(path) : null;
+		if (!api?.[name] || !path) return;
 		if (path === canonicalNotebookRel) openNotebook();
 		else openFilePermanent(path);
 		api[name]();
@@ -621,7 +667,7 @@
 	const runAboveActive = () => runNotebookAction('runAbove');
 	const runBelowActive = () => runNotebookAction('runBelow');
 
-	async function scrollToCell(id, foldKey = null) {
+	async function scrollToCell(id: string, foldKey: string | null = null) {
 		// Open + focus the notebook the outline currently reflects, then scroll. With
 		// no active notebook the outline and search are empty, so there is no row to
 		// click - but never let a null path mint a tab if one ever gets here.
@@ -631,7 +677,7 @@
 		await tick();
 		// Multiple notebooks stay mounted (hidden); pick the visible cell.
 		const els = document.querySelectorAll(`[data-cell-id="${id}"]`);
-		const el = [...els].find((e) => e.offsetParent !== null) ?? els[0];
+		const el = [...els].find((e) => (e as HTMLElement).offsetParent !== null) ?? els[0];
 		if (!el) return;
 		// An outline row addresses a heading, and a cell can hold several - scroll to
 		// the heading itself when we know which, but flash the whole cell.
@@ -642,8 +688,8 @@
 	}
 
 	// ---- Kernel + variables (sidebar) ---------------------------------------
-	let kernelInfo = $state({ started: false, id: null, name: 'python3', status: 'not started' });
-	let variables = $state([]);
+	let kernelInfo = $state<KernelInfo>({ started: false, id: null, name: 'python3', status: 'not started', session_id: null });
+	let variables = $state<VariableInfo[]>([]);
 	let varsLoading = $state(false);
 	let varsError = $state('');
 
@@ -693,7 +739,7 @@
 			if (!res.ok) throw new Error(body?.message || 'inspect failed');
 			variables = body.variables;
 		} catch (err) {
-			varsError = String(err?.message ?? err);
+			varsError = String((err as Error)?.message ?? err);
 		} finally {
 			varsLoading = false;
 		}
@@ -739,7 +785,7 @@
 	// palette's font weights and styles). It is read back off `color-scheme`
 	// rather than derived from the theme's name, so a new theme needs no change
 	// here.
-	function applyTheme(t) {
+	function applyTheme(t: string) {
 		theme = t;
 		if (typeof document !== 'undefined') {
 			const root = document.documentElement;
@@ -758,7 +804,7 @@
 		if (w) sidebarWidth = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, w));
 		// Restore the logs drawer (open state + height) from the same
 		// port-independent UI-state store as every other layout preference.
-		logsOpen = getUi(LOGS_OPEN_KEY, '0') === '1';
+		logsOpen = getUi<string>(LOGS_OPEN_KEY, '0') === '1';
 		const h = Number(getUi(LOGS_HEIGHT_KEY, 0));
 		if (h) logsHeight = Math.min(LOGS_MAX, Math.max(LOGS_MIN, h));
 		// Restore live kernel + variables after a reload — but only inspect if a
@@ -775,10 +821,10 @@
 	// notebook's relative path to the canonical 'notebook' tab and any other
 	// `.ipynb` to a live `ipynb` tab — the same paths a tree double-click uses.
 	onMount(() =>
-		subscribeEvents((ev) => {
+		subscribeEvents((ev: ClientEvent) => {
 			// Flag errors that arrive while the logs drawer is closed, so the status-bar
 			// toggle can show a red dot the user can act on.
-			if (ev.type === 'log' && ev.entry?.level === 'error' && !logsOpen) {
+			if (ev.type === 'log' && (ev.entry as { level?: string } | undefined)?.level === 'error' && !logsOpen) {
 				logsUnseenErrors += 1;
 			}
 			// A run this tab did NOT initiate (an agent, or another tab) may load a
@@ -791,7 +837,7 @@
 			if (ev.type !== 'notebook:opened') return;
 			if (ev.originId && ev.originId === originId) return;
 			if (!ev.relPath) return;
-			openFilePermanent(ev.relPath);
+			openFilePermanent(ev.relPath as string);
 		})
 	);
 
@@ -810,7 +856,7 @@
 	const notebookCommandHandle = $derived(
 		activeNotebookPath
 			? {
-					dispatch: (id) => activeNotebookApi()?.dispatch(id),
+					dispatch: (id: string) => activeNotebookApi()?.dispatch(id),
 					runAll: () => activeNotebookApi()?.runAll(),
 					clearAll: () => activeNotebookApi()?.clearAll()
 				}
@@ -837,7 +883,7 @@
 	// beats CodeMirror; it defers to another open modal (e.g. Settings) which owns
 	// the keyboard while up.
 	onMount(() => {
-		function onKey(e) {
+		function onKey(e: KeyboardEvent) {
 			const chord = chordFromEvent(e);
 			if (!chord) return;
 			const keys = shortcuts.list.find((s) => s.id === 'command-palette')?.keys ?? [];
