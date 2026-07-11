@@ -22,7 +22,7 @@ It saves ordinary `.ipynb` files that open in vanilla Jupyter, and it keeps them
 **Homebrew (recommended).** Trust the formula once, then pick a channel:
 
 ```sh
-brew trust --formula fbereilh/cellar/cellar    # one-time
+brew trust --formula fbereilh/cellar/cellar
 ```
 
 **Stable** - the latest tagged release. Recommended for most people:
@@ -40,9 +40,11 @@ brew install --HEAD fbereilh/cellar/cellar
 > **Why trust?** Homebrew requires a one-time trust before it will load a third-party tap's formula; `--formula` trusts just this one (recommended). The install then auto-taps `fbereilh/cellar` for you, so there's no separate `brew tap` step.
 
 ```sh
-cellar --update      # update to the newest version (install-method aware)
-cellar --version     # show the version, sha, and install method
+cellar --update
+cellar --version
 ```
+
+`cellar --update` fetches the newest version (install-method aware); `cellar --version` prints the version, sha, and install method.
 
 <details>
 <summary>From a git clone (dev)</summary>
@@ -50,10 +52,10 @@ cellar --version     # show the version, sha, and install method
 ```sh
 git clone https://github.com/fbereilh/cellar.git
 cd cellar
-make setup           # npm install + build + link `cellar` onto your PATH
+make setup
 ```
 
-`make update` (or `cellar --update`) pulls and rebuilds. See `make` with no target for all commands.
+`make setup` installs deps, builds, and links `cellar` onto your PATH. `make update` (or `cellar --update`) pulls and rebuilds; run `make` with no target to list all commands.
 </details>
 
 ## Quick start
@@ -103,8 +105,8 @@ Open the sidebar's **Databricks** section, pick a profile and cluster, and click
 Two layers, run with:
 
 ```bash
-npm run test       # vitest unit suite  (fast, no browser, no kernel)
-npm run test:e2e   # playwright smoke   (boots the real app + kernel; local)
+npm run test
+npm run test:e2e
 ```
 
 - **Unit tests** (`tests/unit/`) guard the pure server logic — the crown jewel is
