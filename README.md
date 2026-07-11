@@ -19,16 +19,25 @@ It saves ordinary `.ipynb` files that open in vanilla Jupyter, and it keeps them
 
 ## Install
 
-**Homebrew (recommended).** Cellar tracks the latest `main`, so install it `--HEAD`:
+**Homebrew (recommended).** Third-party taps need a one-time trust, then install:
 
 ```sh
 brew tap fbereilh/cellar
-brew install --HEAD cellar
+brew trust --formula fbereilh/cellar/cellar    # one-time; trusts just this formula
+brew install --HEAD cellar                     # tracks the latest main
 ```
 
+Prefer a pinned, versioned build? Drop `--HEAD` for the latest stable release:
+
 ```sh
-cellar --update      # update to the newest main (install-method aware)
-cellar --version     # show the version, git sha, and install method
+brew install cellar
+```
+
+> **Why the trust step?** Homebrew now asks you to explicitly trust a third-party tap before it will load its formula. `brew trust --formula fbereilh/cellar/cellar` trusts only this one formula (recommended); `brew trust fbereilh/cellar` trusts the whole tap, including any formulae it adds later.
+
+```sh
+cellar --update      # update to the newest version (install-method aware)
+cellar --version     # show the version, sha, and install method
 ```
 
 <details>
