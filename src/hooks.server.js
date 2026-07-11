@@ -7,9 +7,13 @@
  * 2. Start Cellar's in-process MCP agent interface. Running it in the SvelteKit
  *    server process is what lets it share the live notebook document + kernel and
  *    stay decoupled from kernel lifecycle (spec §4).
+ * 3. Self-exit if orphaned: if our launcher dies uncleanly we would otherwise keep
+ *    running (reparented to init) and serve stale code to agents (parent-watch.js).
  */
 import { installConsoleCapture } from '$lib/server/logs.js';
 import { startMcpServer } from '$lib/server/mcp/server.js';
+import { startParentWatch } from '$lib/server/parent-watch.js';
 
 installConsoleCapture();
 startMcpServer();
+startParentWatch();

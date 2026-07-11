@@ -19,6 +19,11 @@
  *                                   instance (zero-config agent connection; see
  *                                   src/lib/server/mcp-bridge.js). Fails fast if
  *                                   no cellar is running in the workspace.
+ *   cellar ls                       list known cellar instances (registry +
+ *                                   untracked orphans) with liveness.
+ *   cellar cleanup [--all] [-y]     reap dead/orphaned instances (launcher gone,
+ *                                   app still listening); --all also stops every
+ *                                   live instance across all workspaces.
  *
  * Flags:
  *   --version / -v              print the version + build/git-sha and exit
@@ -34,14 +39,19 @@
  *   --no-mcp-config             do not write/merge <workspace>/.mcp.json
  *   --new / --force             start a second instance in a folder that
  *                               already has a live one (power-user escape hatch;
- *                               normally a relaunch attaches to the running one)
+ *                               normally a relaunch reaps + replaces the running one)
  *
- * Single-instance-per-folder: a relaunch in a folder that already has a live
- * cellar does NOT start a rival server (two servers persist the same
- * notebook.ipynb from independent in-memory docs → last-writer-wins clobber).
- * An `O_EXCL` lockfile (`.cellar/instance.lock`) atomically gates ownership, so
- * even a rapid double-launch inside the boot window can't start two; the loser
- * attaches by opening the browser to the running instance and exits 0.
+ * Single-instance-per-folder + reap: a relaunch in a folder that already has a
+ * live cellar TAKES OVER — it reaps the old instance and starts fresh, rather than
+ * leaving the old one running with stale in-memory code (the pile-up this fixes:
+ * old servers lingering after an update, still served to agents over MCP). An
+ * `O_EXCL` lockfile (`.cellar/instance.lock`) still atomically gates ownership so
+ * a rapid double-launch can't start two at once; whichever launcher wins the lock
+ * runs, having reaped its predecessor. A global registry (`~/.cellar/instances/`,
+ * see instances.js) records every instance so a launch can also reap orphaned
+ * children (crashed launcher) and instances of deleted worktrees, and so
+ * `cellar ls` / `cellar cleanup` can find and stop them. `--new`/`--force` skips
+ * all of this to run a deliberate second instance.
  */
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
@@ -68,9 +78,22 @@ import {
 	writeMcpConfig,
 	readRuntime,
 	acquireInstanceLock,
-	releaseInstanceLock,
-	waitForInstanceUrl
+	releaseInstanceLock
 } from '../src/lib/server/runtime.js';
+import {
+	registerInstance,
+	updateInstance,
+	unregisterInstance,
+	reapWorkspaceInstances,
+	reapVanishedWorkspaces,
+	pruneDeadInstances,
+	listInstances,
+	readInstance,
+	annotateInstance,
+	reapInstance,
+	killPid,
+	scanUntrackedCellarProcesses
+} from '../src/lib/server/instances.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -103,6 +126,17 @@ if (argv.includes('--version') || argv.includes('-v')) {
 if (argv.includes('--update')) {
 	const { runUpdate } = await import('../src/lib/server/selfupdate.js');
 	process.exit(runUpdate(REPO));
+}
+
+// `cellar ls` / `cellar cleanup` — inspect and reap cellar instances. Handled
+// before normal arg parsing so they never boot a server.
+if (argv[0] === 'ls' || argv[0] === 'list') {
+	await listInstancesCommand();
+	process.exit(0);
+}
+if (argv[0] === 'cleanup' || argv[0] === 'kill') {
+	const code = await cleanupCommand(argv.slice(1));
+	process.exit(code);
 }
 
 function flagValue(...names) {
@@ -169,6 +203,8 @@ function cleanup() {
 		releaseInstanceLock(lockWorkspace);
 		lockWorkspace = null;
 	}
+	// Drop our global registry entry (no-op if we never registered, e.g. --new).
+	unregisterInstance();
 }
 function shutdown(code = 0) {
 	for (const c of children) {
@@ -273,47 +309,162 @@ async function resolveInterpreter() {
 	return { python: r.python, venv: r.venv };
 }
 
+// ---- `cellar ls` / `cellar cleanup` --------------------------------------
+function fmtAge(startedAt) {
+	if (!startedAt) return '?';
+	const s = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+	if (s < 60) return `${s}s`;
+	const m = Math.round(s / 60);
+	if (m < 60) return `${m}m`;
+	const h = Math.round(m / 60);
+	if (h < 48) return `${h}h`;
+	return `${Math.round(h / 24)}d`;
+}
+
+function promptYesNo(question) {
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	return new Promise((res) => {
+		rl.question(question, (ans) => {
+			rl.close();
+			res(/^\s*y/i.test(ans));
+		});
+	});
+}
+
+async function listInstancesCommand() {
+	const entries = await Promise.all(listInstances().map(annotateInstance));
+	if (entries.length === 0) {
+		console.log('[cellar] no registered instances.');
+	} else {
+		console.log(`[cellar] ${entries.length} registered instance(s):`);
+		for (const e of entries) {
+			const state = e.launcherAlive ? 'live' : e.appAlive || e.appResponds ? 'ORPHAN' : 'dead';
+			console.log(
+				`  ${state.padEnd(6)} launcher=${e.launcherPid} app=${e.appPid ?? '?'} appPort=${e.appPort ?? '?'} mcpPort=${e.mcpPort ?? '?'} age=${fmtAge(e.startedAt)} ${e.workspace ?? ''}`
+			);
+		}
+	}
+	const untracked = scanUntrackedCellarProcesses();
+	if (untracked.length) {
+		console.log(`[cellar] ${untracked.length} untracked cellar process(es) (not in registry):`);
+		for (const u of untracked) {
+			console.log(`  ${u.ppid === 1 ? 'ORPHAN' : 'proc  '} pid=${u.pid} ppid=${u.ppid}  ${u.command}`);
+		}
+	}
+}
+
+async function cleanupCommand(flags) {
+	const all = flags.includes('--all');
+	const yes = flags.includes('--yes') || flags.includes('-y') || !!process.env.CI || !process.stdin.isTTY;
+	const log = (m) => console.log(m);
+
+	// 1) Prune fully-dead registry entries (no live process at all).
+	const pruned = await pruneDeadInstances();
+	if (pruned.length) console.log(`[cellar] pruned ${pruned.length} dead registry entr(ies).`);
+
+	// 2) Decide what to reap.
+	const entries = await Promise.all(listInstances().map(annotateInstance));
+	const orphanRegistered = entries.filter((e) => !e.launcherAlive && (e.appAlive || e.appResponds));
+	const liveRegistered = entries.filter((e) => e.launcherAlive);
+	const untracked = scanUntrackedCellarProcesses();
+	// Untracked orphans = reparented to init (ppid 1); safe — no launcher owns them.
+	const untrackedOrphans = untracked.filter((u) => u.ppid === 1);
+	const untrackedOther = untracked.filter((u) => u.ppid !== 1);
+
+	const toReap = [...orphanRegistered];
+	const toKillPids = untrackedOrphans.map((u) => u.pid);
+	if (all) {
+		toReap.push(...liveRegistered);
+		toKillPids.push(...untrackedOther.map((u) => u.pid));
+	}
+
+	if (toReap.length === 0 && toKillPids.length === 0) {
+		console.log(
+			all
+				? '[cellar] no cellar instances to stop.'
+				: '[cellar] nothing to reap (no orphaned instances). Pass --all to also stop live instances.'
+		);
+		return 0;
+	}
+
+	console.log('[cellar] will stop:');
+	for (const e of toReap)
+		console.log(`  ${e.launcherAlive ? 'live  ' : 'orphan'} launcher=${e.launcherPid} app=${e.appPid ?? '?'} ${e.workspace ?? ''}`);
+	for (const u of untrackedOrphans) console.log(`  orphan pid=${u.pid} (untracked)  ${u.command}`);
+	if (all) for (const u of untrackedOther) console.log(`  proc   pid=${u.pid} (untracked)  ${u.command}`);
+
+	if (!yes && !(await promptYesNo('[cellar] Stop these? [y/N] '))) {
+		console.log('[cellar] aborted.');
+		return 1;
+	}
+
+	for (const e of toReap) {
+		console.log(`[cellar] stopping launcher ${e.launcherPid} …`);
+		await reapInstance(e, { log });
+	}
+	for (const pid of toKillPids) {
+		console.log(`[cellar] killing pid ${pid} …`);
+		await killPid(pid);
+	}
+	console.log('[cellar] cleanup done.');
+	return 0;
+}
+
 async function main() {
 	console.log(`[cellar] workspace: ${WORKSPACE}`);
 
-	// 0) Single-instance-per-folder (unless --new/--force). Atomically claim the
-	//    folder via an O_EXCL lockfile BEFORE any slow toolchain work, so a rapid
-	//    double-launch inside the boot window can't start two rival servers (they
-	//    would both persist notebook.ipynb from independent docs and clobber each
-	//    other). The launcher that loses the lock attaches: it opens the browser
-	//    to the running instance and exits, needing no venv/uv of its own. Runs
-	//    before the uv check for exactly that reason — attaching is browser-only.
+	// 0) Single-instance-per-folder + reap (unless --new/--force). The complaint
+	//    this fixes: old cellar servers pile up (launcher crashed → orphaned app
+	//    reparented to init; or a still-running instance after a code update), and
+	//    an agent discovering a stale one over MCP gets outdated instructions. So a
+	//    launch REAPS the old instance and takes over, rather than attaching to it.
+	//    An O_EXCL lockfile (claimed before any slow toolchain work) still gates the
+	//    folder so a rapid double-launch can't start two at once.
+	const reapLog = (m) => console.log(m);
 	if (!forceNew) {
+		// Global hygiene (all workspaces): prune fully-dead registry entries, and
+		// reap instances whose workspace directory no longer exists (deleted
+		// worktrees). Both are always safe — nothing live for a real project is hit.
+		await pruneDeadInstances();
+		await reapVanishedWorkspaces({ excludePid: process.pid, log: reapLog });
+
 		let lock = acquireInstanceLock(WORKSPACE);
-		if (!lock.acquired) {
-			// A live (or still-booting) instance owns this folder. Attach to it:
-			// wait for its app to be reachable, then open the browser and exit.
-			console.log(`[cellar] a cellar instance (pid ${lock.ownerPid}) already owns ${WORKSPACE}.`);
-			const url = await waitForInstanceUrl(WORKSPACE, lock.ownerPid);
-			if (url) {
-				console.log(`[cellar] cellar is already running for ${WORKSPACE} at ${url} - opening it`);
-				console.log('[cellar] (pass --new to start a second, independent instance for this folder.)');
-				await openBrowser(url);
-				process.exit(0);
-			}
-			// The owner vanished mid-boot (crashed) or never became reachable.
-			// Retry the lock: a dead owner's lock is stale and gets reclaimed here.
+		if (!lock.acquired && lock.ownerPid) {
+			// A live instance owns this folder → TAKE OVER: reap it (gracefully:
+			// SIGTERM cascades its own clean shutdown), then claim the lock. Reaping
+			// the owner pid directly covers instances predating the registry; the
+			// sweep then clears any other registered dupes/orphans for this folder.
+			console.log(`[cellar] an instance (pid ${lock.ownerPid}) owns ${WORKSPACE} - taking over (reaping it).`);
+			// Reap via the owner's real registry entry when present (so its recorded
+			// app/jupyter children are killed explicitly, not just via the launcher's
+			// SIGTERM cascade); fall back to a synthetic entry for a pre-registry owner.
+			const ownerEntry = readInstance(lock.ownerPid) || { launcherPid: lock.ownerPid, workspace: WORKSPACE };
+			await reapInstance(ownerEntry, { log: reapLog });
+			await reapWorkspaceInstances(WORKSPACE, { excludePid: process.pid, log: reapLog });
 			lock = acquireInstanceLock(WORKSPACE);
+			for (let i = 0; !lock.acquired && i < 15; i++) {
+				await new Promise((r) => setTimeout(r, 200));
+				lock = acquireInstanceLock(WORKSPACE);
+			}
 			if (!lock.acquired) {
 				console.error(
-					`[cellar] a cellar instance (pid ${lock.ownerPid}) is holding ${WORKSPACE} but its app never became reachable.`
+					`[cellar] could not claim ${WORKSPACE} after reaping the previous instance (pid ${lock.ownerPid}).`
 				);
-				console.error('[cellar] Stop that process, or pass --new to start a separate instance.');
+				console.error('[cellar] Another launcher may be racing it; retry, or pass --new to start a separate instance.');
 				process.exit(1);
 			}
-			console.log('[cellar] previous instance is gone - starting fresh.');
+		} else {
+			// We won the lock (no live owner, or a dead owner's stale lock was
+			// reclaimed inside acquireInstanceLock). A prior launcher that crashed may
+			// still have orphaned app/jupyter children listening on old ports for THIS
+			// workspace — reap them by the registry so only our instance survives.
+			await reapWorkspaceInstances(WORKSPACE, { excludePid: process.pid, log: reapLog });
 		}
 		lockWorkspace = WORKSPACE; // cleanup() releases it on shutdown
-		// We own the folder now; drop any stale runtime.json a prior crashed run
-		// left behind so discovery is clean while we boot (writeRuntime overwrites
-		// it below regardless, but this avoids a misleading stale entry meanwhile).
+		// Drop any stale runtime.json a prior crashed run left behind so discovery is
+		// clean while we boot (writeRuntime overwrites it below regardless).
 		const stale = readRuntime(WORKSPACE);
-		if (stale) clearRuntime(WORKSPACE, stale.pid);
+		if (stale && stale.pid !== process.pid) clearRuntime(WORKSPACE, stale.pid);
 	}
 
 	// uv is mandatory — fail fast with an actionable message, no silent fallback.
@@ -355,6 +506,18 @@ async function main() {
 	// (a stdio command, not a URL) so the dynamic port never leaks into config.
 	runtimeWorkspace = WORKSPACE;
 	writeRuntime(WORKSPACE, { mcpPort, appPort, jupyterPort });
+	// Record in the global registry so a later launch / `cellar ls` / `cellar
+	// cleanup` can discover and reap this instance (child pids filled in after the
+	// sidecar + app spawn below). Registered even under --new so `ls`/`cleanup` see it.
+	registerInstance({
+		launcherPid: process.pid,
+		workspace: WORKSPACE,
+		appPort,
+		mcpPort,
+		jupyterPort,
+		startedAt: Date.now(),
+		mode: useDev ? 'dev' : 'build'
+	});
 	if (writeMcpConfigOptIn) {
 		const status = writeMcpConfig(WORKSPACE);
 		console.log(`[cellar] .mcp.json: ${status} (agent connects via \`cellar mcp\`)`);
@@ -382,6 +545,7 @@ async function main() {
 		{ cwd: WORKSPACE, env: { ...process.env, JUPYTER_PATH: jupyterDir }, stdio: ['ignore', 'inherit', 'inherit'] }
 	);
 	children.push(jupyter);
+	updateInstance(process.pid, { jupyterPid: jupyter.pid });
 	jupyter.on('exit', (c) => {
 		console.error(`[cellar] jupyter sidecar exited (${c})`);
 		shutdown(1);
@@ -401,6 +565,9 @@ async function main() {
 		CELLAR_MCP_PORT: String(mcpPort),
 		CELLAR_PROJECT_VENV: projectPython,
 		CELLAR_KERNELSPEC_DIR: kernelDir,
+		// Self-exit hook: the app watches this pid and exits if the launcher dies
+		// uncleanly (parent-watch.js), so it never lingers orphaned serving stale code.
+		CELLAR_LAUNCHER_PID: String(process.pid),
 		PORT: String(appPort)
 	};
 
@@ -422,6 +589,7 @@ async function main() {
 		app = spawn('node', [buildEntry], { cwd: REPO, env, stdio: 'inherit' });
 	}
 	children.push(app);
+	updateInstance(process.pid, { appPid: app.pid });
 	app.on('exit', (c) => {
 		console.error(`[cellar] app server exited (${c})`);
 		shutdown(1);

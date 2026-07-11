@@ -154,7 +154,7 @@ export function releaseInstanceLock(workspace, pid = process.pid) {
 }
 
 /** Quick liveness probe of the app HTTP port (any response = listening). */
-async function appPortResponds(appPort, timeoutMs = 1500) {
+export async function appPortResponds(appPort, timeoutMs = 1500) {
 	if (!appPort) return false;
 	const ctrl = new AbortController();
 	const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -189,7 +189,7 @@ export async function waitForInstanceUrl(workspace, ownerPid, { timeoutMs = 1200
 }
 
 /** True if a process with `pid` is currently alive. */
-function pidAlive(pid) {
+export function pidAlive(pid) {
 	if (!pid) return false;
 	try {
 		process.kill(pid, 0); // signal 0 = existence check, does not kill
