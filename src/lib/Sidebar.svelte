@@ -24,7 +24,7 @@
 		mcp = null,
 		kernelInfo,
 		kernelBusy,
-		openNotebooks = [],
+		loadedNotebooks = [],
 		variables,
 		varsLoading,
 		varsError,
@@ -70,9 +70,8 @@
 		if (open.environment) environmentMounted = true;
 	});
 
-	const notebooksLabel = $derived(openNotebooks.length ? `notebooks · ${openNotebooks.length}` : 'notebooks');
-	const pendingNotebooksLabel = $derived(
-		openNotebooks.length ? `open notebooks · ${openNotebooks.length} · no live kernel yet` : 'open notebooks'
+	const notebooksLabel = $derived(
+		loadedNotebooks.length ? `loaded notebooks · ${loadedNotebooks.length}` : 'loaded notebooks'
 	);
 
 	// ---- Persisted section order (drag to reorder) --------------------------
@@ -479,12 +478,24 @@
 <!-- One open notebook loaded against the shared kernel. Clicking only focuses
      its existing tab - a preview tab stays a preview, so the file tree's single-
      click slot is untouched. The active notebook is marked with a primary dot. -->
+<!-- One loaded notebook. If its tab is still open the row focuses that tab and the
+     active one is dotted; if the tab was closed the notebook is still loaded in the
+     kernel (its state lives in the shared namespace), so it shows as a dimmed,
+     non-clickable row tagged "closed". -->
 {#snippet notebookRow(nb)}
-	<button class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50 {nb.active ? 'text-base-content' : 'text-base-content/60'}" onclick={() => onFocusNotebook?.(nb.id)} title="Focus {nb.name}" data-testid="kernel-notebook">
-		<svg class="h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
-		<span class="truncate font-mono">{nb.name}</span>
-		{#if nb.active}<span class="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
-	</button>
+	{#if nb.open}
+		<button class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50 {nb.active ? 'text-base-content' : 'text-base-content/60'}" onclick={() => onFocusNotebook?.(nb.id)} title="Focus {nb.name}" data-testid="kernel-notebook">
+			<svg class="h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
+			<span class="truncate font-mono">{nb.name}</span>
+			{#if nb.active}<span class="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
+		</button>
+	{:else}
+		<div class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-base-content/45" title="{nb.name} — loaded in the kernel (tab closed)" data-testid="kernel-notebook">
+			<svg class="h-3.5 w-3.5 shrink-0 text-base-content/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
+			<span class="truncate font-mono">{nb.name}</span>
+			<span class="ml-auto shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>
+		</div>
+	{/if}
 {/snippet}
 
 <!-- Card header: title on the left, live status badge on the right. Shared by the
@@ -503,17 +514,17 @@
 	</div>
 {/snippet}
 
-<!-- The open notebooks loaded against the shared kernel. Rendered by both the
-     started and the not-started card so the two stay structurally identical. -->
+<!-- The notebooks loaded in the shared kernel (ran >=1 cell this session). Only
+     the started card renders this — nothing is loaded before the first run. -->
 {#snippet notebookList(label)}
 	<div class="mt-2 border-t border-base-300 pt-2">
 		<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40" data-testid="kernel-notebooks-label">
 			{label}
 		</div>
-		{#each openNotebooks as nb (nb.id)}
+		{#each loadedNotebooks as nb (nb.id)}
 			{@render notebookRow(nb)}
 		{:else}
-			<p class="px-1 text-xs text-base-content/40">no notebooks open</p>
+			<p class="px-1 text-xs text-base-content/40">no notebooks loaded</p>
 		{/each}
 	</div>
 {/snippet}
@@ -551,10 +562,12 @@
 		{@render refreshBtn(onRefreshKernel, 'Refresh kernel status')}
 	</div>
 	{#if open.kernels}
-		<!-- Cellar runs ONE shared kernel across every open notebook. So the live
-		     picture is: at most one kernel (started only after the first run), with
-		     every open notebook listed under it. Before the first run there is no
-		     kernel — show that, not a phantom `python3`. -->
+		<!-- Cellar runs ONE shared kernel across every notebook. So the live picture
+		     is: at most one kernel (started only after the first run), with every
+		     notebook LOADED in it listed under it (ran >=1 cell this session — server
+		     tracked, so a closed-tab notebook still shows, an unrun one does not).
+		     Before the first run there is no kernel — show that, not a phantom
+		     `python3`. -->
 		<div class="px-3 pb-3" data-testid="kernels-body">
 			{#if kernelInfo?.started}
 				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="kernel-card">
@@ -567,8 +580,8 @@
 					{@render kernelHeader('No kernel running', true)}
 					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">
 						Run a cell to start the <span class="font-mono">{kernelInfo?.name || 'python3'}</span> kernel.
+						Notebooks appear here once they run a cell.
 					</p>
-					{@render notebookList(pendingNotebooksLabel)}
 					{@render kernelControls()}
 				</div>
 			{/if}

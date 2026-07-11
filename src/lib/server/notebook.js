@@ -338,6 +338,15 @@ export function resolveNotebookPath(nb) {
 	return resolveAbs(nb);
 }
 
+/**
+ * Workspace-relative path for an absolute notebook path — the id the browser
+ * uses to address tabs (e.g. the default notebook is `notebook.ipynb`). Inverse
+ * of `resolveAbs` for the common in-workspace case.
+ */
+export function workspaceRelative(abs) {
+	return relative(workspace(), abs);
+}
+
 function find(doc, id) {
 	return doc.cells.find((c) => c.id === id);
 }

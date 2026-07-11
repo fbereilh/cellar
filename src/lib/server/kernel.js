@@ -36,9 +36,37 @@ let sessionId = 0;
 /** Cell executions run in the current epoch (internal probes excluded). */
 let execsThisSession = 0;
 
+/**
+ * Notebooks whose state actually lives in the CURRENT kernel session: the set of
+ * absolute notebook paths that have executed at least one cell in this epoch.
+ * With the one-shared-kernel model this is what "loaded in the kernel" means — a
+ * notebook whose tab was later closed is still here (its variables persist in the
+ * shared namespace), and a just-opened notebook that never ran a cell is not.
+ * Cleared by `beginSession()`, so a fresh namespace starts with nothing loaded.
+ */
+let loadedNbPaths = new Set();
+
 function beginSession() {
 	sessionId += 1;
 	execsThisSession = 0;
+	loadedNbPaths.clear();
+}
+
+/**
+ * Record that notebook `nbAbsPath` executed a cell in session `session`. The run
+ * path calls this after a run resolves, passing the epoch the run STARTED in
+ * (from `execute()`'s `kernel` event). Guarded so a run that spanned a restart —
+ * its epoch no longer current — never re-marks a notebook as loaded in a session
+ * it did not actually touch.
+ */
+export function markNotebookLoaded(nbAbsPath, session) {
+	if (!currentKernel || !nbAbsPath || session !== sessionId) return;
+	loadedNbPaths.add(nbAbsPath);
+}
+
+/** Absolute paths of the notebooks loaded in the live session (empty if none). */
+export function loadedNotebookPaths() {
+	return currentKernel ? [...loadedNbPaths] : [];
 }
 
 function makeSettings() {
