@@ -18,6 +18,8 @@
  * MUST be idempotent: cleaning an already-clean notebook yields zero change.
  */
 
+import type { CellMetadata } from './types.js';
+
 /** Cell-metadata keys preserved through a clean. Everything else is dropped. */
 export const ALLOWED_CELL_METADATA = ['cellar'];
 /** Notebook-metadata keys preserved through a clean. */
@@ -34,20 +36,24 @@ const ADDRESS_RE = /(<[^<>]*?) at 0x[0-9a-fA-F]+(?=[>\s])/g;
 const DATAFRAME_MIME = 'application/vnd.cellar.dataframe+json';
 
 /** Scrub `<... at 0x…>`-style memory addresses from a string or list of strings. */
-export function scrubAddresses(text) {
-	if (Array.isArray(text)) return text.map(scrubAddresses);
+export function scrubAddresses<T>(text: T): T {
+	if (Array.isArray(text)) return text.map((t) => scrubAddresses(t)) as T;
 	if (typeof text !== 'string') return text;
-	return text.replace(ADDRESS_RE, '$1');
+	return text.replace(ADDRESS_RE, '$1') as T;
 }
 
-function pick(obj, allowed) {
-	const out = {};
+function pick(obj: Record<string, unknown> | null | undefined, allowed: readonly string[]): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
 	if (!obj) return out;
 	for (const k of allowed) if (k in obj) out[k] = obj[k];
 	return out;
 }
 
-function cleanOutput(output) {
+// nbformat output objects arrive from JSON and are mutated in place; model them
+// as an open record so the field probes below type-check without over-narrowing.
+type RawOutput = Record<string, unknown> & { data?: Record<string, unknown> };
+
+function cleanOutput(output: RawOutput): RawOutput {
 	if ('execution_count' in output) output.execution_count = null;
 
 	// stream text
@@ -87,10 +93,10 @@ const RUNTIME_CELLAR_KEYS = ['lastRun', 'editedAt'];
  * An emptied `cellar` namespace is dropped so a foreign cell that never had one
  * stays byte-identical, preserving zero-diff-on-re-run and idempotency.
  */
-export function stripRuntimeMeta(metadata) {
-	const md = { ...(metadata ?? {}) };
+export function stripRuntimeMeta(metadata: CellMetadata | undefined | null): CellMetadata {
+	const md: CellMetadata = { ...(metadata ?? {}) };
 	if (md.cellar) {
-		const rest = { ...md.cellar };
+		const rest: Record<string, unknown> = { ...md.cellar };
 		for (const k of RUNTIME_CELLAR_KEYS) delete rest[k];
 		if (Object.keys(rest).length) md.cellar = rest;
 		else delete md.cellar;
@@ -98,26 +104,41 @@ export function stripRuntimeMeta(metadata) {
 	return md;
 }
 
-function cleanCell(cell) {
+// nbformat cell object mutated in place during a clean.
+type RawCell = Record<string, unknown> & {
+	cell_type?: string;
+	outputs?: unknown;
+	metadata?: CellMetadata;
+};
+
+function cleanCell(cell: RawCell): RawCell {
 	if (cell.cell_type === 'code') {
 		cell.execution_count = null;
 		if (Array.isArray(cell.outputs)) cell.outputs = cell.outputs.map(cleanOutput);
 	}
 	// deny-by-default metadata allowlist (keeps the `cellar` namespace intact)
-	cell.metadata = stripRuntimeMeta(pick(cell.metadata, ALLOWED_CELL_METADATA));
+	cell.metadata = stripRuntimeMeta(pick(cell.metadata, ALLOWED_CELL_METADATA) as CellMetadata);
 	return cell;
 }
+
+// nbformat notebook object as it arrives (from JSON or the serialize builder).
+type RawNotebook = Record<string, unknown> & {
+	metadata?: Record<string, unknown>;
+	cells?: RawCell[];
+};
 
 /**
  * Return a cleaned deep copy of an nbformat notebook object. Pure + idempotent.
  */
-export function cleanNotebook(nb) {
+export function cleanNotebook<T extends RawNotebook>(nb: T): T {
 	const out = structuredClone(nb);
 
-	out.metadata = pick(out.metadata, ALLOWED_NB_METADATA);
-	if (out.metadata.kernelspec) {
+	const metadata = pick(out.metadata, ALLOWED_NB_METADATA);
+	out.metadata = metadata;
+	const kernelspec = metadata.kernelspec as { name?: string; display_name?: string } | undefined;
+	if (kernelspec) {
 		// display_name varies per machine; normalize it to the stable name.
-		out.metadata.kernelspec.display_name = out.metadata.kernelspec.name;
+		kernelspec.display_name = kernelspec.name;
 	}
 
 	out.cells = (out.cells || []).map(cleanCell);
