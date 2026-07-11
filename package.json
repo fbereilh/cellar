@@ -27,12 +27,13 @@
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
+    "postbuild": "node scripts/gen-build-info.js",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "cellar": "node bin/cellar.js",
-    "prepack": "vite build",
-    "prepublishOnly": "vite build"
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.2.9",
