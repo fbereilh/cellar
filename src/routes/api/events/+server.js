@@ -1,5 +1,5 @@
-import { subscribe } from '$lib/server/events.js';
-import { queueState } from '$lib/server/run-queue.js';
+import { subscribe } from '$lib/server/events';
+import { queueState } from '$lib/server/run-queue';
 
 /**
  * Server-Sent Events stream — one per browser tab, carrying live document/run

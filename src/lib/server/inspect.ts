@@ -9,7 +9,66 @@
  * only underscore-prefixed temporaries and deletes them, so it neither shows up
  * in nor pollutes the inspected namespace.
  */
-import { execute, kernelStatus, kernelSession, currentSessionId } from './kernel.js';
+import { execute, kernelStatus, kernelSession, currentSessionId } from './kernel';
+import type { RunStreamEvent, SessionId } from './types';
+
+// --- Parsed probe-result shapes (a genuine dynamic boundary: kernel stdout JSON) ---
+
+/** A namespace name that is a plain/from import. `statement` is null when no
+ *  runnable reconstruction is safe (see the __module__ gotcha in the probe). */
+interface ImportRecord {
+	alias: string;
+	module: string;
+	statement: string | null;
+}
+
+interface FunctionRecord {
+	name: string;
+	signature: string;
+}
+
+interface ClassRecord {
+	name: string;
+}
+
+/** A data variable in the sidebar/kernel_state shape. */
+interface VariableRecord {
+	name: string;
+	type: string;
+	shape: string;
+	preview: string;
+	columns?: string[];
+}
+
+/** The bucketed namespace the shared PROBE prints. */
+interface ProbeState {
+	imports: ImportRecord[];
+	functions: FunctionRecord[];
+	classes: ClassRecord[];
+	variables: VariableRecord[];
+}
+
+/** One `_cellar_describe` entry (list_variables); many fields are library-dependent. */
+interface VariableDescriptor {
+	name: string;
+	type: string;
+	module?: string;
+	repr_short?: string;
+	size?: number;
+	kind?: string;
+	shape?: number[];
+	dtype?: string;
+	columns?: Array<{ name: string; dtype: string }>;
+	columns_truncated?: boolean;
+	[key: string]: unknown;
+}
+
+/** The `_cellar_inspect` detail object (inspect_variable); shape varies by kind. */
+interface InspectDetail {
+	found: boolean;
+	name?: string;
+	[key: string]: unknown;
+}
 
 // One probe, four buckets. We start from IPython's user namespace minus the
 // names it already marks hidden (its injected builtins) and classify each name:
@@ -124,11 +183,11 @@ del _cellar_kernel_state
  * `execs_this_session` and the run queue - it is Cellar's own bookkeeping, not a
  * cell the agent ran.
  */
-async function execProbe(code) {
+async function execProbe(code: string): Promise<{ session: SessionId | null; line: string | undefined }> {
 	let stdout = '';
-	let errored = null;
-	let session = null;
-	const onEvent = (ev) => {
+	let errored: string | null = null;
+	let session: SessionId | null = null;
+	const onEvent = (ev: RunStreamEvent) => {
 		if (ev.type === 'kernel') {
 			session = ev.session;
 		} else if (ev.type === 'output') {
@@ -150,17 +209,20 @@ async function execProbe(code) {
  * Run the shared bucketed-namespace probe and return the parsed state, tagged
  * with `session`.
  */
-async function runProbe() {
+async function runProbe(): Promise<{ session: SessionId | null } & ProbeState> {
 	const { session, line } = await execProbe(PROBE);
 	if (!line) return { session, imports: [], functions: [], classes: [], variables: [] };
-	return { session, ...JSON.parse(line) };
+	// The shared PROBE prints exactly the ProbeState bucketed namespace.
+	return { session, ...(JSON.parse(line) as ProbeState) };
 }
 
 /**
  * Sidebar variable inspector: the data-variable list only, in the original
  * `{ name, type, shape, preview }` shape (unchanged for the existing UI).
  */
-export async function inspectVariables() {
+export async function inspectVariables(): Promise<
+	Array<{ name: string; type: string; shape: string; preview: string }>
+> {
 	const state = await runProbe();
 	return (state.variables || []).map(({ name, type, shape, preview }) => ({
 		name,
@@ -190,8 +252,8 @@ export async function kernelState() {
 	if (status === 'not_started') return { started: false, session_id: null };
 	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession().session_id };
 	const state = await runProbe();
-	const seen = new Set();
-	const imports = [];
+	const seen = new Set<string>();
+	const imports: ImportRecord[] = [];
 	for (const imp of state.imports || []) {
 		const key = imp.statement ?? `${imp.module}:${imp.alias}`;
 		if (seen.has(key)) continue;
@@ -411,7 +473,7 @@ def _cellar_inspect(_target):
 
 /** Guard shared by the two agent inspection tools: never boot a kernel, never
  *  queue a probe behind a running cell. Returns a short-circuit payload or null. */
-function inspectionGuard() {
+function inspectionGuard(): { started: boolean; busy?: boolean; session_id: SessionId | null } | null {
 	const status = kernelStatus().status;
 	if (status === 'not_started') return { started: false, session_id: null };
 	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession().session_id };
@@ -433,7 +495,8 @@ export async function listVariables() {
 		started: true,
 		session_id: session,
 		...(stale ? { stale: true } : {}),
-		variables: line ? JSON.parse(line) : []
+		// LIST_VARS_PROBE prints an array of _cellar_describe descriptors.
+		variables: line ? (JSON.parse(line) as VariableDescriptor[]) : []
 	};
 }
 
@@ -443,12 +506,13 @@ export async function listVariables() {
  * a huge object never floods the output. `found:false` when the name is unset in
  * the live namespace. Reflects only the LIVE session.
  */
-export async function inspectVariable(name) {
+export async function inspectVariable(name: string) {
 	const guard = inspectionGuard();
 	if (guard) return guard;
 	const code = INSPECT_PROBE_HEAD + `\nprint(_cj.dumps(_cellar_inspect(${JSON.stringify(String(name))})))\ndel _cellar_inspect\n`;
 	const { session, line } = await execProbe(code);
 	const stale = session !== currentSessionId();
-	const detail = line ? JSON.parse(line) : { found: false, name };
+	// INSPECT_PROBE_HEAD prints one _cellar_inspect detail object (or {found:false}).
+	const detail: InspectDetail = line ? (JSON.parse(line) as InspectDetail) : { found: false, name };
 	return { started: true, session_id: session, ...(stale ? { stale: true } : {}), ...detail };
 }

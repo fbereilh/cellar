@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { getStatus } from '$lib/server/databricks.js';
+import { getStatus } from '$lib/server/databricks';
 
 /**
  * Everything the sidebar's Databricks section needs in one read: the profiles

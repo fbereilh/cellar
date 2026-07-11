@@ -15,10 +15,11 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import * as svc from './service.js';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import * as svc from './service';
 
-const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
-const notFound = (msg) => ({ content: [{ type: 'text', text: msg }], isError: true });
+const text = (obj: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(obj, null, 2) }] });
+const notFound = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true });
 
 /**
  * Run a Databricks tool, turning its structured failure into a structured tool
@@ -26,11 +27,13 @@ const notFound = (msg) => ({ content: [{ type: 'text', text: msg }], isError: tr
  * part an agent can act on - losing it to a bare string would leave "ask the
  * user to connect" indistinguishable from "that catalog does not exist".
  */
-async function databricksTool(fn) {
+async function databricksTool(fn: () => unknown) {
 	try {
 		return text(await fn());
 	} catch (err) {
-		return { content: [{ type: 'text', text: JSON.stringify({ error: err?.code ?? 'error', message: String(err?.message ?? err) }, null, 2) }], isError: true };
+		// A DatabricksError carries a structured `code`; fall back for anything else.
+		const e = err as { code?: string; message?: string };
+		return { content: [{ type: 'text' as const, text: JSON.stringify({ error: e?.code ?? 'error', message: String(e?.message ?? err) }, null, 2) }], isError: true };
 	}
 }
 
@@ -185,14 +188,14 @@ The goal: a notebook a human would be happy to have written — imports up top,
 shared state, a clean section outline, and a continuous line of reasoning from
 first cell to last.`;
 
-function registerTools(server) {
+function registerTools(server: McpServer) {
 	// --- lifecycle ---
 	server.registerTool('restart_kernel', { description: 'Restart the kernel (clears the namespace and opens a new kernel session, so every cell reverts to ran_this_session:false). Also DROPS every queued run: queued work was submitted against the namespace you are clearing. Does NOT affect the MCP connection or document.', inputSchema: {} }, async () => text(await svc.kernel.restart()));
 	server.registerTool('interrupt_kernel', { description: 'Interrupt the running kernel, and drop every queued run (stop means stop).', inputSchema: {} }, async () => text(await svc.kernel.interrupt()));
 	server.registerTool('kernel_status', { description: 'Current kernel status, plus the live kernel session: {started, session_id, execs_this_session}. execs_this_session:0 means no cell has run against this namespace yet, whatever the notebook\'s saved outputs suggest.', inputSchema: {} }, async () => text(svc.kernel.status()));
 	server.registerTool('run_queue', { description: 'The kernel run queue: {running, queue}. There is ONE kernel behind every open notebook, so one cell runs at a time app-wide and everything else waits in a FIFO - a run you request while a user\'s (or another notebook\'s) cell is executing is QUEUED, never dropped. Each entry carries {nb, cellId, actor, position} (position 1 = next up). Reads only; it never boots a kernel.', inputSchema: {} }, async () => text(svc.getRunQueue()));
 	server.registerTool('list_notebooks', { description: 'List every .ipynb in the workspace (workspace-relative paths) so you can discover notebook names to open, and which one is currently active. Use open_notebook to focus one of these.', inputSchema: {} }, async () => text(svc.listNotebooks()));
-	server.registerTool('open_notebook', { description: 'Open and focus an existing workspace notebook by name; surfaces it live in the UI. Use create_notebook to make a new one.', inputSchema: { name: z.string() } }, async ({ name }) => { try { return text(svc.openNotebook(name)); } catch (e) { return notFound(String(e?.message ?? e)); } });
+	server.registerTool('open_notebook', { description: 'Open and focus an existing workspace notebook by name; surfaces it live in the UI. Use create_notebook to make a new one.', inputSchema: { name: z.string() } }, async ({ name }) => { try { return text(svc.openNotebook(name)); } catch (e) { return notFound(String((e as Error)?.message ?? e)); } });
 	server.registerTool('create_notebook', { description: 'Create a NEW workspace notebook by name (a .ipynb file), make it active, and surface it live in the open UI. Omit name for an untitled notebook. To open a notebook that already exists, use open_notebook instead.', inputSchema: { name: z.string().optional() } }, async ({ name }) => text(svc.createNotebook(name)));
 
 	// --- read ---
@@ -209,8 +212,11 @@ function registerTools(server) {
 	server.registerTool('get_full_output', { description: 'Fuller cell outputs. Medium-capped by default; size=full returns everything. Images passed through. ran_this_session:false means these outputs were loaded from the .ipynb and are LEFTOVER from a previous session - kernel_state is the live truth about what is defined now.', inputSchema: { id: z.string(), size: z.enum(['medium', 'full']).optional() } }, async ({ id, size }) => {
 		const r = svc.getFullOutput(id, size ?? 'medium');
 		if (!r) return notFound(`cell ${id} not found or hidden`);
-		const content = [{ type: 'text', text: JSON.stringify({ id: r.id, size: r.size, ran_this_session: r.ran_this_session, outputs: r.outputs.map((o) => (o.data ? { type: o.type, image: o.image } : o)) }, null, 2) }];
-		for (const o of r.outputs) if (o.data) content.push({ type: 'image', data: o.data, mimeType: o.image });
+		// Tool result content is a text summary plus one image block per image output.
+		type TextBlock = { type: 'text'; text: string };
+		type ImageBlock = { type: 'image'; data: string; mimeType: string };
+		const content: Array<TextBlock | ImageBlock> = [{ type: 'text', text: JSON.stringify({ id: r.id, size: r.size, ran_this_session: r.ran_this_session, outputs: r.outputs.map((o) => (o.data ? { type: o.type, image: o.image } : o)) }, null, 2) }];
+		for (const o of r.outputs) if (o.data) content.push({ type: 'image', data: String(o.data), mimeType: String(o.image) });
 		return { content };
 	});
 
@@ -221,7 +227,7 @@ function registerTools(server) {
 		// straight to the imports cell, which is then the cell this call produced.
 		return ids.length
 			? text({ id: ids[0], ...(imports ? { imports } : {}) })
-			: text({ id: imports.cell_id, routed_to_imports: true, imports });
+			: text({ id: imports!.cell_id, routed_to_imports: true, imports });
 	});
 	server.registerTool('add_cells', { description: `Add multiple cells in order (optionally after a cell).${ROUTE_IMPORTS_DOC}`, inputSchema: { cells: z.array(z.object({ cell_type: z.enum(['code', 'sql', 'markdown']).optional(), source: z.string().optional() })), after_id: z.string().optional(), route_imports: z.boolean().optional() } }, async ({ cells, after_id, route_imports }) => text(await svc.addCells(cells, after_id, { routeImports: route_imports ?? true })));
 	server.registerTool('edit_cell', { description: `Replace a cell source in place.${ROUTE_IMPORTS_DOC} (Editing the imports cell itself never routes — you are already writing into it.)`, inputSchema: { id: z.string(), source: z.string(), route_imports: z.boolean().optional() } }, async ({ id, source, route_imports }) => {
@@ -257,7 +263,7 @@ function registerTools(server) {
 }
 
 /** Read and JSON-parse a Node request body. */
-function readBody(req) {
+function readBody(req: IncomingMessage): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		let data = '';
 		req.on('data', (c) => (data += c));
@@ -273,18 +279,20 @@ function readBody(req) {
 }
 
 let started = false;
+// One-time start guard shared across module instances via globalThis.
+const g = globalThis as typeof globalThis & { __cellarMcpStarted?: boolean };
 
 /** Start the in-process MCP HTTP server once. */
 export function startMcpServer() {
-	if (started || globalThis.__cellarMcpStarted) return;
+	if (started || g.__cellarMcpStarted) return;
 	started = true;
-	globalThis.__cellarMcpStarted = true;
+	g.__cellarMcpStarted = true;
 
 	const port = Number(process.env.CELLAR_MCP_PORT || 39587);
-	const transports = {}; // sessionId -> transport
+	const transports: Record<string, StreamableHTTPServerTransport> = {}; // sessionId -> transport
 
-	const httpServer = http.createServer(async (req, res) => {
-		const url = new URL(req.url, 'http://localhost');
+	const httpServer = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
+		const url = new URL(req.url ?? '', 'http://localhost');
 		if (url.pathname !== '/mcp') {
 			res.writeHead(404).end('not found');
 			return;
@@ -292,19 +300,23 @@ export function startMcpServer() {
 		try {
 			if (req.method === 'POST') {
 				const body = await readBody(req);
-				const sid = req.headers['mcp-session-id'];
+				// The MCP session id header is single-valued.
+				const sid = req.headers['mcp-session-id'] as string | undefined;
 				let transport = sid ? transports[sid] : undefined;
 				if (!transport && isInitializeRequest(body)) {
-					transport = new StreamableHTTPServerTransport({
+					const created: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
 						sessionIdGenerator: () => randomUUID(),
-						onsessioninitialized: (id) => (transports[id] = transport)
+						onsessioninitialized: (id: string) => {
+							transports[id] = created;
+						}
 					});
-					transport.onclose = () => {
-						if (transport.sessionId) delete transports[transport.sessionId];
+					created.onclose = () => {
+						if (created.sessionId) delete transports[created.sessionId];
 					};
+					transport = created;
 					const server = new McpServer({ name: 'cellar', version: '0.1.0' }, { instructions: INSTRUCTIONS });
 					registerTools(server);
-					await server.connect(transport);
+					await server.connect(created);
 				}
 				if (!transport) {
 					res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'No valid session; send an initialize request first.' }, id: null }));
@@ -312,7 +324,7 @@ export function startMcpServer() {
 				}
 				await transport.handleRequest(req, res, body);
 			} else if (req.method === 'GET' || req.method === 'DELETE') {
-				const sid = req.headers['mcp-session-id'];
+				const sid = req.headers['mcp-session-id'] as string | undefined;
 				const transport = sid ? transports[sid] : undefined;
 				if (!transport) {
 					res.writeHead(400).end('missing or unknown session');
@@ -323,7 +335,7 @@ export function startMcpServer() {
 				res.writeHead(405).end('method not allowed');
 			}
 		} catch (err) {
-			if (!res.headersSent) res.writeHead(500).end('mcp error: ' + err);
+			if (!res.headersSent) res.writeHead(500).end('mcp error: ' + String(err));
 		}
 	});
 

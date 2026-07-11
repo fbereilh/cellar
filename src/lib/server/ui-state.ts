@@ -20,28 +20,30 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { workspaceRoot } from '$lib/server/fstree.js';
+import { workspaceRoot } from '$lib/server/fstree';
 
 const WRITE_DEBOUNCE_MS = 250;
 
-/** @type {Record<string, unknown> | null} */
-let cache = null;
-/** @type {ReturnType<typeof setTimeout> | null} */
-let writeTimer = null;
+/** The flat preference map persisted to `.cellar/ui-state.json`. */
+export type UiState = Record<string, unknown>;
+
+let cache: UiState | null = null;
+let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let dirty = false;
 let exitHookInstalled = false;
 
-function storePath() {
+function storePath(): string {
 	return join(workspaceRoot(), '.cellar', 'ui-state.json');
 }
 
 /** Load the store from disk once; a missing / unparseable file is an empty store. */
-function ensureLoaded() {
+function ensureLoaded(): UiState {
 	if (cache !== null) return cache;
 	try {
 		const p = storePath();
-		const parsed = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {};
-		cache = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+		// Dynamic boundary: our own on-disk JSON.
+		const parsed: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {};
+		cache = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as UiState) : {};
 	} catch {
 		cache = {};
 	}
@@ -49,7 +51,7 @@ function ensureLoaded() {
 }
 
 /** The whole preference map (a copy, so callers can't mutate the cache). */
-export function getUiState() {
+export function getUiState(): UiState {
 	return { ...ensureLoaded() };
 }
 
@@ -57,7 +59,7 @@ export function getUiState() {
  * Shallow-merge `patch` (a flat key→value map) into the store. A `null` value
  * deletes the key. Returns the updated map. Disk write is debounced.
  */
-export function setUiState(patch) {
+export function setUiState(patch: UiState | null | undefined): UiState {
 	const store = ensureLoaded();
 	if (patch && typeof patch === 'object' && !Array.isArray(patch)) {
 		for (const [key, value] of Object.entries(patch)) {
@@ -69,7 +71,7 @@ export function setUiState(patch) {
 	return { ...store };
 }
 
-function scheduleWrite() {
+function scheduleWrite(): void {
 	dirty = true;
 	installExitHook();
 	if (writeTimer) return;
@@ -78,7 +80,7 @@ function scheduleWrite() {
 	if (typeof writeTimer.unref === 'function') writeTimer.unref();
 }
 
-function flush() {
+function flush(): void {
 	if (writeTimer) {
 		clearTimeout(writeTimer);
 		writeTimer = null;
@@ -94,7 +96,7 @@ function flush() {
 
 // The unref'd debounce timer won't fire if the process exits inside its window;
 // flush synchronously on exit so a just-changed preference is never dropped.
-function installExitHook() {
+function installExitHook(): void {
 	if (exitHookInstalled) return;
 	exitHookInstalled = true;
 	process.once('exit', flush);

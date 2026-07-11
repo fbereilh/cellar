@@ -1,6 +1,6 @@
 import { json, error } from '@sveltejs/kit';
-import { gitHeadFile } from '$lib/server/git.js';
-import { deserialize } from '$lib/server/ipynb.js';
+import { gitHeadFile } from '$lib/server/git';
+import { deserialize } from '$lib/server/ipynb';
 
 /**
  * A file's git-HEAD baseline, for the client-side change decorations.

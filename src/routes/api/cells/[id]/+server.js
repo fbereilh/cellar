@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { setSource, setCellType, deleteCell, setOutputScrolled } from '$lib/server/notebook.js';
+import { setSource, setCellType, deleteCell, setOutputScrolled } from '$lib/server/notebook';
 
 /** Edit a cell's source, type ('code' | 'markdown'), and/or its output-scroll
  *  choice in notebook `nb` (body field; workspace-relative path, defaults to

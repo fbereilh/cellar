@@ -21,23 +21,37 @@
 import { join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { readNotebook, deserialize, writeNotebook } from './ipynb.js';
-import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext.js';
-import { publish } from './events.js';
-import { cancelRun } from './run-queue.js';
+import { readNotebook, deserialize, writeNotebook } from './ipynb';
+import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
+import { publish } from './events';
+import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole.js';
 import { SQL_LANGUAGE } from '../cellLanguage.js';
+import type {
+	Cell,
+	CellView,
+	CellOutput,
+	CellMetadata,
+	CellarNamespace,
+	LogicalCellType,
+	LastRun,
+	NotebookDoc,
+	NotebookView
+} from './types';
+
+/** A freshly-minted cell always carries an initialized `cellar` namespace. */
+type CellWithCellar = Cell & { metadata: CellMetadata & { cellar: CellarNamespace } };
 
 const FILENAME = 'notebook.ipynb';
 
-const docs = new Map(); // absPath -> { path, cells, metadata }
-let activePath = null; // absolute path of the notebook agent tools default to
+const docs = new Map<string, NotebookDoc>(); // absPath -> { path, cells, metadata }
+let activePath: string | null = null; // absolute path of the notebook agent tools default to
 
-function workspace() {
+function workspace(): string {
 	return process.env.CELLAR_WORKSPACE || process.cwd();
 }
 
-function canonicalPath() {
+function canonicalPath(): string {
 	return join(workspace(), FILENAME);
 }
 
@@ -47,7 +61,7 @@ function canonicalPath() {
  * Relative paths resolve against the workspace root; the result must stay
  * within the workspace (mirrors the fs-route path guard).
  */
-function resolveAbs(nb) {
+function resolveAbs(nb?: string | null): string {
 	if (!nb) return activePath || canonicalPath();
 	const abs = isAbsolute(nb) ? resolve(nb) : resolve(workspace(), nb);
 	const rel = relative(workspace(), abs);
@@ -62,13 +76,13 @@ function resolveAbs(nb) {
  * Mint a fresh, unique cell id. UUIDs satisfy the nbformat id pattern
  * (`^[a-zA-Z0-9-_]+$`, ≤64 chars); Cellar still owns generation + uniqueness.
  */
-function mintId() {
+function mintId(): string {
 	return randomUUID();
 }
 
 /** Ensure every cell has a unique id; re-key missing/duplicate ones. */
-function enforceUniqueIds(cells) {
-	const seen = new Set();
+function enforceUniqueIds(cells: Cell[]): void {
+	const seen = new Set<string>();
 	for (const c of cells) {
 		if (!c.id || seen.has(c.id)) {
 			c.id = mintId();
@@ -77,7 +91,7 @@ function enforceUniqueIds(cells) {
 	}
 }
 
-function starterCell() {
+function starterCell(): Cell {
 	return {
 		id: mintId(),
 		cell_type: 'code',
@@ -89,7 +103,7 @@ function starterCell() {
 	};
 }
 
-function newCell(cellType = 'code', source = '') {
+function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCellar {
 	// 'sql' is a LOGICAL type: an nbformat `code` cell tagged cellar.language='sql'
 	// (see $lib/cellLanguage.js). markdown/code map to their nbformat cell_type.
 	const isSql = cellType === 'sql';
@@ -109,7 +123,7 @@ function newCell(cellType = 'code', source = '') {
  * whose `.py` format could not be determined on load (`jpFormat` unset) is never
  * silently rewritten as `.ipynb`.
  */
-function persist(doc) {
+function persist(doc: NotebookDoc): void {
 	if (doc.jpFormat) writePyNotebook(doc.path, doc.cells, doc.jpFormat);
 	else writeNotebook(doc.path, doc);
 }
@@ -126,7 +140,7 @@ function persist(doc) {
  * but that in-memory doc is not written until the user actually creates it or
  * mutates a cell. An arbitrary opened `.ipynb` must already exist on disk.
  */
-function loadDoc(abs) {
+function loadDoc(abs: string): NotebookDoc {
 	let doc = docs.get(abs);
 	if (doc) return doc;
 	if (isPyPath(abs)) {
@@ -155,14 +169,14 @@ function loadDoc(abs) {
 }
 
 /** The document a request targets: explicit `nb` path, else the active one. */
-function docFor(nb) {
+function docFor(nb?: string | null): NotebookDoc {
 	const abs = resolveAbs(nb);
 	const doc = loadDoc(abs);
 	if (!activePath) activePath = abs; // first-ever load seeds the active pointer
 	return doc;
 }
 
-const cellView = (c) => ({ id: c.id, cell_type: c.cell_type, source: c.source, outputs: c.outputs, metadata: c.metadata ?? {} });
+const cellView = (c: Cell): CellView => ({ id: c.id, cell_type: c.cell_type, source: c.source, outputs: c.outputs ?? [], metadata: c.metadata ?? {} });
 
 /**
  * Broadcast a structural document change over the event bus so every open tab
@@ -177,12 +191,12 @@ const cellView = (c) => ({ id: c.id, cell_type: c.cell_type, source: c.source, o
  * so a user's own structural action never double-applies. Agent (MCP) calls
  * pass no `originId`, so every tab renders them.
  */
-function emit(doc, type, extra, originId) {
+function emit(doc: NotebookDoc, type: string, extra: Record<string, unknown>, originId?: string | null): void {
 	publish({ type, nb: doc.path, ...extra, originId });
 }
 
 /** Serializable view of a notebook for the browser. */
-export function getNotebook(nb) {
+export function getNotebook(nb?: string | null): NotebookView {
 	const doc = docFor(nb);
 	return {
 		workspace: workspace(),
@@ -196,7 +210,7 @@ export function getNotebook(nb) {
  * regardless of the current active pointer. SSR seeds the shell (notebook tab,
  * path/name) from this, so it must never follow `activePath`.
  */
-export function getDefaultNotebook() {
+export function getDefaultNotebook(): NotebookView {
 	return getNotebook(canonicalPath());
 }
 
@@ -205,7 +219,7 @@ export function getDefaultNotebook() {
  * if needed) and return its view. The UI calls this when a notebook tab is
  * focused so the MCP interface follows the human's attention.
  */
-export function setActiveNotebook(nb) {
+export function setActiveNotebook(nb?: string | null): NotebookView {
 	const abs = resolveAbs(nb);
 	loadDoc(abs);
 	activePath = abs;
@@ -213,7 +227,7 @@ export function setActiveNotebook(nb) {
 }
 
 /** Absolute path of the active notebook (defaults to the workspace notebook). */
-export function getActiveNotebookPath() {
+export function getActiveNotebookPath(): string {
 	return activePath || canonicalPath();
 }
 
@@ -222,7 +236,7 @@ export function getActiveNotebookPath() {
  * already-open shell surfaces/focuses it in a tab with no reload. Shared by
  * `createNotebook` and `openNotebook` so both take the exact same UI path.
  */
-function activateAndBroadcast(abs, originId) {
+function activateAndBroadcast(abs: string, originId?: string | null): NotebookView {
 	activePath = abs;
 	publish({
 		type: 'notebook:opened',
@@ -235,7 +249,7 @@ function activateAndBroadcast(abs, originId) {
 }
 
 /** True if `nb` resolves to a live doc or an on-disk `.ipynb` in the workspace. */
-export function notebookExists(nb) {
+export function notebookExists(nb?: string | null): boolean {
 	const abs = resolveAbs(nb);
 	return docs.has(abs) || existsSync(abs);
 }
@@ -252,7 +266,7 @@ export function notebookExists(nb) {
  * the file on disk — including the default notebook, which may exist only in
  * memory from a bare load (loadDoc no longer persists on open).
  */
-export function createNotebook(nb, originId) {
+export function createNotebook(nb: string, originId?: string | null): NotebookView {
 	const abs = resolveAbs(nb);
 	let doc = docs.get(abs);
 	if (!doc) {
@@ -276,7 +290,7 @@ export function createNotebook(nb, originId) {
  * workspace-relative `.ipynb` path. Throws `notebook not found` when no live
  * doc and no on-disk file exist — opening never creates (use `createNotebook`).
  */
-export function openNotebook(nb, originId) {
+export function openNotebook(nb: string, originId?: string | null): NotebookView {
 	const abs = resolveAbs(nb);
 	if (!docs.has(abs) && !existsSync(abs)) {
 		throw new Error('notebook not found: ' + relative(workspace(), abs));
@@ -293,7 +307,7 @@ export function openNotebook(nb, originId) {
  * reset to null, so it falls back to the default notebook. A no-op when no live
  * doc matches (non-notebook files, closed notebooks).
  */
-export function dropDocs(nb) {
+export function dropDocs(nb: string): void {
 	const abs = resolveAbs(nb);
 	const prefix = abs + sep;
 	for (const key of [...docs.keys()]) {
@@ -310,17 +324,18 @@ export function dropDocs(nb) {
  * path isn't recreated on the next persist. Updates the active pointer when it
  * referenced a rekeyed doc. A no-op when no live doc matches.
  */
-export function rekeyDocs(fromNb, toNb) {
+export function rekeyDocs(fromNb: string, toNb: string): void {
 	const fromAbs = resolveAbs(fromNb);
 	const toAbs = resolveAbs(toNb);
 	if (fromAbs === toAbs) return;
 	const prefix = fromAbs + sep;
 	for (const key of [...docs.keys()]) {
-		let newKey = null;
+		let newKey: string | null = null;
 		if (key === fromAbs) newKey = toAbs;
 		else if (key.startsWith(prefix)) newKey = toAbs + key.slice(fromAbs.length);
 		if (newKey == null) continue;
 		const doc = docs.get(key);
+		if (!doc) continue;
 		docs.delete(key);
 		doc.path = newKey;
 		docs.set(newKey, doc);
@@ -334,7 +349,7 @@ export function rekeyDocs(fromNb, toNb) {
  * `docs` Map uses and that `getNotebook().path` reports. Callers publishing live
  * events use this so the `nb` tag matches the id the browser filters on.
  */
-export function resolveNotebookPath(nb) {
+export function resolveNotebookPath(nb?: string | null): string {
 	return resolveAbs(nb);
 }
 
@@ -343,18 +358,18 @@ export function resolveNotebookPath(nb) {
  * uses to address tabs (e.g. the default notebook is `notebook.ipynb`). Inverse
  * of `resolveAbs` for the common in-workspace case.
  */
-export function workspaceRelative(abs) {
+export function workspaceRelative(abs: string): string {
 	return relative(workspace(), abs);
 }
 
-function find(doc, id) {
+function find(doc: NotebookDoc, id: string): Cell | undefined {
 	return doc.cells.find((c) => c.id === id);
 }
 
 // --- richer read/write surface (used by the MCP agent interface) -----------
 
 /** Full cell views including metadata, in document order. */
-export function listCells(nb) {
+export function listCells(nb?: string | null): CellView[] {
 	const doc = docFor(nb);
 	return doc.cells.map((c) => ({
 		id: c.id,
@@ -366,7 +381,7 @@ export function listCells(nb) {
 }
 
 /** A single full cell view (or null). */
-export function getCell(id, nb) {
+export function getCell(id: string, nb?: string | null): CellView | null {
 	const doc = docFor(nb);
 	const c = find(doc, id);
 	if (!c) return null;
@@ -374,7 +389,7 @@ export function getCell(id, nb) {
 }
 
 /** Set the agent-visibility flag in the allowlisted `cellar` namespace. */
-export function setVisibility(id, hidden, nb) {
+export function setVisibility(id: string, hidden: boolean, nb?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return false;
@@ -390,7 +405,7 @@ export function setVisibility(id, hidden, nb) {
  * namespace so it round-trips through clean-on-save. `null`/`undefined` clears
  * the explicit choice (falls back to the UI's auto height heuristic).
  */
-export function setOutputScrolled(id, scrolled, nb) {
+export function setOutputScrolled(id: string, scrolled: boolean | null | undefined, nb?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return false;
@@ -424,7 +439,7 @@ export function setOutputScrolled(id, scrolled, nb) {
  * restart; a kernel restart leaves it in place but bumps the epoch, so the stamp
  * then correctly reads as "did not run this session".
  */
-export function setLastRun(id, lastRun, nb) {
+export function setLastRun(id: string, lastRun: LastRun, nb?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return false;
@@ -435,7 +450,7 @@ export function setLastRun(id, lastRun, nb) {
 }
 
 /** The notebook's designated imports cell, or null. */
-export function getImportsCell(nb) {
+export function getImportsCell(nb?: string | null): CellView | null {
 	const doc = docFor(nb);
 	const cell = doc.cells.find(isImportsCell);
 	return cell ? cellView(cell) : null;
@@ -446,7 +461,7 @@ export function getImportsCell(nb) {
  * allowlisted `cellar` namespace so it round-trips through clean-on-save. Only
  * one cell may hold the role, so designating a cell strips it from any other.
  */
-export function setCellRole(id, role, nb, originId) {
+export function setCellRole(id: string, role: string | null, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return false;
@@ -471,7 +486,14 @@ export function setCellRole(id, role, nb, originId) {
  * occupy. The `cell:added` event therefore carries an explicit `index` so the
  * browser inserts where the server did rather than appending.
  */
-export function addCellAt(index, cellType = 'code', nb, originId, source = '', role) {
+export function addCellAt(
+	index: number,
+	cellType: LogicalCellType = 'code',
+	nb?: string | null,
+	originId?: string | null,
+	source = '',
+	role?: string | null
+): Cell {
 	const doc = docFor(nb);
 	const cell = newCell(cellType, source);
 	if (role) cell.metadata.cellar.role = role;
@@ -490,7 +512,7 @@ export function addCellAt(index, cellType = 'code', nb, originId, source = '', r
  * inserted above it (`clampMoveIndex`). The browser applies the identical rule
  * optimistically, so the two never disagree about where a dragged cell landed.
  */
-export function moveCellTo(id, index, nb, originId) {
+export function moveCellTo(id: string, index: number, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
 	const from = doc.cells.findIndex((c) => c.id === id);
 	if (from < 0) return false;
@@ -510,7 +532,13 @@ export function moveCellTo(id, index, nb, originId) {
  * persist and ONE `cell:added` event carrying the real text - rather than an
  * empty cell that a follow-up edit fills in.
  */
-export function addCell(afterId, cellType = 'code', nb, originId, source = '') {
+export function addCell(
+	afterId: string | null | undefined,
+	cellType: LogicalCellType = 'code',
+	nb?: string | null,
+	originId?: string | null,
+	source = ''
+): Cell {
 	const doc = docFor(nb);
 	const cell = newCell(cellType, source);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
@@ -534,7 +562,7 @@ export function addCell(afterId, cellType = 'code', nb, originId, source = '') {
  * The `cell:type` event carries the new `language` so live sync updates the
  * editor's syntax highlighting (SQL ↔ Python) without a reload.
  */
-export function setCellType(id, cellType, nb, originId) {
+export function setCellType(id: string, cellType: LogicalCellType, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return;
@@ -553,7 +581,7 @@ export function setCellType(id, cellType, nb, originId) {
 	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: isSql ? SQL_LANGUAGE : null }, originId);
 }
 
-export function deleteCell(id, nb, originId) {
+export function deleteCell(id: string, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const existed = doc.cells.some((c) => c.id === id);
 	doc.cells = doc.cells.filter((c) => c.id !== id);
@@ -563,7 +591,7 @@ export function deleteCell(id, nb, originId) {
 	if (existed) emit(doc, 'cell:deleted', { cellId: id }, originId);
 }
 
-export function setSource(id, source, nb, originId) {
+export function setSource(id: string, source: string, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell && cell.source !== source) {
@@ -580,7 +608,7 @@ export function setSource(id, source, nb, originId) {
 	}
 }
 
-export function setOutputs(id, outputs, nb) {
+export function setOutputs(id: string, outputs: CellOutput[], nb?: string | null): void {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell) {
@@ -601,12 +629,12 @@ export function setOutputs(id, outputs, nb) {
  * is untouched (persist happens once, at run:end via `setOutputs`), so there is no
  * transient empty-output `.ipynb` write.
  */
-export function clearOutputsLive(id, nb) {
+export function clearOutputsLive(id: string, nb?: string | null): void {
 	const cell = find(docFor(nb), id);
 	if (cell) cell.outputs = [];
 }
 
-export function clearOutputs(id, nb, originId) {
+export function clearOutputs(id: string, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell) {
@@ -625,11 +653,15 @@ export function clearOutputs(id, nb, originId) {
  * path (`checkpoints.js`); `clean.js` strips runtime metadata on persist, so a
  * restore leaves the `.ipynb` git-clean.
  */
-export function replaceCells(nb, cells, originId) {
+export function replaceCells(
+	nb: string | null | undefined,
+	cells: ReadonlyArray<Partial<Cell>>,
+	originId?: string | null
+): NotebookView {
 	const doc = docFor(nb);
-	const cloned = (Array.isArray(cells) ? cells : []).map((c) => ({
-		id: c.id,
-		cell_type: c.cell_type === 'markdown' ? 'markdown' : 'code',
+	const cloned: Cell[] = (Array.isArray(cells) ? cells : []).map((c) => ({
+		id: c.id ?? '',
+		cell_type: (c.cell_type === 'markdown' ? 'markdown' : 'code') as Cell['cell_type'],
 		source: typeof c.source === 'string' ? c.source : '',
 		outputs: Array.isArray(c.outputs) ? structuredClone(c.outputs) : [],
 		metadata: c.metadata ? structuredClone(c.metadata) : {}
@@ -645,7 +677,7 @@ export function replaceCells(nb, cells, originId) {
 }
 
 /** Swap a cell with its neighbour. Honors the imports cell's pin (`clampMoveIndex`). */
-export function moveCell(id, dir, nb, originId) {
+export function moveCell(id: string, dir: 'up' | 'down', nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const i = doc.cells.findIndex((c) => c.id === id);
 	if (i < 0) return;

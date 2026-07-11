@@ -8,16 +8,17 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { cleanNotebook, stripRuntimeMeta } from './clean.js';
+import { cleanNotebook, stripRuntimeMeta } from './clean';
+import type { Cell, NotebookDoc, NotebookMetadata, NbNotebook } from './types';
 
 const NBFORMAT = 4;
 const NBFORMAT_MINOR = 5;
 
 /** Split a source string into nbformat multiline form (lines keep their \n). */
-function toLines(src) {
+function toLines(src: string): string[] {
 	if (!src) return [];
 	const parts = src.split('\n');
-	const lines = [];
+	const lines: string[] = [];
 	for (let i = 0; i < parts.length; i++) {
 		if (i < parts.length - 1) lines.push(parts[i] + '\n');
 		else if (parts[i] !== '') lines.push(parts[i]);
@@ -26,22 +27,31 @@ function toLines(src) {
 }
 
 /** Join nbformat multiline (string | string[]) back into a single string. */
-function fromLines(src) {
+function fromLines(src: string | string[] | undefined | null): string {
 	return Array.isArray(src) ? src.join('') : (src ?? '');
 }
 
 /** Default kernelspec for a fresh notebook. */
-function defaultMetadata() {
+function defaultMetadata(): NotebookMetadata {
 	return { kernelspec: { name: 'python3', display_name: 'python3', language: 'python' } };
 }
 
 /**
  * Build a cleaned nbformat notebook object from the canonical document.
- * @param {{cells: Array, metadata?: object}} doc
  */
-export function serialize(doc) {
+export function serialize(doc: { cells: Cell[]; metadata?: NotebookMetadata }): NbNotebook {
+	// nbformat cells built here carry optional outputs/execution_count that are
+	// deleted for markdown cells before cleaning.
+	type BuiltCell = {
+		cell_type: string;
+		id: string;
+		metadata: Record<string, unknown>;
+		source: string[];
+		outputs?: unknown[];
+		execution_count?: number | null;
+	};
 	const nb = {
-		cells: doc.cells.map((c) => ({
+		cells: doc.cells.map((c): BuiltCell => ({
 			cell_type: c.cell_type,
 			id: c.id,
 			metadata: c.metadata ?? {},
@@ -58,7 +68,7 @@ export function serialize(doc) {
 		nbformat: NBFORMAT,
 		nbformat_minor: NBFORMAT_MINOR
 	};
-	return cleanNotebook(nb);
+	return cleanNotebook(nb) as unknown as NbNotebook;
 }
 
 /**
@@ -69,29 +79,34 @@ export function serialize(doc) {
  * or an externally-authored `.ipynb` could claim a cell ran in the live kernel
  * session. Only an in-process run/edit may originate those stamps. See clean.js.
  */
-export function deserialize(nb) {
-	const cells = (nb.cells || []).map((c) => ({
-		id: c.id,
-		cell_type: c.cell_type || 'code',
+export function deserialize(nb: {
+	cells?: Array<{ id?: string; cell_type?: string; source?: string | string[]; outputs?: unknown; metadata?: import('./types').CellMetadata }>;
+	metadata?: NotebookMetadata;
+}): { cells: Cell[]; metadata: NotebookMetadata } {
+	const cells: Cell[] = (nb.cells || []).map((c) => ({
+		id: c.id ?? '',
+		// Pass the nbformat cell_type through unchanged (Cellar only authors
+		// code/markdown, but a foreign notebook's type must round-trip verbatim).
+		cell_type: (c.cell_type || 'code') as Cell['cell_type'],
 		source: fromLines(c.source),
-		outputs: c.outputs ?? [],
+		outputs: (c.outputs as Cell['outputs']) ?? [],
 		metadata: stripRuntimeMeta(c.metadata)
 	}));
 	return { cells, metadata: nb.metadata ?? defaultMetadata() };
 }
 
 /** Deterministic JSON text for an nbformat object (1-space indent, trailing \n). */
-export function stringify(nb) {
+export function stringify(nb: unknown): string {
 	return JSON.stringify(nb, null, 1) + '\n';
 }
 
-export function readNotebook(path) {
+export function readNotebook(path: string): NbNotebook | null {
 	if (!existsSync(path)) return null;
-	return JSON.parse(readFileSync(path, 'utf8'));
+	return JSON.parse(readFileSync(path, 'utf8')) as NbNotebook;
 }
 
 /** Clean, serialize deterministically, and write to disk. */
-export function writeNotebook(path, doc) {
+export function writeNotebook(path: string, doc: NotebookDoc): void {
 	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, stringify(serialize(doc)));
 }

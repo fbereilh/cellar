@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { buildTree } from '$lib/server/fstree.js';
+import { buildTree } from '$lib/server/fstree';
 
 /** List the workspace folder tree for the sidebar file tree. */
 export function GET() {

@@ -20,17 +20,29 @@ import {
 	writeKernelspec
 } from './venv.js';
 
-function workspace() {
+function workspace(): string {
 	return process.env.CELLAR_WORKSPACE || process.cwd();
 }
 
 /** The interpreter currently bound (tracked in-process; seeded from env). */
-function currentPython() {
+function currentPython(): string {
 	return process.env.CELLAR_PROJECT_VENV || '';
 }
 
+/** Reported by {@link getVenvInfo} for the Settings UI. */
+export interface VenvInfo {
+	python: string;
+	venvDir: string;
+	workspace: string;
+	defaultVenv: string;
+	valid: boolean;
+	hasIpykernel: boolean;
+	uvAvailable: boolean;
+	kernelspecDir: string | null;
+}
+
 /** Report the current binding for the Settings UI. */
-export async function getVenvInfo() {
+export async function getVenvInfo(): Promise<VenvInfo> {
 	const python = currentPython();
 	return {
 		python,
@@ -44,15 +56,24 @@ export async function getVenvInfo() {
 	};
 }
 
+/** Options accepted by {@link bindVenv}: venv dir; `create` uses `uv venv` when it does not already exist. */
+export interface BindVenvOptions {
+	path: string;
+	create?: boolean;
+}
+
+/** Result of {@link bindVenv}. */
+export interface BindVenvResult {
+	python: string;
+	created: boolean;
+	installedIpykernel: boolean;
+}
+
 /**
  * Bind the kernel to a venv, optionally creating it. Rewrites the kernelspec
  * and updates in-process state; the route then calls `rebindKernel()`.
- *
- * @param {{path:string, create?:boolean}} opts - venv dir; `create` uses `uv
- *   venv` when it does not already exist.
- * @returns {Promise<{python:string, created:boolean, installedIpykernel:boolean}>}
  */
-export async function bindVenv({ path, create = false } = {}) {
+export async function bindVenv({ path, create = false }: BindVenvOptions): Promise<BindVenvResult> {
 	if (!path || typeof path !== 'string') throw new Error('a venv path is required');
 	if (!(await hasUv())) throw new Error('uv is not available on PATH; cannot create or bind venvs');
 

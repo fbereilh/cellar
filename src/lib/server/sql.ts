@@ -34,6 +34,14 @@ export const SQL_RESULT_VAR = '_sql_df';
 const NO_SPARK_MESSAGE =
 	'No Spark session is connected. Open the Databricks panel in the Cellar sidebar and connect a cluster to run SQL cells.';
 
+/** Options for `sqlToPython`. */
+export interface SqlToPythonOptions {
+	/** Rows fetched for display; defaults to SQL_ROW_CAP. */
+	rowCap?: number;
+	/** Kernel variable the result's Spark DataFrame is bound to; defaults to SQL_RESULT_VAR. */
+	resultVar?: string;
+}
+
 /**
  * Compile a SQL cell's source into the Python that executes it. Returns '' for an
  * empty cell (nothing to run, no error). The generated code:
@@ -42,7 +50,10 @@ const NO_SPARK_MESSAGE =
  *   3. leaves `_sql_df.limit(N).toPandas()` as the trailing expression, so the
  *      grid renders it.
  */
-export function sqlToPython(sqlSource, { rowCap = SQL_ROW_CAP, resultVar = SQL_RESULT_VAR } = {}) {
+export function sqlToPython(
+	sqlSource: string | null | undefined,
+	{ rowCap = SQL_ROW_CAP, resultVar = SQL_RESULT_VAR }: SqlToPythonOptions = {}
+): string {
 	// Strip a single trailing statement terminator + surrounding whitespace:
 	// `spark.sql` executes ONE statement and rejects a trailing `;`.
 	const query = String(sqlSource ?? '')

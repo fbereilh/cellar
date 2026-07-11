@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { getUiState, setUiState } from '$lib/server/ui-state.js';
+import { getUiState, setUiState } from '$lib/server/ui-state';
 
 /** The whole per-project UI-preference map (see `$lib/server/ui-state.js`). */
 export function GET() {

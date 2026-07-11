@@ -15,22 +15,23 @@
  * and refetches that notebook on a detected gap (the correctness backstop).
  */
 import { EventEmitter } from 'node:events';
+import type { CellarEvent, PublishedEvent, GlobalEvent, DispatchedEvent } from './types';
 
 const emitter = new EventEmitter();
 // One listener per open SSE stream; a browser may hold several tabs open.
 emitter.setMaxListeners(0);
 
-const seqs = new Map(); // canonical notebook id (absolute path) -> last seq
+const seqs = new Map<string, number>(); // canonical notebook id (absolute path) -> last seq
 
 /**
  * Publish an event to every open stream. Stamps a per-notebook monotonic `seq`
  * and returns the enriched event (with `seq`) for callers that want it.
  */
-export function publish(event) {
+export function publish(event: CellarEvent): PublishedEvent {
 	const nb = event.nb;
 	const seq = (seqs.get(nb) ?? 0) + 1;
 	seqs.set(nb, seq);
-	const full = { ...event, seq };
+	const full: PublishedEvent = { ...event, seq };
 	emitter.emit('event', full);
 	return full;
 }
@@ -42,14 +43,16 @@ export function publish(event) {
  * by the next rather than needing gap detection. The client dispatches these
  * before its per-notebook `nb`/`seq` filter.
  */
-export function publishGlobal(event) {
-	const full = { ...event, global: true };
+export function publishGlobal<T extends Record<string, unknown>>(
+	event: T
+): T & { global: true } {
+	const full = { ...event, global: true as const };
 	emitter.emit('event', full);
 	return full;
 }
 
 /** Subscribe to all events; returns an unsubscribe function. */
-export function subscribe(listener) {
+export function subscribe(listener: (event: DispatchedEvent) => void): () => void {
 	emitter.on('event', listener);
 	return () => emitter.off('event', listener);
 }

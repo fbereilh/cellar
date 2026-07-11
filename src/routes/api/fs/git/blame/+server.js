@@ -1,5 +1,5 @@
 import { json, error } from '@sveltejs/kit';
-import { gitBlameFile } from '$lib/server/git.js';
+import { gitBlameFile } from '$lib/server/git';
 
 /**
  * Per-line git blame for one workspace file, cached client-side per file version

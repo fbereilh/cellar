@@ -66,10 +66,107 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { execute, currentSessionId } from './kernel.js';
-import { publishGlobal } from './events.js';
-import { logInfo, logWarn, logError } from './logs.js';
+import { execute, currentSessionId } from './kernel';
+import { publishGlobal } from './events';
+import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
+import type { RunStreamEvent, SessionId } from './types';
+
+// --- domain types ----------------------------------------------------------
+
+/** A UI selection resolving to auth: a `~/.databrickscfg` profile OR a typed host. */
+interface Selection {
+	profile?: string | null;
+	host?: string | null;
+}
+
+/**
+ * The resolved auth descriptor both the listing subprocess and the kernel
+ * session build a `Config` from - PAT (a profile with a token) or external-
+ * browser OAuth against a host.
+ */
+type Auth = { mode: 'pat'; profile: string; host: string } | { mode: 'oauth'; host: string };
+
+/** A profile parsed out of `~/.databrickscfg` (token value never exposed). */
+interface Profile {
+	name: string;
+	host: string;
+	hasToken: boolean;
+	authType: string | null;
+}
+
+/** The command handed to one `PROBE` subprocess run via `argv[1]`. */
+interface ProbeRequest {
+	op: string;
+	auth?: Auth;
+	catalog?: string;
+	schema?: string;
+}
+
+/**
+ * The one genuinely dynamic boundary: the single JSON line the PROBE subprocess
+ * (and the kernel bootstrap) always print. Success carries op-specific fields
+ * (narrowed at each use site); failure is the fixed `{code, message}` contract.
+ */
+type ProbeOk = { ok: true } & Record<string, unknown>;
+type ProbeFail = { ok: false; code: string; message: string };
+type ProbeResult = ProbeOk | ProbeFail;
+
+// Op-specific views of a `ProbeOk` payload, applied with a single `as` where the
+// shape is known (the fields the python side prints for that op).
+interface CheckPayload {
+	sdk?: boolean;
+	connect?: boolean;
+	sdk_version?: string | null;
+	connect_version?: string | null;
+}
+interface LoginPayload {
+	host?: string;
+	user?: string | null;
+}
+interface ConnectPayload {
+	host?: string;
+	spark_version?: string | null;
+}
+interface ClusterRow {
+	cluster_id: string;
+	name: string;
+	state: string;
+	spark_version: string | null;
+	node_type: string | null;
+}
+interface CatalogRow {
+	name: string;
+	comment: string | null;
+}
+type SchemaRow = CatalogRow;
+interface TableRow {
+	name: string;
+	full_name: string;
+	table_type: string | null;
+	format: string | null;
+}
+
+/** The kernel epoch a live connection's `spark` was built in. */
+interface ConnectionInfo {
+	profile: string | null;
+	clusterId: string;
+	clusterName: string;
+	host: string | null;
+	sparkVersion: string | null;
+	session: SessionId | null;
+}
+
+/** What a kernel restart took from us, kept so the UI can explain the loss. */
+interface LostConnection {
+	profile: string | null;
+	clusterName: string;
+}
+
+/** The connection as a reader sees it: reconciled against the current epoch. */
+type ConnectionStatus =
+	| { connected: false; lost?: LostConnection }
+	| ({ connected: true } & ConnectionInfo);
 
 /** Line prefix both the subprocess and the kernel bootstrap print their JSON result on. */
 const SENTINEL = '__CELLAR_DBX__';
@@ -87,7 +184,7 @@ const LOGIN_TIMEOUT_MS = 300_000;
 
 /** Env vars the boilerplate clears. `DATABRICKS_CONFIG_FILE` is deliberately kept. */
 const KEEP_ENV = new Set(['DATABRICKS_CONFIG_FILE']);
-const isStaleEnv = (k) =>
+const isStaleEnv = (k: string): boolean =>
 	(k.startsWith('DATABRICKS_') || k.startsWith('SPARK_CONNECT_')) && !KEEP_ENV.has(k);
 
 /** A profile name as `~/.databrickscfg` and the SDK accept it. */
@@ -99,7 +196,7 @@ const CLUSTER_RE = /^[A-Za-z0-9-]+$/;
 /** A Unity Catalog identifier part. */
 const UC_NAME_RE = /^[A-Za-z0-9_$-]+$/;
 
-function workspace() {
+function workspace(): string {
 	return process.env.CELLAR_WORKSPACE || process.cwd();
 }
 
@@ -109,7 +206,7 @@ function workspace() {
  * exactly what our listing calls should import, or the two would disagree about
  * whether the feature is installed at all.
  */
-export function projectPython() {
+export function projectPython(): string | null {
 	const bound = process.env.CELLAR_PROJECT_VENV;
 	if (bound && existsSync(bound)) return bound;
 	// `vite dev` without the launcher: fall back to the conventional project venv.
@@ -118,7 +215,7 @@ export function projectPython() {
 }
 
 /** Where the SDK reads profiles from (`DATABRICKS_CONFIG_FILE` wins, as in the SDK). */
-export function configPath() {
+export function configPath(): string {
 	return process.env.DATABRICKS_CONFIG_FILE || join(homedir(), '.databrickscfg');
 }
 
@@ -140,17 +237,27 @@ export function configPath() {
  * one that needs the interactive OAuth sign-in. The token *value* is never
  * exposed - only whether one is present.
  */
-export function readProfiles() {
+export function readProfiles(): {
+	configPath: string;
+	exists: boolean;
+	profiles: Profile[];
+	error?: string;
+} {
 	const path = configPath();
 	if (!existsSync(path)) return { configPath: path, exists: false, profiles: [] };
-	let text;
+	let text: string;
 	try {
 		text = readFileSync(path, 'utf8');
 	} catch (err) {
-		return { configPath: path, exists: true, error: String(err?.message ?? err), profiles: [] };
+		return {
+			configPath: path,
+			exists: true,
+			error: err instanceof Error ? err.message : String(err),
+			profiles: []
+		};
 	}
-	const sections = [];
-	let current = null;
+	const sections: Profile[] = [];
+	let current: Profile | null = null;
 	for (const raw of text.split(/\r?\n/)) {
 		const line = raw.trim();
 		if (!line || line.startsWith('#') || line.startsWith(';')) continue;
@@ -175,7 +282,7 @@ export function readProfiles() {
 }
 
 /** Normalize a user-typed workspace host: trim, drop a trailing slash, force https. */
-function normalizeHost(host) {
+function normalizeHost(host?: string | null): string {
 	let h = String(host ?? '').trim().replace(/\/+$/, '');
 	if (!h) return '';
 	if (!/^https?:\/\//i.test(h)) h = `https://${h}`;
@@ -193,7 +300,7 @@ function normalizeHost(host) {
  * the ubiquitous `auth_type = databricks-cli` profile just works via the SDK's
  * native U2M flow - no CLI, no pre-cached login.
  */
-export function resolveAuth({ profile, host } = {}) {
+export function resolveAuth({ profile, host }: Selection = {}): Auth {
 	if (profile) {
 		assertMatches(profile, PROFILE_RE, 'profile');
 		const found = readProfiles().profiles.find((p) => p.name === profile);
@@ -216,7 +323,7 @@ export function resolveAuth({ profile, host } = {}) {
  * `DATABRICKS_CONFIG_PROFILE` to set here - a leftover one would only override
  * the host/profile we just resolved, which is exactly what `isStaleEnv` clears.
  */
-function scrubEnv() {
+function scrubEnv(): NodeJS.ProcessEnv {
 	const env = { ...process.env };
 	for (const key of Object.keys(env)) if (isStaleEnv(key)) delete env[key];
 	return env;
@@ -433,7 +540,8 @@ sys.stdout.write('${SENTINEL}' + json.dumps(result) + '\\n')
 
 /** A structured failure both API routes and the UI understand. `code` drives the UI's copy. */
 export class DatabricksError extends Error {
-	constructor(code, message) {
+	code: string;
+	constructor(code: string, message: string) {
 		super(message);
 		this.name = 'DatabricksError';
 		this.code = code;
@@ -444,7 +552,7 @@ export class DatabricksError extends Error {
  * HTTP status for a `DatabricksError.code`. The UI keys its copy off `code`, not
  * the status, so this only has to be honest enough for the network tab.
  */
-export function statusFor(code) {
+export function statusFor(code: string): number {
 	switch (code) {
 		case 'bad_request':
 			return 400;
@@ -475,7 +583,7 @@ export function statusFor(code) {
 }
 
 /** No project interpreter bound at all - nothing can import the SDK. */
-function requirePython() {
+function requirePython(): string {
 	const python = projectPython();
 	if (!python) {
 		throw new DatabricksError(
@@ -487,9 +595,9 @@ function requirePython() {
 }
 
 /** Run one `PROBE` command in the project venv and return its parsed result. */
-function probe(request, timeoutMs = PROBE_TIMEOUT_MS) {
+function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS): Promise<ProbeResult> {
 	const python = requirePython();
-	return new Promise((resolve, reject) => {
+	return new Promise<ProbeResult>((resolve, reject) => {
 		const child = spawn(python, ['-c', PROBE, JSON.stringify(request)], {
 			env: scrubEnv(),
 			cwd: workspace(),
@@ -514,8 +622,9 @@ function probe(request, timeoutMs = PROBE_TIMEOUT_MS) {
 			);
 		}, timeoutMs);
 
-		child.stdout.on('data', (d) => (stdout += d));
-		child.stderr.on('data', (d) => (stderr += d));
+		// stdio is ['ignore','pipe','pipe'], so both streams exist at runtime.
+		child.stdout!.on('data', (d) => (stdout += d));
+		child.stderr!.on('data', (d) => (stderr += d));
 		child.on('error', (err) => {
 			clearTimeout(timer);
 			logError('databricks', `could not run probe (${request.op}): ${err.message}`);
@@ -549,7 +658,8 @@ function probe(request, timeoutMs = PROBE_TIMEOUT_MS) {
 				return;
 			}
 			try {
-				const result = JSON.parse(line.slice(SENTINEL.length));
+				// The one dynamic boundary: parse the sentinel JSON line into ProbeResult.
+				const result = JSON.parse(line.slice(SENTINEL.length)) as ProbeResult;
 				// The probe never raises; a failure comes back as {ok:false, code, message}.
 				// That message carries the REAL cause (`Exc: detail`) - record it so the
 				// user sees why the op failed, beyond the friendly sidebar text.
@@ -558,20 +668,28 @@ function probe(request, timeoutMs = PROBE_TIMEOUT_MS) {
 				}
 				resolve(result);
 			} catch (err) {
-				logError('databricks', `unparseable probe result (${request.op}): ${err.message}`);
-				reject(new DatabricksError('error', `unparseable probe result: ${err.message}`));
+				const msg = err instanceof Error ? err.message : String(err);
+				logError('databricks', `unparseable probe result (${request.op}): ${msg}`);
+				reject(new DatabricksError('error', `unparseable probe result: ${msg}`));
 			}
 		});
 	});
 }
 
 /** Throw a `DatabricksError` for a `{ok:false}` probe/kernel result; else return it. */
-function unwrap(result) {
+function unwrap(result: ProbeResult): ProbeOk {
 	if (result?.ok) return result;
 	throw new DatabricksError(result?.code || 'error', result?.message || 'Databricks call failed');
 }
 
-function assertMatches(value, re, label) {
+/**
+ * Assert the op-specific shape of a probe payload. Probe fields arrive as
+ * `unknown` (the JSON boundary), so this is the one place a shape is asserted
+ * onto them - the python side is what guarantees it per op.
+ */
+const payload = <T>(r: ProbeResult): T => r as unknown as T;
+
+function assertMatches(value: unknown, re: RegExp, label: string): string {
 	if (typeof value !== 'string' || !re.test(value)) {
 		throw new DatabricksError('bad_request', `invalid ${label}: ${JSON.stringify(value)}`);
 	}
@@ -593,7 +711,7 @@ function assertMatches(value, re, label) {
 const signedInHosts = new Set();
 
 /** Throw `oauth_login_required` if an OAuth selection has not signed in yet. */
-function assertSignedIn(auth) {
+function assertSignedIn(auth: Auth): void {
 	if (auth.mode === 'oauth' && !signedInHosts.has(auth.host)) {
 		throw new DatabricksError(
 			'oauth_login_required',
@@ -603,7 +721,7 @@ function assertSignedIn(auth) {
 }
 
 /** Resolve a `{profile}|{host}` selection to an auth descriptor and gate listing on sign-in. */
-function authForListing(sel) {
+function authForListing(sel: Selection): Auth {
 	const auth = resolveAuth(sel);
 	assertSignedIn(auth);
 	return auth;
@@ -615,34 +733,43 @@ function authForListing(sel) {
  * the config), so this is a no-op that just records the host. For OAuth it runs
  * the interactive `login` subprocess (opens the browser, caches the token).
  */
-export async function login(sel) {
+export async function login(sel: Selection) {
 	const auth = resolveAuth(sel);
 	if (auth.mode === 'pat') {
 		signedInHosts.add(auth.host);
 		return { ok: true, mode: 'pat', host: auth.host };
 	}
-	const result = unwrap(await probe({ op: 'login', auth }, LOGIN_TIMEOUT_MS));
+	const result = payload<LoginPayload>(unwrap(await probe({ op: 'login', auth }, LOGIN_TIMEOUT_MS)));
 	signedInHosts.add(auth.host);
 	return { ok: true, mode: 'oauth', host: result.host ?? auth.host, user: result.user ?? null };
 }
 
+/** Runtime install state of the Databricks packages in the project venv. */
+interface InstallStatus {
+	python: string | null;
+	sdk: boolean;
+	connect: boolean;
+	sdkVersion?: string | null;
+	connectVersion?: string | null;
+}
+
 /** Are `databricks-sdk` / `databricks-connect` importable by the kernel's interpreter? */
-export async function checkInstall() {
+export async function checkInstall(): Promise<InstallStatus> {
 	const python = projectPython();
 	if (!python) return { python: null, sdk: false, connect: false };
-	const result = await probe({ op: 'check' });
+	const result = payload<CheckPayload>(await probe({ op: 'check' }));
 	return { python, sdk: !!result.sdk, connect: !!result.connect, sdkVersion: result.sdk_version, connectVersion: result.connect_version };
 }
 
 /** Everything the sidebar needs to render before a connection exists. */
 export async function getStatus() {
 	const { configPath: path, exists, profiles, error } = readProfiles();
-	let install = { python: projectPython(), sdk: false, connect: false };
-	let installError = null;
+	let install: InstallStatus = { python: projectPython(), sdk: false, connect: false };
+	let installError: string | null = null;
 	try {
 		install = await checkInstall();
 	} catch (err) {
-		installError = err.message;
+		installError = err instanceof Error ? err.message : String(err);
 	}
 	return {
 		config: { path, exists, profiles, error: error ?? null },
@@ -654,27 +781,43 @@ export async function getStatus() {
 	};
 }
 
-export async function listClusters(sel) {
-	const auth = authForListing(sel);
-	return unwrap(await probe({ op: 'clusters', auth })).clusters;
+interface CatalogList {
+	ok: true;
+	catalogs: CatalogRow[];
+	truncated: boolean;
+}
+interface SchemaList {
+	ok: true;
+	schemas: SchemaRow[];
+	truncated: boolean;
+}
+interface TableList {
+	ok: true;
+	tables: TableRow[];
+	truncated: boolean;
 }
 
-export async function listCatalogs(sel) {
+export async function listClusters(sel: Selection): Promise<ClusterRow[]> {
 	const auth = authForListing(sel);
-	return unwrap(await probe({ op: 'catalogs', auth }));
+	return payload<{ clusters: ClusterRow[] }>(unwrap(await probe({ op: 'clusters', auth }))).clusters;
 }
 
-export async function listSchemas(sel, catalog) {
+export async function listCatalogs(sel: Selection): Promise<CatalogList> {
+	const auth = authForListing(sel);
+	return payload<CatalogList>(unwrap(await probe({ op: 'catalogs', auth })));
+}
+
+export async function listSchemas(sel: Selection, catalog: string): Promise<SchemaList> {
 	const auth = authForListing(sel);
 	assertMatches(catalog, UC_NAME_RE, 'catalog');
-	return unwrap(await probe({ op: 'schemas', auth, catalog }));
+	return payload<SchemaList>(unwrap(await probe({ op: 'schemas', auth, catalog })));
 }
 
-export async function listTables(sel, catalog, schema) {
+export async function listTables(sel: Selection, catalog: string, schema: string): Promise<TableList> {
 	const auth = authForListing(sel);
 	assertMatches(catalog, UC_NAME_RE, 'catalog');
 	assertMatches(schema, UC_NAME_RE, 'schema');
-	return unwrap(await probe({ op: 'tables', auth, catalog, schema }));
+	return payload<TableList>(unwrap(await probe({ op: 'tables', auth, catalog, schema })));
 }
 
 // ---------------------------------------------------------------------------
@@ -688,7 +831,7 @@ export async function listTables(sel, catalog, schema) {
  * host or profile name contains. The regex validation above is the real guard;
  * this is the belt to its braces.
  */
-const pyLiteral = (cfg) => JSON.stringify(JSON.stringify(cfg));
+const pyLiteral = (cfg: unknown): string => JSON.stringify(JSON.stringify(cfg));
 
 /**
  * The boilerplate, run once inside the kernel. Everything is underscore-prefixed
@@ -704,7 +847,7 @@ const pyLiteral = (cfg) => JSON.stringify(JSON.stringify(cfg));
  * An existing session is stopped first - `getOrCreate()` would otherwise hand
  * back the *old* cluster's session and silently ignore the cluster just picked.
  */
-const CONNECT_CODE = (cfg) => `
+const CONNECT_CODE = (cfg: { auth: Auth; cluster_id: string }): string => `
 import json as _cellar_json
 
 def _cellar_dbx_connect(_cfg):
@@ -798,14 +941,14 @@ finally:
  * session was actually built in, and `connectionStatus()` correctly reports it
  * as gone rather than pairing a fresh namespace with a `spark` it never got.
  */
-async function runInKernel(code) {
+async function runInKernel(code: string): Promise<{ result: ProbeResult; session: SessionId | null }> {
 	let stdout = '';
-	let kernelError = null;
-	let session = null;
+	let kernelError: string | null = null;
+	let session: SessionId | null = null;
 	try {
 		await execute(
 			code,
-			(ev) => {
+			(ev: RunStreamEvent) => {
 				if (ev.type === 'kernel') {
 					session = ev.session;
 				} else if (ev.type === 'output') {
@@ -824,15 +967,17 @@ async function runInKernel(code) {
 		// unreachable. That is a Cellar problem, not a Databricks one, and saying so
 		// is the difference between the user restarting Cellar and them re-checking a
 		// token that was never the issue.
-		logError('databricks', `kernel unreachable during Databricks op: ${err?.message ?? err}`);
-		throw new DatabricksError('kernel_unavailable', `the Python kernel could not be reached: ${err?.message ?? err}`);
+		const detail = err instanceof Error ? err.message : String(err);
+		logError('databricks', `kernel unreachable during Databricks op: ${detail}`);
+		throw new DatabricksError('kernel_unavailable', `the Python kernel could not be reached: ${detail}`);
 	}
 	const line = stdout.split('\n').find((l) => l.startsWith(SENTINEL));
 	if (!line) {
 		if (kernelError) logError('databricks', `kernel error during Databricks op: ${kernelError}`);
 		throw new DatabricksError('error', kernelError || 'the kernel returned no result');
 	}
-	return { result: JSON.parse(line.slice(SENTINEL.length)), session };
+	// The kernel bootstrap prints the same sentinel {ok,...} JSON as the PROBE.
+	return { result: JSON.parse(line.slice(SENTINEL.length)) as ProbeResult, session };
 }
 
 /**
@@ -840,11 +985,11 @@ async function runInKernel(code) {
  * in - see the module header: it is the only thing that can tell "connected"
  * from "connected before someone restarted the kernel".
  */
-let connection = null;
+let connection: ConnectionInfo | null = null;
 /** The `{profile}|{host}` selection the live connection was built from (for `forAgent` listings). */
-let connectedSel = null;
+let connectedSel: Selection | null = null;
 /** The connection a kernel restart took from us, kept so the UI can say so. */
-let lost = null;
+let lost: LostConnection | null = null;
 /** One connect/disconnect at a time: both mutate the same kernel namespace. */
 let inFlight = false;
 
@@ -853,7 +998,7 @@ let inFlight = false;
  * kernel epoch on every read, so a restart (or a rebind onto another venv)
  * downgrades us to disconnected without anyone having to notify this module.
  */
-export function connectionStatus() {
+export function connectionStatus(): ConnectionStatus {
 	if (connection && connection.session !== currentSessionId()) {
 		lost = { profile: connection.profile, clusterName: connection.clusterName };
 		connection = null;
@@ -870,9 +1015,19 @@ export function connectionStatus() {
  * copy. `assertSignedIn` guarantees an OAuth connect never opens a browser in the
  * kernel: the interactive login already happened in its own subprocess.
  */
-export async function connect({ profile, host, clusterId, clusterName }) {
+export async function connect({
+	profile,
+	host,
+	clusterId,
+	clusterName
+}: {
+	profile?: string | null;
+	host?: string | null;
+	clusterId: string;
+	clusterName?: string | null;
+}): Promise<{ ok: true; connection: ConnectionStatus }> {
 	assertMatches(clusterId, CLUSTER_RE, 'cluster id');
-	const sel = profile ? { profile } : { host };
+	const sel: Selection = profile ? { profile } : { host };
 	const auth = resolveAuth(sel);
 	assertSignedIn(auth);
 	if (inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
@@ -887,19 +1042,20 @@ export async function connect({ profile, host, clusterId, clusterName }) {
 			logError('databricks', `connect failed [${result.code || 'error'}]: ${result.message || 'unknown error'}`);
 			throw new DatabricksError(result.code || 'error', result.message);
 		}
+		const ok = payload<ConnectPayload>(result);
 		connection = {
 			profile: profile ?? null,
 			clusterId,
 			clusterName: clusterName || clusterId,
-			host: result.host ?? auth.host ?? null,
-			sparkVersion: result.spark_version ?? null,
+			host: ok.host ?? auth.host ?? null,
+			sparkVersion: ok.spark_version ?? null,
 			session
 		};
 		// Re-query catalogs against the same auth, using the SDK's canonical host.
 		connectedSel = auth.mode === 'pat' ? { profile } : { host: connection.host };
 		lost = null;
 		publishGlobal({ type: 'databricks:changed' });
-		logInfo('databricks', `connected: host ${result.host ?? '?'}, spark ${result.spark_version ?? '?'}`);
+		logInfo('databricks', `connected: host ${ok.host ?? '?'}, spark ${ok.spark_version ?? '?'}`);
 		return { ok: true, connection: connectionStatus() };
 	} finally {
 		inFlight = false;
@@ -915,7 +1071,7 @@ export async function connect({ profile, host, clusterId, clusterName }) {
  * which is the whole point of this integration.
  */
 export function agentStatus() {
-	const status = connectionStatus();
+	const status: ConnectionStatus = connectionStatus();
 	if (!status.connected) {
 		return {
 			connected: false,
@@ -936,7 +1092,7 @@ export function agentStatus() {
 }
 
 /** The `{profile}|{host}` selection of the live connection, or a `not_connected` error an agent can act on. */
-function requireConnectedSel() {
+function requireConnectedSel(): Selection {
 	const status = connectionStatus();
 	if (!status.connected || !connectedSel) {
 		throw new DatabricksError(
@@ -949,13 +1105,14 @@ function requireConnectedSel() {
 
 /** Unity Catalog listings for the agent, against the auth of the live connection. */
 export const forAgent = {
-	catalogs: async () => listCatalogs(requireConnectedSel()),
-	schemas: async (catalog) => listSchemas(requireConnectedSel(), catalog),
-	tables: async (catalog, schema) => listTables(requireConnectedSel(), catalog, schema)
+	catalogs: async (): Promise<CatalogList> => listCatalogs(requireConnectedSel()),
+	schemas: async (catalog: string): Promise<SchemaList> => listSchemas(requireConnectedSel(), catalog),
+	tables: async (catalog: string, schema: string): Promise<TableList> =>
+		listTables(requireConnectedSel(), catalog, schema)
 };
 
 /** `catalog.schema.table`, or the two-part `schema.table` a legacy metastore uses. */
-function assertTableName(name) {
+function assertTableName(name: string): string {
 	const parts = typeof name === 'string' ? name.split('.') : [];
 	if (parts.length < 2 || parts.length > 3 || !parts.every((p) => UC_NAME_RE.test(p))) {
 		throw new DatabricksError('bad_request', `invalid table name: ${JSON.stringify(name)} (expected catalog.schema.table)`);
@@ -973,7 +1130,7 @@ function assertTableName(name) {
  * `default=str` on the dump is what makes dates, decimals, and binary columns
  * survive the trip instead of raising deep inside `json.dumps`.
  */
-const PREVIEW_CODE = (cfg) => `
+const PREVIEW_CODE = (cfg: { name: string; limit: number }): string => `
 import json as _cellar_json
 
 def _cellar_dbx_preview(_cfg):
@@ -1002,8 +1159,27 @@ finally:
     del _cellar_dbx_preview, _cellar_json
 `;
 
+interface PreviewColumn {
+	name: string;
+	type: string;
+}
+/** Agent-facing table preview payload: schema + JSON rows read through `spark`. */
+interface PreviewResult {
+	ok: true;
+	name: string;
+	limit: number;
+	schema: PreviewColumn[];
+	rows: Record<string, unknown>[];
+}
+
 /** Agent-facing table preview: `{name, limit, schema, rows}`. Requires a live session. */
-export async function previewTable({ name, limit = 20 }) {
+export async function previewTable({
+	name,
+	limit = 20
+}: {
+	name: string;
+	limit?: number;
+}): Promise<PreviewResult> {
 	assertTableName(name);
 	requireConnectedSel();
 	const n = Number(limit);
@@ -1011,11 +1187,11 @@ export async function previewTable({ name, limit = 20 }) {
 		throw new DatabricksError('bad_request', `invalid limit: ${JSON.stringify(limit)} (1-1000)`);
 	}
 	const { result } = await runInKernel(PREVIEW_CODE({ name, limit: n }));
-	return unwrap(result);
+	return payload<PreviewResult>(unwrap(result));
 }
 
 /** Stop the session and drop `spark`/`w` from the kernel namespace. */
-export async function disconnect() {
+export async function disconnect(): Promise<{ ok: true }> {
 	if (inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
 	inFlight = true;
 	try {
@@ -1039,7 +1215,7 @@ export async function disconnect() {
  * so `version` (e.g. `16.1`) pins it; unpinned installs the latest, which only
  * talks to the latest DBR.
  */
-export async function installDeps({ version } = {}) {
+export async function installDeps({ version }: { version?: string | null } = {}) {
 	const python = requirePython();
 	if (!(await hasUv())) {
 		throw new DatabricksError('no_uv', 'uv is not on PATH; Cellar uses uv for all installs.');
@@ -1053,5 +1229,7 @@ export async function installDeps({ version } = {}) {
 		pin = /^\d+\.\d+$/.test(version) ? `==${version}.*` : `==${version}`;
 	}
 	await installPackages(python, ['databricks-sdk', `databricks-connect${pin}`]);
-	return { ok: true, python, ...(await checkInstall()) };
+	// checkInstall() already reports `python`; spreading it last is what the caller
+	// sees, so no explicit `python` key here (it would only be overwritten).
+	return { ok: true, ...(await checkInstall()) };
 }

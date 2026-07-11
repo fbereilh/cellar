@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { getNotebookStaleness } from '$lib/server/dataflow.js';
+import { getNotebookStaleness } from '$lib/server/dataflow';
 
 /**
  * Per-cell staleness for a notebook: `{ sid, cells: { id: { state, reason, upstream } } }`.

@@ -13,14 +13,19 @@
  * so there is no way for outputs to be duplicated or cross runs.
  */
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
-import { clearRunQueue } from './run-queue.js';
-import { logInfo, logWarn, logError } from './logs.js';
+import type { Kernel, KernelMessage } from '@jupyterlab/services';
+import { clearRunQueue } from './run-queue';
+import { logInfo, logWarn, logError } from './logs';
+import type { RunStreamEvent, ExecuteOptions, SessionId } from './types';
 
-let kernelPromise = null;
-let liveKernel = null; // last-resolved kernel, for read-only status introspection
-let manager = null;
-let currentKernel = null;
-let statusHandler = null;
+type KernelConnection = Kernel.IKernelConnection;
+type StatusListener = (sender: KernelConnection, status: Kernel.Status) => void;
+
+let kernelPromise: Promise<KernelConnection> | null = null;
+let liveKernel: KernelConnection | null = null; // last-resolved kernel, for read-only status introspection
+let manager: KernelManager | null = null;
+let currentKernel: KernelConnection | null = null;
+let statusHandler: StatusListener | null = null;
 
 /**
  * Kernel session epoch. Every fresh namespace gets a new id: a first start, a
@@ -44,7 +49,7 @@ let execsThisSession = 0;
  * shared namespace), and a just-opened notebook that never ran a cell is not.
  * Cleared by `beginSession()`, so a fresh namespace starts with nothing loaded.
  */
-let loadedNbPaths = new Set();
+let loadedNbPaths = new Set<string>();
 
 function beginSession() {
 	sessionId += 1;
@@ -59,13 +64,13 @@ function beginSession() {
  * its epoch no longer current — never re-marks a notebook as loaded in a session
  * it did not actually touch.
  */
-export function markNotebookLoaded(nbAbsPath, session) {
+export function markNotebookLoaded(nbAbsPath: string, session: SessionId): void {
 	if (!currentKernel || !nbAbsPath || session !== sessionId) return;
 	loadedNbPaths.add(nbAbsPath);
 }
 
 /** Absolute paths of the notebooks loaded in the live session (empty if none). */
-export function loadedNotebookPaths() {
+export function loadedNotebookPaths(): string[] {
 	return currentKernel ? [...loadedNbPaths] : [];
 }
 
@@ -180,7 +185,7 @@ const DATAFRAME_FORMATTER_CODE = [
 	'del _cellar_register_df_formatter'
 ].join('\n');
 
-async function runSilent(kernel, code) {
+async function runSilent(kernel: KernelConnection, code: string): Promise<void> {
 	try {
 		const future = kernel.requestExecute({
 			code,
@@ -194,13 +199,13 @@ async function runSilent(kernel, code) {
 	}
 }
 
-async function initKernel(kernel) {
+async function initKernel(kernel: KernelConnection): Promise<void> {
 	await runSilent(kernel, STARTUP_CODE);
 	await runSilent(kernel, DATAFRAME_FORMATTER_CODE);
 }
 
 /** Start (or reuse) the single kernel. */
-async function getKernel() {
+async function getKernel(): Promise<KernelConnection> {
 	if (kernelPromise) return kernelPromise;
 	kernelPromise = (async () => {
 		const serverSettings = makeSettings();
@@ -224,6 +229,7 @@ async function getKernel() {
 		// autorestart clears the namespace AND the matplotlib backend.
 		statusHandler = (_sender, status) => {
 			if (status !== 'autorestarting' || currentKernel !== kernel) return;
+			// (kernel captured in this closure is the one this handler belongs to)
 			logWarn('kernel', 'kernel died and was autorestarted by jupyter_server; namespace cleared');
 			beginSession();
 			// The namespace queued work was submitted against is gone (see clearRunQueue).
@@ -236,8 +242,9 @@ async function getKernel() {
 		return kernel;
 	})();
 	// If startup fails, allow a later retry.
-	kernelPromise.catch((err) => {
-		logError('kernel', `kernel failed to start: ${err?.message ?? err}`);
+	kernelPromise.catch((err: unknown) => {
+		const message = err instanceof Error ? err.message : String(err);
+		logError('kernel', `kernel failed to start: ${message}`);
 		kernelPromise = null;
 	});
 	return kernelPromise;
@@ -285,7 +292,7 @@ export async function rebindKernel() {
 	const wasRunning = !!currentKernel;
 	if (currentKernel) {
 		try {
-			currentKernel.statusChanged.disconnect(statusHandler);
+			if (statusHandler) currentKernel.statusChanged.disconnect(statusHandler);
 		} catch {}
 		try {
 			await currentKernel.shutdown();
@@ -362,11 +369,12 @@ export function currentSessionId() {
  * `internal: true` marks a Cellar-issued probe (see inspect.js) so it does not
  * inflate `execs_this_session`, which counts cell executions the agent can see.
  *
- * @param {string} code
- * @param {(event: object) => void} onEvent
- * @param {{ internal?: boolean }} [opts]
  */
-export async function execute(code, onEvent, { internal = false } = {}) {
+export async function execute(
+	code: string,
+	onEvent: (event: RunStreamEvent) => void,
+	{ internal = false }: ExecuteOptions = {}
+): Promise<KernelMessage.IExecuteReplyMsg['content']> {
 	const kernel = await getKernel();
 	const session = sessionId;
 	if (!internal) execsThisSession += 1;
@@ -377,37 +385,38 @@ export async function execute(code, onEvent, { internal = false } = {}) {
 	// Output events carry a real nbformat output object under `output`, so the
 	// caller can both stream them live to the browser AND accumulate them into
 	// the cell's `outputs` for persistence — one shape, no divergence.
-	future.onIOPub = (msg) => {
+	// IOPub content is a dynamic Jupyter wire payload; narrow per msg_type.
+	future.onIOPub = (msg: KernelMessage.IIOPubMessage) => {
 		const t = msg.header.msg_type;
-		const c = msg.content;
+		const c = msg.content as Record<string, unknown>;
 		switch (t) {
 			case 'status':
-				onEvent({ type: 'status', execution_state: c.execution_state });
+				onEvent({ type: 'status', execution_state: c.execution_state as string });
 				break;
 			case 'stream':
-				onEvent({ type: 'output', output: { output_type: 'stream', name: c.name, text: c.text } });
+				onEvent({ type: 'output', output: { output_type: 'stream', name: c.name as string, text: c.text as string | string[] } });
 				break;
 			case 'execute_result':
 				onEvent({
 					type: 'output',
 					output: {
 						output_type: 'execute_result',
-						data: c.data,
-						metadata: c.metadata ?? {},
-						execution_count: c.execution_count
+						data: c.data as Record<string, unknown>,
+						metadata: (c.metadata ?? {}) as Record<string, unknown>,
+						execution_count: c.execution_count as number | null
 					}
 				});
 				break;
 			case 'display_data':
 				onEvent({
 					type: 'output',
-					output: { output_type: 'display_data', data: c.data, metadata: c.metadata ?? {} }
+					output: { output_type: 'display_data', data: c.data as Record<string, unknown>, metadata: (c.metadata ?? {}) as Record<string, unknown> }
 				});
 				break;
 			case 'error':
 				onEvent({
 					type: 'output',
-					output: { output_type: 'error', ename: c.ename, evalue: c.evalue, traceback: c.traceback }
+					output: { output_type: 'error', ename: c.ename as string, evalue: c.evalue as string, traceback: c.traceback as string[] }
 				});
 				break;
 			default:
@@ -416,7 +425,7 @@ export async function execute(code, onEvent, { internal = false } = {}) {
 	};
 
 	const reply = await future.done;
-	onEvent({ type: 'done', status: reply.content.status, execution_count: reply.content.execution_count, session });
+	onEvent({ type: 'done', status: reply.content.status, execution_count: (reply.content as { execution_count?: number | null }).execution_count ?? null, session });
 	return reply.content;
 }
 

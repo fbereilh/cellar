@@ -31,7 +31,7 @@ const SENTINEL = '__CELLAR_ENV__';
 /** How long the probe may run before it is killed. Reading metadata is fast. */
 const PROBE_TIMEOUT_MS = 30_000;
 
-function workspace() {
+function workspace(): string {
 	return process.env.CELLAR_WORKSPACE || process.cwd();
 }
 
@@ -41,7 +41,7 @@ function workspace() {
  * `vite dev` (no launcher) fall back to the conventional `<workspace>/.venv`.
  * Returns null when nothing is resolvable - the "no venv" state the UI renders.
  */
-export function projectPython() {
+export function projectPython(): string | null {
 	const bound = process.env.CELLAR_PROJECT_VENV;
 	if (bound && existsSync(bound)) return bound;
 	const local = join(workspace(), '.venv');
@@ -98,8 +98,35 @@ except Exception as e:  # never let a traceback be the only answer
 sys.stdout.write('${SENTINEL}' + json.dumps(result) + '\\n')
 `;
 
+/** One installed distribution, as reported by the probe. */
+export interface PackageInfo {
+	name: string;
+	version: string;
+}
+
+/** The probe's successful JSON payload (see the embedded `PROBE` script). */
+interface ProbeSuccess {
+	ok: true;
+	executable: string;
+	prefix: string;
+	python_version: string;
+	python_version_full: string;
+	implementation: string;
+	packages: PackageInfo[];
+}
+
+/** The probe's failure JSON payload. */
+interface ProbeFailure {
+	ok: false;
+	code?: string;
+	message: string;
+}
+
+/** The probe always prints exactly one of these two shapes. */
+type ProbeResult = ProbeSuccess | ProbeFailure;
+
 /** Run the probe in the project venv python and return its parsed result. */
-function probe(python) {
+function probe(python: string): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(python, ['-c', PROBE], {
 			cwd: workspace(),
@@ -127,11 +154,40 @@ function probe(python) {
 			try {
 				resolve(JSON.parse(line.slice(SENTINEL.length)));
 			} catch (err) {
-				reject(new Error(`unparseable probe result: ${err.message}`));
+				const message = err instanceof Error ? err.message : String(err);
+				reject(new Error(`unparseable probe result: ${message}`));
 			}
 		});
 	});
 }
+
+/** Successful shape returned by {@link getEnvironment}. */
+export interface EnvironmentOk {
+	ok: true;
+	workspace: string;
+	python: string;
+	venvDir: string;
+	executable: string;
+	prefix: string;
+	pythonVersion: string;
+	pythonVersionFull: string;
+	implementation: string;
+	packages: PackageInfo[];
+}
+
+/** Failure shape returned by {@link getEnvironment}. */
+export interface EnvironmentError {
+	ok: false;
+	code: string;
+	message: string;
+	workspace: string;
+	python: string | null;
+	venvDir?: string;
+	defaultVenv?: string;
+}
+
+/** Result of {@link getEnvironment}. */
+export type EnvironmentResult = EnvironmentOk | EnvironmentError;
 
 /**
  * Everything the Environment section renders in one read: the bound interpreter,
@@ -141,7 +197,7 @@ function probe(python) {
  * When no interpreter is resolvable, returns `{ok:false, code:'no_venv'}` with
  * the workspace + the default venv path so the UI can guide the user.
  */
-export async function getEnvironment() {
+export async function getEnvironment(): Promise<EnvironmentResult> {
 	const python = projectPython();
 	const ws = workspace();
 	if (!python) {
@@ -157,7 +213,8 @@ export async function getEnvironment() {
 	// The venv dir is the parent of the `bin`/`Scripts` dir the python lives in.
 	const venvDir = dirname(dirname(python));
 	try {
-		const result = await probe(python);
+		// Dynamic boundary: child-process stdout JSON, narrowed to the probe's own shape.
+		const result = (await probe(python)) as ProbeResult;
 		if (!result.ok) {
 			return { ok: false, code: result.code || 'error', message: result.message, workspace: ws, python, venvDir };
 		}
@@ -174,7 +231,8 @@ export async function getEnvironment() {
 			packages: result.packages
 		};
 	} catch (err) {
-		return { ok: false, code: 'probe_failed', message: String(err?.message ?? err), workspace: ws, python, venvDir };
+		const message = err instanceof Error ? err.message : String(err);
+		return { ok: false, code: 'probe_failed', message, workspace: ws, python, venvDir };
 	}
 }
 
@@ -183,7 +241,7 @@ export async function getEnvironment() {
  * per line, sorted case-insensitively - the exact bytes a teammate feeds to
  * `pip install -r` / `uv pip install -r` to recreate the environment.
  */
-export function requirementsText(packages = []) {
+export function requirementsText(packages: PackageInfo[] = []): string {
 	const lines = packages
 		.filter((p) => p && p.name && p.version)
 		.map((p) => `${p.name}==${p.version}`)
@@ -191,15 +249,23 @@ export function requirementsText(packages = []) {
 	return lines.join('\n') + (lines.length ? '\n' : '');
 }
 
+/** Result of {@link saveRequirements}. */
+export interface SaveRequirementsResult {
+	ok: true;
+	path: string;
+	count: number;
+}
+
 /**
  * Write a pinned `requirements.txt` into the workspace root from a fresh probe
  * (authoritative - never trusts a client-supplied package list). Returns the
  * absolute path written and the package count.
  */
-export async function saveRequirements() {
+export async function saveRequirements(): Promise<SaveRequirementsResult> {
 	const env = await getEnvironment();
 	if (!env.ok) {
-		const err = new Error(env.message || 'no Python environment to export');
+		const err: Error & { code?: string } = new Error(env.message || 'no Python environment to export');
+		// Attach the environment error code for callers (e.g. the API route) to branch on.
 		err.code = env.code;
 		throw err;
 	}

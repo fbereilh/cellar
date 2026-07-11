@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { interruptKernel } from '$lib/server/kernel.js';
+import { interruptKernel } from '$lib/server/kernel';
 
 /** Interrupt the active kernel (SIGINT equivalent) — stops a running cell. */
 export async function POST() {

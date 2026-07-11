@@ -17,11 +17,24 @@
  *   try { return await executeCellRun({ nb, cellId, actor, source: ticket.source() }); }
  *   finally { ticket.done(); }
  */
-import { execute, markNotebookLoaded } from './kernel.js';
-import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook.js';
-import { publish } from './events.js';
+import { execute, markNotebookLoaded } from './kernel';
+import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook';
+import { publish } from './events';
 import { isSqlCell } from '../cellLanguage.js';
-import { sqlToPython } from './sql.js';
+import { sqlToPython } from './sql';
+import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types';
+
+/** Arguments to `executeCellRun`. */
+export interface CellRunArgs {
+	/** Absolute notebook path. */
+	nb: string;
+	cellId: string;
+	actor: Actor;
+	source: string;
+	originId?: string | null;
+	/** Receives, in wire order, run:start, every execute() frame, and run:end. */
+	onEvent?: (event: RunStreamEvent | { type: 'run:start'; cellId: string; at: number } | ({ type: 'run:end' } & LastRun)) => void;
+}
 
 /**
  * Execute `source` as cell `cellId` of notebook `nb` (an ABSOLUTE path): stream
@@ -41,7 +54,7 @@ import { sqlToPython } from './sql.js';
  * before any kernel existed, so no session can be stamped at all and the error is
  * LIVE rather than leftover.
  */
-export async function executeCellRun({ nb, cellId, actor, source, originId, onEvent }) {
+export async function executeCellRun({ nb, cellId, actor, source, originId, onEvent }: CellRunArgs): Promise<CellRunResult> {
 	const startedAt = Date.now();
 	// Clear stale output the moment execution starts (the caller already holds the
 	// kernel, so this is post-queue): the browser clears on the `run:start` frame
@@ -57,9 +70,9 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	const cell = getCell(cellId, nb);
 	const execSource = isSqlCell(cell) ? sqlToPython(source) : source;
 
-	const outputs = [];
+	const outputs: CellOutput[] = [];
 	let status = 'ok';
-	let session = null;
+	let session: SessionId | null = null;
 	let kernelDown = false;
 	try {
 		const reply = await execute(execSource, (ev) => {
@@ -73,11 +86,12 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 		});
 		status = reply?.status ?? 'ok';
 	} catch (err) {
-		const output = {
+		const message = err instanceof Error ? err.message : String(err);
+		const output: CellOutput = {
 			output_type: 'error',
 			ename: 'CellarError',
-			evalue: String(err?.message ?? err),
-			traceback: [String(err?.message ?? err)]
+			evalue: message,
+			traceback: [message]
 		};
 		outputs.push(output);
 		publish({ type: 'run:output', nb, cellId, output, originId });
@@ -96,7 +110,7 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	setOutputs(cellId, outputs, nb); // clean-on-save persists the .ipynb
 	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,
 	// so "ran X ago" reads as when the run began.
-	const lastRun = {
+	const lastRun: LastRun = {
 		at: startedAt,
 		durationMs: Date.now() - startedAt,
 		actor,

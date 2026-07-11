@@ -35,6 +35,42 @@
 const OPEN = '([{';
 const CLOSE = ')]}';
 
+/** A Python LOGICAL line: `[start, end)` spans every physical line the statement
+ * occupies (trailing newline included); `indent` is its first line's leading
+ * whitespace width; `raw` is the verbatim slice. */
+export interface LogicalLine {
+	start: number;
+	end: number;
+	indent: number;
+	raw: string;
+}
+
+/** A plain `import a.b` / `import a.b as c`, one per bound module name. */
+export interface ImportRecordPlain {
+	kind: 'import';
+	module: string;
+	alias: string | null;
+}
+
+/** A `from .x import y` / `from x import y as z` / `from x import *`, one per name. */
+export interface ImportRecordFrom {
+	kind: 'from';
+	level: number;
+	module: string;
+	name: string;
+	alias: string | null;
+}
+
+/** One bound name lifted from an import statement — the unit dedup/merging works on. */
+export type ImportRecord = ImportRecordPlain | ImportRecordFrom;
+
+/** The result of extracting module-level imports out of a source string. */
+export interface ExtractResult {
+	statements: string[];
+	source: string;
+	changed: boolean;
+}
+
 /**
  * Index just past the string literal starting at `i` (which must be a quote).
  * Handles triple quotes and backslash escapes — including inside raw strings,
@@ -42,7 +78,7 @@ const CLOSE = ')]}';
  * unterminated literal runs to end of input (the source is mid-edit; treating the
  * rest as string data is the conservative read).
  */
-function skipString(src, i) {
+function skipString(src: string, i: number): number {
 	const q = src[i];
 	const triple = src[i + 1] === q && src[i + 2] === q;
 	const term = triple ? q + q + q : q;
@@ -67,8 +103,8 @@ function skipString(src, i) {
  * no code in them, which is exactly what the callers want (they never match an
  * import, and they survive a strip untouched).
  */
-export function logicalLines(source) {
-	const out = [];
+export function logicalLines(source: string): LogicalLine[] {
+	const out: LogicalLine[] = [];
 	let i = 0;
 	while (i < source.length) {
 		const start = i;
@@ -117,7 +153,7 @@ export function logicalLines(source) {
 }
 
 /** Drop comments and fold line continuations out of a logical line's text. */
-function stripComments(text) {
+function stripComments(text: string): string {
 	let out = '';
 	let k = 0;
 	while (k < text.length) {
@@ -144,8 +180,8 @@ function stripComments(text) {
 }
 
 /** Split on top-level `;` (never inside brackets). Import statements hold no strings. */
-function splitSimpleStatements(code) {
-	const parts = [];
+function splitSimpleStatements(code: string): string[] {
+	const parts: string[] = [];
 	let depth = 0;
 	let cur = '';
 	for (const ch of code) {
@@ -163,8 +199,8 @@ function splitSimpleStatements(code) {
 }
 
 /** Split on top-level `,` (never inside brackets). */
-function splitCommas(text) {
-	const parts = [];
+function splitCommas(text: string): string[] {
+	const parts: string[] = [];
 	let depth = 0;
 	let cur = '';
 	for (const ch of text) {
@@ -185,7 +221,7 @@ const DOTTED = /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/;
 const NAME = /^[A-Za-z_]\w*$/;
 
 /** `x`, `x as y` → `{ name, alias }`, or null when it isn't a plain name/alias pair. */
-function parseAliased(part, namePattern) {
+function parseAliased(part: string, namePattern: RegExp): { name: string; alias: string | null } | null {
 	const m = /^(\S+)(?:\s+as\s+([A-Za-z_]\w*))?$/.exec(part.replace(/\s+/g, ' ').trim());
 	if (!m) return null;
 	if (!namePattern.test(m[1])) return null;
@@ -201,11 +237,11 @@ function parseAliased(part, namePattern) {
  *   import a.b, c as d   → [{kind:'import', module:'a.b'}, {kind:'import', module:'c', alias:'d'}]
  *   from .x import y, *  → [{kind:'from', level:1, module:'x', name:'y'}, …]
  */
-export function parseImportStatement(code) {
+export function parseImportStatement(code: string): ImportRecord[] | null {
 	const text = code.replace(/\s+/g, ' ').trim();
 
 	if (/^import\s/.test(text)) {
-		const records = [];
+		const records: ImportRecord[] = [];
 		for (const part of splitCommas(text.slice('import '.length))) {
 			const p = parseAliased(part, DOTTED);
 			if (!p) return null;
@@ -223,7 +259,7 @@ export function parseImportStatement(code) {
 		if (module && !DOTTED.test(module)) return null;
 		let names = m[3].trim();
 		if (names.startsWith('(') && names.endsWith(')')) names = names.slice(1, -1);
-		const records = [];
+		const records: ImportRecord[] = [];
 		for (const part of splitCommas(names)) {
 			if (part === '*') {
 				records.push({ kind: 'from', level, module, name: '*', alias: null });
@@ -240,7 +276,7 @@ export function parseImportStatement(code) {
 }
 
 /** The canonical one-line rendering of a single record. Also its dedup key. */
-export function renderImport(rec) {
+export function renderImport(rec: ImportRecord): string {
 	if (rec.kind === 'import') {
 		return rec.alias ? `import ${rec.module} as ${rec.alias}` : `import ${rec.module}`;
 	}
@@ -249,8 +285,8 @@ export function renderImport(rec) {
 }
 
 /** Parse a list of canonical statement strings back into records. */
-function recordsOf(statements) {
-	const out = [];
+function recordsOf(statements: string[]): ImportRecord[] {
+	const out: ImportRecord[] = [];
 	for (const s of statements) {
 		const recs = parseImportStatement(s);
 		if (recs) out.push(...recs);
@@ -272,12 +308,11 @@ function recordsOf(statements) {
  * rewrite drops the line's original comments, it only happens on a line we fully
  * understand.
  */
-export function extractTopLevelImports(source) {
+export function extractTopLevelImports(source: string | null | undefined): ExtractResult {
 	const src = source ?? '';
-	const statements = [];
-	const seen = new Set();
-	/** @type {{start:number,end:number,text:string}[]} */
-	const edits = [];
+	const statements: string[] = [];
+	const seen = new Set<string>();
+	const edits: { start: number; end: number; text: string }[] = [];
 
 	for (const line of logicalLines(src)) {
 		if (line.indent !== 0) continue;
@@ -285,8 +320,8 @@ export function extractTopLevelImports(source) {
 		if (!/^(import|from)\s/.test(code)) continue;
 
 		const parts = splitSimpleStatements(code);
-		const kept = [];
-		const lifted = [];
+		const kept: string[] = [];
+		const lifted: ImportRecord[] = [];
 		let understood = true;
 		for (const part of parts) {
 			if (!/^(import|from)\s/.test(part)) {
@@ -318,7 +353,7 @@ export function extractTopLevelImports(source) {
 	// a global `\n{3,}` collapse would also reformat the inside of a docstring that
 	// happens to share the cell.
 	let out = '';
-	const seams = [];
+	const seams: number[] = [];
 	let cursor = 0;
 	for (const e of edits) {
 		out += src.slice(cursor, e.start);
@@ -350,7 +385,7 @@ export function extractTopLevelImports(source) {
 }
 
 /** Does `source` hold at least one module-level import? */
-export function hasTopLevelImports(source) {
+export function hasTopLevelImports(source: string | null | undefined): boolean {
 	return extractTopLevelImports(source).statements.length > 0;
 }
 
@@ -360,7 +395,7 @@ export function hasTopLevelImports(source) {
  * one created above it (a notebook whose first cell is already the import block
  * is the overwhelmingly common shape).
  */
-export function isImportsOnly(source) {
+export function isImportsOnly(source: string | null | undefined): boolean {
 	const { source: rest } = extractTopLevelImports(source);
 	return logicalLines(rest).every((l) => stripComments(l.raw).trim() === '');
 }
@@ -376,10 +411,16 @@ export function isImportsOnly(source) {
  * reshuffles a human's file on every agent write. Sorting is by code unit so the
  * result is byte-stable across machines and locales.
  */
-export function renderImportsBlock(records) {
-	const future = [];
-	const plain = new Map(); // groupKey → record
-	const froms = new Map(); // groupKey → { level, module, names: Map<renderKey, rec> }
+export function renderImportsBlock(records: ImportRecord[]): string {
+	/** A `from`-import group: one target module, its bound names keyed by render string. */
+	interface FromGroup {
+		level: number;
+		module: string;
+		names: Map<string, ImportRecordFrom>;
+	}
+	const future: ImportRecordFrom[] = [];
+	const plain = new Map<string, ImportRecordPlain>(); // groupKey → record
+	const froms = new Map<string, FromGroup>(); // groupKey → { level, module, names: Map<renderKey, rec> }
 
 	for (const rec of records) {
 		if (rec.kind === 'from' && rec.level === 0 && rec.module === '__future__') {
@@ -396,8 +437,8 @@ export function renderImportsBlock(records) {
 		froms.set(key, group);
 	}
 
-	const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
-	const groups = [];
+	const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+	const groups: string[][] = [];
 
 	if (future.length) {
 		const names = future
@@ -411,13 +452,13 @@ export function renderImportsBlock(records) {
 		.map(renderImport);
 	if (plainLines.length) groups.push(plainLines);
 
-	const renderFrom = (g) => {
+	const renderFrom = (g: FromGroup): string => {
 		const names = [...g.names.values()]
 			.sort((a, b) => byCodeUnit(a.name, b.name) || byCodeUnit(a.alias ?? '', b.alias ?? ''))
 			.map((r) => (r.alias ? `${r.name} as ${r.alias}` : r.name));
 		return `from ${'.'.repeat(g.level)}${g.module} import ${names.join(', ')}`;
 	};
-	const sortFroms = (list) =>
+	const sortFroms = (list: FromGroup[]): string[] =>
 		list.sort((a, b) => byCodeUnit(a.module, b.module) || a.level - b.level).map(renderFrom);
 
 	// Absolute from-imports, then relative ones — their own group, as a human would
@@ -443,10 +484,13 @@ export function renderImportsBlock(records) {
  * Non-import content already in the imports cell is preserved below the rendered
  * block, so a cell that also holds, say, a `pd.set_option(...)` keeps it.
  */
-export function mergeImportSources(existing, incoming) {
+export function mergeImportSources(
+	existing: string | null | undefined,
+	incoming: string[]
+): { source: string; added: string[] } {
 	const current = extractTopLevelImports(existing ?? '');
 	const have = new Set(current.statements);
-	const added = [];
+	const added: string[] = [];
 	for (const stmt of incoming) {
 		if (have.has(stmt)) continue;
 		have.add(stmt);

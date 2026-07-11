@@ -26,12 +26,35 @@
  * Results are cached by source string, so an edit re-analyzes only the changed
  * cell and a run (no source change) re-analyzes nothing.
  */
-import { spawn } from 'node:child_process';
-import { currentSessionId } from './kernel.js';
-import { listCells } from './notebook.js';
-import { projectPython } from './databricks.js';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { currentSessionId } from './kernel';
+import { listCells } from './notebook';
+import { projectPython } from './databricks';
 import { computeStaleness } from '../staleness.js';
 import { isSqlCell } from '../cellLanguage.js';
+import type { CellView, SessionId } from './types';
+
+/** The names a cell binds at module scope, and the module globals it reads. */
+interface DataflowEntry {
+	defines: string[];
+	uses: string[];
+}
+
+/** Per-cell dataflow, keyed by cell id (or source string in the cache). */
+type DataflowMap = Record<string, DataflowEntry>;
+
+/** The single `SENTINEL`-prefixed JSON line the `symtable` probe prints. */
+interface ProbeResult {
+	ok: boolean;
+	cells: DataflowMap;
+	message?: string;
+}
+
+/** One item submitted to the probe: a stable cache key + the source to analyze. */
+interface ProbeItem {
+	key: string;
+	source: string;
+}
 
 const SENTINEL = '__CELLAR_DF__';
 const PROBE_TIMEOUT_MS = 10000;
@@ -92,14 +115,14 @@ main()
 `;
 
 /** source string → { defines, uses }. Bounded so a long session can't grow it forever. */
-const cache = new Map();
+const cache = new Map<string, DataflowEntry>();
 const CACHE_MAX = 1000;
 
 /** Run the probe over `items` ([{key, source}]) and merge results into the cache. */
-function runProbe(items) {
+function runProbe(items: ProbeItem[]): Promise<DataflowMap> {
 	const python = projectPython() || 'python3';
-	return new Promise((resolve) => {
-		let child;
+	return new Promise<DataflowMap>((resolve) => {
+		let child: ChildProcess;
 		try {
 			child = spawn(python, ['-c', PROBE, JSON.stringify({ cells: items })], {
 				stdio: ['ignore', 'pipe', 'pipe']
@@ -110,8 +133,8 @@ function runProbe(items) {
 		}
 		let stdout = '';
 		const timer = setTimeout(() => child.kill('SIGKILL'), PROBE_TIMEOUT_MS);
-		child.stdout.on('data', (d) => (stdout += d));
-		child.stderr.on('data', () => {}); // drain, never fatal
+		child.stdout?.on('data', (d) => (stdout += d));
+		child.stderr?.on('data', () => {}); // drain, never fatal
 		child.on('error', () => {
 			clearTimeout(timer);
 			resolve({}); // interpreter missing → degrade
@@ -121,7 +144,8 @@ function runProbe(items) {
 			const line = stdout.split('\n').find((l) => l.startsWith(SENTINEL));
 			if (!line) return resolve({});
 			try {
-				const parsed = JSON.parse(line.slice(SENTINEL.length));
+				// The probe prints exactly one SENTINEL-prefixed ProbeResult JSON line.
+				const parsed = JSON.parse(line.slice(SENTINEL.length)) as ProbeResult;
 				resolve(parsed.ok ? parsed.cells : {});
 			} catch {
 				resolve({});
@@ -137,30 +161,30 @@ function runProbe(items) {
  * single edit costs one cheap `symtable` pass over one cell, and a re-run costs
  * nothing. Markdown cells are skipped (they have no dataflow).
  *
- * @param {Array<{id:string, cell_type:string, source?:string}>} cells
- * @returns {Promise<Record<string, {defines:string[], uses:string[]}>>}
+ * @param cells the notebook's cells (code + markdown)
+ * @returns per-code-cell `{ id: { defines, uses } }`
  */
-export async function analyzeDataflow(cells) {
+export async function analyzeDataflow(cells: CellView[]): Promise<DataflowMap> {
 	// SQL cells are code cells on disk but their source is SQL, not Python - a
 	// `symtable` pass would misparse them. Skip them: they get no defines/uses, so
 	// they never join the Python dependency graph (self-edit staleness still works
 	// via lastRun/editedAt, since they run and stamp like any code cell).
 	const code = cells.filter((c) => c.cell_type === 'code' && !isSqlCell(c));
-	const missing = [];
+	const missing: ProbeItem[] = [];
 	for (const c of code) {
 		const src = c.source ?? '';
 		if (!cache.has(src)) missing.push({ key: src, source: src });
 	}
 	if (missing.length) {
 		// De-duplicate identical sources before spawning (many empty cells, say).
-		const bySource = new Map(missing.map((m) => [m.source, m]));
+		const bySource = new Map<string, ProbeItem>(missing.map((m) => [m.source, m]));
 		const results = await runProbe([...bySource.values()]);
 		for (const [src, m] of bySource) {
 			cache.set(src, results[m.key] ?? { defines: [], uses: [] });
 		}
 		if (cache.size > CACHE_MAX) cache.clear(); // simple bound; correctness is unaffected
 	}
-	const out = {};
+	const out: DataflowMap = {};
 	for (const c of code) out[c.id] = cache.get(c.source ?? '') ?? { defines: [], uses: [] };
 	return out;
 }
@@ -175,10 +199,11 @@ export async function analyzeDataflow(cells) {
  * still defines names in the kernel); callers filter the *reported* set as they
  * see fit (MCP hides `hidden_from_agent` cells).
  *
- * @param {string|null|undefined} nb notebook path (nullish ⇒ active notebook)
- * @returns {Promise<{ sid:number|null, cells:Record<string,object> }>}
+ * @param nb notebook path (nullish ⇒ active notebook)
  */
-export async function getNotebookStaleness(nb) {
+export async function getNotebookStaleness(
+	nb?: string | null
+): Promise<{ sid: SessionId | null; cells: ReturnType<typeof computeStaleness> }> {
 	const cells = listCells(nb);
 	const dataflow = await analyzeDataflow(cells);
 	const sid = currentSessionId();

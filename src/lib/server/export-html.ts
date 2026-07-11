@@ -21,18 +21,31 @@
  * and a light/dark toggle baked into the page. No external fonts, scripts, or
  * styles — a strict, offline-safe, single-file artifact.
  */
+// markdown-it ships no type declarations (no @types/markdown-it); import it
+// untyped and constrain the one instance we build to the single method we call.
+// @ts-ignore - no declaration file for 'markdown-it'
 import MarkdownIt from 'markdown-it';
+import type { CellView, CellOutput } from './types';
+
+/** The minimal markdown-it surface this module uses. */
+interface MarkdownRenderer {
+	render(src: string): string;
+}
 
 // markdown-it in the same safe configuration Cell.svelte uses: `html:false`
 // escapes any raw HTML in the source into text, so notebook content cannot
 // inject markup into the exported file. That escaping is why this server-side
 // path needs no DOMPurify (which would require a DOM Cellar's backend lacks).
-const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
+const md: MarkdownRenderer = new MarkdownIt({ html: false, linkify: true, breaks: false });
 
-const asText = (s) => (Array.isArray(s) ? s.join('') : (s ?? ''));
+// Payloads arrive from nbformat MIME bundles (Record<string, unknown>), so the
+// coercion at this boundary is deliberate: a bundle value is normally a string
+// or string[], and anything else is stringified by `?? ''` exactly as before.
+const asText = (s: unknown): string =>
+	Array.isArray(s) ? s.join('') : ((s ?? '') as string);
 
 /** HTML-escape a plain-text string for safe insertion into the document. */
-function esc(s) {
+function esc(s: unknown): string {
 	return String(s)
 		.replace(/&/g, '&amp;')
 		.replace(/</g, '&lt;')
@@ -43,13 +56,16 @@ function esc(s) {
 // Strip ANSI SGR color codes (ESC[…m) that Jupyter puts in tracebacks — same as
 // Cell.svelte's `stripAnsi`.
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
-const stripAnsi = (s) => s.replace(ANSI, '');
+const stripAnsi = (s: string): string => s.replace(ANSI, '');
 
 // ---- Markdown tables inside plain-text output (ports Cell.svelte) -----------
 const TABLE_SEP = /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/;
-const isTableRow = (l) => l.includes('|') && l.trim() !== '';
+const isTableRow = (l: string): boolean => l.includes('|') && l.trim() !== '';
 
-function renderTable(src) {
+/** A slice of output text: either verbatim text or a rendered markdown table. */
+type OutputSegment = { type: 'text'; text: string } | { type: 'table'; html: string };
+
+function renderTable(src: string): string {
 	// markdown-it emits a plain <table>; give it the same look the app applies via
 	// its daisyUI table classes by styling `.export-table table` in the stylesheet.
 	return md.render(src);
@@ -61,10 +77,10 @@ function renderTable(src) {
  * plain text. Mirrors Cell.svelte's `textSegments` so a printed table renders as
  * a real table and ordinary pipe-containing text is left untouched.
  */
-function textSegments(text) {
+function textSegments(text: string): OutputSegment[] {
 	const lines = text.split('\n');
-	const segs = [];
-	let buf = [];
+	const segs: OutputSegment[] = [];
+	let buf: string[] = [];
 	const flush = () => {
 		if (buf.length) segs.push({ type: 'text', text: buf.join('\n') });
 		buf = [];
@@ -85,7 +101,7 @@ function textSegments(text) {
 }
 
 /** Build a data: URL for an nbformat image bundle (ports Cell.svelte). */
-function imageDataUrl(mime, payload) {
+function imageDataUrl(mime: string, payload: unknown): string {
 	const data = asText(payload);
 	if (mime === 'image/svg+xml') return `data:image/svg+xml;utf8,${encodeURIComponent(data)}`;
 	return `data:${mime};base64,${data.replace(/\s+/g, '')}`;
@@ -115,9 +131,9 @@ const PY_BUILTINS = new Set([
 ]);
 const PY_SELF = new Set(['self', 'cls']);
 
-const isIdentStart = (ch) => /[A-Za-z_]/.test(ch) || ch.charCodeAt(0) > 127;
-const isIdentPart = (ch) => /[A-Za-z0-9_]/.test(ch) || ch.charCodeAt(0) > 127;
-const isDigit = (ch) => ch >= '0' && ch <= '9';
+const isIdentStart = (ch: string): boolean => /[A-Za-z_]/.test(ch) || ch.charCodeAt(0) > 127;
+const isIdentPart = (ch: string): boolean => /[A-Za-z0-9_]/.test(ch) || ch.charCodeAt(0) > 127;
+const isDigit = (ch: string): boolean => ch >= '0' && ch <= '9';
 
 /**
  * Tokenize a Python source string into highlighted HTML. Char-by-char scan
@@ -125,13 +141,13 @@ const isDigit = (ch) => ch >= '0' && ch <= '9';
  * would otherwise look like a keyword, and multi-line triple-quoted strings are
  * one token.
  */
-function highlightPython(src) {
+function highlightPython(src: string): string {
 	let out = '';
 	let i = 0;
 	const n = src.length;
 	// Track the previous significant word so `def f`/`class C` colour the name.
-	let prevWord = null;
-	const span = (cls, text) => `<span class="${cls}">${esc(text)}</span>`;
+	let prevWord: string | null = null;
+	const span = (cls: string, text: string): string => `<span class="${cls}">${esc(text)}</span>`;
 
 	while (i < n) {
 		const ch = src[i];
@@ -202,7 +218,7 @@ function highlightPython(src) {
 			let j = i + 1;
 			while (j < n && isIdentPart(src[j])) j++;
 			const word = src.slice(i, j);
-			let cls;
+			let cls: string;
 			if (PY_KEYWORDS.has(word)) cls = 'tok-keyword';
 			else if (PY_ATOMS.has(word)) cls = 'tok-atom';
 			else if (prevWord === 'def') cls = 'tok-function';
@@ -236,13 +252,13 @@ function highlightPython(src) {
 }
 
 /** Lowercased string prefix (for the raw-string escape check). */
-function prefixLower(src, start, len) {
+function prefixLower(src: string, start: number, len: number): string {
 	return src.slice(start, start + len).toLowerCase();
 }
 
 // ---- Output rendering (ports Cell.svelte's renderOutput) --------------------
 
-function renderOutputText(tone, text) {
+function renderOutputText(tone: string, text: string): string {
 	const segs = textSegments(text);
 	if (segs.some((s) => s.type === 'table')) {
 		let html = '';
@@ -255,7 +271,7 @@ function renderOutputText(tone, text) {
 	return `<pre class="output-text tone-${tone}">${esc(text)}</pre>`;
 }
 
-function renderOutput(o) {
+function renderOutput(o: CellOutput): string {
 	switch (o.output_type) {
 		case 'stream': {
 			const tone = o.name === 'stderr' ? 'stderr' : 'stdout';
@@ -280,29 +296,32 @@ function renderOutput(o) {
 
 // ---- Cell rendering ----------------------------------------------------------
 
-function renderMarkdownCell(cell) {
+function renderMarkdownCell(cell: CellView): string {
 	if (!cell.source.trim()) return '';
 	// html:false makes markdown-it's output safe to inject directly.
 	const html = md.render(cell.source);
 	return `<section class="cell md-cell"><div class="cellar-md">${html}</div></section>`;
 }
 
-function renderCodeCell(cell) {
+function renderCodeCell(cell: CellView): string {
 	const code = `<div class="cell-input"><pre class="code"><code>${highlightPython(cell.source)}</code></pre></div>`;
 	const outs = (cell.outputs || []).map(renderOutput).filter(Boolean);
 	const output = outs.length ? `<div class="cell-output">${outs.join('')}</div>` : '';
 	return `<section class="cell code-cell">${code}${output}</section>`;
 }
 
-function renderCell(cell) {
+function renderCell(cell: CellView): string {
 	return cell.cell_type === 'markdown' ? renderMarkdownCell(cell) : renderCodeCell(cell);
 }
 
-/**
- * Render a notebook to a complete, self-contained HTML document.
- * @param {{ cells: Array, title?: string }} opts
- */
-export function renderNotebookHtml({ cells, title = 'Notebook' }) {
+/** Render a notebook to a complete, self-contained HTML document. */
+export function renderNotebookHtml({
+	cells,
+	title = 'Notebook'
+}: {
+	cells: CellView[];
+	title?: string;
+}): string {
 	const body = cells.map(renderCell).filter(Boolean).join('\n');
 	const safeTitle = esc(title);
 	return `<!doctype html>
@@ -335,7 +354,7 @@ ${body || '<p class="empty">This notebook has no cells.</p>'}
 }
 
 /** Build a safe download filename (`<name>.html`) from a notebook path. */
-export function exportFilename(nbPath) {
+export function exportFilename(nbPath?: string | null): string {
 	const base = String(nbPath || 'notebook').split(/[/\\]/).pop() || 'notebook';
 	return base.replace(/\.ipynb$/i, '') + '.html';
 }

@@ -19,16 +19,16 @@ import { readInstance, unregisterInstance } from './instances.js';
 const CHECK_MS = 5000;
 
 /** True if `pid` is currently alive (EPERM = exists, owned by another user). */
-function alive(pid) {
+function alive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
 	} catch (err) {
-		return err?.code === 'EPERM';
+		return (err as NodeJS.ErrnoException)?.code === 'EPERM';
 	}
 }
 
-export function startParentWatch() {
+export function startParentWatch(): void {
 	const raw = process.env.CELLAR_LAUNCHER_PID;
 	const launcherPid = raw ? parseInt(raw, 10) : NaN;
 	// pid 1 (init) is never a real launcher — guard against a stray value.

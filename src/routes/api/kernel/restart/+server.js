@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { restartKernel } from '$lib/server/kernel.js';
+import { restartKernel } from '$lib/server/kernel';
 
 /**
  * Restart the active kernel: restarts the process (clears the namespace) while
