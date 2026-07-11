@@ -17,7 +17,7 @@
  *   try { return await executeCellRun({ nb, cellId, actor, source: ticket.source() }); }
  *   finally { ticket.done(); }
  */
-import { execute } from './kernel.js';
+import { execute, markNotebookLoaded } from './kernel.js';
 import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook.js';
 import { publish } from './events.js';
 import { isSqlCell } from '../cellLanguage.js';
@@ -87,6 +87,11 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 		// to stamp: this failure is the run the caller just asked for, not a leftover.
 		if (session === null) kernelDown = true;
 	}
+
+	// A real kernel session executed this cell (session != null) → its state now
+	// lives in the shared namespace, so this notebook is "loaded in the kernel".
+	// A kernel-down run (session === null) touched no namespace and is skipped.
+	if (session !== null) markNotebookLoaded(nb, session);
 
 	setOutputs(cellId, outputs, nb); // clean-on-save persists the .ipynb
 	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,

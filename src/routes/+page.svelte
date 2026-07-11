@@ -208,18 +208,30 @@
 	}
 	const activeBlame = $derived((activeFilePath && blameByPath[activeFilePath]) || null);
 
-	// Notebooks currently open in the shell (the default notebook tab + every
-	// opened `.ipynb`). With the single-shared-kernel model these are exactly the
-	// notebooks loaded against that one kernel, so the sidebar Kernels section
-	// lists them under it. Derived from tabs → updates live as notebooks open/close.
-	// The dot reads `activeNotebookPath`, the same source of truth the outline and
-	// search sections use, so every sidebar section agrees on which notebook is
-	// active - including agreeing on "none" while a plain file tab holds focus and
-	// no notebook tab is open.
-	const openNotebooks = $derived(
-		tabs
-			.filter((t) => t.kind === 'notebook' || t.kind === 'ipynb')
-			.map((t) => ({ id: t.id, path: t.path, name: t.title, active: t.path === activeNotebookPath }))
+	// Notebooks actually LOADED in the shared kernel: those that have run >=1 cell
+	// in the current kernel session, so their state lives in the one shared
+	// namespace. The membership comes from the SERVER (`kernelInfo.loaded_notebooks`,
+	// tracked in kernel.js and cleared on restart) — NOT from open tabs. So a
+	// notebook whose tab was closed still appears (its variables are still loaded),
+	// and a just-opened notebook that never ran a cell does not. It refreshes live
+	// on every run-end / restart (`refreshKernel`).
+	//
+	// Each server entry is enriched with the matching open tab (if any): `open`
+	// lets a still-open row focus its tab, and `active` (reading `activeNotebookPath`,
+	// the same source the outline/search sections use) dots the focused notebook.
+	const loadedNotebooks = $derived(
+		(kernelInfo.loaded_notebooks ?? []).map((n) => {
+			const tab = tabs.find(
+				(t) => (t.kind === 'notebook' || t.kind === 'ipynb') && t.path === n.path
+			);
+			return {
+				id: tab?.id ?? n.path,
+				path: n.path,
+				name: tab?.title || n.name,
+				open: !!tab,
+				active: n.path === activeNotebookPath
+			};
+		})
 	);
 
 	function tabIdFor(path) {
@@ -769,6 +781,13 @@
 			if (ev.type === 'log' && ev.entry?.level === 'error' && !logsOpen) {
 				logsUnseenErrors += 1;
 			}
+			// A run this tab did NOT initiate (an agent, or another tab) may load a
+			// notebook into the kernel for the first time. Our own runs already refresh
+			// via `onRunEnd`, so only foreign runs need this — refresh the kernel status
+			// so the Kernels section's loaded-notebooks list stays live for agent runs.
+			if (ev.type === 'run:end' && ev.originId !== originId) {
+				refreshKernel();
+			}
 			if (ev.type !== 'notebook:opened') return;
 			if (ev.originId && ev.originId === originId) return;
 			if (!ev.relPath) return;
@@ -876,7 +895,7 @@
 					{mcp}
 					kernelInfo={displayKernel}
 					{kernelBusy}
-					{openNotebooks}
+					{loadedNotebooks}
 					{variables}
 					{varsLoading}
 					{varsError}
