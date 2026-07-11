@@ -1,0 +1,182 @@
+name: release
+
+# Cut a Cellar release by pushing a semver tag:
+#
+#   npm version <patch|minor|major>   # bumps package.json + creates the tag
+#   git push --follow-tags            # or: git push origin vX.Y.Z
+#
+# On a `v*` tag this workflow (1) creates the GitHub Release with auto-generated
+# notes and (2) bumps the Homebrew tap formula (fbereilh/homebrew-cellar,
+# Formula/cellar.rb) so `brew install cellar` resolves the new stable version.
+#
+# See RELEASING.md for the full flow and the one-time TAP_TOKEN setup.
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual fallback: run against an existing tag from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release, e.g. v1.2.3"
+        required: true
+        type: string
+
+# One release per tag at a time.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job A - create/update the GitHub Release for the tag.
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release + read the tag (default GITHUB_TOKEN)
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Resolve tag + prerelease flag
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ]; then
+            echo "::error::No tag to release."
+            exit 1
+          fi
+          # rc/beta/alpha suffixes => prerelease (not promoted to stable brew).
+          if [[ "$TAG" == *-rc* || "$TAG" == *-beta* || "$TAG" == *-alpha* ]]; then
+            PRE=true
+          else
+            PRE=false
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (prerelease=$PRE)"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          PRE_FLAG=""
+          if [ "$PRE" = "true" ]; then
+            PRE_FLAG="--prerelease"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists - regenerating notes."
+            gh release edit "$TAG" --draft=false $PRE_FLAG
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes $PRE_FLAG
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job B - bump the Homebrew tap formula to the new stable tag.
+  # Runs only for non-prerelease tags (a prerelease must not become stable).
+  # ---------------------------------------------------------------------------
+  bump-tap:
+    name: Bump Homebrew tap formula
+    needs: release
+    if: needs.release.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify TAP_TOKEN is configured
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::error::secrets.TAP_TOKEN is not set. The GitHub Release was created, but the Homebrew tap formula was NOT updated."
+            echo "::error::Create a fine-grained PAT with Contents: read/write on fbereilh/homebrew-cellar and add it: gh secret set TAP_TOKEN -R fbereilh/cellar"
+            echo "::error::See RELEASING.md for the exact steps, then re-run this workflow (Actions -> release -> Run workflow) against tag ${{ needs.release.outputs.tag }}."
+            exit 1
+          fi
+          echo "TAP_TOKEN present."
+
+      - name: Compute tarball sha256
+        id: hash
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/fbereilh/cellar/archive/refs/tags/${TAG}.tar.gz"
+          echo "Downloading $URL"
+          curl -fsSL --retry 3 --retry-delay 5 -o source.tar.gz "$URL"
+          SHA="$(shasum -a 256 source.tar.gz | awk '{print $1}')"
+          if [ -z "$SHA" ]; then
+            echo "::error::Failed to compute sha256 for $URL"
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA"
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: fbereilh/homebrew-cellar
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula url + sha256
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+          URL: ${{ steps.hash.outputs.url }}
+          SHA: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          FORMULA="tap/Formula/cellar.rb"
+          if [ ! -f "$FORMULA" ]; then
+            echo "::error::$FORMULA not found in the tap."
+            exit 1
+          fi
+          # Rewrite the stable stanza. The url regex matches the archive tag
+          # tarball only (never the `head` git url); there is exactly one
+          # sha256 line (head carries none).
+          sed -E -i \
+            -e "s|https://github.com/fbereilh/cellar/archive/refs/tags/[^\"]+\.tar\.gz|${URL}|" \
+            -e "s|^([[:space:]]*)sha256 \"[0-9a-f]{64}\"|\1sha256 \"${SHA}\"|" \
+            "$FORMULA"
+
+          # Fail loudly if either edit did not land (formula shape changed).
+          if ! grep -qF "$URL" "$FORMULA"; then
+            echo "::error::url line was not updated in $FORMULA"
+            exit 1
+          fi
+          if ! grep -qF "$SHA" "$FORMULA"; then
+            echo "::error::sha256 line was not updated in $FORMULA"
+            exit 1
+          fi
+          echo "----- updated formula -----"
+          grep -E 'url |sha256 ' "$FORMULA"
+
+      - name: Commit + push to tap
+        working-directory: tap
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Formula already at ${TAG}; nothing to commit."
+            exit 0
+          fi
+          git add Formula/cellar.rb
+          git commit -m "cellar ${TAG}"
+          git push origin HEAD
+          echo "Pushed cellar ${TAG} to fbereilh/homebrew-cellar."
