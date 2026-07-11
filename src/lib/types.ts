@@ -8,8 +8,31 @@
  * publishes up to its `LiveNotebook`.
  */
 
+import type { Cell } from '$lib/server/types';
+
 /** Jupyter-style modal keyboard mode for the notebook. */
 export type KeyMode = 'command' | 'edit';
+
+/**
+ * A remote (agent / other-tab) source edit handed to a live `Cell` via
+ * `cell.remoteEdit`, held until the user chooses to load it if they are typing.
+ */
+export interface RemoteEdit {
+	source: string;
+}
+
+/**
+ * A cell as the live UI holds it: the server-owned {@link Cell} plus the
+ * runtime-only `remoteEdit` marker `LiveNotebook` attaches when an out-of-band
+ * edit arrives. Never persisted - `remoteEdit` exists only in the browser.
+ */
+export type UICell = Cell & { remoteEdit?: RemoteEdit | null };
+
+/** Segment indices of a single cell that an outer folded heading hides. */
+export interface SegHidden {
+	headings: Set<number>;
+	bodies: Set<number>;
+}
 
 /**
  * The imperative handle a `Cell.svelte` hands up to its notebook via
