@@ -1,14 +1,14 @@
-<script>
+<script lang="ts">
 	import { onMount, setContext } from 'svelte';
 	import Databricks from '$lib/Databricks.svelte';
 	import Environment from '$lib/Environment.svelte';
 	import Checkpoints from '$lib/Checkpoints.svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
-	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
-	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections.js';
-	import { outlineRows as buildOutlineRows } from '$lib/headings.js';
-	import { getUi, setUi } from '$lib/uiState.js';
+	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge';
+	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
+	import { outlineRows as buildOutlineRows } from '$lib/headings';
+	import { getUi, setUi } from '$lib/uiState';
 
 	let {
 		cells,

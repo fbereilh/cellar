@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import Navbar from '$lib/Navbar.svelte';
 	import Sidebar from '$lib/Sidebar.svelte';
@@ -6,12 +6,12 @@
 	import FileTab from '$lib/FileTab.svelte';
 	import Settings from '$lib/Settings.svelte';
 	import CommandPalette from '$lib/CommandPalette.svelte';
-	import { buildCommands } from '$lib/commands.js';
-	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte.js';
+	import { buildCommands } from '$lib/commands';
+	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte';
 	import LogsPanel from '$lib/LogsPanel.svelte';
-	import { subscribeEvents, originId } from '$lib/events-client.js';
-	import { hydrateUiState, getUi, setUi } from '$lib/uiState.js';
-	import { relativeTimeLong } from '$lib/relativeTime.js';
+	import { subscribeEvents, originId } from '$lib/events-client';
+	import { hydrateUiState, getUi, setUi } from '$lib/uiState';
+	import { relativeTimeLong } from '$lib/relativeTime';
 
 	const isPyPath = (p) => /\.py$/i.test(p);
 

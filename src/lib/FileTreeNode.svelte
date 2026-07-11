@@ -1,4 +1,4 @@
-<script module>
+<script module lang="ts">
 	// VS Code-style git decoration colors, shared by every tree node.
 	// U/A = green, M/R = gold, D/C = red. Each token resolves per color-scheme in
 	// `app.css` - VS Code's dark decoration hues are far too light to read against
@@ -23,9 +23,9 @@
 	}
 </script>
 
-<script>
+<script lang="ts">
 	import Self from '$lib/FileTreeNode.svelte';
-	import { iconSvg } from '$lib/fileIcons.js';
+	import { iconSvg } from '$lib/fileIcons';
 	import { getContext } from 'svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 

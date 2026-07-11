@@ -20,7 +20,7 @@
 import { execute, markNotebookLoaded } from './kernel';
 import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook';
 import { publish } from './events';
-import { isSqlCell } from '../cellLanguage.js';
+import { isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
 import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types';
 

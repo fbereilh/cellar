@@ -1,5 +1,5 @@
-<script>
-	import { iconSvg } from '$lib/fileIcons.js';
+<script lang="ts">
+	import { iconSvg } from '$lib/fileIcons';
 
 	// Inline editable row used by the file tree for renaming an entry and for
 	// creating a new file/folder. Enter submits, Escape (or blur) cancels. Kept

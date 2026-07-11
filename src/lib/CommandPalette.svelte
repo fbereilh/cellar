@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	// Cmd/Ctrl+K command palette. A searchable, keyboard-navigable overlay over
 	// every notebook/app action. Rendered as a daisyUI `.modal-open` so the
 	// notebook's modal keyboard stands down while it is open (LiveNotebook's
@@ -9,8 +9,8 @@
 	// `commands.js`, so this component owns only search + navigation, never the
 	// command list itself.
 	import { tick } from 'svelte';
-	import { filterCommands } from '$lib/commands.js';
-	import { chordTokens, formatChord } from '$lib/shortcuts.svelte.js';
+	import { filterCommands } from '$lib/commands';
+	import { chordTokens, formatChord } from '$lib/shortcuts.svelte';
 
 	let { open, commands, onClose } = $props();
 

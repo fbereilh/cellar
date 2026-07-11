@@ -13,7 +13,7 @@
   kernel), so it works before the first cell runs. See
   `src/lib/server/environment.js`. Fetched on first open + manual refresh.
 -->
-<script>
+<script lang="ts">
 	import { onMount } from 'svelte';
 
 	let env = $state(null);

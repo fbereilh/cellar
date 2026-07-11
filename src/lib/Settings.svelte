@@ -1,7 +1,7 @@
-<script>
+<script lang="ts">
 	// Settings panel (modal): theme toggle, the project-venv (Python kernel)
 	// control, and the keyboard-shortcut registry (view + rebind).
-	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte.js';
+	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 
 	let { open, theme, onClose, onSetTheme, onVenvRebound } = $props();
 

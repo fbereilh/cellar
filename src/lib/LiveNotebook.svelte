@@ -1,13 +1,13 @@
-<script>
+<script lang="ts">
 	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
-	import { subscribeEvents, originId } from '$lib/events-client.js';
-	import { cellIdOfKey, computeFolding, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings.js';
-	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff.js';
-	import { cellClipboard } from '$lib/cellClipboard.js';
-	import { clampMoveIndex } from '$lib/importsRole.js';
-	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte.js';
-	import { getUi, setUi } from '$lib/uiState.js';
+	import { subscribeEvents, originId } from '$lib/events-client';
+	import { cellIdOfKey, computeFolding, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
+	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
+	import { cellClipboard } from '$lib/cellClipboard';
+	import { clampMoveIndex } from '$lib/importsRole';
+	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
+	import { getUi, setUi } from '$lib/uiState';
 
 	// A live, kernel-attached notebook document addressed by its workspace path.
 	// Owns its own cell array + all cell operations (every request carries

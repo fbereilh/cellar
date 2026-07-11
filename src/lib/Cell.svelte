@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { browser } from '$app/environment';
 	import { EditorView } from '@codemirror/view';
@@ -10,15 +10,15 @@
 	import { markdown } from '@codemirror/lang-markdown';
 	import { sql } from '@codemirror/lang-sql';
 	import DOMPurify from 'dompurify';
-	import { md, renderMarkdown } from '$lib/markdown.js';
-	import { EDITOR_THEME } from '$lib/editorTheme.js';
+	import { md, renderMarkdown } from '$lib/markdown';
+	import { EDITOR_THEME } from '$lib/editorTheme';
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
 	import PlotlyOutput from '$lib/PlotlyOutput.svelte';
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
-	import { foldKey, splitHeadingSegments } from '$lib/headings.js';
-	import { isImportsCell } from '$lib/importsRole.js';
-	import { isSqlCell, logicalCellType } from '$lib/cellLanguage.js';
-	import { relativeTime, formatDuration } from '$lib/relativeTime.js';
+	import { foldKey, splitHeadingSegments } from '$lib/headings';
+	import { isImportsCell } from '$lib/importsRole';
+	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
+	import { relativeTime, formatDuration } from '$lib/relativeTime';
 
 	const NO_SEGS_HIDDEN = { headings: new Set(), bodies: new Set() };
 

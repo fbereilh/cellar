@@ -33,8 +33,8 @@ import { executeCellRun } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree } from '../fstree';
 import { getNotebookStaleness } from '../dataflow';
-import { STALE_STATE, staleIdsInOrder } from '../../staleness.js';
-import { isSqlCell } from '../../cellLanguage.js';
+import { STALE_STATE, staleIdsInOrder } from '../../staleness';
+import { isSqlCell } from '../../cellLanguage';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
 import type { CellView, CellOutput, SessionId, LogicalCellType } from '../types';
 

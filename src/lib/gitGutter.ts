@@ -13,7 +13,7 @@
  */
 import { EditorView, gutter, GutterMarker } from '@codemirror/view';
 import { RangeSet, RangeSetBuilder, StateEffect, StateField } from '@codemirror/state';
-import { lineChanges } from '$lib/gitdiff.js';
+import { lineChanges } from '$lib/gitdiff';
 
 /** Set (or clear, with `null`) the git-HEAD text this editor diffs against. */
 export const setGitBaseline = StateEffect.define();

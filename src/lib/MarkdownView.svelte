@@ -1,6 +1,6 @@
-<script>
+<script lang="ts">
 	import { browser } from '$app/environment';
-	import { renderMarkdown } from '$lib/markdown.js';
+	import { renderMarkdown } from '$lib/markdown';
 
 	// Read-only rendered view of a full markdown document. Reuses the one markdown
 	// engine + the shared `.cellar-md` styling (app.css), so a `.md` file preview

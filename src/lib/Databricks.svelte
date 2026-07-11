@@ -14,9 +14,9 @@
   Listing (profiles/clusters/catalogs/schemas/tables) is a server call; the
   session itself is built in the kernel. See `src/lib/server/databricks.js`.
 -->
-<script>
+<script lang="ts">
 	import { onMount } from 'svelte';
-	import { subscribeEvents } from '$lib/events-client.js';
+	import { subscribeEvents } from '$lib/events-client';
 
 	let {
 		/** Kernel session epoch. A change means a restart replaced the namespace → `spark` is gone. */

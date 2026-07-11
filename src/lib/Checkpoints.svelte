@@ -10,10 +10,10 @@
   the active notebook changes, and on the `checkpoints:changed` event an auto- or
   manual checkpoint publishes.
 -->
-<script>
+<script lang="ts">
 	import { onMount } from 'svelte';
-	import { subscribeEvents, originId } from '$lib/events-client.js';
-	import { relativeTimeLong } from '$lib/relativeTime.js';
+	import { subscribeEvents, originId } from '$lib/events-client';
+	import { relativeTimeLong } from '$lib/relativeTime';
 
 	let { notebookPath = null } = $props();
 

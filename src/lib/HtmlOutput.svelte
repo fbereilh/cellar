@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	// Renders a rich `text/html` cell output (Bokeh, Altair, folium, ipywidgets'
 	// HTML reprs, plotly's HTML renderer, styled DataFrames, …) inside a **sandboxed
 	// iframe**. The iframe uses `sandbox="allow-scripts"` WITHOUT `allow-same-origin`,

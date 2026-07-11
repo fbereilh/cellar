@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { EditorView, keymap } from '@codemirror/view';
 	import { EditorState, Prec } from '@codemirror/state';
@@ -9,8 +9,8 @@
 	import { yaml as yamlLang } from '@codemirror/lang-yaml';
 	import { StreamLanguage } from '@codemirror/language';
 	import { toml as tomlMode } from '@codemirror/legacy-modes/mode/toml';
-	import { EDITOR_THEME } from '$lib/editorTheme.js';
-	import { gitGutterExtension, setGitBaseline } from '$lib/gitGutter.js';
+	import { EDITOR_THEME } from '$lib/editorTheme';
+	import { gitGutterExtension, setGitBaseline } from '$lib/gitGutter';
 	import MarkdownView from '$lib/MarkdownView.svelte';
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports

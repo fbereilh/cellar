@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	// Renders a Plotly figure output (mimetype `application/vnd.plotly.v1+json`,
 	// whose payload is `{data, layout, config}`) as a live, interactive chart.
 	//

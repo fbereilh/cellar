@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	// Interactive DataFrame grid for cell outputs. Renders the bounded, structured
 	// payload emitted by the kernel-side formatter (see kernel.js): column names +
 	// dtypes, a capped page of rows, and the true row/column counts. All sort /

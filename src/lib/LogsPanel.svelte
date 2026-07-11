@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	/**
 	 * Cellar — in-app Logs panel (bottom drawer console).
 	 *
@@ -14,7 +14,7 @@
 	 * Theme-aware via daisyUI semantic tokens (error red / warn amber / info muted).
 	 */
 	import { onMount, tick } from 'svelte';
-	import { subscribeEvents } from '$lib/events-client.js';
+	import { subscribeEvents } from '$lib/events-client';
 
 	let { open = false, onClose } = $props();
 

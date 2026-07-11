@@ -1,6 +1,6 @@
-<script>
+<script lang="ts">
 	import Cell from '$lib/Cell.svelte';
-	import { isImportsCell } from '$lib/importsRole.js';
+	import { isImportsCell } from '$lib/importsRole';
 
 	const NO_SEGS_HIDDEN = { headings: new Set(), bodies: new Set() };
 

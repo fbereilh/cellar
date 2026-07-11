@@ -13,7 +13,7 @@
 // calling it inside a `$derived` keeps the palette in sync with rebindings and
 // with which notebook is active.
 
-import { shortcuts } from '$lib/shortcuts.svelte.js';
+import { shortcuts } from '$lib/shortcuts.svelte';
 
 /** The live bindings of a registry shortcut (respects user rebindings). */
 export function keysForShortcut(id) {

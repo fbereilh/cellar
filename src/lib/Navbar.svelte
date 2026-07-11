@@ -1,6 +1,6 @@
-<script>
-	import { iconSvg } from '$lib/fileIcons.js';
-	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge.js';
+<script lang="ts">
+	import { iconSvg } from '$lib/fileIcons';
+	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge';
 
 	let {
 		tabs,
