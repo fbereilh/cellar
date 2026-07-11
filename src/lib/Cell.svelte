@@ -19,48 +19,95 @@
 	import { isImportsCell } from '$lib/importsRole';
 	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration } from '$lib/relativeTime';
+	import type { CellOutput, LogicalCellType } from '$lib/server/types';
+	import type { KeyMode, UICell, SegHidden, CellRegisterApi, RemoteEdit } from '$lib/types';
+	import type { StalenessEntry } from '$lib/staleness';
 
-	const NO_SEGS_HIDDEN = { headings: new Set(), bodies: new Set() };
+	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
+
+	interface Props {
+		cell: UICell;
+		index: number;
+		count: number;
+		running: boolean;
+		/** 1-based place in the kernel's run queue, or null. */
+		queuedPosition?: number | null;
+		active?: boolean;
+		/** Notebook mode; only meaningful while `active`. */
+		keyMode?: KeyMode;
+		/** Staleness verdict ($lib/staleness), or null. */
+		staleState?: StalenessEntry | null;
+		dragging?: boolean;
+		/** The notebook's cell 0 is the pinned imports cell. */
+		pinnedTop?: boolean;
+		/** Fold keys of every collapsed heading in the notebook. */
+		foldedIds?: Set<string>;
+		/** Segment indices of THIS cell an outer fold hides. */
+		segHidden?: SegHidden;
+		/** Fold key → whole cells that fold hides (the "N cells hidden" hint). */
+		foldCounts?: Record<string, number>;
+		onToggleFold?: (key: string) => void;
+		onRun: (id: string, source: string) => void;
+		onRunAdvance: (id: string, source: string, opts: { focusNext: boolean }) => void;
+		/** Interrupt the shared kernel (reuses the Kernels-section handler). */
+		onInterrupt?: () => void;
+		onClear: (id: string) => void;
+		onDelete: (id: string) => void;
+		onMove: (id: string, dir: 'up' | 'down') => void;
+		onEdit: (id: string, source: string, opts?: { keepalive?: boolean }) => void;
+		onSetType: (id: string, type: LogicalCellType) => void;
+		onSetScrolled?: (id: string, scrolled: boolean) => void;
+		/** Per-cell code-editor collapse choice (undefined = auto / true / false). */
+		editorCollapsed?: boolean;
+		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
+		onActivate?: (id: string) => void;
+		/** Hands the notebook this cell's imperative API (null on teardown). */
+		onRegister?: (id: string, api: CellRegisterApi | null) => void;
+		onEditorFocus?: (id: string) => void;
+		onEditorBlur?: (id: string) => void;
+		onDragStart?: (e: DragEvent, id: string) => void;
+		onDragEnd?: () => void;
+	}
 
 	let {
 		cell,
 		index,
 		count,
 		running,
-		queuedPosition = null, // 1-based place in the kernel's run queue, or null
+		queuedPosition = null,
 		active = false,
-		keyMode = 'command', // notebook mode ('command' | 'edit'); only meaningful while `active`
-		staleState = null, // staleness verdict {state, reason, upstream} ($lib/staleness.js), or null
+		keyMode = 'command',
+		staleState = null,
 		dragging = false,
-		pinnedTop = false, // the notebook's cell 0 is the pinned imports cell
-		foldedIds = new Set(), // fold keys of every collapsed heading in the notebook
-		segHidden = NO_SEGS_HIDDEN, // segment indices of THIS cell an outer fold hides
-		foldCounts = {}, // fold key → whole cells that fold hides (the "N cells hidden" hint)
+		pinnedTop = false,
+		foldedIds = new Set(),
+		segHidden = NO_SEGS_HIDDEN,
+		foldCounts = {},
 		onToggleFold,
 		onRun,
 		onRunAdvance,
-		onInterrupt, // interrupt the shared kernel (reuses the Kernels-section handler)
+		onInterrupt,
 		onClear,
 		onDelete,
 		onMove,
 		onEdit,
 		onSetType,
 		onSetScrolled,
-		editorCollapsed, // per-cell code-editor collapse choice (undefined = auto / true / false)
+		editorCollapsed,
 		onSetEditorCollapsed,
 		onActivate,
-		onRegister, // (id, api|null): hands the notebook this cell's imperative API
+		onRegister,
 		onEditorFocus,
 		onEditorBlur,
 		onDragStart,
 		onDragEnd
-	} = $props();
+	}: Props = $props();
 
-	let cardEl; // the cell's outer card: what holds focus in command mode
-	let editorEl;
-	let view;
-	let editorResizeObserver;
-	let editTimer;
+	let cardEl: HTMLDivElement | undefined; // the cell's outer card: what holds focus in command mode
+	let editorEl: HTMLDivElement | undefined;
+	let view: EditorView | undefined;
+	let editorResizeObserver: ResizeObserver | undefined;
+	let editTimer: ReturnType<typeof setTimeout>;
 	// True while the user has uncommitted local typing (a debounced save pending).
 	// Together with editor focus this gates whether a remote source edit may
 	// overwrite the editor (the editor-safety rule).
@@ -81,7 +128,7 @@
 	 * `keepalive` is only set from the unload path (the browser caps a keepalive
 	 * request body at ~64KB, so normal page-alive saves must not use it).
 	 */
-	function flushEdit({ keepalive = false } = {}) {
+	function flushEdit({ keepalive = false }: { keepalive?: boolean } = {}) {
 		clearTimeout(editTimer);
 		if (view && liveSource !== savedSource) {
 			savedSource = liveSource;
@@ -104,8 +151,8 @@
 	// A remote (agent / other-tab) source edit that arrived while the user was
 	// editing this cell, held until they choose to load it (the affordance below).
 	let remoteChanged = $state(false);
-	let pendingRemoteSource = null;
-	let appliedRemote = null; // the last cell.remoteEdit object we processed
+	let pendingRemoteSource: string | null = null;
+	let appliedRemote: RemoteEdit | null = null; // the last cell.remoteEdit object we processed
 
 	// The editor's live text. Declared before `mode` because `mode` derives from it.
 	let liveSource = $state(cell.source);
@@ -148,7 +195,7 @@
 	// Running indicator: only reveal after a short delay so fast cells never
 	// flash it (avoids the flicker the play-button spinner had).
 	let showRunning = $state(false);
-	let runIndicatorTimer;
+	let runIndicatorTimer: ReturnType<typeof setTimeout>;
 	$effect(() => {
 		if (running) {
 			runIndicatorTimer = setTimeout(() => (showRunning = true), 180);
@@ -197,12 +244,12 @@
 
 	// Strip ANSI SGR color codes (ESC[…m) that Jupyter puts in tracebacks.
 	const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
-	const stripAnsi = (s) => s.replace(ANSI, '');
-	const asText = (s) => (Array.isArray(s) ? s.join('') : (s ?? ''));
+	const stripAnsi = (s: string): string => s.replace(ANSI, '');
+	const asText = (s: unknown): string => (Array.isArray(s) ? s.join('') : ((s as string) ?? ''));
 
 	// Build a data: URL for an nbformat image bundle. Raster mimes (png/jpeg/gif)
 	// carry base64 text; image/svg+xml carries raw XML, so it is URI-encoded.
-	function imageDataUrl(mime, payload) {
+	function imageDataUrl(mime: string, payload: unknown): string {
 		const data = asText(payload);
 		if (mime === 'image/svg+xml') return `data:image/svg+xml;utf8,${encodeURIComponent(data)}`;
 		return `data:${mime};base64,${data.replace(/\s+/g, '')}`;
@@ -210,15 +257,18 @@
 
 	// A markdown-table separator row: pipes, dashes, colons, spaces, ≥1 dash.
 	const TABLE_SEP = /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/;
-	const isTableRow = (l) => l.includes('|') && l.trim() !== '';
+	const isTableRow = (l: string): boolean => l.includes('|') && l.trim() !== '';
+
+	// A parsed span of text output: plain monospace text, or a rendered md table.
+	type TextSegment = { type: 'text'; text: string } | { type: 'table'; html: string };
 	// Split plain text into segments: contiguous markdown tables (header row +
 	// separator row + body rows) become {type:'table'}; everything else stays
 	// {type:'text'}. A table needs a header line immediately followed by a
 	// separator line, so ordinary pipe-containing text is left untouched.
-	function textSegments(text) {
+	function textSegments(text: string): TextSegment[] {
 		const lines = text.split('\n');
-		const segs = [];
-		let buf = [];
+		const segs: TextSegment[] = [];
+		let buf: string[] = [];
 		const flush = () => {
 			if (buf.length) segs.push({ type: 'text', text: buf.join('\n') });
 			buf = [];
@@ -238,7 +288,7 @@
 		return segs;
 	}
 	// Render a markdown table to sanitized HTML, then apply daisyUI table classes.
-	function renderTable(src) {
+	function renderTable(src: string): string {
 		if (!browser) return '';
 		const html = DOMPurify.sanitize(md.render(src));
 		return html.replace(/<table>/g, '<table class="table table-zebra table-xs">');
@@ -247,8 +297,22 @@
 	// Map an nbformat output object to a renderable {tone, text, segments}. Text
 	// outputs (stdout / stderr / result) carry parsed segments so embedded
 	// markdown tables render as real tables; errors stay raw monospace.
-	function renderOutput(o) {
-		let tone, text;
+	// A renderable output. `dataframe`/`plotly` are dynamic mimebundle payloads
+	// (untyped JSON from the kernel) handed straight to the typed child renderers,
+	// so they are `any` at this boundary.
+	interface RenderedOutput {
+		tone: string;
+		text?: string;
+		dataframe?: any;
+		plotly?: any;
+		image?: string;
+		html?: string;
+		segments: TextSegment[] | null;
+	}
+
+	function renderOutput(o: CellOutput): RenderedOutput {
+		let tone = 'stdout';
+		let text = '';
 		switch (o.output_type) {
 			case 'stream':
 				tone = o.name === 'stderr' ? 'stderr' : 'stdout';
@@ -319,9 +383,9 @@
 	// output index; a re-run rebuilds `outputs` and resets the choice, which is
 	// the honest default (a new render is a fresh image), so it never touches the
 	// `.ipynb`.
-	let fullImages = $state(new Set());
+	let fullImages = $state<Set<number>>(new Set());
 	const hasFullImage = $derived(fullImages.size > 0);
-	function toggleFullImage(i) {
+	function toggleFullImage(i: number) {
 		const next = new Set(fullImages);
 		if (next.has(i)) next.delete(i);
 		else next.add(i);
@@ -333,7 +397,7 @@
 	// (undefined = auto, true = force scrolled, false = force full). Above a
 	// height threshold we auto-scroll unless the user set an explicit choice.
 	const SCROLL_THRESHOLD = 360; // px of output beyond which we contract by default
-	let outputInner = $state(null);
+	let outputInner = $state<HTMLElement | null>(null);
 	let outputTall = $state(false);
 	// The DataFrame grid — and a full-size image — manage their own fixed height +
 	// scroll, so they must not also be wrapped in the outer output-scroll box (that
@@ -392,7 +456,7 @@
 				: 'border-info ring-1 ring-info/60'
 	);
 
-	const toneClass = {
+	const toneClass: Record<string, string> = {
 		stdout: 'text-base-content border-transparent',
 		stderr: 'text-warning border-warning/40',
 		result: 'text-success font-semibold border-success/40',
@@ -402,8 +466,8 @@
 	// ---- Cell-type menu (Python / SQL / Markdown) ---------------------------
 	// A native popover so the menu renders in the top layer, unclipped by the
 	// card's `overflow-hidden`. Positioned under its trigger button on open.
-	let typeMenuEl = $state(null);
-	let typeBtnEl = $state(null);
+	let typeMenuEl = $state<HTMLElement | null>(null);
+	let typeBtnEl = $state<HTMLElement | null>(null);
 	function openTypeMenu() {
 		if (!typeMenuEl || !typeBtnEl) return;
 		typeMenuEl.showPopover();
@@ -412,7 +476,13 @@
 		typeMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
 		typeMenuEl.style.top = r.bottom + 4 + 'px';
 	}
-	function chooseType(type) {
+	// The cell-type menu options (Python / SQL / Markdown).
+	const TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
+		{ v: 'code', label: 'Python', hint: 'python3' },
+		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
+		{ v: 'markdown', label: 'Markdown', hint: 'text' }
+	];
+	function chooseType(type: LogicalCellType) {
 		typeMenuEl?.hidePopover();
 		if (type !== logicalType) onSetType(cell.id, type);
 	}
@@ -423,7 +493,7 @@
 
 	// Replace the editor's whole document with `src` without echoing it back to
 	// the server as a local edit (the update listener honors `applyingRemote`).
-	function applySourceToEditor(src) {
+	function applySourceToEditor(src: string) {
 		if (!view) return;
 		applyingRemote = true;
 		try {
@@ -465,7 +535,7 @@
 	 * the caller persists the new source itself, and reuses the remote-apply path
 	 * so the update listener doesn't echo the same text back as a second save.
 	 */
-	function replaceSource(src) {
+	function replaceSource(src: string) {
 		clearTimeout(editTimer);
 		editPending = false;
 		applySourceToEditor(src);
@@ -483,7 +553,7 @@
 	// kernel); for code the parent runs it on the kernel. `focusNext` lets a
 	// command-mode Shift+Enter advance the *selection* without dropping into the
 	// next cell's editor, while an edit-mode one keeps typing there (Jupyter).
-	function doRun(advance, { focusNext = true } = {}) {
+	function doRun(advance: boolean = false, { focusNext = true }: { focusNext?: boolean } = {}) {
 		const src = currentSource();
 		liveSource = src;
 		savedSource = src;
@@ -609,7 +679,8 @@
 				]
 			})
 		});
-		if (import.meta.env.DEV) (window.cellarViews ??= {})[cell.id] = view;
+		// Dev-only debug handle; `cellarViews` is not a standard Window property.
+		if (import.meta.env.DEV) ((window as any).cellarViews ??= {})[cell.id] = view;
 		// The imperative surface the notebook's shortcut actions drive. `run` goes
 		// through `doRun` so it always uses the editor's *live* text, even when the
 		// 500ms edit debounce has not fired yet.
@@ -886,7 +957,7 @@
 							class="flex items-center gap-1 text-[11px] text-base-content/70"
 							data-testid="queued-indicator"
 							data-queue-position={queuedPosition}
-							title={`Waiting for the shared kernel — ${queuedPosition === 1 ? 'next to run' : `${queuedPosition - 1} run${queuedPosition === 2 ? '' : 's'} ahead`}`}
+							title={`Waiting for the shared kernel — ${queuedPosition === 1 ? 'next to run' : `${queuedPosition! - 1} run${queuedPosition === 2 ? '' : 's'} ahead`}`}
 						>
 							<!-- clock: waiting, not working -->
 							<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>
@@ -916,7 +987,7 @@
 							data-testid="type-menu"
 						>
 							<div class="flex w-36 flex-col gap-0.5">
-								{#each [{ v: 'code', label: 'Python', hint: 'python3' }, { v: 'sql', label: 'SQL', hint: 'spark.sql' }, { v: 'markdown', label: 'Markdown', hint: 'text' }] as opt}
+								{#each TYPE_OPTIONS as opt}
 									<button
 										class="flex items-center justify-between rounded px-2 py-1 text-left hover:bg-base-200 {logicalType === opt.v ? 'font-semibold text-primary' : 'text-base-content'}"
 										onclick={() => chooseType(opt.v)}

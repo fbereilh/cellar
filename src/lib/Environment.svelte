@@ -15,8 +15,9 @@
 -->
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import type { EnvironmentResult } from '$lib/server/environment';
 
-	let env = $state(null);
+	let env = $state<EnvironmentResult | null>(null);
 	let error = $state('');
 	let loading = $state(false);
 
@@ -31,11 +32,11 @@
 			const body = await res.json();
 			if (mine !== seq) return; // superseded
 			if (!res.ok && !body) throw new Error('failed to read the environment');
-			env = body;
+			env = body as EnvironmentResult;
 			error = '';
 		} catch (err) {
 			if (mine !== seq) return;
-			error = String(err?.message ?? err);
+			error = String((err as Error)?.message ?? err);
 		} finally {
 			if (mine === seq) loading = false;
 		}
@@ -49,7 +50,7 @@
 	}
 
 	const ready = $derived(!!env?.ok);
-	const packages = $derived(env?.packages ?? []);
+	const packages = $derived(env?.ok ? env.packages : []);
 
 	const requirements = $derived(
 		packages
@@ -67,9 +68,9 @@
 	);
 
 	// ---- Export -------------------------------------------------------------
-	let copied = $state(''); // 'req' | 'path' | ''
-	let copyTimer;
-	async function copyText(kind, text) {
+	let copied = $state<'req' | 'path' | ''>(''); // 'req' | 'path' | ''
+	let copyTimer: ReturnType<typeof setTimeout>;
+	async function copyText(kind: 'req' | 'path', text: string) {
 		try {
 			await navigator.clipboard.writeText(text);
 			copied = kind;
@@ -91,7 +92,7 @@
 			if (!res.ok || !body?.ok) throw new Error(body?.message || 'failed to save requirements.txt');
 			savedPath = body.path;
 		} catch (err) {
-			saveError = String(err?.message ?? err);
+			saveError = String((err as Error)?.message ?? err);
 		} finally {
 			saving = false;
 		}
@@ -110,7 +111,7 @@
 		<div class="flex items-center gap-2 px-1 py-2 text-xs text-base-content/40">
 			<span class="loading loading-spinner loading-xs"></span> reading environment…
 		</div>
-	{:else if !ready}
+	{:else if !env || !env.ok}
 		<!-- No venv resolvable: guide the user, never blank / crash. -->
 		<div class="rounded-lg border border-dashed border-base-300 bg-base-100 p-2.5" data-testid="env-no-venv">
 			<p class="text-xs font-medium text-base-content/70">No Python environment bound</p>
@@ -125,7 +126,7 @@
 				</p>
 			{/if}
 		</div>
-	{:else}
+	{:else if env && env.ok}
 		<!-- Interpreter facts -->
 		<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="env-card">
 			<div class="flex items-center justify-between gap-2">

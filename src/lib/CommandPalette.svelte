@@ -10,14 +10,23 @@
 	// command list itself.
 	import { tick } from 'svelte';
 	import { filterCommands } from '$lib/commands';
+	import type { PaletteCommand, ScoredCommand } from '$lib/commands';
 	import { chordTokens, formatChord } from '$lib/shortcuts.svelte';
 
-	let { open, commands, onClose } = $props();
+	interface Props {
+		open: boolean;
+		commands: PaletteCommand[];
+		onClose?: () => void;
+	}
+	let { open, commands, onClose }: Props = $props();
 
 	let query = $state('');
 	let activeIndex = $state(0);
-	let inputEl = $state(null);
-	let listEl = $state(null);
+	let inputEl = $state<HTMLInputElement | null>(null);
+	let listEl = $state<HTMLDivElement | null>(null);
+
+	// One result row: the scored command plus its flat index into `results`.
+	type IndexedResult = ScoredCommand & { index: number };
 
 	// Ranked, flat results (disabled commands are already dropped by filterCommands).
 	const results = $derived(filterCommands(commands, query));
@@ -27,17 +36,19 @@
 	// agree regardless of category boundaries.
 	const groups = $derived(
 		(() => {
-			const order = [];
-			const byCat = new Map();
+			const order: string[] = [];
+			const byCat = new Map<string, IndexedResult[]>();
 			results.forEach((entry, index) => {
 				const cat = entry.command.category;
-				if (!byCat.has(cat)) {
-					byCat.set(cat, []);
+				let bucket = byCat.get(cat);
+				if (!bucket) {
+					bucket = [];
+					byCat.set(cat, bucket);
 					order.push(cat);
 				}
-				byCat.get(cat).push({ ...entry, index });
+				bucket.push({ ...entry, index });
 			});
-			return order.map((cat) => ({ category: cat, items: byCat.get(cat) }));
+			return order.map((cat) => ({ category: cat, items: byCat.get(cat) ?? [] }));
 		})()
 	);
 
@@ -61,7 +72,7 @@
 		listEl?.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest' });
 	});
 
-	function run(entry) {
+	function run(entry: ScoredCommand | undefined) {
 		if (!entry) return;
 		onClose?.();
 		// Run after the modal is torn down so an action that focuses a cell lands
@@ -69,7 +80,7 @@
 		entry.command.run();
 	}
 
-	function onKeydown(e) {
+	function onKeydown(e: KeyboardEvent) {
 		if (e.key === 'ArrowDown') {
 			e.preventDefault();
 			if (results.length) activeIndex = (activeIndex + 1) % results.length;
@@ -86,10 +97,10 @@
 	}
 
 	// Split a title into matched / unmatched runs so matched characters can be bold.
-	function segments(title, positions) {
+	function segments(title: string, positions: number[]): { text: string; hit: boolean }[] {
 		if (!positions?.length) return [{ text: title, hit: false }];
 		const set = new Set(positions);
-		const out = [];
+		const out: { text: string; hit: boolean }[] = [];
 		let buf = '';
 		let hit = set.has(0);
 		for (let i = 0; i < title.length; i++) {

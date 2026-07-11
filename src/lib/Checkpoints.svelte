@@ -14,14 +14,19 @@
 	import { onMount } from 'svelte';
 	import { subscribeEvents, originId } from '$lib/events-client';
 	import { relativeTimeLong } from '$lib/relativeTime';
+	import type { CheckpointMeta, CheckpointTrigger } from '$lib/server/checkpoints';
 
-	let { notebookPath = null } = $props();
+	interface Props {
+		notebookPath?: string | null;
+	}
 
-	let checkpoints = $state([]);
+	let { notebookPath = null }: Props = $props();
+
+	let checkpoints = $state<CheckpointMeta[]>([]);
 	let error = $state('');
 	let loading = $state(false);
 	let busy = $state(false); // a create/restore is in flight
-	let confirmId = $state(null); // the checkpoint id awaiting a restore confirmation
+	let confirmId = $state<string | null>(null); // the checkpoint id awaiting a restore confirmation
 	let seq = 0;
 
 	// A ticking clock so the relative timestamps ("2 minutes ago") stay current.
@@ -44,7 +49,7 @@
 			error = '';
 		} catch (err) {
 			if (mine !== seq) return;
-			error = String(err?.message ?? err);
+			error = String((err as Error)?.message ?? err);
 		} finally {
 			if (mine === seq) loading = false;
 		}
@@ -70,7 +75,7 @@
 		load();
 	});
 
-	async function post(action, extra = {}) {
+	async function post(action: string, extra: Record<string, unknown> = {}) {
 		if (!notebookPath || busy) return null;
 		busy = true;
 		try {
@@ -85,7 +90,7 @@
 			error = '';
 			return body;
 		} catch (err) {
-			error = String(err?.message ?? err);
+			error = String((err as Error)?.message ?? err);
 			return null;
 		} finally {
 			busy = false;
@@ -100,7 +105,7 @@
 		post('create');
 	}
 
-	async function restore(id) {
+	async function restore(id: string) {
 		confirmId = null;
 		await post('restore', { id });
 	}
@@ -110,12 +115,12 @@
 
 	const hasAgentCheckpoint = $derived(checkpoints.some((c) => c.trigger === 'agent'));
 
-	function triggerLabel(t) {
+	function triggerLabel(t: CheckpointTrigger): string {
 		if (t === 'agent') return 'agent';
 		if (t === 'restore') return 'pre-restore';
 		return 'manual';
 	}
-	function triggerBadge(t) {
+	function triggerBadge(t: CheckpointTrigger): string {
 		if (t === 'agent') return 'badge-warning';
 		if (t === 'restore') return 'badge-info';
 		return 'badge-primary';

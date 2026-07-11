@@ -2,8 +2,16 @@
 	// Settings panel (modal): theme toggle, the project-venv (Python kernel)
 	// control, and the keyboard-shortcut registry (view + rebind).
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
+	import type { VenvInfo } from '$lib/server/venv-bind';
 
-	let { open, theme, onClose, onSetTheme, onVenvRebound } = $props();
+	interface Props {
+		open: boolean;
+		theme: string;
+		onClose?: () => void;
+		onSetTheme: (id: string) => void;
+		onVenvRebound?: () => void;
+	}
+	let { open, theme, onClose, onSetTheme, onVenvRebound }: Props = $props();
 
 	const THEMES = [
 		{ id: 'dim', label: 'Dark', hint: 'dim' },
@@ -18,15 +26,15 @@
 	const customized = $derived(shortcuts.list.some((s) => s.customized));
 
 	// The binding slot currently listening for a new chord: `{id, index}`.
-	let capturing = $state(null);
-	const isCapturing = (id, i) => capturing?.id === id && capturing.index === i;
+	let capturing = $state<{ id: string; index: number } | null>(null);
+	const isCapturing = (id: string, i: number) => capturing?.id === id && capturing.index === i;
 
 	// A captured chord that would shadow a typable character, held for the user to
 	// confirm: `{id, index, chord}`. Binding `k` to an edit-mode or global command
 	// really does make `k` untypable in every cell, so we say so in as many words,
 	// and then, if they still want it, we do it. The freedom is the point; the
 	// surprise is what we refuse.
-	let pendingHazard = $state(null);
+	let pendingHazard = $state<{ id: string; index: number; chord: string } | null>(null);
 
 	// While capturing, swallow every keystroke and turn the first real chord into
 	// the new binding. Escape cancels (its own binding is reachable via Reset).
@@ -35,7 +43,7 @@
 	$effect(() => {
 		if (!capturing) return;
 		const slot = capturing;
-		function onKey(e) {
+		function onKey(e: KeyboardEvent) {
 			e.preventDefault();
 			e.stopPropagation();
 			if (e.key === 'Escape') {
@@ -74,13 +82,13 @@
 
 	// Starting a new capture supersedes any unanswered hazard confirmation, so the
 	// two prompts can never be on screen at once.
-	function startCapture(id, index) {
+	function startCapture(id: string, index: number) {
 		pendingHazard = null;
 		capturing = { id, index };
 	}
 
 	// ---- Venv control --------------------------------------------------------
-	let venv = $state(null);
+	let venv = $state<VenvInfo | null>(null);
 	let venvPath = $state('');
 	let busy = $state(false);
 	let error = $state('');
@@ -91,10 +99,10 @@
 		notice = '';
 		try {
 			const res = await fetch('/api/venv');
-			venv = await res.json();
+			venv = (await res.json()) as VenvInfo;
 			venvPath = venv?.venvDir || venv?.defaultVenv || '';
 		} catch (err) {
-			error = String(err?.message ?? err);
+			error = String((err as Error)?.message ?? err);
 		}
 	}
 
@@ -105,7 +113,17 @@
 		wasOpen = open;
 	});
 
-	async function bind({ path, create }) {
+	// The POST /api/venv response (see the venv route): the bind result plus the
+	// refreshed VenvInfo.
+	interface BindResponse {
+		ok?: boolean;
+		message?: string;
+		info?: VenvInfo;
+		created?: boolean;
+		installedIpykernel?: boolean;
+	}
+
+	async function bind({ path, create }: { path: string; create: boolean }) {
 		if (busy) return;
 		busy = true;
 		error = '';
@@ -116,16 +134,16 @@
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ path, create })
 			});
-			const body = await res.json();
+			const body = (await res.json()) as BindResponse;
 			if (!res.ok || !body.ok) throw new Error(body?.message || 'failed to bind venv');
-			venv = body.info;
+			venv = body.info ?? null;
 			venvPath = venv?.venvDir || path;
 			notice = body.created
 				? `Created venv and bound the kernel to it${body.installedIpykernel ? ' (installed ipykernel)' : ''}.`
 				: `Bound the kernel to the selected venv${body.installedIpykernel ? ' (installed ipykernel)' : ''}.`;
 			onVenvRebound?.();
 		} catch (err) {
-			error = String(err?.message ?? err);
+			error = String((err as Error)?.message ?? err);
 		} finally {
 			busy = false;
 		}
