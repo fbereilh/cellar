@@ -85,6 +85,26 @@ Open the sidebar's **Databricks** section, pick a profile and cluster, and click
 - **Python 3.9+**
 - **[`uv`](https://docs.astral.sh/uv/)** on your `PATH` (Cellar uses it for all venv and package management)
 
+## Testing
+
+Two layers, run with:
+
+```bash
+npm run test       # vitest unit suite  (fast, no browser, no kernel)
+npm run test:e2e   # playwright smoke   (boots the real app + kernel; local)
+```
+
+- **Unit tests** (`tests/unit/`) guard the pure server logic — the crown jewel is
+  clean-on-save: idempotent, git-clean round-trips, the metadata allowlist, memory-address
+  scrubbing, and the notebook model (stable cell IDs, add/move/delete, duplicate-ID
+  re-keying). These are the **must-pass gate and run on every PR in CI**.
+- **E2E smoke** (`tests/e2e/smoke.spec.ts`, one spec) boots the real `cellar` launcher
+  against a scratch workspace, runs `6*7`, asserts `42` renders, and confirms the saved
+  `.ipynb` is valid. It needs the full kernel runtime (`uv` + `python3` + the cached
+  host-venv), so it is a **local, best-effort** check and skips itself when that runtime is
+  absent. CI does not provide the kernel runtime, so the E2E is not run there — the unit
+  suite is what gates merges. Install the browser once with `npx playwright install chromium`.
+
 ## License
 
 Released under the [MIT License](LICENSE).

@@ -4,6 +4,10 @@ node_modules/
 build/
 *.log
 
+# Playwright E2E artifacts
+test-results/
+playwright-report/
+
 # workspace notebook artifact (created when cellar runs in this folder)
 notebook.ipynb
 
