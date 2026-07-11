@@ -34,6 +34,24 @@ export interface SegHidden {
 	bodies: Set<number>;
 }
 
+/** Imperative fold controls a notebook publishes to the sidebar Outline. */
+export interface FoldRegistryHandle {
+	toggle: (key: string) => void;
+	collapseAll: () => void;
+	expandAll: () => void;
+}
+
+/** Imperative notebook controls the shell hands to the sidebar + command palette. */
+export interface NotebookApiHandle {
+	insertAndRunCode: (source: string) => void;
+	dispatch: (shortcutId: string) => void;
+	runAll: () => void;
+	clearAll: () => void;
+	runAbove: () => void;
+	runBelow: () => void;
+	runStale: () => void;
+}
+
 /**
  * The imperative handle a `Cell.svelte` hands up to its notebook via
  * `onRegister(id, api | null)`. The notebook's keyboard dispatcher and the

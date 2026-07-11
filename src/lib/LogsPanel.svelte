@@ -15,25 +15,39 @@
 	 */
 	import { onMount, tick } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
+	import type { LogEntry, LogLevel } from '$lib/server/logs';
 
-	let { open = false, onClose } = $props();
+	interface Props {
+		open?: boolean;
+		onClose?: () => void;
+	}
+
+	let { open = false, onClose }: Props = $props();
 
 	/** Client mirror of the server ring buffer (bounded to the same cap). */
 	const MAX_ENTRIES = 1000;
-	let entries = $state([]);
-	let bySeq = new Map(); // seq → index, so a coalesced repeat updates in place
+	let entries = $state<LogEntry[]>([]);
+	let bySeq = new Map<number, number>(); // seq → index, so a coalesced repeat updates in place
 
-	let levelFilter = $state('all'); // 'all' | 'warn' | 'error'
+	let levelFilter = $state<'all' | LogLevel>('all'); // 'all' | 'warn' | 'error'
 	let search = $state('');
 	let autoScroll = $state(true);
 	let loaded = $state(false);
 	let copied = $state(false);
 
-	let scrollEl = $state(null);
+	let scrollEl = $state<HTMLDivElement | null>(null);
 
 	// Level filter as an inclusion set. 'warn' means warn+error; 'error' means error.
-	const LEVEL_RANK = { info: 0, warn: 1, error: 2 };
+	const LEVEL_RANK: Record<LogLevel, number> = { info: 0, warn: 1, error: 2 };
 	const filterFloor = $derived(levelFilter === 'error' ? 2 : levelFilter === 'warn' ? 1 : 0);
+
+	// Level filter buttons: value + label, typed so the click handler assigns a
+	// valid `levelFilter`.
+	const LEVEL_FILTERS: [('all' | LogLevel), string][] = [
+		['all', 'All'],
+		['warn', 'Warn+'],
+		['error', 'Error']
+	];
 
 	const filtered = $derived.by(() => {
 		const q = search.trim().toLowerCase();
@@ -58,7 +72,7 @@
 		bySeq = new Map(entries.map((e, i) => [e.seq, i]));
 	}
 
-	function pushEntry(entry) {
+	function pushEntry(entry: LogEntry) {
 		const existing = bySeq.get(entry.seq);
 		if (existing != null) {
 			// A coalesced repeat: the server re-published the same seq with a bumped count.
@@ -93,7 +107,7 @@
 		backfill();
 		const unsub = subscribeEvents((ev) => {
 			if (ev.type === 'log' && ev.entry) {
-				pushEntry(ev.entry);
+				pushEntry(ev.entry as LogEntry);
 				scrollToTail();
 			} else if (ev.type === 'log:cleared') {
 				entries = [];
@@ -122,15 +136,15 @@
 		if (open && loaded) scrollToTail();
 	});
 
-	function fmtTime(ts) {
+	function fmtTime(ts: number) {
 		const d = new Date(ts);
-		const p = (n, w = 2) => String(n).padStart(w, '0');
+		const p = (n: number, w = 2) => String(n).padStart(w, '0');
 		return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
 	}
 
 	async function copyLogs() {
 		const text = filtered
-			.map((e) => `${fmtTime(e.ts)} ${e.level.toUpperCase().padEnd(5)} [${e.source}] ${e.message}${e.count > 1 ? ` (x${e.count})` : ''}`)
+			.map((e) => `${fmtTime(e.ts)} ${e.level.toUpperCase().padEnd(5)} [${e.source}] ${e.message}${(e.count ?? 1) > 1 ? ` (x${e.count})` : ''}`)
 			.join('\n');
 		try {
 			await navigator.clipboard.writeText(text);
@@ -149,7 +163,7 @@
 		bySeq = new Map();
 	}
 
-	const levelClass = (level) =>
+	const levelClass = (level: LogLevel) =>
 		level === 'error' ? 'text-error' : level === 'warn' ? 'text-warning' : 'text-base-content/70';
 </script>
 
@@ -170,7 +184,7 @@
 
 			<!-- Level filter -->
 			<div class="join ml-2">
-				{#each [['all', 'All'], ['warn', 'Warn+'], ['error', 'Error']] as [val, label]}
+				{#each LEVEL_FILTERS as [val, label]}
 					<button
 						class="btn btn-xs join-item {levelFilter === val ? 'btn-active btn-neutral' : 'btn-ghost'}"
 						onclick={() => (levelFilter = val)}
@@ -228,7 +242,7 @@
 						<span class="shrink-0 text-base-content/40 tabular-nums">{fmtTime(e.ts)}</span>
 						<span class="shrink-0 uppercase {levelClass(e.level)}" style="width: 3.2rem">{e.level}</span>
 						<span class="shrink-0 text-base-content/50">[{e.source}]</span>
-						<span class="{e.level === 'error' ? 'text-error' : e.level === 'warn' ? 'text-warning' : 'text-base-content/90'}">{e.message}{#if e.count > 1}<span class="ml-1 text-base-content/40">(×{e.count})</span>{/if}</span>
+						<span class="{e.level === 'error' ? 'text-error' : e.level === 'warn' ? 'text-warning' : 'text-base-content/90'}">{e.message}{#if (e.count ?? 1) > 1}<span class="ml-1 text-base-content/40">(×{e.count})</span>{/if}</span>
 					</div>
 				{/each}
 			{/if}
