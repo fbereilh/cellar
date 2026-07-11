@@ -23,13 +23,13 @@ It saves ordinary `.ipynb` files that open in vanilla Jupyter, and it keeps them
 
 ```sh
 brew trust --formula fbereilh/cellar/cellar
-brew install --HEAD fbereilh/cellar/cellar     # tracks the latest main
+brew install fbereilh/cellar/cellar
 ```
 
-Prefer a pinned, versioned build? Drop `--HEAD`:
+Want the bleeding edge instead of the latest release? Add `--HEAD` to track `main`:
 
 ```sh
-brew install fbereilh/cellar/cellar
+brew install --HEAD fbereilh/cellar/cellar
 ```
 
 > **Why trust?** Homebrew requires a one-time trust before it will load a third-party tap's formula; `--formula` trusts just this one (recommended). The install then auto-taps `fbereilh/cellar` for you, so there's no separate `brew tap` step.
