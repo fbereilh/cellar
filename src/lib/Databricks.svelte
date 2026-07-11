@@ -616,7 +616,7 @@
 									class="flex w-full items-center gap-1.5 rounded border border-base-300 px-1.5 py-1 text-left hover:border-primary/50 hover:bg-base-300/40 disabled:opacity-50"
 									onclick={() => connect(c)}
 									disabled={!!busy}
-									title="Connect `spark` to {c.name}"
+									title="Connect 'spark' to {c.name}"
 									data-testid="databricks-cluster"
 								>
 									<span class="min-w-0 flex-1">
