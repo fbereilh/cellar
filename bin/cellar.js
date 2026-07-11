@@ -26,6 +26,7 @@
  *                                   live instance across all workspaces.
  *
  * Flags:
+ *   --help / -h                 print this usage message and exit
  *   --version / -v              print the version + build/git-sha and exit
  *   --update                    fetch + install the latest cellar and exit
  *                               (install-method aware: Homebrew or git clone;
@@ -114,6 +115,14 @@ if (argv[0] === 'mcp') {
 	process.exit(0);
 }
 
+// `cellar --help` / `-h` — handled before the normal launcher arg parsing (like
+// `mcp` / `--version`) so it never boots a server and can't trip the unknown-flag
+// guard. Kept in sync with the top-of-file header JSDoc.
+if (argv.includes('--help') || argv.includes('-h')) {
+	printHelp();
+	process.exit(0);
+}
+
 // `cellar --version` / `cellar --update` — handled before the normal launcher
 // arg parsing (like `mcp`) so they never boot servers and their handling can't
 // trip the unknown-flag guard. REPO (the launcher's own install dir) is what the
@@ -149,7 +158,7 @@ function flagValue(...names) {
 function hasFlag(...names) {
 	return names.some((n) => argv.includes(n));
 }
-const KNOWN_FLAGS = new Set(['--version', '-v', '--update', '--workspace', '-w', '--venv', '--python', '--yes', '-y', '--dev', '--build', '--no-mcp-config', '--new', '--force']);
+const KNOWN_FLAGS = new Set(['--help', '-h', '--version', '-v', '--update', '--workspace', '-w', '--venv', '--python', '--yes', '-y', '--dev', '--build', '--no-mcp-config', '--new', '--force']);
 const VALUE_FLAGS = new Set(['--workspace', '-w', '--venv', '--python']);
 // First non-flag, non-flag-value token is the positional workspace path.
 let positional;
@@ -329,6 +338,39 @@ function promptYesNo(question) {
 			res(/^\s*y/i.test(ans));
 		});
 	});
+}
+
+function printHelp() {
+	console.log(`cellar - run a live, agent-connected notebook in any project directory.
+
+Usage:
+  cellar [path] [options]     start Cellar in a folder (default: cwd)
+  cellar mcp [options]        stdio <-> HTTP MCP bridge for the running instance
+  cellar ls                   list known cellar instances with liveness
+  cellar cleanup [options]    reap dead / orphaned instances
+
+Subcommands:
+  mcp        zero-config agent connection: bridge stdio to the live instance
+             (fails fast if no cellar is running in the workspace)
+  ls         list registered + untracked cellar instances and whether each is alive
+  cleanup    reap dead/orphaned instances; --all also stops every live instance
+
+Options:
+  --help, -h              print this usage message and exit
+  --version, -v           print the version + build/git-sha and exit
+  --update                fetch + install the latest cellar and exit (never launches)
+  [path] / --workspace <dir>  open another repo without cd-ing (default: cwd)
+  --venv <dir>            explicit project venv (or CELLAR_VENV)
+  --python <path>         bind an arbitrary interpreter (no venv create / install)
+  --yes, -y               auto-approve venv create / ipykernel install
+  --dev                   run the Vite dev server instead of the production build
+  --no-mcp-config         do not write/merge <workspace>/.mcp.json
+  --new / --force         start a second instance in a folder that already has one
+
+Examples:
+  cellar                  start Cellar in the current directory
+  cellar ../other-repo    start Cellar scoped to another repo
+  cellar --update         update Cellar to the latest version`);
 }
 
 async function listInstancesCommand() {
