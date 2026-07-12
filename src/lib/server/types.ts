@@ -65,6 +65,8 @@ export interface CellarNamespace {
 	language?: string;
 	/** Cell role, e.g. the pinned imports cell ('imports'). */
 	role?: string | null;
+	/** nbdev-style export flag: include this code cell in the `.py` module. */
+	export?: boolean;
 	/** Runtime-only run stamp (never persisted). */
 	lastRun?: LastRun;
 	/** Runtime-only wall-clock ms the source last changed (never persisted). */
@@ -114,6 +116,8 @@ export interface NotebookView {
 	workspace: string;
 	path: string;
 	cells: CellView[];
+	/** nbdev-style export target (`.py` module path), or null when unset. */
+	exportTarget: string | null;
 }
 
 /** nbformat kernelspec. */
@@ -124,10 +128,17 @@ export interface KernelSpec {
 	[key: string]: unknown;
 }
 
+/** Notebook-level `cellar` metadata namespace (round-trips through clean-on-save). */
+export interface NotebookCellarNamespace {
+	/** nbdev-style export target: a workspace-relative `.py` module path. */
+	export_target?: string;
+	[key: string]: unknown;
+}
+
 /** nbformat notebook metadata (only `kernelspec`/`cellar` survive a clean). */
 export interface NotebookMetadata {
 	kernelspec?: KernelSpec;
-	cellar?: Record<string, unknown>;
+	cellar?: NotebookCellarNamespace;
 	[key: string]: unknown;
 }
 

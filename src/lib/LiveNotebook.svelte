@@ -6,6 +6,7 @@
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
+	import { exportCellCount } from '$lib/exportRole';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
@@ -39,12 +40,14 @@
 	type StructuralEvent =
 		| { type: 'cell:added'; cell?: CellView; afterId?: string | null; index?: number }
 		| { type: 'cell:role'; cellId: string; role?: string | null }
+		| { type: 'cell:export'; cellId: string; exported: boolean }
 		| { type: 'cell:deleted'; cellId: string }
 		| { type: 'cell:moved'; cellId: string; toIndex: number }
 		| { type: 'cell:type'; cellId: string; cell_type: CellType; language?: string | null }
 		| { type: 'cell:cleared'; cellId: string }
 		| { type: 'cell:rendered'; cellId: string }
-		| { type: 'cell:edited'; cellId: string; source: string };
+		| { type: 'cell:edited'; cellId: string; source: string }
+		| { type: 'notebook:export-target'; target: string | null };
 
 	/** A run-lifecycle event (run:start / run:output / run:end). */
 	type RunEvent =
@@ -84,6 +87,13 @@
 	let cells = $state<UICell[]>([]);
 	let fetching = $state(true); // loading the notebook's cells from the server
 	let loadError = $state('');
+	// nbdev-style export: the notebook's `.py` module target + how many cells are
+	// marked for export. `exportTarget` mirrors `notebook.metadata.cellar.export_target`
+	// (loaded on mount, kept live via the `notebook:export-target` SSE event); the
+	// count derives from the live cell flags. Rendered as a header bar at the top of
+	// the notebook (Notebook.svelte) once either is set.
+	let exportTarget = $state<string | null>(null);
+	const exportCount = $derived(exportCellCount(cells));
 	let runningId = $state<string | null>(null); // the cell running in THIS notebook (≤1)
 	// Cells of THIS notebook waiting in the kernel's global FIFO → their 1-based
 	// position in that queue (1 = next up). The positions are global on purpose:
@@ -164,7 +174,7 @@
 	// action the modal keyboard runs for a registry shortcut id, so the palette and
 	// the keyboard share one handler and cannot diverge.
 	$effect(() => {
-		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale });
+		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy });
 		return () => onRegisterApi?.(path, null);
 	});
 
@@ -473,6 +483,7 @@
 			if (!res.ok) throw new Error(body?.message || 'could not open notebook');
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
+			exportTarget = body.notebook.exportTarget ?? null; // nbdev export target
 			// A notebook always has a selected cell (command mode acts on it), so
 			// j/k and the rest work the moment the notebook opens.
 			if (!activeId || !cells.some((c) => c.id === activeId)) activeId = cells[0]?.id ?? null;
@@ -544,6 +555,18 @@
 				else delete cellar.role;
 				cell.metadata = { ...(cell.metadata ?? {}), cellar };
 			}
+		} else if (ev.type === 'cell:export') {
+			// A cell was marked (or unmarked) for nbdev-style export. Reassign metadata
+			// for reactivity (the cell may have had no `cellar` namespace).
+			const cell = findCell(ev.cellId);
+			if (cell) {
+				const cellar = { ...(cell.metadata?.cellar ?? {}) };
+				if (ev.exported) cellar.export = true;
+				else delete cellar.export;
+				cell.metadata = { ...(cell.metadata ?? {}), cellar };
+			}
+		} else if (ev.type === 'notebook:export-target') {
+			exportTarget = ev.target;
 		} else if (ev.type === 'cell:deleted') {
 			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
@@ -689,7 +712,8 @@
 				return;
 			}
 			if (pe.originId && pe.originId === originId) return; // our own UI action
-			if (pe.type?.startsWith('cell:')) applyStructuralEvent(pe as unknown as StructuralEvent);
+			if (pe.type?.startsWith('cell:') || pe.type === 'notebook:export-target')
+				applyStructuralEvent(pe as unknown as StructuralEvent);
 			else applyRunEvent(pe as unknown as RunEvent);
 		})
 	);
@@ -900,6 +924,52 @@
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ role, nb: path, originId })
 		}).catch(() => {});
+	}
+
+	/**
+	 * Mark (or unmark) a code cell for nbdev-style export to the `.py` module.
+	 * Applied optimistically here (reassign metadata so the badge/menu react) and
+	 * persisted server-side, which also regenerates the module on save.
+	 */
+	async function setExport(id: string, exported: boolean) {
+		const cell = findCell(id);
+		if (cell) {
+			const cellar = { ...(cell.metadata?.cellar ?? {}) };
+			if (exported) cellar.export = true;
+			else delete cellar.export;
+			cell.metadata = { ...(cell.metadata ?? {}), cellar };
+		}
+		await fetch(`/api/cells/${id}`, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ export: exported, nb: path, originId })
+		}).catch(() => {});
+	}
+
+	/** Set (or clear) the notebook's `.py` export target. Optimistic + persisted. */
+	async function setExportTargetValue(target: string) {
+		exportTarget = target.trim() || null;
+		await fetch('/api/notebooks/export-py', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ op: 'set-target', target, path, originId })
+		}).catch(() => {});
+	}
+
+	/** Regenerate the `.py` module now (manual trigger). Returns the server result. */
+	async function exportPy() {
+		try {
+			const res = await fetch('/api/notebooks/export-py', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ op: 'export', path })
+			});
+			const body = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(body?.message || 'export failed');
+			return body as { written: boolean; target: string | null; count: number; reason?: 'no-target' | 'no-cells' | 'unchanged' };
+		} catch {
+			return null;
+		}
 	}
 
 	// ---- Cut / copy / paste / undo-delete ------------------------------------
@@ -1436,6 +1506,11 @@
 			onEdit={editCell}
 			onSetType={setType}
 			onSetRole={setRole}
+			onSetExport={setExport}
+			exportTarget={exportTarget}
+			exportCount={exportCount}
+			onSetExportTarget={setExportTargetValue}
+			onExportPy={exportPy}
 			onSetScrolled={setScrolled}
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}

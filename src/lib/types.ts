@@ -41,6 +41,14 @@ export interface FoldRegistryHandle {
 	expandAll: () => void;
 }
 
+/** Result of an nbdev-style `.py` module export. */
+export interface ExportPyResult {
+	written: boolean;
+	target: string | null;
+	count: number;
+	reason?: 'no-target' | 'no-cells' | 'unchanged';
+}
+
 /** Imperative notebook controls the shell hands to the sidebar + command palette. */
 export interface NotebookApiHandle {
 	insertAndRunCode: (source: string) => void;
@@ -50,6 +58,8 @@ export interface NotebookApiHandle {
 	runAbove: () => void;
 	runBelow: () => void;
 	runStale: () => void;
+	/** Regenerate the nbdev-style `.py` module now (manual "Export to .py"). */
+	exportPy: () => Promise<ExportPyResult | null>;
 }
 
 /**

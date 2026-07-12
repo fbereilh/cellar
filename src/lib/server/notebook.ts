@@ -26,6 +26,7 @@ import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
+import { exportNotebookToPy, type ExportResult } from './export-py';
 import { SQL_LANGUAGE } from '../cellLanguage';
 import type {
 	Cell,
@@ -126,6 +127,24 @@ function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCella
 function persist(doc: NotebookDoc): void {
 	if (doc.jpFormat) writePyNotebook(doc.path, doc.cells, doc.jpFormat);
 	else writeNotebook(doc.path, doc);
+	autoExportPy(doc);
+}
+
+/**
+ * Auto-regenerate the nbdev-style `.py` module on every save, so the module
+ * stays in lockstep with the notebook without a manual step. A no-op unless a
+ * target is configured AND at least one cell is marked for export (see
+ * `exportNotebookToPy`), and idempotent (skips the write when the bytes are
+ * unchanged). Never lets an export failure break the notebook save: a bad target
+ * only surfaces through the explicit "Export to .py" action.
+ */
+function autoExportPy(doc: NotebookDoc): void {
+	if (doc.jpFormat) return; // `.py` text notebooks carry no cellar cell metadata
+	try {
+		exportNotebookToPy(doc);
+	} catch {
+		/* auto-export is best-effort; the manual button surfaces real errors */
+	}
 }
 
 /**
@@ -198,10 +217,12 @@ function emit(doc: NotebookDoc, type: string, extra: Record<string, unknown>, or
 /** Serializable view of a notebook for the browser. */
 export function getNotebook(nb?: string | null): NotebookView {
 	const doc = docFor(nb);
+	const t = doc.metadata?.cellar?.export_target;
 	return {
 		workspace: workspace(),
 		path: doc.path,
-		cells: doc.cells.map(cellView)
+		cells: doc.cells.map(cellView),
+		exportTarget: typeof t === 'string' && t.trim() ? t.trim() : null
 	};
 }
 
@@ -481,6 +502,61 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
 }
 
 /**
+ * Mark (or unmark) a code cell for nbdev-style export in the allowlisted `cellar`
+ * namespace, so the flag round-trips through clean-on-save. Only a code cell can
+ * carry it (a markdown/SQL cell has no module source). `persist` regenerates the
+ * `.py` module as a side effect (auto-on-save).
+ */
+export function setCellExport(id: string, exported: boolean, nb?: string | null, originId?: string | null): boolean {
+	const doc = docFor(nb);
+	const cell = find(doc, id);
+	if (!cell || cell.cell_type !== 'code') return false;
+	cell.metadata = cell.metadata ?? {};
+	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	if (exported) cell.metadata.cellar.export = true;
+	else delete cell.metadata.cellar.export;
+	persist(doc);
+	emit(doc, 'cell:export', { cellId: id, exported: !!exported }, originId);
+	return true;
+}
+
+/** The notebook's configured export target (`.py` module path), or null. */
+export function getExportTarget(nb?: string | null): string | null {
+	const doc = docFor(nb);
+	const t = doc.metadata?.cellar?.export_target;
+	return typeof t === 'string' && t.trim() ? t.trim() : null;
+}
+
+/**
+ * Set (or clear, with null/'') the notebook-level export target in the
+ * allowlisted `cellar` namespace, so it round-trips through clean-on-save.
+ * Materializes `doc.metadata` if the notebook had none yet. `persist` regenerates
+ * the `.py` module as a side effect (auto-on-save).
+ */
+export function setExportTarget(target: string | null, nb?: string | null, originId?: string | null): boolean {
+	const doc = docFor(nb);
+	doc.metadata = doc.metadata ?? {};
+	doc.metadata.cellar = doc.metadata.cellar ?? {};
+	const trimmed = (target ?? '').trim();
+	if (trimmed) doc.metadata.cellar.export_target = trimmed;
+	else delete doc.metadata.cellar.export_target;
+	persist(doc);
+	emit(doc, 'notebook:export-target', { target: trimmed || null }, originId);
+	return true;
+}
+
+/**
+ * Regenerate the `.py` module on demand (the manual "Export to .py" action).
+ * Unlike the auto-on-save path, this surfaces a real error (bad target) to the
+ * caller rather than swallowing it.
+ */
+export function exportPy(nb?: string | null): ExportResult {
+	const doc = docFor(nb);
+	if (doc.jpFormat) throw new Error('cannot export a .py text notebook to a module');
+	return exportNotebookToPy(doc);
+}
+
+/**
  * Insert a cell at an absolute index. `addCell` can only insert AFTER a known id,
  * which cannot express "at the very top" — the one position the imports cell must
  * occupy. The `cell:added` event therefore carries an explicit `index` so the
@@ -576,6 +652,10 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
 	// SQL and markdown cells cannot be the Python imports cell.
 	if ((cell.cell_type === 'markdown' || isSql) && cell.metadata.cellar.role === IMPORTS_ROLE) {
 		delete cell.metadata.cellar.role;
+	}
+	// Only a Python code cell exports to the module; converting away drops the flag.
+	if ((cell.cell_type === 'markdown' || isSql) && cell.metadata.cellar.export) {
+		delete cell.metadata.cellar.export;
 	}
 	persist(doc);
 	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: isSql ? SQL_LANGUAGE : null }, originId);

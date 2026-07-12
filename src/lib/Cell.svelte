@@ -17,6 +17,7 @@
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
 	import { foldKey, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
+	import { isExportCell } from '$lib/exportRole';
 	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration } from '$lib/relativeTime';
 	import type { CellOutput, LogicalCellType } from '$lib/server/types';
@@ -56,6 +57,8 @@
 		onSetType: (id: string, type: LogicalCellType) => void;
 		/** Designate this cell the imports cell ('imports') or un-designate it (null). */
 		onSetRole: (id: string, role: string | null) => void;
+		/** Mark this code cell for nbdev-style `.py` export, or unmark it. */
+		onSetExport?: (id: string, exported: boolean) => void;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Per-cell code-editor collapse choice (undefined = auto / true / false). */
 		editorCollapsed?: boolean;
@@ -92,6 +95,7 @@
 		onEdit,
 		onSetType,
 		onSetRole,
+		onSetExport,
 		onSetScrolled,
 		editorCollapsed,
 		onSetEditorCollapsed,
@@ -149,6 +153,10 @@
 	// cell can hold the role, so the mark action is offered only when `canBeImports`.
 	const isImports = $derived(isImportsCell(cell));
 	const canBeImports = $derived(logicalType === 'code');
+	// nbdev-style export: this code cell is written to the notebook's `.py` module.
+	// Only a plain Python code cell can be, so the toggle rides the same `canBeImports`
+	// gate (code cells only) as the cell-actions menu it lives in.
+	const isExport = $derived(isExportCell(cell));
 
 	// A remote (agent / other-tab) source edit that arrived while the user was
 	// editing this cell, held until they choose to load it (the affordance below).
@@ -506,6 +514,10 @@
 		roleMenuEl?.hidePopover();
 		onSetRole(cell.id, isImports ? null : 'imports');
 	}
+	function toggleExport() {
+		roleMenuEl?.hidePopover();
+		onSetExport?.(cell.id, !isExport);
+	}
 
 	function currentSource() {
 		return view ? view.state.doc.toString() : cell.source;
@@ -851,6 +863,18 @@
 						imports
 					</span>
 				{/if}
+				{#if isExport}
+					<!-- Export marker: this code cell is written to the notebook's `.py`
+					     module (nbdev's `#|export`). -->
+					<span
+						class="badge badge-xs ml-1.5 flex items-center gap-1 badge-soft badge-accent font-medium"
+						title="Exported to the notebook's .py module. Set the target and re-export from the bar at the top; the module also regenerates on save."
+						data-testid="export-badge"
+					>
+						<svg class="h-2.5 w-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+						export
+					</span>
+				{/if}
 				{#if isSql}
 					<!-- SQL indicator: this code cell holds a SQL query run against `spark`. -->
 					<span
@@ -967,6 +991,14 @@
 							>
 								<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>
 								<span>{isImports ? 'Unmark as imports cell' : 'Mark as imports cell'}</span>
+							</button>
+							<button
+								class="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-base-200 {isExport ? 'text-base-content' : 'text-accent'}"
+								onclick={toggleExport}
+								data-testid="toggle-export"
+							>
+								<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+								<span>{isExport ? 'Unmark for export' : 'Mark for export to .py'}</span>
 							</button>
 						</div>
 					</div>
