@@ -41,7 +41,7 @@ async function databricksTool(fn: () => unknown) {
  * The `route_imports` contract, appended verbatim to every write tool that
  * accepts it. One string so the four descriptions cannot drift apart.
  */
-const ROUTE_IMPORTS_DOC = ` IMPORT ROUTING (default ON): any MODULE-LEVEL import in your source is moved into the notebook's single pinned "imports" cell at the top (created on demand), deduplicated against what is already there, removed from the code you submitted, and the imports cell is RUN so the kernel has it immediately. Imports nested inside a def/class/if/try body are never touched. The result carries an "imports" report {cell_id, added, run_status}. Pass route_imports:false to keep the import lines inline in this cell instead — do that when the import is deliberately local (a lazy or conditional import, or a cell demonstrating an import).`;
+const ROUTE_IMPORTS_DOC = ` IMPORT ROUTING (default ON): any MODULE-LEVEL import in your source is moved into the notebook's single "imports" cell (the user-designated cell wherever it sits, or created on demand), deduplicated against what is already there, removed from the code you submitted, and the imports cell is RUN so the kernel has it immediately. Imports nested inside a def/class/if/try body are never touched. The result carries an "imports" report {cell_id, added, run_status}. Pass route_imports:false to keep the import lines inline in this cell instead — do that when the import is deliberately local (a lazy or conditional import, or a cell demonstrating an import).`;
 
 /**
  * House-style doctrine handed to the agent once at connect (MCP server
@@ -55,10 +55,12 @@ narrative where each cell builds on the last.
 
 Follow this house style:
 
-1. IMPORTS GO AT THE TOP, ONCE — AND CELLAR PUTS THEM THERE FOR YOU. The notebook
-   has one pinned "imports" cell at index 0. When you write code through add_cell,
-   add_cells, edit_cell or add_and_run, any module-level import in it is moved into
-   that cell, deduplicated, and the cell is run — so just write the import where
+1. IMPORTS ARE COLLECTED IN ONE CELL — AND CELLAR PUTS THEM THERE FOR YOU. The
+   notebook has a single "imports" cell (the user may designate any code cell, and
+   it can live at any position; one is created on demand if none is designated).
+   When you write code through add_cell, add_cells, edit_cell or add_and_run, any
+   module-level import in it is moved into that cell, deduplicated, and the cell is
+   run — so just write the import where
    the code needs it and let it be routed. Your cell keeps only the real work.
    Imports inside a def/class/if/try body are left exactly where you put them.
    Pass route_imports:false when you mean an import to stay inline (a lazy or
@@ -234,7 +236,7 @@ function registerTools(server: McpServer) {
 		const r = await svc.editCell(id, source, { routeImports: route_imports ?? true });
 		return r ? text(r) : notFound(`cell ${id} not found`);
 	});
-	server.registerTool('consolidate_imports', { description: 'Sweep every MODULE-LEVEL import in the active notebook into one pinned "imports" cell at the top (deduplicated, __future__ first, canonically ordered), strip those lines from the cells they came from, and run the imports cell so the kernel has them. Imports nested inside a def/class/if/try body are deliberately left alone — a nested import is a choice (lazy loading, TYPE_CHECKING), not an accident. Idempotent: running it twice changes nothing and re-runs nothing.', inputSchema: {} }, async () => text(await svc.consolidate()));
+	server.registerTool('consolidate_imports', { description: 'Sweep every MODULE-LEVEL import in the active notebook into its single "imports" cell (the user-designated cell wherever it sits, or created at the top on demand; deduplicated, __future__ first, canonically ordered), strip those lines from the cells they came from, and run the imports cell so the kernel has them. Imports nested inside a def/class/if/try body are deliberately left alone — a nested import is a choice (lazy loading, TYPE_CHECKING), not an accident. Idempotent: running it twice changes nothing and re-runs nothing.', inputSchema: {} }, async () => text(await svc.consolidate()));
 	server.registerTool('create_checkpoint', { description: 'Snapshot the active notebook (cells + source + outputs + metadata) to a restorable checkpoint the human can revert to. Cellar already takes an automatic checkpoint before your mutations and runs (coalesced to one per turn), so you rarely need this — call it only to mark a deliberate restore point before a risky change. Returns the checkpoint metadata {id, at, trigger, label, cellCount}.', inputSchema: { label: z.string().optional() } }, async ({ label }) => text(svc.checkpoint(label)));
 	server.registerTool('delete_cell', { description: 'Delete a cell.', inputSchema: { id: z.string() } }, async ({ id }) => (svc.removeCell(id) ? text({ ok: true }) : notFound(`cell ${id} not found`)));
 	server.registerTool('move_cell', { description: 'Move a cell to an absolute index.', inputSchema: { id: z.string(), position: z.number().int() } }, async ({ id, position }) => (svc.moveCell(id, position) ? text({ ok: true }) : notFound(`cell ${id} not found`)));

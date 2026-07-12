@@ -1,9 +1,9 @@
 /**
- * Cellar — the pinned imports cell.
+ * Cellar — the imports cell.
  *
- * ONE code cell per notebook, pinned at index 0 and marked
- * `metadata.cellar.role = 'imports'`, holds the notebook's imports. Two things
- * fill it, and only these two:
+ * ONE user-choosable code cell per notebook, marked
+ * `metadata.cellar.role = 'imports'` and living at any index, holds the
+ * notebook's imports. Two things fill it, and only these two:
  *
  *   1. CONSOLIDATE (`consolidateImports`) — an explicit, human-invoked sweep that
  *      lifts every module-level import out of every cell.
@@ -26,7 +26,6 @@ import {
 	getCell,
 	setSource,
 	deleteCell,
-	moveCellTo,
 	addCellAt,
 	setCellRole,
 	getImportsCell,
@@ -68,26 +67,33 @@ export interface ConsolidateResult {
 }
 
 /**
- * The notebook's imports cell, creating it if needed.
+ * The notebook's imports cell, creating it only if there is nowhere to put the
+ * imports.
  *
- * ADOPTION. A notebook whose first cell is already nothing but imports (comments
- * and blank lines allowed) is the overwhelmingly common shape, and stacking a
- * second import cell on top of it would be absurd — so that cell is adopted and
- * given the role. Anything else gets a fresh cell inserted at index 0. An
- * already-designated cell is simply hoisted back to the top if it has drifted
- * (a notebook edited outside Cellar, or a role written by hand).
+ * The imports cell is user-choosable and un-pinned, so its POSITION is left
+ * exactly where the user (or a prior adoption) put it — this function never
+ * hoists a designated cell to the top.
  *
- * To look one up WITHOUT creating it, use `getImportsCell` — this function always
- * leaves the notebook with an imports cell at index 0.
+ *   1. A cell already carries the role → return it where it sits.
+ *   2. FALLBACK, no designated cell. A notebook whose first cell is already
+ *      nothing but imports (comments and blank lines allowed) is the common
+ *      shape, so that cell is adopted in place rather than stacking a second
+ *      import cell on top of it.
+ *   3. FALLBACK, nothing to adopt → a fresh code cell is inserted at index 0.
+ *      This is the ONE case that touches the top: a notebook with no imports cell
+ *      at all needs the imports to land somewhere sensible, and the top of the
+ *      notebook is where imports conventionally live. The user can then move it,
+ *      or designate a different cell.
+ *
+ * This is only ever called from the two deliberate import flows (agent routing
+ * and human consolidate); merely opening a notebook creates nothing. To look one
+ * up WITHOUT creating it, use `getImportsCell`.
  */
 export function ensureImportsCell(nb?: string | null, originId?: string | null): Cell | CellView {
 	const cells = listCells(nb);
 	const existing = cells.find(isImportsCell);
-	if (existing) {
-		if (cells[0].id !== existing.id) moveCellTo(existing.id, 0, nb, originId);
-		// The cell was just located in this doc, so getCell cannot miss it.
-		return getCell(existing.id, nb)!;
-	}
+	// Honor the user's designation wherever it is — do NOT hoist it to the top.
+	if (existing) return getCell(existing.id, nb)!;
 
 	const first = cells[0];
 	if (first && first.cell_type === 'code' && isImportsOnly(first.source)) {

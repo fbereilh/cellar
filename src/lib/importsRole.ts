@@ -1,14 +1,14 @@
 /**
- * Cellar — the imports cell's identity + pinning rule.
+ * Cellar — the imports cell's identity.
  *
  * ONE designated code cell per notebook holds the notebook's imports. It is
  * marked with `metadata.cellar.role = 'imports'` (the `cellar` namespace is the
  * one clean-on-save preserves, so the designation survives a save byte-for-byte
- * and produces no git noise) and it is pinned at index 0.
+ * and produces no git noise). The cell is user-choosable — any code cell can be
+ * designated — and it may live at ANY index: it is no longer pinned to the top.
  *
- * Both halves of the app need this: the server enforces the pin in `notebook.js`
- * and the browser must apply the SAME rule optimistically before its move POST
- * lands, or the two would disagree about where a cell went. Hence one pure,
+ * Both halves of the app read this identity: the server (`notebook.ts`) and the
+ * browser both need `isImportsCell`/`importsCellIndex`, so they live in one pure,
  * browser-safe module rather than a predicate copied on each side.
  */
 
@@ -42,20 +42,17 @@ export function importsCellIndex(cells: readonly RoleCell[] | null | undefined):
  * `toIndex` is an index into the array with the moved cell already removed —
  * the same convention `moveCellTo` uses.
  *
- * The imports cell is pinned: it never leaves the top, and nothing may be
- * inserted above it. Returns `-1` when the move must be refused outright (the
- * pinned imports cell itself was asked to move).
- *
- * A notebook whose imports cell is NOT yet at index 0 (e.g. one just adopted, or
- * an `.ipynb` written elsewhere) is left free to move until `ensureImportsCell`
- * hoists it — the pin is a rule about the cell at the top, not a lock on a role.
+ * The imports cell used to be pinned at index 0; it no longer is. A designated
+ * cell moves like any other and cells move freely above it, so this is now the
+ * identity function. It is kept (rather than deleted) because `notebook.ts` and
+ * `Notebook.svelte` call it at every move site: routing every move through one
+ * predicate leaves a single place to reintroduce a positional rule if one is
+ * ever wanted again, and keeps the server/browser move math sharing one source.
  */
 export function clampMoveIndex(
-	cells: readonly RoleCell[] | null | undefined,
-	fromIndex: number,
+	_cells: readonly RoleCell[] | null | undefined,
+	_fromIndex: number,
 	toIndex: number
 ): number {
-	if (!isImportsCell(cells?.[0])) return toIndex;
-	if (fromIndex === 0) return -1; // the pinned imports cell never moves
-	return Math.max(1, toIndex);
+	return toIndex;
 }

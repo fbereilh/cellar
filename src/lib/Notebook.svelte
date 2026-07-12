@@ -1,6 +1,5 @@
 <script lang="ts">
 	import Cell from '$lib/Cell.svelte';
-	import { isImportsCell } from '$lib/importsRole';
 	import type { CellType, LogicalCellType } from '$lib/server/types';
 	import type { KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
@@ -41,6 +40,8 @@
 		onMoveToIndex?: (id: string, toIndex: number) => void;
 		onEdit: (id: string, source: string, opts?: { keepalive?: boolean }) => void;
 		onSetType: (id: string, type: LogicalCellType) => void;
+		/** Designate this cell the imports cell ('imports') or un-designate it (null). */
+		onSetRole: (id: string, role: string | null) => void;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** cell id → explicit code-editor collapse choice (runtime-only) */
 		editorCollapsed?: Record<string, boolean | undefined>;
@@ -79,6 +80,7 @@
 		onMoveToIndex,
 		onEdit,
 		onSetType,
+		onSetRole,
 		onSetScrolled,
 		editorCollapsed = {},
 		onSetEditorCollapsed,
@@ -98,11 +100,6 @@
 	let dropIndex = $state<number | null>(null); // insertion index the drop would land at
 	let dropAtEnd = $state(false); // insertion line drawn below the last hovered cell
 
-	// Cell 0 is the pinned imports cell: nothing may be dropped above it, and it is
-	// not draggable itself. Drawing an insertion line there would promise a drop the
-	// clamp would then refuse, so the line snaps below it instead.
-	const pinnedTop = $derived(isImportsCell(cells[0]));
-
 	function onDragStart(e: DragEvent, id: string) {
 		dragId = id;
 		if (e.dataTransfer) {
@@ -112,10 +109,9 @@
 			} catch {}
 		}
 	}
-	/** Which edge of cell `index` the pointer is nearest — never above a pinned top cell. */
+	/** Which edge of cell `index` the pointer is nearest. */
 	function dropsAfter(e: DragEvent, index: number): boolean {
 		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-		if (index === 0 && pinnedTop) return true;
 		return e.clientY > r.top + r.height / 2;
 	}
 	function onDragOverCell(e: DragEvent, index: number) {
@@ -222,7 +218,6 @@
 						active={activeId === cell.id}
 						{keyMode}
 						staleState={staleness[cell.id] ?? null}
-						{pinnedTop}
 						dragging={dragId === cell.id}
 						{foldedIds}
 						segHidden={hiddenSegs.get(cell.id) ?? NO_SEGS_HIDDEN}
@@ -236,6 +231,7 @@
 						onMove={onMove}
 						onEdit={onEdit}
 						onSetType={onSetType}
+						onSetRole={onSetRole}
 						onSetScrolled={onSetScrolled}
 						editorCollapsed={editorCollapsed[cell.id]}
 						onSetEditorCollapsed={onSetEditorCollapsed}
