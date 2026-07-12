@@ -5,7 +5,7 @@
 	import { cellIdOfKey, computeFolding, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
-	import { clampMoveIndex } from '$lib/importsRole';
+	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
@@ -331,15 +331,40 @@
 		return r.top >= view.top - 4 && r.top <= view.bottom - Math.min(r.height, 96);
 	}
 
+	function reducedMotion(): boolean {
+		return !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+	}
+
+	// Snappy programmatic scroll. The browser's native `behavior: 'smooth'` is
+	// noticeably laggy on this heavy app (long main-thread frames during a run),
+	// so we drive a short ease-out tween on the container's `scrollTop` ourselves
+	// (~140ms) via rAF. Honors prefers-reduced-motion by jumping instantly.
+	const SCROLL_TWEEN_MS = 140;
+	function tweenScrollTop(parent: HTMLElement, top: number) {
+		const target = Math.max(0, Math.min(top, parent.scrollHeight - parent.clientHeight));
+		const start = parent.scrollTop;
+		const dist = target - start;
+		if (reducedMotion() || Math.abs(dist) < 1) {
+			parent.scrollTop = target;
+			return;
+		}
+		const t0 = performance.now();
+		const step = (now: number) => {
+			const p = Math.min(1, (now - t0) / SCROLL_TWEEN_MS);
+			const eased = 1 - Math.pow(1 - p, 3); // ease-out cubic
+			parent.scrollTop = start + dist * eased;
+			if (p < 1) requestAnimationFrame(step);
+		};
+		requestAnimationFrame(step);
+	}
+
 	// Bring a cell the *agent* is running into view: center it when it fits, else
 	// pin its top. Distinct from `scrollCellIntoView` (keyboard selection), which
 	// wants the smallest possible movement, not a deliberate reframing.
 	function scrollElementIntoView(el: HTMLElement) {
-		const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-		const behavior = reduce ? 'auto' : 'smooth';
 		const parent = scrollParent(el);
 		if (!parent) {
-			el.scrollIntoView({ behavior, block: 'center' });
+			el.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'center' });
 			return;
 		}
 		const view = parent.getBoundingClientRect();
@@ -352,7 +377,7 @@
 			r.height + margin * 2 <= view.height
 				? r.top - view.top - (view.height - r.height) / 2
 				: r.top - view.top - margin;
-		parent.scrollTo({ top: parent.scrollTop + delta, behavior });
+		tweenScrollTop(parent, parent.scrollTop + delta);
 	}
 
 	// Unfold whatever collapsed sections hide `id`, so a cell the agent is running
@@ -372,6 +397,10 @@
 
 	async function followCell(id: string) {
 		if (userIsTyping()) return;
+		// The imports cell is pinned at the top; adding/updating an import re-runs it,
+		// which would otherwise reframe the viewport all the way up to it (and back
+		// once the agent's real cell runs) - jarring. Leave the user's scroll put.
+		if (isImportsCell(findCell(id))) return;
 		revealCell(id);
 		await tick(); // an `add_and_run` cell (or a just-revealed one) needs its DOM node
 		// Scope the lookup to THIS notebook: cell ids are unique per document, not
@@ -1083,7 +1112,10 @@
 		// Scope to this notebook: several notebooks stay mounted (hidden), and a
 		// cell id is only unique *within* a document.
 		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
-		el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+		// Instant for keyboard selection: the smallest movement to reveal the cell,
+		// with no animation lag, is what makes arrow-key nav feel immediate. (The
+		// deliberate run-reframe uses the tween in `scrollElementIntoView`.)
+		el?.scrollIntoView({ behavior: 'auto', block: 'nearest' });
 	}
 
 	/**
