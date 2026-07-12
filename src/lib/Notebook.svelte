@@ -42,6 +42,16 @@
 		onSetType: (id: string, type: LogicalCellType) => void;
 		/** Designate this cell the imports cell ('imports') or un-designate it (null). */
 		onSetRole: (id: string, role: string | null) => void;
+		/** Mark this code cell for nbdev-style `.py` export, or unmark it. */
+		onSetExport?: (id: string, exported: boolean) => void;
+		/** The notebook's `.py` export target (module path), or null when unset. */
+		exportTarget?: string | null;
+		/** How many cells are currently marked for export. */
+		exportCount?: number;
+		/** Set (or clear, with '') the notebook's `.py` export target. */
+		onSetExportTarget?: (target: string) => void;
+		/** Regenerate the `.py` module now; resolves with the server result. */
+		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** cell id → explicit code-editor collapse choice (runtime-only) */
 		editorCollapsed?: Record<string, boolean | undefined>;
@@ -81,6 +91,11 @@
 		onEdit,
 		onSetType,
 		onSetRole,
+		onSetExport,
+		exportTarget = null,
+		exportCount = 0,
+		onSetExportTarget,
+		onExportPy,
 		onSetScrolled,
 		editorCollapsed = {},
 		onSetEditorCollapsed,
@@ -157,6 +172,29 @@
 		moved: 'Moved since the last commit'
 	};
 	const removedLabel = (n: number): string => `${n} ${n === 1 ? 'cell' : 'cells'} removed`;
+
+	// ---- nbdev-style export header bar ---------------------------------------
+	// A slim bar at the top of the notebook to set the `.py` target and export on
+	// demand. Shown only once the feature is in use (a target is set OR at least
+	// one cell is marked), so it stays unobtrusive otherwise.
+	let exportFeedback = $state('');
+	let exporting = $state(false);
+	const showExportBar = $derived(!!exportTarget || exportCount > 0);
+
+	function onExportTargetInput(e: Event) {
+		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value);
+	}
+	async function doExport() {
+		if (exporting) return;
+		exporting = true;
+		exportFeedback = '';
+		const r = await onExportPy?.();
+		exporting = false;
+		if (!r) exportFeedback = 'Export failed.';
+		else if (r.reason === 'no-target') exportFeedback = 'Set a target .py path first.';
+		else if (r.reason === 'no-cells') exportFeedback = 'No cells are marked for export.';
+		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
+	}
 </script>
 
 {#snippet removedSeam(n: number)}
@@ -179,6 +217,43 @@
 	     cells use more horizontal space on wide monitors without going full-bleed
 	     on ultrawide. -->
 	<div class="mx-auto w-full max-w-[clamp(48rem,92%,88rem)] px-4 py-6" data-testid="notebook">
+		{#if showExportBar}
+			<!-- nbdev-style export: the notebook-level target `.py` module + a manual
+			     "Export to .py" button. Appears once any cell is marked for export or a
+			     target is set; the module also regenerates automatically on save. -->
+			<div
+				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-primary/25 bg-primary/5 px-3 py-2 text-sm"
+				data-testid="export-bar"
+			>
+				<span class="flex items-center gap-1.5 font-medium text-primary">
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+					Export to
+				</span>
+				<input
+					type="text"
+					class="input input-bordered input-xs w-56 font-mono"
+					placeholder="utils.py"
+					value={exportTarget ?? ''}
+					oninput={onExportTargetInput}
+					data-testid="export-target-input"
+					aria-label="Export target .py module path"
+				/>
+				<span class="text-xs text-base-content/55" data-testid="export-count">
+					{exportCount} {exportCount === 1 ? 'cell' : 'cells'} marked
+				</span>
+				<button
+					class="btn btn-primary btn-xs gap-1"
+					onclick={doExport}
+					disabled={exporting}
+					data-testid="export-run"
+				>
+					{exporting ? 'Exporting…' : 'Export to .py'}
+				</button>
+				{#if exportFeedback}
+					<span class="text-xs text-base-content/70" data-testid="export-feedback">{exportFeedback}</span>
+				{/if}
+			</div>
+		{/if}
 		<div class="space-y-4">
 			{#each cells as cell, i (cell.id)}
 				{#if gitRemovedBefore[cell.id] && !hidden.has(cell.id)}
@@ -232,6 +307,7 @@
 						onEdit={onEdit}
 						onSetType={onSetType}
 						onSetRole={onSetRole}
+						onSetExport={onSetExport}
 						onSetScrolled={onSetScrolled}
 						editorCollapsed={editorCollapsed[cell.id]}
 						onSetEditorCollapsed={onSetEditorCollapsed}

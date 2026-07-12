@@ -31,6 +31,7 @@
 		onPromoteTab?: (id: string) => void;
 		onToggleSidebar: () => void;
 		onConsolidateImports: () => void;
+		onExportPy: () => void;
 		onSaveAsPy: () => void;
 		onConvertToIpynb: () => void;
 		onExportHtml: () => void;
@@ -60,6 +61,7 @@
 		onPromoteTab,
 		onToggleSidebar,
 		onConsolidateImports,
+		onExportPy,
 		onSaveAsPy,
 		onConvertToIpynb,
 		onExportHtml,
@@ -149,6 +151,17 @@
 							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
 						{/if}
 						Consolidate imports
+					</button>
+				</li>
+				<li>
+					<button
+						onclick={onExportPy}
+						disabled={!canConsolidateImports}
+						title="Write the cells marked for export to the notebook's .py module (nbdev-style). Mark cells and set the target from the bar at the top of the notebook."
+						data-testid="export-py-menu"
+					>
+						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+						Export to .py
 					</button>
 				</li>
 				<div class="divider my-1"></div>

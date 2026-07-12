@@ -531,6 +531,24 @@
 		consolidating = false;
 	}
 
+	// ---- nbdev-style export to a .py module -----------------------------------
+	// Delegate to the active notebook (it owns the target + the marked cells) and
+	// surface the result as a transient notice. The module also regenerates
+	// automatically on every save; this is the manual trigger.
+	async function exportPy() {
+		const api = activeNotebookApi();
+		if (!api) return;
+		notice = '';
+		const r = await api.exportPy();
+		if (!r) notice = 'Export to .py failed.';
+		else if (r.reason === 'no-target') notice = 'Set a target .py path at the top of the notebook first.';
+		else if (r.reason === 'no-cells') notice = 'No cells are marked for export - use a cell’s ⋮ menu.';
+		else {
+			fsRefreshSignal++; // a new/updated .py on disk → refresh the tree + git decorations
+			notice = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`;
+		}
+	}
+
 	// ---- jupytext: save as .py / convert .py → .ipynb -------------------------
 	// The active notebook (the one the sidebar reflects), and whether it is a `.py`
 	// text notebook (the only source a "Convert to .ipynb" makes sense for).
@@ -917,6 +935,7 @@
 		onPromoteTab={promoteTab}
 		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
 		onConsolidateImports={consolidateImports}
+		onExportPy={exportPy}
 		onSaveAsPy={openSaveAsPy}
 		onConvertToIpynb={convertToIpynb}
 		onExportHtml={exportHtml}
