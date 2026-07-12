@@ -508,9 +508,9 @@ export function addCellAt(
  * Move a cell to an absolute index (clamped). `index` addresses the array with
  * the moved cell already removed.
  *
- * The imports cell is PINNED at the top: it never moves, and nothing may be
- * inserted above it (`clampMoveIndex`). The browser applies the identical rule
- * optimistically, so the two never disagree about where a dragged cell landed.
+ * `clampMoveIndex` is the shared move-index rule the browser applies
+ * optimistically too, so the two never disagree about where a dragged cell
+ * landed. It is currently the identity (the imports cell is no longer pinned).
  */
 export function moveCellTo(id: string, index: number, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
@@ -676,14 +676,14 @@ export function replaceCells(
 	return getNotebook(doc.path);
 }
 
-/** Swap a cell with its neighbour. Honors the imports cell's pin (`clampMoveIndex`). */
+/** Swap a cell with its neighbour (via the shared `clampMoveIndex` rule). */
 export function moveCell(id: string, dir: 'up' | 'down', nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const i = doc.cells.findIndex((c) => c.id === id);
 	if (i < 0) return;
 	const j = dir === 'up' ? i - 1 : i + 1;
 	if (j < 0 || j >= doc.cells.length) return;
-	if (clampMoveIndex(doc.cells, i, j) !== j) return; // the pinned top cell, or a move above it
+	if (clampMoveIndex(doc.cells, i, j) !== j) return; // reserved for a future positional rule (identity today)
 	[doc.cells[i], doc.cells[j]] = [doc.cells[j], doc.cells[i]];
 	persist(doc);
 	emit(doc, 'cell:moved', { cellId: id, toIndex: j }, originId);

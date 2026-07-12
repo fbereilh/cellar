@@ -38,8 +38,6 @@
 		/** Staleness verdict ($lib/staleness), or null. */
 		staleState?: StalenessEntry | null;
 		dragging?: boolean;
-		/** The notebook's cell 0 is the pinned imports cell. */
-		pinnedTop?: boolean;
 		/** Fold keys of every collapsed heading in the notebook. */
 		foldedIds?: Set<string>;
 		/** Segment indices of THIS cell an outer fold hides. */
@@ -56,6 +54,8 @@
 		onMove: (id: string, dir: 'up' | 'down') => void;
 		onEdit: (id: string, source: string, opts?: { keepalive?: boolean }) => void;
 		onSetType: (id: string, type: LogicalCellType) => void;
+		/** Designate this cell the imports cell ('imports') or un-designate it (null). */
+		onSetRole: (id: string, role: string | null) => void;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Per-cell code-editor collapse choice (undefined = auto / true / false). */
 		editorCollapsed?: boolean;
@@ -79,7 +79,6 @@
 		keyMode = 'command',
 		staleState = null,
 		dragging = false,
-		pinnedTop = false,
 		foldedIds = new Set(),
 		segHidden = NO_SEGS_HIDDEN,
 		foldCounts = {},
@@ -92,6 +91,7 @@
 		onMove,
 		onEdit,
 		onSetType,
+		onSetRole,
 		onSetScrolled,
 		editorCollapsed,
 		onSetEditorCollapsed,
@@ -144,9 +144,11 @@
 	// The logical cell type the type menu speaks: 'code' | 'sql' | 'markdown'.
 	const logicalType = $derived(logicalCellType(cell));
 	const typeLabel = $derived(logicalType === 'sql' ? 'SQL' : logicalType === 'markdown' ? 'markdown' : 'python3');
-	// The notebook's designated imports cell: pinned at the top, marked in the
-	// toolbar, and immovable (`clampMoveIndex` enforces the same rule server-side).
+	// The notebook's designated imports cell: user-choosable, marked in the toolbar
+	// with the "imports" badge, and free to live at any index. Only a Python code
+	// cell can hold the role, so the mark action is offered only when `canBeImports`.
 	const isImports = $derived(isImportsCell(cell));
+	const canBeImports = $derived(logicalType === 'code');
 
 	// A remote (agent / other-tab) source edit that arrived while the user was
 	// editing this cell, held until they choose to load it (the affordance below).
@@ -487,6 +489,24 @@
 		if (type !== logicalType) onSetType(cell.id, type);
 	}
 
+	// The cell-actions ("⋮") menu — currently the imports-cell mark/unmark toggle.
+	// A popover in the top layer, like the type menu, so the card's overflow never
+	// clips it. Positioned under its trigger on open.
+	let roleMenuEl = $state<HTMLElement | null>(null);
+	let roleBtnEl = $state<HTMLElement | null>(null);
+	function openRoleMenu() {
+		if (!roleMenuEl || !roleBtnEl) return;
+		roleMenuEl.showPopover();
+		const r = roleBtnEl.getBoundingClientRect();
+		const mw = roleMenuEl.offsetWidth || 200;
+		roleMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
+		roleMenuEl.style.top = r.bottom + 4 + 'px';
+	}
+	function toggleImportsRole() {
+		roleMenuEl?.hidePopover();
+		onSetRole(cell.id, isImports ? null : 'imports');
+	}
+
 	function currentSource() {
 		return view ? view.state.doc.toString() : cell.source;
 	}
@@ -783,30 +803,19 @@
 		<!-- Cell toolbar -->
 		<div class="flex items-center justify-between border-b border-base-300 px-2 py-1">
 			<div class="flex items-center gap-0.5">
-				{#if isImports}
-					<!-- The imports cell is pinned at the top, so it has nowhere to be
-					     dragged to. A pin sits where every other cell's grip handle does,
-					     keeping the toolbar's columns aligned. -->
-					<span
-						class="flex h-6 w-6 items-center justify-center text-primary"
-						title="Pinned imports cell - Cellar keeps the notebook's imports here, at the top"
-						data-testid="imports-pin"
-					>
-						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>
-					</span>
-				{:else}
-					<button
-						class="btn btn-ghost btn-xs btn-square cursor-grab text-base-content/30 hover:text-base-content/70 active:cursor-grabbing"
-						draggable="true"
-						ondragstart={(e) => onDragStart?.(e, cell.id)}
-						ondragend={onDragEnd}
-						title="Drag to reorder cell"
-						aria-label="Drag to reorder cell"
-						data-testid="drag-handle"
-					>
-						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6" /><circle cx="15" cy="6" r="1.6" /><circle cx="9" cy="12" r="1.6" /><circle cx="15" cy="12" r="1.6" /><circle cx="9" cy="18" r="1.6" /><circle cx="15" cy="18" r="1.6" /></svg>
-					</button>
-				{/if}
+				<!-- The imports cell is no longer pinned, so every cell (imports included)
+				     carries the same drag handle and can be reordered freely. -->
+				<button
+					class="btn btn-ghost btn-xs btn-square cursor-grab text-base-content/30 hover:text-base-content/70 active:cursor-grabbing"
+					draggable="true"
+					ondragstart={(e) => onDragStart?.(e, cell.id)}
+					ondragend={onDragEnd}
+					title="Drag to reorder cell"
+					aria-label="Drag to reorder cell"
+					data-testid="drag-handle"
+				>
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6" /><circle cx="15" cy="6" r="1.6" /><circle cx="9" cy="12" r="1.6" /><circle cx="15" cy="12" r="1.6" /><circle cx="9" cy="18" r="1.6" /><circle cx="15" cy="18" r="1.6" /></svg>
+				</button>
 				<button
 					class="btn btn-ghost btn-xs btn-square text-success"
 					onclick={() => doRun(false)}
@@ -831,11 +840,16 @@
 					</button>
 				{/if}
 				{#if isImports}
+					<!-- The visual marker that THIS is the notebook's imports cell — a pin
+					     glyph + label, no longer tied to the cell's position. -->
 					<span
-						class="badge badge-xs ml-1.5 badge-soft badge-primary font-medium"
-						title="Consolidate imports, and imports an agent writes, are collected here"
-						data-testid="imports-badge">imports</span
+						class="badge badge-xs ml-1.5 flex items-center gap-1 badge-soft badge-primary font-medium"
+						title="Imports cell — Consolidate imports, and imports an agent writes, are collected here. Use the ⋮ menu to move the designation to another cell."
+						data-testid="imports-badge"
 					>
+						<svg class="h-2.5 w-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>
+						imports
+					</span>
 				{/if}
 				{#if isSql}
 					<!-- SQL indicator: this code cell holds a SQL query run against `spark`. -->
@@ -918,14 +932,45 @@
 						{/if}
 					</span>
 				{/if}
-				<!-- The imports cell is pinned at index 0, so neither it nor the cell below
-				     it may swap across the top (`clampMoveIndex`, applied on both sides). -->
-				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'up')} disabled={index === 0 || isImports || (pinnedTop && index === 1)} title={isImports ? 'The imports cell stays at the top' : 'Move up'} aria-label="Move cell up" data-testid="move-up">
+				<!-- Every cell — the imports cell included — moves freely now. -->
+				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'up')} disabled={index === 0} title="Move up" aria-label="Move cell up" data-testid="move-up">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6" /></svg>
 				</button>
-				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'down')} disabled={index === count - 1 || isImports} title={isImports ? 'The imports cell stays at the top' : 'Move down'} aria-label="Move cell down" data-testid="move-down">
+				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'down')} disabled={index === count - 1} title="Move down" aria-label="Move cell down" data-testid="move-down">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 				</button>
+				{#if canBeImports}
+					<!-- Cell-actions menu: designate this Python code cell as the notebook's
+					     imports cell, or clear the designation. -->
+					<button
+						bind:this={roleBtnEl}
+						class="btn btn-ghost btn-xs btn-square {isImports ? 'text-primary' : 'text-base-content/50 hover:text-base-content/80'}"
+						onclick={openRoleMenu}
+						title="Cell actions"
+						aria-label="Cell actions"
+						data-testid="cell-actions"
+					>
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="12" cy="19" r="1.7" /></svg>
+					</button>
+					<div
+						bind:this={roleMenuEl}
+						popover="auto"
+						class="m-0 rounded-box border border-base-300 bg-base-100 p-1 text-sm shadow-lg"
+						style="position: fixed; inset: auto; margin: 0;"
+						data-testid="cell-actions-menu"
+					>
+						<div class="flex w-56 flex-col gap-0.5">
+							<button
+								class="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-base-200 {isImports ? 'text-base-content' : 'text-primary'}"
+								onclick={toggleImportsRole}
+								data-testid="toggle-imports-role"
+							>
+								<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>
+								<span>{isImports ? 'Unmark as imports cell' : 'Mark as imports cell'}</span>
+							</button>
+						</div>
+					</div>
+				{/if}
 				<button class="btn btn-ghost btn-xs btn-square text-error/70 hover:text-error" onclick={() => onDelete(cell.id)} disabled={count === 1} title="Delete cell" aria-label="Delete cell" data-testid="delete">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m-1 0v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V6" /></svg>
 				</button>

@@ -397,9 +397,10 @@
 
 	async function followCell(id: string) {
 		if (userIsTyping()) return;
-		// The imports cell is pinned at the top; adding/updating an import re-runs it,
-		// which would otherwise reframe the viewport all the way up to it (and back
-		// once the agent's real cell runs) - jarring. Leave the user's scroll put.
+		// Adding/updating an import re-runs the imports cell; following it would
+		// reframe the viewport to it (wherever it sits) and back once the agent's
+		// real cell runs - jarring. Leave the user's scroll put. Position-independent:
+		// keyed on the role, not the top, so it holds now the cell can live anywhere.
 		if (isImportsCell(findCell(id))) return;
 		revealCell(id);
 		await tick(); // an `add_and_run` cell (or a just-revealed one) needs its DOM node
@@ -875,6 +876,30 @@
 			body: JSON.stringify({ cell_type: cellType, nb: path, originId })
 		});
 		scheduleStaleness();
+	}
+
+	/**
+	 * Designate `id` the notebook's imports cell, or un-designate it (`role: null`).
+	 * Exactly one imports cell per notebook, so marking a new one strips the role
+	 * from any other — applied optimistically here and enforced server-side by
+	 * `setCellRole`. Reassign each affected cell's `metadata` (it may have had no
+	 * `cellar` namespace) so the imports badge/menu react.
+	 */
+	async function setRole(id: string, role: string | null) {
+		for (const c of cells) {
+			const has = c.metadata?.cellar?.role != null;
+			const target = c.id === id;
+			if (!target && !has) continue; // untouched
+			const cellar = { ...(c.metadata?.cellar ?? {}) };
+			if (target && role) cellar.role = role;
+			else delete cellar.role;
+			c.metadata = { ...(c.metadata ?? {}), cellar };
+		}
+		await fetch(`/api/cells/${id}`, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ role, nb: path, originId })
+		}).catch(() => {});
 	}
 
 	// ---- Cut / copy / paste / undo-delete ------------------------------------
@@ -1410,6 +1435,7 @@
 			onMoveToIndex={moveCellToIndex}
 			onEdit={editCell}
 			onSetType={setType}
+			onSetRole={setRole}
 			onSetScrolled={setScrolled}
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}

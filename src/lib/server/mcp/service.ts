@@ -578,7 +578,7 @@ export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium') {
 
 /**
  * Lift the module-level imports out of code an agent is writing into a cell and
- * merge them into the pinned imports cell.
+ * merge them into the notebook's imports cell (wherever it is designated).
  *
  * This is a pure DOCUMENT edit; it never runs the kernel. Running the imports
  * cell is the caller's job (`finishImportRouting`) precisely because a write tool
@@ -630,8 +630,8 @@ async function finishImportRouting(nb: string, cellId: string | null, added: str
 }
 
 /**
- * Sweep every module-level import in the active notebook into the pinned imports
- * cell and run it. Idempotent; see `imports-cell.js`.
+ * Sweep every module-level import in the active notebook into its imports cell
+ * and run it. Idempotent; see `imports-cell.js`.
  */
 export async function consolidate() {
 	const nb = getActiveNotebookPath();
