@@ -842,7 +842,11 @@ const pyLiteral = (cfg: unknown): string => JSON.stringify(JSON.stringify(cfg));
  * profile, or external-browser OAuth via host) drives both the `WorkspaceClient`
  * and the `DatabricksSession` through `.sdkConfig(...)`, so the session and the
  * server-side listings authenticate identically. For OAuth the token was already
- * minted + cached by the `login` subprocess, so nothing here opens a browser.
+ * minted + cached by the `login` subprocess, so nothing here opens a browser. The
+ * cluster is bound via `Config(cluster_id=...)`, NOT a separate builder call:
+ * databricks-connect 15.x+ raises "sdkConfig must not be set when connection
+ * parameters are explicitly configured." if `.sdkConfig()` is combined with an
+ * explicit `.clusterId()` / `.remote()`.
  *
  * An existing session is stopped first - `getOrCreate()` would otherwise hand
  * back the *old* cluster's session and silently ignore the cluster just picked.
@@ -874,19 +878,21 @@ def _cellar_dbx_connect(_cfg):
     except Exception as _e:
         return {'ok': False, 'code': 'connect_missing', 'message': '%s: %s' % (type(_e).__name__, _e)}
     try:
+        # cluster_id must live INSIDE the Config, not on a separate .clusterId()
+        # builder call: databricks-connect 15.x+ rejects .sdkConfig() combined
+        # with any explicit connection param ("sdkConfig must not be set when
+        # connection parameters are explicitly configured."). One Config still
+        # drives both the WorkspaceClient and the session, keeping auth identical.
         if _auth['mode'] == 'pat':
-            _sdk = Config(profile=_auth['profile'])
+            _sdk = Config(profile=_auth['profile'], cluster_id=_cfg['cluster_id'])
         else:
-            _sdk = Config(host=_auth['host'], auth_type='external-browser')
+            _sdk = Config(host=_auth['host'], auth_type='external-browser', cluster_id=_cfg['cluster_id'])
         _w = WorkspaceClient(config=_sdk)
         _host = _w.config.host
     except Exception as _e:
         return {'ok': False, 'code': 'auth_failed', 'message': '%s: %s' % (type(_e).__name__, _e)}
     try:
-        _spark = (DatabricksSession.builder
-                  .sdkConfig(_sdk)
-                  .clusterId(_cfg['cluster_id'])
-                  .getOrCreate())
+        _spark = DatabricksSession.builder.sdkConfig(_sdk).getOrCreate()
     except Exception as _e:
         return {'ok': False, 'code': 'session_failed', 'message': '%s: %s' % (type(_e).__name__, _e)}
     _g['spark'] = _spark
