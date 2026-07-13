@@ -395,6 +395,24 @@
 		activeTabId = id;
 	}
 
+	// Surface a notebook as an AVAILABLE tab without stealing the user's focus —
+	// the browser side of an agent declaring its working notebook (a
+	// `notebook:opened` with focus:false). Opens (or promotes) a permanent tab so
+	// the notebook's live edits stream into it, but never changes activeTabId —
+	// unless the user has no active tab to lose (empty workspace), in which case
+	// there is no focus to steal and showing it is the friendly default.
+	async function surfaceFilePermanent(path: string) {
+		const id = tabIdFor(path);
+		const existing = tabs.find((t) => t.id === id);
+		if (existing) {
+			if (existing.preview) tabs = tabs.map((t) => (t.id === id ? { ...t, preview: false } : t));
+		} else {
+			const kind = await resolveTabKind(path);
+			if (!tabs.find((t) => t.id === id)) tabs = [...tabs, makeTab(path, false, kind)];
+		}
+		if (!tabs.some((t) => t.id === activeTabId)) activeTabId = id;
+	}
+
 	function promoteTab(id: string) {
 		tabs = tabs.map((t) => (t.id === id ? { ...t, preview: false } : t));
 	}
@@ -905,7 +923,11 @@
 			if (ev.type !== 'notebook:opened') return;
 			if (ev.originId && ev.originId === originId) return;
 			if (!ev.relPath) return;
-			openFilePermanent(ev.relPath as string);
+			// focus:false is an AGENT declaring its working notebook — surface it as an
+			// available tab, but never yank the user off the tab they are on. A human's
+			// own open/create (focus:true, or the field absent on older events) focuses.
+			if (ev.focus === false) surfaceFilePermanent(ev.relPath as string);
+			else openFilePermanent(ev.relPath as string);
 		})
 	);
 
