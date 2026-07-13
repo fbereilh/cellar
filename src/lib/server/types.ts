@@ -61,6 +61,13 @@ export interface CellarNamespace {
 	hidden_from_agent?: boolean;
 	/** Explicit "scroll outputs" choice; undefined = auto height heuristic. */
 	output_scrolled?: boolean;
+	/**
+	 * Explicit per-cell "hide code input" choice for a code cell (the editor is
+	 * hidden, the output stays). Tri-state: undefined = inherit the notebook-wide
+	 * `hide_all_code` default, true = force hidden, false = force shown. Display
+	 * only - the cell's source is never touched and it still runs.
+	 */
+	hide_input?: boolean;
 	/** Logical cell language, e.g. 'sql'. Absent = Python. */
 	language?: string;
 	/** Cell role, e.g. the pinned imports cell ('imports'). */
@@ -120,6 +127,8 @@ export interface NotebookView {
 	exportTarget: string | null;
 	/** Heading levels (1-6) rendered with a display-only auto-number. */
 	headerNumbering: number[];
+	/** Notebook-wide "hide all code inputs" (report view) default. */
+	hideAllCode: boolean;
 }
 
 /** nbformat kernelspec. */
@@ -136,6 +145,11 @@ export interface NotebookCellarNamespace {
 	export_target?: string;
 	/** Heading levels (1-6) rendered with a display-only auto-number. */
 	header_numbering?: number[];
+	/**
+	 * Notebook-wide "hide all code inputs" default (a clean output-only report
+	 * view). A cell's explicit `cellar.hide_input` overrides this per cell.
+	 */
+	hide_all_code?: boolean;
 	[key: string]: unknown;
 }
 

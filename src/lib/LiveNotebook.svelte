@@ -29,6 +29,8 @@
 		onFoldsChange?: (path: string, foldedIds: Set<string>, folding: Folding) => void;
 		/** (path, numbers, levels): the sidebar Outline's heading auto-numbers + the enabled levels. */
 		onNumberingChange?: (path: string, numbers: Record<string, string>, levels: number[]) => void;
+		/** (path, hidden): the notebook-wide "hide all code" state, for the navbar toggle. */
+		onHideAllCodeChange?: (path: string, hidden: boolean) => void;
 		/** (path, handle|null): lets the Outline toggle this notebook's numbering levels. */
 		onRegisterNumbering?: (path: string, handle: NumberingRegistryHandle | null) => void;
 		/** (path, runningId, queued): the sidebar Outline's per-section run/queue badges. */
@@ -48,6 +50,7 @@
 		| { type: 'cell:added'; cell?: CellView; afterId?: string | null; index?: number }
 		| { type: 'cell:role'; cellId: string; role?: string | null }
 		| { type: 'cell:export'; cellId: string; exported: boolean }
+		| { type: 'cell:hide-input'; cellId: string; hidden: boolean | null }
 		| { type: 'cell:deleted'; cellId: string }
 		| { type: 'cell:moved'; cellId: string; toIndex: number }
 		| { type: 'cell:type'; cellId: string; cell_type: CellType; language?: string | null }
@@ -55,7 +58,8 @@
 		| { type: 'cell:rendered'; cellId: string }
 		| { type: 'cell:edited'; cellId: string; source: string }
 		| { type: 'notebook:export-target'; target: string | null }
-		| { type: 'notebook:header-numbering'; levels: number[] };
+		| { type: 'notebook:header-numbering'; levels: number[] }
+		| { type: 'notebook:hide-all-code'; hidden: boolean };
 
 	/** A run-lifecycle event (run:cleared / run:start / run:output / run:end). */
 	type RunEvent =
@@ -87,6 +91,7 @@
 		onCellsChange,
 		onFoldsChange,
 		onNumberingChange,
+		onHideAllCodeChange,
 		onRunStateChange,
 		onRegisterFolds,
 		onRegisterNumbering,
@@ -119,6 +124,16 @@
 	// numbers and its per-level toggle reflects the current setting.
 	$effect(() => {
 		onNumberingChange?.(path, headingNumbers, headerNumbering);
+	});
+	// Notebook-wide "hide all code inputs" (report view) default. Mirrors
+	// `notebook.metadata.cellar.hide_all_code` (loaded on mount, kept live via the
+	// `notebook:hide-all-code` SSE event). It is the default for cells without an
+	// explicit per-cell `cellar.hide_input`; a per-cell choice always wins. Display
+	// only - no cell source is touched, so the `.ipynb` stays git-clean.
+	let hideAllCode = $state(false);
+	// Publish it up so the navbar's "Hide all code" toggle reflects + drives it.
+	$effect(() => {
+		onHideAllCodeChange?.(path, hideAllCode);
 	});
 	let runningId = $state<string | null>(null); // the cell running in THIS notebook (≤1)
 	// Cells of THIS notebook waiting in the kernel's global FIFO → their 1-based
@@ -206,7 +221,7 @@
 	// action the modal keyboard runs for a registry shortcut id, so the palette and
 	// the keyboard share one handler and cannot diverge.
 	$effect(() => {
-		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, save });
+		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, toggleHideAllCode, save });
 		return () => onRegisterApi?.(path, null);
 	});
 	$effect(() => {
@@ -521,6 +536,7 @@
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
 			exportTarget = body.notebook.exportTarget ?? null; // nbdev export target
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
+			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			// A notebook always has a selected cell (command mode acts on it), so
 			// j/k and the rest work the moment the notebook opens.
 			if (!activeId || !cells.some((c) => c.id === activeId)) activeId = cells[0]?.id ?? null;
@@ -602,10 +618,23 @@
 				else delete cellar.export;
 				cell.metadata = { ...(cell.metadata ?? {}), cellar };
 			}
+		} else if (ev.type === 'cell:hide-input') {
+			// A code cell's per-cell hide-code choice changed. Reassign metadata for
+			// reactivity (the cell may have had no `cellar` namespace); a null clears
+			// the explicit choice so the cell follows the notebook-wide default.
+			const cell = findCell(ev.cellId);
+			if (cell) {
+				const cellar = { ...(cell.metadata?.cellar ?? {}) };
+				if (ev.hidden === null || ev.hidden === undefined) delete cellar.hide_input;
+				else cellar.hide_input = !!ev.hidden;
+				cell.metadata = { ...(cell.metadata ?? {}), cellar };
+			}
 		} else if (ev.type === 'notebook:export-target') {
 			exportTarget = ev.target;
 		} else if (ev.type === 'notebook:header-numbering') {
 			headerNumbering = ev.levels ?? [];
+		} else if (ev.type === 'notebook:hide-all-code') {
+			hideAllCode = !!ev.hidden;
 		} else if (ev.type === 'cell:deleted') {
 			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
@@ -764,7 +793,12 @@
 				return;
 			}
 			if (pe.originId && pe.originId === originId) return; // our own UI action
-			if (pe.type?.startsWith('cell:') || pe.type === 'notebook:export-target' || pe.type === 'notebook:header-numbering')
+			if (
+				pe.type?.startsWith('cell:') ||
+				pe.type === 'notebook:export-target' ||
+				pe.type === 'notebook:header-numbering' ||
+				pe.type === 'notebook:hide-all-code'
+			)
 				applyStructuralEvent(pe as unknown as StructuralEvent);
 			else applyRunEvent(pe as unknown as RunEvent);
 		})
@@ -1011,6 +1045,40 @@
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ export: exported, nb: path, originId })
+		}).catch(() => {});
+	}
+
+	/**
+	 * Hide (or show) a code cell's input in place - a display-only choice that
+	 * survives clean-on-save (`cellar.hide_input`). Applied optimistically here
+	 * (reassign metadata so the editor hides/reveals) and persisted server-side.
+	 * The source is never touched and the cell still runs.
+	 */
+	async function setHideInput(id: string, hidden: boolean) {
+		const cell = findCell(id);
+		if (cell) {
+			const cellar = { ...(cell.metadata?.cellar ?? {}) };
+			cellar.hide_input = hidden;
+			cell.metadata = { ...(cell.metadata ?? {}), cellar };
+		}
+		await fetch(`/api/cells/${id}`, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ hideInput: hidden, nb: path, originId })
+		}).catch(() => {});
+	}
+
+	/**
+	 * Flip the notebook-wide "hide all code inputs" (report view) default.
+	 * Optimistic + persisted. Per-cell `hide_input` choices still win over it.
+	 */
+	async function toggleHideAllCode() {
+		const next = !hideAllCode;
+		hideAllCode = next;
+		await fetch('/api/notebooks/hide-code', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ hidden: next, path, originId })
 		}).catch(() => {});
 	}
 
@@ -1600,6 +1668,8 @@
 			onSetExportTarget={setExportTargetValue}
 			onExportPy={exportPy}
 			onSetScrolled={setScrolled}
+			hideAllCode={hideAllCode}
+			onSetHideInput={setHideInput}
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}
 			onActivate={setActive}

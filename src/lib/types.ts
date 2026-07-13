@@ -66,6 +66,8 @@ export interface NotebookApiHandle {
 	runStale: () => void;
 	/** Regenerate the nbdev-style `.py` module now (manual "Export to .py"). */
 	exportPy: () => Promise<ExportPyResult | null>;
+	/** Toggle the notebook-wide "hide all code inputs" (report view) default. */
+	toggleHideAllCode: () => void;
 	/**
 	 * Flush every cell's pending (not-yet-autosaved) edit and let the normal
 	 * PATCH persistence write the notebook now. Resolves once the flushed edits
