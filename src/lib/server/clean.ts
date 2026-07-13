@@ -35,6 +35,16 @@ const ADDRESS_RE = /(<[^<>]*?) at 0x[0-9a-fA-F]+(?=[>\s])/g;
  */
 const DATAFRAME_MIME = 'application/vnd.cellar.dataframe+json';
 
+/**
+ * ipywidgets view output (tqdm progress bars). It references a live widget model
+ * by id whose state lives only in the running kernel session (never persisted),
+ * and the id is a fresh UUID every run — so persisting it would both fail to
+ * render on reopen AND churn a git diff on every run. Like the DataFrame grid,
+ * it is stripped on save; any real fallback (e.g. a `text/plain` repr) is kept,
+ * and an output left with an empty bundle is dropped entirely.
+ */
+const WIDGET_VIEW_MIME = 'application/vnd.jupyter.widget-view+json';
+
 /** Scrub `<... at 0x…>`-style memory addresses from a string or list of strings. */
 export function scrubAddresses<T>(text: T): T {
 	if (Array.isArray(text)) return text.map((t) => scrubAddresses(t)) as T;
@@ -69,7 +79,25 @@ function cleanOutput(output: RawOutput): RawOutput {
 	if (output.data && DATAFRAME_MIME in output.data) {
 		delete output.data[DATAFRAME_MIME];
 	}
+	// Drop the volatile ipywidgets view mime (tqdm bars); a fallback repr is kept.
+	if (output.data && WIDGET_VIEW_MIME in output.data) {
+		delete output.data[WIDGET_VIEW_MIME];
+	}
 	return output;
+}
+
+/**
+ * A display output whose MIME bundle is now empty carries nothing to render on
+ * disk — it only existed for a live-only mime we just stripped (a widget view
+ * with no fallback). Drop it so the `.ipynb` stays clean, matching Jupyter,
+ * which persists no output for a bare widget display.
+ */
+function isEmptyDisplayOutput(output: RawOutput): boolean {
+	return (
+		(output.output_type === 'display_data' || output.output_type === 'execute_result') &&
+		!!output.data &&
+		Object.keys(output.data).length === 0
+	);
 }
 
 /** Runtime-only `cellar` keys — never persisted, stripped symmetrically on read + write. */
@@ -114,7 +142,9 @@ type RawCell = Record<string, unknown> & {
 function cleanCell(cell: RawCell): RawCell {
 	if (cell.cell_type === 'code') {
 		cell.execution_count = null;
-		if (Array.isArray(cell.outputs)) cell.outputs = cell.outputs.map(cleanOutput);
+		if (Array.isArray(cell.outputs)) {
+			cell.outputs = cell.outputs.map(cleanOutput).filter((o) => !isEmptyDisplayOutput(o));
+		}
 	}
 	// deny-by-default metadata allowlist (keeps the `cellar` namespace intact)
 	cell.metadata = stripRuntimeMeta(pick(cell.metadata, ALLOWED_CELL_METADATA) as CellMetadata);

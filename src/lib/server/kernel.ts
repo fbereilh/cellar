@@ -15,6 +15,7 @@
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
+import { openWidget, updateWidget, closeWidget, resetWidgets } from './widgets';
 import { logInfo, logWarn, logError } from './logs';
 import type { RunStreamEvent, ExecuteOptions, SessionId } from './types';
 
@@ -55,6 +56,41 @@ function beginSession() {
 	sessionId += 1;
 	execsThisSession = 0;
 	loadedNbPaths.clear();
+	// A fresh namespace has no widgets: drop any tqdm progress models from the
+	// previous session so a stale bar can never linger across a restart.
+	resetWidgets();
+}
+
+/**
+ * Register the ipywidgets comm target on a freshly-connected kernel. tqdm's
+ * `.notebook` bars push their state over comm channels on target
+ * `jupyter.widget`; we receive it into the widget store (display-only — we never
+ * send widget interaction back). Registered once per kernel connection: a plain
+ * `restart()`/autorestart keeps the connection (and thus the target), while a
+ * rebind builds a new connection and re-runs this via `getKernel()`.
+ *
+ * The initial `comm_open` state and every `comm_msg` update are dynamic Jupyter
+ * wire payloads (`content.data`), narrowed here to the widget shape.
+ */
+function registerWidgetComm(kernel: KernelConnection): void {
+	try {
+		kernel.registerCommTarget('jupyter.widget', (comm, msg) => {
+			const commId = comm.commId;
+			const data = (msg.content?.data ?? {}) as { state?: Record<string, unknown> };
+			openWidget(commId, data.state ?? {});
+			comm.onMsg = (m: KernelMessage.ICommMsgMsg) => {
+				const d = (m.content?.data ?? {}) as { method?: string; state?: Record<string, unknown> };
+				// Only state syncs concern us; ignore ipywidgets `custom` messages.
+				if (d.method === 'update') updateWidget(commId, d.state ?? {});
+			};
+			comm.onClose = () => closeWidget(commId);
+		});
+	} catch (err) {
+		// A widget target that fails to register must never break kernel bring-up;
+		// progress bars just won't render.
+		const message = err instanceof Error ? err.message : String(err);
+		logWarn('kernel', `ipywidgets comm target not registered: ${message}`);
+	}
 }
 
 /**
@@ -215,6 +251,8 @@ async function getKernel(): Promise<KernelConnection> {
 		liveKernel = kernel;
 		currentKernel = kernel;
 		beginSession();
+		// Register before any user code runs so a widget `comm_open` is never missed.
+		registerWidgetComm(kernel);
 		// A kernel that dies is restarted by jupyter_server behind our back, which
 		// clears the namespace without any Cellar call. Catch that too, so a cell
 		// stamped before the crash never reads as "ran this session" after it.

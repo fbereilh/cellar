@@ -292,3 +292,21 @@ export interface QueueState {
 	running: RunningView | null;
 	queue: QueueEntryView[];
 }
+
+// --- ipywidgets (tqdm progress bars) --------------------------------------
+
+/**
+ * One ipywidgets model in the live kernel session. `state` is the raw trait
+ * bundle received over the comm protocol (`_model_name`, `value`, `children`,
+ * …); it is a dynamic Jupyter payload, narrowed by the frontend renderer.
+ */
+export interface WidgetModel {
+	/** The comm id, which is also the model id a `widget-view` output references. */
+	comm_id: string;
+	state: Record<string, unknown>;
+}
+
+/** All widget models known to the server, for seeding a freshly-connected tab. */
+export interface WidgetSnapshot {
+	models: WidgetModel[];
+}

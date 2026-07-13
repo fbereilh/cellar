@@ -15,6 +15,7 @@
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
 	import PlotlyOutput from '$lib/PlotlyOutput.svelte';
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
+	import WidgetOutput from '$lib/WidgetOutput.svelte';
 	import { foldKey, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
 	import { isExportCell } from '$lib/exportRole';
@@ -352,6 +353,8 @@
 		plotly?: any;
 		image?: string;
 		html?: string;
+		/** ipywidgets model id (tqdm bar) — rendered live from the widget store. */
+		widget?: string;
 		segments: TextSegment[] | null;
 	}
 
@@ -366,6 +369,14 @@
 			case 'execute_result':
 			case 'display_data': {
 				const d = o.data || {};
+				// ipywidgets view (tqdm progress bars): the mime carries only a
+				// `model_id`; the live widget store holds the actual state, rendered as a
+				// bar/text tree by WidgetOutput. Checked first — it never has a useful
+				// rich fallback, only a `text/plain` repr like `HBox(children=…)`.
+				const widgetView = d['application/vnd.jupyter.widget-view+json'] as { model_id?: string } | undefined;
+				if (widgetView?.model_id) {
+					return { tone: 'result', widget: widgetView.model_id, segments: null };
+				}
 				// Prefer Cellar's structured DataFrame payload: a pandas DataFrame emits
 				// it (see kernel.js) alongside its text/plain + text/html reprs, and we
 				// render it as an interactive grid instead of the static repr.
@@ -1265,6 +1276,10 @@
 							{#if o.dataframe}
 								<div class="px-3 py-1" data-testid="output-dataframe">
 									<DataFrameGrid payload={o.dataframe} />
+								</div>
+							{:else if o.widget != null}
+								<div class="px-3 py-1" data-testid="output-widget">
+									<WidgetOutput modelId={o.widget} />
 								</div>
 							{:else if o.plotly}
 								<div class="px-3 py-1" data-testid="output-plotly-wrap">
