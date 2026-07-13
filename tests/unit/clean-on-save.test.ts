@@ -146,6 +146,66 @@ describe('cleanNotebook — correctness', () => {
 	});
 });
 
+describe('cleanNotebook — ipywidgets (tqdm) volatile output policy', () => {
+	const WIDGET_MIME = 'application/vnd.jupyter.widget-view+json';
+
+	function widgetNotebook(): any {
+		return {
+			nbformat: 4,
+			nbformat_minor: 5,
+			metadata: { kernelspec: { name: 'python3' } },
+			cells: [
+				{
+					cell_type: 'code',
+					id: 'c1',
+					source: 'for _ in tqdm(range(3)): pass',
+					execution_count: 1,
+					metadata: {},
+					outputs: [
+						// A bare widget view (no useful fallback) — must be dropped entirely.
+						{
+							output_type: 'display_data',
+							data: { [WIDGET_MIME]: { version_major: 2, version_minor: 0, model_id: 'abc123' } },
+							metadata: {}
+						},
+						// A stream output around it must survive untouched.
+						{ output_type: 'stream', name: 'stdout', text: 'done\n' },
+						// A widget view that also carries a text/plain repr — strip the mime,
+						// keep the repr (the output survives).
+						{
+							output_type: 'display_data',
+							data: { [WIDGET_MIME]: { model_id: 'def456' }, 'text/plain': 'HBox(children=(…))' },
+							metadata: {}
+						}
+					]
+				}
+			]
+		};
+	}
+
+	it('strips the widget-view mime and drops an output left with an empty bundle', () => {
+		const outputs = (cleanNotebook(widgetNotebook()).cells[0] as any).outputs;
+		// The bare widget output is gone; the stream + the widget-with-fallback remain.
+		expect(outputs).toHaveLength(2);
+		expect(outputs[0]).toMatchObject({ output_type: 'stream', text: 'done\n' });
+		expect(outputs[1].data[WIDGET_MIME]).toBeUndefined();
+		expect(outputs[1].data['text/plain']).toBe('HBox(children=(…))');
+	});
+
+	it('is idempotent — a re-clean of the stripped notebook is a no-op', () => {
+		const once = cleanNotebook(widgetNotebook());
+		expect(cleanNotebook(once)).toEqual(once);
+	});
+
+	it('yields identical bytes on an identical re-run despite fresh model ids', () => {
+		// Model ids are a fresh UUID every run; stripping them is what keeps git clean.
+		const runA = widgetNotebook();
+		const runB = widgetNotebook();
+		(runB.cells[0].outputs[0].data[WIDGET_MIME] as any).model_id = 'totally-different-uuid';
+		expect(stringify(cleanNotebook(runA))).toBe(stringify(cleanNotebook(runB)));
+	});
+});
+
 describe('scrubAddresses / stripRuntimeMeta helpers', () => {
 	it('scrubs across strings and string arrays, leaves clean text untouched', () => {
 		expect(scrubAddresses('<X at 0xdeadbeef>')).toBe('<X>');

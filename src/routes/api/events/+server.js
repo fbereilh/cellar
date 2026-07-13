@@ -1,5 +1,6 @@
 import { subscribe } from '$lib/server/events';
 import { queueState } from '$lib/server/run-queue';
+import { widgetSnapshot } from '$lib/server/widgets';
 
 /**
  * Server-Sent Events stream — one per browser tab, carrying live document/run
@@ -53,6 +54,9 @@ export function GET({ request }) {
 			// change, so a tab that connects mid-queue would otherwise show no badges
 			// until the next enqueue.
 			send({ type: 'queue:changed', global: true, ...queueState() });
+			// Seed live ipywidgets (tqdm bars) too: a tab connecting mid-run must see
+			// models opened before it was listening. A full snapshot, so it self-heals.
+			send({ type: 'widget:sync', global: true, ...widgetSnapshot() });
 			unsubscribe = subscribe(send);
 			heartbeat = setInterval(() => enqueue(': heartbeat\n\n'), HEARTBEAT_MS);
 

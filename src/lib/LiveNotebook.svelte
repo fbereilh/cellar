@@ -8,6 +8,7 @@
 	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
 	import { exportCellCount } from '$lib/exportRole';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
+	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
 	import type { CellView, CellOutput, CellType, LogicalCellType, Actor, RunningView, QueueEntryView, LastRun, CellarNamespace, PublishedEvent } from '$lib/server/types';
@@ -697,6 +698,14 @@
 			// the queue is shared state, not one tab's action, so every tab renders it.
 			if (ev.type === 'queue:changed') {
 				applyQueueEvent(ev as unknown as QueueChangedEvent);
+				return;
+			}
+			// ipywidgets (tqdm bars) are global too: model ids are unique per kernel
+			// session, so they feed one shared store keyed by model id. Dispatched
+			// before the per-notebook filter and without echo suppression — the store
+			// is shared state, and every mounted notebook feeding it is idempotent.
+			if (isWidgetEvent(ev)) {
+				applyWidgetEvent(ev as Parameters<typeof applyWidgetEvent>[0]);
 				return;
 			}
 			// Past this point every event is a per-notebook `PublishedEvent`.
