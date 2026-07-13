@@ -28,15 +28,38 @@ function alive(pid: number): boolean {
 	}
 }
 
+// Require the launcher to look dead on this many CONSECUTIVE checks before we
+// self-exit. A single missed check could be a transient (a hiccup in the
+// existence probe); two in a row, CHECK_MS apart, is a real disappearance. This
+// keeps a live kernel from being torn down on a spurious reading.
+const CONFIRM_STRIKES = 2;
+
 export function startParentWatch(): void {
 	const raw = process.env.CELLAR_LAUNCHER_PID;
 	const launcherPid = raw ? parseInt(raw, 10) : NaN;
 	// pid 1 (init) is never a real launcher — guard against a stray value.
 	if (!Number.isInteger(launcherPid) || launcherPid <= 1) return;
 
+	let strikes = 0;
 	const timer = setInterval(() => {
-		if (alive(launcherPid)) return;
-		console.log(`[cellar] launcher pid ${launcherPid} is gone - exiting orphaned server`);
+		if (alive(launcherPid)) {
+			// Any live reading clears prior strikes — the launcher is still here.
+			if (strikes > 0) {
+				console.log(`[cellar] launcher pid ${launcherPid} responded again - staying up`);
+				strikes = 0;
+			}
+			return;
+		}
+		strikes += 1;
+		if (strikes < CONFIRM_STRIKES) {
+			console.warn(
+				`[cellar] launcher pid ${launcherPid} not found (${strikes}/${CONFIRM_STRIKES}) - confirming before exit`
+			);
+			return;
+		}
+		console.warn(
+			`[cellar] launcher pid ${launcherPid} confirmed gone (${strikes}/${CONFIRM_STRIKES} checks) - exiting orphaned server (trigger: orphan self-exit)`
+		);
 		// Reap the (now also orphaned) Jupyter sidecar and drop the registry entry
 		// before we go, so nothing is left behind listening.
 		try {

@@ -93,6 +93,7 @@ import {
 	annotateInstance,
 	reapInstance,
 	killPid,
+	processStartTime,
 	scanUntrackedCellarProcesses
 } from '../src/lib/server/instances.js';
 
@@ -215,7 +216,13 @@ function cleanup() {
 	// Drop our global registry entry (no-op if we never registered, e.g. --new).
 	unregisterInstance();
 }
-function shutdown(code = 0) {
+let shuttingDown = false;
+function shutdown(code = 0, trigger = 'unknown') {
+	if (shuttingDown) return; // a child exiting during our own teardown must not recurse
+	shuttingDown = true;
+	// Always name WHY we are stopping, so a killed instance is distinguishable
+	// from one that crashed — the user asked to be able to see this in the log.
+	console.log(`[cellar] shutting down (trigger: ${trigger}) - stopping ${children.length} child process(es)`);
 	for (const c of children) {
 		try {
 			c.kill('SIGTERM');
@@ -224,8 +231,20 @@ function shutdown(code = 0) {
 	cleanup();
 	process.exit(code);
 }
-process.on('SIGINT', () => shutdown(0));
-process.on('SIGTERM', () => shutdown(0));
+// A SIGTERM here is almost always another `cellar` launch reaping this instance
+// (take-over / cleanup) or the terminal/session ending. Naming it is what turns
+// "my kernel just died" into an answerable question.
+process.on('SIGINT', () => shutdown(0, 'SIGINT (Ctrl-C / interrupt)'));
+process.on('SIGTERM', () => shutdown(0, 'SIGTERM received (another cellar reaped us, or the session ended)'));
+// Belt-and-suspenders: drop our own registry entry on ANY normal exit (uncaught
+// throw, natural end), not just the signal paths, so a throwaway-workspace
+// instance never leaves a stale entry whose pid the OS could later reuse. Sync
+// only (rmSync), pid-guarded, idempotent — safe to also run after cleanup().
+process.on('exit', () => {
+	try {
+		unregisterInstance();
+	} catch {}
+});
 
 function freePort() {
 	return new Promise((resolvePort, reject) => {
@@ -401,7 +420,7 @@ async function cleanupCommand(flags) {
 	const log = (m) => console.log(m);
 
 	// 1) Prune fully-dead registry entries (no live process at all).
-	const pruned = await pruneDeadInstances();
+	const pruned = await pruneDeadInstances({ log });
 	if (pruned.length) console.log(`[cellar] pruned ${pruned.length} dead registry entr(ies).`);
 
 	// 2) Decide what to reap.
@@ -442,7 +461,7 @@ async function cleanupCommand(flags) {
 
 	for (const e of toReap) {
 		console.log(`[cellar] stopping launcher ${e.launcherPid} …`);
-		await reapInstance(e, { log });
+		await reapInstance(e, { log, reason: 'cleanup' });
 	}
 	for (const pid of toKillPids) {
 		console.log(`[cellar] killing pid ${pid} …`);
@@ -467,7 +486,7 @@ async function main() {
 		// Global hygiene (all workspaces): prune fully-dead registry entries, and
 		// reap instances whose workspace directory no longer exists (deleted
 		// worktrees). Both are always safe — nothing live for a real project is hit.
-		await pruneDeadInstances();
+		await pruneDeadInstances({ log: reapLog });
 		await reapVanishedWorkspaces({ excludePid: process.pid, log: reapLog });
 
 		let lock = acquireInstanceLock(WORKSPACE);
@@ -480,8 +499,14 @@ async function main() {
 			// Reap via the owner's real registry entry when present (so its recorded
 			// app/jupyter children are killed explicitly, not just via the launcher's
 			// SIGTERM cascade); fall back to a synthetic entry for a pre-registry owner.
+			// A synthetic entry carries no recorded start time, so reapInstance can't
+			// prove the lock's pid is still that instance and will SKIP-not-kill it
+			// (the safe direction — never signal a pid we can't identify). Every
+			// current-code instance registers with launcherStart, so the real
+			// take-over path (a genuine same-workspace relaunch) is unaffected; only a
+			// pre-registry / lost-entry owner degrades to prune-and-reclaim-the-lock.
 			const ownerEntry = readInstance(lock.ownerPid) || { launcherPid: lock.ownerPid, workspace: WORKSPACE };
-			await reapInstance(ownerEntry, { log: reapLog });
+			await reapInstance(ownerEntry, { log: reapLog, reason: 'same-workspace-takeover' });
 			await reapWorkspaceInstances(WORKSPACE, { excludePid: process.pid, log: reapLog });
 			lock = acquireInstanceLock(WORKSPACE);
 			for (let i = 0; !lock.acquired && i < 15; i++) {
@@ -558,6 +583,10 @@ async function main() {
 		mcpPort,
 		jupyterPort,
 		startedAt: Date.now(),
+		// The launcher's real OS start time — the reuse-proof identity a later
+		// reaper compares against before it dares signal this pid. Without it, a
+		// reused pid would be indistinguishable from this instance.
+		launcherStart: processStartTime(process.pid),
 		mode: useDev ? 'dev' : 'build'
 	});
 	if (writeMcpConfigOptIn) {
@@ -587,10 +616,10 @@ async function main() {
 		{ cwd: WORKSPACE, env: { ...process.env, JUPYTER_PATH: jupyterDir }, stdio: ['ignore', 'inherit', 'inherit'] }
 	);
 	children.push(jupyter);
-	updateInstance(process.pid, { jupyterPid: jupyter.pid });
+	updateInstance(process.pid, { jupyterPid: jupyter.pid, jupyterStart: processStartTime(jupyter.pid) });
 	jupyter.on('exit', (c) => {
 		console.error(`[cellar] jupyter sidecar exited (${c})`);
-		shutdown(1);
+		shutdown(1, `jupyter sidecar exited (${c})`);
 	});
 
 	console.log(`[cellar] starting Jupyter sidecar on ${jupyterUrl} …`);
@@ -625,16 +654,16 @@ async function main() {
 		if (!existsSync(buildEntry)) {
 			console.error(`[cellar] production build not found at ${buildEntry}.`);
 			console.error('[cellar] Run `npm run build` first, or pass --dev to use the Vite dev server.');
-			shutdown(1);
+			shutdown(1, 'production build missing');
 			return;
 		}
 		app = spawn('node', [buildEntry], { cwd: REPO, env, stdio: 'inherit' });
 	}
 	children.push(app);
-	updateInstance(process.pid, { appPid: app.pid });
+	updateInstance(process.pid, { appPid: app.pid, appStart: processStartTime(app.pid) });
 	app.on('exit', (c) => {
 		console.error(`[cellar] app server exited (${c})`);
-		shutdown(1);
+		shutdown(1, `app server exited (${c})`);
 	});
 
 	const appUrl = `http://localhost:${appPort}`;
