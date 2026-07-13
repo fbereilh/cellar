@@ -64,6 +64,10 @@
 		/** Mark this code cell for nbdev-style `.py` export, or unmark it. */
 		onSetExport?: (id: string, exported: boolean) => void;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
+		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
+		hideAllCode?: boolean;
+		/** Hide (or show) this code cell's input in place. */
+		onSetHideInput?: (id: string, hidden: boolean) => void;
 		/** Per-cell code-editor collapse choice (undefined = auto / true / false). */
 		editorCollapsed?: boolean;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
@@ -102,6 +106,8 @@
 		onSetRole,
 		onSetExport,
 		onSetScrolled,
+		hideAllCode = false,
+		onSetHideInput,
 		editorCollapsed,
 		onSetEditorCollapsed,
 		onActivate,
@@ -519,6 +525,20 @@
 	}
 	function toggleEditorCollapsed() {
 		onSetEditorCollapsed?.(cell.id, !collapsed);
+	}
+
+	// ---- Hide code input (report view) --------------------------------------
+	// Display-only: the code editor is hidden while the output stays. Distinct
+	// from `editorCollapsed` above (which only contracts a TALL editor to a scroll
+	// box) - this hides the input entirely, regardless of length. The choice is a
+	// tri-state: the explicit per-cell `cellar.hide_input` wins; when unset the
+	// cell follows the notebook-wide `hideAllCode` default. The source is never
+	// touched and the cell still runs, so the `.ipynb` stays git-clean.
+	const hideInputExplicit = $derived(cell.metadata?.cellar?.hide_input);
+	const codeHidden = $derived(!isMarkdown && (hideInputExplicit ?? hideAllCode));
+	function toggleHideInput() {
+		roleMenuEl?.hidePopover();
+		onSetHideInput?.(cell.id, !codeHidden);
 	}
 
 	// ---- Modal selection emphasis --------------------------------------------
@@ -1051,12 +1071,12 @@
 				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'down')} disabled={index === count - 1} title="Move down" aria-label="Move cell down" data-testid="move-down">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 				</button>
-				{#if canBeImports}
-					<!-- Cell-actions menu: designate this Python code cell as the notebook's
-					     imports cell, or clear the designation. -->
+				{#if !isMarkdown}
+					<!-- Cell-actions menu: hide/show this code cell's input, and (for a plain
+					     Python code cell) designate it the imports cell or mark it for export. -->
 					<button
 						bind:this={roleBtnEl}
-						class="btn btn-ghost btn-xs btn-square {isImports ? 'text-primary' : 'text-base-content/50 hover:text-base-content/80'}"
+						class="btn btn-ghost btn-xs btn-square {isImports || codeHidden ? 'text-primary' : 'text-base-content/50 hover:text-base-content/80'}"
 						onclick={openRoleMenu}
 						title="Cell actions"
 						aria-label="Cell actions"
@@ -1072,6 +1092,22 @@
 						data-testid="cell-actions-menu"
 					>
 						<div class="flex w-56 flex-col gap-0.5">
+							<!-- Hide/show the code input (report view). Available on any code cell
+							     (Python or SQL); markdown cells have no code to hide. -->
+							<button
+								class="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-base-200 {codeHidden ? 'text-base-content' : 'text-primary'}"
+								onclick={toggleHideInput}
+								data-testid="toggle-hide-input"
+							>
+								{#if codeHidden}
+									<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>
+									<span>Show code</span>
+								{:else}
+									<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" /><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" /><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" /><line x1="2" y1="2" x2="22" y2="22" /></svg>
+									<span>Hide code</span>
+								{/if}
+							</button>
+							{#if canBeImports}
 							<button
 								class="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-base-200 {isImports ? 'text-base-content' : 'text-primary'}"
 								onclick={toggleImportsRole}
@@ -1088,6 +1124,7 @@
 								<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
 								<span>{isExport ? 'Unmark for export' : 'Mark for export to .py'}</span>
 							</button>
+							{/if}
 						</div>
 					</div>
 				{/if}
@@ -1241,11 +1278,30 @@
 			</div>
 		{/if}
 
-		<!-- Editor (hidden while a markdown cell shows its rendered view). A code
-		     editor can be collapsed to a fixed-height scroll box (mirrors the
-		     scrollable-outputs toggle); the choice is persisted runtime-only. A
-		     markdown edit view keeps its original cap unchanged. -->
-		<div class="relative {isMarkdown && mode === 'rendered' ? 'hidden' : ''}">
+		<!-- "Show code" affordance: replaces the editor when a code cell's input is
+		     hidden (per-cell choice or the notebook-wide report view). A slim,
+		     discoverable bar; clicking reveals the editor in place. The output below
+		     (and the toolbar's run controls / run-status) stay visible. -->
+		{#if codeHidden}
+			<button
+				class="flex w-full items-center gap-1.5 border-b border-base-300 bg-base-200/40 px-3 py-1 text-left text-[11px] text-base-content/45 transition-colors hover:bg-base-200/80 hover:text-base-content/70"
+				onclick={toggleHideInput}
+				title="Show code input"
+				data-testid="show-code"
+				aria-expanded="false"
+			>
+				<svg class="h-3 w-3 shrink-0 -rotate-90" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+				<svg class="h-3 w-3 shrink-0 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6" /><path d="m8 6-6 6 6 6" /></svg>
+				<span class="font-medium">show code</span>
+			</button>
+		{/if}
+
+		<!-- Editor (hidden while a markdown cell shows its rendered view, or when a
+		     code cell's input is hidden as a report view). A code editor can be
+		     collapsed to a fixed-height scroll box (mirrors the scrollable-outputs
+		     toggle); the choice is persisted runtime-only. A markdown edit view keeps
+		     its original cap unchanged. -->
+		<div class="relative {(isMarkdown && mode === 'rendered') || codeHidden ? 'hidden' : ''}">
 			{#if canCollapse}
 				<!-- Collapse-editor toggle (mirrors the "Enable Scrolling for Outputs" control). -->
 				<button

@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport } from '$lib/server/notebook';
+import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setHideInput } from '$lib/server/notebook';
 
 /** Edit a cell's source, type ('code' | 'markdown'), imports-cell role, and/or
  *  its output-scroll choice in notebook `nb` (body field; workspace-relative
@@ -13,6 +13,7 @@ export async function PATCH({ params, request }) {
 	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
 	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
 	if ('export' in body) setCellExport(params.id, !!body.export, body.nb, body.originId);
+	if ('hideInput' in body) setHideInput(params.id, body.hideInput, body.nb, body.originId);
 	return json({ ok: true });
 }
 

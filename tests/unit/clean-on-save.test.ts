@@ -118,6 +118,20 @@ describe('cleanNotebook — correctness', () => {
 		expect(cellar.extract).toBe(false);
 	});
 
+	it('preserves the per-cell hide_input flag through a clean (display-only, git-clean)', () => {
+		const nb = messyNotebook();
+		(nb.cells[0] as any).metadata.cellar.hide_input = true;
+		const cleaned = cleanNotebook(nb);
+		expect((cleaned.cells[0] as any).metadata.cellar.hide_input).toBe(true);
+	});
+
+	it('preserves the notebook-level hide_all_code flag through a clean', () => {
+		const nb = messyNotebook();
+		(nb.metadata as any).cellar = { ...(nb.metadata as any).cellar, hide_all_code: true };
+		const cleaned = cleanNotebook(nb);
+		expect((cleaned.metadata as any).cellar.hide_all_code).toBe(true);
+	});
+
 	it('normalizes kernelspec.display_name → name', () => {
 		const cleaned = cleanNotebook(messyNotebook());
 		const ks = (cleaned.metadata as any).kernelspec;

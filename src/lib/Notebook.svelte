@@ -55,6 +55,10 @@
 		/** Regenerate the `.py` module now; resolves with the server result. */
 		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
+		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
+		hideAllCode?: boolean;
+		/** Hide (or show) a code cell's input in place. */
+		onSetHideInput?: (id: string, hidden: boolean) => void;
 		/** cell id → explicit code-editor collapse choice (runtime-only) */
 		editorCollapsed?: Record<string, boolean | undefined>;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
@@ -100,6 +104,8 @@
 		onSetExportTarget,
 		onExportPy,
 		onSetScrolled,
+		hideAllCode = false,
+		onSetHideInput,
 		editorCollapsed = {},
 		onSetEditorCollapsed,
 		onActivate,
@@ -313,6 +319,8 @@
 						onSetRole={onSetRole}
 						onSetExport={onSetExport}
 						onSetScrolled={onSetScrolled}
+						{hideAllCode}
+						onSetHideInput={onSetHideInput}
 						editorCollapsed={editorCollapsed[cell.id]}
 						onSetEditorCollapsed={onSetEditorCollapsed}
 						onActivate={onActivate}

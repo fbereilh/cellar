@@ -223,7 +223,8 @@ export function getNotebook(nb?: string | null): NotebookView {
 		path: doc.path,
 		cells: doc.cells.map(cellView),
 		exportTarget: typeof t === 'string' && t.trim() ? t.trim() : null,
-		headerNumbering: readHeaderNumbering(doc)
+		headerNumbering: readHeaderNumbering(doc),
+		hideAllCode: !!doc.metadata?.cellar?.hide_all_code
 	};
 }
 
@@ -449,6 +450,32 @@ export function setOutputScrolled(id: string, scrolled: boolean | null | undefin
 }
 
 /**
+ * Persist a code cell's "hide code input" choice in the allowlisted `cellar`
+ * namespace so it round-trips through clean-on-save. Tri-state:
+ * `null`/`undefined` clears the explicit choice (the cell then follows the
+ * notebook-wide `hide_all_code` default). Only a code cell can carry it (a
+ * markdown cell has no code to hide). Display only: the source is untouched and
+ * the cell still runs, so the `.ipynb` stays git-clean apart from the flag.
+ */
+export function setHideInput(
+	id: string,
+	hidden: boolean | null | undefined,
+	nb?: string | null,
+	originId?: string | null
+): boolean {
+	const doc = docFor(nb);
+	const cell = find(doc, id);
+	if (!cell || cell.cell_type !== 'code') return false;
+	cell.metadata = cell.metadata ?? {};
+	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	if (hidden === null || hidden === undefined) delete cell.metadata.cellar.hide_input;
+	else cell.metadata.cellar.hide_input = !!hidden;
+	persist(doc);
+	emit(doc, 'cell:hide-input', { cellId: id, hidden: hidden ?? null }, originId);
+	return true;
+}
+
+/**
  * Stamp runtime-only run metadata on a cell in the allowlisted `cellar`
  * namespace: `lastRun = { at, durationMs, actor, status, session }`.
  * Both run entry points (the UI `/run` route → `actor:'user'`, the MCP run tools
@@ -583,6 +610,28 @@ export function setHeaderNumbering(
 	persist(doc);
 	emit(doc, 'notebook:header-numbering', { levels: clean }, originId);
 	return clean;
+}
+
+/** Whether the notebook-wide "hide all code inputs" (report view) default is on. */
+export function getHideAllCode(nb?: string | null): boolean {
+	return !!docFor(nb).metadata?.cellar?.hide_all_code;
+}
+
+/**
+ * Set the notebook-wide "hide all code inputs" default in the allowlisted
+ * `cellar` namespace so it round-trips through clean-on-save. This is the
+ * default for cells with no explicit per-cell `cellar.hide_input`; a per-cell
+ * choice always wins. Display only - no cell source is touched.
+ */
+export function setHideAllCode(hidden: boolean, nb?: string | null, originId?: string | null): boolean {
+	const doc = docFor(nb);
+	doc.metadata = doc.metadata ?? {};
+	doc.metadata.cellar = doc.metadata.cellar ?? {};
+	if (hidden) doc.metadata.cellar.hide_all_code = true;
+	else delete doc.metadata.cellar.hide_all_code;
+	persist(doc);
+	emit(doc, 'notebook:hide-all-code', { hidden: !!hidden }, originId);
+	return !!hidden;
 }
 
 /**

@@ -26,6 +26,10 @@
 		canExportHtml?: boolean;
 		canRunActions?: boolean;
 		canCheckpoint?: boolean;
+		/** A notebook is active, so the notebook-wide hide-code toggle has a target. */
+		canHideCode?: boolean;
+		/** Whether the active notebook's "hide all code" (report view) is on. */
+		hideAllCode?: boolean;
 		onSelectTab: (id: string) => void;
 		onCloseTab: (id: string) => void;
 		onPromoteTab?: (id: string) => void;
@@ -40,6 +44,8 @@
 		onRunBelow: () => void;
 		onCheckpointNow: () => void;
 		onUndoAgent: () => void;
+		/** Toggle the active notebook's notebook-wide "hide all code" (report view). */
+		onToggleHideAllCode: () => void;
 		onOpenSettings: () => void;
 	}
 
@@ -56,6 +62,8 @@
 		canExportHtml = false, // a notebook is active, so there's something to export
 		canRunActions = false, // a notebook is active, so the bulk-run actions have a target
 		canCheckpoint = false, // a notebook is active, so it can be snapshotted / reverted
+		canHideCode = false, // a notebook is active, so hide-all-code has a target
+		hideAllCode = false, // the active notebook's report-view state
 		onSelectTab,
 		onCloseTab,
 		onPromoteTab,
@@ -70,6 +78,7 @@
 		onRunBelow,
 		onCheckpointNow,
 		onUndoAgent,
+		onToggleHideAllCode,
 		onOpenSettings
 	}: Props = $props();
 
@@ -162,6 +171,25 @@
 					>
 						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
 						Export to .py
+					</button>
+				</li>
+				<div class="divider my-1"></div>
+				<li class="menu-title text-[11px]">View</li>
+				<li>
+					<button
+						onclick={onToggleHideAllCode}
+						disabled={!canHideCode}
+						title="Hide every code cell's input for a clean, output-only report view. A cell's own show/hide choice still wins; reveal any one from its 'show code' bar."
+						data-testid="toggle-hide-all-code"
+						aria-pressed={hideAllCode}
+					>
+						{#if hideAllCode}
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>
+							Show all code
+						{:else}
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" /><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" /><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" /><line x1="2" y1="2" x2="22" y2="22" /></svg>
+							Hide all code
+						{/if}
 					</button>
 				</li>
 				<div class="divider my-1"></div>

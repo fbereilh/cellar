@@ -100,6 +100,13 @@
 	function handleNumberingChange(path: string, numbers: Record<string, string>, levels: number[]) {
 		notebooksNumbering[path] = { numbers, levels };
 	}
+	// path → whether that notebook's notebook-wide "hide all code" (report view) is
+	// on, published up from each LiveNotebook so the navbar's toggle reflects the
+	// active notebook. Assign into the key (never rebuild the map), like above.
+	let notebooksHideAll = $state<Record<string, boolean>>({});
+	function handleHideAllCodeChange(path: string, hidden: boolean) {
+		notebooksHideAll[path] = hidden;
+	}
 	// Imperative, not reactive: path → the notebook's numbering setter. The Outline's
 	// per-level checkboxes drive numbering through this, same shape as `foldTogglers`.
 	const numberingTogglers = new Map<string, NumberingRegistryHandle>();
@@ -264,6 +271,7 @@
 	const activeCells = $derived((activeNotebookPath && notebooksCells[activeNotebookPath]) || []);
 	const activeFolds = $derived((activeNotebookPath && notebooksFolds[activeNotebookPath]) || null);
 	const activeNumbering = $derived((activeNotebookPath && notebooksNumbering[activeNotebookPath]) || null);
+	const activeHideAllCode = $derived(!!(activeNotebookPath && notebooksHideAll[activeNotebookPath]));
 	const activeRunState = $derived((activeNotebookPath && notebooksRunState[activeNotebookPath]) || null);
 
 	// Git blame for the active file's cursor line, shown in the bottom status bar.
@@ -582,6 +590,13 @@
 			fsRefreshSignal++; // a new/updated .py on disk → refresh the tree + git decorations
 			notice = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`;
 		}
+	}
+
+	// Toggle the active notebook's notebook-wide "hide all code" (report view).
+	// Delegates to the notebook's own setter (which persists + broadcasts); the
+	// navbar's label reflects `activeHideAllCode`, published back up per notebook.
+	function toggleHideAllCode() {
+		activeNotebookApi()?.toggleHideAllCode();
 	}
 
 	// ---- jupytext: save as .py / convert .py → .ipynb -------------------------
@@ -992,6 +1007,8 @@
 		canExportHtml={!!activeNotebookPath}
 		canRunActions={!!activeNotebookPath}
 		canCheckpoint={!!activeNotebookPath}
+		canHideCode={!!activeNotebookPath}
+		hideAllCode={activeHideAllCode}
 		onSelectTab={selectTab}
 		onCloseTab={closeTab}
 		onPromoteTab={promoteTab}
@@ -1006,6 +1023,7 @@
 		onRunBelow={runBelowActive}
 		onCheckpointNow={checkpointNow}
 		onUndoAgent={undoLastAgentAction}
+		onToggleHideAllCode={toggleHideAllCode}
 		onOpenSettings={() => (settingsOpen = true)}
 	/>
 
@@ -1071,6 +1089,7 @@
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
 						onNumberingChange={handleNumberingChange}
+						onHideAllCodeChange={handleHideAllCodeChange}
 						onRunStateChange={handleRunStateChange}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
@@ -1091,6 +1110,7 @@
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
 						onNumberingChange={handleNumberingChange}
+						onHideAllCodeChange={handleHideAllCodeChange}
 						onRunStateChange={handleRunStateChange}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
