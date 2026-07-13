@@ -13,6 +13,7 @@
 	import { md, renderMarkdown } from '$lib/markdown';
 	import { EDITOR_THEME } from '$lib/editorTheme';
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
+	import { parsePandasDataFrameHtml } from '$lib/dataframeHtml';
 	import PlotlyOutput from '$lib/PlotlyOutput.svelte';
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
@@ -401,6 +402,18 @@
 				const imgMime = Object.keys(d).find((k) => k.startsWith('image/'));
 				if (imgMime) {
 					return { tone: 'result', image: imageDataUrl(imgMime, d[imgMime]), segments: null };
+				}
+				// A *saved* DataFrame lost its structured MIME to clean-on-save and now
+				// carries only pandas' text/html repr. Recognize that repr (a
+				// `class="dataframe"` table) and render it with the interactive grid,
+				// so a reopened notebook looks like the live one. Only reached when no
+				// structured payload was present (checked above); any non-dataframe
+				// HTML parses to null and falls through to the sandboxed iframe.
+				if (d['text/html']) {
+					const parsed = parsePandasDataFrameHtml(asText(d['text/html']));
+					if (parsed) {
+						return { tone: 'result', dataframe: parsed, segments: null };
+					}
 				}
 				// Rich text/html (Bokeh, Altair, folium, styled DataFrames, plotly's
 				// HTML renderer, …) renders in a sandboxed iframe so its embedded JS
