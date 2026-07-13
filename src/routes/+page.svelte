@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { fade } from 'svelte/transition';
 	import Navbar from '$lib/Navbar.svelte';
 	import Sidebar from '$lib/Sidebar.svelte';
 	import LiveNotebook from '$lib/LiveNotebook.svelte';
@@ -901,11 +902,23 @@
 	// beats CodeMirror; it defers to another open modal (e.g. Settings) which owns
 	// the keyboard while up.
 	onMount(() => {
+		const bindsFor = (id: string) => shortcuts.list.find((s) => s.id === id)?.keys ?? [];
 		function onKey(e: KeyboardEvent) {
 			const chord = chordFromEvent(e);
 			if (!chord) return;
-			const keys = shortcuts.list.find((s) => s.id === 'command-palette')?.keys ?? [];
-			if (!keys.includes(chord)) return;
+			// Cmd/Ctrl+S saves the active notebook instead of Chrome's "Save page as…".
+			// Shell-level (like the palette) so it fires even with focus inside a
+			// CodeMirror editor — capture phase runs before the editor's own keymap.
+			// Only when a notebook is active: a plain file tab keeps FileTab's own
+			// Mod-s save, and a modal owns the keyboard while up.
+			if (bindsFor('save-notebook').includes(chord)) {
+				if (!activeNotebookPath || document.querySelector('.modal-open')) return;
+				e.preventDefault();
+				e.stopPropagation();
+				saveActiveNotebook();
+				return;
+			}
+			if (!bindsFor('command-palette').includes(chord)) return;
 			if (!paletteOpen && document.querySelector('.modal-open')) return; // another modal owns the keyboard
 			e.preventDefault();
 			e.stopPropagation();
@@ -914,6 +927,21 @@
 		window.addEventListener('keydown', onKey, true);
 		return () => window.removeEventListener('keydown', onKey, true);
 	});
+
+	// Brief "Saved" confirmation for a Cmd/Ctrl+S save. Fades out on its own.
+	let savedToast = $state(false);
+	let savedTimer: ReturnType<typeof setTimeout>;
+	function showSavedToast() {
+		savedToast = true;
+		clearTimeout(savedTimer);
+		savedTimer = setTimeout(() => (savedToast = false), 1400);
+	}
+	async function saveActiveNotebook() {
+		const api = activeNotebookApi();
+		if (!api) return;
+		await api.save();
+		showSavedToast();
+	}
 </script>
 
 <div class="flex h-screen flex-col overflow-hidden bg-base-200 text-base-content">
@@ -1105,6 +1133,29 @@
 </div>
 
 <CommandPalette open={paletteOpen} commands={paletteCommands} onClose={() => (paletteOpen = false)} />
+
+{#if savedToast}
+	<div
+		class="pointer-events-none fixed bottom-5 right-5 z-[60]"
+		transition:fade={{ duration: 180 }}
+		data-testid="saved-toast"
+	>
+		<div
+			class="flex items-center gap-2 rounded-lg border border-base-300 bg-base-100 px-3 py-2 text-sm text-base-content shadow-lg"
+		>
+			<svg class="h-4 w-4 text-success" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+				<path
+					d="M5 10.5l3.5 3.5L15 6.5"
+					stroke="currentColor"
+					stroke-width="2"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+				/>
+			</svg>
+			Saved
+		</div>
+	</div>
+{/if}
 
 <Settings
 	open={settingsOpen}

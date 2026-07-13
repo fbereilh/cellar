@@ -66,6 +66,13 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		category: 'Application',
 		description: 'Open the command palette'
 	},
+	{
+		id: 'save-notebook',
+		keys: ['Mod-s'],
+		mode: 'global',
+		category: 'Application',
+		description: 'Save the notebook (flush pending edits)'
+	},
 
 	// ---- Modes -------------------------------------------------------------
 	{

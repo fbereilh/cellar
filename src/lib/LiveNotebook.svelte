@@ -175,7 +175,7 @@
 	// action the modal keyboard runs for a registry shortcut id, so the palette and
 	// the keyboard share one handler and cannot diverge.
 	$effect(() => {
-		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy });
+		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, save });
 		return () => onRegisterApi?.(path, null);
 	});
 
@@ -863,6 +863,17 @@
 	/** Run every STALE code cell, in document (dependency) order — clears staleness. */
 	function runStale() {
 		runCodeIds(cells.filter((c) => staleness[c.id]?.state === 'stale').map((c) => c.id));
+	}
+
+	/**
+	 * Save the notebook now (Cmd/Ctrl+S). Edits already autosave on a debounce, so
+	 * the job here is to flush every cell's pending edit immediately and let the
+	 * normal PATCH persistence write it — no separate save endpoint. Awaits all
+	 * flushed PATCHes so the caller's "Saved" confirmation means persisted. A cell
+	 * with nothing dirty flushes to a resolved no-op.
+	 */
+	async function save() {
+		await Promise.all(Object.values(cellApis).map((a) => a.flush?.() ?? Promise.resolve()));
 	}
 
 	async function editCell(id: string, source: string, { keepalive = false }: { keepalive?: boolean } = {}) {

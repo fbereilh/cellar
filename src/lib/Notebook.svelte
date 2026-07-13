@@ -38,7 +38,7 @@
 		onDelete: (id: string) => void;
 		onMove: (id: string, dir: 'up' | 'down') => void;
 		onMoveToIndex?: (id: string, toIndex: number) => void;
-		onEdit: (id: string, source: string, opts?: { keepalive?: boolean }) => void;
+		onEdit: (id: string, source: string, opts?: { keepalive?: boolean }) => void | Promise<void>;
 		onSetType: (id: string, type: LogicalCellType) => void;
 		/** Designate this cell the imports cell ('imports') or un-designate it (null). */
 		onSetRole: (id: string, role: string | null) => void;
