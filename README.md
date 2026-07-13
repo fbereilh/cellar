@@ -8,13 +8,17 @@ Cellar runs an interactive notebook in your browser on one shared Jupyter kernel
 
 It saves ordinary `.ipynb` files that open in vanilla Jupyter, and it keeps them git-clean so your diffs stay meaningful.
 
+![Cellar running a live analysis notebook: a markdown heading, Python cells, and an interactive DataFrame grid, with an outline and live variable inspector in the sidebar](docs/images/hero.png)
+
+<p align="center"><em>One live notebook, one shared kernel - markdown, code, and rich outputs, with an outline and live kernel inspector alongside. (Shown in the dark theme; a light theme ships too.)</em></p>
+
 ## Why Cellar
 
 - 🤝 **You and your agent, one notebook.** An agent's runs and edits appear live in your open tab (streaming output, run badges, structural changes), and your edits flow back the same way. You are never looking at stale state.
 - ⚡ **One command, zero setup.** Run `cellar` in any folder. It resolves (or creates) the project venv with [`uv`](https://docs.astral.sh/uv/), starts the kernel, and opens your browser.
 - 🔌 **Zero-config agent connection.** Cellar drops a `.mcp.json` in your workspace, so an agent opened in that folder connects automatically over MCP. Nothing to wire up.
 - 🧹 **Git-friendly by design.** Clean-on-save strips volatile metadata and normalizes outputs, so re-running a notebook with the same results produces *no* git diff.
-- 📊 **Rich outputs and data tools.** Matplotlib, Plotly, HTML, and full-size images render inline; inspect variables and preview DataFrames without leaving the page.
+- 📊 **Rich outputs and data tools.** Matplotlib, Plotly, HTML, and full-size images render inline; sort and filter DataFrames in an interactive grid, and inspect the live namespace without leaving the page.
 - 🧱 **Databricks, natively.** Point-and-click connect binds `spark` and a `WorkspaceClient` in the kernel and gives you a Unity Catalog browser.
 
 ## Install
@@ -60,9 +64,9 @@ make setup
 
 ## Run with Docker
 
-A second way to run Cellar: **only Docker on the host** - no Node, Python, or `uv` to install, and a **reproducible, pinned kernel environment** baked into the image so every run is identical. This is an alternative distribution for single-user, reproducible/zero-prereq use (Cellar has one shared kernel and no auth, so it is **not** for multi-user hosting).
+Prefer to skip installing anything? If you have Docker, you have Cellar. This path needs **only Docker on the host** - no Node, Python, or `uv` - and bakes a **reproducible, pinned kernel environment** into the image so every run is identical. It's meant for single-user, reproducible, zero-prerequisite use: Cellar has one shared kernel and no auth, so it is **not** for multi-user hosting.
 
-**Zero-prerequisite run.** Build the image once, then run it against any project folder:
+Build the image once, then point it at any project folder:
 
 ```sh
 git clone https://github.com/fbereilh/cellar.git && cd cellar
@@ -75,35 +79,36 @@ docker run --rm --init \
   cellar
 ```
 
-Then open **http://localhost:8888** (the container prints it on startup). Your folder is mounted at `/workspace`; edits, new notebooks, and exports are written straight back to it. `Ctrl-C` (or `docker stop`) shuts it down cleanly.
+Open **http://localhost:8888** (the container prints it on startup) and you're in. Your folder is mounted at `/workspace`, so edits, new notebooks, and exports land straight back in it. `Ctrl-C` (or `docker stop`) shuts everything down cleanly.
 
-Or with Compose (mounts the current dir, publishes both ports):
+Prefer Compose? It mounts the current directory and publishes both ports for you:
 
 ```sh
 docker compose up --build   # then open http://localhost:8888
 ```
 
-Once published to a registry you can skip the build entirely:
+Once the image is published to a registry, you can skip the build entirely:
 
 ```sh
 docker run --rm --init -v "$PWD":/workspace -p 8888:8888 -p 39587:39587 ghcr.io/fbereilh/cellar:latest
 ```
 
-**The reproducible pinned env.** The image bakes a `uv`-managed virtualenv at `/opt/cellar-kernel` from [`docker/kernel-requirements.txt`](docker/kernel-requirements.txt) (a version-pinned scientific stack: `ipykernel`, `ipywidgets`, `numpy`, `pandas`, `matplotlib`, `scipy`) and binds the Cellar kernel to it. Every container therefore runs the exact same kernel env with no network access at start. To customize:
+**The reproducible pinned env.** The image bakes a `uv`-managed virtualenv at `/opt/cellar-kernel` from [`docker/kernel-requirements.txt`](docker/kernel-requirements.txt) - a version-pinned scientific stack (`ipykernel`, `ipywidgets`, `numpy`, `pandas`, `matplotlib`, `scipy`) - and binds the Cellar kernel to it. Every container runs the exact same kernel env, with no network access at start. To make it yours:
 
-- **Rebuild with your own pins** (the primary path): edit `docker/kernel-requirements.txt`, then `docker build -t my-cellar .`. Change the base or tool versions with build args, e.g. `--build-arg NODE_IMAGE=node:22-bookworm-slim`.
+- **Rebuild with your own pins** (the primary path): edit `docker/kernel-requirements.txt`, then `docker build -t my-cellar .`. Swap the base or tool versions with build args, e.g. `--build-arg NODE_IMAGE=node:22-bookworm-slim`.
 - **Ad-hoc extras without a rebuild**: mount a requirements file and point `CELLAR_REQUIREMENTS` at it - `-v "$PWD/requirements.txt":/reqs.txt -e CELLAR_REQUIREMENTS=/reqs.txt` - and the entrypoint installs them into the kernel venv at startup (needs network).
 
-**Connecting an agent.** The MCP endpoint is published on **http://localhost:39587/mcp** (Streamable HTTP). Point an HTTP-capable MCP client at it (the in-container `cellar mcp` stdio bridge isn't used from the host, so the image writes no `.mcp.json` by default - set `-e CELLAR_MCP_CONFIG=1` to opt back in for an agent running *inside* the container).
+**Connecting an agent.** The MCP endpoint is published on **http://localhost:39587/mcp** (Streamable HTTP). Point an HTTP-capable MCP client at it. (The in-container `cellar mcp` stdio bridge isn't used from the host, so the image writes no `.mcp.json` by default; set `-e CELLAR_MCP_CONFIG=1` to opt back in for an agent running *inside* the container.)
 
-**Design.** The image is self-contained (Node + `uv` + Python, multi-stage build) rather than based on a `jupyter/docker-stacks` conda image: Cellar is `uv`-first by design (it manages every venv through `uv`), so a conda base would add a second package manager Cellar never uses, and docker-stacks ships no Node. The container runs isolated (`CELLAR_ISOLATED=1` - no host registry or reaper), non-root, with fixed published ports and the app/MCP bound to `0.0.0.0`.
+**Why this image, not a Jupyter base?** It's self-contained (Node + `uv` + Python, multi-stage build) rather than built on a `jupyter/docker-stacks` conda image. Cellar is `uv`-first by design - it manages every venv through `uv` - so a conda base would bolt on a second package manager Cellar never uses, and docker-stacks ships no Node. The container runs isolated (`CELLAR_ISOLATED=1`, no host registry or reaper), non-root, with fixed published ports and the app/MCP bound to `0.0.0.0`.
 
-**Caveats (honest).**
-- The kernel environment is the **container's** baked env, not a host `.venv`. Point Cellar at a different env by rebuilding, or with `-e CELLAR_VENV=/workspace/.venv` (it will `uv`-install `ipykernel` there at startup if missing).
-- **Databricks** needs `~/.databrickscfg` mounted read-only (`-v "$HOME/.databrickscfg":/home/cellar/.databrickscfg:ro`, or uncomment the line in `docker-compose.yml`). A **PAT** profile works headless; OAuth's browser flow is awkward in a container.
-- Git blame/diff features need the repo mounted - it is, via `/workspace`.
-- **Linux uid**: files are written as uid 1000 by default. If your host user differs, add `--user "$(id -u):$(id -g)"` so mounted files stay owned by you (macOS Docker Desktop handles this automatically).
-- Single-user only - do not expose the ports beyond `localhost`.
+**Good to know (the honest caveats):**
+
+- The kernel environment is the **container's** baked env, not a host `.venv`. Point Cellar at a different one by rebuilding, or with `-e CELLAR_VENV=/workspace/.venv` (it will `uv`-install `ipykernel` there at startup if missing).
+- **Databricks** needs `~/.databrickscfg` mounted read-only (`-v "$HOME/.databrickscfg":/home/cellar/.databrickscfg:ro`, or uncomment the line in `docker-compose.yml`). A **PAT** profile works headless; OAuth's browser flow is awkward inside a container.
+- Git blame and diff features need the repo mounted - it is, via `/workspace`.
+- **Linux uid:** files are written as uid 1000 by default. If your host user differs, add `--user "$(id -u):$(id -g)"` so mounted files stay owned by you. (macOS Docker Desktop handles this for you.)
+- **Single-user only** - don't expose the ports beyond `localhost`.
 
 ## Quick start
 
@@ -118,14 +123,25 @@ Your browser opens to a clean, empty workspace. Click **New notebook** (or open 
 
 ## Features
 
+Everything you'd expect from a notebook, plus the things that make sharing one with an agent feel natural:
+
 - **Code, Markdown, and SQL cells**, with a run queue, live run status, and staleness tracking so you always know what's fresh.
 - **Rich outputs**: matplotlib, Plotly, rich HTML, and images you can double-click to view at natural size.
+- **Interactive DataFrame grid**: pandas frames become a sortable, filterable, paginated table instead of a static repr.
 - **Run metadata** on every cell: when it last ran, how long it took, and who ran it (you or an agent).
 - **Checkpoints and undo** for agent actions - snapshot before a risky change and roll back.
-- **Command palette** for fast navigation and actions.
+- **Command palette** and Jupyter-style modal keyboard shortcuts for fast navigation.
 - **Variable and DataFrame inspection** to peek into the live kernel namespace.
-- **Git blame and diff gutters** right in the editor.
+- **Git blame and diff gutters** right in the editor, and per-cell change bars in the notebook.
 - One shared kernel across notebooks, with a sidebar showing what's actually loaded in memory.
+
+![A pandas DataFrame rendered as Cellar's interactive grid, sorted by a column, with dtype headers, a filter box, and pagination](docs/images/dataframe-grid.png)
+
+<p align="center"><em>A bare <code>df</code> becomes an interactive grid - click a header to sort, type to filter, page through the rows.</em></p>
+
+![A matplotlib line chart rendered inline in a Cellar notebook, showing quarterly revenue by region](docs/images/revenue-plot.png)
+
+<p align="center"><em>Matplotlib, Plotly, and HTML outputs render inline, right where you ran the cell.</em></p>
 
 ## Working with agents (MCP)
 
@@ -158,16 +174,8 @@ npm run test
 npm run test:e2e
 ```
 
-- **Unit tests** (`tests/unit/`) guard the pure server logic — the crown jewel is
-  clean-on-save: idempotent, git-clean round-trips, the metadata allowlist, memory-address
-  scrubbing, and the notebook model (stable cell IDs, add/move/delete, duplicate-ID
-  re-keying). These are the **must-pass gate and run on every PR in CI**.
-- **E2E smoke** (`tests/e2e/smoke.spec.ts`, one spec) boots the real `cellar` launcher
-  against a scratch workspace, runs `6*7`, asserts `42` renders, and confirms the saved
-  `.ipynb` is valid. It needs the full kernel runtime (`uv` + `python3` + the cached
-  host-venv), so it is a **local, best-effort** check and skips itself when that runtime is
-  absent. CI does not provide the kernel runtime, so the E2E is not run there — the unit
-  suite is what gates merges. Install the browser once with `npx playwright install chromium`.
+- **Unit tests** (`tests/unit/`) guard the pure server logic. The crown jewel is clean-on-save: idempotent, git-clean round-trips, the metadata allowlist, memory-address scrubbing, and the notebook model (stable cell IDs, add/move/delete, duplicate-ID re-keying). These are the **must-pass gate and run on every PR in CI**.
+- **E2E smoke** (`tests/e2e/smoke.spec.ts`, one spec) boots the real `cellar` launcher against a scratch workspace, runs `6*7`, asserts `42` renders, and confirms the saved `.ipynb` is valid. It needs the full kernel runtime (`uv` + `python3` + the cached host-venv), so it's a **local, best-effort** check that skips itself when that runtime is absent. CI doesn't provide the kernel runtime, so it runs locally, not there - the unit suite is what gates merges. Install the browser once with `npx playwright install chromium`.
 
 ## License
 
