@@ -41,6 +41,12 @@ export interface FoldRegistryHandle {
 	expandAll: () => void;
 }
 
+/** Imperative heading-numbering controls a notebook publishes to the sidebar Outline. */
+export interface NumberingRegistryHandle {
+	/** Turn the display-only auto-number for heading level (1-6) on or off. */
+	setLevel: (level: number, on: boolean) => void;
+}
+
 /** Result of an nbdev-style `.py` module export. */
 export interface ExportPyResult {
 	written: boolean;

@@ -222,8 +222,18 @@ export function getNotebook(nb?: string | null): NotebookView {
 		workspace: workspace(),
 		path: doc.path,
 		cells: doc.cells.map(cellView),
-		exportTarget: typeof t === 'string' && t.trim() ? t.trim() : null
+		exportTarget: typeof t === 'string' && t.trim() ? t.trim() : null,
+		headerNumbering: readHeaderNumbering(doc)
 	};
+}
+
+/** Sanitized heading-numbering levels (unique, 1-6, ascending) from a doc. */
+function readHeaderNumbering(doc: NotebookDoc): number[] {
+	const raw = doc.metadata?.cellar?.header_numbering;
+	if (!Array.isArray(raw)) return [];
+	return [...new Set(raw.filter((l): l is number => Number.isInteger(l) && l >= 1 && l <= 6))].sort(
+		(a, b) => a - b
+	);
 }
 
 /**
@@ -543,6 +553,36 @@ export function setExportTarget(target: string | null, nb?: string | null, origi
 	persist(doc);
 	emit(doc, 'notebook:export-target', { target: trimmed || null }, originId);
 	return true;
+}
+
+/** The notebook's enabled heading-numbering levels (unique, 1-6, ascending). */
+export function getHeaderNumbering(nb?: string | null): number[] {
+	return readHeaderNumbering(docFor(nb));
+}
+
+/**
+ * Set the heading levels (1-6) rendered with a display-only auto-number, in the
+ * allowlisted `cellar` namespace so it round-trips through clean-on-save. The
+ * numbers themselves are computed at render time and never written to any cell's
+ * markdown source - this only persists *which levels* are numbered. An empty list
+ * clears the setting.
+ */
+export function setHeaderNumbering(
+	levels: readonly number[] | null | undefined,
+	nb?: string | null,
+	originId?: string | null
+): number[] {
+	const doc = docFor(nb);
+	doc.metadata = doc.metadata ?? {};
+	doc.metadata.cellar = doc.metadata.cellar ?? {};
+	const clean = [
+		...new Set((levels ?? []).filter((l) => Number.isInteger(l) && l >= 1 && l <= 6))
+	].sort((a, b) => a - b);
+	if (clean.length) doc.metadata.cellar.header_numbering = clean;
+	else delete doc.metadata.cellar.header_numbering;
+	persist(doc);
+	emit(doc, 'notebook:header-numbering', { levels: clean }, originId);
+	return clean;
 }
 
 /**

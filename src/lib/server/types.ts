@@ -118,6 +118,8 @@ export interface NotebookView {
 	cells: CellView[];
 	/** nbdev-style export target (`.py` module path), or null when unset. */
 	exportTarget: string | null;
+	/** Heading levels (1-6) rendered with a display-only auto-number. */
+	headerNumbering: number[];
 }
 
 /** nbformat kernelspec. */
@@ -132,6 +134,8 @@ export interface KernelSpec {
 export interface NotebookCellarNamespace {
 	/** nbdev-style export target: a workspace-relative `.py` module path. */
 	export_target?: string;
+	/** Heading levels (1-6) rendered with a display-only auto-number. */
+	header_numbering?: number[];
 	[key: string]: unknown;
 }
 

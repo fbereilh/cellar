@@ -148,6 +148,67 @@ export function outlineHeadings(cells: readonly HeadingCell[] | null | undefined
 	return out;
 }
 
+/**
+ * Display prefix for a computed heading number. A flat number keeps the classic
+ * trailing period (`1.` → `1. Header`, matching the captain's example); a dotted
+ * hierarchical number reads cleaner without it (`1.2` → `1.2 Header`).
+ */
+export function headingNumberPrefix(number: string): string {
+	return number.includes('.') ? `${number} ` : `${number}. `;
+}
+
+/**
+ * Compute the display-only auto-number for every heading occurrence, in document
+ * order. Numbering is hierarchical over the *enabled* levels only:
+ *   - only H2 enabled → flat `1`, `2`, `3`
+ *   - H1+H2 enabled  → `1`, `1.1`, `1.2`, `2`, … (a deeper counter resets when a
+ *     higher enabled level increments)
+ * Disabled levels get no number and never consume a counter (they are skipped in
+ * the hierarchy). Returns a foldKey → number string map (e.g. `"1"`, `"2.3"`);
+ * a heading whose level is disabled is simply absent. Pure + deterministic, so
+ * add/remove/reorder/level-change re-derives live and the `.ipynb` is untouched.
+ */
+export function computeHeadingNumbers(
+	headings: readonly OutlineHeading[] | null | undefined,
+	enabledLevels: ReadonlySet<number> | null | undefined
+): Record<string, string> {
+	const out: Record<string, string> = {};
+	// The enabled levels, ordered shallow→deep; a level's index is its counter slot.
+	const levels = [...(enabledLevels ?? [])].filter((l) => l >= 1 && l <= 6).sort((a, b) => a - b);
+	if (!levels.length) return out;
+	const slotOf = new Map(levels.map((l, i) => [l, i]));
+	const counters = new Array(levels.length).fill(0);
+	for (const h of headings ?? []) {
+		const slot = slotOf.get(h.level);
+		if (slot === undefined) continue; // disabled level: no number, no counter effect
+		counters[slot]++;
+		for (let i = slot + 1; i < counters.length; i++) counters[i] = 0;
+		const parts = counters.slice(0, slot + 1);
+		// A deeper heading appearing before any of its parents leaves leading zeros
+		// (parent never incremented); drop them so an orphan `## Foo` reads `1`, not `0.1`.
+		let start = 0;
+		while (start < parts.length - 1 && parts[start] === 0) start++;
+		out[h.key] = parts.slice(start).join('.');
+	}
+	return out;
+}
+
+// A heading line's leading `#`s + text, for re-rendering a numbered heading.
+const HEADING_LINE = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
+
+/**
+ * A heading source line rewritten so the rendered heading shows its auto-number:
+ * `## Header` + `"1"` → `## 1. Header`. Display-only - the caller renders this,
+ * never persists it, so the cell's real markdown source is untouched. Returns the
+ * line unchanged when there is no number or the line isn't a heading.
+ */
+export function numberHeadingLine(headingLine: string, number: string | undefined): string {
+	if (!number) return headingLine;
+	const m = HEADING_LINE.exec(headingLine);
+	if (!m) return headingLine;
+	return `${m[1]} ${headingNumberPrefix(number)}${m[2]}`;
+}
+
 // A single fold unit: a foldable heading (carries a level + key) or a body run.
 type FoldUnit =
 	| { cellId: string; seg: number; kind: 'heading'; level: number; key: string }

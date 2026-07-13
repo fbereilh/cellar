@@ -2,7 +2,7 @@
 	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client';
-	import { cellIdOfKey, computeFolding, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
+	import { cellIdOfKey, computeFolding, computeHeadingNumbers, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
@@ -12,7 +12,7 @@
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
 	import type { CellView, CellOutput, CellType, LogicalCellType, Actor, RunningView, QueueEntryView, LastRun, CellarNamespace, PublishedEvent } from '$lib/server/types';
-	import type { UICell, KeyMode, FoldRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
+	import type { UICell, KeyMode, FoldRegistryHandle, NumberingRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
 	import type { ClientEvent } from '$lib/events-client';
 	import type { Folding } from '$lib/headings';
 	import type { StalenessMap } from '$lib/staleness';
@@ -27,6 +27,10 @@
 		onCellsChange?: (path: string, cells: UICell[]) => void;
 		/** (path, foldedIds, folding): the sidebar Outline renders from this. */
 		onFoldsChange?: (path: string, foldedIds: Set<string>, folding: Folding) => void;
+		/** (path, numbers, levels): the sidebar Outline's heading auto-numbers + the enabled levels. */
+		onNumberingChange?: (path: string, numbers: Record<string, string>, levels: number[]) => void;
+		/** (path, handle|null): lets the Outline toggle this notebook's numbering levels. */
+		onRegisterNumbering?: (path: string, handle: NumberingRegistryHandle | null) => void;
 		/** (path, runningId, queued): the sidebar Outline's per-section run/queue badges. */
 		onRunStateChange?: (path: string, runningId: string | null, queued: Record<string, number>) => void;
 		/** (path, handle|null): lets the Outline drive this notebook's folds. */
@@ -50,7 +54,8 @@
 		| { type: 'cell:cleared'; cellId: string }
 		| { type: 'cell:rendered'; cellId: string }
 		| { type: 'cell:edited'; cellId: string; source: string }
-		| { type: 'notebook:export-target'; target: string | null };
+		| { type: 'notebook:export-target'; target: string | null }
+		| { type: 'notebook:header-numbering'; levels: number[] };
 
 	/** A run-lifecycle event (run:cleared / run:start / run:output / run:end). */
 	type RunEvent =
@@ -81,8 +86,10 @@
 		gitRefresh = 0,
 		onCellsChange,
 		onFoldsChange,
+		onNumberingChange,
 		onRunStateChange,
 		onRegisterFolds,
+		onRegisterNumbering,
 		onRegisterApi,
 		onRunStart,
 		onRunEnd,
@@ -99,6 +106,20 @@
 	// the notebook (Notebook.svelte) once either is set.
 	let exportTarget = $state<string | null>(null);
 	const exportCount = $derived(exportCellCount(cells));
+	// Display-only automatic header numbering. `headerNumbering` mirrors
+	// `notebook.metadata.cellar.header_numbering` (loaded on mount, kept live via
+	// the `notebook:header-numbering` SSE event); the per-heading numbers are
+	// derived from it + the live heading structure and prepended at RENDER time,
+	// so no cell's markdown source is ever touched and the `.ipynb` stays git-clean.
+	// Re-derives automatically on add/remove/reorder/level-change.
+	let headerNumbering = $state<number[]>([]);
+	const numberingLevels = $derived(new Set(headerNumbering));
+	const headingNumbers = $derived(computeHeadingNumbers(outlineHeadings(cells), numberingLevels));
+	// Publish numbers + enabled levels up so the sidebar Outline shows the same
+	// numbers and its per-level toggle reflects the current setting.
+	$effect(() => {
+		onNumberingChange?.(path, headingNumbers, headerNumbering);
+	});
 	let runningId = $state<string | null>(null); // the cell running in THIS notebook (≤1)
 	// Cells of THIS notebook waiting in the kernel's global FIFO → their 1-based
 	// position in that queue (1 = next up). The positions are global on purpose:
@@ -187,6 +208,10 @@
 	$effect(() => {
 		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, save });
 		return () => onRegisterApi?.(path, null);
+	});
+	$effect(() => {
+		onRegisterNumbering?.(path, { setLevel: setNumberingLevel });
+		return () => onRegisterNumbering?.(path, null);
 	});
 
 	function foldStorageKey(): string | null {
@@ -495,6 +520,7 @@
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
 			exportTarget = body.notebook.exportTarget ?? null; // nbdev export target
+			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			// A notebook always has a selected cell (command mode acts on it), so
 			// j/k and the rest work the moment the notebook opens.
 			if (!activeId || !cells.some((c) => c.id === activeId)) activeId = cells[0]?.id ?? null;
@@ -578,6 +604,8 @@
 			}
 		} else if (ev.type === 'notebook:export-target') {
 			exportTarget = ev.target;
+		} else if (ev.type === 'notebook:header-numbering') {
+			headerNumbering = ev.levels ?? [];
 		} else if (ev.type === 'cell:deleted') {
 			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
@@ -736,7 +764,7 @@
 				return;
 			}
 			if (pe.originId && pe.originId === originId) return; // our own UI action
-			if (pe.type?.startsWith('cell:') || pe.type === 'notebook:export-target')
+			if (pe.type?.startsWith('cell:') || pe.type === 'notebook:export-target' || pe.type === 'notebook:header-numbering')
 				applyStructuralEvent(pe as unknown as StructuralEvent);
 			else applyRunEvent(pe as unknown as RunEvent);
 		})
@@ -993,6 +1021,25 @@
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ op: 'set-target', target, path, originId })
+		}).catch(() => {});
+	}
+
+	/**
+	 * Turn the display-only auto-number for heading `level` (1-6) on or off.
+	 * Optimistic + persisted; the numbers themselves are derived at render time,
+	 * so this only changes *which levels* are numbered - the `.ipynb` cell sources
+	 * are never touched.
+	 */
+	async function setNumberingLevel(level: number, on: boolean) {
+		const next = new Set(headerNumbering);
+		if (on) next.add(level);
+		else next.delete(level);
+		const levels = [...next].sort((a, b) => a - b);
+		headerNumbering = levels;
+		await fetch('/api/notebooks/header-numbering', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ levels, path, originId })
 		}).catch(() => {});
 	}
 
@@ -1532,6 +1579,7 @@
 			foldedIds={foldedIds}
 			hiddenSegs={folding.segs}
 			hiddenCounts={folding.counts}
+			headingNumbers={headingNumbers}
 			gitStatus={gitChanges.status}
 			gitRemovedBefore={gitChanges.removedBefore}
 			gitRemovedAtEnd={gitChanges.removedAtEnd}

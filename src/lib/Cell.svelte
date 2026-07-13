@@ -17,7 +17,7 @@
 	import PlotlyOutput from '$lib/PlotlyOutput.svelte';
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
-	import { foldKey, splitHeadingSegments } from '$lib/headings';
+	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
 	import { isExportCell } from '$lib/exportRole';
 	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
@@ -47,6 +47,8 @@
 		segHidden?: SegHidden;
 		/** Fold key → whole cells that fold hides (the "N cells hidden" hint). */
 		foldCounts?: Record<string, number>;
+		/** Fold key → display-only auto-number for that heading (e.g. "1", "2.3"). */
+		headingNumbers?: Record<string, string>;
 		onToggleFold?: (key: string) => void;
 		onRun: (id: string, source: string) => void;
 		onRunAdvance: (id: string, source: string, opts: { focusNext: boolean }) => void;
@@ -87,6 +89,7 @@
 		foldedIds = new Set(),
 		segHidden = NO_SEGS_HIDDEN,
 		foldCounts = {},
+		headingNumbers = {},
 		onToggleFold,
 		onRun,
 		onRunAdvance,
@@ -198,7 +201,14 @@
 			? splitHeadingSegments(liveSource).map((s) => ({
 					...s,
 					key: foldKey(cell.id, s.index),
-					headingHtml: s.level != null ? renderMarkdown(s.heading) : '',
+					// Prepend the display-only auto-number (if this level is numbered) into
+					// the heading line before rendering, so it lands inside the <h2>… tag at
+					// heading size. The cell's real markdown source (`cell.source`) is never
+					// touched - numbers are recomputed live from the notebook structure.
+					headingHtml:
+						s.level != null
+							? renderMarkdown(numberHeadingLine(s.heading, headingNumbers[foldKey(cell.id, s.index)]))
+							: '',
 					bodyHtml: s.body.trim() ? renderMarkdown(s.body) : ''
 				}))
 			: []
