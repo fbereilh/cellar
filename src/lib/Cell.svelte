@@ -235,6 +235,41 @@
 	const ranText = $derived(lastRun ? `ran ${relativeTime(lastRun.at, now)} · ${formatDuration(lastRun.durationMs)}` : '');
 	const isAgentRun = $derived(lastRun?.actor === 'agent');
 
+	// ---- Click-to-copy cell id ----------------------------------------------
+	// The label shows `cell #<first-8>`; a click copies exactly that short id
+	// (no "cell " / "#" prefix) and briefly flips to "copied!". View-only:
+	// touches neither the doc nor the kernel. Falls back to execCommand when
+	// navigator.clipboard is absent (non-secure context); worst case a no-op.
+	const shortId = $derived(cell.id.slice(0, 8));
+	let copied = $state(false);
+	let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+	async function copyCellId(e: Event) {
+		e.stopPropagation();
+		e.preventDefault();
+		let ok = false;
+		try {
+			if (browser && navigator.clipboard?.writeText) {
+				await navigator.clipboard.writeText(shortId);
+				ok = true;
+			} else if (browser && typeof document !== 'undefined') {
+				const ta = document.createElement('textarea');
+				ta.value = shortId;
+				ta.style.position = 'fixed';
+				ta.style.opacity = '0';
+				document.body.appendChild(ta);
+				ta.select();
+				ok = document.execCommand('copy');
+				document.body.removeChild(ta);
+			}
+		} catch {
+			ok = false;
+		}
+		if (!ok) return;
+		copied = true;
+		if (copiedTimer) clearTimeout(copiedTimer);
+		copiedTimer = setTimeout(() => (copied = false), 1000);
+	}
+
 	// ---- Staleness indicator -------------------------------------------------
 	// A code cell that ran this session but whose inputs changed since is STALE:
 	// its output no longer matches its current code (self-edit) or an upstream
@@ -883,7 +918,23 @@
 						data-testid="sql-badge">SQL</span
 					>
 				{/if}
-				<span class="ml-1.5 font-mono text-xs text-base-content/50" title={cell.id}>cell <span class="text-base-content/70">#{cell.id.slice(0, 8)}</span></span>
+				<!-- Click-to-copy short cell id. Real button so it is keyboard-
+				     focusable; stops propagation so copying never selects/activates
+				     the cell. Flips to "copied!" for ~1s on success. -->
+				<button
+					type="button"
+					class="ml-1.5 cursor-pointer rounded px-0.5 font-mono text-xs transition-colors hover:bg-base-content/10 focus-visible:outline focus-visible:outline-1 focus-visible:outline-primary {copied ? 'text-success' : 'text-base-content/50'}"
+					aria-label="Copy cell id"
+					title={copied ? 'Copied cell id' : 'Click to copy cell id'}
+					onclick={copyCellId}
+					data-testid="cell-id-copy"
+				>
+					{#if copied}
+						<span>copied!</span>
+					{:else}
+						cell <span class="text-base-content/70">#{shortId}</span>
+					{/if}
+				</button>
 				{#if !isMarkdown && lastRun && !showRunning}
 					<span
 						class="ml-2 flex items-center gap-1 text-[11px] text-base-content/45"
