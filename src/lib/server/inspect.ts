@@ -184,7 +184,7 @@ del _cellar_kernel_state
  * `execs_this_session` and the run queue - it is Cellar's own bookkeeping, not a
  * cell the agent ran.
  */
-async function execProbe(code: string): Promise<{ session: SessionId | null; line: string | undefined }> {
+async function execProbe(code: string, nbPath?: string | null): Promise<{ session: SessionId | null; line: string | undefined }> {
 	let stdout = '';
 	let errored: string | null = null;
 	let session: SessionId | null = null;
@@ -200,9 +200,11 @@ async function execProbe(code: string): Promise<{ session: SessionId | null; lin
 			}
 		}
 	};
-	// The variable inspector reflects the ACTIVE notebook's kernel (per-notebook
-	// inspection is a later phase); its epoch reconciles against the same notebook.
-	await execute(getActiveNotebookPath(), code, onEvent, { internal: true });
+	// Probe the given notebook's OWN kernel (each notebook has its own), so the
+	// namespace snapshot and its `session` epoch belong to that notebook. The
+	// sidebar inspector passes no path and reflects the ACTIVE notebook's kernel
+	// (per-notebook inspection there is a later phase).
+	await execute(nbPath ?? getActiveNotebookPath(), code, onEvent, { internal: true });
 	if (errored) throw new Error(errored);
 	const line = stdout.trim().split('\n').filter(Boolean).at(-1);
 	return { session, line };
@@ -212,8 +214,8 @@ async function execProbe(code: string): Promise<{ session: SessionId | null; lin
  * Run the shared bucketed-namespace probe and return the parsed state, tagged
  * with `session`.
  */
-async function runProbe(): Promise<{ session: SessionId | null } & ProbeState> {
-	const { session, line } = await execProbe(PROBE);
+async function runProbe(nbPath?: string | null): Promise<{ session: SessionId | null } & ProbeState> {
+	const { session, line } = await execProbe(PROBE, nbPath);
 	if (!line) return { session, imports: [], functions: [], classes: [], variables: [] };
 	// The shared PROBE prints exactly the ProbeState bucketed namespace.
 	return { session, ...(JSON.parse(line) as ProbeState) };
@@ -250,11 +252,11 @@ export async function inspectVariables(): Promise<
  * set: the namespace below belongs to `session_id`, which is no longer live, so
  * nothing in it is defined any more.
  */
-export async function kernelState() {
-	const status = kernelStatus().status;
+export async function kernelState(nbPath?: string | null) {
+	const status = kernelStatus(nbPath).status;
 	if (status === 'not_started') return { started: false, session_id: null };
-	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession().session_id };
-	const state = await runProbe();
+	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession(nbPath).session_id };
+	const state = await runProbe(nbPath);
 	const seen = new Set<string>();
 	const imports: ImportRecord[] = [];
 	for (const imp of state.imports || []) {
@@ -263,7 +265,7 @@ export async function kernelState() {
 		seen.add(key);
 		imports.push(imp);
 	}
-	const stale = state.session !== currentSessionId();
+	const stale = state.session !== currentSessionId(nbPath);
 	return {
 		started: true,
 		session_id: state.session,

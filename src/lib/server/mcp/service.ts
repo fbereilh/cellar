@@ -469,7 +469,10 @@ export async function getNotebookMap(nb?: string | null) {
 		}
 	}
 	const view = getNotebook(nb);
-	return { notebook: view.path, kernel: kernelSession(), databricks: await databricksStatus(), cell_count: cells.length, sections: root };
+	// The `kernel` header reports THIS notebook's own session epoch, so it lines up
+	// with each cell's run_status/ran_this_session (each computed against the same
+	// per-notebook epoch), never against whichever notebook the user last focused.
+	return { notebook: view.path, kernel: kernelSession(nb), databricks: await databricksStatus(), cell_count: cells.length, sections: root };
 }
 
 /**
@@ -485,7 +488,9 @@ export async function getNotebookMap(nb?: string | null) {
  * destroyed `spark` reads as disconnected here too.
  */
 export async function getKernelState(nb?: string | null) {
-	const [state, stale, dbx] = await Promise.all([kernelState(), staleCells(nb), databricksStatus()]);
+	// Read THIS notebook's own namespace + epoch; each notebook has its own kernel,
+	// so kernel_state for A must reflect A's session, never the active tab's.
+	const [state, stale, dbx] = await Promise.all([kernelState(nb), staleCells(nb), databricksStatus()]);
 	return { ...state, databricks: dbx, stale_cells: stale };
 }
 
@@ -612,7 +617,7 @@ export async function readSection(headerId: string, nb?: string | null) {
 export function searchCells(query: string, where: 'input' | 'output' | 'both' = 'both', nb?: string | null) {
 	const q = (query || '').toLowerCase();
 	if (!q) return [];
-	const sid = currentSessionId();
+	const sid = currentSessionId(nb);
 	const results: Array<{ id: string; where: string; ran_this_session: boolean; snippet: string }> = [];
 	const snippet = (text: string): string | null => {
 		const i = text.toLowerCase().indexOf(q);
@@ -643,7 +648,7 @@ export function searchCells(query: string, where: 'input' | 'output' | 'both' = 
  * `ran_this_session: false` the failure is LIVE and blocking, not leftover.
  */
 export function getErrors(nb?: string | null) {
-	const sid = currentSessionId();
+	const sid = currentSessionId(nb);
 	const errs: Array<Record<string, unknown>> = [];
 	for (const c of visibleCells(nb)) {
 		for (const o of c.outputs || []) {
@@ -677,7 +682,7 @@ export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium', nb
 		if (img && 'data' in o) return { type: o.output_type, image: img, data: o.data[img] };
 		return summarizeOutput(o, cap);
 	});
-	return { id: c.id, size, ran_this_session: ranThisSession(c, currentSessionId()), outputs };
+	return { id: c.id, size, ran_this_session: ranThisSession(c, currentSessionId(nb)), outputs };
 }
 
 // --- write ------------------------------------------------------------------
@@ -945,7 +950,7 @@ export async function runCell(id: string, nbArg?: string | null): Promise<Record
 		// cleared this cell's own staleness — surface its fresh verdict so a follow-up
 		// read is not needed just to see whether the run settled it.
 		const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness(nb);
-		return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id]), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+		return { id, status, ran_this_session: isLiveSession(session, currentSessionId(nb)), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id]), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and
 		// broadcast, so the wire order stays run:end → run:start.
@@ -993,7 +998,7 @@ export async function addAndRun({ source, cellType = 'code', afterId, routeImpor
 			status: ('run_status' in imports ? imports.run_status : undefined) ?? 'skipped',
 			routed_to_imports: true,
 			note: "the submitted code was only imports; they were merged into the notebook's imports cell and no new cell was created.",
-			ran_this_session: cell ? ranThisSession(cell, currentSessionId()) : false,
+			ran_this_session: cell ? ranThisSession(cell, currentSessionId(nb)) : false,
 			imports,
 			outputs: cell ? summarizeOutputs(cell, READ_CAP) : []
 		};
