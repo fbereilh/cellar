@@ -54,19 +54,32 @@
  * boilerplate: `DATABRICKS_CONFIG_FILE` is preserved rather than deleted, since
  * it is what tells the SDK where the config we read the profiles from lives.
  *
- * ## Connection state is epoch-scoped
+ * ## Connection state is epoch-scoped, AND liveness-checked
  * `spark` lives in the kernel namespace, so a kernel restart destroys it. This
  * module records the kernel-session epoch (`kernel.js`'s monotonic
  * `currentSessionId()`) the session was created in and reports `connected:false`
  * the moment that epoch is no longer current - the same rule `service.js` uses
  * to tell a live run from a persisted one. Never report a connection from a
  * dead namespace: the user's next `spark.read…` would `NameError`.
+ *
+ * The epoch rule alone is not enough. A Spark Connect session can die
+ * *server-side* while the same kernel epoch is still current - an idle timeout or
+ * a cluster GC closes the handle, and the next `spark.*` call raises
+ * `[INVALID_HANDLE.SESSION_CLOSED]` even though `spark` is still bound and the
+ * epoch never changed. So `agentStatus()` also runs a cheap **liveness probe**
+ * (`spark.sql('SELECT 1')` in the kernel, cached with a short TTL so repeated
+ * status reads stay fast and never queue behind a running cell) and, when it sees
+ * a session-closed error, **auto-reconnects** against the stored selection
+ * (`connectedSel` + the same cluster) via the ordinary `connect()` path -
+ * `getOrCreate()` rebuilds the expired session. A genuine kernel restart still
+ * reads as disconnected (the epoch rule is untouched); only a same-epoch expiry
+ * self-heals.
  */
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { execute, currentSessionId } from './kernel';
+import { execute, currentSessionId, kernelStatus } from './kernel';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
@@ -938,6 +951,57 @@ finally:
 `;
 
 /**
+ * A cheap liveness probe run in the kernel against the bound `spark`. A live
+ * Spark Connect session answers `SELECT 1` in a single tiny RPC; a session that
+ * expired server-side (idle timeout / cluster GC) raises
+ * `[INVALID_HANDLE.SESSION_CLOSED]` (or "Spark Connect Session expired on the
+ * server"), which the epoch check can never see because the kernel epoch is
+ * still current. `expired:true` is what tells `agentStatus()` to auto-reconnect.
+ * A non-session error (a transient network blip) comes back `alive:false,
+ * expired:false`, so it degrades to "connected but unverified" rather than
+ * tearing down a session that is probably fine.
+ */
+const PING_CODE = `
+import json as _cellar_json
+
+def _cellar_dbx_ping():
+    _spark = globals().get('spark')
+    if _spark is None:
+        return {'ok': True, 'alive': False, 'expired': False, 'reason': 'no_spark'}
+    try:
+        _spark.sql('SELECT 1').collect()
+        return {'ok': True, 'alive': True, 'expired': False}
+    except Exception as _e:
+        _msg = '%s: %s' % (type(_e).__name__, _e)
+        _low = _msg.lower()
+        _expired = ('session_closed' in _low or 'invalid_handle' in _low
+                    or 'session expired' in _low or 'session was closed' in _low
+                    or 'session is closed' in _low or 'sessionclosed' in _low)
+        return {'ok': True, 'alive': False, 'expired': _expired, 'message': _msg}
+
+try:
+    print('${SENTINEL}' + _cellar_json.dumps(_cellar_dbx_ping()))
+except Exception as _e:
+    print('${SENTINEL}' + _cellar_json.dumps(
+        {'ok': False, 'code': 'error', 'message': '%s: %s' % (type(_e).__name__, _e)}))
+finally:
+    del _cellar_dbx_ping, _cellar_json
+`;
+
+/** Does an error message look like a dead/expired Spark Connect session handle? */
+export function isSessionClosed(message: unknown): boolean {
+	const m = String(message ?? '').toLowerCase();
+	return (
+		m.includes('session_closed') ||
+		m.includes('sessionclosed') ||
+		m.includes('invalid_handle') ||
+		m.includes('session expired') ||
+		m.includes('session was closed') ||
+		m.includes('session is closed')
+	);
+}
+
+/**
  * Run a bootstrap script in the kernel and read back its sentinel line.
  *
  * `internal: true` - this is Cellar's own bookkeeping, not a cell the user or an
@@ -1000,18 +1064,134 @@ let lost: LostConnection | null = null;
 let inFlight = false;
 
 /**
+ * The cached result of the last liveness probe. `agentStatus()` reads it instead
+ * of re-pinging the workspace on every call: a probe is only re-run when the
+ * cache is missing, stale (older than `LIVENESS_TTL_MS`), or from a different
+ * kernel epoch. Keeping the round-trip out of the common path is what preserves
+ * "status is fast" while still catching a server-side session expiry.
+ */
+interface Liveness {
+	session: SessionId | null;
+	alive: boolean;
+	expired: boolean;
+	checkedAt: number;
+	message?: string;
+}
+let liveness: Liveness | null = null;
+/** In-flight probe, so concurrent status reads share one `SELECT 1`, not N. */
+let livenessInFlight: Promise<Liveness> | null = null;
+/** In-flight auto-reconnect, so a burst of expired-status reads heals once. */
+let reconnecting: Promise<boolean> | null = null;
+
+/** How long a liveness probe result is trusted before it must be refreshed. */
+const LIVENESS_TTL_MS = 15_000;
+
+/**
  * The connection as the UI should see it. Reconciles against the *current*
  * kernel epoch on every read, so a restart (or a rebind onto another venv)
  * downgrades us to disconnected without anyone having to notify this module.
+ *
+ * This is the epoch-only view (no workspace round-trip), so it stays cheap for
+ * the frequently-polled sidebar. The server-side liveness check lives in
+ * `agentStatus()`, which is what the agent surface reads.
  */
 export function connectionStatus(): ConnectionStatus {
 	if (connection && connection.session !== currentSessionId()) {
 		lost = { profile: connection.profile, clusterName: connection.clusterName };
 		connection = null;
 		connectedSel = null;
+		liveness = null;
 	}
 	if (!connection) return { connected: false, ...(lost ? { lost } : {}) };
 	return { connected: true, ...connection };
+}
+
+/**
+ * Probe whether the bound `spark` session is actually alive, memoizing the
+ * result. Concurrent callers share the one in-flight probe. A `SELECT 1` is a
+ * single tiny RPC, so this is cheap - but it still runs in the kernel, so the
+ * caller (`agentStatus`) skips it entirely when the kernel is busy rather than
+ * queue behind a running cell.
+ */
+async function probeLiveness(session: SessionId | null): Promise<Liveness> {
+	if (livenessInFlight) return livenessInFlight;
+	livenessInFlight = (async () => {
+		let live: Liveness;
+		try {
+			const { result, session: ran } = await runInKernel(PING_CODE);
+			const r = result as ProbeResult & { alive?: boolean; expired?: boolean; message?: string };
+			live = {
+				session: ran ?? session,
+				alive: r.ok === true && r.alive === true,
+				expired: r.ok === true && r.expired === true,
+				checkedAt: Date.now(),
+				message: r.message
+			};
+		} catch (err) {
+			// The kernel was unreachable (a Cellar problem, not an expiry). Record it as
+			// "unverified", never as expired: tearing down a session because the sidecar
+			// hiccuped would be the wrong direction.
+			live = {
+				session,
+				alive: false,
+				expired: false,
+				checkedAt: Date.now(),
+				message: err instanceof Error ? err.message : String(err)
+			};
+		}
+		liveness = live;
+		return live;
+	})();
+	try {
+		return await livenessInFlight;
+	} finally {
+		livenessInFlight = null;
+	}
+}
+
+/**
+ * Rebuild an expired session against the stored selection + cluster, via the
+ * ordinary `connect()` path (`getOrCreate()` rebuilds the closed session). Reuses
+ * the exact auth + cluster of the connection that just expired, so the epoch
+ * semantics are preserved: a real kernel restart already nulled `connection`
+ * above, so this can only ever heal a same-epoch, server-side expiry. Concurrent
+ * callers share one attempt.
+ */
+async function autoReconnect(): Promise<boolean> {
+	if (reconnecting) return reconnecting;
+	const conn = connection;
+	const sel = connectedSel;
+	if (!conn || !sel) return false;
+	reconnecting = (async () => {
+		try {
+			logInfo('databricks', `Spark Connect session expired; auto-reconnecting cluster "${conn.clusterName}"`);
+			await connect({
+				profile: sel.profile ?? null,
+				host: sel.host ?? null,
+				clusterId: conn.clusterId,
+				clusterName: conn.clusterName
+			});
+			liveness = { session: currentSessionId(), alive: true, expired: false, checkedAt: Date.now() };
+			logInfo('databricks', 'Databricks auto-reconnect succeeded');
+			return true;
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			logWarn('databricks', `Databricks auto-reconnect failed: ${detail}`);
+			// Cache the failed-heal so a burst of status reads does not hammer the
+			// cluster with reconnect attempts; the TTL lets it retry later.
+			liveness = {
+				session: currentSessionId(),
+				alive: false,
+				expired: true,
+				checkedAt: Date.now(),
+				message: detail
+			};
+			return false;
+		} finally {
+			reconnecting = null;
+		}
+	})();
+	return reconnecting;
 }
 
 /**
@@ -1060,6 +1240,9 @@ export async function connect({
 		// Re-query catalogs against the same auth, using the SDK's canonical host.
 		connectedSel = auth.mode === 'pat' ? { profile } : { host: connection.host };
 		lost = null;
+		// A fresh session is alive by construction; seed the cache so an immediate
+		// status read doesn't pay for a redundant liveness probe.
+		liveness = { session, alive: true, expired: false, checkedAt: Date.now() };
 		publishGlobal({ type: 'databricks:changed' });
 		logInfo('databricks', `connected: host ${ok.host ?? '?'}, spark ${ok.spark_version ?? '?'}`);
 		return { ok: true, connection: connectionStatus() };
@@ -1076,9 +1259,10 @@ export async function connect({
  * `spark` exists will use it instead of writing its own connection boilerplate,
  * which is the whole point of this integration.
  */
-export function agentStatus() {
+export async function agentStatus() {
 	const status: ConnectionStatus = connectionStatus();
 	if (!status.connected) {
+		liveness = null;
 		return {
 			connected: false,
 			...(status.lost
@@ -1086,6 +1270,59 @@ export function agentStatus() {
 				: { note: 'No Databricks session. `spark` is not defined. Ask the user to connect from the Databricks sidebar section; agents cannot connect on their own.' })
 		};
 	}
+
+	// `spark` is bound in the current epoch - but the Spark Connect handle may have
+	// died server-side (idle timeout / cluster GC) while the epoch stayed current.
+	// Verify liveness (cached; skipped when the kernel is busy so we never queue
+	// behind a running cell), and self-heal on a session-closed error.
+	const sid = status.session;
+	const fresh = liveness && liveness.session === sid && Date.now() - liveness.checkedAt < LIVENESS_TTL_MS;
+	let live: Liveness | null = fresh ? liveness : null;
+	if (!live) {
+		if (kernelStatus().status === 'busy') {
+			// Don't block status behind a running cell. Fall back to the last-known
+			// reading for this epoch if we have one; otherwise report unverified.
+			live = liveness && liveness.session === sid ? liveness : null;
+		} else {
+			live = await probeLiveness(sid);
+		}
+	}
+
+	if (live?.expired) {
+		const healed = await autoReconnect();
+		if (!healed) {
+			return {
+				connected: false,
+				expired: true,
+				stale: true,
+				cluster: { id: status.clusterId, name: status.clusterName },
+				host: status.host,
+				note: 'The Databricks Connect session expired (idle timeout or cluster GC) and Cellar could not automatically reconnect. Ask the user to reconnect from the Databricks sidebar section, then re-run the cell.'
+			};
+		}
+		// autoReconnect() rebuilt spark/w against the same cluster; report the fresh
+		// connection so the agent knows spark is usable again.
+		const healedStatus = connectionStatus();
+		if (healedStatus.connected) {
+			return {
+				...connectedPayload(healedStatus),
+				reconnected: true,
+				note: 'The previous Databricks Connect session had expired; Cellar automatically reconnected. `spark` and `w` are live again against the cluster above - re-run any cell that failed with SESSION_CLOSED. Use them directly, do not re-create a DatabricksSession.'
+			};
+		}
+	}
+
+	const payloadOut = connectedPayload(status);
+	if (live && !live.alive && !live.expired) {
+		// A non-session error (or a busy-skipped probe): spark is still bound and the
+		// epoch is current, so report connected, but flag that we could not confirm.
+		return { ...payloadOut, liveness_unverified: true };
+	}
+	return payloadOut;
+}
+
+/** The standard connected payload the agent reads, shared by the healthy + healed paths. */
+function connectedPayload(status: ConnectionStatus & { connected: true }) {
 	return {
 		connected: true,
 		profile: status.profile,
@@ -1192,7 +1429,13 @@ export async function previewTable({
 	if (!Number.isInteger(n) || n < 1 || n > 1000) {
 		throw new DatabricksError('bad_request', `invalid limit: ${JSON.stringify(limit)} (1-1000)`);
 	}
-	const { result } = await runInKernel(PREVIEW_CODE({ name, limit: n }));
+	let { result } = await runInKernel(PREVIEW_CODE({ name, limit: n }));
+	// If the read failed because the session expired server-side, self-heal once:
+	// rebuild spark against the same cluster and retry - the agent gets its rows
+	// instead of a dead-session error it cannot recover from on its own.
+	if (result.ok === false && isSessionClosed(result.message) && (await autoReconnect())) {
+		({ result } = await runInKernel(PREVIEW_CODE({ name, limit: n })));
+	}
 	return payload<PreviewResult>(unwrap(result));
 }
 
@@ -1206,6 +1449,7 @@ export async function disconnect(): Promise<{ ok: true }> {
 		connection = null;
 		connectedSel = null;
 		lost = null;
+		liveness = null;
 		publishGlobal({ type: 'databricks:changed' });
 		return { ok: true };
 	} finally {

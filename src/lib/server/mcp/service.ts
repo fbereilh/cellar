@@ -363,7 +363,7 @@ export async function getNotebookMap() {
 		}
 	}
 	const nb = getNotebook();
-	return { notebook: nb.path, kernel: kernelSession(), databricks: databricksStatus(), cell_count: cells.length, sections: root };
+	return { notebook: nb.path, kernel: kernelSession(), databricks: await databricksStatus(), cell_count: cells.length, sections: root };
 }
 
 /**
@@ -379,8 +379,8 @@ export async function getNotebookMap() {
  * destroyed `spark` reads as disconnected here too.
  */
 export async function getKernelState() {
-	const [state, stale] = await Promise.all([kernelState(), staleCells()]);
-	return { ...state, databricks: databricksStatus(), stale_cells: stale };
+	const [state, stale, dbx] = await Promise.all([kernelState(), staleCells(), databricksStatus()]);
+	return { ...state, databricks: dbx, stale_cells: stale };
 }
 
 /**
