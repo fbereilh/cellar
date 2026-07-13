@@ -661,7 +661,7 @@
 			});
 			const body = await res.json().catch(() => ({}));
 			if (!res.ok) notice = `Undo failed: ${body?.message ?? ''}`;
-			else if (body.ok) notice = 'Reverted to before the last agent action.';
+			else if (body.ok) notice = 'Reverted to the last automatic checkpoint.';
 			else notice = 'Nothing to undo - no agent action has been checkpointed yet.';
 		} catch (err) {
 			notice = `Undo failed: ${(err as Error)?.message ?? err}`;

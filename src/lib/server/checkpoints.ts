@@ -7,12 +7,19 @@
  *
  *   - a MANUAL "Checkpoint now" action (trigger `manual`), and
  *   - an AUTOMATIC snapshot taken BEFORE an agent action (trigger `agent`), so an
- *     agent's mutation or run can be undone. Agent actions arrive in bursts (a
- *     run_all is many run_cell calls; one agent turn fires several tools), so the
- *     auto path COALESCES: the first action of a burst snapshots the pre-burst
- *     state and the rest are folded into it, until a quiet gap starts a new burst.
- *     The result is one "before agent action" checkpoint per logical turn, which
- *     is exactly what "undo last agent action" restores.
+ *     agent's mutation or run can be undone. Agent actions are frequent (a run_all
+ *     is many run_cell calls; one agent turn fires several tools), so snapshotting
+ *     before *every* action produces far too many checkpoints. The auto path
+ *     THROTTLES BY COUNT: it snapshots on the first agent action for a notebook and
+ *     then once every `CHECKPOINT_EVERY_N_ACTIONS` actions, skipping the ones in
+ *     between. Each snapshot is taken BEFORE the action, so it captures the state
+ *     just before that batch of up to N actions began — restoring it walks the
+ *     notebook back to before the batch. A `CHECKPOINT_MAX_GAP_MS` time backstop
+ *     also snapshots if it's been a long while since the last auto checkpoint, so a
+ *     slow, sparse agent (fewer than N actions over a long session) still gets
+ *     periodic backups. The count is the primary trigger; time is only a floor.
+ *     The result is one "before agent action" checkpoint per batch, which is what
+ *     "undo last agent action" restores to.
  *
  * STORAGE mirrors `ui-state.js`: a single JSON file under the workspace's
  * `.cellar/` dir (already gitignored in full), keyed by workspace-relative
@@ -77,16 +84,28 @@ const WRITE_DEBOUNCE_MS = 250;
 const MAX_PER_NOTEBOOK = 25;
 /** A snapshot larger than this (serialized) drops its outputs to stay bounded. */
 const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
-/** A fresh agent action within this window of the last one folds into the same pre-burst checkpoint. */
-const COALESCE_MS = 4000;
+/**
+ * Auto-checkpoint throttle: take one automatic snapshot per this many agent
+ * actions (plus the very first). The captain may retune this single constant.
+ */
+const CHECKPOINT_EVERY_N_ACTIONS = 5;
+/**
+ * Time backstop for the count throttle: if this long has passed since the last
+ * auto checkpoint while the agent is still acting, snapshot even when fewer than
+ * `CHECKPOINT_EVERY_N_ACTIONS` actions have occurred — so a slow, sparse agent
+ * still gets periodic backups. Secondary to the count trigger.
+ */
+const CHECKPOINT_MAX_GAP_MS = 3 * 60 * 1000;
 
 let cache: Record<string, Checkpoint[]> | null = null;
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let dirty = false;
 let exitHookInstalled = false;
 
-/** Per-notebook timestamp of the last agent action, for auto-checkpoint coalescing (in-memory only). */
-const lastAgentAt = new Map<string, number>();
+/** Per-notebook count of agent actions since the last auto checkpoint (in-memory only). */
+const actionsSinceCheckpoint = new Map<string, number>();
+/** Per-notebook timestamp of the last auto checkpoint, for the time backstop (in-memory only). */
+const lastAutoCheckpointAt = new Map<string, number>();
 
 function storePath(): string {
 	return join(workspaceRoot(), '.cellar', 'checkpoints.json');
@@ -181,18 +200,33 @@ function defaultLabel(trigger: string): string {
 }
 
 /**
- * Take an automatic pre-action checkpoint before an AGENT mutation/run, coalesced
- * so a burst of agent activity yields a single "before agent action" snapshot.
- * Returns the checkpoint metadata when one was taken, else null (folded into the
- * burst already in progress). Called from the MCP service layer.
+ * Take an automatic pre-action checkpoint before an AGENT mutation/run, throttled
+ * to one snapshot per `CHECKPOINT_EVERY_N_ACTIONS` agent actions (plus the first
+ * action for a notebook, and a `CHECKPOINT_MAX_GAP_MS` time backstop). Returns the
+ * checkpoint metadata when one was taken, else null (this action was skipped and
+ * folded into the batch protected by the previous checkpoint). Because the snapshot
+ * is taken BEFORE the action, restoring it walks the notebook back to before the
+ * current batch of up to N actions. Called from the MCP service layer.
  */
 export function autoCheckpointBeforeAgentAction(nb?: string | null): CheckpointMeta | null {
 	const key = keyFor(nb);
 	const now = Date.now();
-	const prev = lastAgentAt.get(key) ?? 0;
-	lastAgentAt.set(key, now); // extend the burst on every action
-	if (now - prev < COALESCE_MS) return null; // still inside an active burst
-	return createCheckpoint(nb, { trigger: 'agent' });
+	// `undefined` = never acted on this notebook → always snapshot the first action.
+	const firstAction = !actionsSinceCheckpoint.has(key);
+	const count = (actionsSinceCheckpoint.get(key) ?? 0) + 1;
+	const lastAt = lastAutoCheckpointAt.get(key) ?? 0;
+
+	const dueByCount = firstAction || count >= CHECKPOINT_EVERY_N_ACTIONS;
+	// Backstop only after a prior checkpoint exists; the first action already covers t=0.
+	const dueByTime = lastAt !== 0 && now - lastAt >= CHECKPOINT_MAX_GAP_MS;
+
+	if (dueByCount || dueByTime) {
+		actionsSinceCheckpoint.set(key, 0); // reset → exactly one checkpoint per N actions
+		lastAutoCheckpointAt.set(key, now);
+		return createCheckpoint(nb, { trigger: 'agent' });
+	}
+	actionsSinceCheckpoint.set(key, count);
+	return null;
 }
 
 /** Find a stored checkpoint (with its cells) by id, or null. */

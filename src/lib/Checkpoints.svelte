@@ -1,8 +1,9 @@
 <!--
   Sidebar → History (checkpoints). A checkpoint is a full snapshot of the active
   notebook's cells - source, outputs, and metadata - taken either manually
-  ("Checkpoint now") or automatically BEFORE an agent action (so an agent's edit
-  or run can be undone). Restoring reverts the notebook to that snapshot.
+  ("Checkpoint now") or automatically before a batch of agent actions (throttled
+  to one snapshot per N actions, so an agent's edits can be undone). Restoring
+  reverts the notebook to that snapshot.
 
   Storage is a per-project file under `.cellar/` (see `server/checkpoints.js`), so
   history survives the dynamic app port but never bloats the `.ipynb`. This panel
@@ -131,12 +132,13 @@
 	{#if !notebookPath}
 		<p class="px-1 py-2 text-xs text-base-content/40">Open a notebook to see its checkpoints.</p>
 	{:else}
-		<!-- Undo last agent action: the headline flow. Restores the newest pre-agent-run snapshot. -->
+		<!-- Undo last agent action: the headline flow. Restores the newest automatic
+		     checkpoint, taken before a recent batch of agent actions. -->
 		<button
 			class="btn btn-outline btn-xs w-full gap-1.5"
 			onclick={undoLastAgent}
 			disabled={busy || !hasAgentCheckpoint}
-			title="Restore the notebook to just before the last agent action"
+			title="Restore the notebook to the last automatic checkpoint (taken before a recent batch of agent actions)"
 			data-testid="undo-agent-action"
 		>
 			<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5" /><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11" /></svg>

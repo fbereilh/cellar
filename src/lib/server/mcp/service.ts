@@ -774,8 +774,8 @@ export async function runCell(id: string): Promise<Record<string, unknown> | nul
 	const nbAtCall = getActiveNotebookPath();
 	const c = getCell(id, nbAtCall);
 	if (!c) return null;
-	// Snapshot before this agent run so it can be undone (coalesced: a run_all is one
-	// pre-burst checkpoint, not one per cell). Captures the pre-run outputs.
+	// Snapshot before this agent run so it can be undone (throttled: one checkpoint
+	// per N agent actions, not one per cell). Captures the pre-run outputs.
 	autoCheckpointBeforeAgentAction(nbAtCall);
 	if (c.cell_type === 'markdown') {
 		// Markdown doesn't execute on the kernel; "running" it RENDERS it (the same
