@@ -25,10 +25,12 @@
  * request's response, so one run == one stream. No global broadcast, so there is
  * no way for outputs to be duplicated or cross runs.
  */
+import { basename } from 'node:path';
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
-import { getActiveNotebookPath } from './notebook';
+import { getActiveNotebookPath, workspaceRelative } from './notebook';
+import { publishGlobal } from './events';
 import {
 	openWidget,
 	updateWidget,
@@ -40,7 +42,8 @@ import {
 	clearWidgetOutput
 } from './widgets';
 import { logInfo, logWarn, logError } from './logs';
-import type { RunStreamEvent, ExecuteOptions, SessionId } from './types';
+import type { RunStreamEvent, ExecuteOptions, SessionId, KernelStatus } from './types';
+import type { KernelListEntry } from '$lib/kernelBadge';
 
 type KernelConnection = Kernel.IKernelConnection;
 type StatusListener = (sender: KernelConnection, status: Kernel.Status) => void;
@@ -272,6 +275,62 @@ export function loadedNotebookPaths(): string[] {
 }
 
 /**
+ * Snapshot of every live per-notebook kernel — one card per entry in the
+ * Kernels sidebar. Drives `/api/kernel` and the `kernel:status` SSE broadcast.
+ * The workspace-relative `path` is the id the browser matches tabs on. Every
+ * entry is a kernel Cellar is running: a notebook that never ran a cell has NO
+ * entry (its "not started" card is built from the open tab instead). A booting
+ * kernel (connection not yet resolved) reads `starting` with a null session so
+ * its card appears the instant the first run is requested.
+ */
+export function listKernels(): KernelListEntry[] {
+	const out: KernelListEntry[] = [];
+	for (const [abs, nbKernel] of kernels) {
+		const conn = nbKernel.connection;
+		const status: KernelStatus = conn ? conn.status : 'starting';
+		out.push({
+			path: workspaceRelative(abs),
+			name: conn?.name || 'python3',
+			// A map entry IS a kernel (booting or up), so its card is never "not started".
+			started: true,
+			id: conn?.id ?? null,
+			status,
+			session_id: conn ? nbKernel.sessionId : null,
+			busy: status === 'busy'
+		});
+	}
+	return out;
+}
+
+/**
+ * Broadcast the full kernel list to every open tab as a global SSE snapshot
+ * (`kernel:status`), so the Kernels sidebar reflects a start / busy / idle /
+ * restart / shutdown with no reload. Like `queue:changed` it is a FULL snapshot
+ * carrying no `seq`, so a missed broadcast self-heals on the next one. Called on
+ * every kernel lifecycle transition and, via `statusChanged`, on every idle/busy
+ * flip so two notebooks running at once show two busy cards independently.
+ */
+export function publishKernelStatus(): void {
+	publishGlobal({ type: 'kernel:status', kernels: listKernels() });
+}
+
+/**
+ * Shut a single notebook's kernel down: terminate the process and REMOVE its
+ * entry (its card drops from the sidebar), unlike `restartKernel` which keeps
+ * the process/entry and only clears the namespace. The document and MCP session
+ * are untouched; the notebook lazily gets a fresh kernel on its next run.
+ * Shutting down a notebook that never started is a no-op.
+ */
+export async function shutdownKernel(nbPath?: string | null) {
+	const abs = resolveNb(nbPath);
+	const nbKernel = kernels.get(abs);
+	if (!nbKernel) return { status: 'not_started', id: null, session_id: null };
+	await teardownKernel(nbKernel, 'kernel_shutdown');
+	publishKernelStatus();
+	return { status: 'not_started', id: null, session_id: null };
+}
+
+/**
  * Kernel startup injection: activate matplotlib's inline backend so a Figure
  * renders as an `image/png` in the display bundle instead of falling back to its
  * `<Figure …>` text repr — exactly what a classic notebook's `%matplotlib
@@ -427,7 +486,11 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		// Re-injecting the startup code keeps parity with restartKernel(): an
 		// autorestart clears the namespace AND the matplotlib backend.
 		nbKernel.statusHandler = (_sender, status) => {
-			if (status !== 'autorestarting' || nbKernel.connection !== kernel) return;
+			if (nbKernel.connection !== kernel) return;
+			// Every idle/busy flip reaches the Kernels sidebar so parallel runs show
+			// their own busy cards independently.
+			publishKernelStatus();
+			if (status !== 'autorestarting') return;
 			logWarn('kernel', `kernel for ${nbPath} died and was autorestarted; namespace cleared`);
 			beginSession(nbKernel);
 			// The namespace queued work was submitted against is gone (see clearRunQueue).
@@ -437,16 +500,23 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		kernel.statusChanged.connect(nbKernel.statusHandler);
 		await initKernel(kernel);
 		logInfo('kernel', `kernel for ${nbPath} started (session ${nbKernel.sessionId})`);
+		// The kernel is up: refresh its card from "starting" to its live status.
+		publishKernelStatus();
 		return kernel;
 	})();
 
 	kernels.set(nbPath, nbKernel);
+	// Surface the booting kernel's card ("starting") the instant its first run is
+	// requested, before the connection resolves.
+	publishKernelStatus();
 
 	// If startup fails, drop the entry so a later run can retry.
 	nbKernel.startPromise.catch((err: unknown) => {
 		const message = err instanceof Error ? err.message : String(err);
 		logError('kernel', `kernel for ${nbPath} failed to start: ${message}`);
 		if (kernels.get(nbPath) === nbKernel) kernels.delete(nbPath);
+		// The card that just appeared as "starting" must drop when the boot fails.
+		publishKernelStatus();
 	});
 	return nbKernel.startPromise;
 }
@@ -477,6 +547,7 @@ export async function restartKernel(nbPath?: string | null) {
 	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
 	await initKernel(kernel);
+	publishKernelStatus();
 	return { status: kernel.status, id: kernel.id, session_id: nbKernel.sessionId };
 }
 
@@ -486,9 +557,9 @@ export async function restartKernel(nbPath?: string | null) {
  * a per-notebook rebind and the (future) explicit shutdown control. Bumps the
  * epoch so any cell stamped before teardown reads as not-this-session.
  */
-async function teardownKernel(nbKernel: NotebookKernel): Promise<void> {
+async function teardownKernel(nbKernel: NotebookKernel, reason = 'kernel_rebind'): Promise<void> {
 	const { nbPath } = nbKernel;
-	clearRunQueue(nbPath, 'kernel_rebind');
+	clearRunQueue(nbPath, reason);
 	if (nbKernel.connection) {
 		try {
 			if (nbKernel.statusHandler) nbKernel.connection.statusChanged.disconnect(nbKernel.statusHandler);
@@ -523,6 +594,7 @@ export async function rebindKernel(nbPath?: string | null) {
 		const nbKernel = kernels.get(resolveNb(nbPath));
 		if (!nbKernel) return { status: 'not_started', id: null, session_id: null, rebound: 0 };
 		await teardownKernel(nbKernel);
+		publishKernelStatus();
 		return { status: 'not_started', id: null, session_id: null, rebound: 1 };
 	}
 	// No arg: a venv change rewrote the shared kernelspec → every kernel must rebind.
@@ -534,6 +606,7 @@ export async function rebindKernel(nbPath?: string | null) {
 		manager?.dispose();
 	} catch {}
 	manager = null;
+	publishKernelStatus();
 	return { status: 'not_started', id: null, session_id: null, rebound: all.length };
 }
 
@@ -550,6 +623,7 @@ export async function interruptKernel(nbPath?: string | null) {
 	if (!nbKernel) return { status: 'not_started', id: null };
 	const kernel = await nbKernel.startPromise;
 	await kernel.interrupt();
+	publishKernelStatus();
 	return { status: kernel.status, id: kernel.id };
 }
 

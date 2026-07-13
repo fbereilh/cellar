@@ -12,7 +12,7 @@
 	import type { Cell } from '$lib/server/types';
 	import type { TreeNode } from '$lib/server/fstree';
 	import type { GitStatusLetter } from '$lib/server/git';
-	import type { KernelInfo } from '$lib/kernelBadge';
+	import type { KernelInfo, KernelCard } from '$lib/kernelBadge';
 	import type { CellarFileOps, FileClipboard, NewEntry, FileDescriptor } from '$lib/fileOps';
 
 	/** A file/dir/root descriptor the context menu + selection act on. */
@@ -22,13 +22,6 @@
 		name: string;
 		root: string;
 		tree: TreeNode[];
-	}
-	/** One open/loaded notebook shown under the Kernels section. */
-	interface NotebookTab {
-		id: string;
-		name?: string;
-		open?: boolean;
-		active?: boolean;
 	}
 	/** A kernel-namespace variable row (from the inspector probe). */
 	interface VariableInfo {
@@ -67,16 +60,19 @@
 		/** Turn the auto-number for a heading level on or off. */
 		onToggleNumberingLevel?: (level: number, on: boolean) => void;
 		mcp?: McpInfo | null;
+		/** The ACTIVE notebook's kernel — for the Databricks panel + variables label. */
 		kernelInfo?: KernelInfo | null;
-		kernelBusy?: boolean;
-		loadedNotebooks?: NotebookTab[];
+		/** One card per notebook (open tab or live kernel) for the Kernels section. */
+		kernelCards?: KernelCard[];
 		variables?: VariableInfo[];
 		varsLoading?: boolean;
 		varsError?: string;
 		onRefreshVars?: () => void;
 		onRefreshKernel?: () => void;
-		onInterruptKernel?: () => void;
-		onRestartKernel?: () => void;
+		/** Per-notebook kernel controls; each takes that notebook's workspace-rel path. */
+		onInterruptKernel?: (path: string) => void | Promise<void>;
+		onRestartKernel?: (path: string) => void | Promise<void>;
+		onShutdownKernel?: (path: string) => void | Promise<void>;
 		onInsertAndRun?: ((source: string) => void) | null;
 		onDatabricksSessionChange?: () => void;
 		onOpenFile: (path: string) => void;
@@ -113,8 +109,7 @@
 		onToggleNumberingLevel,
 		mcp = null,
 		kernelInfo,
-		kernelBusy,
-		loadedNotebooks = [],
+		kernelCards = [],
 		variables,
 		varsLoading,
 		varsError,
@@ -122,6 +117,7 @@
 		onRefreshKernel,
 		onInterruptKernel,
 		onRestartKernel,
+		onShutdownKernel,
 		// Databricks: `spark` lives in the kernel, so a new kernel session epoch means
 		// the session is gone. `onInsertAndRun` is null when no notebook is open.
 		onInsertAndRun = null,
@@ -168,9 +164,23 @@
 		if (open.environment) environmentMounted = true;
 	});
 
-	const notebooksLabel = $derived(
-		loadedNotebooks.length ? `loaded notebooks · ${loadedNotebooks.length}` : 'loaded notebooks'
-	);
+	// Live kernel count for the section header (feeds the §3.1 cap warning later).
+	// Counts only notebooks with a running kernel, not open-but-never-run tabs.
+	const kernelCount = $derived(kernelCards.filter((c) => c.hasKernel).length);
+	// Per-card in-flight state so a card's controls disable + spinner while an
+	// interrupt/restart/shutdown it fired is still resolving. Keyed by notebook path.
+	let actingPaths = $state<Set<string>>(new Set());
+	async function runKernelAction(path: string, action?: (p: string) => void | Promise<void>) {
+		if (!action || actingPaths.has(path)) return;
+		actingPaths = new Set(actingPaths).add(path);
+		try {
+			await action(path);
+		} finally {
+			const next = new Set(actingPaths);
+			next.delete(path);
+			actingPaths = next;
+		}
+	}
 
 	// ---- Persisted section order (drag to reorder) --------------------------
 	const ORDER_KEY = 'cellar-sidebar-order';
@@ -584,116 +594,109 @@
 	{/if}
 {/snippet}
 
-<!-- One open notebook loaded against the shared kernel. Clicking only focuses
-     its existing tab - a preview tab stays a preview, so the file tree's single-
-     click slot is untouched. The active notebook is marked with a primary dot. -->
-<!-- One loaded notebook. If its tab is still open the row focuses that tab and the
-     active one is dotted; if the tab was closed the notebook is still loaded in the
-     kernel (its state lives in the shared namespace), so it shows as a dimmed,
-     non-clickable row tagged "closed". -->
-{#snippet notebookRow(nb: NotebookTab)}
-	{#if nb.open}
-		<button class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50 {nb.active ? 'text-base-content' : 'text-base-content/60'}" onclick={() => onFocusNotebook?.(nb.id)} title="Focus {nb.name}" data-testid="kernel-notebook">
-			<svg class="h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
-			<span class="truncate font-mono">{nb.name}</span>
-			{#if nb.active}<span class="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
-		</button>
-	{:else}
-		<div class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-base-content/45" title="{nb.name} — loaded in the kernel (tab closed)" data-testid="kernel-notebook">
-			<svg class="h-3.5 w-3.5 shrink-0 text-base-content/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
-			<span class="truncate font-mono">{nb.name}</span>
-			<span class="ml-auto shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>
+<!-- One kernel card: a single notebook's kernel. Cellar runs one kernel PER
+     notebook, so each card carries its own status badge + Interrupt / Restart
+     (=wipe namespace) / Shut down (=free the process), each acting only on THIS
+     notebook. A card exists for every open notebook (so an unrun one shows "not
+     started") and for every live kernel whose tab was closed (still in memory).
+     The name focuses its tab when open; the active notebook is dotted. -->
+{#snippet kernelCardView(card: KernelCard)}
+	{@const acting = actingPaths.has(card.path)}
+	{@const busy = card.info.status === 'busy'}
+	<div
+		class="rounded-lg border bg-base-100 p-2.5 {card.hasKernel ? 'border-base-300' : 'border-dashed border-base-300'}"
+		data-testid="kernel-card"
+		data-nb-path={card.path}
+	>
+		<div class="flex items-center justify-between gap-2">
+			{#if card.open}
+				<button
+					class="flex min-w-0 items-center gap-1.5 text-sm font-medium hover:text-primary"
+					onclick={() => onFocusNotebook?.(card.id)}
+					title="Focus {card.name}"
+					data-testid="kernel-notebook"
+				>
+					<svg class="h-3.5 w-3.5 shrink-0 {card.hasKernel ? 'text-primary' : 'text-base-content/40'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
+					<span class="min-w-0 truncate">{card.name}</span>
+					{#if card.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
+				</button>
+			{:else}
+				<span
+					class="flex min-w-0 items-center gap-1.5 text-sm font-medium text-base-content/70"
+					title="{card.name} — kernel running, tab closed"
+					data-testid="kernel-notebook"
+				>
+					<svg class="h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
+					<span class="min-w-0 truncate">{card.name}</span>
+					<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>
+				</span>
+			{/if}
+			<span class="badge badge-sm shrink-0 whitespace-nowrap {kernelBadgeClass(card.info)} gap-1" data-testid="kernel-card-status">
+				<span class="inline-block h-1.5 w-1.5 rounded-full bg-current {busy ? 'animate-pulse' : ''}"></span>
+				{kernelStatusLabel(card.info)}
+			</span>
 		</div>
-	{/if}
-{/snippet}
-
-<!-- Card header: title on the left, live status badge on the right. Shared by the
-     started and not-started cards so both read their badge from `kernelBadge.js`.
-     The badge never wraps; at narrow sidebar widths the title gives way instead. -->
-{#snippet kernelHeader(title: string, muted: boolean)}
-	<div class="flex items-center justify-between gap-2">
-		<span class="flex min-w-0 items-center gap-1.5 text-sm font-medium {muted ? 'text-base-content/50' : ''}">
-			<svg class="h-3.5 w-3.5 shrink-0 {muted ? 'text-base-content/40' : 'text-primary'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
-			<span class="min-w-0 break-words">{title}</span>
-		</span>
-		<span class="badge badge-sm shrink-0 whitespace-nowrap {kernelBadgeClass(kernelInfo)} gap-1" data-testid="kernel-card-status">
-			<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
-			{kernelStatusLabel(kernelInfo)}
-		</span>
-	</div>
-{/snippet}
-
-<!-- The notebooks loaded in the shared kernel (ran >=1 cell this session). Only
-     the started card renders this — nothing is loaded before the first run. -->
-{#snippet notebookList(label: string)}
-	<div class="mt-2 border-t border-base-300 pt-2">
-		<div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/40" data-testid="kernel-notebooks-label">
-			{label}
+		<!-- Interrupt / Restart on one row; Shut down set apart below since it removes
+		     the kernel entirely (frees memory), a heavier action than a wipe. All
+		     disabled until this notebook has a live kernel, or while one is acting. -->
+		<div class="mt-2 border-t border-base-300 pt-2" data-testid="kernel-controls">
+			<div class="flex gap-1.5">
+				<button
+					class="btn btn-outline btn-xs flex-1 gap-1"
+					onclick={() => runKernelAction(card.path, onInterruptKernel)}
+					disabled={!card.hasKernel || acting}
+					title="Interrupt this notebook's kernel (stop the running cell)"
+					data-testid="kernel-interrupt"
+				>
+					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
+					Interrupt
+				</button>
+				<button
+					class="btn btn-outline btn-xs flex-1 gap-1"
+					onclick={() => runKernelAction(card.path, onRestartKernel)}
+					disabled={!card.hasKernel || acting}
+					title="Restart this notebook's kernel — wipe its namespace from memory (keeps the notebook)"
+					data-testid="kernel-restart"
+				>
+					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
+					Restart
+				</button>
+			</div>
+			<button
+				class="btn btn-ghost btn-xs mt-1.5 w-full gap-1 text-error/80 hover:bg-error/10 hover:text-error"
+				onclick={() => runKernelAction(card.path, onShutdownKernel)}
+				disabled={!card.hasKernel || acting}
+				title="Shut down this notebook's kernel — free its memory and remove it (starts fresh on next run)"
+				data-testid="kernel-shutdown"
+			>
+				<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v10" /><path d="M18.4 6.6a9 9 0 1 1-12.8 0" /></svg>
+				Shut down
+			</button>
 		</div>
-		{#each loadedNotebooks as nb (nb.id)}
-			{@render notebookRow(nb)}
-		{:else}
-			<p class="px-1 text-xs text-base-content/40">no notebooks loaded</p>
-		{/each}
-	</div>
-{/snippet}
-
-<!-- Interrupt / restart the shared kernel; disabled until it is started (and
-     while a control is already in flight). -->
-{#snippet kernelControls()}
-	<div class="mt-2 flex gap-1.5 border-t border-base-300 pt-2" data-testid="kernel-controls">
-		<button
-			class="btn btn-outline btn-xs flex-1 gap-1"
-			onclick={onInterruptKernel}
-			disabled={!kernelInfo?.started || kernelBusy}
-			title="Interrupt the kernel (stop the running cell)"
-			data-testid="kernel-interrupt"
-		>
-			<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
-			Interrupt
-		</button>
-		<button
-			class="btn btn-outline btn-xs flex-1 gap-1"
-			onclick={onRestartKernel}
-			disabled={!kernelInfo?.started || kernelBusy}
-			title="Restart the kernel (clear the namespace, keep the notebook)"
-			data-testid="kernel-restart"
-		>
-			<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
-			Restart
-		</button>
 	</div>
 {/snippet}
 
 {#snippet kernelsSection()}
 	<div class="flex items-center">
 		{@render header('kernels', 'Kernels', 'section-kernels')}
+		{#if kernelCount > 0}
+			<span class="badge badge-xs badge-neutral shrink-0" title="{kernelCount} live kernel{kernelCount === 1 ? '' : 's'}" data-testid="kernel-count">{kernelCount}</span>
+		{/if}
 		{@render refreshBtn(onRefreshKernel, 'Refresh kernel status')}
 	</div>
 	{#if open.kernels}
-		<!-- Cellar runs ONE shared kernel across every notebook. So the live picture
-		     is: at most one kernel (started only after the first run), with every
-		     notebook LOADED in it listed under it (ran >=1 cell this session — server
-		     tracked, so a closed-tab notebook still shows, an unrun one does not).
-		     Before the first run there is no kernel — show that, not a phantom
-		     `python3`. -->
-		<div class="px-3 pb-3" data-testid="kernels-body">
-			{#if kernelInfo?.started}
-				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="kernel-card">
-					{@render kernelHeader(kernelInfo.name || 'python3', false)}
-					{@render notebookList(notebooksLabel)}
-					{@render kernelControls()}
-				</div>
+		<!-- Cellar runs one kernel PER notebook (lazy: started on that notebook's first
+		     run). One card per notebook — every open tab (an unrun one reads "not
+		     started"), plus any live kernel whose tab was closed (still in memory).
+		     Two notebooks running at once show two independent busy cards. -->
+		<div class="space-y-2 px-3 pb-3" data-testid="kernels-body">
+			{#each kernelCards as card (card.path)}
+				{@render kernelCardView(card)}
 			{:else}
-				<div class="rounded-lg border border-dashed border-base-300 bg-base-100 p-2.5" data-testid="kernel-card">
-					{@render kernelHeader('No kernel running', true)}
-					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">
-						Run a cell to start the <span class="font-mono">{kernelInfo?.name || 'python3'}</span> kernel.
-						Notebooks appear here once they run a cell.
-					</p>
-					{@render kernelControls()}
+				<div class="rounded-lg border border-dashed border-base-300 bg-base-100 p-2.5 text-[11px] leading-relaxed text-base-content/40" data-testid="kernel-empty">
+					No notebooks open. Open a notebook and run a cell to start a kernel.
 				</div>
-			{/if}
+			{/each}
 		</div>
 	{/if}
 {/snippet}

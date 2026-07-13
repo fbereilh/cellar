@@ -1,6 +1,7 @@
 import { subscribe } from '$lib/server/events';
 import { queueStateAll } from '$lib/server/run-queue';
 import { widgetSnapshot } from '$lib/server/widgets';
+import { listKernels } from '$lib/server/kernel';
 
 /**
  * Server-Sent Events stream — one per browser tab, carrying live document/run
@@ -57,6 +58,9 @@ export function GET({ request }) {
 			// Seed live ipywidgets (tqdm bars) too: a tab connecting mid-run must see
 			// models opened before it was listening. A full snapshot, so it self-heals.
 			send({ type: 'widget:sync', global: true, ...widgetSnapshot() });
+			// Seed the live kernel list so the Kernels sidebar reflects kernels already
+			// running when this tab connects. Also a full snapshot — self-healing.
+			send({ type: 'kernel:status', global: true, kernels: listKernels() });
 			unsubscribe = subscribe(send);
 			heartbeat = setInterval(() => enqueue(': heartbeat\n\n'), HEARTBEAT_MS);
 

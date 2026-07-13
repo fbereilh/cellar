@@ -26,6 +26,41 @@ export interface KernelInfo {
 	loaded_notebooks?: LoadedNotebook[];
 }
 
+/**
+ * One live per-notebook kernel, as returned by `listKernels()` / the `/api/kernel`
+ * `kernels` field / the `kernel:status` SSE snapshot. `path` is workspace-relative
+ * (the id the browser matches tabs on). Cellar runs one kernel PER notebook, so
+ * this list is the true "loaded notebooks" set — a notebook with no entry never
+ * ran a cell and shows as "not started".
+ */
+export interface KernelListEntry {
+	path: string;
+	name: string;
+	started: boolean;
+	id: string | null;
+	status: KernelStatus;
+	session_id: SessionId | null;
+	busy: boolean;
+}
+
+/**
+ * A Kernels-sidebar card: one per notebook that either has a live kernel OR is
+ * open in a tab. `info` drives the status badge (`kernelBadgeClass`); `open`/
+ * `active` come from the tab set so a card can focus its tab and dot the focused
+ * notebook. `hasKernel` gates the Interrupt/Restart/Shut-down controls.
+ */
+export interface KernelCard {
+	/** Tab id when open, else the notebook path. */
+	id: string;
+	/** Workspace-relative notebook path (target for the per-kernel controls). */
+	path: string;
+	name: string;
+	open: boolean;
+	active: boolean;
+	hasKernel: boolean;
+	info: KernelInfo;
+}
+
 export function kernelStatusLabel(info: KernelInfo | null | undefined): string {
 	return info?.started ? info.status : 'not started';
 }

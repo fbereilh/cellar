@@ -1,22 +1,18 @@
 import { json } from '@sveltejs/kit';
-import { basename } from 'node:path';
-import { getKernelInfo, loadedNotebookPaths } from '$lib/server/kernel';
-import { workspaceRelative } from '$lib/server/notebook';
+import { getKernelInfo, listKernels } from '$lib/server/kernel';
 
 /**
- * Current kernel status for the sidebar Kernels section (does not start one).
+ * Kernel status for the sidebar (does not start one).
  *
- * `loaded_notebooks` lists the notebooks whose state actually lives in a kernel:
- * a notebook is "loaded" iff it has a live kernel entry in the manager (one per
- * notebook, lazily started on that notebook's first run), NOT the open tabs. The
- * entry survives a restart (the connection is reused; only the namespace clears)
- * and is dropped on shutdown/rebind. Each carries its workspace-relative `path`
- * (the id the browser matches tabs on) and a display `name`.
+ * `kernels` is the full list of live per-notebook kernels — one card per entry
+ * in the Kernels section, each with its own status/session/busy (Cellar runs one
+ * kernel PER notebook, lazily started on that notebook's first run). Each carries
+ * its workspace-relative `path` (the id the browser matches tabs on) and a display
+ * `name`; the entry survives a restart (the process is reused, only the namespace
+ * clears) and is dropped on shutdown/rebind. The top-level fields are the ACTIVE
+ * notebook's kernel, kept for the navbar badge, the variable inspector, and the
+ * Databricks panel, which all follow the focused notebook.
  */
 export function GET() {
-	const loaded_notebooks = loadedNotebookPaths().map((abs) => ({
-		path: workspaceRelative(abs),
-		name: basename(abs)
-	}));
-	return json({ ...getKernelInfo(), loaded_notebooks });
+	return json({ ...getKernelInfo(), kernels: listKernels() });
 }
