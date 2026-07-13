@@ -168,11 +168,24 @@ Follow this house style:
    over adding a cell just to look at a table. Add a cell when the query is part
    of the notebook's story; use the tools when you are only orienting yourself.
 
-   When databricks says connected:false, spark does not exist and every
-   databricks_* tool fails with error "not_connected". Connecting is a HUMAN
-   action: ask the user to connect from the Databricks section of the Cellar
-   sidebar. Do not try to connect yourself, and do not restart the kernel while a
-   session is connected - that destroys it.
+   When databricks says connected:false WITHOUT expired:true, spark does not exist
+   and every databricks_* tool fails with error "not_connected". A first-time
+   connect is a HUMAN action: ask the user to connect from the Databricks section
+   of the Cellar sidebar. Do not try to connect yourself, and do not restart the
+   kernel while a session is connected - that destroys it.
+
+   EXPIRED SESSIONS SELF-HEAL. A Spark Connect session can die server-side (idle
+   timeout or cluster GC) while spark is still bound - a spark.* cell then fails
+   with [INVALID_HANDLE.SESSION_CLOSED] / "Spark Connect Session expired". This is
+   RECOVERABLE, not a dead end: Cellar detects the expiry via a liveness probe and
+   automatically reconnects against the same profile+cluster. So when a cell fails
+   that way, call databricks_status (or kernel_state) - that both reports the
+   truth and triggers the auto-reconnect. A response with reconnected:true (or
+   connected:true after a retry) means spark is live again: simply re-run the cell
+   that failed. Only if it comes back connected:false, expired:true did the
+   automatic heal fail - then ask the user to reconnect from the sidebar and re-run.
+   Never treat connected:true as proof a stale cell's SESSION_CLOSED is permanent;
+   re-check status and re-run.
 
 10. SQL CELLS RUN AGAINST spark. A cell can be type "sql" (add_cell / add_cells /
    add_and_run with cell_type:"sql", or set_cell_type to "sql"). Its source is raw
@@ -252,7 +265,7 @@ function registerTools(server: McpServer) {
 	server.registerTool('run_range', { description: 'Run code cells in the inclusive range from one cell to another (same queueing + cancellation semantics as run_cells).', inputSchema: { from_id: z.string(), to_id: z.string() } }, async ({ from_id, to_id }) => text(await svc.runRange(from_id, to_id)));
 
 	// --- databricks (read-only; connecting stays a human action in the sidebar) ---
-	server.registerTool('databricks_status', { description: 'Whether a Databricks Connect session is live in the kernel, and against which profile/cluster/host. When connected:true, `spark` (a Spark session on that cluster) and `w` (a databricks.sdk WorkspaceClient) are ALREADY bound in the kernel namespace - use them directly instead of writing connection boilerplate. When connected:false, `spark` does not exist: ask the user to connect from the Databricks section of the Cellar sidebar. Reads only; never boots a kernel and never contacts the workspace. The same block appears in kernel_state and get_notebook_map.', inputSchema: {} }, async () => text(svc.databricks.status()));
+	server.registerTool('databricks_status', { description: 'Whether a Databricks Connect session is LIVE in the kernel, and against which profile/cluster/host. When connected:true, `spark` (a Spark session on that cluster) and `w` (a databricks.sdk WorkspaceClient) are bound in the kernel namespace and verified reachable - use them directly instead of writing connection boilerplate. Liveness is checked with a cheap cached `SELECT 1` probe (short TTL, skipped while the kernel is busy), so a session that expired server-side (idle timeout / cluster GC) is caught even though `spark` is still bound. On expiry Cellar AUTO-RECONNECTS against the same profile+cluster: a healed response is connected:true with reconnected:true (re-run any cell that failed with SESSION_CLOSED). If auto-reconnect fails it returns connected:false with expired:true - ask the user to reconnect from the Databricks sidebar, then re-run. connected:true with liveness_unverified:true means liveness could not be confirmed (kernel busy or a transient error), not that it is dead. connected:false without expired means no session at all: ask the user to connect. May run a tiny kernel probe; never boots a kernel. The same block appears in kernel_state and get_notebook_map.', inputSchema: {} }, async () => text(await svc.databricks.status()));
 	server.registerTool('databricks_list_catalogs', { description: 'List the Unity Catalog catalogs the connected workspace exposes: [{name, comment}]. Runs the Databricks SDK server-side (not in the kernel), so it never queues behind a running cell. Fails with error "not_connected" when there is no live session.', inputSchema: {} }, async () => databricksTool(() => svc.databricks.catalogs()));
 	server.registerTool('databricks_list_schemas', { description: 'List the schemas in one Unity Catalog catalog: [{name, comment}]. Server-side SDK call. Fails with error "not_connected" when there is no live session, "not_found" when the catalog does not exist, "permission_denied" when you cannot see it.', inputSchema: { catalog: z.string() } }, async ({ catalog }) => databricksTool(() => svc.databricks.schemas(catalog)));
 	server.registerTool('databricks_list_tables', { description: 'List the tables in one Unity Catalog schema: [{name, full_name, table_type, format}]. Use full_name with databricks_preview_table or spark.read.table(). Server-side SDK call. Fails with error "not_connected" when there is no live session.', inputSchema: { catalog: z.string(), schema: z.string() } }, async ({ catalog, schema }) => databricksTool(() => svc.databricks.tables(catalog, schema)));
