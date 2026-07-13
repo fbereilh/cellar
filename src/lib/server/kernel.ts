@@ -15,12 +15,30 @@
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
-import { openWidget, updateWidget, closeWidget, resetWidgets } from './widgets';
+import {
+	openWidget,
+	updateWidget,
+	closeWidget,
+	resetWidgets,
+	setOutputCapture,
+	outputCommForMsg,
+	appendWidgetOutput,
+	clearWidgetOutput
+} from './widgets';
 import { logInfo, logWarn, logError } from './logs';
 import type { RunStreamEvent, ExecuteOptions, SessionId } from './types';
 
 type KernelConnection = Kernel.IKernelConnection;
 type StatusListener = (sender: KernelConnection, status: Kernel.Status) => void;
+
+/**
+ * Live comm objects for open ipywidgets models, keyed by comm id. Populated in
+ * `registerWidgetComm` when the kernel opens a widget comm; this is what lets the
+ * frontend send interaction BACK to the kernel (a slider move, a checkbox tick, a
+ * button click) via `sendWidgetComm` — the return direction #86 lacked. Cleared
+ * on every session change (a fresh namespace has no widgets) alongside the store.
+ */
+const widgetComms = new Map<string, Kernel.IComm>();
 
 let kernelPromise: Promise<KernelConnection> | null = null;
 let liveKernel: KernelConnection | null = null; // last-resolved kernel, for read-only status introspection
@@ -56,16 +74,19 @@ function beginSession() {
 	sessionId += 1;
 	execsThisSession = 0;
 	loadedNbPaths.clear();
-	// A fresh namespace has no widgets: drop any tqdm progress models from the
-	// previous session so a stale bar can never linger across a restart.
+	// A fresh namespace has no widgets: drop any progress/interactive models from
+	// the previous session so a stale widget can never linger across a restart, and
+	// forget their comms so a send can never target a dead model.
+	widgetComms.clear();
 	resetWidgets();
 }
 
 /**
- * Register the ipywidgets comm target on a freshly-connected kernel. tqdm's
- * `.notebook` bars push their state over comm channels on target
- * `jupyter.widget`; we receive it into the widget store (display-only — we never
- * send widget interaction back). Registered once per kernel connection: a plain
+ * Register the ipywidgets comm target on a freshly-connected kernel. ipywidgets
+ * (tqdm bars AND interactive controls) push their state over comm channels on
+ * target `jupyter.widget`; we receive it into the widget store and — for
+ * interactive widgets — send interaction BACK through the stored comm (see
+ * `sendWidgetComm`). Registered once per kernel connection: a plain
  * `restart()`/autorestart keeps the connection (and thus the target), while a
  * rebind builds a new connection and re-runs this via `getKernel()`.
  *
@@ -76,21 +97,111 @@ function registerWidgetComm(kernel: KernelConnection): void {
 	try {
 		kernel.registerCommTarget('jupyter.widget', (comm, msg) => {
 			const commId = comm.commId;
-			const data = (msg.content?.data ?? {}) as { state?: Record<string, unknown> };
-			openWidget(commId, data.state ?? {});
+			// Keep the comm so a browser interaction can send an update/click back to
+			// the model living in the kernel.
+			widgetComms.set(commId, comm);
+			const openState = (msg.content?.data ?? {}) as { state?: Record<string, unknown> };
+			openWidget(commId, openState.state ?? {});
+			// An Output widget may already name a capture target in its opening state.
+			if (openState.state && 'msg_id' in openState.state) setOutputCapture(commId, openState.state.msg_id);
 			comm.onMsg = (m: KernelMessage.ICommMsgMsg) => {
 				const d = (m.content?.data ?? {}) as { method?: string; state?: Record<string, unknown> };
-				// Only state syncs concern us; ignore ipywidgets `custom` messages.
-				if (d.method === 'update') updateWidget(commId, d.state ?? {});
+				// Regular `update`s (a Python-side value change, an observer firing, an
+				// `interact` re-run repopulating an Output widget) sync into the store.
+				// ipywidgets 8's `echo_update` — the kernel echoing back a value the
+				// frontend just set — is deliberately ignored: applying it while the
+				// user is still dragging a slider would snap the thumb backward, and the
+				// optimistic local update already reflects the change.
+				if (d.method === 'update') {
+					updateWidget(commId, d.state ?? {});
+					// An Output widget publishes/clears its capture target via `msg_id`;
+					// track it so the iopub router (below) knows where to route captured
+					// outputs. This lands before any captured output message arrives (it is
+					// an earlier iopub message), so ordering is safe.
+					if (d.state && 'msg_id' in d.state) setOutputCapture(commId, d.state.msg_id);
+				}
 			};
-			comm.onClose = () => closeWidget(commId);
+			comm.onClose = () => {
+				widgetComms.delete(commId);
+				closeWidget(commId);
+			};
 		});
 	} catch (err) {
 		// A widget target that fails to register must never break kernel bring-up;
-		// progress bars just won't render.
+		// widgets just won't render.
 		const message = err instanceof Error ? err.message : String(err);
 		logWarn('kernel', `ipywidgets comm target not registered: ${message}`);
 	}
+}
+
+/**
+ * Convert a raw iopub output message to an nbformat output object (the same shape
+ * `execute()` emits), or null for a message type that isn't a rendered output.
+ */
+function iopubToNbformat(msg: KernelMessage.IIOPubMessage): Record<string, unknown> | null {
+	const t = msg.header.msg_type;
+	const c = msg.content as Record<string, unknown>;
+	switch (t) {
+		case 'stream':
+			return { output_type: 'stream', name: c.name, text: c.text };
+		case 'display_data':
+			return { output_type: 'display_data', data: c.data, metadata: c.metadata ?? {} };
+		case 'execute_result':
+			return { output_type: 'execute_result', data: c.data, metadata: c.metadata ?? {}, execution_count: c.execution_count ?? null };
+		case 'error':
+			return { output_type: 'error', ename: c.ename, evalue: c.evalue, traceback: c.traceback };
+		default:
+			return null;
+	}
+}
+
+/**
+ * Route iopub outputs captured by an `Output` widget. An Output widget (built by
+ * `interact`/`interactive`) captures every output whose `parent_header.msg_id`
+ * matches the `msg_id` it published, INSTEAD of syncing them over its comm — so
+ * a plain comm listener never sees them. This connects to the kernel's raw iopub
+ * stream, and for a message whose parent is a registered capture target, appends
+ * it to that Output widget's `outputs` (or honors its `clear_output`). This is
+ * what makes `interact`'s result area update live as the user drives the control.
+ * Registered once per connection, alongside `registerWidgetComm`.
+ */
+function registerWidgetOutputCapture(kernel: KernelConnection): void {
+	try {
+		kernel.iopubMessage.connect((_sender, msg: KernelMessage.IIOPubMessage) => {
+			const parentId = msg.parent_header && 'msg_id' in msg.parent_header ? (msg.parent_header as { msg_id?: string }).msg_id : undefined;
+			const commId = outputCommForMsg(parentId);
+			if (!commId) return;
+			if (msg.header.msg_type === 'clear_output') {
+				clearWidgetOutput(commId, !!(msg.content as { wait?: boolean }).wait);
+				return;
+			}
+			const output = iopubToNbformat(msg);
+			if (output) appendWidgetOutput(commId, output);
+		});
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		logWarn('kernel', `ipywidgets output capture not registered: ${message}`);
+	}
+}
+
+/**
+ * Send a `comm_msg` to an open widget model — the return direction that makes
+ * interactive widgets work. `{method:'update', state:{<trait>:<value>}}` sets a
+ * trait (a slider's `value`, a dropdown's `index`), so ipywidgets updates the
+ * Python model and fires its `observe`/`interact` callbacks; `{method:'custom',
+ * content:{event:'click'}}` is a Button press, firing its `on_click` handlers.
+ * Any resulting trait/output changes flow back through the receive path above.
+ *
+ * Throws when the comm is unknown (widget from a dead session / never opened) so
+ * the API route can answer with a clear error rather than silently dropping it.
+ */
+export function sendWidgetComm(commId: string, data: Record<string, unknown>): void {
+	const comm = widgetComms.get(commId);
+	if (!comm) throw new Error(`no live widget comm for ${commId}`);
+	// Fire-and-forget: a comm_msg has no shell reply to await, and the kernel's
+	// response (changed traits, new Output) arrives asynchronously over iopub. The
+	// payload is a plain JSON object; cast to the comm API's JSON value type.
+	comm.send(data as unknown as Parameters<typeof comm.send>[0]);
 }
 
 /**
@@ -253,6 +364,7 @@ async function getKernel(): Promise<KernelConnection> {
 		beginSession();
 		// Register before any user code runs so a widget `comm_open` is never missed.
 		registerWidgetComm(kernel);
+		registerWidgetOutputCapture(kernel);
 		// A kernel that dies is restarted by jupyter_server behind our back, which
 		// clears the namespace without any Cellar call. Catch that too, so a cell
 		// stamped before the crash never reads as "ran this session" after it.
@@ -427,6 +539,16 @@ export async function execute(
 	future.onIOPub = (msg: KernelMessage.IIOPubMessage) => {
 		const t = msg.header.msg_type;
 		const c = msg.content as Record<string, unknown>;
+		// An output captured by an active Output widget (interact's result area) is
+		// routed into that widget by registerWidgetOutputCapture; it must NOT also
+		// land as a cell output, or the interact cell would double-render its result.
+		// `outputCommForMsg` is truthy only while an Output is capturing this run's
+		// msg_id (set/cleared by the widget's `msg_id` trait), so a normal cell run
+		// is never affected.
+		if (t === 'stream' || t === 'display_data' || t === 'execute_result' || t === 'error') {
+			const parentId = (msg.parent_header as { msg_id?: string } | undefined)?.msg_id;
+			if (outputCommForMsg(parentId)) return;
+		}
 		switch (t) {
 			case 'status':
 				onEvent({ type: 'status', execution_state: c.execution_state as string });
