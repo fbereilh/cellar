@@ -24,6 +24,8 @@
 		hiddenSegs?: Map<string, SegHidden>;
 		/** fold key → number of whole cells that heading hides */
 		hiddenCounts?: Record<string, number>;
+		/** fold key → display-only auto-number for that heading (e.g. "1", "2.3") */
+		headingNumbers?: Record<string, string>;
 		/** cell id → change status vs git HEAD */
 		gitStatus?: Record<string, CellChangeStatus>;
 		/** cell id → cells deleted from HEAD immediately above it */
@@ -77,6 +79,7 @@
 		foldedIds = new Set(),
 		hiddenSegs = new Map(),
 		hiddenCounts = {},
+		headingNumbers = {},
 		gitStatus = {},
 		gitRemovedBefore = {},
 		gitRemovedAtEnd = 0,
@@ -297,6 +300,7 @@
 						{foldedIds}
 						segHidden={hiddenSegs.get(cell.id) ?? NO_SEGS_HIDDEN}
 						foldCounts={hiddenCounts}
+						{headingNumbers}
 						onToggleFold={onToggleFold}
 						onRun={onRun}
 						onRunAdvance={onRunAdvance}

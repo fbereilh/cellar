@@ -7,7 +7,7 @@
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
-	import { outlineRows as buildOutlineRows, sectionRunState } from '$lib/headings';
+	import { outlineRows as buildOutlineRows, sectionRunState, headingNumberPrefix } from '$lib/headings';
 	import { getUi, setUi } from '$lib/uiState';
 	import type { Cell } from '$lib/server/types';
 	import type { TreeNode } from '$lib/server/fstree';
@@ -60,6 +60,12 @@
 		onToggleFold?: (key: string) => void;
 		onCollapseAllFolds?: () => void;
 		onExpandAllFolds?: () => void;
+		/** fold key → display-only auto-number for that heading (e.g. "1", "2.3"). */
+		headingNumbers?: Record<string, string>;
+		/** Heading levels (1-6) currently rendered with an auto-number. */
+		numberingLevels?: number[];
+		/** Turn the auto-number for a heading level on or off. */
+		onToggleNumberingLevel?: (level: number, on: boolean) => void;
 		mcp?: McpInfo | null;
 		kernelInfo?: KernelInfo | null;
 		kernelBusy?: boolean;
@@ -99,6 +105,12 @@
 		// Same shared fold state as `onToggleFold`, driven through the notebook.
 		onCollapseAllFolds,
 		onExpandAllFolds,
+		// Display-only heading auto-numbers + the enabled levels, both owned by the
+		// active notebook's LiveNotebook. The Outline shows the same numbers the cells
+		// render and toggles the levels through the notebook, so the two never diverge.
+		headingNumbers = {},
+		numberingLevels = [],
+		onToggleNumberingLevel,
 		mcp = null,
 		kernelInfo,
 		kernelBusy,
@@ -440,6 +452,9 @@
 	// as it does in the notebook, a folded heading hides its subtree in both, and
 	// the two can never disagree about what is collapsed.
 	const outlineRows = $derived(buildOutlineRows(cells, foldedIds, foldCounts));
+	// Membership set for the per-level numbering toggle (H1-H6 checkboxes).
+	const numberingSet = $derived(new Set(numberingLevels));
+	let numberingMenuOpen = $state(false);
 	// Which heading section is running / has queued cells, from the live kernel
 	// run-queue. Keyed by the same foldKey as the outline rows, so a row looks up
 	// its own state directly. `running` wins a row's primary indicator; a queued
@@ -810,6 +825,51 @@
 	<div class="flex items-center">
 		{@render header('outline', 'Outline', 'section-outline')}
 		{#if open.outline && outlineRows.length}
+			<!-- Per-level heading auto-numbering (display-only): a small gear opens
+			     H1-H6 checkboxes. The numbers are computed from the heading structure
+			     and prepended at render time, so nothing is written to any cell. -->
+			<div class="relative">
+				<button
+					class="btn btn-ghost btn-xs btn-square {numberingLevels.length ? 'text-primary' : 'text-base-content/40'} hover:text-base-content"
+					onclick={() => (numberingMenuOpen = !numberingMenuOpen)}
+					title="Heading numbering"
+					aria-label="Heading numbering"
+					aria-expanded={numberingMenuOpen}
+					data-testid="outline-numbering-toggle"
+				>
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h3M4 12h3M4 17h3" /><path d="M11 6h9M11 12h9M11 18h9" /></svg>
+				</button>
+				{#if numberingMenuOpen}
+					<!-- Click-away backdrop -->
+					<button
+						class="fixed inset-0 z-10 cursor-default"
+						aria-label="Close heading numbering menu"
+						tabindex="-1"
+						onclick={() => (numberingMenuOpen = false)}
+					></button>
+					<div
+						class="absolute right-0 top-full z-20 mt-1 w-44 rounded-lg border border-base-300 bg-base-100 p-2 shadow-lg"
+						data-testid="outline-numbering-menu"
+					>
+						<p class="mb-1 px-1 text-[11px] font-semibold text-base-content/60">Auto-number headings</p>
+						{#each [1, 2, 3, 4, 5, 6] as lvl}
+							<label class="flex cursor-pointer items-center gap-2 rounded px-1 py-0.5 text-xs hover:bg-base-300/50">
+								<input
+									type="checkbox"
+									class="checkbox checkbox-xs checkbox-primary"
+									checked={numberingSet.has(lvl)}
+									onchange={(e) => onToggleNumberingLevel?.(lvl, e.currentTarget.checked)}
+									data-testid="numbering-level-{lvl}"
+								/>
+								<span class="text-base-content/40">{'#'.repeat(lvl)}</span>
+								<span>Heading {lvl}</span>
+							</label>
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
+		{#if open.outline && outlineRows.length}
 			<button
 				class="btn btn-ghost btn-xs btn-square text-base-content/40 hover:text-base-content"
 				onclick={() => onCollapseAllFolds?.()}
@@ -856,7 +916,11 @@
 						data-testid="outline-item"
 						title={item.title}
 					>
-						<span class="text-base-content/30">{'#'.repeat(item.level)}</span>
+						{#if headingNumbers[item.key]}
+							<span class="font-medium text-base-content/70" data-testid="outline-number">{headingNumberPrefix(headingNumbers[item.key])}</span>
+						{:else}
+							<span class="text-base-content/30">{'#'.repeat(item.level)}</span>
+						{/if}
 						{item.title}
 					</button>
 					{#if sectionRun.running.has(item.key)}

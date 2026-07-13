@@ -16,7 +16,7 @@
 	import { relativeTimeLong } from '$lib/relativeTime';
 	import type { PageData } from './$types';
 	import type { Cell } from '$lib/server/types';
-	import type { UICell, FoldRegistryHandle, NotebookApiHandle } from '$lib/types';
+	import type { UICell, FoldRegistryHandle, NumberingRegistryHandle, NotebookApiHandle } from '$lib/types';
 	import type { Folding } from '$lib/headings';
 	import type { KernelInfo } from '$lib/kernelBadge';
 	import type { BlameLine } from '$lib/server/git';
@@ -58,6 +58,8 @@
 
 	const EMPTY_FOLDS = new Set<string>(); // no notebook active → the Outline folds nothing
 	const EMPTY_QUEUED: Record<string, number> = {}; // no notebook active → nothing queued
+	const EMPTY_NUMBERS: Record<string, string> = {}; // no notebook active → no heading numbers
+	const EMPTY_LEVELS: number[] = []; // no notebook active → no numbered levels
 
 	const workspace = data.notebook.workspace;
 	const notebookPath = data.notebook.path;
@@ -87,6 +89,26 @@
 	let notebooksFolds = $state<Record<string, { foldedIds: Set<string>; folding: Folding }>>({}); // path → { foldedIds, folding }
 	function handleFoldsChange(path: string, foldedIds: Set<string>, folding: Folding) {
 		notebooksFolds[path] = { foldedIds, folding };
+	}
+
+	// Display-only heading auto-numbering per open notebook, reported up by each
+	// LiveNotebook (which owns the setting + derives the numbers). The sidebar
+	// Outline shows the same numbers the cells render, and its per-level toggle
+	// drives the numbers through the notebook's own setter. Assign into the key
+	// (never rebuild the map) for the same loop-avoidance reason as `notebooksFolds`.
+	let notebooksNumbering = $state<Record<string, { numbers: Record<string, string>; levels: number[] }>>({});
+	function handleNumberingChange(path: string, numbers: Record<string, string>, levels: number[]) {
+		notebooksNumbering[path] = { numbers, levels };
+	}
+	// Imperative, not reactive: path → the notebook's numbering setter. The Outline's
+	// per-level checkboxes drive numbering through this, same shape as `foldTogglers`.
+	const numberingTogglers = new Map<string, NumberingRegistryHandle>();
+	function registerNumbering(path: string, api: NumberingRegistryHandle | null) {
+		if (api) numberingTogglers.set(path, api);
+		else numberingTogglers.delete(path);
+	}
+	function toggleActiveNumberingLevel(level: number, on: boolean) {
+		if (activeNotebookPath) numberingTogglers.get(activeNotebookPath)?.setLevel(level, on);
 	}
 
 	// Live run/queue state per open notebook, reported up by each LiveNotebook from
@@ -241,6 +263,7 @@
 	);
 	const activeCells = $derived((activeNotebookPath && notebooksCells[activeNotebookPath]) || []);
 	const activeFolds = $derived((activeNotebookPath && notebooksFolds[activeNotebookPath]) || null);
+	const activeNumbering = $derived((activeNotebookPath && notebooksNumbering[activeNotebookPath]) || null);
 	const activeRunState = $derived((activeNotebookPath && notebooksRunState[activeNotebookPath]) || null);
 
 	// Git blame for the active file's cursor line, shown in the bottom status bar.
@@ -998,6 +1021,9 @@
 					onToggleFold={toggleActiveFold}
 					onCollapseAllFolds={collapseAllActiveFolds}
 					onExpandAllFolds={expandAllActiveFolds}
+					headingNumbers={activeNumbering?.numbers ?? EMPTY_NUMBERS}
+					numberingLevels={activeNumbering?.levels ?? EMPTY_LEVELS}
+					onToggleNumberingLevel={toggleActiveNumberingLevel}
 					{mcp}
 					kernelInfo={displayKernel}
 					{kernelBusy}
@@ -1044,8 +1070,10 @@
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
+						onNumberingChange={handleNumberingChange}
 						onRunStateChange={handleRunStateChange}
 						onRegisterFolds={registerFolds}
+						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
@@ -1062,8 +1090,10 @@
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
+						onNumberingChange={handleNumberingChange}
 						onRunStateChange={handleRunStateChange}
 						onRegisterFolds={registerFolds}
+						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
