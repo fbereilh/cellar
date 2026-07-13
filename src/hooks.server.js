@@ -15,5 +15,16 @@ import { startMcpServer } from '$lib/server/mcp/server';
 import { startParentWatch } from '$lib/server/parent-watch';
 
 installConsoleCapture();
+
+// Name the signal that stops this server, so a killed kernel is distinguishable
+// from a crash in the log. adapter-node registers its own SIGTERM/SIGINT
+// handlers for graceful shutdown; these listeners are additive (they only log)
+// and never call process.exit, so they don't interfere with that.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+	process.on(sig, () => {
+		console.log(`[cellar] app server received ${sig} - shutting down (kernel will stop)`);
+	});
+}
+
 startMcpServer();
 startParentWatch();
