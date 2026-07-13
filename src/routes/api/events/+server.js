@@ -1,5 +1,5 @@
 import { subscribe } from '$lib/server/events';
-import { queueState } from '$lib/server/run-queue';
+import { queueStateAll } from '$lib/server/run-queue';
 import { widgetSnapshot } from '$lib/server/widgets';
 
 /**
@@ -53,7 +53,7 @@ export function GET({ request }) {
 			// Seed the run queue on every (re)connect: `queue:changed` only fires on a
 			// change, so a tab that connects mid-queue would otherwise show no badges
 			// until the next enqueue.
-			send({ type: 'queue:changed', global: true, ...queueState() });
+			send({ type: 'queue:changed', global: true, ...queueStateAll() });
 			// Seed live ipywidgets (tqdm bars) too: a tab connecting mid-run must see
 			// models opened before it was listening. A full snapshot, so it self-heals.
 			send({ type: 'widget:sync', global: true, ...widgetSnapshot() });

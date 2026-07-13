@@ -51,7 +51,7 @@ type WidgetEvent =
 	| { type: 'widget:open'; comm_id: string; state: WidgetState }
 	| { type: 'widget:update'; comm_id: string; state: WidgetState }
 	| { type: 'widget:close'; comm_id: string }
-	| { type: 'widget:clear' };
+	| { type: 'widget:clear'; comm_ids?: string[] };
 
 /** Whether an event is one this store handles. */
 export function isWidgetEvent(ev: { type?: string }): boolean {
@@ -78,7 +78,13 @@ export function applyWidgetEvent(ev: WidgetEvent): void {
 			models.set(ev.comm_id, { ...(models.get(ev.comm_id) ?? {}), ...ev.state });
 			break;
 		case 'widget:clear':
-			models.clear();
+			// `comm_ids` present → one notebook's kernel restarted; drop only its
+			// widgets. Bare `clear` empties everything (a full reset).
+			if (ev.comm_ids) {
+				for (const id of ev.comm_ids) models.delete(id);
+			} else {
+				models.clear();
+			}
 			break;
 		case 'widget:close':
 			// Keep the model so a completed (leave=True) bar still renders.

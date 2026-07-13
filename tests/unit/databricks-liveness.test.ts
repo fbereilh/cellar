@@ -35,7 +35,7 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/lib/server/kernel', () => ({
-	execute: async (code: string, onEvent: (e: unknown) => void) => {
+	execute: async (_nbPath: string, code: string, onEvent: (e: unknown) => void) => {
 		onEvent({ type: 'kernel', session: state.session });
 		let payload: Record<string, unknown>;
 		if (code.includes('_cellar_dbx_ping')) payload = state.ping;

@@ -68,10 +68,15 @@
 		| { type: 'run:output'; cellId?: string; output: CellOutput }
 		| { type: 'run:end'; cellId?: string; at?: number; durationMs?: number; actor?: Actor };
 
-	/** A kernel run-queue snapshot (queue:changed). */
+	/**
+	 * A run-queue snapshot (queue:changed). `running` lists EVERY busy kernel's
+	 * active cell (notebooks run in parallel, so there can be several) and `queue`
+	 * every notebook's pending runs; both are tagged with `nb` and this notebook
+	 * filters to its own.
+	 */
 	interface QueueChangedEvent {
 		type?: string;
-		running?: RunningView | null;
+		running?: RunningView[];
 		queue?: QueueEntryView[];
 	}
 
@@ -700,16 +705,19 @@
 		}
 		queued = next;
 
-		// The snapshot also names the cell holding the kernel, which is how a tab that
-		// connects mid-run learns what is executing — `run:start` fired before it was
-		// listening. Without this, such a tab renders cells "queued · 1" behind a cell
-		// it shows as idle. `run:start` still owns `agentRunningId`: adopting a
-		// running cell must not scroll a tab that never saw the agent start it.
-		const running = ev.running?.nb === canonicalId ? ev.running.cellId : null;
+		// The snapshot also names the cell holding each kernel, which is how a tab
+		// that connects mid-run learns what is executing — `run:start` fired before it
+		// was listening. Without this, such a tab renders cells "queued · 1" behind a
+		// cell it shows as idle. We pick out THIS notebook's running cell (each
+		// notebook has its own kernel, so at most one). `run:start` still owns
+		// `agentRunningId`: adopting a running cell must not scroll a tab that never
+		// saw the agent start it.
+		const running = ev.running?.find((r) => r.nb === canonicalId)?.cellId ?? null;
 		if (running) {
 			if (findCell(running)) runningId = running;
 		} else if (runningId) {
-			// The kernel is idle, or busy with another notebook: nothing of ours runs.
+			// This notebook's kernel is idle: nothing of ours runs (another notebook's
+			// kernel may still be busy — that is not ours to reflect).
 			runningId = null;
 		}
 	}

@@ -141,14 +141,33 @@ export function clearWidgetOutput(commId: string, wait: boolean): void {
 }
 
 /**
- * Drop every widget model — called on a kernel session change (start / restart /
- * rebind / autorestart), where the namespace and thus every widget is gone.
+ * Drop widget models on a kernel session change (start / restart / rebind /
+ * autorestart), where the namespace and thus its widgets are gone.
+ *
+ * With one kernel per notebook the store still spans all notebooks (comm ids are
+ * globally unique per session, so there is no collision), but a restart must drop
+ * only the RESTARTED notebook's widgets — otherwise restarting notebook A would
+ * wipe notebook B's live bars. So `beginSession` passes the restarting kernel's
+ * own comm ids and only those are removed (`widget:clear` carries `comm_ids`). A
+ * bare `resetWidgets()` with no argument still clears everything (a full reset).
  */
-export function resetWidgets(): void {
-	msgIdToComm.clear();
-	commToMsgId.clear();
-	pendingClear.clear();
-	if (!models.size) return;
-	models.clear();
-	publishGlobal({ type: 'widget:clear' });
+export function resetWidgets(commIds?: string[]): void {
+	if (commIds === undefined) {
+		msgIdToComm.clear();
+		commToMsgId.clear();
+		pendingClear.clear();
+		if (!models.size) return;
+		models.clear();
+		publishGlobal({ type: 'widget:clear' });
+		return;
+	}
+	const removed: string[] = [];
+	for (const commId of commIds) {
+		if (models.delete(commId)) removed.push(commId);
+		const msg = commToMsgId.get(commId);
+		if (msg !== undefined) msgIdToComm.delete(msg);
+		commToMsgId.delete(commId);
+		pendingClear.delete(commId);
+	}
+	if (removed.length) publishGlobal({ type: 'widget:clear', comm_ids: removed });
 }
