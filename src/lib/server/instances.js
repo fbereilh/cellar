@@ -37,6 +37,22 @@ import {
 export function registryDir() {
 	return join(homedir(), '.cellar', 'instances');
 }
+
+/**
+ * Isolated mode: an instance that does NOT register in the global registry and
+ * does NOT reap other instances (no single-instance lock, no workspace/vanished
+ * sweeps). Driven by the `CELLAR_ISOLATED` env var so it applies to EVERY launch
+ * in an environment (CI, automated firstmate crewmate runs) without relying on a
+ * per-launch `--new` flag — a test harness can't be trusted to remember the flag,
+ * and even one non-isolated launch churns (or historically reaped) a user's real
+ * instance in the shared registry. Truthy = `1`/`true`/`yes` (case-insensitive);
+ * anything else, unset included, is the normal registered + reaping behavior. It
+ * is a strict superset of `--new`: same no-reap/no-lock path, and additionally no
+ * registry entry (so it is invisible to `cellar ls` / `cellar cleanup` too).
+ */
+export function isIsolatedEnv(env = process.env) {
+	return /^(1|true|yes)$/i.test(env?.CELLAR_ISOLATED ?? '');
+}
 function entryPath(launcherPid) {
 	return join(registryDir(), `${launcherPid}.json`);
 }
