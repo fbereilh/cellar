@@ -1,7 +1,7 @@
 /**
  * Cellar — the one cell-execution core.
  *
- * Three callers need to run a cell against the shared kernel: the UI's `/run`
+ * Three callers need to run a cell against a notebook's kernel: the UI's `/run`
  * route, the MCP `run_cell` tool, and the imports cell (`imports-cell.js`). They
  * differ only in how they answer their caller — an NDJSON stream, a JSON tool
  * result, nothing — never in what executing a cell MEANS. That shared meaning
@@ -17,7 +17,7 @@
  *   try { return await executeCellRun({ nb, cellId, actor, source: ticket.source() }); }
  *   finally { ticket.done(); }
  */
-import { execute, markNotebookLoaded } from './kernel';
+import { execute } from './kernel';
 import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook';
 import { publish } from './events';
 import { isSqlCell } from '../cellLanguage';
@@ -77,7 +77,7 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	let session: SessionId | null = null;
 	let kernelDown = false;
 	try {
-		const reply = await execute(execSource, (ev) => {
+		const reply = await execute(nb, execSource, (ev) => {
 			if (ev.type === 'output') {
 				outputs.push(ev.output);
 				publish({ type: 'run:output', nb, cellId, output: ev.output, originId });
@@ -104,10 +104,9 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 		if (session === null) kernelDown = true;
 	}
 
-	// A real kernel session executed this cell (session != null) → its state now
-	// lives in the shared namespace, so this notebook is "loaded in the kernel".
-	// A kernel-down run (session === null) touched no namespace and is skipped.
-	if (session !== null) markNotebookLoaded(nb, session);
+	// A notebook is "loaded in the kernel" iff it has a live kernel entry, which the
+	// manager tracks directly — no separate marking step. A kernel-down run (session
+	// === null) touched no namespace; either way there is nothing to record here.
 
 	setOutputs(cellId, outputs, nb); // clean-on-save persists the .ipynb
 	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,

@@ -29,7 +29,7 @@ import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSes
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
 import { agentStatus as databricksStatus, forAgent as databricksCatalog, previewTable } from '../databricks';
 import { publish } from '../events';
-import { enqueueRun, queueState, queuePosition } from '../run-queue';
+import { enqueueRun, queueStateFor, queuePosition } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree } from '../fstree';
@@ -842,11 +842,14 @@ export function setCellVisibility(id: string, hidden: boolean, nb?: string | nul
 // --- execute ----------------------------------------------------------------
 
 /**
- * The kernel's run queue: what is executing and what is waiting behind it,
- * across every open notebook (there is one kernel, so there is one queue).
+ * The run queue for the caller's working notebook: what is executing and what is
+ * waiting behind it. Each notebook has its own kernel and its own FIFO, so this
+ * resolves to the active notebook's queue (Phase 5 threads the session's pinned
+ * notebook through). The shape — `{ running, queue }`, one running cell — is
+ * unchanged.
  */
 export function getRunQueue() {
-	return queueState();
+	return queueStateFor(getActiveNotebookPath());
 }
 
 /**

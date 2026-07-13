@@ -1,20 +1,34 @@
 /**
- * Cellar — kernel bridge.
+ * Cellar — kernel manager (one kernel per notebook).
  *
- * Owns a single long-lived Jupyter kernel connection (one shared kernel for the
- * whole app) via @jupyterlab/services over Jupyter's REST + WebSocket protocol.
+ * Cellar runs ONE Jupyter kernel per open notebook, keyed by the notebook's
+ * absolute path, so notebooks execute in PARALLEL against ISOLATED namespaces:
+ * a name defined in notebook A is not visible in notebook B, and a long cell in
+ * A never blocks a cell in B. Each kernel is a full Python process the shared
+ * `jupyter_server` sidecar hosts; `@jupyterlab/services` connects to each over
+ * Jupyter's REST + WebSocket protocol. Kernels are LAZY: a notebook gets its
+ * kernel on its FIRST run, not when its tab opens.
  *
- * The core wiring:
- *   SvelteKit (Node) <-> @jupyterlab/services <-> Jupyter kernel service.
+ * The core wiring, per notebook:
+ *   SvelteKit (Node) <-> @jupyterlab/services <-> one Jupyter kernel.
+ *
+ * This module is the manager: a `Map<nbPath, NotebookKernel>` replacing the old
+ * single `currentKernel`. Every operation that used to act on "the kernel" now
+ * takes an `nbPath` (defaulting to the ACTIVE notebook, so callers that still
+ * think in terms of one kernel — the sidebar, the kernel routes, the MCP tools —
+ * keep working while later phases expose the N-kernel reality). Each
+ * `NotebookKernel` owns exactly what was process-global before: its connection,
+ * its session epoch, its widget comms, its autorestart handler.
  *
  * Each execute() call streams its own IOPub messages back through an onEvent
- * callback — the caller (the /api/execute endpoint) pipes those straight into
- * that request's HTTP response, so one run == one stream. No global broadcast,
- * so there is no way for outputs to be duplicated or cross runs.
+ * callback — the caller (the run route / MCP tool) pipes those straight into that
+ * request's response, so one run == one stream. No global broadcast, so there is
+ * no way for outputs to be duplicated or cross runs.
  */
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
+import { getActiveNotebookPath } from './notebook';
 import {
 	openWidget,
 	updateWidget,
@@ -32,53 +46,94 @@ type KernelConnection = Kernel.IKernelConnection;
 type StatusListener = (sender: KernelConnection, status: Kernel.Status) => void;
 
 /**
- * Live comm objects for open ipywidgets models, keyed by comm id. Populated in
- * `registerWidgetComm` when the kernel opens a widget comm; this is what lets the
- * frontend send interaction BACK to the kernel (a slider move, a checkbox tick, a
- * button click) via `sendWidgetComm` — the return direction #86 lacked. Cleared
- * on every session change (a fresh namespace has no widgets) alongside the store.
+ * One notebook's live kernel. Holds exactly what used to be a process-global
+ * singleton, now scoped to a single notebook keyed by its absolute path.
  */
-const widgetComms = new Map<string, Kernel.IComm>();
+interface NotebookKernel {
+	/** Absolute notebook path — the Map key. */
+	nbPath: string;
+	/** Resolves to the live kernel connection; cached so a lookup never re-starts. */
+	startPromise: Promise<KernelConnection>;
+	/** The resolved connection, once startup finished (null while still starting). */
+	connection: KernelConnection | null;
+	/**
+	 * This notebook's session epoch. Every fresh namespace gets a new id (drawn
+	 * from a process-global monotonic counter, so epochs never collide ACROSS
+	 * notebooks either): a first start, a restart, a rebind, and a server-side
+	 * autorestart all bump it. Callers stamp the epoch a cell ran in, so "this
+	 * cell has saved outputs" (persisted, maybe from a previous session) can be
+	 * told apart from "this cell executed against the namespace live right now".
+	 */
+	sessionId: number;
+	/** Cell executions run in this notebook's current epoch (internal probes excluded). */
+	execsThisSession: number;
+	/** The autorestart status handler, identity-guarded to THIS connection. */
+	statusHandler: StatusListener | null;
+	/**
+	 * Live comm objects for this kernel's open ipywidgets models, keyed by comm id.
+	 * This is what lets the frontend send interaction BACK (a slider move, a button
+	 * click) via `sendWidgetComm`. Cleared on every session change for this kernel.
+	 */
+	widgetComms: Map<string, Kernel.IComm>;
+}
 
-let kernelPromise: Promise<KernelConnection> | null = null;
-let liveKernel: KernelConnection | null = null; // last-resolved kernel, for read-only status introspection
+/** One shared KernelManager hosts every notebook's kernel (N kernels, one host). */
 let manager: KernelManager | null = null;
-let currentKernel: KernelConnection | null = null;
-let statusHandler: StatusListener | null = null;
+/** Every notebook's kernel, keyed by absolute notebook path. */
+const kernels = new Map<string, NotebookKernel>();
 
 /**
- * Kernel session epoch. Every fresh namespace gets a new id: a first start, a
- * restart, a rebind onto another interpreter, and a server-side autorestart all
- * bump it. Callers stamp the epoch a cell ran in, so "this cell has saved
- * outputs" (persisted, possibly from a previous session) can be told apart from
- * "this cell actually executed against the namespace that is live right now".
- *
- * Monotonic and starts at 0, which means "no kernel has ever started" — so a
- * stamp can never accidentally match the current epoch before a kernel exists.
+ * Process-global monotonic epoch source. Each new kernel session grabs the next
+ * value, so a session id is unique across ALL notebooks — a cell stamped with
+ * notebook A's epoch can never accidentally read as live under notebook B's.
+ * Starts at 0, which means "no kernel session has ever existed"; the first
+ * session is 1, so a stamp can never match before a kernel exists.
  */
-let sessionId = 0;
-/** Cell executions run in the current epoch (internal probes excluded). */
-let execsThisSession = 0;
+let sessionCounter = 0;
+
+/** Resolve an optional notebook path to an absolute one (default: active notebook). */
+function resolveNb(nbPath?: string | null): string {
+	return nbPath || getActiveNotebookPath();
+}
+
+function makeSettings() {
+	const baseUrl = process.env.CELLAR_JUPYTER_URL || 'http://127.0.0.1:8888';
+	const token = process.env.CELLAR_JUPYTER_TOKEN || '';
+	const wsUrl = baseUrl.replace(/^http/, 'ws');
+	return ServerConnection.makeSettings({
+		baseUrl,
+		wsUrl,
+		token,
+		// Node 18+ ships global fetch/WebSocket; pass them explicitly so
+		// @jupyterlab/services does not reach for a browser-only shim.
+		fetch: globalThis.fetch,
+		WebSocket: globalThis.WebSocket
+	});
+}
+
+/** The shared KernelManager, created on first use. */
+async function getManager(): Promise<KernelManager> {
+	if (!manager) {
+		manager = new KernelManager({ serverSettings: makeSettings() });
+	}
+	await manager.ready;
+	return manager;
+}
 
 /**
- * Notebooks whose state actually lives in the CURRENT kernel session: the set of
- * absolute notebook paths that have executed at least one cell in this epoch.
- * With the one-shared-kernel model this is what "loaded in the kernel" means — a
- * notebook whose tab was later closed is still here (its variables persist in the
- * shared namespace), and a just-opened notebook that never ran a cell is not.
- * Cleared by `beginSession()`, so a fresh namespace starts with nothing loaded.
+ * Open a new session epoch for a notebook's kernel: bump its id from the global
+ * counter, reset its exec count, and drop its widgets. Called on a fresh start
+ * and on every restart/rebind/autorestart. Only THIS kernel's widgets are cleared
+ * (by comm id) so restarting notebook A never wipes notebook B's live bars.
  */
-let loadedNbPaths = new Set<string>();
-
-function beginSession() {
-	sessionId += 1;
-	execsThisSession = 0;
-	loadedNbPaths.clear();
-	// A fresh namespace has no widgets: drop any progress/interactive models from
-	// the previous session so a stale widget can never linger across a restart, and
-	// forget their comms so a send can never target a dead model.
-	widgetComms.clear();
-	resetWidgets();
+function beginSession(nbKernel: NotebookKernel): void {
+	nbKernel.sessionId = ++sessionCounter;
+	nbKernel.execsThisSession = 0;
+	// A fresh namespace has no widgets: drop this kernel's progress/interactive
+	// models and forget their comms so a send can never target a dead model.
+	const commIds = [...nbKernel.widgetComms.keys()];
+	nbKernel.widgetComms.clear();
+	resetWidgets(commIds);
 }
 
 /**
@@ -88,18 +143,19 @@ function beginSession() {
  * interactive widgets — send interaction BACK through the stored comm (see
  * `sendWidgetComm`). Registered once per kernel connection: a plain
  * `restart()`/autorestart keeps the connection (and thus the target), while a
- * rebind builds a new connection and re-runs this via `getKernel()`.
+ * rebind builds a new connection and re-runs this via `startKernel()`. Comms land
+ * in THIS kernel's `widgetComms` map so a send targets the right kernel.
  *
  * The initial `comm_open` state and every `comm_msg` update are dynamic Jupyter
  * wire payloads (`content.data`), narrowed here to the widget shape.
  */
-function registerWidgetComm(kernel: KernelConnection): void {
+function registerWidgetComm(nbKernel: NotebookKernel, kernel: KernelConnection): void {
 	try {
 		kernel.registerCommTarget('jupyter.widget', (comm, msg) => {
 			const commId = comm.commId;
 			// Keep the comm so a browser interaction can send an update/click back to
 			// the model living in the kernel.
-			widgetComms.set(commId, comm);
+			nbKernel.widgetComms.set(commId, comm);
 			const openState = (msg.content?.data ?? {}) as { state?: Record<string, unknown> };
 			openWidget(commId, openState.state ?? {});
 			// An Output widget may already name a capture target in its opening state.
@@ -122,7 +178,7 @@ function registerWidgetComm(kernel: KernelConnection): void {
 				}
 			};
 			comm.onClose = () => {
-				widgetComms.delete(commId);
+				nbKernel.widgetComms.delete(commId);
 				closeWidget(commId);
 			};
 		});
@@ -192,11 +248,17 @@ function registerWidgetOutputCapture(kernel: KernelConnection): void {
  * content:{event:'click'}}` is a Button press, firing its `on_click` handlers.
  * Any resulting trait/output changes flow back through the receive path above.
  *
- * Throws when the comm is unknown (widget from a dead session / never opened) so
- * the API route can answer with a clear error rather than silently dropping it.
+ * Comm ids are globally unique per session, so the comm is looked up across every
+ * notebook's kernel. Throws when the comm is unknown (widget from a dead session /
+ * never opened) so the API route can answer with a clear error rather than
+ * silently dropping it.
  */
 export function sendWidgetComm(commId: string, data: Record<string, unknown>): void {
-	const comm = widgetComms.get(commId);
+	let comm: Kernel.IComm | undefined;
+	for (const nbKernel of kernels.values()) {
+		comm = nbKernel.widgetComms.get(commId);
+		if (comm) break;
+	}
 	if (!comm) throw new Error(`no live widget comm for ${commId}`);
 	// Fire-and-forget: a comm_msg has no shell reply to await, and the kernel's
 	// response (changed traits, new Output) arrives asynchronously over iopub. The
@@ -204,36 +266,9 @@ export function sendWidgetComm(commId: string, data: Record<string, unknown>): v
 	comm.send(data as unknown as Parameters<typeof comm.send>[0]);
 }
 
-/**
- * Record that notebook `nbAbsPath` executed a cell in session `session`. The run
- * path calls this after a run resolves, passing the epoch the run STARTED in
- * (from `execute()`'s `kernel` event). Guarded so a run that spanned a restart —
- * its epoch no longer current — never re-marks a notebook as loaded in a session
- * it did not actually touch.
- */
-export function markNotebookLoaded(nbAbsPath: string, session: SessionId): void {
-	if (!currentKernel || !nbAbsPath || session !== sessionId) return;
-	loadedNbPaths.add(nbAbsPath);
-}
-
-/** Absolute paths of the notebooks loaded in the live session (empty if none). */
+/** Absolute paths of the notebooks that currently have a live kernel entry. */
 export function loadedNotebookPaths(): string[] {
-	return currentKernel ? [...loadedNbPaths] : [];
-}
-
-function makeSettings() {
-	const baseUrl = process.env.CELLAR_JUPYTER_URL || 'http://127.0.0.1:8888';
-	const token = process.env.CELLAR_JUPYTER_TOKEN || '';
-	const wsUrl = baseUrl.replace(/^http/, 'ws');
-	return ServerConnection.makeSettings({
-		baseUrl,
-		wsUrl,
-		token,
-		// Node 18+ ships global fetch/WebSocket; pass them explicitly so
-		// @jupyterlab/services does not reach for a browser-only shim.
-		fetch: globalThis.fetch,
-		WebSocket: globalThis.WebSocket
-	});
+	return [...kernels.keys()];
 }
 
 /**
@@ -351,19 +386,33 @@ async function initKernel(kernel: KernelConnection): Promise<void> {
 	await runSilent(kernel, DATAFRAME_FORMATTER_CODE);
 }
 
-/** Start (or reuse) the single kernel. */
-async function getKernel(): Promise<KernelConnection> {
-	if (kernelPromise) return kernelPromise;
-	kernelPromise = (async () => {
-		const serverSettings = makeSettings();
-		manager = new KernelManager({ serverSettings });
-		await manager.ready;
-		const kernel = await manager.startNew({ name: 'python3' });
-		liveKernel = kernel;
-		currentKernel = kernel;
-		beginSession();
+/**
+ * Start (or reuse) the kernel for notebook `nbPath`. Lazy: the kernel does not
+ * exist until a notebook's first run. If the Map already holds an entry, its
+ * cached start promise is returned; otherwise a fresh kernel process is started,
+ * initialized (matplotlib + dataframe formatter + widget wiring), and cached.
+ */
+function getKernel(nbPath: string): Promise<KernelConnection> {
+	const existing = kernels.get(nbPath);
+	if (existing) return existing.startPromise;
+
+	const nbKernel: NotebookKernel = {
+		nbPath,
+		startPromise: undefined as unknown as Promise<KernelConnection>,
+		connection: null,
+		sessionId: 0,
+		execsThisSession: 0,
+		statusHandler: null,
+		widgetComms: new Map()
+	};
+
+	nbKernel.startPromise = (async () => {
+		const mgr = await getManager();
+		const kernel = await mgr.startNew({ name: 'python3' });
+		nbKernel.connection = kernel;
+		beginSession(nbKernel);
 		// Register before any user code runs so a widget `comm_open` is never missed.
-		registerWidgetComm(kernel);
+		registerWidgetComm(nbKernel, kernel);
 		registerWidgetOutputCapture(kernel);
 		// A kernel that dies is restarted by jupyter_server behind our back, which
 		// clears the namespace without any Cellar call. Catch that too, so a cell
@@ -377,39 +426,45 @@ async function getKernel(): Promise<KernelConnection> {
 		//
 		// Re-injecting the startup code keeps parity with restartKernel(): an
 		// autorestart clears the namespace AND the matplotlib backend.
-		statusHandler = (_sender, status) => {
-			if (status !== 'autorestarting' || currentKernel !== kernel) return;
-			// (kernel captured in this closure is the one this handler belongs to)
-			logWarn('kernel', 'kernel died and was autorestarted by jupyter_server; namespace cleared');
-			beginSession();
+		nbKernel.statusHandler = (_sender, status) => {
+			if (status !== 'autorestarting' || nbKernel.connection !== kernel) return;
+			logWarn('kernel', `kernel for ${nbPath} died and was autorestarted; namespace cleared`);
+			beginSession(nbKernel);
 			// The namespace queued work was submitted against is gone (see clearRunQueue).
-			clearRunQueue('kernel_autorestart');
+			clearRunQueue(nbPath, 'kernel_autorestart');
 			void initKernel(kernel);
 		};
-		kernel.statusChanged.connect(statusHandler);
+		kernel.statusChanged.connect(nbKernel.statusHandler);
 		await initKernel(kernel);
-		logInfo('kernel', `kernel started (session ${sessionId})`);
+		logInfo('kernel', `kernel for ${nbPath} started (session ${nbKernel.sessionId})`);
 		return kernel;
 	})();
-	// If startup fails, allow a later retry.
-	kernelPromise.catch((err: unknown) => {
+
+	kernels.set(nbPath, nbKernel);
+
+	// If startup fails, drop the entry so a later run can retry.
+	nbKernel.startPromise.catch((err: unknown) => {
 		const message = err instanceof Error ? err.message : String(err);
-		logError('kernel', `kernel failed to start: ${message}`);
-		kernelPromise = null;
+		logError('kernel', `kernel for ${nbPath} failed to start: ${message}`);
+		if (kernels.get(nbPath) === nbKernel) kernels.delete(nbPath);
 	});
-	return kernelPromise;
+	return nbKernel.startPromise;
 }
 
 /**
- * Restart the kernel process (clears the namespace) while KEEPING the same
- * connection. Cellar's backend, MCP server, and document are untouched — this
- * is what makes the agent interface kernel-restart-proof.
+ * Restart notebook `nbPath`'s kernel process (clears ITS namespace) while KEEPING
+ * the same connection. Other notebooks' kernels are untouched. Cellar's backend,
+ * MCP server, and document are untouched — this is what makes the agent interface
+ * kernel-restart-proof. Restarting a notebook that never started is a no-op.
  */
-export async function restartKernel() {
-	// Drop pending runs BEFORE the restart is issued, so nothing can dequeue into
-	// the kernel that is about to lose its namespace.
-	clearRunQueue('kernel_restart');
-	const kernel = await getKernel();
+export async function restartKernel(nbPath?: string | null) {
+	const abs = resolveNb(nbPath);
+	// Drop this notebook's pending runs BEFORE the restart is issued, so nothing can
+	// dequeue into the kernel that is about to lose its namespace.
+	clearRunQueue(abs, 'kernel_restart');
+	const nbKernel = kernels.get(abs);
+	if (!nbKernel) return { status: 'not_started', id: null, session_id: null };
+	const kernel = await nbKernel.startPromise;
 	try {
 		await kernel.restart();
 	} finally {
@@ -418,116 +473,142 @@ export async function restartKernel() {
 		// The epoch must be bumped on BOTH paths: it is monotonic and opaque, so an
 		// extra bump is harmless, while a missing one leaves cells falsely reading
 		// as `ok_session` against a namespace that no longer exists.
-		beginSession();
+		beginSession(nbKernel);
 	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
 	await initKernel(kernel);
-	return { status: kernel.status, id: kernel.id, session_id: sessionId };
+	return { status: kernel.status, id: kernel.id, session_id: nbKernel.sessionId };
 }
 
 /**
- * Rebind onto a freshly-written kernelspec (e.g. after the Settings venv
- * control points the `python3` spec at a different interpreter). A plain
- * `restart()` reuses the kernel's original launch argv, so it would NOT switch
- * interpreters — we must tear the kernel down so the next start re-reads the
- * kernelspec from disk and launches the newly-bound python. The connection,
- * backend, MCP session, and document are untouched.
- *
- * If no kernel is running yet, we only clear cached state; the next execute()
- * naturally picks up the new spec.
+ * Tear a single notebook's kernel down: disconnect its handler, shut the process
+ * down, drop its pending queue and widgets, and remove it from the Map. Used by
+ * a per-notebook rebind and the (future) explicit shutdown control. Bumps the
+ * epoch so any cell stamped before teardown reads as not-this-session.
  */
-export async function rebindKernel() {
-	// Queued runs were submitted against the OLD interpreter's namespace.
-	clearRunQueue('kernel_rebind');
-	const wasRunning = !!currentKernel;
-	if (currentKernel) {
+async function teardownKernel(nbKernel: NotebookKernel): Promise<void> {
+	const { nbPath } = nbKernel;
+	clearRunQueue(nbPath, 'kernel_rebind');
+	if (nbKernel.connection) {
 		try {
-			if (statusHandler) currentKernel.statusChanged.disconnect(statusHandler);
+			if (nbKernel.statusHandler) nbKernel.connection.statusChanged.disconnect(nbKernel.statusHandler);
 		} catch {}
 		try {
-			await currentKernel.shutdown();
+			await nbKernel.connection.shutdown();
 		} catch {}
 	}
+	// The old namespace is gone; bump so its epoch can never read as current, and
+	// drop this kernel's widgets from the store.
+	beginSession(nbKernel);
+	nbKernel.connection = null;
+	nbKernel.statusHandler = null;
+	if (kernels.get(nbPath) === nbKernel) kernels.delete(nbPath);
+}
+
+/**
+ * Rebind onto a freshly-written kernelspec (e.g. after the Settings venv control
+ * points the `python3` spec at a different interpreter). A plain `restart()`
+ * reuses the kernel's original launch argv, so it would NOT switch interpreters —
+ * we must tear the kernel down so the NEXT start re-reads the kernelspec from disk
+ * and launches the newly-bound python.
+ *
+ * With one shared `python3` kernelspec across all notebooks, a venv change affects
+ * every kernel — so `rebindKernel()` with NO argument tears down every live kernel
+ * (they lazily re-start on their next run under the new interpreter). Passing an
+ * `nbPath` rebinds just that one notebook. The connection, MCP session, and
+ * documents are untouched.
+ */
+export async function rebindKernel(nbPath?: string | null) {
+	if (nbPath) {
+		const nbKernel = kernels.get(resolveNb(nbPath));
+		if (!nbKernel) return { status: 'not_started', id: null, session_id: null, rebound: 0 };
+		await teardownKernel(nbKernel);
+		return { status: 'not_started', id: null, session_id: null, rebound: 1 };
+	}
+	// No arg: a venv change rewrote the shared kernelspec → every kernel must rebind.
+	const all = [...kernels.values()];
+	await Promise.all(all.map((k) => teardownKernel(k)));
+	// Dispose the shared manager so the next start reconnects cleanly under the new
+	// spec; it is recreated lazily by getManager().
 	try {
 		manager?.dispose();
 	} catch {}
 	manager = null;
-	statusHandler = null;
-	kernelPromise = null;
-	currentKernel = null;
-	liveKernel = null;
-	if (!wasRunning) return { status: 'not_started', id: null, session_id: null };
-	// The old namespace is gone the moment the kernel was torn down, whether or not
-	// the replacement comes up. Bump now so a getKernel() failure below cannot leave
-	// the previous epoch reachable.
-	beginSession();
-	// getKernel() starts a brand-new kernel process, so it opens a new session.
-	const kernel = await getKernel();
-	return { status: kernel.status, id: kernel.id, session_id: sessionId };
+	return { status: 'not_started', id: null, session_id: null, rebound: all.length };
 }
 
 /**
- * Interrupt the running kernel (SIGINT equivalent). Also drops the pending run
- * queue: "stop" must mean stop, not "stop this cell and start the next one" —
- * and jupyter aborts its own queued execute requests on an interrupt anyway.
+ * Interrupt notebook `nbPath`'s running kernel (SIGINT equivalent). Also drops
+ * that notebook's pending run queue: "stop" must mean stop, not "stop this cell
+ * and start the next one" — and jupyter aborts its own queued execute requests on
+ * an interrupt anyway. Other notebooks are untouched.
  */
-export async function interruptKernel() {
-	clearRunQueue('kernel_interrupt');
-	const kernel = await getKernel();
+export async function interruptKernel(nbPath?: string | null) {
+	const abs = resolveNb(nbPath);
+	clearRunQueue(abs, 'kernel_interrupt');
+	const nbKernel = kernels.get(abs);
+	if (!nbKernel) return { status: 'not_started', id: null };
+	const kernel = await nbKernel.startPromise;
 	await kernel.interrupt();
 	return { status: kernel.status, id: kernel.id };
 }
 
-/** Current kernel status without forcing a start. */
-export function kernelStatus() {
-	if (!currentKernel) return { status: 'not_started', id: null };
-	return { status: currentKernel.status, id: currentKernel.id };
+/** Current status of notebook `nbPath`'s kernel, without forcing a start. */
+export function kernelStatus(nbPath?: string | null) {
+	const nbKernel = kernels.get(resolveNb(nbPath));
+	if (!nbKernel || !nbKernel.connection) return { status: 'not_started', id: null };
+	return { status: nbKernel.connection.status, id: nbKernel.connection.id };
 }
 
 /**
- * Live kernel-session snapshot, without forcing a start. `session_id` is the
- * current epoch (null when no kernel is running); a cell whose recorded run
- * epoch equals it genuinely executed against the namespace that exists now.
- * Everything else — however good its saved outputs look — did not.
+ * Live kernel-session snapshot for notebook `nbPath`, without forcing a start.
+ * `session_id` is the current epoch (null when its kernel is not running); a cell
+ * whose recorded run epoch equals it genuinely executed against the namespace that
+ * exists now. Everything else — however good its saved outputs look — did not.
  */
-export function kernelSession() {
-	if (!currentKernel) {
+export function kernelSession(nbPath?: string | null) {
+	const nbKernel = kernels.get(resolveNb(nbPath));
+	if (!nbKernel || !nbKernel.connection) {
 		return { started: false, session_id: null, status: 'not_started', execs_this_session: 0 };
 	}
 	return {
 		started: true,
-		session_id: sessionId,
-		status: currentKernel.status,
-		execs_this_session: execsThisSession
+		session_id: nbKernel.sessionId,
+		status: nbKernel.connection.status,
+		execs_this_session: nbKernel.execsThisSession
 	};
 }
 
-/** The epoch a run should be stamped with, or null when no kernel is running. */
-export function currentSessionId() {
-	return currentKernel ? sessionId : null;
+/** The epoch a run should be stamped with for notebook `nbPath`, or null when its kernel is not running. */
+export function currentSessionId(nbPath?: string | null): SessionId | null {
+	const nbKernel = kernels.get(resolveNb(nbPath));
+	return nbKernel && nbKernel.connection ? nbKernel.sessionId : null;
 }
 
 /**
- * Execute one chunk of code. Each IOPub message is delivered live via onEvent
- * as it arrives from the kernel. Resolves with the execute reply when done.
+ * Execute one chunk of code against notebook `nbPath`'s kernel (lazy-starting it
+ * if needed). Each IOPub message is delivered live via onEvent as it arrives.
+ * Resolves with the execute reply when done.
  *
  * The `kernel` and `done` events both carry the kernel-session epoch this run
  * *started* in. Callers stamp that epoch on the cell rather than reading the
  * epoch afterwards: if the kernel restarted mid-run the namespace is gone, and
  * the stale stamp correctly reads as "did not run this session".
  *
- * `internal: true` marks a Cellar-issued probe (see inspect.js) so it does not
+ * `internal: true` marks a Cellar-issued probe (see inspect.ts) so it does not
  * inflate `execs_this_session`, which counts cell executions the agent can see.
- *
  */
 export async function execute(
+	nbPath: string,
 	code: string,
 	onEvent: (event: RunStreamEvent) => void,
 	{ internal = false }: ExecuteOptions = {}
 ): Promise<KernelMessage.IExecuteReplyMsg['content']> {
-	const kernel = await getKernel();
-	const session = sessionId;
-	if (!internal) execsThisSession += 1;
+	const abs = resolveNb(nbPath);
+	const kernel = await getKernel(abs);
+	const nbKernel = kernels.get(abs)!;
+	const session = nbKernel.sessionId;
+	if (!internal) nbKernel.execsThisSession += 1;
 	onEvent({ type: 'kernel', id: kernel.id, session });
 
 	const future = kernel.requestExecute({ code, stop_on_error: false });
@@ -590,23 +671,25 @@ export async function execute(
 }
 
 /**
- * Read-only snapshot of the current kernel for the sidebar's Kernels section.
- * Does NOT start a kernel — reports `started: false` until the first execute().
+ * Read-only snapshot of notebook `nbPath`'s kernel for the sidebar's Kernels
+ * section. Does NOT start a kernel — reports `started: false` until that
+ * notebook's first execute().
  *
  * `session_id` is the epoch (see above). It is what lets a client notice that a
  * restart replaced the namespace - the kernel id survives a `restart()`, so it
  * cannot answer that question. The Databricks section re-checks its `spark`
  * session on every change to it.
  */
-export function getKernelInfo() {
-	if (!liveKernel) {
+export function getKernelInfo(nbPath?: string | null) {
+	const nbKernel = kernels.get(resolveNb(nbPath));
+	if (!nbKernel || !nbKernel.connection) {
 		return { started: false, id: null, name: 'python3', status: 'not started', session_id: null };
 	}
 	return {
 		started: true,
-		id: liveKernel.id,
-		name: liveKernel.name || 'python3',
-		status: liveKernel.status, // 'idle' | 'busy' | 'starting' | 'dead' | …
-		session_id: currentSessionId()
+		id: nbKernel.connection.id,
+		name: nbKernel.connection.name || 'python3',
+		status: nbKernel.connection.status, // 'idle' | 'busy' | 'starting' | 'dead' | …
+		session_id: nbKernel.sessionId
 	};
 }

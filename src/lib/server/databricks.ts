@@ -80,6 +80,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execute, currentSessionId, kernelStatus } from './kernel';
+import { getActiveNotebookPath } from './notebook';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
@@ -1016,7 +1017,10 @@ async function runInKernel(code: string): Promise<{ result: ProbeResult; session
 	let kernelError: string | null = null;
 	let session: SessionId | null = null;
 	try {
+		// Databricks binds `spark`/`w` into the ACTIVE notebook's kernel (per-notebook
+		// Databricks is a later phase); the epoch we stamp comes from that kernel.
 		await execute(
+			getActiveNotebookPath(),
 			code,
 			(ev: RunStreamEvent) => {
 				if (ev.type === 'kernel') {

@@ -10,6 +10,7 @@
  * in nor pollutes the inspected namespace.
  */
 import { execute, kernelStatus, kernelSession, currentSessionId } from './kernel';
+import { getActiveNotebookPath } from './notebook';
 import type { RunStreamEvent, SessionId } from './types';
 
 // --- Parsed probe-result shapes (a genuine dynamic boundary: kernel stdout JSON) ---
@@ -199,7 +200,9 @@ async function execProbe(code: string): Promise<{ session: SessionId | null; lin
 			}
 		}
 	};
-	await execute(code, onEvent, { internal: true });
+	// The variable inspector reflects the ACTIVE notebook's kernel (per-notebook
+	// inspection is a later phase); its epoch reconciles against the same notebook.
+	await execute(getActiveNotebookPath(), code, onEvent, { internal: true });
 	if (errored) throw new Error(errored);
 	const line = stdout.trim().split('\n').filter(Boolean).at(-1);
 	return { session, line };

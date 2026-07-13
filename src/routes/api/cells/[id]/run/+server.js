@@ -8,13 +8,13 @@ import { executeCellRun, clearOutputsForQueue } from '$lib/server/run';
  * while also being accumulated into the cell's `outputs` and persisted to the
  * `.ipynb` on done.
  *
- * There is one kernel for the whole app, so the run first takes a ticket from
- * the kernel-global FIFO (`run-queue.js`). When the kernel is free the ticket
+ * Each notebook has its own kernel, so the run first takes a ticket from that
+ * notebook's FIFO (`run-queue.js`). When the notebook's kernel is free the ticket
  * resolves immediately and nothing about this route's behavior changes. When it
- * is busy — with this tab's own cell, another tab's, another notebook's, or an
- * agent's — the run WAITS its turn rather than being dropped. The response
- * stream stays open across the wait, so the tab that asked for the run is still
- * the tab that renders it.
+ * is busy — with this tab's own cell, another tab's, or an agent's — the run
+ * WAITS its turn rather than being dropped (another NOTEBOOK being busy never
+ * queues this one). The response stream stays open across the wait, so the tab
+ * that asked for the run is still the tab that renders it.
  *
  * The execution itself — persist, stamp, broadcast — belongs to `executeCellRun`
  * (`run.js`), shared with the MCP `run_cell` tool and the imports cell, so what

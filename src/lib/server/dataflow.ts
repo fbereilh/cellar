@@ -206,6 +206,8 @@ export async function getNotebookStaleness(
 ): Promise<{ sid: SessionId | null; cells: ReturnType<typeof computeStaleness> }> {
 	const cells = listCells(nb);
 	const dataflow = await analyzeDataflow(cells);
-	const sid = currentSessionId();
+	// Reconcile against THIS notebook's kernel epoch (each notebook has its own),
+	// not the active one — so staleness is correct even for a non-active notebook.
+	const sid = currentSessionId(nb);
 	return { sid, cells: computeStaleness(cells, dataflow, sid) };
 }
