@@ -34,7 +34,7 @@ import {
 import { IMPORTS_ROLE, isImportsCell } from '../importsRole';
 import { extractTopLevelImports, mergeImportSources, isImportsOnly, hasTopLevelImports } from './imports';
 import { enqueueRun, queuePosition, RunCancelled } from './run-queue';
-import { executeCellRun } from './run';
+import { executeCellRun, clearOutputsForQueue } from './run';
 import type { Actor, Cell, CellView, CellOutput, SessionId } from './types';
 
 /** The imports cell's run outcome: a run result, or a non-executing status when
@@ -132,6 +132,8 @@ export async function runImportsCell(
 			? { id: cell.id, status: 'queued', queue_position: position, note: 'the imports cell is already queued; it will run the merged imports when the kernel frees.' }
 			: { id: cell.id, status: 'running', note: 'the imports cell is executing right now, so it did not pick up the new imports; re-run it once it finishes.' };
 	}
+	// Clear the imports cell's stale output the moment it is queued (see run.ts).
+	clearOutputsForQueue({ nb: abs, cellId: cell.id, originId });
 	try {
 		await ticket.wait!();
 	} catch (err) {

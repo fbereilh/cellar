@@ -15,7 +15,7 @@
 import { listCells, resolveNotebookPath } from './notebook';
 import { writeNotebook } from './ipynb';
 import { enqueueRun } from './run-queue';
-import { executeCellRun } from './run';
+import { executeCellRun, clearOutputsForQueue } from './run';
 import {
 	JupytextError,
 	SAVE_FORMATS,
@@ -73,6 +73,8 @@ async function runAllCells(nb: string, actor: Actor, originId?: string | null): 
 	for (const c of cells) {
 		const ticket = enqueueRun({ nb, cellId: c.id, actor, source: c.source ?? '' });
 		if (ticket.duplicate) continue; // already running/queued elsewhere; its run stands
+		// Clear this cell's stale output the moment it is queued (see run.ts).
+		clearOutputsForQueue({ nb, cellId: c.id, originId });
 		try {
 			await ticket.wait();
 		} catch {

@@ -56,10 +56,12 @@ export interface CellRunArgs {
  */
 export async function executeCellRun({ nb, cellId, actor, source, originId, onEvent }: CellRunArgs): Promise<CellRunResult> {
 	const startedAt = Date.now();
-	// Clear stale output the moment execution starts (the caller already holds the
-	// kernel, so this is post-queue): the browser clears on the `run:start` frame
-	// below, and this keeps the live in-memory model in step so a tab loading
-	// mid-run reads an empty cell rather than the prior run's outputs.
+	// Clear stale output. For a queued run this already happened at ENQUEUE
+	// (`clearOutputsForQueue`), so this is an idempotent backstop that also covers
+	// any run path which did not clear on enqueue; clearing an already-empty cell is
+	// a no-op. The browser likewise clears on the `run:start` frame below, and this
+	// keeps the live in-memory model in step so a tab loading mid-run reads an empty
+	// cell rather than the prior run's outputs.
 	clearOutputsLive(cellId, nb);
 	publish({ type: 'run:start', nb, cellId, actor, at: startedAt, originId });
 	onEvent?.({ type: 'run:start', cellId, at: startedAt });
@@ -123,4 +125,37 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	publish({ type: 'run:end', nb, cellId, ...lastRun, originId });
 
 	return { outputs, status, session, kernelDown, lastRun };
+}
+
+/**
+ * Clear a cell's LIVE outputs the moment its run is QUEUED, rather than waiting
+ * for the kernel to free. Empties the in-memory doc and broadcasts a `run:cleared`
+ * event so every open tab empties the cell right away — otherwise the prior run's
+ * output lingers under the "queued · N" badge until the cell's turn finally comes.
+ *
+ * Call it once per FRESH (non-duplicate) enqueue, right after taking the ticket. A
+ * duplicate submission is already running or already queued, so its outputs were
+ * cleared when it first entered — clearing again would wipe a live run's output.
+ *
+ * It is idempotent (clearing an already-empty cell is a no-op) and touches no disk
+ * — persist happens once, at run:end via `setOutputs` — so queuing writes no
+ * transient empty-output `.ipynb`. When `onEvent` is given it also emits the frame
+ * on the caller's own stream: the UI `/run` route passes its NDJSON `send`, so the
+ * initiating tab (which drops its own `originId`-tagged SSE echo) still clears
+ * immediately instead of only when the run eventually starts.
+ */
+export function clearOutputsForQueue({
+	nb,
+	cellId,
+	originId,
+	onEvent
+}: {
+	nb: string;
+	cellId: string;
+	originId?: string | null;
+	onEvent?: (event: { type: 'run:cleared'; cellId: string }) => void;
+}): void {
+	clearOutputsLive(cellId, nb);
+	onEvent?.({ type: 'run:cleared', cellId });
+	publish({ type: 'run:cleared', nb, cellId, originId });
 }

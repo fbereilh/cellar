@@ -1,6 +1,6 @@
 import { getCell, setSource, resolveNotebookPath } from '$lib/server/notebook';
 import { enqueueRun } from '$lib/server/run-queue';
-import { executeCellRun } from '$lib/server/run';
+import { executeCellRun, clearOutputsForQueue } from '$lib/server/run';
 
 /**
  * Run one cell. The given source is saved to the document, executed, and its
@@ -54,6 +54,12 @@ export async function POST({ params, request }) {
 				controller.close();
 				return;
 			}
+
+			// Clear the cell's stale output the instant it enters the queue, not when
+			// its turn finally comes. Empties the in-memory doc + broadcasts run:cleared
+			// to other tabs; this tab drops that SSE echo (originId), so `send` clears it
+			// here on its own NDJSON stream.
+			clearOutputsForQueue({ nb: canonicalNb, cellId, originId, onEvent: send });
 
 			try {
 				await ticket.wait();
