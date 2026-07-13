@@ -42,6 +42,14 @@
  *                               already has a live one (power-user escape hatch;
  *                               normally a relaunch reaps + replaces the running one)
  *
+ * Environment:
+ *   CELLAR_ISOLATED=1|true|yes  run isolated (no global registry entry, no
+ *                               reaping, no single-instance lock) — for CI /
+ *                               automated launches that must never see or reap a
+ *                               user's real instance. Applies to every launch in
+ *                               the environment (a superset of --new; --new still
+ *                               registers, isolated does not). Unset = normal.
+ *
  * Single-instance-per-folder + reap: a relaunch in a folder that already has a
  * live cellar TAKES OVER — it reaps the old instance and starts fresh, rather than
  * leaving the old one running with stale in-memory code (the pile-up this fixes:
@@ -52,7 +60,8 @@
  * see instances.js) records every instance so a launch can also reap orphaned
  * children (crashed launcher) and instances of deleted worktrees, and so
  * `cellar ls` / `cellar cleanup` can find and stop them. `--new`/`--force` skips
- * all of this to run a deliberate second instance.
+ * all of this to run a deliberate second instance; `CELLAR_ISOLATED` does the same
+ * and additionally skips the registry entry (so it is invisible to ls/cleanup too).
  */
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
@@ -94,7 +103,8 @@ import {
 	reapInstance,
 	killPid,
 	processStartTime,
-	scanUntrackedCellarProcesses
+	scanUntrackedCellarProcesses,
+	isIsolatedEnv
 } from '../src/lib/server/instances.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -187,9 +197,17 @@ const autoYes = hasFlag('--yes', '-y') || !!process.env.CI || !process.stdin.isT
 // Production build is the default; --dev opts into Vite (--build kept as alias).
 const useDev = hasFlag('--dev') && !hasFlag('--build');
 const writeMcpConfigOptIn = !hasFlag('--no-mcp-config');
+// Isolated mode (env-driven): run fully independent — no global registry entry,
+// no reaping, no single-instance lock — for CI / automated launches that must
+// never see or reap a user's real instance. Set for every launch in the shell,
+// so a test harness needn't remember a flag (see isIsolatedEnv). It is a strict
+// superset of --new: --new skips reap+lock but still registers (so `ls`/`cleanup`
+// see it); isolated additionally skips registerInstance.
+const isolated = isIsolatedEnv();
 // Power-user escape hatch: start a second, independent instance even if one is
 // already live for this folder (normally a relaunch attaches to the running one).
-const forceNew = hasFlag('--new', '--force');
+// Isolated implies it — both skip the reap + single-instance-lock block.
+const forceNew = hasFlag('--new', '--force') || isolated;
 
 // ---- Lifecycle ------------------------------------------------------------
 const children = [];
@@ -386,6 +404,11 @@ Options:
   --no-mcp-config         do not write/merge <workspace>/.mcp.json
   --new / --force         start a second instance in a folder that already has one
 
+Environment:
+  CELLAR_ISOLATED=1       run isolated (no global registry, no reaping) — for
+                          CI / automated launches (applies to every launch; a
+                          superset of --new that also skips registration)
+
 Examples:
   cellar                  start Cellar in the current directory
   cellar ../other-repo    start Cellar scoped to another repo
@@ -481,6 +504,17 @@ async function main() {
 	//    launch REAPS the old instance and takes over, rather than attaching to it.
 	//    An O_EXCL lockfile (claimed before any slow toolchain work) still gates the
 	//    folder so a rapid double-launch can't start two at once.
+	// Announce isolated / independent mode so "why didn't this reap / register?" is
+	// answerable from the log (complements the per-reap + shutdown logging).
+	if (isolated) {
+		console.log(
+			'[cellar] isolated mode (CELLAR_ISOLATED): not registered in the global registry, reaping disabled.'
+		);
+	} else if (forceNew) {
+		console.log(
+			'[cellar] --new: independent instance, reaping disabled (still registered for ls/cleanup).'
+		);
+	}
 	const reapLog = (m) => console.log(m);
 	if (!forceNew) {
 		// Global hygiene (all workspaces): prune fully-dead registry entries, and
@@ -575,20 +609,25 @@ async function main() {
 	writeRuntime(WORKSPACE, { mcpPort, appPort, jupyterPort });
 	// Record in the global registry so a later launch / `cellar ls` / `cellar
 	// cleanup` can discover and reap this instance (child pids filled in after the
-	// sidecar + app spawn below). Registered even under --new so `ls`/`cleanup` see it.
-	registerInstance({
-		launcherPid: process.pid,
-		workspace: WORKSPACE,
-		appPort,
-		mcpPort,
-		jupyterPort,
-		startedAt: Date.now(),
-		// The launcher's real OS start time — the reuse-proof identity a later
-		// reaper compares against before it dares signal this pid. Without it, a
-		// reused pid would be indistinguishable from this instance.
-		launcherStart: processStartTime(process.pid),
-		mode: useDev ? 'dev' : 'build'
-	});
+	// sidecar + app spawn below). Registered even under --new so `ls`/`cleanup` see
+	// it — but NOT under CELLAR_ISOLATED, whose whole point is invisibility: an
+	// isolated instance must never appear in the shared registry (nor let the later
+	// updateInstance calls re-create an entry — they're gated on `isolated` too).
+	if (!isolated) {
+		registerInstance({
+			launcherPid: process.pid,
+			workspace: WORKSPACE,
+			appPort,
+			mcpPort,
+			jupyterPort,
+			startedAt: Date.now(),
+			// The launcher's real OS start time — the reuse-proof identity a later
+			// reaper compares against before it dares signal this pid. Without it, a
+			// reused pid would be indistinguishable from this instance.
+			launcherStart: processStartTime(process.pid),
+			mode: useDev ? 'dev' : 'build'
+		});
+	}
 	if (writeMcpConfigOptIn) {
 		const status = writeMcpConfig(WORKSPACE);
 		console.log(`[cellar] .mcp.json: ${status} (agent connects via \`cellar mcp\`)`);
@@ -616,7 +655,10 @@ async function main() {
 		{ cwd: WORKSPACE, env: { ...process.env, JUPYTER_PATH: jupyterDir }, stdio: ['ignore', 'inherit', 'inherit'] }
 	);
 	children.push(jupyter);
-	updateInstance(process.pid, { jupyterPid: jupyter.pid, jupyterStart: processStartTime(jupyter.pid) });
+	// Skip under isolation — updateInstance would re-create the registry entry we
+	// deliberately never wrote (it falls back to registerInstance when none exists).
+	if (!isolated)
+		updateInstance(process.pid, { jupyterPid: jupyter.pid, jupyterStart: processStartTime(jupyter.pid) });
 	jupyter.on('exit', (c) => {
 		console.error(`[cellar] jupyter sidecar exited (${c})`);
 		shutdown(1, `jupyter sidecar exited (${c})`);
@@ -660,7 +702,7 @@ async function main() {
 		app = spawn('node', [buildEntry], { cwd: REPO, env, stdio: 'inherit' });
 	}
 	children.push(app);
-	updateInstance(process.pid, { appPid: app.pid, appStart: processStartTime(app.pid) });
+	if (!isolated) updateInstance(process.pid, { appPid: app.pid, appStart: processStartTime(app.pid) });
 	app.on('exit', (c) => {
 		console.error(`[cellar] app server exited (${c})`);
 		shutdown(1, `app server exited (${c})`);
