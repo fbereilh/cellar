@@ -60,6 +60,12 @@ export interface NotebookApiHandle {
 	runStale: () => void;
 	/** Regenerate the nbdev-style `.py` module now (manual "Export to .py"). */
 	exportPy: () => Promise<ExportPyResult | null>;
+	/**
+	 * Flush every cell's pending (not-yet-autosaved) edit and let the normal
+	 * PATCH persistence write the notebook now. Resolves once the flushed edits
+	 * are persisted — the Cmd/Ctrl+S save path.
+	 */
+	save: () => Promise<void>;
 }
 
 /**
@@ -94,4 +100,10 @@ export interface CellRegisterApi {
 	cursorOffset: () => number;
 	/** Replace the editor doc through the remote-apply path (caller persists). */
 	replaceSource: (source: string) => void;
+	/**
+	 * Persist this cell's pending edit right now (no debounce/blur wait) and
+	 * resolve once the PATCH settles. A no-op (resolved) when nothing is dirty.
+	 * Drives the notebook's Cmd/Ctrl+S save.
+	 */
+	flush: () => Promise<void>;
 }

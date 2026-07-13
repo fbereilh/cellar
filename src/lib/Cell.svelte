@@ -53,7 +53,7 @@
 		onClear: (id: string) => void;
 		onDelete: (id: string) => void;
 		onMove: (id: string, dir: 'up' | 'down') => void;
-		onEdit: (id: string, source: string, opts?: { keepalive?: boolean }) => void;
+		onEdit: (id: string, source: string, opts?: { keepalive?: boolean }) => void | Promise<void>;
 		onSetType: (id: string, type: LogicalCellType) => void;
 		/** Designate this cell the imports cell ('imports') or un-designate it (null). */
 		onSetRole: (id: string, role: string | null) => void;
@@ -132,12 +132,12 @@
 	 * `keepalive` is only set from the unload path (the browser caps a keepalive
 	 * request body at ~64KB, so normal page-alive saves must not use it).
 	 */
-	function flushEdit({ keepalive = false }: { keepalive?: boolean } = {}) {
+	function flushEdit({ keepalive = false }: { keepalive?: boolean } = {}): void | Promise<void> {
 		clearTimeout(editTimer);
 		if (view && liveSource !== savedSource) {
 			savedSource = liveSource;
 			editPending = false;
-			onEdit(cell.id, liveSource, { keepalive });
+			return onEdit(cell.id, liveSource, { keepalive });
 		}
 	}
 
@@ -743,7 +743,10 @@
 			// `cell.source`), and `cursorOffset` is where a split divides it.
 			currentSource,
 			cursorOffset: () => (view ? view.state.selection.main.head : 0),
-			replaceSource
+			replaceSource,
+			// Persist a pending edit immediately (Cmd/Ctrl+S). Resolves once the
+			// flushed PATCH settles; a clean cell resolves right away.
+			flush: () => Promise.resolve(flushEdit())
 		});
 		// Measure editor content height so a tall code cell auto-collapses. A
 		// ResizeObserver re-measures on content growth AND on the hidden→visible
