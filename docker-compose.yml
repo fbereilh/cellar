@@ -1,0 +1,32 @@
+# Convenience compose file for running Cellar in Docker.
+#
+#   docker compose up          # build (first run) + start; open the printed URL
+#   docker compose up --build  # rebuild after pulling new code
+#   docker compose down        # stop
+#
+# It mounts the CURRENT directory as the workspace, publishes the app + MCP
+# ports, and (optionally) mounts your Databricks config read-only. Everything is
+# single-user local use — Cellar has one shared kernel and no auth.
+services:
+  cellar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/fbereilh/cellar:latest
+    # Mount the project you want to work on. `.` = the dir you run compose from;
+    # override with e.g. `CELLAR_WORKSPACE=/path/to/proj docker compose up`.
+    volumes:
+      - ${CELLAR_WORKSPACE:-.}:/workspace
+      # Databricks (opt-in): UNCOMMENT to mount your config read-only for the
+      # native connector. A Personal Access Token profile works headless; OAuth's
+      # browser flow is awkward in a container. Leave commented if unused — Docker
+      # would otherwise auto-create an empty ~/.databrickscfg directory on the host
+      # when the file doesn't exist.
+      # - ${HOME}/.databrickscfg:/home/cellar/.databrickscfg:ro
+    ports:
+      - "8888:8888"    # app UI  → open http://localhost:8888
+      - "39587:39587"  # MCP     → agents connect to http://localhost:39587/mcp
+    # tini (image ENTRYPOINT) already reaps children; `init: true` is belt-and-
+    # suspenders for clean signal handling on `docker compose down`.
+    init: true
+    stop_grace_period: 15s

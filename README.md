@@ -58,6 +58,53 @@ make setup
 `make setup` installs deps, builds, and links `cellar` onto your PATH. `make update` (or `cellar --update`) pulls and rebuilds; run `make` with no target to list all commands.
 </details>
 
+## Run with Docker
+
+A second way to run Cellar: **only Docker on the host** - no Node, Python, or `uv` to install, and a **reproducible, pinned kernel environment** baked into the image so every run is identical. This is an alternative distribution for single-user, reproducible/zero-prereq use (Cellar has one shared kernel and no auth, so it is **not** for multi-user hosting).
+
+**Zero-prerequisite run.** Build the image once, then run it against any project folder:
+
+```sh
+git clone https://github.com/fbereilh/cellar.git && cd cellar
+docker build -t cellar .
+
+# from the project you want to work on:
+docker run --rm --init \
+  -v "$PWD":/workspace \
+  -p 8888:8888 -p 39587:39587 \
+  cellar
+```
+
+Then open **http://localhost:8888** (the container prints it on startup). Your folder is mounted at `/workspace`; edits, new notebooks, and exports are written straight back to it. `Ctrl-C` (or `docker stop`) shuts it down cleanly.
+
+Or with Compose (mounts the current dir, publishes both ports):
+
+```sh
+docker compose up --build   # then open http://localhost:8888
+```
+
+Once published to a registry you can skip the build entirely:
+
+```sh
+docker run --rm --init -v "$PWD":/workspace -p 8888:8888 -p 39587:39587 ghcr.io/fbereilh/cellar:latest
+```
+
+**The reproducible pinned env.** The image bakes a `uv`-managed virtualenv at `/opt/cellar-kernel` from [`docker/kernel-requirements.txt`](docker/kernel-requirements.txt) (a version-pinned scientific stack: `ipykernel`, `ipywidgets`, `numpy`, `pandas`, `matplotlib`, `scipy`) and binds the Cellar kernel to it. Every container therefore runs the exact same kernel env with no network access at start. To customize:
+
+- **Rebuild with your own pins** (the primary path): edit `docker/kernel-requirements.txt`, then `docker build -t my-cellar .`. Change the base or tool versions with build args, e.g. `--build-arg NODE_IMAGE=node:22-bookworm-slim`.
+- **Ad-hoc extras without a rebuild**: mount a requirements file and point `CELLAR_REQUIREMENTS` at it - `-v "$PWD/requirements.txt":/reqs.txt -e CELLAR_REQUIREMENTS=/reqs.txt` - and the entrypoint installs them into the kernel venv at startup (needs network).
+
+**Connecting an agent.** The MCP endpoint is published on **http://localhost:39587/mcp** (Streamable HTTP). Point an HTTP-capable MCP client at it (the in-container `cellar mcp` stdio bridge isn't used from the host, so the image writes no `.mcp.json` by default - set `-e CELLAR_MCP_CONFIG=1` to opt back in for an agent running *inside* the container).
+
+**Design.** The image is self-contained (Node + `uv` + Python, multi-stage build) rather than based on a `jupyter/docker-stacks` conda image: Cellar is `uv`-first by design (it manages every venv through `uv`), so a conda base would add a second package manager Cellar never uses, and docker-stacks ships no Node. The container runs isolated (`CELLAR_ISOLATED=1` - no host registry or reaper), non-root, with fixed published ports and the app/MCP bound to `0.0.0.0`.
+
+**Caveats (honest).**
+- The kernel environment is the **container's** baked env, not a host `.venv`. Point Cellar at a different env by rebuilding, or with `-e CELLAR_VENV=/workspace/.venv` (it will `uv`-install `ipykernel` there at startup if missing).
+- **Databricks** needs `~/.databrickscfg` mounted read-only (`-v "$HOME/.databrickscfg":/home/cellar/.databrickscfg:ro`, or uncomment the line in `docker-compose.yml`). A **PAT** profile works headless; OAuth's browser flow is awkward in a container.
+- Git blame/diff features need the repo mounted - it is, via `/workspace`.
+- **Linux uid**: files are written as uid 1000 by default. If your host user differs, add `--user "$(id -u):$(id -g)"` so mounted files stay owned by you (macOS Docker Desktop handles this automatically).
+- Single-user only - do not expose the ports beyond `localhost`.
+
 ## Quick start
 
 ```sh
@@ -99,6 +146,8 @@ Open the sidebar's **Databricks** section, pick a profile and cluster, and click
 - **Node 18+**
 - **Python 3.9+**
 - **[`uv`](https://docs.astral.sh/uv/)** on your `PATH` (Cellar uses it for all venv and package management)
+
+Or **just Docker** - see [Run with Docker](#run-with-docker) for a zero-prerequisite, reproducible-env alternative.
 
 ## Testing
 
