@@ -1,10 +1,10 @@
 /**
- * Cellar spike — kernel bridge.
+ * Cellar — kernel bridge.
  *
- * Owns a single long-lived Jupyter kernel connection (one kernel for the whole
- * spike) via @jupyterlab/services over Jupyter's REST + WebSocket protocol.
+ * Owns a single long-lived Jupyter kernel connection (one shared kernel for the
+ * whole app) via @jupyterlab/services over Jupyter's REST + WebSocket protocol.
  *
- * This is the riskiest wiring the spike exists to prove:
+ * The core wiring:
  *   SvelteKit (Node) <-> @jupyterlab/services <-> Jupyter kernel service.
  *
  * Each execute() call streams its own IOPub messages back through an onEvent
