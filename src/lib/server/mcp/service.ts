@@ -20,6 +20,7 @@ import {
 	setVisibility,
 	getActiveNotebookPath,
 	resolveNotebookPath,
+	workspaceRelative,
 	createNotebook as createNotebookDoc,
 	openNotebook as openNotebookDoc,
 	notebookExists
@@ -49,7 +50,98 @@ const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
 const stripAnsi = (s: string): string => (typeof s === 'string' ? s.replace(ANSI, '') : s);
 
 const isHidden = (c: CellView): boolean => c.metadata?.cellar?.hidden_from_agent === true;
-const visibleCells = (): CellView[] => listCells().filter((c) => !isHidden(c));
+const visibleCells = (nb?: string | null): CellView[] => listCells(nb).filter((c) => !isHidden(c));
+
+// --- per-MCP-session working notebook ---------------------------------------
+//
+// The captain runs many agents against ONE Cellar, each on its own notebook.
+// Before this, every agent tool resolved to the single global "active" notebook
+// (getActiveNotebookPath) — which is also the user's focused tab — so two agents
+// could not work two notebooks, and the user switching tabs redirected every
+// agent. The server model underneath is already per-notebook (docs keyed by
+// absolute path; every op accepts an `nb` target); only the MCP tools hard-wired
+// to "active".
+//
+// The fix: each MCP session (one per connected `cellar mcp` stdio bridge, keyed
+// by its Streamable-HTTP `Mcp-Session-Id`, surfaced to every tool call as
+// `extra.sessionId`) may PIN its own working notebook here. Targeting resolves
+// as: explicit per-call `notebook` > this session's pin > the global active
+// notebook (the backward-compatible fallback for a lone agent that never pins).
+// A session's pin is wholly decoupled from the user's focus: switching the user's
+// tab never touches it, and an agent pinning/editing its notebook never steals
+// the user's focus (open/create surface it focus:false).
+const sessionNotebooks = new Map<string, string>(); // mcp sessionId -> absolute notebook path
+
+/** Whether this MCP session has pinned a working notebook. */
+function isPinned(sessionId?: string | null): boolean {
+	return !!(sessionId && sessionNotebooks.has(sessionId));
+}
+
+/**
+ * The absolute notebook path a tool call targets. Precedence:
+ *   1. an explicit per-call `notebook` (a one-off cross-notebook operation),
+ *   2. this session's pinned working notebook,
+ *   3. the global active notebook (the user's focused tab) — the fallback for a
+ *      single agent that never declared a working notebook.
+ * Explicit + pinned targets are resolved to the same canonical absolute id the
+ * `docs` Map and every notebook op key on.
+ */
+export function targetFor(sessionId?: string | null, explicit?: string | null): string {
+	if (explicit != null && String(explicit).trim()) return resolveNotebookPath(explicit);
+	if (sessionId) {
+		const pin = sessionNotebooks.get(sessionId);
+		if (pin) return pin;
+	}
+	return getActiveNotebookPath();
+}
+
+/**
+ * Pin THIS MCP session's working notebook without stealing the user's focus.
+ * Opens the notebook (creating it when it does not exist), records the
+ * session→notebook binding, and surfaces it as an AVAILABLE tab (focus:false) so
+ * an open UI shows it without yanking the user off their current tab. This is how
+ * an agent declares "I am working here"; every subsequent read/write/run from
+ * this session defaults to it, regardless of which tab the user later focuses.
+ */
+export function useNotebook(sessionId: string | undefined, name: string) {
+	let rel = (name ?? '').trim();
+	if (!rel) throw new Error('use_notebook requires a notebook name. Use list_notebooks to see existing notebooks; a name that does not exist yet is created.');
+	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
+	const existed = notebookExists(rel);
+	// createNotebookDoc opens an existing file or creates a new one; focus:false
+	// keeps the user's tab where it is.
+	const nb = createNotebookDoc(rel, null, { focus: false });
+	if (sessionId) sessionNotebooks.set(sessionId, nb.path);
+	return {
+		working_notebook: workspaceRelative(nb.path),
+		path: nb.path,
+		created: !existed,
+		pinned: !!sessionId,
+		cells: cellCount(nb),
+		note: sessionId
+			? 'Pinned as this session\'s working notebook. Your reads/writes/runs now default to it; pass notebook:"other.ipynb" for a one-off cross-notebook op.'
+			: 'Opened, but this connection exposes no session id, so it could not be pinned; operations still default to the active notebook.'
+	};
+}
+
+/**
+ * This session's current working-notebook target, and whether it is a genuine
+ * pin or the active-notebook fallback — so an agent can confirm where its edits
+ * will land, and notice when an unpinned target could move as the user switches
+ * tabs.
+ */
+export function currentNotebook(sessionId?: string) {
+	const pinned = isPinned(sessionId);
+	const abs = targetFor(sessionId);
+	return {
+		working_notebook: workspaceRelative(abs),
+		path: abs,
+		pinned,
+		source: pinned ? 'session_pin' : 'active_fallback',
+		active_notebook: workspaceRelative(getActiveNotebookPath()),
+		...(pinned ? {} : { note: 'No working notebook pinned: defaulting to the user\'s active tab, which moves when they switch tabs. Call use_notebook(name) to pin your own.' })
+	};
+}
 
 function firstLine(src: string, cap = 80): string {
 	const line = (src || '').split('\n').find((l) => l.trim()) ?? '';
@@ -252,8 +344,9 @@ export const kernel = {
  * is currently active. Paths are workspace-relative (what `open_notebook` and
  * `create_notebook` accept).
  */
-export function listNotebooks() {
+export function listNotebooks(sessionId?: string) {
 	const activeAbs = getActiveNotebookPath();
+	const workingAbs = targetFor(sessionId);
 	const paths: string[] = [];
 	// Structural view of an fstree node; the walk only needs these fields.
 	interface TreeNodeLike {
@@ -272,8 +365,16 @@ export function listNotebooks() {
 	walk(tree as TreeNodeLike[]);
 	paths.sort();
 	return {
+		working_notebook: workspaceRelative(workingAbs),
+		notebooks_pinned: isPinned(sessionId),
 		workspace: root,
-		notebooks: paths.map((rel) => ({ path: rel, active: resolveNotebookPath(rel) === activeAbs }))
+		// `active` = the user's focused tab; `working` = THIS session's target (its
+		// pin, or the active notebook when unpinned). They differ whenever an agent
+		// pinned a notebook other than the one the user is looking at.
+		notebooks: paths.map((rel) => {
+			const abs = resolveNotebookPath(rel);
+			return { path: rel, active: abs === activeAbs, working: abs === workingAbs };
+		})
 	};
 }
 
@@ -286,15 +387,18 @@ const cellCount = (nb: { cells?: unknown[] }) => (nb.cells ? nb.cells.length : 0
  * optional). Throws with a create_notebook pointer when it does not exist —
  * open never creates.
  */
-export function openNotebook(name: string) {
+export function openNotebook(sessionId: string | undefined, name: string) {
 	let rel = (name ?? '').trim();
 	if (!rel) throw new Error('open_notebook requires a notebook name. Use list_notebooks to see available notebooks, or create_notebook to make a new one.');
 	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
 	if (!notebookExists(rel)) {
 		throw new Error(`Notebook "${rel}" does not exist. Use list_notebooks to see workspace notebooks, or create_notebook("${rel}") to make a new one.`);
 	}
-	const nb = openNotebookDoc(rel);
-	return { path: nb.path, workspace: nb.workspace, cells: cellCount(nb) };
+	// Opening is this agent declaring "I am working here": pin it as the session's
+	// working notebook, and surface it focus:false so the user's tab is not stolen.
+	const nb = openNotebookDoc(rel, null, { focus: false });
+	if (sessionId) sessionNotebooks.set(sessionId, nb.path);
+	return { working_notebook: workspaceRelative(nb.path), path: nb.path, workspace: nb.workspace, cells: cellCount(nb), pinned: !!sessionId };
 }
 
 /**
@@ -305,11 +409,13 @@ export function openNotebook(name: string) {
  * For opening a notebook you know already exists, prefer open_notebook.
  * Returns its path + cell count.
  */
-export function createNotebook(name?: string) {
+export function createNotebook(sessionId: string | undefined, name?: string) {
 	let rel = (name ?? '').trim() || 'untitled';
 	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
-	const nb = createNotebookDoc(rel);
-	return { path: nb.path, workspace: nb.workspace, cells: cellCount(nb) };
+	// Creating is likewise a declaration of intent: pin it, and don't steal focus.
+	const nb = createNotebookDoc(rel, null, { focus: false });
+	if (sessionId) sessionNotebooks.set(sessionId, nb.path);
+	return { working_notebook: workspaceRelative(nb.path), path: nb.path, workspace: nb.workspace, cells: cellCount(nb), pinned: !!sessionId };
 }
 
 // --- read -------------------------------------------------------------------
@@ -323,9 +429,9 @@ export function createNotebook(name?: string) {
  * status is saved output from an earlier session and nothing those cells define
  * exists in the namespace. `kernel_state` remains the live truth.
  */
-export async function getNotebookMap() {
-	const cells = visibleCells();
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
+export async function getNotebookMap(nb?: string | null) {
+	const cells = visibleCells(nb);
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
 	// A section node holds nested cell/section entries; a cell leaf is a plain record.
 	interface MapSection {
 		id: string;
@@ -362,8 +468,8 @@ export async function getNotebookMap() {
 			(stack.length ? stack[stack.length - 1].node.children : root).push(leaf(c));
 		}
 	}
-	const nb = getNotebook();
-	return { notebook: nb.path, kernel: kernelSession(), databricks: await databricksStatus(), cell_count: cells.length, sections: root };
+	const view = getNotebook(nb);
+	return { notebook: view.path, kernel: kernelSession(), databricks: await databricksStatus(), cell_count: cells.length, sections: root };
 }
 
 /**
@@ -378,8 +484,8 @@ export async function getNotebookMap() {
  * against the same kernel session the namespace was read from, so a restart that
  * destroyed `spark` reads as disconnected here too.
  */
-export async function getKernelState() {
-	const [state, stale, dbx] = await Promise.all([kernelState(), staleCells(), databricksStatus()]);
+export async function getKernelState(nb?: string | null) {
+	const [state, stale, dbx] = await Promise.all([kernelState(), staleCells(nb), databricksStatus()]);
 	return { ...state, databricks: dbx, stale_cells: stale };
 }
 
@@ -402,10 +508,10 @@ export function inspectVariable(name: string) {
  * agent in kernel_state so it can re-run (or distrust) them before relying on
  * their outputs, the same way the UI's stale indicator warns a human.
  */
-async function staleCells() {
-	const { cells }: { cells: StalenessMap } = await getNotebookStaleness();
+async function staleCells(nb?: string | null) {
+	const { cells }: { cells: StalenessMap } = await getNotebookStaleness(nb);
 	const out: Array<{ id: string; reason?: string; upstream?: string[] }> = [];
-	for (const c of visibleCells()) {
+	for (const c of visibleCells(nb)) {
 		const e = cells[c.id];
 		if (e?.state === STALE_STATE.STALE) {
 			out.push({ id: c.id, reason: e.reason, ...(e.upstream?.length ? { upstream: e.upstream } : {}) });
@@ -433,10 +539,10 @@ export const databricks = {
 	preview: (name: string, limit?: number) => previewTable({ name, limit })
 };
 
-export async function readCell(id: string) {
-	const c = getCell(id);
+export async function readCell(id: string, nb?: string | null) {
+	const c = getCell(id, nb);
 	if (!c || isHidden(c)) return null;
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
 	return readForm(c, READ_CAP, sid, stale[id]);
 }
 
@@ -446,11 +552,11 @@ export async function readCell(id: string) {
  * single response against two different kernel sessions — some cells `ok_session`,
  * some `ok_persisted` — for the same kernel state.
  */
-export async function readCells(ids: string[]) {
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
+export async function readCells(ids: string[], nb?: string | null) {
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
 	return ids
 		.map((id) => {
-			const c = getCell(id);
+			const c = getCell(id, nb);
 			if (!c || isHidden(c)) return null;
 			return readForm(c, READ_CAP, sid, stale[id]);
 		})
@@ -463,8 +569,8 @@ export async function readByLocation({ index, position, relativeTo, direction }:
 	position?: 'first' | 'last';
 	relativeTo?: string;
 	direction?: 'prev' | 'next';
-}) {
-	const cells = visibleCells();
+}, nb?: string | null) {
+	const cells = visibleCells(nb);
 	if (!cells.length) return null;
 	let target: CellView | null | undefined = null;
 	if (typeof index === 'number') target = cells[index];
@@ -476,13 +582,13 @@ export async function readByLocation({ index, position, relativeTo, direction }:
 		target = direction === 'prev' ? cells[i - 1] : cells[i + 1];
 	}
 	if (!target) return null;
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
 	return readForm(target, READ_CAP, sid, stale[target.id]);
 }
 
 /** Cells under a markdown header (until the next same-or-higher header). */
-export async function readSection(headerId: string) {
-	const cells = visibleCells();
+export async function readSection(headerId: string, nb?: string | null) {
+	const cells = visibleCells(nb);
 	const idx = cells.findIndex((c) => c.id === headerId);
 	if (idx < 0) return null;
 	const h = headerInfo(cells[idx]);
@@ -494,7 +600,7 @@ export async function readSection(headerId: string) {
 		out.push(cells[i]);
 	}
 	// One sampled epoch + staleness pass for the whole section (see readCells).
-	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness();
+	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
 	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid, stale[c.id])) };
 }
 
@@ -503,7 +609,7 @@ export async function readSection(headerId: string) {
  * an output snippet from a cell that has not run this session was deserialized
  * from the `.ipynb` and describes a namespace that no longer exists.
  */
-export function searchCells(query: string, where: 'input' | 'output' | 'both' = 'both') {
+export function searchCells(query: string, where: 'input' | 'output' | 'both' = 'both', nb?: string | null) {
 	const q = (query || '').toLowerCase();
 	if (!q) return [];
 	const sid = currentSessionId();
@@ -514,7 +620,7 @@ export function searchCells(query: string, where: 'input' | 'output' | 'both' = 
 		const start = Math.max(0, i - 40);
 		return (start > 0 ? '…' : '') + text.slice(start, i + q.length + 40).replace(/\n/g, ' ') + '…';
 	};
-	for (const c of visibleCells()) {
+	for (const c of visibleCells(nb)) {
 		const live = ranThisSession(c, sid);
 		if (where === 'input' || where === 'both') {
 			const s = snippet(c.source || '');
@@ -536,10 +642,10 @@ export function searchCells(query: string, where: 'input' | 'output' | 'both' = 
  * marks the third case: the run could not reach a kernel at all, so despite
  * `ran_this_session: false` the failure is LIVE and blocking, not leftover.
  */
-export function getErrors() {
+export function getErrors(nb?: string | null) {
 	const sid = currentSessionId();
 	const errs: Array<Record<string, unknown>> = [];
-	for (const c of visibleCells()) {
+	for (const c of visibleCells(nb)) {
 		for (const o of c.outputs || []) {
 			if (o.output_type === 'error') {
 				errs.push({
@@ -562,8 +668,8 @@ export function getErrors() {
  * `ran_this_session: false` means these outputs were saved by a PREVIOUS session
  * - they describe a namespace that no longer exists.
  */
-export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium') {
-	const c = getCell(id);
+export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium', nb?: string | null) {
+	const c = getCell(id, nb);
 	if (!c || isHidden(c)) return null;
 	const cap = size === 'full' ? Infinity : MEDIUM_CAP;
 	const outputs: Array<Record<string, unknown>> = (c.outputs || []).map((o) => {
@@ -633,10 +739,10 @@ async function finishImportRouting(nb: string, cellId: string | null, added: str
  * Sweep every module-level import in the active notebook into its imports cell
  * and run it. Idempotent; see `imports-cell.js`.
  */
-export async function consolidate() {
-	const nb = getActiveNotebookPath();
-	autoCheckpointBeforeAgentAction(nb);
-	return consolidateImports(nb, { actor: 'agent' });
+export async function consolidate(nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	autoCheckpointBeforeAgentAction(target);
+	return consolidateImports(target, { actor: 'agent' });
 }
 
 /**
@@ -647,9 +753,9 @@ export async function consolidate() {
  * means "undo last agent action" targets only those automatic pre-action
  * snapshots — never a save point the agent chose to keep.
  */
-export function checkpoint(label?: string) {
-	const nb = getActiveNotebookPath();
-	return createCheckpoint(nb, { trigger: 'manual', label: label || 'Agent checkpoint' });
+export function checkpoint(label?: string, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	return createCheckpoint(target, { trigger: 'manual', label: label || 'Agent checkpoint' });
 }
 
 /**
@@ -663,9 +769,9 @@ export function checkpoint(label?: string) {
 export async function addCells(
 	specs: Array<{ cell_type?: string; source?: string }>,
 	afterId?: string | null,
-	{ routeImports: routeEnabled = true }: { routeImports?: boolean } = {}
+	{ routeImports: routeEnabled = true, nb: nbArg }: { routeImports?: boolean; nb?: string | null } = {}
 ) {
-	const nb = getActiveNotebookPath();
+	const nb = nbArg ?? getActiveNotebookPath();
 	autoCheckpointBeforeAgentAction(nb);
 	const bodies: Array<{ cellType: string; source: string }> = [];
 	const added: string[] = [];
@@ -684,8 +790,8 @@ export async function addCells(
 	let anchor = afterId;
 	const created: string[] = [];
 	for (const body of bodies) {
-		const cell = addCell(anchor, body.cellType as LogicalCellType);
-		if (body.source) setSource(cell.id, body.source);
+		const cell = addCell(anchor, body.cellType as LogicalCellType, nb);
+		if (body.source) setSource(cell.id, body.source, nb);
 		created.push(cell.id);
 		anchor = cell.id;
 	}
@@ -693,8 +799,8 @@ export async function addCells(
 	return { ids: created, ...(imports ? { imports } : {}) };
 }
 
-export async function editCell(id: string, source: string, { routeImports: routeEnabled = true }: { routeImports?: boolean } = {}) {
-	const nb = getActiveNotebookPath();
+export async function editCell(id: string, source: string, { routeImports: routeEnabled = true, nb: nbArg }: { routeImports?: boolean; nb?: string | null } = {}) {
+	const nb = nbArg ?? getActiveNotebookPath();
 	const cell = getCell(id, nb);
 	if (!cell) return null;
 	autoCheckpointBeforeAgentAction(nb);
@@ -707,27 +813,30 @@ export async function editCell(id: string, source: string, { routeImports: route
 	return { ok: true, id, ...(imports ? { imports } : {}) };
 }
 
-export function removeCell(id: string) {
-	if (!getCell(id)) return false;
-	autoCheckpointBeforeAgentAction(getActiveNotebookPath());
-	deleteCell(id);
+export function removeCell(id: string, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	if (!getCell(id, target)) return false;
+	autoCheckpointBeforeAgentAction(target);
+	deleteCell(id, target);
 	return true;
 }
 
-export function moveCell(id: string, pos: number) {
-	autoCheckpointBeforeAgentAction(getActiveNotebookPath());
-	return moveCellTo(id, pos);
+export function moveCell(id: string, pos: number, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	autoCheckpointBeforeAgentAction(target);
+	return moveCellTo(id, pos, target);
 }
 
-export function setType(id: string, type: LogicalCellType) {
-	if (!getCell(id)) return false;
-	autoCheckpointBeforeAgentAction(getActiveNotebookPath());
-	setCellType(id, type);
+export function setType(id: string, type: LogicalCellType, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	if (!getCell(id, target)) return false;
+	autoCheckpointBeforeAgentAction(target);
+	setCellType(id, type, target);
 	return true;
 }
 
-export function setCellVisibility(id: string, hidden: boolean) {
-	return setVisibility(id, hidden);
+export function setCellVisibility(id: string, hidden: boolean, nb?: string | null) {
+	return setVisibility(id, hidden, nb ?? getActiveNotebookPath());
 }
 
 // --- execute ----------------------------------------------------------------
@@ -770,8 +879,8 @@ export function getRunQueue() {
  * outputs. `run_queue` shows the pending list at any time; `interrupt_kernel` /
  * `restart_kernel` drop it, and a dropped run returns `status: "cancelled"`.
  */
-export async function runCell(id: string): Promise<Record<string, unknown> | null> {
-	const nbAtCall = getActiveNotebookPath();
+export async function runCell(id: string, nbArg?: string | null): Promise<Record<string, unknown> | null> {
+	const nbAtCall = nbArg ?? getActiveNotebookPath();
 	const c = getCell(id, nbAtCall);
 	if (!c) return null;
 	// Snapshot before this agent run so it can be undone (throttled: one checkpoint
@@ -832,7 +941,7 @@ export async function runCell(id: string): Promise<Record<string, unknown> | nul
 		// The run may have made downstream cells stale (this one just re-ran) or
 		// cleared this cell's own staleness — surface its fresh verdict so a follow-up
 		// read is not needed just to see whether the run settled it.
-		const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness();
+		const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness(nb);
 		return { id, status, ran_this_session: isLiveSession(session, currentSessionId()), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id]), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and
@@ -859,13 +968,14 @@ export async function runCell(id: string): Promise<Record<string, unknown> | nul
  * `pd` finds it. Source that is nothing BUT imports creates no cell at all: its
  * imports are in the imports cell, and an empty cell beside them is litter.
  */
-export async function addAndRun({ source, cellType = 'code', afterId, routeImports: routeEnabled = true }: {
+export async function addAndRun({ source, cellType = 'code', afterId, routeImports: routeEnabled = true, nb: nbArg }: {
 	source?: string;
 	cellType?: LogicalCellType;
 	afterId?: string | null;
 	routeImports?: boolean;
+	nb?: string | null;
 } = {}) {
-	const nb = getActiveNotebookPath();
+	const nb = nbArg ?? getActiveNotebookPath();
 	const routed = routeOne(source ?? '', nb, { routeEnabled, cellType });
 	const body = routed ? routed.source : (source ?? '');
 	// Run the imports cell BEFORE the new cell, so the code that needs `pd` finds it.
@@ -886,9 +996,9 @@ export async function addAndRun({ source, cellType = 'code', afterId, routeImpor
 		};
 	}
 	// Routing already happened (once), so the add must not route a second time.
-	const { ids } = await addCells([{ cell_type: cellType, source: body }], afterId, { routeImports: false });
+	const { ids } = await addCells([{ cell_type: cellType, source: body }], afterId, { routeImports: false, nb });
 	const id = ids[0];
-	const result = await runCell(id);
+	const result = await runCell(id, nb);
 	return { id, ...result, ...(imports ? { imports } : {}) };
 }
 
@@ -898,11 +1008,12 @@ export async function addAndRun({ source, cellType = 'code', afterId, routeImpor
  * was written against a namespace that no longer exists, so running it would
  * execute cell N+1 without cell N's definitions.
  */
-export async function runCells(ids: string[]) {
+export async function runCells(ids: string[], nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
 	const results: Array<Record<string, unknown>> = [];
 	for (const id of ids) {
-		const r = await runCell(id);
-		const cell = getCell(id);
+		const r = await runCell(id, target);
+		const cell = getCell(id, target);
 		if (r && !(cell && isHidden(cell))) results.push(r);
 		if (r?.status === 'cancelled') break;
 	}
@@ -910,9 +1021,10 @@ export async function runCells(ids: string[]) {
 }
 
 /** Run every code cell in document order; hidden cells run but are omitted from results. */
-export async function runAll() {
-	const ids = listCells().filter((c) => c.cell_type === 'code').map((c) => c.id);
-	return runCells(ids);
+export async function runAll(nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	const ids = listCells(target).filter((c) => c.cell_type === 'code').map((c) => c.id);
+	return runCells(ids, target);
 }
 
 /**
@@ -923,20 +1035,22 @@ export async function runAll() {
  * sync with its current code. Hidden cells run but are omitted from results
  * (same as run_all). Returns the run results plus which cells were run.
  */
-export async function runStale() {
-	const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness();
-	const ids = staleIdsInOrder(listCells(), stale);
-	const results = await runCells(ids);
+export async function runStale(nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness(target);
+	const ids = staleIdsInOrder(listCells(target), stale);
+	const results = await runCells(ids, target);
 	return { ran: ids, results };
 }
 
 /** Run code cells in the inclusive document range from→to. */
-export async function runRange(fromId: string, toId: string) {
-	const all = listCells();
+export async function runRange(fromId: string, toId: string, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	const all = listCells(target);
 	const i = all.findIndex((c) => c.id === fromId);
 	const j = all.findIndex((c) => c.id === toId);
 	if (i < 0 || j < 0) return [];
 	const [lo, hi] = i <= j ? [i, j] : [j, i];
 	const ids = all.slice(lo, hi + 1).filter((c) => c.cell_type === 'code').map((c) => c.id);
-	return runCells(ids);
+	return runCells(ids, target);
 }

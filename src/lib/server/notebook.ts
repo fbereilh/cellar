@@ -264,17 +264,31 @@ export function getActiveNotebookPath(): string {
 }
 
 /**
- * Make `abs` the active notebook and broadcast `notebook:opened` so an
- * already-open shell surfaces/focuses it in a tab with no reload. Shared by
- * `createNotebook` and `openNotebook` so both take the exact same UI path.
+ * Load `abs` and broadcast `notebook:opened` so an already-open shell surfaces it
+ * in a tab with no reload. Shared by `createNotebook` and `openNotebook` so both
+ * take the exact same UI path.
+ *
+ * `focus` controls whether this steals the USER's attention:
+ *   - focus:true  (the human's own open/create) — makes it the active notebook
+ *     AND the browser focuses its tab.
+ *   - focus:false (an agent declaring its working notebook) — the notebook is
+ *     surfaced as an AVAILABLE tab, but the global active pointer and the user's
+ *     focused tab are left untouched. This is the core of the multi-agent
+ *     decoupling: an agent opening its notebook must not yank a user off the tab
+ *     they are working in.
  */
-function activateAndBroadcast(abs: string, originId?: string | null): NotebookView {
-	activePath = abs;
+function activateAndBroadcast(
+	abs: string,
+	originId?: string | null,
+	{ focus = true }: { focus?: boolean } = {}
+): NotebookView {
+	if (focus) activePath = abs;
 	publish({
 		type: 'notebook:opened',
 		nb: abs,
 		relPath: relative(workspace(), abs),
 		name: abs.split(/[/\\]/).pop(),
+		focus,
 		originId
 	});
 	return getNotebook(abs);
@@ -298,7 +312,11 @@ export function notebookExists(nb?: string | null): boolean {
  * the file on disk — including the default notebook, which may exist only in
  * memory from a bare load (loadDoc no longer persists on open).
  */
-export function createNotebook(nb: string, originId?: string | null): NotebookView {
+export function createNotebook(
+	nb: string,
+	originId?: string | null,
+	opts: { focus?: boolean } = {}
+): NotebookView {
 	const abs = resolveAbs(nb);
 	let doc = docs.get(abs);
 	if (!doc) {
@@ -313,7 +331,7 @@ export function createNotebook(nb: string, originId?: string | null): NotebookVi
 	// only existed in memory — loadDoc no longer persists on open). An existing
 	// file is left untouched.
 	if (!existsSync(abs)) persist(doc);
-	return activateAndBroadcast(abs, originId);
+	return activateAndBroadcast(abs, originId, opts);
 }
 
 /**
@@ -322,13 +340,17 @@ export function createNotebook(nb: string, originId?: string | null): NotebookVi
  * workspace-relative `.ipynb` path. Throws `notebook not found` when no live
  * doc and no on-disk file exist — opening never creates (use `createNotebook`).
  */
-export function openNotebook(nb: string, originId?: string | null): NotebookView {
+export function openNotebook(
+	nb: string,
+	originId?: string | null,
+	opts: { focus?: boolean } = {}
+): NotebookView {
 	const abs = resolveAbs(nb);
 	if (!docs.has(abs) && !existsSync(abs)) {
 		throw new Error('notebook not found: ' + relative(workspace(), abs));
 	}
 	loadDoc(abs);
-	return activateAndBroadcast(abs, originId);
+	return activateAndBroadcast(abs, originId, opts);
 }
 
 /**
