@@ -8,8 +8,10 @@
  * up its `model_id` here. Model ids are unique per kernel session, so one global
  * store serves every open notebook.
  *
- * Display-only: we receive kernel→frontend state and render it live; we never
- * send widget interaction back. Purely runtime — nothing here is persisted.
+ * Two-way: we receive kernel→frontend state and render it live, and interactive
+ * widgets send changes back through `$lib/widgetActions` (the values here are
+ * updated optimistically via `setWidgetTrait`, then reconciled by the kernel's
+ * reply over SSE). Purely runtime — nothing here is persisted.
  */
 import { SvelteMap } from 'svelte/reactivity';
 
@@ -22,6 +24,19 @@ const models = new SvelteMap<string, WidgetState>();
 /** The live state for a widget model id, or `undefined` until its comm opens. */
 export function getWidgetState(id: string): WidgetState | undefined {
 	return models.get(id);
+}
+
+/**
+ * Optimistically merge a trait change into the local model — used the instant a
+ * user drives a control, so the readout / thumb follows without waiting for the
+ * POST → kernel → SSE round-trip. The authoritative value still arrives over SSE
+ * (our own broadcast, or a kernel-side clamp) and reconciles on top. No-op for an
+ * unknown model. Writes a fresh object so the `$derived` lookups re-run.
+ */
+export function setWidgetTrait(id: string, patch: WidgetState): void {
+	const cur = models.get(id);
+	if (!cur) return;
+	models.set(id, { ...cur, ...patch });
 }
 
 /** The ipywidgets model class of a state bundle, e.g. `IntProgress`, `HBox`. */
