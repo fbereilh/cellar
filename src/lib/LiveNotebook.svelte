@@ -50,8 +50,9 @@
 		| { type: 'cell:edited'; cellId: string; source: string }
 		| { type: 'notebook:export-target'; target: string | null };
 
-	/** A run-lifecycle event (run:start / run:output / run:end). */
+	/** A run-lifecycle event (run:cleared / run:start / run:output / run:end). */
 	type RunEvent =
+		| { type: 'run:cleared'; cellId?: string }
 		| { type: 'run:start'; cellId?: string; actor?: Actor }
 		| { type: 'run:output'; cellId?: string; output: CellOutput }
 		| { type: 'run:end'; cellId?: string; at?: number; durationMs?: number; actor?: Actor };
@@ -649,7 +650,12 @@
 
 	function applyRunEvent(ev: RunEvent) {
 		const cell = ev.cellId ? findCell(ev.cellId) : undefined;
-		if (ev.type === 'run:start') {
+		if (ev.type === 'run:cleared') {
+			// The cell was just QUEUED (or is starting, when there is no wait): empty its
+			// prior output immediately so it reads as pending-with-no-output under the
+			// "queued · N" badge, instead of lingering until its turn comes.
+			if (cell) cell.outputs = [];
+		} else if (ev.type === 'run:start') {
 			if (cell) {
 				runningId = ev.cellId ?? null;
 				// Only an agent's run earns the viewport; a user run in another tab
@@ -799,7 +805,12 @@
 					buf = buf.slice(nl + 1);
 					if (!line) continue;
 					const ev = JSON.parse(line);
-					if (ev.type === 'run:start') {
+					if (ev.type === 'run:cleared') {
+						// Emitted the instant this run enters the queue (before any wait). Clear
+						// the prior output now so a queued cell shows empty under its "queued · N"
+						// badge, rather than only once the kernel frees and run:start arrives.
+						cell.outputs = [];
+					} else if (ev.type === 'run:start') {
 						// The kernel is ours now (immediately, or after a wait in the queue).
 						// Clear stale output at execution start so the cell reads as
 						// "running, no output yet" until fresh output streams in.

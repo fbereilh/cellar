@@ -29,7 +29,7 @@ import { kernelState, listVariables as _listVariables, inspectVariable as _inspe
 import { agentStatus as databricksStatus, forAgent as databricksCatalog, previewTable } from '../databricks';
 import { publish } from '../events';
 import { enqueueRun, queueState, queuePosition } from '../run-queue';
-import { executeCellRun } from '../run';
+import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree } from '../fstree';
 import { getNotebookStaleness } from '../dataflow';
@@ -800,6 +800,10 @@ export async function runCell(id: string): Promise<Record<string, unknown> | nul
 			? { id, status: 'queued', queue_position: position, note: `already queued at position ${position}; its source was refreshed to the current one. It will run when the kernel frees.` }
 			: { id, status: 'running', queue_position: 0, note: 'already executing in the kernel right now; not enqueued again.' };
 	}
+	// Clear this cell's stale output the moment it is queued (an agent run carries no
+	// originId, so every open tab empties it right away), rather than leaving the
+	// prior output under the "queued · N" badge until the kernel frees.
+	clearOutputsForQueue({ nb, cellId: id });
 	const queuedAt = ticket.queued ? Date.now() : 0;
 	const acceptedPosition = ticket.position;
 	try {
