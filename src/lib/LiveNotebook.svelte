@@ -27,6 +27,8 @@
 		onCellsChange?: (path: string, cells: UICell[]) => void;
 		/** (path, foldedIds, folding): the sidebar Outline renders from this. */
 		onFoldsChange?: (path: string, foldedIds: Set<string>, folding: Folding) => void;
+		/** (path, runningId, queued): the sidebar Outline's per-section run/queue badges. */
+		onRunStateChange?: (path: string, runningId: string | null, queued: Record<string, number>) => void;
 		/** (path, handle|null): lets the Outline drive this notebook's folds. */
 		onRegisterFolds?: (path: string, handle: FoldRegistryHandle | null) => void;
 		/** (path, api|null): lets the sidebar drop a cell in here. */
@@ -79,6 +81,7 @@
 		gitRefresh = 0,
 		onCellsChange,
 		onFoldsChange,
+		onRunStateChange,
 		onRegisterFolds,
 		onRegisterApi,
 		onRunStart,
@@ -166,6 +169,12 @@
 	// Publish the fold state (and let the Outline toggle it) - see `+page.svelte`.
 	$effect(() => {
 		onFoldsChange?.(path, foldedIds, folding);
+	});
+	// Publish the live run/queue state so the sidebar Outline can mark which
+	// section is running / queued. Reads the same `runningId` + `queued` snapshot
+	// the cells render from, so outline and notebook agree by construction.
+	$effect(() => {
+		onRunStateChange?.(path, runningId, queued);
 	});
 	$effect(() => {
 		onRegisterFolds?.(path, { toggle: toggleFold, collapseAll: () => setAllFolded(true), expandAll: () => setAllFolded(false) });
