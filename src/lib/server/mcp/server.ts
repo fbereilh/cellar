@@ -304,6 +304,11 @@ export function startMcpServer() {
 	g.__cellarMcpStarted = true;
 
 	const port = Number(process.env.CELLAR_MCP_PORT || 39587);
+	// Bind loopback by default (a local, single-user tool). In a container the
+	// port is published, and Docker forwards to the container's external
+	// interface, not loopback — so CELLAR_MCP_HOST=0.0.0.0 makes the MCP endpoint
+	// reachable from the host. Opt-in only; nothing changes for a local run.
+	const host = process.env.CELLAR_MCP_HOST || '127.0.0.1';
 	const transports: Record<string, StreamableHTTPServerTransport> = {}; // sessionId -> transport
 
 	const httpServer = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -355,7 +360,8 @@ export function startMcpServer() {
 	});
 
 	httpServer.on('error', (err) => console.error('[cellar-mcp] server error:', err));
-	httpServer.listen(port, '127.0.0.1', () => {
-		console.log(`[cellar-mcp] MCP agent interface on http://127.0.0.1:${port}/mcp`);
+	httpServer.listen(port, host, () => {
+		const shown = host === '0.0.0.0' ? '127.0.0.1' : host;
+		console.log(`[cellar-mcp] MCP agent interface on http://${shown}:${port}/mcp`);
 	});
 }

@@ -49,6 +49,12 @@
  *                               user's real instance. Applies to every launch in
  *                               the environment (a superset of --new; --new still
  *                               registers, isolated does not). Unset = normal.
+ *   CELLAR_APP_PORT / CELLAR_MCP_PORT / CELLAR_JUPYTER_PORT
+ *                               pin these ports instead of picking a free one per
+ *                               run — needed to publish/map them in Docker or any
+ *                               container. Unset = free ephemeral port (default).
+ *   CELLAR_NO_BROWSER=1|true|yes  do not try to open a browser (headless /
+ *                               container launches; the user opens the printed URL).
  *
  * Single-instance-per-folder + reap: a relaunch in a folder that already has a
  * live cellar TAKES OVER — it reaps the old instance and starts fresh, rather than
@@ -276,6 +282,18 @@ function freePort() {
 	});
 }
 
+/**
+ * Resolve a port: honor an explicit `CELLAR_*_PORT` env var when set (fixed,
+ * predictable ports — needed to publish/map them in Docker or any container),
+ * otherwise fall back to a free ephemeral one (the normal per-run behavior, so
+ * concurrent local instances never collide). Unset = unchanged behavior.
+ */
+async function resolvePort(envName) {
+	const v = process.env[envName];
+	if (v && /^\d+$/.test(v)) return Number(v);
+	return freePort();
+}
+
 async function waitFor(url, { headers = {}, timeoutMs = 30000 } = {}) {
 	const start = Date.now();
 	while (Date.now() - start < timeoutMs) {
@@ -300,9 +318,21 @@ function confirm(question) {
 }
 
 async function openBrowser(url) {
+	// Headless / container launches (CELLAR_NO_BROWSER) have no browser to open —
+	// the user opens the printed URL on the host. Skip cleanly.
+	if (/^(1|true|yes)$/i.test(process.env.CELLAR_NO_BROWSER ?? '')) return;
 	const cmd =
 		process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-	spawn(cmd, [url], { stdio: 'ignore', detached: true, shell: process.platform === 'win32' }).unref();
+	const child = spawn(cmd, [url], {
+		stdio: 'ignore',
+		detached: true,
+		shell: process.platform === 'win32'
+	});
+	// A missing opener (e.g. no `xdg-open` in a minimal container) emits an 'error'
+	// event; without this handler Node would throw it as an uncaught exception and
+	// crash the launcher. Opening a browser is best-effort, never fatal.
+	child.on('error', () => {});
+	child.unref();
 }
 
 /**
@@ -594,11 +624,12 @@ async function main() {
 	writeKernelspec(kernelDir, projectPython);
 	console.log(`[cellar] kernel bound to: ${projectPython}`);
 
-	// 4) Ports (app + jupyter already dynamic; MCP now dynamic too — fixes the
-	//    concurrent-instance collision on the previously-fixed 39587).
-	const jupyterPort = await freePort();
-	const appPort = await freePort();
-	const mcpPort = await freePort();
+	// 4) Ports — a free ephemeral port each by default (fixes the concurrent-
+	//    instance collision on the previously-fixed 39587), or a pinned one when
+	//    the matching CELLAR_*_PORT env is set (Docker / container publishing).
+	const jupyterPort = await resolvePort('CELLAR_JUPYTER_PORT');
+	const appPort = await resolvePort('CELLAR_APP_PORT');
+	const mcpPort = await resolvePort('CELLAR_MCP_PORT');
 	const token = randomBytes(24).toString('hex');
 	const jupyterUrl = `http://127.0.0.1:${jupyterPort}`;
 

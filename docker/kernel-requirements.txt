@@ -1,0 +1,20 @@
+# Pinned kernel environment for the Cellar Docker image.
+#
+# These are baked into a uv-managed venv at /opt/cellar-kernel and the Cellar
+# kernel is bound to it (CELLAR_VENV), so EVERY container run gets the exact same
+# reproducible scientific Python stack — no host Python, no per-run installs.
+#
+# To customize: edit these pins and rebuild the image
+#   docker build -t my-cellar .
+# (or mount your own requirements and set CELLAR_REQUIREMENTS at run time — see
+#  the README "Run with Docker" section). Keep everything version-pinned so the
+# image stays reproducible.
+#
+# ipykernel is REQUIRED (it is the kernel Cellar talks to). ipywidgets enables
+# Cellar's interactive widget support. The rest is a sensible default data stack.
+ipykernel==6.29.5
+ipywidgets==8.1.5
+numpy==2.1.3
+pandas==2.2.3
+matplotlib==3.9.2
+scipy==1.14.1
