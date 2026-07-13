@@ -231,6 +231,50 @@ export function computeFolding(cells: readonly HeadingCell[] | null | undefined,
 	return { hidden, segs, counts };
 }
 
+/** Per-heading execution state derived from the live kernel run-queue. */
+export interface SectionRunState {
+	/** foldKeys whose section contains the currently-running cell. */
+	running: Set<string>;
+	/** foldKey → number of queued cells in that section. */
+	queued: Record<string, number>;
+}
+
+/**
+ * Map the live run-queue onto heading sections, for the Outline's running/queued
+ * indicators. A section runs from its heading until the next heading of the same
+ * or higher level, so a code cell belongs to every heading currently *open* above
+ * it (its nearest heading and that heading's ancestors) - which is why a running
+ * cell lights up its whole ancestor chain, and a collapsed parent still shows a
+ * descendant is executing. Only code cells run, so markdown cells only open/close
+ * sections; they never carry run state themselves.
+ *
+ *   running — foldKeys whose section contains `runningId`
+ *   queued  — foldKey → count of `queuedIds` cells in that section (running cell
+ *             excluded by the caller's queue snapshot, which never lists it)
+ */
+export function sectionRunState(
+	cells: readonly HeadingCell[] | null | undefined,
+	runningId: string | null | undefined,
+	queuedIds: ReadonlySet<string> | null | undefined
+): SectionRunState {
+	const running = new Set<string>();
+	const queued: Record<string, number> = {};
+	const stack: { level: number; key: string }[] = []; // open heading occurrences above the cursor
+	for (const cell of cells ?? []) {
+		if (cell.cell_type === 'markdown') {
+			for (const s of splitHeadingSegments(cell.source)) {
+				if (s.level == null) continue;
+				while (stack.length && stack[stack.length - 1].level >= s.level) stack.pop();
+				stack.push({ level: s.level, key: foldKey(cell.id, s.index) });
+			}
+			continue;
+		}
+		if (runningId && cell.id === runningId) for (const h of stack) running.add(h.key);
+		if (queuedIds?.has(cell.id)) for (const h of stack) queued[h.key] = (queued[h.key] ?? 0) + 1;
+	}
+	return { running, queued };
+}
+
 /**
  * The Outline's rows: every heading, nested by level, with the rows a folded
  * ancestor hides dropped. Reads the same `foldedIds` the notebook renders from,

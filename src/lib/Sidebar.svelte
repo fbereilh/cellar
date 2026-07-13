@@ -7,7 +7,7 @@
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
-	import { outlineRows as buildOutlineRows } from '$lib/headings';
+	import { outlineRows as buildOutlineRows, sectionRunState } from '$lib/headings';
 	import { getUi, setUi } from '$lib/uiState';
 	import type { Cell } from '$lib/server/types';
 	import type { TreeNode } from '$lib/server/fstree';
@@ -53,6 +53,10 @@
 		cells: Cell[];
 		foldedIds?: Set<string>;
 		foldCounts?: Record<string, number>;
+		/** The active notebook's currently-running cell (from the shared kernel), or null. */
+		runningId?: string | null;
+		/** The active notebook's queued cells (id → global queue position). */
+		queued?: Record<string, number>;
 		onToggleFold?: (key: string) => void;
 		onCollapseAllFolds?: () => void;
 		onExpandAllFolds?: () => void;
@@ -86,6 +90,10 @@
 		// calls straight into the notebook's `toggleFold`.
 		foldedIds = new Set(),
 		foldCounts = {},
+		// Live run/queue state of the active notebook, mapped onto heading sections
+		// below so the Outline shows which section is executing / has queued cells.
+		runningId = null,
+		queued = {},
 		onToggleFold,
 		// Collapse/expand every heading section at once (the Outline header buttons).
 		// Same shared fold state as `onToggleFold`, driven through the notebook.
@@ -432,6 +440,11 @@
 	// as it does in the notebook, a folded heading hides its subtree in both, and
 	// the two can never disagree about what is collapsed.
 	const outlineRows = $derived(buildOutlineRows(cells, foldedIds, foldCounts));
+	// Which heading section is running / has queued cells, from the live kernel
+	// run-queue. Keyed by the same foldKey as the outline rows, so a row looks up
+	// its own state directly. `running` wins a row's primary indicator; a queued
+	// count can still show alongside (a section may run one cell with more pending).
+	const sectionRun = $derived(sectionRunState(cells, runningId, new Set(Object.keys(queued))));
 
 	// ---- Search (over cell content) -----------------------------------------
 	let query = $state('');
@@ -846,6 +859,31 @@
 						<span class="text-base-content/30">{'#'.repeat(item.level)}</span>
 						{item.title}
 					</button>
+					{#if sectionRun.running.has(item.key)}
+						<!-- A cell in this section is executing: the warning-hued spinner, tying
+						     it to the in-cell running bar. Running wins the primary indicator; a
+						     lingering queued count still shows beside it. -->
+						<span
+							class="mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-[10px] text-warning"
+							data-testid="outline-running"
+							title="Running"
+						>
+							<span class="loading loading-spinner loading-xs h-3 w-3"></span>
+							{#if sectionRun.queued[item.key]}<span class="text-base-content/50">· {sectionRun.queued[item.key]}</span>{/if}
+						</span>
+					{:else if sectionRun.queued[item.key]}
+						<!-- One or more cells in this section are waiting in the kernel queue:
+						     the quieter sibling of the running indicator (amber clock + count). -->
+						<span
+							class="mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-[10px] text-base-content/60"
+							data-testid="outline-queued"
+							data-queued-count={sectionRun.queued[item.key]}
+							title={`${sectionRun.queued[item.key]} ${sectionRun.queued[item.key] === 1 ? 'cell' : 'cells'} queued`}
+						>
+							<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>
+							{sectionRun.queued[item.key]}
+						</span>
+					{/if}
 					{#if item.folded}
 						<span
 							class="mr-1 shrink-0 whitespace-nowrap text-[10px] text-base-content/45"

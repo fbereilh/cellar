@@ -57,6 +57,7 @@
 	hydrateUiState(data.uiState);
 
 	const EMPTY_FOLDS = new Set<string>(); // no notebook active → the Outline folds nothing
+	const EMPTY_QUEUED: Record<string, number> = {}; // no notebook active → nothing queued
 
 	const workspace = data.notebook.workspace;
 	const notebookPath = data.notebook.path;
@@ -86,6 +87,15 @@
 	let notebooksFolds = $state<Record<string, { foldedIds: Set<string>; folding: Folding }>>({}); // path → { foldedIds, folding }
 	function handleFoldsChange(path: string, foldedIds: Set<string>, folding: Folding) {
 		notebooksFolds[path] = { foldedIds, folding };
+	}
+
+	// Live run/queue state per open notebook, reported up by each LiveNotebook from
+	// the shared kernel's `queue:changed` snapshot. The sidebar Outline maps it onto
+	// heading sections (running spinner / queued badge). Assign into the key (never
+	// rebuild the map) for the same loop-avoidance reason as `notebooksFolds`.
+	let notebooksRunState = $state<Record<string, { runningId: string | null; queued: Record<string, number> }>>({});
+	function handleRunStateChange(path: string, runningId: string | null, queued: Record<string, number>) {
+		notebooksRunState[path] = { runningId, queued };
 	}
 	// Imperative, not reactive: a plain map of path → the notebook's fold API
 	// ({toggle, collapseAll, expandAll}). The Outline drives every fold through this.
@@ -231,6 +241,7 @@
 	);
 	const activeCells = $derived((activeNotebookPath && notebooksCells[activeNotebookPath]) || []);
 	const activeFolds = $derived((activeNotebookPath && notebooksFolds[activeNotebookPath]) || null);
+	const activeRunState = $derived((activeNotebookPath && notebooksRunState[activeNotebookPath]) || null);
 
 	// Git blame for the active file's cursor line, shown in the bottom status bar.
 	// Each mounted FileTab reports its own path's line record; the footer reads the
@@ -982,6 +993,8 @@
 					cells={activeCells}
 					foldedIds={activeFolds?.foldedIds ?? EMPTY_FOLDS}
 					foldCounts={activeFolds?.folding?.counts ?? {}}
+					runningId={activeRunState?.runningId ?? null}
+					queued={activeRunState?.queued ?? EMPTY_QUEUED}
 					onToggleFold={toggleActiveFold}
 					onCollapseAllFolds={collapseAllActiveFolds}
 					onExpandAllFolds={expandAllActiveFolds}
@@ -1031,6 +1044,7 @@
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
+						onRunStateChange={handleRunStateChange}
 						onRegisterFolds={registerFolds}
 						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
@@ -1048,6 +1062,7 @@
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
+						onRunStateChange={handleRunStateChange}
 						onRegisterFolds={registerFolds}
 						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
