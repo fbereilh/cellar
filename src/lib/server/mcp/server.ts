@@ -22,12 +22,71 @@ const text = (obj: unknown) => ({ content: [{ type: 'text' as const, text: JSON.
 const notFound = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true });
 
 /**
- * Per-tool-call context the MCP SDK hands every handler as its second argument.
- * `sessionId` is the Streamable-HTTP `Mcp-Session-Id` — stable for the life of one
- * connected `cellar mcp` bridge, so it is the reliable identifier for THIS agent's
- * session. We resolve every notebook-scoped tool's target from it.
+ * Per-tool-call context the MCP SDK hands every handler as its second argument
+ * (`RequestHandlerExtra`). `sessionId` is the Streamable-HTTP `Mcp-Session-Id` —
+ * stable for the life of one connected `cellar mcp` bridge, so it is the reliable
+ * identifier for THIS agent's session; we resolve every notebook-scoped tool's
+ * target from it. `_meta.progressToken` + `sendNotification` are what a
+ * long-running tool uses to keep the call alive (see `withProgress`).
  */
-type ToolExtra = { sessionId?: string };
+type ToolExtra = {
+	sessionId?: string;
+	_meta?: { progressToken?: string | number };
+	sendNotification?: (notification: {
+		method: 'notifications/progress';
+		params: { progressToken: string | number; progress: number; total?: number; message?: string };
+	}) => Promise<void>;
+};
+
+/**
+ * How often a long-running run tool emits an MCP progress notification while it
+ * waits for the kernel. It exists ONLY to keep the client's per-tool-call timeout
+ * from firing on a slow cell (Claude Code's default is ~60s), so it must be
+ * comfortably under that: at 15s a 60s-timeout client gets three resets before it
+ * would have given up. Exported for the unit test.
+ */
+export const PROGRESS_INTERVAL_MS = 15_000;
+
+/**
+ * Run a long-running tool body while emitting periodic MCP progress
+ * notifications, so the call never goes silent and trips the MCP CLIENT's
+ * per-tool-call timeout (the killer: a cell that runs longer than ~60s makes the
+ * agent's client give up and DISCARD the eventual result, even though the run
+ * finishes server-side). A client that requested progress sets a `progressToken`
+ * in the request `_meta`; each notification we send against it resets that
+ * client's timeout (when it enables `resetTimeoutOnProgress`, as Claude Code
+ * does) and keeps the connection alive, so the FINAL result is delivered when the
+ * run completes. The tool's contract is unchanged — it still returns the full
+ * result at the end; it just no longer goes quiet in the meantime.
+ *
+ * A wall-clock heartbeat, deliberately NOT tied to the run's output stream: the
+ * canonical hang is `time.sleep(90)`, which emits nothing until it finishes, so
+ * an output-driven ping would never fire. If the client sent no progressToken
+ * (it did not ask for progress) this is a no-op passthrough — we never push
+ * unsolicited notifications. Any send error is swallowed (a dropped heartbeat
+ * must never fail the run), and the timer is `unref`'d so it can't keep the
+ * process alive on its own.
+ */
+export async function withProgress<T>(extra: ToolExtra | undefined, fn: () => Promise<T>): Promise<T> {
+	const progressToken = extra?._meta?.progressToken;
+	const send = extra?.sendNotification;
+	if (progressToken === undefined || !send) return fn();
+	const startedAt = Date.now();
+	let progress = 0;
+	const timer = setInterval(() => {
+		progress += 1;
+		const seconds = Math.round((Date.now() - startedAt) / 1000);
+		// progress must be monotonically increasing (MCP spec); total is unknown for
+		// an open-ended run, so we omit it and carry the elapsed time in `message`.
+		send({ method: 'notifications/progress', params: { progressToken, progress, message: `running… ${seconds}s` } }).catch(() => {});
+	}, PROGRESS_INTERVAL_MS);
+	timer.unref?.();
+	try {
+		return await fn();
+	} finally {
+		clearInterval(timer);
+	}
+}
 
 /**
  * The absolute notebook a tool call targets: an explicit per-call `notebook`
@@ -318,12 +377,12 @@ function registerTools(server: McpServer) {
 	server.registerTool('set_cell_visibility', { description: 'Show/hide a cell from the agent (cellar.hidden_from_agent).' + NOTEBOOK_PARAM_DOC, inputSchema: { id: z.string(), hidden: z.boolean(), ...notebookParam } }, async ({ id, hidden, notebook }, extra: ToolExtra) => (svc.setCellVisibility(id, hidden, targetOf(extra, notebook)) ? text({ ok: true, id, hidden }) : notFound(`cell ${id} not found`)));
 
 	// --- execute ---
-	server.registerTool('add_and_run', { description: `PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|sql|markdown cell (default code) with the given source, after a cell (after_id) or appended at the end, runs it, and returns run_cell's result (status + outputs) plus the new cell id. Code that raises returns the error as the result (does not fail — the cell still exists). A markdown cell_type is created AND rendered (markdown does not execute on the kernel - running it renders it, status "rendered"); this is the way to add markdown so it shows rendered rather than raw source. Use add_cell (no run) only when you want to add a cell WITHOUT running/rendering it.${ROUTE_IMPORTS_DOC} Routing happens BEFORE this cell runs, so an import it needs is already in the kernel. Source that is ONLY imports creates no cell at all (they go straight to the imports cell) and returns routed_to_imports:true.${NOTEBOOK_PARAM_DOC}`, inputSchema: { source: z.string(), cell_type: z.enum(['code', 'sql', 'markdown']).optional(), after_id: z.string().optional(), route_imports: z.boolean().optional(), ...notebookParam } }, async ({ source, cell_type, after_id, route_imports, notebook }, extra: ToolExtra) => text(await svc.addAndRun({ source, cellType: cell_type, afterId: after_id, routeImports: route_imports ?? true, nb: targetOf(extra, notebook) })));
-	server.registerTool('run_cell', { description: 'Run one cell by UUID. Running a markdown cell RENDERS it (no code executes) and returns status "rendered"; use this (or add_and_run) so markdown shows rendered rather than raw source. Your notebook\'s kernel runs one cell at a time: if IT is busy your run is QUEUED (never dropped) and this call waits its turn, then returns the real outputs annotated queued:true + queue_position + waited_ms. A run in another notebook never queues this one (parallel kernels). If that cell is ALREADY queued (or running) it is not enqueued twice - the call returns immediately with status "queued" (or "running") and its queue_position; a pending run has its source refreshed to the current one. status "cancelled" means an interrupt/restart dropped the queued run before it started; nothing executed. See run_queue.' + NOTEBOOK_PARAM_DOC, inputSchema: { id: z.string(), ...notebookParam } }, async ({ id, notebook }, extra: ToolExtra) => { const r = await svc.runCell(id, targetOf(extra, notebook)); return r ? text(r) : notFound(`cell ${id} not found`); });
-	server.registerTool('run_cells', { description: 'Run multiple cells in order, each waiting its turn in the kernel queue. Stops at the first cell whose queued run an interrupt/restart cancelled (status "cancelled") - the rest would run against a namespace their predecessors never populated.' + NOTEBOOK_PARAM_DOC, inputSchema: { ids: z.array(z.string()), ...notebookParam } }, async ({ ids, notebook }, extra: ToolExtra) => text(await svc.runCells(ids, targetOf(extra, notebook))));
-	server.registerTool('run_all', { description: 'Run all code cells in document order (same queueing + cancellation semantics as run_cells).' + NOTEBOOK_PARAM_DOC, inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await svc.runAll(targetOf(extra, notebook))));
-	server.registerTool('run_stale', { description: 'Re-run every STALE code cell (a cell that ran this session but whose inputs changed since) in dependency order, bringing the notebook back in sync with its current code. Returns {ran:[ids], results}. Use this after editing an upstream cell instead of hunting down every downstream cell by hand; see stale_cells in kernel_state / stale_state in get_notebook_map for what is stale. Same queueing + cancellation semantics as run_cells.' + NOTEBOOK_PARAM_DOC, inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await svc.runStale(targetOf(extra, notebook))));
-	server.registerTool('run_range', { description: 'Run code cells in the inclusive range from one cell to another (same queueing + cancellation semantics as run_cells).' + NOTEBOOK_PARAM_DOC, inputSchema: { from_id: z.string(), to_id: z.string(), ...notebookParam } }, async ({ from_id, to_id, notebook }, extra: ToolExtra) => text(await svc.runRange(from_id, to_id, targetOf(extra, notebook))));
+	server.registerTool('add_and_run', { description: `PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|sql|markdown cell (default code) with the given source, after a cell (after_id) or appended at the end, runs it, and returns run_cell's result (status + outputs) plus the new cell id. Code that raises returns the error as the result (does not fail — the cell still exists). A markdown cell_type is created AND rendered (markdown does not execute on the kernel - running it renders it, status "rendered"); this is the way to add markdown so it shows rendered rather than raw source. Use add_cell (no run) only when you want to add a cell WITHOUT running/rendering it.${ROUTE_IMPORTS_DOC} Routing happens BEFORE this cell runs, so an import it needs is already in the kernel. Source that is ONLY imports creates no cell at all (they go straight to the imports cell) and returns routed_to_imports:true.${NOTEBOOK_PARAM_DOC}`, inputSchema: { source: z.string(), cell_type: z.enum(['code', 'sql', 'markdown']).optional(), after_id: z.string().optional(), route_imports: z.boolean().optional(), ...notebookParam } }, async ({ source, cell_type, after_id, route_imports, notebook }, extra: ToolExtra) => text(await withProgress(extra, () => svc.addAndRun({ source, cellType: cell_type, afterId: after_id, routeImports: route_imports ?? true, nb: targetOf(extra, notebook) }))));
+	server.registerTool('run_cell', { description: 'Run one cell by UUID. Running a markdown cell RENDERS it (no code executes) and returns status "rendered"; use this (or add_and_run) so markdown shows rendered rather than raw source. Your notebook\'s kernel runs one cell at a time: if IT is busy your run is QUEUED (never dropped) and this call waits its turn, then returns the real outputs annotated queued:true + queue_position + waited_ms. A run in another notebook never queues this one (parallel kernels). If that cell is ALREADY queued (or running) it is not enqueued twice - the call returns immediately with status "queued" (or "running") and its queue_position; a pending run has its source refreshed to the current one. status "cancelled" means an interrupt/restart dropped the queued run before it started; nothing executed. See run_queue.' + NOTEBOOK_PARAM_DOC, inputSchema: { id: z.string(), ...notebookParam } }, async ({ id, notebook }, extra: ToolExtra) => { const r = await withProgress(extra, () => svc.runCell(id, targetOf(extra, notebook))); return r ? text(r) : notFound(`cell ${id} not found`); });
+	server.registerTool('run_cells', { description: 'Run multiple cells in order, each waiting its turn in the kernel queue. Stops at the first cell whose queued run an interrupt/restart cancelled (status "cancelled") - the rest would run against a namespace their predecessors never populated.' + NOTEBOOK_PARAM_DOC, inputSchema: { ids: z.array(z.string()), ...notebookParam } }, async ({ ids, notebook }, extra: ToolExtra) => text(await withProgress(extra, () => svc.runCells(ids, targetOf(extra, notebook)))));
+	server.registerTool('run_all', { description: 'Run all code cells in document order (same queueing + cancellation semantics as run_cells).' + NOTEBOOK_PARAM_DOC, inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await withProgress(extra, () => svc.runAll(targetOf(extra, notebook)))));
+	server.registerTool('run_stale', { description: 'Re-run every STALE code cell (a cell that ran this session but whose inputs changed since) in dependency order, bringing the notebook back in sync with its current code. Returns {ran:[ids], results}. Use this after editing an upstream cell instead of hunting down every downstream cell by hand; see stale_cells in kernel_state / stale_state in get_notebook_map for what is stale. Same queueing + cancellation semantics as run_cells.' + NOTEBOOK_PARAM_DOC, inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await withProgress(extra, () => svc.runStale(targetOf(extra, notebook)))));
+	server.registerTool('run_range', { description: 'Run code cells in the inclusive range from one cell to another (same queueing + cancellation semantics as run_cells).' + NOTEBOOK_PARAM_DOC, inputSchema: { from_id: z.string(), to_id: z.string(), ...notebookParam } }, async ({ from_id, to_id, notebook }, extra: ToolExtra) => text(await withProgress(extra, () => svc.runRange(from_id, to_id, targetOf(extra, notebook)))));
 
 	// --- databricks (read-only; connecting stays a human action in the sidebar) ---
 	server.registerTool('databricks_status', { description: 'Whether a Databricks Connect session is LIVE in YOUR working notebook\'s kernel, and against which profile/cluster/host. Each notebook has its OWN kernel and its OWN Databricks session, so this reports your notebook\'s connection - another notebook may be connected to a different cluster, or not at all. When connected:true, `spark` (a Spark session on that cluster) and `w` (a databricks.sdk WorkspaceClient) are bound in the kernel namespace and verified reachable - use them directly instead of writing connection boilerplate. Liveness is checked with a cheap cached `SELECT 1` probe (short TTL, skipped while the kernel is busy), so a session that expired server-side (idle timeout / cluster GC) is caught even though `spark` is still bound. On expiry Cellar AUTO-RECONNECTS against the same profile+cluster: a healed response is connected:true with reconnected:true (re-run any cell that failed with SESSION_CLOSED). If auto-reconnect fails it returns connected:false with expired:true - ask the user to reconnect from the Databricks sidebar, then re-run. connected:true with liveness_unverified:true means liveness could not be confirmed (kernel busy or a transient error), not that it is dead. connected:false without expired means no session at all: ask the user to connect. May run a tiny kernel probe; never boots a kernel. The same block appears in kernel_state and get_notebook_map.' + NOTEBOOK_PARAM_DOC, inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await svc.databricks.status(targetOf(extra, notebook))));
@@ -420,6 +479,15 @@ export function startMcpServer() {
 		}
 	});
 
+	// A run tool holds its POST response open for the ENTIRE cell run (streaming
+	// progress notifications meanwhile), which for a long cell is minutes. Node's
+	// default `requestTimeout` (300s) is measured from first byte to the request
+	// being fully RECEIVED — the body here arrives at once, so it would not cut a
+	// long response — but disable it (and the socket idle `timeout`) explicitly so
+	// no future default can silently cap a legitimate long-lived run. Safe for a
+	// local single-user endpoint; progress traffic keeps the socket live anyway.
+	httpServer.requestTimeout = 0;
+	httpServer.timeout = 0;
 	httpServer.on('error', (err) => console.error('[cellar-mcp] server error:', err));
 	httpServer.listen(port, host, () => {
 		const shown = host === '0.0.0.0' ? '127.0.0.1' : host;
