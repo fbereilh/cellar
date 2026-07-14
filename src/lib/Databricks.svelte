@@ -74,17 +74,33 @@
 	}
 
 	let {
-		/** Kernel session epoch. A change means a restart replaced the namespace → `spark` is gone. */
+		/**
+		 * The ACTIVE notebook's absolute path. Databricks is per-notebook - `spark`/`w`
+		 * live in each notebook's own kernel - so the panel reflects (and connect/
+		 * disconnect act on) whichever notebook the user has focused. Null when no
+		 * notebook tab is open, in which case requests target the server default.
+		 */
+		notebookPath = null,
+		/**
+		 * The active notebook's kernel session epoch. A change means that notebook's
+		 * kernel restarted and replaced its namespace → its `spark` is gone; re-read.
+		 */
 		kernelSessionId = null,
 		/** Insert a code cell into the active notebook and run it. Null when no notebook is open. */
 		onInsertAndRun = null,
 		/** Called after a successful connect/disconnect so the shell refreshes its kernel + variables. */
 		onSessionChange = null
 	}: {
+		notebookPath?: string | null;
 		kernelSessionId?: SessionId | null;
 		onInsertAndRun?: ((source: string) => void) | null;
 		onSessionChange?: (() => void) | null;
 	} = $props();
+
+	/** Query string carrying the active notebook path, so every per-notebook request targets it. */
+	function pathQuery(): string {
+		return notebookPath ? `?path=${encodeURIComponent(notebookPath)}` : '';
+	}
 
 	/** Normalize a thrown value (a route body, or an Error) into `{code, message}`. */
 	function toDbxError(err: unknown): DbxError {
@@ -160,7 +176,7 @@
 	async function loadStatus() {
 		const seq = ++statusSeq;
 		try {
-			const res = await fetch('/api/databricks');
+			const res = await fetch(`/api/databricks${pathQuery()}`);
 			const body = await res.json();
 			if (!res.ok) throw new Error(body?.message || 'failed to read Databricks status');
 			if (seq !== statusSeq) return; // superseded while in flight
@@ -186,18 +202,25 @@
 		});
 	});
 
-	// A new kernel session means a restarted namespace: whatever `spark` was, it is
-	// gone. Re-read rather than guess - the server decides, from the same epoch.
-	// `lastSession` is deliberately NOT `$state`: this effect must depend on the
-	// epoch alone. Reading `status` here (which `loadStatus` writes) would loop.
+	// Re-read the connection whenever the FOCUSED notebook changes (Databricks is
+	// per-notebook, so the panel must switch to that notebook's session) OR its
+	// kernel session epoch changes (a restart replaced the namespace: whatever
+	// `spark` was, it is gone). The server decides from the per-notebook epoch.
+	// `lastKey`/`lastSession` are deliberately NOT `$state`: this effect must depend
+	// on the path + epoch alone. Reading `status` here (which `loadStatus` writes)
+	// would loop.
+	let lastKey: string | null | undefined;
 	let lastSession: SessionId | null | undefined;
 	$effect(() => {
+		const key = notebookPath;
 		const sid = kernelSessionId;
-		if (lastSession === undefined) {
-			lastSession = sid; // onMount already loaded the first status
+		if (lastKey === undefined) {
+			lastKey = key; // onMount already loaded the first status
+			lastSession = sid;
 			return;
 		}
-		if (lastSession === sid) return;
+		if (lastKey === key && lastSession === sid) return;
+		lastKey = key;
 		lastSession = sid;
 		loadStatus();
 	});
@@ -309,7 +332,7 @@
 			const res = await fetch('/api/databricks/connect', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ ...selectionParams(), clusterId: cluster.cluster_id, clusterName: cluster.name })
+				body: JSON.stringify({ ...selectionParams(), clusterId: cluster.cluster_id, clusterName: cluster.name, path: notebookPath ?? undefined })
 			});
 			const body = await res.json();
 			if (!res.ok) throw body;
@@ -329,7 +352,7 @@
 		busy = 'disconnect';
 		connectError = null;
 		try {
-			const res = await fetch('/api/databricks/connect', { method: 'DELETE' });
+			const res = await fetch(`/api/databricks/connect${pathQuery()}`, { method: 'DELETE' });
 			if (!res.ok) throw await res.json();
 			resetBrowser();
 			await loadStatus();

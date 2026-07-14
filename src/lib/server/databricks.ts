@@ -80,7 +80,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execute, currentSessionId, kernelStatus } from './kernel';
-import { getActiveNotebookPath } from './notebook';
+import { resolveNotebookPath } from './notebook';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
@@ -775,8 +775,13 @@ export async function checkInstall(): Promise<InstallStatus> {
 	return { python, sdk: !!result.sdk, connect: !!result.connect, sdkVersion: result.sdk_version, connectVersion: result.connect_version };
 }
 
-/** Everything the sidebar needs to render before a connection exists. */
-export async function getStatus() {
+/**
+ * Everything the sidebar needs to render before a connection exists. `nb` is the
+ * notebook whose connection to report - the sidebar passes the ACTIVE notebook,
+ * so the panel always reflects the focused notebook's Databricks session. The
+ * profiles/install/uv fields are workspace-level and notebook-independent.
+ */
+export async function getStatus(nb?: string | null) {
 	const { configPath: path, exists, profiles, error } = readProfiles();
 	let install: InstallStatus = { python: projectPython(), sdk: false, connect: false };
 	let installError: string | null = null;
@@ -791,7 +796,7 @@ export async function getStatus() {
 		installError,
 		uv: await hasUv(),
 		signedInHosts: [...signedInHosts],
-		connection: connectionStatus()
+		connection: connectionStatus(nb)
 	};
 }
 
@@ -1012,15 +1017,15 @@ export function isSessionClosed(message: unknown): boolean {
  * session was actually built in, and `connectionStatus()` correctly reports it
  * as gone rather than pairing a fresh namespace with a `spark` it never got.
  */
-async function runInKernel(code: string): Promise<{ result: ProbeResult; session: SessionId | null }> {
+async function runInKernel(nb: string, code: string): Promise<{ result: ProbeResult; session: SessionId | null }> {
 	let stdout = '';
 	let kernelError: string | null = null;
 	let session: SessionId | null = null;
 	try {
-		// Databricks binds `spark`/`w` into the ACTIVE notebook's kernel (per-notebook
-		// Databricks is a later phase); the epoch we stamp comes from that kernel.
+		// Databricks binds `spark`/`w` into THIS notebook's own kernel (each notebook
+		// has its own kernel + Databricks session); the epoch we stamp comes from it.
 		await execute(
-			getActiveNotebookPath(),
+			nb,
 			code,
 			(ev: RunStreamEvent) => {
 				if (ev.type === 'kernel') {
@@ -1055,19 +1060,6 @@ async function runInKernel(code: string): Promise<{ result: ProbeResult; session
 }
 
 /**
- * The live connection, or null. `session` is the kernel epoch `spark` was built
- * in - see the module header: it is the only thing that can tell "connected"
- * from "connected before someone restarted the kernel".
- */
-let connection: ConnectionInfo | null = null;
-/** The `{profile}|{host}` selection the live connection was built from (for `forAgent` listings). */
-let connectedSel: Selection | null = null;
-/** The connection a kernel restart took from us, kept so the UI can say so. */
-let lost: LostConnection | null = null;
-/** One connect/disconnect at a time: both mutate the same kernel namespace. */
-let inFlight = false;
-
-/**
  * The cached result of the last liveness probe. `agentStatus()` reads it instead
  * of re-pinging the workspace on every call: a probe is only re-run when the
  * cache is missing, stale (older than `LIVENESS_TTL_MS`), or from a different
@@ -1081,11 +1073,55 @@ interface Liveness {
 	checkedAt: number;
 	message?: string;
 }
-let liveness: Liveness | null = null;
-/** In-flight probe, so concurrent status reads share one `SELECT 1`, not N. */
-let livenessInFlight: Promise<Liveness> | null = null;
-/** In-flight auto-reconnect, so a burst of expired-status reads heals once. */
-let reconnecting: Promise<boolean> | null = null;
+
+/**
+ * Per-notebook Databricks connection state. `spark`/`w` live in a notebook's own
+ * kernel namespace (each notebook has its own kernel — see the kernel manager),
+ * so each notebook holds an INDEPENDENT Databricks Connect session: notebook A
+ * can be connected to cluster X while B is unconnected or on cluster Y, and
+ * restarting A's kernel drops only A's session (its epoch bumps, which
+ * `connectionStatus(nb)` reconciles against). The state is therefore keyed by
+ * the notebook's absolute path, never a module singleton.
+ */
+interface ConnState {
+	/**
+	 * The live connection, or null. `session` is the kernel epoch `spark` was built
+	 * in - see the module header: it is the only thing that can tell "connected"
+	 * from "connected before someone restarted the kernel".
+	 */
+	connection: ConnectionInfo | null;
+	/** The `{profile}|{host}` selection the live connection was built from (for `forAgent` listings). */
+	connectedSel: Selection | null;
+	/** The connection a kernel restart took from us, kept so the UI can say so. */
+	lost: LostConnection | null;
+	/** One connect/disconnect at a time PER NOTEBOOK: both mutate that kernel's namespace. */
+	inFlight: boolean;
+	liveness: Liveness | null;
+	/** In-flight probe, so concurrent status reads for one notebook share one `SELECT 1`, not N. */
+	livenessInFlight: Promise<Liveness> | null;
+	/** In-flight auto-reconnect for one notebook, so a burst of expired-status reads heals once. */
+	reconnecting: Promise<boolean> | null;
+}
+
+const states = new Map<string, ConnState>();
+
+/** The connection state for a notebook, created empty on first touch. Keyed by absolute path. */
+function stateFor(nb: string): ConnState {
+	let s = states.get(nb);
+	if (!s) {
+		s = {
+			connection: null,
+			connectedSel: null,
+			lost: null,
+			inFlight: false,
+			liveness: null,
+			livenessInFlight: null,
+			reconnecting: null
+		};
+		states.set(nb, s);
+	}
+	return s;
+}
 
 /** How long a liveness probe result is trusted before it must be refreshed. */
 const LIVENESS_TTL_MS = 15_000;
@@ -1099,15 +1135,17 @@ const LIVENESS_TTL_MS = 15_000;
  * the frequently-polled sidebar. The server-side liveness check lives in
  * `agentStatus()`, which is what the agent surface reads.
  */
-export function connectionStatus(): ConnectionStatus {
-	if (connection && connection.session !== currentSessionId()) {
-		lost = { profile: connection.profile, clusterName: connection.clusterName };
-		connection = null;
-		connectedSel = null;
-		liveness = null;
+export function connectionStatus(nb?: string | null): ConnectionStatus {
+	const abs = resolveNotebookPath(nb);
+	const s = stateFor(abs);
+	if (s.connection && s.connection.session !== currentSessionId(abs)) {
+		s.lost = { profile: s.connection.profile, clusterName: s.connection.clusterName };
+		s.connection = null;
+		s.connectedSel = null;
+		s.liveness = null;
 	}
-	if (!connection) return { connected: false, ...(lost ? { lost } : {}) };
-	return { connected: true, ...connection };
+	if (!s.connection) return { connected: false, ...(s.lost ? { lost: s.lost } : {}) };
+	return { connected: true, ...s.connection };
 }
 
 /**
@@ -1117,12 +1155,13 @@ export function connectionStatus(): ConnectionStatus {
  * caller (`agentStatus`) skips it entirely when the kernel is busy rather than
  * queue behind a running cell.
  */
-async function probeLiveness(session: SessionId | null): Promise<Liveness> {
-	if (livenessInFlight) return livenessInFlight;
-	livenessInFlight = (async () => {
+async function probeLiveness(nb: string, session: SessionId | null): Promise<Liveness> {
+	const s = stateFor(nb);
+	if (s.livenessInFlight) return s.livenessInFlight;
+	s.livenessInFlight = (async () => {
 		let live: Liveness;
 		try {
-			const { result, session: ran } = await runInKernel(PING_CODE);
+			const { result, session: ran } = await runInKernel(nb, PING_CODE);
 			const r = result as ProbeResult & { alive?: boolean; expired?: boolean; message?: string };
 			live = {
 				session: ran ?? session,
@@ -1143,13 +1182,13 @@ async function probeLiveness(session: SessionId | null): Promise<Liveness> {
 				message: err instanceof Error ? err.message : String(err)
 			};
 		}
-		liveness = live;
+		s.liveness = live;
 		return live;
 	})();
 	try {
-		return await livenessInFlight;
+		return await s.livenessInFlight;
 	} finally {
-		livenessInFlight = null;
+		s.livenessInFlight = null;
 	}
 }
 
@@ -1161,21 +1200,23 @@ async function probeLiveness(session: SessionId | null): Promise<Liveness> {
  * above, so this can only ever heal a same-epoch, server-side expiry. Concurrent
  * callers share one attempt.
  */
-async function autoReconnect(): Promise<boolean> {
-	if (reconnecting) return reconnecting;
-	const conn = connection;
-	const sel = connectedSel;
+async function autoReconnect(nb: string): Promise<boolean> {
+	const s = stateFor(nb);
+	if (s.reconnecting) return s.reconnecting;
+	const conn = s.connection;
+	const sel = s.connectedSel;
 	if (!conn || !sel) return false;
-	reconnecting = (async () => {
+	s.reconnecting = (async () => {
 		try {
 			logInfo('databricks', `Spark Connect session expired; auto-reconnecting cluster "${conn.clusterName}"`);
 			await connect({
 				profile: sel.profile ?? null,
 				host: sel.host ?? null,
 				clusterId: conn.clusterId,
-				clusterName: conn.clusterName
+				clusterName: conn.clusterName,
+				nb
 			});
-			liveness = { session: currentSessionId(), alive: true, expired: false, checkedAt: Date.now() };
+			s.liveness = { session: currentSessionId(nb), alive: true, expired: false, checkedAt: Date.now() };
 			logInfo('databricks', 'Databricks auto-reconnect succeeded');
 			return true;
 		} catch (err) {
@@ -1183,8 +1224,8 @@ async function autoReconnect(): Promise<boolean> {
 			logWarn('databricks', `Databricks auto-reconnect failed: ${detail}`);
 			// Cache the failed-heal so a burst of status reads does not hammer the
 			// cluster with reconnect attempts; the TTL lets it retry later.
-			liveness = {
-				session: currentSessionId(),
+			s.liveness = {
+				session: currentSessionId(nb),
 				alive: false,
 				expired: true,
 				checkedAt: Date.now(),
@@ -1192,10 +1233,10 @@ async function autoReconnect(): Promise<boolean> {
 			};
 			return false;
 		} finally {
-			reconnecting = null;
+			s.reconnecting = null;
 		}
 	})();
-	return reconnecting;
+	return s.reconnecting;
 }
 
 /**
@@ -1209,31 +1250,35 @@ export async function connect({
 	profile,
 	host,
 	clusterId,
-	clusterName
+	clusterName,
+	nb
 }: {
 	profile?: string | null;
 	host?: string | null;
 	clusterId: string;
 	clusterName?: string | null;
+	nb?: string | null;
 }): Promise<{ ok: true; connection: ConnectionStatus }> {
 	assertMatches(clusterId, CLUSTER_RE, 'cluster id');
+	const abs = resolveNotebookPath(nb);
+	const s = stateFor(abs);
 	const sel: Selection = profile ? { profile } : { host };
 	const auth = resolveAuth(sel);
 	assertSignedIn(auth);
-	if (inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
-	inFlight = true;
+	if (s.inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
+	s.inFlight = true;
 	try {
 		logInfo('databricks', `connecting: profile "${profile}", cluster "${clusterName || clusterId}"`);
-		const { result, session } = await runInKernel(CONNECT_CODE({ auth, cluster_id: clusterId }));
+		const { result, session } = await runInKernel(abs, CONNECT_CODE({ auth, cluster_id: clusterId }));
 		if (!result.ok) {
-			connection = null;
-			connectedSel = null;
+			s.connection = null;
+			s.connectedSel = null;
 			publishGlobal({ type: 'databricks:changed' });
 			logError('databricks', `connect failed [${result.code || 'error'}]: ${result.message || 'unknown error'}`);
 			throw new DatabricksError(result.code || 'error', result.message);
 		}
 		const ok = payload<ConnectPayload>(result);
-		connection = {
+		s.connection = {
 			profile: profile ?? null,
 			clusterId,
 			clusterName: clusterName || clusterId,
@@ -1242,16 +1287,16 @@ export async function connect({
 			session
 		};
 		// Re-query catalogs against the same auth, using the SDK's canonical host.
-		connectedSel = auth.mode === 'pat' ? { profile } : { host: connection.host };
-		lost = null;
+		s.connectedSel = auth.mode === 'pat' ? { profile } : { host: s.connection.host };
+		s.lost = null;
 		// A fresh session is alive by construction; seed the cache so an immediate
 		// status read doesn't pay for a redundant liveness probe.
-		liveness = { session, alive: true, expired: false, checkedAt: Date.now() };
+		s.liveness = { session, alive: true, expired: false, checkedAt: Date.now() };
 		publishGlobal({ type: 'databricks:changed' });
 		logInfo('databricks', `connected: host ${ok.host ?? '?'}, spark ${ok.spark_version ?? '?'}`);
-		return { ok: true, connection: connectionStatus() };
+		return { ok: true, connection: connectionStatus(abs) };
 	} finally {
-		inFlight = false;
+		s.inFlight = false;
 	}
 }
 
@@ -1263,10 +1308,12 @@ export async function connect({
  * `spark` exists will use it instead of writing its own connection boilerplate,
  * which is the whole point of this integration.
  */
-export async function agentStatus() {
-	const status: ConnectionStatus = connectionStatus();
+export async function agentStatus(nb?: string | null) {
+	const abs = resolveNotebookPath(nb);
+	const s = stateFor(abs);
+	const status: ConnectionStatus = connectionStatus(abs);
 	if (!status.connected) {
-		liveness = null;
+		s.liveness = null;
 		return {
 			connected: false,
 			...(status.lost
@@ -1280,20 +1327,20 @@ export async function agentStatus() {
 	// Verify liveness (cached; skipped when the kernel is busy so we never queue
 	// behind a running cell), and self-heal on a session-closed error.
 	const sid = status.session;
-	const fresh = liveness && liveness.session === sid && Date.now() - liveness.checkedAt < LIVENESS_TTL_MS;
-	let live: Liveness | null = fresh ? liveness : null;
+	const fresh = s.liveness && s.liveness.session === sid && Date.now() - s.liveness.checkedAt < LIVENESS_TTL_MS;
+	let live: Liveness | null = fresh ? s.liveness : null;
 	if (!live) {
-		if (kernelStatus().status === 'busy') {
+		if (kernelStatus(abs).status === 'busy') {
 			// Don't block status behind a running cell. Fall back to the last-known
 			// reading for this epoch if we have one; otherwise report unverified.
-			live = liveness && liveness.session === sid ? liveness : null;
+			live = s.liveness && s.liveness.session === sid ? s.liveness : null;
 		} else {
-			live = await probeLiveness(sid);
+			live = await probeLiveness(abs, sid);
 		}
 	}
 
 	if (live?.expired) {
-		const healed = await autoReconnect();
+		const healed = await autoReconnect(abs);
 		if (!healed) {
 			return {
 				connected: false,
@@ -1306,7 +1353,7 @@ export async function agentStatus() {
 		}
 		// autoReconnect() rebuilt spark/w against the same cluster; report the fresh
 		// connection so the agent knows spark is usable again.
-		const healedStatus = connectionStatus();
+		const healedStatus = connectionStatus(abs);
 		if (healedStatus.connected) {
 			return {
 				...connectedPayload(healedStatus),
@@ -1338,24 +1385,31 @@ function connectedPayload(status: ConnectionStatus & { connected: true }) {
 	};
 }
 
-/** The `{profile}|{host}` selection of the live connection, or a `not_connected` error an agent can act on. */
-function requireConnectedSel(): Selection {
-	const status = connectionStatus();
-	if (!status.connected || !connectedSel) {
+/** The `{profile}|{host}` selection of a notebook's live connection, or a `not_connected` error an agent can act on. */
+function requireConnectedSel(nb: string): Selection {
+	const s = stateFor(nb);
+	const status = connectionStatus(nb);
+	if (!status.connected || !s.connectedSel) {
 		throw new DatabricksError(
 			'not_connected',
 			'Not connected to Databricks. Ask the user to connect from the Databricks section of the Cellar sidebar (agents cannot connect on their own).'
 		);
 	}
-	return connectedSel;
+	return s.connectedSel;
 }
 
-/** Unity Catalog listings for the agent, against the auth of the live connection. */
+/**
+ * Unity Catalog listings for the agent, against the auth of a notebook's live
+ * connection. The listing itself is a stateless server-side SDK call (no kernel),
+ * but the AUTH comes from that notebook's connection, so a catalog browse only
+ * works for a notebook that is connected.
+ */
 export const forAgent = {
-	catalogs: async (): Promise<CatalogList> => listCatalogs(requireConnectedSel()),
-	schemas: async (catalog: string): Promise<SchemaList> => listSchemas(requireConnectedSel(), catalog),
-	tables: async (catalog: string, schema: string): Promise<TableList> =>
-		listTables(requireConnectedSel(), catalog, schema)
+	catalogs: async (nb?: string | null): Promise<CatalogList> => listCatalogs(requireConnectedSel(resolveNotebookPath(nb))),
+	schemas: async (catalog: string, nb?: string | null): Promise<SchemaList> =>
+		listSchemas(requireConnectedSel(resolveNotebookPath(nb)), catalog),
+	tables: async (catalog: string, schema: string, nb?: string | null): Promise<TableList> =>
+		listTables(requireConnectedSel(resolveNotebookPath(nb)), catalog, schema)
 };
 
 /** `catalog.schema.table`, or the two-part `schema.table` a legacy metastore uses. */
@@ -1422,42 +1476,47 @@ interface PreviewResult {
 /** Agent-facing table preview: `{name, limit, schema, rows}`. Requires a live session. */
 export async function previewTable({
 	name,
-	limit = 20
+	limit = 20,
+	nb
 }: {
 	name: string;
 	limit?: number;
+	nb?: string | null;
 }): Promise<PreviewResult> {
 	assertTableName(name);
-	requireConnectedSel();
+	const abs = resolveNotebookPath(nb);
+	requireConnectedSel(abs);
 	const n = Number(limit);
 	if (!Number.isInteger(n) || n < 1 || n > 1000) {
 		throw new DatabricksError('bad_request', `invalid limit: ${JSON.stringify(limit)} (1-1000)`);
 	}
-	let { result } = await runInKernel(PREVIEW_CODE({ name, limit: n }));
+	let { result } = await runInKernel(abs, PREVIEW_CODE({ name, limit: n }));
 	// If the read failed because the session expired server-side, self-heal once:
 	// rebuild spark against the same cluster and retry - the agent gets its rows
 	// instead of a dead-session error it cannot recover from on its own.
-	if (result.ok === false && isSessionClosed(result.message) && (await autoReconnect())) {
-		({ result } = await runInKernel(PREVIEW_CODE({ name, limit: n })));
+	if (result.ok === false && isSessionClosed(result.message) && (await autoReconnect(abs))) {
+		({ result } = await runInKernel(abs, PREVIEW_CODE({ name, limit: n })));
 	}
 	return payload<PreviewResult>(unwrap(result));
 }
 
-/** Stop the session and drop `spark`/`w` from the kernel namespace. */
-export async function disconnect(): Promise<{ ok: true }> {
-	if (inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
-	inFlight = true;
+/** Stop a notebook's session and drop `spark`/`w` from its kernel namespace. */
+export async function disconnect(nb?: string | null): Promise<{ ok: true }> {
+	const abs = resolveNotebookPath(nb);
+	const s = stateFor(abs);
+	if (s.inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
+	s.inFlight = true;
 	try {
 		// Nothing to stop if the kernel that held it is gone; just clear our state.
-		if (connectionStatus().connected) await runInKernel(DISCONNECT_CODE);
-		connection = null;
-		connectedSel = null;
-		lost = null;
-		liveness = null;
+		if (connectionStatus(abs).connected) await runInKernel(abs, DISCONNECT_CODE);
+		s.connection = null;
+		s.connectedSel = null;
+		s.lost = null;
+		s.liveness = null;
 		publishGlobal({ type: 'databricks:changed' });
 		return { ok: true };
 	} finally {
-		inFlight = false;
+		s.inFlight = false;
 	}
 }
 

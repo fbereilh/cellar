@@ -11,19 +11,21 @@ import { connect, disconnect, statusFor } from '$lib/server/databricks';
  * for it), so the client shows a spinner rather than a timeout.
  */
 export async function POST({ request }) {
-	const { profile, host, clusterId, clusterName } = await request.json();
+	const { profile, host, clusterId, clusterName, path } = await request.json();
 	try {
-		return json(await connect({ profile, host, clusterId, clusterName }));
+		// `path` binds `spark`/`w` into THAT notebook's kernel (each notebook has its
+		// own kernel + Databricks session); omitting it targets the active notebook.
+		return json(await connect({ profile, host, clusterId, clusterName, nb: path }));
 	} catch (err) {
 		const code = err?.code ?? 'error';
 		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
 	}
 }
 
-/** Disconnect: stop the session and unbind `spark`/`w` from the namespace. */
-export async function DELETE() {
+/** Disconnect: stop this notebook's session and unbind `spark`/`w` from its namespace. */
+export async function DELETE({ url }) {
 	try {
-		return json(await disconnect());
+		return json(await disconnect(url.searchParams.get('path')));
 	} catch (err) {
 		const code = err?.code ?? 'error';
 		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
