@@ -800,6 +800,14 @@
 				load();
 				return;
 			}
+			// This notebook's kernel was shut down (manual, idle cull, or venv rebind):
+			// with no live kernel its cells must read "not run this session". Refetch
+			// run-status/staleness (the sidebar cards update via the kernel:status
+			// snapshot separately). No optimistic local change, so no originId gate.
+			if (pe.type === 'kernel:shutdown') {
+				scheduleStaleness();
+				return;
+			}
 			if (pe.originId && pe.originId === originId) return; // our own UI action
 			if (
 				pe.type?.startsWith('cell:') ||
