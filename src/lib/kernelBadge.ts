@@ -71,3 +71,16 @@ export function kernelBadgeClass(info: KernelInfo | null | undefined): string {
 	if (info.status === 'dead') return 'badge-error';
 	return 'badge-warning';
 }
+
+/**
+ * Background-color class for a compact status dot in the Kernels list — the
+ * standalone-dot counterpart to `kernelBadgeClass`, following the same rule
+ * (only a genuinely usable `idle` kernel reads green). A not-started kernel is
+ * a muted neutral; `busy` and every transitional state are amber; `dead` red.
+ */
+export function kernelDotClass(info: KernelInfo | null | undefined): string {
+	if (!info?.started) return 'bg-base-content/25';
+	if (info.status === 'idle') return 'bg-success';
+	if (info.status === 'dead') return 'bg-error';
+	return 'bg-warning';
+}
