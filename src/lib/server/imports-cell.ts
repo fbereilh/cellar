@@ -33,6 +33,7 @@ import {
 } from './notebook';
 import { IMPORTS_ROLE, isImportsCell } from '../importsRole';
 import { extractTopLevelImports, mergeImportSources, isImportsOnly, hasTopLevelImports } from './imports';
+import { isCellMagicCell } from './magics';
 import { enqueueRun, queuePosition, RunCancelled } from './run-queue';
 import { executeCellRun, clearOutputsForQueue } from './run';
 import type { Actor, Cell, CellView, CellOutput, SessionId } from './types';
@@ -171,6 +172,10 @@ export function routeImports(
 ): RouteImportsResult {
 	const none: RouteImportsResult = { source, added: [], importsCellId: null };
 	if (skipCellId && getImportsCell(nb)?.id === skipCellId) return none;
+	// A cell magic (`%%bash`, `%%writefile foo.py`, …) is a deliberate special cell
+	// whose body is not ordinary Python — never rearrange its lines, even if the body
+	// happens to contain an `import`-looking line (a writefile of a .py file does).
+	if (isCellMagicCell(source)) return none;
 	if (!hasTopLevelImports(source)) return none;
 
 	const { statements, source: stripped } = extractTopLevelImports(source);
@@ -216,6 +221,7 @@ export async function consolidateImports(
 	const removals: string[] = [];
 	for (const cell of cells) {
 		if (cell.cell_type !== 'code' || cell.id === importsSourceCell?.id) continue;
+		if (isCellMagicCell(cell.source)) continue; // never sweep a cell magic's body
 		const { statements, source, changed } = extractTopLevelImports(cell.source);
 		if (!changed) continue;
 		collected.push(...statements);

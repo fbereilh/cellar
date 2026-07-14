@@ -17,6 +17,14 @@
  *    `databricks.js` does for its SDK calls. `symtable` is stdlib, so any Python 3
  *    works — no package, and no dependency on the venv being set up.
  *
+ * MAGIC-AWARE. A cell holding an IPython magic (`%%time`, `%matplotlib inline`,
+ * `!pip …`) is not valid Python, so before analysis each cell's source is run
+ * through `normalizeForAnalysis` (`magics.ts`): a Python-body cell magic
+ * (`%%time\ndf = load()`) has its header stripped so `df` still registers as a
+ * define; a non-Python cell magic (`%%bash`) yields no Python to analyze; line
+ * magics / shell escapes are blanked so the surrounding Python still parses. The
+ * cache is keyed by the ORIGINAL source, so identical cells still share a result.
+ *
  * The probe never raises: a cell whose source does not parse (it is mid-edit) is
  * reported with empty defines/uses rather than failing the whole analysis. If no
  * interpreter can be found or the process dies, `analyzeDataflow` degrades to an
@@ -32,6 +40,7 @@ import { listCells } from './notebook';
 import { projectPython } from './databricks';
 import { computeStaleness } from '../staleness';
 import { isSqlCell } from '../cellLanguage';
+import { normalizeForAnalysis } from './magics';
 import type { CellView, SessionId } from './types';
 
 /** The names a cell binds at module scope, and the module globals it reads. */
@@ -173,13 +182,16 @@ export async function analyzeDataflow(cells: CellView[]): Promise<DataflowMap> {
 	const missing: ProbeItem[] = [];
 	for (const c of code) {
 		const src = c.source ?? '';
-		if (!cache.has(src)) missing.push({ key: src, source: src });
+		// Cache/lookup key = the ORIGINAL source; the probe analyzes the magic-normalized
+		// source (a `%%time` body still contributes its defines; a `%%bash` body does not).
+		if (!cache.has(src)) missing.push({ key: src, source: normalizeForAnalysis(src) });
 	}
 	if (missing.length) {
-		// De-duplicate identical sources before spawning (many empty cells, say).
-		const bySource = new Map<string, ProbeItem>(missing.map((m) => [m.source, m]));
-		const results = await runProbe([...bySource.values()]);
-		for (const [src, m] of bySource) {
+		// De-duplicate identical cells before spawning (many empty cells, say), keyed by
+		// their original source so each distinct cell maps back to its own cache entry.
+		const byKey = new Map<string, ProbeItem>(missing.map((m) => [m.key, m]));
+		const results = await runProbe([...byKey.values()]);
+		for (const [src, m] of byKey) {
 			cache.set(src, results[m.key] ?? { defines: [], uses: [] });
 		}
 		if (cache.size > CACHE_MAX) cache.clear(); // simple bound; correctness is unaffected
