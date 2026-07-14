@@ -13,6 +13,7 @@
 	import { getUi, setUi } from '$lib/uiState';
 	import type { CellView, CellOutput, CellType, LogicalCellType, Actor, RunningView, QueueEntryView, LastRun, CellarNamespace, PublishedEvent } from '$lib/server/types';
 	import type { UICell, KeyMode, FoldRegistryHandle, NumberingRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
+	import type { BlameLine } from '$lib/server/git';
 	import type { ClientEvent } from '$lib/events-client';
 	import type { Folding } from '$lib/headings';
 	import type { StalenessMap } from '$lib/staleness';
@@ -43,6 +44,8 @@
 		onRunEnd?: () => void;
 		/** Interrupt the shared kernel (same handler the Kernels sidebar uses). */
 		onInterruptKernel?: () => void;
+		/** (path, record|null): the focused cell's git blame, for the shell footer. */
+		onBlame?: (path: string, record: BlameLine | null) => void;
 	}
 
 	/** A structural document event as this component reads it (see events.js). */
@@ -103,7 +106,8 @@
 		onRegisterApi,
 		onRunStart,
 		onRunEnd,
-		onInterruptKernel
+		onInterruptKernel,
+		onBlame
 	}: Props = $props();
 
 	let cells = $state<UICell[]>([]);
@@ -187,6 +191,9 @@
 		} catch {}
 	}
 	function scheduleStaleness() {
+		// A disk-changing event (edit, run, structural change) also moves git blame —
+		// refetch it (own, longer debounce so it reads the just-persisted source).
+		scheduleBlame();
 		clearTimeout(stalenessTimer);
 		stalenessTimer = setTimeout(refreshStaleness, 250);
 	}
@@ -344,6 +351,65 @@
 	});
 
 	const gitChanges = $derived(gitBaselineCells ? notebookCellChanges(gitBaselineCells, cells) : NO_CELL_CHANGES);
+
+	// ---- Git blame (bottom status bar) ---------------------------------------
+	// Blame the whole notebook once (per-cell map keyed by stable cell id, cached),
+	// then report the FOCUSED cell's record to the shell footer — exactly how a
+	// FileTab reports its cursor line. Cheap: one `git blame` per notebook, refreshed
+	// only on save / git-state changes, never per keystroke. A cell edited but not
+	// yet committed comes back `notCommitted` ("You, uncommitted"); an untracked or
+	// non-git notebook reports null (no blame bar). `blameTimer` coalesces the
+	// refetch after an edit/run persists to disk.
+	let cellBlame = $state.raw<Record<string, BlameLine> | null>(null);
+	let blameTimer: ReturnType<typeof setTimeout>;
+
+	async function loadBlame() {
+		let map: Record<string, BlameLine> | null = null;
+		try {
+			const res = await fetch(`/api/fs/git/blame?path=${encodeURIComponent(path)}&kind=notebook`);
+			const body = await res.json();
+			if (res.ok && body.tracked) map = body.cells;
+		} catch {}
+		cellBlame = map;
+	}
+
+	// Refetch after a change lands on disk. Longer than the editor's 500ms autosave
+	// debounce so the blame we read reflects the just-persisted source.
+	function scheduleBlame() {
+		clearTimeout(blameTimer);
+		blameTimer = setTimeout(loadBlame, 700);
+	}
+
+	// The focused cell's blame record (or null when there's no map / no selection).
+	const activeCellBlame = $derived((cellBlame && activeId && cellBlame[activeId]) || null);
+
+	// Report it up to the shell footer whenever it changes. The change-guard is
+	// load-bearing: `onBlame` writes PARENT state (`blameByPath`), so an effect that
+	// re-reported the same record on every flush would spin the scheduler
+	// (`effect_update_depth_exceeded`). Reporting only on an actual change breaks
+	// that — the record is a stable reference within one blame map.
+	let lastReportedBlame: BlameLine | null | undefined;
+	$effect(() => {
+		const rec = activeCellBlame;
+		if (rec === lastReportedBlame) return;
+		lastReportedBlame = rec;
+		onBlame?.(path, rec);
+	});
+
+	// Load on mount and whenever the shell signals git state may have moved; window
+	// `focus` covers a commit/checkout made outside Cellar.
+	$effect(() => {
+		gitRefresh;
+		loadBlame();
+	});
+	onMount(() => {
+		const onFocus = () => loadBlame();
+		window.addEventListener('focus', onFocus);
+		return () => {
+			window.removeEventListener('focus', onFocus);
+			clearTimeout(blameTimer);
+		};
+	});
 
 	// ---- Follow the agent ----------------------------------------------------
 	// When an agent runs a cell we bring that cell into view, so a human watching

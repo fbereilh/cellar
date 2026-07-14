@@ -276,15 +276,20 @@
 	const activeHideAllCode = $derived(!!(activeNotebookPath && notebooksHideAll[activeNotebookPath]));
 	const activeRunState = $derived((activeNotebookPath && notebooksRunState[activeNotebookPath]) || null);
 
-	// Git blame for the active file's cursor line, shown in the bottom status bar.
-	// Each mounted FileTab reports its own path's line record; the footer reads the
-	// active file's. Notebooks/`.ipynb` never report (blaming JSON lines is
-	// meaningless), so `activeBlame` is null for them and the bar hides gracefully.
+	// Git blame shown in the bottom status bar. A FileTab reports its cursor line's
+	// record; a LiveNotebook reports its FOCUSED CELL's record (per-cell blame) — both
+	// through the same `handleBlame`, keyed by workspace path. The footer reads the
+	// active tab's, whether that's a file or a notebook. An untracked/non-git target
+	// reports null and the bar hides gracefully.
 	let blameByPath = $state<Record<string, BlameLine | null>>({});
 	function handleBlame(path: string, record: BlameLine | null) {
 		blameByPath = { ...blameByPath, [path]: record };
 	}
-	const activeBlame = $derived((activeFilePath && blameByPath[activeFilePath]) || null);
+	const activeBlame = $derived(
+		(activeFilePath && blameByPath[activeFilePath]) ||
+			(activeNotebookPath && blameByPath[activeNotebookPath]) ||
+			null
+	);
 
 	// One card per notebook's kernel in the Kernels sidebar. Cellar runs one kernel
 	// PER notebook (lazy, started on that notebook's first run). The card set is:
@@ -1154,6 +1159,7 @@
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(canonicalNotebookRel)}
+						onBlame={handleBlame}
 					/>
 				</div>
 			{/if}
@@ -1175,6 +1181,7 @@
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(tab.path)}
+						onBlame={handleBlame}
 					/>
 				</div>
 			{/each}
@@ -1228,9 +1235,10 @@
 			<span class="truncate">workspace: <span class="font-mono">{workspace}</span></span>
 		</div>
 
-		<!-- Git blame for the active file's cursor line (GitLens-style): who last
-		     touched it and when; commit summary + short SHA on hover. Hidden when
-		     there's no blame (notebook active, untracked file, or non-git). -->
+		<!-- Git blame for the active tab (GitLens-style): a file's cursor line, or a
+		     notebook's FOCUSED CELL; who last touched it and when, commit summary +
+		     short SHA on hover. Hidden when there's no blame (no focused cell,
+		     untracked file/notebook, or non-git). -->
 		{#if activeBlame}
 			<span
 				class="flex min-w-0 items-center gap-1 truncate text-base-content/55"
