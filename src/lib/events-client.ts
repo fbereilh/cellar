@@ -43,6 +43,13 @@ const listeners = new Set<EventListener>();
  * that window — it is a full snapshot, so replaying it is always safe.
  */
 let lastQueue: ClientEvent | null = null;
+/**
+ * The most recent `kernel:status` snapshot, replayed to a late subscriber for the
+ * same reason as `lastQueue`: a `LiveNotebook`/sidebar mounted after a kernel
+ * started would otherwise show no card until the next status flip. A full
+ * snapshot, so replaying it is always safe.
+ */
+let lastKernels: ClientEvent | null = null;
 
 function ensureSource(): void {
 	if (source || !browser) return;
@@ -55,6 +62,7 @@ function ensureSource(): void {
 			return;
 		}
 		if (ev.type === 'queue:changed') lastQueue = ev;
+		if (ev.type === 'kernel:status') lastKernels = ev;
 		for (const listener of listeners) listener(ev);
 	});
 	// Fires on the initial connect and on every automatic reconnect.
@@ -72,12 +80,15 @@ export function subscribeEvents(listener: EventListener): () => void {
 	listeners.add(listener);
 	ensureSource();
 	if (lastQueue) listener(lastQueue); // catch a late subscriber up on the run queue
+	if (lastKernels) listener(lastKernels); // …and on the live kernel list
 	return () => {
 		listeners.delete(listener);
 		if (listeners.size === 0 && source) {
 			source.close();
 			source = null;
-			lastQueue = null; // the next connect re-seeds it (the SSE stream sends a snapshot)
+			// The next connect re-seeds both (the SSE stream sends fresh snapshots).
+			lastQueue = null;
+			lastKernels = null;
 		}
 	};
 }

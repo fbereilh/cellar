@@ -18,7 +18,7 @@
 	import type { Cell } from '$lib/server/types';
 	import type { UICell, FoldRegistryHandle, NumberingRegistryHandle, NotebookApiHandle } from '$lib/types';
 	import type { Folding } from '$lib/headings';
-	import type { KernelInfo } from '$lib/kernelBadge';
+	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import type { BlameLine } from '$lib/server/git';
 
 	/** Kind of an open tab: the canonical notebook, an opened `.ipynb`/`.py`, or a text file. */
@@ -284,31 +284,46 @@
 	}
 	const activeBlame = $derived((activeFilePath && blameByPath[activeFilePath]) || null);
 
-	// Notebooks actually LOADED in the shared kernel: those that have run >=1 cell
-	// in the current kernel session, so their state lives in the one shared
-	// namespace. The membership comes from the SERVER (`kernelInfo.loaded_notebooks`,
-	// tracked in kernel.js and cleared on restart) — NOT from open tabs. So a
-	// notebook whose tab was closed still appears (its variables are still loaded),
-	// and a just-opened notebook that never ran a cell does not. It refreshes live
-	// on every run-end / restart (`refreshKernel`).
-	//
-	// Each server entry is enriched with the matching open tab (if any): `open`
-	// lets a still-open row focus its tab, and `active` (reading `activeNotebookPath`,
-	// the same source the outline/search sections use) dots the focused notebook.
-	const loadedNotebooks = $derived.by(() =>
-		(kernelInfo.loaded_notebooks ?? []).map((n) => {
-			const tab = tabs.find(
-				(t) => (t.kind === 'notebook' || t.kind === 'ipynb') && t.path === n.path
-			);
-			return {
-				id: tab?.id ?? n.path,
-				path: n.path,
-				name: tab?.title || n.name,
+	// One card per notebook's kernel in the Kernels sidebar. Cellar runs one kernel
+	// PER notebook (lazy, started on that notebook's first run). The card set is:
+	//   1. every LIVE kernel (`kernels`, from the server via `/api/kernel` + the
+	//      `kernel:status` SSE snapshot) — a notebook whose tab was CLOSED but whose
+	//      kernel is still alive keeps its card (its state is still in memory);
+	//   2. the ACTIVE notebook, even with no kernel yet — so a just-opened notebook
+	//      shows a "not started" card you can watch start on first run.
+	// So shutting down a non-active notebook's kernel drops its card (nothing left
+	// to control), while the notebook you are looking at always has a card. A tab is
+	// matched by path to carry `open` (focus its tab) + `active` (dot it).
+	const notebookTabFor = (p: string) =>
+		tabs.find((t) => (t.kind === 'notebook' || t.kind === 'ipynb') && t.path === p);
+	const kernelCards = $derived.by<KernelCard[]>(() => {
+		const byPath = new Map<string, KernelCard>();
+		for (const k of kernels) {
+			const tab = notebookTabFor(k.path);
+			byPath.set(k.path, {
+				id: tab?.id ?? k.path,
+				path: k.path,
+				name: tab?.title || k.name,
 				open: !!tab,
-				active: n.path === activeNotebookPath
-			};
-		})
-	);
+				active: k.path === activeNotebookPath,
+				hasKernel: true,
+				info: { started: k.started, id: k.id, name: k.name, status: k.status, session_id: k.session_id }
+			});
+		}
+		if (activeNotebookPath && !byPath.has(activeNotebookPath)) {
+			const tab = notebookTabFor(activeNotebookPath);
+			byPath.set(activeNotebookPath, {
+				id: tab?.id ?? activeNotebookPath,
+				path: activeNotebookPath,
+				name: tab?.title || activeNotebookPath,
+				open: !!tab,
+				active: true,
+				hasKernel: false,
+				info: { started: false, id: null, name: 'python3', status: 'not started', session_id: null }
+			});
+		}
+		return [...byPath.values()];
+	});
 
 	function tabIdFor(path: string) {
 		return path === canonicalNotebookRel ? 'notebook' : 'file:' + path;
@@ -774,7 +789,12 @@
 	}
 
 	// ---- Kernel + variables (sidebar) ---------------------------------------
+	// `kernelInfo` is the ACTIVE notebook's kernel (navbar badge, variable inspector,
+	// Databricks panel — all follow the focused notebook). `kernels` is the full
+	// per-notebook list driving the Kernels sidebar cards; it stays live via the
+	// `kernel:status` SSE snapshot as kernels start / go busy / restart / shut down.
 	let kernelInfo = $state<KernelInfo>({ started: false, id: null, name: 'python3', status: 'not started', session_id: null });
+	let kernels = $state<KernelListEntry[]>([]);
 	let variables = $state<VariableInfo[]>([]);
 	let varsLoading = $state(false);
 	let varsError = $state('');
@@ -800,9 +820,12 @@
 		try {
 			const res = await fetch('/api/kernel');
 			if (!res.ok) return;
-			const info = await res.json();
+			const { kernels: list, ...info } = await res.json();
 			if (seq !== kernelReqSeq) return; // superseded while in flight → drop it
 			kernelInfo = info;
+			// A full snapshot, so overwriting an SSE update with an equally-fresh fetch
+			// (or vice-versa) is always safe; the newest snapshot wins and self-heals.
+			kernels = list ?? [];
 		} catch {}
 	}
 
@@ -831,33 +854,34 @@
 		}
 	}
 
-	// Interrupt / restart the active kernel. Both reuse the exact kernel.js path
-	// the MCP agent interface proved: restart keeps the same session (document
-	// intact) while clearing the namespace.
-	let kernelBusy = $state(false);
-	async function interruptKernel() {
-		if (kernelBusy) return;
-		kernelBusy = true;
+	// Per-notebook kernel controls. Each targets ONE notebook's kernel (by its
+	// workspace-relative `path`) and reuses the exact kernel.js paths the MCP agent
+	// interface proved: restart keeps the same session (document intact) while
+	// clearing that notebook's namespace — the "wipe from memory" affordance — and
+	// shutdown terminates the process and drops the card. Other notebooks' kernels
+	// are untouched. The Kernels sidebar owns per-card in-flight/disabled state and
+	// awaits these promises. A restart/shutdown of the ACTIVE notebook cleared its
+	// namespace, so drop the now-stale inspector rows.
+	const kernelJson = { method: 'POST', headers: { 'content-type': 'application/json' } };
+	async function interruptKernel(path: string) {
 		try {
-			await fetch('/api/kernel/interrupt', { method: 'POST' });
+			await fetch('/api/kernel/interrupt', { ...kernelJson, body: JSON.stringify({ path }) });
 		} catch {}
-		finally {
-			kernelBusy = false;
-			refreshKernel();
-		}
+		refreshKernel();
 	}
-	async function restartKernel() {
-		if (kernelBusy) return;
-		kernelBusy = true;
+	async function restartKernel(path: string) {
 		try {
-			await fetch('/api/kernel/restart', { method: 'POST' });
-			// Namespace is cleared on restart — drop the now-stale inspector rows.
-			variables = [];
+			await fetch('/api/kernel/restart', { ...kernelJson, body: JSON.stringify({ path }) });
+			if (path === activeNotebookPath) variables = [];
 		} catch {}
-		finally {
-			kernelBusy = false;
-			refreshKernel();
-		}
+		refreshKernel();
+	}
+	async function shutdownKernel(path: string) {
+		try {
+			await fetch('/api/kernel/shutdown', { ...kernelJson, body: JSON.stringify({ path }) });
+			if (path === activeNotebookPath) variables = [];
+		} catch {}
+		refreshKernel();
 	}
 
 	// ---- Theme ---------------------------------------------------------------
@@ -913,10 +937,16 @@
 			if (ev.type === 'log' && (ev.entry as { level?: string } | undefined)?.level === 'error' && !logsOpen) {
 				logsUnseenErrors += 1;
 			}
+			// The live per-notebook kernel list — a full snapshot published on every
+			// kernel start / busy-idle flip / restart / shutdown. Drives the Kernels
+			// sidebar cards with no reload (two notebooks running show two busy cards).
+			if (ev.type === 'kernel:status') {
+				kernels = (ev.kernels as KernelListEntry[] | undefined) ?? [];
+				return;
+			}
 			// A run this tab did NOT initiate (an agent, or another tab) may load a
 			// notebook into the kernel for the first time. Our own runs already refresh
-			// via `onRunEnd`, so only foreign runs need this — refresh the kernel status
-			// so the Kernels section's loaded-notebooks list stays live for agent runs.
+			// via `onRunEnd`; this keeps the ACTIVE-notebook badge/inspector live too.
 			if (ev.type === 'run:end' && ev.originId !== originId) {
 				refreshKernel();
 			}
@@ -959,8 +989,10 @@
 				toggleTheme,
 				toggleSidebar: () => (sidebarOpen = !sidebarOpen),
 				openSettings: () => (settingsOpen = true),
-				interruptKernel,
-				restartKernel,
+				// The command palette acts on the ACTIVE notebook's kernel (empty path →
+				// the server resolves to the active notebook).
+				interruptKernel: () => interruptKernel(activeNotebookPath ?? ''),
+				restartKernel: () => restartKernel(activeNotebookPath ?? ''),
 				newNotebook,
 				consolidateImports
 			}
@@ -1066,8 +1098,7 @@
 					onToggleNumberingLevel={toggleActiveNumberingLevel}
 					{mcp}
 					kernelInfo={displayKernel}
-					{kernelBusy}
-					{loadedNotebooks}
+					{kernelCards}
 					{variables}
 					{varsLoading}
 					{varsError}
@@ -1078,6 +1109,7 @@
 					onRefreshKernel={refreshKernel}
 					onInterruptKernel={interruptKernel}
 					onRestartKernel={restartKernel}
+					onShutdownKernel={shutdownKernel}
 					onInsertAndRun={canInsertAndRun}
 					onDatabricksSessionChange={onDatabricksSessionChange}
 					onOpenFile={openFile}
@@ -1118,7 +1150,7 @@
 						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
-						onInterruptKernel={interruptKernel}
+						onInterruptKernel={() => interruptKernel(canonicalNotebookRel)}
 					/>
 				</div>
 			{/if}
@@ -1139,7 +1171,7 @@
 						onRegisterApi={registerNotebookApi}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
-						onInterruptKernel={interruptKernel}
+						onInterruptKernel={() => interruptKernel(tab.path)}
 					/>
 				</div>
 			{/each}

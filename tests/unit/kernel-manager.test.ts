@@ -47,7 +47,10 @@ vi.mock('@jupyterlab/services', () => ({
 }));
 
 vi.mock('../../src/lib/server/notebook', () => ({
-	getActiveNotebookPath: () => h.activeNb
+	getActiveNotebookPath: () => h.activeNb,
+	// listKernels() (via the kernel:status publish) maps each absolute path to its
+	// workspace-relative id; the fake workspace is '/ws'.
+	workspaceRelative: (abs: string) => abs.replace(/^\/ws\//, '')
 }));
 
 vi.mock('../../src/lib/server/run-queue', () => ({
@@ -66,6 +69,8 @@ import {
 	kernelStatus,
 	currentSessionId,
 	loadedNotebookPaths,
+	listKernels,
+	shutdownKernel,
 	restartKernel
 } from '../../src/lib/server/kernel';
 
@@ -136,5 +141,41 @@ describe('kernel manager (per notebook)', () => {
 		expect(getKernelInfo().id).toBe(getKernelInfo(B).id);
 		expect(currentSessionId()).toBe(currentSessionId(B));
 		h.activeNb = A;
+	});
+});
+
+describe('listKernels + shutdown (Phase 3)', () => {
+	// A and B both have live kernels carried over from the runs above.
+	it('lists one entry per live kernel with its own status + workspace-relative path', () => {
+		const list = listKernels();
+		const byPath = Object.fromEntries(list.map((k) => [k.path, k]));
+		expect(new Set(list.map((k) => k.path))).toEqual(new Set(['a.ipynb', 'b.ipynb']));
+		expect(byPath['a.ipynb'].started).toBe(true);
+		expect(byPath['a.ipynb'].status).toBe('idle');
+		expect(byPath['a.ipynb'].busy).toBe(false);
+		expect(byPath['a.ipynb'].session_id).not.toBeNull();
+		// The entry's id matches the live connection, and the two notebooks differ.
+		expect(byPath['a.ipynb'].id).toBe(getKernelInfo(A).id);
+		expect(byPath['a.ipynb'].id).not.toBe(byPath['b.ipynb'].id);
+	});
+
+	it('shutdown terminates one kernel, drops its entry, and leaves the other intact', async () => {
+		const aBefore = currentSessionId(A);
+		const info = await shutdownKernel(B);
+		expect(info.status).toBe('not_started');
+		// B is gone: no entry, no epoch, reads as not started.
+		expect(new Set(loadedNotebookPaths())).toEqual(new Set([A]));
+		expect(listKernels().map((k) => k.path)).toEqual(['a.ipynb']);
+		expect(currentSessionId(B)).toBeNull();
+		expect(getKernelInfo(B).started).toBe(false);
+		// A is untouched — same live kernel, same epoch.
+		expect(getKernelInfo(A).started).toBe(true);
+		expect(currentSessionId(A)).toBe(aBefore);
+	});
+
+	it('shutdown of a notebook with no kernel is a no-op', async () => {
+		const info = await shutdownKernel(B);
+		expect(info.status).toBe('not_started');
+		expect(loadedNotebookPaths()).toEqual([A]);
 	});
 });
