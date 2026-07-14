@@ -79,7 +79,8 @@ const EXT_MAP: Record<string, IconKind> = {
 	webp: 'image',
 	svg: 'image',
 	bmp: 'image',
-	ico: 'image'
+	ico: 'image',
+	avif: 'image'
 };
 
 export interface IconOpts {
