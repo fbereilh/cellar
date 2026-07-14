@@ -321,6 +321,13 @@ export interface QueueState {
 export interface WidgetModel {
 	/** The comm id, which is also the model id a `widget-view` output references. */
 	comm_id: string;
+	/**
+	 * Absolute path of the notebook whose kernel owns this widget. Comm ids are
+	 * globally unique per kernel session, so this is provenance rather than a
+	 * collision guard — it lets a per-notebook restart clear only its own widgets
+	 * and lets a client associate a model with the tab it belongs to.
+	 */
+	nb?: string;
 	state: Record<string, unknown>;
 }
 

@@ -160,7 +160,7 @@ function registerWidgetComm(nbKernel: NotebookKernel, kernel: KernelConnection):
 			// the model living in the kernel.
 			nbKernel.widgetComms.set(commId, comm);
 			const openState = (msg.content?.data ?? {}) as { state?: Record<string, unknown> };
-			openWidget(commId, openState.state ?? {});
+			openWidget(nbKernel.nbPath, commId, openState.state ?? {});
 			// An Output widget may already name a capture target in its opening state.
 			if (openState.state && 'msg_id' in openState.state) setOutputCapture(commId, openState.state.msg_id);
 			comm.onMsg = (m: KernelMessage.ICommMsgMsg) => {

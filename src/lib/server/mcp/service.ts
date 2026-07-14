@@ -29,7 +29,7 @@ import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSes
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
 import { agentStatus as databricksStatus, forAgent as databricksCatalog, previewTable } from '../databricks';
 import { publish } from '../events';
-import { enqueueRun, queueStateFor, queuePosition } from '../run-queue';
+import { enqueueRun, queuesByNotebook, queuePosition } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree } from '../fstree';
@@ -38,7 +38,7 @@ import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { isSqlCell } from '../../cellLanguage';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
-import type { CellView, CellOutput, SessionId, LogicalCellType } from '../types';
+import type { CellView, CellOutput, SessionId, LogicalCellType, QueueState } from '../types';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -330,12 +330,16 @@ function readForm(cell: CellView, cap = READ_CAP, sid: SessionId | null = curren
 
 // --- lifecycle --------------------------------------------------------------
 
+// Each notebook has its OWN kernel, so every lifecycle op resolves to the
+// notebook the caller is targeting (its pinned working notebook, via `targetFor`
+// in server.ts). An agent restarting/interrupting its kernel therefore touches
+// ONLY its own notebook — never the user's or another agent's namespace.
 export const kernel = {
-	restart: () => restartKernel(),
-	interrupt: () => interruptKernel(),
+	restart: (nb?: string | null) => restartKernel(nb),
+	interrupt: (nb?: string | null) => interruptKernel(nb),
 	// `id` is the only field unique to kernelStatus(); both report the same
 	// `status`, so let kernelSession() be its single source of truth.
-	status: () => ({ id: kernelStatus().id, ...kernelSession() })
+	status: (nb?: string | null) => ({ id: kernelStatus(nb).id, ...kernelSession(nb) })
 };
 
 /**
@@ -500,11 +504,11 @@ export async function getKernelState(nb?: string | null) {
  * the Variables sidebar and `kernel_state` use, so no user code runs and exec
  * counts are untouched. Read-only; reflect only the live kernel session.
  */
-export function getVariables() {
-	return _listVariables();
+export function getVariables(nb?: string | null) {
+	return _listVariables(nb);
 }
-export function inspectVariable(name: string) {
-	return _inspectVariable(name);
+export function inspectVariable(name: string, nb?: string | null) {
+	return _inspectVariable(name, nb);
 }
 
 /**
@@ -847,14 +851,20 @@ export function setCellVisibility(id: string, hidden: boolean, nb?: string | nul
 // --- execute ----------------------------------------------------------------
 
 /**
- * The run queue for the caller's working notebook: what is executing and what is
- * waiting behind it. Each notebook has its own kernel and its own FIFO, so this
- * resolves to the active notebook's queue (Phase 5 threads the session's pinned
- * notebook through). The shape — `{ running, queue }`, one running cell — is
- * unchanged.
+ * The run queue across every notebook, as a per-notebook map
+ * `{ [relPath]: {running, queue} }`. Each notebook has its own kernel and its own
+ * FIFO, so an agent's run only ever waits behind ITS OWN notebook's cells — this
+ * map lets the agent see that (and see whether another notebook is busy) rather
+ * than a single global queue. `working` names the caller's pinned notebook so the
+ * agent can find its own slice; a notebook with no active/pending run is absent
+ * (its queue is empty). Reads only; never boots a kernel.
  */
-export function getRunQueue() {
-	return queueStateFor(getActiveNotebookPath());
+export function getRunQueue(sessionId?: string) {
+	const workingAbs = targetFor(sessionId);
+	const byAbs = queuesByNotebook();
+	const notebooks: Record<string, QueueState> = {};
+	for (const [abs, state] of Object.entries(byAbs)) notebooks[workspaceRelative(abs)] = state;
+	return { working: workspaceRelative(workingAbs), notebooks };
 }
 
 /**
