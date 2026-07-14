@@ -31,7 +31,8 @@
  * cell + every notebook's ordered queue, each entry tagged with its `nb`), so a
  * client renders "queued · 2" by reading a snapshot rather than reconstructing it
  * from a stream of deltas (a missed event self-heals on the next one). The MCP
- * `run_queue` tool instead reads a single notebook's slice (`queueStateFor`).
+ * `run_queue` tool reads the whole per-notebook map (`queuesByNotebook`) so an
+ * agent sees every notebook's own queue; `queueStateFor` returns one slice.
  */
 import { publishGlobal } from './events';
 import type { Actor, QueueEntryView, QueueState, RunningView } from './types';
@@ -144,6 +145,27 @@ export function queueStateAll(): { running: RunningView[]; queue: QueueEntryView
 		for (const item of pendingSnapshot(q)) queue.push(item);
 	}
 	return { running, queue };
+}
+
+/**
+ * The per-notebook queue map: `{ [absNbPath]: {running, queue} }`, one entry for
+ * every notebook that has an active or pending run. This is what the MCP
+ * `run_queue` tool returns so an agent sees each notebook's OWN kernel queue —
+ * with one kernel per notebook, a run only ever waits behind its own notebook's
+ * cells, and cross-notebook contention no longer exists. Only non-idle notebooks
+ * appear (an idle queue is pruned); a notebook absent from the map has an empty
+ * queue. Keyed by absolute path — the caller maps to workspace-relative for the
+ * agent-facing shape.
+ */
+export function queuesByNotebook(): Record<string, QueueState> {
+	const out: Record<string, QueueState> = {};
+	for (const [nb, q] of queues) {
+		out[nb] = {
+			running: q.active ? { nb: q.active.nb, cellId: q.active.cellId, actor: q.active.actor } : null,
+			queue: pendingSnapshot(q)
+		};
+	}
+	return out;
 }
 
 function broadcast() {

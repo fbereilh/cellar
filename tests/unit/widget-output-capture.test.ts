@@ -26,7 +26,7 @@ describe('Output widget capture routing', () => {
 	beforeEach(() => resetWidgets());
 
 	it('maps a captured msg_id to the Output comm and appends outputs', () => {
-		openWidget('out1', { _model_name: 'OutputModel', outputs: [] });
+		openWidget('/ws/a.ipynb', 'out1', { _model_name: 'OutputModel', outputs: [] });
 		setOutputCapture('out1', 'msgA');
 		expect(outputCommForMsg('msgA')).toBe('out1');
 
@@ -37,7 +37,7 @@ describe('Output widget capture routing', () => {
 	});
 
 	it('clear_output(wait=true) defers: next append replaces, not adds', () => {
-		openWidget('out1', { _model_name: 'OutputModel', outputs: [] });
+		openWidget('/ws/a.ipynb', 'out1', { _model_name: 'OutputModel', outputs: [] });
 		appendWidgetOutput('out1', STREAM('old\n'));
 		expect(outputsOf('out1')).toHaveLength(1);
 		clearWidgetOutput('out1', true); // armed, not yet cleared
@@ -47,13 +47,13 @@ describe('Output widget capture routing', () => {
 	});
 
 	it('clear_output(wait=false) empties immediately', () => {
-		openWidget('out1', { outputs: [STREAM('a')] });
+		openWidget('/ws/a.ipynb', 'out1', { outputs: [STREAM('a')] });
 		clearWidgetOutput('out1', false);
 		expect(outputsOf('out1')).toEqual([]);
 	});
 
 	it('re-targeting msg_id unhooks the old message; empty stops capture', () => {
-		openWidget('out1', { outputs: [] });
+		openWidget('/ws/a.ipynb', 'out1', { outputs: [] });
 		setOutputCapture('out1', 'msgA');
 		setOutputCapture('out1', 'msgB');
 		expect(outputCommForMsg('msgA')).toBeUndefined();
@@ -63,7 +63,7 @@ describe('Output widget capture routing', () => {
 	});
 
 	it('resetWidgets drops capture mappings (a session change)', () => {
-		openWidget('out1', { outputs: [] });
+		openWidget('/ws/a.ipynb', 'out1', { outputs: [] });
 		setOutputCapture('out1', 'msgA');
 		resetWidgets();
 		expect(outputCommForMsg('msgA')).toBeUndefined();
@@ -71,7 +71,7 @@ describe('Output widget capture routing', () => {
 	});
 
 	it('registering a widget via comm_open keeps its non-output traits', () => {
-		openWidget('s1', { _model_name: 'IntSliderModel', value: 3, max: 10 });
+		openWidget('/ws/a.ipynb', 's1', { _model_name: 'IntSliderModel', value: 3, max: 10 });
 		updateWidget('s1', { value: 8 });
 		const m = widgetSnapshot().models.find((x) => x.comm_id === 's1');
 		expect(m?.state.value).toBe(8);

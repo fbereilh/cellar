@@ -477,25 +477,29 @@ def _cellar_inspect(_target):
 `;
 
 /** Guard shared by the two agent inspection tools: never boot a kernel, never
- *  queue a probe behind a running cell. Returns a short-circuit payload or null. */
-function inspectionGuard(): { started: boolean; busy?: boolean; session_id: SessionId | null } | null {
-	const status = kernelStatus().status;
+ *  queue a probe behind a running cell. Reads the target notebook's OWN kernel
+ *  (each notebook has its own), so an agent inspecting variables sees its working
+ *  notebook's namespace. Returns a short-circuit payload or null. */
+function inspectionGuard(nbPath?: string | null): { started: boolean; busy?: boolean; session_id: SessionId | null } | null {
+	const status = kernelStatus(nbPath).status;
 	if (status === 'not_started') return { started: false, session_id: null };
-	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession().session_id };
+	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession(nbPath).session_id };
 	return null;
 }
 
 /**
- * MCP `list_variables`: the live kernel's data variables with type + schema
- * (DataFrame shape/columns/dtypes, numpy dtype/shape, container sizes). Read-only
- * introspection; reflects only the LIVE session (`session_id`, `stale`). Returns
- * `{ started: false }` when no kernel is running (never boots one).
+ * MCP `list_variables`: the target notebook's kernel data variables with type +
+ * schema (DataFrame shape/columns/dtypes, numpy dtype/shape, container sizes).
+ * Each notebook has its own kernel, so `nbPath` selects whose namespace to read
+ * (the calling agent's working notebook). Read-only introspection; reflects only
+ * the LIVE session (`session_id`, `stale`). Returns `{ started: false }` when that
+ * notebook's kernel is not running (never boots one).
  */
-export async function listVariables() {
-	const guard = inspectionGuard();
+export async function listVariables(nbPath?: string | null) {
+	const guard = inspectionGuard(nbPath);
 	if (guard) return guard;
-	const { session, line } = await execProbe(LIST_VARS_PROBE);
-	const stale = session !== currentSessionId();
+	const { session, line } = await execProbe(LIST_VARS_PROBE, nbPath);
+	const stale = session !== currentSessionId(nbPath);
 	return {
 		started: true,
 		session_id: session,
@@ -508,15 +512,16 @@ export async function listVariables() {
 /**
  * MCP `inspect_variable`: one variable in detail (full type, shape/len,
  * DataFrame columns + a small head sample, array stats, dict keys, …), bounded so
- * a huge object never floods the output. `found:false` when the name is unset in
- * the live namespace. Reflects only the LIVE session.
+ * a huge object never floods the output. Reads the target notebook's OWN kernel
+ * (`nbPath` = the calling agent's working notebook). `found:false` when the name
+ * is unset in that namespace. Reflects only the LIVE session.
  */
-export async function inspectVariable(name: string) {
-	const guard = inspectionGuard();
+export async function inspectVariable(name: string, nbPath?: string | null) {
+	const guard = inspectionGuard(nbPath);
 	if (guard) return guard;
 	const code = INSPECT_PROBE_HEAD + `\nprint(_cj.dumps(_cellar_inspect(${JSON.stringify(String(name))})))\ndel _cellar_inspect\n`;
-	const { session, line } = await execProbe(code);
-	const stale = session !== currentSessionId();
+	const { session, line } = await execProbe(code, nbPath);
+	const stale = session !== currentSessionId(nbPath);
 	// INSPECT_PROBE_HEAD prints one _cellar_inspect detail object (or {found:false}).
 	const detail: InspectDetail = line ? (JSON.parse(line) as InspectDetail) : { found: false, name };
 	return { started: true, session_id: session, ...(stale ? { stale: true } : {}), ...detail };

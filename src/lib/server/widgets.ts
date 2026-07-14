@@ -28,12 +28,26 @@
  * change (a fresh namespace has no widgets), never persisted to the `.ipynb`
  * (clean.ts strips the volatile widget output + the `metadata.widgets` blob).
  * Binary comm buffers are ignored — tqdm's widget state is all JSON.
+ *
+ * With one kernel PER notebook, every model records the absolute path of the
+ * notebook whose kernel opened it (`nb`), and every SSE event carries that `nb`
+ * tag. Comm ids are globally unique per session, so one store still spans all
+ * notebooks without collision; the `nb` tag is what lets a per-notebook restart
+ * wipe only its own widgets and lets a client associate a model with its tab.
  */
 import { publishGlobal } from './events';
 import type { WidgetModel, WidgetSnapshot } from './types';
 
-/** comm_id → current merged model state. One map for the live kernel session. */
+/** comm_id → current merged model state. One map for every notebook's kernels. */
 const models = new Map<string, WidgetModel>();
+
+/** comm_id → absolute path of the notebook whose kernel owns the comm. */
+const commToNb = new Map<string, string>();
+
+/** The owning notebook of a comm, for tagging an update/close/output event. */
+function nbOf(commId: string): string | undefined {
+	return commToNb.get(commId);
+}
 
 /**
  * `Output` widget capture routing. An `Output` widget (the result area an
@@ -57,27 +71,31 @@ export function widgetSnapshot(): WidgetSnapshot {
 }
 
 /**
- * A `comm_open` for `jupyter.widget`: record the model's initial state. `state`
- * carries `_model_name` (e.g. `IntProgressModel`, `HTMLModel`, `HBoxModel`),
- * which is how the frontend picks a renderer.
+ * A `comm_open` for `jupyter.widget`: record the model's initial state under the
+ * owning notebook. `state` carries `_model_name` (e.g. `IntProgressModel`,
+ * `HTMLModel`, `HBoxModel`), which is how the frontend picks a renderer. `nb` is
+ * the absolute path of the notebook whose kernel opened the comm.
  */
-export function openWidget(commId: string, state: Record<string, unknown>): void {
-	const model: WidgetModel = { comm_id: commId, state: { ...state } };
+export function openWidget(nb: string, commId: string, state: Record<string, unknown>): void {
+	commToNb.set(commId, nb);
+	const model: WidgetModel = { comm_id: commId, nb, state: { ...state } };
 	models.set(commId, model);
-	publishGlobal({ type: 'widget:open', comm_id: commId, state: model.state });
+	publishGlobal({ type: 'widget:open', nb, comm_id: commId, state: model.state });
 }
 
 /**
  * A `comm_msg` `update`: merge the changed traits onto the stored state (tqdm
- * pushes just `value` / the label text each tick) and rebroadcast the delta.
- * An update for an unknown comm is stored as-is so a late-registered model still
- * renders — over-keeping is the safe direction for display-only state.
+ * pushes just `value` / the label text each tick) and rebroadcast the delta,
+ * tagged with the owning notebook. An update for an unknown comm is stored as-is
+ * so a late-registered model still renders — over-keeping is the safe direction
+ * for display-only state.
  */
 export function updateWidget(commId: string, state: Record<string, unknown>): void {
 	const prev = models.get(commId);
-	const merged: WidgetModel = { comm_id: commId, state: { ...(prev?.state ?? {}), ...state } };
+	const nb = prev?.nb ?? nbOf(commId);
+	const merged: WidgetModel = { comm_id: commId, nb, state: { ...(prev?.state ?? {}), ...state } };
 	models.set(commId, merged);
-	publishGlobal({ type: 'widget:update', comm_id: commId, state });
+	publishGlobal({ type: 'widget:update', nb, comm_id: commId, state });
 }
 
 /**
@@ -86,8 +104,9 @@ export function updateWidget(commId: string, state: Record<string, unknown>): vo
  * the client stop expecting more.
  */
 export function closeWidget(commId: string): void {
-	if (!models.has(commId)) return;
-	publishGlobal({ type: 'widget:close', comm_id: commId });
+	const model = models.get(commId);
+	if (!model) return;
+	publishGlobal({ type: 'widget:close', nb: model.nb, comm_id: commId });
 }
 
 /**
@@ -114,15 +133,16 @@ export function outputCommForMsg(msgId: string | undefined): string | undefined 
 /** Append one nbformat output to an Output widget, honoring an armed clear. */
 export function appendWidgetOutput(commId: string, output: Record<string, unknown>): void {
 	const prev = models.get(commId);
+	const nb = prev?.nb ?? nbOf(commId);
 	let outputs = Array.isArray(prev?.state?.outputs) ? [...(prev!.state.outputs as unknown[])] : [];
 	if (pendingClear.has(commId)) {
 		outputs = [];
 		pendingClear.delete(commId);
 	}
 	outputs.push(output);
-	const merged: WidgetModel = { comm_id: commId, state: { ...(prev?.state ?? {}), outputs } };
+	const merged: WidgetModel = { comm_id: commId, nb, state: { ...(prev?.state ?? {}), outputs } };
 	models.set(commId, merged);
-	publishGlobal({ type: 'widget:update', comm_id: commId, state: { outputs } });
+	publishGlobal({ type: 'widget:update', nb, comm_id: commId, state: { outputs } });
 }
 
 /**
@@ -135,9 +155,10 @@ export function clearWidgetOutput(commId: string, wait: boolean): void {
 		return;
 	}
 	const prev = models.get(commId);
-	const merged: WidgetModel = { comm_id: commId, state: { ...(prev?.state ?? {}), outputs: [] } };
+	const nb = prev?.nb ?? nbOf(commId);
+	const merged: WidgetModel = { comm_id: commId, nb, state: { ...(prev?.state ?? {}), outputs: [] } };
 	models.set(commId, merged);
-	publishGlobal({ type: 'widget:update', comm_id: commId, state: { outputs: [] } });
+	publishGlobal({ type: 'widget:update', nb, comm_id: commId, state: { outputs: [] } });
 }
 
 /**
@@ -155,6 +176,7 @@ export function resetWidgets(commIds?: string[]): void {
 	if (commIds === undefined) {
 		msgIdToComm.clear();
 		commToMsgId.clear();
+		commToNb.clear();
 		pendingClear.clear();
 		if (!models.size) return;
 		models.clear();
@@ -167,6 +189,7 @@ export function resetWidgets(commIds?: string[]): void {
 		const msg = commToMsgId.get(commId);
 		if (msg !== undefined) msgIdToComm.delete(msg);
 		commToMsgId.delete(commId);
+		commToNb.delete(commId);
 		pendingClear.delete(commId);
 	}
 	if (removed.length) publishGlobal({ type: 'widget:clear', comm_ids: removed });
