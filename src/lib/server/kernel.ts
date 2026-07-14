@@ -26,13 +26,14 @@
  * no way for outputs to be duplicated or cross runs.
  */
 import { basename, sep } from 'node:path';
-import { KernelManager, ServerConnection } from '@jupyterlab/services';
+import { KernelManager, ServerConnection, CommsOverSubshells } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
 import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from './notebook';
 import { workspaceRoot } from './fstree';
 import { addProjectRootToPath } from './ui-state';
 import { projectRootAddCode, projectRootRemoveCode } from './projectRoot';
+import { CONTROL_COMM_TARGET, RESTART_MAGIC_CODE, controlOp } from './controlMagic';
 import { publish, publishGlobal } from './events';
 import {
 	openWidget,
@@ -230,6 +231,85 @@ function registerWidgetComm(nbKernel: NotebookKernel, kernel: KernelConnection):
 		const message = err instanceof Error ? err.message : String(err);
 		logWarn('kernel', `ipywidgets comm target not registered: ${message}`);
 	}
+}
+
+/**
+ * Register the `cellar.control` comm target on a freshly-connected kernel: the
+ * channel a Cellar magic uses to ask the SERVER to act on this notebook's kernel.
+ * Currently one op, `restart` (from `%restart_python`), which runs a managed
+ * `restartKernel(nbPath)` for THIS notebook — the closure captures `nbKernel`, so
+ * the restart targets the right kernel and never another notebook's.
+ *
+ * Registered once per kernel connection (like `registerWidgetComm`): a plain
+ * `restart()`/autorestart keeps the connection and thus this target, while a
+ * rebind builds a new connection and re-runs this via `getKernel()`.
+ */
+function registerControlComm(nbKernel: NotebookKernel, kernel: KernelConnection): void {
+	try {
+		kernel.registerCommTarget(CONTROL_COMM_TARGET, (comm, msg) => {
+			handleControlData(nbKernel, msg.content?.data);
+			comm.onMsg = (m: KernelMessage.ICommMsgMsg) => handleControlData(nbKernel, m.content?.data);
+		});
+	} catch (err) {
+		// A control target that fails to register must never break kernel bring-up;
+		// %restart_python just won't reach the server (it prints its friendly line and
+		// the comm open is dropped).
+		const message = err instanceof Error ? err.message : String(err);
+		logWarn('kernel', `cellar control comm target not registered: ${message}`);
+	}
+}
+
+/**
+ * Act on a `cellar.control` payload. `restart` runs a managed restart of the
+ * calling notebook's kernel, DEFERRED until the kernel is next idle: the restart
+ * request arrives as an iopub `comm_open` WHILE the `%restart_python` cell is still
+ * executing, and tearing the process down mid-run would reject that run's future
+ * (surfacing a spurious error on the cell). Jupyter emits the kernel's `idle`
+ * status only AFTER the cell's `execute_reply`, so waiting for idle guarantees the
+ * run has completed (and its `run:end` published) before we restart. A bounded
+ * fallback covers the pathological "no idle ever arrives" case.
+ */
+function handleControlData(nbKernel: NotebookKernel, data: unknown): void {
+	if (controlOp(data) !== 'restart') return;
+	const kernel = nbKernel.connection;
+	if (!kernel) return;
+	logInfo('kernel', `%restart_python requested for ${nbKernel.nbPath}`);
+	void whenIdle(kernel).then(() => {
+		// Guard against a rebind/teardown that replaced the connection while we waited:
+		// only restart if this is still the notebook's live kernel.
+		if (kernels.get(nbKernel.nbPath) !== nbKernel) return;
+		return restartKernel(nbKernel.nbPath);
+	}).catch((err: unknown) => {
+		const message = err instanceof Error ? err.message : String(err);
+		logError('kernel', `%restart_python restart failed for ${nbKernel.nbPath}: ${message}`);
+	});
+}
+
+/**
+ * Resolve once the kernel is idle: immediately if it already is, otherwise on its
+ * next `idle` status. A bounded timeout resolves anyway so a caller can never hang
+ * forever on a kernel that stops reporting status. The one-shot listener always
+ * disconnects itself, so it never leaks.
+ */
+function whenIdle(kernel: KernelConnection, timeoutMs = 10000): Promise<void> {
+	if (kernel.status === 'idle') return Promise.resolve();
+	return new Promise<void>((resolve) => {
+		let done = false;
+		const finish = () => {
+			if (done) return;
+			done = true;
+			try {
+				kernel.statusChanged.disconnect(handler);
+			} catch {}
+			clearTimeout(timer);
+			resolve();
+		};
+		const handler: StatusListener = (_sender, status) => {
+			if (status === 'idle') finish();
+		};
+		const timer = setTimeout(finish, timeoutMs);
+		kernel.statusChanged.connect(handler);
+	});
 }
 
 /**
@@ -482,6 +562,8 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 async function initKernel(kernel: KernelConnection): Promise<void> {
 	await runSilent(kernel, STARTUP_CODE);
 	await runSilent(kernel, DATAFRAME_FORMATTER_CODE);
+	// Register the %restart_python line magic (managed restart via the control comm).
+	await runSilent(kernel, RESTART_MAGIC_CODE);
 	// Add the workspace root to sys.path so a notebook in any subfolder can import
 	// project modules (and the `.py` module the export writes at the root). Gated by
 	// the per-workspace setting (default ON) and re-read here so a restart /
@@ -531,10 +613,26 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		const mgr = await getManager();
 		const kernel = await mgr.startNew({ name: 'python3' });
 		nbKernel.connection = kernel;
+		// Run every comm on the kernel's MAIN shell, not a per-comm-target subshell
+		// (@jupyterlab/services' default under ipykernel 7). Cellar serializes runs
+		// anyway, so it gains nothing from subshells — and a comm subshell is actively
+		// harmful here: opening one issues a `create_subshell_request` whose future
+		// `restart()` cancels, and @jupyterlab rejects that future WITHOUT an awaiter,
+		// crashing the Node process (an unhandled rejection). `%restart_python` opens a
+		// comm and then restarts, so it would hit this every time; a widget open racing
+		// a restart hits the same latent trap. Disabling subshells removes it entirely
+		// and matches classic-Jupyter comm behavior. Must be set before any comm opens.
+		try {
+			kernel.commsOverSubshells = CommsOverSubshells.Disabled;
+		} catch {
+			// Older @jupyterlab/services without the property: nothing to disable.
+		}
 		beginSession(nbKernel);
 		// Register before any user code runs so a widget `comm_open` is never missed.
 		registerWidgetComm(nbKernel, kernel);
 		registerWidgetOutputCapture(kernel);
+		// The control channel `%restart_python` signals the server on.
+		registerControlComm(nbKernel, kernel);
 		// A kernel that dies is restarted by jupyter_server behind our back, which
 		// clears the namespace without any Cellar call. Catch that too, so a cell
 		// stamped before the crash never reads as "ran this session" after it.
