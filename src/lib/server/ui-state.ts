@@ -21,6 +21,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { workspaceRoot } from '$lib/server/fstree';
+import { ADD_PROJECT_ROOT_KEY, projectRootEnabled } from '$lib/server/projectRoot';
 
 const WRITE_DEBOUNCE_MS = 250;
 
@@ -69,6 +70,15 @@ export function setUiState(patch: UiState | null | undefined): UiState {
 	}
 	scheduleWrite();
 	return { ...store };
+}
+
+/**
+ * Whether a notebook's kernel should have the workspace root on `sys.path`
+ * (default TRUE). Read at kernel-start time by `kernel.ts`; an env override
+ * (`CELLAR_ADD_PROJECT_ROOT`) wins over the stored value. See `projectRoot.ts`.
+ */
+export function addProjectRootToPath(): boolean {
+	return projectRootEnabled(ensureLoaded()[ADD_PROJECT_ROOT_KEY], process.env.CELLAR_ADD_PROJECT_ROOT);
 }
 
 function scheduleWrite(): void {
