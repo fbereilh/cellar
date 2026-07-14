@@ -5,6 +5,8 @@
 	import Sidebar from '$lib/Sidebar.svelte';
 	import LiveNotebook from '$lib/LiveNotebook.svelte';
 	import FileTab from '$lib/FileTab.svelte';
+	import ImageTab from '$lib/ImageTab.svelte';
+	import { isImagePath } from '$lib/imagePath';
 	import Settings from '$lib/Settings.svelte';
 	import CommandPalette from '$lib/CommandPalette.svelte';
 	import { buildCommands } from '$lib/commands';
@@ -21,8 +23,8 @@
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import type { BlameLine } from '$lib/server/git';
 
-	/** Kind of an open tab: the canonical notebook, an opened `.ipynb`/`.py`, or a text file. */
-	type TabKind = 'notebook' | 'ipynb' | 'file';
+	/** Kind of an open tab: the canonical notebook, an opened `.ipynb`/`.py`, a rendered image, or a text file. */
+	type TabKind = 'notebook' | 'ipynb' | 'image' | 'file';
 	/** An open tab in the shell. Structurally a superset of what Navbar renders. */
 	interface Tab {
 		id: string;
@@ -249,6 +251,7 @@
 	let activeTabId = $state<string | null>(null);
 	let tabsRestored = $state(false);
 	const fileTabs = $derived(tabs.filter((t) => t.kind === 'file'));
+	const imageTabs = $derived(tabs.filter((t) => t.kind === 'image'));
 	const ipynbTabs = $derived(tabs.filter((t) => t.kind === 'ipynb'));
 	const notebookOpen = $derived(tabs.some((t) => t.kind === 'notebook'));
 	const activeTab = $derived(tabs.find((t) => t.id === activeTabId) ?? null);
@@ -341,6 +344,8 @@
 	const pyKindCache = new Map<string, TabKind>(); // rel path → 'ipynb' | 'file'
 	function baseKindFor(path: string): TabKind {
 		if (/\.ipynb$/i.test(path)) return 'ipynb';
+		// Check images early so a binary image can never fall through to a text kind.
+		if (isImagePath(path)) return 'image';
 		if (isPyPath(path)) return pyKindCache.get(path) ?? 'file';
 		return 'file';
 	}
@@ -1189,6 +1194,12 @@
 			{#each fileTabs as tab (tab.id)}
 				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
 					<FileTab path={tab.path} onDirty={onFileDirty} gitRefresh={fsRefreshSignal} onBlame={handleBlame} />
+				</div>
+			{/each}
+
+			{#each imageTabs as tab (tab.id)}
+				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
+					<ImageTab path={tab.path} />
 				</div>
 			{/each}
 
