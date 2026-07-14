@@ -6,6 +6,7 @@
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge';
+	import { isOverKernelCap } from '$lib/kernelCap';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
 	import { outlineRows as buildOutlineRows, sectionRunState, headingNumberPrefix } from '$lib/headings';
 	import { getUi, setUi } from '$lib/uiState';
@@ -64,6 +65,8 @@
 		kernelInfo?: KernelInfo | null;
 		/** One card per notebook (open tab or live kernel) for the Kernels section. */
 		kernelCards?: KernelCard[];
+		/** Soft cap on live kernels; past it the section warns (0 = disabled). */
+		maxKernels?: number;
 		variables?: VariableInfo[];
 		varsLoading?: boolean;
 		varsError?: string;
@@ -110,6 +113,7 @@
 		mcp = null,
 		kernelInfo,
 		kernelCards = [],
+		maxKernels = 8,
 		variables,
 		varsLoading,
 		varsError,
@@ -164,9 +168,12 @@
 		if (open.environment) environmentMounted = true;
 	});
 
-	// Live kernel count for the section header (feeds the §3.1 cap warning later).
+	// Live kernel count for the section header (feeds the §3.1 cap warning).
 	// Counts only notebooks with a running kernel, not open-but-never-run tabs.
 	const kernelCount = $derived(kernelCards.filter((c) => c.hasKernel).length);
+	// Past the soft cap, each kernel being a full Python process (100s of MB with
+	// pandas/pyspark) adds up — warn (never block). `maxKernels <= 0` disables it.
+	const kernelsOverCap = $derived(isOverKernelCap(kernelCount, maxKernels));
 	// Per-card in-flight state so a card's controls disable + spinner while an
 	// interrupt/restart/shutdown it fired is still resolving. Keyed by notebook path.
 	let actingPaths = $state<Set<string>>(new Set());
@@ -680,11 +687,27 @@
 	<div class="flex items-center">
 		{@render header('kernels', 'Kernels', 'section-kernels')}
 		{#if kernelCount > 0}
-			<span class="badge badge-xs badge-neutral shrink-0" title="{kernelCount} live kernel{kernelCount === 1 ? '' : 's'}" data-testid="kernel-count">{kernelCount}</span>
+			<span
+				class="badge badge-xs shrink-0 {kernelsOverCap ? 'badge-warning' : 'badge-neutral'}"
+				title="{kernelCount} live kernel{kernelCount === 1 ? '' : 's'}{kernelsOverCap ? ` — over the soft cap of ${maxKernels}` : ''}"
+				data-testid="kernel-count">{kernelCount}</span>
 		{/if}
 		{@render refreshBtn(onRefreshKernel, 'Refresh kernel status')}
 	</div>
 	{#if open.kernels}
+		{#if kernelsOverCap}
+			<!-- Warn-only past the soft cap: N Python processes with pandas/pyspark add
+			     up fast. Never blocks a run — a run still lazily starts its kernel. -->
+			<div
+				class="mx-3 mb-2 flex items-start gap-1.5 rounded-lg border border-warning/40 bg-warning/10 p-2"
+				data-testid="kernel-cap-warning">
+				<svg class="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+				<p class="text-[11px] leading-relaxed text-base-content/70">
+					<span class="font-semibold text-base-content/80">{kernelCount} kernels running</span> — high memory use.
+					Each is a full Python process; shut down ones you're done with to reclaim memory.
+				</p>
+			</div>
+		{/if}
 		<!-- Cellar runs one kernel PER notebook (lazy: started on that notebook's first
 		     run). One card per notebook — every open tab (an unrun one reads "not
 		     started"), plus any live kernel whose tab was closed (still in memory).

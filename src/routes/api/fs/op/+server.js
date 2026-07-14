@@ -7,6 +7,7 @@ import {
 	copyEntry
 } from '$lib/server/fstree';
 import { dropDocs, rekeyDocs } from '$lib/server/notebook';
+import { shutdownKernelsUnder } from '$lib/server/kernel';
 
 /**
  * File-management operations for the sidebar file explorer. A single POST
@@ -35,6 +36,10 @@ export async function POST({ request }) {
 			case 'delete': {
 				const res = deleteEntry(body.path);
 				dropDocs(res.path);
+				// Free the kernel process(es) of the deleted notebook (or every notebook
+				// under a deleted folder), not just the in-memory doc. Best-effort: a
+				// failed shutdown must not fail the delete the user already committed to.
+				shutdownKernelsUnder(res.path).catch(() => {});
 				return json({ ok: true, ...res });
 			}
 			case 'move': {

@@ -25,12 +25,12 @@
  * request's response, so one run == one stream. No global broadcast, so there is
  * no way for outputs to be duplicated or cross runs.
  */
-import { basename } from 'node:path';
+import { basename, sep } from 'node:path';
 import { KernelManager, ServerConnection } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
-import { getActiveNotebookPath, workspaceRelative } from './notebook';
-import { publishGlobal } from './events';
+import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from './notebook';
+import { publish, publishGlobal } from './events';
 import {
 	openWidget,
 	updateWidget,
@@ -118,9 +118,45 @@ function makeSettings() {
 async function getManager(): Promise<KernelManager> {
 	if (!manager) {
 		manager = new KernelManager({ serverSettings: makeSettings() });
+		// Detect idle-culled kernels. The sidecar's MappingKernelManager culls a
+		// kernel that has been idle past `cull_idle_timeout` (configured in
+		// bin/cellar.js); when it does, the kernel vanishes from the server's running
+		// list. The KernelManager polls that list (~10s) and fires `runningChanged`,
+		// so we reconcile our Map against it: any kernel we hold that is gone
+		// server-side was culled and must be torn down (card drops, epoch bumped, so
+		// its cells correctly read "not run this session"). Feature-guarded so a mock
+		// manager without the signal (unit tests) is a harmless no-op.
+		manager.runningChanged?.connect?.(() => reconcileCulledKernels());
 	}
 	await manager.ready;
 	return manager;
+}
+
+/**
+ * Reconcile the kernel Map against the server's live running list: any kernel we
+ * still hold whose connection is no longer running server-side was culled (idle
+ * shutdown) — tear it down so its card drops and its epoch is invalidated. Driven
+ * by the KernelManager's `runningChanged` poll. Safe to call repeatedly:
+ * `teardownKernel` is idempotent (it removes the Map entry synchronously), so a
+ * repeated poll can't double-process. A still-booting kernel (null connection) is
+ * skipped — it isn't in the running list yet by our own doing, not a cull.
+ */
+function reconcileCulledKernels(): void {
+	const mgr = manager;
+	if (!mgr || typeof mgr.running !== 'function') return;
+	const liveIds = new Set<string>();
+	try {
+		for (const model of mgr.running()) liveIds.add(model.id);
+	} catch {
+		return; // a transient poll error must never tear kernels down
+	}
+	for (const nbKernel of [...kernels.values()]) {
+		const conn = nbKernel.connection;
+		if (!conn) continue; // still starting — not a cull
+		if (liveIds.has(conn.id)) continue; // still alive server-side
+		logWarn('kernel', `kernel for ${nbKernel.nbPath} was culled by the sidecar (idle); reconciling`);
+		void teardownKernel(nbKernel, 'kernel_culled', { alreadyGone: true }).then(publishKernelStatus);
+	}
 }
 
 /**
@@ -522,6 +558,25 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 }
 
 /**
+ * Free every kernel at or under a workspace path that a sidebar file-management
+ * op just deleted — the notebook itself, or (when a folder was deleted) any
+ * notebook nested under it. Deleting a notebook must free its Python process, not
+ * just its document (`dropDocs` handles the doc). Idempotent: a path with no live
+ * kernel is a no-op, matching `dropDocs`. Returns how many kernels were shut down.
+ */
+export async function shutdownKernelsUnder(deletedPath: string): Promise<number> {
+	const deletedAbs = resolveNotebookPath(deletedPath);
+	const prefix = deletedAbs + sep;
+	const victims = [...kernels.values()].filter(
+		(k) => k.nbPath === deletedAbs || k.nbPath.startsWith(prefix)
+	);
+	if (victims.length === 0) return 0;
+	await Promise.all(victims.map((k) => teardownKernel(k, 'notebook_deleted')));
+	publishKernelStatus();
+	return victims.length;
+}
+
+/**
  * Restart notebook `nbPath`'s kernel process (clears ITS namespace) while KEEPING
  * the same connection. Other notebooks' kernels are untouched. Cellar's backend,
  * MCP server, and document are untouched — this is what makes the agent interface
@@ -554,26 +609,49 @@ export async function restartKernel(nbPath?: string | null) {
 /**
  * Tear a single notebook's kernel down: disconnect its handler, shut the process
  * down, drop its pending queue and widgets, and remove it from the Map. Used by
- * a per-notebook rebind and the (future) explicit shutdown control. Bumps the
- * epoch so any cell stamped before teardown reads as not-this-session.
+ * the explicit shutdown control, a per-notebook rebind, and idle-cull
+ * reconciliation. Bumps the epoch so any cell stamped before teardown reads as
+ * not-this-session, and publishes a per-notebook `kernel:shutdown` event so an
+ * open tab refetches its run-status (its cells now read "not run this session").
+ *
+ * Idempotent: the Map entry is removed synchronously up front, so a concurrent
+ * teardown (e.g. a cull poll racing an explicit shutdown) is a no-op the second
+ * time. `alreadyGone` skips the REST shutdown call for a kernel the sidecar has
+ * already removed (idle cull), disposing our local connection instead.
  */
-async function teardownKernel(nbKernel: NotebookKernel, reason = 'kernel_rebind'): Promise<void> {
+async function teardownKernel(
+	nbKernel: NotebookKernel,
+	reason = 'kernel_rebind',
+	{ alreadyGone = false }: { alreadyGone?: boolean } = {}
+): Promise<void> {
 	const { nbPath } = nbKernel;
+	if (kernels.get(nbPath) !== nbKernel) return; // already torn down
+	kernels.delete(nbPath);
 	clearRunQueue(nbPath, reason);
-	if (nbKernel.connection) {
+	const conn = nbKernel.connection;
+	if (conn) {
 		try {
-			if (nbKernel.statusHandler) nbKernel.connection.statusChanged.disconnect(nbKernel.statusHandler);
+			if (nbKernel.statusHandler) conn.statusChanged.disconnect(nbKernel.statusHandler);
 		} catch {}
-		try {
-			await nbKernel.connection.shutdown();
-		} catch {}
+		if (alreadyGone) {
+			// The server already removed the kernel; just dispose our dead connection.
+			try {
+				conn.dispose?.();
+			} catch {}
+		} else {
+			try {
+				await conn.shutdown();
+			} catch {}
+		}
 	}
 	// The old namespace is gone; bump so its epoch can never read as current, and
 	// drop this kernel's widgets from the store.
 	beginSession(nbKernel);
 	nbKernel.connection = null;
 	nbKernel.statusHandler = null;
-	if (kernels.get(nbPath) === nbKernel) kernels.delete(nbPath);
+	// Invalidate this notebook's run-status in every open tab: with no live kernel
+	// its cells must read "not run this session".
+	publish({ type: 'kernel:shutdown', nb: nbPath, reason });
 }
 
 /**

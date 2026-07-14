@@ -175,6 +175,33 @@ function flagValue(...names) {
 function hasFlag(...names) {
 	return names.some((n) => argv.includes(n));
 }
+
+/**
+ * Sidecar CLI args for idle-kernel culling (empty when disabled). Reads
+ * CELLAR_KERNEL_IDLE_TIMEOUT (default 7200s / 2h; 0 or non-positive disables) and
+ * CELLAR_KERNEL_CULL_INTERVAL (default min(300, timeout)). Logs the effective
+ * policy so a stuck-alive kernel is diagnosable.
+ */
+function cullingArgs() {
+	const raw = process.env.CELLAR_KERNEL_IDLE_TIMEOUT;
+	const timeout = raw == null || raw === '' ? 7200 : Number(raw);
+	if (!Number.isFinite(timeout) || timeout <= 0) {
+		console.log('[cellar] idle-kernel culling: disabled');
+		return [];
+	}
+	const t = Math.floor(timeout);
+	const rawInterval = process.env.CELLAR_KERNEL_CULL_INTERVAL;
+	const intervalNum = rawInterval == null || rawInterval === '' ? Math.min(300, t) : Number(rawInterval);
+	const interval = Number.isFinite(intervalNum) && intervalNum > 0 ? Math.floor(intervalNum) : Math.min(300, t);
+	console.log(`[cellar] idle-kernel culling: ${t}s idle, swept every ${interval}s`);
+	return [
+		`--MappingKernelManager.cull_idle_timeout=${t}`,
+		`--MappingKernelManager.cull_interval=${interval}`,
+		// Cellar always holds a websocket to each kernel, so a kernel is "connected"
+		// even when idle; without this, jupyter's culler would never touch it.
+		'--MappingKernelManager.cull_connected=True'
+	];
+}
 const KNOWN_FLAGS = new Set(['--help', '-h', '--version', '-v', '--update', '--workspace', '-w', '--venv', '--python', '--yes', '-y', '--dev', '--build', '--no-mcp-config', '--new', '--force']);
 const VALUE_FLAGS = new Set(['--workspace', '-w', '--venv', '--python']);
 // First non-flag, non-flag-value token is the positional workspace path.
@@ -664,7 +691,16 @@ async function main() {
 		console.log(`[cellar] .mcp.json: ${status} (agent connects via \`cellar mcp\`)`);
 	}
 
-	// 5) Jupyter sidecar (host env), discovering our kernelspec via JUPYTER_PATH.
+	// Idle-kernel culling. With one kernel PER notebook, N idle Python processes
+	// (100s of MB each with pandas/pyspark) can exhaust RAM. Lean on the sidecar's
+	// own MappingKernelManager culler rather than a hand-rolled timer: it shuts a
+	// kernel down after `cull_idle_timeout` of inactivity, and kernel.ts reconciles
+	// the culled kernel out of its Map (via the manager's runningChanged poll).
+	//   CELLAR_KERNEL_IDLE_TIMEOUT  seconds of idle before cull (default 7200 = 2h; 0 disables)
+	//   CELLAR_KERNEL_CULL_INTERVAL seconds between cull sweeps (default min(300, timeout))
+	// cull_connected MUST be true: Cellar holds a persistent websocket to every
+	// kernel, so with jupyter's default (false) a kernel is never seen as idle.
+	const cullArgs = cullingArgs();
 	const jupyter = spawn(
 		hostPython,
 		[
@@ -675,7 +711,8 @@ async function main() {
 			'--ServerApp.ip=127.0.0.1',
 			'--ServerApp.open_browser=False',
 			`--ServerApp.root_dir=${WORKSPACE}`,
-			'--ServerApp.disable_check_xsrf=True'
+			'--ServerApp.disable_check_xsrf=True',
+			...cullArgs
 		],
 		// cwd must agree with root_dir: a kernel started without a notebook path
 		// (kernel.js `startNew({name:'python3'})`) inherits the sidecar's process

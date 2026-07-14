@@ -3,6 +3,7 @@ import { getDefaultNotebook } from '$lib/server/notebook';
 import { workspaceRoot } from '$lib/server/fstree';
 import { mcpConfigPath } from '$lib/server/runtime.js';
 import { getUiState } from '$lib/server/ui-state';
+import { parseMaxKernels } from '$lib/kernelCap';
 
 /**
  * Whether `<workspace>/.mcp.json` currently registers the `cellar` stdio server.
@@ -31,6 +32,11 @@ export function load() {
 	const mcpPort = Number(process.env.CELLAR_MCP_PORT || 39587);
 	return {
 		notebook: getDefaultNotebook(),
+		// Soft cap on live kernels: past this the Kernels sidebar shows a
+		// high-memory warning (warn-only, never blocks a run). Each kernel is a full
+		// Python process (100s of MB with pandas/pyspark). Tunable via
+		// `CELLAR_MAX_KERNELS` (default 8; 0 disables the warning).
+		maxKernels: parseMaxKernels(process.env.CELLAR_MAX_KERNELS),
 		// Per-project UI preferences, port-independent (see `$lib/server/ui-state.js`).
 		// Delivered via SSR so the client seeds them synchronously - no flash, and
 		// they survive the dynamic app port that resets `localStorage` each launch.

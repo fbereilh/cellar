@@ -205,6 +205,8 @@
 	let notice = $state('');
 	let theme = $state('dim');
 	const mcp = data.mcp;
+	// Soft cap on live kernels; past it the Kernels sidebar warns (warn-only).
+	const maxKernels = data.maxKernels ?? 8;
 
 	// ---- Logs drawer (bottom console) ---------------------------------------
 	const LOGS_OPEN_KEY = 'cellar-logs-open';
@@ -1099,6 +1101,7 @@
 					{mcp}
 					kernelInfo={displayKernel}
 					{kernelCards}
+					{maxKernels}
 					{variables}
 					{varsLoading}
 					{varsError}
