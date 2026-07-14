@@ -15,6 +15,7 @@
  * with the workspace root as the working directory.
  */
 import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { workspaceRoot, resolveInWorkspace } from './fstree';
 
 const MAX_GIT_BUFFER = 8 * 1024 * 1024;
@@ -50,6 +51,18 @@ export interface GitBlameFileResult {
 	isRepo: boolean;
 	tracked: boolean;
 	lines: BlameLine[];
+}
+
+/**
+ * Result of `gitBlameNotebookCells()`: per-cell blame keyed by stable cell id.
+ * Each record is a `BlameLine` (an uncommitted/new cell is a `notCommitted:true`
+ * record), so the status-bar footer renders it with the exact same markup as a
+ * file's cursor-line blame.
+ */
+export interface GitBlameNotebookResult {
+	isRepo: boolean;
+	tracked: boolean;
+	cells: Record<string, BlameLine>;
 }
 
 /**
@@ -262,4 +275,217 @@ export async function gitBlameFile(relPath: string): Promise<GitBlameFileResult>
 	const out = await runGit(root, ['blame', '--line-porcelain', '-w', '--', rel]);
 	if (out == null) return { isRepo: true, tracked: false, lines: [] };
 	return { isRepo: true, tracked: true, lines: parseBlame(out) };
+}
+
+/** A `Not Committed Yet` blame record for a cell with no committed source lines. */
+function notCommittedRecord(): BlameLine {
+	return { commit: ZERO_SHA, shortSha: null, author: 'Not Committed Yet', authorTime: null, summary: '', notCommitted: true };
+}
+
+/**
+ * Map each cell id in a serialized `.ipynb` to the 1-based FILE LINES its `source`
+ * occupies, by parsing the JSON while tracking line numbers.
+ *
+ * We can't use `JSON.parse` here: git blame is per file line, so we need to know
+ * which physical line each `source` string sits on. Cellar's clean-on-save writes
+ * deterministic, pretty-printed nbformat (1-space indent) where every `source`
+ * array element is its own JSON string on its own line — and a JSON string is
+ * always single-line (a raw `\n` is escaped), so a string token's start line IS
+ * its file line for any pretty-printed notebook, cellar-authored or not.
+ *
+ * Returns `null` when the text isn't a notebook object with a `cells` array — the
+ * caller then reports `tracked:false` (nothing to blame), like the HEAD route does
+ * for an unparseable baseline.
+ */
+function cellSourceLines(text: string): Map<string, number[]> | null {
+	let i = 0;
+	let line = 1;
+	const n = text.length;
+
+	/** A parsed node: strings carry the file line they start on. */
+	type StringNode = { type: 'string'; value: string; line: number };
+	type Node =
+		| { type: 'object'; props: Record<string, Node> }
+		| { type: 'array'; items: Node[] }
+		| StringNode
+		| { type: 'other' };
+
+	function skipWs(): void {
+		while (i < n) {
+			const c = text[i];
+			if (c === '\n') { line++; i++; }
+			else if (c === ' ' || c === '\t' || c === '\r') i++;
+			else break;
+		}
+	}
+
+	function parseString(): StringNode {
+		const startLine = line;
+		i++; // opening quote
+		let s = '';
+		while (i < n) {
+			const c = text[i++];
+			if (c === '\\') {
+				const e = text[i++];
+				if (e === 'n') s += '\n';
+				else if (e === 't') s += '\t';
+				else if (e === 'r') s += '\r';
+				else if (e === 'b') s += '\b';
+				else if (e === 'f') s += '\f';
+				else if (e === 'u') { s += String.fromCharCode(parseInt(text.slice(i, i + 4), 16) || 0); i += 4; }
+				else s += e; // \" \\ \/ and anything else → the literal char
+			} else if (c === '"') {
+				break;
+			} else {
+				if (c === '\n') line++; // not valid JSON inside a string, but stay honest
+				s += c;
+			}
+		}
+		return { type: 'string', value: s, line: startLine };
+	}
+
+	function parseValue(): Node {
+		skipWs();
+		const c = text[i];
+		if (c === '{') return parseObject();
+		if (c === '[') return parseArray();
+		if (c === '"') return parseString();
+		// number / true / false / null — value we don't care about, scan to a delimiter.
+		while (i < n) {
+			const ch = text[i];
+			if (ch === ',' || ch === '}' || ch === ']' || ch === '\n' || ch === ' ' || ch === '\t' || ch === '\r') break;
+			i++;
+		}
+		return { type: 'other' };
+	}
+
+	function parseObject(): Node {
+		const props: Record<string, Node> = {};
+		i++; // '{'
+		skipWs();
+		if (text[i] === '}') { i++; return { type: 'object', props }; }
+		while (i < n) {
+			skipWs();
+			if (text[i] !== '"') throw new Error('bad json');
+			const key = parseString().value;
+			skipWs();
+			if (text[i] !== ':') throw new Error('bad json');
+			i++; // ':'
+			props[key] = parseValue();
+			skipWs();
+			const sep = text[i++];
+			if (sep === ',') continue;
+			if (sep === '}') break;
+			throw new Error('bad json');
+		}
+		return { type: 'object', props };
+	}
+
+	function parseArray(): Node {
+		const items: Node[] = [];
+		i++; // '['
+		skipWs();
+		if (text[i] === ']') { i++; return { type: 'array', items }; }
+		while (i < n) {
+			items.push(parseValue());
+			skipWs();
+			const sep = text[i++];
+			if (sep === ',') continue;
+			if (sep === ']') break;
+			throw new Error('bad json');
+		}
+		return { type: 'array', items };
+	}
+
+	let root: Node;
+	try {
+		root = parseValue();
+	} catch {
+		return null;
+	}
+	if (root.type !== 'object') return null;
+	const cellsNode = root.props.cells;
+	if (!cellsNode || cellsNode.type !== 'array') return null;
+
+	const map = new Map<string, number[]>();
+	for (const cellNode of cellsNode.items) {
+		if (cellNode.type !== 'object') continue;
+		const idNode = cellNode.props.id;
+		if (!idNode || idNode.type !== 'string' || !idNode.value) continue; // can't key without an id
+		const srcNode = cellNode.props.source;
+		const lines: number[] = [];
+		if (srcNode) {
+			if (srcNode.type === 'array') {
+				for (const el of srcNode.items) if (el.type === 'string') lines.push(el.line);
+			} else if (srcNode.type === 'string') {
+				lines.push(srcNode.line);
+			}
+		}
+		map.set(idNode.value, lines);
+	}
+	return map;
+}
+
+/**
+ * Per-CELL git blame for a notebook — who last touched each cell and when, keyed
+ * by the cell's stable nbformat id. The shell shows the focused cell's record in
+ * the same bottom status bar a file tab uses for its cursor line.
+ *
+ * We blame the on-disk `.ipynb` per line (`gitBlameFile`'s machinery), read the
+ * exact bytes git blamed to learn which file lines each cell's `source` spans
+ * (`cellSourceLines`), then reduce each cell to its MOST-RECENT contributing
+ * commit (max author-time across its source lines). A cell whose source lines are
+ * all locally-modified or brand-new (no committed line) comes back `notCommitted`
+ * — so an edited-but-uncommitted cell reads "You, uncommitted" rather than a stale
+ * old author. Blaming the working-tree file is what makes that automatic: an edit
+ * autosaves to disk, git sees those lines as uncommitted, and the next refetch
+ * reflects it.
+ *
+ * `tracked:false` (empty `cells`) covers every no-blame case: not a repo, an
+ * untracked/new notebook, or on-disk bytes that don't parse as a notebook.
+ *
+ * @param {string} relPath Workspace-relative path (path-guarded).
+ */
+export async function gitBlameNotebookCells(relPath: string): Promise<GitBlameNotebookResult> {
+	const root = workspaceRoot();
+	const abs = resolveInWorkspace(relPath); // throws if the path escapes the workspace
+	const rel = String(relPath ?? '').replace(/\\/g, '/');
+	if (!rel) throw new Error('path required');
+
+	if ((await runGit(root, ['rev-parse', '--is-inside-work-tree'])) == null) {
+		return { isRepo: false, tracked: false, cells: {} };
+	}
+	const out = await runGit(root, ['blame', '--line-porcelain', '-w', '--', rel]);
+	if (out == null) return { isRepo: true, tracked: false, cells: {} }; // untracked / no HEAD blob
+	const blame = parseBlame(out);
+
+	let text: string;
+	try {
+		text = readFileSync(abs, 'utf8');
+	} catch {
+		return { isRepo: true, tracked: false, cells: {} };
+	}
+	const cellLines = cellSourceLines(text);
+	if (!cellLines) return { isRepo: true, tracked: false, cells: {} };
+
+	const cells: Record<string, BlameLine> = {};
+	for (const [id, lineNums] of cellLines) {
+		// An uncommitted (locally-modified or brand-new) source line is the MOST-RECENT
+		// contribution to the cell — newer than any commit — so any such line makes the
+		// whole cell read "You, uncommitted" rather than a stale committed author. This
+		// is also the dirty-cell case: an edit autosaves to disk, git flags those lines
+		// uncommitted, and the cell surfaces as uncommitted on the next refetch.
+		let best: BlameLine | null = null;
+		let dirty = false;
+		for (const ln of lineNums) {
+			const rec = blame[ln - 1];
+			if (!rec) continue;
+			if (rec.notCommitted) { dirty = true; break; }
+			if (rec.authorTime == null) continue;
+			if (!best || (rec.authorTime ?? 0) > (best.authorTime ?? 0)) best = rec;
+		}
+		// No source line at all (empty cell) is likewise treated as uncommitted.
+		cells[id] = dirty || !best ? notCommittedRecord() : best;
+	}
+	return { isRepo: true, tracked: true, cells };
 }
