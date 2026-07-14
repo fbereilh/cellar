@@ -30,6 +30,9 @@ import { KernelManager, ServerConnection } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
 import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from './notebook';
+import { workspaceRoot } from './fstree';
+import { addProjectRootToPath } from './ui-state';
+import { projectRootAddCode, projectRootRemoveCode } from './projectRoot';
 import { publish, publishGlobal } from './events';
 import {
 	openWidget,
@@ -479,6 +482,29 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 async function initKernel(kernel: KernelConnection): Promise<void> {
 	await runSilent(kernel, STARTUP_CODE);
 	await runSilent(kernel, DATAFRAME_FORMATTER_CODE);
+	// Add the workspace root to sys.path so a notebook in any subfolder can import
+	// project modules (and the `.py` module the export writes at the root). Gated by
+	// the per-workspace setting (default ON) and re-read here so a restart /
+	// autorestart, which resets sys.path along with the namespace, re-applies the
+	// current choice. Idempotent — never inserts a duplicate (see projectRoot.ts).
+	if (addProjectRootToPath()) await runSilent(kernel, projectRootAddCode(workspaceRoot()));
+}
+
+/**
+ * Apply the "add workspace root to sys.path" setting to every LIVE kernel now, so
+ * toggling it takes effect without a restart: ON inserts the root into each
+ * running namespace's `sys.path`, OFF removes it. Kernels still starting are
+ * skipped (their `connection` is null) — they pick up the current setting from
+ * `initKernel` once up. The store must be updated BEFORE this is called so a
+ * kernel finishing start mid-apply reads the new value. Idempotent.
+ */
+export async function applyProjectRootToLiveKernels(enabled: boolean): Promise<void> {
+	const root = workspaceRoot();
+	const code = enabled ? projectRootAddCode(root) : projectRootRemoveCode(root);
+	const live = [...kernels.values()]
+		.map((k) => k.connection)
+		.filter((c): c is KernelConnection => c !== null);
+	await Promise.all(live.map((c) => runSilent(c, code)));
 }
 
 /**

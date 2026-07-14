@@ -331,6 +331,32 @@
 		refreshFiles();
 	});
 
+	// ---- Add project root to the kernel's sys.path (default ON) -------------
+	// Lets a notebook in any subfolder `import` project modules (and the `.py`
+	// module the nbdev-style export writes at the root). Persisted per workspace
+	// server-side; the POST also applies it live to running kernels. Key kept in
+	// sync with `$lib/server/projectRoot.ts`'s ADD_PROJECT_ROOT_KEY.
+	const PROJECT_ROOT_KEY = 'cellar-add-project-root';
+	let projectRootOnPath = $state(true);
+	onMount(() => {
+		projectRootOnPath = getUi<boolean>(PROJECT_ROOT_KEY, true);
+	});
+	async function toggleProjectRoot() {
+		const next = !projectRootOnPath;
+		projectRootOnPath = next; // optimistic
+		setUi(PROJECT_ROOT_KEY, next); // persist + keep client cache coherent
+		try {
+			// Apply live to running kernels (server also re-persists — idempotent).
+			await fetch('/api/kernel/project-root', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ enabled: next })
+			});
+		} catch {
+			// Setting is already persisted; new/restarted kernels honor it regardless.
+		}
+	}
+
 	// ---- File management (context menu, clipboard, inline rename/new) -------
 	// A VS Code-style file explorer over the workspace tree. All mutations go
 	// through the path-guarded /api/fs/op route; the tree + git decorations are
@@ -636,6 +662,19 @@
 				<p class="mt-1 px-2 text-xs text-error" data-testid="files-op-error">{opError}</p>
 			{/if}
 		</div>
+		<label
+			class="mx-2 mb-2 flex cursor-pointer items-center gap-2 border-t border-base-300 px-1 pt-2 text-[11px] text-base-content/60"
+			title="Add the workspace root to each kernel's Python path (sys.path), so a notebook in any subfolder can import project modules."
+		>
+			<input
+				type="checkbox"
+				class="toggle toggle-xs toggle-primary"
+				checked={projectRootOnPath}
+				onchange={toggleProjectRoot}
+				data-testid="project-root-toggle"
+			/>
+			<span>Project root on Python path</span>
+		</label>
 	{/if}
 {/snippet}
 
