@@ -21,7 +21,10 @@ import { join } from 'node:path';
 
 type ProgressNote = { method: string; params: { progressToken: string | number; progress: number; total?: number; message?: string } };
 
-let withProgress: <T>(extra: unknown, fn: () => Promise<T>) => Promise<T>;
+// Derive the local's type from the module so it matches `withProgress`'s real
+// `ToolExtra`-typed signature (which isn't exported); a hand-written `unknown`
+// param is contravariantly incompatible under strict function checks.
+let withProgress: typeof import('../../src/lib/server/mcp/server').withProgress;
 let PROGRESS_INTERVAL_MS: number;
 
 beforeAll(async () => {
