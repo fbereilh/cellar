@@ -472,7 +472,7 @@ export async function getNotebookMap(nb?: string | null) {
 	// The `kernel` header reports THIS notebook's own session epoch, so it lines up
 	// with each cell's run_status/ran_this_session (each computed against the same
 	// per-notebook epoch), never against whichever notebook the user last focused.
-	return { notebook: view.path, kernel: kernelSession(nb), databricks: await databricksStatus(), cell_count: cells.length, sections: root };
+	return { notebook: view.path, kernel: kernelSession(nb), databricks: await databricksStatus(nb), cell_count: cells.length, sections: root };
 }
 
 /**
@@ -490,7 +490,7 @@ export async function getNotebookMap(nb?: string | null) {
 export async function getKernelState(nb?: string | null) {
 	// Read THIS notebook's own namespace + epoch; each notebook has its own kernel,
 	// so kernel_state for A must reflect A's session, never the active tab's.
-	const [state, stale, dbx] = await Promise.all([kernelState(nb), staleCells(nb), databricksStatus()]);
+	const [state, stale, dbx] = await Promise.all([kernelState(nb), staleCells(nb), databricksStatus(nb)]);
 	return { ...state, databricks: dbx, stale_cells: stale };
 }
 
@@ -537,11 +537,11 @@ async function staleCells(nb?: string | null) {
  * there is no live session. Connecting stays a human action, in the sidebar.
  */
 export const databricks = {
-	status: () => databricksStatus(),
-	catalogs: () => databricksCatalog.catalogs(),
-	schemas: (catalog: string) => databricksCatalog.schemas(catalog),
-	tables: (catalog: string, schema: string) => databricksCatalog.tables(catalog, schema),
-	preview: (name: string, limit?: number) => previewTable({ name, limit })
+	status: (nb?: string | null) => databricksStatus(nb),
+	catalogs: (nb?: string | null) => databricksCatalog.catalogs(nb),
+	schemas: (catalog: string, nb?: string | null) => databricksCatalog.schemas(catalog, nb),
+	tables: (catalog: string, schema: string, nb?: string | null) => databricksCatalog.tables(catalog, schema, nb),
+	preview: (name: string, limit?: number, nb?: string | null) => previewTable({ name, limit, nb })
 };
 
 export async function readCell(id: string, nb?: string | null) {
