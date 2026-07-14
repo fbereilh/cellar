@@ -5,7 +5,7 @@
 	import Checkpoints from '$lib/Checkpoints.svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
-	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge';
+	import { kernelStatusLabel, kernelDotClass } from '$lib/kernelBadge';
 	import { isOverKernelCap } from '$lib/kernelCap';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
 	import { outlineRows as buildOutlineRows, sectionRunState, headingNumberPrefix } from '$lib/headings';
@@ -174,6 +174,16 @@
 	// Past the soft cap, each kernel being a full Python process (100s of MB with
 	// pandas/pyspark) adds up — warn (never block). `maxKernels <= 0` disables it.
 	const kernelsOverCap = $derived(isOverKernelCap(kernelCount, maxKernels));
+	// How many live kernels are executing right now — surfaced in the header so a
+	// user managing many agents sees at a glance which/how many are working.
+	const busyCount = $derived(kernelCards.filter((c) => c.hasKernel && c.info.status === 'busy').length);
+	// Bulk-action target sets. The active (focused) notebook's kernel is protected
+	// from the bulk shutdowns — you never lose the one you're looking at without an
+	// explicit per-row shut down. Restart-all is a namespace wipe (process kept), so
+	// it may include the active kernel.
+	const liveKernels = $derived(kernelCards.filter((c) => c.hasKernel));
+	const idleTargets = $derived(liveKernels.filter((c) => !c.active && c.info.status === 'idle'));
+	const otherTargets = $derived(liveKernels.filter((c) => !c.active));
 	// Per-card in-flight state so a card's controls disable + spinner while an
 	// interrupt/restart/shutdown it fired is still resolving. Keyed by notebook path.
 	let actingPaths = $state<Set<string>>(new Set());
@@ -186,6 +196,34 @@
 			const next = new Set(actingPaths);
 			next.delete(path);
 			actingPaths = next;
+		}
+	}
+
+	// ---- Bulk kernel actions (section-header menu) --------------------------
+	// A denser Kernels list needs bulk control: shutting down idle kernels is the
+	// memory-reclaim workhorse with many notebooks open. Each is a two-step confirm
+	// (destructive), and fires the existing per-notebook handler across the target
+	// set concurrently so each row shows its own acting spinner.
+	let kernelMenuOpen = $state(false);
+	// null | 'idle' | 'others' | 'restart' — which bulk action is awaiting confirm.
+	let bulkConfirm = $state<string | null>(null);
+	let bulkBusy = $state(false);
+	function openKernelMenu() {
+		kernelMenuOpen = !kernelMenuOpen;
+		bulkConfirm = null;
+	}
+	function closeKernelMenu() {
+		kernelMenuOpen = false;
+		bulkConfirm = null;
+	}
+	async function runBulk(cards: KernelCard[], action?: (p: string) => void | Promise<void>) {
+		if (!action || bulkBusy) return;
+		bulkBusy = true;
+		try {
+			await Promise.all(cards.map((c) => runKernelAction(c.path, action)));
+		} finally {
+			bulkBusy = false;
+			closeKernelMenu();
 		}
 	}
 
@@ -601,86 +639,118 @@
 	{/if}
 {/snippet}
 
-<!-- One kernel card: a single notebook's kernel. Cellar runs one kernel PER
-     notebook, so each card carries its own status badge + Interrupt / Restart
-     (=wipe namespace) / Shut down (=free the process), each acting only on THIS
-     notebook. A card exists for every open notebook (so an unrun one shows "not
-     started") and for every live kernel whose tab was closed (still in memory).
-     The name focuses its tab when open; the active notebook is dotted. -->
-{#snippet kernelCardView(card: KernelCard)}
+<!-- One compact kernel row: a single notebook's kernel, dense enough that 10+
+     stay scannable. A leading status dot (pulses when busy) + the notebook name
+     (focuses its tab when open) + hover/focus-revealed Interrupt / Restart
+     (=wipe namespace) / Shut down (=free the process) icon buttons, each acting
+     only on THIS notebook. A row exists for every open notebook (an unrun one
+     reads "not started") and every live kernel whose tab was closed. -->
+{#snippet kernelRow(card: KernelCard)}
 	{@const acting = actingPaths.has(card.path)}
 	{@const busy = card.info.status === 'busy'}
 	<div
-		class="rounded-lg border bg-base-100 p-2.5 {card.hasKernel ? 'border-base-300' : 'border-dashed border-base-300'}"
+		class="group flex items-center gap-2 rounded-md px-2 py-1 hover:bg-base-300/40 {busy ? 'bg-warning/5' : ''}"
 		data-testid="kernel-card"
 		data-nb-path={card.path}
 	>
-		<div class="flex items-center justify-between gap-2">
-			{#if card.open}
-				<button
-					class="flex min-w-0 items-center gap-1.5 text-sm font-medium hover:text-primary"
-					onclick={() => onFocusNotebook?.(card.id)}
-					title="Focus {card.name}"
-					data-testid="kernel-notebook"
-				>
-					<svg class="h-3.5 w-3.5 shrink-0 {card.hasKernel ? 'text-primary' : 'text-base-content/40'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
-					<span class="min-w-0 truncate">{card.name}</span>
-					{#if card.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
-				</button>
-			{:else}
-				<span
-					class="flex min-w-0 items-center gap-1.5 text-sm font-medium text-base-content/70"
-					title="{card.name} — kernel running, tab closed"
-					data-testid="kernel-notebook"
-				>
-					<svg class="h-3.5 w-3.5 shrink-0 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg>
-					<span class="min-w-0 truncate">{card.name}</span>
-					<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>
-				</span>
-			{/if}
-			<span class="badge badge-sm shrink-0 whitespace-nowrap {kernelBadgeClass(card.info)} gap-1" data-testid="kernel-card-status">
-				<span class="inline-block h-1.5 w-1.5 rounded-full bg-current {busy ? 'animate-pulse' : ''}"></span>
-				{kernelStatusLabel(card.info)}
+		<!-- Status dot — the at-a-glance signal. A busy kernel gets a ping halo so a
+		     working notebook stands out across a long list. -->
+		<span class="relative flex h-2 w-2 shrink-0" title="{kernelStatusLabel(card.info)}">
+			{#if busy}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
+			<span class="relative inline-flex h-2 w-2 rounded-full {kernelDotClass(card.info)}"></span>
+		</span>
+		{#if card.open}
+			<button
+				class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary"
+				onclick={() => onFocusNotebook?.(card.id)}
+				title="Focus {card.name} — {kernelStatusLabel(card.info)}"
+				data-testid="kernel-notebook"
+			>
+				<span class="min-w-0 truncate {busy ? 'font-medium' : ''} {card.hasKernel ? '' : 'text-base-content/50'}">{card.name}</span>
+				{#if card.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
+			</button>
+		{:else}
+			<span
+				class="flex min-w-0 flex-1 items-center gap-1.5 text-sm text-base-content/70"
+				title="{card.name} — kernel running, tab closed"
+				data-testid="kernel-notebook"
+			>
+				<span class="min-w-0 truncate {busy ? 'font-medium' : ''}">{card.name}</span>
+				<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>
 			</span>
-		</div>
-		<!-- Interrupt / Restart on one row; Shut down set apart below since it removes
-		     the kernel entirely (frees memory), a heavier action than a wipe. All
-		     disabled until this notebook has a live kernel, or while one is acting. -->
-		<div class="mt-2 border-t border-base-300 pt-2" data-testid="kernel-controls">
-			<div class="flex gap-1.5">
+		{/if}
+		{#if !card.hasKernel}
+			<!-- Open but never run: no process to control, just a muted state hint. -->
+			<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30" data-testid="kernel-not-started">not started</span>
+		{:else if acting}
+			<span class="loading loading-spinner loading-xs shrink-0 text-base-content/50" data-testid="kernel-acting"></span>
+		{:else}
+			<!-- Uncluttered at rest, full control on interaction: reveal on row hover or
+			     keyboard focus. The slot keeps layout width stable (no reflow). -->
+			<div
+				class="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
+				data-testid="kernel-controls"
+			>
 				<button
-					class="btn btn-outline btn-xs flex-1 gap-1"
+					class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/60 hover:text-base-content"
 					onclick={() => runKernelAction(card.path, onInterruptKernel)}
-					disabled={!card.hasKernel || acting}
-					title="Interrupt this notebook's kernel (stop the running cell)"
+					title="Interrupt this kernel (stop the running cell)"
+					aria-label="Interrupt {card.name}'s kernel"
 					data-testid="kernel-interrupt"
 				>
 					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
-					Interrupt
 				</button>
 				<button
-					class="btn btn-outline btn-xs flex-1 gap-1"
+					class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/60 hover:text-base-content"
 					onclick={() => runKernelAction(card.path, onRestartKernel)}
-					disabled={!card.hasKernel || acting}
-					title="Restart this notebook's kernel — wipe its namespace from memory (keeps the notebook)"
+					title="Restart this kernel — wipe its namespace from memory (keeps the notebook)"
+					aria-label="Restart {card.name}'s kernel"
 					data-testid="kernel-restart"
 				>
 					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
-					Restart
+				</button>
+				<button
+					class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-error/70 hover:bg-error/10 hover:text-error"
+					onclick={() => runKernelAction(card.path, onShutdownKernel)}
+					title="Shut down this kernel — free its memory and remove it (starts fresh on next run)"
+					aria-label="Shut down {card.name}'s kernel"
+					data-testid="kernel-shutdown"
+				>
+					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v10" /><path d="M18.4 6.6a9 9 0 1 1-12.8 0" /></svg>
 				</button>
 			</div>
-			<button
-				class="btn btn-ghost btn-xs mt-1.5 w-full gap-1 text-error/80 hover:bg-error/10 hover:text-error"
-				onclick={() => runKernelAction(card.path, onShutdownKernel)}
-				disabled={!card.hasKernel || acting}
-				title="Shut down this notebook's kernel — free its memory and remove it (starts fresh on next run)"
-				data-testid="kernel-shutdown"
-			>
-				<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v10" /><path d="M18.4 6.6a9 9 0 1 1-12.8 0" /></svg>
-				Shut down
-			</button>
-		</div>
+		{/if}
 	</div>
+{/snippet}
+
+<!-- One bulk-menu item: label + target count, opening a two-step inline confirm. -->
+{#snippet bulkItem(key: string, label: string, hint: string, count: number, danger: boolean, run: () => void)}
+	{#if bulkConfirm === key}
+		<div class="rounded px-2 py-1.5 {danger ? 'bg-error/10' : 'bg-base-300/50'}">
+			<p class="mb-1.5 text-[11px] leading-snug text-base-content/70">{hint}</p>
+			<div class="flex gap-1.5">
+				<button
+					class="btn btn-xs flex-1 {danger ? 'btn-error' : 'btn-primary'}"
+					onclick={run}
+					disabled={bulkBusy}
+					data-testid="kernel-bulk-{key}-confirm"
+				>
+					{#if bulkBusy}<span class="loading loading-spinner loading-xs"></span>{:else}Confirm{/if}
+				</button>
+				<button class="btn btn-ghost btn-xs flex-1" onclick={() => (bulkConfirm = null)} disabled={bulkBusy}>Cancel</button>
+			</div>
+		</div>
+	{:else}
+		<button
+			class="flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-base-300/50 disabled:opacity-40 {danger ? 'text-error/90' : ''}"
+			onclick={() => (bulkConfirm = key)}
+			disabled={count === 0 || bulkBusy}
+			data-testid="kernel-bulk-{key}"
+		>
+			<span>{label}</span>
+			<span class="shrink-0 rounded bg-base-content/10 px-1.5 text-[10px] tabular-nums text-base-content/60">{count}</span>
+		</button>
+	{/if}
 {/snippet}
 
 {#snippet kernelsSection()}
@@ -691,6 +761,71 @@
 				class="badge badge-xs shrink-0 {kernelsOverCap ? 'badge-warning' : 'badge-neutral'}"
 				title="{kernelCount} live kernel{kernelCount === 1 ? '' : 's'}{kernelsOverCap ? ` — over the soft cap of ${maxKernels}` : ''}"
 				data-testid="kernel-count">{kernelCount}</span>
+			{#if busyCount > 0}
+				<span
+					class="badge badge-xs shrink-0 gap-1 border-warning/40 bg-warning/15 text-warning"
+					title="{busyCount} kernel{busyCount === 1 ? '' : 's'} running right now"
+					data-testid="kernel-running-count">
+					<span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-warning"></span>
+					{busyCount}
+				</span>
+			{/if}
+		{/if}
+		{#if kernelCount > 0}
+			<!-- Bulk-actions menu — valuable with many kernels; each item is a two-step
+			     destructive confirm. The active notebook's kernel is protected from the
+			     shutdowns (you never lose the one you're looking at without a per-row act). -->
+			<div class="relative">
+				<button
+					class="btn btn-ghost btn-xs btn-square text-base-content/40 hover:text-base-content"
+					onclick={openKernelMenu}
+					title="Bulk kernel actions"
+					aria-label="Bulk kernel actions"
+					aria-expanded={kernelMenuOpen}
+					data-testid="kernel-bulk-toggle"
+				>
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" /></svg>
+				</button>
+				{#if kernelMenuOpen}
+					<button
+						class="fixed inset-0 z-10 cursor-default"
+						aria-label="Close bulk kernel actions menu"
+						tabindex="-1"
+						onclick={closeKernelMenu}
+					></button>
+					<div
+						class="absolute right-0 top-full z-20 mt-1 w-60 rounded-lg border border-base-300 bg-base-100 p-1.5 shadow-lg"
+						data-testid="kernel-bulk-menu"
+					>
+						<p class="mb-1 px-2 pt-0.5 text-[11px] font-semibold text-base-content/50">Bulk actions</p>
+						{@render bulkItem(
+							'idle',
+							'Shut down idle',
+							`Shut down ${idleTargets.length} idle kernel${idleTargets.length === 1 ? '' : 's'} to reclaim memory (keeps the active notebook and any running kernel).`,
+							idleTargets.length,
+							true,
+							() => runBulk(idleTargets, onShutdownKernel)
+						)}
+						{@render bulkItem(
+							'others',
+							'Shut down all others',
+							`Shut down ${otherTargets.length} kernel${otherTargets.length === 1 ? '' : 's'}, keeping only the active notebook's.`,
+							otherTargets.length,
+							true,
+							() => runBulk(otherTargets, onShutdownKernel)
+						)}
+						<div class="my-1 border-t border-base-300"></div>
+						{@render bulkItem(
+							'restart',
+							'Restart all',
+							`Restart ${liveKernels.length} kernel${liveKernels.length === 1 ? '' : 's'} — wipes every namespace (the notebooks and processes are kept).`,
+							liveKernels.length,
+							false,
+							() => runBulk(liveKernels, onRestartKernel)
+						)}
+					</div>
+				{/if}
+			</div>
 		{/if}
 		{@render refreshBtn(onRefreshKernel, 'Refresh kernel status')}
 	</div>
@@ -709,14 +844,14 @@
 			</div>
 		{/if}
 		<!-- Cellar runs one kernel PER notebook (lazy: started on that notebook's first
-		     run). One card per notebook — every open tab (an unrun one reads "not
-		     started"), plus any live kernel whose tab was closed (still in memory).
-		     Two notebooks running at once show two independent busy cards. -->
-		<div class="space-y-2 px-3 pb-3" data-testid="kernels-body">
+		     run). One compact row per notebook — every open tab (an unrun one reads
+		     "not started"), plus any live kernel whose tab was closed. Scrolls past a
+		     handful so a long list never crowds out the rest of the sidebar. -->
+		<div class="max-h-64 space-y-0.5 overflow-y-auto px-2 pb-3" data-testid="kernels-body">
 			{#each kernelCards as card (card.path)}
-				{@render kernelCardView(card)}
+				{@render kernelRow(card)}
 			{:else}
-				<div class="rounded-lg border border-dashed border-base-300 bg-base-100 p-2.5 text-[11px] leading-relaxed text-base-content/40" data-testid="kernel-empty">
+				<div class="mx-1 rounded-lg border border-dashed border-base-300 bg-base-100 p-2.5 text-[11px] leading-relaxed text-base-content/40" data-testid="kernel-empty">
 					No notebooks open. Open a notebook and run a cell to start a kernel.
 				</div>
 			{/each}
