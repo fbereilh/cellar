@@ -41,6 +41,8 @@
 		onOpenPermanent?: (path: string) => void;
 		/** Workspace-relative path → git status letter. */
 		gitFiles?: Record<string, GitStatusLetter>;
+		/** Predicate: is this workspace-relative path git-ignored? (greys the row.) */
+		ignoredMatcher?: (path: string) => boolean;
 		activePath?: string | null;
 	}
 
@@ -50,13 +52,16 @@
 	// File-management state (context menu, clipboard, inline rename/new) flows
 	// via the shared `cellarFileOps` context so it need not drill through the
 	// recursive tree.
-	let { node, depth = 0, onOpen, onOpenPermanent, gitFiles = {}, activePath = null }: Props = $props();
+	let { node, depth = 0, onOpen, onOpenPermanent, gitFiles = {}, ignoredMatcher, activePath = null }: Props = $props();
 	let open = $state(false); // folders start collapsed
 
 	const ops = getContext<CellarFileOps>('cellarFileOps');
 
 	const status = $derived(node.type === 'dir' ? rollupStatus(gitFiles, node.path) : gitFiles[node.path] || '');
 	const color = $derived(gitColor(status));
+	// VS Code-style greying for git-ignored entries. Git status wins: a
+	// force-added ignored file that carries a status keeps its full-strength color.
+	const dimmed = $derived(!status && !!ignoredMatcher?.(node.path));
 	const isActive = $derived(node.type === 'file' && node.path === activePath);
 	const isSelected = $derived(ops?.selectedPath === node.path);
 	// Dim a cut entry (and, for a cut folder, everything under it) until pasted.
@@ -97,13 +102,14 @@
 		/>
 	{:else}
 		<button
-			class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {isSelected ? 'bg-base-300/70' : ''} {isCut ? 'opacity-40' : ''}"
+			class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {isSelected ? 'bg-base-300/70' : ''} {isCut ? 'opacity-40' : ''} {dimmed ? 'opacity-50' : ''}"
 			style="padding-left: {depth * 12 + 4}px{color ? `; color: ${color}` : ''}"
 			onclick={() => { ops?.select(descriptor); open = !open; }}
 			oncontextmenu={onContext}
 			data-testid="tree-dir"
 			data-path={node.path}
 			data-git={status || undefined}
+			data-git-ignored={dimmed || undefined}
 		>
 			<svg class="h-3 w-3 shrink-0 text-base-content/50 transition-transform {open ? 'rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
 			<span class="shrink-0">{@html iconSvg(node.name, { dir: true, open })}</span>
@@ -123,7 +129,7 @@
 			/>
 		{/if}
 		{#each node.children ?? [] as child (child.path)}
-			<Self node={child} depth={depth + 1} {onOpen} {onOpenPermanent} {gitFiles} {activePath} />
+			<Self node={child} depth={depth + 1} {onOpen} {onOpenPermanent} {gitFiles} {ignoredMatcher} {activePath} />
 		{/each}
 	{/if}
 {:else if isRenaming}
@@ -136,7 +142,7 @@
 	/>
 {:else}
 	<button
-		class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {isActive || isSelected ? 'bg-base-300/70' : ''} {isCut ? 'opacity-40' : ''}"
+		class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {isActive || isSelected ? 'bg-base-300/70' : ''} {isCut ? 'opacity-40' : ''} {dimmed ? 'opacity-50' : ''}"
 		style="padding-left: {depth * 12 + 4}px{color ? `; color: ${color}` : ''}"
 		class:text-base-content={!color}
 		onclick={() => { ops?.select(descriptor); onOpen(node.path); }}
@@ -145,6 +151,7 @@
 		data-testid="tree-file"
 		data-path={node.path}
 		data-git={status || undefined}
+		data-git-ignored={dimmed || undefined}
 		title={node.path}
 	>
 		<span class="h-3 w-3 shrink-0"></span>

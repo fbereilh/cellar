@@ -10,6 +10,7 @@
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
 	import { outlineRows as buildOutlineRows, sectionRunState, headingNumberPrefix } from '$lib/headings';
 	import { getUi, setUi } from '$lib/uiState';
+	import { makeIgnoredMatcher } from '$lib/gitIgnored';
 	import type { Cell } from '$lib/server/types';
 	import type { TreeNode } from '$lib/server/fstree';
 	import type { GitStatusLetter } from '$lib/server/git';
@@ -289,6 +290,12 @@
 	let treeError = $state('');
 	// Per-file git status (VS Code-style decorations); {} when not a git repo.
 	let gitFiles = $state<Record<string, GitStatusLetter>>({});
+	// Git-ignored paths (VS Code-style greying); [] when not a git repo.
+	let gitIgnored = $state<string[]>([]);
+	// Current branch (or short SHA when detached); '' when not a git repo.
+	let gitBranch = $state('');
+	let gitDetached = $state(false);
+	const ignoredMatcher = $derived(makeIgnoredMatcher(gitIgnored));
 	async function loadTree() {
 		try {
 			const res = await fetch('/api/fs/tree');
@@ -305,8 +312,14 @@
 			if (!res.ok) return;
 			const body = await res.json();
 			gitFiles = body.isRepo ? body.files : {};
+			gitIgnored = body.isRepo ? (body.ignored ?? []) : [];
+			gitBranch = body.isRepo ? (body.branch ?? '') : '';
+			gitDetached = body.isRepo ? !!body.detached : false;
 		} catch {
 			gitFiles = {}; // degrade silently in a non-git workspace
+			gitIgnored = [];
+			gitBranch = '';
+			gitDetached = false;
 		}
 	}
 	function refreshFiles() {
@@ -644,12 +657,24 @@
 			{#if treeError}
 				<p class="px-2 text-xs text-error">{treeError}</p>
 			{:else if treeRoot}
-				<p class="truncate px-1 pb-1 text-[11px] text-base-content/40" title={treeRoot.root}>{treeRoot.name}</p>
+				<div class="flex items-center gap-1.5 px-1 pb-1 text-[11px] text-base-content/40">
+					<span class="truncate" title={treeRoot.root}>{treeRoot.name}</span>
+					{#if gitBranch}
+						<span
+							class="flex min-w-0 shrink items-center gap-1 text-base-content/45"
+							title={gitDetached ? `detached HEAD @ ${gitBranch}` : `branch: ${gitBranch}`}
+							data-testid="git-branch"
+						>
+							<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg>
+							<span class="truncate">{gitDetached ? `(${gitBranch})` : gitBranch}</span>
+						</span>
+					{/if}
+				</div>
 				{#if newEntry?.parentPath === ''}
 					<TreeEntryInput depth={0} kind={newEntry.kind} onSubmit={submitNew} onCancel={cancelNew} />
 				{/if}
 				{#each treeRoot.tree as node (node.path)}
-					<FileTreeNode {node} onOpen={onOpenFile} onOpenPermanent={onOpenFilePermanent} {gitFiles} activePath={activeFilePath} />
+					<FileTreeNode {node} onOpen={onOpenFile} onOpenPermanent={onOpenFilePermanent} {gitFiles} {ignoredMatcher} activePath={activeFilePath} />
 				{:else}
 					{#if newEntry?.parentPath !== ''}
 						<p class="px-2 text-xs text-base-content/40">empty workspace</p>

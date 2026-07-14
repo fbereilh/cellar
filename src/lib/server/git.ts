@@ -26,6 +26,23 @@ export type GitStatusLetter = 'M' | 'A' | 'D' | 'R' | 'U' | 'C';
 export interface GitStatusResult {
 	isRepo: boolean;
 	files: Record<string, GitStatusLetter>;
+	/**
+	 * Git-ignored paths (workspace-relative), so the file tree can grey them the
+	 * way VS Code does. A whole ignored directory is one entry WITH a trailing
+	 * slash (`build/`); individually-ignored files carry no slash (`secret.txt`).
+	 * The client greys a node when its path matches an entry exactly or sits under
+	 * an ignored directory prefix (see `$lib/gitIgnored`).
+	 */
+	ignored: string[];
+}
+
+/** Result of `gitBranch()`: the current branch (or short SHA when detached). */
+export interface GitBranchResult {
+	isRepo: boolean;
+	/** Branch name on a normal HEAD, short commit SHA when detached, else null. */
+	branch: string | null;
+	/** True when HEAD is detached — the client renders the SHA in parentheses. */
+	detached: boolean;
 }
 
 /** Result of `gitHeadFile()`: one file's content as of git HEAD. */
@@ -74,12 +91,17 @@ function classify(xy: string): GitStatusLetter {
 	return 'M';
 }
 
-/** Run `git status --porcelain` at the workspace root (NUL-delimited). */
+/**
+ * Run `git status --porcelain` at the workspace root (NUL-delimited).
+ * `--ignored=matching` folds ignored paths into the same output as `!!` entries
+ * (a wholly-ignored directory collapses to one `dir/` entry, scattered ignored
+ * files list individually) so status + ignore come back in one git call.
+ */
 function runStatus(root: string): Promise<string | null> {
 	return new Promise((resolve) => {
 		execFile(
 			'git',
-			['-C', root, 'status', '--porcelain=v1', '--untracked-files=all', '-z', '--', '.'],
+			['-C', root, 'status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching', '-z', '--', '.'],
 			{ maxBuffer: 8 * 1024 * 1024 },
 			(err, stdout) => {
 				if (err) {
@@ -120,9 +142,12 @@ function runPrefix(root: string): Promise<string> {
  * @param {string} prefix Workspace path relative to the repo root (trailing
  *   slash), stripped so keys are workspace-relative. Paths outside the
  *   workspace subtree are dropped.
+ * @returns Status letters keyed by path, plus the list of git-ignored paths
+ *   (`!!` entries; directories keep their trailing slash).
  */
-function parse(stdout: string, prefix: string): Record<string, GitStatusLetter> {
+function parse(stdout: string, prefix: string): { files: Record<string, GitStatusLetter>; ignored: string[] } {
 	const map: Record<string, GitStatusLetter> = {};
+	const ignored: string[] = [];
 	const parts = stdout.split('\0');
 	for (let i = 0; i < parts.length; i++) {
 		const entry = parts[i];
@@ -137,9 +162,10 @@ function parse(stdout: string, prefix: string): Record<string, GitStatusLetter> 
 			path = path.slice(prefix.length);
 		}
 		if (!path) continue;
-		map[path] = classify(xy);
+		if (xy === '!!') ignored.push(path); // git-ignored (dirs keep trailing slash)
+		else map[path] = classify(xy);
 	}
-	return map;
+	return { files: map, ignored };
 }
 
 /**
@@ -149,9 +175,35 @@ function parse(stdout: string, prefix: string): Record<string, GitStatusLetter> 
 export async function gitStatus(): Promise<GitStatusResult> {
 	const root = workspaceRoot();
 	const stdout = await runStatus(root);
-	if (stdout == null) return { isRepo: false, files: {} };
+	if (stdout == null) return { isRepo: false, files: {}, ignored: [] };
 	const prefix = await runPrefix(root);
-	return { isRepo: true, files: parse(stdout, prefix) };
+	const { files, ignored } = parse(stdout, prefix);
+	return { isRepo: true, files, ignored };
+}
+
+/**
+ * The current git branch for the workspace.
+ *
+ * A normal (even unborn/no-commits-yet) branch resolves via `symbolic-ref`; a
+ * detached HEAD makes that fail, so we fall back to the short commit SHA and
+ * flag `detached` (the client renders it parenthesized, VS Code-style). A
+ * non-repo returns `{isRepo:false, branch:null}` so the header shows no chip.
+ */
+export async function gitBranch(): Promise<GitBranchResult> {
+	const root = workspaceRoot();
+	// Succeeds on any real branch (including one with no commits yet); `--quiet`
+	// makes a detached HEAD exit non-zero silently → runGit resolves null.
+	const sym = await runGit(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+	if (sym != null) {
+		const branch = sym.trim();
+		return { isRepo: true, branch: branch || null, detached: false };
+	}
+	// Either detached HEAD or not a repo — a short SHA distinguishes them.
+	const sha = await runGit(root, ['rev-parse', '--short', 'HEAD']);
+	if (sha != null) return { isRepo: true, branch: sha.trim(), detached: true };
+	// No SHA: confirm whether this is even a repo (an empty/detached repo is rare).
+	const inside = await runGit(root, ['rev-parse', '--is-inside-work-tree']);
+	return { isRepo: inside != null, branch: null, detached: false };
 }
 
 /** Run a git subcommand at the workspace root; `null` on any failure. */
