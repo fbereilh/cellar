@@ -26,6 +26,7 @@
 // @ts-ignore - no declaration file for 'markdown-it'
 import MarkdownIt from 'markdown-it';
 import type { CellView, CellOutput } from './types';
+import { listCells, getHideAllCode, resolveNotebookPath } from './notebook';
 
 /** The minimal markdown-it surface this module uses. */
 interface MarkdownRenderer {
@@ -386,7 +387,43 @@ ${body || '<p class="empty">This notebook has no cells.</p>'}
 /** Build a safe download filename (`<name>.html`) from a notebook path. */
 export function exportFilename(nbPath?: string | null): string {
 	const base = String(nbPath || 'notebook').split(/[/\\]/).pop() || 'notebook';
-	return base.replace(/\.ipynb$/i, '') + '.html';
+	return base.replace(/\.(ipynb|py)$/i, '') + '.html';
+}
+
+/** Result of {@link buildNotebookHtml}: the rendered document + its metadata. */
+export interface BuiltNotebookHtml {
+	/** The complete, self-contained HTML document. */
+	html: string;
+	/** The download filename (`<notebook-name>.html`). */
+	filename: string;
+	/** The report-view flag that was actually applied (the effective hide-code). */
+	hideAllCode: boolean;
+}
+
+/**
+ * The one render orchestration shared by BOTH the HTTP export route and the MCP
+ * `export_html` tool: resolve the notebook, read its cells + persisted outputs
+ * (never touching the kernel), decide report-style, and render a self-contained
+ * HTML document. Keeping this single implementation is what guarantees the tool
+ * and the download produce byte-identical files for the same inputs.
+ *
+ * `hideCode` is the report-style override: `undefined` follows the notebook's
+ * saved `hide_all_code` setting (the route's default), `true`/`false` force it
+ * on/off. The returned `hideAllCode` is whichever was effectively applied.
+ */
+export function buildNotebookHtml({
+	nb,
+	hideCode
+}: {
+	nb?: string | null;
+	hideCode?: boolean;
+}): BuiltNotebookHtml {
+	const abs = resolveNotebookPath(nb ?? undefined);
+	const cells = listCells(nb ?? undefined);
+	const hideAllCode = hideCode == null ? getHideAllCode(nb ?? undefined) : hideCode;
+	const filename = exportFilename(abs);
+	const html = renderNotebookHtml({ cells, title: filename.replace(/\.html$/i, ''), hideAllCode });
+	return { html, filename, hideAllCode };
 }
 
 // The theme toggle: default light, honour the OS scheme on first load, remember
