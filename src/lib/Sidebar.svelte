@@ -77,6 +77,7 @@
 		onInterruptKernel?: (path: string) => void | Promise<void>;
 		onRestartKernel?: (path: string) => void | Promise<void>;
 		onShutdownKernel?: (path: string) => void | Promise<void>;
+		onWipeKernel?: (path: string) => void | Promise<void>;
 		onInsertAndRun?: ((source: string) => void) | null;
 		onDatabricksSessionChange?: () => void;
 		onOpenFile: (path: string) => void;
@@ -123,6 +124,7 @@
 		onInterruptKernel,
 		onRestartKernel,
 		onShutdownKernel,
+		onWipeKernel,
 		// Databricks: `spark` lives in the kernel, so a new kernel session epoch means
 		// the session is gone. `onInsertAndRun` is null when no notebook is open.
 		onInsertAndRun = null,
@@ -198,6 +200,14 @@
 			next.delete(path);
 			actingPaths = next;
 		}
+	}
+	// "Wipe variables" is destructive to in-memory state (the file is untouched), so
+	// it takes a two-step inline confirm — clicking the eraser arms it on that one
+	// row, a second click runs it. Only one row can be armed at a time.
+	let confirmWipePath = $state<string | null>(null);
+	async function runWipe(path: string) {
+		confirmWipePath = null;
+		await runKernelAction(path, onWipeKernel);
 	}
 
 	// ---- Bulk kernel actions (section-header menu) --------------------------
@@ -748,6 +758,25 @@
 			<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30" data-testid="kernel-not-started">not started</span>
 		{:else if acting}
 			<span class="loading loading-spinner loading-xs shrink-0 text-base-content/50" data-testid="kernel-acting"></span>
+		{:else if confirmWipePath === card.path}
+			<!-- Two-step confirm for "wipe variables": armed on this row only. -->
+			<div class="flex shrink-0 items-center gap-1" data-testid="kernel-wipe-confirm">
+				<span class="text-[11px] text-base-content/60">Wipe vars?</span>
+				<button
+					class="btn btn-warning btn-xs h-6 min-h-0 px-2"
+					onclick={() => runWipe(card.path)}
+					data-testid="kernel-wipe-vars-confirm"
+				>
+					Confirm
+				</button>
+				<button
+					class="btn btn-ghost btn-xs h-6 min-h-0 px-2"
+					onclick={() => (confirmWipePath = null)}
+					data-testid="kernel-wipe-vars-cancel"
+				>
+					Cancel
+				</button>
+			</div>
 		{:else}
 			<!-- Uncluttered at rest, full control on interaction: reveal on row hover or
 			     keyboard focus. The slot keeps layout width stable (no reflow). -->
@@ -763,6 +792,15 @@
 					data-testid="kernel-interrupt"
 				>
 					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
+				</button>
+				<button
+					class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/60 hover:text-base-content"
+					onclick={() => (confirmWipePath = card.path)}
+					title="Clear this kernel's user variables from memory — keeps imports, functions/classes & any Databricks session; the kernel stays alive (no restart)"
+					aria-label="Wipe {card.name}'s kernel variables"
+					data-testid="kernel-wipe-vars"
+				>
+					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20H7L3 16a1.5 1.5 0 0 1 0-2.1l8.4-8.4a1.5 1.5 0 0 1 2.1 0l5.9 5.9a1.5 1.5 0 0 1 0 2.1L13 20" /><path d="m7 20 6.5-6.5" /></svg>
 				</button>
 				<button
 					class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/60 hover:text-base-content"
