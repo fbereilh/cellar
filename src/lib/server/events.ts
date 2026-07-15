@@ -24,6 +24,25 @@ emitter.setMaxListeners(0);
 const seqs = new Map<string, number>(); // canonical notebook id (absolute path) -> last seq
 
 /**
+ * The full SSE frame for a dispatched event — computed ONCE here, then fanned out
+ * to every subscriber. A runaway cell that emits many events would otherwise
+ * `JSON.stringify` the same event once per open tab; serializing once and sharing
+ * the string keeps the broadcast O(tabs) in bytes copied, not O(tabs) in
+ * stringify passes. Per-notebook events carry an SSE `id:` (their `seq`, for
+ * gap detection); global snapshots carry none.
+ */
+export function sseFrame(event: DispatchedEvent): string {
+	const seq = (event as PublishedEvent).seq;
+	const idLine = seq == null ? '' : `id: ${seq}\n`;
+	return idLine + `data: ${JSON.stringify(event)}\n\n`;
+}
+
+/** Emit an event plus its pre-serialized frame to every subscriber. */
+function emit(event: DispatchedEvent): void {
+	emitter.emit('event', event, sseFrame(event));
+}
+
+/**
  * Publish an event to every open stream. Stamps a per-notebook monotonic `seq`
  * and returns the enriched event (with `seq`) for callers that want it.
  */
@@ -32,7 +51,7 @@ export function publish(event: CellarEvent): PublishedEvent {
 	const seq = (seqs.get(nb) ?? 0) + 1;
 	seqs.set(nb, seq);
 	const full: PublishedEvent = { ...event, seq };
-	emitter.emit('event', full);
+	emit(full);
 	return full;
 }
 
@@ -47,12 +66,17 @@ export function publishGlobal<T extends Record<string, unknown>>(
 	event: T
 ): T & { global: true } {
 	const full = { ...event, global: true as const };
-	emitter.emit('event', full);
+	emit(full as unknown as DispatchedEvent);
 	return full;
 }
 
-/** Subscribe to all events; returns an unsubscribe function. */
-export function subscribe(listener: (event: DispatchedEvent) => void): () => void {
+/**
+ * Subscribe to all events. The listener receives the event object AND its
+ * pre-serialized SSE `frame` string (see `sseFrame`) — the SSE route writes the
+ * shared frame directly, so the payload is serialized once per publish regardless
+ * of how many tabs are connected. Returns an unsubscribe function.
+ */
+export function subscribe(listener: (event: DispatchedEvent, frame: string) => void): () => void {
 	emitter.on('event', listener);
 	return () => emitter.off('event', listener);
 }

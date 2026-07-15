@@ -458,7 +458,24 @@
 		// single plain-text segment renders identically to the old monospace pre.
 		return { tone, text, segments: segments.some((s) => s.type === 'table') ? segments : null };
 	}
-	const outputs = $derived((cell.outputs || []).map(renderOutput));
+	// Memoize the render by output-object identity. A streamed run overwrites a
+	// single output element in place (`LiveNotebook.applyOutput`) — the growing
+	// coalesced stream element is a NEW object each flush (re-rendered, correct),
+	// while every stable prior output keeps its identity and is served from cache.
+	// So this map costs O(changed outputs), not O(all outputs) per frame — the
+	// append-only render that keeps a runaway cell from re-rendering its whole
+	// history each chunk. `renderOutput` is a pure function of its output, so
+	// caching by identity is sound; the WeakMap lets overwritten objects be GC'd.
+	const renderCache = new WeakMap<CellOutput, RenderedOutput>();
+	function renderOutputMemo(o: CellOutput): RenderedOutput {
+		let r = renderCache.get(o);
+		if (r === undefined) {
+			r = renderOutput(o);
+			renderCache.set(o, r);
+		}
+		return r;
+	}
+	const outputs = $derived((cell.outputs || []).map(renderOutputMemo));
 
 	// ---- Full-size image outputs (JupyterLab double-click) -------------------
 	// Double-clicking an image output toggles it between fit-to-width and its
@@ -496,9 +513,22 @@
 	const ownsScroll = $derived(hasDataframe || hasFullImage || hasSelfSized);
 	const explicitScrolled = $derived(cell.metadata?.cellar?.output_scrolled);
 	const scrolled = $derived(ownsScroll ? false : (explicitScrolled ?? outputTall));
+	// Measure output height off a ResizeObserver, not on every `cell.outputs`
+	// mutation: a runaway cell streams outputs ~25×/s, and reading `scrollHeight`
+	// synchronously in an effect forced a full reflow per frame. The observer
+	// coalesces size changes into one batched, post-layout callback (so reading
+	// scrollHeight there adds no extra reflow), which is the debounce this needs.
 	$effect(() => {
-		cell.outputs; // re-measure whenever outputs change
-		if (outputInner) outputTall = !ownsScroll && outputInner.scrollHeight > SCROLL_THRESHOLD;
+		const el = outputInner;
+		if (!el) return;
+		const measure = () => {
+			outputTall = !ownsScroll && el.scrollHeight > SCROLL_THRESHOLD;
+		};
+		measure(); // initial (and on ownsScroll / element change)
+		if (typeof ResizeObserver === 'undefined') return;
+		const ro = new ResizeObserver(measure);
+		ro.observe(el);
+		return () => ro.disconnect();
 	});
 	function toggleScrolled() {
 		onSetScrolled?.(cell.id, !scrolled);
