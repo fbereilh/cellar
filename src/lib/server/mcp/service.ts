@@ -35,7 +35,7 @@ import { buildTree } from '../fstree';
 import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
-import { resolveSymbol } from '../../symbolGraph';
+import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
 import { IMG_MAX_EDGE, downscaleImageForBlock, imagePlaceholder } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
@@ -830,6 +830,31 @@ export async function findSymbol(name: string, nb?: string | null) {
 		dataflow,
 		sid: currentSessionId(nb),
 		kernelNames,
+		toHandle: handleFn(nb)
+	});
+}
+
+/**
+ * The dependency blast radius of ONE cell, off the SAME definer graph as staleness
+ * (`$lib/symbolGraph`): `depends_on` = the cells whose definitions this cell reads
+ * (its direct upstream), `dependents` = the transitive downstream cells that would
+ * go STALE if this cell is edited, both in document order. Answers "what will
+ * run_stale re-run after I touch this" BEFORE the edit — the downstream direction
+ * `stale_upstream` (which only appears once a cell is ALREADY stale) never surfaces.
+ *
+ * Honest limit (inherited, see the module header): a self-reassignment
+ * (`df = f(df)`) hides that cell's read of `df`, so a data cell's `dependents` can
+ * UNDER-report; `get_notebook_map`'s `stale_state` is the authoritative post-hoc
+ * signal. The graph is built over ALL code cells and traversed through hidden ones,
+ * but only agent-visible cells are reported.
+ */
+export async function cellImpact(id: string, nb?: string | null) {
+	const cells = listCells(nb); // ALL cells (incl. hidden) so the graph stays complete
+	const dataflow = await analyzeDataflow(cells);
+	return resolveImpact({
+		id: asFullId(nb, id),
+		cells: cells.map((c) => ({ id: c.id, cell_type: c.cell_type, hidden: isHidden(c) })),
+		dataflow,
 		toHandle: handleFn(nb)
 	});
 }

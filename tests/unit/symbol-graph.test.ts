@@ -14,7 +14,7 @@
  *     definers, and kernel reconciliation (live_definer / live_in_kernel).
  */
 import { describe, it, expect } from 'vitest';
-import { buildDefinerGraph, resolveSymbol, type Dataflow, type SymbolCell } from '../../src/lib/symbolGraph';
+import { buildDefinerGraph, resolveSymbol, resolveImpact, type Dataflow, type SymbolCell, type ImpactCell } from '../../src/lib/symbolGraph';
 import { computeStaleness, STALE_STATE } from '../../src/lib/staleness';
 import type { Cell, SessionId } from '../../src/lib/server/types';
 
@@ -272,5 +272,114 @@ describe('resolveSymbol — kernel reconciliation', () => {
 		const r = resolveSymbol({ name: 'df', cells: symCells(SCENARIO_IDS), dataflow: SCENARIO, sid: SID, kernelNames: new Set(['df']) });
 		expect(r.live_definer).toBeUndefined();
 		expect(r.live_in_kernel).toBe(true);
+	});
+});
+
+// --- 3. cell_impact (resolveImpact) -----------------------------------------
+
+const impactCell = (id: string, over: Partial<ImpactCell> = {}): ImpactCell => ({
+	id,
+	cell_type: 'code',
+	hidden: false,
+	...over
+});
+const impactCells = (ids: string[]): ImpactCell[] => ids.map((id) => impactCell(id));
+
+describe('resolveImpact — the report §4.1 scenario', () => {
+	it("cell_impact('c3') -> depends_on=[c1], dependents=[c4,c5,c6] (edit clean/featurize -> 3 stale)", () => {
+		const r = resolveImpact({ id: 'c3', cells: impactCells(SCENARIO_IDS), dataflow: SCENARIO });
+		expect(r.cell).toBe('c3');
+		expect(r.depends_on).toEqual(['c1']); // c3 uses np, defined in c1
+		expect(r.dependents).toEqual(['c4', 'c5', 'c6']); // clean/featurize -> c4 -> df -> c5, c6
+	});
+
+	it("cell_impact('c2') -> dependents=[] — the documented self-reassignment under-report", () => {
+		// c2 defines df; c4 is `df = clean(df)`, whose READ of df the probe masks
+		// (uses = referenced − defined), so c4 does not appear to depend on c2, and
+		// c5/c6 bind their df to c4 (the nearest preceding definer), never c2.
+		const r = resolveImpact({ id: 'c2', cells: impactCells(SCENARIO_IDS), dataflow: SCENARIO });
+		expect(r.depends_on).toEqual(['c1']); // c2 uses pd, defined in c1
+		expect(r.dependents).toEqual([]); // under-reports: c4's read of df is invisible
+	});
+
+	it('the cell_impact description warns about the self-reassignment under-report', async () => {
+		// The honesty the tool ships on: its registered description must point at the
+		// under-report and at stale_state as the authoritative post-hoc signal.
+		const src = await import('node:fs').then((fs) =>
+			fs.readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8')
+		);
+		const line = src.split('\n').find((l) => l.includes("registerTool('cell_impact'"));
+		expect(line).toBeTruthy();
+		expect(line).toMatch(/self-reassignment|df = f\(df\)/);
+		expect(line).toMatch(/under-report/i);
+		expect(line).toMatch(/stale_state/);
+	});
+});
+
+describe('resolveImpact — transitivity, order, cycles', () => {
+	it('a multi-hop chain a->b->c->d flows transitively downstream in document order', () => {
+		const df: Dataflow = {
+			a: { defines: ['x'], uses: [] },
+			b: { defines: ['y'], uses: ['x'] },
+			c: { defines: ['z'], uses: ['y'] },
+			d: { defines: [], uses: ['z'] }
+		};
+		const cells = impactCells(['a', 'b', 'c', 'd']);
+		expect(resolveImpact({ id: 'a', cells, dataflow: df }).dependents).toEqual(['b', 'c', 'd']);
+		expect(resolveImpact({ id: 'b', cells, dataflow: df }).dependents).toEqual(['c', 'd']);
+		expect(resolveImpact({ id: 'd', cells, dataflow: df }).dependents).toEqual([]); // leaf
+		expect(resolveImpact({ id: 'c', cells, dataflow: df }).depends_on).toEqual(['b']); // nearest definer of y
+	});
+
+	it('a diamond a->{b,c}->d reports each dependent once, in document order', () => {
+		const df: Dataflow = {
+			a: { defines: ['x'], uses: [] },
+			b: { defines: ['y'], uses: ['x'] },
+			c: { defines: ['w'], uses: ['x'] },
+			d: { defines: [], uses: ['y', 'w'] }
+		};
+		const cells = impactCells(['a', 'b', 'c', 'd']);
+		const r = resolveImpact({ id: 'a', cells, dataflow: df });
+		expect(r.dependents).toEqual(['b', 'c', 'd']); // d reached via both b and c, listed once
+		expect(resolveImpact({ id: 'd', cells, dataflow: df }).depends_on).toEqual(['b', 'c']);
+	});
+
+	it('redefinition does not create a false downstream edge past the new definer', () => {
+		// c uses x -> binds to b (nearest preceding), so a's only dependent is b's
+		// definer chain; a re-defined-then-used name does not make a a dependency of c.
+		const df: Dataflow = {
+			a: { defines: ['x'], uses: [] },
+			b: { defines: ['x'], uses: [] },
+			c: { defines: [], uses: ['x'] } // -> b
+		};
+		const cells = impactCells(['a', 'b', 'c']);
+		expect(resolveImpact({ id: 'a', cells, dataflow: df }).dependents).toEqual([]); // c binds to b, not a
+		expect(resolveImpact({ id: 'b', cells, dataflow: df }).dependents).toEqual(['c']);
+	});
+
+	it('a markdown / unknown / non-code target yields empty lists (never throws)', () => {
+		const cells = [impactCell('m', { cell_type: 'markdown' }), ...impactCells(SCENARIO_IDS)];
+		expect(resolveImpact({ id: 'm', cells, dataflow: SCENARIO })).toEqual({ cell: 'm', depends_on: [], dependents: [] });
+		expect(resolveImpact({ id: 'nope', cells, dataflow: SCENARIO })).toEqual({ cell: 'nope', depends_on: [], dependents: [] });
+	});
+});
+
+describe('resolveImpact — hidden cells', () => {
+	it('traverses THROUGH a hidden intermediary but never reports it', () => {
+		// a -> b(hidden) -> c: editing a still stales c, but b is suppressed.
+		const df: Dataflow = {
+			a: { defines: ['x'], uses: [] },
+			b: { defines: ['y'], uses: ['x'] },
+			c: { defines: [], uses: ['y'] }
+		};
+		const cells = [impactCell('a'), impactCell('b', { hidden: true }), impactCell('c')];
+		const r = resolveImpact({ id: 'a', cells, dataflow: df });
+		expect(r.dependents).toEqual(['c']); // b hidden, dropped; c still surfaces via b
+	});
+
+	it('a hidden direct dependency is excluded from depends_on', () => {
+		const df: Dataflow = { a: { defines: ['x'], uses: [] }, b: { defines: [], uses: ['x'] } };
+		const cells = [impactCell('a', { hidden: true }), impactCell('b')];
+		expect(resolveImpact({ id: 'b', cells, dataflow: df }).depends_on).toEqual([]); // a hidden
 	});
 });
