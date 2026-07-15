@@ -15,7 +15,7 @@
 
 	const THEMES = [
 		{ id: 'dim', label: 'Dark', hint: 'dim' },
-		{ id: 'nord', label: 'Light', hint: 'nord' }
+		{ id: 'cellar-light', label: 'Light', hint: 'cellar-light' }
 	];
 
 	// ---- Keyboard shortcuts --------------------------------------------------
