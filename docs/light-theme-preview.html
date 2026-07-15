@@ -1,0 +1,764 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Cellar — light palette preview</title>
+		<style>
+			/* ================================================================
+			 * Cellar light-palette preview.
+			 *
+			 * A static, self-contained mock of Cellar's main surfaces so the new
+			 * `cellar-light` theme (LEFT) can be judged beside the unchanged dark
+			 * `dim` theme (RIGHT), which is the quality bar. Every value below is
+			 * copied verbatim from src/app.css + the daisyUI theme blocks, so what
+			 * you see here is what the app renders. Not part of the build.
+			 * ================================================================ */
+
+			/* ---- LIGHT (new cellar-light) ---- */
+			.light {
+				--base-100: #f9fafc;
+				--base-200: #f2f5f8;
+				--base-300: #e0e5eb;
+				--base-content: #262e3c;
+				--muted: #5b6472;
+				--faint: #7e8792;
+				--primary: #158140;
+				--primary-content: #fbfdfb;
+				--secondary: #ba4e38;
+				--accent: #8050b0;
+				--info: #0078aa;
+				--success: #138146;
+				--warning: #e4a830;
+				--warning-content: #332710;
+				--error: #cc2827;
+				--surface-page: #e9ecf1;
+				--surface-cell: #ffffff;
+				--surface-output: #ffffff;
+				--cm-bg: #f4f6f9;
+				--cm-fg: #383a42;
+				--cm-gutter: #a3acb8;
+				--cm-selection: #cfe0f6;
+				/* One Light, contrast-hardened */
+				--t-comment: #636972;
+				--t-comment-style: italic;
+				--t-keyword: #a626a4;
+				--t-string: #25793f;
+				--t-number: #a15b00;
+				--t-func: #3361bb;
+				--t-type: #755d0e;
+				--t-name: #ba3728;
+				--t-builtin: #a15b00;
+				--t-operator: #57606a;
+				--t-def: #383a42;
+				--t-decorator: #a626a4;
+				/* git + stale */
+				--git-added: #1a7f37;
+				--git-modified: #0969da;
+				--git-moved: #8250df;
+				--git-removed: #cf222e;
+				--stale: #b45309;
+				--stale-soft: #b4530918;
+				--shadow: 0 1px 2px #1c2a4708, 0 2px 8px #1c2a470a;
+			}
+
+			/* ---- DARK (dim — unchanged reference) ---- */
+			.dark {
+				--base-100: #2a303c;
+				--base-200: #242933;
+				--base-300: #20252e;
+				--base-content: #b2ccd6;
+				--muted: #8b9aa4;
+				--faint: #7d8799;
+				--primary: #9fe88d;
+				--primary-content: #16281a;
+				--secondary: #ff7d5d;
+				--accent: #c792e9;
+				--info: #28ebff;
+				--success: #62efbd;
+				--warning: #efd057;
+				--warning-content: #2a2410;
+				--error: #ffae9b;
+				--surface-page: #242933;
+				--surface-cell: #2a303c;
+				--surface-output: #2a303c;
+				--cm-bg: #282c34;
+				--cm-fg: #abb2bf;
+				--cm-gutter: #7d8799;
+				--cm-selection: #3e4451;
+				--t-comment: #7d8799;
+				--t-comment-style: normal;
+				--t-keyword: #c678dd;
+				--t-string: #98c379;
+				--t-number: #e5c07b;
+				--t-func: #61afef;
+				--t-type: #e5c07b;
+				--t-name: #e06c75;
+				--t-builtin: #d19a66;
+				--t-operator: #56b6c2;
+				--t-def: #abb2bf;
+				--t-decorator: #7d8799;
+				--git-added: #3fb950;
+				--git-modified: #58a6ff;
+				--git-moved: #bc8cff;
+				--git-removed: #f85149;
+				--stale: #f0b429;
+				--stale-soft: #f0b42920;
+				--shadow: 0 1px 2px #0006, 0 2px 8px #0004;
+			}
+
+			* {
+				box-sizing: border-box;
+			}
+			body {
+				margin: 0;
+				font-family:
+					ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+				background: #6b7280;
+				color: #111;
+				padding: 28px;
+			}
+			h1.page-title {
+				color: #fff;
+				font-weight: 650;
+				font-size: 20px;
+				margin: 0 0 4px;
+			}
+			p.page-sub {
+				color: #d4d7dd;
+				margin: 0 0 22px;
+				font-size: 13.5px;
+			}
+			.cols {
+				display: grid;
+				grid-template-columns: 1fr 1fr;
+				gap: 22px;
+				max-width: 1500px;
+			}
+			@media (max-width: 1080px) {
+				.cols {
+					grid-template-columns: 1fr;
+				}
+			}
+
+			.theme {
+				background: var(--base-200);
+				color: var(--base-content);
+				border-radius: 14px;
+				overflow: hidden;
+				box-shadow: 0 8px 30px #0003;
+			}
+			.theme-tag {
+				font-size: 11px;
+				letter-spacing: 0.08em;
+				text-transform: uppercase;
+				padding: 8px 16px;
+				color: var(--muted);
+				background: var(--base-100);
+				border-bottom: 1px solid var(--base-300);
+				font-weight: 600;
+			}
+
+			/* ---- navbar ---- */
+			.navbar {
+				display: flex;
+				align-items: center;
+				gap: 10px;
+				background: var(--base-100);
+				padding: 8px 14px;
+				border-bottom: 1px solid var(--base-300);
+			}
+			.logo {
+				width: 22px;
+				height: 22px;
+				border-radius: 6px;
+				background: var(--primary);
+			}
+			.tabs {
+				display: flex;
+				gap: 4px;
+				flex: 1;
+			}
+			.tab {
+				font-size: 12.5px;
+				padding: 4px 12px;
+				border-radius: 6px 6px 0 0;
+				color: var(--muted);
+				display: flex;
+				align-items: center;
+				gap: 6px;
+			}
+			.tab.active {
+				background: var(--surface-cell);
+				color: var(--base-content);
+				box-shadow: inset 0 0 0 1px var(--base-300);
+			}
+			.tab .dot {
+				width: 6px;
+				height: 6px;
+				border-radius: 50%;
+				background: var(--primary);
+			}
+			.badge {
+				font-size: 11px;
+				font-weight: 600;
+				padding: 2px 9px;
+				border-radius: 999px;
+			}
+			.badge.idle {
+				color: var(--success);
+				background: color-mix(in oklab, var(--success) 15%, transparent);
+			}
+
+			/* ---- body: sidebar + notebook ---- */
+			.body {
+				display: grid;
+				grid-template-columns: 168px 1fr;
+			}
+			.sidebar {
+				background: var(--base-100);
+				border-right: 1px solid var(--base-300);
+				padding: 10px 8px;
+				font-size: 12.5px;
+			}
+			.side-h {
+				text-transform: uppercase;
+				font-size: 10px;
+				letter-spacing: 0.07em;
+				color: var(--faint);
+				margin: 12px 6px 5px;
+				font-weight: 600;
+			}
+			.side-h:first-child {
+				margin-top: 2px;
+			}
+			.side-row {
+				padding: 4px 8px;
+				border-radius: 5px;
+				display: flex;
+				align-items: center;
+				gap: 7px;
+			}
+			.side-row.sel {
+				background: color-mix(in oklab, var(--primary) 14%, transparent);
+				color: var(--primary);
+				font-weight: 600;
+			}
+			.side-row .ico {
+				width: 13px;
+				height: 13px;
+				border-radius: 3px;
+				background: var(--faint);
+				opacity: 0.65;
+			}
+			.side-row.g-mod {
+				color: var(--git-modified);
+			}
+			.side-row.g-add {
+				color: var(--git-added);
+			}
+			.tick {
+				margin-left: auto;
+				font-weight: 700;
+				font-size: 11px;
+			}
+
+			.notebook {
+				background: var(--surface-page);
+				padding: 18px;
+				min-height: 420px;
+			}
+
+			/* ---- cell ---- */
+			.cell {
+				background: var(--surface-cell);
+				border-radius: 8px;
+				box-shadow: var(--shadow);
+				margin-bottom: 14px;
+				position: relative;
+				border: 1px solid color-mix(in oklab, var(--base-300) 60%, transparent);
+			}
+			.cell.active {
+				box-shadow:
+					var(--shadow),
+					0 0 0 1.5px var(--primary);
+			}
+			.cell.active::before {
+				content: '';
+				position: absolute;
+				left: 0;
+				top: 8px;
+				bottom: 8px;
+				width: 3px;
+				border-radius: 3px;
+				background: var(--primary);
+			}
+			.cell-pad {
+				padding: 12px 15px;
+			}
+			.md h2 {
+				margin: 0 0 6px;
+				font-size: 19px;
+				font-weight: 700;
+			}
+			.md p {
+				margin: 0;
+				line-height: 1.55;
+				color: var(--base-content);
+			}
+			.md .link {
+				color: var(--primary);
+				text-decoration: underline;
+			}
+			.md code {
+				font-family: ui-monospace, Menlo, monospace;
+				font-size: 0.88em;
+				background: color-mix(in oklab, var(--base-content) 12%, transparent);
+				padding: 0.08em 0.34em;
+				border-radius: 4px;
+			}
+
+			/* ---- code editor ---- */
+			.editor {
+				display: flex;
+				font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+				font-size: 12.7px;
+				line-height: 1.55;
+				background: var(--cm-bg);
+				color: var(--cm-fg);
+				border-radius: 8px 8px 0 0;
+				padding: 9px 0;
+				overflow: hidden;
+			}
+			.editor.round {
+				border-radius: 8px;
+			}
+			.gutter {
+				flex: 0 0 auto;
+				text-align: right;
+				color: var(--cm-gutter);
+				padding: 0 8px 0 12px;
+				user-select: none;
+			}
+			.code {
+				white-space: pre;
+				overflow-x: auto;
+			}
+			.sel {
+				background: var(--cm-selection);
+				border-radius: 2px;
+			}
+			.k {
+				color: var(--t-keyword);
+			}
+			.s {
+				color: var(--t-string);
+			}
+			.n {
+				color: var(--t-number);
+			}
+			.f {
+				color: var(--t-func);
+			}
+			.ty {
+				color: var(--t-type);
+			}
+			.nm {
+				color: var(--t-name);
+			}
+			.b {
+				color: var(--t-builtin);
+			}
+			.o {
+				color: var(--t-operator);
+			}
+			.d {
+				color: var(--t-def);
+			}
+			.at {
+				color: var(--t-decorator);
+			}
+			.c {
+				color: var(--t-comment);
+				font-style: var(--t-comment-style);
+			}
+
+			/* ---- output ---- */
+			.output {
+				background: var(--surface-output);
+				border-top: 1px solid var(--base-300);
+				padding: 10px 15px;
+				border-radius: 0 0 8px 8px;
+				font-size: 12.5px;
+			}
+			table.df {
+				border-collapse: collapse;
+				font-family: ui-monospace, Menlo, monospace;
+				font-size: 11.5px;
+			}
+			table.df th {
+				text-align: right;
+				padding: 3px 10px;
+				background: var(--base-200);
+				color: var(--muted);
+				border-bottom: 1px solid var(--base-300);
+				font-weight: 600;
+			}
+			table.df td {
+				text-align: right;
+				padding: 3px 10px;
+				border-bottom: 1px solid
+					color-mix(in oklab, var(--base-300) 55%, transparent);
+			}
+			table.df td.idx {
+				color: var(--faint);
+			}
+			.run-row {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				margin-bottom: 8px;
+			}
+			.pill {
+				font-size: 10.5px;
+				font-weight: 600;
+				padding: 1.5px 8px;
+				border-radius: 999px;
+				display: inline-flex;
+				align-items: center;
+				gap: 5px;
+			}
+			.pill.ok {
+				color: var(--success);
+				background: color-mix(in oklab, var(--success) 14%, transparent);
+			}
+			.pill.stale {
+				color: var(--stale);
+				background: var(--stale-soft);
+				box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--stale) 40%, transparent);
+			}
+			.pill.run {
+				color: var(--warning-content);
+				background: var(--warning);
+			}
+
+			/* ---- swatches ---- */
+			.swatches {
+				background: var(--base-100);
+				border-top: 1px solid var(--base-300);
+				padding: 14px 16px 18px;
+			}
+			.sw-h {
+				font-size: 10px;
+				letter-spacing: 0.07em;
+				text-transform: uppercase;
+				color: var(--faint);
+				font-weight: 600;
+				margin: 4px 0 8px;
+			}
+			.chips {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 8px;
+				margin-bottom: 14px;
+			}
+			.chip {
+				width: 62px;
+			}
+			.chip .box {
+				height: 34px;
+				border-radius: 7px;
+				box-shadow: inset 0 0 0 1px #0000001a;
+			}
+			.chip .lbl {
+				font-size: 9.5px;
+				color: var(--muted);
+				margin-top: 3px;
+				text-align: center;
+			}
+			.btnrow {
+				display: flex;
+				gap: 8px;
+				flex-wrap: wrap;
+				align-items: center;
+			}
+			.btn {
+				font-size: 12px;
+				font-weight: 600;
+				padding: 5px 13px;
+				border-radius: 6px;
+				border: none;
+			}
+			.btn.primary {
+				background: var(--primary);
+				color: var(--primary-content);
+			}
+			.btn.ghost {
+				background: transparent;
+				color: var(--base-content);
+				box-shadow: inset 0 0 0 1px var(--base-300);
+			}
+			.input {
+				font-size: 12px;
+				padding: 5px 10px;
+				border-radius: 6px;
+				background: var(--surface-cell);
+				color: var(--base-content);
+				border: 1px solid var(--base-300);
+			}
+		</style>
+	</head>
+	<body>
+		<h1 class="page-title">Cellar — refined light palette (left) vs unchanged dark (right)</h1>
+		<p class="page-sub">
+			Both columns use the exact tokens from <code>src/app.css</code>. Light is the new
+			<code>cellar-light</code> theme (color-theory translation of <code>dim</code>); the code cell uses the
+			hardened One Light syntax tokens. Dark is <code>dim</code> — byte-unchanged, the quality bar.
+		</p>
+
+		<div class="cols">
+			<!-- ================= LIGHT ================= -->
+			<div class="theme light" id="light">
+				<div class="theme-tag">cellar-light · new</div>
+				<div class="navbar">
+					<div class="logo"></div>
+					<div class="tabs">
+						<div class="tab active"><span class="dot"></span>analysis.ipynb</div>
+						<div class="tab">utils.py</div>
+						<div class="tab">README.md</div>
+					</div>
+					<span class="badge idle">● idle</span>
+				</div>
+				<div class="body">
+					<div class="sidebar">
+						<div class="side-h">Files</div>
+						<div class="side-row g-mod"><span class="ico"></span>analysis.ipynb<span class="tick">M</span></div>
+						<div class="side-row g-add"><span class="ico"></span>utils.py<span class="tick">A</span></div>
+						<div class="side-row"><span class="ico"></span>README.md</div>
+						<div class="side-h">Outline</div>
+						<div class="side-row sel">Load & clean</div>
+						<div class="side-row" style="padding-left: 18px">Feature build</div>
+						<div class="side-h">Kernel</div>
+						<div class="side-row"><span class="badge idle">● idle</span></div>
+					</div>
+					<div class="notebook" id="nb-light">
+						<div class="cell">
+							<div class="cell-pad md">
+								<h2>Load &amp; clean</h2>
+								<p>
+									Read the raw parquet, drop nulls, and cache. See <span class="link">the spec</span> for the
+									<code>schema</code> contract.
+								</p>
+							</div>
+						</div>
+
+						<div class="cell active">
+							<div class="editor">
+								<div class="gutter">1<br />2<br />3<br />4<br />5<br />6<br />7</div>
+								<div class="code"><span class="c"># load the training frame and standardise columns</span>
+<span class="k">import</span> <span class="nm">pandas</span> <span class="k">as</span> <span class="nm">pd</span>
+<span class="k">from</span> <span class="nm">pathlib</span> <span class="k">import</span> <span class="ty">Path</span>
+
+<span class="at">@lru_cache</span>
+<span class="k">def</span> <span class="f">load</span>(<span class="d">path</span><span class="o">:</span> <span class="ty">str</span> <span class="o">=</span> <span class="s">"data.parquet"</span>) <span class="o">-></span> <span class="ty">pd</span>.<span class="ty">DataFrame</span><span class="o">:</span>
+    <span class="nm">df</span> <span class="o">=</span> <span class="ty">pd</span>.<span class="f">read_parquet</span>(<span class="b">Path</span>(<span class="d">path</span>))<span class="o">.</span><span class="f">dropna</span>()
+    <span class="k">return</span> <span class="nm">df</span><span class="o">.</span><span class="f">assign</span>(<span class="d">score</span><span class="o">=</span><span class="nm">df</span><span class="o">.</span><span class="nm">x</span> <span class="o">*</span> <span class="n">2.5</span> <span class="o">+</span> <span class="n">10</span>)</div>
+							</div>
+							<div class="output">
+								<div class="run-row">
+									<span class="pill ok">✓ ran this session</span>
+									<span style="color: var(--muted); font-size: 11px">1.2s</span>
+								</div>
+								<table class="df">
+									<tr>
+										<th></th>
+										<th>x</th>
+										<th>y</th>
+										<th>score</th>
+									</tr>
+									<tr><td class="idx">0</td><td>3.1</td><td>0.4</td><td>17.75</td></tr>
+									<tr><td class="idx">1</td><td>5.8</td><td>1.2</td><td>24.50</td></tr>
+									<tr><td class="idx">2</td><td>2.0</td><td>0.9</td><td>15.00</td></tr>
+								</table>
+							</div>
+						</div>
+
+						<div class="cell">
+							<div class="editor round">
+								<div class="gutter">1<br />2</div>
+								<div class="code"><span class="nm">features</span> <span class="o">=</span> <span class="f">build</span>(<span class="nm">df</span>)  <span class="c"># edited — now stale</span>
+<span class="b">print</span>(<span class="nm">features</span><span class="o">.</span><span class="nm">shape</span>)</div>
+							</div>
+							<div class="output">
+								<div class="run-row">
+									<span class="pill stale">▲ stale</span>
+									<span class="pill run">● running…</span>
+								</div>
+							</div>
+						</div>
+					</div>
+				</div>
+
+				<!-- swatches -->
+				<div class="swatches" id="sw-light">
+					<div class="sw-h">Surfaces &amp; text</div>
+					<div class="chips">
+						<div class="chip"><div class="box" style="background: var(--surface-page)"></div><div class="lbl">page</div></div>
+						<div class="chip"><div class="box" style="background: var(--base-100)"></div><div class="lbl">base-100</div></div>
+						<div class="chip"><div class="box" style="background: var(--base-200)"></div><div class="lbl">base-200</div></div>
+						<div class="chip"><div class="box" style="background: var(--base-300)"></div><div class="lbl">base-300</div></div>
+						<div class="chip"><div class="box" style="background: var(--surface-cell)"></div><div class="lbl">cell</div></div>
+						<div class="chip"><div class="box" style="background: var(--cm-bg)"></div><div class="lbl">editor</div></div>
+						<div class="chip"><div class="box" style="background: var(--base-content)"></div><div class="lbl">text</div></div>
+						<div class="chip"><div class="box" style="background: var(--muted)"></div><div class="lbl">muted</div></div>
+					</div>
+					<div class="sw-h">Accents &amp; states</div>
+					<div class="chips">
+						<div class="chip"><div class="box" style="background: var(--primary)"></div><div class="lbl">primary</div></div>
+						<div class="chip"><div class="box" style="background: var(--secondary)"></div><div class="lbl">secondary</div></div>
+						<div class="chip"><div class="box" style="background: var(--accent)"></div><div class="lbl">accent</div></div>
+						<div class="chip"><div class="box" style="background: var(--info)"></div><div class="lbl">info</div></div>
+						<div class="chip"><div class="box" style="background: var(--success)"></div><div class="lbl">success</div></div>
+						<div class="chip"><div class="box" style="background: var(--warning)"></div><div class="lbl">warning</div></div>
+						<div class="chip"><div class="box" style="background: var(--error)"></div><div class="lbl">error</div></div>
+						<div class="chip"><div class="box" style="background: var(--stale)"></div><div class="lbl">stale</div></div>
+					</div>
+					<div class="sw-h">Git decorations</div>
+					<div class="chips">
+						<div class="chip"><div class="box" style="background: var(--git-added)"></div><div class="lbl">added</div></div>
+						<div class="chip"><div class="box" style="background: var(--git-modified)"></div><div class="lbl">modified</div></div>
+						<div class="chip"><div class="box" style="background: var(--git-moved)"></div><div class="lbl">moved</div></div>
+						<div class="chip"><div class="box" style="background: var(--git-removed)"></div><div class="lbl">removed</div></div>
+					</div>
+					<div class="sw-h">Controls</div>
+					<div class="btnrow">
+						<button class="btn primary">Run all</button>
+						<button class="btn ghost">Restart</button>
+						<input class="input" value="filter cells…" />
+					</div>
+				</div>
+			</div>
+
+			<!-- ================= DARK ================= -->
+			<div class="theme dark" id="dark">
+				<div class="theme-tag">dim · unchanged reference</div>
+				<div class="navbar">
+					<div class="logo"></div>
+					<div class="tabs">
+						<div class="tab active"><span class="dot"></span>analysis.ipynb</div>
+						<div class="tab">utils.py</div>
+						<div class="tab">README.md</div>
+					</div>
+					<span class="badge idle">● idle</span>
+				</div>
+				<div class="body">
+					<div class="sidebar">
+						<div class="side-h">Files</div>
+						<div class="side-row g-mod"><span class="ico"></span>analysis.ipynb<span class="tick">M</span></div>
+						<div class="side-row g-add"><span class="ico"></span>utils.py<span class="tick">A</span></div>
+						<div class="side-row"><span class="ico"></span>README.md</div>
+						<div class="side-h">Outline</div>
+						<div class="side-row sel">Load & clean</div>
+						<div class="side-row" style="padding-left: 18px">Feature build</div>
+						<div class="side-h">Kernel</div>
+						<div class="side-row"><span class="badge idle">● idle</span></div>
+					</div>
+					<div class="notebook">
+						<div class="cell">
+							<div class="cell-pad md">
+								<h2>Load &amp; clean</h2>
+								<p>
+									Read the raw parquet, drop nulls, and cache. See <span class="link">the spec</span> for the
+									<code>schema</code> contract.
+								</p>
+							</div>
+						</div>
+
+						<div class="cell active">
+							<div class="editor">
+								<div class="gutter">1<br />2<br />3<br />4<br />5<br />6<br />7</div>
+								<div class="code"><span class="c"># load the training frame and standardise columns</span>
+<span class="k">import</span> <span class="nm">pandas</span> <span class="k">as</span> <span class="nm">pd</span>
+<span class="k">from</span> <span class="nm">pathlib</span> <span class="k">import</span> <span class="ty">Path</span>
+
+<span class="at">@lru_cache</span>
+<span class="k">def</span> <span class="f">load</span>(<span class="d">path</span><span class="o">:</span> <span class="ty">str</span> <span class="o">=</span> <span class="s">"data.parquet"</span>) <span class="o">-></span> <span class="ty">pd</span>.<span class="ty">DataFrame</span><span class="o">:</span>
+    <span class="nm">df</span> <span class="o">=</span> <span class="ty">pd</span>.<span class="f">read_parquet</span>(<span class="b">Path</span>(<span class="d">path</span>))<span class="o">.</span><span class="f">dropna</span>()
+    <span class="k">return</span> <span class="nm">df</span><span class="o">.</span><span class="f">assign</span>(<span class="d">score</span><span class="o">=</span><span class="nm">df</span><span class="o">.</span><span class="nm">x</span> <span class="o">*</span> <span class="n">2.5</span> <span class="o">+</span> <span class="n">10</span>)</div>
+							</div>
+							<div class="output">
+								<div class="run-row">
+									<span class="pill ok">✓ ran this session</span>
+									<span style="color: var(--muted); font-size: 11px">1.2s</span>
+								</div>
+								<table class="df">
+									<tr>
+										<th></th>
+										<th>x</th>
+										<th>y</th>
+										<th>score</th>
+									</tr>
+									<tr><td class="idx">0</td><td>3.1</td><td>0.4</td><td>17.75</td></tr>
+									<tr><td class="idx">1</td><td>5.8</td><td>1.2</td><td>24.50</td></tr>
+									<tr><td class="idx">2</td><td>2.0</td><td>0.9</td><td>15.00</td></tr>
+								</table>
+							</div>
+						</div>
+
+						<div class="cell">
+							<div class="editor round">
+								<div class="gutter">1<br />2</div>
+								<div class="code"><span class="nm">features</span> <span class="o">=</span> <span class="f">build</span>(<span class="nm">df</span>)  <span class="c"># edited — now stale</span>
+<span class="b">print</span>(<span class="nm">features</span><span class="o">.</span><span class="nm">shape</span>)</div>
+							</div>
+							<div class="output">
+								<div class="run-row">
+									<span class="pill stale">▲ stale</span>
+									<span class="pill run">● running…</span>
+								</div>
+							</div>
+						</div>
+					</div>
+				</div>
+
+				<div class="swatches">
+					<div class="sw-h">Surfaces &amp; text</div>
+					<div class="chips">
+						<div class="chip"><div class="box" style="background: var(--surface-page)"></div><div class="lbl">page</div></div>
+						<div class="chip"><div class="box" style="background: var(--base-100)"></div><div class="lbl">base-100</div></div>
+						<div class="chip"><div class="box" style="background: var(--base-200)"></div><div class="lbl">base-200</div></div>
+						<div class="chip"><div class="box" style="background: var(--base-300)"></div><div class="lbl">base-300</div></div>
+						<div class="chip"><div class="box" style="background: var(--surface-cell)"></div><div class="lbl">cell</div></div>
+						<div class="chip"><div class="box" style="background: var(--cm-bg)"></div><div class="lbl">editor</div></div>
+						<div class="chip"><div class="box" style="background: var(--base-content)"></div><div class="lbl">text</div></div>
+						<div class="chip"><div class="box" style="background: var(--muted)"></div><div class="lbl">muted</div></div>
+					</div>
+					<div class="sw-h">Accents &amp; states</div>
+					<div class="chips">
+						<div class="chip"><div class="box" style="background: var(--primary)"></div><div class="lbl">primary</div></div>
+						<div class="chip"><div class="box" style="background: var(--secondary)"></div><div class="lbl">secondary</div></div>
+						<div class="chip"><div class="box" style="background: var(--accent)"></div><div class="lbl">accent</div></div>
+						<div class="chip"><div class="box" style="background: var(--info)"></div><div class="lbl">info</div></div>
+						<div class="chip"><div class="box" style="background: var(--success)"></div><div class="lbl">success</div></div>
+						<div class="chip"><div class="box" style="background: var(--warning)"></div><div class="lbl">warning</div></div>
+						<div class="chip"><div class="box" style="background: var(--error)"></div><div class="lbl">error</div></div>
+						<div class="chip"><div class="box" style="background: var(--stale)"></div><div class="lbl">stale</div></div>
+					</div>
+					<div class="sw-h">Git decorations</div>
+					<div class="chips">
+						<div class="chip"><div class="box" style="background: var(--git-added)"></div><div class="lbl">added</div></div>
+						<div class="chip"><div class="box" style="background: var(--git-modified)"></div><div class="lbl">modified</div></div>
+						<div class="chip"><div class="box" style="background: var(--git-moved)"></div><div class="lbl">moved</div></div>
+						<div class="chip"><div class="box" style="background: var(--git-removed)"></div><div class="lbl">removed</div></div>
+					</div>
+					<div class="sw-h">Controls</div>
+					<div class="btnrow">
+						<button class="btn primary">Run all</button>
+						<button class="btn ghost">Restart</button>
+						<input class="input" value="filter cells…" />
+					</div>
+				</div>
+			</div>
+		</div>
+	</body>
+</html>

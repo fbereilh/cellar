@@ -908,6 +908,9 @@
 	// rather than derived from the theme's name, so a new theme needs no change
 	// here.
 	function applyTheme(t: string) {
+		// `nord` was the light theme before the color-theory pass; map any persisted
+		// value forward so a returning user lands on the new `cellar-light`.
+		if (t === 'nord') t = 'cellar-light';
 		theme = t;
 		if (typeof document !== 'undefined') {
 			const root = document.documentElement;
@@ -980,7 +983,7 @@
 	// disabled while no notebook tab is active; the api is resolved at call time
 	// (`notebookApis` is a plain Map, so the reactive gate is `activeNotebookPath`).
 	function toggleTheme() {
-		applyTheme(theme === 'dim' ? 'nord' : 'dim');
+		applyTheme(theme === 'dim' ? 'cellar-light' : 'dim');
 	}
 	function activeNotebookApi() {
 		return (activeNotebookPath && notebookApis.get(activeNotebookPath)) || null;
