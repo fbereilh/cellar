@@ -233,6 +233,24 @@ function foldUnits(cells: readonly HeadingCell[] | null | undefined): FoldUnit[]
 }
 
 /**
+ * A cheap structural signature of exactly what `computeFolding` reads: each
+ * cell's id, its type, and — for markdown cells only — its source (the heading
+ * layout comes from markdown headings). A code cell's source, any cell's outputs,
+ * execution counts and metadata are all invisible to folding, so they are
+ * deliberately excluded. Two cell arrays with the same signature always fold
+ * identically, which lets a caller memoize `computeFolding` and skip the O(N)
+ * fence-aware re-parse when an unrelated change (a run's streamed output, a code
+ * edit) leaves the heading layout untouched.
+ */
+export function foldSignature(cells: readonly HeadingCell[] | null | undefined): string {
+	let sig = '';
+	for (const c of cells ?? []) {
+		sig += c.id + '\0' + c.cell_type + '\0' + (c.cell_type === 'markdown' ? c.source : '') + '\x1e';
+	}
+	return sig;
+}
+
+/**
  * Given the ordered cells and the set of folded heading keys, decide what the
  * notebook hides. Nested folds compose: a unit hidden by an outer fold stays
  * hidden regardless of inner state.
