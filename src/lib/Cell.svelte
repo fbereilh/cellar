@@ -22,6 +22,7 @@
 	import { isExportCell } from '$lib/exportRole';
 	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration } from '$lib/relativeTime';
+	import { nowMs, subscribeNow } from '$lib/now.svelte';
 	import type { CellOutput, LogicalCellType } from '$lib/server/types';
 	import type { KeyMode, UICell, SegHidden, CellRegisterApi, RemoteEdit } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
@@ -242,15 +243,16 @@
 
 	// ---- Per-cell run metadata badge ("ran 2m ago · 1.2s · agent") ----------
 	// Runtime-only `{ at, durationMs, actor }` stamped by both run paths, stripped
-	// from disk by clean.js. `now` ticks so the relative time stays fresh.
+	// from disk by clean.js. The relative-time freshness rides the app-wide shared
+	// ticker (ONE interval for the whole app; see $lib/now.svelte.ts) rather than a
+	// per-cell setInterval — 200 cells no longer means 200 timers. Subscribe only
+	// while this cell has a run to show, so the shared timer stops when idle.
 	const lastRun = $derived(cell.metadata?.cellar?.lastRun);
-	let now = $state(Date.now());
 	$effect(() => {
 		if (!lastRun) return;
-		const t = setInterval(() => (now = Date.now()), 15000);
-		return () => clearInterval(t);
+		return subscribeNow();
 	});
-	const ranText = $derived(lastRun ? `ran ${relativeTime(lastRun.at, now)} · ${formatDuration(lastRun.durationMs)}` : '');
+	const ranText = $derived(lastRun ? `ran ${relativeTime(lastRun.at, nowMs())} · ${formatDuration(lastRun.durationMs)}` : '');
 	const isAgentRun = $derived(lastRun?.actor === 'agent');
 
 	// ---- Click-to-copy cell id ----------------------------------------------
