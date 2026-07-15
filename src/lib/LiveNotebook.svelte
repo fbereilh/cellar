@@ -2,7 +2,7 @@
 	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client';
-	import { cellIdOfKey, computeFolding, computeHeadingNumbers, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
+	import { cellIdOfKey, computeFolding, computeHeadingNumbers, foldSignature, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
@@ -212,7 +212,24 @@
 	// cells stay in `cells` (they run/persist normally); we only hide them from
 	// the rendered flow.
 	let foldedIds = $state<Set<string>>(new Set());
-	const folding = $derived(computeFolding(cells, foldedIds));
+	// `computeFolding` is an O(N) fence-aware re-parse of every markdown cell, but it
+	// depends ONLY on the heading layout (`foldSignature`) and the folded set - not on
+	// outputs, code-cell edits, execution counts or metadata. Recomputing it on every
+	// `cells` change (a run streams outputs constantly) is wasted work, so memoize on
+	// the structural signature + the folded-set identity. `foldedIds` is only ever
+	// REPLACED with a fresh Set (never mutated in place - see every write below), so
+	// identity comparison is a sound cache key. The value is byte-for-byte what an
+	// unmemoized `computeFolding(cells, foldedIds)` would return.
+	const foldSig = $derived(foldSignature(cells));
+	let foldCache: { sig: string; folded: Set<string>; value: Folding } | null = null;
+	const folding = $derived.by(() => {
+		const sig = foldSig;
+		const folded = foldedIds;
+		if (foldCache && foldCache.sig === sig && foldCache.folded === folded) return foldCache.value;
+		const value = computeFolding(cells, folded);
+		foldCache = { sig, folded, value };
+		return value;
+	});
 
 	// Publish the fold state (and let the Outline toggle it) - see `+page.svelte`.
 	$effect(() => {
