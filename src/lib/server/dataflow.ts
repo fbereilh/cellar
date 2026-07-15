@@ -114,7 +114,10 @@ def analyze(source):
 
 def main():
     try:
-        req = json.loads(sys.argv[1])
+        # Payload arrives on STDIN, not argv: a large notebook's JSON would blow
+        # ARG_MAX as a command-line argument, silently killing staleness for exactly
+        # the big notebooks that most need it. Read stdin to completion, then analyze.
+        req = json.loads(sys.stdin.read())
         out = {c['key']: analyze(c['source']) for c in req.get('cells', [])}
         sys.stdout.write('${SENTINEL}' + json.dumps({'ok': True, 'cells': out}) + '\\n')
     except Exception as e:
@@ -133,8 +136,11 @@ function runProbe(items: ProbeItem[]): Promise<DataflowMap> {
 	return new Promise<DataflowMap>((resolve) => {
 		let child: ChildProcess;
 		try {
-			child = spawn(python, ['-c', PROBE, JSON.stringify({ cells: items })], {
-				stdio: ['ignore', 'pipe', 'pipe']
+			// Payload goes over STDIN (not argv): a large notebook's JSON exceeds
+			// ARG_MAX and the spawn fails, which used to silently drop staleness for
+			// the biggest notebooks. stdin has no such ceiling.
+			child = spawn(python, ['-c', PROBE], {
+				stdio: ['pipe', 'pipe', 'pipe']
 			});
 		} catch {
 			resolve({}); // spawn threw synchronously (bad interpreter) → degrade
@@ -142,13 +148,27 @@ function runProbe(items: ProbeItem[]): Promise<DataflowMap> {
 		}
 		let stdout = '';
 		const timer = setTimeout(() => child.kill('SIGKILL'), PROBE_TIMEOUT_MS);
-		child.stdout?.on('data', (d) => (stdout += d));
+		child.stdout?.on('data', (d) => (stdout += d)); // drain stdout so the pipe never blocks the child
 		child.stderr?.on('data', () => {}); // drain, never fatal
 		child.on('error', () => {
 			clearTimeout(timer);
 			resolve({}); // interpreter missing → degrade
 		});
-		child.on('exit', () => {
+		// Feed the payload and close stdin so the probe's `sys.stdin.read()` returns.
+		// The child reads stdin fully before writing stdout, and Node buffers our
+		// write in-process (never blocking the event loop) while we already drain
+		// stdout above, so a large payload can't deadlock the pipes. An EPIPE (child
+		// died before reading) must not crash the app, so swallow stdin errors — the
+		// 'error'/'close' handlers own the degrade path.
+		const stdin = child.stdin;
+		if (stdin) {
+			stdin.on('error', () => {}); // e.g. EPIPE if the child exited early
+			stdin.end(JSON.stringify({ cells: items }));
+		}
+		// 'close', not 'exit': a large notebook produces a large stdout, and 'exit'
+		// can fire before that stdout is fully drained. 'close' waits for the stdio
+		// streams to end, so `stdout` is complete when we parse it.
+		child.on('close', () => {
 			clearTimeout(timer);
 			const line = stdout.split('\n').find((l) => l.startsWith(SENTINEL));
 			if (!line) return resolve({});
