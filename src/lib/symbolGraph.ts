@@ -192,3 +192,95 @@ export function resolveSymbol(opts: {
 	if (kernelNames) info.live_in_kernel = kernelNames.has(name);
 	return info;
 }
+
+/** The cell shape `resolveImpact` reads: an id and whether it is agent-visible. */
+export interface ImpactCell {
+	id: string;
+	cell_type: string;
+	/** Hidden from the agent (`metadata.cellar.hidden_from_agent`) — never reported. */
+	hidden: boolean;
+}
+
+/** The `cell_impact` answer (report §3.2). */
+export interface ImpactInfo {
+	/** The queried cell's handle (echoed back). */
+	cell: string;
+	/** Visible cells whose definitions this cell reads (its direct upstream). */
+	depends_on: string[];
+	/** Visible cells that would go STALE if this cell is edited (transitive downstream). */
+	dependents: string[];
+}
+
+/**
+ * The dependency blast radius of one cell, off the SAME definer graph as
+ * staleness (and `resolveSymbol`): its `depends_on` (the cells whose definitions
+ * this cell reads — its direct upstream) and its `dependents` (the transitive
+ * downstream cells that would go STALE if this cell is edited), both in document
+ * order. This answers "what will run_stale re-run after I touch this cell" BEFORE
+ * the edit — the downstream direction nothing else surfaces.
+ *
+ * The graph is built over ALL code cells and traversed THROUGH hidden cells (a
+ * hidden cell still propagates a dependency in the kernel), but only agent-visible
+ * cells are reported. A non-code / unknown target yields empty lists.
+ *
+ * Inherits the definer graph's limits (see this module's header): a
+ * self-reassignment (`df = f(df)`) hides that cell's read of `df`, so a data cell's
+ * `dependents` can UNDER-report. `get_notebook_map`'s `stale_state` is the
+ * authoritative post-hoc signal (it catches this at run time via `lastRun`).
+ *
+ * @param id       the full cell id to query
+ * @param cells    ALL notebook cells in document order (code + markdown)
+ * @param dataflow per-code-cell `{defines, uses}`, keyed by cell id
+ * @param toHandle full cell id → short agent handle
+ */
+export function resolveImpact(opts: {
+	id: string;
+	cells: readonly ImpactCell[];
+	dataflow: Dataflow;
+	toHandle?: (id: string) => string;
+}): ImpactInfo {
+	const { id, cells, dataflow } = opts;
+	const toHandle = opts.toHandle ?? ((x) => x);
+
+	const codeCells = cells.filter((c) => c.cell_type === 'code');
+	const targetIdx = codeCells.findIndex((c) => c.id === id);
+	// A markdown / unknown / non-code target has no dataflow edges.
+	if (targetIdx < 0) return { cell: toHandle(id), depends_on: [], dependents: [] };
+
+	const { directUpstream } = buildDefinerGraph(codeCells, dataflow);
+
+	// depends_on: the direct upstream, in document order, visible cells only.
+	const depends_on = [...directUpstream[targetIdx]]
+		.sort((a, b) => a - b)
+		.filter((j) => !codeCells[j].hidden)
+		.map((j) => toHandle(codeCells[j].id));
+
+	// dependents: transitive downstream. Reverse the upstream edges (j ∈ upstream[i]
+	// ⇒ i is a dependent of j), then BFS from the target. The graph is acyclic
+	// (upstream indices are always < the cell's own, i.e. earlier in the document),
+	// so this always terminates; `seen` is belt-and-suspenders. Traversal passes
+	// THROUGH hidden cells so a dependent behind a hidden one still surfaces; only
+	// the emitted list excludes hidden cells.
+	const downstream: Set<number>[] = codeCells.map(() => new Set<number>());
+	directUpstream.forEach((ups, i) => {
+		for (const j of ups) downstream[j].add(i);
+	});
+	const seen = new Set<number>([targetIdx]);
+	const found = new Set<number>();
+	const queue = [targetIdx];
+	while (queue.length) {
+		const i = queue.shift()!;
+		for (const d of downstream[i]) {
+			if (seen.has(d)) continue;
+			seen.add(d);
+			found.add(d);
+			queue.push(d);
+		}
+	}
+	const dependents = [...found]
+		.sort((a, b) => a - b)
+		.filter((j) => !codeCells[j].hidden)
+		.map((j) => toHandle(codeCells[j].id));
+
+	return { cell: toHandle(id), depends_on, dependents };
+}
