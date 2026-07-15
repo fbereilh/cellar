@@ -19,7 +19,16 @@ import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { workspaceRoot, resolveInWorkspace } from './fstree';
 
-const MAX_GIT_BUFFER = 8 * 1024 * 1024;
+/**
+ * Cap on a single `git` subprocess's stdout. Node's `execFile` REJECTS with an
+ * `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` error the moment stdout crosses this — it
+ * does NOT hand back the bytes read so far — so an undersized cap silently loses
+ * a legitimately large result (e.g. `git show HEAD:big.ipynb` for a notebook with
+ * many/large outputs). Node's own default is a stingy 1 MB; we raise it well past
+ * any realistic tracked-file blob. An overflow past even this is surfaced by
+ * `runGit` (logged + honest degrade) rather than masqueraded as "not tracked".
+ */
+const MAX_GIT_BUFFER = 256 * 1024 * 1024;
 
 /**
  * Every `git` subprocess this module spawns bumps this counter. The shell fires a
@@ -390,9 +399,30 @@ function runGit(root: string, args: string[]): Promise<string | null> {
 	spawnCount++;
 	return new Promise((resolve) => {
 		execFile('git', ['-C', root, '--no-optional-locks', ...args], { maxBuffer: MAX_GIT_BUFFER }, (err, stdout) => {
+			// A maxBuffer overflow returns truncated stdout ALONGSIDE the error, and the
+			// old `err ? null` collapsed it into the same "not a repo / no such ref"
+			// silence as an ordinary failure — a huge tracked blob would then just
+			// vanish with no decoration and no trace. Detect that one error and SURFACE
+			// it (the cap is already large, so hitting it is genuinely anomalous), then
+			// degrade honestly to null so the caller shows no baseline rather than a
+			// silently-truncated one.
+			if (isMaxBufferError(err)) {
+				console.warn(
+					`[cellar/git] output exceeded the ${Math.round(MAX_GIT_BUFFER / (1024 * 1024))} MB buffer for \`git ${args.join(' ')}\`; ` +
+						`dropping the (truncated) result — decorations for this target are unavailable.`
+				);
+				return resolve(null);
+			}
 			resolve(err ? null : stdout);
 		});
 	});
+}
+
+/** True when `execFile` failed specifically because stdout crossed `maxBuffer`. */
+export function isMaxBufferError(err: unknown): boolean {
+	// Node tags the overflow with this code; older/edge builds only set the message.
+	const e = err as { code?: string; message?: string } | null;
+	return !!e && (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || /maxBuffer length exceeded/i.test(e.message ?? ''));
 }
 
 /**
