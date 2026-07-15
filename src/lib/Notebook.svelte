@@ -67,6 +67,8 @@
 		onEditorFocus?: (id: string) => void;
 		onEditorBlur?: (id: string) => void;
 		onAddCell: (afterId: string | undefined, cellType: CellType) => void;
+		/** Insert a fresh `cellType` cell above/below `targetId`, then select+focus it. */
+		onInsertCell: (where: 'above' | 'below', targetId: string, cellType: CellType) => void;
 	}
 
 	// The shell owns the cell array + all cell operations (so the sidebar's
@@ -112,7 +114,8 @@
 		onRegister,
 		onEditorFocus,
 		onEditorBlur,
-		onAddCell
+		onAddCell,
+		onInsertCell
 	}: Props = $props();
 
 	// ---- Drag to reorder cells ----------------------------------------------
@@ -206,6 +209,37 @@
 	}
 </script>
 
+<!-- Hover-between insert control (VS Code style): a thin strip living in the gap
+     above a cell that, on hover, reveals "+ Code" / "+ Markdown" buttons. Clicking
+     inserts a fresh cell at that position (above `targetId`), reusing the one
+     positional-insert path. Rendered per gap, so it covers above the first cell
+     and between every pair; the always-visible append bar covers the very end. -->
+{#snippet insertControls(where: 'above' | 'below', targetId: string | undefined)}
+	{#if targetId}
+		<div class="pointer-events-none absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-primary/25 opacity-0 transition-opacity group-hover/ins:opacity-100"></div>
+		<div class="pointer-events-none flex gap-1 opacity-0 transition-opacity group-hover/ins:pointer-events-auto group-hover/ins:opacity-100">
+			<button
+				class="btn btn-primary btn-xs h-5 min-h-0 gap-1 px-2 shadow-sm"
+				onclick={() => onInsertCell(where, targetId, 'code')}
+				data-testid="insert-code"
+				title="Insert a code cell here"
+			>
+				<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+				Code
+			</button>
+			<button
+				class="btn btn-neutral btn-xs h-5 min-h-0 gap-1 px-2 shadow-sm"
+				onclick={() => onInsertCell(where, targetId, 'markdown')}
+				data-testid="insert-markdown"
+				title="Insert a markdown cell here"
+			>
+				<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+				Markdown
+			</button>
+		</div>
+	{/if}
+{/snippet}
+
 {#snippet removedSeam(n: number)}
 	<div
 		class="flex items-center gap-2 text-[11px]"
@@ -286,6 +320,16 @@
 							data-git={gitStatus[cell.id]}
 						></div>
 					{/if}
+					<!-- Hover-between "+" control, living in the gap above this cell. Hidden
+					     during a drag so it never fights the drop indicator. -->
+					{#if dragId == null}
+						<div
+							class="group/ins absolute inset-x-0 -top-4 z-20 flex h-4 items-center justify-center"
+							data-testid="insert-between"
+						>
+							{@render insertControls('above', cell.id)}
+						</div>
+					{/if}
 					<!-- Insertion indicator (top or bottom edge of the hovered cell). -->
 					{#if dragId != null && dropIndex === i}
 						<div
@@ -327,6 +371,7 @@
 						onRegister={onRegister}
 						onEditorFocus={onEditorFocus}
 						onEditorBlur={onEditorBlur}
+						onInsertCell={onInsertCell}
 						onDragStart={onDragStart}
 						onDragEnd={endDrag}
 					/>

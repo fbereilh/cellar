@@ -25,7 +25,7 @@
 	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration } from '$lib/relativeTime';
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
-	import type { CellOutput, LogicalCellType } from '$lib/server/types';
+	import type { CellOutput, CellType, LogicalCellType } from '$lib/server/types';
 	import type { KeyMode, UICell, SegHidden, CellRegisterApi, RemoteEdit } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 
@@ -60,6 +60,8 @@
 		onClear: (id: string) => void;
 		onDelete: (id: string) => void;
 		onMove: (id: string, dir: 'up' | 'down') => void;
+		/** Insert a fresh `cellType` cell above/below this one, then select+focus it. */
+		onInsertCell: (where: 'above' | 'below', targetId: string, cellType: CellType) => void;
 		onEdit: (id: string, source: string, opts?: { keepalive?: boolean }) => void | Promise<void>;
 		onSetType: (id: string, type: LogicalCellType) => void;
 		/** Designate this cell the imports cell ('imports') or un-designate it (null). */
@@ -104,6 +106,7 @@
 		onClear,
 		onDelete,
 		onMove,
+		onInsertCell,
 		onEdit,
 		onSetType,
 		onSetRole,
@@ -1190,6 +1193,15 @@
 						{/if}
 					</span>
 				{/if}
+				<!-- Insert a fresh code cell directly above / below this one. The per-cell
+				     analogue of the hover-between "+" and the `a`/`b` shortcuts; all three
+				     go through the one positional-insert path. -->
+				<button class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-base-content/80" onclick={() => onInsertCell('above', cell.id, 'code')} title="Insert cell above (a)" aria-label="Insert cell above" data-testid="cell-insert-above">
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16" /><path d="M12 10v9" /><path d="M8 14h8" /></svg>
+				</button>
+				<button class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-base-content/80" onclick={() => onInsertCell('below', cell.id, 'code')} title="Insert cell below (b)" aria-label="Insert cell below" data-testid="cell-insert-below">
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19h16" /><path d="M12 5v9" /><path d="M8 10h8" /></svg>
+				</button>
 				<!-- Every cell — the imports cell included — moves freely now. -->
 				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'up')} disabled={index === 0} title="Move up" aria-label="Move cell up" data-testid="move-up">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6" /></svg>
