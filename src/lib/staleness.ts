@@ -35,6 +35,9 @@
  */
 
 import type { Cell, LastRun, SessionId } from '$lib/server/types';
+import { buildDefinerGraph, type Dataflow } from '$lib/symbolGraph';
+
+export type { Dataflow };
 
 /** state values a cell can carry. */
 export const STALE_STATE = {
@@ -46,9 +49,6 @@ export const STALE_STATE = {
 
 /** One of the four staleness states. */
 export type StaleState = (typeof STALE_STATE)[keyof typeof STALE_STATE];
-
-/** Per-cell dataflow (what each cell defines / uses); missing entry ⇒ no dataflow. */
-export type Dataflow = Record<string, { defines?: string[]; uses?: string[] } | undefined>;
 
 /** A single cell's staleness verdict. */
 export interface StalenessEntry {
@@ -94,38 +94,12 @@ export function computeStaleness(
 	const df: Dataflow = dataflow || {};
 	const result: StalenessMap = {};
 
-	// The graph is over CODE cells only. Build, per name, the document-ordered list
-	// of the cells that define it, so a use resolves to its nearest preceding definer.
+	// The graph is over CODE cells only. The definer graph (per name, the
+	// document-ordered defining cells; each use's nearest preceding definer) is
+	// built by `$lib/symbolGraph`, so the exact same rule backs the MCP find_symbol
+	// tool — one definition, no drift.
 	const codeCells = cells.filter((c) => c.cell_type === 'code');
-	const definers = new Map<string, number[]>(); // name -> [codeCell indices, ascending]
-	codeCells.forEach((c, i) => {
-		for (const name of df[c.id]?.defines ?? []) {
-			if (!definers.has(name)) definers.set(name, []);
-			definers.get(name)!.push(i);
-		}
-	});
-
-	/** The nearest code-cell index < `i` that defines `name`, or -1. */
-	function definerBefore(name: string, i: number): number {
-		const list = definers.get(name);
-		if (!list) return -1;
-		let best = -1;
-		for (const j of list) {
-			if (j < i) best = j;
-			else break;
-		}
-		return best;
-	}
-
-	// The set of upstream code-cell indices each code cell directly depends on.
-	const directUpstream = codeCells.map((c, i) => {
-		const ups = new Set<number>();
-		for (const name of df[c.id]?.uses ?? []) {
-			const j = definerBefore(name, i);
-			if (j >= 0) ups.add(j);
-		}
-		return ups;
-	});
+	const { directUpstream } = buildDefinerGraph(codeCells, df);
 
 	// Process in document order: an upstream (nearest preceding definer) always has
 	// a smaller index, so its verdict is already known — transitive staleness

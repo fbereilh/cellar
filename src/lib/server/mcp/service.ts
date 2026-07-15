@@ -32,9 +32,10 @@ import { enqueueRun, queuesByNotebook, queuePosition } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree } from '../fstree';
-import { getNotebookStaleness } from '../dataflow';
+import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
+import { resolveSymbol } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
 import { IMG_MAX_EDGE, downscaleImageForBlock, imagePlaceholder } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
@@ -779,6 +780,58 @@ export function searchCells(query: string, where: 'input' | 'output' | 'both' = 
 		}
 	}
 	return results;
+}
+
+/**
+ * The set of names live in a notebook's kernel namespace right now, or null when
+ * that is unknowable (no kernel, busy mid-run, or the namespace belongs to a
+ * session that has since restarted). Drawn from the SAME bucketed `kernel_state`
+ * probe every other live-truth read uses, so `find_symbol`'s `live_in_kernel`
+ * cannot disagree with `kernel_state`.
+ */
+async function liveKernelNames(nb?: string | null): Promise<Set<string> | null> {
+	const state = await kernelState(nb);
+	// Only an idle, current-session namespace has readable buckets; {started:false},
+	// {busy:true}, and a stale namespace all carry no trustworthy names.
+	if (!('variables' in state) || state.stale) return null;
+	const names = new Set<string>();
+	for (const i of state.imports || []) names.add(i.alias);
+	for (const f of state.functions || []) names.add(f.name);
+	for (const c of state.classes || []) names.add(c.name);
+	for (const v of state.variables || []) names.add(v.name);
+	return names;
+}
+
+/**
+ * Locate a Python name across the notebook by DATAFLOW, not text: the cells that
+ * DEFINE it (assignment/import/def/class, document order) and the cells that USE
+ * it (each resolved to the definition it binds to), reconciled with the live
+ * kernel. Surfaces the symbol→cell graph Cellar already computes for staleness and
+ * otherwise discards — the `used_in` (references) side is a capability no other
+ * tool provides, and `defined_in` is far more precise than `search_cells`.
+ *
+ * The graph is built over ALL code cells (a hidden cell still defines names in the
+ * kernel), but only agent-visible cells are reported; a hidden definer sets
+ * `hidden_definer`. Inherits `symtable`'s limits (see `$lib/symbolGraph`): a
+ * self-reassignment (`df = f(df)`) hides that cell's read of `df`, dynamic names
+ * (exec/globals/star-import) are invisible, and a forward reference binds to null.
+ */
+export async function findSymbol(name: string, nb?: string | null) {
+	const cells = listCells(nb); // ALL cells (incl. hidden) so a hidden definer still counts
+	const [dataflow, kernelNames] = await Promise.all([analyzeDataflow(cells), liveKernelNames(nb)]);
+	return resolveSymbol({
+		name,
+		cells: cells.map((c) => ({
+			id: c.id,
+			cell_type: c.cell_type,
+			hidden: isHidden(c),
+			lastRunSession: c.metadata?.cellar?.lastRun?.session ?? null
+		})),
+		dataflow,
+		sid: currentSessionId(nb),
+		kernelNames,
+		toHandle: handleFn(nb)
+	});
 }
 
 /**
