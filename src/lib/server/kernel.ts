@@ -690,6 +690,24 @@ const DATAFRAME_FORMATTER_CODE = [
 	'del _cellar_register_df_formatter'
 ].join('\n');
 
+/**
+ * Best-effort: after a kernel restart has re-established a notebook's namespace,
+ * ask the Databricks layer to rebuild that notebook's `spark`/`w` session against
+ * the same profile+cluster it had before (a no-op if it had none). Detached and
+ * error-swallowing so it can NEVER block or break the restart. Loaded dynamically
+ * to keep databricks.ts's dependency on this module one-directional (no import
+ * cycle) - the reconnect is a pure side effect, not part of the restart's result.
+ */
+async function reconnectDatabricksAfterRestart(nbPath: string): Promise<void> {
+	try {
+		const { reconnectAfterKernelRestart } = await import('./databricks');
+		await reconnectAfterKernelRestart(nbPath);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		logWarn('kernel', `Databricks reconnect after restart of ${nbPath} errored: ${message}`);
+	}
+}
+
 async function runSilent(kernel: KernelConnection, code: string): Promise<void> {
 	try {
 		const future = kernel.requestExecute({
@@ -826,7 +844,12 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 			// (submitted against the namespace that is now gone; see clearRunQueue).
 			abortActiveRuns(nbKernel, 'kernel_autorestart');
 			clearRunQueue(nbPath, 'kernel_autorestart');
-			void initKernel(kernel);
+			// Re-inject the startup code, THEN best-effort re-establish a Databricks
+			// session if this notebook had one (both after the namespace is fresh).
+			// Detached so a jupyter-driven autorestart is never blocked by either.
+			void initKernel(kernel)
+				.then(() => reconnectDatabricksAfterRestart(nbPath))
+				.catch(() => {});
 		};
 		kernel.statusChanged.connect(nbKernel.statusHandler);
 		await initKernel(kernel);
@@ -903,6 +926,10 @@ export async function restartKernel(nbPath?: string | null) {
 	// restart() clears the namespace and the inline-backend config, so re-inject.
 	await initKernel(kernel);
 	publishKernelStatus();
+	// If this notebook had a live Databricks session, rebuild it against the same
+	// profile+cluster now the namespace is fresh. Detached (void) so it never blocks
+	// the restart from returning; failures degrade to the honest ask-user state.
+	void reconnectDatabricksAfterRestart(abs);
 	return { status: kernel.status, id: kernel.id, session_id: nbKernel.sessionId };
 }
 
