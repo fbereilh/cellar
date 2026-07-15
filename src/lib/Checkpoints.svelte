@@ -15,6 +15,7 @@
 	import { onMount } from 'svelte';
 	import { subscribeEvents, originId } from '$lib/events-client';
 	import { relativeTimeLong } from '$lib/relativeTime';
+	import { nowMs, subscribeNow } from '$lib/now.svelte';
 	import type { CheckpointMeta, CheckpointTrigger } from '$lib/server/checkpoints';
 
 	interface Props {
@@ -29,9 +30,6 @@
 	let busy = $state(false); // a create/restore is in flight
 	let confirmId = $state<string | null>(null); // the checkpoint id awaiting a restore confirmation
 	let seq = 0;
-
-	// A ticking clock so the relative timestamps ("2 minutes ago") stay current.
-	let now = $state(Date.now());
 
 	async function load() {
 		if (!notebookPath) {
@@ -58,14 +56,17 @@
 
 	onMount(() => {
 		load();
-		const t = setInterval(() => (now = Date.now()), 15000);
+		// Relative timestamps ("2 minutes ago") stay current off the app-wide shared
+		// ticker (one interval for the whole app; see $lib/now.svelte.ts) rather than
+		// a panel-local setInterval.
+		const untick = subscribeNow();
 		const unsub = subscribeEvents((ev) => {
 			// Any checkpoint change re-lists (a cheap metadata GET); the route always
 			// targets our own notebook, so an over-broad refetch is harmless.
 			if (ev.type === 'checkpoints:changed') load();
 		});
 		return () => {
-			clearInterval(t);
+			untick();
 			unsub();
 		};
 	});
@@ -167,7 +168,7 @@
 						</div>
 						<div class="mt-1 flex items-center justify-between gap-2">
 							<span class="whitespace-nowrap text-[11px] text-base-content/45" title={new Date(cp.at).toLocaleString()}>
-								{relativeTimeLong(cp.at, now)} · {cp.cellCount} cell{cp.cellCount === 1 ? '' : 's'}{cp.outputsTruncated ? ' · outputs trimmed' : ''}
+								{relativeTimeLong(cp.at, nowMs())} · {cp.cellCount} cell{cp.cellCount === 1 ? '' : 's'}{cp.outputsTruncated ? ' · outputs trimmed' : ''}
 							</span>
 							{#if confirmId === cp.id}
 								<span class="flex shrink-0 items-center gap-1">

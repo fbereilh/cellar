@@ -1,9 +1,9 @@
 import { test, expect } from '@playwright/test';
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync } from 'node:fs';
+import { type ChildProcess } from 'node:child_process';
+import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { runtimeAvailable, bootCellar, killCellar } from './harness';
 
 /**
  * ONE end-to-end smoke test guarding cellar's core promise: create a notebook,
@@ -16,80 +16,12 @@ import { fileURLToPath } from 'node:url';
  * so this spec is a LOCAL, best-effort check and SKIPS itself when the runtime
  * is missing — the vitest unit suite is the must-pass gate. There are no
  * arbitrary sleeps: the launcher's stdout announces readiness and every wait is
- * on an observable condition.
+ * on an observable condition. The launcher lifecycle lives in ./harness.
  */
-
-const REPO = resolve(fileURLToPath(import.meta.url), '../../..');
-
-/** True only when the kernel runtime this E2E needs is actually present. */
-function runtimeAvailable(): boolean {
-	const has = (cmd: string) => spawnSync(cmd, ['--version'], { stdio: 'ignore' }).status === 0;
-	const hostVenv = join(process.env.HOME || '', '.cellar', 'host-venv', 'bin', 'python');
-	return has('uv') && has('python3') && existsSync(hostVenv);
-}
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
 let baseURL = '';
-
-/** Spawn the launcher and resolve the app URL it prints once fully up. */
-function bootCellar(ws: string): Promise<{ proc: ChildProcess; url: string }> {
-	// A no-op `open`/`xdg-open` on PATH so the launcher's "open the browser" step
-	// is suppressed — Playwright drives its own browser against the URL.
-	const shim = join(ws, '.shim');
-	mkdirSync(shim, { recursive: true });
-	for (const name of ['open', 'xdg-open']) {
-		const p = join(shim, name);
-		writeFileSync(p, '#!/bin/sh\nexit 0\n');
-		chmodSync(p, 0o755);
-	}
-
-	const proc = spawn(
-		'node',
-		[join(REPO, 'bin', 'cellar.js'), '-w', ws, '--new', '--no-mcp-config', '-y'],
-		{
-			cwd: REPO,
-			env: { ...process.env, PATH: `${shim}:${process.env.PATH}`, CI: '1' },
-			stdio: ['ignore', 'pipe', 'pipe'],
-			detached: true
-		}
-	);
-
-	return new Promise((resolvePromise, reject) => {
-		const timer = setTimeout(() => reject(new Error('launcher did not become ready in time')), 90_000);
-		let buf = '';
-		const scan = (chunk: Buffer) => {
-			const s = chunk.toString();
-			buf += s;
-			process.stdout.write(`[cellar-e2e] ${s}`);
-			const m = buf.match(/app → (http:\/\/localhost:\d+)/);
-			if (m) {
-				clearTimeout(timer);
-				resolvePromise({ proc, url: m[1] });
-			}
-		};
-		proc.stdout?.on('data', scan);
-		proc.stderr?.on('data', scan);
-		proc.on('exit', (code) => {
-			clearTimeout(timer);
-			reject(new Error(`launcher exited early (${code})`));
-		});
-	});
-}
-
-/** Kill the launcher and its whole process group (app + jupyter sidecar). */
-function killCellar(proc: ChildProcess): void {
-	if (proc.pid == null) return;
-	try {
-		process.kill(-proc.pid, 'SIGTERM');
-	} catch {
-		try {
-			proc.kill('SIGTERM');
-		} catch {
-			/* already gone */
-		}
-	}
-}
 
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available — E2E is local-only');
