@@ -26,7 +26,7 @@ import {
 } from '../notebook';
 import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel';
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
-import { agentStatus as databricksStatus, forAgent as databricksCatalog, previewTable } from '../databricks';
+import { agentStatus as databricksStatus, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable } from '../databricks';
 import { publish } from '../events';
 import { enqueueRun, queuesByNotebook, queuePosition } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
@@ -354,6 +354,34 @@ function outputText(o: CellOutput): string {
 	}
 }
 
+/**
+ * Upper bound on how much of ONE cell's concatenated output text `searchCells`
+ * scans. It used to stringify EVERY output of every cell in full, so a single
+ * query over an output-heavy notebook could serialize megabytes; this bounds the
+ * scanned text per cell. A match sitting past the cap inside one giant output is
+ * missed — the accepted trade for not serializing the whole document — but WHICH
+ * cells are searched is unchanged, and the cap is generous enough that ordinary
+ * outputs are scanned whole.
+ */
+export const SEARCH_SCAN_CAP = 100_000;
+
+/**
+ * A cell's output text for the search scan, concatenated but stopped once
+ * `SEARCH_SCAN_CAP` characters have accumulated (the last output is sliced to fit
+ * exactly). Bounds the work per cell without changing which cells are scanned.
+ */
+export function scanOutputText(outputs: CellOutput[] | undefined): string {
+	let acc = '';
+	for (const o of outputs || []) {
+		if (acc.length >= SEARCH_SCAN_CAP) break;
+		const t = outputText(o);
+		const sep = acc ? '\n' : '';
+		const room = SEARCH_SCAN_CAP - acc.length - sep.length;
+		acc += sep + (t.length > room ? t.slice(0, room) : t);
+	}
+	return acc;
+}
+
 /** Cap text, with a dataframe-aware shape+head summary for pandas reprs. */
 function capText(text: string, cap: number): { text: string; truncated: boolean } {
 	const df = text.match(/\[(\d+) rows x (\d+) columns\]/);
@@ -571,8 +599,13 @@ export async function getNotebookMap(nb?: string | null) {
 	// per-notebook epoch), never against whichever notebook the user last focused.
 	// The map ships only whether a Databricks session is bound - the actionable
 	// "ask the user to connect" note lives on `databricks_status`/`get_kernel_state`,
-	// so we don't repeat ~150 chars of boilerplate on every map call.
-	const dbx = await databricksStatus(nb);
+	// so we don't repeat ~150 chars of boilerplate on every map call. Read the
+	// CACHED, epoch-reconciled connection (`connectionStatus`), NOT `agentStatus`:
+	// this is a plain structural read that can fire on every edit, and `agentStatus`
+	// would run a live `SELECT 1` liveness probe through the kernel each time. The
+	// live probe still backs `databricks_status`/`get_kernel_state`, where verifying
+	// the session is the point.
+	const dbx = databricksConnection(nb);
 	return { notebook: view.path, kernel: kernelSession(nb), databricks: { connected: dbx.connected === true }, cell_count: cells.length, sections: root };
 }
 
@@ -740,7 +773,7 @@ export function searchCells(query: string, where: 'input' | 'output' | 'both' = 
 			if (s) results.push({ id: toHandle(c.id), where: 'input', ran_this_session: live, snippet: s });
 		}
 		if (where === 'output' || where === 'both') {
-			const otext = (c.outputs || []).map(outputText).join('\n');
+			const otext = scanOutputText(c.outputs); // bounded scan (see SEARCH_SCAN_CAP)
 			const s = snippet(otext);
 			if (s) results.push({ id: toHandle(c.id), where: 'output', ran_this_session: live, snippet: s });
 		}
