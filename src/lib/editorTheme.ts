@@ -107,7 +107,12 @@ const cellarEditorTheme = EditorView.theme({
 // does not) the tag gets its own token var rather than being forced into a
 // shared group. Where one palette leaves a tag unstyled, its var resolves to
 // `--cellar-cm-fg`, i.e. exactly the color that tag inherits today.
-const cellarHighlightStyle = HighlightStyle.define([
+//
+// Exported so the lazy static-render path (`staticHighlight.ts`) can reuse the
+// EXACT same tag→class mapping: an unfocused cell that shows its source without a
+// live CodeMirror editor still highlights identically, and its generated classes
+// resolve against the same `--cellar-cm-tok-*` custom properties in `app.css`.
+export const cellarHighlightStyle = HighlightStyle.define([
 	{ tag: [t.comment, t.lineComment, t.blockComment], color: c('tok-comment'), fontStyle: c('tok-comment-style') },
 	{ tag: [t.meta], color: c('tok-meta') },
 	{ tag: [t.annotation], color: c('tok-annotation') },

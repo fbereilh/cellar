@@ -54,8 +54,9 @@ test('create a notebook, run 6*7, see 42, and save a valid .ipynb', async ({ pag
 	const firstCell = page.getByTestId('cell').first();
 	await expect(firstCell).toBeVisible();
 
-	// Replace whatever the cell was seeded with, then run. Select-all first so the
-	// typed expression is the cell's entire source (the starter cell is non-empty).
+	// Cells render their source read-only until first focus (lazy editors), so
+	// click the editor area to build the real CodeMirror editor, then interact.
+	await firstCell.getByTestId('editor-scroll').click();
 	const editor = firstCell.locator('.cm-content');
 	await editor.click();
 	await page.keyboard.press('ControlOrMeta+a');
