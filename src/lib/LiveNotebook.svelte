@@ -68,7 +68,7 @@
 	type RunEvent =
 		| { type: 'run:cleared'; cellId?: string }
 		| { type: 'run:start'; cellId?: string; actor?: Actor }
-		| { type: 'run:output'; cellId?: string; output: CellOutput }
+		| { type: 'run:output'; cellId?: string; output: CellOutput; index?: number }
 		| { type: 'run:end'; cellId?: string; at?: number; durationMs?: number; actor?: Actor };
 
 	/**
@@ -788,6 +788,18 @@
 		}
 	}
 
+	// Apply a streamed output to a cell's output array. The server assigns each
+	// output a STABLE index: a coalesced stream re-emits at the same index as its
+	// text grows (overwrite one element) and a fresh output takes the next index
+	// (append). Overwriting one element in place instead of rebuilding the whole
+	// array per chunk is what keeps a runaway cell's render append-only — Svelte's
+	// deep `$state` proxy makes the indexed write reactive. Events without an index
+	// (defensive / older shapes) simply append.
+	function applyOutput(cell: UICell, output: CellOutput, index?: number) {
+		if (!cell.outputs) cell.outputs = [];
+		cell.outputs[index ?? cell.outputs.length] = output;
+	}
+
 	function applyRunEvent(ev: RunEvent) {
 		const cell = ev.cellId ? findCell(ev.cellId) : undefined;
 		if (ev.type === 'run:cleared') {
@@ -808,7 +820,7 @@
 				cell.outputs = [];
 			}
 		} else if (ev.type === 'run:output') {
-			if (cell) cell.outputs = [...(cell.outputs ?? []), ev.output];
+			if (cell) applyOutput(cell, ev.output, ev.index);
 		} else if (ev.type === 'run:end') {
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;
@@ -971,7 +983,7 @@
 						runningId = id;
 						cell.outputs = [];
 					} else if (ev.type === 'output') {
-						cell.outputs = [...(cell.outputs ?? []), ev.output];
+						applyOutput(cell, ev.output, ev.index);
 					} else if (ev.type === 'run:end') {
 						stampLastRun(cell, ev); // this tab's own user run → its badge
 					}

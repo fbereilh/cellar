@@ -236,7 +236,7 @@ export type KernelStatus =
 export type RunStreamEvent =
 	| { type: 'kernel'; id: string; session: SessionId }
 	| { type: 'status'; execution_state: string }
-	| { type: 'output'; output: CellOutput }
+	| { type: 'output'; output: CellOutput; index?: number }
 	| { type: 'done'; status: string; execution_count: number | null; session: SessionId };
 
 /** Options for a single `execute()` call. */

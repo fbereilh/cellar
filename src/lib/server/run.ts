@@ -22,6 +22,7 @@ import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook';
 import { publish } from './events';
 import { isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
+import { OutputAccumulator, OUTPUT_FLUSH_MS } from './output-accumulator';
 import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types';
 
 /** Arguments to `executeCellRun`. */
@@ -72,37 +73,54 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	const cell = getCell(cellId, nb);
 	const execSource = isSqlCell(cell) ? sqlToPython(source) : source;
 
-	const outputs: CellOutput[] = [];
+	// Bound + coalesce the run's output across all three consumers (persist, SSE
+	// broadcast, this caller's stream). The accumulator merges consecutive
+	// same-stream chunks and caps runaway output; `emit` fans each committed/updated
+	// element out with its STABLE index so the broadcast re-emits a growing stream at
+	// one index (the client overwrites that element) instead of appending per chunk.
+	const emit = (output: CellOutput, index: number) => {
+		publish({ type: 'run:output', nb, cellId, output, index, originId });
+		onEvent?.({ type: 'output', output, index });
+	};
+	const acc = new OutputAccumulator(emit);
+	// Flush buffered stream text on a ~40ms tick so a long run shows live progress;
+	// ordering with rich outputs is preserved by flushing immediately before each
+	// (in `acc.push`) and at run end (`acc.finish`), not by this timer.
+	const flushTimer = setInterval(() => acc.flush(), OUTPUT_FLUSH_MS);
+	if (typeof flushTimer.unref === 'function') flushTimer.unref();
+
 	let status = 'ok';
 	let session: SessionId | null = null;
 	let kernelDown = false;
 	try {
 		const reply = await execute(nb, execSource, (ev) => {
 			if (ev.type === 'output') {
-				outputs.push(ev.output);
-				publish({ type: 'run:output', nb, cellId, output: ev.output, originId });
+				acc.push(ev.output);
 			} else if (ev.type === 'kernel') {
 				session = ev.session;
+				onEvent?.(ev);
+			} else {
+				onEvent?.(ev);
 			}
-			onEvent?.(ev);
 		});
 		status = reply?.status ?? 'ok';
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		const output: CellOutput = {
+		acc.push({
 			output_type: 'error',
 			ename: 'CellarError',
 			evalue: message,
 			traceback: [message]
-		};
-		outputs.push(output);
-		publish({ type: 'run:output', nb, cellId, output, originId });
-		onEvent?.({ type: 'output', output });
+		});
 		status = 'error';
 		// execute() threw before it ever had a kernel in hand, so there is no session
 		// to stamp: this failure is the run the caller just asked for, not a leftover.
 		if (session === null) kernelDown = true;
+	} finally {
+		clearInterval(flushTimer);
 	}
+	// Flush the tail + finalize the truncation marker; this is the array we persist.
+	const outputs = acc.finish();
 
 	// A notebook is "loaded in the kernel" iff it has a live kernel entry, which the
 	// manager tracks directly — no separate marking step. A kernel-down run (session
