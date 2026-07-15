@@ -16,6 +16,17 @@
  *  - scrub memory-address reprs (`<foo at 0x…>` → `<foo>`) in text/stream output
  *
  * MUST be idempotent: cleaning an already-clean notebook yields zero change.
+ *
+ * Performance (a save runs on every keystroke-triggered autosave): clean does
+ * NOT deep-clone the notebook. It builds a shallow copy of the notebook and of
+ * each cell wrapper, and reuses every output object BY REFERENCE unless clean
+ * actually rewrites that output (copy-on-write in `cleanOutput`). So a save
+ * never duplicates the (potentially multi-MB) output blobs it does not touch,
+ * and it never mutates the live document the UI is bound to. On top of that, a
+ * cell's cleaned outputs are memoized by the identity of its raw outputs array:
+ * a source-only edit leaves that array reference untouched (a run replaces it),
+ * so a source-only autosave reuses the previously-cleaned outputs verbatim
+ * without re-scanning them, while a run-end / clear save (new array) recomputes.
  */
 
 import type { CellMetadata } from './types';
@@ -52,6 +63,30 @@ export function scrubAddresses<T>(text: T): T {
 	return text.replace(ADDRESS_RE, '$1') as T;
 }
 
+/**
+ * Scrub addresses but report whether anything changed, reusing the input by
+ * reference when it did not — the copy-on-write signal callers use to avoid
+ * copying an output that clean leaves byte-identical. For a string, `!==` is a
+ * value comparison, so an unchanged string is reported unchanged; for a list we
+ * scrub each element and keep the original array whenever no element changed.
+ */
+function scrubChanged(value: unknown): { value: unknown; changed: boolean } {
+	if (Array.isArray(value)) {
+		let changed = false;
+		const mapped = value.map((v) => {
+			const r = scrubAddresses(v);
+			if (r !== v) changed = true;
+			return r;
+		});
+		return changed ? { value: mapped, changed: true } : { value, changed: false };
+	}
+	if (typeof value === 'string') {
+		const r = scrubAddresses(value);
+		return { value: r, changed: r !== value };
+	}
+	return { value, changed: false };
+}
+
 function pick(obj: Record<string, unknown> | null | undefined, allowed: readonly string[]): Record<string, unknown> {
 	const out: Record<string, unknown> = {};
 	if (!obj) return out;
@@ -59,31 +94,137 @@ function pick(obj: Record<string, unknown> | null | undefined, allowed: readonly
 	return out;
 }
 
-// nbformat output objects arrive from JSON and are mutated in place; model them
-// as an open record so the field probes below type-check without over-narrowing.
+// nbformat output objects arrive from JSON; clean treats them as READ-ONLY (they
+// alias the live document) and copies on write. Model them as an open record so
+// the field probes below type-check without over-narrowing.
 type RawOutput = Record<string, unknown> & { data?: Record<string, unknown> };
 
+/**
+ * Observability counters for the save/clean hot path (per-save work). Purely
+ * diagnostic — reading or resetting them never changes clean's output. Used by
+ * the unit tests to prove a source-only save reuses cleaned outputs (a cache
+ * hit, zero object copies) and by the E2E smoke test to show the dropped work.
+ */
+export const cleanMetrics = {
+	/** Outputs arrays freshly cleaned (a run-end / clear / first save — cache miss). */
+	outputArraysCleaned: 0,
+	/** Outputs arrays served from the memo (a source-only save — cache hit). */
+	outputArrayCacheHits: 0,
+	/** Individual output objects shallow-copied by copy-on-write (never the live one). */
+	outputsCopied: 0
+};
+
+/** Reset the clean metrics (test/diagnostic helper). */
+export function resetCleanMetrics(): void {
+	cleanMetrics.outputArraysCleaned = 0;
+	cleanMetrics.outputArrayCacheHits = 0;
+	cleanMetrics.outputsCopied = 0;
+}
+
+/**
+ * Copy-on-write clean of a single output. Returns the input BY REFERENCE when
+ * clean rewrites nothing (the common case — an image, an error, an already-clean
+ * repr), so the output blob is never duplicated and the live object is never
+ * touched. Only when a field must change do we shallow-copy the output wrapper
+ * (and, if needed, its `data` bundle), leaving the large mime payloads shared.
+ */
 function cleanOutput(output: RawOutput): RawOutput {
-	if ('execution_count' in output) output.execution_count = null;
+	let result = output;
+	const srcData = output.data;
+	let data = srcData;
+
+	const ensureOutputCopy = () => {
+		if (result === output) {
+			result = { ...output };
+			cleanMetrics.outputsCopied += 1;
+		}
+	};
+	const ensureDataCopy = () => {
+		if (data === srcData && srcData) {
+			ensureOutputCopy();
+			data = { ...srcData };
+			result.data = data;
+		}
+	};
+
+	// null execution_count (only when it is present and not already null — an
+	// already-null count needs no copy and stays byte-identical).
+	if ('execution_count' in output && output.execution_count !== null) {
+		ensureOutputCopy();
+		result.execution_count = null;
+	}
 
 	// stream text
 	if (output.output_type === 'stream' && 'text' in output) {
-		output.text = scrubAddresses(output.text);
+		const s = scrubChanged(output.text);
+		if (s.changed) {
+			ensureOutputCopy();
+			result.text = s.value;
+		}
 	}
-	// text/plain reprs inside execute_result / display_data
-	if (output.data && 'text/plain' in output.data) {
-		output.data['text/plain'] = scrubAddresses(output.data['text/plain']);
+
+	if (srcData) {
+		// text/plain reprs inside execute_result / display_data
+		if ('text/plain' in srcData) {
+			const s = scrubChanged(srcData['text/plain']);
+			if (s.changed) {
+				ensureDataCopy();
+				data!['text/plain'] = s.value;
+			}
+		}
+		// Drop the live-only DataFrame grid payload — a render of the output, never
+		// persisted (keeps the .ipynb git-clean; pandas' own reprs stay as fallback).
+		if (DATAFRAME_MIME in srcData) {
+			ensureDataCopy();
+			delete data![DATAFRAME_MIME];
+		}
+		// Drop the volatile ipywidgets view mime (tqdm bars); a fallback repr is kept.
+		if (WIDGET_VIEW_MIME in srcData) {
+			ensureDataCopy();
+			delete data![WIDGET_VIEW_MIME];
+		}
 	}
-	// Drop the live-only DataFrame grid payload — a render of the output, never
-	// persisted (keeps the .ipynb git-clean; pandas' own reprs stay as fallback).
-	if (output.data && DATAFRAME_MIME in output.data) {
-		delete output.data[DATAFRAME_MIME];
+
+	return result;
+}
+
+/**
+ * Cleaned-outputs memo, keyed by the identity of a cell's RAW outputs array.
+ * Cellar only ever REPLACES a cell's outputs wholesale (a run installs a fresh
+ * array via `setOutputs`); a source edit leaves the array reference untouched.
+ * So the array identity is an exact "did the outputs change since last save"
+ * key: a source-only autosave hits and reuses the prior cleaned array verbatim,
+ * a run-end / clear save misses and recomputes. A WeakMap keeps this leak-free —
+ * an entry is collected when its raw array is dropped. Referentially transparent:
+ * same array ⇒ same cleaned result a fresh clean would produce (byte-identical),
+ * so idempotency/zero-diff is preserved.
+ */
+const cleanedOutputsCache = new WeakMap<object, RawOutput[]>();
+
+/**
+ * Clean a cell's outputs, reusing a memoized result on a source-only save. On a
+ * miss we map each output through the copy-on-write `cleanOutput` and drop any
+ * now-empty display output; when nothing changed we return the input array
+ * itself (maximal reference reuse). The result is cached against the raw array.
+ */
+function cleanOutputs(outputs: RawOutput[]): RawOutput[] {
+	const cached = cleanedOutputsCache.get(outputs);
+	if (cached) {
+		cleanMetrics.outputArrayCacheHits += 1;
+		return cached;
 	}
-	// Drop the volatile ipywidgets view mime (tqdm bars); a fallback repr is kept.
-	if (output.data && WIDGET_VIEW_MIME in output.data) {
-		delete output.data[WIDGET_VIEW_MIME];
-	}
-	return output;
+	cleanMetrics.outputArraysCleaned += 1;
+	let changed = false;
+	const mapped = outputs.map((o) => {
+		const c = cleanOutput(o);
+		if (c !== o) changed = true;
+		return c;
+	});
+	const needFilter = mapped.some(isEmptyDisplayOutput);
+	const result =
+		!changed && !needFilter ? outputs : needFilter ? mapped.filter((o) => !isEmptyDisplayOutput(o)) : mapped;
+	cleanedOutputsCache.set(outputs, result);
+	return result;
 }
 
 /**
@@ -140,15 +281,19 @@ type RawCell = Record<string, unknown> & {
 };
 
 function cleanCell(cell: RawCell): RawCell {
-	if (cell.cell_type === 'code') {
-		cell.execution_count = null;
-		if (Array.isArray(cell.outputs)) {
-			cell.outputs = cell.outputs.map(cleanOutput).filter((o) => !isEmptyDisplayOutput(o));
+	// Shallow-copy the cell wrapper so clean never mutates its input (the wrapper
+	// aliases the live document via `outputs`/`metadata`). This copies only the
+	// small wrapper — the outputs array and its blobs stay shared by reference.
+	const out: RawCell = { ...cell };
+	if (out.cell_type === 'code') {
+		out.execution_count = null;
+		if (Array.isArray(out.outputs)) {
+			out.outputs = cleanOutputs(out.outputs as RawOutput[]);
 		}
 	}
 	// deny-by-default metadata allowlist (keeps the `cellar` namespace intact)
-	cell.metadata = stripRuntimeMeta(pick(cell.metadata, ALLOWED_CELL_METADATA) as CellMetadata);
-	return cell;
+	out.metadata = stripRuntimeMeta(pick(cell.metadata, ALLOWED_CELL_METADATA) as CellMetadata);
+	return out;
 }
 
 // nbformat notebook object as it arrives (from JSON or the serialize builder).
@@ -158,19 +303,21 @@ type RawNotebook = Record<string, unknown> & {
 };
 
 /**
- * Return a cleaned deep copy of an nbformat notebook object. Pure + idempotent.
+ * Return a cleaned copy of an nbformat notebook object. Pure + idempotent, and
+ * SURGICAL: it shallow-copies the notebook, its metadata, its kernelspec, and
+ * each cell wrapper, but reuses the (potentially large) output blobs by
+ * reference wherever clean does not rewrite them — so a save never duplicates
+ * every output in memory, and the live document is never mutated.
  */
 export function cleanNotebook<T extends RawNotebook>(nb: T): T {
-	const out = structuredClone(nb);
-
-	const metadata = pick(out.metadata, ALLOWED_NB_METADATA);
-	out.metadata = metadata;
+	const metadata = pick(nb.metadata, ALLOWED_NB_METADATA);
 	const kernelspec = metadata.kernelspec as { name?: string; display_name?: string } | undefined;
 	if (kernelspec) {
-		// display_name varies per machine; normalize it to the stable name.
-		kernelspec.display_name = kernelspec.name;
+		// display_name varies per machine; normalize it to the stable name. Copy the
+		// kernelspec first so the live document's kernelspec object is left untouched.
+		metadata.kernelspec = { ...kernelspec, display_name: kernelspec.name };
 	}
 
-	out.cells = (out.cells || []).map(cleanCell);
-	return out;
+	const cells = (nb.cells || []).map(cleanCell);
+	return { ...nb, metadata, cells } as T;
 }
