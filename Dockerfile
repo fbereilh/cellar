@@ -23,6 +23,11 @@
 ARG NODE_IMAGE=node:22.13.1-bookworm-slim
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.5.14
 
+# uv binary as a named stage. buildx (multi-arch) does not support variable
+# expansion in `COPY --from=`, so we resolve ${UV_IMAGE} here (a `FROM ${ARG}`
+# with a global-scope ARG is allowed) and copy from this stage by name below.
+FROM ${UV_IMAGE} AS uvbin
+
 # =============================================================================
 # Stage 1 — build the SvelteKit app (needs dev deps + the full source tree).
 # =============================================================================
@@ -47,10 +52,9 @@ RUN npm run build
 # Stage 2 — the runtime image: Node + uv + a baked, pinned kernel + host venv.
 # =============================================================================
 FROM ${NODE_IMAGE} AS runtime
-ARG UV_IMAGE
 
 # uv — the single toolchain Cellar uses for all Python venv/package work.
-COPY --from=${UV_IMAGE} /uv /usr/local/bin/uv
+COPY --from=uvbin /uv /usr/local/bin/uv
 
 # System Python (stable, world-readable — the interpreter the baked venvs link
 # to), tini (PID 1: forwards signals + reaps the kernel/sidecar children Cellar
