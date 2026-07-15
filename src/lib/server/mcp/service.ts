@@ -37,6 +37,7 @@ import { getNotebookStaleness } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { isSqlCell } from '../../cellLanguage';
+import { IMG_MAX_EDGE, downscaleImageForBlock, imagePlaceholder } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
 import type { CellView, CellOutput, SessionId, LogicalCellType, QueueState } from '../types';
 
@@ -260,9 +261,14 @@ function outputText(o: CellOutput): string {
 		case 'execute_result':
 		case 'display_data': {
 			const d = o.data || {};
-			if (d['text/plain']) return asText(d['text/plain']);
 			const img = imageKey(o);
-			return img ? `[${img} output]` : '[rich output]';
+			// An image cell shows an enriched, image-token-free placeholder (mime +
+			// dimensions + bytes) even when a text/plain repr exists, so the agent
+			// knows an image is there and how big before fetching it with
+			// get_full_output. The text/plain repr of a figure is just `<Figure …>`.
+			if (img) return imagePlaceholder(img, String(d[img]));
+			if (d['text/plain']) return asText(d['text/plain']);
+			return '[rich output]';
 		}
 		case 'error':
 			return stripAnsi((o.traceback || [o.ename + ': ' + o.evalue]).join('\n'));
@@ -725,7 +731,16 @@ export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium', nb
 	const cap = size === 'full' ? Infinity : MEDIUM_CAP;
 	const outputs: Array<Record<string, unknown>> = (c.outputs || []).map((o) => {
 		const img = imageKey(o);
-		if (img && 'data' in o) return { type: o.output_type, image: img, data: o.data[img] };
+		if (img && 'data' in o) {
+			const raw = String(o.data[img]);
+			// Default path downscales an oversized raster (a retina/high-DPI figure)
+			// to IMG_MAX_EDGE before it becomes an MCP image block, cutting image
+			// tokens ~3x. size:'full' passes the ORIGINAL bytes through untouched, so
+			// an agent that needs pixel detail still opts in and gets it.
+			const scaled = size === 'full' ? { data: raw, resized: false as const } : downscaleImageForBlock(img, raw, IMG_MAX_EDGE);
+			const note = scaled.resized ? { downscaled: { from: `${scaled.width}×${scaled.height}`, to: `${scaled.scaledWidth}×${scaled.scaledHeight}`, full: "get_full_output size:'full' for the original" } } : {};
+			return { type: o.output_type, image: img, data: scaled.data, ...note };
+		}
 		return summarizeOutput(o, cap);
 	});
 	return { id: c.id, size, ran_this_session: ranThisSession(c, currentSessionId(nb)), outputs };

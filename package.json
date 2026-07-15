@@ -46,6 +46,7 @@
     "@tailwindcss/vite": "^4.3.2",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.20.1",
+    "@types/pngjs": "^6.0.5",
     "daisyui": "^5.6.14",
     "svelte": "^5.1.0",
     "svelte-check": "^4.7.2",
@@ -73,6 +74,7 @@
     "dompurify": "^3.4.11",
     "markdown-it": "^14.3.0",
     "plotly.js-dist-min": "^3.7.0",
+    "pngjs": "^7.0.0",
     "zod": "^4.4.3"
   }
 }
