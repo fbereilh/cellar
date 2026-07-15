@@ -99,13 +99,25 @@ export function updateWidget(commId: string, state: Record<string, unknown>): vo
 }
 
 /**
- * A `comm_close`. We KEEP the last state (a finished `leave=True` tqdm bar must
- * still render its final 100%); closing only ends live updates. The event lets
- * the client stop expecting more.
+ * A `comm_close`: the kernel destroyed this widget's model, so we EVICT it (and
+ * every per-widget bookkeeping entry) rather than let it live for the kernel's
+ * whole session — that unbounded retention (one model per `tqdm` bar, forever) is
+ * the leak this frees. Eviction is only ever reached from the comm's genuine
+ * `onClose`; a live, still-updating widget flows through `updateWidget` and keeps
+ * its model. The `widget:close` event still fires so a browser stops expecting
+ * updates; a tab already showing the widget keeps its own rendered copy (client
+ * state), and a `leave=True` tqdm bar never sends `comm_close` (only `leave=False`
+ * closes its container), so a finished bar meant to stay visible is unaffected.
  */
 export function closeWidget(commId: string): void {
 	const model = models.get(commId);
 	if (!model) return;
+	models.delete(commId);
+	commToNb.delete(commId);
+	const msg = commToMsgId.get(commId);
+	if (msg !== undefined) msgIdToComm.delete(msg);
+	commToMsgId.delete(commId);
+	pendingClear.delete(commId);
 	publishGlobal({ type: 'widget:close', nb: model.nb, comm_id: commId });
 }
 
