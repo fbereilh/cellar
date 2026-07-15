@@ -61,7 +61,7 @@ jobs:
           echo "Releasing $TAG (prerelease=$PRE)"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.meta.outputs.tag }}
           fetch-depth: 0
@@ -95,20 +95,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify TAP_TOKEN is configured
+        id: verify
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${TAP_TOKEN:-}" ]; then
-            echo "::error::secrets.TAP_TOKEN is not set. The GitHub Release was created, but the Homebrew tap formula was NOT updated."
-            echo "::error::Create a fine-grained PAT with Contents: read/write on fbereilh/homebrew-cellar and add it: gh secret set TAP_TOKEN -R fbereilh/cellar"
-            echo "::error::See RELEASING.md for the exact steps, then re-run this workflow (Actions -> release -> Run workflow) against tag ${{ needs.release.outputs.tag }}."
-            exit 1
+            # No token => skip the brew bump gracefully. The GitHub Release
+            # (and Docker image) already succeeded, so the run stays GREEN.
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::secrets.TAP_TOKEN is not set - skipping the Homebrew tap bump. The GitHub Release was created; only the brew formula was not updated."
+            echo "::notice::To enable the Homebrew bump, create a fine-grained PAT with Contents: read/write on fbereilh/homebrew-cellar and add it: gh secret set TAP_TOKEN -R fbereilh/cellar"
+            echo "::notice::See RELEASING.md for the exact steps, then re-run this workflow (Actions -> release -> Run workflow) against tag ${{ needs.release.outputs.tag }}."
+            exit 0
           fi
+          echo "has_token=true" >> "$GITHUB_OUTPUT"
           echo "TAP_TOKEN present."
 
       - name: Compute tarball sha256
         id: hash
+        if: steps.verify.outputs.has_token == 'true'
         env:
           TAG: ${{ needs.release.outputs.tag }}
         run: |
@@ -126,13 +132,15 @@ jobs:
           echo "sha256=$SHA"
 
       - name: Checkout tap
-        uses: actions/checkout@v4
+        if: steps.verify.outputs.has_token == 'true'
+        uses: actions/checkout@v5
         with:
           repository: fbereilh/homebrew-cellar
           token: ${{ secrets.TAP_TOKEN }}
           path: tap
 
       - name: Update formula url + sha256
+        if: steps.verify.outputs.has_token == 'true'
         env:
           TAG: ${{ needs.release.outputs.tag }}
           URL: ${{ steps.hash.outputs.url }}
@@ -165,6 +173,7 @@ jobs:
           grep -E 'url |sha256 ' "$FORMULA"
 
       - name: Commit + push to tap
+        if: steps.verify.outputs.has_token == 'true'
         working-directory: tap
         env:
           TAG: ${{ needs.release.outputs.tag }}
