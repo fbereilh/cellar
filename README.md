@@ -60,6 +60,8 @@ make setup
 ```
 
 `make setup` installs deps, builds, and links `cellar` onto your PATH. `make update` (or `cellar --update`) pulls and rebuilds; run `make` with no target to list all commands.
+
+For the full clone-to-run walkthrough, the kernel/venv resolution order, and every configuration knob, see **[docs/SETUP.md](docs/SETUP.md)**.
 </details>
 
 ## Run with Docker
@@ -164,6 +166,8 @@ Open the sidebar's **Databricks** section, pick a profile and cluster, and click
 - **[`uv`](https://docs.astral.sh/uv/)** on your `PATH` (Cellar uses it for all venv and package management)
 
 Or **just Docker** - see [Run with Docker](#run-with-docker) for a zero-prerequisite, reproducible-env alternative.
+
+Cellar runs with **zero configuration** - it discovers your home directory, its own install location, and free ports at runtime. For the clone-to-run steps, kernel/venv resolution, and the full environment-variable reference (all optional, with defaults), see **[docs/SETUP.md](docs/SETUP.md)**.
 
 ## Testing
 
