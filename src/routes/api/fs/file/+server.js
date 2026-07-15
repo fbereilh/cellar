@@ -1,5 +1,6 @@
 import { json, error } from '@sveltejs/kit';
 import { readWorkspaceFile, writeWorkspaceFile } from '$lib/server/fstree';
+import { invalidateGitStatusCache } from '$lib/server/git';
 
 /** Read a workspace file's text content (for opening it into an editor tab). */
 export function GET({ url }) {
@@ -18,6 +19,7 @@ export async function PUT({ request }) {
 	if (!path) throw error(400, 'path required');
 	try {
 		writeWorkspaceFile(path, content ?? '');
+		invalidateGitStatusCache(); // a save changes `git status`; refresh the tree decorations now
 		return json({ ok: true });
 	} catch (err) {
 		throw error(400, String(err?.message ?? err));

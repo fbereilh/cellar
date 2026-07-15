@@ -8,6 +8,7 @@ import {
 } from '$lib/server/fstree';
 import { dropDocs, rekeyDocs } from '$lib/server/notebook';
 import { shutdownKernelsUnder } from '$lib/server/kernel';
+import { invalidateGitStatusCache } from '$lib/server/git';
 
 /**
  * File-management operations for the sidebar file explorer. A single POST
@@ -24,6 +25,10 @@ export async function POST({ request }) {
 		throw error(400, 'invalid JSON body');
 	}
 	const { op } = body ?? {};
+	// Every op here mutates the working tree (create/delete/rename/move/copy), so
+	// `git status` will differ; drop the cached status so the file-tree decorations
+	// reflect the change on the client's next refresh instead of lagging by the TTL.
+	invalidateGitStatusCache();
 	try {
 		switch (op) {
 			case 'create':
