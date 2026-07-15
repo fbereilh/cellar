@@ -41,6 +41,7 @@ import { projectPython } from './databricks';
 import { computeStaleness } from '../staleness';
 import { isSqlCell } from '../cellLanguage';
 import { normalizeForAnalysis } from './magics';
+import { LruCache } from './lru';
 import type { CellView, SessionId } from './types';
 
 /** The names a cell binds at module scope, and the module globals it reads. */
@@ -126,9 +127,13 @@ def main():
 main()
 `;
 
-/** source string → { defines, uses }. Bounded so a long session can't grow it forever. */
-const cache = new Map<string, DataflowEntry>();
-const CACHE_MAX = 1000;
+/**
+ * source string → { defines, uses }. A bounded LRU, not a `Map` we `.clear()` on
+ * overflow: a full flush at the cap re-analyzes every hot cell on the next pass,
+ * whereas the LRU evicts only the coldest source so the notebook's live cells
+ * stay cached across the bound.
+ */
+const cache = new LruCache<string, DataflowEntry>(1000);
 
 /** Run the probe over `items` ([{key, source}]) and merge results into the cache. */
 function runProbe(items: ProbeItem[]): Promise<DataflowMap> {
@@ -212,9 +217,8 @@ export async function analyzeDataflow(cells: CellView[]): Promise<DataflowMap> {
 		const byKey = new Map<string, ProbeItem>(missing.map((m) => [m.key, m]));
 		const results = await runProbe([...byKey.values()]);
 		for (const [src, m] of byKey) {
-			cache.set(src, results[m.key] ?? { defines: [], uses: [] });
+			cache.set(src, results[m.key] ?? { defines: [], uses: [] }); // LRU evicts the coldest source past the cap
 		}
-		if (cache.size > CACHE_MAX) cache.clear(); // simple bound; correctness is unaffected
 	}
 	const out: DataflowMap = {};
 	for (const c of code) out[c.id] = cache.get(c.source ?? '') ?? { defines: [], uses: [] };
