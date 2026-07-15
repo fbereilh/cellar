@@ -12,6 +12,8 @@
 	import DOMPurify from 'dompurify';
 	import { md, renderMarkdown } from '$lib/markdown';
 	import { EDITOR_THEME } from '$lib/editorTheme';
+	import StaticCode from '$lib/StaticCode.svelte';
+	import type { StaticLang } from '$lib/staticHighlight';
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
 	import { parsePandasDataFrameHtml } from '$lib/dataframeHtml';
 	import PlotlyOutput from '$lib/PlotlyOutput.svelte';
@@ -120,8 +122,16 @@
 	}: Props = $props();
 
 	let cardEl: HTMLDivElement | undefined; // the cell's outer card: what holds focus in command mode
-	let editorEl: HTMLDivElement | undefined;
+	let scrollBoxEl: HTMLDivElement | undefined; // the overflow/height-clamp box (measured for auto-collapse)
+	let editorEl: HTMLDivElement | undefined; // the CodeMirror mount point (empty until the editor is built)
 	let view: EditorView | undefined;
+	// The heavy CodeMirror `EditorView` is built lazily, on first edit-intent
+	// (click / keyboard enter-edit / a programmatic focus), NOT on mount — a big
+	// notebook opened N editors + N ResizeObservers up front (tens of MB, seconds
+	// of mount). Until then the cell renders its source read-only via `StaticCode`,
+	// so the notebook looks complete on open. `editorBuilt` flips the template from
+	// the static stand-in to the live editor. See `buildEditor()`.
+	let editorBuilt = $state(false);
 	let editorResizeObserver: ResizeObserver | undefined;
 	let editTimer: ReturnType<typeof setTimeout>;
 	// True while the user has uncommitted local typing (a debounced save pending).
@@ -551,9 +561,11 @@
 	// or an explicit choice already exists — short cells stay uncluttered.
 	const canCollapse = $derived(!isMarkdown && (editorTall || editorCollapsed != null));
 	// scrollHeight is the full content height regardless of the max-height clamp,
-	// so this reads true whether or not the box is currently contracted.
+	// so this reads true whether or not the box is currently contracted. Measured
+	// on the scroll box (not the CM mount) so a tall UNFOCUSED cell — whose source
+	// is shown by the static render, no editor built — also auto-collapses.
 	function measureEditor() {
-		if (editorEl) editorTall = editorEl.scrollHeight > EDITOR_MAX_PX;
+		if (scrollBoxEl) editorTall = scrollBoxEl.scrollHeight > EDITOR_MAX_PX;
 	}
 	function toggleEditorCollapsed() {
 		onSetEditorCollapsed?.(cell.id, !collapsed);
@@ -641,7 +653,10 @@
 	}
 
 	function currentSource() {
-		return view ? view.state.doc.toString() : cell.source;
+		// With no live editor, `liveSource` is the doc-backed source (it tracks the
+		// server via the remote-edit path below), so the static render and every
+		// reader agree with what a lazily-built editor would seed from.
+		return view ? view.state.doc.toString() : liveSource;
 	}
 
 	// Replace the editor's whole document with `src` without echoing it back to
@@ -670,8 +685,19 @@
 		const re = cell.remoteEdit;
 		if (!re || re === appliedRemote) return;
 		appliedRemote = re;
-		const editing = (view && view.hasFocus) || editPending;
-		if (view && !editing) {
+		if (!view) {
+			// No live editor is built yet, so there is nothing to clobber and no
+			// active typing to protect: adopt the remote source directly. This keeps
+			// the static read-only render current (an agent/MCP edit to an unfocused
+			// cell still shows) AND means a later lazy build seeds from the edited
+			// text — no divergence. `liveSource` also refreshes a rendered markdown cell.
+			liveSource = re.source;
+			cell.source = re.source;
+			savedSource = re.source;
+			return;
+		}
+		const editing = view.hasFocus || editPending;
+		if (!editing) {
 			applySourceToEditor(re.source);
 			remoteChanged = false;
 			pendingRemoteSource = null;
@@ -691,7 +717,16 @@
 	function replaceSource(src: string) {
 		clearTimeout(editTimer);
 		editPending = false;
-		applySourceToEditor(src);
+		if (view) {
+			applySourceToEditor(src);
+			return;
+		}
+		// No live editor (a command-mode heading restamp on an unfocused cell): rewrite
+		// the doc-backed source directly rather than building an editor just to mutate
+		// it. The caller persists (`editCell`), and the static render reflects it at once.
+		liveSource = src;
+		cell.source = src;
+		savedSource = src;
 	}
 
 	function loadRemote() {
@@ -717,6 +752,7 @@
 
 	async function enterEdit() {
 		rawEdit = true;
+		buildEditor(); // summon the real editor (no-op if already built)
 		await tick();
 		view?.focus();
 	}
@@ -737,8 +773,14 @@
 	 * so the cell itself does (which is command mode, as Jupyter does it).
 	 */
 	function focusEditorOrCell() {
-		if (isMarkdown && mode === 'rendered') focusCell();
-		else view?.focus();
+		if (isMarkdown && mode === 'rendered') {
+			focusCell();
+			return;
+		}
+		// A programmatic advance targets the editor, so it must exist first — never
+		// target a non-existent editor (build-before-focus, the reveal-and-mount rule).
+		buildEditor();
+		view?.focus();
 	}
 
 	/**
@@ -758,6 +800,9 @@
 		if (cell.cell_type === 'markdown') return markdown();
 		return isSql ? sql() : python();
 	}
+	// The same grammar choice, for the static (no-editor) render. Kept in lockstep
+	// with `langFor` so the read-only view highlights like the editor it precedes.
+	const staticLang = $derived<StaticLang>(isMarkdown ? 'markdown' : isSql ? 'sql' : 'python');
 
 	// Reconfigure the editor language when the cell type OR its SQL/Python language
 	// toggles; after a manual cell_type toggle, drop into edit mode so the user sees
@@ -775,11 +820,23 @@
 		}
 	});
 
-	onMount(() => {
+	/**
+	 * Build the heavy CodeMirror `EditorView` — lazily, on first edit-intent. The
+	 * whole point of the interim virtualization: a freshly opened notebook builds
+	 * ZERO editors (each cell shows its source via `StaticCode`), and an editor is
+	 * created only when the user (or a programmatic focus) needs to interact with a
+	 * given cell. Idempotent — every edit-intent path calls this, and it no-ops once
+	 * the editor exists (this is lazy-*create*, not windowing: the editor is never
+	 * torn down). The new editor seeds from `liveSource`, the doc-backed source that
+	 * has tracked every remote edit while the cell had no editor, so there is no
+	 * divergence between what the static render showed and what the editor now holds.
+	 */
+	function buildEditor(): EditorView {
+		if (view) return view;
 		view = new EditorView({
 			parent: editorEl,
 			state: EditorState.create({
-				doc: cell.source,
+				doc: liveSource,
 				extensions: [
 					basicSetup,
 					language.of(langFor()),
@@ -832,11 +889,42 @@
 				]
 			})
 		});
+		editorBuilt = true; // flips the template from the static stand-in to the editor
 		// Dev-only debug handle; `cellarViews` is not a standard Window property.
 		if (import.meta.env.DEV) ((window as any).cellarViews ??= {})[cell.id] = view;
-		// The imperative surface the notebook's shortcut actions drive. `run` goes
-		// through `doRun` so it always uses the editor's *live* text, even when the
-		// 500ms edit debounce has not fired yet.
+		// The editor's real content height may now differ from the static render's,
+		// so re-measure the auto-collapse cap.
+		measureEditor();
+		return view;
+	}
+
+	/**
+	 * Summon the editor and place the caret where the user clicked in the static
+	 * render, then hand off — the click-to-edit path. The static stand-in and the
+	 * empty CM mount both sit flush to the top of the scroll box (the mount is
+	 * zero-height until built), so the click's viewport coordinates map onto the
+	 * freshly built editor; `posAtCoords` (after a frame, once CM has laid out and
+	 * the static node is gone) lands the caret near the clicked character.
+	 */
+	function summonEditorAt(e: PointerEvent) {
+		if (e.button !== 0) return; // left button only; leave modifier/middle clicks alone
+		e.preventDefault(); // no native text-selection on a node we're about to remove
+		const x = e.clientX;
+		const y = e.clientY;
+		buildEditor();
+		requestAnimationFrame(() => {
+			if (!view) return;
+			const pos = view.posAtCoords({ x, y });
+			if (pos != null) view.dispatch({ selection: { anchor: pos } });
+			view.focus();
+		});
+	}
+
+	onMount(() => {
+		// Register the imperative surface up front (before any editor exists) so the
+		// notebook can focus/run/edit this cell immediately; every method that needs
+		// the editor builds it on demand. `run` goes through `doRun` so it always uses
+		// the editor's *live* text, even when the 500ms edit debounce has not fired.
 		onRegister?.(cell.id, {
 			focus: focusEditorOrCell,
 			focusCell,
@@ -860,24 +948,30 @@
 			},
 			isMarkdown: () => isMarkdown,
 			// Primitives the notebook's cut/copy, heading and split actions compose.
-			// `currentSource` is the editor's live text (never the debounced
-			// `cell.source`), and `cursorOffset` is where a split divides it.
+			// `currentSource` is the live editor text (or `liveSource` with no editor),
+			// and `cursorOffset` is where a split divides it — so it must be a REAL
+			// offset, which means building the editor if the split targets a cell that
+			// was never focused.
 			currentSource,
-			cursorOffset: () => (view ? view.state.selection.main.head : 0),
+			cursorOffset: () => {
+				buildEditor();
+				return view ? view.state.selection.main.head : 0;
+			},
 			replaceSource,
 			// Persist a pending edit immediately (Cmd/Ctrl+S). Resolves once the
 			// flushed PATCH settles; a clean cell resolves right away.
 			flush: () => Promise.resolve(flushEdit())
 		});
-		// Measure editor content height so a tall code cell auto-collapses. A
+		// Measure content height so a tall cell auto-collapses — measured on the
+		// scroll box, so it works for the static render too (no editor built). A
 		// ResizeObserver re-measures on content growth AND on the hidden→visible
 		// transition (a background tab measures 0 until shown), so the auto-cap
-		// applies whenever the editor is actually laid out. `measureEditor` reads
+		// applies whenever the box is actually laid out. `measureEditor` reads
 		// scrollHeight (unclamped) and only assigns when the value changes, so the
 		// clamp it may trigger doesn't feed back into a loop.
-		if (typeof ResizeObserver !== 'undefined' && editorEl) {
+		if (typeof ResizeObserver !== 'undefined' && scrollBoxEl) {
 			editorResizeObserver = new ResizeObserver(() => measureEditor());
-			editorResizeObserver.observe(editorEl);
+			editorResizeObserver.observe(scrollBoxEl);
 		}
 		measureEditor();
 		// Closing the tab/window can fire before the 500ms debounce; flush on
@@ -1352,13 +1446,27 @@
 					{/if}
 				</button>
 			{/if}
+			<!-- The height-clamp / overflow box wraps BOTH the CodeMirror mount and the
+			     static stand-in, so `measureEditor` (which reads its scrollHeight) and
+			     the collapse cap apply whether or not an editor has been built. The CM
+			     mount is a zero-height empty div until `buildEditor()` fills it; the
+			     static render is shown until then, sitting flush at the box's top so a
+			     click's coordinates map onto the editor that replaces it. -->
 			<div
-				bind:this={editorEl}
+				bind:this={scrollBoxEl}
 				aria-label="cell source"
 				class="overflow-auto {isMarkdown ? 'max-h-96' : collapsed ? 'max-h-[36rem]' : ''}"
 				data-testid="editor-scroll"
 				data-collapsed={collapsed ? 'true' : undefined}
-			></div>
+			>
+				<div bind:this={editorEl}></div>
+				{#if !editorBuilt}
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<div onpointerdown={summonEditorAt} data-testid="static-code">
+						<StaticCode source={liveSource} lang={staticLang} />
+					</div>
+				{/if}
+			</div>
 		</div>
 
 		<!-- Output (code cells only) -->

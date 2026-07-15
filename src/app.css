@@ -262,3 +262,47 @@
 	border: 1px solid var(--color-base-300);
 	padding: 0.3em 0.6em;
 }
+
+/* --- Static (lazy) cell source render -------------------------------------
+ * The read-only stand-in a code/markdown cell shows until its CodeMirror editor
+ * is built on first focus (see `StaticCode.svelte` + `Cell.svelte`). It mirrors
+ * CodeMirror's layout closely — same editor surface, same 13.5px monospace, a
+ * sticky line-number gutter and a no-wrap content column — so summoning the real
+ * editor on focus does not shift the code. Token colors come from the shared
+ * highlight style's classes (mounted by `staticHighlight.ts`), resolving against
+ * the same `--cellar-cm-tok-*` custom properties the live editor uses. */
+.cm-static {
+	display: flex;
+	align-items: flex-start;
+	width: max-content;
+	min-width: 100%;
+	background-color: var(--cellar-cm-bg);
+	color: var(--cellar-cm-fg);
+	font-size: 13.5px;
+	line-height: 1.4;
+	padding: 10px 0;
+	cursor: text;
+}
+.cm-static-gutter {
+	position: sticky;
+	left: 0;
+	z-index: 1;
+	flex: 0 0 auto;
+	background-color: var(--cellar-cm-bg);
+	color: var(--cellar-cm-line-number-fg);
+}
+.cm-static-lineno {
+	padding: 0 3px 0 5px;
+	min-width: 20px;
+	text-align: right;
+	white-space: pre;
+}
+.cm-static-content {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+.cm-static-line {
+	padding: 0 2px 0 6px;
+	white-space: pre;
+	min-height: calc(13.5px * 1.4);
+}

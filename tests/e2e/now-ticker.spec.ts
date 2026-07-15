@@ -48,6 +48,9 @@ test.afterAll(async () => {
 async function typeAndRun(page: Page, cellIndex: number, code: string) {
 	const cell = page.getByTestId('cell').nth(cellIndex);
 	await expect(cell).toBeVisible();
+	// Lazy editors: build the CodeMirror editor by clicking the editor area first
+	// (the cell shows a read-only static render until then), then type into it.
+	await cell.getByTestId('editor-scroll').click();
 	const editor = cell.locator('.cm-content');
 	await editor.click();
 	await page.keyboard.press('ControlOrMeta+a');
