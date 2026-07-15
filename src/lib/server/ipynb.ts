@@ -6,9 +6,11 @@
  * (fixed key order, stable formatting) and runs the clean-on-save policy, so
  * an identical re-run produces a byte-identical file (no git diff).
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { cleanNotebook, stripRuntimeMeta } from './clean';
+import { atomicWriteFileSync } from './atomic-write';
+import { serializeWriteSync } from './write-lock';
 import type { Cell, NotebookDoc, NotebookMetadata, NbNotebook } from './types';
 
 const NBFORMAT = 4;
@@ -105,8 +107,18 @@ export function readNotebook(path: string): NbNotebook | null {
 	return JSON.parse(readFileSync(path, 'utf8')) as NbNotebook;
 }
 
-/** Clean, serialize deterministically, and write to disk. */
+/**
+ * Clean, serialize deterministically, and write to disk — atomically, and
+ * serialized against any concurrent write to the same notebook.
+ *
+ * The document is snapshotted to text SYNCHRONOUSLY (before any queuing), so a
+ * queued write persists the state as of when it was requested. The disk write
+ * is temp-file + fsync + rename (`atomicWriteFileSync`), so a crash mid-write
+ * never truncates the user's notebook, and it goes through the per-path lock so
+ * an autosave and a run-end persist to the same file cannot interleave.
+ */
 export function writeNotebook(path: string, doc: NotebookDoc): void {
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, stringify(serialize(doc)));
+	const data = stringify(serialize(doc));
+	serializeWriteSync(resolve(path), () => atomicWriteFileSync(path, data));
 }
