@@ -43,7 +43,7 @@ describe('per-notebook widget scoping', () => {
 
 		// The store tags each model with its notebook.
 		expect(nbOfModel('wA')).toBe(A);
-		expect(nbOfModel('wB')).toBe(B);
+		expect(nbOfModel('wB')).toBeUndefined(); // closed comm -> evicted
 
 		// Every widget event carries the owning notebook, resolved from the comm even
 		// when the caller (updateWidget/closeWidget) passed only the comm id.
