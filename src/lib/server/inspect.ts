@@ -10,7 +10,8 @@
  * in nor pollutes the inspected namespace.
  */
 import { execute, kernelStatus, kernelSession, currentSessionId } from './kernel';
-import { getActiveNotebookPath } from './notebook';
+import { getActiveNotebookPath, resolveNotebookPath } from './notebook';
+import { queueStateFor } from './run-queue';
 import type { RunStreamEvent, SessionId } from './types';
 
 // --- Parsed probe-result shapes (a genuine dynamic boundary: kernel stdout JSON) ---
@@ -255,7 +256,15 @@ export async function inspectVariables(): Promise<
 export async function kernelState(nbPath?: string | null) {
 	const status = kernelStatus(nbPath).status;
 	if (status === 'not_started') return { started: false, session_id: null };
-	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession(nbPath).session_id };
+	// Report busy from the run queue's OWN truth as well as jupyter's status. A run
+	// claims the kernel synchronously the instant it is dequeued (`queue.active`),
+	// but jupyter's idle→busy flip lands asynchronously a beat later; reading only
+	// jupyter's status left a check-then-act window in which a cell run started
+	// between this read and the probe's `execute()`, so the internal probe would
+	// queue behind that cell in jupyter and block — defeating the whole point of the
+	// non-blocking short-circuit. The queue's `running` flag closes that window.
+	if (status === 'busy' || queueStateFor(resolveNotebookPath(nbPath)).running != null)
+		return { started: true, busy: true, session_id: kernelSession(nbPath).session_id };
 	const state = await runProbe(nbPath);
 	const seen = new Set<string>();
 	const imports: ImportRecord[] = [];
