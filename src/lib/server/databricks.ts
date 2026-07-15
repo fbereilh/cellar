@@ -1083,6 +1083,18 @@ interface Liveness {
  * `connectionStatus(nb)` reconciles against). The state is therefore keyed by
  * the notebook's absolute path, never a module singleton.
  */
+/**
+ * The information needed to re-establish a session identically: the auth
+ * selection (`{profile}|{host}`) plus the cluster it was bound to. Both the
+ * expiry self-heal and the kernel-restart re-establish reconnect through this
+ * one descriptor, so they can never target different profile/clusters.
+ */
+interface ReconnectTarget {
+	sel: Selection;
+	clusterId: string;
+	clusterName: string;
+}
+
 interface ConnState {
 	/**
 	 * The live connection, or null. `session` is the kernel epoch `spark` was built
@@ -1094,6 +1106,16 @@ interface ConnState {
 	connectedSel: Selection | null;
 	/** The connection a kernel restart took from us, kept so the UI can say so. */
 	lost: LostConnection | null;
+	/**
+	 * The reconnect INTENT (auth selection + cluster) of the last live connection,
+	 * kept ACROSS a kernel restart. `connectionStatus()` clears `connection` the
+	 * moment the epoch changes, so it cannot answer "what should we reconnect to";
+	 * this survives that reconciliation and is what lets a restart / autorestart /
+	 * `%restart_python` re-establish the SAME `spark`/`w` automatically (see
+	 * `reconnectAfterKernelRestart`). Set on every successful `connect()`; cleared
+	 * only by an explicit `disconnect()`.
+	 */
+	reconnectTarget: ReconnectTarget | null;
 	/** One connect/disconnect at a time PER NOTEBOOK: both mutate that kernel's namespace. */
 	inFlight: boolean;
 	liveness: Liveness | null;
@@ -1113,6 +1135,7 @@ function stateFor(nb: string): ConnState {
 			connection: null,
 			connectedSel: null,
 			lost: null,
+			reconnectTarget: null,
 			inFlight: false,
 			liveness: null,
 			livenessInFlight: null,
@@ -1193,29 +1216,40 @@ async function probeLiveness(nb: string, session: SessionId | null): Promise<Liv
 }
 
 /**
- * Rebuild an expired session against the stored selection + cluster, via the
- * ordinary `connect()` path (`getOrCreate()` rebuilds the closed session). Reuses
- * the exact auth + cluster of the connection that just expired, so the epoch
- * semantics are preserved: a real kernel restart already nulled `connection`
- * above, so this can only ever heal a same-epoch, server-side expiry. Concurrent
- * callers share one attempt.
+ * Rebuild `spark`/`w` against a stored `ReconnectTarget` via the ordinary
+ * `connect()` path (`getOrCreate()` re-creates the closed/absent session). The one
+ * seam both reconnection triggers - the server-side expiry self-heal and the
+ * kernel-restart re-establish - go through, so they reconnect to the EXACT same
+ * profile+cluster; there is no second reconnection mechanism to drift.
+ */
+async function reconnectTo(nb: string, target: ReconnectTarget): Promise<void> {
+	await connect({
+		profile: target.sel.profile ?? null,
+		host: target.sel.host ?? null,
+		clusterId: target.clusterId,
+		clusterName: target.clusterName,
+		nb
+	});
+}
+
+/**
+ * Rebuild an expired session against the stored reconnect target, via the ordinary
+ * `connect()` path. Reuses the exact auth + cluster of the connection that just
+ * expired, so the epoch semantics are preserved: a real kernel restart already
+ * nulled `connection` above, so THIS path can only ever heal a same-epoch,
+ * server-side expiry (a restart is handled by `reconnectAfterKernelRestart`, which
+ * reads the same `reconnectTarget`). Concurrent callers share one attempt.
  */
 async function autoReconnect(nb: string): Promise<boolean> {
 	const s = stateFor(nb);
 	if (s.reconnecting) return s.reconnecting;
 	const conn = s.connection;
-	const sel = s.connectedSel;
-	if (!conn || !sel) return false;
+	const target = s.reconnectTarget;
+	if (!conn || !target) return false;
 	s.reconnecting = (async () => {
 		try {
-			logInfo('databricks', `Spark Connect session expired; auto-reconnecting cluster "${conn.clusterName}"`);
-			await connect({
-				profile: sel.profile ?? null,
-				host: sel.host ?? null,
-				clusterId: conn.clusterId,
-				clusterName: conn.clusterName,
-				nb
-			});
+			logInfo('databricks', `Spark Connect session expired; auto-reconnecting cluster "${target.clusterName}"`);
+			await reconnectTo(nb, target);
 			s.liveness = { session: currentSessionId(nb), alive: true, expired: false, checkedAt: Date.now() };
 			logInfo('databricks', 'Databricks auto-reconnect succeeded');
 			return true;
@@ -1237,6 +1271,63 @@ async function autoReconnect(nb: string): Promise<boolean> {
 		}
 	})();
 	return s.reconnecting;
+}
+
+/**
+ * Re-establish a notebook's Databricks session after its KERNEL was restarted.
+ *
+ * A restart / autorestart / `%restart_python` wipes the kernel namespace, so
+ * `spark`/`w` are gone and `connectionStatus()` reconciles the connection to
+ * disconnected. But the reconnect INTENT (profile+cluster) is kept in
+ * `reconnectTarget` across the restart, so this rebuilds the SAME session
+ * automatically - the user does not have to reconnect by hand. Reuses the ordinary
+ * `connect()` path via `reconnectTo` (identical to the expiry self-heal), so the
+ * auth and epoch semantics stay correct: the rebuilt session is stamped with the
+ * NEW epoch, so it reads as genuinely live.
+ *
+ * The kernel calls this fire-and-forget after a restart completes, so it must
+ * NEVER throw and must NEVER block the restart. Every edge degrades honestly:
+ *   - no reconnect target       → the notebook never had a session; do nothing.
+ *   - kernel not started        → never boot a kernel just to reconnect.
+ *   - a connect already in flight → leave it; skip.
+ *   - `connect()` fails         → leave the session reported as lost (`s.lost`), so
+ *     the UI/agent tell the user to reconnect from the sidebar, exactly as a real
+ *     restart-loss reads today. The reconnect intent is kept, so the NEXT restart
+ *     retries.
+ *
+ * Only ever heals ONE notebook (keyed by `nb`); another notebook's kernel/session
+ * is never touched.
+ */
+export async function reconnectAfterKernelRestart(
+	nb?: string | null
+): Promise<{ reconnected: boolean; reason?: string }> {
+	const abs = resolveNotebookPath(nb);
+	const s = stateFor(abs);
+	const target = s.reconnectTarget;
+	// The notebook never had a live Databricks session: nothing to re-establish.
+	if (!target) return { reconnected: false, reason: 'no_prior_session' };
+	// Never force a kernel to boot solely to reconnect Databricks. A restart keeps
+	// the kernel entry, so this is only hit if the kernel was torn down (shutdown /
+	// cull) - in which case dropping the session is the correct behavior.
+	if (kernelStatus(abs).status === 'not_started') return { reconnected: false, reason: 'no_kernel' };
+	// A connect/disconnect is already mutating this notebook's namespace; don't race it.
+	if (s.inFlight) return { reconnected: false, reason: 'busy' };
+	// The restart bumped the epoch; reconcile so the stale connection is cleared
+	// before we rebuild (a successful connect() then stamps the fresh epoch).
+	connectionStatus(abs);
+	try {
+		logInfo('databricks', `kernel for ${abs} restarted; auto-reconnecting Databricks cluster "${target.clusterName}"`);
+		await reconnectTo(abs, target);
+		logInfo('databricks', 'Databricks reconnect after kernel restart succeeded');
+		return { reconnected: true };
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		logWarn('databricks', `Databricks reconnect after kernel restart failed: ${detail}`);
+		// Degrade honestly: surface it as a session the restart took, which the
+		// UI/agent already phrase as "reconnect from the Databricks sidebar section".
+		s.lost = { profile: target.sel.profile ?? null, clusterName: target.clusterName };
+		return { reconnected: false, reason: detail };
+	}
 }
 
 /**
@@ -1288,6 +1379,10 @@ export async function connect({
 		};
 		// Re-query catalogs against the same auth, using the SDK's canonical host.
 		s.connectedSel = auth.mode === 'pat' ? { profile } : { host: s.connection.host };
+		// Remember the reconnect intent so a KERNEL restart - which the epoch
+		// reconciliation in connectionStatus() clears from `connection` - can
+		// re-establish the SAME session automatically (reconnectAfterKernelRestart).
+		s.reconnectTarget = { sel: s.connectedSel, clusterId, clusterName: s.connection.clusterName };
 		s.lost = null;
 		// A fresh session is alive by construction; seed the cache so an immediate
 		// status read doesn't pay for a redundant liveness probe.
@@ -1511,6 +1606,9 @@ export async function disconnect(nb?: string | null): Promise<{ ok: true }> {
 		if (connectionStatus(abs).connected) await runInKernel(abs, DISCONNECT_CODE);
 		s.connection = null;
 		s.connectedSel = null;
+		// An explicit disconnect is the ONLY thing that clears the reconnect intent:
+		// after this a kernel restart must NOT silently re-establish the session.
+		s.reconnectTarget = null;
 		s.lost = null;
 		s.liveness = null;
 		publishGlobal({ type: 'databricks:changed' });
