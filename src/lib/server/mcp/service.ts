@@ -1063,21 +1063,92 @@ export async function addAndRun({ source, cellType = 'code', afterId, routeImpor
 }
 
 /**
+ * The stale annotation an agent must act on, extracted from a runCell result
+ * WITHOUT recomputing (runCell already ran the staleness pass and carries its
+ * staleFields): only the stale-flag fields, mirroring the omit-when-default pattern.
+ * A cell that just ran is fresh, so its (default) `stale_state` carries no signal
+ * in a batch — we keep only `stale`/`stale_reason`/`stale_upstream`, present just
+ * when the cell is STILL stale after the run (an upstream it needs was not run).
+ */
+function pickStale(r: Record<string, unknown>): Record<string, unknown> {
+	if (r.stale !== true) return {};
+	return {
+		stale: true,
+		...(r.stale_reason != null ? { stale_reason: r.stale_reason } : {}),
+		...(Array.isArray(r.stale_upstream) ? { stale_upstream: r.stale_upstream } : {})
+	};
+}
+
+/**
+ * Collapse ONE runCell result into a compact batch-run record. A batch echoing
+ * every OK cell's full output is the single biggest recurring token cost (a
+ * ~20-cell run_all ran ~2.5-5k tokens), so an OK cell keeps only its status
+ * line — id, run_status, non-default staleness — and `has_output` flags that its
+ * full output is one `get_full_output(id)` call away (unchanged, always
+ * reachable). An ERRORED cell keeps its `ename`/`evalue` + the SAME
+ * elided-and-READ_CAP-capped traceback the single-cell path returns (already
+ * summarized on `r.outputs`; the full stack stays reachable via
+ * `get_full_output(id, size:'full')`), so a batch failure is actionable without a
+ * second call. Non-executed results (rendered / skipped / queued / running /
+ * cancelled) carry no outputs array and are already terse — pass them through.
+ *
+ * `run_status` is the canonical enum for the cell as it stands right after its run
+ * (runStatus is the single source of truth; never re-derive the epoch rule), not
+ * runCell's raw jupyter `status` field.
+ */
+function toBatchRecord(r: Record<string, unknown>, cell: CellView | null, nb: string): Record<string, unknown> {
+	const outputs = r.outputs;
+	if (!Array.isArray(outputs)) return r;
+	const run_status = cell ? runStatus(cell, currentSessionId(nb)) : String(r.status);
+	const stale = pickStale(r);
+	const errOut = outputs.find((o) => (o as { type?: string }).type === 'error') as
+		| { ename?: unknown; evalue?: unknown; text?: unknown; truncated?: unknown }
+		| undefined;
+	if (errOut) {
+		return {
+			id: r.id,
+			run_status,
+			ename: errOut.ename,
+			evalue: errOut.evalue,
+			traceback: errOut.text,
+			...(errOut.truncated ? { truncated: true } : {}),
+			...stale
+		};
+	}
+	return { id: r.id, run_status, ...(outputs.length ? { has_output: true } : {}), ...stale };
+}
+
+/**
  * Run cells one at a time, in order, each waiting its turn in the kernel queue.
  * Stops at the first run a restart/interrupt cancelled: the rest of the sequence
  * was written against a namespace that no longer exists, so running it would
  * execute cell N+1 without cell N's definitions.
+ *
+ * Returns a compact batch summary `{ ran, errored, results }`: `ran`/`errored`
+ * are how many cells executed / raised, and `results` is one COMPACT record per
+ * cell (see `toBatchRecord`) — OK cells as a status line, errored cells with
+ * their traceback in full. Any OK cell's full output is still one
+ * `get_full_output(id)` call away.
  */
 export async function runCells(ids: string[], nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	const results: Array<Record<string, unknown>> = [];
+	let ran = 0;
+	let errored = 0;
 	for (const id of ids) {
 		const r = await runCell(id, target);
 		const cell = getCell(id, target);
-		if (r && !(cell && isHidden(cell))) results.push(r);
+		if (r && !(cell && isHidden(cell))) {
+			results.push(toBatchRecord(r, cell ?? null, target));
+			const outs = r.outputs;
+			if (Array.isArray(outs)) {
+				ran++;
+				if (outs.some((o) => (o as { type?: string }).type === 'error')) errored++;
+			}
+		}
 		if (r?.status === 'cancelled') break;
 	}
-	return results;
+	return { ran, errored, results };
 }
 
 /** Run every code cell in document order; hidden cells run but are omitted from results. */
@@ -1093,14 +1164,15 @@ export async function runAll(nb?: string | null) {
  * after the upstreams that made it stale. This is the agent-side counterpart of
  * the UI's "Run all stale" action: one call to bring the whole notebook back in
  * sync with its current code. Hidden cells run but are omitted from results
- * (same as run_all). Returns the run results plus which cells were run.
+ * (same as run_all). Returns runCells' `{ ran, errored, results }` — the per-cell
+ * records already name every cell that ran, so the old duplicate `ran:[ids]`
+ * echo is gone.
  */
 export async function runStale(nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness(target);
 	const ids = staleIdsInOrder(listCells(target), stale);
-	const results = await runCells(ids, target);
-	return { ran: ids, results };
+	return runCells(ids, target);
 }
 
 /** Run code cells in the inclusive document range from→to. */
@@ -1109,7 +1181,7 @@ export async function runRange(fromId: string, toId: string, nb?: string | null)
 	const all = listCells(target);
 	const i = all.findIndex((c) => c.id === fromId);
 	const j = all.findIndex((c) => c.id === toId);
-	if (i < 0 || j < 0) return [];
+	if (i < 0 || j < 0) return { ran: 0, errored: 0, results: [] as Array<Record<string, unknown>> };
 	const [lo, hi] = i <= j ? [i, j] : [j, i];
 	const ids = all.slice(lo, hi + 1).filter((c) => c.cell_type === 'code').map((c) => c.id);
 	return runCells(ids, target);
