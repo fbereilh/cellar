@@ -82,6 +82,25 @@ interface NotebookKernel {
 	 * click) via `sendWidgetComm`. Cleared on every session change for this kernel.
 	 */
 	widgetComms: Map<string, Kernel.IComm>;
+	/**
+	 * Runs currently awaiting this kernel's `execute_reply`. Tracked so a restart /
+	 * autorestart / teardown can force-abort a run whose reply the kernel change
+	 * destroys (see `abortActiveRuns`); `clearRunQueue` drops only PENDING runs, so
+	 * without this an ACTIVE run stuck awaiting a lost reply would wedge the notebook
+	 * forever.
+	 */
+	activeRuns: Set<ActiveRun>;
+}
+
+/**
+ * A run currently awaiting its kernel's reply. `abort` rejects the run's
+ * `Promise.race` in `execute()`, causing it to dispose the future and throw — so
+ * the run's OWNER releases its queue slot through its existing `finally`, the same
+ * single release path a normal run uses (never a second one). The future itself is
+ * disposed inside `execute()`'s finally, so it need not be held here.
+ */
+interface ActiveRun {
+	abort: (reason: string) => void;
 }
 
 /** One shared KernelManager hosts every notebook's kernel (N kernels, one host). */
@@ -101,6 +120,68 @@ let sessionCounter = 0;
 /** Resolve an optional notebook path to an absolute one (default: active notebook). */
 function resolveNb(nbPath?: string | null): string {
 	return nbPath || getActiveNotebookPath();
+}
+
+/**
+ * Idle watchdog window for `execute()`. If a running cell's kernel produces NO
+ * traffic at all — no iopub output, no status flip, no reply — for this long, the
+ * kernel is treated as unresponsive (a stalled websocket, an undelivered
+ * `execute_reply`, a dropped autorestart) and the run is aborted, so its queue slot
+ * frees instead of wedging the notebook forever.
+ *
+ * It is an IDLE window, NOT a wall-clock timeout: ANY kernel activity RESETS it
+ * (see `resetWatchdog` in `execute()`), so a legitimately long-running cell that
+ * keeps emitting output — a training loop, a tqdm bar, steady prints — is NEVER
+ * killed. That guarantee is non-negotiable, so the window is deliberately generous:
+ * the manual "Restart kernel" control (which now force-aborts the active run) is the
+ * INSTANT recovery path, and this watchdog is only the automatic backstop for a
+ * kernel that has gone truly silent. Override with `CELLAR_KERNEL_IDLE_TIMEOUT_MS`
+ * (milliseconds), primarily so tests can drive the trip with a tiny window.
+ */
+const DEFAULT_KERNEL_IDLE_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+
+function kernelIdleTimeoutMs(): number {
+	const raw = process.env.CELLAR_KERNEL_IDLE_TIMEOUT_MS;
+	if (raw == null || raw === '') return DEFAULT_KERNEL_IDLE_TIMEOUT_MS;
+	const n = Number(raw);
+	return Number.isFinite(n) && n > 0 ? n : DEFAULT_KERNEL_IDLE_TIMEOUT_MS;
+}
+
+/**
+ * Thrown by `execute()` when a run is aborted before its reply arrives: either the
+ * idle watchdog tripped (`reason: 'idle_watchdog'`) or a restart/autorestart/
+ * teardown force-aborted the active future (`reason: 'kernel_restart'` etc.). The
+ * caller (`executeCellRun`) catches it and turns it into an error output; because
+ * `execute()` returns control to the caller, the owner's `finally` releases the
+ * queue slot — unwedging the notebook.
+ */
+export class KernelExecuteAborted extends Error {
+	reason: string;
+	constructor(message: string, reason: string) {
+		super(message);
+		this.name = 'KernelExecuteAborted';
+		this.reason = reason;
+	}
+}
+
+/**
+ * Force-abort every run currently awaiting `nbKernel`'s reply. Each aborted run's
+ * `execute()` disposes its future and throws `KernelExecuteAborted`, so the run's
+ * OWNER releases its queue slot through its existing `finally` — no second release
+ * path. Called from restart / autorestart / teardown, whose kernel change destroys
+ * the namespace the awaited reply belonged to (the reply may now never arrive).
+ * `clearRunQueue` drops only PENDING runs; this covers the ACTIVE one, so a manual
+ * restart actually rescues a wedged run.
+ */
+function abortActiveRuns(nbKernel: NotebookKernel, reason: string): void {
+	if (nbKernel.activeRuns.size === 0) return;
+	const runs = [...nbKernel.activeRuns];
+	nbKernel.activeRuns.clear();
+	for (const run of runs) {
+		try {
+			run.abort(reason);
+		} catch {}
+	}
 }
 
 function makeSettings() {
@@ -606,7 +687,8 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		sessionId: 0,
 		execsThisSession: 0,
 		statusHandler: null,
-		widgetComms: new Map()
+		widgetComms: new Map(),
+		activeRuns: new Set()
 	};
 
 	nbKernel.startPromise = (async () => {
@@ -653,7 +735,10 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 			if (status !== 'autorestarting') return;
 			logWarn('kernel', `kernel for ${nbPath} died and was autorestarted; namespace cleared`);
 			beginSession(nbKernel);
-			// The namespace queued work was submitted against is gone (see clearRunQueue).
+			// The active run's reply will never arrive (the process died and was replaced),
+			// so force-abort it — otherwise its queue slot never frees. Then drop pending
+			// (submitted against the namespace that is now gone; see clearRunQueue).
+			abortActiveRuns(nbKernel, 'kernel_autorestart');
 			clearRunQueue(nbPath, 'kernel_autorestart');
 			void initKernel(kernel);
 		};
@@ -713,6 +798,11 @@ export async function restartKernel(nbPath?: string | null) {
 	clearRunQueue(abs, 'kernel_restart');
 	const nbKernel = kernels.get(abs);
 	if (!nbKernel) return { status: 'not_started', id: null, session_id: null };
+	// Force-abort the ACTIVE run too: `clearRunQueue` drops only pending, so a run
+	// stuck awaiting a reply this restart will destroy would keep its slot forever.
+	// Its owner's `finally` then frees the slot — this is what makes a manual restart
+	// actually rescue a wedged run.
+	abortActiveRuns(nbKernel, 'kernel_restart');
 	const kernel = await nbKernel.startPromise;
 	try {
 		await kernel.restart();
@@ -751,6 +841,9 @@ async function teardownKernel(
 	const { nbPath } = nbKernel;
 	if (kernels.get(nbPath) !== nbKernel) return; // already torn down
 	kernels.delete(nbPath);
+	// The process is going away; abort any run awaiting its reply so its slot frees,
+	// then drop pending runs (submitted against a namespace that is about to vanish).
+	abortActiveRuns(nbKernel, reason);
 	clearRunQueue(nbPath, reason);
 	const conn = nbKernel.connection;
 	if (conn) {
@@ -889,11 +982,65 @@ export async function execute(
 
 	const future = kernel.requestExecute({ code, stop_on_error: false });
 
+	// --- Idle watchdog + force-abort -----------------------------------------
+	// `await future.done` is unbounded: a stalled websocket, an undelivered
+	// `execute_reply`, or a dropped autorestart would leave it pending forever, so
+	// the run's queue slot never frees and the notebook can never run again. Guard it
+	// two ways, both resolving through the SAME race below (never a second release):
+	//   (1) an IDLE watchdog — if the kernel goes silent (no iopub, no status flip,
+	//       no reply) for `idleMs`, the run aborts. `resetWatchdog` re-arms on ANY
+	//       activity, so a long cell that keeps emitting output is never killed;
+	//   (2) a force-abort handle in `nbKernel.activeRuns`, so restart/autorestart/
+	//       teardown can settle THIS run (see `abortActiveRuns`).
+	// Either trigger rejects the race; `execute()` then disposes the future and
+	// throws `KernelExecuteAborted`, and the caller's `finally` releases the slot.
+	const idleMs = kernelIdleTimeoutMs();
+	let settled = false;
+	let aborted = false;
+	let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
+	let abortReject: ((err: Error) => void) | null = null;
+	const abortRace = new Promise<never>((_, reject) => {
+		abortReject = reject;
+	});
+	// Swallow the race's own late rejection: after the run settles normally the
+	// promise never rejects, and while it is live the `await` below handles it — this
+	// only marks it handled so a post-settle no-op can never surface unhandled.
+	abortRace.catch(() => {});
+	const triggerAbort = (err: Error) => {
+		if (settled || aborted) return;
+		aborted = true;
+		abortReject?.(err);
+	};
+	const resetWatchdog = () => {
+		if (settled || aborted) return;
+		if (watchdogTimer) clearTimeout(watchdogTimer);
+		watchdogTimer = setTimeout(() => {
+			triggerAbort(
+				new KernelExecuteAborted(
+					`Kernel went unresponsive (no activity for ${Math.round(idleMs / 1000)}s); run aborted. Restart the kernel to recover.`,
+					'idle_watchdog'
+				)
+			);
+		}, idleMs);
+		// The watchdog must never keep the Node process alive on its own.
+		watchdogTimer.unref?.();
+	};
+	const run: ActiveRun = {
+		abort: (reason) => triggerAbort(new KernelExecuteAborted('Run aborted: the kernel was restarted.', reason))
+	};
+	nbKernel.activeRuns.add(run);
+	resetWatchdog(); // arm before any traffic can arrive
+	// A reply or stdin request on any channel is kernel activity: reset the watchdog.
+	future.onReply = () => resetWatchdog();
+	future.onStdin = () => resetWatchdog();
+
 	// Output events carry a real nbformat output object under `output`, so the
 	// caller can both stream them live to the browser AND accumulate them into
 	// the cell's `outputs` for persistence — one shape, no divergence.
 	// IOPub content is a dynamic Jupyter wire payload; narrow per msg_type.
 	future.onIOPub = (msg: KernelMessage.IIOPubMessage) => {
+		// Any iopub message (output, status flip, clear) is activity: keep the run alive.
+		resetWatchdog();
 		const t = msg.header.msg_type;
 		const c = msg.content as Record<string, unknown>;
 		// An output captured by an active Output widget (interact's result area) is
@@ -941,9 +1088,23 @@ export async function execute(
 		}
 	};
 
-	const reply = await future.done;
-	onEvent({ type: 'done', status: reply.content.status, execution_count: (reply.content as { execution_count?: number | null }).execution_count ?? null, session });
-	return reply.content;
+	try {
+		const reply = await Promise.race([future.done, abortRace]);
+		onEvent({ type: 'done', status: reply.content.status, execution_count: (reply.content as { execution_count?: number | null }).execution_count ?? null, session });
+		return reply.content;
+	} finally {
+		settled = true;
+		if (watchdogTimer) clearTimeout(watchdogTimer);
+		nbKernel.activeRuns.delete(run);
+		// On an abort (watchdog trip or restart) the future is still live, awaiting a
+		// reply that may never arrive: dispose it so its handlers detach. A future that
+		// completed normally has already disposed itself, so only dispose when aborted.
+		if (aborted) {
+			try {
+				future.dispose();
+			} catch {}
+		}
+	}
 }
 
 /**
