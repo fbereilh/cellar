@@ -1,6 +1,5 @@
 import { error } from '@sveltejs/kit';
-import { listCells, getHideAllCode, resolveNotebookPath } from '$lib/server/notebook';
-import { renderNotebookHtml, exportFilename } from '$lib/server/export-html';
+import { buildNotebookHtml } from '$lib/server/export-html';
 
 /**
  * Export a notebook to a single self-contained HTML file.
@@ -20,11 +19,8 @@ export function GET({ url }) {
 	const path = url.searchParams.get('path') || undefined;
 	const hideParam = url.searchParams.get('hideCode');
 	try {
-		const abs = resolveNotebookPath(path);
-		const cells = listCells(path);
-		const hideAllCode = hideParam == null ? getHideAllCode(path) : hideParam === '1' || hideParam === 'true';
-		const filename = exportFilename(abs);
-		const html = renderNotebookHtml({ cells, title: filename.replace(/\.html$/i, ''), hideAllCode });
+		const hideCode = hideParam == null ? undefined : hideParam === '1' || hideParam === 'true';
+		const { html, filename } = buildNotebookHtml({ nb: path, hideCode });
 		return new Response(html, {
 			headers: {
 				'content-type': 'text/html; charset=utf-8',

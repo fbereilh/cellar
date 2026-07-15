@@ -8,6 +8,8 @@
  * `metadata.cellar.hidden_from_agent === true` never appears in any map, read,
  * search, section, or execution result.
  */
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import {
 	listCells,
 	getCell,
@@ -31,7 +33,8 @@ import { publish } from '../events';
 import { enqueueRun, queuesByNotebook, queuePosition } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
-import { buildTree } from '../fstree';
+import { buildTree, resolveInWorkspace } from '../fstree';
+import { buildNotebookHtml, exportFilename } from '../export-html';
 import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
@@ -992,6 +995,59 @@ export async function consolidate(nb?: string | null) {
 export function checkpoint(label?: string, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	return createCheckpoint(target, { trigger: 'manual', label: label || 'Agent checkpoint' });
+}
+
+/**
+ * Export the working notebook to a self-contained HTML file ON DISK and return
+ * its LOCATION, never the HTML body — an inlined document would blow the token
+ * budget. Reuses the SAME render as the HTTP export route (`buildNotebookHtml`),
+ * so the tool and the download produce identical bytes.
+ *
+ * `hideCode` maps to the same report-style path as the route's `?hideCode`:
+ * omitted follows the notebook's saved `hide_all_code` setting, `true`/`false`
+ * force the report view on/off. A report drops code cells that have no output,
+ * yielding a clean markdown + outputs document.
+ *
+ * The output goes alongside the notebook as `<name>.html` by default, or to an
+ * explicit workspace-relative `path`. EITHER way it is resolved through
+ * `resolveInWorkspace`, so a traversal / absolute-escape attempt is refused and
+ * nothing is ever written outside the workspace.
+ */
+export function exportHtml({
+	hideCode,
+	path,
+	nb
+}: {
+	hideCode?: boolean;
+	path?: string | null;
+	nb?: string | null;
+} = {}) {
+	const target = nb ?? getActiveNotebookPath();
+	const { html, hideAllCode } = buildNotebookHtml({ nb: target, hideCode });
+
+	// Default alongside the notebook (`<name>.html` in the notebook's own dir);
+	// an explicit path is taken as workspace-relative. Both go through the
+	// workspace guard, which throws on any escape.
+	const nbAbs = resolveNotebookPath(target);
+	const explicit = (path ?? '').trim();
+	let outRel: string;
+	if (explicit) {
+		outRel = /\.html$/i.test(explicit) ? explicit : explicit + '.html';
+	} else {
+		const nbRel = workspaceRelative(nbAbs);
+		const dir = dirname(nbRel);
+		const name = exportFilename(nbAbs); // `<name>.html`
+		outRel = dir === '.' || dir === '' ? name : `${dir}/${name}`;
+	}
+	const outAbs = resolveInWorkspace(outRel); // throws on workspace escape
+
+	mkdirSync(dirname(outAbs), { recursive: true });
+	writeFileSync(outAbs, html);
+	return {
+		path: workspaceRelative(outAbs),
+		bytes: Buffer.byteLength(html),
+		hide_code: hideAllCode
+	};
 }
 
 /**
