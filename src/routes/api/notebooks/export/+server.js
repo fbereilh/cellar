@@ -1,5 +1,5 @@
 import { error } from '@sveltejs/kit';
-import { listCells, resolveNotebookPath } from '$lib/server/notebook';
+import { listCells, getHideAllCode, resolveNotebookPath } from '$lib/server/notebook';
 import { renderNotebookHtml, exportFilename } from '$lib/server/export-html';
 
 /**
@@ -10,14 +10,21 @@ import { renderNotebookHtml, exportFilename } from '$lib/server/export-html';
  * the notebook's last run. `path` is the workspace-relative notebook (defaults
  * to the active one). The response is an HTML attachment so the browser
  * downloads it; the file opens standalone with no Cellar server.
+ *
+ * Report style: by default the export honors the notebook's "hide all code"
+ * (report view) setting, so a notebook read as a clean report in Cellar exports
+ * as one (markdown + outputs, no code). `?hideCode=1|0` explicitly forces the
+ * report style on/off for a one-off export regardless of the saved setting.
  */
 export function GET({ url }) {
 	const path = url.searchParams.get('path') || undefined;
+	const hideParam = url.searchParams.get('hideCode');
 	try {
 		const abs = resolveNotebookPath(path);
 		const cells = listCells(path);
+		const hideAllCode = hideParam == null ? getHideAllCode(path) : hideParam === '1' || hideParam === 'true';
 		const filename = exportFilename(abs);
-		const html = renderNotebookHtml({ cells, title: filename.replace(/\.html$/i, '') });
+		const html = renderNotebookHtml({ cells, title: filename.replace(/\.html$/i, ''), hideAllCode });
 		return new Response(html, {
 			headers: {
 				'content-type': 'text/html; charset=utf-8',

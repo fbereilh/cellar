@@ -303,26 +303,56 @@ function renderMarkdownCell(cell: CellView): string {
 	return `<section class="cell md-cell"><div class="cellar-md">${html}</div></section>`;
 }
 
-function renderCodeCell(cell: CellView): string {
-	const code = `<div class="cell-input"><pre class="code"><code>${highlightPython(cell.source)}</code></pre></div>`;
+function renderCodeCell(cell: CellView, hidden: boolean): string {
 	const outs = (cell.outputs || []).map(renderOutput).filter(Boolean);
 	const output = outs.length ? `<div class="cell-output">${outs.join('')}</div>` : '';
+	if (hidden) {
+		// Report view: the code input is dropped, only the output survives. A code
+		// cell with no output (an import cell, a `df = load()` with no repr)
+		// contributes nothing to the report and is filtered out entirely - so a
+		// hidden-code export reads as pure markdown + results.
+		return output ? `<section class="cell code-cell code-hidden">${output}</section>` : '';
+	}
+	const code = `<div class="cell-input"><pre class="code"><code>${highlightPython(cell.source)}</code></pre></div>`;
 	return `<section class="cell code-cell">${code}${output}</section>`;
 }
 
-function renderCell(cell: CellView): string {
-	return cell.cell_type === 'markdown' ? renderMarkdownCell(cell) : renderCodeCell(cell);
+/**
+ * Whether a code cell's input is hidden in the export. Mirrors Cell.svelte's
+ * `codeHidden` rule EXACTLY so the export reads like the app's report view: the
+ * explicit per-cell `cellar.hide_input` wins; when unset the cell follows the
+ * notebook-wide `hideAllCode` default. Markdown cells never hide.
+ */
+function codeIsHidden(cell: CellView, hideAllCode: boolean): boolean {
+	if (cell.cell_type === 'markdown') return false;
+	return cell.metadata?.cellar?.hide_input ?? hideAllCode;
 }
 
-/** Render a notebook to a complete, self-contained HTML document. */
+function renderCell(cell: CellView, hideAllCode: boolean): string {
+	return cell.cell_type === 'markdown'
+		? renderMarkdownCell(cell)
+		: renderCodeCell(cell, codeIsHidden(cell, hideAllCode));
+}
+
+/**
+ * Render a notebook to a complete, self-contained HTML document.
+ *
+ * `hideAllCode` is the notebook-wide "hide all code inputs" (report view)
+ * default: when on, every code cell renders output-only unless a cell opts back
+ * in via `cellar.hide_input = false` (and any cell can force-hide via
+ * `hide_input = true` regardless). This is the export coupling - a notebook read
+ * as a report in Cellar exports as a clean report (markdown + outputs, no code).
+ */
 export function renderNotebookHtml({
 	cells,
-	title = 'Notebook'
+	title = 'Notebook',
+	hideAllCode = false
 }: {
 	cells: CellView[];
 	title?: string;
+	hideAllCode?: boolean;
 }): string {
-	const body = cells.map(renderCell).filter(Boolean).join('\n');
+	const body = cells.map((c) => renderCell(c, hideAllCode)).filter(Boolean).join('\n');
 	const safeTitle = esc(title);
 	return `<!doctype html>
 <html lang="en" data-theme-mode="light">
@@ -471,6 +501,9 @@ pre.code{
 pre.code code{ font: inherit; }
 
 .cell-output{ border-top: 1px solid var(--border); background: var(--output); padding: 0.35rem 0; }
+/* Report view: an output-only (code-hidden) cell has no input above its output,
+   so drop the divider that would otherwise sit at the top of the card. */
+.code-hidden .cell-output{ border-top: none; }
 .output-text{
 	margin: 0; padding: 0.25rem 1rem 0.25rem 0.85rem;
 	border-left: 2px solid transparent;
