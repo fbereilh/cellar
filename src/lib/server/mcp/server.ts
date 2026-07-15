@@ -17,6 +17,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import * as svc from './service';
+import { McpSessionRegistry, SESSION_IDLE_MS, REAPER_INTERVAL_MS } from './sessions';
 
 const text = (obj: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(obj) }] });
 const notFound = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true });
@@ -422,7 +423,21 @@ export function startMcpServer() {
 	// interface, not loopback — so CELLAR_MCP_HOST=0.0.0.0 makes the MCP endpoint
 	// reachable from the host. Opt-in only; nothing changes for a local run.
 	const host = process.env.CELLAR_MCP_HOST || '127.0.0.1';
-	const transports: Record<string, StreamableHTTPServerTransport> = {}; // sessionId -> transport
+	// Every session owns a full McpServer (~30 registered tools) + transport + its
+	// per-session service state (the pinned notebook). The registry is the single
+	// owner of that lifecycle: `forget(sid)` closes the McpServer (dropping its
+	// registrations + transport) AND clears the service-layer pin, and its `unref`'d
+	// idle reaper reclaims sessions whose bridge died uncleanly (SIGKILL never fires
+	// onclose) via that same path — so neither a clean nor an unclean disconnect
+	// leaks. Forgetting a session is shared-resource-safe: it never shuts a kernel
+	// or closes a notebook doc (both shared across sessions + the UI).
+	const sessions = new McpSessionRegistry<McpServer, StreamableHTTPServerTransport>(svc.forgetSession);
+	// The idle window + scan interval default to the module constants; both are
+	// env-overridable so an operator can tune them (and a test can force the idle
+	// path with a short threshold) without a rebuild.
+	const idleMs = Number(process.env.CELLAR_MCP_SESSION_IDLE_MS) || SESSION_IDLE_MS;
+	const reaperMs = Number(process.env.CELLAR_MCP_REAPER_INTERVAL_MS) || REAPER_INTERVAL_MS;
+	sessions.startReaper(reaperMs, idleMs);
 
 	const httpServer = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
 		const url = new URL(req.url ?? '', 'http://localhost');
@@ -435,20 +450,25 @@ export function startMcpServer() {
 				const body = await readBody(req);
 				// The MCP session id header is single-valued.
 				const sid = req.headers['mcp-session-id'] as string | undefined;
-				let transport = sid ? transports[sid] : undefined;
+				const existing = sid ? sessions.get(sid) : undefined;
+				if (sid && existing) sessions.touch(sid); // keep an active session from being reaped
+				let transport = existing?.transport;
 				if (!transport && isInitializeRequest(body)) {
+					const server = new McpServer({ name: 'cellar', version: '0.1.0' }, { instructions: INSTRUCTIONS });
+					registerTools(server);
 					const created: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
 						sessionIdGenerator: () => randomUUID(),
 						onsessioninitialized: (id: string) => {
-							transports[id] = created;
+							sessions.register(id, { server, transport: created, lastActivity: Date.now() });
 						}
 					});
+					// A clean disconnect closes the transport; do the FULL teardown, not
+					// just a transport delete. `forget` removes the entry before closing
+					// the server, so this re-entrant onclose is then a harmless no-op.
 					created.onclose = () => {
-						if (created.sessionId) delete transports[created.sessionId];
+						if (created.sessionId) sessions.forget(created.sessionId);
 					};
 					transport = created;
-					const server = new McpServer({ name: 'cellar', version: '0.1.0' }, { instructions: INSTRUCTIONS });
-					registerTools(server);
 					await server.connect(created);
 				}
 				if (!transport) {
@@ -458,12 +478,13 @@ export function startMcpServer() {
 				await transport.handleRequest(req, res, body);
 			} else if (req.method === 'GET' || req.method === 'DELETE') {
 				const sid = req.headers['mcp-session-id'] as string | undefined;
-				const transport = sid ? transports[sid] : undefined;
-				if (!transport) {
+				const entry = sid ? sessions.get(sid) : undefined;
+				if (!entry) {
 					res.writeHead(400).end('missing or unknown session');
 					return;
 				}
-				await transport.handleRequest(req, res);
+				sessions.touch(sid!);
+				await entry.transport.handleRequest(req, res);
 			} else {
 				res.writeHead(405).end('method not allowed');
 			}

@@ -127,6 +127,23 @@ function isPinned(sessionId?: string | null): boolean {
 }
 
 /**
+ * Drop ALL per-session state for an ended MCP session (its transport closed, or
+ * the idle reaper reclaimed it). Today the only session-keyed state in the
+ * service layer is the pinned working notebook; this is the single place the
+ * session lifecycle (server.ts) calls to release it, so anything else keyed by
+ * `sessionId` added later must be cleared here too.
+ *
+ * Deliberately SHARED-RESOURCE-SAFE: it forgets only this session's pin. The
+ * notebook document and its per-notebook kernel are shared across sessions and
+ * the UI, so this never closes a doc or touches a kernel — a reaped agent
+ * session leaves every open notebook and every live kernel exactly as they were.
+ * Idempotent: forgetting an unknown/already-forgotten session is a no-op.
+ */
+export function forgetSession(sessionId: string): void {
+	sessionNotebooks.delete(sessionId);
+}
+
+/**
  * The absolute notebook path a tool call targets. Precedence:
  *   1. an explicit per-call `notebook` (a one-off cross-notebook operation),
  *   2. this session's pinned working notebook,
