@@ -937,7 +937,7 @@
 	});
 
 	// Surface an agent-created / newly-active notebook live: when the MCP
-	// `create_notebook` tool runs, the server broadcasts `notebook:opened` so we
+	// `use_notebook` tool runs, the server broadcasts `notebook:opened` so we
 	// open (or focus) a permanent tab for it with no reload. Our own actions carry
 	// this tab's `originId` and are skipped. `openFilePermanent` maps the default
 	// notebook's relative path to the canonical 'notebook' tab and any other

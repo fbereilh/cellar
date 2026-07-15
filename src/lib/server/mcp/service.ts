@@ -22,7 +22,6 @@ import {
 	resolveNotebookPath,
 	workspaceRelative,
 	createNotebook as createNotebookDoc,
-	openNotebook as openNotebookDoc,
 	notebookExists
 } from '../notebook';
 import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel';
@@ -147,17 +146,29 @@ export function targetFor(sessionId?: string | null, explicit?: string | null): 
 
 /**
  * Pin THIS MCP session's working notebook without stealing the user's focus.
- * Opens the notebook (creating it when it does not exist), records the
- * session→notebook binding, and surfaces it as an AVAILABLE tab (focus:false) so
- * an open UI shows it without yanking the user off their current tab. This is how
- * an agent declares "I am working here"; every subsequent read/write/run from
- * this session defaults to it, regardless of which tab the user later focuses.
+ * Open-or-create: opens the notebook, creating it when it does not exist (the
+ * merged replacement for the old open_notebook + create_notebook tools). Pass
+ * `createIfMissing:false` for open-only semantics (throws when the notebook does
+ * not exist) — the one case the old open_notebook covered that a plain open-or-
+ * create does not. Records the session→notebook binding and surfaces it as an
+ * AVAILABLE tab (focus:false) so an open UI shows it without yanking the user off
+ * their current tab. This is how an agent declares "I am working here"; every
+ * subsequent read/write/run from this session defaults to it, regardless of which
+ * tab the user later focuses.
  */
-export function useNotebook(sessionId: string | undefined, name: string) {
+export function useNotebook(sessionId: string | undefined, name?: string, createIfMissing = true) {
 	let rel = (name ?? '').trim();
-	if (!rel) throw new Error('use_notebook requires a notebook name. Use list_notebooks to see existing notebooks; a name that does not exist yet is created.');
+	if (!rel) {
+		// No name: default to an untitled notebook when creating (the old
+		// create_notebook affordance); open-only has nothing to open.
+		if (!createIfMissing) throw new Error('use_notebook requires a notebook name to open. Use list_notebooks to see existing notebooks.');
+		rel = 'untitled';
+	}
 	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
 	const existed = notebookExists(rel);
+	if (!existed && !createIfMissing) {
+		throw new Error(`Notebook "${rel}" does not exist. Use list_notebooks to see workspace notebooks, or call use_notebook without create_if_missing:false (create is the default) to create it.`);
+	}
 	// createNotebookDoc opens an existing file or creates a new one; focus:false
 	// keeps the user's tab where it is.
 	const nb = createNotebookDoc(rel, null, { focus: false });
@@ -413,7 +424,7 @@ function staleFields(
 		out.stale = true;
 		out.stale_reason = entry.reason;
 		// The upstream cell ids the agent must re-run are handles too, so they can be
-		// passed straight back to run_cell / read_cell.
+		// passed straight back to run_cell / read_cells.
 		if (entry.upstream?.length) out.stale_upstream = entry.upstream.map(toHandle);
 	}
 	return out;
@@ -454,8 +465,7 @@ export const kernel = {
 /**
  * List every `.ipynb` in the workspace so the agent can discover names to open.
  * Walks the workspace file tree (skipping noise dirs) and marks which notebook
- * is currently active. Paths are workspace-relative (what `open_notebook` and
- * `create_notebook` accept).
+ * is currently active. Paths are workspace-relative (what `use_notebook` accepts).
  */
 export function listNotebooks(sessionId?: string) {
 	const activeAbs = getActiveNotebookPath();
@@ -492,44 +502,6 @@ export function listNotebooks(sessionId?: string) {
 }
 
 const cellCount = (nb: { cells?: unknown[] }) => (nb.cells ? nb.cells.length : 0);
-
-/**
- * Open and focus an EXISTING workspace notebook by name, making it the active
- * notebook and broadcasting `notebook:opened` so an open browser surfaces/
- * focuses its tab live. `name` is a workspace `.ipynb` path (extension
- * optional). Throws with a create_notebook pointer when it does not exist —
- * open never creates.
- */
-export function openNotebook(sessionId: string | undefined, name: string) {
-	let rel = (name ?? '').trim();
-	if (!rel) throw new Error('open_notebook requires a notebook name. Use list_notebooks to see available notebooks, or create_notebook to make a new one.');
-	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
-	if (!notebookExists(rel)) {
-		throw new Error(`Notebook "${rel}" does not exist. Use list_notebooks to see workspace notebooks, or create_notebook("${rel}") to make a new one.`);
-	}
-	// Opening is this agent declaring "I am working here": pin it as the session's
-	// working notebook, and surface it focus:false so the user's tab is not stolen.
-	const nb = openNotebookDoc(rel, null, { focus: false });
-	if (sessionId) sessionNotebooks.set(sessionId, nb.path);
-	return { working_notebook: workspaceRelative(nb.path), path: nb.path, workspace: nb.workspace, cells: cellCount(nb), pinned: !!sessionId };
-}
-
-/**
- * Create a NEW workspace notebook (or open one if the name already exists) and
- * make it active. `name` is an optional `.ipynb` filename (defaults to
- * `untitled.ipynb`); the `.ipynb` suffix is added if missing. Broadcasts
- * `notebook:opened` so an open browser surfaces the notebook in a tab live.
- * For opening a notebook you know already exists, prefer open_notebook.
- * Returns its path + cell count.
- */
-export function createNotebook(sessionId: string | undefined, name?: string) {
-	let rel = (name ?? '').trim() || 'untitled';
-	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
-	// Creating is likewise a declaration of intent: pin it, and don't steal focus.
-	const nb = createNotebookDoc(rel, null, { focus: false });
-	if (sessionId) sessionNotebooks.set(sessionId, nb.path);
-	return { working_notebook: workspaceRelative(nb.path), path: nb.path, workspace: nb.workspace, cells: cellCount(nb), pinned: !!sessionId };
-}
 
 // --- read -------------------------------------------------------------------
 
@@ -998,7 +970,7 @@ export function getRunQueue(sessionId?: string) {
 	const notebooks: Record<string, QueueState> = {};
 	for (const [abs, state] of Object.entries(byAbs)) {
 		// Each entry's cellId is emitted as that notebook's short handle so the agent
-		// can pass it straight back to run_cell / read_cell.
+		// can pass it straight back to run_cell / read_cells.
 		const h = handleFn(abs);
 		notebooks[workspaceRelative(abs)] = {
 			running: state.running ? { ...state.running, cellId: h(state.running.cellId) } : null,
