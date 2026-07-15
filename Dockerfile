@@ -31,7 +31,13 @@ FROM ${UV_IMAGE} AS uvbin
 # =============================================================================
 # Stage 1 — build the SvelteKit app (needs dev deps + the full source tree).
 # =============================================================================
-FROM ${NODE_IMAGE} AS build
+# Pin to the native build platform (BUILDPLATFORM): the adapter-node output in
+# build/ is architecture-independent JavaScript, so there is nothing to gain from
+# running this heavy `npm run build` under QEMU for each target arch - and doing
+# so makes multi-arch builds slow and can abort Node/V8 under emulation. The
+# per-target-arch native modules are installed separately in the runtime stage's
+# `npm ci --omit=dev`, so the final image stays identical per arch.
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS build
 WORKDIR /app
 
 # Install deps first (cached until package*.json change).
@@ -64,8 +70,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user (docker-stacks convention). Home holds the baked Jupyter host env.
-RUN groupadd --gid 1000 cellar \
-    && useradd --uid 1000 --gid 1000 --create-home --home-dir /home/cellar cellar
+RUN groupadd --gid 1001 cellar \
+    && useradd --uid 1001 --gid 1001 --create-home --home-dir /home/cellar cellar
 
 ENV HOME=/home/cellar
 
