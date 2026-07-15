@@ -903,6 +903,13 @@
 				scheduleStaleness();
 				return;
 			}
+			// This notebook's kernel had its user variables wiped (kernel stays alive):
+			// the cells that defined a cleared name lost their run stamp, so refetch
+			// staleness (they now read "not run this session" and dependents "stale").
+			if (pe.type === 'kernel:variables-wiped') {
+				scheduleStaleness();
+				return;
+			}
 			if (pe.originId && pe.originId === originId) return; // our own UI action
 			if (
 				pe.type?.startsWith('cell:') ||

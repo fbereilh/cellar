@@ -226,6 +226,26 @@ export async function analyzeDataflow(cells: CellView[]): Promise<DataflowMap> {
 }
 
 /**
+ * The code cells that DEFINE at least one of `names`, in document order — used to
+ * reflect a "wipe variables" (see kernel.ts `wipeKernelVariables`): after the
+ * kernel drops those data variables, the cells that defined them must read "not
+ * run this session" so staleness propagates to their dependents. Built from the
+ * same cached dataflow `defines` sets that back the staleness graph, so the
+ * attribution matches what the rest of Cellar believes each cell defines.
+ *
+ * `names` empty ⇒ no cells. Reads the live doc for `nb` (nullish ⇒ active).
+ */
+export async function cellsDefiningNames(names: readonly string[], nb?: string | null): Promise<string[]> {
+	const wanted = new Set(names);
+	if (wanted.size === 0) return [];
+	const cells = listCells(nb);
+	const dataflow = await analyzeDataflow(cells);
+	return cells
+		.filter((c) => c.cell_type === 'code' && (dataflow[c.id]?.defines ?? []).some((d) => wanted.has(d)))
+		.map((c) => c.id);
+}
+
+/**
  * The staleness verdict for a whole notebook: analyze its dataflow, then apply the
  * pure rule against the live kernel session. Shared by the UI's staleness endpoint
  * and the MCP agent surface, so the human and the agent see the same verdict.

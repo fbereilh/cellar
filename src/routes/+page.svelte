@@ -895,6 +895,18 @@
 		} catch {}
 		refreshKernel();
 	}
+	// Wipe a notebook's user variables from its kernel to free memory, keeping the
+	// kernel alive (no restart, same session): the process, epoch, imports, defs and
+	// any live Databricks session all survive. The active notebook's inspector is
+	// refetched so it shows the now-empty namespace (staleness updates via the
+	// `kernel:variables-wiped` SSE event the server publishes). No kernel status
+	// change (still the same running session), so no refreshKernel() is needed.
+	async function wipeKernel(path: string) {
+		try {
+			await fetch('/api/kernel/wipe', { ...kernelJson, body: JSON.stringify({ path }) });
+			if (path === activeNotebookPath) refreshVariables();
+		} catch {}
+	}
 
 	// ---- Theme ---------------------------------------------------------------
 	// Setting `data-theme` is the whole toggle: daisyUI restyles the app and, via
@@ -1123,6 +1135,7 @@
 					onInterruptKernel={interruptKernel}
 					onRestartKernel={restartKernel}
 					onShutdownKernel={shutdownKernel}
+					onWipeKernel={wipeKernel}
 					onInsertAndRun={canInsertAndRun}
 					onDatabricksSessionChange={onDatabricksSessionChange}
 					onOpenFile={openFile}

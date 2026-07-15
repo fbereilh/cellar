@@ -529,6 +529,34 @@ export function setLastRun(id: string, lastRun: LastRun, nb?: string | null): bo
 	return true;
 }
 
+/**
+ * Invalidate the runtime-only run stamp of specific cells after a namespace
+ * "wipe variables" (see kernel.ts `wipeKernelVariables`). Clearing `lastRun` makes
+ * a cell read "not run this session", so the existing staleness rule reports it
+ * `not_run` and its downstream dependents `stale` — reflecting that the values it
+ * defined are gone from the kernel — WITHOUT any epoch bump or restart. `lastRun`
+ * is runtime-only (stripped from disk), so this never changes the `.ipynb`.
+ *
+ * The caller resolves which cells defined the wiped names (see dataflow.ts
+ * `cellsDefiningNames`); passing an empty list is a no-op. Emits one
+ * `kernel:variables-wiped` event so every open tab refetches its staleness.
+ * Returns how many cells were actually cleared.
+ */
+export function clearLastRunStamps(cellIds: readonly string[], nb?: string | null): number {
+	const doc = docFor(nb);
+	let cleared = 0;
+	for (const id of cellIds) {
+		const cell = find(doc, id);
+		const lr = cell?.metadata?.cellar?.lastRun;
+		if (lr) {
+			delete cell!.metadata!.cellar!.lastRun;
+			cleared++;
+		}
+	}
+	emit(doc, 'kernel:variables-wiped', { cleared });
+	return cleared;
+}
+
 /** The notebook's designated imports cell, or null. */
 export function getImportsCell(nb?: string | null): CellView | null {
 	const doc = docFor(nb);

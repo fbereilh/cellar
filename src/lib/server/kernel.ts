@@ -1035,6 +1035,116 @@ export async function interruptKernel(nbPath?: string | null) {
 	return { status: kernel.status, id: kernel.id };
 }
 
+/**
+ * Silently clear the user-defined DATA variables from notebook `nbPath`'s kernel
+ * namespace — the "wipe variables to free memory" action — WITHOUT restarting.
+ *
+ * This is deliberately a scalpel, not a restart: the kernel process and its
+ * session stay alive and the epoch is NOT bumped (so a subsequent cell runs
+ * instantly, and any live Databricks session — whose liveness `databricks.ts`
+ * reconciles against the epoch — stays connected). What it removes is exactly the
+ * data variables the Variables inspector lists; it PRESERVES imports, user-defined
+ * functions and classes, and every name in `preserve` (the caller passes
+ * `['spark','w']` when a Databricks session is live, since deleting `spark` while
+ * keeping the epoch would leave `connectionStatus()` falsely reporting connected).
+ * It also flushes IPython's output cache (`_`, `__`, `Out[...]`), which otherwise
+ * pins the last results in memory and would defeat the point of freeing state.
+ *
+ * Runs through `execute(..., {internal:true})` like every other Cellar probe, so
+ * it bypasses the run queue (jupyter serializes it after any running cell) and
+ * does not inflate `execs_this_session`. Never forces a start: a notebook whose
+ * kernel is not running has nothing to wipe. Returns the names actually deleted so
+ * the caller can invalidate the run-status of the cells that defined them.
+ *
+ * Other notebooks' kernels are untouched (this resolves and probes ONE kernel).
+ */
+export async function wipeKernelVariables(
+	nbPath?: string | null,
+	{ preserve = [] }: { preserve?: string[] } = {}
+): Promise<{ status: string; cleared: string[]; session_id: SessionId | null; probe_failed?: boolean }> {
+	const abs = resolveNb(nbPath);
+	const nbKernel = kernels.get(abs);
+	// No kernel → nothing in memory to clear. Never boot one just to wipe it.
+	if (!nbKernel || !nbKernel.connection) return { status: 'not_started', cleared: [], session_id: null };
+	const code = wipeProbeCode(preserve);
+	let stdout = '';
+	let session: SessionId | null = null;
+	await execute(
+		abs,
+		code,
+		(ev) => {
+			if (ev.type === 'kernel') session = ev.session;
+			else if (ev.type === 'output' && ev.output.output_type === 'stream' && ev.output.name === 'stdout') {
+				stdout += Array.isArray(ev.output.text) ? ev.output.text.join('') : ev.output.text;
+			}
+		},
+		{ internal: true }
+	);
+	// The probe deleted the names kernel-side regardless of whether we can parse its
+	// printed summary; the parse only recovers WHICH names for staleness reflection.
+	const line = stdout.trim().split('\n').filter(Boolean).at(-1);
+	let cleared: string[] = [];
+	let probe_failed = false;
+	try {
+		const parsed = line ? (JSON.parse(line) as { cleared?: unknown }) : null;
+		if (parsed && Array.isArray(parsed.cleared)) cleared = parsed.cleared.map(String);
+		else probe_failed = true;
+	} catch {
+		probe_failed = true;
+	}
+	// No epoch bump, no restart, no reconnect: the session the wipe ran in is still live.
+	return { status: nbKernel.connection.status, cleared, session_id: session, ...(probe_failed ? { probe_failed: true } : {}) };
+}
+
+/**
+ * Python for the wipe probe: classify the user namespace exactly as inspect.ts's
+ * PROBE does (so "what the Variables inspector shows" and "what a wipe removes"
+ * cannot disagree), delete the data variables, flush the output cache, and print
+ * `{"cleared":[...]}`. Every name it binds is underscore-prefixed and deleted, so
+ * the probe leaves no trace in the namespace. `preserve` is injected as a JSON
+ * literal (valid Python) — imports/functions/classes are skipped structurally.
+ */
+function wipeProbeCode(preserve: string[]): string {
+	return `
+import json as _cellar_wj, inspect as _cellar_wi
+def _cellar_wipe(_preserve):
+    try:
+        _ip = get_ipython(); _ns = _ip.user_ns; _hidden = set(_ip.user_ns_hidden)
+    except Exception:
+        _ip = None; _ns = globals(); _hidden = set()
+    _skip = {'typing', 'abc', 'IPython.core.magic'}
+    _keep = set(_preserve) | {'In', 'Out', 'exit', 'quit', 'get_ipython'}
+    _cleared = []
+    for _k, _v in list(_ns.items()):
+        if _k.startswith('_') or _k in _hidden or _k in _keep:
+            continue
+        try:
+            if (_cellar_wi.ismodule(_v) or _cellar_wi.isfunction(_v)
+                    or _cellar_wi.isbuiltin(_v) or _cellar_wi.isroutine(_v)
+                    or _cellar_wi.isclass(_v)):
+                continue
+        except Exception:
+            continue
+        if getattr(type(_v), '__module__', '') in _skip:
+            continue
+        _cleared.append(_k)
+    for _k in _cleared:
+        try:
+            del _ns[_k]
+        except Exception:
+            pass
+    # Flush the output cache (_, __, Out[...]) so wiped values are not pinned by history.
+    try:
+        if _ip is not None:
+            _ip.displayhook.flush()
+    except Exception:
+        pass
+    return _cleared
+print(_cellar_wj.dumps({'cleared': _cellar_wipe(${JSON.stringify(preserve)})}))
+del _cellar_wipe, _cellar_wj, _cellar_wi
+`;
+}
+
 /** Current status of notebook `nbPath`'s kernel, without forcing a start. */
 export function kernelStatus(nbPath?: string | null) {
 	const nbKernel = kernels.get(resolveNb(nbPath));
