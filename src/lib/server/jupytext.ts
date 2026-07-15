@@ -35,6 +35,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join, resolve, extname, sep } from 'node:path';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
+import { invalidateGitStatusCache } from './git';
 import type { Cell } from './types';
 
 /** A request handed to the embedded Python helper (one JSON arg in argv[1]). */
@@ -328,6 +329,7 @@ export function writePyNotebook(absPath: string, cells: Cell[], format: string):
 		source: typeof c.source === 'string' ? c.source : ''
 	}));
 	runHelperSync({ op: 'write', path: absPath, format, cells: payload });
+	invalidateGitStatusCache(); // a save changes `git status`; refresh the tree decorations now
 }
 
 // ---------------------------------------------------------------------------

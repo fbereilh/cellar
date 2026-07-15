@@ -11,6 +11,7 @@ import { dirname, resolve } from 'node:path';
 import { cleanNotebook, stripRuntimeMeta } from './clean';
 import { atomicWriteFileSync } from './atomic-write';
 import { serializeWriteSync } from './write-lock';
+import { invalidateGitStatusCache } from './git';
 import type { Cell, NotebookDoc, NotebookMetadata, NbNotebook } from './types';
 
 const NBFORMAT = 4;
@@ -121,4 +122,9 @@ export function writeNotebook(path: string, doc: NotebookDoc): void {
 	mkdirSync(dirname(path), { recursive: true });
 	const data = stringify(serialize(doc));
 	serializeWriteSync(resolve(path), () => atomicWriteFileSync(path, data));
+	// A save changes the working tree (so `git status` differs) without touching
+	// the git index, so drop the workspace status cache to keep the file-tree
+	// decorations instant. The notebook's own blame/HEAD caches self-invalidate on
+	// its new mtime.
+	invalidateGitStatusCache();
 }

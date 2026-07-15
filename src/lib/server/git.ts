@@ -15,10 +15,162 @@
  * with the workspace root as the working directory.
  */
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { workspaceRoot, resolveInWorkspace } from './fstree';
 
 const MAX_GIT_BUFFER = 8 * 1024 * 1024;
+
+/**
+ * Every `git` subprocess this module spawns bumps this counter. The shell fires a
+ * burst of git-backed requests on each window focus and each save (file-tree
+ * status, per-file HEAD baselines, per-file/cell blame), so the counter is how we
+ * observe — in tests and in the E2E smoke test — that the memoized preflights and
+ * the status/blame caches actually collapse that fan-out.
+ */
+let spawnCount = 0;
+/** Total `git` subprocesses spawned by this module since the last reset. */
+export function gitSpawnCount(): number {
+	return spawnCount;
+}
+/** Reset the spawn counter (tests / E2E measurement). */
+export function resetGitSpawnCount(): void {
+	spawnCount = 0;
+}
+
+/**
+ * Backstop TTL for the mtime-keyed status/blame/HEAD caches. The real
+ * invalidator is the cache signature (target file mtime + git index mtime, see
+ * `cacheSig`), which catches every ordinary mutation — a working-tree edit, a
+ * stage, a commit, a checkout. The TTL only exists to self-heal the exotic
+ * history moves that touch neither (e.g. `git reset --soft`), so it is generous:
+ * a burst of identical requests within one focus/save is served from cache, and
+ * an unchanged file re-probes at most once per window.
+ */
+const CACHE_TTL_MS = 5000;
+
+/**
+ * Status has a workspace-wide blind spot the per-file caches don't: an UNSTAGED
+ * edit made outside cellar touches neither the git index nor a file we key on, so
+ * only the TTL bounds its staleness. A quick external edit can be bracketed by a
+ * shorter blur→focus gap than a full commit, so status uses a tighter backstop
+ * than blame/HEAD. In-app saves clear it outright via `invalidateGitStatusCache`.
+ */
+const STATUS_TTL_MS = 1500;
+
+/**
+ * A negative repo detection ("this path is not inside a git work tree") is
+ * re-probed after this long, so a `git init` performed mid-session is picked up
+ * promptly. A positive detection is cached for the life of the process — a
+ * workspace does not stop being a git repo in a way that matters here.
+ */
+const PREFLIGHT_MISS_TTL_MS = 4000;
+
+/**
+ * Session-stable repo-detection preflights for one directory: whether it is
+ * inside a work tree, its path relative to the repo root (porcelain/`git show`
+ * paths are repo-root-relative, so we strip this), and the absolute git dir
+ * (whose `index` mtime is our cheap, spawn-free "history changed" signal).
+ */
+interface Preflight {
+	inside: boolean;
+	prefix: string;
+	gitDir: string | null;
+	at: number;
+}
+const preflightCache = new Map<string, Preflight>();
+
+/**
+ * Resolve (and memoize) the three repo-detection preflights for `root` in ONE
+ * `git rev-parse` spawn. These are stable for the session, so caching them is
+ * what removes the bulk of the per-focus/per-save git fan-out — every endpoint
+ * used to re-derive `--is-inside-work-tree` / `--show-prefix` on every call.
+ */
+async function preflight(root: string): Promise<Preflight> {
+	const cached = preflightCache.get(root);
+	// A positive detection never expires; a negative one is re-probed after a
+	// short TTL to catch a mid-session `git init`.
+	if (cached && (cached.inside || Date.now() - cached.at < PREFLIGHT_MISS_TTL_MS)) return cached;
+
+	const out = await runGit(root, ['rev-parse', '--is-inside-work-tree', '--show-prefix', '--absolute-git-dir']);
+	let info: Preflight;
+	if (out == null) {
+		info = { inside: false, prefix: '', gitDir: null, at: Date.now() };
+	} else {
+		const lines = out.split('\n');
+		const inside = lines[0]?.trim() === 'true';
+		const prefix = (lines[1] ?? '').trim();
+		const gitDir = (lines[2] ?? '').trim() || null;
+		info = { inside, prefix, gitDir, at: Date.now() };
+	}
+	preflightCache.set(root, info);
+	return info;
+}
+
+/** File mtime in ms, or null when the file is absent/unreadable. */
+function fileMtimeMs(abs: string): number | null {
+	try {
+		return statSync(abs).mtimeMs;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * A cache signature that changes on any mutation affecting git output for a file:
+ * the working-tree file's mtime (a plain edit) OR the git index's mtime (a stage,
+ * commit, checkout, merge or rebase all rewrite the index). Reading both is two
+ * `stat`s and zero git spawns.
+ */
+function cacheSig(abs: string | null, gitDir: string | null): string {
+	const fileM = abs ? fileMtimeMs(abs) : null;
+	const idxM = gitDir ? fileMtimeMs(join(gitDir, 'index')) : null;
+	return `${fileM ?? 'x'}:${idxM ?? 'x'}`;
+}
+
+/** One entry in a signature+TTL cache. */
+interface CacheEntry<T> {
+	sig: string;
+	at: number;
+	value: T;
+}
+const headCache = new Map<string, CacheEntry<GitHeadFileResult>>();
+const blameFileCache = new Map<string, CacheEntry<GitBlameFileResult>>();
+const blameNbCache = new Map<string, CacheEntry<GitBlameNotebookResult>>();
+let statusCache: CacheEntry<GitStatusResult> | null = null;
+let branchCache: CacheEntry<GitBranchResult> | null = null;
+
+/** Serve a cached value when its signature still matches and it is within the TTL. */
+function fresh<T>(entry: CacheEntry<T> | null | undefined, sig: string, ttl = CACHE_TTL_MS): T | null {
+	if (entry && entry.sig === sig && Date.now() - entry.at < ttl) return entry.value;
+	return null;
+}
+
+/**
+ * Drop the workspace-wide status cache. Call on an in-app save/mutation: a
+ * cellar-side write changes the working tree (so `git status` differs) WITHOUT
+ * touching the git index, so the status signature would otherwise not budge and
+ * the file-tree decorations would lag by up to the backstop TTL. Per-file blame
+ * and HEAD caches need no such hook — the written file's mtime moves, which is
+ * already their signature. Edits made OUTSIDE cellar are bracketed by a
+ * blur→focus gap longer than the TTL, so the backstop refreshes those.
+ */
+export function invalidateGitStatusCache(): void {
+	statusCache = null;
+}
+
+/**
+ * Drop every cached git result (status, blame, HEAD). Broader than the save-hook
+ * needs — exported for tests and for any caller that wants a hard reset.
+ * Preflights are intentionally NOT cleared: repo identity does not change here.
+ */
+export function invalidateGitCaches(): void {
+	headCache.clear();
+	blameFileCache.clear();
+	blameNbCache.clear();
+	statusCache = null;
+	branchCache = null;
+}
 
 /** Single-letter git decoration, matching VS Code's convention. */
 export type GitStatusLetter = 'M' | 'A' | 'D' | 'R' | 'U' | 'C';
@@ -111,39 +263,15 @@ function classify(xy: string): GitStatusLetter {
  * files list individually) so status + ignore come back in one git call.
  */
 function runStatus(root: string): Promise<string | null> {
-	return new Promise((resolve) => {
-		execFile(
-			'git',
-			['-C', root, 'status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching', '-z', '--', '.'],
-			{ maxBuffer: 8 * 1024 * 1024 },
-			(err, stdout) => {
-				if (err) {
-					// Not a repo, or git missing → no decorations, no error.
-					resolve(null);
-					return;
-				}
-				resolve(stdout);
-			}
-		);
-	});
-}
-
-/**
- * The workspace path relative to the git repo root (e.g. `sub/deep/`, with a
- * trailing slash, or `''` when the workspace *is* the repo root). Porcelain
- * paths are repo-root-relative, so we strip this to key the map by the same
- * workspace-relative paths the file tree uses.
- */
-function runPrefix(root: string): Promise<string> {
-	return new Promise((resolve) => {
-		execFile('git', ['-C', root, 'rev-parse', '--show-prefix'], (err, stdout) => {
-			if (err) {
-				resolve('');
-				return;
-			}
-			resolve(stdout.trim());
-		});
-	});
+	return runGit(root, [
+		'status',
+		'--porcelain=v1',
+		'--untracked-files=all',
+		'--ignored=matching',
+		'-z',
+		'--',
+		'.'
+	]);
 }
 
 /**
@@ -187,11 +315,26 @@ function parse(stdout: string, prefix: string): { files: Record<string, GitStatu
  */
 export async function gitStatus(): Promise<GitStatusResult> {
 	const root = workspaceRoot();
+	const pre = await preflight(root);
+	// Not a repo → no decorations, no error, no status spawn.
+	if (!pre.inside) return { isRepo: false, files: {}, ignored: [] };
+
+	// The index mtime is the cheap "history changed" signal; combined with the
+	// backstop TTL it lets a focus/save burst reuse one status result while still
+	// refreshing on a stage/commit/checkout (index mtime) or an explicit save
+	// event (`invalidateGitCaches`). Unstaged working edits don't touch the index,
+	// so the TTL is what bounds their staleness — the client also refetches status
+	// right after a save, which lands fresh once the burst window has passed.
+	const sig = cacheSig(null, pre.gitDir);
+	const hit = fresh(statusCache, sig, STATUS_TTL_MS);
+	if (hit) return hit;
+
 	const stdout = await runStatus(root);
 	if (stdout == null) return { isRepo: false, files: {}, ignored: [] };
-	const prefix = await runPrefix(root);
-	const { files, ignored } = parse(stdout, prefix);
-	return { isRepo: true, files, ignored };
+	const { files, ignored } = parse(stdout, pre.prefix);
+	const value: GitStatusResult = { isRepo: true, files, ignored };
+	statusCache = { sig, at: Date.now(), value };
+	return value;
 }
 
 /**
@@ -204,6 +347,21 @@ export async function gitStatus(): Promise<GitStatusResult> {
  */
 export async function gitBranch(): Promise<GitBranchResult> {
 	const root = workspaceRoot();
+	// The branch fires on every focus (alongside status), yet only changes on a
+	// checkout/switch — which rewrites the index, bumping its mtime. So the same
+	// index-mtime signature that keys status keys this too: a warm focus re-uses it,
+	// a branch switch (or the first commit onto an unborn branch) refreshes it.
+	const pre = await preflight(root);
+	const sig = cacheSig(null, pre.gitDir);
+	const hit = fresh(branchCache, sig);
+	if (hit) return hit;
+
+	const value = await resolveBranch(root, pre);
+	branchCache = { sig, at: Date.now(), value };
+	return value;
+}
+
+async function resolveBranch(root: string, pre: Preflight): Promise<GitBranchResult> {
 	// Succeeds on any real branch (including one with no commits yet); `--quiet`
 	// makes a detached HEAD exit non-zero silently → runGit resolves null.
 	const sym = await runGit(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
@@ -214,15 +372,24 @@ export async function gitBranch(): Promise<GitBranchResult> {
 	// Either detached HEAD or not a repo — a short SHA distinguishes them.
 	const sha = await runGit(root, ['rev-parse', '--short', 'HEAD']);
 	if (sha != null) return { isRepo: true, branch: sha.trim(), detached: true };
-	// No SHA: confirm whether this is even a repo (an empty/detached repo is rare).
-	const inside = await runGit(root, ['rev-parse', '--is-inside-work-tree']);
-	return { isRepo: inside != null, branch: null, detached: false };
+	// No SHA: the memoized preflight already told us whether this is even a repo.
+	return { isRepo: pre.inside, branch: null, detached: false };
 }
 
-/** Run a git subcommand at the workspace root; `null` on any failure. */
+/**
+ * Run a git subcommand at the workspace root; `null` on any failure.
+ *
+ * `--no-optional-locks` is load-bearing for the caches: a plain `git status`
+ * REFRESHES and rewrites the index's stat cache, bumping `.git/index`'s mtime —
+ * the very signal the status cache keys on — so the entry it just wrote would be
+ * stale on the next read. Suppressing the optional index write keeps the index
+ * mtime a stable "history/staging changed" signal (and avoids lock contention
+ * with a concurrent terminal git); the command's output is unaffected.
+ */
 function runGit(root: string, args: string[]): Promise<string | null> {
+	spawnCount++;
 	return new Promise((resolve) => {
-		execFile('git', ['-C', root, ...args], { maxBuffer: MAX_GIT_BUFFER }, (err, stdout) => {
+		execFile('git', ['-C', root, '--no-optional-locks', ...args], { maxBuffer: MAX_GIT_BUFFER }, (err, stdout) => {
 			resolve(err ? null : stdout);
 		});
 	});
@@ -243,20 +410,30 @@ function runGit(root: string, args: string[]): Promise<string | null> {
  */
 export async function gitHeadFile(relPath: string): Promise<GitHeadFileResult> {
 	const root = workspaceRoot();
-	resolveInWorkspace(relPath); // throws if the path escapes the workspace
+	const abs = resolveInWorkspace(relPath); // throws if the path escapes the workspace
 	const rel = String(relPath ?? '').replace(/\\/g, '/');
 	if (!rel) throw new Error('path required');
 
-	if ((await runGit(root, ['rev-parse', '--is-inside-work-tree'])) == null) {
-		return { isRepo: false, tracked: false, content: null };
-	}
+	const pre = await preflight(root);
+	if (!pre.inside) return { isRepo: false, tracked: false, content: null };
+
+	// HEAD:path content changes only when history moves (commit/checkout), so the
+	// index mtime alone is a sound signature; the working-file mtime rides along
+	// harmlessly and the TTL backstops exotic history moves.
+	const cacheKey = `${root}\0${rel}`;
+	const sig = cacheSig(abs, pre.gitDir);
+	const hit = fresh(headCache.get(cacheKey), sig);
+	if (hit) return hit;
+
 	// Porcelain paths (and `git show`'s object syntax) are repo-root-relative.
-	const prefix = await runPrefix(root);
-	const content = await runGit(root, ['show', `HEAD:${prefix}${rel}`]);
-	if (content == null) return { isRepo: true, tracked: false, content: null };
+	const content = await runGit(root, ['show', `HEAD:${pre.prefix}${rel}`]);
+	let value: GitHeadFileResult;
+	if (content == null) value = { isRepo: true, tracked: false, content: null };
 	// A NUL byte means a binary blob; there is no line diff to draw.
-	if (content.includes('\0')) return { isRepo: true, tracked: false, content: null };
-	return { isRepo: true, tracked: true, content };
+	else if (content.includes('\0')) value = { isRepo: true, tracked: false, content: null };
+	else value = { isRepo: true, tracked: true, content };
+	headCache.set(cacheKey, { sig, at: Date.now(), value });
+	return value;
 }
 
 /** The 40-char all-zero SHA git blame uses for not-yet-committed local lines. */
@@ -315,18 +492,85 @@ function parseBlame(stdout: string): BlameLine[] {
  */
 export async function gitBlameFile(relPath: string): Promise<GitBlameFileResult> {
 	const root = workspaceRoot();
-	resolveInWorkspace(relPath); // throws if the path escapes the workspace
+	const abs = resolveInWorkspace(relPath); // throws if the path escapes the workspace
 	const rel = String(relPath ?? '').replace(/\\/g, '/');
 	if (!rel) throw new Error('path required');
 
-	if ((await runGit(root, ['rev-parse', '--is-inside-work-tree'])) == null) {
-		return { isRepo: false, tracked: false, lines: [] };
-	}
+	const pre = await preflight(root);
+	if (!pre.inside) return { isRepo: false, tracked: false, lines: [] };
+
+	// Blame changes on a working edit (file mtime) or a history move (index mtime);
+	// the signature+TTL cache collapses the per-focus/per-save burst without ever
+	// serving a result across a real edit.
+	const cacheKey = `${root}\0${rel}`;
+	const sig = cacheSig(abs, pre.gitDir);
+	const hit = fresh(blameFileCache.get(cacheKey), sig);
+	if (hit) return hit;
+
 	// `--incremental` off; `-w` ignores whitespace-only reblame noise. A file with
 	// no HEAD blob (untracked / newly added) makes blame fail → tracked:false.
 	const out = await runGit(root, ['blame', '--line-porcelain', '-w', '--', rel]);
-	if (out == null) return { isRepo: true, tracked: false, lines: [] };
-	return { isRepo: true, tracked: true, lines: parseBlame(out) };
+	const value: GitBlameFileResult =
+		out == null ? { isRepo: true, tracked: false, lines: [] } : { isRepo: true, tracked: true, lines: parseBlame(out) };
+	blameFileCache.set(cacheKey, { sig, at: Date.now(), value });
+	return value;
+}
+
+/**
+ * Parse `git blame -L … --line-porcelain` into a `Map<fileLine, BlameLine>`,
+ * keyed by the FINAL (current-file) line number the porcelain header reports.
+ *
+ * The whole-file `parseBlame` keys records by position because it blames every
+ * line 1..N in order; a ranged blame skips the gaps between `-L` ranges, so a
+ * record's array index no longer equals its file line. The header
+ * `<sha> <origLine> <finalLine> [count]` carries the answer directly — its
+ * second field is the current-file line — so we key on that and never depend on
+ * output being contiguous.
+ */
+function parseBlameByLine(stdout: string): Map<number, BlameLine> {
+	const byLine = new Map<number, BlameLine>();
+	let cur: { commit: string; line: number; author: string; authorTime: number; summary: string; notCommitted: boolean } | null =
+		null;
+	for (const raw of stdout.split('\n')) {
+		const m = /^([0-9a-f]{40}) \d+ (\d+)/.exec(raw);
+		if (m) {
+			const sha = m[1];
+			cur = { commit: sha, line: Number(m[2]), author: '', authorTime: 0, summary: '', notCommitted: sha === ZERO_SHA };
+			continue;
+		}
+		if (!cur) continue;
+		if (raw.startsWith('author ')) cur.author = raw.slice(7);
+		else if (raw.startsWith('author-time ')) cur.authorTime = Number(raw.slice(12)) * 1000;
+		else if (raw.startsWith('summary ')) cur.summary = raw.slice(8);
+		else if (raw.startsWith('\t')) {
+			byLine.set(cur.line, {
+				commit: cur.commit,
+				shortSha: cur.notCommitted ? null : cur.commit.slice(0, 7),
+				author: cur.author,
+				authorTime: cur.authorTime || null,
+				summary: cur.summary,
+				notCommitted: cur.notCommitted
+			});
+			cur = null;
+		}
+	}
+	return byLine;
+}
+
+/**
+ * Merge a set of 1-based file line numbers into minimal ascending contiguous
+ * ranges (`[start, end]` inclusive), so a cell's consecutive source lines become
+ * one `-L start,end` and the output gaps between cells are never blamed.
+ */
+function coalesceRanges(lineNums: number[]): Array<[number, number]> {
+	const sorted = Array.from(new Set(lineNums)).sort((a, b) => a - b);
+	const ranges: Array<[number, number]> = [];
+	for (const ln of sorted) {
+		const last = ranges[ranges.length - 1];
+		if (last && ln === last[1] + 1) last[1] = ln;
+		else ranges.push([ln, ln]);
+	}
+	return ranges;
 }
 
 /** A `Not Committed Yet` blame record for a cell with no committed source lines. */
@@ -349,7 +593,7 @@ function notCommittedRecord(): BlameLine {
  * caller then reports `tracked:false` (nothing to blame), like the HEAD route does
  * for an unparseable baseline.
  */
-function cellSourceLines(text: string): Map<string, number[]> | null {
+export function cellSourceLines(text: string): Map<string, number[]> | null {
 	let i = 0;
 	let line = 1;
 	const n = text.length;
@@ -504,21 +748,48 @@ export async function gitBlameNotebookCells(relPath: string): Promise<GitBlameNo
 	const rel = String(relPath ?? '').replace(/\\/g, '/');
 	if (!rel) throw new Error('path required');
 
-	if ((await runGit(root, ['rev-parse', '--is-inside-work-tree'])) == null) {
-		return { isRepo: false, tracked: false, cells: {} };
-	}
-	const out = await runGit(root, ['blame', '--line-porcelain', '-w', '--', rel]);
-	if (out == null) return { isRepo: true, tracked: false, cells: {} }; // untracked / no HEAD blob
-	const blame = parseBlame(out);
+	const pre = await preflight(root);
+	if (!pre.inside) return { isRepo: false, tracked: false, cells: {} };
 
+	const cacheKey = `${root}\0${rel}`;
+	const sig = cacheSig(abs, pre.gitDir);
+	const hit = fresh(blameNbCache.get(cacheKey), sig);
+	if (hit) return hit;
+
+	const cache = (value: GitBlameNotebookResult): GitBlameNotebookResult => {
+		blameNbCache.set(cacheKey, { sig, at: Date.now(), value });
+		return value;
+	};
+
+	// Read the on-disk bytes FIRST and map each cell to the physical file lines its
+	// `source` occupies. Cellar's deterministic clean-on-save (1-space indent, one
+	// JSON string per source array element on its own line) makes a string token's
+	// start line its git-blame line, so these numbers are exactly what `-L` wants.
 	let text: string;
 	try {
 		text = readFileSync(abs, 'utf8');
 	} catch {
-		return { isRepo: true, tracked: false, cells: {} };
+		return cache({ isRepo: true, tracked: false, cells: {} });
 	}
 	const cellLines = cellSourceLines(text);
-	if (!cellLines) return { isRepo: true, tracked: false, cells: {} };
+	if (!cellLines) return cache({ isRepo: true, tracked: false, cells: {} });
+
+	// Blame ONLY the source-line ranges, not the whole `.ipynb`. An output-heavy
+	// notebook has thousands of output lines that never need a blame record; `-L`
+	// keeps the blame (and the parse) proportional to source, not to output size.
+	const allLines: number[] = [];
+	for (const nums of cellLines.values()) allLines.push(...nums);
+	// When no cell has any source line, still probe line 1 so an untracked notebook
+	// (blame fails → tracked:false) is distinguished from a tracked one whose cells
+	// are all empty (tracked:true, every cell notCommitted).
+	const ranges = allLines.length ? coalesceRanges(allLines) : ([[1, 1]] as Array<[number, number]>);
+
+	const args = ['blame', '--line-porcelain', '-w'];
+	for (const [a, b] of ranges) args.push('-L', `${a},${b}`);
+	args.push('--', rel);
+	const out = await runGit(root, args);
+	if (out == null) return cache({ isRepo: true, tracked: false, cells: {} }); // untracked / no HEAD blob
+	const byLine = parseBlameByLine(out);
 
 	const cells: Record<string, BlameLine> = {};
 	for (const [id, lineNums] of cellLines) {
@@ -530,7 +801,7 @@ export async function gitBlameNotebookCells(relPath: string): Promise<GitBlameNo
 		let best: BlameLine | null = null;
 		let dirty = false;
 		for (const ln of lineNums) {
-			const rec = blame[ln - 1];
+			const rec = byLine.get(ln);
 			if (!rec) continue;
 			if (rec.notCommitted) { dirty = true; break; }
 			if (rec.authorTime == null) continue;
@@ -539,5 +810,5 @@ export async function gitBlameNotebookCells(relPath: string): Promise<GitBlameNo
 		// No source line at all (empty cell) is likewise treated as uncommitted.
 		cells[id] = dirty || !best ? notCommittedRecord() : best;
 	}
-	return { isRepo: true, tracked: true, cells };
+	return cache({ isRepo: true, tracked: true, cells });
 }
