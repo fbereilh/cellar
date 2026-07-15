@@ -1027,7 +1027,11 @@ export function getRunQueue(sessionId?: string) {
  * outputs. `run_queue` shows the pending list at any time; `interrupt_kernel` /
  * `restart_kernel` drop it, and a dropped run returns `status: "cancelled"`.
  */
-export async function runCell(id: string, nbArg?: string | null): Promise<Record<string, unknown> | null> {
+export async function runCell(
+	id: string,
+	nbArg?: string | null,
+	opts: { skipStaleness?: boolean } = {}
+): Promise<Record<string, unknown> | null> {
 	const nbAtCall = nbArg ?? getActiveNotebookPath();
 	// Accept a short handle / prefix as well as a full id; `id` is the full UUID from
 	// here on (queue keys, event tags, and setOutputs are all UUID-keyed).
@@ -1105,9 +1109,14 @@ export async function runCell(id: string, nbArg?: string | null): Promise<Record
 		const hiddenNote = isHidden(cell) ? { hidden: true } : {};
 		// The run may have made downstream cells stale (this one just re-ran) or
 		// cleared this cell's own staleness — surface its fresh verdict so a follow-up
-		// read is not needed just to see whether the run settled it.
-		const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness(nb);
-		return { id: outId, status, ran_this_session: isLiveSession(session, currentSessionId(nb)), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id], handleFn(nb)), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+		// read is not needed just to see whether the run settled it. In a BATCH this is
+		// skipped: `runCells` computes staleness ONCE over the post-batch notebook state
+		// instead of once per cell (O(N^2)→O(N)), so a mid-batch per-cell pass would be
+		// both redundant and superseded by the final snapshot.
+		const staleAnnotation = opts.skipStaleness
+			? {}
+			: staleFields((await getNotebookStaleness(nb)).cells[id], handleFn(nb));
+		return { id: outId, status, ran_this_session: isLiveSession(session, currentSessionId(nb)), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleAnnotation, ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and
 		// broadcast, so the wire order stays run:end → run:start. Running on EVERY exit
@@ -1171,19 +1180,23 @@ export async function addAndRun({ source, cellType = 'code', afterId, routeImpor
 }
 
 /**
- * The stale annotation an agent must act on, extracted from a runCell result
- * WITHOUT recomputing (runCell already ran the staleness pass and carries its
- * staleFields): only the stale-flag fields, mirroring the omit-when-default pattern.
- * A cell that just ran is fresh, so its (default) `stale_state` carries no signal
- * in a batch — we keep only `stale`/`stale_reason`/`stale_upstream`, present just
- * when the cell is STILL stale after the run (an upstream it needs was not run).
+ * The stale annotation an agent must act on, derived from the batch's SINGLE
+ * post-batch staleness snapshot (`getNotebookStaleness`, run once in `runCells`),
+ * NOT from a per-cell runCell pass — that pass is skipped in a batch: only the
+ * final whole-notebook snapshot is the correct end-state view. Mirrors the
+ * omit-when-default pattern: a cell that just ran is fresh, so its (default)
+ * `stale_state` carries no signal in a batch — we keep only
+ * `stale`/`stale_reason`/`stale_upstream`, present just when the cell is STILL
+ * stale after the batch (an upstream it needs was not run).
  */
-function pickStale(r: Record<string, unknown>): Record<string, unknown> {
-	if (r.stale !== true) return {};
+function pickStale(entry: StalenessEntry | undefined | null, toHandle: (id: string) => string): Record<string, unknown> {
+	const f = staleFields(entry, toHandle);
+	if (f.stale !== true) return {};
+	// Drop the always-present `stale_state`; keep only the stale-when-true fields.
 	return {
 		stale: true,
-		...(r.stale_reason != null ? { stale_reason: r.stale_reason } : {}),
-		...(Array.isArray(r.stale_upstream) ? { stale_upstream: r.stale_upstream } : {})
+		...(f.stale_reason != null ? { stale_reason: f.stale_reason } : {}),
+		...(f.stale_upstream != null ? { stale_upstream: f.stale_upstream } : {})
 	};
 }
 
@@ -1204,11 +1217,19 @@ function pickStale(r: Record<string, unknown>): Record<string, unknown> {
  * (runStatus is the single source of truth; never re-derive the epoch rule), not
  * runCell's raw jupyter `status` field.
  */
-function toBatchRecord(r: Record<string, unknown>, cell: CellView | null, nb: string): Record<string, unknown> {
+function toBatchRecord(
+	r: Record<string, unknown>,
+	cell: CellView | null,
+	nb: string,
+	staleMap: StalenessMap,
+	toHandle: (id: string) => string
+): Record<string, unknown> {
 	const outputs = r.outputs;
 	if (!Array.isArray(outputs)) return r;
 	const run_status = cell ? runStatus(cell, currentSessionId(nb)) : String(r.status);
-	const stale = pickStale(r);
+	// Stale state comes from the batch's single post-batch snapshot, keyed by the
+	// cell's FULL id (the snapshot is), not from the (skipped) per-run pass.
+	const stale = pickStale(cell ? staleMap[cell.id] : null, toHandle);
 	const errOut = outputs.find((o) => (o as { type?: string }).type === 'error') as
 		| { ename?: unknown; evalue?: unknown; text?: unknown; truncated?: unknown }
 		| undefined;
@@ -1240,22 +1261,38 @@ function toBatchRecord(r: Record<string, unknown>, cell: CellView | null, nb: st
  */
 export async function runCells(ids: string[], nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
+	// Run the whole batch first, deferring staleness: each runCell SKIPS its own
+	// per-cell staleness pass, so a batch drives O(N) executions and exactly ONE
+	// whole-notebook staleness computation at the end — not N of them (O(N^2)+ of
+	// redundant JS recompute over the definer graph on a large notebook). The
+	// post-batch snapshot is the correct end-state view for every cell that ran.
+	const runs: Array<{ r: Record<string, unknown>; cell: CellView | null }> = [];
+	for (const id of ids) {
+		const full = asFullId(target, id);
+		const r = await runCell(full, target, { skipStaleness: true });
+		const cell = getCell(full, target);
+		if (r) runs.push({ r, cell: cell ?? null });
+		// An interrupt/restart cancelled this queued run: the namespace the rest of
+		// the sequence was written against is gone, so stop. Staleness is still
+		// computed once below over exactly what actually ran.
+		if (r?.status === 'cancelled') break;
+	}
+	// ONE staleness pass for the entire batch, over the real post-batch notebook
+	// state (including an early stop): correct by construction, since it reads the
+	// live doc rather than replaying per-cell verdicts.
+	const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness(target);
+	const toHandle = handleFn(target);
 	const results: Array<Record<string, unknown>> = [];
 	let ran = 0;
 	let errored = 0;
-	for (const id of ids) {
-		const full = asFullId(target, id);
-		const r = await runCell(full, target);
-		const cell = getCell(full, target);
-		if (r && !(cell && isHidden(cell))) {
-			results.push(toBatchRecord(r, cell ?? null, target));
-			const outs = r.outputs;
-			if (Array.isArray(outs)) {
-				ran++;
-				if (outs.some((o) => (o as { type?: string }).type === 'error')) errored++;
-			}
+	for (const { r, cell } of runs) {
+		if (cell && isHidden(cell)) continue;
+		results.push(toBatchRecord(r, cell, target, stale, toHandle));
+		const outs = r.outputs;
+		if (Array.isArray(outs)) {
+			ran++;
+			if (outs.some((o) => (o as { type?: string }).type === 'error')) errored++;
 		}
-		if (r?.status === 'cancelled') break;
 	}
 	return { ran, errored, results };
 }
