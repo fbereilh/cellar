@@ -286,12 +286,58 @@ function capText(text: string, cap: number): { text: string; truncated: boolean 
 	return { text, truncated: false };
 }
 
+/**
+ * Collapse library-internal middle frames of a Python traceback so the parts that
+ * identify the culprit survive a cap: the exception header, EVERY user (notebook)
+ * frame, and the FIRST and LAST frames are always kept; a contiguous run of
+ * site-packages/stdlib frames between them becomes a `… N library frames elided …`
+ * marker. Deliberately conservative — it only acts when it can cleanly parse ≥4
+ * frame openers, and returns the text unchanged otherwise, so it never mangles a
+ * traceback it doesn't understand. The full, un-elided stack stays reachable via
+ * `get_full_output(id, size:'full')` (that path passes cap=Infinity, which skips
+ * this entirely).
+ */
+function elideTraceback(text: string): string {
+	const lines = text.split('\n');
+	// Frame openers across IPython + classic Python: "Cell In[N], line X",
+	// "File <path>:X, in ...", and '  File "<path>", line X, in ...'.
+	const isOpener = (l: string) => /^Cell In\[/.test(l) || /^File .+?:\d+/.test(l) || /^\s*File ".+?", line \d+/.test(l);
+	const starts: number[] = [];
+	for (let i = 0; i < lines.length; i++) if (isOpener(lines[i])) starts.push(i);
+	if (starts.length < 4) return text; // too few frames to be worth eliding / to parse confidently
+	const head = lines.slice(0, starts[0]);
+	// A block runs from its opener to the next opener (the last block also holds the
+	// trailing `ename: evalue` line), so always keeping the last block keeps the tail.
+	const blocks = starts.map((from, k) => lines.slice(from, k + 1 < starts.length ? starts[k + 1] : lines.length));
+	const isLibrary = (opener: string) => /site-packages|dist-packages|[/\\]lib[/\\]python|<frozen /.test(opener);
+	const out = [...head];
+	let elided = 0;
+	const flush = () => {
+		if (elided) out.push(`… ${elided} library frame${elided > 1 ? 's' : ''} elided …`);
+		elided = 0;
+	};
+	blocks.forEach((block, i) => {
+		const keep = i === 0 || i === blocks.length - 1 || !isLibrary(block[0]);
+		if (keep) {
+			flush();
+			out.push(...block);
+		} else {
+			elided++;
+		}
+	});
+	flush();
+	return out.join('\n');
+}
+
 function summarizeOutput(o: CellOutput, cap: number) {
 	const base: Record<string, unknown> = { type: o.output_type };
 	if (o.output_type === 'error') Object.assign(base, { ename: o.ename, evalue: o.evalue });
 	const img = imageKey(o);
 	if (img) base.image = img;
-	return { ...base, ...capText(outputText(o), cap) };
+	let text = outputText(o);
+	// Elide library frames only when capping; the full stack must survive size='full'.
+	if (o.output_type === 'error' && cap !== Infinity) text = elideTraceback(text);
+	return { ...base, ...capText(text, cap) };
 }
 
 const summarizeOutputs = (cell: CellView, cap: number) => (cell.outputs || []).map((o) => summarizeOutput(o, cap));
@@ -320,10 +366,7 @@ function readForm(cell: CellView, cap = READ_CAP, sid: SessionId | null = curren
 		...(isSqlCell(cell) ? { language: 'sql' } : {}),
 		source: cell.source,
 		run_status: runStatus(cell, sid),
-		ran_this_session: ranThisSession(cell, sid),
 		...staleFields(staleEntry),
-		has_output: hasOutput(cell),
-		visible: !isHidden(cell),
 		outputs: summarizeOutputs(cell, cap)
 	};
 }
@@ -439,32 +482,26 @@ export async function getNotebookMap(nb?: string | null) {
 	// A section node holds nested cell/section entries; a cell leaf is a plain record.
 	interface MapSection {
 		id: string;
-		kind: 'section';
 		type: 'markdown';
 		level: number;
 		title: string;
-		summary: string;
-		visible: boolean;
 		children: unknown[];
 	}
 	const root: unknown[] = [];
 	const stack: { node: MapSection; level: number }[] = [];
 	const leaf = (c: CellView) => ({
 		id: c.id,
-		kind: 'cell',
 		type: c.cell_type,
 		...(isSqlCell(c) ? { language: 'sql' } : {}),
 		summary: firstLine(c.source),
 		run_status: runStatus(c, sid),
-		ran_this_session: ranThisSession(c, sid),
 		...staleFields(stale[c.id]),
-		has_output: hasOutput(c),
-		visible: true
+		has_output: hasOutput(c)
 	});
 	for (const c of cells) {
 		const h = headerInfo(c);
 		if (h) {
-			const node: MapSection = { id: c.id, kind: 'section', type: 'markdown', level: h.level, title: h.title, summary: h.title, visible: true, children: [] };
+			const node: MapSection = { id: c.id, type: 'markdown', level: h.level, title: h.title, children: [] };
 			while (stack.length && stack[stack.length - 1].level >= h.level) stack.pop();
 			(stack.length ? stack[stack.length - 1].node.children : root).push(node);
 			stack.push({ node, level: h.level });
@@ -476,7 +513,11 @@ export async function getNotebookMap(nb?: string | null) {
 	// The `kernel` header reports THIS notebook's own session epoch, so it lines up
 	// with each cell's run_status/ran_this_session (each computed against the same
 	// per-notebook epoch), never against whichever notebook the user last focused.
-	return { notebook: view.path, kernel: kernelSession(nb), databricks: await databricksStatus(nb), cell_count: cells.length, sections: root };
+	// The map ships only whether a Databricks session is bound - the actionable
+	// "ask the user to connect" note lives on `databricks_status`/`get_kernel_state`,
+	// so we don't repeat ~150 chars of boilerplate on every map call.
+	const dbx = await databricksStatus(nb);
+	return { notebook: view.path, kernel: kernelSession(nb), databricks: { connected: dbx.connected === true }, cell_count: cells.length, sections: root };
 }
 
 /**
@@ -659,12 +700,13 @@ export function getErrors(nb?: string | null) {
 			if (o.output_type === 'error') {
 				errs.push({
 					id: c.id,
-					ran_this_session: ranThisSession(c, sid),
 					run_status: runStatus(c, sid),
 					...(kernelUnavailable(c, sid) ? { kernel_unavailable: true } : {}),
 					ename: o.ename,
 					evalue: o.evalue,
-					traceback: capText(stripAnsi((o.traceback || []).join('\n')), MEDIUM_CAP).text
+					// Multi-error SCAN tool: cap each stack at READ_CAP (not MEDIUM_CAP) and
+					// elide library frames - the truncation marker + get_full_output reach the rest.
+					traceback: capText(elideTraceback(stripAnsi((o.traceback || []).join('\n'))), READ_CAP).text
 				});
 			}
 		}
