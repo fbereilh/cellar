@@ -1509,23 +1509,22 @@
 		if (foldedIds.has(id) !== folded) toggleFold(id);
 	}
 
-	async function insertCell(where: 'above' | 'below') {
-		const i = cells.findIndex((c) => c.id === activeId);
-		if (where === 'below' || i < 0) {
-			const created = await addCell(activeId ?? cells.at(-1)?.id);
-			await selectAndFocus(created.id);
-			return;
-		}
-		if (i > 0) {
-			const created = await addCell(cells[i - 1].id);
-			await selectAndFocus(created.id);
-			return;
-		}
-		// Above the first cell: the API can only insert *after* an id, so append
-		// and move it to the top (one extra persist, same clean-on-save result).
-		const created = await addCell(cells.at(-1)?.id);
-		await moveCellToIndex(created.id, 0);
+	/**
+	 * Insert a fresh `cellType` cell directly above/below `targetId` (the selected
+	 * cell by default), then select and focus it. The ONE positional-insert path,
+	 * shared by the `a`/`b` command-mode shortcuts, the per-cell toolbar buttons,
+	 * and the hover-between "+" control. Reuses `insertCellAt`, which addresses an
+	 * absolute gap index and handles the top-of-notebook hoist (the add API can
+	 * only insert *after* an id), so every insertion is one positional path -
+	 * ids stay stable and the cell participates in run/dataflow/staleness like
+	 * any other. With no target (empty selection) it appends.
+	 */
+	async function insertCell(where: 'above' | 'below', targetId: string | null = activeId, cellType: CellType = 'code') {
+		const i = targetId ? cells.findIndex((c) => c.id === targetId) : -1;
+		const index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
+		const created = await insertCellAt(index, { cell_type: cellType, source: '' });
 		await selectAndFocus(created.id);
+		return created;
 	}
 
 	// Reordering moves the cell's DOM node and drops focus; restore it onto the
@@ -1788,6 +1787,7 @@
 			onEditorFocus={onEditorFocus}
 			onEditorBlur={onEditorBlur}
 			onAddCell={addCell}
+			onInsertCell={insertCell}
 		/>
 	</div>
 {/if}

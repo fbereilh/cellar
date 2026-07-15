@@ -63,6 +63,31 @@ describe('add / move / delete', () => {
 		expect(order).toEqual([c2.id, c1.id]);
 	});
 
+	it('inserts a cell at an absolute index (between cells), ids stay stable', () => {
+		const path = 'insert.ipynb';
+		nb.createNotebook(path); // seeds one empty code cell
+		const seed = nb.listCells(path)[0];
+		const last = nb.addCell(seed.id, 'code', path, null, 'last');
+		expect(nb.listCells(path).map((c) => c.id)).toEqual([seed.id, last.id]);
+
+		// Insert BETWEEN the two existing cells (index 1), not appended.
+		const mid = nb.addCellAt(1, 'code', path, null, 'middle');
+		const order = nb.listCells(path).map((c) => c.id);
+		expect(order).toEqual([seed.id, mid.id, last.id]);
+		// A fresh, distinct id; the existing ids are untouched.
+		expect(new Set(order).size).toBe(3);
+		expect(mid.id).not.toBe(seed.id);
+		expect(mid.id).not.toBe(last.id);
+
+		// Insert at the very top (index 0) and at the very end (clamped past length).
+		const top = nb.addCellAt(0, 'markdown', path, null, '# top');
+		const end = nb.addCellAt(999, 'code', path, null, 'end');
+		expect(nb.listCells(path).map((c) => c.id)).toEqual([top.id, seed.id, mid.id, last.id, end.id]);
+		// The inserted sources survive to disk in position.
+		expect(nb.getCell(mid.id, path)?.source).toBe('middle');
+		expect(nb.getCell(top.id, path)?.cell_type).toBe('markdown');
+	});
+
 	it('reflects an edit in the persisted document', () => {
 		const path = 'edit.ipynb';
 		nb.createNotebook(path);
