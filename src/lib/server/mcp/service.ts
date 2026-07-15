@@ -39,6 +39,7 @@ import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { isSqlCell } from '../../cellLanguage';
 import { IMG_MAX_EDGE, downscaleImageForBlock, imagePlaceholder } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
+import { computeHandles, resolveCellId } from './cellHandle';
 import type { CellView, CellOutput, SessionId, LogicalCellType, QueueState } from '../types';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
@@ -52,6 +53,54 @@ const stripAnsi = (s: string): string => (typeof s === 'string' ? s.replace(ANSI
 
 const isHidden = (c: CellView): boolean => c.metadata?.cellar?.hidden_from_agent === true;
 const visibleCells = (nb?: string | null): CellView[] => listCells(nb).filter((c) => !isHidden(c));
+
+// --- short cell-id handles --------------------------------------------------
+//
+// Every cell id emitted to the agent is a SHORT HANDLE (the shortest unique >=8
+// char prefix of the full UUID — see cellHandle.ts), not the 36-char UUID that is
+// stored in the .ipynb. Handles are computed over ALL of a notebook's cells (not
+// just the visible ones a response shows), so a handle is unique within the whole
+// document and `resolveRef` — which accepts a handle, any longer prefix, or the
+// full UUID — always maps it back to exactly the cell it named.
+
+/** Full-id → short-handle mapper for one notebook's current cells. */
+function handleFn(nb?: string | null): (id: string) => string {
+	const map = computeHandles(listCells(nb));
+	return (id: string) => map.get(id) ?? id;
+}
+
+/** The short handle for one full cell id in `nb` (falls back to the id itself). */
+export function handleFor(nb: string | null | undefined, fullId: string): string {
+	return handleFn(nb)(fullId);
+}
+
+/**
+ * Resolve a caller-supplied cell ref (short handle / longer prefix / full id) to a
+ * full cell id, best-effort. The MCP boundary (server.ts) already resolves refs and
+ * turns an ambiguous or unknown ref into an actionable tool error, so on the agent
+ * path this only ever sees a full id (an instant exact match). It exists so the
+ * service stays symmetric — the ids it EMITS (handles) can be fed straight back into
+ * the ids it ACCEPTS — for direct callers and internally-reused handles. An
+ * unresolvable ref is returned unchanged, preserving each function's existing
+ * "unknown id → null/false" contract (the lookup then simply misses).
+ */
+function asFullId(nb: string | null | undefined, ref: string): string {
+	try {
+		return resolveCellId(listCells(nb), ref);
+	} catch {
+		return ref;
+	}
+}
+
+/**
+ * Resolve an agent-supplied cell reference (a short handle, any longer prefix, or
+ * a full UUID) to the one full cell id it names, or throw an actionable error
+ * (ambiguous prefix / not found). Applied at the tool boundary (server.ts) so all
+ * downstream service + notebook code keeps working with full ids.
+ */
+export function resolveRef(nb: string | null | undefined, ref: string): string {
+	return resolveCellId(listCells(nb), ref);
+}
 
 // --- per-MCP-session working notebook ---------------------------------------
 //
@@ -354,25 +403,36 @@ const summarizeOutputs = (cell: CellView, cap: number) => (cell.outputs || []).m
  * n/a); a stale cell additionally carries WHY and the upstream cell ids that made
  * it stale, so an agent knows exactly what to re-run before trusting the output.
  */
-function staleFields(entry: StalenessEntry | undefined | null): Record<string, unknown> {
+function staleFields(
+	entry: StalenessEntry | undefined | null,
+	toHandle: (id: string) => string = (x) => x
+): Record<string, unknown> {
 	if (!entry) return {};
 	const out: Record<string, unknown> = { stale_state: entry.state };
 	if (entry.state === STALE_STATE.STALE) {
 		out.stale = true;
 		out.stale_reason = entry.reason;
-		if (entry.upstream?.length) out.stale_upstream = entry.upstream;
+		// The upstream cell ids the agent must re-run are handles too, so they can be
+		// passed straight back to run_cell / read_cell.
+		if (entry.upstream?.length) out.stale_upstream = entry.upstream.map(toHandle);
 	}
 	return out;
 }
 
-function readForm(cell: CellView, cap = READ_CAP, sid: SessionId | null = currentSessionId(), staleEntry: StalenessEntry | null = null) {
+function readForm(
+	cell: CellView,
+	cap = READ_CAP,
+	sid: SessionId | null = currentSessionId(),
+	staleEntry: StalenessEntry | null = null,
+	toHandle: (id: string) => string = (x) => x
+) {
 	return {
-		id: cell.id,
+		id: toHandle(cell.id),
 		type: cell.cell_type,
 		...(isSqlCell(cell) ? { language: 'sql' } : {}),
 		source: cell.source,
 		run_status: runStatus(cell, sid),
-		...staleFields(staleEntry),
+		...staleFields(staleEntry, toHandle),
 		outputs: summarizeOutputs(cell, cap)
 	};
 }
@@ -495,19 +555,20 @@ export async function getNotebookMap(nb?: string | null) {
 	}
 	const root: unknown[] = [];
 	const stack: { node: MapSection; level: number }[] = [];
+	const toHandle = handleFn(nb);
 	const leaf = (c: CellView) => ({
-		id: c.id,
+		id: toHandle(c.id),
 		type: c.cell_type,
 		...(isSqlCell(c) ? { language: 'sql' } : {}),
 		summary: firstLine(c.source),
 		run_status: runStatus(c, sid),
-		...staleFields(stale[c.id]),
+		...staleFields(stale[c.id], toHandle),
 		has_output: hasOutput(c)
 	});
 	for (const c of cells) {
 		const h = headerInfo(c);
 		if (h) {
-			const node: MapSection = { id: c.id, type: 'markdown', level: h.level, title: h.title, children: [] };
+			const node: MapSection = { id: toHandle(c.id), type: 'markdown', level: h.level, title: h.title, children: [] };
 			while (stack.length && stack[stack.length - 1].level >= h.level) stack.pop();
 			(stack.length ? stack[stack.length - 1].node.children : root).push(node);
 			stack.push({ node, level: h.level });
@@ -566,11 +627,12 @@ export function inspectVariable(name: string, nb?: string | null) {
  */
 async function staleCells(nb?: string | null) {
 	const { cells }: { cells: StalenessMap } = await getNotebookStaleness(nb);
+	const toHandle = handleFn(nb);
 	const out: Array<{ id: string; reason?: string; upstream?: string[] }> = [];
 	for (const c of visibleCells(nb)) {
 		const e = cells[c.id];
 		if (e?.state === STALE_STATE.STALE) {
-			out.push({ id: c.id, reason: e.reason, ...(e.upstream?.length ? { upstream: e.upstream } : {}) });
+			out.push({ id: toHandle(c.id), reason: e.reason, ...(e.upstream?.length ? { upstream: e.upstream.map(toHandle) } : {}) });
 		}
 	}
 	return out;
@@ -596,10 +658,11 @@ export const databricks = {
 };
 
 export async function readCell(id: string, nb?: string | null) {
-	const c = getCell(id, nb);
+	const full = asFullId(nb, id);
+	const c = getCell(full, nb);
 	if (!c || isHidden(c)) return null;
 	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
-	return readForm(c, READ_CAP, sid, stale[id]);
+	return readForm(c, READ_CAP, sid, stale[full], handleFn(nb));
 }
 
 /**
@@ -610,11 +673,13 @@ export async function readCell(id: string, nb?: string | null) {
  */
 export async function readCells(ids: string[], nb?: string | null) {
 	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
+	const toHandle = handleFn(nb);
 	return ids
 		.map((id) => {
-			const c = getCell(id, nb);
+			const full = asFullId(nb, id);
+			const c = getCell(full, nb);
 			if (!c || isHidden(c)) return null;
-			return readForm(c, READ_CAP, sid, stale[id]);
+			return readForm(c, READ_CAP, sid, stale[full], toHandle);
 		})
 		.filter(Boolean);
 }
@@ -633,19 +698,20 @@ export async function readByLocation({ index, position, relativeTo, direction }:
 	else if (position === 'first') target = cells[0];
 	else if (position === 'last') target = cells[cells.length - 1];
 	else if (relativeTo) {
-		const i = cells.findIndex((c) => c.id === relativeTo);
+		const rel = asFullId(nb, relativeTo);
+		const i = cells.findIndex((c) => c.id === rel);
 		if (i < 0) return null;
 		target = direction === 'prev' ? cells[i - 1] : cells[i + 1];
 	}
 	if (!target) return null;
 	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
-	return readForm(target, READ_CAP, sid, stale[target.id]);
+	return readForm(target, READ_CAP, sid, stale[target.id], handleFn(nb));
 }
 
 /** Cells under a markdown header (until the next same-or-higher header). */
 export async function readSection(headerId: string, nb?: string | null) {
 	const cells = visibleCells(nb);
-	const idx = cells.findIndex((c) => c.id === headerId);
+	const idx = cells.findIndex((c) => c.id === asFullId(nb, headerId));
 	if (idx < 0) return null;
 	const h = headerInfo(cells[idx]);
 	if (!h) return null;
@@ -657,7 +723,8 @@ export async function readSection(headerId: string, nb?: string | null) {
 	}
 	// One sampled epoch + staleness pass for the whole section (see readCells).
 	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
-	return { header: { id: cells[idx].id, level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid, stale[c.id])) };
+	const toHandle = handleFn(nb);
+	return { header: { id: toHandle(cells[idx].id), level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid, stale[c.id], toHandle)) };
 }
 
 /**
@@ -669,6 +736,7 @@ export function searchCells(query: string, where: 'input' | 'output' | 'both' = 
 	const q = (query || '').toLowerCase();
 	if (!q) return [];
 	const sid = currentSessionId(nb);
+	const toHandle = handleFn(nb);
 	const results: Array<{ id: string; where: string; ran_this_session: boolean; snippet: string }> = [];
 	const snippet = (text: string): string | null => {
 		const i = text.toLowerCase().indexOf(q);
@@ -680,12 +748,12 @@ export function searchCells(query: string, where: 'input' | 'output' | 'both' = 
 		const live = ranThisSession(c, sid);
 		if (where === 'input' || where === 'both') {
 			const s = snippet(c.source || '');
-			if (s) results.push({ id: c.id, where: 'input', ran_this_session: live, snippet: s });
+			if (s) results.push({ id: toHandle(c.id), where: 'input', ran_this_session: live, snippet: s });
 		}
 		if (where === 'output' || where === 'both') {
 			const otext = (c.outputs || []).map(outputText).join('\n');
 			const s = snippet(otext);
-			if (s) results.push({ id: c.id, where: 'output', ran_this_session: live, snippet: s });
+			if (s) results.push({ id: toHandle(c.id), where: 'output', ran_this_session: live, snippet: s });
 		}
 	}
 	return results;
@@ -700,12 +768,13 @@ export function searchCells(query: string, where: 'input' | 'output' | 'both' = 
  */
 export function getErrors(nb?: string | null) {
 	const sid = currentSessionId(nb);
+	const toHandle = handleFn(nb);
 	const errs: Array<Record<string, unknown>> = [];
 	for (const c of visibleCells(nb)) {
 		for (const o of c.outputs || []) {
 			if (o.output_type === 'error') {
 				errs.push({
-					id: c.id,
+					id: toHandle(c.id),
 					run_status: runStatus(c, sid),
 					...(kernelUnavailable(c, sid) ? { kernel_unavailable: true } : {}),
 					ename: o.ename,
@@ -726,7 +795,7 @@ export function getErrors(nb?: string | null) {
  * - they describe a namespace that no longer exists.
  */
 export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium', nb?: string | null) {
-	const c = getCell(id, nb);
+	const c = getCell(asFullId(nb, id), nb);
 	if (!c || isHidden(c)) return null;
 	const cap = size === 'full' ? Infinity : MEDIUM_CAP;
 	const outputs: Array<Record<string, unknown>> = (c.outputs || []).map((o) => {
@@ -743,7 +812,7 @@ export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium', nb
 		}
 		return summarizeOutput(o, cap);
 	});
-	return { id: c.id, size, ran_this_session: ranThisSession(c, currentSessionId(nb)), outputs };
+	return { id: handleFor(nb, c.id), size, ran_this_session: ranThisSession(c, currentSessionId(nb)), outputs };
 }
 
 // --- write ------------------------------------------------------------------
@@ -788,10 +857,11 @@ function routeOne(
  * and this run belongs to the notebook the code was written into.
  */
 async function finishImportRouting(nb: string, cellId: string | null, added: string[]) {
-	if (!added.length) return { cell_id: cellId, added: [] as string[], note: 'already present in the imports cell; removed from your code' };
+	const handle = cellId == null ? cellId : handleFor(nb, cellId);
+	if (!added.length) return { cell_id: handle, added: [] as string[], note: 'already present in the imports cell; removed from your code' };
 	const run = await runImportsCell(nb, 'agent');
 	return {
-		cell_id: cellId,
+		cell_id: handle,
 		added,
 		run_status: run?.status ?? 'not_run',
 		// A failed imports cell (a missing package) is surfaced, never swallowed:
@@ -862,11 +932,14 @@ export async function addCells(
 		anchor = cell.id;
 	}
 	const imports = importsCellId ? await finishImportRouting(nb, importsCellId, added) : null;
-	return { ids: created, ...(imports ? { imports } : {}) };
+	// Emit handles (short prefixes) for the created cells; the .ipynb keeps the UUIDs.
+	const toHandle = handleFn(nb);
+	return { ids: created.map(toHandle), ...(imports ? { imports } : {}) };
 }
 
 export async function editCell(id: string, source: string, { routeImports: routeEnabled = true, nb: nbArg }: { routeImports?: boolean; nb?: string | null } = {}) {
 	const nb = nbArg ?? getActiveNotebookPath();
+	id = asFullId(nb, id);
 	const cell = getCell(id, nb);
 	if (!cell) return null;
 	autoCheckpointBeforeAgentAction(nb);
@@ -876,11 +949,12 @@ export async function editCell(id: string, source: string, { routeImports: route
 	const routed = routeOne(source, nb, { routeEnabled, cellType: logicalType, skipCellId: id });
 	setSource(id, routed ? routed.source : source, nb);
 	const imports = routed ? await finishImportRouting(nb, routed.importsCellId, routed.added) : null;
-	return { ok: true, id, ...(imports ? { imports } : {}) };
+	return { ok: true, id: handleFor(nb, id), ...(imports ? { imports } : {}) };
 }
 
 export function removeCell(id: string, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
+	id = asFullId(target, id);
 	if (!getCell(id, target)) return false;
 	autoCheckpointBeforeAgentAction(target);
 	deleteCell(id, target);
@@ -890,11 +964,12 @@ export function removeCell(id: string, nb?: string | null) {
 export function moveCell(id: string, pos: number, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	autoCheckpointBeforeAgentAction(target);
-	return moveCellTo(id, pos, target);
+	return moveCellTo(asFullId(target, id), pos, target);
 }
 
 export function setType(id: string, type: LogicalCellType, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
+	id = asFullId(target, id);
 	if (!getCell(id, target)) return false;
 	autoCheckpointBeforeAgentAction(target);
 	setCellType(id, type, target);
@@ -902,7 +977,8 @@ export function setType(id: string, type: LogicalCellType, nb?: string | null) {
 }
 
 export function setCellVisibility(id: string, hidden: boolean, nb?: string | null) {
-	return setVisibility(id, hidden, nb ?? getActiveNotebookPath());
+	const target = nb ?? getActiveNotebookPath();
+	return setVisibility(asFullId(target, id), hidden, target);
 }
 
 // --- execute ----------------------------------------------------------------
@@ -920,7 +996,15 @@ export function getRunQueue(sessionId?: string) {
 	const workingAbs = targetFor(sessionId);
 	const byAbs = queuesByNotebook();
 	const notebooks: Record<string, QueueState> = {};
-	for (const [abs, state] of Object.entries(byAbs)) notebooks[workspaceRelative(abs)] = state;
+	for (const [abs, state] of Object.entries(byAbs)) {
+		// Each entry's cellId is emitted as that notebook's short handle so the agent
+		// can pass it straight back to run_cell / read_cell.
+		const h = handleFn(abs);
+		notebooks[workspaceRelative(abs)] = {
+			running: state.running ? { ...state.running, cellId: h(state.running.cellId) } : null,
+			queue: state.queue.map((e) => ({ ...e, cellId: h(e.cellId) }))
+		};
+	}
 	return { working: workspaceRelative(workingAbs), notebooks };
 }
 
@@ -956,8 +1040,14 @@ export function getRunQueue(sessionId?: string) {
  */
 export async function runCell(id: string, nbArg?: string | null): Promise<Record<string, unknown> | null> {
 	const nbAtCall = nbArg ?? getActiveNotebookPath();
+	// Accept a short handle / prefix as well as a full id; `id` is the full UUID from
+	// here on (queue keys, event tags, and setOutputs are all UUID-keyed).
+	id = asFullId(nbAtCall, id);
 	const c = getCell(id, nbAtCall);
 	if (!c) return null;
+	// The agent addresses cells by short handle; every result echoes the handle, not
+	// the stored full UUID.
+	const outId = handleFor(nbAtCall, id);
 	// Snapshot before this agent run so it can be undone (throttled: one checkpoint
 	// per N agent actions, not one per cell). Captures the pre-run outputs.
 	autoCheckpointBeforeAgentAction(nbAtCall);
@@ -968,9 +1058,9 @@ export async function runCell(id: string, nbArg?: string | null): Promise<Record
 		// every open tab flips this cell to its rendered view (no originId: an agent
 		// run has none, so every tab renders it).
 		publish({ type: 'cell:rendered', nb: nbAtCall, cellId: id });
-		return { id, status: 'rendered', note: 'markdown cell rendered (no kernel execution)' };
+		return { id: outId, status: 'rendered', note: 'markdown cell rendered (no kernel execution)' };
 	}
-	if (c.cell_type !== 'code') return { id, status: 'skipped', note: 'not a code cell' };
+	if (c.cell_type !== 'code') return { id: outId, status: 'skipped', note: 'not a code cell' };
 	// Pin the notebook now: the UI may focus another one while we wait in the
 	// queue, and this run must land in the document it was requested against.
 	const nb = nbAtCall;
@@ -981,8 +1071,8 @@ export async function runCell(id: string, nbArg?: string | null): Promise<Record
 		// "running" are both "accepted, not finished", and neither is an error.
 		const position = queuePosition(nb, id);
 		return position
-			? { id, status: 'queued', queue_position: position, note: `already queued at position ${position}; its source was refreshed to the current one. It will run when the kernel frees.` }
-			: { id, status: 'running', queue_position: 0, note: 'already executing in the kernel right now; not enqueued again.' };
+			? { id: outId, status: 'queued', queue_position: position, note: `already queued at position ${position}; its source was refreshed to the current one. It will run when the kernel frees.` }
+			: { id: outId, status: 'running', queue_position: 0, note: 'already executing in the kernel right now; not enqueued again.' };
 	}
 	// Clear this cell's stale output the moment it is queued (an agent run carries no
 	// originId, so every open tab empties it right away), rather than leaving the
@@ -996,14 +1086,14 @@ export async function runCell(id: string, nbArg?: string | null): Promise<Record
 		// A restart / interrupt / rebind dropped this pending run before any kernel
 		// touched it: nothing executed, nothing to persist, no lastRun stamp.
 		const reason = (err as { reason?: string })?.reason ?? 'cancelled';
-		return { id, status: 'cancelled', reason, ran_this_session: false, note: 'the queued run was dropped before it started (the kernel was interrupted or restarted).' };
+		return { id: outId, status: 'cancelled', reason, ran_this_session: false, note: 'the queued run was dropped before it started (the kernel was interrupted or restarted).' };
 	}
 	const queuedInfo = queuedAt ? { queued: true, queue_position: acceptedPosition, waited_ms: Date.now() - queuedAt } : {};
 
 	try {
 		// Re-read the cell: it may have been edited (or deleted) while queued.
 		const cell = getCell(id, nb);
-		if (!cell) return { id, status: 'cancelled', reason: 'cell_removed', ran_this_session: false, ...queuedInfo };
+		if (!cell) return { id: outId, status: 'cancelled', reason: 'cell_removed', ran_this_session: false, ...queuedInfo };
 		// One shared execution core with the UI route and the imports cell (`run.js`):
 		// execute, persist, stamp the kernel-session epoch, broadcast the lifecycle.
 		const { outputs, status, session, kernelDown } = await executeCellRun({
@@ -1017,7 +1107,7 @@ export async function runCell(id: string, nbArg?: string | null): Promise<Record
 		// cleared this cell's own staleness — surface its fresh verdict so a follow-up
 		// read is not needed just to see whether the run settled it.
 		const { cells: stale }: { cells: StalenessMap } = await getNotebookStaleness(nb);
-		return { id, status, ran_this_session: isLiveSession(session, currentSessionId(nb)), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id]), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+		return { id: outId, status, ran_this_session: isLiveSession(session, currentSessionId(nb)), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id], handleFn(nb)), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and
 		// broadcast, so the wire order stays run:end → run:start.
@@ -1059,7 +1149,9 @@ export async function addAndRun({ source, cellType = 'code', afterId, routeImpor
 	if (routed && imports && !body.trim()) {
 		// The submitted code was nothing but imports. They now live in the imports
 		// cell; an empty cell beside it would be litter, so report that cell instead.
-		const cell = imports.cell_id ? getCell(imports.cell_id, nb) : null;
+		// `imports.cell_id` is a short handle (emitted) — look the cell up by the FULL
+		// id `routeOne` returned, not the handle.
+		const cell = routed.importsCellId ? getCell(routed.importsCellId, nb) : null;
 		return {
 			id: imports.cell_id,
 			status: ('run_status' in imports ? imports.run_status : undefined) ?? 'skipped',
@@ -1072,9 +1164,9 @@ export async function addAndRun({ source, cellType = 'code', afterId, routeImpor
 	}
 	// Routing already happened (once), so the add must not route a second time.
 	const { ids } = await addCells([{ cell_type: cellType, source: body }], afterId, { routeImports: false, nb });
-	const id = ids[0];
-	const result = await runCell(id, nb);
-	return { id, ...result, ...(imports ? { imports } : {}) };
+	// addCells emits a handle; runCell accepts it (resolves it back to the full id).
+	const result = await runCell(ids[0], nb);
+	return { id: ids[0], ...result, ...(imports ? { imports } : {}) };
 }
 
 /**
@@ -1151,8 +1243,9 @@ export async function runCells(ids: string[], nb?: string | null) {
 	let ran = 0;
 	let errored = 0;
 	for (const id of ids) {
-		const r = await runCell(id, target);
-		const cell = getCell(id, target);
+		const full = asFullId(target, id);
+		const r = await runCell(full, target);
+		const cell = getCell(full, target);
 		if (r && !(cell && isHidden(cell))) {
 			results.push(toBatchRecord(r, cell ?? null, target));
 			const outs = r.outputs;
@@ -1194,8 +1287,10 @@ export async function runStale(nb?: string | null) {
 export async function runRange(fromId: string, toId: string, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	const all = listCells(target);
-	const i = all.findIndex((c) => c.id === fromId);
-	const j = all.findIndex((c) => c.id === toId);
+	const from = asFullId(target, fromId);
+	const to = asFullId(target, toId);
+	const i = all.findIndex((c) => c.id === from);
+	const j = all.findIndex((c) => c.id === to);
 	if (i < 0 || j < 0) return { ran: 0, errored: 0, results: [] as Array<Record<string, unknown>> };
 	const [lo, hi] = i <= j ? [i, j] : [j, i];
 	const ids = all.slice(lo, hi + 1).filter((c) => c.cell_type === 'code').map((c) => c.id);

@@ -126,7 +126,9 @@ describe('get_full_output default-vs-full image contract', () => {
 		svc.useNotebook('imgSess', NB); // open-or-create so the doc exists on disk
 		const nb = nbmod.resolveNotebookPath(NB);
 		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'fig' }], null, { nb, routeImports: false });
-		const id = ids[0];
+		// addCells emits a short handle; setOutputs below is a UUID-keyed notebook op,
+		// so resolve to the full id (getFullOutput accepts either).
+		const id = svc.resolveRef(nb, ids[0]);
 
 		const bigB64 = makePngB64(1600, 1200);
 		nbmod.setOutputs(id, [{ output_type: 'display_data', data: { 'image/png': bigB64 }, metadata: {} }], nb);
