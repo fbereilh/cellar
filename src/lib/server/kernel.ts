@@ -74,6 +74,14 @@ interface NotebookKernel {
 	sessionId: number;
 	/** Cell executions run in this notebook's current epoch (internal probes excluded). */
 	execsThisSession: number;
+	/**
+	 * How many USER (non-internal) runs are currently executing on this kernel.
+	 * Gates the status broadcast: a busy/idle flip is fanned out to the Kernels
+	 * sidebar only while this is > 0. Flips caused solely by internal work — inspect/
+	 * variable probes and the startup injections — leave it at 0, so they never
+	 * flicker a card nor fan a redundant snapshot out to every open tab.
+	 */
+	userRuns: number;
 	/** The autorestart status handler, identity-guarded to THIS connection. */
 	statusHandler: StatusListener | null;
 	/**
@@ -503,15 +511,71 @@ export function listKernels(): KernelListEntry[] {
 }
 
 /**
- * Broadcast the full kernel list to every open tab as a global SSE snapshot
- * (`kernel:status`), so the Kernels sidebar reflects a start / busy / idle /
- * restart / shutdown with no reload. Like `queue:changed` it is a FULL snapshot
- * carrying no `seq`, so a missed broadcast self-heals on the next one. Called on
- * every kernel lifecycle transition and, via `statusChanged`, on every idle/busy
- * flip so two notebooks running at once show two busy cards independently.
+ * Kernel-status broadcast — deduped, with a coalescing (debounced) fast path.
+ *
+ * The Kernels sidebar reflects a start / busy / idle / restart / shutdown by
+ * reading a full `kernel:status` snapshot (like `queue:changed`, no `seq`, so a
+ * missed one self-heals). Two problems this layer solves:
+ *   1. REDUNDANCY — the internal-probe / startup-injection busy/idle flurry, and
+ *      repeated lifecycle calls, would each fan the SAME snapshot out to every open
+ *      tab. `emitKernelStatus` skips a snapshot byte-identical to the last one sent,
+ *      so an unchanged status never fans out. Seeding a fresh tab is independent
+ *      (the SSE route calls `listKernels()` on connect; the client replays the last
+ *      snapshot to a late in-tab subscriber), so a skipped duplicate is always safe.
+ *   2. BURSTS — a single run produces several flips (busy → … → idle). The
+ *      high-frequency path (`scheduleKernelStatus`, used by the `statusChanged`
+ *      handler and user-run boundaries) COALESCES a burst into one trailing
+ *      broadcast that captures the final state.
+ */
+let lastStatusSnapshot: string | null = null;
+let statusDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Debounce window for the coalesced status path (ms). Overridable so tests drive it. */
+function statusDebounceMs(): number {
+	const raw = process.env.CELLAR_KERNEL_STATUS_DEBOUNCE_MS;
+	if (raw == null || raw === '') return 80;
+	const n = Number(raw);
+	return Number.isFinite(n) && n >= 0 ? n : 80;
+}
+
+/** Fan the current kernel list out, unless it is byte-identical to the last one sent. */
+function emitKernelStatus(): void {
+	const kernelList = listKernels();
+	const snapshot = JSON.stringify(kernelList);
+	if (snapshot === lastStatusSnapshot) return; // nothing changed — no fan-out
+	lastStatusSnapshot = snapshot;
+	publishGlobal({ type: 'kernel:status', kernels: kernelList });
+}
+
+/**
+ * Broadcast the kernel list NOW (deduped). Used by lifecycle transitions
+ * (start / restart / shutdown / cull / rebind) — infrequent single events that
+ * should reach tabs promptly. Cancels any pending coalesced broadcast, since this
+ * one already carries the change.
  */
 export function publishKernelStatus(): void {
-	publishGlobal({ type: 'kernel:status', kernels: listKernels() });
+	if (statusDebounceTimer) {
+		clearTimeout(statusDebounceTimer);
+		statusDebounceTimer = null;
+	}
+	emitKernelStatus();
+}
+
+/**
+ * Broadcast the kernel list soon, coalescing a burst into ONE trailing message.
+ * The high-frequency path: the `statusChanged` handler's user-run busy/idle flips
+ * and the end-of-run boundary. A pending broadcast absorbs further calls and
+ * captures the latest snapshot when it fires, so a run's flurry of flips collapses
+ * to a single wire message.
+ */
+function scheduleKernelStatus(): void {
+	if (statusDebounceTimer) return; // one already queued — it captures the latest state at fire time
+	statusDebounceTimer = setTimeout(() => {
+		statusDebounceTimer = null;
+		emitKernelStatus();
+	}, statusDebounceMs());
+	// Never keep the Node process alive just to flush a status snapshot.
+	statusDebounceTimer.unref?.();
 }
 
 /**
@@ -641,16 +705,29 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 }
 
 async function initKernel(kernel: KernelConnection): Promise<void> {
-	await runSilent(kernel, STARTUP_CODE);
-	await runSilent(kernel, DATAFRAME_FORMATTER_CODE);
-	// Register the %restart_python line magic (managed restart via the control comm).
-	await runSilent(kernel, RESTART_MAGIC_CODE);
+	// Coalesce every startup injection into ONE round-trip in front of the first
+	// user result. Each block is independently guarded (a matplotlib/pandas/IPython
+	// failure degrades to a no-op) and defines-then-`del`s its own private temp
+	// names, so they compose cleanly as consecutive top-level statements — running
+	// them as one silent exec, rather than four serial `execute_reply`s, gets the
+	// kernel ready sooner without dropping anything they establish. Runs on every
+	// fresh start AND after a restart/autorestart (which clears the namespace, the
+	// matplotlib backend, the DataFrame formatter, the magic, and sys.path).
+	const parts = [
+		// matplotlib inline backend → Figures emit image/png, not their text repr.
+		STARTUP_CODE,
+		// The Cellar DataFrame/Series display formatter (interactive grid mimetype).
+		DATAFRAME_FORMATTER_CODE,
+		// The %restart_python line magic (managed restart via the control comm).
+		RESTART_MAGIC_CODE
+	];
 	// Add the workspace root to sys.path so a notebook in any subfolder can import
 	// project modules (and the `.py` module the export writes at the root). Gated by
 	// the per-workspace setting (default ON) and re-read here so a restart /
-	// autorestart, which resets sys.path along with the namespace, re-applies the
-	// current choice. Idempotent — never inserts a duplicate (see projectRoot.ts).
-	if (addProjectRootToPath()) await runSilent(kernel, projectRootAddCode(workspaceRoot()));
+	// autorestart re-applies the current choice. Idempotent — never inserts a
+	// duplicate (see projectRoot.ts).
+	if (addProjectRootToPath()) parts.push(projectRootAddCode(workspaceRoot()));
+	await runSilent(kernel, parts.join('\n\n'));
 }
 
 /**
@@ -686,6 +763,7 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		connection: null,
 		sessionId: 0,
 		execsThisSession: 0,
+		userRuns: 0,
 		statusHandler: null,
 		widgetComms: new Map(),
 		activeRuns: new Set()
@@ -729,9 +807,17 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		// autorestart clears the namespace AND the matplotlib backend.
 		nbKernel.statusHandler = (_sender, status) => {
 			if (nbKernel.connection !== kernel) return;
-			// Every idle/busy flip reaches the Kernels sidebar so parallel runs show
-			// their own busy cards independently.
-			publishKernelStatus();
+			// Fan a flip out only when it can matter to a user:
+			//   - a lifecycle transition (restarting / autorestarting / dead / …)
+			//     always broadcasts;
+			//   - a plain busy/idle flip broadcasts only while a USER run is in flight,
+			//     so two notebooks running at once still show their own busy cards
+			//     independently — but a flip caused solely by an internal probe
+			//     (inspect/variables) or a startup injection (userRuns === 0) is
+			//     suppressed, never flickering a card nor fanning out to every tab.
+			// The broadcast is coalesced so a run's flurry of flips collapses to one.
+			const isBusyIdle = status === 'idle' || status === 'busy';
+			if (!isBusyIdle || nbKernel.userRuns > 0) scheduleKernelStatus();
 			if (status !== 'autorestarting') return;
 			logWarn('kernel', `kernel for ${nbPath} died and was autorestarted; namespace cleared`);
 			beginSession(nbKernel);
@@ -977,7 +1063,11 @@ export async function execute(
 	const kernel = await getKernel(abs);
 	const nbKernel = kernels.get(abs)!;
 	const session = nbKernel.sessionId;
-	if (!internal) nbKernel.execsThisSession += 1;
+	if (!internal) {
+		nbKernel.execsThisSession += 1;
+		// A USER run: its busy/idle flips must reach the sidebar (see statusHandler).
+		nbKernel.userRuns += 1;
+	}
 	onEvent({ type: 'kernel', id: kernel.id, session });
 
 	const future = kernel.requestExecute({ code, stop_on_error: false });
@@ -1096,6 +1186,13 @@ export async function execute(
 		settled = true;
 		if (watchdogTimer) clearTimeout(watchdogTimer);
 		nbKernel.activeRuns.delete(run);
+		if (!internal) {
+			nbKernel.userRuns -= 1;
+			// Reflect the now-idle kernel promptly, without depending on the idle
+			// `statusChanged` flip's timing (it can land after userRuns hit 0 and be
+			// suppressed). Coalesced + deduped, so this is at most one extra broadcast.
+			scheduleKernelStatus();
+		}
 		// On an abort (watchdog trip or restart) the future is still live, awaiting a
 		// reply that may never arrive: dispose it so its handlers detach. A future that
 		// completed normally has already disposed itself, so only dispose when aborted.

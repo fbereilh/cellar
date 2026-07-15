@@ -122,8 +122,10 @@ describe('%restart_python — managed restart trigger', () => {
 	it('injects the restart magic + control comm target at kernel startup', async () => {
 		await execute('/ws/inject.ipynb', 'x=1', noop);
 		const entry = entryFor('/ws/inject.ipynb');
-		// initKernel ran the magic registration silently on first start…
-		expect(entry.codes).toContain(RESTART_MAGIC_CODE);
+		// initKernel ran the magic registration silently on first start — the startup
+		// injections are coalesced into ONE exec, so the magic rides inside a combined
+		// setup string rather than its own round-trip.
+		expect(entry.codes.some((c: string) => c.includes(RESTART_MAGIC_CODE))).toBe(true);
 		// …and registered the control comm target so a restart signal can land.
 		expect(entry.targets.has(CONTROL_COMM_TARGET)).toBe(true);
 	});
