@@ -1063,23 +1063,34 @@ export async function runCell(id: string, nbArg?: string | null): Promise<Record
 			? { id: outId, status: 'queued', queue_position: position, note: `already queued at position ${position}; its source was refreshed to the current one. It will run when the kernel frees.` }
 			: { id: outId, status: 'running', queue_position: 0, note: 'already executing in the kernel right now; not enqueued again.' };
 	}
-	// Clear this cell's stale output the moment it is queued (an agent run carries no
-	// originId, so every open tab empties it right away), rather than leaving the
-	// prior output under the "queued · N" badge until the kernel frees.
-	clearOutputsForQueue({ nb, cellId: id });
-	const queuedAt = ticket.queued ? Date.now() : 0;
-	const acceptedPosition = ticket.position;
+	// A fresh (non-duplicate) ticket now HOLDS a slot in this notebook's kernel FIFO
+	// (it is either the active run or a pending entry). From here every exit path —
+	// success, a handled cancel, or an UNEXPECTED throw in the pre-wait gap below
+	// (e.g. `clearOutputsForQueue` faulting, or a bad-arg/null-deref before the
+	// guarded await) — MUST reach `ticket.done()`, or the slot is never released and
+	// every later run on THIS notebook waits behind it forever (a wedged queue). One
+	// outer `finally` is the whole guarantee; `release` is idempotent per entry (a
+	// second `done()` is a no-op, and it only advances the queue when this entry is
+	// the active one, so it can never over-release or free a slot early).
 	try {
-		await ticket.wait();
-	} catch (err) {
-		// A restart / interrupt / rebind dropped this pending run before any kernel
-		// touched it: nothing executed, nothing to persist, no lastRun stamp.
-		const reason = (err as { reason?: string })?.reason ?? 'cancelled';
-		return { id: outId, status: 'cancelled', reason, ran_this_session: false, note: 'the queued run was dropped before it started (the kernel was interrupted or restarted).' };
-	}
-	const queuedInfo = queuedAt ? { queued: true, queue_position: acceptedPosition, waited_ms: Date.now() - queuedAt } : {};
+		// Clear this cell's stale output the moment it is queued (an agent run carries
+		// no originId, so every open tab empties it right away), rather than leaving the
+		// prior output under the "queued · N" badge until the kernel frees.
+		clearOutputsForQueue({ nb, cellId: id });
+		const queuedAt = ticket.queued ? Date.now() : 0;
+		const acceptedPosition = ticket.position;
+		try {
+			await ticket.wait();
+		} catch (err) {
+			// A restart / interrupt / rebind dropped this pending run before any kernel
+			// touched it: nothing executed, nothing to persist, no lastRun stamp. The
+			// entry was already spliced out of the queue by the cancel, so the outer
+			// `finally`'s `done()` is a harmless no-op here.
+			const reason = (err as { reason?: string })?.reason ?? 'cancelled';
+			return { id: outId, status: 'cancelled', reason, ran_this_session: false, note: 'the queued run was dropped before it started (the kernel was interrupted or restarted).' };
+		}
+		const queuedInfo = queuedAt ? { queued: true, queue_position: acceptedPosition, waited_ms: Date.now() - queuedAt } : {};
 
-	try {
 		// Re-read the cell: it may have been edited (or deleted) while queued.
 		const cell = getCell(id, nb);
 		if (!cell) return { id: outId, status: 'cancelled', reason: 'cell_removed', ran_this_session: false, ...queuedInfo };
@@ -1099,7 +1110,8 @@ export async function runCell(id: string, nbArg?: string | null): Promise<Record
 		return { id: outId, status, ran_this_session: isLiveSession(session, currentSessionId(nb)), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleFields(stale[id], handleFn(nb)), ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and
-		// broadcast, so the wire order stays run:end → run:start.
+		// broadcast, so the wire order stays run:end → run:start. Running on EVERY exit
+		// path (the pre-wait gap included) is what closes the slot leak.
 		ticket.done();
 	}
 }
