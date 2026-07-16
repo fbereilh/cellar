@@ -19,15 +19,31 @@
  * `mcp/service.js`, `kernel.js`): a cell's `metadata.cellar.lastRun` carries the
  * kernel-session epoch + start time it last ran at, and `metadata.cellar.editedAt`
  * the wall-clock time its source last changed. Both are runtime-only (stripped
- * from disk), so staleness is derived at runtime and never persisted — a stale
- * cell produces zero git diff.
+ * from disk), so staleness is computed fresh each time and never persisted — a
+ * stale cell produces zero git diff.
+ *
+ * WHAT THIS IS NOT: a runtime check of the kernel. The verdict is STATIC ANALYSIS
+ * (the definer graph, built from `symtable` output) PLUS TIMESTAMPS (`lastRun`,
+ * `editedAt`). `lastRun` carries `{at, durationMs, actor, status, session}` - it
+ * never records the names a cell actually read or wrote, and nothing here inspects
+ * the kernel namespace. So every blind spot below is a blind spot in the verdict
+ * too: staleness cannot catch a dependency the graph missed, and no other signal
+ * catches it either (`find_symbol` and `cell_impact` are derived from this same
+ * graph, so they under-report identically - none of the three backs up the other).
+ * The one genuinely runtime-derived input is `lastRun.session`: a kernel restart
+ * bumps the epoch and correctly resets every cell to `not_run`. That is epoch
+ * tracking, not name tracking.
  *
  * KNOWN LIMITS (documented, acceptable for a dataflow-by-common-cases graph):
  *  - Dynamic names never reach the graph: `exec`, `globals()[...]=`, `setattr`,
  *    `del`, star-imports' expansion, monkeypatching. A dependency carried only
  *    through those is invisible here.
- *  - Augmented assignment (`count += 1`) at module level reads an upstream value
- *    but is recorded as a pure definition, so the reading half is not tracked.
+ *  - A read-then-rebind hides the read: the probe computes `uses = referenced −
+ *    defined`, so a cell that reads a name it also rebinds records `defines=[x]`,
+ *    `uses=[]` and gets NO upstream edge. This covers self-reassignment
+ *    (`df = f(df)`, `x = x + 10`) and augmented assignment (`count += 1`) alike.
+ *    Editing that cell's upstream therefore leaves it reported `fresh` while its
+ *    output is already out of date - the widest under-report in practice.
  *  - The definer is the nearest *preceding* cell (document order) that binds the
  *    name; a name defined only by a later cell is treated as external.
  *  - Redefinition resolves to that nearest preceding definer, which is correct

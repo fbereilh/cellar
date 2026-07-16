@@ -17,9 +17,10 @@
  *
  * INHERITED LIMITS (identical to those `staleness.ts` documents; this module adds
  * NO new blind spots):
- *  - Self-referential reassignment masks the read: `df = f(df)` records
- *    `defines=[df]`, `uses=[]` (the probe computes `uses = referenced − defined`),
- *    so that cell does not appear to *use* `df`.
+ *  - A read-then-rebind masks the read: `df = f(df)`, `x = x + 10`, `count += 1` -
+ *    any cell reading a name it also rebinds - records `defines=[df]`, `uses=[]`
+ *    (the probe computes `uses = referenced − defined`), so that cell does not
+ *    appear to *use* `df` and gets no upstream edge.
  *  - Dynamic names (`exec`, `globals()[...]=`, star-imports) never reach the graph;
  *    the live kernel namespace (`kernel_state`) is the fallback for those.
  *  - A forward reference (a use with no *preceding* definer) resolves to -1 / null.
@@ -223,10 +224,17 @@ export interface ImpactInfo {
  * hidden cell still propagates a dependency in the kernel), but only agent-visible
  * cells are reported. A non-code / unknown target yields empty lists.
  *
- * Inherits the definer graph's limits (see this module's header): a
- * self-reassignment (`df = f(df)`) hides that cell's read of `df`, so a data cell's
- * `dependents` can UNDER-report. `get_notebook_map`'s `stale_state` is the
- * authoritative post-hoc signal (it catches this at run time via `lastRun`).
+ * Inherits the definer graph's limits (see this module's header): a read-then-rebind
+ * - a self-reassignment (`df = f(df)`), an augmented assignment, or any cell reading
+ * a name it also rebinds - hides that cell's read, so a data cell's `dependents` can
+ * UNDER-report.
+ *
+ * There is NO runtime backstop for this. `get_notebook_map`'s `stale_state` is
+ * `computeStaleness(cells, dataflow, sid)` - this same static graph plus `lastRun`
+ * timestamps - and `lastRun` carries only `{at, session, ...}`, never the name sets
+ * a cell read or wrote. So staleness under-reports identically and cannot catch what
+ * the graph missed. (`lastRun.session` IS runtime-derived and correctly invalidates
+ * everything across a kernel restart, but that is epoch tracking, not name tracking.)
  *
  * @param id       the full cell id to query
  * @param cells    ALL notebook cells in document order (code + markdown)

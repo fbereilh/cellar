@@ -14,6 +14,7 @@
  *     definers, and kernel reconciliation (live_definer / live_in_kernel).
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { buildDefinerGraph, resolveSymbol, resolveImpact, type Dataflow, type SymbolCell, type ImpactCell } from '../../src/lib/symbolGraph';
 import { computeStaleness, STALE_STATE } from '../../src/lib/staleness';
 import type { Cell, SessionId } from '../../src/lib/server/types';
@@ -285,6 +286,19 @@ const impactCell = (id: string, over: Partial<ImpactCell> = {}): ImpactCell => (
 });
 const impactCells = (ids: string[]): ImpactCell[] => ids.map((id) => impactCell(id));
 
+/** The real server source; the registered description strings are read from it. */
+const serverSrc = () =>
+	readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
+
+/** The single `registerTool('<name>', …)` line — the description an agent is served. */
+const descriptionOf = (tool: string): string => {
+	const line = serverSrc()
+		.split('\n')
+		.find((l) => l.includes(`registerTool('${tool}'`));
+	if (!line) throw new Error(`no registerTool('${tool}') line found`);
+	return line;
+};
+
 describe('resolveImpact — the report §4.1 scenario', () => {
 	it("cell_impact('c3') -> depends_on=[c1], dependents=[c4,c5,c6] (edit clean/featurize -> 3 stale)", () => {
 		const r = resolveImpact({ id: 'c3', cells: impactCells(SCENARIO_IDS), dataflow: SCENARIO });
@@ -302,17 +316,53 @@ describe('resolveImpact — the report §4.1 scenario', () => {
 		expect(r.dependents).toEqual([]); // under-reports: c4's read of df is invisible
 	});
 
-	it('the cell_impact description warns about the self-reassignment under-report', async () => {
+	it('the cell_impact description warns about the self-reassignment under-report', () => {
 		// The honesty the tool ships on: its registered description must point at the
-		// under-report and at stale_state as the authoritative post-hoc signal.
-		const src = await import('node:fs').then((fs) =>
-			fs.readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8')
-		);
-		const line = src.split('\n').find((l) => l.includes("registerTool('cell_impact'"));
+		// under-report and must address stale_state - which is NOT a backstop for it
+		// (same static graph + timestamps, so it under-reports identically).
+		const line = descriptionOf('cell_impact');
 		expect(line).toBeTruthy();
 		expect(line).toMatch(/self-reassignment|df = f\(df\)/);
 		expect(line).toMatch(/under-report/i);
 		expect(line).toMatch(/stale_state/);
+	});
+
+	it('NO tool description promises stale_state as a RUNTIME backstop (the false claim)', () => {
+		// Regression guard for the docs fix. stale_state is computeStaleness(cells,
+		// dataflow, sid) - the SAME static graph these tools use, plus lastRun
+		// timestamps, which carry {at,durationMs,actor,status,session} and NO name
+		// sets. So it can never "catch at run time" what the graph missed; the two
+		// tests above prove that behaviourally. The prior wording ("the authoritative
+		// post-hoc signal (it catches this at run time)") told an agent to trust a
+		// signal that under-reports identically - the exact trap this must not regress
+		// into. Scoped to the tool DESCRIPTIONS: that string is what reaches the agent.
+		const descs = serverSrc().split('\n').filter((l) => l.includes('server.registerTool('));
+		expect(descs.length).toBeGreaterThan(0);
+		for (const line of descs) {
+			expect(line).not.toMatch(/authoritative post-hoc signal/i);
+			// The honest text legitimately reads "NOTHING catches this at run time",
+			// so match the CLAIM (stale_state doing the catching), not the phrase.
+			expect(line).not.toMatch(/(?<!NOTHING )\bit catches this at run time/i);
+		}
+	});
+
+	it('cell_impact states the under-report is NOT caught at run time, and says what to do', () => {
+		const line = descriptionOf('cell_impact');
+		expect(line).toMatch(/NOTHING catches this at run time/i); // no false backstop
+		expect(line).toMatch(/SAME static graph plus run timestamps/i); // what stale_state IS
+		expect(line).toMatch(/never inspects the kernel namespace/i); // why it can't catch it
+		expect(line).toMatch(/read-then-rebind/i); // the real cause, not just df = f(df)
+		expect(line).toMatch(/re-run the downstream cells yourself/i); // the actionable remedy
+	});
+
+	it('find_symbol no longer defers to stale_state as the backstop', () => {
+		const line = descriptionOf('find_symbol');
+		// The old trailing pointer: "For whether a change makes dependents out of
+		// date, see get_notebook_map stale_state."
+		expect(line).not.toMatch(/see get_notebook_map stale_state/i);
+		expect(line).toMatch(/SAME static graph plus run timestamps/i);
+		expect(line).toMatch(/treat none of the three as a runtime check of the kernel/i);
+		expect(line).toMatch(/reads a name it also rebinds/i); // read-then-rebind, generalised
 	});
 });
 

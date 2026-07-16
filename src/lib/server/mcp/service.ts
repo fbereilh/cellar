@@ -845,11 +845,13 @@ export async function findSymbol(name: string, nb?: string | null) {
  * run_stale re-run after I touch this" BEFORE the edit — the downstream direction
  * `stale_upstream` (which only appears once a cell is ALREADY stale) never surfaces.
  *
- * Honest limit (inherited, see the module header): a self-reassignment
- * (`df = f(df)`) hides that cell's read of `df`, so a data cell's `dependents` can
- * UNDER-report; `get_notebook_map`'s `stale_state` is the authoritative post-hoc
- * signal. The graph is built over ALL code cells and traversed through hidden ones,
- * but only agent-visible cells are reported.
+ * Honest limit (inherited, see the module header): a read-then-rebind - a
+ * self-reassignment (`df = f(df)`), an augmented assignment, or any cell reading a
+ * name it also rebinds - hides that cell's read, so a data cell's `dependents` can
+ * UNDER-report. `get_notebook_map`'s `stale_state` is NOT a backstop: it is derived
+ * from this same static graph plus run timestamps, so it under-reports identically
+ * (see `resolveImpact` in `$lib/symbolGraph`). The graph is built over ALL code
+ * cells and traversed through hidden ones, but only agent-visible cells are reported.
  */
 export async function cellImpact(id: string, nb?: string | null) {
 	const cells = listCells(nb); // ALL cells (incl. hidden) so the graph stays complete
