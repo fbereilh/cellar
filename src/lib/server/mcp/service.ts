@@ -20,6 +20,9 @@ import {
 	deleteCell,
 	moveCellTo,
 	setVisibility,
+	getHeaderNumbering,
+	setHeaderNumbering as setHeaderNumberingDoc,
+	setHideAllCode as setHideAllCodeDoc,
 	getActiveNotebookPath,
 	resolveNotebookPath,
 	workspaceRelative,
@@ -40,6 +43,7 @@ import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
+import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { IMG_MAX_EDGE, downscaleImageForBlock, imagePlaceholder } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
@@ -240,6 +244,25 @@ function headerInfo(cell: CellView): { level: number; title: string } | null {
 
 function hasOutput(cell: CellView): boolean {
 	return cell.cell_type === 'code' && (cell.outputs || []).length > 0;
+}
+
+/**
+ * The display-only auto-number each heading currently renders with, keyed by cell
+ * id - the exact strings the human reads ("1", "2.3"), or `{}` when no level is
+ * numbered. Two things make the lookup line up with the section tree:
+ *
+ *  - It is computed over ALL cells, not `visibleCells`. A cell hidden from the
+ *    agent still renders for the human and still consumes a counter, so numbering
+ *    the visible subset would report numbers that are on no screen.
+ *  - `computeHeadingNumbers` keys a cell's LEADING heading by its plain cell id
+ *    (`foldKey(id, 0) === id`), which is the only heading `headerInfo` reads. A
+ *    later heading in the same cell keys as `<id>#<seg>` and is simply absent
+ *    here - it is not a section to this layer either (see headerInfo).
+ */
+function headingNumbers(nb?: string | null, levels?: readonly number[]): Record<string, string> {
+	const enabled = levels ?? getHeaderNumbering(nb);
+	if (!enabled.length) return {};
+	return computeHeadingNumbers(outlineHeadings(listCells(nb)), new Set(enabled));
 }
 
 /**
@@ -562,6 +585,9 @@ const cellCount = (nb: { cells?: unknown[] }) => (nb.cells ? nb.cells.length : 0
  * `kernel.started: false` (or `execs_this_session: 0`) every `*_persisted`
  * status is saved output from an earlier session and nothing those cells define
  * exists in the namespace. `kernel_state` remains the live truth.
+ *
+ * The `display` block reports the notebook-level display-only settings, and every
+ * numbered section carries the `number` it renders with (see `headingNumbers`).
  */
 export async function getNotebookMap(nb?: string | null) {
 	const cells = visibleCells(nb);
@@ -572,11 +598,17 @@ export async function getNotebookMap(nb?: string | null) {
 		type: 'markdown';
 		level: number;
 		title: string;
+		number?: string;
 		children: unknown[];
 	}
 	const root: unknown[] = [];
 	const stack: { node: MapSection; level: number }[] = [];
 	const toHandle = handleFn(nb);
+	const view = getNotebook(nb);
+	// The number each section renders with, so the agent reads the SAME heading the
+	// human does ("1. Setup", not "Setup") and can see the numbering is already
+	// being done for it - which is what stops it hardcoding a number into the source.
+	const numbers = headingNumbers(nb, view.headerNumbering);
 	const leaf = (c: CellView) => ({
 		id: toHandle(c.id),
 		type: c.cell_type,
@@ -589,7 +621,7 @@ export async function getNotebookMap(nb?: string | null) {
 	for (const c of cells) {
 		const h = headerInfo(c);
 		if (h) {
-			const node: MapSection = { id: toHandle(c.id), type: 'markdown', level: h.level, title: h.title, children: [] };
+			const node: MapSection = { id: toHandle(c.id), type: 'markdown', level: h.level, title: h.title, ...(numbers[c.id] ? { number: numbers[c.id] } : {}), children: [] };
 			while (stack.length && stack[stack.length - 1].level >= h.level) stack.pop();
 			(stack.length ? stack[stack.length - 1].node.children : root).push(node);
 			stack.push({ node, level: h.level });
@@ -597,7 +629,6 @@ export async function getNotebookMap(nb?: string | null) {
 			(stack.length ? stack[stack.length - 1].node.children : root).push(leaf(c));
 		}
 	}
-	const view = getNotebook(nb);
 	// The `kernel` header reports THIS notebook's own session epoch, so it lines up
 	// with each cell's run_status/ran_this_session (each computed against the same
 	// per-notebook epoch), never against whichever notebook the user last focused.
@@ -610,7 +641,19 @@ export async function getNotebookMap(nb?: string | null) {
 	// live probe still backs `databricks_status`/`get_kernel_state`, where verifying
 	// the session is the point.
 	const dbx = databricksConnection(nb);
-	return { notebook: view.path, kernel: kernelSession(nb), databricks: { connected: dbx.connected === true }, cell_count: cells.length, sections: root };
+	// `display` = the notebook-level, display-only settings that change what the
+	// human sees without touching any cell's source. They ride the map because the
+	// map is what an agent reads before it writes: `header_numbering` is why a new
+	// header must NOT carry a hand-typed number, and `report_view` is why a cell's
+	// code may be invisible to the reader even though it is in the document.
+	return {
+		notebook: view.path,
+		kernel: kernelSession(nb),
+		databricks: { connected: dbx.connected === true },
+		display: { header_numbering: view.headerNumbering, report_view: view.hideAllCode },
+		cell_count: cells.length,
+		sections: root
+	};
 }
 
 /**
@@ -734,7 +777,16 @@ export async function readByLocation({ index, position, relativeTo, direction }:
 	return readForm(target, READ_CAP, sid, stale[target.id], handleFn(nb));
 }
 
-/** Cells under a markdown header (until the next same-or-higher header). */
+/**
+ * Cells under a markdown header (until the next same-or-higher header).
+ *
+ * Its `header` carries the display-only auto-`number` (when its level is
+ * numbered), because this tool presents a heading AS a heading - the one other
+ * place besides the section tree where the agent reads what the human reads.
+ * `read_cell`/`read_cells`/`search_cells` deliberately do NOT: they hand back a
+ * cell's raw source, where the number provably is not, and stamping a rendered
+ * number onto raw source is exactly the confusion this feature exists to end.
+ */
 export async function readSection(headerId: string, nb?: string | null) {
 	const cells = visibleCells(nb);
 	const idx = cells.findIndex((c) => c.id === asFullId(nb, headerId));
@@ -750,7 +802,8 @@ export async function readSection(headerId: string, nb?: string | null) {
 	// One sampled epoch + staleness pass for the whole section (see readCells).
 	const { sid, cells: stale }: { sid: SessionId | null; cells: StalenessMap } = await getNotebookStaleness(nb);
 	const toHandle = handleFn(nb);
-	return { header: { id: toHandle(cells[idx].id), level: h.level, title: h.title }, cells: out.map((c) => readForm(c, READ_CAP, sid, stale[c.id], toHandle)) };
+	const number = headingNumbers(nb)[cells[idx].id];
+	return { header: { id: toHandle(cells[idx].id), level: h.level, title: h.title, ...(number ? { number } : {}) }, cells: out.map((c) => readForm(c, READ_CAP, sid, stale[c.id], toHandle)) };
 }
 
 /**
@@ -1137,6 +1190,37 @@ export function setType(id: string, type: LogicalCellType, nb?: string | null) {
 export function setCellVisibility(id: string, hidden: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	return setVisibility(asFullId(target, id), hidden, target);
+}
+
+/**
+ * MCP `set_header_numbering`. Notebook-level and display-only: it records WHICH
+ * heading levels render with an auto-number and never writes a number into any
+ * cell's source. An empty list clears the setting. Returns the SANITIZED levels
+ * (unique, 1-6, ascending - so a caller sees what actually took effect, not what
+ * it asked for) plus how many headings now carry a number, which is the cheap
+ * confirmation that the levels it picked match the headings it has; the numbers
+ * themselves are one get_notebook_map away.
+ *
+ * Like `setCellVisibility` and unlike the content mutations, this takes no
+ * pre-action checkpoint: it changes how the notebook is displayed, not what is in
+ * it, so there is no cell state an undo would need to bring back.
+ */
+export function setHeaderNumbering(levels: readonly number[] | null | undefined, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	const clean = setHeaderNumberingDoc(levels, target);
+	return { levels: clean, numbered_headings: Object.keys(headingNumbers(target, clean)).length };
+}
+
+/**
+ * MCP `set_report_view`. The notebook-level "hide all code inputs" default: code
+ * cells render output-only, for a clean report a human reads without the code.
+ * Display-only - no source is touched and every cell still runs. A per-cell
+ * `cellar.hide_input` overrides it in either direction, so a cell may still show
+ * its code under report view (that per-cell flag has no agent surface today).
+ */
+export function setReportView(enabled: boolean, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	return { report_view: setHideAllCodeDoc(enabled, target) };
 }
 
 // --- execute ----------------------------------------------------------------

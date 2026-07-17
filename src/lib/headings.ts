@@ -201,6 +201,13 @@ const HEADING_LINE = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
  * `## Header` + `"1"` → `## 1. Header`. Display-only - the caller renders this,
  * never persists it, so the cell's real markdown source is untouched. Returns the
  * line unchanged when there is no number or the line isn't a heading.
+ *
+ * Everything after the `#`s is the title, verbatim: a source `## 1. Setup` under
+ * numbering renders `1. 1. Setup`, and that double number is BY DESIGN. Do NOT
+ * strip a leading number here - Cellar cannot tell an agent's stray auto-number
+ * from one the human meant (`3. Third Attempt` would lose its 3). The sanctioned
+ * fix is the MCP `INSTRUCTIONS` clause telling the agent never to hand-number a
+ * header and to clean stray numbers out of the source with judgment.
  */
 export function numberHeadingLine(headingLine: string, number: string | undefined): string {
 	if (!number) return headingLine;
