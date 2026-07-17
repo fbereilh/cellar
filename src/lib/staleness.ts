@@ -44,6 +44,12 @@
  *    (`df = f(df)`, `x = x + 10`) and augmented assignment (`count += 1`) alike.
  *    Editing that cell's upstream therefore leaves it reported `fresh` while its
  *    output is already out of date - the widest under-report in practice.
+ *  - A SQL cell is a graph SOURCE: `dataflow.js` gives it the names its run binds
+ *    (`_sql_df`, plus any `-- >> name`) as `defines` but never any `uses`, since
+ *    reading table names out of SQL is lineage analysis and out of scope. So a
+ *    Python cell reading a SQL result does go stale when the query is edited, but
+ *    a SQL cell never goes stale from an upstream Python cell (a temp view it
+ *    queries, say) - only from its own edit or a restart.
  *  - The definer is the nearest *preceding* cell (document order) that binds the
  *    name; a name defined only by a later cell is treated as external.
  *  - Redefinition resolves to that nearest preceding definer, which is correct

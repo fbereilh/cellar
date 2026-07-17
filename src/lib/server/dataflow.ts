@@ -25,6 +25,15 @@
  * magics / shell escapes are blanked so the surrounding Python still parses. The
  * cache is keyed by the ORIGINAL source, so identical cells still share a result.
  *
+ * SQL-AWARE. A SQL cell is a `code` cell whose source is SQL, so it stays OUT of
+ * the probe entirely (`symtable` would misparse it) and gets a SYNTHETIC
+ * contribution instead: `defines` is exactly the names `sql.ts` compiles the cell
+ * to bind (`parseSqlCell().resultVars` - the `-- >> name` prefix line's name plus
+ * the `_sql_df` alias, else `_sql_df` alone), so a Python cell reading a SQL result
+ * gets its upstream edge and goes stale when the query is edited. `uses` stays
+ * empty: reading table names out of SQL is lineage analysis, deliberately out of
+ * scope, so a SQL cell is a graph SOURCE.
+ *
  * The probe never raises: a cell whose source does not parse (it is mid-edit) is
  * reported with empty defines/uses rather than failing the whole analysis. If no
  * interpreter can be found or the process dies, `analyzeDataflow` degrades to an
@@ -41,6 +50,7 @@ import { projectPython } from './databricks';
 import { computeStaleness } from '../staleness';
 import { isSqlCell } from '../cellLanguage';
 import { normalizeForAnalysis } from './magics';
+import { parseSqlCell } from './sql';
 import { LruCache } from './lru';
 import type { CellView, SessionId } from './types';
 
@@ -200,9 +210,11 @@ function runProbe(items: ProbeItem[]): Promise<DataflowMap> {
  */
 export async function analyzeDataflow(cells: CellView[]): Promise<DataflowMap> {
 	// SQL cells are code cells on disk but their source is SQL, not Python - a
-	// `symtable` pass would misparse them. Skip them: they get no defines/uses, so
-	// they never join the Python dependency graph (self-edit staleness still works
-	// via lastRun/editedAt, since they run and stamp like any code cell).
+	// `symtable` pass would misparse them, so they stay OUT of the probe and get a
+	// SYNTHETIC contribution instead (below): their run really does bind names in the
+	// kernel, so the graph must see those defines or a Python cell reading a SQL
+	// result gets no upstream edge and never goes stale when the query is edited.
+	const sql = cells.filter((c) => c.cell_type === 'code' && isSqlCell(c));
 	const code = cells.filter((c) => c.cell_type === 'code' && !isSqlCell(c));
 	const missing: ProbeItem[] = [];
 	for (const c of code) {
@@ -222,6 +234,14 @@ export async function analyzeDataflow(cells: CellView[]): Promise<DataflowMap> {
 	}
 	const out: DataflowMap = {};
 	for (const c of code) out[c.id] = cache.get(c.source ?? '') ?? { defines: [], uses: [] };
+	// Synthetic dataflow for SQL cells: `sql.ts` compiles the cell to a `spark.sql()`
+	// wrapper that binds its result (the `-- >> name` prefix line's name plus the
+	// `_sql_df` alias, else `_sql_df` alone), so those names are exactly what the
+	// cell DEFINES. `uses` stays empty on purpose: reading table names out of SQL is
+	// lineage analysis, deliberately out of scope - a SQL cell is a graph SOURCE.
+	// An empty cell, or one whose prefix line is unusable (it compiles to a `raise`),
+	// binds nothing, so `resultVars` is empty and it defines nothing.
+	for (const c of sql) out[c.id] = { defines: parseSqlCell(c.source ?? '').resultVars, uses: [] };
 	return out;
 }
 

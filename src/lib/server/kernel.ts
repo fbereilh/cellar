@@ -125,9 +125,21 @@ const kernels = new Map<string, NotebookKernel>();
  */
 let sessionCounter = 0;
 
-/** Resolve an optional notebook path to an absolute one (default: active notebook). */
+/**
+ * Resolve an optional notebook path to an absolute one (default: active notebook).
+ *
+ * The `kernels` Map is keyed by ABSOLUTE path, so a workspace-relative `nbPath`
+ * MUST be resolved here or it simply misses every entry. It used to be passed
+ * through verbatim, which silently broke every caller that addresses a notebook the
+ * way the browser does (`notebook.ipynb`): `currentSessionId('notebook.ipynb')`
+ * returned null, so `getNotebookStaleness` reconciled against "no kernel session"
+ * and reported EVERY cell `not_run` — the whole staleness signal read dead in the
+ * UI, whatever the cells had actually done. `resolveNotebookPath` is the same
+ * resolver `notebook.ts` applies to its own `nb` arguments (it is idempotent on an
+ * already-absolute path), so the two now agree on what a path names.
+ */
 function resolveNb(nbPath?: string | null): string {
-	return nbPath || getActiveNotebookPath();
+	return nbPath ? resolveNotebookPath(nbPath) : getActiveNotebookPath();
 }
 
 /**

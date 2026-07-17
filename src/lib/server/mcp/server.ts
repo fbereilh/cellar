@@ -310,7 +310,14 @@ Follow this house style:
    set_cell_type). Its source is raw SQL — do NOT wrap it in spark.sql() or Python
    quotes; Cellar runs spark.sql(<your query>) and renders the result as an
    interactive grid, also binding it to _sql_df in the kernel so a following Python
-   cell can chain off it. SQL cells need the live spark session from clause 9 (with
+   cell can chain off it. _sql_df is LAST-WRITE-WINS across the notebook, so with
+   more than one SQL cell, NAME the binding: open the cell with a "-- >> sales_df"
+   line (a plain SQL comment; must be the first non-blank line) and the result also
+   binds to sales_df, which no later SQL cell clobbers. The name must be a valid
+   Python identifier (an invalid one fails the cell with a message saying so). A
+   named cell still sets _sql_df too, and the staleness graph treats the SQL cell as
+   DEFINING the name, so a Python cell using it goes stale when you edit the query.
+   SQL cells need the live spark session from clause 9 (with
    databricks connected:false they fail with a clear "connect Databricks" message).
    Prefer a sql cell when the query itself is the point; a python cell (or the
    databricks_* tools) when you need Python around it.

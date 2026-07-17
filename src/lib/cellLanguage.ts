@@ -8,8 +8,10 @@
  * round-trips clean-on-save with zero git noise, exactly like the imports role).
  * A SQL cell therefore runs through the SAME code-cell machinery everywhere - run
  * queue, run status, staleness, persistence - and only differs where the language
- * genuinely matters: syntax highlighting, and how its source is executed
- * (`server/sql.js` wraps it as `spark.sql(...)`).
+ * genuinely matters: syntax highlighting; how its source is executed
+ * (`server/sql.js` wraps it as `spark.sql(...)`); and how its dataflow is derived
+ * (`server/dataflow.js` keeps it out of the Python `symtable` probe and reads the
+ * names it binds from `sql.js` instead, so staleness still sees its result).
  *
  * This module is the single source of truth for "is this a SQL cell" and for the
  * three-way LOGICAL cell type the UI toggle + MCP tools speak (`code` / `sql` /

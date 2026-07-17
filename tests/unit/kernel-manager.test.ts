@@ -50,7 +50,10 @@ vi.mock('../../src/lib/server/notebook', () => ({
 	getActiveNotebookPath: () => h.activeNb,
 	// listKernels() (via the kernel:status publish) maps each absolute path to its
 	// workspace-relative id; the fake workspace is '/ws'.
-	workspaceRelative: (abs: string) => abs.replace(/^\/ws\//, '')
+	workspaceRelative: (abs: string) => abs.replace(/^\/ws\//, ''),
+	// kernel.ts resolves every `nb` argument through this, so a relative path finds
+	// the same (absolute-keyed) kernel entry. Idempotent on an absolute path.
+	resolveNotebookPath: (p: string) => (p.startsWith('/') ? p : `/ws/${p}`)
 }));
 
 vi.mock('../../src/lib/server/run-queue', () => ({
