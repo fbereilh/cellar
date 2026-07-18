@@ -9,7 +9,7 @@
  *
  * This module owns ONLY the rule; it does not parse Python. The dependency
  * information (which names each cell defines / uses) is computed elsewhere
- * (`server/dataflow.js`, a Python `symtable` analysis) and handed in as
+ * (`server/dataflow.js`, a Python `ast` + `symtable` analysis) and handed in as
  * `dataflow`. Keeping the rule pure and separate from the analysis means the
  * exact same staleness verdict is computed for the UI (a fetch of the server's
  * result) and for the MCP agent surface — one definition, no drift — and that it
@@ -23,7 +23,7 @@
  * stale cell produces zero git diff.
  *
  * WHAT THIS IS NOT: a runtime check of the kernel. The verdict is STATIC ANALYSIS
- * (the definer graph, built from `symtable` output) PLUS TIMESTAMPS (`lastRun`,
+ * (the definer graph, built from `ast` + `symtable` output) PLUS TIMESTAMPS (`lastRun`,
  * `editedAt`). `lastRun` carries `{at, durationMs, actor, status, session}` - it
  * never records the names a cell actually read or wrote, and nothing here inspects
  * the kernel namespace. So every blind spot below is a blind spot in the verdict
@@ -38,12 +38,14 @@
  *  - Dynamic names never reach the graph: `exec`, `globals()[...]=`, `setattr`,
  *    `del`, star-imports' expansion, monkeypatching. A dependency carried only
  *    through those is invisible here.
- *  - A read-then-rebind hides the read: the probe computes `uses = referenced −
- *    defined`, so a cell that reads a name it also rebinds records `defines=[x]`,
- *    `uses=[]` and gets NO upstream edge. This covers self-reassignment
- *    (`df = f(df)`, `x = x + 10`) and augmented assignment (`count += 1`) alike.
- *    Editing that cell's upstream therefore leaves it reported `fresh` while its
- *    output is already out of date - the widest under-report in practice.
+ *  - A CONDITIONAL bind counts as bound: `if flag: df = load()` then `df.head()`
+ *    records no use of `df`, so an upstream `df` cell's edit does not stale it.
+ *    The module-scope walk (`dataflow.js`) is sequential, not a branch join.
+ *  - An augmented assignment to a name declared `global` INSIDE a function
+ *    (`def g(): global c; c += 1`) is missed - that read lives in a deferred body,
+ *    which is `symtable`'s half of the probe, and `symtable` reports
+ *    `is_referenced() == False` for an augmented target. Module-scope `count += 1`
+ *    is caught (see `dataflow.js`).
  *  - A SQL cell is a graph SOURCE: `dataflow.js` gives it the names its run binds
  *    (`_sql_df`, plus any `-- >> name`) as `defines` but never any `uses`, since
  *    reading table names out of SQL is lineage analysis and out of scope. So a

@@ -21,12 +21,19 @@ import type { Cell, SessionId } from '../../src/lib/server/types';
 
 // --- fixtures ---------------------------------------------------------------
 
-// The report §4.1 scenario, as the real `symtable` PROBE reports it.
+// The report §4.1 scenario, as the real PROBE reports it. Keep it that way: these
+// are hand-written fixtures, so nothing here fails when the probe's output moves —
+// which is exactly how they once "codified" a blind spot the probe had already
+// stopped having. `dataflow-load-before-store.test.ts` spawns the real probe; the
+// values below are copied from it.
+//   c4 is `df = featurize(clean(df))` — a read-then-rebind. It USES df: the load
+//   happens before this cell binds df, so it reads c2's. That edge is what the old
+//   `uses = referenced − defined` rule dropped.
 const SCENARIO: Dataflow = {
 	c1: { defines: ['np', 'pd'], uses: [] },
 	c2: { defines: ['df'], uses: ['pd'] },
 	c3: { defines: ['clean', 'featurize'], uses: ['np'] },
-	c4: { defines: ['df'], uses: ['clean', 'featurize'] },
+	c4: { defines: ['df'], uses: ['clean', 'df', 'featurize'] },
 	c5: { defines: ['flag', 'model'], uses: ['df'] },
 	c6: { defines: [], uses: ['df', 'model', 'print'] },
 	c7: { defines: ['df'], uses: ['pd'] }
@@ -102,9 +109,10 @@ describe('buildDefinerGraph — staleness parity', () => {
 			df: { a: { defines: [], uses: ['z'] }, b: { defines: ['z'], uses: [] } }
 		},
 		{
-			name: 'self-reassignment (df = f(df)) hides the read',
+			// b is `df = f(df)`: it both defines df and uses the df a defined.
+			name: 'self-reassignment (df = f(df)) reads its upstream',
 			ids: ['a', 'b'],
-			df: { a: { defines: ['df'], uses: [] }, b: { defines: ['df'], uses: [] } }
+			df: { a: { defines: ['df'], uses: [] }, b: { defines: ['df'], uses: ['df'] } }
 		},
 		{ name: 'empty + missing entries', ids: ['a', 'b', 'c'], df: { a: {}, b: { uses: ['q'] } } }
 	];
@@ -181,6 +189,10 @@ describe('resolveSymbol — the report §4.1 scenario', () => {
 		expect(r.symbol).toBe('df');
 		expect(r.defined_in).toEqual(['c2', 'c4', 'c7']);
 		expect(r.used_in).toEqual([
+			// c4 both defines df and appears here: `df = featurize(clean(df))` really
+			// does read df, and it binds to the nearest PRECEDING definer (c2), never
+			// to itself.
+			{ cell: 'c4', binds_to: 'c2' },
 			{ cell: 'c5', binds_to: 'c4' },
 			{ cell: 'c6', binds_to: 'c4' }
 		]);
@@ -244,7 +256,11 @@ describe('resolveSymbol — edge cases', () => {
 	it('a hidden USING cell is not reported', () => {
 		const cells = symCells(SCENARIO_IDS).map((c) => (c.id === 'c6' ? { ...c, hidden: true } : c));
 		const r = resolveSymbol({ name: 'df', cells, dataflow: SCENARIO, sid: null, kernelNames: null });
-		expect(r.used_in).toEqual([{ cell: 'c5', binds_to: 'c4' }]); // c6 hidden, gone
+		// c6 hidden, gone; c4 remains — it reads df as well as defining it.
+		expect(r.used_in).toEqual([
+			{ cell: 'c4', binds_to: 'c2' },
+			{ cell: 'c5', binds_to: 'c4' }
+		]);
 	});
 });
 
@@ -307,22 +323,26 @@ describe('resolveImpact — the report §4.1 scenario', () => {
 		expect(r.dependents).toEqual(['c4', 'c5', 'c6']); // clean/featurize -> c4 -> df -> c5, c6
 	});
 
-	it("cell_impact('c2') -> dependents=[] — the documented self-reassignment under-report", () => {
-		// c2 defines df; c4 is `df = clean(df)`, whose READ of df the probe masks
-		// (uses = referenced − defined), so c4 does not appear to depend on c2, and
-		// c5/c6 bind their df to c4 (the nearest preceding definer), never c2.
+	it("cell_impact('c2') -> dependents=[c4,c5,c6] through the self-reassignment in c4", () => {
+		// The graph-level statement of the fix. c2 defines df; c4 is
+		// `df = featurize(clean(df))`, which READS c2's df before rebinding it. That
+		// read used to be masked (`uses = referenced − defined`), so this asserted
+		// dependents=[] — editing c2 flagged NOTHING, and the notebook reported itself
+		// in sync while c4/c5/c6 held values computed from the old df. The chain now
+		// resolves: c2 -> c4 (df) -> c5/c6.
 		const r = resolveImpact({ id: 'c2', cells: impactCells(SCENARIO_IDS), dataflow: SCENARIO });
 		expect(r.depends_on).toEqual(['c1']); // c2 uses pd, defined in c1
-		expect(r.dependents).toEqual([]); // under-reports: c4's read of df is invisible
+		expect(r.dependents).toEqual(['c4', 'c5', 'c6']);
 	});
 
-	it('the cell_impact description warns about the self-reassignment under-report', () => {
+	it('the cell_impact description warns about the under-report it still has', () => {
 		// The honesty the tool ships on: its registered description must point at the
 		// under-report and must address stale_state - which is NOT a backstop for it
-		// (same static graph + timestamps, so it under-reports identically).
+		// (same static graph + timestamps, so it under-reports identically). The named
+		// cause moves as the graph improves; that it names a REAL one must not.
 		const line = descriptionOf('cell_impact');
 		expect(line).toBeTruthy();
-		expect(line).toMatch(/self-reassignment|df = f\(df\)/);
+		expect(line).toMatch(/conditional bind|exec\/globals/);
 		expect(line).toMatch(/under-report/i);
 		expect(line).toMatch(/stale_state/);
 	});
@@ -351,7 +371,7 @@ describe('resolveImpact — the report §4.1 scenario', () => {
 		expect(line).toMatch(/NOTHING catches this at run time/i); // no false backstop
 		expect(line).toMatch(/SAME static graph plus run timestamps/i); // what stale_state IS
 		expect(line).toMatch(/never inspects the kernel namespace/i); // why it can't catch it
-		expect(line).toMatch(/read-then-rebind/i); // the real cause, not just df = f(df)
+		expect(line).toMatch(/conditional bind/i); // a real remaining cause, named concretely
 		expect(line).toMatch(/re-run the downstream cells yourself/i); // the actionable remedy
 	});
 
@@ -362,7 +382,20 @@ describe('resolveImpact — the report §4.1 scenario', () => {
 		expect(line).not.toMatch(/see get_notebook_map stale_state/i);
 		expect(line).toMatch(/SAME static graph plus run timestamps/i);
 		expect(line).toMatch(/treat none of the three as a runtime check of the kernel/i);
-		expect(line).toMatch(/reads a name it also rebinds/i); // read-then-rebind, generalised
+		expect(line).toMatch(/conditional bind/i); // a real remaining cause, named concretely
+	});
+
+	// Read-then-rebind (df = f(df), x = x + 10, count += 1) is FIXED by the
+	// load-before-store walk in dataflow.ts. The agent-facing text must not keep
+	// naming it as a limit: an agent told a fixed shape is broken re-runs cells it
+	// need not, and an inaccurate limits list is what makes the accurate half ignorable.
+	it('no agent-facing text still claims read-then-rebind is a limitation', () => {
+		for (const name of ['cell_impact', 'find_symbol', 'get_notebook_map']) {
+			const line = descriptionOf(name);
+			expect(line, name).not.toMatch(/read-then-rebind|rebinds/i);
+			expect(line, name).not.toMatch(/df = f\(df\)|count \+= 1/i);
+		}
+		expect(serverSrc()).not.toMatch(/reads a name it also\s+rebinds/i); // INSTRUCTIONS
 	});
 });
 

@@ -4,15 +4,15 @@
  * Magics EXECUTE fine: a cell's source is sent verbatim to ipykernel (`run.ts`),
  * which is IPython, so `%%time`, `%%bash`, `%pip`, `%load_ext`, `%matplotlib
  * inline` all run natively. This module is only about the STATIC side — the
- * `symtable` dataflow probe (`dataflow.ts`) and import routing (`imports-cell.ts`)
+ * `ast`/`symtable` dataflow probe (`dataflow.ts`) and import routing (`imports-cell.ts`)
  * both assume plain Python, and magic syntax is not valid Python.
  *
  * WHY NOT IPYTHON'S OWN TRANSFORM. `TransformerManager().transform_cell` rewrites
  * `%%time\ndf = load()` into `get_ipython().run_cell_magic('time', '', 'df =
- * load()\\n')` — the body becomes a STRING LITERAL, so `symtable` never sees `df`
+ * load()\\n')` — the body becomes a STRING LITERAL, so the probe never sees `df`
  * assigned. It is exactly the wrong shape for dataflow. It also needs IPython in
- * the interpreter, whereas the probe uses only stdlib `symtable` so any Python 3
- * works with no venv set up. So we normalize in JS instead: a targeted,
+ * the interpreter, whereas the probe uses only the stdlib (`ast`/`symtable`) so any
+ * Python 3 works with no venv set up. So we normalize in JS instead: a targeted,
  * well-tested line pass that preserves the analyzable Python.
  *
  * The three cases (see `normalizeForAnalysis`):

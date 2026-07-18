@@ -868,9 +868,10 @@ async function liveKernelNames(nb?: string | null): Promise<Set<string> | null> 
  *
  * The graph is built over ALL code cells (a hidden cell still defines names in the
  * kernel), but only agent-visible cells are reported; a hidden definer sets
- * `hidden_definer`. Inherits `symtable`'s limits (see `$lib/symbolGraph`): a
- * self-reassignment (`df = f(df)`) hides that cell's read of `df`, dynamic names
- * (exec/globals/star-import) are invisible, and a forward reference binds to null.
+ * `hidden_definer`. Inherits the definer graph's limits (see `$lib/symbolGraph`): a
+ * conditional bind (`if flag: df = load()`) hides that cell's later read of `df`,
+ * dynamic names (exec/globals/star-import) are invisible, and a forward reference
+ * binds to null.
  */
 export async function findSymbol(name: string, nb?: string | null) {
 	const cells = listCells(nb); // ALL cells (incl. hidden) so a hidden definer still counts
@@ -898,10 +899,11 @@ export async function findSymbol(name: string, nb?: string | null) {
  * run_stale re-run after I touch this" BEFORE the edit — the downstream direction
  * `stale_upstream` (which only appears once a cell is ALREADY stale) never surfaces.
  *
- * Honest limit (inherited, see the module header): a read-then-rebind - a
- * self-reassignment (`df = f(df)`), an augmented assignment, or any cell reading a
- * name it also rebinds - hides that cell's read, so a data cell's `dependents` can
- * UNDER-report. `get_notebook_map`'s `stale_state` is NOT a backstop: it is derived
+ * Honest limit (inherited, see the module header): a dependency carried only through
+ * a conditional bind (`if flag: df = load()`), a `global`-declared augmented
+ * assignment inside a function, or `exec`/`globals()` is invisible to the graph, so
+ * a data cell's `dependents` can UNDER-report. `get_notebook_map`'s `stale_state`
+ * is NOT a backstop: it is derived
  * from this same static graph plus run timestamps, so it under-reports identically
  * (see `resolveImpact` in `$lib/symbolGraph`). The graph is built over ALL code
  * cells and traversed through hidden ones, but only agent-visible cells are reported.

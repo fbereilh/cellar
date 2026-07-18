@@ -2,8 +2,10 @@
  * Cellar — the definer graph (pure, browser-safe).
  *
  * A notebook's dependency structure is fully determined by which names each code
- * cell DEFINES and USES (computed by `server/dataflow.ts`, a Python `symtable`
- * pass). This module owns the two derivations built on top of that:
+ * cell DEFINES and USES (computed by `server/dataflow.ts` — a Python `ast` walk for
+ * module scope plus a `symtable` pass for nested scopes; that module's header owns
+ * the explanation of why both are needed). This module owns the two derivations built
+ * on top of that:
  *
  *   - the DEFINER GRAPH — per name, the document-ordered code cells that bind it,
  *     and the "nearest preceding definer" a use resolves to; and
@@ -17,10 +19,10 @@
  *
  * INHERITED LIMITS (identical to those `staleness.ts` documents; this module adds
  * NO new blind spots):
- *  - A read-then-rebind masks the read: `df = f(df)`, `x = x + 10`, `count += 1` -
- *    any cell reading a name it also rebinds - records `defines=[df]`, `uses=[]`
- *    (the probe computes `uses = referenced − defined`), so that cell does not
- *    appear to *use* `df` and gets no upstream edge.
+ *  - A CONDITIONAL bind counts as bound: `if flag: df = load()` then `df.head()`
+ *    records no use of `df`, so that cell gets no upstream edge.
+ *  - An augmented assignment to a `global`-declared name inside a function
+ *    (`def g(): global c; c += 1`) is missed; module-scope `count += 1` is not.
  *  - Dynamic names (`exec`, `globals()[...]=`, star-imports) never reach the graph;
  *    the live kernel namespace (`kernel_state`) is the fallback for those.
  *  - A forward reference (a use with no *preceding* definer) resolves to -1 / null.
@@ -224,10 +226,10 @@ export interface ImpactInfo {
  * hidden cell still propagates a dependency in the kernel), but only agent-visible
  * cells are reported. A non-code / unknown target yields empty lists.
  *
- * Inherits the definer graph's limits (see this module's header): a read-then-rebind
- * - a self-reassignment (`df = f(df)`), an augmented assignment, or any cell reading
- * a name it also rebinds - hides that cell's read, so a data cell's `dependents` can
- * UNDER-report.
+ * Inherits the definer graph's limits (see this module's header): a dependency
+ * carried only through a conditional bind, a `global`-declared augmented assignment
+ * inside a function, or `exec`/`globals()` is invisible to the graph, so a data
+ * cell's `dependents` can UNDER-report.
  *
  * There is NO runtime backstop for this. `get_notebook_map`'s `stale_state` is
  * `computeStaleness(cells, dataflow, sid)` - this same static graph plus `lastRun`

@@ -10,7 +10,7 @@
  * queue, run status, staleness, persistence - and only differs where the language
  * genuinely matters: syntax highlighting; how its source is executed
  * (`server/sql.js` wraps it as `spark.sql(...)`); and how its dataflow is derived
- * (`server/dataflow.js` keeps it out of the Python `symtable` probe and reads the
+ * (`server/dataflow.js` keeps it out of the Python `ast`/`symtable` probe and reads the
  * names it binds from `sql.js` instead, so staleness still sees its result).
  *
  * This module is the single source of truth for "is this a SQL cell" and for the

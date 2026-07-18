@@ -49,7 +49,7 @@
  *
  * `parseSqlCell` is the single source of truth for both halves: `sqlToPython`
  * compiles from it, and `dataflow.ts` reads `resultVars` from it to give a SQL cell
- * its synthetic `defines` (SQL never reaches the `symtable` probe).
+ * its synthetic `defines` (SQL never reaches the `ast`/`symtable` probe).
  */
 
 /** Rows fetched for display. Matches kernel.js's DataFrame formatter MAX_ROWS. */
