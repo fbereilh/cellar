@@ -700,6 +700,9 @@ async function main() {
 	//   CELLAR_KERNEL_CULL_INTERVAL seconds between cull sweeps (default min(300, timeout))
 	// cull_connected MUST be true: Cellar holds a persistent websocket to every
 	// kernel, so with jupyter's default (false) a kernel is never seen as idle.
+	// NOT to be confused with the app-side, near-identically-named
+	// CELLAR_KERNEL_IDLE_TIMEOUT_MS: that is kernel.ts's per-RUN liveness-probe
+	// interval (it never culls anything), while this culls a whole idle kernel process.
 	const cullArgs = cullingArgs();
 	const jupyter = spawn(
 		hostPython,

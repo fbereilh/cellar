@@ -26,7 +26,7 @@
  * no way for outputs to be duplicated or cross runs.
  */
 import { basename, sep } from 'node:path';
-import { KernelManager, ServerConnection, CommsOverSubshells } from '@jupyterlab/services';
+import { KernelManager, ServerConnection, CommsOverSubshells, KernelAPI } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
 import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from './notebook';
@@ -143,28 +143,269 @@ function resolveNb(nbPath?: string | null): string {
 }
 
 /**
- * Idle watchdog window for `execute()`. If a running cell's kernel produces NO
- * traffic at all — no iopub output, no status flip, no reply — for this long, the
- * kernel is treated as unresponsive (a stalled websocket, an undelivered
- * `execute_reply`, a dropped autorestart) and the run is aborted, so its queue slot
- * frees instead of wedging the notebook forever.
+ * Idle window for `execute()`'s watchdog - now a PROBE INTERVAL, not a deadline.
  *
- * It is an IDLE window, NOT a wall-clock timeout: ANY kernel activity RESETS it
- * (see `resetWatchdog` in `execute()`), so a legitimately long-running cell that
- * keeps emitting output — a training loop, a tqdm bar, steady prints — is NEVER
- * killed. That guarantee is non-negotiable, so the window is deliberately generous:
- * the manual "Restart kernel" control (which now force-aborts the active run) is the
- * INSTANT recovery path, and this watchdog is only the automatic backstop for a
- * kernel that has gone truly silent. Override with `CELLAR_KERNEL_IDLE_TIMEOUT_MS`
- * (milliseconds), primarily so tests can drive the trip with a tiny window.
+ * SILENCE IS NOT DEATH. This window elapsing means only "this kernel has sent us
+ * nothing for a while", which a healthy kernel does constantly: a Spark query
+ * (`spark.sql(...).toPandas()`, see `sql.ts`), a big pandas op, or model training
+ * with no logging is ONE blocking call that emits NOTHING until it returns. The
+ * watchdog used to abort on this window alone, which killed exactly those runs -
+ * it could not tell a 20-minute cluster job from a dead kernel, because both are
+ * silent. So the window no longer decides anything: it schedules a LIVENESS PROBE
+ * (`probeKernelLiveness`), and only the probe's verdict may abort a run.
+ *
+ * ANY kernel activity still resets the window (see `resetWatchdog`), so a cell that
+ * emits output is never probed at all. A cell that is silent but whose kernel probes
+ * BUSY re-arms and keeps running, indefinitely - a 3-hour Spark job survives.
+ *
+ * Because a probe is cheap (one localhost HTTP GET, ~3-5ms, only while a run is
+ * active) and no longer destructive, the interval is FAR shorter than the 15 minutes
+ * the old abort-on-expiry window needed to be safe: a wedged notebook now recovers in
+ * one window (proven death) to three (`SUSPECT_STRIKES`) - ~30-90s at the default -
+ * instead of waiting 15 minutes for the watchdog's one shot. Override with
+ * `CELLAR_KERNEL_IDLE_TIMEOUT_MS` (milliseconds); tests drive the trip with a tiny
+ * window. An explicit `0` disables the per-run watchdog entirely (see
+ * `kernelIdleTimeoutMs`) - a genuinely wedged kernel then frees its slot only on
+ * manual Restart.
  */
-const DEFAULT_KERNEL_IDLE_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+const DEFAULT_KERNEL_IDLE_TIMEOUT_MS = 30 * 1000; // 30s between liveness probes
 
-function kernelIdleTimeoutMs(): number {
-	const raw = process.env.CELLAR_KERNEL_IDLE_TIMEOUT_MS;
-	if (raw == null || raw === '') return DEFAULT_KERNEL_IDLE_TIMEOUT_MS;
+/**
+ * Consecutive SUSPECT probes required before aborting a run. A suspect verdict is
+ * ambiguous by nature (a websocket mid-reconnect, a status read racing the reply of
+ * a cell that just finished), so one is not proof. `dead` needs no strikes - a
+ * kernel the server no longer has is not a race that resolves. Mirrors
+ * `parent-watch`'s CONFIRM_STRIKES: act on a repeated reading, never a single one.
+ */
+const SUSPECT_STRIKES = 3;
+
+/**
+ * How long a single liveness probe may take before it is abandoned as `unknown`.
+ * Deliberately a fixed constant, NOT derived from the idle window: the window is a
+ * probe INTERVAL that tests drive down to milliseconds, and a probe timeout that
+ * short would time out every probe. This is a localhost GET that normally answers in
+ * ~3-5ms, so 10s is generous. At the 30s default window this can never overlap another
+ * probe: `armWatchdog()` re-arms only once a probe settles, and the only other arming
+ * path (`resetWatchdog`, on kernel traffic) cannot fire a second probe within a window
+ * longer than the timeout. Drive the window below the timeout and traffic mid-probe CAN
+ * start a second one - tolerable, because a verdict only ever re-arms or accrues a
+ * strike, never anything a stale reading could corrupt.
+ * Override with `CELLAR_KERNEL_PROBE_TIMEOUT_MS`; tests drive it tiny.
+ */
+const DEFAULT_PROBE_TIMEOUT_MS = 10 * 1000;
+
+/** Race token distinguishing "the probe timed out" from a real (possibly undefined) model. */
+const PROBE_TIMED_OUT = Symbol('probe-timed-out');
+
+/**
+ * The verdict for a probe that failed or timed out - the one reading that has no view of
+ * the kernel at all, so it turns entirely on the socket.
+ *
+ * A failed probe alone is `unknown` and NEVER convicts: absence of evidence is not
+ * evidence, and a sidecar that is briefly unreachable proves nothing about the kernel.
+ * That stance was written for a TRANSIENT failure, though, and a PERSISTENT one (a
+ * black-holed or wedged jupyter-server that still holds the TCP connection open) would
+ * fail every probe forever, so strikes could never accrue and the queue slot this
+ * watchdog exists to free would wedge permanently.
+ *
+ * The socket closes that hole WITHOUT weakening the doctrine. The websocket rides the
+ * SAME sidecar as this HTTP request, so a failed probe AND a socket that has exhausted
+ * @jupyterlab's reconnect retries into 'disconnected' are two INDEPENDENT, CORROBORATING
+ * signals that we cannot hear this kernel by ANY route. That is a POSITIVE match, which
+ * is exactly what killing requires - so it convicts through the normal strike path.
+ *
+ * A socket that is 'connected' or 'connecting' is the opposite: we still have a route to
+ * the kernel, so a failing probe stays `unknown` and re-arms forever. This is what keeps
+ * a silent multi-hour Spark query safe - its socket is connected, so probe flakiness
+ * alone can never abort it.
+ *
+ * As on every other path, the message asserts only what the reading established. Losing
+ * both routes tells us LESS about the cell than ever - on a healthy kernel it is very
+ * likely still executing - so this may never claim the cell stopped.
+ */
+function probeFailureVerdict(kernel: KernelConnection, detail: string): ProbeResult {
+	if (kernel.connectionStatus === 'disconnected') {
+		return {
+			verdict: 'suspect',
+			message: `Cannot reach the kernel by any route: ${detail} and the socket is 'disconnected'; run abandoned.`
+		};
+	}
+	return { verdict: 'unknown', message: `${detail}.` };
+}
+
+/**
+ * One parsing rule for every millisecond knob: unset, empty, non-numeric, or
+ * non-positive all fall back, so a typo'd override can never disarm a timer.
+ */
+function envMs(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw == null || raw === '') return fallback;
 	const n = Number(raw);
-	return Number.isFinite(n) && n > 0 ? n : DEFAULT_KERNEL_IDLE_TIMEOUT_MS;
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function probeTimeoutMs(): number {
+	return envMs('CELLAR_KERNEL_PROBE_TIMEOUT_MS', DEFAULT_PROBE_TIMEOUT_MS);
+}
+
+/**
+ * The idle window is the ONE knob that may be disabled outright. This branch exists
+ * because the old watchdog aborted real work, and even the redesigned probe surfaced
+ * several distinct false-positive shapes over a single review, so an explicit escape
+ * hatch is cheap insurance for a user who hits a residual one: what it forgoes -
+ * freeing a queue slot when the kernel is genuinely gone - is already recoverable by
+ * the manual Restart control the abort message points to. So an EXPLICIT "0" disables
+ * the per-run liveness watchdog entirely (`WATCHDOG_DISABLED`), matching the semantics
+ * of its neighbour `CELLAR_KERNEL_IDLE_TIMEOUT=0` (which disables culling). Empty,
+ * unset, non-numeric, and negative all still fall back to the default exactly as
+ * before - unlike `probeTimeoutMs`, a 0 probe TIMEOUT would be a meaningless footgun,
+ * so `envMs` keeps rejecting non-positive values as typos for every other knob.
+ */
+const WATCHDOG_DISABLED = 0;
+function kernelIdleTimeoutMs(): number {
+	if (process.env.CELLAR_KERNEL_IDLE_TIMEOUT_MS === '0') return WATCHDOG_DISABLED;
+	return envMs('CELLAR_KERNEL_IDLE_TIMEOUT_MS', DEFAULT_KERNEL_IDLE_TIMEOUT_MS);
+}
+
+/**
+ * A liveness verdict for a kernel we are awaiting a reply from.
+ *   `alive`   - provably executing: the run is healthy, re-arm and let it run.
+ *   `dead`    - provably gone: abort (this is the wedge the watchdog exists to clear).
+ *   `suspect` - the reply can no longer reach us ('disconnected'), or we are connected
+ *               and the kernel is not running our cell: needs strikes.
+ *   `unknown` - the probe failed or timed out with a socket that is still connected or
+ *               reconnecting, or the socket is mid-reconnect: PROVES NOTHING, so it
+ *               never aborts.
+ */
+type ProbeVerdict = 'alive' | 'dead' | 'suspect' | 'unknown';
+
+/**
+ * A verdict plus the complete sentence describing it. Each path states only what its
+ * own reading established and nothing more - the abort message is this sentence, not a
+ * shared prefix pasted in front of a fragment. A `disconnected` socket in particular
+ * may NOT claim the cell stopped running: we lost the socket, so on a healthy kernel
+ * the cell is very likely still running, and asserting otherwise would be the same
+ * confidently-wrong report ("no activity for 900s") this watchdog exists to retire.
+ */
+type ProbeResult = { verdict: ProbeVerdict; message: string };
+
+/**
+ * Probe a kernel's liveness OUT OF BAND, while its shell channel is blocked.
+ *
+ * The signal is the Jupyter server's own REST view of the kernel
+ * (`GET /api/kernels/<id>` via `KernelAPI.getKernelModel`). This is the ONLY
+ * usable one, verified empirically against a real sidecar running a blocking
+ * `time.sleep` cell:
+ *   - REST answers in ~3-5ms with `execution_state: 'busy'` while the cell blocks -
+ *     it is the SERVER's bookkeeping, so the blocked kernel never gates it;
+ *   - a `kernel_info_request` (or any `execute`, `internal:true` included) rides the
+ *     SHELL channel and QUEUES behind the running cell - it does not answer until the
+ *     cell finishes, so it would read "unresponsive" for precisely the workload this
+ *     protects. Never probe with one.
+ * `getKernelInfo()`/`listKernels()` cannot serve either: they report the LOCAL
+ * `connection.status`, which a stalled websocket freezes at 'busy' forever.
+ *
+ * A gone kernel is reported by `getKernelModel` as `undefined` (it resolves the 404,
+ * it does not throw); a throw means the sidecar itself was unreachable.
+ *
+ * The probe MUST always settle. `fetch` has no default request timeout, so a sidecar
+ * that accepts the connection but never answers (a black-holed socket, a wedged
+ * jupyter-server) would leave this pending forever - and because `armWatchdog()` only
+ * runs once a probe settles, that would DISARM the watchdog permanently, wedging the
+ * very queue slot it exists to free. So the request carries an abort signal and is
+ * raced against `probeTimeoutMs()`, cancelling the hung request rather than leaking
+ * its socket. A probe that fails or times out proves nothing about the kernel ON ITS
+ * OWN, so it is `unknown` and the watchdog merely keeps CYCLING - EXCEPT when the
+ * socket has also reached 'disconnected' (see `probeFailureVerdict`).
+ *
+ * The caller may pass its own `AbortController` so the request is cancelled the moment
+ * the run settles, instead of holding a socket for the rest of the probe timeout.
+ *
+ * Note a kernel PROCESS death is not this probe's case: `jupyter_server` autorestarts
+ * it, and `abortActiveRuns(…, 'kernel_autorestart')` already settles the run.
+ */
+async function probeKernelLiveness(
+	kernel: KernelConnection,
+	controller: AbortController = new AbortController()
+): Promise<ProbeResult> {
+	let model: { execution_state?: string } | undefined;
+	const timeoutMs = probeTimeoutMs();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const timedOut = new Promise<typeof PROBE_TIMED_OUT>((resolve) => {
+			timer = setTimeout(() => {
+				controller.abort();
+				resolve(PROBE_TIMED_OUT);
+			}, timeoutMs);
+			// Like the watchdog itself, this must never keep the Node process alive.
+			timer.unref?.();
+		});
+		const settled = await Promise.race([
+			KernelAPI.getKernelModel(kernel.id, makeSettings(controller.signal)).then((m) => ({ model: m })),
+			timedOut
+		]);
+		if (settled === PROBE_TIMED_OUT) {
+			return probeFailureVerdict(kernel, `the liveness probe timed out after ${timeoutMs}ms`);
+		}
+		model = settled.model;
+	} catch (err) {
+		return probeFailureVerdict(kernel, `the liveness probe failed (${(err as Error)?.message ?? err})`);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+	if (!model) {
+		return {
+			verdict: 'dead',
+			message:
+				'The kernel is gone from the Jupyter server (shut down or culled), so it is no longer running this cell; run aborted.'
+		};
+	}
+	const state = model.execution_state;
+	if (state === 'dead') {
+		return {
+			verdict: 'dead',
+			message:
+				'The Jupyter server reports the kernel process as dead, so it is no longer running this cell; run aborted.'
+		};
+	}
+	// The server still HAS the kernel, so the verdict now turns on whether we can still
+	// HEAR it. Exactly two paths below may accrue a strike, and each is spelled out on
+	// its own rather than reached by falling through to a catch-all.
+	const socket = kernel.connectionStatus;
+	if (socket === 'disconnected') {
+		// @jupyterlab exhausted its 7 reconnect attempts, so the reply can never reach us
+		// however healthy the kernel is. That is ALL we know: without the socket we cannot
+		// see whether the cell is still running, so the message must not claim it stopped.
+		return {
+			verdict: 'suspect',
+			message: `Lost the connection to the kernel (socket 'disconnected'); run abandoned.`
+		};
+	}
+	if (socket === 'connected') {
+		if (state === 'busy') {
+			return { verdict: 'alive', message: 'The kernel is busy executing.' };
+		}
+		// Connected, so we WOULD have heard the reply, and the kernel is not running our
+		// cell: the reply was lost or never sent. The transport failure the watchdog
+		// exists for.
+		return {
+			verdict: 'suspect',
+			message: `The kernel is '${state}', no longer running this cell - its reply was lost; run aborted.`
+		};
+	}
+	// The socket is mid-reconnect ('connecting'): INCONCLUSIVE whatever the kernel's
+	// state, so never a strike. @jupyterlab retries 7 times with backoff (~120s) and
+	// jupyter_server's `buffer_offline_messages` replays the buffered iopub/shell on
+	// reconnect, so a run that rides the blip out really does complete - including one
+	// whose cell FINISHED mid-blip, which reads 'idle' here while its `execute_reply`
+	// sits buffered for delivery. Convicting either would destroy work the kernel has
+	// already done, and report a lost reply that is about to arrive. A socket that is
+	// truly dead is not spared: the retries exhaust into 'disconnected' above, which
+	// convicts through the normal strike path - recovery is delayed, never lost.
+	return {
+		verdict: 'unknown',
+		message: `The kernel is '${state}' while the connection is '${socket}' (reconnecting).`
+	};
 }
 
 /**
@@ -204,7 +445,7 @@ function abortActiveRuns(nbKernel: NotebookKernel, reason: string): void {
 	}
 }
 
-function makeSettings() {
+function makeSettings(signal?: AbortSignal) {
 	const baseUrl = process.env.CELLAR_JUPYTER_URL || 'http://127.0.0.1:8888';
 	const token = process.env.CELLAR_JUPYTER_TOKEN || '';
 	const wsUrl = baseUrl.replace(/^http/, 'ws');
@@ -212,6 +453,9 @@ function makeSettings() {
 		baseUrl,
 		wsUrl,
 		token,
+		// `init` REPLACES @jupyterlab's default rather than merging into it, so its
+		// defaults are restated here alongside the caller's optional abort signal.
+		init: { cache: 'no-store', credentials: 'same-origin', signal },
 		// Node 18+ ships global fetch/WebSocket; pass them explicitly so
 		// @jupyterlab/services does not reach for a browser-only shim.
 		fetch: globalThis.fetch,
@@ -1226,9 +1470,10 @@ export async function execute(
 	// `execute_reply`, or a dropped autorestart would leave it pending forever, so
 	// the run's queue slot never frees and the notebook can never run again. Guard it
 	// two ways, both resolving through the SAME race below (never a second release):
-	//   (1) an IDLE watchdog — if the kernel goes silent (no iopub, no status flip,
-	//       no reply) for `idleMs`, the run aborts. `resetWatchdog` re-arms on ANY
-	//       activity, so a long cell that keeps emitting output is never killed;
+	//   (1) a PROBE-BACKED idle watchdog - if the kernel goes silent (no iopub, no
+	//       status flip, no reply) for `idleMs`, the run is NOT aborted: the kernel is
+	//       probed out-of-band (`probeKernelLiveness`) and only PROVEN death aborts.
+	//       Silence is what a Spark query looks like, so silence alone may never kill;
 	//   (2) a force-abort handle in `nbKernel.activeRuns`, so restart/autorestart/
 	//       teardown can settle THIS run (see `abortActiveRuns`).
 	// Either trigger rejects the race; `execute()` then disposes the future and
@@ -1237,6 +1482,10 @@ export async function execute(
 	let settled = false;
 	let aborted = false;
 	let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
+	let suspectStrikes = 0;
+	// The in-flight probe's controller, so the run's teardown can cancel a hung request
+	// instead of leaving it holding a socket for the rest of the probe timeout.
+	let probeController: AbortController | undefined;
 	let abortReject: ((err: Error) => void) | null = null;
 	const abortRace = new Promise<never>((_, reject) => {
 		abortReject = reject;
@@ -1250,19 +1499,75 @@ export async function execute(
 		aborted = true;
 		abortReject?.(err);
 	};
-	const resetWatchdog = () => {
+	const armWatchdog = () => {
 		if (settled || aborted) return;
+		// A disabled watchdog (CELLAR_KERNEL_IDLE_TIMEOUT_MS=0) never arms a timer, so it
+		// never probes and never aborts: the run relies solely on the force-abort path
+		// (restart/autorestart/teardown) and the kernel's own reply, i.e. the pre-watchdog
+		// world. `resetWatchdog` funnels here too, so kernel traffic is likewise a no-op.
+		if (idleMs === WATCHDOG_DISABLED) return;
 		if (watchdogTimer) clearTimeout(watchdogTimer);
-		watchdogTimer = setTimeout(() => {
-			triggerAbort(
-				new KernelExecuteAborted(
-					`Kernel went unresponsive (no activity for ${Math.round(idleMs / 1000)}s); run aborted. Restart the kernel to recover.`,
-					'idle_watchdog'
-				)
-			);
-		}, idleMs);
+		// A timer-fired rejection has no awaiter and would crash the app (the comm-subshell
+		// trap this repo already hit), so make that structurally impossible here rather
+		// than relying on `probeKernelLiveness` catching everything forever.
+		watchdogTimer = setTimeout(() => void onIdleWindowExpired().catch(() => {}), idleMs);
 		// The watchdog must never keep the Node process alive on its own.
 		watchdogTimer.unref?.();
+	};
+	/**
+	 * The idle window elapsed. This is NOT grounds to abort - it only means the kernel
+	 * has been quiet, which is exactly what a healthy blocking cell looks like. Ask the
+	 * kernel itself, out of band, and let the verdict decide:
+	 *   alive   → healthy, re-arm; repeats forever, so a 3-hour job survives;
+	 *   dead    → proven gone: abort now, freeing the queue slot (the watchdog's job);
+	 *   suspect → ambiguous: abort only on `SUSPECT_STRIKES` consecutive readings;
+	 *   unknown → the probe proved nothing (it failed or timed out with a socket we still
+	 *             have, or the socket is mid-reconnect): re-arm, NEVER abort.
+	 * The inconclusive stance is deliberate and matches the instance reaper's
+	 * (`pidReapDecision`): killing REQUIRES a positive match, because the costs are not
+	 * symmetric - a false abort destroys the user's real work (a cluster job that has
+	 * run for an hour, unrecoverable), while a false re-arm only delays recovery of a
+	 * notebook that is already broken, and the manual "Restart kernel" control remains
+	 * the instant, always-available escape from that.
+	 */
+	const onIdleWindowExpired = async () => {
+		if (settled || aborted) return;
+		// `probeController` is a single shared slot but probes can overlap (drive the
+		// window below the probe timeout). Capture this probe's own controller and only
+		// clear the shared slot when it still holds THIS instance, so an overlapping probe
+		// or the run's teardown always aborts the currently-live controller, never a
+		// settled one and never nothing.
+		const mine = new AbortController();
+		probeController = mine;
+		let result: ProbeResult;
+		try {
+			result = await probeKernelLiveness(kernel, mine);
+		} finally {
+			if (probeController === mine) probeController = undefined;
+		}
+		const { verdict, message } = result;
+		// The run may have finished while the probe was in flight; if so it is settled
+		// through the normal path and must not be touched (nor the watchdog re-armed).
+		if (settled || aborted) return;
+		if (verdict === 'alive' || verdict === 'unknown') {
+			suspectStrikes = 0;
+			armWatchdog();
+			return;
+		}
+		if (verdict === 'suspect') {
+			suspectStrikes += 1;
+			if (suspectStrikes < SUSPECT_STRIKES) {
+				armWatchdog();
+				return;
+			}
+		}
+		logWarn('kernel', `aborting run on ${abs}: ${message}`);
+		triggerAbort(new KernelExecuteAborted(`${message} Restart the kernel to recover.`, 'idle_watchdog'));
+	};
+	/** Kernel traffic: the run is provably alive, so re-arm and forget any strikes. */
+	const resetWatchdog = () => {
+		suspectStrikes = 0;
+		armWatchdog();
 	};
 	const run: ActiveRun = {
 		abort: (reason) => triggerAbort(new KernelExecuteAborted('Run aborted: the kernel was restarted.', reason))
@@ -1334,6 +1639,10 @@ export async function execute(
 	} finally {
 		settled = true;
 		if (watchdogTimer) clearTimeout(watchdogTimer);
+		// A probe still in flight can no longer change anything (its verdict is discarded
+		// by the settled/aborted guard), so cancel its request rather than let a hung GET
+		// hold a socket for the rest of the probe timeout.
+		probeController?.abort();
 		nbKernel.activeRuns.delete(run);
 		if (!internal) {
 			nbKernel.userRuns -= 1;
