@@ -34,6 +34,7 @@ import { workspaceRoot } from './fstree';
 import { addProjectRootToPath } from './ui-state';
 import { projectRootAddCode, projectRootRemoveCode } from './projectRoot';
 import { CONTROL_COMM_TARGET, RESTART_MAGIC_CODE, controlOp } from './controlMagic';
+import { WIDGETS_SHIM_CODE } from './widgetsShim';
 import { publish, publishGlobal } from './events';
 import {
 	openWidget,
@@ -992,6 +993,9 @@ async function initKernel(kernel: KernelConnection): Promise<void> {
 		STARTUP_CODE,
 		// The Cellar DataFrame/Series display formatter (interactive grid mimetype).
 		DATAFRAME_FORMATTER_CODE,
+		// The native `dbutils.widgets` shim (Databricks-style parameter widgets on
+		// any kernel; value-only silent degrade when ipywidgets is absent).
+		WIDGETS_SHIM_CODE,
 		// The %restart_python line magic (managed restart via the control comm).
 		RESTART_MAGIC_CODE
 	];

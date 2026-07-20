@@ -32,6 +32,8 @@
 		childIds,
 		optionLabels,
 		selectedIndex,
+		selectedIndices,
+		comboOptions,
 		rangeValue,
 		widgetStep,
 		isFloatWidget,
@@ -76,6 +78,11 @@
 	const children = $derived(childIds(state));
 	const options = $derived(optionLabels(state));
 	const index = $derived(selectedIndex(state));
+	// SelectMultiple: `index` is a tuple of selected slots. Combobox: free-text
+	// with `options` suggestions rendered via a <datalist>.
+	const indices = $derived(selectedIndices(state));
+	const comboOpts = $derived(comboOptions(state));
+	const comboListId = $derived(`wl-${modelId}`);
 	const step = $derived(widgetStep(state, name));
 	const minV = $derived(num(state?.min, 0));
 	const maxV = $derived(num(state?.max, 100));
@@ -108,6 +115,15 @@
 		let hi = parseNum((e.target as HTMLInputElement).value);
 		if (hi < lo) hi = lo;
 		onContinuous({ value: [lo, hi] });
+	}
+
+	// SelectMultiple: collect every selected <option> slot → `index` tuple. The
+	// kernel derives `value`/`label` from `index`, so `.get()` reflects the choice.
+	function onMultiChange(e: Event) {
+		const chosen = Array.from((e.target as HTMLSelectElement).selectedOptions).map((o) =>
+			Number(o.value)
+		);
+		onCommit({ index: chosen });
 	}
 </script>
 
@@ -255,6 +271,43 @@
 				<option value={i} selected={i === index}>{opt}</option>
 			{/each}
 		</select>
+	</label>
+{:else if kind === 'multiselect'}
+	<!-- A native <select multiple> listbox, NOT daisyUI's `.select` (that class is
+	     tuned for a single-line dropdown and collapses the options); styled to
+	     match the bordered inputs while staying a proper vertical multi-select. -->
+	<label class="flex items-start gap-2 text-sm" data-testid="widget-multiselect">
+		{#if description}<span class="min-w-16 pt-1 text-xs text-base-content/70">{description}</span>{/if}
+		<select
+			class="min-w-32 rounded-md border border-base-300 bg-base-100 px-1 py-1 text-sm focus:border-primary focus:outline-none disabled:opacity-50"
+			multiple
+			size={Math.min(Math.max(options.length, 2), 6)}
+			{disabled}
+			onchange={onMultiChange}
+		>
+			{#each options as opt, i (i)}
+				<option class="rounded px-1" value={i} selected={indices.includes(i)}>{opt}</option>
+			{/each}
+		</select>
+	</label>
+{:else if kind === 'combobox'}
+	<label class="flex items-center gap-2 text-sm" data-testid="widget-combobox">
+		{#if description}<span class="min-w-16 text-xs text-base-content/70">{description}</span>{/if}
+		<input
+			type="text"
+			class="input input-bordered input-sm"
+			list={comboListId}
+			placeholder={str(state?.placeholder)}
+			value={strValue}
+			{disabled}
+			oninput={(e) => onContinuous({ value: (e.target as HTMLInputElement).value })}
+			onchange={(e) => onCommit({ value: (e.target as HTMLInputElement).value })}
+		/>
+		<datalist id={comboListId}>
+			{#each comboOpts as opt (opt)}
+				<option value={opt}></option>
+			{/each}
+		</datalist>
 	</label>
 {:else if kind === 'text' || kind === 'password'}
 	<label class="flex items-center gap-2 text-sm" data-testid="widget-{kind}">

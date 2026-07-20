@@ -45,6 +45,26 @@ export function selectedIndex(state: WidgetState | undefined): number {
 	return i;
 }
 
+/**
+ * A multi-select widget's selected option indices — `SelectMultiple` syncs
+ * `index` as a tuple (array), not a scalar. Empty when nothing is selected.
+ */
+export function selectedIndices(state: WidgetState | undefined): number[] {
+	const i = state?.index;
+	if (!Array.isArray(i)) return [];
+	return i.filter((x): x is number => typeof x === 'number' && Number.isInteger(x));
+}
+
+/**
+ * A combobox's free-text suggestions — `Combobox` syncs `options` (not the
+ * selection widgets' `_options_labels`), always coerced to strings.
+ */
+export function comboOptions(state: WidgetState | undefined): string[] {
+	const o = state?.options;
+	if (!Array.isArray(o)) return [];
+	return o.map((x) => String(x));
+}
+
 /** Progress/slider bar geometry, normalized so a non-zero `min` still starts at 0. */
 export function barGeometry(state: WidgetState | undefined): { barValue: number; span: number } {
 	const min = num(state?.min, 0);
@@ -122,6 +142,10 @@ export function widgetKind(name: string): string {
 			return 'select';
 		case 'ToggleButtons':
 			return 'togglebuttons';
+		case 'Combobox':
+			return 'combobox';
+		case 'SelectMultiple':
+			return 'multiselect';
 		case 'Text':
 			return 'text';
 		case 'Textarea':

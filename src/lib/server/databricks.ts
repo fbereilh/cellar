@@ -1109,6 +1109,10 @@ def _cellar_dbx_connect(_cfg):
         return {'ok': False, 'code': 'session_failed', 'message': '%s: %s' % (type(_e).__name__, _e)}
     _g['spark'] = _spark
     _g['w'] = _w
+    # Deliberately NOT rebinding dbutils: the Cellar-native dbutils.widgets shim
+    # injected at kernel start (widgetsShim.ts) owns the bare dbutils name so
+    # parameter widgets work with or without a connection. The SDK's own
+    # w.dbutils stays reachable and untouched. No double-binding / shadowing.
     # Live per-stage job progress bars. Best-effort: a failure here (no
     # ipywidgets, an older client) must never fail the connection.
     try:
