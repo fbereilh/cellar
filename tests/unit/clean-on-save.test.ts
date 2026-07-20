@@ -218,6 +218,35 @@ describe('cleanNotebook — ipywidgets (tqdm) volatile output policy', () => {
 		(runB.cells[0].outputs[0].data[WIDGET_MIME] as any).model_id = 'totally-different-uuid';
 		expect(stringify(cleanNotebook(runA))).toBe(stringify(cleanNotebook(runB)));
 	});
+
+	it('drops a live Spark job-progress bar so it never reaches the .ipynb', () => {
+		// The live Spark progress bar (databricks.ts) is an ordinary ipywidget
+		// (an HBox[FloatProgress, Label]), so its display_data carries the same
+		// widget-view mime and no useful fallback — clean-on-save must drop the
+		// whole output, leaving zero git diff from a query's progress.
+		const nb: any = {
+			nbformat: 4,
+			nbformat_minor: 5,
+			metadata: { kernelspec: { name: 'python3' } },
+			cells: [
+				{
+					cell_type: 'code',
+					id: 'sql1',
+					source: 'spark.range(0, 2_000_000_000).selectExpr("sum(id % 7)").collect()',
+					execution_count: 1,
+					metadata: {},
+					outputs: [
+						{
+							output_type: 'display_data',
+							data: { [WIDGET_MIME]: { version_major: 2, version_minor: 0, model_id: 'sparkbar' } },
+							metadata: {}
+						}
+					]
+				}
+			]
+		};
+		expect((cleanNotebook(nb).cells[0] as any).outputs).toHaveLength(0);
+	});
 });
 
 describe('scrubAddresses / stripRuntimeMeta helpers', () => {

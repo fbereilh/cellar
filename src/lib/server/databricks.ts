@@ -853,6 +853,198 @@ export async function listTables(sel: Selection, catalog: string, schema: string
 const pyLiteral = (cfg: unknown): string => JSON.stringify(JSON.stringify(cfg));
 
 /**
+ * The pure, ipywidgets-free core of the live Spark-progress feature: the
+ * per-stage → overall-completion projection (`_cellar_spark_summary`) and the
+ * stateful bar manager (`_CellarSparkProgress`). Kept renderer-agnostic (the
+ * manager takes an injected renderer) so it is exercisable from a plain `python3`
+ * in a unit test with a fake renderer, exactly as `dataflow.ts`'s probe is - see
+ * `tests/unit/spark-progress.test.ts`.
+ *
+ * Design facts, all hard-won against a real Databricks cluster (recorded in
+ * `AGENTS.md`):
+ *   - `registerProgressHandler` is Spark **Connect only** (`@remote_only`), which
+ *     is exactly what Cellar's Databricks integration uses. The handler is called
+ *     synchronously on the cell-execution thread inside `.collect()`, so a widget
+ *     displayed here parents to the running cell's output - just like tqdm.
+ *   - The handler fires ~4-5 times per ~2s tick with IDENTICAL payloads, so it
+ *     MUST dedupe (here: by `key`, an absolute-counts tuple - never increments).
+ *   - A query shorter than the server `reportInterval` (~2s) delivers a single
+ *     terminal `done=True` callback and no intermediate ticks. That is expected;
+ *     the `if s['done'] ... return` guard means such a query (and Cellar's own
+ *     sub-second internal `SELECT 1` probes) never flashes a bar.
+ */
+export const SPARK_PROGRESS_CORE_PY = `
+def _cellar_human_bytes(n):
+    try:
+        n = float(n or 0)
+    except Exception:
+        return ''
+    if n <= 0:
+        return ''
+    for _u in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
+        if n < 1024.0 or _u == 'PiB':
+            return ('%d B' % int(n)) if _u == 'B' else ('%.1f %s' % (n, _u))
+        n /= 1024.0
+
+def _cellar_spark_summary(stages, inflight_tasks, done):
+    stages = list(stages or [])
+    total = 0
+    completed = 0
+    nbytes = 0
+    for _st in stages:
+        total += int(getattr(_st, 'num_tasks', 0) or 0)
+        completed += int(getattr(_st, 'num_completed_tasks', 0) or 0)
+        nbytes += int(getattr(_st, 'num_bytes_read', 0) or 0)
+    try:
+        inflight = int(inflight_tasks or 0)
+    except Exception:
+        inflight = 0
+    pct = (100.0 * completed / total) if total > 0 else 0.0
+    _parts = ['%d/%d tasks' % (completed, total)]
+    if inflight > 0:
+        _parts.append('%d running' % inflight)
+    _hb = _cellar_human_bytes(nbytes)
+    if _hb:
+        _parts.append(_hb)
+    return {
+        'total': total,
+        'completed': completed,
+        'inflight': inflight,
+        'bytes': nbytes,
+        'num_stages': len(stages),
+        'pct': pct,
+        'done': bool(done),
+        'key': (completed, total, inflight, bool(done), len(stages)),
+        'label': ' \\u00b7 '.join(_parts),
+    }
+
+class _CellarSparkProgress:
+    def __init__(self, renderer):
+        self._r = renderer
+        self._bars = {}
+
+    def handle(self, stages, inflight_tasks, operation_id, done):
+        # The handler runs inside the user's .collect(); a bug here must never
+        # break their query, so the whole body is swallowed.
+        try:
+            s = _cellar_spark_summary(stages, inflight_tasks, done)
+            e = self._bars.get(operation_id)
+            if e is None:
+                # No bar yet: only create one for a query still doing real work.
+                # A terminal-only callback (sub-interval query / internal probe)
+                # or a zero-task plan never flashes a bar.
+                if s['done'] or s['total'] <= 0:
+                    return
+                e = {'w': self._r.make(), 'key': None}
+                self._bars[operation_id] = e
+                self._r.show(e['w'])
+            # DEDUPE: the ~4-5 identical callbacks per tick collapse to one render.
+            if s['key'] == e['key']:
+                return
+            e['key'] = s['key']
+            self._r.update(e['w'], s)
+            if s['done']:
+                # Complete + stop tracking this query. The renderer fills to 100%
+                # and closes the widget; the bar never persists (clean-on-save
+                # strips the widget-view mime).
+                self._r.close(e['w'], s)
+                self._bars.pop(operation_id, None)
+        except Exception:
+            pass
+
+
+def _cellar_spark_progress_cb(mgr):
+    # The callable actually registered with Spark. It is deliberately NOT the
+    # bound method: pyspark's Progress._notify invokes the handler with no
+    # try/except of its own, so an argument-binding mismatch (a future
+    # databricks-connect ProgressHandler.__call__ signature change - added,
+    # renamed, or reordered params) would raise INSIDE the user's .collect()
+    # and break their query, which the handler body's own try/except cannot
+    # reach. This *args/**kwargs wrapper binds any call shape, extracts the four
+    # fields by keyword (falling back to positional index for other call
+    # conventions), and swallows everything - so a signature drift degrades to
+    # 'no bar' instead of a crash. It must itself never raise.
+    def _cb(*args, **kwargs):
+        try:
+            def _pick(name, idx):
+                if name in kwargs:
+                    return kwargs[name]
+                if idx < len(args):
+                    return args[idx]
+                return None
+            mgr.handle(_pick('stages', 0), _pick('inflight_tasks', 1),
+                       _pick('operation_id', 2), _pick('done', 3))
+        except Exception:
+            pass
+    return _cb
+`;
+
+/**
+ * Registers the progress handler on a live `spark` session, wired to an
+ * ipywidgets renderer (an `HBox[FloatProgress, Label]`, the same composite tqdm
+ * uses, so it draws through Cellar's already-working widget pipeline with zero
+ * frontend work). Guarded on ipywidgets being importable: if it is absent the
+ * function registers nothing and returns, degrading silently to today's behavior
+ * (Cellar only guarantees `ipykernel` in a project venv). `clearProgressHandlers`
+ * first makes re-registration on reconnect idempotent (no duplicate bars).
+ */
+const SPARK_PROGRESS_INSTALL_PY = `
+def _cellar_install_spark_progress(_spark):
+    _g = globals()
+    try:
+        import ipywidgets as _ipw
+        from IPython.display import display as _ipy_display
+    except Exception:
+        return False
+
+    class _CellarIpwRenderer:
+        def make(self):
+            _bar = _ipw.FloatProgress(value=0.0, min=0.0, max=100.0,
+                                      description='Spark', bar_style='info')
+            _lbl = _ipw.Label(value='starting\\u2026')
+            return (_ipw.HBox([_bar, _lbl]), _bar, _lbl)
+
+        def show(self, w):
+            # Emit ONLY the widget-view mime, never the text/plain HBox repr:
+            # clean-on-save strips the widget mime, and with no fallback the
+            # output is left empty and dropped entirely, so a query's progress
+            # bar leaves ZERO residue in the saved .ipynb (a kept text/plain repr
+            # would otherwise persist an 'HBox(children=(FloatProgress(...)))'
+            # line). Live rendering is unaffected - the browser draws from the
+            # widget model over the comm, not the fallback.
+            _ipy_display(w[0], include=['application/vnd.jupyter.widget-view+json'])
+
+        def update(self, w, s):
+            _box, _bar, _lbl = w
+            _bar.value = s['pct']
+            _lbl.value = s['label']
+
+        def close(self, w, s):
+            _box, _bar, _lbl = w
+            _bar.value = 100.0
+            _bar.bar_style = 'success'
+            _lbl.value = s['label']
+            try:
+                _box.close()
+            except Exception:
+                pass
+
+    _mgr = _CellarSparkProgress(_CellarIpwRenderer())
+    _g['_cellar_spark_progress'] = _mgr
+    _cb = _cellar_spark_progress_cb(_mgr)
+    _g['_cellar_spark_progress_cb'] = _cb
+    try:
+        _spark.clearProgressHandlers()
+    except Exception:
+        pass
+    try:
+        _spark.registerProgressHandler(_cb)
+        return True
+    except Exception:
+        return False
+`;
+
+/**
  * The boilerplate, run once inside the kernel. Everything is underscore-prefixed
  * or deleted afterwards, so the only names it leaves behind are the two the user
  * asked for: `spark` and `w`.
@@ -872,7 +1064,8 @@ const pyLiteral = (cfg: unknown): string => JSON.stringify(JSON.stringify(cfg));
  */
 const CONNECT_CODE = (cfg: { auth: Auth; cluster_id: string }): string => `
 import json as _cellar_json
-
+${SPARK_PROGRESS_CORE_PY}
+${SPARK_PROGRESS_INSTALL_PY}
 def _cellar_dbx_connect(_cfg):
     import os
     _keep = {${[...KEEP_ENV].map((k) => `'${k}'`).join(', ')}}
@@ -916,6 +1109,12 @@ def _cellar_dbx_connect(_cfg):
         return {'ok': False, 'code': 'session_failed', 'message': '%s: %s' % (type(_e).__name__, _e)}
     _g['spark'] = _spark
     _g['w'] = _w
+    # Live per-stage job progress bars. Best-effort: a failure here (no
+    # ipywidgets, an older client) must never fail the connection.
+    try:
+        _cellar_install_spark_progress(_spark)
+    except Exception:
+        pass
     try:
         _version = _spark.version
     except Exception:
@@ -939,8 +1138,13 @@ def _cellar_dbx_disconnect():
     _g = globals()
     _old = _g.pop('spark', None)
     _g.pop('w', None)
+    _g.pop('_cellar_spark_progress', None)
     if _old is None:
         return {'ok': True, 'stopped': False}
+    try:
+        _old.clearProgressHandlers()
+    except Exception:
+        pass
     try:
         _old.stop()
     except Exception as _e:
