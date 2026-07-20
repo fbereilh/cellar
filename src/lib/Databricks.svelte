@@ -525,7 +525,7 @@
 		no_python: 'Bind a Python environment in Settings → Python environment.',
 		no_uv: 'Cellar installs packages with uv. Install uv, or install the packages yourself.',
 		session_failed: 'The cluster refused the Spark session. Check that databricks-connect matches the cluster’s runtime version, and that the cluster allows Databricks Connect.',
-		version_mismatch: 'databricks-connect is newer than the cluster’s runtime. Cellar re-pins a matching client automatically on your next connect - just click the cluster again. To pin it by hand, set the cluster’s runtime major.minor in the runtime-version field above and reinstall.',
+		version_mismatch: 'databricks-connect is newer than the cluster’s runtime. Cellar re-pins a matching client automatically on your next connect - just click the cluster again.',
 		read_failed: 'Spark could not read that table.',
 		kernel_unavailable: 'Cellar could not reach the Python kernel. Restart Cellar, then connect again.',
 		busy: 'Another Databricks operation is still running.'

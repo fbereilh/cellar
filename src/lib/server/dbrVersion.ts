@@ -54,20 +54,38 @@ export function connectMajorMinor(version: string | null | undefined): string | 
  * no reinstall is needed.
  *
  *   - `dbr` unknown (`null`) ⇒ `null` (serverless / unresolvable — never guess).
- *   - installed client's major.minor already equals `dbr` ⇒ `null` (no-op; the
- *     newest patch of the right minor is fine, a patch-level move is never forced).
- *   - otherwise ⇒ `dbr` (e.g. `"17.3"`), the line to `databricks-connect==17.3.*`.
+ *   - installed client's major.minor unparseable ⇒ `null` (never force a reinstall
+ *     loop on a version we cannot read).
+ *   - installed client is older-or-equal to `dbr` numerically ⇒ `null` (a client
+ *     ≤ the runtime connects fine, so leave it untouched).
+ *   - only when the installed client is provably NEWER than `dbr` ⇒ `dbr`
+ *     (e.g. `"17.3"`), the line to `databricks-connect==17.3.*`.
  *
- * Note this is symmetric: a client that is TOO OLD for the cluster is repinned to
- * the cluster's line just as a too-new one is, which is the correct client either
- * way.
+ * This is **asymmetric** on purpose: Databricks Connect only hard-fails when the
+ * client is NEWER than the runtime, so a too-old client is deliberately left alone
+ * (no reinstall, no namespace-wiping kernel restart). The comparison is NUMERIC on
+ * major.minor (so `17.10` > `17.3`, not the lexical opposite).
  */
 export function pinTargetForConnect(
 	dbr: string | null | undefined,
 	installedConnect: string | null | undefined
 ): string | null {
 	if (!dbr) return null;
-	return connectMajorMinor(installedConnect) === dbr ? null : dbr;
+	const installed = connectMajorMinor(installedConnect);
+	if (!installed) return null;
+	return compareMajorMinor(installed, dbr) > 0 ? dbr : null;
+}
+
+/**
+ * Numerically compare two `major.minor` strings. Returns >0 when `a` is newer than
+ * `b`, <0 when older, 0 when equal. Numeric, not lexical: `17.10` is newer than
+ * `17.3`. A component that does not parse is treated as `0`.
+ */
+function compareMajorMinor(a: string, b: string): number {
+	const [aMaj, aMin] = a.split('.').map((n) => Number.parseInt(n, 10) || 0);
+	const [bMaj, bMin] = b.split('.').map((n) => Number.parseInt(n, 10) || 0);
+	if (aMaj !== bMaj) return aMaj - bMaj;
+	return aMin - bMin;
 }
 
 /**
@@ -108,7 +126,6 @@ export function versionMismatchMessage({
 	return (
 		`Databricks Connect (${client}) is newer than your cluster's runtime (DBR ${runtime}). ` +
 		`Cellar needs a client that matches — pin \`databricks-connect==${runtime}.*\` ` +
-		`(Cellar re-pins this automatically on your next connect, or set "${runtime}" in the ` +
-		`Databricks panel's runtime-version field and reinstall).`
+		`(Cellar re-pins this automatically on your next connect; just click the cluster again).`
 	);
 }

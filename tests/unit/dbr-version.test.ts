@@ -55,12 +55,19 @@ describe('connectMajorMinor', () => {
 });
 
 describe('pinTargetForConnect', () => {
-	it('pins to the DBR line when the installed client mismatches (the captain’s case)', () => {
+	it('pins to the DBR line when the installed client is NEWER (the captain’s case)', () => {
 		// DBR 17.3 cluster, latest client 18.3.2 installed → pin to 17.3.
 		expect(pinTargetForConnect('17.3', '18.3.2')).toBe('17.3');
 	});
-	it('pins even when the client is TOO OLD for the cluster (symmetric)', () => {
-		expect(pinTargetForConnect('17.3', '15.4.1')).toBe('17.3');
+	it('leaves a client that is TOO OLD for the cluster untouched (asymmetric)', () => {
+		// A client ≤ the runtime connects fine, so no reinstall / kernel restart.
+		expect(pinTargetForConnect('17.3', '15.4.1')).toBeNull();
+	});
+	it('compares major.minor numerically, not lexically', () => {
+		// 17.10 is NEWER than 17.3 (10 > 3), so it must be re-pinned.
+		expect(pinTargetForConnect('17.3', '17.10.0')).toBe('17.3');
+		// 17.3 is OLDER than 17.10 (3 < 10), so it is left alone.
+		expect(pinTargetForConnect('17.10', '17.3.0')).toBeNull();
 	});
 	it('is a no-op when the installed client already matches the DBR line', () => {
 		expect(pinTargetForConnect('17.3', '17.3.12')).toBeNull();
@@ -70,9 +77,9 @@ describe('pinTargetForConnect', () => {
 		expect(pinTargetForConnect(null, '18.3.2')).toBeNull();
 		expect(pinTargetForConnect(undefined, '18.3.2')).toBeNull();
 	});
-	it('treats an unparseable installed version as a mismatch (reinstall to be safe)', () => {
-		expect(pinTargetForConnect('17.3', null)).toBe('17.3');
-		expect(pinTargetForConnect('17.3', 'unknown')).toBe('17.3');
+	it('leaves an unparseable installed version untouched (never a forced reinstall loop)', () => {
+		expect(pinTargetForConnect('17.3', null)).toBeNull();
+		expect(pinTargetForConnect('17.3', 'unknown')).toBeNull();
 	});
 });
 
