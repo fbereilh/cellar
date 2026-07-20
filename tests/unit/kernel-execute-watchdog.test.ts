@@ -108,6 +108,12 @@ const h = vi.hoisted(() => {
 			restart: vi.fn(async () => {}),
 			interrupt: vi.fn(async () => {}),
 			shutdown: vi.fn(async () => {}),
+			// Rung-1 socket refresh: a real reconnect() rebuilds the websocket and the
+			// socket returns to 'connected'. The fake mirrors that so a disconnected
+			// conviction can self-heal (see refreshKernelConnection).
+			reconnect: vi.fn(async () => {
+				k.connectionStatus = 'connected';
+			}),
 			dispose: vi.fn()
 		};
 		h.lastKernel = k;
@@ -408,7 +414,10 @@ describe('the websocket state alone never convicts a busy kernel', () => {
 		// Without the socket we cannot see whether the cell is still running - and on a
 		// healthy kernel it very likely is. The message must claim only what we know.
 		expect(evalue).not.toMatch(/no longer running this cell|reply was lost/i);
-		expect(evalue).toMatch(/restart the kernel to recover/i);
+		// A dead socket now self-heals (rung 1): the message points at re-running, not at
+		// a manual restart, and the watchdog kicked the socket refresh (x8).
+		expect(evalue).toMatch(/connection is being refreshed; re-run the cell/i);
+		expect(evalue).not.toMatch(/restart the kernel to recover/i);
 		expect(h.lastHanging!.dispose).toHaveBeenCalledTimes(1);
 		expect(queue.queueStateFor(abs())).toEqual({ running: null, queue: [] });
 	});
@@ -510,7 +519,9 @@ describe('an inconclusive probe never aborts', () => {
 		// Having lost BOTH routes we know LESS about the cell than ever - on a healthy
 		// kernel it is very likely still executing - so this may not claim it stopped.
 		expect(evalue).not.toMatch(/no longer running this cell|reply was lost/i);
-		expect(evalue).toMatch(/restart the kernel to recover/i);
+		// A dead socket self-heals (rung 1) here too: re-run, not manual restart.
+		expect(evalue).toMatch(/connection is being refreshed; re-run the cell/i);
+		expect(evalue).not.toMatch(/restart the kernel to recover/i);
 		expect(h.lastHanging!.dispose).toHaveBeenCalledTimes(1);
 		// It convicts through the normal strike path, never on a single reading.
 		expect(h.probeCalls).toBeGreaterThanOrEqual(SUSPECT_STRIKES);
@@ -559,6 +570,40 @@ describe('an inconclusive probe never aborts', () => {
 		// Unwedged: the notebook runs again.
 		const c2 = newCell('after = 1');
 		expect((await runViaOwner(c2, 'after = 1')).status).toBe('ok');
+	});
+});
+
+describe('a disconnected socket self-heals: the notebook is no longer wedged (x8)', () => {
+	it('after a disconnected conviction, the NEXT run refreshes the socket and succeeds', async () => {
+		const nb = abs();
+		const kid = () => h.lastKernel!.id;
+		const startedKernel = kid();
+		const c = newCell('spark  # HANG');
+		const runP = startRun(c, 'spark  # HANG');
+		await waitForProbes(1);
+		// The websocket dies: @jupyterlab's retries are spent. The old bug left this dead
+		// connection in the map, so every later run wedged in _pendingMessages forever.
+		h.lastKernel!.connectionStatus = 'disconnected';
+
+		const res = await runP;
+		// The convicted run is still lost (option a) - the win is that the notebook heals.
+		expect(res.status).toBe('error');
+		expect(String((res.outputs[0] as unknown as Record<string, unknown>).evalue)).toMatch(
+			/connection is being refreshed; re-run the cell/i
+		);
+
+		// The rung-1 socket refresh (the watchdog's fire-and-forget and/or the next run's
+		// defensive dispatch check) rebuilt the websocket: the notebook runs again with NO
+		// manual restart, which is the whole point of x8.
+		const c2 = newCell('after = 1');
+		const r2 = await runViaOwner(c2, 'after = 1');
+		expect(r2.status).toBe('ok');
+		expect(h.lastKernel!.reconnect).toHaveBeenCalled();
+		// Same kernel, same process: refresh preserved it (no teardown, no restart). A
+		// teardown+lazy-restart would have started a NEW fake kernel (kernel-N+1).
+		expect(kid()).toBe(startedKernel);
+		expect(h.lastKernel!.shutdown).not.toHaveBeenCalled();
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
 	});
 });
 
