@@ -119,8 +119,10 @@ bundles no CLI. It reads profiles from `~/.databrickscfg` (override the location
 with the standard `DATABRICKS_CONFIG_FILE` env var). In the sidebar's
 **Databricks** section, pick a profile and cluster and click Connect; Cellar binds
 `spark` and a `WorkspaceClient` (`w`) into the kernel. A **PAT** profile works
-headless; **OAuth** uses a browser flow. `databricks-connect` must match the
-cluster's DBR major.minor; Cellar installs it into the project venv on connect.
+headless; **OAuth** uses a browser flow. `databricks-connect` must be no newer
+than the cluster's DBR (a newer client hard-fails the session); Cellar installs
+it into the project venv on connect, pinned to the cluster's DBR major.minor, and
+re-pins a matching client automatically if a mismatch would otherwise surface.
 
 A teammate with **no** `~/.databrickscfg` can still type a workspace host in the UI
 and sign in through the browser - a config file is not required to get started.

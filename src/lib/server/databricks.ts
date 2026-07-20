@@ -79,7 +79,13 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { execute, currentSessionId, kernelStatus } from './kernel';
+import { execute, currentSessionId, kernelStatus, restartKernel } from './kernel';
+import {
+	dbrMajorMinor,
+	parseVersionMismatch,
+	pinTargetForConnect,
+	versionMismatchMessage
+} from './dbrVersion';
 import { resolveNotebookPath } from './notebook';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
@@ -115,6 +121,7 @@ interface ProbeRequest {
 	auth?: Auth;
 	catalog?: string;
 	schema?: string;
+	cluster_id?: string;
 }
 
 /**
@@ -459,6 +466,15 @@ def clusters(w):
     rows.sort(key=lambda r: (running(r), r['name'].lower()))
     return {'ok': True, 'clusters': rows}
 
+def cluster(w, cluster_id):
+    # The one field the connect flow needs BEFORE building the session: the
+    # cluster's Databricks Runtime (spark_version), so it can pin
+    # databricks-connect to a matching client. Fetched authoritatively from the
+    # workspace (not trusted from the picker), so a stale/renamed cluster still
+    # reports its real runtime.
+    c = w.clusters.get(cluster_id=cluster_id)
+    return {'ok': True, 'spark_version': getattr(c, 'spark_version', None)}
+
 def catalogs(w):
     rows = [{'name': c.name, 'comment': getattr(c, 'comment', None)}
             for c in w.catalogs.list() if c.name]
@@ -535,6 +551,8 @@ def main():
             return {'ok': True, 'host': w.config.host, 'user': getattr(me, 'user_name', None)}
         if op == 'clusters':
             return clusters(w)
+        if op == 'cluster':
+            return cluster(w, req['cluster_id'])
         if op == 'catalogs':
             return catalogs(w)
         if op == 'schemas':
@@ -581,6 +599,7 @@ export function statusFor(code: string): number {
 			return 404;
 		case 'not_connected':
 		case 'busy':
+		case 'version_mismatch':
 			return 409;
 		case 'sdk_missing':
 		case 'connect_missing':
@@ -1134,6 +1153,20 @@ finally:
     del _cellar_dbx_connect, _cellar_json
 `;
 
+/**
+ * A tiny kernel probe: is `databricks.connect` already imported in this kernel?
+ * If it is, a reinstall of a DIFFERENT client version cannot take effect until the
+ * kernel restarts (Python caches the imported module in `sys.modules`), so the
+ * caller restarts to load the freshly-pinned client. If it was never imported (the
+ * common first-connect case), the reinstall is picked up by the fresh import in
+ * `CONNECT_CODE` with NO restart — so the user's variables survive.
+ */
+const CONNECT_IMPORTED_CODE = `
+import json as _cellar_json, sys as _cellar_sys
+print('${SENTINEL}' + _cellar_json.dumps({'ok': True, 'imported': 'databricks.connect' in _cellar_sys.modules}))
+del _cellar_json, _cellar_sys
+`;
+
 /** Stop the session and unbind both names. Idempotent: a missing `spark` is fine. */
 const DISCONNECT_CODE = `
 import json as _cellar_json
@@ -1539,11 +1572,100 @@ export async function reconnectAfterKernelRestart(
 }
 
 /**
+ * The cluster's Databricks Runtime major.minor (e.g. `"17.3"`), or `null` when it
+ * cannot be resolved — serverless (no classic DBR), a permissions error, an
+ * unreachable workspace. Never throws: version-pinning is best-effort, and a
+ * `null` here just means the connect proceeds unpinned and the version-mismatch
+ * safety net (Part B) covers a genuine mismatch.
+ */
+async function clusterDbr(auth: Auth, clusterId: string): Promise<string | null> {
+	try {
+		const result = await probe({ op: 'cluster', auth, cluster_id: clusterId });
+		if (!result.ok) return null;
+		return dbrMajorMinor(payload<{ spark_version?: string | null }>(result).spark_version);
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		logWarn('databricks', `could not resolve cluster runtime for ${clusterId}: ${detail}`);
+		return null;
+	}
+}
+
+/**
+ * Is `databricks.connect` already imported in this notebook's kernel? Only then
+ * does a reinstall of a different client require a kernel restart to take effect.
+ * A not-started kernel has imported nothing, so this never boots one just to ask.
+ */
+async function isConnectImported(nb: string): Promise<boolean> {
+	if (kernelStatus(nb).status === 'not_started') return false;
+	try {
+		const { result } = await runInKernel(nb, CONNECT_IMPORTED_CODE);
+		return result.ok === true && (result as { imported?: boolean }).imported === true;
+	} catch {
+		// Could not even ask the kernel: assume imported so we restart, the safe
+		// direction (a needless restart only wipes a namespace the user can rebuild;
+		// a skipped one leaves a stale client that fails the connection).
+		return true;
+	}
+}
+
+/**
+ * Pin `databricks-connect` to the cluster's DBR line (`dbr`, e.g. `"17.3"`) when
+ * the installed client does not already match, so the Spark session builds against
+ * a compatible client. Returns `true` iff it actually reinstalled — the caller
+ * uses that to decide whether to (re-)run the connect, and it is what makes the
+ * Part B retry loop-safe (an already-matching client returns `false`, no retry).
+ *
+ * Only re-pins an EXISTING install: a missing client is the `connect_missing`
+ * path (the user installs from the sidebar), not something to auto-install here.
+ * A reinstall while the kernel already imported the old client needs a restart to
+ * load the new one; a fresh (never-imported) kernel does not, so the common
+ * first-connect path keeps the user's variables. Best-effort by contract: a failed
+ * reinstall is logged and swallowed (returns `false`) so pinning never blocks a
+ * connection.
+ */
+async function ensurePinnedConnect(nb: string, dbr: string | null): Promise<boolean> {
+	if (!dbr) return false;
+	let installed: InstallStatus;
+	try {
+		installed = await checkInstall();
+	} catch {
+		return false;
+	}
+	if (!installed.connect) return false;
+	const target = pinTargetForConnect(dbr, installed.connectVersion ?? null);
+	if (!target) return false;
+	const imported = await isConnectImported(nb);
+	try {
+		logInfo(
+			'databricks',
+			`pinning databricks-connect to ${target}.* to match cluster runtime (installed ${installed.connectVersion ?? 'unknown'})`
+		);
+		await installDeps({ version: target });
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		logWarn('databricks', `could not pin databricks-connect to ${target}.*: ${detail}`);
+		return false;
+	}
+	if (imported) {
+		logInfo('databricks', `restarting kernel so databricks-connect==${target}.* is loaded`);
+		await restartKernel(nb);
+	}
+	return true;
+}
+
+/**
  * Build `spark` + `w` in the kernel against `clusterId`, using the resolved auth
  * for the chosen `profile` OR typed `host`. Resolves with `{ok:true, connection}`
  * or throws a `DatabricksError` whose `code` the sidebar turns into actionable
  * copy. `assertSignedIn` guarantees an OAuth connect never opens a browser in the
  * kernel: the interactive login already happened in its own subprocess.
+ *
+ * Version pinning (the databricks-connect ≤ DBR rule): the client must be no newer
+ * than the cluster's runtime or the session hard-fails. This is enforced in two
+ * layers — Part A resolves the cluster's DBR and pins a matching client BEFORE
+ * building the session (prevention); Part B catches a mismatch that still slips
+ * through (unresolvable DBR), pins from the error's own runtime version, retries
+ * once, and otherwise surfaces an actionable `version_mismatch` message.
  */
 export async function connect({
 	profile,
@@ -1568,11 +1690,40 @@ export async function connect({
 	s.inFlight = true;
 	try {
 		logInfo('databricks', `connecting: profile "${profile}", cluster "${clusterName || clusterId}"`);
-		const { result, session } = await runInKernel(abs, CONNECT_CODE({ auth, cluster_id: clusterId }));
+		// Part A (prevention): resolve the cluster's Databricks Runtime and pin a
+		// matching databricks-connect client BEFORE building the session, so a
+		// "latest" client can never mismatch an older cluster. Best-effort - a null
+		// DBR (serverless / unresolvable) just skips the pin.
+		const dbr = await clusterDbr(auth, clusterId);
+		await ensurePinnedConnect(abs, dbr);
+
+		let { result, session } = await runInKernel(abs, CONNECT_CODE({ auth, cluster_id: clusterId }));
+
+		// Part B (safety net): a version mismatch can still surface when the runtime
+		// could not be pre-resolved. The error itself names the runtime, so pin the
+		// client from it and retry ONCE. `ensurePinnedConnect` returns false unless it
+		// actually reinstalled (already-matching → false), so this can never loop.
+		if (!result.ok) {
+			const mismatch = parseVersionMismatch(result.message);
+			if (mismatch && (await ensurePinnedConnect(abs, mismatch.runtime))) {
+				logInfo('databricks', `retrying connect after pinning databricks-connect to ${mismatch.runtime}.*`);
+				({ result, session } = await runInKernel(abs, CONNECT_CODE({ auth, cluster_id: clusterId })));
+			}
+		}
+
 		if (!result.ok) {
 			s.connection = null;
 			s.connectedSel = null;
 			publishGlobal({ type: 'databricks:changed' });
+			// A still-unresolved version mismatch: surface an actionable, user-facing
+			// message (with the exact pin) instead of the raw SDK exception, under a
+			// dedicated `version_mismatch` code the sidebar has copy for.
+			const mismatch = parseVersionMismatch(result.message);
+			if (mismatch) {
+				const message = versionMismatchMessage(mismatch);
+				logError('databricks', `connect failed [version_mismatch]: ${message} (raw: ${result.message})`);
+				throw new DatabricksError('version_mismatch', message);
+			}
 			logError('databricks', `connect failed [${result.code || 'error'}]: ${result.message || 'unknown error'}`);
 			throw new DatabricksError(result.code || 'error', result.message);
 		}
