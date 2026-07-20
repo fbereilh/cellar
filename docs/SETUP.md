@@ -56,7 +56,10 @@ On this first run Cellar will, with your confirmation on a TTY:
 1. Create `~/.cellar/host-venv` and install `jupyter-server` into it (cached; one-time).
 2. Resolve (or create) the **project** venv for the kernel - see
    [Kernel / venv resolution](#kernel--venv-resolution) below.
-3. Ensure `ipykernel` is present in the project venv.
+3. Ensure `ipykernel` is present in the project venv, and best-effort install
+   `ipywidgets` (a soft feature dependency for Databricks-style parameter
+   widgets and other interactive widgets - it never prompts, and a failure is a
+   quiet no-op rather than an error).
 4. Start the Jupyter sidecar and the app, allocate free ports, and open the browser.
 
 `Ctrl-C` shuts everything down cleanly. `cellar ../other-repo` opens a different
