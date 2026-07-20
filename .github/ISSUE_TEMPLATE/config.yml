@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions / Help
+    url: https://github.com/fbereilh/cellar/discussions
+    about: Have a question, need help, or want to discuss an idea? Please open a Discussion instead of an issue.
+  - name: Report a security vulnerability
+    url: https://github.com/fbereilh/cellar/security/advisories/new
+    about: Please report security issues privately, not as a public issue. See SECURITY.md.

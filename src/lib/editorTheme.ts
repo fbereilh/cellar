@@ -112,6 +112,9 @@ const cellarEditorTheme = EditorView.theme({
 // EXACT same tag→class mapping: an unfocused cell that shows its source without a
 // live CodeMirror editor still highlights identically, and its generated classes
 // resolve against the same `--cellar-cm-tok-*` custom properties in `app.css`.
+//
+// Palette provenance + license notices (One Dark / One Light, both MIT): see
+// THIRD-PARTY.md.
 export const cellarHighlightStyle = HighlightStyle.define([
 	{ tag: [t.comment, t.lineComment, t.blockComment], color: c('tok-comment'), fontStyle: c('tok-comment-style') },
 	{ tag: [t.meta], color: c('tok-meta') },

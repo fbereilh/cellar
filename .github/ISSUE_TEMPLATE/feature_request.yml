@@ -1,0 +1,58 @@
+name: Feature request
+description: Suggest an idea or improvement for Cellar.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! For open-ended questions or "is this possible?" discussions,
+        [Discussions](https://github.com/fbereilh/cellar/discussions) is a better fit than an issue.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case or pain point. What are you trying to do that's hard or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Cellar to do? How might it look or behave?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Area
+      description: Which part of Cellar does this touch? (pick all that apply)
+      multiple: true
+      options:
+        - UI (browser / notebook)
+        - Kernel / execution
+        - MCP (agent interface)
+        - Databricks
+        - Launcher / CLI / packaging
+        - Other / not sure
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you use today, or other approaches you thought about.
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Mockups, examples from other tools, or additional context.
+    validations:
+      required: false
