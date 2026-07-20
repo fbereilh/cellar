@@ -1,6 +1,8 @@
 # Cellar
 
 [![CI](https://github.com/fbereilh/cellar/actions/workflows/ci.yml/badge.svg)](https://github.com/fbereilh/cellar/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/fbereilh/cellar)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/fbereilh/cellar)](https://github.com/fbereilh/cellar/releases)
 
 **A Python notebook built for you and your AI agent to share.**
 
@@ -190,6 +192,21 @@ npm run test:e2e
 - **Unit tests** (`tests/unit/`) guard the pure server logic. The crown jewel is clean-on-save: idempotent, git-clean round-trips, the metadata allowlist, memory-address scrubbing, and the notebook model (stable cell IDs, add/move/delete, duplicate-ID re-keying). These are the **must-pass gate and run on every PR in CI**.
 - **E2E** (`tests/e2e/`) drives the real `cellar` launcher against a scratch workspace in a browser. The smoke spec (`smoke.spec.ts`) runs `6*7`, asserts `42` renders, and confirms the saved `.ipynb` is valid; the rest cover behavior only the full stack can show (e.g. `kernel-watchdog-probe.spec.ts` proves a long, silent cell is never aborted for being silent). They need the full kernel runtime (`uv` + `python3` + the cached host-venv), so they're a **local, best-effort** layer that skips itself when that runtime is absent. CI doesn't provide the kernel runtime, so they run locally, not there - the unit suite is what gates merges. Install the browser once with `npx playwright install chromium`.
 
+## Contributing
+
+Contributions are welcome - see **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev
+setup, the CI gate (`npm run build && npm run check && npm run test`), and the
+project's conventions. Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+Found a security issue? Please report it privately - see **[SECURITY.md](SECURITY.md)**
+(Cellar runs an arbitrary-code-execution kernel, so this matters).
+
+There's intentionally no hand-maintained changelog - see
+[Releases](https://github.com/fbereilh/cellar/releases) for what changed in each
+version.
+
 ## License
 
-Released under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE). Some editor syntax palettes were
+ported in from other open-source projects; see [THIRD-PARTY.md](THIRD-PARTY.md)
+for their notices.
