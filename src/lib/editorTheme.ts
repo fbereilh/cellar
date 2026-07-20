@@ -19,9 +19,11 @@
 //      `light-dark()` reads the resolved `color-scheme`, never a theme-name
 //      allowlist.
 //
-// The palettes: light is pygments "default" (the standard Jupyter light syntax
-// scheme) on the faintly-tinted editor surface; dark is One Dark, ported
-// verbatim from `@codemirror/theme-one-dark`. Because both now live in one
+// The palettes: light is Atom "One Light" (retuned so every token clears WCAG AA)
+// on the faintly-tinted editor surface; dark is One Dark, ported verbatim from
+// `@codemirror/theme-one-dark`. See THIRD-PARTY.md for both notices (the HTML
+// export in `server/export-html.ts` keeps the older pygments "default" light
+// scheme). Because both now live in one
 // static theme, the editor never sets CodeMirror's `dark` flag, so this theme
 // must supply every color the library's own `&light`/`&dark` base rules would
 // otherwise have picked - hence the long list below (panels, tooltips, buttons
@@ -103,7 +105,7 @@ const cellarEditorTheme = EditorView.theme({
 });
 
 // One highlight style for both schemes. Where the two palettes group tags
-// differently (pygments paints `operator` and `operatorKeyword` alike, One Dark
+// differently (One Dark paints `operator` and `operatorKeyword` alike, One Light
 // does not) the tag gets its own token var rather than being forced into a
 // shared group. Where one palette leaves a tag unstyled, its var resolves to
 // `--cellar-cm-fg`, i.e. exactly the color that tag inherits today.
