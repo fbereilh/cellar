@@ -172,6 +172,31 @@ export async function ensureIpykernel(python, { stdio = 'pipe' } = {}) {
 	return { installed: true };
 }
 
+/** True iff the given interpreter can `import ipywidgets`. */
+export async function hasIpywidgets(python) {
+	const r = await run(python, ['-c', 'import ipywidgets']);
+	return r.code === 0;
+}
+
+/**
+ * Best-effort ensure `ipywidgets` in the project venv so Databricks-style
+ * `dbutils.widgets` and any ipywidget render/interact. Unlike `ipykernel`, this
+ * is a soft feature dependency: Cellar only guarantees `ipykernel`, and the
+ * kernel-side widget shim degrades to value-only when ipywidgets is absent. So
+ * this NEVER throws - a failed probe or install returns `{ installed: false }`
+ * and Cellar carries on (mirrors the Spark progress bar's silent guard). Returns
+ * `{ installed }`.
+ */
+export async function ensureIpywidgets(python, { stdio = 'pipe' } = {}) {
+	try {
+		if (await hasIpywidgets(python)) return { installed: false };
+		await installPackages(python, ['ipywidgets'], { stdio });
+		return { installed: true };
+	} catch {
+		return { installed: false };
+	}
+}
+
 /**
  * Ensure Cellar's private Jupyter host env exists (`~/.cellar/host-venv` with
  * `jupyter-server`). Created + cached on first run so the project venv only

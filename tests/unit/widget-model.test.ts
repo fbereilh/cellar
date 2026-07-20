@@ -5,6 +5,8 @@ import {
 	rangeValue,
 	optionLabels,
 	selectedIndex,
+	selectedIndices,
+	comboOptions,
 	childIds,
 	progressBarClass,
 	buttonClass,
@@ -32,6 +34,8 @@ describe('widgetKind — model name → renderer group', () => {
 		expect(widgetKind('RadioButtons')).toBe('radio');
 		expect(widgetKind('ToggleButtons')).toBe('togglebuttons');
 		expect(widgetKind('Select')).toBe('select');
+		expect(widgetKind('Combobox')).toBe('combobox');
+		expect(widgetKind('SelectMultiple')).toBe('multiselect');
 		expect(widgetKind('Text')).toBe('text');
 		expect(widgetKind('Password')).toBe('password');
 		expect(widgetKind('Textarea')).toBe('textarea');
@@ -95,6 +99,19 @@ describe('selection traits', () => {
 		expect(selectedIndex({ index: 0 })).toBe(0);
 		expect(selectedIndex({})).toBe(-1);
 		expect(selectedIndex({ index: null })).toBe(-1);
+	});
+	it('reads a multi-select index tuple, empty when none', () => {
+		expect(selectedIndices({ index: [0, 2] })).toEqual([0, 2]);
+		expect(selectedIndices({ index: [] })).toEqual([]);
+		expect(selectedIndices({ index: 1 })).toEqual([]); // scalar → not a multi-select
+		expect(selectedIndices({ index: [0, 1.5, 'x'] })).toEqual([0]); // non-int slots dropped
+		expect(selectedIndices({})).toEqual([]);
+	});
+	it('reads combobox options (from `options`, coerced to strings)', () => {
+		expect(comboOptions({ options: ['a', 'b'] })).toEqual(['a', 'b']);
+		expect(comboOptions({ options: [1, 2] })).toEqual(['1', '2']);
+		expect(comboOptions({ _options_labels: ['a'] })).toEqual([]); // combobox uses `options`
+		expect(comboOptions({})).toEqual([]);
 	});
 });
 

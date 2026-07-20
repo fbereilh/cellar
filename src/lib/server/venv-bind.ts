@@ -17,6 +17,7 @@ import {
 	hasIpykernel,
 	createVenv,
 	ensureIpykernel,
+	ensureIpywidgets,
 	writeKernelspec
 } from './venv.js';
 
@@ -89,6 +90,9 @@ export async function bindVenv({ path, create = false }: BindVenvOptions): Promi
 	}
 	const python = venvPython(venv);
 	const { installed: installedIpykernel } = await ensureIpykernel(python, {});
+	// Best-effort: enable ipywidgets (Databricks-style parameter widgets + any
+	// ipywidget). Never blocks a rebind - the kernel shim degrades to value-only.
+	await ensureIpywidgets(python, {});
 
 	writeKernelspec(kernelspecDir, python);
 	process.env.CELLAR_PROJECT_VENV = python;

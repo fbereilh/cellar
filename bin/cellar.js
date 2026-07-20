@@ -82,6 +82,7 @@ import {
 	resolveProjectVenv,
 	createVenv,
 	ensureIpykernel,
+	ensureIpywidgets,
 	hasIpykernel,
 	ensureHostEnv,
 	writeKernelspec,
@@ -393,6 +394,7 @@ async function resolveInterpreter() {
 		await createVenv(r.venv, { stdio: 'inherit' });
 		await ensureIpykernel(r.python, { stdio: 'inherit' });
 		console.log(`[cellar] created ${r.venv} with ipykernel.`);
+		await ensureWidgets(r.python);
 		return { python: r.python, venv: r.venv };
 	}
 
@@ -409,7 +411,19 @@ async function resolveInterpreter() {
 		}
 		await ensureIpykernel(r.python, { stdio: 'inherit' });
 	}
+	await ensureWidgets(r.python);
 	return { python: r.python, venv: r.venv };
+}
+
+/**
+ * Best-effort: enable Databricks-style parameter widgets (and any ipywidget) by
+ * ensuring `ipywidgets` in the project venv. A soft feature dependency, unlike
+ * `ipykernel` - it never prompts and never aborts (the kernel-side shim degrades
+ * to value-only without it), so a failure is a quiet no-op.
+ */
+async function ensureWidgets(python) {
+	const { installed } = await ensureIpywidgets(python, { stdio: 'pipe' });
+	if (installed) console.log(`[cellar] installed ipywidgets into ${python} (parameter widgets).`);
 }
 
 // ---- `cellar ls` / `cellar cleanup` --------------------------------------
