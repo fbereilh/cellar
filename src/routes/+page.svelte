@@ -206,6 +206,16 @@
 	// Transient, dismissable status line (jupytext env not ready, convert result, …).
 	let notice = $state('');
 	let theme = $state('dim');
+	// Follow-the-running-cell preference (default on). A viewer preference, not a
+	// notebook document property, so it lives in the per-project UI-state store
+	// (survives the dynamic port) like theme/sidebar-width — never in the `.ipynb`.
+	// `hydrateUiState` has already run (init, above), so this read is synchronous.
+	const FOLLOW_KEY = 'cellar-follow-running-cell';
+	let followRunningCell = $state(getUi<boolean>(FOLLOW_KEY, true));
+	function toggleFollowRunningCell() {
+		followRunningCell = !followRunningCell;
+		setUi(FOLLOW_KEY, followRunningCell);
+	}
 	const mcp = data.mcp;
 	// Soft cap on live kernels; past it the Kernels sidebar warns (warn-only).
 	const maxKernels = data.maxKernels ?? 8;
@@ -1090,6 +1100,7 @@
 		canCheckpoint={!!activeNotebookPath}
 		canHideCode={!!activeNotebookPath}
 		hideAllCode={activeHideAllCode}
+		followRunningCell={followRunningCell}
 		onSelectTab={selectTab}
 		onCloseTab={closeTab}
 		onPromoteTab={promoteTab}
@@ -1105,6 +1116,7 @@
 		onCheckpointNow={checkpointNow}
 		onUndoAgent={undoLastAgentAction}
 		onToggleHideAllCode={toggleHideAllCode}
+		onToggleFollowRunningCell={toggleFollowRunningCell}
 		onOpenSettings={() => (settingsOpen = true)}
 	/>
 
@@ -1168,6 +1180,7 @@
 					<LiveNotebook
 						path={canonicalNotebookRel}
 						active={activeTabId === 'notebook'}
+						follow={followRunningCell}
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
@@ -1190,6 +1203,7 @@
 					<LiveNotebook
 						path={tab.path}
 						active={activeTabId === tab.id}
+						follow={followRunningCell}
 						gitRefresh={fsRefreshSignal}
 						onCellsChange={handleCellsChange}
 						onFoldsChange={handleFoldsChange}
