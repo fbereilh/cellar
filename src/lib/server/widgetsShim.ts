@@ -63,9 +63,36 @@ class _CellarWidgets:
         self._ipw = _ipw
         self._display = _display
         self._widgets = {}
+        self._meta = {}
 
-    def _register(self, name, value_widget, label):
+    def _preserved_value(self, name, kind, opts):
+        # Databricks parity: re-declaring an existing widget PRESERVES the current
+        # value instead of resetting to the default, but only when the new spec is
+        # compatible. Returns (True, value) to carry a value over, else (False, None)
+        # to keep the new default. Kept independent of the widget backend so the
+        # value-only mode reconciles identically to the ipywidgets mode.
+        _old = self._widgets.get(name)
+        _oldmeta = self._meta.get(name)
+        if _old is None or _oldmeta is None:
+            return (False, None)
+        if _oldmeta[0] != kind:
+            return (False, None)
+        _cur = _old.value
+        if kind == 'multiselect':
+            return (True, tuple(_x for _x in _cur if _x in opts))
+        if kind in ('dropdown', 'combobox'):
+            return (True, _cur) if _cur in opts else (False, None)
+        return (True, _cur)
+
+    def _register(self, name, kind, value_widget, label, opts=None):
+        _carry, _val = self._preserved_value(name, kind, opts)
+        if _carry:
+            try:
+                value_widget.value = _val
+            except Exception:
+                pass
         self._widgets[name] = value_widget
+        self._meta[name] = (kind, opts)
         if self._ipw is not None and self._display is not None:
             try:
                 _lbl = self._ipw.Label(value=(label if label is not None else name))
@@ -76,26 +103,26 @@ class _CellarWidgets:
     def text(self, name, defaultValue='', label=None):
         _v = str(defaultValue)
         _w = self._ipw.Text(value=_v) if self._ipw is not None else _CellarValueHolder(_v)
-        self._register(name, _w, label)
+        self._register(name, 'text', _w, label)
 
     def dropdown(self, name, defaultValue, choices, label=None):
         _opts = [str(_c) for _c in choices]
         _v = str(defaultValue)
         _w = self._ipw.Dropdown(value=_v, options=_opts) if self._ipw is not None else _CellarValueHolder(_v)
-        self._register(name, _w, label)
+        self._register(name, 'dropdown', _w, label, _opts)
 
     def combobox(self, name, defaultValue, choices, label=None):
         _opts = [str(_c) for _c in choices]
         _v = str(defaultValue)
         _w = self._ipw.Combobox(value=_v, options=_opts) if self._ipw is not None else _CellarValueHolder(_v)
-        self._register(name, _w, label)
+        self._register(name, 'combobox', _w, label, _opts)
 
     def multiselect(self, name, defaultValue, choices, label=None):
         _opts = [str(_c) for _c in choices]
         _dv = str(defaultValue)
         _init = (_dv,) if _dv in _opts else ()
         _w = self._ipw.SelectMultiple(value=_init, options=_opts) if self._ipw is not None else _CellarValueHolder(_init)
-        self._register(name, _w, label)
+        self._register(name, 'multiselect', _w, label, _opts)
 
     def get(self, name):
         if name not in self._widgets:
@@ -113,9 +140,11 @@ class _CellarWidgets:
 
     def remove(self, name):
         self._widgets.pop(name, None)
+        self._meta.pop(name, None)
 
     def removeAll(self):
         self._widgets.clear()
+        self._meta.clear()
 
 
 class _CellarDbUtils:

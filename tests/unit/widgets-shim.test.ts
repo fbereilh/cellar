@@ -144,6 +144,51 @@ db = _CellarDbUtils(_CellarWidgets(None, None))
 db.widgets.text('p', 'v')
 out['dbutils_get'] = db.widgets.get('p')
 
+# --- redeclare preserves the current value when compatible (Databricks parity) ---
+rd = _CellarWidgets(_FakeIpw, _fake_display)
+rd.text('t', 'orig')
+rd._widgets['t'].value = 'edited'
+rd.text('t', 'newdefault')  # same kind → keep 'edited', not the new default
+out['redeclare_text_keeps'] = rd.get('t')
+
+rd.dropdown('d', 'red', ['red', 'green'])
+rd._widgets['d'].value = 'green'
+rd.dropdown('d', 'red', ['red', 'green', 'blue'])  # 'green' still valid → kept
+out['redeclare_dropdown_keeps'] = rd.get('d')
+rd.dropdown('d', 'red', ['red', 'yellow'])  # 'green' no longer valid → reset to default
+out['redeclare_dropdown_resets'] = rd.get('d')
+
+rd.combobox('c', 'NYC', ['NYC', 'LA'])
+rd._widgets['c'].value = 'LA'
+rd.combobox('c', 'NYC', ['SF'])  # 'LA' no longer valid → reset to default
+out['redeclare_combobox_resets'] = rd.get('c')
+
+rd.multiselect('m', 'a', ['a', 'b', 'c'])
+rd._widgets['m'].value = ('a', 'c')
+rd.multiselect('m', 'a', ['a', 'b'])  # keep subset still valid → ('a',)
+out['redeclare_multiselect_subset'] = rd.get('m')
+
+# incompatible kind change → reset to new default
+rd.text('x', 'hello')
+rd._widgets['x'].value = 'typed'
+rd.dropdown('x', 'red', ['red', 'green'])  # text → dropdown, kind differs → default
+out['redeclare_kind_change_resets'] = rd.get('x')
+
+# value-only mode reconciles identically
+rv = _CellarWidgets(None, None)
+rv.text('t', 'orig')
+rv._widgets['t'].value = 'edited'
+rv.text('t', 'newdefault')
+out['vo_redeclare_text_keeps'] = rv.get('t')
+rv.dropdown('d', 'red', ['red', 'green'])
+rv._widgets['d'].value = 'green'
+rv.dropdown('d', 'red', ['red', 'yellow'])  # invalid → reset
+out['vo_redeclare_dropdown_resets'] = rv.get('d')
+rv.text('k', 'hi')
+rv._widgets['k'].value = 'typed'
+rv.dropdown('k', 'red', ['red', 'green'])  # kind change → reset
+out['vo_redeclare_kind_change_resets'] = rv.get('k')
+
 print(json.dumps(out))
 `;
 
@@ -201,5 +246,23 @@ describe('dbutils.widgets shim — value/return-type parity', () => {
 
 	it('exposes the registry through the dbutils wrapper', () => {
 		expect(out.dbutils_get).toBe('v');
+	});
+
+	it('preserves the current value when a widget is re-declared with a compatible spec', () => {
+		expect(out.redeclare_text_keeps).toBe('edited');
+		expect(out.redeclare_dropdown_keeps).toBe('green');
+		expect(out.redeclare_multiselect_subset).toBe('a');
+	});
+
+	it('resets to the new default when a re-declaration is incompatible', () => {
+		expect(out.redeclare_dropdown_resets).toBe('red');
+		expect(out.redeclare_combobox_resets).toBe('NYC');
+		expect(out.redeclare_kind_change_resets).toBe('red');
+	});
+
+	it('reconciles re-declarations identically in value-only mode', () => {
+		expect(out.vo_redeclare_text_keeps).toBe('edited');
+		expect(out.vo_redeclare_dropdown_resets).toBe('red');
+		expect(out.vo_redeclare_kind_change_resets).toBe('red');
 	});
 });

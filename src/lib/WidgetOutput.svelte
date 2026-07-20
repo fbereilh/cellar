@@ -304,7 +304,7 @@
 			onchange={(e) => onCommit({ value: (e.target as HTMLInputElement).value })}
 		/>
 		<datalist id={comboListId}>
-			{#each comboOpts as opt (opt)}
+			{#each comboOpts as opt, i (i)}
 				<option value={opt}></option>
 			{/each}
 		</datalist>
