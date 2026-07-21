@@ -10,7 +10,7 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup install build update run dev
+.PHONY: help setup install build update run dev changelog
 
 help: ## List available targets
 	@echo "Cellar — make targets:"
@@ -19,6 +19,7 @@ help: ## List available targets
 	@echo "  make build    Install deps and build the production server"
 	@echo "  make run      Run cellar in the current directory"
 	@echo "  make dev      Run cellar in dev mode (Vite dev server)"
+	@echo "  make changelog Regenerate CHANGELOG.md from the git history (git-cliff)"
 	@echo "  make help     Show this help (default)"
 
 setup: build ## First-time setup: build, then link 'cellar' onto PATH
@@ -53,3 +54,7 @@ run: ## Run cellar in the current directory
 dev: ## Run cellar in dev mode (Vite dev server)
 	@echo "==> Starting cellar in dev mode"
 	node bin/cellar.js --dev
+
+changelog: ## Regenerate CHANGELOG.md from the git history (git-cliff)
+	@echo "==> Regenerating CHANGELOG.md (git-cliff)"
+	bash scripts/gen-changelog.sh
