@@ -153,6 +153,7 @@ to publish, e.g. inside a container.
 | `CELLAR_KERNEL_CULL_INTERVAL` | `min(300, timeout)` (s) | How often the idle culler runs. |
 | `CELLAR_KERNEL_IDLE_TIMEOUT_MS` | `30000` (ms, = 30s) | Per-run watchdog: how often a silent running cell has its kernel probed for liveness. **Not a deadline** - a silent cell whose kernel probes healthy runs indefinitely, and only the probe's verdict aborts a run: the kernel is gone from the Jupyter server or reports itself dead (aborts on the first probe), or the kernel's reply can no longer reach us on 3 consecutive probes (the websocket has given up reconnecting, or it is connected yet the kernel is not executing our cell). A probe that fails or times out, and a websocket that is still reconnecting, are inconclusive: the watchdog just probes again - unless the websocket has ALSO given up, which is corroborated proof the kernel is unreachable by any route and aborts on 3 consecutive such probes. `0` disables the per-run watchdog entirely (a genuinely wedged kernel then frees its slot only on manual Restart); a positive value overrides the probe interval. Distinct from the culler above. |
 | `CELLAR_KERNEL_PROBE_TIMEOUT_MS` | `10000` (ms, = 10s) | How long one liveness probe (a localhost `GET /api/kernels/<id>`, normally ~3-5ms) may take before it is abandoned as inconclusive. An abandoned probe does not abort a run on its own; the watchdog just probes again (unless the websocket has also given up - see above). |
+| `CELLAR_KERNEL_RECONNECT_TIMEOUT_MS` | `15000` (ms, = 15s) | How long a dead-socket self-heal (rebuild the kernel websocket without restarting the process or clearing its namespace, after the watchdog convicts a `disconnected` socket) may take before it is abandoned. A timeout is non-fatal: the reconnect keeps trying in the background and a later run retries, so nothing is lost. |
 | `CELLAR_MAX_KERNELS` | `8` | Soft cap: shows a warn-only banner past N live kernels (never blocks a run). `0` disables the warning. |
 
 ### MCP session lifecycle
@@ -221,3 +222,8 @@ Install its browser once with `npx playwright install chromium`.
   however long it runs. Restart the kernel from the sidebar's Kernels section, and
   see `CELLAR_KERNEL_IDLE_TIMEOUT_MS` above - set it to `0` to disable the per-run
   watchdog entirely if you hit a false abort.
+- **A run aborted with "The kernel connection is being refreshed; re-run the cell"** -
+  the kernel websocket died (its reconnect retries were spent) while the process
+  itself is still alive. Cellar rebuilds the socket in the background without
+  restarting the kernel or clearing its namespace, so you can simply re-run the cell;
+  no manual restart is needed. See `CELLAR_KERNEL_RECONNECT_TIMEOUT_MS` above.

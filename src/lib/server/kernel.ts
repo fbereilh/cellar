@@ -99,6 +99,13 @@ interface NotebookKernel {
 	 * forever.
 	 */
 	activeRuns: Set<ActiveRun>;
+	/**
+	 * The in-flight `refreshKernelConnection()` attempt, or null. Single-flights the
+	 * rung-1 socket refresh so a burst of triggers (the watchdog convicting a
+	 * `disconnected` socket AND the next run's defensive dispatch check) reconnects
+	 * ONCE, not once per caller. Mirrors `livenessInFlight` in `databricks.ts`.
+	 */
+	refreshInFlight: Promise<{ refreshed: boolean; reason: string }> | null;
 }
 
 /**
@@ -247,6 +254,20 @@ function envMs(name: string, fallback: number): number {
 
 function probeTimeoutMs(): number {
 	return envMs('CELLAR_KERNEL_PROBE_TIMEOUT_MS', DEFAULT_PROBE_TIMEOUT_MS);
+}
+
+/**
+ * How long a rung-1 socket refresh (`refreshKernelConnection` → `conn.reconnect()`)
+ * may take before it is abandoned as a non-fatal `reconnect_timeout`. Longer than a
+ * probe: `reconnect()` may retry the websocket handshake a few times before the
+ * socket reaches 'connected', whereas a probe is a single localhost GET. On timeout
+ * the reconnect keeps trying in the background (a later run's defensive check re-reads
+ * the socket), so nothing is lost - the bound just stops the primitive from awaiting a
+ * stalled handshake forever. Override with `CELLAR_KERNEL_RECONNECT_TIMEOUT_MS`.
+ */
+const DEFAULT_RECONNECT_TIMEOUT_MS = 15 * 1000;
+function reconnectTimeoutMs(): number {
+	return envMs('CELLAR_KERNEL_RECONNECT_TIMEOUT_MS', DEFAULT_RECONNECT_TIMEOUT_MS);
 }
 
 /**
@@ -1044,7 +1065,8 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		userRuns: 0,
 		statusHandler: null,
 		widgetComms: new Map(),
-		activeRuns: new Set()
+		activeRuns: new Set(),
+		refreshInFlight: null
 	};
 
 	nbKernel.startPromise = (async () => {
@@ -1242,6 +1264,113 @@ async function teardownKernel(
 	// Invalidate this notebook's run-status in every open tab: with no live kernel
 	// its cells must read "not run this session".
 	publish({ type: 'kernel:shutdown', nb: nbPath, reason });
+}
+
+/**
+ * Rung 1 of the reconnect ladder: refresh a notebook's kernel WebSocket WITHOUT
+ * killing the process or clearing its namespace.
+ *
+ * The bug this closes (`cellar-dead-connection-refresh-x8`): after the watchdog
+ * convicts a `disconnected` socket (@jupyterlab's 7 reconnect retries spent), the
+ * dead `KernelConnection` stays in the `kernels` map. The kernel PROCESS is still in
+ * the server's running list, so `reconcileCulledKernels` won't remove it, and
+ * `getKernel` hands that same dead socket to the next run - whose messages sit in
+ * @jupyterlab's `_pendingMessages` awaiting a reconnect that can never come. Every
+ * later run then silently queues, goes quiet, is convicted again: the notebook is
+ * broken until a manual restart.
+ *
+ * A plain `teardownKernel` is the WRONG fix: a `disconnected` socket does NOT prove
+ * the process is dead. On a healthy kernel the user's cell is very likely STILL
+ * EXECUTING (the multi-hour Spark job the watchdog exists to protect), and tearing
+ * the process down would destroy exactly that work. So this primitive repairs only
+ * the TRANSPORT, built on `@jupyterlab/services`' `KernelConnection.reconnect()`
+ * (*"refreshes the connection to an existing kernel … does not restart the kernel"*):
+ * it rebuilds the websocket to the SAME kernel id and re-flushes pending messages,
+ * leaving the namespace and any running cell intact.
+ *
+ * The one case where the process really is gone is gated out with the watchdog's
+ * existing "gone-from-server ⇒ proven dead" rule (`probeKernelLiveness` → `'dead'`):
+ * if the server no longer has the kernel, a socket reconnect would hang or reject, so
+ * we fall through to `teardownKernel` (rung 3) and let the next run lazily restart.
+ *
+ * On a successful refresh there is NO epoch bump (the session never changed), so
+ * `connectionStatus()` / `ran_this_session` stay correct and a live Databricks
+ * `spark`/`w` remains valid. Idempotent + single-flight per notebook, so the two
+ * triggers (the watchdog conviction and the run-dispatch defensive check) converge on
+ * ONE reconnect - there is deliberately no second reconnect code path.
+ *
+ * Returns `{refreshed, reason}`:
+ *   - `refreshed:true,  reason:'reconnected'`     - socket rebuilt, run again;
+ *   - `refreshed:false, reason:'no_kernel'`       - notebook has no kernel (never boot one);
+ *   - `refreshed:false, reason:'kernel_gone'`     - process proven dead → torn down (rung 3);
+ *   - `refreshed:false, reason:'reconnect_timeout'|'reconnect_failed'` - transport still
+ *     down; a later run's defensive check will retry.
+ */
+export async function refreshKernelConnection(
+	nbPath?: string | null
+): Promise<{ refreshed: boolean; reason: string }> {
+	const abs = resolveNb(nbPath);
+	const nbKernel = kernels.get(abs);
+	if (!nbKernel) return { refreshed: false, reason: 'no_kernel' };
+	// Single-flight: a burst of triggers reconnects once (mirrors `livenessInFlight`).
+	if (nbKernel.refreshInFlight) return nbKernel.refreshInFlight;
+	const attempt = (async (): Promise<{ refreshed: boolean; reason: string }> => {
+		const conn = nbKernel.connection;
+		if (!conn) return { refreshed: false, reason: 'no_kernel' };
+		// Gate on the server-model liveness check - the SAME "proven dead" rule the
+		// watchdog uses. Only a `dead` verdict (the server no longer has the kernel, or
+		// reports the process dead) means the process is gone; a `disconnected` socket
+		// with a present model is 'suspect', NOT 'dead', so it proceeds to the socket
+		// refresh. This is what keeps us from reconnecting to a corpse.
+		const probe = await probeKernelLiveness(conn);
+		if (kernels.get(abs) !== nbKernel) return { refreshed: false, reason: 'no_kernel' }; // torn down while probing
+		if (probe.verdict === 'dead') {
+			// The process is genuinely gone: a socket reconnect would hang. Fall through
+			// to rung 3 - tear the dead entry down so the next run lazily starts fresh.
+			await teardownKernel(nbKernel, 'kernel_gone');
+			publishKernelStatus();
+			return { refreshed: false, reason: 'kernel_gone' };
+		}
+		// The server still HAS the kernel (or the probe was merely inconclusive, which
+		// killing may never act on): refresh only the transport. Bound the handshake so
+		// a stalled reconnect can never leave this pending forever.
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timedOut = new Promise<typeof PROBE_TIMED_OUT>((resolve) => {
+			timer = setTimeout(() => resolve(PROBE_TIMED_OUT), reconnectTimeoutMs());
+			timer.unref?.();
+		});
+		try {
+			const reconnectP = conn.reconnect();
+			// `.then(onOk, onErr)` never rejects, so the race settles cleanly; a late
+			// rejection after a timeout win is swallowed below so it never surfaces.
+			const outcome = await Promise.race([
+				reconnectP.then(
+					() => 'reconnected' as const,
+					() => 'reconnect_failed' as const
+				),
+				timedOut
+			]);
+			if (outcome === PROBE_TIMED_OUT) {
+				reconnectP.catch(() => {}); // still pending in the background - don't leak
+				logWarn('kernel', `socket refresh for ${abs} timed out; will retry on next run`);
+				return { refreshed: false, reason: 'reconnect_timeout' };
+			}
+			if (outcome === 'reconnected') {
+				logInfo('kernel', `refreshed kernel socket for ${abs} (namespace preserved)`);
+				return { refreshed: true, reason: 'reconnected' };
+			}
+			logWarn('kernel', `socket refresh for ${abs} failed; will retry on next run`);
+			return { refreshed: false, reason: 'reconnect_failed' };
+		} finally {
+			clearTimeout(timer);
+		}
+	})();
+	nbKernel.refreshInFlight = attempt;
+	try {
+		return await attempt;
+	} finally {
+		if (nbKernel.refreshInFlight === attempt) nbKernel.refreshInFlight = null;
+	}
 }
 
 /**
@@ -1457,7 +1586,19 @@ export async function execute(
 	{ internal = false }: ExecuteOptions = {}
 ): Promise<KernelMessage.IExecuteReplyMsg['content']> {
 	const abs = resolveNb(nbPath);
-	const kernel = await getKernel(abs);
+	let kernel = await getKernel(abs);
+	// Rung-1 defensive refresh (closes x8's "every later run hangs"). A cached
+	// connection whose socket the watchdog already convicted ('disconnected',
+	// @jupyterlab's retries spent) would wedge this run in `_pendingMessages` forever.
+	// Heal the transport before handing it a run - or, if the process is gone, fall
+	// through to a fresh kernel. Only ever fires on a genuinely dead socket (rare), so
+	// a healthy run pays nothing; single-flight coalesces with the watchdog's own
+	// refresh. Re-resolve afterwards: a `kernel_gone` teardown means `getKernel` starts
+	// a fresh process, so `kernel`/`nbKernel` must be the post-refresh ones.
+	if (kernel.connectionStatus === 'disconnected') {
+		await refreshKernelConnection(abs);
+		kernel = await getKernel(abs);
+	}
 	const nbKernel = kernels.get(abs)!;
 	const session = nbKernel.sessionId;
 	if (!internal) {
@@ -1566,7 +1707,18 @@ export async function execute(
 			}
 		}
 		logWarn('kernel', `aborting run on ${abs}: ${message}`);
-		triggerAbort(new KernelExecuteAborted(`${message} Restart the kernel to recover.`, 'idle_watchdog'));
+		// If the socket itself died ('disconnected'), heal the TRANSPORT (rung 1) so the
+		// NEXT run gets a live socket instead of wedging in @jupyterlab's `_pendingMessages`
+		// - the x8 bug. This run is already lost, so fire-and-forget; single-flight
+		// coalesces with the run-dispatch defensive check, so the two triggers reconnect
+		// once. On any other verdict (proven process death, or a lost reply on a still-live
+		// socket) a socket refresh is not the repair, so recovery stays a manual restart.
+		const socketDead = kernel.connectionStatus === 'disconnected';
+		if (socketDead) void refreshKernelConnection(abs).catch(() => {});
+		const recover = socketDead
+			? 'The kernel connection is being refreshed; re-run the cell.'
+			: 'Restart the kernel to recover.';
+		triggerAbort(new KernelExecuteAborted(`${message} ${recover}`, 'idle_watchdog'));
 	};
 	/** Kernel traffic: the run is provably alive, so re-arm and forget any strikes. */
 	const resetWatchdog = () => {
