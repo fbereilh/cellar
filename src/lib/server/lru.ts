@@ -54,6 +54,11 @@ export class LruCache<K, V> {
 		this.map.clear();
 	}
 
+	/** Remove `key` if present; returns whether it was there. */
+	delete(key: K): boolean {
+		return this.map.delete(key);
+	}
+
 	/** Move an existing key to the most-recently-used position. */
 	private touch(key: K): void {
 		const v = this.map.get(key);

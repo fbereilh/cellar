@@ -80,4 +80,15 @@ describe('LruCache', () => {
 	it('rejects a non-positive cap', () => {
 		expect(() => new LruCache<string, number>(0)).toThrow();
 	});
+
+	it('delete removes a key (used to clear a batch backoff on success)', () => {
+		const c = new LruCache<string, number>(4);
+		c.set('a', 1);
+		c.set('b', 2);
+		expect(c.delete('a')).toBe(true); // present -> removed
+		expect(c.has('a')).toBe(false);
+		expect(c.delete('a')).toBe(false); // already gone -> no-op
+		expect(c.has('b')).toBe(true);
+		expect(c.size).toBe(1);
+	});
 });
