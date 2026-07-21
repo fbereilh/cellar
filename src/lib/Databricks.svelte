@@ -117,6 +117,14 @@
 	// Set when the toggle/version changes so the "restart to apply" hint shows; the
 	// change only takes effect on the next kernel start.
 	let runtimeDirty = $state(false);
+	// Set on a FRESH connect (the not-connected -> connected transition, in
+	// `connect()`): the kernel already started WITHOUT the runtime env, so an
+	// import-time IS_DATABRICKS gate has already run. Surfacing the same "restart to
+	// apply" hint prompts the user to restart so the default-ON runtime actually
+	// takes effect. Cleared when the user acts (restart) or turns the toggle off; it
+	// never re-fires after a restart because the post-restart reconnect is handled
+	// server-side and does not re-enter `connect()`.
+	let connectHint = $state(false);
 	onMount(() => {
 		runtimeOn = getUi<boolean>(DBX_RUNTIME_KEY, true);
 		runtimeVersion = getUi<string>(DBX_RUNTIME_VERSION_KEY, DBX_RUNTIME_VERSION_DEFAULT);
@@ -125,6 +133,7 @@
 		runtimeOn = !runtimeOn; // optimistic
 		setUi(DBX_RUNTIME_KEY, runtimeOn);
 		runtimeDirty = true;
+		if (!runtimeOn) connectHint = false; // turning it off clears the connect prompt
 	}
 	function onVersionInput(e: Event) {
 		const v = (e.currentTarget as HTMLInputElement).value.trim();
@@ -135,6 +144,7 @@
 	}
 	async function restartToApply() {
 		runtimeDirty = false;
+		connectHint = false;
 		if (onRestartKernel && notebookPath) await onRestartKernel(notebookPath);
 	}
 
@@ -379,6 +389,9 @@
 			if (!res.ok) throw body;
 			switching = false;
 			await loadStatus();
+			// Fresh connect on a kernel that started without the runtime env: prompt a
+			// restart so the default-ON runtime takes effect (import-time gate).
+			if (runtimeOn) connectHint = true;
 			onSessionChange?.();
 		} catch (err) {
 			connectError = toDbxError(err);
@@ -694,7 +707,7 @@
 							/>
 						</label>
 					{/if}
-					{#if runtimeDirty}
+					{#if runtimeDirty || (connectHint && runtimeOn)}
 						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/60" data-testid="databricks-runtime-hint">
 							Takes effect on the next kernel start.
 							{#if onRestartKernel && notebookPath}

@@ -96,10 +96,11 @@ export function shouldInjectDatabricksRuntime(
 	envValue: string | null | undefined,
 	bound: boolean
 ): boolean {
-	const override = parseBoolEnv(envValue);
-	if (override !== null) return override; // explicit override wins, bypasses the connection scope
-	if (storeValue === false) return false; // user turned it off
-	return bound; // default ON, but only for a connected notebook
+	// Reuse the preference resolver so the env-override / default-ON logic lives in
+	// one place. An explicit env override forces the decision either way AND bypasses
+	// the connection scope; otherwise the resolved preference must be ON and the
+	// notebook must be `bound` to a cluster.
+	return databricksRuntimeEnabled(storeValue, envValue) && (parseBoolEnv(envValue) !== null || bound);
 }
 
 /**
