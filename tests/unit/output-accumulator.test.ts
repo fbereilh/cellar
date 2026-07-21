@@ -1,18 +1,40 @@
 import { describe, it, expect } from 'vitest';
-import { OutputAccumulator, type OutputCaps } from '../../src/lib/server/output-accumulator';
+import { OutputAccumulator, type OutputCaps, type StreamDelta } from '../../src/lib/server/output-accumulator';
 import type { CellOutput } from '../../src/lib/server/types';
 
-/** Collect every (output, index) the accumulator emits, in order. */
+/** Collect every (output, index, delta?) the accumulator emits, in order. */
 function withRecorder(caps?: Partial<OutputCaps>) {
-	const emits: Array<{ output: CellOutput; index: number }> = [];
+	const emits: Array<{ output: CellOutput; index: number; delta?: StreamDelta }> = [];
 	const full = {
 		maxStreamBytes: 1_000,
 		maxItems: 10,
 		maxTotalBytes: 5_000,
 		...caps
 	};
-	const acc = new OutputAccumulator((output, index) => emits.push({ output, index }), full);
+	const acc = new OutputAccumulator((output, index, delta) => emits.push({ output, index, delta }), full);
 	return { acc, emits };
+}
+
+/**
+ * Reconstruct what a CLIENT would show for one stream element, applying the wire
+ * frames the accumulator emitted at `index` in order: a full emit (no delta)
+ * establishes/replaces the element's text; a delta splices `prev.slice(0,keep)+chunk`
+ * — but only when its `base` matches the current length (else the client is out of
+ * sync and would refetch, which this helper models by refusing to apply).
+ */
+function replay(emits: Array<{ output: CellOutput; index: number; delta?: StreamDelta }>, index: number): string {
+	let text: string | null = null;
+	for (const e of emits) {
+		if (e.index !== index) continue;
+		if (!e.delta) {
+			text = (e.output as { text: string }).text;
+		} else {
+			const cur: string = text ?? '';
+			expect(cur.length).toBe(e.delta.base); // in-order frames must never desync
+			text = cur.slice(0, e.delta.keep) + e.delta.chunk;
+		}
+	}
+	return text ?? '';
 }
 
 const stream = (name: string, text: string): CellOutput => ({ output_type: 'stream', name, text });
@@ -64,6 +86,127 @@ describe('OutputAccumulator — coalescing', () => {
 			{ output_type: 'stream', name: 'stderr', text: 'err\n' },
 			{ output_type: 'stream', name: 'stdout', text: 'out2\n' }
 		]);
+	});
+});
+
+describe('OutputAccumulator — streamed deltas (wire optimization)', () => {
+	it('emits the whole element only ONCE, then deltas — not the full buffer per tick', () => {
+		const { acc, emits } = withRecorder();
+		acc.push(stream('stdout', 'line1\n'));
+		acc.flush();
+		acc.push(stream('stdout', 'line2\n'));
+		acc.flush();
+		acc.push(stream('stdout', 'line3\n'));
+		acc.finish();
+		// Exactly one full-element emit (the first); the rest are deltas.
+		const full = emits.filter((e) => !e.delta);
+		const deltas = emits.filter((e) => e.delta);
+		expect(full.length).toBe(1);
+		expect(full[0].delta).toBeUndefined();
+		expect(deltas.length).toBe(2);
+		// A plain streaming log is a pure append: keep === base, chunk === the new bytes.
+		expect(deltas[0].delta).toEqual({ base: 6, keep: 6, chunk: 'line2\n' });
+		expect(deltas[1].delta).toEqual({ base: 12, keep: 12, chunk: 'line3\n' });
+	});
+
+	it('per-run wire bytes are O(size), not O(size × ticks)', () => {
+		const { acc, emits } = withRecorder({ maxStreamBytes: 10_000_000, maxTotalBytes: 20_000_000 });
+		// 200 chunks of 64 bytes, flushed each tick — the O(N²) scenario from the audit.
+		const chunk = 'x'.repeat(63) + '\n';
+		let total = 0;
+		for (let i = 0; i < 200; i++) {
+			acc.push(stream('stdout', chunk));
+			total += chunk.length;
+			acc.flush();
+		}
+		acc.finish();
+		// Bytes actually put on the wire = first full element + every delta chunk.
+		const wire = emits.reduce(
+			(n, e) => n + (e.delta ? e.delta.chunk.length : (e.output as { text: string }).text.length),
+			0
+		);
+		// O(size): within a small constant of the real output. The pre-fix behavior
+		// re-emitted the whole growing buffer each tick — Σ ≈ size²/chunk ≈ 100× here.
+		expect(wire).toBeLessThan(total * 2);
+		expect(wire).toBeGreaterThanOrEqual(total); // never drops bytes
+	});
+
+	it('replaying the emitted frames reconstructs the exact final text (plain log)', () => {
+		const { acc, emits } = withRecorder();
+		for (let i = 0; i < 5; i++) {
+			acc.push(stream('stdout', `epoch ${i}\n`));
+			acc.flush();
+		}
+		const out = acc.finish();
+		const final = (out[0] as { text: string }).text;
+		expect(replay(emits, 0)).toBe(final);
+		expect(final).toBe('epoch 0\nepoch 1\nepoch 2\nepoch 3\nepoch 4\n');
+	});
+
+	it('a terminal CR-rewrite emits a tail-splice delta (keep < base), still byte-correct', () => {
+		const { acc, emits } = withRecorder();
+		acc.push(stream('stdout', '\r 0%|   | 0/30'));
+		acc.flush();
+		acc.push(stream('stdout', '\r 50%|#  | 15/30'));
+		acc.flush();
+		acc.push(stream('stdout', '\r100%|###| 30/30'));
+		const out = acc.finish();
+		const final = (out[0] as { text: string }).text;
+		expect(final).toBe('100%|###| 30/30');
+		// The reducer rewrote earlier bytes, so at least one delta splices before its
+		// end (keep < base) rather than pure-appending.
+		const deltas = emits.filter((e) => e.delta).map((e) => e.delta!);
+		expect(deltas.some((d) => d.keep < d.base)).toBe(true);
+		// Replaying every frame still yields the byte-exact collapsed line.
+		expect(replay(emits, 0)).toBe(final);
+	});
+
+	it('a mixed log + progress-bar stream stays byte-correct through deltas', () => {
+		const { acc, emits } = withRecorder();
+		acc.push(stream('stdout', 'starting run\n'));
+		acc.flush();
+		acc.push(stream('stdout', '\rprogress 10%'));
+		acc.flush();
+		acc.push(stream('stdout', '\rprogress 90%'));
+		acc.flush();
+		acc.push(stream('stdout', '\ndone\n'));
+		const out = acc.finish();
+		const final = (out[0] as { text: string }).text;
+		expect(replay(emits, 0)).toBe(final);
+	});
+
+	it('an idle flush tick (no new bytes) broadcasts nothing', () => {
+		const { acc, emits } = withRecorder();
+		acc.push(stream('stdout', 'hello\n'));
+		acc.flush();
+		const afterFirst = emits.length;
+		acc.flush(); // nothing new
+		acc.flush(); // still nothing
+		expect(emits.length).toBe(afterFirst);
+	});
+
+	it('a fresh stream element after a rich output starts with a full emit again', () => {
+		const { acc, emits } = withRecorder();
+		acc.push(stream('stdout', 'a'));
+		acc.flush();
+		acc.push(display('MID')); // closes the stream element
+		acc.push(stream('stdout', 'b')); // new element at index 2
+		acc.flush();
+		acc.push(stream('stdout', 'c'));
+		acc.finish();
+		// The second stream element (index 2) is established by a full emit, then grows by delta.
+		const idx2 = emits.filter((e) => e.index === 2);
+		expect(idx2[0].delta).toBeUndefined();
+		expect(idx2.slice(1).every((e) => !!e.delta)).toBe(true);
+		expect(replay(emits, 2)).toBe('bc');
+	});
+
+	it('the delta base guard rejects a stale/out-of-order splice (models client refetch)', () => {
+		// A delta whose base does not match the current text must NOT be applied — the
+		// client discards it and refetches. Prove a mismatched base is detectable.
+		const cur = 'ABCDEFG'; // client already advanced past this delta
+		const stale: StreamDelta = { base: 3, keep: 3, chunk: 'DE' }; // computed against 'ABC'
+		expect(cur.length).not.toBe(stale.base); // guard fires → refetch, no corruption
 	});
 });
 

@@ -22,7 +22,7 @@ import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook';
 import { publish } from './events';
 import { isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
-import { OutputAccumulator, OUTPUT_FLUSH_MS } from './output-accumulator';
+import { OutputAccumulator, OUTPUT_FLUSH_MS, type StreamDelta } from './output-accumulator';
 import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types';
 
 /** Arguments to `executeCellRun`. */
@@ -34,7 +34,13 @@ export interface CellRunArgs {
 	source: string;
 	originId?: string | null;
 	/** Receives, in wire order, run:start, every execute() frame, and run:end. */
-	onEvent?: (event: RunStreamEvent | { type: 'run:start'; cellId: string; at: number } | ({ type: 'run:end' } & LastRun)) => void;
+	onEvent?: (
+		event:
+			| RunStreamEvent
+			| { type: 'run:start'; cellId: string; at: number }
+			| { type: 'output-append'; index: number; base: number; keep: number; chunk: string }
+			| ({ type: 'run:end' } & LastRun)
+	) => void;
 }
 
 /**
@@ -76,11 +82,21 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// Bound + coalesce the run's output across all three consumers (persist, SSE
 	// broadcast, this caller's stream). The accumulator merges consecutive
 	// same-stream chunks and caps runaway output; `emit` fans each committed/updated
-	// element out with its STABLE index so the broadcast re-emits a growing stream at
-	// one index (the client overwrites that element) instead of appending per chunk.
-	const emit = (output: CellOutput, index: number) => {
-		publish({ type: 'run:output', nb, cellId, output, index, originId });
-		onEvent?.({ type: 'output', output, index });
+	// element out with its STABLE index. A growing stream element is re-emitted as a
+	// small `run:output-append` DELTA (only the bytes that changed since the last
+	// flush) instead of its whole buffer, so a slow streaming cell no longer
+	// re-broadcasts O(size) to every tab each tick — see output-accumulator's header.
+	// The full-element `run:output` is kept for the element's first emission and for
+	// rich/marker outputs; a dropped delta self-heals via the client's seq-gap
+	// refetch (each frame carries a monotonic `seq`).
+	const emit = (output: CellOutput, index: number, delta?: StreamDelta) => {
+		if (delta) {
+			publish({ type: 'run:output-append', nb, cellId, index, base: delta.base, keep: delta.keep, chunk: delta.chunk, originId });
+			onEvent?.({ type: 'output-append', index, base: delta.base, keep: delta.keep, chunk: delta.chunk });
+		} else {
+			publish({ type: 'run:output', nb, cellId, output, index, originId });
+			onEvent?.({ type: 'output', output, index });
+		}
 	};
 	const acc = new OutputAccumulator(emit);
 	// Flush buffered stream text on a ~40ms tick so a long run shows live progress;

@@ -67,11 +67,12 @@
 		| { type: 'notebook:header-numbering'; levels: number[] }
 		| { type: 'notebook:hide-all-code'; hidden: boolean };
 
-	/** A run-lifecycle event (run:cleared / run:start / run:output / run:end). */
+	/** A run-lifecycle event (run:cleared / run:start / run:output / run:output-append / run:end). */
 	type RunEvent =
 		| { type: 'run:cleared'; cellId?: string }
 		| { type: 'run:start'; cellId?: string; actor?: Actor }
 		| { type: 'run:output'; cellId?: string; output: CellOutput; index?: number }
+		| { type: 'run:output-append'; cellId?: string; index: number; base: number; keep: number; chunk: string }
 		| { type: 'run:end'; cellId?: string; at?: number; durationMs?: number; actor?: Actor };
 
 	/**
@@ -847,16 +848,36 @@
 		}
 	}
 
-	// Apply a streamed output to a cell's output array. The server assigns each
-	// output a STABLE index: a coalesced stream re-emits at the same index as its
-	// text grows (overwrite one element) and a fresh output takes the next index
-	// (append). Overwriting one element in place instead of rebuilding the whole
-	// array per chunk is what keeps a runaway cell's render append-only — Svelte's
-	// deep `$state` proxy makes the indexed write reactive. Events without an index
-	// (defensive / older shapes) simply append.
+	// Apply a whole streamed output to a cell's output array at its STABLE index: a
+	// fresh output takes the next index (append), a rich output or a growing stream
+	// element's FIRST emission overwrites/establishes its element. Subsequent growth
+	// of a stream element arrives as a `run:output-append` delta (applyOutputAppend),
+	// not a full re-emit, so a runaway cell no longer re-broadcasts its whole buffer
+	// per chunk. Reassigning the element (not mutating in place) keeps Svelte's deep
+	// `$state` proxy reactive. Events without an index (defensive / older shapes)
+	// simply append.
 	function applyOutput(cell: UICell, output: CellOutput, index?: number) {
 		if (!cell.outputs) cell.outputs = [];
 		cell.outputs[index ?? cell.outputs.length] = output;
+	}
+
+	// Apply a streamed-output DELTA (`run:output-append`) to a growing stream
+	// element. To keep a slow streaming cell from re-broadcasting its whole buffer
+	// each ~40ms flush, the server sends only what changed: splice the element's
+	// text as `prev.slice(0, keep) + chunk` (a pure append has `keep === base`; the
+	// terminal reducer can rewrite the tail, giving `keep < base`). `base` is the
+	// length this element's text MUST currently have for the splice to be valid — a
+	// mismatch means we missed the establishing frame or an earlier delta (or a
+	// reconnect refetch is racing a live delta), so we discard it and let the
+	// seq-gap refetch backstop resync rather than corrupting the text. Reassigning
+	// the element (not mutating in place) keeps Svelte's `$state` proxy reactive.
+	function applyOutputAppend(cell: UICell, index: number, base: number, keep: number, chunk: string): boolean {
+		const cur = cell.outputs?.[index];
+		if (!cur || cur.output_type !== 'stream') return false;
+		const oldText = typeof cur.text === 'string' ? cur.text : Array.isArray(cur.text) ? cur.text.join('') : '';
+		if (oldText.length !== base) return false; // out of sync → caller refetches
+		cell.outputs![index] = { ...cur, text: oldText.slice(0, keep) + chunk };
+		return true;
 	}
 
 	function applyRunEvent(ev: RunEvent) {
@@ -880,6 +901,12 @@
 			}
 		} else if (ev.type === 'run:output') {
 			if (cell) applyOutput(cell, ev.output, ev.index);
+		} else if (ev.type === 'run:output-append') {
+			// A stream delta whose base doesn't match means we're out of sync (a
+			// dropped establishing frame / earlier delta, or a reconnect refetch racing
+			// a live delta): refetch to resync. Skip if a load is already in flight — it
+			// will resync us — so a burst of mismatches can't pile up loads.
+			if (cell && !applyOutputAppend(cell, ev.index, ev.base, ev.keep, ev.chunk) && !fetching) load();
 		} else if (ev.type === 'run:end') {
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;
@@ -1049,6 +1076,12 @@
 						cell.outputs = [];
 					} else if (ev.type === 'output') {
 						applyOutput(cell, ev.output, ev.index);
+					} else if (ev.type === 'output-append') {
+						// Streamed-output delta on our own run's stream (see applyOutputAppend).
+						// A base mismatch here would only happen if we missed the establishing
+						// frame on this same ordered stream — treat it as a no-op; the final
+						// run:end + persisted outputs (and any SSE seq-gap refetch) settle it.
+						applyOutputAppend(cell, ev.index, ev.base, ev.keep, ev.chunk);
 					} else if (ev.type === 'run:end') {
 						stampLastRun(cell, ev); // this tab's own user run → its badge
 					}
