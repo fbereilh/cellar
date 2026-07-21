@@ -318,8 +318,9 @@ Follow this house style:
    Connecting is a HUMAN action: ask the user to connect from the Databricks
    sidebar; do not connect yourself, and do NOT restart your kernel while connected
    — that destroys the session. Expired sessions SELF-HEAL: when a spark.* cell
-   fails with SESSION_CLOSED / "Spark Connect Session expired", call
-   databricks_status (or kernel_state) — that triggers Cellar's auto-reconnect —
+   fails with SESSION_CLOSED / "Spark Connect Session expired" / NO_ACTIVE_SESSION
+   (a closed client), call databricks_status (or kernel_state) — that triggers
+   Cellar's auto-reconnect —
    then re-run the failed cell. (See the databricks_* tool docs for the
    reconnected:true / expired:true semantics.)
 
