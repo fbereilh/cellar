@@ -1152,13 +1152,30 @@ def _cellar_dbx_connect(_cfg):
         _version = None
     return {'ok': True, 'host': _host, 'spark_version': _version}
 
+import os as _cellar_os
+# Preserve Cellar's injected DATABRICKS_RUNTIME_VERSION across the connect. The
+# "Databricks runtime" toggle sets it at kernel start to flip a notebook's
+# import-time IS_DATABRICKS gate (see databricksRuntime.ts / kernel.ts); it starts
+# with 'DATABRICKS_' and so matches the scrub inside _cellar_dbx_connect, which
+# would pop it. That scrub is REQUIRED, not incidental: databricks-connect refuses
+# to build a REMOTE Spark session while it believes it is on a Databricks runtime,
+# so the var must be absent while the session is created (this is why a plain
+# KEEP_ENV entry is wrong - it would re-break connect). So the scrub + session
+# build run with a clean env as before, and we restore the var afterward so the
+# user's cells still see IS_DATABRICKS == True. Without this, the reconnect that
+# runs right after initKernel injected the var (a kernel restart of a bound
+# notebook) silently un-advertises the runtime - DATABRICKS_RUNTIME_VERSION reads
+# None after a connected restart, the exact bug this guards.
+_cellar_saved_runtime = _cellar_os.environ.get('DATABRICKS_RUNTIME_VERSION')
 try:
     print('${SENTINEL}' + _cellar_json.dumps(_cellar_dbx_connect(_cellar_json.loads(${pyLiteral(cfg)}))))
 except Exception as _e:
     print('${SENTINEL}' + _cellar_json.dumps(
         {'ok': False, 'code': 'error', 'message': '%s: %s' % (type(_e).__name__, _e)}))
 finally:
-    del _cellar_dbx_connect, _cellar_json
+    if _cellar_saved_runtime is not None:
+        _cellar_os.environ['DATABRICKS_RUNTIME_VERSION'] = _cellar_saved_runtime
+    del _cellar_dbx_connect, _cellar_json, _cellar_os, _cellar_saved_runtime
 `;
 
 /**
