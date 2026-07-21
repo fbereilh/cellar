@@ -24,6 +24,7 @@ import {
 	setHeaderNumbering as setHeaderNumberingDoc,
 	setHideAllCode as setHideAllCodeDoc,
 	setHideInput as setHideInputDoc,
+	setExportTarget as setExportTargetDoc,
 	getActiveNotebookPath,
 	resolveNotebookPath,
 	workspaceRelative,
@@ -667,16 +668,25 @@ export async function getNotebookMap(nb?: string | null) {
 	// live probe still backs `databricks_status`/`get_kernel_state`, where verifying
 	// the session is the point.
 	const dbx = databricksConnection(nb);
-	// `display` = the notebook-level, display-only settings that change what the
-	// human sees without touching any cell's source. They ride the map because the
+	// `display` = the notebook-level settings that change how the notebook is
+	// presented without touching any cell's source. They ride the map because the
 	// map is what an agent reads before it writes: `header_numbering` is why a new
-	// header must NOT carry a hand-typed number, and `report_view` is why a cell's
-	// code may be invisible to the reader even though it is in the document.
+	// header must NOT carry a hand-typed number, `report_view` is why a cell's code
+	// may be invisible to the reader even though it is in the document, and
+	// `export_target` is the notebook's nbdev-style `#|default_exp` module path (the
+	// `.py` file the `export`-marked cells are written to), so an agent marking
+	// cells for export can see where they land and set it (see set_export_target).
+	// export_target is the one settling that is not purely display: it drives the
+	// auto-generated `.py` module, but it lives in the same `cellar` metadata seam.
 	return {
 		notebook: view.path,
 		kernel: kernelSession(nb),
 		databricks: { connected: dbx.connected === true },
-		display: { header_numbering: view.headerNumbering, report_view: view.hideAllCode },
+		display: {
+			header_numbering: view.headerNumbering,
+			report_view: view.hideAllCode,
+			export_target: view.exportTarget
+		},
 		cell_count: cells.length,
 		sections: root
 	};
@@ -1257,6 +1267,25 @@ export function setHeaderNumbering(levels: readonly number[] | null | undefined,
 export function setReportView(enabled: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	return { report_view: setHideAllCodeDoc(enabled, target) };
+}
+
+/**
+ * MCP `set_export_target`. The notebook-level nbdev-style `#|default_exp` target:
+ * the workspace-relative `.py` module the cells marked `cellar.export` are written
+ * to. Setting it (or clearing it with null/'') persists in the allowlisted
+ * `cellar` namespace so it round-trips through clean-on-save, and `persist`
+ * regenerates the module as a side effect (auto-on-save) exactly like the UI's
+ * target input. Returns the resulting `export_target` (the trimmed path, or null
+ * when cleared); `get_notebook_map`'s `display` block reports the same value.
+ *
+ * Unlike the pure display setters this one DOES have a side effect (it drives the
+ * generated `.py`), but it changes no cell source, so like them it takes no
+ * pre-action checkpoint — there is no cell state an undo would need to bring back.
+ */
+export function setExportTarget(target: string | null | undefined, nb?: string | null) {
+	const nbTarget = nb ?? getActiveNotebookPath();
+	setExportTargetDoc(target ?? null, nbTarget);
+	return { export_target: getNotebook(nbTarget).exportTarget };
 }
 
 /**
