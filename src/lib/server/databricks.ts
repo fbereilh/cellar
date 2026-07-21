@@ -1413,6 +1413,22 @@ export function connectionStatus(nb?: string | null): ConnectionStatus {
 }
 
 /**
+ * Whether a notebook is BOUND to a Databricks cluster - i.e. it has a live session
+ * OR a kept reconnect intent (set on connect, survives a kernel restart, cleared
+ * only by an explicit `disconnect`). This is the durable "this is a Databricks
+ * notebook" signal, deliberately distinct from `connectionStatus().connected`
+ * (which reports the LIVE session and reads false between a restart and its
+ * auto-reconnect). `kernel.ts` reads it at kernel-start time to scope the
+ * `DATABRICKS_RUNTIME_VERSION` injection to connected notebooks - so a restart of
+ * a bound notebook re-injects the env (the binding persists) while a purely-local
+ * kernel never gets it. Never boots a kernel; cheap; keyed by absolute path.
+ */
+export function databricksBound(nb?: string | null): boolean {
+	const s = stateFor(resolveNotebookPath(nb));
+	return s.connection !== null || s.reconnectTarget !== null;
+}
+
+/**
  * Probe whether the bound `spark` session is actually alive, memoizing the
  * result. Concurrent callers share the one in-flight probe. A `SELECT 1` is a
  * single tiny RPC, so this is cheap - but it still runs in the kernel, so the

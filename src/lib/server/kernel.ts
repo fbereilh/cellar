@@ -31,8 +31,9 @@ import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
 import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from './notebook';
 import { workspaceRoot } from './fstree';
-import { addProjectRootToPath } from './ui-state';
+import { addProjectRootToPath, injectDatabricksRuntime, databricksRuntimeVersion } from './ui-state';
 import { projectRootAddCode, projectRootRemoveCode } from './projectRoot';
+import { databricksRuntimeEnvCode } from './databricksRuntime';
 import { CONTROL_COMM_TARGET, RESTART_MAGIC_CODE, controlOp } from './controlMagic';
 import { WIDGETS_SHIM_CODE } from './widgetsShim';
 import { publish, publishGlobal } from './events';
@@ -1077,6 +1078,23 @@ async function reconnectDatabricksAfterRestart(nbPath: string): Promise<void> {
 	}
 }
 
+/**
+ * Whether a notebook is bound to a Databricks cluster (a live session OR a kept
+ * reconnect intent). Read at kernel-start time to scope the
+ * `DATABRICKS_RUNTIME_VERSION` injection to connected notebooks. Loaded
+ * dynamically to keep databricks.ts's dependency on this module one-directional
+ * (no import cycle); a failure degrades to "not bound" so kernel bring-up is never
+ * broken by it.
+ */
+async function databricksNotebookBound(nbPath: string): Promise<boolean> {
+	try {
+		const { databricksBound } = await import('./databricks');
+		return databricksBound(nbPath);
+	} catch {
+		return false;
+	}
+}
+
 async function runSilent(kernel: KernelConnection, code: string): Promise<void> {
 	try {
 		const future = kernel.requestExecute({
@@ -1091,7 +1109,7 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 	}
 }
 
-async function initKernel(kernel: KernelConnection): Promise<void> {
+async function initKernel(kernel: KernelConnection, nbPath: string): Promise<void> {
 	// Coalesce every startup injection into ONE round-trip in front of the first
 	// user result. Each block is independently guarded (a matplotlib/pandas/IPython
 	// failure degrades to a no-op) and defines-then-`del`s its own private temp
@@ -1100,7 +1118,19 @@ async function initKernel(kernel: KernelConnection): Promise<void> {
 	// kernel ready sooner without dropping anything they establish. Runs on every
 	// fresh start AND after a restart/autorestart (which clears the namespace, the
 	// matplotlib backend, the DataFrame formatter, the magic, and sys.path).
-	const parts = [
+	const parts: string[] = [];
+	// FIRST: advertise a Databricks runtime (set DATABRICKS_RUNTIME_VERSION) so a
+	// notebook's `IS_DATABRICKS`-gated code takes its `dbutils.widgets` path - set
+	// before every other injected snippet AND before the user's first import (the
+	// gate is import-time). Scoped to notebooks BOUND to a Databricks cluster
+	// (default ON there) so a purely-local kernel is never told it is on Databricks;
+	// an explicit env override can force it. Re-read here so a restart of a bound
+	// notebook re-applies it - which is exactly the "restart to apply" contract
+	// (connect binds the notebook, restart injects the env for the fresh imports).
+	if (injectDatabricksRuntime(await databricksNotebookBound(nbPath))) {
+		parts.push(databricksRuntimeEnvCode(databricksRuntimeVersion()));
+	}
+	parts.push(
 		// matplotlib inline backend → Figures emit image/png, not their text repr.
 		STARTUP_CODE,
 		// The Cellar DataFrame/Series display formatter (interactive grid mimetype).
@@ -1110,7 +1140,7 @@ async function initKernel(kernel: KernelConnection): Promise<void> {
 		WIDGETS_SHIM_CODE,
 		// The %restart_python line magic (managed restart via the control comm).
 		RESTART_MAGIC_CODE
-	];
+	);
 	// Add the workspace root to sys.path so a notebook in any subfolder can import
 	// project modules (and the `.py` module the export writes at the root). Gated by
 	// the per-workspace setting (default ON) and re-read here so a restart /
@@ -1220,12 +1250,12 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 			// Re-inject the startup code, THEN best-effort re-establish a Databricks
 			// session if this notebook had one (both after the namespace is fresh).
 			// Detached so a jupyter-driven autorestart is never blocked by either.
-			void initKernel(kernel)
+			void initKernel(kernel, nbPath)
 				.then(() => reconnectDatabricksAfterRestart(nbPath))
 				.catch(() => {});
 		};
 		kernel.statusChanged.connect(nbKernel.statusHandler);
-		await initKernel(kernel);
+		await initKernel(kernel, nbPath);
 		logInfo('kernel', `kernel for ${nbPath} started (session ${nbKernel.sessionId})`);
 		// The kernel is up: refresh its card from "starting" to its live status, and
 		// begin sampling its resident memory (the poller self-stops when no kernel
@@ -1300,7 +1330,7 @@ export async function restartKernel(nbPath?: string | null) {
 		beginSession(nbKernel);
 	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
-	await initKernel(kernel);
+	await initKernel(kernel, abs);
 	publishKernelStatus();
 	// If this notebook had a live Databricks session, rebuild it against the same
 	// profile+cluster now the namespace is fresh. Detached (void) so it never blocks

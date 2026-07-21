@@ -125,7 +125,15 @@ vi.mock('../../src/lib/server/run-queue', () => ({ clearRunQueue: vi.fn() }));
 
 vi.mock('../../src/lib/server/fstree', () => ({ workspaceRoot: () => '/ws' }));
 
-vi.mock('../../src/lib/server/ui-state', () => ({ addProjectRootToPath: () => true }));
+vi.mock('../../src/lib/server/ui-state', () => ({
+	addProjectRootToPath: () => true,
+	injectDatabricksRuntime: () => false,
+	databricksRuntimeVersion: () => '15.4'
+}));
+
+// initKernel dynamically imports this to scope the Databricks-runtime env; a plain
+// kernel is unbound, so the bound check is false (no injection).
+vi.mock('../../src/lib/server/databricks', () => ({ databricksBound: () => false }));
 
 vi.mock('../../src/lib/server/logs', () => ({ logInfo: vi.fn(), logWarn: vi.fn(), logError: vi.fn() }));
 

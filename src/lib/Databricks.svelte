@@ -17,6 +17,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
+	import { getUi, setUi } from '$lib/uiState';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -89,13 +90,53 @@
 		/** Insert a code cell into the active notebook and run it. Null when no notebook is open. */
 		onInsertAndRun = null,
 		/** Called after a successful connect/disconnect so the shell refreshes its kernel + variables. */
-		onSessionChange = null
+		onSessionChange = null,
+		/** Restart the active notebook's kernel - used to apply the Databricks-runtime toggle. */
+		onRestartKernel = null
 	}: {
 		notebookPath?: string | null;
 		kernelSessionId?: SessionId | null;
 		onInsertAndRun?: ((source: string) => void) | null;
 		onSessionChange?: (() => void) | null;
+		onRestartKernel?: ((path: string) => void | Promise<void>) | null;
 	} = $props();
+
+	// ---- Databricks-runtime toggle (advertise DATABRICKS_RUNTIME_VERSION) -----
+	// Sets DATABRICKS_RUNTIME_VERSION in the kernel at start so a notebook's
+	// import-time `IS_DATABRICKS` gate takes its `dbutils.widgets` path. Persisted
+	// per workspace (server keys mirrored from `$lib/server/databricksRuntime.ts` -
+	// a client component can't import a `$lib/server` module). Applies at kernel
+	// START only (the gate is import-time), so toggling shows a "restart to apply"
+	// hint rather than acting live. Default ON - scoped server-side to a CONNECTED
+	// notebook, so a purely-local kernel is never told it is on Databricks.
+	const DBX_RUNTIME_KEY = 'cellar-databricks-runtime';
+	const DBX_RUNTIME_VERSION_KEY = 'cellar-databricks-runtime-version';
+	const DBX_RUNTIME_VERSION_DEFAULT = '15.4';
+	let runtimeOn = $state(true);
+	let runtimeVersion = $state(DBX_RUNTIME_VERSION_DEFAULT);
+	// Set when the toggle/version changes so the "restart to apply" hint shows; the
+	// change only takes effect on the next kernel start.
+	let runtimeDirty = $state(false);
+	onMount(() => {
+		runtimeOn = getUi<boolean>(DBX_RUNTIME_KEY, true);
+		runtimeVersion = getUi<string>(DBX_RUNTIME_VERSION_KEY, DBX_RUNTIME_VERSION_DEFAULT);
+	});
+	function toggleRuntime() {
+		runtimeOn = !runtimeOn; // optimistic
+		setUi(DBX_RUNTIME_KEY, runtimeOn);
+		runtimeDirty = true;
+	}
+	function onVersionInput(e: Event) {
+		const v = (e.currentTarget as HTMLInputElement).value.trim();
+		runtimeVersion = v;
+		// Persist a non-empty value; an empty field falls back to the default on read.
+		setUi(DBX_RUNTIME_VERSION_KEY, v === '' ? null : v);
+		runtimeDirty = true;
+	}
+	async function restartToApply() {
+		runtimeDirty = false;
+		if (onRestartKernel && notebookPath) await onRestartKernel(notebookPath);
+	}
 
 	/** Query string carrying the active notebook path, so every per-notebook request targets it. */
 	function pathQuery(): string {
@@ -621,6 +662,52 @@
 					<button class="btn btn-outline btn-xs flex-1" onclick={disconnect} disabled={!!busy} data-testid="databricks-disconnect">
 						{#if busy === 'disconnect'}<span class="loading loading-spinner loading-xs"></span>{:else}Disconnect{/if}
 					</button>
+				</div>
+				<!-- Databricks-runtime toggle: advertise DATABRICKS_RUNTIME_VERSION so this
+				     notebook's IS_DATABRICKS-gated code takes its dbutils.widgets path.
+				     Shown only when connected; applies at kernel START (import-time gate),
+				     so a change surfaces a "restart to apply" hint. -->
+				<div class="mt-2 border-t border-success/20 pt-2">
+					<label
+						class="flex cursor-pointer items-center gap-2 text-[11px] text-base-content/70"
+						title="Advertises a Databricks runtime (sets DATABRICKS_RUNTIME_VERSION) so notebook code that gates on IS_DATABRICKS takes its dbutils.widgets path. Affects all libraries (e.g. mlflow), requires a kernel restart, and does not connect a cluster - use Databricks Connect for spark/Unity Catalog."
+					>
+						<input
+							type="checkbox"
+							class="toggle toggle-xs toggle-success"
+							checked={runtimeOn}
+							onchange={toggleRuntime}
+							data-testid="databricks-runtime-toggle"
+						/>
+						<span>Databricks runtime (<code class="font-mono text-[10px]">dbutils.widgets</code>)</span>
+					</label>
+					{#if runtimeOn}
+						<label class="mt-1.5 flex items-center gap-2 text-[11px] text-base-content/50">
+							<span class="shrink-0">version</span>
+							<input
+								type="text"
+								class="input input-xs input-bordered h-5 min-h-0 w-20 py-0 font-mono text-[10px]"
+								value={runtimeVersion}
+								oninput={onVersionInput}
+								placeholder={DBX_RUNTIME_VERSION_DEFAULT}
+								data-testid="databricks-runtime-version"
+							/>
+						</label>
+					{/if}
+					{#if runtimeDirty}
+						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/60" data-testid="databricks-runtime-hint">
+							Takes effect on the next kernel start.
+							{#if onRestartKernel && notebookPath}
+								<button
+									class="text-primary/80 hover:text-primary hover:underline"
+									onclick={restartToApply}
+									data-testid="databricks-runtime-restart"
+								>Restart the kernel to apply now.</button>
+							{:else}
+								Restart the kernel to apply now.
+							{/if}
+						</p>
+					{/if}
 				</div>
 			</div>
 		{:else if connection.lost}
