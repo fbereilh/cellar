@@ -143,12 +143,15 @@ function parseNdjson(body: string): WireEvent[] {
 function reconstruct(events: WireEvent[], index: number): string {
 	let text: string | null = null;
 	for (const e of events) {
-		if (e.type === 'output' && e.index === index) {
-			text = e.output.text ?? '';
-		} else if (e.type === 'output-append' && e.index === index) {
-			const cur = text ?? '';
-			expect(cur.length).toBe(e.base);
-			text = cur.slice(0, e.keep) + e.chunk;
+		if (e.type === 'output') {
+			const f = e as Extract<WireEvent, { type: 'output' }>;
+			if (f.index === index) text = f.output.text ?? '';
+		} else if (e.type === 'output-append') {
+			const d = e as Extract<WireEvent, { type: 'output-append' }>;
+			if (d.index !== index) continue;
+			const cur: string = text ?? '';
+			expect(cur.length).toBe(d.base);
+			text = cur.slice(0, d.keep) + d.chunk;
 		}
 	}
 	return text ?? '';
