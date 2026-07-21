@@ -155,6 +155,7 @@ to publish, e.g. inside a container.
 | `CELLAR_KERNEL_PROBE_TIMEOUT_MS` | `10000` (ms, = 10s) | How long one liveness probe (a localhost `GET /api/kernels/<id>`, normally ~3-5ms) may take before it is abandoned as inconclusive. An abandoned probe does not abort a run on its own; the watchdog just probes again (unless the websocket has also given up - see above). |
 | `CELLAR_KERNEL_RECONNECT_TIMEOUT_MS` | `15000` (ms, = 15s) | How long a dead-socket self-heal (rebuild the kernel websocket without restarting the process or clearing its namespace, after the watchdog convicts a `disconnected` socket) may take before it is abandoned. A timeout is non-fatal: the reconnect keeps trying in the background and a later run retries, so nothing is lost. |
 | `CELLAR_MAX_KERNELS` | `8` | Soft cap: shows a warn-only banner past N live kernels (never blocks a run). `0` disables the warning. |
+| `CELLAR_KERNEL_MEMORY_POLL_MS` | `4000` (ms, = 4s) | How often each live kernel's resident memory (RSS) is measured host-side (via `ps`) and re-broadcast to the UI. The timer is unref'd and self-stops when no kernel remains; a value is only re-published when the whole-MiB figure changes. |
 
 ### MCP session lifecycle
 
