@@ -38,6 +38,7 @@
  * unit-tested directly (`tests/unit/output-accumulator.test.ts`).
  */
 import type { CellOutput, StreamOutput } from './types';
+import { isTerminalStyle, reduceCheap } from './terminal';
 
 /** Coalesce/broadcast tick: flush buffered stream text at most this often (ms). */
 export const OUTPUT_FLUSH_MS = 40;
@@ -196,7 +197,13 @@ export class OutputAccumulator {
 	flush(): void {
 		if (!this.pending) return;
 		const { name, text, index } = this.pending;
-		const out: StreamOutput = { output_type: 'stream', name, text };
+		// Keep `pending.text` raw — coalescing across chunks and the byte caps both
+		// depend on the full reassembled text (and Phase 2's VT emulator will too).
+		// Emit the terminal-reduced COPY so persist (.ipynb), the SSE broadcast, the
+		// agent read, and the render all see the collapsed final line instead of
+		// hundreds of `\r`-overwrite frames. Plain logs skip reduction entirely.
+		const reduced = isTerminalStyle(text) ? reduceCheap(text) : text;
+		const out: StreamOutput = { output_type: 'stream', name, text: reduced };
 		if (index < this.outputs.length) this.outputs[index] = out;
 		else this.outputs.push(out);
 		this.onEmit(out, index);
