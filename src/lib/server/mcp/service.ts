@@ -31,7 +31,7 @@ import {
 } from '../notebook';
 import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel';
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
-import { agentStatus as databricksStatus, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable } from '../databricks';
+import { agentStatus as databricksStatus, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable, reconnectSession as databricksReconnect, connectCluster as databricksConnect, listClustersForAgent as databricksClusters } from '../databricks';
 import { publish } from '../events';
 import { enqueueRun, queuesByNotebook, queuePosition } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
@@ -715,11 +715,19 @@ async function staleCells(nb?: string | null) {
  * cell to the human's document (the UI's own preview deliberately does, since
  * there the cell IS the deliverable).
  *
- * Every one of these throws a `DatabricksError` with code `not_connected` when
- * there is no live session. Connecting stays a human action, in the sidebar.
+ * The read/listing tools throw a `DatabricksError` with code `not_connected` when
+ * there is no live session. The agent MAY restore a dead session (`reconnect`,
+ * against the cluster the user already chose) and MAY connect a chosen cluster
+ * (`connect`, gated on non-browser auth), but never starts compute and never drives
+ * the OAuth browser — those stay human-only. Every path reuses the SAME
+ * reconnect/connect machinery in `databricks.ts` (no second code path).
  */
 export const databricks = {
 	status: (nb?: string | null) => databricksStatus(nb),
+	reconnect: (nb?: string | null) => databricksReconnect(nb),
+	connect: (opts: { clusterId: string; clusterName?: string | null; profile?: string | null; host?: string | null; nb?: string | null }) =>
+		databricksConnect(opts),
+	listClusters: (sel: { profile?: string | null; host?: string | null }, nb?: string | null) => databricksClusters(nb, sel),
 	catalogs: (nb?: string | null) => databricksCatalog.catalogs(nb),
 	schemas: (catalog: string, nb?: string | null) => databricksCatalog.schemas(catalog, nb),
 	tables: (catalog: string, schema: string, nb?: string | null) => databricksCatalog.tables(catalog, schema, nb),
