@@ -47,6 +47,7 @@ import {
 	clearWidgetOutput
 } from './widgets';
 import { logInfo, logWarn, logError } from './logs';
+import { sampleKernelMemory } from './kernelMemory';
 import type { RunStreamEvent, ExecuteOptions, SessionId, KernelStatus } from './types';
 import type { KernelListEntry } from '$lib/kernelBadge';
 
@@ -782,7 +783,8 @@ export function listKernels(): KernelListEntry[] {
 			id: conn?.id ?? null,
 			status,
 			session_id: conn ? nbKernel.sessionId : null,
-			busy: status === 'busy'
+			busy: status === 'busy',
+			memoryRss: conn?.id ? (kernelMemory.get(conn.id) ?? null) : null
 		});
 	}
 	return out;
@@ -854,6 +856,95 @@ function scheduleKernelStatus(): void {
 	}, statusDebounceMs());
 	// Never keep the Node process alive just to flush a status snapshot.
 	statusDebounceTimer.unref?.();
+}
+
+/**
+ * Per-kernel resident memory (bytes), keyed by Jupyter `kernel.id`, refreshed by a
+ * background poller while any kernel is alive. `listKernels()`/`getKernelInfo()`
+ * read from here so they stay synchronous; the poller samples RSS out-of-band (see
+ * `kernelMemory.ts`) and fans a fresh `kernel:status` snapshot when a reading moves.
+ * Values are rounded to whole MiB so a stable idle kernel's tiny RSS jitter does not
+ * churn the deduped status broadcast.
+ */
+const kernelMemory = new Map<string, number>();
+const MB = 1024 * 1024;
+let memoryPollTimer: ReturnType<typeof setInterval> | null = null;
+
+/** Poll cadence for the RSS sampler (ms). Cheap: one `ps` scan, off the run path. */
+function memoryPollMs(): number {
+	return envMs('CELLAR_KERNEL_MEMORY_POLL_MS', 4000);
+}
+
+/** Every live kernel's `id → absolute path`, for kernels whose connection resolved. */
+function liveKernelIds(): Map<string, string> {
+	const out = new Map<string, string>();
+	for (const [abs, nbKernel] of kernels) {
+		const id = nbKernel.connection?.id;
+		if (id) out.set(id, abs);
+	}
+	return out;
+}
+
+/**
+ * One memory sample: read RSS for every live kernel, update `kernelMemory`, and
+ * broadcast if anything changed. Self-stops the timer when no kernel remains. A
+ * transient `ps` failure keeps the last readings and retries next tick.
+ */
+async function pollKernelMemory(): Promise<void> {
+	const ids = liveKernelIds();
+	if (ids.size === 0) {
+		stopMemoryPolling();
+		if (kernelMemory.size > 0) {
+			kernelMemory.clear();
+			publishKernelStatus();
+		}
+		return;
+	}
+	let sample: Map<string, number>;
+	try {
+		sample = await sampleKernelMemory(ids.keys());
+	} catch {
+		return; // ps unavailable this tick — hold the last readings, try again
+	}
+	let changed = false;
+	for (const id of ids.keys()) {
+		const bytes = sample.get(id);
+		const rounded = bytes == null ? null : Math.round(bytes / MB) * MB;
+		const prev = kernelMemory.get(id) ?? null;
+		if (rounded == null) {
+			if (prev != null) {
+				kernelMemory.delete(id);
+				changed = true;
+			}
+		} else if (rounded !== prev) {
+			kernelMemory.set(id, rounded);
+			changed = true;
+		}
+	}
+	// Drop readings for kernels that vanished between ticks.
+	for (const id of [...kernelMemory.keys()]) {
+		if (!ids.has(id)) {
+			kernelMemory.delete(id);
+			changed = true;
+		}
+	}
+	if (changed) publishKernelStatus();
+}
+
+/** Start the RSS poller if not already running, and take one prompt sample. */
+function ensureMemoryPolling(): void {
+	if (memoryPollTimer) return;
+	memoryPollTimer = setInterval(() => void pollKernelMemory(), memoryPollMs());
+	// Never keep the Node process alive just to sample memory.
+	memoryPollTimer.unref?.();
+	void pollKernelMemory();
+}
+
+function stopMemoryPolling(): void {
+	if (memoryPollTimer) {
+		clearInterval(memoryPollTimer);
+		memoryPollTimer = null;
+	}
 }
 
 /**
@@ -1136,8 +1227,11 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		kernel.statusChanged.connect(nbKernel.statusHandler);
 		await initKernel(kernel);
 		logInfo('kernel', `kernel for ${nbPath} started (session ${nbKernel.sessionId})`);
-		// The kernel is up: refresh its card from "starting" to its live status.
+		// The kernel is up: refresh its card from "starting" to its live status, and
+		// begin sampling its resident memory (the poller self-stops when no kernel
+		// remains, and is a no-op if already running for another notebook).
 		publishKernelStatus();
+		ensureMemoryPolling();
 		return kernel;
 	})();
 
@@ -1831,13 +1925,14 @@ export async function execute(
 export function getKernelInfo(nbPath?: string | null) {
 	const nbKernel = kernels.get(resolveNb(nbPath));
 	if (!nbKernel || !nbKernel.connection) {
-		return { started: false, id: null, name: 'python3', status: 'not started', session_id: null };
+		return { started: false, id: null, name: 'python3', status: 'not started', session_id: null, memoryRss: null };
 	}
 	return {
 		started: true,
 		id: nbKernel.connection.id,
 		name: nbKernel.connection.name || 'python3',
 		status: nbKernel.connection.status, // 'idle' | 'busy' | 'starting' | 'dead' | …
-		session_id: nbKernel.sessionId
+		session_id: nbKernel.sessionId,
+		memoryRss: kernelMemory.get(nbKernel.connection.id) ?? null
 	};
 }
