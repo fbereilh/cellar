@@ -868,14 +868,15 @@
 	// terminal reducer can rewrite the tail, giving `keep < base`). `base` is the
 	// length this element's text MUST currently have for the splice to be valid — a
 	// mismatch means we missed the establishing frame or an earlier delta (or a
-	// reconnect refetch is racing a live delta), so we discard it and let the
-	// seq-gap refetch backstop resync rather than corrupting the text. Reassigning
-	// the element (not mutating in place) keeps Svelte's `$state` proxy reactive.
+	// reconnect refetch is racing a live delta), so we return false and the caller
+	// DROPS the delta rather than corrupting the text; the server's periodic
+	// full-frame checkpoint resyncs the element. Reassigning the element (not
+	// mutating in place) keeps Svelte's `$state` proxy reactive.
 	function applyOutputAppend(cell: UICell, index: number, base: number, keep: number, chunk: string): boolean {
 		const cur = cell.outputs?.[index];
 		if (!cur || cur.output_type !== 'stream') return false;
 		const oldText = typeof cur.text === 'string' ? cur.text : Array.isArray(cur.text) ? cur.text.join('') : '';
-		if (oldText.length !== base) return false; // out of sync → caller refetches
+		if (oldText.length !== base) return false; // out of sync → caller drops, resyncs at next checkpoint
 		cell.outputs![index] = { ...cur, text: oldText.slice(0, keep) + chunk };
 		return true;
 	}
@@ -904,9 +905,11 @@
 		} else if (ev.type === 'run:output-append') {
 			// A stream delta whose base doesn't match means we're out of sync (a
 			// dropped establishing frame / earlier delta, or a reconnect refetch racing
-			// a live delta): refetch to resync. Skip if a load is already in flight — it
-			// will resync us — so a burst of mismatches can't pile up loads.
-			if (cell && !applyOutputAppend(cell, ev.index, ev.base, ev.keep, ev.chunk) && !fetching) load();
+			// a live delta): DROP it as a no-op. The server's periodic full-frame
+			// checkpoint (every STREAM_CHECKPOINT_EVERY flushes) re-establishes the whole
+			// element, so a desynced tab resyncs at the next checkpoint — no refetch, so a
+			// burst of mismatches can't storm the notebook with loads.
+			if (cell) applyOutputAppend(cell, ev.index, ev.base, ev.keep, ev.chunk);
 		} else if (ev.type === 'run:end') {
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;

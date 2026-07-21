@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { OutputAccumulator, type OutputCaps, type StreamDelta } from '../../src/lib/server/output-accumulator';
+import { OutputAccumulator, STREAM_CHECKPOINT_EVERY, type OutputCaps, type StreamDelta } from '../../src/lib/server/output-accumulator';
 import type { CellOutput } from '../../src/lib/server/types';
 
 /** Collect every (output, index, delta?) the accumulator emits, in order. */
@@ -90,7 +90,7 @@ describe('OutputAccumulator — coalescing', () => {
 });
 
 describe('OutputAccumulator — streamed deltas (wire optimization)', () => {
-	it('emits the whole element only ONCE, then deltas — not the full buffer per tick', () => {
+	it('the FIRST emit is full, then deltas — not the full buffer per tick', () => {
 		const { acc, emits } = withRecorder();
 		acc.push(stream('stdout', 'line1\n'));
 		acc.flush();
@@ -98,7 +98,8 @@ describe('OutputAccumulator — streamed deltas (wire optimization)', () => {
 		acc.flush();
 		acc.push(stream('stdout', 'line3\n'));
 		acc.finish();
-		// Exactly one full-element emit (the first); the rest are deltas.
+		// The first emit is the full element; the next few (well under the checkpoint
+		// interval) are deltas.
 		const full = emits.filter((e) => !e.delta);
 		const deltas = emits.filter((e) => e.delta);
 		expect(full.length).toBe(1);
@@ -109,7 +110,47 @@ describe('OutputAccumulator — streamed deltas (wire optimization)', () => {
 		expect(deltas[1].delta).toEqual({ base: 12, keep: 12, chunk: 'line3\n' });
 	});
 
-	it('per-run wire bytes are O(size), not O(size × ticks)', () => {
+	it('promotes a full-frame CHECKPOINT at most every STREAM_CHECKPOINT_EVERY emissions', () => {
+		const { acc, emits } = withRecorder({ maxStreamBytes: 10_000_000, maxTotalBytes: 20_000_000 });
+		// Many non-idle flushes so several checkpoints fire.
+		const ticks = STREAM_CHECKPOINT_EVERY * 3 + 4;
+		for (let i = 0; i < ticks; i++) {
+			acc.push(stream('stdout', `l${i}\n`));
+			acc.flush();
+		}
+		acc.finish();
+		// The gap between consecutive full frames (index 0) never exceeds the interval.
+		const fullPositions = emits
+			.map((e, i) => ({ e, i }))
+			.filter(({ e }) => !e.delta)
+			.map(({ i }) => i);
+		expect(fullPositions[0]).toBe(0); // first emit is full
+		for (let k = 1; k < fullPositions.length; k++) {
+			expect(fullPositions[k] - fullPositions[k - 1]).toBeLessThanOrEqual(STREAM_CHECKPOINT_EVERY);
+		}
+		// More than one full frame means checkpoints actually fired.
+		expect(fullPositions.length).toBeGreaterThan(1);
+	});
+
+	it('a MID-STREAM JOINER resyncs at a checkpoint and reconstructs the exact final text', () => {
+		const { acc, emits } = withRecorder({ maxStreamBytes: 10_000_000, maxTotalBytes: 20_000_000 });
+		const ticks = STREAM_CHECKPOINT_EVERY * 2 + 7;
+		for (let i = 0; i < ticks; i++) {
+			acc.push(stream('stdout', `row ${i}\n`));
+			acc.flush();
+		}
+		const out = acc.finish();
+		const final = (out[0] as { text: string }).text;
+		// A tab that joined mid-stream missed the first frame and every delta before the
+		// second checkpoint (dropping un-appliable deltas). Replay only from that
+		// checkpoint onward: it establishes the element there, then splices the rest.
+		const fullIdxs = emits.map((e, i) => ({ e, i })).filter(({ e }) => !e.delta).map(({ i }) => i);
+		const joinAt = fullIdxs[fullIdxs.length - 1]; // the last checkpoint before finish
+		expect(joinAt).toBeGreaterThan(0); // it genuinely dropped earlier frames
+		expect(replay(emits.slice(joinAt), 0)).toBe(final);
+	});
+
+	it('per-run wire bytes are O(size) + bounded checkpoint overhead, not O(size × ticks)', () => {
 		const { acc, emits } = withRecorder({ maxStreamBytes: 10_000_000, maxTotalBytes: 20_000_000 });
 		// 200 chunks of 64 bytes, flushed each tick — the O(N²) scenario from the audit.
 		const chunk = 'x'.repeat(63) + '\n';
@@ -120,14 +161,17 @@ describe('OutputAccumulator — streamed deltas (wire optimization)', () => {
 			acc.flush();
 		}
 		acc.finish();
-		// Bytes actually put on the wire = first full element + every delta chunk.
+		// Bytes actually put on the wire = every full element (first + checkpoints) + every delta chunk.
 		const wire = emits.reduce(
 			(n, e) => n + (e.delta ? e.delta.chunk.length : (e.output as { text: string }).text.length),
 			0
 		);
-		// O(size): within a small constant of the real output. The pre-fix behavior
-		// re-emitted the whole growing buffer each tick — Σ ≈ size²/chunk ≈ 100× here.
-		expect(wire).toBeLessThan(total * 2);
+		// A small constant multiple of the real output. Deltas contribute O(size); the
+		// periodic checkpoints add only a 1/N slice of ticks re-sending the buffer, so
+		// the overhead is bounded (~4.5× here at N=25). The pre-fix behavior re-emitted
+		// the whole growing buffer EVERY tick — Σ ≈ size²/chunk ≈ 100× here — so this
+		// bound still proves the O(size × ticks) blowup is gone.
+		expect(wire).toBeLessThan(total * 8);
 		expect(wire).toBeGreaterThanOrEqual(total); // never drops bytes
 	});
 

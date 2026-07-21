@@ -40,6 +40,17 @@
  * O(size), not O(size × ticks). Rich outputs and the truncation marker are
  * one-shot and always emit the full element.
  *
+ * Every STREAM_CHECKPOINT_EVERY-th NON-idle emission is promoted back to a FULL
+ * element (a checkpoint) even though only the tail changed. That periodic full
+ * frame is the resync mechanism: a tab that missed the first frame or an earlier
+ * delta (an agent/background/cross-tab viewer, or a reconnect mid-stream) DROPS
+ * the un-appliable deltas and re-adopts the whole element at the next checkpoint,
+ * so a desync self-heals within N ticks with no client refetch — a mid-run
+ * `load()` returns EMPTY (the doc's outputs are only persisted at run end) and
+ * each per-tick delta would re-trigger it into a refetch storm. The amortized
+ * wire stays O(size): checkpoints add only a 1/N slice of ticks re-sending the
+ * buffer, not the pre-fix O(size × ticks).
+ *
  * The delta is a tail-splice, not a pure append, because the terminal reducer
  * (CR-overwrite collapse) can rewrite earlier bytes of the element: `keep` is the
  * offset up to which the prior text is unchanged and `chunk` is what follows, so
@@ -49,8 +60,8 @@
  * case); a terminal buffer diffs to the common prefix. `base` is the length the
  * client's element must currently have for the splice to be valid — a mismatch
  * (a delta dropped, or a reconnect refetch racing a live delta) means the client
- * is out of sync, so it discards the delta and self-heals via the seq-gap refetch
- * backstop rather than corrupting the text. `outputs` is the final
+ * is out of sync, so it discards the delta and self-heals at the next full-frame
+ * checkpoint rather than corrupting the text. `outputs` is the final
  * capped+coalesced array the caller persists (always the full reduced text; the
  * delta protocol is purely a wire optimization).
  *
@@ -62,6 +73,19 @@ import { isTerminalStyle, reduceCheap } from './terminal';
 
 /** Coalesce/broadcast tick: flush buffered stream text at most this often (ms). */
 export const OUTPUT_FLUSH_MS = 40;
+
+/**
+ * Every Nth NON-IDLE emission of a growing stream element is promoted from a
+ * `StreamDelta` to a FULL-element emission (a `run:output` at the stable index).
+ * That periodic checkpoint is the resync mechanism: it re-establishes the whole
+ * element for any tab that missed the first full frame or an earlier delta (an
+ * agent/background/cross-tab viewer, or a reconnect mid-stream), so an out-of-sync
+ * client can DROP un-appliable deltas and simply adopt the next checkpoint rather
+ * than refetching the notebook per tick. It bounds the un-synced window to at most
+ * N ticks while keeping amortized wire cost O(size) (each checkpoint adds only a
+ * 1/N overhead). At the ~40ms flush tick, N=25 is ~1s.
+ */
+export const STREAM_CHECKPOINT_EVERY = 25;
 
 /** Caps. Chosen so they bite only on runaway output; a normal run never trips them. */
 export interface OutputCaps {
@@ -101,8 +125,9 @@ function outputBytes(o: CellOutput): number {
 /**
  * A wire-delta for a growing stream element: reconstruct the element's text as
  * `prev.slice(0, keep) + chunk`. `base` = the length the client's current text
- * must have for the splice to apply (else it refetches). For a pure append
- * `keep === base`; a terminal CR-rewrite gives `keep < base`.
+ * must have for the splice to apply (else it drops the delta and resyncs at the
+ * next full-frame checkpoint). For a pure append `keep === base`; a terminal
+ * CR-rewrite gives `keep < base`.
  */
 export interface StreamDelta {
 	base: number;
@@ -126,8 +151,10 @@ export class OutputAccumulator {
 
 	// Buffered stream text for the current contiguous run. `emitted` is the reduced
 	// text last handed to `onEmit` for this element (null until its first emission),
-	// so a flush can diff against it and broadcast only the delta.
-	private pending: { name: string; text: string; index: number; emitted: string | null } | null = null;
+	// so a flush can diff against it and broadcast only the delta. `sinceFull` counts
+	// deltas emitted since the last FULL frame (the first emission or a checkpoint), so
+	// every STREAM_CHECKPOINT_EVERY-th non-idle emission re-emits the whole element.
+	private pending: { name: string; text: string; index: number; emitted: string | null; sinceFull: number } | null = null;
 
 	private streamBytes = 0; // committed + pending stream text
 	private totalBytes = 0; // all outputs
@@ -196,7 +223,7 @@ export class OutputAccumulator {
 			// `outputs` until flush(); no other element can take this slot while the
 			// run is open (a rich/other-stream output closes it first). `emitted` is
 			// null so the first flush emits the whole element (delta absent).
-			this.pending = { name, text, index: this.outputs.length, emitted: null };
+			this.pending = { name, text, index: this.outputs.length, emitted: null, sinceFull: 0 };
 		}
 	}
 
@@ -239,6 +266,11 @@ export class OutputAccumulator {
 	 * since the previous emission, so a slow streaming cell costs O(new bytes) on
 	 * the wire per tick instead of O(whole buffer). A tick with no new bytes since
 	 * the last emission broadcasts nothing.
+	 *
+	 * Every STREAM_CHECKPOINT_EVERY-th non-idle emission is promoted back to a FULL
+	 * frame (a checkpoint) so a tab that missed the first frame or a delta can resync
+	 * by adopting it — bounding the un-synced window to N ticks while keeping the
+	 * amortized wire cost O(size).
 	 */
 	flush(): void {
 		if (!this.pending) return;
@@ -252,16 +284,22 @@ export class OutputAccumulator {
 		const reduced = terminal ? reduceCheap(text) : text;
 		const prev = this.pending.emitted;
 		// Idle timer tick: nothing has changed since the last emission, so don't
-		// re-broadcast the element at all.
+		// re-broadcast the element at all (and don't advance the checkpoint counter).
 		if (prev !== null && reduced === prev) return;
 		const out: StreamOutput = { output_type: 'stream', name, text: reduced };
 		if (index < this.outputs.length) this.outputs[index] = out;
 		else this.outputs.push(out);
-		if (prev === null) {
-			// First materialization of this element — emit it whole so the client has
-			// something to splice later deltas onto (and so a fresh element carries its
-			// output_type/name). No delta.
+		// The first emission is always a full frame; thereafter every non-idle emission
+		// advances the counter and every STREAM_CHECKPOINT_EVERY-th one is re-emitted
+		// full (a resync checkpoint). Either full path sends the whole element and
+		// resets the counter; a delta increments it.
+		const checkpoint = prev !== null && this.pending.sinceFull + 1 >= STREAM_CHECKPOINT_EVERY;
+		if (prev === null || checkpoint) {
+			// Full frame: the client (re)establishes the element from `out.text` — the
+			// first materialization, or a periodic checkpoint that lets a desynced tab
+			// adopt the whole element and resume splicing.
 			this.onEmit(out, index);
+			this.pending.sinceFull = 0;
 		} else {
 			// A plain (non-terminal) stream reduces to identity and only ever grows by
 			// appending, so `prev` is a strict prefix of `reduced`: keep its whole
@@ -269,6 +307,7 @@ export class OutputAccumulator {
 			// rewrite its tail (CR collapse), so diff to the common prefix.
 			const keep = terminal ? commonPrefixLen(prev, reduced) : prev.length;
 			this.onEmit(out, index, { base: prev.length, keep, chunk: reduced.slice(keep) });
+			this.pending.sinceFull += 1;
 		}
 		this.pending.emitted = reduced;
 	}

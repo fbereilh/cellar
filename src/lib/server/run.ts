@@ -86,9 +86,9 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// small `run:output-append` DELTA (only the bytes that changed since the last
 	// flush) instead of its whole buffer, so a slow streaming cell no longer
 	// re-broadcasts O(size) to every tab each tick — see output-accumulator's header.
-	// The full-element `run:output` is kept for the element's first emission and for
-	// rich/marker outputs; a dropped delta self-heals via the client's seq-gap
-	// refetch (each frame carries a monotonic `seq`).
+	// The full-element `run:output` is kept for the element's first emission, for
+	// rich/marker outputs, and for the periodic checkpoint; a dropped delta is a
+	// no-op on the client and self-heals at the next full-frame checkpoint.
 	const emit = (output: CellOutput, index: number, delta?: StreamDelta) => {
 		if (delta) {
 			publish({ type: 'run:output-append', nb, cellId, index, base: delta.base, keep: delta.keep, chunk: delta.chunk, originId });
