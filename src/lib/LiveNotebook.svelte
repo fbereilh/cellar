@@ -132,7 +132,29 @@
 	// Re-derives automatically on add/remove/reorder/level-change.
 	let headerNumbering = $state<number[]>([]);
 	const numberingLevels = $derived(new Set(headerNumbering));
-	const headingNumbers = $derived(computeHeadingNumbers(outlineHeadings(cells), numberingLevels));
+	// `computeHeadingNumbers(outlineHeadings(cells), ...)` re-parses every markdown
+	// cell (fence-aware regex) and produces a FRESH object identity on ANY `cells`
+	// change - including a code-cell edit-flush or a streaming-output tick that never
+	// touched a heading. That identity fans out as a prop into every Cell, where it
+	// invalidates the markdown `segments` derived and re-runs markdown-it + DOMPurify
+	// on EVERY markdown cell (a re-sanitize storm). The result depends ONLY on the
+	// heading layout (`foldSig`) + the enabled levels (`numberingLevels` identity), so
+	// memoize on exactly those - identical to the `foldCache` memo below, and sound for
+	// the same reason: the value is byte-for-byte what the unmemoized derived returns,
+	// only its identity is stabilized so an unrelated `cells` change no longer
+	// re-renders every markdown cell.
+	const foldSig = $derived(foldSignature(cells));
+	let numbersCache: { sig: string; levels: Set<number>; value: Record<string, string> } | null =
+		null;
+	const headingNumbers = $derived.by(() => {
+		const sig = foldSig;
+		const levels = numberingLevels;
+		if (numbersCache && numbersCache.sig === sig && numbersCache.levels === levels)
+			return numbersCache.value;
+		const value = computeHeadingNumbers(outlineHeadings(cells), levels);
+		numbersCache = { sig, levels, value };
+		return value;
+	});
 	// Publish numbers + enabled levels up so the sidebar Outline shows the same
 	// numbers and its per-level toggle reflects the current setting.
 	$effect(() => {
@@ -217,8 +239,8 @@
 	// the structural signature + the folded-set identity. `foldedIds` is only ever
 	// REPLACED with a fresh Set (never mutated in place - see every write below), so
 	// identity comparison is a sound cache key. The value is byte-for-byte what an
-	// unmemoized `computeFolding(cells, foldedIds)` would return.
-	const foldSig = $derived(foldSignature(cells));
+	// unmemoized `computeFolding(cells, foldedIds)` would return. `foldSig` (the
+	// heading-layout signature) is declared up by `headingNumbers`, which shares it.
 	let foldCache: { sig: string; folded: Set<string>; value: Folding } | null = null;
 	const folding = $derived.by(() => {
 		const sig = foldSig;
