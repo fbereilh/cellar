@@ -2054,7 +2054,7 @@ function requireConnectedSel(nb: string): Selection {
 // doctrine exists to prevent).
 
 /** Cluster states in which a Databricks Connect session cannot be built. */
-const DOWN_CLUSTER_STATES = new Set(['TERMINATED', 'TERMINATING', 'ERROR', 'UNKNOWN']);
+const DOWN_CLUSTER_STATES = new Set(['TERMINATED', 'TERMINATING', 'ERROR']);
 
 /**
  * The cluster's lifecycle state (`RUNNING`, `TERMINATED`, `PENDING`, …), or null
