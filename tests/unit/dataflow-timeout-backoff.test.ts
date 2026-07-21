@@ -12,7 +12,9 @@
  *   - a CHANGED batch (a real edit) DOES re-probe (backoff resets on content change),
  *   - the window eventually elapses and re-probes (backoff is not permanent),
  *   - a timed-out notebook is reported conservative-STALE, never a false `fresh`,
- *   - a non-timeout failure (missing interpreter) is NOT backed off - it stays retryable.
+ *   - a non-timeout failure (missing interpreter) is NOT backed off - it stays retryable,
+ *   - a non-timeout failure degrades to empty dataflow (a ran cell reads `fresh`), so the
+ *     conservative-STALE path is scoped to genuine timeouts only.
  *
  * The Python subprocess is MOCKED so the timeout path is forced deterministically
  * (no real interpreter, no 10s waits): a fake child that never answers is SIGKILLed
@@ -179,5 +181,21 @@ describe('dataflow probe timeout backoff', () => {
 		// A cheap, fast failure must retry every pass (the venv may come up); it is the
 		// slow, CPU-burning TIMEOUT - not any failure - that the backoff exists to tame.
 		expect(h.count).toBe(3);
+	});
+
+	it('does NOT mark a ran cell stale on a non-timeout failure (empty dataflow reads fresh)', async () => {
+		// A missing interpreter is NOT a timeout, so it degrades to empty dataflow exactly
+		// as before the backoff existed: a ran-this-session cell with no dependencies stays
+		// `fresh`, never the conservative-stale the timeout path invents. This is what scopes
+		// the "unavailable ⇒ stale" broadening to genuine timeouts only.
+		h.behavior = 'error';
+		const sid = 9;
+		h.sid = sid;
+		h.cells = [ranCell('a', 'x = 1', sid)];
+
+		const { cells: stale } = await getNotebookStaleness('/nb.ipynb');
+
+		expect(stale['a'].state).toBe('fresh');
+		expect(stale['a'].state).not.toBe('stale');
 	});
 });

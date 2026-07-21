@@ -59,12 +59,15 @@
  * `backoff` store keyed by the batch's source signature and is NOT re-probed until an
  * exponential window elapses (capped) OR the batch actually changes (a real edit adds
  * / removes / rewrites a source ⇒ new signature ⇒ immediate re-probe). While backed
- * off, the batch's cells are reported UNAVAILABLE, which `staleness.js` renders as a
- * conservative `stale` - never a false `fresh` (the invariant this whole file guards).
- * A missing interpreter is a DIFFERENT failure: it returns immediately (no CPU burn)
- * and may resolve once the venv is set up, so it is deliberately NOT backed off.
- * A single in-flight probe per batch signature is enforced too, so concurrent UI+MCP
- * staleness passes fold into one subprocess.
+ * off (and only then), the batch's cells are reported UNAVAILABLE, which `staleness.js`
+ * renders as a conservative `stale` - never a false `fresh` (the invariant this whole
+ * file guards). ONLY a timed-out / backed-off batch is UNAVAILABLE: a NON-timeout
+ * failure (missing interpreter, spawn error, probe crash/parse failure) is a DIFFERENT
+ * case - it returns immediately (no CPU burn), may resolve once the venv is set up, so
+ * it is deliberately NOT backed off AND NOT reported unavailable; those cells degrade to
+ * empty dataflow (read as `fresh`) exactly as before this backoff existed, so nothing is
+ * broadened. A single in-flight probe per batch signature is enforced too, so concurrent
+ * UI+MCP staleness passes fold into one subprocess.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -444,8 +447,16 @@ interface BackoffEntry {
  */
 const backoff = new LruCache<string, BackoffEntry>(256);
 
+/**
+ * A `probeBatch` outcome. `unavailable` is TRUE only when the batch was backed off or
+ * its fresh probe TIMED OUT - the conservative-stale cases. A non-timeout failure
+ * (missing interpreter, spawn error, probe crash/parse failure) leaves it FALSE, so
+ * those cells degrade to empty dataflow (read as `fresh`) exactly as before.
+ */
+type BatchRun = ProbeRun & { unavailable: boolean };
+
 /** In-flight probes keyed by batch signature, so concurrent identical passes fold into one. */
-const inflight = new Map<string, Promise<ProbeRun>>();
+const inflight = new Map<string, Promise<BatchRun>>();
 
 /**
  * A stable, order-independent signature for the SET of source keys in a batch. Keyed
@@ -475,30 +486,35 @@ function backoffDelay(attempts: number): number {
  * Run the probe over `items`, but converge instead of storming when a batch keeps
  * timing out. On a timeout the batch's signature is recorded with an exponential
  * window and is NOT re-probed until the window elapses or the batch changes; while
- * backed off it returns `{ ok: false }` WITHOUT spawning (so a persistently-slow
- * notebook stops pinning a core). A success clears the backoff; a non-timeout failure
- * (missing interpreter) does not back off - it is cheap and may resolve. A single probe
- * per signature is in flight at once, so concurrent UI+MCP staleness passes share it.
+ * backed off it returns `{ ok: false, unavailable: true }` WITHOUT spawning (so a
+ * persistently-slow notebook stops pinning a core). A success clears the backoff; a
+ * non-timeout failure (missing interpreter) does not back off and is NOT `unavailable`
+ * - it is cheap, may resolve, and keeps the prior degrade-to-empty behavior. A single
+ * probe per signature is in flight at once, so concurrent UI+MCP passes share it.
  */
-async function probeBatch(items: ProbeItem[]): Promise<ProbeRun> {
+async function probeBatch(items: ProbeItem[]): Promise<BatchRun> {
 	const sig = batchSignature(items.map((i) => i.key));
 	const bo = backoff.get(sig);
-	if (bo && Date.now() < bo.until) return { ok: false, cells: {} }; // backed off: do NOT spawn
+	// Backed off: do NOT spawn. Conservative-stale, so unavailable:true.
+	if (bo && Date.now() < bo.until) return { ok: false, cells: {}, unavailable: true };
 
 	const pending = inflight.get(sig);
 	if (pending) return pending; // single-flight: fold a concurrent identical probe
 
-	const run = (async (): Promise<ProbeRun> => {
+	const run = (async (): Promise<BatchRun> => {
 		const raw = await runProbe(items);
 		if (raw.ok) {
 			backoff.delete(sig); // answered ⇒ clear any prior backoff for this batch
-			return { ok: true, cells: raw.cells };
+			return { ok: true, cells: raw.cells, unavailable: false };
 		}
 		if (raw.timedOut) {
 			const attempts = (bo?.attempts ?? 0) + 1;
 			backoff.set(sig, { until: Date.now() + backoffDelay(attempts), attempts });
+			return { ok: false, cells: {}, unavailable: true }; // timeout ⇒ conservative-stale
 		}
-		return { ok: false, cells: {} };
+		// Non-timeout failure (missing interpreter, spawn/crash/parse): degrade to empty
+		// dataflow (reads as fresh), NOT conservative-stale - the long-standing behavior.
+		return { ok: false, cells: {}, unavailable: false };
 	})();
 
 	inflight.set(sig, run);
@@ -583,13 +599,14 @@ function runProbe(items: ProbeItem[]): Promise<RawProbe> {
 /** A dataflow map plus the code-cell ids whose analysis was unavailable this pass. */
 interface DataflowResult {
 	dataflow: DataflowMap;
-	/** Code-cell ids the probe could not answer (timed out / backed off / no interpreter). */
+	/** Code-cell ids the probe could not answer because it TIMED OUT or is backed off. */
 	unavailable: Set<string>;
 }
 
 /**
  * Analyze a notebook's code cells, returning both the dataflow map AND the code-cell
- * ids whose analysis was unavailable this pass (the probe failed or is backed off).
+ * ids whose analysis was unavailable this pass (the probe TIMED OUT or is backed off -
+ * NOT a non-timeout failure, which degrades to empty dataflow like it always did).
  * `analyzeDataflow` exposes just the map; `getNotebookStaleness` uses `unavailable` to
  * mark those cells conservative-stale rather than let empty dataflow read as `fresh`.
  */
@@ -623,9 +640,12 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 			for (const [src, m] of byKey) {
 				cache.set(src, run.cells[m.key] ?? { defines: [], uses: [] }); // LRU evicts the coldest source past the cap
 			}
-		} else {
-			// The probe failed or is backed off: mark these sources unresolved so their cells
-			// are reported UNAVAILABLE below (conservative-stale), never cached as empty.
+		} else if (run.unavailable) {
+			// ONLY a timed-out / backed-off batch is unavailable: mark these sources
+			// unresolved so their cells are reported UNAVAILABLE below (conservative-stale),
+			// never cached as empty. A non-timeout failure (missing interpreter, spawn/crash)
+			// falls through - it caches nothing but adds NO unavailable entry, so those cells
+			// degrade to empty dataflow and read as `fresh`, exactly as before this backoff.
 			for (const src of byKey.keys()) unresolved.add(src);
 		}
 	}
