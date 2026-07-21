@@ -61,6 +61,21 @@ const cellarEditorTheme = EditorView.theme({
 	'.cm-activeLineGutter': { backgroundColor: c('active-line-gutter') },
 	'.cm-lineNumbers .cm-gutterElement': { color: c('line-number-fg') },
 	'.cm-foldPlaceholder': { backgroundColor: 'transparent', border: 'none', color: c('fold-placeholder') },
+	// Pin the fold gutter to a fixed width and centre its ⌄/› marker. CodeMirror
+	// sizes this gutter from its widest child, so its natural width is
+	// font-metric-dependent; the static pre-editor render (`StaticCode.svelte`)
+	// cannot reproduce that unknown width and so reserved NO fold-gutter column,
+	// which made the code jump right by the gutter's width the instant the real
+	// editor mounted on first click. Fixing the width here and mirroring it with
+	// the same `--cellar-cm-fold-width` var in the static render makes the two
+	// geometries identical, so first-click adds zero horizontal reflow.
+	'.cm-foldGutter .cm-gutterElement': {
+		boxSizing: 'border-box',
+		width: 'var(--cellar-cm-fold-width)',
+		padding: '0',
+		textAlign: 'center'
+	},
+	'.cm-foldGutter .cm-gutterElement span': { padding: '0' },
 
 	// Also matched focused, because `@codemirror/language`'s own bracket rules
 	// are `&.cm-focused`-scoped and would otherwise out-specify these.

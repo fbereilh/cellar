@@ -150,6 +150,55 @@ test('cells render their source with zero editors until first interaction', asyn
 	await expect(editorCount(page)).resolves.toBe(2);
 });
 
+/**
+ * The x-position of a cell's first code character must be IDENTICAL before and
+ * after its editor is summoned. Regression guard for the fold-gutter reflow: the
+ * static render reserves the fold gutter's column (`.cm-static-foldgutter`, width
+ * `--cellar-cm-fold-width`) that `basicSetup`'s `foldGutter` mounts on first
+ * click, so the code never jumps right by that gutter's width. `basicSetup`
+ * reserves the fold column even for cells with no foldable region, so these
+ * single-line cells still exercise the reflow the fix removes.
+ */
+async function firstCharLeft(page: Page, cellIndex: number, selector: string): Promise<number> {
+	const line = page.getByTestId('cell').nth(cellIndex).locator(selector).first();
+	await expect(line).toBeVisible();
+	return line.evaluate((el) => {
+		// A Range around the first character measures the glyph's left edge, which
+		// is exactly what a user perceives as the code's x-position.
+		const node = el.firstChild ?? el;
+		const range = document.createRange();
+		range.setStart(node, 0);
+		range.setEnd(node, node.textContent && node.textContent.length ? 1 : 0);
+		return range.getBoundingClientRect().left;
+	});
+}
+
+test('summoning a cell editor does not shift the code horizontally (fold-gutter reserved)', async ({ page }) => {
+	await ensureNotebookOpen(page);
+	const cells = page.getByTestId('cell');
+	await expect(cells).toHaveCount(6);
+
+	// Cell 5 ('E = 666') is never mutated by the other specs — use it so this test
+	// is order-independent. It shows its static render with no editor built.
+	const c5 = cells.nth(5);
+	await expect(c5.getByTestId('static-code')).toBeVisible();
+
+	// BEFORE: the static render's first character.
+	const before = await firstCharLeft(page, 5, '.cm-static-line');
+
+	// Summon the editor (first-click) — this is where the fold gutter would appear.
+	await c5.getByTestId('editor-scroll').click();
+	await expect(c5.locator('.cm-editor')).toBeVisible();
+	await expect(c5.getByTestId('static-code')).toHaveCount(0);
+
+	// AFTER: the live editor's first character. Must land on the same pixel.
+	const after = await firstCharLeft(page, 5, '.cm-line');
+
+	// Without the reserved fold column the shift is the whole gutter width (~10px);
+	// the reserved column pins it to zero. Sub-pixel tolerance for rounding only.
+	expect(Math.abs(after - before)).toBeLessThan(0.5);
+});
+
 test('an agent edit to an UNfocused cell updates its static render (doc is source of truth)', async ({ page }) => {
 	await ensureNotebookOpen(page);
 	const cells = page.getByTestId('cell');
