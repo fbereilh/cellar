@@ -35,6 +35,8 @@
 		/** Whether "follow the running cell" is on (a global viewer preference). */
 		followRunningCell?: boolean;
 		onSelectTab: (id: string) => void;
+		/** Click the tab's run/queue indicator: jump to that notebook's running cell. */
+		onJumpToRunningCell?: (id: string) => void;
 		onCloseTab: (id: string) => void;
 		onPromoteTab?: (id: string) => void;
 		onToggleSidebar: () => void;
@@ -73,6 +75,7 @@
 		hideAllCode = false, // the active notebook's report-view state
 		followRunningCell = true, // global viewer preference (default on)
 		onSelectTab,
+		onJumpToRunningCell,
 		onCloseTab,
 		onPromoteTab,
 		onToggleSidebar,
@@ -302,27 +305,39 @@
 				data-run-state={runState || undefined}
 				ondblclick={() => tab.preview && onPromoteTab?.(tab.id)}
 			>
-				<button class="flex min-w-0 items-center gap-1.5 py-2" onclick={() => onSelectTab(tab.id)}>
-					<!-- While this notebook is executing/queueing a cell, the icon slot shows a
-					     run indicator instead of the file icon (background runs included), so a
-					     glance at the tab strip tells you which notebooks are busy. -->
-					<span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+				<!-- While this notebook is executing/queueing a cell, the icon slot shows a
+				     run indicator instead of the file icon (background runs included), so a
+				     glance at the tab strip tells you which notebooks are busy. When shown,
+				     it's a distinct button: clicking it jumps to that notebook's running
+				     cell (activating the tab first if it isn't the viewed one), while a
+				     click anywhere else on the tab still just selects it. The click is
+				     stopped from bubbling so a spinner-click is never an ambiguous tab
+				     select. -->
+				{#if runState}
+					<button
+						type="button"
+						class="flex h-3.5 w-3.5 shrink-0 cursor-pointer items-center justify-center rounded hover:bg-base-300/70"
+						title="Jump to running cell"
+						aria-label="Jump to running cell"
+						data-testid="tab-jump-running"
+						onclick={(e) => {
+							e.stopPropagation();
+							onJumpToRunningCell?.(tab.id);
+						}}
+					>
 						{#if runState === 'running'}
-							<span
-								class="loading loading-spinner h-3.5 w-3.5 text-warning"
-								title="Running a cell"
-								data-testid="tab-running"
-							></span>
-						{:else if runState === 'queued'}
-							<span
-								class="h-1.5 w-1.5 animate-pulse rounded-full bg-warning/70"
-								title="Cell queued"
-								data-testid="tab-queued"
-							></span>
+							<span class="loading loading-spinner h-3.5 w-3.5 text-warning" data-testid="tab-running"></span>
 						{:else}
-							{@html iconSvg(tab.title, { dir: false })}
+							<span class="h-1.5 w-1.5 animate-pulse rounded-full bg-warning/70" data-testid="tab-queued"></span>
 						{/if}
-					</span>
+					</button>
+				{/if}
+				<button class="flex min-w-0 items-center gap-1.5 py-2" onclick={() => onSelectTab(tab.id)}>
+					{#if !runState}
+						<span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+							{@html iconSvg(tab.title, { dir: false })}
+						</span>
+					{/if}
 					<span class="truncate {tab.preview ? 'italic' : ''}">{tab.title}</span>
 				</button>
 				{#if tab.dirty}

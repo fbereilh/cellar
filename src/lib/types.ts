@@ -69,6 +69,13 @@ export interface NotebookApiHandle {
 	/** Toggle the notebook-wide "hide all code inputs" (report view) default. */
 	toggleHideAllCode: () => void;
 	/**
+	 * Scroll/reveal this notebook's currently running (or, failing that, first
+	 * queued) cell into view. An EXPLICIT user action (clicking the tab's run
+	 * spinner), so it bypasses the `follow` preference and the typing guard the
+	 * automatic follow-effect honors. No-op when nothing is running or queued.
+	 */
+	revealRunning: () => void;
+	/**
 	 * Flush every cell's pending (not-yet-autosaved) edit and let the normal
 	 * PATCH persistence write the notebook now. Resolves once the flushed edits
 	 * are persisted — the Cmd/Ctrl+S save path.

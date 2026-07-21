@@ -418,6 +418,19 @@
 		activeTabId = id;
 	}
 
+	// Click on a tab's run/queue indicator: activate that notebook (if it isn't the
+	// viewed one) and scroll its running (or queued) cell into view. Reuses the
+	// notebook's own reveal/scroll mechanism via its imperative API, so folds are
+	// opened and the follow-cell viewport conventions are honored - an explicit
+	// jump, so it ignores the `follow` preference the automatic effect obeys.
+	async function jumpToRunningCell(tabId: string) {
+		const tab = tabs.find((t) => t.id === tabId);
+		if (!tab) return;
+		if (activeTabId !== tabId) activeTabId = tabId;
+		await tick(); // a background notebook's pane has no geometry until it's active
+		notebookApis.get(tab.path)?.revealRunning();
+	}
+
 	// Single-click a tree file → open in the single shared preview slot. If a tab
 	// for it already exists (preview or pinned) just focus it; otherwise reuse the
 	// existing preview tab's slot, or append one. A `.py` is content-probed first
@@ -1154,6 +1167,7 @@
 		hideAllCode={activeHideAllCode}
 		followRunningCell={followRunningCell}
 		onSelectTab={selectTab}
+		onJumpToRunningCell={jumpToRunningCell}
 		onCloseTab={closeTab}
 		onPromoteTab={promoteTab}
 		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}

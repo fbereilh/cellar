@@ -248,7 +248,7 @@
 	// action the modal keyboard runs for a registry shortcut id, so the palette and
 	// the keyboard share one handler and cannot diverge.
 	$effect(() => {
-		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, toggleHideAllCode, save });
+		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, toggleHideAllCode, save, revealRunning });
 		return () => onRegisterApi?.(path, null);
 	});
 	$effect(() => {
@@ -546,6 +546,19 @@
 		}
 		foldedIds = next;
 		saveFolds();
+	}
+
+	// Explicit "jump to running cell": reveal + center this notebook's running
+	// (or, failing that, first queued) cell, regardless of the `follow` preference,
+	// the typing guard, or the imports-cell skip that the automatic follow-effect
+	// honors - the user clicked the tab spinner and asked to be taken there.
+	async function revealRunning() {
+		const id = runningId ?? Object.keys(queued)[0] ?? null;
+		if (!id) return;
+		revealCell(id);
+		await tick(); // a just-revealed (unfolded) cell needs its DOM node
+		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null;
+		if (el) scrollElementIntoView(el);
 	}
 
 	async function followCell(id: string) {
