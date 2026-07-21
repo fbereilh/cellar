@@ -79,7 +79,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { execute, currentSessionId, kernelStatus, restartKernel } from './kernel';
+import { execute, currentSessionId, kernelStatus, restartKernel, refreshKernelConnection } from './kernel';
 import {
 	dbrMajorMinor,
 	parseVersionMismatch,
@@ -471,9 +471,13 @@ def cluster(w, cluster_id):
     # cluster's Databricks Runtime (spark_version), so it can pin
     # databricks-connect to a matching client. Fetched authoritatively from the
     # workspace (not trusted from the picker), so a stale/renamed cluster still
-    # reports its real runtime.
+    # reports its real runtime. The state field rides along so the connect and
+    # reconnect gates can refuse a TERMINATED cluster with a clean
+    # cluster_terminated instead of a raw Spark Connect error (agents cannot
+    # start compute).
     c = w.clusters.get(cluster_id=cluster_id)
-    return {'ok': True, 'spark_version': getattr(c, 'spark_version', None)}
+    return {'ok': True, 'spark_version': getattr(c, 'spark_version', None),
+            'state': enum_value(getattr(c, 'state', None)) or 'UNKNOWN'}
 
 def catalogs(w):
     rows = [{'name': c.name, 'comment': getattr(c, 'comment', None)}
@@ -600,6 +604,8 @@ export function statusFor(code: string): number {
 		case 'not_connected':
 		case 'busy':
 		case 'version_mismatch':
+		case 'cluster_terminated':
+		case 'reconnect_failed':
 			return 409;
 		case 'sdk_missing':
 		case 'connect_missing':
@@ -2033,6 +2039,266 @@ function requireConnectedSel(nb: string): Selection {
 		);
 	}
 	return s.connectedSel;
+}
+
+// --- agent-driven reconnect / connect (MCP) --------------------------------
+//
+// The agent surface for the connection lifecycle. It adds NO new
+// session-establishment or reconnect mechanism: every path funnels through the
+// SAME `refreshKernelConnection` (rung 1, kernel.ts) + `reconnectTo` → `connect()`
+// (rungs 2/3) the automatic recovery already uses, so the agent tool and the
+// watchdog/expiry self-heal can never drift. What is new here is only the
+// ORCHESTRATION (walk the ladder in order) plus HONEST SIDE-EFFECT reporting: the
+// agent must never think a reconnect was free when a version re-pin restarted the
+// kernel and cleared its namespace (the same NameError trap the run-status
+// doctrine exists to prevent).
+
+/** Cluster states in which a Databricks Connect session cannot be built. */
+const DOWN_CLUSTER_STATES = new Set(['TERMINATED', 'TERMINATING', 'ERROR']);
+
+/**
+ * The cluster's lifecycle state (`RUNNING`, `TERMINATED`, `PENDING`, …), or null
+ * if it cannot be resolved. Reads authoritatively from the workspace via the same
+ * `cluster` PROBE op the version pin uses; never throws (a null just means "could
+ * not tell", so the caller degrades to the raw connect error rather than a
+ * confident-but-wrong verdict).
+ */
+async function clusterState(sel: Selection, clusterId: string): Promise<string | null> {
+	try {
+		const result = await probe({ op: 'cluster', auth: resolveAuth(sel), cluster_id: clusterId });
+		if (!result.ok) return null;
+		return payload<{ state?: string | null }>(result).state ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Turn a failed reconnect/connect into the most actionable error. If the target
+ * cluster is provably down (TERMINATED / TERMINATING / ERROR), that is the real
+ * cause and it is HUMAN-ONLY to fix — agents cannot start compute (D2) — so raise
+ * a dedicated `cluster_terminated`. Otherwise the cause is unknown, so raise
+ * `reconnect_failed` pointing at the sidebar. Always throws.
+ */
+async function throwReconnectFailure(target: ReconnectTarget, prefix: string): Promise<never> {
+	const state = await clusterState(target.sel, target.clusterId);
+	if (state && DOWN_CLUSTER_STATES.has(state.toUpperCase())) {
+		throw new DatabricksError(
+			'cluster_terminated',
+			`${prefix} The cluster "${target.clusterName}" is ${state}. Agents cannot start compute — ask the user to start the cluster from the Databricks sidebar (or workspace), then reconnect.`
+		);
+	}
+	throw new DatabricksError(
+		'reconnect_failed',
+		`${prefix} Ask the user to reconnect from the Databricks sidebar section.`
+	);
+}
+
+/** The agent-facing payload a successful reconnect returns, with honest namespace-loss flags. */
+function reconnectedPayload(
+	abs: string,
+	{ socketRefreshed, kernelRestarted }: { socketRefreshed: boolean; kernelRestarted: boolean }
+) {
+	const status = connectionStatus(abs);
+	if (!status.connected) {
+		// Shouldn't happen (we only call this after a confirmed reconnect), but never
+		// claim a live session we cannot see.
+		throw new DatabricksError(
+			'reconnect_failed',
+			'Reconnected, but the session did not come up live. Ask the user to reconnect from the Databricks sidebar section.'
+		);
+	}
+	publishGlobal({ type: 'databricks:changed' });
+	const note = kernelRestarted
+		? '`spark` and `w` are live again against the cluster above — BUT reconnecting had to restart your kernel (a databricks-connect re-pin), so EVERY Python variable you had defined is gone (ran_this_session is now false for every cell). Re-run the cells you need before continuing.'
+		: '`spark` and `w` are live again against the cluster above; your kernel namespace was preserved. Re-run any cell that failed with SESSION_CLOSED — use spark/w directly, do not re-create a DatabricksSession.';
+	return {
+		...connectedPayload(status),
+		reconnected: true,
+		socket_refreshed: socketRefreshed,
+		kernel_restarted: kernelRestarted,
+		namespace_cleared: kernelRestarted,
+		note
+	};
+}
+
+/**
+ * Re-establish a notebook's Databricks Connect session against the cluster the
+ * USER already chose, after it went dead — the agent-facing counterpart to the
+ * automatic recovery. Walks the ONE recovery ladder in order:
+ *
+ *   Rung 1 (transport): `refreshKernelConnection` rebuilds a dropped kernel
+ *     WebSocket in place — no kernel restart, `spark`/`w` intact.
+ *   Rung 2 (session): a server-side expiry (SESSION_CLOSED / closed client) heals
+ *     via `agentStatus`'s `autoReconnect` → `connect()`. Namespace preserved unless
+ *     a version re-pin restarts the kernel.
+ *   Rung 3 (process): a kernel restart bumped the epoch, so `spark`/`w` are gone;
+ *     `reconnectAfterKernelRestart` re-establishes the SAME cluster via `connect()`.
+ *     The namespace was already cleared by the restart.
+ *
+ * The agent may only RESTORE what a human established (the stored `reconnectTarget`),
+ * never choose a new cluster here (that is `connectCluster`) and never start compute.
+ * Returns the `connectedPayload` plus `reconnected` / `socket_refreshed` /
+ * `kernel_restarted` / `namespace_cleared` so the agent never assumes a reconnect
+ * was free. Throws a `DatabricksError` (`not_connected`, `kernel_unavailable`,
+ * `cluster_terminated`, `reconnect_failed`, `busy`) the `databricksTool` wrapper
+ * turns into a structured `{error, message}`.
+ */
+export async function reconnectSession(nb?: string | null) {
+	const abs = resolveNotebookPath(nb);
+	const s = stateFor(abs);
+	const target = s.reconnectTarget;
+	// The session was never established by a human: the agent cannot choose one here.
+	if (!target) {
+		throw new DatabricksError(
+			'not_connected',
+			'This notebook has no Databricks session to restore. Ask the user to connect from the Databricks sidebar section (agents cannot choose a cluster or start compute on their own; connect a cluster with databricks_connect only once one has been chosen).'
+		);
+	}
+
+	// Rung 1: repair a dropped kernel socket in place (namespace-preserving; never
+	// restarts the kernel). If the process itself was proven dead this tore it down —
+	// there is no live kernel to re-establish a session in, and we never boot one just
+	// to reconnect, so surface that honestly.
+	const refresh = await refreshKernelConnection(abs);
+	if (refresh.reason === 'kernel_gone') {
+		throw new DatabricksError(
+			'kernel_unavailable',
+			'The kernel process was lost, so its Databricks session cannot be restored yet. Run any cell to start a fresh kernel — Cellar re-establishes the session automatically — or ask the user to reconnect from the sidebar.'
+		);
+	}
+	const socketRefreshed = refresh.refreshed && refresh.reason === 'reconnected';
+
+	// Reconcile the connection against the current kernel epoch (a restart nulls it).
+	const status = connectionStatus(abs);
+
+	if (status.connected) {
+		// Epoch current, `spark` bound. Verify real liveness and heal a server-side
+		// expiry in place (rung 2). `agentStatus(heal:true)` is the one place that does
+		// this — probe (cached, skipped while busy) + `autoReconnect` on SESSION_CLOSED —
+		// so reuse it rather than a second probe path. A version re-pin inside the heal
+		// could restart the kernel; detect it by the epoch moving across the call.
+		const epochBefore = currentSessionId(abs);
+		const a = (await agentStatus(abs)) as Record<string, unknown>;
+		if (a.connected === true) {
+			const epochAfter = currentSessionId(abs);
+			const kernelRestarted = epochBefore != null && epochAfter !== epochBefore;
+			return reconnectedPayload(abs, { socketRefreshed, kernelRestarted });
+		}
+		// Bound but the session is dead and could not be healed in place.
+		return throwReconnectFailure(target, 'The Databricks session expired and Cellar could not reconnect it.');
+	}
+
+	// Not connected at the current epoch → the kernel was restarted (rung 3).
+	// Re-establish the SAME cluster via the existing post-restart path (reuses
+	// `connect()`). The namespace was already cleared by that restart.
+	const r = await reconnectAfterKernelRestart(abs);
+	if (r.reconnected) {
+		return reconnectedPayload(abs, { socketRefreshed, kernelRestarted: true });
+	}
+	if (r.reason === 'no_kernel') {
+		throw new DatabricksError(
+			'kernel_unavailable',
+			'The kernel is not running, so its Databricks session cannot be restored yet. Run any cell to start a fresh kernel — Cellar re-establishes the session automatically — or ask the user to reconnect from the sidebar.'
+		);
+	}
+	if (r.reason === 'busy') {
+		throw new DatabricksError('busy', 'A Databricks connect is already in progress for this notebook; try again shortly.');
+	}
+	return throwReconnectFailure(target, `Could not reconnect to cluster "${target.clusterName}".`);
+}
+
+/**
+ * Connect a notebook to a cluster the AGENT chose (D1). Reuses `connect()` wholesale
+ * — same auth (`resolveAuth`/`assertSignedIn`), same version-pin machinery, same
+ * `reconnectTarget` bookkeeping — so there is no second connect path. Two gates on
+ * top:
+ *   - AUTH: an OAuth host that has not signed in throws `oauth_login_required`
+ *     (the browser sign-in is human-only); a PAT profile proceeds. `assertSignedIn`
+ *     inside `connect()` enforces this; checked up front so the cluster-state probe
+ *     is not paid for an unusable auth.
+ *   - COMPUTE (D2): a TERMINATED/ERROR cluster is refused with `cluster_terminated`
+ *     — agents cannot start compute — instead of failing with a raw Spark error.
+ *
+ * Reports the side effects the agent must understand: a version re-pin can restart
+ * the kernel and clear the namespace (`kernel_restarted` / `namespace_cleared`).
+ */
+export async function connectCluster({
+	clusterId,
+	clusterName,
+	profile,
+	host,
+	nb
+}: {
+	clusterId: string;
+	clusterName?: string | null;
+	profile?: string | null;
+	host?: string | null;
+	nb?: string | null;
+}) {
+	assertMatches(clusterId, CLUSTER_RE, 'cluster id');
+	const abs = resolveNotebookPath(nb);
+	const sel: Selection = profile ? { profile } : { host };
+	// Gate 1 (auth): refuse an un-signed-in OAuth host before doing any work.
+	assertSignedIn(resolveAuth(sel));
+	// Gate 2 (compute is human-only): refuse a down cluster with a clean, actionable
+	// error rather than starting it (agents cannot) or failing with a raw Spark error.
+	const state = await clusterState(sel, clusterId);
+	if (state && DOWN_CLUSTER_STATES.has(state.toUpperCase())) {
+		throw new DatabricksError(
+			'cluster_terminated',
+			`Cluster "${clusterName || clusterId}" is ${state}. Agents cannot start compute — ask the user to start it from the Databricks sidebar (or workspace), then connect.`
+		);
+	}
+	const epochBefore = currentSessionId(abs);
+	// Reuse the entire connect path: auth, version pin (may reinstall + restart the
+	// kernel), CONNECT_CODE, `reconnectTarget`, and the `databricks:changed` publish.
+	await connect({ profile, host, clusterId, clusterName, nb: abs });
+	const epochAfter = currentSessionId(abs);
+	// A restart only clears a namespace that EXISTED — a fresh connect that merely
+	// booted the kernel (no prior epoch) cleared nothing, so guard on epochBefore.
+	const kernelRestarted = epochBefore != null && epochAfter !== epochBefore;
+	const status = connectionStatus(abs);
+	if (!status.connected) {
+		throw new DatabricksError('error', 'Connected, but the session did not come up live. Ask the user to check the Databricks sidebar.');
+	}
+	return {
+		...connectedPayload(status),
+		kernel_restarted: kernelRestarted,
+		namespace_cleared: kernelRestarted,
+		note: kernelRestarted
+			? 'Connected to the cluster above — BUT connecting had to reinstall databricks-connect to match the cluster runtime, which RESTARTED your kernel: every Python variable you had is gone (ran_this_session is now false for every cell). Re-run the cells you need. `spark` and `w` are live; use them directly.'
+			: 'Connected to the cluster above. `spark` and `w` are live in the kernel namespace; use them directly — do not re-create a DatabricksSession.'
+	};
+}
+
+/**
+ * List the workspace's attachable clusters for the agent (read-only discovery, so
+ * it can pick one for `databricks_connect` or report state to the user). Auth is an
+ * explicit `profile`/`host`, or — when neither is given — the notebook's own live
+ * connection. Gated on a signed-in host (`listClusters` → `authForListing`), so an
+ * un-signed-in OAuth selection returns `oauth_login_required`. Never starts compute.
+ */
+export async function listClustersForAgent(
+	nb?: string | null,
+	sel?: { profile?: string | null; host?: string | null }
+): Promise<ClusterRow[]> {
+	const abs = resolveNotebookPath(nb);
+	let selection: Selection;
+	if (sel && (sel.profile || sel.host)) {
+		selection = sel.profile ? { profile: sel.profile } : { host: sel.host };
+	} else {
+		const s = stateFor(abs);
+		if (connectionStatus(abs).connected && s.connectedSel) {
+			selection = s.connectedSel;
+		} else {
+			throw new DatabricksError(
+				'not_connected',
+				'Provide a `profile` (a ~/.databrickscfg profile name) to list clusters, or ask the user to connect a notebook first. Agents cannot list clusters without an auth selection.'
+			);
+		}
+	}
+	return listClusters(selection);
 }
 
 /**
