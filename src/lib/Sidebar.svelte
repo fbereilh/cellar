@@ -986,7 +986,7 @@
 	     spawns a python subprocess, which a user who never opens this should not pay. -->
 	{#if databricksMounted}
 		<div class:hidden={!open.databricks}>
-			<Databricks notebookPath={activeNotebookPath} kernelSessionId={kernelInfo?.session_id ?? null} {onInsertAndRun} onSessionChange={onDatabricksSessionChange} />
+			<Databricks notebookPath={activeNotebookPath} kernelSessionId={kernelInfo?.session_id ?? null} {onInsertAndRun} onSessionChange={onDatabricksSessionChange} {onRestartKernel} />
 		</div>
 	{/if}
 {/snippet}

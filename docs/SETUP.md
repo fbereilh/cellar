@@ -127,6 +127,15 @@ re-pins a matching client automatically if a mismatch would otherwise surface.
 A teammate with **no** `~/.databrickscfg` can still type a workspace host in the UI
 and sign in through the browser - a config file is not required to get started.
 
+Once connected, the **Databricks** section also carries a **Databricks runtime**
+toggle (on by default for a connected notebook). It advertises
+`DATABRICKS_RUNTIME_VERSION` in the kernel so pasted Databricks-notebook code that
+gates on `IS_DATABRICKS` takes its interactive `dbutils.widgets` path instead of a
+local CLI fallback. Because that gate is read at import time, changes apply at
+kernel start/restart only - the panel shows a "restart to apply" hint and a Restart
+button. Force it (and the advertised version) headless with `CELLAR_DATABRICKS_RUNTIME`
+/ `CELLAR_DATABRICKS_RUNTIME_VERSION` (see the reference below).
+
 ## Configuration reference (environment variables)
 
 All of these are optional. **Unset = the standard behavior**; set one only to
@@ -171,6 +180,8 @@ to publish, e.g. inside a container.
 | `CELLAR_ISOLATED` | unset | Run with no global instance registry and no cross-instance reaping (what the Docker image sets). |
 | `CELLAR_KERNEL_STATUS_DEBOUNCE_MS` | `80` | Debounce window for kernel-status broadcasts to the UI. |
 | `CELLAR_ADD_PROJECT_ROOT` | UI setting | Force whether the project root is added to the kernel's `sys.path` (overrides the persisted UI toggle). |
+| `CELLAR_DATABRICKS_RUNTIME` | UI setting (default on for a connected notebook) | Force whether `DATABRICKS_RUNTIME_VERSION` is advertised in the kernel environment, so `IS_DATABRICKS`-gated notebook code takes its `dbutils.widgets` path. Overrides the persisted UI toggle and bypasses the connected-notebook scope. Applied at kernel start/restart only. |
+| `CELLAR_DATABRICKS_RUNTIME_VERSION` | `15.4` | The runtime version string advertised when the toggle above is on (overrides the persisted UI value). |
 | `CELLAR_JUPYTER_URL` | `http://127.0.0.1:8888` | Point the kernel bridge at an external Jupyter server (the launcher sets this automatically for the managed sidecar). |
 | `CELLAR_JUPYTER_TOKEN` | `` (empty) | Token for an external Jupyter server. |
 | `DATABRICKS_CONFIG_FILE` | `~/.databrickscfg` | Standard SDK variable for the Databricks config location. |

@@ -22,6 +22,12 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { workspaceRoot } from '$lib/server/fstree';
 import { ADD_PROJECT_ROOT_KEY, projectRootEnabled } from '$lib/server/projectRoot';
+import {
+	DBX_RUNTIME_KEY,
+	DBX_RUNTIME_VERSION_KEY,
+	shouldInjectDatabricksRuntime,
+	databricksRuntimeVersion as resolveDatabricksRuntimeVersion
+} from '$lib/server/databricksRuntime';
 
 const WRITE_DEBOUNCE_MS = 250;
 
@@ -79,6 +85,34 @@ export function setUiState(patch: UiState | null | undefined): UiState {
  */
 export function addProjectRootToPath(): boolean {
 	return projectRootEnabled(ensureLoaded()[ADD_PROJECT_ROOT_KEY], process.env.CELLAR_ADD_PROJECT_ROOT);
+}
+
+/**
+ * Whether to inject `DATABRICKS_RUNTIME_VERSION` at kernel start for a notebook
+ * that IS (`bound`) or IS NOT bound to a Databricks cluster. Default ON, but
+ * SCOPED to a connected notebook so a purely-local kernel is never told it is on
+ * Databricks (which would change mlflow & co.); an env override
+ * (`CELLAR_DATABRICKS_RUNTIME`) forces it either way. Read at kernel-start time by
+ * `kernel.ts`. See `databricksRuntime.ts`.
+ */
+export function injectDatabricksRuntime(bound: boolean): boolean {
+	return shouldInjectDatabricksRuntime(
+		ensureLoaded()[DBX_RUNTIME_KEY],
+		process.env.CELLAR_DATABRICKS_RUNTIME,
+		bound
+	);
+}
+
+/**
+ * The Databricks runtime version string to advertise (default a recent LTS line).
+ * An env override (`CELLAR_DATABRICKS_RUNTIME_VERSION`) wins over the stored value.
+ * See `databricksRuntime.ts`.
+ */
+export function databricksRuntimeVersion(): string {
+	return resolveDatabricksRuntimeVersion(
+		ensureLoaded()[DBX_RUNTIME_VERSION_KEY],
+		process.env.CELLAR_DATABRICKS_RUNTIME_VERSION
+	);
 }
 
 function scheduleWrite(): void {
