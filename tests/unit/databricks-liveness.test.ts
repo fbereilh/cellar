@@ -116,6 +116,17 @@ describe('isSessionClosed classification', () => {
 			expect(dbx.isSessionClosed(m)).toBe(true);
 		}
 	});
+	it('matches a locally CLOSED client (NO_ACTIVE_SESSION)', () => {
+		// A closed Spark Connect client (`_client.is_closed == True`) raises this from
+		// SparkConnectClient._stub - just as definitive a dead-session signal as
+		// SESSION_CLOSED, so it must classify as closed.
+		for (const m of [
+			'SparkConnectException: [NO_ACTIVE_SESSION] No active Spark session found',
+			'[NO_ACTIVE_SESSION] No active Spark session found.'
+		]) {
+			expect(dbx.isSessionClosed(m)).toBe(true);
+		}
+	});
 	it('does not match unrelated errors', () => {
 		for (const m of ['AnalysisException: table not found', 'ConnectionError: timed out', '', null, undefined]) {
 			expect(dbx.isSessionClosed(m)).toBe(false);
@@ -194,6 +205,93 @@ describe('agentStatus liveness + auto-reconnect', () => {
 		const s = (await dbx.agentStatus()) as Record<string, unknown>;
 		expect(s.connected).toBe(true);
 		expect(s.expired).toBeUndefined();
+	});
+
+	it('treats a CLOSED Spark Connect client (is_closed) as expiry and AUTO-RECONNECTS', async () => {
+		await freshConnect();
+		// The fixed PING_CODE reads `spark._client.is_closed` synchronously; when it is
+		// True it returns this (no SELECT 1 round-trip). The mock returns it verbatim.
+		state.ping = {
+			ok: true,
+			alive: false,
+			expired: true,
+			closed: true,
+			message: 'SparkConnectClient.is_closed is True (session closed locally)'
+		};
+		vi.advanceTimersByTime(TTL_MS + 1_000);
+		const s = (await dbx.agentStatus()) as Record<string, unknown>;
+		// The bug: this used to report connected:true + liveness_unverified:true.
+		expect(s.reconnected).toBe(true);
+		expect(s.connected).toBe(true);
+		expect(s.liveness_unverified).toBeUndefined();
+	});
+
+	it('reports expired (not liveness_unverified) for a NO_ACTIVE_SESSION probe when reconnect fails', async () => {
+		await freshConnect();
+		// A closed client makes SELECT 1 raise NO_ACTIVE_SESSION; the fixed probe
+		// classifies that as expired. With reconnect failing, status must be honest.
+		state.ping = {
+			ok: true,
+			alive: false,
+			expired: true,
+			message: '[NO_ACTIVE_SESSION] No active Spark session found'
+		};
+		state.connect = { ok: false, code: 'session_failed', message: 'cluster unreachable' };
+		vi.advanceTimersByTime(TTL_MS + 1_000);
+		const s = (await dbx.agentStatus()) as Record<string, unknown>;
+		expect(s.connected).toBe(false);
+		expect(s.expired).toBe(true);
+		expect(s.liveness_unverified).toBeUndefined();
+	});
+
+	it('surfaces is_closed and probe age on a liveness_unverified reading', async () => {
+		await freshConnect();
+		// A transient, non-session error: probe ran, could read is_closed:false but the
+		// SELECT failed. Report connected+unverified with the diagnostic fields.
+		state.ping = { ok: true, alive: false, expired: false, closed: false, message: 'ConnectionError: blip' };
+		vi.advanceTimersByTime(TTL_MS + 1_000);
+		const s = (await dbx.agentStatus()) as Record<string, unknown>;
+		expect(s.liveness_unverified).toBe(true);
+		expect(s.is_closed).toBe(false);
+		expect(typeof s.liveness_checked_ms_ago).toBe('number');
+	});
+});
+
+describe('getStatus UI connection reflects liveness (no epoch-only lie)', () => {
+	it('reports connected for a healthy live session', async () => {
+		await freshConnect();
+		const st = (await dbx.getStatus()) as { connection: Record<string, unknown> };
+		expect(st.connection.connected).toBe(true);
+		expect(st.connection.expired).toBeUndefined();
+	});
+
+	it('reports expired (connected:false) when the client is closed and heal fails', async () => {
+		await freshConnect();
+		state.ping = { ok: true, alive: false, expired: true, closed: true, message: 'is_closed' };
+		state.connect = { ok: false, code: 'session_failed', message: 'cluster unreachable' };
+		vi.advanceTimersByTime(TTL_MS + 1_000);
+		const st = (await dbx.getStatus()) as { connection: Record<string, unknown> };
+		// The UI panel must NOT keep saying connected over a dead handle.
+		expect(st.connection.connected).toBe(false);
+		expect(st.connection.expired).toBe(true);
+		expect((st.connection.lost as Record<string, unknown>)?.clusterName).toBe('Test Cluster');
+	});
+
+	it('kicks off a background heal (never blocks the poll) and recovers on a later read', async () => {
+		await freshConnect();
+		state.ping = { ok: true, alive: false, expired: true, closed: true, message: 'is_closed' };
+		state.connect = { ok: true, host: 'https://test.databricks.com', spark_version: '3.5.0' };
+		vi.advanceTimersByTime(TTL_MS + 1_000);
+		// The UI poll must NOT stall on a (possibly minutes-long) reconnect: the first
+		// read reports expired and fires the heal fire-and-forget.
+		const first = (await dbx.getStatus()) as { connection: Record<string, unknown> };
+		expect(first.connection.connected).toBe(false);
+		expect(first.connection.expired).toBe(true);
+		// Let the background reconnect (and its liveness cache reseed) settle.
+		await vi.advanceTimersByTimeAsync(0);
+		const second = (await dbx.getStatus()) as { connection: Record<string, unknown> };
+		expect(second.connection.connected).toBe(true);
+		expect(second.connection.expired).toBeUndefined();
 	});
 });
 

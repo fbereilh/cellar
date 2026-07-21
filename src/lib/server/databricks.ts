@@ -799,6 +799,14 @@ export async function checkInstall(): Promise<InstallStatus> {
  * notebook whose connection to report - the sidebar passes the ACTIVE notebook,
  * so the panel always reflects the focused notebook's Databricks session. The
  * profiles/install/uv fields are workspace-level and notebook-independent.
+ *
+ * `connection` is `liveConnection(nb)` (not the raw epoch-only `connectionStatus`):
+ * it reflects a REAL liveness verdict, so a session whose Spark Connect client was
+ * closed (idle timeout / cluster GC) reads as expired/reconnecting rather than
+ * "connected" over a dead handle. That runs a cached `SELECT 1` probe, so this
+ * call may contact the workspace - but the probe is memoized (short TTL) and
+ * skipped while the kernel is busy, and it NEVER boots a kernel, so the sidebar
+ * poll stays cheap. It never blocks on a reconnect either (see `liveConnection`).
  */
 export async function getStatus(nb?: string | null) {
 	const { configPath: path, exists, profiles, error } = readProfiles();
@@ -815,7 +823,7 @@ export async function getStatus(nb?: string | null) {
 		installError,
 		uv: await hasUv(),
 		signedInHosts: [...signedInHosts],
-		connection: connectionStatus(nb)
+		connection: await liveConnection(nb)
 	};
 }
 
@@ -1207,6 +1215,19 @@ finally:
  * A non-session error (a transient network blip) comes back `alive:false,
  * expired:false`, so it degrades to "connected but unverified" rather than
  * tearing down a session that is probably fine.
+ *
+ * DEFINITIVE local signal, checked BEFORE the `SELECT 1`: a Spark Connect client
+ * that has been closed reports `spark._client.is_closed == True`
+ * (`SparkConnectClient.is_closed`). This is a synchronous, in-kernel boolean with
+ * NO gRPC round-trip, so it is authoritative even when the workspace is
+ * unreachable - and when it is set, `spark.sql(...)` would only raise
+ * `[NO_ACTIVE_SESSION] No active Spark session found` (`SparkConnectClient._stub`
+ * raises precisely because `self.is_closed`). Ignoring `is_closed` and trusting
+ * the epoch is exactly how Cellar came to report "connected" over a hard local
+ * "the client is closed" fact, so it is consulted first and reported as
+ * `expired:true` (a closed client cannot recover in place; only a reconnect can).
+ * `w` (the WorkspaceClient) is never touched by this - only the Spark session is
+ * probed - so a `w`-only workflow keeps working even when this reports expired.
  */
 const PING_CODE = `
 import json as _cellar_json
@@ -1216,14 +1237,22 @@ def _cellar_dbx_ping():
     if _spark is None:
         return {'ok': True, 'alive': False, 'expired': False, 'reason': 'no_spark'}
     try:
+        _client = getattr(_spark, '_client', None)
+        if _client is not None and getattr(_client, 'is_closed', False):
+            return {'ok': True, 'alive': False, 'expired': True, 'closed': True,
+                    'message': 'SparkConnectClient.is_closed is True (session closed locally)'}
+    except Exception:
+        pass
+    try:
         _spark.sql('SELECT 1').collect()
-        return {'ok': True, 'alive': True, 'expired': False}
+        return {'ok': True, 'alive': True, 'expired': False, 'closed': False}
     except Exception as _e:
         _msg = '%s: %s' % (type(_e).__name__, _e)
         _low = _msg.lower()
         _expired = ('session_closed' in _low or 'invalid_handle' in _low
                     or 'session expired' in _low or 'session was closed' in _low
-                    or 'session is closed' in _low or 'sessionclosed' in _low)
+                    or 'session is closed' in _low or 'sessionclosed' in _low
+                    or 'no_active_session' in _low or 'no active spark session' in _low)
         return {'ok': True, 'alive': False, 'expired': _expired, 'message': _msg}
 
 try:
@@ -1235,7 +1264,12 @@ finally:
     del _cellar_dbx_ping, _cellar_json
 `;
 
-/** Does an error message look like a dead/expired Spark Connect session handle? */
+/**
+ * Does an error message look like a dead/expired Spark Connect session handle?
+ * Includes `NO_ACTIVE_SESSION` / "no active spark session": a locally CLOSED
+ * client (`is_closed == True`) raises that from `SparkConnectClient._stub`, so
+ * it is a session-closed signal every bit as definitive as `SESSION_CLOSED`.
+ */
 export function isSessionClosed(message: unknown): boolean {
 	const m = String(message ?? '').toLowerCase();
 	return (
@@ -1244,7 +1278,9 @@ export function isSessionClosed(message: unknown): boolean {
 		m.includes('invalid_handle') ||
 		m.includes('session expired') ||
 		m.includes('session was closed') ||
-		m.includes('session is closed')
+		m.includes('session is closed') ||
+		m.includes('no_active_session') ||
+		m.includes('no active spark session')
 	);
 }
 
@@ -1311,6 +1347,13 @@ interface Liveness {
 	session: SessionId | null;
 	alive: boolean;
 	expired: boolean;
+	/**
+	 * The Spark Connect client's local `is_closed` flag, when the probe could read
+	 * it. `true` is a DEFINITIVE dead-session signal (no gRPC round-trip); `false`
+	 * means open (or open-but-unconfirmed); `undefined` means the probe never ran
+	 * (kernel busy) or errored before it could look.
+	 */
+	closed?: boolean;
 	checkedAt: number;
 	message?: string;
 }
@@ -1442,11 +1485,17 @@ async function probeLiveness(nb: string, session: SessionId | null): Promise<Liv
 		let live: Liveness;
 		try {
 			const { result, session: ran } = await runInKernel(nb, PING_CODE);
-			const r = result as ProbeResult & { alive?: boolean; expired?: boolean; message?: string };
+			const r = result as ProbeResult & {
+				alive?: boolean;
+				expired?: boolean;
+				closed?: boolean;
+				message?: string;
+			};
 			live = {
 				session: ran ?? session,
 				alive: r.ok === true && r.alive === true,
 				expired: r.ok === true && r.expired === true,
+				closed: r.ok === true && typeof r.closed === 'boolean' ? r.closed : undefined,
 				checkedAt: Date.now(),
 				message: r.message
 			};
@@ -1770,6 +1819,84 @@ export async function connect({
 	}
 }
 
+/** A connection reconciled as still live for the current epoch. */
+type Connected = ConnectionStatus & { connected: true };
+
+/**
+ * The real-liveness verdict for a CONNECTED notebook, produced by `assessLiveness`
+ * and formatted by both the agent surface (`agentStatus`) and the UI status poll
+ * (`liveConnection`) so they can never disagree about whether `spark` is alive.
+ *   - `live`        - the probe (or a fresh cached reading) confirmed the session.
+ *   - `reconnected` - it had expired and Cellar rebuilt it; `status` is the fresh one.
+ *   - `expired`     - it is definitively dead (server-side expiry, or a locally
+ *                     CLOSED Spark Connect client) and could not be healed in place.
+ *   - `unverified`  - could not confirm liveness (kernel busy with no cached
+ *                     reading, or a transient error): still bound, just unconfirmed.
+ */
+type Assessment =
+	| { kind: 'live' }
+	| { kind: 'reconnected'; status: Connected }
+	| { kind: 'expired' }
+	| { kind: 'unverified'; liveness: Liveness | null };
+
+/**
+ * Reconcile a connected notebook's REAL Spark Connect liveness, memoized via the
+ * liveness cache. The one place that decides live/expired/unverified, shared by
+ * the agent surface and the UI poll.
+ *
+ * The load-bearing signal is `is_closed`: a closed Spark Connect client is a
+ * DEFINITIVE, synchronous, local dead-session fact (no gRPC round-trip), so the
+ * probe reports it as `expired` even though the kernel epoch is unchanged. Trusting
+ * the epoch (or a `SELECT 1` that came back with an unrecognized `NO_ACTIVE_SESSION`
+ * message) over that hard local fact is exactly how Cellar reported "connected"
+ * against a dead handle - see the PING_CODE header. Only the Spark session is
+ * probed; `w` is untouched, so a `w`-only workflow is unaffected by an expiry here.
+ *
+ * `heal` controls the reconnect: the agent surface (`heal:true`) AWAITS
+ * `autoReconnect` and reports the healed session; the UI (`heal:false`) must never
+ * stall a status poll minutes behind a cold-cluster restart, so it fires the
+ * reconnect fire-and-forget (its success publishes `databricks:changed`, which
+ * reloads the panel) and reports the honest `expired` now.
+ */
+async function assessLiveness(abs: string, status: Connected, { heal }: { heal: boolean }): Promise<Assessment> {
+	const s = stateFor(abs);
+	const sid = status.session;
+	const fresh = s.liveness && s.liveness.session === sid && Date.now() - s.liveness.checkedAt < LIVENESS_TTL_MS;
+	let live: Liveness | null = fresh ? s.liveness : null;
+	if (!live) {
+		if (kernelStatus(abs).status === 'busy') {
+			// Don't block status behind a running cell. Fall back to the last-known
+			// reading for THIS epoch if we have one; otherwise we cannot verify (a
+			// closed client can only be observed by running the probe, which we can't
+			// queue behind the busy cell) - so report unverified, never a bare connected.
+			live = s.liveness && s.liveness.session === sid ? s.liveness : null;
+		} else {
+			live = await probeLiveness(abs, sid);
+		}
+	}
+
+	if (live?.expired) {
+		if (heal) {
+			// autoReconnect() rebuilds spark/w against the same cluster; report the
+			// fresh connection so the agent knows spark is usable again.
+			if (await autoReconnect(abs)) {
+				const healedStatus = connectionStatus(abs);
+				if (healedStatus.connected) return { kind: 'reconnected', status: healedStatus };
+			}
+			return { kind: 'expired' };
+		}
+		// autoReconnect() catches its own errors and never throws, so fire-and-forget.
+		void autoReconnect(abs);
+		return { kind: 'expired' };
+	}
+
+	if (live && live.alive) return { kind: 'live' };
+	// live is null (busy, no cached reading) OR a non-session error / a closed flag
+	// we could not read: spark is still bound and the epoch is current, so we stay
+	// connected but could not CONFIRM the session is live.
+	return { kind: 'unverified', liveness: live };
+}
+
 /**
  * The connection as an *agent* should see it (MCP `kernel_state`, the notebook
  * map header, and the not-connected error every `databricks_*` tool returns).
@@ -1793,53 +1920,76 @@ export async function agentStatus(nb?: string | null) {
 	}
 
 	// `spark` is bound in the current epoch - but the Spark Connect handle may have
-	// died server-side (idle timeout / cluster GC) while the epoch stayed current.
-	// Verify liveness (cached; skipped when the kernel is busy so we never queue
-	// behind a running cell), and self-heal on a session-closed error.
-	const sid = status.session;
-	const fresh = s.liveness && s.liveness.session === sid && Date.now() - s.liveness.checkedAt < LIVENESS_TTL_MS;
-	let live: Liveness | null = fresh ? s.liveness : null;
-	if (!live) {
-		if (kernelStatus(abs).status === 'busy') {
-			// Don't block status behind a running cell. Fall back to the last-known
-			// reading for this epoch if we have one; otherwise report unverified.
-			live = s.liveness && s.liveness.session === sid ? s.liveness : null;
-		} else {
-			live = await probeLiveness(abs, sid);
-		}
+	// died server-side (idle timeout / cluster GC) or had its client closed while the
+	// epoch stayed current. Verify liveness (cached; skipped when the kernel is busy)
+	// and self-heal on a dead session.
+	const a = await assessLiveness(abs, status, { heal: true });
+	if (a.kind === 'reconnected') {
+		return {
+			...connectedPayload(a.status),
+			reconnected: true,
+			note: 'The previous Databricks Connect session had expired; Cellar automatically reconnected. `spark` and `w` are live again against the cluster above - re-run any cell that failed with SESSION_CLOSED. Use them directly, do not re-create a DatabricksSession.'
+		};
 	}
+	if (a.kind === 'expired') {
+		return {
+			connected: false,
+			expired: true,
+			stale: true,
+			cluster: { id: status.clusterId, name: status.clusterName },
+			host: status.host,
+			note: 'The Databricks Connect session expired (idle timeout, cluster GC, or a closed Spark Connect client) and Cellar could not automatically reconnect. Ask the user to reconnect from the Databricks sidebar section, then re-run the cell.'
+		};
+	}
+	if (a.kind === 'unverified') {
+		// A non-session error, or a busy-skipped probe with no cached reading: spark is
+		// still bound and the epoch is current, so report connected, but flag that we
+		// could not confirm - and expose is_closed / probe age so a caller can tell
+		// "unknown (busy)" from "confirmed open but a transient SELECT failed".
+		const l = a.liveness;
+		return {
+			...connectedPayload(status),
+			liveness_unverified: true,
+			...(l
+				? {
+						liveness_checked_ms_ago: Date.now() - l.checkedAt,
+						...(typeof l.closed === 'boolean' ? { is_closed: l.closed } : {})
+					}
+				: {})
+		};
+	}
+	return connectedPayload(status);
+}
 
-	if (live?.expired) {
-		const healed = await autoReconnect(abs);
-		if (!healed) {
-			return {
-				connected: false,
-				expired: true,
-				stale: true,
-				cluster: { id: status.clusterId, name: status.clusterName },
-				host: status.host,
-				note: 'The Databricks Connect session expired (idle timeout or cluster GC) and Cellar could not automatically reconnect. Ask the user to reconnect from the Databricks sidebar section, then re-run the cell.'
-			};
-		}
-		// autoReconnect() rebuilt spark/w against the same cluster; report the fresh
-		// connection so the agent knows spark is usable again.
-		const healedStatus = connectionStatus(abs);
-		if (healedStatus.connected) {
-			return {
-				...connectedPayload(healedStatus),
-				reconnected: true,
-				note: 'The previous Databricks Connect session had expired; Cellar automatically reconnected. `spark` and `w` are live again against the cluster above - re-run any cell that failed with SESSION_CLOSED. Use them directly, do not re-create a DatabricksSession.'
-			};
-		}
+/**
+ * The connection the UI sidebar reads: `connectionStatus()` (epoch-reconciled)
+ * enriched with the real liveness verdict, so the panel reflects a session that
+ * expired server-side (or whose Spark Connect client was closed) instead of
+ * reporting a dead session as "connected" on the strength of a still-current
+ * epoch. Never blocks on a reconnect (see `assessLiveness`'s `heal:false`).
+ */
+async function liveConnection(
+	nb?: string | null
+): Promise<ConnectionStatus & { expired?: boolean; livenessUnverified?: boolean; isClosed?: boolean }> {
+	const abs = resolveNotebookPath(nb);
+	const status = connectionStatus(abs);
+	if (!status.connected) return status;
+	const a = await assessLiveness(abs, status, { heal: false });
+	if (a.kind === 'reconnected') return a.status;
+	if (a.kind === 'expired') {
+		// Surface it as a session the notebook LOST (same shape a kernel-restart loss
+		// uses, so the sidebar's existing "reconnect below" affordance renders), plus
+		// an explicit `expired` flag so the panel can phrase it as an expiry.
+		return { connected: false, expired: true, lost: { profile: status.profile, clusterName: status.clusterName } };
 	}
-
-	const payloadOut = connectedPayload(status);
-	if (live && !live.alive && !live.expired) {
-		// A non-session error (or a busy-skipped probe): spark is still bound and the
-		// epoch is current, so report connected, but flag that we could not confirm.
-		return { ...payloadOut, liveness_unverified: true };
+	if (a.kind === 'unverified') {
+		return {
+			...status,
+			livenessUnverified: true,
+			...(typeof a.liveness?.closed === 'boolean' ? { isClosed: a.liveness.closed } : {})
+		};
 	}
-	return payloadOut;
+	return status;
 }
 
 /** The standard connected payload the agent reads, shared by the healthy + healed paths. */

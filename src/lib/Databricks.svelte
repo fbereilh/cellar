@@ -43,6 +43,17 @@
 		sparkVersion?: string;
 		/** Present when a live session ended because the kernel restarted. */
 		lost?: { clusterName?: string };
+		/**
+		 * The Spark Connect session expired (idle timeout / cluster GC / a closed
+		 * client) and could not be healed in place. Reported as `connected:false`
+		 * with a `lost` cluster; Cellar is attempting a background reconnect.
+		 */
+		expired?: boolean;
+		/**
+		 * Still connected, but a `SELECT 1` liveness probe could not confirm the
+		 * session (kernel busy, or a transient error). Not a dead session.
+		 */
+		livenessUnverified?: boolean;
 	}
 	interface DbxInstall {
 		python: string | null;
@@ -668,6 +679,11 @@
 					<code class="font-mono text-[10px] text-primary">spark</code> and
 					<code class="font-mono text-[10px] text-primary">w</code> are ready in the kernel.
 				</p>
+				{#if connection.livenessUnverified}
+					<p class="mt-1 text-[11px] leading-relaxed text-base-content/40" data-testid="databricks-unverified">
+						Liveness not confirmed (kernel busy or a transient error) - not a dead session.
+					</p>
+				{/if}
 				<div class="mt-2 flex gap-1.5">
 					<button class="btn btn-outline btn-xs flex-1" onclick={() => (switching = !switching)} disabled={!!busy} data-testid="databricks-switch">
 						{switching ? 'Cancel' : 'Switch cluster'}
@@ -722,6 +738,10 @@
 						</p>
 					{/if}
 				</div>
+			</div>
+		{:else if connection.expired}
+			<div class="mb-2 rounded-lg border border-warning/30 bg-warning/10 p-2 text-[11px] leading-relaxed text-base-content/70" data-testid="databricks-expired">
+				The Spark Connect session on <span class="font-mono">{connection.lost?.clusterName}</span> expired (idle timeout or a closed client). Cellar is reconnecting; if it does not recover, reconnect below.
 			</div>
 		{:else if connection.lost}
 			<div class="mb-2 rounded-lg border border-warning/30 bg-warning/10 p-2 text-[11px] leading-relaxed text-base-content/70" data-testid="databricks-lost">
