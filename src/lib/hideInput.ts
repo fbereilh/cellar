@@ -23,8 +23,8 @@ type HideInputCell = { cell_type?: string; metadata?: CellMetadata | null } | nu
 /**
  * The EXPLICIT per-cell choice, tri-state: `true` = force hidden, `false` = force
  * shown, `undefined` = no choice (follow the notebook-wide default). Only a code
- * cell can carry it — a markdown/SQL cell has no code to hide — so any other type
- * reads `undefined`.
+ * cell can carry it — a markdown cell has no code to hide (a SQL cell is itself a
+ * `code` cell, so it does) — so a non-code cell reads `undefined`.
  */
 export function hideInputExplicit(cell: HideInputCell): boolean | undefined {
 	if (!cell || cell.cell_type !== 'code') return undefined;
