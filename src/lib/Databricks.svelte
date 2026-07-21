@@ -207,16 +207,26 @@
 	/** Signed in for the current selection this session (an OAuth token is usable). */
 	let authed = $state(false);
 	let authError = $state<DbxError | null>(null);
+	/**
+	 * A named profile is handed straight to the SDK, so it is never pre-gated - we
+	 * try to list, and only if the SDK actually reports it needs a fresh
+	 * interactive login (`oauth_login_required`, set by `loadClusters`) do we show
+	 * the sign-in button. A bare typed host has no profile for the SDK to read, so
+	 * it is always gated on sign-in first.
+	 */
+	let oauthRequired = $state(false);
 
 	const selectionMode = $derived(useHost || !hasProfiles ? 'host' : 'profile');
-	const selectedProfile = $derived(profiles.find((p: DbxProfile) => p.name === profile) ?? null);
-	/** A profile carrying a token authenticates with no browser; everything else is OAuth. */
-	const selectionHasToken = $derived(selectionMode === 'profile' && !!selectedProfile?.hasToken);
 	const hostTrimmed = $derived(hostInput.trim());
 	const hostLooksValid = $derived(/^(https?:\/\/)?[a-z0-9-]+(\.[a-z0-9-]+)+/i.test(hostTrimmed));
 	const haveSelection = $derived(selectionMode === 'profile' ? !!profile : hostLooksValid);
-	/** OAuth selection that has not signed in yet: show the sign-in button, not clusters. */
-	const needsAuth = $derived(!connected && haveSelection && !selectionHasToken && !authed);
+	/** Show the sign-in button instead of clusters: a bare host (always), or a profile the SDK said needs OAuth. */
+	const needsAuth = $derived(
+		!connected &&
+			haveSelection &&
+			!authed &&
+			(selectionMode === 'host' || oauthRequired)
+	);
 	/** Identifies the current selection, so a change resets sign-in + cluster state. */
 	const selectionKey = $derived(selectionMode === 'profile' ? `p:${profile}` : `h:${hostTrimmed}`);
 
@@ -295,9 +305,11 @@
 	/** Switch-cluster: show the picker again while a session is live. */
 	let switching = $state(false);
 
-	// Clusters load only once a selection is authenticated - never while the
-	// sign-in button is still showing (`needsAuth`), so a listing subprocess can
-	// never be the thing that pops the OAuth browser.
+	// Clusters load whenever the selection is not showing the sign-in button
+	// (`needsAuth`). For a bare host that means "only after sign-in", so a listing
+	// subprocess can never be the thing that pops the OAuth browser. A named
+	// profile is not pre-gated: its listing runs immediately (the SDK reads its own
+	// token cache), and only a genuine `oauth_login_required` flips `needsAuth`.
 	const showClusters = $derived(ready && haveSelection && !needsAuth && (!connected || switching));
 	/** Plain (non-reactive) memo of the selection the cluster list belongs to. */
 	let clustersFor: string | null = null;
@@ -313,6 +325,7 @@
 		const seq = ++clustersSeq;
 		clustersLoading = true;
 		clustersError = null;
+		oauthRequired = false;
 		try {
 			const q = new URLSearchParams(selectionParams());
 			const res = await fetch(`/api/databricks/clusters?${q}`);
@@ -325,9 +338,13 @@
 			clusters = null;
 			const e = toDbxError(err);
 			clustersError = e;
-			// The server says this OAuth selection is not signed in (e.g. Cellar
-			// restarted and lost the in-process flag): fall back to the sign-in button.
-			if (e.code === 'oauth_login_required') authed = false;
+			// The SDK reports this selection needs a fresh interactive login (a bare
+			// host we lost the in-process sign-in flag for, or a profile whose cached
+			// OAuth token is gone/absent): fall back to the sign-in button.
+			if (e.code === 'oauth_login_required') {
+				authed = false;
+				oauthRequired = true;
+			}
 		} finally {
 			if (seq === clustersSeq) clustersLoading = false;
 		}
@@ -344,6 +361,7 @@
 	/** A new selection: forget the old sign-in + cluster list. */
 	function resetSelection() {
 		authed = false;
+		oauthRequired = false;
 		authError = null;
 		clusters = null;
 		clustersError = null;
@@ -361,7 +379,7 @@
 		resetSelection();
 	}
 
-	// ---- Sign in (OAuth U2M via the SDK; instant for a PAT profile) -----------
+	// ---- Sign in (OAuth U2M via the SDK; only reached when auth needs a browser) ----
 	async function signIn() {
 		if (busy) return;
 		busy = 'login';
@@ -374,7 +392,13 @@
 			});
 			const body = await res.json();
 			if (!res.ok) throw body;
-			authed = true; // the cluster effect fires now that `needsAuth` is false
+			authed = true;
+			oauthRequired = false;
+			// Force the cluster effect to reload: a profile that surfaced
+			// `oauth_login_required` already ran a (failed) listing, so `clustersFor`
+			// still points at this selection and the effect's guard would skip it.
+			clustersError = null;
+			clustersFor = null;
 		} catch (err) {
 			authError = toDbxError(err);
 		} finally {
@@ -800,7 +824,7 @@
 					{/if}
 				{/if}
 
-				<!-- 3b. OAuth selections sign in first; PAT profiles go straight to clusters. -->
+				<!-- 3b. A bare host signs in first; a profile lists straight away and only shows this if the SDK asks for a login. -->
 				{#if needsAuth}
 					<button
 						class="btn btn-primary btn-xs mt-2 w-full gap-1"
