@@ -140,3 +140,50 @@ describe('OutputAccumulator — capping', () => {
 		expect(out).toEqual([img]);
 	});
 });
+
+describe('OutputAccumulator — terminal-style reduction', () => {
+	it('emits the collapsed final line for a \\r-overwritten progress bar', () => {
+		const { acc } = withRecorder();
+		acc.push(stream('stdout', '\r 0%|   | 0/30'));
+		acc.push(stream('stdout', '\r 50%|#  | 15/30'));
+		acc.push(stream('stdout', '\r100%|###| 30/30'));
+		const out = acc.finish();
+		expect(out).toEqual([{ output_type: 'stream', name: 'stdout', text: '100%|###| 30/30' }]);
+	});
+
+	it('strips SGR color from emitted stream text', () => {
+		const { acc } = withRecorder();
+		acc.push(stream('stdout', '\x1b[32m✓\x1b[0m installed rich'));
+		const out = acc.finish();
+		expect(out).toEqual([{ output_type: 'stream', name: 'stdout', text: '✓ installed rich' }]);
+	});
+
+	it('reduces on every flush tick so the live view collapses in place', () => {
+		const { acc, emits } = withRecorder();
+		acc.push(stream('stdout', '\rloading 10%'));
+		acc.flush();
+		acc.push(stream('stdout', '\rloading 99%'));
+		const out = acc.finish();
+		expect(out).toEqual([{ output_type: 'stream', name: 'stdout', text: 'loading 99%' }]);
+		// Each emitted frame is already reduced — never a raw pile of \r frames.
+		expect(emits.every((e) => !(e.output as { text: string }).text.includes('\r'))).toBe(true);
+	});
+
+	it('leaves plain (non-terminal) stream output byte-for-byte unchanged', () => {
+		const { acc } = withRecorder();
+		acc.push(stream('stdout', 'INFO epoch 1\nINFO epoch 2\n'));
+		const out = acc.finish();
+		expect(out).toEqual([{ output_type: 'stream', name: 'stdout', text: 'INFO epoch 1\nINFO epoch 2\n' }]);
+	});
+
+	it('reduces the emitted copy but never mutates the raw byte accounting', () => {
+		// A run that would trip the stream-byte cap on RAW bytes still trips it even
+		// though the reduced (emitted) text is far smaller — caps count raw input.
+		const { acc } = withRecorder({ maxStreamBytes: 40, maxTotalBytes: 1_000 });
+		for (let i = 0; i < 20; i++) acc.push(stream('stdout', `\rframe ${i} padding padding`));
+		const out = acc.finish();
+		expect(acc.wasCapped).toBe(true);
+		// The kept stream element is the reduced final frame, not a \r pile.
+		expect((out[0] as { text: string }).text).not.toContain('\r');
+	});
+});
