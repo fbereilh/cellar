@@ -5,7 +5,7 @@
 	import Checkpoints from '$lib/Checkpoints.svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
-	import { kernelStatusLabel, kernelDotClass } from '$lib/kernelBadge';
+	import { kernelStatusLabel, kernelDotClass, formatMemory } from '$lib/kernelBadge';
 	import { isOverKernelCap } from '$lib/kernelCap';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
 	import { outlineRows as buildOutlineRows, sectionRunState, headingNumberPrefix } from '$lib/headings';
@@ -208,6 +208,12 @@
 	async function runWipe(path: string) {
 		confirmWipePath = null;
 		await runKernelAction(path, onWipeKernel);
+	}
+
+	// A kernel card's human-readable resident memory, or null (hide) when it has no
+	// live kernel or the reading is not yet sampled.
+	function cardMemory(card: KernelCard): string | null {
+		return card.hasKernel ? formatMemory(card.info.memoryRss) : null;
 	}
 
 	// ---- Bulk kernel actions (section-header menu) --------------------------
@@ -751,6 +757,15 @@
 			>
 				<span class="min-w-0 truncate {busy ? 'font-medium' : ''}">{card.name}</span>
 				<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>
+			</span>
+		{/if}
+		{#if cardMemory(card)}
+			<span
+				class="shrink-0 tabular-nums text-[11px] text-base-content/40"
+				title="Kernel resident memory (RSS)"
+				data-testid="kernel-memory"
+			>
+				{cardMemory(card)}
 			</span>
 		{/if}
 		{#if !card.hasKernel}

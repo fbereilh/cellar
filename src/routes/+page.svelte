@@ -289,6 +289,23 @@
 	const activeHideAllCode = $derived(!!(activeNotebookPath && notebooksHideAll[activeNotebookPath]));
 	const activeRunState = $derived((activeNotebookPath && notebooksRunState[activeNotebookPath]) || null);
 
+	// Per-tab run indicator for the tab strip: 'running' (a cell is executing in that
+	// notebook) or 'queued' (a cell is waiting), keyed by tab id. `notebooksRunState`
+	// is reported by every mounted LiveNotebook regardless of `active`, so a BACKGROUND
+	// notebook (one the user isn't viewing) still lights up its tab. Keyed by tab.path,
+	// which equals the run-state key for both the default and opened `.ipynb` tabs.
+	const tabRunState = $derived.by<Record<string, 'running' | 'queued'>>(() => {
+		const out: Record<string, 'running' | 'queued'> = {};
+		for (const t of tabs) {
+			if (t.kind !== 'notebook' && t.kind !== 'ipynb') continue;
+			const rs = notebooksRunState[t.path];
+			if (!rs) continue;
+			if (rs.runningId != null) out[t.id] = 'running';
+			else if (Object.keys(rs.queued).length > 0) out[t.id] = 'queued';
+		}
+		return out;
+	});
+
 	// Git blame shown in the bottom status bar. A FileTab reports its cursor line's
 	// record; a LiveNotebook reports its FOCUSED CELL's record (per-cell blame) — both
 	// through the same `handleBlame`, keyed by workspace path. The footer reads the
@@ -327,7 +344,14 @@
 				open: !!tab,
 				active: k.path === activeNotebookPath,
 				hasKernel: true,
-				info: { started: k.started, id: k.id, name: k.name, status: k.status, session_id: k.session_id }
+				info: {
+					started: k.started,
+					id: k.id,
+					name: k.name,
+					status: k.status,
+					session_id: k.session_id,
+					memoryRss: k.memoryRss
+				}
 			});
 		}
 		if (activeNotebookPath && !byPath.has(activeNotebookPath)) {
@@ -339,7 +363,14 @@
 				open: !!tab,
 				active: true,
 				hasKernel: false,
-				info: { started: false, id: null, name: 'python3', status: 'not started', session_id: null }
+				info: {
+					started: false,
+					id: null,
+					name: 'python3',
+					status: 'not started',
+					session_id: null,
+					memoryRss: null
+				}
 			});
 		}
 		return [...byPath.values()];
@@ -815,13 +846,33 @@
 	// Databricks panel — all follow the focused notebook). `kernels` is the full
 	// per-notebook list driving the Kernels sidebar cards; it stays live via the
 	// `kernel:status` SSE snapshot as kernels start / go busy / restart / shut down.
-	let kernelInfo = $state<KernelInfo>({ started: false, id: null, name: 'python3', status: 'not started', session_id: null });
+	let kernelInfo = $state<KernelInfo>({
+		started: false,
+		id: null,
+		name: 'python3',
+		status: 'not started',
+		session_id: null,
+		memoryRss: null
+	});
 	let kernels = $state<KernelListEntry[]>([]);
 	let variables = $state<VariableInfo[]>([]);
 	let varsLoading = $state(false);
 	let varsError = $state('');
 
-	const displayKernel = $derived(runBusy ? { ...kernelInfo, started: true, status: 'busy' } : kernelInfo);
+	// The active notebook's live RSS, read from the per-notebook `kernels` list (where
+	// the memory poller writes, kept live by the `kernel:status` SSE snapshot). Strictly
+	// scoped to the active notebook's OWN entry — no fallback to `kernelInfo.memoryRss`,
+	// which lags behind tab focus and would briefly leak another notebook's figure next
+	// to a "not started" badge. A notebook with no live kernel simply has no entry → null
+	// → the navbar hides the figure (the badge already reads "not started").
+	const activeKernelMemory = $derived.by<number | null>(() =>
+		activeNotebookPath ? (kernels.find((k) => k.path === activeNotebookPath)?.memoryRss ?? null) : null
+	);
+
+	const displayKernel = $derived<KernelInfo>({
+		...(runBusy ? { ...kernelInfo, started: true, status: 'busy' } : kernelInfo),
+		memoryRss: activeKernelMemory
+	});
 
 	// Monotonic generation for writes to `kernelInfo`. A fetched status is applied
 	// only while it is still the newest word on the kernel's state: any newer read,
@@ -1088,6 +1139,7 @@
 	<Navbar
 		{tabs}
 		{activeTabId}
+		{tabRunState}
 		{sidebarOpen}
 		kernelInfo={displayKernel}
 		canConsolidateImports={!!activeNotebookPath}

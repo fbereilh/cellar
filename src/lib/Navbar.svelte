@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { iconSvg } from '$lib/fileIcons';
-	import { kernelBadgeClass, kernelStatusLabel } from '$lib/kernelBadge';
+	import { kernelBadgeClass, kernelStatusLabel, formatMemory } from '$lib/kernelBadge';
 	import type { KernelInfo } from '$lib/kernelBadge';
 
 	// The tab fields the navbar renders. The shell (+page) holds richer tab
@@ -16,6 +16,8 @@
 	interface Props {
 		tabs: Tab[];
 		activeTabId: string | null;
+		/** Per-tab run indicator, keyed by tab id: 'running' or 'queued' (background runs included). */
+		tabRunState?: Record<string, 'running' | 'queued'>;
 		sidebarOpen: boolean;
 		kernelInfo: KernelInfo | null;
 		canConsolidateImports?: boolean;
@@ -56,6 +58,7 @@
 	let {
 		tabs,
 		activeTabId,
+		tabRunState = {},
 		sidebarOpen,
 		kernelInfo,
 		canConsolidateImports = false, // a notebook is active, so the sweep has a target
@@ -92,6 +95,8 @@
 	// "not started", never a green idle badge.
 	const kernelLabel = $derived(kernelStatusLabel(kernelInfo));
 	const kernelBadge = $derived(kernelBadgeClass(kernelInfo));
+	// Live resident memory of the active kernel; null (hidden) when no kernel / unread.
+	const kernelMemory = $derived(kernelInfo?.started ? formatMemory(kernelInfo.memoryRss) : null);
 </script>
 
 <header class="flex min-h-11 items-stretch border-b border-base-300 bg-base-100 text-base-content" data-testid="navbar">
@@ -287,16 +292,37 @@
 	<!-- Tab bar: wraps onto additional rows when the open tabs overflow. -->
 	<div class="flex min-w-0 flex-1 flex-wrap content-start items-stretch" data-testid="tabbar">
 		{#each tabs as tab (tab.id)}
+			{@const runState = tabRunState[tab.id]}
 			<div
 				class="group flex max-w-[220px] shrink-0 items-center gap-1.5 border-b border-r border-base-300 px-3 text-sm {tab.id === activeTabId ? 'bg-base-200 text-base-content' : 'bg-base-100 text-base-content/60 hover:bg-base-200/50'}"
 				data-testid="tab"
 				data-tab-id={tab.id}
 				data-active={tab.id === activeTabId}
 				data-preview={tab.preview || undefined}
+				data-run-state={runState || undefined}
 				ondblclick={() => tab.preview && onPromoteTab?.(tab.id)}
 			>
 				<button class="flex min-w-0 items-center gap-1.5 py-2" onclick={() => onSelectTab(tab.id)}>
-					<span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center">{@html iconSvg(tab.title, { dir: false })}</span>
+					<!-- While this notebook is executing/queueing a cell, the icon slot shows a
+					     run indicator instead of the file icon (background runs included), so a
+					     glance at the tab strip tells you which notebooks are busy. -->
+					<span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+						{#if runState === 'running'}
+							<span
+								class="loading loading-spinner h-3.5 w-3.5 text-warning"
+								title="Running a cell"
+								data-testid="tab-running"
+							></span>
+						{:else if runState === 'queued'}
+							<span
+								class="h-1.5 w-1.5 animate-pulse rounded-full bg-warning/70"
+								title="Cell queued"
+								data-testid="tab-queued"
+							></span>
+						{:else}
+							{@html iconSvg(tab.title, { dir: false })}
+						{/if}
+					</span>
 					<span class="truncate {tab.preview ? 'italic' : ''}">{tab.title}</span>
 				</button>
 				{#if tab.dirty}
@@ -317,12 +343,17 @@
 		{/each}
 	</div>
 
-	<!-- Right cluster: kernel status -->
+	<!-- Right cluster: kernel status + live resident memory -->
 	<div class="flex items-center gap-2 border-l border-base-300 px-3 text-xs text-base-content/60">
 		<span>kernel</span>
 		<span class="badge badge-sm gap-1.5 badge-soft {kernelBadge}" data-testid="kernel-status">
 			<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
 			{kernelLabel}
 		</span>
+		{#if kernelMemory}
+			<span class="tabular-nums text-base-content/45" title="Kernel resident memory (RSS)" data-testid="kernel-memory">
+				{kernelMemory}
+			</span>
+		{/if}
 	</div>
 </header>

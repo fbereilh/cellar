@@ -22,6 +22,8 @@ export interface KernelInfo {
 	name: string;
 	status: KernelStatus;
 	session_id: SessionId | null;
+	/** Resident memory of the kernel process in bytes; null when no kernel / unreadable. */
+	memoryRss?: number | null;
 	/** Notebooks loaded in the live session (only the `/api/kernel` route adds this). */
 	loaded_notebooks?: LoadedNotebook[];
 }
@@ -41,6 +43,8 @@ export interface KernelListEntry {
 	status: KernelStatus;
 	session_id: SessionId | null;
 	busy: boolean;
+	/** Resident memory of the kernel process in bytes; null when unreadable / not sampled yet. */
+	memoryRss: number | null;
 }
 
 /**
@@ -83,4 +87,18 @@ export function kernelDotClass(info: KernelInfo | null | undefined): string {
 	if (info.status === 'idle') return 'bg-success';
 	if (info.status === 'dead') return 'bg-error';
 	return 'bg-warning';
+}
+
+/**
+ * Compact, human-readable memory figure for a kernel's RSS (e.g. `312 MB`,
+ * `1.4 GB`). Returns null for a missing/invalid reading so callers can hide the
+ * figure rather than render a broken `NaN`/`0 B`. Uses decimal (MB/GB) units — the
+ * familiar "how much RAM" scale — not binary MiB/GiB, since the value is displayed
+ * to a human, not compared byte-for-byte.
+ */
+export function formatMemory(bytes: number | null | undefined): string | null {
+	if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return null;
+	if (bytes < 1000 * 1000) return `${Math.max(1, Math.round(bytes / 1000))} KB`;
+	if (bytes < 1000 * 1000 * 1000) return `${Math.round(bytes / (1000 * 1000))} MB`;
+	return `${(bytes / (1000 * 1000 * 1000)).toFixed(1)} GB`;
 }
