@@ -43,9 +43,24 @@ beforeAll(async () => {
 			'host = https://default.cloud.databricks.com',
 			'auth_type = databricks-cli',
 			'',
+			// A no-PAT profile with NO explicit auth_type (SDK infers databricks-cli).
+			'[bare_profile]',
+			'host = https://bare.cloud.databricks.com',
+			'',
 			// A PAT profile.
 			'[pat_profile]',
 			'host = https://pat.cloud.databricks.com/',
+			'token = dummy-pat-value',
+			'',
+			// A no-token external-browser profile - the ONE gated shape (could pop a browser).
+			'[ext_browser]',
+			'host = https://ext.cloud.databricks.com',
+			'auth_type = external-browser',
+			'',
+			// An external-browser profile that ALSO carries a token - the token wins, not gated.
+			'[ext_browser_token]',
+			'host = https://exttok.cloud.databricks.com',
+			'auth_type = external-browser',
 			'token = dummy-pat-value',
 			'',
 			// The CLI writes bookkeeping sections here too - not a profile (no host).
@@ -105,11 +120,56 @@ describe('resolveAuth', () => {
 		}
 	});
 
-	it('readProfiles still reports hasToken for the UI label (informational, not a gate)', () => {
+	it('readProfiles still reports hasToken for the UI label (informational)', () => {
 		const { profiles } = dbx.readProfiles();
 		const names = profiles.map((p) => p.name).sort();
-		expect(names).toEqual(['DEFAULT', 'pat_profile']); // __settings__ (host-less) dropped
+		// __settings__ (host-less) dropped
+		expect(names).toEqual(['DEFAULT', 'bare_profile', 'ext_browser', 'ext_browser_token', 'pat_profile']);
 		expect(profiles.find((p) => p.name === 'DEFAULT')?.hasToken).toBe(false);
 		expect(profiles.find((p) => p.name === 'pat_profile')?.hasToken).toBe(true);
+	});
+});
+
+/**
+ * The browser-safety gate: a listing/connect must never itself pop the SDK's
+ * OAuth browser. Only ONE profile shape can - a no-token `auth_type =
+ * external-browser` profile - so it (like a bare host) is held behind an explicit
+ * sign-in; every other profile the SDK can authenticate silently is ungated. This
+ * is encoded in `resolveAuth`'s `needsSignIn` flag and enforced by the listing
+ * gate (`listClusters` throws `oauth_login_required` BEFORE spawning any probe).
+ */
+describe('profile sign-in gate (needsSignIn)', () => {
+	it('a databricks-cli profile is ungated (needsSignIn false)', () => {
+		const auth = dbx.resolveAuth({ profile: 'DEFAULT' }) as Record<string, unknown>;
+		expect(auth.needsSignIn).toBe(false);
+	});
+
+	it('a no-authType no-token profile is ungated (DEFAULT-shape, needsSignIn false)', () => {
+		const auth = dbx.resolveAuth({ profile: 'bare_profile' }) as Record<string, unknown>;
+		expect(auth.mode).toBe('profile');
+		expect(auth.needsSignIn).toBe(false);
+	});
+
+	it('a PAT profile is ungated (needsSignIn false)', () => {
+		const auth = dbx.resolveAuth({ profile: 'pat_profile' }) as Record<string, unknown>;
+		expect(auth.needsSignIn).toBe(false);
+	});
+
+	it('a no-token external-browser profile is gated (needsSignIn true)', () => {
+		const auth = dbx.resolveAuth({ profile: 'ext_browser' }) as Record<string, unknown>;
+		expect(auth.mode).toBe('profile');
+		expect(auth.profile).toBe('ext_browser'); // name preserved, still a profile
+		expect(auth.needsSignIn).toBe(true);
+	});
+
+	it('an external-browser profile WITH a token is ungated (the token wins)', () => {
+		const auth = dbx.resolveAuth({ profile: 'ext_browser_token' }) as Record<string, unknown>;
+		expect(auth.needsSignIn).toBe(false);
+	});
+
+	it('listing an un-signed-in external-browser profile throws oauth_login_required (before any probe)', async () => {
+		await expect(dbx.listClusters({ profile: 'ext_browser' })).rejects.toMatchObject({
+			code: 'oauth_login_required'
+		});
 	});
 });

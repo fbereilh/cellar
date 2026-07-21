@@ -22,9 +22,13 @@
  *     than collapsing a no-token profile to a bare host. A profile that the SDK
  *     can authenticate (the ubiquitous `auth_type = databricks-cli` / OAuth
  *     profile with a cached token - the captain's `DEFAULT`) therefore just works
- *     with no Cellar sign-in step; only a profile whose auth genuinely needs a
- *     fresh interactive login surfaces `oauth_login_required` (reactively, from
- *     the SDK error), which the `login` subprocess then satisfies.
+ *     with no Cellar sign-in step. The ONE exception, so a listing/connect can
+ *     never itself pop a browser: a no-token `auth_type = external-browser`
+ *     profile (`profileNeedsSignIn`) is held behind the same sign-in gate as a
+ *     bare host - it still authenticates by name (`Config(profile=…)`), just after
+ *     the deliberate `login` runs. Any other profile whose auth genuinely needs a
+ *     fresh interactive login surfaces `oauth_login_required` reactively (from the
+ *     SDK error), which the `login` subprocess then satisfies.
  *   - **OAuth U2M (`external-browser`)** - a workspace **host the user typed by
  *     hand**, with no profile to read. `Config(host=…, auth_type='external-
  *     browser')` runs the SDK's *own* OAuth flow: it opens the system browser,
@@ -36,10 +40,11 @@
  *
  * The interactive browser step runs in a short-lived **`login` subprocess** (not
  * the kernel, so it never blocks a running cell) with a long timeout. For a bare
- * host an in-process `signedInHosts` gate lets the fast listing subprocesses run
+ * host an in-process `signedInHosts` gate (and its `signedInProfiles` sibling for
+ * a no-token external-browser profile) lets the fast listing subprocesses run
  * only after that sign-in, so a listing can never be the thing that pops the
- * browser; a named profile is never pre-gated (the SDK owns its auth and reads
- * its own token cache first). The workspace *host* comes from a profile's `host`
+ * browser; every other named profile is never pre-gated (the SDK owns its auth
+ * and reads its own token cache first). The workspace *host* comes from a profile's `host`
  * or is typed directly - a cached profile is never required. The profile list
  * below is parsed from `~/.databrickscfg` so the picker works before anything is
  * installed.
@@ -115,7 +120,9 @@ interface Selection {
  * (`Config(profile=…)`, whatever the profile's `auth_type`) or external-browser
  * OAuth against a bare typed host.
  */
-type Auth = { mode: 'profile'; profile: string; host: string } | { mode: 'oauth'; host: string };
+type Auth =
+	| { mode: 'profile'; profile: string; host: string; needsSignIn: boolean }
+	| { mode: 'oauth'; host: string };
 
 /** A profile parsed out of `~/.databrickscfg` (token value never exposed). */
 interface Profile {
@@ -264,11 +271,13 @@ export function configPath(): string {
  * host-less sections are dropped rather than offered as something to connect to.
  *
  * Each profile also reports `hasToken` (a `token` key ⇒ PAT auth) and its
- * declared `authType`, purely so the UI can *label* a profile's auth style. It
- * is NOT a gate: every named profile is handed to the SDK the same way
+ * declared `authType`. Every named profile is handed to the SDK the same way
  * (`Config(profile=…)`), which authenticates a no-token profile from its own
- * cached OAuth/keyring/CLI credential. The token *value* is never exposed - only
- * whether one is present.
+ * cached OAuth/keyring/CLI credential - so these fields are almost purely a UI
+ * label. The one gate they drive is `profileNeedsSignIn`: a no-token
+ * `auth_type = external-browser` profile is the sole shape the SDK could pop a
+ * browser for, so it (alone) is held behind sign-in. The token *value* is never
+ * exposed - only whether one is present.
  */
 export function readProfiles(): {
 	configPath: string;
@@ -323,6 +332,19 @@ function normalizeHost(host?: string | null): string {
 }
 
 /**
+ * The one profile shape a silent listing/connect could still make the SDK open a
+ * browser for: `auth_type = external-browser` with no `token`. A profile with a
+ * `token` (PAT), or `databricks-cli`, or no explicit `auth_type` at all (the SDK
+ * infers `databricks-cli` - the captain's `DEFAULT`) is NOT this: it authenticates
+ * from a token or a CLI-supplied credential and only ever errors cleanly, never a
+ * browser. So the gate keys on `external-browser` specifically - never on a merely
+ * missing `auth_type` - to avoid re-gating `DEFAULT`.
+ */
+function profileNeedsSignIn(p: Profile): boolean {
+	return p.authType === 'external-browser' && !p.hasToken;
+}
+
+/**
  * Resolve a UI selection - a `profile` name, or a typed `host` - to the auth
  * descriptor both the subprocess and the kernel build their `Config` from:
  *
@@ -338,9 +360,17 @@ function normalizeHost(host?: string | null): string {
  * identity and forced a redundant sign-in for a profile the SDK could already
  * authenticate, e.g. an `auth_type = databricks-cli` profile with a cached
  * token). Cellar's own OAuth (`mode: 'oauth'`) is reserved for a typed host with
- * no profile to read. A profile whose auth genuinely needs a fresh interactive
- * login is not pre-judged here: the SDK reports it (`oauth_login_required`) when
- * a listing/connect actually runs, and the `login` subprocess satisfies it.
+ * no profile to read.
+ *
+ * `needsSignIn` marks the ONE profile shape the SDK could pop a browser for from
+ * an otherwise-silent listing/connect: `auth_type = external-browser` with no
+ * `token`. Those alone are gated behind an explicit sign-in (`assertSignedIn`,
+ * exactly like a bare host), so a listing/connect never triggers the browser -
+ * only the deliberate `login` subprocess does. Every other profile (a PAT,
+ * `databricks-cli`, or - the captain's `DEFAULT` - one with no explicit
+ * `auth_type`, which the SDK infers as `databricks-cli`) is never pre-gated: it
+ * lists silently, and a profile whose auth genuinely needs a fresh interactive
+ * login still surfaces `oauth_login_required` reactively from the SDK error.
  */
 export function resolveAuth({ profile, host }: Selection = {}): Auth {
 	if (profile) {
@@ -349,7 +379,12 @@ export function resolveAuth({ profile, host }: Selection = {}): Auth {
 		if (!found) {
 			throw new DatabricksError('profile_missing', `profile "${profile}" is not in ${configPath()}`);
 		}
-		return { mode: 'profile', profile, host: normalizeHost(found.host) };
+		return {
+			mode: 'profile',
+			profile,
+			host: normalizeHost(found.host),
+			needsSignIn: profileNeedsSignIn(found)
+		};
 	}
 	const h = normalizeHost(host);
 	if (!h || !HOST_RE.test(h)) {
@@ -761,24 +796,45 @@ function assertMatches(value: unknown, re: RegExp, label: string): string {
 
 /**
  * Bare **hosts** this server process has completed an OAuth sign-in for. It gates
- * only the host path's listing subprocesses (a typed host has no profile-scoped
- * token cache to read): they may run only once we know a usable token exists on
- * disk, so a listing can never be the thing that pops an unexpected browser - the
- * deliberate, long-lived `login` subprocess is. A named **profile** is never
- * gated: the SDK owns its own auth and reads its own token cache first, so a
- * profile it can authenticate lists silently and one it cannot surfaces
- * `oauth_login_required` reactively. Lost on a server restart, which is safe: the
- * on-disk token cache survives, so the next `login` is silent (cache hit) and
- * just re-populates this set.
+ * the host path's listing subprocesses (a typed host has no profile-scoped token
+ * cache to read): they may run only once we know a usable token exists on disk,
+ * so a listing can never be the thing that pops an unexpected browser - the
+ * deliberate, long-lived `login` subprocess is. Lost on a server restart, which
+ * is safe: the on-disk token cache survives, so the next `login` is silent (cache
+ * hit) and just re-populates this set.
  */
-const signedInHosts = new Set();
+const signedInHosts = new Set<string>();
 
-/** Throw `oauth_login_required` if a bare-host OAuth selection has not signed in yet. */
+/**
+ * **Profiles** this server process has signed in for. The sibling of
+ * `signedInHosts` for the ONE profile shape that is gated: a no-token
+ * `auth_type = external-browser` profile (`profileNeedsSignIn`), whose SDK auth
+ * could otherwise open a browser from a listing/connect. Every other profile is
+ * never gated, so it never lands here. Same restart-safe reasoning: the SDK's own
+ * token cache survives, so the next `login` is a silent cache hit.
+ */
+const signedInProfiles = new Set<string>();
+
+/**
+ * Throw `oauth_login_required` if a selection that could pop a browser has not
+ * signed in yet: a bare-host OAuth selection, or a no-token external-browser
+ * profile (`auth.needsSignIn`). Any other profile passes straight through - the
+ * SDK reads its own credential and, if it genuinely needs one, errors reactively.
+ */
 function assertSignedIn(auth: Auth): void {
-	if (auth.mode === 'oauth' && !signedInHosts.has(auth.host)) {
+	if (auth.mode === 'oauth') {
+		if (!signedInHosts.has(auth.host)) {
+			throw new DatabricksError(
+				'oauth_login_required',
+				`Sign in to ${auth.host} first (this opens your browser to authenticate).`
+			);
+		}
+		return;
+	}
+	if (auth.needsSignIn && !signedInProfiles.has(auth.profile)) {
 		throw new DatabricksError(
 			'oauth_login_required',
-			`Sign in to ${auth.host} first (this opens your browser to authenticate).`
+			`Sign in to profile "${auth.profile}" first (this opens your browser to authenticate).`
 		);
 	}
 }
@@ -797,13 +853,15 @@ function authForListing(sel: Selection): Auth {
  * caches the token; for a named **profile** the SDK reads its own auth - a PAT or
  * an already-cached OAuth/keyring token verifies silently, and only a genuine
  * cache miss opens the browser. Either way the round-trip proves the workspace is
- * reachable. Only a host is added to the sign-in gate (a profile is never gated;
- * the SDK owns its token cache).
+ * reachable. The completed sign-in is recorded so the gated selections
+ * (`assertSignedIn`) - a bare host, or a no-token external-browser profile - now
+ * list/connect silently.
  */
 export async function login(sel: Selection) {
 	const auth = resolveAuth(sel);
 	const result = payload<LoginPayload>(unwrap(await probe({ op: 'login', auth }, LOGIN_TIMEOUT_MS)));
 	if (auth.mode === 'oauth') signedInHosts.add(auth.host);
+	else signedInProfiles.add(auth.profile);
 	return { ok: true, mode: auth.mode, host: result.host ?? auth.host, user: result.user ?? null };
 }
 
@@ -853,6 +911,7 @@ export async function getStatus(nb?: string | null) {
 		installError,
 		uv: await hasUv(),
 		signedInHosts: [...signedInHosts],
+		signedInProfiles: [...signedInProfiles],
 		connection: await liveConnection(nb)
 	};
 }
@@ -1770,8 +1829,10 @@ async function ensurePinnedConnect(nb: string, dbr: string | null): Promise<bool
  * Build `spark` + `w` in the kernel against `clusterId`, using the resolved auth
  * for the chosen `profile` OR typed `host`. Resolves with `{ok:true, connection}`
  * or throws a `DatabricksError` whose `code` the sidebar turns into actionable
- * copy. `assertSignedIn` guarantees an OAuth connect never opens a browser in the
- * kernel: the interactive login already happened in its own subprocess.
+ * copy. `assertSignedIn` guarantees a connect that could pop a browser (a bare
+ * host, or a no-token external-browser profile) never opens one in the kernel:
+ * it throws `oauth_login_required` until the interactive login has run in its own
+ * subprocess. A profile the SDK can authenticate silently proceeds directly.
  *
  * Version pinning (the databricks-connect ≤ DBR rule): the client must be no newer
  * than the cluster's runtime or the session hard-fails. This is enforced in two
@@ -2238,10 +2299,11 @@ export async function reconnectSession(nb?: string | null) {
  * — same auth (`resolveAuth`/`assertSignedIn`), same version-pin machinery, same
  * `reconnectTarget` bookkeeping — so there is no second connect path. Two gates on
  * top:
- *   - AUTH: an OAuth host that has not signed in throws `oauth_login_required`
- *     (the browser sign-in is human-only); a PAT profile proceeds. `assertSignedIn`
- *     inside `connect()` enforces this; checked up front so the cluster-state probe
- *     is not paid for an unusable auth.
+ *   - AUTH: a selection that could pop a browser (an OAuth host, or a no-token
+ *     external-browser profile) that has not signed in throws `oauth_login_required`
+ *     (the browser sign-in is human-only); any other profile the SDK can authenticate
+ *     proceeds. `assertSignedIn` inside `connect()` enforces this; checked up front so
+ *     the cluster-state probe is not paid for an unusable auth.
  *   - COMPUTE (D2): a TERMINATED/ERROR cluster is refused with `cluster_terminated`
  *     — agents cannot start compute — instead of failing with a raw Spark error.
  *

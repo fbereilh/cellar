@@ -33,6 +33,7 @@
 		name: string;
 		host?: string;
 		hasToken?: boolean;
+		authType?: string | null;
 	}
 	interface DbxConnection {
 		connected: boolean;
@@ -208,11 +209,13 @@
 	let authed = $state(false);
 	let authError = $state<DbxError | null>(null);
 	/**
-	 * A named profile is handed straight to the SDK, so it is never pre-gated - we
-	 * try to list, and only if the SDK actually reports it needs a fresh
-	 * interactive login (`oauth_login_required`, set by `loadClusters`) do we show
-	 * the sign-in button. A bare typed host has no profile for the SDK to read, so
-	 * it is always gated on sign-in first.
+	 * Most named profiles are handed straight to the SDK, so they are never
+	 * pre-gated - we try to list, and only if the SDK actually reports it needs a
+	 * fresh interactive login (`oauth_login_required`, set by `loadClusters`) do we
+	 * show the sign-in button. The exception, mirrored from the server, is a
+	 * no-token `auth_type = external-browser` profile: it CAN pop a browser, so
+	 * `profileNeedsSignIn` pre-gates it (no auto-listing) exactly like a bare typed
+	 * host, which has no profile for the SDK to read and is always gated first.
 	 */
 	let oauthRequired = $state(false);
 
@@ -220,12 +223,18 @@
 	const hostTrimmed = $derived(hostInput.trim());
 	const hostLooksValid = $derived(/^(https?:\/\/)?[a-z0-9-]+(\.[a-z0-9-]+)+/i.test(hostTrimmed));
 	const haveSelection = $derived(selectionMode === 'profile' ? !!profile : hostLooksValid);
-	/** Show the sign-in button instead of clusters: a bare host (always), or a profile the SDK said needs OAuth. */
+	/** The selected profile record, for its auth-shape fields. */
+	const selectedProfile = $derived(profiles.find((p) => p.name === profile));
+	/** A no-token external-browser profile: the SDK could pop a browser, so pre-gate it (same rule as the server's `profileNeedsSignIn`). */
+	const profileNeedsSignIn = $derived(
+		selectionMode === 'profile' && selectedProfile?.authType === 'external-browser' && !selectedProfile?.hasToken
+	);
+	/** Show the sign-in button instead of clusters: a bare host (always), a no-token external-browser profile, or a profile the SDK said needs OAuth. */
 	const needsAuth = $derived(
 		!connected &&
 			haveSelection &&
 			!authed &&
-			(selectionMode === 'host' || oauthRequired)
+			(selectionMode === 'host' || profileNeedsSignIn || oauthRequired)
 	);
 	/** Identifies the current selection, so a change resets sign-in + cluster state. */
 	const selectionKey = $derived(selectionMode === 'profile' ? `p:${profile}` : `h:${hostTrimmed}`);
@@ -306,10 +315,11 @@
 	let switching = $state(false);
 
 	// Clusters load whenever the selection is not showing the sign-in button
-	// (`needsAuth`). For a bare host that means "only after sign-in", so a listing
-	// subprocess can never be the thing that pops the OAuth browser. A named
-	// profile is not pre-gated: its listing runs immediately (the SDK reads its own
-	// token cache), and only a genuine `oauth_login_required` flips `needsAuth`.
+	// (`needsAuth`). For a bare host - and for a no-token external-browser profile -
+	// that means "only after sign-in", so a listing subprocess can never be the
+	// thing that pops the OAuth browser. Every other named profile is not pre-gated:
+	// its listing runs immediately (the SDK reads its own token cache), and only a
+	// genuine `oauth_login_required` flips `needsAuth`.
 	const showClusters = $derived(ready && haveSelection && !needsAuth && (!connected || switching));
 	/** Plain (non-reactive) memo of the selection the cluster list belongs to. */
 	let clustersFor: string | null = null;
