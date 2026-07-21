@@ -23,6 +23,9 @@
 		/** Workspace path addressing this notebook (the REST API resolves it server-side). */
 		path: string;
 		active?: boolean;
+		/** User preference: follow the running cell (scroll it into view) while THIS
+		 *  notebook is the viewed one. Default on; the shell persists the toggle. */
+		follow?: boolean;
 		/** The shell's `fsRefreshSignal`: a bump re-fetches the git HEAD baseline. */
 		gitRefresh?: number;
 		onCellsChange?: (path: string, cells: UICell[]) => void;
@@ -95,6 +98,7 @@
 	let {
 		path,
 		active = false,
+		follow = true,
 		gitRefresh = 0,
 		onCellsChange,
 		onFoldsChange,
@@ -153,12 +157,6 @@
 	// single client can compute it.
 	let queued = $state<Record<string, number>>({});
 	let activeId = $state<string | null>(null); // the selected/focused cell (visual emphasis)
-	// The cell an AGENT (MCP) is currently running here, or null. Distinct from
-	// `runningId` - which is set for every run, including this tab's own and other
-	// tabs' user runs - because only an agent run may move the viewport (see
-	// "Follow the agent" below). Never used for visuals; the running affordance
-	// keys off `runningId` for all runs alike.
-	let agentRunningId = $state<string | null>(null);
 	let keyMode = $state<KeyMode>('command'); // 'command' | 'edit' (visuals only; the dispatcher reads the DOM)
 	// This notebook's DOM subtree. Scopes the modal-keyboard handler and cell
 	// lookups (ids repeat across the open, still-mounted notebooks), and takes
@@ -428,19 +426,25 @@
 		};
 	});
 
-	// ---- Follow the agent ----------------------------------------------------
-	// When an agent runs a cell we bring that cell into view, so a human watching
-	// can keep up with what is executing. Three rules keep it from being hostile:
+	// ---- Follow the running cell ---------------------------------------------
+	// While a cell runs in the notebook the user is VIEWING, we bring that cell
+	// into view so a human can keep up with what is executing - whether the run is
+	// the user's own, another tab's, or an agent's (`runningId` covers all three).
+	// Four rules keep it from being hostile:
 	//
-	//   1. Agent runs only. `run:start` already carries `actor`; a user's own run
-	//      (this tab or another) never moves anyone's viewport.
-	//   2. Follow-tail, not fight-the-user: we scroll only when the running cell
+	//   1. Viewed notebook only. The effect gates on `active`, so a run in a
+	//      notebook the user is NOT looking at (an agent working a background
+	//      notebook) never moves the viewport. This is the load-bearing scope that
+	//      preserves the active/viewed-notebook decoupling: no background hijack.
+	//   2. User opt-out. The `follow` preference (default on, persisted by the
+	//      shell) disables the whole behavior.
+	//   3. Follow-tail, not fight-the-user: we scroll only when the running cell
 	//      isn't already on screen, and never while the user is typing in this
 	//      notebook (a viewport jump mid-keystroke is the hostile case).
-	//   3. Selection is untouched - `activeId` stays where the user left it. The
+	//   4. Selection is untouched - `activeId` stays where the user left it. The
 	//      running cell is marked by its own (warning-hued) accent in `Cell.svelte`.
 
-	let followedId: string | null = null; // last agent-run cell we scrolled to (one scroll per run)
+	let followedId: string | null = null; // last running cell we scrolled to (one scroll per run)
 	let lastTypedAt = 0; // last keystroke inside this notebook (see `userIsTyping`)
 
 	// Typing guard. Focus alone is too coarse - a cell keeps editor focus long
@@ -560,13 +564,16 @@
 		scrollElementIntoView(el);
 	}
 
-	// Follow on agent `run:start`, and also when the user switches to this tab
-	// while an agent run is already in flight (a hidden pane has no geometry to
-	// scroll). One scroll per run: `followedId` clears when the run ends.
+	// Follow whenever this notebook's running cell changes, and also when the user
+	// switches to this tab while a run is already in flight (a hidden pane has no
+	// geometry to scroll, so `active` flipping true re-runs this and catches up).
+	// Turning `follow` off mid-run stops it; turning it back on catches up to the
+	// still-running cell. One scroll per run: `followedId` clears when the run ends.
 	$effect(() => {
-		const id = agentRunningId;
+		const id = runningId;
 		const visible = active;
-		if (!id) {
+		const on = follow;
+		if (!id || !on) {
 			followedId = null;
 			return;
 		}
@@ -636,7 +643,6 @@
 			// finished server-side) would leave the spinner stuck and, via runCell's
 			// `runningId === id` double-submit guard, permanently refuse to re-run it.
 			runningId = null;
-			agentRunningId = null;
 			lastSeq = null; // reconnect refetches once here; don't also trip the seq-gap check
 			// `queued` is NOT reset: the queue lives on the server and outlives this
 			// refetch. Apply any snapshot that arrived before we knew our absolute id.
@@ -727,7 +733,6 @@
 			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
 			if (runningId === ev.cellId) runningId = null;
-			if (agentRunningId === ev.cellId) agentRunningId = null;
 			if (activeId === ev.cellId) activeId = null;
 		} else if (ev.type === 'cell:moved') {
 			const from = cells.findIndex((c) => c.id === ev.cellId);
@@ -792,9 +797,11 @@
 		// that connects mid-run learns what is executing — `run:start` fired before it
 		// was listening. Without this, such a tab renders cells "queued · 1" behind a
 		// cell it shows as idle. We pick out THIS notebook's running cell (each
-		// notebook has its own kernel, so at most one). `run:start` still owns
-		// `agentRunningId`: adopting a running cell must not scroll a tab that never
-		// saw the agent start it.
+		// notebook has its own kernel, so at most one). Adopting a running cell here
+		// does move `runningId`, so a tab that connects mid-run and is VIEWING this
+		// notebook will follow it - which is the intended behavior (it is looking at
+		// the notebook that is running); a background tab stays put via the `active`
+		// guard on the follow effect.
 		const running = ev.running?.find((r) => r.nb === canonicalId)?.cellId ?? null;
 		if (running) {
 			if (findCell(running)) runningId = running;
@@ -827,9 +834,9 @@
 		} else if (ev.type === 'run:start') {
 			if (cell) {
 				runningId = ev.cellId ?? null;
-				// Only an agent's run earns the viewport; a user run in another tab
-				// must not scroll this one.
-				if (ev.actor === 'agent') agentRunningId = ev.cellId ?? null;
+				// Following is driven by `runningId` + the viewed-notebook (`active`)
+				// guard, so any run in the viewed notebook follows and a background
+				// notebook's run never does - no per-actor bookkeeping needed here.
 				// Clear stale output the moment execution starts (the server fires
 				// run:start when the kernel is actually claimed, after any queue wait),
 				// so a re-run reads as "running, no output yet" until fresh output
@@ -841,7 +848,6 @@
 		} else if (ev.type === 'run:end') {
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;
-			if (agentRunningId === ev.cellId) agentRunningId = null;
 			scheduleStaleness(); // a finished run clears/creates staleness downstream
 		}
 	}

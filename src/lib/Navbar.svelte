@@ -30,6 +30,8 @@
 		canHideCode?: boolean;
 		/** Whether the active notebook's "hide all code" (report view) is on. */
 		hideAllCode?: boolean;
+		/** Whether "follow the running cell" is on (a global viewer preference). */
+		followRunningCell?: boolean;
 		onSelectTab: (id: string) => void;
 		onCloseTab: (id: string) => void;
 		onPromoteTab?: (id: string) => void;
@@ -46,6 +48,8 @@
 		onUndoAgent: () => void;
 		/** Toggle the active notebook's notebook-wide "hide all code" (report view). */
 		onToggleHideAllCode: () => void;
+		/** Toggle the global "follow the running cell" viewer preference. */
+		onToggleFollowRunningCell: () => void;
 		onOpenSettings: () => void;
 	}
 
@@ -64,6 +68,7 @@
 		canCheckpoint = false, // a notebook is active, so it can be snapshotted / reverted
 		canHideCode = false, // a notebook is active, so hide-all-code has a target
 		hideAllCode = false, // the active notebook's report-view state
+		followRunningCell = true, // global viewer preference (default on)
 		onSelectTab,
 		onCloseTab,
 		onPromoteTab,
@@ -79,6 +84,7 @@
 		onCheckpointNow,
 		onUndoAgent,
 		onToggleHideAllCode,
+		onToggleFollowRunningCell,
 		onOpenSettings
 	}: Props = $props();
 
@@ -189,6 +195,22 @@
 						{:else}
 							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" /><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" /><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" /><line x1="2" y1="2" x2="22" y2="22" /></svg>
 							Hide all code
+						{/if}
+					</button>
+				</li>
+				<li>
+					<button
+						onclick={onToggleFollowRunningCell}
+						title="Scroll the running cell into view while you're viewing the notebook that's executing. Runs in a notebook you're not looking at (e.g. an agent working in the background) never move your view."
+						data-testid="toggle-follow-running-cell"
+						aria-pressed={followRunningCell}
+					>
+						{#if followRunningCell}
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 5v2" /><path d="M12 17v2" /><path d="M5 12h2" /><path d="M17 12h2" /></svg>
+							Stop following runs
+						{:else}
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 5v2" /><path d="M12 17v2" /><path d="M5 12h2" /><path d="M17 12h2" /><line x1="3" y1="3" x2="21" y2="21" /></svg>
+							Follow running cell
 						{/if}
 					</button>
 				</li>
