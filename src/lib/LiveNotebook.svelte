@@ -869,14 +869,14 @@
 	// length this element's text MUST currently have for the splice to be valid — a
 	// mismatch means we missed the establishing frame or an earlier delta (or a
 	// reconnect refetch is racing a live delta), so we return false and the caller
-	// DROPS the delta rather than corrupting the text; the server's periodic
-	// full-frame checkpoint resyncs the element. Reassigning the element (not
-	// mutating in place) keeps Svelte's `$state` proxy reactive.
+	// resyncs with one `load()` (authoritative: the server keeps the live doc's
+	// outputs current on every flush). Reassigning the element (not mutating in
+	// place) keeps Svelte's `$state` proxy reactive.
 	function applyOutputAppend(cell: UICell, index: number, base: number, keep: number, chunk: string): boolean {
 		const cur = cell.outputs?.[index];
 		if (!cur || cur.output_type !== 'stream') return false;
 		const oldText = typeof cur.text === 'string' ? cur.text : Array.isArray(cur.text) ? cur.text.join('') : '';
-		if (oldText.length !== base) return false; // out of sync → caller drops, resyncs at next checkpoint
+		if (oldText.length !== base) return false; // out of sync → caller resyncs with one load()
 		cell.outputs![index] = { ...cur, text: oldText.slice(0, keep) + chunk };
 		return true;
 	}
@@ -903,13 +903,14 @@
 		} else if (ev.type === 'run:output') {
 			if (cell) applyOutput(cell, ev.output, ev.index);
 		} else if (ev.type === 'run:output-append') {
-			// A stream delta whose base doesn't match means we're out of sync (a
-			// dropped establishing frame / earlier delta, or a reconnect refetch racing
-			// a live delta): DROP it as a no-op. The server's periodic full-frame
-			// checkpoint (every STREAM_CHECKPOINT_EVERY flushes) re-establishes the whole
-			// element, so a desynced tab resyncs at the next checkpoint — no refetch, so a
-			// burst of mismatches can't storm the notebook with loads.
-			if (cell) applyOutputAppend(cell, ev.index, ev.base, ev.keep, ev.chunk);
+			// A stream delta whose base doesn't match means we're out of sync (a dropped
+			// establishing frame / earlier delta, or a reconnect refetch racing a live
+			// delta): resync with ONE load(), guarded by `!fetching` so a burst of
+			// mismatches triggers at most one in-flight refetch. The load is
+			// authoritative because the server keeps the live doc's outputs current on
+			// every flush (setOutputsLive), so it returns the last-flushed text and the
+			// next delta's base matches again — no refetch storm.
+			if (cell && !applyOutputAppend(cell, ev.index, ev.base, ev.keep, ev.chunk) && !fetching) load();
 		} else if (ev.type === 'run:end') {
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
 			if (runningId === ev.cellId) runningId = null;

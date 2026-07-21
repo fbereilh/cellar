@@ -18,7 +18,7 @@
  *   finally { ticket.done(); }
  */
 import { execute } from './kernel';
-import { setOutputs, setLastRun, clearOutputsLive, getCell } from './notebook';
+import { setOutputs, setOutputsLive, setLastRun, clearOutputsLive, getCell } from './notebook';
 import { publish } from './events';
 import { isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
@@ -86,9 +86,11 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// small `run:output-append` DELTA (only the bytes that changed since the last
 	// flush) instead of its whole buffer, so a slow streaming cell no longer
 	// re-broadcasts O(size) to every tab each tick — see output-accumulator's header.
-	// The full-element `run:output` is kept for the element's first emission, for
-	// rich/marker outputs, and for the periodic checkpoint; a dropped delta is a
-	// no-op on the client and self-heals at the next full-frame checkpoint.
+	// The full-element `run:output` is kept for the element's first emission and for
+	// rich/marker outputs; a dropped delta is a no-op on the client and resyncs with
+	// one `load()`, which is authoritative because each emit also mirrors the
+	// accumulator's current outputs into the in-memory doc (setOutputsLive) so a
+	// mid-run read returns the last-flushed text rather than empty.
 	const emit = (output: CellOutput, index: number, delta?: StreamDelta) => {
 		if (delta) {
 			publish({ type: 'run:output-append', nb, cellId, index, base: delta.base, keep: delta.keep, chunk: delta.chunk, originId });
@@ -97,6 +99,11 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 			publish({ type: 'run:output', nb, cellId, output, index, originId });
 			onEvent?.({ type: 'output', output, index });
 		}
+		// Keep the live doc current (in-memory only, no persist/event) so a client that
+		// desynced does ONE load() that genuinely resyncs. `acc.outputs` is already
+		// updated for this emit; a shallow copy detaches the doc from the array the
+		// accumulator keeps mutating in place.
+		setOutputsLive(cellId, acc.outputs.slice(), nb);
 	};
 	const acc = new OutputAccumulator(emit);
 	// Flush buffered stream text on a ~40ms tick so a long run shows live progress;
