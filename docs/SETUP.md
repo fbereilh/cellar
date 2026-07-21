@@ -179,6 +179,9 @@ to publish, e.g. inside a container.
 | --- | --- | --- |
 | `CELLAR_ISOLATED` | unset | Run with no global instance registry and no cross-instance reaping (what the Docker image sets). |
 | `CELLAR_KERNEL_STATUS_DEBOUNCE_MS` | `80` | Debounce window for kernel-status broadcasts to the UI. |
+| `CELLAR_DATAFLOW_PROBE_TIMEOUT_MS` | `10000` (ms, = 10s) | How long the staleness dataflow probe subprocess (`ast` + `symtable` over the notebook's cells) may run before it is SIGKILLed. A batch that times out is treated as conservative-stale, never falsely fresh. |
+| `CELLAR_DATAFLOW_BACKOFF_BASE_MS` | `30000` (ms, = 30s) | First backoff window after a dataflow batch times out; doubles per consecutive timeout. A timed-out batch is not re-probed until its window elapses or its source content changes, so a persistently-slow notebook converges instead of re-spawning the probe every pass. |
+| `CELLAR_DATAFLOW_BACKOFF_MAX_MS` | `300000` (ms, = 5min) | Ceiling on the dataflow backoff window, so a persistently-slow notebook still re-probes rarely rather than never. |
 | `CELLAR_ADD_PROJECT_ROOT` | UI setting | Force whether the project root is added to the kernel's `sys.path` (overrides the persisted UI toggle). |
 | `CELLAR_DATABRICKS_RUNTIME` | UI setting (default on for a connected notebook) | Force whether `DATABRICKS_RUNTIME_VERSION` is advertised in the kernel environment, so `IS_DATABRICKS`-gated notebook code takes its `dbutils.widgets` path. Overrides the persisted UI toggle and bypasses the connected-notebook scope. Applied at kernel start/restart only. |
 | `CELLAR_DATABRICKS_RUNTIME_VERSION` | `15.4` | The runtime version string advertised when the toggle above is on (overrides the persisted UI value). |
