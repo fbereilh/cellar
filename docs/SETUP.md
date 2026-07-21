@@ -118,8 +118,12 @@ Databricks auth is the SDK's own profile auth - Cellar shells out to nothing and
 bundles no CLI. It reads profiles from `~/.databrickscfg` (override the location
 with the standard `DATABRICKS_CONFIG_FILE` env var). In the sidebar's
 **Databricks** section, pick a profile and cluster and click Connect; Cellar binds
-`spark` and a `WorkspaceClient` (`w`) into the kernel. A **PAT** profile works
-headless; **OAuth** uses a browser flow. `databricks-connect` must be no newer
+`spark` and a `WorkspaceClient` (`w`) into the kernel. Cellar hands the profile
+straight to the SDK, which authenticates it however it is configured - a **PAT**,
+or a `databricks-cli` / keyring / cached-OAuth token - so most profiles connect
+with no sign-in step. The one profile shape gated behind an in-browser sign-in is
+a no-token `auth_type = external-browser` profile (as is a hand-typed host, below).
+`databricks-connect` must be no newer
 than the cluster's DBR (a newer client hard-fails the session); Cellar installs
 it into the project venv on connect, pinned to the cluster's DBR major.minor, and
 re-pins a matching client automatically if a mismatch would otherwise surface.
