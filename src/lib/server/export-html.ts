@@ -27,6 +27,7 @@
 import MarkdownIt from 'markdown-it';
 import type { CellView, CellOutput } from './types';
 import { listCells, getHideAllCode, resolveNotebookPath } from './notebook';
+import { isCodeHidden } from '$lib/hideInput';
 
 /** The minimal markdown-it surface this module uses. */
 interface MarkdownRenderer {
@@ -318,21 +319,13 @@ function renderCodeCell(cell: CellView, hidden: boolean): string {
 	return `<section class="cell code-cell">${code}${output}</section>`;
 }
 
-/**
- * Whether a code cell's input is hidden in the export. Mirrors Cell.svelte's
- * `codeHidden` rule EXACTLY so the export reads like the app's report view: the
- * explicit per-cell `cellar.hide_input` wins; when unset the cell follows the
- * notebook-wide `hideAllCode` default. Markdown cells never hide.
- */
-function codeIsHidden(cell: CellView, hideAllCode: boolean): boolean {
-	if (cell.cell_type === 'markdown') return false;
-	return cell.metadata?.cellar?.hide_input ?? hideAllCode;
-}
-
 function renderCell(cell: CellView, hideAllCode: boolean): string {
+	// `isCodeHidden` is the shared precedence rule (per-cell hide_input wins over
+	// the notebook-wide hideAllCode default), so the export reads like the app's
+	// report view and cannot drift from Cell.svelte / the agent map.
 	return cell.cell_type === 'markdown'
 		? renderMarkdownCell(cell)
-		: renderCodeCell(cell, codeIsHidden(cell, hideAllCode));
+		: renderCodeCell(cell, isCodeHidden(cell, hideAllCode));
 }
 
 /**

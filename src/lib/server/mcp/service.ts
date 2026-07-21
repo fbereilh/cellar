@@ -23,6 +23,7 @@ import {
 	getHeaderNumbering,
 	setHeaderNumbering as setHeaderNumberingDoc,
 	setHideAllCode as setHideAllCodeDoc,
+	setHideInput as setHideInputDoc,
 	getActiveNotebookPath,
 	resolveNotebookPath,
 	workspaceRelative,
@@ -43,6 +44,7 @@ import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
+import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { IMG_MAX_EDGE, downscaleImageForBlock, imagePlaceholder } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
@@ -244,6 +246,29 @@ function headerInfo(cell: CellView): { level: number; title: string } | null {
 
 function hasOutput(cell: CellView): boolean {
 	return cell.cell_type === 'code' && (cell.outputs || []).length > 0;
+}
+
+/**
+ * The per-cell "hide code input" fields for a map leaf, applying the SAME
+ * precedence the UI and the HTML export use (`hide_input ?? hide_all_code`, see
+ * `$lib/hideInput`). Only a code cell can hide its input, so a markdown cell
+ * contributes nothing.
+ *
+ * Kept compact like the other conditional leaf fields: `code_hidden: true` only
+ * when the code is EFFECTIVELY hidden (its editor is not shown to the human), and
+ * `hide_input` only when the cell carries an EXPLICIT per-cell override. Their
+ * absence means "code shown, following the notebook default" — the common case —
+ * so a report_view-on notebook still lets the agent spot the one cell whose code
+ * a human deliberately kept visible (it reports `hide_input: false` with no
+ * `code_hidden`).
+ */
+function hideInputFields(cell: CellView, hideAllCode: boolean): Record<string, boolean> {
+	if (cell.cell_type !== 'code') return {};
+	const explicit = hideInputExplicit(cell);
+	return {
+		...(isCodeHidden(cell, hideAllCode) ? { code_hidden: true } : {}),
+		...(explicit === undefined ? {} : { hide_input: explicit })
+	};
 }
 
 /**
@@ -616,7 +641,8 @@ export async function getNotebookMap(nb?: string | null) {
 		summary: firstLine(c.source),
 		run_status: runStatus(c, sid),
 		...staleFields(stale[c.id], toHandle),
-		has_output: hasOutput(c)
+		has_output: hasOutput(c),
+		...hideInputFields(c, view.hideAllCode)
 	});
 	for (const c of cells) {
 		const h = headerInfo(c);
@@ -1225,12 +1251,45 @@ export function setHeaderNumbering(levels: readonly number[] | null | undefined,
  * MCP `set_report_view`. The notebook-level "hide all code inputs" default: code
  * cells render output-only, for a clean report a human reads without the code.
  * Display-only - no source is touched and every cell still runs. A per-cell
- * `cellar.hide_input` overrides it in either direction, so a cell may still show
- * its code under report view (that per-cell flag has no agent surface today).
+ * `cellar.hide_input` overrides it in either direction (see `setHideInput`), so a
+ * cell may still show its code under report view.
  */
 export function setReportView(enabled: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	return { report_view: setHideAllCodeDoc(enabled, target) };
+}
+
+/**
+ * MCP `set_hide_input`. The per-cell override of report view: force one code
+ * cell's input hidden or shown regardless of the notebook-wide default, or clear
+ * the override so the cell follows it again. Tri-state — `true` = force hidden,
+ * `false` = force shown, `null` = clear the per-cell choice. Display-only: the
+ * source is untouched and the cell still runs.
+ *
+ * Only a code cell can carry it (a markdown cell has no code to hide); a bad id
+ * or non-code target returns `{ ok: false }`. On success it reports the resulting
+ * per-cell `hide_input` (the explicit value, or `null` when cleared), the
+ * effective `code_hidden` (applying `hide_input ?? report_view`), and the
+ * notebook-wide `report_view` default — so the caller sees both halves of the
+ * precedence at once, matching what `get_notebook_map` surfaces.
+ *
+ * Like the notebook-level display setters (and unlike the content mutations) it
+ * takes no pre-action checkpoint: it changes how a cell is displayed, not what is
+ * in it, so there is no cell state an undo would need to bring back.
+ */
+export function setHideInput(id: string, hidden: boolean | null | undefined, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	const full = asFullId(target, id);
+	if (!setHideInputDoc(full, hidden, target)) return { ok: false as const };
+	const cell = getCell(full, target);
+	const reportView = getNotebook(target).hideAllCode;
+	const explicit = cell ? hideInputExplicit(cell) : undefined;
+	return {
+		ok: true as const,
+		hide_input: explicit ?? null,
+		code_hidden: cell ? isCodeHidden(cell, reportView) : false,
+		report_view: reportView
+	};
 }
 
 // --- execute ----------------------------------------------------------------

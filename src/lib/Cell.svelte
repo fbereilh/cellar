@@ -22,6 +22,7 @@
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
 	import { isExportCell } from '$lib/exportRole';
+	import { isCodeHidden } from '$lib/hideInput';
 	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration } from '$lib/relativeTime';
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
@@ -581,8 +582,10 @@
 	// tri-state: the explicit per-cell `cellar.hide_input` wins; when unset the
 	// cell follows the notebook-wide `hideAllCode` default. The source is never
 	// touched and the cell still runs, so the `.ipynb` stays git-clean.
-	const hideInputExplicit = $derived(cell.metadata?.cellar?.hide_input);
-	const codeHidden = $derived(!isMarkdown && (hideInputExplicit ?? hideAllCode));
+	// `isCodeHidden` is the shared precedence rule (per-cell hide_input wins over
+	// the notebook-wide hideAllCode default), used identically by the HTML export
+	// and the agent map so the three surfaces cannot drift.
+	const codeHidden = $derived(isCodeHidden(cell, hideAllCode));
 	function toggleHideInput() {
 		roleMenuEl?.hidePopover();
 		onSetHideInput?.(cell.id, !codeHidden);
