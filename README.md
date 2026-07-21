@@ -201,9 +201,10 @@ project's conventions. Please also read the [Code of Conduct](CODE_OF_CONDUCT.md
 Found a security issue? Please report it privately - see **[SECURITY.md](SECURITY.md)**
 (Cellar runs an arbitrary-code-execution kernel, so this matters).
 
-There's intentionally no hand-maintained changelog - see
-[Releases](https://github.com/fbereilh/cellar/releases) for what changed in each
-version.
+See **[CHANGELOG.md](CHANGELOG.md)** for what changed in each release (it's
+generated from the git history by [git-cliff](https://git-cliff.org) - never
+hand-edited; run `make changelog` to regenerate), or the
+[Releases](https://github.com/fbereilh/cellar/releases) page.
 
 ## License
 

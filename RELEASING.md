@@ -26,7 +26,11 @@ git checkout main && git pull
 # Bump package.json and create the matching tag in one step:
 npm version patch      # or: minor | major  -> creates commit + tag vX.Y.Z
 
-# Push the commit and the tag:
+# Refresh the changelog now that the tag exists, and commit it:
+make changelog
+git add CHANGELOG.md && git commit -m "chore(changelog): vX.Y.Z"
+
+# Push the commits and the tag:
 git push --follow-tags
 ```
 
@@ -49,6 +53,36 @@ release for testing without promoting it to everyone's `brew install`.
 If a tag push didn't run (or you need to re-run the tap bump after adding
 `TAP_TOKEN`), go to **Actions -> release -> Run workflow** and enter an existing
 tag. It re-creates/refreshes the release and re-bumps the tap.
+
+## The changelog
+
+`CHANGELOG.md` is **auto-generated** from the git history by
+[git-cliff](https://git-cliff.org) (config in `cliff.toml`) - it is never
+hand-edited. Regenerate it any time with:
+
+```sh
+make changelog          # = bash scripts/gen-changelog.sh  (= npm run changelog)
+```
+
+git-cliff groups commits by their Conventional-Commit type (Features / Bug
+Fixes / Performance / …) into one dated section per release tag. git-cliff is a
+`devDependency`, so `make changelog` needs no global install; regeneration is
+deterministic (same history in, same file out).
+
+One wrinkle the script handles: a history rewrite of `main` after v0.1.0 shipped
+left the `v0.1.0` tag on a commit that is no longer an ancestor of `HEAD`, so a
+single git-cliff pass would fold the initial-development commits into v0.2.0. The
+script (`scripts/gen-changelog.sh`) generates the mainline releases and the
+v0.1.0 section in two passes and concatenates them - see its header comment.
+
+**Why regeneration is a manual release step, not CI:** refreshing the changelog
+for a new tag means committing `CHANGELOG.md` back to `main`. Doing that from the
+tag-triggered `release.yml` is fiddly and fragile - the push needs write
+credentials that clear branch protection, the tagged commit still wouldn't
+contain its own changelog entry (chicken-and-egg), and an auto-commit risks
+re-triggering CI. So the flow above regenerates + commits it as part of cutting
+the release instead. If you forget, just run `make changelog` on `main` afterward
+and commit.
 
 ## One-time setup: the `TAP_TOKEN` secret
 

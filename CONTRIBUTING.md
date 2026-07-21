@@ -69,9 +69,10 @@ npm run test:e2e
   `chore(ci): …`, `perf(dataflow): …`. Browse `git log` for the house style.
 - **PRs are squash-merged**, so the PR title becomes the commit on `main` (with the
   `(#NNN)` PR number appended). Give the PR a Conventional-Commits-style title.
-- **Don't hand-edit auto-generated files** (e.g. `CHANGELOG.md` if present, or
-  generated build info). There is intentionally no hand-maintained changelog -
-  release notes are auto-generated (see below).
+- **Don't hand-edit auto-generated files.** `CHANGELOG.md` is generated from the
+  git history by [git-cliff](https://git-cliff.org) (run `make changelog` to
+  regenerate; see below) - never edit it by hand. Your Conventional-Commits
+  commit title is what lands in it.
 - Match the surrounding code's style, comment density, and naming. Cellar's
   in-repo agent/architecture notes live in `CLAUDE.md`; skim the relevant entry
   before changing a subsystem.
