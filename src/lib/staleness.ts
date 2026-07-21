@@ -109,11 +109,18 @@ function ranThisSession(cell: StaleCell | undefined | null, sid: SessionId | nul
  * @param cells cells in document order, carrying `metadata.cellar.lastRun` + `.editedAt`
  * @param dataflow per-cell defined/used names (code cells; missing entry ⇒ no dataflow)
  * @param sid current kernel-session epoch, or null when no kernel runs
+ * @param unavailable code-cell ids whose dataflow could NOT be computed this pass
+ *   (the `ast`/`symtable` probe timed out or is backed off - see `dataflow.js`). Their
+ *   `dataflow` entry is empty, which would otherwise read as "no dependencies ⇒ fresh".
+ *   A cell we could not analyze must NEVER be certified fresh, so any such cell that ran
+ *   this session is marked `stale` outright. This is the conservative direction the
+ *   backoff design demands: a false `fresh` is the one verdict staleness must not invent.
  */
 export function computeStaleness(
 	cells: readonly StaleCell[],
 	dataflow: Dataflow | null | undefined,
-	sid: SessionId | null
+	sid: SessionId | null,
+	unavailable?: ReadonlySet<string> | null
 ): StalenessMap {
 	const df: Dataflow = dataflow || {};
 	const result: StalenessMap = {};
@@ -133,6 +140,19 @@ export function computeStaleness(
 	codeCells.forEach((cell, i) => {
 		if (!ranThisSession(cell, sid)) {
 			result[cell.id] = { state: STALE_STATE.NOT_RUN };
+			return;
+		}
+		// Analysis unavailable (probe timed out / backed off): we hold no trustworthy
+		// dataflow for this cell, so we cannot rule out a changed dependency. Mark it
+		// stale rather than let its empty dataflow read as "no deps ⇒ fresh".
+		if (unavailable?.has(cell.id)) {
+			stale[i] = true;
+			result[cell.id] = {
+				state: STALE_STATE.STALE,
+				reason: 'dependency analysis timed out; treated as stale',
+				self: false,
+				upstream: []
+			};
 			return;
 		}
 		const at = lastRunOf(cell)?.at ?? 0;
