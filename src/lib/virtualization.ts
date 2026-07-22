@@ -156,3 +156,49 @@ export function mountedIds(plan: PlanItem[]): Set<string> {
 	for (const item of plan) if (item.kind === 'cell') s.add(item.id);
 	return s;
 }
+
+/**
+ * Cumulative top offset (px) of `id` within `order`: the sum of the heights of
+ * every cell before it (measured, else estimated). Returns the total height when
+ * `id` is absent. O(index); callers invoke it only on the few near-viewport cells
+ * a ResizeObserver actually re-measures.
+ */
+export function offsetOf(id: string, order: string[], heights: Map<string, number>, estimate: (id: string) => number): number {
+	let sum = 0;
+	for (const cur of order) {
+		if (cur === id) return sum;
+		sum += heightOf(cur, heights, estimate);
+	}
+	return sum;
+}
+
+/**
+ * Scroll-stability core (report §4.2). When a cell's measured height changes from
+ * what the layout currently assumes, everything below it shifts by the delta. If
+ * that cell sits ABOVE the viewport's top edge, the shift moves the visible content
+ * — a jump — so the caller must add this delta to `scrollTop` (in the same frame,
+ * before paint) to keep the viewport anchored. A change at or below the viewport top
+ * only moves off-screen content, so it returns 0 (no correction, no double-count
+ * with native `overflow-anchor`).
+ *
+ * `prior` is read from the SAME `heights`/`estimate` the spacer or mounted card was
+ * laid out with, so the delta is exactly the DOM shift. Pure ⇒ unit-testable with no
+ * DOM (the report's "spacer deltas at the controller level").
+ */
+export function scrollCompensation(args: {
+	id: string;
+	newHeight: number;
+	order: string[];
+	heights: Map<string, number>;
+	estimate: (id: string) => number;
+	viewportTop: number;
+}): number {
+	const { id, newHeight, order, heights, estimate, viewportTop } = args;
+	// Nothing is above a viewport pinned to the very top; skip the offset walk.
+	if (viewportTop <= 0) return 0;
+	const prior = heightOf(id, heights, estimate);
+	const delta = newHeight - prior;
+	if (delta === 0) return 0;
+	const top = offsetOf(id, order, heights, estimate);
+	return top < viewportTop ? delta : 0;
+}
