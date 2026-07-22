@@ -954,7 +954,10 @@
 			const res = await fetch('/api/kernel/variables');
 			const body = await res.json();
 			if (!res.ok) throw new Error(body?.message || 'inspect failed');
-			variables = body.variables;
+			// `busy` means the kernel was running a cell, so the server skipped the probe
+			// (an internal probe must never queue behind a run). Keep the variables we
+			// already show rather than clearing them; the next idle refresh updates them.
+			if (!body.busy) variables = body.variables;
 		} catch (err) {
 			varsError = String((err as Error)?.message ?? err);
 		} finally {

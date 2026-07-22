@@ -223,19 +223,39 @@ async function runProbe(nbPath?: string | null): Promise<{ session: SessionId | 
 }
 
 /**
- * Sidebar variable inspector: the data-variable list only, in the original
- * `{ name, type, shape, preview }` shape (unchanged for the existing UI).
+ * Sidebar variable inspector: the data-variable list in the original
+ * `{ name, type, shape, preview }` shape, wrapped as `{ variables, busy? }`.
+ *
+ * Skips the probe while the kernel is busy (or a run holds the queue), returning
+ * `busy: true` and no list so the sidebar keeps what it already shows. This is
+ * load-bearing, not just an optimization: every `execute()` now serializes on the
+ * kernel's exec lock (see `kernel.ts`), so a probe issued while a cell runs would
+ * WAIT for that cell — and the sidebar refreshes after EVERY run, so during a Run
+ * all that would interleave one probe between each cell, doubling the round-trips
+ * and defeating the whole point of internal probes never queuing behind a run. The
+ * short-circuit restores that non-blocking contract; the lock still guarantees
+ * correctness if a run starts in the check-then-act window (they can't collide).
+ * Mirrors `kernelState`'s guard, including the queue's own `running` truth (jupyter's
+ * idle→busy flip lags the synchronous dequeue).
  */
-export async function inspectVariables(): Promise<
-	Array<{ name: string; type: string; shape: string; preview: string }>
-> {
+export async function inspectVariables(): Promise<{
+	variables: Array<{ name: string; type: string; shape: string; preview: string }>;
+	busy?: boolean;
+}> {
+	const nbPath = getActiveNotebookPath();
+	const status = kernelStatus(nbPath).status;
+	if (status === 'not_started') return { variables: [] };
+	if (status === 'busy' || queueStateFor(resolveNotebookPath(nbPath)).running != null)
+		return { variables: [], busy: true };
 	const state = await runProbe();
-	return (state.variables || []).map(({ name, type, shape, preview }) => ({
-		name,
-		type,
-		shape,
-		preview
-	}));
+	return {
+		variables: (state.variables || []).map(({ name, type, shape, preview }) => ({
+			name,
+			type,
+			shape,
+			preview
+		}))
+	};
 }
 
 /**
