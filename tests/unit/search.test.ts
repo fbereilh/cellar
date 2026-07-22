@@ -10,19 +10,70 @@ import { describe, it, expect, vi } from 'vitest';
 import {
 	searchNotebook,
 	groupByCell,
+	dedupeMatchesForDisplay,
 	createSearchCache,
 	contentSignature,
+	strippedMarkdown,
+	SEARCH_SCAN_CAP,
 	DEFAULT_SEARCH_OPTS,
 	type SearchOpts
 } from '../../src/lib/search';
+import type { CellOutput } from '../../src/lib/server/types';
 
 interface TCell {
 	id: string;
 	cell_type: string;
 	source: string;
+	outputs?: CellOutput[];
 }
 const cell = (id: string, source: string, cell_type = 'code'): TCell => ({ id, cell_type, source });
-const opts = (o: Partial<SearchOpts> = {}): SearchOpts => ({ ...DEFAULT_SEARCH_OPTS, ...o });
+// P1 default was source-only; keep these unit tests deterministic against the
+// engine's *source* behavior by pinning scope:'source' unless a case opts into 'all'.
+const opts = (o: Partial<SearchOpts> = {}): SearchOpts => ({
+	...DEFAULT_SEARCH_OPTS,
+	scope: 'source',
+	...o
+});
+const allOpts = (o: Partial<SearchOpts> = {}): SearchOpts => ({
+	...DEFAULT_SEARCH_OPTS,
+	scope: 'all',
+	...o
+});
+
+// nbformat output builders for the P2 coverage tests.
+const streamOut = (text: string, name = 'stdout'): CellOutput => ({
+	output_type: 'stream',
+	name,
+	text
+});
+const resultOut = (text: string): CellOutput => ({
+	output_type: 'execute_result',
+	data: { 'text/plain': text },
+	metadata: {},
+	execution_count: 1
+});
+const errorOut = (ename: string, evalue: string, traceback: string[]): CellOutput => ({
+	output_type: 'error',
+	ename,
+	evalue,
+	traceback
+});
+const dataframeOut = (columns: string[], data: unknown[][]): CellOutput => ({
+	output_type: 'execute_result',
+	data: {
+		'application/vnd.cellar.dataframe+json': {
+			columns,
+			dtypes: columns.map(() => 'object'),
+			index: data.map((_, i) => i),
+			index_name: '',
+			data,
+			total_rows: data.length,
+			total_cols: columns.length
+		}
+	},
+	metadata: {},
+	execution_count: 1
+});
 
 describe('searchNotebook - basics', () => {
 	it('returns [] for an empty query', () => {
@@ -136,13 +187,15 @@ describe('searchNotebook - cache invalidation', () => {
 		expect(cache.get('a')).toBe(entry1); // identical object => lowercased buffer reused
 	});
 
-	it('rebuilds the cache entry when a cell edits (content signature changes)', () => {
+	it('rebuilds the cached buffer when a cell edits (content signature changes)', () => {
 		const cache = createSearchCache();
-		searchNotebook([cell('a', 'version one')], 'one', DEFAULT_SEARCH_OPTS, cache);
-		const entry1 = cache.get('a');
-		// Same id, edited source -> new signature -> fresh entry.
-		searchNotebook([cell('a', 'version two')], 'two', DEFAULT_SEARCH_OPTS, cache);
-		expect(cache.get('a')).not.toBe(entry1);
+		// The old query must no longer match after the edit, and the new one must.
+		expect(searchNotebook([cell('a', 'version one')], 'one', DEFAULT_SEARCH_OPTS, cache)).toHaveLength(1);
+		// Same id, edited source -> new signature -> the source buffer is rebuilt in
+		// place (the entry object is reused so the independent outputs cache survives
+		// a source-only edit; see the output-cache-invalidation tests).
+		expect(searchNotebook([cell('a', 'version two')], 'two', DEFAULT_SEARCH_OPTS, cache)).toHaveLength(1);
+		expect(searchNotebook([cell('a', 'version two')], 'one', DEFAULT_SEARCH_OPTS, cache)).toHaveLength(0);
 	});
 
 	it('lowercases the source once per content change, not per keystroke', () => {
@@ -197,10 +250,310 @@ describe('contentSignature', () => {
 describe('groupByCell', () => {
 	it('groups matches by cell in first-occurrence (document) order with counts', () => {
 		const cells = [cell('a', 'foo'), cell('b', 'foo foo'), cell('c', 'nope')];
-		const m = searchNotebook(cells, 'foo');
+		const m = searchNotebook(cells, 'foo', opts());
 		const groups = groupByCell(m, (id) => cells.find((c) => c.id === id)!.cell_type);
 		expect(groups.map((g) => g.cellId)).toEqual(['a', 'b']);
 		expect(groups.map((g) => g.count)).toEqual([1, 2]);
 		expect(groups[0].snippet).toBe('foo');
+		expect(groups[0].field).toBe('source');
+	});
+});
+
+// ---- P2: coverage (outputs + rendered markdown, capped, scope toggle) ----------
+
+describe('scope: default is all (source + markdown + outputs)', () => {
+	it('DEFAULT_SEARCH_OPTS.scope is "all"', () => {
+		expect(DEFAULT_SEARCH_OPTS.scope).toBe('all');
+	});
+});
+
+describe('searchNotebook - output coverage (scope:all)', () => {
+	it('finds a match in a printed stream value', () => {
+		const cells: TCell[] = [
+			{ id: 'a', cell_type: 'code', source: 'print(x)', outputs: [streamOut('the answer is 42\n')] }
+		];
+		const m = searchNotebook(cells, 'answer', allOpts());
+		expect(m).toHaveLength(1);
+		expect(m[0]).toMatchObject({ cellId: 'a', field: 'output', outputIndex: 0 });
+		expect(m[0].snippet).toContain('answer');
+	});
+
+	it('finds a match in an execute_result text/plain repr', () => {
+		const cells: TCell[] = [
+			{ id: 'a', cell_type: 'code', source: 'x', outputs: [resultOut("'hello world'")] }
+		];
+		const m = searchNotebook(cells, 'world', allOpts());
+		expect(m).toHaveLength(1);
+		expect(m[0].field).toBe('output');
+	});
+
+	it('finds a match in an error message / traceback (ANSI stripped)', () => {
+		const cells: TCell[] = [
+			{
+				id: 'a',
+				cell_type: 'code',
+				source: 'boom()',
+				outputs: [
+					errorOut('ValueError', 'bad thing happened', [
+						'[0;31mTraceback (most recent call last)[0m',
+						'[0;31mValueError[0m: bad thing happened'
+					])
+				]
+			}
+		];
+		const m = searchNotebook(cells, 'bad thing', allOpts());
+		expect(m.length).toBeGreaterThanOrEqual(1);
+		expect(m[0].field).toBe('output');
+		// The ANSI escape must not leak into the searchable text.
+		expect(m.some((x) => x.snippet.includes(''))).toBe(false);
+	});
+
+	it('finds a match inside a DataFrame cell value (structured payload)', () => {
+		const cells: TCell[] = [
+			{
+				id: 'a',
+				cell_type: 'code',
+				source: 'df',
+				outputs: [dataframeOut(['name', 'city'], [['alice', 'berlin'], ['bob', 'tokyo']])]
+			}
+		];
+		expect(searchNotebook(cells, 'berlin', allOpts())).toHaveLength(1);
+		expect(searchNotebook(cells, 'city', allOpts()).some((x) => x.field === 'output')).toBe(true);
+	});
+
+	it('tags matches with their output index across multiple outputs', () => {
+		const cells: TCell[] = [
+			{
+				id: 'a',
+				cell_type: 'code',
+				source: 'x',
+				outputs: [streamOut('needle here\n'), resultOut('another needle')]
+			}
+		];
+		const m = searchNotebook(cells, 'needle', allOpts());
+		expect(m.map((x) => x.outputIndex)).toEqual([0, 1]);
+	});
+
+	it('scope:source ignores outputs entirely (P1 behavior preserved)', () => {
+		const cells: TCell[] = [
+			{ id: 'a', cell_type: 'code', source: 'x', outputs: [streamOut('answer 42\n')] }
+		];
+		expect(searchNotebook(cells, 'answer', opts())).toEqual([]);
+		expect(searchNotebook(cells, 'answer', allOpts())).toHaveLength(1);
+	});
+
+	it('does not match rich non-text output (no text/plain fallback)', () => {
+		const image: CellOutput = {
+			output_type: 'display_data',
+			data: { 'image/png': 'iVBORencodedbytes' },
+			metadata: {}
+		};
+		const cells: TCell[] = [{ id: 'a', cell_type: 'code', source: 'plot', outputs: [image] }];
+		expect(searchNotebook(cells, 'encodedbytes', allOpts())).toEqual([]);
+	});
+});
+
+describe('searchNotebook - rendered-markdown coverage (scope:all)', () => {
+	it('finds a heading word even though the source has ## syntax', () => {
+		const cells = [cell('a', '## Setup Instructions', 'markdown')];
+		const m = searchNotebook(cells, 'Setup', allOpts());
+		// One match in raw source, one in the rendered-markdown text.
+		expect(m.map((x) => x.field).sort()).toEqual(['markdown', 'source']);
+	});
+
+	it('finds a link/emphasis word that is hidden by md syntax in source', () => {
+		// "docs" is the visible link text; the query has no md punctuation so it only
+		// matches the rendered text, not the raw `[docs](http://x)`.
+		const cells = [cell('a', 'see the [docs](http://example.com) now', 'markdown')];
+		const m = searchNotebook(cells, 'docs', allOpts());
+		expect(m.some((x) => x.field === 'markdown')).toBe(true);
+	});
+
+	it('scope:source only searches raw markdown source', () => {
+		const cells = [cell('a', '## Setup', 'markdown')];
+		const m = searchNotebook(cells, 'Setup', opts());
+		expect(m).toHaveLength(1);
+		expect(m[0].field).toBe('source');
+	});
+});
+
+describe('dedupeMatchesForDisplay (user-facing counts)', () => {
+	const countFor = (matches: ReturnType<typeof searchNotebook>) =>
+		dedupeMatchesForDisplay(matches).length;
+
+	it('a plain-prose markdown cell reports N, not 2N', () => {
+		const cells = [cell('a', 'Setup the setup then Setup again', 'markdown')];
+		const raw = searchNotebook(cells, 'setup', allOpts());
+		// Scanned in both source and markdown, so the raw list double-counts.
+		expect(raw.filter((m) => m.field === 'source')).toHaveLength(3);
+		expect(raw.filter((m) => m.field === 'markdown')).toHaveLength(3);
+		// Deduped for display: one per visible occurrence.
+		expect(countFor(raw)).toBe(3);
+	});
+
+	it('a heading word counts once', () => {
+		const cells = [cell('a', '## Setup', 'markdown')];
+		const raw = searchNotebook(cells, 'Setup', allOpts());
+		expect(raw.length).toBe(2); // source + markdown
+		expect(countFor(raw)).toBe(1);
+	});
+
+	it('a URL-only match inside a markdown link still counts', () => {
+		const cells = [cell('a', 'see [docs](http://setup.example.com)', 'markdown')];
+		const raw = searchNotebook(cells, 'setup', allOpts());
+		// Only the raw source has "setup" (inside the stripped-away URL).
+		expect(raw.map((m) => m.field)).toEqual(['source']);
+		expect(countFor(raw)).toBe(1);
+	});
+
+	it('a visible word plus a URL occurrence both count', () => {
+		const cells = [cell('a', 'about [setup](http://setup.example.com)', 'markdown')];
+		const raw = searchNotebook(cells, 'setup', allOpts());
+		// source: link text + URL = 2; markdown (rendered "about setup"): 1 visible.
+		expect(raw.filter((m) => m.field === 'source')).toHaveLength(2);
+		expect(raw.filter((m) => m.field === 'markdown')).toHaveLength(1);
+		// One visible occurrence + one URL-only occurrence.
+		expect(countFor(raw)).toBe(2);
+	});
+
+	it('a rendered occurrence with no source counterpart survives (a*b*c -> abc)', () => {
+		const cells = [cell('a', 'a*b*c', 'markdown')];
+		const raw = searchNotebook(cells, 'abc', allOpts());
+		// The word only appears once the emphasis markers are stripped.
+		expect(raw.map((m) => m.field)).toEqual(['markdown']);
+		expect(countFor(raw)).toBe(1);
+	});
+
+	it('leaves code-cell source + output counts unaffected', () => {
+		const cells: TCell[] = [
+			{ id: 'a', cell_type: 'code', source: 'df', outputs: [streamOut('df result df')] }
+		];
+		const raw = searchNotebook(cells, 'df', allOpts());
+		const deduped = dedupeMatchesForDisplay(raw);
+		expect(deduped).toHaveLength(raw.length);
+		expect(deduped).toEqual(raw);
+	});
+
+	it('is a no-op (copy) when there are no markdown matches', () => {
+		const cells = [cell('a', 'setup setup', 'code')];
+		const raw = searchNotebook(cells, 'setup', allOpts());
+		const deduped = dedupeMatchesForDisplay(raw);
+		expect(deduped).toEqual(raw);
+		expect(deduped).not.toBe(raw);
+	});
+});
+
+describe('strippedMarkdown', () => {
+	it('strips headings, emphasis, links, code, and list markers', () => {
+		expect(strippedMarkdown('## Setup').trim()).toBe('Setup');
+		expect(strippedMarkdown('**bold** and *italic*')).toBe('bold and italic');
+		expect(strippedMarkdown('[docs](http://x)')).toBe('docs');
+		expect(strippedMarkdown('![alt text](img.png)')).toBe('alt text');
+		expect(strippedMarkdown('use `pd.read_csv`')).toBe('use pd.read_csv');
+		expect(strippedMarkdown('- item one').trim()).toBe('item one');
+		expect(strippedMarkdown('1. first').trim()).toBe('first');
+		expect(strippedMarkdown('> a quote').trim()).toBe('a quote');
+	});
+});
+
+describe('searchNotebook - per-cell output cap', () => {
+	it('scans a giant output only up to SEARCH_SCAN_CAP', () => {
+		// A needle placed just past the cap is NOT found; one just before it is.
+		const filler = 'a'.repeat(SEARCH_SCAN_CAP + 500);
+		const before = filler.slice(0, SEARCH_SCAN_CAP - 10) + 'NEEDLE' + filler.slice(SEARCH_SCAN_CAP - 4);
+		const past = 'x'.repeat(SEARCH_SCAN_CAP + 100) + 'BEYOND';
+		const cells: TCell[] = [
+			{ id: 'a', cell_type: 'code', source: 's', outputs: [streamOut(before)] },
+			{ id: 'b', cell_type: 'code', source: 's', outputs: [streamOut(past)] }
+		];
+		expect(searchNotebook(cells, 'NEEDLE', allOpts())).toHaveLength(1);
+		expect(searchNotebook(cells, 'BEYOND', allOpts())).toEqual([]);
+	});
+
+	it('caps across multiple outputs of one cell (total, not per-output)', () => {
+		const big = 'y'.repeat(SEARCH_SCAN_CAP);
+		const cells: TCell[] = [
+			{ id: 'a', cell_type: 'code', source: 's', outputs: [streamOut(big), streamOut('TAIL')] }
+		];
+		// The first output already fills the cap, so the second is never scanned.
+		expect(searchNotebook(cells, 'TAIL', allOpts())).toEqual([]);
+	});
+});
+
+describe('searchNotebook - output cache invalidation (scope:all)', () => {
+	it('rebuilds the output cache when the outputs array is reassigned (element identity changes)', () => {
+		const cache = createSearchCache();
+		const outs1 = [streamOut('alpha beta')];
+		const c1: TCell = { id: 'a', cell_type: 'code', source: 's', outputs: outs1 };
+		// First scan extracts + lowercases the outputs once.
+		searchNotebook([c1], 'alpha', allOpts(), cache);
+		const built1 = cache.get('a')!;
+		// A different query over the SAME outputs array reuses the extracted text.
+		const spy = vi.spyOn(String.prototype, 'toLowerCase');
+		try {
+			searchNotebook([c1], 'beta', allOpts(), cache);
+			// Only the query is lowercased on a hit (outputs text reused).
+			const hitCalls = spy.mock.calls.length;
+			expect(hitCalls).toBe(1);
+			// Re-running the cell (a NEW outputs array) forces re-extraction.
+			const c2: TCell = { id: 'a', cell_type: 'code', source: 's', outputs: [streamOut('gamma')] };
+			spy.mock.calls.length = 0;
+			searchNotebook([c2], 'gamma', allOpts(), cache);
+			// query + the new output text = 2 lowercases.
+			expect(spy.mock.calls.length).toBe(2);
+		} finally {
+			spy.mockRestore();
+		}
+		expect(built1).toBe(cache.get('a')); // same entry object, output slot swapped in place
+	});
+
+	it('reflects in-place outputs mutation (LiveNotebook grows/rewrites the same array)', () => {
+		const cache = createSearchCache();
+		// LiveNotebook sets cell.outputs = [] on run:start, then mutates that SAME
+		// array in place: applyOutput assigns a fresh element at an index, and
+		// applyOutputAppend spreads into a fresh element - the array ref never changes.
+		const outs: CellOutput[] = [streamOut('partial snapshot')];
+		const cell: TCell = { id: 'a', cell_type: 'code', source: 's', outputs: outs };
+		searchNotebook([cell], 'partial', allOpts(), cache);
+
+		// Grow the array in place (a later stream element lands).
+		outs.push(streamOut('appended text'));
+		expect(
+			searchNotebook([cell], 'appended', allOpts(), cache).some((m) => m.field === 'output')
+		).toBe(true);
+
+		// Rewrite an existing element in place (applyOutputAppend swaps the object).
+		outs[0] = streamOut('rewritten value');
+		expect(
+			searchNotebook([cell], 'rewritten', allOpts(), cache).some((m) => m.field === 'output')
+		).toBe(true);
+		// The now-stale text is gone.
+		expect(searchNotebook([cell], 'partial', allOpts(), cache)).toEqual([]);
+	});
+
+	it('editing source does not re-extract unchanged outputs', () => {
+		const cache = createSearchCache();
+		const outs = [streamOut('printed value')];
+		searchNotebook(
+			[{ id: 'a', cell_type: 'code', source: 'x = 1', outputs: outs }],
+			'value',
+			allOpts(),
+			cache
+		);
+		const spy = vi.spyOn(String.prototype, 'toLowerCase');
+		try {
+			// Same outputs array reference, edited source.
+			searchNotebook(
+				[{ id: 'a', cell_type: 'code', source: 'x = 2', outputs: outs }],
+				'value',
+				allOpts(),
+				cache
+			);
+			// query (1) + the edited source re-lowercase (1) = 2; the output text is NOT
+			// re-lowercased (its array identity is unchanged).
+			expect(spy.mock.calls.length).toBe(2);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 });

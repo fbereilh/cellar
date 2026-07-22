@@ -9,7 +9,13 @@
 	import { isOverKernelCap } from '$lib/kernelCap';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
 	import { outlineRows as buildOutlineRows, sectionRunState, headingNumberPrefix } from '$lib/headings';
-	import { searchNotebook, groupByCell, createSearchCache, DEFAULT_SEARCH_OPTS } from '$lib/search';
+	import {
+		searchNotebook,
+		groupByCell,
+		dedupeMatchesForDisplay,
+		createSearchCache,
+		DEFAULT_SEARCH_OPTS
+	} from '$lib/search';
 	import type { SearchCache } from '$lib/search';
 	import { getUi, setUi } from '$lib/uiState';
 	import { makeIgnoredMatcher } from '$lib/gitIgnored';
@@ -592,6 +598,11 @@
 	// instead of re-folding it.
 	let query = $state('');
 	let debouncedQuery = $state('');
+	// Scope toggle: 'all' (source + rendered markdown + outputs, the default per
+	// the captain's Q1 decision - Search covers what the user sees) or 'source'
+	// (raw code/markdown source only, P1 behavior).
+	let searchScope = $state<'all' | 'source'>('all');
+	const searchOpts = $derived({ ...DEFAULT_SEARCH_OPTS, scope: searchScope });
 	// A private cache used until the active notebook registers its own (or when a
 	// plain file tab is focused and there is no live notebook cache).
 	const fallbackSearchCache = createSearchCache();
@@ -607,16 +618,21 @@
 	});
 	const searchMatches = $derived(
 		debouncedQuery
-			? searchNotebook(cells, debouncedQuery, DEFAULT_SEARCH_OPTS, searchCache ?? fallbackSearchCache)
+			? searchNotebook(cells, debouncedQuery, searchOpts, searchCache ?? fallbackSearchCache)
 			: []
 	);
-	const totalMatches = $derived(searchMatches.length);
+	// A markdown cell is scanned in both raw source and rendered markdown for later
+	// per-surface highlighting, so collapse the coinciding pair to one visible
+	// occurrence before COUNTING (the raw match list is left untouched for callers
+	// that highlight both surfaces).
+	const displayMatches = $derived(dedupeMatchesForDisplay(searchMatches));
+	const totalMatches = $derived(displayMatches.length);
 	// One row per matching cell (navigation is to the cell), in document order,
 	// each carrying its own match count.
 	const matchGroups = $derived.by(() => {
-		if (!searchMatches.length) return [];
+		if (!displayMatches.length) return [];
 		const typeOf = new Map(cells.map((c) => [c.id, c.cell_type]));
-		return groupByCell(searchMatches, (id) => typeOf.get(id) ?? 'code');
+		return groupByCell(displayMatches, (id) => typeOf.get(id) ?? 'code');
 	});
 
 	// ---- Connect an agent (zero-config MCP) ---------------------------------
@@ -1353,6 +1369,22 @@
 				<svg class="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></svg>
 				<input type="text" class="grow text-xs" placeholder="search cells…" bind:value={query} data-testid="search-input" />
 			</label>
+			<div class="mt-1.5 flex items-center gap-1" role="group" aria-label="Search scope" data-testid="search-scope">
+				<button
+					class="btn btn-xs {searchScope === 'all' ? 'btn-primary' : 'btn-ghost'}"
+					aria-pressed={searchScope === 'all'}
+					title="Search source, rendered markdown, and outputs"
+					onclick={() => (searchScope = 'all')}
+					data-testid="search-scope-all">All</button
+				>
+				<button
+					class="btn btn-xs {searchScope === 'source' ? 'btn-primary' : 'btn-ghost'}"
+					aria-pressed={searchScope === 'source'}
+					title="Search code/markdown source only"
+					onclick={() => (searchScope = 'source')}
+					data-testid="search-scope-source">Source</button
+				>
+			</div>
 			{#if debouncedQuery}
 				<p class="px-1 pt-2 text-[11px] text-base-content/40" data-testid="search-count">
 					{totalMatches} match{totalMatches === 1 ? '' : 'es'}{matchGroups.length
