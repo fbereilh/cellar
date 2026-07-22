@@ -156,7 +156,7 @@ async function forceOverlayScrollbars(page: Page): Promise<void> {
  * visible in the screenshots. Returns a cleanup that removes the marker.
  */
 async function annotateGutter(page: Page, scrollBox: Locator, label: string): Promise<() => Promise<void>> {
-	const id = await scrollBox.evaluate((el, text) => {
+	const id = await scrollBox.evaluate((el: HTMLElement, text) => {
 		const r = el.getBoundingClientRect();
 		const w = el.offsetWidth - el.clientWidth;
 		const mark = document.createElement('div');
@@ -208,7 +208,7 @@ async function toggleVsGutter(
 	scrollBox: Locator,
 	toggle: Locator
 ): Promise<{ scrollbarW: number; gapToGutter: number; toggleRightEdge: number; gutterLeft: number }> {
-	const box = await scrollBox.evaluate((el) => {
+	const box = await scrollBox.evaluate((el: HTMLElement) => {
 		const r = el.getBoundingClientRect();
 		return { right: r.right, scrollbarW: el.offsetWidth - el.clientWidth };
 	});
