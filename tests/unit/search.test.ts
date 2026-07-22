@@ -10,6 +10,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
 	searchNotebook,
 	groupByCell,
+	dedupeMatchesForDisplay,
 	createSearchCache,
 	contentSignature,
 	strippedMarkdown,
@@ -373,6 +374,72 @@ describe('searchNotebook - rendered-markdown coverage (scope:all)', () => {
 		const m = searchNotebook(cells, 'Setup', opts());
 		expect(m).toHaveLength(1);
 		expect(m[0].field).toBe('source');
+	});
+});
+
+describe('dedupeMatchesForDisplay (user-facing counts)', () => {
+	const countFor = (matches: ReturnType<typeof searchNotebook>) =>
+		dedupeMatchesForDisplay(matches).length;
+
+	it('a plain-prose markdown cell reports N, not 2N', () => {
+		const cells = [cell('a', 'Setup the setup then Setup again', 'markdown')];
+		const raw = searchNotebook(cells, 'setup', allOpts());
+		// Scanned in both source and markdown, so the raw list double-counts.
+		expect(raw.filter((m) => m.field === 'source')).toHaveLength(3);
+		expect(raw.filter((m) => m.field === 'markdown')).toHaveLength(3);
+		// Deduped for display: one per visible occurrence.
+		expect(countFor(raw)).toBe(3);
+	});
+
+	it('a heading word counts once', () => {
+		const cells = [cell('a', '## Setup', 'markdown')];
+		const raw = searchNotebook(cells, 'Setup', allOpts());
+		expect(raw.length).toBe(2); // source + markdown
+		expect(countFor(raw)).toBe(1);
+	});
+
+	it('a URL-only match inside a markdown link still counts', () => {
+		const cells = [cell('a', 'see [docs](http://setup.example.com)', 'markdown')];
+		const raw = searchNotebook(cells, 'setup', allOpts());
+		// Only the raw source has "setup" (inside the stripped-away URL).
+		expect(raw.map((m) => m.field)).toEqual(['source']);
+		expect(countFor(raw)).toBe(1);
+	});
+
+	it('a visible word plus a URL occurrence both count', () => {
+		const cells = [cell('a', 'about [setup](http://setup.example.com)', 'markdown')];
+		const raw = searchNotebook(cells, 'setup', allOpts());
+		// source: link text + URL = 2; markdown (rendered "about setup"): 1 visible.
+		expect(raw.filter((m) => m.field === 'source')).toHaveLength(2);
+		expect(raw.filter((m) => m.field === 'markdown')).toHaveLength(1);
+		// One visible occurrence + one URL-only occurrence.
+		expect(countFor(raw)).toBe(2);
+	});
+
+	it('a rendered occurrence with no source counterpart survives (a*b*c -> abc)', () => {
+		const cells = [cell('a', 'a*b*c', 'markdown')];
+		const raw = searchNotebook(cells, 'abc', allOpts());
+		// The word only appears once the emphasis markers are stripped.
+		expect(raw.map((m) => m.field)).toEqual(['markdown']);
+		expect(countFor(raw)).toBe(1);
+	});
+
+	it('leaves code-cell source + output counts unaffected', () => {
+		const cells: TCell[] = [
+			{ id: 'a', cell_type: 'code', source: 'df', outputs: [streamOut('df result df')] }
+		];
+		const raw = searchNotebook(cells, 'df', allOpts());
+		const deduped = dedupeMatchesForDisplay(raw);
+		expect(deduped).toHaveLength(raw.length);
+		expect(deduped).toEqual(raw);
+	});
+
+	it('is a no-op (copy) when there are no markdown matches', () => {
+		const cells = [cell('a', 'setup setup', 'code')];
+		const raw = searchNotebook(cells, 'setup', allOpts());
+		const deduped = dedupeMatchesForDisplay(raw);
+		expect(deduped).toEqual(raw);
+		expect(deduped).not.toBe(raw);
 	});
 });
 

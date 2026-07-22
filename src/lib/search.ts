@@ -323,7 +323,7 @@ function isWordChar(ch: string): boolean {
 
 /**
  * The trimmed, capped snippet for a match, given the start of its line
- * (`lineStart`, tracked by {@link scanField} in O(1)) and the match offset `idx`.
+ * (`lineStart`, tracked by {@link scanField} in O(1)).
  *
  * Bounded: it reads at most `SNIPPET_CAP + a little` characters from `lineStart`,
  * so a pathologically long single line (e.g. a 100k-char output on one line with
@@ -331,8 +331,8 @@ function isWordChar(ch: string): boolean {
  * it stops at the first newline, then trims and caps - identical output to a
  * whole-line read for any realistic line, at O(SNIPPET_CAP) per match.
  */
-function snippetFrom(source: string, lineStart: number, idx: number): string {
-	const hardEnd = Math.min(source.length, Math.max(idx, lineStart) + SNIPPET_CAP + 64);
+function snippetFrom(source: string, lineStart: number): string {
+	const hardEnd = Math.min(source.length, lineStart + SNIPPET_CAP + 64);
 	const win = source.slice(lineStart, hardEnd);
 	const nl = win.indexOf('\n');
 	return (nl === -1 ? win : win.slice(0, nl)).trim().slice(0, SNIPPET_CAP);
@@ -388,7 +388,7 @@ function scanField(
 			start: idx,
 			end,
 			line,
-			snippet: snippetFrom(orig, lineStart, idx)
+			snippet: snippetFrom(orig, lineStart)
 		});
 		from = end > idx ? end : idx + 1;
 	}
@@ -456,6 +456,52 @@ export function searchNotebook(
 		}
 	}
 	return matches;
+}
+
+/**
+ * Collapse the per-visible-occurrence double-count that {@link searchNotebook}
+ * emits for markdown cells, for USER-FACING counts only (sidebar total + per-cell
+ * badges). A markdown cell is scanned in BOTH its raw `source` and its rendered
+ * `markdown` text (kept that way for later per-surface highlighting), so plain
+ * prose - where the rendered text equals the source - matches every occurrence
+ * twice. To a user that is one visible occurrence, so this drops the coinciding
+ * `source` match and keeps the `markdown` one.
+ *
+ * Coincidence is by occurrence ORDINAL within each field: the k-th `source` match
+ * pairs with the k-th `markdown` match (the matched text is the query for every
+ * match, so the ordinal is the only distinguishing key). Dropping those paired
+ * `source` matches leaves `max(sourceCount, markdownCount)` per cell - exactly the
+ * visible-occurrence count plus any `source`-only extra (a query hidden in a link
+ * URL that the rendered text strips away, which stays counted). The rendered text
+ * only ever REMOVES characters from source, so a rendered occurrence with no
+ * source counterpart (e.g. `a*b*c` -> `abc`) survives via the leftover, unpaired
+ * `markdown` matches. Code cells (no `markdown` field) are returned untouched, so
+ * source + output counts are unaffected. Pure; preserves document order.
+ */
+export function dedupeMatchesForDisplay(matches: readonly Match[]): Match[] {
+	let anyMarkdown = false;
+	const markdownCountByCell = new Map<string, number>();
+	for (const m of matches)
+		if (m.field === 'markdown') {
+			anyMarkdown = true;
+			markdownCountByCell.set(m.cellId, (markdownCountByCell.get(m.cellId) ?? 0) + 1);
+		}
+	if (!anyMarkdown) return matches.slice();
+
+	const sourceSeen = new Map<string, number>();
+	const out: Match[] = [];
+	for (const m of matches) {
+		if (m.field === 'source') {
+			const md = markdownCountByCell.get(m.cellId) ?? 0;
+			if (md > 0) {
+				const k = sourceSeen.get(m.cellId) ?? 0;
+				sourceSeen.set(m.cellId, k + 1);
+				if (k < md) continue; // pairs with the k-th markdown match: one visible occurrence
+			}
+		}
+		out.push(m);
+	}
+	return out;
 }
 
 /** One cell's search summary: the first match's snippet + its total match count, in document order. */

@@ -9,7 +9,13 @@
 	import { isOverKernelCap } from '$lib/kernelCap';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
 	import { outlineRows as buildOutlineRows, sectionRunState, headingNumberPrefix } from '$lib/headings';
-	import { searchNotebook, groupByCell, createSearchCache, DEFAULT_SEARCH_OPTS } from '$lib/search';
+	import {
+		searchNotebook,
+		groupByCell,
+		dedupeMatchesForDisplay,
+		createSearchCache,
+		DEFAULT_SEARCH_OPTS
+	} from '$lib/search';
 	import type { SearchCache } from '$lib/search';
 	import { getUi, setUi } from '$lib/uiState';
 	import { makeIgnoredMatcher } from '$lib/gitIgnored';
@@ -615,13 +621,18 @@
 			? searchNotebook(cells, debouncedQuery, searchOpts, searchCache ?? fallbackSearchCache)
 			: []
 	);
-	const totalMatches = $derived(searchMatches.length);
+	// A markdown cell is scanned in both raw source and rendered markdown for later
+	// per-surface highlighting, so collapse the coinciding pair to one visible
+	// occurrence before COUNTING (the raw match list is left untouched for callers
+	// that highlight both surfaces).
+	const displayMatches = $derived(dedupeMatchesForDisplay(searchMatches));
+	const totalMatches = $derived(displayMatches.length);
 	// One row per matching cell (navigation is to the cell), in document order,
 	// each carrying its own match count.
 	const matchGroups = $derived.by(() => {
-		if (!searchMatches.length) return [];
+		if (!displayMatches.length) return [];
 		const typeOf = new Map(cells.map((c) => [c.id, c.cell_type]));
-		return groupByCell(searchMatches, (id) => typeOf.get(id) ?? 'code');
+		return groupByCell(displayMatches, (id) => typeOf.get(id) ?? 'code');
 	});
 
 	// ---- Connect an agent (zero-config MCP) ---------------------------------
