@@ -17,7 +17,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
-	import { getUi, setUi } from '$lib/uiState';
+	import { getUi, setUi, setUiNow } from '$lib/uiState';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -118,51 +118,103 @@
 		loadStatus();
 	}
 
-	// ---- Databricks-runtime toggle (advertise DATABRICKS_RUNTIME_VERSION) -----
+	// ---- Databricks-runtime card (advertise DATABRICKS_RUNTIME_VERSION) --------
 	// Sets DATABRICKS_RUNTIME_VERSION in the kernel at start so a notebook's
 	// import-time `IS_DATABRICKS` gate takes its `dbutils.widgets` path. Persisted
 	// per workspace (server keys mirrored from `$lib/server/databricksRuntime.ts` -
-	// a client component can't import a `$lib/server` module). Applies at kernel
-	// START only (the gate is import-time), so toggling shows a "restart to apply"
-	// hint rather than acting live. Default ON - scoped server-side to a CONNECTED
-	// notebook, so a purely-local kernel is never told it is on Databricks.
+	// a client component can't import a `$lib/server` module). The gate is
+	// import-time, so a change takes effect only on the next kernel START; rather
+	// than leave the user a manual "restart to apply" hint, Cellar APPLIES the
+	// change immediately by restarting the kernel (which re-injects the env AND
+	// rebuilds spark/w via the server's reconnect-after-restart path). Default ON,
+	// scoped server-side to a CONNECTED notebook - so a purely-local kernel is never
+	// told it is on Databricks, and CONNECTING auto-enables it (see `connect()`).
 	const DBX_RUNTIME_KEY = 'cellar-databricks-runtime';
 	const DBX_RUNTIME_VERSION_KEY = 'cellar-databricks-runtime-version';
 	const DBX_RUNTIME_VERSION_DEFAULT = '15.4';
 	let runtimeOn = $state(true);
 	let runtimeVersion = $state(DBX_RUNTIME_VERSION_DEFAULT);
-	// Set when the toggle/version changes so the "restart to apply" hint shows; the
-	// change only takes effect on the next kernel start.
-	let runtimeDirty = $state(false);
-	// Set on a FRESH connect (the not-connected -> connected transition, in
-	// `connect()`): the kernel already started WITHOUT the runtime env, so an
-	// import-time IS_DATABRICKS gate has already run. Surfacing the same "restart to
-	// apply" hint prompts the user to restart so the default-ON runtime actually
-	// takes effect. Cleared when the user acts (restart) or turns the toggle off; it
-	// never re-fires after a restart because the post-restart reconnect is handled
-	// server-side and does not re-enter `connect()`.
-	let connectHint = $state(false);
+	// The version string currently LIVE in the kernel (set at each apply), so a
+	// version edit only restarts when it actually changed from what is running.
+	let appliedVersion = $state(DBX_RUNTIME_VERSION_DEFAULT);
+	// True while a runtime change (toggle or version) is restarting the kernel, so
+	// the Runtime card shows an "applying…" state and the transient post-restart
+	// lost/expired flash is suppressed.
+	let runtimeApplying = $state(false);
 	onMount(() => {
 		runtimeOn = getUi<boolean>(DBX_RUNTIME_KEY, true);
 		runtimeVersion = getUi<string>(DBX_RUNTIME_VERSION_KEY, DBX_RUNTIME_VERSION_DEFAULT);
+		appliedVersion = runtimeVersion;
 	});
-	function toggleRuntime() {
-		runtimeOn = !runtimeOn; // optimistic
-		setUi(DBX_RUNTIME_KEY, runtimeOn);
-		runtimeDirty = true;
-		if (!runtimeOn) connectHint = false; // turning it off clears the connect prompt
+
+	/**
+	 * Apply the runtime preference to the LIVE kernel: persist on/off (+ version)
+	 * server-side FIRST (race-free via `setUiNow`, so the restart re-reads the new
+	 * value), then restart the kernel so `initKernel` injects/omits the env for the
+	 * fresh imports and `reconnectAfterKernelRestart` rebuilds spark/w. The one
+	 * mechanism behind both connect-time auto-enable and the manual toggle - there is
+	 * no second "apply runtime" path.
+	 */
+	async function applyRuntime(on: boolean): Promise<void> {
+		runtimeOn = on; // optimistic
+		const v = runtimeVersion.trim();
+		await setUiNow(DBX_RUNTIME_KEY, on);
+		await setUiNow(DBX_RUNTIME_VERSION_KEY, v === '' ? null : v);
+		appliedVersion = v || DBX_RUNTIME_VERSION_DEFAULT;
+		if (onRestartKernel && notebookPath) await onRestartKernel(notebookPath);
+	}
+
+	/** Toggle the runtime on/off; applies IMMEDIATELY by restarting the kernel. */
+	async function toggleRuntime() {
+		if (runtimeApplying || busy) return;
+		runtimeApplying = true;
+		try {
+			await applyRuntime(!runtimeOn);
+			await settleConnection();
+		} finally {
+			runtimeApplying = false;
+		}
 	}
 	function onVersionInput(e: Event) {
+		// Reflect + persist as the user types; the actual apply (kernel restart) is
+		// deferred to blur/Enter so a keystroke can't restart the kernel per character.
 		const v = (e.currentTarget as HTMLInputElement).value.trim();
 		runtimeVersion = v;
-		// Persist a non-empty value; an empty field falls back to the default on read.
 		setUi(DBX_RUNTIME_VERSION_KEY, v === '' ? null : v);
-		runtimeDirty = true;
 	}
-	async function restartToApply() {
-		runtimeDirty = false;
-		connectHint = false;
-		if (onRestartKernel && notebookPath) await onRestartKernel(notebookPath);
+	/** Commit a version edit (blur/Enter): restart to apply only if it truly changed. */
+	async function commitVersion() {
+		if (runtimeApplying || busy || !runtimeOn) return;
+		if ((runtimeVersion.trim() || DBX_RUNTIME_VERSION_DEFAULT) === appliedVersion) return;
+		runtimeApplying = true;
+		try {
+			await applyRuntime(true);
+			await settleConnection();
+		} finally {
+			runtimeApplying = false;
+		}
+	}
+
+	/**
+	 * A kernel restart rebuilds the Databricks session asynchronously (the server
+	 * fires `reconnectAfterKernelRestart` detached and publishes `databricks:changed`
+	 * on success, but the restart also bumps the kernel epoch, so a status read taken
+	 * mid-restart transiently reports "session lost"). Poll - bounded - until the
+	 * connection settles back to `connected`, and resolve ONLY then, so the caller's
+	 * `busy`/`runtimeApplying` guard holds the connected/connecting view through the
+	 * whole transient window and the panel never flashes the "lost" card. On timeout
+	 * (the reconnect genuinely failed) it returns and the last status - which the
+	 * poll left honest - shows the real state.
+	 */
+	async function settleConnection(): Promise<void> {
+		const deadline = Date.now() + 15000;
+		// eslint-disable-next-line no-constant-condition
+		while (true) {
+			await loadStatus();
+			if (status?.connection?.connected) return;
+			if (Date.now() >= deadline) return;
+			await new Promise((r) => setTimeout(r, 400));
+		}
 	}
 
 	/** Query string carrying the active notebook path, so every per-notebook request targets it. */
@@ -316,6 +368,8 @@
 	let clustersError = $state<DbxError | null>(null);
 	let clustersLoading = $state(false);
 	let connectingId = $state('');
+	/** Name of the cluster being connected, for the Cluster card's "Connecting…" state. */
+	let connectingName = $state('');
 	/** Switch-cluster: show the picker again while a session is live. */
 	let switching = $state(false);
 
@@ -432,6 +486,7 @@
 		if (busy) return;
 		busy = 'connect';
 		connectingId = cluster.cluster_id;
+		connectingName = cluster.name;
 		connectError = null;
 		reconnectNote = '';
 		reconnectError = null;
@@ -445,15 +500,21 @@
 			if (!res.ok) throw body;
 			switching = false;
 			await loadStatus();
-			// Fresh connect on a kernel that started without the runtime env: prompt a
-			// restart so the default-ON runtime takes effect (import-time gate).
-			if (runtimeOn) connectHint = true;
 			onSessionChange?.();
+			// Connecting ALWAYS enables the Databricks runtime and restarts the kernel
+			// so the `IS_DATABRICKS`/`dbutils.widgets` path is live immediately - no
+			// manual restart. `applyRuntime(true)` persists the ON preference then
+			// restarts (which re-injects the env AND rebuilds spark/w). Kept inside the
+			// connect spinner, and `settleConnection` waits for the rebuilt session so
+			// the panel never flashes the "session lost" card.
+			await applyRuntime(true);
+			await settleConnection();
 		} catch (err) {
 			connectError = toDbxError(err);
 		} finally {
 			busy = '';
 			connectingId = '';
+			connectingName = '';
 		}
 	}
 
@@ -726,6 +787,274 @@
 	{#if reconnectError}{@render errorBox(reconnectError, 'databricks-reconnect-error')}{/if}
 {/snippet}
 
+{#snippet cardLabel(text: string)}
+	<span class="text-[10px] font-semibold uppercase tracking-wide text-base-content/40">{text}</span>
+{/snippet}
+
+<!-- The connect form: pick an auth source (a saved profile, or a typed workspace
+     host), sign in if needed, then pick a cluster. Reused by the disconnected
+     Cluster card, the "Switch cluster" sub-panel, and the expired/lost cards. -->
+{#snippet picker()}
+	<!-- Auth source: a config profile, or a workspace host typed by hand. -->
+	{#if selectionMode === 'profile'}
+		{#if profiles.length > 1}
+			<label class="block">
+				<span class="text-[10px] uppercase tracking-wide text-base-content/40">profile</span>
+				<select
+					class="select select-xs select-bordered mt-0.5 w-full font-mono text-[11px]"
+					value={profile}
+					onchange={(e) => pickProfile(e.currentTarget.value)}
+					disabled={!!busy}
+					data-testid="databricks-profile"
+				>
+					{#each profiles as p (p.name)}
+						<option value={p.name}>{p.name}{p.hasToken ? '' : ' (OAuth)'}</option>
+					{/each}
+				</select>
+			</label>
+		{:else}
+			<p class="text-[11px] text-base-content/40">
+				profile <span class="font-mono text-base-content/60" data-testid="databricks-profile">{profile}</span>
+			</p>
+		{/if}
+		{#if hasProfiles}
+			<button class="mt-1 text-[10px] text-primary/70 hover:text-primary hover:underline" onclick={toggleUseHost} disabled={!!busy} data-testid="databricks-use-host">
+				or connect to a workspace host…
+			</button>
+		{/if}
+	{:else}
+		<label class="block">
+			<span class="text-[10px] uppercase tracking-wide text-base-content/40">workspace host</span>
+			<input
+				type="text"
+				class="input input-xs input-bordered mt-0.5 w-full font-mono text-[11px]"
+				placeholder="https://dbc-….cloud.databricks.com"
+				bind:value={hostInput}
+				oninput={() => resetSelection()}
+				disabled={!!busy}
+				data-testid="databricks-host"
+			/>
+		</label>
+		{#if hasProfiles}
+			<button class="mt-1 text-[10px] text-primary/70 hover:text-primary hover:underline" onclick={toggleUseHost} disabled={!!busy} data-testid="databricks-use-profile">
+				use a saved profile instead
+			</button>
+		{:else}
+			{@render hint('No profile in ~/.databrickscfg. Enter your workspace URL and sign in - Cellar authenticates you through your browser, no token needed.')}
+		{/if}
+	{/if}
+
+	<!-- A bare host signs in first; a profile lists straight away and only shows this if the SDK asks for a login. -->
+	{#if needsAuth}
+		<button
+			class="btn btn-primary btn-xs mt-2 w-full gap-1"
+			onclick={signIn}
+			disabled={!!busy || !haveSelection}
+			data-testid="databricks-signin"
+		>
+			{#if busy === 'login'}<span class="loading loading-spinner loading-xs"></span>Opening browser…{:else}Sign in with Databricks{/if}
+		</button>
+		{@render hint('Opens your browser to authenticate with Databricks (OAuth). No access token required, and Cellar stores nothing.')}
+		{#if authError}{@render errorBox(authError, 'databricks-auth-error')}{/if}
+	{:else if haveSelection}
+		<div class="mt-2 flex items-center justify-between">
+			<span class="text-[10px] uppercase tracking-wide text-base-content/40">clusters</span>
+			<button class="btn btn-ghost btn-xs h-5 min-h-0 px-1 text-[11px] font-normal text-base-content/50 hover:text-base-content" onclick={refreshClusters} disabled={clustersLoading} data-testid="databricks-refresh-clusters">
+				{clustersLoading ? 'loading…' : 'refresh'}
+			</button>
+		</div>
+
+		{#if clustersError}
+			{@render errorBox(clustersError, 'databricks-clusters-error')}
+		{:else if clustersLoading && !clusters}
+			<p class="px-2 py-2 text-xs text-base-content/40">loading clusters…</p>
+		{:else if clusters?.length}
+			<div class="max-h-56 space-y-0.5 overflow-y-auto">
+				{#each clusters as c (c.cluster_id)}
+					<button
+						class="group flex w-full items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-base-300/40 disabled:opacity-50"
+						onclick={() => connect(c)}
+						disabled={!!busy}
+						title="Connect 'spark' to {c.name}"
+						data-testid="databricks-cluster"
+					>
+						<span class="relative flex h-2 w-2 shrink-0" title={c.state.toLowerCase()}>
+							{#if clusterPending(c.state)}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
+							<span class="relative inline-flex h-2 w-2 rounded-full {clusterDotClass(c.state)}"></span>
+						</span>
+						<span class="min-w-0 flex-1">
+							<span class="block truncate text-xs text-base-content/80">{c.name}</span>
+							{#if c.spark_version}<span class="block truncate font-mono text-[10px] text-base-content/40">{c.spark_version}</span>{/if}
+						</span>
+						{#if connectingId === c.cluster_id}
+							<span class="loading loading-spinner loading-xs shrink-0 text-primary"></span>
+						{:else}
+							<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/40">{c.state.toLowerCase()}</span>
+						{/if}
+					</button>
+				{/each}
+			</div>
+			<!-- Behavior consequence: connecting enables the Databricks runtime and
+			     restarts the kernel to make it live immediately (variables cleared). -->
+			<p class="mt-1.5 flex items-start gap-1 text-[11px] leading-relaxed text-base-content/40" data-testid="databricks-connect-note">
+				<svg class="mt-px h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 16v-4M12 8h.01" /></svg>
+				<span>Connecting enables the Databricks runtime and restarts the kernel - variables are cleared.</span>
+			</p>
+		{:else if clusters}
+			<p class="px-2 py-2 text-xs text-base-content/40">no clusters in this workspace</p>
+		{/if}
+	{/if}
+
+	{#if connectError}{@render errorBox(connectError, 'databricks-connect-error')}{/if}
+{/snippet}
+
+<!-- The Runtime card: advertise DATABRICKS_RUNTIME_VERSION so this notebook's
+     IS_DATABRICKS-gated code takes its dbutils.widgets path. A separate card from
+     the connection, applied LIVE - toggling (or a version edit) restarts the kernel
+     to take effect immediately. Green (toggle-success) is a deliberate Databricks
+     cue, unlike Files' primary toggle. -->
+{#snippet runtimeCard()}
+	<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-runtime-card">
+		<div class="flex items-center justify-between gap-2">
+			{@render cardLabel('runtime')}
+			{#if runtimeApplying}
+				<span class="flex items-center gap-1 text-[10px] text-base-content/40" data-testid="databricks-runtime-applying">
+					<span class="loading loading-spinner loading-xs"></span>restarting…
+				</span>
+			{:else if runtimeOn}
+				<span class="flex items-center gap-1 text-[10px] uppercase tracking-wide text-success" data-testid="databricks-runtime-active">
+					<span class="inline-block h-1.5 w-1.5 rounded-full bg-success"></span>active
+				</span>
+			{:else}
+				<span class="text-[10px] uppercase tracking-wide text-base-content/30" data-testid="databricks-runtime-inactive">off</span>
+			{/if}
+		</div>
+		<label
+			class="mt-1.5 flex cursor-pointer items-center gap-2 text-[11px] text-base-content/70"
+			title="Advertises a Databricks runtime (sets DATABRICKS_RUNTIME_VERSION) so notebook code that gates on IS_DATABRICKS takes its dbutils.widgets path. Affects all libraries (e.g. mlflow) and restarts the kernel to apply. It does not connect a cluster - use Databricks Connect for spark/Unity Catalog."
+		>
+			<input
+				type="checkbox"
+				class="toggle toggle-xs toggle-success"
+				checked={runtimeOn}
+				onchange={toggleRuntime}
+				disabled={runtimeApplying || !!busy}
+				data-testid="databricks-runtime-toggle"
+			/>
+			<span>Databricks runtime (<code class="font-mono text-[10px]">dbutils.widgets</code>)</span>
+		</label>
+		{#if runtimeOn}
+			<label class="mt-1.5 flex items-center gap-2 text-[11px] text-base-content/50">
+				<span class="shrink-0">version</span>
+				<input
+					type="text"
+					class="input input-xs input-bordered h-5 min-h-0 w-20 py-0 font-mono text-[10px]"
+					value={runtimeVersion}
+					oninput={onVersionInput}
+					onchange={commitVersion}
+					onkeydown={(e) => { if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur(); }}
+					placeholder={DBX_RUNTIME_VERSION_DEFAULT}
+					disabled={runtimeApplying}
+					data-testid="databricks-runtime-version"
+				/>
+			</label>
+		{/if}
+		<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">
+			{#if runtimeOn}
+				<code class="font-mono text-[10px]">IS_DATABRICKS</code>-gated code takes the Databricks path. Toggling restarts the kernel - variables are cleared.
+			{:else}
+				Notebook code runs its non-Databricks path. Turning it on restarts the kernel - variables are cleared.
+			{/if}
+		</p>
+	</div>
+{/snippet}
+
+<!-- Unity Catalog browser: catalog > schema > table, one level per expand.
+     Subordinate to the two cards above (a labeled region, not a card of its own). -->
+{#snippet dataBrowser()}
+	<div class="pt-1" data-testid="databricks-browser">
+		<div class="flex items-center justify-between gap-2">
+			<span class="text-[10px] uppercase tracking-wide text-base-content/40">data</span>
+			<label class="flex items-center gap-1 text-[10px] text-base-content/40">
+				preview
+				<!-- `pe-7` clears daisyUI's chevron: at `pe-5` a 3-digit limit renders underneath it. -->
+				<select class="select select-xs select-bordered h-5 min-h-0 py-0 pe-7 ps-1.5 font-mono text-[10px]" bind:value={limit} data-testid="databricks-limit">
+					{#each LIMITS as n (n)}<option value={n}>{n}</option>{/each}
+				</select>
+				rows
+			</label>
+		</div>
+
+		{#if catalogsError}
+			{@render errorBox(catalogsError, 'databricks-catalogs-error')}
+		{:else if catalogsLoading}
+			<p class="px-2 py-2 text-xs text-base-content/40">loading catalogs…</p>
+		{:else if catalogs?.length}
+			<div class="max-h-72 overflow-y-auto pt-1">
+				{#each catalogs as cat (cat.name)}
+					{@const cid = `c:${cat.name}`}
+					<button class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50" onclick={() => toggleCatalog(cat.name)} data-testid="databricks-catalog">
+						<svg class="h-3 w-3 shrink-0 text-base-content/40 transition-transform {openNodes[cid] ? 'rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+						<span class="truncate text-base-content/80">{cat.name}</span>
+					</button>
+
+					{#if openNodes[cid]}
+						{@const node = nodes[cid]}
+						<div class="ml-3">
+							{#if node?.loading}
+								<p class="px-2 py-0.5 text-[11px] text-base-content/40">loading…</p>
+							{:else if node?.error}
+								{@render errorBox(node.error, 'databricks-node-error')}
+							{:else if node?.items?.length}
+								{#each node.items as sch (sch.name)}
+									{@const sid = `s:${cat.name}.${sch.name}`}
+									<button class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50" onclick={() => toggleSchema(cat.name, sch.name)} data-testid="databricks-schema">
+										<svg class="h-3 w-3 shrink-0 text-base-content/40 transition-transform {openNodes[sid] ? 'rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+										<span class="truncate text-base-content/70">{sch.name}</span>
+									</button>
+
+									{#if openNodes[sid]}
+										{@const tnode = nodes[sid]}
+										<div class="ml-3">
+											{#if tnode?.loading}
+												<p class="px-2 py-0.5 text-[11px] text-base-content/40">loading…</p>
+											{:else if tnode?.error}
+												{@render errorBox(tnode.error, 'databricks-node-error')}
+											{:else if tnode?.items?.length}
+												{#each tnode.items as tbl (tbl.name)}
+													<button
+														class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50 disabled:cursor-not-allowed disabled:opacity-40"
+														onclick={() => previewTable(tbl.full_name)}
+														disabled={!onInsertAndRun}
+														title={onInsertAndRun ? `Preview ${limit} rows of ${tbl.full_name}` : 'Open a notebook to preview a table'}
+														data-testid="databricks-table"
+													>
+														<svg class="h-3 w-3 shrink-0 text-base-content/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" /><path d="M3 9h18M3 15h18M9 3v18" /></svg>
+														<span class="truncate text-base-content/70">{tbl.name}</span>
+													</button>
+												{/each}
+											{:else}
+												<p class="px-2 py-0.5 text-[11px] text-base-content/40">no tables</p>
+											{/if}
+										</div>
+									{/if}
+								{/each}
+							{:else}
+								<p class="px-2 py-0.5 text-[11px] text-base-content/40">no schemas</p>
+							{/if}
+						</div>
+					{/if}
+				{/each}
+			</div>
+			{#if !onInsertAndRun}
+				{@render hint('Open a notebook to preview a table.')}
+			{/if}
+		{:else if catalogs}
+			<p class="px-2 py-2 text-xs text-base-content/40">no catalogs visible to this profile</p>
+		{/if}
+	</div>
+{/snippet}
+
 <div class="px-2 pb-3" data-testid="databricks-body">
 	{#if statusError}
 		{@render errorBox({ code: 'error', message: statusError }, 'databricks-status-error')}
@@ -770,303 +1099,119 @@
 			{#if installError}{@render errorBox(installError, 'databricks-install-error')}{/if}
 		</div>
 
-		<!-- 3. Ready: profile + cluster picker, or the live session. -->
+		<!-- 3. Ready: the connection (Cluster card) + a separate Runtime card + the
+		     subordinate Unity Catalog browser. Two clearly separated cards. -->
 	{:else}
-		{#if connected}
-			<!-- Compact, sidebar-native connected view: a leading success dot + cluster
-			     name + status badge (kernel-row density), one muted meta line, the
-			     spark/w hint, then the actions and the runtime toggle - no tinted card. -->
-			<div class="px-1" data-testid="databricks-connected">
-				<div class="flex items-center gap-2">
-					<span class="relative flex h-2 w-2 shrink-0" title="connected"><span class="inline-flex h-2 w-2 rounded-full bg-success"></span></span>
-					<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connection.clusterName}>{connection.clusterName}</span>
-					<span class="badge badge-success badge-xs shrink-0 gap-1" data-testid="databricks-connection-status">
-						<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>connected
-					</span>
-				</div>
-				{#if connMeta}
-					<p class="mt-1 truncate font-mono text-[11px] text-base-content/50" title={connMeta}>{connMeta}</p>
-				{/if}
-				<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/50">
-					<code class="font-mono text-[10px] text-primary">spark</code> and
-					<code class="font-mono text-[10px] text-primary">w</code> are ready in the kernel.
-				</p>
-				{#if reconnectNote}
-					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/60" data-testid="databricks-reconnect-note">{reconnectNote}</p>
-				{/if}
-				{#if connection.livenessUnverified}
-					<p class="mt-1 text-[11px] leading-relaxed text-base-content/40" data-testid="databricks-unverified">
-						Liveness not confirmed (kernel busy or a transient error) - not a dead session.
-					</p>
-				{/if}
-				<div class="mt-2 flex gap-1.5">
-					<button class="btn btn-outline btn-xs flex-1" onclick={() => { switching = !switching; reconnectNote = ''; }} disabled={!!busy} data-testid="databricks-switch">
-						{switching ? 'Cancel' : 'Switch cluster'}
-					</button>
-					<button class="btn btn-outline btn-xs flex-1" onclick={disconnect} disabled={!!busy} data-testid="databricks-disconnect">
-						{#if busy === 'disconnect'}<span class="loading loading-spinner loading-xs"></span>{:else}Disconnect{/if}
-					</button>
-				</div>
-				<!-- Databricks-runtime toggle: advertise DATABRICKS_RUNTIME_VERSION so this
-				     notebook's IS_DATABRICKS-gated code takes its dbutils.widgets path.
-				     Shown only when connected; applies at kernel START (import-time gate),
-				     so a change surfaces a "restart to apply" hint. Kept a green
-				     (toggle-success) Databricks cue, deliberately unlike Files' primary toggle. -->
-				<div class="mt-2 border-t border-base-300 pt-2">
-					<label
-						class="flex cursor-pointer items-center gap-2 text-[11px] text-base-content/70"
-						title="Advertises a Databricks runtime (sets DATABRICKS_RUNTIME_VERSION) so notebook code that gates on IS_DATABRICKS takes its dbutils.widgets path. Affects all libraries (e.g. mlflow), requires a kernel restart, and does not connect a cluster - use Databricks Connect for spark/Unity Catalog."
-					>
-						<input
-							type="checkbox"
-							class="toggle toggle-xs toggle-success"
-							checked={runtimeOn}
-							onchange={toggleRuntime}
-							data-testid="databricks-runtime-toggle"
-						/>
-						<span>Databricks runtime (<code class="font-mono text-[10px]">dbutils.widgets</code>)</span>
-					</label>
-					{#if runtimeOn}
-						<label class="mt-1.5 flex items-center gap-2 text-[11px] text-base-content/50">
-							<span class="shrink-0">version</span>
-							<input
-								type="text"
-								class="input input-xs input-bordered h-5 min-h-0 w-20 py-0 font-mono text-[10px]"
-								value={runtimeVersion}
-								oninput={onVersionInput}
-								placeholder={DBX_RUNTIME_VERSION_DEFAULT}
-								data-testid="databricks-runtime-version"
-							/>
-						</label>
-					{/if}
-					{#if runtimeDirty || (connectHint && runtimeOn)}
-						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/60" data-testid="databricks-runtime-hint">
-							Takes effect on the next kernel start.
-							{#if onRestartKernel && notebookPath}
-								<button
-									class="text-primary/80 hover:text-primary hover:underline"
-									onclick={restartToApply}
-									data-testid="databricks-runtime-restart"
-								>Restart the kernel to apply now.</button>
-							{:else}
-								Restart the kernel to apply now.
-							{/if}
-						</p>
-					{/if}
-				</div>
-			</div>
-		{:else if connection.expired}
-			<div class="mb-2 rounded-lg border border-warning/30 bg-warning/10 p-2.5" data-testid="databricks-expired">
-				<p class="text-[11px] leading-relaxed text-base-content/70">
-					The Spark Connect session on <span class="font-mono">{connection.lost?.clusterName}</span> expired (idle timeout or a closed client). Cellar is reconnecting automatically; if it doesn't recover, use Reconnect.
-				</p>
-				{@render reconnectButton()}
-			</div>
-		{:else if connection.lost}
-			<div class="mb-2 rounded-lg border border-warning/30 bg-warning/10 p-2.5" data-testid="databricks-lost">
-				<p class="text-[11px] leading-relaxed text-base-content/70">
-					The session on <span class="font-mono">{connection.lost.clusterName}</span> ended when the kernel restarted. Reconnect to restore <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code>.
-				</p>
-				{@render reconnectButton()}
-			</div>
-		{/if}
-
-		{#if !connected || switching}
-			<div class="{connected ? 'mt-2 border-t border-base-300 pt-2' : ''}">
-				<!-- 3a. Auth source: a config profile, or a workspace host typed by hand. -->
-				{#if selectionMode === 'profile'}
-					{#if profiles.length > 1}
-						<label class="block">
-							<span class="text-[10px] uppercase tracking-wide text-base-content/40">profile</span>
-							<select
-								class="select select-xs select-bordered mt-0.5 w-full font-mono text-[11px]"
-								value={profile}
-								onchange={(e) => pickProfile(e.currentTarget.value)}
-								disabled={!!busy}
-								data-testid="databricks-profile"
-							>
-								{#each profiles as p (p.name)}
-									<option value={p.name}>{p.name}{p.hasToken ? '' : ' (OAuth)'}</option>
-								{/each}
-							</select>
-						</label>
-					{:else}
-						<p class="text-[11px] text-base-content/40">
-							profile <span class="font-mono text-base-content/60" data-testid="databricks-profile">{profile}</span>
-						</p>
-					{/if}
-					{#if hasProfiles}
-						<button class="mt-1 text-[10px] text-primary/70 hover:text-primary hover:underline" onclick={toggleUseHost} disabled={!!busy} data-testid="databricks-use-host">
-							or connect to a workspace host…
-						</button>
-					{/if}
-				{:else}
-					<label class="block">
-						<span class="text-[10px] uppercase tracking-wide text-base-content/40">workspace host</span>
-						<input
-							type="text"
-							class="input input-xs input-bordered mt-0.5 w-full font-mono text-[11px]"
-							placeholder="https://dbc-….cloud.databricks.com"
-							bind:value={hostInput}
-							oninput={() => resetSelection()}
-							disabled={!!busy}
-							data-testid="databricks-host"
-						/>
-					</label>
-					{#if hasProfiles}
-						<button class="mt-1 text-[10px] text-primary/70 hover:text-primary hover:underline" onclick={toggleUseHost} disabled={!!busy} data-testid="databricks-use-profile">
-							use a saved profile instead
-						</button>
-					{:else}
-						{@render hint('No profile in ~/.databrickscfg. Enter your workspace URL and sign in - Cellar authenticates you through your browser, no token needed.')}
-					{/if}
-				{/if}
-
-				<!-- 3b. A bare host signs in first; a profile lists straight away and only shows this if the SDK asks for a login. -->
-				{#if needsAuth}
-					<button
-						class="btn btn-primary btn-xs mt-2 w-full gap-1"
-						onclick={signIn}
-						disabled={!!busy || !haveSelection}
-						data-testid="databricks-signin"
-					>
-						{#if busy === 'login'}<span class="loading loading-spinner loading-xs"></span>Opening browser…{:else}Sign in with Databricks{/if}
-					</button>
-					{@render hint('Opens your browser to authenticate with Databricks (OAuth). No access token required, and Cellar stores nothing.')}
-					{#if authError}{@render errorBox(authError, 'databricks-auth-error')}{/if}
-				{:else if haveSelection}
-					<div class="mt-2 flex items-center justify-between">
-						<span class="text-[10px] uppercase tracking-wide text-base-content/40">clusters</span>
-						<button class="btn btn-ghost btn-xs h-5 min-h-0 px-1 text-[11px] font-normal text-base-content/50 hover:text-base-content" onclick={refreshClusters} disabled={clustersLoading} data-testid="databricks-refresh-clusters">
-							{clustersLoading ? 'loading…' : 'refresh'}
-						</button>
+		<div class="space-y-2">
+			{#if busy === 'connect'}
+				<!-- Connecting: one calm state in the Cluster card, held (via
+				     settleConnection, after the runtime-enable restart) until the rebuilt
+				     session settles - so the panel never flashes the "session lost" card. -->
+				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-connecting">
+					{@render cardLabel('cluster')}
+					<div class="mt-1.5 flex items-center gap-2">
+						<span class="loading loading-spinner loading-xs shrink-0 text-primary"></span>
+						<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connectingName}>Connecting to {connectingName}…</span>
 					</div>
-
-					{#if clustersError}
-						{@render errorBox(clustersError, 'databricks-clusters-error')}
-					{:else if clustersLoading && !clusters}
-						<p class="px-2 py-2 text-xs text-base-content/40">loading clusters…</p>
-					{:else if clusters?.length}
-						<div class="max-h-56 space-y-0.5 overflow-y-auto">
-							{#each clusters as c (c.cluster_id)}
-								<button
-									class="group flex w-full items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-base-300/40 disabled:opacity-50"
-									onclick={() => connect(c)}
-									disabled={!!busy}
-									title="Connect 'spark' to {c.name}"
-									data-testid="databricks-cluster"
-								>
-									<span class="relative flex h-2 w-2 shrink-0" title={c.state.toLowerCase()}>
-										{#if clusterPending(c.state)}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
-										<span class="relative inline-flex h-2 w-2 rounded-full {clusterDotClass(c.state)}"></span>
-									</span>
-									<span class="min-w-0 flex-1">
-										<span class="block truncate text-xs text-base-content/80">{c.name}</span>
-										{#if c.spark_version}<span class="block truncate font-mono text-[10px] text-base-content/40">{c.spark_version}</span>{/if}
-									</span>
-									{#if connectingId === c.cluster_id}
-										<span class="loading loading-spinner loading-xs shrink-0 text-primary"></span>
-									{:else}
-										<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/40">{c.state.toLowerCase()}</span>
-									{/if}
-								</button>
-							{/each}
-						</div>
-						{#if busy === 'connect'}
-							{@render hint('Connecting… starting a terminated cluster can take a few minutes.')}
+					{@render hint('Enabling the Databricks runtime and starting the session. A terminated cluster can take a few minutes.')}
+					{#if connectError}{@render errorBox(connectError, 'databricks-connect-error')}{/if}
+				</div>
+			{:else if connected || runtimeApplying}
+				<!-- Cluster card. Kept mounted through a runtime-toggle restart
+				     (runtimeApplying) so the two-card view never flickers to "lost". -->
+				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-connected">
+					<div class="flex items-center justify-between gap-2">
+						{@render cardLabel('cluster')}
+						{#if runtimeApplying}
+							<span class="flex items-center gap-1 text-[10px] uppercase tracking-wide text-base-content/40">
+								<span class="loading loading-spinner loading-xs"></span>restarting
+							</span>
+						{:else}
+							<span class="badge badge-success badge-xs shrink-0 gap-1" data-testid="databricks-connection-status">
+								<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>connected
+							</span>
 						{/if}
-					{:else if clusters}
-						<p class="px-2 py-2 text-xs text-base-content/40">no clusters in this workspace</p>
+					</div>
+					<div class="mt-1.5 flex items-center gap-2">
+						<span class="relative flex h-2 w-2 shrink-0" title="connected"><span class="inline-flex h-2 w-2 rounded-full bg-success"></span></span>
+						<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connection.clusterName ?? connection.lost?.clusterName ?? ''}>{connection.clusterName ?? connection.lost?.clusterName ?? ''}</span>
+					</div>
+					{#if connMeta}
+						<p class="mt-1 truncate font-mono text-[11px] text-base-content/50" title={connMeta}>{connMeta}</p>
 					{/if}
-				{/if}
-
-				{#if connectError}{@render errorBox(connectError, 'databricks-connect-error')}{/if}
-			</div>
-		{/if}
-
-		<!-- 4. Unity Catalog browser: catalog > schema > table, one level per expand. -->
-		{#if connected}
-			<div class="mt-3 border-t border-base-300 pt-2" data-testid="databricks-browser">
-				<div class="flex items-center justify-between gap-2">
-					<span class="text-[10px] uppercase tracking-wide text-base-content/40">data</span>
-					<label class="flex items-center gap-1 text-[10px] text-base-content/40">
-						preview
-						<!-- `pe-7` clears daisyUI's chevron: at `pe-5` a 3-digit limit renders underneath it. -->
-						<select class="select select-xs select-bordered h-5 min-h-0 py-0 pe-7 ps-1.5 font-mono text-[10px]" bind:value={limit} data-testid="databricks-limit">
-							{#each LIMITS as n (n)}<option value={n}>{n}</option>{/each}
-						</select>
-						rows
-					</label>
+					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/50">
+						<code class="font-mono text-[10px] text-primary">spark</code> and
+						<code class="font-mono text-[10px] text-primary">w</code> are ready in the kernel.
+					</p>
+					{#if reconnectNote}
+						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/60" data-testid="databricks-reconnect-note">{reconnectNote}</p>
+					{/if}
+					{#if connection.livenessUnverified}
+						<p class="mt-1 text-[11px] leading-relaxed text-base-content/40" data-testid="databricks-unverified">
+							Liveness not confirmed (kernel busy or a transient error) - not a dead session.
+						</p>
+					{/if}
+					<div class="mt-2 flex gap-1.5">
+						<button class="btn btn-outline btn-xs flex-1" onclick={() => { switching = !switching; reconnectNote = ''; }} disabled={!!busy || runtimeApplying} data-testid="databricks-switch">
+							{switching ? 'Cancel' : 'Switch cluster'}
+						</button>
+						<button class="btn btn-outline btn-xs flex-1" onclick={disconnect} disabled={!!busy || runtimeApplying} data-testid="databricks-disconnect">
+							{#if busy === 'disconnect'}<span class="loading loading-spinner loading-xs"></span>{:else}Disconnect{/if}
+						</button>
+					</div>
+					{#if switching}
+						<div class="mt-2 border-t border-base-300 pt-2">
+							{@render picker()}
+						</div>
+					{/if}
 				</div>
 
-				{#if catalogsError}
-					{@render errorBox(catalogsError, 'databricks-catalogs-error')}
-				{:else if catalogsLoading}
-					<p class="px-2 py-2 text-xs text-base-content/40">loading catalogs…</p>
-				{:else if catalogs?.length}
-					<div class="max-h-72 overflow-y-auto pt-1">
-						{#each catalogs as cat (cat.name)}
-							{@const cid = `c:${cat.name}`}
-							<button class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50" onclick={() => toggleCatalog(cat.name)} data-testid="databricks-catalog">
-								<svg class="h-3 w-3 shrink-0 text-base-content/40 transition-transform {openNodes[cid] ? 'rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
-								<span class="truncate text-base-content/80">{cat.name}</span>
-							</button>
+				<!-- Runtime card: a SEPARATE card from the connection (requirement #1). -->
+				{@render runtimeCard()}
 
-							{#if openNodes[cid]}
-								{@const node = nodes[cid]}
-								<div class="ml-3">
-									{#if node?.loading}
-										<p class="px-2 py-0.5 text-[11px] text-base-content/40">loading…</p>
-									{:else if node?.error}
-										{@render errorBox(node.error, 'databricks-node-error')}
-									{:else if node?.items?.length}
-										{#each node.items as sch (sch.name)}
-											{@const sid = `s:${cat.name}.${sch.name}`}
-											<button class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50" onclick={() => toggleSchema(cat.name, sch.name)} data-testid="databricks-schema">
-												<svg class="h-3 w-3 shrink-0 text-base-content/40 transition-transform {openNodes[sid] ? 'rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
-												<span class="truncate text-base-content/70">{sch.name}</span>
-											</button>
-
-											{#if openNodes[sid]}
-												{@const tnode = nodes[sid]}
-												<div class="ml-3">
-													{#if tnode?.loading}
-														<p class="px-2 py-0.5 text-[11px] text-base-content/40">loading…</p>
-													{:else if tnode?.error}
-														{@render errorBox(tnode.error, 'databricks-node-error')}
-													{:else if tnode?.items?.length}
-														{#each tnode.items as tbl (tbl.name)}
-															<button
-																class="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/50 disabled:cursor-not-allowed disabled:opacity-40"
-																onclick={() => previewTable(tbl.full_name)}
-																disabled={!onInsertAndRun}
-																title={onInsertAndRun ? `Preview ${limit} rows of ${tbl.full_name}` : 'Open a notebook to preview a table'}
-																data-testid="databricks-table"
-															>
-																<svg class="h-3 w-3 shrink-0 text-base-content/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" /><path d="M3 9h18M3 15h18M9 3v18" /></svg>
-																<span class="truncate text-base-content/70">{tbl.name}</span>
-															</button>
-														{/each}
-													{:else}
-														<p class="px-2 py-0.5 text-[11px] text-base-content/40">no tables</p>
-													{/if}
-												</div>
-											{/if}
-										{/each}
-									{:else}
-										<p class="px-2 py-0.5 text-[11px] text-base-content/40">no schemas</p>
-									{/if}
-								</div>
-							{/if}
-						{/each}
+				<!-- Data browser: subordinate to the two cards above. -->
+				{@render dataBrowser()}
+			{:else if connection.expired}
+				<div class="rounded-lg border border-warning/30 bg-warning/10 p-2.5" data-testid="databricks-expired">
+					<div class="flex items-center justify-between gap-2">
+						{@render cardLabel('cluster')}
+						<span class="flex items-center gap-1 text-[10px] uppercase tracking-wide text-warning">
+							<span class="inline-block h-1.5 w-1.5 rounded-full bg-warning"></span>expired
+						</span>
 					</div>
-					{#if !onInsertAndRun}
-						{@render hint('Open a notebook to preview a table.')}
-					{/if}
-				{:else if catalogs}
-					<p class="px-2 py-2 text-xs text-base-content/40">no catalogs visible to this profile</p>
-				{/if}
-			</div>
-		{/if}
+					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/70">
+						The Spark Connect session on <span class="font-mono">{connection.lost?.clusterName}</span> expired (idle timeout or a closed client). Cellar is reconnecting automatically; if it doesn't recover, use Reconnect.
+					</p>
+					{@render reconnectButton()}
+					<div class="mt-2 border-t border-warning/20 pt-2">
+						{@render picker()}
+					</div>
+				</div>
+			{:else if connection.lost}
+				<div class="rounded-lg border border-warning/30 bg-warning/10 p-2.5" data-testid="databricks-lost">
+					<div class="flex items-center justify-between gap-2">
+						{@render cardLabel('cluster')}
+						<span class="flex items-center gap-1 text-[10px] uppercase tracking-wide text-warning">
+							<span class="inline-block h-1.5 w-1.5 rounded-full bg-warning"></span>lost
+						</span>
+					</div>
+					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/70">
+						The session on <span class="font-mono">{connection.lost.clusterName}</span> ended when the kernel restarted. Reconnect to restore <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code>.
+					</p>
+					{@render reconnectButton()}
+					<div class="mt-2 border-t border-warning/20 pt-2">
+						{@render picker()}
+					</div>
+				</div>
+			{:else}
+				<!-- Disconnected: the Cluster card in its connect-form. -->
+				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-picker">
+					{@render cardLabel('cluster')}
+					<div class="mt-1.5">
+						{@render picker()}
+					</div>
+				</div>
+			{/if}
+		</div>
 	{/if}
 </div>

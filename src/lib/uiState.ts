@@ -68,6 +68,33 @@ export function setUi(key: string, value: unknown): void {
 }
 
 /**
+ * Like `setUi`, but PUTs the change to the server IMMEDIATELY and resolves once
+ * the write is acknowledged - for the rare caller that must guarantee the server
+ * store already reflects the value before a FOLLOWING server action reads it. The
+ * Databricks runtime toggle is the one such caller: it must persist the on/off (and
+ * version) preference server-side before restarting the kernel, because the restart
+ * re-reads the store to decide whether to inject `DATABRICKS_RUNTIME_VERSION`, and
+ * the debounced `setUi` PUT could still be in flight. This write supersedes any
+ * value the debounced path had queued for the same key. A no-op off the browser.
+ */
+export async function setUiNow(key: string, value: unknown): Promise<void> {
+	if (value === null) delete cache[key];
+	else cache[key] = value;
+	delete pending[key]; // this synchronous write wins over any queued debounced value
+	if (!browser) return;
+	try {
+		await fetch('/api/ui-state', {
+			method: 'PUT',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ [key]: value })
+		});
+	} catch {
+		// A failed persist degrades to "runtime applies on the next kernel start"; the
+		// caller's optimistic local state still reflects the user's choice.
+	}
+}
+
+/**
  * The server store is the cross-launch source of truth, so a value that only
  * exists in a returning same-port user's `localStorage` is seeded into it once.
  * A key the server already knows always wins (it is never overwritten).
