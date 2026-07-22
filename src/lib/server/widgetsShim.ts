@@ -147,9 +147,90 @@ class _CellarWidgets:
         self._meta.clear()
 
 
+class _CellarUndefinedOption:
+    # A Scala-\`Option\`-like "None". Databricks driver APIs return \`Option[str]\`
+    # (apiUrl/apiToken/...), and libraries probe them with .isDefined()/.get()/
+    # .getOrElse() before use. There is no real Databricks driver behind Cellar,
+    # so every option is honestly UNDEFINED - that is what lets a probing library
+    # (mlflow first) fall through its "not really on a driver" branch instead of
+    # trusting a fabricated URL/token. It is falsy so a bare truthiness check also
+    # reads empty.
+    def isDefined(self):
+        return False
+    def isEmpty(self):
+        return True
+    def nonEmpty(self):
+        return False
+    def get(self):
+        return None
+    def getOrElse(self, _default=None):
+        return _default
+    def orNull(self):
+        return None
+    def map(self, _f):
+        return self
+    def foreach(self, _f):
+        return None
+    def __bool__(self):
+        return False
+
+
+class _CellarNotebookContext:
+    # entry_point.getDbutils().notebook().getContext(). Its values (apiUrl,
+    # apiToken, notebookId, clusterId, ...) are all Scala Options in a real
+    # runtime, so any getter here returns an undefined option - never raises.
+    def __getattr__(self, _name):
+        return lambda *a, **k: _CellarUndefinedOption()
+
+
+class _CellarNotebookProxy:
+    def getContext(self, *a, **k):
+        return _CellarNotebookContext()
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+class _CellarDbutilsProxy:
+    # entry_point.getDbutils()
+    def notebook(self, *a, **k):
+        return _CellarNotebookProxy()
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+class _CellarDriverConf:
+    def workflowSslTrustAll(self, *a, **k):
+        return False
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+class _CellarEntryPoint:
+    # A faithful "no real Databricks driver" \`dbutils.entry_point\`. Cellar sets
+    # DATABRICKS_RUNTIME_VERSION so a library believes it is on a runtime and then
+    # reaches for the driver-only entry point (e.g. mlflow's module-level
+    # _init_databricks_dynamic_token_config_provider(dbutils.entry_point) in
+    # databricks_utils.py). Every method a probing library reaches for must exist
+    # and return an honest undefined/None so attribute/method access never raises;
+    # otherwise the AttributeError propagates and kills the import (mlflow only
+    # catches _NoDbutilsError). See AGENTS.md.
+    def getDbutils(self, *a, **k):
+        return _CellarDbutilsProxy()
+    def getDriverConf(self, *a, **k):
+        return _CellarDriverConf()
+    def __getattr__(self, _name):
+        # getLogger / getNonUcApiToken / getReplId / getJobGroupId /
+        # clearMlflowProperties / get{Repl,User}{Local,NFS}TempDir / ... - all
+        # undefined here → a callable returning None, never a missing attribute.
+        return lambda *a, **k: None
+
+
 class _CellarDbUtils:
     def __init__(self, widgets):
         self.widgets = widgets
+        # A compatible entry_point so driver-API-probing libraries (mlflow, ...)
+        # see honest undefined/None values instead of an AttributeError at import.
+        self.entry_point = _CellarEntryPoint()
 `;
 
 /**
