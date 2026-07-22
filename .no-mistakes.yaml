@@ -1,0 +1,20 @@
+# Per-repo no-mistakes overrides.
+
+# Run cellar's real vitest suite deterministically as the test-step baseline,
+# instead of delegating to an agent. When no test command is configured,
+# no-mistakes prints "no test command configured, asking agent to run tests..."
+# and spawns an agent to build + run the suite; that agent runs everything and
+# reports success, but the process exits status 1 (a harness artifact) which the
+# gate counts as a test failure, forcing manual gate-skips. `npm test` maps to
+# `vitest run` (non-watch, CI-appropriate) and runs the full unit suite in a few
+# seconds, so the test step now passes/fails on the real result.
+#
+# Note: no-mistakes loads repo commands from the DEFAULT branch, not the pushed
+# branch, so this takes effect for every run once it has merged to main.
+commands:
+  test: 'npm test'
+
+# Keep test evidence out of this repo; it stays in a temp dir instead.
+test:
+  evidence:
+    store_in_repo: false
