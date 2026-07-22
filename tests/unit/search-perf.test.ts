@@ -22,11 +22,13 @@
  */
 import { describe, it, expect } from 'vitest';
 import { searchNotebook, createSearchCache, DEFAULT_SEARCH_OPTS } from '../../src/lib/search';
+import type { CellOutput } from '../../src/lib/server/types';
 
 interface TCell {
 	id: string;
 	cell_type: string;
 	source: string;
+	outputs?: CellOutput[];
 }
 
 /** A synthetic N-cell notebook with a mix of short/long code + markdown sources. */
@@ -76,6 +78,38 @@ describe('search keystroke latency (N=300)', () => {
 		// eslint-disable-next-line no-console
 		console.log(`[search-perf N=300] worst single call=${worstPerCall.toFixed(3)}ms`);
 		expect(worstPerCall).toBeLessThan(16);
+	});
+
+	it('scope:all with multi-MB outputs stays bounded (the per-cell cap holds)', () => {
+		// Every cell carries a ~3 MB single-line output; without the SEARCH_SCAN_CAP
+		// the engine would extract + lowercase ~900 MB per keystroke. With the cap it
+		// scans at most SEARCH_SCAN_CAP chars/cell. A realistic query matches a
+		// handful of times, so a settled query stays within a frame.
+		const HUGE = 300;
+		// A rare token near the start (within the cap) + megabytes of filler after it.
+		const bigOutput = 'x'.repeat(5000) + 'RAREMARKER' + 'y'.repeat(3_000_000);
+		const heavy: TCell[] = [];
+		for (let i = 0; i < HUGE; i++) {
+			heavy.push({
+				id: `h-${i}`,
+				cell_type: 'code',
+				source: `df${i} = load()`,
+				outputs: [{ output_type: 'stream', name: 'stdout', text: bigOutput }]
+			});
+		}
+		const cache = createSearchCache();
+		// Warm: first miss extracts+caps+lowercases each output once.
+		searchNotebook(heavy, 'raremarker', DEFAULT_SEARCH_OPTS, cache);
+		let best = Infinity;
+		for (let r = 0; r < 9; r++) {
+			const start = performance.now();
+			const m = searchNotebook(heavy, 'raremarker', DEFAULT_SEARCH_OPTS, cache);
+			best = Math.min(best, performance.now() - start);
+			expect(m).toHaveLength(HUGE); // one match per cell, all inside the cap
+		}
+		// eslint-disable-next-line no-console
+		console.log(`[search-perf N=300 big-outputs] warm call=${best.toFixed(3)}ms`);
+		expect(best).toBeLessThan(16);
 	});
 
 	it('cache-hit (steady state) is no slower than cold', () => {
