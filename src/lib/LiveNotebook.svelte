@@ -19,6 +19,7 @@
 	import type { ClientEvent } from '$lib/events-client';
 	import type { Folding } from '$lib/headings';
 	import type { StalenessMap } from '$lib/staleness';
+	import { codeIdsAll, codeIdsAbove } from '$lib/runTargets';
 	import type { ClipboardCell } from '$lib/cellClipboard';
 
 	interface Props {
@@ -1199,13 +1200,22 @@
 		refreshStaleness();
 	}
 	function codeIdsInRange(from: number, to: number): string[] {
-		return cells.slice(from, to).filter((c) => c.cell_type === 'code').map((c) => c.id);
+		return codeIdsAll(cells.slice(from, to));
 	}
 	/** Run every code cell above the selected one (exclusive). */
 	function runAbove() {
 		const i = cells.findIndex((c) => c.id === activeId);
 		if (i < 0) return;
 		runCodeIds(codeIdsInRange(0, i));
+	}
+	/**
+	 * Run every code cell above `id` (exclusive), in document order — the per-cell
+	 * "Run all above" affordance. Addressed by cell id (not the active selection),
+	 * so a cell's own button runs the cells above IT regardless of what's selected.
+	 * A no-op on the first cell (nothing above).
+	 */
+	function runAboveCell(id: string) {
+		runCodeIds(codeIdsAbove(cells, id));
 	}
 	/** Run the selected cell and every code cell below it (Jupyter's "run all below"). */
 	function runBelow() {
@@ -1788,8 +1798,8 @@
 	// server-side FIFO serializes them in submission order, and `runCell` uses each
 	// cell's live editor text. Palette "Run all cells".
 	function runAll() {
-		for (const c of cells) {
-			if (c.cell_type === 'code') runCell(c.id, cellApis[c.id]?.currentSource?.() ?? c.source);
+		for (const id of codeIdsAll(cells)) {
+			runCell(id, cellApis[id]?.currentSource?.() ?? findCell(id)?.source ?? '');
 		}
 	}
 
@@ -1925,6 +1935,8 @@
 			onToggleFold={toggleFold}
 			onRun={runCell}
 			onRunAdvance={runAndAdvance}
+			onRunAbove={runAboveCell}
+			onRunAll={runAll}
 			onInterrupt={onInterruptKernel}
 			onClear={clearCell}
 			onDelete={deleteCell}

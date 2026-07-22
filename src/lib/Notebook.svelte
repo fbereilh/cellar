@@ -37,6 +37,10 @@
 		onToggleFold?: (key: string) => void;
 		onRun: (id: string, source: string) => void;
 		onRunAdvance: (id: string, source: string, opts: { focusNext: boolean }) => void;
+		/** Run every code cell above this one (exclusive), in document order. */
+		onRunAbove?: (id: string) => void;
+		/** Run every code cell in the notebook, top to bottom. */
+		onRunAll?: () => void;
 		onInterrupt?: () => void;
 		onClear: (id: string) => void;
 		onDelete: (id: string) => void;
@@ -97,6 +101,8 @@
 		onToggleFold,
 		onRun,
 		onRunAdvance,
+		onRunAbove,
+		onRunAll,
 		onInterrupt,
 		onClear,
 		onDelete,
@@ -333,6 +339,8 @@
 	let exportFeedback = $state('');
 	let exporting = $state(false);
 	const showExportBar = $derived(!!exportTarget || exportCount > 0);
+	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
+	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 
 	function onExportTargetInput(e: Event) {
 		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value);
@@ -401,6 +409,23 @@
 	     cells use more horizontal space on wide monitors without going full-bleed
 	     on ultrawide. -->
 	<div class="mx-auto w-full max-w-[clamp(48rem,92%,88rem)] px-4 py-6" data-testid="notebook">
+		<!-- Notebook toolbar: the discoverable, top-of-notebook entry point for
+		     running the whole notebook. Enqueues every code cell through the same
+		     server-side FIFO run queue as any other run, so interrupting cancels
+		     the whole batch. -->
+		<div class="mb-4 flex items-center gap-2" data-testid="notebook-toolbar">
+			<button
+				class="btn btn-ghost btn-sm gap-1.5 text-success"
+				onclick={() => onRunAll?.()}
+				disabled={!hasCodeCell}
+				title="Run all cells top to bottom"
+				aria-label="Run all cells"
+				data-testid="run-all"
+			>
+				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
+				Run all
+			</button>
+		</div>
 		{#if showExportBar}
 			<!-- nbdev-style export: the notebook-level target `.py` module + a manual
 			     "Export to .py" button. Appears once any cell is marked for export or a
@@ -496,6 +521,7 @@
 						onToggleFold={onToggleFold}
 						onRun={onRun}
 						onRunAdvance={onRunAdvance}
+						onRunAbove={onRunAbove}
 						onInterrupt={onInterrupt}
 						onClear={onClear}
 						onDelete={onDelete}

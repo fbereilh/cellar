@@ -56,6 +56,8 @@
 		onToggleFold?: (key: string) => void;
 		onRun: (id: string, source: string) => void;
 		onRunAdvance: (id: string, source: string, opts: { focusNext: boolean }) => void;
+		/** Run every code cell above this one (exclusive), in document order. */
+		onRunAbove?: (id: string) => void;
 		/** Interrupt the shared kernel (reuses the Kernels-section handler). */
 		onInterrupt?: () => void;
 		onClear: (id: string) => void;
@@ -106,6 +108,7 @@
 		onToggleFold,
 		onRun,
 		onRunAdvance,
+		onRunAbove,
 		onInterrupt,
 		onClear,
 		onDelete,
@@ -1122,6 +1125,21 @@
 				>
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
 				</button>
+				{#if !isMarkdown}
+					<!-- Run every code cell above this one (exclusive), in document order —
+					     the Jupyter "Run All Above" convention. No-op / disabled on the first
+					     cell (nothing above). Runs through the same bulk-run/queue path. -->
+					<button
+						class="btn btn-ghost btn-xs btn-square text-base-content/60 hover:text-success"
+						onclick={() => onRunAbove?.(cell.id)}
+						disabled={index === 0}
+						title="Run all cells above"
+						aria-label="Run all cells above"
+						data-testid="run-above"
+					>
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 15l-6-6-6 6" /><path d="M12 9v11" /></svg>
+					</button>
+				{/if}
 				{#if isMarkdown}
 					{#if mode === 'rendered'}
 						<button class="btn btn-ghost btn-xs btn-square text-base-content/60" onclick={enterEdit} title="Edit markdown" aria-label="Edit markdown" data-testid="edit-md">
