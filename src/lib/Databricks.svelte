@@ -440,6 +440,8 @@
 		busy = 'connect';
 		connectingId = cluster.cluster_id;
 		connectError = null;
+		reconnectNote = '';
+		reconnectError = null;
 		try {
 			const res = await fetch('/api/databricks/connect', {
 				method: 'POST',
@@ -466,6 +468,8 @@
 		if (busy) return;
 		busy = 'disconnect';
 		connectError = null;
+		reconnectNote = '';
+		reconnectError = null;
 		try {
 			const res = await fetch(`/api/databricks/connect${pathQuery()}`, { method: 'DELETE' });
 			if (!res.ok) throw await res.json();
@@ -811,13 +815,16 @@
 					<code class="font-mono text-[10px] text-primary">spark</code> and
 					<code class="font-mono text-[10px] text-primary">w</code> are ready in the kernel.
 				</p>
+				{#if reconnectNote}
+					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/60" data-testid="databricks-reconnect-note">{reconnectNote}</p>
+				{/if}
 				{#if connection.livenessUnverified}
 					<p class="mt-1 text-[11px] leading-relaxed text-base-content/40" data-testid="databricks-unverified">
 						Liveness not confirmed (kernel busy or a transient error) - not a dead session.
 					</p>
 				{/if}
 				<div class="mt-2 flex gap-1.5">
-					<button class="btn btn-outline btn-xs flex-1" onclick={() => (switching = !switching)} disabled={!!busy} data-testid="databricks-switch">
+					<button class="btn btn-outline btn-xs flex-1" onclick={() => { switching = !switching; reconnectNote = ''; }} disabled={!!busy} data-testid="databricks-switch">
 						{switching ? 'Cancel' : 'Switch cluster'}
 					</button>
 					<button class="btn btn-outline btn-xs flex-1" onclick={disconnect} disabled={!!busy} data-testid="databricks-disconnect">
