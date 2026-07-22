@@ -23,6 +23,7 @@
 		createSearchCache
 	} from '$lib/search';
 	import type { Match, SearchCache, SearchOpts } from '$lib/search';
+	import type { SearchHighlightState } from '$lib/searchHighlight';
 	import type { Cell } from '$lib/server/types';
 
 	interface Props {
@@ -36,8 +37,14 @@
 		onClose: () => void;
 		/** Navigate to a match: the shell routes this to the active notebook's `jumpToCell`. */
 		onJump: (match: Match) => void | Promise<void>;
+		/**
+		 * Shared highlight state (Search P4): the find-bar is the sole owner of the
+		 * search, so it publishes its query/opts/matches/active index here for the
+		 * active notebook to paint in place. The shell sets `notebookPath`.
+		 */
+		highlight?: SearchHighlightState | null;
 	}
-	let { open, cells, searchCache, seed = '', onClose, onJump }: Props = $props();
+	let { open, cells, searchCache, seed = '', onClose, onJump, highlight = null }: Props = $props();
 
 	let query = $state('');
 	let debouncedQuery = $state('');
@@ -106,6 +113,20 @@
 	// Keep the active index in range as the result set shrinks under it.
 	$effect(() => {
 		if (activeIndex > total - 1) activeIndex = Math.max(0, total - 1);
+	});
+
+	// Publish the search into the shared highlight state so the active notebook can
+	// paint every match in place + emphasize the active one (P4). The find-bar owns
+	// the search; the notebook is a pure consumer. When closed we clear the query so
+	// every highlight vanishes (the notebook's `open` gate also drops them).
+	$effect(() => {
+		if (!highlight) return;
+		highlight.open = open;
+		highlight.query = open ? debouncedQuery : '';
+		highlight.caseSensitive = caseSensitive;
+		highlight.wholeWord = wholeWord;
+		highlight.matches = open ? matches : [];
+		highlight.activeIndex = activeIndex;
 	});
 
 	// Seed + focus on the open transition. Reading the current selection is a

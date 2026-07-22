@@ -26,6 +26,9 @@
 	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration } from '$lib/relativeTime';
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
+	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
+	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
+	import { setSurfaceRanges, clearSurface, buildTextRanges, allocSurfaceKey } from '$lib/domHighlight';
 	import type { CellOutput, CellType, LogicalCellType } from '$lib/server/types';
 	import type { KeyMode, UICell, SegHidden, CellRegisterApi, RemoteEdit } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
@@ -80,6 +83,13 @@
 		editorCollapsed?: boolean;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
 		onActivate?: (id: string) => void;
+		/** Find-in-page query (Search P4); empty when the find bar is closed / this
+		 *  notebook isn't the searched one. Non-empty drives in-place highlighting. */
+		searchQuery?: string;
+		searchCaseSensitive?: boolean;
+		searchWholeWord?: boolean;
+		/** This cell's highlight payload (present iff it has ≥1 match), or null. */
+		searchHighlight?: CellHighlight | null;
 		/** Hands the notebook this cell's imperative API (null on teardown). */
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		/** Reports this card's rendered height (px) into the notebook's height cache
@@ -124,6 +134,10 @@
 		editorCollapsed,
 		onSetEditorCollapsed,
 		onActivate,
+		searchQuery = '',
+		searchCaseSensitive = false,
+		searchWholeWord = false,
+		searchHighlight = null,
 		onRegister,
 		onMeasure,
 		onEditorFocus,
@@ -896,6 +910,8 @@
 					basicSetup,
 					language.of(langFor()),
 					EDITOR_THEME,
+					// Find-in-page match highlighting (Search P4), driven by `setCmSearch`.
+					cmSearchHighlight,
 					// No run/escape keymap here on purpose: every notebook shortcut,
 					// edit-mode ones included, is declared in `shortcuts.svelte.js` and
 					// dispatched by LiveNotebook's capture-phase handler (which runs
@@ -1053,7 +1069,129 @@
 			cardResizeObserver?.disconnect();
 			window.removeEventListener('pagehide', flushOnUnload);
 			onRegister?.(cell.id, null);
+			// Drop this cell's search-highlight ranges from the shared registry.
+			clearSurface(K_SRC);
+			clearSurface(K_MD);
+			clearSurface(K_OUT);
 			view?.destroy();
+		};
+	});
+
+	// ---- Find-in-page highlight (Search P4) --------------------------------------
+	// Per-instance surface keys (never the cell id - ids repeat across the several
+	// mounted notebooks). The source surface is the built editor (CM decorations) OR
+	// the static stand-in (CSS Custom Highlight); markdown/output are always DOM.
+	const hlBase = allocSurfaceKey();
+	const K_SRC = `${hlBase}:src`;
+	const K_MD = `${hlBase}:md`;
+	const K_OUT = `${hlBase}:out`;
+	// The last (query, opts, active) target we scrolled to, so we scroll on a genuine
+	// navigation but NOT on incidental re-runs (a streaming output, a source edit).
+	let lastScrollKey = '';
+
+	/**
+	 * Apply the current highlight state to this cell's visible surfaces. Runs after a
+	 * `tick()` (so Svelte has rendered the surface for the current state) and reads
+	 * live component state; the driving `$effect` establishes reactivity by reading
+	 * the deps synchronously first. View-only: it paints Ranges / CM decorations and
+	 * may scroll, but never touches `cell`.
+	 */
+	function applyHighlights() {
+		if (!browser) return;
+		const q = searchQuery;
+		const active = searchHighlight?.active ?? null;
+		const opts = { caseSensitive: searchCaseSensitive, wholeWord: searchWholeWord };
+		const scrollKey = `${q}|${searchCaseSensitive}|${searchWholeWord}|${active ? `${active.field}:${active.outputIndex ?? ''}:${active.ordinal}` : ''}`;
+		const shouldScroll = !!active && scrollKey !== lastScrollKey;
+		lastScrollKey = scrollKey;
+
+		const sourceVisible = !(isMarkdown && mode === 'rendered') && !codeHidden;
+		const sourceActive = active && (active.field === 'source' || active.field === 'markdown') ? active.ordinal : null;
+
+		// --- source surface: the built editor, else the static stand-in ---
+		if (sourceVisible && editorBuilt && view) {
+			clearSurface(K_SRC);
+			view.dispatch({
+				effects: setCmSearch.of(q ? { query: q, caseSensitive: opts.caseSensitive, wholeWord: opts.wholeWord, activeOrdinal: sourceActive } : null)
+			});
+			if (shouldScroll && sourceActive != null) {
+				const m = activeCmMatch(view);
+				if (m) view.dispatch({ effects: EditorView.scrollIntoView(m.from, { y: 'center' }) });
+			}
+		} else {
+			if (view) view.dispatch({ effects: setCmSearch.of(null) });
+			const el = sourceVisible ? (cardEl?.querySelector('[data-testid="static-code"] .cm-static-content') as Element | null) : null;
+			paintDomSurface(K_SRC, el, q, opts, sourceActive, shouldScroll);
+		}
+
+		// --- rendered markdown ---
+		const mdEl = isMarkdown && mode === 'rendered' ? (cardEl?.querySelector('[data-testid="markdown-rendered"]') as Element | null) : null;
+		const mdActive = active && active.field === 'markdown' ? active.ordinal : null;
+		paintDomSurface(K_MD, mdEl, q, opts, mdActive, shouldScroll);
+
+		// --- output ---
+		const outEl = !isMarkdown && outputs.length ? outputInner : null;
+		const outActive = active && active.field === 'output' ? active.ordinal : null;
+		paintDomSurface(K_OUT, outEl, q, opts, outActive, shouldScroll);
+	}
+
+	/** Paint one DOM surface (or clear it when `el`/`query` is absent). */
+	function paintDomSurface(
+		key: string,
+		el: Element | null,
+		query: string,
+		opts: { caseSensitive: boolean; wholeWord: boolean },
+		activeOrdinal: number | null,
+		shouldScroll: boolean
+	) {
+		if (!el || !query) {
+			clearSurface(key);
+			return;
+		}
+		const ranges = buildTextRanges(el, query, opts, findOccurrences);
+		if (!ranges.length) {
+			clearSurface(key);
+			return;
+		}
+		let activeRange: Range | null = null;
+		if (activeOrdinal != null && activeOrdinal >= 0 && activeOrdinal < ranges.length) {
+			activeRange = ranges[activeOrdinal];
+		}
+		const base = activeRange ? ranges.filter((r) => r !== activeRange) : ranges;
+		setSurfaceRanges(key, base, activeRange ? [activeRange] : []);
+		if (shouldScroll && activeRange) {
+			const anchor =
+				activeRange.startContainer.nodeType === Node.ELEMENT_NODE
+					? (activeRange.startContainer as Element)
+					: activeRange.startContainer.parentElement;
+			anchor?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+		}
+	}
+
+	// Drive highlighting. Reads every dep that changes WHAT is shown (so a surface
+	// swap - editor built, markdown render/edit, code hidden, outputs streaming,
+	// source edited - re-paints), then applies after a tick so the DOM reflects the
+	// current render. Highlighting is bounded to this (mounted) cell; a windowed-out
+	// cell has no instance, so it simply highlights when it mounts.
+	$effect(() => {
+		// Track the reactive inputs.
+		void searchQuery;
+		void searchCaseSensitive;
+		void searchWholeWord;
+		void searchHighlight;
+		void editorBuilt;
+		void isMarkdown;
+		void mode;
+		void codeHidden;
+		void outputs;
+		void liveSource;
+		if (!browser) return;
+		let cancelled = false;
+		tick().then(() => {
+			if (!cancelled) applyHighlights();
+		});
+		return () => {
+			cancelled = true;
 		};
 	});
 </script>

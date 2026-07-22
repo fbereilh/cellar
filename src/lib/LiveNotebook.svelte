@@ -9,6 +9,7 @@
 	import { exportCellCount } from '$lib/exportRole';
 	import { createSearchCache } from '$lib/search';
 	import type { SearchCache, Match } from '$lib/search';
+	import { buildCellHighlights, type SearchHighlightState } from '$lib/searchHighlight';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
 	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
@@ -62,6 +63,13 @@
 		onInterruptKernel?: () => void;
 		/** (path, record|null): the focused cell's git blame, for the shell footer. */
 		onBlame?: (path: string, record: BlameLine | null) => void;
+		/**
+		 * The shell's shared find-in-page highlight state (Search P4). This notebook
+		 * paints highlights only when the bar is open AND it is the searched notebook
+		 * (`notebookPath === path`); cell ids repeat across the several mounted
+		 * notebooks, so the path gate is what keeps a background notebook dark.
+		 */
+		searchHighlight?: SearchHighlightState | null;
 	}
 
 	/** A structural document event as this component reads it (see events.js). */
@@ -127,8 +135,21 @@
 		onRunStart,
 		onRunEnd,
 		onInterruptKernel,
-		onBlame
+		onBlame,
+		searchHighlight = null
 	}: Props = $props();
+
+	// Find-in-page highlighting is scoped to THIS notebook only when the bar is open
+	// and it is the searched one. Cell ids repeat across the several mounted
+	// notebooks, so a background notebook must stay dark even for the same query.
+	const searchOn = $derived(
+		!!searchHighlight && searchHighlight.open && searchHighlight.notebookPath === path
+	);
+	const cellHighlights = $derived(
+		searchOn && searchHighlight
+			? buildCellHighlights(searchHighlight.matches, searchHighlight.activeIndex)
+			: null
+	);
 
 	let cells = $state<UICell[]>([]);
 	let fetching = $state(true); // loading the notebook's cells from the server
@@ -2034,6 +2055,10 @@
 			onRegister={registerCell}
 			onEditorFocus={onEditorFocus}
 			onEditorBlur={onEditorBlur}
+			searchQuery={searchOn && searchHighlight ? searchHighlight.query : ''}
+			searchCaseSensitive={searchHighlight?.caseSensitive ?? false}
+			searchWholeWord={searchHighlight?.wholeWord ?? false}
+			{cellHighlights}
 			onAddCell={addCell}
 			onInsertCell={insertCell}
 		/>
