@@ -9,6 +9,8 @@
 	import { isOverKernelCap } from '$lib/kernelCap';
 	import { DEFAULT_SECTION_ORDER, reconcileSectionOrder } from '$lib/sidebarSections';
 	import { outlineRows as buildOutlineRows, sectionRunState, headingNumberPrefix } from '$lib/headings';
+	import { searchNotebook, groupByCell, createSearchCache, DEFAULT_SEARCH_OPTS } from '$lib/search';
+	import type { SearchCache } from '$lib/search';
 	import { getUi, setUi } from '$lib/uiState';
 	import { makeIgnoredMatcher } from '$lib/gitIgnored';
 	import type { Cell } from '$lib/server/types';
@@ -46,6 +48,13 @@
 
 	interface Props {
 		cells: Cell[];
+		/**
+		 * The active notebook's per-cell search-text cache (owned by its LiveNotebook).
+		 * Passed into the shared engine so a keystroke reuses each cell's lowercased
+		 * text instead of re-folding it. Undefined until a notebook registers one - the
+		 * search then falls back to a private cache so it still works.
+		 */
+		searchCache?: SearchCache;
 		foldedIds?: Set<string>;
 		foldCounts?: Record<string, number>;
 		/** The active notebook's currently-running cell (from the shared kernel), or null. */
@@ -92,6 +101,7 @@
 
 	let {
 		cells,
+		searchCache,
 		// The active notebook's collapsible-heading state, owned by its LiveNotebook.
 		// The Outline is a second view of it, never a second copy: a chevron here
 		// calls straight into the notebook's `toggleFold`.
@@ -595,18 +605,39 @@
 	const sectionRun = $derived(sectionRunState(cells, runningId, new Set(Object.keys(queued))));
 
 	// ---- Search (over cell content) -----------------------------------------
+	// Backed by the shared, cached engine (`$lib/search`): P1 is source-only,
+	// substring, case-insensitive, but returns EVERY match so we can show a real
+	// total count and a per-cell count. The query is debounced ~120ms so typing
+	// mid-word does not re-scan; the per-cell text cache (owned by the notebook,
+	// or a private fallback) means a keystroke reuses each cell's lowercased text
+	// instead of re-folding it.
 	let query = $state('');
-	const matches = $derived.by(() => {
-		const q = query.trim().toLowerCase();
-		if (!q) return [];
-		const out: { cellId: string; cellType: string; snippet: string }[] = [];
-		for (const cell of cells) {
-			const src = cell.source || '';
-			if (!src.toLowerCase().includes(q)) continue;
-			const line = src.split('\n').find((l) => l.toLowerCase().includes(q)) || src.split('\n')[0] || '';
-			out.push({ cellId: cell.id, cellType: cell.cell_type, snippet: line.trim().slice(0, 80) });
+	let debouncedQuery = $state('');
+	// A private cache used until the active notebook registers its own (or when a
+	// plain file tab is focused and there is no live notebook cache).
+	const fallbackSearchCache = createSearchCache();
+	$effect(() => {
+		const q = query.trim();
+		// Clear instantly when emptied (find-in-page feel); otherwise debounce.
+		if (!q) {
+			debouncedQuery = '';
+			return;
 		}
-		return out;
+		const t = setTimeout(() => (debouncedQuery = q), 120);
+		return () => clearTimeout(t);
+	});
+	const searchMatches = $derived(
+		debouncedQuery
+			? searchNotebook(cells, debouncedQuery, DEFAULT_SEARCH_OPTS, searchCache ?? fallbackSearchCache)
+			: []
+	);
+	const totalMatches = $derived(searchMatches.length);
+	// One row per matching cell (navigation is to the cell), in document order,
+	// each carrying its own match count.
+	const matchGroups = $derived.by(() => {
+		if (!searchMatches.length) return [];
+		const typeOf = new Map(cells.map((c) => [c.id, c.cell_type]));
+		return groupByCell(searchMatches, (id) => typeOf.get(id) ?? 'code');
 	});
 
 	// ---- Connect an agent (zero-config MCP) ---------------------------------
@@ -1357,13 +1388,20 @@
 				<svg class="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></svg>
 				<input type="text" class="grow text-xs" placeholder="search cells…" bind:value={query} data-testid="search-input" />
 			</label>
-			{#if query.trim()}
-				<p class="px-1 pt-2 text-[11px] text-base-content/40">{matches.length} match{matches.length === 1 ? '' : 'es'}</p>
+			{#if debouncedQuery}
+				<p class="px-1 pt-2 text-[11px] text-base-content/40" data-testid="search-count">
+					{totalMatches} match{totalMatches === 1 ? '' : 'es'}{matchGroups.length
+						? ` in ${matchGroups.length} cell${matchGroups.length === 1 ? '' : 's'}`
+						: ''}
+				</p>
 				<div class="pt-1">
-					{#each matches as m (m.cellId)}
-						<button class="block w-full rounded px-1.5 py-1 text-left hover:bg-base-300/60" onclick={() => onScrollToCell(m.cellId)} data-testid="search-result">
-							<span class="mr-1 badge badge-xs {m.cellType === 'markdown' ? 'badge-secondary' : 'badge-primary'} badge-soft">{m.cellType === 'markdown' ? 'md' : 'py'}</span>
-							<span class="font-mono text-xs text-base-content/70">{m.snippet}</span>
+					{#each matchGroups as g (g.cellId)}
+						<button class="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left hover:bg-base-300/60" onclick={() => onScrollToCell(g.cellId)} data-testid="search-result">
+							<span class="badge badge-xs {g.cellType === 'markdown' ? 'badge-secondary' : 'badge-primary'} badge-soft">{g.cellType === 'markdown' ? 'md' : 'py'}</span>
+							<span class="min-w-0 grow truncate font-mono text-xs text-base-content/70">{g.snippet}</span>
+							{#if g.count > 1}
+								<span class="badge badge-ghost badge-xs shrink-0 tabular-nums" data-testid="search-result-count" title="{g.count} matches in this cell">{g.count}</span>
+							{/if}
 						</button>
 					{/each}
 				</div>

@@ -19,6 +19,7 @@
 	import type { PageData } from './$types';
 	import type { Cell } from '$lib/server/types';
 	import type { UICell, FoldRegistryHandle, NumberingRegistryHandle, NotebookApiHandle } from '$lib/types';
+	import type { SearchCache } from '$lib/search';
 	import type { Folding } from '$lib/headings';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import type { BlameLine } from '$lib/server/git';
@@ -153,6 +154,15 @@
 		else notebookApis.delete(path);
 	}
 
+	// Each mounted LiveNotebook's per-cell search-text cache, keyed by path. Reactive
+	// (unlike `notebookApis`) so the sidebar Search re-derives when the active notebook
+	// changes; the cache itself is owned by its notebook and self-invalidates on edit/run.
+	let searchCaches = $state<Record<string, SearchCache>>({});
+	function registerSearchCache(path: string, cache: SearchCache | null) {
+		if (cache) searchCaches[path] = cache;
+		else delete searchCaches[path];
+	}
+
 	/**
 	 * Append a code cell to the active notebook and run it - the sidebar's
 	 * point-and-click table preview. Focus the notebook's tab first: a hidden pane
@@ -284,6 +294,11 @@
 					: null
 	);
 	const activeCells = $derived((activeNotebookPath && notebooksCells[activeNotebookPath]) || []);
+	// The active notebook's search-text cache (registered by its LiveNotebook),
+	// handed to the sidebar Search so it runs the shared engine over it.
+	const activeSearchCache = $derived(
+		(activeNotebookPath && searchCaches[activeNotebookPath]) || undefined
+	);
 	const activeFolds = $derived((activeNotebookPath && notebooksFolds[activeNotebookPath]) || null);
 	const activeNumbering = $derived((activeNotebookPath && notebooksNumbering[activeNotebookPath]) || null);
 	const activeHideAllCode = $derived(!!(activeNotebookPath && notebooksHideAll[activeNotebookPath]));
@@ -1191,6 +1206,7 @@
 			<div class="shrink-0 border-r border-base-300" style="width: {sidebarWidth}px">
 				<Sidebar
 					cells={activeCells}
+					searchCache={activeSearchCache}
 					foldedIds={activeFolds?.foldedIds ?? EMPTY_FOLDS}
 					foldCounts={activeFolds?.folding?.counts ?? {}}
 					runningId={activeRunState?.runningId ?? null}
@@ -1256,6 +1272,7 @@
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
+						onRegisterSearchCache={registerSearchCache}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(canonicalNotebookRel)}
@@ -1279,6 +1296,7 @@
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
+						onRegisterSearchCache={registerSearchCache}
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(tab.path)}

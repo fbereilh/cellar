@@ -7,6 +7,8 @@
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
 	import { exportCellCount } from '$lib/exportRole';
+	import { createSearchCache } from '$lib/search';
+	import type { SearchCache } from '$lib/search';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
 	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
@@ -43,6 +45,13 @@
 		onRegisterFolds?: (path: string, handle: FoldRegistryHandle | null) => void;
 		/** (path, api|null): lets the sidebar drop a cell in here. */
 		onRegisterApi?: (path: string, api: NotebookApiHandle | null) => void;
+		/**
+		 * (path, cache|null): publishes this notebook's per-cell search-text cache
+		 * up so the sidebar Search (and, later, the find-bar) run the shared engine
+		 * over it. The cache is owned here because this component owns `cells` and
+		 * their lifecycle; entries self-invalidate on content change (see search.ts).
+		 */
+		onRegisterSearchCache?: (path: string, cache: SearchCache | null) => void;
 		onRunStart?: (path: string, id: string) => void;
 		onRunEnd?: () => void;
 		/** Interrupt the shared kernel (same handler the Kernels sidebar uses). */
@@ -109,6 +118,7 @@
 		onRegisterFolds,
 		onRegisterNumbering,
 		onRegisterApi,
+		onRegisterSearchCache,
 		onRunStart,
 		onRunEnd,
 		onInterruptKernel,
@@ -277,6 +287,14 @@
 	$effect(() => {
 		onRegisterNumbering?.(path, { setLevel: setNumberingLevel });
 		return () => onRegisterNumbering?.(path, null);
+	});
+	// This notebook's per-cell search-text cache. Owned here (we own `cells`),
+	// published up so the sidebar Search runs the shared engine over it; entries
+	// self-invalidate on content change, so a bare stable reference is all we pass.
+	const searchCache: SearchCache = createSearchCache();
+	$effect(() => {
+		onRegisterSearchCache?.(path, searchCache);
+		return () => onRegisterSearchCache?.(path, null);
 	});
 
 	function foldStorageKey(): string | null {
