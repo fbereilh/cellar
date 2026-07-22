@@ -76,6 +76,14 @@ export interface NotebookApiHandle {
 	 */
 	revealRunning: () => void;
 	/**
+	 * Abort this notebook's own queued / browser-held run requests (all but the
+	 * currently running cell). Called by the shell's interrupt handler BEFORE it
+	 * hits the server: freeing the connections those streaming run requests hold is
+	 * what lets the interrupt request actually reach the server (otherwise the
+	 * HTTP/1.1 connection pool starves it), and it cancels the queued runs at once.
+	 */
+	cancelQueuedRuns: () => void;
+	/**
 	 * Flush every cell's pending (not-yet-autosaved) edit and let the normal
 	 * PATCH persistence write the notebook now. Resolves once the flushed edits
 	 * are persisted — the Cmd/Ctrl+S save path.

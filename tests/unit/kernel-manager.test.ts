@@ -74,8 +74,10 @@ import {
 	loadedNotebookPaths,
 	listKernels,
 	shutdownKernel,
-	restartKernel
+	restartKernel,
+	interruptKernel
 } from '../../src/lib/server/kernel';
+import { clearRunQueue } from '../../src/lib/server/run-queue';
 
 const A = '/ws/a.ipynb';
 const B = '/ws/b.ipynb';
@@ -136,6 +138,27 @@ describe('kernel manager (per notebook)', () => {
 		expect(currentSessionId(B)).toBe(bBefore);
 		// Restart did not start a new kernel (it reuses the connection).
 		expect(h.startNew).not.toHaveBeenCalled();
+	});
+
+	it('interrupt drops that notebook\'s pending run queue and interrupts only its kernel', async () => {
+		vi.mocked(clearRunQueue).mockClear();
+		const info = await interruptKernel(A);
+		// interrupt() was awaited (a throw would reject) and reports A's live kernel.
+		expect(info.id).toBe(getKernelInfo(A).id);
+		// The task's core invariant: "stop" clears the whole pending queue, so a
+		// queued cell can never advance after the running one is interrupted.
+		expect(clearRunQueue).toHaveBeenCalledWith(A, 'kernel_interrupt');
+		// Scoped to A: interrupting one notebook never drops another's queue.
+		expect(clearRunQueue).not.toHaveBeenCalledWith(B, expect.anything());
+	});
+
+	it('interrupt of a notebook with no kernel still clears its queue but starts nothing', async () => {
+		vi.mocked(clearRunQueue).mockClear();
+		const C = '/ws/c.ipynb';
+		const info = await interruptKernel(C);
+		expect(info).toEqual({ status: 'not_started', id: null });
+		expect(clearRunQueue).toHaveBeenCalledWith(C, 'kernel_interrupt');
+		expect(h.startNew).not.toHaveBeenCalled(); // never force-boots a kernel
 	});
 
 	it('resolves a bare (no-arg) call to the active notebook', async () => {

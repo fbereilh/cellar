@@ -965,6 +965,13 @@
 	// namespace, so drop the now-stale inspector rows.
 	const kernelJson = { method: 'POST', headers: { 'content-type': 'application/json' } };
 	async function interruptKernel(path: string) {
+		// Abort this notebook's queued/held run fetches FIRST (synchronous, no network):
+		// they hold the streaming connections that would otherwise starve the interrupt
+		// request out of the browser's HTTP/1.1 connection pool, so without this the
+		// interrupt can't reach the server until the running cell finishes on its own -
+		// and the queue drains meanwhile. This also cancels the queued runs; the
+		// server's own `clearRunQueue` on interrupt is the backstop for any that raced in.
+		notebookApis.get(path)?.cancelQueuedRuns?.();
 		try {
 			await fetch('/api/kernel/interrupt', { ...kernelJson, body: JSON.stringify({ path }) });
 		} catch {}
