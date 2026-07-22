@@ -216,10 +216,18 @@
 		// top, replacing its assumed height with the measured one would shift the
 		// visible content by the delta — a jump. Compensate scrollTop by that delta
 		// in the SAME frame (this runs inside the card's ResizeObserver callback, i.e.
-		// after layout but before paint), so the correction is invisible. Native
-		// `overflow-anchor: auto` on the scroll pane covers the visible-anchor cases;
-		// this covers the one it can't — an above-viewport row (often a spacer) being
-		// resized. Only ever active while windowing is on.
+		// after layout but before paint), so the correction is invisible. Under
+		// windowing the scroll pane sets `overflow-anchor: none` (see +page.svelte), so
+		// native scroll anchoring is DISABLED and explicit scrollCompensation is the
+		// SINGLE authority for above-viewport height corrections — this is what stops
+		// native + explicit from double-compensating an in-place resize of a pinned
+		// above-fold cell (streaming into a runningId cell with follow off, an output
+		// clear, an editor collapse). With the flag OFF native anchoring stays on and
+		// recordHeight does no compensation.
+		// KNOWN GAP (deferred P3/P4): a STRUCTURAL add/delete of a cell ABOVE the
+		// viewport is not compensated — explicit only fires from this measured-cell
+		// ResizeObserver path, which a structural insert/delete does not go through.
+		// Rare in practice and the pane is default-off.
 		if (virtualize && containerEl && viewportTop > 0) {
 			const parent = scrollParentOf(containerEl);
 			// C = the cell-stack container's top within the scroll pane (page padding
