@@ -8,7 +8,7 @@
 	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
 	import { exportCellCount } from '$lib/exportRole';
 	import { createSearchCache } from '$lib/search';
-	import type { SearchCache } from '$lib/search';
+	import type { SearchCache, Match } from '$lib/search';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
 	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
@@ -306,7 +306,7 @@
 	// action the modal keyboard runs for a registry shortcut id, so the palette and
 	// the keyboard share one handler and cannot diverge.
 	$effect(() => {
-		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, toggleHideAllCode, save, revealRunning, cancelQueuedRuns });
+		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, toggleHideAllCode, save, revealRunning, jumpToCell, focusRoot, cancelQueuedRuns });
 		return () => onRegisterApi?.(path, null);
 	});
 	$effect(() => {
@@ -630,6 +630,22 @@
 		scrollPins = next;
 	}
 
+	// The single seam that makes an arbitrary cell reachable for scrolling: reveal
+	// (unfold) any collapsed section hiding it, and PIN it so windowing mounts it
+	// (off-screen cells are spacers, so a `querySelector` would otherwise miss).
+	// Returns the cell's DOM node once it is in the tree, or null if it does not
+	// exist. Virtualization only has to make this ONE primitive mount off-screen
+	// cells; run-follow, jump-to-running, and the find-bar all route through it.
+	// The CALLER is responsible for `unpinScrollTarget(id)` once it has scrolled.
+	async function ensureCellMounted(id: string): Promise<HTMLElement | null> {
+		revealCell(id);
+		pinScrollTarget(id);
+		await tick(); // a just-revealed (unfolded) or off-screen (windowed) cell needs its DOM node
+		// Scope the lookup to THIS notebook: cell ids are unique per document, not
+		// across documents, and every open notebook stays mounted (hidden).
+		return (rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null) ?? null;
+	}
+
 	// Explicit "jump to running cell": reveal + center this notebook's running
 	// (or, failing that, first queued) cell, regardless of the `follow` preference,
 	// the typing guard, or the imports-cell skip that the automatic follow-effect
@@ -637,13 +653,34 @@
 	async function revealRunning() {
 		const id = runningId ?? Object.keys(queued)[0] ?? null;
 		if (!id) return;
-		revealCell(id);
-		pinScrollTarget(id);
-		await tick(); // a just-revealed (unfolded) or off-screen (windowed) cell needs its DOM node
-		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null;
+		const el = await ensureCellMounted(id);
 		if (el) scrollElementIntoView(el);
 		await tick();
 		unpinScrollTarget(id); // now in the natural window (or already pinned as runningId)
+	}
+
+	// The find-in-page navigation seam. `jumpToCell` reveals + mounts the target
+	// (so a windowed-out match still navigates - the crucial virtualization
+	// cooperation), scrolls it into view, and flashes it. `match` is accepted for
+	// a future match-precise scroll + highlight (P4); today the whole cell is
+	// centered + flashed, the report's sanctioned P3 fallback (§5.3). Resolves to
+	// the mounted node (or null if the cell is gone).
+	async function jumpToCell(id: string, _match?: Match): Promise<HTMLElement | null> {
+		const el = await ensureCellMounted(id);
+		if (el) {
+			scrollElementIntoView(el);
+			el.classList.add('cellar-flash');
+			setTimeout(() => el.classList.remove('cellar-flash'), 1200);
+		}
+		await tick();
+		unpinScrollTarget(id);
+		return el;
+	}
+
+	// Return keyboard focus to this notebook (e.g. after the find bar closes), so
+	// command-mode keys work again without the user first clicking a cell.
+	function focusRoot() {
+		rootEl?.focus({ preventScroll: true });
 	}
 
 	async function followCell(id: string) {
@@ -653,13 +690,9 @@
 		// real cell runs - jarring. Leave the user's scroll put. Position-independent:
 		// keyed on the role, not the top, so it holds now the cell can live anywhere.
 		if (isImportsCell(findCell(id))) return;
-		revealCell(id);
-		pinScrollTarget(id);
 		try {
-			await tick(); // an `add_and_run` cell (or a just-revealed / windowed one) needs its DOM node
-			// Scope the lookup to THIS notebook: cell ids are unique per document, not
-			// across documents, and every open notebook stays mounted (hidden).
-			const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null;
+			// an `add_and_run` cell (or a just-revealed / windowed one) needs its DOM node
+			const el = await ensureCellMounted(id);
 			if (!el || cellIsVisible(el)) return;
 			scrollElementIntoView(el);
 			await tick();

@@ -101,6 +101,8 @@
 		activeFilePath?: string | null;
 		fsRefreshSignal?: number;
 		onScrollToCell: (cellId: string, key?: string) => void;
+		/** Open the floating find-in-page bar (Search P3) over the active notebook. */
+		onOpenFindBar?: () => void;
 		onFsChange?: (change: FsChange) => void;
 		activeNotebookPath?: string | null;
 	}
@@ -151,6 +153,7 @@
 		activeFilePath = null,
 		fsRefreshSignal = 0,
 		onScrollToCell,
+		onOpenFindBar,
 		onFsChange,
 		// The active notebook (workspace-relative path, or null). Drives the History
 		// (checkpoints) panel, which is per-notebook.
@@ -1365,10 +1368,23 @@
 	</div>
 	{#if open.search}
 		<div class="px-3 pb-3" data-testid="search-body">
-			<label class="input input-sm input-bordered flex items-center gap-2">
-				<svg class="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></svg>
-				<input type="text" class="grow text-xs" placeholder="search cells…" bind:value={query} data-testid="search-input" />
-			</label>
+			<div class="flex items-center gap-1.5">
+				<label class="input input-sm input-bordered flex grow items-center gap-2">
+					<svg class="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></svg>
+					<input type="text" class="grow text-xs" placeholder="search cells…" bind:value={query} data-testid="search-input" />
+				</label>
+				<!-- Open the floating find-in-page bar over the notebook (count + next/prev
+				     navigation). The list below stays the "all matching cells" view. -->
+				<button
+					class="btn btn-sm btn-ghost btn-square shrink-0"
+					title="Open the floating find bar (find in page)"
+					aria-label="Open find bar"
+					onclick={() => onOpenFindBar?.()}
+					data-testid="open-find-bar"
+				>
+					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6" /><line x1="4" y1="12" x2="14" y2="12" /><line x1="4" y1="18" x2="10" y2="18" /></svg>
+				</button>
+			</div>
 			<div class="mt-1.5 flex items-center gap-1" role="group" aria-label="Search scope" data-testid="search-scope">
 				<button
 					class="btn btn-xs {searchScope === 'all' ? 'btn-primary' : 'btn-ghost'}"

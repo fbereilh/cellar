@@ -9,6 +9,7 @@
  */
 
 import type { Cell } from '$lib/server/types';
+import type { Match } from '$lib/search';
 
 /** Jupyter-style modal keyboard mode for the notebook. */
 export type KeyMode = 'command' | 'edit';
@@ -75,6 +76,17 @@ export interface NotebookApiHandle {
 	 * automatic follow-effect honors. No-op when nothing is running or queued.
 	 */
 	revealRunning: () => void;
+	/**
+	 * The single find-in-page navigation seam (shared with the virtualization
+	 * mounting primitive): reveal (unfold) + **mount** the target cell - so it
+	 * works even when virtualization has windowed it out of the DOM - then scroll
+	 * it into view and flash it. `match` is accepted for a future match-precise
+	 * scroll/highlight (P4); today the whole cell is centered + flashed. Resolves
+	 * to the mounted cell node, or null when the cell no longer exists.
+	 */
+	jumpToCell: (id: string, match?: Match) => Promise<HTMLElement | null>;
+	/** Return keyboard focus to this notebook's root (e.g. after closing the find bar). */
+	focusRoot: () => void;
 	/**
 	 * Abort this notebook's own queued / browser-held run requests (all but the
 	 * currently running cell). Called by the shell's interrupt handler BEFORE it

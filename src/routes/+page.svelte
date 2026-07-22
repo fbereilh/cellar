@@ -9,6 +9,8 @@
 	import { isImagePath } from '$lib/imagePath';
 	import Settings from '$lib/Settings.svelte';
 	import CommandPalette from '$lib/CommandPalette.svelte';
+	import FindBar from '$lib/FindBar.svelte';
+	import type { Match } from '$lib/search';
 	import { buildCommands } from '$lib/commands';
 	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte';
 	import LogsPanel from '$lib/LogsPanel.svelte';
@@ -213,6 +215,12 @@
 	let sidebarOpen = $state(true);
 	let settingsOpen = $state(false);
 	let paletteOpen = $state(false);
+	// The floating find-in-page bar (Search P3). Opened from a non-Ctrl entry point
+	// (the sidebar Search button, or the `open-find` shortcut) - Ctrl+F interception
+	// is P5. `findSeed` holds the text selection captured at open time; the bar
+	// seeds its query from it only on the closed->open transition.
+	let findOpen = $state(false);
+	let findSeed = $state('');
 	// Transient, dismissable status line (jupytext env not ready, convert result, …).
 	let notice = $state('');
 	let theme = $state('dim');
@@ -876,6 +884,26 @@
 		setTimeout(() => el.classList.remove('cellar-flash'), 1200);
 	}
 
+	// ---- Find-in-page (floating find bar, Search P3) ------------------------
+	// Open the bar, seeding its query from the current text selection (native find
+	// behavior). Capturing the selection here - before focus moves to the find
+	// input - is what makes the seed reliable.
+	function openFindBar() {
+		findSeed = (typeof window !== 'undefined' && window.getSelection?.()?.toString().trim()) || '';
+		findOpen = true;
+	}
+	function closeFindBar() {
+		findOpen = false;
+		// Return keyboard focus to the notebook so command-mode keys work again.
+		activeNotebookApi()?.focusRoot();
+	}
+	// Route a match jump to the ACTIVE notebook's `jumpToCell`, which awaits
+	// `ensureCellMounted` first - so a match in a cell windowed out by
+	// virtualization mounts before it scrolls (the crucial cooperation).
+	function jumpToMatch(match: Match) {
+		void activeNotebookApi()?.jumpToCell(match.cellId, match);
+	}
+
 	// ---- Kernel + variables (sidebar) ---------------------------------------
 	// `kernelInfo` is the ACTIVE notebook's kernel (navbar badge, variable inspector,
 	// Databricks panel — all follow the focused notebook). `kernels` is the full
@@ -1154,6 +1182,17 @@
 				saveActiveNotebook();
 				return;
 			}
+			// Open the find bar (temporary non-Ctrl entry point; Ctrl+F is P5). Shell-
+			// level so it fires with focus inside an editor, and only when a notebook is
+			// active - a plain file tab has nothing to find across cells. A modal owns
+			// the keyboard while up.
+			if (bindsFor('open-find').includes(chord)) {
+				if (!activeNotebookPath || document.querySelector('.modal-open')) return;
+				e.preventDefault();
+				e.stopPropagation();
+				openFindBar();
+				return;
+			}
 			if (!bindsFor('command-palette').includes(chord)) return;
 			if (!paletteOpen && document.querySelector('.modal-open')) return; // another modal owns the keyboard
 			e.preventDefault();
@@ -1256,6 +1295,7 @@
 					onOpenFilePermanent={openFilePermanent}
 					onFocusNotebook={selectTab}
 					onScrollToCell={scrollToCell}
+					onOpenFindBar={openFindBar}
 					onFsChange={handleFsChange}
 				/>
 			</div>
@@ -1271,6 +1311,18 @@
 		{/if}
 
 		<main class="relative min-w-0 flex-1 overflow-hidden">
+			<!-- Floating find-in-page bar over the active notebook pane (Search P3).
+			     Reads the active notebook's cells + shared search cache; every jump
+			     routes to the active notebook's `jumpToCell` (mounts a windowed-out
+			     match before scrolling). -->
+			<FindBar
+				open={findOpen}
+				cells={activeCells}
+				searchCache={activeSearchCache}
+				seed={findSeed}
+				onClose={closeFindBar}
+				onJump={jumpToMatch}
+			/>
 			<!-- Every open notebook stays mounted (editor + run state preserved),
 			     just hidden. The default notebook and opened `.ipynb` files use the
 			     same live component; each persists to its own file. -->
