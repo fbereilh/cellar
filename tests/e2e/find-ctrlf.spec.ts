@@ -145,8 +145,13 @@ test('Ctrl+F while the bar is already open re-focuses/re-seeds, does not close',
 	await expect(findCount(page)).toHaveText('1/1');
 
 	// Move focus off the input, then press Ctrl+F again: the bar stays open and
-	// focus returns to the input (a repeat native-find press).
+	// focus returns to the input (a repeat native-find press). Wait for the click's
+	// async focus-follows-selection to settle (the input loses focus) before the
+	// repeat press - otherwise, in a large notebook where the click lands on a cell,
+	// that pending cell-focus races the reseed refocus (a test-only timing artifact,
+	// not something a real user hits between a click and a keystroke).
 	await page.getByTestId('notebook-root').click();
+	await expect(findInput(page)).not.toBeFocused();
 	await page.keyboard.press('ControlOrMeta+f');
 	await expect(findBar(page)).toBeVisible(); // NOT closed
 	await expect(findInput(page)).toBeFocused();
