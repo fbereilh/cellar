@@ -137,14 +137,19 @@ cluster you already chose - the same one-click recovery agents and the automatic
 expiry self-heal use, so it may briefly restart the kernel (and wipe its
 namespace) when a `databricks-connect` re-pin is needed.
 
-Once connected, the **Databricks** section also carries a **Databricks runtime**
-toggle (on by default for a connected notebook). It advertises
+Once connected, the **Databricks** section shows two cards - a **Cluster** card
+(the connection identity plus Switch/Disconnect, or Reconnect when a session
+dropped) and a separate **Runtime** card carrying the **Databricks runtime**
+toggle (on by default for a connected notebook). The runtime setting advertises
 `DATABRICKS_RUNTIME_VERSION` in the kernel so pasted Databricks-notebook code that
 gates on `IS_DATABRICKS` takes its interactive `dbutils.widgets` path instead of a
-local CLI fallback. Because that gate is read at import time, changes apply at
-kernel start/restart only - the panel shows a "restart to apply" hint and a Restart
-button. Force it (and the advertised version) headless with `CELLAR_DATABRICKS_RUNTIME`
-/ `CELLAR_DATABRICKS_RUNTIME_VERSION` (see the reference below).
+local CLI fallback. Because that gate is read at import time, the setting is
+applied by **restarting the kernel** - so connecting (or switching) a cluster
+auto-enables the runtime and restarts the kernel for you, and toggling the Runtime
+card likewise restarts immediately (which clears the kernel namespace). No manual
+"restart to apply" step. Force the setting (and the advertised version) headless
+with `CELLAR_DATABRICKS_RUNTIME` / `CELLAR_DATABRICKS_RUNTIME_VERSION` (see the
+reference below).
 
 ## Configuration reference (environment variables)
 
