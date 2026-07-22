@@ -173,6 +173,15 @@
 	--cellar-cm-search-match: light-dark(#ffe08a80, #72a1ff59);
 	--cellar-cm-search-match-outline: light-dark(transparent, #457dff);
 	--cellar-cm-search-match-selected: light-dark(#ffab5b80, #6199ff2f);
+	/* Find-in-page (Search P4) in-place highlights over the RENDERED surfaces
+	 * (static code, markdown, outputs) via the CSS Custom Highlight API + the
+	 * `<mark>` fallback. `::highlight()` accepts only color/background/text-*, so the
+	 * active match is carried by an opaque, warm background (distinct from the
+	 * translucent all-match tint in BOTH schemes - unlike the CM panel's dark
+	 * "selected" which leans on an outline the Highlight API can't draw). */
+	--cellar-search-all: light-dark(#ffe08a80, #72a1ff59);
+	--cellar-search-active-bg: light-dark(#ff9632, #ffab48);
+	--cellar-search-active-fg: #1a1a1a;
 	--cellar-cm-button-bg-top: light-dark(#f9fafc, #393939);
 	--cellar-cm-button-bg-bottom: light-dark(#e0e5eb, #111111);
 	--cellar-cm-button-border: light-dark(#c4ccd6, #888888);
@@ -233,6 +242,28 @@
 	 * comments (which One Dark leaves upright). So the light editor reads as the
 	 * same design as the dark one, not a heavier pygments variant. */
 	--cellar-cm-tok-comment-style: italic;
+}
+
+/* Find-in-page in-place highlights (Search P4). The CSS Custom Highlight API
+ * (`::highlight()`) paints Ranges over the static-code / rendered-markdown / output
+ * surfaces with no DOM mutation; the `<mark>` rules are the reversible fallback for
+ * engines without the API. CodeMirror editors are highlighted by their own
+ * `.cm-searchMatch` decorations (see `cmSearchHighlight.ts` / `editorTheme.ts`). */
+::highlight(cellar-search) {
+	background-color: var(--cellar-search-all);
+}
+::highlight(cellar-search-active) {
+	background-color: var(--cellar-search-active-bg);
+	color: var(--cellar-search-active-fg);
+}
+mark.cellar-search-mark {
+	background-color: var(--cellar-search-all);
+	color: inherit;
+	border-radius: 1px;
+}
+mark.cellar-search-mark-active {
+	background-color: var(--cellar-search-active-bg);
+	color: var(--cellar-search-active-fg);
 }
 
 /*

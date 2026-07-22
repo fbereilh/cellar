@@ -4,6 +4,7 @@
 	import type { KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
+	import type { CellHighlight } from '$lib/searchHighlight';
 	import { planWindow, estimateHeight, DEFAULT_OVERSCAN_PX, ROW_GAP_PX, type PlanItem } from '$lib/virtualization';
 
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
@@ -73,6 +74,12 @@
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		onEditorFocus?: (id: string) => void;
 		onEditorBlur?: (id: string) => void;
+		/** Find-in-page query (Search P4); empty when the find bar is closed. */
+		searchQuery?: string;
+		searchCaseSensitive?: boolean;
+		searchWholeWord?: boolean;
+		/** cell id → its highlight payload, for cells with ≥1 match (or null map). */
+		cellHighlights?: Map<string, CellHighlight> | null;
 		/** Windowed (virtualized) cell rendering. Default OFF — with it off the
 		 *  renderer mounts every cell exactly as before (byte-identical). */
 		virtualize?: boolean;
@@ -130,6 +137,10 @@
 		onRegister,
 		onEditorFocus,
 		onEditorBlur,
+		searchQuery = '',
+		searchCaseSensitive = false,
+		searchWholeWord = false,
+		cellHighlights = null,
 		virtualize = false,
 		scrollPins,
 		onAddCell,
@@ -508,6 +519,10 @@
 			editorCollapsed={editorCollapsed[cell.id]}
 			onSetEditorCollapsed={onSetEditorCollapsed}
 			onActivate={onActivate}
+			{searchQuery}
+			{searchCaseSensitive}
+			{searchWholeWord}
+			searchHighlight={cellHighlights?.get(cell.id) ?? null}
 			onRegister={onRegister}
 			onEditorFocus={onEditorFocus}
 			onEditorBlur={onEditorBlur}

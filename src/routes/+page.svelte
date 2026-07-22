@@ -22,6 +22,7 @@
 	import type { Cell } from '$lib/server/types';
 	import type { UICell, FoldRegistryHandle, NumberingRegistryHandle, NotebookApiHandle } from '$lib/types';
 	import type { SearchCache } from '$lib/search';
+	import type { SearchHighlightState } from '$lib/searchHighlight';
 	import type { Folding } from '$lib/headings';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import type { BlameLine } from '$lib/server/git';
@@ -221,6 +222,24 @@
 	// seeds its query from it only on the closed->open transition.
 	let findOpen = $state(false);
 	let findSeed = $state('');
+	// Shared find-in-page highlight state (Search P4). The find-bar publishes its
+	// query/opts/matches/active index here; the active notebook reads it and paints
+	// every match in place (active one emphasized + scrolled into view). One object,
+	// so the match set is computed once by the bar and reused by the notebook.
+	let searchHighlight = $state<SearchHighlightState>({
+		open: false,
+		notebookPath: null,
+		query: '',
+		caseSensitive: false,
+		wholeWord: false,
+		matches: [],
+		activeIndex: 0
+	});
+	// The bar always searches the active notebook; keep the highlight scoped to it so
+	// a background notebook (same cell ids) never lights up.
+	$effect(() => {
+		searchHighlight.notebookPath = findOpen ? activeNotebookPath : null;
+	});
 	// Transient, dismissable status line (jupytext env not ready, convert result, …).
 	let notice = $state('');
 	let theme = $state('dim');
@@ -1322,6 +1341,7 @@
 				seed={findSeed}
 				onClose={closeFindBar}
 				onJump={jumpToMatch}
+				highlight={searchHighlight}
 			/>
 			<!-- Every open notebook stays mounted (editor + run state preserved),
 			     just hidden. The default notebook and opened `.ipynb` files use the
@@ -1347,6 +1367,7 @@
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(canonicalNotebookRel)}
 						onBlame={handleBlame}
+						searchHighlight={searchHighlight}
 					/>
 				</div>
 			{/if}
@@ -1372,6 +1393,7 @@
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(tab.path)}
 						onBlame={handleBlame}
+						searchHighlight={searchHighlight}
 					/>
 				</div>
 			{/each}
