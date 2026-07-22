@@ -853,6 +853,21 @@ export function clearOutputsLive(id: string, nb?: string | null): void {
 	if (cell) cell.outputs = [];
 }
 
+/**
+ * Reflect a cell's CURRENT streamed outputs into the LIVE in-memory doc — no
+ * persist, no event (the same in-memory-only contract as `clearOutputsLive`).
+ * Called on every flush during a run (`run.js`) so `getNotebook`/`GET /api/notebooks`
+ * returns the last-flushed outputs for a running cell. That is what makes a
+ * mid-stream `load()` authoritative: a client that missed the establishing frame or
+ * a delta refetches ONCE and genuinely resyncs, rather than reading empty (disk is
+ * written once, at run:end via `setOutputs`; the SSE deltas already carry the live
+ * update, so no event fires here).
+ */
+export function setOutputsLive(id: string, outputs: CellOutput[], nb?: string | null): void {
+	const cell = find(docFor(nb), id);
+	if (cell) cell.outputs = outputs;
+}
+
 export function clearOutputs(id: string, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const cell = find(doc, id);

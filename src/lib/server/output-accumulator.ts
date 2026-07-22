@@ -28,11 +28,33 @@
  *    was dropped. So `while True: print(x)` can never grow the server heap
  *    without bound.
  *
- * Each committed/updated element is surfaced through `onEmit(output, index)`
- * with its STABLE index in the accumulated array: a growing coalesced stream
- * re-emits at the same index (the client overwrites that one element instead of
- * rebuilding the array), a fresh output takes the next index. `outputs` is the
- * final capped+coalesced array the caller persists.
+ * Each committed/updated element is surfaced through `onEmit(output, index, delta?)`
+ * with its STABLE index in the accumulated array: a fresh output takes the next
+ * index, a growing coalesced stream re-emits at the same index. To keep a slow
+ * streaming cell from re-broadcasting its whole buffer every ~40ms flush (an
+ * O(size × ticks) blowup on the SSE fan-out — measured 91× traffic
+ * amplification), a growing stream element does NOT re-emit its full text each
+ * tick: the FIRST materialization emits the whole element (`delta` absent, the
+ * client establishes it) and every subsequent flush emits only a `StreamDelta`
+ * describing what changed since the last emission, so per-run wire cost is
+ * O(size), not O(size × ticks). Rich outputs and the truncation marker are
+ * one-shot and always emit the full element.
+ *
+ * The delta is a tail-splice, not a pure append, because the terminal reducer
+ * (CR-overwrite collapse) can rewrite earlier bytes of the element: `keep` is the
+ * offset up to which the prior text is unchanged and `chunk` is what follows, so
+ * `new = prev.slice(0, keep) + chunk` reconstructs it exactly. A plain
+ * (non-terminal) stream reduces to identity and only ever appends, so `keep`
+ * equals the prior length with no scan (the fast path for the common streaming-log
+ * case); a terminal buffer diffs to the common prefix. `base` is the length the
+ * client's element must currently have for the splice to be valid — a mismatch
+ * (a delta dropped, or a reconnect refetch racing a live delta) means the client
+ * is out of sync, so it discards the delta and resyncs with ONE `load()` refetch.
+ * That refetch is authoritative because the caller keeps the in-memory doc's
+ * outputs CURRENT on every flush (`setOutputsLive`), so a mid-stream `load()`
+ * returns the last-flushed text rather than empty — see run.ts. `outputs` is the
+ * final capped+coalesced array the caller persists (always the full reduced text;
+ * the delta protocol is purely a wire optimization).
  *
  * Pure of any Cellar state — it only transforms an output stream — so it is
  * unit-tested directly (`tests/unit/output-accumulator.test.ts`).
@@ -78,7 +100,25 @@ function outputBytes(o: CellOutput): number {
 	}
 }
 
-export type EmitFn = (output: CellOutput, index: number) => void;
+/**
+ * A wire-delta for a growing stream element: reconstruct the element's text as
+ * `prev.slice(0, keep) + chunk`. `base` = the length the client's current text
+ * must have for the splice to apply (else it drops the delta and resyncs with one
+ * `load()` refetch). For a pure append `keep === base`; a terminal CR-rewrite
+ * gives `keep < base`.
+ */
+export interface StreamDelta {
+	base: number;
+	keep: number;
+	chunk: string;
+}
+
+/**
+ * Surfaces a committed/updated output. `delta` is present only for a re-emission
+ * of an already-established growing stream element (see the module header): when
+ * given, broadcast the small delta instead of the full `output`.
+ */
+export type EmitFn = (output: CellOutput, index: number, delta?: StreamDelta) => void;
 
 export class OutputAccumulator {
 	/** The coalesced, capped output array — what the caller persists. */
@@ -87,8 +127,10 @@ export class OutputAccumulator {
 	private readonly caps: OutputCaps;
 	private readonly onEmit: EmitFn;
 
-	// Buffered, not-yet-committed stream text for the current contiguous run.
-	private pending: { name: string; text: string; index: number } | null = null;
+	// Buffered stream text for the current contiguous run. `emitted` is the reduced
+	// text last handed to `onEmit` for this element (null until its first emission),
+	// so a flush can diff against it and broadcast only the delta.
+	private pending: { name: string; text: string; index: number; emitted: string | null } | null = null;
 
 	private streamBytes = 0; // committed + pending stream text
 	private totalBytes = 0; // all outputs
@@ -155,8 +197,9 @@ export class OutputAccumulator {
 		} else {
 			// Open a new contiguous stream run at the next slot. Not materialized into
 			// `outputs` until flush(); no other element can take this slot while the
-			// run is open (a rich/other-stream output closes it first).
-			this.pending = { name, text, index: this.outputs.length };
+			// run is open (a rich/other-stream output closes it first). `emitted` is
+			// null so the first flush emits the whole element (delta absent).
+			this.pending = { name, text, index: this.outputs.length, emitted: null };
 		}
 	}
 
@@ -193,6 +236,16 @@ export class OutputAccumulator {
 	 * WITHOUT closing the element — subsequent same-stream chunks keep extending it
 	 * and re-emit at the same index. Idempotent and cheap when nothing is pending
 	 * (the timer calls it every tick).
+	 *
+	 * The FIRST flush of an element emits the whole element (so the client can
+	 * establish it); every later flush emits only a `StreamDelta` of what changed
+	 * since the previous emission, so a slow streaming cell costs O(new bytes) on
+	 * the wire per tick instead of O(whole buffer). A tick with no new bytes since
+	 * the last emission broadcasts nothing.
+	 *
+	 * A client that missed the first full frame or a delta drops the un-appliable
+	 * delta and resyncs with one `load()` — authoritative because run.ts keeps the
+	 * in-memory doc's outputs current on every flush.
 	 */
 	flush(): void {
 		if (!this.pending) return;
@@ -202,11 +255,27 @@ export class OutputAccumulator {
 		// Emit the terminal-reduced COPY so persist (.ipynb), the SSE broadcast, the
 		// agent read, and the render all see the collapsed final line instead of
 		// hundreds of `\r`-overwrite frames. Plain logs skip reduction entirely.
-		const reduced = isTerminalStyle(text) ? reduceCheap(text) : text;
+		const terminal = isTerminalStyle(text);
+		const reduced = terminal ? reduceCheap(text) : text;
+		const prev = this.pending.emitted;
+		// Idle timer tick: nothing has changed since the last emission, so don't
+		// re-broadcast the element at all.
+		if (prev !== null && reduced === prev) return;
 		const out: StreamOutput = { output_type: 'stream', name, text: reduced };
 		if (index < this.outputs.length) this.outputs[index] = out;
 		else this.outputs.push(out);
-		this.onEmit(out, index);
+		if (prev === null) {
+			// First materialization: the client establishes the element from `out.text`.
+			this.onEmit(out, index);
+		} else {
+			// A plain (non-terminal) stream reduces to identity and only ever grows by
+			// appending, so `prev` is a strict prefix of `reduced`: keep its whole
+			// length with no scan (the O(new bytes) fast path). A terminal buffer can
+			// rewrite its tail (CR collapse), so diff to the common prefix.
+			const keep = terminal ? commonPrefixLen(prev, reduced) : prev.length;
+			this.onEmit(out, index, { base: prev.length, keep, chunk: reduced.slice(keep) });
+		}
+		this.pending.emitted = reduced;
 	}
 
 	/** Commit and CLOSE the open stream element, so the next output takes a new slot. */
@@ -256,6 +325,14 @@ export class OutputAccumulator {
 	get wasCapped(): boolean {
 		return this.capped;
 	}
+}
+
+/** Length (in UTF-16 code units) of the common leading prefix of `a` and `b`. */
+function commonPrefixLen(a: string, b: string): number {
+	const n = Math.min(a.length, b.length);
+	let i = 0;
+	while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+	return i;
 }
 
 /** Trim a string to at most `maxBytes` UTF-8 bytes without splitting a code point. */

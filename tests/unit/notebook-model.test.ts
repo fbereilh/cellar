@@ -126,6 +126,25 @@ describe('duplicate-ID re-keying on load', () => {
 	});
 });
 
+describe('setOutputsLive keeps the live doc current without persisting', () => {
+	it('reflects streamed outputs in memory but writes nothing to disk', () => {
+		const path = 'live-outputs.ipynb';
+		nb.createNotebook(path);
+		const cell = nb.listCells(path)[0];
+		const abs = join(WS, path);
+		const before = readFileSync(abs, 'utf8');
+
+		const outputs = [{ output_type: 'stream' as const, name: 'stdout', text: 'streaming...' }];
+		nb.setOutputsLive(cell.id, outputs, path);
+
+		// The in-memory doc (what GET /api/notebooks -> getNotebook reads) is current,
+		// so a mid-run load() returns the last-flushed outputs rather than empty.
+		expect(nb.getCell(cell.id, path)?.outputs).toEqual(outputs);
+		// But nothing was persisted: disk is untouched until run:end (setOutputs).
+		expect(readFileSync(abs, 'utf8')).toBe(before);
+	});
+});
+
 describe('loading never writes an uninvited file', () => {
 	it('opening a non-existent default notebook drops no file on disk', async () => {
 		// A bare workspace with no notebook.ipynb: getDefaultNotebook materializes
