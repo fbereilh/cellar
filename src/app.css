@@ -154,6 +154,15 @@
 	--cellar-cm-line-number-fg: light-dark(#a3acb8, #7d8799);
 	--cellar-cm-active-line-gutter: light-dark(transparent, #2c313a);
 	--cellar-cm-fold-placeholder: light-dark(#7e8792, #dddddd);
+	/* Width reserved for CodeMirror's fold gutter (the ⌄/› marker column). Pinned
+	 * to a fixed width in `editorTheme.ts` AND mirrored by the static (pre-editor)
+	 * render's `.cm-static-foldgutter` spacer, so summoning the real editor on
+	 * first click adds no new gutter column and the code never shifts right. A
+	 * geometry constant, so it is scheme-independent (no `light-dark()`). The
+	 * value matches CodeMirror's natural fold-gutter width (the ⌄ marker plus its
+	 * 1px side padding) so pinning it changes nothing visible - it only makes the
+	 * width deterministic and shareable with the static render. */
+	--cellar-cm-fold-width: 10px;
 	--cellar-cm-matching-bracket: light-dark(#cfe8d4, #bad0f847);
 	--cellar-cm-nonmatching-bracket: light-dark(#f6d0d0, #bad0f847);
 
@@ -354,13 +363,29 @@
 	padding: 10px 0;
 	cursor: text;
 }
-.cm-static-gutter {
+/* The sticky gutter group, mirroring CodeMirror's `.cm-gutters`: line numbers +
+ * the fold-gutter spacer, held together so the spacer tracks the line-number
+ * column's width. */
+.cm-static-gutters {
 	position: sticky;
 	left: 0;
 	z-index: 1;
 	flex: 0 0 auto;
+	display: flex;
+	align-items: flex-start;
 	background-color: var(--cellar-cm-bg);
+}
+.cm-static-gutter {
+	flex: 0 0 auto;
 	color: var(--cellar-cm-line-number-fg);
+}
+/* Empty stand-in for CodeMirror's fold-gutter column, so the static render's
+ * content starts at the same x-position the live editor will use (see
+ * StaticCode.svelte and `--cellar-cm-fold-width`, pinned identically in
+ * `editorTheme.ts`). */
+.cm-static-foldgutter {
+	flex: 0 0 auto;
+	width: var(--cellar-cm-fold-width);
 }
 .cm-static-lineno {
 	padding: 0 3px 0 5px;
