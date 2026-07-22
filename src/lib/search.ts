@@ -30,9 +30,10 @@
  *
  * P2 extends the same discipline to the new fields: rendered-markdown is derived
  * once per source change (same signature as `sourceLC`), and output text is
- * extracted + lowercased once per outputs change (detected by the `outputs`
- * array identity - Cellar reassigns the array on run/refetch), then bounded by
- * the per-cell cap so one query can never serialize megabytes of output.
+ * extracted + lowercased once per outputs change (detected by output ELEMENT
+ * identity - length + per-element ref, so an in-place stream growth/rewrite
+ * invalidates), then bounded by the per-cell cap so one query can never
+ * serialize megabytes of output.
  */
 
 import type { CellOutput } from '$lib/server/types';
@@ -112,8 +113,14 @@ interface CacheEntry {
 	markdownLC?: string;
 	/** True once `markdown`/`markdownLC` were computed for the current `sig`. */
 	markdownBuilt: boolean;
-	/** Identity of the `outputs` array the `outputs` cache was built from (invalidation key). */
-	outputsRef?: readonly CellOutput[] | null;
+	/**
+	 * Snapshot of the output ELEMENT references the `outputs` cache was built from.
+	 * Invalidation keys off element identity (length + per-element `===`), not the
+	 * array reference: LiveNotebook grows/rewrites the outputs array IN PLACE
+	 * during a run (each mutation replaces the element object at an index), so
+	 * array identity alone would serve stale text mid/post-stream.
+	 */
+	outputElems?: readonly CellOutput[] | null;
 	/** Per-output extracted+lowercased text, capped across the cell at {@link SEARCH_SCAN_CAP}. */
 	outputs?: OutputText[];
 }
@@ -121,7 +128,7 @@ interface CacheEntry {
 /**
  * Per-cell searchable-text cache, keyed by cell id. Caller-owned and passed into
  * {@link searchNotebook} so it survives across keystrokes; entries self-invalidate
- * on content change (source via signature, outputs via array identity), so no
+ * on content change (source via signature, outputs via element identity), so no
  * explicit lifecycle wiring is needed.
  */
 export type SearchCache = Map<string, CacheEntry>;
@@ -165,7 +172,7 @@ function entryFor(cache: SearchCache, cell: SearchableCell): CacheEntry {
 	if (hit && hit.sig === sig) return hit;
 	if (hit) {
 		// Source changed: refresh the source-derived fields, but leave the outputs
-		// cache alone (it has its own identity-based lifecycle) - editing source
+		// cache alone (it has its own element-identity lifecycle) - editing source
 		// must not force a re-extraction of unchanged outputs.
 		hit.sig = sig;
 		hit.sourceLC = cell.source.toLowerCase();
@@ -259,13 +266,35 @@ function buildOutputCache(outputs: readonly CellOutput[] | null | undefined): Ou
 	return out;
 }
 
-/** Ensure the entry's outputs cache matches the cell's current `outputs` (identity-keyed). */
+/**
+ * Ensure the entry's outputs cache matches the cell's current `outputs`.
+ *
+ * Invalidation tracks ELEMENT identity (in-place-mutation-safe): the cache is
+ * reused only when the current outputs array is non-null, has the same length as
+ * the snapshot, AND every element is `===` the snapshotted element. LiveNotebook
+ * grows/rewrites the outputs array in place during a run (replacing the element
+ * object at each index), so array identity alone would keep serving a stale
+ * partial snapshot. O(numOutputs) per cell - tiny, and no full-text hashing on
+ * the hit path.
+ */
 function ensureOutputs(entry: CacheEntry, cell: SearchableCell): OutputText[] {
 	const ref = cell.outputs ?? null;
-	if (entry.outputsRef === ref && entry.outputs) return entry.outputs;
-	entry.outputsRef = ref;
+	const snap = entry.outputElems;
+	if (entry.outputs && outputsUnchanged(snap, ref)) return entry.outputs;
+	entry.outputElems = ref ? ref.slice() : ref;
 	entry.outputs = buildOutputCache(ref);
 	return entry.outputs;
+}
+
+/** Same length and every element `===` between the built-from snapshot and current outputs. */
+function outputsUnchanged(
+	snap: readonly CellOutput[] | null | undefined,
+	ref: readonly CellOutput[] | null
+): boolean {
+	if (snap == null || ref == null) return snap === ref;
+	if (snap.length !== ref.length) return false;
+	for (let i = 0; i < snap.length; i++) if (snap[i] !== ref[i]) return false;
+	return true;
 }
 
 // ---- Rendered-markdown text (light md-syntax strip, model-based) ----------------

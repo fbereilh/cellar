@@ -481,7 +481,7 @@ describe('searchNotebook - per-cell output cap', () => {
 });
 
 describe('searchNotebook - output cache invalidation (scope:all)', () => {
-	it('rebuilds the output cache only when the outputs array identity changes', () => {
+	it('rebuilds the output cache when the outputs array is reassigned (element identity changes)', () => {
 		const cache = createSearchCache();
 		const outs1 = [streamOut('alpha beta')];
 		const c1: TCell = { id: 'a', cell_type: 'code', source: 's', outputs: outs1 };
@@ -505,6 +505,30 @@ describe('searchNotebook - output cache invalidation (scope:all)', () => {
 			spy.mockRestore();
 		}
 		expect(built1).toBe(cache.get('a')); // same entry object, output slot swapped in place
+	});
+
+	it('reflects in-place outputs mutation (LiveNotebook grows/rewrites the same array)', () => {
+		const cache = createSearchCache();
+		// LiveNotebook sets cell.outputs = [] on run:start, then mutates that SAME
+		// array in place: applyOutput assigns a fresh element at an index, and
+		// applyOutputAppend spreads into a fresh element - the array ref never changes.
+		const outs: CellOutput[] = [streamOut('partial snapshot')];
+		const cell: TCell = { id: 'a', cell_type: 'code', source: 's', outputs: outs };
+		searchNotebook([cell], 'partial', allOpts(), cache);
+
+		// Grow the array in place (a later stream element lands).
+		outs.push(streamOut('appended text'));
+		expect(
+			searchNotebook([cell], 'appended', allOpts(), cache).some((m) => m.field === 'output')
+		).toBe(true);
+
+		// Rewrite an existing element in place (applyOutputAppend swaps the object).
+		outs[0] = streamOut('rewritten value');
+		expect(
+			searchNotebook([cell], 'rewritten', allOpts(), cache).some((m) => m.field === 'output')
+		).toBe(true);
+		// The now-stale text is gone.
+		expect(searchNotebook([cell], 'partial', allOpts(), cache)).toEqual([]);
 	});
 
 	it('editing source does not re-extract unchanged outputs', () => {
