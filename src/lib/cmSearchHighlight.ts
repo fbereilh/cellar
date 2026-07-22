@@ -58,7 +58,9 @@ export function activeCmMatch(view: EditorView): { from: number; to: number } | 
 	const cursor = q.getCursor(view.state, 0, view.state.doc.length);
 	let i = 0;
 	for (let it = cursor.next(); !it.done; it = cursor.next()) {
-		if (i === spec.activeOrdinal) return { from: it.value.from, to: it.value.to };
+		const { from, to } = it.value;
+		if (from === to) continue; // skip empty matches, mirroring the engine
+		if (i === spec.activeOrdinal) return { from, to };
 		i++;
 	}
 	return null;
@@ -90,12 +92,14 @@ const highlighter = ViewPlugin.fromClass(
 			});
 			if (!q.valid) return builder.finish();
 			// Cell editors are small, so decorate every match in doc order (the builder
-			// needs sorted adds; the cursor yields matches in order). CM's cursor skips
-			// empty matches, so from<to always holds even for a `\b`/`a*` regex.
+			// needs sorted adds; the cursor yields matches in order). CM's cursor DOES
+			// yield empty matches for `\b`/`a*` regexes, but the engine skips them, so
+			// skip them here too to keep the active-ordinal count aligned.
 			const cursor = q.getCursor(view.state, 0, view.state.doc.length);
 			let i = 0;
 			for (let it = cursor.next(); !it.done; it = cursor.next()) {
 				const { from, to } = it.value;
+				if (from === to) continue;
 				builder.add(from, to, i === spec.activeOrdinal ? activeMark : matchMark);
 				i++;
 			}

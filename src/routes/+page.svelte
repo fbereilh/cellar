@@ -321,6 +321,14 @@
 	const notebookOpen = $derived(tabs.some((t) => t.kind === 'notebook'));
 	const activeTab = $derived(tabs.find((t) => t.id === activeTabId) ?? null);
 	const activeFilePath = $derived(activeTab && activeTab.kind !== 'notebook' ? activeTab.path : null);
+	// Whether the ACTIVE tab is itself a live notebook (canonical or an opened
+	// `.ipynb`). Distinct from `activeNotebookPath`, which falls back to the default
+	// notebook whenever ANY notebook tab is open - even while a plain file tab holds
+	// focus. Shell shortcuts that must defer to a focused file tab (Ctrl/Cmd+F find,
+	// Cmd/Ctrl+S save) gate on this, so those keys fall through to FileTab/browser.
+	const activeTabIsNotebook = $derived(
+		activeTab?.kind === 'notebook' || activeTab?.kind === 'ipynb'
+	);
 
 	// Which notebook the sidebar (outline / search / Kernels dot) reflects: the
 	// active notebook tab, else the default - but only while the default actually
@@ -1209,7 +1217,7 @@
 			// Only when a notebook is active: a plain file tab keeps FileTab's own
 			// Mod-s save, and a modal owns the keyboard while up.
 			if (bindsFor('save-notebook').includes(chord)) {
-				if (!activeNotebookPath || document.querySelector('.modal-open')) return;
+				if (!activeTabIsNotebook || document.querySelector('.modal-open')) return;
 				e.preventDefault();
 				e.stopPropagation();
 				saveActiveNotebook();
@@ -1224,7 +1232,7 @@
 			// what suppresses native find; `openFindBar` re-seeds when already open
 			// (a repeat Ctrl+F) rather than closing.
 			if (bindsFor('open-find').includes(chord)) {
-				if (!activeNotebookPath || document.querySelector('.modal-open')) return;
+				if (!activeTabIsNotebook || document.querySelector('.modal-open')) return;
 				e.preventDefault();
 				e.stopPropagation();
 				openFindBar();
