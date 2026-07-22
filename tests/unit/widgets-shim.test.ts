@@ -179,6 +179,19 @@ except Exception:
 # an entirely unknown driver method still resolves to a no-op callable
 out['ep_unknown_method'] = _ep.someFutureDriverMethod() is None
 
+# unknown Option methods on the undefined option never raise, and chaining
+# stays falsy/undefined through them (parity with the sibling proxies).
+try:
+    out['opt_exists_falsy'] = bool(_url.exists(lambda _v: True))
+    out['opt_orelse_isdefined'] = _url.orElse('x').isDefined()
+    out['opt_filter_get'] = _url.filter(None).get()
+    out['opt_flatmap_falsy'] = bool(_url.flatMap(lambda _v: _v))
+    out['opt_contains_falsy'] = bool(_url.contains('anything'))
+    out['opt_chain_isdefined'] = _url.filter(None).orElse('y').flatMap(lambda _v: _v).isDefined()
+    out['opt_unknown_raises'] = False
+except Exception:
+    out['opt_unknown_raises'] = True
+
 # --- redeclare preserves the current value when compatible (Databricks parity) ---
 rd = _CellarWidgets(_FakeIpw, _fake_display)
 rd.text('t', 'orig')
@@ -298,6 +311,16 @@ describe('dbutils.widgets shim — value/return-type parity', () => {
 		expect(out.ep_surface_raises).toBe(false);
 		expect(out.ep_surface_all_none).toBe(true);
 		expect(out.ep_unknown_method).toBe(true);
+	});
+
+	it('an undefined Option never raises on unknown methods and stays falsy when chained', () => {
+		expect(out.opt_unknown_raises).toBe(false);
+		expect(out.opt_exists_falsy).toBe(false);
+		expect(out.opt_orelse_isdefined).toBe(false);
+		expect(out.opt_filter_get).toBe(null);
+		expect(out.opt_flatmap_falsy).toBe(false);
+		expect(out.opt_contains_falsy).toBe(false);
+		expect(out.opt_chain_isdefined).toBe(false);
 	});
 
 	it('preserves the current value when a widget is re-declared with a compatible spec', () => {

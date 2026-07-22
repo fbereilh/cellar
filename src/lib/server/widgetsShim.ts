@@ -173,6 +173,11 @@ class _CellarUndefinedOption:
         return None
     def __bool__(self):
         return False
+    def __getattr__(self, _name):
+        # Any other Option method (.exists/.filter/.flatMap/.orElse/.contains/
+        # .fold/.toList/...) → a callable returning this same undefined option, so
+        # a chain stays falsy/undefined and never raises mid-chain.
+        return lambda *a, **k: self
 
 
 class _CellarNotebookContext:
