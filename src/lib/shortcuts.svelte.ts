@@ -74,12 +74,13 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		description: 'Save the notebook (flush pending edits)'
 	},
 	{
-		// The find-bar's temporary, non-Ctrl entry point. Ctrl/Cmd+F is deliberately
-		// left to the browser until P5 (the intercept lands only once the find-bar +
-		// highlight make Search a real replacement), so this opens it via a
-		// find-in-files-style chord that dogfoods the bar first.
+		// The find-bar's entry points. `Mod-f` (Ctrl/Cmd+F) is the primary one: P5
+		// intercepts the browser's native find and opens cellar Search instead (the
+		// shell `preventDefault`s it and, when the bar is already open, re-seeds
+		// rather than closing). `Mod-Shift-f` is the original find-in-files-style
+		// chord, kept so the bar still opens even if a user rebinds `Mod-f` away.
 		id: 'open-find',
-		keys: ['Mod-Shift-f'],
+		keys: ['Mod-f', 'Mod-Shift-f'],
 		mode: 'global',
 		category: 'Application',
 		description: 'Find in notebook (floating find bar)'

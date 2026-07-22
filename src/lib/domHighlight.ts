@@ -126,8 +126,12 @@ export function clearSurface(key: string) {
 export function buildTextRanges(
 	root: Element,
 	query: string,
-	opts: { caseSensitive: boolean; wholeWord: boolean },
-	findFn: (hay: string, needle: string, o: { caseSensitive: boolean; wholeWord: boolean }) => Array<{ start: number; end: number }>
+	opts: { caseSensitive: boolean; wholeWord: boolean; regex?: boolean },
+	findFn: (
+		hay: string,
+		needle: string,
+		o: { caseSensitive: boolean; wholeWord: boolean; regex?: boolean }
+	) => Array<{ start: number; end: number }>
 ): Range[] {
 	if (!query) return [];
 	const doc = root.ownerDocument;

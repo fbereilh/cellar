@@ -174,6 +174,56 @@ describe('searchNotebook - whole word', () => {
 	});
 });
 
+describe('searchNotebook - regex (P5)', () => {
+	it('matches a regular expression, case-insensitive by default', () => {
+		const cells = [cell('a', 'df1 = load()\nDF2 = load()\nother = 3')];
+		const m = searchNotebook(cells, 'df\\d', opts({ regex: true }));
+		expect(m.map((x) => x.start)).toEqual([0, 13]); // df1 and DF2 (i flag)
+	});
+
+	it('honors caseSensitive under regex', () => {
+		const cells = [cell('a', 'df1 DF2')];
+		const m = searchNotebook(cells, 'df\\d', opts({ regex: true, caseSensitive: true }));
+		expect(m.map((x) => x.start)).toEqual([0]); // only lowercase df1
+	});
+
+	it('reports correct start/end offsets for a variable-length match', () => {
+		const cells = [cell('a', 'foo = 42; foobar = 7')];
+		const m = searchNotebook(cells, 'foo\\w*', opts({ regex: true }));
+		expect(m).toHaveLength(2);
+		expect([m[0].start, m[0].end]).toEqual([0, 3]); // "foo"
+		expect([m[1].start, m[1].end]).toEqual([10, 16]); // "foobar"
+	});
+
+	it('an invalid regex matches nothing and never throws (fail-safe)', () => {
+		const cells = [cell('a', 'anything at all')];
+		expect(() => searchNotebook(cells, '(', opts({ regex: true }))).not.toThrow();
+		expect(searchNotebook(cells, '(', opts({ regex: true }))).toEqual([]);
+		expect(searchNotebook(cells, '[a-', opts({ regex: true }))).toEqual([]);
+	});
+
+	it('a zero-length-capable pattern terminates (no infinite loop)', () => {
+		const cells = [cell('a', 'abc')];
+		// `x*` can match empty at every position; the scanner must not spin.
+		const m = searchNotebook(cells, 'x*', opts({ regex: true }));
+		expect(Array.isArray(m)).toBe(true); // returns (empties are skipped)
+	});
+
+	it('regex + wholeWord enforces boundaries', () => {
+		const cells = [cell('a', 'cat category cat')];
+		const m = searchNotebook(cells, 'ca.', opts({ regex: true, wholeWord: true }));
+		expect(m.map((x) => x.start)).toEqual([0, 13]); // standalone "cat"s, not "cat" in "category"
+	});
+
+	it('a literal query with regex OFF treats metacharacters literally', () => {
+		const cells = [cell('a', 'a.b axb')];
+		// With regex off, "a.b" matches only the literal "a.b", not "axb".
+		expect(searchNotebook(cells, 'a.b', opts({ regex: false }))).toHaveLength(1);
+		// With regex on, "." is any char, so both match.
+		expect(searchNotebook(cells, 'a.b', opts({ regex: true }))).toHaveLength(2);
+	});
+});
+
 describe('searchNotebook - cache invalidation', () => {
 	it('reuses the SAME cache entry across queries (no re-lowercase on a cache hit)', () => {
 		const cells = [cell('a', 'Alpha Beta Gamma')];

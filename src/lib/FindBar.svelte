@@ -1,7 +1,8 @@
 <script lang="ts">
-	// The floating find-in-page bar (Search P3). A small widget over the top-right
-	// of the active notebook pane: a query box, a live `i / N` match count,
-	// prev/next chevrons, and case (`Aa`) / whole-word (`\b`) toggle chips.
+	// The floating find-in-page bar (Search P3 + P5). A small widget over the
+	// top-right of the active notebook pane: a query box, a live `i / N` match
+	// count, prev/next chevrons, and case (`Aa`) / whole-word (`\b`) / regex (`.*`)
+	// toggle chips.
 	//
 	// It runs queries through the SAME shared engine + per-cell cache as the
 	// sidebar Search (`$lib/search`), so the two views can never disagree, and it
@@ -12,9 +13,10 @@
 	// the shell to the active notebook's `jumpToCell` (which `await`s
 	// `ensureCellMounted` first, so an off-screen match mounts before it scrolls).
 	//
-	// This is deliberately NOT the Ctrl+F surface yet (that is P5): it opens from
-	// a non-Ctrl entry point (the sidebar Search button, or the app shortcut) so
-	// it can ship and be dogfooded before it owns the browser's find key.
+	// P5 makes this the Ctrl/Cmd+F surface: the shell intercepts the browser's
+	// native find and opens this bar instead (seeding from the selection). A repeat
+	// Ctrl+F while the bar is already open re-focuses + re-seeds it (native-find
+	// behavior) via the `reseedSignal` prop, rather than toggling it closed.
 	import { tick } from 'svelte';
 	import {
 		searchNotebook,
@@ -34,6 +36,12 @@
 		searchCache?: SearchCache;
 		/** Seed the query from this text when the bar opens (native-find behavior). */
 		seed?: string;
+		/**
+		 * A monotonic signal the shell bumps when Ctrl/Cmd+F is pressed while the bar
+		 * is ALREADY open: re-focus the input + re-seed from the current selection
+		 * (native-find behavior), instead of closing. Ignored while closed.
+		 */
+		reseedSignal?: number;
 		onClose: () => void;
 		/** Navigate to a match: the shell routes this to the active notebook's `jumpToCell`. */
 		onJump: (match: Match) => void | Promise<void>;
@@ -44,19 +52,34 @@
 		 */
 		highlight?: SearchHighlightState | null;
 	}
-	let { open, cells, searchCache, seed = '', onClose, onJump, highlight = null }: Props = $props();
+	let { open, cells, searchCache, seed = '', reseedSignal = 0, onClose, onJump, highlight = null }: Props = $props();
 
 	let query = $state('');
 	let debouncedQuery = $state('');
 	let caseSensitive = $state(false);
 	let wholeWord = $state(false);
+	let regex = $state(false);
 	let activeIndex = $state(0);
 	let inputEl = $state<HTMLInputElement | null>(null);
 
 	const opts = $derived<SearchOpts>({
 		...DEFAULT_SEARCH_OPTS,
 		caseSensitive,
-		wholeWord
+		wholeWord,
+		regex
+	});
+
+	// A regex query that won't compile: the engine already returns no matches (a
+	// fail-safe), and this drives the input's subtle invalid state so the user sees
+	// WHY - rather than a silent "0 matches" that reads like a typo.
+	const regexInvalid = $derived.by(() => {
+		if (!regex || !debouncedQuery) return false;
+		try {
+			new RegExp(debouncedQuery);
+			return false;
+		} catch {
+			return true;
+		}
 	});
 
 	// A private fallback cache for when the active tab has no live notebook cache
@@ -102,7 +125,7 @@
 			lastNavKey = '';
 			return;
 		}
-		const key = JSON.stringify([debouncedQuery, caseSensitive, wholeWord]);
+		const key = JSON.stringify([debouncedQuery, caseSensitive, wholeWord, regex]);
 		if (key === lastNavKey) return;
 		lastNavKey = key;
 		activeIndex = 0;
@@ -125,6 +148,7 @@
 		highlight.query = open ? debouncedQuery : '';
 		highlight.caseSensitive = caseSensitive;
 		highlight.wholeWord = wholeWord;
+		highlight.regex = regex;
 		highlight.matches = open ? matches : [];
 		highlight.activeIndex = activeIndex;
 	});
@@ -134,22 +158,37 @@
 	// selection it replaces the query (native-find seeds from the selection),
 	// otherwise the last query is kept. The input text is selected so typing
 	// replaces it.
+	function seedAndFocus() {
+		const sel = seed?.trim() || (typeof window !== 'undefined' ? window.getSelection?.()?.toString().trim() : '') || '';
+		if (sel) {
+			query = sel;
+			debouncedQuery = sel; // apply immediately - a deliberate open, not typing
+		}
+		tick().then(() => {
+			inputEl?.focus();
+			inputEl?.select();
+		});
+	}
+
 	let wasOpen = false;
 	$effect(() => {
 		if (open && !wasOpen) {
-			const sel = seed?.trim() || (typeof window !== 'undefined' ? window.getSelection?.()?.toString().trim() : '') || '';
-			if (sel) {
-				query = sel;
-				debouncedQuery = sel; // apply immediately - a deliberate open, not typing
-			}
-			tick().then(() => {
-				inputEl?.focus();
-				inputEl?.select();
-			});
+			seedAndFocus();
 		} else if (!open && wasOpen) {
 			debouncedQuery = ''; // stop scanning when closed; a re-open starts clean
 		}
 		wasOpen = open;
+	});
+
+	// Ctrl/Cmd+F pressed while the bar is already open: the shell bumps
+	// `reseedSignal`, and we re-focus + re-seed from the current selection (what
+	// the browser's native find does on a repeat press) instead of closing.
+	let lastReseed = 0; // the prop's default; a change from the shell drives the re-seed
+	$effect(() => {
+		const sig = reseedSignal;
+		if (sig === lastReseed) return;
+		lastReseed = sig;
+		if (open) seedAndFocus();
 	});
 
 	function goTo(index: number) {
@@ -215,19 +254,22 @@
 			bind:value={query}
 			onkeydown={onInputKeydown}
 			type="text"
-			class="w-44 bg-transparent text-xs outline-none placeholder:text-base-content/40"
+			class="w-44 bg-transparent text-xs outline-none placeholder:text-base-content/40 {regexInvalid ? 'text-error' : ''}"
 			placeholder="Find in notebook…"
 			spellcheck="false"
 			autocomplete="off"
 			aria-label="Find query"
+			aria-invalid={regexInvalid}
 			data-testid="find-input"
 		/>
 		<span
-			class="min-w-[3.5rem] shrink-0 text-right text-[11px] tabular-nums {debouncedQuery && !total ? 'text-error/70' : 'text-base-content/45'}"
+			class="min-w-[3.5rem] shrink-0 text-right text-[11px] tabular-nums {(debouncedQuery && !total) || regexInvalid ? 'text-error/70' : 'text-base-content/45'}"
 			data-testid="find-count"
 			aria-live="polite"
 		>
-			{#if debouncedQuery}
+			{#if regexInvalid}
+				<span title="Invalid regular expression" data-testid="find-invalid">bad regex</span>
+			{:else if debouncedQuery}
 				{total ? activeIndex + 1 : 0}/{total}
 			{:else}
 				&nbsp;
@@ -248,6 +290,13 @@
 				title="Whole word"
 				onclick={() => (wholeWord = !wholeWord)}
 				data-testid="find-word">\b</button
+			>
+			<button
+				class="btn btn-ghost btn-xs px-1.5 font-mono {regex ? 'btn-active text-primary' : 'text-base-content/50'}"
+				aria-pressed={regex}
+				title="Use regular expression"
+				onclick={() => (regex = !regex)}
+				data-testid="find-regex">.*</button
 			>
 		</div>
 

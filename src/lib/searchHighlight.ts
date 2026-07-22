@@ -29,10 +29,12 @@ function isWordChar(ch: string): boolean {
 	return /[\p{L}\p{N}_]/u.test(ch);
 }
 
-/** Options that affect where a literal query matches (shared with the engine). */
+/** Options that affect where a query matches (shared with the engine). */
 export interface OccurrenceOpts {
 	caseSensitive: boolean;
 	wholeWord: boolean;
+	/** Treat the query as a regular expression (P5). An invalid pattern matches nothing. */
+	regex?: boolean;
 }
 
 /** A half-open `[start, end)` character range within some text. */
@@ -57,6 +59,7 @@ export interface Occurrence {
  */
 export function findOccurrences(hay: string, needle: string, opts: OccurrenceOpts): Occurrence[] {
 	if (!needle || !hay) return [];
+	if (opts.regex) return findOccurrencesRegex(hay, needle, opts);
 	const h = opts.caseSensitive ? hay : hay.toLowerCase();
 	const n = opts.caseSensitive ? needle : needle.toLowerCase();
 	const nLen = n.length;
@@ -75,6 +78,41 @@ export function findOccurrences(hay: string, needle: string, opts: OccurrenceOpt
 		}
 		out.push({ start: idx, end });
 		from = end > idx ? end : idx + 1;
+	}
+	return out;
+}
+
+/**
+ * The regex-mode sibling of {@link findOccurrences}: locate every match of `needle`
+ * (a JS regex) in `hay`, honoring case-sensitivity and whole-word. Mirrors the
+ * engine's `scanFieldRegex` (`$lib/search`) so the highlighted spans line up with
+ * the find-bar's count. An invalid pattern (or a zero-length match) is handled
+ * safely - never a throw, never an infinite loop.
+ */
+function findOccurrencesRegex(hay: string, needle: string, opts: OccurrenceOpts): Occurrence[] {
+	let re: RegExp;
+	try {
+		re = new RegExp(needle, opts.caseSensitive ? 'g' : 'gi');
+	} catch {
+		return [];
+	}
+	const out: Occurrence[] = [];
+	let m: RegExpExecArray | null;
+	re.lastIndex = 0;
+	while ((m = re.exec(hay)) !== null) {
+		const start = m.index;
+		const len = m[0].length;
+		if (len === 0) {
+			re.lastIndex = start + 1; // never spin on an empty match
+			continue;
+		}
+		const end = start + len;
+		if (opts.wholeWord) {
+			const before = start > 0 ? hay[start - 1] : '';
+			const after = end < hay.length ? hay[end] : '';
+			if ((before && isWordChar(before)) || (after && isWordChar(after))) continue;
+		}
+		out.push({ start, end });
 	}
 	return out;
 }
@@ -117,6 +155,8 @@ export interface SearchHighlightState {
 	query: string;
 	caseSensitive: boolean;
 	wholeWord: boolean;
+	/** Treat the query as a regular expression (P5). */
+	regex: boolean;
 	/** The deduped, document-ordered display matches (same list the count/nav use). */
 	matches: Match[];
 	/** Index into `matches` of the active (emphasized) match. */

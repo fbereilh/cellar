@@ -135,6 +135,7 @@ Everything you'd expect from a notebook, plus the things that make sharing one w
 - **Run metadata** on every cell: when it last ran, how long it took, and who ran it (you or an agent).
 - **Checkpoints and undo** for agent actions - snapshot before a risky change and roll back.
 - **Command palette** and Jupyter-style modal keyboard shortcuts for fast navigation.
+- **Find in notebook** with `Ctrl`/`Cmd-F` - search across cell source, rendered markdown, and outputs (with regex), and jump between highlighted matches.
 - **Variable and DataFrame inspection** to peek into the live kernel namespace.
 - **Git blame and diff gutters** right in the editor, and per-cell change bars in the notebook.
 - One shared kernel across notebooks, with a sidebar showing what's actually loaded in memory.
