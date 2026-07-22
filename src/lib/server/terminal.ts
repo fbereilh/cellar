@@ -1,29 +1,42 @@
 /**
- * Cellar — terminal-style stream output reduction (Phase 1: the cheap tier).
+ * Cellar — terminal-style stream output reduction (two tiers, zero deps).
  *
- * A cell that runs a CLI (`tqdm`, a spinner, a single-line progress bar) emits
- * hundreds of carriage-return-overwritten frames plus ANSI color escapes. Left
- * raw, a `<pre>` stacks every `\r`-frame on its own line and prints escape
- * bytes as literal `[32m…` garbage — and the same pile is persisted into the
+ * A cell that runs a CLI (`tqdm`, a spinner, `uv pip install`, any progress
+ * bar) emits hundreds of carriage-return-overwritten frames plus ANSI escapes.
+ * Left raw, a `<pre>` stacks every `\r`-frame on its own line and prints escape
+ * bytes as literal `[2K[4A…` garbage — and the same pile is persisted into the
  * `.ipynb` and read by the agent over MCP.
  *
- * This module collapses that spam to the final rendered line, cheaply and with
- * ZERO dependencies. Two exports:
+ * This module collapses that spam to the FINAL rendered state — byte-identical
+ * to what a real terminal shows — cheaply and with ZERO dependencies. Exports:
  *
  *  - `isTerminalStyle(text)` — is this stream text terminal-styled (contains a
  *    `\r` carriage return or a CSI `ESC[` introducer)? A cheap gate: plain logs
  *    are `false` and skip reduction entirely, passing through byte-for-byte.
- *  - `reduceCheap(text)` — strip SGR (ANSI color) escapes, then collapse `\r`
- *    overwrites with true terminal semantics on each physical line. Fixes
- *    `tqdm`, braille/ASCII spinners, and every single-line progress bar.
+ *  - `reduceCheap(text)` — the cheap tier: strip SGR (ANSI color) escapes, then
+ *    collapse `\r` overwrites with true terminal semantics on each physical
+ *    line. Fixes `tqdm`, braille/ASCII spinners, single-line progress bars — the
+ *    ~80% by frequency. Cannot undo a VERTICAL repaint (cursor-up + erase-line
+ *    across lines); its non-SGR escapes are left in place for the full tier.
+ *  - `reduceFull(text)` — the full tier: a minimal VT screen emulator over a
+ *    line-array screen + `(row, col)` cursor. Applies the small BOUNDED escape
+ *    set (`\r`, `\n`, cursor up/down/fwd/back/column-absolute, erase-in-line,
+ *    erase-in-display, absolute cursor position) so the multi-line cursor
+ *    repaint of `uv pip install` / multi-bar `tqdm` collapses to its final
+ *    screen. This is what the output pipeline uses (see `output-accumulator.ts`).
  *
- * Scope (Phase 1 / cheap tier): single-line `\r` overwrite + color strip only.
- * The multi-line cursor repaint of `uv pip install` / multi-bar `tqdm` needs a
- * full VT screen emulator (cursor-up + erase-line across lines) — deliberately
- * OUT of scope here, and its non-SGR escapes (`[2K`, `[4A`, …) are left in place
- * for the Phase 2 full tier to model. So `reduceCheap` never *worsens* output it
- * does not fully understand; it just does not yet undo a vertical repaint. See
- * the scout report `cellar-terminal-output-scout-t4`.
+ * The full tier supersedes the cheap tier for pipeline stream output; both are
+ * exported so the cheap tier stays independently testable (and cheaply reused
+ * where a full screen model is unwarranted). `isTerminalStyle` gates both.
+ *
+ * The observed escape alphabet is tiny (enumerated from a real `uv pip install`
+ * PTY capture: SGR `m`, erase-line `K`, cursor-up `A`, cursor-down `B`, plus
+ * `C`/`D`/`G`/`J`/`H`/`f` handled for safety). Any OTHER CSI, and any non-CSI
+ * `ESC` sequence, is a defensive no-op — dropped, never printed as garbage — so
+ * the emulator can only ever improve output it doesn't fully understand, never
+ * worsen it. A full-screen TUI / alternate-screen program is out of scope by
+ * design (final-state collapse of command output, not a live terminal widget).
+ * See the scout report `cellar-terminal-output-scout-t4` (§3.2, §4.2).
  *
  * Pure and browser-safe (no Node/Cellar state), unit-tested in isolation
  * (`tests/unit/terminal.test.ts`) like `output-accumulator.test.ts`.
@@ -76,4 +89,243 @@ export function reduceCheap(text: string): string {
 	const stripped = stripSgr(text);
 	if (!stripped.includes('\r')) return stripped;
 	return stripped.split('\n').map(collapseCarriageReturns).join('\n');
+}
+
+// ─── Full tier: a minimal VT screen emulator ────────────────────────────────
+
+/** Ensure the screen has a (mutable) row at `row`, appending blank rows as needed. */
+function ensureRow(rows: string[][], row: number): string[] {
+	while (rows.length <= row) rows.push([]);
+	return rows[row];
+}
+
+/** First CSI parameter as a number, defaulting an empty/malformed param to `def`. */
+function csiParam(params: string, def: number): number {
+	if (params === '') return def;
+	const v = parseInt(params.split(';')[0], 10);
+	return Number.isNaN(v) ? def : v;
+}
+
+/** Right-trim ASCII spaces + tabs from a rendered line. */
+function rtrim(s: string): string {
+	return s.replace(/[ \t]+$/, '');
+}
+
+/**
+ * Full-tier reduction: emulate a scrollback-less terminal screen so a VERTICAL
+ * repaint (cursor-up + erase-line, as `uv pip install` / multi-bar `tqdm` use)
+ * collapses to its final rendered state. Models a growing line-array screen and
+ * a `(row, col)` cursor, applies the bounded escape set (see the module header),
+ * and joins the surviving rows — each right-trimmed of trailing blank cells,
+ * trailing blank rows dropped — exactly as a terminal-capture tool renders the
+ * final screen (verified byte-identical against `pyte` on a real `uv` capture).
+ *
+ * Newline semantics are ONLCR (a real terminal's default): `\n` returns the
+ * column to 0 as well as advancing the row, matching the cheap tier and how
+ * ordinary program output (`print`) renders. Only an explicit `\r`-less cursor
+ * move keeps the column.
+ *
+ * Defensive by construction: an unknown or malformed CSI is dropped (never
+ * printed), a non-CSI `ESC` sequence is skipped, and an INCOMPLETE escape at the
+ * very end of `text` is held back (dropped from this pass) rather than leaked —
+ * the accumulator keeps the raw buffer and re-reduces the completed text on the
+ * next flush, so a sequence split across a flush boundary resolves correctly.
+ *
+ * Iterates by code point (via `Array.from`) so multibyte glyphs (braille spinner
+ * frames `⠋⠙⠹`, block bars `█`) each occupy exactly one column.
+ */
+export function reduceFull(text: string): string {
+	const rows: string[][] = [[]];
+	let row = 0;
+	let col = 0;
+
+	const write = (ch: string): void => {
+		const line = ensureRow(rows, row);
+		while (line.length < col) line.push(' ');
+		line[col] = ch;
+		col += 1;
+	};
+
+	const chars = Array.from(text);
+	const n = chars.length;
+	let i = 0;
+	while (i < n) {
+		const ch = chars[i];
+
+		if (ch === '\r') {
+			col = 0;
+			i += 1;
+		} else if (ch === '\n') {
+			row += 1;
+			col = 0;
+			ensureRow(rows, row);
+			i += 1;
+		} else if (ch === '\b') {
+			// Backspace: move the cursor left one column (CLIs emit it to redraw).
+			if (col > 0) col -= 1;
+			i += 1;
+		} else if (ch === '\x1b') {
+			const advanced = handleEscape(chars, i, rows, row, col);
+			if (advanced == null) break; // incomplete escape at end — hold it back
+			({ row, col, i } = advanced);
+		} else {
+			// Ordinary printable character.
+			write(ch);
+			i += 1;
+		}
+	}
+
+	// Render: right-trim each row of trailing blank cells, drop trailing blank rows.
+	const lines = rows.map((line) => rtrim(line.join('')));
+	while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+	return lines.join('\n');
+}
+
+/**
+ * Handle one `ESC…` sequence starting at `chars[i]`. Mutates `rows` for erase
+ * ops and returns the post-sequence `{row, col, i}`; returns `null` when the
+ * sequence is INCOMPLETE at the end of the buffer (the caller holds it back).
+ */
+function handleEscape(
+	chars: string[],
+	i: number,
+	rows: string[][],
+	row: number,
+	col: number
+): { row: number; col: number; i: number } | null {
+	const n = chars.length;
+	const next = i + 1 < n ? chars[i + 1] : '';
+
+	if (next === '') return null; // lone trailing ESC — hold it back
+
+	if (next === '[') {
+		// CSI: ESC [ <params> <intermediates> <final>. Params 0x30–0x3F (digits,
+		// `;`, private markers `<=>?`), intermediates 0x20–0x2F, final 0x40–0x7E.
+		let j = i + 2;
+		let params = '';
+		while (j < n) {
+			const code = chars[j].codePointAt(0)!;
+			if (code >= 0x30 && code <= 0x3f) {
+				params += chars[j];
+				j += 1;
+			} else break;
+		}
+		while (j < n) {
+			const code = chars[j].codePointAt(0)!;
+			if (code >= 0x20 && code <= 0x2f) j += 1; // intermediate byte(s)
+			else break;
+		}
+		if (j >= n) return null; // incomplete CSI at end of buffer — hold it back
+		const final = chars[j];
+		const afterI = j + 1;
+		// A private-marker CSI (`ESC[?…`, e.g. hide-cursor `?25l`, alt-screen
+		// `?1049h`) is not a cursor/erase op we model — drop it entirely.
+		if (params.charCodeAt(0) === 0x3f /* '?' */) return { row, col, i: afterI };
+		return applyCsi(rows, params, final, row, col, afterI);
+	}
+
+	if (next === ']') {
+		// OSC: ESC ] … terminated by BEL (0x07) or ST (ESC \). Drop it whole; if it
+		// never terminates within the buffer, it's incomplete — hold it back.
+		let j = i + 2;
+		while (j < n) {
+			if (chars[j] === '\x07') return { row, col, i: j + 1 };
+			if (chars[j] === '\x1b' && j + 1 < n && chars[j + 1] === '\\') return { row, col, i: j + 2 };
+			j += 1;
+		}
+		return null;
+	}
+
+	// A charset/other nF escape `ESC <intermediate(s)> <final>`: the byte after
+	// ESC is an intermediate (0x20–0x2F, e.g. `(` `)` `#` `%`), so consume every
+	// intermediate then one final byte (0x30–0x7E). E.g. `ESC(B` is three bytes.
+	const nextCode = next.codePointAt(0)!;
+	if (nextCode >= 0x20 && nextCode <= 0x2f) {
+		let j = i + 1;
+		while (j < n) {
+			const code = chars[j].codePointAt(0)!;
+			if (code >= 0x20 && code <= 0x2f) j += 1;
+			else break;
+		}
+		if (j >= n) return null; // incomplete — hold it back
+		return { row, col, i: j + 1 }; // drop through the final byte
+	}
+
+	// Any other 2-byte ESC sequence (save/restore `ESC7`/`ESC8`, reverse-index
+	// `ESC M`, keypad modes `ESC=`/`ESC>`, reset `ESCc`, …): drop ESC + its byte.
+	return { row, col, i: i + 2 };
+}
+
+/**
+ * Apply one non-private CSI to the screen (erase ops) and cursor. The bounded
+ * set the emulator models; every other final byte is a deliberate no-op that
+ * only consumes the sequence. Returns the post-sequence `{row, col, i}`.
+ */
+function applyCsi(
+	rows: string[][],
+	params: string,
+	final: string,
+	row: number,
+	col: number,
+	afterI: number
+): { row: number; col: number; i: number } {
+	switch (final) {
+		case 'A': // cursor up
+			row = Math.max(0, row - csiParam(params, 1));
+			break;
+		case 'B': // cursor down
+			row = row + csiParam(params, 1);
+			ensureRow(rows, row);
+			break;
+		case 'C': // cursor forward
+			col = col + csiParam(params, 1);
+			break;
+		case 'D': // cursor back
+			col = Math.max(0, col - csiParam(params, 1));
+			break;
+		case 'G': // cursor horizontal absolute (1-based)
+			col = Math.max(0, csiParam(params, 1) - 1);
+			break;
+		case 'H': // cursor position (row;col, 1-based)
+		case 'f': {
+			const parts = params.split(';');
+			const r = parts[0] === '' || parts[0] == null ? 1 : parseInt(parts[0], 10) || 1;
+			const c = parts[1] === '' || parts[1] == null ? 1 : parseInt(parts[1], 10) || 1;
+			row = Math.max(0, r - 1);
+			col = Math.max(0, c - 1);
+			ensureRow(rows, row);
+			break;
+		}
+		case 'K': {
+			// erase in line
+			const mode = csiParam(params, 0);
+			const line = ensureRow(rows, row);
+			if (mode === 0) line.length = Math.min(line.length, col); // cursor→end
+			else if (mode === 1) for (let k = 0; k <= col && k < line.length; k++) line[k] = ' '; // start→cursor
+			else line.length = 0; // whole line
+			break;
+		}
+		case 'J': {
+			// erase in display
+			const mode = csiParam(params, 0);
+			if (mode === 0) {
+				// cursor→end: truncate current line at cursor, drop rows below.
+				const line = ensureRow(rows, row);
+				line.length = Math.min(line.length, col);
+				rows.length = row + 1;
+			} else if (mode === 1) {
+				// start→cursor: blank rows above, blank current line up to cursor.
+				for (let k = 0; k < row; k++) rows[k] = [];
+				const line = ensureRow(rows, row);
+				for (let k = 0; k <= col && k < line.length; k++) line[k] = ' ';
+			} else {
+				// whole screen (2/3): blank every existing row, keep the cursor.
+				for (let k = 0; k < rows.length; k++) rows[k] = [];
+				ensureRow(rows, row);
+			}
+			break;
+		}
+		// SGR ('m') and any other final byte: no-op — consume and move on.
+	}
+	return { row, col, i: afterI };
 }

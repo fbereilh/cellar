@@ -1,0 +1,13 @@
+Using Python 3.13.14 environment at: tv
+Resolved 9 packages in 222ms
+Prepared 9 packages in 130ms
+Installed 9 packages in 7ms
+ + certifi==2026.7.22
+ + charset-normalizer==3.4.9
+ + idna==3.18
+ + markdown-it-py==4.2.0
+ + mdurl==0.1.2
+ + pygments==2.20.0
+ + requests==2.34.2
+ + rich==15.0.0
+ + urllib3==2.7.0

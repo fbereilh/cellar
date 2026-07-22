@@ -53,7 +53,10 @@ const LOG_LAST = `line ${String(LOG_LINES - 1).padStart(4, '0')}`;
 
 // A `\r`-overwrite progress bar: the terminal reducer collapses it to the final
 // line, and because it rewrites earlier bytes the deltas are tail-splices
-// (keep < base) rather than pure appends.
+// (keep < base) rather than pure appends. The full-tier reducer renders the true
+// final SCREEN, so the trailing `\n` after "done" leaves a trailing blank row
+// that is trimmed (exactly what `pyte` / a real terminal capture shows) — hence
+// no trailing newline here, unlike a plain (un-reduced) log.
 const BAR_SRC = [
 	'import time, sys',
 	'for i in range(0, 101, 2):',
@@ -64,7 +67,24 @@ const BAR_SRC = [
 	'sys.stdout.write("\\n")',
 	'print("done")'
 ].join('\n');
-const BAR_FINAL = `100%|${'#'.repeat(50)}| 100/100\ndone\n`;
+const BAR_FINAL = `100%|${'#'.repeat(50)}| 100/100\ndone`;
+
+// A MULTI-LINE cursor repaint (Phase 2 — the case the cheap tier cannot undo):
+// two stacked "bars" repainted in place each tick via cursor-up (ESC[1A) +
+// erase-line (ESC[2K). The full-tier VT emulator collapses the whole animation
+// to the two final lines; the cheap tier would leave raw `[1A`/`[2K` escapes.
+const MULTI_SRC = [
+	'import time, sys',
+	'sys.stdout.write("barA:   0%\\nbarB:   0%")',
+	'sys.stdout.flush()',
+	'for i in range(10, 101, 10):',
+	'    sys.stdout.write(f"\\x1b[1A\\r\\x1b[2KbarA: {i:3d}%\\x1b[1B\\r\\x1b[2KbarB: {i:3d}%")',
+	'    sys.stdout.flush()',
+	'    time.sleep(0.05)',
+	'sys.stdout.write("\\n")',
+	'print("done")'
+].join('\n');
+const MULTI_FINAL = 'barA: 100%\nbarB: 100%\ndone';
 
 /** A code cell for the seeded notebook. */
 function cell(id: string, source: string) {
@@ -93,7 +113,7 @@ test.beforeAll(async () => {
 		join(workspace, 'notebook.ipynb'),
 		JSON.stringify(
 			{
-				cells: [cell('c-log', LOG_SRC), cell('c-bar', BAR_SRC)],
+				cells: [cell('c-log', LOG_SRC), cell('c-bar', BAR_SRC), cell('c-multi', MULTI_SRC)],
 				metadata: { kernelspec: { name: 'python3', display_name: 'python3', language: 'python' } },
 				nbformat: 4,
 				nbformat_minor: 5
@@ -193,7 +213,7 @@ test('a slow streaming cell renders byte-correct while the wire carries deltas, 
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
 	const cells = page.getByTestId('cell');
-	await expect(cells).toHaveCount(2);
+	await expect(cells).toHaveCount(3);
 
 	// ---- 1. Plain streaming log: pure-append deltas ----
 	const logEvents = await runAndCapture(page, cells.nth(0), LOG_LAST);
@@ -248,6 +268,32 @@ test('a slow streaming cell renders byte-correct while the wire carries deltas, 
 	const barIdx = (barFull[0] as { index: number }).index;
 	expect(reconstruct(barEvents, barIdx)).toBe(BAR_FINAL);
 
+	// ---- 3. Multi-line cursor repaint: full-tier VT collapse (Phase 2) ----
+	const multiEvents = await runAndCapture(page, cells.nth(2), 'done');
+
+	const multiOut = cells.nth(2).getByTestId('output-scroll');
+	await expect(multiOut).toContainText('barA: 100%');
+	await expect(multiOut).toContainText('barB: 100%');
+	await expect(multiOut).toContainText('done');
+	// The VT emulator collapsed the vertical repaint — no CR nor raw escape reaches
+	// the DOM (the cheap tier would have leaked `[1A`/`[2K` here).
+	const multiText = (await multiOut.textContent()) ?? '';
+	expect(multiText).not.toContain('\r');
+	expect(multiText).not.toContain('\x1b');
+	expect(multiText).not.toContain('[2K');
+
+	const multiFull = multiEvents.filter((e) => e.type === 'output');
+	const multiDeltas = multiEvents.filter((e) => e.type === 'output-append') as Extract<
+		WireEvent,
+		{ type: 'output-append' }
+	>[];
+	expect(multiDeltas.length).toBeGreaterThan(0);
+	// A vertical repaint rewrites an EARLIER line, so at least one delta tail-splices.
+	expect(multiDeltas.some((d) => d.keep < d.base)).toBe(true);
+	const multiIdx = (multiFull[0] as { index: number }).index;
+	// The client's splice reconstructs the exact final screen, byte-for-byte.
+	expect(reconstruct(multiEvents, multiIdx)).toBe(MULTI_FINAL);
+
 	// ---- Evidence: screenshot + a wire transcript artifact ----
 	if (EVIDENCE) {
 		mkdirSync(EVIDENCE, { recursive: true });
@@ -269,6 +315,12 @@ test('a slow streaming cell renders byte-correct while the wire carries deltas, 
 			`  "output-append" delta frames       : ${barDeltas.length}`,
 			`  tail-splice deltas present (keep<base): ${barDeltas.some((d) => d.keep < d.base)}`,
 			`  reconstructed final line           : ${JSON.stringify(reconstruct(barEvents, barIdx))}`,
+			'',
+			'Multi-line repaint cell (c-multi): cursor-up + erase-line → full-tier VT collapse',
+			`  full "output" frames on wire       : ${multiFull.length}`,
+			`  "output-append" delta frames       : ${multiDeltas.length}`,
+			`  tail-splice deltas present (keep<base): ${multiDeltas.some((d) => d.keep < d.base)}`,
+			`  reconstructed final screen         : ${JSON.stringify(reconstruct(multiEvents, multiIdx))}`,
 			''
 		].join('\n');
 		writeFileSync(join(EVIDENCE, 'stream-output-deltas.txt'), transcript);
