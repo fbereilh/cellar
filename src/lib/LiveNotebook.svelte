@@ -179,6 +179,21 @@
 	// snapshot, never derived locally — the queue spans notebooks and tabs, so no
 	// single client can compute it.
 	let queued = $state<Record<string, number>>({});
+
+	// Live run requests this tab has in flight (or still held by the browser's
+	// connection pool), keyed by cell id → the fetch's AbortController. An interrupt
+	// aborts every one EXCEPT the running cell's: a queued/held run holds an open
+	// streaming response, and enough of them saturate the browser's ~6-connection
+	// HTTP/1.1 limit, so the interrupt request itself cannot get a connection until a
+	// run finishes on its own - by which point the queue has already drained.
+	// Aborting the queued fetches is synchronous (no network), so it frees the
+	// connections AND cancels the queued/held runs at once. See `cancelQueuedRuns`.
+	const runControllers = new Map<string, AbortController>();
+	// Bumped on interrupt so a sequential bulk-run loop (runAbove/below/stale) stops
+	// advancing to the next cell after its current run is aborted, instead of firing
+	// the rest of the batch (nothing is queued server-side there to clear).
+	let interruptGeneration = 0;
+
 	let activeId = $state<string | null>(null); // the selected/focused cell (visual emphasis)
 	let keyMode = $state<KeyMode>('command'); // 'command' | 'edit' (visuals only; the dispatcher reads the DOM)
 	// This notebook's DOM subtree. Scopes the modal-keyboard handler and cell
@@ -271,7 +286,7 @@
 	// action the modal keyboard runs for a registry shortcut id, so the palette and
 	// the keyboard share one handler and cannot diverge.
 	$effect(() => {
-		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, toggleHideAllCode, save, revealRunning });
+		onRegisterApi?.(path, { insertAndRunCode, dispatch: dispatchCommand, runAll, clearAll, runAbove, runBelow, runStale, exportPy, toggleHideAllCode, save, revealRunning, cancelQueuedRuns });
 		return () => onRegisterApi?.(path, null);
 	});
 	$effect(() => {
@@ -1047,11 +1062,16 @@
 		// it, so a request the server refused (duplicate) or dropped (a restart
 		// cancelled the queued run) never touches what is on screen.
 		let started = false;
+		// Track this run's fetch so an interrupt can abort it while it is queued or
+		// still held by the browser's connection pool (see `runControllers`).
+		const controller = new AbortController();
+		runControllers.set(id, controller);
 		try {
 			const res = await fetch(`/api/cells/${id}/run`, {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ source, nb: path, originId })
+				body: JSON.stringify({ source, nb: path, originId }),
+				signal: controller.signal
 			});
 			const reader = res.body!.getReader();
 			const decoder = new TextDecoder();
@@ -1095,9 +1115,15 @@
 				}
 			}
 		} catch (err) {
-			// The request itself failed (the server is gone). That IS this cell's result.
-			cell.outputs = [{ output_type: 'error', ename: 'CellarError', evalue: String(err), traceback: [String(err)] }];
+			// An AbortError is an intentional cancel (the interrupt aborted this queued /
+			// held run) - not a failure. Leave the cell's outputs as they are (empty for a
+			// never-started run), so a cancelled queued cell reads as idle, no output.
+			if ((err as { name?: string })?.name !== 'AbortError') {
+				// The request itself failed (the server is gone). That IS this cell's result.
+				cell.outputs = [{ output_type: 'error', ename: 'CellarError', evalue: String(err), traceback: [String(err)] }];
+			}
 		} finally {
+			runControllers.delete(id);
 			// Only a run WE actually started may clear the spinner: a request the server
 			// answered `run:duplicate` was refused precisely because that cell is running
 			// (here or in another tab), and clearing then would erase a live indicator.
@@ -1108,18 +1134,45 @@
 		}
 	}
 
+	/**
+	 * Interrupt-triggered local cancellation of this notebook's own run requests.
+	 * Called (from the shell's interrupt handler) BEFORE the interrupt hits the
+	 * server, and it is what makes the interrupt actually reach the server: aborting
+	 * the queued/held run fetches is synchronous and frees the browser connections
+	 * they hold, so the interrupt request is no longer starved by the HTTP/1.1
+	 * connection-pool limit. It also cancels those runs outright - a queued run's
+	 * abort closes its stream, which the /run route turns into a `ticket.cancel()`,
+	 * and a browser-held (never-sent) run is dropped before it can reach the kernel.
+	 *
+	 * The RUNNING cell's fetch is deliberately kept: `kernel.interrupt()` stops it
+	 * server-side and its stream still delivers the KeyboardInterrupt output. Bumping
+	 * `interruptGeneration` stops any in-progress sequential bulk-run loop (runAbove /
+	 * runBelow / runStale) from advancing to the next cell after this abort.
+	 */
+	function cancelQueuedRuns() {
+		interruptGeneration += 1;
+		for (const [id, ctrl] of runControllers) {
+			if (id !== runningId) ctrl.abort();
+		}
+	}
+
 	// ---- Bulk run actions (Run above / below / stale) ------------------------
 	// Run a set of code cells one at a time, in the given (document) order. `runCell`
 	// awaits the whole run before returning, so awaiting it in sequence keeps the
 	// execution order — which is dependency order for these actions (a cell's
 	// upstreams always precede it), so downstream cells run against fresh inputs.
 	async function runCodeIds(ids: string[]) {
+		// An interrupt during the batch must stop it here, not fire the rest: each run
+		// is awaited in turn, so an aborted cell's `runCell` returns like a normal
+		// finish and the loop would otherwise advance to the next cell.
+		const gen = interruptGeneration;
 		for (const id of ids) {
 			const cell = findCell(id);
 			if (!cell || cell.cell_type !== 'code') continue;
 			// Use the editor's LIVE text, not the debounced `cell.source`.
 			const src = cellApis[id]?.currentSource?.() ?? cell.source;
 			await runCell(id, src);
+			if (interruptGeneration !== gen) return; // interrupted mid-batch
 		}
 		refreshStaleness();
 	}
