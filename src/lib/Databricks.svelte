@@ -101,17 +101,29 @@
 		kernelSessionId = null,
 		/** Insert a code cell into the active notebook and run it. Null when no notebook is open. */
 		onInsertAndRun = null,
-		/** Called after a successful connect/disconnect so the shell refreshes its kernel + variables. */
+		/** Called after a successful connect/disconnect/reconnect so the shell refreshes its kernel + variables. */
 		onSessionChange = null,
 		/** Restart the active notebook's kernel - used to apply the Databricks-runtime toggle. */
-		onRestartKernel = null
+		onRestartKernel = null,
+		/**
+		 * Reports a compact connection summary up to the sidebar so the section HEADER
+		 * can render an at-a-glance status badge (matching the Kernels section), without
+		 * the user expanding the panel. See `headerState` below for the vocabulary.
+		 */
+		onStateChange = null
 	}: {
 		notebookPath?: string | null;
 		kernelSessionId?: SessionId | null;
 		onInsertAndRun?: ((source: string) => void) | null;
 		onSessionChange?: (() => void) | null;
 		onRestartKernel?: ((path: string) => void | Promise<void>) | null;
+		onStateChange?: ((summary: { state: string; clusterName?: string | null }) => void) | null;
 	} = $props();
+
+	/** Let the section header's refresh button re-read status (bind:this in Sidebar). */
+	export function refresh() {
+		loadStatus();
+	}
 
 	// ---- Databricks-runtime toggle (advertise DATABRICKS_RUNTIME_VERSION) -----
 	// Sets DATABRICKS_RUNTIME_VERSION in the kernel at start so a notebook's
@@ -416,8 +428,12 @@
 		}
 	}
 
-	// ---- Connect / disconnect ------------------------------------------------
+	// ---- Connect / disconnect / reconnect ------------------------------------
 	let connectError = $state<DbxError | null>(null);
+	// Reconnect is a distinct, bound-but-not-live recovery: its feedback lives in the
+	// expired/lost box, so it keeps its own error + note separate from the picker's.
+	let reconnectError = $state<DbxError | null>(null);
+	let reconnectNote = $state('');
 
 	async function connect(cluster: DbxCluster) {
 		if (busy) return;
@@ -458,6 +474,37 @@
 			onSessionChange?.();
 		} catch (err) {
 			connectError = toDbxError(err);
+		} finally {
+			busy = '';
+		}
+	}
+
+	/**
+	 * One-click recovery when the notebook is BOUND but its session is not live
+	 * (`expired` / `lost`). Reuses the server's ONE reconnect ladder via
+	 * `reconnectSession` (the SAME path auto-reconnect and the agent tool walk) - no
+	 * new reconnect flow. On success it reloads status and, if a databricks-connect
+	 * re-pin restarted the kernel, warns that the namespace was cleared.
+	 */
+	async function reconnect() {
+		if (busy) return;
+		busy = 'reconnect';
+		reconnectError = null;
+		reconnectNote = '';
+		try {
+			const res = await fetch('/api/databricks/reconnect', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ path: notebookPath ?? undefined })
+			});
+			const body = await res.json();
+			if (!res.ok) throw body;
+			// The kernel had to be restarted (a version re-pin), so every variable is gone.
+			if (body.kernel_restarted) reconnectNote = 'Reconnected, but the kernel was restarted - your variables are gone. Re-run your cells.';
+			await loadStatus();
+			onSessionChange?.();
+		} catch (err) {
+			reconnectError = toDbxError(err);
 		} finally {
 			busy = '';
 		}
@@ -602,12 +649,45 @@
 
 	// ---- Presentation --------------------------------------------------------
 	/** RUNNING is the only state you can attach to right away; PENDING will get there. */
-	function clusterBadge(state: string | undefined) {
-		if (state === 'RUNNING') return 'badge-success';
-		if (state === 'PENDING' || state === 'RESTARTING' || state === 'RESIZING') return 'badge-warning';
-		if (state === 'ERROR') return 'badge-error';
-		return 'badge-ghost';
+	function clusterDotClass(state: string | undefined) {
+		if (state === 'RUNNING') return 'bg-success';
+		if (state === 'PENDING' || state === 'RESTARTING' || state === 'RESIZING') return 'bg-warning';
+		if (state === 'ERROR') return 'bg-error';
+		return 'bg-base-content/30';
 	}
+	/** A cluster still spinning up gets a ping halo (like a busy kernel row). */
+	function clusterPending(state: string | undefined) {
+		return state === 'PENDING' || state === 'RESTARTING' || state === 'RESIZING';
+	}
+
+	// A single muted "profile · host · spark" line replacing the connected card's
+	// former <dl> grid - shorter and calmer, still complete.
+	const connMeta = $derived(
+		[
+			connection.profile,
+			connection.host ? connection.host.replace(/^https?:\/\//, '') : null,
+			connection.sparkVersion
+		]
+			.filter(Boolean)
+			.join(' · ')
+	);
+
+	// The section-header status vocabulary. Reported up so the sidebar renders a
+	// badge (cluster short-name when live, else the state word) - the at-a-glance
+	// signal the Kernels section has and this one lacked.
+	const headerState = $derived.by(() => {
+		if (busy === 'connect' || busy === 'reconnect') return 'connecting';
+		if (!status) return 'loading';
+		if (!installed) return 'disconnected';
+		if (connected) return 'connected';
+		if (connection.expired) return 'expired';
+		if (connection.lost) return 'lost';
+		return 'disconnected';
+	});
+	const headerClusterName = $derived(connection.clusterName ?? connection.lost?.clusterName ?? null);
+	$effect(() => {
+		onStateChange?.({ state: headerState, clusterName: headerClusterName });
+	});
 
 	/** What the user should DO about a failure. The server's own message follows it. */
 	const REMEDY: Record<string, string> = {
@@ -644,7 +724,29 @@
 	<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">{text}</p>
 {/snippet}
 
-<div class="px-3 pb-3" data-testid="databricks-body">
+<!-- One-click recovery for the bound-but-not-live states (expired / lost). Wired to
+     `reconnectSession` via /api/databricks/reconnect - the SAME ladder auto-reconnect
+     walks; the cluster picker below stays as the manual "pick another cluster" fallback. -->
+{#snippet reconnectButton()}
+	<button
+		class="btn btn-primary btn-xs mt-2 w-full gap-1"
+		onclick={reconnect}
+		disabled={!!busy}
+		data-testid="databricks-reconnect"
+	>
+		{#if busy === 'reconnect'}
+			<span class="loading loading-spinner loading-xs"></span>Reconnecting…
+		{:else}
+			<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>Reconnect
+		{/if}
+	</button>
+	{#if reconnectNote}
+		<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/60" data-testid="databricks-reconnect-note">{reconnectNote}</p>
+	{/if}
+	{#if reconnectError}{@render errorBox(reconnectError, 'databricks-reconnect-error')}{/if}
+{/snippet}
+
+<div class="px-2 pb-3" data-testid="databricks-body">
 	{#if statusError}
 		{@render errorBox({ code: 'error', message: statusError }, 'databricks-status-error')}
 
@@ -691,25 +793,21 @@
 		<!-- 3. Ready: profile + cluster picker, or the live session. -->
 	{:else}
 		{#if connected}
-			<div class="rounded-lg border border-success/30 bg-success/10 p-2.5" data-testid="databricks-connected">
-				<div class="flex items-center justify-between gap-2">
-					<span class="min-w-0 break-words text-sm font-medium" title={connection.clusterName}>{connection.clusterName}</span>
-					<span class="badge badge-success badge-sm shrink-0 gap-1" data-testid="databricks-connection-status">
+			<!-- Compact, sidebar-native connected view: a leading success dot + cluster
+			     name + status badge (kernel-row density), one muted meta line, the
+			     spark/w hint, then the actions and the runtime toggle - no tinted card. -->
+			<div class="px-1" data-testid="databricks-connected">
+				<div class="flex items-center gap-2">
+					<span class="relative flex h-2 w-2 shrink-0" title="connected"><span class="inline-flex h-2 w-2 rounded-full bg-success"></span></span>
+					<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connection.clusterName}>{connection.clusterName}</span>
+					<span class="badge badge-success badge-xs shrink-0 gap-1" data-testid="databricks-connection-status">
 						<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>connected
 					</span>
 				</div>
-				<dl class="mt-2 space-y-0.5 text-[11px] text-base-content/50">
-					{#if connection.profile}
-						<div class="flex justify-between gap-2"><dt>profile</dt><dd class="truncate font-mono text-base-content/70">{connection.profile}</dd></div>
-					{/if}
-					{#if connection.host}
-						<div class="flex justify-between gap-2"><dt>host</dt><dd class="truncate font-mono text-base-content/70" title={connection.host}>{connection.host.replace(/^https?:\/\//, '')}</dd></div>
-					{/if}
-					{#if connection.sparkVersion}
-						<div class="flex justify-between gap-2"><dt>spark</dt><dd class="truncate font-mono text-base-content/70">{connection.sparkVersion}</dd></div>
-					{/if}
-				</dl>
-				<p class="mt-2 border-t border-success/20 pt-2 text-[11px] leading-relaxed text-base-content/50">
+				{#if connMeta}
+					<p class="mt-1 truncate font-mono text-[11px] text-base-content/50" title={connMeta}>{connMeta}</p>
+				{/if}
+				<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/50">
 					<code class="font-mono text-[10px] text-primary">spark</code> and
 					<code class="font-mono text-[10px] text-primary">w</code> are ready in the kernel.
 				</p>
@@ -729,8 +827,9 @@
 				<!-- Databricks-runtime toggle: advertise DATABRICKS_RUNTIME_VERSION so this
 				     notebook's IS_DATABRICKS-gated code takes its dbutils.widgets path.
 				     Shown only when connected; applies at kernel START (import-time gate),
-				     so a change surfaces a "restart to apply" hint. -->
-				<div class="mt-2 border-t border-success/20 pt-2">
+				     so a change surfaces a "restart to apply" hint. Kept a green
+				     (toggle-success) Databricks cue, deliberately unlike Files' primary toggle. -->
+				<div class="mt-2 border-t border-base-300 pt-2">
 					<label
 						class="flex cursor-pointer items-center gap-2 text-[11px] text-base-content/70"
 						title="Advertises a Databricks runtime (sets DATABRICKS_RUNTIME_VERSION) so notebook code that gates on IS_DATABRICKS takes its dbutils.widgets path. Affects all libraries (e.g. mlflow), requires a kernel restart, and does not connect a cluster - use Databricks Connect for spark/Unity Catalog."
@@ -774,12 +873,18 @@
 				</div>
 			</div>
 		{:else if connection.expired}
-			<div class="mb-2 rounded-lg border border-warning/30 bg-warning/10 p-2 text-[11px] leading-relaxed text-base-content/70" data-testid="databricks-expired">
-				The Spark Connect session on <span class="font-mono">{connection.lost?.clusterName}</span> expired (idle timeout or a closed client). Cellar is reconnecting; if it does not recover, reconnect below.
+			<div class="mb-2 rounded-lg border border-warning/30 bg-warning/10 p-2.5" data-testid="databricks-expired">
+				<p class="text-[11px] leading-relaxed text-base-content/70">
+					The Spark Connect session on <span class="font-mono">{connection.lost?.clusterName}</span> expired (idle timeout or a closed client). Cellar is reconnecting automatically; if it doesn't recover, use Reconnect.
+				</p>
+				{@render reconnectButton()}
 			</div>
 		{:else if connection.lost}
-			<div class="mb-2 rounded-lg border border-warning/30 bg-warning/10 p-2 text-[11px] leading-relaxed text-base-content/70" data-testid="databricks-lost">
-				The session on <span class="font-mono">{connection.lost.clusterName}</span> ended when the kernel restarted. Reconnect below.
+			<div class="mb-2 rounded-lg border border-warning/30 bg-warning/10 p-2.5" data-testid="databricks-lost">
+				<p class="text-[11px] leading-relaxed text-base-content/70">
+					The session on <span class="font-mono">{connection.lost.clusterName}</span> ended when the kernel restarted. Reconnect to restore <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code>.
+				</p>
+				{@render reconnectButton()}
 			</div>
 		{/if}
 
@@ -857,17 +962,21 @@
 					{#if clustersError}
 						{@render errorBox(clustersError, 'databricks-clusters-error')}
 					{:else if clustersLoading && !clusters}
-						<p class="px-1 py-2 text-xs text-base-content/40">loading clusters…</p>
+						<p class="px-2 py-2 text-xs text-base-content/40">loading clusters…</p>
 					{:else if clusters?.length}
-						<div class="max-h-56 space-y-1 overflow-y-auto">
+						<div class="max-h-56 space-y-0.5 overflow-y-auto">
 							{#each clusters as c (c.cluster_id)}
 								<button
-									class="flex w-full items-center gap-1.5 rounded border border-base-300 px-1.5 py-1 text-left hover:border-primary/50 hover:bg-base-300/40 disabled:opacity-50"
+									class="group flex w-full items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-base-300/40 disabled:opacity-50"
 									onclick={() => connect(c)}
 									disabled={!!busy}
 									title="Connect 'spark' to {c.name}"
 									data-testid="databricks-cluster"
 								>
+									<span class="relative flex h-2 w-2 shrink-0" title={c.state.toLowerCase()}>
+										{#if clusterPending(c.state)}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
+										<span class="relative inline-flex h-2 w-2 rounded-full {clusterDotClass(c.state)}"></span>
+									</span>
 									<span class="min-w-0 flex-1">
 										<span class="block truncate text-xs text-base-content/80">{c.name}</span>
 										{#if c.spark_version}<span class="block truncate font-mono text-[10px] text-base-content/40">{c.spark_version}</span>{/if}
@@ -875,7 +984,7 @@
 									{#if connectingId === c.cluster_id}
 										<span class="loading loading-spinner loading-xs shrink-0 text-primary"></span>
 									{:else}
-										<span class="badge badge-xs shrink-0 {clusterBadge(c.state)}">{c.state.toLowerCase()}</span>
+										<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/40">{c.state.toLowerCase()}</span>
 									{/if}
 								</button>
 							{/each}
@@ -884,7 +993,7 @@
 							{@render hint('Connecting… starting a terminated cluster can take a few minutes.')}
 						{/if}
 					{:else if clusters}
-						<p class="px-1 py-2 text-xs text-base-content/40">no clusters in this workspace</p>
+						<p class="px-2 py-2 text-xs text-base-content/40">no clusters in this workspace</p>
 					{/if}
 				{/if}
 
@@ -910,7 +1019,7 @@
 				{#if catalogsError}
 					{@render errorBox(catalogsError, 'databricks-catalogs-error')}
 				{:else if catalogsLoading}
-					<p class="px-1 py-2 text-xs text-base-content/40">loading catalogs…</p>
+					<p class="px-2 py-2 text-xs text-base-content/40">loading catalogs…</p>
 				{:else if catalogs?.length}
 					<div class="max-h-72 overflow-y-auto pt-1">
 						{#each catalogs as cat (cat.name)}
@@ -972,7 +1081,7 @@
 						{@render hint('Open a notebook to preview a table.')}
 					{/if}
 				{:else if catalogs}
-					<p class="px-1 py-2 text-xs text-base-content/40">no catalogs visible to this profile</p>
+					<p class="px-2 py-2 text-xs text-base-content/40">no catalogs visible to this profile</p>
 				{/if}
 			</div>
 		{/if}
