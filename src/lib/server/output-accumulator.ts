@@ -60,7 +60,7 @@
  * unit-tested directly (`tests/unit/output-accumulator.test.ts`).
  */
 import type { CellOutput, StreamOutput } from './types';
-import { isTerminalStyle, reduceCheap } from './terminal';
+import { isTerminalStyle, reduceFull } from './terminal';
 
 /** Coalesce/broadcast tick: flush buffered stream text at most this often (ms). */
 export const OUTPUT_FLUSH_MS = 40;
@@ -251,12 +251,15 @@ export class OutputAccumulator {
 		if (!this.pending) return;
 		const { name, text, index } = this.pending;
 		// Keep `pending.text` raw — coalescing across chunks and the byte caps both
-		// depend on the full reassembled text (and Phase 2's VT emulator will too).
-		// Emit the terminal-reduced COPY so persist (.ipynb), the SSE broadcast, the
-		// agent read, and the render all see the collapsed final line instead of
-		// hundreds of `\r`-overwrite frames. Plain logs skip reduction entirely.
+		// depend on the full reassembled text, and the VT emulator re-reduces the
+		// WHOLE raw buffer each flush (so a cursor repaint that rewrites an earlier
+		// line, and a sequence split across a flush boundary, both resolve
+		// correctly). Emit the terminal-reduced COPY so persist (.ipynb), the SSE
+		// broadcast, the agent read, and the render all see the collapsed final
+		// screen instead of hundreds of `\r`/cursor-repaint frames. Plain logs skip
+		// reduction entirely (byte-for-byte passthrough via the isTerminalStyle gate).
 		const terminal = isTerminalStyle(text);
-		const reduced = terminal ? reduceCheap(text) : text;
+		const reduced = terminal ? reduceFull(text) : text;
 		const prev = this.pending.emitted;
 		// Idle timer tick: nothing has changed since the last emission, so don't
 		// re-broadcast the element at all.
@@ -271,7 +274,10 @@ export class OutputAccumulator {
 			// A plain (non-terminal) stream reduces to identity and only ever grows by
 			// appending, so `prev` is a strict prefix of `reduced`: keep its whole
 			// length with no scan (the O(new bytes) fast path). A terminal buffer can
-			// rewrite its tail (CR collapse), so diff to the common prefix.
+			// rewrite earlier bytes (a `\r` collapse or a cursor-up repaint of an
+			// earlier line), so diff to the common prefix — everything from the first
+			// divergence onward rides in `chunk`, and `new = prev.slice(0,keep)+chunk`
+			// reconstructs it exactly wherever the rewrite landed.
 			const keep = terminal ? commonPrefixLen(prev, reduced) : prev.length;
 			this.onEmit(out, index, { base: prev.length, keep, chunk: reduced.slice(keep) });
 		}

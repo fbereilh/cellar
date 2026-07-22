@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { OutputAccumulator, type OutputCaps, type StreamDelta } from '../../src/lib/server/output-accumulator';
 import type { CellOutput } from '../../src/lib/server/types';
 
@@ -178,6 +179,46 @@ describe('OutputAccumulator — streamed deltas (wire optimization)', () => {
 		expect(deltas.some((d) => d.keep < d.base)).toBe(true);
 		// Replaying every frame still yields the byte-exact collapsed line.
 		expect(replay(emits, 0)).toBe(final);
+	});
+
+	it('a multi-line cursor repaint (full tier) stays byte-correct through deltas', () => {
+		// Two stacked bars repainted via cursor-up + erase-line — the case the cheap
+		// tier can't undo. The full-tier reduction rewrites an EARLIER line, so the
+		// delta must splice before its end (keep < base) and still replay exactly.
+		const { acc, emits } = withRecorder();
+		acc.push(stream('stdout', 'bar1: 0%\nbar2: 0%'));
+		acc.flush();
+		acc.push(stream('stdout', '\x1b[1A\r\x1b[2Kbar1: 50%'));
+		acc.flush();
+		acc.push(stream('stdout', '\x1b[1B\r\x1b[2Kbar2: 50%'));
+		acc.flush();
+		acc.push(stream('stdout', '\x1b[1A\r\x1b[2Kbar1: 100%\x1b[1B\r\x1b[2Kbar2: 100%'));
+		const out = acc.finish();
+		const final = (out[0] as { text: string }).text;
+		expect(final).toBe('bar1: 100%\nbar2: 100%');
+		expect(final).not.toMatch(/[\r\x1b]/); // no leaked CR/escape bytes
+		const deltas = emits.filter((e) => e.delta).map((e) => e.delta!);
+		expect(deltas.some((d) => d.keep < d.base)).toBe(true); // rewrote an earlier line
+		expect(replay(emits, 0)).toBe(final);
+	});
+
+	it('the real `uv pip install` capture reduces + replays byte-exactly through deltas', () => {
+		const raw = readFileSync(new URL('./fixtures/uv-pip-install.raw.txt', import.meta.url), 'utf8');
+		const finalScreen = readFileSync(
+			new URL('./fixtures/uv-pip-install.final.txt', import.meta.url),
+			'utf8'
+		).replace(/\n$/, '');
+		const { acc, emits } = withRecorder({ maxStreamBytes: 10_000_000, maxTotalBytes: 20_000_000 });
+		// Feed the 18KB capture in realistic ~256-byte chunks, flushing each tick, so
+		// escape sequences split across flush boundaries and the delta path is exercised.
+		for (let p = 0; p < raw.length; p += 256) {
+			acc.push(stream('stdout', raw.slice(p, p + 256)));
+			acc.flush();
+		}
+		const out = acc.finish();
+		const final = (out[0] as { text: string }).text;
+		expect(final).toBe(finalScreen); // persisted .ipynb = clean final screen
+		expect(replay(emits, 0)).toBe(final); // SSE delta replay reconstructs it exactly
 	});
 
 	it('a mixed log + progress-bar stream stays byte-correct through deltas', () => {
