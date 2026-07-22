@@ -184,6 +184,14 @@ export function offsetOf(id: string, order: string[], heights: Map<string, numbe
  * `prior` is read from the SAME `heights`/`estimate` the spacer or mounted card was
  * laid out with, so the delta is exactly the DOM shift. Pure ⇒ unit-testable with no
  * DOM (the report's "spacer deltas at the controller level").
+ *
+ * `viewportTop` MUST be expressed in `offsetOf`'s coordinate space (the cell-stack
+ * origin: the top of the `<div class="space-y-4">` cell container), NOT the raw
+ * `scrollParent.scrollTop`. The two differ by a constant offset — the page padding
+ * plus the optional export bar above the stack — so the caller subtracts that offset
+ * before passing scrollTop in. Otherwise a cell in the `[scrollTop-C, scrollTop)` band
+ * is visible at the top of the viewport yet misclassified as above-the-fold and gets a
+ * spurious compensation, causing the very jump this function prevents.
  */
 export function scrollCompensation(args: {
 	id: string;

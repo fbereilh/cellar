@@ -71,6 +71,29 @@ async function firstCellTop(page: Page): Promise<number | null> {
 	});
 }
 
+/** The `data-cell-id` of a mounted cell whose top is nearest the viewport's top edge. */
+async function cellNearViewportTop(page: Page): Promise<string | null> {
+	return page.evaluate(() => {
+		let best: { id: string; d: number } | null = null;
+		for (const el of Array.from(document.querySelectorAll('[data-cell-id]'))) {
+			const id = (el as HTMLElement).getAttribute('data-cell-id');
+			if (!id) continue;
+			const top = (el as HTMLElement).getBoundingClientRect().top;
+			if (top < 0) continue;
+			if (!best || top < best.d) best = { id, d: top };
+		}
+		return best?.id ?? null;
+	});
+}
+
+/** Viewport-relative top of the cell with `data-cell-id`, or null if unmounted. */
+async function cellTopById(page: Page, id: string): Promise<number | null> {
+	return page.evaluate((cellId) => {
+		const el = document.querySelector(`[data-cell-id="${CSS.escape(cellId)}"]`);
+		return el ? (el as HTMLElement).getBoundingClientRect().top : null;
+	}, id);
+}
+
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available — E2E is local-only');
 	workspace = mkdtempSync(join(tmpdir(), 'cellar-virt-e2e-'));
@@ -144,6 +167,34 @@ test(`windows a ${CELL_COUNT}-cell notebook: O(viewport) mounted, fewer nodes, n
 	expect(topAfter).not.toBeNull();
 	// The first cell sits where it did before the round trip: no accumulated jump.
 	expect(Math.abs((topAfter as number) - (topBefore as number))).toBeLessThan(4);
+
+	// (c2) The same no-jump guarantee at a NON-zero scroll offset — where the
+	// `viewportTop<=0` short-circuit does NOT fire, so scrollCompensation actually
+	// runs and the coordinate-origin (scrollTop vs cell-stack) must line up. Pick a
+	// mid-notebook offset, anchor on a currently-visible reference cell, round-trip
+	// to the bottom and back to the SAME offset, and assert the reference is stable.
+	const midOffset = Math.round(scrollHeight * 0.4);
+	await setScrollTop(page, midOffset);
+	await page.waitForTimeout(200);
+	const refId = await cellNearViewportTop(page);
+	expect(refId).not.toBeNull();
+	const refTopBefore = await cellTopById(page, refId as string);
+	expect(refTopBefore).not.toBeNull();
+
+	for (let f = 0.4; f <= 1.0001; f += 0.2) {
+		await setScrollTop(page, Math.round(scrollHeight * Math.min(1, f)));
+		await page.waitForTimeout(120);
+	}
+	for (let f = 0.8; f >= 0.4; f -= 0.2) {
+		await setScrollTop(page, Math.round(scrollHeight * f));
+		await page.waitForTimeout(120);
+	}
+	await setScrollTop(page, midOffset);
+	await page.waitForTimeout(200);
+
+	const refTopAfter = await cellTopById(page, refId as string);
+	expect(refTopAfter).not.toBeNull();
+	expect(Math.abs((refTopAfter as number) - (refTopBefore as number))).toBeLessThan(4);
 
 	// eslint-disable-next-line no-console
 	console.log(
