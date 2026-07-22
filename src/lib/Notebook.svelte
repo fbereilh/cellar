@@ -236,10 +236,19 @@
 		read();
 		parent.addEventListener('scroll', onScroll, { passive: true });
 		window.addEventListener('resize', onScroll);
+		// The scroll pane is `display:none` while its tab is inactive, so a notebook
+		// that loaded hidden reads clientHeight=0 and would window against a zero-height
+		// viewport (blank spacer) until the first scroll/resize. Observing the pane's own
+		// size refreshes the metrics on the display:none→visible transition (and on
+		// sidebar-drag / other container resizes) with no scroll needed.
+		const ro =
+			typeof ResizeObserver !== 'undefined' ? new ResizeObserver(onScroll) : null;
+		ro?.observe(parent);
 		return () => {
 			if (raf) cancelAnimationFrame(raf);
 			parent.removeEventListener('scroll', onScroll);
 			window.removeEventListener('resize', onScroll);
+			ro?.disconnect();
 		};
 	});
 
