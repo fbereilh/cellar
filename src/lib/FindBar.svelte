@@ -75,7 +75,7 @@
 	// per-surface highlighting; to a user that is one visible occurrence), so the
 	// count and next/prev step through visible occurrences - what a user expects.
 	const matches = $derived<Match[]>(
-		debouncedQuery
+		open && debouncedQuery
 			? dedupeMatchesForDisplay(
 					searchNotebook(cells, debouncedQuery, opts, searchCache ?? fallbackCache)
 				)
@@ -125,6 +125,8 @@
 				inputEl?.focus();
 				inputEl?.select();
 			});
+		} else if (!open && wasOpen) {
+			debouncedQuery = ''; // stop scanning when closed; a re-open starts clean
 		}
 		wasOpen = open;
 	});

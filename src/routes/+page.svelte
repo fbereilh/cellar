@@ -217,8 +217,8 @@
 	let paletteOpen = $state(false);
 	// The floating find-in-page bar (Search P3). Opened from a non-Ctrl entry point
 	// (the sidebar Search button, or the `open-find` shortcut) - Ctrl+F interception
-	// is P5. `findSeed` bumps a counter each open so the bar re-seeds from the
-	// current selection every time (even if it was already open on the same query).
+	// is P5. `findSeed` holds the text selection captured at open time; the bar
+	// seeds its query from it only on the closed->open transition.
 	let findOpen = $state(false);
 	let findSeed = $state('');
 	// Transient, dismissable status line (jupytext env not ready, convert result, …).
