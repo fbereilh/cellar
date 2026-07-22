@@ -88,6 +88,7 @@
 		searchQuery?: string;
 		searchCaseSensitive?: boolean;
 		searchWholeWord?: boolean;
+		searchRegex?: boolean;
 		/** This cell's highlight payload (present iff it has ≥1 match), or null. */
 		searchHighlight?: CellHighlight | null;
 		/** Hands the notebook this cell's imperative API (null on teardown). */
@@ -137,6 +138,7 @@
 		searchQuery = '',
 		searchCaseSensitive = false,
 		searchWholeWord = false,
+		searchRegex = false,
 		searchHighlight = null,
 		onRegister,
 		onMeasure,
@@ -1100,8 +1102,8 @@
 		if (!browser) return;
 		const q = searchQuery;
 		const active = searchHighlight?.active ?? null;
-		const opts = { caseSensitive: searchCaseSensitive, wholeWord: searchWholeWord };
-		const scrollKey = `${q}|${searchCaseSensitive}|${searchWholeWord}|${active ? `${active.field}:${active.outputIndex ?? ''}:${active.ordinal}` : ''}`;
+		const opts = { caseSensitive: searchCaseSensitive, wholeWord: searchWholeWord, regex: searchRegex };
+		const scrollKey = `${q}|${searchCaseSensitive}|${searchWholeWord}|${searchRegex}|${active ? `${active.field}:${active.outputIndex ?? ''}:${active.ordinal}` : ''}`;
 		const shouldScroll = !!active && scrollKey !== lastScrollKey;
 		lastScrollKey = scrollKey;
 
@@ -1112,7 +1114,7 @@
 		if (sourceVisible && editorBuilt && view) {
 			clearSurface(K_SRC);
 			view.dispatch({
-				effects: setCmSearch.of(q ? { query: q, caseSensitive: opts.caseSensitive, wholeWord: opts.wholeWord, activeOrdinal: sourceActive } : null)
+				effects: setCmSearch.of(q ? { query: q, caseSensitive: opts.caseSensitive, wholeWord: opts.wholeWord, regex: opts.regex, activeOrdinal: sourceActive } : null)
 			});
 			if (shouldScroll && sourceActive != null) {
 				const m = activeCmMatch(view);
@@ -1140,7 +1142,7 @@
 		key: string,
 		el: Element | null,
 		query: string,
-		opts: { caseSensitive: boolean; wholeWord: boolean },
+		opts: { caseSensitive: boolean; wholeWord: boolean; regex?: boolean },
 		activeOrdinal: number | null,
 		shouldScroll: boolean
 	) {
@@ -1178,6 +1180,7 @@
 		void searchQuery;
 		void searchCaseSensitive;
 		void searchWholeWord;
+		void searchRegex;
 		void searchHighlight;
 		void editorBuilt;
 		void isMarkdown;

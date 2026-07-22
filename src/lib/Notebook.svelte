@@ -78,6 +78,7 @@
 		searchQuery?: string;
 		searchCaseSensitive?: boolean;
 		searchWholeWord?: boolean;
+		searchRegex?: boolean;
 		/** cell id → its highlight payload, for cells with ≥1 match (or null map). */
 		cellHighlights?: Map<string, CellHighlight> | null;
 		/** Windowed (virtualized) cell rendering. Default OFF — with it off the
@@ -140,6 +141,7 @@
 		searchQuery = '',
 		searchCaseSensitive = false,
 		searchWholeWord = false,
+		searchRegex = false,
 		cellHighlights = null,
 		virtualize = false,
 		scrollPins,
@@ -522,6 +524,7 @@
 			{searchQuery}
 			{searchCaseSensitive}
 			{searchWholeWord}
+			{searchRegex}
 			searchHighlight={cellHighlights?.get(cell.id) ?? null}
 			onRegister={onRegister}
 			onEditorFocus={onEditorFocus}

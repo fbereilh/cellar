@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, flushSync } from 'svelte';
 	import { fade } from 'svelte/transition';
 	import Navbar from '$lib/Navbar.svelte';
 	import Sidebar from '$lib/Sidebar.svelte';
@@ -222,6 +222,9 @@
 	// seeds its query from it only on the closed->open transition.
 	let findOpen = $state(false);
 	let findSeed = $state('');
+	// Bumped when Ctrl/Cmd+F is pressed while the bar is already open, so the bar
+	// re-focuses + re-seeds (native-find behavior) instead of toggling closed.
+	let findReseed = $state(0);
 	// Shared find-in-page highlight state (Search P4). The find-bar publishes its
 	// query/opts/matches/active index here; the active notebook reads it and paints
 	// every match in place (active one emphasized + scrolled into view). One object,
@@ -232,6 +235,7 @@
 		query: '',
 		caseSensitive: false,
 		wholeWord: false,
+		regex: false,
 		matches: [],
 		activeIndex: 0
 	});
@@ -260,6 +264,13 @@
 	// once at init; URL params don't change within a session.
 	const virtualizeCells =
 		typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('virtualize') === '1';
+	// Print safety (Search P5): windowing drops off-screen cells from the DOM, so a
+	// print/PDF would capture only the mounted window. `beforeprint` flips this and
+	// synchronously flushes (`flushSync`) so EVERY cell mounts before the browser
+	// snapshots; `afterprint` restores windowing. Only meaningful when windowing is
+	// on - with it off all cells are already mounted, so `printing` changes nothing.
+	let printing = $state(false);
+	const effectiveVirtualize = $derived(virtualizeCells && !printing);
 	const mcp = data.mcp;
 	// Soft cap on live kernels; past it the Kernels sidebar warns (warn-only).
 	const maxKernels = data.maxKernels ?? 8;
@@ -903,13 +914,16 @@
 		setTimeout(() => el.classList.remove('cellar-flash'), 1200);
 	}
 
-	// ---- Find-in-page (floating find bar, Search P3) ------------------------
+	// ---- Find-in-page (floating find bar, Search P3 + P5) -------------------
 	// Open the bar, seeding its query from the current text selection (native find
 	// behavior). Capturing the selection here - before focus moves to the find
-	// input - is what makes the seed reliable.
+	// input - is what makes the seed reliable. When the bar is ALREADY open (a
+	// repeat Ctrl/Cmd+F), bump the reseed signal so it re-focuses + re-seeds rather
+	// than staying put or closing - matching the browser's native find.
 	function openFindBar() {
 		findSeed = (typeof window !== 'undefined' && window.getSelection?.()?.toString().trim()) || '';
-		findOpen = true;
+		if (findOpen) findReseed++;
+		else findOpen = true;
 	}
 	function closeFindBar() {
 		findOpen = false;
@@ -1201,10 +1215,14 @@
 				saveActiveNotebook();
 				return;
 			}
-			// Open the find bar (temporary non-Ctrl entry point; Ctrl+F is P5). Shell-
-			// level so it fires with focus inside an editor, and only when a notebook is
-			// active - a plain file tab has nothing to find across cells. A modal owns
-			// the keyboard while up.
+			// Open the find bar (P5: this INTERCEPTS the browser's native Ctrl/Cmd+F -
+			// `open-find` is bound to `Mod-f` - and opens cellar Search instead; the
+			// `Mod-Shift-f` chord also lands here). Shell-level so it fires with focus
+			// inside an editor, and only when a notebook is active - a plain file tab
+			// has nothing to find across cells, so Ctrl+F falls through to the browser
+			// there. A modal likewise owns the keyboard while up. `preventDefault` is
+			// what suppresses native find; `openFindBar` re-seeds when already open
+			// (a repeat Ctrl+F) rather than closing.
 			if (bindsFor('open-find').includes(chord)) {
 				if (!activeNotebookPath || document.querySelector('.modal-open')) return;
 				e.preventDefault();
@@ -1220,6 +1238,26 @@
 		}
 		window.addEventListener('keydown', onKey, true);
 		return () => window.removeEventListener('keydown', onKey, true);
+	});
+
+	// Print safety under virtualization (Search P5). Force every cell to mount
+	// before the browser snapshots for print/PDF, then restore windowing after.
+	// `flushSync` makes the un-windowed render land synchronously inside the
+	// `beforeprint` handler, before the print engine reads the DOM.
+	onMount(() => {
+		function onBeforePrint() {
+			printing = true;
+			flushSync();
+		}
+		function onAfterPrint() {
+			printing = false;
+		}
+		window.addEventListener('beforeprint', onBeforePrint);
+		window.addEventListener('afterprint', onAfterPrint);
+		return () => {
+			window.removeEventListener('beforeprint', onBeforePrint);
+			window.removeEventListener('afterprint', onAfterPrint);
+		};
 	});
 
 	// Brief "Saved" confirmation for a Cmd/Ctrl+S save. Fades out on its own.
@@ -1339,6 +1377,7 @@
 				cells={activeCells}
 				searchCache={activeSearchCache}
 				seed={findSeed}
+				reseedSignal={findReseed}
 				onClose={closeFindBar}
 				onJump={jumpToMatch}
 				highlight={searchHighlight}
@@ -1350,7 +1389,7 @@
 				<div class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}">
 					<LiveNotebook
 						path={canonicalNotebookRel}
-						virtualize={virtualizeCells}
+						virtualize={effectiveVirtualize}
 						active={activeTabId === 'notebook'}
 						follow={followRunningCell}
 						gitRefresh={fsRefreshSignal}
@@ -1376,7 +1415,7 @@
 				<div class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}">
 					<LiveNotebook
 						path={tab.path}
-						virtualize={virtualizeCells}
+						virtualize={effectiveVirtualize}
 						active={activeTabId === tab.id}
 						follow={followRunningCell}
 						gitRefresh={fsRefreshSignal}

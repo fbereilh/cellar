@@ -53,6 +53,33 @@ describe('findOccurrences', () => {
 			{ start: 2, end: 3 }
 		]);
 	});
+
+	// P5: regex mode mirrors the engine's scanFieldRegex, so highlighted spans
+	// line up with the find-bar count.
+	it('locates regex matches with offsets, case-insensitive by default', () => {
+		expect(findOccurrences('df1 DF2', 'df\\d', { caseSensitive: false, wholeWord: false, regex: true })).toEqual([
+			{ start: 0, end: 3 },
+			{ start: 4, end: 7 }
+		]);
+	});
+
+	it('regex honors caseSensitive and wholeWord', () => {
+		expect(findOccurrences('df1 DF2', 'df\\d', { caseSensitive: true, wholeWord: false, regex: true })).toEqual([
+			{ start: 0, end: 3 }
+		]);
+		expect(findOccurrences('cat category', 'ca.', { caseSensitive: false, wholeWord: true, regex: true })).toEqual([
+			{ start: 0, end: 3 }
+		]);
+	});
+
+	it('an invalid regex yields no occurrences and never throws', () => {
+		expect(() => findOccurrences('abc', '(', { caseSensitive: false, wholeWord: false, regex: true })).not.toThrow();
+		expect(findOccurrences('abc', '(', { caseSensitive: false, wholeWord: false, regex: true })).toEqual([]);
+	});
+
+	it('a zero-length-capable regex terminates', () => {
+		expect(findOccurrences('abc', 'x*', { caseSensitive: false, wholeWord: false, regex: true })).toEqual([]);
+	});
 });
 
 describe('buildCellHighlights', () => {

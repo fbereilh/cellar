@@ -2058,6 +2058,7 @@
 			searchQuery={searchOn && searchHighlight ? searchHighlight.query : ''}
 			searchCaseSensitive={searchHighlight?.caseSensitive ?? false}
 			searchWholeWord={searchHighlight?.wholeWord ?? false}
+			searchRegex={searchHighlight?.regex ?? false}
 			{cellHighlights}
 			onAddCell={addCell}
 			onInsertCell={insertCell}

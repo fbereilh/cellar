@@ -15,8 +15,10 @@
  *    match). Model-based, so complete under virtualization. Each {@link Match}
  *    carries which `field` matched (`source` / `markdown` / `output`) so later
  *    phases can highlight the right surface.
- *  - later (`opts.regex`): the option exists on {@link SearchOpts} today; only
- *    substring / case / word / scope are honored now.
+ *  - **P5** (`opts.regex`): the query is a regular expression (`caseSensitive`
+ *    picks the `i` flag, `wholeWord` still enforces boundaries). Compiled once per
+ *    call; an invalid pattern yields NO matches (a fail-safe, never a throw), which
+ *    is what lets the find-bar show a subtle invalid state instead of crashing.
  *
  * ## The cache (the perf primitive)
  * Every keystroke used to re-`toLowerCase()` every cell's source - a fresh
@@ -38,13 +40,13 @@
 
 import type { CellOutput } from '$lib/server/types';
 
-/** Search options. `regex` is reserved for a later phase - not honored yet. */
+/** Search options. */
 export interface SearchOpts {
 	/** Match case exactly. Default false (case-insensitive). */
 	caseSensitive: boolean;
 	/** Require word boundaries around each match. */
 	wholeWord: boolean;
-	/** Treat the query as a regular expression. Reserved for a later phase - not honored yet. */
+	/** Treat the query as a JS regular expression (P5). An invalid pattern matches nothing. */
 	regex: boolean;
 	/** `'source'` = code/markdown source only (P1). `'all'` = + outputs + rendered markdown (P2). */
 	scope: 'source' | 'all';
@@ -424,14 +426,80 @@ function scanField(
 }
 
 /**
+ * Compile the query into a global {@link RegExp} for regex mode, or `null` if the
+ * pattern is invalid. Case-insensitivity is the `i` flag (not a lowercased
+ * haystack, so offsets land on the original text); `g` makes {@link scanFieldRegex}
+ * iterate every occurrence. Callers treat `null` as "no matches" (a fail-safe).
+ */
+export function compileRegex(query: string, opts: SearchOpts): RegExp | null {
+	try {
+		return new RegExp(query, opts.caseSensitive ? 'g' : 'gi');
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Scan one field with a precompiled global regex, appending `Match`es to `out`
+ * (the regex-mode sibling of {@link scanField}). Operates on the ORIGINAL text
+ * (the `i` flag handles casing), advances the line counter the same O(1) way, and
+ * guards against a zero-length match (`^`, `\b`, `a*`) wedging the loop by nudging
+ * `lastIndex`. `wholeWord` still enforces boundaries around each match.
+ */
+function scanFieldRegex(
+	re: RegExp,
+	orig: string,
+	opts: SearchOpts,
+	cellId: string,
+	field: Match['field'],
+	outputIndex: number | undefined,
+	out: Match[]
+): void {
+	re.lastIndex = 0;
+	let scanned = 0;
+	let line = 1;
+	let lineStart = 0;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(orig)) !== null) {
+		const idx = m.index;
+		const len = m[0].length;
+		if (len === 0) {
+			re.lastIndex = idx + 1; // never spin on an empty match
+			continue;
+		}
+		const end = idx + len;
+		if (opts.wholeWord) {
+			const before = idx > 0 ? orig[idx - 1] : '';
+			const after = end < orig.length ? orig[end] : '';
+			if ((before && isWordChar(before)) || (after && isWordChar(after))) continue;
+		}
+		for (let i = scanned; i < idx; i++)
+			if (orig.charCodeAt(i) === 10) {
+				line++;
+				lineStart = i + 1;
+			}
+		scanned = idx;
+		out.push({
+			cellId,
+			field,
+			...(outputIndex !== undefined ? { outputIndex } : {}),
+			start: idx,
+			end,
+			line,
+			snippet: snippetFrom(orig, lineStart)
+		});
+	}
+}
+
+/**
  * Search every cell for `query`, returning all matches in document order.
  *
  * Pure: no side effects beyond populating the caller-owned `cache`. Returns `[]`
- * for an empty query. Honors `caseSensitive`, `wholeWord`, and `scope`; `regex`
- * is reserved for a later phase. Under `scope: 'all'` (the default) a cell's
- * source, its rendered markdown (markdown cells), and its output text (bounded
- * by {@link SEARCH_SCAN_CAP} per cell) are all scanned, and each `Match` carries
- * the `field` it came from.
+ * for an empty query, or for an invalid regex under `opts.regex` (a fail-safe -
+ * never a throw). Honors `caseSensitive`, `wholeWord`, `regex`, and `scope`. Under
+ * `scope: 'all'` (the default) a cell's source, its rendered markdown (markdown
+ * cells), and its output text (bounded by {@link SEARCH_SCAN_CAP} per cell) are all
+ * scanned, and each `Match` carries the `field` it came from.
  *
  * @param cells document-order cells (the authoritative model, not the DOM)
  * @param query the raw query (callers trim/​debounce as a UI concern)
@@ -445,9 +513,20 @@ export function searchNotebook(
 	cache: SearchCache = createSearchCache()
 ): Match[] {
 	if (!query) return [];
-	const needle = opts.caseSensitive ? query : query.toLowerCase();
-	if (!needle) return [];
-	const needleLen = needle.length;
+	const useRegex = opts.regex;
+	// Regex mode compiles once (offsets index the original text, so the cached
+	// lowercased buffers are irrelevant); literal mode reuses those buffers.
+	let re: RegExp | null = null;
+	let needle = '';
+	let needleLen = 0;
+	if (useRegex) {
+		re = compileRegex(query, opts);
+		if (!re) return []; // invalid pattern: match nothing, never throw
+	} else {
+		needle = opts.caseSensitive ? query : query.toLowerCase();
+		if (!needle) return [];
+		needleLen = needle.length;
+	}
 	const all = opts.scope === 'all';
 
 	const matches: Match[] = [];
@@ -459,8 +538,11 @@ export function searchNotebook(
 
 		// --- source (both scopes) ---
 		if (source) {
-			const hay = opts.caseSensitive ? source : entry!.sourceLC;
-			scanField(hay, source, needle, needleLen, opts, cell.id, 'source', undefined, matches);
+			if (useRegex) scanFieldRegex(re!, source, opts, cell.id, 'source', undefined, matches);
+			else {
+				const hay = opts.caseSensitive ? source : entry!.sourceLC;
+				scanField(hay, source, needle, needleLen, opts, cell.id, 'source', undefined, matches);
+			}
 		}
 
 		if (!all) continue;
@@ -470,8 +552,11 @@ export function searchNotebook(
 			ensureMarkdown(entry!, cell);
 			const orig = entry!.markdown!;
 			if (orig) {
-				const hay = opts.caseSensitive ? orig : entry!.markdownLC!;
-				scanField(hay, orig, needle, needleLen, opts, cell.id, 'markdown', undefined, matches);
+				if (useRegex) scanFieldRegex(re!, orig, opts, cell.id, 'markdown', undefined, matches);
+				else {
+					const hay = opts.caseSensitive ? orig : entry!.markdownLC!;
+					scanField(hay, orig, needle, needleLen, opts, cell.id, 'markdown', undefined, matches);
+				}
 			}
 		}
 
@@ -479,8 +564,11 @@ export function searchNotebook(
 		if (cell.outputs && cell.outputs.length) {
 			const outs = ensureOutputs(entry!, cell);
 			for (const o of outs) {
-				const hay = opts.caseSensitive ? o.text : o.textLC;
-				scanField(hay, o.text, needle, needleLen, opts, cell.id, 'output', o.index, matches);
+				if (useRegex) scanFieldRegex(re!, o.text, opts, cell.id, 'output', o.index, matches);
+				else {
+					const hay = opts.caseSensitive ? o.text : o.textLC;
+					scanField(hay, o.text, needle, needleLen, opts, cell.id, 'output', o.index, matches);
+				}
 			}
 		}
 	}
