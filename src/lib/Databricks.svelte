@@ -104,20 +104,13 @@
 		/** Called after a successful connect/disconnect/reconnect so the shell refreshes its kernel + variables. */
 		onSessionChange = null,
 		/** Restart the active notebook's kernel - used to apply the Databricks-runtime toggle. */
-		onRestartKernel = null,
-		/**
-		 * Reports a compact connection summary up to the sidebar so the section HEADER
-		 * can render an at-a-glance status badge (matching the Kernels section), without
-		 * the user expanding the panel. See `headerState` below for the vocabulary.
-		 */
-		onStateChange = null
+		onRestartKernel = null
 	}: {
 		notebookPath?: string | null;
 		kernelSessionId?: SessionId | null;
 		onInsertAndRun?: ((source: string) => void) | null;
 		onSessionChange?: (() => void) | null;
 		onRestartKernel?: ((path: string) => void | Promise<void>) | null;
-		onStateChange?: ((summary: { state: string; clusterName?: string | null }) => void) | null;
 	} = $props();
 
 	/** Let the section header's refresh button re-read status (bind:this in Sidebar). */
@@ -675,23 +668,6 @@
 			.filter(Boolean)
 			.join(' · ')
 	);
-
-	// The section-header status vocabulary. Reported up so the sidebar renders a
-	// badge (cluster short-name when live, else the state word) - the at-a-glance
-	// signal the Kernels section has and this one lacked.
-	const headerState = $derived.by(() => {
-		if (busy === 'connect' || busy === 'reconnect') return 'connecting';
-		if (!status) return 'loading';
-		if (!installed) return 'disconnected';
-		if (connected) return 'connected';
-		if (connection.expired) return 'expired';
-		if (connection.lost) return 'lost';
-		return 'disconnected';
-	});
-	const headerClusterName = $derived(connection.clusterName ?? connection.lost?.clusterName ?? null);
-	$effect(() => {
-		onStateChange?.({ state: headerState, clusterName: headerClusterName });
-	});
 
 	/** What the user should DO about a failure. The server's own message follows it. */
 	const REMEDY: Record<string, string> = {

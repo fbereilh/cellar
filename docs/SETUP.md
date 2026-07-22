@@ -131,9 +131,8 @@ re-pins a matching client automatically if a mismatch would otherwise surface.
 A teammate with **no** `~/.databrickscfg` can still type a workspace host in the UI
 and sign in through the browser - a config file is not required to get started.
 
-The **Databricks** section header shows a status badge (the cluster name while
-live, an amber `reconnecting`/`lost` while a session has dropped). If a session
-goes idle or otherwise drops, a **Reconnect** button restores it against the
+Once you connect, the **Databricks** panel shows the cluster name and connection
+status. If a session goes idle or otherwise drops, a **Reconnect** button restores it against the
 cluster you already chose - the same one-click recovery agents and the automatic
 expiry self-heal use, so it may briefly restart the kernel (and wipe its
 namespace) when a `databricks-connect` re-pin is needed.

@@ -167,29 +167,8 @@
 	$effect(() => {
 		if (open.databricks) databricksMounted = true;
 	});
-	// Databricks component handle (bind:this) for the header's refresh button, and the
-	// connection summary it reports up (onStateChange) so the header can show a status
-	// badge without the user expanding the section - the at-a-glance signal the
-	// Kernels section has. State vocabulary: 'connected' | 'expired' | 'lost' |
-	// 'connecting' | 'disconnected' | 'loading'.
+	// Databricks component handle (bind:this) for the header's refresh button.
 	let databricksComp = $state<{ refresh: () => void } | null>(null);
-	let databricksState = $state<{ state: string; clusterName?: string | null } | null>(null);
-	// The header badge: a green cluster-name chip when live, an amber state chip when
-	// bound-but-not-live / connecting; nothing when disconnected or still loading (so a
-	// user who never uses Databricks sees a clean header, like Kernels at 0).
-	const databricksBadge = $derived.by(() => {
-		const s = databricksState?.state;
-		const name = databricksState?.clusterName;
-		if (s === 'connected')
-			return { cls: 'badge-success', dot: true, dotCls: 'bg-current', label: name || 'connected', title: name ? `Connected to ${name}` : 'Connected' };
-		if (s === 'connecting')
-			return { cls: 'badge-warning', dot: false, dotCls: '', label: 'connecting', title: 'Connecting to Databricks' };
-		if (s === 'expired')
-			return { cls: 'badge-warning', dot: false, dotCls: '', label: 'reconnecting', title: 'Session expired - reconnecting' };
-		if (s === 'lost')
-			return { cls: 'badge-warning', dot: false, dotCls: '', label: 'lost', title: 'Session lost - reconnect to restore spark/w' };
-		return null;
-	});
 
 	// Same lazy-mount latch for the Environment panel: it spawns a python
 	// subprocess to list packages, so a user who never opens it never pays for it.
@@ -1033,19 +1012,6 @@
 {#snippet databricksSection()}
 	<div class="flex items-center">
 		{@render header('databricks', 'Databricks', 'section-databricks')}
-		<!-- At-a-glance connection status in the header (like the Kernels count badge):
-		     the live badge shows the cluster short-name, a warning badge shows a
-		     bound-but-not-live state, so the user reads the connection without expanding. -->
-		{#if databricksBadge}
-			<span
-				class="badge badge-xs shrink-0 gap-1 {databricksBadge.cls}"
-				title={databricksBadge.title}
-				data-testid="databricks-header-status"
-			>
-				{#if databricksBadge.dot}<span class="inline-block h-1.5 w-1.5 rounded-full {databricksBadge.dotCls}"></span>{/if}
-				<span class="max-w-24 truncate">{databricksBadge.label}</span>
-			</span>
-		{/if}
 		{#if databricksMounted}
 			{@render refreshBtn(() => databricksComp?.refresh?.(), 'Refresh Databricks status')}
 		{/if}
@@ -1063,7 +1029,6 @@
 				{onInsertAndRun}
 				onSessionChange={onDatabricksSessionChange}
 				{onRestartKernel}
-				onStateChange={(s) => (databricksState = s)}
 			/>
 		</div>
 	{/if}
