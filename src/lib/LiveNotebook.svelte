@@ -28,6 +28,9 @@
 		follow?: boolean;
 		/** The shell's `fsRefreshSignal`: a bump re-fetches the git HEAD baseline. */
 		gitRefresh?: number;
+		/** Windowed (virtualized) cell rendering. Default OFF; forwarded to Notebook,
+		 *  where it is fully wired but dormant (no behavior change) at this phase. */
+		virtualize?: boolean;
 		onCellsChange?: (path: string, cells: UICell[]) => void;
 		/** (path, foldedIds, folding): the sidebar Outline renders from this. */
 		onFoldsChange?: (path: string, foldedIds: Set<string>, folding: Folding) => void;
@@ -101,6 +104,7 @@
 		active = false,
 		follow = true,
 		gitRefresh = 0,
+		virtualize = false,
 		onCellsChange,
 		onFoldsChange,
 		onNumberingChange,
@@ -1833,6 +1837,7 @@
 	<div bind:this={rootEl} tabindex="-1" class="outline-none" data-testid="notebook-root">
 		<Notebook
 			{cells}
+			{virtualize}
 			runningId={runningId}
 			{queued}
 			{activeId}

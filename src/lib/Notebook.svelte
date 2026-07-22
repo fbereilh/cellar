@@ -4,8 +4,10 @@
 	import type { KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
+	import { planWindow, estimateHeight, mountedIds, DEFAULT_OVERSCAN_PX, type PlanItem } from '$lib/virtualization';
 
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
+	const EMPTY_PLAN: PlanItem[] = [];
 
 	interface Props {
 		cells: UICell[];
@@ -66,6 +68,9 @@
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		onEditorFocus?: (id: string) => void;
 		onEditorBlur?: (id: string) => void;
+		/** Windowed (virtualized) cell rendering. Default OFF — with it off the
+		 *  renderer mounts every cell exactly as before (byte-identical). */
+		virtualize?: boolean;
 		onAddCell: (afterId: string | undefined, cellType: CellType) => void;
 		/** Insert a fresh `cellType` cell above/below `targetId`, then select+focus it. */
 		onInsertCell: (where: 'above' | 'below', targetId: string, cellType: CellType) => void;
@@ -114,9 +119,145 @@
 		onRegister,
 		onEditorFocus,
 		onEditorBlur,
+		virtualize = false,
 		onAddCell,
 		onInsertCell
 	}: Props = $props();
+
+	// ---- Windowed rendering (virtualization) ---------------------------------
+	// The FOUNDATION phase: the machinery below is fully wired but DORMANT while
+	// `virtualize` is false (the default). With the flag off, `planWindow` returns
+	// "every cell mounted", `isMounted()` short-circuits to true, no scroll listener
+	// is attached, and no reactive state churns — so the render is byte-identical to
+	// the eager `{#each}`. Height measurement (`recordHeight`, fed by each Cell's
+	// `onMeasure`) DOES run with the flag off, to keep the cache warm and trustworthy
+	// before a later phase turns windowing on. See `$lib/virtualization`.
+	let containerEl = $state<HTMLElement | null>(null);
+	let viewportTop = $state(0);
+	let viewportHeight = $state(0);
+	// Measured card heights (px), keyed by cell id. Plain (non-reactive) Map: with
+	// the flag off nothing reads it, so measurement never triggers a re-render. A
+	// version counter drives re-planning ONLY while windowing is on.
+	const heights = new Map<string, number>();
+	let heightsVersion = $state(0);
+	function recordHeight(id: string, px: number) {
+		if (px <= 0 || heights.get(id) === px) return;
+		heights.set(id, px);
+		if (virtualize) heightsVersion++;
+	}
+
+	function scrollParentOf(el: HTMLElement): HTMLElement | null {
+		for (let p = el.parentElement; p; p = p.parentElement) {
+			const oy = getComputedStyle(p).overflowY;
+			if (oy === 'auto' || oy === 'scroll') return p;
+		}
+		return null;
+	}
+
+	// A per-id cell lookup + height estimate, built only while windowing is on.
+	const cellById = $derived.by(() => (virtualize ? new Map(cells.map((c) => [c.id, c])) : null));
+	const DEFAULT_ESTIMATE_PX = 200;
+	function estimateFor(id: string): number {
+		const c = cellById?.get(id);
+		return c ? estimateHeight(c) : DEFAULT_ESTIMATE_PX;
+	}
+	// Cells forced to stay mounted wherever they are. This phase pins the running
+	// and active cells; later phases extend it (queued heads, focus, scroll targets).
+	const pinned = $derived.by(() => {
+		if (!virtualize) return undefined;
+		const s = new Set<string>();
+		if (runningId) s.add(runningId);
+		if (activeId) s.add(activeId);
+		return s;
+	});
+	const plan = $derived.by<PlanItem[]>(() => {
+		if (!virtualize) return EMPTY_PLAN;
+		void heightsVersion; // re-plan as measured heights land
+		return planWindow({
+			order: cells.map((c) => c.id),
+			heights,
+			estimate: estimateFor,
+			virtualize: true,
+			viewportTop,
+			viewportHeight,
+			overscanPx: Math.max(DEFAULT_OVERSCAN_PX, viewportHeight * 1.5),
+			pinned
+		});
+	});
+	const mounted = $derived(virtualize ? mountedIds(plan) : null);
+	function isMounted(id: string): boolean {
+		return !virtualize || (mounted?.has(id) ?? true);
+	}
+	function spacerHeight(id: string): number {
+		return heights.get(id) ?? estimateFor(id);
+	}
+
+	// Scroll-pane metrics. Attached ONLY while windowing is on, so with the flag off
+	// the scroll path carries no extra listener (zero behavior change). Reads are
+	// rAF-coalesced. Wired now; a later phase is the first to act on the metrics.
+	$effect(() => {
+		if (!virtualize || !containerEl) return;
+		const parent = scrollParentOf(containerEl);
+		if (!parent) return;
+		let raf = 0;
+		const read = () => {
+			raf = 0;
+			viewportTop = parent.scrollTop;
+			viewportHeight = parent.clientHeight;
+		};
+		const onScroll = () => {
+			if (!raf) raf = requestAnimationFrame(read);
+		};
+		read();
+		parent.addEventListener('scroll', onScroll, { passive: true });
+		window.addEventListener('resize', onScroll);
+		return () => {
+			if (raf) cancelAnimationFrame(raf);
+			parent.removeEventListener('scroll', onScroll);
+			window.removeEventListener('resize', onScroll);
+		};
+	});
+
+	// Dev-only trustworthiness probe (report §6 P1 acceptance). Once cells have been
+	// measured, each cached height must match the cell's live rendered box — a spacer
+	// of the cached height must reproduce the flow space the cell occupied. The flow
+	// gaps + page padding sit OUTSIDE the cache and are identical whether a row is a
+	// cell or a spacer, so comparing Σ(cached) to Σ(live offsetHeight) is the faithful
+	// check (equivalent, modulo that constant chrome, to Σ heights ≈ scrollHeight).
+	if (import.meta.env.DEV) {
+		$effect(() => {
+			const el = containerEl;
+			const n = cells.length;
+			if (!el || n === 0) return;
+			let cancelled = false;
+			// Two rAFs so the cards' ResizeObservers have delivered their first sizes.
+			requestAnimationFrame(() =>
+				requestAnimationFrame(() => {
+					if (cancelled) return;
+					let live = 0;
+					let cached = 0;
+					let measured = 0;
+					for (const c of cells) {
+						const node = el.querySelector(`[data-cell-id="${CSS.escape(c.id)}"]`) as HTMLElement | null;
+						const h = heights.get(c.id);
+						if (!node || h == null) continue;
+						live += node.offsetHeight;
+						cached += h;
+						measured++;
+					}
+					if (measured < n || live === 0) return; // only assert on a fully-measured notebook
+					const drift = Math.abs(cached - live) / live;
+					if (drift > 0.02)
+						console.warn(
+							`[cellar/virtualization] height cache drift ${(drift * 100).toFixed(1)}% over ${measured} cells (cached ${cached}px vs live ${live}px)`
+						);
+				})
+			);
+			return () => {
+				cancelled = true;
+			};
+		});
+	}
 
 	// ---- Drag to reorder cells ----------------------------------------------
 	// A per-cell drag handle sets `draggable`; the editor stays non-draggable so
@@ -255,7 +396,7 @@
 
 <!-- The notebook page: a faintly-grey plane in light themes, so a cell's white
      output and grey editor each read as their own surface. -->
-<div class="min-h-full bg-(--cellar-surface-page)">
+<div bind:this={containerEl} class="min-h-full bg-(--cellar-surface-page)">
 	<!-- Fluid content column: fills the available width up to a readable cap, so
 	     cells use more horizontal space on wide monitors without going full-bleed
 	     on ultrawide. -->
@@ -337,6 +478,7 @@
 							data-testid="cell-drop-indicator"
 						></div>
 					{/if}
+					{#if isMounted(cell.id)}
 					<Cell
 						{cell}
 						index={i}
@@ -372,9 +514,15 @@
 						onEditorFocus={onEditorFocus}
 						onEditorBlur={onEditorBlur}
 						onInsertCell={onInsertCell}
+						onMeasure={recordHeight}
 						onDragStart={onDragStart}
 						onDragEnd={endDrag}
 					/>
+					{:else}
+						<!-- Off-screen (windowed) cell collapsed to a spacer of its cached
+						     height. Dormant while `virtualize` is off (isMounted is always true). -->
+						<div aria-hidden="true" data-testid="cell-spacer" style="height: {spacerHeight(cell.id)}px"></div>
+					{/if}
 				</div>
 			{/each}
 			{#if gitRemovedAtEnd}

@@ -80,6 +80,9 @@
 		onActivate?: (id: string) => void;
 		/** Hands the notebook this cell's imperative API (null on teardown). */
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
+		/** Reports this card's rendered height (px) into the notebook's height cache
+		 *  (for windowed rendering). Passive: fires on mount and on every resize. */
+		onMeasure?: (id: string, px: number) => void;
 		onEditorFocus?: (id: string) => void;
 		onEditorBlur?: (id: string) => void;
 		onDragStart?: (e: DragEvent, id: string) => void;
@@ -119,6 +122,7 @@
 		onSetEditorCollapsed,
 		onActivate,
 		onRegister,
+		onMeasure,
 		onEditorFocus,
 		onEditorBlur,
 		onDragStart,
@@ -137,6 +141,7 @@
 	// the static stand-in to the live editor. See `buildEditor()`.
 	let editorBuilt = $state(false);
 	let editorResizeObserver: ResizeObserver | undefined;
+	let cardResizeObserver: ResizeObserver | undefined; // reports card height into the notebook's virtualization height cache
 	let editTimer: ReturnType<typeof setTimeout>;
 	// True while the user has uncommitted local typing (a debounced save pending).
 	// Together with editor focus this gates whether a remote source edit may
@@ -980,6 +985,19 @@
 			editorResizeObserver.observe(scrollBoxEl);
 		}
 		measureEditor();
+		// Report this card's rendered height into the notebook's virtualization
+		// height cache (a spacer of this height later stands in for the cell when it
+		// scrolls off-screen). Reads the observer's `borderBoxSize` — the same box as
+		// `offsetHeight` — so it never forces a synchronous reflow. Passive: it only
+		// writes the cache; nothing downstream acts on it while windowing is off.
+		if (typeof ResizeObserver !== 'undefined' && cardEl && onMeasure) {
+			cardResizeObserver = new ResizeObserver((entries) => {
+				const box = entries[0]?.borderBoxSize?.[0];
+				const px = box ? box.blockSize : cardEl?.offsetHeight;
+				if (px && px > 0) onMeasure?.(cell.id, Math.round(px));
+			});
+			cardResizeObserver.observe(cardEl);
+		}
 		// Closing the tab/window can fire before the 500ms debounce; flush on
 		// `pagehide` so an in-progress edit is persisted (the PATCH uses
 		// `keepalive` so it survives unload).
@@ -988,6 +1006,7 @@
 		return () => {
 			flushEdit();
 			editorResizeObserver?.disconnect();
+			cardResizeObserver?.disconnect();
 			window.removeEventListener('pagehide', flushOnUnload);
 			onRegister?.(cell.id, null);
 			view?.destroy();
