@@ -144,6 +144,54 @@ db = _CellarDbUtils(_CellarWidgets(None, None))
 db.widgets.text('p', 'v')
 out['dbutils_get'] = db.widgets.get('p')
 
+# --- entry_point fidelity (driver-API-probing libraries, e.g. mlflow) ---
+# Replays mlflow's import-time access path off dbutils.entry_point and a broad
+# surface of driver getters; nothing here may raise, and the token/url options
+# must read UNDEFINED so a probing library falls through cleanly.
+out['has_entry_point'] = hasattr(db, 'entry_point')
+_ep = db.entry_point
+_ctx = _ep.getDbutils().notebook().getContext()
+_url = _ctx.apiUrl()
+_tok = _ctx.apiToken()
+out['ep_apiurl_isdefined'] = _url.isDefined()
+out['ep_apitoken_isdefined'] = _tok.isDefined()
+out['ep_apiurl_get'] = _url.get()
+out['ep_apiurl_getorelse'] = _url.getOrElse('fallback')
+out['ep_apiurl_falsy'] = bool(_url)
+out['ep_ssl_trust_all'] = _ep.getDriverConf().workflowSslTrustAll()
+# unknown context getters degrade to undefined options too
+out['ep_ctx_unknown_isdefined'] = _ctx.clusterId().isDefined()
+try:
+    # the full surface mlflow reaches for - every one must be callable & return None
+    _ep.getLogger()
+    _ep.getNonUcApiToken()
+    _ep.getReplId()
+    _ep.getJobGroupId()
+    _ep.clearMlflowProperties()
+    _ep.getReplLocalTempDir()
+    _ep.getReplNFSTempDir()
+    _ep.getUserLocalTempDir()
+    _ep.getUserNFSTempDir()
+    out['ep_surface_all_none'] = _ep.getReplId() is None and _ep.getNonUcApiToken() is None
+    out['ep_surface_raises'] = False
+except Exception:
+    out['ep_surface_raises'] = True
+# an entirely unknown driver method still resolves to a no-op callable
+out['ep_unknown_method'] = _ep.someFutureDriverMethod() is None
+
+# unknown Option methods on the undefined option never raise, and chaining
+# stays falsy/undefined through them (parity with the sibling proxies).
+try:
+    out['opt_exists_falsy'] = bool(_url.exists(lambda _v: True))
+    out['opt_orelse_isdefined'] = _url.orElse('x').isDefined()
+    out['opt_filter_get'] = _url.filter(None).get()
+    out['opt_flatmap_falsy'] = bool(_url.flatMap(lambda _v: _v))
+    out['opt_contains_falsy'] = bool(_url.contains('anything'))
+    out['opt_chain_isdefined'] = _url.filter(None).orElse('y').flatMap(lambda _v: _v).isDefined()
+    out['opt_unknown_raises'] = False
+except Exception:
+    out['opt_unknown_raises'] = True
+
 # --- redeclare preserves the current value when compatible (Databricks parity) ---
 rd = _CellarWidgets(_FakeIpw, _fake_display)
 rd.text('t', 'orig')
@@ -246,6 +294,33 @@ describe('dbutils.widgets shim — value/return-type parity', () => {
 
 	it('exposes the registry through the dbutils wrapper', () => {
 		expect(out.dbutils_get).toBe('v');
+	});
+
+	it('exposes a faithful entry_point so driver-API probes (mlflow) never AttributeError', () => {
+		expect(out.has_entry_point).toBe(true);
+		// getContext().apiUrl()/apiToken() are undefined Options → the library
+		// falls through instead of trusting a fabricated URL/token.
+		expect(out.ep_apiurl_isdefined).toBe(false);
+		expect(out.ep_apitoken_isdefined).toBe(false);
+		expect(out.ep_apiurl_get).toBe(null);
+		expect(out.ep_apiurl_getorelse).toBe('fallback');
+		expect(out.ep_apiurl_falsy).toBe(false);
+		expect(out.ep_ssl_trust_all).toBe(false);
+		expect(out.ep_ctx_unknown_isdefined).toBe(false);
+		// the broad driver surface is all callable, all None, never raises
+		expect(out.ep_surface_raises).toBe(false);
+		expect(out.ep_surface_all_none).toBe(true);
+		expect(out.ep_unknown_method).toBe(true);
+	});
+
+	it('an undefined Option never raises on unknown methods and stays falsy when chained', () => {
+		expect(out.opt_unknown_raises).toBe(false);
+		expect(out.opt_exists_falsy).toBe(false);
+		expect(out.opt_orelse_isdefined).toBe(false);
+		expect(out.opt_filter_get).toBe(null);
+		expect(out.opt_flatmap_falsy).toBe(false);
+		expect(out.opt_contains_falsy).toBe(false);
+		expect(out.opt_chain_isdefined).toBe(false);
 	});
 
 	it('preserves the current value when a widget is re-declared with a compatible spec', () => {
