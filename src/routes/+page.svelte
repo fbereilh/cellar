@@ -216,10 +216,11 @@
 	let sidebarOpen = $state(true);
 	let settingsOpen = $state(false);
 	let paletteOpen = $state(false);
-	// The floating find-in-page bar (Search P3). Opened from a non-Ctrl entry point
-	// (the sidebar Search button, or the `open-find` shortcut) - Ctrl+F interception
-	// is P5. `findSeed` holds the text selection captured at open time; the bar
-	// seeds its query from it only on the closed->open transition.
+	// The floating find-in-page bar (Search P3 + P5). Opened by intercepting the
+	// browser's native Ctrl/Cmd+F (P5, the primary entry point), plus the sidebar
+	// Search button and the `open-find` shortcut. `findSeed` holds the text selection
+	// captured at open time; the bar seeds its query from it only on the closed->open
+	// transition.
 	let findOpen = $state(false);
 	let findSeed = $state('');
 	// Bumped when Ctrl/Cmd+F is pressed while the bar is already open, so the bar
