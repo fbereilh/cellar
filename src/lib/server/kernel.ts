@@ -1601,10 +1601,12 @@ export async function interruptKernel(nbPath?: string | null) {
  * pins the last results in memory and would defeat the point of freeing state.
  *
  * Runs through `execute(..., {internal:true})` like every other Cellar probe, so
- * it bypasses the run queue (jupyter serializes it after any running cell) and
- * does not inflate `execs_this_session`. Never forces a start: a notebook whose
- * kernel is not running has nothing to wipe. Returns the names actually deleted so
- * the caller can invalidate the run-status of the cells that defined them.
+ * it bypasses the run queue but still serializes on the per-kernel exec lock
+ * (`NotebookKernel.execChain`) behind any running cell (no two `requestExecute` are
+ * ever on the wire at once), and does not inflate `execs_this_session`. Never forces
+ * a start: a notebook whose kernel is not running has nothing to wipe. Returns the
+ * names actually deleted so the caller can invalidate the run-status of the cells
+ * that defined them.
  *
  * Other notebooks' kernels are untouched (this resolves and probes ONE kernel).
  */
@@ -1795,20 +1797,23 @@ export async function execute(
 	// epoch), not the moment it queued.
 	const releaseExec = await acquireExecLock(nbKernel);
 	const session = nbKernel.sessionId;
-	if (!internal) {
-		nbKernel.execsThisSession += 1;
-		// A USER run: its busy/idle flips must reach the sidebar (see statusHandler).
-		nbKernel.userRuns += 1;
-	}
-	onEvent({ type: 'kernel', id: kernel.id, session });
 
 	let future: Kernel.IShellFuture<KernelMessage.IExecuteRequestMsg, KernelMessage.IExecuteReplyMsg>;
 	try {
+		if (!internal) {
+			nbKernel.execsThisSession += 1;
+			// A USER run: its busy/idle flips must reach the sidebar (see statusHandler).
+			nbKernel.userRuns += 1;
+		}
+		// A caller-supplied `onEvent` can throw synchronously; the `requestExecute` send
+		// can reject (e.g. the kernel is dead). Either way nothing will settle this run,
+		// so both must release the exec lock now or every later execute on this kernel
+		// would wedge behind a run that never ran (a permanent deadlock). Cover the whole
+		// post-acquire body so no early throw can escape without releasing.
+		onEvent({ type: 'kernel', id: kernel.id, session });
 		future = kernel.requestExecute({ code, stop_on_error: false });
 	} catch (err) {
-		// The kernel rejected the send (e.g. it is dead): nothing will settle this run,
-		// so release the lock now or every later execute on this kernel would wedge
-		// behind a run that never ran. Undo the just-applied user-run bookkeeping too.
+		// Undo the just-applied user-run bookkeeping too.
 		if (!internal) {
 			nbKernel.userRuns -= 1;
 			scheduleKernelStatus();
