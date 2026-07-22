@@ -3,13 +3,12 @@ import {
 	planWindow,
 	estimateHeight,
 	mountedIds,
-	offsetOf,
-	scrollCompensation,
 	CARD_CHROME_PX,
 	CODE_LINE_PX,
 	MARKDOWN_BASE_PX,
 	OUTPUT_PER_PX,
 	OUTPUT_CAP_PX,
+	ROW_GAP_PX,
 	type PlanItem
 } from '../../src/lib/virtualization';
 
@@ -177,6 +176,79 @@ describe('planWindow — flag ON (windowed)', () => {
 	});
 });
 
+describe('planWindow — inter-cell gap accounting (space-y-4)', () => {
+	it('advances the window by the gap between cells so a deep cell stays in-window', () => {
+		// 40 cells × 100px + 16px gaps ⇒ cell k's top = k·116. Viewport [1000,1200],
+		// overscan 0, window [1000,1200]. WITH the 16px gap, real tops are k·116 so
+		// c8 [928,1028), c9 [1044,1144), c10 [1160,1260) overlap the window; without
+		// the gap the model tops are k·100 and a different (higher) run wins.
+		const { order, heights } = uniform(40, 100);
+		const plan = planWindow({
+			order,
+			heights,
+			estimate: () => 100,
+			virtualize: true,
+			viewportTop: 1000,
+			viewportHeight: 200,
+			overscanPx: 0,
+			gapPx: ROW_GAP_PX
+		});
+		expect(cellIds(plan)).toEqual(['c8', 'c9', 'c10']);
+		// Ignoring the gap would have windowed a different (higher) run.
+		const noGap = planWindow({
+			order,
+			heights,
+			estimate: () => 100,
+			virtualize: true,
+			viewportTop: 1000,
+			viewportHeight: 200,
+			overscanPx: 0,
+			gapPx: 0
+		});
+		expect(cellIds(noGap)).not.toEqual(cellIds(plan));
+	});
+
+	it("a coalesced spacer's px includes its run's internal gaps (Σheights + (K-1)·gap)", () => {
+		// 10 cells × 100px, gap 16. Viewport [500,560] with overscan 0 windows the cell
+		// straddling that band and collapses the runs before and after into spacers.
+		const { order, heights } = uniform(10, 100);
+		const plan = planWindow({
+			order,
+			heights,
+			estimate: () => 100,
+			virtualize: true,
+			viewportTop: 500,
+			viewportHeight: 60,
+			overscanPx: 0,
+			gapPx: ROW_GAP_PX
+		});
+		const cells = cellIds(plan);
+		const spacers = plan.filter((p) => p.kind === 'spacer') as Array<{ px: number }>;
+		// Total flow height is conserved: Σ(mounted heights) + Σ(spacer px) + all
+		// outer gaps between plan items = the full stack height (N·100 + (N-1)·16).
+		const K = cells.length;
+		const mountedPx = K * 100;
+		const spacerPx = spacers.reduce((a, s) => a + s.px, 0);
+		const planGaps = (plan.length - 1) * ROW_GAP_PX; // gap between every pair of plan items
+		expect(mountedPx + spacerPx + planGaps).toBe(10 * 100 + 9 * ROW_GAP_PX);
+		// And a run of K cells contributes exactly Σheights + (K-1)·gap.
+		const topSpacer = plan[0] as { kind: string; px: number };
+		if (topSpacer.kind === 'spacer') {
+			// c0..cJ collapsed; recover J from the first mounted cell's index.
+			const firstMounted = Number((cells[0] as string).slice(1));
+			expect(topSpacer.px).toBe(firstMounted * 100 + (firstMounted - 1) * ROW_GAP_PX);
+		}
+	});
+
+	it('defaults gapPx to 0 so the uniform-height model is unchanged', () => {
+		const { order, heights } = uniform(10, 100);
+		const withDefault = planWindow({ order, heights, estimate: () => 100, virtualize: true, viewportTop: 250, viewportHeight: 200, overscanPx: 0 });
+		const withZero = planWindow({ order, heights, estimate: () => 100, virtualize: true, viewportTop: 250, viewportHeight: 200, overscanPx: 0, gapPx: 0 });
+		expect(cellIds(withDefault)).toEqual(cellIds(withZero));
+		expect(spacerSum(withDefault)).toBe(spacerSum(withZero));
+	});
+});
+
 describe('mountedIds', () => {
 	it('extracts the mounted cell ids from a plan', () => {
 		const plan: PlanItem[] = [
@@ -186,59 +258,5 @@ describe('mountedIds', () => {
 			{ kind: 'spacer', px: 50, key: 'spacer:3' }
 		];
 		expect(mountedIds(plan)).toEqual(new Set(['x', 'y']));
-	});
-});
-
-describe('offsetOf', () => {
-	const est = () => 100;
-	it('sums the heights of the cells before the target', () => {
-		const { order, heights } = uniform(5, 100);
-		expect(offsetOf('c0', order, heights, est)).toBe(0);
-		expect(offsetOf('c3', order, heights, est)).toBe(300);
-	});
-	it('falls back to the estimate for an unmeasured predecessor', () => {
-		const order = ['a', 'b', 'c'];
-		const heights = new Map<string, number>([['a', 100]]); // b, c unmeasured
-		const estimate = (id: string) => (id === 'b' ? 500 : 100);
-		expect(offsetOf('c', order, heights, estimate)).toBe(600); // 100 + 500
-	});
-	it('returns the total height when the id is absent', () => {
-		const { order, heights } = uniform(3, 100);
-		expect(offsetOf('missing', order, heights, est)).toBe(300);
-	});
-});
-
-describe('scrollCompensation (report §4.2 scroll stability)', () => {
-	const est = () => 100;
-	it('returns 0 when the viewport is pinned to the very top (nothing above)', () => {
-		const { order, heights } = uniform(5, 100);
-		expect(scrollCompensation({ id: 'c0', newHeight: 300, order, heights, estimate: est, viewportTop: 0 })).toBe(0);
-	});
-	it('returns 0 when the measured height is unchanged', () => {
-		const { order, heights } = uniform(5, 100);
-		expect(scrollCompensation({ id: 'c1', newHeight: 100, order, heights, estimate: est, viewportTop: 250 })).toBe(0);
-	});
-	it('compensates by the delta when an above-viewport cell grows', () => {
-		// Viewport top at 250px; c1 spans [100,200) — entirely above it. Growing it
-		// from 100 to 160 shifts the visible content down 60px, so scrollTop += 60.
-		const { order, heights } = uniform(5, 100);
-		expect(scrollCompensation({ id: 'c1', newHeight: 160, order, heights, estimate: est, viewportTop: 250 })).toBe(60);
-	});
-	it('compensates negatively when an above-viewport cell shrinks', () => {
-		const { order, heights } = uniform(5, 100);
-		expect(scrollCompensation({ id: 'c1', newHeight: 70, order, heights, estimate: est, viewportTop: 250 })).toBe(-30);
-	});
-	it('returns 0 when the changed cell is at or below the viewport top (only off-screen content moves)', () => {
-		// c3 spans [300,400): its top (300) is below the viewport top (250), so a
-		// height change there only shifts content already off the bottom — no jump.
-		const { order, heights } = uniform(5, 100);
-		expect(scrollCompensation({ id: 'c3', newHeight: 500, order, heights, estimate: est, viewportTop: 250 })).toBe(0);
-	});
-	it('measures the delta against the estimate for a just-mounted (unmeasured) cell', () => {
-		// c1 was a spacer at its 100px estimate; it mounts and measures 250px. Its top
-		// (100) is above the viewport top (250), so compensate by 250 - 100 = 150.
-		const order = ['c0', 'c1', 'c2'];
-		const heights = new Map<string, number>([['c0', 100]]); // c1, c2 never measured
-		expect(scrollCompensation({ id: 'c1', newHeight: 250, order, heights, estimate: est, viewportTop: 250 })).toBe(150);
 	});
 });

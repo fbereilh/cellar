@@ -13,8 +13,9 @@ import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
  *   (a) mounted-cell count is O(viewport + overscan), NOT O(N);
  *   (b) total DOM node count drops far below the eager baseline (~137 nodes/cell);
  *   (c) scrolling top→bottom→top produces NO visible jump — the first cell's
- *       viewport-relative top is stable across the round trip, the scroll-stability
- *       core (estimate→measured corrections compensated, report §4.2).
+ *       viewport-relative top is stable across the round trip, courtesy of the scroll
+ *       pane's native `overflow-anchor` (the window model accounts for the space-y-4
+ *       inter-cell gap so it tracks the real scroll and never blanks the viewport).
  * A final check reloads WITHOUT the flag and asserts the render is un-windowed
  * (zero spacers, every cell mounted) — the flag-off byte-identical guarantee.
  *
@@ -86,6 +87,30 @@ async function cellNearViewportTop(page: Page): Promise<string | null> {
 	});
 }
 
+/**
+ * True if at least one MOUNTED cell's bounding rect overlaps the scroll pane's
+ * visible viewport rect — i.e. the window actually tracked the scroll and did not
+ * leave the viewport filled with only spacers / blank space.
+ */
+async function aMountedCellIsVisible(page: Page): Promise<boolean> {
+	return page.evaluate(() => {
+		const cell = document.querySelector('[data-testid="cell"]');
+		let pane: HTMLElement | null = cell as HTMLElement | null;
+		while (pane) {
+			const s = getComputedStyle(pane);
+			if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && pane.scrollHeight > pane.clientHeight) break;
+			pane = pane.parentElement;
+		}
+		if (!pane) return false;
+		const view = pane.getBoundingClientRect();
+		for (const el of Array.from(document.querySelectorAll('[data-testid="cell"]'))) {
+			const r = (el as HTMLElement).getBoundingClientRect();
+			if (r.bottom > view.top && r.top < view.bottom) return true;
+		}
+		return false;
+	});
+}
+
 /** Viewport-relative top of the cell with `data-cell-id`, or null if unmounted. */
 async function cellTopById(page: Page, id: string): Promise<number | null> {
 	return page.evaluate((cellId) => {
@@ -152,8 +177,10 @@ test(`windows a ${CELL_COUNT}-cell notebook: O(viewport) mounted, fewer nodes, n
 		await setScrollTop(page, Math.round(scrollHeight * Math.min(1, f)));
 		await page.waitForTimeout(120);
 	}
-	// The last cell must have mounted by the time we reach the bottom.
-	await expect.poll(() => mountedCells(page), { timeout: 10_000 }).toBeGreaterThan(0);
+	// Deep in the notebook the window must still contain a REAL mounted cell that
+	// overlaps the visible viewport — not only spacers/blank space (the failure the
+	// space-y-4 gap accounting prevents: model position drifting off the real scroll).
+	await expect.poll(() => aMountedCellIsVisible(page), { timeout: 10_000 }).toBe(true);
 
 	// Back to the top the same way.
 	for (let f = 0.75; f >= -0.0001; f -= 0.25) {
@@ -168,11 +195,10 @@ test(`windows a ${CELL_COUNT}-cell notebook: O(viewport) mounted, fewer nodes, n
 	// The first cell sits where it did before the round trip: no accumulated jump.
 	expect(Math.abs((topAfter as number) - (topBefore as number))).toBeLessThan(4);
 
-	// (c2) The same no-jump guarantee at a NON-zero scroll offset — where the
-	// `viewportTop<=0` short-circuit does NOT fire, so scrollCompensation actually
-	// runs and the coordinate-origin (scrollTop vs cell-stack) must line up. Pick a
-	// mid-notebook offset, anchor on a currently-visible reference cell, round-trip
-	// to the bottom and back to the SAME offset, and assert the reference is stable.
+	// (c2) The same no-jump guarantee at a NON-zero scroll offset — native
+	// `overflow-anchor` must keep a mid-notebook reference cell stable as the window
+	// re-plans around it. Anchor on a currently-visible reference cell, round-trip to
+	// the bottom and back to the SAME offset, and assert the reference is stable.
 	const midOffset = Math.round(scrollHeight * 0.4);
 	await setScrollTop(page, midOffset);
 	await page.waitForTimeout(200);

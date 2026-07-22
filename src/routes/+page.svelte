@@ -1272,10 +1272,7 @@
 			     just hidden. The default notebook and opened `.ipynb` files use the
 			     same live component; each persists to its own file. -->
 			{#if notebookOpen}
-				<div
-					class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}"
-					style="overflow-anchor: {virtualizeCells ? 'none' : 'auto'}"
-				>
+				<div class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}">
 					<LiveNotebook
 						path={canonicalNotebookRel}
 						virtualize={virtualizeCells}
@@ -1300,10 +1297,7 @@
 			{/if}
 
 			{#each ipynbTabs as tab (tab.id)}
-				<div
-					class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}"
-					style="overflow-anchor: {virtualizeCells ? 'none' : 'auto'}"
-				>
+				<div class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}">
 					<LiveNotebook
 						path={tab.path}
 						virtualize={virtualizeCells}

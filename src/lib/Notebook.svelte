@@ -4,7 +4,7 @@
 	import type { KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
-	import { planWindow, estimateHeight, scrollCompensation, DEFAULT_OVERSCAN_PX, type PlanItem } from '$lib/virtualization';
+	import { planWindow, estimateHeight, DEFAULT_OVERSCAN_PX, ROW_GAP_PX, type PlanItem } from '$lib/virtualization';
 
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
 	const EMPTY_PLAN: PlanItem[] = [];
@@ -146,12 +146,6 @@
 	// measurement (`recordHeight`, fed by each Cell's `onMeasure`) DOES run with the
 	// flag off, to keep the cache warm. See `$lib/virtualization`.
 	let containerEl = $state<HTMLElement | null>(null);
-	// The cell-stack container (the `space-y-4` div wrapping the cells/plan). Its
-	// top is `offsetOf`'s origin 0; `scrollParent.scrollTop` uses the scroll-pane
-	// origin, so a constant offset C (page padding + the export bar) sits between
-	// them. `recordHeight` measures C to convert scrollTop into the stack's space
-	// before feeding `scrollCompensation`.
-	let stackEl = $state<HTMLElement | null>(null);
 	let viewportTop = $state(0);
 	let viewportHeight = $state(0);
 	// Measured card heights (px), keyed by cell id. Plain (non-reactive) Map: with
@@ -206,39 +200,19 @@
 			viewportTop,
 			viewportHeight,
 			overscanPx: Math.max(DEFAULT_OVERSCAN_PX, viewportHeight * 1.5),
-			pinned
+			pinned,
+			gapPx: ROW_GAP_PX
 		});
 	});
 
 	function recordHeight(id: string, px: number) {
 		if (px <= 0 || heights.get(id) === px) return;
-		// Scroll-stability core (report §4.2): if this cell sits above the viewport
-		// top, replacing its assumed height with the measured one would shift the
-		// visible content by the delta — a jump. Compensate scrollTop by that delta
-		// in the SAME frame (this runs inside the card's ResizeObserver callback, i.e.
-		// after layout but before paint), so the correction is invisible. Under
-		// windowing the scroll pane sets `overflow-anchor: none` (see +page.svelte), so
-		// native scroll anchoring is DISABLED and explicit scrollCompensation is the
-		// SINGLE authority for above-viewport height corrections — this is what stops
-		// native + explicit from double-compensating an in-place resize of a pinned
-		// above-fold cell (streaming into a runningId cell with follow off, an output
-		// clear, an editor collapse). With the flag OFF native anchoring stays on and
-		// recordHeight does no compensation.
-		// KNOWN GAP (deferred P3/P4): a STRUCTURAL add/delete of a cell ABOVE the
-		// viewport is not compensated — explicit only fires from this measured-cell
-		// ResizeObserver path, which a structural insert/delete does not go through.
-		// Rare in practice and the pane is default-off.
-		if (virtualize && containerEl && viewportTop > 0) {
-			const parent = scrollParentOf(containerEl);
-			// C = the cell-stack container's top within the scroll pane (page padding
-			// + export bar). Convert the scroll-pane-origin scrollTop into `offsetOf`'s
-			// cell-stack origin so both sides of scrollCompensation share one origin.
-			// The rect reads run inside the ResizeObserver callback (post-layout), so
-			// they force no reflow; fall back to C=0 if either element is missing.
-			const C = parent && stackEl ? stackEl.getBoundingClientRect().top - parent.getBoundingClientRect().top + parent.scrollTop : 0;
-			const delta = scrollCompensation({ id, newHeight: px, order: visibleOrder, heights, estimate: estimateFor, viewportTop: viewportTop - C });
-			if (delta !== 0 && parent) parent.scrollTop += delta;
-		}
+		// Scroll stability is the browser's: the scroll pane keeps its native
+		// `overflow-anchor` (see +page.svelte), which re-anchors the viewport when an
+		// off-screen cell mounts or an above-fold cell resizes. This module only feeds
+		// the cache + re-plans; it holds no explicit scrollTop compensation. `planWindow`
+		// accounts for the `space-y-4` inter-cell gap so its model tracks the real
+		// scrollTop and the window never blanks.
 		heights.set(id, px);
 		if (virtualize) heightsVersion++;
 	}
@@ -597,7 +571,7 @@
 				{/if}
 			</div>
 		{/if}
-		<div bind:this={stackEl} class="space-y-4">
+		<div class="space-y-4">
 			{#if virtualize}
 				<!-- Windowed: iterate the render PLAN. Each mounted item renders the full
 				     row via `cellRow`; each off-screen run is one inert, height-preserving
