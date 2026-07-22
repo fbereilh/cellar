@@ -93,10 +93,28 @@ export function reduceCheap(text: string): string {
 
 // ─── Full tier: a minimal VT screen emulator ────────────────────────────────
 
-/** Ensure the screen has a (mutable) row at `row`, appending blank rows as needed. */
+// Defensive ceilings on the emulated screen. A single CSI carries an arbitrary
+// numeric argument (`ESC[9999999B`, `ESC[1;9999999H`), and reduceFull re-reduces
+// the WHOLE raw buffer on every flush, so an unclamped cursor move would push
+// millions of empty rows/cells per ~10-byte escape, repeatedly. These are far
+// beyond any real terminal capture (uv, multi-bar tqdm, colored logs stay
+// byte-identical); a huge numeric argument is bounded here, not honored. The
+// column ceiling is tighter than the row ceiling because a far cursor move
+// followed by a write PADS the gap with real space cells (O(MAX_COLS) work),
+// whereas an empty row is nearly free — and no real capture exceeds a few
+// hundred columns, so MAX_COLS is still orders of magnitude beyond any of them.
+const MAX_ROWS = 100_000;
+const MAX_COLS = 10_000;
+
+/**
+ * Ensure the screen has a (mutable) row at `row`, appending blank rows as
+ * needed. Capped at `MAX_ROWS` so a pathological cursor move cannot force
+ * unbounded row growth; callers also clamp the cursor row itself.
+ */
 function ensureRow(rows: string[][], row: number): string[] {
-	while (rows.length <= row) rows.push([]);
-	return rows[row];
+	const target = Math.min(row, MAX_ROWS);
+	while (rows.length <= target) rows.push([]);
+	return rows[target];
 }
 
 /** First CSI parameter as a number, defaulting an empty/malformed param to `def`. */
@@ -141,8 +159,11 @@ export function reduceFull(text: string): string {
 
 	const write = (ch: string): void => {
 		const line = ensureRow(rows, row);
-		while (line.length < col) line.push(' ');
-		line[col] = ch;
+		// Clamp the write column to MAX_COLS: a write clamped there can only
+		// overwrite the last cell, never pad a line to a huge cursor position.
+		const at = Math.min(col, MAX_COLS);
+		while (line.length < at) line.push(' ');
+		line[at] = ch;
 		col += 1;
 	};
 
@@ -273,26 +294,27 @@ function applyCsi(
 		case 'A': // cursor up
 			row = Math.max(0, row - csiParam(params, 1));
 			break;
-		case 'B': // cursor down
-			row = row + csiParam(params, 1);
+		case 'B': // cursor down (clamp to MAX_ROWS — a huge argument is bounded)
+			row = Math.min(row + csiParam(params, 1), MAX_ROWS);
 			ensureRow(rows, row);
 			break;
-		case 'C': // cursor forward
-			col = col + csiParam(params, 1);
+		case 'C': // cursor forward (clamp to MAX_COLS)
+			col = Math.min(col + csiParam(params, 1), MAX_COLS);
 			break;
 		case 'D': // cursor back
 			col = Math.max(0, col - csiParam(params, 1));
 			break;
-		case 'G': // cursor horizontal absolute (1-based)
-			col = Math.max(0, csiParam(params, 1) - 1);
+		case 'G': // cursor horizontal absolute (1-based, clamp to MAX_COLS)
+			col = Math.min(Math.max(0, csiParam(params, 1) - 1), MAX_COLS);
 			break;
 		case 'H': // cursor position (row;col, 1-based)
 		case 'f': {
 			const parts = params.split(';');
 			const r = parts[0] === '' || parts[0] == null ? 1 : parseInt(parts[0], 10) || 1;
 			const c = parts[1] === '' || parts[1] == null ? 1 : parseInt(parts[1], 10) || 1;
-			row = Math.max(0, r - 1);
-			col = Math.max(0, c - 1);
+			// Clamp both axes — a huge absolute position is bounded, not honored.
+			row = Math.min(Math.max(0, r - 1), MAX_ROWS);
+			col = Math.min(Math.max(0, c - 1), MAX_COLS);
 			ensureRow(rows, row);
 			break;
 		}

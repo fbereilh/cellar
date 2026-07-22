@@ -230,4 +230,21 @@ describe('reduceFull — degrades gracefully, never leaks raw escapes or throws'
 	it('never throws on a pile of malformed escapes', () => {
 		expect(() => reduceFull(`${ESC}${ESC}[${ESC}[;;;${ESC}]${ESC}[999Z`)).not.toThrow();
 	});
+
+	it('bounds a huge cursor-down argument (no millions of rows for a ~10-byte escape)', () => {
+		// `ESC[9999999B` must not push ~10M empty rows; row growth is clamped, so
+		// the rendered screen stays bounded (~MAX_ROWS lines, not the argument).
+		const out = reduceFull(`a${ESC}[9999999Bb`);
+		expect(out).toContain('a');
+		expect(out).toContain('b');
+		expect(out.split('\n').length).toBeLessThanOrEqual(100_002);
+	});
+
+	it('bounds a huge absolute cursor position (no unbounded column growth)', () => {
+		// `ESC[1;9999999H` clamps the column, so a following write pads at most to
+		// MAX_COLS rather than the ~10M-cell argument.
+		const out = reduceFull(`top${ESC}[1;9999999Hend`);
+		expect(out).toContain('top');
+		expect(out.length).toBeLessThanOrEqual(10_010);
+	});
 });
