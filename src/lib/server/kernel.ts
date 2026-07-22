@@ -108,6 +108,24 @@ interface NotebookKernel {
 	 * ONCE, not once per caller. Mirrors `livenessInFlight` in `databricks.ts`.
 	 */
 	refreshInFlight: Promise<{ refreshed: boolean; reason: string }> | null;
+	/**
+	 * Serializes EVERY `execute()` on this kernel — a promise the next execute awaits
+	 * before it sends `requestExecute`, replaced by its own completion promise. A
+	 * kernel can only run one cell at a time anyway, but the wire protocol must match:
+	 * two `requestExecute` in flight on ONE kernel make @jupyterlab mis-pair the
+	 * interleaved iopub `status: idle` / `execute_reply` messages, so one run's
+	 * `future.done` never resolves and its cell wedges "running" forever (recovered
+	 * only by the idle watchdog, ~120-210s). The run queue (`run-queue.ts`) already
+	 * serializes USER cell runs, but INTERNAL probes (the variables inspector, kernel
+	 * state, Databricks connect/preview) call `execute({internal:true})` and BYPASS
+	 * that queue — so during a bulk run an inspector probe would fire `requestExecute`
+	 * concurrently with the next cell's, which is exactly the collision. This lock is
+	 * the single seam where ALL executes — queued cell runs, internal probes, AND the
+	 * silent startup/re-injection execs (`runSilent`) — line up, so no two are ever on
+	 * the wire at once. It is released in `execute()`'s `finally` (including the abort
+	 * path), so a wedged/aborted run can never hold it. See `execute()` + `runSilent`.
+	 */
+	execChain: Promise<void>;
 }
 
 /**
@@ -1095,7 +1113,23 @@ async function databricksNotebookBound(nbPath: string): Promise<boolean> {
 	}
 }
 
+/** The NotebookKernel that owns this live connection, if any (small linear scan). */
+function nbKernelForConnection(kernel: KernelConnection): NotebookKernel | undefined {
+	for (const nb of kernels.values()) if (nb.connection === kernel) return nb;
+	return undefined;
+}
+
 async function runSilent(kernel: KernelConnection, code: string): Promise<void> {
+	// A silent injection is still a `requestExecute` on the wire, so it MUST take the
+	// kernel's exec lock like every other execute — two in flight at once wedge a run's
+	// `future.done` (see NotebookKernel.execChain). This covers the paths that bypass
+	// `execute()`: startup/autorestart re-injection (`initKernel`) and the live-kernel
+	// project-root toggle (`applyProjectRootToLiveKernels`). During a fresh start the
+	// lock is uncontended (no user run can execute until `getKernel` resolves); after
+	// an autorestart it waits behind the just-aborted run's release. Best-effort: if
+	// the connection isn't tracked yet, fall through unlocked rather than block bring-up.
+	const nbKernel = nbKernelForConnection(kernel);
+	const release = nbKernel ? await acquireExecLock(nbKernel) : null;
 	try {
 		const future = kernel.requestExecute({
 			code,
@@ -1106,6 +1140,8 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 		await future.done;
 	} catch {
 		// A failed startup injection must never break kernel bring-up.
+	} finally {
+		release?.();
 	}
 }
 
@@ -1187,7 +1223,8 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		statusHandler: null,
 		widgetComms: new Map(),
 		activeRuns: new Set(),
-		refreshInFlight: null
+		refreshInFlight: null,
+		execChain: Promise.resolve()
 	};
 
 	nbKernel.startPromise = (async () => {
@@ -1691,6 +1728,31 @@ export function currentSessionId(nbPath?: string | null): SessionId | null {
 }
 
 /**
+ * Acquire this kernel's execute lock, resolving to a `release` the caller MUST
+ * invoke (in a `finally`) once its `requestExecute` has fully settled. It appends
+ * to `nbKernel.execChain` so callers line up FIFO: each awaits the previous run's
+ * completion before it may put its own `requestExecute` on the wire. The read of
+ * the current tail and the install of the new one are synchronous (no `await`
+ * between them), so JS's single-threaded turn makes the swap atomic — two callers
+ * that arrive "at once" still serialize, the second chaining behind the first's
+ * release rather than both proceeding off the same predecessor. This is what keeps
+ * a queued cell run and an internal inspector probe from ever having two executes
+ * in flight on one kernel — the collision that wedges a run's `future.done`. See
+ * `NotebookKernel.execChain`.
+ */
+async function acquireExecLock(nbKernel: NotebookKernel): Promise<() => void> {
+	const prev = nbKernel.execChain;
+	let release!: () => void;
+	nbKernel.execChain = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	// A predecessor's chain never rejects (release only ever resolves), but guard
+	// anyway so one caller's odd state can never poison the whole kernel's chain.
+	await prev.catch(() => {});
+	return release;
+}
+
+/**
  * Execute one chunk of code against notebook `nbPath`'s kernel (lazy-starting it
  * if needed). Each IOPub message is delivered live via onEvent as it arrives.
  * Resolves with the execute reply when done.
@@ -1724,6 +1786,14 @@ export async function execute(
 		kernel = await getKernel(abs);
 	}
 	const nbKernel = kernels.get(abs)!;
+	// Serialize behind any other execute on THIS kernel (queued cell run OR internal
+	// probe) so two `requestExecute` are never on the wire at once — the collision
+	// that makes @jupyterlab mis-pair the interleaved idle/reply and wedges a run's
+	// `future.done` forever (see NotebookKernel.execChain). Released in the `finally`.
+	// Acquired before reading `session`/incrementing so those reflect the state at the
+	// moment this run actually reaches the kernel (a restart during the wait bumps the
+	// epoch), not the moment it queued.
+	const releaseExec = await acquireExecLock(nbKernel);
 	const session = nbKernel.sessionId;
 	if (!internal) {
 		nbKernel.execsThisSession += 1;
@@ -1732,7 +1802,20 @@ export async function execute(
 	}
 	onEvent({ type: 'kernel', id: kernel.id, session });
 
-	const future = kernel.requestExecute({ code, stop_on_error: false });
+	let future: Kernel.IShellFuture<KernelMessage.IExecuteRequestMsg, KernelMessage.IExecuteReplyMsg>;
+	try {
+		future = kernel.requestExecute({ code, stop_on_error: false });
+	} catch (err) {
+		// The kernel rejected the send (e.g. it is dead): nothing will settle this run,
+		// so release the lock now or every later execute on this kernel would wedge
+		// behind a run that never ran. Undo the just-applied user-run bookkeeping too.
+		if (!internal) {
+			nbKernel.userRuns -= 1;
+			scheduleKernelStatus();
+		}
+		releaseExec();
+		throw err;
+	}
 
 	// --- Idle watchdog + force-abort -----------------------------------------
 	// `await future.done` is unbounded: a stalled websocket, an undelivered
@@ -1939,6 +2022,9 @@ export async function execute(
 				future.dispose();
 			} catch {}
 		}
+		// Hand this kernel's execute lock to the next run — even on abort, so a wedged
+		// run the watchdog kills can never block every later execute behind it.
+		releaseExec();
 	}
 }
 

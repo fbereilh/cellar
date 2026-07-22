@@ -199,7 +199,7 @@ describe('internal-probe vs user status broadcasts', () => {
 		const k = h.lastKernel!;
 		// Start a user run but hold it in flight (manual future).
 		const runP = kernelmod.execute(A, 'y=2', noop);
-		await Promise.resolve(); // let execute() reach requestExecute
+		await flush(); // let execute() acquire the exec lock, mark the run, reach requestExecute
 		// Kernel goes busy while the user run executes → must broadcast.
 		k._emitStatus('busy');
 		await flush();
@@ -217,7 +217,7 @@ describe('internal-probe vs user status broadcasts', () => {
 		h.statusBroadcasts.length = 0;
 		const k = h.lastKernel!;
 		const runP = kernelmod.execute(A, 'z=3', noop);
-		await Promise.resolve();
+		await flush(); // let execute() acquire the exec lock, mark the run, reach requestExecute
 		// A flurry of flips within one debounce window collapses to ONE wire message.
 		k._emitStatus('busy');
 		k._emitStatus('idle');
@@ -228,5 +228,36 @@ describe('internal-probe vs user status broadcasts', () => {
 		k.status = 'idle';
 		h.lastUserFuture!._resolve('ok');
 		await runP;
+	});
+});
+
+describe('execute serialization (the per-kernel exec lock)', () => {
+	// The root-cause guard for the Run-all wedge: TWO executes must never be on one
+	// kernel's wire at once. Two concurrent `requestExecute` make @jupyterlab mis-pair
+	// the interleaved iopub idle/reply, so one run's `future.done` never resolves and
+	// its cell wedges "running" forever. The run queue serializes USER cell runs, but
+	// an internal probe (the variables inspector) bypasses it — so during a bulk run a
+	// probe would fire `requestExecute` alongside the next cell's. `execChain` is the
+	// one seam where every execute lines up. This proves the second waits for the first.
+	const codeCalls = (code: string) => h.execCalls.filter((c) => !c.silent && c.code === code).length;
+
+	it('a second execute waits for the first to settle before it reaches the kernel', async () => {
+		h.execCalls.length = 0;
+		// Fire two runs "at once" (e.g. a queued cell run + an inspector probe).
+		const first = kernelmod.execute(A, 'FIRST', noop);
+		const second = kernelmod.execute(A, 'SECOND', noop, { internal: true });
+		await flush();
+		// Only the FIRST has hit the wire; the second is parked on the exec lock.
+		expect(codeCalls('FIRST')).toBe(1);
+		expect(codeCalls('SECOND')).toBe(0);
+		// The lock still holds the first's future (SECOND never requestExecute'd), so
+		// `lastUserFuture` is the FIRST run's — resolve it to let the first complete.
+		h.lastUserFuture!._resolve('ok');
+		await first;
+		await flush();
+		// Now — and only now — the second run reaches the kernel.
+		expect(codeCalls('SECOND')).toBe(1);
+		h.lastUserFuture!._resolve('ok');
+		await second;
 	});
 });

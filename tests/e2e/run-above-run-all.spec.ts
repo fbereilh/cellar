@@ -48,21 +48,27 @@ function codeMarkerNotebook(): string {
 }
 
 /**
- * Two code cells interleaved with markdown — for the Run all test. Run all must
- * run BOTH code cells (v0, v1) top-to-bottom and skip the markdown cells.
+ * Several code cells interleaved with markdown — for the Run all test. Run all must
+ * run every code cell (v0..v3) top-to-bottom and skip the markdown cells.
  *
- * Exactly two code cells is deliberate: the notebook wedges on a per-run-transition
- * kernel-bridge race (see the Run all test), and two code cells is a single
- * transition — the same reliable one-transition batch the Run above test already
- * exercises. Markdown cells never reach the kernel (they "run" client-side), so
- * they add coverage (proving non-code is skipped) without adding a transition.
+ * This used to be capped at two code cells because Run all fired every cell's POST
+ * at once (fire-and-forget) and intermittently wedged on a reused kernel — a cell
+ * stuck "running" for the ~120-210s watchdog window. Run all now dispatches
+ * SEQUENTIALLY (`LiveNotebook.runCodeIds`) and every `execute()` serializes on the
+ * kernel's exec lock, so no two run against the same kernel at once and the wedge is
+ * gone. So the batch is deliberately larger (four code cells = three run-to-run
+ * transitions) to exercise the reliability this task fixed. The interleaved markdown
+ * cells prove Run all runs every CODE cell and skips non-code.
  */
 function runAllMarkerNotebook(): string {
 	return buildNotebook([
 		{ type: 'markdown', source: '# Report' },
 		{ type: 'code', source: 'v0 = 0' },
 		{ type: 'markdown', source: '## Analysis' },
-		{ type: 'code', source: 'v1 = 1' }
+		{ type: 'code', source: 'v1 = 1' },
+		{ type: 'code', source: 'v2 = 2' },
+		{ type: 'markdown', source: '## More' },
+		{ type: 'code', source: 'v3 = 3' }
 	]);
 }
 
@@ -135,27 +141,32 @@ test('Run above runs exactly the cells above the clicked cell (exclusive)', asyn
 	expect(await definedMarkers(page)).toEqual(['v0', 'v1']);
 });
 
-test('Run all runs every code cell top to bottom', async ({ page }) => {
+test('Run all runs every code cell top to bottom (reliable on a warm kernel)', async ({ page }) => {
 	test.setTimeout(120_000);
-	// A FRESH kernel + a two-code-cell notebook keep this deterministic. Run all
-	// (like every bulk run) dispatches its cells to the kernel one at a time, and
-	// the kernel bridge has a pre-existing race that intermittently wedges a run
-	// following a prior one on the same kernel (a trivial cell stuck "running",
-	// recovered only on the watchdog's ~120-210s scale) — tracked as a SEPARATE
-	// dedicated task, not touched here. That race grows with the number of
-	// run-to-run transitions, so this test asserts Run all's reliable contract on
-	// the smallest meaningful batch: exactly two code cells = a single transition,
-	// the same one the Run above test already runs reliably. The interleaved
-	// markdown cells prove Run all runs every CODE cell top-to-bottom and skips
-	// non-code, without adding a kernel transition.
+	// Run all now dispatches SEQUENTIALLY and every execute serializes on the kernel's
+	// exec lock, so the reused-kernel wedge this task fixed cannot recur. Prove it on a
+	// warm kernel with multiple transitions: run once to warm the kernel, then Run all
+	// AGAIN (the exact "Run all again after cells already ran" scenario) and assert all
+	// four code cells run, in order, with nothing stuck. The interleaved markdown cells
+	// prove non-code is skipped.
 	await boot(runAllMarkerNotebook());
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await openNotebook(page, 4); // 2 code + 2 markdown
+	await openNotebook(page, 7); // 4 code + 3 markdown
 
-	// Run all is enabled (there are code cells) and runs both of them.
 	await expect(page.getByTestId('run-all')).toBeEnabled();
-	await page.getByTestId('run-all').click();
 
-	// Both code cells run top-to-bottom; the markdown cells define nothing.
-	await expect.poll(async () => definedMarkers(page), { timeout: 45_000 }).toEqual(['v0', 'v1']);
+	// First Run all warms the kernel and defines every marker.
+	await page.getByTestId('run-all').click();
+	await expect.poll(async () => definedMarkers(page), { timeout: 45_000 }).toEqual(['v0', 'v1', 'v2', 'v3']);
+
+	// Run all AGAIN on the now-warm kernel: it must complete with no cell left running.
+	await page.getByTestId('run-all').click();
+	// The batch re-runs and drains fully — no cell stuck "running", no leftover queue.
+	await expect
+		.poll(async () => (await page.getByTestId('running-indicator').count()) + (await page.getByTestId('queued-indicator').count()), { timeout: 45_000 })
+		.toBe(0);
+	// Every marker is (re)defined. Poll rather than read once: the sidebar inspector
+	// probe is briefly in flight after the batch, and the variables endpoint reports
+	// `busy` (empty) while it runs — a transient the poll rides out.
+	await expect.poll(async () => definedMarkers(page), { timeout: 15_000 }).toEqual(['v0', 'v1', 'v2', 'v3']);
 });

@@ -6,18 +6,25 @@ import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
 
 /**
- * E2E: interrupting a running cell must cancel the WHOLE pending queue.
+ * E2E: interrupting a Run all must cancel the WHOLE run — the running cell AND
+ * every cell that has not run yet.
  *
- * Run All on a notebook whose first cell is a long sleeper, so that cell runs
- * while the rest queue. Interrupt the running cell (the in-cell stop button) and
- * assert that NONE of the queued cells executed - their marker variables never get
- * defined in the kernel, every queued/running badge clears, and the sleeper itself
- * stopped early (was interrupted, not run to completion).
+ * Run all on a notebook whose first cell is a long sleeper. Run all dispatches
+ * SEQUENTIALLY (`LiveNotebook.runCodeIds` — one `/run` stream open at a time, the
+ * same reliable path Run above/below use), so while the sleeper runs the marker
+ * cells behind it have not been submitted yet. Interrupt the running sleeper (its
+ * in-cell stop button) and assert that NONE of the later cells execute — their
+ * marker variables never get defined — the sleeper itself stopped early (was
+ * interrupted, not run to completion), and every running/queued badge clears.
  *
- * This reproduces a real, subtle bug: each queued run holds an open streaming
- * response, and enough of them saturate the browser's HTTP/1.1 connection pool, so
- * the interrupt request could not even reach the server until the running cell
- * finished on its own - by which point the queue had already drained.
+ * Interrupt cancels a bulk run through two paths, BOTH exercised here:
+ *   - the client bumps `interruptGeneration` (`cancelQueuedRuns`), which stops the
+ *     sequential Run-all loop from advancing to the next cell after the abort; and
+ *   - the server interrupts the kernel, ending the running cell.
+ * (The old fire-and-forget Run all opened every cell's stream at once and relied on
+ * saturating the browser's HTTP/1.1 pool; that dispatch model — and the wedge it
+ * caused on a reused kernel — was replaced by the sequential path, so this spec no
+ * longer asserts a pile of queued badges: with one stream at a time there are none.)
  */
 
 let launcher: ChildProcess | null = null;
@@ -36,7 +43,6 @@ function queueNotebook(): string {
 			source: ['import time\n', 'time.sleep(20)\n', 'sleeper_ran = True']
 		}
 	];
-	// 10 markers → comfortably exceeds the browser's ~6-connection HTTP/1.1 pool.
 	for (let i = 0; i < 10; i++) {
 		cells.push({
 			cell_type: 'code',
@@ -107,18 +113,17 @@ test.afterAll(async () => {
 	}
 });
 
-test('interrupt cancels the running cell AND every queued cell', async ({ page }) => {
+test('interrupt cancels the running cell AND the rest of the Run all batch', async ({ page }) => {
 	test.setTimeout(120_000);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
 
-	// Run All via the command palette — the real user path (fires each cell's own
-	// run request, so the client's AbortControllers are in play).
+	// Run All via the command palette — the real user path.
 	await runAllViaPalette(page);
 
-	// The sleeper is running and several markers show the queued badge.
+	// The sleeper runs first; no later cell has been submitted yet (sequential
+	// dispatch awaits the running cell), so nothing downstream should be defined.
 	await expect(page.locator('[data-cell-id="sleeper"] [data-testid="running-bar"]')).toBeVisible({ timeout: 20_000 });
-	await expect.poll(async () => page.getByTestId('queued-indicator').count(), { timeout: 15_000 }).toBeGreaterThan(2);
 
 	// Let the kernel boot and the sleep genuinely begin.
 	await page.waitForTimeout(4000);
@@ -129,12 +134,12 @@ test('interrupt cancels the running cell AND every queued cell', async ({ page }
 	// The sleeper must stop well before its 20s sleep would end.
 	await expect(page.locator('[data-cell-id="sleeper"] [data-testid="running-bar"]')).toBeHidden({ timeout: 15_000 });
 
-	// Give any leaked queued runs ample time to (wrongly) execute.
+	// Give any leaked run ample time to (wrongly) execute.
 	await page.waitForTimeout(6000);
 
-	// EXPECTED: no marker cell ever ran, so no marker variable exists.
+	// EXPECTED: the Run-all loop stopped at the interrupt, so no marker cell ran.
 	const markers = await definedMarkers(page);
-	expect(markers, `queued cells leaked and executed: ${markers.join(', ')}`).toEqual([]);
+	expect(markers, `the rest of the batch leaked and executed: ${markers.join(', ')}`).toEqual([]);
 
 	// EXPECTED: the sleeper was interrupted (its sleep did NOT complete).
 	const sleeperCompleted = await page.evaluate(async () => {
@@ -144,7 +149,7 @@ test('interrupt cancels the running cell AND every queued cell', async ({ page }
 	});
 	expect(sleeperCompleted, 'the sleeper ran to completion instead of being interrupted').toBe(false);
 
-	// EXPECTED: every queued/running badge cleared back to idle.
+	// EXPECTED: every running/queued badge cleared back to idle.
 	expect(await page.getByTestId('queued-indicator').count()).toBe(0);
 	expect(await page.getByTestId('running-indicator').count()).toBe(0);
 });
@@ -154,16 +159,16 @@ test('a normal Run All (no interrupt) still runs every cell in order', async ({ 
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
 
-	// Run All with NO interrupt: the sleeper runs, the markers queue behind it, and
-	// every one must eventually run (the queue drains normally, in order). The
-	// sleeper's own 20s sleep sets the pace, so poll generously.
+	// Run All with NO interrupt: the sleeper runs first, then every marker runs in
+	// order behind it (the sequential loop advances cell by cell). All must run.
+	// The sleeper's own 20s sleep sets the pace, so poll generously.
 	await runAllViaPalette(page);
 	await expect(page.locator('[data-cell-id="sleeper"] [data-testid="running-bar"]')).toBeVisible({ timeout: 20_000 });
-	await expect.poll(async () => page.getByTestId('queued-indicator').count(), { timeout: 15_000 }).toBeGreaterThan(2);
 
-	// Every marker eventually gets defined; nothing was cancelled.
+	// Every marker eventually gets defined, in order; nothing was cancelled.
 	await expect
-		.poll(async () => (await definedMarkers(page)).length, { timeout: 45_000 })
+		.poll(async () => (await definedMarkers(page)).length, { timeout: 60_000 })
 		.toBe(10);
-	expect(await page.getByTestId('queued-indicator').count()).toBe(0);
+	await expect.poll(async () => page.getByTestId('queued-indicator').count(), { timeout: 15_000 }).toBe(0);
+	expect(await page.getByTestId('running-indicator').count()).toBe(0);
 });

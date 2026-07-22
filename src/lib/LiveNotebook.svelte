@@ -1209,11 +1209,20 @@
 		}
 	}
 
-	// ---- Bulk run actions (Run above / below / stale) ------------------------
+	// ---- Bulk run actions (Run all / above / below / stale) ------------------
 	// Run a set of code cells one at a time, in the given (document) order. `runCell`
 	// awaits the whole run before returning, so awaiting it in sequence keeps the
 	// execution order — which is dependency order for these actions (a cell's
 	// upstreams always precede it), so downstream cells run against fresh inputs.
+	//
+	// Awaiting each run is also what keeps a bulk run RELIABLE: at most ONE `/run`
+	// NDJSON stream is ever open, so a bulk run never oversubscribes the browser's
+	// ~6-connection HTTP/1.1 pool. The old "Run all" fired every cell's POST at once
+	// (fire-and-forget) and relied on the server FIFO to serialize them; on a reused
+	// kernel that oversubscription intermittently churned/cancelled streams and left
+	// a cell wedged "running" while later cells stayed "queued" (recovered only by
+	// the ~120-210s kernel watchdog). Sequential dispatch removes that entirely —
+	// which is why Run all now routes through here like Run above/below always have.
 	async function runCodeIds(ids: string[]) {
 		// An interrupt during the batch must stop it here, not fire the rest: each run
 		// is awaited in turn, so an aborted cell's `runCell` returns like a normal
@@ -1824,13 +1833,15 @@
 		actions[shortcutId]?.('command');
 	}
 
-	// Run every code cell top-to-bottom. Fire without awaiting: the shared kernel's
-	// server-side FIFO serializes them in submission order, and `runCell` uses each
-	// cell's live editor text. Palette "Run all cells".
+	// Run every code cell top-to-bottom, SEQUENTIALLY through `runCodeIds` (awaits
+	// each run before the next), exactly like Run above/below. This is the reliable
+	// path: only one `/run` stream is open at a time, so Run all can never
+	// oversubscribe the browser connection pool and wedge on a reused kernel (see
+	// `runCodeIds`). `runCodeIds` reads each cell's live editor text and honors the
+	// interrupt (`interruptGeneration`) so an interrupt stops the whole batch. Both
+	// the top-of-notebook button and the palette "Run all cells" call this.
 	function runAll() {
-		for (const id of codeIdsAll(cells)) {
-			runCell(id, cellApis[id]?.currentSource?.() ?? findCell(id)?.source ?? '');
-		}
+		runCodeIds(codeIdsAll(cells));
 	}
 
 	// Clear every cell's outputs. Palette "Clear all outputs".
