@@ -4,10 +4,11 @@
 	import type { KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
-	import { planWindow, estimateHeight, mountedIds, DEFAULT_OVERSCAN_PX, type PlanItem } from '$lib/virtualization';
+	import { planWindow, estimateHeight, DEFAULT_OVERSCAN_PX, ROW_GAP_PX, type PlanItem } from '$lib/virtualization';
 
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
 	const EMPTY_PLAN: PlanItem[] = [];
+	const EMPTY_IDS: string[] = [];
 
 	interface Props {
 		cells: UICell[];
@@ -75,6 +76,10 @@
 		/** Windowed (virtualized) cell rendering. Default OFF — with it off the
 		 *  renderer mounts every cell exactly as before (byte-identical). */
 		virtualize?: boolean;
+		/** Transient jump targets forced to stay mounted wherever they are, so a
+		 *  scroll-to-cell can land on a real DOM node even under windowing. Owned by
+		 *  LiveNotebook (the jump paths live there); the full rework is P4. */
+		scrollPins?: Set<string>;
 		onAddCell: (afterId: string | undefined, cellType: CellType) => void;
 		/** Insert a fresh `cellType` cell above/below `targetId`, then select+focus it. */
 		onInsertCell: (where: 'above' | 'below', targetId: string, cellType: CellType) => void;
@@ -126,18 +131,20 @@
 		onEditorFocus,
 		onEditorBlur,
 		virtualize = false,
+		scrollPins,
 		onAddCell,
 		onInsertCell
 	}: Props = $props();
 
 	// ---- Windowed rendering (virtualization) ---------------------------------
-	// The FOUNDATION phase: the machinery below is fully wired but DORMANT while
-	// `virtualize` is false (the default). With the flag off, `planWindow` returns
-	// "every cell mounted", `isMounted()` short-circuits to true, no scroll listener
-	// is attached, and no reactive state churns — so the render is byte-identical to
-	// the eager `{#each}`. Height measurement (`recordHeight`, fed by each Cell's
-	// `onMeasure`) DOES run with the flag off, to keep the cache warm and trustworthy
-	// before a later phase turns windowing on. See `$lib/virtualization`.
+	// P2: with `virtualize` on, only the cells whose estimated extent overlaps the
+	// viewport (± overscan) plus the pinned set are mounted; every off-screen run
+	// collapses into one inert `height:{px}` spacer (report §3). With the flag OFF
+	// (the default, what ships) NONE of this runs: the `{:else}` render branch
+	// mounts every cell exactly as the eager `{#each}` did, no scroll listener is
+	// attached, and no reactive state churns — byte-identical to today. Height
+	// measurement (`recordHeight`, fed by each Cell's `onMeasure`) DOES run with the
+	// flag off, to keep the cache warm. See `$lib/virtualization`.
 	let containerEl = $state<HTMLElement | null>(null);
 	let viewportTop = $state(0);
 	let viewportHeight = $state(0);
@@ -146,11 +153,6 @@
 	// version counter drives re-planning ONLY while windowing is on.
 	const heights = new Map<string, number>();
 	let heightsVersion = $state(0);
-	function recordHeight(id: string, px: number) {
-		if (px <= 0 || heights.get(id) === px) return;
-		heights.set(id, px);
-		if (virtualize) heightsVersion++;
-	}
 
 	function scrollParentOf(el: HTMLElement): HTMLElement | null {
 		for (let p = el.parentElement; p; p = p.parentElement) {
@@ -160,42 +162,59 @@
 		return null;
 	}
 
-	// A per-id cell lookup + height estimate, built only while windowing is on.
+	// A per-id cell lookup + document index, built only while windowing is on. The
+	// ON render iterates the plan (not `cells`), so it resolves each mounted item's
+	// cell object + index (for git decorations + drag targets) through these.
 	const cellById = $derived.by(() => (virtualize ? new Map(cells.map((c) => [c.id, c])) : null));
+	const indexById = $derived.by(() => (virtualize ? new Map(cells.map((c, i) => [c.id, i])) : null));
 	const DEFAULT_ESTIMATE_PX = 200;
 	function estimateFor(id: string): number {
 		const c = cellById?.get(id);
 		return c ? estimateHeight(c) : DEFAULT_ESTIMATE_PX;
 	}
-	// Cells forced to stay mounted wherever they are. This phase pins the running
-	// and active cells; later phases extend it (queued heads, focus, scroll targets).
+	// The window walks the VISIBLE cell sequence: a folded (`hidden`) cell contributes
+	// 0 height and never mounts (report §5.5), so it is excluded from the order the
+	// plan is built over. (Its wrapper is `display:none` anyway; leaving it in would
+	// corrupt the running-offset math the window depends on.)
+	const visibleOrder = $derived.by(() => (virtualize ? cells.filter((c) => !hidden.has(c.id)).map((c) => c.id) : EMPTY_IDS));
+	// Cells forced to stay mounted wherever they are. This phase pins the running and
+	// active cells (cheap; avoids the active cell unmounting mid-series) plus any
+	// transient scroll target LiveNotebook is jumping to. Queued heads + focus follow
+	// in P3, the full jump-path rework in P4.
 	const pinned = $derived.by(() => {
 		if (!virtualize) return undefined;
 		const s = new Set<string>();
 		if (runningId) s.add(runningId);
 		if (activeId) s.add(activeId);
+		if (scrollPins) for (const id of scrollPins) s.add(id);
 		return s;
 	});
 	const plan = $derived.by<PlanItem[]>(() => {
 		if (!virtualize) return EMPTY_PLAN;
 		void heightsVersion; // re-plan as measured heights land
 		return planWindow({
-			order: cells.map((c) => c.id),
+			order: visibleOrder,
 			heights,
 			estimate: estimateFor,
 			virtualize: true,
 			viewportTop,
 			viewportHeight,
 			overscanPx: Math.max(DEFAULT_OVERSCAN_PX, viewportHeight * 1.5),
-			pinned
+			pinned,
+			gapPx: ROW_GAP_PX
 		});
 	});
-	const mounted = $derived(virtualize ? mountedIds(plan) : null);
-	function isMounted(id: string): boolean {
-		return !virtualize || (mounted?.has(id) ?? true);
-	}
-	function spacerHeight(id: string): number {
-		return heights.get(id) ?? estimateFor(id);
+
+	function recordHeight(id: string, px: number) {
+		if (px <= 0 || heights.get(id) === px) return;
+		// Scroll stability is the browser's: the scroll pane keeps its native
+		// `overflow-anchor` (see +page.svelte), which re-anchors the viewport when an
+		// off-screen cell mounts or an above-fold cell resizes. This module only feeds
+		// the cache + re-plans; it holds no explicit scrollTop compensation. `planWindow`
+		// accounts for the `space-y-4` inter-cell gap so its model tracks the real
+		// scrollTop and the window never blanks.
+		heights.set(id, px);
+		if (virtualize) heightsVersion++;
 	}
 
 	// Scroll-pane metrics. Attached ONLY while windowing is on, so with the flag off
@@ -217,10 +236,19 @@
 		read();
 		parent.addEventListener('scroll', onScroll, { passive: true });
 		window.addEventListener('resize', onScroll);
+		// The scroll pane is `display:none` while its tab is inactive, so a notebook
+		// that loaded hidden reads clientHeight=0 and would window against a zero-height
+		// viewport (blank spacer) until the first scroll/resize. Observing the pane's own
+		// size refreshes the metrics on the display:none→visible transition (and on
+		// sidebar-drag / other container resizes) with no scroll needed.
+		const ro =
+			typeof ResizeObserver !== 'undefined' ? new ResizeObserver(onScroll) : null;
+		ro?.observe(parent);
 		return () => {
 			if (raf) cancelAnimationFrame(raf);
 			parent.removeEventListener('scroll', onScroll);
 			window.removeEventListener('resize', onScroll);
+			ro?.disconnect();
 		};
 	});
 
@@ -402,6 +430,95 @@
 	</div>
 {/snippet}
 
+<!-- One mounted cell row: the removed-seam above it, the `relative` wrapper, the
+     per-cell git bar / hover-insert / drop indicator decorations, and the `<Cell>`.
+     Shared by BOTH render paths so the flag-off output stays byte-identical: with
+     windowing off the render iterates `cells` and calls this for every one (exactly
+     the old eager `{#each}`); with it on the render iterates the plan and calls this
+     only for the mounted items, emitting inert spacers for the collapsed runs. `i`
+     is the cell's index within `cells` (its drag target + count position). -->
+{#snippet cellRow(cell: UICell, i: number)}
+	{#if gitRemovedBefore[cell.id] && !hidden.has(cell.id)}
+		{@render removedSeam(gitRemovedBefore[cell.id])}
+	{/if}
+	<div
+		role="presentation"
+		class="relative"
+		class:hidden={hidden.has(cell.id)}
+		ondragover={(e) => onDragOverCell(e, i)}
+		ondrop={(e) => onDropCell(e, i)}
+	>
+		<!-- Git change bar: sits in the content column's left padding, outside
+		     the card (whose own left accent already means selected / running). -->
+		{#if gitStatus[cell.id]}
+			<div
+				class="absolute inset-y-0 -left-3 w-1 rounded-full"
+				style="background-color: {GIT_COLOR[gitStatus[cell.id]]}"
+				title={GIT_TITLE[gitStatus[cell.id]]}
+				data-testid="cell-git-bar"
+				data-git={gitStatus[cell.id]}
+			></div>
+		{/if}
+		<!-- Hover-between "+" control, living in the gap above this cell. Hidden
+		     during a drag so it never fights the drop indicator. -->
+		{#if dragId == null}
+			<div
+				class="group/ins absolute inset-x-0 -top-4 z-20 flex h-4 items-center justify-center"
+				data-testid="insert-between"
+			>
+				{@render insertControls('above', cell.id)}
+			</div>
+		{/if}
+		<!-- Insertion indicator (top or bottom edge of the hovered cell). -->
+		{#if dragId != null && dropIndex === i}
+			<div
+				class="pointer-events-none absolute left-0 right-0 z-10 h-0.5 rounded bg-primary {dropAtEnd ? '-bottom-2' : '-top-2'}"
+				data-testid="cell-drop-indicator"
+			></div>
+		{/if}
+		<Cell
+			{cell}
+			index={i}
+			count={cells.length}
+			running={runningId === cell.id}
+			queuedPosition={queued[cell.id] ?? null}
+			active={activeId === cell.id}
+			{keyMode}
+			staleState={staleness[cell.id] ?? null}
+			dragging={dragId === cell.id}
+			{foldedIds}
+			segHidden={hiddenSegs.get(cell.id) ?? NO_SEGS_HIDDEN}
+			foldCounts={hiddenCounts}
+			{headingNumbers}
+			onToggleFold={onToggleFold}
+			onRun={onRun}
+			onRunAdvance={onRunAdvance}
+			onRunAbove={onRunAbove}
+			onInterrupt={onInterrupt}
+			onClear={onClear}
+			onDelete={onDelete}
+			onMove={onMove}
+			onEdit={onEdit}
+			onSetType={onSetType}
+			onSetRole={onSetRole}
+			onSetExport={onSetExport}
+			onSetScrolled={onSetScrolled}
+			{hideAllCode}
+			onSetHideInput={onSetHideInput}
+			editorCollapsed={editorCollapsed[cell.id]}
+			onSetEditorCollapsed={onSetEditorCollapsed}
+			onActivate={onActivate}
+			onRegister={onRegister}
+			onEditorFocus={onEditorFocus}
+			onEditorBlur={onEditorBlur}
+			onInsertCell={onInsertCell}
+			onMeasure={recordHeight}
+			onDragStart={onDragStart}
+			onDragEnd={endDrag}
+		/>
+	</div>
+{/snippet}
+
 <!-- The notebook page: a faintly-grey plane in light themes, so a cell's white
      output and grey editor each read as their own surface. -->
 <div bind:this={containerEl} class="min-h-full bg-(--cellar-surface-page)">
@@ -464,93 +581,27 @@
 			</div>
 		{/if}
 		<div class="space-y-4">
-			{#each cells as cell, i (cell.id)}
-				{#if gitRemovedBefore[cell.id] && !hidden.has(cell.id)}
-					{@render removedSeam(gitRemovedBefore[cell.id])}
-				{/if}
-				<div
-					role="presentation"
-					class="relative"
-					class:hidden={hidden.has(cell.id)}
-					ondragover={(e) => onDragOverCell(e, i)}
-					ondrop={(e) => onDropCell(e, i)}
-				>
-					<!-- Git change bar: sits in the content column's left padding, outside
-					     the card (whose own left accent already means selected / running). -->
-					{#if gitStatus[cell.id]}
-						<div
-							class="absolute inset-y-0 -left-3 w-1 rounded-full"
-							style="background-color: {GIT_COLOR[gitStatus[cell.id]]}"
-							title={GIT_TITLE[gitStatus[cell.id]]}
-							data-testid="cell-git-bar"
-							data-git={gitStatus[cell.id]}
-						></div>
-					{/if}
-					<!-- Hover-between "+" control, living in the gap above this cell. Hidden
-					     during a drag so it never fights the drop indicator. -->
-					{#if dragId == null}
-						<div
-							class="group/ins absolute inset-x-0 -top-4 z-20 flex h-4 items-center justify-center"
-							data-testid="insert-between"
-						>
-							{@render insertControls('above', cell.id)}
-						</div>
-					{/if}
-					<!-- Insertion indicator (top or bottom edge of the hovered cell). -->
-					{#if dragId != null && dropIndex === i}
-						<div
-							class="pointer-events-none absolute left-0 right-0 z-10 h-0.5 rounded bg-primary {dropAtEnd ? '-bottom-2' : '-top-2'}"
-							data-testid="cell-drop-indicator"
-						></div>
-					{/if}
-					{#if isMounted(cell.id)}
-					<Cell
-						{cell}
-						index={i}
-						count={cells.length}
-						running={runningId === cell.id}
-						queuedPosition={queued[cell.id] ?? null}
-						active={activeId === cell.id}
-						{keyMode}
-						staleState={staleness[cell.id] ?? null}
-						dragging={dragId === cell.id}
-						{foldedIds}
-						segHidden={hiddenSegs.get(cell.id) ?? NO_SEGS_HIDDEN}
-						foldCounts={hiddenCounts}
-						{headingNumbers}
-						onToggleFold={onToggleFold}
-						onRun={onRun}
-						onRunAdvance={onRunAdvance}
-						onRunAbove={onRunAbove}
-						onInterrupt={onInterrupt}
-						onClear={onClear}
-						onDelete={onDelete}
-						onMove={onMove}
-						onEdit={onEdit}
-						onSetType={onSetType}
-						onSetRole={onSetRole}
-						onSetExport={onSetExport}
-						onSetScrolled={onSetScrolled}
-						{hideAllCode}
-						onSetHideInput={onSetHideInput}
-						editorCollapsed={editorCollapsed[cell.id]}
-						onSetEditorCollapsed={onSetEditorCollapsed}
-						onActivate={onActivate}
-						onRegister={onRegister}
-						onEditorFocus={onEditorFocus}
-						onEditorBlur={onEditorBlur}
-						onInsertCell={onInsertCell}
-						onMeasure={recordHeight}
-						onDragStart={onDragStart}
-						onDragEnd={endDrag}
-					/>
+			{#if virtualize}
+				<!-- Windowed: iterate the render PLAN. Each mounted item renders the full
+				     row via `cellRow`; each off-screen run is one inert, height-preserving
+				     spacer. Mounted cells are keyed by id (their editor/run state survives
+				     re-planning as the window scrolls); a spacer by its collapsed-run key. -->
+				{#each plan as item (item.kind === 'cell' ? item.id : item.key)}
+					{#if item.kind === 'spacer'}
+						<div aria-hidden="true" data-testid="cell-spacer" style="height: {item.px}px"></div>
 					{:else}
-						<!-- Off-screen (windowed) cell collapsed to a spacer of its cached
-						     height. Dormant while `virtualize` is off (isMounted is always true). -->
-						<div aria-hidden="true" data-testid="cell-spacer" style="height: {spacerHeight(cell.id)}px"></div>
+						{@const cell = cellById?.get(item.id)}
+						{#if cell}
+							{@render cellRow(cell, indexById?.get(item.id) ?? 0)}
+						{/if}
 					{/if}
-				</div>
-			{/each}
+				{/each}
+			{:else}
+				<!-- Flag off (default): mount every cell, exactly as the eager `{#each}`. -->
+				{#each cells as cell, i (cell.id)}
+					{@render cellRow(cell, i)}
+				{/each}
+			{/if}
 			{#if gitRemovedAtEnd}
 				{@render removedSeam(gitRemovedAtEnd)}
 			{/if}

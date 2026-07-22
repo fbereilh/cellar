@@ -226,6 +226,13 @@
 		followRunningCell = !followRunningCell;
 		setUi(FOLLOW_KEY, followRunningCell);
 	}
+	// Cell virtualization (windowed rendering) — ships OFF by default. This phase
+	// (P2) lands the windowing itself behind the flag; a later phase (P5) will
+	// enable it automatically above a cell-count threshold. Until then an explicit
+	// `?virtualize=1` opt-in turns it on (the e2e harness + anyone trying it). Read
+	// once at init; URL params don't change within a session.
+	const virtualizeCells =
+		typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('virtualize') === '1';
 	const mcp = data.mcp;
 	// Soft cap on live kernels; past it the Kernels sidebar warns (warn-only).
 	const maxKernels = data.maxKernels ?? 8;
@@ -1268,6 +1275,7 @@
 				<div class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}">
 					<LiveNotebook
 						path={canonicalNotebookRel}
+						virtualize={virtualizeCells}
 						active={activeTabId === 'notebook'}
 						follow={followRunningCell}
 						gitRefresh={fsRefreshSignal}
@@ -1292,6 +1300,7 @@
 				<div class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}">
 					<LiveNotebook
 						path={tab.path}
+						virtualize={virtualizeCells}
 						active={activeTabId === tab.id}
 						follow={followRunningCell}
 						gitRefresh={fsRefreshSignal}

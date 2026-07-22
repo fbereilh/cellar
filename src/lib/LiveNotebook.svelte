@@ -211,6 +211,11 @@
 
 	let activeId = $state<string | null>(null); // the selected/focused cell (visual emphasis)
 	let keyMode = $state<KeyMode>('command'); // 'command' | 'edit' (visuals only; the dispatcher reads the DOM)
+	// Transient jump targets forced to stay mounted under windowing, so a scroll-to
+	// helper can land on a real DOM node even when the target is off-screen. Passed
+	// down to Notebook, where it joins the pinned set. Empty (and inert) unless
+	// `virtualize` is on; the full jump-path rework is P4. Kept minimal here.
+	let scrollPins = $state<Set<string>>(new Set());
 	// This notebook's DOM subtree. Scopes the modal-keyboard handler and cell
 	// lookups (ids repeat across the open, still-mounted notebooks), and takes
 	// focus when the tab activates - so it must be a real, focusable box.
@@ -609,6 +614,22 @@
 		saveFolds();
 	}
 
+	// Force a jump target to mount under windowing before we query its DOM node.
+	// Off-screen cells are spacers, so a `querySelector` would miss; pinning splits
+	// the spacer and mounts the cell. A no-op when windowing is off (every cell is
+	// already mounted). The pin is released once the cell has been scrolled into the
+	// natural window. The full jump-path rework (outline / search / print) is P4.
+	function pinScrollTarget(id: string) {
+		if (!virtualize || scrollPins.has(id)) return;
+		scrollPins = new Set(scrollPins).add(id);
+	}
+	function unpinScrollTarget(id: string) {
+		if (!scrollPins.has(id)) return;
+		const next = new Set(scrollPins);
+		next.delete(id);
+		scrollPins = next;
+	}
+
 	// Explicit "jump to running cell": reveal + center this notebook's running
 	// (or, failing that, first queued) cell, regardless of the `follow` preference,
 	// the typing guard, or the imports-cell skip that the automatic follow-effect
@@ -617,9 +638,12 @@
 		const id = runningId ?? Object.keys(queued)[0] ?? null;
 		if (!id) return;
 		revealCell(id);
-		await tick(); // a just-revealed (unfolded) cell needs its DOM node
+		pinScrollTarget(id);
+		await tick(); // a just-revealed (unfolded) or off-screen (windowed) cell needs its DOM node
 		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null;
 		if (el) scrollElementIntoView(el);
+		await tick();
+		unpinScrollTarget(id); // now in the natural window (or already pinned as runningId)
 	}
 
 	async function followCell(id: string) {
@@ -630,12 +654,18 @@
 		// keyed on the role, not the top, so it holds now the cell can live anywhere.
 		if (isImportsCell(findCell(id))) return;
 		revealCell(id);
-		await tick(); // an `add_and_run` cell (or a just-revealed one) needs its DOM node
-		// Scope the lookup to THIS notebook: cell ids are unique per document, not
-		// across documents, and every open notebook stays mounted (hidden).
-		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null;
-		if (!el || cellIsVisible(el)) return;
-		scrollElementIntoView(el);
+		pinScrollTarget(id);
+		try {
+			await tick(); // an `add_and_run` cell (or a just-revealed / windowed one) needs its DOM node
+			// Scope the lookup to THIS notebook: cell ids are unique per document, not
+			// across documents, and every open notebook stays mounted (hidden).
+			const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null;
+			if (!el || cellIsVisible(el)) return;
+			scrollElementIntoView(el);
+			await tick();
+		} finally {
+			unpinScrollTarget(id);
+		}
 	}
 
 	// Follow whenever this notebook's running cell changes, and also when the user
@@ -1919,6 +1949,7 @@
 		<Notebook
 			{cells}
 			{virtualize}
+			{scrollPins}
 			runningId={runningId}
 			{queued}
 			{activeId}

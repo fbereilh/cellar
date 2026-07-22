@@ -4,6 +4,13 @@
 //   §3   — the hand-rolled, flow-preserving spacer window (why not a library)
 //   §4.1 — height estimation + measured cache
 //
+// Scroll stability is the browser's: the scroll pane keeps its native
+// `overflow-anchor`, which re-anchors the viewport when an off-screen cell mounts
+// (spacer→cell) or resizes. This module only decides WHICH cells to mount; it holds
+// no scrollTop compensation of its own. To let native anchoring track the real
+// layout, the offset model accounts for the `space-y-4` inter-cell gap (`gapPx`), so
+// a spacer reproduces the exact flow space its collapsed run occupied.
+//
 // This is the FOUNDATION phase (P0+P1). Windowing is flag-gated OFF: `planWindow`
 // returns "every cell mounted" whenever `virtualize` is false OR the viewport
 // metrics are absent, so the notebook renders byte-identically to the eager
@@ -54,6 +61,14 @@ export interface PlanWindowArgs {
 	overscanPx?: number;
 	/** Cells forced into the mounted set wherever they are (running / active / scroll target). */
 	pinned?: Set<string>;
+	/**
+	 * Vertical gap (px) the flow renders between adjacent cells (the `space-y-4`
+	 * margin between siblings). Added to the running offset between every pair of
+	 * cells so the model position tracks the real DOM `scrollTop`; also folded into a
+	 * coalesced spacer's height so it reproduces the exact flow space its run occupied.
+	 * DEFAULT 0 (the uniform-height tests assume no gap).
+	 */
+	gapPx?: number;
 }
 
 // ---- Height estimation constants (§4.1) ------------------------------------
@@ -66,6 +81,8 @@ export const MARKDOWN_BASE_PX = 60; // a small constant for a rendered markdown 
 export const OUTPUT_PER_PX = 120; // coarse per-output block
 export const OUTPUT_CAP_PX = 480; // ...capped so one huge output can't dominate
 export const DEFAULT_OVERSCAN_PX = 800;
+// The `space-y-4` margin the cell stack renders between adjacent rows (1rem).
+export const ROW_GAP_PX = 16;
 
 /**
  * Estimate a cell's rendered height from its source line count (+ a coarse
@@ -107,7 +124,8 @@ export function planWindow(args: PlanWindowArgs): PlanItem[] {
 		viewportTop,
 		viewportHeight,
 		overscanPx = DEFAULT_OVERSCAN_PX,
-		pinned
+		pinned,
+		gapPx = 0
 	} = args;
 
 	// No windowing without an explicit opt-in AND a viewport to window against.
@@ -122,18 +140,23 @@ export function planWindow(args: PlanWindowArgs): PlanItem[] {
 	const items: PlanItem[] = [];
 	let offset = 0; // running top edge of the current cell in the stacked flow
 	let spacerPx = 0; // accumulated height of the current off-screen run
+	let spacerCount = 0; // cells collapsed into the current run (drives its internal gaps)
 	let spacerStart = 0; // order index the current run began at (for a stable key)
 
 	const flushSpacer = () => {
 		if (spacerPx > 0) {
 			items.push({ kind: 'spacer', px: spacerPx, key: `spacer:${spacerStart}` });
 			spacerPx = 0;
+			spacerCount = 0;
 		}
 	};
 
 	for (let i = 0; i < order.length; i++) {
 		const id = order[i];
 		const h = heightOf(id, heights, estimate);
+		// The gap precedes every cell but the first, matching `space-y-4`'s
+		// between-siblings margin, so cell k's top = Σ(heights before it) + k·gap.
+		if (i > 0) offset += gapPx;
 		const cellTop = offset;
 		const cellBottom = offset + h;
 		const inWindow = cellBottom >= top && cellTop <= bottom;
@@ -142,7 +165,12 @@ export function planWindow(args: PlanWindowArgs): PlanItem[] {
 			items.push({ kind: 'cell', id });
 			spacerStart = i + 1;
 		} else {
+			// A spacer stands in for K cells; it carries their heights plus the K-1
+			// gaps BETWEEN them (the outer gaps to its neighbors are drawn by
+			// `space-y-4` around the spacer div itself).
+			if (spacerCount > 0) spacerPx += gapPx;
 			spacerPx += h;
+			spacerCount++;
 		}
 		offset = cellBottom;
 	}

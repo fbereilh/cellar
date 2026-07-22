@@ -8,6 +8,7 @@ import {
 	MARKDOWN_BASE_PX,
 	OUTPUT_PER_PX,
 	OUTPUT_CAP_PX,
+	ROW_GAP_PX,
 	type PlanItem
 } from '../../src/lib/virtualization';
 
@@ -172,6 +173,79 @@ describe('planWindow — flag ON (windowed)', () => {
 		});
 		const keys = plan.filter((p) => p.kind === 'spacer').map((p) => (p as { key: string }).key);
 		expect(new Set(keys).size).toBe(keys.length); // unique
+	});
+});
+
+describe('planWindow — inter-cell gap accounting (space-y-4)', () => {
+	it('advances the window by the gap between cells so a deep cell stays in-window', () => {
+		// 40 cells × 100px + 16px gaps ⇒ cell k's top = k·116. Viewport [1000,1200],
+		// overscan 0, window [1000,1200]. WITH the 16px gap, real tops are k·116 so
+		// c8 [928,1028), c9 [1044,1144), c10 [1160,1260) overlap the window; without
+		// the gap the model tops are k·100 and a different (higher) run wins.
+		const { order, heights } = uniform(40, 100);
+		const plan = planWindow({
+			order,
+			heights,
+			estimate: () => 100,
+			virtualize: true,
+			viewportTop: 1000,
+			viewportHeight: 200,
+			overscanPx: 0,
+			gapPx: ROW_GAP_PX
+		});
+		expect(cellIds(plan)).toEqual(['c8', 'c9', 'c10']);
+		// Ignoring the gap would have windowed a different (higher) run.
+		const noGap = planWindow({
+			order,
+			heights,
+			estimate: () => 100,
+			virtualize: true,
+			viewportTop: 1000,
+			viewportHeight: 200,
+			overscanPx: 0,
+			gapPx: 0
+		});
+		expect(cellIds(noGap)).not.toEqual(cellIds(plan));
+	});
+
+	it("a coalesced spacer's px includes its run's internal gaps (Σheights + (K-1)·gap)", () => {
+		// 10 cells × 100px, gap 16. Viewport [500,560] with overscan 0 windows the cell
+		// straddling that band and collapses the runs before and after into spacers.
+		const { order, heights } = uniform(10, 100);
+		const plan = planWindow({
+			order,
+			heights,
+			estimate: () => 100,
+			virtualize: true,
+			viewportTop: 500,
+			viewportHeight: 60,
+			overscanPx: 0,
+			gapPx: ROW_GAP_PX
+		});
+		const cells = cellIds(plan);
+		const spacers = plan.filter((p) => p.kind === 'spacer') as Array<{ px: number }>;
+		// Total flow height is conserved: Σ(mounted heights) + Σ(spacer px) + all
+		// outer gaps between plan items = the full stack height (N·100 + (N-1)·16).
+		const K = cells.length;
+		const mountedPx = K * 100;
+		const spacerPx = spacers.reduce((a, s) => a + s.px, 0);
+		const planGaps = (plan.length - 1) * ROW_GAP_PX; // gap between every pair of plan items
+		expect(mountedPx + spacerPx + planGaps).toBe(10 * 100 + 9 * ROW_GAP_PX);
+		// And a run of K cells contributes exactly Σheights + (K-1)·gap.
+		const topSpacer = plan[0] as { kind: string; px: number };
+		if (topSpacer.kind === 'spacer') {
+			// c0..cJ collapsed; recover J from the first mounted cell's index.
+			const firstMounted = Number((cells[0] as string).slice(1));
+			expect(topSpacer.px).toBe(firstMounted * 100 + (firstMounted - 1) * ROW_GAP_PX);
+		}
+	});
+
+	it('defaults gapPx to 0 so the uniform-height model is unchanged', () => {
+		const { order, heights } = uniform(10, 100);
+		const withDefault = planWindow({ order, heights, estimate: () => 100, virtualize: true, viewportTop: 250, viewportHeight: 200, overscanPx: 0 });
+		const withZero = planWindow({ order, heights, estimate: () => 100, virtualize: true, viewportTop: 250, viewportHeight: 200, overscanPx: 0, gapPx: 0 });
+		expect(cellIds(withDefault)).toEqual(cellIds(withZero));
+		expect(spacerSum(withDefault)).toBe(spacerSum(withZero));
 	});
 });
 
