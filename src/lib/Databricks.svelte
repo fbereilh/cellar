@@ -141,6 +141,16 @@
 	// the Runtime card shows an "applying…" state and the transient post-restart
 	// lost/expired flash is suppressed.
 	let runtimeApplying = $state(false);
+	// True from the moment an EXPECTED kernel restart is issued (connect, switch
+	// cluster, or a runtime toggle/version apply - all go through `applyRuntime`)
+	// until the session settles again (`settleConnection`). It is what distinguishes
+	// an expected restart-in-progress from a genuine unexpected session loss: while
+	// it is set, the "lost"/"expired" cards are suppressed and the connecting/connected
+	// view is held, so the transient mid-restart "session lost" the epoch bump reports
+	// never surfaces. Cleared on settle (connected) OR on the reconnect timing out, so
+	// a reconnect that genuinely fails still falls through to the real lost/expired
+	// state with its Reconnect button.
+	let restarting = $state(false);
 	onMount(() => {
 		runtimeOn = getUi<boolean>(DBX_RUNTIME_KEY, true);
 		runtimeVersion = getUi<string>(DBX_RUNTIME_VERSION_KEY, DBX_RUNTIME_VERSION_DEFAULT);
@@ -161,7 +171,13 @@
 		await setUiNow(DBX_RUNTIME_KEY, on);
 		await setUiNow(DBX_RUNTIME_VERSION_KEY, v === '' ? null : v);
 		appliedVersion = v || DBX_RUNTIME_VERSION_DEFAULT;
-		if (onRestartKernel && notebookPath) await onRestartKernel(notebookPath);
+		if (onRestartKernel && notebookPath) {
+			// Mark the expected-restart window BEFORE issuing it, so the transient
+			// mid-restart "session lost" the epoch bump reports is read as "connecting",
+			// never "lost". `settleConnection` clears it once the session settles.
+			restarting = true;
+			await onRestartKernel(notebookPath);
+		}
 	}
 
 	/** Toggle the runtime on/off; applies IMMEDIATELY by restarting the kernel. */
@@ -173,6 +189,7 @@
 			await settleConnection();
 		} finally {
 			runtimeApplying = false;
+			restarting = false; // definitive cleanup if applyRuntime threw before settleConnection
 		}
 	}
 	function onVersionInput(e: Event) {
@@ -192,6 +209,7 @@
 			await settleConnection();
 		} finally {
 			runtimeApplying = false;
+			restarting = false; // definitive cleanup if applyRuntime threw before settleConnection
 		}
 	}
 
@@ -205,15 +223,29 @@
 	 * whole transient window and the panel never flashes the "lost" card. On timeout
 	 * (the reconnect genuinely failed) it returns and the last status - which the
 	 * poll left honest - shows the real state.
+	 *
+	 * The connected check reads THIS poll's own fetched body, never the shared
+	 * `status`: a concurrent `loadStatus` (the kernelSessionId `$effect`) bumps
+	 * `statusSeq` and can leave `status` momentarily holding the pre-restart
+	 * "connected" while this poll's fresh "lost" read was discarded - reading `status`
+	 * there released the gate early and the panel stuck on "lost". `restarting` is the
+	 * explicit "an expected restart is in flight" flag (set in `applyRuntime` before
+	 * the restart, cleared here on settle): while it is true the lost/expired cards are
+	 * suppressed in favour of the connecting/connected view, so an unexpected loss and
+	 * an expected restart-in-progress can never be confused.
 	 */
 	async function settleConnection(): Promise<void> {
 		const deadline = Date.now() + 15000;
-		// eslint-disable-next-line no-constant-condition
-		while (true) {
-			await loadStatus();
-			if (status?.connection?.connected) return;
-			if (Date.now() >= deadline) return;
-			await new Promise((r) => setTimeout(r, 400));
+		try {
+			// eslint-disable-next-line no-constant-condition
+			while (true) {
+				const body = await loadStatus();
+				if (body?.connection?.connected) return;
+				if (Date.now() >= deadline) return;
+				await new Promise((r) => setTimeout(r, 400));
+			}
+		} finally {
+			restarting = false;
 		}
 	}
 
@@ -311,13 +343,21 @@
 	let clustersSeq = 0;
 	let catalogsSeq = 0;
 
-	async function loadStatus() {
+	// RETURNS the body this call fetched (or null on failure), regardless of whether
+	// it was the newest word on `status` (the `statusSeq` guard only decides whether
+	// to APPLY it to the shared `status`). `settleConnection` polls on that returned
+	// body, NOT the shared `status`: a concurrent `loadStatus` (the kernelSessionId
+	// `$effect`, or an SSE-driven reload) bumps `statusSeq` and would otherwise make a
+	// settle poll discard its own fresh read and re-check a STALE `status` - which is
+	// exactly how a connect used to release its "connecting" gate against a leftover
+	// "connected" while the real reconnect was mid-flight, then stick on "lost".
+	async function loadStatus(): Promise<DbxStatus | null> {
 		const seq = ++statusSeq;
 		try {
 			const res = await fetch(`/api/databricks${pathQuery()}`);
-			const body = await res.json();
-			if (!res.ok) throw new Error(body?.message || 'failed to read Databricks status');
-			if (seq !== statusSeq) return; // superseded while in flight
+			const body = (await res.json()) as DbxStatus;
+			if (!res.ok) throw new Error((body as { message?: string })?.message || 'failed to read Databricks status');
+			if (seq !== statusSeq) return body; // superseded for `status`, but still a valid read for the caller
 			status = body;
 			statusError = '';
 			// Default to DEFAULT, else the first profile - until the user picks one.
@@ -325,9 +365,10 @@
 				const names: string[] = (body.config?.profiles ?? []).map((p: DbxProfile) => p.name);
 				profile = body.connection?.profile || (names.includes('DEFAULT') ? 'DEFAULT' : (names[0] ?? ''));
 			}
+			return body;
 		} catch (err) {
-			if (seq !== statusSeq) return;
-			statusError = toDbxError(err).message;
+			if (seq === statusSeq) statusError = toDbxError(err).message;
+			return null;
 		}
 	}
 
@@ -515,6 +556,7 @@
 			busy = '';
 			connectingId = '';
 			connectingName = '';
+			restarting = false; // definitive cleanup if applyRuntime threw before settleConnection
 		}
 	}
 
@@ -1103,15 +1145,23 @@
 		     subordinate Unity Catalog browser. Two clearly separated cards. -->
 	{:else}
 		<div class="space-y-2">
-			{#if busy === 'connect'}
-				<!-- Connecting: one calm state in the Cluster card, held (via
-				     settleConnection, after the runtime-enable restart) until the rebuilt
-				     session settles - so the panel never flashes the "session lost" card. -->
+			{#if busy === 'connect' || (restarting && !runtimeApplying)}
+				<!-- Connecting: one calm state in the Cluster card, held until the rebuilt
+				     session settles - so the panel never flashes the "session lost" card.
+				     Shown for a connect/switch (`busy === 'connect'`) AND for any other
+				     expected restart still in flight (`restarting`, e.g. the gate outliving
+				     `busy` for a tick), EXCEPT a runtime toggle - that keeps the connected
+				     card with its "restarting" pill (the next branch). Because `restarting`
+				     is true for the whole expected-restart window, the lost/expired branches
+				     below are unreachable during it: an expected restart can never be
+				     mistaken for an unexpected loss. -->
 				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-connecting">
 					{@render cardLabel('cluster')}
 					<div class="mt-1.5 flex items-center gap-2">
 						<span class="loading loading-spinner loading-xs shrink-0 text-primary"></span>
-						<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connectingName}>Connecting to {connectingName}…</span>
+						<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connectingName}>
+							{connectingName ? `Connecting to ${connectingName}…` : 'Reconnecting…'}
+						</span>
 					</div>
 					{@render hint('Enabling the Databricks runtime and starting the session. A terminated cluster can take a few minutes.')}
 					{#if connectError}{@render errorBox(connectError, 'databricks-connect-error')}{/if}
