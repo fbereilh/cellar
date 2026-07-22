@@ -521,6 +521,11 @@
 	// height threshold we auto-scroll unless the user set an explicit choice.
 	const SCROLL_THRESHOLD = 360; // px of output beyond which we contract by default
 	let outputInner = $state<HTMLElement | null>(null);
+	// The output scroll box (bind:this below). Its vertical scrollbar, when the
+	// output is contracted, would sit under the top-right expand toggle — measured
+	// here so the toggle can clear the gutter. See `scrollbarClearRight` below.
+	let outputScrollEl = $state<HTMLElement | null>(null);
+	let outputScrollbarW = $state(0);
 	let outputTall = $state(false);
 	// The DataFrame grid — and a full-size image — manage their own fixed height +
 	// scroll, so they must not also be wrapped in the outer output-scroll box (that
@@ -551,8 +556,38 @@
 		ro.observe(el);
 		return () => ro.disconnect();
 	});
+	// Track the width the vertical scrollbar takes off the output box so the expand
+	// toggle can be inset past it (a classic/always-on scrollbar has a real layout
+	// width; an overlay scrollbar reports 0 and is handled by the floor in
+	// `scrollbarClearRight`). Re-measures whenever the box resizes (a scrollbar
+	// appearing shrinks the content-box, which the observer catches) and when the
+	// contracted state toggles its overflow.
+	$effect(() => {
+		const el = outputScrollEl;
+		if (!el) return;
+		void scrolled; // re-measure when the box gains/loses its overflow clamp
+		const measure = () => {
+			outputScrollbarW = el.offsetWidth - el.clientWidth;
+		};
+		measure();
+		if (typeof ResizeObserver === 'undefined') return;
+		const ro = new ResizeObserver(measure);
+		ro.observe(el);
+		return () => ro.disconnect();
+	});
 	function toggleScrolled() {
 		onSetScrolled?.(cell.id, !scrolled);
+	}
+	// Right offset for an absolutely-positioned overlay control (the input/output
+	// expand toggles) so it always clears the scroll box's vertical scrollbar. The
+	// measured width covers classic/always-on scrollbars (a real gutter, so the
+	// control sits a constant 0.25rem past whatever the platform's scrollbar width
+	// is); the `1rem` floor covers macOS-style overlay scrollbars, which take no
+	// layout width (measured 0) yet paint over the content edge — and expand to
+	// ~15px — on hover. Keeps a small consistent gap in every state instead of
+	// pinning to `right: 0.25rem` over the gutter.
+	function scrollbarClearRight(scrollbarW: number): string {
+		return `max(1rem, calc(0.25rem + ${scrollbarW}px))`;
 	}
 
 	// ---- Collapsible / scrollable code editor -------------------------------
@@ -573,8 +608,14 @@
 	// so this reads true whether or not the box is currently contracted. Measured
 	// on the scroll box (not the CM mount) so a tall UNFOCUSED cell — whose source
 	// is shown by the static render, no editor built — also auto-collapses.
+	let editorScrollbarW = $state(0);
 	function measureEditor() {
-		if (scrollBoxEl) editorTall = scrollBoxEl.scrollHeight > EDITOR_MAX_PX;
+		if (scrollBoxEl) {
+			editorTall = scrollBoxEl.scrollHeight > EDITOR_MAX_PX;
+			// Width the vertical scrollbar takes off the box (0 for overlay/none), so
+			// the collapse/expand toggle can clear it — see `scrollbarClearRight`.
+			editorScrollbarW = scrollBoxEl.offsetWidth - scrollBoxEl.clientWidth;
+		}
 	}
 	function toggleEditorCollapsed() {
 		onSetEditorCollapsed?.(cell.id, !collapsed);
@@ -1465,7 +1506,8 @@
 			{#if canCollapse}
 				<!-- Collapse-editor toggle (mirrors the "Enable Scrolling for Outputs" control). -->
 				<button
-					class="btn btn-ghost btn-xs absolute right-1 top-1 z-10 h-5 min-h-0 gap-1 px-1.5 text-[10px] font-normal text-base-content/40 hover:text-base-content/80"
+					class="btn btn-ghost btn-xs absolute top-1 z-10 h-5 min-h-0 gap-1 px-1.5 text-[10px] font-normal text-base-content/40 hover:text-base-content/80"
+					style:right={scrollbarClearRight(editorScrollbarW)}
 					onclick={toggleEditorCollapsed}
 					title={collapsed ? 'Expand editor (show full height)' : 'Collapse editor (contract to a fixed height)'}
 					data-testid="editor-collapse-toggle"
@@ -1511,7 +1553,8 @@
 				     toggle is hidden for them. -->
 				{#if !ownsScroll}
 				<button
-					class="btn btn-ghost btn-xs absolute right-1 top-1 z-10 h-5 min-h-0 gap-1 px-1.5 text-[10px] font-normal text-base-content/40 hover:text-base-content/80"
+					class="btn btn-ghost btn-xs absolute top-1 z-10 h-5 min-h-0 gap-1 px-1.5 text-[10px] font-normal text-base-content/40 hover:text-base-content/80"
+					style:right={scrollbarClearRight(outputScrollbarW)}
 					onclick={toggleScrolled}
 					title={scrolled ? 'Expand output (show full height)' : 'Scroll output (contract to a fixed height)'}
 					data-testid="output-scroll-toggle"
@@ -1526,7 +1569,7 @@
 					{/if}
 				</button>
 				{/if}
-				<div class="{scrolled ? 'max-h-[22rem] overflow-y-auto' : ''}" data-testid="output-scroll" data-scrolled={scrolled ? 'true' : undefined}>
+				<div bind:this={outputScrollEl} class="{scrolled ? 'max-h-[22rem] overflow-y-auto' : ''}" data-testid="output-scroll" data-scrolled={scrolled ? 'true' : undefined}>
 					<div bind:this={outputInner} class="space-y-0.5 py-2">
 						{#each outputs as o, i}
 							{#if o.dataframe}
