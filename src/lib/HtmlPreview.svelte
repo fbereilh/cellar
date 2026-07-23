@@ -6,14 +6,22 @@
 	 * tab's Preview/Source toggle swaps it for the CodeMirror editor.
 	 *
 	 * SECURITY — the file is untrusted content, so the frame is origin-isolated
-	 * from the app exactly the way rich `text/html` cell outputs are
-	 * (`HtmlOutput.svelte`, the precedent this follows):
-	 *   • `sandbox="allow-scripts allow-popups"` and deliberately NOT
-	 *     `allow-same-origin`. Scripts run — self-contained plots need them — but
-	 *     in a unique OPAQUE origin, so the document cannot read the app's DOM,
-	 *     cookies, `localStorage`, or same-origin `fetch`. Never add
+	 * from the app the same way rich `text/html` cell outputs are
+	 * (`HtmlOutput.svelte`, the precedent this follows — with one deliberate
+	 * divergence, `allow-downloads`, below):
+	 *   • `sandbox="allow-scripts allow-popups allow-downloads"` and deliberately
+	 *     NOT `allow-same-origin`. Scripts run — self-contained plots need them —
+	 *     but in a unique OPAQUE origin, so the document cannot read the app's
+	 *     DOM, cookies, `localStorage`, or same-origin `fetch`. Never add
 	 *     `allow-same-origin` here: paired with `allow-scripts` it hands the file
 	 *     the app's origin and the isolation is gone.
+	 *   • `allow-downloads` is the one token this adds over `HtmlOutput.svelte`.
+	 *     It grants NO origin access, so the invariant above is untouched; it
+	 *     only lets the page save a file the user asked for. Without it the
+	 *     browser blocks every in-page save, which silently breaks plotly's
+	 *     modebar "Download plot as PNG" (a data URI + an `<a download>` click)
+	 *     on exactly the export type this preview targets. A cell output is a
+	 *     different surface and keeps its own token set.
 	 *   • `srcdoc` (not a URL served from the app's origin), so the app never
 	 *     serves workspace HTML as `text/html` from its own origin — a route that
 	 *     did would be a stored-XSS surface reachable outside any sandbox. This is
@@ -63,7 +71,7 @@
 		<iframe
 			title="HTML preview"
 			srcdoc={source}
-			sandbox="allow-scripts allow-popups"
+			sandbox="allow-scripts allow-popups allow-downloads"
 			class="min-h-0 w-full flex-1 border-0 bg-white"
 			data-testid="html-preview"
 		></iframe>

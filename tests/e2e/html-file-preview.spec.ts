@@ -96,8 +96,9 @@ test('an .html file opens as a sandboxed preview, toggles to an editable source 
 	await expect(frame.locator('#plot')).toHaveText('RENDERED-BY-SCRIPT');
 
 	// ---- …and it is sandboxed away from the app -----------------------------
-	// The attribute states the intent: scripts yes, app origin no.
-	await expect(iframe).toHaveAttribute('sandbox', 'allow-scripts allow-popups');
+	// The attribute states the intent: scripts yes, downloads yes (an export's own
+	// "save as PNG" affordance, which grants no origin access), app origin no.
+	await expect(iframe).toHaveAttribute('sandbox', 'allow-scripts allow-popups allow-downloads');
 	const sandbox = (await iframe.getAttribute('sandbox')) ?? '';
 	expect(sandbox).not.toContain('allow-same-origin');
 	// The frame's own verdict: it could reach neither the app's DOM nor its storage.

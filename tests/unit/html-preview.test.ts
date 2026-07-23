@@ -10,8 +10,9 @@
  * fails on the edit is the cheapest way to keep that from being a one-word
  * regression.
  */
-import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isHtmlPath, hasRelativeAssetRefs } from '../../src/lib/htmlPreview';
@@ -187,8 +188,11 @@ describe('HtmlPreview sandbox (security invariant)', () => {
 	const src = readFileSync(join(REPO, 'src/lib/HtmlPreview.svelte'), 'utf8');
 	const iframeTag = src.slice(src.indexOf('<iframe'), src.indexOf('></iframe>'));
 
+	// `allow-downloads` is the one token this diverges from `HtmlOutput.svelte`
+	// by: it grants no origin access, and without it the browser blocks plotly's
+	// modebar "Download plot as PNG" on exactly the exports this preview targets.
 	it('renders the file in an iframe sandboxed away from the app', () => {
-		expect(iframeTag).toContain('sandbox="allow-scripts allow-popups"');
+		expect(iframeTag).toContain('sandbox="allow-scripts allow-popups allow-downloads"');
 	});
 
 	// Scoped to the tag, not the file: the module comment names `allow-same-origin`
@@ -200,6 +204,54 @@ describe('HtmlPreview sandbox (security invariant)', () => {
 	it('renders through srcdoc, so the app never serves workspace HTML from its origin', () => {
 		expect(iframeTag).toContain('srcdoc={source}');
 		expect(iframeTag).not.toMatch(/\bsrc=/);
+	});
+});
+
+/**
+ * The HTML tab's raised size ceiling. Both directions matter: the feature is
+ * useless if it refuses the multi-MB self-contained exports it exists to open,
+ * and the raise is worthless if it leaks into the ordinary text-file cap.
+ */
+describe('readWorkspaceFile size caps', () => {
+	const MB = 1024 * 1024;
+	let dir: string;
+	let priorWorkspace: string | undefined;
+	let readWorkspaceFile: (relPath: string) => string;
+
+	const fill = (name: string, bytes: number) =>
+		writeFileSync(join(dir, name), Buffer.alloc(bytes, 0x61));
+
+	beforeAll(async () => {
+		dir = mkdtempSync(join(tmpdir(), 'cellar-fsize-'));
+		priorWorkspace = process.env.CELLAR_WORKSPACE;
+		process.env.CELLAR_WORKSPACE = dir;
+		({ readWorkspaceFile } = await import('../../src/lib/server/fstree'));
+		fill('small.html', 1 * MB);
+		fill('report.html', 5 * MB); // a plotly write_html(include_plotlyjs=True)
+		fill('huge.html', 16 * MB);
+		fill('big.txt', 3 * MB);
+		fill('small.txt', 1 * MB);
+	});
+
+	afterAll(() => {
+		if (priorWorkspace === undefined) delete process.env.CELLAR_WORKSPACE;
+		else process.env.CELLAR_WORKSPACE = priorWorkspace;
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('opens an HTML file between the two caps', () => {
+		expect(readWorkspaceFile('report.html').length).toBe(5 * MB);
+		expect(readWorkspaceFile('small.html').length).toBe(1 * MB);
+	});
+
+	it('still refuses an HTML file above the HTML cap', () => {
+		expect(() => readWorkspaceFile('huge.html')).toThrow(/too large/);
+	});
+
+	// The regression that would mean the scoping failed.
+	it('still refuses a non-HTML text file above the ordinary cap', () => {
+		expect(() => readWorkspaceFile('big.txt')).toThrow(/too large/);
+		expect(readWorkspaceFile('small.txt').length).toBe(1 * MB);
 	});
 });
 
