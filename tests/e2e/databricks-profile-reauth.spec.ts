@@ -218,3 +218,73 @@ test('a session the auto-heal could not restore shows the command on the panel i
 		`databricks auth login --profile ${PROFILE}`
 	);
 });
+
+test('one expired profile failing BOTH the session heal and the cluster listing renders ONE box', async ({ page }) => {
+	// The combination the earlier cases each missed by mocking one source only: an
+	// expired profile fails every operation that touches it at once, so the panel
+	// used to stack the identical explanation + command + copy + SDK detail twice.
+	await mockDatabricksStatus(page, () => ({
+		...cliProfileStatus(),
+		connection: { connected: false, reauth: reauthBody(PROFILE) }
+	}));
+	await mockClustersFailing(page, reauthBody(PROFILE));
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	// The session box is the copy that survives - it is the one that explains the
+	// state the whole card is in, not just one failed listing.
+	await expect(page.getByTestId('databricks-session-error-reauth-command')).toHaveText(
+		`databricks auth login --profile ${PROFILE}`
+	);
+	await expect(page.locator('[data-testid$="-reauth-command"]')).toHaveCount(1);
+	await expect(page.locator('[data-testid$="-reauth-explain"]')).toHaveCount(1);
+	await expect(page.getByTestId('databricks-clusters-error')).toHaveCount(0);
+
+	// "refresh clusters" re-runs the failing listing - the path that made the
+	// duplicate reachable even when the first load was skipped.
+	await page.getByTestId('databricks-refresh-clusters').click();
+	await expect(page.locator('[data-testid$="-reauth-command"]')).toHaveCount(1);
+});
+
+test('a NON-reauth cluster failure still renders beside the session re-auth box', async ({ page }) => {
+	// The de-dupe suppresses a DUPLICATE FACT, never a different one: two remedies
+	// must not collapse into one, or a real error is hidden.
+	await mockDatabricksStatus(page, () => ({
+		...cliProfileStatus(),
+		connection: { connected: false, reauth: reauthBody(PROFILE) }
+	}));
+	await mockClustersFailing(page, { code: 'timeout', message: 'the workspace did not respond' }, 504);
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	await expect(page.getByTestId('databricks-session-error')).toBeVisible();
+	const clusters = page.getByTestId('databricks-clusters-error');
+	await expect(clusters).toBeVisible();
+	await expect(clusters).toContainText('the workspace did not respond');
+	// Still exactly one re-auth box: the timeout box is not one.
+	await expect(page.locator('[data-testid$="-reauth-command"]')).toHaveCount(1);
+});
+
+test('a reauth about a DIFFERENT profile is not suppressed as a duplicate', async ({ page }) => {
+	// Two different profiles need two different commands, so both boxes stand.
+	await mockDatabricksStatus(page, () => ({
+		...cliProfileStatus(),
+		connection: { connected: false, reauth: reauthBody('other-workspace') }
+	}));
+	await mockClustersFailing(page, reauthBody(PROFILE));
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	await expect(page.getByTestId('databricks-session-error-reauth-command')).toHaveText(
+		'databricks auth login --profile other-workspace'
+	);
+	await expect(page.getByTestId('databricks-clusters-error-reauth-command')).toHaveText(
+		`databricks auth login --profile ${PROFILE}`
+	);
+});

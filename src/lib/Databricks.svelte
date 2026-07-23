@@ -1067,6 +1067,28 @@
 		return (err.profile ?? '').trim();
 	}
 
+	/**
+	 * Is this error the SAME expired-profile fact the card's session box already
+	 * spells out in full?
+	 *
+	 * One expired profile fails every operation that touches it at once - the
+	 * session heal, the cluster listing behind the picker, an explicit Reconnect -
+	 * so a card would stack two or three identical explanation+command+copy boxes.
+	 * The session box (`connection.reauth`) is the one that survives; the rest are
+	 * suppressed by `errorBox` itself, so no call site has to remember the rule.
+	 *
+	 * Matching is strict: same code AND same named profile. A non-reauth failure is
+	 * a different fact with a different remedy and always renders, and two DIFFERENT
+	 * profiles need two different commands - so anything unproven falls through and
+	 * shows, since a hidden real error is far worse than a repeated one.
+	 */
+	function duplicatesSessionReauth(err: DbxError): boolean {
+		const session = connection?.reauth;
+		if (!session || session.code !== PROFILE_REAUTH_CODE || err.code !== PROFILE_REAUTH_CODE) return false;
+		const name = reauthProfile(err);
+		return !!name && name === reauthProfile(session);
+	}
+
 	// Copy-the-command affordance for the re-auth box - the same idiom as the
 	// sidebar's "Connect an agent" panel. Keyed by the box's own `key`, NOT its
 	// testid: a testid is a SELECTOR, not an identity - `databricks-node-error` is
@@ -1135,6 +1157,14 @@
   own.
 -->
 {#snippet errorBox(err: DbxError, testid: string, key: string = testid)}
+	{#if !duplicatesSessionReauth(err)}
+		{@render errorBody(err, testid, key)}
+	{/if}
+{/snippet}
+
+<!-- The box itself. Rendered through `errorBox` everywhere except the session
+     re-auth box, which is the ONE copy the de-dupe keeps. -->
+{#snippet errorBody(err: DbxError, testid: string, key: string)}
 	<div class="mt-2 rounded-lg border border-error/30 bg-error/10 p-2" data-testid={testid}>
 		{#if err.code === PROFILE_REAUTH_CODE}
 			{@render reauthBox(err, `${testid}-reauth`, key)}
@@ -1160,10 +1190,13 @@
   picker - whose "Sign in with Databricks" button is exactly the dead end here - so
   the explanation has to travel with the state, not only with a click on Reconnect.
   Rendered inside one branch at a time, so its testid stays unique in the DOM.
+
+  Goes through `errorBody` directly, NOT `errorBox`: this is the copy the de-dupe
+  keeps, so it must not suppress itself.
 -->
 {#snippet sessionReauthBox()}
 	{#if connection?.reauth}
-		{@render errorBox(connection.reauth, 'databricks-session-error')}
+		{@render errorBody(connection.reauth, 'databricks-session-error', 'databricks-session-error')}
 	{/if}
 {/snippet}
 
