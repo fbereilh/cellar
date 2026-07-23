@@ -11,11 +11,11 @@
 // layout, the offset model accounts for the `space-y-4` inter-cell gap (`gapPx`), so
 // a spacer reproduces the exact flow space its collapsed run occupied.
 //
-// This is the FOUNDATION phase (P0+P1). Windowing is flag-gated OFF: `planWindow`
-// returns "every cell mounted" whenever `virtualize` is false OR the viewport
-// metrics are absent, so the notebook renders byte-identically to the eager
+// Windowing (P2) and the pinned set (P3, below) are live but flag-gated OFF:
+// `planWindow` returns "every cell mounted" whenever `virtualize` is false OR the
+// viewport metrics are absent, so the notebook renders byte-identically to the eager
 // `{#each}`. Actual spacer coalescing only runs when a caller opts in AND supplies
-// live `viewportTop`/`viewportHeight` — wired but dormant at this phase.
+// live `viewportTop`/`viewportHeight`.
 //
 // INVARIANT (enforce in review): this module is render-only. It never reads from,
 // gates on, or mutates the document model (`cells`). Heights flow in from measured
@@ -59,7 +59,7 @@ export interface PlanWindowArgs {
 	viewportHeight?: number;
 	/** Extra px mounted above and below the viewport. */
 	overscanPx?: number;
-	/** Cells forced into the mounted set wherever they are (running / active / scroll target). */
+	/** Cells forced into the mounted set wherever they are (the `pinnedCellIds` union). */
 	pinned?: Set<string>;
 	/**
 	 * Vertical gap (px) the flow renders between adjacent cells (the `space-y-4`
