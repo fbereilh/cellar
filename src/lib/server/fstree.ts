@@ -22,6 +22,7 @@ import {
 } from 'node:fs';
 import { join, resolve, relative, sep, basename, dirname, extname } from 'node:path';
 import { isHtmlPath } from '$lib/htmlPreview';
+import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES } from '$lib/server/limits.js';
 
 // Directories that are noise for a workspace file tree.
 const IGNORE_DIRS = new Set([
@@ -36,27 +37,15 @@ const IGNORE_DIRS = new Set([
 ]);
 
 const MAX_DEPTH = 8; // guard against pathological deep trees
-const MAX_FILE_BYTES = 2 * 1024 * 1024; // don't stream giant files into a tab
 
 /**
- * The one deliberate exception to `MAX_FILE_BYTES`, scoped to `.html`/`.htm`.
- *
- * An HTML tab's whole point is the rendered preview of a SELF-CONTAINED export,
- * and self-contained is exactly what makes those files big: plotly's
- * `write_html(include_plotlyjs=True)` inlines the full bundle (~3.5 MB), bokeh
- * with `INLINE` resources and an nbconvert report with base64 figures clear
- * 2 MB routinely, and Cellar's own `export_html` inlines its images as data
- * URIs. At the ordinary cap the feature refuses precisely the files it exists
- * to open. The ceiling is raised, not removed — a `srcdoc` of unbounded size is
- * still a browser tab full of string.
+ * Byte ceiling for opening `relPath` into a tab. HTML gets the higher one (see
+ * `limits.js` for why, and for the save-side limit derived from it).
  *
  * Identity comes from the same `isHtmlPath` the rest of the feature resolves
  * (preview kind, syntax highlighting, the file icon), so there is one answer to
  * "is this an HTML file" and never an ad-hoc extension test here.
  */
-const MAX_HTML_FILE_BYTES = 15 * 1024 * 1024;
-
-/** Byte ceiling for opening `relPath` into a tab. HTML gets the higher one. */
 function maxFileBytesFor(relPath: string): number {
 	return isHtmlPath(relPath) ? MAX_HTML_FILE_BYTES : MAX_FILE_BYTES;
 }

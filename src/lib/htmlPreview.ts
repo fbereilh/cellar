@@ -35,7 +35,8 @@ export function isHtmlPath(path: string): boolean {
 /**
  * Elements whose `src` (or, for `<link>`, `href`) makes the browser FETCH a
  * subresource. Plain `<a href>` is deliberately excluded: a relative link is a
- * navigation the user has not asked for yet, not a broken render.
+ * navigation the user has not asked for yet, not a broken render. `<link>` is
+ * further narrowed by its `rel` (see `LINK_FETCH_RELS`).
  *
  * `<script>`/`<style>` are here for their own attributes; their BODIES are
  * skipped separately (see `RAW_TEXT_TAGS`).
@@ -56,16 +57,39 @@ const SUBRESOURCE_TAGS = new Set([
 ]);
 
 /**
- * Elements whose CONTENT a browser never parses as markup, so neither may this
- * scan: a self-contained export inlines a minified bundle whose string literals
- * build `<img src="…">` markup, and reporting that would put the notice on
- * exactly the file the preview targets. `<textarea>`/`<title>` are the same
- * class — displayed text that merely looks like a tag.
+ * Elements whose CONTENT the scan must not read as live markup: a self-contained
+ * export inlines a minified bundle whose string literals build `<img src="…">`
+ * markup, and reporting that would put the notice on exactly the file the
+ * preview targets. `<textarea>`/`<title>` are the same class — displayed text
+ * that merely looks like a tag.
+ *
+ * `<template>` is here for the same OUTCOME by a different route: its content IS
+ * parsed as markup, but into an inert fragment that fetches nothing until a
+ * script clones it. (A nested `<template>` ends the skip at the inner close —
+ * accepted, since it only returns the scan to today's behavior.)
  */
-const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'title']);
+const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'title', 'template']);
 
 /** The attribute NAMES that carry a fetched URL. Longest is 4 chars (`href`). */
 const URL_ATTRS = new Set(['src', 'href', 'data']);
+
+/**
+ * The `<link>` relations a browser fetches to RENDER the page. A `<link>` is the
+ * one subresource element whose `href` may just as well be metadata: `canonical`
+ * and `alternate` are never fetched at all, and `icon` is chrome, not content —
+ * a missing favicon is not a broken render. Reporting those would be an
+ * over-report, the direction this module's contract singles out as the one to
+ * avoid, so an unrecognized (or absent) `rel` does NOT convict.
+ */
+const LINK_FETCH_RELS = new Set(['stylesheet', 'preload', 'modulepreload']);
+
+/** True when a `<link>`'s (possibly multi-token, possibly empty) `rel` fetches. */
+function linkFetchesToRender(rel: string): boolean {
+	for (const token of rel.split(/\s+/)) {
+		if (token && LINK_FETCH_RELS.has(token)) return true;
+	}
+	return false;
+}
 
 /** ASCII letter or digit — the only characters a tag name is scanned from. */
 const NAME_CHAR = /[a-z0-9]/i;
@@ -97,7 +121,8 @@ function resolvesWithoutFolder(url: string): boolean {
 /**
  * Walk one tag's attributes from just after its name, QUOTE-AWARE, and report
  * where the tag ends plus (when `wantUrls`) whether a URL attribute holds a
- * folder-relative ref.
+ * folder-relative ref and (when `wantRel`) the tag's `rel` value — read in the
+ * same pass because attribute order is arbitrary (`<link href=… rel=…>`).
  *
  * Respecting quotes is what keeps a self-contained export off the notice: a
  * value may legally contain `>` (an inline `data:image/svg+xml` URI carries a
@@ -109,13 +134,19 @@ function resolvesWithoutFolder(url: string): boolean {
  * Nothing is allocated per attribute unless the name is the length of one of
  * `src`/`href`/`data`, nor per value unless that name is one of them.
  */
-function scanTag(html: string, start: number, wantUrls: boolean): { end: number; relative: boolean } {
+function scanTag(
+	html: string,
+	start: number,
+	wantUrls: boolean,
+	wantRel: boolean
+): { end: number; relative: boolean; rel: string } {
 	const n = html.length;
 	let i = start;
 	let relative = false;
+	let rel = '';
 	while (i < n) {
 		const c = html[i];
-		if (c === '>') return { end: i + 1, relative };
+		if (c === '>') return { end: i + 1, relative, rel };
 		if (isSpace(c) || c === '/') {
 			i++;
 			continue;
@@ -145,14 +176,21 @@ function scanTag(html: string, start: number, wantUrls: boolean): { end: number;
 			valueEnd = i;
 		}
 
-		if (wantUrls && !relative && (nameLen === 3 || nameLen === 4)) {
+		if ((wantUrls || wantRel) && (nameLen === 3 || nameLen === 4)) {
 			const name = html.slice(nameStart, nameStart + nameLen).toLowerCase();
-			if (URL_ATTRS.has(name) && !resolvesWithoutFolder(html.slice(valueStart, valueEnd))) {
+			if (wantRel && name === 'rel') {
+				rel = html.slice(valueStart, valueEnd).trim().toLowerCase();
+			} else if (
+				wantUrls &&
+				!relative &&
+				URL_ATTRS.has(name) &&
+				!resolvesWithoutFolder(html.slice(valueStart, valueEnd))
+			) {
 				relative = true;
 			}
 		}
 	}
-	return { end: n, relative };
+	return { end: n, relative, rel };
 }
 
 /**
@@ -180,13 +218,14 @@ function rawTextEnd(html: string, from: number, tag: string): number {
  * the file on disk — i.e. content the sandboxed preview cannot resolve. A
  * self-contained export (everything inline, or CDN URLs) returns false.
  *
- * Markup-shaped text that a browser never treats as markup — an HTML comment, a
- * raw-text body (`<script>`/`<style>`/`<textarea>`/`<title>`), or the inside of
- * an attribute VALUE — is skipped, so an inlined bundle cannot fake a reference
- * the page does not actually load. Under-reporting is the safe direction: a false notice on a
- * genuinely self-contained export is worse than a missing one, so anything the
- * scan cannot read confidently (an unterminated comment, quote or raw-text body)
- * ends the scan rather than convicting.
+ * Markup a browser never fetches from — an HTML comment, an inert body
+ * (`<script>`/`<style>`/`<textarea>`/`<title>`/`<template>`), the inside of an
+ * attribute VALUE, or a `<link>` whose `rel` the browser does not fetch to
+ * render — is skipped, so an inlined bundle cannot fake a reference the page
+ * does not actually load. Under-reporting is the safe direction: a false notice
+ * on a genuinely self-contained export is worse than a missing one, so anything
+ * the scan cannot read confidently (an unterminated comment, quote or raw-text
+ * body) ends the scan rather than convicting.
  *
  * Known misses, deliberately not chased — each needs its own parsing, and a
  * missed ref costs only the notice, not the render: `<img srcset>` (a
@@ -219,8 +258,9 @@ export function hasRelativeAssetRefs(html: string): boolean {
 		}
 
 		const tag = nameLen <= MAX_TAG_LEN ? html.slice(nameStart, p).toLowerCase() : '';
-		const scanned = scanTag(html, p, SUBRESOURCE_TAGS.has(tag));
-		if (scanned.relative) return true;
+		const isLink = tag === 'link';
+		const scanned = scanTag(html, p, SUBRESOURCE_TAGS.has(tag), isLink);
+		if (scanned.relative && (!isLink || linkFetchesToRender(scanned.rel))) return true;
 		i = scanned.end;
 
 		if (RAW_TEXT_TAGS.has(tag)) {

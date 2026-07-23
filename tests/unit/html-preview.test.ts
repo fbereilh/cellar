@@ -168,6 +168,37 @@ describe('hasRelativeAssetRefs', () => {
 		expect(hasRelativeAssetRefs('<img title=\'use href="a/b.css"\' src="https://x/y.png">')).toBe(false);
 	});
 
+	// A <link>'s href is only a subresource for the relations the browser fetches
+	// to RENDER the page. `canonical`/`alternate` are never fetched, and a missing
+	// favicon is not a broken render — reporting them would be the over-report the
+	// module's contract singles out as the one to avoid.
+	it('scans a <link> href only for the relations that fetch to render', () => {
+		expect(hasRelativeAssetRefs('<link rel="stylesheet" href="assets/style.css">')).toBe(true);
+		expect(hasRelativeAssetRefs('<link rel="preload" as="font" href="fonts/a.woff2">')).toBe(true);
+		expect(hasRelativeAssetRefs('<link rel="modulepreload" href="./app.js">')).toBe(true);
+		// Order-independent (attributes are read in one pass) and multi-token rels count.
+		expect(hasRelativeAssetRefs('<link href="assets/style.css" rel="stylesheet">')).toBe(true);
+		expect(hasRelativeAssetRefs('<link rel="  preload  stylesheet " href="a/b.css">')).toBe(true);
+		expect(hasRelativeAssetRefs('<link REL=Stylesheet HREF=a/b.css>')).toBe(true);
+
+		for (const rel of ['canonical', 'alternate', 'icon', 'shortcut icon', 'manifest', 'author']) {
+			expect(hasRelativeAssetRefs(`<link rel="${rel}" href="index.html">`)).toBe(false);
+		}
+		// No rel at all is unrecognized too, so it does not convict.
+		expect(hasRelativeAssetRefs('<link href="index.html">')).toBe(false);
+		// A non-fetching <link> never masks a real ref elsewhere.
+		expect(
+			hasRelativeAssetRefs('<link rel="canonical" href="index.html"><img src="figures/a.png">')
+		).toBe(true);
+	});
+
+	// <template> content is parsed as markup but into an inert fragment: nothing
+	// is fetched until a script clones it.
+	it('ignores refs inside a <template> body', () => {
+		expect(hasRelativeAssetRefs('<template><img src="figures/a.png"></template>')).toBe(false);
+		expect(hasRelativeAssetRefs('<template><x></template><img src="figures/a.png">')).toBe(true);
+	});
+
 	// Under-reporting is the safe direction: these render broken with no notice,
 	// which is documented at the seam rather than chased.
 	it('misses srcset/poster/CSS url() by design (documented limits)', () => {
@@ -252,6 +283,60 @@ describe('readWorkspaceFile size caps', () => {
 	it('still refuses a non-HTML text file above the ordinary cap', () => {
 		expect(() => readWorkspaceFile('big.txt')).toThrow(/too large/);
 		expect(readWorkspaceFile('small.txt').length).toBe(1 * MB);
+	});
+});
+
+/**
+ * The read cap and the save cap are one pair: a file big enough to OPEN in an
+ * editable Source view must fit through the request body the save PUTs back, or
+ * the tab offers an edit it can never persist. adapter-node's own default
+ * (512 K) rejects that body before the route handler runs, so the failure is not
+ * even ours to report — hence both halves below: the launcher must raise the
+ * limit, and the tab must say so when a save is refused anyway.
+ */
+describe('save path keeps up with the raised read cap', () => {
+	it('derives the request-body limit from the HTML file cap, with headroom', async () => {
+		const { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES, MAX_REQUEST_BODY_BYTES } = await import(
+			'../../src/lib/server/limits.js'
+		);
+		expect(MAX_HTML_FILE_BYTES).toBeGreaterThan(MAX_FILE_BYTES);
+		// Strictly larger, not equal: `JSON.stringify({path, content})` escapes the
+		// content and carries the path, so a body is always bigger than its file.
+		expect(MAX_REQUEST_BODY_BYTES).toBeGreaterThan(MAX_HTML_FILE_BYTES);
+		// Bounded, not blown open: headroom for escaping, not an open door.
+		expect(MAX_REQUEST_BODY_BYTES).toBeLessThanOrEqual(MAX_HTML_FILE_BYTES * 3);
+		// And above adapter-node's 512 K default, which is what makes this necessary.
+		expect(MAX_REQUEST_BODY_BYTES).toBeGreaterThan(512 * 1024);
+	});
+
+	// Source-level, like the sandbox guard: the launcher is what ships the limit,
+	// and a literal typed here instead of the derived constant is exactly how the
+	// two caps would silently drift apart again.
+	it('the launcher passes that derived limit to the app, respecting an operator value', () => {
+		const src = readFileSync(join(REPO, 'bin/cellar.js'), 'utf8');
+		expect(src).toContain("from '../src/lib/server/limits.js'");
+		expect(src).toMatch(
+			/BODY_SIZE_LIMIT:\s*process\.env\.BODY_SIZE_LIMIT\s*\|\|\s*String\(MAX_REQUEST_BODY_BYTES\)/
+		);
+	});
+
+	// A save that fails must not be silent (it used to write into a variable the
+	// template only rendered for a LOAD error) and must not turn an open document
+	// into an error view either.
+	it('the file tab surfaces a save failure in its header, apart from load errors', () => {
+		const src = readFileSync(join(REPO, 'src/lib/FileTab.svelte'), 'utf8');
+		// Its own state, rendered in the header.
+		expect(src).toMatch(/let saveError = \$state\(''\)/);
+		expect(src).toContain('data-testid="file-save-error"');
+		// The catch writes the save error, never `errorMsg`/`status` (the load view).
+		const saveFn = src.slice(src.indexOf('async function save()'), src.indexOf('// ---- Git change bars'));
+		expect(saveFn).toContain('saveError = String');
+		expect(saveFn).not.toContain('errorMsg =');
+		expect(saveFn).not.toMatch(/(^|[^.\w])status\s*=\s*['"]/);
+		// Oversize is keyed off the status code, not off parsing a body that a 413
+		// from the server front-end does not carry.
+		expect(saveFn).toContain('res.status === 413');
+		expect(saveFn).toContain('file too large to save');
 	});
 });
 

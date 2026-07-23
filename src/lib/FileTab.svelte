@@ -42,6 +42,10 @@
 	let view = $state.raw<EditorView | null>(null);
 	let status = $state<'loading' | 'ready' | 'error'>('loading');
 	let errorMsg = $state('');
+	// Kept apart from `errorMsg`/`status`: a failed SAVE must not make a perfectly
+	// loaded document render as a load error, and it must not be silent either —
+	// it shows in the header, where the user just clicked Save.
+	let saveError = $state('');
 	let dirty = $state(false);
 	let saving = $state(false);
 	let savedFlash = $state(false);
@@ -140,6 +144,7 @@
 	async function save() {
 		if (saving || !view) return;
 		saving = true;
+		saveError = '';
 		try {
 			const content = view.state.doc.toString();
 			const res = await fetch('/api/fs/file', {
@@ -148,8 +153,12 @@
 				body: JSON.stringify({ path, content })
 			});
 			if (!res.ok) {
-				const body = (await res.json().catch(() => ({}))) as { message?: string };
-				throw new Error(body?.message || 'save failed');
+				// An oversize body is rejected by the server BEFORE the route runs, so
+				// it carries no JSON message of ours — key it off the status, never off
+				// parsing the body (that parse is what used to swallow the failure).
+				if (res.status === 413) throw new Error('file too large to save');
+				const body = (await res.json().catch(() => null)) as { message?: string } | null;
+				throw new Error(body?.message || `save failed (${res.status})`);
 			}
 			setDirty(false);
 			savedFlash = true;
@@ -158,7 +167,7 @@
 			// stop reading "Not Committed Yet" only where git agrees they moved.
 			loadBlame();
 		} catch (err) {
-			errorMsg = String((err as Error)?.message ?? err);
+			saveError = String((err as Error)?.message ?? err);
 		} finally {
 			saving = false;
 		}
@@ -311,6 +320,7 @@
 				</div>
 			{/if}
 			{#if savedFlash}<span class="text-success">saved</span>{/if}
+			{#if saveError}<span class="text-error" title={saveError} data-testid="file-save-error">{saveError}</span>{/if}
 			<button class="btn btn-xs btn-ghost gap-1" onclick={save} disabled={saving || status !== 'ready'} data-testid="file-save">
 				{saving ? 'saving…' : 'Save'}
 				<kbd class="kbd kbd-xs">⌘S</kbd>

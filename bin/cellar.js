@@ -113,6 +113,7 @@ import {
 	scanUntrackedCellarProcesses,
 	isIsolatedEnv
 } from '../src/lib/server/instances.js';
+import { MAX_REQUEST_BODY_BYTES } from '../src/lib/server/limits.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -766,7 +767,13 @@ async function main() {
 		// Self-exit hook: the app watches this pid and exits if the launcher dies
 		// uncleanly (parent-watch.js), so it never lingers orphaned serving stale code.
 		CELLAR_LAUNCHER_PID: String(process.pid),
-		PORT: String(appPort)
+		PORT: String(appPort),
+		// adapter-node caps a request body at 512 K by default, which rejects a file
+		// save long before the read caps in limits.js do — an HTML export big enough
+		// to be worth previewing would open in an editable Source view and then fail
+		// to save. Derived from that same file cap so the two can't drift; an
+		// operator-set value wins.
+		BODY_SIZE_LIMIT: process.env.BODY_SIZE_LIMIT || String(MAX_REQUEST_BODY_BYTES)
 	};
 
 	let app;

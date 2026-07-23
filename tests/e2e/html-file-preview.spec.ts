@@ -138,6 +138,25 @@ test('an .html file opens as a sandboxed preview, toggles to an editable source 
 	await expect(frame2.locator('body')).toContainText('EDITED-IN-SOURCE-MODE');
 	await expect(frame2.locator('#plot')).toHaveText('RENDERED-BY-SCRIPT');
 
+	// ---- A refused save is VISIBLE, and does not become a load error ---------
+	// The real trigger is an oversize body, which the server front-end rejects
+	// with 413 before the route runs; a 15 MB fixture would cost far more than it
+	// proves, so the response is what is faked here, not the mechanism.
+	await page.getByTestId('file-view-source').click();
+	await page.route('**/api/fs/file', async (route) => {
+		if (route.request().method() !== 'PUT') return route.fallback();
+		await route.fulfill({ status: 413, contentType: 'text/plain', body: 'Payload Too Large' });
+	});
+	await editor.click();
+	await page.keyboard.type('x');
+	await page.getByTestId('file-save').click();
+
+	await expect(page.getByTestId('file-save-error')).toHaveText('file too large to save');
+	// The document is still open and editable — a failed save is not a failed load.
+	await expect(page.getByTestId('file-error')).toHaveCount(0);
+	await expect(editor).toBeVisible();
+	await page.unroute('**/api/fs/file');
+
 	// ---- Regression: a non-HTML file is untouched ---------------------------
 	// The edited `report.html` tab was promoted to permanent, so it stays mounted
 	// (hidden) behind the new tab — scope these to what is actually on screen.
