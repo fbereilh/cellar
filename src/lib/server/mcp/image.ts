@@ -1,7 +1,7 @@
 /**
  * Server-side image handling for the MCP agent surface.
  *
- * Three jobs, all about IMAGE TOKENS:
+ * Four jobs, all about IMAGE TOKENS:
  *
  *  1. `downscaleImageForBlock` shrinks an oversized PNG (a retina / high-DPI
  *     matplotlib figure) down to a bounded longest edge BEFORE it becomes an MCP
@@ -13,10 +13,14 @@
  *
  *  2. `buildImageBlocks` is the ONE policy seam deciding which of a cell's image
  *     outputs actually become MCP image blocks, and at what size — the mime
- *     allowlist, the per-result count cap, and the byte/dimension ceilings. Every
- *     tool that ships images (run_cell / add_and_run / get_full_output) goes
- *     through it, so the cost bound cannot drift between them. Anything it
- *     declines is reported in `omitted` WITH a reason, never dropped silently -
+ *     allowlist, the per-result count cap, the per-image byte/dimension ceilings,
+ *     and the two AGGREGATE budgets that bound one whole reply
+ *     (IMAGE_RESULT_MAX_BYTES of shipped raster, MAX_RESULT_DECODE_PIXELS of
+ *     source pixels handed to the decoder - the ceilings bound ONE image, nothing
+ *     else bounded N). Every tool that ships images (run_cell / add_and_run /
+ *     get_full_output) goes through it, so the cost bound cannot drift between
+ *     them. Anything it declines is reported in `omitted` WITH a reason, never
+ *     dropped silently -
  *     though a consecutive run declined by the SAME aggregate bound collapses into
  *     one entry carrying a `count`, since dozens of identical notes are cost
  *     without information on the very path the caps exist to keep cheap.
@@ -31,9 +35,15 @@
  *     exactly the figure that did not fit.
  *
  *  3. `imagePlaceholder` builds the terse, image-token-free marker the scan read
- *     paths (map / read / search) show instead of the raster:
+ *     paths (map / read / search / errors) show instead of the raster:
  *     `[image/png, 1600×1200, 46 KB]` — enough for the agent to decide whether to
  *     fetch it, spending zero image tokens.
+ *
+ *  4. `canInlineImage` answers, from the header alone and with no decode, whether
+ *     job 2 would really SHOW this output. It is what a batch run's `has_image`
+ *     means: not "an image mime is present" but "a figure `get_full_output` can
+ *     display", so the flag never sends the agent on a round trip that hands back
+ *     the same placeholder it already had.
  *
  * Robustness doctrine (matches the imports/traceback parsers): every path is
  * fallback-safe. Anything we cannot cleanly decode/resize is returned UNTOUCHED,
@@ -44,8 +54,10 @@
  * package). It normalizes every PNG colour type (palette, grayscale, 16-bit,
  * interlaced) to 8-bit RGBA on read, so the resize path handles one pixel format
  * and can never mangle an exotic input. Only PNG is downscaled (matplotlib's
- * inline backend, and every other Cellar image path, emits PNG); JPEG/GIF/SVG
- * pass through and still get an enriched placeholder.
+ * inline backend, and every other Cellar image path, emits PNG); a JPEG/GIF ships
+ * unresampled when it is already inside the ceilings and is declined with a reason
+ * when it is not, while an SVG is outside the allowlist entirely and only ever
+ * shows its enriched placeholder.
  */
 import { PNG } from 'pngjs';
 
