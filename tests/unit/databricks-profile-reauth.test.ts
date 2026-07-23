@@ -570,4 +570,34 @@ describe('the auto-heal status surfaces name the expired profile', () => {
 		const panel = await pastLivenessTtl(() => dbx.getStatus(nb));
 		expect((panel.connection as Record<string, unknown>).reauth).toBeUndefined();
 	});
+
+	it('a renewed-but-compute-failed direct connect never keeps the stale expired-sign-in box', async () => {
+		const nb = await connectedNotebook('autoheal-renewed-connect.ipynb');
+		// The saved sign-in expires and the awaited heal records the verdict.
+		kernel.sessionExpired = true;
+		kernel.connectOk = false;
+		await pastLivenessTtl(() => dbx.agentStatus(nb));
+		expect(
+			((await pastLivenessTtl(() => dbx.getStatus(nb))).connection as Record<string, unknown>).reauth
+		).toBeDefined();
+
+		// The user renews the credential in a terminal, then - instead of Reconnect -
+		// uses the picker to connect to a cluster that fails for a NON-auth reason
+		// (a terminated cluster, a version mismatch). The credential is now valid, so
+		// this connect proves auth; its failure has nothing to do with the sign-in.
+		kernel.sessionExpired = false;
+		kernel.connectOk = false;
+		kernel.connectMessage = 'Unauthenticated: Invalid access token. Config: host=…, auth_type=pat';
+		await expect(
+			dbx.connect({ profile: 'DEFAULT', clusterId: '0710-abc123-xyz', clusterName: 'analytics', nb })
+		).rejects.toMatchObject({ code: 'auth_failed' });
+
+		// The stale reauth verdict must be gone: entering connect() retired it, and
+		// this failure never re-recorded one, so no surface may re-attach the box.
+		const agent = (await pastLivenessTtl(() => dbx.agentStatus(nb))) as Record<string, unknown>;
+		expect(agent.reauth_required).toBeUndefined();
+		expect(String(agent.note)).not.toContain('databricks auth login --profile DEFAULT');
+		const panel = await pastLivenessTtl(() => dbx.getStatus(nb));
+		expect((panel.connection as Record<string, unknown>).reauth).toBeUndefined();
+	});
 });

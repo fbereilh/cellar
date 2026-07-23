@@ -2493,6 +2493,13 @@ export async function connect({
 	if (s.inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
 	s.inFlight = true;
 	try {
+		// A recorded expired-profile verdict belongs to a PAST attempt. Retire it the
+		// instant a fresh connect begins, exactly as `reconnectSession` self-clears at
+		// entry, so a renewed-but-compute-failed connect (a terminated cluster, a
+		// version mismatch) can never render a stale "your sign-in expired" remedy
+		// over a credential this attempt is about to prove. A genuine expired profile
+		// re-records its own fresh verdict below (`reclassifyReauth` → `reconnectTo`).
+		s.reconnectError = null;
 		logInfo('databricks', `connecting: profile "${profile}", cluster "${clusterName || clusterId}"`);
 		// Part A (prevention): resolve the cluster's Databricks Runtime and pin a
 		// matching databricks-connect client BEFORE building the session, so a
