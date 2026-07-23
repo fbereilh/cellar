@@ -79,6 +79,15 @@ Use the fully-qualified `brew uninstall fbereilh/cellar/cellar` if another tap a
 
 > **Is `brew autoremove` safe?** Yes - it only removes formulae that were installed as another formula's dependency and are no longer needed by anything. Packages you installed on request are never touched, so a directly-installed `node` or `uv` stays. Run `brew autoremove --dry-run` first if you want to see the list before anything is removed.
 
+**Optional** - Homebrew doesn't own everything Cellar creates. To also remove Cellar's local data and the tap:
+
+```sh
+rm -rf ~/.cellar
+brew untap fbereilh/cellar
+```
+
+> **What's in `~/.cellar`?** Cellar's private Jupyter host env (`~/.cellar/host-venv`, which holds `jupyter-server` and is often hundreds of MB) and its instance registry (`~/.cellar/instances/`). Both are optional to delete - Cellar recreates them on the next run. Your projects' own `.venv` folders and notebooks live in your project directories and are never touched.
+
 ## Run with Docker
 
 Prefer to skip installing anything? If you have Docker, you have Cellar. This path needs **only Docker on the host** - no Node, Python, or `uv` - and bakes a **reproducible, pinned kernel environment** into the image so every run is identical. It's meant for single-user, reproducible, zero-prerequisite use: Cellar has one shared kernel and no auth, so it is **not** for multi-user hosting.
