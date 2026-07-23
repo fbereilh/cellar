@@ -12,6 +12,10 @@
  * the use site, never a blanket `any`.
  */
 
+import type { ImportChangeStamps } from './importBindings';
+
+export type { ImportChangeStamps };
+
 // --- cells + notebook document --------------------------------------------
 
 /** nbformat cell type as stored on disk. `sql` is a logical Cellar type that
@@ -79,13 +83,15 @@ export interface CellarNamespace {
 	/** Runtime-only wall-clock ms the source last changed (never persisted). */
 	editedAt?: number;
 	/**
-	 * Runtime-only, never persisted: per module-level import binding this cell
-	 * provides, the wall-clock ms that binding last CHANGED (added / rebound /
-	 * removed). An absent name has not changed since this document was loaded.
-	 * Feeds the staleness rule so an imports-cell edit stales only the cells that
-	 * read a name whose binding actually moved - see `importBindings.ts`.
+	 * Runtime-only, never persisted: this cell's last KNOWN-GOOD module-level import
+	 * bindings - per name, the canonical statement that bound it (null once removed)
+	 * and the wall-clock ms it last CHANGED (0 / an absent name = unchanged since
+	 * this document was loaded). It is the baseline every later edit is diffed
+	 * against, so a transient unparseable mid-edit snapshot cannot re-stamp
+	 * everything. Feeds the staleness rule so an imports-cell edit stales only the
+	 * cells that read a name whose binding actually moved - see `importBindings.ts`.
 	 */
-	importBindings?: Record<string, number>;
+	importBindings?: ImportChangeStamps;
 	[key: string]: unknown;
 }
 

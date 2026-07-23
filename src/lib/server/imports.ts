@@ -396,7 +396,18 @@ export function hasTopLevelImports(source: string | null | undefined): boolean {
  * is the overwhelmingly common shape).
  */
 export function isImportsOnly(source: string | null | undefined): boolean {
-	const { source: rest } = extractTopLevelImports(source);
+	return isImportsOnlyResidual(extractTopLevelImports(source).source);
+}
+
+/**
+ * The residual half of `isImportsOnly`: is what `extractTopLevelImports` LEFT
+ * BEHIND nothing but comments and blank lines?
+ *
+ * Exported so a caller that already ran the tokenizer (`importBindings.ts`, which
+ * needs both the verdict and the statements) reuses that one pass instead of
+ * paying for a second. It is the same exact test, never a regex approximation.
+ */
+export function isImportsOnlyResidual(rest: string): boolean {
 	return logicalLines(rest).every((l) => stripComments(l.raw).trim() === '');
 }
 

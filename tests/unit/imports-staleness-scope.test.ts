@@ -67,7 +67,13 @@ afterEach(() => vi.useRealTimers());
 
 /** Add a code cell after `after` and mark it as having run this session. */
 function ran(after: string | null, source: string, at = RAN_AT): string {
+	// A cell is born, THEN runs. `addCell` stamps the bindings its source introduces
+	// at creation time (a pasted `import polars as pd` really does rebind `pd`), so
+	// the clock has to reflect that ordering or every cell would look rebound after
+	// the run we are about to record.
+	vi.setSystemTime(at - 1);
 	const c = nb.addCell(after, 'code', abs, null, source);
+	vi.setSystemTime(RAN_AT + 1000); // every later edit lands after the last run
 	const cell = nb.listCells(abs).find((x) => x.id === c.id)!;
 	cell.metadata.cellar = { ...(cell.metadata.cellar ?? {}), lastRun: ranStamp(at) };
 	return c.id;
@@ -167,6 +173,39 @@ describe('an imports-cell edit stales only the affected dependents', () => {
 		const m = await staleness();
 		expect(state(m, usesSeed)).toBe(STALE_STATE.STALE);
 		expect(state(m, usesPd)).toBe(STALE_STATE.STALE);
+	});
+
+	it('a cell PASTED IN with a rebinding import stales its readers', async () => {
+		// `addCell` seeds a cell born with a source, not just `setSource`: a paste /
+		// split / undo-delete introduces its bindings the moment it lands. Without that
+		// stamp the new cell reads as "these bindings have not changed since the
+		// document loaded" and, being the nearest preceding definer of `pd`, would
+		// EXEMPT the very edge it just rebound - a false `fresh`.
+		const { imports, usesPd, usesNp } = notebook();
+		const pasted = nb.addCell(imports, 'code', abs, null, 'import polars as pd');
+		// It ran after every reader did, so only the exemption can decide this.
+		const cell = nb.listCells(abs).find((c) => c.id === pasted.id)!;
+		cell.metadata.cellar = { ...(cell.metadata.cellar ?? {}), lastRun: ranStamp(RAN_AT + 5000) };
+
+		const m = await staleness();
+		expect(state(m, usesPd)).toBe(STALE_STATE.STALE);
+		expect(state(m, usesNp)).toBe(STALE_STATE.FRESH); // `np` still comes from the imports cell
+	});
+
+	it('a transient unparseable mid-edit save does not re-stale the notebook', async () => {
+		// Cell.svelte autosaves on a 500ms debounce, so an intermediate snapshot of an
+		// imports-cell edit (here: the instant after a select-all) really is persisted.
+		// Folding against the cell's stored baseline rather than that snapshot is what
+		// keeps the settled edit precise instead of stamping every binding twice.
+		const { imports, usesPd, usesNp, joins } = notebook();
+		nb.setSource(imports, 'import ', abs); // mid-keystroke, binds nothing knowable
+		nb.setSource(imports, 'import pandas as pd\nimport numpy as np\nimport re', abs);
+
+		const m = await staleness();
+		expect(state(m, imports)).toBe(STALE_STATE.STALE); // edited after it ran
+		expect(state(m, usesPd)).toBe(STALE_STATE.FRESH);
+		expect(state(m, usesNp)).toBe(STALE_STATE.FRESH);
+		expect(state(m, joins)).toBe(STALE_STATE.FRESH);
 	});
 
 	it('a star-import is unanalyzable, so it stays conservative', async () => {

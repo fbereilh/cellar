@@ -40,18 +40,31 @@
  * (null) rather than merely omitting an entry - same "I don't understand this, so
  * don't touch it" rule `imports.ts` applies to a statement it cannot re-render.
  */
-import { extractTopLevelImports, isImportsOnly, parseImportStatement, type ImportRecord } from './imports';
+import { extractTopLevelImports, isImportsOnlyResidual, parseImportStatement, type ImportRecord } from './imports';
 
 /** name → the canonical rendering of the import record that binds it. */
 export type ImportSpecs = Map<string, string>;
 
+/** One name's last KNOWN-GOOD binding, plus when it last changed. */
+export interface ImportBinding {
+	/** The canonical import statement that binds the name, or null once it is gone. */
+	spec: string | null;
+	/**
+	 * Wall-clock ms the binding last CHANGED (added, rebound, removed). 0 means it
+	 * has not changed since Cellar started watching this document, which is exactly
+	 * the reading a downstream cell needs - its `lastRun` cannot predate that.
+	 */
+	at: number;
+}
+
 /**
- * The runtime-only stamp map stored on a cell: name → wall-clock ms its import
- * binding last CHANGED (added, rebound, or removed). A name absent from the map
- * has not changed since Cellar started watching this document, which is exactly
- * the reading a downstream cell needs - its `lastRun` cannot predate that.
+ * The runtime-only map stored on a cell: name → its last known-good binding.
+ *
+ * It is a BASELINE, not just a change log: it records every name the cell was last
+ * PROVEN to bind, so a fold is always knowable-vs-knowable even when the cell's
+ * current source is not (see `foldImportChange`).
  */
-export type ImportChangeStamps = Record<string, number>;
+export type ImportChangeStamps = Record<string, ImportBinding>;
 
 /** The name an import record binds at module scope (`import a.b` binds `a`). */
 function boundName(rec: ImportRecord): string | null {
@@ -70,13 +83,15 @@ function boundName(rec: ImportRecord): string | null {
  */
 export function importBindingSpecs(source: string | null | undefined): ImportSpecs | null {
 	const src = source ?? '';
+	// ONE tokenizer pass answers both halves: what was lifted, and what was left.
 	// Anything else at module scope could rebind an imported name; we cannot prove
 	// otherwise without re-deriving Python's binding rules, so we do not try.
-	if (!isImportsOnly(src)) return null;
+	const extracted = extractTopLevelImports(src);
+	if (!isImportsOnlyResidual(extracted.source)) return null;
 	const specs: ImportSpecs = new Map();
 	// `statements` is one canonical, deduplicated statement per bound name, in
 	// document order - so each entry is exactly one binding and is its own spec.
-	for (const statement of extractTopLevelImports(src).statements) {
+	for (const statement of extracted.statements) {
 		const recs = parseImportStatement(statement);
 		if (!recs || recs.length !== 1) return null; // never expected; degrade rather than guess
 		const name = boundName(recs[0]);
@@ -87,18 +102,62 @@ export function importBindingSpecs(source: string | null | undefined): ImportSpe
 }
 
 /**
- * Fold one source edit into a cell's import-change stamps.
+ * The baseline a fold compares against: the cell's stored last known-good bindings
+ * when it has any, else the ones its previous source provides (the very first fold
+ * of a cell, whose runtime stamps were never written or were stripped on load).
+ *
+ * Null means we have no proven picture of what this cell bound - no stamps yet AND
+ * an unknowable previous source - so nothing about it may be certified stable.
+ */
+function baselineOf(
+	prev: ImportChangeStamps | undefined | null,
+	prevSource: string | null | undefined
+): ImportChangeStamps | null {
+	if (prev && Object.keys(prev).length) return { ...prev };
+	const specs = importBindingSpecs(prevSource);
+	if (!specs) return null;
+	const out: ImportChangeStamps = {};
+	for (const [name, spec] of specs) out[name] = { spec, at: 0 };
+	return out;
+}
+
+/**
+ * Fold one source edit into a cell's import bindings.
  *
  * A name keeps its previous stamp when its binding is byte-identical before and
  * after (so re-rendering, reordering, or re-adding an import that was already
  * there changes nothing) and takes `now` when it was added, rebound, or REMOVED.
- * A removed name stays in the map: its disappearance is a change downstream cells
- * must see, and forgetting it is precisely the false `fresh` this mechanism exists
- * to prevent.
+ * A removed name stays in the map with a null spec: its disappearance is a change
+ * downstream cells must see, and forgetting it is precisely the false `fresh` this
+ * mechanism exists to prevent.
  *
- * When either side is UNKNOWABLE (`importBindingSpecs` returned null) every name
- * either side mentions is stamped `now` - we cannot prove any binding survived, so
- * none may be certified stable.
+ * THE COMPARISON IS ALWAYS KNOWABLE-VS-KNOWABLE, and that is load-bearing. The
+ * fold diffs the new source against the cell's STORED baseline, never against the
+ * previous source text, because a cell's persisted source is routinely an unusable
+ * mid-edit snapshot: `Cell.svelte` autosaves on a 500ms debounce, so the instant
+ * after a select-all, or a pause after typing a bare `import `, reaches this
+ * function. Stamping every name whenever a side is unknowable (what this used to
+ * do) made that transient snapshot permanently re-stamp every binding - the exact
+ * blanket-stale this mechanism exists to remove.
+ *
+ * So an UNKNOWABLE next source changes nothing: the last known-good baseline is
+ * frozen and returned as-is, and the real delta is computed once the source parses
+ * again. That cannot certify anything falsely fresh in the meantime, because
+ * staleness only ever exempts a name that the CURRENT source still provides as an
+ * import binding (`dataflow`'s `imports`, i.e. `importBindingNames`, which is empty
+ * for an unknowable source) - so while the cell is mid-edit it grants no exemption
+ * at all and every edge out of it stays conservative.
+ *
+ * An unknowable BASELINE (a cell that has never been proven imports-only) is the
+ * one stamp-everything case left: nothing is known to have survived, so every name
+ * the new source binds is stamped `now`.
+ *
+ * The freeze's one blind spot, and it is the SAME family as the limit `staleness.ts`
+ * already documents for a deleted definer: an edit that both stops being analyzable
+ * AND drops a binding records no change for the dropped name, so a reader of it -
+ * which now has no definer at all, and no edge - stays `fresh`. Closing that would
+ * take a second per-name field (last real change vs. last unprovable), which buys a
+ * contrived case at the cost of the mechanism's whole point.
  */
 export function foldImportChange(
 	prevSource: string | null | undefined,
@@ -106,18 +165,23 @@ export function foldImportChange(
 	prev: ImportChangeStamps | undefined | null,
 	now: number
 ): ImportChangeStamps {
-	const before = importBindingSpecs(prevSource);
+	const baseline = baselineOf(prev, prevSource);
 	const after = importBindingSpecs(nextSource);
-	const out: ImportChangeStamps = { ...(prev ?? {}) };
+	// Unknowable now: freeze what we last proved rather than invent a change.
+	if (!after) return baseline ?? { ...(prev ?? {}) };
 
-	const names = new Set<string>([...Object.keys(out), ...(before?.keys() ?? []), ...(after?.keys() ?? [])]);
+	const out: ImportChangeStamps = {};
+	const names = new Set<string>([...Object.keys(baseline ?? {}), ...after.keys()]);
 	for (const name of names) {
-		if (!before || !after) {
-			out[name] = now; // unknowable on either side ⇒ nothing is provably stable
+		// A name absent from the baseline and one the baseline records as REMOVED are
+		// the same fact - it was not bound before - so both compare as null.
+		const before = baseline ? (baseline[name]?.spec ?? null) : undefined;
+		const spec = after.get(name) ?? null;
+		if (before !== undefined && before === spec) {
+			out[name] = baseline?.[name] ?? { spec, at: 0 };
 			continue;
 		}
-		if (before.get(name) === after.get(name)) continue; // unchanged (absent on both sides included)
-		out[name] = now;
+		out[name] = { spec, at: now };
 	}
 	return out;
 }

@@ -35,6 +35,7 @@ import type {
 	CellOutput,
 	CellMetadata,
 	CellarNamespace,
+	ImportChangeStamps,
 	LogicalCellType,
 	LastRun,
 	NotebookDoc,
@@ -109,13 +110,35 @@ function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCella
 	// 'sql' is a LOGICAL type: an nbformat `code` cell tagged cellar.language='sql'
 	// (see $lib/cellLanguage.js). markdown/code map to their nbformat cell_type.
 	const isSql = cellType === 'sql';
-	return {
+	const cell: CellWithCellar = {
 		id: mintId(),
 		cell_type: cellType === 'markdown' ? 'markdown' : 'code',
 		source: typeof source === 'string' ? source : '',
 		outputs: [],
 		metadata: { cellar: { extract: false, visible: true, ...(isSql ? { language: SQL_LANGUAGE } : {}) } }
 	};
+	// A cell born WITH a source (paste / split / undo-delete) introduces every
+	// binding it holds right now, so it is stamped here for the same reason
+	// `setSource` stamps an edit: without it the cell reads as "these bindings have
+	// not changed since the document loaded", and a pasted `import polars as pd`
+	// above a reader of `pd` would exempt the very edge it just rebound - the one
+	// verdict staleness must never invent. Folded from an EMPTY previous source: the
+	// cell did not exist before, so nothing about it was ever proven stable.
+	setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()));
+	return cell;
+}
+
+/**
+ * Store (or clear) a cell's runtime-only import-binding baseline.
+ *
+ * An empty map is stored as ABSENT rather than `{}`: it says exactly the same
+ * thing (nothing proven, nothing changed) and every ordinary code cell would
+ * otherwise ship a useless object to the browser on each `cell:edited`, and carry
+ * it into every deep-cloned checkpoint snapshot.
+ */
+function setImportBindings(cellar: CellarNamespace, stamps: ImportChangeStamps): void {
+	if (Object.keys(stamps).length) cellar.importBindings = stamps;
+	else delete cellar.importBindings;
 }
 
 /**
@@ -827,16 +850,15 @@ export function setSource(id: string, source: string, nb?: string | null, origin
 		cell.metadata.cellar.editedAt = now;
 		// …and the per-NAME refinement of that stamp for module-level import bindings.
 		// `editedAt` alone makes an imports-cell edit stale every cell below it (it
-		// defines a name almost all of them use); folding the before/after binding sets
-		// records WHICH names actually moved, so staleness can transmit only along the
-		// edges that carry one. Same runtime-only contract as `editedAt`. Cheap (a
-		// tokenizer pass over one cell) and it must happen here: `prevSource` exists
-		// nowhere else.
-		cell.metadata.cellar.importBindings = foldImportChange(
-			prevSource,
-			source,
-			cell.metadata.cellar.importBindings,
-			now
+		// defines a name almost all of them use); folding the new source against the
+		// cell's last known-good baseline records WHICH names actually moved, so
+		// staleness can transmit only along the edges that carry one. Same runtime-only
+		// contract as `editedAt`. Cheap (a tokenizer pass over one cell). `prevSource`
+		// only ever SEEDS a baseline the cell does not have yet - a mid-edit snapshot is
+		// never compared against, see `foldImportChange`.
+		setImportBindings(
+			cell.metadata.cellar,
+			foldImportChange(prevSource, source, cell.metadata.cellar.importBindings, now)
 		);
 		persist(doc);
 		emit(doc, 'cell:edited', { cellId: id, source }, originId);

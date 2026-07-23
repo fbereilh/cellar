@@ -73,11 +73,21 @@
  *    `importlib.reload` (or a module with import-time side effects) breaks. Both
  *    are deliberate, explicit acts; treating them as ordinary would give back the
  *    blanket-stale this exists to remove.
+ *  - REMOVAL is only covered while the cell that provided the name survives. The
+ *    ledger below reads `importBindings` off that cell, so DELETING the imports
+ *    cell outright takes its stamps with it: its readers then have no definer, no
+ *    ledger entry, and report `fresh`. This is pre-existing (a deleted definer
+ *    never produced an edge either, so nothing changed here), but it is asymmetric
+ *    with the in-cell removal ledger - do not read that ledger as covering removal
+ *    in general. Same family: an edit that drops a binding AND leaves the cell
+ *    unanalyzable in one step records no change for the dropped name (see
+ *    `foldImportChange`), so its readers - which have no definer either - stay
+ *    `fresh` too.
  *  - Redefinition resolves to that nearest preceding definer, which is correct
  *    for the common top-to-bottom notebook and approximate for out-of-order runs.
  */
 
-import type { Cell, LastRun, SessionId } from '$lib/server/types';
+import type { Cell, ImportChangeStamps, LastRun, SessionId } from '$lib/server/types';
 import { buildDefinerGraph, type Dataflow } from '$lib/symbolGraph';
 
 export type { Dataflow };
@@ -114,7 +124,7 @@ const lastRunOf = (cell: StaleCell | undefined | null): LastRun | null =>
 	cell?.metadata?.cellar?.lastRun ?? null;
 const editedAtOf = (cell: StaleCell | undefined | null): number | null =>
 	cell?.metadata?.cellar?.editedAt ?? null;
-const importStampsOf = (cell: StaleCell | undefined | null): Record<string, number> =>
+const importStampsOf = (cell: StaleCell | undefined | null): ImportChangeStamps =>
 	cell?.metadata?.cellar?.importBindings ?? {};
 
 /**
@@ -129,8 +139,9 @@ const importStampsOf = (cell: StaleCell | undefined | null): Record<string, numb
  * A name is exempt only under a property strong enough to survive re-execution: it
  * is bound by a MODULE-LEVEL import (`importDefines`), so its value is a pure
  * function of its import statement, AND that statement has not changed since this
- * cell ran (`importBindings[name] <= at`; an absent stamp means it has not changed
- * since the document was loaded, which no `lastRun` can predate). Re-running such
+ * cell ran (`importBindings[name].at <= at`; an absent stamp, or a 0 one, means it
+ * has not changed since the document was loaded, which no `lastRun` can predate).
+ * Re-running such
  * an import rebinds the same `sys.modules` entry, so the reader's saved result
  * still reflects its input.
  *
@@ -150,7 +161,7 @@ function edgeCarriesChange(
 	const stamps = importStampsOf(up);
 	for (const name of names) {
 		if (!importDefines.has(name)) return true; // not an import binding
-		if ((stamps[name] ?? 0) > at) return true; // its import statement moved after we ran
+		if ((stamps[name]?.at ?? 0) > at) return true; // its import statement moved after we ran
 	}
 	return false;
 }
@@ -207,7 +218,7 @@ export function computeStaleness(
 	// construction (no need to guard against cycles).
 	const stale: boolean[] = new Array(codeCells.length).fill(false);
 	const foldRemovals = (cell: StaleCell, i: number): void => {
-		for (const [name, at] of Object.entries(importStampsOf(cell))) {
+		for (const [name, { at }] of Object.entries(importStampsOf(cell))) {
 			if (importDefines[i].has(name)) continue; // still provided ⇒ not a removal
 			const prev = removedBefore.get(name);
 			if (!prev || at > prev.at) removedBefore.set(name, { at, id: cell.id });

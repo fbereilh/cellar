@@ -40,7 +40,7 @@ function messyNotebook(): any {
 						visible: true,
 						lastRun: { at: 123, session: 1 },
 						editedAt: 999,
-						importBindings: { pd: 999 }
+						importBindings: { pd: { spec: 'import pandas as pd', at: 999 } }
 					},
 					// Non-allowlisted cell metadata that MUST be dropped.
 					collapsed: true,
