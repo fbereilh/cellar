@@ -203,6 +203,7 @@ to publish, e.g. inside a container.
 | `CELLAR_JUPYTER_URL` | `http://127.0.0.1:8888` | Point the kernel bridge at an external Jupyter server (the launcher sets this automatically for the managed sidecar). |
 | `CELLAR_JUPYTER_TOKEN` | `` (empty) | Token for an external Jupyter server. |
 | `DATABRICKS_CONFIG_FILE` | `~/.databrickscfg` | Standard SDK variable for the Databricks config location. |
+| `BODY_SIZE_LIMIT` | `512K` | adapter-node's app-wide cap on a request body, which is what bounds how large a file a tab may **save** (reading is unaffected - a 15 MB HTML export still opens and previews). Cellar deliberately leaves it alone, since raising it raises how much memory any request can make the server buffer; a document that would not fit opens view-only instead. Set it (e.g. `2M`) to widen the editable range - the app reports the value actually in force to each file tab. `cellar --dev` runs Vite, which applies no body cap at all. |
 
 > **Internal, do not set by hand:** `CELLAR_WORKSPACE`, `CELLAR_KERNELSPEC_DIR`,
 > `CELLAR_PROJECT_VENV`, `CELLAR_LAUNCHER_PID`, and `CELLAR_KEYS` are set by the
@@ -252,6 +253,26 @@ Install its browser once with `npx playwright install chromium`.
   however long it runs. Restart the kernel from the sidebar's Kernels section, and
   see `CELLAR_KERNEL_IDLE_TIMEOUT_MS` above - set it to `0` to disable the per-run
   watchdog entirely if you hit a false abort.
+- **A file tab says "view-only · too large to save"** - the document is larger than a
+  save request may carry (`BODY_SIZE_LIMIT`, `512K` by default), so Cellar opens it
+  read-only rather than offering an edit it could never persist. Reading, syntax
+  highlighting, and the rendered preview are unaffected. Raise `BODY_SIZE_LIMIT`
+  (see above) if you need to edit it.
+- **A file will not open: "file too large to open"** - a text file is capped at
+  **2 MB**, with one exception: `.html`/`.htm` get **15 MB**, because a self-contained
+  export (plotly with the inlined bundle, bokeh `INLINE`, an nbconvert report) is
+  routinely bigger than the ordinary cap. Saving enforces the same ceiling, so a
+  save can never land bytes the tab would refuse to reopen.
+- **The status bar says "too large for blame"** - line-level git decorations (the
+  blame line and the change bars) are skipped above 2 MB, since blaming a multi-MB
+  file costs seconds on the same thread that carries kernel streaming, SSE, and MCP.
+  The file itself opens and previews normally; only the per-line decorations are absent.
+- **An `.html` preview says "This page loads files stored next to it"** - the preview
+  is origin-isolated (it cannot read the app's DOM, cookies, or storage), and the cost
+  of that isolation is that a page pulling sibling files off disk
+  (`<script src="report_files/x.js">`) cannot load them, so the page renders without
+  them. Re-export the file self-contained (e.g. plotly's `include_plotlyjs=True`,
+  bokeh's `INLINE`, `jupyter nbconvert --embed-images`) and it renders in full.
 - **A run aborted with "The kernel connection is being refreshed; re-run the cell"** -
   the kernel websocket died (its reconnect retries were spent) while the process
   itself is still alive. Cellar rebuilds the socket in the background without

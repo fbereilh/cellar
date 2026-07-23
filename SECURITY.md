@@ -52,6 +52,13 @@ follows directly from that:
 - **The MCP server drives that kernel.** Any client that can reach the MCP
   endpoint can add and run cells, i.e. execute code on your machine. Only
   connect agents you trust to the workspace.
+- **Workspace HTML is rendered, but origin-isolated.** Previewing a `.html` file
+  from the sidebar (and rich `text/html` cell output) runs the document's scripts
+  - a self-contained plot needs them - inside a sandboxed iframe without
+  `allow-same-origin`, so the page sits in an opaque origin and cannot reach the
+  app's DOM, cookies, storage, or same-origin endpoints. Cellar never serves
+  workspace HTML as `text/html` from its own origin. The cost of that isolation is
+  that a page pulling sibling files off disk cannot load them; the tab says so.
 - **Do not expose the ports beyond `localhost`.** The app, MCP, and Jupyter
   ports are for local use only. Publishing them to a network (or to `0.0.0.0`)
   turns "runs code as me" into "runs code as me, for anyone who can reach the

@@ -67,11 +67,15 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		description: 'Open the command palette'
 	},
 	{
+		// Owned by the shell (`+page.svelte`), not by any one view, and it answers
+		// for BOTH tab kinds: the active notebook (flush pending edits) or the
+		// active file tab (save the file). The id stays `save-notebook` so an
+		// existing user rebinding keeps working.
 		id: 'save-notebook',
 		keys: ['Mod-s'],
 		mode: 'global',
 		category: 'Application',
-		description: 'Save the notebook (flush pending edits)'
+		description: 'Save the active tab (notebook or file)'
 	},
 	{
 		// The find-bar's entry points. `Mod-f` (Ctrl/Cmd+F) is the primary one: P5
