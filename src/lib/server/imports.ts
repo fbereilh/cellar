@@ -4,7 +4,10 @@
  * Pure and side-effect free: no kernel, no filesystem, no notebook. Everything
  * the imports cell does (consolidate, agent routing) is expressed as functions
  * over source strings, so the interesting logic is testable without a kernel and
- * without a document.
+ * without a document. Staleness is a further consumer: `importBindings.ts` reuses
+ * this tokenizer's exactness (`isImportsOnlyResidual`) and its canonical rendering
+ * (`renderImport`) to decide which import bindings a cell provides and when one
+ * actually changed - never a regex, for the reason spelled out below.
  *
  * WHY NOT THE KERNEL'S `ast` MODULE. Parsing through the live kernel would be
  * "more correct" on paper and worse in practice: it can only run when a kernel
@@ -275,7 +278,12 @@ export function parseImportStatement(code: string): ImportRecord[] | null {
 	return null;
 }
 
-/** The canonical one-line rendering of a single record. Also its dedup key. */
+/**
+ * The canonical one-line rendering of a single record. Also its dedup key - and,
+ * because it is one statement per bound name, the IDENTITY of that binding for
+ * `importBindings.ts` (two sources bind a name identically iff this string matches),
+ * so "the same import" cannot mean two different things in Cellar.
+ */
 export function renderImport(rec: ImportRecord): string {
 	if (rec.kind === 'import') {
 		return rec.alias ? `import ${rec.module} as ${rec.alias}` : `import ${rec.module}`;

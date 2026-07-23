@@ -592,6 +592,13 @@ export function setLastRun(id: string, lastRun: LastRun, nb?: string | null): bo
  * defined are gone from the kernel — WITHOUT any epoch bump or restart. `lastRun`
  * is runtime-only (stripped from disk), so this never changes the `.ipynb`.
  *
+ * Only `lastRun` is cleared: the cell's `importBindings` baseline stays, because it
+ * records what the SOURCE binds, not what the namespace holds. That is also why
+ * `pruneImportBindings` is dated against the DOCUMENT's newest run (`latestConsumeAt`)
+ * rather than the providing cell's own stamp - a wipe here would otherwise read as
+ * "this cell never bound anything" and drop its removal records (see
+ * `importBindings.ts`).
+ *
  * The caller resolves which cells defined the wiped names (see dataflow.ts
  * `cellsDefiningNames`); passing an empty list is a no-op. Emits one
  * `kernel:variables-wiped` event so every open tab refetches its staleness.

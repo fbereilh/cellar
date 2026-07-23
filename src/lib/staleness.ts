@@ -193,8 +193,11 @@ function ranThisSession(cell: StaleCell | undefined | null, sid: SessionId | nul
 /**
  * Compute per-cell staleness for a whole notebook.
  *
- * @param cells cells in document order, carrying `metadata.cellar.lastRun` + `.editedAt`
- * @param dataflow per-cell defined/used names (code cells; missing entry ⇒ no dataflow)
+ * @param cells cells in document order, carrying `metadata.cellar.lastRun` + `.editedAt`,
+ *   and - on a cell whose module-level import bindings are knowable - `.importBindings`,
+ *   the per-name stamps that scope an imports-cell edit to its real dependents
+ * @param dataflow per-cell defined/used names (code cells; missing entry ⇒ no dataflow),
+ *   plus each cell's `imports` subset: the names an exemption may apply to at all
  * @param sid current kernel-session epoch, or null when no kernel runs
  * @param unavailable code-cell ids whose dataflow could NOT be computed this pass
  *   (the `ast`/`symtable` probe timed out or is backed off - see `dataflow.js`). Their
@@ -337,7 +340,11 @@ export function computeStaleness(
 	return result;
 }
 
-/** Why a cell is stale. */
+/**
+ * Why a cell is stale. `upstream_edited` doubles as the removal-ledger verdict (an
+ * import a preceding cell deleted is an edit to that cell, and it has no edge left
+ * to report through), so no kind was added for it.
+ */
 type ReasonKind =
 	| 'self_edited'
 	| 'upstream_edited'

@@ -53,8 +53,8 @@ export interface LastRun {
 
 /**
  * Cellar's allowlisted `cellar` metadata namespace. Round-trips through
- * clean-on-save except the runtime-only keys (`lastRun`, `editedAt`), which are
- * stripped symmetrically on read + write.
+ * clean-on-save except the runtime-only keys (`lastRun`, `editedAt`,
+ * `importBindings`), which are stripped symmetrically on read + write.
  */
 export interface CellarNamespace {
 	/** Reserved: mark a cell for future extract-to-.py. */

@@ -8,7 +8,10 @@
  * on top of that:
  *
  *   - the DEFINER GRAPH — per name, the document-ordered code cells that bind it,
- *     and the "nearest preceding definer" a use resolves to; and
+ *     the "nearest preceding definer" a use resolves to, and the resulting edges
+ *     BOTH as bare upstream sets (`directUpstream`) and carrying the names each edge
+ *     is made of (`edgeNames`), which is what lets staleness ask whether an edge
+ *     actually carries a change rather than treating a touched cell as one fact; and
  *   - `resolveSymbol` — the symbol-navigation answer (where a name is defined +
  *     which cells reference it), reconciled with the live kernel namespace.
  *

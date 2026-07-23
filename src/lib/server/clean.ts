@@ -9,7 +9,8 @@
  * Rules (KEEPS outputs by default):
  *  - null every `execution_count` (cell level + inside each output)
  *  - strip all cell metadata except the allowlisted `cellar` namespace
- *  - drop runtime-only `cellar` run metadata (`lastRun`, `editedAt`)
+ *  - drop runtime-only `cellar` run metadata (`lastRun`, `editedAt`,
+ *    `importBindings`)
  *  - strip all notebook metadata except `kernelspec` (+ `cellar` if present);
  *    this drops `language_info` and the volatile `widgets` state
  *  - normalize `kernelspec.display_name` → `kernelspec.name`

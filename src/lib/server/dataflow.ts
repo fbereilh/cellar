@@ -35,6 +35,18 @@
  * empty: reading table names out of SQL is lineage analysis, deliberately out of
  * scope, so a SQL cell is a graph SOURCE.
  *
+ * IMPORT-BINDING SUBSET. Each entry also carries `imports`: the subset of `defines`
+ * bound by a module-level import, which `staleness.js` uses to transmit change only
+ * along the edges whose names could actually have moved (see `importBindings.ts`).
+ * It is computed HERE, in JS, by the tokenizer rather than by the probe - it is a
+ * tokenizer question, the probe is already the expensive part, and it must keep
+ * working when the probe cannot run (its own `importCache`, so a probe failure or
+ * backoff never costs it). An UNAVAILABLE cell has empty `defines`, hence no edges,
+ * hence no exemption, so the backoff design's conservative-stale is unchanged. The
+ * one gate is notebook-wide: `%autoreload` makes re-executing an import NON-idempotent
+ * and arming it is a KERNEL-global act, so if ANY code cell mentions it, `imports` is
+ * omitted for EVERY cell and no edge anywhere is exempt.
+ *
  * The probe never raises: EVERY cell is analyzed behind its own catch-all, so a cell
  * that does not parse (it is mid-edit) — or one whose shape the walk mishandles — is
  * reported with empty defines/uses and degrades ALONE, rather than failing the whole

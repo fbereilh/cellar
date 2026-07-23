@@ -24,6 +24,16 @@
  *    the surrounding Python still analyzes; an assignment FROM one (`files = !ls`)
  *    keeps its left-hand side as a define.
  *
+ * STALENESS ASKS A DIFFERENT QUESTION OF THE SAME VOCABULARY. `importBindings.ts`
+ * needs not "how do I make this analyzable" but "can I prove this magic binds
+ * nothing", since a cell that is nothing but imports plus inert magics still has
+ * knowable import bindings. Blanking is not an answer there - `%run script.py`
+ * executes a script IN the namespace - so that side is served by `isBareMagicLine`
+ * (the shape of a magic line, shared with `blankLineMagics` so the two cannot
+ * drift), the `INERT_LINE_MAGICS` allowlist, `scanMagics` (every magic fact in ONE
+ * pass over already-tokenized lines) and `hasAutoreloadMagic` (the notebook-wide
+ * gate, since arming autoreload is kernel-global).
+ *
  * Pure and browser-safe-ish (it only imports the pure `logicalLines` tokenizer),
  * so it is unit-testable without a kernel, a subprocess, or a document.
  */

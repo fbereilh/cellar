@@ -116,6 +116,12 @@ async function typeInto(page: Page, c: Locator, text: string): Promise<void> {
 	await editor.click();
 	await page.keyboard.press('ControlOrMeta+a');
 	await page.keyboard.type(text);
+	// Typing leaves CodeMirror's completion tooltip open over the cells below, which
+	// would hide the very badges (or absence of them) the assertions - and the
+	// evidence screenshots - are about. Escape is CM's first, so this closes the
+	// popup without leaving edit mode.
+	await page.keyboard.press('Escape');
+	await expect(c.locator('.cm-tooltip-autocomplete')).toHaveCount(0);
 }
 
 async function shot(page: Page, name: string): Promise<void> {
