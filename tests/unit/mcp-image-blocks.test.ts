@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { PNG } from 'pngjs';
-import { base64Bytes, buildImageBlocks, IMG_MAX_EDGE, MAX_IMAGE_BLOCKS } from '../../src/lib/server/mcp/image';
+import { base64Bytes, buildImageBlocks, IMG_MAX_EDGE, MAX_DECODE_PIXELS, MAX_IMAGE_BLOCKS } from '../../src/lib/server/mcp/image';
 import type { ImageOutputRef } from '../../src/lib/server/mcp/image';
 import { textWithImages } from '../../src/lib/server/mcp/server';
 
@@ -47,6 +47,23 @@ const dimsOf = (b64: string) => {
 
 const ref = (output_index: number, mime: string, b64: string): ImageOutputRef => ({ output_index, mime, b64 });
 
+/**
+ * A PNG signature + IHDR claiming `w×h`, with no image data behind it — the shape
+ * of the attack the pixel bound exists for. Decoding one really is a
+ * width*height*4 allocation, so the policy must refuse it from the HEADER; a
+ * fixture that actually contained 49 MP would take the test to allocate what the
+ * test is asserting we never allocate.
+ */
+function fakePngHeader(w: number, h: number): string {
+	const buf = Buffer.alloc(32);
+	buf.writeUInt32BE(0x89504e47, 0);
+	buf.writeUInt32BE(0x0d0a1a0a, 4);
+	buf.write('IHDR', 12, 'ascii');
+	buf.writeUInt32BE(w, 16);
+	buf.writeUInt32BE(h, 20);
+	return buf.toString('base64');
+}
+
 describe('image block policy', () => {
 	it('ships a PNG figure as an image block, downscaled, naming the output it came from', () => {
 		const { images, omitted } = buildImageBlocks([ref(2, 'image/png', makePngB64(1600, 1200))]);
@@ -90,6 +107,48 @@ describe('image block policy', () => {
 		expect(omitted.every((o) => o.reason === 'limit')).toBe(true);
 		// The route to the ones that did not fit is named, so the cap costs no capability.
 		expect(omitted[0].note).toMatch(/get_full_output/);
+	});
+
+	it('is UNCAPPED when the caller asked for this cell explicitly, so the limit note names a real route', () => {
+		// The cap bounds an AUTOMATIC run result, where the agent never asked to pay
+		// for figures. get_full_output(id) is the explicit per-cell request the
+		// omission note points at, so it passes limit:Infinity — otherwise a cell's
+		// 5th figure would be unreachable by ANY tool and the note would be a lie.
+		const many = Array.from({ length: MAX_IMAGE_BLOCKS + 3 }, (_, i) => ref(i, 'image/png', makePngB64(60, 40, i)));
+		const { images, omitted } = buildImageBlocks(many, { limit: Infinity });
+		expect(images).toHaveLength(MAX_IMAGE_BLOCKS + 3);
+		expect(omitted).toEqual([]);
+	});
+
+	it('emits the REGISTERED jpeg mime for an `image/jpg` bundle key, which a host would otherwise reject', () => {
+		// image/jpg is an unregistered spelling: a block carrying it fails the WHOLE
+		// tool result, the exact failure the allowlist exists to prevent. Such an
+		// output is still shown — only the emitted type is corrected.
+		const jpeg = Buffer.from('fake jpeg bytes').toString('base64');
+		const { images, omitted } = buildImageBlocks([ref(0, 'image/jpg', jpeg)]);
+		expect(omitted).toEqual([]);
+		expect(images[0]).toEqual(expect.objectContaining({ mime: 'image/jpeg', data: jpeg }));
+	});
+
+	it('refuses a raster past the pixel bound WITHOUT decoding it (an OOM would kill the whole server)', () => {
+		// 7000×7000 = 49 MP: past MAX_DECODE_PIXELS but with both edges UNDER the
+		// host's 8000px ceiling — so only a pre-decode bound can catch it. Decoding
+		// would ask pngjs for ~196 MB of RGBA (and a real 30000×30000 typo, for
+		// gigabytes) inside the request that just ran the cell, and an OOM takes down
+		// every kernel websocket, SSE stream and agent session in the process.
+		expect(7000 * 7000).toBeGreaterThan(MAX_DECODE_PIXELS);
+		const { images, omitted } = buildImageBlocks([ref(3, 'image/png', fakePngHeader(7000, 7000))]);
+		expect(images).toEqual([]);
+		expect(omitted).toEqual([expect.objectContaining({ output_index: 3, reason: 'too_large' })]);
+	});
+
+	it('applies the pixel bound on the `full` path too — asking for detail is not a licence to ship (or decode) an unbounded raster', () => {
+		// `full` skips the routine downscale, so without a pre-decode bound this one
+		// would sail past the host ceilings on its edges alone; an oversized original
+		// that DID trip them falls back to a downscale, which is a decode.
+		const { images, omitted } = buildImageBlocks([ref(0, 'image/png', fakePngHeader(7000, 7000))], { full: true });
+		expect(images).toEqual([]);
+		expect(omitted).toEqual([expect.objectContaining({ reason: 'too_large' })]);
 	});
 
 	it('an explicit `full` request skips the downscale and returns the original raster', () => {

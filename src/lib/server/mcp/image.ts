@@ -17,6 +17,12 @@
  *     tool that ships images (run_cell / add_and_run / get_full_output) goes
  *     through it, so the cost bound cannot drift between them. Anything it
  *     declines is reported in `omitted` WITH a reason, never dropped silently.
+ *     The count cap is the one knob that differs by caller: it bounds the
+ *     AUTOMATIC result of a run, where the agent did not ask for figures and the
+ *     token bill is unbudgeted, while `get_full_output(id)` — an explicit,
+ *     per-cell request for exactly this — passes `limit: Infinity` and returns
+ *     every image on the cell. That is what makes the `limit` omission note's
+ *     route a real one rather than a promise nothing keeps.
  *
  *  3. `imagePlaceholder` builds the terse, image-token-free marker the scan read
  *     paths (map / read / search) show instead of the raster:
@@ -145,6 +151,11 @@ export interface ScaledImage {
  */
 export function downscaleImageForBlock(mime: string, b64: string, maxEdge = IMG_MAX_EDGE): ScaledImage {
 	if (mime !== 'image/png') return { data: b64, resized: false };
+	// Refuse to decode a raster past the pixel bound (see `exceedsDecodeBound`):
+	// pngjs allocates the whole RGBA buffer up front, and no try/catch survives an
+	// OOM. Declining to shrink is the module's standard safe direction, and the
+	// caller's host-limit check then omits it with a reason.
+	if (exceedsDecodeBound(mime, b64)) return { data: b64, resized: false };
 	try {
 		const src = PNG.sync.read(Buffer.from(b64, 'base64'));
 		const { width: sw, height: sh } = src;
@@ -156,7 +167,11 @@ export function downscaleImageForBlock(mime: string, b64: string, maxEdge = IMG_
 
 		const out = new PNG({ width: dw, height: dh });
 		out.data = resizeRGBA(src.data, sw, sh, dw, dh);
-		const encoded = PNG.sync.write(out).toString('base64');
+		// Cheap deflate: this runs synchronously on the shared event loop of the
+		// process that also streams SSE frames and services every other kernel and
+		// MCP session, and level 9 buys a few percent on a raster the agent only has
+		// to READ. Time matters here; the last byte does not.
+		const encoded = PNG.sync.write(out, { deflateLevel: 3 }).toString('base64');
 		return { data: encoded, resized: true, width: sw, height: sh, scaledWidth: dw, scaledHeight: dh };
 	} catch {
 		// Undecodable / unexpected raster: hand back the original, never a corrupt one.
@@ -174,13 +189,28 @@ export function downscaleImageForBlock(mime: string, b64: string, maxEdge = IMG_
  */
 export const INLINE_IMAGE_MIMES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'];
 
+/** Whether a mime may ride as an image content block at all (the allowlist). */
+export const isInlinableImageMime = (mime: unknown): boolean => typeof mime === 'string' && INLINE_IMAGE_MIMES.includes(mime);
+
 /**
- * How many image blocks ONE tool result may carry. A cell that plots in a loop
- * can emit dozens of figures; at ~590 image tokens each, an uncapped result is a
- * five-figure token bill from a single `add_and_run`. Four covers the real cases
- * (one figure, or a small subplot series) and the rest are reported in
- * `images_omitted` with the `get_full_output` route to them — bounded, never
- * silently truncated.
+ * The mime an image BLOCK carries, which is not always the bundle key it came
+ * from: `image/jpg` is a common but unregistered spelling that hosts do not
+ * accept, and a rejected block fails the ENTIRE tool result — the exact failure
+ * the allowlist exists to prevent. So such an output is still shown; only the
+ * emitted type is corrected to the registered `image/jpeg`.
+ */
+export function blockMime(mime: string): string {
+	return mime === 'image/jpg' ? 'image/jpeg' : mime;
+}
+
+/**
+ * How many image blocks ONE AUTOMATIC tool result may carry. A cell that plots in
+ * a loop can emit dozens of figures; at ~590 image tokens each, an uncapped run
+ * result is a five-figure token bill from a single `add_and_run` the agent never
+ * asked to pay. Four covers the real cases (one figure, or a small subplot
+ * series) and the rest are reported in `images_omitted` — bounded, never silently
+ * truncated, and reachable in full because `get_full_output(id)` is EXPLICIT and
+ * therefore runs uncapped (`limit: Infinity`).
  */
 export const MAX_IMAGE_BLOCKS = 4;
 
@@ -195,6 +225,32 @@ export const IMAGE_BLOCK_MAX_BYTES = 3.5 * 1024 * 1024;
 
 /** Hard pixel ceiling per edge (hosts reject beyond ~8000px). */
 export const MAX_IMAGE_EDGE_HARD = 8000;
+
+/**
+ * Pixel-count ceiling above which a raster is refused WITHOUT ever being decoded.
+ * `PNG.sync.read` allocates width×height×4 bytes of RGBA up front, so one
+ * pathological figure (an agent typo like `plt.figure(figsize=(100,100),
+ * dpi=300)` → 30000×30000) would ask pngjs for gigabytes inside the request that
+ * just ran the cell — and a genuine OOM is not something a try/catch can save us
+ * from: it kills the single shared Node process, taking every notebook's kernel
+ * websocket, every SSE stream and every other agent session with it. So the
+ * header dimensions are read first (`imageDimensions`, no decode) and anything
+ * past this bound — or past `MAX_IMAGE_EDGE_HARD`, which the host would reject
+ * anyway — is omitted `too_large` with the output keeping its text placeholder.
+ * Set well beyond any real figure: a 300-dpi 20×12in plot is ~21 MP.
+ */
+export const MAX_DECODE_PIXELS = 32_000_000;
+
+/**
+ * Whether a raster is too big to safely hand to the decoder. Header-only, so it
+ * costs nothing; an unparseable header is NOT treated as oversized (the decode
+ * then fails cheaply on its own and the fallback returns the original untouched).
+ */
+export function exceedsDecodeBound(mime: string, b64: string): boolean {
+	const dim = imageDimensions(mime, b64);
+	if (!dim) return false;
+	return dim.width * dim.height > MAX_DECODE_PIXELS || Math.max(dim.width, dim.height) > MAX_IMAGE_EDGE_HARD;
+}
 
 /** One image output of a cell, as the service hands it to the policy. */
 export interface ImageOutputRef {
@@ -230,6 +286,8 @@ export interface ImageBlocks {
 }
 
 const FETCH_FULL = "get_full_output(id, size:'full') returns the original bytes";
+/** The route named by the `limit` omission — and it is a real one: see MAX_IMAGE_BLOCKS. */
+const FETCH_ALL = 'get_full_output(id) returns every image on this cell (that call is not capped)';
 
 /**
  * Decide which of a cell's image outputs become MCP image blocks, and at what
@@ -240,6 +298,9 @@ const FETCH_FULL = "get_full_output(id, size:'full') returns the original bytes"
  * ceilings still apply, because they are about what the HOST will accept, not
  * about token thrift: an oversized original is downscaled to fit (with a note
  * saying so) rather than shipped as a block the host would reject.
+ *
+ * `limit` is the caller's token budget, not a capability bound: the run path
+ * takes the MAX_IMAGE_BLOCKS default, `get_full_output` passes Infinity.
  */
 export function buildImageBlocks(
 	items: ImageOutputRef[],
@@ -254,12 +315,12 @@ export function buildImageBlocks(
 			continue;
 		}
 		if (images.length >= limit) {
-			omitted.push({ output_index, mime, reason: 'limit', note: `only the first ${limit} images are shown; ${FETCH_FULL}` });
+			omitted.push({ output_index, mime, reason: 'limit', note: `only the first ${limit} images ride in a run result; ${FETCH_ALL}` });
 			continue;
 		}
 		const block = fitImageBlock(output_index, mime, b64, full, maxEdge, maxBytes);
 		if (block) images.push(block);
-		else omitted.push({ output_index, mime, reason: 'too_large', note: `image too large to inline; ${FETCH_FULL}` });
+		else omitted.push({ output_index, mime, reason: 'too_large', note: 'image too large to send as an image block; its size is in the outputs placeholder' });
 	}
 	return { images, omitted };
 }
@@ -269,12 +330,16 @@ export function buildImageBlocks(
  * ceilings — falling back to a downscale for an oversized `full` image, and
  * returning null only when even that does not fit (a huge non-PNG, which we
  * cannot resample). Never returns a payload we know the host would reject.
+ *
+ * The pixel bound is checked FIRST, before any decode: a raster past it is
+ * declined outright rather than handed to pngjs (see `MAX_DECODE_PIXELS`).
  */
 function fitImageBlock(output_index: number, mime: string, b64: string, full: boolean, maxEdge: number, maxBytes: number): ImageBlockPayload | null {
+	if (exceedsDecodeBound(mime, b64)) return null;
 	const scaled = full ? { data: b64, resized: false as const } : downscaleImageForBlock(mime, b64, maxEdge);
 	const build = (s: ScaledImage, note?: string): ImageBlockPayload => ({
 		output_index,
-		mime,
+		mime: blockMime(mime),
 		data: s.data,
 		...(s.width != null ? { width: s.width, height: s.height } : {}),
 		...(s.resized ? { downscaled: { from: `${s.width}×${s.height}`, to: `${s.scaledWidth}×${s.scaledHeight}`, ...(note ? { note } : { note: FETCH_FULL }) } } : {})

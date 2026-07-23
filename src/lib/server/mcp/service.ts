@@ -47,7 +47,7 @@ import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
-import { buildImageBlocks, imagePlaceholder } from './image';
+import { buildImageBlocks, imagePlaceholder, isInlinableImageMime } from './image';
 import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
@@ -1043,7 +1043,10 @@ export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium', nb
 		size,
 		ran_this_session: ranThisSession(c, currentSessionId(nb)),
 		outputs,
-		...imageFields(buildImageBlocks(imageRefs(c.outputs), { full: size === 'full' }))
+		// Uncapped: this call IS the agent explicitly asking for this one cell's
+		// figures, so it is the route the run path's `limit` omission names — a cap
+		// here would leave the 5th figure of a cell unreachable by any tool.
+		...imageFields(buildImageBlocks(imageRefs(c.outputs), { full: size === 'full', limit: Infinity }))
 	};
 }
 
@@ -1635,7 +1638,11 @@ function toBatchRecord(
 	// alone cannot: a batch never inlines images (see runCell's skipImages), so
 	// without this an agent that just ran 20 plotting cells has no way to know any
 	// of them drew anything except by fetching each one.
-	const hasImage = outputs.some((o) => (o as { image?: unknown }).image != null);
+	// Only an INLINABLE mime counts: has_image promises a figure get_full_output can
+	// actually SHOW, so an svg-only output (which the block policy declines, and
+	// which would come back as the same placeholder) must not send the agent on a
+	// round trip that tells it nothing new.
+	const hasImage = outputs.some((o) => isInlinableImageMime((o as { image?: unknown }).image));
 	return { id: r.id, run_status, ...(outputs.length ? { has_output: true } : {}), ...(hasImage ? { has_image: true } : {}), ...stale };
 }
 

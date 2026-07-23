@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PNG } from 'pngjs';
-import { IMG_MAX_EDGE } from '../../src/lib/server/mcp/image';
+import { IMG_MAX_EDGE, MAX_IMAGE_BLOCKS } from '../../src/lib/server/mcp/image';
 
 /**
  * Token diet: downscale high-DPI plot images on the DEFAULT read path.
@@ -85,6 +85,22 @@ describe('image module', () => {
 		expect(r.data).toBe(fake);
 	});
 
+	it('declines to decode a raster past the pixel bound (pngjs would allocate w*h*4 up front)', () => {
+		// Header-only fixture: 30000×30000 claimed, no pixels behind it. Building a
+		// real one would allocate the 3.6 GB the bound exists to refuse.
+		const buf = Buffer.alloc(32);
+		buf.writeUInt32BE(0x89504e47, 0);
+		buf.writeUInt32BE(0x0d0a1a0a, 4);
+		buf.write('IHDR', 12, 'ascii');
+		buf.writeUInt32BE(30000, 16);
+		buf.writeUInt32BE(30000, 20);
+		const huge = buf.toString('base64');
+		expect(img.exceedsDecodeBound('image/png', huge)).toBe(true);
+		const r = img.downscaleImageForBlock('image/png', huge, img.IMG_MAX_EDGE);
+		expect(r.resized).toBe(false);
+		expect(r.data).toBe(huge); // untouched, never decoded
+	});
+
 	it('returns the original, undamaged, when the PNG cannot be decoded', () => {
 		const junk = Buffer.from('\x89PNG\r\n\x1a\n corrupt tail').toString('base64');
 		const r = img.downscaleImageForBlock('image/png', junk, img.IMG_MAX_EDGE);
@@ -157,5 +173,27 @@ describe('get_full_output default-vs-full image contract', () => {
 		const out = read!.outputs[0] as { image?: string; text?: string };
 		expect(out.image).toBe('image/png');
 		expect(out.text).toMatch(/^\[image\/png, 1600×1200, \d+ (B|KB|MB)\]$/);
+	});
+
+	it('returns EVERY figure of the cell — the per-result cap bounds a run, not this explicit request', async () => {
+		const NB = 'many-plots.ipynb';
+		svc.useNotebook('imgSessMany', NB);
+		const nb = nbmod.resolveNotebookPath(NB);
+		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'figs' }], null, { nb, routeImports: false });
+		const id = svc.resolveRef(nb, ids[0]);
+
+		const COUNT = MAX_IMAGE_BLOCKS + 2;
+		nbmod.setOutputs(
+			id,
+			Array.from({ length: COUNT }, () => ({ output_type: 'display_data', data: { 'image/png': makePngB64(40, 30) }, metadata: {} })),
+			nb
+		);
+
+		// This is the route the run path's `limit` omission names; capping it here
+		// would leave the 5th figure unreachable by any tool.
+		const res = svc.getFullOutput(id, 'medium', nb)!;
+		expect(res.images).toHaveLength(COUNT);
+		expect(res.images!.map((i) => i.output_index)).toEqual([...Array(COUNT).keys()]);
+		expect(res.images_omitted).toBeUndefined();
 	});
 });
