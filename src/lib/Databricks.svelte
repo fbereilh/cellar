@@ -19,6 +19,14 @@
 	import { subscribeEvents } from '$lib/events-client';
 	import { getUi, setUi, setUiNow } from '$lib/uiState';
 	import { normalizeDatabricksHost } from '$lib/databricksHost';
+	import {
+		PROFILE_REAUTH_CODE,
+		REAUTH_COMMAND_HEAD,
+		REAUTH_PROFILE_FLAG,
+		reauthCommand,
+		reauthDetail,
+		reauthExplanation
+	} from '$lib/databricksReauth';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -29,6 +37,8 @@
 	interface DbxError {
 		code: string;
 		message: string;
+		/** Set for `profile_reauth_required`: the profile whose saved sign-in expired. */
+		profile?: string;
 	}
 	interface DbxProfile {
 		name: string;
@@ -289,10 +299,12 @@
 
 	/** Normalize a thrown value (a route body, or an Error) into `{code, message}`. */
 	function toDbxError(err: unknown): DbxError {
-		const e = err as { code?: unknown; message?: unknown } | null | undefined;
+		const e = err as { code?: unknown; message?: unknown; profile?: unknown } | null | undefined;
 		return {
 			code: typeof e?.code === 'string' ? e.code : 'error',
-			message: typeof e?.message === 'string' ? e.message : String(err)
+			message: typeof e?.message === 'string' ? e.message : String(err),
+			// Carried only by `profile_reauth_required`, where the remedy names it.
+			...(typeof e?.profile === 'string' && e.profile ? { profile: e.profile } : {})
 		};
 	}
 
@@ -1029,14 +1041,85 @@
 		kernel_unavailable: 'Cellar could not reach the Python kernel. Restart Cellar, then connect again.',
 		busy: 'Another Databricks operation is still running.'
 	};
+
+	/**
+	 * The profile a `profile_reauth_required` failure is about. The server names it
+	 * (it resolved the auth that failed); the current picker selection is only the
+	 * fallback for an older body, so the command is never hardcoded.
+	 */
+	function reauthProfile(err: DbxError): string {
+		return err.profile || profile;
+	}
+
+	// Copy-the-command affordance for the re-auth box - the same idiom as the
+	// sidebar's "Connect an agent" panel. Keyed by the box's testid so two boxes
+	// (a listing failure and a connect failure) cannot share one "copied" tick.
+	let copiedReauth = $state('');
+	let copyReauthTimer: ReturnType<typeof setTimeout>;
+	async function copyReauth(key: string, text: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			copiedReauth = key;
+			clearTimeout(copyReauthTimer);
+			copyReauthTimer = setTimeout(() => (copiedReauth = ''), 1400);
+		} catch {
+			/* a denied clipboard permission must not break the error box */
+		}
+	}
 </script>
+
+<!--
+  The one auth failure Cellar cannot fix for the user: a NAMED profile whose
+  CLI-managed sign-in expired. "Sign in with Databricks" runs Cellar's OWN browser
+  OAuth, which mints a token this profile never reads - a dead end - so this box
+  shows the exact command instead, with the real profile name. See
+  $lib/databricksReauth for why Cellar does not run it for them.
+-->
+{#snippet reauthBox(err: DbxError, testid: string)}
+	{@const name = reauthProfile(err)}
+	{@const command = reauthCommand(name)}
+	<p class="text-[11px] font-medium leading-relaxed text-base-content/80" data-testid="{testid}-explain">
+		{reauthExplanation(name)}
+	</p>
+	<!-- The command WRAPS rather than truncating: in a ~200px box the tail is the
+	     profile name, i.e. the one part of it the user must read. The flag is held
+	     in a no-wrap span because a browser breaks after a hyphen, which split
+	     `--profile` into `-` / `-profile` - a command a reader could mistype. -->
+	<div class="mt-1.5 flex items-start gap-1 rounded-md border border-base-300 bg-base-100 p-1">
+		<code class="min-w-0 flex-1 px-1 py-0.5 font-mono text-[11px] leading-snug text-primary [overflow-wrap:break-word]" title={command} data-testid="{testid}-command">{REAUTH_COMMAND_HEAD} <span class="whitespace-nowrap">{REAUTH_PROFILE_FLAG}</span> {name}</code>
+		<button
+			class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
+			onclick={() => copyReauth(testid, command)}
+			title="Copy command"
+			aria-label="Copy command"
+			data-testid="{testid}-copy"
+		>
+			{#if copiedReauth === testid}
+				<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+			{:else}
+				<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+			{/if}
+		</button>
+	</div>
+{/snippet}
 
 {#snippet errorBox(err: DbxError, testid: string)}
 	<div class="mt-2 rounded-lg border border-error/30 bg-error/10 p-2" data-testid={testid}>
-		{#if REMEDY[err.code]}
-			<p class="text-[11px] font-medium leading-relaxed text-base-content/80">{REMEDY[err.code]}</p>
+		{#if err.code === PROFILE_REAUTH_CODE}
+			{@render reauthBox(err, `${testid}-reauth`)}
+			<!-- The SDK's own text only; the head of the server message is what the
+			     box above already says in full, so repeating it would state the same
+			     remedy three times. -->
+			{@const detail = reauthDetail(err.message)}
+			{#if detail}
+				<p class="mt-1.5 break-words font-mono text-[10px] leading-relaxed text-base-content/50">{detail}</p>
+			{/if}
+		{:else}
+			{#if REMEDY[err.code]}
+				<p class="text-[11px] font-medium leading-relaxed text-base-content/80">{REMEDY[err.code]}</p>
+			{/if}
+			<p class="mt-0.5 break-words font-mono text-[10px] leading-relaxed text-base-content/50">{err.message}</p>
 		{/if}
-		<p class="mt-0.5 break-words font-mono text-[10px] leading-relaxed text-base-content/50">{err.message}</p>
 	</div>
 {/snippet}
 

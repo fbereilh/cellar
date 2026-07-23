@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { connect, disconnect, statusFor } from '$lib/server/databricks';
+import { connect, disconnect } from '$lib/server/databricks';
+import { databricksErrorResponse } from '../error-response.js';
 
 /**
  * Connect: build `spark` + `w` inside the shared kernel against the chosen
@@ -17,8 +18,7 @@ export async function POST({ request }) {
 		// own kernel + Databricks session); omitting it targets the active notebook.
 		return json(await connect({ profile, host, clusterId, clusterName, nb: path }));
 	} catch (err) {
-		const code = err?.code ?? 'error';
-		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
+		return databricksErrorResponse(err);
 	}
 }
 
@@ -27,7 +27,6 @@ export async function DELETE({ url }) {
 	try {
 		return json(await disconnect(url.searchParams.get('path')));
 	} catch (err) {
-		const code = err?.code ?? 'error';
-		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
+		return databricksErrorResponse(err);
 	}
 }

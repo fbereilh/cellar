@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { reconnectSession, statusFor } from '$lib/server/databricks';
+import { reconnectSession } from '$lib/server/databricks';
+import { databricksErrorResponse } from '../error-response.js';
 
 /**
  * Reconnect: restore a notebook's Databricks Connect session against the cluster
@@ -22,7 +23,6 @@ export async function POST({ request }) {
 		// Databricks session); omitting it targets the active notebook.
 		return json(await reconnectSession(path));
 	} catch (err) {
-		const code = err?.code ?? 'error';
-		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
+		return databricksErrorResponse(err);
 	}
 }

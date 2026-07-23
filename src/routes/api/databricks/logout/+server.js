@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { logout, statusFor } from '$lib/server/databricks';
+import { logout } from '$lib/server/databricks';
+import { databricksErrorResponse } from '../error-response.js';
 
 /**
  * Sign out of Databricks - the deliberate sibling of the connect route's DELETE
@@ -22,7 +23,6 @@ export async function POST({ request }) {
 	try {
 		return json(await logout({ profile, host, nb: path }));
 	} catch (err) {
-		const code = err?.code ?? 'error';
-		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
+		return databricksErrorResponse(err);
 	}
 }

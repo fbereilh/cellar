@@ -101,6 +101,7 @@ import {
 	versionMismatchMessage
 } from './dbrVersion';
 import { normalizeDatabricksHost } from '../databricksHost';
+import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthMessage } from '../databricksReauth';
 import { resolveNotebookPath } from './notebook';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
@@ -148,7 +149,9 @@ interface ProbeRequest {
  * (narrowed at each use site); failure is the fixed `{code, message}` contract.
  */
 type ProbeOk = { ok: true } & Record<string, unknown>;
-type ProbeFail = { ok: false; code: string; message: string };
+// `profile` is never printed by the python side: it is attached in Node by
+// `reclassifyReauth`, which alone knows WHICH profile the failing call resolved.
+type ProbeFail = { ok: false; code: string; message: string; profile?: string };
 type ProbeResult = ProbeOk | ProbeFail;
 
 // Op-specific views of a `ProbeOk` payload, applied with a single `as` where the
@@ -857,10 +860,17 @@ sys.stdout.write('${SENTINEL}' + json.dumps(result) + '\\n')
 /** A structured failure both API routes and the UI understand. `code` drives the UI's copy. */
 export class DatabricksError extends Error {
 	code: string;
-	constructor(code: string, message: string) {
+	/**
+	 * The `~/.databrickscfg` profile the failure is about. Set only for
+	 * `profile_reauth_required`, where the UI needs the real name to render the
+	 * exact `databricks auth login --profile <name>` command (never hardcoded).
+	 */
+	profile?: string;
+	constructor(code: string, message: string, profile?: string) {
 		super(message);
 		this.name = 'DatabricksError';
 		this.code = code;
+		if (profile) this.profile = profile;
 	}
 }
 
@@ -876,6 +886,7 @@ export function statusFor(code: string): number {
 		case 'profile_missing':
 		case 'oauth_login_required':
 		case 'login_failed':
+		case PROFILE_REAUTH_CODE:
 			return 401;
 		case 'permission_denied':
 			return 403;
@@ -911,6 +922,38 @@ function requirePython(): string {
 		);
 	}
 	return python;
+}
+
+/**
+ * Re-label a failure that is really "this NAMED profile's CLI-managed sign-in
+ * expired" - the one auth dead end Cellar cannot fix for the user.
+ *
+ * The python side cannot make this call: `classify()` sees only the message, and
+ * an expired `databricks-cli` refresh token reads as `oauth_login_required` (the
+ * text mentions OAuth) or `auth_failed`. Both send the user to the sidebar's
+ * "Sign in with Databricks" button, which runs CELLAR's own browser OAuth - it
+ * mints a token into the SDK's python-local cache that a `databricks-cli`
+ * profile never reads, so the user is stuck. So the decision is made HERE, where
+ * the resolved `Auth` says which profile was actually asked for.
+ *
+ * Scoped deliberately:
+ *   - only `mode: 'profile'` - a bare typed **host** has no CLI profile to log
+ *     into, and its dead token IS the one Cellar's own sign-in re-mints, so
+ *     `oauth_login_required` stays correct there.
+ *   - never a `needsSignIn` profile (a no-token `auth_type = external-browser`
+ *     one): that is also Cellar's own to re-mint (`hasCellarCachedOAuth`), so
+ *     redirecting it to the CLI would be the same dead end with the sign flipped.
+ */
+function reclassifyReauth(auth: Auth | undefined, result: ProbeResult): ProbeResult {
+	if (!result || result.ok !== false) return result;
+	if (!auth || auth.mode !== 'profile' || auth.needsSignIn) return result;
+	if (!isProfileReauthError(result.message)) return result;
+	return {
+		ok: false,
+		code: PROFILE_REAUTH_CODE,
+		message: reauthMessage(auth.profile, result.message),
+		profile: auth.profile
+	};
 }
 
 /** Run one `PROBE` command in the project venv and return its parsed result. */
@@ -978,7 +1021,10 @@ function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS): Promise<Pro
 			}
 			try {
 				// The one dynamic boundary: parse the sentinel JSON line into ProbeResult.
-				const result = JSON.parse(line.slice(SENTINEL.length)) as ProbeResult;
+				// An expired named-profile sign-in is re-labelled here (the python side
+				// cannot tell which profile was asked for) BEFORE the log, so the log
+				// records the code the caller actually gets.
+				const result = reclassifyReauth(request.auth, JSON.parse(line.slice(SENTINEL.length)) as ProbeResult);
 				// The probe never raises; a failure comes back as {ok:false, code, message}.
 				// That message carries the REAL cause (`Exc: detail`) - record it so the
 				// user sees why the op failed, beyond the friendly sidebar text.
@@ -998,7 +1044,11 @@ function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS): Promise<Pro
 /** Throw a `DatabricksError` for a `{ok:false}` probe/kernel result; else return it. */
 function unwrap(result: ProbeResult): ProbeOk {
 	if (result?.ok) return result;
-	throw new DatabricksError(result?.code || 'error', result?.message || 'Databricks call failed');
+	throw new DatabricksError(
+		result?.code || 'error',
+		result?.message || 'Databricks call failed',
+		result?.profile
+	);
 }
 
 /**
@@ -2397,6 +2447,11 @@ export async function connect({
 			}
 		}
 
+		// `CONNECT_CODE` hardcodes `auth_failed` for the Config/WorkspaceClient step,
+		// so the same expired-profile dead end reaches the sidebar from the kernel
+		// too. Same reclassification, same reason - see `reclassifyReauth`.
+		result = reclassifyReauth(auth, result);
+
 		if (!result.ok) {
 			s.connection = null;
 			s.connectedSel = null;
@@ -2411,7 +2466,7 @@ export async function connect({
 				throw new DatabricksError('version_mismatch', message);
 			}
 			logError('databricks', `connect failed [${result.code || 'error'}]: ${result.message || 'unknown error'}`);
-			throw new DatabricksError(result.code || 'error', result.message);
+			throw new DatabricksError(result.code || 'error', result.message, result.profile);
 		}
 		const ok = payload<ConnectPayload>(result);
 		s.connection = {

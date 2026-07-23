@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { listCatalogs, listSchemas, listTables, statusFor } from '$lib/server/databricks';
+import { listCatalogs, listSchemas, listTables } from '$lib/server/databricks';
+import { databricksErrorResponse } from '../error-response.js';
 import { selectionFrom } from '../selection.js';
 
 /**
@@ -24,7 +25,6 @@ export async function GET({ url }) {
 		if (level === 'tables') return json(await listTables(sel, catalog, schema));
 		return json({ code: 'bad_request', message: `unknown level: ${level}` }, { status: 400 });
 	} catch (err) {
-		const code = err?.code ?? 'error';
-		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
+		return databricksErrorResponse(err);
 	}
 }

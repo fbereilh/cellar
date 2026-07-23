@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { login, statusFor } from '$lib/server/databricks';
+import { login } from '$lib/server/databricks';
+import { databricksErrorResponse } from '../error-response.js';
 
 /**
  * Sign in to a workspace so the fast listing subprocesses (and the kernel
@@ -19,7 +20,6 @@ export async function POST({ request }) {
 	try {
 		return json(await login(profile ? { profile } : { host }));
 	} catch (err) {
-		const code = err?.code ?? 'error';
-		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
+		return databricksErrorResponse(err);
 	}
 }
