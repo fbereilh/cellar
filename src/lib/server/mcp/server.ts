@@ -258,7 +258,10 @@ Follow this house style:
    same module, so re-running it or re-adding it verbatim changes nothing for a cell
    that uses pd. Do not read the resulting quiet as staleness being broken, and do
    not re-run the notebook "to be safe": a rebound or removed import DOES still
-   stale its readers.
+   stale its readers. The exception is withdrawn where re-running an import is no
+   longer harmless - a notebook that arms %autoreload anywhere, or an imports cell
+   carrying a magic that injects names (%run, %store, %load, %pylab) - and those
+   notebooks simply go back to staling everything downstream of an imports edit.
 
    STALENESS UNDER-REPORTS - IT IS A FLOOR, NOT A GUARANTEE. The flag is static
    analysis (which names each cell defines/uses) plus run timestamps; nothing

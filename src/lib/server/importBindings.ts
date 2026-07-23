@@ -41,19 +41,32 @@
  * (null) rather than merely omitting an entry - same "I don't understand this, so
  * don't touch it" rule `imports.ts` applies to a statement it cannot re-render.
  *
- * LINE MAGICS ARE IGNORABLE, LIKE COMMENTS. `%matplotlib inline`, `%pip install …`,
- * `%config …` above the import block is one of the most common notebook headers
- * there is, and a magic line binds no Python name - so treating one as "other code"
+ * INERT LINE MAGICS ARE IGNORABLE, LIKE COMMENTS. `%matplotlib inline`, `%pip
+ * install …`, `%config …` above the import block is one of the most common notebook
+ * headers there is, and those bind no Python name - so treating one as "other code"
  * would degrade the map to null and leave exactly the reported bug unfixed for most
  * real notebooks. The vocabulary comes from `magics.ts` (`blankLineMagics`, already
  * the probe's), never a second regex here, and the assignment form (`files = !ls`)
  * survives that pass as `files = None`, so it still reads as ordinary code and still
- * disqualifies. Two deliberate exceptions: a `%%cell magic` cell is not a Python
- * imports cell at all, and `%autoreload` breaks the idempotence premise above - both
- * keep the conservative rule (see `hasAutoreloadMagic`).
+ * disqualifies.
+ *
+ * INERT is the operative word, and it is an ALLOWLIST (`magics.ts`'s
+ * `INERT_LINE_MAGICS`): a magic that injects into the namespace - `%run script.py`
+ * executes it THERE, `%store -r name` / `%load` inject names, `%pylab` is a star
+ * import - could rebind an imported name exactly like the `os = shim` case above,
+ * so it disqualifies, as does any magic not on the list. Two further exceptions: a
+ * `%%cell magic` cell is not a Python imports cell at all, and `%autoreload` breaks
+ * the idempotence premise above (see `hasAutoreloadMagic` - the check here is only
+ * the local half, since arming autoreload is kernel-global and `dataflow.ts` gates
+ * the whole notebook on it).
  */
 import { extractTopLevelImports, isImportsOnlyResidual, parseImportStatement, type ImportRecord } from './imports';
-import { blankLineMagics, hasAutoreloadMagic, isCellMagicCell } from './magics';
+import {
+	blankLineMagics,
+	hasAutoreloadMagic,
+	hasNonInertLineMagic,
+	isCellMagicCell
+} from './magics';
 
 /** name → the canonical rendering of the import record that binds it. */
 export type ImportSpecs = Map<string, string>;
@@ -109,13 +122,16 @@ function boundName(rec: ImportRecord): string | null {
 export function importBindingSpecs(source: string | null | undefined): ImportSpecs | null {
 	const src = source ?? '';
 	// A `%%cell magic` cell's body is not module-level Python (bash, html, its own
-	// mini-language), so it is never an imports cell; and autoreload retires the
-	// idempotence premise the whole exemption rests on.
-	if (isCellMagicCell(src) || hasAutoreloadMagic(src)) return null;
+	// mini-language), so it is never an imports cell; autoreload retires the
+	// idempotence premise the whole exemption rests on; and a magic we cannot prove
+	// inert (`%run`, `%store`, `%load`, `%pylab`, anything unrecognized) may inject a
+	// name into the namespace, which is the `os = shim` shadow in another costume.
+	if (isCellMagicCell(src) || hasAutoreloadMagic(src) || hasNonInertLineMagic(src)) return null;
 	// ONE tokenizer pass answers both halves: what was lifted, and what was left.
 	// Anything else at module scope could rebind an imported name; we cannot prove
 	// otherwise without re-deriving Python's binding rules, so we do not try - only
-	// line magics / shell escapes are discounted, and only because they bind nothing.
+	// inert line magics / shell escapes are discounted, and only because they bind
+	// nothing (the gate above has already refused every magic not proven inert).
 	const extracted = extractTopLevelImports(src);
 	if (!isImportsOnlyResidual(blankLineMagics(extracted.source))) return null;
 	const specs: ImportSpecs = new Map();

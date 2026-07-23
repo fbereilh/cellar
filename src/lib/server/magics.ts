@@ -71,10 +71,15 @@ export function isCellMagicCell(source: string | null | undefined): boolean {
  * magic, not Python" when deciding whether a cell is imports-only: a header of
  * `%matplotlib inline` / `%load_ext …` / `%pip install …` above the import block is
  * ubiquitous, and re-deriving what counts as a magic there would be a second,
- * drifting vocabulary. Note the deliberate asymmetry that makes reuse SAFE for that
- * caller: a bare magic or shell escape binds no Python name, while the assignment
- * form (`files = !ls`) keeps its binding as `name = None` and therefore still reads
- * as ordinary module-level code.
+ * drifting vocabulary. The assignment form (`files = !ls`) keeps its binding as
+ * `name = None` and therefore still reads as ordinary module-level code, which is
+ * what that caller needs.
+ *
+ * BUT NOT EVERY BARE MAGIC IS INERT, so blanking one here is right for the PROBE
+ * (magic syntax is not Python either way) and NOT sufficient for that caller:
+ * `%run setup.py` executes a script IN the user namespace, `%store -r name` and
+ * `%load` inject names, `%pylab` is a star import. `importBindings.ts` therefore
+ * gates on `hasNonInertLineMagic` as well - see `INERT_LINE_MAGICS`.
  */
 export function blankLineMagics(src: string): string {
 	const edits: { start: number; end: number; text: string }[] = [];
@@ -102,17 +107,74 @@ export function blankLineMagics(src: string): string {
 const EXT_LOADERS = new Set(['load_ext', 'reload_ext']);
 
 /**
+ * Line magics PROVEN to bind no name in the user namespace, and therefore safe for
+ * `importBindings.ts` to discount like a comment when testing "is this cell nothing
+ * but imports".
+ *
+ * It is an ALLOWLIST, deliberately: the failure directions are not symmetric. A
+ * magic wrongly listed here silently certifies a rebound name as unchanged - a false
+ * `fresh`, the one verdict staleness must never invent - while one wrongly left out
+ * only costs a needless re-run. So an unrecognized magic, including any IPython (or
+ * extension) adds later, disqualifies the cell.
+ *
+ * Adding an entry means proving the magic injects NOTHING into the namespace.
+ * Counter-examples that must stay OUT: `%run` (executes a script in the namespace,
+ * so `setup.py` may rebind `pd`), `%store -r name`, `%load`, `%pylab` (a star import
+ * of numpy/matplotlib names), `%timeit -o` in its assignment form (already handled -
+ * that keeps its left-hand side and reads as ordinary code).
+ *
+ * `autoreload` is listed because the flag line itself binds nothing; the reason it
+ * still disqualifies is separate and notebook-wide (see `hasAutoreloadMagic`).
+ */
+const INERT_LINE_MAGICS = new Set([
+	'matplotlib',
+	'load_ext',
+	'reload_ext',
+	'config',
+	'pip',
+	'conda',
+	'autoreload'
+]);
+
+/**
+ * Does this source contain a module-level line magic that is NOT on the inert
+ * allowlist - i.e. one we cannot claim binds nothing?
+ *
+ * Only `importBindings.ts` cares, and only to REFUSE. Shell escapes (`!cmd`) run a
+ * subprocess and bind nothing, so they are not considered here; the assignment form
+ * (`files = !ls`) is not a magic line at all after `blankLineMagics` and disqualifies
+ * through the ordinary imports-only residual test.
+ */
+export function hasNonInertLineMagic(source: string | null | undefined): boolean {
+	for (const line of logicalLines(source ?? '')) {
+		const text = line.raw.trimStart();
+		if (text[0] !== '%') continue;
+		const m = /^%{1,2}(\w+)/.exec(text);
+		if (!m || !INERT_LINE_MAGICS.has(m[1])) return true; // unknown ⇒ conservative
+	}
+	return false;
+}
+
+/**
  * Does this source arm IPython's `autoreload` extension (`%load_ext autoreload`,
  * `%autoreload 2`, …)?
  *
- * Only `importBindings.ts` cares, and only to REFUSE: every other magic is inert
- * for static analysis, but autoreload changes what re-executing an import means -
- * it reloads a changed module rather than handing back the object `sys.modules`
- * already holds. That is the one premise the import-binding staleness exemption
- * rests on, so a cell that arms autoreload keeps the conservative rule instead.
- * Any mention disqualifies, including `%autoreload 0`: distinguishing a live
- * setting from a disabled one would mean tracking cell execution order for a knob
- * whose whole purpose is to make imports non-idempotent.
+ * Autoreload changes what re-executing an import MEANS - it reloads a changed
+ * module rather than handing back the object `sys.modules` already holds - and that
+ * is the one premise the import-binding staleness exemption rests on. Any mention
+ * disqualifies, including `%autoreload 0`: distinguishing a live setting from a
+ * disabled one would mean tracking cell execution order for a knob whose whole
+ * purpose is to make imports non-idempotent.
+ *
+ * ARMING IT IS KERNEL-GLOBAL, SO THE GATE MUST BE NOTEBOOK-WIDE. The ubiquitous
+ * header puts `%load_ext autoreload` / `%autoreload 2` in its OWN cell, and Cellar
+ * makes that split the default outcome (`ensureImportsCell` adopts a first cell only
+ * via `isImportsOnly`, so a magic-only header is never adopted and a separate,
+ * magic-free imports cell is inserted above it). Checking only the cell being
+ * analyzed would therefore grant the exemption in exactly the arrangement where
+ * autoreload is most commonly armed. `dataflow.ts` runs this over EVERY code cell
+ * and, on a hit, omits `imports` for all of them so no edge anywhere is exempt;
+ * `importBindings.ts` keeps its own per-cell check as the local half.
  */
 export function hasAutoreloadMagic(source: string | null | undefined): boolean {
 	for (const line of logicalLines(source ?? '')) {

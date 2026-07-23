@@ -82,7 +82,7 @@ describe('importBindingSpecs - which names a source provides', () => {
 		expect(specs('import json\nimport ujson as json')).toEqual({ json: 'import ujson as json' });
 	});
 
-	it('DISCOUNTS line magics and shell escapes, which bind nothing', () => {
+	it('DISCOUNTS only the line magics PROVEN to bind nothing (plus shell escapes)', () => {
 		// `%matplotlib inline` above the import block is one of the commonest notebook
 		// headers there is. Treating it as "other code" would degrade the whole map to
 		// null and leave the reported bug unfixed for most real notebooks.
@@ -91,6 +91,24 @@ describe('importBindingSpecs - which names a source provides', () => {
 		expect(specs('%config InlineBackend.figure_format = "retina"\nimport os')).toEqual({
 			os: 'import os'
 		});
+	});
+
+	it('is UNKNOWABLE for a magic that injects names into the namespace', () => {
+		// `%run setup.py` executes the script IN the user namespace, so it can rebind an
+		// imported name (`pd = wrap(pd)`) exactly like `os = shim` - the shadow the
+		// imports-only test exists to refuse. Same for the other injectors.
+		expect(importBindingSpecs('import pandas as pd\n%run setup.py')).toBeNull();
+		expect(importBindingSpecs('%store -r pd\nimport os')).toBeNull();
+		expect(importBindingSpecs('%load helpers.py\nimport os')).toBeNull();
+		expect(importBindingSpecs('%pylab inline\nimport os')).toBeNull();
+	});
+
+	it('is UNKNOWABLE for an UNRECOGNIZED magic - the allowlist fails conservative', () => {
+		// The discount is an allowlist, not a denylist: a magic nobody here has heard of
+		// (a future IPython one, an extension's own) must cost a needless re-run, never
+		// certify a name it may have rebound as unchanged.
+		expect(importBindingSpecs('%mystery_magic\nimport os')).toBeNull();
+		expect(importBindingSpecs('import os\n%sql SELECT 1')).toBeNull();
 	});
 
 	it('still refuses the ASSIGNMENT form of a magic, which does bind', () => {

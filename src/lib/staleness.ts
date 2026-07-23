@@ -73,10 +73,16 @@
  *    `importlib.reload` (or a module with import-time side effects) breaks. Both
  *    are deliberate, explicit acts; treating them as ordinary would give back the
  *    blanket-stale this exists to remove. IPython's `%autoreload` breaks the same
- *    premise, but that one IS detected: a cell arming it is treated as unanalyzable,
- *    so its edges stay conservative (see `importBindings.ts`). Ordinary line magics
- *    (`%matplotlib inline`, `%pip install …`) bind nothing and are discounted, so a
- *    magic-headed imports cell still gets the refinement.
+ *    premise, and that one IS detected - notebook-wide, because arming it is a
+ *    KERNEL-global act and the usual header puts it in its own cell: if ANY code
+ *    cell mentions it, `dataflow.js` omits `imports` for every cell, so no edge
+ *    anywhere is exempt (see `magics.js`). Line magics PROVEN to bind nothing
+ *    (`%matplotlib inline`, `%pip install …`, `%config …`) are discounted, so a
+ *    magic-headed imports cell still gets the refinement - but that is an
+ *    ALLOWLIST: a magic that injects into the namespace (`%run` executes a script
+ *    THERE, `%store -r`, `%load`, `%pylab`) or any magic not on the list makes its
+ *    cell unanalyzable, so it keeps the conservative rule rather than risk
+ *    certifying a name that script rebound.
  *  - REMOVAL is only covered while the cell that provided the name survives. The
  *    ledger below reads `importBindings` off that cell, so DELETING the imports
  *    cell outright takes its stamps with it: its readers then have no definer, no

@@ -257,6 +257,36 @@ describe('an imports-cell edit stales only the affected dependents', () => {
 		expect(state(m, usesPd)).toBe(STALE_STATE.STALE);
 	});
 
+	it('%autoreload armed in ANOTHER cell still disarms the exemption notebook-wide', async () => {
+		// The repro that a same-cell test cannot catch, and the arrangement autoreload
+		// is actually used in: the header lives in its OWN cell, so a per-cell check
+		// leaves the (magic-free) imports cell fully exempt while every one of its
+		// bindings is being reloaded on re-run. Cellar makes that split the default -
+		// `ensureImportsCell` adopts a first cell only via `isImportsOnly`, so a
+		// magic-only header is never adopted.
+		const imports = ran(null, 'import mymod');
+		const header = ran(imports, '%load_ext autoreload\n%autoreload 2');
+		const reader = ran(header, 'x = mymod.f()');
+		// Re-run the imports cell: with autoreload armed this really does re-import a
+		// changed module, so the reader's input has moved.
+		const cell = nb.listCells(abs).find((c) => c.id === imports)!;
+		cell.metadata.cellar!.lastRun = ranStamp(RAN_AT + 5000);
+
+		const m = await staleness();
+		expect(state(m, reader)).toBe(STALE_STATE.STALE);
+	});
+
+	it('a name-injecting magic (%run) disqualifies its cell - the script may rebind', async () => {
+		// `%run setup.py` executes IN the namespace, so `pd` after it is not provably
+		// the module `import pandas as pd` bound.
+		const imports = ran(null, 'import pandas as pd\n%run setup.py');
+		const usesPd = ran(imports, 'x = pd.DataFrame()');
+		nb.setSource(imports, 'import pandas as pd\n%run setup.py\nimport re', abs);
+
+		const m = await staleness();
+		expect(state(m, usesPd)).toBe(STALE_STATE.STALE);
+	});
+
 	it('a star-import is unanalyzable, so it stays conservative', async () => {
 		const head = ran(null, 'import pandas as pd\nfrom os.path import *');
 		const consumer = ran(head, 'x = join(pd.__name__, "a")');

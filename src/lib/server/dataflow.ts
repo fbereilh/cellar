@@ -76,7 +76,7 @@ import { listCells } from './notebook';
 import { projectPython } from './databricks';
 import { computeStaleness } from '../staleness';
 import { isSqlCell } from '../cellLanguage';
-import { normalizeForAnalysis } from './magics';
+import { hasAutoreloadMagic, normalizeForAnalysis } from './magics';
 import { parseSqlCell } from './sql';
 import { importBindingNames } from './importBindings';
 import { LruCache } from './lru';
@@ -455,6 +455,22 @@ function importNamesFor(source: string): string[] {
 	return names;
 }
 
+/**
+ * source string → does it arm `%autoreload`. Cached for the same reason as
+ * `importCache`: this one is scanned over EVERY code cell on every debounced pass
+ * (the gate is notebook-wide), not just over cells whose analysis is missing.
+ */
+const autoreloadCache = new LruCache<string, boolean>(1000);
+
+/** Does `source` arm `%autoreload` (a kernel-global act), cached. */
+function armsAutoreload(source: string): boolean {
+	const hit = autoreloadCache.get(source);
+	if (hit !== undefined) return hit;
+	const armed = hasAutoreloadMagic(source);
+	autoreloadCache.set(source, armed);
+	return armed;
+}
+
 /** A probe run's public outcome plus WHY it failed (a timeout is the one we back off). */
 type RawProbe = ProbeRun & { timedOut: boolean };
 
@@ -555,6 +571,7 @@ async function probeBatch(items: ProbeItem[]): Promise<BatchRun> {
 export function __resetDataflowState(): void {
 	cache.clear();
 	importCache.clear();
+	autoreloadCache.clear();
 	backoff.clear();
 	inflight.clear();
 }
@@ -645,6 +662,17 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 	// result gets no upstream edge and never goes stale when the query is edited.
 	const sql = cells.filter((c) => c.cell_type === 'code' && isSqlCell(c));
 	const code = cells.filter((c) => c.cell_type === 'code' && !isSqlCell(c));
+	// `%autoreload` is a KERNEL-GLOBAL setting, so its effect on the import-binding
+	// exemption is notebook-wide, not cell-local: with it armed, re-running `import
+	// mymod` re-imports a changed module instead of handing back the `sys.modules`
+	// object, so dependents really do go stale and NO edge may be exempt. The
+	// ubiquitous header arms it in its OWN cell (and Cellar's `ensureImportsCell`
+	// makes that split the default, since it adopts a first cell only via
+	// `isImportsOnly`), so a per-cell check alone would grant the exemption in
+	// exactly the arrangement where autoreload is most commonly used. One hit
+	// anywhere ⇒ omit `imports` everywhere ⇒ the whole notebook falls back to the
+	// conservative cell-level rule.
+	const autoreloadArmed = code.some((c) => armsAutoreload(c.source ?? ''));
 	const missing: ProbeItem[] = [];
 	for (const c of code) {
 		const src = c.source ?? '';
@@ -691,7 +719,7 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 		// defines can be exempted downstream, so an unavailable cell (empty defines)
 		// carries no exemption either - it stays conservative-stale as the backoff
 		// design requires. Merged into a COPY: `cached` is the shared LRU entry.
-		const imports = importNamesFor(src);
+		const imports = autoreloadArmed ? [] : importNamesFor(src);
 		if (imports.length) out[c.id] = { ...out[c.id], imports };
 	}
 	// Synthetic dataflow for SQL cells: `sql.ts` compiles the cell to a `spark.sql()`
