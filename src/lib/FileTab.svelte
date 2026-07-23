@@ -49,12 +49,15 @@
 	// ---- Rendered preview (markdown + html) -----------------------------------
 	// Two file kinds can toggle between the raw source editor and a rendered view:
 	// `.md`/`.markdown` (the notebook markdown renderer) and `.html`/`.htm` (a
-	// SANDBOXED iframe — see `HtmlPreview.svelte`). `liveSource` mirrors the editor
-	// buffer, so a preview always reflects unsaved edits and toggling back
-	// re-renders from the current content. The view choice is remembered across
-	// files as a session-wide preference, per kind — markdown defaults to source
-	// (you open a `.md` to edit it), HTML defaults to preview (you open an export
-	// to look at it).
+	// SANDBOXED iframe — see `HtmlPreview.svelte`). `liveSource` carries the editor
+	// buffer into the preview, so a preview always reflects unsaved edits and
+	// toggling back re-renders from the current content. It is sampled when a
+	// preview is entered (and after the initial load), never per keystroke: the
+	// editor is `display:none` under a preview, so its document cannot change
+	// while one is on screen, and a 2 MB export must not be serialized on the
+	// edit path. The view choice is remembered across files as a session-wide
+	// preference, per kind — markdown defaults to source (you open a `.md` to
+	// edit it), HTML defaults to preview (you open an export to look at it).
 	type ViewMode = 'source' | 'preview';
 	type PreviewKind = 'markdown' | 'html' | null;
 
@@ -91,13 +94,17 @@
 	);
 
 	function setViewMode(m: ViewMode) {
+		if (m === 'preview' && view) liveSource = view.state.doc.toString();
 		viewMode = m;
 		try {
 			localStorage.setItem(viewKey, m);
 		} catch {}
 	}
 
-	const showPreview = $derived(previewKind !== null && viewMode === 'preview' && status !== 'error');
+	// Gated on `ready`, not merely "not error": a preview mounted while the fetch
+	// is still in flight would render an empty document — an "Empty file"
+	// placeholder for a file that is simply not loaded yet.
+	const showPreview = $derived(previewKind !== null && viewMode === 'preview' && status === 'ready');
 
 	// Toggle order: the kind's default view leads.
 	const viewModes = $derived<ViewMode[]>(
@@ -109,13 +116,17 @@
 	// so both editor themes style it without any theme-side work.
 	const tomlLang = () => StreamLanguage.define(tomlMode);
 
+	// Matched on a lowercased path, so every kind is case-insensitive like
+	// `previewKindOf`/`isHtmlPath` — a `README.MD` that gets the rendered-preview
+	// toggle must also get markdown highlighting in Source mode.
 	function langFor(p: string): Extension {
-		if (p.endsWith('.py')) return python();
-		if (p.endsWith('.md') || p.endsWith('.markdown')) return markdown();
-		if (p.endsWith('.json') || p.endsWith('.ipynb')) return jsonLang();
-		if (p.endsWith('.yml') || p.endsWith('.yaml')) return yamlLang();
-		if (p.endsWith('.toml')) return tomlLang();
-		if (isHtmlPath(p)) return htmlLang();
+		const q = p.toLowerCase();
+		if (q.endsWith('.py')) return python();
+		if (q.endsWith('.md') || q.endsWith('.markdown')) return markdown();
+		if (q.endsWith('.json') || q.endsWith('.ipynb')) return jsonLang();
+		if (q.endsWith('.yml') || q.endsWith('.yaml')) return yamlLang();
+		if (q.endsWith('.toml')) return tomlLang();
+		if (isHtmlPath(q)) return htmlLang();
 		return [];
 	}
 
@@ -261,10 +272,7 @@
 					EDITOR_THEME,
 					Prec.highest(keymap.of([{ key: 'Mod-s', run: () => (save(), true) }])),
 					EditorView.updateListener.of((v: ViewUpdate) => {
-						if (v.docChanged) {
-							setDirty(true);
-							if (previewKind) liveSource = v.state.doc.toString();
-						}
+						if (v.docChanged) setDirty(true);
 						// Cursor moved (or the doc shifted the line under it) → re-map blame.
 						if (v.selectionSet || v.docChanged) scheduleBlame();
 					}),

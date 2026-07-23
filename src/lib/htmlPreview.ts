@@ -33,14 +33,32 @@ export function isHtmlPath(path: string): boolean {
 }
 
 /**
- * Elements whose `src` (or, for `<link>`, `href`) makes the browser FETCH a
- * subresource. Plain `<a href>` is deliberately excluded: a relative link is a
- * navigation the user has not asked for yet, not a broken render.
+ * One pass over the document: either a comment opener, or an element whose `src`
+ * (or, for `<link>`, `href`) makes the browser FETCH a subresource. Plain
+ * `<a href>` is deliberately excluded: a relative link is a navigation the user
+ * has not asked for yet, not a broken render.
+ *
+ * `<script>`/`<style>` are in the list for their own attributes AND because they
+ * open a raw-text body: a self-contained export inlines a minified bundle whose
+ * string literals build `<img src="…">` markup, so scanning that body would
+ * report the very file this preview targets as having unresolvable assets.
  */
-const SUBRESOURCE_TAG = /<(link|script|img|iframe|frame|source|audio|video|embed|track|object)\b([^>]*)>/gi;
+const TOKEN =
+	/<!--|<(link|script|style|img|iframe|frame|source|audio|video|embed|track|object)\b([^>]*)>/gi;
 
-/** `src="…"` / `href="…"` / `data="…"`, quoted or bare, inside one tag's attributes. */
-const URL_ATTR = /\b(?:src|href|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+/** Closers for the two raw-text bodies `TOKEN` skips over. */
+const CLOSE_TAG: Record<string, RegExp> = {
+	script: /<\/\s*script\b/gi,
+	style: /<\/\s*style\b/gi
+};
+
+/**
+ * `src="…"` / `href="…"` / `data="…"`, quoted or bare, inside one tag's
+ * attributes. The name is anchored to an attribute boundary rather than `\b`,
+ * because `-` is a non-word character: `\bsrc=` matches inside `data-src=`, and
+ * a lazy-loading page whose real refs are all absolute would be misreported.
+ */
+const URL_ATTR = /(?:^|[\s/])(?:src|href|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
 
 /**
  * A reference that resolves WITHOUT the file's folder: absolute URLs, protocol-
@@ -57,21 +75,46 @@ function resolvesWithoutFolder(url: string): boolean {
 	return /^[a-z][a-z0-9+.-]*:/i.test(u);
 }
 
+/** True when one tag's attribute text carries a folder-relative subresource ref. */
+function attrsRefRelative(attrs: string): boolean {
+	URL_ATTR.lastIndex = 0;
+	let attr: RegExpExecArray | null;
+	while ((attr = URL_ATTR.exec(attrs))) {
+		const value = attr[1] ?? attr[2] ?? attr[3] ?? '';
+		if (!resolvesWithoutFolder(value)) return true;
+	}
+	return false;
+}
+
 /**
  * True when the document loads at least one subresource by a path relative to
  * the file on disk — i.e. content the sandboxed preview cannot resolve. A
  * self-contained export (everything inline, or CDN URLs) returns false.
+ *
+ * Markup-shaped text that a browser never treats as markup — an HTML comment,
+ * or a string inside a `<script>`/`<style>` body — is skipped, so an inlined
+ * bundle cannot fake a reference the page does not actually load.
  */
 export function hasRelativeAssetRefs(html: string): boolean {
-	SUBRESOURCE_TAG.lastIndex = 0;
-	let tag: RegExpExecArray | null;
-	while ((tag = SUBRESOURCE_TAG.exec(html))) {
-		const attrs = tag[2] ?? '';
-		URL_ATTR.lastIndex = 0;
-		let attr: RegExpExecArray | null;
-		while ((attr = URL_ATTR.exec(attrs))) {
-			const value = attr[1] ?? attr[2] ?? attr[3] ?? '';
-			if (!resolvesWithoutFolder(value)) return true;
+	TOKEN.lastIndex = 0;
+	let token: RegExpExecArray | null;
+	while ((token = TOKEN.exec(html))) {
+		if (token[0] === '<!--') {
+			const end = html.indexOf('-->', TOKEN.lastIndex);
+			// Unterminated: a browser comments out the rest of the document.
+			if (end === -1) return false;
+			TOKEN.lastIndex = end + 3;
+			continue;
+		}
+		if (attrsRefRelative(token[2] ?? '')) return true;
+
+		const closer = CLOSE_TAG[token[1].toLowerCase()];
+		if (closer) {
+			closer.lastIndex = TOKEN.lastIndex;
+			const close = closer.exec(html);
+			// Unterminated: a browser reads the rest of the document as raw text.
+			if (!close) return false;
+			TOKEN.lastIndex = close.index;
 		}
 	}
 	return false;

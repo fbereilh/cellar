@@ -82,6 +82,52 @@ describe('hasRelativeAssetRefs', () => {
 		expect(hasRelativeAssetRefs('<SCRIPT   SRC = "app.js" ></SCRIPT>')).toBe(true);
 	});
 
+	// A self-contained plotly/bokeh export inlines a minified bundle whose string
+	// literals build `<img …>` markup. Reporting that as an unresolvable asset
+	// would put the notice on exactly the file the preview targets.
+	it('ignores markup-shaped text inside a <script> body', () => {
+		expect(
+			hasRelativeAssetRefs('<html><script>var t="<img src=\\""+u+"\\">";</script></html>')
+		).toBe(false);
+		expect(hasRelativeAssetRefs('<script>var s = \'<link href="a/b.css">\';</script>')).toBe(false);
+		// The script tag's OWN attributes are still scanned.
+		expect(hasRelativeAssetRefs('<script src="app/main.js">var t="<img src=\'x\'>";</script>')).toBe(
+			true
+		);
+		// …and so is markup after the body closes.
+		expect(hasRelativeAssetRefs('<script>var t="<b>";</script><img src="figures/a.png">')).toBe(
+			true
+		);
+	});
+
+	it('ignores markup-shaped text inside a <style> body', () => {
+		expect(hasRelativeAssetRefs('<style>/* <img src="a/b.png"> */ body{color:red}</style>')).toBe(
+			false
+		);
+		expect(hasRelativeAssetRefs('<style>body{color:red}</style><script src="a/b.js"></script>')).toBe(
+			true
+		);
+	});
+
+	it('ignores markup inside an HTML comment', () => {
+		expect(
+			hasRelativeAssetRefs('<!-- <script src="old/app.js"></script> --><body>hi</body>')
+		).toBe(false);
+		expect(hasRelativeAssetRefs('<!-- old --><img src="figures/a.png">')).toBe(true);
+	});
+
+	// `\b(?:src|href)` matches inside `data-src=`, so a lazy-loading page whose
+	// real refs are absolute or inline would be misreported.
+	it('does not match data-* attributes that merely end in a URL attribute name', () => {
+		expect(hasRelativeAssetRefs('<img data-src="figures/a.png" src="https://x/y.png">')).toBe(false);
+		expect(hasRelativeAssetRefs('<link data-href="a/b.css" href="https://x/y.css">')).toBe(false);
+		expect(hasRelativeAssetRefs('<object data-data="a/b.svg" data="https://x/y.svg"></object>')).toBe(
+			false
+		);
+		// The real attribute right beside it is still seen.
+		expect(hasRelativeAssetRefs('<img data-src="https://x/y.png" src="figures/a.png">')).toBe(true);
+	});
+
 	it('is stateless across calls (the module-level regexes never carry lastIndex)', () => {
 		const relative = '<img src="a/b.png">';
 		for (let i = 0; i < 5; i++) expect(hasRelativeAssetRefs(relative)).toBe(true);
