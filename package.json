@@ -25,6 +25,7 @@
     "node": ">=18"
   },
   "scripts": {
+    "prepare": "svelte-kit sync || echo ''",
     "dev": "vite dev",
     "build": "vite build",
     "postbuild": "node scripts/gen-build-info.js",
