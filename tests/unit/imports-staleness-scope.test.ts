@@ -240,6 +240,22 @@ describe('an imports-cell edit stales only the affected dependents', () => {
 		expect(state(m, usesN)).toBe(STALE_STATE.FRESH);
 	});
 
+	it('a WIPED providing cell still records the removal that follows it', async () => {
+		// `clearLastRunStamps` (the wipe-variables route) deletes `lastRun` from cells
+		// that RAN - it is a statement about the namespace, not about execution. Dating
+		// the removal-record prune against the providing cell's own stamp therefore read
+		// the imports cell as "never bound anything", dropped `pd`'s removal record, and
+		// left a reader of `pd` with no definer, no ledger entry and a false `fresh`.
+		const { imports, usesPd } = notebook();
+		nb.clearLastRunStamps([imports], abs);
+		nb.setSource(imports, 'import numpy as np', abs); // `pd` deliberately dropped
+
+		const cell = nb.listCells(abs).find((c) => c.id === imports)!;
+		expect(cell.metadata.cellar!.importBindings?.pd?.removedAt).toBeTruthy();
+		const m = await staleness();
+		expect(state(m, usesPd)).toBe(STALE_STATE.STALE);
+	});
+
 	it('but DELETING every import really does stale its readers (never a false fresh)', async () => {
 		// The half the undoable removal must not trade away: with the imports gone the
 		// readers have no definer at all, so only the removal record can flag them.

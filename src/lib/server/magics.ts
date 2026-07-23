@@ -81,21 +81,16 @@ export function isBareMagicLine(raw: string): boolean {
  * expression (`x = (a\n% b)`) is part of the previous logical line and never
  * mistaken for a magic.
  *
- * Exported because `importBindings.ts` needs the SAME notion of "this line is a
- * magic, not Python" when deciding whether a cell is imports-only: a header of
- * `%matplotlib inline` / `%load_ext …` / `%pip install …` above the import block is
- * ubiquitous, and re-deriving what counts as a magic there would be a second,
- * drifting vocabulary. The assignment form (`files = !ls`) keeps its binding as
- * `name = None` and therefore still reads as ordinary module-level code, which is
- * what that caller needs.
- *
- * BUT NOT EVERY BARE MAGIC IS INERT, so blanking one here is right for the PROBE
- * (magic syntax is not Python either way) and NOT sufficient for that caller:
- * `%run setup.py` executes a script IN the user namespace, `%store -r name` and
- * `%load` inject names, `%pylab` is a star import. `importBindings.ts` therefore
- * gates on `hasNonInertLineMagic` as well - see `INERT_LINE_MAGICS`.
+ * Internal to the PROBE path (`normalizeForAnalysis`). `importBindings.ts` asks the
+ * related but distinct question "is this cell nothing but imports", and reaches the
+ * shared vocabulary directly: `isBareMagicLine` for the shape of a magic line, and
+ * `scanMagics` for whether every magic present is one we can prove inert. Blanking a
+ * magic is right here because magic syntax is not Python either way, and NOT
+ * sufficient there - `%run setup.py` executes a script IN the user namespace,
+ * `%store -r name` and `%load` inject names, `%pylab` is a star import (see
+ * `INERT_LINE_MAGICS`).
  */
-export function blankLineMagics(src: string): string {
+function blankLineMagics(src: string): string {
 	const edits: { start: number; end: number; text: string }[] = [];
 	for (const line of logicalLines(src)) {
 		if (isBareMagicLine(line.raw)) {
@@ -152,26 +147,19 @@ const EXT_LOADERS = new Set(['load_ext', 'reload_ext']);
  */
 const INERT_LINE_MAGICS = new Set(['matplotlib', 'config', 'pip', 'conda', 'autoreload']);
 
-/**
- * Does this source contain a module-level line magic that is NOT on the inert
- * allowlist - i.e. one we cannot claim binds nothing?
- *
- * Only `importBindings.ts` cares, and only to REFUSE. Shell escapes (`!cmd`) run a
- * subprocess and bind nothing, so they are not considered here; the assignment form
- * (`files = !ls`) is not a bare magic line at all (see `isBareMagicLine`) and
- * disqualifies through the ordinary imports-only residual test.
- */
-export function hasNonInertLineMagic(source: string | null | undefined): boolean {
-	return scanMagics(logicalLines(source ?? '')).nonInert;
-}
-
 /** What one walk over a cell's logical lines says about its magics. */
 export interface MagicScan {
 	/** The cell opens with a `%%name` cell magic, so its body is not module-level Python. */
 	cellMagic: boolean;
 	/** Some line arms `autoreload` (see `hasAutoreloadMagic`). */
 	autoreload: boolean;
-	/** Some line magic is NOT on the inert allowlist, i.e. may inject a name. */
+	/**
+	 * Some line magic is NOT on the inert allowlist, i.e. one we cannot claim binds
+	 * nothing. Only `importBindings.ts` reads it, and only to REFUSE. Shell escapes
+	 * (`!cmd`) run a subprocess and bind nothing, so they never set it; the assignment
+	 * form (`files = !ls`) is not a bare magic line at all (see `isBareMagicLine`) and
+	 * disqualifies through the ordinary imports-only residual test instead.
+	 */
 	nonInert: boolean;
 }
 
@@ -179,10 +167,10 @@ export interface MagicScan {
  * Every magic question `importBindings.ts` asks, answered in ONE pass over lines the
  * caller has already tokenized.
  *
- * It exists because that caller used to ask them separately (`isCellMagicCell`,
- * `hasAutoreloadMagic`, `hasNonInertLineMagic`), paying a full tokenizer walk each,
- * on every 500ms autosave of every cell. The rules themselves are unchanged and stay
- * here, so there is still one vocabulary of what a magic is.
+ * It exists because that caller used to ask them separately (one query per fact),
+ * paying a full tokenizer walk each, on every 500ms autosave of every cell. The rules
+ * themselves are unchanged and stay here, so there is still one vocabulary of what a
+ * magic is; `hasAutoreloadMagic` is the same scan for callers holding only a source.
  *
  * `cellMagic` mirrors `cellMagicName` on the first non-blank line; the two must keep
  * agreeing (that function stays the entry point for callers that need the NAME).

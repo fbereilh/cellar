@@ -123,25 +123,51 @@ function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCella
 	// not changed since the document loaded", and a pasted `import polars as pd`
 	// above a reader of `pd` would exempt the very edge it just rebound - the one
 	// verdict staleness must never invent. Folded from an EMPTY previous source: the
-	// cell did not exist before, so nothing about it was ever proven stable.
-	setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()));
+	// cell did not exist before, so nothing about it was ever proven stable. A birth
+	// records no removal, so there is nothing here for the prune to date (null).
+	setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
 	return cell;
+}
+
+/**
+ * The newest moment any cell in this notebook could have CONSUMED another cell's
+ * import bindings: the latest `lastRun.at` in the document, or null when no cell
+ * carries one.
+ *
+ * It dates `pruneImportBindings`. A per-cell stamp cannot: the "wipe variables" route
+ * (`clearLastRunStamps`) deletes `lastRun` from cells that DID run, so reading only the
+ * providing cell's own stamp made a wiped cell look like it had never bound anything.
+ * A cell with no stamp reads `not_run` and never reaches the removal ledger, so the
+ * document's newest stamp bounds every consumption the ledger can be asked about.
+ */
+function latestConsumeAt(doc: NotebookDoc): number | null {
+	let latest: number | null = null;
+	for (const c of doc.cells) {
+		const at = c.metadata?.cellar?.lastRun?.at;
+		if (typeof at === 'number' && (latest == null || at > latest)) latest = at;
+	}
+	return latest;
 }
 
 /**
  * Store (or clear) a cell's runtime-only import-binding baseline.
  *
- * Pruned on the way in, against this cell's own last run, so the removal records a
- * debounced autosave mints for a name that was born and died between two runs do not
- * accumulate for the life of the session (see `pruneImportBindings`).
+ * Pruned on the way in, against the notebook's newest run, so the removal records a
+ * debounced autosave mints for a name that was born and died after every run do not
+ * accumulate for the life of the session - while a removal any cell could have read
+ * is kept, whatever happened to this cell's own run stamp (see `pruneImportBindings`).
  *
  * An empty map is stored as ABSENT rather than `{}`: it says exactly the same
  * thing (nothing proven, nothing changed) and every ordinary code cell would
  * otherwise ship a useless object to the browser on each `cell:edited`, and carry
  * it into every deep-cloned checkpoint snapshot.
  */
-function setImportBindings(cellar: CellarNamespace, stamps: ImportChangeStamps): void {
-	const kept = pruneImportBindings(stamps, cellar.lastRun?.at ?? null);
+function setImportBindings(
+	cellar: CellarNamespace,
+	stamps: ImportChangeStamps,
+	consumedBefore: number | null
+): void {
+	const kept = pruneImportBindings(stamps, consumedBefore);
 	if (Object.keys(kept).length) cellar.importBindings = kept;
 	else delete cellar.importBindings;
 }
@@ -863,7 +889,8 @@ export function setSource(id: string, source: string, nb?: string | null, origin
 		// never compared against, see `foldImportChange`.
 		setImportBindings(
 			cell.metadata.cellar,
-			foldImportChange(prevSource, source, cell.metadata.cellar.importBindings, now)
+			foldImportChange(prevSource, source, cell.metadata.cellar.importBindings, now),
+			latestConsumeAt(doc)
 		);
 		persist(doc);
 		emit(doc, 'cell:edited', { cellId: id, source }, originId);

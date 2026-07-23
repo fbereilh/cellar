@@ -99,8 +99,8 @@ export interface ImportBinding {
 	/**
 	 * Wall-clock ms the name first APPEARED in this cell, as opposed to `at`, which
 	 * moves on every rebinding. 0 (or absent) means it may have been here all along.
-	 * Only `pruneImportBindings` reads it, to tell a binding that was live at the
-	 * cell's last run from one that was born and died between two runs.
+	 * Only `pruneImportBindings` reads it, to tell a binding that was live while the
+	 * notebook was running from one that was born and died after every run.
 	 */
 	sinceAt?: number;
 }
@@ -303,28 +303,41 @@ export function foldImportChange(
  * checkpoint, and a short phantom name (`n`, `p`, `re`) colliding with a real one
  * made the ledger report a removal that never happened.
  *
- * THE TEST IS "WAS IT BOUND WHEN THIS CELL LAST RAN", NOT "IS IT IN THE SOURCE NOW" -
- * and the distinction is the whole safety of this function. Pruning every name the
- * current source lacks would delete exactly the records the ledger exists for, since a
- * genuinely deleted import is also absent from the source. A name that appeared AFTER
- * the last run (`sinceAt > lastRunAt`) and has since gone never entered the namespace
- * this cell contributed to, so nothing downstream can have read it; a name that was
- * already there when the cell ran did, so its removal record survives - however many
- * times it was rebound in between, because `sinceAt` tracks first appearance while
- * `at` tracks rebinding.
+ * THE TEST IS "COULD ANY CELL HAVE READ IT", NOT "IS IT IN THE SOURCE NOW" - and the
+ * distinction is the whole safety of this function. Pruning every name the current
+ * source lacks would delete exactly the records the ledger exists for, since a
+ * genuinely deleted import is also absent from the source. So the reference is
+ * `consumedBefore`: the newest `lastRun.at` anywhere in the NOTEBOOK (see
+ * `notebook.ts`'s `latestConsumeAt`). A binding that first appeared after that moment
+ * (`sinceAt > consumedBefore`) and has since gone was never live during any run, so no
+ * cell can have consumed it and its record is forgotten; a binding that was already
+ * there keeps its record - however many times it was rebound in between, because
+ * `sinceAt` tracks first appearance while `at` tracks rebinding.
  *
- * A cell that has never run (`lastRunAt` null) bound nothing at all, so the same rule
- * drops its removals. An entry from before this field existed (a restored checkpoint)
- * reads as `sinceAt` 0 and is therefore kept.
+ * WHY THE NOTEBOOK'S NEWEST RUN AND NOT THIS CELL'S OWN. `lastRun` is not only absent
+ * on a never-run cell: `clearLastRunStamps` (the "wipe variables" route) DELETES it
+ * from cells that ran, precisely because they ran and defined a wiped name. Dating the
+ * prune against this cell's own stamp therefore read a wiped cell as "never bound
+ * anything", dropped its removal records, and left a reader of a since-deleted import
+ * with no definer, no ledger entry and a false `fresh` - the one verdict this may never
+ * invent. A reader can only consult the ledger if it HAS a run stamp (one without reads
+ * `not_run` and returns before the ledger), so the notebook's newest stamp is an upper
+ * bound on every consumption that can matter, and it survives a wipe of any one cell.
+ *
+ * `consumedBefore` null (nothing in the notebook has ever run, or a wipe cleared every
+ * stamp) means we cannot date anything, so NOTHING is pruned. That prunes strictly less
+ * than dating against the cell's own run did - the deliberate trade: an unbounded map
+ * is a cost, a false `fresh` is a defect. An entry from before `sinceAt` existed (a
+ * restored checkpoint) reads as 0 and is likewise kept.
  */
 export function pruneImportBindings(
 	stamps: ImportChangeStamps,
-	lastRunAt: number | null | undefined
+	consumedBefore: number | null | undefined
 ): ImportChangeStamps {
+	if (consumedBefore == null) return { ...stamps }; // undatable ⇒ keep everything
 	const out: ImportChangeStamps = {};
 	for (const [name, b] of Object.entries(stamps)) {
-		const phantom = lastRunAt == null || (b.sinceAt ?? 0) > lastRunAt;
-		if (b.removedAt != null && phantom) continue;
+		if (b.removedAt != null && (b.sinceAt ?? 0) > consumedBefore) continue;
 		out[name] = b;
 	}
 	return out;

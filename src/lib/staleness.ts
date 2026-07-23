@@ -93,10 +93,13 @@
  *    in general. Same family: an edit that drops a binding AND leaves the cell
  *    unanalyzable in one step records no change for the dropped name (see
  *    `foldImportChange`), so its readers - which have no definer either - stay
- *    `fresh` too. The ledger is also scoped to names that were bound when the
- *    providing cell LAST RAN (`pruneImportBindings`): one that appeared and went
- *    between two runs never entered the namespace, so nothing downstream can have
- *    read it and its record is forgotten rather than kept forever.
+ *    `fresh` too. The ledger is also scoped to names that could actually have been
+ *    read (`pruneImportBindings`): one that appeared and went after the notebook's
+ *    newest run never entered the namespace while anything ran, so nothing can have
+ *    read it and its record is forgotten rather than kept forever. That reference is
+ *    the whole DOCUMENT's newest run, not the providing cell's own - a "wipe
+ *    variables" deletes `lastRun` from cells that ran - and when nothing in the
+ *    notebook has run, nothing is pruned at all.
  *  - Redefinition resolves to that nearest preceding definer, which is correct
  *    for the common top-to-bottom notebook and approximate for out-of-order runs.
  */

@@ -280,9 +280,10 @@ describe('foldImportChange - when each binding last changed', () => {
 });
 
 describe('pruneImportBindings - which removal records are worth remembering', () => {
+	// The reference is the notebook's newest run, not the providing cell's own stamp.
 	const RAN_AT = 1000;
 
-	it('DROPS a name born and removed between two runs (a debounced mid-edit phantom)', () => {
+	it('DROPS a name born and removed after every run (a debounced mid-edit phantom)', () => {
 		// Retyping `import numpy as np` persists `import numpy as n` on the way through,
 		// so `n` is minted and removed a keystroke later. Nothing ran while it existed,
 		// so no downstream cell can have read it - and left in the map it would grow the
@@ -296,7 +297,7 @@ describe('pruneImportBindings - which removal records are worth remembering', ()
 		}); // …and the prune is what forgets it
 	});
 
-	it('KEEPS the removal of a name that WAS bound when the cell last ran', () => {
+	it('KEEPS the removal of a name that WAS bound while the notebook was running', () => {
 		// The half that must never be traded away: a genuinely deleted import has to keep
 		// staling its readers, and they have no definer left to reach it by any other
 		// route. Pruning "every name the current source lacks" would delete exactly this.
@@ -322,9 +323,13 @@ describe('pruneImportBindings - which removal records are worth remembering', ()
 		expect(pruneImportBindings(out, null)).toEqual(out); // nothing removed ⇒ nothing to prune
 	});
 
-	it('drops the removals of a cell that has never run - it bound nothing to consume', () => {
+	it('KEEPS every removal when nothing can be dated - an undatable record is never dropped', () => {
+		// A null reference means no cell in the notebook carries a run stamp, which is NOT
+		// the same as "nothing ever ran": the wipe-variables route DELETES `lastRun` from
+		// cells that did run. Dropping records here is how a wiped notebook produced a
+		// false `fresh` for a reader of a since-deleted import, so undatable means keep.
 		const gone = foldImportChange('import numpy as np', '', {}, RAN_AT);
-		expect(pruneImportBindings(gone, null)).toEqual({});
+		expect(pruneImportBindings(gone, null).np?.removedAt).toBe(RAN_AT);
 	});
 
 	it('keeps a legacy entry that predates sinceAt rather than guessing', () => {
