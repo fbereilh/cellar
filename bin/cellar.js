@@ -767,6 +767,15 @@ async function main() {
 		// uncleanly (parent-watch.js), so it never lingers orphaned serving stale code.
 		CELLAR_LAUNCHER_PID: String(process.pid),
 		PORT: String(appPort)
+		// The app-wide request-body ceiling is deliberately left alone here.
+		// adapter-node applies it upstream of every route, so raising it for the
+		// file-save PUT would raise how much memory ANY unauthenticated request can
+		// make this process buffer. Its safe 512 K default stands; a document too
+		// big to fit through it opens read-only instead (see $lib/saveLimit.ts). An
+		// operator who sets BODY_SIZE_LIMIT still wins in full: the spread above
+		// passes their environment through untouched, and the app reports the value
+		// actually in force to each file tab, so their larger ceiling really does
+		// widen the editable range.
 	};
 
 	let app;

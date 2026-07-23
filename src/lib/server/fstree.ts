@@ -21,6 +21,8 @@ import {
 	cpSync
 } from 'node:fs';
 import { join, resolve, relative, sep, basename, dirname, extname } from 'node:path';
+import { isHtmlPath } from '$lib/htmlPreview';
+import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES } from '$lib/server/limits.js';
 
 // Directories that are noise for a workspace file tree.
 const IGNORE_DIRS = new Set([
@@ -35,7 +37,18 @@ const IGNORE_DIRS = new Set([
 ]);
 
 const MAX_DEPTH = 8; // guard against pathological deep trees
-const MAX_FILE_BYTES = 2 * 1024 * 1024; // don't stream giant files into a tab
+
+/**
+ * Byte ceiling for opening `relPath` into a tab. HTML gets the higher one (see
+ * `limits.js` for why, and for the save-side limit derived from it).
+ *
+ * Identity comes from the same `isHtmlPath` the rest of the feature resolves
+ * (preview kind, syntax highlighting, the file icon), so there is one answer to
+ * "is this an HTML file" and never an ad-hoc extension test here.
+ */
+function maxFileBytesFor(relPath: string): number {
+	return isHtmlPath(relPath) ? MAX_HTML_FILE_BYTES : MAX_FILE_BYTES;
+}
 
 /**
  * One node in the workspace file tree (`buildTree`'s recursive shape). The
@@ -116,7 +129,7 @@ export function readWorkspaceFile(relPath: string): string {
 	const abs = resolveInWorkspace(relPath);
 	const st = statSync(abs);
 	if (!st.isFile()) throw new Error('not a file');
-	if (st.size > MAX_FILE_BYTES) throw new Error('file too large to open');
+	if (st.size > maxFileBytesFor(relPath)) throw new Error('file too large to open');
 	const buf = readFileSync(abs);
 	// Cheap binary sniff: a NUL byte in the first 4KB → treat as binary.
 	const slice = buf.subarray(0, Math.min(buf.length, 4096));
@@ -124,10 +137,25 @@ export function readWorkspaceFile(relPath: string): string {
 	return buf.toString('utf8');
 }
 
-/** Write text content to a workspace file (used by editor-tab save). */
+/**
+ * Write text content to a workspace file (used by editor-tab save).
+ *
+ * Refused above the SAME per-path ceiling `readWorkspaceFile` enforces: a save
+ * that lands bytes the reader will not reopen strands the file the moment its
+ * tab closes ("file too large to open" from then on). This is the ceiling on the
+ * FILE, so its message names that ceiling - distinct from the front-end's 413,
+ * which is adapter-node refusing the request body before any handler runs (a
+ * document that big opens read-only in the first place; see `$lib/saveLimit.ts`).
+ * Nothing is written on refusal: the original file is left exactly as it was.
+ */
 export function writeWorkspaceFile(relPath: string, content: string | null | undefined): void {
 	const abs = resolveInWorkspace(relPath);
-	writeFileSync(abs, content ?? '', 'utf8');
+	const text = content ?? '';
+	const max = maxFileBytesFor(relPath);
+	if (Buffer.byteLength(text, 'utf8') > max) {
+		throw new Error(`file too large to save (over the ${Math.round(max / (1024 * 1024))} MB limit)`);
+	}
+	writeFileSync(abs, text, 'utf8');
 }
 
 // ---- File-management operations (sidebar file explorer) -------------------

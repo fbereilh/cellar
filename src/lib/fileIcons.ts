@@ -21,6 +21,7 @@ type IconKind =
 	| 'json'
 	| 'svelte'
 	| 'markdown'
+	| 'html'
 	| 'config'
 	| 'image'
 	| 'folder'
@@ -39,6 +40,9 @@ const ICONS: Record<IconKind, string> = {
 	// Markdown: the classic "M▾" mark in a rounded outline.
 	markdown:
 		'<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="1" y="3.5" width="14" height="9" rx="1.5" fill="none" stroke="#42a5f5" stroke-width="1.3"/><path d="M3.4 10.6V6.2l2 2 2-2v4.4" fill="none" stroke="#42a5f5" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/><path d="M10.6 6.4v3.4m0 0-1.3-1.4m1.3 1.4 1.3-1.4" fill="none" stroke="#42a5f5" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/></svg>',
+	// HTML: the angle-bracket mark in HTML5's orange (the hue every icon theme
+	// uses for it), distinct in shape from the JS/TS monogram badges.
+	html: '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M5.6 4.6 2.4 8l3.2 3.4M10.4 4.6 13.6 8l-3.2 3.4M9.2 3.4 6.8 12.6" fill="none" stroke="#e44d26" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 	// Config (yaml/toml): a violet gear, the way icon themes mark settings files.
 	config:
 		'<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 1.9l1.05 1.36 1.7-.28.32 1.7 1.55.76-.84 1.5.84 1.5-1.55.76-.32 1.7-1.7-.28L8 14.1l-1.05-1.36-1.7.28-.32-1.7-1.55-.76.84-1.5-.84-1.5 1.55-.76.32-1.7 1.7.28z" fill="none" stroke="#a074c4" stroke-width="1.2" stroke-linejoin="round"/><circle cx="8" cy="8" r="1.9" fill="none" stroke="#a074c4" stroke-width="1.2"/></svg>',
@@ -68,6 +72,8 @@ const EXT_MAP: Record<string, IconKind> = {
 	jsonc: 'json',
 	md: 'markdown',
 	markdown: 'markdown',
+	html: 'html',
+	htm: 'html',
 	svelte: 'svelte',
 	yml: 'config',
 	yaml: 'config',

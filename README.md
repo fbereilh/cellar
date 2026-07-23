@@ -162,6 +162,7 @@ Everything you'd expect from a notebook, plus the things that make sharing one w
 - **Find in notebook** with `Ctrl`/`Cmd-F` - search across cell source, rendered markdown, and outputs (with regex), and jump between highlighted matches.
 - **Variable and DataFrame inspection** to peek into the live kernel namespace.
 - **Git blame and diff gutters** right in the editor, and per-cell change bars in the notebook.
+- **Workspace files in tabs**: open any file from the sidebar to read or edit it with syntax highlighting. Markdown and `.html` also get a **Source/Preview** toggle, so a saved plotly, bokeh, or nbconvert export just renders - inside a sandboxed frame that cannot reach the app.
 - One shared kernel across notebooks, with a sidebar showing what's actually loaded in memory.
 
 ![A pandas DataFrame rendered as Cellar's interactive grid, sorted by a column, with dtype headers, a filter box, and pagination](docs/images/dataframe-grid.png)

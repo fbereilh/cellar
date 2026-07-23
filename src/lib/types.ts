@@ -56,6 +56,23 @@ export interface ExportPyResult {
 	reason?: 'no-target' | 'no-cells' | 'unchanged';
 }
 
+/**
+ * Imperative controls a mounted file tab publishes to the shell.
+ *
+ * `requestSave` is the tab's ONE save entry point, and the shell's Cmd/Ctrl+S
+ * capture handler is its only caller: a save shortcut bound to the editor's own
+ * keymap can fire only while `.cm-content` holds focus, which is false in every
+ * view where the editor is not the focused surface (a preview hides it with
+ * `display:none`, and a `display:none` subtree cannot hold focus at all) - so
+ * the keystroke fell through to the browser's "Save page as…" dialog, silently
+ * dropping an unsaved edit. Owning it at the tab level makes it view-agnostic.
+ * It saves when the document is saveable and surfaces the view-only reason when
+ * it is not; it never pretends to save.
+ */
+export interface FileTabApiHandle {
+	requestSave: () => void;
+}
+
 /** Options for the shared "take me to this cell" jump (`NotebookApiHandle.jumpToCell`). */
 export interface JumpOptions {
 	/** The find-in-page match being navigated to (reserved for a match-precise scroll). */
