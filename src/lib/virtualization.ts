@@ -11,11 +11,11 @@
 // layout, the offset model accounts for the `space-y-4` inter-cell gap (`gapPx`), so
 // a spacer reproduces the exact flow space its collapsed run occupied.
 //
-// This is the FOUNDATION phase (P0+P1). Windowing is flag-gated OFF: `planWindow`
-// returns "every cell mounted" whenever `virtualize` is false OR the viewport
-// metrics are absent, so the notebook renders byte-identically to the eager
+// Windowing (P2) and the pinned set (P3, below) are live but flag-gated OFF:
+// `planWindow` returns "every cell mounted" whenever `virtualize` is false OR the
+// viewport metrics are absent, so the notebook renders byte-identically to the eager
 // `{#each}`. Actual spacer coalescing only runs when a caller opts in AND supplies
-// live `viewportTop`/`viewportHeight` — wired but dormant at this phase.
+// live `viewportTop`/`viewportHeight`.
 //
 // INVARIANT (enforce in review): this module is render-only. It never reads from,
 // gates on, or mutates the document model (`cells`). Heights flow in from measured
@@ -59,7 +59,7 @@ export interface PlanWindowArgs {
 	viewportHeight?: number;
 	/** Extra px mounted above and below the viewport. */
 	overscanPx?: number;
-	/** Cells forced into the mounted set wherever they are (running / active / scroll target). */
+	/** Cells forced into the mounted set wherever they are (the `pinnedCellIds` union). */
 	pinned?: Set<string>;
 	/**
 	 * Vertical gap (px) the flow renders between adjacent cells (the `space-y-4`
@@ -183,4 +183,84 @@ export function mountedIds(plan: PlanItem[]): Set<string> {
 	const s = new Set<string>();
 	for (const item of plan) if (item.kind === 'cell') s.add(item.id);
 	return s;
+}
+
+// ---- The pinned set (P3) ----------------------------------------------------
+// A pin forces a cell to stay mounted wherever it is, splitting the surrounding
+// spacer. Pins are what make windowing invisible to the features that need a live
+// DOM node for a cell the viewport has left behind (report §5.2, §5.3):
+//
+//   running        — a streaming cell keeps a live node, so its height stays honest
+//                    while its output grows (the scrollbar can't lie mid-run) and
+//                    follow / jump-to-running always find a real node. Correctness
+//                    never depended on it: `applyOutput` writes the MODEL, which is
+//                    live whether or not the cell is mounted — pinning is about the
+//                    height and the node, not about the bytes.
+//   queued heads   — the cells about to run next, so a run starting does not have to
+//                    mount its cell from cold (and the queued affordance is real).
+//   active         — the selected cell must not vanish mid-series (j/k, a/b, dd).
+//   focused        — the cell holding DOM focus. Distinct from `active` on purpose:
+//                    a focus event may still be in flight, and the editing cell is
+//                    the one thing whose unmount would lose user state (CodeMirror
+//                    cursor + undo). It becomes unmount-eligible only after blur, by
+//                    which point the edit has already flushed (`Cell.flushEdit`), so
+//                    text is never at risk. We deliberately do NOT pin every cell
+//                    edited this session — that would keep every visited editor alive
+//                    and defeat the memory win (report §7 Q2).
+//   scroll targets — transient pins owned by `LiveNotebook.ensureCellMounted`.
+//
+// Every pin is DROPPED the moment its reason lapses (the run ends, the cell leaves
+// the queue, selection/focus moves, the jump settles); a cell outside the window
+// with no live reason then collapses back into a spacer on the next re-plan.
+
+/** How many queued cells (nearest the front of the kernel's FIFO) stay pinned. */
+export const QUEUED_PIN_LIMIT = 3;
+
+/**
+ * The queued cells nearest the front of the kernel's global FIFO, in run order.
+ *
+ * Capped on purpose: `queued` is a GLOBAL queue that an agent's `run_cells` (or a
+ * user mashing Run) can fill with dozens of this notebook's cells, and pinning all
+ * of them would mount most of the notebook — defeating the window exactly when the
+ * machine is busiest. The heads are the only ones about to need a node.
+ */
+export function queuedHeadIds(
+	queued: Record<string, number> | null | undefined,
+	limit: number = QUEUED_PIN_LIMIT
+): string[] {
+	if (!queued || limit <= 0) return [];
+	const entries: Array<[string, number]> = [];
+	for (const [id, pos] of Object.entries(queued)) {
+		if (typeof pos === 'number' && Number.isFinite(pos)) entries.push([id, pos]);
+	}
+	// Position first; id as a tiebreak so the set is deterministic (positions are
+	// global, so two cells of one notebook never actually share one).
+	entries.sort((a, b) => a[1] - b[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+	return entries.slice(0, limit).map(([id]) => id);
+}
+
+export interface PinInputs {
+	/** The cell running in THIS notebook (≤1). */
+	runningId?: string | null;
+	/** cell id → 1-based position in the kernel's global run queue. */
+	queued?: Record<string, number> | null;
+	/** The selected cell (command-mode target). */
+	activeId?: string | null;
+	/** The cell holding DOM focus (its editor, or the card itself). */
+	focusedId?: string | null;
+	/** Transient jump targets (`ensureCellMounted`). */
+	scrollPins?: Iterable<string> | null;
+	/** Override the queued-head cap (tests). */
+	queuedPinLimit?: number;
+}
+
+/** The union of every reason a cell must stay mounted (see the doctrine above). */
+export function pinnedCellIds(inputs: PinInputs): Set<string> {
+	const pins = new Set<string>();
+	if (inputs.runningId) pins.add(inputs.runningId);
+	for (const id of queuedHeadIds(inputs.queued, inputs.queuedPinLimit ?? QUEUED_PIN_LIMIT)) pins.add(id);
+	if (inputs.activeId) pins.add(inputs.activeId);
+	if (inputs.focusedId) pins.add(inputs.focusedId);
+	if (inputs.scrollPins) for (const id of inputs.scrollPins) pins.add(id);
+	return pins;
 }

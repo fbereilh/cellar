@@ -237,6 +237,12 @@
 	// down to Notebook, where it joins the pinned set. Empty (and inert) unless
 	// `virtualize` is on; the full jump-path rework is P4. Kept minimal here.
 	let scrollPins = $state<Set<string>>(new Set());
+	// The cell holding DOM focus, tracked off the DOM (not off `activeId`), and pinned
+	// under windowing so an EDITED cell scrolled far out of the window keeps its
+	// CodeMirror cursor + undo history until it blurs - the one unmount that would
+	// lose user state. Its text never is: `Cell` flushes on blur and on destroy, and
+	// `cell.source` is authoritative. See `pinnedCellIds` in `$lib/virtualization`.
+	let focusedId = $state<string | null>(null);
 	// This notebook's DOM subtree. Scopes the modal-keyboard handler and cell
 	// lookups (ids repeat across the open, still-mounted notebooks), and takes
 	// focus when the tab activates - so it must be a real, focusable box.
@@ -549,6 +555,44 @@
 		const onType = () => (lastTypedAt = Date.now());
 		el.addEventListener('keydown', onType, true);
 		return () => el.removeEventListener('keydown', onType, true);
+	});
+
+	// DOM-focus tracking (the `focusedId` pin). Attached ONLY while windowing is on —
+	// with the flag off nothing can unmount, so the pin has no job and the focus path
+	// carries no extra listener (the same rule the scroll-metrics effect in
+	// `Notebook.svelte` follows). `focusin` bubbles, so one listener on the notebook
+	// root sees an editor, a toolbar button, or the cell card itself take focus.
+	// The pin is added EAGERLY (on focusin) but dropped LAZILY: a `focusout`
+	// only schedules a re-read of the settled `document.activeElement`, because focus
+	// moves as blur→focus in the same task (clicking another cell, CodeMirror
+	// refocusing its own content) and acting on the intermediate state would unpin a
+	// cell that is about to keep focus - the in-flight-focus-event case the report
+	// calls out. Losing focus to somewhere outside the notebook (the find bar, the
+	// sidebar) clears it: the cell is then unmount-eligible, its edit already flushed.
+	$effect(() => {
+		const el = rootEl;
+		if (!virtualize || !el) return;
+		let settle: ReturnType<typeof setTimeout> | undefined;
+		const cellIdOf = (node: EventTarget | null): string | null =>
+			(node as HTMLElement | null)?.closest?.('[data-cell-id]')?.getAttribute('data-cell-id') ?? null;
+		const onFocusIn = (e: FocusEvent) => {
+			const id = cellIdOf(e.target);
+			if (id) focusedId = id;
+		};
+		const onFocusOut = () => {
+			clearTimeout(settle);
+			settle = setTimeout(() => {
+				const active = document.activeElement;
+				focusedId = active && el.contains(active) ? cellIdOf(active) : null;
+			}, 0);
+		};
+		el.addEventListener('focusin', onFocusIn);
+		el.addEventListener('focusout', onFocusOut);
+		return () => {
+			clearTimeout(settle);
+			el.removeEventListener('focusin', onFocusIn);
+			el.removeEventListener('focusout', onFocusOut);
+		};
 	});
 
 	// The scrollable ancestor the notebook lives in (the shell gives each notebook
@@ -2015,6 +2059,7 @@
 			{cells}
 			{virtualize}
 			{scrollPins}
+			{focusedId}
 			runningId={runningId}
 			{queued}
 			{activeId}

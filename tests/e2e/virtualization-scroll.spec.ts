@@ -4,6 +4,7 @@ import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
+import { paneMetric, setScrollTop, cellTop } from './notebook-scroll';
 
 /**
  * Cell virtualization P2 — the windowing itself, behind the off-by-default flag.
@@ -33,36 +34,6 @@ let baseURL = '';
 const mountedCells = (page: Page) => page.locator('[data-testid="cell"]').count();
 const spacers = (page: Page) => page.locator('[data-testid="cell-spacer"]').count();
 const totalNodes = (page: Page) => page.evaluate(() => document.querySelectorAll('*').length);
-
-/** The notebook's own scroll pane (the shell's `overflow-y-auto` ancestor). */
-async function scrollPaneMetric(page: Page, prop: 'scrollTop' | 'scrollHeight' | 'clientHeight'): Promise<number> {
-	return page.evaluate((p) => {
-		const cell = document.querySelector('[data-testid="cell"]');
-		let el: HTMLElement | null = cell as HTMLElement | null;
-		while (el) {
-			const s = getComputedStyle(el);
-			if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight)
-				return (el as unknown as Record<string, number>)[p];
-			el = el.parentElement;
-		}
-		return -1;
-	}, prop);
-}
-
-async function setScrollTop(page: Page, top: number): Promise<void> {
-	await page.evaluate((t) => {
-		const cell = document.querySelector('[data-testid="cell"]');
-		let el: HTMLElement | null = cell as HTMLElement | null;
-		while (el) {
-			const s = getComputedStyle(el);
-			if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
-				el.scrollTop = t;
-				return;
-			}
-			el = el.parentElement;
-		}
-	}, top);
-}
 
 /** Viewport-relative top of the first cell, or null if it isn't mounted. */
 async function firstCellTop(page: Page): Promise<number | null> {
@@ -109,14 +80,6 @@ async function aMountedCellIsVisible(page: Page): Promise<boolean> {
 		}
 		return false;
 	});
-}
-
-/** Viewport-relative top of the cell with `data-cell-id`, or null if unmounted. */
-async function cellTopById(page: Page, id: string): Promise<number | null> {
-	return page.evaluate((cellId) => {
-		const el = document.querySelector(`[data-cell-id="${CSS.escape(cellId)}"]`);
-		return el ? (el as HTMLElement).getBoundingClientRect().top : null;
-	}, id);
 }
 
 test.beforeAll(async () => {
@@ -170,7 +133,7 @@ test(`windows a ${CELL_COUNT}-cell notebook: O(viewport) mounted, fewer nodes, n
 	const topBefore = await firstCellTop(page);
 	expect(topBefore).not.toBeNull();
 
-	const scrollHeight = await scrollPaneMetric(page, 'scrollHeight');
+	const scrollHeight = await paneMetric(page, 'scrollHeight');
 	// Drift the window down to the bottom in steps, so every estimate→measured
 	// correction along the way is exercised (and compensated) rather than skipped.
 	for (let f = 0.25; f <= 1.0001; f += 0.25) {
@@ -204,7 +167,7 @@ test(`windows a ${CELL_COUNT}-cell notebook: O(viewport) mounted, fewer nodes, n
 	await page.waitForTimeout(200);
 	const refId = await cellNearViewportTop(page);
 	expect(refId).not.toBeNull();
-	const refTopBefore = await cellTopById(page, refId as string);
+	const refTopBefore = await cellTop(page, refId as string);
 	expect(refTopBefore).not.toBeNull();
 
 	for (let f = 0.4; f <= 1.0001; f += 0.2) {
@@ -218,7 +181,7 @@ test(`windows a ${CELL_COUNT}-cell notebook: O(viewport) mounted, fewer nodes, n
 	await setScrollTop(page, midOffset);
 	await page.waitForTimeout(200);
 
-	const refTopAfter = await cellTopById(page, refId as string);
+	const refTopAfter = await cellTop(page, refId as string);
 	expect(refTopAfter).not.toBeNull();
 	expect(Math.abs((refTopAfter as number) - (refTopBefore as number))).toBeLessThan(4);
 

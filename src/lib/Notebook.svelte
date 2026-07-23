@@ -5,7 +5,14 @@
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
 	import type { CellHighlight } from '$lib/searchHighlight';
-	import { planWindow, estimateHeight, DEFAULT_OVERSCAN_PX, ROW_GAP_PX, type PlanItem } from '$lib/virtualization';
+	import {
+		planWindow,
+		pinnedCellIds,
+		estimateHeight,
+		DEFAULT_OVERSCAN_PX,
+		ROW_GAP_PX,
+		type PlanItem
+	} from '$lib/virtualization';
 
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
 	const EMPTY_PLAN: PlanItem[] = [];
@@ -88,6 +95,10 @@
 		 *  scroll-to-cell can land on a real DOM node even under windowing. Owned by
 		 *  LiveNotebook (the jump paths live there); the full rework is P4. */
 		scrollPins?: Set<string>;
+		/** The cell holding DOM focus (LiveNotebook tracks it off `focusin`). Pinned
+		 *  alongside `activeId` so an edited cell scrolled far out of the window keeps
+		 *  its CodeMirror cursor/undo until it blurs. */
+		focusedId?: string | null;
 		onAddCell: (afterId: string | undefined, cellType: CellType) => void;
 		/** Insert a fresh `cellType` cell above/below `targetId`, then select+focus it. */
 		onInsertCell: (where: 'above' | 'below', targetId: string, cellType: CellType) => void;
@@ -145,6 +156,7 @@
 		cellHighlights = null,
 		virtualize = false,
 		scrollPins,
+		focusedId = null,
 		onAddCell,
 		onInsertCell
 	}: Props = $props();
@@ -190,18 +202,14 @@
 	// plan is built over. (Its wrapper is `display:none` anyway; leaving it in would
 	// corrupt the running-offset math the window depends on.)
 	const visibleOrder = $derived.by(() => (virtualize ? cells.filter((c) => !hidden.has(c.id)).map((c) => c.id) : EMPTY_IDS));
-	// Cells forced to stay mounted wherever they are. This phase pins the running and
-	// active cells (cheap; avoids the active cell unmounting mid-series) plus any
-	// transient scroll target LiveNotebook is jumping to. Queued heads + focus follow
-	// in P3, the full jump-path rework in P4.
-	const pinned = $derived.by(() => {
-		if (!virtualize) return undefined;
-		const s = new Set<string>();
-		if (runningId) s.add(runningId);
-		if (activeId) s.add(activeId);
-		if (scrollPins) for (const id of scrollPins) s.add(id);
-		return s;
-	});
+	// Cells forced to stay mounted wherever they are: the running cell, the heads of
+	// the kernel's run queue, the selected cell, the cell holding DOM focus, and any
+	// transient scroll target LiveNotebook is jumping to. The union (and the reason
+	// each member is in it) lives in `$lib/virtualization`'s `pinnedCellIds`, which is
+	// pure and unit-tested; this is only the wiring.
+	const pinned = $derived.by(() =>
+		virtualize ? pinnedCellIds({ runningId, queued, activeId, focusedId, scrollPins }) : undefined
+	);
 	const plan = $derived.by<PlanItem[]>(() => {
 		if (!virtualize) return EMPTY_PLAN;
 		void heightsVersion; // re-plan as measured heights land

@@ -258,8 +258,8 @@
 		followRunningCell = !followRunningCell;
 		setUi(FOLLOW_KEY, followRunningCell);
 	}
-	// Cell virtualization (windowed rendering) — ships OFF by default. This phase
-	// (P2) lands the windowing itself behind the flag; a later phase (P5) will
+	// Cell virtualization (windowed rendering) — ships OFF by default. The windowing
+	// (P2) and the pinned set (P3) are behind the flag; a later phase (P5) will
 	// enable it automatically above a cell-count threshold. Until then an explicit
 	// `?virtualize=1` opt-in turns it on (the e2e harness + anyone trying it). Read
 	// once at init; URL params don't change within a session.

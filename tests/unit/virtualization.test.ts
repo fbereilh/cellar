@@ -3,11 +3,14 @@ import {
 	planWindow,
 	estimateHeight,
 	mountedIds,
+	pinnedCellIds,
+	queuedHeadIds,
 	CARD_CHROME_PX,
 	CODE_LINE_PX,
 	MARKDOWN_BASE_PX,
 	OUTPUT_PER_PX,
 	OUTPUT_CAP_PX,
+	QUEUED_PIN_LIMIT,
 	ROW_GAP_PX,
 	type PlanItem
 } from '../../src/lib/virtualization';
@@ -246,6 +249,87 @@ describe('planWindow — inter-cell gap accounting (space-y-4)', () => {
 		const withZero = planWindow({ order, heights, estimate: () => 100, virtualize: true, viewportTop: 250, viewportHeight: 200, overscanPx: 0, gapPx: 0 });
 		expect(cellIds(withDefault)).toEqual(cellIds(withZero));
 		expect(spacerSum(withDefault)).toBe(spacerSum(withZero));
+	});
+});
+
+describe('queuedHeadIds (P3)', () => {
+	it('returns the queue in run order, capped at the head limit', () => {
+		const queued = { e: 5, a: 1, c: 3, b: 2, d: 4 };
+		expect(queuedHeadIds(queued)).toEqual(['a', 'b', 'c']);
+		expect(QUEUED_PIN_LIMIT).toBe(3);
+	});
+
+	it('caps on purpose: a huge queue can never pin the whole notebook', () => {
+		const queued: Record<string, number> = {};
+		for (let i = 0; i < 300; i++) queued[`c${i}`] = i + 1;
+		expect(queuedHeadIds(queued)).toEqual(['c0', 'c1', 'c2']);
+		expect(queuedHeadIds(queued, 10)).toHaveLength(10);
+	});
+
+	it('is empty for no queue, an empty queue, or a zero limit', () => {
+		expect(queuedHeadIds(undefined)).toEqual([]);
+		expect(queuedHeadIds(null)).toEqual([]);
+		expect(queuedHeadIds({})).toEqual([]);
+		expect(queuedHeadIds({ a: 1 }, 0)).toEqual([]);
+	});
+
+	it('ignores non-numeric positions rather than ordering on garbage', () => {
+		const queued = { a: 2, bad: Number.NaN, c: 1 } as unknown as Record<string, number>;
+		expect(queuedHeadIds(queued)).toEqual(['c', 'a']);
+	});
+});
+
+describe('pinnedCellIds (P3)', () => {
+	it('unions running, queued heads, active, focused and scroll targets', () => {
+		expect(
+			pinnedCellIds({
+				runningId: 'r',
+				queued: { q1: 1, q2: 2, q3: 3, q4: 4 },
+				activeId: 'a',
+				focusedId: 'f',
+				scrollPins: new Set(['s'])
+			})
+		).toEqual(new Set(['r', 'q1', 'q2', 'q3', 'a', 'f', 's']));
+	});
+
+	it('is empty when nothing is running, queued, selected or focused', () => {
+		expect(pinnedCellIds({})).toEqual(new Set());
+		expect(pinnedCellIds({ runningId: null, activeId: null, focusedId: null, queued: {} })).toEqual(new Set());
+	});
+
+	it('keeps the focused cell pinned even when the selection moved off it', () => {
+		// A focus event still in flight (or focus held by a cell the keyboard has
+		// since selected past) must not drop the editing cell's node.
+		expect(pinnedCellIds({ activeId: 'a', focusedId: 'edited' })).toEqual(new Set(['a', 'edited']));
+	});
+
+	it('drops a pin the moment its reason lapses', () => {
+		const running = pinnedCellIds({ runningId: 'r', queued: { q: 1 } });
+		expect(running.has('r')).toBe(true);
+		// Run ended, queue drained, nothing selected ⇒ nothing pinned.
+		expect(pinnedCellIds({ runningId: null, queued: {} })).toEqual(new Set());
+	});
+
+	it('mounts a pinned cell far outside the window (the pin reaches planWindow)', () => {
+		const { order, heights } = uniform(20, 100);
+		const pinned = pinnedCellIds({ runningId: 'c17', queued: { c15: 1 }, focusedId: 'c12' });
+		const plan = planWindow({
+			order,
+			heights,
+			estimate: () => 100,
+			virtualize: true,
+			viewportTop: 0,
+			viewportHeight: 200,
+			overscanPx: 0,
+			pinned
+		});
+		const ids = cellIds(plan);
+		expect(ids).toContain('c17'); // running, far off-screen
+		expect(ids).toContain('c15'); // queued head
+		expect(ids).toContain('c12'); // focused (editing)
+		expect(ids).not.toContain('c10'); // an ordinary off-screen cell is still a spacer
+		// Flow height is still conserved with three spacer splits.
+		expect(spacerSum(plan) + ids.length * 100).toBe(2000);
 	});
 });
 
