@@ -241,8 +241,8 @@ launcher directly (see the [README's Docker section](../README.md#run-with-docke
 
 ```sh
 npm run build     # production build (must be green)
-npm run check     # svelte-check — must report 0 errors
-npm run test      # unit suite — the merge gate
+npm run check     # svelte-check - must report 0 errors
+npm run test      # unit suite - the merge gate
 ```
 
 `npm run test:e2e` is a best-effort local smoke test that boots the real launcher,
