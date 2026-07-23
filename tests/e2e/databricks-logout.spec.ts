@@ -202,9 +202,13 @@ test('connected: Log out sits beside Disconnect, ends the session and returns to
 	expect(lBox.y).toBeGreaterThan(dBox.y);
 	expect(lBox.width).toBeLessThan(dBox.width);
 	// The tooltip has to name the blast radius: this signs out EVERYWHERE and
-	// disconnects every notebook, not just the selection this panel is showing.
-	await expect(logout).toHaveAttribute('title', /clears the saved sign-in/i);
+	// disconnects every notebook, not just the selection this panel is showing. This
+	// connection is a PAT profile with no Cellar sign-in anywhere, so it must NOT
+	// promise a purge - the post-action note says the credentials were left untouched,
+	// and the two must not contradict each other.
 	await expect(logout).toHaveAttribute('title', /everywhere/i);
+	await expect(logout).toHaveAttribute('title', /disconnects every notebook/i);
+	await expect(logout).toHaveAttribute('title', /no saved Cellar sign-in to clear/i);
 
 	await page.screenshot({ path: join(EVIDENCE_DIR, 'databricks-logout-connected.png') });
 
@@ -218,6 +222,10 @@ test('connected: Log out sits beside Disconnect, ends the session and returns to
 	// source newline, and the point of the assertion is the words, not the layout.
 	await expect(confirmBox).toContainText(/every\s+notebook/i);
 	await expect(confirmBox).toContainText(/cold cluster/i);
+	// ...and only the blast radius it really has. No Cellar sign-in exists here, so
+	// the confirm says so rather than promising a clear that cannot happen.
+	await expect(confirmBox).toContainText(/no saved Cellar sign-in to clear/i);
+	await expect(confirmBox).not.toContainText(/clears every saved sign-in/i);
 	await page.screenshot({ path: join(EVIDENCE_DIR, 'databricks-logout-confirm.png') });
 	await page.getByTestId('databricks-logout-confirm').click();
 
@@ -296,7 +304,12 @@ test('an INCOMPLETE sign-out warns instead of confirming - the cached token may 
 	await openNotebook(page);
 	await openDatabricksSection(page);
 	await page.getByTestId('databricks-host').fill(HOST);
-	await logOut(page);
+
+	// This host DOES carry a Cellar sign-in, so here the confirm keeps the strong
+	// wording - the two branches must stay distinguishable.
+	await page.getByTestId('databricks-logout').click();
+	await expect(page.getByTestId('databricks-logout-confirm-box')).toContainText(/clears every saved sign-in/i);
+	await page.getByTestId('databricks-logout-confirm').click();
 
 	// Never the ordinary confirmation: reported as clean, a surviving token would
 	// make the next "Sign in" a silent cache hit for a user who believes they left.
@@ -388,6 +401,48 @@ test('the log-out note does not outlive a later sign-in on the same selection', 
 	// there renders it under a live cluster, claiming the opposite of what is shown.
 	await page.getByTestId('databricks-signin').click();
 	await expect(page.getByTestId('databricks-logout-note')).toHaveCount(0);
+});
+
+test('the incomplete warning does not outlive the disconnect it asks for', async ({ page }) => {
+	// A notebook mid-connect is what made the sign-out incomplete, so the connection
+	// survives the log out - the card comes back with the warning above its Disconnect.
+	await mockDatabricksStatus(page, connectedStatus);
+	await mockDatabricksClusters(page);
+	await page.route(/\/api\/databricks\/logout$/, async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				ok: true,
+				disconnected: 0,
+				clearedTokens: 1,
+				externalSkipped: 0,
+				clearedSignIns: 1,
+				purgeFailed: 0,
+				purgeMissed: 0,
+				sessionsFailed: 1,
+				incomplete: true,
+				incompleteReason: 'a notebook was mid-connect, so its session could not be disconnected'
+			})
+		});
+	});
+	await page.route(/\/api\/databricks\/connect(\?.*)?$/, async (route) => {
+		if (route.request().method() !== 'DELETE') return route.continue();
+		await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+	});
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+	await logOut(page);
+
+	const warning = page.getByTestId('databricks-logout-warning');
+	await expect(warning).toContainText(/Disconnect that notebook/i);
+
+	// Doing exactly what it asks must not leave it still claiming the sign-out is
+	// unfinished: disconnecting is a "user moved on" action like sign-in and connect.
+	await page.getByTestId('databricks-disconnect').click();
+	await expect(warning).toHaveCount(0);
 });
 
 test('disconnected with only a PAT profile: no Log out - that credential is not Cellar\'s', async ({ page }) => {

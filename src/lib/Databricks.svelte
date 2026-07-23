@@ -378,6 +378,26 @@
 					: (status?.signedInProfiles ?? []).includes(profile)))
 	);
 
+	/**
+	 * What Log out will actually DO to this selection, said before the user commits.
+	 * The button is always shown while connected (where it ends the session too), so
+	 * it renders over a PAT/`databricks-cli` connection that has no Cellar-minted
+	 * credential at all - and promising to clear a saved sign-in there would have the
+	 * pre-action confirm contradicting the post-action note, in the one place the
+	 * user decides whether to proceed. The session half is global either way, which
+	 * is the part worth confirming.
+	 */
+	const logoutConfirmCopy = $derived(
+		cellarSignedIn
+			? "Sign out of Databricks everywhere? This clears every saved sign-in and disconnects every notebook's Spark session app-wide - reconnecting can take minutes on a cold cluster."
+			: "Sign out of Databricks everywhere? This disconnects every notebook's Spark session app-wide - reconnecting can take minutes on a cold cluster. There is no saved Cellar sign-in to clear: this connection authenticates through ~/.databrickscfg or the databricks CLI, which Cellar leaves untouched."
+	);
+	const logoutButtonTitle = $derived(
+		cellarSignedIn
+			? "Sign out of Databricks everywhere - clears the saved sign-ins and disconnects every notebook; you'll need to sign in again"
+			: 'Sign out of Databricks everywhere - disconnects every notebook; there is no saved Cellar sign-in to clear'
+	);
+
 	/** The `{profile}|{host}` body/query a request should carry for the current selection. */
 	function selectionParams(): Record<string, string> {
 		return selectionMode === 'profile' ? { profile } : { host: hostTrimmed };
@@ -657,6 +677,11 @@
 		connectError = null;
 		reconnectNote = '';
 		reconnectError = null;
+		// The last "user moved on" action. It is also literally the remedy a
+		// sessions-only incomplete sign-out advises, so leaving the warning up here
+		// would have it still claiming the sign-out is unfinished right after the
+		// user finished it.
+		clearLogoutFeedback();
 		try {
 			const res = await fetch(`/api/databricks/connect${pathQuery()}`, { method: 'DELETE' });
 			if (!res.ok) throw await res.json();
@@ -1011,7 +1036,9 @@
      while connected (where it ends the session too). It is also the panel's most
      destructive control and sits right below Disconnect, so it takes a two-step
      inline confirm whose copy names the blast radius: this signs out EVERYWHERE and
-     disconnects every notebook, not just the selection this panel is showing. -->
+     disconnects every notebook, not just the selection this panel is showing. The
+     confirm/tooltip copy is `cellarSignedIn`-conditional so it never promises a purge
+     the connection has nothing to purge - see `logoutConfirmCopy`. -->
 {#snippet logoutRow(always: boolean)}
 	{#if always || cellarSignedIn}
 		{#if confirmLogout}
@@ -1019,10 +1046,7 @@
 				class="mt-1.5 rounded border border-warning/40 bg-warning/10 px-2 py-1.5"
 				data-testid="databricks-logout-confirm-box"
 			>
-				<p class="text-[11px] leading-relaxed text-base-content/80">
-					Sign out of Databricks everywhere? This clears every saved sign-in and disconnects every
-					notebook's Spark session app-wide - reconnecting can take minutes on a cold cluster.
-				</p>
+				<p class="text-[11px] leading-relaxed text-base-content/80">{logoutConfirmCopy}</p>
 				<div class="mt-1.5 flex justify-end gap-1">
 					<button
 						class="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[11px] font-normal text-base-content/60"
@@ -1047,7 +1071,7 @@
 					class="btn btn-ghost btn-xs h-5 min-h-0 px-1 text-[11px] font-normal text-base-content/50 hover:text-error"
 					onclick={() => (confirmLogout = true)}
 					disabled={!!busy || runtimeApplying}
-					title="Sign out of Databricks everywhere - clears the saved sign-ins and disconnects every notebook; you'll need to sign in again"
+					title={logoutButtonTitle}
 					data-testid="databricks-logout"
 				>
 					Log out
