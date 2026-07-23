@@ -11,9 +11,8 @@
  * Cellar does not raise it (see `$lib/saveLimit.ts`), it makes an over-threshold
  * document read-only instead.
  *
- * Node builtins only — in fact no imports at all — so this is importable both by
- * the launcher (`../src/lib/server/limits.js`, plain node, no bundler) and by the
- * SvelteKit server (`$lib/server/limits.js`), the same rule `venv.js` follows.
+ * Server-only, and reached exclusively through `$lib/server` (`fstree.ts`), so it
+ * rides the normal bundle into `build/` — the launcher does not import it.
  */
 
 /** Ordinary text file ceiling: don't stream a giant file into a CodeMirror tab. */

@@ -14,22 +14,84 @@
  * 15 MB HTML export still opens and previews exactly as before. Only the save
  * direction has a body.
  *
+ * The limit compared against is the one ACTUALLY in force, never a guess: the
+ * server computes it (`effectiveBodyLimit`) and the file GET carries it to the
+ * tab. Guessing was a real defect in both directions - `cellar --dev` runs Vite,
+ * whose handler calls `getRequest()` with NO `bodySizeLimit` at all, so a 600 KB
+ * `.md` that saves fine there would have opened read-only; and an operator who
+ * raises `BODY_SIZE_LIMIT` would have gained nothing user-visible.
+ *
  * Pure + browser-safe (no imports, no DOM, no Node): the decision is made in the
- * tab, where the document is.
+ * tab, where the document is, and the server half only feeds it a number.
  */
 
 /**
- * adapter-node's own default `BODY_SIZE_LIMIT` (`'512K'`, see its `handler.js`).
+ * adapter-node's own default `BODY_SIZE_LIMIT` (`'512K'`, see its `handler.js`)
+ * - the FALLBACK for when the effective limit cannot be determined.
  *
- * Deliberately NOT raised by the launcher: it is an app-wide setting, so lifting
- * it for one save route lifts how much memory ANY unauthenticated request can
- * make the server buffer - on the same process that carries kernel streaming,
- * SSE and the in-process MCP server. An operator who sets the variable still
- * wins (the launcher passes their environment through untouched); Cellar simply
- * assumes the safe default here, so an over-threshold file reads as view-only
- * rather than editable-but-doomed.
+ * Cellar's launcher deliberately does not raise the real setting: it is app-wide,
+ * so lifting it for one save route lifts how much memory ANY unauthenticated
+ * request can make the server buffer - on the same process that carries kernel
+ * streaming, SSE and the in-process MCP server. An over-threshold document opens
+ * view-only instead of editable-but-doomed.
  */
 export const DEFAULT_BODY_SIZE_LIMIT = 512 * 1024;
+
+/**
+ * Wire sentinel for "no body cap at all" - what the Vite dev server enforces
+ * (nothing), and what `BODY_SIZE_LIMIT=Infinity` asks for in production. A
+ * string, not `Infinity`: `JSON.stringify(Infinity)` is `null`, which would be
+ * indistinguishable from a field the server never sent.
+ */
+export const UNLIMITED_BODY_LIMIT = 'unlimited';
+
+/** What the server tells the browser about the in-force request-body ceiling. */
+export type BodyLimitWire = number | typeof UNLIMITED_BODY_LIMIT;
+
+/**
+ * Parse a `BODY_SIZE_LIMIT` value exactly as adapter-node does (`parse_as_bytes`
+ * in its `utils.js`): an optional `K`/`M`/`G` suffix over a plain number, with
+ * `Infinity` meaning uncapped. `null` for anything unparseable - adapter-node
+ * refuses to boot on a NaN limit, so a value we cannot read is a value we must
+ * not assume anything about.
+ */
+export function parseBodySizeLimit(raw: string | undefined | null): number | null {
+	const value = String(raw ?? '').trim();
+	if (!value) return null;
+	const unit = value[value.length - 1].toUpperCase();
+	const multiplier = unit === 'K' ? 1024 : unit === 'M' ? 1024 * 1024 : unit === 'G' ? 1024 * 1024 * 1024 : 1;
+	const n = Number(multiplier === 1 ? value : value.slice(0, -1)) * multiplier;
+	if (Number.isNaN(n) || n < 0) return null;
+	return n;
+}
+
+/**
+ * The request-body ceiling the running server actually enforces, as the browser
+ * should hear it.
+ *
+ * @param raw `process.env.BODY_SIZE_LIMIT` - an operator's own setting, which the
+ *   launcher passes through untouched and which therefore really does widen the
+ *   editable range.
+ * @param isDev SvelteKit's `dev`. The Vite dev handler applies no body cap, so
+ *   nothing may be view-only for transport reasons under `cellar --dev`.
+ */
+export function effectiveBodyLimit(raw: string | undefined | null, isDev: boolean): BodyLimitWire {
+	if (isDev) return UNLIMITED_BODY_LIMIT;
+	const parsed = parseBodySizeLimit(raw);
+	if (parsed === null) return DEFAULT_BODY_SIZE_LIMIT; // unset, or unreadable
+	return Number.isFinite(parsed) ? parsed : UNLIMITED_BODY_LIMIT;
+}
+
+/**
+ * Read the wire value back into a number of bytes, `Infinity` for uncapped.
+ * Anything unrecognised - a field an older server never sent, a malformed value -
+ * falls to the conservative default rather than assuming there is no cap.
+ */
+export function resolveBodyLimit(wire: unknown): number {
+	if (wire === UNLIMITED_BODY_LIMIT) return Infinity;
+	if (typeof wire === 'number' && Number.isFinite(wire) && wire >= 0) return wire;
+	return DEFAULT_BODY_SIZE_LIMIT;
+}
 
 /** `{"path":` + `,"content":` + `}` - the framing around the two JSON strings. */
 const FRAME_BYTES = 20;
@@ -74,12 +136,18 @@ export function saveBodyBytes(relPath: string, content: string): number {
 /**
  * Can this document be saved at all? `false` ⇒ the tab opens read-only and says
  * so, instead of accepting edits the PUT would 413 on.
+ *
+ * `limit` is the effective in-force ceiling in bytes (`Infinity` = uncapped),
+ * which callers get by running the server's wire value through
+ * `resolveBodyLimit`; the default is only the fallback for a caller with no wire
+ * value at all.
  */
 export function saveFitsTransport(
 	relPath: string,
 	content: string,
 	limit: number = DEFAULT_BODY_SIZE_LIMIT
 ): boolean {
+	if (limit === Infinity) return true; // don't walk megabytes to compare against ∞
 	// adapter-node refuses on `content_length > limit`, so equality still fits.
 	return saveBodyBytes(relPath, content) <= limit;
 }

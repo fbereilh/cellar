@@ -15,7 +15,7 @@
 	import MarkdownView from '$lib/MarkdownView.svelte';
 	import HtmlPreview from '$lib/HtmlPreview.svelte';
 	import { isHtmlPath, hasRelativeAssetRefs } from '$lib/htmlPreview';
-	import { saveFitsTransport } from '$lib/saveLimit';
+	import { saveFitsTransport, resolveBodyLimit } from '$lib/saveLimit';
 	import type { BlameLine } from '$lib/server/git';
 	import type { BlameReport } from '$lib/blame';
 
@@ -60,9 +60,11 @@
 	// says why. Offering an edit whose PUT the server front-end would 413 before
 	// any handler runs is the failure this retires - the read cap admits files
 	// (a 15 MB self-contained export) far past what the transport accepts, and
-	// that transport limit is app-wide and deliberately not raised. Decided ONCE,
-	// from the loaded content: a read-only document cannot grow past the line it
-	// was measured against, so nothing needs re-measuring per keystroke.
+	// that transport limit is app-wide and deliberately not raised. The ceiling
+	// compared against is the one the RUNNING server enforces (`body.bodyLimit`,
+	// uncapped under the Vite dev server), never a client-side guess. Decided
+	// ONCE, from the loaded content: a read-only document cannot grow past the
+	// line it was measured against, so nothing needs re-measuring per keystroke.
 	let saveTooLarge = $state(false);
 
 	// ---- Rendered preview (markdown + html) -----------------------------------
@@ -288,7 +290,7 @@
 			if (!res.ok) throw new Error(body?.message || 'could not open file');
 			content = body.content;
 			liveSource = content;
-			saveTooLarge = !saveFitsTransport(path, content);
+			saveTooLarge = !saveFitsTransport(path, content, resolveBodyLimit(body.bodyLimit));
 			status = 'ready';
 		} catch (err) {
 			status = 'error';

@@ -16,7 +16,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isHtmlPath, hasRelativeAssetRefs } from '../../src/lib/htmlPreview';
-import { saveBodyBytes, saveFitsTransport, DEFAULT_BODY_SIZE_LIMIT } from '../../src/lib/saveLimit';
+import {
+	saveBodyBytes,
+	saveFitsTransport,
+	parseBodySizeLimit,
+	effectiveBodyLimit,
+	resolveBodyLimit,
+	DEFAULT_BODY_SIZE_LIMIT,
+	UNLIMITED_BODY_LIMIT
+} from '../../src/lib/saveLimit';
 import { iconKind } from '../../src/lib/fileIcons';
 
 const REPO = join(fileURLToPath(import.meta.url), '../../..');
@@ -413,12 +421,85 @@ describe('save transport limit', () => {
 		expect(saveFitsTransport('src/app.ts', 'x'.repeat(64 * 1024))).toBe(true);
 	});
 
+	/**
+	 * The ceiling compared against has to be the one the RUNNING server enforces.
+	 * Assuming adapter-node's default was wrong in both directions: `cellar --dev`
+	 * runs Vite, whose handler calls `getRequest()` with no `bodySizeLimit` at all
+	 * (so nothing may be view-only there), and an operator who raises
+	 * `BODY_SIZE_LIMIT` gained nothing user-visible from a value the client never
+	 * saw.
+	 */
+	describe('effective limit', () => {
+		it('parses BODY_SIZE_LIMIT exactly as adapter-node does', () => {
+			expect(parseBodySizeLimit('512K')).toBe(512 * 1024);
+			expect(parseBodySizeLimit('2M')).toBe(2 * 1024 * 1024);
+			expect(parseBodySizeLimit('1g')).toBe(1024 * 1024 * 1024);
+			expect(parseBodySizeLimit('1048576')).toBe(1048576);
+			expect(parseBodySizeLimit('Infinity')).toBe(Infinity);
+			// Unreadable ⇒ no opinion; adapter-node itself refuses to boot on these.
+			expect(parseBodySizeLimit('lots')).toBe(null);
+			expect(parseBodySizeLimit('')).toBe(null);
+			expect(parseBodySizeLimit(undefined)).toBe(null);
+		});
+
+		it('reports no cap under the dev server, whatever the environment says', () => {
+			expect(effectiveBodyLimit(undefined, true)).toBe(UNLIMITED_BODY_LIMIT);
+			expect(effectiveBodyLimit('512K', true)).toBe(UNLIMITED_BODY_LIMIT);
+		});
+
+		it('reports the operator value in production, else the safe default', () => {
+			expect(effectiveBodyLimit(undefined, false)).toBe(DEFAULT_BODY_SIZE_LIMIT);
+			expect(effectiveBodyLimit('4M', false)).toBe(4 * 1024 * 1024);
+			expect(effectiveBodyLimit('Infinity', false)).toBe(UNLIMITED_BODY_LIMIT);
+			// A value we cannot read falls to the conservative side, never to "no cap".
+			expect(effectiveBodyLimit('lots', false)).toBe(DEFAULT_BODY_SIZE_LIMIT);
+		});
+
+		it('resolves the wire value, defaulting conservatively on anything odd', () => {
+			expect(resolveBodyLimit(UNLIMITED_BODY_LIMIT)).toBe(Infinity);
+			expect(resolveBodyLimit(4 * 1024 * 1024)).toBe(4 * 1024 * 1024);
+			// A field an older server never sent must not read as "unlimited".
+			expect(resolveBodyLimit(undefined)).toBe(DEFAULT_BODY_SIZE_LIMIT);
+			expect(resolveBodyLimit(null)).toBe(DEFAULT_BODY_SIZE_LIMIT);
+			expect(resolveBodyLimit('4M')).toBe(DEFAULT_BODY_SIZE_LIMIT);
+			expect(resolveBodyLimit(-1)).toBe(DEFAULT_BODY_SIZE_LIMIT);
+		});
+
+		it('a mid-size text file stays editable wherever the transport allows it', () => {
+			// 600 KB of markdown: over adapter-node's default, but the dev server has
+			// no cap and an operator can raise the production one.
+			const md = '# heading\n\n'.repeat(Math.ceil((600 * 1024) / 11));
+			expect(saveFitsTransport('notes.md', md, DEFAULT_BODY_SIZE_LIMIT)).toBe(false);
+			expect(saveFitsTransport('notes.md', md, resolveBodyLimit(effectiveBodyLimit(undefined, true)))).toBe(
+				true
+			);
+			expect(saveFitsTransport('notes.md', md, resolveBodyLimit(effectiveBodyLimit('4M', false)))).toBe(
+				true
+			);
+			// The operator's ceiling still binds - it widens the range, it does not remove it.
+			expect(
+				saveFitsTransport('big.html', 'x'.repeat(8 * 1024 * 1024), resolveBodyLimit(effectiveBodyLimit('4M', false)))
+			).toBe(false);
+		});
+
+		// Source-level: only the server can know this, so the value has to travel.
+		it('the file GET carries the in-force limit to the tab', () => {
+			const src = readFileSync(join(REPO, 'src/routes/api/fs/file/+server.js'), 'utf8');
+			expect(src).toContain("import { dev } from '$app/environment'");
+			expect(src).toContain('effectiveBodyLimit(process.env.BODY_SIZE_LIMIT, dev)');
+			expect(src).toMatch(/bodyLimit:/);
+		});
+	});
+
 	// The tab is where the decision is applied: read-only editor, no Save button,
 	// a chip saying why - and the preview left alone.
 	it('the file tab opens an over-transport document read-only, with an affordance', () => {
 		const src = readFileSync(join(REPO, 'src/lib/FileTab.svelte'), 'utf8');
 		expect(src).toContain("from '$lib/saveLimit'");
-		expect(src).toMatch(/saveTooLarge = !saveFitsTransport\(path, content\)/);
+		// …against the limit the SERVER reports, never a client-side guess.
+		expect(src).toMatch(
+			/saveTooLarge = !saveFitsTransport\(path, content, resolveBodyLimit\(body\.bodyLimit\)\)/
+		);
 		expect(src).toContain('EditorState.readOnly.of(true)');
 		expect(src).toContain('data-testid="file-view-only"');
 		// Save is not merely disabled - it is absent, and the handler refuses too.

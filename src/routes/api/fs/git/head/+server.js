@@ -14,10 +14,11 @@ import { deserialize } from '$lib/server/ipynb';
  * alone never reads as a change. `tracked:false` means "nothing at HEAD to
  * compare against" — the caller draws no decorations.
  *
- * The file form is size-guarded (`tooLarge:true` past `MAX_DECORATION_BYTES`,
- * with no `git show`) because its baseline is re-diffed line by line on every
- * keystroke. The notebook form opts OUT: its diff is per cell and scales with
- * SOURCE, not with the outputs that make an `.ipynb` big.
+ * The file form is size-guarded (no `git show` past `MAX_DECORATION_BYTES`, so
+ * it answers `tracked:false` and the gutter stays empty) because its baseline is
+ * re-diffed line by line on every keystroke. The notebook form opts OUT: its
+ * diff is per cell and scales with SOURCE, not with the outputs that make an
+ * `.ipynb` big.
  */
 export async function GET({ url }) {
 	const path = url.searchParams.get('path');

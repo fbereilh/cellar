@@ -114,13 +114,14 @@ describe('line-level git decorations are size-gated', () => {
 		expect(blame.lines).toEqual([]);
 
 		const head = await gitHeadFile('report.html');
-		expect(head.tooLarge).toBe(true);
 		expect(head.content).toBe(null);
 
 		// …and neither answer ran the expensive call. This is the whole fix: what
-		// it cost is index lookups, never the `--line-porcelain` blame or the
-		// whole-blob `git show`.
-		expect(gitSpawnLog()).toEqual(['ls-files', 'ls-files']);
+		// it cost is ONE index lookup — the blame's, to name the right fact — never
+		// the `--line-porcelain` blame or the whole-blob `git show`. The baseline
+		// adds nothing: an empty gutter is an empty gutter either way, so it never
+		// buys a distinction it cannot render.
+		expect(gitSpawnLog()).toEqual(['ls-files']);
 	});
 
 	/**
@@ -134,17 +135,41 @@ describe('line-level git decorations are size-gated', () => {
 		git(dir, ['commit', '-q', '-m', 'first']);
 
 		const guarded = await gitHeadFile('report.html');
-		expect(guarded.tooLarge).toBe(true);
+		expect(guarded.tracked).toBe(false);
 		expect(guarded.content).toBe(null);
 
 		// Same path, guard opted out: the real baseline, not the cached refusal.
 		const unguarded = await gitHeadFile('report.html', { sizeGuard: false });
 		expect(unguarded.tracked).toBe(true);
-		expect(unguarded.tooLarge).toBe(false);
 		expect(unguarded.content?.length).toBeGreaterThan(MAX_DECORATION_BYTES);
 
 		// …and the other direction: the refusal is still what the guarded form says.
-		expect((await gitHeadFile('report.html')).tooLarge).toBe(true);
+		expect((await gitHeadFile('report.html')).content).toBe(null);
+	});
+
+	/**
+	 * The baseline's refusal costs NOTHING beyond the `stat`. It draws the same
+	 * empty gutter whether the file is untracked or merely oversized, so paying an
+	 * index lookup per mount / `gitRefresh` bump / window focus to tell them apart
+	 * would buy a value no caller reads.
+	 */
+	it('an over-threshold HEAD baseline is refused with no git spawn at all', async () => {
+		writeFileSync(join(dir, 'seed.txt'), 'seed\n');
+		git(dir, ['add', '-A']);
+		git(dir, ['commit', '-q', '-m', 'first']);
+		writeFileSync(join(dir, 'report.html'), filler(MAX_DECORATION_BYTES + 64 * 1024));
+		git(dir, ['add', '-A']);
+		git(dir, ['commit', '-q', '-m', 'tracked but huge']);
+
+		await gitHeadFile('seed.txt'); // warm the preflight
+		resetGitSpawnCount();
+
+		const head = await gitHeadFile('report.html');
+		expect(head.tracked).toBe(false);
+		expect(head.content).toBe(null);
+		expect(head.tooLarge).toBe(false);
+		expect(gitSpawnLog()).toEqual([]);
+		expect(gitSpawnCount()).toBe(0);
 	});
 
 	/**
@@ -195,7 +220,7 @@ describe('line-level git decorations are size-gated', () => {
 		expect(head.tooLarge).toBe(false);
 
 		// Still never blamed — the distinction is one index lookup, not the stall.
-		expect(gitSpawnLog()).toEqual(['ls-files', 'ls-files']);
+		expect(gitSpawnLog()).toEqual(['ls-files']);
 	});
 
 	it('an over-threshold GITIGNORED file reads as untracked too', async () => {

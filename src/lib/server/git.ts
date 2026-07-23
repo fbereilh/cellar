@@ -166,10 +166,11 @@ function fileMtimeMs(abs: string): number | null {
  * The ordinary text-file cap is the threshold on purpose: everything a tab could
  * open before the HTML exception was carved out (see `limits.js`) keeps its
  * decorations EXACTLY as before, and only the export-sized files that exception
- * newly admits skip them. A refusal is reported (`tooLarge:true`), never
- * disguised as `tracked:false` — "too big to blame" and "untracked" are
- * different facts and the status bar says which. Which is also why size alone
- * cannot decide it: see `decorationRefusal`.
+ * newly admits skip them. On the BLAME surface — the one with a status bar that
+ * can say something — a refusal is reported (`tooLarge:true`) rather than
+ * disguised as `tracked:false`, because "too big to blame" and "untracked" are
+ * different facts. Which is also why size alone cannot decide it there: see
+ * `decorationRefusal`.
  */
 export const MAX_DECORATION_BYTES = MAX_FILE_BYTES;
 
@@ -199,9 +200,9 @@ async function isTracked(root: string, rel: string): Promise<boolean> {
 }
 
 /**
- * Decide whether to refuse line-level decorations for one file, and why.
- * `null` means "small enough — go run git"; otherwise decorations are skipped
- * and `tooLarge` says whether SIZE is the honest reason.
+ * Decide whether to refuse BLAME for one file, and why. `null` means "small
+ * enough — go run git"; otherwise the blame is skipped and `tooLarge` says
+ * whether SIZE is the honest reason.
  *
  * Size alone is not that reason. The file this ceiling exists for is a generated
  * `report.html`, which is usually gitignored or simply never added — it has no
@@ -306,7 +307,12 @@ export interface GitHeadFileResult {
 	isRepo: boolean;
 	tracked: boolean;
 	content: string | null;
-	/** Refused for being past `MAX_DECORATION_BYTES` — distinct from untracked. */
+	/**
+	 * Always false: a baseline refusal and an untracked file draw the same empty
+	 * gutter, so `gitHeadFile` never pays the `ls-files` to tell them apart. The
+	 * field lives on for shape parity with `GitBlameFileResult`, where the status
+	 * bar does render the difference.
+	 */
 	tooLarge: boolean;
 }
 
@@ -535,14 +541,20 @@ export function isMaxBufferError(err: unknown): boolean {
  * leaves a brand-new file's gutter empty — the file tree's `U`/`A` letter is
  * already the whole story.
  *
+ * `tooLarge` is always false here. The distinction it carries — "too big to
+ * blame" vs "untracked" — is a BLAME one: the gutter renders a refusal and an
+ * untracked file identically (no change bars), and the status bar that does say
+ * which reads `gitBlameFile`. Computing it would cost an `ls-files` per mount,
+ * per `gitRefresh` bump and per window focus for a value no caller inspects, so
+ * the size gate here refuses on the `stat` alone.
+ *
  * @param {string} relPath Workspace-relative path (path-guarded).
- * @param opts.sizeGuard Skip the `git show` above `MAX_DECORATION_BYTES`
- *   (`tooLarge:true` only when the file is also TRACKED — see
- *   `decorationRefusal`). Default true — a file tab's gutter re-diffs the whole
- *   baseline on every keystroke. The NOTEBOOK caller passes false: its
- *   decorations are per CELL and their cost tracks SOURCE, not the outputs that
- *   make an `.ipynb` big, so a size gate there would drop the change bars off an
- *   ordinary plot-heavy notebook.
+ * @param opts.sizeGuard Skip the `git show` above `MAX_DECORATION_BYTES`.
+ *   Default true — a file tab's gutter re-diffs the whole baseline on every
+ *   keystroke. The NOTEBOOK caller passes false: its decorations are per CELL
+ *   and their cost tracks SOURCE, not the outputs that make an `.ipynb` big, so
+ *   a size gate there would drop the change bars off an ordinary plot-heavy
+ *   notebook.
  * @returns {Promise<{isRepo: boolean, tracked: boolean, content: string|null}>}
  */
 export async function gitHeadFile(
@@ -575,11 +587,11 @@ export async function gitHeadFile(
 	if (hit) return hit;
 
 	let value: GitHeadFileResult;
-	const refused = guarded ? await decorationRefusal(root, abs, rel) : null;
-	if (refused) {
-		// No `git show`: the whole point is not to pay for a blob the gutter would
-		// re-diff on every keystroke.
-		value = { isRepo: true, tracked: false, content: null, tooLarge: refused.tooLarge };
+	if (guarded && tooLargeToDecorate(abs)) {
+		// No `git show`, and no `ls-files` either: the whole point is not to pay for
+		// a blob the gutter would re-diff on every keystroke, and nothing here reads
+		// the tracked/too-large distinction that lookup would buy.
+		value = { isRepo: true, tracked: false, content: null, tooLarge: false };
 	} else {
 		// Porcelain paths (and `git show`'s object syntax) are repo-root-relative.
 		const content = await runGit(root, ['show', `HEAD:${pre.prefix}${rel}`]);
