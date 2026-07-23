@@ -66,6 +66,19 @@ make setup
 For the full clone-to-run walkthrough, the kernel/venv resolution order, and every configuration knob, see **[docs/SETUP.md](docs/SETUP.md)**.
 </details>
 
+## Uninstall
+
+Installed via Homebrew? Remove Cellar, then clean up what it pulled in:
+
+```sh
+brew uninstall cellar
+brew autoremove
+```
+
+Use the fully-qualified `brew uninstall fbereilh/cellar/cellar` if another tap also provides a `cellar` formula.
+
+> **Is `brew autoremove` safe?** Yes - it only removes formulae that were installed as another formula's dependency and are no longer needed by anything. Packages you installed on request are never touched, so a directly-installed `node` or `uv` stays. Run `brew autoremove --dry-run` first if you want to see the list before anything is removed.
+
 ## Run with Docker
 
 Prefer to skip installing anything? If you have Docker, you have Cellar. This path needs **only Docker on the host** - no Node, Python, or `uv` - and bakes a **reproducible, pinned kernel environment** into the image so every run is identical. It's meant for single-user, reproducible, zero-prerequisite use: Cellar has one shared kernel and no auth, so it is **not** for multi-user hosting.
