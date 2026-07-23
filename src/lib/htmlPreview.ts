@@ -33,32 +33,51 @@ export function isHtmlPath(path: string): boolean {
 }
 
 /**
- * One pass over the document: either a comment opener, or an element whose `src`
- * (or, for `<link>`, `href`) makes the browser FETCH a subresource. Plain
- * `<a href>` is deliberately excluded: a relative link is a navigation the user
- * has not asked for yet, not a broken render.
+ * Elements whose `src` (or, for `<link>`, `href`) makes the browser FETCH a
+ * subresource. Plain `<a href>` is deliberately excluded: a relative link is a
+ * navigation the user has not asked for yet, not a broken render.
  *
- * `<script>`/`<style>` are in the list for their own attributes AND because they
- * open a raw-text body: a self-contained export inlines a minified bundle whose
- * string literals build `<img src="…">` markup, so scanning that body would
- * report the very file this preview targets as having unresolvable assets.
+ * `<script>`/`<style>` are here for their own attributes; their BODIES are
+ * skipped separately (see `RAW_TEXT_TAGS`).
  */
-const TOKEN =
-	/<!--|<(link|script|style|img|iframe|frame|source|audio|video|embed|track|object)\b([^>]*)>/gi;
-
-/** Closers for the two raw-text bodies `TOKEN` skips over. */
-const CLOSE_TAG: Record<string, RegExp> = {
-	script: /<\/\s*script\b/gi,
-	style: /<\/\s*style\b/gi
-};
+const SUBRESOURCE_TAGS = new Set([
+	'link',
+	'script',
+	'style',
+	'img',
+	'iframe',
+	'frame',
+	'source',
+	'audio',
+	'video',
+	'embed',
+	'track',
+	'object'
+]);
 
 /**
- * `src="…"` / `href="…"` / `data="…"`, quoted or bare, inside one tag's
- * attributes. The name is anchored to an attribute boundary rather than `\b`,
- * because `-` is a non-word character: `\bsrc=` matches inside `data-src=`, and
- * a lazy-loading page whose real refs are all absolute would be misreported.
+ * Elements whose CONTENT a browser never parses as markup, so neither may this
+ * scan: a self-contained export inlines a minified bundle whose string literals
+ * build `<img src="…">` markup, and reporting that would put the notice on
+ * exactly the file the preview targets. `<textarea>`/`<title>` are the same
+ * class — displayed text that merely looks like a tag.
  */
-const URL_ATTR = /(?:^|[\s/])(?:src|href|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'title']);
+
+/** The attribute NAMES that carry a fetched URL. Longest is 4 chars (`href`). */
+const URL_ATTRS = new Set(['src', 'href', 'data']);
+
+/** ASCII letter or digit — the only characters a tag name is scanned from. */
+const NAME_CHAR = /[a-z0-9]/i;
+
+/** Longest name either set holds, so a longer one is skipped without slicing. */
+const MAX_TAG_LEN = Math.max(
+	...[...SUBRESOURCE_TAGS, ...RAW_TEXT_TAGS].map((tag) => tag.length)
+);
+
+function isSpace(c: string): boolean {
+	return c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f';
+}
 
 /**
  * A reference that resolves WITHOUT the file's folder: absolute URLs, protocol-
@@ -75,15 +94,85 @@ function resolvesWithoutFolder(url: string): boolean {
 	return /^[a-z][a-z0-9+.-]*:/i.test(u);
 }
 
-/** True when one tag's attribute text carries a folder-relative subresource ref. */
-function attrsRefRelative(attrs: string): boolean {
-	URL_ATTR.lastIndex = 0;
-	let attr: RegExpExecArray | null;
-	while ((attr = URL_ATTR.exec(attrs))) {
-		const value = attr[1] ?? attr[2] ?? attr[3] ?? '';
-		if (!resolvesWithoutFolder(value)) return true;
+/**
+ * Walk one tag's attributes from just after its name, QUOTE-AWARE, and report
+ * where the tag ends plus (when `wantUrls`) whether a URL attribute holds a
+ * folder-relative ref.
+ *
+ * Respecting quotes is what keeps a self-contained export off the notice: a
+ * value may legally contain `>` (an inline `data:image/svg+xml` URI carries a
+ * whole `<svg …></svg>`), so ending the tag at the first `>` would truncate it
+ * and read the remainder as bare attributes. It also means only attribute NAMES
+ * are matched, so `src=`-shaped text inside some other attribute's value (an
+ * `alt`, a `title`) is never mistaken for a reference.
+ *
+ * Nothing is allocated per attribute unless the name is the length of one of
+ * `src`/`href`/`data`, nor per value unless that name is one of them.
+ */
+function scanTag(html: string, start: number, wantUrls: boolean): { end: number; relative: boolean } {
+	const n = html.length;
+	let i = start;
+	let relative = false;
+	while (i < n) {
+		const c = html[i];
+		if (c === '>') return { end: i + 1, relative };
+		if (isSpace(c) || c === '/') {
+			i++;
+			continue;
+		}
+
+		const nameStart = i;
+		while (i < n && !isSpace(html[i]) && html[i] !== '=' && html[i] !== '>' && html[i] !== '/') i++;
+		const nameLen = i - nameStart;
+		while (i < n && isSpace(html[i])) i++;
+		// A valueless attribute (`<img hidden>`); re-read the delimiter at the top.
+		if (html[i] !== '=') continue;
+		i++;
+		while (i < n && isSpace(html[i])) i++;
+
+		const quote = html[i];
+		let valueStart: number;
+		let valueEnd: number;
+		if (quote === '"' || quote === "'") {
+			valueStart = i + 1;
+			const close = html.indexOf(quote, valueStart);
+			// Unterminated: a browser swallows the rest of the document as the value.
+			valueEnd = close === -1 ? n : close;
+			i = close === -1 ? n : close + 1;
+		} else {
+			valueStart = i;
+			while (i < n && !isSpace(html[i]) && html[i] !== '>') i++;
+			valueEnd = i;
+		}
+
+		if (wantUrls && !relative && (nameLen === 3 || nameLen === 4)) {
+			const name = html.slice(nameStart, nameStart + nameLen).toLowerCase();
+			if (URL_ATTRS.has(name) && !resolvesWithoutFolder(html.slice(valueStart, valueEnd))) {
+				relative = true;
+			}
+		}
 	}
-	return false;
+	return { end: n, relative };
+}
+
+/**
+ * Index of the `</tag` that closes a raw-text body (`<script>`/`<style>`), or
+ * -1 when the document never closes it.
+ */
+function rawTextEnd(html: string, from: number, tag: string): number {
+	const n = html.length;
+	let i = from;
+	for (;;) {
+		const lt = html.indexOf('</', i);
+		if (lt === -1) return -1;
+		let p = lt + 2;
+		while (p < n && isSpace(html[p])) p++;
+		if (html.slice(p, p + tag.length).toLowerCase() === tag) {
+			const after = html[p + tag.length];
+			if (after === undefined || !NAME_CHAR.test(after)) return lt;
+		}
+		i = lt + 2;
+	}
 }
 
 /**
@@ -91,30 +180,54 @@ function attrsRefRelative(attrs: string): boolean {
  * the file on disk — i.e. content the sandboxed preview cannot resolve. A
  * self-contained export (everything inline, or CDN URLs) returns false.
  *
- * Markup-shaped text that a browser never treats as markup — an HTML comment,
- * or a string inside a `<script>`/`<style>` body — is skipped, so an inlined
- * bundle cannot fake a reference the page does not actually load.
+ * Markup-shaped text that a browser never treats as markup — an HTML comment, a
+ * raw-text body (`<script>`/`<style>`/`<textarea>`/`<title>`), or the inside of
+ * an attribute VALUE — is skipped, so an inlined bundle cannot fake a reference
+ * the page does not actually load. Under-reporting is the safe direction: a false notice on a
+ * genuinely self-contained export is worse than a missing one, so anything the
+ * scan cannot read confidently (an unterminated comment, quote or raw-text body)
+ * ends the scan rather than convicting.
+ *
+ * Known misses, deliberately not chased — each needs its own parsing, and a
+ * missed ref costs only the notice, not the render: `<img srcset>` (a
+ * comma-separated descriptor list), `<video poster>`, and `url(…)` inside a
+ * `<style>` body or a `style=` attribute. Plain `<a href>` is excluded by
+ * design, per above.
  */
 export function hasRelativeAssetRefs(html: string): boolean {
-	TOKEN.lastIndex = 0;
-	let token: RegExpExecArray | null;
-	while ((token = TOKEN.exec(html))) {
-		if (token[0] === '<!--') {
-			const end = html.indexOf('-->', TOKEN.lastIndex);
+	const n = html.length;
+	let i = 0;
+	while (i < n) {
+		const lt = html.indexOf('<', i);
+		if (lt === -1) return false;
+		if (html.startsWith('<!--', lt)) {
+			const end = html.indexOf('-->', lt + 4);
 			// Unterminated: a browser comments out the rest of the document.
 			if (end === -1) return false;
-			TOKEN.lastIndex = end + 3;
+			i = end + 3;
 			continue;
 		}
-		if (attrsRefRelative(token[2] ?? '')) return true;
 
-		const closer = CLOSE_TAG[token[1].toLowerCase()];
-		if (closer) {
-			closer.lastIndex = TOKEN.lastIndex;
-			const close = closer.exec(html);
+		const nameStart = lt + 1;
+		let p = nameStart;
+		while (p < n && NAME_CHAR.test(html[p])) p++;
+		const nameLen = p - nameStart;
+		if (nameLen === 0) {
+			// A closing tag, or a bare `<` in text — neither opens an element.
+			i = lt + 1;
+			continue;
+		}
+
+		const tag = nameLen <= MAX_TAG_LEN ? html.slice(nameStart, p).toLowerCase() : '';
+		const scanned = scanTag(html, p, SUBRESOURCE_TAGS.has(tag));
+		if (scanned.relative) return true;
+		i = scanned.end;
+
+		if (RAW_TEXT_TAGS.has(tag)) {
+			const close = rawTextEnd(html, i, tag);
 			// Unterminated: a browser reads the rest of the document as raw text.
-			if (!close) return false;
-			TOKEN.lastIndex = close.index;
+			if (close === -1) return false;
+			i = close;
 		}
 	}
 	return false;

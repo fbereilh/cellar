@@ -109,6 +109,13 @@ describe('hasRelativeAssetRefs', () => {
 		);
 	});
 
+	// Same class as <script>/<style>: text a browser displays, never parses.
+	it('ignores markup-shaped text inside <textarea>/<title>', () => {
+		expect(hasRelativeAssetRefs('<textarea><img src="figures/a.png"></textarea>')).toBe(false);
+		expect(hasRelativeAssetRefs('<title>How to &lt;img src="a/b.png"&gt;</title>')).toBe(false);
+		expect(hasRelativeAssetRefs('<textarea>x</textarea><img src="figures/a.png">')).toBe(true);
+	});
+
 	it('ignores markup inside an HTML comment', () => {
 		expect(
 			hasRelativeAssetRefs('<!-- <script src="old/app.js"></script> --><body>hi</body>')
@@ -128,7 +135,47 @@ describe('hasRelativeAssetRefs', () => {
 		expect(hasRelativeAssetRefs('<img data-src="https://x/y.png" src="figures/a.png">')).toBe(true);
 	});
 
-	it('is stateless across calls (the module-level regexes never carry lastIndex)', () => {
+	// A tag ends at the first `>` OUTSIDE a quoted value. An inline
+	// `data:image/svg+xml` URI carries a whole `<svg …></svg>`, so truncating
+	// there would read the remainder as bare attributes and put the notice on
+	// exactly the self-contained export this preview targets.
+	it('respects quoted attribute values containing ">"', () => {
+		expect(
+			hasRelativeAssetRefs(
+				`<img src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'></svg>" alt=x>`
+			)
+		).toBe(false);
+		// A `>`-bearing attribute must not mis-anchor the <script> raw-text skip either.
+		expect(hasRelativeAssetRefs(`<script data-x="a>b">var t="<img src='q/r.png'>";</script>`)).toBe(
+			false
+		);
+		// A real relative ref beside one is still seen.
+		expect(hasRelativeAssetRefs('<img alt="a>b" src="figures/a.png">')).toBe(true);
+		expect(
+			hasRelativeAssetRefs(
+				'<img src="data:image/svg+xml;utf8,<svg></svg>"><script src="x/y.js"></script>'
+			)
+		).toBe(true);
+	});
+
+	// Only attribute NAMES are matched, so markup-shaped prose inside some other
+	// attribute's value is not a reference.
+	it('does not match a URL attribute name appearing inside another attribute value', () => {
+		expect(hasRelativeAssetRefs('<img alt="pass src=foo/bar.png to it" src="https://cdn/x.png">')).toBe(
+			false
+		);
+		expect(hasRelativeAssetRefs('<img title=\'use href="a/b.css"\' src="https://x/y.png">')).toBe(false);
+	});
+
+	// Under-reporting is the safe direction: these render broken with no notice,
+	// which is documented at the seam rather than chased.
+	it('misses srcset/poster/CSS url() by design (documented limits)', () => {
+		expect(hasRelativeAssetRefs('<img srcset="images/a.png 1x">')).toBe(false);
+		expect(hasRelativeAssetRefs('<video poster="thumbs/a.jpg"></video>')).toBe(false);
+		expect(hasRelativeAssetRefs('<style>body{background:url(fonts/bg.png)}</style>')).toBe(false);
+	});
+
+	it('is stateless across calls (no scanner state survives a call)', () => {
 		const relative = '<img src="a/b.png">';
 		for (let i = 0; i < 5; i++) expect(hasRelativeAssetRefs(relative)).toBe(true);
 		const absolute = '<img src="https://x/y.png">';
