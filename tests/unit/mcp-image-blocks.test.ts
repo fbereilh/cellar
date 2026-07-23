@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { PNG } from 'pngjs';
-import { base64Bytes, buildImageBlocks, IMG_MAX_EDGE, MAX_DECODE_PIXELS, MAX_IMAGE_BLOCKS } from '../../src/lib/server/mcp/image';
+import { base64Bytes, buildImageBlocks, canInlineImage, IMG_MAX_EDGE, MAX_DECODE_PIXELS, MAX_IMAGE_BLOCKS, MAX_IMAGE_EDGE_HARD } from '../../src/lib/server/mcp/image';
 import type { ImageOutputRef } from '../../src/lib/server/mcp/image';
 import { textWithImages } from '../../src/lib/server/mcp/server';
 
@@ -61,6 +61,15 @@ function fakePngHeader(w: number, h: number): string {
 	buf.write('IHDR', 12, 'ascii');
 	buf.writeUInt32BE(w, 16);
 	buf.writeUInt32BE(h, 20);
+	return buf.toString('base64');
+}
+
+/** A GIF header claiming `w×h` — a non-PNG, i.e. one the policy cannot resample. */
+function gifHeader(w: number, h: number): string {
+	const buf = Buffer.alloc(13);
+	buf.write('GIF89a', 0, 'ascii');
+	buf.writeUInt16LE(w, 6);
+	buf.writeUInt16LE(h, 8);
 	return buf.toString('base64');
 }
 
@@ -140,6 +149,56 @@ describe('image block policy', () => {
 		const { images, omitted } = buildImageBlocks([ref(3, 'image/png', fakePngHeader(7000, 7000))]);
 		expect(images).toEqual([]);
 		expect(omitted).toEqual([expect.objectContaining({ output_index: 3, reason: 'too_large' })]);
+	});
+
+	it('SHIPS a tall figure whose long edge is over the host ceiling but whose pixels are not — it downscales to fit', () => {
+		// A stacked-subplot / FacetGrid plot (plt.subplots(30,1,figsize=(8,60),dpi=150))
+		// is ~1200×9000: past MAX_IMAGE_EDGE_HARD on one edge, but ~11 MP, far under the
+		// decode bound. The decode is what w*h*4 makes dangerous, and this one is cheap;
+		// refusing it pre-decode would hand back a placeholder for a figure that
+		// downscales to 768px and ships fine. The edge ceiling belongs on the raster we
+		// EMIT, which withinHostLimits already enforces.
+		const b64 = makePngB64(30, 9000); // same aspect problem, ~0.3 MP to build
+		expect(30 * 9000).toBeLessThan(MAX_DECODE_PIXELS);
+		expect(9000).toBeGreaterThan(MAX_IMAGE_EDGE_HARD);
+
+		const { images, omitted } = buildImageBlocks([ref(0, 'image/png', b64)]);
+		expect(omitted).toEqual([]);
+		expect(dimsOf(images[0].data).height).toBe(IMG_MAX_EDGE);
+		expect(images[0].downscaled).toEqual(expect.objectContaining({ from: '30×9000' }));
+
+		// Even asked for at full resolution it degrades to that downscaled copy — the
+		// ship ceiling is enforced on the emitted raster — never to nothing.
+		const full = buildImageBlocks([ref(0, 'image/png', b64)], { full: true });
+		expect(full.omitted).toEqual([]);
+		expect(dimsOf(full.images[0].data).height).toBe(IMG_MAX_EDGE);
+
+		// And the batch flag agrees: has_image must not promise a figure the policy declines.
+		expect(canInlineImage('image/png', b64)).toBe(true);
+	});
+
+	it('canInlineImage declines exactly what the policy declines, from the header alone', () => {
+		// The batch path never decodes (see runCell's skipImages), so has_image is
+		// decided on headers. It must agree with buildImageBlocks or the agent spends a
+		// get_full_output round trip to receive the same placeholder it already had.
+		const svg = Buffer.from('<svg/>').toString('base64');
+		expect(canInlineImage('image/svg+xml', svg)).toBe(false);
+		expect(canInlineImage('image/webp', Buffer.from('RIFF....WEBP').toString('base64'))).toBe(false);
+		expect(canInlineImage('image/png', fakePngHeader(7000, 7000))).toBe(false); // pixel bomb
+		expect(canInlineImage('image/png', makePngB64(40, 30))).toBe(true);
+		// A non-PNG cannot be resampled, so one past the host's edge ceiling is a no.
+		expect(canInlineImage('image/gif', gifHeader(9000, 100))).toBe(false);
+		expect(canInlineImage('image/gif', gifHeader(600, 400))).toBe(true);
+	});
+
+	it('does NOT inline webp — its header is unreadable here, so the ceilings could not be enforced on it', () => {
+		// The module only ships a raster it has VERIFIED is inside the host's ceilings.
+		// With no webp header parser an oversized one would sail through and fail the
+		// entire tool result, so it keeps its text placeholder like svg.
+		const webp = Buffer.from('RIFF....WEBPVP8 ').toString('base64');
+		const { images, omitted } = buildImageBlocks([ref(0, 'image/webp', webp)]);
+		expect(images).toEqual([]);
+		expect(omitted).toEqual([expect.objectContaining({ output_index: 0, mime: 'image/webp', reason: 'unsupported_mime' })]);
 	});
 
 	it('applies the pixel bound on the `full` path too — asking for detail is not a licence to ship (or decode) an unbounded raster', () => {

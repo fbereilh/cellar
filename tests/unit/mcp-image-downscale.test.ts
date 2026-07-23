@@ -101,6 +101,18 @@ describe('image module', () => {
 		expect(r.data).toBe(huge); // untouched, never decoded
 	});
 
+	it('bounds the decode on TOTAL PIXELS, not on one long edge — a tall figure is decoded and shrunk', () => {
+		// w*h*4 is the allocation, so it is the whole risk. A 30×9000 stacked-subplot
+		// plot is over the host's per-edge ship ceiling but ~0.3 MP, and refusing it
+		// pre-decode would return a placeholder for a figure that downscales fine.
+		const tall = makePngB64(30, 9000);
+		expect(Math.max(30, 9000)).toBeGreaterThan(img.MAX_IMAGE_EDGE_HARD);
+		expect(img.exceedsDecodeBound('image/png', tall)).toBe(false);
+		const r = img.downscaleImageForBlock('image/png', tall, img.IMG_MAX_EDGE);
+		expect(r.resized).toBe(true);
+		expect(dimsOf(r.data).height).toBe(img.IMG_MAX_EDGE);
+	});
+
 	it('returns the original, undamaged, when the PNG cannot be decoded', () => {
 		const junk = Buffer.from('\x89PNG\r\n\x1a\n corrupt tail').toString('base64');
 		const r = img.downscaleImageForBlock('image/png', junk, img.IMG_MAX_EDGE);
@@ -173,6 +185,27 @@ describe('get_full_output default-vs-full image contract', () => {
 		const out = read!.outputs[0] as { image?: string; text?: string };
 		expect(out.image).toBe('image/png');
 		expect(out.text).toMatch(/^\[image\/png, 1600×1200, \d+ (B|KB|MB)\]$/);
+	});
+
+	it('picks the viewable rasterization when one bundle carries several (png + svg)', async () => {
+		// matplotlib with figure_formats={'png','svg'} emits BOTH for one figure. Taking
+		// the first image/* key can land on the svg, which the block policy correctly
+		// declines — leaving the agent with no picture while a viewable PNG sits in the
+		// same output.
+		const NB = 'png-and-svg.ipynb';
+		svc.useNotebook('imgSessMulti', NB);
+		const nb = nbmod.resolveNotebookPath(NB);
+		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'fig' }], null, { nb, routeImports: false });
+		const id = svc.resolveRef(nb, ids[0]);
+
+		const png = makePngB64(120, 90);
+		nbmod.setOutputs(id, [{ output_type: 'display_data', data: { 'image/svg+xml': Buffer.from('<svg/>').toString('base64'), 'image/png': png }, metadata: {} }], nb);
+
+		const res = svc.getFullOutput(id, 'medium', nb)!;
+		expect(res.images_omitted).toBeUndefined();
+		expect(res.images![0]).toEqual(expect.objectContaining({ output_index: 0, mime: 'image/png', data: png }));
+		// The placeholder names the SAME mime, so images[i] and outputs[i] cannot disagree.
+		expect((res.outputs[0] as { image?: string }).image).toBe('image/png');
 	});
 
 	it('returns EVERY figure of the cell — the per-result cap bounds a run, not this explicit request', async () => {

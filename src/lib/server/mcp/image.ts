@@ -186,8 +186,19 @@ export function downscaleImageForBlock(mime: string, b64: string, maxEdge = IMG_
  * matplotlib emits under the svg backend) is not "slightly worse output" — the
  * host rejects the whole tool result, so ONE svg figure would break the call that
  * carried it. Anything outside this set keeps its enriched text placeholder.
+ *
+ * `image/webp` is deliberately NOT here even though hosts accept it: this module
+ * only ships a raster it has VERIFIED is inside the host's ceilings, and it has no
+ * webp header reader (`imageDimensions` returns null), so an oversized webp would
+ * pass the dimension check by default and fail the whole tool result — the exact
+ * failure the allowlist exists to prevent. Nor could it be brought under the
+ * ceiling: only PNG is resampleable here. Nothing in Cellar emits webp (it takes a
+ * hand-written `display({'image/webp': …}, raw=True)`), so it keeps its text
+ * placeholder like svg. Adding it back means adding a VP8/VP8L/VP8X header parse
+ * to `imageDimensions` first — the ceilings must be genuinely enforced, not
+ * vacuously true.
  */
-export const INLINE_IMAGE_MIMES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'];
+export const INLINE_IMAGE_MIMES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif'];
 
 /** Whether a mime may ride as an image content block at all (the allowlist). */
 export const isInlinableImageMime = (mime: unknown): boolean => typeof mime === 'string' && INLINE_IMAGE_MIMES.includes(mime);
@@ -223,7 +234,15 @@ export const MAX_IMAGE_BLOCKS = 4;
  */
 export const IMAGE_BLOCK_MAX_BYTES = 3.5 * 1024 * 1024;
 
-/** Hard pixel ceiling per edge (hosts reject beyond ~8000px). */
+/**
+ * Hard pixel ceiling per edge (hosts reject beyond ~8000px). It is a SHIP bound,
+ * enforced by `withinHostLimits` on the raster actually emitted — deliberately NOT
+ * a pre-decode refusal. A tall-but-modest figure (a stacked-subplot / FacetGrid
+ * plot: `plt.subplots(30, 1, figsize=(8,60), dpi=150)` → 1200×9000, ~11 MP) is over
+ * this edge yet nowhere near the decode bound, and downscaling resolves it to
+ * ≤ IMG_MAX_EDGE on both axes — so it must be decoded and shipped, not refused.
+ * A non-PNG over the edge cannot be resampled, so it is declined here instead.
+ */
 export const MAX_IMAGE_EDGE_HARD = 8000;
 
 /**
@@ -235,9 +254,11 @@ export const MAX_IMAGE_EDGE_HARD = 8000;
  * from: it kills the single shared Node process, taking every notebook's kernel
  * websocket, every SSE stream and every other agent session with it. So the
  * header dimensions are read first (`imageDimensions`, no decode) and anything
- * past this bound — or past `MAX_IMAGE_EDGE_HARD`, which the host would reject
- * anyway — is omitted `too_large` with the output keeping its text placeholder.
- * Set well beyond any real figure: a 300-dpi 20×12in plot is ~21 MP.
+ * past this bound is omitted `too_large` with the output keeping its text
+ * placeholder. TOTAL PIXELS is the whole rule, because w×h×4 is the whole risk:
+ * a single long edge costs nothing to decode and is handled by the ship ceiling
+ * (`MAX_IMAGE_EDGE_HARD`) on the emitted raster. Set well beyond any real figure:
+ * a 300-dpi 20×12in plot is ~21 MP.
  */
 export const MAX_DECODE_PIXELS = 32_000_000;
 
@@ -249,7 +270,7 @@ export const MAX_DECODE_PIXELS = 32_000_000;
 export function exceedsDecodeBound(mime: string, b64: string): boolean {
 	const dim = imageDimensions(mime, b64);
 	if (!dim) return false;
-	return dim.width * dim.height > MAX_DECODE_PIXELS || Math.max(dim.width, dim.height) > MAX_IMAGE_EDGE_HARD;
+	return dim.width * dim.height > MAX_DECODE_PIXELS;
 }
 
 /** One image output of a cell, as the service hands it to the policy. */
@@ -359,6 +380,26 @@ function withinHostLimits(mime: string, b64: string, maxBytes: number): boolean 
 	if (base64Bytes(b64) > maxBytes) return false;
 	const dim = imageDimensions(mime, b64);
 	return !dim || Math.max(dim.width, dim.height) <= MAX_IMAGE_EDGE_HARD;
+}
+
+/**
+ * Whether `buildImageBlocks` would actually SHOW this output on the default path —
+ * decided from the header alone, so a caller can flag a figure without paying for
+ * a decode. This is what `has_image` on a batch record means: not "an image mime
+ * is present" but "a figure `get_full_output` can really display", so a raster the
+ * policy declines never sends the agent on a round trip that returns the same text
+ * placeholder it already had.
+ *
+ * A PNG over `maxEdge` is resampled down to it, so its shipped raster is bounded
+ * on both axes (and at 768px cannot approach the byte ceiling) — that branch is a
+ * yes without decoding. Everything else must already be inside the ceilings.
+ */
+export function canInlineImage(mime: string, b64: string, maxEdge = IMG_MAX_EDGE, maxBytes = IMAGE_BLOCK_MAX_BYTES): boolean {
+	if (!isInlinableImageMime(mime)) return false;
+	if (exceedsDecodeBound(mime, b64)) return false;
+	const dim = imageDimensions(mime, b64);
+	if (mime === 'image/png' && dim && Math.max(dim.width, dim.height) > maxEdge) return true;
+	return withinHostLimits(mime, b64, maxBytes);
 }
 
 /**

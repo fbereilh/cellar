@@ -47,7 +47,7 @@ import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
-import { buildImageBlocks, imagePlaceholder, isInlinableImageMime } from './image';
+import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime } from './image';
 import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
@@ -380,9 +380,18 @@ function runStatus(cell: CellView, sid: SessionId | null): string {
 }
 
 // Outputs carry `data` only on execute_result/display_data; guard before probing.
+// ONE bundle can hold several rasterizations of the same figure (matplotlib with
+// `figure_formats = {'png','svg'}` emits both), so an INLINABLE key wins over the
+// merely-first one — otherwise the svg would be chosen, the block policy would
+// decline it, and the agent would get no picture while a viewable PNG sat in the
+// same output. Every surface derives from this one function (the placeholder and
+// the image block alike), so `images[i].mime` and `outputs[i].image` can never
+// disagree about which mime an output_index carries.
 const imageKey = (o: CellOutput): string | undefined => {
 	const data = 'data' in o ? o.data : undefined;
-	return data ? Object.keys(data).find((k) => k.startsWith('image/')) : undefined;
+	if (!data) return undefined;
+	const keys = Object.keys(data).filter((k) => k.startsWith('image/'));
+	return keys.find(isInlinableImageMime) ?? keys[0];
 };
 
 /**
@@ -1638,11 +1647,15 @@ function toBatchRecord(
 	// alone cannot: a batch never inlines images (see runCell's skipImages), so
 	// without this an agent that just ran 20 plotting cells has no way to know any
 	// of them drew anything except by fetching each one.
-	// Only an INLINABLE mime counts: has_image promises a figure get_full_output can
-	// actually SHOW, so an svg-only output (which the block policy declines, and
-	// which would come back as the same placeholder) must not send the agent on a
-	// round trip that tells it nothing new.
-	const hasImage = outputs.some((o) => isInlinableImageMime((o as { image?: unknown }).image));
+	// It promises a figure get_full_output can actually SHOW, so the test is the
+	// block policy's own (`canInlineImage`, header-only — no decode on the batch
+	// path): an output the policy would decline, whether for its mime (svg) or its
+	// size, must not send the agent on a round trip that returns the same
+	// placeholder it already has. Falls back to the mime alone only when the cell
+	// itself is gone, where there is no raster left to judge.
+	const hasImage = cell
+		? imageRefs(cell.outputs).some((r) => canInlineImage(r.mime, r.b64))
+		: outputs.some((o) => isInlinableImageMime((o as { image?: unknown }).image));
 	return { id: r.id, run_status, ...(outputs.length ? { has_output: true } : {}), ...(hasImage ? { has_image: true } : {}), ...stale };
 }
 
