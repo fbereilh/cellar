@@ -30,8 +30,9 @@
  * source is exactly the mistake `imports.ts` exists to avoid, and a MISSED shadow
  * is a false `fresh` - the one verdict staleness must never invent. So the test is
  * the tokenizer's own, already-exact one: `isImportsOnly` (every module-level
- * logical line is an import, a comment, or blank). Nothing at module scope can then
- * bind anything the imports did not. A mixed cell simply keeps today's conservative
+ * logical line is an import, a comment, a blank - or, see below, a magic that binds
+ * nothing). Nothing at module scope can then bind anything the imports did not. A
+ * mixed cell simply keeps today's conservative
  * behavior, which costs precision nowhere that matters: the imports cell - the
  * whole point of this mechanism - is imports-only by construction (both the
  * routing/consolidate path and `isImportsOnly` adoption keep it so).
@@ -39,22 +40,46 @@
  * `from x import *` binds unknowable names, so it makes the whole map UNKNOWABLE
  * (null) rather than merely omitting an entry - same "I don't understand this, so
  * don't touch it" rule `imports.ts` applies to a statement it cannot re-render.
+ *
+ * LINE MAGICS ARE IGNORABLE, LIKE COMMENTS. `%matplotlib inline`, `%pip install …`,
+ * `%config …` above the import block is one of the most common notebook headers
+ * there is, and a magic line binds no Python name - so treating one as "other code"
+ * would degrade the map to null and leave exactly the reported bug unfixed for most
+ * real notebooks. The vocabulary comes from `magics.ts` (`blankLineMagics`, already
+ * the probe's), never a second regex here, and the assignment form (`files = !ls`)
+ * survives that pass as `files = None`, so it still reads as ordinary code and still
+ * disqualifies. Two deliberate exceptions: a `%%cell magic` cell is not a Python
+ * imports cell at all, and `%autoreload` breaks the idempotence premise above - both
+ * keep the conservative rule (see `hasAutoreloadMagic`).
  */
 import { extractTopLevelImports, isImportsOnlyResidual, parseImportStatement, type ImportRecord } from './imports';
+import { blankLineMagics, hasAutoreloadMagic, isCellMagicCell } from './magics';
 
 /** name → the canonical rendering of the import record that binds it. */
 export type ImportSpecs = Map<string, string>;
 
 /** One name's last KNOWN-GOOD binding, plus when it last changed. */
 export interface ImportBinding {
-	/** The canonical import statement that binds the name, or null once it is gone. */
-	spec: string | null;
 	/**
-	 * Wall-clock ms the binding last CHANGED (added, rebound, removed). 0 means it
-	 * has not changed since Cellar started watching this document, which is exactly
-	 * the reading a downstream cell needs - its `lastRun` cannot predate that.
+	 * The canonical import statement that binds the name. It is the last one PROVEN
+	 * to bind it and is kept even after the name is removed (see `removedAt`), so a
+	 * source that comes back is compared against what it actually used to say.
+	 */
+	spec: string;
+	/**
+	 * Wall-clock ms the binding last CHANGED (was added or rebound). 0 means it has
+	 * not changed since Cellar started watching this document, which is exactly the
+	 * reading a downstream cell needs - its `lastRun` cannot predate that.
 	 */
 	at: number;
+	/**
+	 * Wall-clock ms a KNOWABLE source last stopped providing the name; absent while
+	 * it is provided. Separate from `at` so a removal that is undone (the transient
+	 * blank save below) can be un-recorded rather than re-stamped, and so staleness
+	 * can tell "this name was really dropped" from "we never proved anything about
+	 * this cell's current source".
+	 */
+	removedAt?: number;
 }
 
 /**
@@ -83,11 +108,16 @@ function boundName(rec: ImportRecord): string | null {
  */
 export function importBindingSpecs(source: string | null | undefined): ImportSpecs | null {
 	const src = source ?? '';
+	// A `%%cell magic` cell's body is not module-level Python (bash, html, its own
+	// mini-language), so it is never an imports cell; and autoreload retires the
+	// idempotence premise the whole exemption rests on.
+	if (isCellMagicCell(src) || hasAutoreloadMagic(src)) return null;
 	// ONE tokenizer pass answers both halves: what was lifted, and what was left.
 	// Anything else at module scope could rebind an imported name; we cannot prove
-	// otherwise without re-deriving Python's binding rules, so we do not try.
+	// otherwise without re-deriving Python's binding rules, so we do not try - only
+	// line magics / shell escapes are discounted, and only because they bind nothing.
 	const extracted = extractTopLevelImports(src);
-	if (!isImportsOnlyResidual(extracted.source)) return null;
+	if (!isImportsOnlyResidual(blankLineMagics(extracted.source))) return null;
 	const specs: ImportSpecs = new Map();
 	// `statements` is one canonical, deduplicated statement per bound name, in
 	// document order - so each entry is exactly one binding and is its own spec.
@@ -126,19 +156,20 @@ function baselineOf(
  *
  * A name keeps its previous stamp when its binding is byte-identical before and
  * after (so re-rendering, reordering, or re-adding an import that was already
- * there changes nothing) and takes `now` when it was added, rebound, or REMOVED.
- * A removed name stays in the map with a null spec: its disappearance is a change
- * downstream cells must see, and forgetting it is precisely the false `fresh` this
- * mechanism exists to prevent.
+ * there changes nothing) and takes `now` when it was added or rebound. A name the
+ * new source no longer provides keeps its entry, its spec and its `at`, and gains a
+ * `removedAt`: its disappearance is a change downstream cells must see, and
+ * forgetting it is precisely the false `fresh` this mechanism exists to prevent.
  *
  * THE COMPARISON IS ALWAYS KNOWABLE-VS-KNOWABLE, and that is load-bearing. The
  * fold diffs the new source against the cell's STORED baseline, never against the
  * previous source text, because a cell's persisted source is routinely an unusable
- * mid-edit snapshot: `Cell.svelte` autosaves on a 500ms debounce, so the instant
- * after a select-all, or a pause after typing a bare `import `, reaches this
- * function. Stamping every name whenever a side is unknowable (what this used to
- * do) made that transient snapshot permanently re-stamp every binding - the exact
- * blanket-stale this mechanism exists to remove.
+ * mid-edit snapshot: `Cell.svelte` autosaves on a 500ms debounce (and flushes on
+ * blur), so a pause after typing a bare `import `, or the instant after a
+ * select-all-then-type, really does reach this function. Stamping every name
+ * whenever a side is unknowable (what this used to do) made that transient snapshot
+ * permanently re-stamp every binding - the exact blanket-stale this mechanism
+ * exists to remove.
  *
  * So an UNKNOWABLE next source changes nothing: the last known-good baseline is
  * frozen and returned as-is, and the real delta is computed once the source parses
@@ -148,6 +179,17 @@ function baselineOf(
  * for an unknowable source) - so while the cell is mid-edit it grants no exemption
  * at all and every edge out of it stays conservative.
  *
+ * A select-all-then-DELETE is the other half of that story and needs the opposite
+ * treatment, because an EMPTY source is perfectly knowable - it provides nothing -
+ * so freezing it would silently drop a genuine "delete all imports". The removal is
+ * therefore RECORDED but kept UNDOABLE: `spec` survives it, so retyping the same
+ * block matches the baseline and clears `removedAt` with no stamp at all, while a
+ * deletion the user MEANT keeps its `removedAt` and stales the readers of the name
+ * (`staleness.ts` only consults it for names nothing defines any more). Recording
+ * the removal by overwriting the stamp instead - what this used to do - meant the
+ * retype could only read as "this binding just changed", i.e. the whole notebook
+ * stale after a round trip that ended byte-identical to where it started.
+ *
  * An unknowable BASELINE (a cell that has never been proven imports-only) is the
  * one stamp-everything case left: nothing is known to have survived, so every name
  * the new source binds is stamped `now`.
@@ -156,8 +198,8 @@ function baselineOf(
  * already documents for a deleted definer: an edit that both stops being analyzable
  * AND drops a binding records no change for the dropped name, so a reader of it -
  * which now has no definer at all, and no edge - stays `fresh`. Closing that would
- * take a second per-name field (last real change vs. last unprovable), which buys a
- * contrived case at the cost of the mechanism's whole point.
+ * take yet another per-name field (last real change vs. last unprovable), which buys
+ * a contrived case at the cost of the mechanism's whole point.
  */
 export function foldImportChange(
 	prevSource: string | null | undefined,
@@ -173,15 +215,19 @@ export function foldImportChange(
 	const out: ImportChangeStamps = {};
 	const names = new Set<string>([...Object.keys(baseline ?? {}), ...after.keys()]);
 	for (const name of names) {
-		// A name absent from the baseline and one the baseline records as REMOVED are
-		// the same fact - it was not bound before - so both compare as null.
-		const before = baseline ? (baseline[name]?.spec ?? null) : undefined;
-		const spec = after.get(name) ?? null;
-		if (before !== undefined && before === spec) {
-			out[name] = baseline?.[name] ?? { spec, at: 0 };
+		const before = baseline?.[name];
+		const spec = after.get(name);
+		if (spec === undefined) {
+			// Gone from a knowable source. Keep the baseline intact so a restore is still
+			// recognizable as one, and remember WHEN it went - but only the first time,
+			// so a run of edits that leave it absent does not walk the removal forward.
+			if (before) out[name] = { ...before, removedAt: before.removedAt ?? now };
 			continue;
 		}
-		out[name] = { spec, at: now };
+		// Provided again, or still: an unchanged spec keeps its stamp and drops any
+		// pending removal. A name the baseline never proved (or proved differently) is
+		// the real change, and is the only thing stamped `now`.
+		out[name] = before && before.spec === spec ? { spec, at: before.at } : { spec, at: now };
 	}
 	return out;
 }

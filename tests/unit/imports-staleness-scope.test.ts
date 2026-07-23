@@ -208,6 +208,55 @@ describe('an imports-cell edit stales only the affected dependents', () => {
 		expect(state(m, joins)).toBe(STALE_STATE.FRESH);
 	});
 
+	it('a transient EMPTIED cell that is retyped identically does not re-stale the notebook', async () => {
+		// The other debounced-save shape: select-all, delete, pause, retype. Unlike an
+		// unparseable snapshot an empty source is knowable, so the removal it implies is
+		// recorded - but undoably, so restoring the same block clears it again.
+		const { imports, usesPd, usesNp, joins } = notebook();
+		nb.setSource(imports, '', abs);
+		nb.setSource(imports, 'import pandas as pd\nimport numpy as np', abs);
+
+		const m = await staleness();
+		expect(state(m, imports)).toBe(STALE_STATE.STALE); // edited after it ran
+		expect(state(m, usesPd)).toBe(STALE_STATE.FRESH);
+		expect(state(m, usesNp)).toBe(STALE_STATE.FRESH);
+		expect(state(m, joins)).toBe(STALE_STATE.FRESH);
+	});
+
+	it('but DELETING every import really does stale its readers (never a false fresh)', async () => {
+		// The half the undoable removal must not trade away: with the imports gone the
+		// readers have no definer at all, so only the removal record can flag them.
+		const { imports, usesPd, usesNp, joins } = notebook();
+		nb.setSource(imports, '', abs);
+
+		const m = await staleness();
+		expect(state(m, usesPd)).toBe(STALE_STATE.STALE);
+		expect(state(m, usesNp)).toBe(STALE_STATE.STALE);
+		expect(state(m, joins)).toBe(STALE_STATE.STALE);
+	});
+
+	it('a magic-headed imports cell still gets the per-binding refinement', async () => {
+		// `%matplotlib inline` binds nothing, so it must not make the cell unanalyzable -
+		// otherwise the commonest real-world imports cell keeps the blanket-stale.
+		const imports = ran(null, '%matplotlib inline\nimport pandas as pd\nimport numpy as np');
+		const usesPd = ran(imports, 'x = pd.DataFrame()');
+		const usesNp = ran(usesPd, 'y = np.zeros(3)');
+		nb.setSource(imports, '%matplotlib inline\nimport pandas as pd\nimport numpy.random as np', abs);
+
+		const m = await staleness();
+		expect(state(m, usesNp)).toBe(STALE_STATE.STALE); // its binding really moved
+		expect(state(m, usesPd)).toBe(STALE_STATE.FRESH); // pd is untouched
+	});
+
+	it('a cell arming %autoreload stays conservative (imports are no longer idempotent)', async () => {
+		const imports = ran(null, '%load_ext autoreload\n%autoreload 2\nimport pandas as pd\nimport numpy as np');
+		const usesPd = ran(imports, 'x = pd.DataFrame()');
+		nb.setSource(imports, '%load_ext autoreload\n%autoreload 2\nimport pandas as pd\nimport numpy as np\nimport re', abs);
+
+		const m = await staleness();
+		expect(state(m, usesPd)).toBe(STALE_STATE.STALE);
+	});
+
 	it('a star-import is unanalyzable, so it stays conservative', async () => {
 		const head = ran(null, 'import pandas as pd\nfrom os.path import *');
 		const consumer = ran(head, 'x = join(pd.__name__, "a")');

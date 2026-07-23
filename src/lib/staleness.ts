@@ -72,7 +72,11 @@
  *  - The import-binding exemption assumes an import is idempotent, which
  *    `importlib.reload` (or a module with import-time side effects) breaks. Both
  *    are deliberate, explicit acts; treating them as ordinary would give back the
- *    blanket-stale this exists to remove.
+ *    blanket-stale this exists to remove. IPython's `%autoreload` breaks the same
+ *    premise, but that one IS detected: a cell arming it is treated as unanalyzable,
+ *    so its edges stay conservative (see `importBindings.ts`). Ordinary line magics
+ *    (`%matplotlib inline`, `%pip install …`) bind nothing and are discounted, so a
+ *    magic-headed imports cell still gets the refinement.
  *  - REMOVAL is only covered while the cell that provided the name survives. The
  *    ledger below reads `importBindings` off that cell, so DELETING the imports
  *    cell outright takes its stamps with it: its readers then have no definer, no
@@ -210,6 +214,14 @@ export function computeStaleness(
 	// BELOW it): name → the latest wall-clock ms some earlier cell stopped providing
 	// it, plus which cell that was. A stamp for a name the cell still provides is an
 	// ordinary rebinding and is handled by `edgeCarriesChange`, not here.
+	//
+	// A removal has to be visible in the cell's CURRENT source, not merely recorded
+	// once: a stamp counts only for a name `importDefines` no longer lists AND that
+	// the fold actually watched leave a knowable source (`removedAt`). A cell caught
+	// mid-edit lists no imports at all, so without that second half every transient
+	// keystroke would read as "every binding here was just removed" and blanket-stale
+	// the notebook - the very thing this refinement exists to stop. Retyping a block
+	// that was momentarily deleted clears `removedAt` again (see `foldImportChange`).
 	const removedBefore = new Map<string, { at: number; id: string }>();
 
 	// Process in document order: an upstream (nearest preceding definer) always has
@@ -218,10 +230,11 @@ export function computeStaleness(
 	// construction (no need to guard against cycles).
 	const stale: boolean[] = new Array(codeCells.length).fill(false);
 	const foldRemovals = (cell: StaleCell, i: number): void => {
-		for (const [name, { at }] of Object.entries(importStampsOf(cell))) {
+		for (const [name, { removedAt }] of Object.entries(importStampsOf(cell))) {
 			if (importDefines[i].has(name)) continue; // still provided ⇒ not a removal
+			if (removedAt == null) continue; // never watched leave ⇒ nothing observed
 			const prev = removedBefore.get(name);
-			if (!prev || at > prev.at) removedBefore.set(name, { at, id: cell.id });
+			if (!prev || removedAt > prev.at) removedBefore.set(name, { at: removedAt, id: cell.id });
 		}
 	};
 	codeCells.forEach((cell, i) => {

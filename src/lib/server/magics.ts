@@ -66,8 +66,17 @@ export function isCellMagicCell(source: string | null | undefined): boolean {
  * Uses `logicalLines` so a `%`/`!` that is really a continuation of a bracketed
  * expression (`x = (a\n% b)`) is part of the previous logical line and never
  * mistaken for a magic.
+ *
+ * Exported because `importBindings.ts` needs the SAME notion of "this line is a
+ * magic, not Python" when deciding whether a cell is imports-only: a header of
+ * `%matplotlib inline` / `%load_ext …` / `%pip install …` above the import block is
+ * ubiquitous, and re-deriving what counts as a magic there would be a second,
+ * drifting vocabulary. Note the deliberate asymmetry that makes reuse SAFE for that
+ * caller: a bare magic or shell escape binds no Python name, while the assignment
+ * form (`files = !ls`) keeps its binding as `name = None` and therefore still reads
+ * as ordinary module-level code.
  */
-function blankLineMagics(src: string): string {
+export function blankLineMagics(src: string): string {
 	const edits: { start: number; end: number; text: string }[] = [];
 	for (const line of logicalLines(src)) {
 		const first = line.raw.trimStart()[0];
@@ -87,6 +96,32 @@ function blankLineMagics(src: string): string {
 		out = out.slice(0, e.start) + e.text + out.slice(e.end);
 	}
 	return out;
+}
+
+/** `%load_ext autoreload` and `%reload_ext autoreload` both arm the extension. */
+const EXT_LOADERS = new Set(['load_ext', 'reload_ext']);
+
+/**
+ * Does this source arm IPython's `autoreload` extension (`%load_ext autoreload`,
+ * `%autoreload 2`, …)?
+ *
+ * Only `importBindings.ts` cares, and only to REFUSE: every other magic is inert
+ * for static analysis, but autoreload changes what re-executing an import means -
+ * it reloads a changed module rather than handing back the object `sys.modules`
+ * already holds. That is the one premise the import-binding staleness exemption
+ * rests on, so a cell that arms autoreload keeps the conservative rule instead.
+ * Any mention disqualifies, including `%autoreload 0`: distinguishing a live
+ * setting from a disabled one would mean tracking cell execution order for a knob
+ * whose whole purpose is to make imports non-idempotent.
+ */
+export function hasAutoreloadMagic(source: string | null | undefined): boolean {
+	for (const line of logicalLines(source ?? '')) {
+		const m = /^%{1,2}(\w+)([^\n]*)/.exec(line.raw.trimStart());
+		if (!m) continue;
+		if (m[1] === 'autoreload') return true;
+		if (EXT_LOADERS.has(m[1]) && /\bautoreload\b/.test(m[2])) return true;
+	}
+	return false;
 }
 
 /**

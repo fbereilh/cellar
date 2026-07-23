@@ -84,12 +84,13 @@ export interface CellarNamespace {
 	editedAt?: number;
 	/**
 	 * Runtime-only, never persisted: this cell's last KNOWN-GOOD module-level import
-	 * bindings - per name, the canonical statement that bound it (null once removed)
-	 * and the wall-clock ms it last CHANGED (0 / an absent name = unchanged since
-	 * this document was loaded). It is the baseline every later edit is diffed
-	 * against, so a transient unparseable mid-edit snapshot cannot re-stamp
-	 * everything. Feeds the staleness rule so an imports-cell edit stales only the
-	 * cells that read a name whose binding actually moved - see `importBindings.ts`.
+	 * bindings - per name, the canonical statement that bound it, the wall-clock ms
+	 * it last CHANGED (0 / an absent name = unchanged since this document was
+	 * loaded), and, once the name leaves a knowable source, when it was dropped. It
+	 * is the baseline every later edit is diffed against, so neither a transient
+	 * unparseable snapshot nor a momentarily emptied cell can re-stamp everything.
+	 * Feeds the staleness rule so an imports-cell edit stales only the cells that
+	 * read a name whose binding actually moved - see `importBindings.ts`.
 	 */
 	importBindings?: ImportChangeStamps;
 	[key: string]: unknown;

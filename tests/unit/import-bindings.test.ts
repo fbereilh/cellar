@@ -18,7 +18,8 @@ import { describe, it, expect } from 'vitest';
 import {
 	importBindingSpecs,
 	importBindingNames,
-	foldImportChange
+	foldImportChange,
+	type ImportChangeStamps
 } from '../../src/lib/server/importBindings';
 
 const specs = (src: string) => {
@@ -80,13 +81,54 @@ describe('importBindingSpecs - which names a source provides', () => {
 	it('lets a later duplicate binding win, like Python', () => {
 		expect(specs('import json\nimport ujson as json')).toEqual({ json: 'import ujson as json' });
 	});
+
+	it('DISCOUNTS line magics and shell escapes, which bind nothing', () => {
+		// `%matplotlib inline` above the import block is one of the commonest notebook
+		// headers there is. Treating it as "other code" would degrade the whole map to
+		// null and leave the reported bug unfixed for most real notebooks.
+		expect(specs('%matplotlib inline\nimport pandas as pd')).toEqual({ pd: 'import pandas as pd' });
+		expect(specs('%pip install polars\n!ls\nimport os')).toEqual({ os: 'import os' });
+		expect(specs('%config InlineBackend.figure_format = "retina"\nimport os')).toEqual({
+			os: 'import os'
+		});
+	});
+
+	it('still refuses the ASSIGNMENT form of a magic, which does bind', () => {
+		// `files = !ls` binds `files`, so the cell is ordinary code again - and a cell
+		// that binds anything outside its imports could rebind an imported name.
+		expect(importBindingSpecs('import os\nfiles = !ls')).toBeNull();
+		expect(importBindingSpecs('import os\nt = %timeit -o f()')).toBeNull();
+	});
+
+	it('is UNKNOWABLE for a cell magic, whose body is not module-level Python', () => {
+		expect(importBindingSpecs('%%bash\nimport os')).toBeNull();
+		expect(importBindingSpecs('%%time\nimport os')).toBeNull();
+	});
+
+	it('is UNKNOWABLE for a cell arming %autoreload, which un-does import idempotence', () => {
+		// The exemption rests on "re-executing an import rebinds the same object";
+		// autoreload exists precisely to break that, so such a cell keeps the
+		// conservative cell-level rule (documented in staleness.ts KNOWN LIMITS).
+		expect(importBindingSpecs('%load_ext autoreload\n%autoreload 2\nimport pandas as pd')).toBeNull();
+		expect(importBindingSpecs('%reload_ext autoreload\nimport os')).toBeNull();
+		expect(importBindingSpecs('%autoreload 0\nimport os')).toBeNull();
+		// A different extension is an ordinary magic and stays analyzable.
+		expect(specs('%load_ext sql\nimport os')).toEqual({ os: 'import os' });
+	});
 });
 
 describe('foldImportChange - when each binding last changed', () => {
 	const NOW = 5000;
 	/** name → the ms stamp, dropping the baseline spec each entry also carries. */
-	const stamps = (out: Record<string, { spec: string | null; at: number }>) =>
+	const stamps = (out: ImportChangeStamps) =>
 		Object.fromEntries(Object.entries(out).map(([name, b]) => [name, b.at]));
+	/** name → when it stopped being provided; only removals appear. */
+	const removals = (out: ImportChangeStamps) =>
+		Object.fromEntries(
+			Object.entries(out)
+				.filter(([, b]) => b.removedAt != null)
+				.map(([name, b]) => [name, b.removedAt])
+		);
 
 	it('stamps nothing when the bindings survive a rewrite', () => {
 		// Reordered and re-rendered - the same two bindings. This is the routing case.
@@ -104,12 +146,19 @@ describe('foldImportChange - when each binding last changed', () => {
 		expect(stamps(out)).toEqual({ np: NOW, pd: 0 });
 	});
 
-	it('stamps a REMOVED name and KEEPS it in the map', () => {
+	it('records WHEN a name was REMOVED and KEEPS it in the map', () => {
 		// The entry is what tells staleness a reader of `np` must be re-run; dropping
-		// it leaves that reader with no definer at all, i.e. a false `fresh`.
+		// it leaves that reader with no definer at all, i.e. a false `fresh`. The spec
+		// survives the removal so a later restore can be recognized as one.
 		const out = foldImportChange('import numpy as np\nimport pandas as pd', 'import pandas as pd', {}, NOW);
-		expect(out.np).toEqual({ spec: null, at: NOW });
-		expect(stamps(out)).toEqual({ np: NOW, pd: 0 });
+		expect(out.np).toEqual({ spec: 'import numpy as np', at: 0, removedAt: NOW });
+		expect(removals(out)).toEqual({ np: NOW });
+	});
+
+	it('keeps the FIRST removal time across later edits that leave the name absent', () => {
+		const gone = foldImportChange('import numpy as np\nimport os', 'import os', {}, 100);
+		const later = foldImportChange('import os', 'import os\nimport re', gone, NOW);
+		expect(removals(later)).toEqual({ np: 100 }); // when it left, not when we last looked
 	});
 
 	it('carries a prior stamp forward for a binding this edit did not touch', () => {
@@ -118,10 +167,25 @@ describe('foldImportChange - when each binding last changed', () => {
 		expect(stamps(out)).toEqual({ pd: 100, re: NOW });
 	});
 
-	it('re-stamps a name that is removed and then restored', () => {
+	it('UNDOES a removal that the same content restores (select-all, delete, retype)', () => {
+		// The other transient save shape: an EMPTY source is perfectly knowable, so it
+		// cannot be frozen like an unparseable one without losing a genuine "delete all
+		// imports". Instead the removal is recorded but stays undoable - retyping the
+		// identical block clears it and stamps nothing, so a round trip that ends
+		// byte-identical to where it started leaves the notebook exactly as it was.
 		const gone = foldImportChange('import numpy as np', '', {}, 100);
-		expect(stamps(gone)).toEqual({ np: 100 });
+		expect(removals(gone)).toEqual({ np: 100 });
+		expect(stamps(gone)).toEqual({ np: 0 });
+
 		const back = foldImportChange('', 'import numpy as np', gone, NOW);
+		expect(removals(back)).toEqual({});
+		expect(stamps(back)).toEqual({ np: 0 });
+	});
+
+	it('treats a REBINDING across that window as the real change it is', () => {
+		const gone = foldImportChange('import numpy as np', '', {}, 100);
+		const back = foldImportChange('', 'import numpy.random as np', gone, NOW);
+		expect(removals(back)).toEqual({});
 		expect(stamps(back)).toEqual({ np: NOW });
 	});
 
