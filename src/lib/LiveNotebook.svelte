@@ -765,12 +765,20 @@
 	// is what makes arrow-key nav feel immediate, so this is deliberately NOT a
 	// settle-loop caller (settle is for discrete jump targets; keyboard selection and
 	// follow-running stay single-scroll). It bumps `scrollGen` for the same reason
-	// `scrollElementIntoView` does, and every native pane write goes through here so
-	// a future site cannot forget: a selection that scrolled outside the guard would
-	// be undone by an in-flight loop's next corrective pass, and - when it targets the
-	// SAME cell - would take pin ownership and unpin that target two frames later,
-	// leaving the older loop to abandon on its `isConnected` guard, i.e. the jump
-	// silently lands nowhere.
+	// `scrollElementIntoView` does, and it is the one choke point for every native pane
+	// write THIS component makes, so a future site here cannot forget: a selection that
+	// scrolled outside the guard would be undone by an in-flight loop's next corrective
+	// pass, and - when it targets the SAME cell - would take pin ownership and unpin
+	// that target two frames later, leaving the older loop to abandon on its
+	// `isConnected` guard, i.e. the jump silently lands nowhere.
+	//
+	// Known exception, pre-existing and outside this component: `Cell.svelte`'s
+	// search-highlight scrolls (the active match's anchor `scrollIntoView`, and
+	// `EditorView.scrollIntoView` for a match inside a built editor, both from Search
+	// P4) write the same ancestor pane without bumping `scrollGen`, and they fire
+	// during the find-bar jump's own settle loop. Bounded, not a fight: they target the
+	// very cell that jump is scrolling to, so the two converge - but their ordering
+	// relative to the loop's passes is not guaranteed.
 	function scrollElementIntoViewNearest(el: HTMLElement) {
 		scrollGen++;
 		el.scrollIntoView({ behavior: 'auto', block: 'nearest' });
@@ -855,7 +863,9 @@
 	 * lands, re-planning against the pre-scroll viewport and unmounting the very cell
 	 * just jumped to. A visible tab gets a floor well past any plausible frame; only a
 	 * hidden one (rAF suspended, the leak this backstop exists for) gets a tight one,
-	 * and a tab backgrounded mid-wait re-arms to it.
+	 * and a tab whose visibility flips mid-wait re-arms in EITHER direction - widening
+	 * back on return to visible is what stops the tight floor it armed while hidden
+	 * from firing once rAF has resumed but before two real frames have landed.
 	 */
 	const FRAME_TIMEOUT_HIDDEN_MS = 50;
 	const FRAME_TIMEOUT_VISIBLE_MS = 1000;
@@ -870,7 +880,11 @@
 				timer = setTimeout(settle, perFrame * n);
 			}
 			function onVisibility() {
-				if (doc?.hidden) arm(FRAME_TIMEOUT_HIDDEN_MS);
+				// Re-arm in BOTH directions, replacing the pending timer rather than
+				// stacking one: a tab hidden at t=0 armed the tight floor, so returning to
+				// visible must widen it back or that stale short timer fires before two
+				// real frames land - the premature unpin the visible floor exists to stop.
+				arm(doc?.hidden ? FRAME_TIMEOUT_HIDDEN_MS : FRAME_TIMEOUT_VISIBLE_MS);
 			}
 			function settle() {
 				if (done) return;
@@ -1804,7 +1818,7 @@
 	 */
 	async function insertAndRunCode(source: string) {
 		const created = await insertCellAt(cells.length, { cell_type: 'code', source });
-		scrollCellIntoView(created.id);
+		await scrollCellIntoView(created.id);
 		await runCell(created.id, source);
 		return created.id;
 	}
