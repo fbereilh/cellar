@@ -304,9 +304,90 @@ test('an INCOMPLETE sign-out warns instead of confirming - the cached token may 
 	await expect(warning).toBeVisible();
 	await expect(warning).toContainText(/may be incomplete/i);
 	await expect(warning).toContainText(/could not be cleared/i);
+	// The remedy is reason-specific: this one IS a surviving file, so it says so.
+	await expect(warning).toContainText(/remove the cached sign-in yourself/i);
 	await expect(page.getByTestId('databricks-logout-note')).toHaveCount(0);
 
 	await page.screenshot({ path: join(EVIDENCE_DIR, 'databricks-logout-incomplete.png') });
+});
+
+test('an incomplete sign-out whose only failure is a mid-connect notebook does NOT tell the user to delete a file', async ({ page }) => {
+	await mockDatabricksStatus(page, signedInHostStatus);
+	await mockDatabricksClusters(page);
+	await page.route(/\/api\/databricks\/logout$/, async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				ok: true,
+				disconnected: 0,
+				// The token WAS deleted and the gate cleared; the only thing left undone is
+				// a notebook whose connect was still in flight.
+				clearedTokens: 1,
+				externalSkipped: 0,
+				clearedSignIns: 1,
+				purgeFailed: 0,
+				purgeMissed: 0,
+				sessionsFailed: 1,
+				incomplete: true,
+				incompleteReason: 'a connect is still in progress, so 1 notebook may still hold a session (notebook.ipynb (busy))'
+			})
+		});
+	});
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+	await page.getByTestId('databricks-host').fill(HOST);
+	await logOut(page);
+
+	const warning = page.getByTestId('databricks-logout-warning');
+	await expect(warning).toBeVisible();
+	await expect(warning).toContainText(/still in progress/i);
+	await expect(warning).toContainText(/Disconnect that notebook/i);
+	// Advising a purge that already succeeded would be wrong advice about a file that
+	// is gone - the remedy follows what actually failed, not one fixed sentence.
+	await expect(warning).not.toContainText(/remove the cached sign-in/i);
+	await expect(warning).not.toContainText(/databricks-sdk-py/i);
+});
+
+test('the log-out note does not outlive a later sign-in on the same selection', async ({ page }) => {
+	await mockDatabricksStatus(page, signedInHostStatus);
+	await mockDatabricksClusters(page);
+	await page.route(/\/api\/databricks\/logout$/, async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				ok: true,
+				disconnected: 0,
+				clearedTokens: 1,
+				externalSkipped: 0,
+				clearedSignIns: 1,
+				purgeFailed: 0,
+				purgeMissed: 0,
+				sessionsFailed: 0,
+				incomplete: false,
+				incompleteReason: null
+			})
+		});
+	});
+	await page.route(/\/api\/databricks\/login$/, async (route) => {
+		await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+	});
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+	await page.getByTestId('databricks-host').fill(HOST);
+	await logOut(page);
+	await expect(page.getByTestId('databricks-logout-note')).toBeVisible();
+
+	// Signing in again on the SAME selection never runs `resetSelection`, so without
+	// its own clear the "signed out everywhere" note survives - and a connect from
+	// there renders it under a live cluster, claiming the opposite of what is shown.
+	await page.getByTestId('databricks-signin').click();
+	await expect(page.getByTestId('databricks-logout-note')).toHaveCount(0);
 });
 
 test('disconnected with only a PAT profile: no Log out - that credential is not Cellar\'s', async ({ page }) => {

@@ -86,6 +86,16 @@
 		 */
 		incomplete?: boolean;
 		incompleteReason?: string | null;
+		/**
+		 * WHICH part did not complete, so the advice can name the right remedy: a
+		 * surviving token is a file the user can delete, a notebook mid-connect is
+		 * not. Telling someone to remove a cache entry that was just deleted is
+		 * exactly the "say more than the server verified" failure this feature keeps
+		 * guarding against.
+		 */
+		purgeFailed?: number;
+		purgeMissed?: number;
+		sessionsFailed?: number;
 	}
 	interface DbxCluster {
 		cluster_id: string;
@@ -523,9 +533,7 @@
 		clusters = null;
 		clustersError = null;
 		clustersFor = null;
-		logoutNote = '';
-		logoutWarning = '';
-		logoutError = null;
+		clearLogoutFeedback();
 		// An armed confirm belongs to the selection it was armed on: changing the
 		// selection disarms it rather than leaving a primed global sign-out behind.
 		confirmLogout = false;
@@ -547,6 +555,9 @@
 		if (busy) return;
 		busy = 'login';
 		authError = null;
+		// A fresh sign-in falsifies the log-out feedback as surely as a selection change
+		// does - and this path never runs `resetSelection`, so it has to drop it itself.
+		clearLogoutFeedback();
 		try {
 			const res = await fetch('/api/databricks/login', {
 				method: 'POST',
@@ -588,6 +599,18 @@
 	// Two-step inline confirm, the same idiom as the kernel wipe / checkpoint restore.
 	let confirmLogout = $state(false);
 
+	/**
+	 * Drop the log-out feedback. It deliberately OUTLIVES the connected→picker card
+	 * swap a log out causes, but it describes one moment in time: a selection change,
+	 * a fresh sign-in, or a connect all falsify it, and leaving it up would render
+	 * "signed out everywhere" under a live cluster.
+	 */
+	function clearLogoutFeedback() {
+		logoutNote = '';
+		logoutWarning = '';
+		logoutError = null;
+	}
+
 	async function connect(cluster: DbxCluster) {
 		if (busy) return;
 		busy = 'connect';
@@ -596,6 +619,9 @@
 		connectError = null;
 		reconnectNote = '';
 		reconnectError = null;
+		// Same reason as `signIn`: a live session is the loudest possible contradiction
+		// of "signed out everywhere", and connecting is not a selection change.
+		clearLogoutFeedback();
 		try {
 			const res = await fetch('/api/databricks/connect', {
 				method: 'POST',
@@ -645,6 +671,27 @@
 	}
 
 	/**
+	 * The advice line for an incomplete sign-out, built from WHICH part did not
+	 * complete rather than one fixed remedy. A surviving cached token is a file the
+	 * user can delete (and the server's reason already names the directory, so this
+	 * never repeats the path); a notebook mid-connect is not - telling someone to
+	 * remove a cache entry that was just deleted is the same "assert more than the
+	 * server verified" mistake the honest-reporting rule exists to prevent. When
+	 * both apply, both are said.
+	 */
+	function incompleteWarning(out: DbxLogout): string {
+		const advice: string[] = [];
+		if (out.purgeFailed || out.purgeMissed) {
+			advice.push('Your saved sign-in may still be usable - try again, or remove the cached sign-in yourself.');
+		}
+		if (out.sessionsFailed) {
+			advice.push('Disconnect that notebook once its connect finishes.');
+		}
+		const reason = out.incompleteReason ?? 'part of it could not be verified';
+		return [`Sign-out may be incomplete: ${reason}.`, ...advice].join(' ');
+	}
+
+	/**
 	 * Sign out of Databricks - the deliberate sibling of `disconnect`, not a louder
 	 * version of it. Disconnect ends the Spark session and leaves you
 	 * authenticated; this ALSO drops Cellar's own cached sign-in, so the next
@@ -666,9 +713,7 @@
 	async function logoutDatabricks() {
 		if (busy) return;
 		busy = 'logout';
-		logoutError = null;
-		logoutNote = '';
-		logoutWarning = '';
+		clearLogoutFeedback();
 		connectError = null;
 		reconnectError = null;
 		reconnectNote = '';
@@ -689,13 +734,16 @@
 			await loadStatus();
 			onSessionChange?.();
 			if (out.incomplete) {
-				logoutWarning = `Sign-out may be incomplete: ${out.incompleteReason ?? 'part of it could not be verified'}. Your saved sign-in may still be usable - try again, or remove the cached sign-in yourself from ~/.config/databricks-sdk-py/oauth/.`;
+				logoutWarning = incompleteWarning(out);
 			} else {
 				logoutNote = out.clearedTokens
 					? "Signed out everywhere. Cellar's saved Databricks sign-ins were cleared and every notebook was disconnected - the next connect signs in again."
 					: out.externalSkipped
 						? "Signed out of Cellar everywhere, and every notebook was disconnected. This profile's credentials live in ~/.databrickscfg or the databricks CLI, so they were left untouched."
-						: 'Signed out everywhere - every saved sign-in was cleared and every notebook disconnected.';
+						: // No purge was verified here (the only target was this selection, which
+							// Cellar holds no recorded sign-in for), so say what was actually done
+							// rather than claiming a token deletion the server could not confirm.
+							"Signed out everywhere - every notebook was disconnected and Cellar's saved sign-in state was cleared. There was no recorded Cellar sign-in to delete.";
 			}
 		} catch (err) {
 			logoutError = toDbxError(err);

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, afterAll, beforeAll, beforeEach, vi } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -75,6 +75,14 @@ let cfgPath: string;
  */
 let stubPython = '';
 let stubPythonEmpty = '';
+/**
+ * The env this file redirects at its temp home. `HOME` drives `os.homedir()` for
+ * `databricks.ts`/`venv.js`/`instances.js`, so leaving it pointed at a deleted temp
+ * dir would only be contained by vitest's isolated-pool default - a setting this
+ * file must not silently depend on. Saved here, restored in `afterAll`.
+ */
+const REDIRECTED_ENV = ['HOME', 'DATABRICKS_CONFIG_FILE', 'CELLAR_WORKSPACE', 'CELLAR_PROJECT_VENV'] as const;
+const savedEnv = new Map<string, string | undefined>();
 
 /**
  * The project venv's python, but only if it can actually import databricks-sdk.
@@ -166,6 +174,7 @@ function seedUnderivableCacheEntry(name: string, iss: string): string {
 }
 
 beforeAll(async () => {
+	for (const key of REDIRECTED_ENV) savedEnv.set(key, process.env[key]);
 	home = mkdtempSync(join(tmpdir(), 'cellar-dbx-logout-'));
 	cfgPath = join(home, '.databrickscfg');
 	writeFileSync(
@@ -192,6 +201,14 @@ beforeAll(async () => {
 	useRealPython();
 
 	dbx = await import('../../src/lib/server/databricks');
+});
+
+afterAll(() => {
+	for (const [key, value] of savedEnv) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	rmSync(home, { recursive: true, force: true });
 });
 
 beforeEach(async () => {
@@ -344,6 +361,10 @@ describe('an incomplete sign-out is never reported as a clean one', () => {
 		expect(result.clearedTokens).toBe(0);
 		expect(result.incomplete).toBe(true);
 		expect(result.incompleteReason).toMatch(/could not be cleared/i);
+		// Every purge reason names the cache directory: the UI's remedy line tells the
+		// user a token may still be deletable by hand, and it must not carry a second,
+		// drifting copy of where that is.
+		expect(result.incompleteReason).toMatch(/databricks-sdk-py\/oauth/);
 		// The gate stays: it is the only thing left telling the user (and
 		// `assertSignedIn`) that a usable credential may still exist.
 		expect(result.clearedSignIns).toBe(0);
@@ -362,6 +383,7 @@ describe('an incomplete sign-out is never reported as a clean one', () => {
 		expect(result.purgeMissed).toBe(1);
 		expect(result.incomplete).toBe(true);
 		expect(result.incompleteReason).toMatch(/still be on disk/i);
+		expect(result.incompleteReason).toMatch(/databricks-sdk-py\/oauth/);
 		expect(result.clearedSignIns).toBe(0);
 	});
 
@@ -431,6 +453,11 @@ describe('an incomplete sign-out is never reported as a clean one', () => {
 			expect(result.sessionsFailed).toBe(1);
 			expect(result.incomplete).toBe(true);
 			expect(result.incompleteReason).toMatch(/connect is still in progress/i);
+			// A session that could not be ended says nothing about the token cache: the
+			// reason must not point at a file, or the UI's remedy would tell the user to
+			// delete something a successful purge already removed.
+			expect(result.purgeFailed + result.purgeMissed).toBe(0);
+			expect(result.incompleteReason).not.toMatch(/databricks-sdk-py\/oauth/);
 		} finally {
 			// Release even on a failed assertion, or the held execution wedges the
 			// mocked kernel for every test after this one.

@@ -1310,7 +1310,16 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 	}
 
 	const reasons: string[] = [];
-	if (purgeFailed) reasons.push(`the saved sign-in could not be cleared (${purgeFailures[0]})`);
+	// Every purge reason names the cache directory: the UI's remedy line says a token
+	// may still be deletable by hand, and it must not have to carry a second, drifting
+	// copy of where that is. The vanished-selection failure already appends it itself.
+	if (purgeFailed) {
+		const first = purgeFailures[0];
+		reasons.push(
+			`the saved sign-in could not be cleared (${first})` +
+				(first.includes(OAUTH_CACHE_DIR) ? '' : ` - look in ${OAUTH_CACHE_DIR}`)
+		);
+	}
 	if (purgeMissed) {
 		reasons.push(
 			`no cached sign-in was found to delete for ${purgeMissed} signed-in workspace${purgeMissed === 1 ? '' : 's'}, so a token may still be on disk - look in ${OAUTH_CACHE_DIR}`
