@@ -28,12 +28,14 @@ import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { exportNotebookToPy, type ExportResult } from './export-py';
 import { SQL_LANGUAGE } from '../cellLanguage';
+import { foldImportChange, pruneImportBindings } from './importBindings';
 import type {
 	Cell,
 	CellView,
 	CellOutput,
 	CellMetadata,
 	CellarNamespace,
+	ImportChangeStamps,
 	LogicalCellType,
 	LastRun,
 	NotebookDoc,
@@ -108,13 +110,66 @@ function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCella
 	// 'sql' is a LOGICAL type: an nbformat `code` cell tagged cellar.language='sql'
 	// (see $lib/cellLanguage.js). markdown/code map to their nbformat cell_type.
 	const isSql = cellType === 'sql';
-	return {
+	const cell: CellWithCellar = {
 		id: mintId(),
 		cell_type: cellType === 'markdown' ? 'markdown' : 'code',
 		source: typeof source === 'string' ? source : '',
 		outputs: [],
 		metadata: { cellar: { extract: false, visible: true, ...(isSql ? { language: SQL_LANGUAGE } : {}) } }
 	};
+	// A cell born WITH a source (paste / split / undo-delete) introduces every
+	// binding it holds right now, so it is stamped here for the same reason
+	// `setSource` stamps an edit: without it the cell reads as "these bindings have
+	// not changed since the document loaded", and a pasted `import polars as pd`
+	// above a reader of `pd` would exempt the very edge it just rebound - the one
+	// verdict staleness must never invent. Folded from an EMPTY previous source: the
+	// cell did not exist before, so nothing about it was ever proven stable. A birth
+	// records no removal, so there is nothing here for the prune to date (null).
+	setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
+	return cell;
+}
+
+/**
+ * The newest moment any cell in this notebook could have CONSUMED another cell's
+ * import bindings: the latest `lastRun.at` in the document, or null when no cell
+ * carries one.
+ *
+ * It dates `pruneImportBindings`. A per-cell stamp cannot: the "wipe variables" route
+ * (`clearLastRunStamps`) deletes `lastRun` from cells that DID run, so reading only the
+ * providing cell's own stamp made a wiped cell look like it had never bound anything.
+ * A cell with no stamp reads `not_run` and never reaches the removal ledger, so the
+ * document's newest stamp bounds every consumption the ledger can be asked about.
+ */
+function latestConsumeAt(doc: NotebookDoc): number | null {
+	let latest: number | null = null;
+	for (const c of doc.cells) {
+		const at = c.metadata?.cellar?.lastRun?.at;
+		if (typeof at === 'number' && (latest == null || at > latest)) latest = at;
+	}
+	return latest;
+}
+
+/**
+ * Store (or clear) a cell's runtime-only import-binding baseline.
+ *
+ * Pruned on the way in, against the notebook's newest run, so the removal records a
+ * debounced autosave mints for a name that was born and died after every run do not
+ * accumulate for the life of the session - while a removal any cell could have read
+ * is kept, whatever happened to this cell's own run stamp (see `pruneImportBindings`).
+ *
+ * An empty map is stored as ABSENT rather than `{}`: it says exactly the same
+ * thing (nothing proven, nothing changed) and every ordinary code cell would
+ * otherwise ship a useless object to the browser on each `cell:edited`, and carry
+ * it into every deep-cloned checkpoint snapshot.
+ */
+function setImportBindings(
+	cellar: CellarNamespace,
+	stamps: ImportChangeStamps,
+	consumedBefore: number | null
+): void {
+	const kept = pruneImportBindings(stamps, consumedBefore);
+	if (Object.keys(kept).length) cellar.importBindings = kept;
+	else delete cellar.importBindings;
 }
 
 /**
@@ -537,6 +592,13 @@ export function setLastRun(id: string, lastRun: LastRun, nb?: string | null): bo
  * defined are gone from the kernel — WITHOUT any epoch bump or restart. `lastRun`
  * is runtime-only (stripped from disk), so this never changes the `.ipynb`.
  *
+ * Only `lastRun` is cleared: the cell's `importBindings` baseline stays, because it
+ * records what the SOURCE binds, not what the namespace holds. That is also why
+ * `pruneImportBindings` is dated against the DOCUMENT's newest run (`latestConsumeAt`)
+ * rather than the providing cell's own stamp - a wipe here would otherwise read as
+ * "this cell never bound anything" and drop its removal records (see
+ * `importBindings.ts`).
+ *
  * The caller resolves which cells defined the wiped names (see dataflow.ts
  * `cellsDefiningNames`); passing an empty list is a no-op. Emits one
  * `kernel:variables-wiped` event so every open tab refetches its staleness.
@@ -814,6 +876,7 @@ export function setSource(id: string, source: string, nb?: string | null, origin
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell && cell.source !== source) {
+		const prevSource = cell.source;
 		cell.source = source;
 		// Runtime-only edit stamp for the staleness rule ($lib/staleness.js): a cell
 		// (and everything downstream of it) is stale once its source changes after it
@@ -821,7 +884,21 @@ export function setSource(id: string, source: string, nb?: string | null, origin
 		// dirties the .ipynb. Set BEFORE persist so it rides the same in-memory doc.
 		cell.metadata = cell.metadata ?? {};
 		cell.metadata.cellar = cell.metadata.cellar ?? {};
-		cell.metadata.cellar.editedAt = Date.now();
+		const now = Date.now();
+		cell.metadata.cellar.editedAt = now;
+		// …and the per-NAME refinement of that stamp for module-level import bindings.
+		// `editedAt` alone makes an imports-cell edit stale every cell below it (it
+		// defines a name almost all of them use); folding the new source against the
+		// cell's last known-good baseline records WHICH names actually moved, so
+		// staleness can transmit only along the edges that carry one. Same runtime-only
+		// contract as `editedAt`. Cheap (a tokenizer pass over one cell). `prevSource`
+		// only ever SEEDS a baseline the cell does not have yet - a mid-edit snapshot is
+		// never compared against, see `foldImportChange`.
+		setImportBindings(
+			cell.metadata.cellar,
+			foldImportChange(prevSource, source, cell.metadata.cellar.importBindings, now),
+			latestConsumeAt(doc)
+		);
 		persist(doc);
 		emit(doc, 'cell:edited', { cellId: id, source }, originId);
 	}

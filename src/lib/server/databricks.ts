@@ -92,7 +92,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { execute, currentSessionId, kernelStatus, restartKernel, refreshKernelConnection } from './kernel';
 import {
 	dbrMajorMinor,
@@ -100,6 +100,7 @@ import {
 	pinTargetForConnect,
 	versionMismatchMessage
 } from './dbrVersion';
+import { normalizeDatabricksHost } from '../databricksHost';
 import { resolveNotebookPath } from './notebook';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
@@ -323,13 +324,12 @@ export function readProfiles(): {
 	return { configPath: path, exists: true, profiles };
 }
 
-/** Normalize a user-typed workspace host: trim, drop a trailing slash, force https. */
-function normalizeHost(host?: string | null): string {
-	let h = String(host ?? '').trim().replace(/\/+$/, '');
-	if (!h) return '';
-	if (!/^https?:\/\//i.test(h)) h = `https://${h}`;
-	return h.replace(/^http:\/\//i, 'https://');
-}
+/**
+ * Normalize a user-typed workspace host: trim, drop a trailing slash, force https.
+ * Shared verbatim with the browser (`$lib/databricksHost`) because the sidebar has
+ * to match a typed host against the normalized `signedInHosts` this module records.
+ */
+const normalizeHost = normalizeDatabricksHost;
 
 /**
  * The one profile shape a silent listing/connect could still make the SDK open a
@@ -421,7 +421,7 @@ function scrubEnv(): NodeJS.ProcessEnv {
  * `inspect.js` embeds its probe the same way.
  */
 const PROBE = `
-import json, sys
+import json, os, sys
 
 MAX_ROWS = 500
 
@@ -587,6 +587,226 @@ def build_client(auth):
         raise ValueError('unknown auth mode: %r' % (mode,))
     return WorkspaceClient(config=cfg)
 
+class _NoAuth:
+    # A credentials strategy that authenticates NOTHING. Config() calls init_auth()
+    # in its constructor, so building a normal Config for an external-browser
+    # selection would open the browser - the exact thing a logout is undoing. This
+    # keeps the constructor's config LOADING (profile file, env, host fixing,
+    # client_id/scopes resolution) while making its auth step a no-op.
+    def auth_type(self):
+        return 'noop'
+
+    def __call__(self, cfg):
+        return lambda: {}
+
+def redirect_urls():
+    # Every redirect URL this SDK's external-browser flow might have used. The
+    # cache key has drifted across SDK versions (current builds hash only
+    # host + client_id + scopes + profile, older ones folded in the redirect URL),
+    # so hardcoding one value made a single upstream change silently miss every
+    # candidate. Module-level constants are read first so a future rename is
+    # picked up on its own; the known defaults are appended as a floor.
+    urls = []
+    try:
+        from databricks.sdk import credentials_provider as cp
+        for name in dir(cp):
+            if 'REDIRECT' in name.upper():
+                value = getattr(cp, name, None)
+                if isinstance(value, str) and value.startswith('http'):
+                    urls.append(value)
+    except Exception:
+        pass
+    for url in ('http://localhost:8020', 'http://localhost:8080'):
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+def host_key(value):
+    # The bare netloc of a host/URL, for comparing a selection's host with the one
+    # a cached credential names ('https://X/oidc' and 'X' are the same workspace).
+    v = str(value or '').strip().lower()
+    if '://' in v:
+        from urllib.parse import urlparse
+        v = urlparse(v).netloc
+    else:
+        v = v.split('/')[0]
+    return v.strip()
+
+def jwt_claims(token):
+    # An OAuth access token is a JWT; its payload is the only host-bearing field a
+    # cached credential has (the SDK stores {'token': {...}} with no host).
+    parts = str(token).split('.')
+    if len(parts) != 3:
+        return None
+    try:
+        import base64
+        seg = parts[1]
+        seg += '=' * (-len(seg) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(seg.encode('ascii')).decode('utf-8'))
+        return claims if isinstance(claims, dict) else None
+    except Exception:
+        return None
+
+def cache_entry_hosts(data):
+    # Every workspace host this cached credential POSITIVELY names, from an
+    # explicit host field or from its own access/refresh token's claims.
+    hosts = set()
+    def walk(value):
+        if isinstance(value, dict):
+            for key, sub in value.items():
+                if key in ('host', 'workspace_url') and isinstance(sub, str):
+                    hosts.add(host_key(sub))
+                walk(sub)
+        elif isinstance(value, list):
+            for sub in value:
+                walk(sub)
+        elif isinstance(value, str):
+            claims = jwt_claims(value)
+            if claims:
+                for field in ('iss', 'issuer', 'aud', 'audience'):
+                    raw = claims.get(field)
+                    for item in (raw if isinstance(raw, list) else [raw]):
+                        if isinstance(item, str) and '://' in item:
+                            hosts.add(host_key(item))
+    walk(data)
+    hosts.discard('')
+    return hosts
+
+def scan_cache_for_host(host):
+    # Fallback for a DERIVATION MISS: cache entries that positively identify
+    # THIS host through their own token claims. Deliberately NOT a sweep of the
+    # directory - it is shared with the user's own python scripts and with other
+    # workspaces, and only an entry that names the host being signed out of may
+    # ever be removed. Returns (hits, files_examined).
+    want = host_key(host)
+    if not want:
+        return [], 0
+    from databricks.sdk.oauth import TokenCache
+    base = os.path.expanduser(TokenCache.BASE_PATH)
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError:
+        return [], 0
+    hits = []
+    examined = 0
+    for name in entries:
+        if not name.endswith('.json'):
+            continue
+        examined += 1
+        try:
+            with open(os.path.join(base, name)) as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        if want in cache_entry_hosts(data):
+            hits.append(os.path.join(base, name))
+    return hits, examined
+
+def oauth_cache_paths(auth):
+    # The files the SDK's own external-browser token cache would use for THIS
+    # selection. Mirrors databricks.sdk.credentials_provider.external_browser's
+    # cache key (host + client_id + scopes + profile) and derives the filename
+    # through the SDK's own TokenCache, so the hashing is never reimplemented here.
+    #
+    # A cross-product of near-miss keys is generated on purpose (with/without the
+    # 'offline_access' scope, profile-scoped and not, every plausible redirect
+    # URL): every candidate is a sha256 that already includes THIS host, so a
+    # wrong guess simply names a file that does not exist. That makes the purge
+    # robust to SDK-version drift in the key derivation without ever widening the
+    # blast radius to another workspace.
+    #
+    # Returns (filenames, resolved_host) - the host is the SDK's own canonical
+    # form, which the scan fallback matches cached credentials against.
+    from databricks.sdk.core import Config
+    from databricks.sdk import oauth as dbx_oauth
+    # Config()'s constructor also runs a best-effort /.well-known host-metadata
+    # discovery, whose DEFAULT 300s retry budget hangs the whole logout for five
+    # minutes on an unreachable host - and signing out is exactly when the host may
+    # be unreachable. Nothing here needs that metadata (the cache key is host +
+    # client_id + scopes + profile), and the probe swallows its own failure, so both
+    # budgets are cut to make it give up immediately.
+    kw = {
+        'credentials_strategy': _NoAuth(),
+        'http_timeout_seconds': 5,
+        'retry_timeout_seconds': 1,
+    }
+    if auth.get('mode') == 'profile':
+        cfg = Config(profile=auth['profile'], **kw)
+    else:
+        cfg = Config(host=auth['host'], auth_type='external-browser', **kw)
+    client_id = getattr(cfg, 'client_id', None) or getattr(cfg, 'azure_client_id', None) or 'databricks-cli'
+    try:
+        base = list(cfg.get_scopes())
+    except Exception:
+        base = list(getattr(cfg, 'scopes', None) or ['all-apis'])
+    scope_sets = [tuple(base)]
+    if 'offline_access' not in base:
+        scope_sets.append(tuple(base + ['offline_access']))
+    profiles = {getattr(cfg, 'profile', None) or '', ''}
+    redirects = redirect_urls()
+    names = set()
+    for scopes in scope_sets:
+        for prof in profiles:
+            for redirect_url in redirects:
+                args = dict(
+                    host=cfg.host,
+                    oidc_endpoints=None,
+                    client_id=client_id,
+                    redirect_url=redirect_url,
+                    client_secret=getattr(cfg, 'client_secret', None),
+                    scopes=list(scopes),
+                )
+                try:
+                    cache = dbx_oauth.TokenCache(profile=prof, **args)
+                except TypeError:  # older SDK: no profile in the cache key
+                    cache = dbx_oauth.TokenCache(**args)
+                names.add(cache.filename)
+    return sorted(names), cfg.host
+
+def logout(auth):
+    # Delete ONLY the SDK's python-local OAuth token cache entry for this
+    # selection (~/.config/databricks-sdk-py/oauth/<hash>.json - the SDK notes it
+    # is "local to the Python SDK and not reused by other SDKs"). That is the
+    # credential Cellar's own browser sign-in minted. ~/.databrickscfg, the OS
+    # keyring, and the databricks CLI's own token cache belong to the user and are
+    # never touched here.
+    #
+    # Reports enough for the caller to tell a real purge from a derivation MISS:
+    # a miss reported as "nothing to clear" would read as a clean sign-out while
+    # the token is still on disk, which is the one thing a sign-out may not do.
+    try:
+        paths, host = oauth_cache_paths(auth)
+    except Exception as e:
+        return fail(e)
+    cleared = []
+    failed = []
+    for path in paths:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                cleared.append(os.path.basename(path))
+        except OSError as e:
+            failed.append('%s: %s' % (os.path.basename(path), e))
+    # Only when the derived keys hit nothing: fall back to identifying this host's
+    # entries positively, so an upstream change to the cache key cannot silently
+    # leave the credential behind.
+    by_scan = 0
+    examined = 0
+    if not cleared:
+        try:
+            hits, examined = scan_cache_for_host(host or auth.get('host'))
+        except Exception:
+            hits = []
+        for path in hits:
+            try:
+                os.remove(path)
+                cleared.append(os.path.basename(path))
+                by_scan += 1
+            except OSError as e:
+                failed.append('%s: %s' % (os.path.basename(path), e))
+    return {'ok': True, 'cleared': cleared, 'failed': failed,
+            'checked': len(paths), 'by_scan': by_scan, 'scanned': examined}
+
 def main():
     req = json.loads(sys.argv[1])
     op = req.get('op')
@@ -597,6 +817,11 @@ def main():
     except Exception as e:
         return fail(e, 'sdk_missing')
     auth = req.get('auth') or {}
+    # Logout is dispatched BEFORE build_client: that builds an authenticating
+    # WorkspaceClient, which for an external-browser selection would pop the very
+    # browser sign-in we are here to erase.
+    if op == 'logout':
+        return logout(auth)
     try:
         w = build_client(auth)
     except Exception as e:
@@ -863,6 +1088,293 @@ export async function login(sel: Selection) {
 	if (auth.mode === 'oauth') signedInHosts.add(auth.host);
 	else signedInProfiles.add(auth.profile);
 	return { ok: true, mode: auth.mode, host: result.host ?? auth.host, user: result.user ?? null };
+}
+
+/**
+ * Does Cellar itself hold a cached credential for this selection - i.e. did
+ * Cellar's own browser sign-in mint the token, so a logout has something of ours
+ * to erase?
+ *
+ * True for exactly the two external-browser shapes Cellar gates behind its own
+ * `login`: a bare typed **host**, and a no-token `auth_type = external-browser`
+ * **profile**. Those are the selections whose credential lands in the SDK's
+ * python-local OAuth token cache because *we* opened the browser.
+ *
+ * False for every other profile - a PAT lives in `~/.databrickscfg`, a
+ * `databricks-cli` / keyring profile in the CLI's own store. Those credentials
+ * are the user's, managed by the databricks CLI/SDK, and are NOT Cellar's to
+ * delete: for them a logout is only "forget our session state", never a purge.
+ */
+export function hasCellarCachedOAuth(auth: Auth): boolean {
+	return auth.mode === 'oauth' || auth.needsSignIn;
+}
+
+/**
+ * Where the SDK keeps the python-local OAuth token cache Cellar's browser sign-in
+ * mints into. Named in every incomplete-sign-out reason on purpose: when neither
+ * the derived cache keys nor the claim-matching scan can find a selection's token,
+ * keeping the sign-in gate is correct but leaves the user with a warning they can
+ * never clear - so the reason has to say where to look to finish the job by hand.
+ */
+const OAUTH_CACHE_DIR = '~/.config/databricks-sdk-py/oauth/';
+
+/** The `logout` probe op's payload - what the purge found, deleted, and could not delete. */
+interface LogoutProbe {
+	/** Basenames of the cache files actually removed. */
+	cleared?: string[];
+	/** Files that matched but could not be removed (`<name>: <errno message>`). */
+	failed?: string[];
+	/** How many derived candidate filenames were checked. */
+	checked?: number;
+	/** How many of `cleared` came from the positive host scan rather than the derived keys. */
+	by_scan?: number;
+}
+
+/**
+ * What a logout did, so the UI can say it honestly rather than claiming a purge
+ * that never happened.
+ *
+ * The load-bearing pair is `incomplete` / `incompleteReason`: an incomplete
+ * sign-out must never be presentable as a clean one. The counters say what went
+ * wrong; `incomplete` is the single flag the UI branches on.
+ */
+export interface LogoutResult {
+	ok: true;
+	/** Sessions torn down (every notebook that was bound to a cluster). */
+	disconnected: number;
+	/** Selections whose Cellar-minted OAuth token cache was purged. */
+	clearedTokens: number;
+	/** Selections skipped because their credential is external (PAT / databricks-cli / keyring). */
+	externalSkipped: number;
+	/** In-process sign-in flags dropped, so a gated selection must sign in again. */
+	clearedSignIns: number;
+	/** Selections whose purge could not run or could not delete (no venv, SDK missing, timeout, EPERM). */
+	purgeFailed: number;
+	/** Signed-in selections where the purge ran but found no token - so one may still be on disk. */
+	purgeMissed: number;
+	/** Notebooks whose session could not be ended (either reason below). */
+	sessionsFailed: number;
+	/** Notebooks skipped because a connect was still in flight - the teardown never ran. */
+	sessionsBusy: number;
+	/** Notebooks whose teardown FAILED, so they are still bound and may rebuild `spark`. */
+	sessionsStuck: number;
+	/** True when anything above leaves the sign-out unproven. */
+	incomplete: boolean;
+	/** One user-facing sentence naming what did not complete; null when the sign-out was clean. */
+	incompleteReason: string | null;
+}
+
+/**
+ * **Sign out of Databricks** - the deliberate sibling of `disconnect`.
+ *
+ * `disconnect` ends a Spark session and leaves you authenticated; `logout` also
+ * drops the authentication, so the next connect has to sign in again. Three
+ * things happen, in this order:
+ *
+ *  1. Every notebook BOUND to a cluster is disconnected through the ordinary
+ *     `disconnect` path (no second teardown path). Disconnecting all of them, not
+ *     just the caller's, is what makes the sign-out real: a leftover
+ *     `reconnectTarget` elsewhere would silently rebuild `spark` on the next
+ *     kernel restart, after the user was told they were signed out.
+ *  2. For each selection Cellar signed in for (and the caller's, if given), the
+ *     token Cellar's own browser flow minted is deleted - but only where
+ *     `hasCellarCachedOAuth` says the credential is ours. `~/.databrickscfg`, the
+ *     OS keyring and the databricks CLI's own token cache are never touched.
+ *  3. The in-process sign-in gate (`signedInHosts` / `signedInProfiles`) is
+ *     cleared - but only for the selections whose purge provably completed.
+ *     A cleared gate over a SURVIVING token is the worst possible state: the
+ *     next "Sign in" is a silent cache hit with no browser prompt, so the user
+ *     is told they signed out and one click restores access. Keeping the gate is
+ *     what makes the surviving token visible instead.
+ *
+ * The session teardown (step 1) is unconditional - ending a session is always
+ * safe. Everything else that does not provably complete is counted and reported
+ * through `incomplete` / `incompleteReason`: a sign-out that did not finish must
+ * never be presentable as a clean one.
+ *
+ * Scope is deliberately GLOBAL - every sign-in this process recorded, every bound
+ * notebook - not just the caller's selection. A per-selection purge would leave
+ * another notebook's `reconnectTarget` to silently rebuild `spark` after the user
+ * was told they were signed out. The UI copy says so.
+ */
+export async function logout(sel: Selection & { nb?: string | null } = {}): Promise<LogoutResult> {
+	// 1. End every live/bound session. `databricksBound` is the durable signal, so
+	//    this catches a notebook between a kernel restart and its auto-reconnect.
+	const bound = [...states.keys()].filter((nb) => databricksBound(nb));
+	if (sel.nb) {
+		const abs = resolveNotebookPath(sel.nb);
+		if (!bound.includes(abs)) bound.push(abs);
+	}
+	let disconnected = 0;
+	// The two failure shapes are NOT the same thing and must not be reported as one.
+	// `busy` = a connect is in flight, so `disconnect` refused before touching
+	// anything; it cannot be waited out (a connect can take minutes). Anything else
+	// comes out of `runInKernel(DISCONNECT_CODE)`, i.e. BEFORE the assignments that
+	// clear the state, so `connection` AND `reconnectTarget` both survive and the
+	// notebook is genuinely still bound - the silent-rebuild hazard step 1 exists to
+	// prevent. Their remedies differ too, so each carries its own sentence.
+	const sessionBusy: string[] = [];
+	const sessionStuck: string[] = [];
+	for (const nb of bound) {
+		try {
+			await disconnect(nb);
+			disconnected += 1;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			const busy = err instanceof DatabricksError && err.code === 'busy';
+			logWarn('databricks', `logout: could not disconnect ${nb}: ${message}`);
+			(busy ? sessionBusy : sessionStuck).push(`${basename(nb)} (${message})`);
+		}
+	}
+
+	// 2. Purge only what Cellar itself cached, for everything it signed in for.
+	//    `recorded` marks a selection this process holds a sign-in for: for those a
+	//    purge that deletes NOTHING is a miss (a drifted cache key), not a clean
+	//    sign-out, so it must not be reported as one.
+	const signedHosts = [...signedInHosts];
+	const signedProfiles = [...signedInProfiles];
+	const targets: { sel: Selection; recorded: boolean }[] = [
+		...signedHosts.map((host) => ({ sel: { host }, recorded: true })),
+		...signedProfiles.map((profile) => ({ sel: { profile }, recorded: true }))
+	];
+	if (sel.profile || sel.host) targets.push({ sel: { profile: sel.profile, host: sel.host }, recorded: false });
+	const seen = new Set<string>();
+	/** Auth keys whose purge did NOT provably complete - their sign-in gate must stay. */
+	const unresolved = new Set<string>();
+	// Each failure carries whether its own detail already names the cache directory,
+	// so the reason below never has to sniff the text it just built to decide - a
+	// substring check drifts into a duplicated or a missing path on any reword.
+	const purgeFailures: { detail: string; namesCacheDir: boolean }[] = [];
+	let clearedTokens = 0;
+	let externalSkipped = 0;
+	let purgeMissed = 0;
+	for (const target of targets) {
+		let auth: Auth;
+		try {
+			auth = resolveAuth(target.sel);
+		} catch (err) {
+			// A selection that no longer resolves - in practice a profile deleted or
+			// renamed in `~/.databrickscfg` since we signed in. For a RECORDED sign-in
+			// that is NOT a clean skip: without the profile we cannot derive which cache
+			// entry is its token, so the token may well still be on disk. Skipping it
+			// silently would clear its gate anyway and report a clean sign-out - the
+			// cleared-gate-over-a-surviving-token state step 3 exists to prevent - so it
+			// goes through the same unresolved/incomplete path as any other failed purge.
+			if (!target.recorded) continue;
+			const missingKey = target.sel.profile ? `p:${target.sel.profile}` : `h:${target.sel.host}`;
+			if (seen.has(missingKey)) continue;
+			seen.add(missingKey);
+			const missingLabel = target.sel.profile ? `profile "${target.sel.profile}"` : String(target.sel.host);
+			const message = err instanceof Error ? err.message : String(err);
+			unresolved.add(missingKey);
+			purgeFailures.push({
+				detail: `${missingLabel}: ${message}, so its cached token could not be identified - look in ${OAUTH_CACHE_DIR}`,
+				namesCacheDir: true
+			});
+			logWarn('databricks', `logout: could not resolve the signed-in selection ${missingKey}: ${message}`);
+			continue;
+		}
+		const key = auth.mode === 'oauth' ? `h:${auth.host}` : `p:${auth.profile}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		if (!hasCellarCachedOAuth(auth)) {
+			externalSkipped += 1;
+			continue;
+		}
+		const label = auth.mode === 'oauth' ? auth.host : `profile "${auth.profile}"`;
+		try {
+			const result = payload<LogoutProbe>(unwrap(await probe({ op: 'logout', auth })));
+			if (result.failed?.length) {
+				unresolved.add(key);
+				purgeFailures.push({ detail: `${label}: ${result.failed[0]}`, namesCacheDir: false });
+				logWarn('databricks', `logout: could not remove the cached token for ${key}: ${result.failed.join('; ')}`);
+			} else if (result.cleared?.length) {
+				clearedTokens += 1;
+			} else if (target.recorded) {
+				purgeMissed += 1;
+				unresolved.add(key);
+				logWarn(
+					'databricks',
+					`logout: signed in to ${key} but found no cached token to clear (${result.checked ?? 0} candidate(s) checked)`
+				);
+			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			unresolved.add(key);
+			purgeFailures.push({ detail: `${label}: ${message}`, namesCacheDir: false });
+			logWarn('databricks', `logout: could not clear the cached token for ${key}: ${message}`);
+		}
+	}
+
+	// 3. Drop the in-process sign-in gate, for everything that provably completed.
+	let clearedSignIns = 0;
+	for (const host of signedHosts) {
+		if (unresolved.has(`h:${host}`)) continue;
+		signedInHosts.delete(host);
+		clearedSignIns += 1;
+	}
+	for (const profile of signedProfiles) {
+		if (unresolved.has(`p:${profile}`)) continue;
+		signedInProfiles.delete(profile);
+		clearedSignIns += 1;
+	}
+
+	const purgeFailed = purgeFailures.length;
+	const sessionsFailed = sessionBusy.length + sessionStuck.length;
+	const plural = (n: number) => (n === 1 ? '' : 's');
+	const reasons: string[] = [];
+	// Every purge reason names the cache directory: the UI's remedy line says a token
+	// may still be deletable by hand, and it must not have to carry a second, drifting
+	// copy of where that is. The vanished-selection failure already appends it itself,
+	// which is what `namesCacheDir` records. Counts are stated the same way on every
+	// reason, so a sentence can never under-report what the counters say.
+	if (purgeFailed) {
+		const first = purgeFailures[0];
+		reasons.push(
+			`the saved sign-in could not be cleared for ${purgeFailed} signed-in workspace${plural(purgeFailed)} (${first.detail})` +
+				(first.namesCacheDir ? '' : ` - look in ${OAUTH_CACHE_DIR}`)
+		);
+	}
+	if (purgeMissed) {
+		reasons.push(
+			`no cached sign-in was found to delete for ${purgeMissed} signed-in workspace${plural(purgeMissed)}, so a token may still be on disk - look in ${OAUTH_CACHE_DIR}`
+		);
+	}
+	if (sessionBusy.length) {
+		reasons.push(
+			`a connect is still in progress, so ${sessionBusy.length} notebook${plural(sessionBusy.length)} may still hold a session (${sessionBusy[0]})`
+		);
+	}
+	if (sessionStuck.length) {
+		// Worse than the busy case, and a different remedy: the teardown FAILED, so
+		// these notebooks keep their reconnect intent and would rebuild `spark` on the
+		// next kernel restart. Saying "a connect is still in progress" here would name a
+		// cause that never happened and advise waiting for something that will never end.
+		reasons.push(
+			`${sessionStuck.length} notebook${plural(sessionStuck.length)} could not be disconnected and ${sessionStuck.length === 1 ? 'is' : 'are'} still bound to a cluster (${sessionStuck[0]})`
+		);
+	}
+	const incompleteReason = reasons.length ? reasons.join('; ') : null;
+	logInfo(
+		'databricks',
+		`logout: ${disconnected} session(s) ended, ${clearedTokens} cached token(s) cleared, ${externalSkipped} external credential(s) left untouched` +
+			(incompleteReason ? ` - INCOMPLETE: ${incompleteReason}` : '')
+	);
+	publishGlobal({ type: 'databricks:changed' });
+	return {
+		ok: true,
+		disconnected,
+		clearedTokens,
+		externalSkipped,
+		clearedSignIns,
+		purgeFailed,
+		purgeMissed,
+		sessionsFailed,
+		sessionsBusy: sessionBusy.length,
+		sessionsStuck: sessionStuck.length,
+		incomplete: incompleteReason !== null,
+		incompleteReason
+	};
 }
 
 /** Runtime install state of the Databricks packages in the project venv. */

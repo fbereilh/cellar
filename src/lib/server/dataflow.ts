@@ -35,6 +35,18 @@
  * empty: reading table names out of SQL is lineage analysis, deliberately out of
  * scope, so a SQL cell is a graph SOURCE.
  *
+ * IMPORT-BINDING SUBSET. Each entry also carries `imports`: the subset of `defines`
+ * bound by a module-level import, which `staleness.js` uses to transmit change only
+ * along the edges whose names could actually have moved (see `importBindings.ts`).
+ * It is computed HERE, in JS, by the tokenizer rather than by the probe - it is a
+ * tokenizer question, the probe is already the expensive part, and it must keep
+ * working when the probe cannot run (its own `importCache`, so a probe failure or
+ * backoff never costs it). An UNAVAILABLE cell has empty `defines`, hence no edges,
+ * hence no exemption, so the backoff design's conservative-stale is unchanged. The
+ * one gate is notebook-wide: `%autoreload` makes re-executing an import NON-idempotent
+ * and arming it is a KERNEL-global act, so if ANY code cell mentions it, `imports` is
+ * omitted for EVERY cell and no edge anywhere is exempt.
+ *
  * The probe never raises: EVERY cell is analyzed behind its own catch-all, so a cell
  * that does not parse (it is mid-edit) — or one whose shape the walk mishandles — is
  * reported with empty defines/uses and degrades ALONE, rather than failing the whole
@@ -76,8 +88,9 @@ import { listCells } from './notebook';
 import { projectPython } from './databricks';
 import { computeStaleness } from '../staleness';
 import { isSqlCell } from '../cellLanguage';
-import { normalizeForAnalysis } from './magics';
+import { hasAutoreloadMagic, normalizeForAnalysis } from './magics';
 import { parseSqlCell } from './sql';
+import { importBindingNames } from './importBindings';
 import { LruCache } from './lru';
 import type { CellView, SessionId } from './types';
 
@@ -85,6 +98,13 @@ import type { CellView, SessionId } from './types';
 interface DataflowEntry {
 	defines: string[];
 	uses: string[];
+	/**
+	 * The subset of `defines` bound by a MODULE-LEVEL import, so their values are a
+	 * pure function of the import statement (see `importBindings.ts`). Computed in
+	 * JS, NOT by the probe: it is a tokenizer question, the probe is already the
+	 * expensive part, and staleness must keep working when the probe cannot run.
+	 */
+	imports?: string[];
 }
 
 /** Per-cell dataflow, keyed by cell id (or source string in the cache). */
@@ -429,6 +449,40 @@ main()
  */
 const cache = new LruCache<string, DataflowEntry>(1000);
 
+/**
+ * source string → the module-level import bindings it provides. A separate cache
+ * from `cache` on purpose: this is a cheap JS tokenizer pass, not the probe's
+ * answer, so it must survive a probe failure/backoff (the whole point is that the
+ * import-binding refinement never depends on the subprocess) and must never be
+ * confused with a probe result when deciding what is cacheable.
+ */
+const importCache = new LruCache<string, string[]>(1000);
+
+/** The names `source` provides as stable module-level import bindings, cached. */
+function importNamesFor(source: string): string[] {
+	const hit = importCache.get(source);
+	if (hit) return hit;
+	const names = importBindingNames(source);
+	importCache.set(source, names);
+	return names;
+}
+
+/**
+ * source string → does it arm `%autoreload`. Cached for the same reason as
+ * `importCache`: this one is scanned over EVERY code cell on every debounced pass
+ * (the gate is notebook-wide), not just over cells whose analysis is missing.
+ */
+const autoreloadCache = new LruCache<string, boolean>(1000);
+
+/** Does `source` arm `%autoreload` (a kernel-global act), cached. */
+function armsAutoreload(source: string): boolean {
+	const hit = autoreloadCache.get(source);
+	if (hit !== undefined) return hit;
+	const armed = hasAutoreloadMagic(source);
+	autoreloadCache.set(source, armed);
+	return armed;
+}
+
 /** A probe run's public outcome plus WHY it failed (a timeout is the one we back off). */
 type RawProbe = ProbeRun & { timedOut: boolean };
 
@@ -528,6 +582,8 @@ async function probeBatch(items: ProbeItem[]): Promise<BatchRun> {
 /** Clear all module state (analysis cache + timeout backoff). Test-only. */
 export function __resetDataflowState(): void {
 	cache.clear();
+	importCache.clear();
+	autoreloadCache.clear();
 	backoff.clear();
 	inflight.clear();
 }
@@ -618,6 +674,17 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 	// result gets no upstream edge and never goes stale when the query is edited.
 	const sql = cells.filter((c) => c.cell_type === 'code' && isSqlCell(c));
 	const code = cells.filter((c) => c.cell_type === 'code' && !isSqlCell(c));
+	// `%autoreload` is a KERNEL-GLOBAL setting, so its effect on the import-binding
+	// exemption is notebook-wide, not cell-local: with it armed, re-running `import
+	// mymod` re-imports a changed module instead of handing back the `sys.modules`
+	// object, so dependents really do go stale and NO edge may be exempt. The
+	// ubiquitous header arms it in its OWN cell (and Cellar's `ensureImportsCell`
+	// makes that split the default, since it adopts a first cell only via
+	// `isImportsOnly`), so a per-cell check alone would grant the exemption in
+	// exactly the arrangement where autoreload is most commonly used. One hit
+	// anywhere ⇒ omit `imports` everywhere ⇒ the whole notebook falls back to the
+	// conservative cell-level rule.
+	const autoreloadArmed = code.some((c) => armsAutoreload(c.source ?? ''));
 	const missing: ProbeItem[] = [];
 	for (const c of code) {
 		const src = c.source ?? '';
@@ -659,6 +726,13 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 			out[c.id] = { defines: [], uses: [] };
 			if (unresolved.has(src)) unavailable.add(c.id); // could not analyze this pass
 		}
+		// The import-binding subset, from the JS tokenizer rather than the probe, so it
+		// is available even when the probe is not. Only names the probe also reports as
+		// defines can be exempted downstream, so an unavailable cell (empty defines)
+		// carries no exemption either - it stays conservative-stale as the backoff
+		// design requires. Merged into a COPY: `cached` is the shared LRU entry.
+		const imports = autoreloadArmed ? [] : importNamesFor(src);
+		if (imports.length) out[c.id] = { ...out[c.id], imports };
 	}
 	// Synthetic dataflow for SQL cells: `sql.ts` compiles the cell to a `spark.sql()`
 	// wrapper that binds its result (the `-- >> name` prefix line's name plus the
@@ -672,16 +746,19 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 }
 
 /**
- * Analyze a notebook's code cells into `{ id: { defines, uses } }`.
+ * Analyze a notebook's code cells into `{ id: { defines, uses, imports? } }`.
  *
  * Only cells whose source is not already cached are sent to the subprocess, so a
  * single edit costs one cheap `ast` + `symtable` pass over one cell, and a re-run
  * costs nothing. Markdown cells are skipped (they have no dataflow). A cell whose
  * analysis is unavailable this pass degrades to empty defines/uses (the long-standing
  * contract); `getNotebookStaleness` additionally treats it as conservative-stale.
+ * `imports` (the module-level import subset of `defines`, absent when empty) rides
+ * along from the JS tokenizer, so it is present even when the probe is not - and is
+ * omitted for EVERY cell when any code cell arms `%autoreload`.
  *
  * @param cells the notebook's cells (code + markdown)
- * @returns per-code-cell `{ id: { defines, uses } }`
+ * @returns per-code-cell `{ id: { defines, uses, imports? } }`
  */
 export async function analyzeDataflow(cells: CellView[]): Promise<DataflowMap> {
 	return (await analyzeDataflowDetailed(cells)).dataflow;

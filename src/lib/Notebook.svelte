@@ -93,7 +93,9 @@
 		virtualize?: boolean;
 		/** Transient jump targets forced to stay mounted wherever they are, so a
 		 *  scroll-to-cell can land on a real DOM node even under windowing. Owned by
-		 *  LiveNotebook (the jump paths live there); the full rework is P4. */
+		 *  LiveNotebook (the jump paths live there): every jump / reveal / focus path
+		 *  takes one through `ensureCellMounted` and drops it again via
+		 *  `releaseScrollPin` once its scroll has settled (P4). */
 		scrollPins?: Set<string>;
 		/** The cell holding DOM focus (LiveNotebook tracks it off `focusin`). Pinned
 		 *  alongside `activeId` so an edited cell scrolled far out of the window keeps
@@ -240,7 +242,10 @@
 
 	// Scroll-pane metrics. Attached ONLY while windowing is on, so with the flag off
 	// the scroll path carries no extra listener (zero behavior change). Reads are
-	// rAF-coalesced. Wired now; a later phase is the first to act on the metrics.
+	// rAF-coalesced, which is why a jump path must wait two frames after its scroll
+	// before dropping its mount pin (see `LiveNotebook.releaseScrollPin`): unpinning
+	// sooner re-plans the window against the PRE-scroll viewport. `planWindow` below
+	// consumes these directly.
 	$effect(() => {
 		if (!virtualize || !containerEl) return;
 		const parent = scrollParentOf(containerEl);

@@ -151,6 +151,25 @@ card likewise restarts immediately (which clears the kernel namespace). No manua
 with `CELLAR_DATABRICKS_RUNTIME` / `CELLAR_DATABRICKS_RUNTIME_VERSION` (see the
 reference below).
 
+**Disconnect vs Log out.** Disconnect ends that notebook's Spark session and
+leaves you authenticated. **Log out** - the quiet button under the Cluster card's
+Switch/Disconnect row - also signs you out: it disconnects every bound notebook
+app-wide (so no leftover reconnect intent silently rebuilds `spark` later),
+deletes the OAuth token Cellar's own browser sign-in minted (the Databricks SDK's
+python-local cache, `~/.config/databricks-sdk-py/oauth/`), and clears Cellar's
+in-process sign-in state, so the next connect has to authenticate again. It never
+touches credentials that are not Cellar's: `~/.databrickscfg` profiles, OS keyring
+entries and the databricks CLI's own token cache are left alone - for a PAT or
+`databricks-cli` profile there is simply nothing of Cellar's to purge, and the
+panel says so rather than implying a purge that never happened. Because it signs
+out everywhere, it asks you to confirm first; the button is hidden when Cellar
+holds no saved sign-in anywhere to clear, except while connected, where it still
+ends the sessions. If any part of it does not provably complete - a cached token
+that could not be deleted or found, a notebook whose session could not be ended -
+it reports the sign-out as **incomplete** instead of clean, and says what to finish
+by hand. There is no agent/MCP equivalent: signing out, like the sign-in browser,
+stays a human action.
+
 ## Configuration reference (environment variables)
 
 All of these are optional. **Unset = the standard behavior**; set one only to

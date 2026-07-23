@@ -276,7 +276,8 @@
 		setUi(FOLLOW_KEY, followRunningCell);
 	}
 	// Cell virtualization (windowed rendering) — ships OFF by default. The windowing
-	// (P2) and the pinned set (P3) are behind the flag; a later phase (P5) will
+	// (P2), the pinned set (P3) and the jump paths that force a windowed-out target to
+	// mount (P4, `scrollToCell` below) are behind the flag; a later phase (P5) will
 	// enable it automatically above a cell-count threshold. Until then an explicit
 	// `?virtualize=1` opt-in turns it on (the e2e harness + anyone trying it). Read
 	// once at init; URL params don't change within a session.
@@ -922,24 +923,22 @@
 	const runAboveActive = () => runNotebookAction('runAbove');
 	const runBelowActive = () => runNotebookAction('runBelow');
 
+	// The sidebar's outline + search rows jump here. Routed through the active
+	// notebook's `jumpToCell`, the SAME seam the find bar uses - it awaits
+	// `ensureCellMounted`, so a row addressing a cell virtualization has windowed out
+	// mounts it before scrolling (a `document.querySelector` would find only a
+	// spacer). It also owns the flash, the fold reveal, and the transient mount pin.
 	async function scrollToCell(id: string, foldKey: string | null = null) {
 		// Open + focus the notebook the outline currently reflects, then scroll. With
 		// no active notebook the outline and search are empty, so there is no row to
 		// click - but never let a null path mint a tab if one ever gets here.
-		if (!activeNotebookPath) return;
-		if (activeNotebookPath === canonicalNotebookRel) openNotebook();
-		else openFilePermanent(activeNotebookPath);
+		const path = activeNotebookPath;
+		if (!path) return;
+		if (path === canonicalNotebookRel) openNotebook();
+		else openFilePermanent(path);
+		// A hidden pane has no geometry, so the tab must be live before we scroll in it.
 		await tick();
-		// Multiple notebooks stay mounted (hidden); pick the visible cell.
-		const els = document.querySelectorAll(`[data-cell-id="${id}"]`);
-		const el = [...els].find((e) => (e as HTMLElement).offsetParent !== null) ?? els[0];
-		if (!el) return;
-		// An outline row addresses a heading, and a cell can hold several - scroll to
-		// the heading itself when we know which, but flash the whole cell.
-		const target = (foldKey && el.querySelector(`[data-fold-key="${CSS.escape(foldKey)}"]`)?.closest('[data-testid="heading-row"]')) || el;
-		target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-		el.classList.add('cellar-flash');
-		setTimeout(() => el.classList.remove('cellar-flash'), 1200);
+		await notebookApis.get(path)?.jumpToCell(id, { foldKey });
 	}
 
 	// ---- Find-in-page (floating find bar, Search P3 + P5) -------------------
@@ -962,7 +961,7 @@
 	// `ensureCellMounted` first - so a match in a cell windowed out by
 	// virtualization mounts before it scrolls (the crucial cooperation).
 	function jumpToMatch(match: Match) {
-		void activeNotebookApi()?.jumpToCell(match.cellId, match);
+		void activeNotebookApi()?.jumpToCell(match.cellId, { match });
 	}
 
 	// ---- Kernel + variables (sidebar) ---------------------------------------

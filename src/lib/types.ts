@@ -73,6 +73,18 @@ export interface FileTabApiHandle {
 	requestSave: () => void;
 }
 
+/** Options for the shared "take me to this cell" jump (`NotebookApiHandle.jumpToCell`). */
+export interface JumpOptions {
+	/** The find-in-page match being navigated to (reserved for a match-precise scroll). */
+	match?: Match;
+	/**
+	 * A heading occurrence inside the cell (`headings.ts` fold key). A markdown cell
+	 * can hold several headings, so an outline row addresses one of them: the heading
+	 * row is what gets scrolled to, while the whole cell is what flashes.
+	 */
+	foldKey?: string | null;
+}
+
 /** Imperative notebook controls the shell hands to the sidebar + command palette. */
 export interface NotebookApiHandle {
 	insertAndRunCode: (source: string) => void;
@@ -94,14 +106,14 @@ export interface NotebookApiHandle {
 	 */
 	revealRunning: () => void;
 	/**
-	 * The single find-in-page navigation seam (shared with the virtualization
-	 * mounting primitive): reveal (unfold) + **mount** the target cell - so it
-	 * works even when virtualization has windowed it out of the DOM - then scroll
-	 * it into view and flash it. `match` is accepted for a future match-precise
-	 * scroll/highlight (P4); today the whole cell is centered + flashed. Resolves
-	 * to the mounted cell node, or null when the cell no longer exists.
+	 * The single deliberate "take me to this cell" seam (shared with the
+	 * virtualization mounting primitive), used by the find bar AND by the shell's
+	 * outline / sidebar-search rows: reveal (unfold) + **mount** the target cell -
+	 * so it works even when virtualization has windowed it out of the DOM - then
+	 * scroll it into view and flash it. Resolves to the mounted cell node, or null
+	 * when the cell no longer exists.
 	 */
-	jumpToCell: (id: string, match?: Match) => Promise<HTMLElement | null>;
+	jumpToCell: (id: string, opts?: JumpOptions) => Promise<HTMLElement | null>;
 	/** Return keyboard focus to this notebook's root (e.g. after closing the find bar). */
 	focusRoot: () => void;
 	/**
