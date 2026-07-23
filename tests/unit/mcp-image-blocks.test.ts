@@ -112,12 +112,38 @@ describe('image block policy', () => {
 		const { images, omitted } = buildImageBlocks(many);
 		expect(images).toHaveLength(MAX_IMAGE_BLOCKS);
 		expect(images.map((i) => i.output_index)).toEqual([0, 1, 2, 3]);
-		expect(omitted).toHaveLength(3);
-		expect(omitted.every((o) => o.reason === 'limit')).toBe(true);
-		// The route to the ones that did not fit is named AND resumable: it points at
-		// the very output that was declined, so the cap costs no capability.
+		// ONE entry for the whole run, not one per figure: the cap is a single bound
+		// hit once, so a note per declined image is repetition, not information.
+		expect(omitted).toHaveLength(1);
+		expect(omitted[0]).toEqual(expect.objectContaining({ output_index: MAX_IMAGE_BLOCKS, reason: 'limit', count: 3 }));
+		// Nothing is declined silently even so: the entry says HOW MANY did not fit,
+		// and the route to them is named AND resumable - it points at the very output
+		// that was declined first, so the cap costs no capability.
+		expect(omitted[0].note).toMatch(/3 further images were not included/);
 		expect(omitted[0].note).toMatch(/get_full_output\(id, images_from: 4\)/);
-		expect(omitted[1].note).toMatch(/images_from: 5/);
+	});
+
+	it('collapses the flood a loop-plotting cell would otherwise produce, at constant cost', () => {
+		// 60 figures in a loop is ordinary. Per-image notes made the omission text
+		// ~8 KB on the exact path the 4-cap exists to keep cheap, and because paging
+		// with images_from re-emits the shrinking tail on every call, the text over a
+		// full page-through was quadratic in the number of figures.
+		const many = Array.from({ length: 60 }, (_, i) => ref(i, 'image/png', makePngB64(20, 20, i)));
+		const { images, omitted } = buildImageBlocks(many);
+		expect(images).toHaveLength(MAX_IMAGE_BLOCKS);
+		expect(omitted).toHaveLength(1);
+		expect(omitted[0].count).toBe(60 - MAX_IMAGE_BLOCKS);
+		expect(JSON.stringify(omitted).length).toBeLessThan(400);
+
+		// A SPECIFIC reason names a specific figure and a specific cause, so it is
+		// never merged into a run - and it also breaks one, since the images either
+		// side of it were declined for unrelated reasons.
+		const mixed = buildImageBlocks([ref(0, 'image/png', makePngB64(20, 20)), ref(1, 'image/png', makePngB64(20, 20, 1)), ref(2, 'image/svg+xml', Buffer.from('<svg/>').toString('base64')), ref(3, 'image/png', makePngB64(20, 20, 3))], { limit: 1 });
+		expect(mixed.omitted.map((o) => [o.reason, o.output_index, o.count])).toEqual([
+			['limit', 1, undefined],
+			['unsupported_mime', 2, undefined],
+			['limit', 3, undefined]
+		]);
 	});
 
 	it('gives an EXPLICIT per-cell request a far larger cap, so the run result\'s omission note is a real route', () => {
@@ -139,7 +165,8 @@ describe('image block policy', () => {
 		const many = Array.from({ length: MAX_FULL_OUTPUT_IMAGE_BLOCKS + 2 }, (_, i) => ref(i, 'image/png', makePngB64(20, 20, i)));
 		const { images, omitted } = buildImageBlocks(many, { limit: MAX_FULL_OUTPUT_IMAGE_BLOCKS });
 		expect(images).toHaveLength(MAX_FULL_OUTPUT_IMAGE_BLOCKS);
-		expect(omitted.map((o) => o.output_index)).toEqual([MAX_FULL_OUTPUT_IMAGE_BLOCKS, MAX_FULL_OUTPUT_IMAGE_BLOCKS + 1]);
+		expect(omitted.map((o) => o.output_index)).toEqual([MAX_FULL_OUTPUT_IMAGE_BLOCKS]);
+		expect(omitted[0].count).toBe(2);
 		expect(omitted[0].note).toMatch(new RegExp(`images_from: ${MAX_FULL_OUTPUT_IMAGE_BLOCKS}`));
 	});
 
@@ -150,8 +177,8 @@ describe('image block policy', () => {
 		// Room for two, not five.
 		const { images, omitted } = buildImageBlocks(many, { limit: 100, maxTotalBytes: bytes * 2 + 1 });
 		expect(images).toHaveLength(2);
-		expect(omitted).toHaveLength(3);
-		expect(omitted.every((o) => o.reason === 'budget')).toBe(true);
+		expect(omitted).toHaveLength(1);
+		expect(omitted[0]).toEqual(expect.objectContaining({ output_index: 2, reason: 'budget', count: 3 }));
 		expect(omitted[0].note).toMatch(/get_full_output\(id, images_from: 2\)/);
 	});
 
@@ -168,6 +195,29 @@ describe('image block policy', () => {
 		// A small image costs no decode, so it is never charged against that budget.
 		const small = Array.from({ length: 4 }, (_, i) => ref(i, 'image/png', makePngB64(40, 30, i)));
 		expect(buildImageBlocks(small, { limit: 100, maxDecodePixels: 1 }).images).toHaveLength(4);
+	});
+
+	it('will not START an unpredictable decode once the budget is gone', () => {
+		// A header that would not parse hides its decode cost until pngjs has read the
+		// raster, so it cannot be pre-charged. Refusing to begin one on a spent budget
+		// is what bounds the overshoot to a single image rather than letting a run of
+		// unreadable headers decode without limit.
+		const junk = Buffer.from('\x89PNG\r\n\x1a\n corrupt tail').toString('base64');
+		const { images, omitted } = buildImageBlocks([ref(0, 'image/png', junk)], { maxDecodePixels: 0 });
+		expect(images).toEqual([]);
+		expect(omitted).toEqual([expect.objectContaining({ output_index: 0, reason: 'budget' })]);
+	});
+
+	it('reports the pixel size on every block, not only the ones a downscale happened to decode', () => {
+		// width/height used to be a side effect of the downscale decode, so a `full`
+		// block and every JPEG/GIF block carried none while a downscaled one did - an
+		// avoidable gap, since the header dimensions are already parsed and in scope.
+		const b64 = makePngB64(1600, 1200);
+		expect(buildImageBlocks([ref(0, 'image/png', b64)], { full: true }).images[0]).toEqual(expect.objectContaining({ width: 1600, height: 1200 }));
+		expect(buildImageBlocks([ref(0, 'image/gif', gifHeader(600, 400))]).images[0]).toEqual(expect.objectContaining({ width: 600, height: 400 }));
+		// An unreadable header simply has none to report - never a bogus size.
+		const opaque = Buffer.from('fake jpeg bytes').toString('base64');
+		expect(buildImageBlocks([ref(0, 'image/jpeg', opaque)]).images[0].width).toBeUndefined();
 	});
 
 	it('emits the REGISTERED jpeg mime for an `image/jpg` bundle key, which a host would otherwise reject', () => {
@@ -284,9 +334,8 @@ describe('image block policy', () => {
 		const { images, omitted } = buildImageBlocks(many, { ...overByte, maxDecodePixels: 1000 * 900 * 2 });
 		expect(images).toHaveLength(2);
 		expect(images.every((i) => i.downscaled)).toBe(true);
-		expect(omitted).toHaveLength(2);
-		expect(omitted.every((o) => o.reason === 'budget')).toBe(true);
-		expect(omitted[0].output_index).toBe(2);
+		expect(omitted).toHaveLength(1);
+		expect(omitted[0]).toEqual(expect.objectContaining({ reason: 'budget', output_index: 2, count: 2 }));
 		expect(omitted[0].note).toMatch(/get_full_output\(id, images_from: 2\)/);
 
 		// A `full` image already inside the ceilings ships untouched, so it decodes

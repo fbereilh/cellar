@@ -16,7 +16,10 @@
  *     allowlist, the per-result count cap, and the byte/dimension ceilings. Every
  *     tool that ships images (run_cell / add_and_run / get_full_output) goes
  *     through it, so the cost bound cannot drift between them. Anything it
- *     declines is reported in `omitted` WITH a reason, never dropped silently.
+ *     declines is reported in `omitted` WITH a reason, never dropped silently -
+ *     though a consecutive run declined by the SAME aggregate bound collapses into
+ *     one entry carrying a `count`, since dozens of identical notes are cost
+ *     without information on the very path the caps exist to keep cheap.
  *     The count cap is the one knob that differs by caller: four bound the
  *     AUTOMATIC result of a run, where the agent did not ask for figures and the
  *     token bill is unbudgeted, while `get_full_output(id)` — an explicit,
@@ -180,6 +183,13 @@ export interface ScaledImage {
 	/** Downscaled pixel dimensions, present only when `resized`. */
 	scaledWidth?: number;
 	scaledHeight?: number;
+	/**
+	 * SOURCE pixels actually handed to the decoder, 0 when nothing was decoded.
+	 * Required, not optional, so every return path has to STATE its cost: this is
+	 * what `buildImageBlocks` charges against `MAX_RESULT_DECODE_PIXELS`, and a path
+	 * that quietly omitted it would be a decode nothing bounds.
+	 */
+	decodedPixels: number;
 }
 
 /**
@@ -189,16 +199,27 @@ export interface ScaledImage {
  * byte-for-byte untouched with `resized:false`.
  */
 export function downscaleImageForBlock(mime: string, b64: string, maxEdge = IMG_MAX_EDGE, dim?: ImageDims): ScaledImage {
-	if (mime !== 'image/png') return { data: b64, resized: false };
+	if (mime !== 'image/png') return { data: b64, resized: false, decodedPixels: 0 };
+	const d = dim === undefined ? imageDimensions(mime, b64) : dim;
 	// Refuse to decode a raster past the pixel bound (see `exceedsDecodeBound`):
 	// pngjs allocates the whole RGBA buffer up front, and no try/catch survives an
 	// OOM. Declining to shrink is the module's standard safe direction, and the
 	// caller's host-limit check then omits it with a reason.
-	if (exceedsDecodeBound(mime, b64, dim)) return { data: b64, resized: false };
+	if (exceedsDecodeBound(mime, b64, d)) return { data: b64, resized: false, decodedPixels: 0 };
+	// Already inside the edge, on dimensions the caller has ALREADY parsed from the
+	// header: there is nothing to resample, so the raster never reaches pngjs.
+	// Decoding it merely to re-read a width and height we were handed allocates the
+	// whole width×height×4 buffer and discards it - precisely the work
+	// MAX_RESULT_DECODE_PIXELS exists to bound, on the one path that would report
+	// itself as having spent none of it.
+	if (d && Math.max(d.width, d.height) <= maxEdge) return { data: b64, resized: false, width: d.width, height: d.height, decodedPixels: 0 };
 	try {
 		const src = PNG.sync.read(Buffer.from(b64, 'base64'));
 		const { width: sw, height: sh } = src;
-		if (Math.max(sw, sh) <= maxEdge) return { data: b64, resized: false, width: sw, height: sh };
+		// Charged from the raster pngjs really read, so a header that would not parse
+		// (`d === null`, which no caller could pre-charge) still pays for its decode.
+		const decodedPixels = sw * sh;
+		if (Math.max(sw, sh) <= maxEdge) return { data: b64, resized: false, width: sw, height: sh, decodedPixels };
 
 		const scale = maxEdge / Math.max(sw, sh);
 		const dw = Math.max(1, Math.round(sw * scale));
@@ -211,10 +232,14 @@ export function downscaleImageForBlock(mime: string, b64: string, maxEdge = IMG_
 		// MCP session, and level 9 buys a few percent on a raster the agent only has
 		// to READ. Time matters here; the last byte does not.
 		const encoded = PNG.sync.write(out, { deflateLevel: 3 }).toString('base64');
-		return { data: encoded, resized: true, width: sw, height: sh, scaledWidth: dw, scaledHeight: dh };
+		return { data: encoded, resized: true, width: sw, height: sh, scaledWidth: dw, scaledHeight: dh, decodedPixels };
 	} catch {
 		// Undecodable / unexpected raster: hand back the original, never a corrupt one.
-		return { data: b64, resized: false };
+		// A known-size raster is still charged for the allocation the attempt made
+		// (pngjs sizes its buffer from the IHDR before it fails on the pixel data);
+		// with no header there is nothing to charge, and pngjs rejects such a payload
+		// on the signature before allocating anything.
+		return { data: b64, resized: false, decodedPixels: d ? d.width * d.height : 0 };
 	}
 }
 
@@ -372,6 +397,14 @@ export interface OmittedImage {
 	output_index: number;
 	mime: string;
 	reason: 'unsupported_mime' | 'limit' | 'too_large' | 'budget';
+	/**
+	 * How many CONSECUTIVE image outputs this entry stands for, starting at
+	 * `output_index`; absent means exactly one. Only a `limit`/`budget` entry ever
+	 * covers more than one (see `buildImageBlocks`) - those are one bound hit once,
+	 * so a run of them says nothing per figure, whereas `unsupported_mime` /
+	 * `too_large` each name a specific figure and a specific cause.
+	 */
+	count?: number;
 	note: string;
 }
 
@@ -425,6 +458,34 @@ export function buildImageBlocks(
 	const omitted: OmittedImage[] = [];
 	let spentBytes = 0;
 	let spentPixels = 0;
+
+	const boundNote = (reason: 'limit' | 'budget', from: number, count: number): string => {
+		const why = reason === 'limit' ? `this result carries at most ${limit} images` : `this result's image budget is spent`;
+		return `${count > 1 ? `${count} further images were not included: ` : ''}${why}; ${resumeAt(from)}`;
+	};
+	/**
+	 * Report an image declined by one of the aggregate BOUNDS. A `limit`/`budget`
+	 * decline says nothing about the individual figure - it is one bound, hit once,
+	 * and every image after it goes the same way - so a CONSECUTIVE run of them
+	 * collapses into ONE entry carrying the count and the first output to resume
+	 * from. Per-image notes here are pure repetition on the exact path the count cap
+	 * exists to keep cheap: a cell that plotted 60 figures in a loop would return 4
+	 * blocks and 56 near-identical ~105-char notes, and because `images_from` pages
+	 * re-emit the shrinking tail, the omission text over a full page-through grows
+	 * quadratically in the number of figures. The contract is unweakened: the entry
+	 * still says how many were declined and names the exact call that resumes at the
+	 * first of them.
+	 */
+	const declineBound = (output_index: number, mime: string, reason: 'limit' | 'budget') => {
+		const last = omitted[omitted.length - 1];
+		if (last && last.reason === reason) {
+			last.count = (last.count ?? 1) + 1;
+			last.note = boundNote(reason, last.output_index, last.count);
+			return;
+		}
+		omitted.push({ output_index, mime, reason, note: boundNote(reason, output_index, 1) });
+	};
+
 	for (const item of items) {
 		const { output_index, mime, b64 } = item;
 		if (!isInlinableImageMime(mime)) {
@@ -432,7 +493,7 @@ export function buildImageBlocks(
 			continue;
 		}
 		if (images.length >= limit) {
-			omitted.push({ output_index, mime, reason: 'limit', note: `this result carries at most ${limit} images; ${resumeAt(output_index)}` });
+			declineBound(output_index, mime, 'limit');
 			continue;
 		}
 		const dim = imageDimensions(mime, b64);
@@ -440,27 +501,37 @@ export function buildImageBlocks(
 			omitted.push({ output_index, mime, reason: 'too_large', note: TOO_LARGE_NOTE });
 			continue;
 		}
-		// Charge the decode budget BEFORE decoding, and charge it even if the block is
-		// then declined on bytes - the CPU is spent either way, and that is what this
-		// budget bounds.
+		// Charge the decode budget BEFORE decoding whenever the cost is knowable, so a
+		// decode that would blow the budget never runs at all.
 		const pixels = dim && willDecode(full, mime, b64, dim, maxEdge, maxBytes) ? dim.width * dim.height : 0;
 		if (pixels && spentPixels + pixels > maxDecodePixels) {
-			omitted.push({ output_index, mime, reason: 'budget', note: `this result's image budget is spent; ${resumeAt(output_index)}` });
+			declineBound(output_index, mime, 'budget');
 			continue;
 		}
-		spentPixels += pixels;
-		const block = fitImageBlock(output_index, mime, b64, full, maxEdge, maxBytes, dim);
-		if (!block) {
+		// A header that would not parse hides its decode cost until pngjs has read the
+		// raster, so it can only be charged afterwards. Refusing to START one once the
+		// budget is gone is what bounds the overshoot to a single image instead of
+		// letting a run of unreadable headers decode without limit.
+		if (!dim && spentPixels >= maxDecodePixels) {
+			declineBound(output_index, mime, 'budget');
+			continue;
+		}
+		const fitted = fitImageBlock(output_index, mime, b64, full, maxEdge, maxBytes, dim);
+		// Charge what was ACTUALLY decoded - including a decode the block is then
+		// declined for, and including the unpredictable no-header case above. The CPU
+		// is spent either way, and that is what this budget bounds.
+		spentPixels += fitted.decodedPixels;
+		if (!fitted.block) {
 			omitted.push({ output_index, mime, reason: 'too_large', note: TOO_LARGE_NOTE });
 			continue;
 		}
-		const bytes = base64Bytes(block.data);
+		const bytes = base64Bytes(fitted.block.data);
 		if (spentBytes + bytes > maxTotalBytes) {
-			omitted.push({ output_index, mime, reason: 'budget', note: `this result's image budget is spent; ${resumeAt(output_index)}` });
+			declineBound(output_index, mime, 'budget');
 			continue;
 		}
 		spentBytes += bytes;
-		images.push(block);
+		images.push(fitted.block);
 	}
 	return { images, omitted };
 }
@@ -484,34 +555,49 @@ function willDecode(full: boolean, mime: string, b64: string, dim: ImageDims, ma
 	return !withinHostLimits(b64, maxBytes, dim);
 }
 
+/** A fitted image plus what producing it actually cost the decoder. */
+interface FittedImage {
+	block: ImageBlockPayload | null;
+	/** SOURCE pixels handed to the decoder across every attempt made here. */
+	decodedPixels: number;
+}
+
 /**
  * One image, scaled to policy: downscale unless `full`, then enforce the host
  * ceilings — falling back to a downscale for an oversized `full` image, and
- * returning null only when even that does not fit (a huge non-PNG, which we
- * cannot resample). Never returns a payload we know the host would reject.
+ * returning a null block only when even that does not fit (a huge non-PNG, which
+ * we cannot resample). Never returns a payload we know the host would reject.
  *
  * The pixel bound is checked FIRST, before any decode: a raster past it is
  * declined outright rather than handed to pngjs (see `MAX_DECODE_PIXELS`). `dim`
- * is the caller's already-parsed header, threaded through so no path re-reads it.
+ * is the caller's already-parsed header, threaded through so no path re-reads it
+ * - and it is also the fallback for the block's own `width`/`height`, so a `full`
+ * image and a non-PNG (neither of which is decoded) report the same pixel size a
+ * downscaled one does rather than reporting none.
  */
-function fitImageBlock(output_index: number, mime: string, b64: string, full: boolean, maxEdge: number, maxBytes: number, dim: ImageDims = imageDimensions(mime, b64)): ImageBlockPayload | null {
-	if (exceedsDecodeBound(mime, b64, dim)) return null;
-	const scaled = full ? { data: b64, resized: false as const } : downscaleImageForBlock(mime, b64, maxEdge, dim);
-	const build = (s: ScaledImage, note?: string): ImageBlockPayload => ({
-		output_index,
-		mime: blockMime(mime),
-		data: s.data,
-		...(s.width != null ? { width: s.width, height: s.height } : {}),
-		...(s.resized ? { downscaled: { from: `${s.width}×${s.height}`, to: `${s.scaledWidth}×${s.scaledHeight}`, ...(note ? { note } : { note: FETCH_FULL }) } } : {})
-	});
-	if (withinHostLimits(scaled.data, maxBytes, emittedDims(scaled, dim))) return build(scaled);
+function fitImageBlock(output_index: number, mime: string, b64: string, full: boolean, maxEdge: number, maxBytes: number, dim: ImageDims = imageDimensions(mime, b64)): FittedImage {
+	if (exceedsDecodeBound(mime, b64, dim)) return { block: null, decodedPixels: 0 };
+	const scaled = full ? { data: b64, resized: false as const, decodedPixels: 0 } : downscaleImageForBlock(mime, b64, maxEdge, dim);
+	const build = (s: ScaledImage, note?: string): ImageBlockPayload => {
+		const width = s.width ?? dim?.width;
+		const height = s.height ?? dim?.height;
+		return {
+			output_index,
+			mime: blockMime(mime),
+			data: s.data,
+			...(width != null && height != null ? { width, height } : {}),
+			...(s.resized ? { downscaled: { from: `${width}×${height}`, to: `${s.scaledWidth}×${s.scaledHeight}`, ...(note ? { note } : { note: FETCH_FULL }) } } : {})
+		};
+	};
+	if (withinHostLimits(scaled.data, maxBytes, emittedDims(scaled, dim))) return { block: build(scaled), decodedPixels: scaled.decodedPixels };
 	// Over a host ceiling. A routine (already downscaled) image that still does not
 	// fit is beyond what we can do; a `full` one gets the ordinary downscale as a
 	// fallback, so "I asked for full res" degrades to a smaller figure, not to none.
-	if (!full) return null;
+	if (!full) return { block: null, decodedPixels: scaled.decodedPixels };
 	const retry = downscaleImageForBlock(mime, b64, maxEdge, dim);
-	if (retry.resized && withinHostLimits(retry.data, maxBytes, emittedDims(retry, dim))) return build(retry, 'the original exceeds the inline image size limit, so a downscaled copy is shown');
-	return null;
+	const decodedPixels = scaled.decodedPixels + retry.decodedPixels;
+	if (retry.resized && withinHostLimits(retry.data, maxBytes, emittedDims(retry, dim))) return { block: build(retry, 'the original exceeds the inline image size limit, so a downscaled copy is shown'), decodedPixels };
+	return { block: null, decodedPixels };
 }
 
 /** The dimensions of the raster actually EMITTED - the resampled ones when we resized. */

@@ -118,6 +118,44 @@ describe('image module', () => {
 		expect(dimsOf(r.data)).toEqual({ width: 640, height: 480 });
 	});
 
+	it('does NOT hand an already-small raster to the decoder at all when its size is known', () => {
+		// The size came off the header; there is nothing to resample. Decoding purely
+		// to re-read a width and height we were already given allocates the whole
+		// width*height*4 RGBA buffer and discards it - the exact synchronous event-loop
+		// cost MAX_RESULT_DECODE_PIXELS exists to bound, on the one path that reported
+		// itself as spending none of it (willDecode says no-decode, so it is charged
+		// nothing).
+		const b64 = makePngB64(640, 480);
+		const dim = img.imageDimensions('image/png', b64);
+		const spy = vi.spyOn(PNG.sync, 'read');
+		try {
+			const r = img.downscaleImageForBlock('image/png', b64, img.IMG_MAX_EDGE, dim);
+			expect(spy).not.toHaveBeenCalled();
+			expect(r.decodedPixels).toBe(0);
+			expect(r.resized).toBe(false);
+			expect(r.data).toBe(b64);
+			// The dimensions still come back - they no longer depend on the decode.
+			expect(r.width).toBe(640);
+			expect(r.height).toBe(480);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it('charges every decode that DOES run, including one whose header never parsed', () => {
+		// A decode is the cost the budget bounds, so no path may run one for free.
+		// `dim === null` is the case nothing upstream can pre-charge: willDecode reports
+		// no-decode and exceedsDecodeBound cannot refuse it, so the charge has to come
+		// from the raster pngjs actually read.
+		const b64 = makePngB64(1000, 900);
+		expect(img.downscaleImageForBlock('image/png', b64, img.IMG_MAX_EDGE, null).decodedPixels).toBe(1000 * 900);
+		// Including when that decode turns out to need no resample: it still ran.
+		expect(img.downscaleImageForBlock('image/png', makePngB64(100, 80), img.IMG_MAX_EDGE, null).decodedPixels).toBe(100 * 80);
+		// And the ordinary over-edge downscale is charged its SOURCE pixels, not the
+		// small raster it produced.
+		expect(img.downscaleImageForBlock('image/png', b64, img.IMG_MAX_EDGE).decodedPixels).toBe(1000 * 900);
+	});
+
 	it('passes a non-PNG image through untouched (only PNG is downscaled)', () => {
 		const fake = Buffer.from('not really a jpeg but big').toString('base64');
 		const r = img.downscaleImageForBlock('image/jpeg', fake, img.IMG_MAX_EDGE);
@@ -313,7 +351,10 @@ describe('get_full_output default-vs-full image contract', () => {
 
 		const first = svc.getFullOutput(id, 'medium', nb)!;
 		expect(first.images).toHaveLength(MAX_FULL_OUTPUT_IMAGE_BLOCKS);
-		expect(first.images_omitted).toHaveLength(2);
+		// One collapsed entry for the whole declined run, counting them and naming the
+		// output to resume at.
+		expect(first.images_omitted).toHaveLength(1);
+		expect(first.images_omitted![0].count).toBe(2);
 		expect(first.images_omitted![0].note).toMatch(new RegExp(`images_from: ${MAX_FULL_OUTPUT_IMAGE_BLOCKS}`));
 
 		// Following that note really does return the ones that did not fit.
