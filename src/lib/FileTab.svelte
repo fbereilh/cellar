@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { EditorView, keymap, type ViewUpdate } from '@codemirror/view';
-	import { EditorState, Prec, type Extension } from '@codemirror/state';
+	import { EditorView, type ViewUpdate } from '@codemirror/view';
+	import { EditorState, type Extension } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
@@ -18,11 +18,17 @@
 	import { saveFitsTransport, resolveBodyLimit } from '$lib/saveLimit';
 	import type { BlameLine } from '$lib/server/git';
 	import type { BlameReport } from '$lib/blame';
+	import type { FileTabApiHandle } from '$lib/types';
 
 	interface Props {
 		path: string;
 		/** Reports (path, dirty) so the tab bar can show the unsaved indicator. */
 		onDirty?: (path: string, dirty: boolean) => void;
+		/**
+		 * Publishes this tab's imperative handle (today: `requestSave`) to the shell,
+		 * which owns the Cmd/Ctrl+S binding for every tab kind. Null on unmount.
+		 */
+		onRegisterApi?: (path: string, api: FileTabApiHandle | null) => void;
 		/** The shell's fsRefreshSignal: a bump re-fetches the git-HEAD baseline. */
 		gitRefresh?: number;
 		/**
@@ -40,7 +46,7 @@
 	// `onBlame(path, record|null)` reports the git-blame record for the line the
 	// cursor sits on, so the shell's bottom status bar can show "who last edited
 	// this line, and when" (GitLens-style). `null` = no blame (untracked / non-repo).
-	let { path, onDirty, gitRefresh = 0, onBlame }: Props = $props();
+	let { path, onDirty, gitRefresh = 0, onBlame, onRegisterApi }: Props = $props();
 
 	let editorEl: HTMLDivElement;
 	// `$state.raw` so the git-baseline effect below re-runs once the editor exists,
@@ -66,10 +72,11 @@
 	// ONCE, from the loaded content: a read-only document cannot grow past the
 	// line it was measured against, so nothing needs re-measuring per keystroke.
 	let saveTooLarge = $state(false);
-	// `Mod-s` in a view-only tab is still HANDLED (so the browser's own "Save
-	// page as…" dialog stays suppressed), but there is nothing to persist — and a
-	// keystroke that appears to do nothing reads as a bug. So it pulses the chip
-	// that already says why, rather than adding a second copy of the same text.
+	// Cmd/Ctrl+S in a view-only tab is still HANDLED (the shell's capture handler
+	// suppresses the browser's own "Save page as…" dialog for every file tab), but
+	// there is nothing to persist — and a keystroke that appears to do nothing
+	// reads as a bug. So it pulses the chip that already says why, rather than
+	// adding a second copy of the same text.
 	let viewOnlyFlash = $state(false);
 	let viewOnlyTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -169,6 +176,17 @@
 			onDirty?.(path, v);
 		}
 	}
+
+	// Publish the tab's ONE save entry point (`save()`, shared with the header
+	// button) so the shell can drive Cmd/Ctrl+S. The shortcut is owned by the TAB
+	// rather than by the editor's keymap because a keymap fires only while
+	// `.cm-content` holds focus — and the editor is `display:none` under a
+	// rendered preview, the view every `.html` opens in, so the keystroke reached
+	// the browser's "Save page as…" dialog with a dirty document still unsaved.
+	onMount(() => {
+		onRegisterApi?.(path, { requestSave: () => void save() });
+		return () => onRegisterApi?.(path, null);
+	});
 
 	async function save() {
 		if (saving || !view) return;
@@ -332,14 +350,11 @@
 					// the rest true - `editable.of(false)` sets `contenteditable="false"`
 					// and adds NO tabindex, so `.cm-content` (where CodeMirror attaches
 					// its key handlers) could not take focus at all: a click landed on
-					// `.cm-scroller` and every keystroke died there. Without it the
-					// document is not selectable by keyboard, the editor's own search
-					// panel never opens, and the `Mod-s` keymap below cannot fire - so
-					// Cmd/Ctrl+S fell through to Chrome's "Save page as…" dialog (the
-					// shell's capture handler deliberately does not preventDefault for a
-					// non-notebook tab). With it, the document is focusable, selectable
-					// and searchable, still not editable, and `Mod-s` is handled: it
-					// suppresses the browser dialog and pulses the view-only chip.
+					// `.cm-scroller` and every keystroke died there, costing keyboard
+					// selection and the editor's own search panel. With it, the document
+					// is focusable, selectable and searchable, and still not editable.
+					// Cmd/Ctrl+S is not this element's business either way - the shell
+					// owns it for every file tab, in every view (see `requestSave`).
 					...(saveTooLarge
 						? [
 								EditorState.readOnly.of(true),
@@ -347,7 +362,6 @@
 								EditorView.contentAttributes.of({ tabindex: '0' })
 							]
 						: []),
-					Prec.highest(keymap.of([{ key: 'Mod-s', run: () => (save(), true) }])),
 					EditorView.updateListener.of((v: ViewUpdate) => {
 						if (v.docChanged) {
 							setDirty(true);

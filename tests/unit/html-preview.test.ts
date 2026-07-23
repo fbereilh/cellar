@@ -555,15 +555,41 @@ describe('save transport limit', () => {
 		expect(src).toContain('data-testid="file-view-only"');
 		// A read-only editor sets `contenteditable="false"` and NO tabindex, so
 		// `.cm-content` - where CodeMirror attaches its key handlers - could not take
-		// focus: no keyboard selection, no editor search panel, and `Mod-s` never
-		// fired, so Cmd/Ctrl+S reached Chrome's own "Save page as…" dialog. The
-		// explicit tabindex is one line wide and would regress invisibly.
+		// focus: no keyboard selection and no editor search panel. The explicit
+		// tabindex is one line wide and would regress invisibly.
 		expect(src).toContain("EditorView.contentAttributes.of({ tabindex: '0' })");
 		// Save is not merely disabled - it is absent, and the handler refuses to
 		// persist while still HANDLING the keystroke, surfacing the reason.
 		expect(src).toMatch(/if \(saveTooLarge\) \{\s*\n\s*flashViewOnly\(\);\s*\n\s*return;/);
 		// The rendered preview never depends on it.
 		expect(src).not.toMatch(/showPreview[^\n]*saveTooLarge/);
+	});
+
+	// The save shortcut is owned by the TAB, not by the editor. Bound as a
+	// CodeMirror keymap it fired only while `.cm-content` held focus, so in a
+	// rendered preview - `display:none` on the editor, and HTML's DEFAULT view -
+	// Cmd/Ctrl+S fell through to the browser's "Save page as…" dialog with the
+	// document still dirty. Source-level because the regression is one line wide
+	// in either file and reintroducing the keymap would also double-save.
+	it('the shell owns Cmd/Ctrl+S for a file tab, in every view', () => {
+		const tab = readFileSync(join(REPO, 'src/lib/FileTab.svelte'), 'utf8');
+		// The tab publishes its save handle and binds no key itself.
+		expect(tab).toContain('onRegisterApi?.(path, { requestSave: () => void save() })');
+		expect(tab).not.toMatch(/keymap\.of\(\[\{\s*key:\s*'Mod-s'/);
+
+		const shell = readFileSync(join(REPO, 'src/routes/+page.svelte'), 'utf8');
+		// One handler, both kinds - so a file tab no longer falls through.
+		expect(shell).toContain('const fileTabApis = new Map<string, FileTabApiHandle>()');
+		expect(shell).toContain('onRegisterApi={registerFileTabApi}');
+		const handler = shell.slice(
+			shell.indexOf("if (bindsFor('save-notebook').includes(chord))"),
+			shell.indexOf("if (bindsFor('open-find').includes(chord))")
+		);
+		expect(handler).toContain('e.preventDefault()');
+		expect(handler).toContain('fileApi?.requestSave()');
+		expect(handler).toContain('saveActiveNotebook()');
+		// A modal still owns the keyboard while up.
+		expect(handler).toContain("document.querySelector('.modal-open')");
 	});
 
 	// A save that fails must not be silent (it used to write into a variable the
