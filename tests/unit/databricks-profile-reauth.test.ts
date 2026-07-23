@@ -215,6 +215,16 @@ describe('isProfileReauthError - the pure rule', () => {
 		// No underlying detail => no detail row.
 		expect(reauth.reauthDetail(reauth.reauthMessage('DEFAULT'))).toBe('');
 	});
+
+	it('names no profile it was not given (the renderer then shows no command)', () => {
+		expect(reauth.reauthExplanation('DEFAULT')).toContain('DEFAULT');
+		for (const missing of [undefined, null, '', '   ']) {
+			const text = reauth.reauthExplanation(missing);
+			expect(text).toContain('sign-in expired');
+			// Not a half-written command, and not a guessed name: just what to do.
+			expect(text).not.toContain('--profile');
+		}
+	});
 });
 
 describe('the seam: an expired profile surfaces its own code + profile name', () => {
@@ -327,32 +337,32 @@ describe('the route body carries the profile name the sidebar prints', () => {
  * it is never invented: an ordinary failure still reads `reconnect_failed`, and a
  * reauth verdict from an earlier attempt cannot speak for a later one.
  */
+/** A notebook with a real, live connection - the only state the recovery paths act on. */
+async function connectedNotebook(name: string): Promise<string> {
+	const nb = join(dir, name);
+	writeStub(null);
+	kernel.session = 1;
+	kernel.connectOk = true;
+	kernel.sessionExpired = false;
+	kernel.connectMessage = SDK_ERROR;
+	await expect(
+		dbx.connect({ profile: 'DEFAULT', clusterId: '0710-abc123-xyz', clusterName: 'analytics', nb })
+	).resolves.toMatchObject({ ok: true });
+	return nb;
+}
+
+/** Run `fn` with the clock past `LIVENESS_TTL_MS`, so a cached "alive" cannot answer for us. */
+async function pastLivenessTtl<T>(fn: () => Promise<T>): Promise<T> {
+	const realNow = Date.now;
+	Date.now = () => realNow() + 60_000;
+	try {
+		return await fn();
+	} finally {
+		Date.now = realNow;
+	}
+}
+
 describe('the reconnect ladder keeps the expired-profile verdict', () => {
-	/** A notebook with a real, live connection - the only state the ladder will act on. */
-	async function connectedNotebook(name: string): Promise<string> {
-		const nb = join(dir, name);
-		writeStub(null);
-		kernel.session = 1;
-		kernel.connectOk = true;
-		kernel.sessionExpired = false;
-		kernel.connectMessage = SDK_ERROR;
-		await expect(
-			dbx.connect({ profile: 'DEFAULT', clusterId: '0710-abc123-xyz', clusterName: 'analytics', nb })
-		).resolves.toMatchObject({ ok: true });
-		return nb;
-	}
-
-	/** Run `fn` with the clock past `LIVENESS_TTL_MS`, so a cached "alive" cannot answer for us. */
-	async function pastLivenessTtl<T>(fn: () => Promise<T>): Promise<T> {
-		const realNow = Date.now;
-		Date.now = () => realNow() + 60_000;
-		try {
-			return await fn();
-		} finally {
-			Date.now = realNow;
-		}
-	}
-
 	it('rung 3 (kernel restart): surfaces profile_reauth_required, not the generic sidebar message', async () => {
 		const nb = await connectedNotebook('reconnect-restart.ipynb');
 		// A kernel restart bumps the epoch, so `spark` is gone and the ladder falls to
@@ -408,5 +418,156 @@ describe('the reconnect ladder keeps the expired-profile verdict', () => {
 		kernel.connectOk = false;
 		kernel.connectMessage = 'Unauthenticated: Invalid access token. Config: host=…, auth_type=pat';
 		await expect(dbx.reconnectSession(nb)).rejects.toMatchObject({ code: 'reconnect_failed' });
+	});
+});
+
+/**
+ * **The AUTO-HEAL status surfaces must name it too.**
+ *
+ * The explicit Reconnect button is not the only way a user meets this: the panel
+ * polls (`getStatus` → `liveConnection`) and an agent asks (`databricks_status` →
+ * `agentStatus`), and both run the self-heal on a dead session. When that heal
+ * fails because the profile's saved sign-in expired, saying "reconnect from the
+ * Databricks sidebar section" costs the user a hop to a button that cannot fix it.
+ *
+ * Note WHERE the user actually ends up: a failed heal runs through `connect()`,
+ * which clears the connection - so the panel drops to the picker card, the one
+ * offering the "Sign in with Databricks" button that cannot fix a CLI-managed
+ * profile. That state, not just the brief `expired` one, has to carry the command.
+ *
+ * The verdict is the one `reconnectTo` recorded (`pendingReauth`), fenced so it
+ * can only speak for the present: it needs a still-bound notebook, and any
+ * successful `connect()` retires it.
+ */
+describe('the auto-heal status surfaces name the expired profile', () => {
+	it('agentStatus relays the exact command instead of pointing at the sidebar', async () => {
+		const nb = await connectedNotebook('autoheal-agent.ipynb');
+		// The Spark Connect client is closed (a server-side expiry, no restart), so
+		// agentStatus heals in place - and that heal hits the dead token.
+		kernel.sessionExpired = true;
+		kernel.connectOk = false;
+		const status = (await pastLivenessTtl(() => dbx.agentStatus(nb))) as Record<string, unknown>;
+		expect(status).toMatchObject({
+			connected: false,
+			expired: true,
+			reauth_required: true,
+			profile: 'DEFAULT',
+			reauth_command: 'databricks auth login --profile DEFAULT'
+		});
+		expect(String(status.note)).toContain('databricks auth login --profile DEFAULT');
+		// The dead-end instruction this whole feature exists to retire.
+		expect(String(status.note)).not.toMatch(/reconnect from the Databricks sidebar section/);
+	});
+
+	it('an ordinary expiry keeps the plain "reconnect from the sidebar" note', async () => {
+		const nb = await connectedNotebook('autoheal-agent-generic.ipynb');
+		kernel.sessionExpired = true;
+		kernel.connectOk = false;
+		kernel.connectMessage = 'Unauthenticated: Invalid access token. Config: host=…, auth_type=pat';
+		const status = (await pastLivenessTtl(() => dbx.agentStatus(nb))) as Record<string, unknown>;
+		expect(status).toMatchObject({ connected: false, expired: true });
+		expect(status.reauth_required).toBeUndefined();
+		expect(status.profile).toBeUndefined();
+		expect(String(status.note)).toContain('reconnect from the Databricks sidebar section');
+	});
+
+	it('a bound notebook whose heal already failed keeps saying so, not "just connect"', async () => {
+		const nb = await connectedNotebook('autoheal-agent-durable.ipynb');
+		kernel.sessionExpired = true;
+		kernel.connectOk = false;
+		await pastLivenessTtl(() => dbx.agentStatus(nb));
+		// The failed heal ran through connect(), which cleared the connection - so the
+		// NEXT read has no session to assess. It must still name the real blocker
+		// instead of the generic "ask the user to connect from the sidebar".
+		const later = (await pastLivenessTtl(() => dbx.agentStatus(nb))) as Record<string, unknown>;
+		expect(later).toMatchObject({ connected: false, reauth_required: true, profile: 'DEFAULT' });
+		expect(String(later.note)).toContain('databricks auth login --profile DEFAULT');
+	});
+
+	it('the sidebar status carries the box once a heal has proved the cause', async () => {
+		const nb = await connectedNotebook('autoheal-panel.ipynb');
+		kernel.sessionExpired = true;
+		kernel.connectOk = false;
+		// The panel's own read never blocks on a reconnect, so the first one reports
+		// the honest bare expiry: nothing has established a cause yet.
+		const first = await pastLivenessTtl(() => dbx.getStatus(nb));
+		expect(first.connection).toMatchObject({ connected: false, expired: true });
+		expect((first.connection as Record<string, unknown>).reauth).toBeUndefined();
+
+		// Once a heal HAS concluded (here the awaited one), the panel carries the
+		// verdict - including on the picker card the cleared connection drops it to,
+		// which is where the useless "Sign in with Databricks" button lives.
+		await pastLivenessTtl(() => dbx.agentStatus(nb));
+		const second = await pastLivenessTtl(() => dbx.getStatus(nb));
+		expect(second.connection).toMatchObject({
+			connected: false,
+			reauth: { code: reauth.PROFILE_REAUTH_CODE, profile: 'DEFAULT' }
+		});
+		expect(
+			String(((second.connection as Record<string, unknown>).reauth as { message: string }).message)
+		).toContain('databricks auth login --profile DEFAULT');
+	});
+
+	it('a restored session retires the verdict rather than keeping it on the panel', async () => {
+		const nb = await connectedNotebook('autoheal-retired.ipynb');
+		kernel.sessionExpired = true;
+		kernel.connectOk = false;
+		await pastLivenessTtl(() => dbx.agentStatus(nb));
+		expect(
+			((await pastLivenessTtl(() => dbx.getStatus(nb))).connection as Record<string, unknown>).reauth
+		).toBeDefined();
+
+		// The user runs the command and clicks Reconnect: a live session is proof the
+		// credential works, so neither surface may keep showing the expiry.
+		kernel.connectOk = true;
+		kernel.sessionExpired = false;
+		await expect(dbx.reconnectSession(nb)).resolves.toMatchObject({ connected: true });
+		const panel = await pastLivenessTtl(() => dbx.getStatus(nb));
+		expect(panel.connection).toMatchObject({ connected: true });
+		expect((panel.connection as Record<string, unknown>).reauth).toBeUndefined();
+		const agent = (await pastLivenessTtl(() => dbx.agentStatus(nb))) as Record<string, unknown>;
+		expect(agent.connected).toBe(true);
+		expect(agent.reauth_required).toBeUndefined();
+	});
+
+	it('a later loss is not blamed on the sign-in the user already fixed', async () => {
+		const nb = await connectedNotebook('autoheal-superseded.ipynb');
+		kernel.sessionExpired = true;
+		kernel.connectOk = false;
+		await pastLivenessTtl(() => dbx.agentStatus(nb));
+
+		// The user re-authenticates and connects from the picker (not Reconnect, which
+		// clears the record itself): a live session is what retires the verdict.
+		kernel.connectOk = true;
+		kernel.sessionExpired = false;
+		await expect(
+			dbx.connect({ profile: 'DEFAULT', clusterId: '0710-abc123-xyz', clusterName: 'analytics', nb })
+		).resolves.toMatchObject({ ok: true });
+
+		// Now the kernel restarts, so the notebook is bound with no live session again -
+		// a state nothing re-classified. It must read as the restart it is, never as
+		// the expired sign-in that was already fixed.
+		kernel.session += 1;
+		const status = (await pastLivenessTtl(() => dbx.agentStatus(nb))) as Record<string, unknown>;
+		expect(status).toMatchObject({ connected: false });
+		expect(status.reauth_required).toBeUndefined();
+		expect(String(status.note)).toContain('ended when the kernel restarted');
+		const panel = await pastLivenessTtl(() => dbx.getStatus(nb));
+		expect((panel.connection as Record<string, unknown>).reauth).toBeUndefined();
+	});
+
+	it('a disconnected notebook is not haunted by the verdict of a binding it dropped', async () => {
+		const nb = await connectedNotebook('autoheal-disconnected.ipynb');
+		kernel.sessionExpired = true;
+		kernel.connectOk = false;
+		await pastLivenessTtl(() => dbx.agentStatus(nb));
+		// Disconnect drops the reconnect intent, so there is no longer a session
+		// Cellar is trying to restore - and nothing to re-authenticate FOR.
+		await dbx.disconnect(nb);
+		const agent = (await pastLivenessTtl(() => dbx.agentStatus(nb))) as Record<string, unknown>;
+		expect(agent.reauth_required).toBeUndefined();
+		expect(String(agent.note)).toContain('No Databricks session');
+		const panel = await pastLivenessTtl(() => dbx.getStatus(nb));
+		expect((panel.connection as Record<string, unknown>).reauth).toBeUndefined();
 	});
 });

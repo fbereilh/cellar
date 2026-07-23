@@ -179,3 +179,42 @@ test('regression: a no-token external-browser profile still offers Cellar’s br
 	await expect(page.getByTestId('databricks-signin')).toBeVisible();
 	await expect(page.getByTestId('databricks-clusters-error-reauth-command')).toHaveCount(0);
 });
+
+test('with no profile name on the error, the box explains but shows no command', async ({ page }) => {
+	await mockDatabricksStatus(page, cliProfileStatus);
+	// The `profile` field is what every server path sets; a body without one is the
+	// shape that must FAIL CLOSED. Guessing from the picker would print a command
+	// re-authenticating the wrong profile - or `--profile` with nothing after it,
+	// which the copy button would hand over verbatim.
+	const { profile: _dropped, ...noProfile } = reauthBody(PROFILE);
+	await mockClustersFailing(page, noProfile);
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	const explain = page.getByTestId('databricks-clusters-error-reauth-explain');
+	await expect(explain).toBeVisible();
+	// It names no profile it does not know - and offers no command at all.
+	await expect(explain).not.toContainText(PROFILE);
+	await expect(page.getByTestId('databricks-clusters-error-reauth-command')).toHaveCount(0);
+	await expect(page.getByTestId('databricks-clusters-error-reauth-copy')).toHaveCount(0);
+});
+
+test('a session the auto-heal could not restore shows the command on the panel itself', async ({ page }) => {
+	// What the panel actually reaches after a failed self-heal: no live session (so
+	// the picker card, with its useless "Sign in with Databricks" button) - and the
+	// server's verdict riding along, so the user is told why before clicking it.
+	await mockDatabricksStatus(page, () => ({
+		...cliProfileStatus(),
+		connection: { connected: false, reauth: reauthBody(PROFILE) }
+	}));
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	await expect(page.getByTestId('databricks-session-error')).toBeVisible();
+	await expect(page.getByTestId('databricks-session-error-reauth-command')).toHaveText(
+		`databricks auth login --profile ${PROFILE}`
+	);
+});

@@ -75,9 +75,18 @@ export function reauthCommand(profile: string): string {
 /**
  * The one-line explanation shown above the command. Says what died and what the
  * user does about it - never that Cellar can fix it, because it cannot.
+ *
+ * Fails closed with no profile name: every producer of this case names the profile
+ * (`reclassifyReauth` reads it off the resolved auth), so a missing one means we do
+ * not actually know which sign-in died - and a renderer with no name shows no
+ * command either, since `databricks auth login --profile` with nothing after it is
+ * worse than no command at all.
  */
-export function reauthExplanation(profile: string): string {
-	return `Your saved ${profile} sign-in expired. Re-authenticate in a terminal, then reconnect.`;
+export function reauthExplanation(profile?: string | null): string {
+	const name = String(profile ?? '').trim();
+	return name
+		? `Your saved ${name} sign-in expired. Re-authenticate in a terminal, then reconnect.`
+		: 'Your saved Databricks sign-in expired. Re-authenticate with the Databricks CLI in a terminal, then reconnect.';
 }
 
 /** Separates Cellar's actionable head from the SDK's own text in `reauthMessage`. */
