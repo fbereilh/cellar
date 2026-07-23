@@ -8,14 +8,14 @@
 	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
 	import { exportCellCount } from '$lib/exportRole';
 	import { createSearchCache } from '$lib/search';
-	import type { SearchCache, Match } from '$lib/search';
+	import type { SearchCache } from '$lib/search';
 	import { buildCellHighlights, type SearchHighlightState } from '$lib/searchHighlight';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
 	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
 	import type { CellView, CellOutput, CellType, LogicalCellType, Actor, RunningView, QueueEntryView, LastRun, CellarNamespace, PublishedEvent } from '$lib/server/types';
-	import type { UICell, KeyMode, FoldRegistryHandle, NumberingRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
+	import type { UICell, KeyMode, FoldRegistryHandle, JumpOptions, NumberingRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
 	import type { BlameLine } from '$lib/server/git';
 	import type { ClientEvent } from '$lib/events-client';
 	import type { Folding } from '$lib/headings';
@@ -235,7 +235,9 @@
 	// Transient jump targets forced to stay mounted under windowing, so a scroll-to
 	// helper can land on a real DOM node even when the target is off-screen. Passed
 	// down to Notebook, where it joins the pinned set. Empty (and inert) unless
-	// `virtualize` is on; the full jump-path rework is P4. Kept minimal here.
+	// `virtualize` is on. Taken by `ensureCellMounted` - which EVERY jump/reveal/focus
+	// path routes through (P4) - and dropped by `releaseScrollPin` once that jump's
+	// scroll has settled, so the set stays transient rather than accumulating.
 	let scrollPins = $state<Set<string>>(new Set());
 	// The cell holding DOM focus, tracked off the DOM (not off `activeId`), and pinned
 	// under windowing so an EDITED cell scrolled far out of the window keeps its
@@ -623,45 +625,163 @@
 	// noticeably laggy on this heavy app (long main-thread frames during a run),
 	// so we drive a short ease-out tween on the container's `scrollTop` ourselves
 	// (~140ms) via rAF. Honors prefers-reduced-motion by jumping instantly.
+	// Resolves once the scroll has SETTLED, so a jump path knows when it is safe to
+	// drop its transient mount pin (see `releaseScrollPin`).
+	// `isCurrent` is the supersession guard (see `scrollElementIntoView`): a newer
+	// scroll on the same pane makes this tween stop writing `scrollTop` immediately,
+	// so two overlapping jumps can never fight frame-by-frame over the viewport.
 	const SCROLL_TWEEN_MS = 140;
-	function tweenScrollTop(parent: HTMLElement, top: number) {
+	function tweenScrollTop(
+		parent: HTMLElement,
+		top: number,
+		isCurrent: () => boolean = () => true
+	): Promise<void> {
 		const target = Math.max(0, Math.min(top, parent.scrollHeight - parent.clientHeight));
 		const start = parent.scrollTop;
 		const dist = target - start;
 		if (reducedMotion() || Math.abs(dist) < 1) {
 			parent.scrollTop = target;
-			return;
+			return Promise.resolve();
 		}
-		const t0 = performance.now();
-		const step = (now: number) => {
-			const p = Math.min(1, (now - t0) / SCROLL_TWEEN_MS);
-			const eased = 1 - Math.pow(1 - p, 3); // ease-out cubic
-			parent.scrollTop = start + dist * eased;
-			if (p < 1) requestAnimationFrame(step);
-		};
-		requestAnimationFrame(step);
+		return new Promise((resolve) => {
+			let done = false;
+			const settle = () => {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				resolve();
+			};
+			// A backgrounded tab suspends rAF, so the tween would never finish and the
+			// jump's transient mount pin (which waits on this promise) would be held
+			// forever - virtualization undone. Snap to the target and settle well past
+			// the tween's own duration, so this is a backstop, never the normal path.
+			// It snaps to the SAME destination the tween was heading for, so winning the
+			// race costs the animation, never the landing.
+			const timer = setTimeout(() => {
+				if (isCurrent()) parent.scrollTop = target;
+				settle();
+			}, SCROLL_TWEEN_MS * 4);
+			const t0 = performance.now();
+			const step = (now: number) => {
+				if (done) return;
+				if (!isCurrent()) return settle();
+				const p = Math.min(1, (now - t0) / SCROLL_TWEEN_MS);
+				const eased = 1 - Math.pow(1 - p, 3); // ease-out cubic
+				parent.scrollTop = start + dist * eased;
+				if (p < 1) requestAnimationFrame(step);
+				else settle();
+			};
+			requestAnimationFrame(step);
+		});
 	}
 
-	// Bring a cell the *agent* is running into view: center it when it fits, else
-	// pin its top. Distinct from `scrollCellIntoView` (keyboard selection), which
-	// wants the smallest possible movement, not a deliberate reframing.
-	function scrollElementIntoView(el: HTMLElement) {
+	// How far the pane must scroll to frame `el` deliberately: centered when it fits,
+	// otherwise top-pinned near the pane's top so the cell's header + first outputs
+	// are what the user sees (centering a tall cell would push its top off screen).
+	function reframeDelta(parent: HTMLElement, el: HTMLElement): number {
+		const view = parent.getBoundingClientRect();
+		const r = el.getBoundingClientRect();
+		const margin = 24;
+		return r.height + margin * 2 <= view.height
+			? r.top - view.top - (view.height - r.height) / 2
+			: r.top - view.top - margin;
+	}
+
+	// Deliberately REFRAME the viewport around `el` (jump-to-cell, follow-running).
+	// Distinct from `scrollElementIntoViewNearest` below - the keyboard-selection
+	// writer - which wants the smallest possible movement, not a reframing.
+	//
+	// A long jump under windowing lands TWICE, and `settle` is why it lands at all.
+	// The first scroll is computed against the window's *estimated* heights for every
+	// cell it flies over; the moment it moves, those cells mount and their real
+	// heights replace the estimates, so the target slides out from under the tween -
+	// measured at ~2.6k px of drift on a 64k px jump in a 300-cell notebook, i.e. the
+	// target ended up four viewports below the fold. So we re-measure and re-scroll
+	// (bounded, so a pathological notebook cannot spin). The first pass tweens (it is
+	// the movement the user perceives); the corrections snap, since animating a
+	// correction only adds lag to the same destination.
+	//
+	// WHAT counts as settled is the caller's, because the two kinds of caller want
+	// different things - and conflating them is what made a streaming cell get
+	// re-snapped four extra times:
+	//   'frame'   - DISCRETE targets (`jumpToCell`, `revealRunning`): converge on the
+	//               exact framing. The user asked to be taken to this cell.
+	//   'visible' - the CONTINUOUS follow-running path (`followCell`): stop the moment
+	//               the cell is on screen. Its target is *streaming*, so its own height
+	//               (and, once it outgrows the viewport, its framing rule) keeps
+	//               changing and an exact-framing loop would keep re-snapping a
+	//               viewport the user is reading. Correcting only until visible fixes
+	//               the mount-drift - which the window does NOT catch up on by itself,
+	//               so leaving the cell short would silently break follow under
+	//               windowing - without ever chasing a growing cell.
+	// Omitted (the default) = one scroll, no re-measure.
+	//
+	// When layout is STATIC - windowing OFF, the shipping default - both modes settle
+	// on pass 1 with a ~0 delta / an already-visible cell, so nothing re-snaps and the
+	// flag-OFF path is one tween exactly as before.
+	//
+	// `scrollGen` is the supersession guard: a NEWER scroll on this pane cancels the
+	// older loop (and its in-flight tween) on the spot, so overlapping jumps - the
+	// find bar's Enter-repeat, rapid outline/search clicks, a follow-running scroll
+	// landing mid-jump - never fight, and the pane rests where the LAST caller asked.
+	// EVERY writer of this pane bumps it, `scrollElementIntoViewNearest` included, so
+	// a keyboard selection cancels an in-flight loop rather than racing it. It is
+	// per-pane and distinct from `pinSeq`, which is per-cell pin ownership; a
+	// superseded loop still returns normally so its caller's release path runs.
+	const SCROLL_SETTLE_PASSES = 5;
+	const SCROLL_SETTLE_TOLERANCE_PX = 8;
+	let scrollGen = 0;
+	async function scrollElementIntoView(
+		el: HTMLElement,
+		opts: { settle?: 'frame' | 'visible' } = {}
+	): Promise<void> {
+		const gen = ++scrollGen;
 		const parent = scrollParent(el);
 		if (!parent) {
 			el.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'center' });
 			return;
 		}
-		const view = parent.getBoundingClientRect();
-		const r = el.getBoundingClientRect();
-		const margin = 24;
-		// Center a cell that fits; otherwise pin its top near the pane's top so the
-		// header + first outputs are what the user sees (centering a tall cell would
-		// push its top off screen).
-		const delta =
-			r.height + margin * 2 <= view.height
-				? r.top - view.top - (view.height - r.height) / 2
-				: r.top - view.top - margin;
-		tweenScrollTop(parent, parent.scrollTop + delta);
+		const passes = opts.settle ? SCROLL_SETTLE_PASSES : 1;
+		const isCurrent = () => gen === scrollGen;
+		for (let pass = 0; pass < passes; pass++) {
+			// The loop spans frames of DOM churn, so the target can be deleted, moved,
+			// or re-rendered out from under it. A detached node measures an all-zero
+			// rect, which would read as "scroll the pane to the top" on every remaining
+			// pass - abandon a target that no longer exists instead.
+			if (!el.isConnected || !isCurrent()) return;
+			if (opts.settle === 'visible' && cellIsVisible(el)) return;
+			const delta = reframeDelta(parent, el);
+			if (Math.abs(delta) <= SCROLL_SETTLE_TOLERANCE_PX) return;
+			if (pass === 0) await tweenScrollTop(parent, parent.scrollTop + delta, isCurrent);
+			else parent.scrollTop = Math.max(0, Math.min(parent.scrollTop + delta, parent.scrollHeight - parent.clientHeight));
+			if (pass + 1 >= passes) return;
+			// Let the moved viewport re-plan the window (the metrics read is
+			// rAF-coalesced) and the newly mounted cells report their real heights.
+			await nextFrames(2);
+		}
+	}
+
+	// The other pane writer: reveal `el` with the SMALLEST movement, instantly. That
+	// is what makes arrow-key nav feel immediate, so this is deliberately NOT a
+	// settle-loop caller (settle is for discrete jump targets; keyboard selection and
+	// follow-running stay single-scroll). It bumps `scrollGen` for the same reason
+	// `scrollElementIntoView` does, and it is the one choke point for every native pane
+	// write THIS component makes, so a future site here cannot forget: a selection that
+	// scrolled outside the guard would be undone by an in-flight loop's next corrective
+	// pass, and - when it targets the SAME cell - would take pin ownership and unpin
+	// that target two frames later, leaving the older loop to abandon on its
+	// `isConnected` guard, i.e. the jump silently lands nowhere.
+	//
+	// Known exception, pre-existing and outside this component: `Cell.svelte`'s
+	// search-highlight scrolls (the active match's anchor `scrollIntoView`, and
+	// `EditorView.scrollIntoView` for a match inside a built editor, both from Search
+	// P4) write the same ancestor pane without bumping `scrollGen`, and they fire
+	// during the find-bar jump's own settle loop. Bounded, not a fight: they target the
+	// very cell that jump is scrolling to, so the two converge - but their ordering
+	// relative to the loop's passes is not guaranteed.
+	function scrollElementIntoViewNearest(el: HTMLElement) {
+		scrollGen++;
+		el.scrollIntoView({ behavior: 'auto', block: 'nearest' });
 	}
 
 	// Unfold whatever collapsed sections hide `id`, so a cell the agent is running
@@ -679,14 +799,29 @@
 		saveFolds();
 	}
 
+	/** A transient mount pin, identified by the cell AND the jump that took it. */
+	type ScrollPin = { id: string; seq: number };
+	/** What `ensureCellMounted` hands back: the node, plus the pin to release. */
+	type MountedCell = { el: HTMLElement | null; pin: ScrollPin };
+
 	// Force a jump target to mount under windowing before we query its DOM node.
 	// Off-screen cells are spacers, so a `querySelector` would miss; pinning splits
 	// the spacer and mounts the cell. A no-op when windowing is off (every cell is
-	// already mounted). The pin is released once the cell has been scrolled into the
-	// natural window. The full jump-path rework (outline / search / print) is P4.
-	function pinScrollTarget(id: string) {
-		if (!virtualize || scrollPins.has(id)) return;
-		scrollPins = new Set(scrollPins).add(id);
+	// already mounted). Pins are TRANSIENT by contract - every jump path releases its
+	// own once the scroll settles, else they accumulate and pin the whole notebook
+	// mounted, which is virtualization undone. `pinSeq` makes a release belong to the
+	// jump that took it: a newer jump re-pinning the same id supersedes the older
+	// release, so a rapid second jump to the same cell can't be unpinned mid-flight.
+	// The sequence is captured at PIN time and carried in the returned `ScrollPin` -
+	// reading it back at release time would compare the newest value against itself,
+	// so an older jump resuming after a newer one re-pinned the same id would pass the
+	// ownership test and unpin a target the newer jump is still scrolling to.
+	const pinSeq = new Map<string, number>();
+	function pinScrollTarget(id: string): ScrollPin {
+		const seq = (pinSeq.get(id) ?? 0) + 1;
+		pinSeq.set(id, seq);
+		if (virtualize && !scrollPins.has(id)) scrollPins = new Set(scrollPins).add(id);
+		return { id, seq };
 	}
 	function unpinScrollTarget(id: string) {
 		if (!scrollPins.has(id)) return;
@@ -695,20 +830,104 @@
 		scrollPins = next;
 	}
 
+	// Drop a transient pin once `settled` (the scroll it was taken for) has finished
+	// AND the window has re-planned against the resulting scrollTop. Both halves
+	// matter: `Notebook.svelte` reads the pane metrics rAF-coalesced, so unpinning in
+	// the same frame as the scroll re-plans against the PRE-scroll viewport and
+	// unmounts the very cell we just jumped to. Two frames after the scroll ends, the
+	// target sits in the natural window and the pin is redundant.
+	function releaseScrollPin(pin: ScrollPin, settled: Promise<void> = Promise.resolve()) {
+		// Swallow BEFORE the no-pin early return: with windowing off - the shipping
+		// default - nothing is ever pinned, so this is the only handler every scroll
+		// promise gets, and a throw inside the settle loop would otherwise surface as
+		// an unhandled rejection on the default path.
+		const done = settled.catch(() => {}); // a scroll that failed must still release its pin
+		if (!scrollPins.has(pin.id)) return;
+		void done.then(() => nextFrames(2)).then(() => {
+			if (pinSeq.get(pin.id) === pin.seq) unpinScrollTarget(pin.id);
+		});
+	}
+	/**
+	 * Resolve after `n` animation frames (the granularity the window re-plans at),
+	 * with a timeout floor. rAF is the FAST path and stays load-bearing - waiting two
+	 * real frames after a scroll is what stops the window re-planning against the
+	 * pre-scroll viewport and unmounting the cell just jumped to - but a backgrounded
+	 * tab suspends rAF entirely, and a release that never fires holds its mount pin
+	 * forever, which is virtualization undone. So the timeout is a backstop, never a
+	 * replacement: whichever settles first wins.
+	 *
+	 * The floor is therefore gated on visibility, not fixed. This app has long
+	 * main-thread frames during a run (it drives its own tween precisely because of
+	 * them), so a tight per-frame floor is reachable on a VISIBLE tab - and a timeout
+	 * that wins there unpins BEFORE `Notebook.svelte`'s rAF-coalesced metrics read
+	 * lands, re-planning against the pre-scroll viewport and unmounting the very cell
+	 * just jumped to. A visible tab gets a floor well past any plausible frame; only a
+	 * hidden one (rAF suspended, the leak this backstop exists for) gets a tight one,
+	 * and a tab whose visibility flips mid-wait re-arms in EITHER direction - widening
+	 * back on return to visible is what stops the tight floor it armed while hidden
+	 * from firing once rAF has resumed but before two real frames have landed.
+	 */
+	const FRAME_TIMEOUT_HIDDEN_MS = 50;
+	const FRAME_TIMEOUT_VISIBLE_MS = 1000;
+	function nextFrames(n = 1): Promise<void> {
+		const hasRaf = typeof requestAnimationFrame === 'function';
+		const doc = typeof document !== 'undefined' ? document : null;
+		return new Promise((resolve) => {
+			let done = false;
+			let timer: ReturnType<typeof setTimeout>;
+			function arm(perFrame: number) {
+				clearTimeout(timer);
+				timer = setTimeout(settle, perFrame * n);
+			}
+			function onVisibility() {
+				// Re-arm in BOTH directions, replacing the pending timer rather than
+				// stacking one: a tab hidden at t=0 armed the tight floor, so returning to
+				// visible must widen it back or that stale short timer fires before two
+				// real frames land - the premature unpin the visible floor exists to stop.
+				arm(doc?.hidden ? FRAME_TIMEOUT_HIDDEN_MS : FRAME_TIMEOUT_VISIBLE_MS);
+			}
+			function settle() {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				doc?.removeEventListener('visibilitychange', onVisibility);
+				resolve();
+			}
+			if (!hasRaf) {
+				arm(16);
+				return;
+			}
+			arm(doc?.hidden ? FRAME_TIMEOUT_HIDDEN_MS : FRAME_TIMEOUT_VISIBLE_MS);
+			doc?.addEventListener('visibilitychange', onVisibility);
+			let left = n;
+			const step = () => (--left > 0 ? requestAnimationFrame(step) : settle());
+			requestAnimationFrame(step);
+		});
+	}
+
 	// The single seam that makes an arbitrary cell reachable for scrolling: reveal
 	// (unfold) any collapsed section hiding it, and PIN it so windowing mounts it
 	// (off-screen cells are spacers, so a `querySelector` would otherwise miss).
 	// Returns the cell's DOM node once it is in the tree, or null if it does not
 	// exist. Virtualization only has to make this ONE primitive mount off-screen
 	// cells; run-follow, jump-to-running, and the find-bar all route through it.
-	// The CALLER is responsible for `unpinScrollTarget(id)` once it has scrolled.
-	async function ensureCellMounted(id: string): Promise<HTMLElement | null> {
+	// The CALLER is responsible for `releaseScrollPin(pin, settled)` once it has
+	// scrolled - which is why the pin it took comes back alongside the node, rather
+	// than being looked up again later (see `pinScrollTarget`). Every scroll-to-cell /
+	// reveal / focus path in the app goes through here (P4), with no exceptions:
+	// jump-to-running, follow-running, the find bar, the shell's outline /
+	// search-result jump (via `jumpToCell`), and - via `selectAndAct` /
+	// `scrollCellIntoView` - keyboard selection, cell moves, paste/undo selection,
+	// `insertAndRunCode`, run-and-advance, run-and-insert-below and split-cell.
+	async function ensureCellMounted(id: string): Promise<MountedCell> {
 		revealCell(id);
-		pinScrollTarget(id);
+		const pin = pinScrollTarget(id);
 		await tick(); // a just-revealed (unfolded) or off-screen (windowed) cell needs its DOM node
 		// Scope the lookup to THIS notebook: cell ids are unique per document, not
 		// across documents, and every open notebook stays mounted (hidden).
-		return (rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null) ?? null;
+		const el =
+			(rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null) ?? null;
+		return { el, pin };
 	}
 
 	// Explicit "jump to running cell": reveal + center this notebook's running
@@ -718,27 +937,36 @@
 	async function revealRunning() {
 		const id = runningId ?? Object.keys(queued)[0] ?? null;
 		if (!id) return;
-		const el = await ensureCellMounted(id);
-		if (el) scrollElementIntoView(el);
-		await tick();
-		unpinScrollTarget(id); // now in the natural window (or already pinned as runningId)
+		const { el, pin } = await ensureCellMounted(id);
+		// The pin is redundant for a still-running cell (`runningId` pins it anyway),
+		// but the queued-head fallback is only pinned while it stays a queued head.
+		releaseScrollPin(pin, el ? scrollElementIntoView(el, { settle: 'frame' }) : Promise.resolve());
 	}
 
-	// The find-in-page navigation seam. `jumpToCell` reveals + mounts the target
-	// (so a windowed-out match still navigates - the crucial virtualization
-	// cooperation), scrolls it into view, and flashes it. `match` is accepted for
-	// a future match-precise scroll + highlight (P4); today the whole cell is
-	// centered + flashed, the report's sanctioned P3 fallback (§5.3). Resolves to
-	// the mounted node (or null if the cell is gone).
-	async function jumpToCell(id: string, _match?: Match): Promise<HTMLElement | null> {
-		const el = await ensureCellMounted(id);
+	// The deliberate "take me to this cell" seam, shared by the find bar and the
+	// shell's outline / sidebar-search rows. Reveals + MOUNTS the target (so a cell
+	// windowed out by virtualization still navigates - the crucial cooperation),
+	// scrolls it into view, and flashes it. `opts.foldKey` addresses one heading
+	// inside a cell that holds several: the heading row is what gets scrolled to,
+	// while the whole cell is what flashes. `opts.match` is accepted for a future
+	// match-precise scroll (the highlight itself is Search P4's overlay). Resolves
+	// to the mounted node (or null if the cell is gone).
+	async function jumpToCell(id: string, opts: JumpOptions = {}): Promise<HTMLElement | null> {
+		const { el, pin } = await ensureCellMounted(id);
 		if (el) {
-			scrollElementIntoView(el);
+			const target =
+				(opts.foldKey &&
+					(el
+						.querySelector(`[data-fold-key="${CSS.escape(opts.foldKey)}"]`)
+						?.closest('[data-testid="heading-row"]') as HTMLElement | null)) ||
+				el;
+			const settled = scrollElementIntoView(target, { settle: 'frame' });
 			el.classList.add('cellar-flash');
 			setTimeout(() => el.classList.remove('cellar-flash'), 1200);
+			releaseScrollPin(pin, settled);
+		} else {
+			releaseScrollPin(pin);
 		}
-		await tick();
-		unpinScrollTarget(id);
 		return el;
 	}
 
@@ -755,15 +983,14 @@
 		// real cell runs - jarring. Leave the user's scroll put. Position-independent:
 		// keyed on the role, not the top, so it holds now the cell can live anywhere.
 		if (isImportsCell(findCell(id))) return;
-		try {
-			// an `add_and_run` cell (or a just-revealed / windowed one) needs its DOM node
-			const el = await ensureCellMounted(id);
-			if (!el || cellIsVisible(el)) return;
-			scrollElementIntoView(el);
-			await tick();
-		} finally {
-			unpinScrollTarget(id);
-		}
+		// an `add_and_run` cell (or a just-revealed / windowed one) needs its DOM node
+		const { el, pin } = await ensureCellMounted(id);
+		// `settle:'visible'` (not `'frame'`): this target is a STREAMING cell, so we
+		// correct only until it is on screen and never chase its growing geometry.
+		releaseScrollPin(
+			pin,
+			el && !cellIsVisible(el) ? scrollElementIntoView(el, { settle: 'visible' }) : Promise.resolve()
+		);
 	}
 
 	// Follow whenever this notebook's running cell changes, and also when the user
@@ -1591,8 +1818,7 @@
 	 */
 	async function insertAndRunCode(source: string) {
 		const created = await insertCellAt(cells.length, { cell_type: 'code', source });
-		await tick();
-		scrollCellIntoView(created.id);
+		await scrollCellIntoView(created.id);
 		await runCell(created.id, source);
 		return created.id;
 	}
@@ -1757,12 +1983,9 @@
 			await selectAndFocus(nextId);
 			return;
 		}
-		setActive(nextId);
-		await tick();
 		// `focus()` lands on the next cell's editor, or on the cell itself when that
 		// cell is rendered markdown (whose editor is display:none and unfocusable).
-		apiOf(nextId)?.focus();
-		scrollCellIntoView(nextId);
+		await selectAndAct(nextId, (api) => api?.focus());
 	}
 
 	// ---- Modal keyboard ------------------------------------------------------
@@ -1775,15 +1998,43 @@
 	// Cells the user can actually select: the ones a folded heading isn't hiding.
 	const selectable = $derived(cells.filter((c) => !folding.hidden.has(c.id)));
 
-	function scrollCellIntoView(id: string | null) {
+	// The ONE mount/reveal/release tail: mount `id` through the shared
+	// `ensureCellMounted` seam so a target windowed out by virtualization mounts
+	// first (it would otherwise be a spacer, i.e. a scroll to nowhere), let the
+	// caller land on it while it is mounted (`land`, see `selectAndAct`), then reveal
+	// it with the smallest movement and drop the transient pin. Two callers:
+	// `selectAndAct` (which delegates its whole tail here, so keyboard selection and
+	// this share one path) and `insertAndRunCode` (no `land`: that path deliberately
+	// never touches `activeId`, so nothing else pins its appended cell).
+	async function scrollCellIntoView(
+		id: string | null,
+		land?: (api: CellRegisterApi | undefined) => void
+	) {
 		if (!id) return;
-		// Scope to this notebook: several notebooks stay mounted (hidden), and a
-		// cell id is only unique *within* a document.
-		const el = rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
-		// Instant for keyboard selection: the smallest movement to reveal the cell,
-		// with no animation lag, is what makes arrow-key nav feel immediate. (The
-		// deliberate run-reframe uses the tween in `scrollElementIntoView`.)
-		el?.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+		const { el, pin } = await ensureCellMounted(id);
+		land?.(cellApis[id]);
+		if (el) scrollElementIntoViewNearest(el);
+		releaseScrollPin(pin);
+	}
+
+	/**
+	 * Select `id`, MOUNT it, then land on it however the caller lands. The one
+	 * mount-then-act seam behind every select-and-focus path; sites differ only in
+	 * `act` - `focusCell` (plain selection), `focus` (the next cell's editor), or
+	 * `enterEdit` (a created cell that must open in edit mode, since a markdown cell
+	 * with text mounts in its rendered view whose editor is `display:none`).
+	 *
+	 * The mount runs BEFORE `act`: under windowing a cell outside the natural window
+	 * has no DOM node and no registered API, so the act (and with it the whole modal
+	 * keyboard, which reads a keystroke's mode off the focused element) would
+	 * silently go nowhere. It also subsumes the `tick()` these paths used to await
+	 * for a just-created cell to register. Selection is set FIRST, then the mount /
+	 * land / reveal / release tail is `scrollCellIntoView`'s - one path, not two.
+	 */
+	async function selectAndAct(id: string | null, act: (api: CellRegisterApi | undefined) => void) {
+		if (!id) return;
+		setActive(id);
+		await scrollCellIntoView(id, act);
 	}
 
 	/**
@@ -1791,14 +2042,10 @@
 	 * a keystroke's mode and its target from the focused element, so a selection the
 	 * focus doesn't follow is a selection the next keystroke doesn't act on: the
 	 * next key would instead reach whatever button or rendered cell the user last
-	 * clicked. Awaits `tick()` so a just-created cell has registered its API.
+	 * clicked.
 	 */
 	async function selectAndFocus(id: string | null) {
-		if (!id) return;
-		setActive(id);
-		await tick();
-		cellApis[id]?.focusCell();
-		scrollCellIntoView(id);
+		await selectAndAct(id, (api) => api?.focusCell());
 	}
 
 	function selectRelative(delta: number) {
@@ -1840,8 +2087,7 @@
 		const id = activeId;
 		if (!id) return;
 		moveCell(id, dir);
-		await tick();
-		if (mode === 'edit') apiOf(id)?.focus();
+		if (mode === 'edit') await selectAndAct(id, (api) => api?.focus());
 		else await selectAndFocus(id);
 	}
 
@@ -1852,10 +2098,7 @@
 		if (!id) return;
 		apiOf(id)?.run(false); // fire; the insert shouldn't wait for the kernel
 		const created = await addCell(id);
-		setActive(created.id);
-		await tick();
-		cellApis[created.id]?.enterEdit();
-		scrollCellIntoView(created.id);
+		await selectAndAct(created.id, (api) => api?.enterEdit());
 	}
 
 	// Ctrl+Shift+-: split the focused cell at the cursor. The text above the cursor
@@ -1871,12 +2114,9 @@
 		api.replaceSource(source.slice(0, at));
 		await editCell(id, source.slice(0, at));
 		const created = await addCell(id, cell.cell_type, source.slice(at));
-		setActive(created.id);
-		await tick();
 		// `enterEdit`, not `focus`: a markdown cell created with text mounts in its
 		// rendered view, whose editor is `display:none` and cannot take the caret.
-		cellApis[created.id]?.enterEdit();
-		scrollCellIntoView(created.id);
+		await selectAndAct(created.id, (api) => api?.enterEdit());
 	}
 
 	// 1-6: make the selected cell a markdown heading of that level, converting a
