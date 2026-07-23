@@ -526,6 +526,9 @@
 		logoutNote = '';
 		logoutWarning = '';
 		logoutError = null;
+		// An armed confirm belongs to the selection it was armed on: changing the
+		// selection disarms it rather than leaving a primed global sign-out behind.
+		confirmLogout = false;
 	}
 
 	function pickProfile(name: string) {
@@ -579,6 +582,11 @@
 	// An INCOMPLETE sign-out is not a quieter success: the cached token may still be
 	// on disk, so it gets its own warning-toned line rather than the confirmation.
 	let logoutWarning = $state('');
+	// Log out is the most destructive control in the panel - it signs out EVERYWHERE
+	// and disconnects every notebook app-wide - and it sits right below the everyday
+	// Disconnect, so a misclick on the common action must not land on the rare one.
+	// Two-step inline confirm, the same idiom as the kernel wipe / checkpoint restore.
+	let confirmLogout = $state(false);
 
 	async function connect(cluster: DbxCluster) {
 		if (busy) return;
@@ -681,7 +689,7 @@
 			await loadStatus();
 			onSessionChange?.();
 			if (out.incomplete) {
-				logoutWarning = `Sign-out may be incomplete: ${out.incompleteReason ?? 'part of it could not be verified'}. Your saved sign-in may still be usable - check and try again.`;
+				logoutWarning = `Sign-out may be incomplete: ${out.incompleteReason ?? 'part of it could not be verified'}. Your saved sign-in may still be usable - try again, or remove the cached sign-in yourself from ~/.config/databricks-sdk-py/oauth/.`;
 			} else {
 				logoutNote = out.clearedTokens
 					? "Signed out everywhere. Cellar's saved Databricks sign-ins were cleared and every notebook was disconnected - the next connect signs in again."
@@ -693,6 +701,9 @@
 			logoutError = toDbxError(err);
 		} finally {
 			busy = '';
+			// Disarm on BOTH outcomes: a failed sign-out must be re-armed deliberately,
+			// never left one stray click from firing again.
+			confirmLogout = false;
 		}
 	}
 
@@ -949,21 +960,52 @@
 <!-- Sign out of Databricks. Deliberately QUIETER than Disconnect: Disconnect is the
      everyday outlined action that ends the session, this is the rarer one that also
      drops the saved sign-in. Shown whenever there is a sign-in to clear, and always
-     while connected (where it ends the session too). The title names the blast
-     radius - this signs out EVERYWHERE, not just for the current selection. -->
+     while connected (where it ends the session too). It is also the panel's most
+     destructive control and sits right below Disconnect, so it takes a two-step
+     inline confirm whose copy names the blast radius: this signs out EVERYWHERE and
+     disconnects every notebook, not just the selection this panel is showing. -->
 {#snippet logoutRow(always: boolean)}
 	{#if always || cellarSignedIn}
-		<div class="mt-1.5 flex justify-end">
-			<button
-				class="btn btn-ghost btn-xs h-5 min-h-0 px-1 text-[11px] font-normal text-base-content/50 hover:text-error"
-				onclick={logoutDatabricks}
-				disabled={!!busy || runtimeApplying}
-				title="Sign out of Databricks everywhere - clears the saved sign-ins and disconnects every notebook; you'll need to sign in again"
-				data-testid="databricks-logout"
+		{#if confirmLogout}
+			<div
+				class="mt-1.5 rounded border border-warning/40 bg-warning/10 px-2 py-1.5"
+				data-testid="databricks-logout-confirm-box"
 			>
-				{#if busy === 'logout'}<span class="loading loading-spinner loading-xs"></span>Signing out…{:else}Log out{/if}
-			</button>
-		</div>
+				<p class="text-[11px] leading-relaxed text-base-content/80">
+					Sign out of Databricks everywhere? This clears every saved sign-in and disconnects every
+					notebook's Spark session app-wide - reconnecting can take minutes on a cold cluster.
+				</p>
+				<div class="mt-1.5 flex justify-end gap-1">
+					<button
+						class="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[11px] font-normal text-base-content/60"
+						onclick={() => (confirmLogout = false)}
+						data-testid="databricks-logout-cancel"
+					>
+						Cancel
+					</button>
+					<button
+						class="btn btn-warning btn-xs h-5 min-h-0 px-1.5 text-[11px]"
+						onclick={logoutDatabricks}
+						disabled={!!busy || runtimeApplying}
+						data-testid="databricks-logout-confirm"
+					>
+						{#if busy === 'logout'}<span class="loading loading-spinner loading-xs"></span>Signing out…{:else}Sign out everywhere{/if}
+					</button>
+				</div>
+			</div>
+		{:else}
+			<div class="mt-1.5 flex justify-end">
+				<button
+					class="btn btn-ghost btn-xs h-5 min-h-0 px-1 text-[11px] font-normal text-base-content/50 hover:text-error"
+					onclick={() => (confirmLogout = true)}
+					disabled={!!busy || runtimeApplying}
+					title="Sign out of Databricks everywhere - clears the saved sign-ins and disconnects every notebook; you'll need to sign in again"
+					data-testid="databricks-logout"
+				>
+					Log out
+				</button>
+			</div>
+		{/if}
 	{/if}
 	<!-- The outcome is NOT gated on the button still being shown: a successful log out
 	     is exactly what makes `cellarSignedIn` false, and the confirmation has to

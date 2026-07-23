@@ -14,8 +14,9 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  * connect has to authenticate again. What that means per auth mode is the thing
  * this spec pins in the UI:
  *
- *   - connected                    → Log out is offered next to Disconnect, and
- *                                    taking it returns the panel to the connect form
+ *   - connected                    → Log out is offered next to Disconnect, takes a
+ *                                    two-step confirm (arming alone signs nothing
+ *                                    out), and returns the panel to the connect form
  *                                    with an explicit confirmation that names the
  *                                    blast radius (it signs out EVERYWHERE).
  *   - disconnected, PAT profile    → no Log out: the credential lives in
@@ -101,6 +102,18 @@ async function mockDatabricksClusters(page: Page): Promise<void> {
 			})
 		});
 	});
+}
+
+/**
+ * Drive the two-step confirm. Log out is the panel's most destructive control - it
+ * signs out EVERYWHERE and disconnects every notebook - and it sits directly below
+ * the everyday Disconnect, so nothing fires until the second, explicit click.
+ */
+async function logOut(page: Page): Promise<void> {
+	await page.getByTestId('databricks-logout').click();
+	const confirm = page.getByTestId('databricks-logout-confirm');
+	await expect(confirm).toBeVisible();
+	await confirm.click();
 }
 
 async function openNotebook(page: Page): Promise<void> {
@@ -196,6 +209,17 @@ test('connected: Log out sits beside Disconnect, ends the session and returns to
 	await page.screenshot({ path: join(EVIDENCE_DIR, 'databricks-logout-connected.png') });
 
 	await logout.click();
+	// The confirm has to state the blast radius plainly - a tooltip is not a
+	// confirmation, and "Disconnect" one row up looks almost the same.
+	const confirmBox = page.getByTestId('databricks-logout-confirm-box');
+	await expect(confirmBox).toBeVisible();
+	await expect(confirmBox).toContainText(/everywhere/i);
+	// `\s+` because the copy wraps in the markup - the rendered text carries the
+	// source newline, and the point of the assertion is the words, not the layout.
+	await expect(confirmBox).toContainText(/every\s+notebook/i);
+	await expect(confirmBox).toContainText(/cold cluster/i);
+	await page.screenshot({ path: join(EVIDENCE_DIR, 'databricks-logout-confirm.png') });
+	await page.getByTestId('databricks-logout-confirm').click();
 
 	// It targets the notebook AND carries the current selection, so a selection this
 	// server never recorded a sign-in for is still purged.
@@ -215,6 +239,35 @@ test('connected: Log out sits beside Disconnect, ends the session and returns to
 	await expect(page.getByTestId('databricks-logout-warning')).toHaveCount(0);
 
 	await page.screenshot({ path: join(EVIDENCE_DIR, 'databricks-logout-after.png') });
+});
+
+test('arming alone signs nothing out, and cancelling leaves the session intact', async ({ page }) => {
+	await mockDatabricksStatus(page, connectedStatus);
+	await mockDatabricksClusters(page);
+
+	let posted = 0;
+	await page.route(/\/api\/databricks\/logout$/, async (route) => {
+		posted += 1;
+		await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+	});
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+	await expect(page.getByTestId('databricks-connected')).toBeVisible();
+
+	// One click ARMS. It must not sign out: this control is a misclick away from
+	// Disconnect, and its blast radius is every notebook in the app.
+	await page.getByTestId('databricks-logout').click();
+	await expect(page.getByTestId('databricks-logout-confirm')).toBeVisible();
+	expect(posted).toBe(0);
+
+	// Cancelling disarms and changes nothing - still connected, still never posted.
+	await page.getByTestId('databricks-logout-cancel').click();
+	await expect(page.getByTestId('databricks-logout-confirm')).toHaveCount(0);
+	await expect(page.getByTestId('databricks-logout')).toBeVisible();
+	await expect(page.getByTestId('databricks-connected')).toBeVisible();
+	expect(posted).toBe(0);
 });
 
 test('an INCOMPLETE sign-out warns instead of confirming - the cached token may have survived', async ({ page }) => {
@@ -243,7 +296,7 @@ test('an INCOMPLETE sign-out warns instead of confirming - the cached token may 
 	await openNotebook(page);
 	await openDatabricksSection(page);
 	await page.getByTestId('databricks-host').fill(HOST);
-	await page.getByTestId('databricks-logout').click();
+	await logOut(page);
 
 	// Never the ordinary confirmation: reported as clean, a surviving token would
 	// make the next "Sign in" a silent cache hit for a user who believes they left.
@@ -303,7 +356,7 @@ test('disconnected but signed in to a bare host: Log out IS offered, and its not
 	await page.screenshot({ path: join(EVIDENCE_DIR, 'databricks-logout-signed-in-host.png') });
 
 	// The confirmation deliberately outlives the card swap a log out causes...
-	await page.getByTestId('databricks-logout').click();
+	await logOut(page);
 	await expect(page.getByTestId('databricks-logout-note')).toBeVisible();
 
 	// ...but it describes ONE selection, so typing a different host must drop it -

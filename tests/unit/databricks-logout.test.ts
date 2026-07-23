@@ -365,6 +365,41 @@ describe('an incomplete sign-out is never reported as a clean one', () => {
 		expect(result.clearedSignIns).toBe(0);
 	});
 
+	/**
+	 * A recorded sign-in whose profile has since been deleted or renamed in
+	 * `~/.databrickscfg`. Without the profile the purge cannot derive WHICH cache
+	 * entry holds that token, so it may still be on disk - which makes this a failed
+	 * purge, not a clean skip. Reported as such, and its gate is kept: dropping it
+	 * silently is the same cleared-gate-over-a-surviving-token trap as any other
+	 * unproven purge, and the reason has to point at the cache so the user can finish
+	 * the job by hand.
+	 */
+	it('a signed-in profile that VANISHED from the config keeps its gate and reports incomplete', async () => {
+		await signIn({ profile: 'browser' });
+		const configBefore = readFileSync(cfgPath, 'utf8');
+		try {
+			// The user renamed the profile between signing in and signing out.
+			writeFileSync(cfgPath, configBefore.replace('[browser]', '[browser-renamed]'));
+
+			const result = await dbx.logout();
+
+			expect(result.purgeFailed).toBe(1);
+			expect(result.clearedTokens).toBe(0);
+			expect(result.incomplete).toBe(true);
+			expect(result.incompleteReason).toMatch(/is not in/i);
+			// Actionable, not a dead end: name where the token would be.
+			expect(result.incompleteReason).toMatch(/databricks-sdk-py\/oauth/);
+			// The gate SURVIVES - it is the only thing still telling the user (and
+			// `assertSignedIn`) that a usable credential may be cached.
+			expect(result.clearedSignIns).toBe(0);
+			useStub();
+			const status = await dbx.getStatus();
+			expect(status.signedInProfiles).toContain('browser');
+		} finally {
+			writeFileSync(cfgPath, configBefore);
+		}
+	});
+
 	it('a clean purge DOES clear the gate and reports no incompleteness', async () => {
 		await signIn({ host: HOST_SIGNED_IN });
 

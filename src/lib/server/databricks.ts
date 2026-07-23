@@ -1109,6 +1109,15 @@ export function hasCellarCachedOAuth(auth: Auth): boolean {
 	return auth.mode === 'oauth' || auth.needsSignIn;
 }
 
+/**
+ * Where the SDK keeps the python-local OAuth token cache Cellar's browser sign-in
+ * mints into. Named in every incomplete-sign-out reason on purpose: when neither
+ * the derived cache keys nor the claim-matching scan can find a selection's token,
+ * keeping the sign-in gate is correct but leaves the user with a warning they can
+ * never clear - so the reason has to say where to look to finish the job by hand.
+ */
+const OAUTH_CACHE_DIR = '~/.config/databricks-sdk-py/oauth/';
+
 /** The `logout` probe op's payload - what the purge found, deleted, and could not delete. */
 interface LogoutProbe {
 	/** Basenames of the cache files actually removed. */
@@ -1231,8 +1240,27 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 		let auth: Auth;
 		try {
 			auth = resolveAuth(target.sel);
-		} catch {
-			continue; // a profile that has since vanished from the config file
+		} catch (err) {
+			// A selection that no longer resolves - in practice a profile deleted or
+			// renamed in `~/.databrickscfg` since we signed in. For a RECORDED sign-in
+			// that is NOT a clean skip: without the profile we cannot derive which cache
+			// entry is its token, so the token may well still be on disk. Skipping it
+			// silently would clear its gate anyway and report a clean sign-out - the
+			// cleared-gate-over-a-surviving-token state step 3 exists to prevent - so it
+			// goes through the same unresolved/incomplete path as any other failed purge.
+			if (!target.recorded) continue;
+			const missingKey = target.sel.profile ? `p:${target.sel.profile}` : `h:${target.sel.host}`;
+			if (seen.has(missingKey)) continue;
+			seen.add(missingKey);
+			const missingLabel = target.sel.profile ? `profile "${target.sel.profile}"` : String(target.sel.host);
+			const message = err instanceof Error ? err.message : String(err);
+			purgeFailed += 1;
+			unresolved.add(missingKey);
+			purgeFailures.push(
+				`${missingLabel}: ${message}, so its cached token could not be identified - look in ${OAUTH_CACHE_DIR}`
+			);
+			logWarn('databricks', `logout: could not resolve the signed-in selection ${missingKey}: ${message}`);
+			continue;
 		}
 		const key = auth.mode === 'oauth' ? `h:${auth.host}` : `p:${auth.profile}`;
 		if (seen.has(key)) continue;
@@ -1285,7 +1313,7 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 	if (purgeFailed) reasons.push(`the saved sign-in could not be cleared (${purgeFailures[0]})`);
 	if (purgeMissed) {
 		reasons.push(
-			`no cached sign-in was found to delete for ${purgeMissed} signed-in workspace${purgeMissed === 1 ? '' : 's'}, so a token may still be on disk`
+			`no cached sign-in was found to delete for ${purgeMissed} signed-in workspace${purgeMissed === 1 ? '' : 's'}, so a token may still be on disk - look in ${OAUTH_CACHE_DIR}`
 		);
 	}
 	if (sessionFailures.length) {
