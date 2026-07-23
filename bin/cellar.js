@@ -113,6 +113,7 @@ import {
 	scanUntrackedCellarProcesses,
 	isIsolatedEnv
 } from '../src/lib/server/instances.js';
+import { buildFreshness, stalenessReason, SKIP_ENV } from '../src/lib/server/build-freshness.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -298,6 +299,12 @@ process.on('exit', () => {
 	} catch {}
 });
 
+// Known TOCTOU: the probe socket is closed before the returned port is handed to
+// the app's real listen(), so the port is briefly unclaimed. Per-run instances use
+// mkdtemp workspaces + dynamic ports, so collisions are near-impossible in practice;
+// e2e runs at workers:2 (do NOT drop below 2). If a port-collision flake ever
+// surfaces here, harden by holding the probe socket open until the child has bound,
+// or by retrying the launch on EADDRINUSE — not by serializing the suite.
 function freePort() {
 	return new Promise((resolvePort, reject) => {
 		const srv = createServer();
@@ -565,8 +572,43 @@ async function cleanupCommand(flags) {
 	return 0;
 }
 
+/**
+ * Refuse to launch on an unusable production build, BEFORE any slow toolchain
+ * work (venv resolve/create, host venv, Jupyter sidecar) — a build we will not
+ * serve should not cost a boot.
+ *
+ * A MISSING build was always caught here. A STALE one was not: it passed
+ * silently and served OLD server code against NEW source, so `cellar` (and every
+ * e2e spec, which boots this launcher without `--dev`) could validate code that
+ * was never compiled. See src/lib/server/build-freshness.js.
+ *
+ * Returns true when the build is usable; otherwise it has already shut down.
+ */
+function assertUsableBuild() {
+	if (useDev) return true;
+	const freshness = buildFreshness(REPO);
+	if (freshness.state === 'missing') {
+		console.error(`[cellar] production build not found at ${freshness.buildEntry}.`);
+		console.error('[cellar] Run `npm run build` first, or pass --dev to use the Vite dev server.');
+		shutdown(1, 'production build missing');
+		return false;
+	}
+	if (freshness.state === 'stale' && !process.env[SKIP_ENV]) {
+		console.error(`[cellar] production build is STALE: ${stalenessReason(REPO, freshness)}.`);
+		console.error('[cellar] Serving it would run OLD code against your current sources.');
+		console.error(
+			`[cellar] Run \`npm run build\` (or \`make build\`), pass --dev for the Vite dev server, or set ${SKIP_ENV}=1 to override.`
+		);
+		shutdown(1, 'production build stale');
+		return false;
+	}
+	return true;
+}
+
 async function main() {
 	console.log(`[cellar] workspace: ${WORKSPACE}`);
+
+	if (!assertUsableBuild()) return;
 
 	// 0) Single-instance-per-folder + reap (unless --new/--force). The complaint
 	//    this fixes: old cellar servers pile up (launcher crashed → orphaned app
@@ -786,13 +828,8 @@ async function main() {
 			{ cwd: REPO, env, stdio: 'inherit' }
 		);
 	} else {
+		// Validated up front by assertUsableBuild() — missing/stale never gets here.
 		const buildEntry = join(REPO, 'build', 'index.js');
-		if (!existsSync(buildEntry)) {
-			console.error(`[cellar] production build not found at ${buildEntry}.`);
-			console.error('[cellar] Run `npm run build` first, or pass --dev to use the Vite dev server.');
-			shutdown(1, 'production build missing');
-			return;
-		}
 		app = spawn('node', [buildEntry], { cwd: REPO, env, stdio: 'inherit' });
 	}
 	children.push(app);

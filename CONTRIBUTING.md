@@ -62,6 +62,21 @@ npx playwright install chromium   # once
 npm run test:e2e
 ```
 
+`npm run test:e2e` **builds first** (the `pretest:e2e` hook, `scripts/ensure-build.js`)
+and rebuilds only when `build/` is older than `src/`, so a re-run against an
+already-fresh build pays nothing. This matters: the specs boot the real launcher
+*without* `--dev`, so they run the production build - and a stale one used to be
+served silently, testing code that was never compiled. That produced 11 false
+failures burning ~18 minutes of expect-timeouts on results that were meaningless
+in both directions. The launcher now refuses a stale build outright
+(`src/lib/server/build-freshness.js`; `CELLAR_SKIP_BUILD_CHECK=1` overrides).
+
+The suite runs at **`workers: 2`** locally (`playwright.config.ts`) - ~2.5 min
+instead of ~6, verified green across repeated full runs. `fullyParallel` stays
+`false` (tests within a file share one launcher, workspace and kernel). Don't
+raise workers past 2: 4 was no faster and broke four timing-sensitive real-kernel
+specs.
+
 ## Conventions
 
 - **Commit messages** follow [Conventional Commits](https://www.conventionalcommits.org/):

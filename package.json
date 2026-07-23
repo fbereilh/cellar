@@ -16,6 +16,7 @@
     "build/",
     "bin/",
     "src/lib/server/venv.js",
+    "src/lib/server/build-freshness.js",
     "src/lib/server/runtime.js",
     "src/lib/server/mcp-bridge.js",
     "src/lib/server/selfupdate.js",
@@ -36,6 +37,7 @@
     "changelog": "bash scripts/gen-changelog.sh",
     "test": "vitest run",
     "test:watch": "vitest",
+    "pretest:e2e": "node scripts/ensure-build.js",
     "test:e2e": "playwright test",
     "prepack": "npm run build",
     "prepublishOnly": "npm run build"

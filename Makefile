@@ -48,6 +48,8 @@ update: ## Pull latest, reinstall deps, and rebuild
 	@echo "==> Updated. The linked 'cellar' command now serves the new version."
 
 run: ## Run cellar in the current directory
+	@echo "==> Ensuring the production build is up to date (rebuilds only when stale)"
+	node scripts/ensure-build.js
 	@echo "==> Starting cellar in $(CURDIR)"
 	node bin/cellar.js
 

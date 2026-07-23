@@ -18,8 +18,20 @@ export default defineConfig({
 	// Kernel boot + cell execution is inherently slower than a pure-web test.
 	timeout: 120_000,
 	expect: { timeout: 30_000 },
+	// Keep `fullyParallel: false`: tests INSIDE a file share one booted launcher, one
+	// workspace and one kernel, so they must stay ordered. `workers` is file-level
+	// concurrency, which IS safe here — every spec gets its own mkdtemp workspace,
+	// its own dynamically-allocated ports, and passes `--new` (so concurrent
+	// launchers never reap each other).
+	//
+	// 2, not more: the serial suite used under one core of fifteen, and 2 cuts it
+	// ~2.5x (369s -> 142-201s) green across repeated full runs. 4 was NOT faster
+	// (the makespan is bound by a few long spec files) and broke four
+	// timing-sensitive real-kernel specs. Do not raise it without first splitting
+	// those into their own workers:1 project. See
+	// data/cellar-test-timing-scout-t7/report.md.
 	fullyParallel: false,
-	workers: 1,
+	workers: process.env.CI ? 1 : 2,
 	retries: 0,
 	reporter: [['list']],
 	use: {
