@@ -77,6 +77,24 @@ node bin/cellar.js --dev                      # Vite dev server (hot reload)
 
 `make run` / `make dev` are the same two commands.
 
+## Uninstall (from a clone)
+
+Drop the linked command, then delete the clone:
+
+```sh
+npm uninstall -g cellar   # removes the `cellar` symlink `npm link` created
+cd .. && rm -rf cellar    # the clone itself
+```
+
+Cellar's cached data lives outside the clone, in `~/.cellar` - the Jupyter
+host-venv (`~/.cellar/host-venv`, often hundreds of MB) and the instance registry
+(`~/.cellar/instances/`). Both are optional to delete (`rm -rf ~/.cellar`); Cellar
+recreates them on the next run. Your projects are untouched: their `.venv`
+folders, notebooks, and per-project `.cellar/` directories all stay put.
+
+Installed with Homebrew instead? See the
+[README's Uninstall section](../README.md#uninstall).
+
 ## Kernel / venv resolution
 
 Cellar binds the kernel to **your project's** interpreter, not a global one. On

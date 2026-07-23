@@ -88,6 +88,8 @@ brew untap fbereilh/cellar
 
 > **What's in `~/.cellar`?** Cellar's private Jupyter host env (`~/.cellar/host-venv`, which holds `jupyter-server` and is often hundreds of MB) and its instance registry (`~/.cellar/instances/`). Both are optional to delete - Cellar recreates them on the next run. Your projects' own `.venv` folders and notebooks live in your project directories and are never touched.
 
+Installed from a git clone instead? See **[docs/SETUP.md](docs/SETUP.md#uninstall-from-a-clone)**. Ran it with Docker? Nothing was installed on the host - `docker rmi cellar` removes the image you built.
+
 ## Run with Docker
 
 Prefer to skip installing anything? If you have Docker, you have Cellar. This path needs **only Docker on the host** - no Node, Python, or `uv` - and bakes a **reproducible, pinned kernel environment** into the image so every run is identical. It's meant for single-user, reproducible, zero-prerequisite use: Cellar has one shared kernel and no auth, so it is **not** for multi-user hosting.
