@@ -17,7 +17,7 @@ import {
 	addCell,
 	setSource,
 	setCellType,
-	deleteCell,
+	deleteCells,
 	moveCellTo,
 	setVisibility,
 	getHeaderNumbering,
@@ -1266,19 +1266,89 @@ export async function editCell(id: string, source: string, { routeImports: route
 	return { ok: true, id: handleFor(nb, id), ...(imports ? { imports } : {}) };
 }
 
-export function removeCell(id: string, nb?: string | null) {
+/**
+ * MCP `delete_cells`: remove one or several cells in ONE call. A batch is not
+ * sugar — an agent pivoting off a dead end deletes eight cells, and one call per
+ * cell is eight round-trips, eight persists, and eight SSE fan-outs for what is
+ * one edit in the user's head.
+ *
+ * All-or-nothing on ADDRESSING: every ref is resolved before anything is
+ * deleted, so a typo in the fifth handle cannot leave the first four gone (the
+ * boundary in server.ts resolves refs and rejects an unknown/ambiguous one, and
+ * this re-checks each cell exists). Duplicates collapse. ONE pre-action
+ * checkpoint covers the whole batch, so the human's undo restores the notebook
+ * as it was before the pivot rather than after seven eighths of it, and
+ * `deleteCells` makes the removal ONE document write rather than one per cell.
+ */
+export function removeCells(ids: string[], nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
-	id = asFullId(target, id);
-	if (!getCell(id, target)) return false;
+	const full: string[] = [];
+	const seen = new Set<string>();
+	for (const ref of ids) {
+		const id = asFullId(target, ref);
+		if (seen.has(id)) continue;
+		if (!getCell(id, target)) return { ok: false as const, missing: ref };
+		seen.add(id);
+		full.push(id);
+	}
+	if (!full.length) return { ok: false as const, missing: null };
+	// Handles are prefixes of the CURRENT cell set, so read them before deleting.
+	const toHandle = handleFn(target);
+	const deleted = full.map(toHandle);
 	autoCheckpointBeforeAgentAction(target);
-	deleteCell(id, target);
-	return true;
+	deleteCells(full, target);
+	return { ok: true as const, deleted, count: deleted.length };
 }
 
-export function moveCell(id: string, pos: number, nb?: string | null) {
+/** Where a `move_cell` lands: beside another cell (a handle, like every other
+ *  tool takes) or at an absolute index. */
+export type MoveDest = { position?: number | null; beforeId?: string | null; afterId?: string | null };
+
+/**
+ * Resolve a move destination to the index `moveCellTo` wants — which is the
+ * index the cell ends up at, i.e. counted in the array AFTER the cell has been
+ * lifted out. So an anchor sitting BELOW the moved cell shifts up by one; that
+ * off-by-one is the whole reason this is a named function and not inline
+ * arithmetic at the call site.
+ */
+function destIndex(nb: string, cells: CellView[], from: number, dest: MoveDest): number | { error: 'unknown_anchor' | 'same_cell' | 'no_destination' } {
+	const anchor = dest.beforeId ?? dest.afterId;
+	if (anchor != null) {
+		// Accept a handle here too, so the ids this layer EMITS can be fed straight
+		// back in (the same symmetry every other id argument has). The MCP boundary
+		// has already resolved it; a direct caller need not.
+		const full = asFullId(nb, anchor);
+		const i = cells.findIndex((c) => c.id === full);
+		if (i < 0) return { error: 'unknown_anchor' };
+		if (i === from) return { error: 'same_cell' };
+		const shifted = i > from ? i - 1 : i;
+		return dest.beforeId != null ? shifted : shifted + 1;
+	}
+	if (typeof dest.position === 'number' && Number.isInteger(dest.position)) return Math.max(0, dest.position);
+	return { error: 'no_destination' };
+}
+
+/**
+ * MCP `move_cell`. The cell to move AND its destination are both addressed by
+ * HANDLE (`before_id` / `after_id`) — an absolute `position` still works, but it
+ * was the only destination the tool used to accept, which forced an agent to
+ * fetch the whole notebook map just to learn an index for a move it could
+ * already name ("put this after that"). Reports the resulting `index` so the
+ * caller never has to re-read the map to confirm where the cell landed.
+ */
+export function moveCell(id: string, dest: MoveDest, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
+	const full = asFullId(target, id);
+	const cells = listCells(target);
+	const from = cells.findIndex((c) => c.id === full);
+	if (from < 0) return { ok: false as const, error: 'not_found' as const };
+	const to = destIndex(target, cells, from, dest);
+	if (typeof to !== 'number') return { ok: false as const, error: to.error };
 	autoCheckpointBeforeAgentAction(target);
-	return moveCellTo(asFullId(target, id), pos, target);
+	if (!moveCellTo(full, to, target)) return { ok: false as const, error: 'not_found' as const };
+	// The authoritative landing spot, read back from the document rather than
+	// assumed from the requested index (which `moveCellTo` clamps).
+	return { ok: true as const, id: handleFor(target, full), index: listCells(target).findIndex((c) => c.id === full) };
 }
 
 export function setType(id: string, type: LogicalCellType, nb?: string | null) {
