@@ -193,7 +193,12 @@ describe('line-level git decorations are size-gated', () => {
 		expect(gitSpawnLog().length).toBe(SPAWN_LOG_MAX);
 		// Trimmed from the front: a measurement asks what ran most recently.
 		expect(gitSpawnLog().at(-1)).toBe('show');
-	});
+		// This loop spawns SPAWN_LOG_MAX+1 real `git show` subprocesses in
+		// sequence; under the full suite's parallel load that runs past the 5s
+		// default. A generous timeout keeps it INSIDE its own test boundary — a
+		// timeout would let the loop keep running into the next tests, mutating the
+		// module-global spawn log they assert on.
+	}, 60000);
 
 	/**
 	 * The shape this ceiling exists for is a GENERATED `report.html`, which is
