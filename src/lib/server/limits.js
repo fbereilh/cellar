@@ -2,11 +2,14 @@
  * Cellar — the size ceilings a workspace file must clear to be OPENED in a tab
  * and SAVED back again, in ONE place so the two can never drift apart.
  *
- * They are a pair, not two independent knobs: a file the read cap admits into an
- * editable Source view must also fit through the request body the save PUTs back,
- * or the tab offers an edit it can never persist. That is why the transport limit
- * is DERIVED from the file cap here rather than typed as a literal in the
- * launcher (see `MAX_REQUEST_BODY_BYTES`).
+ * They are a pair, not two independent knobs: the reader and the writer enforce
+ * the SAME per-path ceiling, so a save can never land bytes the reader would
+ * later refuse to reopen.
+ *
+ * The third limit in that story - how big a save REQUEST BODY may be - is
+ * adapter-node's app-wide `BODY_SIZE_LIMIT` and deliberately does NOT live here:
+ * Cellar does not raise it (see `$lib/saveLimit.ts`), it makes an over-threshold
+ * document read-only instead.
  *
  * Node builtins only — in fact no imports at all — so this is importable both by
  * the launcher (`../src/lib/server/limits.js`, plain node, no bundler) and by the
@@ -29,17 +32,3 @@ export const MAX_FILE_BYTES = 2 * 1024 * 1024;
  * browser tab full of string.
  */
 export const MAX_HTML_FILE_BYTES = 15 * 1024 * 1024;
-
-/**
- * Ceiling for a request body, handed to adapter-node as `BODY_SIZE_LIMIT` (whose
- * own default, 512 K, rejects a save of anything past a fraction of the caps
- * above — before the route handler ever runs).
- *
- * Derived from the largest openable file with headroom, because the save PUTs
- * `JSON.stringify({path, content})`: string escaping expands the content (every
- * `"`, `\` and newline becomes two bytes — HTML is full of all three), and the
- * `path` field plus framing ride along. 2× covers that realistic worst case; a
- * limit set to the file cap exactly would refuse a file that only just fits it,
- * recreating the very defect this pairing exists to close.
- */
-export const MAX_REQUEST_BODY_BYTES = MAX_HTML_FILE_BYTES * 2 + 64 * 1024;

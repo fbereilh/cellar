@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isHtmlPath, hasRelativeAssetRefs } from '../../src/lib/htmlPreview';
+import { saveBodyBytes, saveFitsTransport, DEFAULT_BODY_SIZE_LIMIT } from '../../src/lib/saveLimit';
 import { iconKind } from '../../src/lib/fileIcons';
 
 const REPO = join(fileURLToPath(import.meta.url), '../../..');
@@ -348,37 +349,82 @@ describe('readWorkspaceFile size caps', () => {
 });
 
 /**
- * The read cap and the save cap are one pair: a file big enough to OPEN in an
- * editable Source view must fit through the request body the save PUTs back, or
- * the tab offers an edit it can never persist. adapter-node's own default
- * (512 K) rejects that body before the route handler runs, so the failure is not
- * even ours to report — hence both halves below: the launcher must raise the
- * limit, and the tab must say so when a save is refused anyway.
+ * The read cap admits far more than a save request body may carry, and that body
+ * limit (adapter-node's `BODY_SIZE_LIMIT`) is app-wide - read once at module
+ * load and applied upstream of every route, so it cannot be relaxed for the save
+ * endpoint alone. Cellar therefore does NOT raise it: an over-threshold document
+ * opens read-only and says so, and the 413 surfacing stays as the backstop for a
+ * document edited past the line after it loaded.
  */
-describe('save path keeps up with the raised read cap', () => {
-	it('derives the request-body limit from the HTML file cap, with headroom', async () => {
-		const { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES, MAX_REQUEST_BODY_BYTES } = await import(
+describe('save transport limit', () => {
+	it('keeps the HTML read cap above the ordinary one - reading is untouched', async () => {
+		const { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES } = await import(
 			'../../src/lib/server/limits.js'
 		);
 		expect(MAX_HTML_FILE_BYTES).toBeGreaterThan(MAX_FILE_BYTES);
-		// Strictly larger, not equal: `JSON.stringify({path, content})` escapes the
-		// content and carries the path, so a body is always bigger than its file.
-		expect(MAX_REQUEST_BODY_BYTES).toBeGreaterThan(MAX_HTML_FILE_BYTES);
-		// Bounded, not blown open: headroom for escaping, not an open door.
-		expect(MAX_REQUEST_BODY_BYTES).toBeLessThanOrEqual(MAX_HTML_FILE_BYTES * 3);
-		// And above adapter-node's 512 K default, which is what makes this necessary.
-		expect(MAX_REQUEST_BODY_BYTES).toBeGreaterThan(512 * 1024);
 	});
 
-	// Source-level, like the sandbox guard: the launcher is what ships the limit,
-	// and a literal typed here instead of the derived constant is exactly how the
-	// two caps would silently drift apart again.
-	it('the launcher passes that derived limit to the app, respecting an operator value', () => {
+	// Source-level, like the sandbox guard: raising an app-wide body ceiling is
+	// exactly the kind of change that reads as innocuous in a diff.
+	it('the launcher never raises the app-wide body limit', () => {
 		const src = readFileSync(join(REPO, 'bin/cellar.js'), 'utf8');
-		expect(src).toContain("from '../src/lib/server/limits.js'");
-		expect(src).toMatch(
-			/BODY_SIZE_LIMIT:\s*process\.env\.BODY_SIZE_LIMIT\s*\|\|\s*String\(MAX_REQUEST_BODY_BYTES\)/
-		);
+		expect(src).not.toMatch(/BODY_SIZE_LIMIT\s*:/);
+		expect(src).not.toContain('MAX_REQUEST_BODY_BYTES');
+	});
+
+	// The exactness is the point: a raw-length guess would either refuse files
+	// that fit or admit files the front-end 413s - and admitting one is the
+	// silent failure this replaced.
+	it('measures the real serialized body, byte for byte', () => {
+		const cases = [
+			'',
+			'<h1>hi</h1>\n',
+			'a "quoted" \\ backslash\r\n\tand a tab',
+			' control chars',
+			'ünïcödé — ✓ 中文',
+			'emoji 😀 pair',
+			'lone \ud800 surrogate'
+		];
+		for (const content of cases) {
+			const body = JSON.stringify({ path: 'sub dir/report.html', content });
+			expect(saveBodyBytes('sub dir/report.html', content)).toBe(
+				new TextEncoder().encode(body).length
+			);
+		}
+	});
+
+	it('admits a document that fits the transport and refuses one that does not', () => {
+		// adapter-node refuses on `content_length > limit`, so an exact fit passes.
+		const frame = saveBodyBytes('a.html', '');
+		const exact = 'x'.repeat(DEFAULT_BODY_SIZE_LIMIT - frame);
+		expect(saveFitsTransport('a.html', exact)).toBe(true);
+		expect(saveFitsTransport('a.html', exact + 'x')).toBe(false);
+		// Escaping counts: a document of quotes is twice its raw length on the wire.
+		const halfRaw = '"'.repeat(Math.floor((DEFAULT_BODY_SIZE_LIMIT - frame) * 0.75));
+		expect(halfRaw.length).toBeLessThan(DEFAULT_BODY_SIZE_LIMIT);
+		expect(saveFitsTransport('a.html', halfRaw)).toBe(false);
+	});
+
+	it('is well below the HTML read cap - a 15 MB export opens, view-only', async () => {
+		const { MAX_HTML_FILE_BYTES } = await import('../../src/lib/server/limits.js');
+		expect(DEFAULT_BODY_SIZE_LIMIT).toBeLessThan(MAX_HTML_FILE_BYTES);
+		expect(saveFitsTransport('big.html', 'x'.repeat(3 * 1024 * 1024))).toBe(false);
+		// …while an ordinary source file stays fully editable.
+		expect(saveFitsTransport('src/app.ts', 'x'.repeat(64 * 1024))).toBe(true);
+	});
+
+	// The tab is where the decision is applied: read-only editor, no Save button,
+	// a chip saying why - and the preview left alone.
+	it('the file tab opens an over-transport document read-only, with an affordance', () => {
+		const src = readFileSync(join(REPO, 'src/lib/FileTab.svelte'), 'utf8');
+		expect(src).toContain("from '$lib/saveLimit'");
+		expect(src).toMatch(/saveTooLarge = !saveFitsTransport\(path, content\)/);
+		expect(src).toContain('EditorState.readOnly.of(true)');
+		expect(src).toContain('data-testid="file-view-only"');
+		// Save is not merely disabled - it is absent, and the handler refuses too.
+		expect(src).toMatch(/if \(saving \|\| !view \|\| saveTooLarge\) return;/);
+		// The rendered preview never depends on it.
+		expect(src).not.toMatch(/showPreview[^\n]*saveTooLarge/);
 	});
 
 	// A save that fails must not be silent (it used to write into a variable the
@@ -398,6 +444,9 @@ describe('save path keeps up with the raised read cap', () => {
 		// from the server front-end does not carry.
 		expect(saveFn).toContain('res.status === 413');
 		expect(saveFn).toContain('file too large to save');
+		// …and it stops asserting itself once the document it described changed.
+		const listener = src.slice(src.indexOf('EditorView.updateListener.of'));
+		expect(listener.slice(0, listener.indexOf('})'))).toMatch(/if \(saveError\) saveError = ''/);
 	});
 });
 

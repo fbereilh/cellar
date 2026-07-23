@@ -54,10 +54,19 @@ const REPORT_HTML = `<!doctype html>
 
 const PLAIN_PY = 'value = 1\nprint(value)\n';
 
+// Past adapter-node's 512 K request-body ceiling, which is app-wide and
+// deliberately not raised: this one still OPENS and PREVIEWS (a read is a GET
+// response, not a request body) but must not offer an edit its PUT would 413 on.
+const BIG_HTML = `<!doctype html>
+<html><head><meta charset="utf-8"><title>Big report</title></head>
+<body><h1>Big report</h1><div id="pad">${'x'.repeat(700 * 1024)}</div></body></html>
+`;
+
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available — E2E is local-only');
 	workspace = mkdtempSync(join(tmpdir(), 'cellar-e2e-html-'));
 	writeFileSync(join(workspace, 'report.html'), REPORT_HTML);
+	writeFileSync(join(workspace, 'big.html'), BIG_HTML);
 	writeFileSync(join(workspace, 'script.py'), PLAIN_PY);
 	const booted = await bootCellar(workspace);
 	launcher = booted.proc;
@@ -155,6 +164,10 @@ test('an .html file opens as a sandboxed preview, toggles to an editable source 
 	// The document is still open and editable — a failed save is not a failed load.
 	await expect(page.getByTestId('file-error')).toHaveCount(0);
 	await expect(editor).toBeVisible();
+	// …and it stops asserting itself the moment the document it described changes.
+	await editor.click();
+	await page.keyboard.type('y');
+	await expect(page.getByTestId('file-save-error')).toHaveCount(0);
 	await page.unroute('**/api/fs/file');
 
 	// ---- Regression: a non-HTML file is untouched ---------------------------
@@ -165,4 +178,47 @@ test('an .html file opens as a sandboxed preview, toggles to an editable source 
 	await expect(page.locator('[data-testid="file-view-source"]:visible')).toHaveCount(0);
 	await expect(page.locator('[data-testid="html-preview"]:visible')).toHaveCount(0);
 	await expect(page.locator('.cm-content').filter({ hasText: 'value = 1' })).toBeVisible();
+});
+
+/**
+ * A file too big for a save request body still opens and previews - reading is a
+ * GET response, and the app-wide `BODY_SIZE_LIMIT` only governs requests - but it
+ * opens VIEW-ONLY, so the tab never offers an edit whose PUT the server front-end
+ * would reject before any handler ran.
+ */
+test('an HTML file past the save-transport limit previews but opens read-only', async ({ page }) => {
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+
+	await page.locator('[data-testid="tree-file"][data-path="big.html"]').click();
+
+	// Tabs are session memory, so a previous test's file may still be mounted
+	// (hidden) behind this one — scope to what is actually on screen.
+	const preview = page.locator('[data-testid="html-preview"]:visible');
+	// Reading is untouched: the preview renders as it would for any export.
+	await expect(preview).toBeVisible();
+	await expect(page.frameLocator('[data-testid="html-preview"]:visible').locator('h1')).toHaveText(
+		'Big report'
+	);
+
+	// Source mode: readable, but not editable, and it says why.
+	await page.locator('[data-testid="file-view-source"]:visible').click();
+	await expect(page.locator('[data-testid="file-view-only"]:visible')).toBeVisible();
+	await expect(page.locator('[data-testid="file-save"]:visible')).toHaveCount(0);
+	const editor = page.locator('.cm-content:visible');
+	await expect(editor).toBeVisible();
+	await expect(editor).toHaveAttribute('contenteditable', 'false');
+
+	// Typing changes nothing on screen and leaves the file alone.
+	const before = readFileSync(join(workspace, 'big.html'), 'utf8');
+	await editor.click();
+	await page.keyboard.type('MUST-NOT-APPEAR');
+	await expect(editor).not.toContainText('MUST-NOT-APPEAR');
+	await page.keyboard.press('ControlOrMeta+s');
+	await expect(page.locator('[data-testid="file-save-error"]:visible')).toHaveCount(0);
+	expect(readFileSync(join(workspace, 'big.html'), 'utf8')).toBe(before);
+
+	// An ordinary-sized file in the same session keeps its Save button.
+	await page.locator('[data-testid="tree-file"][data-path="report.html"]').click();
+	await expect(page.locator('[data-testid="file-save"]:visible')).toHaveCount(1);
+	await expect(page.locator('[data-testid="file-view-only"]:visible')).toHaveCount(0);
 });

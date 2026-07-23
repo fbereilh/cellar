@@ -142,12 +142,11 @@ export function readWorkspaceFile(relPath: string): string {
  *
  * Refused above the SAME per-path ceiling `readWorkspaceFile` enforces: a save
  * that lands bytes the reader will not reopen strands the file the moment its
- * tab closes ("file too large to open" from then on). The transport limit
- * (`MAX_REQUEST_BODY_BYTES`) is deliberately larger than either cap, so an
- * oversize body reaches this handler and is refused HERE, with a message that
- * names the ceiling — distinct from the front-end's 413, which is about the
- * request rather than the file. Nothing is written on refusal: the original file
- * is left exactly as it was.
+ * tab closes ("file too large to open" from then on). This is the ceiling on the
+ * FILE, so its message names that ceiling - distinct from the front-end's 413,
+ * which is adapter-node refusing the request body before any handler runs (a
+ * document that big opens read-only in the first place; see `$lib/saveLimit.ts`).
+ * Nothing is written on refusal: the original file is left exactly as it was.
  */
 export function writeWorkspaceFile(relPath: string, content: string | null | undefined): void {
 	const abs = resolveInWorkspace(relPath);

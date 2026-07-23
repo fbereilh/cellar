@@ -15,6 +15,7 @@
 	import MarkdownView from '$lib/MarkdownView.svelte';
 	import HtmlPreview from '$lib/HtmlPreview.svelte';
 	import { isHtmlPath, hasRelativeAssetRefs } from '$lib/htmlPreview';
+	import { saveFitsTransport } from '$lib/saveLimit';
 	import type { BlameLine } from '$lib/server/git';
 	import type { BlameReport } from '$lib/blame';
 
@@ -54,6 +55,15 @@
 	let dirty = $state(false);
 	let saving = $state(false);
 	let savedFlash = $state(false);
+	// The loaded document is bigger than the save PUT's request body may be, so it
+	// opens VIEW-ONLY: the editor is read-only and Save is replaced by a chip that
+	// says why. Offering an edit whose PUT the server front-end would 413 before
+	// any handler runs is the failure this retires - the read cap admits files
+	// (a 15 MB self-contained export) far past what the transport accepts, and
+	// that transport limit is app-wide and deliberately not raised. Decided ONCE,
+	// from the loaded content: a read-only document cannot grow past the line it
+	// was measured against, so nothing needs re-measuring per keystroke.
+	let saveTooLarge = $state(false);
 
 	// ---- Rendered preview (markdown + html) -----------------------------------
 	// Two file kinds can toggle between the raw source editor and a rendered view:
@@ -147,7 +157,7 @@
 	}
 
 	async function save() {
-		if (saving || !view) return;
+		if (saving || !view || saveTooLarge) return;
 		saving = true;
 		saveError = '';
 		try {
@@ -278,6 +288,7 @@
 			if (!res.ok) throw new Error(body?.message || 'could not open file');
 			content = body.content;
 			liveSource = content;
+			saveTooLarge = !saveFitsTransport(path, content);
 			status = 'ready';
 		} catch (err) {
 			status = 'error';
@@ -296,9 +307,18 @@
 					// against the code (VS Code's placement).
 					gitGutterExtension(),
 					EDITOR_THEME,
+					// View-only: the document is still selectable, searchable and
+					// scrollable (and its preview is untouched) - only editing goes.
+					// `Mod-s` still returns true so the browser's own save dialog stays
+					// suppressed on a document Cellar simply cannot persist.
+					...(saveTooLarge ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
 					Prec.highest(keymap.of([{ key: 'Mod-s', run: () => (save(), true) }])),
 					EditorView.updateListener.of((v: ViewUpdate) => {
-						if (v.docChanged) setDirty(true);
+						if (v.docChanged) {
+							setDirty(true);
+							// The message described content the user has since changed.
+							if (saveError) saveError = '';
+						}
 						// Cursor moved (or the doc shifted the line under it) → re-map blame.
 						if (v.selectionSet || v.docChanged) scheduleBlame();
 					}),
@@ -338,10 +358,19 @@
 			{/if}
 			{#if savedFlash}<span class="text-success">saved</span>{/if}
 			{#if saveError}<span class="text-error" title={saveError} data-testid="file-save-error">{saveError}</span>{/if}
-			<button class="btn btn-xs btn-ghost gap-1" onclick={save} disabled={saving || status !== 'ready'} data-testid="file-save">
-				{saving ? 'saving…' : 'Save'}
-				<kbd class="kbd kbd-xs">⌘S</kbd>
-			</button>
+			{#if saveTooLarge}
+				<!-- Save is absent, not merely disabled: there is no edit to persist. -->
+				<span
+					class="text-base-content/55"
+					title="This file is larger than a save request may carry, so it opens read-only. The rendered preview is unaffected."
+					data-testid="file-view-only">view-only · too large to save</span
+				>
+			{:else}
+				<button class="btn btn-xs btn-ghost gap-1" onclick={save} disabled={saving || status !== 'ready'} data-testid="file-save">
+					{saving ? 'saving…' : 'Save'}
+					<kbd class="kbd kbd-xs">⌘S</kbd>
+				</button>
+			{/if}
 		</div>
 	</div>
 

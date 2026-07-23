@@ -40,18 +40,30 @@ const MAX_GIT_BUFFER = 256 * 1024 * 1024;
  */
 let spawnCount = 0;
 /**
- * The subcommand of every `git` spawned since the last reset, in order. The
- * count alone cannot express the guarantee the size gate makes — "no
+ * The subcommand of the most recent `git` spawns since the last reset, in order.
+ * The count alone cannot express the guarantee the size gate makes - "no
  * `blame --line-porcelain` ran on this file" — because refusing honestly costs
  * one cheap index lookup, so a test asserting a bare zero would forbid the
  * lookup instead of the multi-second call it exists to prevent.
+ *
+ * BOUNDED, unlike the counter beside it: the app server is long-lived (a session
+ * runs for hours) and git spawns on every tree refresh, window focus, save,
+ * blame and status, so an unbounded array would grow for the process lifetime to
+ * serve an assertion nothing in production reads. The oldest entries are dropped
+ * - a measurement asks what ran RECENTLY - and `spawnCount` stays exact, so a
+ * trimmed log can never turn into an under-count.
  */
 let spawnLog: string[] = [];
+/** How many of those entries are retained (any real measurement uses a handful). */
+export const SPAWN_LOG_MAX = 64;
 /** Total `git` subprocesses spawned by this module since the last reset. */
 export function gitSpawnCount(): number {
 	return spawnCount;
 }
-/** The subcommand (`argv[0]`) of each `git` spawned since the last reset. */
+/**
+ * The subcommand (`argv[0]`) of each `git` spawned since the last reset, capped
+ * at the most recent `SPAWN_LOG_MAX`.
+ */
 export function gitSpawnLog(): string[] {
 	return spawnLog.slice();
 }
@@ -483,6 +495,7 @@ async function resolveBranch(root: string, pre: Preflight): Promise<GitBranchRes
  */
 function runGit(root: string, args: string[]): Promise<string | null> {
 	spawnCount++;
+	if (spawnLog.length >= SPAWN_LOG_MAX) spawnLog.shift();
 	spawnLog.push(args[0] ?? '');
 	return new Promise((resolve) => {
 		execFile('git', ['-C', root, '--no-optional-locks', ...args], { maxBuffer: MAX_GIT_BUFFER }, (err, stdout) => {
@@ -549,13 +562,20 @@ export async function gitHeadFile(
 	// harmlessly and the TTL backstops exotic history moves. Probing the cache
 	// first costs two `stat`s and no spawn, so it never weakens the size gate
 	// below — a refused answer is cached like any other.
-	const cacheKey = `${root}\0${rel}`;
+	// The guard is part of the ENTRY'S IDENTITY, not just of how it was produced:
+	// a guarded call caches a refusal, and serving that to a caller who explicitly
+	// opted out (the notebook form) would hand it a missing baseline it never
+	// asked to go without - while the reverse would defeat the guard. The two
+	// forms never meet today only because the shell routes them by tab kind, an
+	// invariant held a layer up with nothing here to record it.
+	const guarded = opts.sizeGuard !== false;
+	const cacheKey = `${root}\0${rel}\0${guarded ? '1' : '0'}`;
 	const sig = cacheSig(abs, pre.gitDir);
 	const hit = fresh(headCache.get(cacheKey), sig);
 	if (hit) return hit;
 
 	let value: GitHeadFileResult;
-	const refused = opts.sizeGuard === false ? null : await decorationRefusal(root, abs, rel);
+	const refused = guarded ? await decorationRefusal(root, abs, rel) : null;
 	if (refused) {
 		// No `git show`: the whole point is not to pay for a blob the gutter would
 		// re-diff on every keystroke.

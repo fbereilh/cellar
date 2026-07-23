@@ -12,7 +12,8 @@ import {
 	gitSpawnLog,
 	resetGitSpawnCount,
 	invalidateGitCaches,
-	MAX_DECORATION_BYTES
+	MAX_DECORATION_BYTES,
+	SPAWN_LOG_MAX
 } from '../../src/lib/server/git';
 import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES } from '../../src/lib/server/limits.js';
 
@@ -120,6 +121,53 @@ describe('line-level git decorations are size-gated', () => {
 		// it cost is index lookups, never the `--line-porcelain` blame or the
 		// whole-blob `git show`.
 		expect(gitSpawnLog()).toEqual(['ls-files', 'ls-files']);
+	});
+
+	/**
+	 * The guard is part of a cache entry's identity, not just of how it was
+	 * produced. Nothing routes one path through both forms today - the shell picks
+	 * by tab kind - so this pins the seam itself rather than that invariant.
+	 */
+	it('a guarded refusal is never served to a caller that opted out of the guard', async () => {
+		writeFileSync(join(dir, 'report.html'), filler(MAX_DECORATION_BYTES + 64 * 1024));
+		git(dir, ['add', '-A']);
+		git(dir, ['commit', '-q', '-m', 'first']);
+
+		const guarded = await gitHeadFile('report.html');
+		expect(guarded.tooLarge).toBe(true);
+		expect(guarded.content).toBe(null);
+
+		// Same path, guard opted out: the real baseline, not the cached refusal.
+		const unguarded = await gitHeadFile('report.html', { sizeGuard: false });
+		expect(unguarded.tracked).toBe(true);
+		expect(unguarded.tooLarge).toBe(false);
+		expect(unguarded.content?.length).toBeGreaterThan(MAX_DECORATION_BYTES);
+
+		// …and the other direction: the refusal is still what the guarded form says.
+		expect((await gitHeadFile('report.html')).tooLarge).toBe(true);
+	});
+
+	/**
+	 * The log exists for the assertions above, but the app server it lives in runs
+	 * for hours and spawns git on every tree refresh, focus, save and blame - so
+	 * it is bounded. The COUNT must stay exact through the trim, or a measurement
+	 * built on it would silently under-report.
+	 */
+	it('bounds the spawn log without disturbing the spawn count', async () => {
+		writeFileSync(join(dir, 'seed.txt'), 'seed\n');
+		git(dir, ['add', '-A']);
+		git(dir, ['commit', '-q', '-m', 'first']);
+		resetGitSpawnCount();
+
+		while (gitSpawnCount() <= SPAWN_LOG_MAX) {
+			invalidateGitCaches(); // every call spawns afresh
+			await gitHeadFile('seed.txt');
+		}
+
+		expect(gitSpawnCount()).toBeGreaterThan(SPAWN_LOG_MAX);
+		expect(gitSpawnLog().length).toBe(SPAWN_LOG_MAX);
+		// Trimmed from the front: a measurement asks what ran most recently.
+		expect(gitSpawnLog().at(-1)).toBe('show');
 	});
 
 	/**
