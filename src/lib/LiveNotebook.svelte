@@ -637,13 +637,29 @@
 			return Promise.resolve();
 		}
 		return new Promise((resolve) => {
+			let done = false;
+			const settle = () => {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				resolve();
+			};
+			// A backgrounded tab suspends rAF, so the tween would never finish and the
+			// jump's transient mount pin (which waits on this promise) would be held
+			// forever - virtualization undone. Snap to the target and settle well past
+			// the tween's own duration, so this is a backstop, never the normal path.
+			const timer = setTimeout(() => {
+				parent.scrollTop = target;
+				settle();
+			}, SCROLL_TWEEN_MS * 4);
 			const t0 = performance.now();
 			const step = (now: number) => {
+				if (done) return;
 				const p = Math.min(1, (now - t0) / SCROLL_TWEEN_MS);
 				const eased = 1 - Math.pow(1 - p, 3); // ease-out cubic
 				parent.scrollTop = start + dist * eased;
 				if (p < 1) requestAnimationFrame(step);
-				else resolve();
+				else settle();
 			};
 			requestAnimationFrame(step);
 		});
@@ -684,6 +700,11 @@
 			return;
 		}
 		for (let pass = 0; pass < SCROLL_SETTLE_PASSES; pass++) {
+			// The loop spans frames of DOM churn, so the target can be deleted, moved,
+			// or re-rendered out from under it. A detached node measures an all-zero
+			// rect, which would read as "scroll the pane to the top" on every remaining
+			// pass - abandon a target that no longer exists instead.
+			if (!el.isConnected) return;
 			const delta = reframeDelta(parent, el);
 			if (Math.abs(delta) <= SCROLL_SETTLE_TOLERANCE_PX) return;
 			if (pass === 0) await tweenScrollTop(parent, parent.scrollTop + delta);
@@ -746,15 +767,30 @@
 				if (pinSeq.get(id) === seq) unpinScrollTarget(id);
 			});
 	}
-	/** Resolve after `n` animation frames (the granularity the window re-plans at). */
+	/**
+	 * Resolve after `n` animation frames (the granularity the window re-plans at),
+	 * with a timeout floor. rAF is the FAST path and stays load-bearing - waiting two
+	 * real frames after a scroll is what stops the window re-planning against the
+	 * pre-scroll viewport and unmounting the cell just jumped to - but a backgrounded
+	 * tab suspends rAF entirely, and a release that never fires holds its mount pin
+	 * forever, which is virtualization undone. So the timeout is a backstop, never a
+	 * replacement: whichever settles first wins.
+	 */
+	const FRAME_TIMEOUT_MS = 50;
 	function nextFrames(n = 1): Promise<void> {
+		const hasRaf = typeof requestAnimationFrame === 'function';
 		return new Promise((resolve) => {
-			if (typeof requestAnimationFrame !== 'function') {
-				setTimeout(resolve, 16 * n);
-				return;
+			let done = false;
+			function settle() {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				resolve();
 			}
+			const timer = setTimeout(settle, (hasRaf ? FRAME_TIMEOUT_MS : 16) * n);
+			if (!hasRaf) return;
 			let left = n;
-			const step = () => (--left > 0 ? requestAnimationFrame(step) : resolve());
+			const step = () => (--left > 0 ? requestAnimationFrame(step) : settle());
 			requestAnimationFrame(step);
 		});
 	}
@@ -767,8 +803,11 @@
 	// cells; run-follow, jump-to-running, and the find-bar all route through it.
 	// The CALLER is responsible for `releaseScrollPin(id, settled)` once it has
 	// scrolled. Every scroll-to-cell / reveal / focus path in the app goes through
-	// here (P4): jump-to-running, follow-running, the find bar, keyboard selection,
-	// and the shell's outline / search-result jump (via `jumpToCell`).
+	// here (P4), with no exceptions: jump-to-running, follow-running, the find bar,
+	// the shell's outline / search-result jump (via `jumpToCell`), and - via
+	// `selectAndAct` / `scrollCellIntoView` - keyboard selection, cell moves,
+	// paste/undo selection, `insertAndRunCode`, run-and-advance, run-and-insert-below
+	// and split-cell.
 	async function ensureCellMounted(id: string): Promise<HTMLElement | null> {
 		revealCell(id);
 		pinScrollTarget(id);
@@ -1827,12 +1866,9 @@
 			await selectAndFocus(nextId);
 			return;
 		}
-		setActive(nextId);
-		await tick();
 		// `focus()` lands on the next cell's editor, or on the cell itself when that
 		// cell is rendered markdown (whose editor is display:none and unfocusable).
-		apiOf(nextId)?.focus();
-		scrollCellIntoView(nextId);
+		await selectAndAct(nextId, (api) => api?.focus());
 	}
 
 	// ---- Modal keyboard ------------------------------------------------------
@@ -1861,24 +1897,36 @@
 	}
 
 	/**
+	 * Select `id`, MOUNT it, then land on it however the caller lands. The one
+	 * mount-then-act seam behind every select-and-focus path; sites differ only in
+	 * `act` - `focusCell` (plain selection), `focus` (the next cell's editor), or
+	 * `enterEdit` (a created cell that must open in edit mode, since a markdown cell
+	 * with text mounts in its rendered view whose editor is `display:none`).
+	 *
+	 * `ensureCellMounted` runs BEFORE `act`: under windowing a cell outside the
+	 * natural window has no DOM node and no registered API, so the act (and with it
+	 * the whole modal keyboard, which reads a keystroke's mode off the focused
+	 * element) would silently go nowhere. It also subsumes the `tick()` these paths
+	 * used to await for a just-created cell to register.
+	 */
+	async function selectAndAct(id: string | null, act: (api: CellRegisterApi | undefined) => void) {
+		if (!id) return;
+		setActive(id);
+		const el = await ensureCellMounted(id);
+		act(cellApis[id]);
+		el?.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+		releaseScrollPin(id);
+	}
+
+	/**
 	 * Select `id` and give it DOM focus (command mode). The dispatcher decides both
 	 * a keystroke's mode and its target from the focused element, so a selection the
 	 * focus doesn't follow is a selection the next keystroke doesn't act on: the
 	 * next key would instead reach whatever button or rendered cell the user last
-	 * clicked. Awaits `tick()` so a just-created cell has registered its API.
+	 * clicked.
 	 */
 	async function selectAndFocus(id: string | null) {
-		if (!id) return;
-		setActive(id);
-		// `ensureCellMounted` before `focusCell`: under windowing a cell outside the
-		// natural window has no DOM node and no registered API, so focus (and with it
-		// the whole modal keyboard, which reads a keystroke's mode off the focused
-		// element) would silently go nowhere. It also subsumes the `tick()` this used
-		// to await for a just-created cell to register.
-		const el = await ensureCellMounted(id);
-		cellApis[id]?.focusCell();
-		el?.scrollIntoView({ behavior: 'auto', block: 'nearest' });
-		releaseScrollPin(id);
+		await selectAndAct(id, (api) => api?.focusCell());
 	}
 
 	function selectRelative(delta: number) {
@@ -1920,8 +1968,7 @@
 		const id = activeId;
 		if (!id) return;
 		moveCell(id, dir);
-		await tick();
-		if (mode === 'edit') apiOf(id)?.focus();
+		if (mode === 'edit') await selectAndAct(id, (api) => api?.focus());
 		else await selectAndFocus(id);
 	}
 
@@ -1932,10 +1979,7 @@
 		if (!id) return;
 		apiOf(id)?.run(false); // fire; the insert shouldn't wait for the kernel
 		const created = await addCell(id);
-		setActive(created.id);
-		await tick();
-		cellApis[created.id]?.enterEdit();
-		scrollCellIntoView(created.id);
+		await selectAndAct(created.id, (api) => api?.enterEdit());
 	}
 
 	// Ctrl+Shift+-: split the focused cell at the cursor. The text above the cursor
@@ -1951,12 +1995,9 @@
 		api.replaceSource(source.slice(0, at));
 		await editCell(id, source.slice(0, at));
 		const created = await addCell(id, cell.cell_type, source.slice(at));
-		setActive(created.id);
-		await tick();
 		// `enterEdit`, not `focus`: a markdown cell created with text mounts in its
 		// rendered view, whose editor is `display:none` and cannot take the caret.
-		cellApis[created.id]?.enterEdit();
-		scrollCellIntoView(created.id);
+		await selectAndAct(created.id, (api) => api?.enterEdit());
 	}
 
 	// 1-6: make the selected cell a markdown heading of that level, converting a
