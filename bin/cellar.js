@@ -299,6 +299,12 @@ process.on('exit', () => {
 	} catch {}
 });
 
+// Known TOCTOU: the probe socket is closed before the returned port is handed to
+// the app's real listen(), so the port is briefly unclaimed. Per-run instances use
+// mkdtemp workspaces + dynamic ports, so collisions are near-impossible in practice;
+// e2e runs at workers:2 (do NOT drop below 2). If a port-collision flake ever
+// surfaces here, harden by holding the probe socket open until the child has bound,
+// or by retrying the launch on EADDRINUSE — not by serializing the suite.
 function freePort() {
 	return new Promise((resolvePort, reject) => {
 		const srv = createServer();

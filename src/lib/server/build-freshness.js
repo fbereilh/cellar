@@ -21,7 +21,7 @@
  * Node builtins only — `bin/cellar.js` imports it directly (like venv.js), so it
  * must not reach for anything the packaged launcher cannot resolve.
  */
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 /** Trees whose contents `vite build` compiles into `build/`. */
@@ -38,18 +38,29 @@ export const SKIP_ENV = 'CELLAR_SKIP_BUILD_CHECK';
 
 /**
  * Newest mtime under `dir`, stopping early once anything beats `threshold`.
- * Returns `{ mtimeMs, path }` for the newest file seen, or null for an empty /
- * absent tree. The early exit is what keeps the stale case cheap; the fresh case
- * walks the whole tree, which is a few milliseconds for cellar's ~1k files.
+ * Returns `{ mtimeMs, path }` for the newest file OR directory seen, or null for
+ * an absent tree. The early exit is what keeps the stale case cheap; the fresh
+ * case walks the whole tree, which is a few milliseconds for cellar's ~1k files.
+ *
+ * Directory mtimes are folded in deliberately: a delete-only source change
+ * (`rm src/foo.js`, or a `git checkout` that removes a file) advances the parent
+ * directory's mtime but moves no surviving file forward, so a files-only walk
+ * would serve the compiled-away code as fresh.
  */
 function newestUnder(dir, threshold) {
-	let best = null;
 	let entries;
 	try {
 		entries = readdirSync(dir, { withFileTypes: true });
 	} catch {
 		return null;
 	}
+	let best = null;
+	try {
+		best = { mtimeMs: statSync(dir).mtimeMs, path: dir };
+	} catch {
+		/* unreadable dir: fall through to its entries */
+	}
+	if (best && threshold != null && best.mtimeMs > threshold) return best;
 	for (const entry of entries) {
 		if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
 		const full = join(dir, entry.name);
@@ -70,6 +81,36 @@ function newestUnder(dir, threshold) {
 	return best;
 }
 
+/** The `source` field stamped into `build/build-info.json` at build time, or null. */
+function buildInfoSource(repo) {
+	try {
+		const info = JSON.parse(readFileSync(join(repo, 'build', 'build-info.json'), 'utf8'));
+		return typeof info?.source === 'string' ? info.source : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Is this a SOURCE checkout (where "stale" is a meaningful, answerable question)
+ * versus a packaged install (npm/brew/Docker), where it is not?
+ *
+ * A packaged install cannot be identified by the absence of `src/`: `package.json`
+ * `files` ships `src/lib/server/*.js`, and Docker/Homebrew copy source too, so the
+ * source tree is present in real installs. So we key off a POSITIVE signal instead:
+ *   - `build-info.json` `source` of `release`/`env` is a stamped packaged build
+ *     (a Homebrew stable tarball, or release automation) → NOT a source checkout;
+ *   - otherwise a real checkout is proven by a `.git` (a dir, or a worktree pointer
+ *     file) at the repo root — dev clones, CI, and the e2e harness all have one.
+ * Anything ambiguous (a `git`-stamped tarball with no `.git`, an unreadable stamp)
+ * falls through to `false` → `unknown` → launch, never a false stale refusal.
+ */
+function isSourceCheckout(repo) {
+	const source = buildInfoSource(repo);
+	if (source === 'release' || source === 'env') return false;
+	return existsSync(join(repo, '.git'));
+}
+
 /**
  * Classify `<repo>/build/index.js` against the repo's sources.
  *
@@ -77,9 +118,9 @@ function newestUnder(dir, threshold) {
  * @returns {{ state: 'missing'|'stale'|'fresh'|'unknown', buildEntry: string,
  *             newest?: string, buildMs?: number, newestMs?: number }}
  *
- * `unknown` means there is nothing to compare against — a packaged install
- * (`package.json` `files` ships `build/` and `bin/`, not the source tree), where
- * "stale" is not a meaningful question and must never block a launch.
+ * `unknown` means there is nothing meaningful to compare against — a packaged
+ * install (npm/brew/Docker), where "stale" is not answerable and must never block
+ * a launch. Only a proven source checkout runs the real mtime comparison.
  */
 export function buildFreshness(repo) {
 	const buildEntry = join(repo, 'build', 'index.js');
@@ -91,6 +132,8 @@ export function buildFreshness(repo) {
 	} catch {
 		return { state: 'unknown', buildEntry };
 	}
+
+	if (!isSourceCheckout(repo)) return { state: 'unknown', buildEntry };
 
 	const roots = SOURCE_DIRS.map((d) => join(repo, d)).filter((d) => existsSync(d));
 	if (roots.length === 0) return { state: 'unknown', buildEntry };

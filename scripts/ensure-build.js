@@ -34,8 +34,9 @@ const why =
 
 console.log(`[cellar] ${why} — running \`npm run build\` …`);
 
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const build = spawnSync(npm, ['run', 'build'], { cwd: REPO, stdio: 'inherit' });
+const isWin = process.platform === 'win32';
+const npm = isWin ? 'npm.cmd' : 'npm';
+const build = spawnSync(npm, ['run', 'build'], { cwd: REPO, stdio: 'inherit', shell: isWin });
 
 if (build.error) {
 	console.error(`[cellar] failed to run \`npm run build\`: ${build.error.message}`);
