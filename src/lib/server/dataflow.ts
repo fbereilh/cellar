@@ -746,16 +746,19 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 }
 
 /**
- * Analyze a notebook's code cells into `{ id: { defines, uses } }`.
+ * Analyze a notebook's code cells into `{ id: { defines, uses, imports? } }`.
  *
  * Only cells whose source is not already cached are sent to the subprocess, so a
  * single edit costs one cheap `ast` + `symtable` pass over one cell, and a re-run
  * costs nothing. Markdown cells are skipped (they have no dataflow). A cell whose
  * analysis is unavailable this pass degrades to empty defines/uses (the long-standing
  * contract); `getNotebookStaleness` additionally treats it as conservative-stale.
+ * `imports` (the module-level import subset of `defines`, absent when empty) rides
+ * along from the JS tokenizer, so it is present even when the probe is not - and is
+ * omitted for EVERY cell when any code cell arms `%autoreload`.
  *
  * @param cells the notebook's cells (code + markdown)
- * @returns per-code-cell `{ id: { defines, uses } }`
+ * @returns per-code-cell `{ id: { defines, uses, imports? } }`
  */
 export async function analyzeDataflow(cells: CellView[]): Promise<DataflowMap> {
 	return (await analyzeDataflowDetailed(cells)).dataflow;
