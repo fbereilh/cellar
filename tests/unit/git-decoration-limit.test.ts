@@ -9,6 +9,7 @@ import {
 	gitBlameFile,
 	gitBlameNotebookCells,
 	gitSpawnCount,
+	gitSpawnLog,
 	resetGitSpawnCount,
 	invalidateGitCaches,
 	MAX_DECORATION_BYTES
@@ -21,9 +22,14 @@ import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES } from '../../src/lib/server/limits
  * `--line-porcelain` blame (seconds of git, tens of MB of stdout) on every mount,
  * save and window focus.
  *
- * Both directions are pinned, and the refusing half asserts the SPAWN COUNT: the
- * fix is not paying for the git call, so a test that only checked "no blame came
- * back" would pass while the cost still happened.
+ * Both directions are pinned, and the refusing half asserts WHICH git
+ * subcommands ran: the fix is not paying for the blame, so a test that only
+ * checked "no blame came back" would pass while the cost still happened.
+ *
+ * The refusal also has to name the right fact. `tooLarge` is reserved for a
+ * TRACKED file; the generated `report.html` this ceiling exists for is usually
+ * untracked or gitignored, and that has no blame for an ordinary reason — so all
+ * three states are pinned below.
  */
 
 function git(cwd: string, args: string[]) {
@@ -72,6 +78,7 @@ describe('line-level git decorations are size-gated', () => {
 		writeFileSync(join(dir, 'small.html'), '<html>\n<body>hi</body>\n</html>\n');
 		git(dir, ['add', '-A']);
 		git(dir, ['commit', '-q', '-m', 'first']);
+		resetGitSpawnCount();
 
 		const blame = await gitBlameFile('small.html');
 		expect(blame.tracked).toBe(true);
@@ -83,16 +90,20 @@ describe('line-level git decorations are size-gated', () => {
 		expect(head.tracked).toBe(true);
 		expect(head.tooLarge).toBe(false);
 		expect(head.content).toContain('<body>hi</body>');
+
+		// An under-threshold file pays nothing for the tracked/too-large
+		// distinction: that lookup happens only once the size gate has tripped.
+		expect(gitSpawnLog()).not.toContain('ls-files');
 	});
 
-	it('an over-threshold file is refused WITHOUT spawning git, and says why', async () => {
+	it('an over-threshold TRACKED file is refused without blaming it, and says why', async () => {
 		writeFileSync(join(dir, 'report.html'), filler(MAX_DECORATION_BYTES + 64 * 1024));
 		writeFileSync(join(dir, 'small.html'), '<html></html>\n');
 		git(dir, ['add', '-A']);
 		git(dir, ['commit', '-q', '-m', 'first']);
 
-		// Warm the repo-detection preflight on the small file, so the counter below
-		// measures only the blame / `git show` this guard exists to prevent.
+		// Warm the repo-detection preflight on the small file, so the log below
+		// records only what answering for `report.html` cost.
 		await gitBlameFile('small.html');
 		resetGitSpawnCount();
 
@@ -105,8 +116,54 @@ describe('line-level git decorations are size-gated', () => {
 		expect(head.tooLarge).toBe(true);
 		expect(head.content).toBe(null);
 
-		// …and neither answer cost a git subprocess. This is the whole fix.
-		expect(gitSpawnCount()).toBe(0);
+		// …and neither answer ran the expensive call. This is the whole fix: what
+		// it cost is index lookups, never the `--line-porcelain` blame or the
+		// whole-blob `git show`.
+		expect(gitSpawnLog()).toEqual(['ls-files', 'ls-files']);
+	});
+
+	/**
+	 * The shape this ceiling exists for is a GENERATED `report.html`, which is
+	 * normally gitignored or simply never added. That file has no blame for an
+	 * entirely different reason, and VS Code shows nothing for it — so it must
+	 * read as untracked, not as "too large for blame".
+	 */
+	it('an over-threshold UNTRACKED file reads as untracked, not as too-large', async () => {
+		writeFileSync(join(dir, 'seed.txt'), 'seed\n');
+		git(dir, ['add', '-A']);
+		git(dir, ['commit', '-q', '-m', 'first']);
+		writeFileSync(join(dir, 'report.html'), filler(MAX_DECORATION_BYTES + 64 * 1024));
+
+		await gitBlameFile('seed.txt'); // warm the preflight
+		resetGitSpawnCount();
+
+		const blame = await gitBlameFile('report.html');
+		expect(blame.tracked).toBe(false);
+		expect(blame.tooLarge).toBe(false);
+		expect(blame.lines).toEqual([]);
+
+		const head = await gitHeadFile('report.html');
+		expect(head.tracked).toBe(false);
+		expect(head.tooLarge).toBe(false);
+
+		// Still never blamed — the distinction is one index lookup, not the stall.
+		expect(gitSpawnLog()).toEqual(['ls-files', 'ls-files']);
+	});
+
+	it('an over-threshold GITIGNORED file reads as untracked too', async () => {
+		writeFileSync(join(dir, '.gitignore'), 'report.html\n');
+		git(dir, ['add', '-A']);
+		git(dir, ['commit', '-q', '-m', 'first']);
+		writeFileSync(join(dir, 'report.html'), filler(MAX_DECORATION_BYTES + 64 * 1024));
+
+		await gitBlameFile('.gitignore'); // warm the preflight
+		resetGitSpawnCount();
+
+		const blame = await gitBlameFile('report.html');
+		expect(blame.tracked).toBe(false);
+		expect(blame.tooLarge).toBe(false);
+		expect(gitSpawnLog()).toEqual(['ls-files']);
+		expect(gitSpawnCount()).toBe(1);
 	});
 
 	// Notebook decorations are per CELL and their blame is already `-L`-scoped to

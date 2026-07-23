@@ -137,10 +137,26 @@ export function readWorkspaceFile(relPath: string): string {
 	return buf.toString('utf8');
 }
 
-/** Write text content to a workspace file (used by editor-tab save). */
+/**
+ * Write text content to a workspace file (used by editor-tab save).
+ *
+ * Refused above the SAME per-path ceiling `readWorkspaceFile` enforces: a save
+ * that lands bytes the reader will not reopen strands the file the moment its
+ * tab closes ("file too large to open" from then on). The transport limit
+ * (`MAX_REQUEST_BODY_BYTES`) is deliberately larger than either cap, so an
+ * oversize body reaches this handler and is refused HERE, with a message that
+ * names the ceiling — distinct from the front-end's 413, which is about the
+ * request rather than the file. Nothing is written on refusal: the original file
+ * is left exactly as it was.
+ */
 export function writeWorkspaceFile(relPath: string, content: string | null | undefined): void {
 	const abs = resolveInWorkspace(relPath);
-	writeFileSync(abs, content ?? '', 'utf8');
+	const text = content ?? '';
+	const max = maxFileBytesFor(relPath);
+	if (Buffer.byteLength(text, 'utf8') > max) {
+		throw new Error(`file too large to save (over the ${Math.round(max / (1024 * 1024))} MB limit)`);
+	}
+	writeFileSync(abs, text, 'utf8');
 }
 
 // ---- File-management operations (sidebar file explorer) -------------------

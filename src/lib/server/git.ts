@@ -39,13 +39,26 @@ const MAX_GIT_BUFFER = 256 * 1024 * 1024;
  * the status/blame caches actually collapse that fan-out.
  */
 let spawnCount = 0;
+/**
+ * The subcommand of every `git` spawned since the last reset, in order. The
+ * count alone cannot express the guarantee the size gate makes — "no
+ * `blame --line-porcelain` ran on this file" — because refusing honestly costs
+ * one cheap index lookup, so a test asserting a bare zero would forbid the
+ * lookup instead of the multi-second call it exists to prevent.
+ */
+let spawnLog: string[] = [];
 /** Total `git` subprocesses spawned by this module since the last reset. */
 export function gitSpawnCount(): number {
 	return spawnCount;
 }
+/** The subcommand (`argv[0]`) of each `git` spawned since the last reset. */
+export function gitSpawnLog(): string[] {
+	return spawnLog.slice();
+}
 /** Reset the spawn counter (tests / E2E measurement). */
 export function resetGitSpawnCount(): void {
 	spawnCount = 0;
+	spawnLog = [];
 }
 
 /**
@@ -143,15 +156,16 @@ function fileMtimeMs(abs: string): number | null {
  * decorations EXACTLY as before, and only the export-sized files that exception
  * newly admits skip them. A refusal is reported (`tooLarge:true`), never
  * disguised as `tracked:false` — "too big to blame" and "untracked" are
- * different facts and the status bar says which.
+ * different facts and the status bar says which. Which is also why size alone
+ * cannot decide it: see `decorationRefusal`.
  */
 export const MAX_DECORATION_BYTES = MAX_FILE_BYTES;
 
 /**
- * True when the working-tree file is past `MAX_DECORATION_BYTES`. Two `stat`s
- * and zero git spawns, and it runs BEFORE the cache probe — the point is not to
- * pay the blame/`git show` at all, not to discard its result afterwards. An
- * unreadable file is NOT refused here: it falls through to git, which reports
+ * True when the working-tree file is past `MAX_DECORATION_BYTES`. One `stat` and
+ * zero git spawns, and it gates every path that would run the blame/`git show` —
+ * the point is not to pay for them at all, not to discard the result afterwards.
+ * An unreadable file is NOT refused here: it falls through to git, which reports
  * the honest `tracked:false`.
  */
 function tooLargeToDecorate(abs: string): boolean {
@@ -160,6 +174,37 @@ function tooLargeToDecorate(abs: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Does git track `rel`? ONE path-scoped index lookup — not a repo walk, and a
+ * different cost class entirely from the `--line-porcelain` blame the size gate
+ * exists to prevent. (`git status --porcelain` is the wrong tool here: it cannot
+ * see ignored files at all, so it can't tell tracked-clean from gitignored.)
+ */
+async function isTracked(root: string, rel: string): Promise<boolean> {
+	return (await runGit(root, ['ls-files', '--error-unmatch', '--', rel])) != null;
+}
+
+/**
+ * Decide whether to refuse line-level decorations for one file, and why.
+ * `null` means "small enough — go run git"; otherwise decorations are skipped
+ * and `tooLarge` says whether SIZE is the honest reason.
+ *
+ * Size alone is not that reason. The file this ceiling exists for is a generated
+ * `report.html`, which is usually gitignored or simply never added — it has no
+ * blame because git has never heard of it, exactly as VS Code shows nothing for
+ * a new file. Answering "too large for blame" there names the wrong fact. So an
+ * oversized file costs one `ls-files` to separate the two; the blame itself is
+ * never spawned either way, which is the guarantee that matters.
+ */
+async function decorationRefusal(
+	root: string,
+	abs: string,
+	rel: string
+): Promise<{ tooLarge: boolean } | null> {
+	if (!tooLargeToDecorate(abs)) return null;
+	return { tooLarge: await isTracked(root, rel) };
 }
 
 /**
@@ -438,6 +483,7 @@ async function resolveBranch(root: string, pre: Preflight): Promise<GitBranchRes
  */
 function runGit(root: string, args: string[]): Promise<string | null> {
 	spawnCount++;
+	spawnLog.push(args[0] ?? '');
 	return new Promise((resolve) => {
 		execFile('git', ['-C', root, '--no-optional-locks', ...args], { maxBuffer: MAX_GIT_BUFFER }, (err, stdout) => {
 			// A maxBuffer overflow returns truncated stdout ALONGSIDE the error, and the
@@ -477,8 +523,9 @@ export function isMaxBufferError(err: unknown): boolean {
  * already the whole story.
  *
  * @param {string} relPath Workspace-relative path (path-guarded).
- * @param opts.sizeGuard Refuse (`tooLarge:true`, no `git show`) above
- *   `MAX_DECORATION_BYTES`. Default true — a file tab's gutter re-diffs the whole
+ * @param opts.sizeGuard Skip the `git show` above `MAX_DECORATION_BYTES`
+ *   (`tooLarge:true` only when the file is also TRACKED — see
+ *   `decorationRefusal`). Default true — a file tab's gutter re-diffs the whole
  *   baseline on every keystroke. The NOTEBOOK caller passes false: its
  *   decorations are per CELL and their cost tracks SOURCE, not the outputs that
  *   make an `.ipynb` big, so a size gate there would drop the change bars off an
@@ -497,27 +544,30 @@ export async function gitHeadFile(
 	const pre = await preflight(root);
 	if (!pre.inside) return { isRepo: false, tracked: false, content: null, tooLarge: false };
 
-	// Before the cache probe and before any spawn: the whole point is not to pay
-	// for a blob the gutter would re-diff on every keystroke.
-	if (opts.sizeGuard !== false && tooLargeToDecorate(abs)) {
-		return { isRepo: true, tracked: false, content: null, tooLarge: true };
-	}
-
 	// HEAD:path content changes only when history moves (commit/checkout), so the
 	// index mtime alone is a sound signature; the working-file mtime rides along
-	// harmlessly and the TTL backstops exotic history moves.
+	// harmlessly and the TTL backstops exotic history moves. Probing the cache
+	// first costs two `stat`s and no spawn, so it never weakens the size gate
+	// below — a refused answer is cached like any other.
 	const cacheKey = `${root}\0${rel}`;
 	const sig = cacheSig(abs, pre.gitDir);
 	const hit = fresh(headCache.get(cacheKey), sig);
 	if (hit) return hit;
 
-	// Porcelain paths (and `git show`'s object syntax) are repo-root-relative.
-	const content = await runGit(root, ['show', `HEAD:${pre.prefix}${rel}`]);
 	let value: GitHeadFileResult;
-	if (content == null) value = { isRepo: true, tracked: false, content: null, tooLarge: false };
-	// A NUL byte means a binary blob; there is no line diff to draw.
-	else if (content.includes('\0')) value = { isRepo: true, tracked: false, content: null, tooLarge: false };
-	else value = { isRepo: true, tracked: true, content, tooLarge: false };
+	const refused = opts.sizeGuard === false ? null : await decorationRefusal(root, abs, rel);
+	if (refused) {
+		// No `git show`: the whole point is not to pay for a blob the gutter would
+		// re-diff on every keystroke.
+		value = { isRepo: true, tracked: false, content: null, tooLarge: refused.tooLarge };
+	} else {
+		// Porcelain paths (and `git show`'s object syntax) are repo-root-relative.
+		const content = await runGit(root, ['show', `HEAD:${pre.prefix}${rel}`]);
+		if (content == null) value = { isRepo: true, tracked: false, content: null, tooLarge: false };
+		// A NUL byte means a binary blob; there is no line diff to draw.
+		else if (content.includes('\0')) value = { isRepo: true, tracked: false, content: null, tooLarge: false };
+		else value = { isRepo: true, tracked: true, content, tooLarge: false };
+	}
 	headCache.set(cacheKey, { sig, at: Date.now(), value });
 	return value;
 }
@@ -572,6 +622,10 @@ function parseBlame(stdout: string): BlameLine[] {
  *
  * `tracked:false` (empty `lines`) covers every no-blame case: not a repo, no
  * commits, an untracked file, or a binary blob — the caller then shows nothing.
+ * `tooLarge:true` is the one no-blame case worth saying out loud, and it is
+ * reserved for a TRACKED file past `MAX_DECORATION_BYTES` (see
+ * `decorationRefusal`): an untracked one has no blame for the ordinary reason
+ * and reads as untracked, however big it is.
  *
  * @param {string} relPath Workspace-relative path (path-guarded).
  * @returns {Promise<{isRepo: boolean, tracked: boolean, lines: Array<object>}>}
@@ -585,26 +639,30 @@ export async function gitBlameFile(relPath: string): Promise<GitBlameFileResult>
 	const pre = await preflight(root);
 	if (!pre.inside) return { isRepo: false, tracked: false, lines: [], tooLarge: false };
 
-	// Before the cache probe and before any spawn: `--line-porcelain` on a
-	// multi-MB file is seconds of git plus tens of MB of stdout, and this runs on
-	// mount, on every save and on every window focus.
-	if (tooLargeToDecorate(abs)) return { isRepo: true, tracked: false, lines: [], tooLarge: true };
-
 	// Blame changes on a working edit (file mtime) or a history move (index mtime);
 	// the signature+TTL cache collapses the per-focus/per-save burst without ever
-	// serving a result across a real edit.
+	// serving a result across a real edit. Probing it first costs two `stat`s and
+	// no spawn, so it never weakens the size gate below.
 	const cacheKey = `${root}\0${rel}`;
 	const sig = cacheSig(abs, pre.gitDir);
 	const hit = fresh(blameFileCache.get(cacheKey), sig);
 	if (hit) return hit;
 
-	// `--incremental` off; `-w` ignores whitespace-only reblame noise. A file with
-	// no HEAD blob (untracked / newly added) makes blame fail → tracked:false.
-	const out = await runGit(root, ['blame', '--line-porcelain', '-w', '--', rel]);
-	const value: GitBlameFileResult =
-		out == null
-			? { isRepo: true, tracked: false, lines: [], tooLarge: false }
-			: { isRepo: true, tracked: true, lines: parseBlame(out), tooLarge: false };
+	let value: GitBlameFileResult;
+	const refused = await decorationRefusal(root, abs, rel);
+	if (refused) {
+		// No `--line-porcelain`: on a multi-MB file it is seconds of git plus tens
+		// of MB of stdout, and this runs on mount, on every save and every focus.
+		value = { isRepo: true, tracked: false, lines: [], tooLarge: refused.tooLarge };
+	} else {
+		// `--incremental` off; `-w` ignores whitespace-only reblame noise. A file with
+		// no HEAD blob (untracked / newly added) makes blame fail → tracked:false.
+		const out = await runGit(root, ['blame', '--line-porcelain', '-w', '--', rel]);
+		value =
+			out == null
+				? { isRepo: true, tracked: false, lines: [], tooLarge: false }
+				: { isRepo: true, tracked: true, lines: parseBlame(out), tooLarge: false };
+	}
 	blameFileCache.set(cacheKey, { sig, at: Date.now(), value });
 	return value;
 }

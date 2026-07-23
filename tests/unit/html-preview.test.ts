@@ -273,6 +273,7 @@ describe('readWorkspaceFile size caps', () => {
 	let dir: string;
 	let priorWorkspace: string | undefined;
 	let readWorkspaceFile: (relPath: string) => string;
+	let writeWorkspaceFile: (relPath: string, content: string) => void;
 
 	const fill = (name: string, bytes: number) =>
 		writeFileSync(join(dir, name), Buffer.alloc(bytes, 0x61));
@@ -281,7 +282,7 @@ describe('readWorkspaceFile size caps', () => {
 		dir = mkdtempSync(join(tmpdir(), 'cellar-fsize-'));
 		priorWorkspace = process.env.CELLAR_WORKSPACE;
 		process.env.CELLAR_WORKSPACE = dir;
-		({ readWorkspaceFile } = await import('../../src/lib/server/fstree'));
+		({ readWorkspaceFile, writeWorkspaceFile } = await import('../../src/lib/server/fstree'));
 		fill('small.html', 1 * MB);
 		fill('report.html', 5 * MB); // a plotly write_html(include_plotlyjs=True)
 		fill('huge.html', 16 * MB);
@@ -308,6 +309,41 @@ describe('readWorkspaceFile size caps', () => {
 	it('still refuses a non-HTML text file above the ordinary cap', () => {
 		expect(() => readWorkspaceFile('big.txt')).toThrow(/too large/);
 		expect(readWorkspaceFile('small.txt').length).toBe(1 * MB);
+	});
+
+	/**
+	 * The write cap is the third member of the pair, and it is the SAME per-path
+	 * limit: a save the reader will not reopen strands the file the moment its tab
+	 * closes. The transport limit is larger than either cap on purpose, so an
+	 * oversize body reaches the server and has to be refused there.
+	 */
+	describe('the save path mirrors it, per path kind', () => {
+		it('saves what the reader will reopen', () => {
+			writeWorkspaceFile('saved.html', 'a'.repeat(3 * MB));
+			expect(readWorkspaceFile('saved.html').length).toBe(3 * MB);
+			writeWorkspaceFile('saved.txt', 'a'.repeat(1 * MB));
+			expect(readWorkspaceFile('saved.txt').length).toBe(1 * MB);
+		});
+
+		it('refuses a save past the cap, naming the limit and leaving the file alone', () => {
+			writeWorkspaceFile('keep.txt', 'original');
+			expect(() => writeWorkspaceFile('keep.txt', 'a'.repeat(3 * MB))).toThrow(
+				/too large to save \(over the 2 MB limit\)/
+			);
+			// Refused BEFORE the write — a truncated file would be worse than the refusal.
+			expect(readWorkspaceFile('keep.txt')).toBe('original');
+
+			writeWorkspaceFile('keep.html', 'original');
+			expect(() => writeWorkspaceFile('keep.html', 'a'.repeat(16 * MB))).toThrow(
+				/too large to save \(over the 15 MB limit\)/
+			);
+			expect(readWorkspaceFile('keep.html')).toBe('original');
+		});
+
+		// Bytes, not characters: the ceiling the reader enforces is a file size.
+		it('measures UTF-8 bytes, not string length', () => {
+			expect(() => writeWorkspaceFile('multibyte.txt', '€'.repeat(MB))).toThrow(/too large to save/);
+		});
 	});
 });
 
