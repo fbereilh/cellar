@@ -25,7 +25,7 @@
 	import type { SearchHighlightState } from '$lib/searchHighlight';
 	import type { Folding } from '$lib/headings';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
-	import { isBlameUnavailable, type BlameReport } from '$lib/blame';
+	import { isBlameUnavailable, activeBlameFor, type BlameReport } from '$lib/blame';
 
 	/** Kind of an open tab: the canonical notebook, an opened `.ipynb`/`.py`, a rendered image, or a text file. */
 	type TabKind = 'notebook' | 'ipynb' | 'image' | 'file';
@@ -383,15 +383,13 @@
 	// A file whose blame the server refused for its size reports `{unavailable}`
 	// instead of null, so the bar says so rather than going blank — blank means
 	// untracked, a different fact.
+	// Which report is shown is decided by `activeBlameFor` (pure, in `$lib/blame`):
+	// by WHICH TAB IS ACTIVE, never by truthiness.
 	let blameByPath = $state<Record<string, BlameReport | null>>({});
 	function handleBlame(path: string, record: BlameReport | null) {
 		blameByPath = { ...blameByPath, [path]: record };
 	}
-	const activeBlame = $derived(
-		(activeFilePath && blameByPath[activeFilePath]) ||
-			(activeNotebookPath && blameByPath[activeNotebookPath]) ||
-			null
-	);
+	const activeBlame = $derived(activeBlameFor(activeFilePath, activeNotebookPath, blameByPath));
 
 	// One card per notebook's kernel in the Kernels sidebar. Cellar runs one kernel
 	// PER notebook (lazy, started on that notebook's first run). The card set is:

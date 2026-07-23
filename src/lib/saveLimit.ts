@@ -105,10 +105,16 @@ const FRAME_BYTES = 20;
  * refuse files that fit or admit files that 413, and admitting one recreates the
  * silent-failure defect this exists to retire. HTML is full of `"` and `\n`,
  * each of which becomes two bytes.
+ *
+ * `cap` bounds the WORK, never the answer's correctness: the count only grows, so
+ * once it is past `cap` the comparison it feeds is already settled and the walk
+ * stops. The return is then a lower bound that is still strictly greater than
+ * `cap` - so `<= cap` stays exactly as true as it would have been on a full pass.
  */
-function jsonStringBytes(s: string): number {
+function jsonStringBytes(s: string, cap = Infinity): number {
 	let n = 2; // the surrounding quotes
 	for (let i = 0; i < s.length; i++) {
+		if (n > cap) return n;
 		const c = s.charCodeAt(i);
 		if (c === 0x22 || c === 0x5c) n += 2; // \" \\
 		else if (c < 0x20) {
@@ -128,9 +134,17 @@ function jsonStringBytes(s: string): number {
 	return n;
 }
 
-/** Byte length of the exact body a file-tab save would PUT. */
-export function saveBodyBytes(relPath: string, content: string): number {
-	return FRAME_BYTES + jsonStringBytes(String(relPath ?? '')) + jsonStringBytes(content ?? '');
+/**
+ * Byte length of the exact body a file-tab save would PUT.
+ *
+ * With a `cap` the walk may stop early, in which case the result is only
+ * guaranteed to be greater than `cap` (see `jsonStringBytes`); with no `cap` it is
+ * exact.
+ */
+export function saveBodyBytes(relPath: string, content: string, cap = Infinity): number {
+	const framed = FRAME_BYTES + jsonStringBytes(String(relPath ?? ''), cap);
+	if (framed > cap) return framed;
+	return framed + jsonStringBytes(content ?? '', cap - framed);
 }
 
 /**
@@ -141,6 +155,14 @@ export function saveBodyBytes(relPath: string, content: string): number {
  * which callers get by running the server's wire value through
  * `resolveBodyLimit`; the default is only the fallback for a caller with no wire
  * value at all.
+ *
+ * The answer is exact, but it is never paid for in full: this runs on the load
+ * path of every file tab, and a 15 MB export's verdict is settled by its first
+ * ~512 KB. Two provably conservative shortcuts, both leaving the boundary exactly
+ * where a full count puts it - every UTF-16 code unit contributes AT LEAST one
+ * byte to the serialized form (a surrogate pair is 2 units → 4 bytes), so a
+ * length already past `limit` proves the body is too, with no scan at all; and
+ * the count itself stops as soon as it passes `limit`.
  */
 export function saveFitsTransport(
 	relPath: string,
@@ -148,6 +170,7 @@ export function saveFitsTransport(
 	limit: number = DEFAULT_BODY_SIZE_LIMIT
 ): boolean {
 	if (limit === Infinity) return true; // don't walk megabytes to compare against ∞
+	if ((content ?? '').length > limit) return false; // O(1): bytes >= code units
 	// adapter-node refuses on `content_length > limit`, so equality still fits.
-	return saveBodyBytes(relPath, content) <= limit;
+	return saveBodyBytes(relPath, content, limit) <= limit;
 }

@@ -20,3 +20,28 @@ export type BlameReport = BlameLine | { unavailable: BlameUnavailable };
 export function isBlameUnavailable(r: BlameReport | null): r is { unavailable: BlameUnavailable } {
 	return r != null && 'unavailable' in r;
 }
+
+/**
+ * Which report the status bar shows, chosen by WHICH TAB IS ACTIVE — never by
+ * which value happens to be truthy.
+ *
+ * The distinction is the whole point: a focused file tab answers with its OWN
+ * record or nothing, because `notebookPath` stays set (the shell falls back to the
+ * canonical notebook whenever any notebook tab is open) and a LiveNotebook keeps
+ * publishing its focused cell's record under that key. Falling through on a falsy
+ * file record therefore attributed a notebook cell's author and date to the file —
+ * and an untracked, correctly-null file is the common case here, since a generated
+ * report is usually gitignored or never added.
+ *
+ * So every arm of the union renders as itself by construction: a record, the
+ * too-large marker, or nothing (which the bar hides, meaning untracked).
+ */
+export function activeBlameFor(
+	filePath: string | null,
+	notebookPath: string | null,
+	byPath: Record<string, BlameReport | null>
+): BlameReport | null {
+	if (filePath) return byPath[filePath] ?? null;
+	if (notebookPath) return byPath[notebookPath] ?? null;
+	return null;
+}

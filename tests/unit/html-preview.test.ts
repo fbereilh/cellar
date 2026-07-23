@@ -413,6 +413,57 @@ describe('save transport limit', () => {
 		expect(saveFitsTransport('a.html', halfRaw)).toBe(false);
 	});
 
+	// The verdict is settled by roughly the first `limit` bytes, so it is not paid
+	// for in full - but the shortcuts must be provably conservative, i.e. the
+	// boundary has to land byte-for-byte where a full count puts it.
+	it('the early exits leave the boundary exactly where a full count puts it', () => {
+		const encoder = new TextEncoder();
+		const truth = (p: string, c: string) =>
+			encoder.encode(JSON.stringify({ path: p, content: c })).length;
+		const path = 'sub dir/report.html';
+		const limit = 256;
+		// One byte per unit, two, three, a surrogate PAIR (4 bytes / 2 units) and a
+		// LONE surrogate (escaped to 6) - every branch of the counter, swept across
+		// the boundary rather than sampled at it.
+		for (const unit of ['x', '"', '\\', '\n', '\u0001', 'ü', '中', '😀', '\ud800']) {
+			for (let n = 0; n <= 180; n++) {
+				const content = unit.repeat(n);
+				expect(saveFitsTransport(path, content, limit)).toBe(truth(path, content) <= limit);
+			}
+		}
+	});
+
+	it('decides without walking the whole document', () => {
+		// `content` is only ever read through `.length` / `.charCodeAt`, so a counting
+		// stand-in measures the real work the load path pays.
+		function probe(content: string) {
+			let reads = 0;
+			const spy = {
+				length: content.length,
+				charCodeAt(i: number) {
+					reads++;
+					return content.charCodeAt(i);
+				}
+			};
+			return { spy: spy as unknown as string, reads: () => reads };
+		}
+		const limit = DEFAULT_BODY_SIZE_LIMIT;
+		// Longer than the limit in CODE UNITS ⇒ refused with no scan at all: every
+		// unit contributes at least one byte.
+		const huge = probe('x'.repeat(4 * 1024 * 1024));
+		expect(saveFitsTransport('big.html', huge.spy, limit)).toBe(false);
+		expect(huge.reads()).toBe(0);
+		// Within the limit by length but not by bytes ⇒ the count stops as soon as it
+		// passes, roughly halfway through a document of quotes.
+		const quoted = probe('"'.repeat(limit));
+		expect(saveFitsTransport('big.html', quoted.spy, limit)).toBe(false);
+		expect(quoted.reads()).toBeLessThan(limit * 0.6);
+		// A document that fits is still counted in full - the answer needs every byte.
+		const fits = probe('x'.repeat(1024));
+		expect(saveFitsTransport('a.html', fits.spy, limit)).toBe(true);
+		expect(fits.reads()).toBe(1024);
+	});
+
 	it('is well below the HTML read cap - a 15 MB export opens, view-only', async () => {
 		const { MAX_HTML_FILE_BYTES } = await import('../../src/lib/server/limits.js');
 		expect(DEFAULT_BODY_SIZE_LIMIT).toBeLessThan(MAX_HTML_FILE_BYTES);
