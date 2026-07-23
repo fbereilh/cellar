@@ -133,16 +133,21 @@ describe('get_full_output default-vs-full image contract', () => {
 		const bigB64 = makePngB64(1600, 1200);
 		nbmod.setOutputs(id, [{ output_type: 'display_data', data: { 'image/png': bigB64 }, metadata: {} }], nb);
 
-		// Default (medium): the image block is downscaled to the threshold, and it
-		// carries a downscaled:{from,to} note so the agent knows it can fetch more.
+		// Default (medium): the image ships in `images` (the transport turns it into a
+		// real MCP image block), downscaled to the threshold, carrying a
+		// downscaled:{from,to} note so the agent knows it can fetch more. It names the
+		// output it came from, and that output still carries its text placeholder.
 		const med = svc.getFullOutput(id, 'medium', nb)!;
-		const medImg = med.outputs.find((o) => (o as { data?: unknown }).data) as { data: string; downscaled?: { from: string; to: string } };
+		const medImg = med.images![0];
+		expect(medImg.output_index).toBe(0);
+		expect(medImg.mime).toBe('image/png');
 		expect(Math.max(dimsOf(medImg.data).width, dimsOf(medImg.data).height)).toBe(IMG_MAX_EDGE);
 		expect(medImg.downscaled).toEqual(expect.objectContaining({ from: '1600×1200', to: '768×576' }));
+		expect((med.outputs[0] as { text?: string }).text).toMatch(/^\[image\/png, 1600×1200, /);
 
-		// Full: the ORIGINAL raster, byte-for-byte, no note.
+		// Full: the ORIGINAL raster, byte-for-byte, no downscale note.
 		const full = svc.getFullOutput(id, 'full', nb)!;
-		const fullImg = full.outputs.find((o) => (o as { data?: unknown }).data) as { data: string; downscaled?: unknown };
+		const fullImg = full.images![0];
 		expect(fullImg.data).toBe(bigB64);
 		expect(dimsOf(fullImg.data)).toEqual({ width: 1600, height: 1200 });
 		expect(fullImg.downscaled).toBeUndefined();

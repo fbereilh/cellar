@@ -47,7 +47,8 @@ import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
-import { IMG_MAX_EDGE, downscaleImageForBlock, imagePlaceholder } from './image';
+import { buildImageBlocks, imagePlaceholder } from './image';
+import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
 import type { CellView, CellOutput, SessionId, LogicalCellType, QueueState } from '../types';
@@ -383,6 +384,33 @@ const imageKey = (o: CellOutput): string | undefined => {
 	const data = 'data' in o ? o.data : undefined;
 	return data ? Object.keys(data).find((k) => k.startsWith('image/')) : undefined;
 };
+
+/**
+ * A cell's image outputs, addressed by their index in `outputs`, ready for the
+ * one block policy (`image.ts` `buildImageBlocks`). Every tool that SHOWS images
+ * collects them here, so what an agent sees never depends on which tool it used.
+ */
+function imageRefs(outputs: CellOutput[] | undefined): ImageOutputRef[] {
+	const refs: ImageOutputRef[] = [];
+	(outputs || []).forEach((o, output_index) => {
+		const mime = imageKey(o);
+		if (mime && 'data' in o) refs.push({ output_index, mime, b64: String(o.data[mime]) });
+	});
+	return refs;
+}
+
+/**
+ * The `images` / `images_omitted` fields a tool result carries when the cell
+ * produced figures. `images` holds the base64 raster; the TRANSPORT (server.ts)
+ * lifts it out into real MCP image blocks and keeps only the metadata in the JSON
+ * text, so the payload is never stringified into the text content twice.
+ */
+function imageFields({ images, omitted }: ImageBlocks): { images?: ImageBlockPayload[]; images_omitted?: OmittedImage[] } {
+	return {
+		...(images.length ? { images } : {}),
+		...(omitted.length ? { images_omitted: omitted } : {})
+	};
+}
 
 function outputText(o: CellOutput): string {
 	switch (o.output_type) {
@@ -994,29 +1022,29 @@ export function getErrors(nb?: string | null) {
 }
 
 /**
- * Tiered: medium cap by default; full only on size='full'. Images passed through.
+ * Tiered: medium cap by default; full only on size='full'. Figures ride in
+ * `images` (real MCP image blocks once the transport lifts them out) alongside
+ * the text summary of every output, which keeps its enriched image placeholder —
+ * so the agent sees BOTH the picture and where in the output list it sat.
  * `ran_this_session: false` means these outputs were saved by a PREVIOUS session
  * - they describe a namespace that no longer exists.
+ *
+ * Default (medium) downscales an oversized raster (a retina/high-DPI figure) to
+ * IMG_MAX_EDGE, cutting image tokens ~3x; size:'full' passes the ORIGINAL bytes
+ * through untouched, so an agent that needs pixel detail opts in and gets it.
  */
 export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium', nb?: string | null) {
 	const c = getCell(asFullId(nb, id), nb);
 	if (!c || isHidden(c)) return null;
 	const cap = size === 'full' ? Infinity : MEDIUM_CAP;
-	const outputs: Array<Record<string, unknown>> = (c.outputs || []).map((o) => {
-		const img = imageKey(o);
-		if (img && 'data' in o) {
-			const raw = String(o.data[img]);
-			// Default path downscales an oversized raster (a retina/high-DPI figure)
-			// to IMG_MAX_EDGE before it becomes an MCP image block, cutting image
-			// tokens ~3x. size:'full' passes the ORIGINAL bytes through untouched, so
-			// an agent that needs pixel detail still opts in and gets it.
-			const scaled = size === 'full' ? { data: raw, resized: false as const } : downscaleImageForBlock(img, raw, IMG_MAX_EDGE);
-			const note = scaled.resized ? { downscaled: { from: `${scaled.width}×${scaled.height}`, to: `${scaled.scaledWidth}×${scaled.scaledHeight}`, full: "get_full_output size:'full' for the original" } } : {};
-			return { type: o.output_type, image: img, data: scaled.data, ...note };
-		}
-		return summarizeOutput(o, cap);
-	});
-	return { id: handleFor(nb, c.id), size, ran_this_session: ranThisSession(c, currentSessionId(nb)), outputs };
+	const outputs = summarizeOutputs(c, cap);
+	return {
+		id: handleFor(nb, c.id),
+		size,
+		ran_this_session: ranThisSession(c, currentSessionId(nb)),
+		outputs,
+		...imageFields(buildImageBlocks(imageRefs(c.outputs), { full: size === 'full' }))
+	};
 }
 
 // --- write ------------------------------------------------------------------
@@ -1381,7 +1409,7 @@ export function getRunQueue(sessionId?: string) {
 export async function runCell(
 	id: string,
 	nbArg?: string | null,
-	opts: { skipStaleness?: boolean } = {}
+	opts: { skipStaleness?: boolean; skipImages?: boolean } = {}
 ): Promise<Record<string, unknown> | null> {
 	const nbAtCall = nbArg ?? getActiveNotebookPath();
 	// Accept a short handle / prefix as well as a full id; `id` is the full UUID from
@@ -1467,7 +1495,15 @@ export async function runCell(
 		const staleAnnotation = opts.skipStaleness
 			? {}
 			: staleFields((await getNotebookStaleness(nb)).cells[id], handleFn(nb));
-		return { id: outId, status, ran_this_session: isLiveSession(session, currentSessionId(nb)), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleAnnotation, ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)) };
+		// A figure this run just produced ships as a real image the agent can SEE
+		// (bounded: downscaled, and capped per result — see image.ts). Without it an
+		// agent authoring plots is blind to its own charts and has to savefig to a
+		// scratch file just to look at what it drew. Skipped in a BATCH, whose
+		// records are deliberately compact (`toBatchRecord`): decoding and
+		// resampling every cell's figures only to discard them is pure CPU, and N
+		// cells' worth of rasters would be a five-figure token bill besides.
+		const images = opts.skipImages ? { images: [], omitted: [] } : buildImageBlocks(imageRefs(outputs));
+		return { id: outId, status, ran_this_session: isLiveSession(session, currentSessionId(nb)), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleAnnotation, ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)), ...imageFields(images) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and
 		// broadcast, so the wire order stays run:end → run:start. Running on EVERY exit
@@ -1595,7 +1631,12 @@ function toBatchRecord(
 			...stale
 		};
 	}
-	return { id: r.id, run_status, ...(outputs.length ? { has_output: true } : {}), ...stale };
+	// has_image says a FIGURE is waiting behind get_full_output, which has_output
+	// alone cannot: a batch never inlines images (see runCell's skipImages), so
+	// without this an agent that just ran 20 plotting cells has no way to know any
+	// of them drew anything except by fetching each one.
+	const hasImage = outputs.some((o) => (o as { image?: unknown }).image != null);
+	return { id: r.id, run_status, ...(outputs.length ? { has_output: true } : {}), ...(hasImage ? { has_image: true } : {}), ...stale };
 }
 
 /**
@@ -1620,7 +1661,7 @@ export async function runCells(ids: string[], nb?: string | null) {
 	const runs: Array<{ r: Record<string, unknown>; cell: CellView | null }> = [];
 	for (const id of ids) {
 		const full = asFullId(target, id);
-		const r = await runCell(full, target, { skipStaleness: true });
+		const r = await runCell(full, target, { skipStaleness: true, skipImages: true });
 		const cell = getCell(full, target);
 		if (r) runs.push({ r, cell: cell ?? null });
 		// An interrupt/restart cancelled this queued run: the namespace the rest of

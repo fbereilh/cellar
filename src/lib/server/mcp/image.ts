@@ -1,18 +1,25 @@
 /**
  * Server-side image handling for the MCP agent surface.
  *
- * Two jobs, both about IMAGE TOKENS:
+ * Three jobs, all about IMAGE TOKENS:
  *
  *  1. `downscaleImageForBlock` shrinks an oversized PNG (a retina / high-DPI
  *     matplotlib figure) down to a bounded longest edge BEFORE it becomes an MCP
- *     image content block on the DEFAULT read path (`get_full_output` medium).
- *     A ~1600×1200 plot costs ~1,600 image tokens; at ~768px it is ~590. The
- *     original bytes are never touched — `get_full_output(id, size:'full')`
+ *     image content block on the DEFAULT paths (a run result, `get_full_output`
+ *     medium). A ~1600×1200 plot costs ~1,600 image tokens; at ~768px it is ~590.
+ *     The original bytes are never touched — `get_full_output(id, size:'full')`
  *     re-encodes nothing and hands back the raw raster, so an agent that needs
  *     pixel detail still opts in and gets it.
  *
- *  2. `imagePlaceholder` builds the terse, image-token-free marker the non-image
- *     read paths (map / read / run) show instead of the raster:
+ *  2. `buildImageBlocks` is the ONE policy seam deciding which of a cell's image
+ *     outputs actually become MCP image blocks, and at what size — the mime
+ *     allowlist, the per-result count cap, and the byte/dimension ceilings. Every
+ *     tool that ships images (run_cell / add_and_run / get_full_output) goes
+ *     through it, so the cost bound cannot drift between them. Anything it
+ *     declines is reported in `omitted` WITH a reason, never dropped silently.
+ *
+ *  3. `imagePlaceholder` builds the terse, image-token-free marker the scan read
+ *     paths (map / read / search) show instead of the raster:
  *     `[image/png, 1600×1200, 46 KB]` — enough for the agent to decide whether to
  *     fetch it, spending zero image tokens.
  *
@@ -155,6 +162,138 @@ export function downscaleImageForBlock(mime: string, b64: string, maxEdge = IMG_
 		// Undecodable / unexpected raster: hand back the original, never a corrupt one.
 		return { data: b64, resized: false };
 	}
+}
+
+/**
+ * The mime types that may be shipped as an MCP image content block. The list is
+ * an ALLOWLIST, not a filter of known-bad types: an LLM host accepts a bounded
+ * raster set, and handing it anything else (notably `image/svg+xml`, which
+ * matplotlib emits under the svg backend) is not "slightly worse output" — the
+ * host rejects the whole tool result, so ONE svg figure would break the call that
+ * carried it. Anything outside this set keeps its enriched text placeholder.
+ */
+export const INLINE_IMAGE_MIMES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'];
+
+/**
+ * How many image blocks ONE tool result may carry. A cell that plots in a loop
+ * can emit dozens of figures; at ~590 image tokens each, an uncapped result is a
+ * five-figure token bill from a single `add_and_run`. Four covers the real cases
+ * (one figure, or a small subplot series) and the rest are reported in
+ * `images_omitted` with the `get_full_output` route to them — bounded, never
+ * silently truncated.
+ */
+export const MAX_IMAGE_BLOCKS = 4;
+
+/**
+ * Decoded-byte ceiling for one image block. Hosts cap an inline image (~5 MB is
+ * the common limit, measured on the base64 payload, which is 4/3 of this), and a
+ * rejected block fails the entire tool result — so an image over the ceiling is
+ * downscaled to fit, and omitted with a reason if even that will not fit. Chosen
+ * well under the limit: the point is a figure the agent can READ, not a raster.
+ */
+export const IMAGE_BLOCK_MAX_BYTES = 3.5 * 1024 * 1024;
+
+/** Hard pixel ceiling per edge (hosts reject beyond ~8000px). */
+export const MAX_IMAGE_EDGE_HARD = 8000;
+
+/** One image output of a cell, as the service hands it to the policy. */
+export interface ImageOutputRef {
+	/** Index of the output within the cell's `outputs` array. */
+	output_index: number;
+	mime: string;
+	/** base64 raster as stored on the cell. */
+	b64: string;
+}
+
+/** An image the transport turns into an MCP image block (`data` is base64). */
+export interface ImageBlockPayload {
+	output_index: number;
+	mime: string;
+	data: string;
+	width?: number;
+	height?: number;
+	/** Present when the raster shipped is smaller than the one on the cell. */
+	downscaled?: { from: string; to: string; note?: string };
+}
+
+/** An image that was NOT shipped, and why — always reported, never silent. */
+export interface OmittedImage {
+	output_index: number;
+	mime: string;
+	reason: 'unsupported_mime' | 'limit' | 'too_large';
+	note: string;
+}
+
+export interface ImageBlocks {
+	images: ImageBlockPayload[];
+	omitted: OmittedImage[];
+}
+
+const FETCH_FULL = "get_full_output(id, size:'full') returns the original bytes";
+
+/**
+ * Decide which of a cell's image outputs become MCP image blocks, and at what
+ * size. The single cost bound for every tool that ships images.
+ *
+ * `full` (get_full_output size:'full') skips the routine downscale so an agent
+ * that asked for pixel detail gets the original raster — but the byte/dimension
+ * ceilings still apply, because they are about what the HOST will accept, not
+ * about token thrift: an oversized original is downscaled to fit (with a note
+ * saying so) rather than shipped as a block the host would reject.
+ */
+export function buildImageBlocks(
+	items: ImageOutputRef[],
+	{ full = false, maxEdge = IMG_MAX_EDGE, limit = MAX_IMAGE_BLOCKS, maxBytes = IMAGE_BLOCK_MAX_BYTES }: { full?: boolean; maxEdge?: number; limit?: number; maxBytes?: number } = {}
+): ImageBlocks {
+	const images: ImageBlockPayload[] = [];
+	const omitted: OmittedImage[] = [];
+	for (const item of items) {
+		const { output_index, mime, b64 } = item;
+		if (!INLINE_IMAGE_MIMES.includes(mime)) {
+			omitted.push({ output_index, mime, reason: 'unsupported_mime', note: `${mime} cannot be shown as an image; read the output text instead` });
+			continue;
+		}
+		if (images.length >= limit) {
+			omitted.push({ output_index, mime, reason: 'limit', note: `only the first ${limit} images are shown; ${FETCH_FULL}` });
+			continue;
+		}
+		const block = fitImageBlock(output_index, mime, b64, full, maxEdge, maxBytes);
+		if (block) images.push(block);
+		else omitted.push({ output_index, mime, reason: 'too_large', note: `image too large to inline; ${FETCH_FULL}` });
+	}
+	return { images, omitted };
+}
+
+/**
+ * One image, scaled to policy: downscale unless `full`, then enforce the host
+ * ceilings — falling back to a downscale for an oversized `full` image, and
+ * returning null only when even that does not fit (a huge non-PNG, which we
+ * cannot resample). Never returns a payload we know the host would reject.
+ */
+function fitImageBlock(output_index: number, mime: string, b64: string, full: boolean, maxEdge: number, maxBytes: number): ImageBlockPayload | null {
+	const scaled = full ? { data: b64, resized: false as const } : downscaleImageForBlock(mime, b64, maxEdge);
+	const build = (s: ScaledImage, note?: string): ImageBlockPayload => ({
+		output_index,
+		mime,
+		data: s.data,
+		...(s.width != null ? { width: s.width, height: s.height } : {}),
+		...(s.resized ? { downscaled: { from: `${s.width}×${s.height}`, to: `${s.scaledWidth}×${s.scaledHeight}`, ...(note ? { note } : { note: FETCH_FULL }) } } : {})
+	});
+	if (withinHostLimits(mime, scaled.data, maxBytes)) return build(scaled);
+	// Over a host ceiling. A routine (already downscaled) image that still does not
+	// fit is beyond what we can do; a `full` one gets the ordinary downscale as a
+	// fallback, so "I asked for full res" degrades to a smaller figure, not to none.
+	if (!full) return null;
+	const retry = downscaleImageForBlock(mime, b64, maxEdge);
+	if (retry.resized && withinHostLimits(mime, retry.data, maxBytes)) return build(retry, 'the original exceeds the inline image size limit, so a downscaled copy is shown');
+	return null;
+}
+
+/** Whether a raster is small enough (bytes AND pixels) for a host to accept it. */
+function withinHostLimits(mime: string, b64: string, maxBytes: number): boolean {
+	if (base64Bytes(b64) > maxBytes) return false;
+	const dim = imageDimensions(mime, b64);
+	return !dim || Math.max(dim.width, dim.height) <= MAX_IMAGE_EDGE_HARD;
 }
 
 /**
