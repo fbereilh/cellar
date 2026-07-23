@@ -114,6 +114,11 @@ test('move_cell takes a cell handle, so no map fetch is needed to move one cell'
 	const none = await callRaw('move_cell', { id: c0 });
 	expect(none.isError).toBe(true);
 	expect(none.content[0].text).toMatch(/after_id, before_id, or position/);
+	// "Give exactly ONE destination" is enforced: an anchor plus a position is an
+	// under-specified move, rejected rather than silently letting the anchor win.
+	const both = await callRaw('move_cell', { id: c0, after_id: c1, position: 0 });
+	expect(both.isError).toBe(true);
+	expect(both.content[0].text).toMatch(/not position together with an anchor/i);
 });
 
 test('delete_cells drops many cells in ONE call, leaving the rest intact', async () => {

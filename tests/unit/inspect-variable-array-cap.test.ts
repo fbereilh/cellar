@@ -106,7 +106,11 @@ describe.skipIf(!hasPandas)('inspect_variable on a real DataFrame' + (hasPandas 
 		// A Series of arrays hits the same trap through a different branch.
 		'ser = pd.Series([list(range(1000)) for _ in range(40)])',
 		// A text column: one oversized value, not an array.
-		'docs = pd.DataFrame({"body": ["y" * 5000] * 30})'
+		'docs = pd.DataFrame({"body": ["y" * 5000] * 30})',
+		// A WIDE but plain scalar frame: 30 int columns, no arrays, no long
+		// strings. The head budget must NOT clip it and its text-table repr must
+		// survive — the regression a 2-column control could never catch.
+		'wide = pd.DataFrame({("col_%d" % i): range(100) for i in range(30)})'
 	].join('\n');
 
 	it('bounds an array-valued frame on every axis, and names the bounds', () => {
@@ -156,12 +160,40 @@ describe.skipIf(!hasPandas)('inspect_variable on a real DataFrame' + (hasPandas 
 		expect(cost(d)).toBeLessThan(INSPECT_HEAD_BUDGET);
 	});
 
-	it('caps an oversized STRING cell without dropping the column', () => {
+	it('caps an oversized STRING cell without dropping the column, naming ONLY the string bound', () => {
 		const d = inspect(FRAMES, ['docs']).docs;
 		const rows = d.head as Array<Record<string, string>>;
 		expect(rows.length).toBe(INSPECT_HEAD_ROWS); // strings are not "arrays": rows stay
 		for (const row of rows) expect(row.body.length).toBeLessThanOrEqual(INSPECT_STR_CHARS + 1);
 		expect(d.head_truncated).toBe(true);
 		expect(cost(d)).toBeLessThan(INSPECT_HEAD_BUDGET);
+		// Honesty: the note names the STRING cap that bit and not the array cap or
+		// a row cap that never applied (the F1 finding).
+		expect(String(d.head_note)).toMatch(/strings capped at 200 chars/);
+		expect(String(d.head_note)).not.toMatch(/arrays capped/);
+		expect(String(d.head_note)).not.toMatch(/rows\/items/);
+		// A string column is a second dump of oversized values, so repr is cut too.
+		expect(d.repr_truncated).toBe(true);
+	});
+
+	it('leaves a WIDE plain scalar frame fully intact — the budget clips arrays, not width', () => {
+		// The review's real bug: keying the repr cut and a blanket array/string
+		// head_note on head_truncated made a merely-wide scalar frame lose its
+		// text-table repr and get told "arrays capped at 8 items" when no array
+		// or long string existed. A 30-column int frame must be untouched (the
+		// 2-column `plain` control above is too narrow to trip the budget).
+		const d = inspect(FRAMES, ['wide']).wide;
+		expect(d.kind).toBe('dataframe');
+		expect(d.shape).toEqual([100, 30]);
+		expect(d.head_rows).toBe(INSPECT_HEAD_ROWS); // full sample, not the array-row cap
+		expect((d.head as unknown[]).length).toBe(INSPECT_HEAD_ROWS);
+		// No bound bit, so nothing is claimed and nothing is dropped.
+		expect(d.head_truncated).toBeUndefined();
+		expect(d.head_note).toBeUndefined();
+		expect(d.repr_truncated).toBeUndefined();
+		// Every cell is its real integer — no "…" placeholder anywhere.
+		const rows = d.head as Array<Record<string, number>>;
+		expect(Object.keys(rows[0])).toHaveLength(30);
+		for (const row of rows) for (const v of Object.values(row)) expect(typeof v).toBe('number');
 	});
 });

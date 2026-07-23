@@ -470,24 +470,27 @@ def _cellar_arrayish(_vals):
 
 def _cellar_shrink(_x, _b):
     """Bound one JSON-loaded value: arrays to _CELLAR_ARR_N items, strings to
-    _CELLAR_STR_N chars, and the head as a whole to _b['left'] characters.
-    Sets _b['cut'] whenever anything was dropped, so the caller can SAY so.
+    _CELLAR_STR_N chars, and the head as a whole to _b['left'] characters. Sets
+    the SPECIFIC bound that bit on _b - 'arr' (array-item cap), 'str' (string
+    cap), 'budget' (aggregate exhaustion) - so the caller names ONLY the bound
+    that actually applied, never a blanket 'arrays/strings capped' that a wide
+    frame of plain ints did not hit.
 
     A dict keeps EVERY key (a spent budget yields '…' as the value, never a
     missing column): a record with a column silently absent reads as a frame
     that does not have that column."""
     if isinstance(_x, str):
         if _b['left'] <= 0:
-            _b['cut'] = True
+            _b['budget'] = True
             return '…'
         if len(_x) > _CELLAR_STR_N:
-            _b['cut'] = True
+            _b['str'] = True
             _x = _x[:_CELLAR_STR_N] + '…'
         _b['left'] -= len(_x)
         return _x
     if _x is None or isinstance(_x, (bool, int, float)):
         if _b['left'] <= 0:
-            _b['cut'] = True
+            _b['budget'] = True
             return '…'
         _b['left'] -= 8
         return _x
@@ -499,29 +502,34 @@ def _cellar_shrink(_x, _b):
         return _out
     if isinstance(_x, (list, tuple)):
         if _b['left'] <= 0:
-            _b['cut'] = True
+            _b['budget'] = True
             return '…'
         _n = len(_x)
         _out = [_cellar_shrink(_i, _b) for _i in list(_x)[:_CELLAR_ARR_N]]
         if _n > _CELLAR_ARR_N:
-            _b['cut'] = True
+            _b['arr'] = True
             _out.append('… %d more (%d total)' % (_n - _CELLAR_ARR_N, _n))
         return _out
     return _cellar_shrink(str(_x), _b)
 
-def _cellar_head_note(_rows_capped, _cut):
-    """The bounds that actually BIT, named. Never claims one that did not: a
-    two-row frame of arrays is not 'capped at 3 rows'."""
+def _cellar_head_note(_rows_capped, _b):
+    """Name ONLY the bounds that actually bit. Never claims one that did not: a
+    two-row frame of arrays is not 'capped at 3 rows', and a wide frame of plain
+    ints whose tail the budget dropped is not 'arrays capped at 8 items' - it
+    says the budget bit, and nothing else."""
     _bounds = []
     if _rows_capped:
         _bounds.append('sample capped at %d rows/items because the values are arrays' % ${INSPECT_ARRAY_HEAD_ROWS})
-    if _cut:
-        _bounds.append('arrays capped at %d items, strings at %d chars; "…" marks what was dropped'
-                       % (_CELLAR_ARR_N, _CELLAR_STR_N))
+    if _b.get('arr'):
+        _bounds.append('arrays capped at %d items' % _CELLAR_ARR_N)
+    if _b.get('str'):
+        _bounds.append('strings capped at %d chars' % _CELLAR_STR_N)
+    if _b.get('budget'):
+        _bounds.append('later values dropped at the ~%d-char budget' % _CELLAR_BUDGET)
     if not _bounds:
         return None
     return ('head bounded to keep this cheap: ' + '; '.join(_bounds)
-            + '. Run a cell to see full values.')
+            + '; "…" marks what was dropped. Run a cell to see full values.')
 
 def _cellar_inspect(_target):
     try:
@@ -534,7 +542,14 @@ def _cellar_inspect(_target):
         return {'found': False, 'name': _target}
     _N = ${INSPECT_HEAD_ROWS}
     _AN = ${INSPECT_ARRAY_HEAD_ROWS}
-    _b = {'left': _CELLAR_BUDGET, 'cut': False}
+    # The aggregate character budget guards against ARRAY explosion (a wide frame
+    # of long arrays), so it applies only once the values are arrayish; a frame
+    # of plain scalars runs with an effectively unlimited budget and keeps its
+    # full head, so scalar output stays exactly as it was. 'arrayish' drives the
+    # repr cut (the repr is a second dump of the SAME large values); it is kept
+    # DISTINCT from the per-value 'arr' flag, which alone may claim a cap bit.
+    _BIG = 10 ** 9
+    _b = {'left': _BIG, 'arr': False, 'str': False, 'budget': False, 'arrayish': False}
     _t = type(_v)
     _tn = _t.__name__
     _mod = getattr(_t, '__module__', '') or ''
@@ -566,6 +581,8 @@ def _cellar_inspect(_target):
             except Exception:
                 pass
             _arrayish = _cellar_arrayish(_sample)
+            _b['arrayish'] = _b['arrayish'] or _arrayish
+            _b['left'] = _CELLAR_BUDGET if _arrayish else _BIG
             _rows = _AN if _arrayish else _N
             # Shrink each RECORD, never the record list: shrinking the outer list
             # would cap the row count at _CELLAR_ARR_N and quietly shorten an
@@ -573,7 +590,7 @@ def _cellar_inspect(_target):
             _entry['head'] = [_cellar_shrink(_r, _b) for _r in
                               _cj.loads(_v.head(_rows).to_json(orient='records', date_format='iso', default_handler=str))]
             _entry['head_rows'] = int(min(_rows, _v.shape[0]))
-            _note = _cellar_head_note(_arrayish and int(_v.shape[0]) > _AN, _b['cut'])
+            _note = _cellar_head_note(_arrayish and int(_v.shape[0]) > _AN, _b)
             if _note:
                 _entry['head_truncated'] = True
                 _entry['head_note'] = _note
@@ -582,11 +599,13 @@ def _cellar_inspect(_target):
             _entry['dtype'] = str(_v.dtype)
             _entry['size'] = int(_v.shape[0])
             _arrayish = _cellar_arrayish(list(_v.head(min(3, int(_v.shape[0])))))
+            _b['arrayish'] = _b['arrayish'] or _arrayish
+            _b['left'] = _CELLAR_BUDGET if _arrayish else _BIG
             _rows = _AN if _arrayish else _N
             _entry['head'] = _cellar_shrink(
                 _cj.loads(_v.head(_rows).to_json(date_format='iso', default_handler=str)), _b)
             _entry['head_rows'] = int(min(_rows, _v.shape[0]))
-            _note = _cellar_head_note(_arrayish and int(_v.shape[0]) > _AN, _b['cut'])
+            _note = _cellar_head_note(_arrayish and int(_v.shape[0]) > _AN, _b)
             if _note:
                 _entry['head_truncated'] = True
                 _entry['head_note'] = _note
@@ -606,10 +625,14 @@ def _cellar_inspect(_target):
             try:
                 # Per ITEM, not over the item list — see the DataFrame branch.
                 # A numeric array passes through untouched; an object array of
-                # lists (the case that blows up) is bounded like a frame cell.
-                _entry['head'] = [_cellar_shrink(_i, _b) for _i in
-                                  _cj.loads(_cj.dumps(_v.ravel()[:_N].tolist(), default=str))]
-                _note = _cellar_head_note(False, _b['cut'])
+                # lists (the case that blows up) is bounded like a frame cell,
+                # so the aggregate budget applies only when the items are arrays.
+                _headvals = _cj.loads(_cj.dumps(_v.ravel()[:_N].tolist(), default=str))
+                _arrayish = _cellar_arrayish(_headvals[:3])
+                _b['arrayish'] = _b['arrayish'] or _arrayish
+                _b['left'] = _CELLAR_BUDGET if _arrayish else _BIG
+                _entry['head'] = [_cellar_shrink(_i, _b) for _i in _headvals]
+                _note = _cellar_head_note(False, _b)
                 if _note:
                     _entry['head_truncated'] = True
                     _entry['head_note'] = _note
@@ -633,6 +656,7 @@ def _cellar_inspect(_target):
             # them (each a 200-char repr) is a page of noise for one look.
             _items = list(_v)[:_N]
             _arrayish = _cellar_arrayish(_items[:3])
+            _b['arrayish'] = _b['arrayish'] or _arrayish
             if _arrayish:
                 _items = _items[:_AN]
             _head = []
@@ -646,7 +670,7 @@ def _cellar_inspect(_target):
                     _ir = _ir[:197] + '...'
                 _head.append(_ir)
             _entry['head'] = _head
-            _note = _cellar_head_note(_arrayish and min(len(_v), _N) > _AN, False)
+            _note = _cellar_head_note(_arrayish and min(len(_v), _N) > _AN, _b)
             if _note:
                 _entry['head_truncated'] = True
                 _entry['head_note'] = _note
@@ -659,11 +683,14 @@ def _cellar_inspect(_target):
                 pass
     except Exception as _e:
         _entry['detail_error'] = str(_e)
-    # Once the head had to be bounded, the repr is a SECOND dump of the very arrays
-    # it just bounded — the biggest remaining cost and the least informative part
-    # of the answer (kind/shape/columns/head already say it), so it is cut back
-    # too. Untouched for every variable whose head fit.
-    if _entry.get('head_truncated') and len(_entry.get('repr', '')) > _CELLAR_REPR_N:
+    # Cut the repr back ONLY when the values are genuinely arrays or oversized
+    # strings — then the repr is a second dump of the SAME large values the head
+    # just bounded, and kind/shape/columns/head already carry it. Keyed on that
+    # array/oversize signal, NOT on head_truncated: a plain WIDE scalar frame can
+    # trip the aggregate budget (head_truncated true) yet its text-table repr is
+    # useful and small, so it MUST stay intact — "scalar output unchanged".
+    _repr_heavy = _b.get('arrayish') or _b.get('arr') or _b.get('str')
+    if _repr_heavy and len(_entry.get('repr', '')) > _CELLAR_REPR_N:
         _entry['repr'] = _entry['repr'][:_CELLAR_REPR_N] + '…'
         _entry['repr_truncated'] = True
     return _entry
@@ -714,7 +741,7 @@ export async function listVariables(nbPath?: string | null) {
 export async function inspectVariable(name: string, nbPath?: string | null) {
 	const guard = inspectionGuard(nbPath);
 	if (guard) return guard;
-	const code = INSPECT_PROBE_HEAD + `\nprint(_cj.dumps(_cellar_inspect(${JSON.stringify(String(name))})))\ndel _cellar_inspect, _cellar_shrink, _cellar_arrayish, _cellar_head_note\n`;
+	const code = INSPECT_PROBE_HEAD + `\nprint(_cj.dumps(_cellar_inspect(${JSON.stringify(String(name))})))\ndel _cellar_inspect, _cellar_shrink, _cellar_arrayish, _cellar_head_note, _CELLAR_ARR_N, _CELLAR_STR_N, _CELLAR_BUDGET, _CELLAR_REPR_N\n`;
 	const { session, line } = await execProbe(code, nbPath);
 	const stale = session !== currentSessionId(nbPath);
 	// INSPECT_PROBE_HEAD prints one _cellar_inspect detail object (or {found:false}).

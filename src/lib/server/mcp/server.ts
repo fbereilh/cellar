@@ -192,7 +192,7 @@ const ROUTE_IMPORTS_PTR = ` Module-level imports are auto-routed to the notebook
  * module's own constants, so prose and policy cannot disagree: written as literals
  * here, changing a constant would silently leave the agent a wrong description.
  */
-const IMAGE_DOC = ` FIGURES COME BACK AS IMAGES YOU CAN SEE: an image output (a matplotlib/plotly figure) is returned as a real image content block, not a text placeholder — so LOOK at the chart you just drew (labels, ticks, whether the data is what you meant) instead of saving it to a file to read it back. Bounded to stay cheap: an oversized raster is downscaled to ~${IMG_MAX_EDGE}px on the longest edge, at most ${MAX_IMAGE_BLOCKS} images ride in an automatic RUN result (an explicit get_full_output(id) ships up to ${MAX_FULL_OUTPUT_IMAGE_BLOCKS}), and a format that is not inlined (image/svg+xml, image/webp) keeps its text placeholder. Nothing is lost to a bound: whatever did not fit is listed in images_omitted with the call that resumes there — get_full_output(id, images_from: N) returns the images from output N on, so a cell with dozens of figures is paged, never truncated. Every output still appears in \`outputs\` with its [image/png, WxH, KB] placeholder, and \`images\` names each one's output_index. Use get_full_output(id, size:"full") when you need pixel detail.`;
+const IMAGE_DOC = ` FIGURES COME BACK AS IMAGES YOU CAN SEE: an image output (a matplotlib/plotly figure) is returned as a real image content block, not a text placeholder — so LOOK at the chart you just drew (labels, ticks, whether the data is what you meant) instead of saving it to a file to read it back. Bounded to stay cheap: an oversized raster is downscaled to ~${IMG_MAX_EDGE}px on the longest edge, at most ${MAX_IMAGE_BLOCKS} images ride in an automatic RUN result (an explicit get_full_output(id) ships up to ${MAX_FULL_OUTPUT_IMAGE_BLOCKS}), and a format that is not inlined (image/svg+xml, image/webp) keeps its text placeholder. Nothing is lost to a bound: whatever did not fit is listed in images_omitted with the call that resumes there — get_full_output(id, images_from: N) returns the images from output N on, so a cell with dozens of figures is paged, never truncated. A consecutive run declined by the SAME bound is ONE images_omitted entry carrying a \`count\` (how many) plus the output_index to resume at; a per-figure reason (unsupported_mime, too_large) names its own output. Every output still appears in \`outputs\` with its [image/png, WxH, KB] placeholder, and \`images\` names each one's output_index. Use get_full_output(id, size:"full") when you need pixel detail.`;
 
 /**
  * House-style doctrine handed to the agent once at connect (MCP server
@@ -498,6 +498,13 @@ function registerTools(server: McpServer) {
 		const target = targetOf(extra, notebook);
 		const res = resolveOne(target, id);
 		if ('error' in res) return res.error;
+		// "Give exactly ONE destination" is enforced, not merely documented: an
+		// anchor plus a position is a move the caller under-specified, and silently
+		// letting the anchor win (destIndex ignores position when an anchor is
+		// present) hides that from them. Reject the combination up front, exactly
+		// like after_id + before_id below.
+		if (position != null && (after_id != null || before_id != null))
+			return notFound('give exactly one destination: after_id, before_id, OR position — not position together with an anchor');
 		// Resolve the anchor at the same boundary as every other cell ref, so an
 		// ambiguous prefix errors here rather than silently missing below.
 		const dest: svc.MoveDest = { position };
