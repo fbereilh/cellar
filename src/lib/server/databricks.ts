@@ -101,6 +101,7 @@ import {
 	versionMismatchMessage
 } from './dbrVersion';
 import { normalizeDatabricksHost } from '../databricksHost';
+import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
 import { resolveNotebookPath } from './notebook';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
@@ -148,7 +149,9 @@ interface ProbeRequest {
  * (narrowed at each use site); failure is the fixed `{code, message}` contract.
  */
 type ProbeOk = { ok: true } & Record<string, unknown>;
-type ProbeFail = { ok: false; code: string; message: string };
+// `profile` is never printed by the python side: it is attached in Node by
+// `reclassifyReauth`, which alone knows WHICH profile the failing call resolved.
+type ProbeFail = { ok: false; code: string; message: string; profile?: string };
 type ProbeResult = ProbeOk | ProbeFail;
 
 // Op-specific views of a `ProbeOk` payload, applied with a single `as` where the
@@ -857,10 +860,17 @@ sys.stdout.write('${SENTINEL}' + json.dumps(result) + '\\n')
 /** A structured failure both API routes and the UI understand. `code` drives the UI's copy. */
 export class DatabricksError extends Error {
 	code: string;
-	constructor(code: string, message: string) {
+	/**
+	 * The `~/.databrickscfg` profile the failure is about. Set only for
+	 * `profile_reauth_required`, where the UI needs the real name to render the
+	 * exact `databricks auth login --profile <name>` command (never hardcoded).
+	 */
+	profile?: string;
+	constructor(code: string, message: string, profile?: string) {
 		super(message);
 		this.name = 'DatabricksError';
 		this.code = code;
+		if (profile) this.profile = profile;
 	}
 }
 
@@ -876,6 +886,7 @@ export function statusFor(code: string): number {
 		case 'profile_missing':
 		case 'oauth_login_required':
 		case 'login_failed':
+		case PROFILE_REAUTH_CODE:
 			return 401;
 		case 'permission_denied':
 			return 403;
@@ -911,6 +922,52 @@ function requirePython(): string {
 		);
 	}
 	return python;
+}
+
+/**
+ * Re-label a failure that is really "this NAMED profile's CLI-managed sign-in
+ * expired" - the one auth dead end Cellar cannot fix for the user.
+ *
+ * The python side cannot make this call: `classify()` sees only the message, and
+ * an expired `databricks-cli` refresh token reads as `oauth_login_required` (the
+ * text mentions OAuth) or `auth_failed`. Both send the user to the sidebar's
+ * "Sign in with Databricks" button, which runs CELLAR's own browser OAuth - it
+ * mints a token into the SDK's python-local cache that a `databricks-cli`
+ * profile never reads, so the user is stuck. So the decision is made HERE, where
+ * the resolved `Auth` says which profile was actually asked for.
+ *
+ * Scoped deliberately:
+ *   - only `mode: 'profile'` - a bare typed **host** has no CLI profile to log
+ *     into, and its dead token IS the one Cellar's own sign-in re-mints, so
+ *     `oauth_login_required` stays correct there.
+ *   - never a `needsSignIn` profile (a no-token `auth_type = external-browser`
+ *     one): that is also Cellar's own to re-mint (`hasCellarCachedOAuth`), so
+ *     redirecting it to the CLI would be the same dead end with the sign flipped.
+ */
+function reclassifyReauth(auth: Auth | undefined, result: ProbeResult): ProbeResult {
+	if (!result || result.ok !== false) return result;
+	if (!auth || auth.mode !== 'profile' || auth.needsSignIn) return result;
+	if (!isProfileReauthError(result.message)) return result;
+	return {
+		ok: false,
+		code: PROFILE_REAUTH_CODE,
+		message: reauthMessage(auth.profile, result.message),
+		profile: auth.profile
+	};
+}
+
+/**
+ * Is this failure the expired-profile verdict, complete enough to ACT on?
+ *
+ * The whole remedy is a command that names a profile, so a verdict without one
+ * cannot be shown as this case: it would render `databricks auth login --profile`
+ * with nothing after it. `reclassifyReauth` - the only producer - always sets the
+ * name, so this fails closed on a shape that could not have come from it. The one
+ * predicate every surface (the reconnect ladder, the agent status, the UI status)
+ * reads, so none of them can decide it differently.
+ */
+function profileReauthVerdict(err: unknown): DatabricksError | undefined {
+	return err instanceof DatabricksError && err.code === PROFILE_REAUTH_CODE && err.profile ? err : undefined;
 }
 
 /** Run one `PROBE` command in the project venv and return its parsed result. */
@@ -978,7 +1035,10 @@ function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS): Promise<Pro
 			}
 			try {
 				// The one dynamic boundary: parse the sentinel JSON line into ProbeResult.
-				const result = JSON.parse(line.slice(SENTINEL.length)) as ProbeResult;
+				// An expired named-profile sign-in is re-labelled here (the python side
+				// cannot tell which profile was asked for) BEFORE the log, so the log
+				// records the code the caller actually gets.
+				const result = reclassifyReauth(request.auth, JSON.parse(line.slice(SENTINEL.length)) as ProbeResult);
 				// The probe never raises; a failure comes back as {ok:false, code, message}.
 				// That message carries the REAL cause (`Exc: detail`) - record it so the
 				// user sees why the op failed, beyond the friendly sidebar text.
@@ -998,7 +1058,11 @@ function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS): Promise<Pro
 /** Throw a `DatabricksError` for a `{ok:false}` probe/kernel result; else return it. */
 function unwrap(result: ProbeResult): ProbeOk {
 	if (result?.ok) return result;
-	throw new DatabricksError(result?.code || 'error', result?.message || 'Databricks call failed');
+	throw new DatabricksError(
+		result?.code || 'error',
+		result?.message || 'Databricks call failed',
+		result?.profile
+	);
 }
 
 /**
@@ -2026,6 +2090,25 @@ interface ConnState {
 	livenessInFlight: Promise<Liveness> | null;
 	/** In-flight auto-reconnect for one notebook, so a burst of expired-status reads heals once. */
 	reconnecting: Promise<boolean> | null;
+	/**
+	 * The CLASSIFIED failure of the last reconnect attempt (`reconnectTo`), kept
+	 * because the recovery ladder's own failure channel is lossy: rung 2
+	 * (`autoReconnect`) reports a bare `false` and rung 3
+	 * (`reconnectAfterKernelRestart`) flattens the error to a string reason, since
+	 * both are called fire-and-forget by paths that must never throw. Flattening
+	 * discards `DatabricksError.code`/`.profile`, so an actionable cause -
+	 * `profile_reauth_required` above all, whose whole point is naming the profile
+	 * to re-authenticate - degraded into the generic "reconnect from the sidebar"
+	 * dead end. `reconnectSession` clears this before walking the ladder, so
+	 * whatever is here afterwards belongs to THAT attempt, never a stale one.
+	 *
+	 * It also outlives that one call, deliberately: the same dead token is what the
+	 * automatic self-heal keeps hitting, and the status surfaces have to be able to
+	 * SAY so (see `pendingReauth`). It is retired the moment a `connect()` succeeds
+	 * - a live session is proof the credential works - so it can only ever describe
+	 * a binding that is still broken.
+	 */
+	reconnectError: DatabricksError | null;
 }
 
 const states = new Map<string, ConnState>();
@@ -2042,11 +2125,33 @@ function stateFor(nb: string): ConnState {
 			inFlight: false,
 			liveness: null,
 			livenessInFlight: null,
-			reconnecting: null
+			reconnecting: null,
+			reconnectError: null
 		};
 		states.set(nb, s);
 	}
 	return s;
+}
+
+/**
+ * The expired-profile verdict that still describes THIS notebook's state, or
+ * undefined - the ONE thing the status surfaces may read to say "your saved
+ * sign-in for profile X died; run `databricks auth login --profile X`" instead of
+ * the generic "reconnect from the Databricks sidebar section" (a button that runs
+ * Cellar's own browser sign-in and mints a token a CLI-managed profile never
+ * reads, i.e. the dead end this whole case exists to retire).
+ *
+ * Two conditions keep it honest, and both are load-bearing - a verdict that no
+ * longer describes the present is worse than no verdict at all:
+ *   - the notebook is still BOUND (`reconnectTarget`), so the failure is about a
+ *     session Cellar is still trying to restore, not one the user disconnected;
+ *   - nothing has succeeded since. Every established session goes through
+ *     `connect()`, which clears the field, so a credential that has been proven to
+ *     work cannot leave a stale "expired" behind.
+ */
+function pendingReauth(s: ConnState): DatabricksError | undefined {
+	if (!s.reconnectTarget) return undefined;
+	return profileReauthVerdict(s.reconnectError);
 }
 
 /** How long a liveness probe result is trusted before it must be refreshed. */
@@ -2146,15 +2251,28 @@ async function probeLiveness(nb: string, session: SessionId | null): Promise<Liv
  * seam both reconnection triggers - the server-side expiry self-heal and the
  * kernel-restart re-establish - go through, so they reconnect to the EXACT same
  * profile+cluster; there is no second reconnection mechanism to drift.
+ *
+ * Being that one seam is also why the classified failure is recorded HERE: both
+ * callers must swallow their error (they are driven fire-and-forget), so this is
+ * the last place that still holds the `DatabricksError` `connect()` raised, with
+ * its `code` and `profile` intact. See `ConnState.reconnectError`.
  */
 async function reconnectTo(nb: string, target: ReconnectTarget): Promise<void> {
-	await connect({
-		profile: target.sel.profile ?? null,
-		host: target.sel.host ?? null,
-		clusterId: target.clusterId,
-		clusterName: target.clusterName,
-		nb
-	});
+	const s = stateFor(nb);
+	try {
+		// A success needs no clearing here: `connect()` retires `reconnectError` itself,
+		// so the manual connect path cannot leave one behind either.
+		await connect({
+			profile: target.sel.profile ?? null,
+			host: target.sel.host ?? null,
+			clusterId: target.clusterId,
+			clusterName: target.clusterName,
+			nb
+		});
+	} catch (err) {
+		s.reconnectError = err instanceof DatabricksError ? err : null;
+		throw err;
+	}
 }
 
 /**
@@ -2375,6 +2493,13 @@ export async function connect({
 	if (s.inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
 	s.inFlight = true;
 	try {
+		// A recorded expired-profile verdict belongs to a PAST attempt. Retire it the
+		// instant a fresh connect begins, exactly as `reconnectSession` self-clears at
+		// entry, so a renewed-but-compute-failed connect (a terminated cluster, a
+		// version mismatch) can never render a stale "your sign-in expired" remedy
+		// over a credential this attempt is about to prove. A genuine expired profile
+		// re-records its own fresh verdict below (`reclassifyReauth` → `reconnectTo`).
+		s.reconnectError = null;
 		logInfo('databricks', `connecting: profile "${profile}", cluster "${clusterName || clusterId}"`);
 		// Part A (prevention): resolve the cluster's Databricks Runtime and pin a
 		// matching databricks-connect client BEFORE building the session, so a
@@ -2397,6 +2522,11 @@ export async function connect({
 			}
 		}
 
+		// `CONNECT_CODE` hardcodes `auth_failed` for the Config/WorkspaceClient step,
+		// so the same expired-profile dead end reaches the sidebar from the kernel
+		// too. Same reclassification, same reason - see `reclassifyReauth`.
+		result = reclassifyReauth(auth, result);
+
 		if (!result.ok) {
 			s.connection = null;
 			s.connectedSel = null;
@@ -2411,7 +2541,7 @@ export async function connect({
 				throw new DatabricksError('version_mismatch', message);
 			}
 			logError('databricks', `connect failed [${result.code || 'error'}]: ${result.message || 'unknown error'}`);
-			throw new DatabricksError(result.code || 'error', result.message);
+			throw new DatabricksError(result.code || 'error', result.message, result.profile);
 		}
 		const ok = payload<ConnectPayload>(result);
 		s.connection = {
@@ -2429,6 +2559,10 @@ export async function connect({
 		// re-establish the SAME session automatically (reconnectAfterKernelRestart).
 		s.reconnectTarget = { sel: s.connectedSel, clusterId, clusterName: s.connection.clusterName };
 		s.lost = null;
+		// A live session is proof the credential works, so it retires any recorded
+		// reconnect failure - above all an expired-profile verdict, which the status
+		// surfaces would otherwise keep showing over a connection that just came up.
+		s.reconnectError = null;
 		// A fresh session is alive by construction; seed the cache so an immediate
 		// status read doesn't pay for a redundant liveness probe.
 		s.liveness = { session, alive: true, expired: false, checkedAt: Date.now() };
@@ -2519,6 +2653,23 @@ async function assessLiveness(abs: string, status: Connected, { heal }: { heal: 
 }
 
 /**
+ * What an agent is told when the one auth dead end Cellar cannot fix is what is
+ * keeping this notebook's session down. The command is built from the shared
+ * `reauthCommand`, so what the agent relays and what the sidebar prints cannot
+ * drift; the fields are structured too, so a tool result can be acted on without
+ * parsing prose. Shared by the expired and the not-connected branches - it is the
+ * same fact either way, only the moment differs.
+ */
+function reauthFields(profile: string) {
+	return {
+		reauth_required: true,
+		profile,
+		reauth_command: reauthCommand(profile),
+		note: `Cellar cannot restore this notebook's Databricks session: the saved sign-in for profile "${profile}" has expired, and only the Databricks CLI can renew it. Relay this exact command for the user to run in a terminal, then reconnect: ${reauthCommand(profile)}. Do NOT ask them to sign in from the Databricks sidebar - that runs Cellar's own browser sign-in, which mints a token this profile never reads. \`spark\` stays undefined until the session is restored.`
+	};
+}
+
+/**
  * The connection as an *agent* should see it (MCP `kernel_state`, the notebook
  * map header, and the not-connected error every `databricks_*` tool returns).
  *
@@ -2532,6 +2683,11 @@ export async function agentStatus(nb?: string | null) {
 	const status: ConnectionStatus = connectionStatus(abs);
 	if (!status.connected) {
 		s.liveness = null;
+		// A failed self-heal leaves a bound notebook with no live session, so this is
+		// where an expired profile sign-in ends up sitting - telling the agent to ask
+		// for a sidebar reconnect there would just loop it through the same failure.
+		const reauth = pendingReauth(s);
+		if (reauth?.profile) return { connected: false, ...reauthFields(reauth.profile) };
 		return {
 			connected: false,
 			...(status.lost
@@ -2553,13 +2709,22 @@ export async function agentStatus(nb?: string | null) {
 		};
 	}
 	if (a.kind === 'expired') {
+		// When the heal that just failed proved the cause is an expired profile
+		// sign-in, say so HERE rather than sending the agent (and through it the user)
+		// to the sidebar: that button runs Cellar's own browser sign-in, which mints a
+		// token a CLI-managed profile never reads. Only the CLI's own login fixes it.
+		const reauth = pendingReauth(s);
 		return {
 			connected: false,
 			expired: true,
 			stale: true,
 			cluster: { id: status.clusterId, name: status.clusterName },
 			host: status.host,
-			note: 'The Databricks Connect session expired (idle timeout, cluster GC, or a closed Spark Connect client) and Cellar could not automatically reconnect. Ask the user to reconnect from the Databricks sidebar section, then re-run the cell.'
+			...(reauth?.profile
+				? reauthFields(reauth.profile)
+				: {
+						note: 'The Databricks Connect session expired (idle timeout, cluster GC, or a closed Spark Connect client) and Cellar could not automatically reconnect. Ask the user to reconnect from the Databricks sidebar section, then re-run the cell.'
+					})
 		};
 	}
 	if (a.kind === 'unverified') {
@@ -2591,17 +2756,39 @@ export async function agentStatus(nb?: string | null) {
  */
 async function liveConnection(
 	nb?: string | null
-): Promise<ConnectionStatus & { expired?: boolean; livenessUnverified?: boolean; isClosed?: boolean }> {
+): Promise<
+	ConnectionStatus & {
+		expired?: boolean;
+		livenessUnverified?: boolean;
+		isClosed?: boolean;
+		reauth?: { code: string; message: string; profile: string };
+	}
+> {
 	const abs = resolveNotebookPath(nb);
+	const s = stateFor(abs);
 	const status = connectionStatus(abs);
-	if (!status.connected) return status;
+	// `reauth` rides EVERY not-live shape this returns, because that is where the
+	// panel actually meets it: a self-heal that fails clears the connection, so the
+	// user is looking at the picker (whose "Sign in with Databricks" button is the
+	// exact dead end) with no idea why. The verdict is only ever the one recorded
+	// for a still-bound, still-unrestored session - see `pendingReauth`.
+	const verdict = pendingReauth(s);
+	const reauth = verdict?.profile
+		? { code: verdict.code, message: verdict.message, profile: verdict.profile }
+		: undefined;
+	if (!status.connected) return { ...status, ...(reauth ? { reauth } : {}) };
 	const a = await assessLiveness(abs, status, { heal: false });
 	if (a.kind === 'reconnected') return a.status;
 	if (a.kind === 'expired') {
 		// Surface it as a session the notebook LOST (same shape a kernel-restart loss
 		// uses, so the sidebar's existing "reconnect below" affordance renders), plus
 		// an explicit `expired` flag so the panel can phrase it as an expiry.
-		return { connected: false, expired: true, lost: { profile: status.profile, clusterName: status.clusterName } };
+		return {
+			connected: false,
+			expired: true,
+			lost: { profile: status.profile, clusterName: status.clusterName },
+			...(reauth ? { reauth } : {})
+		};
 	}
 	if (a.kind === 'unverified') {
 		return {
@@ -2672,13 +2859,28 @@ async function clusterState(sel: Selection, clusterId: string): Promise<string |
 }
 
 /**
- * Turn a failed reconnect/connect into the most actionable error. If the target
- * cluster is provably down (TERMINATED / TERMINATING / ERROR), that is the real
- * cause and it is HUMAN-ONLY to fix — agents cannot start compute (D2) — so raise
- * a dedicated `cluster_terminated`. Otherwise the cause is unknown, so raise
- * `reconnect_failed` pointing at the sidebar. Always throws.
+ * Turn a failed reconnect/connect into the most actionable error.
+ *
+ * Most actionable FIRST: if the ladder's own `connect()` already classified the
+ * failure as this profile's CLI-managed sign-in having expired, that verdict
+ * outranks anything guessed from here - it names the exact
+ * `databricks auth login --profile <name>` the user must run, and it is the one
+ * auth dead end where "reconnect from the sidebar" is actively wrong (the sidebar
+ * offers Cellar's own browser sign-in, which mints a token that profile never
+ * reads). It also outranks the cluster probe for a second reason: that probe runs
+ * on the SAME dead auth, so it can only ever answer `null` here - paying for it
+ * first would just delay the real answer. Re-thrown as-is, so `code`/`profile`
+ * reach the sidebar and the agent unchanged; see `ConnState.reconnectError`.
+ *
+ * Otherwise, if the target cluster is provably down (TERMINATED / TERMINATING /
+ * ERROR), that is the real cause and it is HUMAN-ONLY to fix — agents cannot start
+ * compute (D2) — so raise a dedicated `cluster_terminated`. Failing both, the
+ * cause is unknown, so raise `reconnect_failed` pointing at the sidebar. Always
+ * throws.
  */
-async function throwReconnectFailure(target: ReconnectTarget, prefix: string): Promise<never> {
+async function throwReconnectFailure(nb: string, target: ReconnectTarget, prefix: string): Promise<never> {
+	const preserved = profileReauthVerdict(stateFor(nb).reconnectError);
+	if (preserved) throw preserved;
 	const state = await clusterState(target.sel, target.clusterId);
 	if (state && DOWN_CLUSTER_STATES.has(state.toUpperCase())) {
 		throw new DatabricksError(
@@ -2754,6 +2956,10 @@ export async function reconnectSession(nb?: string | null) {
 		);
 	}
 
+	// Only THIS attempt's classified failure may speak for it: drop anything a
+	// previous (or fire-and-forget) reconnect left behind before walking the ladder.
+	s.reconnectError = null;
+
 	// Rung 1: repair a dropped kernel socket in place (namespace-preserving; never
 	// restarts the kernel). If the process itself was proven dead this tore it down —
 	// there is no live kernel to re-establish a session in, and we never boot one just
@@ -2784,7 +2990,7 @@ export async function reconnectSession(nb?: string | null) {
 			return reconnectedPayload(abs, { socketRefreshed, kernelRestarted });
 		}
 		// Bound but the session is dead and could not be healed in place.
-		return throwReconnectFailure(target, 'The Databricks session expired and Cellar could not reconnect it.');
+		return throwReconnectFailure(abs, target, 'The Databricks session expired and Cellar could not reconnect it.');
 	}
 
 	// Not connected at the current epoch → the kernel was restarted (rung 3).
@@ -2803,7 +3009,7 @@ export async function reconnectSession(nb?: string | null) {
 	if (r.reason === 'busy') {
 		throw new DatabricksError('busy', 'A Databricks connect is already in progress for this notebook; try again shortly.');
 	}
-	return throwReconnectFailure(target, `Could not reconnect to cluster "${target.clusterName}".`);
+	return throwReconnectFailure(abs, target, `Could not reconnect to cluster "${target.clusterName}".`);
 }
 
 /**

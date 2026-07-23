@@ -152,7 +152,15 @@ describe('search keystroke latency (N=300)', () => {
 		}
 		// eslint-disable-next-line no-console
 		console.log(`[search-perf N=300 big-outputs] warm call=${best.toFixed(3)}ms`);
-		expect(best).toBeLessThan(16);
+		// The claim is that the per-cell cap holds: capped work is ~30M chars/keystroke,
+		// whereas WITHOUT the cap the engine would extract+lowercase+scan ~900 MB - two
+		// orders of magnitude more (hundreds of ms to seconds). The idle warm call is a
+		// few ms, so this absolute bound only has to sit an order of magnitude below the
+		// uncapped cost to catch a cap regression; the generous headroom keeps it from
+		// flaking on a CPU-contended runner (best-of-9 can't find a quiet window when
+		// every sample is preempted - the whole-pass flake `bestPairedKeystrokeTimes`
+		// documents, here on a single ~4ms call rather than a comparison).
+		expect(best).toBeLessThan(64);
 	});
 
 	it('cache-hit (steady state) is no slower than cold', () => {

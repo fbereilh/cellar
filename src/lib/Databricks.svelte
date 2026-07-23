@@ -19,6 +19,14 @@
 	import { subscribeEvents } from '$lib/events-client';
 	import { getUi, setUi, setUiNow } from '$lib/uiState';
 	import { normalizeDatabricksHost } from '$lib/databricksHost';
+	import {
+		PROFILE_REAUTH_CODE,
+		REAUTH_COMMAND_HEAD,
+		REAUTH_PROFILE_FLAG,
+		reauthCommand,
+		reauthDetail,
+		reauthExplanation
+	} from '$lib/databricksReauth';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -29,6 +37,8 @@
 	interface DbxError {
 		code: string;
 		message: string;
+		/** Set for `profile_reauth_required`: the profile whose saved sign-in expired. */
+		profile?: string;
 	}
 	interface DbxProfile {
 		name: string;
@@ -51,6 +61,15 @@
 		 * with a `lost` cluster; Cellar is attempting a background reconnect.
 		 */
 		expired?: boolean;
+		/**
+		 * Set only when a reconnect proved this notebook's session is down because the
+		 * profile's CLI-managed sign-in died - the one case the automatic retry can
+		 * never recover from, and the one the sidebar's own sign-in button cannot fix.
+		 * It rides every not-live shape (expired / lost / plain disconnected), because
+		 * a failed self-heal clears the connection and drops the panel to the picker;
+		 * `sessionReauthBox` renders it on whichever card is showing.
+		 */
+		reauth?: DbxError;
 		/**
 		 * Still connected, but a `SELECT 1` liveness probe could not confirm the
 		 * session (kernel busy, or a transient error). Not a dead session.
@@ -289,10 +308,12 @@
 
 	/** Normalize a thrown value (a route body, or an Error) into `{code, message}`. */
 	function toDbxError(err: unknown): DbxError {
-		const e = err as { code?: unknown; message?: unknown } | null | undefined;
+		const e = err as { code?: unknown; message?: unknown; profile?: unknown } | null | undefined;
 		return {
 			code: typeof e?.code === 'string' ? e.code : 'error',
-			message: typeof e?.message === 'string' ? e.message : String(err)
+			message: typeof e?.message === 'string' ? e.message : String(err),
+			// Carried only by `profile_reauth_required`, where the remedy names it.
+			...(typeof e?.profile === 'string' && e.profile ? { profile: e.profile } : {})
 		};
 	}
 
@@ -1029,15 +1050,154 @@
 		kernel_unavailable: 'Cellar could not reach the Python kernel. Restart Cellar, then connect again.',
 		busy: 'Another Databricks operation is still running.'
 	};
+
+	/**
+	 * The profile a `profile_reauth_required` failure is about - the name the SERVER
+	 * resolved for the auth that actually failed, or '' when it did not name one.
+	 *
+	 * Deliberately NOT falling back to the picker's current selection: that is a
+	 * different question ("what is the user looking at"), so it can name the wrong
+	 * profile in the reconnect box (the dead session may be on another one) or be
+	 * empty while connected, rendering `databricks auth login --profile ` for the
+	 * copy button to hand over verbatim. Every server path that raises this code
+	 * sets the name, so this fails closed on a shape that should not exist: no
+	 * name, no command.
+	 */
+	function reauthProfile(err: DbxError): string {
+		return (err.profile ?? '').trim();
+	}
+
+	/**
+	 * Is this error the SAME expired-profile fact the card's session box already
+	 * spells out in full?
+	 *
+	 * One expired profile fails every operation that touches it at once - the
+	 * session heal, the cluster listing behind the picker, an explicit Reconnect -
+	 * so a card would stack two or three identical explanation+command+copy boxes.
+	 * The session box (`connection.reauth`) is the one that survives; the rest are
+	 * suppressed by `errorBox` itself, so no call site has to remember the rule.
+	 *
+	 * Matching is strict: same code AND same named profile. A non-reauth failure is
+	 * a different fact with a different remedy and always renders, and two DIFFERENT
+	 * profiles need two different commands - so anything unproven falls through and
+	 * shows, since a hidden real error is far worse than a repeated one.
+	 */
+	function duplicatesSessionReauth(err: DbxError): boolean {
+		const session = connection?.reauth;
+		if (!session || session.code !== PROFILE_REAUTH_CODE || err.code !== PROFILE_REAUTH_CODE) return false;
+		const name = reauthProfile(err);
+		return !!name && name === reauthProfile(session);
+	}
+
+	// Copy-the-command affordance for the re-auth box - the same idiom as the
+	// sidebar's "Connect an agent" panel. Keyed by the box's own `key`, NOT its
+	// testid: a testid is a SELECTOR, not an identity - `databricks-node-error` is
+	// rendered once per catalog-tree node, and one expired profile fails every one
+	// of them at once, so keying the tick off it flipped the checkmark in every
+	// sibling box. Each rendered box therefore passes a key unique to it.
+	let copiedReauth = $state('');
+	let copyReauthTimer: ReturnType<typeof setTimeout>;
+	async function copyReauth(key: string, text: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			copiedReauth = key;
+			clearTimeout(copyReauthTimer);
+			copyReauthTimer = setTimeout(() => (copiedReauth = ''), 1400);
+		} catch {
+			/* a denied clipboard permission must not break the error box */
+		}
+	}
 </script>
 
-{#snippet errorBox(err: DbxError, testid: string)}
+<!--
+  The one auth failure Cellar cannot fix for the user: a NAMED profile whose
+  CLI-managed sign-in expired. "Sign in with Databricks" runs Cellar's OWN browser
+  OAuth, which mints a token this profile never reads - a dead end - so this box
+  shows the exact command instead, with the real profile name. See
+  $lib/databricksReauth for why Cellar does not run it for them.
+-->
+{#snippet reauthBox(err: DbxError, testid: string, key: string)}
+	{@const name = reauthProfile(err)}
+	<p class="text-[11px] font-medium leading-relaxed text-base-content/80" data-testid="{testid}-explain">
+		{reauthExplanation(name || null)}
+	</p>
+	<!-- No profile name, no command row: a guessed name is a command that
+	     re-authenticates the wrong profile (or none at all), and the copy button
+	     would hand it over verbatim. -->
+	{#if name}
+		{@const command = reauthCommand(name)}
+		<!-- The command WRAPS rather than truncating: in a ~200px box the tail is the
+		     profile name, i.e. the one part of it the user must read. The flag is held
+		     in a no-wrap span because a browser breaks after a hyphen, which split
+		     `--profile` into `-` / `-profile` - a command a reader could mistype. -->
+		<div class="mt-1.5 flex items-start gap-1 rounded-md border border-base-300 bg-base-100 p-1">
+			<code class="min-w-0 flex-1 px-1 py-0.5 font-mono text-[11px] leading-snug text-primary [overflow-wrap:break-word]" title={command} data-testid="{testid}-command">{REAUTH_COMMAND_HEAD} <span class="whitespace-nowrap">{REAUTH_PROFILE_FLAG}</span> {name}</code>
+			<button
+				class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
+				onclick={() => copyReauth(key, command)}
+				title="Copy command"
+				aria-label="Copy command"
+				data-testid="{testid}-copy"
+			>
+				{#if copiedReauth === key}
+					<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+				{:else}
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+				{/if}
+			</button>
+		</div>
+	{/if}
+{/snippet}
+
+<!--
+  `testid` is the SELECTOR (deliberately repeated across the catalog tree's node
+  boxes, which tests address as one); `key` is the box's IDENTITY, used only for
+  per-box UI state like the copy tick. They coincide everywhere a box is rendered
+  once, so `key` defaults to the testid; a box inside an `{#each}` must pass its
+  own.
+-->
+{#snippet errorBox(err: DbxError, testid: string, key: string = testid)}
+	{#if !duplicatesSessionReauth(err)}
+		{@render errorBody(err, testid, key)}
+	{/if}
+{/snippet}
+
+<!-- The box itself. Rendered through `errorBox` everywhere except the session
+     re-auth box, which is the ONE copy the de-dupe keeps. -->
+{#snippet errorBody(err: DbxError, testid: string, key: string)}
 	<div class="mt-2 rounded-lg border border-error/30 bg-error/10 p-2" data-testid={testid}>
-		{#if REMEDY[err.code]}
-			<p class="text-[11px] font-medium leading-relaxed text-base-content/80">{REMEDY[err.code]}</p>
+		{#if err.code === PROFILE_REAUTH_CODE}
+			{@render reauthBox(err, `${testid}-reauth`, key)}
+			<!-- The SDK's own text only; the head of the server message is what the
+			     box above already says in full, so repeating it would state the same
+			     remedy three times. -->
+			{@const detail = reauthDetail(err.message)}
+			{#if detail}
+				<p class="mt-1.5 break-words font-mono text-[10px] leading-relaxed text-base-content/50">{detail}</p>
+			{/if}
+		{:else}
+			{#if REMEDY[err.code]}
+				<p class="text-[11px] font-medium leading-relaxed text-base-content/80">{REMEDY[err.code]}</p>
+			{/if}
+			<p class="mt-0.5 break-words font-mono text-[10px] leading-relaxed text-base-content/50">{err.message}</p>
 		{/if}
-		<p class="mt-0.5 break-words font-mono text-[10px] leading-relaxed text-base-content/50">{err.message}</p>
 	</div>
+{/snippet}
+
+<!--
+  The expired-profile box on the CONNECTION cards. The server attaches `reauth` to
+  every not-live shape, because a self-heal that fails drops the panel back to the
+  picker - whose "Sign in with Databricks" button is exactly the dead end here - so
+  the explanation has to travel with the state, not only with a click on Reconnect.
+  Rendered inside one branch at a time, so its testid stays unique in the DOM.
+
+  Goes through `errorBody` directly, NOT `errorBox`: this is the copy the de-dupe
+  keeps, so it must not suppress itself.
+-->
+{#snippet sessionReauthBox()}
+	{#if connection?.reauth}
+		{@render errorBody(connection.reauth, 'databricks-session-error', 'databricks-session-error')}
+	{/if}
 {/snippet}
 
 {#snippet hint(text: string)}
@@ -1357,7 +1517,7 @@
 							{#if node?.loading}
 								<p class="px-2 py-0.5 text-[11px] text-base-content/40">loading…</p>
 							{:else if node?.error}
-								{@render errorBox(node.error, 'databricks-node-error')}
+								{@render errorBox(node.error, 'databricks-node-error', cid)}
 							{:else if node?.items?.length}
 								{#each node.items as sch (sch.name)}
 									{@const sid = `s:${cat.name}.${sch.name}`}
@@ -1372,7 +1532,7 @@
 											{#if tnode?.loading}
 												<p class="px-2 py-0.5 text-[11px] text-base-content/40">loading…</p>
 											{:else if tnode?.error}
-												{@render errorBox(tnode.error, 'databricks-node-error')}
+												{@render errorBox(tnode.error, 'databricks-node-error', sid)}
 											{:else if tnode?.items?.length}
 												{#each tnode.items as tbl (tbl.name)}
 													<button
@@ -1541,9 +1701,18 @@
 							<span class="inline-block h-1.5 w-1.5 rounded-full bg-warning"></span>expired
 						</span>
 					</div>
+					<!-- Never promise a background recovery Cellar cannot deliver: with an
+					     expired profile sign-in every retry fails the same way, so the card
+					     names the real cause (and the exact command) instead. Reconnect
+					     stays - it is what the user clicks once they have re-authenticated. -->
 					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/70">
-						The Spark Connect session on <span class="font-mono">{connection.lost?.clusterName}</span> expired (idle timeout or a closed client). Cellar is reconnecting automatically; if it doesn't recover, use Reconnect.
+						{#if connection.reauth}
+							The Spark Connect session on <span class="font-mono">{connection.lost?.clusterName}</span> expired, and Cellar cannot restore it on its own.
+						{:else}
+							The Spark Connect session on <span class="font-mono">{connection.lost?.clusterName}</span> expired (idle timeout or a closed client). Cellar is reconnecting automatically; if it doesn't recover, use Reconnect.
+						{/if}
 					</p>
+					{@render sessionReauthBox()}
 					{@render reconnectButton()}
 					<div class="mt-2 border-t border-warning/20 pt-2">
 						{@render picker()}
@@ -1561,6 +1730,7 @@
 					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/70">
 						The session on <span class="font-mono">{connection.lost.clusterName}</span> ended when the kernel restarted. Reconnect to restore <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code>.
 					</p>
+					{@render sessionReauthBox()}
 					{@render reconnectButton()}
 					<div class="mt-2 border-t border-warning/20 pt-2">
 						{@render picker()}
@@ -1571,6 +1741,10 @@
 				<!-- Disconnected: the Cluster card in its connect-form. -->
 				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-picker">
 					{@render cardLabel('cluster')}
+					<!-- Above the picker on purpose: this is the card that offers "Sign in
+					     with Databricks", and for an expired CLI-managed profile that button
+					     cannot help. Say why before the user reaches for it. -->
+					{@render sessionReauthBox()}
 					<div class="mt-1.5">
 						{@render picker()}
 						{@render logoutRow(false)}

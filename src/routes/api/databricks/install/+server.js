@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { installDeps, statusFor } from '$lib/server/databricks';
+import { installDeps } from '$lib/server/databricks';
+import { databricksErrorResponse } from '../error-response.js';
 
 /**
  * Install `databricks-sdk` + `databricks-connect` into the *project* venv (the
@@ -16,7 +17,6 @@ export async function POST({ request }) {
 	try {
 		return json(await installDeps({ version: version || undefined }));
 	} catch (err) {
-		const code = err?.code ?? 'error';
-		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
+		return databricksErrorResponse(err);
 	}
 }

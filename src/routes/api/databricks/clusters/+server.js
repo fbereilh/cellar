@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { listClusters, statusFor } from '$lib/server/databricks';
+import { listClusters } from '$lib/server/databricks';
+import { databricksErrorResponse } from '../error-response.js';
 import { selectionFrom } from '../selection.js';
 
 /**
@@ -15,7 +16,6 @@ export async function GET({ url }) {
 	try {
 		return json({ ...sel, clusters: await listClusters(sel) });
 	} catch (err) {
-		const code = err?.code ?? 'error';
-		return json({ code, message: String(err?.message ?? err) }, { status: statusFor(code) });
+		return databricksErrorResponse(err);
 	}
 }

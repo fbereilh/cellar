@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
 import { getStatus } from '$lib/server/databricks';
+import { databricksErrorResponse } from './error-response.js';
 
 /**
  * Everything the sidebar's Databricks section needs in one read: the profiles
@@ -14,6 +15,6 @@ export async function GET({ url }) {
 		// ACTIVE notebook, so the panel reflects the focused notebook's session.
 		return json(await getStatus(url.searchParams.get('path')));
 	} catch (err) {
-		return json({ code: err?.code ?? 'error', message: String(err?.message ?? err) }, { status: 500 });
+		return databricksErrorResponse(err);
 	}
 }
