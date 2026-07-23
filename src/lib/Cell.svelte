@@ -1097,6 +1097,12 @@
 	 * live component state; the driving `$effect` establishes reactivity by reading
 	 * the deps synchronously first. View-only: it paints Ranges / CM decorations and
 	 * may scroll, but never touches `cell`.
+	 *
+	 * Those scrolls are the ONE known writer of the notebook's scroll pane that does
+	 * not bump `LiveNotebook`'s per-pane `scrollGen` supersession guard, and they fire
+	 * during the find-bar jump's own settle loop. Bounded, not a fight: they target the
+	 * very cell that jump is scrolling to, so the two converge - but their ordering
+	 * relative to the loop's passes is not guaranteed (see `scrollElementIntoView`).
 	 */
 	function applyHighlights() {
 		if (!browser) return;

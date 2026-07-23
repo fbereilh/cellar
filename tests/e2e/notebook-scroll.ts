@@ -2,7 +2,7 @@ import type { Page } from '@playwright/test';
 
 /**
  * Shared browser-side helpers for the notebook's scroll pane, used by the cell
- * virtualization specs (P2 windowing, P3 pinning).
+ * virtualization specs (P2 windowing, P3 pinning, P4 jump paths).
  *
  * The pane is the shell's `overflow-y-auto` ancestor of the notebook (each open
  * notebook tab gets its own), so every helper walks up from a mounted cell to the
