@@ -16,6 +16,7 @@
 	import HtmlPreview from '$lib/HtmlPreview.svelte';
 	import { isHtmlPath, hasRelativeAssetRefs } from '$lib/htmlPreview';
 	import type { BlameLine } from '$lib/server/git';
+	import type { BlameReport } from '$lib/blame';
 
 	interface Props {
 		path: string;
@@ -23,8 +24,12 @@
 		onDirty?: (path: string, dirty: boolean) => void;
 		/** The shell's fsRefreshSignal: a bump re-fetches the git-HEAD baseline. */
 		gitRefresh?: number;
-		/** Reports the git-blame record for the cursor's line (null = untracked). */
-		onBlame?: (path: string, record: BlameLine | null) => void;
+		/**
+		 * Reports what the status bar should say for the cursor's line: a blame
+		 * record, `{unavailable}` when there IS a reason worth saying, or null when
+		 * there is simply no blame (untracked / non-repo).
+		 */
+		onBlame?: (path: string, record: BlameReport | null) => void;
 	}
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports
@@ -176,7 +181,9 @@
 	// ---- Git change bars (gutter) --------------------------------------------
 	// Fetch the file's git-HEAD text and hand it to the gutter extension, which
 	// re-diffs the live document against it on every edit. An untracked file (or a
-	// workspace that isn't a repo) has no baseline → no bars, like VS Code.
+	// workspace that isn't a repo) has no baseline → no bars, like VS Code. A file
+	// past the decoration ceiling answers `tooLarge` (no `git show` runs) and
+	// likewise gets no bars — absent, never wrong.
 	async function loadGitBaseline() {
 		if (!view) return;
 		let baseline: string | null = null;
@@ -201,20 +208,30 @@
 	// as it moves — cheap: no `git` process per keystroke, refreshed only on save
 	// / git-state changes. An untracked file or non-repo reports null (no blame).
 	let blameLines: BlameLine[] | null = null; // 0-indexed by file line
+	// The server refused to blame this file for its size. Asking is what carries
+	// that reason back — and it costs one `stat`, not the blame — so the fetch
+	// still happens; what it must not do is read as "untracked" in the status bar.
+	let blameTooLarge = false;
 	let blameTimer: ReturnType<typeof setTimeout>;
 
 	async function loadBlame() {
 		blameLines = null;
+		blameTooLarge = false;
 		try {
 			const res = await fetch(`/api/fs/git/blame?path=${encodeURIComponent(path)}`);
 			const body = await res.json();
 			if (res.ok && body.tracked) blameLines = body.lines;
+			else if (res.ok && body.tooLarge) blameTooLarge = true;
 		} catch {}
 		reportBlame();
 	}
 
 	function reportBlame() {
 		if (!onBlame) return;
+		if (blameTooLarge) {
+			onBlame(path, { unavailable: 'too_large' });
+			return;
+		}
 		if (!view || !blameLines) {
 			onBlame(path, null);
 			return;

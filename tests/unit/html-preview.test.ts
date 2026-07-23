@@ -207,6 +207,31 @@ describe('hasRelativeAssetRefs', () => {
 		expect(hasRelativeAssetRefs('<style>body{background:url(fonts/bg.png)}</style>')).toBe(false);
 	});
 
+	// An absolute <base href> rebases every relative ref, so they DO resolve inside
+	// the sandbox — reporting them would be the over-report the contract rules out.
+	it('is false when an absolute <base href> rebases the document', () => {
+		const withBase =
+			'<html><head><base href="https://cdn.example.com/report/"></head><body><img src="figures/a.png"></body></html>';
+		expect(hasRelativeAssetRefs(withBase)).toBe(false);
+		// The very same document without the <base> still reports.
+		expect(hasRelativeAssetRefs(withBase.replace(/<base[^>]*>/, ''))).toBe(true);
+
+		// Quoting, casing and protocol-relative forms all count as absolute.
+		expect(hasRelativeAssetRefs("<base href='http://x/y/'><script src=app.js></script>")).toBe(false);
+		expect(hasRelativeAssetRefs('<BASE HREF=//cdn/x/><img src="a/b.png">')).toBe(false);
+		// A <base> declared AFTER the refs it rebases still suppresses (it is a
+		// whole-document pre-scan, not a positional rule).
+		expect(hasRelativeAssetRefs('<img src="a/b.png"><base href="https://cdn/x/">')).toBe(false);
+	});
+
+	it('still reports when a <base href> cannot rebase the refs', () => {
+		// Root-relative: the app serves no such path either, so it stays a broken ref.
+		expect(hasRelativeAssetRefs('<base href="/reports/"><img src="figures/a.png">')).toBe(true);
+		// Folder-relative, and a <base> with no href at all.
+		expect(hasRelativeAssetRefs('<base href="sub/"><img src="figures/a.png">')).toBe(true);
+		expect(hasRelativeAssetRefs('<base target="_blank"><img src="figures/a.png">')).toBe(true);
+	});
+
 	it('is stateless across calls (no scanner state survives a call)', () => {
 		const relative = '<img src="a/b.png">';
 		for (let i = 0; i < 5; i++) expect(hasRelativeAssetRefs(relative)).toBe(true);

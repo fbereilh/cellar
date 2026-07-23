@@ -13,19 +13,25 @@ import { deserialize } from '$lib/server/ipynb';
  * (nbformat's multiline `source` arrays joined into one string) and formatting
  * alone never reads as a change. `tracked:false` means "nothing at HEAD to
  * compare against" — the caller draws no decorations.
+ *
+ * The file form is size-guarded (`tooLarge:true` past `MAX_DECORATION_BYTES`,
+ * with no `git show`) because its baseline is re-diffed line by line on every
+ * keystroke. The notebook form opts OUT: its diff is per cell and scales with
+ * SOURCE, not with the outputs that make an `.ipynb` big.
  */
 export async function GET({ url }) {
 	const path = url.searchParams.get('path');
 	if (!path) error(400, 'path required');
+	const isNotebook = url.searchParams.get('kind') === 'notebook';
 
 	let head;
 	try {
-		head = await gitHeadFile(path);
+		head = await gitHeadFile(path, { sizeGuard: !isNotebook });
 	} catch (err) {
 		error(400, String(err?.message ?? err));
 	}
 
-	if (url.searchParams.get('kind') !== 'notebook') {
+	if (!isNotebook) {
 		return json(head);
 	}
 

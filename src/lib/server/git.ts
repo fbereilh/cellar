@@ -18,6 +18,7 @@ import { execFile } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { workspaceRoot, resolveInWorkspace } from './fstree';
+import { MAX_FILE_BYTES } from '$lib/server/limits.js';
 
 /**
  * Cap on a single `git` subprocess's stdout. Node's `execFile` REJECTS with an
@@ -126,6 +127,42 @@ function fileMtimeMs(abs: string): number | null {
 }
 
 /**
+ * Ceiling past which LINE-LEVEL git decorations (a file tab's gutter change bars
+ * and its per-line blame) are refused outright.
+ *
+ * They are the one git surface whose cost scales with the whole FILE: a
+ * `--line-porcelain` blame emits a full commit header per line (a 10 MB report
+ * measured ~2.6 s and ~46 MB of stdout, then one object per line, then a
+ * synchronous `JSON.stringify` of the lot — on the same thread that carries
+ * kernel streaming, SSE and the in-process MCP server), and the HEAD baseline
+ * ships the entire blob to the browser to be re-diffed on every keystroke. Both
+ * re-run on mount, on every save and on every window focus.
+ *
+ * The ordinary text-file cap is the threshold on purpose: everything a tab could
+ * open before the HTML exception was carved out (see `limits.js`) keeps its
+ * decorations EXACTLY as before, and only the export-sized files that exception
+ * newly admits skip them. A refusal is reported (`tooLarge:true`), never
+ * disguised as `tracked:false` — "too big to blame" and "untracked" are
+ * different facts and the status bar says which.
+ */
+export const MAX_DECORATION_BYTES = MAX_FILE_BYTES;
+
+/**
+ * True when the working-tree file is past `MAX_DECORATION_BYTES`. Two `stat`s
+ * and zero git spawns, and it runs BEFORE the cache probe — the point is not to
+ * pay the blame/`git show` at all, not to discard its result afterwards. An
+ * unreadable file is NOT refused here: it falls through to git, which reports
+ * the honest `tracked:false`.
+ */
+function tooLargeToDecorate(abs: string): boolean {
+	try {
+		return statSync(abs).size > MAX_DECORATION_BYTES;
+	} catch {
+		return false;
+	}
+}
+
+/**
  * A cache signature that changes on any mutation affecting git output for a file:
  * the working-tree file's mtime (a plain edit) OR the git index's mtime (a stage,
  * commit, checkout, merge or rebase all rewrite the index). Reading both is two
@@ -212,6 +249,8 @@ export interface GitHeadFileResult {
 	isRepo: boolean;
 	tracked: boolean;
 	content: string | null;
+	/** Refused for being past `MAX_DECORATION_BYTES` — distinct from untracked. */
+	tooLarge: boolean;
 }
 
 /** One parsed `git blame --line-porcelain` line record. */
@@ -229,6 +268,8 @@ export interface GitBlameFileResult {
 	isRepo: boolean;
 	tracked: boolean;
 	lines: BlameLine[];
+	/** Refused for being past `MAX_DECORATION_BYTES` — distinct from untracked. */
+	tooLarge: boolean;
 }
 
 /**
@@ -436,16 +477,31 @@ export function isMaxBufferError(err: unknown): boolean {
  * already the whole story.
  *
  * @param {string} relPath Workspace-relative path (path-guarded).
+ * @param opts.sizeGuard Refuse (`tooLarge:true`, no `git show`) above
+ *   `MAX_DECORATION_BYTES`. Default true — a file tab's gutter re-diffs the whole
+ *   baseline on every keystroke. The NOTEBOOK caller passes false: its
+ *   decorations are per CELL and their cost tracks SOURCE, not the outputs that
+ *   make an `.ipynb` big, so a size gate there would drop the change bars off an
+ *   ordinary plot-heavy notebook.
  * @returns {Promise<{isRepo: boolean, tracked: boolean, content: string|null}>}
  */
-export async function gitHeadFile(relPath: string): Promise<GitHeadFileResult> {
+export async function gitHeadFile(
+	relPath: string,
+	opts: { sizeGuard?: boolean } = {}
+): Promise<GitHeadFileResult> {
 	const root = workspaceRoot();
 	const abs = resolveInWorkspace(relPath); // throws if the path escapes the workspace
 	const rel = String(relPath ?? '').replace(/\\/g, '/');
 	if (!rel) throw new Error('path required');
 
 	const pre = await preflight(root);
-	if (!pre.inside) return { isRepo: false, tracked: false, content: null };
+	if (!pre.inside) return { isRepo: false, tracked: false, content: null, tooLarge: false };
+
+	// Before the cache probe and before any spawn: the whole point is not to pay
+	// for a blob the gutter would re-diff on every keystroke.
+	if (opts.sizeGuard !== false && tooLargeToDecorate(abs)) {
+		return { isRepo: true, tracked: false, content: null, tooLarge: true };
+	}
 
 	// HEAD:path content changes only when history moves (commit/checkout), so the
 	// index mtime alone is a sound signature; the working-file mtime rides along
@@ -458,10 +514,10 @@ export async function gitHeadFile(relPath: string): Promise<GitHeadFileResult> {
 	// Porcelain paths (and `git show`'s object syntax) are repo-root-relative.
 	const content = await runGit(root, ['show', `HEAD:${pre.prefix}${rel}`]);
 	let value: GitHeadFileResult;
-	if (content == null) value = { isRepo: true, tracked: false, content: null };
+	if (content == null) value = { isRepo: true, tracked: false, content: null, tooLarge: false };
 	// A NUL byte means a binary blob; there is no line diff to draw.
-	else if (content.includes('\0')) value = { isRepo: true, tracked: false, content: null };
-	else value = { isRepo: true, tracked: true, content };
+	else if (content.includes('\0')) value = { isRepo: true, tracked: false, content: null, tooLarge: false };
+	else value = { isRepo: true, tracked: true, content, tooLarge: false };
 	headCache.set(cacheKey, { sig, at: Date.now(), value });
 	return value;
 }
@@ -527,7 +583,12 @@ export async function gitBlameFile(relPath: string): Promise<GitBlameFileResult>
 	if (!rel) throw new Error('path required');
 
 	const pre = await preflight(root);
-	if (!pre.inside) return { isRepo: false, tracked: false, lines: [] };
+	if (!pre.inside) return { isRepo: false, tracked: false, lines: [], tooLarge: false };
+
+	// Before the cache probe and before any spawn: `--line-porcelain` on a
+	// multi-MB file is seconds of git plus tens of MB of stdout, and this runs on
+	// mount, on every save and on every window focus.
+	if (tooLargeToDecorate(abs)) return { isRepo: true, tracked: false, lines: [], tooLarge: true };
 
 	// Blame changes on a working edit (file mtime) or a history move (index mtime);
 	// the signature+TTL cache collapses the per-focus/per-save burst without ever
@@ -541,7 +602,9 @@ export async function gitBlameFile(relPath: string): Promise<GitBlameFileResult>
 	// no HEAD blob (untracked / newly added) makes blame fail → tracked:false.
 	const out = await runGit(root, ['blame', '--line-porcelain', '-w', '--', rel]);
 	const value: GitBlameFileResult =
-		out == null ? { isRepo: true, tracked: false, lines: [] } : { isRepo: true, tracked: true, lines: parseBlame(out) };
+		out == null
+			? { isRepo: true, tracked: false, lines: [], tooLarge: false }
+			: { isRepo: true, tracked: true, lines: parseBlame(out), tooLarge: false };
 	blameFileCache.set(cacheKey, { sig, at: Date.now(), value });
 	return value;
 }

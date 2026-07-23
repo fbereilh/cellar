@@ -25,7 +25,7 @@
 	import type { SearchHighlightState } from '$lib/searchHighlight';
 	import type { Folding } from '$lib/headings';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
-	import type { BlameLine } from '$lib/server/git';
+	import { isBlameUnavailable, type BlameReport } from '$lib/blame';
 
 	/** Kind of an open tab: the canonical notebook, an opened `.ipynb`/`.py`, a rendered image, or a text file. */
 	type TabKind = 'notebook' | 'ipynb' | 'image' | 'file';
@@ -380,8 +380,11 @@
 	// through the same `handleBlame`, keyed by workspace path. The footer reads the
 	// active tab's, whether that's a file or a notebook. An untracked/non-git target
 	// reports null and the bar hides gracefully.
-	let blameByPath = $state<Record<string, BlameLine | null>>({});
-	function handleBlame(path: string, record: BlameLine | null) {
+	// A file whose blame the server refused for its size reports `{unavailable}`
+	// instead of null, so the bar says so rather than going blank — blank means
+	// untracked, a different fact.
+	let blameByPath = $state<Record<string, BlameReport | null>>({});
+	function handleBlame(path: string, record: BlameReport | null) {
 		blameByPath = { ...blameByPath, [path]: record };
 	}
 	const activeBlame = $derived(
@@ -1504,8 +1507,18 @@
 		<!-- Git blame for the active tab (GitLens-style): a file's cursor line, or a
 		     notebook's FOCUSED CELL; who last touched it and when, commit summary +
 		     short SHA on hover. Hidden when there's no blame (no focused cell,
-		     untracked file/notebook, or non-git). -->
-		{#if activeBlame}
+		     untracked file/notebook, or non-git) — EXCEPT when the reason is worth
+		     saying: a file too big to blame reads as such, not as untracked. -->
+		{#if isBlameUnavailable(activeBlame)}
+			<span
+				class="flex min-w-0 items-center gap-1 truncate text-base-content/55"
+				title="This file is past the size limit for line-level git decorations, so blame and change bars are skipped"
+				data-testid="blame-status"
+			>
+				<svg class="h-3 w-3 shrink-0 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><line x1="1.5" y1="12" x2="8" y2="12" /><line x1="16" y1="12" x2="22.5" y2="12" /></svg>
+				<span class="truncate">too large for blame</span>
+			</span>
+		{:else if activeBlame}
 			<span
 				class="flex min-w-0 items-center gap-1 truncate text-base-content/55"
 				title={activeBlame.notCommitted

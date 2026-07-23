@@ -91,6 +91,22 @@ function linkFetchesToRender(rel: string): boolean {
 	return false;
 }
 
+/**
+ * A `<base href>` pointing at an ABSOLUTE URL (`https://cdn/x/`, or the
+ * protocol-relative `//cdn/x/`) rebases every relative reference in the document
+ * onto it, so those refs resolve inside the sandbox after all and the notice
+ * would be an over-report — the one direction this module's contract rules out.
+ *
+ * Deliberately a whole-document PRE-scan rather than a case handled mid-walk:
+ * `<base>` is legal anywhere, including AFTER the refs it rebases, and one cheap
+ * regex pass answers that without turning the walk into a collect-everything
+ * scan (the early exit on the first relative ref is what keeps a multi-MB export
+ * cheap). A `<base>`-shaped string inside a comment or a script body suppresses
+ * the notice too — under-reporting, the safe side. A relative or unparseable
+ * `<base href>` (`/reports/`) does not match: those still fail to resolve.
+ */
+const ABSOLUTE_BASE_TAG = /<base\s[^>]*\bhref\s*=\s*["']?\s*(?:[a-z][a-z0-9+.-]*:)?\/\//i;
+
 /** ASCII letter or digit — the only characters a tag name is scanned from. */
 const NAME_CHAR = /[a-z0-9]/i;
 
@@ -227,6 +243,9 @@ function rawTextEnd(html: string, from: number, tag: string): number {
  * the scan cannot read confidently (an unterminated comment, quote or raw-text
  * body) ends the scan rather than convicting.
  *
+ * An absolute `<base href>` rebases the whole document, so it suppresses the
+ * notice outright (see `ABSOLUTE_BASE_TAG`).
+ *
  * Known misses, deliberately not chased — each needs its own parsing, and a
  * missed ref costs only the notice, not the render: `<img srcset>` (a
  * comma-separated descriptor list), `<video poster>`, and `url(…)` inside a
@@ -234,6 +253,7 @@ function rawTextEnd(html: string, from: number, tag: string): number {
  * design, per above.
  */
 export function hasRelativeAssetRefs(html: string): boolean {
+	if (ABSOLUTE_BASE_TAG.test(html)) return false;
 	const n = html.length;
 	let i = 0;
 	while (i < n) {
