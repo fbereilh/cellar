@@ -443,7 +443,7 @@ export function buildImageBlocks(
 		// Charge the decode budget BEFORE decoding, and charge it even if the block is
 		// then declined on bytes - the CPU is spent either way, and that is what this
 		// budget bounds.
-		const pixels = willDecode(full, mime, dim, maxEdge) ? dim!.width * dim!.height : 0;
+		const pixels = dim && willDecode(full, mime, b64, dim, maxEdge, maxBytes) ? dim.width * dim.height : 0;
 		if (pixels && spentPixels + pixels > maxDecodePixels) {
 			omitted.push({ output_index, mime, reason: 'budget', note: `this result's image budget is spent; ${resumeAt(output_index)}` });
 			continue;
@@ -467,9 +467,21 @@ export function buildImageBlocks(
 
 const TOO_LARGE_NOTE = 'image too large to send as an image block; its size is in the outputs placeholder';
 
-/** Whether shipping this image will cost a full decode (only an oversized PNG is resampled). */
-function willDecode(full: boolean, mime: string, dim: ImageDims, maxEdge: number): boolean {
-	return !full && mime === 'image/png' && !!dim && Math.max(dim.width, dim.height) > maxEdge;
+/**
+ * Whether shipping this image will cost a full decode. Only a PNG is ever
+ * resampled, but `full` does NOT mean "no decode": `fitImageBlock` falls back to
+ * the ordinary downscale whenever a full-size original breaches a host ceiling,
+ * and that decode is not one byte cheaper for having been requested at full size.
+ * Missing it left `size:'full'` charging nothing while running up to
+ * MAX_FULL_OUTPUT_IMAGE_BLOCKS decodes of up to MAX_DECODE_PIXELS each - the
+ * event-loop stall MAX_RESULT_DECODE_PIXELS exists to bound. Those retries also
+ * emit SMALL blocks, so the byte budget cannot catch them either; this is the only
+ * place that sees the cost.
+ */
+function willDecode(full: boolean, mime: string, b64: string, dim: ImageDims, maxEdge: number, maxBytes: number): boolean {
+	if (mime !== 'image/png') return false;
+	if (!full) return !!dim && Math.max(dim.width, dim.height) > maxEdge;
+	return !withinHostLimits(b64, maxBytes, dim);
 }
 
 /**

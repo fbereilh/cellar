@@ -1523,7 +1523,13 @@ export async function runCell(
 		// records are deliberately compact (`toBatchRecord`): decoding and
 		// resampling every cell's figures only to discard them is pure CPU, and N
 		// cells' worth of rasters would be a five-figure token bill besides.
-		const images = opts.skipImages ? { images: [], omitted: [] } : buildImageBlocks(imageRefs(outputs));
+		// Skipped for a cell hidden from the agent too: a picture is qualitatively
+		// more revealing than the outputs text (which a hidden cell has always
+		// returned, and still does - this must not widen what hidden_from_agent
+		// discloses), and `getFullOutput` refuses a hidden cell outright, so gating
+		// here is what keeps the two tools agreeing on what the flag withholds.
+		// Whether a hidden cell may RUN is unchanged; only the raster stays behind.
+		const images = opts.skipImages || isHidden(cell) ? { images: [], omitted: [] } : buildImageBlocks(imageRefs(outputs));
 		return { id: outId, status, ran_this_session: isLiveSession(session, currentSessionId(nb)), ...(kernelDown ? { kernel_unavailable: true } : {}), ...staleAnnotation, ...queuedInfo, ...hiddenNote, outputs: outputs.map((o) => summarizeOutput(o, READ_CAP)), ...imageFields(images) };
 	} finally {
 		// Hand the kernel to the next queued run only once this one has persisted and

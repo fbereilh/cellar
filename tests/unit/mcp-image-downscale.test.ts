@@ -1,9 +1,23 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PNG } from 'pngjs';
 import { IMG_MAX_EDGE, MAX_FULL_OUTPUT_IMAGE_BLOCKS, MAX_IMAGE_BLOCKS } from '../../src/lib/server/mcp/image';
+
+// The run path is driven with the shared execution core faked: the question under
+// test is what a run RESULT may carry, so the kernel is beside the point (the real
+// matplotlib → image-block loop is the e2e spec).
+const h = vi.hoisted(() => ({ figure: '' }));
+vi.mock('../../src/lib/server/run', async (importOriginal) => ({
+	...(await importOriginal<typeof import('../../src/lib/server/run')>()),
+	executeCellRun: async ({ nb, cellId }: { nb: string; cellId: string }) => {
+		const outputs = [{ output_type: 'display_data' as const, data: { 'image/png': h.figure }, metadata: {} }];
+		const { setOutputs } = await import('../../src/lib/server/notebook');
+		setOutputs(cellId, outputs, nb);
+		return { outputs, status: 'ok', session: 1, kernelDown: false };
+	}
+}));
 
 /**
  * Token diet: downscale high-DPI plot images on the DEFAULT read path.
@@ -330,5 +344,34 @@ describe('get_full_output default-vs-full image contract', () => {
 		// The placeholder is built from the same joined payload, so its size and
 		// dimensions describe the real raster rather than a comma-joined string.
 		expect((res.outputs[0] as { text?: string }).text).toMatch(/^\[image\/png, 320×240, /);
+	});
+
+	it('a cell hidden from the agent runs, but its FIGURE stays hidden - like get_full_output', async () => {
+		// A picture reveals far more than the outputs text a hidden cell has always
+		// returned, so shipping it would widen what hidden_from_agent withholds.
+		// getFullOutput refuses such a cell outright; the run path must agree, or the
+		// two tools disagree about what the flag means.
+		h.figure = makePngB64(1600, 1200);
+		const NB = 'hidden-figure.ipynb';
+		svc.useNotebook('imgSessHidden', NB);
+		const nb = nbmod.resolveNotebookPath(NB);
+		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'plot()' }], null, { nb, routeImports: false });
+		const id = svc.resolveRef(nb, ids[0]);
+
+		const visible = (await svc.runCell(id, nb, { skipStaleness: true }))!;
+		expect(visible.images).toHaveLength(1);
+		expect(visible.hidden).toBeUndefined();
+
+		svc.setCellVisibility(id, true, nb);
+		const hidden = (await svc.runCell(id, nb, { skipStaleness: true }))!;
+		expect(hidden.hidden).toBe(true);
+		expect(hidden.images).toBeUndefined();
+		expect(hidden.images_omitted).toBeUndefined();
+		// Running it is unchanged, and so is the outputs TEXT it has always carried -
+		// only the raster stays behind.
+		expect(hidden.status).toBe('ok');
+		expect((hidden.outputs as Array<{ text?: string }>)[0].text).toMatch(/^\[image\/png, 1600×1200, /);
+		// The other tool's answer for the same cell.
+		expect(svc.getFullOutput(id, 'medium', nb)).toBeNull();
 	});
 });

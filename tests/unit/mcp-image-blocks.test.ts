@@ -270,6 +270,31 @@ describe('image block policy', () => {
 		expect(images[0].downscaled?.note).toMatch(/exceeds the inline image size limit/);
 	});
 
+	it('charges that degradation to the DECODE budget too - `full` is not a way to spend unbounded CPU', () => {
+		// The fallback above is a real PNG.sync.read + resample + re-encode, and it is
+		// no cheaper for having been asked for at full size. It also emits a SMALL
+		// block, so the byte budget cannot catch it: without charging the source
+		// pixels here, one get_full_output(size:'full') over a cell of oversized
+		// figures runs MAX_FULL_OUTPUT_IMAGE_BLOCKS decodes free of charge and stalls
+		// the event loop that streams SSE frames and serves every other kernel.
+		const b64 = makePngB64(1000, 900);
+		const many = Array.from({ length: 4 }, (_, i) => ref(i, 'image/png', b64));
+		const overByte = { full: true as const, limit: 100, maxBytes: base64Bytes(b64) - 1 };
+
+		const { images, omitted } = buildImageBlocks(many, { ...overByte, maxDecodePixels: 1000 * 900 * 2 });
+		expect(images).toHaveLength(2);
+		expect(images.every((i) => i.downscaled)).toBe(true);
+		expect(omitted).toHaveLength(2);
+		expect(omitted.every((o) => o.reason === 'budget')).toBe(true);
+		expect(omitted[0].output_index).toBe(2);
+		expect(omitted[0].note).toMatch(/get_full_output\(id, images_from: 2\)/);
+
+		// A `full` image already inside the ceilings ships untouched, so it decodes
+		// nothing and is never charged - the budget bounds decodes, not images.
+		const small = Array.from({ length: 4 }, (_, i) => ref(i, 'image/png', makePngB64(40, 30, i)));
+		expect(buildImageBlocks(small, { full: true, limit: 100, maxDecodePixels: 1 }).images).toHaveLength(4);
+	});
+
 	it('omits (with a reason) an image no downscale can bring under the ceiling', () => {
 		// A non-PNG cannot be resampled, so an oversized one has nowhere to go.
 		const big = Buffer.alloc(5000, 7).toString('base64');
