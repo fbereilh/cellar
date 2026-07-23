@@ -75,7 +75,11 @@ npm run build && node bin/cellar.js          # production build
 node bin/cellar.js --dev                      # Vite dev server (hot reload)
 ```
 
-`make run` / `make dev` are the same two commands.
+`make dev` is the second command. `make run` is the first, but rebuilds only when
+the build is stale (via `scripts/ensure-build.js`) instead of unconditionally.
+Note that a production launch refuses a **stale** build (built before your latest
+`src/` edit), not just a missing one: run `npm run build` (or `make run`, which
+does it for you), pass `--dev`, or set `CELLAR_SKIP_BUILD_CHECK=1` to override.
 
 ## Kernel / venv resolution
 
@@ -212,6 +216,7 @@ to publish, e.g. inside a container.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CELLAR_ISOLATED` | unset | Run with no global instance registry and no cross-instance reaping (what the Docker image sets). |
+| `CELLAR_SKIP_BUILD_CHECK` | unset | `1` serves a **stale** production build anyway (a source checkout otherwise refuses to launch when `build/index.js` is older than `src/`). A packaged install never checks. `--dev` bypasses the check too. |
 | `CELLAR_KERNEL_STATUS_DEBOUNCE_MS` | `80` | Debounce window for kernel-status broadcasts to the UI. |
 | `CELLAR_DATAFLOW_PROBE_TIMEOUT_MS` | `10000` (ms, = 10s) | How long the staleness dataflow probe subprocess (`ast` + `symtable` over the notebook's cells) may run before it is SIGKILLed. A batch that times out is treated as conservative-stale, never falsely fresh. |
 | `CELLAR_DATAFLOW_BACKOFF_BASE_MS` | `30000` (ms, = 30s) | First backoff window after a dataflow batch times out; doubles per consecutive timeout. A timed-out batch is not re-probed until its window elapses or its source content changes, so a persistently-slow notebook converges instead of re-spawning the probe every pass. |
@@ -249,7 +254,9 @@ npm run test      # unit suite - the merge gate
 `npm run test:e2e` is a best-effort local smoke test that boots the real launcher,
 runs `6*7`, and asserts `42` renders; it needs the full kernel runtime
 (`uv` + `python3` + the cached host-venv) and skips itself when that is absent.
-Install its browser once with `npx playwright install chromium`.
+It rebuilds the app first when `build/` is older than `src/` (the specs serve the
+production build, so a stale one would silently test uncompiled code) and runs two
+spec files at a time. Install its browser once with `npx playwright install chromium`.
 
 ## Troubleshooting
 
@@ -258,6 +265,11 @@ Install its browser once with `npx playwright install chromium`.
 - **`cellar: command not found` after `make setup`** - the `npm link` symlink needs
   the launcher's executable bit; `make setup` re-`chmod`s it. Re-run `make setup`,
   or run `node bin/cellar.js` directly.
+- **`production build is STALE` / `production build not found`** - a production
+  launch serves `build/index.js`, and refuses to run it against newer `src/`. Run
+  `npm run build` (or `make run`, which rebuilds only when stale), pass `--dev` for
+  the Vite dev server, or set `CELLAR_SKIP_BUILD_CHECK=1` to serve the stale build
+  anyway. A packaged install (npm/brew/Docker) never triggers this.
 - **Port already in use** - Cellar picks free ports by default, so this only
   happens if you pinned `CELLAR_APP_PORT` / `CELLAR_MCP_PORT` / `CELLAR_JUPYTER_PORT`.
   Unset them to let Cellar choose.
