@@ -41,11 +41,21 @@ const SENTINEL = '__CELLAR_DBX__';
 
 // `hold`, when set, stalls the next kernel execution - the one lever that keeps a
 // notebook's connect genuinely IN FLIGHT while a logout runs against it.
-const state = vi.hoisted(() => ({ session: 1 as number | null, hold: null as Promise<void> | null }));
+// `failDisconnect` is the other teardown failure: the kernel is unreachable, so
+// `disconnect` throws out of `runInKernel` BEFORE the assignments that clear the
+// state - the notebook stays bound, which is a different fact and a different remedy.
+const state = vi.hoisted(() => ({
+	session: 1 as number | null,
+	hold: null as Promise<void> | null,
+	failDisconnect: false
+}));
 
 vi.mock('../../src/lib/server/kernel', () => ({
 	execute: async (_nb: string, code: string, onEvent: (e: unknown) => void) => {
 		if (state.hold) await state.hold;
+		if (state.failDisconnect && code.includes('_cellar_dbx_disconnect')) {
+			throw new Error('kernel is not reachable');
+		}
 		onEvent({ type: 'kernel', session: state.session });
 		let out: Record<string, unknown>;
 		if (code.includes('_cellar_dbx_ping')) out = { ok: true, alive: true, expired: false };
@@ -213,6 +223,7 @@ afterAll(() => {
 
 beforeEach(async () => {
 	state.session = 1;
+	state.failDisconnect = false;
 	await dbx.disconnect().catch(() => {}); // a prior test's aborted connect must not cascade
 	useRealPython();
 	// Every sign-in is per-test: clear the module's gate through its own API so one
@@ -373,6 +384,28 @@ describe('an incomplete sign-out is never reported as a clean one', () => {
 		expect(status.signedInHosts).toContain('https://logout-me.example.com');
 	});
 
+	/**
+	 * The sentence the UI renders can only name one failure, so it has to say HOW MANY
+	 * there were - otherwise two failed purges read as one and the user believes the
+	 * other workspace completed, while the counter next to it says otherwise.
+	 */
+	it('several failed purges are COUNTED in the reason, not silently reduced to the first', async () => {
+		await signIn({ host: HOST_SIGNED_IN });
+		await signIn({ host: HOST_SIGNED_IN_TOO });
+		delete process.env.CELLAR_PROJECT_VENV;
+
+		const result = await dbx.logout();
+
+		expect(result.purgeFailed).toBe(2);
+		expect(result.incompleteReason).toMatch(/2 signed-in workspaces/i);
+		expect(result.incompleteReason).toMatch(/databricks-sdk-py\/oauth/);
+		// Both gates survive, since neither purge provably completed.
+		expect(result.clearedSignIns).toBe(0);
+		useStub();
+		const status = await dbx.getStatus();
+		expect(status.signedInHosts).toHaveLength(2);
+	});
+
 	it('a purge that finds NOTHING for a signed-in selection is a miss, not a clean purge', async () => {
 		await signIn({ host: HOST_SIGNED_IN });
 		useStub(stubPythonEmpty);
@@ -451,8 +484,14 @@ describe('an incomplete sign-out is never reported as a clean one', () => {
 			const result = await dbx.logout({ profile: 'pat' });
 
 			expect(result.sessionsFailed).toBe(1);
+			// A REFUSED teardown, not a failed one: `disconnect` never touched the state,
+			// and this resolves itself once the connect ends. The two must stay
+			// distinguishable - their remedies are different.
+			expect(result.sessionsBusy).toBe(1);
+			expect(result.sessionsStuck).toBe(0);
 			expect(result.incomplete).toBe(true);
 			expect(result.incompleteReason).toMatch(/connect is still in progress/i);
+			expect(result.incompleteReason).not.toMatch(/still bound/i);
 			// A session that could not be ended says nothing about the token cache: the
 			// reason must not point at a file, or the UI's remedy would tell the user to
 			// delete something a successful purge already removed.
@@ -464,6 +503,38 @@ describe('an incomplete sign-out is never reported as a clean one', () => {
 			state.hold = null;
 			release();
 			await connecting.catch(() => {});
+			await dbx.disconnect().catch(() => {});
+		}
+	});
+
+	/**
+	 * The other teardown failure, and the worse one. `disconnect` throws out of
+	 * `runInKernel(DISCONNECT_CODE)` - the sidecar is unreachable - which is BEFORE the
+	 * assignments that clear `connection`/`reconnectTarget`, so the notebook stays
+	 * genuinely BOUND and would rebuild `spark` on its next kernel restart. Reporting
+	 * that as "a connect is still in progress" names a cause that never happened and
+	 * sends the user to wait for something that will never finish.
+	 */
+	it('a teardown that FAILED reports the notebook still bound, not a connect in flight', async () => {
+		delete process.env.CELLAR_PROJECT_VENV;
+		await dbx.connect({ profile: 'pat', clusterId: '0725-abc', clusterName: 'Test Cluster' });
+		expect(dbx.databricksBound()).toBe(true);
+		state.failDisconnect = true;
+		try {
+			const result = await dbx.logout({ profile: 'pat' });
+
+			expect(result.sessionsFailed).toBe(1);
+			expect(result.sessionsStuck).toBe(1);
+			expect(result.sessionsBusy).toBe(0);
+			expect(result.incomplete).toBe(true);
+			expect(result.incompleteReason).toMatch(/still bound to a cluster/i);
+			expect(result.incompleteReason).not.toMatch(/connect is still in progress/i);
+			// The reconnect intent really did survive - that is what makes this incomplete.
+			expect(dbx.databricksBound()).toBe(true);
+			// Still nothing to do with the token cache.
+			expect(result.incompleteReason).not.toMatch(/databricks-sdk-py\/oauth/);
+		} finally {
+			state.failDisconnect = false;
 			await dbx.disconnect().catch(() => {});
 		}
 	});

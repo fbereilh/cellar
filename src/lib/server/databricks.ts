@@ -1152,8 +1152,12 @@ export interface LogoutResult {
 	purgeFailed: number;
 	/** Signed-in selections where the purge ran but found no token - so one may still be on disk. */
 	purgeMissed: number;
-	/** Notebooks whose session could not be ended (a connect was still in flight). */
+	/** Notebooks whose session could not be ended (either reason below). */
 	sessionsFailed: number;
+	/** Notebooks skipped because a connect was still in flight - the teardown never ran. */
+	sessionsBusy: number;
+	/** Notebooks whose teardown FAILED, so they are still bound and may rebuild `spark`. */
+	sessionsStuck: number;
 	/** True when anything above leaves the sign-out unproven. */
 	incomplete: boolean;
 	/** One user-facing sentence naming what did not complete; null when the sign-out was clean. */
@@ -1202,18 +1206,24 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 		if (!bound.includes(abs)) bound.push(abs);
 	}
 	let disconnected = 0;
-	const sessionFailures: string[] = [];
+	// The two failure shapes are NOT the same thing and must not be reported as one.
+	// `busy` = a connect is in flight, so `disconnect` refused before touching
+	// anything; it cannot be waited out (a connect can take minutes). Anything else
+	// comes out of `runInKernel(DISCONNECT_CODE)`, i.e. BEFORE the assignments that
+	// clear the state, so `connection` AND `reconnectTarget` both survive and the
+	// notebook is genuinely still bound - the silent-rebuild hazard step 1 exists to
+	// prevent. Their remedies differ too, so each carries its own sentence.
+	const sessionBusy: string[] = [];
+	const sessionStuck: string[] = [];
 	for (const nb of bound) {
 		try {
 			await disconnect(nb);
 			disconnected += 1;
 		} catch (err) {
-			// In practice this is `busy`: a connect is in flight for that notebook, so
-			// it keeps its reconnect intent and may still end up with a live `spark`.
-			// It cannot be waited out (a connect can take minutes), so it is reported.
 			const message = err instanceof Error ? err.message : String(err);
+			const busy = err instanceof DatabricksError && err.code === 'busy';
 			logWarn('databricks', `logout: could not disconnect ${nb}: ${message}`);
-			sessionFailures.push(`${basename(nb)} (${message})`);
+			(busy ? sessionBusy : sessionStuck).push(`${basename(nb)} (${message})`);
 		}
 	}
 
@@ -1231,10 +1241,12 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 	const seen = new Set<string>();
 	/** Auth keys whose purge did NOT provably complete - their sign-in gate must stay. */
 	const unresolved = new Set<string>();
-	const purgeFailures: string[] = [];
+	// Each failure carries whether its own detail already names the cache directory,
+	// so the reason below never has to sniff the text it just built to decide - a
+	// substring check drifts into a duplicated or a missing path on any reword.
+	const purgeFailures: { detail: string; namesCacheDir: boolean }[] = [];
 	let clearedTokens = 0;
 	let externalSkipped = 0;
-	let purgeFailed = 0;
 	let purgeMissed = 0;
 	for (const target of targets) {
 		let auth: Auth;
@@ -1254,11 +1266,11 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 			seen.add(missingKey);
 			const missingLabel = target.sel.profile ? `profile "${target.sel.profile}"` : String(target.sel.host);
 			const message = err instanceof Error ? err.message : String(err);
-			purgeFailed += 1;
 			unresolved.add(missingKey);
-			purgeFailures.push(
-				`${missingLabel}: ${message}, so its cached token could not be identified - look in ${OAUTH_CACHE_DIR}`
-			);
+			purgeFailures.push({
+				detail: `${missingLabel}: ${message}, so its cached token could not be identified - look in ${OAUTH_CACHE_DIR}`,
+				namesCacheDir: true
+			});
 			logWarn('databricks', `logout: could not resolve the signed-in selection ${missingKey}: ${message}`);
 			continue;
 		}
@@ -1273,9 +1285,8 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 		try {
 			const result = payload<LogoutProbe>(unwrap(await probe({ op: 'logout', auth })));
 			if (result.failed?.length) {
-				purgeFailed += 1;
 				unresolved.add(key);
-				purgeFailures.push(`${label}: ${result.failed[0]}`);
+				purgeFailures.push({ detail: `${label}: ${result.failed[0]}`, namesCacheDir: false });
 				logWarn('databricks', `logout: could not remove the cached token for ${key}: ${result.failed.join('; ')}`);
 			} else if (result.cleared?.length) {
 				clearedTokens += 1;
@@ -1289,9 +1300,8 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			purgeFailed += 1;
 			unresolved.add(key);
-			purgeFailures.push(`${label}: ${message}`);
+			purgeFailures.push({ detail: `${label}: ${message}`, namesCacheDir: false });
 			logWarn('databricks', `logout: could not clear the cached token for ${key}: ${message}`);
 		}
 	}
@@ -1309,25 +1319,39 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 		clearedSignIns += 1;
 	}
 
+	const purgeFailed = purgeFailures.length;
+	const sessionsFailed = sessionBusy.length + sessionStuck.length;
+	const plural = (n: number) => (n === 1 ? '' : 's');
 	const reasons: string[] = [];
 	// Every purge reason names the cache directory: the UI's remedy line says a token
 	// may still be deletable by hand, and it must not have to carry a second, drifting
-	// copy of where that is. The vanished-selection failure already appends it itself.
+	// copy of where that is. The vanished-selection failure already appends it itself,
+	// which is what `namesCacheDir` records. Counts are stated the same way on every
+	// reason, so a sentence can never under-report what the counters say.
 	if (purgeFailed) {
 		const first = purgeFailures[0];
 		reasons.push(
-			`the saved sign-in could not be cleared (${first})` +
-				(first.includes(OAUTH_CACHE_DIR) ? '' : ` - look in ${OAUTH_CACHE_DIR}`)
+			`the saved sign-in could not be cleared for ${purgeFailed} signed-in workspace${plural(purgeFailed)} (${first.detail})` +
+				(first.namesCacheDir ? '' : ` - look in ${OAUTH_CACHE_DIR}`)
 		);
 	}
 	if (purgeMissed) {
 		reasons.push(
-			`no cached sign-in was found to delete for ${purgeMissed} signed-in workspace${purgeMissed === 1 ? '' : 's'}, so a token may still be on disk - look in ${OAUTH_CACHE_DIR}`
+			`no cached sign-in was found to delete for ${purgeMissed} signed-in workspace${plural(purgeMissed)}, so a token may still be on disk - look in ${OAUTH_CACHE_DIR}`
 		);
 	}
-	if (sessionFailures.length) {
+	if (sessionBusy.length) {
 		reasons.push(
-			`a connect is still in progress, so ${sessionFailures.length} notebook${sessionFailures.length === 1 ? '' : 's'} may still hold a session (${sessionFailures[0]})`
+			`a connect is still in progress, so ${sessionBusy.length} notebook${plural(sessionBusy.length)} may still hold a session (${sessionBusy[0]})`
+		);
+	}
+	if (sessionStuck.length) {
+		// Worse than the busy case, and a different remedy: the teardown FAILED, so
+		// these notebooks keep their reconnect intent and would rebuild `spark` on the
+		// next kernel restart. Saying "a connect is still in progress" here would name a
+		// cause that never happened and advise waiting for something that will never end.
+		reasons.push(
+			`${sessionStuck.length} notebook${plural(sessionStuck.length)} could not be disconnected and ${sessionStuck.length === 1 ? 'is' : 'are'} still bound to a cluster (${sessionStuck[0]})`
 		);
 	}
 	const incompleteReason = reasons.length ? reasons.join('; ') : null;
@@ -1345,7 +1369,9 @@ export async function logout(sel: Selection & { nb?: string | null } = {}): Prom
 		clearedSignIns,
 		purgeFailed,
 		purgeMissed,
-		sessionsFailed: sessionFailures.length,
+		sessionsFailed,
+		sessionsBusy: sessionBusy.length,
+		sessionsStuck: sessionStuck.length,
 		incomplete: incompleteReason !== null,
 		incompleteReason
 	};

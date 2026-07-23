@@ -73,6 +73,15 @@ function disconnectedPatStatus() {
 	};
 }
 
+/**
+ * Connected through a PAT profile, while this process ALSO holds an OAuth sign-in
+ * for a different, bare host. Log out is global, so that other sign-in is about to
+ * be purged even though the panel is showing the PAT selection.
+ */
+function connectedWithOtherSignInStatus() {
+	return { ...connectedStatus(), signedInHosts: ['https://other-workspace.cloud.databricks.com'] };
+}
+
 /** Installed, disconnected, no profiles at all - and this process signed in to a bare host. */
 function signedInHostStatus() {
 	return {
@@ -177,6 +186,8 @@ test('connected: Log out sits beside Disconnect, ends the session and returns to
 				purgeFailed: 0,
 				purgeMissed: 0,
 				sessionsFailed: 0,
+				sessionsBusy: 0,
+				sessionsStuck: 0,
 				incomplete: false,
 				incompleteReason: null
 			})
@@ -294,6 +305,8 @@ test('an INCOMPLETE sign-out warns instead of confirming - the cached token may 
 				purgeFailed: 1,
 				purgeMissed: 0,
 				sessionsFailed: 0,
+				sessionsBusy: 0,
+				sessionsStuck: 0,
 				incomplete: true,
 				incompleteReason: 'the saved sign-in could not be cleared (no Python environment is bound)'
 			})
@@ -342,6 +355,8 @@ test('an incomplete sign-out whose only failure is a mid-connect notebook does N
 				purgeFailed: 0,
 				purgeMissed: 0,
 				sessionsFailed: 1,
+				sessionsBusy: 1,
+				sessionsStuck: 0,
 				incomplete: true,
 				incompleteReason: 'a connect is still in progress, so 1 notebook may still hold a session (notebook.ipynb (busy))'
 			})
@@ -380,6 +395,8 @@ test('the log-out note does not outlive a later sign-in on the same selection', 
 				purgeFailed: 0,
 				purgeMissed: 0,
 				sessionsFailed: 0,
+				sessionsBusy: 0,
+				sessionsStuck: 0,
 				incomplete: false,
 				incompleteReason: null
 			})
@@ -421,6 +438,8 @@ test('the incomplete warning does not outlive the disconnect it asks for', async
 				purgeFailed: 0,
 				purgeMissed: 0,
 				sessionsFailed: 1,
+				sessionsBusy: 1,
+				sessionsStuck: 0,
 				incomplete: true,
 				incompleteReason: 'a notebook was mid-connect, so its session could not be disconnected'
 			})
@@ -459,9 +478,14 @@ test('disconnected with only a PAT profile: no Log out - that credential is not 
 });
 
 test('disconnected but signed in to a bare host: Log out IS offered, and its note does not outlive the selection', async ({ page }) => {
-	await mockDatabricksStatus(page, signedInHostStatus);
+	// The sign-in really goes away, so the status has to stop reporting it - the
+	// button's visibility now tracks whether ANY sign-in is recorded (Log out is
+	// global), so a frozen "still signed in" body would keep it on screen forever.
+	let signedOut = false;
+	await mockDatabricksStatus(page, () => (signedOut ? { ...signedInHostStatus(), signedInHosts: [] } : signedInHostStatus()));
 	await mockDatabricksClusters(page);
 	await page.route(/\/api\/databricks\/logout$/, async (route) => {
+		signedOut = true;
 		await route.fulfill({
 			status: 200,
 			contentType: 'application/json',
@@ -474,6 +498,8 @@ test('disconnected but signed in to a bare host: Log out IS offered, and its not
 				purgeFailed: 0,
 				purgeMissed: 0,
 				sessionsFailed: 0,
+				sessionsBusy: 0,
+				sessionsStuck: 0,
 				incomplete: false,
 				incompleteReason: null
 			})
@@ -501,4 +527,85 @@ test('disconnected but signed in to a bare host: Log out IS offered, and its not
 	await page.getByTestId('databricks-host').fill('https://other-workspace.cloud.databricks.com');
 	await expect(page.getByTestId('databricks-logout-note')).toHaveCount(0);
 	await expect(page.getByTestId('databricks-logout')).toHaveCount(0);
+});
+
+test('the confirm is scoped to the ACTION, not the panel: another selection\'s sign-in still counts', async ({ page }) => {
+	// Log out is global. Keyed off the selection alone, the confirm for this PAT
+	// connection would say "there is nothing to clear" while the purge deletes the
+	// bare host's Cellar-minted token - and the post-action note would then say the
+	// opposite of the confirm the user had just read.
+	await mockDatabricksStatus(page, connectedWithOtherSignInStatus);
+	await mockDatabricksClusters(page);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+	await expect(page.getByTestId('databricks-connected')).toBeVisible();
+
+	const logout = page.getByTestId('databricks-logout');
+	await expect(logout).toHaveAttribute('title', /clears the saved sign-ins/i);
+	await logout.click();
+	const confirmBox = page.getByTestId('databricks-logout-confirm-box');
+	await expect(confirmBox).toContainText(/clears every saved sign-in/i);
+	await expect(confirmBox).not.toContainText(/no saved Cellar sign-in to clear/i);
+});
+
+test('a sign-in recorded for another selection keeps Log out REACHABLE in the picker', async ({ page }) => {
+	// The picker is showing a PAT profile, which owns nothing of Cellar's - but a bare
+	// host sign-in IS recorded, and Log out is the only control that clears it. Gating
+	// visibility on the selection would hide it exactly when it matters.
+	await mockDatabricksStatus(page, () => ({
+		...disconnectedPatStatus(),
+		signedInHosts: ['https://other-workspace.cloud.databricks.com']
+	}));
+	await mockDatabricksClusters(page);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	await expect(page.getByTestId('databricks-picker')).toBeVisible();
+	await expect(page.getByTestId('databricks-logout')).toBeVisible();
+});
+
+test('a notebook whose teardown FAILED is reported as still bound, not as waiting on a connect', async ({ page }) => {
+	// `disconnect()` threw out of the kernel, BEFORE the assignments that clear the
+	// state - so that notebook keeps its reconnect intent and would rebuild `spark` on
+	// the next kernel restart. There is no connect to wait for, so the busy remedy
+	// ("once its connect finishes") would send the user to wait for nothing.
+	await mockDatabricksStatus(page, signedInHostStatus);
+	await mockDatabricksClusters(page);
+	await page.route(/\/api\/databricks\/logout$/, async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				ok: true,
+				disconnected: 0,
+				clearedTokens: 1,
+				externalSkipped: 0,
+				clearedSignIns: 1,
+				purgeFailed: 0,
+				purgeMissed: 0,
+				sessionsFailed: 1,
+				sessionsBusy: 0,
+				sessionsStuck: 1,
+				incomplete: true,
+				incompleteReason:
+					'1 notebook could not be disconnected and is still bound to a cluster (notebook.ipynb (the Python kernel could not be reached))'
+			})
+		});
+	});
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+	await page.getByTestId('databricks-host').fill(HOST);
+	await logOut(page);
+
+	const warning = page.getByTestId('databricks-logout-warning');
+	await expect(warning).toBeVisible();
+	await expect(warning).toContainText(/still bound to/i);
+	await expect(warning).toContainText(/kernel is reachable again/i);
+	// Not the wrong remedy, and not the token one either - that purge succeeded.
+	await expect(warning).not.toContainText(/once its connect finishes/i);
+	await expect(warning).not.toContainText(/remove the cached sign-in yourself/i);
 });

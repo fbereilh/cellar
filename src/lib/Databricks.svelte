@@ -96,6 +96,10 @@
 		purgeFailed?: number;
 		purgeMissed?: number;
 		sessionsFailed?: number;
+		/** A connect was in flight, so the teardown never ran - it can simply be retried. */
+		sessionsBusy?: number;
+		/** The teardown FAILED, so the notebook is still bound and may rebuild `spark`. */
+		sessionsStuck?: number;
 	}
 	interface DbxCluster {
 		cluster_id: string;
@@ -379,21 +383,42 @@
 	);
 
 	/**
-	 * What Log out will actually DO to this selection, said before the user commits.
-	 * The button is always shown while connected (where it ends the session too), so
-	 * it renders over a PAT/`databricks-cli` connection that has no Cellar-minted
-	 * credential at all - and promising to clear a saved sign-in there would have the
+	 * Does Cellar hold ANY recorded sign-in, process-wide? `logout()` is deliberately
+	 * global - it purges every sign-in this server recorded, not just the selection
+	 * this panel happens to show - so this, NOT the per-selection `cellarSignedIn`, is
+	 * what the confirm copy and the button's visibility must key off. Keyed off the
+	 * selection instead, the confirm would promise "nothing to clear" while a
+	 * different recorded OAuth host's token is about to be deleted (sign in to a bare
+	 * host, switch the picker to a PAT profile, connect, Log out), and the button
+	 * would HIDE the only control that can purge that sign-in. `cellarSignedIn` is
+	 * folded in for the window between signing in and the next status read.
+	 */
+	const cellarSignedInAnywhere = $derived(
+		cellarSignedIn ||
+			(status?.signedInHosts ?? []).length > 0 ||
+			(status?.signedInProfiles ?? []).length > 0
+	);
+
+	/**
+	 * What Log out will actually DO, said before the user commits. The button is
+	 * always shown while connected (where it ends the session too), so it renders over
+	 * a PAT/`databricks-cli` connection that may have no Cellar-minted credential
+	 * anywhere - and promising to clear a saved sign-in there would have the
 	 * pre-action confirm contradicting the post-action note, in the one place the
 	 * user decides whether to proceed. The session half is global either way, which
-	 * is the part worth confirming.
+	 * is the part worth confirming. The "your credentials live elsewhere" clause is
+	 * the one genuinely per-selection bit, so it is gated on `cellarOwnsAuth`.
 	 */
 	const logoutConfirmCopy = $derived(
-		cellarSignedIn
+		cellarSignedInAnywhere
 			? "Sign out of Databricks everywhere? This clears every saved sign-in and disconnects every notebook's Spark session app-wide - reconnecting can take minutes on a cold cluster."
-			: "Sign out of Databricks everywhere? This disconnects every notebook's Spark session app-wide - reconnecting can take minutes on a cold cluster. There is no saved Cellar sign-in to clear: this connection authenticates through ~/.databrickscfg or the databricks CLI, which Cellar leaves untouched."
+			: "Sign out of Databricks everywhere? This disconnects every notebook's Spark session app-wide - reconnecting can take minutes on a cold cluster. There is no saved Cellar sign-in to clear anywhere" +
+				(cellarOwnsAuth
+					? '.'
+					: ': this connection authenticates through ~/.databrickscfg or the databricks CLI, which Cellar leaves untouched.')
 	);
 	const logoutButtonTitle = $derived(
-		cellarSignedIn
+		cellarSignedInAnywhere
 			? "Sign out of Databricks everywhere - clears the saved sign-ins and disconnects every notebook; you'll need to sign in again"
 			: 'Sign out of Databricks everywhere - disconnects every notebook; there is no saved Cellar sign-in to clear'
 	);
@@ -541,7 +566,7 @@
 	/**
 	 * A new selection: forget the old sign-in + cluster list, and the log-out
 	 * feedback with it. The note deliberately OUTLIVES the connected→picker card
-	 * swap a log out causes (it is rendered ungated by `cellarSignedIn`), but it
+	 * swap a log out causes (it is rendered ungated by `cellarSignedInAnywhere`), but it
 	 * describes ONE selection - once the user picks another profile or types
 	 * another host it would be claiming something about a selection it no longer
 	 * describes. `logoutDatabricks` calls this BEFORE it writes its own note.
@@ -701,16 +726,27 @@
 	 * user can delete (and the server's reason already names the directory, so this
 	 * never repeats the path); a notebook mid-connect is not - telling someone to
 	 * remove a cache entry that was just deleted is the same "assert more than the
-	 * server verified" mistake the honest-reporting rule exists to prevent. When
-	 * both apply, both are said.
+	 * server verified" mistake the honest-reporting rule exists to prevent. The two
+	 * session failures differ the same way: a refused teardown resolves itself once
+	 * the connect ends, a FAILED one leaves the notebook bound with nothing to wait
+	 * for. When several apply, each is said.
 	 */
 	function incompleteWarning(out: DbxLogout): string {
 		const advice: string[] = [];
 		if (out.purgeFailed || out.purgeMissed) {
 			advice.push('Your saved sign-in may still be usable - try again, or remove the cached sign-in yourself.');
 		}
-		if (out.sessionsFailed) {
+		if (out.sessionsBusy) {
 			advice.push('Disconnect that notebook once its connect finishes.');
+		}
+		if (out.sessionsStuck) {
+			// A teardown that FAILED, not one that was refused: the notebook keeps its
+			// reconnect intent, so waiting for a connect to finish is not the remedy -
+			// there is no connect, and a retry fails the same way until its kernel is back.
+			advice.push('That notebook is still bound to its cluster - disconnect it once its kernel is reachable again, or its session may rebuild on the next kernel restart.');
+		}
+		if (!out.sessionsBusy && !out.sessionsStuck && out.sessionsFailed) {
+			advice.push('Disconnect that notebook by hand.');
 		}
 		const reason = out.incompleteReason ?? 'part of it could not be verified';
 		return [`Sign-out may be incomplete: ${reason}.`, ...advice].join(' ');
@@ -1036,11 +1072,14 @@
      while connected (where it ends the session too). It is also the panel's most
      destructive control and sits right below Disconnect, so it takes a two-step
      inline confirm whose copy names the blast radius: this signs out EVERYWHERE and
-     disconnects every notebook, not just the selection this panel is showing. The
-     confirm/tooltip copy is `cellarSignedIn`-conditional so it never promises a purge
-     the connection has nothing to purge - see `logoutConfirmCopy`. -->
+     disconnects every notebook, not just the selection this panel is showing. Both
+     the visibility gate and the confirm/tooltip copy therefore key off
+     `cellarSignedInAnywhere`, NOT the per-selection `cellarSignedIn` - matching the
+     scope of what the action does, so the button can never hide the one control that
+     would purge a sign-in recorded for a different selection, nor promise a purge
+     that will not happen - see `logoutConfirmCopy`. -->
 {#snippet logoutRow(always: boolean)}
-	{#if always || cellarSignedIn}
+	{#if always || cellarSignedInAnywhere}
 		{#if confirmLogout}
 			<div
 				class="mt-1.5 rounded border border-warning/40 bg-warning/10 px-2 py-1.5"
@@ -1080,7 +1119,7 @@
 		{/if}
 	{/if}
 	<!-- The outcome is NOT gated on the button still being shown: a successful log out
-	     is exactly what makes `cellarSignedIn` false, and the confirmation has to
+	     is exactly what makes `cellarSignedInAnywhere` false, and the confirmation has to
 	     survive that (and the card swap it triggers). -->
 	{#if logoutNote}
 		<!-- One notch stronger than the surrounding hint copy (/50): this is feedback
