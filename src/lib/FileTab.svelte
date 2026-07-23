@@ -7,11 +7,14 @@
 	import { markdown } from '@codemirror/lang-markdown';
 	import { json as jsonLang } from '@codemirror/lang-json';
 	import { yaml as yamlLang } from '@codemirror/lang-yaml';
+	import { html as htmlLang } from '@codemirror/lang-html';
 	import { StreamLanguage } from '@codemirror/language';
 	import { toml as tomlMode } from '@codemirror/legacy-modes/mode/toml';
 	import { EDITOR_THEME } from '$lib/editorTheme';
 	import { gitGutterExtension, setGitBaseline } from '$lib/gitGutter';
 	import MarkdownView from '$lib/MarkdownView.svelte';
+	import HtmlPreview from '$lib/HtmlPreview.svelte';
+	import { isHtmlPath, hasRelativeAssetRefs } from '$lib/htmlPreview';
 	import type { BlameLine } from '$lib/server/git';
 
 	interface Props {
@@ -43,22 +46,63 @@
 	let saving = $state(false);
 	let savedFlash = $state(false);
 
-	// ---- Markdown preview -----------------------------------------------------
-	// A `.md`/`.markdown` file can toggle between the raw source editor and a
-	// rendered view (reusing the notebook markdown renderer). `liveSource` mirrors
-	// the editor buffer so the preview reflects unsaved edits. The view choice is
-	// remembered across files (session-wide preference; source is the default).
-	const isMarkdownFile = /\.(md|markdown)$/i.test(path);
-	const VIEW_KEY = 'cellar-md-view';
-	let mdMode = $state<'source' | 'preview'>('source');
-	let liveSource = $state('');
+	// ---- Rendered preview (markdown + html) -----------------------------------
+	// Two file kinds can toggle between the raw source editor and a rendered view:
+	// `.md`/`.markdown` (the notebook markdown renderer) and `.html`/`.htm` (a
+	// SANDBOXED iframe — see `HtmlPreview.svelte`). `liveSource` mirrors the editor
+	// buffer, so a preview always reflects unsaved edits and toggling back
+	// re-renders from the current content. The view choice is remembered across
+	// files as a session-wide preference, per kind — markdown defaults to source
+	// (you open a `.md` to edit it), HTML defaults to preview (you open an export
+	// to look at it).
+	type ViewMode = 'source' | 'preview';
+	type PreviewKind = 'markdown' | 'html' | null;
 
-	function setMdMode(m: 'source' | 'preview') {
-		mdMode = m;
+	function previewKindOf(p: string): PreviewKind {
+		if (/\.(md|markdown)$/i.test(p)) return 'markdown';
+		return isHtmlPath(p) ? 'html' : null;
+	}
+	function viewKeyFor(kind: PreviewKind): string {
+		return kind === 'html' ? 'cellar-html-view' : 'cellar-md-view';
+	}
+	const previewKind = $derived(previewKindOf(path));
+	const viewKey = $derived(viewKeyFor(previewKind));
+
+	// The remembered choice is read synchronously at init, not in `onMount`, so an
+	// HTML file paints its preview on the first frame instead of flashing the
+	// source toggle while the fetch is in flight. `localStorage` is absent under
+	// SSR; the catch covers it.
+	function initialViewMode(): ViewMode {
+		const kind = previewKindOf(path);
+		if (!kind) return 'source';
 		try {
-			localStorage.setItem(VIEW_KEY, m);
+			const saved = localStorage.getItem(viewKeyFor(kind));
+			if (saved === 'preview' || saved === 'source') return saved;
+		} catch {}
+		return kind === 'html' ? 'preview' : 'source';
+	}
+	let viewMode = $state<ViewMode>(initialViewMode());
+	let liveSource = $state('');
+	// Only the HTML preview has the sandbox's relative-asset limitation, and only
+	// while it is on screen — `$derived` is lazy, so a source-mode edit never
+	// pays for the scan.
+	const relativeAssets = $derived(
+		previewKind === 'html' && viewMode === 'preview' && hasRelativeAssetRefs(liveSource)
+	);
+
+	function setViewMode(m: ViewMode) {
+		viewMode = m;
+		try {
+			localStorage.setItem(viewKey, m);
 		} catch {}
 	}
+
+	const showPreview = $derived(previewKind !== null && viewMode === 'preview' && status !== 'error');
+
+	// Toggle order: the kind's default view leads.
+	const viewModes = $derived<ViewMode[]>(
+		previewKind === 'html' ? ['preview', 'source'] : ['source', 'preview']
+	);
 
 	// TOML ships no lezer grammar; the official legacy stream mode is the supported
 	// path. Its tokens map onto the same highlight tags every other language uses,
@@ -71,6 +115,7 @@
 		if (p.endsWith('.json') || p.endsWith('.ipynb')) return jsonLang();
 		if (p.endsWith('.yml') || p.endsWith('.yaml')) return yamlLang();
 		if (p.endsWith('.toml')) return tomlLang();
+		if (isHtmlPath(p)) return htmlLang();
 		return [];
 	}
 
@@ -197,12 +242,6 @@
 			content = body.content;
 			liveSource = content;
 			status = 'ready';
-			if (isMarkdownFile) {
-				try {
-					const saved = localStorage.getItem(VIEW_KEY);
-					if (saved === 'preview' || saved === 'source') mdMode = saved;
-				} catch {}
-			}
 		} catch (err) {
 			status = 'error';
 			errorMsg = String((err as Error)?.message ?? err);
@@ -224,7 +263,7 @@
 					EditorView.updateListener.of((v: ViewUpdate) => {
 						if (v.docChanged) {
 							setDirty(true);
-							if (isMarkdownFile) liveSource = v.state.doc.toString();
+							if (previewKind) liveSource = v.state.doc.toString();
 						}
 						// Cursor moved (or the doc shifted the line under it) → re-map blame.
 						if (v.selectionSet || v.docChanged) scheduleBlame();
@@ -248,21 +287,19 @@
 			{#if dirty}<span class="text-warning" title="Unsaved changes">●</span>{/if}
 		</span>
 		<div class="flex items-center gap-2">
-			{#if isMarkdownFile}
-				<!-- Source ↔ rendered toggle (VS Code-style), markdown files only. -->
-				<div class="join" role="group" aria-label="Markdown view">
-					<button
-						class="btn btn-xs join-item {mdMode === 'source' ? 'btn-active' : 'btn-ghost'}"
-						onclick={() => setMdMode('source')}
-						aria-pressed={mdMode === 'source'}
-						data-testid="md-view-source"
-					>Source</button>
-					<button
-						class="btn btn-xs join-item {mdMode === 'preview' ? 'btn-active' : 'btn-ghost'}"
-						onclick={() => setMdMode('preview')}
-						aria-pressed={mdMode === 'preview'}
-						data-testid="md-view-preview"
-					>Preview</button>
+			{#if previewKind}
+				<!-- Source ↔ rendered toggle (VS Code-style), for the file kinds that
+				     have a rendered view. Preview leads for HTML (it is the default
+				     view), source leads for markdown. -->
+				<div class="join" role="group" aria-label="{previewKind === 'html' ? 'HTML' : 'Markdown'} view">
+					{#each viewModes as m (m)}
+						<button
+							class="btn btn-xs join-item {viewMode === m ? 'btn-active' : 'btn-ghost'}"
+							onclick={() => setViewMode(m)}
+							aria-pressed={viewMode === m}
+							data-testid="file-view-{m}"
+						>{m === 'source' ? 'Source' : 'Preview'}</button>
+					{/each}
 				</div>
 			{/if}
 			{#if savedFlash}<span class="text-success">saved</span>{/if}
@@ -276,15 +313,20 @@
 	{#if status === 'error'}
 		<div class="p-6 text-sm text-error" data-testid="file-error">Could not open <code class="font-mono">{path}</code>: {errorMsg}</div>
 	{/if}
-	<!-- Rendered preview (markdown only). Editor stays mounted-but-hidden beneath
-	     so its CodeMirror state, git baseline and unsaved edits survive toggling. -->
-	{#if isMarkdownFile && mdMode === 'preview' && status !== 'error'}
+	<!-- Rendered preview. The editor stays mounted-but-hidden beneath it so its
+	     CodeMirror state, git baseline and unsaved edits survive toggling. -->
+	{#if showPreview && previewKind === 'markdown'}
 		<div class="min-h-0 flex-1 overflow-auto bg-base-100">
 			<MarkdownView source={liveSource} />
+		</div>
+	{:else if showPreview && previewKind === 'html'}
+		<!-- The iframe owns its own scrolling, so the pane must NOT add a second one. -->
+		<div class="min-h-0 flex-1 overflow-hidden bg-base-100">
+			<HtmlPreview source={liveSource} {relativeAssets} />
 		</div>
 	{/if}
 	<div
 		bind:this={editorEl}
-		class="min-h-0 flex-1 overflow-auto bg-base-100 {status === 'error' || (isMarkdownFile && mdMode === 'preview') ? 'hidden' : ''}"
+		class="min-h-0 flex-1 overflow-auto bg-base-100 {status === 'error' || showPreview ? 'hidden' : ''}"
 	></div>
 </div>
