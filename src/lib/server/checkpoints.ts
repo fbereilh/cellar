@@ -168,9 +168,10 @@ export function createCheckpoint(
 	const store = ensureLoaded();
 	const key = keyFor(nb);
 	// Deep-clone the live cells so later document mutations can't corrupt the stored
-	// snapshot. Runtime metadata (lastRun/editedAt) rides along — it lives only in
-	// this ephemeral `.cellar` file, never the `.ipynb`, and restoring it keeps
-	// run-status honest (the kernel-session epoch check still gates ran_this_session).
+	// snapshot. Runtime metadata (lastRun/editedAt/importBindings) rides along - it
+	// lives only in this ephemeral `.cellar` file, never the `.ipynb`, and restoring it
+	// keeps run-status AND staleness honest (the kernel-session epoch check still gates
+	// ran_this_session; the import-change stamps still scope an imports-cell edit).
 	const cells = structuredClone(listCells(nb));
 	const cp: Checkpoint = {
 		id: randomUUID(),

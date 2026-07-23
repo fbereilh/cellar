@@ -78,6 +78,14 @@ export interface CellarNamespace {
 	lastRun?: LastRun;
 	/** Runtime-only wall-clock ms the source last changed (never persisted). */
 	editedAt?: number;
+	/**
+	 * Runtime-only, never persisted: per module-level import binding this cell
+	 * provides, the wall-clock ms that binding last CHANGED (added / rebound /
+	 * removed). An absent name has not changed since this document was loaded.
+	 * Feeds the staleness rule so an imports-cell edit stales only the cells that
+	 * read a name whose binding actually moved - see `importBindings.ts`.
+	 */
+	importBindings?: Record<string, number>;
 	[key: string]: unknown;
 }
 

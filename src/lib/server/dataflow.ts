@@ -78,6 +78,7 @@ import { computeStaleness } from '../staleness';
 import { isSqlCell } from '../cellLanguage';
 import { normalizeForAnalysis } from './magics';
 import { parseSqlCell } from './sql';
+import { importBindingNames } from './importBindings';
 import { LruCache } from './lru';
 import type { CellView, SessionId } from './types';
 
@@ -85,6 +86,13 @@ import type { CellView, SessionId } from './types';
 interface DataflowEntry {
 	defines: string[];
 	uses: string[];
+	/**
+	 * The subset of `defines` bound by a MODULE-LEVEL import, so their values are a
+	 * pure function of the import statement (see `importBindings.ts`). Computed in
+	 * JS, NOT by the probe: it is a tokenizer question, the probe is already the
+	 * expensive part, and staleness must keep working when the probe cannot run.
+	 */
+	imports?: string[];
 }
 
 /** Per-cell dataflow, keyed by cell id (or source string in the cache). */
@@ -429,6 +437,24 @@ main()
  */
 const cache = new LruCache<string, DataflowEntry>(1000);
 
+/**
+ * source string → the module-level import bindings it provides. A separate cache
+ * from `cache` on purpose: this is a cheap JS tokenizer pass, not the probe's
+ * answer, so it must survive a probe failure/backoff (the whole point is that the
+ * import-binding refinement never depends on the subprocess) and must never be
+ * confused with a probe result when deciding what is cacheable.
+ */
+const importCache = new LruCache<string, string[]>(1000);
+
+/** The names `source` provides as stable module-level import bindings, cached. */
+function importNamesFor(source: string): string[] {
+	const hit = importCache.get(source);
+	if (hit) return hit;
+	const names = importBindingNames(source);
+	importCache.set(source, names);
+	return names;
+}
+
 /** A probe run's public outcome plus WHY it failed (a timeout is the one we back off). */
 type RawProbe = ProbeRun & { timedOut: boolean };
 
@@ -528,6 +554,7 @@ async function probeBatch(items: ProbeItem[]): Promise<BatchRun> {
 /** Clear all module state (analysis cache + timeout backoff). Test-only. */
 export function __resetDataflowState(): void {
 	cache.clear();
+	importCache.clear();
 	backoff.clear();
 	inflight.clear();
 }
@@ -659,6 +686,13 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 			out[c.id] = { defines: [], uses: [] };
 			if (unresolved.has(src)) unavailable.add(c.id); // could not analyze this pass
 		}
+		// The import-binding subset, from the JS tokenizer rather than the probe, so it
+		// is available even when the probe is not. Only names the probe also reports as
+		// defines can be exempted downstream, so an unavailable cell (empty defines)
+		// carries no exemption either - it stays conservative-stale as the backoff
+		// design requires. Merged into a COPY: `cached` is the shared LRU entry.
+		const imports = importNamesFor(src);
+		if (imports.length) out[c.id] = { ...out[c.id], imports };
 	}
 	// Synthetic dataflow for SQL cells: `sql.ts` compiles the cell to a `spark.sql()`
 	// wrapper that binds its result (the `-- >> name` prefix line's name plus the

@@ -125,6 +125,26 @@ describe('buildDefinerGraph — staleness parity', () => {
 		});
 	}
 
+	it('edgeNames carries the NAMES each edge is made of, and agrees with directUpstream', () => {
+		// Staleness reasons about an edge per name (an imports-cell edit moves one
+		// binding, not all of them), so the two views must never drift: the keys of
+		// edgeNames ARE directUpstream, and each value is the names resolving there.
+		for (const { name, ids, df } of fixtures) {
+			const codeCells = ids.map((id) => ({ id }));
+			const { directUpstream, edgeNames } = buildDefinerGraph(codeCells, df);
+			edgeNames.forEach((m, i) => {
+				expect(new Set(m.keys()), name).toEqual(directUpstream[i]);
+				for (const [j, names] of m)
+					for (const n of names) {
+						expect(df[ids[i]]?.uses ?? [], name).toContain(n);
+						expect(df[ids[j]]?.defines ?? [], name).toContain(n);
+					}
+			});
+		}
+		const { edgeNames } = buildDefinerGraph(SCENARIO_IDS.map((id) => ({ id })), SCENARIO);
+		expect(edgeNames[3].get(2)).toEqual(new Set(['clean', 'featurize'])); // c4 ← c3
+	});
+
 	it('definers + definerBefore resolve to the nearest preceding definer', () => {
 		const { definers, definerBefore } = buildDefinerGraph(SCENARIO_IDS.map((id) => ({ id })), SCENARIO);
 		expect(definers.get('df')).toEqual([1, 3, 6]); // c2, c4, c7

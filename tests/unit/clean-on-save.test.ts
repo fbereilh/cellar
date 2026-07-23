@@ -35,7 +35,13 @@ function messyNotebook(): any {
 				execution_count: 7,
 				source: ['x = object()\n', 'x'],
 				metadata: {
-					cellar: { extract: false, visible: true, lastRun: { at: 123, session: 1 }, editedAt: 999 },
+					cellar: {
+						extract: false,
+						visible: true,
+						lastRun: { at: 123, session: 1 },
+						editedAt: 999,
+						importBindings: { pd: 999 }
+					},
 					// Non-allowlisted cell metadata that MUST be dropped.
 					collapsed: true,
 					scrolled: false,
@@ -109,11 +115,15 @@ describe('cleanNotebook — correctness', () => {
 		expect(ALLOWED_CELL_METADATA).toEqual(['cellar']);
 	});
 
-	it('strips runtime-only cellar keys (lastRun, editedAt) but keeps durable ones', () => {
+	it('strips runtime-only cellar keys (lastRun, editedAt, importBindings) but keeps durable ones', () => {
 		const cleaned = cleanNotebook(messyNotebook());
 		const cellar = (cleaned.cells[0] as any).metadata.cellar;
 		expect(cellar.lastRun).toBeUndefined();
 		expect(cellar.editedAt).toBeUndefined();
+		// Per-name import-change stamps churn on every edit and an ABSENT one reads as
+		// "unchanged", so persisting them would both dirty the diff and let a
+		// hand-edited notebook forge a stale-exemption.
+		expect(cellar.importBindings).toBeUndefined();
 		expect(cellar.visible).toBe(true);
 		expect(cellar.extract).toBe(false);
 	});

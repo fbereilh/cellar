@@ -28,6 +28,7 @@ import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { exportNotebookToPy, type ExportResult } from './export-py';
 import { SQL_LANGUAGE } from '../cellLanguage';
+import { foldImportChange } from './importBindings';
 import type {
 	Cell,
 	CellView,
@@ -814,6 +815,7 @@ export function setSource(id: string, source: string, nb?: string | null, origin
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell && cell.source !== source) {
+		const prevSource = cell.source;
 		cell.source = source;
 		// Runtime-only edit stamp for the staleness rule ($lib/staleness.js): a cell
 		// (and everything downstream of it) is stale once its source changes after it
@@ -821,7 +823,21 @@ export function setSource(id: string, source: string, nb?: string | null, origin
 		// dirties the .ipynb. Set BEFORE persist so it rides the same in-memory doc.
 		cell.metadata = cell.metadata ?? {};
 		cell.metadata.cellar = cell.metadata.cellar ?? {};
-		cell.metadata.cellar.editedAt = Date.now();
+		const now = Date.now();
+		cell.metadata.cellar.editedAt = now;
+		// …and the per-NAME refinement of that stamp for module-level import bindings.
+		// `editedAt` alone makes an imports-cell edit stale every cell below it (it
+		// defines a name almost all of them use); folding the before/after binding sets
+		// records WHICH names actually moved, so staleness can transmit only along the
+		// edges that carry one. Same runtime-only contract as `editedAt`. Cheap (a
+		// tokenizer pass over one cell) and it must happen here: `prevSource` exists
+		// nowhere else.
+		cell.metadata.cellar.importBindings = foldImportChange(
+			prevSource,
+			source,
+			cell.metadata.cellar.importBindings,
+			now
+		);
 		persist(doc);
 		emit(doc, 'cell:edited', { cellId: id, source }, originId);
 	}

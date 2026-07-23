@@ -32,8 +32,18 @@
 
 import type { SessionId } from '$lib/server/types';
 
-/** Per-cell dataflow (what each cell defines / uses); missing entry ⇒ no dataflow. */
-export type Dataflow = Record<string, { defines?: string[]; uses?: string[] } | undefined>;
+/**
+ * Per-cell dataflow (what each cell defines / uses); missing entry ⇒ no dataflow.
+ *
+ * `imports` is the subset of `defines` bound by a MODULE-LEVEL import whose value
+ * is therefore a pure function of its import statement (see
+ * `server/importBindings.ts`). Staleness uses it to transmit change only along
+ * edges whose names could actually have moved; every other consumer ignores it.
+ */
+export type Dataflow = Record<
+	string,
+	{ defines?: string[]; uses?: string[]; imports?: string[] } | undefined
+>;
 
 /** The minimal cell shape the graph needs: an id (dataflow is keyed by it). */
 interface GraphCell {
@@ -48,6 +58,14 @@ export interface DefinerGraph {
 	definerBefore(name: string, i: number): number;
 	/** For each code cell (by index), the set of upstream code-cell indices it reads. */
 	directUpstream: Set<number>[];
+	/**
+	 * The same edges, carrying the NAMES each one is made of: for code cell `i`,
+	 * upstream index → the names `i` reads that resolve to that upstream. An edge is
+	 * not a single fact but a bundle of per-name facts, and the staleness rule needs
+	 * to reason about them individually (an imports cell's edit moves one name's
+	 * binding, not all of them). `directUpstream[i]` is exactly `edgeNames[i]`'s keys.
+	 */
+	edgeNames: Map<number, Set<string>>[];
 }
 
 /**
@@ -82,18 +100,24 @@ export function buildDefinerGraph(
 		return best;
 	}
 
-	// The set of upstream code-cell indices each code cell directly depends on: each
-	// name it uses, resolved to that name's nearest preceding definer.
-	const directUpstream = codeCells.map((c, i) => {
-		const ups = new Set<number>();
+	// The upstream code cells each code cell directly depends on: each name it uses,
+	// resolved to that name's nearest preceding definer. Kept per NAME as well as per
+	// cell - an edge's names are what let staleness decide whether that edge actually
+	// carries a change (see `$lib/staleness.ts`).
+	const edgeNames = codeCells.map((c, i) => {
+		const ups = new Map<number, Set<string>>();
 		for (const name of dataflow[c.id]?.uses ?? []) {
 			const j = definerBefore(name, i);
-			if (j >= 0) ups.add(j);
+			if (j < 0) continue;
+			let names = ups.get(j);
+			if (!names) ups.set(j, (names = new Set<string>()));
+			names.add(name);
 		}
 		return ups;
 	});
+	const directUpstream = edgeNames.map((m) => new Set(m.keys()));
 
-	return { definers, definerBefore, directUpstream };
+	return { definers, definerBefore, directUpstream, edgeNames };
 }
 
 /** The cell shape `resolveSymbol` reads: id, type, agent-visibility, last-run epoch. */
@@ -230,6 +254,14 @@ export interface ImpactInfo {
  * carried only through a conditional bind, a `global`-declared augmented assignment
  * inside a function, or `exec`/`globals()` is invisible to the graph, so a data
  * cell's `dependents` can UNDER-report.
+ *
+ * It can also OVER-report, in exactly one direction: this is the blast radius of
+ * the WHOLE cell, asked BEFORE an edit exists, so it must assume every name the
+ * cell defines may move. `computeStaleness` runs after the edit and knows more -
+ * it exempts an edge carrying only module-level import bindings whose statements
+ * did not actually change (see `$lib/staleness.ts`). So for an imports cell,
+ * `dependents` is "everything that reads any of these imports", while the cells
+ * that actually go stale are only those reading an import the edit moved.
  *
  * There is NO runtime backstop for this. `get_notebook_map`'s `stale_state` is
  * `computeStaleness(cells, dataflow, sid)` - this same static graph plus `lastRun`

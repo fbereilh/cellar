@@ -242,7 +242,7 @@ function isEmptyDisplayOutput(output: RawOutput): boolean {
 }
 
 /** Runtime-only `cellar` keys — never persisted, stripped symmetrically on read + write. */
-const RUNTIME_CELLAR_KEYS = ['lastRun', 'editedAt'];
+const RUNTIME_CELLAR_KEYS = ['lastRun', 'editedAt', 'importBindings'];
 
 /**
  * Return a copy of cell metadata without the runtime-only `cellar` records:
@@ -251,6 +251,11 @@ const RUNTIME_CELLAR_KEYS = ['lastRun', 'editedAt'];
  *  - `editedAt` — the wall-clock time the source last changed, which feeds the
  *    staleness rule ($lib/staleness.js) and, like the epoch, would churn a git
  *    diff on every keystroke if persisted.
+ *  - `importBindings` - per-name wall-clock stamps of when each module-level
+ *    import binding last changed, the refinement that keeps an imports-cell edit
+ *    from blanket-staling the notebook ($lib/server/importBindings.js). Same
+ *    churn, and same forgery concern as the epoch: an absent stamp reads as
+ *    "unchanged", so a hand-edited notebook must not be able to supply one.
  *
  * This is one half of a two-sided forgery/zero-diff guard, and the two halves
  * must stay in lockstep, so they share this helper: `cleanCell` strips it on the
