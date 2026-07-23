@@ -472,6 +472,23 @@ export function buildImageBlocks(
 	const omitted: OmittedImage[] = [];
 	let spentBytes = 0;
 	let spentPixels = 0;
+	/**
+	 * The bound-decline entry a further decline of the same reason may still be
+	 * merged into - null the moment ANY other outcome intervenes. A run is only
+	 * collapsible while it is genuinely uninterrupted: both budgets are
+	 * `spent + cost > max` tests, so a large image can be declined and a smaller
+	 * following one still fit, and merging across that would inflate the entry's
+	 * `count` over an image the result actually DELIVERED.
+	 */
+	let openBound: OmittedImage | null = null;
+	const shipped = (block: ImageBlockPayload) => {
+		openBound = null;
+		images.push(block);
+	};
+	const declineImage = (entry: OmittedImage) => {
+		openBound = null;
+		omitted.push(entry);
+	};
 
 	const boundNote = (reason: 'limit' | 'budget', from: number, count: number): string => {
 		const why = reason === 'limit' ? `this result carries at most ${limit} images` : `this result's image budget is spent`;
@@ -488,22 +505,23 @@ export function buildImageBlocks(
 	 * re-emit the shrinking tail, the omission text over a full page-through grows
 	 * quadratically in the number of figures. The contract is unweakened: the entry
 	 * still says how many were declined and names the exact call that resumes at the
-	 * first of them.
+	 * first of them - which is only true while the run is UNBROKEN, hence `openBound`.
 	 */
 	const declineBound = (output_index: number, mime: string, reason: 'limit' | 'budget') => {
-		const last = omitted[omitted.length - 1];
-		if (last && last.reason === reason) {
-			last.count = (last.count ?? 1) + 1;
-			last.note = boundNote(reason, last.output_index, last.count);
+		if (openBound && openBound.reason === reason) {
+			openBound.count = (openBound.count ?? 1) + 1;
+			openBound.note = boundNote(reason, openBound.output_index, openBound.count);
 			return;
 		}
-		omitted.push({ output_index, mime, reason, note: boundNote(reason, output_index, 1) });
+		const entry: OmittedImage = { output_index, mime, reason, note: boundNote(reason, output_index, 1) };
+		omitted.push(entry);
+		openBound = entry;
 	};
 
 	for (const item of items) {
 		const { output_index, mime, b64 } = item;
 		if (!isInlinableImageMime(mime)) {
-			omitted.push({ output_index, mime, reason: 'unsupported_mime', note: `${mime} cannot be shown as an image; read the output text instead` });
+			declineImage({ output_index, mime, reason: 'unsupported_mime', note: `${mime} cannot be shown as an image; read the output text instead` });
 			continue;
 		}
 		if (images.length >= limit) {
@@ -512,7 +530,7 @@ export function buildImageBlocks(
 		}
 		const dim = imageDimensions(mime, b64);
 		if (exceedsDecodeBound(mime, b64, dim)) {
-			omitted.push({ output_index, mime, reason: 'too_large', note: TOO_LARGE_NOTE });
+			declineImage({ output_index, mime, reason: 'too_large', note: TOO_LARGE_NOTE });
 			continue;
 		}
 		// Charge the decode budget BEFORE decoding whenever the cost is knowable, so a
@@ -528,9 +546,10 @@ export function buildImageBlocks(
 		// budget is gone is what bounds the overshoot to a single image instead of
 		// letting a run of unreadable headers decode without limit. Only a PNG is ever
 		// handed to pngjs, and on the `full` path only one breaching a host ceiling is -
-		// so this is gated on a decode really being about to happen. Withholding a
-		// figure that costs the decoder nothing would charge it for CPU never spent.
-		if (!dim && mime === 'image/png' && (full ? decoding : true) && spentPixels >= maxDecodePixels) {
+		// so this is gated on `willDecode`, which reports a decode really being about to
+		// happen on either path. Withholding a figure that costs the decoder nothing
+		// would charge it for CPU never spent.
+		if (!dim && decoding && spentPixels >= maxDecodePixels) {
 			declineBound(output_index, mime, 'budget');
 			continue;
 		}
@@ -540,7 +559,7 @@ export function buildImageBlocks(
 		// is spent either way, and that is what this budget bounds.
 		spentPixels += fitted.decodedPixels;
 		if (!fitted.block) {
-			omitted.push({ output_index, mime, reason: 'too_large', note: TOO_LARGE_NOTE });
+			declineImage({ output_index, mime, reason: 'too_large', note: TOO_LARGE_NOTE });
 			continue;
 		}
 		const bytes = base64Bytes(fitted.block.data);
@@ -549,7 +568,7 @@ export function buildImageBlocks(
 			continue;
 		}
 		spentBytes += bytes;
-		images.push(fitted.block);
+		shipped(fitted.block);
 	}
 	return { images, omitted };
 }
@@ -566,10 +585,16 @@ const TOO_LARGE_NOTE = 'image too large to send as an image block; its size is i
  * event-loop stall MAX_RESULT_DECODE_PIXELS exists to bound. Those retries also
  * emit SMALL blocks, so the byte budget cannot catch them either; this is the only
  * place that sees the cost.
+ *
+ * An UNPARSEABLE header on the default path counts as a decode: `downscaleImageForBlock`
+ * skips both of its early returns without dimensions and does reach `PNG.sync.read`.
+ * Saying otherwise would make this predicate false exactly where a decode happens, in
+ * a module whose invariant is that no path may decode uncharged - so a future caller
+ * treating it as the sole decode gate would be routed around the budget.
  */
 function willDecode(full: boolean, mime: string, b64: string, dim: ImageDims, maxEdge: number, maxBytes: number): boolean {
 	if (mime !== 'image/png') return false;
-	if (!full) return !!dim && Math.max(dim.width, dim.height) > maxEdge;
+	if (!full) return !dim || Math.max(dim.width, dim.height) > maxEdge;
 	return !withinHostLimits(b64, maxBytes, dim);
 }
 

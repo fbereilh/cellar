@@ -182,6 +182,34 @@ describe('image block policy', () => {
 		expect(omitted[0].note).toMatch(/get_full_output\(id, images_from: 2\)/);
 	});
 
+	it('never collapses two declines across an image that SHIPPED between them', () => {
+		// A budget is a `spent + cost > max` test, not a latch: a large image can be
+		// declined and a smaller following one still fit. Merging across that would
+		// have made ONE entry claim a run of consecutive withheld outputs that in fact
+		// COVERED a figure the result delivered - `count` is the number of consecutive
+		// outputs the entry stands for, and the agent pages from it on that promise.
+		const big = makePngB64(200, 150);
+		const small = makePngB64(24, 18);
+		const bigBytes = base64Bytes(big);
+		const items = [ref(0, 'image/png', big), ref(1, 'image/png', big), ref(2, 'image/png', small), ref(3, 'image/png', big)];
+		// Room for one big image plus the small one - so out1 and out3 are declined on
+		// bytes while out2 fits between them.
+		const { images, omitted } = buildImageBlocks(items, { limit: 100, maxTotalBytes: bigBytes + base64Bytes(small) + 1 });
+		expect(images.map((i) => i.output_index)).toEqual([0, 2]);
+		expect(omitted.map((o) => [o.reason, o.output_index, o.count])).toEqual([
+			['budget', 1, undefined],
+			['budget', 3, undefined]
+		]);
+		// Each entry resumes at its own figure, and neither claims to stand for the
+		// output that was actually shipped.
+		expect(omitted[0].note).toMatch(/get_full_output\(id, images_from: 1\)/);
+		expect(omitted[1].note).toMatch(/get_full_output\(id, images_from: 3\)/);
+
+		// The collapse is intact where the run really is uninterrupted.
+		const contiguous = buildImageBlocks([ref(0, 'image/png', big), ref(1, 'image/png', big), ref(2, 'image/png', big)], { limit: 100, maxTotalBytes: bigBytes + 1 });
+		expect(contiguous.omitted).toEqual([expect.objectContaining({ output_index: 1, reason: 'budget', count: 2 })]);
+	});
+
 	it('stops on the aggregate DECODE budget - the CPU spent resampling is bounded per result, not just the bytes returned', () => {
 		// A downscaled output is small however big its source was, so a byte budget
 		// alone cannot bound the decode cost. This charges the SOURCE pixels.

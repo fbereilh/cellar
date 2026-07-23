@@ -17,6 +17,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import * as svc from './service';
+import { IMG_MAX_EDGE, MAX_IMAGE_BLOCKS, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
 import { McpSessionRegistry, SESSION_IDLE_MS, REAPER_INTERVAL_MS } from './sessions';
 
 const text = (obj: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(obj) }] });
@@ -186,9 +187,11 @@ const ROUTE_IMPORTS_PTR = ` Module-level imports are auto-routed to the notebook
 /**
  * The image contract, carried by every tool that ships figures (add_and_run,
  * run_cell, get_full_output). Stated once so the bound cannot drift from what
- * `image.ts` actually enforces.
+ * `image.ts` actually enforces - and every number in it is INTERPOLATED from that
+ * module's own constants, so prose and policy cannot disagree: written as literals
+ * here, changing a constant would silently leave the agent a wrong description.
  */
-const IMAGE_DOC = ` FIGURES COME BACK AS IMAGES YOU CAN SEE: an image output (a matplotlib/plotly figure) is returned as a real image content block, not a text placeholder - so LOOK at the chart you just drew (check the labels, the ticks, whether the data is what you meant) instead of saving it to a file to read it back. Bounded so it stays cheap: an oversized raster is downscaled to ~768px on the longest edge, at most 4 images ride in an automatic RUN result while an explicit get_full_output(id) ships up to 20, and a format that is not inlined (image/svg+xml, image/webp) keeps its text placeholder. Nothing is lost to a bound: whatever did not fit is listed in images_omitted with the exact call that resumes there - get_full_output(id, images_from: N) returns the images from output N on, so a cell with dozens of figures is paged through, never truncated. A consecutive run declined by the SAME bound is ONE images_omitted entry carrying count (how many) and the output_index to resume at, not one entry per figure; a per-figure reason (unsupported_mime, too_large) always names its own output. Every output still appears in \`outputs\` with its [image/png, WxH, KB] placeholder, so you can see where each figure sat; \`images\` names each one's output_index. get_full_output(id, size:"full") returns the ORIGINAL full-resolution bytes when you need pixel detail.`;
+const IMAGE_DOC = ` FIGURES COME BACK AS IMAGES YOU CAN SEE: an image output (a matplotlib/plotly figure) is returned as a real image content block, not a text placeholder - so LOOK at the chart you just drew (check the labels, the ticks, whether the data is what you meant) instead of saving it to a file to read it back. Bounded so it stays cheap: an oversized raster is downscaled to ~${IMG_MAX_EDGE}px on the longest edge, at most ${MAX_IMAGE_BLOCKS} images ride in an automatic RUN result while an explicit get_full_output(id) ships up to ${MAX_FULL_OUTPUT_IMAGE_BLOCKS}, and a format that is not inlined (image/svg+xml, image/webp) keeps its text placeholder. Nothing is lost to a bound: whatever did not fit is listed in images_omitted with the exact call that resumes there - get_full_output(id, images_from: N) returns the images from output N on, so a cell with dozens of figures is paged through, never truncated. A consecutive run declined by the SAME bound is ONE images_omitted entry carrying count (how many) and the output_index to resume at, not one entry per figure; a per-figure reason (unsupported_mime, too_large) always names its own output. Every output still appears in \`outputs\` with its [image/png, WxH, KB] placeholder, so you can see where each figure sat; \`images\` names each one's output_index. get_full_output(id, size:"full") returns the ORIGINAL full-resolution bytes when you need pixel detail.`;
 
 /**
  * House-style doctrine handed to the agent once at connect (MCP server
