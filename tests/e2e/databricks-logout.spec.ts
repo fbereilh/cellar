@@ -334,7 +334,14 @@ test('an INCOMPLETE sign-out warns instead of confirming - the cached token may 
 	await expect(warning).toContainText(/remove the cached sign-in yourself/i);
 	await expect(page.getByTestId('databricks-logout-note')).toHaveCount(0);
 
+	// The warning is the whole point of this case, so scroll it fully into view
+	// before the shot - a screenshot that clips its remedy proves nothing a reviewer
+	// can read. The panel-only crop is what makes the copy legible at all.
+	await warning.scrollIntoViewIfNeeded();
 	await page.screenshot({ path: join(EVIDENCE_DIR, 'databricks-logout-incomplete.png') });
+	await page
+		.getByTestId('databricks-body')
+		.screenshot({ path: join(EVIDENCE_DIR, 'databricks-logout-incomplete-panel.png') });
 });
 
 test('an incomplete sign-out whose only failure is a mid-connect notebook does NOT tell the user to delete a file', async ({ page }) => {
