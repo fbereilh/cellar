@@ -553,8 +553,15 @@ describe('save transport limit', () => {
 		);
 		expect(src).toContain('EditorState.readOnly.of(true)');
 		expect(src).toContain('data-testid="file-view-only"');
-		// Save is not merely disabled - it is absent, and the handler refuses too.
-		expect(src).toMatch(/if \(saving \|\| !view \|\| saveTooLarge\) return;/);
+		// A read-only editor sets `contenteditable="false"` and NO tabindex, so
+		// `.cm-content` - where CodeMirror attaches its key handlers - could not take
+		// focus: no keyboard selection, no editor search panel, and `Mod-s` never
+		// fired, so Cmd/Ctrl+S reached Chrome's own "Save page as…" dialog. The
+		// explicit tabindex is one line wide and would regress invisibly.
+		expect(src).toContain("EditorView.contentAttributes.of({ tabindex: '0' })");
+		// Save is not merely disabled - it is absent, and the handler refuses to
+		// persist while still HANDLING the keystroke, surfacing the reason.
+		expect(src).toMatch(/if \(saveTooLarge\) \{\s*\n\s*flashViewOnly\(\);\s*\n\s*return;/);
 		// The rendered preview never depends on it.
 		expect(src).not.toMatch(/showPreview[^\n]*saveTooLarge/);
 	});

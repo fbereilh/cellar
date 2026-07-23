@@ -207,13 +207,24 @@ test('an HTML file past the save-transport limit previews but opens read-only', 
 	const editor = page.locator('.cm-content:visible');
 	await expect(editor).toBeVisible();
 	await expect(editor).toHaveAttribute('contenteditable', 'false');
+	// …but it still takes keyboard focus. `contenteditable="false"` alone is not
+	// focusable, and CodeMirror's key handlers live on this element - so without
+	// the explicit tabindex the document is unselectable, unsearchable, and
+	// Cmd/Ctrl+S falls through to the browser's own save dialog.
+	await expect(editor).toHaveAttribute('tabindex', '0');
 
 	// Typing changes nothing on screen and leaves the file alone.
 	const before = readFileSync(join(workspace, 'big.html'), 'utf8');
 	await editor.click();
+	await expect(editor).toBeFocused();
 	await page.keyboard.type('MUST-NOT-APPEAR');
 	await expect(editor).not.toContainText('MUST-NOT-APPEAR');
+	// Cmd/Ctrl+S is HANDLED (so no browser dialog) but says why nothing was saved,
+	// by pulsing the chip that already carries the reason.
+	const chip = page.locator('[data-testid="file-view-only"]:visible');
+	await expect(chip).toHaveAttribute('data-flash', 'false');
 	await page.keyboard.press('ControlOrMeta+s');
+	await expect(chip).toHaveAttribute('data-flash', 'true');
 	await expect(page.locator('[data-testid="file-save-error"]:visible')).toHaveCount(0);
 	expect(readFileSync(join(workspace, 'big.html'), 'utf8')).toBe(before);
 

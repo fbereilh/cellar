@@ -66,6 +66,18 @@
 	// ONCE, from the loaded content: a read-only document cannot grow past the
 	// line it was measured against, so nothing needs re-measuring per keystroke.
 	let saveTooLarge = $state(false);
+	// `Mod-s` in a view-only tab is still HANDLED (so the browser's own "Save
+	// page as…" dialog stays suppressed), but there is nothing to persist — and a
+	// keystroke that appears to do nothing reads as a bug. So it pulses the chip
+	// that already says why, rather than adding a second copy of the same text.
+	let viewOnlyFlash = $state(false);
+	let viewOnlyTimer: ReturnType<typeof setTimeout> | undefined;
+
+	function flashViewOnly() {
+		viewOnlyFlash = true;
+		clearTimeout(viewOnlyTimer);
+		viewOnlyTimer = setTimeout(() => (viewOnlyFlash = false), 2500);
+	}
 
 	// ---- Rendered preview (markdown + html) -----------------------------------
 	// Two file kinds can toggle between the raw source editor and a rendered view:
@@ -159,7 +171,11 @@
 	}
 
 	async function save() {
-		if (saving || !view || saveTooLarge) return;
+		if (saving || !view) return;
+		if (saveTooLarge) {
+			flashViewOnly();
+			return;
+		}
 		saving = true;
 		saveError = '';
 		try {
@@ -280,7 +296,10 @@
 
 	// An `async` onMount returns a promise, so its return value is never used as a
 	// cleanup — the editor is torn down here instead.
-	onDestroy(() => view?.destroy());
+	onDestroy(() => {
+		clearTimeout(viewOnlyTimer);
+		view?.destroy();
+	});
 
 	onMount(async () => {
 		let content = '';
@@ -309,11 +328,25 @@
 					// against the code (VS Code's placement).
 					gitGutterExtension(),
 					EDITOR_THEME,
-					// View-only: the document is still selectable, searchable and
-					// scrollable (and its preview is untouched) - only editing goes.
-					// `Mod-s` still returns true so the browser's own save dialog stays
-					// suppressed on a document Cellar simply cannot persist.
-					...(saveTooLarge ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
+					// View-only: only editing goes. The explicit `tabindex` is what keeps
+					// the rest true - `editable.of(false)` sets `contenteditable="false"`
+					// and adds NO tabindex, so `.cm-content` (where CodeMirror attaches
+					// its key handlers) could not take focus at all: a click landed on
+					// `.cm-scroller` and every keystroke died there. Without it the
+					// document is not selectable by keyboard, the editor's own search
+					// panel never opens, and the `Mod-s` keymap below cannot fire - so
+					// Cmd/Ctrl+S fell through to Chrome's "Save page as…" dialog (the
+					// shell's capture handler deliberately does not preventDefault for a
+					// non-notebook tab). With it, the document is focusable, selectable
+					// and searchable, still not editable, and `Mod-s` is handled: it
+					// suppresses the browser dialog and pulses the view-only chip.
+					...(saveTooLarge
+						? [
+								EditorState.readOnly.of(true),
+								EditorView.editable.of(false),
+								EditorView.contentAttributes.of({ tabindex: '0' })
+							]
+						: []),
 					Prec.highest(keymap.of([{ key: 'Mod-s', run: () => (save(), true) }])),
 					EditorView.updateListener.of((v: ViewUpdate) => {
 						if (v.docChanged) {
@@ -363,8 +396,9 @@
 			{#if saveTooLarge}
 				<!-- Save is absent, not merely disabled: there is no edit to persist. -->
 				<span
-					class="text-base-content/55"
+					class="transition-colors {viewOnlyFlash ? 'text-warning' : 'text-base-content/55'}"
 					title="This file is larger than a save request may carry, so it opens read-only. The rendered preview is unaffected."
+					data-flash={viewOnlyFlash ? 'true' : 'false'}
 					data-testid="file-view-only">view-only · too large to save</span
 				>
 			{:else}
