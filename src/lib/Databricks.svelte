@@ -78,6 +78,14 @@
 		disconnected: number;
 		clearedTokens: number;
 		externalSkipped: number;
+		/**
+		 * The sign-out did not provably complete (a purge that could not run, a
+		 * cache key that matched nothing, a notebook mid-connect). An incomplete
+		 * sign-out must never be shown as a clean one, so this gets its own
+		 * warning-toned message instead of the ordinary confirmation.
+		 */
+		incomplete?: boolean;
+		incompleteReason?: string | null;
 	}
 	interface DbxCluster {
 		cluster_id: string;
@@ -500,7 +508,14 @@
 		}
 	}
 
-	/** A new selection: forget the old sign-in + cluster list. */
+	/**
+	 * A new selection: forget the old sign-in + cluster list, and the log-out
+	 * feedback with it. The note deliberately OUTLIVES the connected→picker card
+	 * swap a log out causes (it is rendered ungated by `cellarSignedIn`), but it
+	 * describes ONE selection - once the user picks another profile or types
+	 * another host it would be claiming something about a selection it no longer
+	 * describes. `logoutDatabricks` calls this BEFORE it writes its own note.
+	 */
 	function resetSelection() {
 		authed = false;
 		oauthRequired = false;
@@ -508,6 +523,9 @@
 		clusters = null;
 		clustersError = null;
 		clustersFor = null;
+		logoutNote = '';
+		logoutWarning = '';
+		logoutError = null;
 	}
 
 	function pickProfile(name: string) {
@@ -558,6 +576,9 @@
 	// AUTH, not the session, so its outcome must not be mistaken for a connect error.
 	let logoutError = $state<DbxError | null>(null);
 	let logoutNote = $state('');
+	// An INCOMPLETE sign-out is not a quieter success: the cached token may still be
+	// on disk, so it gets its own warning-toned line rather than the confirmation.
+	let logoutWarning = $state('');
 
 	async function connect(cluster: DbxCluster) {
 		if (busy) return;
@@ -621,16 +642,25 @@
 	 * authenticated; this ALSO drops Cellar's own cached sign-in, so the next
 	 * connect has to authenticate again.
 	 *
+	 * It signs out EVERYWHERE: every sign-in this server recorded and every bound
+	 * notebook, not just the current selection - otherwise another notebook's
+	 * reconnect intent would silently rebuild `spark` after the user was told they
+	 * signed out. The copy says so rather than leaving the blast radius implicit.
+	 *
 	 * The server decides what is Cellar's to clear: only the token Cellar's own
 	 * browser sign-in minted. A PAT in `~/.databrickscfg`, an OS keyring entry, the
 	 * databricks CLI's own token cache - those are the user's, and the note below
-	 * says so rather than implying a purge that never happened.
+	 * says so rather than implying a purge that never happened. And a sign-out that
+	 * did NOT provably complete reports as incomplete, never as a clean one: the
+	 * cached token may have survived, in which case the next sign-in is a silent
+	 * cache hit and the user needs to know.
 	 */
 	async function logoutDatabricks() {
 		if (busy) return;
 		busy = 'logout';
 		logoutError = null;
 		logoutNote = '';
+		logoutWarning = '';
 		connectError = null;
 		reconnectError = null;
 		reconnectNote = '';
@@ -650,11 +680,15 @@
 			resetBrowser();
 			await loadStatus();
 			onSessionChange?.();
-			logoutNote = out.clearedTokens
-				? "Signed out. Cellar's saved Databricks sign-in was cleared - the next connect signs in again."
-				: out.externalSkipped
-					? "Signed out of Cellar. This profile's credentials live in ~/.databrickscfg or the databricks CLI, so they were left untouched."
-					: 'Signed out.';
+			if (out.incomplete) {
+				logoutWarning = `Sign-out may be incomplete: ${out.incompleteReason ?? 'part of it could not be verified'}. Your saved sign-in may still be usable - check and try again.`;
+			} else {
+				logoutNote = out.clearedTokens
+					? "Signed out everywhere. Cellar's saved Databricks sign-ins were cleared and every notebook was disconnected - the next connect signs in again."
+					: out.externalSkipped
+						? "Signed out of Cellar everywhere, and every notebook was disconnected. This profile's credentials live in ~/.databrickscfg or the databricks CLI, so they were left untouched."
+						: 'Signed out everywhere - every saved sign-in was cleared and every notebook disconnected.';
+			}
 		} catch (err) {
 			logoutError = toDbxError(err);
 		} finally {
@@ -915,7 +949,8 @@
 <!-- Sign out of Databricks. Deliberately QUIETER than Disconnect: Disconnect is the
      everyday outlined action that ends the session, this is the rarer one that also
      drops the saved sign-in. Shown whenever there is a sign-in to clear, and always
-     while connected (where it ends the session too). -->
+     while connected (where it ends the session too). The title names the blast
+     radius - this signs out EVERYWHERE, not just for the current selection. -->
 {#snippet logoutRow(always: boolean)}
 	{#if always || cellarSignedIn}
 		<div class="mt-1.5 flex justify-end">
@@ -923,7 +958,7 @@
 				class="btn btn-ghost btn-xs h-5 min-h-0 px-1 text-[11px] font-normal text-base-content/50 hover:text-error"
 				onclick={logoutDatabricks}
 				disabled={!!busy || runtimeApplying}
-				title="Sign out of Databricks - clears the saved sign-in; you'll need to sign in again"
+				title="Sign out of Databricks everywhere - clears the saved sign-ins and disconnects every notebook; you'll need to sign in again"
 				data-testid="databricks-logout"
 			>
 				{#if busy === 'logout'}<span class="loading loading-spinner loading-xs"></span>Signing out…{:else}Log out{/if}
@@ -937,6 +972,17 @@
 		<!-- One notch stronger than the surrounding hint copy (/50): this is feedback
 		     on an action just taken, and it lands in a card full of static hints. -->
 		<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/70" data-testid="databricks-logout-note">{logoutNote}</p>
+	{/if}
+	{#if logoutWarning}
+		<!-- A sign-out that did not provably finish. Warning-toned, NEVER the ordinary
+		     confirmation: the cached token may still be on disk, which would make the
+		     next sign-in a silent cache hit for a user who believes they signed out. -->
+		<p
+			class="mt-1.5 rounded border border-warning/40 bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-base-content/80"
+			data-testid="databricks-logout-warning"
+		>
+			{logoutWarning}
+		</p>
 	{/if}
 	{#if logoutError}{@render errorBox(logoutError, 'databricks-logout-error')}{/if}
 {/snippet}
