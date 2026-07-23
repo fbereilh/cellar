@@ -223,6 +223,23 @@ describe('an imports-cell edit stales only the affected dependents', () => {
 		expect(state(m, joins)).toBe(STALE_STATE.FRESH);
 	});
 
+	it('a transient PARSEABLE mid-edit name leaves no phantom removal behind', async () => {
+		// The third debounced-save shape, and the one that used to accumulate: retyping
+		// `import numpy as np` persists a valid `import numpy as n` on the way through.
+		// That mints `n`, and a keystroke later records it as REMOVED - forever. The map
+		// grew for the life of the session, and any cell reading a name spelled `n` was
+		// staled by a removal that never happened.
+		const { imports, usesPd } = notebook();
+		const usesN = ran(usesPd, 'w = n + 1'); // `n` comes from outside the notebook
+		nb.setSource(imports, 'import pandas as pd\nimport numpy as n', abs);
+		nb.setSource(imports, 'import pandas as pd\nimport numpy as np', abs);
+
+		const cell = nb.listCells(abs).find((c) => c.id === imports)!;
+		expect(Object.keys(cell.metadata.cellar!.importBindings ?? {}).sort()).toEqual(['np', 'pd']);
+		const m = await staleness();
+		expect(state(m, usesN)).toBe(STALE_STATE.FRESH);
+	});
+
 	it('but DELETING every import really does stale its readers (never a false fresh)', async () => {
 		// The half the undoable removal must not trade away: with the imports gone the
 		// readers have no definer at all, so only the removal record can flag them.

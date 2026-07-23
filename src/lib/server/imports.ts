@@ -307,14 +307,22 @@ function recordsOf(statements: string[]): ImportRecord[] {
  * has only its import parts lifted; the rest is rewritten in place. Because that
  * rewrite drops the line's original comments, it only happens on a line we fully
  * understand.
+ *
+ * `lines` lets a caller that has ALREADY tokenized `source` (`importBindings.ts`,
+ * which also needs the magic scan) hand that pass in instead of paying for a second
+ * one. It must be `logicalLines(source)` for this exact source - anything else and
+ * the offsets used to rebuild the residual are meaningless.
  */
-export function extractTopLevelImports(source: string | null | undefined): ExtractResult {
+export function extractTopLevelImports(
+	source: string | null | undefined,
+	lines?: readonly LogicalLine[]
+): ExtractResult {
 	const src = source ?? '';
 	const statements: string[] = [];
 	const seen = new Set<string>();
 	const edits: { start: number; end: number; text: string }[] = [];
 
-	for (const line of logicalLines(src)) {
+	for (const line of lines ?? logicalLines(src)) {
 		if (line.indent !== 0) continue;
 		const code = stripComments(line.raw).replace(/\s+/g, ' ').trim();
 		if (!/^(import|from)\s/.test(code)) continue;
@@ -406,9 +414,18 @@ export function isImportsOnly(source: string | null | undefined): boolean {
  * Exported so a caller that already ran the tokenizer (`importBindings.ts`, which
  * needs both the verdict and the statements) reuses that one pass instead of
  * paying for a second. It is the same exact test, never a regex approximation.
+ *
+ * `ignorable` lets that caller discount lines that are not Python at all - an inert
+ * line magic, which `importBindings.ts` treats like a comment (see `magics.ts`) -
+ * without first rewriting the residual and re-tokenizing the rewrite.
  */
-export function isImportsOnlyResidual(rest: string): boolean {
-	return logicalLines(rest).every((l) => stripComments(l.raw).trim() === '');
+export function isImportsOnlyResidual(
+	rest: string,
+	ignorable?: (line: LogicalLine) => boolean
+): boolean {
+	return logicalLines(rest).every(
+		(l) => ignorable?.(l) === true || stripComments(l.raw).trim() === ''
+	);
 }
 
 /**

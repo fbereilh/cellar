@@ -19,6 +19,7 @@ import {
 	importBindingSpecs,
 	importBindingNames,
 	foldImportChange,
+	pruneImportBindings,
 	type ImportChangeStamps
 } from '../../src/lib/server/importBindings';
 
@@ -130,8 +131,16 @@ describe('importBindingSpecs - which names a source provides', () => {
 		expect(importBindingSpecs('%load_ext autoreload\n%autoreload 2\nimport pandas as pd')).toBeNull();
 		expect(importBindingSpecs('%reload_ext autoreload\nimport os')).toBeNull();
 		expect(importBindingSpecs('%autoreload 0\nimport os')).toBeNull();
-		// A different extension is an ordinary magic and stays analyzable.
-		expect(specs('%load_ext sql\nimport os')).toEqual({ os: 'import os' });
+	});
+
+	it('is UNKNOWABLE for ANY %load_ext - an extension may push names of its own', () => {
+		// `%load_ext x` runs x's `load_ipython_extension(ip)`, which is free to call
+		// `ip.push({...})`, so it is the one entry on the allowlist that would have been
+		// arbitrary code. The allowlist's bar is proof, not "the ones I know are quiet".
+		expect(importBindingSpecs('%load_ext sql\nimport os')).toBeNull();
+		expect(importBindingSpecs('%reload_ext line_profiler\nimport os')).toBeNull();
+		// The ubiquitous header that DOES stay analyzable, so the refinement is not lost.
+		expect(specs('%matplotlib inline\nimport os')).toEqual({ os: 'import os' });
 	});
 });
 
@@ -169,7 +178,7 @@ describe('foldImportChange - when each binding last changed', () => {
 		// it leaves that reader with no definer at all, i.e. a false `fresh`. The spec
 		// survives the removal so a later restore can be recognized as one.
 		const out = foldImportChange('import numpy as np\nimport pandas as pd', 'import pandas as pd', {}, NOW);
-		expect(out.np).toEqual({ spec: 'import numpy as np', at: 0, removedAt: NOW });
+		expect(out.np).toEqual({ spec: 'import numpy as np', at: 0, sinceAt: 0, removedAt: NOW });
 		expect(removals(out)).toEqual({ np: NOW });
 	});
 
@@ -253,6 +262,79 @@ describe('foldImportChange - when each binding last changed', () => {
 			pd: 0
 		});
 	});
+
+	it('records WHEN a name first appeared, separately from when it was rebound', () => {
+		// `at` moves on every rebinding; `sinceAt` must not, or a long-standing binding
+		// that was rebound once would look newborn to the prune below.
+		const born = foldImportChange('', 'import numpy as np', undefined, 100);
+		expect(born.np).toEqual({ spec: 'import numpy as np', at: 100, sinceAt: 0 });
+		const rebound = foldImportChange('import numpy as np', 'import numpy.random as np', born, NOW);
+		expect(rebound.np).toEqual({ spec: 'import numpy.random as np', at: NOW, sinceAt: 0 });
+	});
+
+	it('a name that appears only BETWEEN two folds is born now, not "here all along"', () => {
+		const settled = foldImportChange('', 'import numpy as np', { np: { spec: 'import numpy as np', at: 0, sinceAt: 0 } }, 100);
+		const added = foldImportChange('import numpy as np', 'import numpy as np\nimport re', settled, NOW);
+		expect(added.re).toEqual({ spec: 'import re', at: NOW, sinceAt: NOW });
+	});
+});
+
+describe('pruneImportBindings - which removal records are worth remembering', () => {
+	const RAN_AT = 1000;
+
+	it('DROPS a name born and removed between two runs (a debounced mid-edit phantom)', () => {
+		// Retyping `import numpy as np` persists `import numpy as n` on the way through,
+		// so `n` is minted and removed a keystroke later. Nothing ran while it existed,
+		// so no downstream cell can have read it - and left in the map it would grow the
+		// map forever AND make the removal ledger report a removal that never happened
+		// for any cell that uses a name spelled `n`.
+		const born = foldImportChange('import numpy as np', 'import numpy as n', {}, RAN_AT + 10);
+		const gone = foldImportChange('import numpy as n', 'import numpy as np', born, RAN_AT + 20);
+		expect(gone.n?.removedAt).toBe(RAN_AT + 20); // the fold still records it…
+		expect(pruneImportBindings(gone, RAN_AT)).toEqual({
+			np: { spec: 'import numpy as np', at: 0, sinceAt: 0 }
+		}); // …and the prune is what forgets it
+	});
+
+	it('KEEPS the removal of a name that WAS bound when the cell last ran', () => {
+		// The half that must never be traded away: a genuinely deleted import has to keep
+		// staling its readers, and they have no definer left to reach it by any other
+		// route. Pruning "every name the current source lacks" would delete exactly this.
+		const gone = foldImportChange('import numpy as np\nimport os', 'import os', {}, RAN_AT + 10);
+		expect(pruneImportBindings(gone, RAN_AT).np).toEqual({
+			spec: 'import numpy as np',
+			at: 0,
+			sinceAt: 0,
+			removedAt: RAN_AT + 10
+		});
+	});
+
+	it('KEEPS a removal even when the name was REBOUND after that run', () => {
+		// `at` is past the run but `sinceAt` is not: the name WAS bound when the cell ran
+		// (under its old spec), so its readers consumed it and its removal still counts.
+		const rebound = foldImportChange('import numpy as np', 'import numpy.random as np', {}, RAN_AT + 10);
+		const gone = foldImportChange('import numpy.random as np', '', rebound, RAN_AT + 20);
+		expect(pruneImportBindings(gone, RAN_AT).np?.removedAt).toBe(RAN_AT + 20);
+	});
+
+	it('never touches a name the cell still provides', () => {
+		const out = foldImportChange('', 'import os\nimport re', undefined, RAN_AT + 10);
+		expect(pruneImportBindings(out, null)).toEqual(out); // nothing removed ⇒ nothing to prune
+	});
+
+	it('drops the removals of a cell that has never run - it bound nothing to consume', () => {
+		const gone = foldImportChange('import numpy as np', '', {}, RAN_AT);
+		expect(pruneImportBindings(gone, null)).toEqual({});
+	});
+
+	it('keeps a legacy entry that predates sinceAt rather than guessing', () => {
+		const legacy: ImportChangeStamps = { np: { spec: 'import numpy as np', at: 0, removedAt: 900 } };
+		expect(pruneImportBindings(legacy, RAN_AT)).toEqual(legacy);
+	});
+});
+
+describe('foldImportChange - housekeeping', () => {
+	const NOW = 5000;
 
 	it('keeps an ordinary code cell out of the map entirely', () => {
 		// Never imports-only ⇒ nothing knowable, nothing stored: the map stays empty so

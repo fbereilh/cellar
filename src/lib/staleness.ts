@@ -80,9 +80,10 @@
  *    (`%matplotlib inline`, `%pip install …`, `%config …`) are discounted, so a
  *    magic-headed imports cell still gets the refinement - but that is an
  *    ALLOWLIST: a magic that injects into the namespace (`%run` executes a script
- *    THERE, `%store -r`, `%load`, `%pylab`) or any magic not on the list makes its
- *    cell unanalyzable, so it keeps the conservative rule rather than risk
- *    certifying a name that script rebound.
+ *    THERE, `%store -r`, `%load`, `%pylab`, and `%load_ext`, which runs an
+ *    extension's own `load_ipython_extension` and may push names) or any magic not
+ *    on the list makes its cell unanalyzable, so it keeps the conservative rule
+ *    rather than risk certifying a name that script rebound.
  *  - REMOVAL is only covered while the cell that provided the name survives. The
  *    ledger below reads `importBindings` off that cell, so DELETING the imports
  *    cell outright takes its stamps with it: its readers then have no definer, no
@@ -92,7 +93,10 @@
  *    in general. Same family: an edit that drops a binding AND leaves the cell
  *    unanalyzable in one step records no change for the dropped name (see
  *    `foldImportChange`), so its readers - which have no definer either - stay
- *    `fresh` too.
+ *    `fresh` too. The ledger is also scoped to names that were bound when the
+ *    providing cell LAST RAN (`pruneImportBindings`): one that appeared and went
+ *    between two runs never entered the namespace, so nothing downstream can have
+ *    read it and its record is forgotten rather than kept forever.
  *  - Redefinition resolves to that nearest preceding definer, which is correct
  *    for the common top-to-bottom notebook and approximate for out-of-order runs.
  */

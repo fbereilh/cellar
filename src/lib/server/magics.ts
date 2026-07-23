@@ -27,7 +27,7 @@
  * Pure and browser-safe-ish (it only imports the pure `logicalLines` tokenizer),
  * so it is unit-testable without a kernel, a subprocess, or a document.
  */
-import { logicalLines } from './imports';
+import { logicalLines, type LogicalLine } from './imports';
 
 /**
  * Cell magics whose BODY is Python and therefore contributes defines/uses. Every
@@ -54,6 +54,20 @@ export function cellMagicName(source: string | null | undefined): string | null 
 /** True for any `%%name` cell magic (whether or not its body is Python). */
 export function isCellMagicCell(source: string | null | undefined): boolean {
 	return cellMagicName(source) !== null;
+}
+
+/**
+ * Is this logical line ENTIRELY a magic / shell escape (`%foo …`, `!cmd`) rather
+ * than Python? The single definition of that shape, shared by `blankLineMagics`
+ * (which blanks such a line) and by `importBindings.ts`'s imports-only residual
+ * test (which discounts one, like a comment) so the two cannot drift.
+ *
+ * The ASSIGNMENT form (`files = !ls`) is deliberately not one: it binds a name, so
+ * it is ordinary code to both callers.
+ */
+export function isBareMagicLine(raw: string): boolean {
+	const first = raw.trimStart()[0];
+	return first === '%' || first === '!';
 }
 
 /**
@@ -84,8 +98,7 @@ export function isCellMagicCell(source: string | null | undefined): boolean {
 export function blankLineMagics(src: string): string {
 	const edits: { start: number; end: number; text: string }[] = [];
 	for (const line of logicalLines(src)) {
-		const first = line.raw.trimStart()[0];
-		if (first === '%' || first === '!') {
+		if (isBareMagicLine(line.raw)) {
 			edits.push({ start: line.start, end: line.end, text: '\n' });
 			continue;
 		}
@@ -123,18 +136,21 @@ const EXT_LOADERS = new Set(['load_ext', 'reload_ext']);
  * of numpy/matplotlib names), `%timeit -o` in its assignment form (already handled -
  * that keeps its left-hand side and reads as ordinary code).
  *
+ * `%load_ext` / `%reload_ext` are OUT for the same reason, and that is worth naming
+ * because they look inert: they run an arbitrary module's `load_ipython_extension(ip)`,
+ * which is free to `ip.push({...})`, so nothing about them is PROVEN and they cannot
+ * meet this bar. The practical cost is small - `%load_ext autoreload`, the common
+ * case, already disqualifies notebook-wide (see `hasAutoreloadMagic`), and the other
+ * ubiquitous header, `%matplotlib inline`, keeps the refinement.
+ *
+ * `%env` is out too, though it binds nothing in `user_ns`: its bare form RETURNS the
+ * environment dict, so IPython's displayhook binds `_`. Nothing imports a name like
+ * that, but the bar here is proof, not likelihood.
+ *
  * `autoreload` is listed because the flag line itself binds nothing; the reason it
  * still disqualifies is separate and notebook-wide (see `hasAutoreloadMagic`).
  */
-const INERT_LINE_MAGICS = new Set([
-	'matplotlib',
-	'load_ext',
-	'reload_ext',
-	'config',
-	'pip',
-	'conda',
-	'autoreload'
-]);
+const INERT_LINE_MAGICS = new Set(['matplotlib', 'config', 'pip', 'conda', 'autoreload']);
 
 /**
  * Does this source contain a module-level line magic that is NOT on the inert
@@ -142,17 +158,57 @@ const INERT_LINE_MAGICS = new Set([
  *
  * Only `importBindings.ts` cares, and only to REFUSE. Shell escapes (`!cmd`) run a
  * subprocess and bind nothing, so they are not considered here; the assignment form
- * (`files = !ls`) is not a magic line at all after `blankLineMagics` and disqualifies
- * through the ordinary imports-only residual test.
+ * (`files = !ls`) is not a bare magic line at all (see `isBareMagicLine`) and
+ * disqualifies through the ordinary imports-only residual test.
  */
 export function hasNonInertLineMagic(source: string | null | undefined): boolean {
-	for (const line of logicalLines(source ?? '')) {
+	return scanMagics(logicalLines(source ?? '')).nonInert;
+}
+
+/** What one walk over a cell's logical lines says about its magics. */
+export interface MagicScan {
+	/** The cell opens with a `%%name` cell magic, so its body is not module-level Python. */
+	cellMagic: boolean;
+	/** Some line arms `autoreload` (see `hasAutoreloadMagic`). */
+	autoreload: boolean;
+	/** Some line magic is NOT on the inert allowlist, i.e. may inject a name. */
+	nonInert: boolean;
+}
+
+/**
+ * Every magic question `importBindings.ts` asks, answered in ONE pass over lines the
+ * caller has already tokenized.
+ *
+ * It exists because that caller used to ask them separately (`isCellMagicCell`,
+ * `hasAutoreloadMagic`, `hasNonInertLineMagic`), paying a full tokenizer walk each,
+ * on every 500ms autosave of every cell. The rules themselves are unchanged and stay
+ * here, so there is still one vocabulary of what a magic is.
+ *
+ * `cellMagic` mirrors `cellMagicName` on the first non-blank line; the two must keep
+ * agreeing (that function stays the entry point for callers that need the NAME).
+ */
+export function scanMagics(lines: readonly LogicalLine[]): MagicScan {
+	const scan: MagicScan = { cellMagic: false, autoreload: false, nonInert: false };
+	let leading = true;
+	for (const line of lines) {
 		const text = line.raw.trimStart();
+		if (text.trim() === '') continue; // blank lines settle nothing
+		if (leading) {
+			leading = false;
+			if (/^%%\w/.test(text)) scan.cellMagic = true;
+		}
 		if (text[0] !== '%') continue;
-		const m = /^%{1,2}(\w+)/.exec(text);
-		if (!m || !INERT_LINE_MAGICS.has(m[1])) return true; // unknown ⇒ conservative
+		const m = /^%{1,2}(\w+)([^\n]*)/.exec(text);
+		if (!m) {
+			scan.nonInert = true; // `%` followed by something we cannot name ⇒ conservative
+			continue;
+		}
+		if (m[1] === 'autoreload' || (EXT_LOADERS.has(m[1]) && /\bautoreload\b/.test(m[2]))) {
+			scan.autoreload = true;
+		}
+		if (!INERT_LINE_MAGICS.has(m[1])) scan.nonInert = true; // unknown ⇒ conservative
 	}
-	return false;
+	return scan;
 }
 
 /**
@@ -177,13 +233,7 @@ export function hasNonInertLineMagic(source: string | null | undefined): boolean
  * `importBindings.ts` keeps its own per-cell check as the local half.
  */
 export function hasAutoreloadMagic(source: string | null | undefined): boolean {
-	for (const line of logicalLines(source ?? '')) {
-		const m = /^%{1,2}(\w+)([^\n]*)/.exec(line.raw.trimStart());
-		if (!m) continue;
-		if (m[1] === 'autoreload') return true;
-		if (EXT_LOADERS.has(m[1]) && /\bautoreload\b/.test(m[2])) return true;
-	}
-	return false;
+	return scanMagics(logicalLines(source ?? '')).autoreload;
 }
 
 /**

@@ -45,28 +45,31 @@
  * install …`, `%config …` above the import block is one of the most common notebook
  * headers there is, and those bind no Python name - so treating one as "other code"
  * would degrade the map to null and leave exactly the reported bug unfixed for most
- * real notebooks. The vocabulary comes from `magics.ts` (`blankLineMagics`, already
- * the probe's), never a second regex here, and the assignment form (`files = !ls`)
- * survives that pass as `files = None`, so it still reads as ordinary code and still
- * disqualifies.
+ * real notebooks. The vocabulary comes from `magics.ts` (`isBareMagicLine`, the same
+ * shape `blankLineMagics` blanks for the probe), never a second regex here, and the
+ * assignment form (`files = !ls`) is not one, so it still reads as ordinary code and
+ * still disqualifies.
  *
  * INERT is the operative word, and it is an ALLOWLIST (`magics.ts`'s
  * `INERT_LINE_MAGICS`): a magic that injects into the namespace - `%run script.py`
  * executes it THERE, `%store -r name` / `%load` inject names, `%pylab` is a star
- * import - could rebind an imported name exactly like the `os = shim` case above,
- * so it disqualifies, as does any magic not on the list. Two further exceptions: a
- * `%%cell magic` cell is not a Python imports cell at all, and `%autoreload` breaks
- * the idempotence premise above (see `hasAutoreloadMagic` - the check here is only
- * the local half, since arming autoreload is kernel-global and `dataflow.ts` gates
- * the whole notebook on it).
+ * import, `%load_ext` runs an extension's own `load_ipython_extension(ip)`, which may
+ * `push` names - could rebind an imported name exactly like the `os = shim` case
+ * above, so it disqualifies, as does any magic not on the list. Two further
+ * exceptions: a `%%cell magic` cell is not a Python imports cell at all, and
+ * `%autoreload` breaks the idempotence premise above (see `hasAutoreloadMagic` - the
+ * check here is only the local half, since arming autoreload is kernel-global and
+ * `dataflow.ts` gates the whole notebook on it).
  */
-import { extractTopLevelImports, isImportsOnlyResidual, parseImportStatement, type ImportRecord } from './imports';
 import {
-	blankLineMagics,
-	hasAutoreloadMagic,
-	hasNonInertLineMagic,
-	isCellMagicCell
-} from './magics';
+	extractTopLevelImports,
+	isImportsOnlyResidual,
+	logicalLines,
+	parseImportStatement,
+	type ImportRecord,
+	type LogicalLine
+} from './imports';
+import { isBareMagicLine, scanMagics } from './magics';
 
 /** name → the canonical rendering of the import record that binds it. */
 export type ImportSpecs = Map<string, string>;
@@ -93,6 +96,13 @@ export interface ImportBinding {
 	 * this cell's current source".
 	 */
 	removedAt?: number;
+	/**
+	 * Wall-clock ms the name first APPEARED in this cell, as opposed to `at`, which
+	 * moves on every rebinding. 0 (or absent) means it may have been here all along.
+	 * Only `pruneImportBindings` reads it, to tell a binding that was live at the
+	 * cell's last run from one that was born and died between two runs.
+	 */
+	sinceAt?: number;
 }
 
 /**
@@ -100,9 +110,18 @@ export interface ImportBinding {
  *
  * It is a BASELINE, not just a change log: it records every name the cell was last
  * PROVEN to bind, so a fold is always knowable-vs-knowable even when the cell's
- * current source is not (see `foldImportChange`).
+ * current source is not (see `foldImportChange`). Names it holds beyond the ones the
+ * current source provides are removal records, and `pruneImportBindings` bounds those
+ * to the ones a downstream cell could actually have read.
  */
 export type ImportChangeStamps = Record<string, ImportBinding>;
+
+/**
+ * A residual line the imports-only test may skip: a bare magic / shell escape, which
+ * the gate above has already proven inert. The assignment form (`files = !ls`) binds
+ * a name, so it is not one and still disqualifies the cell.
+ */
+const isIgnorableLine = (line: LogicalLine): boolean => isBareMagicLine(line.raw);
 
 /** The name an import record binds at module scope (`import a.b` binds `a`). */
 function boundName(rec: ImportRecord): string | null {
@@ -121,19 +140,24 @@ function boundName(rec: ImportRecord): string | null {
  */
 export function importBindingSpecs(source: string | null | undefined): ImportSpecs | null {
 	const src = source ?? '';
+	// ONE tokenizer pass feeds every question below. This runs on each debounced
+	// autosave of each cell, and asking them separately (each re-walking the source)
+	// is the difference between one pass and half a dozen.
+	const lines = logicalLines(src);
 	// A `%%cell magic` cell's body is not module-level Python (bash, html, its own
 	// mini-language), so it is never an imports cell; autoreload retires the
 	// idempotence premise the whole exemption rests on; and a magic we cannot prove
-	// inert (`%run`, `%store`, `%load`, `%pylab`, anything unrecognized) may inject a
-	// name into the namespace, which is the `os = shim` shadow in another costume.
-	if (isCellMagicCell(src) || hasAutoreloadMagic(src) || hasNonInertLineMagic(src)) return null;
-	// ONE tokenizer pass answers both halves: what was lifted, and what was left.
-	// Anything else at module scope could rebind an imported name; we cannot prove
-	// otherwise without re-deriving Python's binding rules, so we do not try - only
-	// inert line magics / shell escapes are discounted, and only because they bind
-	// nothing (the gate above has already refused every magic not proven inert).
-	const extracted = extractTopLevelImports(src);
-	if (!isImportsOnlyResidual(blankLineMagics(extracted.source))) return null;
+	// inert (`%run`, `%store`, `%load`, `%load_ext`, anything unrecognized) may inject
+	// a name into the namespace, which is the `os = shim` shadow in another costume.
+	const magics = scanMagics(lines);
+	if (magics.cellMagic || magics.autoreload || magics.nonInert) return null;
+	// The same pass answers both halves of the imports-only test: what was lifted,
+	// and what was left. Anything else at module scope could rebind an imported name;
+	// we cannot prove otherwise without re-deriving Python's binding rules, so we do
+	// not try - only bare line magics / shell escapes are discounted, and only because
+	// the gate above has already refused every magic not proven inert.
+	const extracted = extractTopLevelImports(src, lines);
+	if (!isImportsOnlyResidual(extracted.source, isIgnorableLine)) return null;
 	const specs: ImportSpecs = new Map();
 	// `statements` is one canonical, deduplicated statement per bound name, in
 	// document order - so each entry is exactly one binding and is its own spec.
@@ -160,10 +184,18 @@ function baselineOf(
 	prevSource: string | null | undefined
 ): ImportChangeStamps | null {
 	if (prev && Object.keys(prev).length) return { ...prev };
+	// Refuse before the tokenizer runs: with no `import` token anywhere, the source is
+	// either ordinary code (baseline null) or nothing but comments and blanks (baseline
+	// empty), and answering null for both is the conservative read - an empty baseline
+	// and a null one already stamp identically, they differ only in that a null one
+	// leaves `sinceAt` at 0, i.e. RETAINS a later removal record rather than pruning it.
+	// This is what keeps an ordinary code cell's autosave off the tokenizer entirely,
+	// which is most autosaves.
+	if (!(prevSource ?? '').includes('import')) return null;
 	const specs = importBindingSpecs(prevSource);
 	if (!specs) return null;
 	const out: ImportChangeStamps = {};
-	for (const [name, spec] of specs) out[name] = { spec, at: 0 };
+	for (const [name, spec] of specs) out[name] = { spec, at: 0, sinceAt: 0 };
 	return out;
 }
 
@@ -176,6 +208,9 @@ function baselineOf(
  * new source no longer provides keeps its entry, its spec and its `at`, and gains a
  * `removedAt`: its disappearance is a change downstream cells must see, and
  * forgetting it is precisely the false `fresh` this mechanism exists to prevent.
+ * (Which of those records is worth KEEPING is a separate question, decided against
+ * the cell's last run by `pruneImportBindings` - the fold itself records everything
+ * it observes, so the two concerns stay apart.)
  *
  * THE COMPARISON IS ALWAYS KNOWABLE-VS-KNOWABLE, and that is load-bearing. The
  * fold diffs the new source against the cell's STORED baseline, never against the
@@ -229,21 +264,68 @@ export function foldImportChange(
 	if (!after) return baseline ?? { ...(prev ?? {}) };
 
 	const out: ImportChangeStamps = {};
+	// A name the baseline does not hold is being introduced NOW - unless the baseline
+	// itself is unknowable, in which case we cannot say the name is new and must assume
+	// it may have been here all along (0), the reading that RETAINS its removal record.
+	const bornAt = baseline === null ? 0 : now;
 	const names = new Set<string>([...Object.keys(baseline ?? {}), ...after.keys()]);
 	for (const name of names) {
 		const before = baseline?.[name];
 		const spec = after.get(name);
+		// Presence begins once and is never walked forward, so a name that survived a
+		// transient removal is still judged by when it FIRST appeared.
+		const sinceAt = before ? (before.sinceAt ?? 0) : bornAt;
 		if (spec === undefined) {
 			// Gone from a knowable source. Keep the baseline intact so a restore is still
 			// recognizable as one, and remember WHEN it went - but only the first time,
 			// so a run of edits that leave it absent does not walk the removal forward.
-			if (before) out[name] = { ...before, removedAt: before.removedAt ?? now };
+			if (before) out[name] = { ...before, sinceAt, removedAt: before.removedAt ?? now };
 			continue;
 		}
 		// Provided again, or still: an unchanged spec keeps its stamp and drops any
 		// pending removal. A name the baseline never proved (or proved differently) is
 		// the real change, and is the only thing stamped `now`.
-		out[name] = before && before.spec === spec ? { spec, at: before.at } : { spec, at: now };
+		out[name] =
+			before && before.spec === spec ? { spec, at: before.at, sinceAt } : { spec, at: now, sinceAt };
+	}
+	return out;
+}
+
+/**
+ * Drop the removal records no downstream cell could ever have depended on.
+ *
+ * A `removedAt` entry outlives the name it describes on purpose - that is the whole
+ * removal ledger, and forgetting one is a false `fresh`. But `Cell.svelte` autosaves
+ * on a 500ms debounce, so retyping an import block persists PARSEABLE intermediates
+ * (`import numpy as n` on the way to `as np`), each minting a name that is then
+ * removed a keystroke later. Those entries were permanent: the map grew for as long
+ * as the session lasted, rode every `cell:edited` payload and every deep-cloned
+ * checkpoint, and a short phantom name (`n`, `p`, `re`) colliding with a real one
+ * made the ledger report a removal that never happened.
+ *
+ * THE TEST IS "WAS IT BOUND WHEN THIS CELL LAST RAN", NOT "IS IT IN THE SOURCE NOW" -
+ * and the distinction is the whole safety of this function. Pruning every name the
+ * current source lacks would delete exactly the records the ledger exists for, since a
+ * genuinely deleted import is also absent from the source. A name that appeared AFTER
+ * the last run (`sinceAt > lastRunAt`) and has since gone never entered the namespace
+ * this cell contributed to, so nothing downstream can have read it; a name that was
+ * already there when the cell ran did, so its removal record survives - however many
+ * times it was rebound in between, because `sinceAt` tracks first appearance while
+ * `at` tracks rebinding.
+ *
+ * A cell that has never run (`lastRunAt` null) bound nothing at all, so the same rule
+ * drops its removals. An entry from before this field existed (a restored checkpoint)
+ * reads as `sinceAt` 0 and is therefore kept.
+ */
+export function pruneImportBindings(
+	stamps: ImportChangeStamps,
+	lastRunAt: number | null | undefined
+): ImportChangeStamps {
+	const out: ImportChangeStamps = {};
+	for (const [name, b] of Object.entries(stamps)) {
+		const phantom = lastRunAt == null || (b.sinceAt ?? 0) > lastRunAt;
+		if (b.removedAt != null && phantom) continue;
+		out[name] = b;
 	}
 	return out;
 }

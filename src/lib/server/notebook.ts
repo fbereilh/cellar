@@ -28,7 +28,7 @@ import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { exportNotebookToPy, type ExportResult } from './export-py';
 import { SQL_LANGUAGE } from '../cellLanguage';
-import { foldImportChange } from './importBindings';
+import { foldImportChange, pruneImportBindings } from './importBindings';
 import type {
 	Cell,
 	CellView,
@@ -131,13 +131,18 @@ function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCella
 /**
  * Store (or clear) a cell's runtime-only import-binding baseline.
  *
+ * Pruned on the way in, against this cell's own last run, so the removal records a
+ * debounced autosave mints for a name that was born and died between two runs do not
+ * accumulate for the life of the session (see `pruneImportBindings`).
+ *
  * An empty map is stored as ABSENT rather than `{}`: it says exactly the same
  * thing (nothing proven, nothing changed) and every ordinary code cell would
  * otherwise ship a useless object to the browser on each `cell:edited`, and carry
  * it into every deep-cloned checkpoint snapshot.
  */
 function setImportBindings(cellar: CellarNamespace, stamps: ImportChangeStamps): void {
-	if (Object.keys(stamps).length) cellar.importBindings = stamps;
+	const kept = pruneImportBindings(stamps, cellar.lastRun?.at ?? null);
+	if (Object.keys(kept).length) cellar.importBindings = kept;
 	else delete cellar.importBindings;
 }
 
