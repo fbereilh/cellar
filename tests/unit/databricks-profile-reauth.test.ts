@@ -55,22 +55,43 @@ const SDK_ERROR = `ValueError: default auth: databricks-cli: cannot get access t
  * the sidebar from this path too. The mock replays exactly that: the SDK error,
  * under the code the kernel would have stamped on it.
  */
+/**
+ * The kernel the mock pretends to be. Mutable so the reconnect suite can drive the
+ * two things the recovery ladder keys off: the SESSION EPOCH (bumping it is what a
+ * kernel restart looks like to `connectionStatus`, i.e. rung 3) and whether the
+ * Spark Connect handle is still alive (rung 2's expiry). `connectOk` lets a test
+ * establish a real connection first - the ladder only runs for a notebook that has
+ * a `reconnectTarget`, which only a SUCCESSFUL connect sets.
+ */
+const kernel = { session: 1, connectOk: false, sessionExpired: false, connectMessage: SDK_ERROR };
+
 vi.mock('../../src/lib/server/kernel', () => ({
 	execute: async (_nb: string, code: string, onEvent: (e: unknown) => void) => {
-		onEvent({ type: 'kernel', session: 1 });
-		const out = code.includes('_cellar_dbx_connect')
-			? { ok: false, code: 'auth_failed', message: SDK_ERROR }
-			: { ok: true, imported: false };
+		onEvent({ type: 'kernel', session: kernel.session });
+		let out: unknown;
+		if (code.includes('_cellar_dbx_ping')) {
+			out = kernel.sessionExpired
+				? { ok: true, alive: false, expired: true, closed: true }
+				: { ok: true, alive: true, expired: false, closed: false };
+		} else if (code.includes('_cellar_dbx_connect')) {
+			out = kernel.connectOk
+				? { ok: true, host: 'https://default.cloud.databricks.com', spark_version: '3.5.0' }
+				: { ok: false, code: 'auth_failed', message: kernel.connectMessage };
+		} else {
+			out = { ok: true, imported: false };
+		}
 		onEvent({
 			type: 'output',
 			output: { output_type: 'stream', name: 'stdout', text: `${SENTINEL}${JSON.stringify(out)}\n` }
 		});
 		return {};
 	},
-	currentSessionId: () => 1,
+	currentSessionId: () => kernel.session,
 	kernelStatus: () => ({ status: 'idle', id: 'k1' }),
 	restartKernel: vi.fn(),
-	refreshKernelConnection: vi.fn()
+	// Rung 1 of the ladder: a healthy socket needing no repair, so every reconnect
+	// test falls through to the rung it is actually about.
+	refreshKernelConnection: async () => ({ refreshed: false, reason: 'ok' })
 }));
 
 let dbx: typeof import('../../src/lib/server/databricks');
@@ -284,5 +305,108 @@ describe('the route body carries the profile name the sidebar prints', () => {
 
 		const plain = await databricksErrorResponse(new dbx.DatabricksError('auth_failed', 'nope')).json();
 		expect(plain.profile).toBeUndefined();
+	});
+});
+
+/**
+ * **The RECONNECT ladder must not launder the classification away.**
+ *
+ * This is the likeliest way a user meets an expired profile at all: the token
+ * dies under a session that was already working, so what they touch is the
+ * sidebar's Reconnect button (or an agent's `databricks_reconnect`), not a fresh
+ * connect. Both rungs that rebuild a session are driven fire-and-forget by callers
+ * that must never throw, so each swallows its error - rung 2 (`autoReconnect`)
+ * down to `false`, rung 3 (`reconnectAfterKernelRestart`) down to a string reason.
+ * That flattening dropped `code`/`profile`, and `reconnectSession` then raised the
+ * generic `reconnect_failed` telling the user to "reconnect from the Databricks
+ * sidebar section" - which is precisely the dead-end button this whole feature
+ * exists to stop offering. The cluster probe cannot rescue it either: it runs on
+ * the SAME expired auth, so it can only answer "could not tell".
+ *
+ * These pin that the classified failure survives BOTH rungs, and - equally - that
+ * it is never invented: an ordinary failure still reads `reconnect_failed`, and a
+ * reauth verdict from an earlier attempt cannot speak for a later one.
+ */
+describe('the reconnect ladder keeps the expired-profile verdict', () => {
+	/** A notebook with a real, live connection - the only state the ladder will act on. */
+	async function connectedNotebook(name: string): Promise<string> {
+		const nb = join(dir, name);
+		writeStub(null);
+		kernel.session = 1;
+		kernel.connectOk = true;
+		kernel.sessionExpired = false;
+		kernel.connectMessage = SDK_ERROR;
+		await expect(
+			dbx.connect({ profile: 'DEFAULT', clusterId: '0710-abc123-xyz', clusterName: 'analytics', nb })
+		).resolves.toMatchObject({ ok: true });
+		return nb;
+	}
+
+	/** Run `fn` with the clock past `LIVENESS_TTL_MS`, so a cached "alive" cannot answer for us. */
+	async function pastLivenessTtl<T>(fn: () => Promise<T>): Promise<T> {
+		const realNow = Date.now;
+		Date.now = () => realNow() + 60_000;
+		try {
+			return await fn();
+		} finally {
+			Date.now = realNow;
+		}
+	}
+
+	it('rung 3 (kernel restart): surfaces profile_reauth_required, not the generic sidebar message', async () => {
+		const nb = await connectedNotebook('reconnect-restart.ipynb');
+		// A kernel restart bumps the epoch, so `spark` is gone and the ladder falls to
+		// rung 3 - which rebuilds via connect(), where the dead token now surfaces.
+		kernel.session = 2;
+		kernel.connectOk = false;
+		await expect(dbx.reconnectSession(nb)).rejects.toMatchObject({
+			code: reauth.PROFILE_REAUTH_CODE,
+			profile: 'DEFAULT'
+		});
+		// The command rides the message, so the agent tool result is actionable too.
+		await expect(dbx.reconnectSession(nb)).rejects.toThrow(/databricks auth login --profile DEFAULT/);
+	});
+
+	it('rung 2 (server-side expiry): surfaces it too', async () => {
+		const nb = await connectedNotebook('reconnect-expiry.ipynb');
+		// The epoch is unchanged (no restart) but the Spark Connect client is closed,
+		// so the heal runs in place - and its connect() hits the same dead token.
+		kernel.sessionExpired = true;
+		kernel.connectOk = false;
+		await pastLivenessTtl(() =>
+			expect(dbx.reconnectSession(nb)).rejects.toMatchObject({
+				code: reauth.PROFILE_REAUTH_CODE,
+				profile: 'DEFAULT'
+			})
+		);
+	});
+
+	it('an ordinary reconnect failure is still the generic reconnect_failed', async () => {
+		const nb = await connectedNotebook('reconnect-generic.ipynb');
+		kernel.session = 2;
+		kernel.connectOk = false;
+		// A failure that is NOT an expired profile: the reauth verdict must be earned,
+		// never handed to every reconnect that happens to fail.
+		kernel.connectMessage = 'Unauthenticated: Invalid access token. Config: host=…, auth_type=pat';
+		await expect(dbx.reconnectSession(nb)).rejects.toMatchObject({ code: 'reconnect_failed' });
+	});
+
+	it('a later attempt is not spoken for by an earlier verdict', async () => {
+		const nb = await connectedNotebook('reconnect-stale.ipynb');
+		kernel.session = 2;
+		kernel.connectOk = false;
+		// Attempt 1 fails with the expired-profile shape and records that verdict.
+		await expect(dbx.reconnectSession(nb)).rejects.toMatchObject({
+			code: reauth.PROFILE_REAUTH_CODE
+		});
+		// The user runs the command; attempt 2 must come back clean rather than
+		// re-raising the verdict it just retired.
+		kernel.connectOk = true;
+		await expect(dbx.reconnectSession(nb)).resolves.toMatchObject({ connected: true, reconnected: true });
+		// And a LATER, unrelated failure reads as itself, not as the old expiry.
+		kernel.session = 3;
+		kernel.connectOk = false;
+		kernel.connectMessage = 'Unauthenticated: Invalid access token. Config: host=…, auth_type=pat';
+		await expect(dbx.reconnectSession(nb)).rejects.toMatchObject({ code: 'reconnect_failed' });
 	});
 });

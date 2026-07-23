@@ -1052,8 +1052,11 @@
 	}
 
 	// Copy-the-command affordance for the re-auth box - the same idiom as the
-	// sidebar's "Connect an agent" panel. Keyed by the box's testid so two boxes
-	// (a listing failure and a connect failure) cannot share one "copied" tick.
+	// sidebar's "Connect an agent" panel. Keyed by the box's own `key`, NOT its
+	// testid: a testid is a SELECTOR, not an identity - `databricks-node-error` is
+	// rendered once per catalog-tree node, and one expired profile fails every one
+	// of them at once, so keying the tick off it flipped the checkmark in every
+	// sibling box. Each rendered box therefore passes a key unique to it.
 	let copiedReauth = $state('');
 	let copyReauthTimer: ReturnType<typeof setTimeout>;
 	async function copyReauth(key: string, text: string) {
@@ -1075,7 +1078,7 @@
   shows the exact command instead, with the real profile name. See
   $lib/databricksReauth for why Cellar does not run it for them.
 -->
-{#snippet reauthBox(err: DbxError, testid: string)}
+{#snippet reauthBox(err: DbxError, testid: string, key: string)}
 	{@const name = reauthProfile(err)}
 	{@const command = reauthCommand(name)}
 	<p class="text-[11px] font-medium leading-relaxed text-base-content/80" data-testid="{testid}-explain">
@@ -1089,12 +1092,12 @@
 		<code class="min-w-0 flex-1 px-1 py-0.5 font-mono text-[11px] leading-snug text-primary [overflow-wrap:break-word]" title={command} data-testid="{testid}-command">{REAUTH_COMMAND_HEAD} <span class="whitespace-nowrap">{REAUTH_PROFILE_FLAG}</span> {name}</code>
 		<button
 			class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
-			onclick={() => copyReauth(testid, command)}
+			onclick={() => copyReauth(key, command)}
 			title="Copy command"
 			aria-label="Copy command"
 			data-testid="{testid}-copy"
 		>
-			{#if copiedReauth === testid}
+			{#if copiedReauth === key}
 				<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
 			{:else}
 				<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
@@ -1103,10 +1106,17 @@
 	</div>
 {/snippet}
 
-{#snippet errorBox(err: DbxError, testid: string)}
+<!--
+  `testid` is the SELECTOR (deliberately repeated across the catalog tree's node
+  boxes, which tests address as one); `key` is the box's IDENTITY, used only for
+  per-box UI state like the copy tick. They coincide everywhere a box is rendered
+  once, so `key` defaults to the testid; a box inside an `{#each}` must pass its
+  own.
+-->
+{#snippet errorBox(err: DbxError, testid: string, key: string = testid)}
 	<div class="mt-2 rounded-lg border border-error/30 bg-error/10 p-2" data-testid={testid}>
 		{#if err.code === PROFILE_REAUTH_CODE}
-			{@render reauthBox(err, `${testid}-reauth`)}
+			{@render reauthBox(err, `${testid}-reauth`, key)}
 			<!-- The SDK's own text only; the head of the server message is what the
 			     box above already says in full, so repeating it would state the same
 			     remedy three times. -->
@@ -1440,7 +1450,7 @@
 							{#if node?.loading}
 								<p class="px-2 py-0.5 text-[11px] text-base-content/40">loading…</p>
 							{:else if node?.error}
-								{@render errorBox(node.error, 'databricks-node-error')}
+								{@render errorBox(node.error, 'databricks-node-error', cid)}
 							{:else if node?.items?.length}
 								{#each node.items as sch (sch.name)}
 									{@const sid = `s:${cat.name}.${sch.name}`}
@@ -1455,7 +1465,7 @@
 											{#if tnode?.loading}
 												<p class="px-2 py-0.5 text-[11px] text-base-content/40">loading…</p>
 											{:else if tnode?.error}
-												{@render errorBox(tnode.error, 'databricks-node-error')}
+												{@render errorBox(tnode.error, 'databricks-node-error', sid)}
 											{:else if tnode?.items?.length}
 												{#each tnode.items as tbl (tbl.name)}
 													<button

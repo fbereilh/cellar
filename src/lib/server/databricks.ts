@@ -2076,6 +2076,19 @@ interface ConnState {
 	livenessInFlight: Promise<Liveness> | null;
 	/** In-flight auto-reconnect for one notebook, so a burst of expired-status reads heals once. */
 	reconnecting: Promise<boolean> | null;
+	/**
+	 * The CLASSIFIED failure of the last reconnect attempt (`reconnectTo`), kept
+	 * because the recovery ladder's own failure channel is lossy: rung 2
+	 * (`autoReconnect`) reports a bare `false` and rung 3
+	 * (`reconnectAfterKernelRestart`) flattens the error to a string reason, since
+	 * both are called fire-and-forget by paths that must never throw. Flattening
+	 * discards `DatabricksError.code`/`.profile`, so an actionable cause -
+	 * `profile_reauth_required` above all, whose whole point is naming the profile
+	 * to re-authenticate - degraded into the generic "reconnect from the sidebar"
+	 * dead end. `reconnectSession` clears this before walking the ladder, so
+	 * whatever is here afterwards belongs to THAT attempt, never a stale one.
+	 */
+	reconnectError: DatabricksError | null;
 }
 
 const states = new Map<string, ConnState>();
@@ -2092,7 +2105,8 @@ function stateFor(nb: string): ConnState {
 			inFlight: false,
 			liveness: null,
 			livenessInFlight: null,
-			reconnecting: null
+			reconnecting: null,
+			reconnectError: null
 		};
 		states.set(nb, s);
 	}
@@ -2196,15 +2210,27 @@ async function probeLiveness(nb: string, session: SessionId | null): Promise<Liv
  * seam both reconnection triggers - the server-side expiry self-heal and the
  * kernel-restart re-establish - go through, so they reconnect to the EXACT same
  * profile+cluster; there is no second reconnection mechanism to drift.
+ *
+ * Being that one seam is also why the classified failure is recorded HERE: both
+ * callers must swallow their error (they are driven fire-and-forget), so this is
+ * the last place that still holds the `DatabricksError` `connect()` raised, with
+ * its `code` and `profile` intact. See `ConnState.reconnectError`.
  */
 async function reconnectTo(nb: string, target: ReconnectTarget): Promise<void> {
-	await connect({
-		profile: target.sel.profile ?? null,
-		host: target.sel.host ?? null,
-		clusterId: target.clusterId,
-		clusterName: target.clusterName,
-		nb
-	});
+	const s = stateFor(nb);
+	try {
+		await connect({
+			profile: target.sel.profile ?? null,
+			host: target.sel.host ?? null,
+			clusterId: target.clusterId,
+			clusterName: target.clusterName,
+			nb
+		});
+		s.reconnectError = null;
+	} catch (err) {
+		s.reconnectError = err instanceof DatabricksError ? err : null;
+		throw err;
+	}
 }
 
 /**
@@ -2727,13 +2753,28 @@ async function clusterState(sel: Selection, clusterId: string): Promise<string |
 }
 
 /**
- * Turn a failed reconnect/connect into the most actionable error. If the target
- * cluster is provably down (TERMINATED / TERMINATING / ERROR), that is the real
- * cause and it is HUMAN-ONLY to fix — agents cannot start compute (D2) — so raise
- * a dedicated `cluster_terminated`. Otherwise the cause is unknown, so raise
- * `reconnect_failed` pointing at the sidebar. Always throws.
+ * Turn a failed reconnect/connect into the most actionable error.
+ *
+ * Most actionable FIRST: if the ladder's own `connect()` already classified the
+ * failure as this profile's CLI-managed sign-in having expired, that verdict
+ * outranks anything guessed from here - it names the exact
+ * `databricks auth login --profile <name>` the user must run, and it is the one
+ * auth dead end where "reconnect from the sidebar" is actively wrong (the sidebar
+ * offers Cellar's own browser sign-in, which mints a token that profile never
+ * reads). It also outranks the cluster probe for a second reason: that probe runs
+ * on the SAME dead auth, so it can only ever answer `null` here - paying for it
+ * first would just delay the real answer. Re-thrown as-is, so `code`/`profile`
+ * reach the sidebar and the agent unchanged; see `ConnState.reconnectError`.
+ *
+ * Otherwise, if the target cluster is provably down (TERMINATED / TERMINATING /
+ * ERROR), that is the real cause and it is HUMAN-ONLY to fix — agents cannot start
+ * compute (D2) — so raise a dedicated `cluster_terminated`. Failing both, the
+ * cause is unknown, so raise `reconnect_failed` pointing at the sidebar. Always
+ * throws.
  */
-async function throwReconnectFailure(target: ReconnectTarget, prefix: string): Promise<never> {
+async function throwReconnectFailure(nb: string, target: ReconnectTarget, prefix: string): Promise<never> {
+	const preserved = stateFor(nb).reconnectError;
+	if (preserved?.code === PROFILE_REAUTH_CODE) throw preserved;
 	const state = await clusterState(target.sel, target.clusterId);
 	if (state && DOWN_CLUSTER_STATES.has(state.toUpperCase())) {
 		throw new DatabricksError(
@@ -2809,6 +2850,10 @@ export async function reconnectSession(nb?: string | null) {
 		);
 	}
 
+	// Only THIS attempt's classified failure may speak for it: drop anything a
+	// previous (or fire-and-forget) reconnect left behind before walking the ladder.
+	s.reconnectError = null;
+
 	// Rung 1: repair a dropped kernel socket in place (namespace-preserving; never
 	// restarts the kernel). If the process itself was proven dead this tore it down —
 	// there is no live kernel to re-establish a session in, and we never boot one just
@@ -2839,7 +2884,7 @@ export async function reconnectSession(nb?: string | null) {
 			return reconnectedPayload(abs, { socketRefreshed, kernelRestarted });
 		}
 		// Bound but the session is dead and could not be healed in place.
-		return throwReconnectFailure(target, 'The Databricks session expired and Cellar could not reconnect it.');
+		return throwReconnectFailure(abs, target, 'The Databricks session expired and Cellar could not reconnect it.');
 	}
 
 	// Not connected at the current epoch → the kernel was restarted (rung 3).
@@ -2858,7 +2903,7 @@ export async function reconnectSession(nb?: string | null) {
 	if (r.reason === 'busy') {
 		throw new DatabricksError('busy', 'A Databricks connect is already in progress for this notebook; try again shortly.');
 	}
-	return throwReconnectFailure(target, `Could not reconnect to cluster "${target.clusterName}".`);
+	return throwReconnectFailure(abs, target, `Could not reconnect to cluster "${target.clusterName}".`);
 }
 
 /**
