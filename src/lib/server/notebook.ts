@@ -872,6 +872,33 @@ export function deleteCell(id: string, nb?: string | null, originId?: string | n
 	if (existed) emit(doc, 'cell:deleted', { cellId: id }, originId);
 }
 
+/**
+ * Delete SEVERAL cells as ONE document write (the MCP `delete_cells` batch).
+ *
+ * Deliberately NOT a loop over `deleteCell`: that persists — a full serialize +
+ * fsync + rename of the whole notebook — once per cell, and walks the `.ipynb`
+ * through N-1 intermediate states a crash could freeze it in. One filter, one
+ * persist, then one `cell:deleted` per removed cell, so every client applies the
+ * same per-cell events it already handles and no new event shape exists.
+ *
+ * Returns the ids actually removed (unknown ids are ignored rather than
+ * persisting a no-op write).
+ */
+export function deleteCells(ids: readonly string[], nb?: string | null, originId?: string | null): string[] {
+	const doc = docFor(nb);
+	const wanted = new Set(ids);
+	const removed = doc.cells.filter((c) => wanted.has(c.id)).map((c) => c.id);
+	if (!removed.length) return [];
+	doc.cells = doc.cells.filter((c) => !wanted.has(c.id));
+	persist(doc);
+	for (const id of removed) {
+		// A deleted cell must not later dequeue and run.
+		cancelRun(doc.path, id);
+		emit(doc, 'cell:deleted', { cellId: id }, originId);
+	}
+	return removed;
+}
+
 export function setSource(id: string, source: string, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
