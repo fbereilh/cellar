@@ -72,6 +72,20 @@ export function base64Bytes(b64: string): number {
 	return Math.floor((chars * 3) / 4) - Math.min(pad, 2);
 }
 
+/**
+ * The base64 a block may actually SHIP: the same payload with every whitespace
+ * character removed. nbformat splits a raster with `splitlines(True)`, so the line
+ * terminators survive the `join('')` that reassembles it and land inside the
+ * base64 - and a strict host validator rejects a non-alphabet character exactly as
+ * it rejects the comma a `String()` join would have left, failing the ENTIRE tool
+ * result. Unlike `base64Bytes` (which runs several times per image and so counts in
+ * place) this copies, but only at most `limit` times per result, and only when
+ * there is something to strip.
+ */
+function base64Payload(b64: string): string {
+	return /\s/.test(b64) ? b64.replace(/\s+/g, '') : b64;
+}
+
 /** Human byte size: `46 KB`, `1.2 MB`, `812 B`. */
 export function formatBytes(n: number): string {
 	if (n < 1024) return `${n} B`;
@@ -503,7 +517,8 @@ export function buildImageBlocks(
 		}
 		// Charge the decode budget BEFORE decoding whenever the cost is knowable, so a
 		// decode that would blow the budget never runs at all.
-		const pixels = dim && willDecode(full, mime, b64, dim, maxEdge, maxBytes) ? dim.width * dim.height : 0;
+		const decoding = willDecode(full, mime, b64, dim, maxEdge, maxBytes);
+		const pixels = dim && decoding ? dim.width * dim.height : 0;
 		if (pixels && spentPixels + pixels > maxDecodePixels) {
 			declineBound(output_index, mime, 'budget');
 			continue;
@@ -511,8 +526,11 @@ export function buildImageBlocks(
 		// A header that would not parse hides its decode cost until pngjs has read the
 		// raster, so it can only be charged afterwards. Refusing to START one once the
 		// budget is gone is what bounds the overshoot to a single image instead of
-		// letting a run of unreadable headers decode without limit.
-		if (!dim && spentPixels >= maxDecodePixels) {
+		// letting a run of unreadable headers decode without limit. Only a PNG is ever
+		// handed to pngjs, and on the `full` path only one breaching a host ceiling is -
+		// so this is gated on a decode really being about to happen. Withholding a
+		// figure that costs the decoder nothing would charge it for CPU never spent.
+		if (!dim && mime === 'image/png' && (full ? decoding : true) && spentPixels >= maxDecodePixels) {
 			declineBound(output_index, mime, 'budget');
 			continue;
 		}
@@ -584,7 +602,7 @@ function fitImageBlock(output_index: number, mime: string, b64: string, full: bo
 		return {
 			output_index,
 			mime: blockMime(mime),
-			data: s.data,
+			data: base64Payload(s.data),
 			...(width != null && height != null ? { width, height } : {}),
 			...(s.resized ? { downscaled: { from: `${width}×${height}`, to: `${s.scaledWidth}×${s.scaledHeight}`, ...(note ? { note } : { note: FETCH_FULL }) } } : {})
 		};

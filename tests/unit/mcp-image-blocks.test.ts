@@ -208,6 +208,54 @@ describe('image block policy', () => {
 		expect(omitted).toEqual([expect.objectContaining({ output_index: 0, reason: 'budget' })]);
 	});
 
+	it('withholds nothing for a decode it never performs - the budget guards pngjs, not every image', () => {
+		// Only a PNG is ever handed to pngjs, so an image whose header will not parse
+		// costs the decoder nothing unless it is one. Declining these on a spent pixel
+		// budget charged a figure for CPU that was never going to be spent.
+		const opaqueJpeg = Buffer.from('fake jpeg bytes').toString('base64');
+		const spent = { maxDecodePixels: 0 };
+		expect(buildImageBlocks([ref(0, 'image/jpeg', opaqueJpeg)], spent).images).toHaveLength(1);
+		expect(buildImageBlocks([ref(0, 'image/gif', Buffer.from('not really a gif').toString('base64'))], spent).images).toHaveLength(1);
+
+		// Same on the `full` path: it skips the routine downscale, so a PNG already
+		// inside the host ceilings decodes nothing there either, header or no header.
+		const junkPng = Buffer.from('\x89PNG\r\n\x1a\n corrupt tail').toString('base64');
+		expect(buildImageBlocks([ref(0, 'image/png', junkPng)], { ...spent, full: true }).images).toHaveLength(1);
+		// But one that BREACHES a ceiling falls back to a real decode, so it is still
+		// refused on a spent budget - the guard keeps the case it exists for.
+		const overByte = buildImageBlocks([ref(0, 'image/png', junkPng)], { ...spent, full: true, maxBytes: 1 });
+		expect(overByte.images).toEqual([]);
+		expect(overByte.omitted).toEqual([expect.objectContaining({ reason: 'budget' })]);
+	});
+
+	it('never ships base64 carrying the line terminators nbformat stores a raster with', () => {
+		// nbformat splits an image with splitlines(True), so the terminators survive the
+		// join that reassembles it. A strict host validator rejects a non-alphabet
+		// character exactly as it rejects a comma, failing the ENTIRE tool result - and
+		// EVERY non-re-encoding path emits the payload verbatim, so the strip belongs
+		// where the block is built rather than in one branch.
+		const wrap = (b64: string) => (b64.match(/.{1,64}/g) || []).join('\n');
+		const small = makePngB64(400, 300); // under maxEdge: no re-encode
+		const big = makePngB64(1600, 1200);
+		const jpeg = Buffer.from('fake jpeg bytes').toString('base64');
+		const junkPng = Buffer.from('\x89PNG\r\n\x1a\n corrupt tail').toString('base64'); // decode-failure fallback
+
+		const cases: Array<[ImageOutputRef, { full?: boolean }]> = [
+			[ref(0, 'image/png', wrap(small)), {}],
+			[ref(0, 'image/png', wrap(big)), { full: true }],
+			[ref(0, 'image/jpeg', wrap(jpeg)), {}],
+			[ref(0, 'image/png', wrap(junkPng)), {}]
+		];
+		for (const [item, opts] of cases) {
+			const { images } = buildImageBlocks([item], opts);
+			expect(images).toHaveLength(1);
+			expect(images[0].data).not.toMatch(/\s/);
+		}
+		// And the stripped payload is still the SAME raster, not a mangled one.
+		expect(buildImageBlocks([ref(0, 'image/png', wrap(small))]).images[0].data).toBe(small);
+		expect(dimsOf(buildImageBlocks([ref(0, 'image/png', wrap(big))], { full: true }).images[0].data)).toEqual({ width: 1600, height: 1200 });
+	});
+
 	it('reports the pixel size on every block, not only the ones a downscale happened to decode', () => {
 		// width/height used to be a side effect of the downscale decode, so a `full`
 		// block and every JPEG/GIF block carried none while a downscaled one did - an

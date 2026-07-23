@@ -363,11 +363,14 @@ describe('get_full_output default-vs-full image contract', () => {
 		expect(rest.images_omitted).toBeUndefined();
 	});
 
-	it('joins a multiline (string[]) raster instead of comma-joining it into corrupt base64', async () => {
+	it('joins a multiline (string[]) raster and ships it free of the line terminators', async () => {
 		// nbformat stores an image as an ARRAY of lines, and deserialize copies outputs
 		// through verbatim - so an externally-authored .ipynb reaches here as string[].
 		// String(['ab','cd']) is 'ab,cd': base64 with commas in it, which a strict host
-		// validator rejects, failing the ENTIRE tool result.
+		// validator rejects, failing the ENTIRE tool result. The terminators are the same
+		// class of defect: nbformat splits with splitlines(True), so they SURVIVE the
+		// join (this fixture keeps them, exactly as a real .ipynb does) and would ride
+		// into the emitted block unless it strips them.
 		const NB = 'multiline-image.ipynb';
 		svc.useNotebook('imgSessLines', NB);
 		const nb = nbmod.resolveNotebookPath(NB);
@@ -375,12 +378,13 @@ describe('get_full_output default-vs-full image contract', () => {
 		const id = svc.resolveRef(nb, ids[0]);
 
 		const b64 = makePngB64(320, 240);
-		const lines = b64.match(/.{1,64}/g)!;
+		const lines = b64.match(/.{1,64}/g)!.map((l, i, all) => (i === all.length - 1 ? l : `${l}\n`));
+		expect(lines.join('')).toContain('\n');
 		nbmod.setOutputs(id, [{ output_type: 'display_data', data: { 'image/png': lines }, metadata: {} }], nb);
 
 		const res = svc.getFullOutput(id, 'full', nb)!;
 		expect(res.images![0].data).toBe(b64);
-		expect(res.images![0].data).not.toContain(',');
+		expect(res.images![0].data).not.toMatch(/[\s,]/);
 		expect(dimsOf(res.images![0].data)).toEqual({ width: 320, height: 240 });
 		// The placeholder is built from the same joined payload, so its size and
 		// dimensions describe the real raster rather than a comma-joined string.
