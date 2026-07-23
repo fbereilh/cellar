@@ -20,6 +20,11 @@
  * fails with a NameError against a notebook that looks correct. Errors from that
  * run (a missing package) surface as the cell's own outputs, exactly as if a human
  * had pressed Run — never swallowed.
+ *
+ * Rewriting and re-running this cell is therefore routine, which is why staleness
+ * does NOT treat it as a change to everything below: an edit here stales only the
+ * cells reading a module-level import whose statement actually moved (see
+ * `importBindings.ts` and `$lib/staleness.ts`).
  */
 import {
 	listCells,

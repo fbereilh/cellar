@@ -984,6 +984,14 @@ export async function findSymbol(name: string, nb?: string | null) {
  * run_stale re-run after I touch this" BEFORE the edit — the downstream direction
  * `stale_upstream` (which only appears once a cell is ALREADY stale) never surfaces.
  *
+ * It also OVER-reports in one direction, deliberately: asked BEFORE an edit exists,
+ * it is the blast radius of the WHOLE cell, so it assumes every name the cell defines
+ * may move. `computeStaleness` runs after the edit and knows more - it exempts an edge
+ * carrying only module-level import bindings whose statements did not change - so for
+ * the imports cell `dependents` is "everything reading any of these imports" while the
+ * cells that actually go stale are only those reading an import the edit moved (see
+ * `resolveImpact` in `$lib/symbolGraph`).
+ *
  * Honest limit (inherited, see the module header): a dependency carried only through
  * a conditional bind (`if flag: df = load()`), a `global`-declared augmented
  * assignment inside a function, or `exec`/`globals()` is invisible to the graph, so

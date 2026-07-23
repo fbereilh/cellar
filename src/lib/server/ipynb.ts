@@ -78,9 +78,11 @@ export function serialize(doc: { cells: Cell[]; metadata?: NotebookMetadata }): 
  * Parse an nbformat notebook object into canonical cells.
  *
  * `stripRuntimeMeta` is the read-side half of the run-stamp forgery guard: a
- * `cellar.lastRun` (or `.editedAt`) read off disk must never reach the document,
- * or an externally-authored `.ipynb` could claim a cell ran in the live kernel
- * session. Only an in-process run/edit may originate those stamps. See clean.js.
+ * `cellar.lastRun` (or `.editedAt`, or `.importBindings`) read off disk must never
+ * reach the document, or an externally-authored `.ipynb` could claim a cell ran in
+ * the live kernel session - or, with a forged import-binding baseline, that a
+ * binding it rewrote is unchanged. Only an in-process run/edit may originate those
+ * stamps. See clean.js.
  */
 export function deserialize(nb: {
 	cells?: Array<{ id?: string; cell_type?: string; source?: string | string[]; outputs?: unknown; metadata?: import('./types').CellMetadata }>;

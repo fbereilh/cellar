@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { cellMagicName, isCellMagicCell, normalizeForAnalysis } from '../../src/lib/server/magics';
+import { cellMagicName, isCellMagicCell, normalizeForAnalysis, scanMagics } from '../../src/lib/server/magics';
+import { logicalLines } from '../../src/lib/server/imports';
 import { analyzeDataflow } from '../../src/lib/server/dataflow';
 import type { CellView } from '../../src/lib/server/types';
 
@@ -21,6 +22,36 @@ describe('cellMagicName', () => {
 	it('isCellMagicCell mirrors it', () => {
 		expect(isCellMagicCell('%%html\n<b>hi</b>')).toBe(true);
 		expect(isCellMagicCell('x = 1')).toBe(false);
+	});
+});
+
+describe('scanMagics - every magic question in one pass', () => {
+	const scan = (src: string) => scanMagics(logicalLines(src));
+
+	it('agrees with cellMagicName about what opens a cell magic', () => {
+		for (const src of ['%%time\nx = 1', '\n\n%%bash\necho hi', 'x = 1', '%matplotlib inline', 'x = a % b']) {
+			expect(scan(src).cellMagic).toBe(cellMagicName(src) !== null);
+		}
+	});
+
+	it('flags autoreload however it is armed, in any line', () => {
+		expect(scan('import os\n%autoreload 2').autoreload).toBe(true);
+		expect(scan('%load_ext autoreload').autoreload).toBe(true);
+		expect(scan('%reload_ext autoreload').autoreload).toBe(true);
+		expect(scan('%autoreload 0').autoreload).toBe(true); // disabling is still a mention
+		expect(scan('%matplotlib inline\nimport os').autoreload).toBe(false);
+	});
+
+	it('flags every magic not PROVEN inert, unknown ones included', () => {
+		expect(scan('%matplotlib inline\n%pip install x\n%config A.b = 1\nimport os').nonInert).toBe(false);
+		expect(scan('%run setup.py').nonInert).toBe(true);
+		expect(scan('%store -r pd').nonInert).toBe(true);
+		expect(scan('%mystery_magic').nonInert).toBe(true);
+		// An extension can push names of its own, so loading one is not provably inert.
+		expect(scan('%load_ext sql').nonInert).toBe(true);
+		expect(scan('%reload_ext line_profiler').nonInert).toBe(true);
+		// A shell escape runs a subprocess; it binds nothing and is not a line magic.
+		expect(scan('!ls\nimport os').nonInert).toBe(false);
 	});
 });
 
