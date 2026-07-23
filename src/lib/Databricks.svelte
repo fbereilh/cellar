@@ -18,6 +18,7 @@
 	import { onMount } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
 	import { getUi, setUi, setUiNow } from '$lib/uiState';
+	import { normalizeDatabricksHost } from '$lib/databricksHost';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -67,6 +68,16 @@
 		install?: DbxInstall;
 		/** Whether uv is available to install packages. */
 		uv?: boolean;
+		/** Bare hosts this server process has completed a Cellar sign-in for (NORMALIZED). */
+		signedInHosts?: string[];
+		/** No-token external-browser profiles this server process has signed in for. */
+		signedInProfiles?: string[];
+	}
+	/** What `POST /api/databricks/logout` reports, so the note can be honest about what was cleared. */
+	interface DbxLogout {
+		disconnected: number;
+		clearedTokens: number;
+		externalSkipped: number;
 	}
 	interface DbxCluster {
 		cluster_id: string;
@@ -270,7 +281,7 @@
 	// ---- Status (profiles + install + connection) ----------------------------
 	let status = $state<DbxStatus | null>(null);
 	let statusError = $state('');
-	let busy = $state(''); // 'connect' | 'disconnect' | 'install' | ''
+	let busy = $state(''); // 'connect' | 'disconnect' | 'logout' | 'login' | 'reconnect' | 'install' | ''
 
 	const connection = $derived<DbxConnection>(status?.connection ?? { connected: false });
 	const connected = $derived(!!connection.connected);
@@ -327,6 +338,27 @@
 	);
 	/** Identifies the current selection, so a change resets sign-in + cluster state. */
 	const selectionKey = $derived(selectionMode === 'profile' ? `p:${profile}` : `h:${hostTrimmed}`);
+	/**
+	 * Could this selection's credential be one CELLAR minted? Mirrors the server's
+	 * `hasCellarCachedOAuth`: only the two external-browser shapes Cellar signs in
+	 * for itself (a bare typed host, a no-token external-browser profile). A PAT or
+	 * a `databricks-cli` profile is the user's own credential, so there is nothing
+	 * of ours to purge.
+	 */
+	const cellarOwnsAuth = $derived(selectionMode === 'host' || profileNeedsSignIn);
+	/**
+	 * Does Cellar hold a sign-in for this selection that Log out would clear? The
+	 * server's recorded sets are the truth (they survive a reload); `authed` covers
+	 * the window between signing in and the next status read. Hosts are matched
+	 * NORMALIZED, the way the server records them - hence the shared normalizer.
+	 */
+	const cellarSignedIn = $derived(
+		cellarOwnsAuth &&
+			(authed ||
+				(selectionMode === 'host'
+					? (status?.signedInHosts ?? []).includes(normalizeDatabricksHost(hostTrimmed))
+					: (status?.signedInProfiles ?? []).includes(profile)))
+	);
 
 	/** The `{profile}|{host}` body/query a request should carry for the current selection. */
 	function selectionParams(): Record<string, string> {
@@ -522,6 +554,10 @@
 	// expired/lost box, so it keeps its own error + note separate from the picker's.
 	let reconnectError = $state<DbxError | null>(null);
 	let reconnectNote = $state('');
+	// Log out keeps its own feedback too: it is the one action that reports on the
+	// AUTH, not the session, so its outcome must not be mistaken for a connect error.
+	let logoutError = $state<DbxError | null>(null);
+	let logoutNote = $state('');
 
 	async function connect(cluster: DbxCluster) {
 		if (busy) return;
@@ -574,6 +610,53 @@
 			onSessionChange?.();
 		} catch (err) {
 			connectError = toDbxError(err);
+		} finally {
+			busy = '';
+		}
+	}
+
+	/**
+	 * Sign out of Databricks - the deliberate sibling of `disconnect`, not a louder
+	 * version of it. Disconnect ends the Spark session and leaves you
+	 * authenticated; this ALSO drops Cellar's own cached sign-in, so the next
+	 * connect has to authenticate again.
+	 *
+	 * The server decides what is Cellar's to clear: only the token Cellar's own
+	 * browser sign-in minted. A PAT in `~/.databrickscfg`, an OS keyring entry, the
+	 * databricks CLI's own token cache - those are the user's, and the note below
+	 * says so rather than implying a purge that never happened.
+	 */
+	async function logoutDatabricks() {
+		if (busy) return;
+		busy = 'logout';
+		logoutError = null;
+		logoutNote = '';
+		connectError = null;
+		reconnectError = null;
+		reconnectNote = '';
+		try {
+			const res = await fetch('/api/databricks/logout', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ ...selectionParams(), path: notebookPath ?? undefined })
+			});
+			const body = await res.json();
+			if (!res.ok) throw body;
+			const out = body as DbxLogout;
+			// Back to the signed-out state: forget the in-session sign-in flag and the
+			// cluster list it unlocked, so the picker re-gates behind "Sign in".
+			switching = false;
+			resetSelection();
+			resetBrowser();
+			await loadStatus();
+			onSessionChange?.();
+			logoutNote = out.clearedTokens
+				? "Signed out. Cellar's saved Databricks sign-in was cleared - the next connect signs in again."
+				: out.externalSkipped
+					? "Signed out of Cellar. This profile's credentials live in ~/.databrickscfg or the databricks CLI, so they were left untouched."
+					: 'Signed out.';
+		} catch (err) {
+			logoutError = toDbxError(err);
 		} finally {
 			busy = '';
 		}
@@ -829,6 +912,35 @@
 	{#if reconnectError}{@render errorBox(reconnectError, 'databricks-reconnect-error')}{/if}
 {/snippet}
 
+<!-- Sign out of Databricks. Deliberately QUIETER than Disconnect: Disconnect is the
+     everyday outlined action that ends the session, this is the rarer one that also
+     drops the saved sign-in. Shown whenever there is a sign-in to clear, and always
+     while connected (where it ends the session too). -->
+{#snippet logoutRow(always: boolean)}
+	{#if always || cellarSignedIn}
+		<div class="mt-1.5 flex justify-end">
+			<button
+				class="btn btn-ghost btn-xs h-5 min-h-0 px-1 text-[11px] font-normal text-base-content/50 hover:text-error"
+				onclick={logoutDatabricks}
+				disabled={!!busy || runtimeApplying}
+				title="Sign out of Databricks - clears the saved sign-in; you'll need to sign in again"
+				data-testid="databricks-logout"
+			>
+				{#if busy === 'logout'}<span class="loading loading-spinner loading-xs"></span>Signing out…{:else}Log out{/if}
+			</button>
+		</div>
+	{/if}
+	<!-- The outcome is NOT gated on the button still being shown: a successful log out
+	     is exactly what makes `cellarSignedIn` false, and the confirmation has to
+	     survive that (and the card swap it triggers). -->
+	{#if logoutNote}
+		<!-- One notch stronger than the surrounding hint copy (/50): this is feedback
+		     on an action just taken, and it lands in a card full of static hints. -->
+		<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/70" data-testid="databricks-logout-note">{logoutNote}</p>
+	{/if}
+	{#if logoutError}{@render errorBox(logoutError, 'databricks-logout-error')}{/if}
+{/snippet}
+
 {#snippet cardLabel(text: string)}
 	<span class="text-[10px] font-semibold uppercase tracking-wide text-base-content/40">{text}</span>
 {/snippet}
@@ -896,7 +1008,7 @@
 		>
 			{#if busy === 'login'}<span class="loading loading-spinner loading-xs"></span>Opening browser…{:else}Sign in with Databricks{/if}
 		</button>
-		{@render hint('Opens your browser to authenticate with Databricks (OAuth). No access token required, and Cellar stores nothing.')}
+		{@render hint('Opens your browser to authenticate with Databricks (OAuth). No access token required. The sign-in is cached locally by the Databricks SDK - use Log out to clear it.')}
 		{#if authError}{@render errorBox(authError, 'databricks-auth-error')}{/if}
 	{:else if haveSelection}
 		<div class="mt-2 flex items-center justify-between">
@@ -1209,6 +1321,7 @@
 							{#if busy === 'disconnect'}<span class="loading loading-spinner loading-xs"></span>{:else}Disconnect{/if}
 						</button>
 					</div>
+					{@render logoutRow(true)}
 					{#if switching}
 						<div class="mt-2 border-t border-base-300 pt-2">
 							{@render picker()}
@@ -1235,6 +1348,7 @@
 					{@render reconnectButton()}
 					<div class="mt-2 border-t border-warning/20 pt-2">
 						{@render picker()}
+						{@render logoutRow(false)}
 					</div>
 				</div>
 			{:else if connection.lost}
@@ -1251,6 +1365,7 @@
 					{@render reconnectButton()}
 					<div class="mt-2 border-t border-warning/20 pt-2">
 						{@render picker()}
+						{@render logoutRow(false)}
 					</div>
 				</div>
 			{:else}
@@ -1259,6 +1374,7 @@
 					{@render cardLabel('cluster')}
 					<div class="mt-1.5">
 						{@render picker()}
+						{@render logoutRow(false)}
 					</div>
 				</div>
 			{/if}
