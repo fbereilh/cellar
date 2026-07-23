@@ -45,15 +45,53 @@ function makeNotebook(n: number): TCell[] {
 	return cells;
 }
 
+/** One timed pass: type `query` a char at a time, running a search per prefix. */
+function keystrokePass(query: string, run: (prefix: string) => void): number {
+	const start = performance.now();
+	for (let k = 1; k <= query.length; k++) run(query.slice(0, k));
+	return performance.now() - start;
+}
+
 /** Time typing `query` one char at a time (a search per prefix), best-of-`runs`. */
 function bestKeystrokeTime(query: string, run: (prefix: string) => void, runs: number): number {
 	let best = Infinity;
-	for (let r = 0; r < runs; r++) {
-		const start = performance.now();
-		for (let k = 1; k <= query.length; k++) run(query.slice(0, k));
-		best = Math.min(best, performance.now() - start);
-	}
+	for (let r = 0; r < runs; r++) best = Math.min(best, keystrokePass(query, run));
 	return best;
+}
+
+/**
+ * Best-of-`runs` for TWO variants, measured ROUND-ROBIN rather than one after the
+ * other.
+ *
+ * Timing all of A and then all of B lets a scheduling hiccup land entirely inside
+ * one phase and permanently bias the comparison, because best-of only rescues a
+ * phase that contains at least one quiet round. That is exactly how this test
+ * flaked on a contended CI runner: both figures came back ~4x their idle value and
+ * the ORDER inverted (cached 31.7ms vs cold 24.0ms, against a stable ~0.70 ratio on
+ * an idle machine), so the assertion failed on runner noise rather than on anything
+ * the engine did. Interleaving makes both variants sample the same noise window, so
+ * a quiet moment is available to each and a busy one penalizes neither alone.
+ */
+function bestPairedKeystrokeTimes(
+	query: string,
+	a: (prefix: string) => void,
+	b: (prefix: string) => void,
+	runs: number
+): { a: number; b: number } {
+	let bestA = Infinity;
+	let bestB = Infinity;
+	for (let r = 0; r < runs; r++) {
+		// Alternate which variant goes first, so neither systematically pays for the
+		// other's cache/JIT warmth within a round.
+		if (r % 2 === 0) {
+			bestA = Math.min(bestA, keystrokePass(query, a));
+			bestB = Math.min(bestB, keystrokePass(query, b));
+		} else {
+			bestB = Math.min(bestB, keystrokePass(query, b));
+			bestA = Math.min(bestA, keystrokePass(query, a));
+		}
+	}
+	return { a: bestA, b: bestB };
 }
 
 describe('search keystroke latency (N=300)', () => {
@@ -117,9 +155,15 @@ describe('search keystroke latency (N=300)', () => {
 		const warm = createSearchCache();
 		for (let k = 1; k <= query.length; k++) searchNotebook(cells, query.slice(0, k), DEFAULT_SEARCH_OPTS, warm);
 
-		const cached = bestKeystrokeTime(query, (p) => searchNotebook(cells, p, DEFAULT_SEARCH_OPTS, warm), 15);
+		// Measured round-robin, not one phase after the other: see
+		// `bestPairedKeystrokeTimes` for why sequential phases made this flaky on CI.
 		// Cold: a fresh cache each keystroke forces the source to be re-lowercased.
-		const cold = bestKeystrokeTime(query, (p) => searchNotebook(cells, p, DEFAULT_SEARCH_OPTS, createSearchCache()), 15);
+		const { a: cached, b: cold } = bestPairedKeystrokeTimes(
+			query,
+			(p) => searchNotebook(cells, p, DEFAULT_SEARCH_OPTS, warm),
+			(p) => searchNotebook(cells, p, DEFAULT_SEARCH_OPTS, createSearchCache()),
+			15
+		);
 
 		// eslint-disable-next-line no-console
 		console.log(`[search-perf N=300] cached=${cached.toFixed(3)}ms cold=${cold.toFixed(3)}ms`);
