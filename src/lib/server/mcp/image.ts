@@ -17,12 +17,15 @@
  *     tool that ships images (run_cell / add_and_run / get_full_output) goes
  *     through it, so the cost bound cannot drift between them. Anything it
  *     declines is reported in `omitted` WITH a reason, never dropped silently.
- *     The count cap is the one knob that differs by caller: it bounds the
+ *     The count cap is the one knob that differs by caller: four bound the
  *     AUTOMATIC result of a run, where the agent did not ask for figures and the
  *     token bill is unbudgeted, while `get_full_output(id)` — an explicit,
- *     per-cell request for exactly this — passes `limit: Infinity` and returns
- *     every image on the cell. That is what makes the `limit` omission note's
- *     route a real one rather than a promise nothing keeps.
+ *     per-cell request for exactly this - ships up to
+ *     MAX_FULL_OUTPUT_IMAGE_BLOCKS. Both stay FINITE (each image is a synchronous
+ *     decode + resample on the shared event loop), so the bounds are made
+ *     capability-free by the route rather than by being lifted: every omission
+ *     names `get_full_output(id, images_from: <output_index>)`, which resumes at
+ *     exactly the figure that did not fit.
  *
  *  3. `imagePlaceholder` builds the terse, image-token-free marker the scan read
  *     paths (map / read / search) show instead of the raster:
@@ -46,14 +49,24 @@ import { PNG } from 'pngjs';
 /** Longest-edge cap (px) for a downscaled image on the default read path. */
 export const IMG_MAX_EDGE = 768;
 
-/** Decoded byte length of a base64 payload (no allocation). */
+/**
+ * Decoded byte length of a base64 payload, counted in place. nbformat stores a
+ * raster as a multiline string, so the whitespace has to be discounted - but a
+ * `replace(/\s+/g,'')` would copy the whole multi-megabyte payload just to count
+ * it, and this runs several times per image per result. A char scan allocates
+ * nothing.
+ */
 export function base64Bytes(b64: string): number {
-	const s = b64.replace(/\s+/g, '');
-	if (!s) return 0;
+	let chars = 0;
 	let pad = 0;
-	if (s.endsWith('==')) pad = 2;
-	else if (s.endsWith('=')) pad = 1;
-	return Math.floor((s.length * 3) / 4) - pad;
+	for (let i = 0; i < b64.length; i++) {
+		const c = b64.charCodeAt(i);
+		if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) continue;
+		chars++;
+		if (c === 0x3d) pad++; // '=' - padding, which base64 only carries at the end
+	}
+	if (!chars) return 0;
+	return Math.floor((chars * 3) / 4) - Math.min(pad, 2);
 }
 
 /** Human byte size: `46 KB`, `1.2 MB`, `812 B`. */
@@ -63,22 +76,48 @@ export function formatBytes(n: number): string {
 	return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Pixel dimensions read off an image header, or null when it will not parse. */
+export type ImageDims = { width: number; height: number } | null;
+
 /**
- * Read pixel dimensions from an image header WITHOUT a full decode — cheap enough
- * to run on every read-path placeholder. Handles PNG / JPEG / GIF; returns null
- * for anything else (or a truncated/corrupt header), which just omits dimensions
- * from the placeholder.
+ * How much of the base64 payload is decoded to read a header. PNG's IHDR and
+ * GIF's logical screen descriptor live in the first ~24 bytes; JPEG's SOF sits
+ * after the APPn segments, and one EXIF/thumbnail segment runs to 64 KB, so it
+ * gets a larger (still bounded) window. Past the window the dimensions are simply
+ * unknown, which every caller already handles.
  */
-export function imageDimensions(mime: string, b64: string): { width: number; height: number } | null {
-	let buf: Buffer;
+const HEADER_B64_CHARS = 4096;
+const JPEG_HEADER_B64_CHARS = 262_144;
+
+/** Decode only the leading `chars` of a base64 payload (a partial trailing group is dropped). */
+function headerBuffer(b64: string, chars: number): Buffer | null {
 	try {
-		buf = Buffer.from(b64, 'base64');
+		return Buffer.from(b64.length > chars ? b64.slice(0, chars) : b64, 'base64');
 	} catch {
 		return null;
 	}
-	if (mime === 'image/png') return pngDimensions(buf);
-	if (mime === 'image/jpeg' || mime === 'image/jpg') return jpegDimensions(buf);
-	if (mime === 'image/gif') return gifDimensions(buf);
+}
+
+/**
+ * Read pixel dimensions from an image header - genuinely header-only: it decodes
+ * a bounded PREFIX of the base64, never the whole raster (that would allocate
+ * megabytes to read 24 bytes, on a path that runs for every image of every
+ * result). Handles PNG / JPEG / GIF; returns null for anything else (or a
+ * truncated/corrupt header), which just omits dimensions from the placeholder.
+ */
+export function imageDimensions(mime: string, b64: string): ImageDims {
+	if (mime === 'image/png') {
+		const buf = headerBuffer(b64, HEADER_B64_CHARS);
+		return buf ? pngDimensions(buf) : null;
+	}
+	if (mime === 'image/jpeg' || mime === 'image/jpg') {
+		const buf = headerBuffer(b64, JPEG_HEADER_B64_CHARS);
+		return buf ? jpegDimensions(buf) : null;
+	}
+	if (mime === 'image/gif') {
+		const buf = headerBuffer(b64, HEADER_B64_CHARS);
+		return buf ? gifDimensions(buf) : null;
+	}
 	return null;
 }
 
@@ -149,13 +188,13 @@ export interface ScaledImage {
  * threshold (or any non-PNG, or anything that fails to decode) is returned
  * byte-for-byte untouched with `resized:false`.
  */
-export function downscaleImageForBlock(mime: string, b64: string, maxEdge = IMG_MAX_EDGE): ScaledImage {
+export function downscaleImageForBlock(mime: string, b64: string, maxEdge = IMG_MAX_EDGE, dim?: ImageDims): ScaledImage {
 	if (mime !== 'image/png') return { data: b64, resized: false };
 	// Refuse to decode a raster past the pixel bound (see `exceedsDecodeBound`):
 	// pngjs allocates the whole RGBA buffer up front, and no try/catch survives an
 	// OOM. Declining to shrink is the module's standard safe direction, and the
 	// caller's host-limit check then omits it with a reason.
-	if (exceedsDecodeBound(mime, b64)) return { data: b64, resized: false };
+	if (exceedsDecodeBound(mime, b64, dim)) return { data: b64, resized: false };
 	try {
 		const src = PNG.sync.read(Buffer.from(b64, 'base64'));
 		const { width: sw, height: sh } = src;
@@ -220,10 +259,44 @@ export function blockMime(mime: string): string {
  * result is a five-figure token bill from a single `add_and_run` the agent never
  * asked to pay. Four covers the real cases (one figure, or a small subplot
  * series) and the rest are reported in `images_omitted` — bounded, never silently
- * truncated, and reachable in full because `get_full_output(id)` is EXPLICIT and
- * therefore runs uncapped (`limit: Infinity`).
+ * truncated, and reachable because `get_full_output(id)` is EXPLICIT and so runs
+ * against the far larger `MAX_FULL_OUTPUT_IMAGE_BLOCKS`, from any starting output
+ * (`images_from`).
  */
 export const MAX_IMAGE_BLOCKS = 4;
+
+/**
+ * How many image blocks ONE EXPLICIT `get_full_output(id)` may carry. Much larger
+ * than the automatic cap - this call IS the agent asking for this cell's figures,
+ * so the ones past a run result's four have to be reachable here, or that result's
+ * omission note is a promise nothing keeps.
+ *
+ * It is nonetheless FINITE, and that is the point. Every image over `IMG_MAX_EDGE`
+ * is a synchronous decode + resample + re-encode on the shared event loop that also
+ * streams SSE frames and services every other kernel and MCP session, so an
+ * unbounded pass over a cell that plotted in a loop (30-50 figures is ordinary in
+ * data work) would stall the whole process for seconds and, on `size:'full'`,
+ * return tens of megabytes. Past this bound - or past either aggregate budget
+ * below, whichever binds first - the remainder is reported in `images_omitted`
+ * naming `images_from`, so paging through a hundred-figure cell costs several
+ * calls but loses no capability.
+ */
+export const MAX_FULL_OUTPUT_IMAGE_BLOCKS = 20;
+
+/**
+ * Total decoded bytes of the rasters ONE result may ship, across all its images.
+ * The per-image ceiling bounds one raster; nothing else bounds N of them, and on
+ * `size:'full'` twenty images at that ceiling would be a 70 MB reply.
+ */
+export const IMAGE_RESULT_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Total SOURCE pixels one result may hand to the decoder, across all its images -
+ * the CPU sibling of the byte budget, since decode+resize cost scales with w×h
+ * while the downscaled output's size says nothing about what it cost to produce.
+ * ~40 MP is roughly twenty 1600×1200 figures.
+ */
+export const MAX_RESULT_DECODE_PIXELS = 40_000_000;
 
 /**
  * Decoded-byte ceiling for one image block. Hosts cap an inline image (~5 MB is
@@ -266,9 +339,10 @@ export const MAX_DECODE_PIXELS = 32_000_000;
  * Whether a raster is too big to safely hand to the decoder. Header-only, so it
  * costs nothing; an unparseable header is NOT treated as oversized (the decode
  * then fails cheaply on its own and the fallback returns the original untouched).
+ * `dim` lets a caller that has already read the header pass it in rather than
+ * re-parsing it.
  */
-export function exceedsDecodeBound(mime: string, b64: string): boolean {
-	const dim = imageDimensions(mime, b64);
+export function exceedsDecodeBound(mime: string, b64: string, dim: ImageDims = imageDimensions(mime, b64)): boolean {
 	if (!dim) return false;
 	return dim.width * dim.height > MAX_DECODE_PIXELS;
 }
@@ -297,7 +371,7 @@ export interface ImageBlockPayload {
 export interface OmittedImage {
 	output_index: number;
 	mime: string;
-	reason: 'unsupported_mime' | 'limit' | 'too_large';
+	reason: 'unsupported_mime' | 'limit' | 'too_large' | 'budget';
 	note: string;
 }
 
@@ -307,8 +381,16 @@ export interface ImageBlocks {
 }
 
 const FETCH_FULL = "get_full_output(id, size:'full') returns the original bytes";
-/** The route named by the `limit` omission — and it is a real one: see MAX_IMAGE_BLOCKS. */
-const FETCH_ALL = 'get_full_output(id) returns every image on this cell (that call is not capped)';
+/**
+ * The route named by the `limit` / `budget` omissions - and it is a real one:
+ * `get_full_output` ships up to MAX_FULL_OUTPUT_IMAGE_BLOCKS per call and takes an
+ * `images_from` output_index, so however many figures a cell carries, every one of
+ * them is reachable by starting there. Naming the very output that was declined is
+ * what keeps the note honest on BOTH callers: on a run result it pages past the
+ * four inline images, and on `get_full_output` itself it pages past this call's
+ * own bound.
+ */
+const resumeAt = (output_index: number) => `get_full_output(id, images_from: ${output_index}) returns the rest, starting from this one`;
 
 /**
  * Decide which of a cell's image outputs become MCP image blocks, and at what
@@ -320,30 +402,74 @@ const FETCH_ALL = 'get_full_output(id) returns every image on this cell (that ca
  * about token thrift: an oversized original is downscaled to fit (with a note
  * saying so) rather than shipped as a block the host would reject.
  *
- * `limit` is the caller's token budget, not a capability bound: the run path
- * takes the MAX_IMAGE_BLOCKS default, `get_full_output` passes Infinity.
+ * Three bounds, all of them finite and none of them a capability bound, because
+ * `images_from` pages past every one of them:
+ *  - `limit`, the caller's token budget (MAX_IMAGE_BLOCKS for an automatic run
+ *    result, MAX_FULL_OUTPUT_IMAGE_BLOCKS for an explicit get_full_output),
+ *  - `maxTotalBytes`, how much raster one reply may carry in total,
+ *  - `maxDecodePixels`, how much decode+resample CPU one reply may spend on the
+ *    shared event loop.
  */
 export function buildImageBlocks(
 	items: ImageOutputRef[],
-	{ full = false, maxEdge = IMG_MAX_EDGE, limit = MAX_IMAGE_BLOCKS, maxBytes = IMAGE_BLOCK_MAX_BYTES }: { full?: boolean; maxEdge?: number; limit?: number; maxBytes?: number } = {}
+	{
+		full = false,
+		maxEdge = IMG_MAX_EDGE,
+		limit = MAX_IMAGE_BLOCKS,
+		maxBytes = IMAGE_BLOCK_MAX_BYTES,
+		maxTotalBytes = IMAGE_RESULT_MAX_BYTES,
+		maxDecodePixels = MAX_RESULT_DECODE_PIXELS
+	}: { full?: boolean; maxEdge?: number; limit?: number; maxBytes?: number; maxTotalBytes?: number; maxDecodePixels?: number } = {}
 ): ImageBlocks {
 	const images: ImageBlockPayload[] = [];
 	const omitted: OmittedImage[] = [];
+	let spentBytes = 0;
+	let spentPixels = 0;
 	for (const item of items) {
 		const { output_index, mime, b64 } = item;
-		if (!INLINE_IMAGE_MIMES.includes(mime)) {
+		if (!isInlinableImageMime(mime)) {
 			omitted.push({ output_index, mime, reason: 'unsupported_mime', note: `${mime} cannot be shown as an image; read the output text instead` });
 			continue;
 		}
 		if (images.length >= limit) {
-			omitted.push({ output_index, mime, reason: 'limit', note: `only the first ${limit} images ride in a run result; ${FETCH_ALL}` });
+			omitted.push({ output_index, mime, reason: 'limit', note: `this result carries at most ${limit} images; ${resumeAt(output_index)}` });
 			continue;
 		}
-		const block = fitImageBlock(output_index, mime, b64, full, maxEdge, maxBytes);
-		if (block) images.push(block);
-		else omitted.push({ output_index, mime, reason: 'too_large', note: 'image too large to send as an image block; its size is in the outputs placeholder' });
+		const dim = imageDimensions(mime, b64);
+		if (exceedsDecodeBound(mime, b64, dim)) {
+			omitted.push({ output_index, mime, reason: 'too_large', note: TOO_LARGE_NOTE });
+			continue;
+		}
+		// Charge the decode budget BEFORE decoding, and charge it even if the block is
+		// then declined on bytes - the CPU is spent either way, and that is what this
+		// budget bounds.
+		const pixels = willDecode(full, mime, dim, maxEdge) ? dim!.width * dim!.height : 0;
+		if (pixels && spentPixels + pixels > maxDecodePixels) {
+			omitted.push({ output_index, mime, reason: 'budget', note: `this result's image budget is spent; ${resumeAt(output_index)}` });
+			continue;
+		}
+		spentPixels += pixels;
+		const block = fitImageBlock(output_index, mime, b64, full, maxEdge, maxBytes, dim);
+		if (!block) {
+			omitted.push({ output_index, mime, reason: 'too_large', note: TOO_LARGE_NOTE });
+			continue;
+		}
+		const bytes = base64Bytes(block.data);
+		if (spentBytes + bytes > maxTotalBytes) {
+			omitted.push({ output_index, mime, reason: 'budget', note: `this result's image budget is spent; ${resumeAt(output_index)}` });
+			continue;
+		}
+		spentBytes += bytes;
+		images.push(block);
 	}
 	return { images, omitted };
+}
+
+const TOO_LARGE_NOTE = 'image too large to send as an image block; its size is in the outputs placeholder';
+
+/** Whether shipping this image will cost a full decode (only an oversized PNG is resampled). */
+function willDecode(full: boolean, mime: string, dim: ImageDims, maxEdge: number): boolean {
+	return !full && mime === 'image/png' && !!dim && Math.max(dim.width, dim.height) > maxEdge;
 }
 
 /**
@@ -353,11 +479,12 @@ export function buildImageBlocks(
  * cannot resample). Never returns a payload we know the host would reject.
  *
  * The pixel bound is checked FIRST, before any decode: a raster past it is
- * declined outright rather than handed to pngjs (see `MAX_DECODE_PIXELS`).
+ * declined outright rather than handed to pngjs (see `MAX_DECODE_PIXELS`). `dim`
+ * is the caller's already-parsed header, threaded through so no path re-reads it.
  */
-function fitImageBlock(output_index: number, mime: string, b64: string, full: boolean, maxEdge: number, maxBytes: number): ImageBlockPayload | null {
-	if (exceedsDecodeBound(mime, b64)) return null;
-	const scaled = full ? { data: b64, resized: false as const } : downscaleImageForBlock(mime, b64, maxEdge);
+function fitImageBlock(output_index: number, mime: string, b64: string, full: boolean, maxEdge: number, maxBytes: number, dim: ImageDims = imageDimensions(mime, b64)): ImageBlockPayload | null {
+	if (exceedsDecodeBound(mime, b64, dim)) return null;
+	const scaled = full ? { data: b64, resized: false as const } : downscaleImageForBlock(mime, b64, maxEdge, dim);
 	const build = (s: ScaledImage, note?: string): ImageBlockPayload => ({
 		output_index,
 		mime: blockMime(mime),
@@ -365,20 +492,24 @@ function fitImageBlock(output_index: number, mime: string, b64: string, full: bo
 		...(s.width != null ? { width: s.width, height: s.height } : {}),
 		...(s.resized ? { downscaled: { from: `${s.width}×${s.height}`, to: `${s.scaledWidth}×${s.scaledHeight}`, ...(note ? { note } : { note: FETCH_FULL }) } } : {})
 	});
-	if (withinHostLimits(mime, scaled.data, maxBytes)) return build(scaled);
+	if (withinHostLimits(scaled.data, maxBytes, emittedDims(scaled, dim))) return build(scaled);
 	// Over a host ceiling. A routine (already downscaled) image that still does not
 	// fit is beyond what we can do; a `full` one gets the ordinary downscale as a
 	// fallback, so "I asked for full res" degrades to a smaller figure, not to none.
 	if (!full) return null;
-	const retry = downscaleImageForBlock(mime, b64, maxEdge);
-	if (retry.resized && withinHostLimits(mime, retry.data, maxBytes)) return build(retry, 'the original exceeds the inline image size limit, so a downscaled copy is shown');
+	const retry = downscaleImageForBlock(mime, b64, maxEdge, dim);
+	if (retry.resized && withinHostLimits(retry.data, maxBytes, emittedDims(retry, dim))) return build(retry, 'the original exceeds the inline image size limit, so a downscaled copy is shown');
 	return null;
 }
 
+/** The dimensions of the raster actually EMITTED - the resampled ones when we resized. */
+function emittedDims(s: ScaledImage, original: ImageDims): ImageDims {
+	return s.resized ? { width: s.scaledWidth!, height: s.scaledHeight! } : original;
+}
+
 /** Whether a raster is small enough (bytes AND pixels) for a host to accept it. */
-function withinHostLimits(mime: string, b64: string, maxBytes: number): boolean {
+function withinHostLimits(b64: string, maxBytes: number, dim: ImageDims): boolean {
 	if (base64Bytes(b64) > maxBytes) return false;
-	const dim = imageDimensions(mime, b64);
 	return !dim || Math.max(dim.width, dim.height) <= MAX_IMAGE_EDGE_HARD;
 }
 
@@ -396,10 +527,10 @@ function withinHostLimits(mime: string, b64: string, maxBytes: number): boolean 
  */
 export function canInlineImage(mime: string, b64: string, maxEdge = IMG_MAX_EDGE, maxBytes = IMAGE_BLOCK_MAX_BYTES): boolean {
 	if (!isInlinableImageMime(mime)) return false;
-	if (exceedsDecodeBound(mime, b64)) return false;
 	const dim = imageDimensions(mime, b64);
+	if (exceedsDecodeBound(mime, b64, dim)) return false;
 	if (mime === 'image/png' && dim && Math.max(dim.width, dim.height) > maxEdge) return true;
-	return withinHostLimits(mime, b64, maxBytes);
+	return withinHostLimits(b64, maxBytes, dim);
 }
 
 /**

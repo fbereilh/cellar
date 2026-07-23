@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PNG } from 'pngjs';
-import { IMG_MAX_EDGE, MAX_IMAGE_BLOCKS } from '../../src/lib/server/mcp/image';
+import { IMG_MAX_EDGE, MAX_FULL_OUTPUT_IMAGE_BLOCKS, MAX_IMAGE_BLOCKS } from '../../src/lib/server/mcp/image';
 
 /**
  * Token diet: downscale high-DPI plot images on the DEFAULT read path.
@@ -40,6 +40,32 @@ const dimsOf = (b64: string) => {
 	const p = PNG.sync.read(Buffer.from(b64, 'base64'));
 	return { width: p.width, height: p.height };
 };
+
+/**
+ * A JPEG whose SOF0 sits behind `padSegments` maximum-size APPn segments - the
+ * knob for pushing the frame header past the bounded read window (each segment is
+ * ~64 KB, an EXIF/thumbnail block's real size).
+ */
+function jpegWithPaddedHeader(padSegments: number, w: number, h: number): string {
+	const SEG = 65533;
+	const parts: Buffer[] = [Buffer.from([0xff, 0xd8])];
+	for (let i = 0; i < padSegments; i++) {
+		const seg = Buffer.alloc(2 + SEG);
+		seg[0] = 0xff;
+		seg[1] = 0xe1; // APP1
+		seg.writeUInt16BE(SEG, 2);
+		parts.push(seg);
+	}
+	const sof = Buffer.alloc(11);
+	sof[0] = 0xff;
+	sof[1] = 0xc0; // SOF0
+	sof.writeUInt16BE(9, 2);
+	sof[4] = 8; // precision
+	sof.writeUInt16BE(h, 5);
+	sof.writeUInt16BE(w, 7);
+	parts.push(sof);
+	return Buffer.concat(parts).toString('base64');
+}
 
 describe('image module', () => {
 	let img: typeof import('../../src/lib/server/mcp/image');
@@ -122,6 +148,29 @@ describe('image module', () => {
 
 	it('reads PNG dimensions from the header', () => {
 		expect(img.imageDimensions('image/png', makePngB64(320, 240))).toEqual({ width: 320, height: 240 });
+	});
+
+	it('reads dimensions from a bounded PREFIX, never by decoding the whole raster', () => {
+		// The header check runs for every image of every result, so decoding megabytes
+		// to read a 24-byte header is the cost this avoids. A PNG truncated to its
+		// first few hundred base64 chars still yields its dimensions: the prefix is all
+		// that is consulted.
+		const b64 = makePngB64(1600, 1200);
+		expect(img.imageDimensions('image/png', b64.slice(0, 200))).toEqual({ width: 1600, height: 1200 });
+
+		// And the window is genuinely BOUNDED, not merely sufficient - JPEG is the case
+		// that can prove it, since its SOF sits after however many APPn segments the
+		// encoder wrote. Inside the window the dimensions are found; a SOF pushed past
+		// it reads as unknown (the same graceful degrade as any unparseable header)
+		// rather than dragging the whole payload through the decoder.
+		expect(img.imageDimensions('image/jpeg', jpegWithPaddedHeader(2, 800, 600))).toEqual({ width: 800, height: 600 });
+		expect(img.imageDimensions('image/jpeg', jpegWithPaddedHeader(6, 800, 600))).toBeNull();
+
+		// nbformat stores a raster as lines, so the payload can arrive with newlines in
+		// it; the prefix decode and the byte count must both discount them.
+		const wrapped = (b64.match(/.{1,76}/g) || []).join('\n');
+		expect(img.imageDimensions('image/png', wrapped)).toEqual({ width: 1600, height: 1200 });
+		expect(img.base64Bytes(wrapped)).toBe(img.base64Bytes(b64));
 	});
 
 	it('builds an enriched placeholder with mime + dimensions + bytes', () => {
@@ -222,11 +271,64 @@ describe('get_full_output default-vs-full image contract', () => {
 			nb
 		);
 
-		// This is the route the run path's `limit` omission names; capping it here
-		// would leave the 5th figure unreachable by any tool.
+		// This is the route the run path's `limit` omission names; stopping at four
+		// here would leave the 5th figure unreachable by any tool.
 		const res = svc.getFullOutput(id, 'medium', nb)!;
 		expect(res.images).toHaveLength(COUNT);
 		expect(res.images!.map((i) => i.output_index)).toEqual([...Array(COUNT).keys()]);
 		expect(res.images_omitted).toBeUndefined();
+	});
+
+	it('pages past its own bound with images_from, so a figure is never unreachable', async () => {
+		// The explicit path is larger than a run result's but still FINITE (each image
+		// costs a synchronous decode+resample on the shared event loop). What that
+		// bound leaves out has to be fetchable, or the omission note is a promise
+		// nothing keeps.
+		const NB = 'loop-plots.ipynb';
+		svc.useNotebook('imgSessPaged', NB);
+		const nb = nbmod.resolveNotebookPath(NB);
+		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'for i in range(n): plot(i)' }], null, { nb, routeImports: false });
+		const id = svc.resolveRef(nb, ids[0]);
+
+		const COUNT = MAX_FULL_OUTPUT_IMAGE_BLOCKS + 2;
+		nbmod.setOutputs(
+			id,
+			Array.from({ length: COUNT }, () => ({ output_type: 'display_data', data: { 'image/png': makePngB64(40, 30) }, metadata: {} })),
+			nb
+		);
+
+		const first = svc.getFullOutput(id, 'medium', nb)!;
+		expect(first.images).toHaveLength(MAX_FULL_OUTPUT_IMAGE_BLOCKS);
+		expect(first.images_omitted).toHaveLength(2);
+		expect(first.images_omitted![0].note).toMatch(new RegExp(`images_from: ${MAX_FULL_OUTPUT_IMAGE_BLOCKS}`));
+
+		// Following that note really does return the ones that did not fit.
+		const rest = svc.getFullOutput(id, 'medium', nb, MAX_FULL_OUTPUT_IMAGE_BLOCKS)!;
+		expect(rest.images!.map((i) => i.output_index)).toEqual([MAX_FULL_OUTPUT_IMAGE_BLOCKS, MAX_FULL_OUTPUT_IMAGE_BLOCKS + 1]);
+		expect(rest.images_omitted).toBeUndefined();
+	});
+
+	it('joins a multiline (string[]) raster instead of comma-joining it into corrupt base64', async () => {
+		// nbformat stores an image as an ARRAY of lines, and deserialize copies outputs
+		// through verbatim - so an externally-authored .ipynb reaches here as string[].
+		// String(['ab','cd']) is 'ab,cd': base64 with commas in it, which a strict host
+		// validator rejects, failing the ENTIRE tool result.
+		const NB = 'multiline-image.ipynb';
+		svc.useNotebook('imgSessLines', NB);
+		const nb = nbmod.resolveNotebookPath(NB);
+		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'fig' }], null, { nb, routeImports: false });
+		const id = svc.resolveRef(nb, ids[0]);
+
+		const b64 = makePngB64(320, 240);
+		const lines = b64.match(/.{1,64}/g)!;
+		nbmod.setOutputs(id, [{ output_type: 'display_data', data: { 'image/png': lines }, metadata: {} }], nb);
+
+		const res = svc.getFullOutput(id, 'full', nb)!;
+		expect(res.images![0].data).toBe(b64);
+		expect(res.images![0].data).not.toContain(',');
+		expect(dimsOf(res.images![0].data)).toEqual({ width: 320, height: 240 });
+		// The placeholder is built from the same joined payload, so its size and
+		// dimensions describe the real raster rather than a comma-joined string.
+		expect((res.outputs[0] as { text?: string }).text).toMatch(/^\[image\/png, 320×240, /);
 	});
 });

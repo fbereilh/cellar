@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { PNG } from 'pngjs';
-import { base64Bytes, buildImageBlocks, canInlineImage, IMG_MAX_EDGE, MAX_DECODE_PIXELS, MAX_IMAGE_BLOCKS, MAX_IMAGE_EDGE_HARD } from '../../src/lib/server/mcp/image';
+import { base64Bytes, buildImageBlocks, canInlineImage, IMG_MAX_EDGE, MAX_DECODE_PIXELS, MAX_FULL_OUTPUT_IMAGE_BLOCKS, MAX_IMAGE_BLOCKS, MAX_IMAGE_EDGE_HARD } from '../../src/lib/server/mcp/image';
 import type { ImageOutputRef } from '../../src/lib/server/mcp/image';
 import { textWithImages } from '../../src/lib/server/mcp/server';
 
@@ -114,19 +114,60 @@ describe('image block policy', () => {
 		expect(images.map((i) => i.output_index)).toEqual([0, 1, 2, 3]);
 		expect(omitted).toHaveLength(3);
 		expect(omitted.every((o) => o.reason === 'limit')).toBe(true);
-		// The route to the ones that did not fit is named, so the cap costs no capability.
-		expect(omitted[0].note).toMatch(/get_full_output/);
+		// The route to the ones that did not fit is named AND resumable: it points at
+		// the very output that was declined, so the cap costs no capability.
+		expect(omitted[0].note).toMatch(/get_full_output\(id, images_from: 4\)/);
+		expect(omitted[1].note).toMatch(/images_from: 5/);
 	});
 
-	it('is UNCAPPED when the caller asked for this cell explicitly, so the limit note names a real route', () => {
-		// The cap bounds an AUTOMATIC run result, where the agent never asked to pay
-		// for figures. get_full_output(id) is the explicit per-cell request the
-		// omission note points at, so it passes limit:Infinity — otherwise a cell's
-		// 5th figure would be unreachable by ANY tool and the note would be a lie.
+	it('gives an EXPLICIT per-cell request a far larger cap, so the run result\'s omission note is a real route', () => {
+		// The 4-cap bounds an AUTOMATIC run result, where the agent never asked to pay
+		// for figures. get_full_output(id) is the explicit request the omission note
+		// points at, so it must reach well past the 5th figure.
 		const many = Array.from({ length: MAX_IMAGE_BLOCKS + 3 }, (_, i) => ref(i, 'image/png', makePngB64(60, 40, i)));
-		const { images, omitted } = buildImageBlocks(many, { limit: Infinity });
+		const { images, omitted } = buildImageBlocks(many, { limit: MAX_FULL_OUTPUT_IMAGE_BLOCKS });
 		expect(images).toHaveLength(MAX_IMAGE_BLOCKS + 3);
 		expect(omitted).toEqual([]);
+		expect(MAX_FULL_OUTPUT_IMAGE_BLOCKS).toBeGreaterThan(MAX_IMAGE_BLOCKS);
+	});
+
+	it('stays FINITE even there, and pages the remainder rather than stalling on a hundred-figure cell', () => {
+		// Uncapping this path would leave it with no aggregate bound at all: each image
+		// over IMG_MAX_EDGE is a synchronous decode + resample + re-encode on the same
+		// event loop that streams SSE frames and services every other kernel and MCP
+		// session, so a cell that plotted in a loop would stall the whole process.
+		const many = Array.from({ length: MAX_FULL_OUTPUT_IMAGE_BLOCKS + 2 }, (_, i) => ref(i, 'image/png', makePngB64(20, 20, i)));
+		const { images, omitted } = buildImageBlocks(many, { limit: MAX_FULL_OUTPUT_IMAGE_BLOCKS });
+		expect(images).toHaveLength(MAX_FULL_OUTPUT_IMAGE_BLOCKS);
+		expect(omitted.map((o) => o.output_index)).toEqual([MAX_FULL_OUTPUT_IMAGE_BLOCKS, MAX_FULL_OUTPUT_IMAGE_BLOCKS + 1]);
+		expect(omitted[0].note).toMatch(new RegExp(`images_from: ${MAX_FULL_OUTPUT_IMAGE_BLOCKS}`));
+	});
+
+	it('stops on the aggregate BYTE budget, reporting where to resume - one result never returns unbounded raster', () => {
+		const b64 = makePngB64(200, 150);
+		const bytes = base64Bytes(b64);
+		const many = Array.from({ length: 5 }, (_, i) => ref(i, 'image/png', b64));
+		// Room for two, not five.
+		const { images, omitted } = buildImageBlocks(many, { limit: 100, maxTotalBytes: bytes * 2 + 1 });
+		expect(images).toHaveLength(2);
+		expect(omitted).toHaveLength(3);
+		expect(omitted.every((o) => o.reason === 'budget')).toBe(true);
+		expect(omitted[0].note).toMatch(/get_full_output\(id, images_from: 2\)/);
+	});
+
+	it('stops on the aggregate DECODE budget - the CPU spent resampling is bounded per result, not just the bytes returned', () => {
+		// A downscaled output is small however big its source was, so a byte budget
+		// alone cannot bound the decode cost. This charges the SOURCE pixels.
+		const big = makePngB64(1000, 900); // 0.9 MP, over IMG_MAX_EDGE ⇒ really decoded
+		const many = Array.from({ length: 4 }, (_, i) => ref(i, 'image/png', big));
+		const { images, omitted } = buildImageBlocks(many, { limit: 100, maxDecodePixels: 1000 * 900 * 2 });
+		expect(images).toHaveLength(2);
+		expect(omitted.every((o) => o.reason === 'budget')).toBe(true);
+		expect(omitted[0].output_index).toBe(2);
+
+		// A small image costs no decode, so it is never charged against that budget.
+		const small = Array.from({ length: 4 }, (_, i) => ref(i, 'image/png', makePngB64(40, 30, i)));
+		expect(buildImageBlocks(small, { limit: 100, maxDecodePixels: 1 }).images).toHaveLength(4);
 	});
 
 	it('emits the REGISTERED jpeg mime for an `image/jpg` bundle key, which a host would otherwise reject', () => {

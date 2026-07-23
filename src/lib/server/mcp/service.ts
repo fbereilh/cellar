@@ -47,7 +47,7 @@ import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
-import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime } from './image';
+import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
 import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
@@ -403,7 +403,11 @@ function imageRefs(outputs: CellOutput[] | undefined): ImageOutputRef[] {
 	const refs: ImageOutputRef[] = [];
 	(outputs || []).forEach((o, output_index) => {
 		const mime = imageKey(o);
-		if (mime && 'data' in o) refs.push({ output_index, mime, b64: String(o.data[mime]) });
+		// asText, not String(): nbformat stores a raster as an ARRAY of lines, and
+		// String(['ab','cd']) comma-joins it into base64 a strict host validator
+		// rejects - which fails the ENTIRE tool result, the exact failure this
+		// module's allowlist and ceilings exist to prevent.
+		if (mime && 'data' in o) refs.push({ output_index, mime, b64: asText(o.data[mime]) });
 	});
 	return refs;
 }
@@ -433,7 +437,7 @@ function outputText(o: CellOutput): string {
 			// dimensions + bytes) even when a text/plain repr exists, so the agent
 			// knows an image is there and how big before fetching it with
 			// get_full_output. The text/plain repr of a figure is just `<Figure …>`.
-			if (img) return imagePlaceholder(img, String(d[img]));
+			if (img) return imagePlaceholder(img, asText(d[img]));
 			if (d['text/plain']) return asText(d['text/plain']);
 			return '[rich output]';
 		}
@@ -1041,21 +1045,26 @@ export function getErrors(nb?: string | null) {
  * Default (medium) downscales an oversized raster (a retina/high-DPI figure) to
  * IMG_MAX_EDGE, cutting image tokens ~3x; size:'full' passes the ORIGINAL bytes
  * through untouched, so an agent that needs pixel detail opts in and gets it.
+ *
+ * `imagesFrom` is the paging seam: this call is the route a run result's `limit`
+ * omission names, so the figures past the run's four must be reachable - but it
+ * still ships a BOUNDED batch (each image is a synchronous decode+resample on the
+ * shared event loop, and a cell that plotted in a loop can hold dozens), so what
+ * does not fit reports the output_index to resume from here.
  */
-export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium', nb?: string | null) {
+export function getFullOutput(id: string, size: 'medium' | 'full' = 'medium', nb?: string | null, imagesFrom?: number) {
 	const c = getCell(asFullId(nb, id), nb);
 	if (!c || isHidden(c)) return null;
 	const cap = size === 'full' ? Infinity : MEDIUM_CAP;
 	const outputs = summarizeOutputs(c, cap);
+	const refs = imageRefs(c.outputs).filter((r) => imagesFrom == null || r.output_index >= imagesFrom);
 	return {
 		id: handleFor(nb, c.id),
 		size,
 		ran_this_session: ranThisSession(c, currentSessionId(nb)),
 		outputs,
-		// Uncapped: this call IS the agent explicitly asking for this one cell's
-		// figures, so it is the route the run path's `limit` omission names — a cap
-		// here would leave the 5th figure of a cell unreachable by any tool.
-		...imageFields(buildImageBlocks(imageRefs(c.outputs), { full: size === 'full', limit: Infinity }))
+		...(imagesFrom != null ? { images_from: imagesFrom } : {}),
+		...imageFields(buildImageBlocks(refs, { full: size === 'full', limit: MAX_FULL_OUTPUT_IMAGE_BLOCKS }))
 	};
 }
 
