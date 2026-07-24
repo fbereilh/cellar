@@ -1487,7 +1487,18 @@ const WORKSPACE_PROBE_TTL_MS = 5_000;
 
 let workspaceProbeCache: { at: number; python: string | null; value: WorkspaceProbes } | null = null;
 /** Single-flight: a python import can outlast the poll interval, so ticks must not overlap. */
-let workspaceProbeInFlight: { python: string | null; promise: Promise<WorkspaceProbes> } | null = null;
+let workspaceProbeInFlight: {
+	python: string | null;
+	generation: number;
+	promise: Promise<WorkspaceProbes>;
+} | null = null;
+/**
+ * Bumped by every invalidation. A probe that STARTED before the invalidation measured
+ * the pre-install world, so it may neither be handed to a later caller nor write its
+ * result back afterwards - clearing the cache alone left both holes open, and either
+ * one serves a stale "packages missing" for a whole TTL right after an install.
+ */
+let workspaceProbeGeneration = 0;
 
 /**
  * Drop the memoized workspace probes, so the next read re-measures. Called wherever
@@ -1497,6 +1508,7 @@ let workspaceProbeInFlight: { python: string | null; promise: Promise<WorkspaceP
  */
 export function invalidateWorkspaceProbes(): void {
 	workspaceProbeCache = null;
+	workspaceProbeGeneration++;
 }
 
 async function workspaceProbes(): Promise<WorkspaceProbes> {
@@ -1505,8 +1517,11 @@ async function workspaceProbes(): Promise<WorkspaceProbes> {
 	if (cached && cached.python === python && Date.now() - cached.at < WORKSPACE_PROBE_TTL_MS) {
 		return cached.value;
 	}
+	const generation = workspaceProbeGeneration;
 	const running = workspaceProbeInFlight;
-	if (running && running.python === python) return running.promise;
+	if (running && running.python === python && running.generation === generation) {
+		return running.promise;
+	}
 	const promise = (async (): Promise<WorkspaceProbes> => {
 		let install: InstallStatus = { python, sdk: false, connect: false };
 		let installError: string | null = null;
@@ -1517,11 +1532,13 @@ async function workspaceProbes(): Promise<WorkspaceProbes> {
 		}
 		return { install, installError, uv: await hasUv() };
 	})();
-	const entry = { python, promise };
+	const entry = { python, generation, promise };
 	workspaceProbeInFlight = entry;
 	try {
 		const value = await promise;
-		workspaceProbeCache = { at: Date.now(), python, value };
+		if (workspaceProbeGeneration === generation) {
+			workspaceProbeCache = { at: Date.now(), python, value };
+		}
 		return value;
 	} finally {
 		if (workspaceProbeInFlight === entry) workspaceProbeInFlight = null;

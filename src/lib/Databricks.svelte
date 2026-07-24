@@ -276,6 +276,27 @@
 		runtimeVersion = v;
 		setUi(DBX_RUNTIME_VERSION_KEY, v === '' ? null : v);
 	}
+	/**
+	 * Apply an already-ON preference the RUNNING kernel does not carry (the `pending`
+	 * state): restart so `initKernel` injects the env for the fresh imports. It writes
+	 * the SAME stored value it reads, so the preference is unchanged - this only asks
+	 * for the restart the pending copy says is needed, instead of leaving the toggle's
+	 * off-then-on double restart as the only route. Third caller of `applyRuntime`,
+	 * same shape as the other two, so the restart, the suppressed lost-flash and the
+	 * settle handling are identical.
+	 */
+	async function applyPendingRuntime() {
+		if (runtimeApplying || busy || !runtimePending || !runtimeKernelStarted) return;
+		runtimeApplying = true;
+		try {
+			await applyRuntime(true);
+			await settleConnection();
+		} finally {
+			runtimeApplying = false;
+			restarting = false; // definitive cleanup if applyRuntime threw before settleConnection
+		}
+	}
+
 	/** Commit a version edit (blur/Enter): restart to apply only if it truly changed. */
 	async function commitVersion() {
 		if (runtimeApplying || busy || !runtimeOn) return;
@@ -1596,6 +1617,21 @@
 				Notebook code runs its non-Databricks path. Turning it on restarts the kernel - variables are cleared.
 			{/if}
 		</p>
+		<!-- The one state with something to apply: the preference is on and the running
+		     kernel does not carry it. Rendered ONLY here - anywhere else this would be a
+		     restart (and a namespace wipe) nobody asked for. It reuses `applyRuntime`, so
+		     it behaves exactly like the toggle's restart, minus the preference change. -->
+		{#if runtimePending && runtimeKernelStarted && !runtimeApplying}
+			<button
+				class="btn btn-outline btn-xs mt-1.5 w-full"
+				onclick={applyPendingRuntime}
+				disabled={!!busy}
+				title="Restart this notebook's kernel so it starts with the Databricks runtime. Variables are cleared."
+				data-testid="databricks-runtime-apply"
+			>
+				Apply now (restarts kernel)
+			</button>
+		{/if}
 	</div>
 {/snippet}
 

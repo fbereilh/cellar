@@ -18,20 +18,29 @@ import { join } from 'node:path';
  *   - concurrent reads share ONE in-flight probe (they never overlap);
  *   - past the TTL a read re-measures, so the answer cannot go stale forever;
  *   - an install invalidates it, so the sidebar never serves a pre-install
- *     "packages missing" over a venv that now has the packages.
+ *     "packages missing" over a venv that now has the packages - INCLUDING when the
+ *     install lands while a probe of the pre-install world is still in flight.
  *
- * `hasUv` is mocked as the counter. `isValidVenv` is mocked false so `projectPython()`
+ * `hasUv` is mocked as the counter, and its return value doubles as the marker for
+ * WHICH measurement a read observed. `isValidVenv` is mocked false so `projectPython()`
  * resolves to null and `checkInstall` short-circuits - the point here is the caching
  * seam, not the SDK import.
  */
 
-const probes = vi.hoisted(() => ({ uvCalls: 0, gate: null as Promise<void> | null }));
+const probes = vi.hoisted(() => ({
+	uvCalls: 0,
+	uvValue: true,
+	gate: null as Promise<void> | null
+}));
 
 vi.mock('../../src/lib/server/venv.js', () => ({
 	hasUv: async () => {
 		probes.uvCalls++;
+		// Sampled at START, like a real probe: it measures the world it was launched in,
+		// whatever has changed by the time it settles.
+		const measured = probes.uvValue;
 		if (probes.gate) await probes.gate;
-		return true;
+		return measured;
 	},
 	installPackages: async () => {},
 	isValidVenv: () => false,
@@ -64,6 +73,7 @@ beforeEach(() => {
 	clockOffset = 0;
 	vi.spyOn(Date, 'now').mockImplementation(() => realNow() + clockOffset);
 	probes.uvCalls = 0;
+	probes.uvValue = true;
 	probes.gate = null;
 	dbx.invalidateWorkspaceProbes();
 });
@@ -109,6 +119,34 @@ describe('getStatus workspace probes are memoized', () => {
 		expect(probes.uvCalls).toBe(1);
 		dbx.invalidateWorkspaceProbes();
 		await dbx.getStatus();
+		expect(probes.uvCalls).toBe(2);
+	});
+
+	it('a probe started before an invalidation is never reused nor written back', async () => {
+		// A probe of the PRE-install world, still in flight when the install lands.
+		let open!: () => void;
+		probes.gate = new Promise<void>((r) => (open = r));
+		const stale = dbx.getStatus();
+		await new Promise((r) => setTimeout(r, 0));
+		expect(probes.uvCalls).toBe(1);
+
+		dbx.invalidateWorkspaceProbes();
+		probes.gate = null;
+		probes.uvValue = false; // the world the install left behind
+
+		// A read arriving after the invalidation must NOT be handed the in-flight
+		// pre-install promise; it measures the new world for itself.
+		const fresh = await dbx.getStatus();
+		expect(probes.uvCalls).toBe(2);
+		expect(fresh.uv).toBe(false);
+
+		// And when the pre-install probe finally settles it must not write its result
+		// back over the fresh one - otherwise the next read serves the stale answer
+		// for a whole TTL, which is exactly what the invalidation exists to prevent.
+		open();
+		expect((await stale).uv).toBe(true);
+		const after = await dbx.getStatus();
+		expect(after.uv).toBe(false);
 		expect(probes.uvCalls).toBe(2);
 	});
 });

@@ -170,6 +170,10 @@ test('connected: TWO separate bordered cards (Cluster + Runtime) + subordinate d
 	// The obsolete "restart to apply" hint is GONE in every state.
 	await expect(page.getByTestId('databricks-runtime-hint')).toHaveCount(0);
 	await expect(page.getByTestId('databricks-runtime-restart')).toHaveCount(0);
+	// "Apply now" belongs ONLY to the pending state (asserted in the pill test below).
+	// Here the preference is off, so there is nothing to apply and offering a restart
+	// would be a namespace wipe nobody asked for.
+	await expect(page.getByTestId('databricks-runtime-apply')).toHaveCount(0);
 
 	// Reviewer-visible evidence: the full two-card panel.
 	const section = page.getByTestId('section-databricks').locator('xpath=ancestor::*[1]/parent::*');
@@ -229,6 +233,13 @@ test('the Runtime pill never claims "active" over a kernel without the runtime',
 	await expect(page.getByTestId('databricks-runtime-pending')).toBeVisible();
 	await expect(page.getByTestId('databricks-runtime-active')).toHaveCount(0);
 	await expect(page.getByTestId('databricks-runtime-card')).toContainText(/restart the kernel to apply/i);
+
+	// ...and the state that says "restart the kernel to apply" offers a way to do it,
+	// so the only route is not the toggle's off-then-on double restart.
+	const apply = page.getByTestId('databricks-runtime-apply');
+	await expect(apply).toBeVisible();
+	await expect(apply).toBeEnabled();
+	await expect(apply).toContainText(/restarts kernel/i);
 
 	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
 });
