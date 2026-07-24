@@ -139,21 +139,36 @@ Once you connect, the **Databricks** panel shows the cluster name and connection
 status. If a session goes idle or otherwise drops, a **Reconnect** button restores it against the
 cluster you already chose - the same one-click recovery agents and the automatic
 expiry self-heal use, so it may briefly restart the kernel (and wipe its
-namespace) when a `databricks-connect` re-pin is needed.
+namespace) when a `databricks-connect` re-pin is needed. A kernel restart itself -
+from the Runtime toggle, the Kernels sidebar, `%restart_python` or an autorestart -
+does not show that dropped-session warning: the panel says it is reconnecting while
+the session is rebuilt, and only reports the session as lost if the rebuild
+actually fails.
 
 Once connected, the **Databricks** section shows two cards - a **Cluster** card
 (the connection identity plus Switch/Disconnect, or Reconnect when a session
 dropped) and a separate **Runtime** card carrying the **Databricks runtime**
-toggle (on by default for a connected notebook). The runtime setting advertises
+toggle (**off by default**). The runtime setting advertises
 `DATABRICKS_RUNTIME_VERSION` in the kernel so pasted Databricks-notebook code that
-gates on `IS_DATABRICKS` takes its interactive `dbutils.widgets` path instead of a
-local CLI fallback. Because that gate is read at import time, the setting is
-applied by **restarting the kernel** - so connecting (or switching) a cluster
-auto-enables the runtime and restarts the kernel for you, and toggling the Runtime
-card likewise restarts immediately (which clears the kernel namespace). No manual
-"restart to apply" step. Force the setting (and the advertised version) headless
-with `CELLAR_DATABRICKS_RUNTIME` / `CELLAR_DATABRICKS_RUNTIME_VERSION` (see the
-reference below).
+checks whether it is running on Databricks takes its interactive `dbutils.widgets`
+path instead of a local CLI fallback. Because that gate is read at import time, the
+setting is applied by **restarting the kernel**, which clears the kernel namespace -
+and advertising a runtime changes what *every* library believes about its
+environment (mlflow's `is_in_databricks_runtime()` reads the same variable). So it
+is an explicit opt-in: connecting - or switching - a cluster deliberately does *not*
+enable it and does not restart on its own. A connect binds `spark`/`w` in the
+running kernel and keeps your variables, unless the client has to be re-pinned to
+the cluster's DBR (that does restart).
+
+The card's state badge reports the **running kernel**, not the preference you just
+set: `active` when the live session really carries the variable, `pending` when it
+does not - a kernel started without it offers **Apply now**, which restarts it
+exactly as the toggle does, and with no kernel yet the next start picks the setting
+up - and `off` otherwise. Force the setting headless with
+`CELLAR_DATABRICKS_RUNTIME`, and the advertised version with
+`CELLAR_DATABRICKS_RUNTIME_VERSION` (either can be set without the other; see the
+reference below) - the card then says the environment is in control and disables the
+control that override holds, since no toggle or restart can change it.
 
 **Disconnect vs Log out.** Disconnect ends that notebook's Spark session and
 leaves you authenticated. **Log out** - the quiet button under the Cluster card's
@@ -222,8 +237,8 @@ to publish, e.g. inside a container.
 | `CELLAR_DATAFLOW_BACKOFF_BASE_MS` | `30000` (ms, = 30s) | First backoff window after a dataflow batch times out; doubles per consecutive timeout. A timed-out batch is not re-probed until its window elapses or its source content changes, so a persistently-slow notebook converges instead of re-spawning the probe every pass. |
 | `CELLAR_DATAFLOW_BACKOFF_MAX_MS` | `300000` (ms, = 5min) | Ceiling on the dataflow backoff window, so a persistently-slow notebook still re-probes rarely rather than never. |
 | `CELLAR_ADD_PROJECT_ROOT` | UI setting | Force whether the project root is added to the kernel's `sys.path` (overrides the persisted UI toggle). |
-| `CELLAR_DATABRICKS_RUNTIME` | UI setting (default on for a connected notebook) | Force whether `DATABRICKS_RUNTIME_VERSION` is advertised in the kernel environment, so `IS_DATABRICKS`-gated notebook code takes its `dbutils.widgets` path. Overrides the persisted UI toggle and bypasses the connected-notebook scope. Applied at kernel start/restart only. |
-| `CELLAR_DATABRICKS_RUNTIME_VERSION` | `15.4` | The runtime version string advertised when the toggle above is on (overrides the persisted UI value). |
+| `CELLAR_DATABRICKS_RUNTIME` | UI setting (default off) | Force whether `DATABRICKS_RUNTIME_VERSION` is advertised in the kernel environment, so notebook code that checks whether it is running on Databricks takes its `dbutils.widgets` path. Overrides the persisted UI toggle and bypasses the connected-notebook scope; the sidebar then reports the setting as environment-controlled and disables the toggle. Applied at kernel start/restart only. |
+| `CELLAR_DATABRICKS_RUNTIME_VERSION` | `15.4` | The runtime version string advertised when the runtime is on. Overrides the persisted UI value (and disables the card's version field), independently of `CELLAR_DATABRICKS_RUNTIME` - either can be set without the other. |
 | `CELLAR_JUPYTER_URL` | `http://127.0.0.1:8888` | Point the kernel bridge at an external Jupyter server (the launcher sets this automatically for the managed sidecar). |
 | `CELLAR_JUPYTER_TOKEN` | `` (empty) | Token for an external Jupyter server. |
 | `DATABRICKS_CONFIG_FILE` | `~/.databrickscfg` | Standard SDK variable for the Databricks config location. |
