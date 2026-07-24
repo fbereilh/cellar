@@ -69,7 +69,9 @@ vi.mock('../../src/lib/server/kernel', () => ({
 	},
 	currentSessionId: () => state.session,
 	kernelStatus: () => ({ status: 'idle', id: state.session == null ? null : 'k1' }),
-	restartKernel: async () => ({ status: 'idle', id: 'k1', session_id: 1 })
+	restartKernel: async () => ({ status: 'idle', id: 'k1', session_id: 1 }),
+	/** The Runtime card's live state; irrelevant here, so a kernel that carries none. */
+	liveDatabricksRuntime: () => ({ started: true, version: null })
 }));
 
 let dbx: typeof import('../../src/lib/server/databricks');

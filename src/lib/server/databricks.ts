@@ -93,7 +93,14 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { execute, currentSessionId, kernelStatus, restartKernel, refreshKernelConnection } from './kernel';
+import {
+	execute,
+	currentSessionId,
+	kernelStatus,
+	restartKernel,
+	refreshKernelConnection,
+	liveDatabricksRuntime
+} from './kernel';
 import {
 	dbrMajorMinor,
 	parseVersionMismatch,
@@ -103,6 +110,7 @@ import {
 import { normalizeDatabricksHost } from '../databricksHost';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
 import { resolveNotebookPath } from './notebook';
+import { databricksRuntimeForced, databricksRuntimeVersionForced } from './ui-state';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
@@ -1458,11 +1466,93 @@ export async function checkInstall(): Promise<InstallStatus> {
 	return { python, sdk: !!result.sdk, connect: !!result.connect, sdkVersion: result.sdk_version, connectVersion: result.connect_version };
 }
 
+/** The workspace-level half of `getStatus`: is `uv` on PATH, can the venv import the SDK. */
+interface WorkspaceProbes {
+	install: InstallStatus;
+	installError: string | null;
+	uv: boolean;
+}
+
+/**
+ * How long the workspace probes are trusted. They are two SUBPROCESS spawns per read
+ * (`uv --version`, and a project-venv python that imports databricks-sdk) on the same
+ * Node process that streams kernel output, SSE and MCP - and `getStatus` is polled:
+ * the sidebar re-reads it every ~1.2s for as long as a kernel-restart rebuild is in
+ * flight, which on a cold cluster is minutes, not the old 15s-bounded settle poll.
+ * Whether uv exists and whether the venv can import a package are workspace facts
+ * that cannot change between ticks unless Cellar itself installs something - and that
+ * path invalidates this explicitly - so a short TTL costs nothing and bounds the poll
+ * to one probe pair per window.
+ */
+const WORKSPACE_PROBE_TTL_MS = 5_000;
+
+let workspaceProbeCache: { at: number; python: string | null; value: WorkspaceProbes } | null = null;
+/** Single-flight: a python import can outlast the poll interval, so ticks must not overlap. */
+let workspaceProbeInFlight: {
+	python: string | null;
+	generation: number;
+	promise: Promise<WorkspaceProbes>;
+} | null = null;
+/**
+ * Bumped by every invalidation. A probe that STARTED before the invalidation measured
+ * the pre-install world, so it may neither be handed to a later caller nor write its
+ * result back afterwards - clearing the cache alone left both holes open, and either
+ * one serves a stale "packages missing" for a whole TTL right after an install.
+ */
+let workspaceProbeGeneration = 0;
+
+/**
+ * Drop the memoized workspace probes, so the next read re-measures. Called wherever
+ * Cellar itself changes the answer (an install into the project venv) - a stale
+ * "packages missing" card right after an install would be its own defect. A venv
+ * REBIND needs no call: the cache is keyed on the interpreter path it measured.
+ */
+export function invalidateWorkspaceProbes(): void {
+	workspaceProbeCache = null;
+	workspaceProbeGeneration++;
+}
+
+async function workspaceProbes(): Promise<WorkspaceProbes> {
+	const python = projectPython();
+	const cached = workspaceProbeCache;
+	if (cached && cached.python === python && Date.now() - cached.at < WORKSPACE_PROBE_TTL_MS) {
+		return cached.value;
+	}
+	const generation = workspaceProbeGeneration;
+	const running = workspaceProbeInFlight;
+	if (running && running.python === python && running.generation === generation) {
+		return running.promise;
+	}
+	const promise = (async (): Promise<WorkspaceProbes> => {
+		let install: InstallStatus = { python, sdk: false, connect: false };
+		let installError: string | null = null;
+		try {
+			install = await checkInstall();
+		} catch (err) {
+			installError = err instanceof Error ? err.message : String(err);
+		}
+		return { install, installError, uv: await hasUv() };
+	})();
+	const entry = { python, generation, promise };
+	workspaceProbeInFlight = entry;
+	try {
+		const value = await promise;
+		if (workspaceProbeGeneration === generation) {
+			workspaceProbeCache = { at: Date.now(), python, value };
+		}
+		return value;
+	} finally {
+		if (workspaceProbeInFlight === entry) workspaceProbeInFlight = null;
+	}
+}
+
 /**
  * Everything the sidebar needs to render before a connection exists. `nb` is the
  * notebook whose connection to report - the sidebar passes the ACTIVE notebook,
  * so the panel always reflects the focused notebook's Databricks session. The
- * profiles/install/uv fields are workspace-level and notebook-independent.
+ * profiles/install/uv fields are workspace-level and notebook-independent, and are
+ * memoized behind a short TTL (`workspaceProbes`) so polling this route does not
+ * spawn a subprocess pair per tick.
  *
  * `connection` is `liveConnection(nb)` (not the raw epoch-only `connectionStatus`):
  * it reflects a REAL liveness verdict, so a session whose Spark Connect client was
@@ -1471,24 +1561,62 @@ export async function checkInstall(): Promise<InstallStatus> {
  * call may contact the workspace - but the probe is memoized (short TTL) and
  * skipped while the kernel is busy, and it NEVER boots a kernel, so the sidebar
  * poll stays cheap. It never blocks on a reconnect either (see `liveConnection`).
+ *
+ * `runtime` is the LIVE Databricks-runtime state of that notebook's kernel session
+ * (`liveDatabricksRuntime`), NOT the stored toggle preference. The two can honestly
+ * diverge - the env is read at import time, so a preference changed after the kernel
+ * started, or a connect that binds a kernel which started unbound, only takes effect
+ * on the next start - and the Runtime card reports this so it can never claim a
+ * runtime the running kernel does not advertise. Never boots a kernel.
  */
 export async function getStatus(nb?: string | null) {
 	const { configPath: path, exists, profiles, error } = readProfiles();
-	let install: InstallStatus = { python: projectPython(), sdk: false, connect: false };
-	let installError: string | null = null;
-	try {
-		install = await checkInstall();
-	} catch (err) {
-		installError = err instanceof Error ? err.message : String(err);
-	}
+	const { install, installError, uv } = await workspaceProbes();
 	return {
 		config: { path, exists, profiles, error: error ?? null },
 		install,
 		installError,
-		uv: await hasUv(),
+		uv,
 		signedInHosts: [...signedInHosts],
 		signedInProfiles: [...signedInProfiles],
-		connection: await liveConnection(nb)
+		connection: await liveConnection(nb),
+		runtime: runtimeStatus(nb)
+	};
+}
+
+/**
+ * The Databricks-runtime state of a notebook's LIVE kernel session: whether a
+ * kernel exists at all, and the `DATABRICKS_RUNTIME_VERSION` it was actually
+ * started with (null = started without one). The sidebar renders its `active` /
+ * `pending` / `off` state from this rather than from the preference it just wrote,
+ * so it reports reality and lets the divergence read as "restart to apply".
+ *
+ * `envForced` carries WHO decides: `true`/`false` when `CELLAR_DATABRICKS_RUNTIME`
+ * forces it, `null` when the stored preference does. The client cannot see the
+ * server's env, so without this it would read a forced-off decision as a preference
+ * the user can apply - offering an "Apply now" restart that clears the namespace and
+ * leaves the state exactly where it was, every time. With it the card says the
+ * environment is in control instead.
+ *
+ * `versionEnvForced` is the same fact for the VERSION (`CELLAR_DATABRICKS_RUNTIME_VERSION`):
+ * the forced version string, or `null` when the store decides. The two overrides are
+ * INDEPENDENT - either can be set alone - so they ride as separate fields and the card
+ * names whichever is actually in force. Without it the version input would keep offering
+ * an edit whose apply-restart wipes the namespace to advertise a value the override
+ * discards.
+ */
+function runtimeStatus(nb?: string | null): {
+	kernelStarted: boolean;
+	liveVersion: string | null;
+	envForced: boolean | null;
+	versionEnvForced: string | null;
+} {
+	const live = liveDatabricksRuntime(resolveNotebookPath(nb));
+	return {
+		kernelStarted: live.started,
+		liveVersion: live.version,
+		envForced: databricksRuntimeForced(),
+		versionEnvForced: databricksRuntimeVersionForced()
 	};
 }
 
@@ -2074,6 +2202,20 @@ interface ConnState {
 	/** The connection a kernel restart took from us, kept so the UI can say so. */
 	lost: LostConnection | null;
 	/**
+	 * When an EXPECTED kernel restart took the session - i.e. the epoch changed while
+	 * a reconnect intent was still kept, so `reconnectAfterKernelRestart` is about to
+	 * rebuild it. Stamped by `connectionStatus()`'s reconciliation (the one place a
+	 * restart drives this transition) and read only by `liveConnection`, which holds
+	 * back the "lost" shape while the rebuild is provably in flight (plus a short
+	 * dispatch floor - see `restartingAfterKernelRestart`), so a restart settles
+	 * straight back to connected instead of flashing the scary lost card at the user.
+	 * Cleared the moment the outcome is known - a successful `connect()`, a reconnect
+	 * that gave up, a torn-down kernel, an explicit disconnect - so a genuine,
+	 * persistent loss is never delayed beyond the point where we actually know it is
+	 * one.
+	 */
+	restartedAt: number | null;
+	/**
 	 * The reconnect INTENT (auth selection + cluster) of the last live connection,
 	 * kept ACROSS a kernel restart. `connectionStatus()` clears `connection` the
 	 * moment the epoch changes, so it cannot answer "what should we reconnect to";
@@ -2121,6 +2263,7 @@ function stateFor(nb: string): ConnState {
 			connection: null,
 			connectedSel: null,
 			lost: null,
+			restartedAt: null,
 			reconnectTarget: null,
 			inFlight: false,
 			liveness: null,
@@ -2158,6 +2301,62 @@ function pendingReauth(s: ConnState): DatabricksError | undefined {
 const LIVENESS_TTL_MS = 15_000;
 
 /**
+ * The FLOOR of the expected-restart window: how long a stamped restart may hold the
+ * connection in a "restarting" shape before any reconnect attempt has actually
+ * started.
+ *
+ * This is only the bridge, NOT the mechanism. A restart tears the namespace down and
+ * `reconnectAfterKernelRestart` rebuilds it, and that rebuild is not fast - it runs
+ * the cluster DBR probe subprocess, `checkInstall`, and a whole Spark Connect session
+ * build, i.e. seconds. A fixed wall-clock window can therefore never cover it: it
+ * would just move the flash later and add a Reconnecting → lost → connected flip,
+ * which is worse than the flash it set out to prevent. So the load-bearing signal is
+ * the POSITIVE one - an attempt provably in flight (`restartAttemptInFlight`) - and
+ * this floor only covers the gap between the epoch change being OBSERVED and that
+ * attempt starting (the reconnect is fired detached, and a status poll can land
+ * first). Past the floor with nothing in flight, the honest answer is "lost".
+ */
+const RESTART_LOST_GRACE_MS = 1_000;
+
+/**
+ * Is a reconnect attempt for this notebook genuinely running right now? `inFlight`
+ * is set for the whole of `connect()` (which `reconnectTo` - the one seam both the
+ * restart re-establish and the expiry self-heal go through - drives), and
+ * `reconnecting` covers the expiry heal's own single-flight. Either way something is
+ * actively trying to restore the session, so "not connected" is a state in motion
+ * rather than an outcome.
+ */
+function restartAttemptInFlight(s: ConnState): boolean {
+	return s.inFlight || s.reconnecting !== null;
+}
+
+/**
+ * Is this notebook mid-EXPECTED-restart - i.e. does "not connected" here mean
+ * "being rebuilt", not "lost"?
+ *
+ * Requires the restart stamp (only `connectionStatus()`'s epoch reconciliation sets
+ * it, and only when a reconnect is genuinely coming), and then EITHER an attempt in
+ * flight - for however many seconds it takes - or the short floor while one is still
+ * being dispatched. The stamp is cleared outright the moment the outcome is KNOWN (a
+ * successful `connect()`, a reconnect that gave up, a torn-down kernel, an explicit
+ * disconnect), so a proven failure is never held behind a spinner.
+ *
+ * Lapsing is itself such an outcome, so this RETIRES the stamp when the floor runs
+ * out with nothing in flight: the panel has just fallen through to the honest lost
+ * card, and a stamp kept past that point is a latch - any later unrelated attempt on
+ * this notebook (an expiry self-heal, a connect that then fails) would re-satisfy the
+ * in-flight branch and claim a kernel restart that never happened. A stamp may only
+ * ever belong to the restart that set it.
+ */
+function restartingAfterKernelRestart(s: ConnState): boolean {
+	if (s.restartedAt === null) return false;
+	if (restartAttemptInFlight(s)) return true;
+	if (Date.now() - s.restartedAt < RESTART_LOST_GRACE_MS) return true;
+	s.restartedAt = null;
+	return false;
+}
+
+/**
  * The connection as the UI should see it. Reconciles against the *current*
  * kernel epoch on every read, so a restart (or a rebind onto another venv)
  * downgrades us to disconnected without anyone having to notify this module.
@@ -2174,6 +2373,16 @@ export function connectionStatus(nb?: string | null): ConnectionStatus {
 		s.connection = null;
 		s.connectedSel = null;
 		s.liveness = null;
+		// This branch fires exactly once per epoch change (it nulls the connection it
+		// reads), so it is the one honest "the kernel just restarted" moment - and the
+		// grace runs from here, i.e. from when a caller first OBSERVES the loss, which is
+		// exactly the window a sidebar poll can land in. Stamped only when a reconnect is
+		// actually coming: an intent must be kept (an explicit disconnect drops it) AND a
+		// kernel must still exist to rebuild the session in - a torn-down kernel
+		// (shutdown / cull) is a real loss with nothing to wait for, so it is reported at
+		// once rather than behind a spinner. See `RESTART_LOST_GRACE_MS`.
+		s.restartedAt =
+			s.reconnectTarget && kernelStatus(abs).status !== 'not_started' ? Date.now() : null;
 	}
 	if (!s.connection) return { connected: false, ...(s.lost ? { lost: s.lost } : {}) };
 	return { connected: true, ...s.connection };
@@ -2351,8 +2560,13 @@ export async function reconnectAfterKernelRestart(
 	if (!target) return { reconnected: false, reason: 'no_prior_session' };
 	// Never force a kernel to boot solely to reconnect Databricks. A restart keeps
 	// the kernel entry, so this is only hit if the kernel was torn down (shutdown /
-	// cull) - in which case dropping the session is the correct behavior.
-	if (kernelStatus(abs).status === 'not_started') return { reconnected: false, reason: 'no_kernel' };
+	// cull) - in which case dropping the session is the correct behavior. Nothing is
+	// coming, so retire the restart grace rather than making the user watch a spinner
+	// for a reconnect that will never be attempted.
+	if (kernelStatus(abs).status === 'not_started') {
+		s.restartedAt = null;
+		return { reconnected: false, reason: 'no_kernel' };
+	}
 	// A connect/disconnect is already mutating this notebook's namespace; don't race it.
 	if (s.inFlight) return { reconnected: false, reason: 'busy' };
 	// The restart bumped the epoch; reconcile so the stale connection is cleared
@@ -2368,7 +2582,10 @@ export async function reconnectAfterKernelRestart(
 		logWarn('databricks', `Databricks reconnect after kernel restart failed: ${detail}`);
 		// Degrade honestly: surface it as a session the restart took, which the
 		// UI/agent already phrase as "reconnect from the Databricks sidebar section".
+		// The restart's outcome is now KNOWN and it is a loss, so the grace is retired
+		// immediately - it debounces the transient window, never a proven failure.
 		s.lost = { profile: target.sel.profile ?? null, clusterName: target.clusterName };
+		s.restartedAt = null;
 		return { reconnected: false, reason: detail };
 	}
 }
@@ -2559,6 +2776,9 @@ export async function connect({
 		// re-establish the SAME session automatically (reconnectAfterKernelRestart).
 		s.reconnectTarget = { sel: s.connectedSel, clusterId, clusterName: s.connection.clusterName };
 		s.lost = null;
+		// A live session settles whatever restart we were riding out (see
+		// `RESTART_LOST_GRACE_MS`): there is nothing left to hold back.
+		s.restartedAt = null;
 		// A live session is proof the credential works, so it retires any recorded
 		// reconnect failure - above all an expired-profile verdict, which the status
 		// surfaces would otherwise keep showing over a connection that just came up.
@@ -2753,12 +2973,20 @@ export async function agentStatus(nb?: string | null) {
  * expired server-side (or whose Spark Connect client was closed) instead of
  * reporting a dead session as "connected" on the strength of a still-current
  * epoch. Never blocks on a reconnect (see `assessLiveness`'s `heal:false`).
+ *
+ * It is also where the kernel-restart grace is applied (see
+ * `restartingAfterKernelRestart`): a loss the restart is about to undo comes back
+ * flagged `restarting` for as long as the rebuild is actually in flight, so the panel
+ * holds its connecting presentation instead of flashing "lost". Deliberately UI-only
+ * - `agentStatus` keeps reporting the plain truth, since an agent asks a question
+ * and gets one answer rather than watching a card repaint.
  */
 async function liveConnection(
 	nb?: string | null
 ): Promise<
 	ConnectionStatus & {
 		expired?: boolean;
+		restarting?: boolean;
 		livenessUnverified?: boolean;
 		isClosed?: boolean;
 		reauth?: { code: string; message: string; profile: string };
@@ -2776,7 +3004,16 @@ async function liveConnection(
 	const reauth = verdict?.profile
 		? { code: verdict.code, message: verdict.message, profile: verdict.profile }
 		: undefined;
-	if (!status.connected) return { ...status, ...(reauth ? { reauth } : {}) };
+	if (!status.connected) {
+		return {
+			...status,
+			// Inside the grace window this loss is an expected restart being undone, not
+			// something to alarm the user about. Flagged rather than hidden: the panel
+			// keeps rendering the cluster name from `lost`, just as "reconnecting".
+			...(restartingAfterKernelRestart(s) ? { restarting: true } : {}),
+			...(reauth ? { reauth } : {})
+		};
+	}
 	const a = await assessLiveness(abs, status, { heal: false });
 	if (a.kind === 'reconnected') return a.status;
 	if (a.kind === 'expired') {
@@ -3214,6 +3451,11 @@ export async function disconnect(nb?: string | null): Promise<{ ok: true }> {
 	const s = stateFor(abs);
 	if (s.inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
 	s.inFlight = true;
+	// Retire any expected-restart stamp UP FRONT: the user has declared the session
+	// over, so nothing is being ridden out any more. Without this, `inFlight` (which a
+	// disconnect also sets) would read as "a reconnect is running" for the length of
+	// the teardown and the panel would render "Reconnecting…" over a disconnect.
+	s.restartedAt = null;
 	try {
 		// Nothing to stop if the kernel that held it is gone; just clear our state.
 		if (connectionStatus(abs).connected) await runInKernel(abs, DISCONNECT_CODE);
@@ -3223,6 +3465,7 @@ export async function disconnect(nb?: string | null): Promise<{ ok: true }> {
 		// after this a kernel restart must NOT silently re-establish the session.
 		s.reconnectTarget = null;
 		s.lost = null;
+		s.restartedAt = null;
 		s.liveness = null;
 		publishGlobal({ type: 'databricks:changed' });
 		return { ok: true };
@@ -3253,6 +3496,9 @@ export async function installDeps({ version }: { version?: string | null } = {})
 		pin = /^\d+\.\d+$/.test(version) ? `==${version}.*` : `==${version}`;
 	}
 	await installPackages(python, ['databricks-sdk', `databricks-connect${pin}`]);
+	// The venv just changed under the memoized workspace probes, so the sidebar's next
+	// read must re-measure rather than serve the pre-install "packages missing".
+	invalidateWorkspaceProbes();
 	// checkInstall() already reports `python`; spreading it last is what the caller
 	// sees, so no explicit `python` key here (it would only be overwritten).
 	return { ok: true, ...(await checkInstall()) };
