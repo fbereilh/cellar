@@ -63,7 +63,9 @@ vi.mock('../../src/lib/server/kernel', () => {
 		kernelStatus: (nbPath?: string | null) => ({
 			status: nbPath != null && state.busy.has(nbPath) ? 'busy' : 'idle',
 			id: sess(nbPath) == null ? null : 'k1'
-		})
+		}),
+		/** The Runtime card's live state; irrelevant here, so a kernel that carries none. */
+		liveDatabricksRuntime: () => ({ started: true, version: null })
 	};
 });
 

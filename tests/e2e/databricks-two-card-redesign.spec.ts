@@ -45,6 +45,10 @@ function connectedStatus() {
 		},
 		config: { profiles: [{ name: 'DEFAULT', host: 'https://dbc-demo.cloud.databricks.com', hasToken: true }] },
 		install: { python: '/tmp/.venv/bin/python', sdk: true, connect: true },
+		// The kernel is running but was NOT started with the runtime env - the shape a
+		// connect leaves behind now that it no longer restarts. The Runtime card's state
+		// pill must report THIS, never the stored preference.
+		runtime: { kernelStarted: true, liveVersion: null },
 		uv: true
 	};
 }
@@ -140,12 +144,16 @@ test('connected: TWO separate bordered cards (Cluster + Runtime) + subordinate d
 	const runtime = page.getByTestId('databricks-runtime-card');
 	await expect(runtime).toBeVisible();
 	await expect(page.getByTestId('databricks-runtime-toggle')).toBeVisible();
-	// Exactly one of active/off/restarting is shown.
+	// Exactly one of active/pending/off/restarting is shown.
 	const statusCount =
 		(await page.getByTestId('databricks-runtime-active').count()) +
+		(await page.getByTestId('databricks-runtime-pending').count()) +
 		(await page.getByTestId('databricks-runtime-inactive').count()) +
 		(await page.getByTestId('databricks-runtime-applying').count());
 	expect(statusCount).toBe(1);
+	// ...and it is never "active" over a kernel the server says carries no runtime,
+	// whatever the stored preference asks for.
+	await expect(page.getByTestId('databricks-runtime-active')).toHaveCount(0);
 
 	// The two cards are DISTINCT bordered elements (requirement #1).
 	expect(await cluster.evaluate((el) => el.getBoundingClientRect().bottom <= 0)).toBe(false);
@@ -180,14 +188,47 @@ test('disconnected: the Cluster card renders its connect-form picker', async ({ 
 	// (the Runtime card is shown only once connected).
 	await expect(page.getByTestId('databricks-picker')).toBeVisible();
 	await expect(page.getByTestId('databricks-cluster').first()).toBeVisible();
-	// What connecting will actually do is surfaced inline - and it no longer restarts
-	// the kernel, so the note must not promise the old auto-enable behavior.
+	// What connecting will actually do is surfaced inline: it binds spark/w in the
+	// running kernel and no longer auto-enables the runtime. The variables-kept claim
+	// is QUALIFIED, not absolute - a databricks-connect re-pin still restarts - so the
+	// note must name that exception rather than promise something connect can break.
 	const note = page.getByTestId('databricks-connect-note');
 	await expect(note).toBeVisible();
-	await expect(note).not.toContainText(/restart/i);
+	await expect(note).toContainText(/variables are kept/i);
+	await expect(note).toContainText(/re-pinned/i);
+	await expect(note).not.toContainText(/enables the Databricks runtime/i);
 	await expect(page.getByTestId('databricks-runtime-card')).toHaveCount(0);
 	await expect(page.getByTestId('databricks-runtime-hint')).toHaveCount(0);
 
 	const section = page.getByTestId('section-databricks').locator('xpath=ancestor::*[1]/parent::*');
 	await section.screenshot({ path: join(EVIDENCE_DIR, 'databricks-disconnected-picker.png') });
+});
+
+/**
+ * The state pill reports the RUNNING KERNEL, never the stored preference.
+ *
+ * Now that connecting no longer restarts, the two genuinely diverge: a stored `true`
+ * (a prior toggle, or one carried over from the build whose connect wrote it) over a
+ * kernel that started while the notebook was still unbound - so the scope gate
+ * skipped the injection. A preference-derived pill claims "active" there while the
+ * kernel's `DATABRICKS_RUNTIME_VERSION` is unset. This seeds exactly that state (the
+ * preference ON via its own API, the mocked status reporting no live runtime) and
+ * pins that the card says "pending" instead. Runs LAST: it writes the workspace's
+ * preference store.
+ */
+test('the Runtime pill never claims "active" over a kernel without the runtime', async ({ page }) => {
+	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': true } });
+	await mockDatabricksStatus(page, connectedStatus()); // runtime: liveVersion null
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	// The toggle reflects the PREFERENCE (that is what the user set)...
+	await expect(page.getByTestId('databricks-runtime-toggle')).toBeChecked();
+	// ...while the pill reports REALITY, and names the divergence.
+	await expect(page.getByTestId('databricks-runtime-pending')).toBeVisible();
+	await expect(page.getByTestId('databricks-runtime-active')).toHaveCount(0);
+	await expect(page.getByTestId('databricks-runtime-card')).toContainText(/restart the kernel to apply/i);
+
+	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
 });

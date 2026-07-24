@@ -63,10 +63,13 @@
 		expired?: boolean;
 		/**
 		 * The session is down only because the kernel is mid-restart and the server is
-		 * about to rebuild it (`RESTART_LOST_GRACE_MS` in `databricks.ts`). The panel
-		 * reads this exactly like its own in-panel `restarting` flag - hold the
-		 * connecting presentation - so a fast restart never flashes the "lost" card.
-		 * Once the grace lapses the server stops setting it and the real state shows.
+		 * rebuilding it (`restartingAfterKernelRestart` in `databricks.ts`). Set for as
+		 * long as that rebuild is actually in flight - which is seconds, not
+		 * milliseconds: it runs a cluster probe, an install check and a whole Spark
+		 * Connect session build. The panel reads this exactly like its own in-panel
+		 * `restarting` flag - hold the connecting presentation - so a restart never
+		 * flashes the "lost" card. The moment the outcome is known (healed, or gave up)
+		 * the server stops setting it and the real state shows.
 		 */
 		restarting?: boolean;
 		/**
@@ -99,6 +102,15 @@
 		signedInHosts?: string[];
 		/** No-token external-browser profiles this server process has signed in for. */
 		signedInProfiles?: string[];
+		/**
+		 * What the notebook's LIVE kernel session was actually started with for the
+		 * Databricks runtime - never the stored preference. The env is read at import
+		 * time, so it is fixed for a session: a toggle flipped since, or a connect that
+		 * bound a kernel which started unbound, legitimately diverge from it. The Runtime
+		 * card's state pill reads THIS, so it can never claim "active" over a kernel that
+		 * does not advertise the runtime.
+		 */
+		runtime?: { kernelStarted: boolean; liveVersion: string | null };
 	}
 	/** What `POST /api/databricks/logout` reports, so the note can be honest about what was cleared. */
 	interface DbxLogout {
@@ -350,6 +362,20 @@
 	 * in favour of the connecting/connected presentation.
 	 */
 	const expectedRestart = $derived(restarting || !!connection.restarting);
+	/**
+	 * The Databricks runtime the RUNNING kernel actually carries, straight from the
+	 * server (`getStatus().runtime`) - deliberately NOT `runtimeOn`, which is only the
+	 * stored preference this panel just wrote. The env is read at import time, so the
+	 * two honestly diverge whenever the kernel started before the preference applied:
+	 * a toggle is applied by a restart, but a kernel that started while the notebook
+	 * was still unbound (the scope gate) stays without the env until it restarts. The
+	 * card reports reality and names the divergence rather than hiding it.
+	 */
+	const runtimeLiveVersion = $derived(status?.runtime?.liveVersion ?? null);
+	const runtimeActive = $derived(runtimeLiveVersion !== null);
+	const runtimeKernelStarted = $derived(!!status?.runtime?.kernelStarted);
+	/** The preference is ON but the running kernel does not (yet) carry it. */
+	const runtimePending = $derived(runtimeOn && !runtimeActive);
 	const profiles = $derived(status?.config?.profiles ?? []);
 	const hasProfiles = $derived(profiles.length > 0);
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
@@ -543,19 +569,23 @@
 	});
 
 	/**
-	 * The server's `restarting` flag is TIME-BOXED (`RESTART_LOST_GRACE_MS`, ~1s), so
-	 * a read that saw it must be followed by one taken after it lapses - nothing else
-	 * guarantees another. A reconnect that SUCCEEDS publishes `databricks:changed` and
-	 * re-reads on its own, but one that fails (or is never attempted - a torn-down
-	 * kernel, a connect already in flight) publishes nothing, and this panel has no
-	 * periodic poll: without this re-check it would sit on "Reconnecting…" forever
-	 * instead of falling through to the honest lost card. Converges by construction -
-	 * the re-read only re-arms if the server stamped a NEW restart.
+	 * While the server reports `restarting`, poll it - this panel has no periodic poll
+	 * of its own, and nothing else guarantees another read. A reconnect that SUCCEEDS
+	 * publishes `databricks:changed` and re-reads on its own, but one that FAILS (or is
+	 * never attempted - a torn-down kernel, a connect already in flight) publishes
+	 * nothing, so without this the panel would sit on "Reconnecting…" forever instead
+	 * of falling through to the honest lost card.
+	 *
+	 * It is a poll rather than a single delayed re-check because the flag is no longer
+	 * a ~1s window: it now lasts as long as the rebuild is genuinely in flight (a
+	 * cluster probe + install check + Spark Connect session build, i.e. seconds). It
+	 * converges by construction - each fresh status re-runs this effect, and the first
+	 * read that is not `restarting` ends it.
 	 */
-	const RESTART_GRACE_RECHECK_MS = 1200;
+	const RESTART_RECHECK_MS = 1200;
 	$effect(() => {
 		if (!connection.restarting) return;
-		const t = setTimeout(() => loadStatus(), RESTART_GRACE_RECHECK_MS);
+		const t = setTimeout(() => loadStatus(), RESTART_RECHECK_MS);
 		return () => clearTimeout(t);
 	});
 
@@ -1443,10 +1473,15 @@
 				{/each}
 			</div>
 			<!-- Behavior consequence, stated because the OLD behavior restarted the kernel
-			     here: connecting binds spark/w in the running kernel and nothing else. -->
+			     here: connecting binds spark/w in the running kernel and does not enable
+			     the Databricks runtime. The variables-kept claim is QUALIFIED, not
+			     absolute: `ensurePinnedConnect` still restarts the kernel when
+			     databricks-connect has to be re-pinned to the cluster's runtime (the
+			     common shape being a switch to an older-DBR cluster), which is the same
+			     side effect the agent tool reports as `namespace_cleared`. -->
 			<p class="mt-1.5 flex items-start gap-1 text-[11px] leading-relaxed text-base-content/40" data-testid="databricks-connect-note">
 				<svg class="mt-px h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 16v-4M12 8h.01" /></svg>
-				<span>Connecting binds <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code> in the running kernel - your variables are kept.</span>
+				<span>Connecting binds <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code> in the running kernel - your variables are kept, unless the client has to be re-pinned to the cluster's runtime (that restarts the kernel).</span>
 			</p>
 		{:else if clusters}
 			<p class="px-2 py-2 text-xs text-base-content/40">no clusters in this workspace</p>
@@ -1461,7 +1496,12 @@
      connection, default OFF and applied LIVE - toggling (or a version edit) restarts
      the kernel to take effect immediately, and is the ONLY thing that does (a
      connect no longer restarts). Green (toggle-success) is a deliberate Databricks
-     cue, unlike Files' primary toggle. -->
+     cue, unlike Files' primary toggle.
+
+     The TOGGLE shows the stored preference (that is what the user sets); the state
+     pill and the hint show what the LIVE kernel session actually carries. They can
+     honestly differ - the env is read at import time - and that difference IS the
+     "restart to apply" signal, so it is named rather than papered over. -->
 {#snippet runtimeCard()}
 	<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-runtime-card">
 		<div class="flex items-center justify-between gap-2">
@@ -1470,9 +1510,21 @@
 				<span class="flex items-center gap-1 text-[10px] text-base-content/40" data-testid="databricks-runtime-applying">
 					<span class="loading loading-spinner loading-xs"></span>restarting…
 				</span>
-			{:else if runtimeOn}
+			{:else if runtimeActive}
 				<span class="flex items-center gap-1 text-[10px] uppercase tracking-wide text-success" data-testid="databricks-runtime-active">
 					<span class="inline-block h-1.5 w-1.5 rounded-full bg-success"></span>active
+				</span>
+			{:else if runtimePending}
+				<!-- The preference is on but this kernel session was started without the
+				     env (import-time gate), so the pill must NOT say active. -->
+				<span
+					class="flex items-center gap-1 text-[10px] uppercase tracking-wide text-warning"
+					data-testid="databricks-runtime-pending"
+					title={runtimeKernelStarted
+						? 'The running kernel was started without the Databricks runtime. Restart it to apply.'
+						: 'No kernel is running yet; it will start with the Databricks runtime.'}
+				>
+					<span class="inline-block h-1.5 w-1.5 rounded-full bg-warning"></span>pending
 				</span>
 			{:else}
 				<span class="text-[10px] uppercase tracking-wide text-base-content/30" data-testid="databricks-runtime-inactive">off</span>
@@ -1508,9 +1560,16 @@
 				/>
 			</label>
 		{/if}
+		<!-- Says what the RUNNING kernel does, not what the preference asks for: the
+		     env is read at import time, so a preference the current session predates
+		     is pending, not active. -->
 		<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">
-			{#if runtimeOn}
+			{#if runtimeActive}
 				Notebook code that checks for Databricks takes its Databricks path. Toggling restarts the kernel - variables are cleared.
+			{:else if runtimePending && runtimeKernelStarted}
+				The running kernel was started without it, so notebook code still takes its non-Databricks path. Restart the kernel to apply - variables are cleared.
+			{:else if runtimePending}
+				Applies when this notebook's kernel starts; until then notebook code takes its non-Databricks path.
 			{:else}
 				Notebook code runs its non-Databricks path. Turning it on restarts the kernel - variables are cleared.
 			{/if}

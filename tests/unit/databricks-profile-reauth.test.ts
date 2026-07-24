@@ -91,7 +91,9 @@ vi.mock('../../src/lib/server/kernel', () => ({
 	restartKernel: vi.fn(),
 	// Rung 1 of the ladder: a healthy socket needing no repair, so every reconnect
 	// test falls through to the rung it is actually about.
-	refreshKernelConnection: async () => ({ refreshed: false, reason: 'ok' })
+	refreshKernelConnection: async () => ({ refreshed: false, reason: 'ok' }),
+	/** The Runtime card's live state; irrelevant here, so a kernel that carries none. */
+	liveDatabricksRuntime: () => ({ started: true, version: null })
 }));
 
 let dbx: typeof import('../../src/lib/server/databricks');

@@ -80,6 +80,13 @@ export function databricksRuntimeEnabled(storeValue: unknown, envValue?: string 
 	// Default OFF: only an explicit stored `true` enables it. Anything else - unset,
 	// `false`, or junk left by an older build - reads as off, so the user's toggle is
 	// the single thing that turns the runtime on.
+	//
+	// A stored `true` written by the OLD build's connect-time auto-enable is CARRIED
+	// OVER on purpose: that workspace already had the runtime on and working, and
+	// silently turning it off under the user would be its own surprise. Only NEW
+	// connects default to off. Deliberately no one-time migration or reset - and the
+	// Runtime card's state pill is live-derived from the kernel, so the display stays
+	// honest whatever the store holds.
 	return storeValue === true;
 }
 

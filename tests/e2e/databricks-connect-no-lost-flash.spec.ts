@@ -78,11 +78,15 @@ async function mockConnectSequence(page: Page, dropWindowMs: number): Promise<{ 
 
 	await page.route(/\/api\/databricks(\?.*)?$/, async (route) => {
 		if (route.request().method() !== 'GET') return route.continue();
-		let body: unknown;
+		let body: Record<string, unknown>;
 		if (!connectPosted) body = disconnectedStatus();
 		else if (restartAt == null) body = connectedStatus();
 		else if (Date.now() - restartAt < dropWindowMs) body = lostStatus();
 		else body = connectedStatus();
+		// The LIVE kernel state the Runtime card reports: the env is injected at kernel
+		// START, so it becomes live only once the toggle's restart has happened - which
+		// is exactly why a connect (no restart) must leave the card reading not-active.
+		body = { ...body, runtime: { kernelStarted: true, liveVersion: restartAt == null ? null : '15.4' } };
 		await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
 	});
 
@@ -221,8 +225,11 @@ test('connect leaves the runtime off (no restart); turning it on restarts withou
 	await page.getByTestId('databricks-cluster').first().click();
 	await expect(page.getByTestId('databricks-connected')).toBeVisible();
 
-	// The runtime is an explicit opt-in: connecting neither engages it nor restarts.
+	// The runtime is an explicit opt-in: connecting neither engages it nor restarts,
+	// and the card's state pill reports the KERNEL (which carries no runtime), so it
+	// can never read "active" over a session that does not advertise one.
 	await expect(page.getByTestId('databricks-runtime-inactive')).toBeVisible();
+	await expect(page.getByTestId('databricks-runtime-active')).toHaveCount(0);
 	await expect(page.getByTestId('databricks-runtime-toggle')).not.toBeChecked();
 	expect(seq.restarted()).toBe(false);
 	// Give the panel a beat to settle, then confirm no restart snuck in late.
@@ -245,6 +252,9 @@ test('connect leaves the runtime off (no restart); turning it on restarts withou
 	// ...and the scary "lost"/"expired" card NEVER flashed.
 	expect(seen.lost).toBe(false);
 	expect(seen.expired).toBe(false);
+	// The opt-in is now genuinely LIVE in the restarted kernel, which is the only
+	// thing that may turn the pill green.
+	await expect(page.getByTestId('databricks-runtime-active')).toBeVisible();
 });
 
 test('a genuine session loss (no expected restart in flight) still shows "lost" + Reconnect', async ({ page }) => {
@@ -271,10 +281,11 @@ test('a genuine session loss (no expected restart in flight) still shows "lost" 
 });
 
 test('a restart whose reconnect never lands falls through to the lost card', async ({ page }) => {
-	// The server's `restarting` flag is time-boxed, and a reconnect that FAILS
-	// publishes nothing - so the panel (which has no periodic poll) must re-check on
-	// its own once the grace lapses instead of sitting on the spinner forever. The
-	// route reproduces that: `restarting` for a window, then the plain lost shape.
+	// A reconnect that FAILS publishes nothing, so the panel (which has no periodic
+	// poll) must keep re-reading while the server says `restarting` instead of sitting
+	// on the spinner forever. The route reproduces that, with a window deliberately
+	// LONGER than one re-check interval so escaping it takes an actual poll: the flag
+	// is set for a while, then the plain lost shape.
 	let firstReadAt = 0;
 	const RESTARTING_WINDOW_MS = 2000;
 	await page.route(/\/api\/databricks(\?.*)?$/, async (route) => {

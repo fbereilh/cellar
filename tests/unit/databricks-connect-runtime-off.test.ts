@@ -28,7 +28,9 @@ const hoisted = vi.hoisted(() => ({
 	/** Filled in `beforeAll`; the fstree mock closes over it, so it must be hoisted. */
 	dir: '',
 	session: 1 as number | null,
-	connect: { ok: true, host: 'https://test.databricks.com', spark_version: '3.5.0' } as Record<string, unknown>
+	connect: { ok: true, host: 'https://test.databricks.com', spark_version: '3.5.0' } as Record<string, unknown>,
+	/** What the LIVE kernel session was started with - the thing the sidebar reports. */
+	liveRuntime: { started: true, version: null as string | null }
 }));
 
 vi.mock('../../src/lib/server/kernel', () => ({
@@ -46,7 +48,8 @@ vi.mock('../../src/lib/server/kernel', () => ({
 		return {};
 	},
 	currentSessionId: () => hoisted.session,
-	kernelStatus: () => ({ status: 'idle', id: 'k1' })
+	kernelStatus: () => ({ status: 'idle', id: 'k1' }),
+	liveDatabricksRuntime: () => hoisted.liveRuntime
 }));
 
 // `ui-state` resolves its store under the workspace root; point it at the temp dir.
@@ -72,6 +75,7 @@ beforeAll(async () => {
 beforeEach(async () => {
 	hoisted.session = 1;
 	hoisted.connect = { ok: true, host: 'https://test.databricks.com', spark_version: '3.5.0' };
+	hoisted.liveRuntime = { started: true, version: null };
 	// A clean preference store for every case: the whole point is what a connect
 	// leaves behind, so a leftover opt-in from a previous case would mask it.
 	ui.setUiState({ [keys.DBX_RUNTIME_KEY]: null });
@@ -120,5 +124,43 @@ describe('connecting a cluster leaves the Databricks runtime OFF', () => {
 	it('an unbound notebook is never told it is on Databricks, opt-in or not', async () => {
 		ui.setUiState({ [keys.DBX_RUNTIME_KEY]: true });
 		expect(ui.injectDatabricksRuntime(false)).toBe(false);
+	});
+});
+
+/**
+ * The sidebar's Runtime state must describe the RUNNING kernel, not the preference.
+ *
+ * Removing the connect-time restart is exactly what lets the two diverge: a stored
+ * `true` (a prior toggle, or one carried over from the build whose connect wrote it)
+ * over a kernel that started while the notebook was still unbound - the scope gate
+ * skipped the injection - and connecting no longer restarts to reconcile them. A pill
+ * derived from the preference would then claim "active" over a kernel whose
+ * `DATABRICKS_RUNTIME_VERSION` is unset. So `getStatus` reports what the live session
+ * actually carries, and the divergence is what tells the user to restart.
+ */
+describe('the reported runtime state is the KERNEL, not the preference', () => {
+	it('reports no live runtime over a kernel started without it, even with the toggle ON', async () => {
+		await connectA();
+		ui.setUiState({ [keys.DBX_RUNTIME_KEY]: true });
+		hoisted.liveRuntime = { started: true, version: null };
+
+		const st = await dbx.getStatus(A());
+		// The preference says on - the KERNEL says nothing is advertised, and that is
+		// what the card renders: pending, never active.
+		expect(ui.injectDatabricksRuntime(true)).toBe(true);
+		expect(st.runtime).toEqual({ kernelStarted: true, liveVersion: null });
+	});
+
+	it('reports the version the live session was started with', async () => {
+		await connectA();
+		hoisted.liveRuntime = { started: true, version: '15.4' };
+		expect((await dbx.getStatus(A())).runtime).toEqual({ kernelStarted: true, liveVersion: '15.4' });
+	});
+
+	it('reports no kernel at all as not started (nothing to be active in)', async () => {
+		await connectA();
+		ui.setUiState({ [keys.DBX_RUNTIME_KEY]: true });
+		hoisted.liveRuntime = { started: false, version: null };
+		expect((await dbx.getStatus(A())).runtime).toEqual({ kernelStarted: false, liveVersion: null });
 	});
 });

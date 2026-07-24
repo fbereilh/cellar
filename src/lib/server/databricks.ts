@@ -93,7 +93,14 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { execute, currentSessionId, kernelStatus, restartKernel, refreshKernelConnection } from './kernel';
+import {
+	execute,
+	currentSessionId,
+	kernelStatus,
+	restartKernel,
+	refreshKernelConnection,
+	liveDatabricksRuntime
+} from './kernel';
 import {
 	dbrMajorMinor,
 	parseVersionMismatch,
@@ -1471,6 +1478,13 @@ export async function checkInstall(): Promise<InstallStatus> {
  * call may contact the workspace - but the probe is memoized (short TTL) and
  * skipped while the kernel is busy, and it NEVER boots a kernel, so the sidebar
  * poll stays cheap. It never blocks on a reconnect either (see `liveConnection`).
+ *
+ * `runtime` is the LIVE Databricks-runtime state of that notebook's kernel session
+ * (`liveDatabricksRuntime`), NOT the stored toggle preference. The two can honestly
+ * diverge - the env is read at import time, so a preference changed after the kernel
+ * started, or a connect that binds a kernel which started unbound, only takes effect
+ * on the next start - and the Runtime card reports this so it can never claim a
+ * runtime the running kernel does not advertise. Never boots a kernel.
  */
 export async function getStatus(nb?: string | null) {
 	const { configPath: path, exists, profiles, error } = readProfiles();
@@ -1488,8 +1502,21 @@ export async function getStatus(nb?: string | null) {
 		uv: await hasUv(),
 		signedInHosts: [...signedInHosts],
 		signedInProfiles: [...signedInProfiles],
-		connection: await liveConnection(nb)
+		connection: await liveConnection(nb),
+		runtime: runtimeStatus(nb)
 	};
+}
+
+/**
+ * The Databricks-runtime state of a notebook's LIVE kernel session: whether a
+ * kernel exists at all, and the `DATABRICKS_RUNTIME_VERSION` it was actually
+ * started with (null = started without one). The sidebar renders its `active` /
+ * `pending` / `off` state from this rather than from the preference it just wrote,
+ * so it reports reality and lets the divergence read as "restart to apply".
+ */
+function runtimeStatus(nb?: string | null): { kernelStarted: boolean; liveVersion: string | null } {
+	const live = liveDatabricksRuntime(resolveNotebookPath(nb));
+	return { kernelStarted: live.started, liveVersion: live.version };
 }
 
 interface CatalogList {
@@ -2078,11 +2105,13 @@ interface ConnState {
 	 * a reconnect intent was still kept, so `reconnectAfterKernelRestart` is about to
 	 * rebuild it. Stamped by `connectionStatus()`'s reconciliation (the one place a
 	 * restart drives this transition) and read only by `liveConnection`, which holds
-	 * back the "lost" shape for `RESTART_LOST_GRACE_MS` so a fast restart settles
+	 * back the "lost" shape while the rebuild is provably in flight (plus a short
+	 * dispatch floor - see `restartingAfterKernelRestart`), so a restart settles
 	 * straight back to connected instead of flashing the scary lost card at the user.
-	 * Cleared the moment the outcome is known - a successful `connect()`, or a
-	 * reconnect that gave up - so a genuine, persistent loss is never delayed beyond
-	 * the point where we actually know it is one.
+	 * Cleared the moment the outcome is known - a successful `connect()`, a reconnect
+	 * that gave up, a torn-down kernel, an explicit disconnect - so a genuine,
+	 * persistent loss is never delayed beyond the point where we actually know it is
+	 * one.
 	 */
 	restartedAt: number | null;
 	/**
@@ -2171,28 +2200,50 @@ function pendingReauth(s: ConnState): DatabricksError | undefined {
 const LIVENESS_TTL_MS = 15_000;
 
 /**
- * How long an EXPECTED kernel restart may hold the connection in a "restarting"
- * shape before the UI is told the session is lost.
+ * The FLOOR of the expected-restart window: how long a stamped restart may hold the
+ * connection in a "restarting" shape before any reconnect attempt has actually
+ * started.
  *
- * A restart tears the namespace down and rebuilds it (`reconnectAfterKernelRestart`),
- * so for a moment the epoch reconciliation honestly reports "not connected, here is
- * what you lost" - and a status poll landing inside that moment flashed the warning
- * "session lost" card for a fraction of a second before everything went healthy
- * again. This grace is the debounce: a restart that heals inside the window never
- * renders as lost at all. It is deliberately SHORT and deliberately scoped to the
- * restart transition - a loss that outlasts it, and every non-restart loss (an idle
- * expiry, a closed client, a disconnect), still surfaces immediately, because
- * hiding a real loss behind a spinner is worse than the flash it would prevent.
+ * This is only the bridge, NOT the mechanism. A restart tears the namespace down and
+ * `reconnectAfterKernelRestart` rebuilds it, and that rebuild is not fast - it runs
+ * the cluster DBR probe subprocess, `checkInstall`, and a whole Spark Connect session
+ * build, i.e. seconds. A fixed wall-clock window can therefore never cover it: it
+ * would just move the flash later and add a Reconnecting → lost → connected flip,
+ * which is worse than the flash it set out to prevent. So the load-bearing signal is
+ * the POSITIVE one - an attempt provably in flight (`restartAttemptInFlight`) - and
+ * this floor only covers the gap between the epoch change being OBSERVED and that
+ * attempt starting (the reconnect is fired detached, and a status poll can land
+ * first). Past the floor with nothing in flight, the honest answer is "lost".
  */
 const RESTART_LOST_GRACE_MS = 1_000;
 
 /**
- * Is this notebook inside the grace window of an expected kernel restart - i.e.
- * "not connected" here means "mid-restart", not "lost"? Time-based, so it lapses on
- * its own; the stamp is cleared outright once the restart's outcome is known.
+ * Is a reconnect attempt for this notebook genuinely running right now? `inFlight`
+ * is set for the whole of `connect()` (which `reconnectTo` - the one seam both the
+ * restart re-establish and the expiry self-heal go through - drives), and
+ * `reconnecting` covers the expiry heal's own single-flight. Either way something is
+ * actively trying to restore the session, so "not connected" is a state in motion
+ * rather than an outcome.
+ */
+function restartAttemptInFlight(s: ConnState): boolean {
+	return s.inFlight || s.reconnecting !== null;
+}
+
+/**
+ * Is this notebook mid-EXPECTED-restart - i.e. does "not connected" here mean
+ * "being rebuilt", not "lost"?
+ *
+ * Requires the restart stamp (only `connectionStatus()`'s epoch reconciliation sets
+ * it, and only when a reconnect is genuinely coming), and then EITHER an attempt in
+ * flight - for however many seconds it takes - or the short floor while one is still
+ * being dispatched. The stamp is cleared outright the moment the outcome is KNOWN (a
+ * successful `connect()`, a reconnect that gave up, a torn-down kernel, an explicit
+ * disconnect), so a proven failure is never held behind a spinner.
  */
 function restartingAfterKernelRestart(s: ConnState): boolean {
-	return s.restartedAt !== null && Date.now() - s.restartedAt < RESTART_LOST_GRACE_MS;
+	if (s.restartedAt === null) return false;
+	if (restartAttemptInFlight(s)) return true;
+	return Date.now() - s.restartedAt < RESTART_LOST_GRACE_MS;
 }
 
 /**
@@ -2813,8 +2864,9 @@ export async function agentStatus(nb?: string | null) {
  * reporting a dead session as "connected" on the strength of a still-current
  * epoch. Never blocks on a reconnect (see `assessLiveness`'s `heal:false`).
  *
- * It is also where the kernel-restart grace is applied (`RESTART_LOST_GRACE_MS`):
- * a loss the restart is about to undo comes back flagged `restarting`, so the panel
+ * It is also where the kernel-restart grace is applied (see
+ * `restartingAfterKernelRestart`): a loss the restart is about to undo comes back
+ * flagged `restarting` for as long as the rebuild is actually in flight, so the panel
  * holds its connecting presentation instead of flashing "lost". Deliberately UI-only
  * - `agentStatus` keeps reporting the plain truth, since an agent asks a question
  * and gets one answer rather than watching a card repaint.
@@ -3289,6 +3341,11 @@ export async function disconnect(nb?: string | null): Promise<{ ok: true }> {
 	const s = stateFor(abs);
 	if (s.inFlight) throw new DatabricksError('busy', 'a Databricks connect is already in progress');
 	s.inFlight = true;
+	// Retire any expected-restart stamp UP FRONT: the user has declared the session
+	// over, so nothing is being ridden out any more. Without this, `inFlight` (which a
+	// disconnect also sets) would read as "a reconnect is running" for the length of
+	// the teardown and the panel would render "Reconnecting…" over a disconnect.
+	s.restartedAt = null;
 	try {
 		// Nothing to stop if the kernel that held it is gone; just clear our state.
 		if (connectionStatus(abs).connected) await runInKernel(abs, DISCONNECT_CODE);

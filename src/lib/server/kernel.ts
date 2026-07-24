@@ -78,6 +78,17 @@ interface NotebookKernel {
 	/** Cell executions run in this notebook's current epoch (internal probes excluded). */
 	execsThisSession: number;
 	/**
+	 * The `DATABRICKS_RUNTIME_VERSION` this kernel's CURRENT session was actually
+	 * started with, or null when it was started without one. Written by `initKernel`
+	 * (the single place that decides the injection) and reset by `beginSession`, so
+	 * it describes the LIVE namespace rather than the stored preference. The gate is
+	 * import-time, so the two can legitimately disagree - a preference changed after
+	 * the kernel started only takes effect on the next start - and the sidebar's
+	 * Runtime card reports THIS, never the preference, so it can never claim a
+	 * runtime the running kernel does not advertise.
+	 */
+	databricksRuntime: string | null;
+	/**
 	 * How many USER (non-internal) runs are currently executing on this kernel.
 	 * Gates the status broadcast: a busy/idle flip is fanned out to the Kernels
 	 * sidebar only while this is > 0. Flips caused solely by internal work — inspect/
@@ -559,6 +570,9 @@ function reconcileCulledKernels(): void {
 function beginSession(nbKernel: NotebookKernel): void {
 	nbKernel.sessionId = ++sessionCounter;
 	nbKernel.execsThisSession = 0;
+	// A fresh namespace advertises nothing until `initKernel` decides again: the env
+	// is set by an injected snippet, so it dies with the namespace that held it.
+	nbKernel.databricksRuntime = null;
 	// A fresh namespace has no widgets: drop this kernel's progress/interactive
 	// models and forget their comms so a send can never target a dead model.
 	const commIds = [...nbKernel.widgetComms.keys()];
@@ -1145,7 +1159,8 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 	}
 }
 
-async function initKernel(kernel: KernelConnection, nbPath: string): Promise<void> {
+async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): Promise<void> {
+	const { nbPath } = nbKernel;
 	// Coalesce every startup injection into ONE round-trip in front of the first
 	// user result. Each block is independently guarded (a matplotlib/pandas/IPython
 	// failure degrades to a no-op) and defines-then-`del`s its own private temp
@@ -1163,9 +1178,14 @@ async function initKernel(kernel: KernelConnection, nbPath: string): Promise<voi
 	// notebooks BOUND to a Databricks cluster so a purely-local kernel is never told
 	// it is on Databricks; an explicit env override can force it. Re-read here so a
 	// restart of a bound notebook re-applies it - which is exactly the "restart to
-	// apply" contract the toggle relies on.
+	// apply" contract the toggle relies on. What is decided here is RECORDED on the
+	// session (`databricksRuntime`), because it is the only place that knows what this
+	// namespace was actually started with - the preference can change afterwards, and
+	// the sidebar must report the kernel, not the preference.
 	if (injectDatabricksRuntime(await databricksNotebookBound(nbPath))) {
-		parts.push(databricksRuntimeEnvCode(databricksRuntimeVersion()));
+		const version = databricksRuntimeVersion();
+		nbKernel.databricksRuntime = version;
+		parts.push(databricksRuntimeEnvCode(version));
 	}
 	parts.push(
 		// matplotlib inline backend → Figures emit image/png, not their text repr.
@@ -1220,6 +1240,7 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		connection: null,
 		sessionId: 0,
 		execsThisSession: 0,
+		databricksRuntime: null,
 		userRuns: 0,
 		statusHandler: null,
 		widgetComms: new Map(),
@@ -1288,12 +1309,12 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 			// Re-inject the startup code, THEN best-effort re-establish a Databricks
 			// session if this notebook had one (both after the namespace is fresh).
 			// Detached so a jupyter-driven autorestart is never blocked by either.
-			void initKernel(kernel, nbPath)
+			void initKernel(nbKernel, kernel)
 				.then(() => reconnectDatabricksAfterRestart(nbPath))
 				.catch(() => {});
 		};
 		kernel.statusChanged.connect(nbKernel.statusHandler);
-		await initKernel(kernel, nbPath);
+		await initKernel(nbKernel, kernel);
 		logInfo('kernel', `kernel for ${nbPath} started (session ${nbKernel.sessionId})`);
 		// The kernel is up: refresh its card from "starting" to its live status, and
 		// begin sampling its resident memory (the poller self-stops when no kernel
@@ -1368,7 +1389,7 @@ export async function restartKernel(nbPath?: string | null) {
 		beginSession(nbKernel);
 	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
-	await initKernel(kernel, abs);
+	await initKernel(nbKernel, kernel);
 	publishKernelStatus();
 	// If this notebook had a live Databricks session, rebuild it against the same
 	// profile+cluster now the namespace is fresh. Detached (void) so it never blocks
@@ -1722,6 +1743,27 @@ export function kernelSession(nbPath?: string | null) {
 		status: nbKernel.connection.status,
 		execs_this_session: nbKernel.execsThisSession
 	};
+}
+
+/**
+ * What the LIVE kernel session of notebook `nbPath` was actually started with for
+ * the Databricks runtime - never the stored preference.
+ *
+ * `DATABRICKS_RUNTIME_VERSION` is read at IMPORT time, so it is fixed for a session
+ * the moment `initKernel` decides it: a preference toggled afterwards, a connect
+ * that binds a notebook a running kernel started unbound, or an env override all
+ * make the preference and the running namespace disagree. The sidebar's Runtime
+ * card reports THIS, so it can never claim a runtime the kernel does not advertise
+ * (and the divergence itself becomes the "restart to apply" signal). Never starts a
+ * kernel: `started:false` means there is no session to describe yet.
+ */
+export function liveDatabricksRuntime(nbPath?: string | null): {
+	started: boolean;
+	version: string | null;
+} {
+	const nbKernel = kernels.get(resolveNb(nbPath));
+	if (!nbKernel || !nbKernel.connection) return { started: false, version: null };
+	return { started: true, version: nbKernel.databricksRuntime };
 }
 
 /** The epoch a run should be stamped with for notebook `nbPath`, or null when its kernel is not running. */
