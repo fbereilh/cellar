@@ -16,6 +16,7 @@ import {
 	DBX_RUNTIME_VERSION_KEY,
 	DBX_RUNTIME_VERSION_DEFAULT,
 	databricksRuntimeEnabled,
+	databricksRuntimeOverride,
 	shouldInjectDatabricksRuntime,
 	databricksRuntimeVersion,
 	databricksRuntimeEnvCode
@@ -54,6 +55,40 @@ describe('databricksRuntimeEnabled (toggle preference)', () => {
 	it('exposes stable store keys', () => {
 		expect(DBX_RUNTIME_KEY).toBe('cellar-databricks-runtime');
 		expect(DBX_RUNTIME_VERSION_KEY).toBe('cellar-databricks-runtime-version');
+	});
+});
+
+/**
+ * The override's verdict is exported on its own because the UI needs to know the
+ * decision is FORCED, not merely what it resolved to: neither the toggle nor a kernel
+ * restart can move an env-forced decision, so a card that could not see it would
+ * offer an "Apply now" restart that wipes the namespace and changes nothing.
+ */
+describe('databricksRuntimeOverride (who decides)', () => {
+	it('reports the forced value for every recognized spelling', () => {
+		for (const on of ['1', 'true', 'on', 'yes', ' TRUE ']) expect(databricksRuntimeOverride(on)).toBe(true);
+		for (const off of ['0', 'false', 'off', 'no', ' OFF ']) expect(databricksRuntimeOverride(off)).toBe(false);
+	});
+
+	it('reports null when nothing is forced, so the store decides', () => {
+		expect(databricksRuntimeOverride(undefined)).toBe(null);
+		expect(databricksRuntimeOverride(null)).toBe(null);
+		expect(databricksRuntimeOverride('')).toBe(null);
+		expect(databricksRuntimeOverride('maybe')).toBe(null);
+	});
+
+	it('agrees with the resolvers it backs - it IS their override parser', () => {
+		for (const env of ['1', '0', '', 'maybe', undefined]) {
+			const forced = databricksRuntimeOverride(env);
+			if (forced !== null) {
+				expect(databricksRuntimeEnabled(!forced, env)).toBe(forced);
+				// A forced decision bypasses the connection scope, in both directions.
+				expect(shouldInjectDatabricksRuntime(!forced, env, false)).toBe(forced);
+			} else {
+				expect(databricksRuntimeEnabled(true, env)).toBe(true);
+				expect(databricksRuntimeEnabled(false, env)).toBe(false);
+			}
+		}
 	});
 });
 

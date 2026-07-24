@@ -109,8 +109,13 @@
 		 * bound a kernel which started unbound, legitimately diverge from it. The Runtime
 		 * card's state pill reads THIS, so it can never claim "active" over a kernel that
 		 * does not advertise the runtime.
+		 *
+		 * `envForced` says WHO decides: `true`/`false` when `CELLAR_DATABRICKS_RUNTIME`
+		 * forces it, `null` when the stored preference does. The client cannot read the
+		 * server's env, so this is the only way it knows the toggle (and a restart) cannot
+		 * change the outcome.
 		 */
-		runtime?: { kernelStarted: boolean; liveVersion: string | null };
+		runtime?: { kernelStarted: boolean; liveVersion: string | null; envForced?: boolean | null };
 	}
 	/** What `POST /api/databricks/logout` reports, so the note can be honest about what was cleared. */
 	interface DbxLogout {
@@ -259,7 +264,7 @@
 
 	/** Toggle the runtime on/off; applies IMMEDIATELY by restarting the kernel. */
 	async function toggleRuntime() {
-		if (runtimeApplying || busy) return;
+		if (runtimeApplying || busy || runtimeEnvControlled) return;
 		runtimeApplying = true;
 		try {
 			await applyRuntime(!runtimeOn);
@@ -284,9 +289,13 @@
 	 * off-then-on double restart as the only route. Third caller of `applyRuntime`,
 	 * same shape as the other two, so the restart, the suppressed lost-flash and the
 	 * settle handling are identical.
+	 *
+	 * Guarded by `runtimeApplicable`, so it can only ever run where a restart really
+	 * applies the runtime: an env-forced decision and a missing notebook path both make
+	 * the restart a no-op that still costs the user their namespace.
 	 */
 	async function applyPendingRuntime() {
-		if (runtimeApplying || busy || !runtimePending || !runtimeKernelStarted) return;
+		if (runtimeApplying || busy || !runtimeApplicable) return;
 		runtimeApplying = true;
 		try {
 			await applyRuntime(true);
@@ -299,11 +308,15 @@
 
 	/** Commit a version edit (blur/Enter): restart to apply only if it truly changed. */
 	async function commitVersion() {
-		if (runtimeApplying || busy || !runtimeOn) return;
+		if (runtimeApplying || busy || !runtimeEffectiveOn) return;
+		if (!notebookPath || !onRestartKernel) return;
 		if ((runtimeVersion.trim() || DBX_RUNTIME_VERSION_DEFAULT) === appliedVersion) return;
 		runtimeApplying = true;
 		try {
-			await applyRuntime(true);
+			// Pass the STORED preference, not `true`: under an env override the runtime is
+			// on without the user having opted in, and a version edit must not silently
+			// write an opt-in they never made.
+			await applyRuntime(runtimeOn);
 			await settleConnection();
 		} finally {
 			runtimeApplying = false;
@@ -395,8 +408,29 @@
 	const runtimeLiveVersion = $derived(status?.runtime?.liveVersion ?? null);
 	const runtimeActive = $derived(runtimeLiveVersion !== null);
 	const runtimeKernelStarted = $derived(!!status?.runtime?.kernelStarted);
-	/** The preference is ON but the running kernel does not (yet) carry it. */
-	const runtimePending = $derived(runtimeOn && !runtimeActive);
+	/**
+	 * `CELLAR_DATABRICKS_RUNTIME` forces the decision (`true`/`false`), so neither the
+	 * toggle nor a kernel restart can change it. The card must say so rather than
+	 * present a state the user can act on: with a forced-OFF override over a stored
+	 * `true` (the carried-over preference this build deliberately does not migrate) the
+	 * card would otherwise sit in `pending` forever, offering an "Apply now" that wipes
+	 * the namespace and returns to `pending` on every click.
+	 */
+	const runtimeEnvForced = $derived(status?.runtime?.envForced ?? null);
+	const runtimeEnvControlled = $derived(runtimeEnvForced !== null);
+	/** What is actually in force: the override when there is one, else the preference. */
+	const runtimeEffectiveOn = $derived(runtimeEnvForced ?? runtimeOn);
+	/** The runtime is meant to be on, but the running kernel does not (yet) carry it. */
+	const runtimePending = $derived(runtimeEffectiveOn && !runtimeActive);
+	/**
+	 * A restart would genuinely apply the runtime: it is pending, a kernel is running to
+	 * restart, the decision is the user's (not the environment's), and there is a
+	 * notebook to restart. `applyRuntime`'s restart is guarded on `notebookPath`, so
+	 * without that last clause the button would spin and change nothing.
+	 */
+	const runtimeApplicable = $derived(
+		runtimePending && runtimeKernelStarted && !runtimeEnvControlled && !!notebookPath && !!onRestartKernel
+	);
 	const profiles = $derived(status?.config?.profiles ?? []);
 	const hasProfiles = $derived(profiles.length > 0);
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
@@ -1563,9 +1597,11 @@
 				<span
 					class="flex items-center gap-1 text-[10px] uppercase tracking-wide text-warning"
 					data-testid="databricks-runtime-pending"
-					title={runtimeKernelStarted
-						? 'The running kernel was started without the Databricks runtime. Restart it to apply.'
-						: 'No kernel is running yet; it will start with the Databricks runtime.'}
+					title={!runtimeKernelStarted
+						? 'No kernel is running yet; it will start with the Databricks runtime.'
+						: runtimeEnvControlled
+							? 'The environment advertises the Databricks runtime; this kernel started before that took effect.'
+							: 'The running kernel was started without the Databricks runtime. Restart it to apply.'}
 				>
 					<span class="inline-block h-1.5 w-1.5 rounded-full bg-warning"></span>pending
 				</span>
@@ -1573,21 +1609,27 @@
 				<span class="text-[10px] uppercase tracking-wide text-base-content/30" data-testid="databricks-runtime-inactive">off</span>
 			{/if}
 		</div>
+		<!-- The toggle shows what is IN FORCE (the override when there is one), and is
+		     disabled under an override: a switch that silently changes nothing is worse
+		     than one that says who is holding it. -->
 		<label
-			class="mt-1.5 flex cursor-pointer items-center gap-2 text-[11px] text-base-content/70"
-			title="Makes this kernel look like a Databricks cluster, so notebook code that checks whether it is running on Databricks takes its dbutils.widgets path. Affects all libraries (e.g. mlflow) and restarts the kernel to apply. It does not connect a cluster - use Databricks Connect for spark/Unity Catalog."
+			class="mt-1.5 flex items-center gap-2 text-[11px] text-base-content/70"
+			class:cursor-pointer={!runtimeEnvControlled}
+			title={runtimeEnvControlled
+				? 'Set by the CELLAR_DATABRICKS_RUNTIME environment variable, which overrides this setting.'
+				: 'Makes this kernel look like a Databricks cluster, so notebook code that checks whether it is running on Databricks takes its dbutils.widgets path. Affects all libraries (e.g. mlflow) and restarts the kernel to apply. It does not connect a cluster - use Databricks Connect for spark/Unity Catalog.'}
 		>
 			<input
 				type="checkbox"
 				class="toggle toggle-xs toggle-success"
-				checked={runtimeOn}
+				checked={runtimeEffectiveOn}
 				onchange={toggleRuntime}
-				disabled={runtimeApplying || !!busy}
+				disabled={runtimeApplying || !!busy || runtimeEnvControlled}
 				data-testid="databricks-runtime-toggle"
 			/>
 			<span>Databricks runtime (<code class="font-mono text-[10px]">dbutils.widgets</code>)</span>
 		</label>
-		{#if runtimeOn}
+		{#if runtimeEffectiveOn}
 			<label class="mt-1.5 flex items-center gap-2 text-[11px] text-base-content/50">
 				<span class="shrink-0">version</span>
 				<input
@@ -1605,9 +1647,20 @@
 		{/if}
 		<!-- Says what the RUNNING kernel does, not what the preference asks for: the
 		     env is read at import time, so a preference the current session predates
-		     is pending, not active. -->
+		     is pending, not active. An env-forced decision is stated as such: a restart
+		     cannot change it, so the copy must not send the user after one. -->
 		<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">
-			{#if runtimeActive}
+			{#if runtimeEnvControlled}
+				{#if runtimeActive}
+					Notebook code that checks for Databricks takes its Databricks path.
+				{:else if runtimePending}
+					Applies when this notebook's kernel starts; until then notebook code takes its non-Databricks path.
+				{:else}
+					Notebook code runs its non-Databricks path.
+				{/if}
+				Controlled by the <code class="font-mono text-[10px]">CELLAR_DATABRICKS_RUNTIME</code> environment variable, not by this
+				toggle - change it where Cellar is launched.
+			{:else if runtimeActive}
 				Notebook code that checks for Databricks takes its Databricks path. Toggling restarts the kernel - variables are cleared.
 			{:else if runtimePending && runtimeKernelStarted}
 				The running kernel was started without it, so notebook code still takes its non-Databricks path. Restart the kernel to apply - variables are cleared.
@@ -1617,19 +1670,24 @@
 				Notebook code runs its non-Databricks path. Turning it on restarts the kernel - variables are cleared.
 			{/if}
 		</p>
-		<!-- The one state with something to apply: the preference is on and the running
+		<!-- The one state with something to apply: the runtime is on and the running
 		     kernel does not carry it. Rendered ONLY here - anywhere else this would be a
 		     restart (and a namespace wipe) nobody asked for. It reuses `applyRuntime`, so
-		     it behaves exactly like the toggle's restart, minus the preference change. -->
-		{#if runtimePending && runtimeKernelStarted && !runtimeApplying}
+		     it behaves exactly like the toggle's restart, minus the preference change.
+		     An env-forced decision is excluded outright (no restart can change it, so the
+		     button would loop forever wiping the namespace); a missing notebook path only
+		     DISABLES it, because there the remedy is simply to open a notebook. -->
+		{#if runtimePending && runtimeKernelStarted && !runtimeEnvControlled && !runtimeApplying}
 			<button
 				class="btn btn-outline btn-xs mt-1.5 w-full"
 				onclick={applyPendingRuntime}
-				disabled={!!busy}
-				title="Restart this notebook's kernel so it starts with the Databricks runtime. Variables are cleared."
+				disabled={!!busy || !runtimeApplicable}
+				title={runtimeApplicable
+					? "Restart this notebook's kernel so it starts with the Databricks runtime. Variables are cleared."
+					: 'Open a notebook to restart its kernel.'}
 				data-testid="databricks-runtime-apply"
 			>
-				Apply now (restarts kernel)
+				{runtimeApplicable ? 'Apply now (restarts kernel)' : 'Apply now - open a notebook first'}
 			</button>
 		{/if}
 	</div>

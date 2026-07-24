@@ -243,3 +243,82 @@ test('the Runtime pill never claims "active" over a kernel without the runtime',
 
 	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
 });
+
+/**
+ * "Apply now" may only appear where clicking it can actually do something.
+ *
+ * Every click costs the user their namespace (a kernel restart, the Databricks
+ * session rebuilt), so a state where the restart cannot change the outcome must not
+ * offer it at all. Two such states, both proven here:
+ *
+ *   - the decision is FORCED by `CELLAR_DATABRICKS_RUNTIME` (`runtime.envForced`):
+ *     no toggle and no restart can move it, so the card says the environment is in
+ *     control and offers nothing. Without this the carried-over stored `true` this
+ *     build deliberately does not migrate would sit in "pending" forever, wiping the
+ *     namespace on every click and landing back on pending.
+ *   - there is no active NOTEBOOK to restart: `applyRuntime`'s restart is guarded on
+ *     the notebook path, so the click would spin and change nothing.
+ *
+ * Both run with the preference stored ON, so the ordinary pending case (proven
+ * enabled above) is the only difference.
+ */
+test('an env-FORCED runtime says the environment controls it and offers no Apply now', async ({ page }) => {
+	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': true } });
+	// Forced OFF over a stored ON - the exact shape that used to loop.
+	await mockDatabricksStatus(page, {
+		...connectedStatus(),
+		runtime: { kernelStarted: true, liveVersion: null, envForced: false }
+	});
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	const card = page.getByTestId('databricks-runtime-card');
+	await expect(card).toBeVisible();
+	// The override is what is in force, so the toggle shows OFF and is not in control.
+	const toggle = page.getByTestId('databricks-runtime-toggle');
+	await expect(toggle).not.toBeChecked();
+	await expect(toggle).toBeDisabled();
+	await expect(card).toContainText(/CELLAR_DATABRICKS_RUNTIME/);
+	await expect(card).toContainText(/not by this\s+toggle/i);
+	// Nothing to apply, and no restart on offer.
+	await expect(page.getByTestId('databricks-runtime-apply')).toHaveCount(0);
+	await expect(card).not.toContainText(/restart the kernel to apply/i);
+
+	// Forced ON over a kernel started without it is still the environment's call: the
+	// pill is honest ("pending"), but a restart is not something the card asks for.
+	await mockDatabricksStatus(page, {
+		...connectedStatus(),
+		runtime: { kernelStarted: true, liveVersion: null, envForced: true }
+	});
+	await page.reload();
+	await openDatabricksSection(page);
+	await expect(page.getByTestId('databricks-runtime-toggle')).toBeChecked();
+	await expect(page.getByTestId('databricks-runtime-toggle')).toBeDisabled();
+	await expect(page.getByTestId('databricks-runtime-pending')).toBeVisible();
+	await expect(page.getByTestId('databricks-runtime-apply')).toHaveCount(0);
+
+	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
+});
+
+test('with no notebook open, Apply now is disabled and says so - never a silent no-op', async ({ page }) => {
+	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': true } });
+	await mockDatabricksStatus(page, connectedStatus()); // pending: kernel started, no live runtime
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	// Deliberately leave NO notebook open: the sidebar then has no active notebook
+	// path, which is what makes the restart a no-op. The tab session is persisted
+	// per workspace SERVER-side, so an earlier test's notebook can be restored here -
+	// close whatever came back rather than assuming a clean slate.
+	const closers = page.getByTestId('tab-close');
+	for (let i = 0; i < 8 && (await closers.count()) > 0; i++) await closers.first().click();
+	await expect(page.getByTestId('empty-state')).toBeVisible();
+	await openDatabricksSection(page);
+
+	await expect(page.getByTestId('databricks-runtime-pending')).toBeVisible();
+	const apply = page.getByTestId('databricks-runtime-apply');
+	await expect(apply).toBeVisible();
+	await expect(apply).toBeDisabled();
+	await expect(apply).toContainText(/open a notebook/i);
+
+	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
+});

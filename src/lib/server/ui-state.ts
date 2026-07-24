@@ -26,6 +26,7 @@ import {
 	DBX_RUNTIME_KEY,
 	DBX_RUNTIME_VERSION_KEY,
 	shouldInjectDatabricksRuntime,
+	databricksRuntimeOverride,
 	databricksRuntimeVersion as resolveDatabricksRuntimeVersion
 } from '$lib/server/databricksRuntime';
 
@@ -102,6 +103,18 @@ export function injectDatabricksRuntime(bound: boolean): boolean {
 		process.env.CELLAR_DATABRICKS_RUNTIME,
 		bound
 	);
+}
+
+/**
+ * Whether the runtime decision is FORCED by `CELLAR_DATABRICKS_RUNTIME` (`true`/
+ * `false`), or `null` when the store decides. Surfaced to the sidebar so it can say
+ * the environment is in control rather than presenting a state the user can change:
+ * a forced decision survives every toggle and every kernel restart, so offering an
+ * "Apply now" restart there would clear the namespace and change nothing. Derived
+ * from the same predicate the inject decision uses. See `databricksRuntime.ts`.
+ */
+export function databricksRuntimeForced(): boolean | null {
+	return databricksRuntimeOverride(process.env.CELLAR_DATABRICKS_RUNTIME);
 }
 
 /**

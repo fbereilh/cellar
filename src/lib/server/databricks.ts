@@ -110,6 +110,7 @@ import {
 import { normalizeDatabricksHost } from '../databricksHost';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
 import { resolveNotebookPath } from './notebook';
+import { databricksRuntimeForced } from './ui-state';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
@@ -1589,10 +1590,21 @@ export async function getStatus(nb?: string | null) {
  * started with (null = started without one). The sidebar renders its `active` /
  * `pending` / `off` state from this rather than from the preference it just wrote,
  * so it reports reality and lets the divergence read as "restart to apply".
+ *
+ * `envForced` carries WHO decides: `true`/`false` when `CELLAR_DATABRICKS_RUNTIME`
+ * forces it, `null` when the stored preference does. The client cannot see the
+ * server's env, so without this it would read a forced-off decision as a preference
+ * the user can apply - offering an "Apply now" restart that clears the namespace and
+ * leaves the state exactly where it was, every time. With it the card says the
+ * environment is in control instead.
  */
-function runtimeStatus(nb?: string | null): { kernelStarted: boolean; liveVersion: string | null } {
+function runtimeStatus(nb?: string | null): {
+	kernelStarted: boolean;
+	liveVersion: string | null;
+	envForced: boolean | null;
+} {
 	const live = liveDatabricksRuntime(resolveNotebookPath(nb));
-	return { kernelStarted: live.started, liveVersion: live.version };
+	return { kernelStarted: live.started, liveVersion: live.version, envForced: databricksRuntimeForced() };
 }
 
 interface CatalogList {

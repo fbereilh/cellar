@@ -148,19 +148,70 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 		// The preference says on - the KERNEL says nothing is advertised, and that is
 		// what the card renders: pending, never active.
 		expect(ui.injectDatabricksRuntime(true)).toBe(true);
-		expect(st.runtime).toEqual({ kernelStarted: true, liveVersion: null });
+		expect(st.runtime).toEqual({ kernelStarted: true, liveVersion: null, envForced: null });
 	});
 
 	it('reports the version the live session was started with', async () => {
 		await connectA();
 		hoisted.liveRuntime = { started: true, version: '15.4' };
-		expect((await dbx.getStatus(A())).runtime).toEqual({ kernelStarted: true, liveVersion: '15.4' });
+		expect((await dbx.getStatus(A())).runtime).toEqual({
+			kernelStarted: true,
+			liveVersion: '15.4',
+			envForced: null
+		});
 	});
 
 	it('reports no kernel at all as not started (nothing to be active in)', async () => {
 		await connectA();
 		ui.setUiState({ [keys.DBX_RUNTIME_KEY]: true });
 		hoisted.liveRuntime = { started: false, version: null };
-		expect((await dbx.getStatus(A())).runtime).toEqual({ kernelStarted: false, liveVersion: null });
+		expect((await dbx.getStatus(A())).runtime).toEqual({
+			kernelStarted: false,
+			liveVersion: null,
+			envForced: null
+		});
+	});
+});
+
+/**
+ * WHO decides is reported too, not just what was decided.
+ *
+ * `CELLAR_DATABRICKS_RUNTIME` forces the inject decision either way, and the browser
+ * cannot see the server's environment. Without that fact on the wire the sidebar
+ * reads a forced-OFF override over a stored `true` (the carried-over preference this
+ * build deliberately does not migrate) as an ordinary "pending" the user can fix -
+ * and its "Apply now" restart then clears the namespace and lands back on pending,
+ * repeatably. So the card needs to know the decision is the operator's.
+ */
+describe('getStatus reports whether the runtime decision is env-FORCED', () => {
+	beforeEach(() => {
+		delete process.env.CELLAR_DATABRICKS_RUNTIME;
+	});
+
+	it('reports null when no override is set - the stored preference decides', async () => {
+		await connectA();
+		expect((await dbx.getStatus(A())).runtime.envForced).toBe(null);
+	});
+
+	it('reports the forced value, and it outranks the stored preference in both directions', async () => {
+		await connectA();
+		// Forced OFF over a stored ON: no injection, and the card must say so rather than
+		// offer a restart that cannot change it.
+		ui.setUiState({ [keys.DBX_RUNTIME_KEY]: true });
+		process.env.CELLAR_DATABRICKS_RUNTIME = '0';
+		expect((await dbx.getStatus(A())).runtime.envForced).toBe(false);
+		expect(ui.injectDatabricksRuntime(true)).toBe(false);
+
+		// Forced ON over a stored OFF: the toggle is equally not in control.
+		ui.setUiState({ [keys.DBX_RUNTIME_KEY]: false });
+		process.env.CELLAR_DATABRICKS_RUNTIME = '1';
+		expect((await dbx.getStatus(A())).runtime.envForced).toBe(true);
+		expect(ui.injectDatabricksRuntime(true)).toBe(true);
+	});
+
+	it('an unrecognized override is not a decision - the store still decides', async () => {
+		await connectA();
+		process.env.CELLAR_DATABRICKS_RUNTIME = 'maybe';
+		expect((await dbx.getStatus(A())).runtime.envForced).toBe(null);
 	});
 });

@@ -52,10 +52,17 @@ export const DBX_RUNTIME_VERSION_KEY = 'cellar-databricks-runtime-version';
 export const DBX_RUNTIME_VERSION_DEFAULT = '15.4';
 
 /**
- * Parse an env override to an explicit boolean, or `null` when unset / empty /
- * unrecognized (so the caller falls back to the store).
+ * The env override's verdict: `true`/`false` when `CELLAR_DATABRICKS_RUNTIME` forces
+ * the decision, `null` when it is unset / empty / unrecognized (so the store decides).
+ *
+ * Exported because the UI must be able to see that the decision is FORCED, not merely
+ * what it resolved to: a forced decision cannot be changed by the toggle or by
+ * restarting the kernel, so the Runtime card has to say the environment controls it
+ * instead of offering an "Apply now" restart that would clear the namespace and
+ * change nothing. Every consumer derives it here rather than re-parsing the env, so
+ * the display and the inject decision can never disagree about what the operator set.
  */
-function parseBoolEnv(envValue?: string | null): boolean | null {
+export function databricksRuntimeOverride(envValue?: string | null): boolean | null {
 	if (envValue == null || envValue === '') return null;
 	const v = envValue.trim().toLowerCase();
 	if (v === '0' || v === 'false' || v === 'off' || v === 'no') return false;
@@ -75,7 +82,7 @@ function parseBoolEnv(envValue?: string | null): boolean | null {
  * `shouldInjectDatabricksRuntime`).
  */
 export function databricksRuntimeEnabled(storeValue: unknown, envValue?: string | null): boolean {
-	const override = parseBoolEnv(envValue);
+	const override = databricksRuntimeOverride(envValue);
 	if (override !== null) return override;
 	// Default OFF: only an explicit stored `true` enables it. Anything else - unset,
 	// `false`, or junk left by an older build - reads as off, so the user's toggle is
@@ -111,7 +118,7 @@ export function shouldInjectDatabricksRuntime(
 	// one place. An explicit env override forces the decision either way AND bypasses
 	// the connection scope; otherwise the resolved preference must be ON and the
 	// notebook must be `bound` to a cluster.
-	return databricksRuntimeEnabled(storeValue, envValue) && (parseBoolEnv(envValue) !== null || bound);
+	return databricksRuntimeEnabled(storeValue, envValue) && (databricksRuntimeOverride(envValue) !== null || bound);
 }
 
 /**
