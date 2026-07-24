@@ -18,24 +18,23 @@
  *
  * Two deliberate divergences from the sibling `projectRoot.ts` toggle:
  *
- *   1. **Scoped to a Databricks-connected notebook, default ON there.** When a
- *      notebook is bound to a Databricks cluster you generally want its
- *      `IS_DATABRICKS`-gated code to behave as on-Databricks (widgets, not the
- *      CLI path), so the default is ON - but ONLY for a connected notebook. A
- *      purely-local kernel is never told it is on Databricks, because setting this
- *      env advertises a runtime to ALL libraries, not just the user's own
- *      `IS_DATABRICKS` checks - notably mlflow's `is_in_databricks_runtime()`
- *      reads this exact var and will assume it is on a cluster. Scoping the
- *      default to the connected context is how we default on without spoofing the
- *      runtime for local work. An explicit env override (`CELLAR_DATABRICKS_RUNTIME`)
- *      forces the decision either way for headless / CI / operator opt-in,
- *      bypassing the connection scope.
+ *   1. **Default OFF, and additionally scoped to a Databricks-connected notebook.**
+ *      Advertising a runtime is an OPT-IN: it changes behavior for ALL libraries,
+ *      not just the user's own `IS_DATABRICKS` checks - notably mlflow's
+ *      `is_in_databricks_runtime()` reads this exact var and will assume it is on a
+ *      cluster - and turning it on costs a kernel restart (the namespace is
+ *      cleared). So connecting a cluster deliberately does NOT enable it: a connect
+ *      binds `spark`/`w` and leaves the kernel running, and the user opts in via the
+ *      Runtime toggle, which is the ONLY thing that restarts the kernel for this
+ *      setting. (This reverses an earlier "connect auto-enables it" behavior.) The
+ *      connection scope is kept on top of the OFF default so a stored ON never
+ *      spoofs the runtime for a notebook that is no longer bound to a cluster. An
+ *      explicit env override (`CELLAR_DATABRICKS_RUNTIME`) forces the decision
+ *      either way for headless / CI / operator opt-in, bypassing that scope.
  *   2. It applies at kernel start / restart ONLY (no live-apply): `IS_DATABRICKS`
  *      is an import-time gate, so setting the env in a kernel that already imported
- *      the user's package does not re-flip it. Restart to apply. (This composes
- *      naturally with Databricks Connect: connect binds the notebook to a cluster,
- *      then a kernel restart both re-establishes `spark`/`w` and injects the env
- *      before the fresh imports.)
+ *      the user's package does not re-flip it. Restart to apply - which is what the
+ *      toggle does, so the change lands immediately without a manual step.
  *
  * This module holds only the pure bits (no fs, no jupyter, no `$lib` server
  * imports) so they are cheap to unit-test: the toggle predicate, the version
@@ -43,7 +42,7 @@
  * snippet that sets the env var.
  */
 
-/** UI-state key for the per-workspace on/off toggle. Default value is TRUE (see below). */
+/** UI-state key for the per-workspace on/off toggle. Default value is FALSE (see below). */
 export const DBX_RUNTIME_KEY = 'cellar-databricks-runtime';
 
 /** UI-state key for the advertised runtime version string. Default `'15.4'`. */
@@ -66,37 +65,42 @@ function parseBoolEnv(envValue?: string | null): boolean | null {
 
 /**
  * Resolve the effective toggle PREFERENCE (independent of connection). Default is
- * TRUE - a connected notebook wants the Databricks parameter experience by
- * default. Only an explicit `false` (stored value, or a falsey env override)
- * disables it. An env override (`CELLAR_DATABRICKS_RUNTIME`) wins over the store so
- * a headless / CI run can force it either way. This is what the UI checkbox
- * reflects; the runtime gate additionally requires a connected notebook (see
+ * FALSE - advertising a runtime is an explicit opt-in, because it changes what
+ * every library (not just the user's own gate) believes about its environment, and
+ * engaging it restarts the kernel. Only an explicit stored `true` (or a truthy env
+ * override) enables it, so connecting a cluster - which stores nothing - leaves it
+ * off. An env override (`CELLAR_DATABRICKS_RUNTIME`) wins over the store so a
+ * headless / CI run can force it either way. This is what the UI toggle reflects;
+ * the runtime gate additionally requires a connected notebook (see
  * `shouldInjectDatabricksRuntime`).
  */
 export function databricksRuntimeEnabled(storeValue: unknown, envValue?: string | null): boolean {
 	const override = parseBoolEnv(envValue);
 	if (override !== null) return override;
-	// Default ON: anything but an explicit `false` enables it.
-	return storeValue !== false;
+	// Default OFF: only an explicit stored `true` enables it. Anything else - unset,
+	// `false`, or junk left by an older build - reads as off, so the user's toggle is
+	// the single thing that turns the runtime on.
+	return storeValue === true;
 }
 
 /**
  * Decide whether to actually inject `DATABRICKS_RUNTIME_VERSION` at kernel start
- * for a notebook. The default-ON behavior is SCOPED to a Databricks-connected
+ * for a notebook. The stored preference is SCOPED to a Databricks-connected
  * notebook so a purely-local kernel is never told it is on Databricks:
  *
  *   - an explicit env override forces the decision either way (bypasses the scope,
  *     for headless / CI / operator opt-in);
- *   - a stored `false` (user turned the toggle off) never injects;
- *   - otherwise the default is ON, but only when the notebook is `bound` to a
- *     Databricks cluster.
+ *   - an unset / `false` preference (the default, and what a plain connect leaves
+ *     behind) never injects;
+ *   - a stored `true` (the user turned the toggle on) injects, but only while the
+ *     notebook is `bound` to a Databricks cluster.
  */
 export function shouldInjectDatabricksRuntime(
 	storeValue: unknown,
 	envValue: string | null | undefined,
 	bound: boolean
 ): boolean {
-	// Reuse the preference resolver so the env-override / default-ON logic lives in
+	// Reuse the preference resolver so the env-override / default-OFF logic lives in
 	// one place. An explicit env override forces the decision either way AND bypasses
 	// the connection scope; otherwise the resolved preference must be ON and the
 	// notebook must be `bound` to a cluster.

@@ -1158,11 +1158,12 @@ async function initKernel(kernel: KernelConnection, nbPath: string): Promise<voi
 	// FIRST: advertise a Databricks runtime (set DATABRICKS_RUNTIME_VERSION) so a
 	// notebook's `IS_DATABRICKS`-gated code takes its `dbutils.widgets` path - set
 	// before every other injected snippet AND before the user's first import (the
-	// gate is import-time). Scoped to notebooks BOUND to a Databricks cluster
-	// (default ON there) so a purely-local kernel is never told it is on Databricks;
-	// an explicit env override can force it. Re-read here so a restart of a bound
-	// notebook re-applies it - which is exactly the "restart to apply" contract
-	// (connect binds the notebook, restart injects the env for the fresh imports).
+	// gate is import-time). Default OFF (the sidebar's Runtime toggle is the opt-in,
+	// and the only thing that restarts the kernel for it), and additionally scoped to
+	// notebooks BOUND to a Databricks cluster so a purely-local kernel is never told
+	// it is on Databricks; an explicit env override can force it. Re-read here so a
+	// restart of a bound notebook re-applies it - which is exactly the "restart to
+	// apply" contract the toggle relies on.
 	if (injectDatabricksRuntime(await databricksNotebookBound(nbPath))) {
 		parts.push(databricksRuntimeEnvCode(databricksRuntimeVersion()));
 	}

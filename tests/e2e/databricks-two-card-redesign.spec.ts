@@ -180,8 +180,11 @@ test('disconnected: the Cluster card renders its connect-form picker', async ({ 
 	// (the Runtime card is shown only once connected).
 	await expect(page.getByTestId('databricks-picker')).toBeVisible();
 	await expect(page.getByTestId('databricks-cluster').first()).toBeVisible();
-	// The approved connect->auto-enable-runtime consequence is surfaced inline.
-	await expect(page.getByTestId('databricks-connect-note')).toBeVisible();
+	// What connecting will actually do is surfaced inline - and it no longer restarts
+	// the kernel, so the note must not promise the old auto-enable behavior.
+	const note = page.getByTestId('databricks-connect-note');
+	await expect(note).toBeVisible();
+	await expect(note).not.toContainText(/restart/i);
 	await expect(page.getByTestId('databricks-runtime-card')).toHaveCount(0);
 	await expect(page.getByTestId('databricks-runtime-hint')).toHaveCount(0);
 

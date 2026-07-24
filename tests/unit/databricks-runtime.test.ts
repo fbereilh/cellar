@@ -3,10 +3,12 @@
  * connection-scoped inject decision, and the env-set snippet.
  *
  * Setting `DATABRICKS_RUNTIME_VERSION` flips a notebook's import-time
- * `IS_DATABRICKS` gate to its interactive `dbutils.widgets` path. It defaults ON
- * but is SCOPED to a Databricks-connected notebook, so a purely-local kernel is
- * never told it is on Databricks (which would change mlflow & co.). These cover
- * the default, the env override, the connection scope, and the injected Python.
+ * `IS_DATABRICKS` gate to its interactive `dbutils.widgets` path. It defaults OFF -
+ * an explicit opt-in via the sidebar toggle, so CONNECTING a cluster (which stores
+ * nothing) leaves it off and never restarts the kernel - and is additionally SCOPED
+ * to a Databricks-connected notebook, so a purely-local kernel is never told it is
+ * on Databricks (which would change mlflow & co.). These cover the default, the env
+ * override, the connection scope, and the injected Python.
  */
 import { describe, it, expect } from 'vitest';
 import {
@@ -20,16 +22,17 @@ import {
 } from '../../src/lib/server/databricksRuntime';
 
 describe('databricksRuntimeEnabled (toggle preference)', () => {
-	it('defaults ON when the setting is unset', () => {
-		expect(databricksRuntimeEnabled(undefined)).toBe(true);
-		expect(databricksRuntimeEnabled(null)).toBe(true);
+	it('defaults OFF when the setting is unset', () => {
+		expect(databricksRuntimeEnabled(undefined)).toBe(false);
+		expect(databricksRuntimeEnabled(null)).toBe(false);
 	});
 
-	it('is ON unless the stored value is explicitly false', () => {
+	it('is OFF unless the stored value is explicitly true', () => {
 		expect(databricksRuntimeEnabled(true)).toBe(true);
 		expect(databricksRuntimeEnabled(false)).toBe(false);
-		// Any other truthy junk is still ON (default direction).
-		expect(databricksRuntimeEnabled('yes')).toBe(true);
+		// Truthy junk is NOT an opt-in: only the toggle's own `true` turns it on, so a
+		// stray value can never advertise a runtime the user did not ask for.
+		expect(databricksRuntimeEnabled('yes')).toBe(false);
 	});
 
 	it('lets an env override win over the store, both directions', () => {
@@ -45,6 +48,7 @@ describe('databricksRuntimeEnabled (toggle preference)', () => {
 		expect(databricksRuntimeEnabled(false, '')).toBe(false);
 		expect(databricksRuntimeEnabled(true, '')).toBe(true);
 		expect(databricksRuntimeEnabled(false, 'maybe')).toBe(false);
+		expect(databricksRuntimeEnabled(undefined, 'maybe')).toBe(false);
 	});
 
 	it('exposes stable store keys', () => {
@@ -54,11 +58,18 @@ describe('databricksRuntimeEnabled (toggle preference)', () => {
 });
 
 describe('shouldInjectDatabricksRuntime (connection-scoped decision)', () => {
-	it('default-ON injects ONLY for a bound (connected) notebook', () => {
-		expect(shouldInjectDatabricksRuntime(undefined, undefined, true)).toBe(true);
-		expect(shouldInjectDatabricksRuntime(undefined, undefined, false)).toBe(false);
+	it('an opted-in (stored true) preference injects ONLY for a bound notebook', () => {
 		expect(shouldInjectDatabricksRuntime(true, undefined, true)).toBe(true);
 		expect(shouldInjectDatabricksRuntime(true, undefined, false)).toBe(false);
+	});
+
+	// THE connect-leaves-runtime-off invariant, at the layer that decides what the
+	// kernel gets: connecting stores nothing, so a bound notebook whose user never
+	// touched the toggle must NOT be told it is on Databricks.
+	it('an unset preference never injects, bound or not (connect does not opt in)', () => {
+		expect(shouldInjectDatabricksRuntime(undefined, undefined, true)).toBe(false);
+		expect(shouldInjectDatabricksRuntime(undefined, undefined, false)).toBe(false);
+		expect(shouldInjectDatabricksRuntime(null, undefined, true)).toBe(false);
 	});
 
 	it('a stored false never injects, even when bound', () => {
@@ -76,7 +87,8 @@ describe('shouldInjectDatabricksRuntime (connection-scoped decision)', () => {
 	});
 
 	it('an empty / unrecognized env value falls back to the scoped default', () => {
-		expect(shouldInjectDatabricksRuntime(undefined, '', true)).toBe(true);
+		expect(shouldInjectDatabricksRuntime(true, '', true)).toBe(true);
+		expect(shouldInjectDatabricksRuntime(undefined, '', true)).toBe(false);
 		expect(shouldInjectDatabricksRuntime(undefined, 'maybe', false)).toBe(false);
 	});
 });

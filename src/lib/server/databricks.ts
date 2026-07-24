@@ -2074,6 +2074,18 @@ interface ConnState {
 	/** The connection a kernel restart took from us, kept so the UI can say so. */
 	lost: LostConnection | null;
 	/**
+	 * When an EXPECTED kernel restart took the session - i.e. the epoch changed while
+	 * a reconnect intent was still kept, so `reconnectAfterKernelRestart` is about to
+	 * rebuild it. Stamped by `connectionStatus()`'s reconciliation (the one place a
+	 * restart drives this transition) and read only by `liveConnection`, which holds
+	 * back the "lost" shape for `RESTART_LOST_GRACE_MS` so a fast restart settles
+	 * straight back to connected instead of flashing the scary lost card at the user.
+	 * Cleared the moment the outcome is known - a successful `connect()`, or a
+	 * reconnect that gave up - so a genuine, persistent loss is never delayed beyond
+	 * the point where we actually know it is one.
+	 */
+	restartedAt: number | null;
+	/**
 	 * The reconnect INTENT (auth selection + cluster) of the last live connection,
 	 * kept ACROSS a kernel restart. `connectionStatus()` clears `connection` the
 	 * moment the epoch changes, so it cannot answer "what should we reconnect to";
@@ -2121,6 +2133,7 @@ function stateFor(nb: string): ConnState {
 			connection: null,
 			connectedSel: null,
 			lost: null,
+			restartedAt: null,
 			reconnectTarget: null,
 			inFlight: false,
 			liveness: null,
@@ -2158,6 +2171,31 @@ function pendingReauth(s: ConnState): DatabricksError | undefined {
 const LIVENESS_TTL_MS = 15_000;
 
 /**
+ * How long an EXPECTED kernel restart may hold the connection in a "restarting"
+ * shape before the UI is told the session is lost.
+ *
+ * A restart tears the namespace down and rebuilds it (`reconnectAfterKernelRestart`),
+ * so for a moment the epoch reconciliation honestly reports "not connected, here is
+ * what you lost" - and a status poll landing inside that moment flashed the warning
+ * "session lost" card for a fraction of a second before everything went healthy
+ * again. This grace is the debounce: a restart that heals inside the window never
+ * renders as lost at all. It is deliberately SHORT and deliberately scoped to the
+ * restart transition - a loss that outlasts it, and every non-restart loss (an idle
+ * expiry, a closed client, a disconnect), still surfaces immediately, because
+ * hiding a real loss behind a spinner is worse than the flash it would prevent.
+ */
+const RESTART_LOST_GRACE_MS = 1_000;
+
+/**
+ * Is this notebook inside the grace window of an expected kernel restart - i.e.
+ * "not connected" here means "mid-restart", not "lost"? Time-based, so it lapses on
+ * its own; the stamp is cleared outright once the restart's outcome is known.
+ */
+function restartingAfterKernelRestart(s: ConnState): boolean {
+	return s.restartedAt !== null && Date.now() - s.restartedAt < RESTART_LOST_GRACE_MS;
+}
+
+/**
  * The connection as the UI should see it. Reconciles against the *current*
  * kernel epoch on every read, so a restart (or a rebind onto another venv)
  * downgrades us to disconnected without anyone having to notify this module.
@@ -2174,6 +2212,16 @@ export function connectionStatus(nb?: string | null): ConnectionStatus {
 		s.connection = null;
 		s.connectedSel = null;
 		s.liveness = null;
+		// This branch fires exactly once per epoch change (it nulls the connection it
+		// reads), so it is the one honest "the kernel just restarted" moment - and the
+		// grace runs from here, i.e. from when a caller first OBSERVES the loss, which is
+		// exactly the window a sidebar poll can land in. Stamped only when a reconnect is
+		// actually coming: an intent must be kept (an explicit disconnect drops it) AND a
+		// kernel must still exist to rebuild the session in - a torn-down kernel
+		// (shutdown / cull) is a real loss with nothing to wait for, so it is reported at
+		// once rather than behind a spinner. See `RESTART_LOST_GRACE_MS`.
+		s.restartedAt =
+			s.reconnectTarget && kernelStatus(abs).status !== 'not_started' ? Date.now() : null;
 	}
 	if (!s.connection) return { connected: false, ...(s.lost ? { lost: s.lost } : {}) };
 	return { connected: true, ...s.connection };
@@ -2351,8 +2399,13 @@ export async function reconnectAfterKernelRestart(
 	if (!target) return { reconnected: false, reason: 'no_prior_session' };
 	// Never force a kernel to boot solely to reconnect Databricks. A restart keeps
 	// the kernel entry, so this is only hit if the kernel was torn down (shutdown /
-	// cull) - in which case dropping the session is the correct behavior.
-	if (kernelStatus(abs).status === 'not_started') return { reconnected: false, reason: 'no_kernel' };
+	// cull) - in which case dropping the session is the correct behavior. Nothing is
+	// coming, so retire the restart grace rather than making the user watch a spinner
+	// for a reconnect that will never be attempted.
+	if (kernelStatus(abs).status === 'not_started') {
+		s.restartedAt = null;
+		return { reconnected: false, reason: 'no_kernel' };
+	}
 	// A connect/disconnect is already mutating this notebook's namespace; don't race it.
 	if (s.inFlight) return { reconnected: false, reason: 'busy' };
 	// The restart bumped the epoch; reconcile so the stale connection is cleared
@@ -2368,7 +2421,10 @@ export async function reconnectAfterKernelRestart(
 		logWarn('databricks', `Databricks reconnect after kernel restart failed: ${detail}`);
 		// Degrade honestly: surface it as a session the restart took, which the
 		// UI/agent already phrase as "reconnect from the Databricks sidebar section".
+		// The restart's outcome is now KNOWN and it is a loss, so the grace is retired
+		// immediately - it debounces the transient window, never a proven failure.
 		s.lost = { profile: target.sel.profile ?? null, clusterName: target.clusterName };
+		s.restartedAt = null;
 		return { reconnected: false, reason: detail };
 	}
 }
@@ -2559,6 +2615,9 @@ export async function connect({
 		// re-establish the SAME session automatically (reconnectAfterKernelRestart).
 		s.reconnectTarget = { sel: s.connectedSel, clusterId, clusterName: s.connection.clusterName };
 		s.lost = null;
+		// A live session settles whatever restart we were riding out (see
+		// `RESTART_LOST_GRACE_MS`): there is nothing left to hold back.
+		s.restartedAt = null;
 		// A live session is proof the credential works, so it retires any recorded
 		// reconnect failure - above all an expired-profile verdict, which the status
 		// surfaces would otherwise keep showing over a connection that just came up.
@@ -2753,12 +2812,19 @@ export async function agentStatus(nb?: string | null) {
  * expired server-side (or whose Spark Connect client was closed) instead of
  * reporting a dead session as "connected" on the strength of a still-current
  * epoch. Never blocks on a reconnect (see `assessLiveness`'s `heal:false`).
+ *
+ * It is also where the kernel-restart grace is applied (`RESTART_LOST_GRACE_MS`):
+ * a loss the restart is about to undo comes back flagged `restarting`, so the panel
+ * holds its connecting presentation instead of flashing "lost". Deliberately UI-only
+ * - `agentStatus` keeps reporting the plain truth, since an agent asks a question
+ * and gets one answer rather than watching a card repaint.
  */
 async function liveConnection(
 	nb?: string | null
 ): Promise<
 	ConnectionStatus & {
 		expired?: boolean;
+		restarting?: boolean;
 		livenessUnverified?: boolean;
 		isClosed?: boolean;
 		reauth?: { code: string; message: string; profile: string };
@@ -2776,7 +2842,16 @@ async function liveConnection(
 	const reauth = verdict?.profile
 		? { code: verdict.code, message: verdict.message, profile: verdict.profile }
 		: undefined;
-	if (!status.connected) return { ...status, ...(reauth ? { reauth } : {}) };
+	if (!status.connected) {
+		return {
+			...status,
+			// Inside the grace window this loss is an expected restart being undone, not
+			// something to alarm the user about. Flagged rather than hidden: the panel
+			// keeps rendering the cluster name from `lost`, just as "reconnecting".
+			...(restartingAfterKernelRestart(s) ? { restarting: true } : {}),
+			...(reauth ? { reauth } : {})
+		};
+	}
 	const a = await assessLiveness(abs, status, { heal: false });
 	if (a.kind === 'reconnected') return a.status;
 	if (a.kind === 'expired') {
@@ -3223,6 +3298,7 @@ export async function disconnect(nb?: string | null): Promise<{ ok: true }> {
 		// after this a kernel restart must NOT silently re-establish the session.
 		s.reconnectTarget = null;
 		s.lost = null;
+		s.restartedAt = null;
 		s.liveness = null;
 		publishGlobal({ type: 'databricks:changed' });
 		return { ok: true };

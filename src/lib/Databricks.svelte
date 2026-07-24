@@ -62,6 +62,14 @@
 		 */
 		expired?: boolean;
 		/**
+		 * The session is down only because the kernel is mid-restart and the server is
+		 * about to rebuild it (`RESTART_LOST_GRACE_MS` in `databricks.ts`). The panel
+		 * reads this exactly like its own in-panel `restarting` flag - hold the
+		 * connecting presentation - so a fast restart never flashes the "lost" card.
+		 * Once the grace lapses the server stops setting it and the real state shows.
+		 */
+		restarting?: boolean;
+		/**
 		 * Set only when a reconnect proved this notebook's session is down because the
 		 * profile's CLI-managed sign-in died - the one case the automatic retry can
 		 * never recover from, and the one the sidebar's own sign-in button cannot fix.
@@ -171,20 +179,22 @@
 	}
 
 	// ---- Databricks-runtime card (advertise DATABRICKS_RUNTIME_VERSION) --------
-	// Sets DATABRICKS_RUNTIME_VERSION in the kernel at start so a notebook's
-	// import-time `IS_DATABRICKS` gate takes its `dbutils.widgets` path. Persisted
+	// Sets DATABRICKS_RUNTIME_VERSION in the kernel at start so notebook code that
+	// checks for a Databricks runtime takes its `dbutils.widgets` path. Persisted
 	// per workspace (server keys mirrored from `$lib/server/databricksRuntime.ts` -
-	// a client component can't import a `$lib/server` module). The gate is
-	// import-time, so a change takes effect only on the next kernel START; rather
+	// a client component can't import a `$lib/server` module). The check is made at
+	// import time, so a change takes effect only on the next kernel START; rather
 	// than leave the user a manual "restart to apply" hint, Cellar APPLIES the
 	// change immediately by restarting the kernel (which re-injects the env AND
-	// rebuilds spark/w via the server's reconnect-after-restart path). Default ON,
-	// scoped server-side to a CONNECTED notebook - so a purely-local kernel is never
-	// told it is on Databricks, and CONNECTING auto-enables it (see `connect()`).
+	// rebuilds spark/w via the server's reconnect-after-restart path).
+	//
+	// Default OFF, and scoped server-side to a CONNECTED notebook. CONNECTING a
+	// cluster deliberately leaves it off and does NOT restart the kernel (see
+	// `connect()`): the toggle is the one opt-in, and the one thing that restarts.
 	const DBX_RUNTIME_KEY = 'cellar-databricks-runtime';
 	const DBX_RUNTIME_VERSION_KEY = 'cellar-databricks-runtime-version';
 	const DBX_RUNTIME_VERSION_DEFAULT = '15.4';
-	let runtimeOn = $state(true);
+	let runtimeOn = $state(false);
 	let runtimeVersion = $state(DBX_RUNTIME_VERSION_DEFAULT);
 	// The version string currently LIVE in the kernel (set at each apply), so a
 	// version edit only restarts when it actually changed from what is running.
@@ -193,8 +203,8 @@
 	// the Runtime card shows an "applying…" state and the transient post-restart
 	// lost/expired flash is suppressed.
 	let runtimeApplying = $state(false);
-	// True from the moment an EXPECTED kernel restart is issued (connect, switch
-	// cluster, or a runtime toggle/version apply - all go through `applyRuntime`)
+	// True from the moment an EXPECTED kernel restart is issued (a runtime toggle or
+	// version apply - both go through `applyRuntime`; a connect no longer restarts)
 	// until the session settles again (`settleConnection`). It is what distinguishes
 	// an expected restart-in-progress from a genuine unexpected session loss: while
 	// it is set, the "lost"/"expired" cards are suppressed and the connecting/connected
@@ -204,7 +214,10 @@
 	// state with its Reconnect button.
 	let restarting = $state(false);
 	onMount(() => {
-		runtimeOn = getUi<boolean>(DBX_RUNTIME_KEY, true);
+		// `=== true` mirrors the server's `databricksRuntimeEnabled` exactly: only an
+		// explicit stored true is ON, so the toggle can never render on over a value the
+		// kernel would read as off.
+		runtimeOn = getUi<unknown>(DBX_RUNTIME_KEY, false) === true;
 		runtimeVersion = getUi<string>(DBX_RUNTIME_VERSION_KEY, DBX_RUNTIME_VERSION_DEFAULT);
 		appliedVersion = runtimeVersion;
 	});
@@ -213,9 +226,9 @@
 	 * Apply the runtime preference to the LIVE kernel: persist on/off (+ version)
 	 * server-side FIRST (race-free via `setUiNow`, so the restart re-reads the new
 	 * value), then restart the kernel so `initKernel` injects/omits the env for the
-	 * fresh imports and `reconnectAfterKernelRestart` rebuilds spark/w. The one
-	 * mechanism behind both connect-time auto-enable and the manual toggle - there is
-	 * no second "apply runtime" path.
+	 * fresh imports and `reconnectAfterKernelRestart` rebuilds spark/w. The one and
+	 * only "apply runtime" path: the toggle and a version edit are its callers, and
+	 * connecting a cluster deliberately is not.
 	 */
 	async function applyRuntime(on: boolean): Promise<void> {
 		runtimeOn = on; // optimistic
@@ -328,6 +341,15 @@
 
 	const connection = $derived<DbxConnection>(status?.connection ?? { connected: false });
 	const connected = $derived(!!connection.connected);
+	/**
+	 * An EXPECTED kernel restart is in flight, from either of the two things that can
+	 * know it: the panel itself (`restarting`, set around its own `applyRuntime`) and
+	 * the server (`connection.restarting`, its grace window around the epoch change -
+	 * which is what covers a restart the panel did NOT initiate, e.g. the Kernels
+	 * sidebar or `%restart_python`). Either way the lost/expired cards are held back
+	 * in favour of the connecting/connected presentation.
+	 */
+	const expectedRestart = $derived(restarting || !!connection.restarting);
 	const profiles = $derived(status?.config?.profiles ?? []);
 	const hasProfiles = $derived(profiles.length > 0);
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
@@ -520,6 +542,23 @@
 		loadStatus();
 	});
 
+	/**
+	 * The server's `restarting` flag is TIME-BOXED (`RESTART_LOST_GRACE_MS`, ~1s), so
+	 * a read that saw it must be followed by one taken after it lapses - nothing else
+	 * guarantees another. A reconnect that SUCCEEDS publishes `databricks:changed` and
+	 * re-reads on its own, but one that fails (or is never attempted - a torn-down
+	 * kernel, a connect already in flight) publishes nothing, and this panel has no
+	 * periodic poll: without this re-check it would sit on "Reconnecting…" forever
+	 * instead of falling through to the honest lost card. Converges by construction -
+	 * the re-read only re-arms if the server stamped a NEW restart.
+	 */
+	const RESTART_GRACE_RECHECK_MS = 1200;
+	$effect(() => {
+		if (!connection.restarting) return;
+		const t = setTimeout(() => loadStatus(), RESTART_GRACE_RECHECK_MS);
+		return () => clearTimeout(t);
+	});
+
 	// ---- Clusters ------------------------------------------------------------
 	let clusters = $state<DbxCluster[] | null>(null);
 	let clustersError = $state<DbxError | null>(null);
@@ -699,21 +738,17 @@
 			switching = false;
 			await loadStatus();
 			onSessionChange?.();
-			// Connecting ALWAYS enables the Databricks runtime and restarts the kernel
-			// so the `IS_DATABRICKS`/`dbutils.widgets` path is live immediately - no
-			// manual restart. `applyRuntime(true)` persists the ON preference then
-			// restarts (which re-injects the env AND rebuilds spark/w). Kept inside the
-			// connect spinner, and `settleConnection` waits for the rebuilt session so
-			// the panel never flashes the "session lost" card.
-			await applyRuntime(true);
-			await settleConnection();
+			// Connecting binds `spark`/`w` in the LIVE kernel and stops there: it does not
+			// touch the Databricks-runtime preference and does not restart the kernel, so
+			// the user's namespace survives a connect. Advertising a runtime changes what
+			// every library believes about its environment, so it stays an explicit opt-in
+			// via the Runtime toggle - the only thing that restarts the kernel for it.
 		} catch (err) {
 			connectError = toDbxError(err);
 		} finally {
 			busy = '';
 			connectingId = '';
 			connectingName = '';
-			restarting = false; // definitive cleanup if applyRuntime threw before settleConnection
 		}
 	}
 
@@ -1407,11 +1442,11 @@
 					</button>
 				{/each}
 			</div>
-			<!-- Behavior consequence: connecting enables the Databricks runtime and
-			     restarts the kernel to make it live immediately (variables cleared). -->
+			<!-- Behavior consequence, stated because the OLD behavior restarted the kernel
+			     here: connecting binds spark/w in the running kernel and nothing else. -->
 			<p class="mt-1.5 flex items-start gap-1 text-[11px] leading-relaxed text-base-content/40" data-testid="databricks-connect-note">
 				<svg class="mt-px h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 16v-4M12 8h.01" /></svg>
-				<span>Connecting enables the Databricks runtime and restarts the kernel - variables are cleared.</span>
+				<span>Connecting binds <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code> in the running kernel - your variables are kept.</span>
 			</p>
 		{:else if clusters}
 			<p class="px-2 py-2 text-xs text-base-content/40">no clusters in this workspace</p>
@@ -1422,9 +1457,10 @@
 {/snippet}
 
 <!-- The Runtime card: advertise DATABRICKS_RUNTIME_VERSION so this notebook's
-     IS_DATABRICKS-gated code takes its dbutils.widgets path. A separate card from
-     the connection, applied LIVE - toggling (or a version edit) restarts the kernel
-     to take effect immediately. Green (toggle-success) is a deliberate Databricks
+     runtime-gated code takes its dbutils.widgets path. A separate card from the
+     connection, default OFF and applied LIVE - toggling (or a version edit) restarts
+     the kernel to take effect immediately, and is the ONLY thing that does (a
+     connect no longer restarts). Green (toggle-success) is a deliberate Databricks
      cue, unlike Files' primary toggle. -->
 {#snippet runtimeCard()}
 	<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-runtime-card">
@@ -1444,7 +1480,7 @@
 		</div>
 		<label
 			class="mt-1.5 flex cursor-pointer items-center gap-2 text-[11px] text-base-content/70"
-			title="Advertises a Databricks runtime (sets DATABRICKS_RUNTIME_VERSION) so notebook code that gates on IS_DATABRICKS takes its dbutils.widgets path. Affects all libraries (e.g. mlflow) and restarts the kernel to apply. It does not connect a cluster - use Databricks Connect for spark/Unity Catalog."
+			title="Makes this kernel look like a Databricks cluster, so notebook code that checks whether it is running on Databricks takes its dbutils.widgets path. Affects all libraries (e.g. mlflow) and restarts the kernel to apply. It does not connect a cluster - use Databricks Connect for spark/Unity Catalog."
 		>
 			<input
 				type="checkbox"
@@ -1474,7 +1510,7 @@
 		{/if}
 		<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">
 			{#if runtimeOn}
-				<code class="font-mono text-[10px]">IS_DATABRICKS</code>-gated code takes the Databricks path. Toggling restarts the kernel - variables are cleared.
+				Notebook code that checks for Databricks takes its Databricks path. Toggling restarts the kernel - variables are cleared.
 			{:else}
 				Notebook code runs its non-Databricks path. Turning it on restarts the kernel - variables are cleared.
 			{/if}
@@ -1616,16 +1652,16 @@
 		     subordinate Unity Catalog browser. Two clearly separated cards. -->
 	{:else}
 		<div class="space-y-2">
-			{#if busy === 'connect' || (restarting && !runtimeApplying)}
-				<!-- Connecting: one calm state in the Cluster card, held until the rebuilt
-				     session settles - so the panel never flashes the "session lost" card.
-				     Shown for a connect/switch (`busy === 'connect'`) AND for any other
-				     expected restart still in flight (`restarting`, e.g. the gate outliving
-				     `busy` for a tick), EXCEPT a runtime toggle - that keeps the connected
-				     card with its "restarting" pill (the next branch). Because `restarting`
-				     is true for the whole expected-restart window, the lost/expired branches
-				     below are unreachable during it: an expected restart can never be
-				     mistaken for an unexpected loss. -->
+			{#if busy === 'connect' || (expectedRestart && !runtimeApplying)}
+				<!-- Connecting: one calm state in the Cluster card, held until the session
+				     settles - so the panel never flashes the "session lost" card. Shown for a
+				     connect/switch (`busy === 'connect'`) AND for any expected kernel restart
+				     still in flight (`expectedRestart` - this panel's own, or the server's
+				     grace window around a restart triggered elsewhere), EXCEPT a runtime
+				     toggle: that keeps the connected card with its "restarting" pill (the
+				     next branch). Because `expectedRestart` covers the whole window, the
+				     lost/expired branches below are unreachable during it: an expected
+				     restart can never be mistaken for an unexpected loss. -->
 				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-connecting">
 					{@render cardLabel('cluster')}
 					<div class="mt-1.5 flex items-center gap-2">
@@ -1634,7 +1670,7 @@
 							{connectingName ? `Connecting to ${connectingName}…` : 'Reconnecting…'}
 						</span>
 					</div>
-					{@render hint('Enabling the Databricks runtime and starting the session. A terminated cluster can take a few minutes.')}
+					{@render hint('Starting the Databricks session. A terminated cluster can take a few minutes.')}
 					{#if connectError}{@render errorBox(connectError, 'databricks-connect-error')}{/if}
 				</div>
 			{:else if connected || runtimeApplying}

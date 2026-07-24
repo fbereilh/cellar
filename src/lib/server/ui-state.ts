@@ -89,11 +89,12 @@ export function addProjectRootToPath(): boolean {
 
 /**
  * Whether to inject `DATABRICKS_RUNTIME_VERSION` at kernel start for a notebook
- * that IS (`bound`) or IS NOT bound to a Databricks cluster. Default ON, but
- * SCOPED to a connected notebook so a purely-local kernel is never told it is on
- * Databricks (which would change mlflow & co.); an env override
- * (`CELLAR_DATABRICKS_RUNTIME`) forces it either way. Read at kernel-start time by
- * `kernel.ts`. See `databricksRuntime.ts`.
+ * that IS (`bound`) or IS NOT bound to a Databricks cluster. Default OFF - it is an
+ * explicit opt-in via the sidebar's Runtime toggle, so connecting a cluster alone
+ * never enables it - and additionally SCOPED to a connected notebook so a
+ * purely-local kernel is never told it is on Databricks (which would change mlflow
+ * & co.); an env override (`CELLAR_DATABRICKS_RUNTIME`) forces it either way. Read
+ * at kernel-start time by `kernel.ts`. See `databricksRuntime.ts`.
  */
 export function injectDatabricksRuntime(bound: boolean): boolean {
 	return shouldInjectDatabricksRuntime(
