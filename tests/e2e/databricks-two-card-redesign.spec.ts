@@ -93,6 +93,17 @@ async function openNotebook(page: Page): Promise<void> {
 	await expect(page.getByTestId('cell').first()).toBeVisible();
 }
 
+/**
+ * Reviewer-visible evidence of a Runtime-card state. Every state this spec pins is a
+ * COPY + affordance decision (which pill, which hint sentence, whether Apply now /
+ * the toggle are offered at all), so the rendered card is the artifact that shows it -
+ * a selector assertion alone cannot show a reviewer that the card reads honestly.
+ */
+async function cardShot(page: Page, name: string): Promise<void> {
+	const section = page.getByTestId('section-databricks').locator('xpath=ancestor::*[1]/parent::*');
+	await section.screenshot({ path: join(EVIDENCE_DIR, name) });
+}
+
 async function openDatabricksSection(page: Page): Promise<void> {
 	const header = page.getByTestId('section-databricks');
 	await expect(header).toBeVisible();
@@ -240,6 +251,7 @@ test('the Runtime pill never claims "active" over a kernel without the runtime',
 	await expect(apply).toBeVisible();
 	await expect(apply).toBeEnabled();
 	await expect(apply).toContainText(/restarts kernel/i);
+	await cardShot(page, 'databricks-runtime-pending-apply-now.png');
 
 	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
 });
@@ -284,6 +296,7 @@ test('an env-FORCED runtime says the environment controls it and offers no Apply
 	// Nothing to apply, and no restart on offer.
 	await expect(page.getByTestId('databricks-runtime-apply')).toHaveCount(0);
 	await expect(card).not.toContainText(/restart the kernel to apply/i);
+	await cardShot(page, 'databricks-runtime-env-forced-off.png');
 
 	// Forced ON over a kernel started without it is still the environment's call: the
 	// pill is honest ("pending"), but a restart is not something the card asks for.
@@ -322,6 +335,7 @@ test('with no notebook open, Apply now is disabled and says so - never a silent 
 	// The toggle is the same silent no-op with the sign flipped: `applyRuntime` would
 	// write the preference and skip the restart, so it is disabled too.
 	await expect(page.getByTestId('databricks-runtime-toggle')).toBeDisabled();
+	await cardShot(page, 'databricks-runtime-no-notebook.png');
 
 	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
 });
@@ -393,6 +407,7 @@ test('an env-FORCED version shows the version in force and offers no edit', asyn
 	const apply = page.getByTestId('databricks-runtime-apply');
 	await expect(apply).toBeVisible();
 	await expect(apply).toBeEnabled();
+	await cardShot(page, 'databricks-runtime-version-env-forced.png');
 
 	await page.request.put(`${baseURL}/api/ui-state`, {
 		data: { 'cellar-databricks-runtime': null, 'cellar-databricks-runtime-version': null }

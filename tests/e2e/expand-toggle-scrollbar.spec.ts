@@ -106,11 +106,19 @@ async function ensureNotebookOpen(page: Page): Promise<void> {
  * (macOS/headless Chromium), which is what lets this reproduce the classic
  * always-on case cross-platform; the `::-webkit-scrollbar` styling paints a
  * visible thumb in that reserved gutter for the screenshots.
+ *
+ * `scrollbar-color: auto` is load-bearing and must NOT be dropped: daisyUI ships
+ * `:root { scrollbar-color: … }`, which INHERITS to every box, and Chromium ignores
+ * `::-webkit-scrollbar` entirely for any element whose standard `scrollbar-color` /
+ * `scrollbar-width` is set - leaving a macOS overlay scrollbar, for which
+ * `scrollbar-gutter` is a no-op. So without this reset back to the initial value the
+ * emulation silently measured 0 and the scenario could not be reproduced at all.
  */
 async function forceClassicScrollbars(page: Page): Promise<void> {
 	await page.addStyleTag({
 		content: `
 			[data-testid="output-scroll"], [data-testid="editor-scroll"] {
+				scrollbar-color: auto !important;
 				scrollbar-gutter: stable !important;
 			}
 			[data-testid="output-scroll"]::-webkit-scrollbar,
@@ -139,6 +147,7 @@ async function forceOverlayScrollbars(page: Page): Promise<void> {
 	await page.addStyleTag({
 		content: `
 			[data-testid="output-scroll"], [data-testid="editor-scroll"] {
+				scrollbar-color: auto !important;
 				scrollbar-gutter: auto !important;
 			}
 			[data-testid="output-scroll"]::-webkit-scrollbar,

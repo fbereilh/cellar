@@ -1,6 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
@@ -27,6 +27,9 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
 let launcher: ChildProcess | null = null;
 let workspace = '';
 let baseURL = '';
+
+/** Where reviewer-visible screenshots land (same convention as the sibling specs). */
+const EVIDENCE_DIR = process.env.CELLAR_EVIDENCE_DIR || join(tmpdir(), 'cellar-evidence-dbx-noflash');
 
 function disconnectedStatus() {
 	return {
@@ -137,6 +140,11 @@ test.beforeAll(async () => {
 	const booted = await bootCellar(workspace);
 	launcher = booted.proc;
 	baseURL = booted.url;
+	try {
+		mkdirSync(EVIDENCE_DIR, { recursive: true });
+	} catch {
+		/* best effort */
+	}
 });
 
 test.afterAll(async () => {
@@ -186,23 +194,40 @@ function sampleCards(page: Page) {
 }
 
 /**
- * Boot a live kernel with a real run, so a later restart genuinely bumps the epoch
- * (a never-started kernel makes restart a no-op, which would let the transient-lost
- * window slip past unexercised). The click lands on the cell first (which is what
- * summons its CodeMirror editor - cells render a static stand-in until then), then
- * on `.cm-content` itself: typing in COMMAND mode would fire the modal keyboard,
- * where `1` means "make this an H1 markdown cell" rather than a character.
+ * Type + run one cell, waiting for its output. The click lands on the cell first
+ * (which is what summons its CodeMirror editor - cells render a static stand-in until
+ * then), then on `.cm-content` itself: typing in COMMAND mode would fire the modal
+ * keyboard, where `1` means "make this an H1 markdown cell" rather than a character.
  */
-async function startKernel(page: Page): Promise<void> {
-	const firstCell = page.getByTestId('cell').first();
-	await firstCell.click();
-	const editor = firstCell.locator('.cm-content');
+async function runInCell(page: Page, index: number, code: string) {
+	const cell = page.getByTestId('cell').nth(index);
+	await cell.click();
+	const editor = cell.locator('.cm-content');
 	await editor.waitFor({ state: 'visible', timeout: 30000 });
 	await editor.click();
-	await page.keyboard.type('1+1');
+	// REPLACE the cell, never append: the default notebook ships a `print('hello')` /
+	// `6 * 7` cell, so typing at the caret produced `print('hello')1+1` - a SyntaxError
+	// that still renders an output, so a "did it run" check passed while nothing the
+	// test typed had actually executed. Mod-a is CodeMirror's select-all and is not in
+	// cellar's shortcut registry, so it reaches the editor.
+	await page.keyboard.press(process.platform === 'darwin' ? 'Meta+a' : 'Control+a');
+	await page.keyboard.type(code);
 	await page.keyboard.press('Shift+Enter');
 	// Wait for the run to actually execute (output rendered), proving the kernel is live.
-	await expect(firstCell.getByTestId('output').first()).toBeVisible({ timeout: 60000 });
+	await expect(cell.getByTestId('output').first()).toBeVisible({ timeout: 60000 });
+	return cell;
+}
+
+/**
+ * Boot a live kernel with a real run, so a later restart genuinely bumps the epoch
+ * (a never-started kernel makes restart a no-op, which would let the transient-lost
+ * window slip past unexercised). It binds a variable rather than evaluating `1+1`,
+ * because the user-facing promise of "connect no longer restarts" is precisely that
+ * the namespace SURVIVES a connect - so the notebook itself carries the proof.
+ */
+async function startKernel(page: Page): Promise<void> {
+	const first = await runInCell(page, 0, 'x=42;x');
+	await expect(first.getByTestId('output').first()).toContainText('42');
 }
 
 // ONE test for the whole connect → opt-in story, deliberately: both halves need the
@@ -236,6 +261,15 @@ test('connect leaves the runtime off (no restart); turning it on restarts withou
 	await page.waitForTimeout(1000);
 	expect(seq.restarted()).toBe(false);
 	await expect(page.getByTestId('databricks-lost')).toHaveCount(0);
+	await page.screenshot({ path: join(EVIDENCE_DIR, '1-connect-leaves-runtime-off.png') });
+
+	// The promise the removed restart makes to the user, checked the way the user
+	// would: the variable bound BEFORE connecting is still there afterwards. A restart
+	// would have cleared the namespace and this would read NameError.
+	const survivor = await runInCell(page, 1, 'x');
+	await page.screenshot({ path: join(EVIDENCE_DIR, '2-namespace-survived-connect.png') });
+	await expect(survivor.getByTestId('output').first()).toContainText('42');
+	await expect(survivor.getByTestId('output').first()).not.toContainText('NameError');
 
 	// Now the opt-in. Sample the DOM continuously across the toggle-driven restart
 	// (the sampler is already running in the page when the click lands).
@@ -255,6 +289,7 @@ test('connect leaves the runtime off (no restart); turning it on restarts withou
 	// The opt-in is now genuinely LIVE in the restarted kernel, which is the only
 	// thing that may turn the pill green.
 	await expect(page.getByTestId('databricks-runtime-active')).toBeVisible();
+	await page.screenshot({ path: join(EVIDENCE_DIR, '3-runtime-active-after-toggle-restart.png') });
 });
 
 test('a genuine session loss (no expected restart in flight) still shows "lost" + Reconnect', async ({ page }) => {
@@ -278,6 +313,10 @@ test('a genuine session loss (no expected restart in flight) still shows "lost" 
 	await expect(page.getByTestId('databricks-reconnect')).toBeVisible();
 	// It is NOT masked as the connecting spinner.
 	await expect(page.getByTestId('databricks-connecting')).toHaveCount(0);
+	await page
+		.getByTestId('section-databricks')
+		.locator('xpath=ancestor::*[1]/parent::*')
+		.screenshot({ path: join(EVIDENCE_DIR, '4-genuine-loss-still-shows-lost-card.png') });
 });
 
 test('a restart whose reconnect never lands falls through to the lost card', async ({ page }) => {
@@ -302,9 +341,12 @@ test('a restart whose reconnect never lands falls through to the lost card', asy
 	await openNotebook(page);
 	await openDatabricksSection(page);
 
+	const section = page.getByTestId('section-databricks').locator('xpath=ancestor::*[1]/parent::*');
 	// Held as "reconnecting" while the server says so...
 	await expect(page.getByTestId('databricks-connecting')).toBeVisible();
+	await section.screenshot({ path: join(EVIDENCE_DIR, '5-restart-held-as-reconnecting.png') });
 	// ...and the panel gets itself out of that state once the flag stops.
 	await expect(page.getByTestId('databricks-lost')).toBeVisible({ timeout: 20_000 });
 	await expect(page.getByTestId('databricks-reconnect')).toBeVisible();
+	await section.screenshot({ path: join(EVIDENCE_DIR, '6-failed-reconnect-falls-through-to-lost.png') });
 });
