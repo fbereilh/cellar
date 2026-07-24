@@ -27,6 +27,7 @@ import {
 	DBX_RUNTIME_VERSION_KEY,
 	shouldInjectDatabricksRuntime,
 	databricksRuntimeOverride,
+	databricksRuntimeVersionOverride,
 	databricksRuntimeVersion as resolveDatabricksRuntimeVersion
 } from '$lib/server/databricksRuntime';
 
@@ -127,6 +128,18 @@ export function databricksRuntimeVersion(): string {
 		ensureLoaded()[DBX_RUNTIME_VERSION_KEY],
 		process.env.CELLAR_DATABRICKS_RUNTIME_VERSION
 	);
+}
+
+/**
+ * The version `CELLAR_DATABRICKS_RUNTIME_VERSION` forces, or `null` when the store
+ * decides. The independent sibling of `databricksRuntimeForced` (either override can be
+ * set without the other), surfaced for the same reason: a forced version survives every
+ * edit and every kernel restart, so the Runtime card must state that the environment
+ * holds it instead of offering an edit-then-restart that clears the namespace and applies
+ * nothing. Derived from the same resolver the version decision uses.
+ */
+export function databricksRuntimeVersionForced(): string | null {
+	return databricksRuntimeVersionOverride(process.env.CELLAR_DATABRICKS_RUNTIME_VERSION);
 }
 
 function scheduleWrite(): void {

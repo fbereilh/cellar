@@ -122,13 +122,32 @@ export function shouldInjectDatabricksRuntime(
 }
 
 /**
+ * The version override's verdict: the version string `CELLAR_DATABRICKS_RUNTIME_VERSION`
+ * forces, or `null` when it is unset / empty (so the store decides).
+ *
+ * The sibling of `databricksRuntimeOverride`, and exported for the same reason: the UI
+ * must see that the VERSION is forced, not merely what it resolved to. The two overrides
+ * are INDEPENDENT - either can be set without the other - so they are carried as separate
+ * facts, never collapsed into one flag. Without this the version input would keep
+ * offering an edit whose apply-restart clears the namespace and changes nothing, because
+ * the override discards whatever the store holds.
+ */
+export function databricksRuntimeVersionOverride(envValue?: string | null): string | null {
+	if (typeof envValue === 'string' && envValue.trim() !== '') return envValue.trim();
+	return null;
+}
+
+/**
  * Resolve the version string to advertise. A stored non-empty string wins; an env
  * override (`CELLAR_DATABRICKS_RUNTIME_VERSION`) wins over that; otherwise the
  * default LTS line. The value is only ever advertised - Cellar does not connect a
  * cluster (that is Databricks Connect's job), so it need not match any real runtime.
  */
 export function databricksRuntimeVersion(storeValue: unknown, envValue?: string | null): string {
-	if (typeof envValue === 'string' && envValue.trim() !== '') return envValue.trim();
+	// Through the exported override so the display and the decision read the same
+	// value - a second env parse is how those two drift.
+	const override = databricksRuntimeVersionOverride(envValue);
+	if (override !== null) return override;
 	if (typeof storeValue === 'string' && storeValue.trim() !== '') return storeValue.trim();
 	return DBX_RUNTIME_VERSION_DEFAULT;
 }

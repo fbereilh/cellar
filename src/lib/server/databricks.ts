@@ -110,7 +110,7 @@ import {
 import { normalizeDatabricksHost } from '../databricksHost';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
 import { resolveNotebookPath } from './notebook';
-import { databricksRuntimeForced } from './ui-state';
+import { databricksRuntimeForced, databricksRuntimeVersionForced } from './ui-state';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
@@ -1597,14 +1597,27 @@ export async function getStatus(nb?: string | null) {
  * the user can apply - offering an "Apply now" restart that clears the namespace and
  * leaves the state exactly where it was, every time. With it the card says the
  * environment is in control instead.
+ *
+ * `versionEnvForced` is the same fact for the VERSION (`CELLAR_DATABRICKS_RUNTIME_VERSION`):
+ * the forced version string, or `null` when the store decides. The two overrides are
+ * INDEPENDENT - either can be set alone - so they ride as separate fields and the card
+ * names whichever is actually in force. Without it the version input would keep offering
+ * an edit whose apply-restart wipes the namespace to advertise a value the override
+ * discards.
  */
 function runtimeStatus(nb?: string | null): {
 	kernelStarted: boolean;
 	liveVersion: string | null;
 	envForced: boolean | null;
+	versionEnvForced: string | null;
 } {
 	const live = liveDatabricksRuntime(resolveNotebookPath(nb));
-	return { kernelStarted: live.started, liveVersion: live.version, envForced: databricksRuntimeForced() };
+	return {
+		kernelStarted: live.started,
+		liveVersion: live.version,
+		envForced: databricksRuntimeForced(),
+		versionEnvForced: databricksRuntimeVersionForced()
+	};
 }
 
 interface CatalogList {

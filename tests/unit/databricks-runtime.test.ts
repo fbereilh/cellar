@@ -19,6 +19,7 @@ import {
 	databricksRuntimeOverride,
 	shouldInjectDatabricksRuntime,
 	databricksRuntimeVersion,
+	databricksRuntimeVersionOverride,
 	databricksRuntimeEnvCode
 } from '../../src/lib/server/databricksRuntime';
 
@@ -145,6 +146,46 @@ describe('databricksRuntimeVersion', () => {
 		expect(databricksRuntimeVersion('15.4', '  17.0 ')).toBe('17.0');
 		// Empty env falls back to the store.
 		expect(databricksRuntimeVersion('15.4', '')).toBe('15.4');
+	});
+});
+
+/**
+ * The VERSION override's verdict is exported for the same reason its on/off sibling is:
+ * the card must know the version is FORCED, not merely what it resolved to. Without it
+ * the version input keeps offering an edit whose apply-restart clears the user's
+ * namespace to advertise a value the override throws away.
+ *
+ * The two overrides are INDEPENDENT - either can be set alone - so they stay separate
+ * facts and are never collapsed into one flag.
+ */
+describe('databricksRuntimeVersionOverride (who decides the version)', () => {
+	it('reports the forced version, trimmed', () => {
+		expect(databricksRuntimeVersionOverride('13.3')).toBe('13.3');
+		expect(databricksRuntimeVersionOverride('  17.0 ')).toBe('17.0');
+	});
+
+	it('reports null when nothing is forced, so the store decides', () => {
+		expect(databricksRuntimeVersionOverride(undefined)).toBe(null);
+		expect(databricksRuntimeVersionOverride(null)).toBe(null);
+		expect(databricksRuntimeVersionOverride('')).toBe(null);
+		expect(databricksRuntimeVersionOverride('   ')).toBe(null);
+	});
+
+	it('agrees with the resolver it backs - it IS its override parser', () => {
+		for (const env of ['13.3', '  17.0 ', '', undefined]) {
+			const forced = databricksRuntimeVersionOverride(env);
+			if (forced !== null) expect(databricksRuntimeVersion('15.4', env)).toBe(forced);
+			else expect(databricksRuntimeVersion('15.4', env)).toBe('15.4');
+		}
+	});
+
+	it('is independent of the on/off override - either can be in force alone', () => {
+		// A forced version with no on/off override: the store still decides on/off.
+		expect(databricksRuntimeOverride(undefined)).toBe(null);
+		expect(databricksRuntimeVersionOverride('13.3')).toBe('13.3');
+		// A forced on/off with no version override: the store still decides the version.
+		expect(databricksRuntimeOverride('1')).toBe(true);
+		expect(databricksRuntimeVersionOverride(undefined)).toBe(null);
 	});
 });
 

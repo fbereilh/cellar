@@ -148,7 +148,12 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 		// The preference says on - the KERNEL says nothing is advertised, and that is
 		// what the card renders: pending, never active.
 		expect(ui.injectDatabricksRuntime(true)).toBe(true);
-		expect(st.runtime).toEqual({ kernelStarted: true, liveVersion: null, envForced: null });
+		expect(st.runtime).toEqual({
+			kernelStarted: true,
+			liveVersion: null,
+			envForced: null,
+			versionEnvForced: null
+		});
 	});
 
 	it('reports the version the live session was started with', async () => {
@@ -157,7 +162,8 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 		expect((await dbx.getStatus(A())).runtime).toEqual({
 			kernelStarted: true,
 			liveVersion: '15.4',
-			envForced: null
+			envForced: null,
+			versionEnvForced: null
 		});
 	});
 
@@ -168,7 +174,8 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 		expect((await dbx.getStatus(A())).runtime).toEqual({
 			kernelStarted: false,
 			liveVersion: null,
-			envForced: null
+			envForced: null,
+			versionEnvForced: null
 		});
 	});
 });
@@ -213,5 +220,60 @@ describe('getStatus reports whether the runtime decision is env-FORCED', () => {
 		await connectA();
 		process.env.CELLAR_DATABRICKS_RUNTIME = 'maybe';
 		expect((await dbx.getStatus(A())).runtime.envForced).toBe(null);
+	});
+});
+
+/**
+ * The VERSION override rides the same wire, as its OWN fact.
+ *
+ * `CELLAR_DATABRICKS_RUNTIME_VERSION` resolves ahead of the stored version, so with it
+ * set a version edit's apply-restart clears the user's namespace to advertise a value
+ * the override discards - the same namespace-wiping no-op the on/off flag exists to
+ * prevent, one control over. The two are INDEPENDENT (either can be set alone), so they
+ * are reported separately and the card names whichever is actually in force.
+ */
+describe('getStatus reports whether the runtime VERSION is env-FORCED', () => {
+	beforeEach(() => {
+		delete process.env.CELLAR_DATABRICKS_RUNTIME;
+		delete process.env.CELLAR_DATABRICKS_RUNTIME_VERSION;
+	});
+
+	it('reports null when no override is set - the stored version decides', async () => {
+		await connectA();
+		ui.setUiState({ [keys.DBX_RUNTIME_VERSION_KEY]: '14.3' });
+		expect((await dbx.getStatus(A())).runtime.versionEnvForced).toBe(null);
+		expect(ui.databricksRuntimeVersion()).toBe('14.3');
+	});
+
+	it('reports the forced version, and it outranks the stored one', async () => {
+		await connectA();
+		ui.setUiState({ [keys.DBX_RUNTIME_VERSION_KEY]: '14.3' });
+		process.env.CELLAR_DATABRICKS_RUNTIME_VERSION = ' 17.0 ';
+		expect((await dbx.getStatus(A())).runtime.versionEnvForced).toBe('17.0');
+		// What the kernel would actually advertise is the override, so an edit of the
+		// stored value can only ever be discarded - which is why the card must say so.
+		expect(ui.databricksRuntimeVersion()).toBe('17.0');
+	});
+
+	it('is independent of the on/off override - either can be in force alone', async () => {
+		await connectA();
+		// Version forced, on/off left to the store.
+		process.env.CELLAR_DATABRICKS_RUNTIME_VERSION = '13.3';
+		let rt = (await dbx.getStatus(A())).runtime;
+		expect(rt.versionEnvForced).toBe('13.3');
+		expect(rt.envForced).toBe(null);
+
+		// On/off forced, version left to the store.
+		delete process.env.CELLAR_DATABRICKS_RUNTIME_VERSION;
+		process.env.CELLAR_DATABRICKS_RUNTIME = '1';
+		rt = (await dbx.getStatus(A())).runtime;
+		expect(rt.versionEnvForced).toBe(null);
+		expect(rt.envForced).toBe(true);
+	});
+
+	it('an empty override is not a decision - the store still decides', async () => {
+		await connectA();
+		process.env.CELLAR_DATABRICKS_RUNTIME_VERSION = '   ';
+		expect((await dbx.getStatus(A())).runtime.versionEnvForced).toBe(null);
 	});
 });

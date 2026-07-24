@@ -319,6 +319,82 @@ test('with no notebook open, Apply now is disabled and says so - never a silent 
 	await expect(apply).toBeVisible();
 	await expect(apply).toBeDisabled();
 	await expect(apply).toContainText(/open a notebook/i);
+	// The toggle is the same silent no-op with the sign flipped: `applyRuntime` would
+	// write the preference and skip the restart, so it is disabled too.
+	await expect(page.getByTestId('databricks-runtime-toggle')).toBeDisabled();
 
 	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
+});
+
+/**
+ * The same rule for the TOGGLE, in the state where breaking it is worst: the kernel
+ * really does carry the runtime (`liveVersion` set, pill "active") and there is no
+ * notebook to restart. Flipping it there wrote the preference off, silently skipped the
+ * restart, and left the card reading "active" beside an unchecked toggle under copy
+ * claiming the variables had been cleared by a restart that never ran.
+ */
+test('with no notebook open, the toggle cannot fake a restart over a live runtime', async ({ page }) => {
+	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': true } });
+	await mockDatabricksStatus(page, {
+		...connectedStatus(),
+		runtime: { kernelStarted: true, liveVersion: '15.4', envForced: null, versionEnvForced: null }
+	});
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	const closers = page.getByTestId('tab-close');
+	for (let i = 0; i < 8 && (await closers.count()) > 0; i++) await closers.first().click();
+	await expect(page.getByTestId('empty-state')).toBeVisible();
+	await openDatabricksSection(page);
+
+	const card = page.getByTestId('databricks-runtime-card');
+	await expect(page.getByTestId('databricks-runtime-active')).toBeVisible();
+	const toggle = page.getByTestId('databricks-runtime-toggle');
+	await expect(toggle).toBeChecked();
+	await expect(toggle).toBeDisabled();
+	// It must not claim a restart it cannot perform - it names the remedy instead.
+	await expect(card).not.toContainText(/toggling restarts the kernel/i);
+	await expect(card).toContainText(/open a notebook to change it/i);
+	// The version edit is guarded by the same rule.
+	await expect(page.getByTestId('databricks-runtime-version')).toBeDisabled();
+
+	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
+});
+
+/**
+ * `CELLAR_DATABRICKS_RUNTIME_VERSION` is the on/off override's independent sibling, and
+ * it owns the VERSION the same way: it resolves ahead of the stored value, so committing
+ * a version edit would restart the kernel - clearing the namespace - to advertise a value
+ * the override throws away. The field therefore shows what is really in force and takes
+ * no edits, while the on/off decision (not overridden here) stays the user's, Apply now
+ * included - the two flags never collapse into one.
+ */
+test('an env-FORCED version shows the version in force and offers no edit', async ({ page }) => {
+	await page.request.put(`${baseURL}/api/ui-state`, {
+		data: { 'cellar-databricks-runtime': true, 'cellar-databricks-runtime-version': '14.3' }
+	});
+	await mockDatabricksStatus(page, {
+		...connectedStatus(),
+		runtime: { kernelStarted: true, liveVersion: null, envForced: null, versionEnvForced: '17.0' }
+	});
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	const card = page.getByTestId('databricks-runtime-card');
+	const version = page.getByTestId('databricks-runtime-version');
+	await expect(version).toBeVisible();
+	// The value in force, NOT the stored '14.3' the override discards.
+	await expect(version).toHaveValue('17.0');
+	await expect(version).toBeDisabled();
+	await expect(card).toContainText(/CELLAR_DATABRICKS_RUNTIME_VERSION/);
+
+	// Independent of the on/off override: that decision is still the user's, so the
+	// toggle stays live and the pending state still offers its one-click apply.
+	await expect(page.getByTestId('databricks-runtime-toggle')).toBeEnabled();
+	const apply = page.getByTestId('databricks-runtime-apply');
+	await expect(apply).toBeVisible();
+	await expect(apply).toBeEnabled();
+
+	await page.request.put(`${baseURL}/api/ui-state`, {
+		data: { 'cellar-databricks-runtime': null, 'cellar-databricks-runtime-version': null }
+	});
 });
