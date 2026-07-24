@@ -54,7 +54,10 @@ async function allCellIds(page: Page): Promise<string[]> {
 
 /** Open the notebook with windowing on (or off) and settle at the top. */
 async function openNotebook(page: Page, { virtualize = true } = {}): Promise<void> {
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}${virtualize ? '&virtualize=1' : ''}`);
+	// Both modes pinned explicitly: windowing is the default since P5, so the OFF
+	// case needs `virtualize=0` and the ON case states its intent rather than
+	// inheriting it.
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}&virtualize=${virtualize ? '1' : '0'}`);
 	const openButton = page.getByTestId('empty-open-notebook');
 	if (await openButton.isVisible({ timeout: 10_000 }).catch(() => false)) await openButton.click();
 	await expect(page.getByTestId('cell').first()).toBeVisible({ timeout: 30_000 });
@@ -232,7 +235,7 @@ test('follow-the-running-cell scrolls to a cell windowed out of the DOM', async 
 	await expect.poll(() => cellIsOnScreen(page, target), { timeout: 30_000 }).toBe(true);
 });
 
-test('with the flag OFF the same jumps still work (no windowing, no spacers)', async ({ page }) => {
+test('with windowing opted OUT the same jumps still work (no spacers)', async ({ page }) => {
 	// Generous: with windowing off all 300 cells mount, which is precisely the cost
 	// this feature exists to remove - the page is heavy here by design.
 	test.setTimeout(300_000);

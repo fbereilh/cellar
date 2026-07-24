@@ -24,7 +24,8 @@ import {
  * cells which must survive that — running, the heads of the kernel's run queue, the
  * selected cell, and the cell holding DOM focus — keep a live node wherever they
  * are. This spec proves the two correctness properties pinning exists for, on the
- * P0 large-notebook harness with `?virtualize=1`:
+ * P0 large-notebook harness, windowing pinned ON explicitly with `?virtualize=1`
+ * (it is the default since P5, but this spec must exercise the ON path regardless):
  *
  *   A. STREAMING. A cell streaming output while scrolled far off-screen (follow OFF)
  *      keeps a real node whose height GROWS with its output — so the scroll height

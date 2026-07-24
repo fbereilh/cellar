@@ -7,9 +7,11 @@ import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
 import { paneMetric, setScrollTop, cellTop } from './notebook-scroll';
 
 /**
- * Cell virtualization P2 — the windowing itself, behind the off-by-default flag.
+ * Cell virtualization P2 - the windowing itself.
  *
- * A large (N=300) synthetic notebook is opened with `?virtualize=1` and we assert
+ * A large (N=300) synthetic notebook is opened with `?virtualize=1` (windowing is on
+ * by default since P5; this spec states the mode explicitly rather than inheriting
+ * it, so it keeps testing the ON path whatever the default becomes) and we assert
  * the three P2 acceptance properties (report §6 P2):
  *   (a) mounted-cell count is O(viewport + overscan), NOT O(N);
  *   (b) total DOM node count drops far below the eager baseline (~137 nodes/cell);
@@ -17,8 +19,10 @@ import { paneMetric, setScrollTop, cellTop } from './notebook-scroll';
  *       viewport-relative top is stable across the round trip, courtesy of the scroll
  *       pane's native `overflow-anchor` (the window model accounts for the space-y-4
  *       inter-cell gap so it tracks the real scroll and never blanks the viewport).
- * A final check reloads WITHOUT the flag and asserts the render is un-windowed
- * (zero spacers, every cell mounted) — the flag-off byte-identical guarantee.
+ * A final check reloads with the `?virtualize=0` opt-out and asserts the render is
+ * un-windowed (zero spacers, every cell mounted) - the flag-off byte-identical
+ * guarantee. (`tests/e2e/virtualization-default-on.spec.ts` covers the P5 default
+ * itself: no param at all.)
  *
  * Like the rest of the E2E suite this needs the real runtime (uv + python3 + the
  * cached host-venv); it SKIPS gracefully when that is absent. The vitest unit suite
@@ -191,8 +195,8 @@ test(`windows a ${CELL_COUNT}-cell notebook: O(viewport) mounted, fewer nodes, n
 			`DOM nodes ${nodes} (eager baseline ~41,168); first-cell top drift ${Math.abs((topAfter as number) - (topBefore as number)).toFixed(1)}px`
 	);
 
-	// ---- Flag OFF: reload without the param → un-windowed, every cell mounted ----
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	// ---- Opt out: reload with ?virtualize=0 → un-windowed, every cell mounted ----
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}&virtualize=0`);
 	await expect.poll(() => mountedCells(page), { timeout: 30_000 }).toBe(CELL_COUNT);
 	expect(await spacers(page)).toBe(0);
 });

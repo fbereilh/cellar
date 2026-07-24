@@ -34,6 +34,10 @@
 		hideAllCode?: boolean;
 		/** Whether "follow the running cell" is on (a global viewer preference). */
 		followRunningCell?: boolean;
+		/** Whether windowed cell rendering is on (a global viewer preference, default on). */
+		virtualizeCells?: boolean;
+		/** A `?virtualize=` URL param decided it: show the state, but lock the toggle. */
+		virtualizeForced?: boolean;
 		onSelectTab: (id: string) => void;
 		/** Click the tab's run/queue indicator: jump to that notebook's running cell. */
 		onJumpToRunningCell?: (id: string) => void;
@@ -54,6 +58,8 @@
 		onToggleHideAllCode: () => void;
 		/** Toggle the global "follow the running cell" viewer preference. */
 		onToggleFollowRunningCell: () => void;
+		/** Toggle the global windowed-cell-rendering viewer preference. */
+		onToggleVirtualizeCells?: () => void;
 		onOpenSettings: () => void;
 	}
 
@@ -74,6 +80,8 @@
 		canHideCode = false, // a notebook is active, so hide-all-code has a target
 		hideAllCode = false, // the active notebook's report-view state
 		followRunningCell = true, // global viewer preference (default on)
+		virtualizeCells = true, // global viewer preference (windowed rendering, default on)
+		virtualizeForced = false, // a ?virtualize= URL param owns this session
 		onSelectTab,
 		onJumpToRunningCell,
 		onCloseTab,
@@ -91,6 +99,7 @@
 		onUndoAgent,
 		onToggleHideAllCode,
 		onToggleFollowRunningCell,
+		onToggleVirtualizeCells,
 		onOpenSettings
 	}: Props = $props();
 
@@ -219,6 +228,27 @@
 						{:else}
 							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 5v2" /><path d="M12 17v2" /><path d="M5 12h2" /><path d="M17 12h2" /><line x1="3" y1="3" x2="21" y2="21" /></svg>
 							Follow running cell
+						{/if}
+					</button>
+				</li>
+				<li>
+					<button
+						onclick={onToggleVirtualizeCells}
+						disabled={virtualizeForced}
+						title={virtualizeForced
+							? `The ?virtualize URL parameter is controlling this session (windowed rendering ${virtualizeCells ? 'on' : 'off'}); reload without it to use this toggle.`
+							: 'Render only the cells near the viewport, so a long notebook stays fast. Turn it off to keep every cell in the page at all times.'}
+						data-testid="toggle-virtualize-cells"
+						aria-pressed={virtualizeCells}
+					>
+						{#if virtualizeCells}
+							<!-- offered action: un-window → every row drawn -->
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16" /><path d="M4 10h16" /><path d="M4 14h16" /><path d="M4 19h16" /></svg>
+							Render all cells
+						{:else}
+							<!-- offered action: window → only the rows in the viewport band -->
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16" opacity="0.35" /><rect x="3" y="8.5" width="18" height="7" rx="1.5" /><path d="M4 19h16" opacity="0.35" /></svg>
+							Render only visible cells
 						{/if}
 					</button>
 				</li>

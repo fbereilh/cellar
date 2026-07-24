@@ -97,6 +97,21 @@ async function runCellOutOfBand(page: Page, nb: string, cellId: string, sleepS =
 	);
 }
 
+/**
+ * The seeded notebook really opened (and was not replaced by a fresh one) - asked
+ * of the SERVER's document, not of the mounted DOM. Windowed rendering is on by
+ * default since P5, so "count the rendered cells" is no longer a proxy for the
+ * document's size; this is, in both modes.
+ */
+async function docCellCount(page: Page, nb: string): Promise<number> {
+	return page.evaluate(async (path) => {
+		const res = await fetch(`/api/notebooks?path=${encodeURIComponent(path)}`);
+		if (!res.ok) return -1;
+		const body = await res.json();
+		return body?.notebook?.cells?.length ?? -1;
+	}, nb);
+}
+
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available — E2E is local-only');
 	mkdirSync(EVIDENCE, { recursive: true });
@@ -126,9 +141,14 @@ test('follow-the-running-cell: viewed-notebook follows, opt-out works + persists
 	test.setTimeout(180_000);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	// Fresh session → empty state offers to open the notebook; the existing 30-cell
-	// notebook.ipynb on disk is opened untouched (30 cells proves it, not a fresh one).
+	// notebook.ipynb on disk is opened untouched (its 30 cells prove it, not a fresh
+	// one). This spec runs at the DEFAULT rendering mode, which since P5 is windowed -
+	// following a run must work for the ordinary user, and P4's jump paths mount a
+	// windowed-out target - so the seeded-notebook check reads the server document
+	// while the DOM check only asks that the notebook rendered.
 	await page.getByTestId('empty-open-notebook').click();
-	await expect.poll(async () => page.getByTestId('cell').count(), { timeout: 30_000 }).toBe(30);
+	await expect.poll(() => page.getByTestId('cell').count(), { timeout: 30_000 }).toBeGreaterThan(0);
+	expect(await docCellCount(page, 'notebook.ipynb')).toBe(30);
 
 	const runningBar = (id: string) => page.locator(`[data-cell-id="${id}"] [data-testid="running-bar"]`);
 	const settle = async (id: string) =>
@@ -165,7 +185,7 @@ test('follow-the-running-cell: viewed-notebook follows, opt-out works + persists
 
 	// ---- C. Persistence: the OFF choice survives a reload ----
 	await page.reload();
-	await expect.poll(async () => page.getByTestId('cell').count(), { timeout: 30_000 }).toBe(30);
+	await expect.poll(() => page.getByTestId('cell').count(), { timeout: 30_000 }).toBeGreaterThan(0);
 	await page.getByTestId('app-menu').click();
 	await expect(page.getByTestId('toggle-follow-running-cell')).toHaveAttribute('aria-pressed', 'false');
 	await page.screenshot({ path: join(EVIDENCE, '3-follow-off-persisted.png') });

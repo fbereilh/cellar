@@ -78,6 +78,21 @@ async function runCellOutOfBand(page: Page, nb: string, cellId: string, sleepS =
 	);
 }
 
+/**
+ * The seeded notebook really opened (and was not replaced by a fresh one) - asked
+ * of the SERVER's document, not of the mounted DOM. Windowed rendering is on by
+ * default since P5, so "count the rendered cells" is no longer a proxy for the
+ * document's size; this is, in both modes.
+ */
+async function docCellCount(page: Page, nb: string): Promise<number> {
+	return page.evaluate(async (path) => {
+		const res = await fetch(`/api/notebooks?path=${encodeURIComponent(path)}`);
+		if (!res.ok) return -1;
+		const body = await res.json();
+		return body?.notebook?.cells?.length ?? -1;
+	}, nb);
+}
+
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available — E2E is local-only');
 	mkdirSync(EVIDENCE, { recursive: true });
@@ -109,9 +124,12 @@ test('tab run spinner: click jumps to (and switches to) the running notebook, fo
 	test.setTimeout(180_000);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 
-	// Open notebook A (the canonical notebook.ipynb) from the empty state.
+	// Open notebook A (the canonical notebook.ipynb) from the empty state. This spec
+	// runs at the DEFAULT rendering mode - windowed since P5 - so the seeded-notebook
+	// check reads the server document; the DOM only has to have rendered A.
 	await page.getByTestId('empty-open-notebook').click();
-	await expect.poll(async () => page.getByTestId('cell').count(), { timeout: 30_000 }).toBe(30);
+	await expect.poll(() => page.getByTestId('cell').count(), { timeout: 30_000 }).toBeGreaterThan(0);
+	expect(await docCellCount(page, 'notebook.ipynb')).toBe(30);
 
 	const tabA = page.locator('[data-testid="tab"][data-tab-id="notebook"]');
 	const jumpBtnA = tabA.getByTestId('tab-jump-running');

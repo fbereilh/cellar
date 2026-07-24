@@ -11,11 +11,15 @@
 // layout, the offset model accounts for the `space-y-4` inter-cell gap (`gapPx`), so
 // a spacer reproduces the exact flow space its collapsed run occupied.
 //
-// Windowing (P2) and the pinned set (P3, below) are live but flag-gated OFF:
-// `planWindow` returns "every cell mounted" whenever `virtualize` is false OR the
-// viewport metrics are absent, so the notebook renders byte-identically to the eager
-// `{#each}`. Actual spacer coalescing only runs when a caller opts in AND supplies
-// live `viewportTop`/`viewportHeight`.
+// Windowing (P2), the pinned set (P3) and the jump paths (P4) are ON by default
+// since P5 - the shell passes `virtualize: true` unless the persisted viewer
+// preference or a `?virtualize=0` URL param turns it off (`$lib/virtualizePref`),
+// and it is suppressed while printing so a PDF captures every cell. Two fallbacks
+// make that default safe without any cell-count threshold anywhere: `planWindow`
+// returns "every cell mounted" whenever `virtualize` is false OR the viewport
+// metrics are absent, and when every cell fits the viewport + overscan it emits no
+// spacers at all - so a small notebook renders exactly as the eager `{#each}` did.
+// Spacer coalescing only ever appears for cells genuinely outside the window.
 //
 // INVARIANT (enforce in review): this module is render-only. It never reads from,
 // gates on, or mutates the document model (`cells`). Heights flow in from measured

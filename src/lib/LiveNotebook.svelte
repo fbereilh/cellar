@@ -32,8 +32,10 @@
 		follow?: boolean;
 		/** The shell's `fsRefreshSignal`: a bump re-fetches the git HEAD baseline. */
 		gitRefresh?: number;
-		/** Windowed (virtualized) cell rendering. Default OFF; forwarded to Notebook,
-		 *  where it is fully wired but dormant (no behavior change) at this phase. */
+		/** Windowed (virtualized) cell rendering; forwarded to Notebook. The shell
+		 *  turns it ON by default (P5) and suppresses it while printing - see
+		 *  `$lib/virtualizePref`. The prop itself keeps defaulting to false so a
+		 *  standalone mount (tests, any future embedder) renders every cell. */
 		virtualize?: boolean;
 		onCellsChange?: (path: string, cells: UICell[]) => void;
 		/** (path, foldedIds, folding): the sidebar Outline renders from this. */

@@ -62,7 +62,12 @@ function editorCount(page: Page): Promise<number> {
 }
 
 test(`a ${CELL_COUNT}-cell notebook opens with zero editors and shows every cell's code`, async ({ page }) => {
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	// `virtualize=0`: this spec measures the LAZY EDITOR in isolation - every cell
+	// mounted, zero CodeMirror instances - which is a different axis from windowed
+	// cell rendering (on by default since P5, and covered by the virtualization
+	// specs). Pinning the mode keeps this the un-windowed worst case it was written
+	// as; windowing only compounds the win it reports.
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}&virtualize=0`);
 
 	const t0 = Date.now();
 	await page.getByTestId('empty-open-notebook').click();
