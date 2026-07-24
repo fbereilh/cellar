@@ -1465,11 +1465,76 @@ export async function checkInstall(): Promise<InstallStatus> {
 	return { python, sdk: !!result.sdk, connect: !!result.connect, sdkVersion: result.sdk_version, connectVersion: result.connect_version };
 }
 
+/** The workspace-level half of `getStatus`: is `uv` on PATH, can the venv import the SDK. */
+interface WorkspaceProbes {
+	install: InstallStatus;
+	installError: string | null;
+	uv: boolean;
+}
+
+/**
+ * How long the workspace probes are trusted. They are two SUBPROCESS spawns per read
+ * (`uv --version`, and a project-venv python that imports databricks-sdk) on the same
+ * Node process that streams kernel output, SSE and MCP - and `getStatus` is polled:
+ * the sidebar re-reads it every ~1.2s for as long as a kernel-restart rebuild is in
+ * flight, which on a cold cluster is minutes, not the old 15s-bounded settle poll.
+ * Whether uv exists and whether the venv can import a package are workspace facts
+ * that cannot change between ticks unless Cellar itself installs something - and that
+ * path invalidates this explicitly - so a short TTL costs nothing and bounds the poll
+ * to one probe pair per window.
+ */
+const WORKSPACE_PROBE_TTL_MS = 5_000;
+
+let workspaceProbeCache: { at: number; python: string | null; value: WorkspaceProbes } | null = null;
+/** Single-flight: a python import can outlast the poll interval, so ticks must not overlap. */
+let workspaceProbeInFlight: { python: string | null; promise: Promise<WorkspaceProbes> } | null = null;
+
+/**
+ * Drop the memoized workspace probes, so the next read re-measures. Called wherever
+ * Cellar itself changes the answer (an install into the project venv) - a stale
+ * "packages missing" card right after an install would be its own defect. A venv
+ * REBIND needs no call: the cache is keyed on the interpreter path it measured.
+ */
+export function invalidateWorkspaceProbes(): void {
+	workspaceProbeCache = null;
+}
+
+async function workspaceProbes(): Promise<WorkspaceProbes> {
+	const python = projectPython();
+	const cached = workspaceProbeCache;
+	if (cached && cached.python === python && Date.now() - cached.at < WORKSPACE_PROBE_TTL_MS) {
+		return cached.value;
+	}
+	const running = workspaceProbeInFlight;
+	if (running && running.python === python) return running.promise;
+	const promise = (async (): Promise<WorkspaceProbes> => {
+		let install: InstallStatus = { python, sdk: false, connect: false };
+		let installError: string | null = null;
+		try {
+			install = await checkInstall();
+		} catch (err) {
+			installError = err instanceof Error ? err.message : String(err);
+		}
+		return { install, installError, uv: await hasUv() };
+	})();
+	const entry = { python, promise };
+	workspaceProbeInFlight = entry;
+	try {
+		const value = await promise;
+		workspaceProbeCache = { at: Date.now(), python, value };
+		return value;
+	} finally {
+		if (workspaceProbeInFlight === entry) workspaceProbeInFlight = null;
+	}
+}
+
 /**
  * Everything the sidebar needs to render before a connection exists. `nb` is the
  * notebook whose connection to report - the sidebar passes the ACTIVE notebook,
  * so the panel always reflects the focused notebook's Databricks session. The
- * profiles/install/uv fields are workspace-level and notebook-independent.
+ * profiles/install/uv fields are workspace-level and notebook-independent, and are
+ * memoized behind a short TTL (`workspaceProbes`) so polling this route does not
+ * spawn a subprocess pair per tick.
  *
  * `connection` is `liveConnection(nb)` (not the raw epoch-only `connectionStatus`):
  * it reflects a REAL liveness verdict, so a session whose Spark Connect client was
@@ -1488,18 +1553,12 @@ export async function checkInstall(): Promise<InstallStatus> {
  */
 export async function getStatus(nb?: string | null) {
 	const { configPath: path, exists, profiles, error } = readProfiles();
-	let install: InstallStatus = { python: projectPython(), sdk: false, connect: false };
-	let installError: string | null = null;
-	try {
-		install = await checkInstall();
-	} catch (err) {
-		installError = err instanceof Error ? err.message : String(err);
-	}
+	const { install, installError, uv } = await workspaceProbes();
 	return {
 		config: { path, exists, profiles, error: error ?? null },
 		install,
 		installError,
-		uv: await hasUv(),
+		uv,
 		signedInHosts: [...signedInHosts],
 		signedInProfiles: [...signedInProfiles],
 		connection: await liveConnection(nb),
@@ -2239,11 +2298,20 @@ function restartAttemptInFlight(s: ConnState): boolean {
  * being dispatched. The stamp is cleared outright the moment the outcome is KNOWN (a
  * successful `connect()`, a reconnect that gave up, a torn-down kernel, an explicit
  * disconnect), so a proven failure is never held behind a spinner.
+ *
+ * Lapsing is itself such an outcome, so this RETIRES the stamp when the floor runs
+ * out with nothing in flight: the panel has just fallen through to the honest lost
+ * card, and a stamp kept past that point is a latch - any later unrelated attempt on
+ * this notebook (an expiry self-heal, a connect that then fails) would re-satisfy the
+ * in-flight branch and claim a kernel restart that never happened. A stamp may only
+ * ever belong to the restart that set it.
  */
 function restartingAfterKernelRestart(s: ConnState): boolean {
 	if (s.restartedAt === null) return false;
 	if (restartAttemptInFlight(s)) return true;
-	return Date.now() - s.restartedAt < RESTART_LOST_GRACE_MS;
+	if (Date.now() - s.restartedAt < RESTART_LOST_GRACE_MS) return true;
+	s.restartedAt = null;
+	return false;
 }
 
 /**
@@ -3386,6 +3454,9 @@ export async function installDeps({ version }: { version?: string | null } = {})
 		pin = /^\d+\.\d+$/.test(version) ? `==${version}.*` : `==${version}`;
 	}
 	await installPackages(python, ['databricks-sdk', `databricks-connect${pin}`]);
+	// The venv just changed under the memoized workspace probes, so the sidebar's next
+	// read must re-measure rather than serve the pre-install "packages missing".
+	invalidateWorkspaceProbes();
 	// checkInstall() already reports `python`; spreading it last is what the caller
 	// sees, so no explicit `python` key here (it would only be overwritten).
 	return { ok: true, ...(await checkInstall()) };

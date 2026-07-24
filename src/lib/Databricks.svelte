@@ -578,14 +578,36 @@
 	 *
 	 * It is a poll rather than a single delayed re-check because the flag is no longer
 	 * a ~1s window: it now lasts as long as the rebuild is genuinely in flight (a
-	 * cluster probe + install check + Spark Connect session build, i.e. seconds). It
-	 * converges by construction - each fresh status re-runs this effect, and the first
-	 * read that is not `restarting` ends it.
+	 * cluster probe + install check + Spark Connect session build, i.e. seconds).
+	 *
+	 * It is SELF-DRIVING, and that is load-bearing: a FAILED read leaves `status`
+	 * untouched (`loadStatus`'s catch only writes `statusError`), so an effect that
+	 * re-armed only when a read APPLIED would break its own chain on the first flaky
+	 * GET and sit on the spinner forever - the exact stuck state this poll exists to
+	 * prevent. So each tick bumps `restartRecheckTick` AFTER its read settles, which
+	 * re-runs this effect whatever the read did (and never overlaps two reads). It
+	 * converges by construction: the first status that is not `restarting` (or a
+	 * notebook switch, or unmount) fails the guard and no further timer is armed.
+	 *
+	 * Backoff is a second safeguard on top of the server's memoized workspace probes:
+	 * the window is unbounded (a cold-cluster reconnect is minutes), so a long one
+	 * settles into an idle-ish cadence instead of a fixed 1.2s drumbeat.
 	 */
 	const RESTART_RECHECK_MS = 1200;
+	const RESTART_RECHECK_MAX_MS = 5000;
+	let restartRecheckTick = $state(0);
+	let restartRecheckAttempts = 0;
 	$effect(() => {
-		if (!connection.restarting) return;
-		const t = setTimeout(() => loadStatus(), RESTART_RECHECK_MS);
+		void restartRecheckTick; // a real dependency: re-arm on every tick, failed reads included
+		if (!connection.restarting) {
+			restartRecheckAttempts = 0;
+			return;
+		}
+		const delay = Math.min(RESTART_RECHECK_MS * 2 ** restartRecheckAttempts, RESTART_RECHECK_MAX_MS);
+		const t = setTimeout(() => {
+			restartRecheckAttempts++;
+			void loadStatus().finally(() => restartRecheckTick++);
+		}, delay);
 		return () => clearTimeout(t);
 	});
 

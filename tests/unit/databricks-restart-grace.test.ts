@@ -300,6 +300,29 @@ describe('kernel-restart grace (no "lost" flash)', () => {
 		expect(after.lost).toBeUndefined();
 	});
 
+	it('a LATER unrelated attempt cannot revive a stamp that already lapsed', async () => {
+		await connectA();
+		restartKernel(2);
+		// The stamp is set on the first observed read, then lapses with nothing in
+		// flight: the panel has already fallen through to the honest lost card.
+		expect((await panel()).restarting).toBe(true);
+		advanceClock(1200);
+		expect((await panel()).restarting).toBeUndefined();
+
+		// Something unrelated now runs on this notebook (here: a connect held open the
+		// way a real one is by its cluster probe + session build). It is in flight, but
+		// it is NOT the kernel restart that stamped - so a lapsed stamp must not latch
+		// and let it claim to be restarting.
+		const release = gateConnect();
+		const attempt = dbx.connect({ profile: 'test', clusterId: '0725-abc', clusterName: 'Test Cluster', nb: A() });
+		const during = await panel();
+		expect(during.connected).toBe(false);
+		expect(during.restarting).toBeUndefined();
+
+		release();
+		await attempt;
+	});
+
 	it('re-arms for a SECOND restart after an earlier one lapsed into lost', async () => {
 		await connectA();
 		restartKernel(2);
