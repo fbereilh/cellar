@@ -25,6 +25,12 @@ import { isCellMounted, setScrollTop } from './notebook-scroll';
  * the cell out has to hand it to the model too (the user never typed, so there is no
  * local text it could clobber) - otherwise the run reads the pre-stash source.
  *
+ * The third case is that hand-back's own limit: a DELIBERATE local rewrite (split-cell)
+ * supersedes an unresolved stash exactly as typing does. It cannot be seen by the
+ * editor's update listener (a rewrite runs through the remote-apply path, which that
+ * listener skips), so without an explicit drop the teardown would hand the stale marker
+ * back over the rewrite and the cell would come back holding the pre-split text.
+ *
  * The fixture is deliberately one lone code cell in the middle of a tall markdown
  * notebook: tall enough that the target is windowed out at the top, cheap enough
  * that "Run all" is exactly one kernel run.
@@ -40,6 +46,9 @@ const NB = 'notebook.ipynb';
 const STALE = 'print("STALE_ORIGINAL")';
 const EDITED = 'print("REMOTE_EDIT_OK")';
 const STASHED = 'print("STASH_EDIT_OK")';
+const SPLIT_UPPER = 'print("SPLIT_UPPER_OK")';
+const SPLIT_LOWER = 'print("SPLIT_LOWER_OK")';
+const SPLIT_STASH = 'print("SPLIT_STASH_LOST")';
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
@@ -132,6 +141,16 @@ async function agentEdit(page: Page, source: string): Promise<void> {
 	);
 }
 
+/** Open the sidebar Search section and type `needle` into it. */
+async function typeSearch(page: Page, needle: string): Promise<void> {
+	const searchHeader = page.getByTestId('section-search');
+	await searchHeader.scrollIntoViewIfNeeded();
+	const searchInput = page.getByTestId('search-input');
+	if (!(await searchInput.isVisible().catch(() => false))) await searchHeader.click();
+	await expect(searchInput).toBeVisible();
+	await searchInput.fill(needle);
+}
+
 /**
  * How many cells the sidebar Search finds `needle` in. Search reads the notebook's
  * live cell MODEL (never the DOM), so it answers for a cell nothing has mounted -
@@ -139,18 +158,23 @@ async function agentEdit(page: Page, source: string): Promise<void> {
  * Waits for a hit, but returns the count either way so the caller can judge it.
  */
 async function searchHits(page: Page, needle: string): Promise<number> {
-	const searchHeader = page.getByTestId('section-search');
-	await searchHeader.scrollIntoViewIfNeeded();
-	const searchInput = page.getByTestId('search-input');
-	if (!(await searchInput.isVisible().catch(() => false))) await searchHeader.click();
-	await expect(searchInput).toBeVisible();
-	await searchInput.fill(needle);
+	await typeSearch(page, needle);
 	await page
 		.getByTestId('search-result')
 		.first()
 		.waitFor({ timeout: 15_000 })
 		.catch(() => {});
 	return page.getByTestId('search-result').count();
+}
+
+/**
+ * Assert Search finds `needle` NOWHERE. This reads the debounced COUNT line, not the
+ * result rows: the query is debounced, so a row-count read right after typing would
+ * still be answering for the PREVIOUS query and a stale hit would read as a match.
+ */
+async function expectNoSearchHits(page: Page, needle: string): Promise<void> {
+	await typeSearch(page, needle);
+	await expect(page.getByTestId('search-count')).toHaveText('0 matches', { timeout: 15_000 });
 }
 
 /** Empty the target's outputs so the next run's output is unambiguously the new one. */
@@ -244,4 +268,62 @@ test('an unresolved "changed on server" stash survives the cell windowing out', 
 	expect(after.output).toContain('STASH_EDIT_OK');
 	expect(after.source).toContain('STASH_EDIT_OK');
 	expect(after.source).not.toContain('REMOTE_EDIT_OK');
+});
+
+test('a split over an unresolved stash supersedes it, and windowing out keeps the split', async ({ page }) => {
+	test.setTimeout(180_000);
+
+	await openWindowed(page);
+	// Two lines, so the split has a distinguishable upper and lower half.
+	await agentEdit(page, `${SPLIT_UPPER}\n${SPLIT_LOWER}`);
+
+	// Jump to the target and put the caret at the START of its second line, so the
+	// split point is deterministic: doc start (Home from the top line), then down.
+	expect(await searchHits(page, 'SPLIT_UPPER_OK')).toBe(1);
+	await page.getByTestId('search-result').first().click();
+	await expect.poll(() => isCellMounted(page, TARGET), { timeout: 15_000 }).toBe(true);
+	const cell = page.locator(`[data-cell-id="${TARGET}"]`);
+	await cell.getByTestId('editor-scroll').click();
+	await expect(cell.locator('.cm-content')).toBeVisible({ timeout: 10_000 });
+	await cell.locator('.cm-content').click();
+	for (const key of ['ArrowUp', 'ArrowUp', 'Home', 'ArrowDown', 'Home']) await page.keyboard.press(key);
+
+	// ---- The agent edits it while the caret sits there: the edit STASHES ----
+	await agentEdit(page, SPLIT_STASH);
+	await expect(cell.getByTestId('remote-changed')).toBeVisible({ timeout: 15_000 });
+
+	// The user resolves the banner neither way - they split the cell instead. That is
+	// a deliberate local rewrite, so it supersedes the stash (`Ctrl Shift -` names the
+	// physical Ctrl key on every platform, JupyterLab's spelling).
+	await page.keyboard.press('Control+Shift+Minus');
+	await expect.poll(async () => (await serverCell(page)).source, { timeout: 15_000 }).toBe(`${SPLIT_UPPER}\n`);
+
+	// The split lands the caret in the created lower half, and that jump scrolls -
+	// so wait for it before scrolling away, and re-apply the scroll each poll so a
+	// late-settling jump can't quietly put the target back on screen.
+	await expect(page.locator('.cm-editor.cm-focused')).toHaveCount(1, { timeout: 15_000 });
+
+	// Scroll off, destroying the instance: the superseded stash must NOT be handed back.
+	await expect
+		.poll(
+			async () => {
+				await setScrollTop(page, 0);
+				return isCellMounted(page, TARGET);
+			},
+			{ timeout: 20_000 }
+		)
+		.toBe(false);
+
+	// The model holds the split half, not the stale remote source (search reads the
+	// live cell model, so it answers for a cell nothing has mounted).
+	await expectNoSearchHits(page, 'SPLIT_STASH_LOST');
+
+	// …and a run executes and persists the split half, so the rewrite is not reverted.
+	await clearTargetOutputs(page);
+	await page.getByTestId('run-all').click();
+	await expect.poll(async () => (await serverCell(page)).output.length, { timeout: 60_000 }).toBeGreaterThan(0);
+	const after = await serverCell(page);
+	expect(after.output).toContain('SPLIT_UPPER_OK');
+	expect(after.output).not.toContain('SPLIT_STASH_LOST');
+	expect(after.source).toBe(`${SPLIT_UPPER}\n`);
 });

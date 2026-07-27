@@ -446,19 +446,14 @@
 	// instead of rendered HTML, a far louder change than a collapsed editor.
 	let rawEdits = $state<Record<string, boolean | undefined>>({});
 
+	// `false` DELETES the entry rather than storing it, so this doubles as the
+	// delete-path cleanup: a deleted cell can never come back under the same id, and
+	// the map must not grow for the life of the tab.
 	function setRawEdit(id: string, raw: boolean) {
 		if ((rawEdits[id] ?? false) === raw) return;
 		const next = { ...rawEdits };
 		if (raw) next[id] = true;
 		else delete next[id];
-		rawEdits = next;
-	}
-	// A deleted cell can never come back under the same id, so drop its entry rather
-	// than letting the map grow for the life of the tab.
-	function dropRawEdit(id: string) {
-		if (!(id in rawEdits)) return;
-		const next = { ...rawEdits };
-		delete next[id];
 		rawEdits = next;
 	}
 
@@ -1194,7 +1189,7 @@
 		} else if (ev.type === 'cell:deleted') {
 			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
-			dropRawEdit(ev.cellId);
+			setRawEdit(ev.cellId, false);
 			if (runningId === ev.cellId) runningId = null;
 			if (activeId === ev.cellId) activeId = null;
 		} else if (ev.type === 'cell:moved') {
@@ -1917,7 +1912,7 @@
 		deletedCells.push({ index: i, ...snapshotCell(cell) });
 		if (deletedCells.length > UNDO_LIMIT) deletedCells.shift();
 		cells = cells.filter((c) => c.id !== id);
-		dropRawEdit(id);
+		setRawEdit(id, false);
 		// Keep a cell selected: command mode acts on the selection, so deleting the
 		// selected cell must hand the selection to its neighbor, not drop it. Focus
 		// follows, because the delete button that had it is gone with the cell.

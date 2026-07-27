@@ -810,10 +810,19 @@
 	 * toggle, the upper half of a split). Cancels any pending debounce, because
 	 * the caller persists the new source itself, and reuses the remote-apply path
 	 * so the update listener doesn't echo the same text back as a second save.
+	 *
+	 * A deliberate local rewrite SUPERSEDES an unresolved remote stash, exactly as
+	 * typing does - but the update listener's supersede-clear cannot see this one:
+	 * it returns early on `applyingRemote`, which the remote-apply path sets. So the
+	 * stash is dropped here, else teardown would hand the stale marker back over the
+	 * rewrite and a remount would adopt the pre-rewrite text while the server holds
+	 * what the caller just persisted.
 	 */
 	function replaceSource(src: string) {
 		clearTimeout(editTimer);
 		editPending = false;
+		remoteChanged = false;
+		pendingRemoteSource = null;
 		if (view) {
 			applySourceToEditor(src);
 			return;
