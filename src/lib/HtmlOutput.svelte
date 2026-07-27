@@ -18,7 +18,12 @@
 	// a max and lets the iframe scroll internally past it. Cross-origin postMessage
 	// is the only channel an opaque-origin iframe has, which is exactly why it is
 	// safe.
+	//
+	// The injected stylesheet - including the comfortable table defaults a bare
+	// Styler / `_repr_html_` gets, and the low-specificity rule that keeps a user's
+	// own styling winning - lives in `htmlOutputStyle.ts`; read its header first.
 	import { browser } from '$app/environment';
+	import { OUTPUT_HTML_CSS } from '$lib/htmlOutputStyle';
 
 	let { html }: { html: string | null | undefined } = $props();
 
@@ -32,8 +37,7 @@
 	// background) plus the height reporter.
 	function buildSrcdoc(userHtml: string): string {
 		return `<!doctype html><html><head><meta charset="utf-8"><base target="_blank"><style>
-html,body{margin:0;padding:8px;background:#ffffff;color:#1f2937;font-family:system-ui,-apple-system,sans-serif;font-size:14px;}
-img,svg,canvas,table{max-width:100%;}
+${OUTPUT_HTML_CSS}
 </style></head><body>${userHtml}
 <script>(function(){
   function send(){ try{ parent.postMessage({__cellarHtml:'${token}', height: Math.ceil(document.documentElement.scrollHeight)}, '*'); }catch(e){} }
