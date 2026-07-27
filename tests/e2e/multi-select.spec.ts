@@ -224,6 +224,14 @@ test('Cmd/Ctrl+click builds a non-contiguous selection, and bulk retype converts
 	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
 	await clickCell(page, d, [MOD]);
 
+	// A right-click on a MEMBER keeps the selection: a non-primary press is a
+	// context-menu gesture, not a selection one, and collapsing to the clicked cell
+	// before the menu even opens would destroy the set the menu is about to act on.
+	const menuTarget = page.locator(`[data-cell-id="${c}"]`);
+	const menuBox = await menuTarget.boundingBox();
+	await menuTarget.click({ button: 'right', position: { x: Math.round(menuBox!.width / 2), y: 14 } });
+	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+
 	// `m` → markdown, for the whole selection, in one action.
 	await page.keyboard.press('m');
 	const picked = new Set([a, c, d]);
@@ -408,6 +416,46 @@ test('a second `z` during a restore does not replay the same undo group', async 
 	const after = await serverOrder(page);
 	expect(after).toHaveLength(before.length);
 	expect(new Set(after).size).toBe(after.length);
+});
+
+test('an insert that fails mid-restore is resumed, not replayed, by the next `z`', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openNotebook(page, '0');
+	const before = await serverCells(page);
+	const sourcesBefore = before.map((c) => c.source);
+
+	const start = (await visibleCellIds(page))[1];
+	await clickCell(page, start);
+	await page.keyboard.press('Shift+j');
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+	await page.keyboard.press('d');
+	await page.keyboard.press('d');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(before.length - 3);
+
+	// Fail the SECOND insert of the restore. The group survives (that is the whole
+	// point of dropping it only once every cell is back), so the records that
+	// already landed must be gone from it - otherwise the next `z` replays them and
+	// the notebook grows duplicates of cells the user asked to see once.
+	let posts = 0;
+	await page.route('**/api/cells', async (route) => {
+		if (route.request().method() !== 'POST') return route.fallback();
+		posts += 1;
+		return posts === 2 ? route.abort('failed') : route.continue();
+	});
+	await page.keyboard.press('z');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(before.length - 2);
+	await page.waitForTimeout(800); // nothing further lands: the restore stopped there
+	expect(await serverOrder(page)).toHaveLength(before.length - 2);
+	await page.unroute('**/api/cells');
+
+	// The retry picks up the two that never landed and stops.
+	await page.keyboard.press('z');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 30_000 }).toBe(before.length);
+	await page.waitForTimeout(1500);
+	const after = await serverCells(page);
+	expect(after.map((c) => c.source)).toEqual(sourcesBefore); // each cell back exactly once, in place
+	expect(new Set(after.map((c) => c.id)).size).toBe(after.length);
 });
 
 test('a REFUSED bulk delete leaves no undo group, so `z` cannot duplicate cells', async ({ page }) => {

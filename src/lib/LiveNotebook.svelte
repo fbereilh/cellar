@@ -2071,21 +2071,34 @@
 		if (!group?.length) return;
 		undoInFlight = true;
 		const restored: string[] = [];
+		// Ascending index order is what makes each insert land its cell back where it
+		// was (every earlier restore shifts the later ones right by exactly one), and
+		// sorting the group ITSELF is what lets a record be dropped the instant its
+		// cell is back: the group left on the stack then describes exactly what is
+		// still missing, so a retry after a mid-restore failure resumes rather than
+		// replaying - which would insert the cells that already landed a second time.
+		group.sort((a, b) => a.index - b.index);
 		try {
-			for (const record of [...group].sort((a, b) => a.index - b.index)) {
-				restored.push((await insertCellAt(record.index, record)).id);
+			while (group.length) {
+				restored.push((await insertCellAt(group[0].index, group[0])).id);
+				group.shift();
 			}
 			// Dropped by identity, not by position: a delete landing while the restore
 			// awaited has pushed a newer group on top, and popping would discard THAT.
 			const at = deletedCells.indexOf(group);
 			if (at >= 0) deletedCells.splice(at, 1);
+		} catch {
+			// A rejected insert leaves the remaining records on the stack for another
+			// `z`; it must not escape as an unhandled rejection, which would also skip
+			// the selection restore below and strand the user with no selected cell.
 		} finally {
 			undoInFlight = false;
 		}
 		// Restore the SELECTION too, not just the cells: undoing a bulk delete should
 		// hand back the state the delete was issued from, so the next action can act
-		// on the same set.
-		await selectAndFocus(restored[restored.length - 1] ?? null);
+		// on the same set. After a partial restore it covers what actually landed.
+		if (!restored.length) return;
+		await selectAndFocus(restored[restored.length - 1]);
 		if (restored.length > 1) {
 			selectedIds = new Set(restored);
 			anchorId = restored[0];

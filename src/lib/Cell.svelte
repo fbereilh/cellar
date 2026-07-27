@@ -277,7 +277,8 @@
 	/**
 	 * The card's pointerdown: an ordinary click activates this cell, a MODIFIER
 	 * click is a multi-cell selection gesture (Shift = contiguous range from the
-	 * anchor, Cmd/Ctrl = toggle this cell in or out).
+	 * anchor, Cmd/Ctrl = toggle this cell in or out). Either way it is the PRIMARY
+	 * button that selects - see the non-primary branch at the end.
 	 *
 	 * A modifier gesture `preventDefault`s so the press never hands focus to the
 	 * editor - JupyterLab does the same, and without it a Shift+click anywhere in a
@@ -307,6 +308,21 @@
 		) {
 			e.preventDefault();
 			onActivate?.(cell.id, { extend, toggle });
+			return;
+		}
+		// The PLAIN activation is primary-button-only for the same reason: it
+		// collapses the selection to this one cell, so a right-click aimed at a
+		// context menu would destroy a five-cell selection before the menu even
+		// opened. A non-primary press is a context-menu/auxiliary gesture, never a
+		// selection gesture. Accepted cost, deliberately: a right-click on an
+		// UNSELECTED cell no longer selects it first.
+		//
+		// Skipping the call is not enough - the browser focuses the card (it is
+		// `tabindex=-1`) on the press, and the `focusin` that follows collapses onto
+		// whatever it landed on. `preventDefault` is what stops the focus moving;
+		// `contextmenu` is dispatched independently, so the native menu still opens.
+		if (e.button !== 0) {
+			e.preventDefault();
 			return;
 		}
 		onActivate?.(cell.id);
