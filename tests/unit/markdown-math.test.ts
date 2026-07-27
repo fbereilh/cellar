@@ -10,7 +10,11 @@
 // config) is the only test that can catch a KaTeX allowlist extension having
 // quietly let script through.
 import { describe, it, expect } from 'vitest';
-import { renderMarkdown, MARKDOWN_SANITIZE_CONFIG } from '../../src/lib/markdown';
+import {
+	renderMarkdown,
+	renderOutputMarkdown,
+	MARKDOWN_SANITIZE_CONFIG
+} from '../../src/lib/markdown';
 
 /** Parse rendered HTML so assertions read the DOM, not a string. */
 function dom(html: string): HTMLElement {
@@ -103,6 +107,30 @@ describe('math delimiters do not eat prose', () => {
 		const host = dom(renderMarkdown('a \\$x\\$ b'));
 		expect(host.querySelector('.katex')).toBeNull();
 	});
+
+	it('exempts code spans and fenced blocks, so a shell prompt is safe there', () => {
+		// The documented workaround for the shell-prompt limitation below: math is not
+		// parsed inside code, which is where shell commands belong anyway.
+		const span = dom(renderMarkdown('run `$ npm install` then `$ npm run build`'));
+		expect(span.querySelector('.katex')).toBeNull();
+		expect(span.querySelectorAll('code')[0]?.textContent).toBe('$ npm install');
+		expect(span.textContent).toContain('$ npm run build');
+
+		const fenced = dom(renderMarkdown('```sh\n$ npm install\n$ npm run build\n```\n'));
+		expect(fenced.querySelector('.katex')).toBeNull();
+		expect(fenced.querySelector('pre code')?.textContent).toContain('$ npm install');
+	});
+
+	it('documents the accepted limitation: an UNFENCED shell prompt does typeset', () => {
+		// Not a desired outcome - a KNOWN, accepted one, pinned so a future change to
+		// it is a deliberate decision. The plugin rejects a closing `$` followed by a
+		// word character but not one preceded by whitespace, so the span between two
+		// prompt `$`s parses as inline math. Jupyter behaves identically; it is
+		// inherent to the `$` delimiter set this feature is required to use. See the
+		// delimiter doc block in `src/lib/markdown.ts`.
+		const host = dom(renderMarkdown('$ npm install\n$ npm run build'));
+		expect(host.querySelector('.katex')).not.toBeNull();
+	});
 });
 
 describe('rendering errors are contained', () => {
@@ -123,6 +151,30 @@ describe('rendering errors are contained', () => {
 		const html = renderMarkdown('$\\thisisnotacommand{x}$');
 		expect(html).toContain('#cc0000');
 		expectInert(html);
+	});
+
+	it('bounds a hostile oversize expression instead of blowing out the layout', () => {
+		// `\rule`/`\hspace` sizes are NOT gated by `trust:false`, and a downloaded
+		// notebook is untrusted input: at KaTeX's default `maxSize: Infinity` this
+		// renders a multi-thousand-em node that wrecks the cell around it. It must
+		// still RENDER (the expression is valid TeX) - just capped.
+		const html = renderMarkdown('$\\rule{1em}{9999em}$ and $\\hspace{5000em}$ tail');
+		const host = dom(html);
+		expect(host.querySelector('.katex')).not.toBeNull();
+		expect(host.textContent).toContain('tail');
+		// Every em-valued LAYOUT dimension KaTeX emitted (inline styles + the MathML
+		// width/height attrs). The `<annotation>`'s TeX still says 9999em - it is the
+		// source, not a size, and must be left verbatim.
+		const sizes: number[] = [];
+		for (const el of Array.from(host.querySelectorAll('*'))) {
+			for (const name of ['style', 'width', 'height'] as const) {
+				const v = el.getAttribute(name);
+				if (v) for (const m of v.matchAll(/([\d.]+)em/g)) sizes.push(Number(m[1]));
+			}
+		}
+		expect(sizes.length).toBeGreaterThan(0);
+		expect(Math.max(...sizes)).toBeLessThanOrEqual(10);
+		expect(host.querySelector('annotation')?.textContent).toContain('9999em');
 	});
 });
 
@@ -165,6 +217,37 @@ describe('sanitization is not weakened by the KaTeX allowlist', () => {
 			expect(host.querySelector('img')).toBeNull();
 			expectInert(html);
 		}
+	});
+});
+
+describe('kernel output is rendered WITHOUT math', () => {
+	// Deliberate split by CONTENT CLASS, not renderer drift: authored prose may
+	// contain math, arbitrary kernel output may not be $-scanned - a printed price
+	// column is the everyday case, and typesetting it would eat the user's DATA.
+	// Everything else (markdown-it config, sanitizer config, sanitize call site) is
+	// shared, which is what keeps the two from diverging in any other respect.
+	it('leaves a $…$ span in output as literal text', () => {
+		const host = dom(renderOutputMarkdown('| item | price |\n|---|---|\n| a | $x^2$ |\n'));
+		expect(host.querySelector('.katex')).toBeNull();
+		expect(host.textContent).toContain('$x^2$');
+		// …while the authored-prose renderer typesets the same source.
+		expect(dom(renderMarkdown('$x^2$')).querySelector('.katex')).not.toBeNull();
+	});
+
+	it('leaves a printed price column exactly as the kernel printed it', () => {
+		const host = dom(
+			renderOutputMarkdown('| sku | low | high |\n|---|---|---|\n| a | $5 | $1,200 |\n')
+		);
+		expect(host.querySelector('.katex')).toBeNull();
+		const cells = Array.from(host.querySelectorAll('tbody td')).map((c) => c.textContent);
+		expect(cells).toEqual(['a', '$5', '$1,200']);
+	});
+
+	it('renders the same tables and sanitizes the same way as the prose renderer', () => {
+		const table = '| a | b |\n|---|---|\n| 1 | 2 |\n';
+		expect(renderOutputMarkdown(table)).toBe(renderMarkdown(table));
+		expectInert(renderOutputMarkdown('<img src=x onerror=alert(1)> <script>alert(1)</script>'));
+		expect(dom(renderOutputMarkdown('[click](javascript:alert(1))')).querySelector('a')?.getAttribute('href') ?? '').not.toContain('javascript:');
 	});
 });
 

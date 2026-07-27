@@ -12,13 +12,27 @@ import type { KatexOptions } from 'katex';
 // "remember to add the math stylesheet".
 import 'katex/dist/katex.min.css';
 
-// The one markdown engine Cellar uses. Shared by notebook markdown cells
-// (`Cell.svelte`), the file-preview view (`MarkdownView.svelte`) and the
-// markdown-table-in-output path — so every rendered surface parses identically
-// and there is never a second engine to drift from. Safe mode: `html:false`
-// escapes raw HTML, then DOMPurify (client-only, needs a DOM) sanitizes what
-// markdown-it emits, so notebook / file content can't inject script.
-export const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
+/** markdown-it in Cellar's one safe mode: `html:false` escapes raw HTML, and every
+ *  render is then handed to DOMPurify by {@link sanitize} (never bypassed), so
+ *  notebook / file / kernel content can't inject script. */
+const newEngine = () => new MarkdownIt({ html: false, linkify: true, breaks: false });
+
+// The markdown engine for AUTHORED PROSE: notebook markdown cells (`Cell.svelte`)
+// and the `.md` file preview (`MarkdownView.svelte`). Math-enabled (see below).
+// Deliberately NOT exported - every caller goes through `renderMarkdown`, so no
+// surface can reach `md.render` and skip the sanitizer.
+const md = newEngine();
+
+// The engine for KERNEL OUTPUT (the markdown-table-in-output path in
+// `Cell.svelte`'s `renderTable`). Same markdown-it config, same sanitizer config,
+// same sanitize call site - the ONE difference is that the math plugin is not
+// installed on it, and that split is by CONTENT CLASS, not renderer drift:
+// kernel output is arbitrary data, and a printed DataFrame with a price column
+// ("$5", "$1,200") would have its own data false-typeset as math by any $-scanner.
+// Math therefore stays strictly on the authored-prose surfaces. Rendering real
+// `text/latex` output is a separate feature keyed on the output's MIME type - not
+// $-scanning arbitrary cells - and is deliberately not this path.
+const mdOutput = newEngine();
 
 /**
  * TeX math options, KaTeX via `@vscode/markdown-it-katex` (the plugin VS Code's
@@ -35,6 +49,19 @@ export const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
  * `\(…\)` / `\[…\]` are NOT supported by this plugin; `$`/`$$` is the required
  * (and Jupyter-native) set.
  *
+ * KNOWN, ACCEPTED LIMITATION - a shell prompt typesets. Those rules reject a
+ * closing `$` followed by a word character, but not one PRECEDED by whitespace,
+ * so an unfenced paragraph of prompt lines
+ *     $ npm install
+ *     $ npm run build
+ * parses the span between the two `$` as inline math. Jupyter behaves identically:
+ * this is inherent to the `$` delimiter set, not a bug in the wiring, so it is
+ * documented rather than worked around (changing the delimiters would break the
+ * Jupyter-native contract this feature exists to honor). The workaround is the one
+ * a user reaches for anyway, and it is pinned by test: math is NOT parsed inside an
+ * inline code span (`` `$ npm install` ``) or a fenced code block, which is where
+ * shell commands belong.
+ *
  * The options object is spread into `katex.renderToString`, so KaTeX's own knobs
  * ride along with the plugin's:
  *  - `throwOnError:false` — an invalid formula renders KaTeX's inline red error
@@ -45,11 +72,22 @@ export const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
  *    `\includegraphics`, `\html*`); they render as error nodes rather than markup.
  *  - `strict:false` — a questionable-but-parseable construct renders instead of
  *    warning to the console; a notebook is not a TeX linter.
+ *  - `maxSize:MATH_MAX_SIZE_EM` - caps every user-specified size (`\rule`,
+ *    `\hspace`, `\genfrac`), which `trust:false` does NOT gate. A downloaded
+ *    notebook (or `.md`) is untrusted input, exactly the threat model the rest of
+ *    this config is written against, and `$\rule{1em}{9999em}$` at KaTeX's default
+ *    of `Infinity` renders a multi-thousand-pixel node that blows out the cell or
+ *    preview around it. Capped, that expression still renders - just bounded.
+ *    `maxExpand` is deliberately LEFT ALONE: its default is 1000 (NOT `Infinity`),
+ *    so macro-expansion DoS is already bounded; do not set it to `Infinity`.
  */
+const MATH_MAX_SIZE_EM = 10;
+
 const MATH_OPTIONS: MarkdownKatexOptions & KatexOptions = {
 	throwOnError: false,
 	trust: false,
-	strict: false
+	strict: false,
+	maxSize: MATH_MAX_SIZE_EM
 };
 
 // `@vscode/markdown-it-katex` is CommonJS, and the two builds interop with it
@@ -94,6 +132,23 @@ export const MARKDOWN_SANITIZE_CONFIG: Config = {
 	ADD_TAGS: ['semantics', 'annotation']
 };
 
+/** The ONE sanitize call site: every renderer below funnels through it, so the
+ *  config above is the whole security surface for every markdown surface. */
+function sanitize(html: string): string {
+	return DOMPurify.sanitize(html, MARKDOWN_SANITIZE_CONFIG);
+}
+
+/** Render AUTHORED markdown (notebook markdown cells, `.md` previews): math included. */
 export function renderMarkdown(src: string | null | undefined): string {
-	return DOMPurify.sanitize(md.render(src || ''), MARKDOWN_SANITIZE_CONFIG);
+	return sanitize(md.render(src || ''));
+}
+
+/**
+ * Render markdown found in KERNEL OUTPUT (the markdown-table-in-output path) -
+ * identical to {@link renderMarkdown} except that math is NOT parsed, so a `$` in
+ * the user's data stays their data. See `mdOutput` above for why the split is by
+ * content class rather than a second, drifting renderer.
+ */
+export function renderOutputMarkdown(src: string | null | undefined): string {
+	return sanitize(mdOutput.render(src || ''));
 }

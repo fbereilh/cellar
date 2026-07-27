@@ -174,6 +174,25 @@ async function until(cond: () => boolean, what: string, timeoutMs = 5000): Promi
  *  Deliberately far wider than the 1ms debounce so load cannot shrink it. */
 const settle = () => new Promise((r) => setTimeout(r, 50));
 
+/**
+ * Drain the broadcast stream to QUIESCENCE, then clear it.
+ *
+ * A bare `settle()` before a reset is the mirror of the race it fixes: a broadcast
+ * scheduled earlier but delivered after the window lands AFTER the reset, where it
+ * reads as one this test caused. Waiting for a specific count is no better here -
+ * whether a stray broadcast exists at all depends on what the previous case left
+ * behind, so it may never arrive. So loop until a whole settle window passes with
+ * NOTHING new, which is load-independent in both directions, then clear.
+ */
+async function quiesceAndReset(): Promise<void> {
+	for (;;) {
+		const seen = h.statusBroadcasts.length;
+		await settle();
+		if (h.statusBroadcasts.length === seen) break;
+	}
+	h.statusBroadcasts.length = 0;
+}
+
 /** A non-silent (user) exec for `code` reached the fake kernel's wire. */
 const onWire = (code: string) => h.execCalls.some((c) => !c.silent && c.code === code);
 
@@ -187,9 +206,8 @@ beforeEach(async () => {
 	// debounced broadcast still scheduled; clearing without draining lets that
 	// stray message land inside the NEXT test's window, where it reads as a
 	// broadcast that test caused. Every case here assumes a quiet system.
-	await settle();
+	await quiesceAndReset();
 	h.execCalls.length = 0;
-	h.statusBroadcasts.length = 0;
 });
 
 describe('coalesced startup round-trips', () => {
@@ -215,8 +233,9 @@ describe('coalesced startup round-trips', () => {
 describe('internal-probe vs user status broadcasts', () => {
 	it('does NOT broadcast a busy/idle flip with no user run in flight (internal probe)', async () => {
 		// Kernel is up (from the run above). Simulate the busy→idle flips an internal
-		// inspect/variable probe induces — no user run is in flight.
-		h.statusBroadcasts.length = 0;
+		// inspect/variable probe induces - no user run is in flight. (`beforeEach` has
+		// already drained to quiescence, so the stream is genuinely empty here; a bare
+		// reset would instead let a stray in-flight broadcast land after it.)
 		const k = h.lastKernel!;
 		k._emitStatus('busy');
 		k._emitStatus('idle');
@@ -225,7 +244,6 @@ describe('internal-probe vs user status broadcasts', () => {
 	});
 
 	it('DOES broadcast busy then idle for a USER cell run', async () => {
-		h.statusBroadcasts.length = 0;
 		const k = h.lastKernel!;
 		// Start a user run but hold it in flight (manual future).
 		const runP = kernelmod.execute(A, 'y=2', noop);
@@ -249,15 +267,18 @@ describe('internal-probe vs user status broadcasts', () => {
 		const k = h.lastKernel!;
 		const runP = kernelmod.execute(A, 'z=3', noop);
 		await until(() => onWire('z=3'), 'the user run to reach the kernel');
-		// Drain the run-BOUNDARY broadcast `execute()` schedules before counting, then
-		// reset: it is a second, unrelated message, and letting it land after the reset
-		// is exactly what made this read 2 on a loaded machine.
-		await settle();
-		h.statusBroadcasts.length = 0;
+		// Drain any run-BOUNDARY broadcast still in flight before counting, then reset:
+		// it is a second, unrelated message, and letting it land after the reset is
+		// exactly what made this read 2 on a loaded machine.
+		await quiesceAndReset();
 		// A flurry of flips within one debounce window collapses to ONE wire message.
 		k._emitStatus('busy');
 		k._emitStatus('idle');
 		k._emitStatus('busy');
+		// WAIT for the coalesced broadcast (a bare settle would read 0 whenever the
+		// debounce is delivered later than the window), THEN settle to prove a second
+		// one never follows.
+		await until(() => h.statusBroadcasts.length >= 1, 'the coalesced broadcast');
 		await settle();
 		expect(h.statusBroadcasts.length).toBe(1);
 		k.status = 'idle';

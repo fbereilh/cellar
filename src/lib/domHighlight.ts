@@ -113,10 +113,56 @@ export function clearSurface(key: string) {
 // ---- Text-node range building --------------------------------------------------
 
 /**
+ * Typeset math is ONE opaque unit to this walk (`.katex` for a rendered expression,
+ * `.katex-error` for an unparseable one - see `$lib/markdown`).
+ *
+ * KaTeX writes each expression's text into the container THREE times: the clipped,
+ * screen-reader-only `.katex-mathml` MathML branch, that branch's `<annotation>`
+ * carrying the raw TeX, and the visible `.katex-html` glyphs. A plain text walk
+ * counts all three, while the search model counts the expression ONCE (from the
+ * cell source, where it is still `$x^2$`) - so the model's ordinal landed on an
+ * invisible node and the painted highlight count diverged from the reported one.
+ */
+const MATH_SELECTOR = '.katex, .katex-error';
+
+/**
+ * The text a typeset expression contributes to the walk: its own TeX SOURCE between
+ * the delimiters it was written with, which is what the model's text holds for that
+ * region. The glyphs are deliberately not used - they are a different string from
+ * the source (`$\alpha$` renders "α"), so counting them would shift every later
+ * occurrence's ordinal.
+ */
+function mathSourceText(el: Element): string {
+	const display =
+		el.classList.contains('katex-display') ||
+		!!el.closest('.katex-display, p.katex-block') ||
+		!!el.querySelector('.katex-display, math[display="block"]');
+	const delim = display ? '$$' : '$';
+	// `.katex` (typeset): the `<annotation>` carries the source TeX verbatim.
+	// `.katex-error` (KaTeX's own node under `throwOnError:false`): its VISIBLE text is
+	// already the source TeX - the message lives in `title` - so it needs nothing but
+	// the delimiters back.
+	const tex = el.classList.contains('katex-error')
+		? (el.textContent ?? '')
+		: (el.querySelector('annotation')?.textContent ??
+			el.querySelector('.katex-html')?.textContent ??
+			'');
+	return delim + tex + delim;
+}
+
+/**
  * Locate `query` occurrences in an element's concatenated visible text and return
  * them as DOM `Range`s (case/whole-word per `opts`). Ranges may span text-node
  * boundaries (the Custom Highlight API and `Range` both allow it), so a match split
  * across inline tokens - common in syntax-highlighted static code - still paints.
+ *
+ * The returned array is POSITIONAL: entry `i` is the i-th occurrence of the query in
+ * this surface, and it is **`null` when that occurrence cannot be painted** - which
+ * today means it fell inside typeset math ({@link MATH_SELECTOR}), whose source text
+ * the model counts but whose rendered glyphs are a different string. Callers must
+ * therefore index by ordinal and tolerate a hole, never compact the array: dropping
+ * the entry would slide every later occurrence's ordinal by one and emphasize the
+ * wrong match (see `buildCellHighlights`).
  *
  * @param root the surface container (already scoped by the caller so it holds only
  *   the surface's own text, e.g. `.cm-static-content`, not the line-number gutter).
@@ -132,31 +178,58 @@ export function buildTextRanges(
 		needle: string,
 		o: { caseSensitive: boolean; wholeWord: boolean; regex?: boolean }
 	) => Array<{ start: number; end: number }>
-): Range[] {
+): Array<Range | null> {
 	if (!query) return [];
 	const doc = root.ownerDocument;
-	const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-	// Flat map of the concatenated text -> (node, offset-within-node).
+	// Flat map of the concatenated text -> (node, offset-within-node), plus the
+	// unpaintable spans typeset math contributed.
 	const nodes: Text[] = [];
 	const starts: number[] = []; // global start offset of each node's text
+	const opaque: Array<{ start: number; end: number }> = [];
 	let full = '';
-	for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-		const t = n as Text;
-		const data = t.data;
-		if (!data) continue;
-		nodes.push(t);
-		starts.push(full.length);
-		full += data;
-	}
+	// A hand-rolled descent rather than a TreeWalker: a math subtree must be
+	// REPLACED by its source text (contributing offsets but no nodes), and neither
+	// `FILTER_REJECT` nor `FILTER_SKIP` can both yield the element and skip inside it.
+	const walk = (parent: Node) => {
+		for (let child = parent.firstChild; child; child = child.nextSibling) {
+			if (child.nodeType === Node.TEXT_NODE) {
+				const t = child as Text;
+				if (!t.data) continue;
+				nodes.push(t);
+				starts.push(full.length);
+				full += t.data;
+				continue;
+			}
+			if (child.nodeType !== Node.ELEMENT_NODE) continue;
+			const el = child as Element;
+			if (el.matches(MATH_SELECTOR)) {
+				const text = mathSourceText(el);
+				if (text) {
+					opaque.push({ start: full.length, end: full.length + text.length });
+					full += text;
+				}
+				continue; // its subtree yields no paintable range
+			}
+			walk(el);
+		}
+	};
+	walk(root);
 	if (!full) return [];
 	const occ = findFn(full, query, opts);
 	if (!occ.length) return [];
 
-	const ranges: Range[] = [];
+	const ranges: Array<Range | null> = [];
 	for (const { start, end } of occ) {
+		if (opaque.some((o) => start < o.end && end > o.start)) {
+			ranges.push(null); // inside math: keep the ordinal, paint nothing
+			continue;
+		}
 		const s = locate(nodes, starts, start);
 		const e = locate(nodes, starts, end);
-		if (!s || !e) continue;
+		if (!s || !e) {
+			ranges.push(null);
+			continue;
+		}
 		const range = doc.createRange();
 		range.setStart(s.node, s.offset);
 		range.setEnd(e.node, e.offset);

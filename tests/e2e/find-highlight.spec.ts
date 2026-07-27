@@ -25,6 +25,8 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  */
 
 const TOKEN = 'qqzzx';
+/** A second token, used only by the math case so it never disturbs TOKEN's counts. */
+const MATH_TOKEN = 'wwyyv';
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
@@ -46,6 +48,7 @@ const IDX = {
 	mdMatch: 1, // `Some qqzzx prose.`      (rendered-markdown surface)
 	srcMatch: 2, // `alpha = 'qqzzx'`        (static-code / editor surface)
 	outMatch: 3, // stream output holds qqzzx (output surface)
+	mathMatch: 100, // prose + inline math, all three holding wwyyv (rendered markdown)
 	bottom: 60 // `omega = 'qqzzx'`        (windowing target, far down)
 };
 
@@ -59,6 +62,9 @@ function buildNotebook(): string {
 		codeCell(IDX.outMatch, `print("value")`, [
 			{ output_type: 'stream', name: 'stdout', text: `computed ${TOKEN} result\n` }
 		])
+	);
+	cells.push(
+		mdCell(IDX.mathMatch, `Prose ${MATH_TOKEN} before $${MATH_TOKEN}^2$ and ${MATH_TOKEN} after.`)
 	);
 	for (let i = 4; i < IDX.bottom; i++) cells.push(codeCell(i, `g${i} = ${i}`));
 	cells.push(codeCell(IDX.bottom, `omega = '${TOKEN}'`));
@@ -201,6 +207,60 @@ test('stepping next/prev moves the active emphasis (count follows, active stays 
 	await page.keyboard.press('Shift+Enter'); // → back to match 2
 	await expect(findCount(page)).toHaveText(/^2\//);
 	await expect.poll(() => activeEmphasisCount(page)).toBe(1);
+});
+
+/**
+ * A compact signature of the ACTIVE emphasis: one entry per active range, saying
+ * whether it sits inside typeset math and what text node holds it. `inMath:true`
+ * would mean the emphasis landed on one of KaTeX's invisible copies of the
+ * expression (the clipped MathML branch or its `<annotation>` TeX) - the regression.
+ */
+async function activeSignature(page: Page): Promise<string> {
+	return page.evaluate(() => {
+		const hi = (CSS as unknown as { highlights?: Map<string, Iterable<Range>> }).highlights?.get(
+			'cellar-search-active'
+		);
+		if (!hi) return '';
+		const parts: string[] = [];
+		for (const r of hi) {
+			const n = r.startContainer;
+			const el = n.nodeType === Node.ELEMENT_NODE ? (n as Element) : n.parentElement;
+			parts.push(`${el?.closest('.katex, .katex-error') ? 'math' : 'prose'}:${n.textContent ?? ''}`);
+		}
+		return parts.join(' | ');
+	});
+}
+
+test('math counts once: no ordinal lands on an invisible KaTeX copy', async ({ page }) => {
+	// KaTeX writes each expression's text three times (clipped MathML, its
+	// `<annotation>` TeX, the visible glyphs) while the engine counts it once from the
+	// source, so a naive DOM walk emphasized an invisible node and painted more
+	// highlights than the bar reported. Three model matches here - before the math,
+	// INSIDE it, after it - and only the two prose ones are paintable.
+	await open(page);
+	await openFindBar(page);
+	await findInput(page).fill(MATH_TOKEN);
+	await expect(findCount(page)).toHaveText('1/3');
+
+	const painted = async () =>
+		(await highlightCount(page, 'cellar-search')) + (await highlightCount(page, 'cellar-search-active'));
+	await expect.poll(painted).toBe(2);
+
+	// Match 1: the occurrence BEFORE the math, on the visible prose.
+	await expect.poll(() => activeSignature(page)).toBe('prose:Prose wwyyv before ');
+
+	// Match 2 is inside the math: counted (it is in the source) but nothing is
+	// emphasized, because the rendered glyphs are not the source text. Crucially the
+	// base highlights stay put rather than shifting onto the math.
+	await page.keyboard.press('Enter');
+	await expect(findCount(page)).toHaveText('2/3');
+	await expect.poll(() => activeSignature(page)).toBe('');
+	await expect.poll(painted).toBe(2);
+
+	// Match 3: the occurrence AFTER the math - the one the regression skipped past.
+	await page.keyboard.press('Enter');
+	await expect(findCount(page)).toHaveText('3/3');
+	await expect.poll(() => activeSignature(page)).toBe('prose: and wwyyv after.');
 });
 
 test('closing the bar clears every highlight', async ({ page }) => {

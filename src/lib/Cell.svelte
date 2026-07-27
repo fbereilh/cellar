@@ -9,7 +9,7 @@
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
 	import { sql } from '@codemirror/lang-sql';
-	import { renderMarkdown } from '$lib/markdown';
+	import { renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
 	import { EDITOR_THEME } from '$lib/editorTheme';
 	import StaticCode from '$lib/StaticCode.svelte';
 	import type { StaticLang } from '$lib/staticHighlight';
@@ -419,12 +419,15 @@
 		return segs;
 	}
 	// Render a markdown table to sanitized HTML, then apply daisyUI table classes.
-	// Goes through the shared `renderMarkdown` (not a private markdown-it +
-	// DOMPurify pair) so this surface can't drift from the cell/preview one — same
-	// engine, same sanitizer config, one place to change.
+	// Goes through the shared `$lib/markdown` (not a private markdown-it + DOMPurify
+	// pair) so this surface can't drift from the cell/preview one - same markdown-it
+	// config, same sanitizer config, same sanitize call site. The one deliberate
+	// difference is `renderOutputMarkdown`: kernel output is arbitrary DATA (a
+	// printed price column is "$5"/"$1,200"), so math is NOT parsed here - see
+	// `markdown.ts`.
 	function renderTable(src: string): string {
 		if (!browser) return '';
-		return renderMarkdown(src).replace(/<table>/g, '<table class="table table-zebra table-xs">');
+		return renderOutputMarkdown(src).replace(/<table>/g, '<table class="table table-zebra table-xs">');
 	}
 
 	// Map an nbformat output object to a renderable {tone, text, segments}. Text
@@ -1228,8 +1231,12 @@
 			clearSurface(key);
 			return;
 		}
+		// POSITIONAL: entry i is the i-th occurrence, `null` where it cannot be painted
+		// (inside typeset math). Index by ordinal and tolerate the hole - compacting
+		// would slide every later ordinal and emphasize the wrong occurrence.
 		const ranges = buildTextRanges(el, query, opts, findOccurrences);
-		if (!ranges.length) {
+		const paintable = ranges.filter((r): r is Range => r !== null);
+		if (!paintable.length) {
 			clearSurface(key);
 			return;
 		}
@@ -1237,7 +1244,7 @@
 		if (activeOrdinal != null && activeOrdinal >= 0 && activeOrdinal < ranges.length) {
 			activeRange = ranges[activeOrdinal];
 		}
-		const base = activeRange ? ranges.filter((r) => r !== activeRange) : ranges;
+		const base = activeRange ? paintable.filter((r) => r !== activeRange) : paintable;
 		setSurfaceRanges(key, base, activeRange ? [activeRange] : []);
 		if (shouldScroll && activeRange) {
 			const anchor =
