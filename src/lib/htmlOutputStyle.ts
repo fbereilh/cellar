@@ -8,6 +8,30 @@
  * browser's default 1px cell padding: technically correct, painful to scan, and
  * the reason users hand-roll a `set_table_styles` helper on every table.
  *
+ * SCOPE, stated as it really is: these are comfortable DEFAULTS for EVERY
+ * `<table>` in a rich `text/html` output, not for pandas-shaped tables alone.
+ * The reach was measured, not overlooked - a third-party `_repr_html_`
+ * (statsmodels' `summary()` -> `<table class="simpletable">`, dask's array
+ * summary, a folium/bokeh legend table) gets the same 7px/20px cell padding, the
+ * same hairline row separators and header rule, and the same inherited
+ * right-align wherever a cell holds bare inline text and so takes no `:has()`
+ * escape (see the KNOWN LIMIT below). The padding is a universal scannability
+ * win, and dropping the default border is precisely what declutters a bare
+ * table; both are fully overridable, which is what rule 1 below exists to
+ * guarantee.
+ * `table{border:0}` and `th,td{border:0}` also outrank the deprecated `border=`
+ * presentational attribute (author CSS always beats a presentational hint), so a
+ * hand-written `display(HTML('<table border="1">…'))` loses that grid - restore
+ * it with explicit CSS (a `style` attribute, or a stylesheet rule the output
+ * carries), which beats this block. An author who wants a specific grid should
+ * reach for explicit CSS or a pandas Styler, never the `border=` attribute.
+ *
+ * Two narrowings were considered and are REJECTED, so do not reintroduce them:
+ * carving `border:0` back to preserve the `border=` attribute buys one legacy
+ * case for a permanently more complicated rule; and scoping the block to
+ * pandas-shaped tables needs a class or an id selector, which reintroduces the
+ * exact specificity problem rule 1 below exists to close.
+ *
  * TWO RULES GOVERN THIS BLOCK, and both are load-bearing:
  *
  * 1. **Every selector stays at element-level specificity (0-0-1 / 0-0-2).**
@@ -66,15 +90,16 @@
  *
  * KNOWN LIMIT, accepted deliberately: that escape keys off BLOCK-level content
  * only, so a label/value layout table whose cells hold bare inline text (the
- * shape some libraries' `_repr_html_` emits - dask's array summary, pint,
- * awkward) takes no escape and reads right-aligned. Widening the signal with a
+ * shape some libraries' `_repr_html_` emits - statsmodels' `summary()`, dask's
+ * array summary, pint, awkward) takes no escape and reads right-aligned. That is
+ * the alignment half of the scope note above. Widening the signal with a
  * content-length heuristic was considered and REJECTED: it misfires in both
  * directions (a long id or numeric value wrongly left-aligned, a short label
  * still right-aligned). Right-align is the pandas numeric convention and the
  * intended default, and any library can style its own table - which rule 1
  * guarantees will win. Do not add a heuristic here.
  *
- * Scope note: this block only reaches *rich `text/html`* outputs. A plain
+ * Surface note: this block only reaches *rich `text/html`* outputs. A plain
  * DataFrame renders through the native `DataFrameGrid` (structured
  * `application/vnd.cellar.dataframe+json` mime, or `dataframeHtml.ts`'s parse of
  * a saved `_repr_html_`), and markdown-cell tables are styled by `.cellar-md
@@ -92,40 +117,3 @@ thead th{border-bottom:1px solid #cbd5e1;vertical-align:bottom;}
 tbody th{text-align:left;}
 td:has(p,div,ul,ol,pre,table,h1,h2,h3,h4,h5,h6),th:has(p,div,ul,ol,pre,table,h1,h2,h3,h4,h5,h6){text-align:left;}
 `.trim();
-
-/**
- * The selectors of every rule in a hand-written CSS block, in source order.
- *
- * Deliberately a scanner over *this* block rather than a CSS parser: the input
- * is the string above (one rule per line, no at-rules, no nesting, no strings or
- * comments inside selectors), and its only consumer is the specificity guard.
- * A comma-separated selector list yields one entry per selector.
- *
- * The split tracks paren depth, which is load-bearing rather than tidy: a
- * functional pseudo-class takes its own comma-separated argument list, so a flat
- * `split(',')` shreds `td:has(p,div,…)` into a dozen fragments with no closing
- * paren - and the guard that checks what `:has()` may contain then matches
- * nothing and silently asserts nothing at all.
- */
-export function cssSelectors(css: string): string[] {
-	const out: string[] = [];
-	for (const [, prelude] of css.matchAll(/([^{}]+)\{[^{}]*\}/g)) {
-		let depth = 0;
-		let start = 0;
-		const push = (end: number) => {
-			const s = prelude.slice(start, end).trim();
-			if (s) out.push(s);
-		};
-		for (let i = 0; i < prelude.length; i++) {
-			const c = prelude[i];
-			if (c === '(') depth++;
-			else if (c === ')') depth = Math.max(0, depth - 1);
-			else if (c === ',' && depth === 0) {
-				push(i);
-				start = i + 1;
-			}
-		}
-		push(prelude.length);
-	}
-	return out;
-}

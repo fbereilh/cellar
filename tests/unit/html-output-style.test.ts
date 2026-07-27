@@ -28,11 +28,50 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { OUTPUT_HTML_CSS, cssSelectors } from '../../src/lib/htmlOutputStyle';
+import { OUTPUT_HTML_CSS } from '../../src/lib/htmlOutputStyle';
 import { reportedHeight } from '../../src/lib/htmlOutputHeight';
 
 const REPO = join(fileURLToPath(import.meta.url), '../../..');
 const COMPONENT = readFileSync(join(REPO, 'src/lib/HtmlOutput.svelte'), 'utf8');
+
+/**
+ * The selectors of every rule in a hand-written CSS block, in source order.
+ *
+ * Deliberately a scanner over `OUTPUT_HTML_CSS` rather than a CSS parser: the
+ * input is that one string (one rule per line, no at-rules, no nesting, no
+ * strings or comments inside selectors), and its only consumer is the
+ * specificity guard below - which is why it lives here and not in `$lib`, where
+ * it would ship in the client bundle and read as a general-purpose parser it is
+ * not. A comma-separated selector list yields one entry per selector.
+ *
+ * The split tracks paren depth, which is load-bearing rather than tidy: a
+ * functional pseudo-class takes its own comma-separated argument list, so a flat
+ * `split(',')` shreds `td:has(p,div,…)` into a dozen fragments with no closing
+ * paren - and the guard that checks what `:has()` may contain then matches
+ * nothing and silently asserts nothing at all.
+ */
+function cssSelectors(css: string): string[] {
+	const out: string[] = [];
+	for (const [, prelude] of css.matchAll(/([^{}]+)\{[^{}]*\}/g)) {
+		let depth = 0;
+		let start = 0;
+		const push = (end: number) => {
+			const s = prelude.slice(start, end).trim();
+			if (s) out.push(s);
+		};
+		for (let i = 0; i < prelude.length; i++) {
+			const c = prelude[i];
+			if (c === '(') depth++;
+			else if (c === ')') depth = Math.max(0, depth - 1);
+			else if (c === ',' && depth === 0) {
+				push(i);
+				start = i + 1;
+			}
+		}
+		push(prelude.length);
+	}
+	return out;
+}
 
 describe('cssSelectors', () => {
 	it('yields one entry per selector, splitting comma-separated lists', () => {
