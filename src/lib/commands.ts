@@ -100,15 +100,15 @@ export function buildCommands({ notebook, app }: CommandContext): PaletteCommand
 		// ---- Cells -----------------------------------------------------------
 		nb('insert-above', 'Insert cell above', 'Cells'),
 		nb('insert-below', 'Insert cell below', 'Cells'),
-		nb('to-code', 'Change cell to code', 'Cells'),
-		nb('to-markdown', 'Change cell to Markdown', 'Cells'),
-		nb('move-cell-up', 'Move cell up', 'Cells'),
-		nb('move-cell-down', 'Move cell down', 'Cells'),
-		nb('cut-cell', 'Cut cell', 'Cells'),
-		nb('copy-cell', 'Copy cell', 'Cells'),
+		nb('to-code', 'Change cell(s) to code', 'Cells'),
+		nb('to-markdown', 'Change cell(s) to Markdown', 'Cells'),
+		nb('move-cell-up', 'Move selection up', 'Cells'),
+		nb('move-cell-down', 'Move selection down', 'Cells'),
+		nb('cut-cell', 'Cut cell(s)', 'Cells'),
+		nb('copy-cell', 'Copy cell(s)', 'Cells'),
 		nb('paste-below', 'Paste cell below', 'Cells'),
 		nb('paste-above', 'Paste cell above', 'Cells'),
-		nb('delete-cell', 'Delete cell', 'Cells'),
+		nb('delete-cell', 'Delete cell(s)', 'Cells'),
 		nb('undo-delete', 'Undo cell delete', 'Cells'),
 
 		// ---- Selection -------------------------------------------------------

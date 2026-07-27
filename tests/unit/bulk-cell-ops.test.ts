@@ -135,8 +135,9 @@ function writeCount(fn: () => void): number {
 describe('deleteCells - bulk delete', () => {
 	it('removes exactly the addressed cells, scattered ones included, and leaves the rest', () => {
 		const { nb, ids } = makeNotebook('bulk-delete.ipynb', 6);
-		const removed = nbmod.deleteCells([ids[1], ids[3], ids[4]], nb);
-		expect(removed.sort()).toEqual([ids[1], ids[3], ids[4]].sort());
+		const res = nbmod.deleteCells([ids[1], ids[3], ids[4]], nb);
+		expect(res.ok).toBe(true);
+		expect(res.ok && res.removed.slice().sort()).toEqual([ids[1], ids[3], ids[4]].sort());
 		expect(sources(nb)).toEqual(['a = 0', 'a = 2', 'a = 5']);
 	});
 
@@ -149,8 +150,30 @@ describe('deleteCells - bulk delete', () => {
 
 	it('ignores unknown ids rather than persisting a no-op write', () => {
 		const { nb, ids } = makeNotebook('bulk-delete-unknown.ipynb', 3);
-		expect(nbmod.deleteCells(['nope'], nb)).toEqual([]);
+		expect(nbmod.deleteCells(['nope'], nb)).toEqual({ ok: true, removed: [] });
 		expect(idsOf(nb)).toEqual(ids);
+	});
+
+	// The invariant lives here, not only in the browser: the client compares against
+	// ITS cell count, which is stale while an agent's `cell:deleted` events are in
+	// flight, so only the server can refuse the batch that would empty the document.
+	it('refuses a batch covering every cell - nothing removed, nothing written', () => {
+		const { nb, ids } = makeNotebook('bulk-delete-all.ipynb', 3);
+		let res: ReturnType<typeof nbmod.deleteCells>;
+		const wrote = writeCount(() => {
+			res = nbmod.deleteCells(ids, nb);
+		});
+		expect(res!).toEqual({ ok: false, reason: 'would-empty-notebook' });
+		expect(wrote).toBe(0);
+		expect(idsOf(nb)).toEqual(ids);
+		expect(seen.filter((e) => e.type === 'cell:deleted')).toEqual([]);
+	});
+
+	it('still deletes all but one - the refusal is exactly at the boundary', () => {
+		const { nb, ids } = makeNotebook('bulk-delete-all-but-one.ipynb', 3);
+		const res = nbmod.deleteCells(ids.slice(0, 2), nb);
+		expect(res.ok).toBe(true);
+		expect(idsOf(nb)).toEqual([ids[2]]);
 	});
 });
 
@@ -318,6 +341,22 @@ describe('POST /api/cells/bulk - argument validation', () => {
 		}
 		expect(writes.length).toBe(before);
 		expect(nbmod.listCells(nb).map((c) => c.cell_type)).toEqual(['code', 'code', 'code']);
+	});
+
+	it('surfaces the empty-notebook refusal as a 400 in the same shape', async () => {
+		const { nb, ids } = makeNotebook('route-delete-all.ipynb', 3);
+		const before = writes.length;
+		const res = await call({ op: 'delete', ids, nb });
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({ ok: false, reason: 'would-empty-notebook' });
+		expect(writes.length).toBe(before);
+		expect(idsOf(nb)).toEqual(ids);
+
+		// …and the boundary: all-but-one goes through.
+		const ok = await call({ op: 'delete', ids: ids.slice(0, 2), nb });
+		expect(ok.status).toBe(200);
+		expect((await ok.json()).removed).toHaveLength(2);
+		expect(idsOf(nb)).toEqual([ids[2]]);
 	});
 
 	it('still accepts every valid vocabulary word', async () => {

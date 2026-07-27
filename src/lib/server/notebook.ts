@@ -923,8 +923,16 @@ export function deleteCell(id: string, nb?: string | null, originId?: string | n
 	if (existed) emit(doc, 'cell:deleted', { cellId: id }, originId);
 }
 
+/** A refused batch delete is distinguishable from one that simply matched
+ *  nothing: the first is a request the document invariant rejected, the second
+ *  is a no-op the caller can ignore. */
+export type DeleteCellsResult =
+	| { ok: true; removed: string[] }
+	| { ok: false; reason: 'would-empty-notebook' };
+
 /**
- * Delete SEVERAL cells as ONE document write (the MCP `delete_cells` batch).
+ * Delete SEVERAL cells as ONE document write (the multi-cell selection's bulk
+ * delete and the MCP `delete_cells` batch).
  *
  * Deliberately NOT a loop over `deleteCell`: that persists — a full serialize +
  * fsync + rename of the whole notebook — once per cell, and walks the `.ipynb`
@@ -932,14 +940,24 @@ export function deleteCell(id: string, nb?: string | null, originId?: string | n
  * persist, then one `cell:deleted` per removed cell, so every client applies the
  * same per-cell events it already handles and no new event shape exists.
  *
- * Returns the ids actually removed (unknown ids are ignored rather than
- * persisting a no-op write).
+ * "A notebook always keeps at least one cell" is enforced HERE, where the real
+ * cell count lives, not only in the browser: the client compares against ITS
+ * cell count, which is stale for as long as an agent's `cell:deleted` events are
+ * still in flight, so a selection covering everything the server still has would
+ * otherwise persist a zero-cell `.ipynb` - the state the invariant exists to
+ * prevent. Being in the shared layer also covers MCP `delete_cells`, which never
+ * had the check at all. The WHOLE batch is refused (nothing removed, nothing
+ * persisted, no events), matching what the client already models: a partial
+ * delete nobody asked for is worse than a refusal.
+ *
+ * Unknown ids are ignored rather than persisting a no-op write.
  */
-export function deleteCells(ids: readonly string[], nb?: string | null, originId?: string | null): string[] {
+export function deleteCells(ids: readonly string[], nb?: string | null, originId?: string | null): DeleteCellsResult {
 	const doc = docFor(nb);
 	const wanted = new Set(ids);
 	const removed = doc.cells.filter((c) => wanted.has(c.id)).map((c) => c.id);
-	if (!removed.length) return [];
+	if (!removed.length) return { ok: true, removed: [] };
+	if (removed.length >= doc.cells.length) return { ok: false, reason: 'would-empty-notebook' };
 	doc.cells = doc.cells.filter((c) => !wanted.has(c.id));
 	persist(doc);
 	for (const id of removed) {
@@ -947,7 +965,7 @@ export function deleteCells(ids: readonly string[], nb?: string | null, originId
 		cancelRun(doc.path, id);
 		emit(doc, 'cell:deleted', { cellId: id }, originId);
 	}
-	return removed;
+	return { ok: true, removed };
 }
 
 export function setSource(id: string, source: string, nb?: string | null, originId?: string | null): void {

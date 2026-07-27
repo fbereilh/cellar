@@ -213,14 +213,14 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		keys: ['Mod-Shift-ArrowUp'],
 		mode: 'global',
 		category: 'Structure',
-		description: 'Move the selected cell up'
+		description: 'Move the selection up'
 	},
 	{
 		id: 'move-cell-down',
 		keys: ['Mod-Shift-ArrowDown'],
 		mode: 'global',
 		category: 'Structure',
-		description: 'Move the selected cell down'
+		description: 'Move the selection down'
 	},
 	{
 		id: 'insert-above',
@@ -241,14 +241,14 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		keys: ['m'],
 		mode: 'command',
 		category: 'Structure',
-		description: 'Change the selected cell to Markdown'
+		description: 'Change the selected cell(s) to Markdown'
 	},
 	{
 		id: 'to-code',
 		keys: ['y'],
 		mode: 'command',
 		category: 'Structure',
-		description: 'Change the selected cell to code'
+		description: 'Change the selected cell(s) to code'
 	},
 
 	// ---- Editing -----------------------------------------------------------
@@ -257,7 +257,7 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		keys: ['d d'],
 		mode: 'command',
 		category: 'Editing',
-		description: 'Delete the selected cell (press d twice)'
+		description: 'Delete the selected cell(s) (press d twice)'
 	},
 	{
 		id: 'undo-delete',
@@ -271,14 +271,14 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		keys: ['x'],
 		mode: 'command',
 		category: 'Editing',
-		description: 'Cut the selected cell'
+		description: 'Cut the selected cell(s)'
 	},
 	{
 		id: 'copy-cell',
 		keys: ['c'],
 		mode: 'command',
 		category: 'Editing',
-		description: 'Copy the selected cell'
+		description: 'Copy the selected cell(s)'
 	},
 	{
 		id: 'paste-below',

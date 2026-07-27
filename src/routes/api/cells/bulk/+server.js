@@ -21,7 +21,8 @@ import { deleteCells, moveCells, setCellTypes } from '$lib/server/notebook';
  * `dir` and `cellType` are VALIDATED, not coerced: both ops rewrite and persist the
  * user's `.ipynb`, so an out-of-vocabulary value must fail like `no-ids` /
  * `unknown-op` rather than silently reorder or retype cells in a direction nobody
- * asked for.
+ * asked for. A delete that would empty the notebook fails the same way, but the
+ * rule itself is `deleteCells`' - the route only reports its verdict.
  */
 const MOVE_DIRS = new Set(['up', 'down']);
 const CELL_TYPES = new Set(['code', 'sql', 'markdown']);
@@ -31,7 +32,13 @@ export async function POST({ request }) {
 	const list = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && id) : [];
 	if (!list.length) return json({ ok: false, reason: 'no-ids' }, { status: 400 });
 
-	if (op === 'delete') return json({ ok: true, removed: deleteCells(list, nb, originId) });
+	if (op === 'delete') {
+		// The invariant itself lives in `deleteCells`, where the real cell count is;
+		// this only surfaces its refusal in the shape the route already speaks.
+		const res = deleteCells(list, nb, originId);
+		if (!res.ok) return json({ ok: false, reason: res.reason }, { status: 400 });
+		return json({ ok: true, removed: res.removed });
+	}
 	if (op === 'move') {
 		if (!MOVE_DIRS.has(dir)) return json({ ok: false, reason: 'bad-dir' }, { status: 400 });
 		return json({ ok: true, moved: moveCells(list, dir, nb, originId) });

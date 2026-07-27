@@ -2183,9 +2183,10 @@
 			if (ids[0]) await deleteCell(ids[0]);
 			return;
 		}
-		// The same "a notebook always keeps at least one cell" invariant `deleteCell`
-		// enforces at size 1: a selection covering the whole notebook is refused
-		// outright rather than emptying it, so there is always somewhere to type.
+		// "A notebook always keeps at least one cell" - the ENFORCEMENT is the server's
+		// (`deleteCells` refuses the batch), because only it knows the real cell count;
+		// this is the optimistic mirror, like the client/server `clampMoveIndex` pair,
+		// so the common case never renders a delete the server is about to refuse.
 		if (ids.length >= cells.length) return;
 		const order = cellOrder;
 		const removed = new Set(ids);

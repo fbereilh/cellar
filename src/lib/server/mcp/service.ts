@@ -1280,6 +1280,11 @@ export async function editCell(id: string, source: string, { routeImports: route
  * checkpoint covers the whole batch, so the human's undo restores the notebook
  * as it was before the pivot rather than after seven eighths of it, and
  * `deleteCells` makes the removal ONE document write rather than one per cell.
+ *
+ * `deleteCells` also refuses a batch that would empty the notebook, and that
+ * refusal is reported as such: an agent told `{ok:true, count:N}` over a document
+ * the server never changed would go on building against cells that are still
+ * there.
  */
 export function removeCells(ids: string[], nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
@@ -1297,7 +1302,8 @@ export function removeCells(ids: string[], nb?: string | null) {
 	const toHandle = handleFn(target);
 	const deleted = full.map(toHandle);
 	autoCheckpointBeforeAgentAction(target);
-	deleteCells(full, target);
+	const res = deleteCells(full, target);
+	if (!res.ok) return { ok: false as const, refused: res.reason };
 	return { ok: true as const, deleted, count: deleted.length };
 }
 
