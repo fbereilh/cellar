@@ -263,8 +263,11 @@
 		isMarkdown && !rawEdit && liveSource.trim().length > 0 ? 'rendered' : 'edit'
 	);
 
-	// Markdown is rendered through the shared engine in `$lib/markdown.js` (safe
-	// mode + DOMPurify), so cells and the file preview parse identically.
+	// Markdown is rendered through the shared authored-prose renderer in
+	// `$lib/markdown` (safe mode + DOMPurify, `$…$`/`$$…$$` math typeset), so cells
+	// and the `.md` file preview parse identically. Kernel output is the other
+	// content class and goes through `renderOutputMarkdown` instead - see
+	// `renderTable` below.
 	// A markdown cell renders one block per heading segment rather than one blob,
 	// because each heading is independently foldable (a cell may hold several) and
 	// a fold hides the heading's body while leaving the heading itself in view.
