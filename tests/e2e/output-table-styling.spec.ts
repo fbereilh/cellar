@@ -66,12 +66,22 @@ const WIDE_TABLE = `<table id="T_wide"><caption>Wide numeric table</caption>
  * A long text column, as bare text in the `<td>` - deliberately NOT wrapped in a
  * `<p>`, so it does not take the `:has()` escape and is governed by the ordinary
  * cell rules. It must wrap like pandas/Jupyter rather than scroll away.
+ *
+ * The row count is deliberate, not filler: this fixture also carries the height
+ * reporter's liveness guard below, whose failure value is the 120px
+ * pre-measurement default. Eight rows of wrapped prose render several hundred
+ * pixels tall at any plausible viewport, so that assertion is decided by a wide
+ * margin rather than by how one cell happens to wrap at 1280px.
  */
 const TEXT_TABLE = `<table id="T_text">
 <thead><tr><th></th><th>note</th><th>n</th></tr></thead>
-<tbody><tr><th>0</th><td>${'a fairly long sentence of prose that should wrap into view rather than force the output document sideways. '.repeat(
-	3
-)}</td><td>1.5</td></tr></tbody></table>`;
+<tbody>${Array.from(
+	{ length: 8 },
+	(_, r) =>
+		`<tr><th>${r}</th><td>${'a fairly long sentence of prose that should wrap into view rather than force the output document sideways. '.repeat(
+			3
+		)}</td><td>${(r + 1.5).toFixed(1)}</td></tr>`
+).join('')}</tbody></table>`;
 
 /**
  * A Styler that aligns the WHOLE table - `set_table_styles([{'selector': '', …}])`
@@ -358,8 +368,11 @@ test('a long text column wraps into view instead of scrolling away', async ({ pa
 	// inside `send()`, swallowed by its `catch(e){}`, no height is ever posted, and
 	// EVERY rich text/html output silently renders at the 120px pre-measurement
 	// default with both suites still green. Measured on the outer iframe from the
-	// parent page - that is what the postMessage round trip actually produces; this
-	// cell's wrapped prose is comfortably taller than 120px.
+	// parent page - that is what the postMessage round trip actually produces. The
+	// fixture's eight rows of wrapped prose run to several hundred pixels at any
+	// plausible viewport, so this clears 120 by a wide margin instead of hinging on
+	// how one cell wraps; 120 stays the comparison because it is the exact value a
+	// dead reporter leaves behind.
 	await expect
 		.poll(
 			() => text.getByTestId('output-html').evaluate((el) => el.getBoundingClientRect().height),
