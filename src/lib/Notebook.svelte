@@ -77,6 +77,9 @@
 		/** cell id → explicit code-editor collapse choice (runtime-only) */
 		editorCollapsed?: Record<string, boolean | undefined>;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
+		/** cell id → this markdown cell is open for raw source editing (runtime-only) */
+		rawEdits?: Record<string, boolean | undefined>;
+		onSetRawEdit?: (id: string, raw: boolean) => void;
 		onActivate?: (id: string) => void;
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		onEditorFocus?: (id: string) => void;
@@ -88,8 +91,9 @@
 		searchRegex?: boolean;
 		/** cell id → its highlight payload, for cells with ≥1 match (or null map). */
 		cellHighlights?: Map<string, CellHighlight> | null;
-		/** Windowed (virtualized) cell rendering. Default OFF — with it off the
-		 *  renderer mounts every cell exactly as before (byte-identical). */
+		/** Windowed (virtualized) cell rendering. The shell passes true by default
+		 *  (P5); the prop still defaults to false, and with it off the renderer mounts
+		 *  every cell exactly as the eager `{#each}` did (byte-identical). */
 		virtualize?: boolean;
 		/** Transient jump targets forced to stay mounted wherever they are, so a
 		 *  scroll-to-cell can land on a real DOM node even under windowing. Owned by
@@ -147,6 +151,8 @@
 		onSetHideInput,
 		editorCollapsed = {},
 		onSetEditorCollapsed,
+		rawEdits = {},
+		onSetRawEdit,
 		onActivate,
 		onRegister,
 		onEditorFocus,
@@ -164,14 +170,17 @@
 	}: Props = $props();
 
 	// ---- Windowed rendering (virtualization) ---------------------------------
-	// P2: with `virtualize` on, only the cells whose estimated extent overlaps the
-	// viewport (± overscan) plus the pinned set are mounted; every off-screen run
-	// collapses into one inert `height:{px}` spacer (report §3). With the flag OFF
-	// (the default, what ships) NONE of this runs: the `{:else}` render branch
-	// mounts every cell exactly as the eager `{#each}` did, no scroll listener is
-	// attached, and no reactive state churns — byte-identical to today. Height
-	// measurement (`recordHeight`, fed by each Cell's `onMeasure`) DOES run with the
-	// flag off, to keep the cache warm. See `$lib/virtualization`.
+	// P2: with `virtualize` on - which since P5 is what the shell passes by default -
+	// only the cells whose estimated extent overlaps the viewport (± overscan) plus the
+	// pinned set are mounted; every off-screen run collapses into one inert
+	// `height:{px}` spacer (report §3). Nothing here needs a cell-count threshold: when
+	// every cell fits the window (a small notebook) `planWindow` emits no spacers, so
+	// the ON path renders the same cells the eager one did. With the flag OFF (the
+	// opt-out, `?virtualize=0` or the persisted preference) NONE of this runs: the
+	// `{:else}` render branch mounts every cell exactly as the eager `{#each}` did, no
+	// scroll listener is attached, and no reactive state churns. Height measurement
+	// (`recordHeight`, fed by each Cell's `onMeasure`) DOES run with the flag off, to
+	// keep the cache warm. See `$lib/virtualization`.
 	let containerEl = $state<HTMLElement | null>(null);
 	let viewportTop = $state(0);
 	let viewportHeight = $state(0);
@@ -533,6 +542,8 @@
 			onSetHideInput={onSetHideInput}
 			editorCollapsed={editorCollapsed[cell.id]}
 			onSetEditorCollapsed={onSetEditorCollapsed}
+			rawEdit={rawEdits[cell.id] ?? false}
+			onSetRawEdit={onSetRawEdit}
 			onActivate={onActivate}
 			{searchQuery}
 			{searchCaseSensitive}

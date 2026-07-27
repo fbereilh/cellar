@@ -17,6 +17,7 @@
 	import { subscribeEvents, originId } from '$lib/events-client';
 	import type { ClientEvent } from '$lib/events-client';
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState';
+	import { resolveVirtualize, VIRTUALIZE_PREF_KEY } from '$lib/virtualizePref';
 	import { relativeTimeLong } from '$lib/relativeTime';
 	import type { PageData } from './$types';
 	import type { Cell } from '$lib/server/types';
@@ -275,14 +276,31 @@
 		followRunningCell = !followRunningCell;
 		setUi(FOLLOW_KEY, followRunningCell);
 	}
-	// Cell virtualization (windowed rendering) — ships OFF by default. The windowing
-	// (P2), the pinned set (P3) and the jump paths that force a windowed-out target to
-	// mount (P4, `scrollToCell` below) are behind the flag; a later phase (P5) will
-	// enable it automatically above a cell-count threshold. Until then an explicit
-	// `?virtualize=1` opt-in turns it on (the e2e harness + anyone trying it). Read
-	// once at init; URL params don't change within a session.
-	const virtualizeCells =
-		typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('virtualize') === '1';
+	// Cell virtualization (windowed rendering) - ON by default since P5, for every
+	// notebook: the windowing (P2), the pinned set (P3) and the jump paths that force
+	// a windowed-out target to mount (P4, `scrollToCell` below) are all live. There is
+	// no cell-count threshold here on purpose - `planWindow` already degenerates to
+	// "mount every cell" whenever they all fit the viewport + overscan, so a small
+	// notebook renders exactly as it did before the flip and the shell needs no second,
+	// drifting copy of that rule. What remains is the opt-OUT: the persisted viewer
+	// preference (the per-project UI-state store, like follow-running-cell), overridden
+	// by an explicit `?virtualize=0` / `=1` URL param, which always wins so support and
+	// the e2e suite can pin either mode deterministically. Precedence lives in the pure
+	// `$lib/virtualizePref`. The param is read once at init; it can't change in-session.
+	const virtualizeChoice = resolveVirtualize(
+		typeof window !== 'undefined'
+			? new URLSearchParams(window.location.search).get('virtualize')
+			: null,
+		getUi<unknown>(VIRTUALIZE_PREF_KEY, undefined)
+	);
+	/** A URL param decided it, so the View-menu toggle is shown locked, not offered. */
+	const virtualizeForced = virtualizeChoice.forced;
+	let virtualizeCells = $state(virtualizeChoice.enabled);
+	function toggleVirtualizeCells() {
+		if (virtualizeForced) return; // the URL override owns this session
+		virtualizeCells = !virtualizeCells;
+		setUi(VIRTUALIZE_PREF_KEY, virtualizeCells);
+	}
 	// Print safety (Search P5): windowing drops off-screen cells from the DOM, so a
 	// print/PDF would capture only the mounted window. `beforeprint` flips this and
 	// synchronously flushes (`flushSync`) so EVERY cell mounts before the browser
@@ -1330,6 +1348,8 @@
 		canHideCode={!!activeNotebookPath}
 		hideAllCode={activeHideAllCode}
 		followRunningCell={followRunningCell}
+		virtualizeCells={virtualizeCells}
+		virtualizeForced={virtualizeForced}
 		onSelectTab={selectTab}
 		onJumpToRunningCell={jumpToRunningCell}
 		onCloseTab={closeTab}
@@ -1347,6 +1367,7 @@
 		onUndoAgent={undoLastAgentAction}
 		onToggleHideAllCode={toggleHideAllCode}
 		onToggleFollowRunningCell={toggleFollowRunningCell}
+		onToggleVirtualizeCells={toggleVirtualizeCells}
 		onOpenSettings={() => (settingsOpen = true)}
 	/>
 

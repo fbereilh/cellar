@@ -11,11 +11,15 @@
 // layout, the offset model accounts for the `space-y-4` inter-cell gap (`gapPx`), so
 // a spacer reproduces the exact flow space its collapsed run occupied.
 //
-// Windowing (P2) and the pinned set (P3, below) are live but flag-gated OFF:
-// `planWindow` returns "every cell mounted" whenever `virtualize` is false OR the
-// viewport metrics are absent, so the notebook renders byte-identically to the eager
-// `{#each}`. Actual spacer coalescing only runs when a caller opts in AND supplies
-// live `viewportTop`/`viewportHeight`.
+// Windowing (P2), the pinned set (P3) and the jump paths (P4) are ON by default
+// since P5 - the shell passes `virtualize: true` unless the persisted viewer
+// preference or a `?virtualize=0` URL param turns it off (`$lib/virtualizePref`),
+// and it is suppressed while printing so a PDF captures every cell. Two fallbacks
+// make that default safe without any cell-count threshold anywhere: `planWindow`
+// returns "every cell mounted" whenever `virtualize` is false OR the viewport
+// metrics are absent, and when every cell fits the viewport + overscan it emits no
+// spacers at all - so a small notebook renders exactly as the eager `{#each}` did.
+// Spacer coalescing only ever appears for cells genuinely outside the window.
 //
 // INVARIANT (enforce in review): this module is render-only. It never reads from,
 // gates on, or mutates the document model (`cells`). Heights flow in from measured
@@ -73,8 +77,11 @@ export interface PlanWindowArgs {
 
 // ---- Height estimation constants (§4.1) ------------------------------------
 // Estimates are ONLY ever used for cells that have never been on screen; the
-// instant a cell mounts, its real measured height replaces the estimate. These
-// are coarse on purpose and get tuned in a later phase (P5).
+// instant a cell mounts, its real measured height replaces the estimate. They stay
+// coarse on purpose: nothing depends on one being right, because a mis-estimate is
+// corrected the moment its cell mounts and the resulting drift over a long jump is
+// what the jump paths' settle loop re-measures against (`scrollElementIntoView` in
+// `LiveNotebook`). P5 shipped the default-on flip without needing to tune them.
 export const CARD_CHROME_PX = 64; // card border + toolbar + vertical padding
 export const CODE_LINE_PX = 19; // one CodeMirror line
 export const MARKDOWN_BASE_PX = 60; // a small constant for a rendered markdown cell

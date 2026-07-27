@@ -29,7 +29,11 @@ CELLAR_NO_BROWSER=1 node <repo>/bin/cellar.js --yes --no-mcp-config --new
 #               top→bottom rAF scroll of the overflow-y-auto pane
 ```
 
-## Baseline (flag OFF — eager `{#each}`, every cell mounted)
+Windowing is ON by default since P5, so pin the mode you are measuring on that URL:
+`&virtualize=0` reproduces the eager baseline below, `&virtualize=1` the windowed
+side. The param always beats the persisted viewer preference.
+
+## Baseline (windowing OFF - eager `{#each}`, every cell mounted)
 
 Captured via `chrome-devtools-axi` on the fixtures above (headless Chrome).
 
@@ -39,11 +43,15 @@ Captured via `chrome-devtools-axi` on the fixtures above (headless Chrome).
 | 150 |           150 |          20,768 |        138 |          18.5 |                    0 |               1.8 | 0.23% chrome                   |
 | 300 |           300 |          41,168 |        137 |          61.1 |                    0 |               3.5 | 0.11% chrome                   |
 
-All three: **spacers = 0** — the `virtualize` flag defaults OFF, so every cell mounts
-exactly as before (the core P1 safety property: byte-identical to today).
+All three: **spacers = 0** - captured with windowing off, so every cell mounts exactly
+as the eager `{#each}` did (the core P1 safety property). Windowing shipped OFF through
+P1-P4 and is ON by default since P5, so re-running these rows now needs an explicit
+`&virtualize=0`; that un-windowed path is unchanged and still renders byte-identically.
 
 **Headline baseline:** mounted-cell count and total DOM nodes scale **O(N)** (~137–142
-nodes/cell). Windowing (P2) should cut both to O(viewport + overscan), independent of N.
+nodes/cell). Windowing (P2) should cut both to O(viewport + overscan), independent of
+N - which it did: `tests/e2e/virtualization-scroll.spec.ts` holds the N=300 case to
+O(viewport) mounted cells and ~96% fewer DOM nodes.
 
 ¹ JS heap is GC-timing noisy at rest (the 150 sample happened to be post-GC); node
   count is the stable size signal. Treat heap as a coarse before/after, not exact.

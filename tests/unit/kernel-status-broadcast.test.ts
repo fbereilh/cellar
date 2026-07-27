@@ -150,7 +150,22 @@ let kernelmod: typeof import('../../src/lib/server/kernel');
 const A = '/ws/a.ipynb';
 const noop = () => {};
 // A near-zero debounce so a scheduled broadcast flushes on the next macrotask.
+// Use this ONLY to assert something did NOT happen: a fixed delay racing real async
+// work (the exec lock chain, startup injection, requestExecute) fails on a machine
+// busy running the rest of the suite in parallel.
 const flush = () => new Promise((r) => setTimeout(r, 5));
+
+/** Wait for progress instead of guessing at it, so load slows a test, never fails it. */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!cond()) {
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+		await new Promise((r) => setTimeout(r, 1));
+	}
+}
+
+/** True once `code` has reached the kernel wire as a non-silent (user) exec. */
+const ranOnWire = (code: string) => h.execCalls.some((c) => !c.silent && c.code === code);
 
 beforeAll(async () => {
 	process.env.CELLAR_KERNEL_STATUS_DEBOUNCE_MS = '1';
@@ -165,7 +180,8 @@ beforeEach(() => {
 describe('coalesced startup round-trips', () => {
 	it('injects all startup setup in ONE silent round-trip, establishing the same state', async () => {
 		const runP = kernelmod.execute(A, 'x=1', noop);
-		await flush(); // let startup (silent injection) + the user requestExecute settle
+		// Startup (the silent injection) + the user requestExecute have to have settled.
+		await waitFor(() => ranOnWire('x=1'), 'the user run to reach the kernel');
 		h.lastUserFuture!._resolve('ok');
 		await runP;
 		// Exactly one SILENT injection exec — the coalesced startup, not four.
@@ -199,10 +215,12 @@ describe('internal-probe vs user status broadcasts', () => {
 		const k = h.lastKernel!;
 		// Start a user run but hold it in flight (manual future).
 		const runP = kernelmod.execute(A, 'y=2', noop);
-		await flush(); // let execute() acquire the exec lock, mark the run, reach requestExecute
+		// execute() has to have acquired the exec lock, marked the run and reached
+		// requestExecute — the run being IN FLIGHT is what makes the flip broadcast.
+		await waitFor(() => ranOnWire('y=2'), 'the user run to reach the kernel');
 		// Kernel goes busy while the user run executes → must broadcast.
 		k._emitStatus('busy');
-		await flush();
+		await waitFor(() => h.statusBroadcasts.length >= 1, 'the busy broadcast');
 		expect(h.statusBroadcasts.length).toBeGreaterThanOrEqual(1);
 		expect(h.statusBroadcasts.at(-1)!.kernels.find((e) => e.path === 'a.ipynb')!.status).toBe('busy');
 		// Complete the run; the boundary reflects the now-idle kernel.
@@ -217,12 +235,14 @@ describe('internal-probe vs user status broadcasts', () => {
 		h.statusBroadcasts.length = 0;
 		const k = h.lastKernel!;
 		const runP = kernelmod.execute(A, 'z=3', noop);
-		await flush(); // let execute() acquire the exec lock, mark the run, reach requestExecute
+		// execute() has to have acquired the exec lock, marked the run, reached requestExecute.
+		await waitFor(() => ranOnWire('z=3'), 'the user run to reach the kernel');
 		// A flurry of flips within one debounce window collapses to ONE wire message.
 		k._emitStatus('busy');
 		k._emitStatus('idle');
 		k._emitStatus('busy');
-		await flush();
+		await waitFor(() => h.statusBroadcasts.length >= 1, 'the coalesced broadcast');
+		await flush(); // any second (uncoalesced) broadcast would have landed by now
 		const busyBroadcasts = h.statusBroadcasts.length;
 		expect(busyBroadcasts).toBe(1);
 		k.status = 'idle';
@@ -246,7 +266,8 @@ describe('execute serialization (the per-kernel exec lock)', () => {
 		// Fire two runs "at once" (e.g. a queued cell run + an inspector probe).
 		const first = kernelmod.execute(A, 'FIRST', noop);
 		const second = kernelmod.execute(A, 'SECOND', noop, { internal: true });
-		await flush();
+		await waitFor(() => codeCalls('FIRST') === 1, 'the first execute to reach the kernel');
+		await flush(); // a second execute racing onto the wire would have landed by now
 		// Only the FIRST has hit the wire; the second is parked on the exec lock.
 		expect(codeCalls('FIRST')).toBe(1);
 		expect(codeCalls('SECOND')).toBe(0);
@@ -254,7 +275,7 @@ describe('execute serialization (the per-kernel exec lock)', () => {
 		// `lastUserFuture` is the FIRST run's — resolve it to let the first complete.
 		h.lastUserFuture!._resolve('ok');
 		await first;
-		await flush();
+		await waitFor(() => codeCalls('SECOND') === 1, 'the second execute to reach the kernel');
 		// Now — and only now — the second run reaches the kernel.
 		expect(codeCalls('SECOND')).toBe(1);
 		h.lastUserFuture!._resolve('ok');

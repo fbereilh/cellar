@@ -24,7 +24,8 @@ import {
  * cells which must survive that — running, the heads of the kernel's run queue, the
  * selected cell, and the cell holding DOM focus — keep a live node wherever they
  * are. This spec proves the two correctness properties pinning exists for, on the
- * P0 large-notebook harness with `?virtualize=1`:
+ * P0 large-notebook harness, windowing pinned ON explicitly with `?virtualize=1`
+ * (it is the default since P5, but this spec must exercise the ON path regardless):
  *
  *   A. STREAMING. A cell streaming output while scrolled far off-screen (follow OFF)
  *      keeps a real node whose height GROWS with its output — so the scroll height
@@ -37,6 +38,12 @@ import {
  *      NEVER unmounts (proved by a marker attribute a re-mount would destroy), so
  *      its CodeMirror cursor and undo history survive; after blur it is unmount-
  *      eligible again with its text already flushed.
+ *   D. VIEW STATE. The flip side of C: an UNPINNED cell really is destroyed, so any
+ *      per-cell view choice that must outlive a scroll belongs to the NOTEBOOK, not
+ *      to Cell-local `$state`. A markdown cell opened for raw source editing is
+ *      still open for raw editing after it windows out and back - and, the other
+ *      half of that decision, is rendered normally again after a RELOAD, because the
+ *      notebook holds that choice in session only and never persists it.
  *
  * Boots the REAL launcher (Node app + Jupyter sidecar + python3 kernel), so it SKIPS
  * when that runtime is missing — the vitest unit suite (`tests/unit/virtualization
@@ -366,4 +373,135 @@ test('pins the focused cell: an edited cell scrolled out of the window keeps its
 		{ nb: NB, id: editId }
 	);
 	expect(persisted.trim()).toBe(before);
+});
+
+test('markdown raw-edit mode survives a windowed unmount (the notebook owns it, not the Cell)', async ({
+	page
+}) => {
+	test.setTimeout(120_000);
+
+	const mountedAtTop = await openWindowed(page);
+	// The generator's every-6th cell is markdown (heading + prose), so it mounts
+	// RENDERED - the state we are about to change.
+	const mdId = await page.evaluate((ids: string[]) => {
+		for (const id of ids) {
+			const el = document.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null;
+			if (el?.dataset.cellType === 'markdown') return id;
+		}
+		return null;
+	}, mountedAtTop);
+	expect(mdId).not.toBeNull();
+	const cell = page.locator(`[data-cell-id="${mdId}"]`);
+	await expect(cell.getByTestId('markdown-rendered')).toBeVisible();
+
+	// Open it for RAW editing the way a user does: double-click the rendered body.
+	await cell.getByTestId('markdown-rendered').dblclick();
+	await expect(cell.getByTestId('markdown-rendered')).toHaveCount(0);
+	await expect(cell.locator('.cm-content')).toContainText('## Section', { timeout: 10_000 });
+
+	// Move focus AND the selection to another cell, so NOTHING pins this one: the
+	// raw-edit choice has to survive on its own, not because the cell stayed mounted.
+	const otherId = mountedAtTop.find((id) => id !== mdId) as string;
+	await page.locator(`[data-cell-id="${otherId}"]`).click({ position: { x: 5, y: 5 } });
+
+	// ---- Windowed out: the Cell instance is genuinely destroyed ----
+	await scrollToBottom(page);
+	await expect.poll(() => isCellMounted(page, mdId as string), { timeout: 15_000 }).toBe(false);
+
+	// ---- Scrolled back: a FRESH Cell instance, still showing the RAW source ----
+	// A Cell-local `rawEdit` would have reset here and snapped the cell back to its
+	// rendered view; the notebook-owned `rawEdits` map is what keeps it open. The
+	// editor is lazily built, so the raw source may render through `StaticCode`:
+	// what matters is that the rendered-markdown view is NOT what came back.
+	await setScrollTop(page, 0);
+	await expect.poll(() => isCellMounted(page, mdId as string), { timeout: 15_000 }).toBe(true);
+	await expect(cell.getByTestId('editor-scroll')).toBeVisible({ timeout: 10_000 });
+	await expect(cell.getByTestId('editor-scroll')).toContainText('## Section');
+	expect(await cell.getByTestId('markdown-rendered').count()).toBe(0);
+
+	// ---- Across a RELOAD: back to rendered ----
+	// The other half of the decision: the map is IN-SESSION only (no UI-store key),
+	// so a reopened notebook renders its markdown normally rather than greeting the
+	// user with every cell they ever edited as raw source. This assertion is what
+	// pins that - reintroducing persistence fails here.
+	//
+	// The wait + round-trip is what makes that pin deterministic rather than a race:
+	// `setUi` writes are debounced (300ms) before their PUT, so a reload fired inside
+	// that window would find an empty store and pass even WITH persistence. Waiting
+	// past the debounce and then reading the store back means any write this session
+	// would have made has already reached the server before we reload.
+	await page.waitForTimeout(800);
+	await page.evaluate(() => fetch('/api/ui-state').then((r) => r.text()));
+	await openWindowed(page);
+	await expect.poll(() => isCellMounted(page, mdId as string), { timeout: 15_000 }).toBe(true);
+	await expect(page.locator(`[data-cell-id="${mdId}"]`).getByTestId('markdown-rendered')).toBeVisible({
+		timeout: 10_000
+	});
+});
+
+test('a consumed remote edit is never replayed onto a newer local edit by a re-mounted cell', async ({
+	page
+}) => {
+	test.setTimeout(120_000);
+
+	const mountedAtTop = await openWindowed(page);
+	const editId = (await page.evaluate((ids: string[]) => {
+		for (const id of ids) {
+			const el = document.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null;
+			if (el?.dataset.cellType === 'code') return id;
+		}
+		return null;
+	}, mountedAtTop)) as string;
+	expect(editId).not.toBeNull();
+	const cell = page.locator(`[data-cell-id="${editId}"]`);
+
+	// ---- 1. An AGENT (out-of-band, no originId) rewrites the cell ----
+	// The viewing tab gets `cell:edited` over SSE and adopts it: the cell is
+	// unfocused with no editor built, so there is nothing to clobber.
+	await page.evaluate(
+		({ nb, id }) => {
+			return fetch(`/api/cells/${id}`, {
+				method: 'PATCH',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ nb, source: 'agent_wrote = "REMOTE"\n' })
+			}).then(() => undefined);
+		},
+		{ nb: NB, id: editId }
+	);
+	await expect(cell.getByTestId('editor-scroll')).toContainText('REMOTE', { timeout: 15_000 });
+
+	// ---- 2. The USER then edits it locally and blurs (flushing the edit) ----
+	await cell.getByTestId('static-code').click();
+	await expect(cell.locator('.cm-editor')).toBeVisible({ timeout: 10_000 });
+	await page.keyboard.press('ControlOrMeta+a');
+	await page.keyboard.type('user_wrote = "LOCAL"');
+	const otherId = mountedAtTop.find((id) => id !== editId) as string;
+	await page.locator(`[data-cell-id="${otherId}"]`).click({ position: { x: 5, y: 5 } });
+	await expect
+		.poll(
+			async () =>
+				page.evaluate(
+					async ({ nb, id }) => {
+						const res = await fetch(`/api/notebooks?path=${encodeURIComponent(nb)}`);
+						const body = await res.json();
+						return body.notebook.cells.find((c: { id: string }) => c.id === id)?.source ?? '';
+					},
+					{ nb: NB, id: editId }
+				),
+			{ timeout: 15_000 }
+		)
+		.toContain('LOCAL');
+
+	// ---- 3. Window it out and back: the fresh Cell must NOT replay the remote ----
+	// `cell.remoteEdit` is a one-shot command consumed when it was handled in step 1.
+	// Left uncleared, the re-mounted instance (whose per-instance `appliedRemote`
+	// dedupe reset) re-adopts it, silently reverting the user's newer text - and
+	// marking it saved, so nothing ever corrects the divergence from the server.
+	await scrollToBottom(page);
+	await expect.poll(() => isCellMounted(page, editId), { timeout: 15_000 }).toBe(false);
+	await setScrollTop(page, 0);
+	await expect.poll(() => isCellMounted(page, editId), { timeout: 15_000 }).toBe(true);
+	await page.waitForTimeout(500);
+	await expect(cell.getByTestId('editor-scroll')).toContainText('LOCAL');
+	expect(await cell.getByTestId('editor-scroll').innerText()).not.toContain('REMOTE');
 });

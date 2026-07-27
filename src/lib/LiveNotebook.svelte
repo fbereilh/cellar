@@ -32,8 +32,10 @@
 		follow?: boolean;
 		/** The shell's `fsRefreshSignal`: a bump re-fetches the git HEAD baseline. */
 		gitRefresh?: number;
-		/** Windowed (virtualized) cell rendering. Default OFF; forwarded to Notebook,
-		 *  where it is fully wired but dormant (no behavior change) at this phase. */
+		/** Windowed (virtualized) cell rendering; forwarded to Notebook. The shell
+		 *  turns it ON by default (P5) and suppresses it while printing - see
+		 *  `$lib/virtualizePref`. The prop itself keeps defaulting to false so a
+		 *  standalone mount (tests, any future embedder) renders every cell. */
 		virtualize?: boolean;
 		onCellsChange?: (path: string, cells: UICell[]) => void;
 		/** (path, foldedIds, folding): the sidebar Outline renders from this. */
@@ -427,6 +429,32 @@
 		else next[id] = collapsed;
 		editorCollapsed = next;
 		saveEditorCollapsed();
+	}
+
+	// ---- Markdown raw-edit mode ----------------------------------------------
+	// Which markdown cells the user has opened for RAW source editing (a rendered
+	// markdown cell shows its rendered HTML until then). Owned here, not in the
+	// Cell, for the same reason as the collapse choice above: windowing destroys
+	// and rebuilds a Cell whenever it leaves and re-enters the window, so a
+	// per-instance flag would snap a cell the user is editing back to its rendered
+	// view the moment it scrolled out of sight.
+	//
+	// Unlike `editorCollapsed` this is IN-SESSION ONLY - deliberately NOT written to
+	// the per-project UI store. This notebook stays mounted for the life of its tab,
+	// which is all the windowed unmount/remount needs; persisting it would reopen a
+	// notebook with every markdown cell the user ever edited showing raw source
+	// instead of rendered HTML, a far louder change than a collapsed editor.
+	let rawEdits = $state<Record<string, boolean | undefined>>({});
+
+	// `false` DELETES the entry rather than storing it, so this doubles as the
+	// delete-path cleanup: a deleted cell can never come back under the same id, and
+	// the map must not grow for the life of the tab.
+	function setRawEdit(id: string, raw: boolean) {
+		if ((rawEdits[id] ?? false) === raw) return;
+		const next = { ...rawEdits };
+		if (raw) next[id] = true;
+		else delete next[id];
+		rawEdits = next;
 	}
 
 	// ---- Git cell decorations ------------------------------------------------
@@ -1161,6 +1189,7 @@
 		} else if (ev.type === 'cell:deleted') {
 			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
+			setRawEdit(ev.cellId, false);
 			if (runningId === ev.cellId) runningId = null;
 			if (activeId === ev.cellId) activeId = null;
 		} else if (ev.type === 'cell:moved') {
@@ -1190,6 +1219,10 @@
 			// A markdown cell was "run" (agent run_cell / add_and_run). Markdown doesn't
 			// execute on the kernel; running it renders it, so flip the cell to its
 			// rendered view. View-only (no doc mutation, no staleness recompute).
+			// The raw-edit flag is OURS, so clear it here rather than relying on the
+			// cell's API: windowing may have unmounted that cell, and a mounted-only
+			// clear would leave it stuck on raw source when it scrolled back.
+			setRawEdit(ev.cellId, false);
 			cellApis[ev.cellId]?.showRendered?.();
 			return;
 		} else if (ev.type === 'cell:edited') {
@@ -1198,7 +1231,18 @@
 			// (else it surfaces a "changed on server" affordance). A fresh object
 			// each time so the Cell's effect fires even on a same-source re-edit.
 			const cell = findCell(ev.cellId);
-			if (cell) cell.remoteEdit = { source: ev.source };
+			if (cell) {
+				// With NO mounted Cell there is no editor to clobber and no typing to
+				// protect, so the model must be written HERE - the marker alone would sit
+				// unconsumed for as long as windowing keeps the cell out of the DOM, and
+				// `cell.source` is what every model reader falls back to: a bulk run reads
+				// it (`runCodeIds`) and the run route persists what it POSTs, so a stale
+				// value would execute the pre-edit code AND write it over the agent's edit
+				// in the .ipynb. It also feeds `onCellsChange` (find bar / sidebar search /
+				// outline). The MOUNTED path is unchanged: the Cell owns its editor's text.
+				if (!cellApis[ev.cellId]) cell.source = ev.source;
+				cell.remoteEdit = { source: ev.source };
+			}
 		}
 		// Any structural change (add/edit/type/delete/move/clear) can shift the
 		// dependency graph or the run/edit stamps — recompute staleness.
@@ -1868,6 +1912,7 @@
 		deletedCells.push({ index: i, ...snapshotCell(cell) });
 		if (deletedCells.length > UNDO_LIMIT) deletedCells.shift();
 		cells = cells.filter((c) => c.id !== id);
+		setRawEdit(id, false);
 		// Keep a cell selected: command mode acts on the selection, so deleting the
 		// selected cell must hand the selection to its neighbor, not drop it. Focus
 		// follows, because the delete button that had it is gone with the cell.
@@ -2336,6 +2381,8 @@
 			onSetHideInput={setHideInput}
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}
+			rawEdits={rawEdits}
+			onSetRawEdit={setRawEdit}
 			onActivate={setActive}
 			onRegister={registerCell}
 			onEditorFocus={onEditorFocus}

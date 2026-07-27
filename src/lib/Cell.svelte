@@ -30,7 +30,7 @@
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
 	import { setSurfaceRanges, clearSurface, buildTextRanges, allocSurfaceKey } from '$lib/domHighlight';
 	import type { CellOutput, CellType, LogicalCellType } from '$lib/server/types';
-	import type { KeyMode, UICell, SegHidden, CellRegisterApi, RemoteEdit } from '$lib/types';
+	import type { KeyMode, UICell, SegHidden, CellRegisterApi } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
@@ -82,6 +82,10 @@
 		/** Per-cell code-editor collapse choice (undefined = auto / true / false). */
 		editorCollapsed?: boolean;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
+		/** This markdown cell is open for RAW source editing (see `mode` below). Owned
+		 *  by the notebook, like `editorCollapsed`, so it survives a windowed unmount. */
+		rawEdit?: boolean;
+		onSetRawEdit?: (id: string, raw: boolean) => void;
 		onActivate?: (id: string) => void;
 		/** Find-in-page query (Search P4); empty when the find bar is closed / this
 		 *  notebook isn't the searched one. Non-empty drives in-place highlighting. */
@@ -134,6 +138,8 @@
 		onSetHideInput,
 		editorCollapsed,
 		onSetEditorCollapsed,
+		rawEdit = false,
+		onSetRawEdit,
 		onActivate,
 		searchQuery = '',
 		searchCaseSensitive = false,
@@ -187,6 +193,7 @@
 		if (view && liveSource !== savedSource) {
 			savedSource = liveSource;
 			editPending = false;
+			clearRemoteStash();
 			return onEdit(cell.id, liveSource, { keepalive });
 		}
 	}
@@ -212,7 +219,21 @@
 	// editing this cell, held until they choose to load it (the affordance below).
 	let remoteChanged = $state(false);
 	let pendingRemoteSource: string | null = null;
-	let appliedRemote: RemoteEdit | null = null; // the last cell.remoteEdit object we processed
+
+	/**
+	 * Drop an unresolved remote stash (and its banner). EVERY path that deliberately
+	 * writes or persists this cell's source LOCALLY must call this: the stash is what
+	 * the teardown hands back (see the destroy handler), so a stash left standing over
+	 * a local write is re-armed as a marker the next instance adopts - reverting the
+	 * cell to the pre-write text while the server holds what the local path just
+	 * persisted. Typing, a rewrite (`replaceSource`), a run (`doRun`), a flush and the
+	 * Load button all supersede it; centralized here so a future source path cannot
+	 * silently miss it.
+	 */
+	function clearRemoteStash() {
+		remoteChanged = false;
+		pendingRemoteSource = null;
+	}
 
 	// The editor's live text. Declared before `mode` because `mode` derives from it.
 	let liveSource = $state(cell.source);
@@ -230,7 +251,15 @@
 	// `$state`-init-plus-one-shot-event design did (the bug this fixes). Reopening a
 	// notebook already rendered because those cells mount with source; this makes
 	// live agent-created cells behave identically.
-	let rawEdit = $state(false);
+	//
+	// The flag itself is OWNED BY THE NOTEBOOK (the `rawEdit` prop + `onSetRawEdit`,
+	// exactly like `editorCollapsed`): under windowing this Cell is destroyed and
+	// rebuilt whenever it leaves and re-enters the window, and per-instance `$state`
+	// would silently snap a cell the user opened for editing back to its rendered
+	// view. Every set/clear site below writes through `setRawEdit`.
+	function setRawEdit(raw: boolean) {
+		onSetRawEdit?.(cell.id, raw);
+	}
 	const mode = $derived(
 		isMarkdown && !rawEdit && liveSource.trim().length > 0 ? 'rendered' : 'edit'
 	);
@@ -752,10 +781,23 @@
 	// editor in place ONLY when the user isn't actively editing this cell
 	// (unfocused and no pending local change). Otherwise we stash it and surface a
 	// subtle "changed on server" affordance so the user's typing is never clobbered.
+	//
+	// `cell.remoteEdit` is a ONE-SHOT command, so it is CONSUMED (nulled) the moment
+	// this effect has handled it - on EVERY branch, the stash included. Under
+	// windowing a Cell instance is torn down and rebuilt whenever the cell leaves and
+	// re-enters the window, and an unconsumed marker is replayed by the fresh
+	// instance: it would overwrite a NEWER local edit the user has since made
+	// (`cell.source`/`savedSource` reset to the stale remote text, with no re-PATCH to
+	// correct it). That replay is reachable from the stash too - the user resolves the
+	// banner (Load, or dismiss by typing on), then edits and blurs - so the marker
+	// cannot simply be left set on the editing path. Instead the STASH is what is
+	// handed back on teardown, and only while it is genuinely unresolved and the
+	// user's text has not diverged (see the destroy handler). LiveNotebook assigns a
+	// fresh object per remote edit, so consuming here can never drop a future one.
 	$effect(() => {
 		const re = cell.remoteEdit;
-		if (!re || re === appliedRemote) return;
-		appliedRemote = re;
+		if (!re) return;
+		cell.remoteEdit = null;
 		if (!view) {
 			// No live editor is built yet, so there is nothing to clobber and no
 			// active typing to protect: adopt the remote source directly. This keeps
@@ -765,13 +807,13 @@
 			liveSource = re.source;
 			cell.source = re.source;
 			savedSource = re.source;
+			clearRemoteStash();
 			return;
 		}
 		const editing = view.hasFocus || editPending;
 		if (!editing) {
 			applySourceToEditor(re.source);
-			remoteChanged = false;
-			pendingRemoteSource = null;
+			clearRemoteStash();
 			if (isMarkdown && mode === 'rendered') liveSource = re.source; // refresh the rendered view
 		} else {
 			pendingRemoteSource = re.source;
@@ -784,10 +826,18 @@
 	 * toggle, the upper half of a split). Cancels any pending debounce, because
 	 * the caller persists the new source itself, and reuses the remote-apply path
 	 * so the update listener doesn't echo the same text back as a second save.
+	 *
+	 * A deliberate local rewrite SUPERSEDES an unresolved remote stash, exactly as
+	 * typing does - but the update listener's supersede-clear cannot see this one:
+	 * it returns early on `applyingRemote`, which the remote-apply path sets. So the
+	 * stash is dropped here, else teardown would hand the stale marker back over the
+	 * rewrite and a remount would adopt the pre-rewrite text while the server holds
+	 * what the caller just persisted.
 	 */
 	function replaceSource(src: string) {
 		clearTimeout(editTimer);
 		editPending = false;
+		clearRemoteStash();
 		if (view) {
 			applySourceToEditor(src);
 			return;
@@ -804,8 +854,7 @@
 		if (pendingRemoteSource != null && pendingRemoteSource !== currentSource()) {
 			applySourceToEditor(pendingRemoteSource);
 		}
-		remoteChanged = false;
-		pendingRemoteSource = null;
+		clearRemoteStash();
 	}
 
 	// Run/render. For markdown this just renders (parent persists source, no
@@ -816,13 +865,17 @@
 		const src = currentSource();
 		liveSource = src;
 		savedSource = src;
-		if (isMarkdown) rawEdit = false;
+		// Running what you see is a deliberate local action, and the run route PERSISTS
+		// the source it is handed - so it supersedes an unresolved stash exactly as a
+		// rewrite does, and the stash is stale the moment the run is submitted.
+		clearRemoteStash();
+		if (isMarkdown) setRawEdit(false);
 		if (advance) onRunAdvance(cell.id, src, { focusNext });
 		else onRun(cell.id, src);
 	}
 
 	async function enterEdit() {
-		rawEdit = true;
+		setRawEdit(true);
 		buildEditor(); // summon the real editor (no-op if already built)
 		await tick();
 		view?.focus();
@@ -887,18 +940,20 @@
 			prevType = type;
 			// A manual type toggle drops into edit mode so the user sees the source
 			// (a code→markdown conversion that rendered immediately would hide it).
-			rawEdit = true;
+			setRawEdit(true);
 		}
 	});
 
 	/**
 	 * Build the heavy CodeMirror `EditorView` — lazily, on first edit-intent. The
-	 * whole point of the interim virtualization: a freshly opened notebook builds
-	 * ZERO editors (each cell shows its source via `StaticCode`), and an editor is
-	 * created only when the user (or a programmatic focus) needs to interact with a
-	 * given cell. Idempotent — every edit-intent path calls this, and it no-ops once
-	 * the editor exists (this is lazy-*create*, not windowing: the editor is never
-	 * torn down). The new editor seeds from `liveSource`, the doc-backed source that
+	 * whole point of the lazy editor: a freshly opened notebook builds ZERO editors
+	 * (each cell shows its source via `StaticCode`), and an editor is created only
+	 * when the user (or a programmatic focus) needs to interact with a given cell.
+	 * Idempotent — every edit-intent path calls this, and it no-ops once the editor
+	 * exists (this is lazy-*create*: it never tears an editor down itself. Windowing
+	 * does, with the whole Cell, when the cell leaves the window - which is why the
+	 * focused cell is pinned, so a cursor and undo history in use survive). The new
+	 * editor seeds from `liveSource`, the doc-backed source that
 	 * has tracked every remote edit while the cell had no editor, so there is no
 	 * divergence between what the static render showed and what the editor now holds.
 	 */
@@ -925,10 +980,7 @@
 						// A genuine local edit supersedes any stashed remote snapshot: drop
 						// it (and the banner) once the buffer diverges, so Load can never
 						// clobber newer local content with a now-stale remote source.
-						if (remoteChanged && liveSource !== pendingRemoteSource) {
-							remoteChanged = false;
-							pendingRemoteSource = null;
-						}
+						if (remoteChanged && liveSource !== pendingRemoteSource) clearRemoteStash();
 						editPending = true;
 						clearTimeout(editTimer);
 						editTimer = setTimeout(() => {
@@ -948,7 +1000,7 @@
 							// while they type into a fresh empty cell. A rendered markdown cell's
 							// editor is display:none and unfocusable, so this only ever fires
 							// when edit mode is already showing.
-							if (isMarkdown) rawEdit = true;
+							if (isMarkdown) setRawEdit(true);
 							onEditorFocus?.(cell.id);
 							return false;
 						},
@@ -1017,7 +1069,7 @@
 			showRendered: () => {
 				if (!isMarkdown) return;
 				liveSource = currentSource();
-				rawEdit = false;
+				setRawEdit(false);
 			},
 			isMarkdown: () => isMarkdown,
 			// Primitives the notebook's cut/copy, heading and split actions compose.
@@ -1066,6 +1118,25 @@
 		const flushOnUnload = () => flushEdit({ keepalive: true });
 		window.addEventListener('pagehide', flushOnUnload);
 		return () => {
+			// An UNRESOLVED stash ("changed on server", never loaded nor dismissed) lives
+			// only on this instance, so windowing the cell out would drop the agent's edit
+			// entirely: the cell would come back showing the pre-edit source while the
+			// server holds the new one, and the next local edit would PATCH over it from
+			// that stale base. Hand the marker back so the next instance can adopt it -
+			// but ONLY while the user's own text has not diverged, since a restored marker
+			// is applied unconditionally by a fresh instance and would clobber their
+			// typing (checked BEFORE `flushEdit`, which moves `savedSource`).
+			//
+			// That same guard is what lets the MODEL be written here too: with no local
+			// divergence there is no text of the user's to lose, and once this instance is
+			// gone nothing owns `cell.source` - leaving it at the pre-edit text would run
+			// and persist that over the agent's edit exactly as an unconsumed marker
+			// would (see the notebook's `cell:edited` handler, which writes the model for
+			// the same reason whenever no Cell is mounted).
+			if (remoteChanged && pendingRemoteSource != null && currentSource() === savedSource) {
+				cell.source = pendingRemoteSource;
+				cell.remoteEdit = { source: pendingRemoteSource };
+			}
 			flushEdit();
 			editorResizeObserver?.disconnect();
 			cardResizeObserver?.disconnect();

@@ -81,8 +81,11 @@ const findBar = (page: Page) => page.getByTestId('find-bar');
 const findInput = (page: Page) => page.getByTestId('find-input');
 const findCount = (page: Page) => page.getByTestId('find-count');
 
+// Windowing is on by default since P5, so both modes are pinned EXPLICITLY here:
+// `virtualize=0` keeps the un-windowed coverage these cases were written against,
+// `virtualize=1` the windowed one. Neither rides the shell's default.
 async function open(page: Page, virtualize = false): Promise<void> {
-	const q = `?ws=${encodeURIComponent(workspace)}${virtualize ? '&virtualize=1' : ''}`;
+	const q = `?ws=${encodeURIComponent(workspace)}&virtualize=${virtualize ? '1' : '0'}`;
 	await page.goto(`${baseURL}/${q}`);
 	const openBtn = page.getByTestId('empty-open-notebook');
 	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();

@@ -163,6 +163,7 @@ Everything you'd expect from a notebook, plus the things that make sharing one w
 - **Variable and DataFrame inspection** to peek into the live kernel namespace.
 - **Git blame and diff gutters** right in the editor, and per-cell change bars in the notebook.
 - **Workspace files in tabs**: open any file from the sidebar to read or edit it with syntax highlighting. Markdown and `.html` also get a **Source/Preview** toggle, so a saved plotly, bokeh, or nbconvert export just renders - inside a sandboxed frame that cannot reach the app.
+- **Long notebooks stay fast**: only the cells near what you're looking at are kept in the page, so a several-hundred-cell notebook opens and scrolls like a short one. Find, the outline, running, and printing still reach every cell; the **View** menu turns it off if you'd rather have them all rendered at once.
 - One shared kernel across notebooks, with a sidebar showing what's actually loaded in memory.
 
 ![A pandas DataFrame rendered as Cellar's interactive grid, sorted by a column, with dtype headers, a filter box, and pagination](docs/images/dataframe-grid.png)

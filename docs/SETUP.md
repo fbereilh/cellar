@@ -319,6 +319,16 @@ spec files at a time. Install its browser once with `npx playwright install chro
   (`<script src="report_files/x.js">`) cannot load them, so the page renders without
   them. Re-export the file self-contained (e.g. plotly's `include_plotlyjs=True`,
   bokeh's `INLINE`, `jupyter nbconvert --embed-images`) and it renders in full.
+- **A long notebook keeps only its visible cells in the page** - by default Cellar
+  renders the cells near the viewport and collapses the rest into a placeholder of
+  the same height, so a several-hundred-cell notebook opens and scrolls like a short
+  one. Nothing is lost: find-in-notebook, the outline, the sidebar search and
+  follow-the-running-cell all mount their target before jumping to it, and
+  printing/save-to-PDF re-mounts every cell first. Turn it off from the navbar's
+  **View** menu (*Render all cells*), which is remembered per project, or for one
+  session with `?virtualize=0` on the app URL (`=1` forces it back on). The URL
+  parameter always wins, and the menu item is then shown locked so it can't pretend
+  otherwise.
 - **A run aborted with "The kernel connection is being refreshed; re-run the cell"** -
   the kernel websocket died (its reconnect retries were spent) while the process
   itself is still alive. Cellar rebuilds the socket in the background without
