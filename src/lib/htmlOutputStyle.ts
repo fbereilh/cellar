@@ -36,14 +36,23 @@
  * meet on the same element and the id wins, then inherits down. Right stays the
  * default: it is the pandas numeric convention. Do not move it onto the cells.
  *
- * **The table stays a real table.** No `display:block`, because that wraps the
- * rows in an anonymous table box of `width:auto` - a user's `<table width="100%">`
- * or `#T_xxxx{width:100%;table-layout:fixed}` would still apply and simply stop
- * having an effect. Cells therefore wrap normally (the pandas/Jupyter default), so
- * a long text column reads instead of scrolling; a genuinely wide table - many
- * numeric columns, which cannot wrap - overflows and scrolls the output iframe's
- * own document. The app page never scrolls sideways either way: the iframe is
- * fixed-width and clips.
+ * **The table stays a real table, and carries no `max-width`.** No
+ * `display:block`, because that wraps the rows in an anonymous table box of
+ * `width:auto` - a user's `<table width="100%">` or
+ * `#T_xxxx{width:100%;table-layout:fixed}` would still apply and simply stop
+ * having an effect. And no `max-width:100%` on `table`, which looks like an
+ * obvious safety net and is the one declaration a user could not override: their
+ * `width:1500px` is a DIFFERENT property, so no amount of id specificity beats
+ * cellar's `max-width` and their columns are silently squeezed. It also buys
+ * nothing - auto table layout already sizes an auto-width table as
+ * `max(min-content, min(max-content, available))`, so it fits its container
+ * unaided; it cannot prevent min-content overflow anyway; and a genuinely wide
+ * table overflowing is the accepted design here. (The `img,svg,canvas` rule keeps
+ * its own `max-width` - unrelated, and it predates this block.) Cells therefore
+ * wrap normally (the pandas/Jupyter default), so a long text column reads instead
+ * of scrolling; a genuinely wide table - many numeric columns, which cannot wrap
+ * - overflows and scrolls the output iframe's own document. The app page never
+ * scrolls sideways either way: the iframe is fixed-width and clips.
  *
  * The one non-obvious rule is the last one. The same iframe also renders
  * arbitrary `IPython.display.HTML`, where a `<table>` is sometimes a two-column
@@ -75,7 +84,7 @@ export const OUTPUT_HTML_CSS = `
 html,body{margin:0;padding:8px;background:#ffffff;color:#1f2937;font-family:system-ui,-apple-system,sans-serif;font-size:14px;}
 img,svg,canvas{max-width:100%;}
 
-table{max-width:100%;border-collapse:collapse;border:0;text-align:right;font-variant-numeric:tabular-nums;}
+table{border-collapse:collapse;border:0;text-align:right;font-variant-numeric:tabular-nums;}
 caption{text-align:left;font-weight:600;color:#111827;padding:0 0 6px;}
 th,td{padding:7px 20px;border:0;border-bottom:1px solid #eef1f4;}
 th{font-weight:600;color:#111827;}

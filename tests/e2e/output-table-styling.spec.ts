@@ -353,6 +353,20 @@ test('a long text column wraps into view instead of scrolling away', async ({ pa
 
 	const frame = await runForIframe(text);
 
+	// The height reporter is a function serialized into the srcdoc, so if it ever
+	// gains a reference outside its own parameters the ReferenceError is thrown
+	// inside `send()`, swallowed by its `catch(e){}`, no height is ever posted, and
+	// EVERY rich text/html output silently renders at the 120px pre-measurement
+	// default with both suites still green. Measured on the outer iframe from the
+	// parent page - that is what the postMessage round trip actually produces; this
+	// cell's wrapped prose is comfortably taller than 120px.
+	await expect
+		.poll(
+			() => text.getByTestId('output-html').evaluate((el) => el.getBoundingClientRect().height),
+			{ timeout: 15_000 }
+		)
+		.toBeGreaterThan(120);
+
 	// Bare text in the `<td>`, so it does NOT take the `:has()` escape - this is
 	// the ordinary cell rule, and it must leave pandas/Jupyter wrapping alone.
 	const td = frame.locator('tbody td').first();

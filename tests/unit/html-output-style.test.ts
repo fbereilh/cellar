@@ -127,6 +127,15 @@ describe('injected output stylesheet: contents', () => {
 		expect(OUTPUT_HTML_CSS).not.toMatch(/white-space/);
 	});
 
+	// The sibling of the `!important` guard, protecting the same contract from the
+	// other direction a specificity check cannot see: a user's `width:1500px` is a
+	// DIFFERENT property, so no id specificity beats a `max-width` here and their
+	// columns are silently squeezed. The `img,svg,canvas` rule keeps its own.
+	it('puts no max-width on `table` - the one thing a user could not override', () => {
+		expect(OUTPUT_HTML_CSS).not.toMatch(/\btable\{[^}]*max-width/);
+		expect(OUTPUT_HTML_CSS).toMatch(/\bimg,svg,canvas\{[^}]*max-width:100%/);
+	});
+
 	// `display:block` here would be worse than pointless: a caption is already
 	// `display:table-caption` above the table, and forcing block on a child of a
 	// `display:table` element gets it wrapped in an anonymous cell - i.e. a row.
