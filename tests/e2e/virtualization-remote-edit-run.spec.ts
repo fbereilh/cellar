@@ -31,6 +31,10 @@ import { isCellMounted, setScrollTop } from './notebook-scroll';
  * listener skips), so without an explicit drop the teardown would hand the stale marker
  * back over the rewrite and the cell would come back holding the pre-split text.
  *
+ * The fourth is the same rule reached through a RUN: Shift+Enter persists what the user
+ * sees (the run route writes the source it is POSTed), so it supersedes the stash too -
+ * the last of the local-source paths, all of which now drop it through one helper.
+ *
  * The fixture is deliberately one lone code cell in the middle of a tall markdown
  * notebook: tall enough that the target is windowed out at the top, cheap enough
  * that "Run all" is exactly one kernel run.
@@ -49,6 +53,8 @@ const STASHED = 'print("STASH_EDIT_OK")';
 const SPLIT_UPPER = 'print("SPLIT_UPPER_OK")';
 const SPLIT_LOWER = 'print("SPLIT_LOWER_OK")';
 const SPLIT_STASH = 'print("SPLIT_STASH_LOST")';
+const RUN_LOCAL = 'print("RUN_LOCAL_OK")';
+const RUN_STASH = 'print("RUN_STASH_LOST")';
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
@@ -326,4 +332,56 @@ test('a split over an unresolved stash supersedes it, and windowing out keeps th
 	expect(after.output).toContain('SPLIT_UPPER_OK');
 	expect(after.output).not.toContain('SPLIT_STASH_LOST');
 	expect(after.source).toBe(`${SPLIT_UPPER}\n`);
+});
+
+test('running over an unresolved stash supersedes it, and windowing out keeps the run', async ({ page }) => {
+	test.setTimeout(180_000);
+
+	await openWindowed(page);
+	await agentEdit(page, RUN_LOCAL);
+	await clearTargetOutputs(page);
+
+	// Jump to the target and put the caret in its editor - the state that STASHES a
+	// remote edit behind the banner instead of applying it.
+	expect(await searchHits(page, 'RUN_LOCAL_OK')).toBe(1);
+	await page.getByTestId('search-result').first().click();
+	await expect.poll(() => isCellMounted(page, TARGET), { timeout: 15_000 }).toBe(true);
+	const cell = page.locator(`[data-cell-id="${TARGET}"]`);
+	await cell.getByTestId('editor-scroll').click();
+	await expect(cell.locator('.cm-content')).toBeVisible({ timeout: 10_000 });
+	await cell.locator('.cm-content').click();
+
+	// ---- The agent edits it while the caret sits there: the edit STASHES ----
+	await agentEdit(page, RUN_STASH);
+	await expect(cell.getByTestId('remote-changed')).toBeVisible({ timeout: 15_000 });
+
+	// The user resolves the banner neither way - they RUN what they see. The run route
+	// persists that source, so it supersedes the stash and the banner goes with it.
+	await page.keyboard.press('Shift+Enter');
+	await expect.poll(async () => (await serverCell(page)).output, { timeout: 60_000 }).toContain('RUN_LOCAL_OK');
+	await expect(cell.getByTestId('remote-changed')).toHaveCount(0, { timeout: 15_000 });
+
+	// Scroll off, destroying the instance: the superseded stash must NOT be handed back.
+	await expect
+		.poll(
+			async () => {
+				await setScrollTop(page, 0);
+				return isCellMounted(page, TARGET);
+			},
+			{ timeout: 20_000 }
+		)
+		.toBe(false);
+
+	// The model holds what was run, not the stale remote source (search reads the live
+	// cell model, so it answers for a cell nothing has mounted).
+	await expectNoSearchHits(page, 'RUN_STASH_LOST');
+
+	// …and a later run executes and persists it, so the run is not reverted.
+	await clearTargetOutputs(page);
+	await page.getByTestId('run-all').click();
+	await expect.poll(async () => (await serverCell(page)).output.length, { timeout: 60_000 }).toBeGreaterThan(0);
+	const after = await serverCell(page);
+	expect(after.output).toContain('RUN_LOCAL_OK');
+	expect(after.output).not.toContain('RUN_STASH_LOST');
+	expect(after.source).toContain('RUN_LOCAL_OK');
 });

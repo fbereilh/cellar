@@ -193,6 +193,7 @@
 		if (view && liveSource !== savedSource) {
 			savedSource = liveSource;
 			editPending = false;
+			clearRemoteStash();
 			return onEdit(cell.id, liveSource, { keepalive });
 		}
 	}
@@ -218,6 +219,21 @@
 	// editing this cell, held until they choose to load it (the affordance below).
 	let remoteChanged = $state(false);
 	let pendingRemoteSource: string | null = null;
+
+	/**
+	 * Drop an unresolved remote stash (and its banner). EVERY path that deliberately
+	 * writes or persists this cell's source LOCALLY must call this: the stash is what
+	 * the teardown hands back (see the destroy handler), so a stash left standing over
+	 * a local write is re-armed as a marker the next instance adopts - reverting the
+	 * cell to the pre-write text while the server holds what the local path just
+	 * persisted. Typing, a rewrite (`replaceSource`), a run (`doRun`), a flush and the
+	 * Load button all supersede it; centralized here so a future source path cannot
+	 * silently miss it.
+	 */
+	function clearRemoteStash() {
+		remoteChanged = false;
+		pendingRemoteSource = null;
+	}
 
 	// The editor's live text. Declared before `mode` because `mode` derives from it.
 	let liveSource = $state(cell.source);
@@ -791,13 +807,13 @@
 			liveSource = re.source;
 			cell.source = re.source;
 			savedSource = re.source;
+			clearRemoteStash();
 			return;
 		}
 		const editing = view.hasFocus || editPending;
 		if (!editing) {
 			applySourceToEditor(re.source);
-			remoteChanged = false;
-			pendingRemoteSource = null;
+			clearRemoteStash();
 			if (isMarkdown && mode === 'rendered') liveSource = re.source; // refresh the rendered view
 		} else {
 			pendingRemoteSource = re.source;
@@ -821,8 +837,7 @@
 	function replaceSource(src: string) {
 		clearTimeout(editTimer);
 		editPending = false;
-		remoteChanged = false;
-		pendingRemoteSource = null;
+		clearRemoteStash();
 		if (view) {
 			applySourceToEditor(src);
 			return;
@@ -839,8 +854,7 @@
 		if (pendingRemoteSource != null && pendingRemoteSource !== currentSource()) {
 			applySourceToEditor(pendingRemoteSource);
 		}
-		remoteChanged = false;
-		pendingRemoteSource = null;
+		clearRemoteStash();
 	}
 
 	// Run/render. For markdown this just renders (parent persists source, no
@@ -851,6 +865,10 @@
 		const src = currentSource();
 		liveSource = src;
 		savedSource = src;
+		// Running what you see is a deliberate local action, and the run route PERSISTS
+		// the source it is handed - so it supersedes an unresolved stash exactly as a
+		// rewrite does, and the stash is stale the moment the run is submitted.
+		clearRemoteStash();
 		if (isMarkdown) setRawEdit(false);
 		if (advance) onRunAdvance(cell.id, src, { focusNext });
 		else onRun(cell.id, src);
@@ -960,10 +978,7 @@
 						// A genuine local edit supersedes any stashed remote snapshot: drop
 						// it (and the banner) once the buffer diverges, so Load can never
 						// clobber newer local content with a now-stale remote source.
-						if (remoteChanged && liveSource !== pendingRemoteSource) {
-							remoteChanged = false;
-							pendingRemoteSource = null;
-						}
+						if (remoteChanged && liveSource !== pendingRemoteSource) clearRemoteStash();
 						editPending = true;
 						clearTimeout(editTimer);
 						editTimer = setTimeout(() => {
