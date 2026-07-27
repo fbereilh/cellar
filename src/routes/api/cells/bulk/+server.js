@@ -17,17 +17,28 @@ import { deleteCells, moveCells, setCellTypes } from '$lib/server/notebook';
  *   - `{ op: 'delete', ids }`               remove every id
  *   - `{ op: 'move', ids, dir: 'up'|'down' }` slide the selection one step
  *   - `{ op: 'type', ids, cellType }`         retype ('code' | 'sql' | 'markdown')
+ *
+ * `dir` and `cellType` are VALIDATED, not coerced: both ops rewrite and persist the
+ * user's `.ipynb`, so an out-of-vocabulary value must fail like `no-ids` /
+ * `unknown-op` rather than silently reorder or retype cells in a direction nobody
+ * asked for.
  */
+const MOVE_DIRS = new Set(['up', 'down']);
+const CELL_TYPES = new Set(['code', 'sql', 'markdown']);
+
 export async function POST({ request }) {
 	const { op, ids, nb, originId, dir, cellType } = await request.json().catch(() => ({}));
 	const list = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && id) : [];
 	if (!list.length) return json({ ok: false, reason: 'no-ids' }, { status: 400 });
 
 	if (op === 'delete') return json({ ok: true, removed: deleteCells(list, nb, originId) });
-	if (op === 'move') return json({ ok: true, moved: moveCells(list, dir === 'up' ? 'up' : 'down', nb, originId) });
+	if (op === 'move') {
+		if (!MOVE_DIRS.has(dir)) return json({ ok: false, reason: 'bad-dir' }, { status: 400 });
+		return json({ ok: true, moved: moveCells(list, dir, nb, originId) });
+	}
 	if (op === 'type') {
-		const type = cellType === 'markdown' ? 'markdown' : cellType === 'sql' ? 'sql' : 'code';
-		return json({ ok: true, changed: setCellTypes(list, type, nb, originId) });
+		if (!CELL_TYPES.has(cellType)) return json({ ok: false, reason: 'bad-cell-type' }, { status: 400 });
+		return json({ ok: true, changed: setCellTypes(list, cellType, nb, originId) });
 	}
 	return json({ ok: false, reason: 'unknown-op' }, { status: 400 });
 }

@@ -6,7 +6,7 @@
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
-	import { logicalCellType } from '$lib/cellLanguage';
+	import { isLogicalCellType } from '$lib/cellLanguage';
 	import {
 		applyGesture,
 		applyMovePlan,
@@ -2127,8 +2127,12 @@
 	 * `applied` is what the caller changed locally, derived through the same rules
 	 * the server uses, so a batch the server legitimately skipped (cells already of
 	 * the target type) is not mistaken for a refusal and does not refetch.
+	 *
+	 * Returns whether the server confirmed the caller's change, so a caller with
+	 * state that only makes sense once the batch landed (the delete's undo group)
+	 * can hold it back rather than record something that never happened.
 	 */
-	async function bulkOp(body: Record<string, unknown>, applied: number): Promise<void> {
+	async function bulkOp(body: Record<string, unknown>, applied: number): Promise<boolean> {
 		const res = await fetch('/api/cells/bulk', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
@@ -2136,7 +2140,11 @@
 		}).catch(() => null);
 		const payload = res?.ok ? await res.json().catch(() => null) : null;
 		const acted = payload?.removed ?? payload?.moved ?? payload?.changed;
-		if (!Array.isArray(acted) || acted.length !== applied) await load();
+		if (!Array.isArray(acted) || acted.length !== applied) {
+			await load();
+			return false;
+		}
+		return true;
 	}
 
 	/** Delete every selected cell in one action (`dd` / the palette's Delete cell). */
@@ -2152,12 +2160,14 @@
 		if (ids.length >= cells.length) return;
 		const order = cellOrder;
 		const removed = new Set(ids);
-		pushUndo(
-			ids.flatMap((id) => {
-				const cell = findCell(id);
-				return cell ? [{ index: order.indexOf(id), ...snapshotCell(cell) }] : [];
-			})
-		);
+		// Snapshot BEFORE the cells leave the model - this is the only moment their
+		// live source and metadata are readable - but push the group only once the
+		// server confirms, because a refused batch refetches the cells back and a
+		// phantom group would make `z` re-insert copies of cells still present.
+		const group = ids.flatMap((id) => {
+			const cell = findCell(id);
+			return cell ? [{ index: order.indexOf(id), ...snapshotCell(cell) }] : [];
+		});
 		const nextActive = selectionAfterRemoval(order, removed);
 		const before = cells.length;
 		cells = cells.filter((c) => !removed.has(c.id));
@@ -2166,7 +2176,7 @@
 		if (runningId && removed.has(runningId)) runningId = null;
 		selectOnly(nextActive);
 		if (nextActive) await selectAndFocus(nextActive);
-		await bulkOp({ op: 'delete', ids }, applied);
+		if (await bulkOp({ op: 'delete', ids }, applied)) pushUndo(group);
 		scheduleStaleness();
 	}
 
@@ -2210,12 +2220,12 @@
 			return;
 		}
 		// A cell already of the target type is a no-op the server skips too
-		// (`setCellTypes` uses this same `logicalCellType` rule), so counting the ones
+		// (`setCellTypes` uses this same `isLogicalCellType` rule), so counting the ones
 		// that really change is what keeps that legitimate skip from reading as a
 		// refused batch.
 		const pending = ids.filter((id) => {
 			const cell = findCell(id);
-			return !!cell && logicalCellType(cell) !== cellType;
+			return !!cell && !isLogicalCellType(cell, cellType);
 		});
 		for (const id of pending) applyCellTypeLocally(id, cellType);
 		await bulkOp({ op: 'type', ids, cellType }, pending.length);

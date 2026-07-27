@@ -99,6 +99,29 @@ function makeNotebook(name: string, n: number): { nb: string; ids: string[] } {
 	return { nb, ids };
 }
 
+/**
+ * A notebook carrying an nbformat `raw` cell - which Cellar never authors, but an
+ * externally-authored `.ipynb` may, and `ipynb.ts` passes through unchanged.
+ */
+function makeRawNotebook(name: string): { nb: string; ids: string[] } {
+	const nb = join(WS, name);
+	writeFileSync(
+		nb,
+		JSON.stringify({
+			cells: [
+				{ cell_type: 'raw', source: ['raw text'], metadata: {}, id: 'rawcell' },
+				{ cell_type: 'code', source: ['a = 1'], metadata: {}, outputs: [], execution_count: null, id: 'codecell' }
+			],
+			metadata: {},
+			nbformat: 4,
+			nbformat_minor: 5
+		})
+	);
+	const ids = idsOf(nb);
+	seen = [];
+	return { nb, ids };
+}
+
 const sources = (nb: string) => nbmod.listCells(nb).map((c) => c.source);
 const idsOf = (nb: string) => nbmod.listCells(nb).map((c) => c.id);
 
@@ -168,6 +191,24 @@ describe('setCellTypes - bulk change type', () => {
 		expect(nbmod.listCells(nb)[0].metadata?.cellar?.language).toBeUndefined();
 	});
 
+	// A raw cell's LOGICAL type reads as 'code' (nbformat only defines
+	// code/markdown/raw and Cellar treats every non-markdown cell as code), so
+	// skipping on the logical type alone left it raw here while the single-cell
+	// setter - which has no "already" check at all - converted it. Both paths must
+	// answer the same, and the client predicts the batch's count from the same
+	// predicate, so a divergence here also reads as a refused batch.
+	it('converts an nbformat `raw` cell to code, exactly like the single-cell setter', () => {
+		const { nb, ids } = makeRawNotebook('bulk-type-raw.ipynb');
+		expect(nbmod.listCells(nb)[0].cell_type).toBe('raw');
+		expect(nbmod.setCellTypes([ids[0], ids[1]], 'code', nb)).toEqual([ids[0]]);
+		expect(nbmod.listCells(nb)[0].cell_type).toBe('code');
+		expect(seen.filter((e) => e.type === 'cell:type').map((e) => e.cellId)).toEqual([ids[0]]);
+
+		const single = makeRawNotebook('single-type-raw.ipynb');
+		nbmod.setCellType(single.ids[0], 'code', single.nb);
+		expect(nbmod.listCells(single.nb)[0].cell_type).toBe('code');
+	});
+
 	it('emits one ordinary `cell:type` per changed cell', () => {
 		const { nb, ids } = makeNotebook('bulk-type-events.ipynb', 3);
 		nbmod.setCellTypes([ids[0], ids[2]], 'markdown', nb);
@@ -235,5 +276,56 @@ describe('atomicity: one user action is one document write', () => {
 	it('a bulk move of a three-cell selection writes ONCE, however many swaps it takes', () => {
 		const { nb, ids } = makeNotebook('atomic-move.ipynb', 8);
 		expect(writeCount(() => nbmod.moveCells([ids[1], ids[3], ids[5]], 'down', nb))).toBe(1);
+	});
+});
+
+/**
+ * The route's own vocabulary. `dir` and `cellType` are validated rather than
+ * coerced because both ops rewrite and persist the user's `.ipynb`: a malformed
+ * request (a client bug, a hand-rolled call) must fail like `no-ids` /
+ * `unknown-op` instead of silently reordering or retyping cells.
+ */
+describe('POST /api/cells/bulk - argument validation', () => {
+	let POST: (evt: { request: Request }) => Promise<Response>;
+	beforeAll(async () => {
+		const mod = await import('../../src/routes/api/cells/bulk/+server.js');
+		POST = mod.POST as unknown as typeof POST;
+	});
+
+	function call(body: unknown): Promise<Response> {
+		return POST({ request: new Request('http://x/api/cells/bulk', { method: 'POST', body: JSON.stringify(body) }) });
+	}
+
+	it('refuses an out-of-vocabulary `dir` with 400 and touches nothing', async () => {
+		const { nb, ids } = makeNotebook('route-bad-dir.ipynb', 3);
+		const before = writes.length;
+		for (const dir of [undefined, 'sideways', 'UP', 1]) {
+			const res = await call({ op: 'move', ids, dir, nb });
+			expect(res.status).toBe(400);
+			expect(await res.json()).toEqual({ ok: false, reason: 'bad-dir' });
+		}
+		expect(writes.length).toBe(before);
+		expect(idsOf(nb)).toEqual(ids);
+	});
+
+	it('refuses an out-of-vocabulary `cellType` with 400 and touches nothing', async () => {
+		const { nb, ids } = makeNotebook('route-bad-type.ipynb', 3);
+		const before = writes.length;
+		for (const cellType of [undefined, 'raw', 'CODE', null]) {
+			const res = await call({ op: 'type', ids, cellType, nb });
+			expect(res.status).toBe(400);
+			expect(await res.json()).toEqual({ ok: false, reason: 'bad-cell-type' });
+		}
+		expect(writes.length).toBe(before);
+		expect(nbmod.listCells(nb).map((c) => c.cell_type)).toEqual(['code', 'code', 'code']);
+	});
+
+	it('still accepts every valid vocabulary word', async () => {
+		const { nb, ids } = makeNotebook('route-good.ipynb', 3);
+		expect((await (await call({ op: 'move', ids: [ids[0]], dir: 'down', nb })).json()).moved).toHaveLength(1);
+		expect((await (await call({ op: 'move', ids: [ids[0]], dir: 'up', nb })).json()).moved).toHaveLength(1);
+		for (const cellType of ['markdown', 'sql', 'code']) {
+			expect((await (await call({ op: 'type', ids: [ids[1]], cellType, nb })).json()).changed).toEqual([ids[1]]);
+		}
 	});
 });

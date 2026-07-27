@@ -86,6 +86,8 @@ async function clickCell(page: Page, id: string, modifiers: ('Shift' | 'Meta' | 
 }
 
 const selectedInDom = (page: Page) => page.locator('[data-testid="cell"][data-selected="true"]').count();
+const visibleCellIds = (page: Page) =>
+	page.locator('[data-testid="cell"]:visible').evaluateAll((els) => els.map((el) => (el as HTMLElement).dataset.cellId ?? ''));
 const spacers = (page: Page) => page.locator('[data-testid="cell-spacer"]').count();
 
 /** Open the notebook and wait for its cells, at the given windowing mode. */
@@ -319,4 +321,38 @@ test('Cmd/Ctrl+A selects fold-hidden cells too, so a collapsed section is never 
 	await page.waitForTimeout(1500);
 	expect(await serverOrder(page)).toEqual(cells.map((c) => c.id));
 	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length} selected`);
+});
+
+test('a REFUSED bulk delete leaves no undo group, so `z` cannot duplicate cells', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openNotebook(page, '0');
+	const before = await serverOrder(page);
+
+	// A batch the server declines is not an HTTP failure: `{ok:true}` with an empty
+	// `removed` is exactly what a refused delete looks like on the wire, and it is
+	// the shape the client must not record an undo group for - the refusal refetches
+	// the cells back, so a phantom group would make `z` re-insert copies of cells
+	// that are still there.
+	await page.route('**/api/cells/bulk', (route) => route.fulfill({ json: { ok: true, removed: [] } }));
+
+	// Started from a VISIBLE cell: fold state is per-project, so a section an
+	// earlier test in this file collapsed is still collapsed here, and a hidden
+	// cell has no box to click.
+	const start = (await visibleCellIds(page))[1];
+	await clickCell(page, start);
+	await page.keyboard.press('Shift+j');
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+	await page.keyboard.press('d');
+	await page.keyboard.press('d');
+
+	// The refusal's refetch puts the cells back on screen…
+	await expect(page.locator(`[data-cell-id="${start}"]`)).toBeVisible({ timeout: 20_000 });
+	expect(await serverOrder(page)).toEqual(before);
+
+	// …and `z` has nothing to undo, so the document is untouched rather than grown
+	// by three duplicates of cells that were never deleted.
+	await page.keyboard.press('z');
+	await page.waitForTimeout(1500);
+	expect(await serverOrder(page)).toEqual(before);
 });
