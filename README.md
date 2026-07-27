@@ -154,7 +154,7 @@ Your browser opens to a clean, empty workspace. Click **New notebook** (or open 
 Everything you'd expect from a notebook, plus the things that make sharing one with an agent feel natural:
 
 - **Code, Markdown, and SQL cells**, with a run queue, live run status, and staleness tracking so you always know what's fresh.
-- **TeX math in markdown**: `$…$` and `$$…$$` typeset with KaTeX in markdown cells and `.md` previews, just like Jupyter. Fonts and styles are bundled, so it works offline; a bad formula shows an inline error instead of blanking the cell. (Prices like `$5 and $10` stay prose, and the HTML export shows math as literal `$…$` text.)
+- **TeX math in markdown**: `$…$` and `$$…$$` typeset with KaTeX in markdown cells and `.md` previews, just like Jupyter. Fonts and styles are bundled, so it works offline; a bad formula shows an inline error instead of blanking the cell. (Prices like `$5 and $10` stay prose; an unfenced paragraph of `$ some-command` shell prompts does typeset, exactly as in Jupyter - put those in a code block. The HTML export shows math as literal `$…$` text.)
 - **Rich outputs**: matplotlib, Plotly, rich HTML, and images you can double-click to view at natural size.
 - **Interactive DataFrame grid**: pandas frames become a sortable, filterable, paginated table instead of a static repr.
 - **Run metadata** on every cell: when it last ran, how long it took, and who ran it (you or an agent).

@@ -53,7 +53,20 @@ const h = vi.hoisted(() => {
 		seq += 1;
 		const statusHandlers = new Set<(sender: unknown, status: string) => void>();
 		const kernel = {
-			id: `kernel-${seq}`,
+			// Collision-proof by construction, and that is load-bearing HERE in a way
+			// it is not in the other fake-kernel suites: this is the one file that
+			// asserts a broadcast did NOT happen. `kernel.ts`'s RSS poller maps an id
+			// back to a pid by looking for it ANYWHERE in a `ps` command line (a real
+			// id only ever appears in the `-f …/kernel-<id>.json` argument), so a short
+			// synthetic `kernel-1` is a SUBSTRING of any real Jupyter kernel whose UUID
+			// starts with a `1` — one running anywhere on the developer's machine, in
+			// any unrelated project. The poller then attributes that stranger's RSS to
+			// this fake kernel, sees it "change", and fires a stray `kernel:status`
+			// broadcast into whichever test window its async `ps` happens to land in —
+			// a failure that is invisible in isolation and depends on what else the
+			// machine is running. A token no connection file can contain removes the
+			// coupling entirely.
+			id: `cellar-faketest-${seq}-${Math.random().toString(36).slice(2)}`,
 			name: 'python3',
 			status: 'idle' as string,
 			commsOverSubshells: undefined as unknown,
