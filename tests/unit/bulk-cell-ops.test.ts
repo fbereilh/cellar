@@ -177,6 +177,73 @@ describe('deleteCells - bulk delete', () => {
 	});
 });
 
+/**
+ * The singular path is the plural one of size 1, so the invariant holds for EVERY
+ * caller. Guarding only the batch left the identical race open through `DELETE
+ * /api/cells/[id]`: the client's own count is stale while an agent's
+ * `cell:deleted` events are in flight, so a `dd` on what the browser thinks is one
+ * of several would remove the server's LAST cell.
+ */
+describe('deleteCell - the single-cell path shares the invariant', () => {
+	it('refuses the last cell - nothing removed, nothing written, no event', () => {
+		const { nb, ids } = makeNotebook('single-delete-last.ipynb', 1);
+		let res: ReturnType<typeof nbmod.deleteCell>;
+		const wrote = writeCount(() => {
+			res = nbmod.deleteCell(ids[0], nb);
+		});
+		expect(res!).toEqual({ ok: false, reason: 'would-empty-notebook' });
+		expect(wrote).toBe(0);
+		expect(idsOf(nb)).toEqual(ids);
+		expect(seen.filter((e) => e.type === 'cell:deleted')).toEqual([]);
+	});
+
+	it('still deletes down TO one cell, emitting the ordinary event', () => {
+		const { nb, ids } = makeNotebook('single-delete-boundary.ipynb', 2);
+		expect(nbmod.deleteCell(ids[0], nb)).toEqual({ ok: true, removed: [ids[0]] });
+		expect(idsOf(nb)).toEqual([ids[1]]);
+		expect(seen.filter((e) => e.type === 'cell:deleted').map((e) => e.cellId)).toEqual([ids[0]]);
+	});
+
+	it('ignores an unknown id rather than persisting a no-op write', () => {
+		const { nb, ids } = makeNotebook('single-delete-unknown.ipynb', 2);
+		let res: ReturnType<typeof nbmod.deleteCell>;
+		const wrote = writeCount(() => {
+			res = nbmod.deleteCell('nope', nb);
+		});
+		expect(res!).toEqual({ ok: true, removed: [] });
+		expect(wrote).toBe(0);
+		expect(idsOf(nb)).toEqual(ids);
+	});
+});
+
+describe('DELETE /api/cells/[id] - surfaces the refusal', () => {
+	let DELETE: (evt: { params: { id: string }; url: URL }) => Response;
+	beforeAll(async () => {
+		const mod = await import('../../src/routes/api/cells/[id]/+server.js');
+		DELETE = mod.DELETE as unknown as typeof DELETE;
+	});
+
+	function call(id: string, nb: string): Response {
+		return DELETE({ params: { id }, url: new URL(`http://x/api/cells/${id}?nb=${encodeURIComponent(nb)}`) });
+	}
+
+	it('refuses the last cell with a 400 in the same shape as the bulk route', async () => {
+		const { nb, ids } = makeNotebook('route-single-delete-last.ipynb', 1);
+		const before = writes.length;
+		const res = call(ids[0], nb);
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({ ok: false, reason: 'would-empty-notebook' });
+		expect(writes.length).toBe(before);
+		expect(idsOf(nb)).toEqual(ids);
+
+		// …and the boundary: deleting down TO one cell goes through.
+		const two = makeNotebook('route-single-delete-boundary.ipynb', 2);
+		const ok = call(two.ids[0], two.nb);
+		expect(ok.status).toBe(200);
+		expect(idsOf(two.nb)).toEqual([two.ids[1]]);
+	});
+});
+
 describe('setCellTypes - bulk change type', () => {
 	it('converts every addressed cell and clears the outputs of the ones going to markdown', () => {
 		const { nb, ids } = makeNotebook('bulk-type.ipynb', 4);

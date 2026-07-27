@@ -913,17 +913,7 @@ export function setCellTypes(
 	return changed.map((c) => c.id);
 }
 
-export function deleteCell(id: string, nb?: string | null, originId?: string | null): void {
-	const doc = docFor(nb);
-	const existed = doc.cells.some((c) => c.id === id);
-	doc.cells = doc.cells.filter((c) => c.id !== id);
-	persist(doc);
-	// A deleted cell must not later dequeue and run: drop any pending run for it.
-	cancelRun(doc.path, id);
-	if (existed) emit(doc, 'cell:deleted', { cellId: id }, originId);
-}
-
-/** A refused batch delete is distinguishable from one that simply matched
+/** A refused delete is distinguishable from one that simply matched
  *  nothing: the first is a request the document invariant rejected, the second
  *  is a no-op the caller can ignore. */
 export type DeleteCellsResult =
@@ -934,9 +924,9 @@ export type DeleteCellsResult =
  * Delete SEVERAL cells as ONE document write (the multi-cell selection's bulk
  * delete and the MCP `delete_cells` batch).
  *
- * Deliberately NOT a loop over `deleteCell`: that persists — a full serialize +
- * fsync + rename of the whole notebook — once per cell, and walks the `.ipynb`
- * through N-1 intermediate states a crash could freeze it in. One filter, one
+ * Deliberately NOT one persist per cell: a persist is a full serialize + fsync +
+ * rename of the whole notebook, and repeating it walks the `.ipynb` through N-1
+ * intermediate states a crash could freeze it in. One filter, one
  * persist, then one `cell:deleted` per removed cell, so every client applies the
  * same per-cell events it already handles and no new event shape exists.
  *
@@ -966,6 +956,19 @@ export function deleteCells(ids: readonly string[], nb?: string | null, originId
 		emit(doc, 'cell:deleted', { cellId: id }, originId);
 	}
 	return { ok: true, removed };
+}
+
+/**
+ * Delete ONE cell (`DELETE /api/cells/[id]`, the `dd`/cut path, consolidate's
+ * sweep) — a `deleteCells` of one, so the non-empty invariant has exactly ONE
+ * implementation and holds for EVERY caller. Enforcing it only on the batch path
+ * left the same race open through the singular route: the client's own
+ * `cells.length <= 1` check compares against ITS list, which is stale while an
+ * agent's `cell:deleted` events are in flight, so a `dd` on what the browser
+ * thinks is one of several would remove the server's LAST cell.
+ */
+export function deleteCell(id: string, nb?: string | null, originId?: string | null): DeleteCellsResult {
+	return deleteCells([id], nb, originId);
 }
 
 export function setSource(id: string, source: string, nb?: string | null, originId?: string | null): void {

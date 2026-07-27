@@ -317,14 +317,14 @@
 		// selection gesture. Accepted cost, deliberately: a right-click on an
 		// UNSELECTED cell no longer selects it first.
 		//
-		// Skipping the call is not enough - the browser focuses the card (it is
-		// `tabindex=-1`) on the press, and the `focusin` that follows collapses onto
-		// whatever it landed on. `preventDefault` is what stops the focus moving;
-		// `contextmenu` is dispatched independently, so the native menu still opens.
-		if (e.button !== 0) {
-			e.preventDefault();
-			return;
-		}
+		// The selection is preserved by NOT collapsing it, never by CANCELLING the
+		// press: `preventDefault` on `pointerdown` suppresses the compatibility mouse
+		// events, so a right-click inside a code cell would stop focusing its editor
+		// (the native menu's Cut/Copy/Paste then act on nothing) and X11 middle-click
+		// paste would stop working. The `focusin` a non-primary press may still trigger
+		// carries no modifiers and is tagged `fromFocus`, so it re-states the primary
+		// rather than rebuilding the selection.
+		if (e.button !== 0) return;
 		onActivate?.(cell.id);
 	}
 

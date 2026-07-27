@@ -1111,8 +1111,9 @@
 	 * The `fromFocus` guard is what makes the two events compose: a plain pointerdown
 	 * always collapses, but the `focusin` that FOLLOWS a gesture (or a keyboard
 	 * selection) carries no modifiers, and collapsing there would undo the range
-	 * built one event earlier. It only ever suppresses a re-statement of the primary
-	 * that is already primary; a plain click on any other cell still collapses.
+	 * built one event earlier. It only ever spares a cell the selection ALREADY
+	 * holds - the primary itself, or a member the focus promotes to primary; a plain
+	 * click on any other cell still collapses.
 	 */
 	async function activateCell(id: string, gesture: CellActivation = {}) {
 		if (gesture.extend || gesture.toggle) {
@@ -1134,7 +1135,20 @@
 			await scrollCellIntoView(next.activeId, (api) => api?.focusCell());
 			return;
 		}
-		if (gesture.fromFocus && activeId === id) return;
+		if (gesture.fromFocus) {
+			if (activeId === id) return;
+			// Focus landing on another MEMBER of the selection promotes it to primary and
+			// keeps the set. This is what preserves a multi-cell selection through a
+			// right/middle-click on one of its cells: that press is a context-menu gesture,
+			// not a selection gesture, so it never collapses - and the focus the browser
+			// then hands the card (it is `tabindex=-1`) must not collapse on its behalf.
+			// The anchor follows the primary, as it does when a toggle re-seats it.
+			if (selectedIds.size > 1 && selectedIds.has(id)) {
+				activeId = id;
+				anchorId = id;
+				return;
+			}
+		}
 		selectOnly(id);
 	}
 
@@ -2110,9 +2124,14 @@
 		const cell = cells[i];
 		// A notebook always keeps at least one cell - the same invariant the toolbar's
 		// delete button enforces by disabling itself at one cell - so there is always
-		// somewhere to type. `dd` and cut honor it rather than quietly diverging.
+		// somewhere to type. The ENFORCEMENT is the server's (`deleteCell` refuses),
+		// because only it knows the real cell count; this is the optimistic mirror.
 		if (!cell || cells.length <= 1) return;
-		pushUndo([{ index: i, ...snapshotCell(cell) }]);
+		// Snapshot BEFORE the cell leaves the model - the only moment its live source
+		// and metadata are readable - but push the group only once the server confirms,
+		// exactly as the bulk delete does: a refused delete refetches the cell back, and
+		// a phantom group would make `z` re-insert a cell that is still there.
+		const snapshot = [{ index: i, ...snapshotCell(cell) }];
 		cells = cells.filter((c) => c.id !== id);
 		setRawEdit(id, false);
 		// Keep a cell selected: command mode acts on the selection, so deleting the
@@ -2120,7 +2139,13 @@
 		// follows, because the delete button that had it is gone with the cell.
 		if (activeId === id) selectAfterRemoval(i, { focus: true });
 		else if (selectedIds.has(id)) pruneSelection(); // a per-cell delete of a member
-		await fetch(`/api/cells/${id}?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, { method: 'DELETE' });
+		const res = await fetch(`/api/cells/${id}?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, {
+			method: 'DELETE'
+		}).catch(() => null);
+		// A refused/failed delete published no `cell:deleted`, and this tab suppresses
+		// its own echo anyway, so nothing else would ever correct the divergence.
+		if (res?.ok) pushUndo(snapshot);
+		else await load();
 		scheduleStaleness();
 	}
 
@@ -2478,13 +2503,24 @@
 	 * select the heading but not its body, and `moveSelectionPlan` would then swap
 	 * each heading past the first cell of its own section - shuffling headings into
 	 * the sections they title. Selecting the section too moves it as a unit.
+	 *
+	 * The two ends are left spanning the whole document (anchor at the first cell,
+	 * head at the last), because `extendSelection` REBUILDS the selection as
+	 * `rangeIds(anchor, head)`: leaving the head wherever the primary happened to be
+	 * would make the very next Shift+J/K discard everything past it - 300 cells
+	 * collapsing to a handful on one keystroke. Moving the head moves DOM focus, so
+	 * it goes through the shared mount seam (the last cell is almost certainly
+	 * windowed out, and if a collapsed section hides it the reveal is what makes it a
+	 * cell Shift+J/K can walk from) and NOT `selectAndAct`, whose `setActive` would
+	 * collapse the selection this just built.
 	 */
-	function selectAllCells() {
+	async function selectAllCells() {
 		const order = cellOrder;
 		if (!order.length) return;
 		selectedIds = new Set(order);
 		anchorId = order[0];
-		if (!activeId || !selectedIds.has(activeId)) activeId = order[0];
+		activeId = order[order.length - 1];
+		await scrollCellIntoView(activeId, (api) => api?.focusCell());
 	}
 
 	// Fold/unfold act on the selected cell only when it is a markdown header, and

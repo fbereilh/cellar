@@ -27,7 +27,9 @@ import { setScrollTop, isCellMounted, mountedCellIds } from './notebook-scroll';
  *   E. Cmd/Ctrl+A selects the FULL document - fold-hidden cells included - so a
  *      collapsed section can never be left behind by the selection that moves it;
  *   F. toggling the primary OUT of a selection MOUNTS the survivor it hands primacy
- *      to, so focus follows the selection and the next keystroke still has a target.
+ *      to, so focus follows the selection and the next keystroke still has a target;
+ *   G. a right-click on a member keeps the selection WITHOUT cancelling the press,
+ *      and Cmd/Ctrl+A leaves the head at a real end so Shift+K shrinks by one.
  *
  * Every assertion about WHICH cells an op touched reads the SERVER document, not
  * the DOM: the DOM can only ever show the window, and "it looked right on screen"
@@ -331,6 +333,52 @@ test('Cmd/Ctrl+A selects fold-hidden cells too, so a collapsed section is never 
 	await page.waitForTimeout(1500);
 	expect(await serverOrder(page)).toEqual(cells.map((c) => c.id));
 	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length} selected`);
+});
+
+test('a right-click on a member keeps the selection without cancelling the press', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+	const mounted = await mountedCellIds(page);
+	await clickCell(page, mounted[1]);
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+
+	// A right-click is a context-menu gesture, not a selection gesture, so the set
+	// survives it - and the selection is preserved by NOT collapsing, never by
+	// `preventDefault`ing the press: cancelling `pointerdown` would also stop the
+	// press reaching the cell at all (an editor right-clicked for Cut/Copy/Paste
+	// would never take the caret). So focus still lands, and promotes this member.
+	const card = page.locator(`[data-cell-id="${mounted[2]}"]`);
+	const box = await card.boundingBox();
+	await card.click({ button: 'right', position: { x: Math.round(box!.width / 2), y: 14 } });
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+	await expect(card).toHaveAttribute('data-active', 'true');
+	expect(await page.evaluate((id) => document.activeElement?.closest('[data-cell-id]')?.getAttribute('data-cell-id') === id, mounted[2])).toBe(true);
+
+	await page.keyboard.press('Escape');
+});
+
+test('Cmd/Ctrl+A leaves the head at the last cell, so Shift+K shrinks by one', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+	const order = await serverOrder(page);
+	const last = order[order.length - 1];
+
+	await clickCell(page, (await mountedCellIds(page))[1]);
+	await page.keyboard.press(`${MOD}+a`);
+	await expect(page.getByTestId('selection-count')).toHaveText(`${order.length} selected`);
+	// The head really moved to the far end - and through the mount seam, so the last
+	// cell (a spacer a moment ago) has a node and DOM focus.
+	await expect.poll(() => isCellMounted(page, last), { timeout: 20_000 }).toBe(true);
+	await expect(page.locator(`[data-cell-id="${last}"]`)).toHaveAttribute('data-active', 'true');
+
+	// `extendSelection` rebuilds the range as anchor→head, so a head left mid-document
+	// would drop everything past it. One step back from a real end drops exactly one.
+	await page.keyboard.press('Shift+k');
+	await expect(page.getByTestId('selection-count')).toHaveText(`${order.length - 1} selected`);
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText(`${order.length} selected`);
+	await page.keyboard.press('Escape');
 });
 
 test('toggling the primary OUT mounts the survivor, so the keyboard still acts on it', async ({ page }) => {
