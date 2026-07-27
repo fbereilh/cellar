@@ -144,6 +144,40 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		category: 'Navigation',
 		description: 'Select the cell below'
 	},
+	// Multi-cell selection. The head moves one cell; the contiguous range from the
+	// anchor to the head becomes the selection ($lib/cellSelection). `Shift-j` /
+	// `Shift-k` shadow a typable character, but only in command mode - exactly where
+	// bare letters belong - so `typingHazards` correctly reports none.
+	{
+		id: 'extend-select-prev',
+		keys: ['Shift-ArrowUp', 'Shift-k'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Extend the selection to the cell above'
+	},
+	{
+		id: 'extend-select-next',
+		keys: ['Shift-ArrowDown', 'Shift-j'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Extend the selection to the cell below'
+	},
+	{
+		id: 'select-all-cells',
+		keys: ['Mod-a'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Select every cell'
+	},
+	{
+		// Command mode's Escape. `command-mode` also binds Escape but in EDIT mode, and
+		// two modes that cannot be active together cannot collide (`modesOverlap`).
+		id: 'clear-selection',
+		keys: ['Escape'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Collapse a multi-cell selection to the selected cell'
+	},
 	{
 		id: 'fold-section',
 		keys: ['ArrowLeft', 'h'],

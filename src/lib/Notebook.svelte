@@ -1,7 +1,7 @@
 <script lang="ts">
 	import Cell from '$lib/Cell.svelte';
 	import type { CellType, LogicalCellType } from '$lib/server/types';
-	import type { KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
+	import type { CellActivation, KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
 	import type { CellHighlight } from '$lib/searchHighlight';
@@ -17,6 +17,7 @@
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
 	const EMPTY_PLAN: PlanItem[] = [];
 	const EMPTY_IDS: string[] = [];
+	const EMPTY_SELECTION: ReadonlySet<string> = new Set();
 
 	interface Props {
 		cells: UICell[];
@@ -24,6 +25,15 @@
 		/** cell id → 1-based position in the kernel's global run queue */
 		queued?: Record<string, number>;
 		activeId?: string | null;
+		/**
+		 * The multi-cell selection, as document-model ids. Always contains `activeId`
+		 * (the primary), so a plain single selection is the degenerate one-element
+		 * case. Read per cell rather than pinned into the mounted set on purpose:
+		 * pinning a select-all would mount the whole notebook and undo windowing, so
+		 * a selected cell that is windowed out simply renders selected the moment it
+		 * scrolls back in. See `$lib/cellSelection`.
+		 */
+		selectedIds?: ReadonlySet<string>;
 		keyMode?: KeyMode;
 		/** cell id → staleness verdict ($lib/staleness) */
 		staleness?: Record<string, StalenessEntry>;
@@ -80,7 +90,7 @@
 		/** cell id → this markdown cell is open for raw source editing (runtime-only) */
 		rawEdits?: Record<string, boolean | undefined>;
 		onSetRawEdit?: (id: string, raw: boolean) => void;
-		onActivate?: (id: string) => void;
+		onActivate?: (id: string, gesture?: CellActivation) => void;
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		onEditorFocus?: (id: string) => void;
 		onEditorBlur?: (id: string) => void;
@@ -118,6 +128,7 @@
 		runningId,
 		queued = {},
 		activeId = null,
+		selectedIds = EMPTY_SELECTION,
 		keyMode = 'command',
 		staleness = {},
 		hidden = new Set(),
@@ -518,6 +529,7 @@
 			running={runningId === cell.id}
 			queuedPosition={queued[cell.id] ?? null}
 			active={activeId === cell.id}
+			selected={selectedIds.has(cell.id)}
 			{keyMode}
 			staleState={staleness[cell.id] ?? null}
 			dragging={dragId === cell.id}

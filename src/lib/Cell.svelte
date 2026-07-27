@@ -28,8 +28,9 @@
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
 	import { setSurfaceRanges, clearSurface, buildTextRanges, allocSurfaceKey } from '$lib/domHighlight';
+	import { isMac } from '$lib/shortcuts.svelte';
 	import type { CellOutput, CellType, LogicalCellType } from '$lib/server/types';
-	import type { KeyMode, UICell, SegHidden, CellRegisterApi } from '$lib/types';
+	import type { CellActivation, KeyMode, UICell, SegHidden, CellRegisterApi } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
@@ -42,6 +43,15 @@
 		/** 1-based place in the kernel's run queue, or null. */
 		queuedPosition?: number | null;
 		active?: boolean;
+		/**
+		 * This cell is part of the notebook's multi-cell selection. Distinct from
+		 * `active` (the ONE primary cell that holds focus and anchors a range): a
+		 * plain selection is `active && selected`, and a multi-selection is several
+		 * `selected` cells of which exactly one is also `active`. Derived from the
+		 * notebook's id set, so a cell windowing brought back into view renders
+		 * selected without remembering anything itself.
+		 */
+		selected?: boolean;
 		/** Notebook mode; only meaningful while `active`. */
 		keyMode?: KeyMode;
 		/** Staleness verdict ($lib/staleness), or null. */
@@ -85,7 +95,7 @@
 		 *  by the notebook, like `editorCollapsed`, so it survives a windowed unmount. */
 		rawEdit?: boolean;
 		onSetRawEdit?: (id: string, raw: boolean) => void;
-		onActivate?: (id: string) => void;
+		onActivate?: (id: string, gesture?: CellActivation) => void;
 		/** Find-in-page query (Search P4); empty when the find bar is closed / this
 		 *  notebook isn't the searched one. Non-empty drives in-place highlighting. */
 		searchQuery?: string;
@@ -112,6 +122,7 @@
 		running,
 		queuedPosition = null,
 		active = false,
+		selected = false,
 		keyMode = 'command',
 		staleState = null,
 		dragging = false,
@@ -262,6 +273,40 @@
 	const mode = $derived(
 		isMarkdown && !rawEdit && liveSource.trim().length > 0 ? 'rendered' : 'edit'
 	);
+
+	/**
+	 * The card's pointerdown: an ordinary click activates this cell, a MODIFIER
+	 * click is a multi-cell selection gesture (Shift = contiguous range from the
+	 * anchor, Cmd/Ctrl = toggle this cell in or out).
+	 *
+	 * A modifier gesture `preventDefault`s so the press never hands focus to the
+	 * editor - JupyterLab does the same, and without it a Shift+click anywhere in a
+	 * cell (which is mostly editor) would drop into edit mode and collapse the very
+	 * range it was asked for. The notebook focuses the resulting primary cell
+	 * itself, so the modal keyboard still has a focused target.
+	 *
+	 * Two deliberate exemptions keep the gesture from stealing a click that already
+	 * means something else: a control (button/link/field) keeps its own activation,
+	 * and a Shift+click inside an editor that ALREADY HAS THE CARET stays
+	 * CodeMirror's text-selection gesture. That second test asks the editor itself
+	 * (`view.hasFocus`) rather than the notebook's `keyMode`, which is a visual
+	 * mirror and can lag a focus change by an event.
+	 */
+	function onCardPointerDown(e: PointerEvent) {
+		const t = e.target as HTMLElement | null;
+		const extend = e.shiftKey;
+		const toggle = isMac ? e.metaKey : e.ctrlKey;
+		if (
+			(extend || toggle) &&
+			!t?.closest?.('button, a, input, select, textarea, [role="button"]') &&
+			!(view?.hasFocus && t?.closest?.('.cm-editor'))
+		) {
+			e.preventDefault();
+			onActivate?.(cell.id, { extend, toggle });
+			return;
+		}
+		onActivate?.(cell.id);
+	}
 
 	// Markdown is rendered through the shared authored-prose renderer in
 	// `$lib/markdown` (safe mode + DOMPurify, `$…$`/`$$…$$` math typeset), so cells
@@ -1301,17 +1346,20 @@
 			? 'border-warning/30'
 			: active
 				? 'border-primary/50 ring-1 ring-primary/40'
-				: 'border-base-300'} {dragging ? 'opacity-40' : ''}"
+				: selected
+					? 'border-primary/30'
+					: 'border-base-300'} {dragging ? 'opacity-40' : ''}"
 	data-testid="cell"
 	data-cell-id={cell.id}
 	data-cell-type={cell.cell_type}
 	data-active={active ? 'true' : undefined}
+	data-selected={selected ? 'true' : undefined}
 	data-running={showRunning ? 'true' : undefined}
 	data-queued={isQueued ? 'true' : undefined}
 	data-stale={isStale ? 'true' : undefined}
 	role="presentation"
-	onfocusin={() => onActivate?.(cell.id)}
-	onpointerdown={() => onActivate?.(cell.id)}
+	onfocusin={() => onActivate?.(cell.id, { fromFocus: true })}
+	onpointerdown={onCardPointerDown}
 >
 	<!-- Left accent bar (VS Code / Jupyter style); no layout shift. The running
 	     accent deliberately outranks the selection accent and uses `warning` (the
@@ -1320,12 +1368,22 @@
 	     queued cell gets the same hue at a fraction of the opacity and without the
 	     pulse: same story ("the kernel"), lower voice. All three are daisyUI
 	     semantic tokens, so light and dark themes stay coherent for free. -->
+	<!-- A cell in the multi-selection that is NOT the primary keeps the same accent
+	     rail, in the same hue, at reduced voice - so a contiguous block reads as one
+	     continuous rail with the primary brightest inside it, and scattered members
+	     each read as part of the same selection. It deliberately gets NO ring: the
+	     ring is what makes a card "pop", so reserving it for the primary is what
+	     keeps "the one cell I am acting through" distinguishable from "also in the
+	     set" at a glance. Same `primary` vocabulary throughout, never a new colour -
+	     the only thing being said here is "also selected". -->
 	{#if showRunning}
 		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 animate-pulse bg-warning" data-testid="running-bar"></div>
 	{:else if isQueued}
 		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 bg-warning/50" data-testid="queued-bar"></div>
 	{:else if active}
 		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 bg-primary" data-testid="active-bar"></div>
+	{:else if selected}
+		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 bg-primary/55" data-testid="selected-bar"></div>
 	{/if}
 	<div class="card-body gap-0 p-0">
 		<!-- Cell toolbar -->

@@ -139,6 +139,16 @@
 	function handleRunStateChange(path: string, runningId: string | null, queued: Record<string, number>) {
 		notebooksRunState[path] = { runningId, queued };
 	}
+	// How many cells each open notebook has selected. The footer reports the ACTIVE
+	// notebook's, because that is the one place a multi-cell selection stays legible:
+	// the selection reaches past the viewport (windowing means most of its members
+	// may have no DOM at all), so the per-cell accent rails alone cannot say how big
+	// it is, and anything rendered inside the notebook scrolls away with it. Assign
+	// into the key rather than rebuilding the map, like `notebooksRunState`.
+	let notebooksSelection = $state<Record<string, number>>({});
+	function handleSelectionChange(path: string, count: number) {
+		notebooksSelection[path] = count;
+	}
 	// Imperative, not reactive: a plain map of path → the notebook's fold API
 	// ({toggle, collapseAll, expandAll}). The Outline drives every fold through this.
 	const foldTogglers = new Map<string, FoldRegistryHandle>();
@@ -389,6 +399,8 @@
 					: null
 	);
 	const activeCells = $derived((activeNotebookPath && notebooksCells[activeNotebookPath]) || []);
+	/** The active notebook's multi-cell selection size (1 = an ordinary single selection). */
+	const activeSelectionCount = $derived((activeNotebookPath && notebooksSelection[activeNotebookPath]) || 0);
 	// The active notebook's search-text cache (registered by its LiveNotebook),
 	// handed to the sidebar Search so it runs the shared engine over it.
 	const activeSearchCache = $derived(
@@ -1459,6 +1471,7 @@
 						onNumberingChange={handleNumberingChange}
 						onHideAllCodeChange={handleHideAllCodeChange}
 						onRunStateChange={handleRunStateChange}
+						onSelectionChange={handleSelectionChange}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
@@ -1485,6 +1498,7 @@
 						onNumberingChange={handleNumberingChange}
 						onHideAllCodeChange={handleHideAllCodeChange}
 						onRunStateChange={handleRunStateChange}
+						onSelectionChange={handleSelectionChange}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
@@ -1592,7 +1606,19 @@
 			</span>
 		{/if}
 
-		<span class="font-mono">{activeCells.length} cells</span>
+		<!-- Notebook counts, grouped at the right end: the multi-cell selection size
+		     (only while there IS one) beside the cell count it is a fraction of. The
+		     footer is where it belongs because a selection can reach far past the
+		     viewport - under windowing most of its cells may have no DOM at all -
+		     so anything rendered inside the notebook scrolls away from it. -->
+		<div class="flex shrink-0 items-center gap-3">
+			{#if activeSelectionCount > 1}
+				<span class="font-mono text-primary" data-testid="selection-count" aria-live="polite">
+					{activeSelectionCount} selected
+				</span>
+			{/if}
+			<span class="font-mono">{activeCells.length} cells</span>
+		</div>
 	</footer>
 </div>
 

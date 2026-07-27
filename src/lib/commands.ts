@@ -111,6 +111,14 @@ export function buildCommands({ notebook, app }: CommandContext): PaletteCommand
 		nb('delete-cell', 'Delete cell', 'Cells'),
 		nb('undo-delete', 'Undo cell delete', 'Cells'),
 
+		// ---- Selection -------------------------------------------------------
+		// The bulk ops above (delete / move / change type) already act on the whole
+		// selection, so these are the palette's way to BUILD one without the mouse.
+		nb('extend-select-prev', 'Extend selection to the cell above', 'Selection'),
+		nb('extend-select-next', 'Extend selection to the cell below', 'Selection'),
+		nb('select-all-cells', 'Select all cells', 'Selection'),
+		nb('clear-selection', 'Clear the multi-cell selection', 'Selection'),
+
 		// ---- View ------------------------------------------------------------
 		nb('fold-section', 'Collapse heading section', 'View'),
 		nb('unfold-section', 'Expand heading section', 'View'),

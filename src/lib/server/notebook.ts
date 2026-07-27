@@ -26,6 +26,7 @@ import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
+import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, type ExportResult } from './export-py';
 import { SQL_LANGUAGE } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
@@ -843,6 +844,18 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return;
+	applyCellType(cell, cellType);
+	persist(doc);
+	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: cellType === 'sql' ? SQL_LANGUAGE : null }, originId);
+}
+
+/**
+ * The in-place half of a type switch, shared by the single-cell setter and the
+ * `setCellTypes` batch so the two can never diverge on the metadata rules
+ * (markdown clears outputs; markdown/SQL drop the imports role and the export
+ * flag, neither of which a non-Python cell may hold).
+ */
+function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	const isSql = cellType === 'sql';
 	cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
 	cell.metadata = cell.metadata ?? {};
@@ -858,8 +871,46 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
 	if ((cell.cell_type === 'markdown' || isSql) && cell.metadata.cellar.export) {
 		delete cell.metadata.cellar.export;
 	}
+}
+
+/**
+ * Switch SEVERAL cells' logical type as ONE document write (the multi-cell
+ * selection's bulk change-type).
+ *
+ * Deliberately NOT a loop over `setCellType`, for `deleteCells`' reason: that
+ * serializes + fsyncs + renames the whole notebook once per cell and walks the
+ * `.ipynb` through N-1 intermediate states. One pass, one persist, then one
+ * `cell:type` per changed cell - the event every client already applies, so the
+ * batch needs no new event shape.
+ *
+ * Returns the ids actually changed (a cell already of that type is skipped, so a
+ * no-op batch persists nothing).
+ */
+export function setCellTypes(
+	ids: readonly string[],
+	cellType: LogicalCellType,
+	nb?: string | null,
+	originId?: string | null
+): string[] {
+	const doc = docFor(nb);
+	const isSql = cellType === 'sql';
+	const changed: Cell[] = [];
+	for (const id of ids) {
+		const cell = find(doc, id);
+		if (!cell) continue;
+		const already =
+			cell.cell_type === (cellType === 'markdown' ? 'markdown' : 'code') &&
+			(cell.metadata?.cellar?.language === SQL_LANGUAGE) === isSql;
+		if (already) continue;
+		applyCellType(cell, cellType);
+		changed.push(cell);
+	}
+	if (!changed.length) return [];
 	persist(doc);
-	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: isSql ? SQL_LANGUAGE : null }, originId);
+	for (const cell of changed) {
+		emit(doc, 'cell:type', { cellId: cell.id, cell_type: cell.cell_type, language: isSql ? SQL_LANGUAGE : null }, originId);
+	}
+	return changed.map((c) => c.id);
 }
 
 export function deleteCell(id: string, nb?: string | null, originId?: string | null): void {
@@ -1074,4 +1125,46 @@ export function moveCell(id: string, dir: 'up' | 'down', nb?: string | null, ori
 	[doc.cells[i], doc.cells[j]] = [doc.cells[j], doc.cells[i]];
 	persist(doc);
 	emit(doc, 'cell:moved', { cellId: id, toIndex: j }, originId);
+}
+
+/**
+ * Move a whole SELECTION one step `dir`, as ONE document write.
+ *
+ * The plan comes from `$lib/cellSelection`'s `moveSelectionPlan` - the same pure
+ * function the browser runs optimistically - so the client's rendering and the
+ * persisted document are decided by one rule, not two. Each step is an adjacent
+ * swap, emitted as the ordinary `cell:moved` event, so replaying the steps in
+ * order reproduces the result on every other tab with no new event shape.
+ *
+ * The move is all-or-nothing: a step `clampMoveIndex` refuses (the seam reserved
+ * for a positional rule; identity today) abandons the WHOLE plan rather than
+ * leaving the selection half-slid past itself. Returns the steps applied.
+ */
+export function moveCells(
+	ids: readonly string[],
+	dir: 'up' | 'down',
+	nb?: string | null,
+	originId?: string | null
+): { cellId: string; toIndex: number }[] {
+	const doc = docFor(nb);
+	const order = doc.cells.map((c) => c.id);
+	const selected = new Set(ids.filter((id) => order.includes(id)));
+	const steps = moveSelectionPlan(order, selected, dir);
+	if (!steps.length) return [];
+	// Work on a copy so a refused step abandons the plan with the live document
+	// (and the file it is about to be persisted to) completely untouched.
+	const next = [...doc.cells];
+	const applied: { cellId: string; toIndex: number }[] = [];
+	for (const step of steps) {
+		const from = next.findIndex((c) => c.id === step.id);
+		if (from < 0) return []; // cannot happen (ids were filtered against the doc)
+		if (clampMoveIndex(next, from, step.toIndex) !== step.toIndex) return [];
+		const [cell] = next.splice(from, 1);
+		next.splice(step.toIndex, 0, cell);
+		applied.push({ cellId: step.id, toIndex: step.toIndex });
+	}
+	doc.cells = next;
+	persist(doc);
+	for (const move of applied) emit(doc, 'cell:moved', move, originId);
+	return applied;
 }
