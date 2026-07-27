@@ -319,6 +319,14 @@ spec files at a time. Install its browser once with `npx playwright install chro
   (`<script src="report_files/x.js">`) cannot load them, so the page renders without
   them. Re-export the file self-contained (e.g. plotly's `include_plotlyjs=True`,
   bokeh's `INLINE`, `jupyter nbconvert --embed-images`) and it renders in full.
+- **A wide HTML table output has its own sideways scrollbar** - rich `text/html`
+  output (a pandas `Styler`, a table from `IPython.display.HTML`) gets comfortable
+  padding and alignment by default, and a table too wide for the output area
+  overflows into that output's own horizontal scroll instead of being squeezed.
+  Text columns still wrap, and the notebook page itself never scrolls sideways.
+  Anything you style yourself (`set_table_styles`, `set_properties`, an inline
+  `style`) overrides those defaults, so you keep full control of a table you have
+  styled.
 - **A long notebook keeps only its visible cells in the page** - by default Cellar
   renders the cells near the viewport and collapses the rest into a placeholder of
   the same height, so a several-hundred-cell notebook opens and scrolls like a short

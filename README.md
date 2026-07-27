@@ -155,7 +155,7 @@ Everything you'd expect from a notebook, plus the things that make sharing one w
 
 - **Code, Markdown, and SQL cells**, with a run queue, live run status, and staleness tracking so you always know what's fresh.
 - **TeX math in markdown**: `$…$` and `$$…$$` typeset with KaTeX in markdown cells and `.md` previews, just like Jupyter. Fonts and styles are bundled, so it works offline; a bad formula shows an inline error instead of blanking the cell. (Prices like `$5 and $10` stay prose; an unfenced paragraph of `$ some-command` shell prompts does typeset, exactly as in Jupyter - put those in a code block. The HTML export shows math as literal `$…$` text.)
-- **Rich outputs**: matplotlib, Plotly, rich HTML, and images you can double-click to view at natural size.
+- **Rich outputs**: matplotlib, Plotly, rich HTML, and images you can double-click to view at natural size. HTML tables - a pandas `Styler`, or any table you render with `IPython.display.HTML` - get comfortable padding and alignment out of the box, so you don't need a `set_table_styles` helper on every table; anything you style yourself still wins.
 - **Interactive DataFrame grid**: pandas frames become a sortable, filterable, paginated table instead of a static repr.
 - **Run metadata** on every cell: when it last ran, how long it took, and who ran it (you or an agent).
 - **Checkpoints and undo** for agent actions - snapshot before a risky change and roll back.
