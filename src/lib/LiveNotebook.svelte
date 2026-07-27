@@ -5,11 +5,10 @@
 	import { cellIdOfKey, computeFolding, computeHeadingNumbers, foldSignature, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
-	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
+	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
 	import { isLogicalCellType } from '$lib/cellLanguage';
 	import {
 		applyGesture,
-		applyMovePlan,
 		extendSelection,
 		moveSelectionPlan,
 		orderedSelection,
@@ -1115,13 +1114,24 @@
 	 * built one event earlier. It only ever suppresses a re-statement of the primary
 	 * that is already primary; a plain click on any other cell still collapses.
 	 */
-	function activateCell(id: string, gesture: CellActivation = {}) {
+	async function activateCell(id: string, gesture: CellActivation = {}) {
 		if (gesture.extend || gesture.toggle) {
 			const next = applyGesture(cellOrder, { activeId, anchorId, selected: selectedIds }, id, gesture);
+			// Assigned SYNCHRONOUSLY, before the mount seam is awaited: the `focusin`
+			// that follows this pointerdown must already see the new primary, or its
+			// `fromFocus` guard won't recognize a re-statement and would collapse the
+			// selection this gesture just built.
 			activeId = next.activeId;
 			anchorId = next.anchorId;
 			selectedIds = next.selected;
-			apiOf(next.activeId)?.focusCell();
+			// Through the shared mount seam, like `extendSelectionBy`, and for the same
+			// two reasons: toggling the primary OUT hands primacy to a survivor that
+			// windowing may have left with no DOM node and no registered API (focus
+			// would go nowhere, and with it the modal keyboard, which reads a
+			// keystroke's mode and target off the focused element); and it must NOT be
+			// `selectAndAct`, whose `setActive` would collapse the very selection this
+			// gesture produced.
+			await scrollCellIntoView(next.activeId, (api) => api?.focusCell());
 			return;
 		}
 		if (gesture.fromFocus && activeId === id) return;
@@ -1796,10 +1806,20 @@
 		// 'sql' is a code cell tagged cellar.language='sql' ($lib/cellLanguage.js);
 		// 'code' clears that tag. Reassign metadata (the cell may have had no cellar
 		// namespace) so the SQL/Python grammar switch in Cell.svelte reacts.
+		const isSql = cellType === 'sql';
 		cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
 		const cellar = { ...(cell.metadata?.cellar ?? {}) };
-		if (cellType === 'sql') cellar.language = 'sql';
+		if (isSql) cellar.language = 'sql';
 		else delete cellar.language;
+		// The same two drops the server's `applyCellType` makes - neither the imports
+		// role nor the export flag may sit on a non-Python cell - mirrored here for the
+		// `clampMoveIndex` reason: `cell:type` carries no metadata, so a client half
+		// that skipped them would keep drawing the imports/export badge over a cell the
+		// server has already stripped, with no event able to correct it before reload.
+		if (cell.cell_type === 'markdown' || isSql) {
+			if (cellar.role === IMPORTS_ROLE) delete cellar.role;
+			if (cellar.export) delete cellar.export;
+		}
 		cell.metadata = { ...(cell.metadata ?? {}), cellar };
 		if (cell.cell_type === 'markdown') cell.outputs = [];
 	}
@@ -1951,6 +1971,7 @@
 	 */
 	type DeletedGroup = (ClipboardCell & { index: number })[];
 	let deletedCells: DeletedGroup[] = [];
+	let undoInFlight = false;
 	function pushUndo(group: DeletedGroup) {
 		if (!group.length) return;
 		deletedCells.push(group);
@@ -2038,21 +2059,29 @@
 	}
 
 	async function undoDelete() {
+		// The group leaves the stack only once every cell is back (an insert can
+		// reject, and discarding it first would leave the notebook half-restored with
+		// the only description of what was deleted already thrown away), so it stays
+		// visible for the whole multi-fetch window - and a second `z`, or plain key
+		// auto-repeat, would otherwise read the SAME group and restore it twice,
+		// persisting duplicates. One restore at a time closes that without giving the
+		// record-survives-a-failure property back.
+		if (undoInFlight) return;
 		const group = deletedCells.at(-1);
 		if (!group?.length) return;
+		undoInFlight = true;
 		const restored: string[] = [];
-		// The record is popped only once every cell is back. An insert can reject
-		// (the request fails, the notebook is gone), and discarding the group first
-		// would leave the notebook partially restored with the only description of
-		// what was deleted already thrown away - so `z` again could not finish the
-		// job. Restoring twice is recoverable; losing the record is not.
-		for (const record of [...group].sort((a, b) => a.index - b.index)) {
-			restored.push((await insertCellAt(record.index, record)).id);
+		try {
+			for (const record of [...group].sort((a, b) => a.index - b.index)) {
+				restored.push((await insertCellAt(record.index, record)).id);
+			}
+			// Dropped by identity, not by position: a delete landing while the restore
+			// awaited has pushed a newer group on top, and popping would discard THAT.
+			const at = deletedCells.indexOf(group);
+			if (at >= 0) deletedCells.splice(at, 1);
+		} finally {
+			undoInFlight = false;
 		}
-		// Dropped by identity, not by position: a delete landing while the restore
-		// awaited has pushed a newer group on top, and popping would discard THAT.
-		const at = deletedCells.indexOf(group);
-		if (at >= 0) deletedCells.splice(at, 1);
 		// Restore the SELECTION too, not just the cells: undoing a bulk delete should
 		// hand back the state the delete was issued from, so the next action can act
 		// on the same set.

@@ -25,7 +25,9 @@ import { setScrollTop, isCellMounted, mountedCellIds } from './notebook-scroll';
  *   D. Shift+J extends, a bulk move carries the block and keeps it selected, and a
  *      plain click / Escape collapses back to one cell;
  *   E. Cmd/Ctrl+A selects the FULL document - fold-hidden cells included - so a
- *      collapsed section can never be left behind by the selection that moves it.
+ *      collapsed section can never be left behind by the selection that moves it;
+ *   F. toggling the primary OUT of a selection MOUNTS the survivor it hands primacy
+ *      to, so focus follows the selection and the next keystroke still has a target.
  *
  * Every assertion about WHICH cells an op touched reads the SERVER document, not
  * the DOM: the DOM can only ever show the window, and "it looked right on screen"
@@ -321,6 +323,91 @@ test('Cmd/Ctrl+A selects fold-hidden cells too, so a collapsed section is never 
 	await page.waitForTimeout(1500);
 	expect(await serverOrder(page)).toEqual(cells.map((c) => c.id));
 	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length} selected`);
+});
+
+test('toggling the primary OUT mounts the survivor, so the keyboard still acts on it', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+	const order = await serverOrder(page);
+
+	// The survivor-to-be, selected at the top of the notebook.
+	const survivor = (await mountedCellIds(page))[1];
+	await clickCell(page, survivor);
+
+	// Scroll far away and add a cell down here. The survivor stops being the primary
+	// at that moment, so it loses its pin and windowing drops its DOM node.
+	await setScrollTop(page, 14_000);
+	await page.waitForTimeout(400);
+	const mountedBelow = await mountedCellIds(page);
+	const primary = mountedBelow[Math.floor(mountedBelow.length / 2)];
+	await clickCell(page, primary, [MOD]);
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+	await expect.poll(() => isCellMounted(page, survivor), { timeout: 5_000 }).toBe(false);
+
+	// Toggling the primary back OUT hands primacy to that windowed-out survivor. It
+	// must be MOUNTED before focus lands on it: the dispatcher reads a keystroke's
+	// mode and target off the focused element, so a primary with no node would leave
+	// the next key acting on nothing.
+	await clickCell(page, primary, [MOD]);
+	await expect(page.getByTestId('selection-count')).toHaveCount(0);
+	await expect.poll(() => isCellMounted(page, survivor), { timeout: 10_000 }).toBe(true);
+	await expect(page.locator(`[data-cell-id="${survivor}"]`)).toHaveAttribute('data-active', 'true');
+	// Focus is the assertion with teeth: becoming the primary pins the survivor, so
+	// it would mount either way - but focus can only land on it if the mount ran
+	// FIRST, since an unmounted cell has registered no API to focus through.
+	await expect
+		.poll(
+			() =>
+				page.evaluate(
+					(id) => document.activeElement?.closest('[data-testid="cell"]')?.getAttribute('data-cell-id') ?? null,
+					survivor
+				),
+			{ timeout: 10_000 }
+		)
+		.toBe(survivor);
+
+	// And the consequence: a command-mode key acts on the survivor, asserted against
+	// the SERVER document.
+	await page.keyboard.press('d');
+	await page.keyboard.press('d');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(order.length - 1);
+	expect(await serverOrder(page)).toEqual(order.filter((id) => id !== survivor));
+});
+
+test('a second `z` during a restore does not replay the same undo group', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openNotebook(page, '0');
+	const before = await serverOrder(page);
+
+	const start = (await visibleCellIds(page))[1];
+	await clickCell(page, start);
+	await page.keyboard.press('Shift+j');
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+	await page.keyboard.press('d');
+	await page.keyboard.press('d');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(before.length - 3);
+
+	// A restore is one insert per cell, and the group leaves the stack only once the
+	// last one lands - so it is still readable for the whole window. Slowing the
+	// inserts widens that window to something a test can aim at; a second `z` (or
+	// plain key auto-repeat) landing inside it must not restore the group twice.
+	await page.route('**/api/cells', async (route) => {
+		if (route.request().method() !== 'POST') return route.fallback();
+		await new Promise((r) => setTimeout(r, 800));
+		return route.continue();
+	});
+	await page.keyboard.press('z');
+	await page.waitForTimeout(300);
+	await page.keyboard.press('z');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 30_000 }).toBe(before.length);
+	await page.unroute('**/api/cells');
+
+	// Restored ONCE: the three cells are back, with no duplicates persisted.
+	await page.waitForTimeout(1500);
+	const after = await serverOrder(page);
+	expect(after).toHaveLength(before.length);
+	expect(new Set(after).size).toBe(after.length);
 });
 
 test('a REFUSED bulk delete leaves no undo group, so `z` cannot duplicate cells', async ({ page }) => {
