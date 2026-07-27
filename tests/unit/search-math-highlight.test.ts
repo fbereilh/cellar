@@ -40,7 +40,7 @@ function pipeline(source: string, query: string) {
 	const activeRange = (i: number) => {
 		const active = buildCellHighlights(matches, i).get('c1')?.active;
 		if (!active) return undefined;
-		return { field: active.field, range: ranges[active.ordinal] };
+		return { field: active.field, ordinal: active.ordinal, range: ranges[active.ordinal] };
 	};
 	return { matches, host, ranges, activeRange };
 }
@@ -191,6 +191,20 @@ describe('delimiter reconstruction', () => {
 		expect(contextFrom(activeRange(2)!.range!)).toBe('$5 total'); // the prose price
 	});
 
+	it('keeps the delimiters (and nothing else) when a `.katex` subtree has no `<annotation>`', () => {
+		// Unreachable through the real engine (KaTeX's default `output:'htmlAndMathml'`
+		// always emits the annotation and the sanitizer keeps it), so it is built by
+		// hand: what is pinned is that the glyphs are NEVER substituted for the source.
+		// `$\alpha$` renders "α", a different string, so contributing it would slide
+		// every later ordinal - the exact bug this module exists to prevent.
+		const host = document.createElement('div');
+		host.innerHTML =
+			'before <span class="katex"><span class="katex-html">α</span></span> after';
+		expect(buildTextRanges(host, 'α', OPTS, findOccurrences)).toHaveLength(0);
+		// The delimiters alone remain - a known, bounded length, not a wrong string.
+		expect(buildTextRanges(host, '$', OPTS, findOccurrences)).toHaveLength(2);
+	});
+
 	it('drops the backticks of the ``$`x`$`` form, because the model drops them too', () => {
 		// `strippedMarkdown` strips code-span backticks, so the model's text for this
 		// source is `$a+b$` - reconstructing them here would ADD occurrences the model
@@ -207,5 +221,44 @@ describe('delimiter reconstruction', () => {
 		expect(ranges).toHaveLength(2);
 		expect(activeRange(0)!.range).toBeNull(); // the `a` inside the math
 		expect(contextFrom(activeRange(1)!.range!)).toBe('after');
+	});
+});
+
+// These pin a DOCUMENTED, knowingly-imperfect narrowing (the third one enumerated on
+// `buildTextRanges`), NOT desired behavior - do not "fix" them to match an intuition
+// about what they ought to do. `strippedMarkdown` collapses `_x_` / `*x*` / `~~x~~`
+// pairs across the WHOLE source, math included, while `mathSourceText` reconstructs
+// the annotation TeX verbatim, so a query matching a bare emphasis character sees a
+// different occurrence COUNT on each side. Accepted because `strippedMarkdown` is the
+// search engine's cached hot path and is deliberately math-unaware, and because
+// emphasis-collapsing the TeX instead would be wrong (`x_1` is a subscript). The value
+// here is that these fail loudly if the divergence ever widens.
+describe('KNOWN NARROWING: emphasis characters inside math (documented, not desired)', () => {
+	const SRC = 'Use $x_1$ and $y_1$; snake_case names.';
+
+	it('drops the visible occurrence: the model counts one `_`, the DOM walk three', () => {
+		const { matches, ranges, activeRange } = pipeline(SRC, '_');
+		// The model's rendered-markdown text is `Use $x1$ and $y1$; snake_case names.` -
+		// the two subscript underscores were collapsed as an emphasis pair.
+		expect(matches.filter((m) => m.field === 'markdown')).toHaveLength(1);
+		// The walk rebuilt `$x_1$` / `$y_1$` verbatim, so it sees three.
+		expect(ranges).toHaveLength(3);
+		expect(ranges.map((r) => r && r.toString())).toEqual([null, null, '_']);
+		// So the single markdown match sits at ordinal 0 = a math hole, and the one
+		// paintable occurrence (`snake_case`, at ordinal 2) is never emphasized.
+		const md = matches.findIndex((m) => m.field === 'markdown');
+		expect(activeRange(md)!.ordinal).toBe(0);
+		expect(activeRange(md)!.range).toBeNull();
+	});
+
+	it('shifts the prose ordinal in the mirror case: two model matches, one DOM occurrence', () => {
+		// `$x_1$` strips to `$x1$`, so the model counts it as a second `x1` match while
+		// the walk's verbatim `$x_1$` holds none - the prose match lands out of range.
+		const { matches, ranges, activeRange } = pipeline('Use $x_1$ and $y_1$ then x1 here.', 'x1');
+		expect(matches).toHaveLength(2);
+		expect(ranges).toHaveLength(1);
+		expect(ranges[0]!.toString()).toBe('x1');
+		expect(activeRange(1)!.ordinal).toBe(1);
+		expect(activeRange(1)!.range).toBeUndefined();
 	});
 });

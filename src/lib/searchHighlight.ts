@@ -182,7 +182,8 @@ export interface SearchHighlightState {
  * returns a positional `null` for it rather than dropping it, so this ordinal keeps
  * pointing at the same occurrence either way. The correspondence is exact up to
  * `strippedMarkdown`'s own light syntax stripping (`$lib/search`), which the model
- * applies to the whole source, math included.
+ * applies to the whole source, math included - `buildTextRanges` enumerates the three
+ * narrowings that follow from that.
  */
 export function buildCellHighlights(
 	matches: readonly Match[],

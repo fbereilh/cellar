@@ -164,13 +164,21 @@ function mathSourceText(el: Element): string {
 	// `.katex` (typeset): the `<annotation>` carries the source TeX verbatim.
 	// `.katex-error`: the source TeX is the visible text on KaTeX's own node and the
 	// `title` on the plugin's - see {@link isKatexNativeError}.
+	//
+	// A `.katex` subtree with NO `<annotation>` contributes the DELIMITERS ALONE - a
+	// known, bounded length change - and emphatically NOT the `.katex-html` glyphs:
+	// those are a different string from the source (`$\alpha$` renders "α"), so
+	// substituting them is exactly the silent ordinal shift this whole helper exists to
+	// prevent. Unreachable today, and reachable only by a deliberate config change:
+	// KaTeX's default `output:'htmlAndMathml'` always emits the annotation, and
+	// `MARKDOWN_SANITIZE_CONFIG`'s `ADD_TAGS` is what keeps it through DOMPurify - so
+	// setting `output:'html'`/`'mathml'` in `MATH_OPTIONS`, or dropping `annotation`
+	// from that allowlist, lands here (both in `$lib/markdown`).
 	const tex = el.classList.contains('katex-error')
 		? isKatexNativeError(el)
 			? (el.textContent ?? '')
 			: (el.getAttribute('title') ?? '')
-		: (el.querySelector('annotation')?.textContent ??
-			el.querySelector('.katex-html')?.textContent ??
-			'');
+		: (el.querySelector('annotation')?.textContent ?? '');
 	return delim + tex + delim;
 }
 
@@ -191,11 +199,25 @@ function mathSourceText(el: Element): string {
  * What the math substitution has to preserve is the SEQUENCE of occurrences, not the
  * region's length: a reconstruction the query never matches inside costs nothing,
  * while one that yields a different NUMBER of matches than the model's own text does
- * slides every later ordinal. Two accepted narrowings, both of which change lengths
- * only: the plugin's `` $`x`$ `` form reconstructs WITHOUT the backticks, which is
- * right because `strippedMarkdown` strips code-span backticks from the model too; and
- * a fenced `$$`-on-its-own-line block loses the newline after the opening delimiter
- * (markdown-it does not keep it), so only a query spanning that newline is affected.
+ * slides every later ordinal. Two accepted narrowings change lengths only: the
+ * plugin's `` $`x`$ `` form reconstructs WITHOUT the backticks, which is right because
+ * `strippedMarkdown` strips code-span backticks from the model too; and a fenced
+ * `$$`-on-its-own-line block loses the newline after the opening delimiter (markdown-it
+ * does not keep it), so only a query spanning that newline is affected.
+ *
+ * A THIRD narrowing does change the occurrence COUNT, and is accepted deliberately:
+ * `strippedMarkdown` collapses `_x_` / `*x*` / `~~x~~` pairs across the WHOLE source,
+ * math included, while `mathSourceText` reconstructs the annotation TeX verbatim. So
+ * for `Use $x_1$ and $y_1$; snake_case names.` the model's text holds ONE `_` and this
+ * walk builds three: a find for a bare emphasis character (`_`, `*`, `~`) - or for a
+ * span containing one - drifts, dropping or shifting the later prose ordinals. It
+ * bites only when the query matches such a character AND the document's math uses one
+ * (a subscript is the everyday case). Neither side is worth fixing: `strippedMarkdown`
+ * is the search engine's cached hot path and is deliberately math-unaware, so teaching
+ * it to skip `$…$` spans would couple it to math-delimiter awareness for an info-level
+ * drift; and the mirror move - emphasis-collapsing the reconstructed TeX - is simply
+ * wrong, because `x_1` is a subscript, not emphasis. Pinned as-is by
+ * `tests/unit/search-math-highlight.test.ts`.
  *
  * @param root the surface container (already scoped by the caller so it holds only
  *   the surface's own text, e.g. `.cm-static-content`, not the line-number gutter).
