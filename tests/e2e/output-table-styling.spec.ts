@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
-import { isCellMounted, paneMetric, setScrollTop } from './notebook-scroll';
+import { horizontallyOverflowingBoxes, isCellMounted, paneMetric, setScrollTop } from './notebook-scroll';
 
 /**
  * E2E for the comfortable default styling of HTML tables in cell output
@@ -328,11 +328,21 @@ test('a wide table stays a real table and overflows into the output document', a
 	});
 	expect(above.capTop).toBeLessThan(above.headTop);
 
-	// The page itself must never gain a horizontal scrollbar because of it.
-	const pageScrolls = await page.evaluate(
-		() => document.documentElement.scrollWidth > document.documentElement.clientWidth
-	);
-	expect(pageScrolls).toBe(false);
+	// …and it must not push its own container wider - the real guarantee that
+	// dropping `table{max-width:100%}` rests on. The output iframe is a fixed-width
+	// box that scrolls its own document, so nothing here may spill sideways into
+	// the app around it.
+	//
+	// Deliberately NOT measured on `document.documentElement`: the shell root and
+	// `<main>` are both `overflow-hidden`, so a descendant's horizontal overflow is
+	// clipped long before it reaches the root, and an assertion there is
+	// structurally incapable of failing - it reads as coverage while asserting
+	// nothing. The walk is inclusive of the cell card, which is the innermost
+	// `overflow-hidden` boundary and so the layer that can actually answer (verified
+	// live: an oversized child makes it report 5000>904), and carries on through the
+	// notebook's `overflow-y-auto` pane - the layer that would grow a real sideways
+	// scrollbar - up to the root. Do not narrow it back to any one of them.
+	expect(await horizontallyOverflowingBoxes(page, '[data-cell-id="c-wide"]')).toEqual([]);
 
 	if (EVIDENCE) await wide.screenshot({ path: join(EVIDENCE, 'output-table-wide.png') });
 });

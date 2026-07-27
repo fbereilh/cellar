@@ -238,7 +238,29 @@ describe('HtmlOutput.svelte', () => {
 	it('serializes the shared height helper into the reporter', () => {
 		expect(COMPONENT).toContain("import { reportedHeight } from '$lib/htmlOutputHeight'");
 		expect(COMPONENT).toContain('${reportedHeight.toString()}');
-		expect(COMPONENT).toMatch(/reportedHeight\(\s*de\.scrollHeight,[^)]*window\.innerHeight/);
+	});
+
+	// ARGUMENT ORDER is what this pins, not merely that the call exists. The
+	// arguments are five same-typed numbers, so `scrollWidth` and `clientWidth`
+	// swapping places still compiles and still type-checks - and it INVERTS
+	// `scrollWidth > clientWidth`, adding the scrollbar gutter exactly when there
+	// is no horizontal scrollbar and omitting it when there is. That failure is
+	// silent everywhere else: the arithmetic tests above call `reportedHeight`
+	// directly, and the only end-to-end check of this wiring lives in an e2e the
+	// repo deliberately keeps out of CI and the no-mistakes gate. So the whole
+	// list is compared position by position rather than matched loosely.
+	it('calls the height helper with every argument in its own position', () => {
+		const calls = [...COMPONENT.matchAll(/reportedHeight\(([^)]+)\)/g)].map((m) =>
+			m[1].split(',').map((a) => a.trim())
+		);
+		expect(calls, 'HtmlOutput.svelte must call reportedHeight exactly once').toHaveLength(1);
+		expect(calls[0]).toEqual([
+			'de.scrollHeight',
+			'de.scrollWidth',
+			'de.clientWidth',
+			'window.innerHeight',
+			'de.clientHeight'
+		]);
 	});
 
 	it('sandboxes the iframe without granting it the app origin', () => {
