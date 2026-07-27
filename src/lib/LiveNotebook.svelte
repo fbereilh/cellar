@@ -437,31 +437,29 @@
 	// Cell, for the same reason as the collapse choice above: windowing destroys
 	// and rebuilds a Cell whenever it leaves and re-enters the window, so a
 	// per-instance flag would snap a cell the user is editing back to its rendered
-	// view the moment it scrolled out of sight. Runtime-only + per notebook, never
-	// written to the `.ipynb` (zero git-diff).
+	// view the moment it scrolled out of sight.
+	//
+	// Unlike `editorCollapsed` this is IN-SESSION ONLY - deliberately NOT written to
+	// the per-project UI store. This notebook stays mounted for the life of its tab,
+	// which is all the windowed unmount/remount needs; persisting it would reopen a
+	// notebook with every markdown cell the user ever edited showing raw source
+	// instead of rendered HTML, a far louder change than a collapsed editor.
 	let rawEdits = $state<Record<string, boolean | undefined>>({});
 
-	function rawEditsKey(): string | null {
-		return canonicalId ? `cellar-raw-edit:${canonicalId}` : null;
-	}
-	function loadRawEdits() {
-		const key = rawEditsKey();
-		if (!key) return;
-		const saved = getUi(key, null);
-		rawEdits = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
-	}
-	function saveRawEdits() {
-		const key = rawEditsKey();
-		if (!key) return;
-		setUi(key, rawEdits);
-	}
 	function setRawEdit(id: string, raw: boolean) {
 		if ((rawEdits[id] ?? false) === raw) return;
 		const next = { ...rawEdits };
 		if (raw) next[id] = true;
 		else delete next[id];
 		rawEdits = next;
-		saveRawEdits();
+	}
+	// A deleted cell can never come back under the same id, so drop its entry rather
+	// than letting the map grow for the life of the tab.
+	function dropRawEdit(id: string) {
+		if (!(id in rawEdits)) return;
+		const next = { ...rawEdits };
+		delete next[id];
+		rawEdits = next;
 	}
 
 	// ---- Git cell decorations ------------------------------------------------
@@ -1101,7 +1099,6 @@
 			if (!activeId || !cells.some((c) => c.id === activeId)) activeId = cells[0]?.id ?? null;
 			loadFolds(); // restore this notebook's collapsed sections (runtime-only, per notebook)
 			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
-			loadRawEdits(); // restore which markdown cells are open for raw editing (runtime-only)
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
@@ -1197,6 +1194,7 @@
 		} else if (ev.type === 'cell:deleted') {
 			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
+			dropRawEdit(ev.cellId);
 			if (runningId === ev.cellId) runningId = null;
 			if (activeId === ev.cellId) activeId = null;
 		} else if (ev.type === 'cell:moved') {
@@ -1226,6 +1224,10 @@
 			// A markdown cell was "run" (agent run_cell / add_and_run). Markdown doesn't
 			// execute on the kernel; running it renders it, so flip the cell to its
 			// rendered view. View-only (no doc mutation, no staleness recompute).
+			// The raw-edit flag is OURS, so clear it here rather than relying on the
+			// cell's API: windowing may have unmounted that cell, and a mounted-only
+			// clear would leave it stuck on raw source when it scrolled back.
+			setRawEdit(ev.cellId, false);
 			cellApis[ev.cellId]?.showRendered?.();
 			return;
 		} else if (ev.type === 'cell:edited') {
@@ -1904,6 +1906,7 @@
 		deletedCells.push({ index: i, ...snapshotCell(cell) });
 		if (deletedCells.length > UNDO_LIMIT) deletedCells.shift();
 		cells = cells.filter((c) => c.id !== id);
+		dropRawEdit(id);
 		// Keep a cell selected: command mode acts on the selection, so deleting the
 		// selected cell must hand the selection to its neighbor, not drop it. Focus
 		// follows, because the delete button that had it is gone with the cell.

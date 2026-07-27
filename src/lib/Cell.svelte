@@ -30,7 +30,7 @@
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
 	import { setSurfaceRanges, clearSurface, buildTextRanges, allocSurfaceKey } from '$lib/domHighlight';
 	import type { CellOutput, CellType, LogicalCellType } from '$lib/server/types';
-	import type { KeyMode, UICell, SegHidden, CellRegisterApi, RemoteEdit } from '$lib/types';
+	import type { KeyMode, UICell, SegHidden, CellRegisterApi } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
@@ -218,7 +218,6 @@
 	// editing this cell, held until they choose to load it (the affordance below).
 	let remoteChanged = $state(false);
 	let pendingRemoteSource: string | null = null;
-	let appliedRemote: RemoteEdit | null = null; // the last cell.remoteEdit object we processed
 
 	// The editor's live text. Declared before `mode` because `mode` derives from it.
 	let liveSource = $state(cell.source);
@@ -768,17 +767,20 @@
 	// subtle "changed on server" affordance so the user's typing is never clobbered.
 	//
 	// `cell.remoteEdit` is a ONE-SHOT command, so it is CONSUMED (nulled) the moment
-	// this effect has handled it. Under windowing a Cell instance is torn down and
-	// rebuilt whenever the cell leaves and re-enters the window, which resets the
-	// per-instance `appliedRemote` guard - an unconsumed marker would then be
-	// replayed by the fresh instance and overwrite a NEWER local edit the user has
-	// since made (`cell.source`/`savedSource` reset to the stale remote text, with
-	// no re-PATCH to correct it). LiveNotebook assigns a fresh object per remote
-	// edit, so consuming here can never drop a future one.
+	// this effect has handled it - on EVERY branch, the stash included. Under
+	// windowing a Cell instance is torn down and rebuilt whenever the cell leaves and
+	// re-enters the window, and an unconsumed marker is replayed by the fresh
+	// instance: it would overwrite a NEWER local edit the user has since made
+	// (`cell.source`/`savedSource` reset to the stale remote text, with no re-PATCH to
+	// correct it). That replay is reachable from the stash too - the user resolves the
+	// banner (Load, or dismiss by typing on), then edits and blurs - so the marker
+	// cannot simply be left set on the editing path. Instead the STASH is what is
+	// handed back on teardown, and only while it is genuinely unresolved and the
+	// user's text has not diverged (see the destroy handler). LiveNotebook assigns a
+	// fresh object per remote edit, so consuming here can never drop a future one.
 	$effect(() => {
 		const re = cell.remoteEdit;
-		if (!re || re === appliedRemote) return;
-		appliedRemote = re;
+		if (!re) return;
 		cell.remoteEdit = null;
 		if (!view) {
 			// No live editor is built yet, so there is nothing to clobber and no
@@ -1090,6 +1092,17 @@
 		const flushOnUnload = () => flushEdit({ keepalive: true });
 		window.addEventListener('pagehide', flushOnUnload);
 		return () => {
+			// An UNRESOLVED stash ("changed on server", never loaded nor dismissed) lives
+			// only on this instance, so windowing the cell out would drop the agent's edit
+			// entirely: the cell would come back showing the pre-edit source while the
+			// server holds the new one, and the next local edit would PATCH over it from
+			// that stale base. Hand the marker back so the next instance can adopt it -
+			// but ONLY while the user's own text has not diverged, since a restored marker
+			// is applied unconditionally by a fresh instance and would clobber their
+			// typing (checked BEFORE `flushEdit`, which moves `savedSource`).
+			if (remoteChanged && pendingRemoteSource != null && currentSource() === savedSource) {
+				cell.remoteEdit = { source: pendingRemoteSource };
+			}
 			flushEdit();
 			editorResizeObserver?.disconnect();
 			cardResizeObserver?.disconnect();

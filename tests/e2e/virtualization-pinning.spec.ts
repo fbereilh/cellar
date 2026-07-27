@@ -41,7 +41,9 @@ import {
  *   D. VIEW STATE. The flip side of C: an UNPINNED cell really is destroyed, so any
  *      per-cell view choice that must outlive a scroll belongs to the NOTEBOOK, not
  *      to Cell-local `$state`. A markdown cell opened for raw source editing is
- *      still open for raw editing after it windows out and back.
+ *      still open for raw editing after it windows out and back - and, the other
+ *      half of that decision, is rendered normally again after a RELOAD, because the
+ *      notebook holds that choice in session only and never persists it.
  *
  * Boots the REAL launcher (Node app + Jupyter sidecar + python3 kernel), so it SKIPS
  * when that runtime is missing — the vitest unit suite (`tests/unit/virtualization
@@ -416,6 +418,25 @@ test('markdown raw-edit mode survives a windowed unmount (the notebook owns it, 
 	await expect(cell.getByTestId('editor-scroll')).toBeVisible({ timeout: 10_000 });
 	await expect(cell.getByTestId('editor-scroll')).toContainText('## Section');
 	expect(await cell.getByTestId('markdown-rendered').count()).toBe(0);
+
+	// ---- Across a RELOAD: back to rendered ----
+	// The other half of the decision: the map is IN-SESSION only (no UI-store key),
+	// so a reopened notebook renders its markdown normally rather than greeting the
+	// user with every cell they ever edited as raw source. This assertion is what
+	// pins that - reintroducing persistence fails here.
+	//
+	// The wait + round-trip is what makes that pin deterministic rather than a race:
+	// `setUi` writes are debounced (300ms) before their PUT, so a reload fired inside
+	// that window would find an empty store and pass even WITH persistence. Waiting
+	// past the debounce and then reading the store back means any write this session
+	// would have made has already reached the server before we reload.
+	await page.waitForTimeout(800);
+	await page.evaluate(() => fetch('/api/ui-state').then((r) => r.text()));
+	await openWindowed(page);
+	await expect.poll(() => isCellMounted(page, mdId as string), { timeout: 15_000 }).toBe(true);
+	await expect(page.locator(`[data-cell-id="${mdId}"]`).getByTestId('markdown-rendered')).toBeVisible({
+		timeout: 10_000
+	});
 });
 
 test('a consumed remote edit is never replayed onto a newer local edit by a re-mounted cell', async ({
