@@ -77,8 +77,11 @@ export interface PlanWindowArgs {
 
 // ---- Height estimation constants (§4.1) ------------------------------------
 // Estimates are ONLY ever used for cells that have never been on screen; the
-// instant a cell mounts, its real measured height replaces the estimate. These
-// are coarse on purpose and get tuned in a later phase (P5).
+// instant a cell mounts, its real measured height replaces the estimate. They stay
+// coarse on purpose: nothing depends on one being right, because a mis-estimate is
+// corrected the moment its cell mounts and the resulting drift over a long jump is
+// what the jump paths' settle loop re-measures against (`scrollElementIntoView` in
+// `LiveNotebook`). P5 shipped the default-on flip without needing to tune them.
 export const CARD_CHROME_PX = 64; // card border + toolbar + vertical padding
 export const CODE_LINE_PX = 19; // one CodeMirror line
 export const MARKDOWN_BASE_PX = 60; // a small constant for a rendered markdown cell

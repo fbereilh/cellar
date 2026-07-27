@@ -946,12 +946,14 @@
 
 	/**
 	 * Build the heavy CodeMirror `EditorView` — lazily, on first edit-intent. The
-	 * whole point of the interim virtualization: a freshly opened notebook builds
-	 * ZERO editors (each cell shows its source via `StaticCode`), and an editor is
-	 * created only when the user (or a programmatic focus) needs to interact with a
-	 * given cell. Idempotent — every edit-intent path calls this, and it no-ops once
-	 * the editor exists (this is lazy-*create*, not windowing: the editor is never
-	 * torn down). The new editor seeds from `liveSource`, the doc-backed source that
+	 * whole point of the lazy editor: a freshly opened notebook builds ZERO editors
+	 * (each cell shows its source via `StaticCode`), and an editor is created only
+	 * when the user (or a programmatic focus) needs to interact with a given cell.
+	 * Idempotent — every edit-intent path calls this, and it no-ops once the editor
+	 * exists (this is lazy-*create*: it never tears an editor down itself. Windowing
+	 * does, with the whole Cell, when the cell leaves the window - which is why the
+	 * focused cell is pinned, so a cursor and undo history in use survive). The new
+	 * editor seeds from `liveSource`, the doc-backed source that
 	 * has tracked every remote edit while the cell had no editor, so there is no
 	 * divergence between what the static render showed and what the editor now holds.
 	 */
