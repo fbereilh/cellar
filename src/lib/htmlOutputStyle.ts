@@ -55,6 +55,16 @@
  * specificity: `:has()` takes the specificity of its most specific argument, and
  * every argument here is a type selector.
  *
+ * KNOWN LIMIT, accepted deliberately: that escape keys off BLOCK-level content
+ * only, so a label/value layout table whose cells hold bare inline text (the
+ * shape some libraries' `_repr_html_` emits - dask's array summary, pint,
+ * awkward) takes no escape and reads right-aligned. Widening the signal with a
+ * content-length heuristic was considered and REJECTED: it misfires in both
+ * directions (a long id or numeric value wrongly left-aligned, a short label
+ * still right-aligned). Right-align is the pandas numeric convention and the
+ * intended default, and any library can style its own table - which rule 1
+ * guarantees will win. Do not add a heuristic here.
+ *
  * Scope note: this block only reaches *rich `text/html`* outputs. A plain
  * DataFrame renders through the native `DataFrameGrid` (structured
  * `application/vnd.cellar.dataframe+json` mime, or `dataframeHtml.ts`'s parse of
@@ -81,14 +91,32 @@ td:has(p,div,ul,ol,pre,table,h1,h2,h3,h4,h5,h6),th:has(p,div,ul,ol,pre,table,h1,
  * is the string above (one rule per line, no at-rules, no nesting, no strings or
  * comments inside selectors), and its only consumer is the specificity guard.
  * A comma-separated selector list yields one entry per selector.
+ *
+ * The split tracks paren depth, which is load-bearing rather than tidy: a
+ * functional pseudo-class takes its own comma-separated argument list, so a flat
+ * `split(',')` shreds `td:has(p,div,…)` into a dozen fragments with no closing
+ * paren - and the guard that checks what `:has()` may contain then matches
+ * nothing and silently asserts nothing at all.
  */
 export function cssSelectors(css: string): string[] {
 	const out: string[] = [];
 	for (const [, prelude] of css.matchAll(/([^{}]+)\{[^{}]*\}/g)) {
-		for (const sel of prelude.split(',')) {
-			const s = sel.trim();
+		let depth = 0;
+		let start = 0;
+		const push = (end: number) => {
+			const s = prelude.slice(start, end).trim();
 			if (s) out.push(s);
+		};
+		for (let i = 0; i < prelude.length; i++) {
+			const c = prelude[i];
+			if (c === '(') depth++;
+			else if (c === ')') depth = Math.max(0, depth - 1);
+			else if (c === ',' && depth === 0) {
+				push(i);
+				start = i + 1;
+			}
 		}
+		push(prelude.length);
 	}
 	return out;
 }

@@ -29,6 +29,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { OUTPUT_HTML_CSS, cssSelectors } from '../../src/lib/htmlOutputStyle';
+import { reportedHeight } from '../../src/lib/htmlOutputHeight';
 
 const REPO = join(fileURLToPath(import.meta.url), '../../..');
 const COMPONENT = readFileSync(join(REPO, 'src/lib/HtmlOutput.svelte'), 'utf8');
@@ -36,6 +37,12 @@ const COMPONENT = readFileSync(join(REPO, 'src/lib/HtmlOutput.svelte'), 'utf8');
 describe('cssSelectors', () => {
 	it('yields one entry per selector, splitting comma-separated lists', () => {
 		expect(cssSelectors('a{x:1}\nb , c{y:2}')).toEqual(['a', 'b', 'c']);
+	});
+
+	// A flat `split(',')` shreds this into fragments with no closing paren, which
+	// is what silently disabled the `:has()` specificity guard below.
+	it('keeps a functional pseudo-class argument list intact', () => {
+		expect(cssSelectors('td:has(p,div),th{x:1}')).toEqual(['td:has(p,div)', 'th']);
 	});
 
 	it('is empty for a block with no rules', () => {
@@ -63,11 +70,21 @@ describe('injected output stylesheet: specificity', () => {
 	// `:has()` takes the specificity of its most specific argument, so it is only
 	// element-level while every argument is a bare type selector.
 	it('uses :has() only over type selectors, keeping it at element specificity', () => {
+		const TYPE_SELECTORS_ONLY = /^[a-z0-9,\s]+$/;
+		let checked = 0;
 		for (const sel of selectors) {
 			for (const [, args] of sel.matchAll(/:has\(([^)]*)\)/g)) {
-				expect(args, `\`:has(${args})\` must contain only type selectors`).toMatch(/^[a-z0-9,\s]+$/);
+				checked++;
+				expect(args, `\`:has(${args})\` must contain only type selectors`).toMatch(
+					TYPE_SELECTORS_ONLY
+				);
 			}
 		}
+		// The assertion above is vacuous unless the arguments really reach it -
+		// which they did not while `cssSelectors` split inside the parens. Prove
+		// the guard ran, and that it rejects what it exists to catch.
+		expect(checked, 'the :has() arguments must actually be reachable').toBeGreaterThan(0);
+		expect('.dataframe,div').not.toMatch(TYPE_SELECTORS_ONLY);
 		// The only pseudo-class in the block is `:has()`.
 		for (const sel of selectors) {
 			expect(sel.replace(/:has\(/g, ''), `selector \`${sel}\` uses an unexpected pseudo-class`).not.toContain(':');
@@ -136,10 +153,44 @@ describe('injected output stylesheet: contents', () => {
 	});
 });
 
+// These assert ARITHMETIC, not pixels, and deliberately so: the case that
+// matters is a platform with classic, space-taking scrollbars (Windows, Linux),
+// while macOS overlay scrollbars measure 0px - so the local browser e2e cannot
+// tell the fixed reporter from the broken one. Do not "simplify" this into an
+// observed pixel gap; it would pass vacuously on the machine it runs on.
+describe('reportedHeight', () => {
+	it('reports the content height when nothing overflows horizontally', () => {
+		expect(reportedHeight(420, 800, 800, 300, 300)).toBe(420);
+	});
+
+	it('adds nothing for an overlay scrollbar, which occupies no space', () => {
+		// macOS: the bar paints over the content, so the two viewports agree.
+		expect(reportedHeight(420, 1600, 800, 300, 300)).toBe(420);
+	});
+
+	it('adds back the gutter a space-taking horizontal scrollbar consumes', () => {
+		// Windows/Linux: without this the frame is sized to the content exactly,
+		// the bar eats 15px of it, and the frame clips its last row.
+		expect(reportedHeight(420, 1600, 800, 300, 285)).toBe(435);
+	});
+
+	it('never subtracts height if the viewport measurements invert', () => {
+		expect(reportedHeight(420, 1600, 800, 285, 300)).toBe(420);
+	});
+});
+
 describe('HtmlOutput.svelte', () => {
 	it('injects the shared stylesheet rather than carrying its own copy', () => {
 		expect(COMPONENT).toContain("import { OUTPUT_HTML_CSS } from '$lib/htmlOutputStyle'");
 		expect(COMPONENT).toContain('${OUTPUT_HTML_CSS}');
+	});
+
+	// The reporter runs in the iframe, so it cannot import - it is serialized in.
+	// That is what keeps the shipped arithmetic and the tests above one function.
+	it('serializes the shared height helper into the reporter', () => {
+		expect(COMPONENT).toContain("import { reportedHeight } from '$lib/htmlOutputHeight'");
+		expect(COMPONENT).toContain('${reportedHeight.toString()}');
+		expect(COMPONENT).toMatch(/reportedHeight\(\s*de\.scrollHeight,[^)]*window\.innerHeight/);
 	});
 
 	it('sandboxes the iframe without granting it the app origin', () => {
