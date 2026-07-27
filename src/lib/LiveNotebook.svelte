@@ -1236,7 +1236,18 @@
 			// (else it surfaces a "changed on server" affordance). A fresh object
 			// each time so the Cell's effect fires even on a same-source re-edit.
 			const cell = findCell(ev.cellId);
-			if (cell) cell.remoteEdit = { source: ev.source };
+			if (cell) {
+				// With NO mounted Cell there is no editor to clobber and no typing to
+				// protect, so the model must be written HERE - the marker alone would sit
+				// unconsumed for as long as windowing keeps the cell out of the DOM, and
+				// `cell.source` is what every model reader falls back to: a bulk run reads
+				// it (`runCodeIds`) and the run route persists what it POSTs, so a stale
+				// value would execute the pre-edit code AND write it over the agent's edit
+				// in the .ipynb. It also feeds `onCellsChange` (find bar / sidebar search /
+				// outline). The MOUNTED path is unchanged: the Cell owns its editor's text.
+				if (!cellApis[ev.cellId]) cell.source = ev.source;
+				cell.remoteEdit = { source: ev.source };
+			}
 		}
 		// Any structural change (add/edit/type/delete/move/clear) can shift the
 		// dependency graph or the run/edit stamps — recompute staleness.

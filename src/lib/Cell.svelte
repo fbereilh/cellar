@@ -1100,7 +1100,15 @@
 			// but ONLY while the user's own text has not diverged, since a restored marker
 			// is applied unconditionally by a fresh instance and would clobber their
 			// typing (checked BEFORE `flushEdit`, which moves `savedSource`).
+			//
+			// That same guard is what lets the MODEL be written here too: with no local
+			// divergence there is no text of the user's to lose, and once this instance is
+			// gone nothing owns `cell.source` - leaving it at the pre-edit text would run
+			// and persist that over the agent's edit exactly as an unconsumed marker
+			// would (see the notebook's `cell:edited` handler, which writes the model for
+			// the same reason whenever no Cell is mounted).
 			if (remoteChanged && pendingRemoteSource != null && currentSource() === savedSource) {
+				cell.source = pendingRemoteSource;
 				cell.remoteEdit = { source: pendingRemoteSource };
 			}
 			flushEdit();
