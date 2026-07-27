@@ -285,10 +285,13 @@
 	 * range it was asked for. The notebook focuses the resulting primary cell
 	 * itself, so the modal keyboard still has a focused target.
 	 *
-	 * Two deliberate exemptions keep the gesture from stealing a click that already
-	 * means something else: a control (button/link/field) keeps its own activation,
-	 * and a Shift+click inside an editor that ALREADY HAS THE CARET stays
-	 * CodeMirror's text-selection gesture. That second test asks the editor itself
+	 * Three deliberate exemptions keep the gesture from stealing a press that already
+	 * means something else: it is the PRIMARY button only (a Shift/Ctrl right- or
+	 * middle-click opens a context menu or pastes - re-ranging the selection there,
+	 * and `preventDefault`ing the press, would hijack a gesture the user aimed
+	 * elsewhere), a control (button/link/field) keeps its own activation, and a
+	 * Shift+click inside an editor that ALREADY HAS THE CARET stays CodeMirror's
+	 * text-selection gesture. That last test asks the editor itself
 	 * (`view.hasFocus`) rather than the notebook's `keyMode`, which is a visual
 	 * mirror and can lag a focus change by an event.
 	 */
@@ -297,6 +300,7 @@
 		const extend = e.shiftKey;
 		const toggle = isMac ? e.metaKey : e.ctrlKey;
 		if (
+			e.button === 0 &&
 			(extend || toggle) &&
 			!t?.closest?.('button, a, input, select, textarea, [role="button"]') &&
 			!(view?.hasFocus && t?.closest?.('.cm-editor'))

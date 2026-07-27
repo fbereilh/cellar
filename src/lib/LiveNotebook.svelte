@@ -6,6 +6,7 @@
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
+	import { logicalCellType } from '$lib/cellLanguage';
 	import {
 		applyGesture,
 		applyMovePlan,
@@ -2037,12 +2038,21 @@
 	}
 
 	async function undoDelete() {
-		const group = deletedCells.pop();
+		const group = deletedCells.at(-1);
 		if (!group?.length) return;
 		const restored: string[] = [];
+		// The record is popped only once every cell is back. An insert can reject
+		// (the request fails, the notebook is gone), and discarding the group first
+		// would leave the notebook partially restored with the only description of
+		// what was deleted already thrown away - so `z` again could not finish the
+		// job. Restoring twice is recoverable; losing the record is not.
 		for (const record of [...group].sort((a, b) => a.index - b.index)) {
 			restored.push((await insertCellAt(record.index, record)).id);
 		}
+		// Dropped by identity, not by position: a delete landing while the restore
+		// awaited has pushed a newer group on top, and popping would discard THAT.
+		const at = deletedCells.indexOf(group);
+		if (at >= 0) deletedCells.splice(at, 1);
 		// Restore the SELECTION too, not just the cells: undoing a bulk delete should
 		// hand back the state the delete was issued from, so the next action can act
 		// on the same set.
@@ -2103,19 +2113,30 @@
 	}
 
 	/**
-	 * One bulk request. The caller has already rendered the change optimistically,
-	 * so a failure REFETCHES rather than swallowing: a bulk op moves many cells at
-	 * once and the events that would otherwise correct a divergence are exactly the
-	 * ones a failed request never published, so the client would sit on a document
-	 * the server does not have.
+	 * One bulk request, checked against what the caller optimistically rendered.
+	 *
+	 * A REFUSED batch is not an HTTP failure: `moveCells` returns `[]` when its own
+	 * recomputed plan is blocked (or any `clampMoveIndex` step refuses) and
+	 * `setCellTypes` returns `[]` when it matched nothing, both under `{ok:true}`.
+	 * So the honest signal is the COUNT the server reports acting on, not the
+	 * status - and reading it is not optional, because these events carry THIS
+	 * tab's `originId`: the initiating tab suppresses its own echo, so the very
+	 * events that would correct the divergence are the ones it will never apply.
+	 * Without this check it would sit forever on a document the server never had.
+	 *
+	 * `applied` is what the caller changed locally, derived through the same rules
+	 * the server uses, so a batch the server legitimately skipped (cells already of
+	 * the target type) is not mistaken for a refusal and does not refetch.
 	 */
-	async function bulkOp(body: Record<string, unknown>): Promise<void> {
+	async function bulkOp(body: Record<string, unknown>, applied: number): Promise<void> {
 		const res = await fetch('/api/cells/bulk', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ ...body, nb: path, originId })
 		}).catch(() => null);
-		if (!res?.ok) await load();
+		const payload = res?.ok ? await res.json().catch(() => null) : null;
+		const acted = payload?.removed ?? payload?.moved ?? payload?.changed;
+		if (!Array.isArray(acted) || acted.length !== applied) await load();
 	}
 
 	/** Delete every selected cell in one action (`dd` / the palette's Delete cell). */
@@ -2138,12 +2159,14 @@
 			})
 		);
 		const nextActive = selectionAfterRemoval(order, removed);
+		const before = cells.length;
 		cells = cells.filter((c) => !removed.has(c.id));
+		const applied = before - cells.length;
 		for (const id of ids) setRawEdit(id, false);
 		if (runningId && removed.has(runningId)) runningId = null;
 		selectOnly(nextActive);
 		if (nextActive) await selectAndFocus(nextActive);
-		await bulkOp({ op: 'delete', ids });
+		await bulkOp({ op: 'delete', ids }, applied);
 		scheduleStaleness();
 	}
 
@@ -2175,7 +2198,7 @@
 		// `focusin` it triggers is a `fromFocus` re-statement of the existing primary,
 		// so `activateCell` leaves the selection alone.
 		if (activeId) await scrollCellIntoView(activeId, (api) => (mode === 'edit' ? api?.focus() : api?.focusCell()));
-		await bulkOp({ op: 'move', ids, dir });
+		await bulkOp({ op: 'move', ids, dir }, steps.length);
 		scheduleStaleness(); // reordering changes the preceding-definer graph
 	}
 
@@ -2186,8 +2209,16 @@
 			if (ids[0]) await setType(ids[0], cellType);
 			return;
 		}
-		for (const id of ids) applyCellTypeLocally(id, cellType);
-		await bulkOp({ op: 'type', ids, cellType });
+		// A cell already of the target type is a no-op the server skips too
+		// (`setCellTypes` uses this same `logicalCellType` rule), so counting the ones
+		// that really change is what keeps that legitimate skip from reading as a
+		// refused batch.
+		const pending = ids.filter((id) => {
+			const cell = findCell(id);
+			return !!cell && logicalCellType(cell) !== cellType;
+		});
+		for (const id of pending) applyCellTypeLocally(id, cellType);
+		await bulkOp({ op: 'type', ids, cellType }, pending.length);
 		scheduleStaleness();
 	}
 
@@ -2385,13 +2416,22 @@
 		await scrollCellIntoView(next.activeId, (api) => api?.focusCell());
 	}
 
-	/** Cmd/Ctrl+A in command mode: select every cell of the notebook. */
+	/**
+	 * Cmd/Ctrl+A in command mode: select every cell of the notebook - the FULL
+	 * document order, fold-hidden cells included, so there is ONE rule for what a
+	 * selection may contain and it is the one a Shift range already follows
+	 * (`rangeIds` fills in by document index). Selecting only the visible cells
+	 * would also make a bulk move destructive: with a section collapsed it would
+	 * select the heading but not its body, and `moveSelectionPlan` would then swap
+	 * each heading past the first cell of its own section - shuffling headings into
+	 * the sections they title. Selecting the section too moves it as a unit.
+	 */
 	function selectAllCells() {
-		const list = selectable;
-		if (!list.length) return;
-		selectedIds = new Set(list.map((c) => c.id));
-		anchorId = list[0].id;
-		if (!activeId || !selectedIds.has(activeId)) activeId = list[0].id;
+		const order = cellOrder;
+		if (!order.length) return;
+		selectedIds = new Set(order);
+		anchorId = order[0];
+		if (!activeId || !selectedIds.has(activeId)) activeId = order[0];
 	}
 
 	// Fold/unfold act on the selected cell only when it is a markdown header, and

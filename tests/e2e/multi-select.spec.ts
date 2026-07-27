@@ -23,7 +23,9 @@ import { setScrollTop, isCellMounted, mountedCellIds } from './notebook-scroll';
  *   C. Cmd/Ctrl+click builds a genuinely non-contiguous selection and the bulk
  *      retype hits exactly its members;
  *   D. Shift+J extends, a bulk move carries the block and keeps it selected, and a
- *      plain click / Escape collapses back to one cell.
+ *      plain click / Escape collapses back to one cell;
+ *   E. Cmd/Ctrl+A selects the FULL document - fold-hidden cells included - so a
+ *      collapsed section can never be left behind by the selection that moves it.
  *
  * Every assertion about WHICH cells an op touched reads the SERVER document, not
  * the DOM: the DOM can only ever show the window, and "it looked right on screen"
@@ -46,6 +48,19 @@ async function serverOrder(page: Page): Promise<string[]> {
 		const res = await fetch(`/api/notebooks?path=${encodeURIComponent(nb)}`);
 		const body = await res.json();
 		return (body.notebook.cells as { id: string }[]).map((c) => c.id);
+	}, NB);
+}
+
+/** The notebook's cells (id + type + source) in document order, from the server model. */
+async function serverCells(page: Page): Promise<{ id: string; cell_type: string; source: string }[]> {
+	return page.evaluate(async (nb) => {
+		const res = await fetch(`/api/notebooks?path=${encodeURIComponent(nb)}`);
+		const body = await res.json();
+		return (body.notebook.cells as { id: string; cell_type: string; source: string }[]).map((c) => ({
+			id: c.id,
+			cell_type: c.cell_type,
+			source: c.source
+		}));
 	}, NB);
 }
 
@@ -72,6 +87,14 @@ async function clickCell(page: Page, id: string, modifiers: ('Shift' | 'Meta' | 
 
 const selectedInDom = (page: Page) => page.locator('[data-testid="cell"][data-selected="true"]').count();
 const spacers = (page: Page) => page.locator('[data-testid="cell-spacer"]').count();
+
+/** Open the notebook and wait for its cells, at the given windowing mode. */
+async function openNotebook(page: Page, virtualize: '0' | '1'): Promise<void> {
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}&virtualize=${virtualize}`);
+	const openButton = page.getByTestId('empty-open-notebook');
+	if (await openButton.isVisible({ timeout: 10_000 }).catch(() => false)) await openButton.click();
+	await expect(page.getByTestId('cell').first()).toBeVisible({ timeout: 30_000 });
+}
 
 /** Open the notebook windowed and settle at the top. */
 async function openWindowed(page: Page): Promise<void> {
@@ -252,4 +275,48 @@ test('Shift+J extends, a bulk move carries the block, and a plain click / Escape
 	await clickCell(page, mounted[0]);
 	await expect(page.getByTestId('selection-count')).toHaveCount(0);
 	await expect(page.locator(`[data-cell-id="${mounted[0]}"]`)).toHaveAttribute('data-active', 'true');
+});
+
+test('Cmd/Ctrl+A selects fold-hidden cells too, so a collapsed section is never left behind', async ({ page }) => {
+	test.setTimeout(120_000);
+	// Rendered eagerly: the point here is fold SCOPE, not windowing (windowing drops a
+	// fold-hidden cell from the DOM entirely, which would make "hidden" and "windowed
+	// out" indistinguishable), and every heading's fold chevron has to be clickable.
+	await openNotebook(page, '0');
+
+	const cells = await serverCells(page);
+	const headings = cells.flatMap((c, i) => (c.cell_type === 'markdown' && c.source.startsWith('## ') ? [i] : []));
+	expect(headings.length).toBeGreaterThan(2);
+
+	// The LAST section is what makes this test able to fail: folding it hides the
+	// notebook's final cell, so a selection that skipped hidden cells would NOT touch
+	// the bottom edge and the move below would be allowed to run.
+	const tail = headings[headings.length - 1];
+	expect(tail).toBeLessThan(cells.length - 1);
+	// …plus an earlier one, so a visible-only selection would be non-contiguous - the
+	// exact shape in which `moveSelectionPlan` swaps a heading past the first cell of
+	// its own collapsed section.
+	const early = headings.find((i) => i < tail && !headings.includes(i + 1) && i + 1 < cells.length);
+	expect(early).toBeDefined();
+
+	for (const at of [early!, tail]) {
+		await page.locator(`[data-cell-id="${cells[at].id}"] [data-testid="fold-toggle"]`).first().click();
+		await expect(page.locator(`[data-cell-id="${cells[at + 1].id}"]`)).not.toBeVisible();
+	}
+	// The final cell really is hidden, so "select all" now has something to miss.
+	await expect(page.locator(`[data-cell-id="${cells[cells.length - 1].id}"]`)).not.toBeVisible();
+
+	await clickCell(page, cells[early!].id);
+	await page.keyboard.press(`${MOD}+a`);
+	// Every cell of the DOCUMENT, not every cell on screen - the same set a Shift
+	// range would produce across the same collapsed sections.
+	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length} selected`);
+
+	// And the consequence: the selection covers the whole notebook, so the move is
+	// refused outright rather than sliding each visible heading down into the section
+	// it titles. Asserted against the SERVER document.
+	await page.keyboard.press(`${MOD}+Shift+ArrowDown`);
+	await page.waitForTimeout(1500);
+	expect(await serverOrder(page)).toEqual(cells.map((c) => c.id));
+	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length} selected`);
 });

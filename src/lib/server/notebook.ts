@@ -28,7 +28,7 @@ import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, type ExportResult } from './export-py';
-import { SQL_LANGUAGE } from '../cellLanguage';
+import { SQL_LANGUAGE, logicalCellType } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import type {
 	Cell,
@@ -884,7 +884,10 @@ function applyCellType(cell: Cell, cellType: LogicalCellType): void {
  * batch needs no new event shape.
  *
  * Returns the ids actually changed (a cell already of that type is skipped, so a
- * no-op batch persists nothing).
+ * no-op batch persists nothing). "Already of that type" is `logicalCellType`, the
+ * SHARED predicate - the browser predicts this count to tell a refused batch from
+ * a batch that had nothing to do, and a second copy of the rule here would make
+ * the two disagree on exactly the cells they must agree on.
  */
 export function setCellTypes(
 	ids: readonly string[],
@@ -898,10 +901,7 @@ export function setCellTypes(
 	for (const id of ids) {
 		const cell = find(doc, id);
 		if (!cell) continue;
-		const already =
-			cell.cell_type === (cellType === 'markdown' ? 'markdown' : 'code') &&
-			(cell.metadata?.cellar?.language === SQL_LANGUAGE) === isSql;
-		if (already) continue;
+		if (logicalCellType(cell) === cellType) continue;
 		applyCellType(cell, cellType);
 		changed.push(cell);
 	}
