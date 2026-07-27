@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { isCellMounted, setScrollTop } from './notebook-scroll';
 
 /**
  * E2E for the comfortable default styling of HTML tables in cell output
@@ -12,8 +13,9 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  *
  * This has to run in a real browser: the whole feature IS a cascade - cellar's
  * element-level defaults must apply to a bare table AND lose to a Styler's own
- * id-scoped rules - and the layout facts (a wide table scrolling itself instead
- * of the document) only exist once something lays the table out.
+ * id-scoped rules (including one stated on the TABLE, which reaches the cells
+ * only by inheritance) - and the layout facts (which tables wrap, which overflow)
+ * only exist once something lays the table out.
  *
  * It deliberately uses `IPython.display.HTML` with hand-written markup rather
  * than pandas: the markup below IS the shape pandas emits (a Styler's
@@ -59,6 +61,30 @@ const DATAFRAME_REPR = `<table border="1" class="dataframe">
 const WIDE_TABLE = `<table id="T_wide"><caption>Wide numeric table</caption>
 <thead><tr><th class="blank"></th>${Array.from({ length: 18 }, (_, i) => `<th class="col_heading">metric_${i}</th>`).join('')}</tr></thead>
 <tbody><tr><th class="row_heading">0</th>${Array.from({ length: 18 }, (_, i) => `<td class="data">${(i * 1111.25).toFixed(6)}</td>`).join('')}</tr></tbody></table>`;
+
+/**
+ * A long text column, as bare text in the `<td>` - deliberately NOT wrapped in a
+ * `<p>`, so it does not take the `:has()` escape and is governed by the ordinary
+ * cell rules. It must wrap like pandas/Jupyter rather than scroll away.
+ */
+const TEXT_TABLE = `<table id="T_text">
+<thead><tr><th></th><th>note</th><th>n</th></tr></thead>
+<tbody><tr><th>0</th><td>${'a fairly long sentence of prose that should wrap into view rather than force the output document sideways. '.repeat(
+	3
+)}</td><td>1.5</td></tr></tbody></table>`;
+
+/**
+ * A Styler that aligns the WHOLE table - `set_table_styles([{'selector': '', …}])`
+ * emits its rule on the table element, and `text-align` reaches the cells only by
+ * inheritance. Cellar's default therefore has to be declared on `table` too, or a
+ * cell-level default would silently outrank this.
+ */
+const TABLE_LEVEL_STYLED = `<style type="text/css">
+#T_tablelevel { text-align: left; }
+</style>
+<table id="T_tablelevel"><caption>Table-level align</caption>
+<thead><tr><th class="blank"></th><th class="col_heading">alpha</th></tr></thead>
+<tbody><tr><th class="row_heading">0</th><td class="data">1.5</td></tr></tbody></table>`;
 
 /**
  * A Styler that states its own padding/alignment - exactly what `set_table_styles`
@@ -114,7 +140,9 @@ test.beforeAll(async () => {
 					cell('c-styled', displayHtml(STYLED_TABLE)),
 					cell('c-layout', displayHtml(LAYOUT_TABLE)),
 					cell('c-notable', displayHtml(NO_TABLE)),
-					cell('c-grid', displayHtml(DATAFRAME_REPR))
+					cell('c-grid', displayHtml(DATAFRAME_REPR)),
+					cell('c-text', displayHtml(TEXT_TABLE)),
+					cell('c-tablelevel', displayHtml(TABLE_LEVEL_STYLED))
 				],
 				metadata: { kernelspec: { name: 'python3', display_name: 'python3', language: 'python' } },
 				nbformat: 4,
@@ -148,6 +176,26 @@ async function openNotebook(page: Page): Promise<void> {
 	await expect(page.getByTestId('cell').first()).toBeVisible();
 }
 
+/**
+ * Address a cell by its stable id, scrolling until virtualization has mounted it.
+ *
+ * Deliberately NOT `getByTestId('cell').nth(i)`: every test here persists its
+ * cell's output, so by the last one the notebook is tall enough that the bottom
+ * cells start as spacers - which have no `run` button AND do not count towards
+ * that locator, so an index silently addresses the wrong cell. This spec runs at
+ * the shipped windowing default (see the virtualization entry in AGENTS.md); its
+ * subject is the CSS cascade, so it mounts what it needs rather than opting out.
+ */
+async function cellById(page: Page, id: string): Promise<Locator> {
+	const cell = page.locator(`[data-cell-id="${id}"]`);
+	for (let step = 0; step < 60 && !(await isCellMounted(page, id)); step++) {
+		await setScrollTop(page, step * 500);
+	}
+	await expect(cell).toBeAttached({ timeout: 15_000 });
+	await cell.scrollIntoViewIfNeeded();
+	return cell;
+}
+
 /** Run `c` and wait for its rich-HTML iframe to exist, returning a handle to it. */
 async function runForIframe(c: Locator): Promise<FrameLocator> {
 	await c.getByTestId('run').click();
@@ -171,18 +219,20 @@ function styleOf(frame: FrameLocator, selector: string, props: string[]) {
 test('a bare output table gets comfortable, scannable defaults', async ({ page }) => {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
-	const cells = page.getByTestId('cell');
-	await expect(cells).toHaveCount(6);
+	const bare = await cellById(page, 'c-bare');
 
-	const frame = await runForIframe(cells.nth(0));
+	const frame = await runForIframe(bare);
 
 	// Generous horizontal padding is the whole point - the user's hand-rolled
 	// helper existed because the browser default is 1px.
 	const td = await styleOf(frame, 'td', ['padding-top', 'padding-right', 'text-align', 'white-space']);
 	expect(td['padding-top']).toBe('7px');
 	expect(td['padding-right']).toBe('20px');
-	expect(td['text-align']).toBe('right'); // the pandas numeric convention
-	expect(td['white-space']).toBe('nowrap');
+	// The pandas numeric convention, reaching the cell by inheritance from the
+	// `table` rule (see the table-level Styler case below for why that matters).
+	expect(td['text-align']).toBe('right');
+	// Cells wrap like pandas/Jupyter - nothing declares white-space.
+	expect(td['white-space']).toBe('normal');
 
 	// The index column reads as a label, not as data.
 	expect((await styleOf(frame, 'tbody th', ['text-align']))['text-align']).toBe('left');
@@ -196,40 +246,51 @@ test('a bare output table gets comfortable, scannable defaults', async ({ page }
 	expect(borders['border-left-width']).toBe('0px');
 	expect(borders['border-bottom-width']).toBe('1px');
 
-	if (EVIDENCE) await cells.nth(0).screenshot({ path: join(EVIDENCE, 'output-table-bare.png') });
+	if (EVIDENCE) await bare.screenshot({ path: join(EVIDENCE, 'output-table-bare.png') });
 });
 
-test('a wide table scrolls itself - the output document never scrolls sideways', async ({ page }) => {
+test('a wide table stays a real table and overflows into the output document', async ({ page }) => {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
-	const cells = page.getByTestId('cell');
+	const wide = await cellById(page, 'c-wide');
 
-	const frame = await runForIframe(cells.nth(1));
+	const frame = await runForIframe(wide);
 
 	const metrics = await frame.locator('table').first().evaluate((t) => {
 		const de = t.ownerDocument.documentElement;
 		return {
-			tableOverflows: t.scrollWidth > t.clientWidth,
-			docScrollsSideways: de.scrollWidth > de.clientWidth,
-			bodyScrollsSideways: t.ownerDocument.body.scrollWidth > t.ownerDocument.body.clientWidth
+			display: getComputedStyle(t).display,
+			tableScrollsItself: t.scrollWidth > t.clientWidth,
+			docScrollsSideways: de.scrollWidth > de.clientWidth
 		};
 	});
-	// The table is genuinely wider than the output, and absorbs that itself.
-	expect(metrics.tableOverflows).toBe(true);
-	expect(metrics.docScrollsSideways).toBe(false);
-	expect(metrics.bodyScrollsSideways).toBe(false);
+	// It stays a real table, so a user's `width` / `table-layout` still work…
+	expect(metrics.display).toBe('table');
+	// …and the columns are unwrappable numbers, so the overflow lands on the
+	// output iframe's own document rather than on a scroll box inside the table.
+	expect(metrics.tableScrollsItself).toBe(false);
+	expect(metrics.docScrollsSideways).toBe(true);
 
-	// And it really scrolls, rather than merely clipping.
+	// And that document really scrolls, rather than merely clipping.
 	const scrolled = await frame.locator('table').first().evaluate((t) => {
-		t.scrollLeft = 400;
-		return t.scrollLeft;
+		const de = t.ownerDocument.documentElement;
+		de.scrollLeft = 400;
+		return de.scrollLeft;
 	});
 	expect(scrolled).toBeGreaterThan(0);
 
-	// `set_caption` reads as a title above the table.
-	const cap = await styleOf(frame, 'caption', ['font-weight', 'text-align']);
+	// `set_caption` reads as a title above the table - and stays a caption. A
+	// `display:block` here would get it wrapped in an anonymous cell, i.e. a row.
+	const cap = await styleOf(frame, 'caption', ['font-weight', 'text-align', 'display']);
 	expect(cap['font-weight']).toBe('600');
 	expect(cap['text-align']).toBe('left');
+	expect(cap['display']).toBe('table-caption');
+	const above = await frame.locator('table').first().evaluate((el) => {
+		const t = el as HTMLTableElement;
+		const c = t.querySelector('caption') as HTMLElement;
+		return { capTop: c.getBoundingClientRect().top, headTop: t.tHead!.getBoundingClientRect().top };
+	});
+	expect(above.capTop).toBeLessThan(above.headTop);
 
 	// The page itself must never gain a horizontal scrollbar because of it.
 	const pageScrolls = await page.evaluate(
@@ -237,15 +298,13 @@ test('a wide table scrolls itself - the output document never scrolls sideways',
 	);
 	expect(pageScrolls).toBe(false);
 
-	if (EVIDENCE) await cells.nth(1).screenshot({ path: join(EVIDENCE, 'output-table-wide.png') });
+	if (EVIDENCE) await wide.screenshot({ path: join(EVIDENCE, 'output-table-wide.png') });
 });
 
 test("an explicit Styler's own rules still beat cellar's defaults", async ({ page }) => {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
-	const cells = page.getByTestId('cell');
-
-	const frame = await runForIframe(cells.nth(2));
+	const frame = await runForIframe(await cellById(page, 'c-styled'));
 
 	// Every property the user stated is theirs - this is the `overwrite=False`
 	// contract of the helper this feature replaces.
@@ -264,11 +323,10 @@ test("an explicit Styler's own rules still beat cellar's defaults", async ({ pag
 test('a layout table and a non-table output are not harmed', async ({ page }) => {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
-	const cells = page.getByTestId('cell');
-
-	// A cell holding block-level prose is a container, not a datum: it keeps
-	// normal wrapping and start alignment, so a two-column layout still reads.
-	const layout = await runForIframe(cells.nth(3));
+	// A cell holding block-level prose is a container, not a datum: it takes back
+	// start alignment rather than inheriting the table's right-align, so a
+	// two-column layout still reads as prose.
+	const layout = await runForIframe(await cellById(page, 'c-layout'));
 	const cellStyle = await styleOf(layout, 'td', ['white-space', 'text-align']);
 	expect(cellStyle['white-space']).toBe('normal');
 	expect(cellStyle['text-align']).toBe('left');
@@ -280,7 +338,7 @@ test('a layout table and a non-table output are not harmed', async ({ page }) =>
 
 	// A div-based rich output has nothing for the table rules to touch: it keeps
 	// the browser's own inline layout, untouched by any of them.
-	const notable = await runForIframe(cells.nth(4));
+	const notable = await runForIframe(await cellById(page, 'c-notable'));
 	await expect(notable.locator('#est')).toContainText('StandardScaler()');
 	const est = await styleOf(notable, '#est', ['white-space', 'text-align', 'padding-top']);
 	expect(est['white-space']).toBe('normal');
@@ -288,10 +346,52 @@ test('a layout table and a non-table output are not harmed', async ({ page }) =>
 	expect(est['padding-top']).toBe('8px'); // its own inline style, untouched
 });
 
+test('a long text column wraps into view instead of scrolling away', async ({ page }) => {
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	const text = await cellById(page, 'c-text');
+
+	const frame = await runForIframe(text);
+
+	// Bare text in the `<td>`, so it does NOT take the `:has()` escape - this is
+	// the ordinary cell rule, and it must leave pandas/Jupyter wrapping alone.
+	const td = frame.locator('tbody td').first();
+	expect((await styleOf(frame, 'tbody td', ['white-space']))['white-space']).toBe('normal');
+	const layout = await td.evaluate((el) => {
+		const line = parseFloat(getComputedStyle(el).lineHeight) || 20;
+		return {
+			wraps: el.getBoundingClientRect().height > line * 1.5,
+			docScrollsSideways:
+				el.ownerDocument.documentElement.scrollWidth > el.ownerDocument.documentElement.clientWidth
+		};
+	});
+	expect(layout.wraps).toBe(true);
+	// Wrapping is what keeps a text-heavy table out of a horizontal scroll.
+	expect(layout.docScrollsSideways).toBe(false);
+
+	if (EVIDENCE) await text.screenshot({ path: join(EVIDENCE, 'output-table-text.png') });
+});
+
+test("a Styler's TABLE-level alignment beats cellar's default", async ({ page }) => {
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	const frame = await runForIframe(await cellById(page, 'c-tablelevel'));
+
+	// `set_table_styles([{'selector': '', 'props': 'text-align:left'}])` states its
+	// rule on the TABLE, and `text-align` reaches a cell only by inheritance. A
+	// cellar default declared on `th,td` would apply directly and silently outrank
+	// it; declared on `table`, the id-scoped user rule wins on the same element.
+	expect((await styleOf(frame, 'tbody td', ['text-align']))['text-align']).toBe('left');
+	expect((await styleOf(frame, 'thead th', ['text-align']))['text-align']).toBe('left');
+
+	// …while padding, which they did not state, still gets cellar's default.
+	expect((await styleOf(frame, 'tbody td', ['padding-right']))['padding-right']).toBe('20px');
+});
+
 test("a pandas `_repr_html_` still routes to the native grid, not the styled iframe", async ({ page }) => {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
-	const c = page.getByTestId('cell').nth(5);
+	const c = await cellById(page, 'c-grid');
 
 	// `dataframeHtml.ts` recognizes `class="dataframe"` and hands it to
 	// DataFrameGrid - this styling change must not have diverted that path.

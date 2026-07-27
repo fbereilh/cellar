@@ -24,17 +24,36 @@
  *    so this is deliberately NOT theme-adaptive - same convention as classic
  *    Jupyter / nbconvert. See the header comment in `HtmlOutput.svelte`.
  *
- * The one non-obvious rule is the last one. `white-space:nowrap` is what keeps a
- * numeric table from wrapping raggedly (paired with the table's own
- * `overflow-x`, so a wide one scrolls itself rather than spilling into a
- * document-level horizontal scroll), but the same iframe also renders arbitrary
- * `IPython.display.HTML`, where a `<table>` is sometimes a two-column *layout*.
- * There, nowrap + right-align collapses each prose cell onto one scrolled-away
- * line - measurably worse than the browser default. A cell holding block-level
- * content is a container, not a datum (a pandas cell only ever holds text), so
- * `:has()` hands those cells back normal wrapping and start alignment. It stays
- * at element specificity: `:has()` takes the specificity of its most specific
- * argument, and every argument here is a type selector.
+ * Two consequences of rule 1 are subtle enough that an edit would undo them by
+ * accident:
+ *
+ * **`text-align:right` sits on `table`, not on `th,td`, precisely so a user's
+ * table-level rule wins.** An inherited value is only used when no declaration
+ * applies to the element itself, so a cell rule would outrank ANY value the user
+ * sets on an ancestor - and `df.style.set_table_styles([{'selector': '', …}])`,
+ * the standard Styler idiom for aligning a whole table, emits exactly that
+ * (`#T_xxxx{text-align:left}` on the table element). Declared on `table`, the two
+ * meet on the same element and the id wins, then inherits down. Right stays the
+ * default: it is the pandas numeric convention. Do not move it onto the cells.
+ *
+ * **The table stays a real table.** No `display:block`, because that wraps the
+ * rows in an anonymous table box of `width:auto` - a user's `<table width="100%">`
+ * or `#T_xxxx{width:100%;table-layout:fixed}` would still apply and simply stop
+ * having an effect. Cells therefore wrap normally (the pandas/Jupyter default), so
+ * a long text column reads instead of scrolling; a genuinely wide table - many
+ * numeric columns, which cannot wrap - overflows and scrolls the output iframe's
+ * own document. The app page never scrolls sideways either way: the iframe is
+ * fixed-width and clips.
+ *
+ * The one non-obvious rule is the last one. The same iframe also renders
+ * arbitrary `IPython.display.HTML`, where a `<table>` is sometimes a two-column
+ * *layout*; there the table's right-align would inherit into each prose cell and
+ * ragged-right a paragraph. A cell holding block-level content is a container,
+ * not a datum (a pandas cell only ever holds text), so `:has()` hands those cells
+ * back start alignment - deliberately a DIRECT rule, since it exists to beat the
+ * table-level default it would otherwise inherit. It stays at element
+ * specificity: `:has()` takes the specificity of its most specific argument, and
+ * every argument here is a type selector.
  *
  * Scope note: this block only reaches *rich `text/html`* outputs. A plain
  * DataFrame renders through the native `DataFrameGrid` (structured
@@ -46,13 +65,13 @@ export const OUTPUT_HTML_CSS = `
 html,body{margin:0;padding:8px;background:#ffffff;color:#1f2937;font-family:system-ui,-apple-system,sans-serif;font-size:14px;}
 img,svg,canvas{max-width:100%;}
 
-table{display:block;overflow-x:auto;max-width:100%;border-collapse:collapse;border:0;font-variant-numeric:tabular-nums;}
-caption{display:block;text-align:left;font-weight:600;color:#111827;padding:0 0 6px;}
-th,td{padding:7px 20px;white-space:nowrap;text-align:right;border:0;border-bottom:1px solid #eef1f4;}
+table{max-width:100%;border-collapse:collapse;border:0;text-align:right;font-variant-numeric:tabular-nums;}
+caption{text-align:left;font-weight:600;color:#111827;padding:0 0 6px;}
+th,td{padding:7px 20px;border:0;border-bottom:1px solid #eef1f4;}
 th{font-weight:600;color:#111827;}
 thead th{border-bottom:1px solid #cbd5e1;vertical-align:bottom;}
 tbody th{text-align:left;}
-td:has(p,div,ul,ol,pre,table,h1,h2,h3,h4,h5,h6),th:has(p,div,ul,ol,pre,table,h1,h2,h3,h4,h5,h6){white-space:normal;text-align:left;}
+td:has(p,div,ul,ol,pre,table,h1,h2,h3,h4,h5,h6),th:has(p,div,ul,ol,pre,table,h1,h2,h3,h4,h5,h6){text-align:left;}
 `.trim();
 
 /**
