@@ -126,6 +126,27 @@ export function clearSurface(key: string) {
 const MATH_SELECTOR = '.katex, .katex-error';
 
 /**
+ * Was this node produced by KaTeX's OWN error path rather than the markdown-it
+ * plugin's?
+ *
+ * Both wear `katex-error` and they carry the source TeX in OPPOSITE places, so the
+ * two must be told apart structurally, never by guessing which string looks like a
+ * message. KaTeX's `renderError` (the `throwOnError:false` swallow of a `ParseError`)
+ * is the ONLY place KaTeX emits the class, it always builds a `<span>`, and it sets
+ * `title` (the message) and `style="color:…"` (the error color) unconditionally on
+ * the same three lines. The plugin's own `catch` - reachable because `throwOnError`
+ * suppresses only `ParseError`, so a `RangeError` from deeply nested input still
+ * propagates - emits `<span class="katex-error" title="{latex}">{message}</span>`
+ * and `<p class="katex-block katex-error" title="{latex}">{message}</p>`: latex in
+ * the title, message in the text, and no `style` at all (its block form is a `<p>`,
+ * a shape KaTeX never emits). So "a span carrying an inline style" is a property of
+ * how each node is BUILT, not of what it says.
+ */
+function isKatexNativeError(el: Element): boolean {
+	return el.tagName === 'SPAN' && el.hasAttribute('style');
+}
+
+/**
  * The text a typeset expression contributes to the walk: its own TeX SOURCE between
  * the delimiters it was written with, which is what the model's text holds for that
  * region. The glyphs are deliberately not used - they are a different string from
@@ -133,17 +154,20 @@ const MATH_SELECTOR = '.katex, .katex-error';
  * occurrence's ordinal.
  */
 function mathSourceText(el: Element): string {
-	const display =
-		el.classList.contains('katex-display') ||
-		!!el.closest('.katex-display, p.katex-block') ||
-		!!el.querySelector('.katex-display, math[display="block"]');
-	const delim = display ? '$$' : '$';
+	// The delimiter comes from what the SOURCE wrote, not from what KaTeX chose to
+	// render: the plugin promotes INLINE math matching `\begin{align|equation|…}` to
+	// `displayMode`, so `.katex-display` appears over a single-`$` source and reading
+	// it would rebuild `$$…$$` - two characters per side the model never had. Only
+	// the plugin's `<p class="katex-block">` wrapper marks a `$$…$$` source; it wraps
+	// every block form and nothing else.
+	const delim = el.closest('p.katex-block') ? '$$' : '$';
 	// `.katex` (typeset): the `<annotation>` carries the source TeX verbatim.
-	// `.katex-error` (KaTeX's own node under `throwOnError:false`): its VISIBLE text is
-	// already the source TeX - the message lives in `title` - so it needs nothing but
-	// the delimiters back.
+	// `.katex-error`: the source TeX is the visible text on KaTeX's own node and the
+	// `title` on the plugin's - see {@link isKatexNativeError}.
 	const tex = el.classList.contains('katex-error')
-		? (el.textContent ?? '')
+		? isKatexNativeError(el)
+			? (el.textContent ?? '')
+			: (el.getAttribute('title') ?? '')
 		: (el.querySelector('annotation')?.textContent ??
 			el.querySelector('.katex-html')?.textContent ??
 			'');
@@ -163,6 +187,15 @@ function mathSourceText(el: Element): string {
  * therefore index by ordinal and tolerate a hole, never compact the array: dropping
  * the entry would slide every later occurrence's ordinal by one and emphasize the
  * wrong match (see `buildCellHighlights`).
+ *
+ * What the math substitution has to preserve is the SEQUENCE of occurrences, not the
+ * region's length: a reconstruction the query never matches inside costs nothing,
+ * while one that yields a different NUMBER of matches than the model's own text does
+ * slides every later ordinal. Two accepted narrowings, both of which change lengths
+ * only: the plugin's `` $`x`$ `` form reconstructs WITHOUT the backticks, which is
+ * right because `strippedMarkdown` strips code-span backticks from the model too; and
+ * a fenced `$$`-on-its-own-line block loses the newline after the opening delimiter
+ * (markdown-it does not keep it), so only a query spanning that newline is affected.
  *
  * @param root the surface container (already scoped by the caller so it holds only
  *   the surface's own text, e.g. `.cm-static-content`, not the line-number gutter).

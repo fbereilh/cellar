@@ -184,11 +184,20 @@ const settle = () => new Promise((r) => setTimeout(r, 50));
  * behind, so it may never arrive. So loop until a whole settle window passes with
  * NOTHING new, which is load-independent in both directions, then clear.
  */
-async function quiesceAndReset(): Promise<void> {
+async function quiesceAndReset(timeoutMs = 5000): Promise<void> {
+	// Bounded like `until()`: a RECURRING broadcast source (a future periodic
+	// publish, a memory poll that starts reporting a changing RSS) would otherwise
+	// spin here until vitest's hook timeout - an opaque hang in the one file whose
+	// whole point is that failures are named and load-independent.
+	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const seen = h.statusBroadcasts.length;
 		await settle();
 		if (h.statusBroadcasts.length === seen) break;
+		if (Date.now() > deadline)
+			throw new Error(
+				`broadcasts never quiesced (still arriving after ${timeoutMs}ms; ${h.statusBroadcasts.length} seen)`
+			);
 	}
 	h.statusBroadcasts.length = 0;
 }

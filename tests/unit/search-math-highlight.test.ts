@@ -120,3 +120,92 @@ describe('active-match highlighting in a markdown cell containing math', () => {
 		expect(contextFrom(activeRange(matches.length - 1)!.range!)).toBe('x two');
 	});
 });
+
+// The SECOND error-node shape. `throwOnError:false` suppresses only `ParseError`, so
+// any other throw - a `RangeError` from deeply nested input is the reachable one -
+// propagates out of KaTeX and is caught by the markdown-it plugin instead. Its node
+// is the INVERSE of KaTeX's: the latex lives in `title` and the visible text is the
+// error message, so a walk that reads either place unconditionally contributes the
+// wrong string for one of them and slides every later ordinal.
+describe('the markdown-it plugin error node (the non-ParseError catch path)', () => {
+	/** Nested deeply enough to overflow the parser's stack, whatever the runtime. */
+	const DEPTH = 20000;
+	const NESTED = '{'.repeat(DEPTH) + '}'.repeat(DEPTH);
+
+	it('is really the plugin`s node, not KaTeX`s (inverted: latex in title, message in text)', () => {
+		const { host } = pipeline(`one $${NESTED}$ two`, 'zzz-no-match');
+		const err = host.querySelector('.katex-error')!;
+		expect(err).not.toBeNull();
+		expect(err.tagName).toBe('SPAN');
+		// KaTeX's own node would carry the error color; the plugin's sets no style.
+		expect(err.hasAttribute('style')).toBe(false);
+		expect(err.textContent).toContain('RangeError');
+		expect(err.getAttribute('title')).toHaveLength(NESTED.length);
+	});
+
+	it('contributes the SOURCE TeX, so the region has the model`s own match count', () => {
+		// A length assertion with teeth: every one of the source's braces must be in
+		// the reconstructed region. Reading the visible text instead yields the error
+		// message, which has none of them.
+		const { matches, ranges } = pipeline(`one $${NESTED}$ two`, '{');
+		expect(matches).toHaveLength(DEPTH);
+		expect(ranges).toHaveLength(DEPTH);
+	});
+
+	it('keeps later prose ordinals aligned (inline form)', () => {
+		// "error" appears twice in the source but a THIRD time in the message the
+		// buggy walk contributed ("RangeError: …"), which pushed the trailing prose
+		// occurrence onto an unpaintable hole.
+		const { matches, ranges, activeRange } = pipeline(`error one $${NESTED}$ error two`, 'error');
+		expect(matches).toHaveLength(2);
+		expect(ranges).toHaveLength(2);
+		expect(contextFrom(activeRange(1)!.range!)).toBe('error two');
+	});
+
+	it('keeps later prose ordinals aligned (block form, a `<p class="katex-block katex-error">`)', () => {
+		const { matches, ranges, activeRange } = pipeline(
+			`error above\n\n$$\n${NESTED}\n$$\n\nerror below`,
+			'error'
+		);
+		expect(matches).toHaveLength(2);
+		expect(ranges).toHaveLength(2);
+		expect(contextFrom(activeRange(1)!.range!)).toBe('error below');
+	});
+});
+
+// The delimiter has to come from what the SOURCE wrote, never from what KaTeX chose
+// to render.
+describe('delimiter reconstruction', () => {
+	it('keeps ONE `$` for inline math the plugin promoted to display mode', () => {
+		// `\begin{align}` makes the plugin render inline math in displayMode, so
+		// `.katex-display` appears over a single-`$` source; rebuilding `$$…$$` from it
+		// invents two delimiters per side and shifts every later `$` ordinal.
+		const { matches, ranges, activeRange } = pipeline(
+			'a $\\begin{align} x &= 1 \\end{align}$ b costs $5 total',
+			'$'
+		);
+		expect(matches).toHaveLength(3); // the two delimiters + the literal price
+		expect(ranges).toHaveLength(3);
+		expect(activeRange(0)!.range).toBeNull(); // opening delimiter: inside the math
+		expect(activeRange(1)!.range).toBeNull(); // closing delimiter
+		expect(contextFrom(activeRange(2)!.range!)).toBe('$5 total'); // the prose price
+	});
+
+	it('drops the backticks of the ``$`x`$`` form, because the model drops them too', () => {
+		// `strippedMarkdown` strips code-span backticks, so the model's text for this
+		// source is `$a+b$` - reconstructing them here would ADD occurrences the model
+		// never counted.
+		const SRC = 'before $`a+b`$ after';
+		const backtick = pipeline(SRC, '`');
+		// Nothing to paint on the RENDERED surface: the model's rendered-markdown text
+		// has no backtick, so neither may the walk (the raw-source matches that remain
+		// belong to the editor surface, a different field-group entirely).
+		expect(backtick.matches.filter((m) => m.field === 'markdown')).toHaveLength(0);
+		expect(backtick.ranges).toHaveLength(0);
+		const { matches, ranges, activeRange } = pipeline(SRC, 'a');
+		expect(matches).toHaveLength(2);
+		expect(ranges).toHaveLength(2);
+		expect(activeRange(0)!.range).toBeNull(); // the `a` inside the math
+		expect(contextFrom(activeRange(1)!.range!)).toBe('after');
+	});
+});

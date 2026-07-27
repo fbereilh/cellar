@@ -1,8 +1,15 @@
 // @vitest-environment jsdom
 //
-// TeX math in the ONE markdown pipeline (`src/lib/markdown.ts`), which feeds
-// notebook markdown cells, `.md` file previews and the markdown-table-in-output
-// path alike — so what this file pins holds on every rendered surface.
+// TeX math in the ONE markdown pipeline (`src/lib/markdown.ts`), which exposes two
+// renderers over a single markdown-it + a single sanitize call site, split by
+// CONTENT CLASS: `renderMarkdown` (authored prose — notebook markdown cells and
+// `.md` file previews) typesets math, `renderOutputMarkdown` (the
+// markdown-table-in-KERNEL-OUTPUT path) deliberately does NOT. Kernel output is
+// arbitrary data and a printed price column ("$5", "$1,200") is the everyday case,
+// so $-scanning it would false-typeset the user's own data — which is why routing
+// `renderTable` back onto `renderMarkdown` would be a regression, not a
+// simplification. Everything else about the two is identical, and the
+// `kernel output is rendered WITHOUT math` block below pins both halves of that.
 //
 // It runs under jsdom rather than the suite's default `node` environment on
 // purpose: DOMPurify is the security half of this feature and needs a real DOM,
@@ -82,9 +89,10 @@ describe('math rendering', () => {
 		expect(annotation?.textContent).toBe('a^2+b^2=c^2');
 	});
 
-	it('renders the same math identically wherever markdown is rendered', () => {
-		// Cells, `.md` previews and output tables all call this one function, so a
-		// single engine is provable by construction; pin that it is deterministic.
+	it('renders the same math identically wherever PROSE is rendered', () => {
+		// Cells and `.md` previews call this one function, so a single engine is
+		// provable by construction; pin that it is deterministic. (Kernel output is
+		// the other content class and gets the math-free renderer — see the header.)
 		const src = 'x $\\frac{1}{2}$ y';
 		expect(renderMarkdown(src)).toBe(renderMarkdown(src));
 	});
