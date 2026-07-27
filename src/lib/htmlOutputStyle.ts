@@ -37,10 +37,12 @@
  * 1. **Every selector stays at element-level specificity (0-0-1 / 0-0-2).**
  *    These are *defaults*, not opinions - a pandas Styler emits its own
  *    `#T_xxxx td { … }` rules (0-1-0-0, id-scoped) and `set_properties` emits
- *    per-cell `#T_xxxx_row0_col0`, so anything the user states explicitly wins
- *    the cascade with room to spare. That reproduces the mental model of the
- *    helper this replaces, which passed `overwrite=False`. Adding a class or id
- *    to a selector here would start silently beating user styling, so
+ *    per-cell `#T_xxxx_row0_col0`, so anything the user states explicitly on the
+ *    SAME element wins the cascade with room to spare (the one qualifier is the
+ *    direct-declaration list below, which an id-scoped rule still beats). That
+ *    reproduces the mental model of the helper this replaces, which passed
+ *    `overwrite=False`. Adding a class or id to a selector here would start
+ *    silently beating user styling, so
  *    `tests/unit/html-output-style.test.ts` fails the build on one.
  *
  * 2. **The canvas stays a light document.** Rich HTML outputs (Styler, folium,
@@ -60,21 +62,32 @@
  * meet on the same element and the id wins, then inherits down. Right stays the
  * default: it is the pandas numeric convention. Do not move it onto the cells.
  *
- * That is the rule for the DATA alignment, and it has exactly TWO deliberate
- * exceptions, both stated DIRECTLY on their element rather than inherited, so the
- * documented contract matches the stylesheet: `tbody th{text-align:left}` (the
- * index column reads as a label, the pandas convention) and
- * `caption{text-align:left}` (a caption reads as a title - and an INHERITED
- * caption would pick up the table's numeric right-align, which is worse than the
- * thing this exception costs). Both remain overridable through the id-scoped
- * escape hatch (`#T_xxxx th`, `#T_xxxx caption`), so rule 1's user-always-wins
- * contract still holds for anyone who targets them. The one honest caveat: a
- * WHOLE-TABLE idiom - `set_table_styles([{'selector': '', 'props':
- * 'text-align:center'}])`, i.e. `#T_xxxx{text-align:center}` - moves the data
- * cells but NOT these two, since a direct declaration always beats an inherited
- * value whatever the specificity. Keep both as direct rules; the third direct
- * `text-align` is the `:has()` escape below, for the same beat-the-inherited
- * -default reason.
+ * That is the rule for the DATA alignment, and it generalizes: ONE mechanism
+ * bounds it, so state the mechanism once rather than re-deriving it per property.
+ * A DIRECT declaration of an INHERITED property always beats an inherited value,
+ * whatever the specificity - so every such declaration below on a NON-`table`
+ * element sits outside the reach of the whole-table Styler idiom
+ * (`set_table_styles([{'selector': '', 'props': …}])`, i.e. `#T_xxxx{…}`), which
+ * moves the data cells but not these. The complete list, and why each is
+ * deliberate: `tbody th{text-align:left}` (the index column reads as a label, the
+ * pandas convention); `caption{text-align:left}` (a caption reads as a title - and
+ * an INHERITED caption would pick up the table's numeric right-align, which is
+ * worse than the thing this costs); `caption{font-weight:600}` for the same
+ * title-not-datum reason; and `th{color}` / `caption{color}`, the darker ink that
+ * separates a heading from its data. Every one stays overridable through the
+ * id-scoped escape hatch (`#T_xxxx th{color:…}`, `#T_xxxx caption`, `#T_xxxx th`),
+ * so rule 1's user-always-wins contract holds literally, not merely nearly: these
+ * are documented exceptions to ONE idiom, never unbeatable rules. Keep them
+ * direct; the last direct `text-align` is the `:has()` escape below, for the same
+ * beat-the-inherited-default reason.
+ *
+ * Two of those are NOT reach cellar took away, so a future reader does not re-raise
+ * them as regressions: the UA sheet already declares `th{font-weight:bold}` and
+ * `caption{text-align:center}` DIRECTLY, so a table-level rule never reached either
+ * property in the first place. Cellar's `th{font-weight:600}` and
+ * `caption{text-align:left}` change what they look like, not what can override
+ * them. The genuinely new ones are `th{color}`, `caption{color}` and
+ * `caption{font-weight}`.
  *
  * **The table stays a real table, and carries no `max-width`.** No
  * `display:block`, because that wraps the rows in an anonymous table box of
