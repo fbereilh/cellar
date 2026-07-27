@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
-import { isCellMounted, setScrollTop } from './notebook-scroll';
+import { isCellMounted, paneMetric, setScrollTop } from './notebook-scroll';
 
 /**
  * E2E for the comfortable default styling of HTML tables in cell output
@@ -186,6 +186,9 @@ async function openNotebook(page: Page): Promise<void> {
 	await expect(page.getByTestId('cell').first()).toBeVisible();
 }
 
+/** How far each sweep step advances the pane while hunting for a spacer cell. */
+const SCAN_STEP_PX = 500;
+
 /**
  * Address a cell by its stable id, scrolling until virtualization has mounted it.
  *
@@ -195,13 +198,36 @@ async function openNotebook(page: Page): Promise<void> {
  * that locator, so an index silently addresses the wrong cell. This spec runs at
  * the shipped windowing default (see the virtualization entry in AGENTS.md); its
  * subject is the CSS cascade, so it mounts what it needs rather than opting out.
+ *
+ * The sweep runs inside `expect.poll` for one load-bearing reason: `Notebook.svelte`
+ * re-plans its window off rAF-COALESCED pane metrics, so the mount that a scroll
+ * causes lands a frame or more after the scroll itself. Consecutive `page.evaluate`
+ * round trips complete well inside one frame, so a tight loop sweeps the entire
+ * scroll range before a single re-plan runs, clamps at the bottom, and then waits
+ * out its timeout at a fixed offset - a target in the MIDDLE of the notebook would
+ * never mount. The poll interval is what gives the re-plan room (the same reason
+ * `virtualization-remote-edit-run.spec.ts` polls around its scroll); do not
+ * "optimize" it back into a bare loop. The offset wraps rather than clamping, so
+ * the sweep keeps covering the whole notebook for a target anywhere in it.
  */
 async function cellById(page: Page, id: string): Promise<Locator> {
 	const cell = page.locator(`[data-cell-id="${id}"]`);
-	for (let step = 0; step < 60 && !(await isCellMounted(page, id)); step++) {
-		await setScrollTop(page, step * 500);
-	}
-	await expect(cell).toBeAttached({ timeout: 15_000 });
+	let step = 0;
+	await expect
+		.poll(
+			async () => {
+				if (await isCellMounted(page, id)) return true;
+				const max = Math.max(
+					0,
+					(await paneMetric(page, 'scrollHeight')) - (await paneMetric(page, 'clientHeight'))
+				);
+				await setScrollTop(page, max > 0 ? (step++ * SCAN_STEP_PX) % (max + SCAN_STEP_PX) : 0);
+				return false;
+			},
+			{ timeout: 30_000 }
+		)
+		.toBe(true);
+	await expect(cell).toBeAttached();
 	await cell.scrollIntoViewIfNeeded();
 	return cell;
 }

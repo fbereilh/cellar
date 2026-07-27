@@ -60,6 +60,22 @@
  * meet on the same element and the id wins, then inherits down. Right stays the
  * default: it is the pandas numeric convention. Do not move it onto the cells.
  *
+ * That is the rule for the DATA alignment, and it has exactly TWO deliberate
+ * exceptions, both stated DIRECTLY on their element rather than inherited, so the
+ * documented contract matches the stylesheet: `tbody th{text-align:left}` (the
+ * index column reads as a label, the pandas convention) and
+ * `caption{text-align:left}` (a caption reads as a title - and an INHERITED
+ * caption would pick up the table's numeric right-align, which is worse than the
+ * thing this exception costs). Both remain overridable through the id-scoped
+ * escape hatch (`#T_xxxx th`, `#T_xxxx caption`), so rule 1's user-always-wins
+ * contract still holds for anyone who targets them. The one honest caveat: a
+ * WHOLE-TABLE idiom - `set_table_styles([{'selector': '', 'props':
+ * 'text-align:center'}])`, i.e. `#T_xxxx{text-align:center}` - moves the data
+ * cells but NOT these two, since a direct declaration always beats an inherited
+ * value whatever the specificity. Keep both as direct rules; the third direct
+ * `text-align` is the `:has()` escape below, for the same beat-the-inherited
+ * -default reason.
+ *
  * **The table stays a real table, and carries no `max-width`.** No
  * `display:block`, because that wraps the rows in an anonymous table box of
  * `width:auto` - a user's `<table width="100%">` or
