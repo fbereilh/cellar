@@ -16,6 +16,16 @@
 // and asserting the sanitizer's actual behavior (rather than the shape of its
 // config) is the only test that can catch a KaTeX allowlist extension having
 // quietly let script through.
+//
+// `jsdom` is therefore pinned to a major whose own `engines.node` is `>=18`, and
+// bumping it past that REQUIRES bumping CI's Node first. jsdom 30 needs Node
+// `^22.22.2 || ^24.15.0 || >=26`, and on anything older it fails at IMPORT (its
+// `api.js` pulls `undici`, whose `CacheStorage` calls `webidl.util.markAsUncloneable`).
+// That failure is easy to miss locally on a new Node and lands as a red CI on
+// Node 20 (`.github/workflows/ci.yml`, pinned to LTS; `package.json` `engines`
+// says `>=18`) - and it does NOT fail the suite honestly: the two jsdom files
+// simply never load, so vitest reports every OTHER file passing next to an
+// unhandled error, which reads as green at a glance.
 import { describe, it, expect } from 'vitest';
 import {
 	renderMarkdown,
