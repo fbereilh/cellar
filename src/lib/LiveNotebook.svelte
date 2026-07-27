@@ -431,6 +431,39 @@
 		saveEditorCollapsed();
 	}
 
+	// ---- Markdown raw-edit mode ----------------------------------------------
+	// Which markdown cells the user has opened for RAW source editing (a rendered
+	// markdown cell shows its rendered HTML until then). Owned here, not in the
+	// Cell, for the same reason as the collapse choice above: windowing destroys
+	// and rebuilds a Cell whenever it leaves and re-enters the window, so a
+	// per-instance flag would snap a cell the user is editing back to its rendered
+	// view the moment it scrolled out of sight. Runtime-only + per notebook, never
+	// written to the `.ipynb` (zero git-diff).
+	let rawEdits = $state<Record<string, boolean | undefined>>({});
+
+	function rawEditsKey(): string | null {
+		return canonicalId ? `cellar-raw-edit:${canonicalId}` : null;
+	}
+	function loadRawEdits() {
+		const key = rawEditsKey();
+		if (!key) return;
+		const saved = getUi(key, null);
+		rawEdits = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+	}
+	function saveRawEdits() {
+		const key = rawEditsKey();
+		if (!key) return;
+		setUi(key, rawEdits);
+	}
+	function setRawEdit(id: string, raw: boolean) {
+		if ((rawEdits[id] ?? false) === raw) return;
+		const next = { ...rawEdits };
+		if (raw) next[id] = true;
+		else delete next[id];
+		rawEdits = next;
+		saveRawEdits();
+	}
+
 	// ---- Git cell decorations ------------------------------------------------
 	// The notebook-level counterpart of the editor's gutter change bars: mark
 	// which *cells* differ from the notebook's git-HEAD version. The server hands
@@ -1068,6 +1101,7 @@
 			if (!activeId || !cells.some((c) => c.id === activeId)) activeId = cells[0]?.id ?? null;
 			loadFolds(); // restore this notebook's collapsed sections (runtime-only, per notebook)
 			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
+			loadRawEdits(); // restore which markdown cells are open for raw editing (runtime-only)
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
@@ -2338,6 +2372,8 @@
 			onSetHideInput={setHideInput}
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}
+			rawEdits={rawEdits}
+			onSetRawEdit={setRawEdit}
 			onActivate={setActive}
 			onRegister={registerCell}
 			onEditorFocus={onEditorFocus}

@@ -77,6 +77,9 @@
 		/** cell id → explicit code-editor collapse choice (runtime-only) */
 		editorCollapsed?: Record<string, boolean | undefined>;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
+		/** cell id → this markdown cell is open for raw source editing (runtime-only) */
+		rawEdits?: Record<string, boolean | undefined>;
+		onSetRawEdit?: (id: string, raw: boolean) => void;
 		onActivate?: (id: string) => void;
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		onEditorFocus?: (id: string) => void;
@@ -148,6 +151,8 @@
 		onSetHideInput,
 		editorCollapsed = {},
 		onSetEditorCollapsed,
+		rawEdits = {},
+		onSetRawEdit,
 		onActivate,
 		onRegister,
 		onEditorFocus,
@@ -537,6 +542,8 @@
 			onSetHideInput={onSetHideInput}
 			editorCollapsed={editorCollapsed[cell.id]}
 			onSetEditorCollapsed={onSetEditorCollapsed}
+			rawEdit={rawEdits[cell.id] ?? false}
+			onSetRawEdit={onSetRawEdit}
 			onActivate={onActivate}
 			{searchQuery}
 			{searchCaseSensitive}

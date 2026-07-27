@@ -82,6 +82,10 @@
 		/** Per-cell code-editor collapse choice (undefined = auto / true / false). */
 		editorCollapsed?: boolean;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
+		/** This markdown cell is open for RAW source editing (see `mode` below). Owned
+		 *  by the notebook, like `editorCollapsed`, so it survives a windowed unmount. */
+		rawEdit?: boolean;
+		onSetRawEdit?: (id: string, raw: boolean) => void;
 		onActivate?: (id: string) => void;
 		/** Find-in-page query (Search P4); empty when the find bar is closed / this
 		 *  notebook isn't the searched one. Non-empty drives in-place highlighting. */
@@ -134,6 +138,8 @@
 		onSetHideInput,
 		editorCollapsed,
 		onSetEditorCollapsed,
+		rawEdit = false,
+		onSetRawEdit,
 		onActivate,
 		searchQuery = '',
 		searchCaseSensitive = false,
@@ -230,7 +236,15 @@
 	// `$state`-init-plus-one-shot-event design did (the bug this fixes). Reopening a
 	// notebook already rendered because those cells mount with source; this makes
 	// live agent-created cells behave identically.
-	let rawEdit = $state(false);
+	//
+	// The flag itself is OWNED BY THE NOTEBOOK (the `rawEdit` prop + `onSetRawEdit`,
+	// exactly like `editorCollapsed`): under windowing this Cell is destroyed and
+	// rebuilt whenever it leaves and re-enters the window, and per-instance `$state`
+	// would silently snap a cell the user opened for editing back to its rendered
+	// view. Every set/clear site below writes through `setRawEdit`.
+	function setRawEdit(raw: boolean) {
+		onSetRawEdit?.(cell.id, raw);
+	}
 	const mode = $derived(
 		isMarkdown && !rawEdit && liveSource.trim().length > 0 ? 'rendered' : 'edit'
 	);
@@ -752,10 +766,20 @@
 	// editor in place ONLY when the user isn't actively editing this cell
 	// (unfocused and no pending local change). Otherwise we stash it and surface a
 	// subtle "changed on server" affordance so the user's typing is never clobbered.
+	//
+	// `cell.remoteEdit` is a ONE-SHOT command, so it is CONSUMED (nulled) the moment
+	// this effect has handled it. Under windowing a Cell instance is torn down and
+	// rebuilt whenever the cell leaves and re-enters the window, which resets the
+	// per-instance `appliedRemote` guard - an unconsumed marker would then be
+	// replayed by the fresh instance and overwrite a NEWER local edit the user has
+	// since made (`cell.source`/`savedSource` reset to the stale remote text, with
+	// no re-PATCH to correct it). LiveNotebook assigns a fresh object per remote
+	// edit, so consuming here can never drop a future one.
 	$effect(() => {
 		const re = cell.remoteEdit;
 		if (!re || re === appliedRemote) return;
 		appliedRemote = re;
+		cell.remoteEdit = null;
 		if (!view) {
 			// No live editor is built yet, so there is nothing to clobber and no
 			// active typing to protect: adopt the remote source directly. This keeps
@@ -816,13 +840,13 @@
 		const src = currentSource();
 		liveSource = src;
 		savedSource = src;
-		if (isMarkdown) rawEdit = false;
+		if (isMarkdown) setRawEdit(false);
 		if (advance) onRunAdvance(cell.id, src, { focusNext });
 		else onRun(cell.id, src);
 	}
 
 	async function enterEdit() {
-		rawEdit = true;
+		setRawEdit(true);
 		buildEditor(); // summon the real editor (no-op if already built)
 		await tick();
 		view?.focus();
@@ -887,7 +911,7 @@
 			prevType = type;
 			// A manual type toggle drops into edit mode so the user sees the source
 			// (a code→markdown conversion that rendered immediately would hide it).
-			rawEdit = true;
+			setRawEdit(true);
 		}
 	});
 
@@ -948,7 +972,7 @@
 							// while they type into a fresh empty cell. A rendered markdown cell's
 							// editor is display:none and unfocusable, so this only ever fires
 							// when edit mode is already showing.
-							if (isMarkdown) rawEdit = true;
+							if (isMarkdown) setRawEdit(true);
 							onEditorFocus?.(cell.id);
 							return false;
 						},
@@ -1017,7 +1041,7 @@
 			showRendered: () => {
 				if (!isMarkdown) return;
 				liveSource = currentSource();
-				rawEdit = false;
+				setRawEdit(false);
 			},
 			isMarkdown: () => isMarkdown,
 			// Primitives the notebook's cut/copy, heading and split actions compose.
