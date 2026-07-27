@@ -9,8 +9,7 @@
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
 	import { sql } from '@codemirror/lang-sql';
-	import DOMPurify from 'dompurify';
-	import { md, renderMarkdown } from '$lib/markdown';
+	import { renderMarkdown } from '$lib/markdown';
 	import { EDITOR_THEME } from '$lib/editorTheme';
 	import StaticCode from '$lib/StaticCode.svelte';
 	import type { StaticLang } from '$lib/staticHighlight';
@@ -420,10 +419,12 @@
 		return segs;
 	}
 	// Render a markdown table to sanitized HTML, then apply daisyUI table classes.
+	// Goes through the shared `renderMarkdown` (not a private markdown-it +
+	// DOMPurify pair) so this surface can't drift from the cell/preview one — same
+	// engine, same sanitizer config, one place to change.
 	function renderTable(src: string): string {
 		if (!browser) return '';
-		const html = DOMPurify.sanitize(md.render(src));
-		return html.replace(/<table>/g, '<table class="table table-zebra table-xs">');
+		return renderMarkdown(src).replace(/<table>/g, '<table class="table table-zebra table-xs">');
 	}
 
 	// Map an nbformat output object to a renderable {tone, text, segments}. Text
