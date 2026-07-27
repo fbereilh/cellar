@@ -10,11 +10,12 @@
  *
  * This is a deliberate, faithful re-render of the notebook MODEL rather than a
  * DOM serialization, so it mirrors exactly what `Cell.svelte` shows: the same
- * markdown-it config (bar the one divergence below), the same output priority (a rich image beats the
- * `text/plain` repr), the same markdown-table-in-text detection, the same ANSI
- * scrub on tracebacks. It intentionally does NOT invent renderings Cellar lacks
- * (e.g. `text/html` DataFrames) — "looks like the notebook does in Cellar" is
- * the contract, so a DataFrame exports as its text repr, exactly as in the app.
+ * markdown-it config (bar the one divergence below), the same output priority
+ * (a rich image beats the `text/plain` repr), the same markdown-table-in-text
+ * detection, the same ANSI scrub on tracebacks. It intentionally does NOT invent
+ * renderings Cellar lacks (e.g. `text/html` DataFrames) — "looks like the
+ * notebook does in Cellar" is the contract, so a DataFrame exports as its text
+ * repr, exactly as in the app.
  *
  * ONE deliberate divergence from that mirror: this module is NOT math-aware. The
  * app's authored-prose renderer (`$lib/markdown`) typesets `$…$`/`$$…$$` with
