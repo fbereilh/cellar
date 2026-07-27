@@ -46,7 +46,13 @@ clean-on-save: idempotent, git-clean round-trips, the metadata allowlist, and th
 notebook model. If you touch that pipeline, expect to touch its tests.
 
 CI installs Node only - building and type-checking are pure Node, so CI stays
-fast and needs no kernel runtime.
+fast and needs no kernel runtime. It pins **Node 20** (current LTS) while
+`package.json` `engines` declares `>=18`, so a **dev** dependency that needs a
+newer Node than that floor can pass on your machine and still break CI - and it
+may not break honestly: a dependency that throws at *import* takes only the test files
+that use it out of the run, leaving vitest reporting every other file green
+beside an unhandled error. Pick dev-dependency versions that run on the declared
+floor rather than raising it for one test file.
 
 ### Playwright E2E (best-effort, local)
 

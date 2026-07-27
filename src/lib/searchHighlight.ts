@@ -172,6 +172,18 @@ export interface SearchHighlightState {
  * with the SAME field-group (`source` / `markdown` / `output`) - the ordinal a
  * document-order DOM re-scan of that surface will land on. Pure; input order (the
  * engine's document order) is preserved.
+ *
+ * That correspondence is what `buildTextRanges` (`domHighlight.ts`) upholds from the
+ * DOM side, and typeset math is why it is stated rather than assumed: KaTeX writes
+ * an expression's text into the DOM three times (clipped MathML, its `<annotation>`
+ * TeX, the visible glyphs), so the walk collapses each expression back to ONE
+ * occurrence-worth of text - its source TeX, the same string the model counted. An
+ * occurrence that lands inside math therefore has NO paintable range; the DOM side
+ * returns a positional `null` for it rather than dropping it, so this ordinal keeps
+ * pointing at the same occurrence either way. The correspondence is exact up to
+ * `strippedMarkdown`'s own light syntax stripping (`$lib/search`), which the model
+ * applies to the whole source, math included - `buildTextRanges` enumerates the three
+ * narrowings that follow from that.
  */
 export function buildCellHighlights(
 	matches: readonly Match[],

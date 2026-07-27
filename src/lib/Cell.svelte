@@ -9,8 +9,7 @@
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
 	import { sql } from '@codemirror/lang-sql';
-	import DOMPurify from 'dompurify';
-	import { md, renderMarkdown } from '$lib/markdown';
+	import { renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
 	import { EDITOR_THEME } from '$lib/editorTheme';
 	import StaticCode from '$lib/StaticCode.svelte';
 	import type { StaticLang } from '$lib/staticHighlight';
@@ -264,8 +263,11 @@
 		isMarkdown && !rawEdit && liveSource.trim().length > 0 ? 'rendered' : 'edit'
 	);
 
-	// Markdown is rendered through the shared engine in `$lib/markdown.js` (safe
-	// mode + DOMPurify), so cells and the file preview parse identically.
+	// Markdown is rendered through the shared authored-prose renderer in
+	// `$lib/markdown` (safe mode + DOMPurify, `$…$`/`$$…$$` math typeset), so cells
+	// and the `.md` file preview parse identically. Kernel output is the other
+	// content class and goes through `renderOutputMarkdown` instead - see
+	// `renderTable` below.
 	// A markdown cell renders one block per heading segment rather than one blob,
 	// because each heading is independently foldable (a cell may hold several) and
 	// a fold hides the heading's body while leaving the heading itself in view.
@@ -420,10 +422,15 @@
 		return segs;
 	}
 	// Render a markdown table to sanitized HTML, then apply daisyUI table classes.
+	// Goes through the shared `$lib/markdown` (not a private markdown-it + DOMPurify
+	// pair) so this surface can't drift from the cell/preview one - same markdown-it
+	// config, same sanitizer config, same sanitize call site. The one deliberate
+	// difference is `renderOutputMarkdown`: kernel output is arbitrary DATA (a
+	// printed price column is "$5"/"$1,200"), so math is NOT parsed here - see
+	// `markdown.ts`.
 	function renderTable(src: string): string {
 		if (!browser) return '';
-		const html = DOMPurify.sanitize(md.render(src));
-		return html.replace(/<table>/g, '<table class="table table-zebra table-xs">');
+		return renderOutputMarkdown(src).replace(/<table>/g, '<table class="table table-zebra table-xs">');
 	}
 
 	// Map an nbformat output object to a renderable {tone, text, segments}. Text
@@ -1227,8 +1234,12 @@
 			clearSurface(key);
 			return;
 		}
+		// POSITIONAL: entry i is the i-th occurrence, `null` where it cannot be painted
+		// (inside typeset math). Index by ordinal and tolerate the hole - compacting
+		// would slide every later ordinal and emphasize the wrong occurrence.
 		const ranges = buildTextRanges(el, query, opts, findOccurrences);
-		if (!ranges.length) {
+		const paintable = ranges.filter((r): r is Range => r !== null);
+		if (!paintable.length) {
 			clearSurface(key);
 			return;
 		}
@@ -1236,7 +1247,7 @@
 		if (activeOrdinal != null && activeOrdinal >= 0 && activeOrdinal < ranges.length) {
 			activeRange = ranges[activeOrdinal];
 		}
-		const base = activeRange ? ranges.filter((r) => r !== activeRange) : ranges;
+		const base = activeRange ? paintable.filter((r) => r !== activeRange) : paintable;
 		setSurfaceRanges(key, base, activeRange ? [activeRange] : []);
 		if (shouldScroll && activeRange) {
 			const anchor =

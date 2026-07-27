@@ -308,6 +308,14 @@ function outputsUnchanged(
  * Model-based and DOM-independent by design (§5.1) - never parses/renders HTML.
  * Best-effort: it targets the syntax that hides visible words, not a full
  * CommonMark rencoding.
+ *
+ * Deliberately MATH-UNAWARE: `$…$` / `$$…$$` spans are left in place (so an
+ * expression counts once, as its source) and the emphasis collapsing below runs
+ * across them like any other text. Do not teach this function to skip math - it
+ * is the engine's cached hot path, and the only cost is an info-level ordinal
+ * drift for a find on a bare `_`/`*`/`~` in a document whose math uses one
+ * (a subscript). `buildTextRanges` (`$lib/domHighlight`) states that narrowing
+ * from the DOM side and it is pinned by `tests/unit/search-math-highlight.test.ts`.
  */
 export function strippedMarkdown(source: string): string {
 	return (

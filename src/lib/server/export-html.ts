@@ -10,11 +10,22 @@
  *
  * This is a deliberate, faithful re-render of the notebook MODEL rather than a
  * DOM serialization, so it mirrors exactly what `Cell.svelte` shows: the same
- * markdown-it config, the same output priority (a rich image beats the
- * `text/plain` repr), the same markdown-table-in-text detection, the same ANSI
- * scrub on tracebacks. It intentionally does NOT invent renderings Cellar lacks
- * (e.g. `text/html` DataFrames) — "looks like the notebook does in Cellar" is
- * the contract, so a DataFrame exports as its text repr, exactly as in the app.
+ * markdown-it config (bar the one divergence below), the same output priority
+ * (a rich image beats the `text/plain` repr), the same markdown-table-in-text
+ * detection, the same ANSI scrub on tracebacks. It intentionally does NOT invent
+ * renderings Cellar lacks (e.g. `text/html` DataFrames) — "looks like the
+ * notebook does in Cellar" is the contract, so a DataFrame exports as its text
+ * repr, exactly as in the app.
+ *
+ * ONE deliberate divergence from that mirror: this module is NOT math-aware. The
+ * app's authored-prose renderer (`$lib/markdown`) typesets `$…$`/`$$…$$` with
+ * KaTeX; the engine below is this module's own (it always was — server-side, so
+ * `html:false` alone makes it safe and it needs no DOMPurify) and has no math
+ * plugin, so an exported notebook shows `$…$` as literal, legible text.
+ * Typesetting it would mean inlining KaTeX's CSS plus ~1 MB of fonts into every
+ * exported file, against this module's single-file, zero-asset contract. The
+ * cheap future move is KaTeX `output:'mathml'` (native browser MathML, no
+ * assets) — deliberately not done here.
  *
  * The exported palette reuses Cellar's #37 theme tokens verbatim (the pygments
  * "default" light scheme and One Dark), resolved per-scheme with `light-dark()`

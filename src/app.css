@@ -374,6 +374,37 @@ mark.cellar-search-mark-active {
 	padding: 0.3em 0.6em;
 }
 
+/* --- TeX math (KaTeX) -------------------------------------------------------
+ * KaTeX's own stylesheet (bundled via `src/lib/markdown.ts`) does all the
+ * typesetting; these four rules only fit it into Cellar's markdown rhythm. There
+ * is deliberately no color rule: KaTeX sets none either, so math inherits and
+ * tracks `base-content` in both themes for free. */
+.cellar-md .katex {
+	font-size: 1.05em;
+}
+/* A display equation wider than the column scrolls in place rather than widening
+ * the notebook (the `pre`/table convention above). The padding keeps a tall
+ * fraction's ascenders and descenders off the scroll box's edges — `overflow-x`
+ * makes the y-axis a scrollport too, which would otherwise clip them. */
+.cellar-md .katex-display {
+	overflow-x: auto;
+	overflow-y: hidden;
+	padding: 0.25em 0;
+}
+/* The plugin wraps display math in `<p class="katex-block">`; KaTeX's own
+ * `.katex-display` margin carries the vertical rhythm, so the paragraph adds
+ * none of its own. */
+.cellar-md p.katex-block {
+	margin: 0;
+}
+/* An unparseable formula: KaTeX's red error node, shown inline in place of the
+ * math so one bad expression is legible and contained (never a blank cell). */
+.cellar-md .katex-error {
+	font-family: ui-monospace, Menlo, monospace;
+	font-size: 0.9em;
+	white-space: pre-wrap;
+}
+
 /* --- Static (lazy) cell source render -------------------------------------
  * The read-only stand-in a code/markdown cell shows until its CodeMirror editor
  * is built on first focus (see `StaticCode.svelte` + `Cell.svelte`). It mirrors
