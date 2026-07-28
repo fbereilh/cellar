@@ -2451,21 +2451,17 @@
 	// this share one path) and `insertAndRunCode` (no `land`: that path deliberately
 	// never touches `activeId`, so nothing else pins its appended cell).
 	//
-	// `opts.scroll: false` keeps the mount/land/release half and drops only the
-	// movement, for a caller that must place focus on a cell without taking the
-	// reader there (`selectAllCells`). The mount is NOT optional even then: under
+	// Every caller here MOVES focus, which is why the mount is not optional: under
 	// windowing a target outside the natural window has no DOM node and no
 	// registered API, so the land - and with it the modal keyboard, which reads a
-	// keystroke's mode and target off the focused element - would go nowhere.
-	async function scrollCellIntoView(
-		id: string | null,
-		land?: (api: CellRegisterApi | undefined) => void,
-		opts: { scroll?: boolean } = {}
-	) {
+	// keystroke's mode and target off the focused element - would go nowhere. A
+	// caller that moves no focus (`selectAllCells`) must not come through here at
+	// all: this seam reveals as it mounts, and a reveal WRITES persisted fold state.
+	async function scrollCellIntoView(id: string | null, land?: (api: CellRegisterApi | undefined) => void) {
 		if (!id) return;
 		const { el, pin } = await ensureCellMounted(id);
 		land?.(cellApis[id]);
-		if (el && opts.scroll !== false) scrollElementIntoViewNearest(el);
+		if (el) scrollElementIntoViewNearest(el);
 		releaseScrollPin(pin);
 	}
 
@@ -2566,25 +2562,27 @@
 	 * head at the last), because `extendSelection` REBUILDS the selection as
 	 * `rangeIds(anchor, head)`: leaving the head wherever the primary happened to be
 	 * would make the very next Shift+J/K discard everything past it - 300 cells
-	 * collapsing to a handful on one keystroke. Moving the head moves DOM focus, so
-	 * it goes through the shared mount seam (the last cell is almost certainly
-	 * windowed out, and if a collapsed section hides it the reveal is what makes it a
-	 * cell Shift+J/K can walk from) and NOT `selectAndAct`, whose `setActive` would
-	 * collapse the selection this just built.
+	 * collapsing to a handful on one keystroke.
 	 *
-	 * It does NOT scroll (`scroll: false`): select-all is not a navigation, and
-	 * taking the reader to the end of the notebook is a movement they did not ask
-	 * for (JupyterLab leaves the viewport put). The MOUNT still happens - focus must
-	 * land on a real node or the modal keyboard goes dead - and `focusCell` itself
-	 * focuses with `preventScroll`, so nothing moves the pane.
+	 * It touches NOTHING else: no scroll, no DOM focus, no mount, no reveal. This is
+	 * a PURE state change, and deliberately not a navigation - it is the one
+	 * selection path that does not move the primary's focus, so it is also the one
+	 * exempt from the mount-before-focus invariant every other path keeps (a mount
+	 * here would land on a cell nothing is focusing). Going through the mount seam
+	 * cost two side effects nobody asked for: the viewport chasing the head to the
+	 * end of the notebook, and - because `ensureCellMounted` reveals - a collapsed
+	 * section silently UNFOLDING, `saveFolds()` persisting that, so Cmd/Ctrl+A
+	 * expanded whichever section happened to hide the last cell and the change
+	 * survived a reload. The head may therefore be a fold-hidden cell, which is why
+	 * `extendSelection` resolves a head that is absent from the walk by document
+	 * position instead of restarting from the top.
 	 */
-	async function selectAllCells() {
+	function selectAllCells() {
 		const order = cellOrder;
 		if (!order.length) return;
 		selectedIds = new Set(order);
 		anchorId = order[0];
 		activeId = order[order.length - 1];
-		await scrollCellIntoView(activeId, (api) => api?.focusCell(), { scroll: false });
 	}
 
 	// Fold/unfold act on the selected cell only when it is a markdown header, and

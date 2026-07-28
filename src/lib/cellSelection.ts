@@ -229,11 +229,43 @@ export function applyGesture(
 }
 
 /**
+ * Where the head lands when it sits on a cell `walk` does not contain (a
+ * fold-hidden cell): the `delta`-th walkable cell past its DOCUMENT position, in
+ * the direction of travel. Undefined when nothing is left that way; a head absent
+ * from the document order too has no position to step from, so the walk restarts.
+ */
+function stepFromUnwalkableHead(
+	order: readonly string[],
+	walk: readonly string[],
+	activeId: string | null,
+	delta: number
+): string | undefined {
+	const pos = activeId == null ? -1 : order.indexOf(activeId);
+	if (pos < 0) return walk[0];
+	if (!delta) return undefined;
+	// Walkable cells lying before the head in document order; the head sits in the
+	// gap at exactly this insertion point, so `before` is the next entry downward
+	// and `before - 1` the next entry upward.
+	const before = walk.filter((id) => order.indexOf(id) < pos).length;
+	return walk[delta > 0 ? before + delta - 1 : before + delta];
+}
+
+/**
  * Extend the contiguous selection one step in `delta` from the current primary
  * (Shift+J/K, Shift+Arrows). `walk` is the list the head moves along - the
  * SELECTABLE cells, so the head skips cells a folded heading hides exactly like
  * plain `j`/`k` - while the resulting range still fills in by full-document
  * index. Returns null when the head cannot move (no list, or already at the end).
+ *
+ * The head may legitimately BE a fold-hidden cell, and then it is absent from
+ * `walk`: select-all leaves the head on the last cell of the document without
+ * revealing it (revealing writes persisted fold state, which a selection must not
+ * do). Such a head is resolved by its DOCUMENT position - the step lands on the
+ * nearest walkable cell in the direction of travel - because falling back to
+ * `walk[0]` would fling the head to the top of the notebook and `rangeIds` would
+ * then collapse the whole selection on one keystroke. Only a head absent from the
+ * document order itself (a deleted cell) has no position to step from, and there
+ * the walk restarts at its first entry.
  */
 export function extendSelection(
 	order: readonly string[],
@@ -243,7 +275,7 @@ export function extendSelection(
 ): { activeId: string; anchorId: string; selected: Set<string> } | null {
 	if (!walk.length) return null;
 	const at = state.activeId ? walk.indexOf(state.activeId) : -1;
-	const next = walk[at < 0 ? 0 : at + delta];
+	const next = at >= 0 ? walk[at + delta] : stepFromUnwalkableHead(order, walk, state.activeId, delta);
 	if (!next) return null;
 	const anchor = state.anchorId && order.includes(state.anchorId) ? state.anchorId : (state.activeId ?? next);
 	return { activeId: next, anchorId: anchor, selected: new Set(rangeIds(order, anchor, next)) };

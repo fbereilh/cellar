@@ -30,9 +30,10 @@ import { setScrollTop, isCellMounted, mountedCellIds, paneMetric } from './noteb
  *      to, so focus follows the selection and the next keystroke still has a target;
  *   G. a right-click on a member keeps the selection WITHOUT cancelling the press,
  *      and Cmd/Ctrl+A leaves the head at a real end so Shift+K shrinks by one;
- *   H. Cmd/Ctrl+A MOUNTS that far end without scrolling to it (select-all is not a
- *      navigation), and a paste selects the whole pasted block, not just its last
- *      cell - the set-consistency cut/copy and undo already have.
+ *   H. Cmd/Ctrl+A changes nothing BUT the selection - it scrolls nowhere, mounts
+ *      nothing and unfolds nothing, so it can neither move the reader nor write
+ *      persisted fold state - and a paste selects the whole pasted block, not just
+ *      its last cell - the set-consistency cut/copy and undo already have.
  *
  * Every assertion about WHICH cells an op touched reads the SERVER document, not
  * the DOM: the DOM can only ever show the window, and "it looked right on screen"
@@ -368,15 +369,25 @@ test('Cmd/Ctrl+A leaves the head at the last cell, so Shift+K shrinks by one', a
 	const last = order[order.length - 1];
 
 	await clickCell(page, (await mountedCellIds(page))[1]);
+	// Expand everything first: fold state is PERSISTED per notebook (server-side, so
+	// a fresh browser context does not clear it) and this file shares one workspace,
+	// so an earlier test's collapsed section would otherwise decide the arithmetic
+	// below - a fold-hidden head steps past its whole hidden run, not by one. Nothing
+	// unfolds it for us any more: select-all deliberately does not (see "Cmd/Ctrl+A
+	// does not unfold anything").
+	await page.keyboard.press('Shift+ArrowRight');
+	await page.waitForTimeout(300);
+
 	await page.keyboard.press(`${MOD}+a`);
 	await expect(page.getByTestId('selection-count')).toHaveText(`${order.length} selected`);
-	// The head really moved to the far end - and through the mount seam, so the last
-	// cell (a spacer a moment ago) has a node and DOM focus.
+	// The head really moved to the far end. Select-all itself mounts nothing - the
+	// last cell has a node only because the PRIMARY is pinned into the window, which
+	// is pre-existing and independent of any reveal - so the proof is behavioural:
+	// `extendSelection` rebuilds the range as anchor→head, so a head left
+	// mid-document would drop everything past it. One step back from a real end drops
+	// exactly one, and stepping forward again restores exactly one.
 	await expect.poll(() => isCellMounted(page, last), { timeout: 20_000 }).toBe(true);
 	await expect(page.locator(`[data-cell-id="${last}"]`)).toHaveAttribute('data-active', 'true');
-
-	// `extendSelection` rebuilds the range as anchor→head, so a head left mid-document
-	// would drop everything past it. One step back from a real end drops exactly one.
 	await page.keyboard.press('Shift+k');
 	await expect(page.getByTestId('selection-count')).toHaveText(`${order.length - 1} selected`);
 	await page.keyboard.press('Shift+j');
@@ -630,27 +641,72 @@ test('Cmd/Ctrl+A selects everything WITHOUT taking the reader to the end', async
 	await openWindowed(page);
 	const order = await serverOrder(page);
 
-	// Select-all is not a navigation. The head still moves to the LAST cell (that is
-	// what makes a following Shift+J/K extend from a coherent range), and under
-	// windowing that cell must still MOUNT so focus - and with it the modal keyboard,
-	// which reads a keystroke's mode and target off the focused element - has a real
-	// target. What must NOT happen is the viewport chasing it to the far end.
+	// Select-all is not a navigation: it is a PURE state change. The head still moves
+	// to the LAST cell (that is what makes a following Shift+J/K extend from a
+	// coherent range), but nothing travels with it - the viewport stays exactly where
+	// the reader left it and DOM focus stays on the cell they were on, which is all
+	// the modal keyboard needs (it reads a keystroke's mode and target off the
+	// focused element, and every action addresses cells by id).
 	await setScrollTop(page, 6_000);
 	await page.waitForTimeout(400);
-	await clickCell(page, (await visibleCellIds(page))[1]);
+	const focused = (await visibleCellIds(page))[1];
+	await clickCell(page, focused);
 	const before = await paneMetric(page, 'scrollTop');
 
 	await page.keyboard.press(`${MOD}+a`);
 	await expect(page.getByTestId('selection-count')).toHaveText(`${order.length} selected`);
 
-	const last = order[order.length - 1];
-	await expect.poll(() => isCellMounted(page, last), { timeout: 20_000 }).toBe(true);
-	await expect(page.locator(`[data-cell-id="${last}"]`)).toHaveAttribute('data-active', 'true');
-	// The mount alone can shift the pane by a pixel or two as estimated heights are
-	// replaced by measured ones; what is ruled out is the jump to the bottom.
+	// Not "close enough": select-all runs no scroll at all, so the pane cannot move.
 	await page.waitForTimeout(600);
-	expect(Math.abs((await paneMetric(page, 'scrollTop')) - before)).toBeLessThan(50);
+	expect(await paneMetric(page, 'scrollTop')).toBe(before);
+	expect(
+		await page.evaluate(
+			(id) => document.activeElement?.closest('[data-cell-id]')?.getAttribute('data-cell-id') === id,
+			focused
+		)
+	).toBe(true);
 	await page.keyboard.press('Escape');
+});
+
+test('Cmd/Ctrl+A does not unfold anything, not even the section hiding the last cell', async ({ page }) => {
+	test.setTimeout(120_000);
+	// Rendered eagerly so "hidden by a fold" and "windowed out" stay distinguishable.
+	await openNotebook(page, '0');
+	const cells = await serverCells(page);
+	const headings = cells.flatMap((c, i) => (c.cell_type === 'markdown' && c.source.startsWith('## ') ? [i] : []));
+	const tail = headings[headings.length - 1];
+	expect(tail).toBeLessThan(cells.length - 1);
+
+	// Start from a known fold state: it is persisted per notebook (server-side, so a
+	// fresh browser context does not clear it) and this file shares one workspace, so
+	// an earlier test's collapsed section would otherwise make the click below an
+	// UNfold. Nothing clears it for us - which is the whole point of this test.
+	const lastCell = page.locator(`[data-cell-id="${cells[cells.length - 1].id}"]`);
+	await clickCell(page, cells[0].id);
+	await page.keyboard.press('Shift+ArrowRight');
+	await expect(lastCell).toBeVisible();
+
+	await page.locator(`[data-cell-id="${cells[tail].id}"] [data-testid="fold-toggle"]`).first().click();
+	await expect(lastCell).not.toBeVisible();
+
+	// Select-all puts the head ON that hidden last cell. Reaching it through the
+	// mount seam used to REVEAL it - unfolding the section and persisting the change
+	// via `saveFolds()` - so Cmd/Ctrl+A silently expanded whichever section happened
+	// to hide the last cell, and the expansion survived a reload.
+	await clickCell(page, cells[0].id);
+	await page.keyboard.press(`${MOD}+a`);
+	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length} selected`);
+	await page.waitForTimeout(600);
+	await expect(lastCell).not.toBeVisible();
+
+	// A fold-hidden head still walks: Shift+K steps to the nearest VISIBLE cell above
+	// it by document position, contracting the selection rather than collapsing it.
+	await page.keyboard.press('Shift+k');
+	await expect(page.getByTestId('selection-count')).toHaveText(`${tail + 1} selected`);
+
+	// Fold state is persisted, so a reload is what proves nothing was written.
+	await openNotebook(page, '0');
+	await expect(page.locator(`[data-cell-id="${cells[cells.length - 1].id}"]`)).not.toBeVisible();
 });
 
 test('pasting a multi-cell clipboard selects the whole pasted block', async ({ page }) => {

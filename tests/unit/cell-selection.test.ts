@@ -163,6 +163,28 @@ describe('extendSelection - Shift+J/K and Shift+Arrows', () => {
 		expect(extendSelection(ORDER, ORDER, { activeId: 'e', anchorId: 'e' }, 1)).toBeNull();
 		expect(extendSelection(ORDER, [], { activeId: 'a', anchorId: 'a' }, 1)).toBeNull();
 	});
+
+	it('steps by DOCUMENT position when the head itself is fold-hidden', () => {
+		// The shape select-all leaves: it puts the head on the last cell of the
+		// document without revealing it (a reveal writes persisted fold state), so a
+		// collapsed tail section makes the head absent from the walk. Restarting the
+		// walk at its first entry would fling the head to the top and `rangeIds` would
+		// collapse the whole selection on one keystroke.
+		const walk = ['a', 'b', 'c'];
+		const shrunk = extendSelection(ORDER, walk, { activeId: 'e', anchorId: 'a' }, -1);
+		expect(shrunk?.activeId).toBe('c');
+		expect([...(shrunk?.selected ?? [])]).toEqual(['a', 'b', 'c']);
+
+		// The other direction from a hidden head lands on the nearest walkable cell
+		// BELOW it - and null when the collapsed section runs to the end.
+		expect(extendSelection(ORDER, walk, { activeId: 'd', anchorId: 'a' }, 1)).toBeNull();
+		expect(extendSelection(ORDER, ['a', 'e'], { activeId: 'c', anchorId: 'a' }, 1)?.activeId).toBe('e');
+	});
+
+	it('restarts the walk only when the head is gone from the document too', () => {
+		const next = extendSelection(ORDER, ORDER, { activeId: 'deleted', anchorId: 'deleted' }, 1);
+		expect(next?.activeId).toBe('a');
+	});
 });
 
 describe('selectionAfterRemoval - where the selection lands after a bulk delete', () => {
