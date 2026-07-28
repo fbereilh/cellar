@@ -32,6 +32,51 @@ export interface SelectionGesture {
 	toggle?: boolean;
 }
 
+/** The modifier/button state of a pointer press, as much of it as this decides on. */
+export interface PointerModifiers {
+	button: number;
+	shiftKey: boolean;
+	ctrlKey: boolean;
+	metaKey: boolean;
+}
+
+/** What a pointer press MEANS to the selection. */
+export interface PointerIntent extends SelectionGesture {
+	extend: boolean;
+	toggle: boolean;
+	/**
+	 * A context-menu / auxiliary press: NOT a selection gesture at all, so it must
+	 * neither build a selection nor collapse one.
+	 */
+	secondary: boolean;
+}
+
+/**
+ * Decode a pointer press into its selection intent, for the ONE platform question
+ * this gesture turns on: what the Ctrl key means.
+ *
+ * On macOS the platform secondary (context-menu) press is CTRL+CLICK, which
+ * arrives as `button === 0` with `ctrlKey` set, and the toggle modifier there is
+ * Cmd. Deciding on the button alone therefore read a Mac right-click as a PLAIN
+ * click and collapsed a five-cell selection an instant before the native menu
+ * opened - exactly the failure the button check exists to prevent, reached
+ * through the macOS spelling of the same gesture. Everywhere else Ctrl+click IS
+ * the toggle, so the two readings must never be conflated.
+ *
+ * A secondary press yields NO extend/toggle whatever else is held (Ctrl+Shift on
+ * macOS still opens the menu), so the caller's one rule is: a secondary press
+ * preserves the selection by not collapsing it - never by cancelling the event,
+ * which would suppress the compatibility mouse events the native menu needs.
+ */
+export function pointerIntent(e: PointerModifiers, mac: boolean): PointerIntent {
+	const secondary = e.button !== 0 || (mac && e.ctrlKey);
+	return {
+		extend: !secondary && e.shiftKey,
+		toggle: !secondary && (mac ? e.metaKey : e.ctrlKey),
+		secondary
+	};
+}
+
 /** One adjacent-swap step of a bulk move: put `id` at `toIndex`. */
 export interface MoveStep {
 	id: string;

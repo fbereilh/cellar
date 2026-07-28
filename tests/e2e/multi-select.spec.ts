@@ -28,8 +28,10 @@ import { setScrollTop, isCellMounted, mountedCellIds, paneMetric } from './noteb
  *      collapsed section can never be left behind by the selection that moves it;
  *   F. toggling the primary OUT of a selection MOUNTS the survivor it hands primacy
  *      to, so focus follows the selection and the next keystroke still has a target;
- *   G. a right-click on a member keeps the selection WITHOUT cancelling the press,
- *      and Cmd/Ctrl+A leaves the head at a real end so Shift+K shrinks by one;
+ *   G. a secondary press on a member keeps the selection WITHOUT cancelling the
+ *      press - a right-click, and on macOS a Ctrl+click, which is the same gesture
+ *      arriving as button 0 - and Cmd/Ctrl+A leaves the head at a real end so
+ *      Shift+K shrinks by one;
  *   H. Cmd/Ctrl+A leaves a LIVE primary (its head mounts and takes focus, so the
  *      primary-addressed shortcuts still reach it) while changing nothing else - it
  *      scrolls nowhere and unfolds nothing, so it can neither move the reader nor
@@ -240,6 +242,22 @@ test('Cmd/Ctrl+click builds a non-contiguous selection, and bulk retype converts
 	const menuBox = await menuTarget.boundingBox();
 	await menuTarget.click({ button: 'right', position: { x: Math.round(menuBox!.width / 2), y: 14 } });
 	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+
+	// The SAME gesture in its macOS spelling: there the context-menu press is
+	// CTRL+CLICK, which arrives as `button === 0` with `ctrlKey` set while the toggle
+	// modifier is Cmd - so a guard that only looked at the button number read it as a
+	// PLAIN click and collapsed the selection an instant before the menu opened.
+	// Everywhere else Ctrl+click IS the toggle, which must keep working, so this
+	// asserts whichever half the platform actually runs (`pointerIntent` owns the
+	// rule; both halves are unit-tested).
+	await clickCell(page, c, ['Control']);
+	if (process.platform === 'darwin') {
+		await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+	} else {
+		await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+		await clickCell(page, c, ['Control']); // toggle it back in
+		await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+	}
 
 	// `m` → markdown, for the whole selection, in one action.
 	await page.keyboard.press('m');

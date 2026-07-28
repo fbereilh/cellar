@@ -29,6 +29,7 @@
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
 	import { setSurfaceRanges, clearSurface, buildTextRanges, allocSurfaceKey } from '$lib/domHighlight';
 	import { isMac } from '$lib/shortcuts.svelte';
+	import { pointerIntent } from '$lib/cellSelection';
 	import type { CellOutput, CellType, LogicalCellType } from '$lib/server/types';
 	import type { CellActivation, KeyMode, UICell, SegHidden, CellRegisterApi } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
@@ -289,8 +290,10 @@
 	 * The exemptions all guard presses that already mean something else, and they
 	 * exist because cancelling `pointerdown` suppresses the compatibility mouse
 	 * events - so anything the browser or a library drives off those is lost:
-	 *   - PRIMARY button only. A Shift/Ctrl right- or middle-click opens a context
-	 *     menu or pastes; re-ranging the selection there would hijack it.
+	 *   - a SECONDARY press only ever means the context menu / an auxiliary gesture.
+	 *     That is a non-primary button - and, on macOS, CTRL+CLICK, which arrives as
+	 *     `button === 0`: `pointerIntent` owns that platform reading so this file
+	 *     cannot disagree with the toggle modifier about what Ctrl means.
 	 *   - a control (button/link/field) keeps its own activation.
 	 *   - an editor that ALREADY HAS THE CARET keeps CodeMirror's text gesture. That
 	 *     test asks the editor itself (`view.hasFocus`) rather than the notebook's
@@ -312,10 +315,8 @@
 	 */
 	function onCardPointerDown(e: PointerEvent) {
 		const t = e.target as HTMLElement | null;
-		const extend = e.shiftKey;
-		const toggle = isMac ? e.metaKey : e.ctrlKey;
+		const { extend, toggle, secondary } = pointerIntent(e, isMac);
 		if (
-			e.button === 0 &&
 			(extend || toggle) &&
 			!t?.closest?.('button, a, input, select, textarea, [role="button"]') &&
 			!t?.closest?.('[data-testid="markdown-rendered"], [data-testid="output"]') &&
@@ -325,21 +326,21 @@
 			onActivate?.(cell.id, { extend, toggle });
 			return;
 		}
-		// The PLAIN activation is primary-button-only for the same reason: it
+		// The PLAIN activation is refused for a SECONDARY press for the same reason: it
 		// collapses the selection to this one cell, so a right-click aimed at a
 		// context menu would destroy a five-cell selection before the menu even
-		// opened. A non-primary press is a context-menu/auxiliary gesture, never a
-		// selection gesture. Accepted cost, deliberately: a right-click on an
-		// UNSELECTED cell no longer selects it first.
+		// opened - and on macOS that press is Ctrl+click, so the button number alone
+		// cannot tell them apart (`pointerIntent`). Accepted cost, deliberately: a
+		// secondary press on an UNSELECTED cell no longer selects it first.
 		//
 		// The selection is preserved by NOT collapsing it, never by CANCELLING the
 		// press: `preventDefault` on `pointerdown` suppresses the compatibility mouse
 		// events, so a right-click inside a code cell would stop focusing its editor
 		// (the native menu's Cut/Copy/Paste then act on nothing) and X11 middle-click
-		// paste would stop working. The `focusin` a non-primary press may still trigger
+		// paste would stop working. The `focusin` a secondary press may still trigger
 		// carries no modifiers and is tagged `fromFocus`, so it re-states the primary
 		// rather than rebuilding the selection.
-		if (e.button !== 0 || extend || toggle) return;
+		if (secondary || extend || toggle) return;
 		onActivate?.(cell.id);
 	}
 

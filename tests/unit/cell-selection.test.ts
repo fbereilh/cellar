@@ -19,6 +19,7 @@ import {
 	moveSelectionPlan,
 	nearestSelected,
 	orderedSelection,
+	pointerIntent,
 	rangeIds,
 	reseatHiddenPrimary,
 	selectionAfterRemoval,
@@ -156,6 +157,65 @@ describe('applyGesture - what a click does', () => {
 		expect([...next.selected]).toEqual(['b', 'c']);
 		expect(next.activeId).toBe('b');
 		expect(next.anchorId).toBe('b');
+	});
+});
+
+describe('pointerIntent - what Ctrl means, which is a PLATFORM question', () => {
+	const press = (over: Partial<Parameters<typeof pointerIntent>[0]> = {}) => ({
+		button: 0,
+		shiftKey: false,
+		ctrlKey: false,
+		metaKey: false,
+		...over
+	});
+
+	it('reads a macOS Ctrl+click as the SECONDARY press it is, never as a selection gesture', () => {
+		// The bug this exists for: on macOS the context-menu press is Ctrl+click, which
+		// arrives as `button === 0` with `ctrlKey` set, while the toggle modifier there
+		// is Cmd. Deciding on the button alone therefore read it as a PLAIN click, whose
+		// caller collapses the selection to that one cell - destroying a five-cell
+		// selection an instant before the native menu opened.
+		const intent = pointerIntent(press({ ctrlKey: true }), true);
+		expect(intent.secondary).toBe(true);
+		expect(intent.toggle).toBe(false);
+		expect(intent.extend).toBe(false);
+	});
+
+	it('still reads a Ctrl+click OFF macOS as the toggle gesture', () => {
+		const intent = pointerIntent(press({ ctrlKey: true }), false);
+		expect(intent.secondary).toBe(false);
+		expect(intent.toggle).toBe(true);
+	});
+
+	it('takes Cmd as the toggle on macOS and Ctrl everywhere else', () => {
+		expect(pointerIntent(press({ metaKey: true }), true).toggle).toBe(true);
+		expect(pointerIntent(press({ metaKey: true }), false).toggle).toBe(false);
+	});
+
+	it('a non-primary button is secondary on every platform, whatever is held', () => {
+		for (const mac of [true, false]) {
+			expect(pointerIntent(press({ button: 2 }), mac).secondary).toBe(true);
+			expect(pointerIntent(press({ button: 1, shiftKey: true }), mac).extend).toBe(false);
+			expect(pointerIntent(press({ button: 2, ctrlKey: true, metaKey: true }), mac).toggle).toBe(false);
+		}
+	});
+
+	it('a macOS Ctrl+Shift+click is still the context menu, so it builds no range', () => {
+		// Preserving the selection is the safe direction: the menu opens either way, and
+		// a press that re-ranged behind it would silently discard what the user had.
+		const intent = pointerIntent(press({ ctrlKey: true, shiftKey: true }), true);
+		expect(intent.secondary).toBe(true);
+		expect(intent.extend).toBe(false);
+	});
+
+	it('an unmodified primary press is a plain click: no gesture, not secondary', () => {
+		const intent = pointerIntent(press(), true);
+		expect(intent).toEqual({ extend: false, toggle: false, secondary: false });
+	});
+
+	it('Shift is the range gesture on both platforms', () => {
+		expect(pointerIntent(press({ shiftKey: true }), true).extend).toBe(true);
+		expect(pointerIntent(press({ shiftKey: true }), false).extend).toBe(true);
 	});
 });
 

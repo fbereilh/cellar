@@ -17,6 +17,7 @@
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
 	import { exportCellCount } from '$lib/exportRole';
+	import { splitInheritedCellar } from '$lib/splitCell';
 	import { createSearchCache } from '$lib/search';
 	import type { SearchCache } from '$lib/search';
 	import { buildCellHighlights, type SearchHighlightState } from '$lib/searchHighlight';
@@ -2812,7 +2813,11 @@
 		const at = api.cursorOffset();
 		api.replaceSource(source.slice(0, at));
 		await editCell(id, source.slice(0, at));
-		const created = await addCell(id, cell.cell_type, source.slice(at));
+		// The lower half is the same cell's second half, so it inherits the keys that
+		// say how that cell is read and displayed (`splitInheritedCellar` states which,
+		// and why the imports role and the export flag are not among them). Seeded in
+		// the SAME write as the source, so a split stays one persist and one event.
+		const created = await addCell(id, cell.cell_type, source.slice(at), splitInheritedCellar(cell.metadata?.cellar));
 		// `enterEdit`, not `focus`: a markdown cell created with text mounts in its
 		// rendered view, whose editor is `display:none` and cannot take the caret.
 		await selectAndAct(created.id, (api) => api?.enterEdit());
