@@ -92,6 +92,47 @@ export async function cellIsOnScreen(page: Page, id: string): Promise<boolean> {
 	}, id);
 }
 
+/**
+ * Every box from the element matching `selector` up to `<html>` INCLUSIVE whose
+ * content is wider than it is, nearest first (each as a `tag.class sw>cw`
+ * descriptor, so a failure names the offending box and by how much); `null` when
+ * the selector matches nothing.
+ *
+ * `scrollWidth > clientWidth` catches BOTH shapes of the same regression: a box
+ * that scrolls sideways, and a box that CLIPS the excess out of view. That is why
+ * the walk is inclusive and covers the whole chain rather than naming one
+ * element - the layers answer in different ways and only the innermost one can
+ * answer at all:
+ *
+ *   • The notebook cell card is `overflow-hidden`, so it absorbs anything too
+ *     wide and reports it here. It is the innermost boundary, so it is what makes
+ *     an assertion over an output REACHABLE - measured 5000>904 against a
+ *     deliberately oversized child.
+ *   • The notebook's pane is `overflow-y-auto`, and CSS computes the other axis
+ *     of a non-visible overflow to `auto`, so it is the layer that would grow a
+ *     real sideways scrollbar.
+ *   • `document.documentElement` can never answer: the shell root
+ *     (`flex h-screen flex-col overflow-hidden`) and `<main>` are `overflow-hidden`
+ *     too, so overflow is clipped long before it reaches the root. An assertion
+ *     measured there is structurally incapable of failing - do not reduce this
+ *     walk back to it.
+ */
+export async function horizontallyOverflowingBoxes(page: Page, selector: string): Promise<string[] | null> {
+	return page.evaluate((sel) => {
+		const start = document.querySelector(sel) as HTMLElement | null;
+		if (!start) return null;
+		const out: string[] = [];
+		for (let el: HTMLElement | null = start; el; el = el.parentElement) {
+			if (el.scrollWidth > el.clientWidth) {
+				const raw = typeof el.className === 'string' ? el.className.trim() : '';
+				const cls = raw ? '.' + raw.split(/\s+/).join('.') : '';
+				out.push(`${el.tagName.toLowerCase()}${cls} ${el.scrollWidth}>${el.clientWidth}`);
+			}
+		}
+		return out;
+	}, selector);
+}
+
 /** The `data-cell-id`s currently mounted, in document order. */
 export async function mountedCellIds(page: Page): Promise<string[]> {
 	return page.evaluate(() =>

@@ -13,12 +13,20 @@
 	// expects, and it sidesteps re-running the embedded scripts on a theme toggle.
 	//
 	// Auto-sizing: since we own the srcdoc wrapper we inject a tiny reporter that
-	// posts the content's scrollHeight up via postMessage (on load + on every
+	// posts the content's height up via postMessage (on load + on every
 	// ResizeObserver tick, covering async-rendered viz). The parent clamps that to
 	// a max and lets the iframe scroll internally past it. Cross-origin postMessage
 	// is the only channel an opaque-origin iframe has, which is exactly why it is
-	// safe.
+	// safe. The height itself is `reportedHeight()` from `htmlOutputHeight.ts`,
+	// serialized into the srcdoc so the shipped arithmetic and its unit test are
+	// one function - read that header before touching the reporter.
+	//
+	// The injected stylesheet - including the comfortable table defaults a bare
+	// Styler / `_repr_html_` gets, and the low-specificity rule that keeps a user's
+	// own styling winning - lives in `htmlOutputStyle.ts`; read its header first.
 	import { browser } from '$app/environment';
+	import { OUTPUT_HTML_CSS } from '$lib/htmlOutputStyle';
+	import { reportedHeight } from '$lib/htmlOutputHeight';
 
 	let { html }: { html: string | null | undefined } = $props();
 
@@ -32,11 +40,12 @@
 	// background) plus the height reporter.
 	function buildSrcdoc(userHtml: string): string {
 		return `<!doctype html><html><head><meta charset="utf-8"><base target="_blank"><style>
-html,body{margin:0;padding:8px;background:#ffffff;color:#1f2937;font-family:system-ui,-apple-system,sans-serif;font-size:14px;}
-img,svg,canvas,table{max-width:100%;}
+${OUTPUT_HTML_CSS}
 </style></head><body>${userHtml}
 <script>(function(){
-  function send(){ try{ parent.postMessage({__cellarHtml:'${token}', height: Math.ceil(document.documentElement.scrollHeight)}, '*'); }catch(e){} }
+  var reportedHeight = ${reportedHeight.toString()};
+  function send(){ try{ var de = document.documentElement;
+    parent.postMessage({__cellarHtml:'${token}', height: Math.ceil(reportedHeight(de.scrollHeight, de.scrollWidth, de.clientWidth, window.innerHeight, de.clientHeight))}, '*'); }catch(e){} }
   if ('ResizeObserver' in window){ new ResizeObserver(send).observe(document.documentElement); }
   window.addEventListener('load', send);
   document.addEventListener('DOMContentLoaded', send);

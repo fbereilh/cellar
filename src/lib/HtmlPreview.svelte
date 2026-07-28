@@ -7,8 +7,10 @@
 	 *
 	 * SECURITY — the file is untrusted content, so the frame is origin-isolated
 	 * from the app the same way rich `text/html` cell outputs are
-	 * (`HtmlOutput.svelte`, the precedent this follows — with one deliberate
-	 * divergence, `allow-downloads`, below):
+	 * (`HtmlOutput.svelte` is the precedent, and only for the SECURITY posture -
+	 * two deliberate divergences from it are named below, `allow-downloads` and
+	 * the verbatim pass; do not read "the precedent this follows" as an
+	 * instruction to mirror the rest of that component):
 	 *   • `sandbox="allow-scripts allow-popups allow-downloads"` and deliberately
 	 *     NOT `allow-same-origin`. Scripts run — self-contained plots need them —
 	 *     but in a unique OPAQUE origin, so the document cannot read the app's
@@ -26,8 +28,14 @@
 	 *     serves workspace HTML as `text/html` from its own origin — a route that
 	 *     did would be a stored-XSS surface reachable outside any sandbox. This is
 	 *     also why `/api/fs/raw` serves images only.
-	 *   • The content is passed VERBATIM: no wrapper document, no injected script.
-	 *     A full `<!doctype html>` export renders as authored.
+	 *   • The content is passed VERBATIM: no wrapper document, no injected script,
+	 *     and - the second deliberate divergence - no stylesheet. `HtmlOutput`
+	 *     injects `OUTPUT_HTML_CSS` because it OWNS the srcdoc wrapper it builds
+	 *     around a bare fragment the kernel emitted; a workspace `.html` is a
+	 *     finished export the user opened to view AS AUTHORED, so NEVER inject
+	 *     `OUTPUT_HTML_CSS` (or any other CSS) here - restyling their export's
+	 *     tables would be a defect, not parity. A full `<!doctype html>` export
+	 *     renders as authored.
 	 *
 	 * The one cost of that isolation is relative asset refs — see `htmlPreview.ts`
 	 * `hasRelativeAssetRefs()`; the tab surfaces the limitation in one line rather
