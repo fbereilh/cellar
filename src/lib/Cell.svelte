@@ -22,6 +22,7 @@
 	import { isImportsCell } from '$lib/importsRole';
 	import { isExportCell } from '$lib/exportRole';
 	import { isCodeHidden } from '$lib/hideInput';
+	import { collapsedPreview } from '$lib/cellCollapse';
 	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration } from '$lib/relativeTime';
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
@@ -92,6 +93,11 @@
 		/** Per-cell code-editor collapse choice (undefined = auto / true / false). */
 		editorCollapsed?: boolean;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
+		/** This cell is FULLY collapsed: input AND output hidden, header row only.
+		 *  Owned by the notebook (`$lib/cellCollapse`), so it survives a windowed
+		 *  unmount and a reload. Orthogonal to `editorCollapsed` and to heading folds. */
+		cellCollapsed?: boolean;
+		onSetCellCollapsed?: (id: string, collapsed: boolean) => void;
 		/** This markdown cell is open for RAW source editing (see `mode` below). Owned
 		 *  by the notebook, like `editorCollapsed`, so it survives a windowed unmount. */
 		rawEdit?: boolean;
@@ -149,6 +155,8 @@
 		onSetHideInput,
 		editorCollapsed,
 		onSetEditorCollapsed,
+		cellCollapsed = false,
+		onSetCellCollapsed,
 		rawEdit = false,
 		onSetRawEdit,
 		onActivate,
@@ -757,6 +765,45 @@
 		onSetEditorCollapsed?.(cell.id, !collapsed);
 	}
 
+	// ---- Full-cell collapse --------------------------------------------------
+	// The whole cell contracts to its header row: input AND output hidden, whatever
+	// the cell's length. Deliberately distinct from the two neighbours it sits
+	// between - `editorCollapsed` above (a TALL editor contracted to a scroll box,
+	// output untouched) and `codeHidden` below (the input hidden as a report view,
+	// output kept) - and from heading folding, which hides a RANGE of cells outright.
+	// All of them stay independent: a full collapse only supersedes the others
+	// VISUALLY while it is on, and expanding restores exactly what they were.
+	//
+	// The state itself lives in the notebook (`$lib/cellCollapse`), not here: a
+	// windowed cell is destroyed and rebuilt as it leaves and re-enters the window,
+	// so a per-instance flag would silently expand a cell the user collapsed.
+	//
+	// The header keeps the whole toolbar rather than growing a second, competing
+	// chrome row: it already carries the cell id, the type, the run controls and the
+	// run/stale badges, so a collapsed cell stays identifiable AND actionable (it can
+	// still be run, moved, deleted and selected) with no new vocabulary. What a
+	// header alone cannot say is WHICH cell this is at a glance, hence the one-line
+	// source preview beside the id.
+	const collapsePreview = $derived(cellCollapsed ? collapsedPreview(liveSource) : '');
+	function toggleCellCollapsed() {
+		onSetCellCollapsed?.(cell.id, !cellCollapsed);
+	}
+	function expandCell() {
+		if (cellCollapsed) onSetCellCollapsed?.(cell.id, false);
+	}
+	/**
+	 * Click anywhere on a COLLAPSED cell's header (its own controls excepted) to
+	 * expand it - the disclosure convention, and the affordance a user reaches for
+	 * before finding the chevron. Inert while expanded, so it can never interfere
+	 * with the toolbar's ordinary use.
+	 */
+	function onHeaderClick(e: MouseEvent) {
+		if (!cellCollapsed) return;
+		const t = e.target as HTMLElement | null;
+		if (t?.closest?.('button, a, input, select, textarea, [role="button"], [popover]')) return;
+		expandCell();
+	}
+
 	// ---- Hide code input (report view) --------------------------------------
 	// Display-only: the code editor is hidden while the output stays. Distinct
 	// from `editorCollapsed` above (which only contracts a TALL editor to a scroll
@@ -963,6 +1010,12 @@
 	}
 
 	async function enterEdit() {
+		// Edit-intent on a fully collapsed cell EXPANDS it first: its editor is
+		// `display:none`, so it could take neither the caret nor a keystroke, and
+		// "edit mode" over an invisible editor is a dead end the user cannot see out
+		// of. Asking to type in a cell is asking to see it - the same reason a
+		// navigation unfolds a folded section.
+		expandCell();
 		setRawEdit(true);
 		buildEditor(); // summon the real editor (no-op if already built)
 		await tick();
@@ -980,12 +1033,18 @@
 	}
 
 	/**
-	 * Focus for "advance to this cell": its editor, unless it is a markdown cell
-	 * showing rendered HTML: that editor is `display:none` and cannot take focus,
-	 * so the cell itself does (which is command mode, as Jupyter does it).
+	 * Focus for "advance to this cell": its editor, unless that editor is
+	 * `display:none` and so cannot take focus - a markdown cell showing rendered
+	 * HTML, or a FULLY COLLAPSED cell. Then the cell itself takes focus (command
+	 * mode, as Jupyter does it), which is what keeps the modal keyboard alive: the
+	 * notebook's dispatcher reads a keystroke's mode and target off the focused
+	 * element, so a focus that silently went nowhere would leave the next key acting
+	 * on whatever the user last clicked. Collapse is visual - it must not swallow the
+	 * selection, and it deliberately does NOT expand here (only explicit edit-intent
+	 * does): landing on a collapsed cell is not a request to open it.
 	 */
 	function focusEditorOrCell() {
-		if (isMarkdown && mode === 'rendered') {
+		if (cellCollapsed || (isMarkdown && mode === 'rendered')) {
 			focusCell();
 			return;
 		}
@@ -1422,9 +1481,30 @@
 		<div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 bg-primary/55" data-testid="selected-bar"></div>
 	{/if}
 	<div class="card-body gap-0 p-0">
-		<!-- Cell toolbar -->
-		<div class="flex items-center justify-between border-b border-base-300 px-2 py-1">
+		<!-- Cell toolbar. While the cell is FULLY COLLAPSED this row IS the cell, so it
+		     drops its bottom divider (there is nothing below it to divide from) and a
+		     click on its empty space expands - the disclosure convention. -->
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div
+			class="flex items-center justify-between px-2 py-1 {cellCollapsed ? 'cursor-pointer' : 'border-b border-base-300'}"
+			onclick={onHeaderClick}
+		>
 			<div class="flex items-center gap-0.5">
+				<!-- Full-cell collapse: hides the input AND the output, leaving this header.
+				     A disclosure twisty, the same chevron (and rotation) the heading-fold
+				     control uses, so the two collapse gestures read as one vocabulary. -->
+				<button
+					class="btn btn-ghost btn-xs btn-square text-base-content/40 hover:text-base-content/80"
+					onclick={toggleCellCollapsed}
+					title={cellCollapsed ? 'Expand cell (show input and output)' : 'Collapse cell (hide input and output)'}
+					aria-label={cellCollapsed ? 'Expand cell' : 'Collapse cell'}
+					aria-expanded={!cellCollapsed}
+					data-testid="cell-collapse-toggle"
+					data-collapsed={cellCollapsed ? 'true' : undefined}
+				>
+					<svg class="h-3.5 w-3.5 transition-transform {cellCollapsed ? '-rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+				</button>
 				<!-- The imports cell is no longer pinned, so every cell (imports included)
 				     carries the same drag handle and can be reordered freely. -->
 				<button
@@ -1579,8 +1659,23 @@
 					</span>
 				{/if}
 			</div>
+			<!-- Collapsed-only: a one-line source preview, so a stack of collapsed cells
+			     is readable rather than a column of identical chrome. Rendered ONLY while
+			     collapsed, so the expanded toolbar's layout is untouched; it is the flex
+			     item that gives way (`flex-1 min-w-0`), so it truncates instead of pushing
+			     the controls at either end out of the card. -->
+			{#if cellCollapsed}
+				<span
+					class="mx-2 min-w-0 flex-1 truncate text-[11px] text-base-content/45 {isMarkdown ? '' : 'font-mono'}"
+					data-testid="collapsed-preview"
+					title={collapsePreview}
+				>
+					{collapsePreview}
+				</span>
+			{/if}
 			<div class="flex items-center gap-1">
 				<!-- Mode indicator for the selected cell: pencil = edit, dot = command. -->
+
 				{#if active}
 					<span
 						class="mr-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide {editing ? 'text-success' : 'text-info'}"
@@ -1756,7 +1851,15 @@
 		     hidden-cell count) so a collapsed section reads as collapsed at a glance;
 		     its body and everything under it disappears. `segHidden` is what an OUTER
 		     fold hides inside this cell. -->
-		{#if isMarkdown && mode === 'rendered'}
+		<!-- A FULL COLLAPSE hides every block below the toolbar, by one of two
+		     mechanisms, chosen per block rather than uniformly: a block whose content is
+		     purely derived (this one, the show-code bar) is dropped from the DOM with
+		     `{#if}`, so a collapsed cell costs nothing to render; a block holding view
+		     state a re-mount would reset - the editor (CodeMirror's cursor, undo and
+		     scroll) and the output (a DataFrame grid's sort/filter/page, an image's
+		     fit-to-width, an HtmlOutput iframe that would RELOAD) - is merely
+		     `display:none`, so expanding gives back exactly what was collapsed. -->
+		{#if isMarkdown && mode === 'rendered' && !cellCollapsed}
 			<div
 				class="cellar-md px-4 py-3 text-sm leading-relaxed"
 				data-testid="markdown-rendered"
@@ -1824,7 +1927,7 @@
 		     hidden (per-cell choice or the notebook-wide report view). A slim,
 		     discoverable bar; clicking reveals the editor in place. The output below
 		     (and the toolbar's run controls / run-status) stay visible. -->
-		{#if codeHidden}
+		{#if codeHidden && !cellCollapsed}
 			<button
 				class="flex w-full items-center gap-1.5 border-b border-base-300 bg-base-200/40 px-3 py-1 text-left text-[11px] text-base-content/45 transition-colors hover:bg-base-200/80 hover:text-base-content/70"
 				onclick={toggleHideInput}
@@ -1843,7 +1946,7 @@
 		     collapsed to a fixed-height scroll box (mirrors the scrollable-outputs
 		     toggle); the choice is persisted runtime-only. A markdown edit view keeps
 		     its original cap unchanged. -->
-		<div class="relative {(isMarkdown && mode === 'rendered') || codeHidden ? 'hidden' : ''}">
+		<div class="relative {(isMarkdown && mode === 'rendered') || codeHidden || cellCollapsed ? 'hidden' : ''}">
 			{#if canCollapse}
 				<!-- Collapse-editor toggle (mirrors the "Enable Scrolling for Outputs" control). -->
 				<button
@@ -1888,7 +1991,7 @@
 
 		<!-- Output (code cells only) -->
 		{#if !isMarkdown && outputs.length}
-			<div class="relative border-t border-base-300 bg-(--cellar-surface-output)" data-testid="output">
+			<div class="relative border-t border-base-300 bg-(--cellar-surface-output) {cellCollapsed ? 'hidden' : ''}" data-testid="output">
 				<!-- Scroll-outputs toggle (Jupyter "Enable Scrolling for Outputs"). The
 				     DataFrame grid and a full-size image own their own scroll, so the
 				     toggle is hidden for them. -->

@@ -90,12 +90,23 @@ export const OUTPUT_CAP_PX = 480; // ...capped so one huge output can't dominate
 export const DEFAULT_OVERSCAN_PX = 800;
 // The `space-y-4` margin the cell stack renders between adjacent rows (1rem).
 export const ROW_GAP_PX = 16;
+// A FULLY COLLAPSED cell ($lib/cellCollapse) renders its toolbar row and nothing
+// else - no editor, no output - so its height is that row plus the card's border,
+// whatever the cell contains. Without this a collapsed cell that has never been on
+// screen reserves the space of the editor + output it is not rendering, so the
+// window plans against a flow that is metres too tall.
+export const COLLAPSED_CELL_PX = 34;
 
 /**
  * Estimate a cell's rendered height from its source line count (+ a coarse
  * output allowance). Used only for cells that have never been measured.
+ *
+ * `collapsed` is the caller's full-collapse verdict for this cell. It is passed IN
+ * rather than read off the cell, because collapse is a render-time view choice owned
+ * by the notebook - this module must never read the document model (see INVARIANT).
  */
-export function estimateHeight(cell: HeightCell): number {
+export function estimateHeight(cell: HeightCell, collapsed = false): number {
+	if (collapsed) return COLLAPSED_CELL_PX;
 	const source = cell.source ?? '';
 	const lines = source.length === 0 ? 1 : source.split('\n').length;
 	if (cell.cell_type === 'markdown') {

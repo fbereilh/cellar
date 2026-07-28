@@ -25,6 +25,7 @@
 	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
+	import { collapsedKeyFor, sanitizeCollapsed, withCollapse, withoutCells, type CollapsedRecord } from '$lib/cellCollapse';
 	import type { CellView, CellOutput, CellType, LogicalCellType, Actor, RunningView, QueueEntryView, LastRun, CellarNamespace, PublishedEvent } from '$lib/server/types';
 	import type { CellActivation, UICell, KeyMode, FoldRegistryHandle, JumpOptions, NumberingRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
 	import type { BlameLine } from '$lib/server/git';
@@ -494,6 +495,43 @@
 		else next[id] = collapsed;
 		editorCollapsed = next;
 		saveEditorCollapsed();
+	}
+
+	// ---- Fully collapsed cells -----------------------------------------------
+	// "Hide this whole cell": input AND output gone, only the header row (with the
+	// cell id) left. Distinct from `editorCollapsed` above, which only contracts a
+	// TALL editor to a scroll box and leaves the output alone, and from heading
+	// folding, which hides a RANGE of cells outright. The three are orthogonal:
+	// expanding a cell restores whatever its editor-collapse / fold state was.
+	//
+	// Persisted per notebook through the same UI store as `editorCollapsed` - "hide
+	// this cell" is a deliberate, durable intent, so it survives a reload - and, being
+	// a view preference, never reaches the `.ipynb` (zero git diff). Keyed by cell id,
+	// never off a mounted node: with windowing on, most cells have no DOM at all.
+	// The rules (key, shape, preview) are pure and unit-tested in `$lib/cellCollapse`.
+	let cellCollapsed = $state<CollapsedRecord>({});
+
+	function loadCellCollapsed() {
+		const key = collapsedKeyFor(canonicalId);
+		if (!key) return;
+		cellCollapsed = sanitizeCollapsed(getUi(key, null));
+	}
+	function saveCellCollapsed() {
+		const key = collapsedKeyFor(canonicalId);
+		if (key) setUi(key, cellCollapsed);
+	}
+	function setCellCollapsed(id: string, collapsed: boolean) {
+		const next = withCollapse(cellCollapsed, id, collapsed);
+		if (next === cellCollapsed) return; // already in that state - no write, no re-render
+		cellCollapsed = next;
+		saveCellCollapsed();
+	}
+	/** Drop the collapse entries of cells that no longer exist (the delete paths). */
+	function forgetCollapsed(ids: Iterable<string>) {
+		const next = withoutCells(cellCollapsed, ids);
+		if (next === cellCollapsed) return;
+		cellCollapsed = next;
+		saveCellCollapsed();
 	}
 
 	// ---- Markdown raw-edit mode ----------------------------------------------
@@ -1297,6 +1335,7 @@
 			else pruneSelection();
 			loadFolds(); // restore this notebook's collapsed sections (runtime-only, per notebook)
 			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
+			loadCellCollapsed(); // restore this notebook's fully collapsed cells (runtime-only)
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
@@ -1392,6 +1431,7 @@
 		} else if (ev.type === 'cell:deleted') {
 			cells = cells.filter((c) => c.id !== ev.cellId);
 			setRawEdit(ev.cellId, false);
+			forgetCollapsed([ev.cellId]);
 			if (runningId === ev.cellId) runningId = null;
 			// A cell an agent (or another tab) removed leaves the selection: it no
 			// longer exists, so a bulk op must not still be aimed at it. Dropping the
@@ -2303,6 +2343,7 @@
 		const snapshot = [snapshotDeletedCell(cell, i)];
 		cells = cells.filter((c) => c.id !== id);
 		setRawEdit(id, false);
+		forgetCollapsed([id]);
 		// Keep a cell selected: command mode acts on the selection, so deleting the
 		// selected cell must hand the selection to its neighbor, not drop it. Focus
 		// follows, because the delete button that had it is gone with the cell.
@@ -2417,6 +2458,7 @@
 		cells = cells.filter((c) => !removed.has(c.id));
 		const applied = before - cells.length;
 		for (const id of ids) setRawEdit(id, false);
+		forgetCollapsed(ids);
 		if (runningId && removed.has(runningId)) runningId = null;
 		selectOnly(nextActive);
 		if (nextActive) await selectAndFocus(nextActive);
@@ -3071,6 +3113,8 @@
 			onSetHideInput={setHideInput}
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}
+			cellCollapsed={cellCollapsed}
+			onSetCellCollapsed={setCellCollapsed}
 			rawEdits={rawEdits}
 			onSetRawEdit={setRawEdit}
 			onActivate={activateCell}
