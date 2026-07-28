@@ -25,7 +25,14 @@
 	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
-	import { collapsedKeyFor, sanitizeCollapsed, withCollapse, withoutCells, type CollapsedRecord } from '$lib/cellCollapse';
+	import {
+		collapsedKeyFor,
+		sanitizeCollapsed,
+		withCollapse,
+		withoutCells,
+		retainCells,
+		type CollapsedRecord
+	} from '$lib/cellCollapse';
 	import type { CellView, CellOutput, CellType, LogicalCellType, Actor, RunningView, QueueEntryView, LastRun, CellarNamespace, PublishedEvent } from '$lib/server/types';
 	import type { CellActivation, UICell, KeyMode, FoldRegistryHandle, JumpOptions, NumberingRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
 	import type { BlameLine } from '$lib/server/git';
@@ -529,6 +536,24 @@
 	/** Drop the collapse entries of cells that no longer exist (the delete paths). */
 	function forgetCollapsed(ids: Iterable<string>) {
 		const next = withoutCells(cellCollapsed, ids);
+		if (next === cellCollapsed) return;
+		cellCollapsed = next;
+		saveCellCollapsed();
+	}
+	/**
+	 * Reconcile the record against the cells a load just returned.
+	 *
+	 * `forgetCollapsed` only fires for deletions THIS tab saw. A cell deleted while
+	 * the tab was disconnected (the reconnect / seq-gap refetch) or removed by a
+	 * checkpoint restore never reaches it, so without this its entry would sit in the
+	 * per-project JSON for good. Identity-preserving like the helpers above: a load
+	 * with nothing to drop writes nothing.
+	 */
+	function pruneCollapsedToCells() {
+		const next = retainCells(
+			cellCollapsed,
+			cells.map((c) => c.id)
+		);
 		if (next === cellCollapsed) return;
 		cellCollapsed = next;
 		saveCellCollapsed();
@@ -1336,6 +1361,7 @@
 			loadFolds(); // restore this notebook's collapsed sections (runtime-only, per notebook)
 			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
 			loadCellCollapsed(); // restore this notebook's fully collapsed cells (runtime-only)
+			pruneCollapsedToCells(); // drop entries for cells deleted while we were away
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run

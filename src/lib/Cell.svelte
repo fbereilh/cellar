@@ -796,9 +796,22 @@
 	 * expand it - the disclosure convention, and the affordance a user reaches for
 	 * before finding the chevron. Inert while expanded, so it can never interfere
 	 * with the toolbar's ordinary use.
+	 *
+	 * A press carrying a SELECTION MODIFIER is not a disclosure gesture and must
+	 * leave the cell collapsed: a Shift+click range or a Cmd/Ctrl+click toggle
+	 * landing on this row means "select", and the rule this feature ships is that a
+	 * mere SELECTION never expands (only explicit edit-intent does). `onCardPointerDown`
+	 * cancels that press, but `click` is NOT one of the compatibility mouse events
+	 * `preventDefault` suppresses, so it still arrives here and would expand a cell
+	 * the user only meant to add to a range. The reading goes through the shared
+	 * `pointerIntent` rather than a hand-rolled modifier test so this file cannot
+	 * disagree with the selection gesture about what Ctrl means on macOS (there it
+	 * is the context-menu press, not the toggle).
 	 */
 	function onHeaderClick(e: MouseEvent) {
 		if (!cellCollapsed) return;
+		const { extend, toggle, secondary } = pointerIntent(e, isMac);
+		if (extend || toggle || secondary) return;
 		const t = e.target as HTMLElement | null;
 		if (t?.closest?.('button, a, input, select, textarea, [role="button"], [popover]')) return;
 		expandCell();

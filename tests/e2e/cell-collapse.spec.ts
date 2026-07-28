@@ -16,7 +16,9 @@ import { setScrollTop, isCellMounted } from './notebook-scroll';
  *   A. one click hides the input AND the output, and the header that remains still
  *      names the cell (its id) and previews it;
  *   B. the toggle round-trips, and the collapse PERSISTS across a reload - in both
- *      directions, so expanding is as durable as collapsing;
+ *      directions, so expanding is as durable as collapsing. A click carrying a
+ *      SELECTION modifier is not a disclosure gesture, so it selects and leaves the
+ *      cell collapsed (`click` survives the pointerdown the selection cancels);
  *   C. a collapsed cell that is windowed OUT and scrolled back is still collapsed
  *      and still compact: the state is a model record, not something a Cell instance
  *      remembers, and the window plans against the collapsed height;
@@ -181,6 +183,52 @@ test('one click collapses a cell to a header that still names it, and expands it
 	const box = (await card.boundingBox())!;
 	await card.click({ position: { x: Math.round(box.width / 2), y: Math.round(box.height / 2) } });
 	await expect(card.getByTestId('editor-scroll')).toBeVisible();
+});
+
+test('a modifier click on a collapsed header selects without expanding; a plain one expands', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+
+	const cells = await serverCells(page);
+	// The first three, so all of them are inside the window at rest (this spec runs
+	// at the shipped windowing default and a spacer has no header to click). Sharing
+	// cells with the other tests here is safe: each drives the collapse to a KNOWN
+	// state rather than assuming one.
+	const [first, second, third] = [cells[0], cells[1], cells[2]];
+
+	for (const c of [second, third]) await setCollapsed(page, c.id, true);
+	await setCollapsed(page, first.id, false);
+
+	/** Click a collapsed card's header row, avoiding its own controls. */
+	const clickHeader = async (id: string, modifiers?: ('Shift' | 'ControlOrMeta')[]) => {
+		const box = (await cell(page, id).boundingBox())!;
+		await cell(page, id).click({ position: { x: Math.round(box.width / 2), y: Math.round(box.height / 2) }, modifiers });
+	};
+
+	// Seed a selection on the expanded cell above.
+	await clickHeader(first.id);
+	await expect(cell(page, first.id)).toHaveAttribute('data-active', 'true');
+
+	// A Shift+click is a RANGE gesture, not a disclosure one: it must extend the
+	// selection onto the collapsed cell and leave it collapsed. `click` is not one of
+	// the compatibility mouse events `onCardPointerDown`'s preventDefault suppresses,
+	// so without the guard the header handler would expand it here.
+	await clickHeader(second.id, ['Shift']);
+	await expect(cell(page, second.id)).toHaveAttribute('data-selected', 'true');
+	await expect(cell(page, first.id)).toHaveAttribute('data-selected', 'true');
+	await expect(collapseToggle(page, second.id)).toHaveAttribute('data-collapsed', 'true');
+	await expect(cell(page, second.id).getByTestId('editor-scroll')).toBeHidden();
+
+	// Same for the Cmd/Ctrl toggle gesture (ControlOrMeta is the platform's own).
+	await clickHeader(third.id, ['ControlOrMeta']);
+	await expect(cell(page, third.id)).toHaveAttribute('data-selected', 'true');
+	await expect(collapseToggle(page, third.id)).toHaveAttribute('data-collapsed', 'true');
+	await expect(cell(page, third.id).getByTestId('editor-scroll')).toBeHidden();
+
+	// The plain click is still the disclosure affordance the feature ships.
+	await clickHeader(second.id);
+	await expect(collapseToggle(page, second.id)).not.toHaveAttribute('data-collapsed', 'true');
+	await expect(cell(page, second.id).getByTestId('editor-scroll')).toBeVisible();
 });
 
 test('the collapse persists across a reload - and so does expanding again', async ({ page }) => {

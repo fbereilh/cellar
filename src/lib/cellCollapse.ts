@@ -22,6 +22,14 @@
  * per notebook through the per-project UI store, like `editorCollapsed`: "hide this
  * cell" is a deliberate, durable intent, so it survives a reload - and, being a view
  * preference, it never touches the `.ipynb` (zero git diff).
+ *
+ * Collapse is purely USER-driven: nothing in the app collapses or expands a cell on
+ * the user's behalf, and only explicit edit-intent expands one. A mere navigation or
+ * selection deliberately does NOT - `j`/`k`, follow-running and the FIND BAR land on
+ * a collapsed cell and leave it collapsed, so its match is counted but not painted.
+ * That is a decided product trade, not an oversight: a `hide_input` (report-view)
+ * cell's match is equally invisible today, so the two hide features stay consistent,
+ * and a Ctrl+F sweep can never silently discard collapse state the user set by hand.
  */
 
 /** Which cells are collapsed. Only `true` is ever stored - see `withCollapse`. */
@@ -58,7 +66,9 @@ export function sanitizeCollapsed(saved: unknown): CollapsedRecord {
  * Expanding DELETES the entry rather than storing `false`, which is what keeps the
  * persisted record proportional to the cells actually collapsed - and makes this
  * double as the delete-path cleanup, exactly like `setRawEdit`: a deleted cell can
- * never come back under the same id, so its entry must not outlive it.
+ * never come back under the same id, so its entry must not outlive it. That covers
+ * the deletions a tab OBSERVES; `retainCells` is the backstop for the ones it does
+ * not (a delete during a disconnect, a checkpoint restore).
  */
 export function withCollapse(record: CollapsedRecord, id: string, collapsed: boolean): CollapsedRecord {
 	if (!!record[id] === collapsed) return record; // no-op: keep the identity, skip the write
@@ -73,6 +83,29 @@ export function withoutCells(record: CollapsedRecord, ids: Iterable<string>): Co
 	let next: CollapsedRecord | null = null;
 	for (const id of ids) {
 		if (!record[id]) continue;
+		next ??= { ...record };
+		delete next[id];
+	}
+	return next ?? record;
+}
+
+/**
+ * Keep only the entries whose cell still exists, returning the SAME record when
+ * nothing is dropped (so a load that changes nothing writes nothing).
+ *
+ * The per-delete cleanup above only covers deletions THIS tab observed. Two real
+ * paths remove a cell without one reaching it: a cell deleted while this tab was
+ * disconnected (the reconnect / seq-gap refetch is exactly that case), and a
+ * checkpoint restore (`notebook:restored` -> a refetch). Reconciling against the
+ * cells a load actually returned is what makes "the persisted record can never
+ * outlive the cells" true in general rather than only along the observed paths -
+ * otherwise a stale id sits in the per-project JSON for good.
+ */
+export function retainCells(record: CollapsedRecord, ids: Iterable<string>): CollapsedRecord {
+	const alive = ids instanceof Set ? (ids as Set<string>) : new Set(ids);
+	let next: CollapsedRecord | null = null;
+	for (const id of Object.keys(record)) {
+		if (alive.has(id)) continue;
 		next ??= { ...record };
 		delete next[id];
 	}

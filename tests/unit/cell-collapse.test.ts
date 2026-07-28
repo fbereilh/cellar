@@ -7,6 +7,7 @@ import {
 	sanitizeCollapsed,
 	withCollapse,
 	withoutCells,
+	retainCells,
 	type CollapsedRecord
 } from '../../src/lib/cellCollapse';
 import { estimateHeight, COLLAPSED_CELL_PX, CARD_CHROME_PX, CODE_LINE_PX } from '../../src/lib/virtualization';
@@ -91,6 +92,34 @@ describe('withoutCells (the delete-path cleanup)', () => {
 	it('leaves no entry behind for a deleted cell (the persisted record cannot leak)', () => {
 		const record = withoutCells({ a: true, b: true }, ['a', 'b']);
 		expect(Object.keys(record)).toEqual([]);
+	});
+});
+
+describe('retainCells (reconciling a load against the cells it returned)', () => {
+	// The per-delete cleanup only fires for deletions the tab SAW. A cell deleted
+	// while it was disconnected (the reconnect / seq-gap refetch) or removed by a
+	// checkpoint restore never reaches it, so a load has to reconcile or the entry
+	// sits in the per-project JSON for good.
+	it('drops entries whose cell is gone from the loaded notebook', () => {
+		expect(retainCells({ a: true, gone: true, c: true }, ['a', 'b', 'c'])).toEqual({ a: true, c: true });
+	});
+
+	it('keeps every entry whose cell is still there', () => {
+		expect(retainCells({ a: true, c: true }, ['a', 'b', 'c'])).toEqual({ a: true, c: true });
+	});
+
+	it('keeps its identity when nothing is dropped, so an ordinary load writes nothing', () => {
+		const record: CollapsedRecord = { a: true };
+		expect(retainCells(record, ['a', 'b'])).toBe(record);
+		expect(retainCells({}, [])).toEqual({});
+	});
+
+	it('drops everything when the notebook came back with none of those cells', () => {
+		expect(retainCells({ a: true, b: true }, [])).toEqual({});
+	});
+
+	it('accepts a Set as well as a plain list of live ids', () => {
+		expect(retainCells({ a: true, b: true }, new Set(['b']))).toEqual({ b: true });
 	});
 });
 
