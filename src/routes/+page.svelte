@@ -293,8 +293,12 @@
 			: null,
 		getUi<unknown>(VIRTUALIZE_PREF_KEY, undefined)
 	);
-	/** A URL param decided it, so the View-menu toggle is shown locked, not offered. */
+	/** A URL param decided it, so both in-app controls are shown locked, not offered. */
 	const virtualizeForced = virtualizeChoice.forced;
+	// The single source of truth for windowed rendering. TWO surfaces toggle it -
+	// the navbar View menu and the Settings pane - and both call `toggleVirtualizeCells`
+	// below rather than keeping a copy, so they stay in sync in-session and there is
+	// exactly one persisted preference (`VIRTUALIZE_PREF_KEY`).
 	let virtualizeCells = $state(virtualizeChoice.enabled);
 	function toggleVirtualizeCells() {
 		if (virtualizeForced) return; // the URL override owns this session
@@ -1620,8 +1624,11 @@
 <Settings
 	open={settingsOpen}
 	{theme}
+	{virtualizeCells}
+	{virtualizeForced}
 	onClose={() => (settingsOpen = false)}
 	onSetTheme={applyTheme}
+	onToggleVirtualizeCells={toggleVirtualizeCells}
 	onVenvRebound={() => {
 		// New interpreter → namespace is empty; drop stale inspector rows and refresh status.
 		variables = [];

@@ -25,6 +25,10 @@ import { setScrollTop } from './notebook-scroll';
  *   5. The in-app opt-out (navbar View menu) persists across a reload - it lives in
  *      the per-project UI-state store, not localStorage - and `?virtualize=1` still
  *      overrides it, with the toggle locked while a param owns the session.
+ *   6. The Settings pane's "Windowed rendering" row is a SECOND surface for that one
+ *      preference, not a copy: flipped in either place the other agrees in-session,
+ *      it persists across a reload, and a `?virtualize=` session shows the Settings
+ *      control locked with the reason (the param named) like the menu item.
  *
  * Both notebooks live in ONE workspace (one launcher), so every assertion is scoped
  * to the VISIBLE pane: an inactive notebook tab stays mounted behind `display:none`
@@ -92,6 +96,41 @@ async function openAppMenu(page: Page): Promise<void> {
 /** Close it again: the daisyUI dropdown is `:focus-within`-driven, so blur it. */
 async function closeAppMenu(page: Page): Promise<void> {
 	await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+}
+
+/** Open the Settings modal (the SECOND surface for the same windowing preference). */
+async function openSettings(page: Page): Promise<void> {
+	await openAppMenu(page);
+	await page.getByTestId('open-settings').click();
+	await expect(page.getByTestId('settings-modal')).toBeVisible();
+}
+
+async function closeSettings(page: Page): Promise<void> {
+	await page.getByTestId('settings-close').click();
+	await expect(page.getByTestId('settings-modal')).toHaveCount(0);
+	await closeAppMenu(page);
+}
+
+/**
+ * Put the (shared, per-workspace) preference into the windowed state via the
+ * pre-existing navbar control, so a test that starts from "windowing on" says so
+ * instead of inheriting whatever an earlier test left in `.cellar/`.
+ */
+async function ensureWindowed(page: Page): Promise<void> {
+	await openAppMenu(page);
+	const toggle = page.getByTestId('toggle-virtualize-cells');
+	if ((await toggle.getAttribute('aria-pressed')) !== 'true') await toggle.click();
+	await closeAppMenu(page);
+	await expect.poll(() => spacers(page), { timeout: 60_000 }).toBeGreaterThan(0);
+}
+
+/**
+ * Let the debounced UI-state PUT land before the page goes away - `setUi` coalesces
+ * writes over ~300ms, so a test that ends the instant after a toggle can otherwise
+ * leave the server store holding the PREVIOUS value.
+ */
+async function settlePref(page: Page): Promise<void> {
+	await page.waitForTimeout(600);
 }
 
 test.beforeAll(async () => {
@@ -236,4 +275,78 @@ test('the View-menu opt-out survives a reload, and ?virtualize=1 still overrides
 	await openAppMenu(page);
 	await page.getByTestId('toggle-virtualize-cells').click();
 	await expect.poll(() => spacers(page), { timeout: 30_000 }).toBeGreaterThan(0);
+});
+
+test('the Settings opt-out drives the SAME preference as the View menu (one source of truth)', async ({
+	page
+}) => {
+	test.setTimeout(300_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openFromTree(page, 'notebook.ipynb');
+	await ensureWindowed(page);
+
+	// Settings reflects the live state, and offers the opt-out (nothing forces it).
+	await openSettings(page);
+	const settingsToggle = page.getByTestId('settings-virtualize-cells');
+	await expect(settingsToggle).toBeChecked();
+	await expect(settingsToggle).toBeEnabled();
+	await expect(page.getByTestId('virtualize-forced-note')).toHaveCount(0);
+
+	// Turning it off here un-windows the notebook, exactly like the View-menu toggle.
+	await settingsToggle.click();
+	await expect(settingsToggle).not.toBeChecked();
+	await closeSettings(page);
+	await expect.poll(() => cells(page), { timeout: 60_000 }).toBe(LARGE_COUNT);
+	expect(await spacers(page)).toBe(0);
+
+	// …and the NAVBAR toggle already agrees: one state, two surfaces, no second copy.
+	await openAppMenu(page);
+	await expect(page.getByTestId('toggle-virtualize-cells')).toHaveAttribute('aria-pressed', 'false');
+	await closeAppMenu(page);
+
+	// It persists across a reload - the same single `VIRTUALIZE_PREF_KEY` preference
+	// the View menu writes, in the per-project store (not localStorage).
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await expect.poll(() => cells(page), { timeout: 60_000 }).toBe(LARGE_COUNT);
+	expect(await spacers(page)).toBe(0);
+	await openSettings(page);
+	await expect(page.getByTestId('settings-virtualize-cells')).not.toBeChecked();
+	await closeSettings(page);
+
+	// The other direction: flip it in the View menu, Settings reflects it.
+	await openAppMenu(page);
+	await page.getByTestId('toggle-virtualize-cells').click();
+	await expect.poll(() => spacers(page), { timeout: 30_000 }).toBeGreaterThan(0);
+	await closeAppMenu(page);
+	await openSettings(page);
+	await expect(page.getByTestId('settings-virtualize-cells')).toBeChecked();
+	await closeSettings(page);
+	await settlePref(page);
+});
+
+test('a ?virtualize= session shows the Settings control locked, with the reason', async ({
+	page
+}) => {
+	test.setTimeout(300_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}&virtualize=0`);
+	await openFromTree(page, 'notebook.ipynb');
+	await expect.poll(() => cells(page), { timeout: 60_000 }).toBe(LARGE_COUNT);
+	expect(await spacers(page)).toBe(0);
+
+	await openSettings(page);
+	const settingsToggle = page.getByTestId('settings-virtualize-cells');
+	await expect(settingsToggle).not.toBeChecked(); // shows the forced state…
+	await expect(settingsToggle).toBeDisabled(); // …but never pretends to change it
+	await expect(page.getByTestId('virtualize-forced-note')).toBeVisible();
+	await closeSettings(page);
+
+	// The forced ON side reads the same way.
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}&virtualize=1`);
+	await openFromTree(page, 'notebook.ipynb');
+	await expect.poll(() => spacers(page), { timeout: 30_000 }).toBeGreaterThan(0);
+	await openSettings(page);
+	await expect(page.getByTestId('settings-virtualize-cells')).toBeChecked();
+	await expect(page.getByTestId('settings-virtualize-cells')).toBeDisabled();
+	await expect(page.getByTestId('virtualize-forced-note')).toBeVisible();
+	await closeSettings(page);
 });
