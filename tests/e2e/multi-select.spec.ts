@@ -4,7 +4,7 @@ import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
-import { setScrollTop, isCellMounted, mountedCellIds } from './notebook-scroll';
+import { setScrollTop, isCellMounted, mountedCellIds, paneMetric } from './notebook-scroll';
 
 /**
  * Multi-cell selection, exercised against DEFAULT-ON windowed rendering.
@@ -29,7 +29,10 @@ import { setScrollTop, isCellMounted, mountedCellIds } from './notebook-scroll';
  *   F. toggling the primary OUT of a selection MOUNTS the survivor it hands primacy
  *      to, so focus follows the selection and the next keystroke still has a target;
  *   G. a right-click on a member keeps the selection WITHOUT cancelling the press,
- *      and Cmd/Ctrl+A leaves the head at a real end so Shift+K shrinks by one.
+ *      and Cmd/Ctrl+A leaves the head at a real end so Shift+K shrinks by one;
+ *   H. Cmd/Ctrl+A MOUNTS that far end without scrolling to it (select-all is not a
+ *      navigation), and a paste selects the whole pasted block, not just its last
+ *      cell - the set-consistency cut/copy and undo already have.
  *
  * Every assertion about WHICH cells an op touched reads the SERVER document, not
  * the DOM: the DOM can only ever show the window, and "it looked right on screen"
@@ -620,4 +623,70 @@ test('command-mode Escape with nothing to collapse is left for the rest of the a
 	await expect(page.getByTestId('tree-context-menu')).toBeVisible();
 	await page.keyboard.press('Escape');
 	await expect(page.getByTestId('tree-context-menu')).toHaveCount(0);
+});
+
+test('Cmd/Ctrl+A selects everything WITHOUT taking the reader to the end', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+	const order = await serverOrder(page);
+
+	// Select-all is not a navigation. The head still moves to the LAST cell (that is
+	// what makes a following Shift+J/K extend from a coherent range), and under
+	// windowing that cell must still MOUNT so focus - and with it the modal keyboard,
+	// which reads a keystroke's mode and target off the focused element - has a real
+	// target. What must NOT happen is the viewport chasing it to the far end.
+	await setScrollTop(page, 6_000);
+	await page.waitForTimeout(400);
+	await clickCell(page, (await visibleCellIds(page))[1]);
+	const before = await paneMetric(page, 'scrollTop');
+
+	await page.keyboard.press(`${MOD}+a`);
+	await expect(page.getByTestId('selection-count')).toHaveText(`${order.length} selected`);
+
+	const last = order[order.length - 1];
+	await expect.poll(() => isCellMounted(page, last), { timeout: 20_000 }).toBe(true);
+	await expect(page.locator(`[data-cell-id="${last}"]`)).toHaveAttribute('data-active', 'true');
+	// The mount alone can shift the pane by a pixel or two as estimated heights are
+	// replaced by measured ones; what is ruled out is the jump to the bottom.
+	await page.waitForTimeout(600);
+	expect(Math.abs((await paneMetric(page, 'scrollTop')) - before)).toBeLessThan(50);
+	await page.keyboard.press('Escape');
+});
+
+test('pasting a multi-cell clipboard selects the whole pasted block', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openNotebook(page, '0');
+	const before = await serverOrder(page);
+
+	// Cut/copy act on the whole selection and undo restores the whole group, so a
+	// paste that left one cell of three selected would be an asymmetry this feature
+	// invented.
+	const start = (await visibleCellIds(page))[1];
+	await clickCell(page, start);
+	await page.keyboard.press('Shift+j');
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+	await page.keyboard.press('c');
+
+	await page.keyboard.press('v');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(before.length + 3);
+	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+
+	// And they are exactly the PASTED ids, identified against the SERVER document:
+	// the three new cells, with the last of them primary.
+	const after = await serverOrder(page);
+	const pasted = after.filter((id) => !before.includes(id));
+	expect(pasted).toHaveLength(3);
+	const selected = await page
+		.locator('[data-testid="cell"][data-selected="true"]')
+		.evaluateAll((els) => els.map((el) => (el as HTMLElement).dataset.cellId ?? ''));
+	expect(selected.sort()).toEqual([...pasted].sort());
+	await expect(page.locator(`[data-cell-id="${pasted[2]}"]`)).toHaveAttribute('data-active', 'true');
+
+	// A one-cell clipboard is the degenerate case and still lands on a single cell.
+	await clickCell(page, start);
+	await page.keyboard.press('c');
+	await page.keyboard.press('v');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(before.length + 4);
+	await expect(page.getByTestId('selection-count')).toHaveCount(0);
 });

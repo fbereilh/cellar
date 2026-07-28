@@ -414,8 +414,11 @@
 		// Command mode always acts on the selected cell, so the selection can never
 		// be a cell the user cannot see: a fold that hides it hands it to the cell
 		// holding the header that swallowed it. (`folding` is derived, so it already
-		// reflects `next`.)
-		if (activeId && folding.hidden.has(activeId)) activeId = cellIdOfKey(key);
+		// reflects `next`.) Through `selectOnly`, never a bare `activeId` write: the
+		// primary must stay a MEMBER of the selection, or `pruneSelection`'s
+		// `kept.add(activeId)` would silently widen the set on the next refetch and a
+		// following `dd`/`x` would take a cell the user never selected.
+		if (activeId && folding.hidden.has(activeId)) selectOnly(cellIdOfKey(key));
 	}
 
 	// Collapse/expand every heading section in one go, writing the same shared fold
@@ -427,13 +430,14 @@
 		foldedIds = next;
 		saveFolds();
 		// A collapse-all can hide the selected cell; hand the selection to the
-		// nearest header that still owns it (the same rule `toggleFold` applies).
+		// nearest header that still owns it (the same rule `toggleFold` applies,
+		// through the same `selectOnly` seam and for the same reason).
 		if (activeId && computeFolding(cells, next).hidden.has(activeId)) {
 			const id = activeId;
 			const owner = outlineHeadings(cells).find((h) =>
 				computeFolding(cells, new Set([h.key])).hidden.has(id)
 			);
-			if (owner) activeId = owner.cellId;
+			if (owner) selectOnly(owner.cellId);
 		}
 	}
 
@@ -2091,12 +2095,15 @@
 		const i = cells.findIndex((c) => c.id === activeId);
 		// No selection (an empty notebook) → paste at the end.
 		let index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
-		let last: UICell | null = null;
+		// The pasted BLOCK becomes the selection, not just its last cell: cut/copy act
+		// on the whole set and undo restores the whole group, so leaving five pasted
+		// cells with one selected would be an asymmetry this path invented.
+		const inserted: string[] = [];
 		for (const entry of entries) {
-			last = await insertCellAt(index, entry);
+			inserted.push((await insertCellAt(index, entry)).id);
 			index++;
 		}
-		if (last) await selectAndFocus(last.id);
+		await selectGroup(inserted);
 	}
 
 	async function undoDelete() {
@@ -2138,12 +2145,7 @@
 		// Restore the SELECTION too, not just the cells: undoing a bulk delete should
 		// hand back the state the delete was issued from, so the next action can act
 		// on the same set. After a partial restore it covers what actually landed.
-		if (!restored.length) return;
-		await selectAndFocus(restored[restored.length - 1]);
-		if (restored.length > 1) {
-			selectedIds = new Set(restored);
-			anchorId = restored[0];
-		}
+		await selectGroup(restored);
 	}
 
 	async function deleteCell(id: string) {
@@ -2447,14 +2449,22 @@
 	// `selectAndAct` (which delegates its whole tail here, so keyboard selection and
 	// this share one path) and `insertAndRunCode` (no `land`: that path deliberately
 	// never touches `activeId`, so nothing else pins its appended cell).
+	//
+	// `opts.scroll: false` keeps the mount/land/release half and drops only the
+	// movement, for a caller that must place focus on a cell without taking the
+	// reader there (`selectAllCells`). The mount is NOT optional even then: under
+	// windowing a target outside the natural window has no DOM node and no
+	// registered API, so the land - and with it the modal keyboard, which reads a
+	// keystroke's mode and target off the focused element - would go nowhere.
 	async function scrollCellIntoView(
 		id: string | null,
-		land?: (api: CellRegisterApi | undefined) => void
+		land?: (api: CellRegisterApi | undefined) => void,
+		opts: { scroll?: boolean } = {}
 	) {
 		if (!id) return;
 		const { el, pin } = await ensureCellMounted(id);
 		land?.(cellApis[id]);
-		if (el) scrollElementIntoViewNearest(el);
+		if (el && opts.scroll !== false) scrollElementIntoViewNearest(el);
 		releaseScrollPin(pin);
 	}
 
@@ -2487,6 +2497,25 @@
 	 */
 	async function selectAndFocus(id: string | null) {
 		await selectAndAct(id, (api) => api?.focusCell());
+	}
+
+	/**
+	 * Select a whole GROUP of freshly-materialized cells (a paste, an undone bulk
+	 * delete) and focus its last member. The two ends span the group - anchor at the
+	 * first, primary at the last - the same shape `selectAllCells` leaves, so a
+	 * following Shift+J/K extends from a coherent range instead of discarding it.
+	 *
+	 * Focus goes through the shared mount seam and NOT `selectAndAct`, whose
+	 * `setActive` collapses: the set must survive the focus that follows it. A
+	 * one-cell group is the degenerate case and is byte-for-byte a `selectOnly` plus
+	 * focus, so a single-cell paste behaves exactly as it always did.
+	 */
+	async function selectGroup(ids: string[]) {
+		if (!ids.length) return;
+		selectedIds = new Set(ids);
+		anchorId = ids[0];
+		activeId = ids[ids.length - 1];
+		await scrollCellIntoView(activeId, (api) => api?.focusCell());
 	}
 
 	function selectRelative(delta: number) {
@@ -2541,6 +2570,12 @@
 	 * windowed out, and if a collapsed section hides it the reveal is what makes it a
 	 * cell Shift+J/K can walk from) and NOT `selectAndAct`, whose `setActive` would
 	 * collapse the selection this just built.
+	 *
+	 * It does NOT scroll (`scroll: false`): select-all is not a navigation, and
+	 * taking the reader to the end of the notebook is a movement they did not ask
+	 * for (JupyterLab leaves the viewport put). The MOUNT still happens - focus must
+	 * land on a real node or the modal keyboard goes dead - and `focusCell` itself
+	 * focuses with `preventScroll`, so nothing moves the pane.
 	 */
 	async function selectAllCells() {
 		const order = cellOrder;
@@ -2548,7 +2583,7 @@
 		selectedIds = new Set(order);
 		anchorId = order[0];
 		activeId = order[order.length - 1];
-		await scrollCellIntoView(activeId, (api) => api?.focusCell());
+		await scrollCellIntoView(activeId, (api) => api?.focusCell(), { scroll: false });
 	}
 
 	// Fold/unfold act on the selected cell only when it is a markdown header, and
