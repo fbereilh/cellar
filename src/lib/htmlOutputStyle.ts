@@ -13,10 +13,13 @@
  * The reach was measured, not overlooked - a third-party `_repr_html_`
  * (statsmodels' `summary()` -> `<table class="simpletable">`, dask's array
  * summary, a folium/bokeh legend table) gets the same 7px/20px cell padding, the
- * same hairline row separators and header rule, and the same inherited
- * right-align wherever a cell holds bare inline text and so takes no `:has()`
- * escape (see the KNOWN LIMIT below). The padding is a universal scannability
- * win, and dropping the default border is precisely what declutters a bare
+ * same hairline row separators, and the same inherited right-align wherever a
+ * cell holds bare inline text and so takes no `:has()` escape (see the KNOWN
+ * LIMITS below). The darker header rule is the one default with a precondition:
+ * it comes from `thead th`, so it reaches only a table that actually declares a
+ * `<thead>` - which statsmodels' does not (see the thead-less case below). The
+ * padding is a universal scannability win, and dropping the default border is
+ * precisely what declutters a bare
  * table; both are fully overridable, which is what rule 1 below exists to
  * guarantee.
  * `table{border:0}` and `th,td{border:0}` also outrank the deprecated `border=`
@@ -117,9 +120,9 @@
  * specificity: `:has()` takes the specificity of its most specific argument, and
  * every argument here is a type selector.
  *
- * KNOWN LIMIT, accepted deliberately: the escape is a HARDCODED ALLOWLIST of
- * block tags (`p,div,ul,ol,pre,table,h1..h6`), not a general test for block-level
- * content, so it misfires in BOTH directions:
+ * KNOWN LIMITS, accepted deliberately. The first: the escape is a HARDCODED
+ * ALLOWLIST of block tags (`p,div,ul,ol,pre,table,h1..h6`), not a general test
+ * for block-level content, so it misfires in BOTH directions:
  *
  *   • UNDER-reach: a layout table whose prose cells use a block element that is
  *     NOT on that list (`blockquote`, `section`, `figure`, `article`, `dl`) takes
@@ -143,6 +146,19 @@
  * right-aligned). Right-align is the pandas numeric convention and the intended
  * default, and any library can style its own table - which rule 1 guarantees will
  * win. Do not add a heuristic here.
+ *
+ * The second, same class and same verdict: a table that declares no `<thead>`.
+ * The HTML parser auto-inserts `<tbody>` but NEVER `<thead>`, so in
+ * `<table><tr><th>A</th><th>B</th></tr><tr><td>…` the header cells land in the
+ * inserted tbody: they match `tbody th{text-align:left}` and read as index
+ * labels - left-aligned, while the data below stays right-aligned - and take the
+ * plain `th,td` hairline instead of `thead th`'s darker header rule.
+ * statsmodels' `summary().as_html()` is exactly that shape
+ * (`<table class="simpletable"><caption>…<tr><th>`), so it gets no header rule at
+ * all; that is the header-rule qualifier in the scope note above. Not fixable in
+ * CSS - without a `<thead>` there is no selector that tells a header row from an
+ * index column - and, like the misfires above, cosmetic and fully overridable
+ * under rule 1, so it is documented rather than worked around.
  *
  * Surface note: this block only reaches *rich `text/html`* outputs. A plain
  * DataFrame renders through the native `DataFrameGrid` (structured
