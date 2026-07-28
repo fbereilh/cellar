@@ -1,17 +1,38 @@
 <script lang="ts">
-	// Settings panel (modal): theme toggle, the project-venv (Python kernel)
-	// control, and the keyboard-shortcut registry (view + rebind).
+	// Settings panel (modal): theme toggle, the windowed-rendering opt-out, the
+	// project-venv (Python kernel) control, and the keyboard-shortcut registry
+	// (view + rebind).
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
 
 	interface Props {
 		open: boolean;
 		theme: string;
+		/**
+		 * Windowed rendering. This is the SAME shell state the navbar View-menu
+		 * toggle reads and writes (`+page.svelte`, persisted once through
+		 * `VIRTUALIZE_PREF_KEY` in `$lib/virtualizePref`) - deliberately threaded in
+		 * rather than re-read here, so the two control surfaces cannot diverge and
+		 * there is exactly one preference to persist.
+		 */
+		virtualizeCells?: boolean;
+		/** A `?virtualize=` URL param decided it: show the state, but lock the control. */
+		virtualizeForced?: boolean;
 		onClose?: () => void;
 		onSetTheme: (id: string) => void;
+		onToggleVirtualizeCells?: () => void;
 		onVenvRebound?: () => void;
 	}
-	let { open, theme, onClose, onSetTheme, onVenvRebound }: Props = $props();
+	let {
+		open,
+		theme,
+		virtualizeCells = true,
+		virtualizeForced = false,
+		onClose,
+		onSetTheme,
+		onToggleVirtualizeCells,
+		onVenvRebound
+	}: Props = $props();
 
 	const THEMES = [
 		{ id: 'dim', label: 'Dark', hint: 'dim' },
@@ -188,6 +209,37 @@
 							</button>
 						{/each}
 					</div>
+				</div>
+
+				<div class="divider my-1"></div>
+
+				<!-- Windowed rendering. Second surface for the ONE preference the navbar
+				     View menu also toggles; both call the shell's `toggleVirtualizeCells`,
+				     so flipping either updates the other in-session and persists once. -->
+				<div data-testid="virtualize-control">
+					<!-- Locked by a URL param: the row must not offer a click it will refuse,
+					     so the pointer cursor and the full-strength label go with the toggle. -->
+					<label class="flex items-center justify-between gap-4 {virtualizeForced ? 'opacity-60' : 'cursor-pointer'}">
+						<span class="text-sm font-medium">Windowed rendering</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={virtualizeCells}
+							disabled={virtualizeForced}
+							onchange={() => onToggleVirtualizeCells?.()}
+							data-testid="settings-virtualize-cells"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						Renders only the cells near the viewport, so a long notebook stays fast. Turn it off to keep
+						every cell in the page at all times.
+					</p>
+					{#if virtualizeForced}
+						<p class="mt-1 text-xs text-warning" data-testid="virtualize-forced-note">
+							The <span class="font-mono">?virtualize</span> URL parameter is controlling this session
+							(windowed rendering {virtualizeCells ? 'on' : 'off'}); reload without it to change this.
+						</p>
+					{/if}
 				</div>
 
 				<div class="divider my-1"></div>
