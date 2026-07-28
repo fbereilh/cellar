@@ -989,8 +989,17 @@
 	// search-result jump (via `jumpToCell`), and - via `selectAndAct` /
 	// `scrollCellIntoView` - keyboard selection, cell moves, paste/undo selection,
 	// `insertAndRunCode`, run-and-advance, run-and-insert-below and split-cell.
-	async function ensureCellMounted(id: string): Promise<MountedCell> {
-		revealCell(id);
+	//
+	// `reveal:false` is the opt-in MOUNT-ONLY mode, and it exists for exactly one
+	// caller: a path that needs an addressable DOM node but is NOT a navigation.
+	// `revealCell` unfolds a collapsed section AND persists that through
+	// `saveFolds()`, so a non-navigating caller would silently expand a section the
+	// user collapsed and the change would survive a reload. Everything that
+	// genuinely takes the user somewhere (`activateCell`, `selectAndAct`,
+	// `jumpToCell`, follow-running, the outline/search jumps) must keep the default:
+	// scrolling to a `display:none` cell shows nothing.
+	async function ensureCellMounted(id: string, opts: { reveal?: boolean } = {}): Promise<MountedCell> {
+		if (opts.reveal !== false) revealCell(id);
 		const pin = pinScrollTarget(id);
 		await tick(); // a just-revealed (unfolded) or off-screen (windowed) cell needs its DOM node
 		// Scope the lookup to THIS notebook: cell ids are unique per document, not
@@ -2326,6 +2335,9 @@
 			const cell = findCell(id);
 			return !!cell && !isLogicalCellType(cell, cellType);
 		});
+		// Nothing would change (`m` on an already-markdown selection), so there is no
+		// batch to send - the same early return `moveSelection` makes on an empty plan.
+		if (!pending.length) return;
 		for (const id of pending) applyCellTypeLocally(id, cellType);
 		await bulkOp({ op: 'type', ids, cellType }, pending.length);
 		scheduleStaleness();
@@ -2454,9 +2466,11 @@
 	// Every caller here MOVES focus, which is why the mount is not optional: under
 	// windowing a target outside the natural window has no DOM node and no
 	// registered API, so the land - and with it the modal keyboard, which reads a
-	// keystroke's mode and target off the focused element - would go nowhere. A
-	// caller that moves no focus (`selectAllCells`) must not come through here at
-	// all: this seam reveals as it mounts, and a reveal WRITES persisted fold state.
+	// keystroke's mode and target off the focused element - would go nowhere. Every
+	// caller here also SCROLLS and REVEALS, so a caller that must do neither
+	// (`selectAllCells`, which is not a navigation) goes to `ensureCellMounted`
+	// directly in its mount-only mode instead: this seam reveals as it mounts, and a
+	// reveal WRITES persisted fold state.
 	async function scrollCellIntoView(id: string | null, land?: (api: CellRegisterApi | undefined) => void) {
 		if (!id) return;
 		const { el, pin } = await ensureCellMounted(id);
@@ -2564,25 +2578,35 @@
 	 * would make the very next Shift+J/K discard everything past it - 300 cells
 	 * collapsing to a handful on one keystroke.
 	 *
-	 * It touches NOTHING else: no scroll, no DOM focus, no mount, no reveal. This is
-	 * a PURE state change, and deliberately not a navigation - it is the one
-	 * selection path that does not move the primary's focus, so it is also the one
-	 * exempt from the mount-before-focus invariant every other path keeps (a mount
-	 * here would land on a cell nothing is focusing). Going through the mount seam
-	 * cost two side effects nobody asked for: the viewport chasing the head to the
-	 * end of the notebook, and - because `ensureCellMounted` reveals - a collapsed
-	 * section silently UNFOLDING, `saveFolds()` persisting that, so Cmd/Ctrl+A
-	 * expanded whichever section happened to hide the last cell and the change
-	 * survived a reload. The head may therefore be a fold-hidden cell, which is why
-	 * `extendSelection` resolves a head that is absent from the walk by document
-	 * position instead of restarting from the top.
+	 * The head still has to be MOUNTED and FOCUSED, because `activeId` is also the
+	 * PRIMARY every single-cell action addresses through `apiOf(activeId)`: leaving
+	 * it unmounted made `run-cell`, `edit-mode`, `command-mode` and `split-cell`
+	 * silently no-op right after Cmd/Ctrl+A on any notebook long enough to window the
+	 * last cell out. So it goes through the shared seam in its MOUNT-ONLY mode and
+	 * lands with `focusCell` (which already focuses `{preventScroll:true}`) - never
+	 * `scrollCellIntoView`, whose two remaining side effects are exactly the ones
+	 * select-all must not have: the viewport chasing the head to the end of the
+	 * notebook, and the reveal UNFOLDING a collapsed section and `saveFolds()`
+	 * persisting that, so Cmd/Ctrl+A expanded whichever section happened to hide the
+	 * last cell and the change survived a reload. The head may therefore still be a
+	 * fold-hidden cell, which is why `extendSelection` resolves a head that is absent
+	 * from the walk by document position instead of restarting from the top - and
+	 * such a head simply does not mount or take focus (a `display:none` cell cannot),
+	 * so focus stays on the cell the user was on. That is the accepted cost of not
+	 * unfolding: the alternative writes fold state nobody asked to change.
 	 */
-	function selectAllCells() {
+	async function selectAllCells() {
 		const order = cellOrder;
 		if (!order.length) return;
 		selectedIds = new Set(order);
 		anchorId = order[0];
-		activeId = order[order.length - 1];
+		const head = order[order.length - 1];
+		activeId = head;
+		const { pin } = await ensureCellMounted(head, { reveal: false });
+		apiOf(head)?.focusCell();
+		// Safe to drop immediately: the head is `activeId`, which `pinnedCellIds`
+		// already pins, so nothing here depends on the transient pin outliving it.
+		releaseScrollPin(pin);
 	}
 
 	// Fold/unfold act on the selected cell only when it is a markdown header, and

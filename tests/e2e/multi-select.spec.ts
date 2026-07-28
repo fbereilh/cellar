@@ -30,10 +30,13 @@ import { setScrollTop, isCellMounted, mountedCellIds, paneMetric } from './noteb
  *      to, so focus follows the selection and the next keystroke still has a target;
  *   G. a right-click on a member keeps the selection WITHOUT cancelling the press,
  *      and Cmd/Ctrl+A leaves the head at a real end so Shift+K shrinks by one;
- *   H. Cmd/Ctrl+A changes nothing BUT the selection - it scrolls nowhere, mounts
- *      nothing and unfolds nothing, so it can neither move the reader nor write
- *      persisted fold state - and a paste selects the whole pasted block, not just
- *      its last cell - the set-consistency cut/copy and undo already have.
+ *   H. Cmd/Ctrl+A leaves a LIVE primary (its head mounts and takes focus, so the
+ *      primary-addressed shortcuts still reach it) while changing nothing else - it
+ *      scrolls nowhere and unfolds nothing, so it can neither move the reader nor
+ *      write persisted fold state - and a paste selects the whole pasted block, not
+ *      just its last cell - the set-consistency cut/copy and undo already have;
+ *   I. a Shift+click on a READING surface (rendered markdown, the output block)
+ *      stays the browser's text-selection gesture rather than a cell-range one.
  *
  * Every assertion about WHICH cells an op touched reads the SERVER document, not
  * the DOM: the DOM can only ever show the window, and "it looked right on screen"
@@ -362,6 +365,41 @@ test('a right-click on a member keeps the selection without cancelling the press
 	await page.keyboard.press('Escape');
 });
 
+test('a Shift+click in rendered markdown extends the TEXT selection, never the cell range', async ({ page }) => {
+	test.setTimeout(120_000);
+	// Eagerly rendered: this is about a press landing on a specific painted surface,
+	// so every cell needs a stable node and a stable box.
+	await openNotebook(page, '0');
+	const cells = await serverCells(page);
+	const md = cells.find((c, i) => i > 2 && c.cell_type === 'markdown' && c.source.includes('prose'));
+	expect(md).toBeDefined();
+
+	// Fold state is persisted per notebook and this file shares one workspace, so an
+	// earlier test's collapsed section would otherwise decide how far Shift+J steps.
+	await clickCell(page, cells[0].id);
+	await page.keyboard.press('Shift+ArrowRight');
+	await page.waitForTimeout(300);
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+
+	// Rendered markdown and the output block are for READING, and Shift+click there
+	// is how you grab part of a traceback or a printed table. The cell gesture
+	// `preventDefault`s, which suppresses the compatibility mouse events - so with no
+	// exemption the browser never extends the text selection at all.
+	const prose = page.locator(`[data-cell-id="${md!.id}"] [data-testid="markdown-rendered"] p`).first();
+	await expect(prose).toBeVisible();
+	const box = await prose.boundingBox();
+	await prose.click({ position: { x: 4, y: 6 } });
+	await prose.click({ position: { x: Math.round(Math.min(220, box!.width - 8)), y: 6 }, modifiers: ['Shift'] });
+
+	expect(await page.evaluate(() => (window.getSelection()?.toString() ?? '').trim().length)).toBeGreaterThan(0);
+	// And the press is NOT a range gesture: it behaves exactly like the plain click
+	// on the same spot would - it may make that cell the primary, but it never
+	// re-ranges the selection from the anchor.
+	await expect(page.getByTestId('selection-count')).toHaveCount(0);
+	await page.keyboard.press('Escape');
+});
+
 test('Cmd/Ctrl+A leaves the head at the last cell, so Shift+K shrinks by one', async ({ page }) => {
 	test.setTimeout(120_000);
 	await openWindowed(page);
@@ -380,9 +418,8 @@ test('Cmd/Ctrl+A leaves the head at the last cell, so Shift+K shrinks by one', a
 
 	await page.keyboard.press(`${MOD}+a`);
 	await expect(page.getByTestId('selection-count')).toHaveText(`${order.length} selected`);
-	// The head really moved to the far end. Select-all itself mounts nothing - the
-	// last cell has a node only because the PRIMARY is pinned into the window, which
-	// is pre-existing and independent of any reveal - so the proof is behavioural:
+	// The head really moved to the far end. Mounting it proves nothing on its own
+	// (the PRIMARY is pinned into the window anyway), so the proof is behavioural:
 	// `extendSelection` rebuilds the range as anchor→head, so a head left
 	// mid-document would drop everything past it. One step back from a real end drops
 	// exactly one, and stepping forward again restores exactly one.
@@ -641,16 +678,14 @@ test('Cmd/Ctrl+A selects everything WITHOUT taking the reader to the end', async
 	await openWindowed(page);
 	const order = await serverOrder(page);
 
-	// Select-all is not a navigation: it is a PURE state change. The head still moves
-	// to the LAST cell (that is what makes a following Shift+J/K extend from a
-	// coherent range), but nothing travels with it - the viewport stays exactly where
-	// the reader left it and DOM focus stays on the cell they were on, which is all
-	// the modal keyboard needs (it reads a keystroke's mode and target off the
-	// focused element, and every action addresses cells by id).
+	// Select-all is not a navigation. The head moves to the LAST cell (that is what
+	// makes a following Shift+J/K extend from a coherent range) and focus follows it,
+	// because `activeId` is ALSO the primary every single-cell action addresses -
+	// but the viewport does not travel with it. The mount runs in the seam's
+	// mount-only mode and the focus is `preventScroll`, so the reader stays put.
 	await setScrollTop(page, 6_000);
 	await page.waitForTimeout(400);
-	const focused = (await visibleCellIds(page))[1];
-	await clickCell(page, focused);
+	await clickCell(page, (await visibleCellIds(page))[1]);
 	const before = await paneMetric(page, 'scrollTop');
 
 	await page.keyboard.press(`${MOD}+a`);
@@ -659,12 +694,24 @@ test('Cmd/Ctrl+A selects everything WITHOUT taking the reader to the end', async
 	// Not "close enough": select-all runs no scroll at all, so the pane cannot move.
 	await page.waitForTimeout(600);
 	expect(await paneMetric(page, 'scrollTop')).toBe(before);
-	expect(
-		await page.evaluate(
-			(id) => document.activeElement?.closest('[data-cell-id]')?.getAttribute('data-cell-id') === id,
-			focused
+
+	// …and the primary is LIVE, not a windowed-out id: it mounted, it holds focus,
+	// and Enter really reaches it. Without the mount, `apiOf(activeId)` resolved to
+	// nothing and every primary-addressed shortcut (Enter, Ctrl+Enter, command-mode,
+	// split-cell) silently no-opped right after Cmd/Ctrl+A on a long notebook.
+	const last = order[order.length - 1];
+	await expect.poll(() => isCellMounted(page, last), { timeout: 20_000 }).toBe(true);
+	await expect
+		.poll(
+			() =>
+				page.evaluate(
+					() => document.activeElement?.closest('[data-cell-id]')?.getAttribute('data-cell-id') ?? null
+				),
+			{ timeout: 10_000 }
 		)
-	).toBe(true);
+		.toBe(last);
+	await page.keyboard.press('Enter');
+	await expect(page.locator(`[data-cell-id="${last}"]`).getByTestId('cell-mode')).toHaveAttribute('data-mode', 'edit');
 	await page.keyboard.press('Escape');
 });
 

@@ -286,15 +286,22 @@
 	 * range it was asked for. The notebook focuses the resulting primary cell
 	 * itself, so the modal keyboard still has a focused target.
 	 *
-	 * Three deliberate exemptions keep the gesture from stealing a press that already
-	 * means something else: it is the PRIMARY button only (a Shift/Ctrl right- or
-	 * middle-click opens a context menu or pastes - re-ranging the selection there,
-	 * and `preventDefault`ing the press, would hijack a gesture the user aimed
-	 * elsewhere), a control (button/link/field) keeps its own activation, and a
-	 * Shift+click inside an editor that ALREADY HAS THE CARET stays CodeMirror's
-	 * text-selection gesture. That last test asks the editor itself
-	 * (`view.hasFocus`) rather than the notebook's `keyMode`, which is a visual
-	 * mirror and can lag a focus change by an event.
+	 * The exemptions all guard presses that already mean something else, and they
+	 * exist because cancelling `pointerdown` suppresses the compatibility mouse
+	 * events - so anything the browser or a library drives off those is lost:
+	 *   - PRIMARY button only. A Shift/Ctrl right- or middle-click opens a context
+	 *     menu or pastes; re-ranging the selection there would hijack it.
+	 *   - a control (button/link/field) keeps its own activation.
+	 *   - an editor that ALREADY HAS THE CARET keeps CodeMirror's text gesture. That
+	 *     test asks the editor itself (`view.hasFocus`) rather than the notebook's
+	 *     `keyMode`, which is a visual mirror and can lag a focus change by an event.
+	 *   - RENDERED MARKDOWN and the OUTPUT block keep the NATIVE text gesture, so
+	 *     Shift+click still EXTENDS a text selection over part of a traceback or a
+	 *     printed table - the everyday reason to click there. Reading is what those
+	 *     surfaces are for; the cell-range gesture stays on the card's chrome.
+	 * An exempted press falls through to the PLAIN activation below, exactly as an
+	 * unmodified click on the same spot would: it can make that cell the primary, but
+	 * it never re-ranges or toggles the selection.
 	 */
 	function onCardPointerDown(e: PointerEvent) {
 		const t = e.target as HTMLElement | null;
@@ -304,6 +311,7 @@
 			e.button === 0 &&
 			(extend || toggle) &&
 			!t?.closest?.('button, a, input, select, textarea, [role="button"]') &&
+			!t?.closest?.('[data-testid="markdown-rendered"], [data-testid="output"]') &&
 			!(view?.hasFocus && t?.closest?.('.cm-editor'))
 		) {
 			e.preventDefault();
