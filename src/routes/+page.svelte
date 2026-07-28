@@ -19,6 +19,7 @@
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState';
 	import { resolveVirtualize, VIRTUALIZE_PREF_KEY } from '$lib/virtualizePref';
 	import { relativeTimeLong } from '$lib/relativeTime';
+	import { createNoticeChannel } from '$lib/notice.svelte';
 	import type { PageData } from './$types';
 	import type { Cell } from '$lib/server/types';
 	import type {
@@ -273,30 +274,13 @@
 	$effect(() => {
 		searchHighlight.notebookPath = findOpen ? activeNotebookPath : null;
 	});
-	// Transient, dismissable status line (jupytext env not ready, convert result,
-	// a notebook action the document invariants refused, …).
-	let notice = $state('');
-	// The nonce that makes a REPEAT visible: re-assigning an identical string is a
-	// reactive no-op, so a refusal the user retries (Mod+A then `dd` twice) would
-	// otherwise produce no new feedback at all - the "indistinguishable from a dead
-	// keyboard" symptom the status line exists to cure. The markup keys off it, so
-	// each call re-mounts and re-animates the toast even for the same message.
-	let noticeSeq = $state(0);
-	let noticeTimer: ReturnType<typeof setTimeout> | undefined;
-	// Long enough to read a sentence; the ✕ still dismisses early.
-	const NOTICE_TIMEOUT_MS = 6000;
-	/** The one way anything below the shell reaches that status line. */
-	function showNotice(message: string) {
-		clearTimeout(noticeTimer);
-		notice = message;
-		noticeSeq += 1;
-		noticeTimer = setTimeout(clearNotice, NOTICE_TIMEOUT_MS);
-	}
-	/** The one way it is taken down - always cancels the pending auto-dismiss. */
-	function clearNotice() {
-		clearTimeout(noticeTimer);
-		notice = '';
-	}
+	// Transient, dismissable status line (jupytext env not ready, convert progress
+	// and result, a notebook action the document invariants refused, …). The channel
+	// owns the auto-dismiss + repeat-nonce rules, so a `{sticky:true}` caller is the
+	// only thing that has to know it is posting progress rather than an outcome.
+	const notices = createNoticeChannel();
+	const showNotice = notices.show;
+	const clearNotice = notices.dismiss;
 	let theme = $state('dim');
 	// Follow-the-running-cell preference (default on). A viewer preference, not a
 	// notebook document property, so it lives in the per-project UI-state store
@@ -892,7 +876,12 @@
 		const source = activeTab.path;
 		const target = source.replace(/\.py$/i, '.ipynb');
 		converting = true;
-		showNotice('Converting: running all cells…');
+		// Progress, not a result: this runs EVERY cell of the notebook and can take
+		// minutes, so it must stay up until the outcome below replaces it. The only
+		// other signal is the app-menu spinner, inside a `:focus-within` dropdown the
+		// user has usually clicked away from - so a timeout here leaves them with no
+		// indication anything is in flight.
+		showNotice('Converting: running all cells…', { sticky: true });
 		try {
 			const res = await fetch('/api/notebooks/jupytext', {
 				method: 'POST',
@@ -1714,15 +1703,21 @@
 	</div>
 {/if}
 
-<!-- Transient status line for app-level actions and refusals (auto-dismissing, and
-     dismissable early). Keyed on the nonce, not on the text: repeating an action
-     that was refused must re-show the toast, and re-rendering the same string
-     would change nothing on screen. -->
-{#if notice}
-	{#key noticeSeq}
-		<div class="toast toast-end toast-bottom z-[100]" data-testid="app-notice" data-seq={noticeSeq}>
+<!-- Transient status line for app-level actions and refusals (auto-dismissing
+     unless the caller marked it progress, and dismissable early either way).
+     Keyed on the nonce, not on the text: repeating an action that was refused must
+     re-show the toast, and re-rendering the same string would change nothing on
+     screen. -->
+{#if notices.message}
+	{#key notices.seq}
+		<div
+			class="toast toast-end toast-bottom z-[100]"
+			data-testid="app-notice"
+			data-seq={notices.seq}
+			data-sticky={notices.sticky}
+		>
 			<div class="alert alert-info cellar-notice max-w-md text-sm shadow-lg">
-				<span class="min-w-0 break-words">{notice}</span>
+				<span class="min-w-0 break-words">{notices.message}</span>
 				<button class="btn btn-ghost btn-xs btn-square" onclick={clearNotice} aria-label="Dismiss">✕</button>
 			</div>
 		</div>

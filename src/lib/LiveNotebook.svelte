@@ -2020,8 +2020,9 @@
 
 	/**
 	 * Insert a cell carrying `spec`'s type + source at `index`, and return it.
-	 * The caller selects it: paste selects the last pasted cell, undo the restored
-	 * one.
+	 * Selection is the CALLER's: both callers insert a whole group and then select
+	 * the resulting block (paste the pasted cells, undo the restored ones), so this
+	 * deliberately touches neither `activeId` nor `selectedIds`.
 	 */
 	async function insertCellAt(index: number, spec: ClipboardCell): Promise<UICell> {
 		const at = Math.max(0, Math.min(index, cells.length));
