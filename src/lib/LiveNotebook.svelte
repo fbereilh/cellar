@@ -6,7 +6,7 @@
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
-	import { isLogicalCellType } from '$lib/cellLanguage';
+	import { isLogicalCellType, SQL_LANGUAGE } from '$lib/cellLanguage';
 	import {
 		applyGesture,
 		extendSelection,
@@ -58,6 +58,14 @@
 		onRunStateChange?: (path: string, runningId: string | null, queued: Record<string, number>) => void;
 		/** (path, count): how many cells are selected here - the shell footer reports it. */
 		onSelectionChange?: (path: string, count: number) => void;
+		/**
+		 * A short, user-facing explanation of something the notebook REFUSED to do, for
+		 * the shell's transient status line (the same one the export/jupytext actions
+		 * use). A refusal the user asked for by keystroke has no other surface: there is
+		 * no request to fail and no affordance to disable, so without this it reads as
+		 * the keyboard being broken.
+		 */
+		onNotice?: (message: string) => void;
 		/** (path, handle|null): lets the Outline drive this notebook's folds. */
 		onRegisterFolds?: (path: string, handle: FoldRegistryHandle | null) => void;
 		/** (path, api|null): lets the sidebar drop a cell in here. */
@@ -141,6 +149,7 @@
 		onHideAllCodeChange,
 		onRunStateChange,
 		onSelectionChange,
+		onNotice,
 		onRegisterFolds,
 		onRegisterNumbering,
 		onRegisterApi,
@@ -1338,17 +1347,18 @@
 			next.splice(to, 0, cell);
 			cells = next;
 		} else if (ev.type === 'cell:type') {
-			const cell = findCell(ev.cellId);
-			if (cell) {
-				cell.cell_type = ev.cell_type;
-				if (ev.cell_type === 'markdown') cell.outputs = [];
-				// The event carries the new language (sql | null) so a remote code↔sql
-				// switch re-highlights the editor live. Reassign metadata for reactivity.
-				const cellar = { ...(cell.metadata?.cellar ?? {}) };
-				if (ev.language === 'sql') cellar.language = 'sql';
-				else delete cellar.language;
-				cell.metadata = { ...(cell.metadata ?? {}), cellar };
-			}
+			// The RECEIVING half of a type switch goes through the SAME
+			// `applyCellTypeLocally` the optimistic half uses, rather than re-deriving
+			// the metadata rules here: `cell:type` carries only the nbformat type and
+			// the language, so every rule about what a switch DROPS (the imports role,
+			// the export flag) lives on the two client halves and the server's
+			// `applyCellType`. A third hand-written copy is how one gets fixed and the
+			// others left behind - which is exactly what happened here, leaving this tab
+			// drawing the imports/export badge over a cell the server had stripped, with
+			// no further event able to correct it before a reload.
+			const logical: LogicalCellType =
+				ev.cell_type === 'markdown' ? 'markdown' : ev.language === SQL_LANGUAGE ? 'sql' : 'code';
+			applyCellTypeLocally(ev.cellId, logical);
 		} else if (ev.type === 'cell:cleared') {
 			const cell = findCell(ev.cellId);
 			if (cell) cell.outputs = [];
@@ -1810,9 +1820,12 @@
 	}
 
 	/**
-	 * The optimistic half of a type switch, shared by the single-cell `setType` and
-	 * the `setTypeSelection` batch so both render the change identically (the server
-	 * shares its own half the same way, in `notebook.ts`'s `applyCellType`).
+	 * The client half of a type switch, shared by ALL THREE of this component's type
+	 * paths so they cannot diverge: the optimistic single-cell `setType`, the
+	 * optimistic `setTypeSelection` batch, and the REMOTE `cell:type` handler (an
+	 * agent's or another tab's switch). The server shares its own half the same way,
+	 * in `notebook.ts`'s `applyCellType`, so there are exactly two implementations of
+	 * the rules - not one per call site.
 	 */
 	function applyCellTypeLocally(id: string, cellType: LogicalCellType) {
 		const cell = findCell(id);
@@ -2036,6 +2049,19 @@
 		return created.id;
 	}
 
+	/**
+	 * Say WHY nothing happened when the non-empty invariant refused a delete/cut.
+	 *
+	 * The rule itself is deliberate and enforced server-side (`deleteCells`); what
+	 * this fixes is that a keystroke refusal has no other surface. Cmd/Ctrl+A then
+	 * `dd` (or `x`) sends no request that could fail and disables no button, so a
+	 * silent return is indistinguishable from a dead keyboard. Routed to the shell's
+	 * existing transient status line rather than a new affordance.
+	 */
+	function noticeKeepOneCell() {
+		onNotice?.('A notebook keeps at least one cell - that delete would leave none.');
+	}
+
 	// Copy/cut take the whole selection, in document order. The clipboard has always
 	// held a LIST and `pasteCells` has always inserted every entry, so this needed no
 	// new machinery - and the alternative (copying one cell while five are visibly
@@ -2053,7 +2079,8 @@
 		// A cut that cannot delete would be half a cut - copied but still there -
 		// which is worse than doing nothing. So it refuses on exactly the conditions
 		// the delete refuses on: a lone cell, or a selection covering every cell.
-		if (!ids.length || ids.length >= cells.length) return;
+		if (!ids.length) return;
+		if (ids.length >= cells.length) return noticeKeepOneCell();
 		copyActive();
 		deleteSelection();
 	}
@@ -2126,7 +2153,8 @@
 		// delete button enforces by disabling itself at one cell - so there is always
 		// somewhere to type. The ENFORCEMENT is the server's (`deleteCell` refuses),
 		// because only it knows the real cell count; this is the optimistic mirror.
-		if (!cell || cells.length <= 1) return;
+		if (!cell) return;
+		if (cells.length <= 1) return noticeKeepOneCell();
 		// Snapshot BEFORE the cell leaves the model - the only moment its live source
 		// and metadata are readable - but push the group only once the server confirms,
 		// exactly as the bulk delete does: a refused delete refetches the cell back, and
@@ -2225,7 +2253,7 @@
 		// (`deleteCells` refuses the batch), because only it knows the real cell count;
 		// this is the optimistic mirror, like the client/server `clampMoveIndex` pair,
 		// so the common case never renders a delete the server is about to refuse.
-		if (ids.length >= cells.length) return;
+		if (ids.length >= cells.length) return noticeKeepOneCell();
 		const order = cellOrder;
 		const removed = new Set(ids);
 		// Snapshot BEFORE the cells leave the model - this is the only moment their

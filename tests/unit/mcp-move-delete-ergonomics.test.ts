@@ -24,6 +24,7 @@ let WS: string;
 let svc: typeof import('../../src/lib/server/mcp/service');
 let nbmod: typeof import('../../src/lib/server/notebook');
 let events: typeof import('../../src/lib/server/events');
+let cp: typeof import('../../src/lib/server/checkpoints');
 
 const abs = (rel: string) => nbmod.resolveNotebookPath(rel);
 
@@ -33,6 +34,7 @@ beforeAll(async () => {
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
 	events = await import('../../src/lib/server/events');
+	cp = await import('../../src/lib/server/checkpoints');
 });
 
 /** A notebook of code cells `a = 0 … a = n-1`, returned as emitted handles. */
@@ -149,6 +151,32 @@ describe('delete_cells removes many in one call', () => {
 		const r = svc.removeCells([handles[0], handles[0], handles[2]], target);
 		expect(r.ok && r.count).toBe(2);
 		expect(sources(target)).toEqual(['', 'a = 1']);
+	});
+
+	/**
+	 * A checkpoint is a snapshot of the state a mutation is about to leave behind,
+	 * so a batch the non-empty invariant REFUSES must not mint one: it would put an
+	 * entry carrying an 'agent' trigger in the human's History for a document that
+	 * never changed, and (the auto-checkpoint being throttled by an action COUNT)
+	 * it would spend the slot that the next real mutation should have had.
+	 */
+	it('a REFUSED batch takes no checkpoint and spends no action slot', async () => {
+		const { target, handles } = await makeNotebook('delete-refused.ipynb', 2);
+		const all = nbmod.listCells(target).map((c) => c.id);
+		// `makeNotebook`'s own add was this notebook's first agent action, so it
+		// already checkpointed and reset the throttle. Walk the counter to one action
+		// short of the next automatic snapshot, so a stray auto-checkpoint call is
+		// unmistakable rather than merely absent.
+		for (let i = 0; i < 4; i++) await svc.editCell(handles[0], `a = ${i}`, { nb: target, routeImports: false });
+		const before = cp.listCheckpoints(target).length;
+
+		expect(svc.removeCells(all, target)).toEqual({ ok: false, refused: 'would-empty-notebook' });
+		expect(nbmod.listCells(target).map((c) => c.id)).toEqual(all); // nothing removed
+		expect(cp.listCheckpoints(target).length).toBe(before);
+
+		// …and the slot it did not spend is still there for the delete that lands.
+		expect(svc.removeCells([handles[0]], target).ok).toBe(true);
+		expect(cp.listCheckpoints(target).length).toBe(before + 1);
 	});
 
 	it('deletes NOTHING when any id is unknown — a typo cannot half-apply a batch', async () => {

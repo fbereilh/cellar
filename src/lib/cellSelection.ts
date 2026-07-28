@@ -61,7 +61,14 @@ export function orderedSelection(order: readonly string[], selected: ReadonlySet
 	return order.filter((id) => selected.has(id));
 }
 
-/** True when the selection occupies one unbroken run of the document order. */
+/**
+ * True when the selection occupies one unbroken run of the document order.
+ *
+ * Part of this module's algebra rather than a rule any surface reads today: the
+ * ops are all contiguity-agnostic on purpose (`moveSelectionPlan` generalizes to a
+ * scattered selection with no special case), so the only caller is the unit suite,
+ * which uses it to state what a move did to the selection's SHAPE.
+ */
 export function isContiguous(order: readonly string[], selected: ReadonlySet<string>): boolean {
 	const idx = order.flatMap((id, i) => (selected.has(id) ? [i] : []));
 	if (idx.length <= 1) return true;
@@ -164,7 +171,24 @@ export function moveSelectionPlan(order: readonly string[], selected: ReadonlySe
 	return steps;
 }
 
-/** Apply a move plan to an id order (the shared client/server/test replay). */
+/**
+ * Apply a move plan to an id order the way a RECEIVING client does: tolerantly.
+ * An unknown id is skipped and an out-of-range index is clamped, exactly like
+ * `LiveNotebook`'s `cell:moved` handler, because a tab applying someone else's
+ * events cannot refuse them - it has no plan to abandon, only events to replay.
+ *
+ * That is what the tests use it for: proving the `cell:moved` events a batch emits
+ * replay into the order the batch actually persisted.
+ *
+ * The two INITIATING halves - `LiveNotebook`'s `moveSelection` and the server's
+ * `moveCells` - deliberately do NOT go through this, and routing them through it
+ * would be wrong rather than merely redundant: each interleaves the
+ * `clampMoveIndex` guard step by step (an adjacent swap's legality depends on the
+ * swaps before it) and abandons the WHOLE plan on a refusal, so it never persists
+ * or renders a selection half-slid past itself. Tolerant replay and guarded apply
+ * are different contracts; the duplication between those two is the deliberate
+ * client/server mirror `clampMoveIndex` exists to keep in step.
+ */
 export function applyMovePlan(order: readonly string[], steps: readonly MoveStep[]): string[] {
 	const work = [...order];
 	for (const { id, toIndex } of steps) {

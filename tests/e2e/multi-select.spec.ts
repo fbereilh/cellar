@@ -539,3 +539,38 @@ test('a REFUSED bulk delete leaves no undo group, so `z` cannot duplicate cells'
 	await page.waitForTimeout(1500);
 	expect(await serverOrder(page)).toEqual(before);
 });
+
+test('a delete covering every cell is refused - and SAYS why instead of doing nothing', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+	const before = await serverOrder(page);
+
+	// The rule (a notebook always keeps one cell) is deliberate and enforced
+	// server-side. What is under test is that the user is TOLD: a keystroke refusal
+	// sends no request that could fail and disables no button, so a silent return is
+	// indistinguishable from a dead keyboard.
+	// A VISIBLE cell, not merely a mounted one: fold state is per-project, so a
+	// section an earlier test in this file collapsed is still collapsed here and a
+	// hidden cell has no box to click.
+	await clickCell(page, (await visibleCellIds(page))[1]);
+	await page.keyboard.press(`${MOD}+a`);
+	await expect(page.getByTestId('selection-count')).toHaveText(`${before.length} selected`);
+
+	await page.keyboard.press('d');
+	await page.keyboard.press('d');
+	await expect(page.getByTestId('app-notice')).toContainText('at least one cell');
+	await page.waitForTimeout(1000);
+	expect(await serverOrder(page)).toEqual(before); // and nothing was removed
+
+	// The cut path refuses on exactly the same condition and must not go silent
+	// either (a cut that cannot delete would otherwise be half a cut).
+	await page.getByTestId('app-notice').getByRole('button', { name: 'Dismiss' }).click();
+	await expect(page.getByTestId('app-notice')).toHaveCount(0);
+	await clickCell(page, (await visibleCellIds(page))[1]);
+	await page.keyboard.press(`${MOD}+a`);
+	await page.keyboard.press('x');
+	await expect(page.getByTestId('app-notice')).toContainText('at least one cell');
+	await page.waitForTimeout(1000);
+	expect(await serverOrder(page)).toEqual(before);
+	await page.keyboard.press('Escape');
+});

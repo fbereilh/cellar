@@ -19,6 +19,7 @@ import {
 	setCellType,
 	deleteCells,
 	clearOutputsForCells,
+	deleteWouldEmptyNotebook,
 	moveCellTo,
 	setVisibility,
 	getHeaderNumbering,
@@ -1284,7 +1285,7 @@ export async function editCell(id: string, source: string, { routeImports: route
  * `deleteCells` also refuses a batch that would empty the notebook, and that
  * refusal is reported as such: an agent told `{ok:true, count:N}` over a document
  * the server never changed would go on building against cells that are still
- * there.
+ * there. A refused batch takes NO checkpoint either - see below.
  */
 export function removeCells(ids: string[], nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
@@ -1298,6 +1299,14 @@ export function removeCells(ids: string[], nb?: string | null) {
 		full.push(id);
 	}
 	if (!full.length) return { ok: false as const, missing: null };
+	// Look the refusal up BEFORE checkpointing: a checkpoint is a snapshot of the
+	// state a mutation is about to leave behind, so minting one for a batch the
+	// invariant refuses puts a no-op entry carrying an 'agent' trigger in the
+	// human's History for a document that never changed. `deleteCells` below stays
+	// the enforcement - this only decides whether to pay for the snapshot.
+	if (deleteWouldEmptyNotebook(full, target)) {
+		return { ok: false as const, refused: 'would-empty-notebook' as const };
+	}
 	// Handles are prefixes of the CURRENT cell set, so read them before deleting.
 	const toHandle = handleFn(target);
 	const deleted = full.map(toHandle);

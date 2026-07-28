@@ -273,8 +273,13 @@
 	$effect(() => {
 		searchHighlight.notebookPath = findOpen ? activeNotebookPath : null;
 	});
-	// Transient, dismissable status line (jupytext env not ready, convert result, …).
+	// Transient, dismissable status line (jupytext env not ready, convert result,
+	// a notebook action the document invariants refused, …).
 	let notice = $state('');
+	/** The one way anything below the shell reaches that status line. */
+	function showNotice(message: string) {
+		notice = message;
+	}
 	let theme = $state('dim');
 	// Follow-the-running-cell preference (default on). A viewer preference, not a
 	// notebook document property, so it lives in the per-project UI-state store
@@ -1472,6 +1477,7 @@
 						onHideAllCodeChange={handleHideAllCodeChange}
 						onRunStateChange={handleRunStateChange}
 						onSelectionChange={handleSelectionChange}
+						onNotice={showNotice}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
@@ -1499,6 +1505,7 @@
 						onHideAllCodeChange={handleHideAllCodeChange}
 						onRunStateChange={handleRunStateChange}
 						onSelectionChange={handleSelectionChange}
+						onNotice={showNotice}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
@@ -1690,9 +1697,9 @@
 	</div>
 {/if}
 
-<!-- Transient status line for jupytext actions (dismissable). -->
+<!-- Transient status line for app-level actions and refusals (dismissable). -->
 {#if notice}
-	<div class="toast toast-end toast-bottom z-[100]" data-testid="jupytext-notice">
+	<div class="toast toast-end toast-bottom z-[100]" data-testid="app-notice">
 		<div class="alert alert-info max-w-md text-sm shadow-lg">
 			<span class="min-w-0 break-words">{notice}</span>
 			<button class="btn btn-ghost btn-xs btn-square" onclick={() => (notice = '')} aria-label="Dismiss">✕</button>

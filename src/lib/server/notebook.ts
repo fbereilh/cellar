@@ -913,6 +913,29 @@ export function setCellTypes(
 	return changed.map((c) => c.id);
 }
 
+/** The non-empty invariant itself: would removing exactly `removed` (already
+ *  resolved against the document) leave the notebook with no cells? */
+function emptiesNotebook(doc: NotebookDoc, removed: readonly string[]): boolean {
+	return removed.length >= doc.cells.length;
+}
+
+/**
+ * Would deleting `ids` be REFUSED by the non-empty invariant? For a caller with
+ * work to do BEFORE the delete that must not happen if the delete never does -
+ * MCP's `removeCells`, whose auto-checkpoint would otherwise mint a History entry
+ * with an 'agent' trigger for a document that never changed. It reads the same
+ * predicate `deleteCells` enforces with, so the two can't drift into disagreeing
+ * about which batches are refused; `deleteCells` stays the ENFORCEMENT, this is
+ * only a look-ahead (both are synchronous against the same in-memory doc, so
+ * nothing can change between them).
+ */
+export function deleteWouldEmptyNotebook(ids: readonly string[], nb?: string | null): boolean {
+	const doc = docFor(nb);
+	const wanted = new Set(ids);
+	const removed = doc.cells.filter((c) => wanted.has(c.id)).map((c) => c.id);
+	return removed.length > 0 && emptiesNotebook(doc, removed);
+}
+
 /** A refused delete is distinguishable from one that simply matched
  *  nothing: the first is a request the document invariant rejected, the second
  *  is a no-op the caller can ignore. */
@@ -947,7 +970,7 @@ export function deleteCells(ids: readonly string[], nb?: string | null, originId
 	const wanted = new Set(ids);
 	const removed = doc.cells.filter((c) => wanted.has(c.id)).map((c) => c.id);
 	if (!removed.length) return { ok: true, removed: [] };
-	if (removed.length >= doc.cells.length) return { ok: false, reason: 'would-empty-notebook' };
+	if (emptiesNotebook(doc, removed)) return { ok: false, reason: 'would-empty-notebook' };
 	doc.cells = doc.cells.filter((c) => !wanted.has(c.id));
 	persist(doc);
 	for (const id of removed) {
