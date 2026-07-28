@@ -20,6 +20,7 @@ import {
 	nearestSelected,
 	orderedSelection,
 	rangeIds,
+	reseatHiddenPrimary,
 	selectionAfterRemoval,
 	stepFromUnwalkableHead,
 	toggled
@@ -264,6 +265,24 @@ describe('nearestSelected', () => {
 		expect(nearestSelected(ORDER, set('a', 'e'), 'c')).toBe('e');
 		expect(nearestSelected(ORDER, set('a'), 'c')).toBe('a');
 		expect(nearestSelected(ORDER, set(), 'c')).toBeNull();
+	});
+});
+
+describe('reseatHiddenPrimary - a fold hiding the primary must not discard the selection', () => {
+	it('moves the primary to the nearest still-visible MEMBER, keeping the set', () => {
+		// Selection b..e, primary c, and the fold swallows b and c.
+		expect(reseatHiddenPrimary(ORDER, set('b', 'c', 'd', 'e'), 'c', set('b', 'c'))).toBe('d');
+	});
+
+	it('falls back above when nothing selected below survives the fold', () => {
+		expect(reseatHiddenPrimary(ORDER, set('a', 'c', 'd'), 'c', set('c', 'd'))).toBe('a');
+	});
+
+	it('is null ONLY when the fold hides every member - the one case with nowhere to go', () => {
+		expect(reseatHiddenPrimary(ORDER, set('c', 'd'), 'c', set('c', 'd'))).toBeNull();
+		// The degenerate single-cell selection is exactly that case, so the caller
+		// still collapses onto the owning header as it always did.
+		expect(reseatHiddenPrimary(ORDER, set('c'), 'c', set('c'))).toBeNull();
 	});
 });
 

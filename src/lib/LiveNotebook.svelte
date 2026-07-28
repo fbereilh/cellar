@@ -12,6 +12,7 @@
 		extendSelection,
 		moveSelectionPlan,
 		orderedSelection,
+		reseatHiddenPrimary,
 		selectionAfterRemoval,
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
@@ -413,13 +414,9 @@
 		foldedIds = next;
 		saveFolds();
 		// Command mode always acts on the selected cell, so the selection can never
-		// be a cell the user cannot see: a fold that hides it hands it to the cell
-		// holding the header that swallowed it. (`folding` is derived, so it already
-		// reflects `next`.) Through `selectOnly`, never a bare `activeId` write: the
-		// primary must stay a MEMBER of the selection, or `pruneSelection`'s
-		// `kept.add(activeId)` would silently widen the set on the next refetch and a
-		// following `dd`/`x` would take a cell the user never selected.
-		if (activeId && folding.hidden.has(activeId)) selectOnly(cellIdOfKey(key));
+		// be a cell the user cannot see. (`folding` is derived, so it already reflects
+		// `next`.)
+		if (activeId && folding.hidden.has(activeId)) reseatPrimaryAfterFold(activeId, folding.hidden, key);
 	}
 
 	// Collapse/expand every heading section in one go, writing the same shared fold
@@ -430,16 +427,40 @@
 		const next = folded ? new Set(outlineHeadings(cells).map((h) => h.key)) : new Set<string>();
 		foldedIds = next;
 		saveFolds();
-		// A collapse-all can hide the selected cell; hand the selection to the
-		// nearest header that still owns it (the same rule `toggleFold` applies,
-		// through the same `selectOnly` seam and for the same reason).
-		if (activeId && computeFolding(cells, next).hidden.has(activeId)) {
+		// A collapse-all can hide the selected cell; re-seat the primary by the same
+		// rule `toggleFold` applies, through the same seam and for the same reason.
+		const hidden = computeFolding(cells, next).hidden;
+		if (activeId && hidden.has(activeId)) {
 			const id = activeId;
 			const owner = outlineHeadings(cells).find((h) =>
 				computeFolding(cells, new Set([h.key])).hidden.has(id)
 			);
-			if (owner) selectOnly(owner.cellId);
+			reseatPrimaryAfterFold(id, hidden, owner?.key ?? null);
 		}
+	}
+
+	/**
+	 * A fold just hid the primary. Move it to the nearest still-visible MEMBER of
+	 * the selection, which keeps the set the user built intact - a selection may
+	 * legitimately hold fold-hidden cells (a Shift range fills in by document index,
+	 * select-all takes the whole order), so collapsing it would discard six cells
+	 * because one chevron moved.
+	 *
+	 * Only when the fold hides EVERY member is there nowhere inside the selection to
+	 * put the primary, and then the selection collapses onto the cell holding the
+	 * header that swallowed it - through `selectOnly`, never a bare `activeId`
+	 * write, because the primary must stay a MEMBER of the selection or
+	 * `pruneSelection`'s `kept.add(activeId)` would silently widen the set on the
+	 * next refetch and a following `dd`/`x` would take a cell the user never picked.
+	 */
+	function reseatPrimaryAfterFold(hiddenPrimary: string, hidden: ReadonlySet<string>, ownerKey: string | null) {
+		const stay = reseatHiddenPrimary(cellOrder, selectedIds, hiddenPrimary, hidden);
+		if (stay) {
+			activeId = stay;
+			anchorId = stay;
+			return;
+		}
+		if (ownerKey) selectOnly(cellIdOfKey(ownerKey));
 	}
 
 	// ---- Collapsible code editors --------------------------------------------
@@ -2839,7 +2860,12 @@
 			// Nothing to collapse - report NOT HANDLED so Escape keeps bubbling to
 			// whoever else is listening for it (see the `actions` doc comment).
 			if (selectedIds.size <= 1) return false;
-			selectOnly(activeId);
+			// A notebook always keeps a selected cell, so the collapse target has to
+			// tolerate a NULL primary: a remote `cell:deleted` that removed the primary
+			// deliberately leaves `activeId` null while the other members stand (it must
+			// not yank this user's caret to a neighbour), and collapsing onto that null
+			// would empty the selection outright and leave command mode acting on nothing.
+			selectOnly(activeId ?? selectedInOrder[0] ?? cellOrder[0] ?? null);
 		},
 		'fold-section': () => setFolded(activeId, true),
 		'unfold-section': () => setFolded(activeId, false),

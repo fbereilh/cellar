@@ -806,6 +806,22 @@ export function moveCellTo(id: string, index: number, nb?: string | null, origin
 }
 
 /**
+ * The DURABLE `cellar` keys a restore may seed - every declared key of
+ * `CellarNamespace` that is not runtime-only. An allowlist, so an unknown key a
+ * caller invents is dropped rather than written into the user's document.
+ */
+const DURABLE_CELLAR_KEYS = [
+	'language',
+	'role',
+	'export',
+	'hide_input',
+	'output_scrolled',
+	'hidden_from_agent',
+	'extract',
+	'visible'
+] as const satisfies readonly (keyof CellarNamespace)[];
+
+/**
  * Seed a newly created cell with `cellar` metadata a caller is RESTORING - the
  * undo stack re-inserting a deleted cell, which has to bring it back EXACTLY
  * (`language`, so a SQL cell does not come back as Python; `role`, `export`,
@@ -823,7 +839,16 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
 	if (!cellar || typeof cellar !== 'object' || Array.isArray(cellar)) return;
 	const durable = stripRuntimeMeta({ cellar: cellar as CellarNamespace }).cellar;
 	if (!durable) return;
-	Object.assign(cell.metadata.cellar, durable);
+	// Copy only the ENUMERATED durable keys, never the object the client sent: the
+	// `cellar` namespace survives clean-on-save WHOLE, so assigning it wholesale
+	// would make this route a path from arbitrary request JSON into the user's
+	// persisted `.ipynb`. The runtime strip above still runs, so a key that ever
+	// moves between the two lists cannot slip through on this path either.
+	const seed = durable as Record<string, unknown>;
+	const target = cell.metadata.cellar as Record<string, unknown>;
+	for (const key of DURABLE_CELLAR_KEYS) {
+		if (seed[key] !== undefined) target[key] = seed[key];
+	}
 	// The imports role is ONE PER NOTEBOOK (`setCellRole` enforces it by stripping
 	// any other), and this path writes the namespace directly, so it has to hold the
 	// same line: a cell deleted while it held the role, re-designated elsewhere, and

@@ -107,6 +107,33 @@ export function nearestSelected(order: readonly string[], selected: ReadonlySet<
 }
 
 /**
+ * Where the primary goes when a fold hides it while a MULTI-cell selection is
+ * standing: the nearest still-visible MEMBER of that selection, preferring the
+ * one below (the same direction `nearestSelected` settles in). Null when the fold
+ * hides every member - the one case with nowhere inside the selection to put the
+ * primary, and the only one where the caller may collapse.
+ *
+ * Re-seating rather than collapsing is what satisfies both standing rules at
+ * once: `selectedIds` may legitimately CONTAIN fold-hidden cells (a Shift range
+ * fills in by document index and select-all takes the whole order), while the
+ * primary must stay a MEMBER of it, or `pruneSelection`'s `kept.add(activeId)`
+ * would silently widen the set on the next refetch.
+ */
+export function reseatHiddenPrimary(
+	order: readonly string[],
+	selected: ReadonlySet<string>,
+	activeId: string,
+	hidden: ReadonlySet<string>
+): string | null {
+	const usable = (id: string) => selected.has(id) && !hidden.has(id);
+	const at = order.indexOf(activeId);
+	if (at < 0) return orderedSelection(order, selected).find((id) => !hidden.has(id)) ?? null;
+	for (let i = at + 1; i < order.length; i++) if (usable(order[i])) return order[i];
+	for (let i = at - 1; i >= 0; i--) if (usable(order[i])) return order[i];
+	return null;
+}
+
+/**
  * The cell to select after `removed` is deleted: whatever slides into the place
  * of the FIRST removed cell, clamped to the end. Deliberately identical to the
  * single-cell rule (`selectAfterRemoval`) at size 1 - one removal at index `i`

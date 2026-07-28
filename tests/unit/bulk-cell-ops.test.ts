@@ -180,6 +180,22 @@ describe('addCell - the metadata an undo restore brings back', () => {
 		expect(cellar.importBindings?.os?.spec).toBe('import os');
 	});
 
+	it('drops keys outside the durable allowlist, so a request cannot write junk into the .ipynb', () => {
+		// `clean.ts` keeps the `cellar` namespace WHOLE through a save, so anything
+		// seeded here survives every round trip. The seed therefore copies only the
+		// ENUMERATED durable keys - a key the caller invented is not persisted.
+		const { nb } = makeNotebook('restore-allowlist.ipynb', 2);
+		const restored = nbmod.addCell(null, 'code', nb, null, 'z = 1', {
+			language: 'sql',
+			whatever: { deeply: 'nested' },
+			__proto__polluter: 'no'
+		});
+		const cellar = nbmod.listCells(nb).find((c) => c.id === restored.id)?.metadata?.cellar ?? {};
+		expect(cellar.language).toBe('sql');
+		expect(cellar.whatever).toBeUndefined();
+		expect(cellar.__proto__polluter).toBeUndefined();
+	});
+
 	it('never restores a SECOND imports cell', () => {
 		// One imports cell per notebook is `setCellRole`'s invariant, and this path
 		// writes the namespace directly. A cell deleted while it held the role, the role

@@ -342,6 +342,90 @@ test('Cmd/Ctrl+A selects fold-hidden cells too, so a collapsed section is never 
 	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length} selected`);
 });
 
+test('folding the section holding the primary keeps the selection, re-seating the primary', async ({ page }) => {
+	test.setTimeout(120_000);
+	// Rendered eagerly for the same reason as the fold-scope test above: windowing
+	// drops a fold-hidden cell from the DOM entirely, which would make "hidden" and
+	// "windowed out" indistinguishable, and every chevron has to be clickable.
+	await openNotebook(page, '0');
+	const cells = await serverCells(page);
+	const headings = cells.flatMap((c, i) => (c.cell_type === 'markdown' && c.source.startsWith('## ') ? [i] : []));
+	expect(headings.length).toBeGreaterThan(2);
+
+	// Start from a known fold state: it is persisted per notebook (server-side, so a
+	// fresh context does not clear it) and this file shares one workspace.
+	await clickCell(page, cells[0].id);
+	await page.keyboard.press('Shift+ArrowRight');
+	await page.waitForTimeout(300);
+
+	// A section with a body, and the heading after it - which a collapse-all leaves
+	// visible (a folded heading keeps its own line) while every body cell goes.
+	const at = headings.findIndex((i, n) => n + 1 < headings.length && headings[n + 1] > i + 1);
+	expect(at).toBeGreaterThanOrEqual(0);
+	const head = headings[at];
+	const next = headings[at + 1];
+
+	// Anchor on that later heading, PRIMARY on a body cell the collapse will swallow.
+	await clickCell(page, cells[next].id);
+	await clickCell(page, cells[head + 1].id, ['Shift']);
+	const size = next - head;
+	await expect(page.getByTestId('selection-count')).toHaveText(`${size} selected`);
+
+	await page.keyboard.press('Shift+ArrowLeft');
+	await expect(page.locator(`[data-cell-id="${cells[head + 1].id}"]`)).not.toBeVisible();
+
+	// The selection the user built SURVIVES - a selection may legitimately hold
+	// fold-hidden cells - and the primary has moved to the nearest still-visible
+	// MEMBER of it rather than collapsing the whole set onto a heading.
+	await expect(page.getByTestId('selection-count')).toHaveText(`${size} selected`);
+	await expect(page.locator(`[data-cell-id="${cells[next].id}"]`)).toHaveAttribute('data-active', 'true');
+	// The primary really is a MEMBER (the invariant `pruneSelection` leans on), not a
+	// cell the re-seat quietly added outside the set.
+	await expect(page.locator(`[data-cell-id="${cells[next].id}"]`)).toHaveAttribute('data-selected', 'true');
+
+	// And the fallback: with every member hidden there is nowhere inside the
+	// selection to put the primary, so it collapses onto the heading that swallowed
+	// them - the behaviour a single-cell selection has always had.
+	await page.keyboard.press('Shift+ArrowRight');
+	await page.waitForTimeout(300);
+	await clickCell(page, cells[head + 1].id);
+	await clickCell(page, cells[next - 1].id, ['Shift']);
+	await page.keyboard.press('Shift+ArrowLeft');
+	await expect(page.getByTestId('selection-count')).toHaveCount(0);
+	await expect(page.locator(`[data-cell-id="${cells[head].id}"]`)).toHaveAttribute('data-active', 'true');
+	await page.keyboard.press('Shift+ArrowRight');
+	await page.waitForTimeout(300);
+});
+
+test('Escape after a REMOTE delete of the primary still leaves a selected cell', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openNotebook(page, '0');
+	const cells = await serverCells(page);
+
+	await clickCell(page, cells[1].id);
+	await clickCell(page, cells[3].id, ['Shift']);
+	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+
+	// Another writer (an agent, another tab) removes the PRIMARY. That event carries
+	// no originId, so this tab applies it - and deliberately leaves `activeId` null
+	// rather than yanking this user's caret onto a neighbouring cell.
+	await page.evaluate(
+		async ([nb, id]) => {
+			await fetch(`/api/cells/${encodeURIComponent(id)}?nb=${encodeURIComponent(nb)}`, { method: 'DELETE' });
+		},
+		[NB, cells[3].id]
+	);
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+
+	// Escape collapses the rest onto a surviving MEMBER: a notebook always keeps a
+	// selected cell, so collapsing onto the null primary - which would empty the
+	// selection and leave command mode acting on nothing - is not an option.
+	await page.keyboard.press('Escape');
+	await expect(page.getByTestId('selection-count')).toHaveCount(0);
+	await expect(page.locator('[data-testid="cell"][data-active="true"]')).toHaveCount(1);
+	await expect(page.locator(`[data-cell-id="${cells[1].id}"]`)).toHaveAttribute('data-active', 'true');
+});
+
 test('a right-click on a member keeps the selection without cancelling the press', async ({ page }) => {
 	test.setTimeout(120_000);
 	await openWindowed(page);
