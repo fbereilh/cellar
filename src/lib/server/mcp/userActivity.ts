@@ -131,14 +131,17 @@ interface Entry {
 	cellId: string | null;
 	/** The MCP session that caused it, or null when it did not come from an agent. */
 	by: string | null;
-	/** The initiating browser tab, when a UI action. */
-	origin: string | null;
 }
 
 interface Tombstone {
 	id: string;
 	at: number;
 	by: string | null;
+	/**
+	 * The initiating browser tab, when one was threaded. Attribution does NOT turn
+	 * on this - `by` does - so it is read for exactly one thing: whether a deletion
+	 * note may assert it happened "in the Cellar UI".
+	 */
 	origin: string | null;
 }
 
@@ -205,7 +208,7 @@ function record(event: PublishedEvent): void {
 	// at digest time, which is the honest moment ("is this hidden right now").
 	if (kind === 'deleted' && event.hiddenFromAgent === true) return;
 
-	push(activity, event.nb, { seq: event.seq, kind, cellId, by, origin }, ACTIVITY_CAP);
+	push(activity, event.nb, { seq: event.seq, kind, cellId, by }, ACTIVITY_CAP);
 	if (kind === 'deleted' && cellId) {
 		push(tombstones, event.nb, { id: cellId, at: Date.now(), by, origin }, TOMBSTONE_CAP);
 	}
@@ -317,10 +320,16 @@ function clause(kind: Kind, handles: string[]): string {
 }
 
 /**
- * Who to name. A UI action carries a browser tab `originId`; anything else that
- * is not THIS session is either another agent (it ran under its own MCP session)
- * or Cellar acting on the human's behalf through a REST route, which reads as the
- * user either way.
+ * Who to name, from the MCP session (`by`) alone - the same discriminator
+ * `deletionNote` uses. Anything that is not THIS session is either another agent
+ * (which ran under its own MCP session, so `by` is set) or Cellar acting on the
+ * human's behalf through a REST route, which reads as the user either way.
+ *
+ * CALL THIS WITH THE ENTRIES THAT ACTUALLY PRODUCED THE SENTENCE, never the
+ * unfiltered window. Attributing from a change the digest declined to report
+ * makes the phrase claim an actor who did not touch any named cell, and - when
+ * the declined change was a `hidden_from_agent` cell - discloses that the hidden
+ * cell changed at all, which is the very invariant the filtering protects.
  */
 function actorPhrase(entries: Entry[]): string {
 	const agent = entries.some((e) => e.by != null);
@@ -333,8 +342,9 @@ function summarize(entries: Entry[], nb: string): string | null {
 	// A restore replaced the whole document, so every handle the agent holds may
 	// be meaningless - that fact outranks (and would be misdescribed by) a list of
 	// individual cell changes.
-	if (entries.some((e) => e.kind === 'restored'))
-		return `${DIGEST_PREFIX} ${actorPhrase(entries)} restored a checkpoint, so this notebook was reverted wholesale - your cell handles may no longer exist. Re-read it with get_notebook_map before acting.`;
+	const restores = entries.filter((e) => e.kind === 'restored');
+	if (restores.length)
+		return `${DIGEST_PREFIX} ${actorPhrase(restores)} restored a checkpoint, so this notebook was reverted wholesale - your cell handles may no longer exist. Re-read it with get_notebook_map before acting.`;
 
 	// One verb per cell (see PRECEDENCE).
 	const best = new Map<string, Kind>();
@@ -349,6 +359,7 @@ function summarize(entries: Entry[], nb: string): string | null {
 	const byId = new Map(cells.map((c) => [c.id, c]));
 	const handles = computeHandles(cells);
 	const buckets = new Map<Kind, string[]>();
+	const reported = new Set<string>();
 	for (const [id, kind] of best) {
 		let handle: string;
 		if (kind === 'deleted') {
@@ -362,6 +373,7 @@ function summarize(entries: Entry[], nb: string): string | null {
 			if (!cell || hiddenFromAgent(cell)) continue;
 			handle = handles.get(id) ?? id.slice(0, MIN_HANDLE);
 		}
+		reported.add(id);
 		const list = buckets.get(kind);
 		if (list) list.push(handle);
 		else buckets.set(kind, [handle]);
@@ -369,7 +381,13 @@ function summarize(entries: Entry[], nb: string): string | null {
 
 	const parts = PRECEDENCE.filter((k) => buckets.has(k)).map((k) => clause(k, buckets.get(k)!));
 	if (!parts.length) return null;
-	return `${DIGEST_PREFIX} since your last call ${actorPhrase(entries)} ${joinClauses(parts)}.`;
+	// Attribute from the entries that survived the filter above, never the whole
+	// window: an actor whose only change was to a cell this declined to name did
+	// not touch anything the sentence mentions, and naming them would disclose that
+	// a `hidden_from_agent` cell changed - the invariant the filter exists for. A
+	// cell that IS reported and was touched by both still yields both actors.
+	const contributing = entries.filter((e) => e.cellId != null && reported.has(e.cellId));
+	return `${DIGEST_PREFIX} since your last call ${actorPhrase(contributing)} ${joinClauses(parts)}.`;
 }
 
 /**

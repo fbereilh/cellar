@@ -260,6 +260,53 @@ describe('(A) the user-activity digest', () => {
 		expect(note).not.toContain(hidden.slice(0, 8));
 	});
 
+	it('does NOT name an actor whose only change was to a hidden cell', async () => {
+		// Attribution must come from the changes that were REPORTED. Naming "another
+		// agent" here would both credit it with a cell it never touched and disclose
+		// that the hidden cell changed at all - the very thing the filter protects.
+		const nb = await seed('a-hidden-actor.ipynb');
+		const [hidden, visible] = ids(nb);
+		nbmod.setVisibility(hidden, true, nb);
+		expect(digest('sess-hact', nb)).toBeNull();
+
+		await ua.runAsAgent('sess-B', () => svc.editCell(hidden, 'secret = 1', { nb, routeImports: false }));
+		nbmod.setSource(visible, 'shown = 1', nb, TAB);
+
+		const note = digest('sess-hact', nb)!;
+		expect(note).toContain(visible.slice(0, 8));
+		expect(note).not.toContain(hidden.slice(0, 8));
+		expect(note).toContain('the user');
+		expect(note).not.toContain('another agent');
+	});
+
+	it('DOES name both when one REPORTED cell was touched by the user and an agent', async () => {
+		const nb = await seed('a-both-actors.ipynb');
+		const target = ids(nb)[0];
+		expect(digest('sess-both', nb)).toBeNull();
+
+		await ua.runAsAgent('sess-B', () => svc.editCell(target, 'agent_wrote = 1', { nb, routeImports: false }));
+		nbmod.setSource(target, 'user_wrote = 1', nb, TAB);
+
+		const note = digest('sess-both', nb)!;
+		expect(note).toContain(target.slice(0, 8));
+		expect(note).toContain('the user and another agent');
+	});
+
+	it('attributes a RESTORE from the restore itself, not from unrelated hidden activity', async () => {
+		const nb = await seed('a-restore-actor.ipynb');
+		const [hidden] = ids(nb);
+		nbmod.setVisibility(hidden, true, nb);
+		expect(digest('sess-ract', nb)).toBeNull();
+
+		await ua.runAsAgent('sess-B', () => svc.editCell(hidden, 'secret = 1', { nb, routeImports: false }));
+		nbmod.replaceCells(nb, [{ id: ids(nb)[1], cell_type: 'code', source: 'reverted = 1' }], TAB);
+
+		const note = digest('sess-ract', nb)!;
+		expect(note).toContain('restored a checkpoint');
+		expect(note).toContain('the user');
+		expect(note).not.toContain('another agent');
+	});
+
 	it('collapses a burst into a count rather than listing every id', async () => {
 		const nb = await seed('a-burst.ipynb', 30);
 		expect(digest('sess-5', nb)).toBeNull();
