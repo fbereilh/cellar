@@ -996,9 +996,11 @@ export function clearOutputs(id: string, nb?: string | null, originId?: string |
  * Only cells that ACTUALLY have outputs are touched (the UI's `clearAll` guards
  * the same way), so an output-less cell is a genuine no-op: no event, and a
  * batch that would change nothing persists nothing rather than writing the file
- * back byte-identical. `lastRun` is deliberately left alone - clearing OUTPUT
- * says nothing about whether the cell RAN, and `run_status`/`ran_this_session`
- * are derived from that stamp, never from `outputs.length`.
+ * back byte-identical. A `.py` notebook carries no outputs on disk, so it is
+ * cleared in memory and broadcast but never written. `lastRun` is deliberately
+ * left alone - clearing OUTPUT says nothing about whether the cell RAN, and
+ * `run_status`/`ran_this_session` are derived from that stamp, never from
+ * `outputs.length`.
  *
  * Returns the ids actually cleared.
  */
@@ -1012,7 +1014,10 @@ export function clearOutputsForCells(ids: readonly string[], nb?: string | null,
 		cleared.push(cell.id);
 	}
 	if (!cleared.length) return [];
-	persist(doc);
+	// A `.py` notebook stores no outputs on disk, so persisting would re-run the
+	// whole jupytext conversion to produce byte-identical bytes (the guard
+	// `setOutputs` documents). The EVENTS still fire, so every open tab clears.
+	if (!doc.jpFormat) persist(doc);
 	for (const id of cleared) emit(doc, 'cell:cleared', { cellId: id }, originId);
 	return cleared;
 }

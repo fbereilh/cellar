@@ -36,7 +36,7 @@ import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSes
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
 import { agentStatus as databricksStatus, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable, reconnectSession as databricksReconnect, connectCluster as databricksConnect, listClustersForAgent as databricksClusters } from '../databricks';
 import { publish } from '../events';
-import { enqueueRun, queuesByNotebook, queuePosition } from '../run-queue';
+import { enqueueRun, queuesByNotebook, queuePosition, queueStateFor } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree, resolveInWorkspace } from '../fstree';
@@ -1324,11 +1324,26 @@ export function removeCells(ids: string[], nb?: string | null) {
  * `lastRun` is untouched - this mirrors the UI clear exactly, so `run_status`,
  * `ran_this_session` and staleness are unchanged by clearing (they come from the
  * run stamp, never from `outputs.length`); only `has_output` flips.
+ *
+ * A cell whose run is IN FLIGHT is SKIPPED, never cleared, and named in
+ * `skipped`: the run's next accumulator flush (`setOutputsLive`) and its
+ * `run:end` (`setOutputs`) write the outputs straight back, so clearing it would
+ * report a success that silently does not stick. A QUEUED run has produced
+ * nothing yet, so clearing a queued cell is honest and is NOT skipped.
+ *
+ * VISIBILITY. The clear-all form addresses cells the agent never named, so a
+ * cell hidden from the agent is cleared but kept OUT of `cleared`/`count`/
+ * `skipped` - `hidden_from_agent` is honored in every map, read, search, section
+ * and result, and `run_all` draws the same line (it RUNS hidden cells, it just
+ * does not report them). An explicit id list is different: those handles came
+ * from the agent, so echoing one back discloses nothing it did not already know,
+ * which is why `delete_cells` reports them too.
  */
 export function clearOutputs(ids: string[] | null | undefined, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
+	const clearAll = ids == null;
 	let full: string[];
-	if (ids == null) {
+	if (clearAll) {
 		full = listCells(target).map((c) => c.id);
 	} else {
 		full = [];
@@ -1345,13 +1360,33 @@ export function clearOutputs(ids: string[] | null | undefined, nb?: string | nul
 	// Handles are prefixes of the current cell set, and clearing changes no ids -
 	// but read them before mutating, exactly as removeCells does.
 	const toHandle = handleFn(target);
+	// Only the clear-all form can name a cell the agent never did; see VISIBILITY.
+	const reportable = (id: string): boolean => {
+		if (!clearAll) return true;
+		const c = getCell(id, target);
+		return !!c && !isHidden(c);
+	};
+	// The run queue is the authoritative server-side answer to "is this cell
+	// running" - the in-memory outputs are not, since `setOutputsLive` keeps them
+	// current mid-stream and a mid-run buffer is indistinguishable from a settled
+	// one. Checked BEFORE the has-outputs guard: the skip is about the cell being
+	// in the kernel's hands, not about whether its buffer happens to be empty at
+	// this instant, and a run that has emitted nothing yet is about to.
+	const running = queueStateFor(resolveNotebookPath(target)).running?.cellId ?? null;
+	const skippedIds: string[] = [];
+	const withOutputs: string[] = [];
+	for (const id of full) {
+		if (id === running) skippedIds.push(id);
+		else if (getCell(id, target)?.outputs?.length) withOutputs.push(id);
+	}
+	const skipped = skippedIds.filter(reportable).map(toHandle);
+	const skippedField = skipped.length ? { skipped } : {};
 	// Nothing to clear ⇒ no checkpoint and no write: a checkpoint for a no-op
 	// would push the human's real undo target one step further out of reach.
-	const withOutputs = full.filter((id) => getCell(id, target)?.outputs?.length);
-	if (!withOutputs.length) return { ok: true as const, cleared: [], count: 0 };
+	if (!withOutputs.length) return { ok: true as const, cleared: [], count: 0, ...skippedField };
 	autoCheckpointBeforeAgentAction(target);
-	const cleared = clearOutputsForCells(withOutputs, target).map(toHandle);
-	return { ok: true as const, cleared, count: cleared.length };
+	const cleared = clearOutputsForCells(withOutputs, target).filter(reportable).map(toHandle);
+	return { ok: true as const, cleared, count: cleared.length, ...skippedField };
 }
 
 /** Where a `move_cell` lands: beside another cell (a handle, like every other
