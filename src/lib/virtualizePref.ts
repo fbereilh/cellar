@@ -10,12 +10,14 @@
  *   1. the `?virtualize=` URL param - the deterministic override. It ALWAYS wins,
  *      so `?virtualize=0` reliably un-windows a notebook whatever is persisted,
  *      and `?virtualize=1` forces it back on. A run decided this way is `forced`,
- *      which is what lets the UI lock its toggle rather than offering a switch
+ *      which is what lets the UI lock its toggles rather than offering a switch
  *      that silently changes nothing.
  *   2. the persisted viewer preference (`$lib/uiState`, the per-project store the
  *      follow-running-cell / sidebar-width prefs use - NOT `localStorage`, which
  *      resets on every relaunch because the port is dynamic).
- * With neither set, windowing is on.
+ * With neither set, windowing is on. TWO in-app surfaces write that preference -
+ * the navbar View menu and the Settings pane - but the shell keeps the single
+ * `virtualizeCells` state they both toggle, so only ONE value is ever stored.
  *
  * Pure + DOM-free so the precedence rule is unit-testable
  * (`tests/unit/virtualize-pref.test.ts`) and cannot drift from the shell.
@@ -30,7 +32,7 @@ export const VIRTUALIZE_DEFAULT = true;
 export interface VirtualizeChoice {
 	/** Whether to window this session's notebooks. */
 	enabled: boolean;
-	/** A URL param decided it, so the in-app toggle must not pretend to. */
+	/** A URL param decided it, so the in-app toggles must not pretend to. */
 	forced: boolean;
 }
 

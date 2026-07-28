@@ -34,7 +34,11 @@
 		hideAllCode?: boolean;
 		/** Whether "follow the running cell" is on (a global viewer preference). */
 		followRunningCell?: boolean;
-		/** Whether windowed cell rendering is on (a global viewer preference, default on). */
+		/**
+		 * Whether windowed cell rendering is on (a global viewer preference, default on).
+		 * The shell owns it; the Settings pane toggles the SAME state, so this is a view
+		 * of one preference, never a copy of it.
+		 */
 		virtualizeCells?: boolean;
 		/** A `?virtualize=` URL param decided it: show the state, but lock the toggle. */
 		virtualizeForced?: boolean;

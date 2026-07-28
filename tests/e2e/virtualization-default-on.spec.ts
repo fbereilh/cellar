@@ -25,6 +25,10 @@ import { setScrollTop } from './notebook-scroll';
  *   5. The in-app opt-out (navbar View menu) persists across a reload - it lives in
  *      the per-project UI-state store, not localStorage - and `?virtualize=1` still
  *      overrides it, with the toggle locked while a param owns the session.
+ *   6. The Settings pane's "Windowed rendering" row is a SECOND surface for that one
+ *      preference, not a copy: flipped in either place the other agrees in-session,
+ *      it persists across a reload, and a `?virtualize=` session shows the Settings
+ *      control locked with the reason (the param named) like the menu item.
  *
  * Both notebooks live in ONE workspace (one launcher), so every assertion is scoped
  * to the VISIBLE pane: an inactive notebook tab stays mounted behind `display:none`
