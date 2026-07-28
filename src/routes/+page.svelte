@@ -276,9 +276,26 @@
 	// Transient, dismissable status line (jupytext env not ready, convert result,
 	// a notebook action the document invariants refused, …).
 	let notice = $state('');
+	// The nonce that makes a REPEAT visible: re-assigning an identical string is a
+	// reactive no-op, so a refusal the user retries (Mod+A then `dd` twice) would
+	// otherwise produce no new feedback at all - the "indistinguishable from a dead
+	// keyboard" symptom the status line exists to cure. The markup keys off it, so
+	// each call re-mounts and re-animates the toast even for the same message.
+	let noticeSeq = $state(0);
+	let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+	// Long enough to read a sentence; the ✕ still dismisses early.
+	const NOTICE_TIMEOUT_MS = 6000;
 	/** The one way anything below the shell reaches that status line. */
 	function showNotice(message: string) {
+		clearTimeout(noticeTimer);
 		notice = message;
+		noticeSeq += 1;
+		noticeTimer = setTimeout(clearNotice, NOTICE_TIMEOUT_MS);
+	}
+	/** The one way it is taken down - always cancels the pending auto-dismiss. */
+	function clearNotice() {
+		clearTimeout(noticeTimer);
+		notice = '';
 	}
 	let theme = $state('dim');
 	// Follow-the-running-cell preference (default on). A viewer preference, not a
@@ -528,7 +545,7 @@
 				const b = await res.json();
 				kind = b.notebook && b.ready ? 'ipynb' : 'file';
 				if (b.notebook && !b.ready && b.message) {
-					notice = `Open as notebook needs jupytext: ${b.message}`;
+					showNotice(`Open as notebook needs jupytext: ${b.message}`);
 				}
 			}
 		} catch {}
@@ -808,14 +825,14 @@
 	async function exportPy() {
 		const api = activeNotebookApi();
 		if (!api) return;
-		notice = '';
+		clearNotice();
 		const r = await api.exportPy();
-		if (!r) notice = 'Export to .py failed.';
-		else if (r.reason === 'no-target') notice = 'Set a target .py path at the top of the notebook first.';
-		else if (r.reason === 'no-cells') notice = 'No cells are marked for export - use a cell’s ⋮ menu.';
+		if (!r) showNotice('Export to .py failed.');
+		else if (r.reason === 'no-target') showNotice('Set a target .py path at the top of the notebook first.');
+		else if (r.reason === 'no-cells') showNotice('No cells are marked for export - use a cell’s ⋮ menu.');
 		else {
 			fsRefreshSignal++; // a new/updated .py on disk → refresh the tree + git decorations
-			notice = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`;
+			showNotice(`Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`);
 		}
 	}
 
@@ -849,7 +866,7 @@
 	async function doSaveAsPy() {
 		if (saveAsPyBusy || !activeNotebookPath) return;
 		saveAsPyBusy = true;
-		notice = '';
+		clearNotice();
 		try {
 			const res = await fetch('/api/notebooks/jupytext', {
 				method: 'POST',
@@ -860,9 +877,9 @@
 			if (!res.ok) throw new Error(body?.message || 'export failed');
 			saveAsPyOpen = false;
 			fsRefreshSignal++; // a new file on disk → refresh the tree + git decorations
-			notice = `Saved ${body.path} (${body.format}).`;
+			showNotice(`Saved ${body.path} (${body.format}).`);
 		} catch (err) {
-			notice = `Save as .py failed: ${(err as Error)?.message ?? err}`;
+			showNotice(`Save as .py failed: ${(err as Error)?.message ?? err}`);
 		} finally {
 			saveAsPyBusy = false;
 		}
@@ -875,7 +892,7 @@
 		const source = activeTab.path;
 		const target = source.replace(/\.py$/i, '.ipynb');
 		converting = true;
-		notice = 'Converting: running all cells…';
+		showNotice('Converting: running all cells…');
 		try {
 			const res = await fetch('/api/notebooks/jupytext', {
 				method: 'POST',
@@ -886,10 +903,10 @@
 			if (!res.ok) throw new Error(body?.message || 'convert failed');
 			fsRefreshSignal++;
 			const r = body.ran ?? {};
-			notice = `Converted to ${body.path} — ran ${r.ok ?? 0}/${r.total ?? 0} cells${r.errors ? `, ${r.errors} with errors` : ''}.`;
+			showNotice(`Converted to ${body.path} — ran ${r.ok ?? 0}/${r.total ?? 0} cells${r.errors ? `, ${r.errors} with errors` : ''}.`);
 			await openFilePermanent(body.path);
 		} catch (err) {
-			notice = `Convert failed: ${(err as Error)?.message ?? err}`;
+			showNotice(`Convert failed: ${(err as Error)?.message ?? err}`);
 		} finally {
 			converting = false;
 		}
@@ -921,9 +938,9 @@
 				body: JSON.stringify({ path: activeNotebookPath, action: 'create' })
 			});
 			const body = await res.json().catch(() => ({}));
-			notice = res.ok ? 'Checkpoint saved.' : `Checkpoint failed: ${body?.message ?? ''}`;
+			showNotice(res.ok ? 'Checkpoint saved.' : `Checkpoint failed: ${body?.message ?? ''}`);
 		} catch (err) {
-			notice = `Checkpoint failed: ${(err as Error)?.message ?? err}`;
+			showNotice(`Checkpoint failed: ${(err as Error)?.message ?? err}`);
 		}
 	}
 
@@ -936,11 +953,11 @@
 				body: JSON.stringify({ path: activeNotebookPath, action: 'undo-agent', originId })
 			});
 			const body = await res.json().catch(() => ({}));
-			if (!res.ok) notice = `Undo failed: ${body?.message ?? ''}`;
-			else if (body.ok) notice = 'Reverted to the last automatic checkpoint.';
-			else notice = 'Nothing to undo - no agent action has been checkpointed yet.';
+			if (!res.ok) showNotice(`Undo failed: ${body?.message ?? ''}`);
+			else if (body.ok) showNotice('Reverted to the last automatic checkpoint.');
+			else showNotice('Nothing to undo - no agent action has been checkpointed yet.');
 		} catch (err) {
-			notice = `Undo failed: ${(err as Error)?.message ?? err}`;
+			showNotice(`Undo failed: ${(err as Error)?.message ?? err}`);
 		}
 	}
 
@@ -1697,17 +1714,35 @@
 	</div>
 {/if}
 
-<!-- Transient status line for app-level actions and refusals (dismissable). -->
+<!-- Transient status line for app-level actions and refusals (auto-dismissing, and
+     dismissable early). Keyed on the nonce, not on the text: repeating an action
+     that was refused must re-show the toast, and re-rendering the same string
+     would change nothing on screen. -->
 {#if notice}
-	<div class="toast toast-end toast-bottom z-[100]" data-testid="app-notice">
-		<div class="alert alert-info max-w-md text-sm shadow-lg">
-			<span class="min-w-0 break-words">{notice}</span>
-			<button class="btn btn-ghost btn-xs btn-square" onclick={() => (notice = '')} aria-label="Dismiss">✕</button>
+	{#key noticeSeq}
+		<div class="toast toast-end toast-bottom z-[100]" data-testid="app-notice" data-seq={noticeSeq}>
+			<div class="alert alert-info cellar-notice max-w-md text-sm shadow-lg">
+				<span class="min-w-0 break-words">{notice}</span>
+				<button class="btn btn-ghost btn-xs btn-square" onclick={clearNotice} aria-label="Dismiss">✕</button>
+			</div>
 		</div>
-	</div>
+	{/key}
 {/if}
 
 <style>
+	.cellar-notice {
+		animation: cellar-notice-in 200ms ease-out;
+	}
+	@keyframes cellar-notice-in {
+		from {
+			opacity: 0.3;
+			transform: translateY(6px);
+		}
+		to {
+			opacity: 1;
+			transform: none;
+		}
+	}
 	:global(.cellar-flash) {
 		animation: cellar-flash 1.2s ease-out;
 	}

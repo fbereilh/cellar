@@ -172,6 +172,9 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 	{
 		// Command mode's Escape. `command-mode` also binds Escape but in EDIT mode, and
 		// two modes that cannot be active together cannot collide (`modesOverlap`).
+		// The action declines the keystroke (returns NOT HANDLED) when there is no
+		// multi-selection to collapse, so Escape still reaches the app's other
+		// listeners - the notebook dispatcher is a capture-phase window listener.
 		id: 'clear-selection',
 		keys: ['Escape'],
 		mode: 'command',

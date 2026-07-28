@@ -2630,8 +2630,19 @@
 		await editCell(id, next);
 	}
 
-	/** shortcut id → what it does. `mode` is the mode the keystroke fired in. */
-	const actions: Record<string, (mode: KeyMode) => void> = {
+	/**
+	 * shortcut id → what it does. `mode` is the mode the keystroke fired in.
+	 *
+	 * Returning `false` means NOT HANDLED: the dispatcher then leaves the keystroke
+	 * entirely alone (no `preventDefault`, no `stopPropagation`) so it bubbles on
+	 * normally. That opt-out exists because `onKeydown` is a window CAPTURE listener
+	 * covering the whole app - consuming a key an action did nothing with silently
+	 * breaks unrelated bubble-phase listeners (the sidebar dismisses its context menu
+	 * on Escape, the key `clear-selection` binds). Every other return value means
+	 * handled, promises from async actions included, so an action has to opt out
+	 * deliberately and nothing that consumes its key today stops doing so.
+	 */
+	const actions: Record<string, (mode: KeyMode) => unknown> = {
 		'command-mode': () => apiOf(activeId)?.blur(),
 		'edit-mode': () => apiOf(activeId)?.enterEdit(),
 		'run-cell': () => apiOf(activeId)?.run(false),
@@ -2641,7 +2652,12 @@
 		'extend-select-prev': () => extendSelectionBy(-1),
 		'extend-select-next': () => extendSelectionBy(1),
 		'select-all-cells': () => selectAllCells(),
-		'clear-selection': () => selectOnly(activeId),
+		'clear-selection': () => {
+			// Nothing to collapse - report NOT HANDLED so Escape keeps bubbling to
+			// whoever else is listening for it (see the `actions` doc comment).
+			if (selectedIds.size <= 1) return false;
+			selectOnly(activeId);
+		},
 		'fold-section': () => setFolded(activeId, true),
 		'unfold-section': () => setFolded(activeId, false),
 		'collapse-all-headings': () => setAllFolded(true),
@@ -2772,9 +2788,12 @@
 		}
 		const action = shortcut && actions[shortcut.id];
 		if (!action) return;
+		// The action runs BEFORE the keystroke is consumed because it is what decides
+		// whether it was handled at all; `preventDefault`/`stopPropagation` still take
+		// effect afterwards, since we are inside the same event dispatch.
+		if (action(mode) === false) return;
 		e.preventDefault();
 		e.stopPropagation();
-		action(mode);
 	}
 </script>
 

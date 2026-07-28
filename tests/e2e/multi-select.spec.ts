@@ -559,18 +559,65 @@ test('a delete covering every cell is refused - and SAYS why instead of doing no
 	await page.keyboard.press('d');
 	await page.keyboard.press('d');
 	await expect(page.getByTestId('app-notice')).toContainText('at least one cell');
+	const firstSeq = await page.getByTestId('app-notice').getAttribute('data-seq');
 	await page.waitForTimeout(1000);
 	expect(await serverOrder(page)).toEqual(before); // and nothing was removed
 
 	// The cut path refuses on exactly the same condition and must not go silent
-	// either (a cut that cannot delete would otherwise be half a cut).
-	await page.getByTestId('app-notice').getByRole('button', { name: 'Dismiss' }).click();
-	await expect(page.getByTestId('app-notice')).toHaveCount(0);
+	// either (a cut that cannot delete would otherwise be half a cut) - and the
+	// toast is still up carrying the SAME sentence, so what proves the user was
+	// told a second time is the nonce moving, not the text being present.
 	await clickCell(page, (await visibleCellIds(page))[1]);
 	await page.keyboard.press(`${MOD}+a`);
 	await page.keyboard.press('x');
 	await expect(page.getByTestId('app-notice')).toContainText('at least one cell');
+	await expect(page.getByTestId('app-notice')).not.toHaveAttribute('data-seq', firstSeq!);
 	await page.waitForTimeout(1000);
 	expect(await serverOrder(page)).toEqual(before);
+
+	// It takes itself down; a refusal the user will retry must not need dismissing.
+	await expect(page.getByTestId('app-notice')).toHaveCount(0, { timeout: 15_000 });
 	await page.keyboard.press('Escape');
+});
+
+test('command-mode Escape with nothing to collapse is left for the rest of the app', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+
+	// The notebook's key dispatcher is a window CAPTURE listener that stops the
+	// keystroke dead once an action matches, so `clear-selection` binding Escape
+	// would swallow it app-wide - including for the sidebar, which dismisses its
+	// context menu from a plain BUBBLE-phase window listener. An action that did
+	// nothing must therefore decline the keystroke.
+	await page.evaluate(() => {
+		(window as unknown as { __esc: number }).__esc = 0;
+		window.addEventListener('keydown', (e) => {
+			if (e.key === 'Escape') (window as unknown as { __esc: number }).__esc++;
+		});
+	});
+	const escapesSeen = () => page.evaluate(() => (window as unknown as { __esc: number }).__esc);
+
+	const ids = await visibleCellIds(page);
+	await clickCell(page, ids[1]);
+	await expect(page.locator(`[data-cell-id="${ids[1]}"]`)).toHaveAttribute('data-active', 'true');
+	await expect(page.getByTestId('selection-count')).toHaveCount(0); // nothing to collapse
+
+	await page.keyboard.press('Escape');
+	expect(await escapesSeen()).toBe(1);
+
+	// …and a real multi-selection still CONSUMES Escape (it has something to do).
+	await clickCell(page, ids[1]);
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+	await page.keyboard.press('Escape');
+	await expect(page.getByTestId('selection-count')).toHaveCount(0);
+	expect(await escapesSeen()).toBe(1);
+
+	// The user-visible repro: a cell selected in command mode, the sidebar's file
+	// context menu open, Escape must close it.
+	await clickCell(page, ids[1]);
+	await page.getByTestId('files-body').click({ button: 'right', position: { x: 4, y: 4 } });
+	await expect(page.getByTestId('tree-context-menu')).toBeVisible();
+	await page.keyboard.press('Escape');
+	await expect(page.getByTestId('tree-context-menu')).toHaveCount(0);
 });
