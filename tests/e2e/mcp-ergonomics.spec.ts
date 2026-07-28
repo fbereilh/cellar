@@ -8,7 +8,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
 
 /**
- * The three agent-ergonomics fixes, over the wire an agent really uses: a
+ * The agent-ergonomics fixes, over the wire an agent really uses: a
  * `cellar mcp` stdio bridge into a live cellar with a live kernel.
  *
  * Each one came from an agent hitting it in real work, and each is only truly
@@ -16,6 +16,8 @@ import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
  * of the CALL, not of the service function:
  *   - move_cell by handle: "put this after that" with no map fetch first,
  *   - delete_cells: eight cells dropped in ONE call after a pivot,
+ *   - clear_outputs: shedding stale outputs without deleting and recreating the
+ *     cell, which was the only way an agent could do it before,
  *   - inspect_variable: an array-heavy frame answered in a bounded reply
  *     instead of thousands of tokens of floats.
  *
@@ -146,6 +148,52 @@ test('delete_cells drops many cells in ONE call, leaving the rest intact', async
 	const failed = await callRaw('delete_cells', { ids: [keep.ids[0], 'zzzzzzzz'] });
 	expect(failed.isError).toBe(true);
 	expect((await call('read_cells', { ids: [keep.ids[0]] }))[0].source).toBe('kept = 1');
+});
+
+test('clear_outputs drops saved outputs by handle, and clears everything when ids are omitted', async () => {
+	await call('use_notebook', { name: 'clearing' });
+
+	// It is on the surface an agent actually sees, and its description is trimmed
+	// to the house bar (every tool schema is paid for on EVERY session).
+	const tools = (await client!.listTools()).tools;
+	const tool = tools.find((t) => t.name === 'clear_outputs');
+	expect(tool, 'clear_outputs is registered').toBeTruthy();
+	expect(tool!.description!.length).toBeLessThan(700);
+
+	const a = await call('add_and_run', { source: 'print("alpha")', route_imports: false });
+	const b = await call('add_and_run', { source: 'print("beta")', route_imports: false });
+	const c = await call('add_and_run', { source: 'print("gamma")', route_imports: false });
+	const hasOutput = async (id: string) => ((await call('read_cells', { ids: [id] }))[0].outputs as unknown[]).length > 0;
+	expect(await hasOutput(a.id)).toBe(true);
+
+	// By handle: exactly those cells, nothing else.
+	expect(await call('clear_outputs', { ids: [a.id, b.id] })).toMatchObject({ ok: true, count: 2 });
+	expect(await hasOutput(a.id)).toBe(false);
+	expect(await hasOutput(b.id)).toBe(false);
+	expect(await hasOutput(c.id)).toBe(true);
+
+	// Clearing OUTPUT changes no RUN semantics: run_status comes from the run
+	// stamp, not from having outputs, so the cell still reads as having run LIVE
+	// in this session even with its outputs gone.
+	expect((await call('read_cells', { ids: [a.id] }))[0]).toMatchObject({ run_status: 'ok_session' });
+
+	// A cell with nothing to clear is a no-op, not an error.
+	expect(await call('clear_outputs', { ids: [a.id] })).toMatchObject({ ok: true, count: 0 });
+
+	// A bad handle clears NOTHING rather than half-applying the batch.
+	const failed = await callRaw('clear_outputs', { ids: [c.id, 'zzzzzzzz'] });
+	expect(failed.isError).toBe(true);
+	expect(await hasOutput(c.id)).toBe(true);
+
+	// An EMPTY list is a refusal, never a clear-all - omitting ids is the only way
+	// to say "everything", which is what the last call proves.
+	const empty = await callRaw('clear_outputs', { ids: [] });
+	expect(empty.isError).toBe(true);
+	expect(empty.content[0].text).toMatch(/omit ids/i);
+	expect(await hasOutput(c.id)).toBe(true);
+
+	expect(await call('clear_outputs', {})).toMatchObject({ ok: true, count: 1 });
+	expect(await hasOutput(c.id)).toBe(false);
 });
 
 test('inspect_variable answers an array-heavy frame in a bounded reply', async () => {

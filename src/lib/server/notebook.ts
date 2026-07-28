@@ -972,14 +972,63 @@ export function setOutputsLive(id: string, outputs: CellOutput[], nb?: string | 
 	if (cell) cell.outputs = outputs;
 }
 
+/**
+ * Clear ONE cell's outputs (the UI's per-cell clear), persist, and broadcast.
+ *
+ * The `.py` guard is the same one `setOutputs` documents and `clearOutputsForCells`
+ * applies: a text notebook carries no outputs on disk, so persisting would re-run
+ * the whole jupytext conversion to write byte-identical bytes and churn mtime -
+ * once per cell over the UI's clear-all loop. The EVENT still fires unconditionally,
+ * so every open tab clears whatever the format.
+ */
 export function clearOutputs(id: string, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell) {
 		cell.outputs = [];
-		persist(doc);
+		if (!doc.jpFormat) persist(doc);
 		emit(doc, 'cell:cleared', { cellId: id }, originId);
 	}
+}
+
+/**
+ * Clear SEVERAL cells' outputs as ONE document write (the MCP `clear_outputs`
+ * batch, whose clear-all form addresses every cell in the notebook).
+ *
+ * Deliberately NOT a loop over `clearOutputs`, for the same reason `deleteCells`
+ * is not a loop over `deleteCell`: that persists - a full serialize + fsync +
+ * rename of the whole notebook - once per cell, so clearing a 300-cell notebook
+ * would be 300 whole-file writes and 299 intermediate on-disk states. One pass,
+ * one persist, then one `cell:cleared` per cleared cell, so every client applies
+ * the per-cell event it already handles and no new event shape exists.
+ *
+ * Only cells that ACTUALLY have outputs are touched (the UI's `clearAll` guards
+ * the same way), so an output-less cell is a genuine no-op: no event, and a
+ * batch that would change nothing persists nothing rather than writing the file
+ * back byte-identical. A `.py` notebook carries no outputs on disk, so it is
+ * cleared in memory and broadcast but never written. `lastRun` is deliberately
+ * left alone - clearing OUTPUT says nothing about whether the cell RAN, and
+ * `run_status`/`ran_this_session` are derived from that stamp, never from
+ * `outputs.length`.
+ *
+ * Returns the ids actually cleared.
+ */
+export function clearOutputsForCells(ids: readonly string[], nb?: string | null, originId?: string | null): string[] {
+	const doc = docFor(nb);
+	const wanted = new Set(ids);
+	const cleared: string[] = [];
+	for (const cell of doc.cells) {
+		if (!wanted.has(cell.id) || !cell.outputs?.length) continue;
+		cell.outputs = [];
+		cleared.push(cell.id);
+	}
+	if (!cleared.length) return [];
+	// A `.py` notebook stores no outputs on disk, so persisting would re-run the
+	// whole jupytext conversion to produce byte-identical bytes (the guard
+	// `setOutputs` documents). The EVENTS still fire, so every open tab clears.
+	if (!doc.jpFormat) persist(doc);
+	for (const id of cleared) emit(doc, 'cell:cleared', { cellId: id }, originId);
+	return cleared;
 }
 
 /**

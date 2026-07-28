@@ -494,6 +494,17 @@ function registerTools(server: McpServer) {
 		const r = svc.removeCells(res.ids, target);
 		return r.ok ? text(r) : notFound(r.missing ? `cell ${r.missing} not found` : 'ids must not be empty');
 	});
+	server.registerTool('clear_outputs', { description: 'Clear the saved outputs of ONE OR SEVERAL cells by handle; OMIT ids to clear EVERY cell (an empty ids array is an error, never a clear-all). Nothing is cleared unless every id resolves. The pre-clear checkpoint is taken when due (they are throttled) and keeps no outputs for a big notebook, so undo may not bring them back - `undo` says so when it cannot. Display only: run_status/ran_this_session/staleness are unchanged (they read the run stamp, not outputs); only has_output flips. A cell with no outputs is a no-op; one whose run is in flight is SKIPPED (it would rewrite them) and named in `skipped`. Returns {ok, cleared:[ids] (those that HAD outputs), count, skipped?, undo?}.', inputSchema: { ids: z.array(z.string()).optional(), ...notebookParam } }, async ({ ids, notebook }, extra: ToolExtra) => {
+		const target = targetOf(extra, notebook);
+		let full = ids;
+		if (ids != null && ids.length) {
+			const res = resolveMany(target, ids);
+			if ('error' in res) return res.error;
+			full = res.ids;
+		}
+		const r = svc.clearOutputs(full, target);
+		return r.ok ? text(r) : notFound(r.missing ? `cell ${r.missing} not found` : 'ids must not be empty - omit ids entirely to clear every cell');
+	});
 	server.registerTool('move_cell', { description: 'Move a cell. Give exactly ONE destination: after_id / before_id (another cell\'s handle — no map fetch needed) or position (the 0-based index the cell ends up at). Returns {ok, id, index}.', inputSchema: { id: z.string(), after_id: z.string().optional(), before_id: z.string().optional(), position: z.number().int().optional(), ...notebookParam } }, async ({ id, after_id, before_id, position, notebook }, extra: ToolExtra) => {
 		const target = targetOf(extra, notebook);
 		const res = resolveOne(target, id);
