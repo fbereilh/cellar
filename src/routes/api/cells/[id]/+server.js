@@ -17,8 +17,12 @@ export async function PATCH({ params, request }) {
 	return json({ ok: true });
 }
 
-/** Delete a cell from notebook `nb` (query param, defaults to the active one). */
+/** Delete a cell from notebook `nb` (query param, defaults to the active one).
+ *  A delete that would empty the notebook is refused by `deleteCell` itself and
+ *  surfaced the way the bulk route surfaces its own refusals, so the caller can
+ *  resync instead of rendering a removal the document never took. */
 export function DELETE({ params, url }) {
-	deleteCell(params.id, url.searchParams.get('nb') || undefined, url.searchParams.get('originId') || undefined);
+	const res = deleteCell(params.id, url.searchParams.get('nb') || undefined, url.searchParams.get('originId') || undefined);
+	if (!res.ok) return json({ ok: false, reason: res.reason }, { status: 400 });
 	return json({ ok: true });
 }

@@ -11,6 +11,14 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  * Jupyter command-mode `a`/`b` keyboard shortcuts. Also guards the mode gating:
  * `a`/`b` type characters while editing, never insert cells.
  *
+ * SPLIT-CELL is the third way a cell appears between two others, and the last
+ * test covers what only a real browser can: that the notebook hands the created
+ * half the ORIGINAL cell's identity. The rule itself (which `cellar` keys ride
+ * along, and why the imports role and the export flag do not) is unit-tested in
+ * `tests/unit/split-cell.test.ts`; what is checked here is the WIRING, since a
+ * split that forgot to pass the namespace turned a SQL cell's lower half into a
+ * plain Python one that compiles through the wrong path, silently.
+ *
  * Boots the REAL launcher against a throwaway workspace (see ./harness); SKIPS
  * when the kernel runtime is absent (local-only, like smoke.spec).
  */
@@ -164,4 +172,109 @@ test('command mode: `a` inserts above, `b` inserts below; while editing they typ
 	// Characters landed in the editor; NO new cell was created.
 	await expect(editor).toContainText('ab');
 	await expect(cells).toHaveCount(countBeforeTyping);
+});
+
+/** Every cell's id + source + `cellar` namespace, in document order, from the SERVER model. */
+async function serverCells(page: Page): Promise<{ id: string; source: string; cellar: Record<string, unknown> }[]> {
+	return page.evaluate(async () => {
+		const res = await fetch('/api/notebooks?path=notebook.ipynb');
+		const body = await res.json();
+		return (body.notebook.cells as { id: string; source: string; metadata?: { cellar?: Record<string, unknown> } }[]).map((c) => ({
+			id: c.id,
+			source: c.source,
+			cellar: c.metadata?.cellar ?? {}
+		}));
+	});
+}
+
+/** PATCH a cell the way the ⋮ actions / type menus do; callers wait for the tab to apply the event. */
+async function patchCell(page: Page, id: string, body: Record<string, unknown>): Promise<void> {
+	await page.evaluate(
+		async ([cellId, payload]) => {
+			await fetch(`/api/cells/${cellId}`, {
+				method: 'PATCH',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ ...(payload as object), nb: 'notebook.ipynb' })
+			});
+		},
+		[id, body] as [string, Record<string, unknown>]
+	);
+}
+
+/**
+ * Type two lines into `cell`, leaving the caret at the END of the second - so a
+ * following `Home` lands exactly on the line break, a deterministic split point.
+ * Not `typeInto`: its whole-text assertion cannot express a newline, because
+ * CodeMirror renders each line as its own element and `textContent` joins them
+ * with nothing at all.
+ */
+async function typeTwoLines(page: Page, cell: Locator, first: string, second: string): Promise<void> {
+	await cell.getByTestId('editor-scroll').click();
+	const editor = cell.locator('.cm-content');
+	await expect(editor).toBeVisible();
+	await editor.click();
+	await page.keyboard.press('ControlOrMeta+a');
+	await page.keyboard.type(`${first}\n${second}`);
+	await expect(editor).toContainText(second);
+}
+
+test('split-cell hands the created half the cell it came out of - language yes, export no', async ({ page }) => {
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	const cells = page.getByTestId('cell');
+
+	// ---- A SQL cell, split in two: the lower half must still be SQL ----------
+	const beforeSql = await cells.count();
+	await page.getByTestId('add-cell').click();
+	await expect(cells).toHaveCount(beforeSql + 1);
+	const sqlCell = cells.last();
+	const sqlId = (await sqlCell.getAttribute('data-cell-id')) ?? '';
+	expect(sqlId).not.toBe('');
+	await patchCell(page, sqlId, { cell_type: 'sql' });
+	await expect(sqlCell.getByTestId('type-toggle')).toHaveText(/sql/i);
+
+	// Two lines, so the split has a distinguishable upper and lower half. Typing
+	// leaves the caret at the end of line 2, so `Home` puts it exactly at the split.
+	await typeTwoLines(page, sqlCell, 'select 1', 'select 2');
+	await page.keyboard.press('Home');
+	// `Ctrl Shift -` names the physical Ctrl key on every platform (JupyterLab's).
+	await page.keyboard.press('Control+Shift+Minus');
+	await expect(cells).toHaveCount(beforeSql + 2);
+
+	await expect(async () => {
+		const after = await serverCells(page);
+		const upper = after.findIndex((c) => c.id === sqlId);
+		expect(upper).toBeGreaterThanOrEqual(0);
+		expect(after[upper].source).toBe('select 1\n');
+		expect(after[upper + 1].source).toBe('select 2');
+		// The half a split creates is the same cell's second half - so it is SQL, not
+		// a plain Python cell that would compile through the Python path.
+		expect(after[upper + 1].cellar.language).toBe('sql');
+	}).toPass({ timeout: 15_000 });
+
+	// ---- An EXPORT-marked Python cell: the designation stays with the original --
+	const beforeExport = await cells.count();
+	await page.getByTestId('add-cell').click();
+	await expect(cells).toHaveCount(beforeExport + 1);
+	const exportCell = cells.last();
+	const exportId = (await exportCell.getAttribute('data-cell-id')) ?? '';
+	await patchCell(page, exportId, { export: true });
+	await expect(exportCell.getByTestId('export-badge')).toBeVisible();
+
+	await typeTwoLines(page, exportCell, 'a = 1', 'b = 2');
+	await page.keyboard.press('Home');
+	await page.keyboard.press('Control+Shift+Minus');
+	await expect(cells).toHaveCount(beforeExport + 2);
+
+	await expect(async () => {
+		const after = await serverCells(page);
+		const upper = after.findIndex((c) => c.id === exportId);
+		expect(upper).toBeGreaterThanOrEqual(0);
+		expect(after[upper].source).toBe('a = 1\n');
+		expect(after[upper + 1].source).toBe('b = 2');
+		// The user marked THAT cell for export; inheriting it would silently double
+		// what the `.py` module writes out.
+		expect(after[upper].cellar.export).toBe(true);
+		expect(after[upper + 1].cellar.export).toBeUndefined();
+	}).toPass({ timeout: 15_000 });
 });

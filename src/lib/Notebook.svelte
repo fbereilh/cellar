@@ -1,7 +1,7 @@
 <script lang="ts">
 	import Cell from '$lib/Cell.svelte';
 	import type { CellType, LogicalCellType } from '$lib/server/types';
-	import type { KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
+	import type { CellActivation, KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
 	import type { CellHighlight } from '$lib/searchHighlight';
@@ -17,6 +17,7 @@
 	const NO_SEGS_HIDDEN: SegHidden = { headings: new Set(), bodies: new Set() };
 	const EMPTY_PLAN: PlanItem[] = [];
 	const EMPTY_IDS: string[] = [];
+	const EMPTY_SELECTION: ReadonlySet<string> = new Set();
 
 	interface Props {
 		cells: UICell[];
@@ -24,6 +25,15 @@
 		/** cell id → 1-based position in the kernel's global run queue */
 		queued?: Record<string, number>;
 		activeId?: string | null;
+		/**
+		 * The multi-cell selection, as document-model ids. Always contains `activeId`
+		 * (the primary), so a plain single selection is the degenerate one-element
+		 * case. Read per cell rather than pinned into the mounted set on purpose:
+		 * pinning a select-all would mount the whole notebook and undo windowing, so
+		 * a selected cell that is windowed out simply renders selected the moment it
+		 * scrolls back in. See `$lib/cellSelection`.
+		 */
+		selectedIds?: ReadonlySet<string>;
 		keyMode?: KeyMode;
 		/** cell id → staleness verdict ($lib/staleness) */
 		staleness?: Record<string, StalenessEntry>;
@@ -80,7 +90,7 @@
 		/** cell id → this markdown cell is open for raw source editing (runtime-only) */
 		rawEdits?: Record<string, boolean | undefined>;
 		onSetRawEdit?: (id: string, raw: boolean) => void;
-		onActivate?: (id: string) => void;
+		onActivate?: (id: string, gesture?: CellActivation) => void;
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		onEditorFocus?: (id: string) => void;
 		onEditorBlur?: (id: string) => void;
@@ -118,6 +128,7 @@
 		runningId,
 		queued = {},
 		activeId = null,
+		selectedIds = EMPTY_SELECTION,
 		keyMode = 'command',
 		staleness = {},
 		hidden = new Set(),
@@ -333,6 +344,9 @@
 	// text selection is never hijacked. During a drag we show a thin insertion
 	// line at the top or bottom edge of the hovered cell, then commit the move to
 	// an absolute index via `onMoveToIndex` (which reuses the server move API).
+	// Deliberately SINGLE-cell, like the toolbar's trash and move arrows: the grip
+	// is drawn on one cell, so it moves that cell even when several are selected.
+	// The selection-wide move is the keyboard/palette one (`moveSelection`).
 	let dragId = $state<string | null>(null); // id of the cell being dragged
 	let dropIndex = $state<number | null>(null); // insertion index the drop would land at
 	let dropAtEnd = $state(false); // insertion line drawn below the last hovered cell
@@ -518,6 +532,7 @@
 			running={runningId === cell.id}
 			queuedPosition={queued[cell.id] ?? null}
 			active={activeId === cell.id}
+			selected={selectedIds.has(cell.id)}
 			{keyMode}
 			staleState={staleness[cell.id] ?? null}
 			dragging={dragId === cell.id}

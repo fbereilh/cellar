@@ -5,8 +5,19 @@
 	import { cellIdOfKey, computeFolding, computeHeadingNumbers, foldSignature, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
-	import { clampMoveIndex, isImportsCell } from '$lib/importsRole';
+	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
+	import { isLogicalCellType, SQL_LANGUAGE } from '$lib/cellLanguage';
+	import {
+		applyGesture,
+		extendSelection,
+		moveSelectionPlan,
+		orderedSelection,
+		reseatHiddenPrimary,
+		selectionAfterRemoval,
+		stepFromUnwalkableHead
+	} from '$lib/cellSelection';
 	import { exportCellCount } from '$lib/exportRole';
+	import { splitInheritedCellar } from '$lib/splitCell';
 	import { createSearchCache } from '$lib/search';
 	import type { SearchCache } from '$lib/search';
 	import { buildCellHighlights, type SearchHighlightState } from '$lib/searchHighlight';
@@ -15,7 +26,7 @@
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
 	import type { CellView, CellOutput, CellType, LogicalCellType, Actor, RunningView, QueueEntryView, LastRun, CellarNamespace, PublishedEvent } from '$lib/server/types';
-	import type { UICell, KeyMode, FoldRegistryHandle, JumpOptions, NumberingRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
+	import type { CellActivation, UICell, KeyMode, FoldRegistryHandle, JumpOptions, NumberingRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
 	import type { BlameLine } from '$lib/server/git';
 	import type { ClientEvent } from '$lib/events-client';
 	import type { Folding } from '$lib/headings';
@@ -48,6 +59,16 @@
 		onRegisterNumbering?: (path: string, handle: NumberingRegistryHandle | null) => void;
 		/** (path, runningId, queued): the sidebar Outline's per-section run/queue badges. */
 		onRunStateChange?: (path: string, runningId: string | null, queued: Record<string, number>) => void;
+		/** (path, count): how many cells are selected here - the shell footer reports it. */
+		onSelectionChange?: (path: string, count: number) => void;
+		/**
+		 * A short, user-facing explanation of something the notebook REFUSED to do, for
+		 * the shell's transient status line (the same one the export/jupytext actions
+		 * use). A refusal the user asked for by keystroke has no other surface: there is
+		 * no request to fail and no affordance to disable, so without this it reads as
+		 * the keyboard being broken.
+		 */
+		onNotice?: (message: string) => void;
 		/** (path, handle|null): lets the Outline drive this notebook's folds. */
 		onRegisterFolds?: (path: string, handle: FoldRegistryHandle | null) => void;
 		/** (path, api|null): lets the sidebar drop a cell in here. */
@@ -130,6 +151,8 @@
 		onNumberingChange,
 		onHideAllCodeChange,
 		onRunStateChange,
+		onSelectionChange,
+		onNotice,
 		onRegisterFolds,
 		onRegisterNumbering,
 		onRegisterApi,
@@ -232,7 +255,25 @@
 	// the rest of the batch (nothing is queued server-side there to clear).
 	let interruptGeneration = 0;
 
-	let activeId = $state<string | null>(null); // the selected/focused cell (visual emphasis)
+	// ---- Selection -----------------------------------------------------------
+	// THE authoritative selection model (the pure algebra lives in
+	// `$lib/cellSelection`, which is where the rules and their rationale are
+	// written down). Three pieces, deliberately separate:
+	//
+	//   `activeId`    the PRIMARY cell: what takes DOM focus, what a single-cell op
+	//                 addresses, and the moving end of a Shift range.
+	//   `anchorId`    where a Shift range starts from. Kept apart from `activeId` so
+	//                 a second Shift+click re-ranges from the same origin.
+	//   `selectedIds` the selection. It ALWAYS contains `activeId`, so a plain
+	//                 single selection is `{activeId}` and every bulk op is the
+	//                 single-cell op at size 1.
+	//
+	// All three hold document-model ids, never DOM state: windowing means most of a
+	// large notebook has no node at all, and a range spanning 200 cells must select
+	// (and bulk-delete/move/retype) every one of them regardless of what is mounted.
+	let activeId = $state<string | null>(null); // the primary/selected cell (visual emphasis)
+	let anchorId = $state<string | null>(null); // where a Shift range starts from
+	let selectedIds = $state<Set<string>>(new Set());
 	let keyMode = $state<KeyMode>('command'); // 'command' | 'edit' (visuals only; the dispatcher reads the DOM)
 	// Transient jump targets forced to stay mounted under windowing, so a scroll-to
 	// helper can land on a real DOM node even when the target is off-screen. Passed
@@ -374,10 +415,9 @@
 		foldedIds = next;
 		saveFolds();
 		// Command mode always acts on the selected cell, so the selection can never
-		// be a cell the user cannot see: a fold that hides it hands it to the cell
-		// holding the header that swallowed it. (`folding` is derived, so it already
-		// reflects `next`.)
-		if (activeId && folding.hidden.has(activeId)) activeId = cellIdOfKey(key);
+		// be a cell the user cannot see. (`folding` is derived, so it already reflects
+		// `next`.)
+		if (activeId && folding.hidden.has(activeId)) reseatPrimaryAfterFold(activeId, folding.hidden, key);
 	}
 
 	// Collapse/expand every heading section in one go, writing the same shared fold
@@ -388,15 +428,40 @@
 		const next = folded ? new Set(outlineHeadings(cells).map((h) => h.key)) : new Set<string>();
 		foldedIds = next;
 		saveFolds();
-		// A collapse-all can hide the selected cell; hand the selection to the
-		// nearest header that still owns it (the same rule `toggleFold` applies).
-		if (activeId && computeFolding(cells, next).hidden.has(activeId)) {
+		// A collapse-all can hide the selected cell; re-seat the primary by the same
+		// rule `toggleFold` applies, through the same seam and for the same reason.
+		const hidden = computeFolding(cells, next).hidden;
+		if (activeId && hidden.has(activeId)) {
 			const id = activeId;
 			const owner = outlineHeadings(cells).find((h) =>
 				computeFolding(cells, new Set([h.key])).hidden.has(id)
 			);
-			if (owner) activeId = owner.cellId;
+			reseatPrimaryAfterFold(id, hidden, owner?.key ?? null);
 		}
+	}
+
+	/**
+	 * A fold just hid the primary. Move it to the nearest still-visible MEMBER of
+	 * the selection, which keeps the set the user built intact - a selection may
+	 * legitimately hold fold-hidden cells (a Shift range fills in by document index,
+	 * select-all takes the whole order), so collapsing it would discard six cells
+	 * because one chevron moved.
+	 *
+	 * Only when the fold hides EVERY member is there nowhere inside the selection to
+	 * put the primary, and then the selection collapses onto the cell holding the
+	 * header that swallowed it - through `selectOnly`, never a bare `activeId`
+	 * write, because the primary must stay a MEMBER of the selection or
+	 * `pruneSelection`'s `kept.add(activeId)` would silently widen the set on the
+	 * next refetch and a following `dd`/`x` would take a cell the user never picked.
+	 */
+	function reseatPrimaryAfterFold(hiddenPrimary: string, hidden: ReadonlySet<string>, ownerKey: string | null) {
+		const stay = reseatHiddenPrimary(cellOrder, selectedIds, hiddenPrimary, hidden);
+		if (stay) {
+			activeId = stay;
+			anchorId = stay;
+			return;
+		}
+		if (ownerKey) selectOnly(cellIdOfKey(ownerKey));
 	}
 
 	// ---- Collapsible code editors --------------------------------------------
@@ -947,8 +1012,17 @@
 	// search-result jump (via `jumpToCell`), and - via `selectAndAct` /
 	// `scrollCellIntoView` - keyboard selection, cell moves, paste/undo selection,
 	// `insertAndRunCode`, run-and-advance, run-and-insert-below and split-cell.
-	async function ensureCellMounted(id: string): Promise<MountedCell> {
-		revealCell(id);
+	//
+	// `reveal:false` is the opt-in MOUNT-ONLY mode, for a path that needs an
+	// addressable DOM node but is NOT a navigation (`mountAndFocus`, below).
+	// `revealCell` unfolds a collapsed section AND persists that through
+	// `saveFolds()`, so a non-navigating caller would silently expand a section the
+	// user collapsed and the change would survive a reload. Everything that
+	// genuinely takes the user somewhere (`selectAndAct`, `jumpToCell`,
+	// follow-running, the outline/search jumps) must keep the default: scrolling to
+	// a `display:none` cell shows nothing.
+	async function ensureCellMounted(id: string, opts: { reveal?: boolean } = {}): Promise<MountedCell> {
+		if (opts.reveal !== false) revealCell(id);
 		const pin = pinScrollTarget(id);
 		await tick(); // a just-revealed (unfolded) or off-screen (windowed) cell needs its DOM node
 		// Scope the lookup to THIS notebook: cell ids are unique per document, not
@@ -956,6 +1030,35 @@
 		const el =
 			(rootEl?.querySelector(`[data-cell-id="${CSS.escape(id)}"]`) as HTMLElement | null) ?? null;
 		return { el, pin };
+	}
+
+	/**
+	 * MOUNT `id` and put command-mode focus on it, WITHOUT navigating to it - the
+	 * one seam for a selection change that is not a jump (a Cmd/Ctrl or Shift
+	 * gesture, and Cmd/Ctrl+A).
+	 *
+	 * The mount is not optional: `activeId` is also the PRIMARY every single-cell
+	 * action addresses through `apiOf(activeId)`, so under windowing a primary left
+	 * unmounted has no registered API and `run-cell` / `edit-mode` / `command-mode` /
+	 * `split-cell` silently no-op - and the modal keyboard, which reads a keystroke's
+	 * mode and target off the focused element, goes with it.
+	 *
+	 * What it must NOT do is what `scrollCellIntoView` does on top: chase the viewport
+	 * to a cell the user did not ask to be taken to, and REVEAL it - `revealCell`
+	 * unfolds the collapsed section hiding the target and `saveFolds()` PERSISTS that,
+	 * so merely deselecting a cell (or pressing Cmd/Ctrl+A) would expand a section the
+	 * user collapsed and the change would survive a reload. A fold-hidden target
+	 * therefore neither mounts nor takes focus (a `display:none` cell cannot), leaving
+	 * focus where the user already was - the accepted cost of not writing fold state.
+	 * `focusCell` already focuses `{preventScroll:true}`.
+	 */
+	async function mountAndFocus(id: string | null) {
+		if (!id) return;
+		const { pin } = await ensureCellMounted(id, { reveal: false });
+		apiOf(id)?.focusCell();
+		// Safe to drop immediately: every caller has just made `id` the primary, and
+		// `pinnedCellIds` pins the primary, so nothing depends on the transient pin.
+		releaseScrollPin(pin);
 	}
 
 	// Explicit "jump to running cell": reveal + center this notebook's running
@@ -1042,8 +1145,103 @@
 		untrack(() => followCell(id));
 	});
 
-	function setActive(id: string | null) {
+	/** Cell ids in document order - what every selection rule resolves against. */
+	const cellOrder = $derived(cells.map((c) => c.id));
+	/** The selection in document order: the ids every bulk op iterates. */
+	const selectedInOrder = $derived(orderedSelection(cellOrder, selectedIds));
+	// Publish the selection SIZE up so the shell footer can report it. A multi-cell
+	// selection reaches past the viewport (and, under windowing, past the DOM), so
+	// the per-cell accent rails cannot say how big it is; the always-visible status
+	// bar is the one place that stays true across a scroll.
+	$effect(() => {
+		onSelectionChange?.(path, selectedIds.size);
+	});
+
+	/**
+	 * Collapse the selection to `id` alone - the plain, single-cell selection, and
+	 * what every non-gesture selection path (keyboard nav, insert, paste, undo,
+	 * delete, entering edit mode) does. `setActive` is this: a selection change with
+	 * no modifier is always a collapse.
+	 */
+	function selectOnly(id: string | null) {
 		activeId = id;
+		anchorId = id;
+		selectedIds = id ? new Set([id]) : new Set();
+	}
+	function setActive(id: string | null) {
+		selectOnly(id);
+	}
+
+	/**
+	 * A cell asked to become the selected one - the ONE entry point for every
+	 * pointer/focus-driven selection change (`Cell`'s pointerdown and focusin).
+	 *
+	 * A modifier gesture goes through the pure algebra and then places DOM focus on
+	 * the resulting primary itself: `Cell` `preventDefault`s a modifier press so it
+	 * never opens the editor, and the keyboard dispatcher decides a keystroke's mode
+	 * and target from the focused element - so a selection focus doesn't follow is a
+	 * selection the next keystroke doesn't act on.
+	 *
+	 * The `fromFocus` guard is what makes the two events compose: a plain pointerdown
+	 * always collapses, but the `focusin` that FOLLOWS a gesture (or a keyboard
+	 * selection) carries no modifiers, and collapsing there would undo the range
+	 * built one event earlier. It only ever spares a cell the selection ALREADY
+	 * holds - the primary itself, or a member the focus promotes to primary; a plain
+	 * click on any other cell still collapses.
+	 */
+	async function activateCell(id: string, gesture: CellActivation = {}) {
+		if (gesture.extend || gesture.toggle) {
+			const next = applyGesture(cellOrder, { activeId, anchorId, selected: selectedIds }, id, gesture);
+			// Assigned SYNCHRONOUSLY, before the mount seam is awaited: the `focusin`
+			// that follows this pointerdown must already see the new primary, or its
+			// `fromFocus` guard won't recognize a re-statement and would collapse the
+			// selection this gesture just built.
+			activeId = next.activeId;
+			anchorId = next.anchorId;
+			selectedIds = next.selected;
+			// Mount-only, like `selectAllCells` and for the same two reasons: toggling
+			// the primary OUT hands primacy to a survivor that windowing may have left
+			// with no DOM node and no registered API (focus would go nowhere, and with
+			// it the modal keyboard), while a gesture on a cell the user is already
+			// looking at is NOT a navigation - so it must not scroll, and above all must
+			// not REVEAL, which unfolds and `saveFolds()`-persists a section the user
+			// collapsed. (A selection may legitimately hold fold-hidden cells: a Shift
+			// range fills in by document index and select-all takes the whole order.)
+			await mountAndFocus(next.activeId);
+			return;
+		}
+		if (gesture.fromFocus) {
+			if (activeId === id) return;
+			// Focus landing on another MEMBER of the selection promotes it to primary and
+			// keeps the set. This is what preserves a multi-cell selection through a
+			// right/middle-click on one of its cells: that press is a context-menu gesture,
+			// not a selection gesture, so it never collapses - and the focus the browser
+			// then hands the card (it is `tabindex=-1`) must not collapse on its behalf.
+			// The anchor follows the primary, as it does when a toggle re-seats it.
+			if (selectedIds.size > 1 && selectedIds.has(id)) {
+				activeId = id;
+				anchorId = id;
+				return;
+			}
+		}
+		selectOnly(id);
+	}
+
+	/**
+	 * Drop selected ids that no longer exist (a refetch, a remote delete) and keep
+	 * the invariant that the primary is a member. A selection reduced to nothing
+	 * collapses onto the primary rather than leaving the notebook with no selection.
+	 */
+	function pruneSelection() {
+		const live = new Set(cellOrder);
+		const kept = new Set([...selectedIds].filter((id) => live.has(id)));
+		if (activeId && live.has(activeId)) kept.add(activeId);
+		if (!kept.size) {
+			selectOnly(activeId && live.has(activeId) ? activeId : (cellOrder[0] ?? null));
+			return;
+		}
+		selectedIds = kept;
+		if (anchorId && !live.has(anchorId)) anchorId = activeId;
 	}
 
 	// Each Cell registers its imperative API (by id) so the shortcut actions can
@@ -1062,8 +1260,10 @@
 	}
 
 	// The editor holding focus IS edit mode; losing it drops back to command mode.
+	// Entering an editor also collapses a multi-selection: you are now typing in one
+	// cell, so the bulk ops must not still be aimed at a set the caret left behind.
 	function onEditorFocus(id: string) {
-		activeId = id;
+		selectOnly(id);
 		keyMode = 'edit';
 	}
 	function onEditorBlur(id: string) {
@@ -1090,8 +1290,11 @@
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			// A notebook always has a selected cell (command mode acts on it), so
-			// j/k and the rest work the moment the notebook opens.
-			if (!activeId || !cells.some((c) => c.id === activeId)) activeId = cells[0]?.id ?? null;
+			// j/k and the rest work the moment the notebook opens. A refetch can also
+			// have removed cells out from under a multi-selection, so prune it to what
+			// still exists and keep the primary a member.
+			if (!activeId || !cells.some((c) => c.id === activeId)) selectOnly(cells[0]?.id ?? null);
+			else pruneSelection();
 			loadFolds(); // restore this notebook's collapsed sections (runtime-only, per notebook)
 			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
 			// This refetch is the correctness backstop (reconnect / seq gap): the
@@ -1187,11 +1390,20 @@
 		} else if (ev.type === 'notebook:hide-all-code') {
 			hideAllCode = !!ev.hidden;
 		} else if (ev.type === 'cell:deleted') {
-			const i = cells.findIndex((c) => c.id === ev.cellId);
 			cells = cells.filter((c) => c.id !== ev.cellId);
 			setRawEdit(ev.cellId, false);
 			if (runningId === ev.cellId) runningId = null;
+			// A cell an agent (or another tab) removed leaves the selection: it no
+			// longer exists, so a bulk op must not still be aimed at it. Dropping the
+			// PRIMARY deliberately leaves `activeId` null rather than moving it - a
+			// remote delete must not yank this user's caret to a neighbouring cell.
+			if (selectedIds.has(ev.cellId)) {
+				const next = new Set(selectedIds);
+				next.delete(ev.cellId);
+				selectedIds = next;
+			}
 			if (activeId === ev.cellId) activeId = null;
+			if (anchorId === ev.cellId) anchorId = activeId;
 		} else if (ev.type === 'cell:moved') {
 			const from = cells.findIndex((c) => c.id === ev.cellId);
 			if (from < 0) return;
@@ -1201,17 +1413,18 @@
 			next.splice(to, 0, cell);
 			cells = next;
 		} else if (ev.type === 'cell:type') {
-			const cell = findCell(ev.cellId);
-			if (cell) {
-				cell.cell_type = ev.cell_type;
-				if (ev.cell_type === 'markdown') cell.outputs = [];
-				// The event carries the new language (sql | null) so a remote code↔sql
-				// switch re-highlights the editor live. Reassign metadata for reactivity.
-				const cellar = { ...(cell.metadata?.cellar ?? {}) };
-				if (ev.language === 'sql') cellar.language = 'sql';
-				else delete cellar.language;
-				cell.metadata = { ...(cell.metadata ?? {}), cellar };
-			}
+			// The RECEIVING half of a type switch goes through the SAME
+			// `applyCellTypeLocally` the optimistic half uses, rather than re-deriving
+			// the metadata rules here: `cell:type` carries only the nbformat type and
+			// the language, so every rule about what a switch DROPS (the imports role,
+			// the export flag) lives on the two client halves and the server's
+			// `applyCellType`. A third hand-written copy is how one gets fixed and the
+			// others left behind - which is exactly what happened here, leaving this tab
+			// drawing the imports/export badge over a cell the server had stripped, with
+			// no further event able to correct it before a reload.
+			const logical: LogicalCellType =
+				ev.cell_type === 'markdown' ? 'markdown' : ev.language === SQL_LANGUAGE ? 'sql' : 'code';
+			applyCellTypeLocally(ev.cellId, logical);
 		} else if (ev.type === 'cell:cleared') {
 			const cell = findCell(ev.cellId);
 			if (cell) cell.outputs = [];
@@ -1672,19 +1885,40 @@
 		scheduleStaleness();
 	}
 
-	async function setType(id: string, cellType: LogicalCellType) {
+	/**
+	 * The client half of a type switch, shared by ALL THREE of this component's type
+	 * paths so they cannot diverge: the optimistic single-cell `setType`, the
+	 * optimistic `setTypeSelection` batch, and the REMOTE `cell:type` handler (an
+	 * agent's or another tab's switch). The server shares its own half the same way,
+	 * in `notebook.ts`'s `applyCellType`, so there are exactly two implementations of
+	 * the rules - not one per call site.
+	 */
+	function applyCellTypeLocally(id: string, cellType: LogicalCellType) {
 		const cell = findCell(id);
-		if (cell) {
-			// 'sql' is a code cell tagged cellar.language='sql' ($lib/cellLanguage.js);
-			// 'code' clears that tag. Reassign metadata (the cell may have had no cellar
-			// namespace) so the SQL/Python grammar switch in Cell.svelte reacts.
-			cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
-			const cellar = { ...(cell.metadata?.cellar ?? {}) };
-			if (cellType === 'sql') cellar.language = 'sql';
-			else delete cellar.language;
-			cell.metadata = { ...(cell.metadata ?? {}), cellar };
-			if (cell.cell_type === 'markdown') cell.outputs = [];
+		if (!cell) return;
+		// 'sql' is a code cell tagged cellar.language='sql' ($lib/cellLanguage.js);
+		// 'code' clears that tag. Reassign metadata (the cell may have had no cellar
+		// namespace) so the SQL/Python grammar switch in Cell.svelte reacts.
+		const isSql = cellType === 'sql';
+		cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
+		const cellar = { ...(cell.metadata?.cellar ?? {}) };
+		if (isSql) cellar.language = 'sql';
+		else delete cellar.language;
+		// The same two drops the server's `applyCellType` makes - neither the imports
+		// role nor the export flag may sit on a non-Python cell - mirrored here for the
+		// `clampMoveIndex` reason: `cell:type` carries no metadata, so a client half
+		// that skipped them would keep drawing the imports/export badge over a cell the
+		// server has already stripped, with no event able to correct it before reload.
+		if (cell.cell_type === 'markdown' || isSql) {
+			if (cellar.role === IMPORTS_ROLE) delete cellar.role;
+			if (cellar.export) delete cellar.export;
 		}
+		cell.metadata = { ...(cell.metadata ?? {}), cellar };
+		if (cell.cell_type === 'markdown') cell.outputs = [];
+	}
+
+	async function setType(id: string, cellType: LogicalCellType) {
+		applyCellTypeLocally(id, cellType);
 		await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
@@ -1821,9 +2055,23 @@
 	// per-notebook and local: it records the cells THIS user deleted here, so `z`
 	// can never resurrect a cell an agent (or another tab) deliberately removed.
 	const UNDO_LIMIT = 20;
-	let deletedCells: (ClipboardCell & { index: number })[] = [];
+	/**
+	 * The undo stack, one entry per USER ACTION rather than per cell: a bulk delete
+	 * of seven cells pushes ONE group, so `z` restores the whole thing instead of an
+	 * eighth of it. Each record carries the cell's pre-removal document index, so
+	 * re-inserting the group in ascending index order lands every cell back where it
+	 * was (each insert shifts the later ones right by exactly one).
+	 */
+	type DeletedGroup = DeletedCell[];
+	let deletedCells: DeletedGroup[] = [];
+	let undoInFlight = false;
+	function pushUndo(group: DeletedGroup) {
+		if (!group.length) return;
+		deletedCells.push(group);
+		if (deletedCells.length > UNDO_LIMIT) deletedCells.shift();
+	}
 
-	/** A cell as the clipboard and the undo stack store it: live source, no outputs. */
+	/** A cell as the CLIPBOARD stores it: live source, no outputs. */
 	function snapshotCell(cell: UICell): ClipboardCell {
 		return {
 			cell_type: cell.cell_type,
@@ -1833,19 +2081,69 @@
 	}
 
 	/**
-	 * Insert a cell carrying `spec`'s type + source at `index`, and return it.
-	 * The caller selects it: paste selects the last pasted cell, undo the restored
-	 * one.
+	 * A cell as the UNDO STACK stores it: its document index, its live source, and
+	 * its WHOLE `cellar` namespace.
+	 *
+	 * Deliberately NOT the clipboard's shape. The clipboard carries only what a
+	 * cross-notebook paste should carry, but undo is the one path where a user
+	 * expects EXACT restoration - and the narrow shape drops `language`, so ten
+	 * deleted SQL cells came back as ten plain Python cells, along with the imports
+	 * `role`, the nbdev `export` flag and the `hide_input` report-view choice. Bulk
+	 * delete is what turned that from a one-cell annoyance into a ten-cell one.
+	 *
+	 * The namespace is copied whole and the SERVER strips the runtime-only records
+	 * from it (`seedCellar`), which is where that rule already lives - a second copy
+	 * of it here could drift from the one the disk write uses.
 	 */
-	async function insertCellAt(index: number, spec: ClipboardCell): Promise<UICell> {
+	interface DeletedCell {
+		index: number;
+		cell_type: CellType;
+		source: string;
+		cellar?: CellarNamespace;
+	}
+	function snapshotDeletedCell(cell: UICell, index: number): DeletedCell {
+		return {
+			index,
+			cell_type: cell.cell_type,
+			source: cellApis[cell.id]?.currentSource?.() ?? cell.source,
+			cellar: cell.metadata?.cellar ? { ...cell.metadata.cellar } : undefined
+		};
+	}
+
+	/** What an insert re-materializes: a cell's type, source and `cellar` metadata. */
+	interface InsertSpec {
+		cell_type: CellType;
+		source: string;
+		cellar?: CellarNamespace;
+	}
+
+	/**
+	 * Insert a cell carrying `spec`'s type, source and `cellar` metadata at `index`,
+	 * and return it. All three are seeded server-side in the SAME add, so restoring a
+	 * cell is one persist and one `cell:added` event rather than an add trailed by a
+	 * PATCH per metadata key.
+	 *
+	 * Selection is the CALLER's: both callers insert a whole group and then select
+	 * the resulting block (paste the pasted cells, undo the restored ones), so this
+	 * deliberately touches neither `activeId` nor `selectedIds`.
+	 */
+	async function insertCellAt(index: number, spec: InsertSpec): Promise<UICell> {
 		const at = Math.max(0, Math.min(index, cells.length));
 		const afterId = at > 0 ? cells[at - 1]?.id : null;
 		// The add API can only insert *after* an id, so an insert at the very top
 		// appends and then hoists (one extra persist, identical clean-on-save result).
-		const created = await addCell(afterId ?? cells.at(-1)?.id, spec.cell_type, spec.source);
+		const created = await addCell(afterId ?? cells.at(-1)?.id, spec.cell_type, spec.source, spec.cellar);
 		if (!afterId && cells.length > 1) await moveCellToIndex(created.id, 0);
-		if (spec.output_scrolled !== undefined) await setScrolled(created.id, spec.output_scrolled);
 		return created;
+	}
+
+	/** A clipboard entry as an insert: the view choice is the only metadata it carries. */
+	function pasteSpec(entry: ClipboardCell): InsertSpec {
+		return {
+			cell_type: entry.cell_type,
+			source: entry.source,
+			cellar: entry.output_scrolled === undefined ? undefined : { output_scrolled: entry.output_scrolled }
+		};
 	}
 
 	/**
@@ -1867,18 +2165,67 @@
 		return created.id;
 	}
 
+	/**
+	 * Say WHY nothing happened when the non-empty invariant refused a delete/cut.
+	 *
+	 * The rule itself is deliberate and enforced server-side (`deleteCells`); what
+	 * this fixes is that a keystroke refusal has no other surface. Cmd/Ctrl+A then
+	 * `dd` (or `x`) sends no request that could fail and disables no button, so a
+	 * silent return is indistinguishable from a dead keyboard. Routed to the shell's
+	 * existing transient status line rather than a new affordance.
+	 */
+	function noticeKeepOneCell() {
+		onNotice?.('A notebook keeps at least one cell - that delete would leave none.');
+	}
+
+	/** The server's refusal code for the non-empty invariant (`deleteCells`). */
+	const KEEP_ONE_CELL_REASON = 'would-empty-notebook';
+
+	/**
+	 * Say why a delete the client thought legal came back refused.
+	 *
+	 * The optimistic guards above catch the ordinary case, but they compare against
+	 * THIS tab's cell list, which is stale for as long as an agent's `cell:deleted`
+	 * events are in flight - so the server can legitimately refuse a batch the browser
+	 * had already rendered as gone. The recovery is a refetch, and a refetch alone is
+	 * exactly the silent refusal the notice channel exists to close: the cells simply
+	 * reappear, with no explanation and nothing else to explain them (the events that
+	 * would carry this tab's own `originId` are echo-suppressed).
+	 *
+	 * Driven by the reason the server ACTUALLY sent, never assumed from the failure: a
+	 * refetch caused by a dropped connection or any other error must not claim the
+	 * notebook-must-keep-a-cell rule it never invoked.
+	 */
+	async function noticeRefusal(res: Response | null | undefined) {
+		if (!res || res.ok) return;
+		const reason = await res
+			.json()
+			.then((body) => body?.reason)
+			.catch(() => null);
+		if (reason === KEEP_ONE_CELL_REASON) noticeKeepOneCell();
+	}
+
+	// Copy/cut take the whole selection, in document order. The clipboard has always
+	// held a LIST and `pasteCells` has always inserted every entry, so this needed no
+	// new machinery - and the alternative (copying one cell while five are visibly
+	// selected) would be a worse surprise than anything multi-select fixes.
 	function copyActive() {
-		const cell = findCell(activeId);
-		if (cell) cellClipboard.copy([snapshotCell(cell)]);
+		const snapshots = selectionTargets().flatMap((id) => {
+			const cell = findCell(id);
+			return cell ? [snapshotCell(cell)] : [];
+		});
+		if (snapshots.length) cellClipboard.copy(snapshots);
 	}
 
 	function cutActive() {
-		const cell = findCell(activeId);
-		// A lone cell can't be deleted (below), so it can't be cut either: half a cut
-		// - copied but still there - would be worse than doing nothing.
-		if (!cell || cells.length <= 1) return;
-		cellClipboard.copy([snapshotCell(cell)]);
-		deleteCell(cell.id);
+		const ids = selectionTargets();
+		// A cut that cannot delete would be half a cut - copied but still there -
+		// which is worse than doing nothing. So it refuses on exactly the conditions
+		// the delete refuses on: a lone cell, or a selection covering every cell.
+		if (!ids.length) return;
+		if (ids.length >= cells.length) return noticeKeepOneCell();
+		copyActive();
+		deleteSelection();
 	}
 
 	async function pasteCells(where: 'above' | 'below') {
@@ -1887,19 +2234,57 @@
 		const i = cells.findIndex((c) => c.id === activeId);
 		// No selection (an empty notebook) → paste at the end.
 		let index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
-		let last: UICell | null = null;
+		// The pasted BLOCK becomes the selection, not just its last cell: cut/copy act
+		// on the whole set and undo restores the whole group, so leaving five pasted
+		// cells with one selected would be an asymmetry this path invented.
+		const inserted: string[] = [];
 		for (const entry of entries) {
-			last = await insertCellAt(index, entry);
+			inserted.push((await insertCellAt(index, pasteSpec(entry))).id);
 			index++;
 		}
-		if (last) await selectAndFocus(last.id);
+		await selectGroup(inserted);
 	}
 
 	async function undoDelete() {
-		const record = deletedCells.pop();
-		if (!record) return;
-		const restored = await insertCellAt(record.index, record);
-		await selectAndFocus(restored.id);
+		// The group leaves the stack only once every cell is back (an insert can
+		// reject, and discarding it first would leave the notebook half-restored with
+		// the only description of what was deleted already thrown away), so it stays
+		// visible for the whole multi-fetch window - and a second `z`, or plain key
+		// auto-repeat, would otherwise read the SAME group and restore it twice,
+		// persisting duplicates. One restore at a time closes that without giving the
+		// record-survives-a-failure property back.
+		if (undoInFlight) return;
+		const group = deletedCells.at(-1);
+		if (!group?.length) return;
+		undoInFlight = true;
+		const restored: string[] = [];
+		// Ascending index order is what makes each insert land its cell back where it
+		// was (every earlier restore shifts the later ones right by exactly one), and
+		// sorting the group ITSELF is what lets a record be dropped the instant its
+		// cell is back: the group left on the stack then describes exactly what is
+		// still missing, so a retry after a mid-restore failure resumes rather than
+		// replaying - which would insert the cells that already landed a second time.
+		group.sort((a, b) => a.index - b.index);
+		try {
+			while (group.length) {
+				restored.push((await insertCellAt(group[0].index, group[0])).id);
+				group.shift();
+			}
+			// Dropped by identity, not by position: a delete landing while the restore
+			// awaited has pushed a newer group on top, and popping would discard THAT.
+			const at = deletedCells.indexOf(group);
+			if (at >= 0) deletedCells.splice(at, 1);
+		} catch {
+			// A rejected insert leaves the remaining records on the stack for another
+			// `z`; it must not escape as an unhandled rejection, which would also skip
+			// the selection restore below and strand the user with no selected cell.
+		} finally {
+			undoInFlight = false;
+		}
+		// Restore the SELECTION too, not just the cells: undoing a bulk delete should
+		// hand back the state the delete was issued from, so the next action can act
+		// on the same set. After a partial restore it covers what actually landed.
+		await selectGroup(restored);
 	}
 
 	async function deleteCell(id: string) {
@@ -1907,17 +2292,33 @@
 		const cell = cells[i];
 		// A notebook always keeps at least one cell - the same invariant the toolbar's
 		// delete button enforces by disabling itself at one cell - so there is always
-		// somewhere to type. `dd` and cut honor it rather than quietly diverging.
-		if (!cell || cells.length <= 1) return;
-		deletedCells.push({ index: i, ...snapshotCell(cell) });
-		if (deletedCells.length > UNDO_LIMIT) deletedCells.shift();
+		// somewhere to type. The ENFORCEMENT is the server's (`deleteCell` refuses),
+		// because only it knows the real cell count; this is the optimistic mirror.
+		if (!cell) return;
+		if (cells.length <= 1) return noticeKeepOneCell();
+		// Snapshot BEFORE the cell leaves the model - the only moment its live source
+		// and metadata are readable - but push the group only once the server confirms,
+		// exactly as the bulk delete does: a refused delete refetches the cell back, and
+		// a phantom group would make `z` re-insert a cell that is still there.
+		const snapshot = [snapshotDeletedCell(cell, i)];
 		cells = cells.filter((c) => c.id !== id);
 		setRawEdit(id, false);
 		// Keep a cell selected: command mode acts on the selection, so deleting the
 		// selected cell must hand the selection to its neighbor, not drop it. Focus
 		// follows, because the delete button that had it is gone with the cell.
 		if (activeId === id) selectAfterRemoval(i, { focus: true });
-		await fetch(`/api/cells/${id}?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, { method: 'DELETE' });
+		else if (selectedIds.has(id)) pruneSelection(); // a per-cell delete of a member
+		const res = await fetch(`/api/cells/${id}?nb=${encodeURIComponent(path)}&originId=${encodeURIComponent(originId)}`, {
+			method: 'DELETE'
+		}).catch(() => null);
+		// A refused/failed delete published no `cell:deleted`, and this tab suppresses
+		// its own echo anyway, so nothing else would ever correct the divergence - nor
+		// explain it, hence the notice before the refetch puts the cell back.
+		if (res?.ok) pushUndo(snapshot);
+		else {
+			await noticeRefusal(res);
+			await load();
+		}
 		scheduleStaleness();
 	}
 
@@ -1928,8 +2329,154 @@
 	 */
 	function selectAfterRemoval(index: number, { focus = false }: { focus?: boolean } = {}) {
 		const id = cells[Math.min(Math.max(index, 0), cells.length - 1)]?.id ?? null;
-		activeId = id;
+		selectOnly(id);
 		if (focus && id) selectAndFocus(id);
+	}
+
+	// ---- Bulk operations over the selection ----------------------------------
+	// Each one is the SAME operation the single-cell path performs, applied to a
+	// set: at size 1 it delegates to the existing single-cell function verbatim, so
+	// the common case cannot regress, and past that it goes through `POST
+	// /api/cells/bulk` - ONE request, ONE document write, ONE `.ipynb` persist. The
+	// batch is about atomicity, not round trips: N single-cell calls walk the file
+	// through N-1 intermediate states and (for a delete) leave N undo entries where
+	// the user performed one action. The server replies with the ordinary per-cell
+	// events, so other tabs apply patches they already understand.
+	//
+	// All three address document-model ids, so they are exactly as correct for a
+	// selection whose cells are windowed out as for one entirely on screen.
+
+	/** The ids a bulk op acts on: the selection in document order (never empty when a cell is selected). */
+	function selectionTargets(): string[] {
+		const ids = selectedInOrder;
+		return ids.length ? ids : activeId ? [activeId] : [];
+	}
+
+	/**
+	 * One bulk request, checked against what the caller optimistically rendered.
+	 *
+	 * A REFUSED batch is not an HTTP failure: `moveCells` returns `[]` when its own
+	 * recomputed plan is blocked (or any `clampMoveIndex` step refuses) and
+	 * `setCellTypes` returns `[]` when it matched nothing, both under `{ok:true}`.
+	 * So the honest signal is the COUNT the server reports acting on, not the
+	 * status - and reading it is not optional, because these events carry THIS
+	 * tab's `originId`: the initiating tab suppresses its own echo, so the very
+	 * events that would correct the divergence are the ones it will never apply.
+	 * Without this check it would sit forever on a document the server never had.
+	 *
+	 * `applied` is what the caller changed locally, derived through the same rules
+	 * the server uses, so a batch the server legitimately skipped (cells already of
+	 * the target type) is not mistaken for a refusal and does not refetch.
+	 *
+	 * Returns whether the server confirmed the caller's change, so a caller with
+	 * state that only makes sense once the batch landed (the delete's undo group)
+	 * can hold it back rather than record something that never happened.
+	 */
+	async function bulkOp(body: Record<string, unknown>, applied: number): Promise<boolean> {
+		const res = await fetch('/api/cells/bulk', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ ...body, nb: path, originId })
+		}).catch(() => null);
+		// A refusal the client's stale cell count did not predict must SAY so before the
+		// refetch silently puts the cells back (see `noticeRefusal`).
+		await noticeRefusal(res);
+		const payload = res?.ok ? await res.json().catch(() => null) : null;
+		const acted = payload?.removed ?? payload?.moved ?? payload?.changed;
+		if (!Array.isArray(acted) || acted.length !== applied) {
+			await load();
+			return false;
+		}
+		return true;
+	}
+
+	/** Delete every selected cell in one action (`dd` / the palette's Delete cell). */
+	async function deleteSelection() {
+		const ids = selectionTargets();
+		if (ids.length <= 1) {
+			if (ids[0]) await deleteCell(ids[0]);
+			return;
+		}
+		// "A notebook always keeps at least one cell" - the ENFORCEMENT is the server's
+		// (`deleteCells` refuses the batch), because only it knows the real cell count;
+		// this is the optimistic mirror, like the client/server `clampMoveIndex` pair,
+		// so the common case never renders a delete the server is about to refuse.
+		if (ids.length >= cells.length) return noticeKeepOneCell();
+		const order = cellOrder;
+		const removed = new Set(ids);
+		// Snapshot BEFORE the cells leave the model - this is the only moment their
+		// live source and metadata are readable - but push the group only once the
+		// server confirms, because a refused batch refetches the cells back and a
+		// phantom group would make `z` re-insert copies of cells still present.
+		const group = ids.flatMap((id) => {
+			const cell = findCell(id);
+			return cell ? [snapshotDeletedCell(cell, order.indexOf(id))] : [];
+		});
+		const nextActive = selectionAfterRemoval(order, removed);
+		const before = cells.length;
+		cells = cells.filter((c) => !removed.has(c.id));
+		const applied = before - cells.length;
+		for (const id of ids) setRawEdit(id, false);
+		if (runningId && removed.has(runningId)) runningId = null;
+		selectOnly(nextActive);
+		if (nextActive) await selectAndFocus(nextActive);
+		if (await bulkOp({ op: 'delete', ids }, applied)) pushUndo(group);
+		scheduleStaleness();
+	}
+
+	/**
+	 * Move the whole selection one step, carrying it as a unit (`moveSelectionPlan`
+	 * owns the rule and its rationale). The optimistic half mirrors the server's
+	 * `clampMoveIndex` guard exactly as `moveCell` already does - and, like the
+	 * server, abandons the WHOLE plan on a refusal rather than leaving the selection
+	 * half-slid past itself.
+	 */
+	async function moveSelection(dir: 'up' | 'down', mode: KeyMode) {
+		const ids = selectionTargets();
+		if (ids.length <= 1) return moveActive(dir, mode);
+		const steps = moveSelectionPlan(cellOrder, selectedIds, dir);
+		if (!steps.length) return;
+		const work = [...cells];
+		for (const step of steps) {
+			const from = work.findIndex((c) => c.id === step.id);
+			if (from < 0 || clampMoveIndex(work, from, step.toIndex) !== step.toIndex) return;
+			const [cell] = work.splice(from, 1);
+			work.splice(step.toIndex, 0, cell);
+		}
+		cells = work;
+		// The move moved the primary's DOM node, which drops focus; restore it the way
+		// the single-cell move does so repeated moves chain. `scrollCellIntoView`
+		// directly, NOT `selectAndAct`: the latter calls `setActive`, which collapses,
+		// and would silently discard the very selection the move just carried. The
+		// selection is otherwise unchanged (same ids, same relative order), and the
+		// `focusin` it triggers is a `fromFocus` re-statement of the existing primary,
+		// so `activateCell` leaves the selection alone.
+		if (activeId) await scrollCellIntoView(activeId, (api) => (mode === 'edit' ? api?.focus() : api?.focusCell()));
+		await bulkOp({ op: 'move', ids, dir }, steps.length);
+		scheduleStaleness(); // reordering changes the preceding-definer graph
+	}
+
+	/** Change every selected cell's type in one action (`m` / `y` / the palette). */
+	async function setTypeSelection(cellType: LogicalCellType) {
+		const ids = selectionTargets();
+		if (ids.length <= 1) {
+			if (ids[0]) await setType(ids[0], cellType);
+			return;
+		}
+		// A cell already of the target type is a no-op the server skips too
+		// (`setCellTypes` uses this same `isLogicalCellType` rule), so counting the ones
+		// that really change is what keeps that legitimate skip from reading as a
+		// refused batch.
+		const pending = ids.filter((id) => {
+			const cell = findCell(id);
+			return !!cell && !isLogicalCellType(cell, cellType);
+		});
+		// Nothing would change (`m` on an already-markdown selection), so there is no
+		// batch to send - the same early return `moveSelection` makes on an empty plan.
+		if (!pending.length) return;
+		for (const id of pending) applyCellTypeLocally(id, cellType);
+		await bulkOp({ op: 'type', ids, cellType }, pending.length);
+		scheduleStaleness();
 	}
 
 	// The optimistic half of the imports cell's pin: the server applies the very
@@ -1990,13 +2537,19 @@
 		});
 	}
 
-	// `source` seeds the new cell server-side, so a paste / split / undo-delete is
-	// one request, one persist and one `cell:added` event carrying the real text.
-	async function addCell(afterId: string | null | undefined, cellType: CellType = 'code', source = ''): Promise<UICell> {
+	// `source` and `cellar` seed the new cell server-side, so a paste / split /
+	// undo-delete is one request, one persist and one `cell:added` event carrying the
+	// real text and the cell's real metadata.
+	async function addCell(
+		afterId: string | null | undefined,
+		cellType: CellType = 'code',
+		source = '',
+		cellar?: CellarNamespace
+	): Promise<UICell> {
 		const res = await fetch('/api/cells', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ afterId, cellType, source, nb: path, originId })
+			body: JSON.stringify({ afterId, cellType, source, cellar, nb: path, originId })
 		});
 		const { cell } = await res.json();
 		const view: UICell = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs, metadata: cell.metadata ?? {} };
@@ -2051,10 +2604,16 @@
 	// `selectAndAct` (which delegates its whole tail here, so keyboard selection and
 	// this share one path) and `insertAndRunCode` (no `land`: that path deliberately
 	// never touches `activeId`, so nothing else pins its appended cell).
-	async function scrollCellIntoView(
-		id: string | null,
-		land?: (api: CellRegisterApi | undefined) => void
-	) {
+	//
+	// Every caller here MOVES focus, which is why the mount is not optional: under
+	// windowing a target outside the natural window has no DOM node and no
+	// registered API, so the land - and with it the modal keyboard, which reads a
+	// keystroke's mode and target off the focused element - would go nowhere. Every
+	// caller here also SCROLLS and REVEALS, so a caller that must do neither
+	// (`selectAllCells`, which is not a navigation) goes to `ensureCellMounted`
+	// directly in its mount-only mode instead: this seam reveals as it mounts, and a
+	// reveal WRITES persisted fold state.
+	async function scrollCellIntoView(id: string | null, land?: (api: CellRegisterApi | undefined) => void) {
 		if (!id) return;
 		const { el, pin } = await ensureCellMounted(id);
 		land?.(cellApis[id]);
@@ -2093,12 +2652,108 @@
 		await selectAndAct(id, (api) => api?.focusCell());
 	}
 
+	/**
+	 * Select a whole GROUP of freshly-materialized cells (a paste, an undone bulk
+	 * delete) and focus its last member. The two ends span the group - anchor at the
+	 * first, primary at the last - the same shape `selectAllCells` leaves, so a
+	 * following Shift+J/K extends from a coherent range instead of discarding it.
+	 *
+	 * Focus goes through the shared mount seam and NOT `selectAndAct`, whose
+	 * `setActive` collapses: the set must survive the focus that follows it. A
+	 * one-cell group is the degenerate case and is byte-for-byte a `selectOnly` plus
+	 * focus, so a single-cell paste behaves exactly as it always did.
+	 */
+	async function selectGroup(ids: string[]) {
+		if (!ids.length) return;
+		selectedIds = new Set(ids);
+		anchorId = ids[0];
+		activeId = ids[ids.length - 1];
+		await scrollCellIntoView(activeId, (api) => api?.focusCell());
+	}
+
+	/**
+	 * Plain `j`/`k` (and the bare Arrows): move the selection one selectable cell,
+	 * clamped at either end.
+	 *
+	 * The head may legitimately sit on a cell the walk does NOT contain - select-all
+	 * leaves it on the last cell of the document without revealing it - so an
+	 * unwalkable head is resolved by DOCUMENT position through the SAME
+	 * `stepFromUnwalkableHead` Shift+J/K uses. Falling back to the first entry instead
+	 * (what a bare `findIndex` miss gives) flung the selection to the top of the
+	 * notebook on the very next keystroke after Cmd/Ctrl+A whenever the last section
+	 * was collapsed. One rule, so the two moves cannot diverge on it again.
+	 */
 	function selectRelative(delta: number) {
 		const list = selectable;
 		if (!list.length) return;
 		const i = list.findIndex((c) => c.id === activeId);
-		const next = list[i < 0 ? 0 : Math.min(list.length - 1, Math.max(0, i + delta))];
-		selectAndFocus(next.id);
+		const next =
+			i >= 0
+				? list[Math.min(list.length - 1, Math.max(0, i + delta))].id
+				: stepFromUnwalkableHead(
+						cellOrder,
+						list.map((c) => c.id),
+						activeId,
+						delta
+					);
+		if (next) selectAndFocus(next);
+	}
+
+	/**
+	 * Shift+J/K (and Shift+Arrows): grow or shrink the contiguous selection by one
+	 * cell from the moving end. The head walks the SELECTABLE list, so it skips
+	 * cells a folded heading hides exactly like plain `j`/`k`, while the range
+	 * itself fills in by full-document index (`extendSelection`).
+	 *
+	 * Focus follows the head, and must be placed WITHOUT collapsing: `selectAndAct`
+	 * would call `setActive`. Under windowing the head may be a cell with no DOM
+	 * node yet, so it goes through the shared `scrollCellIntoView` mount seam like
+	 * every other selection move.
+	 */
+	async function extendSelectionBy(delta: number) {
+		const next = extendSelection(
+			cellOrder,
+			selectable.map((c) => c.id),
+			{ activeId, anchorId },
+			delta
+		);
+		if (!next) return;
+		activeId = next.activeId;
+		anchorId = next.anchorId;
+		selectedIds = next.selected;
+		await scrollCellIntoView(next.activeId, (api) => api?.focusCell());
+	}
+
+	/**
+	 * Cmd/Ctrl+A in command mode: select every cell of the notebook - the FULL
+	 * document order, fold-hidden cells included, so there is ONE rule for what a
+	 * selection may contain and it is the one a Shift range already follows
+	 * (`rangeIds` fills in by document index). Selecting only the visible cells
+	 * would also make a bulk move destructive: with a section collapsed it would
+	 * select the heading but not its body, and `moveSelectionPlan` would then swap
+	 * each heading past the first cell of its own section - shuffling headings into
+	 * the sections they title. Selecting the section too moves it as a unit.
+	 *
+	 * The two ends are left spanning the whole document (anchor at the first cell,
+	 * head at the last), because `extendSelection` REBUILDS the selection as
+	 * `rangeIds(anchor, head)`: leaving the head wherever the primary happened to be
+	 * would make the very next Shift+J/K discard everything past it - 300 cells
+	 * collapsing to a handful on one keystroke.
+	 *
+	 * The head still has to be MOUNTED and FOCUSED, so it goes through `mountAndFocus`
+	 * - never `scrollCellIntoView`, whose two extra side effects are exactly the ones
+	 * select-all must not have (see that helper). The head may therefore still be a
+	 * fold-hidden cell, which is why BOTH keyboard moves resolve a head absent from the
+	 * walk by document position (`stepFromUnwalkableHead`) instead of restarting from
+	 * the top.
+	 */
+	async function selectAllCells() {
+		const order = cellOrder;
+		if (!order.length) return;
+		selectedIds = new Set(order);
+		anchorId = order[0];
+		activeId = order[order.length - 1];
+		await mountAndFocus(activeId);
 	}
 
 	// Fold/unfold act on the selected cell only when it is a markdown header, and
@@ -2158,7 +2813,11 @@
 		const at = api.cursorOffset();
 		api.replaceSource(source.slice(0, at));
 		await editCell(id, source.slice(0, at));
-		const created = await addCell(id, cell.cell_type, source.slice(at));
+		// The lower half is the same cell's second half, so it inherits the keys that
+		// say how that cell is read and displayed (`splitInheritedCellar` states which,
+		// and why the imports role and the export flag are not among them). Seeded in
+		// the SAME write as the source, so a split stays one persist and one event.
+		const created = await addCell(id, cell.cell_type, source.slice(at), splitInheritedCellar(cell.metadata?.cellar));
 		// `enterEdit`, not `focus`: a markdown cell created with text mounts in its
 		// rendered view, whose editor is `display:none` and cannot take the caret.
 		await selectAndAct(created.id, (api) => api?.enterEdit());
@@ -2180,26 +2839,53 @@
 		await editCell(id, next);
 	}
 
-	/** shortcut id → what it does. `mode` is the mode the keystroke fired in. */
-	const actions: Record<string, (mode: KeyMode) => void> = {
+	/**
+	 * shortcut id → what it does. `mode` is the mode the keystroke fired in.
+	 *
+	 * Returning `false` means NOT HANDLED: the dispatcher then leaves the keystroke
+	 * entirely alone (no `preventDefault`, no `stopPropagation`) so it bubbles on
+	 * normally. That opt-out exists because `onKeydown` is a window CAPTURE listener
+	 * covering the whole app - consuming a key an action did nothing with silently
+	 * breaks unrelated bubble-phase listeners (the sidebar dismisses its context menu
+	 * on Escape, the key `clear-selection` binds). Every other return value means
+	 * handled, promises from async actions included, so an action has to opt out
+	 * deliberately and nothing that consumes its key today stops doing so.
+	 */
+	const actions: Record<string, (mode: KeyMode) => unknown> = {
 		'command-mode': () => apiOf(activeId)?.blur(),
 		'edit-mode': () => apiOf(activeId)?.enterEdit(),
 		'run-cell': () => apiOf(activeId)?.run(false),
 		'run-advance': (mode) => apiOf(activeId)?.run(true, { focusNext: mode === 'edit' }),
 		'select-prev': () => selectRelative(-1),
 		'select-next': () => selectRelative(1),
+		'extend-select-prev': () => extendSelectionBy(-1),
+		'extend-select-next': () => extendSelectionBy(1),
+		'select-all-cells': () => selectAllCells(),
+		'clear-selection': () => {
+			// Nothing to collapse - report NOT HANDLED so Escape keeps bubbling to
+			// whoever else is listening for it (see the `actions` doc comment).
+			if (selectedIds.size <= 1) return false;
+			// A notebook always keeps a selected cell, so the collapse target has to
+			// tolerate a NULL primary: a remote `cell:deleted` that removed the primary
+			// deliberately leaves `activeId` null while the other members stand (it must
+			// not yank this user's caret to a neighbour), and collapsing onto that null
+			// would empty the selection outright and leave command mode acting on nothing.
+			selectOnly(activeId ?? selectedInOrder[0] ?? cellOrder[0] ?? null);
+		},
 		'fold-section': () => setFolded(activeId, true),
 		'unfold-section': () => setFolded(activeId, false),
 		'collapse-all-headings': () => setAllFolded(true),
 		'expand-all-headings': () => setAllFolded(false),
-		'move-cell-up': (mode) => moveActive('up', mode),
-		'move-cell-down': (mode) => moveActive('down', mode),
+		// The three bulk-capable ops. Each delegates to its single-cell function
+		// verbatim at selection size 1, so the common case is unchanged.
+		'move-cell-up': (mode) => moveSelection('up', mode),
+		'move-cell-down': (mode) => moveSelection('down', mode),
 		'insert-above': () => insertCell('above'),
 		'insert-below': () => insertCell('below'),
-		'to-markdown': () => activeId && setType(activeId, 'markdown'),
-		'to-code': () => activeId && setType(activeId, 'code'),
+		'to-markdown': () => setTypeSelection('markdown'),
+		'to-code': () => setTypeSelection('code'),
 		'run-insert-below': () => runAndInsertBelow(),
-		'delete-cell': () => activeId && deleteCell(activeId),
+		'delete-cell': () => deleteSelection(),
 		'undo-delete': () => undoDelete(),
 		'cut-cell': () => cutActive(),
 		'copy-cell': () => copyActive(),
@@ -2316,9 +3002,12 @@
 		}
 		const action = shortcut && actions[shortcut.id];
 		if (!action) return;
+		// The action runs BEFORE the keystroke is consumed because it is what decides
+		// whether it was handled at all; `preventDefault`/`stopPropagation` still take
+		// effect afterwards, since we are inside the same event dispatch.
+		if (action(mode) === false) return;
 		e.preventDefault();
 		e.stopPropagation();
-		action(mode);
 	}
 </script>
 
@@ -2348,6 +3037,7 @@
 			runningId={runningId}
 			{queued}
 			{activeId}
+			{selectedIds}
 			{keyMode}
 			{staleness}
 			hidden={folding.hidden}
@@ -2383,7 +3073,7 @@
 			onSetEditorCollapsed={setEditorCollapsed}
 			rawEdits={rawEdits}
 			onSetRawEdit={setRawEdit}
-			onActivate={setActive}
+			onActivate={activateCell}
 			onRegister={registerCell}
 			onEditorFocus={onEditorFocus}
 			onEditorBlur={onEditorBlur}

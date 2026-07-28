@@ -49,3 +49,22 @@ export function logicalCellType(cell: LanguageCell): LogicalCellType {
 	if (cell?.cell_type === 'markdown') return 'markdown';
 	return isSqlCell(cell) ? 'sql' : 'code';
 }
+
+/**
+ * Is `cell` ALREADY `cellType` - i.e. would switching it be a no-op? The ONE rule
+ * behind the bulk retype's skip: the server's `setCellTypes` skips on it and the
+ * browser predicts the resulting count from it, so a legitimate skip can never
+ * read as a refused batch.
+ *
+ * Deliberately stricter than `logicalCellType(cell) === cellType`, which maps every
+ * non-markdown cell to `code` - nbformat `raw` cells included (`ipynb.ts` passes
+ * them through untouched, since an externally-authored notebook may carry them).
+ * Skipping on the logical type alone left a raw cell raw under a bulk
+ * retype-to-code while the single-cell `setCellType`, which has no "already" check
+ * at all, converted it; requiring the nbformat `cell_type` to match too is what
+ * keeps the two paths in agreement. `raw` is still not a Cellar logical type - it
+ * is simply never "already" anything.
+ */
+export function isLogicalCellType(cell: LanguageCell, cellType: LogicalCellType): boolean {
+	return cell?.cell_type === (cellType === 'markdown' ? 'markdown' : 'code') && logicalCellType(cell) === cellType;
+}

@@ -26,9 +26,11 @@ import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
+import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, type ExportResult } from './export-py';
-import { SQL_LANGUAGE } from '../cellLanguage';
+import { SQL_LANGUAGE, isLogicalCellType } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
+import { stripRuntimeMeta } from './clean';
 import type {
 	Cell,
 	CellView,
@@ -804,20 +806,77 @@ export function moveCellTo(id: string, index: number, nb?: string | null, origin
 }
 
 /**
+ * The DURABLE `cellar` keys a restore may seed - every declared key of
+ * `CellarNamespace` that is not runtime-only. An allowlist, so an unknown key a
+ * caller invents is dropped rather than written into the user's document.
+ */
+const DURABLE_CELLAR_KEYS = [
+	'language',
+	'role',
+	'export',
+	'hide_input',
+	'output_scrolled',
+	'hidden_from_agent',
+	'extract',
+	'visible'
+] as const satisfies readonly (keyof CellarNamespace)[];
+
+/**
+ * Seed a newly created cell with `cellar` metadata a caller is RESTORING - the
+ * undo stack re-inserting a deleted cell, which has to bring it back EXACTLY
+ * (`language`, so a SQL cell does not come back as Python; `role`, `export`,
+ * `hide_input`, `output_scrolled`, `hidden_from_agent`), and a paste carrying its
+ * view choice. Seeding at creation is what keeps that ONE persist and ONE
+ * `cell:added` event, rather than an add followed by a PATCH per key.
+ *
+ * The RUNTIME-only records are stripped first, through the same `stripRuntimeMeta`
+ * the disk write uses, so this can never become a forgery route: `lastRun` is the
+ * sole evidence a cell ran against the LIVE kernel namespace and may only ever
+ * originate from an in-process run, and `importBindings` was just recomputed by
+ * `newCell` for the source this cell is born with.
+ */
+function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): void {
+	if (!cellar || typeof cellar !== 'object' || Array.isArray(cellar)) return;
+	const durable = stripRuntimeMeta({ cellar: cellar as CellarNamespace }).cellar;
+	if (!durable) return;
+	// Copy only the ENUMERATED durable keys, never the object the client sent: the
+	// `cellar` namespace survives clean-on-save WHOLE, so assigning it wholesale
+	// would make this route a path from arbitrary request JSON into the user's
+	// persisted `.ipynb`. The runtime strip above still runs, so a key that ever
+	// moves between the two lists cannot slip through on this path either.
+	const seed = durable as Record<string, unknown>;
+	const target = cell.metadata.cellar as Record<string, unknown>;
+	for (const key of DURABLE_CELLAR_KEYS) {
+		if (seed[key] !== undefined) target[key] = seed[key];
+	}
+	// The imports role is ONE PER NOTEBOOK (`setCellRole` enforces it by stripping
+	// any other), and this path writes the namespace directly, so it has to hold the
+	// same line: a cell deleted while it held the role, re-designated elsewhere, and
+	// then restored would otherwise leave two - and every future routed import would
+	// go to whichever came first.
+	if (cell.metadata.cellar.role === IMPORTS_ROLE && doc.cells.some((c) => isImportsCell(c))) {
+		delete cell.metadata.cellar.role;
+	}
+}
+
+/**
  * Add a cell after `afterId` (appended when it is absent or unknown).
  * `source` seeds the new cell, so a paste / split / undo-delete lands as ONE
  * persist and ONE `cell:added` event carrying the real text - rather than an
- * empty cell that a follow-up edit fills in.
+ * empty cell that a follow-up edit fills in. `cellar` seeds its metadata the same
+ * way, for the same reason (see `seedCellar`).
  */
 export function addCell(
 	afterId: string | null | undefined,
 	cellType: LogicalCellType = 'code',
 	nb?: string | null,
 	originId?: string | null,
-	source = ''
+	source = '',
+	cellar?: unknown
 ): Cell {
 	const doc = docFor(nb);
 	const cell = newCell(cellType, source);
+	seedCellar(doc, cell, cellar);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
 	if (idx >= 0) doc.cells.splice(idx + 1, 0, cell);
 	else doc.cells.push(cell);
@@ -843,6 +902,18 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return;
+	applyCellType(cell, cellType);
+	persist(doc);
+	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: cellType === 'sql' ? SQL_LANGUAGE : null }, originId);
+}
+
+/**
+ * The in-place half of a type switch, shared by the single-cell setter and the
+ * `setCellTypes` batch so the two can never diverge on the metadata rules
+ * (markdown clears outputs; markdown/SQL drop the imports role and the export
+ * flag, neither of which a non-Python cell may hold).
+ */
+function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	const isSql = cellType === 'sql';
 	cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
 	cell.metadata = cell.metadata ?? {};
@@ -858,37 +929,106 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
 	if ((cell.cell_type === 'markdown' || isSql) && cell.metadata.cellar.export) {
 		delete cell.metadata.cellar.export;
 	}
-	persist(doc);
-	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: isSql ? SQL_LANGUAGE : null }, originId);
-}
-
-export function deleteCell(id: string, nb?: string | null, originId?: string | null): void {
-	const doc = docFor(nb);
-	const existed = doc.cells.some((c) => c.id === id);
-	doc.cells = doc.cells.filter((c) => c.id !== id);
-	persist(doc);
-	// A deleted cell must not later dequeue and run: drop any pending run for it.
-	cancelRun(doc.path, id);
-	if (existed) emit(doc, 'cell:deleted', { cellId: id }, originId);
 }
 
 /**
- * Delete SEVERAL cells as ONE document write (the MCP `delete_cells` batch).
+ * Switch SEVERAL cells' logical type as ONE document write (the multi-cell
+ * selection's bulk change-type).
  *
- * Deliberately NOT a loop over `deleteCell`: that persists — a full serialize +
- * fsync + rename of the whole notebook — once per cell, and walks the `.ipynb`
- * through N-1 intermediate states a crash could freeze it in. One filter, one
- * persist, then one `cell:deleted` per removed cell, so every client applies the
- * same per-cell events it already handles and no new event shape exists.
+ * Deliberately NOT a loop over `setCellType`, for `deleteCells`' reason: that
+ * serializes + fsyncs + renames the whole notebook once per cell and walks the
+ * `.ipynb` through N-1 intermediate states. One pass, one persist, then one
+ * `cell:type` per changed cell - the event every client already applies, so the
+ * batch needs no new event shape.
  *
- * Returns the ids actually removed (unknown ids are ignored rather than
- * persisting a no-op write).
+ * Returns the ids actually changed (a cell already of that type is skipped, so a
+ * no-op batch persists nothing). "Already of that type" is `isLogicalCellType`, the
+ * SHARED predicate - the browser predicts this count to tell a refused batch from
+ * a batch that had nothing to do, and a second copy of the rule here would make
+ * the two disagree on exactly the cells they must agree on.
  */
-export function deleteCells(ids: readonly string[], nb?: string | null, originId?: string | null): string[] {
+export function setCellTypes(
+	ids: readonly string[],
+	cellType: LogicalCellType,
+	nb?: string | null,
+	originId?: string | null
+): string[] {
+	const doc = docFor(nb);
+	const isSql = cellType === 'sql';
+	const changed: Cell[] = [];
+	for (const id of ids) {
+		const cell = find(doc, id);
+		if (!cell) continue;
+		if (isLogicalCellType(cell, cellType)) continue;
+		applyCellType(cell, cellType);
+		changed.push(cell);
+	}
+	if (!changed.length) return [];
+	persist(doc);
+	for (const cell of changed) {
+		emit(doc, 'cell:type', { cellId: cell.id, cell_type: cell.cell_type, language: isSql ? SQL_LANGUAGE : null }, originId);
+	}
+	return changed.map((c) => c.id);
+}
+
+/** The non-empty invariant itself: would removing exactly `removed` (already
+ *  resolved against the document) leave the notebook with no cells? */
+function emptiesNotebook(doc: NotebookDoc, removed: readonly string[]): boolean {
+	return removed.length >= doc.cells.length;
+}
+
+/**
+ * Would deleting `ids` be REFUSED by the non-empty invariant? For a caller with
+ * work to do BEFORE the delete that must not happen if the delete never does -
+ * MCP's `removeCells`, whose auto-checkpoint would otherwise mint a History entry
+ * with an 'agent' trigger for a document that never changed. It reads the same
+ * predicate `deleteCells` enforces with, so the two can't drift into disagreeing
+ * about which batches are refused; `deleteCells` stays the ENFORCEMENT, this is
+ * only a look-ahead (both are synchronous against the same in-memory doc, so
+ * nothing can change between them).
+ */
+export function deleteWouldEmptyNotebook(ids: readonly string[], nb?: string | null): boolean {
 	const doc = docFor(nb);
 	const wanted = new Set(ids);
 	const removed = doc.cells.filter((c) => wanted.has(c.id)).map((c) => c.id);
-	if (!removed.length) return [];
+	return removed.length > 0 && emptiesNotebook(doc, removed);
+}
+
+/** A refused delete is distinguishable from one that simply matched
+ *  nothing: the first is a request the document invariant rejected, the second
+ *  is a no-op the caller can ignore. */
+export type DeleteCellsResult =
+	| { ok: true; removed: string[] }
+	| { ok: false; reason: 'would-empty-notebook' };
+
+/**
+ * Delete SEVERAL cells as ONE document write (the multi-cell selection's bulk
+ * delete and the MCP `delete_cells` batch).
+ *
+ * Deliberately NOT one persist per cell: a persist is a full serialize + fsync +
+ * rename of the whole notebook, and repeating it walks the `.ipynb` through N-1
+ * intermediate states a crash could freeze it in. One filter, one
+ * persist, then one `cell:deleted` per removed cell, so every client applies the
+ * same per-cell events it already handles and no new event shape exists.
+ *
+ * "A notebook always keeps at least one cell" is enforced HERE, where the real
+ * cell count lives, not only in the browser: the client compares against ITS
+ * cell count, which is stale for as long as an agent's `cell:deleted` events are
+ * still in flight, so a selection covering everything the server still has would
+ * otherwise persist a zero-cell `.ipynb` - the state the invariant exists to
+ * prevent. Being in the shared layer also covers MCP `delete_cells`, which never
+ * had the check at all. The WHOLE batch is refused (nothing removed, nothing
+ * persisted, no events), matching what the client already models: a partial
+ * delete nobody asked for is worse than a refusal.
+ *
+ * Unknown ids are ignored rather than persisting a no-op write.
+ */
+export function deleteCells(ids: readonly string[], nb?: string | null, originId?: string | null): DeleteCellsResult {
+	const doc = docFor(nb);
+	const wanted = new Set(ids);
+	const removed = doc.cells.filter((c) => wanted.has(c.id)).map((c) => c.id);
+	if (!removed.length) return { ok: true, removed: [] };
+	if (emptiesNotebook(doc, removed)) return { ok: false, reason: 'would-empty-notebook' };
 	doc.cells = doc.cells.filter((c) => !wanted.has(c.id));
 	persist(doc);
 	for (const id of removed) {
@@ -896,7 +1036,20 @@ export function deleteCells(ids: readonly string[], nb?: string | null, originId
 		cancelRun(doc.path, id);
 		emit(doc, 'cell:deleted', { cellId: id }, originId);
 	}
-	return removed;
+	return { ok: true, removed };
+}
+
+/**
+ * Delete ONE cell (`DELETE /api/cells/[id]`, the `dd`/cut path, consolidate's
+ * sweep) — a `deleteCells` of one, so the non-empty invariant has exactly ONE
+ * implementation and holds for EVERY caller. Enforcing it only on the batch path
+ * left the same race open through the singular route: the client's own
+ * `cells.length <= 1` check compares against ITS list, which is stale while an
+ * agent's `cell:deleted` events are in flight, so a `dd` on what the browser
+ * thinks is one of several would remove the server's LAST cell.
+ */
+export function deleteCell(id: string, nb?: string | null, originId?: string | null): DeleteCellsResult {
+	return deleteCells([id], nb, originId);
 }
 
 export function setSource(id: string, source: string, nb?: string | null, originId?: string | null): void {
@@ -1074,4 +1227,46 @@ export function moveCell(id: string, dir: 'up' | 'down', nb?: string | null, ori
 	[doc.cells[i], doc.cells[j]] = [doc.cells[j], doc.cells[i]];
 	persist(doc);
 	emit(doc, 'cell:moved', { cellId: id, toIndex: j }, originId);
+}
+
+/**
+ * Move a whole SELECTION one step `dir`, as ONE document write.
+ *
+ * The plan comes from `$lib/cellSelection`'s `moveSelectionPlan` - the same pure
+ * function the browser runs optimistically - so the client's rendering and the
+ * persisted document are decided by one rule, not two. Each step is an adjacent
+ * swap, emitted as the ordinary `cell:moved` event, so replaying the steps in
+ * order reproduces the result on every other tab with no new event shape.
+ *
+ * The move is all-or-nothing: a step `clampMoveIndex` refuses (the seam reserved
+ * for a positional rule; identity today) abandons the WHOLE plan rather than
+ * leaving the selection half-slid past itself. Returns the steps applied.
+ */
+export function moveCells(
+	ids: readonly string[],
+	dir: 'up' | 'down',
+	nb?: string | null,
+	originId?: string | null
+): { cellId: string; toIndex: number }[] {
+	const doc = docFor(nb);
+	const order = doc.cells.map((c) => c.id);
+	const selected = new Set(ids.filter((id) => order.includes(id)));
+	const steps = moveSelectionPlan(order, selected, dir);
+	if (!steps.length) return [];
+	// Work on a copy so a refused step abandons the plan with the live document
+	// (and the file it is about to be persisted to) completely untouched.
+	const next = [...doc.cells];
+	const applied: { cellId: string; toIndex: number }[] = [];
+	for (const step of steps) {
+		const from = next.findIndex((c) => c.id === step.id);
+		if (from < 0) return []; // cannot happen (ids were filtered against the doc)
+		if (clampMoveIndex(next, from, step.toIndex) !== step.toIndex) return [];
+		const [cell] = next.splice(from, 1);
+		next.splice(step.toIndex, 0, cell);
+		applied.push({ cellId: step.id, toIndex: step.toIndex });
+	}
+	doc.cells = next;
+	persist(doc);
+	for (const move of applied) emit(doc, 'cell:moved', move, originId);
+	return applied;
 }

@@ -1,0 +1,523 @@
+/**
+ * Bulk cell operations over a multi-cell selection, on the REAL notebook
+ * singleton against a scratch workspace.
+ *
+ * Two things are under test, and the second is the one that makes the batch
+ * worth having at all:
+ *
+ *  1. CORRECTNESS - a batch delete / move / retype changes exactly the addressed
+ *     cells and leaves the rest of the document alone, including when the
+ *     addressed cells are scattered. (Whether those cells are MOUNTED is not a
+ *     question this layer can even ask: it only sees ids, which is the whole
+ *     reason the selection is a model-level set.)
+ *  2. ATOMICITY - each is ONE document write. A loop over the single-cell setters
+ *     serializes + fsyncs + renames the whole `.ipynb` once per cell and walks
+ *     the file through N-1 intermediate states a crash could freeze it in, so the
+ *     write count is pinned, not incidental.
+ *
+ * Each batch still emits the ORDINARY per-cell events (`cell:deleted` /
+ * `cell:moved` / `cell:type`), so every open tab applies patches it already
+ * understands and the batch introduces no new event shape. The move events are
+ * additionally checked to REPLAY into the persisted order - that replay is what
+ * a second tab does.
+ */
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { applyMovePlan } from '../../src/lib/cellSelection';
+
+// Count every `.ipynb` write, so "one user action, one document write" is a
+// PINNED property rather than an incidental one. Hoisted (vitest lifts `vi.mock`
+// above the imports, so the factory cannot close over an ordinary top-level const).
+const { writes } = vi.hoisted(() => ({ writes: [] as string[] }));
+vi.mock('../../src/lib/server/ipynb', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('../../src/lib/server/ipynb')>();
+	return {
+		...actual,
+		writeNotebook: (path: string, doc: Parameters<typeof actual.writeNotebook>[1]) => {
+			writes.push(path);
+			return actual.writeNotebook(path, doc);
+		}
+	};
+});
+
+let WS: string;
+let nbmod: typeof import('../../src/lib/server/notebook');
+let events: typeof import('../../src/lib/server/events');
+
+interface Seen {
+	type: string;
+	cellId?: string;
+	toIndex?: number;
+	cell_type?: string;
+}
+
+let seen: Seen[] = [];
+let unsubscribe: (() => void) | null = null;
+
+beforeAll(async () => {
+	WS = mkdtempSync(join(tmpdir(), 'cellar-bulk-ops-'));
+	process.env.CELLAR_WORKSPACE = WS;
+	nbmod = await import('../../src/lib/server/notebook');
+	events = await import('../../src/lib/server/events');
+});
+
+beforeEach(() => {
+	seen = [];
+	unsubscribe = events.subscribe((ev) => {
+		seen.push(ev as unknown as Seen);
+	});
+});
+
+afterEach(() => {
+	unsubscribe?.();
+	unsubscribe = null;
+});
+
+/** A fresh notebook of `n` code cells `a = 0 … a = n-1`; returns its path + cell ids. */
+function makeNotebook(name: string, n: number): { nb: string; ids: string[] } {
+	const nb = join(WS, name);
+	writeFileSync(
+		nb,
+		JSON.stringify({
+			cells: [{ cell_type: 'code', source: ['x = 0'], metadata: {}, outputs: [], execution_count: null, id: 'seed' }],
+			metadata: {},
+			nbformat: 4,
+			nbformat_minor: 5
+		})
+	);
+	const ids: string[] = [];
+	let after: string | null = null;
+	for (let i = 0; i < n; i++) {
+		after = nbmod.addCell(after, 'code', nb, null, `a = ${i}`).id;
+		ids.push(after);
+	}
+	// Drop the seed so the document is exactly the n cells we made.
+	nbmod.deleteCell('seed', nb);
+	seen = []; // setup events are not the batch's
+	return { nb, ids };
+}
+
+/**
+ * A notebook carrying an nbformat `raw` cell - which Cellar never authors, but an
+ * externally-authored `.ipynb` may, and `ipynb.ts` passes through unchanged.
+ */
+function makeRawNotebook(name: string): { nb: string; ids: string[] } {
+	const nb = join(WS, name);
+	writeFileSync(
+		nb,
+		JSON.stringify({
+			cells: [
+				{ cell_type: 'raw', source: ['raw text'], metadata: {}, id: 'rawcell' },
+				{ cell_type: 'code', source: ['a = 1'], metadata: {}, outputs: [], execution_count: null, id: 'codecell' }
+			],
+			metadata: {},
+			nbformat: 4,
+			nbformat_minor: 5
+		})
+	);
+	const ids = idsOf(nb);
+	seen = [];
+	return { nb, ids };
+}
+
+const sources = (nb: string) => nbmod.listCells(nb).map((c) => c.source);
+const idsOf = (nb: string) => nbmod.listCells(nb).map((c) => c.id);
+
+/** How many `.ipynb` writes `fn` caused. */
+function writeCount(fn: () => void): number {
+	const before = writes.length;
+	fn();
+	return writes.length - before;
+}
+
+describe('addCell - the metadata an undo restore brings back', () => {
+	// The server half of "undo restores a deleted cell EXACTLY". The undo record
+	// carries the cell's whole `cellar` namespace and hands it to the add, so a
+	// restore is ONE persist rather than an add trailed by a PATCH per key - and so a
+	// deleted SQL cell does not come back as a plain Python one.
+	it('seeds the durable `cellar` keys in a single write', () => {
+		const { nb } = makeNotebook('restore-metadata.ipynb', 2);
+		const before = writes.length;
+		const restored = nbmod.addCell(null, 'code', nb, null, 'q = 1', {
+			language: 'sql',
+			role: 'imports',
+			export: true,
+			hide_input: true,
+			output_scrolled: false,
+			hidden_from_agent: true
+		});
+		expect(writes.length - before).toBe(1);
+		expect(nbmod.listCells(nb).find((c) => c.id === restored.id)?.metadata?.cellar).toMatchObject({
+			language: 'sql',
+			role: 'imports',
+			export: true,
+			hide_input: true,
+			output_scrolled: false,
+			hidden_from_agent: true
+		});
+	});
+
+	it('strips the RUNTIME-only records, so a snapshot can never forge a run stamp', () => {
+		// `lastRun` is the sole evidence a cell ran against the LIVE kernel namespace
+		// and may only ever originate from an in-process run; `importBindings` was just
+		// recomputed for the source this cell is born with. Both come off through the
+		// same `stripRuntimeMeta` the disk write uses, so there is no second copy of
+		// that rule to drift.
+		const { nb } = makeNotebook('restore-runtime.ipynb', 2);
+		const restored = nbmod.addCell(null, 'code', nb, null, 'import os', {
+			role: 'imports',
+			lastRun: { at: 1, session: 1, status: 'ok', actor: 'user' },
+			editedAt: 12345,
+			importBindings: { os: { spec: 'import evil', at: 1, sinceAt: 1 } }
+		});
+		const cellar = nbmod.listCells(nb).find((c) => c.id === restored.id)?.metadata?.cellar ?? {};
+		expect(cellar.role).toBe('imports');
+		expect(cellar.lastRun).toBeUndefined();
+		expect(cellar.editedAt).toBeUndefined();
+		// Recomputed by `newCell` for the source it was born with, not the forged one.
+		expect(cellar.importBindings?.os?.spec).toBe('import os');
+	});
+
+	it('drops keys outside the durable allowlist, so a request cannot write junk into the .ipynb', () => {
+		// `clean.ts` keeps the `cellar` namespace WHOLE through a save, so anything
+		// seeded here survives every round trip. The seed therefore copies only the
+		// ENUMERATED durable keys - a key the caller invented is not persisted.
+		const { nb } = makeNotebook('restore-allowlist.ipynb', 2);
+		const restored = nbmod.addCell(null, 'code', nb, null, 'z = 1', {
+			language: 'sql',
+			whatever: { deeply: 'nested' },
+			__proto__polluter: 'no'
+		});
+		const cellar = nbmod.listCells(nb).find((c) => c.id === restored.id)?.metadata?.cellar ?? {};
+		expect(cellar.language).toBe('sql');
+		expect(cellar.whatever).toBeUndefined();
+		expect(cellar.__proto__polluter).toBeUndefined();
+	});
+
+	it('never restores a SECOND imports cell', () => {
+		// One imports cell per notebook is `setCellRole`'s invariant, and this path
+		// writes the namespace directly. A cell deleted while it held the role, the role
+		// re-designated elsewhere, then the delete undone would otherwise leave two -
+		// and every future routed import would go to whichever came first.
+		const { nb } = makeNotebook('restore-imports-role.ipynb', 2);
+		const first = nbmod.addCell(null, 'code', nb, null, 'import os', { role: 'imports' });
+		const second = nbmod.addCell(first.id, 'code', nb, null, 'import sys', { role: 'imports' });
+		const roles = nbmod.listCells(nb).filter((c) => c.metadata?.cellar?.role === 'imports');
+		expect(roles.map((c) => c.id)).toEqual([first.id]);
+		expect(nbmod.listCells(nb).find((c) => c.id === second.id)?.metadata?.cellar?.role).toBeUndefined();
+	});
+
+	it('is a no-op for a caller that passes nothing (or junk)', () => {
+		const { nb } = makeNotebook('restore-none.ipynb', 2);
+		for (const junk of [undefined, null, 'nope', 7, ['a']]) {
+			const cell = nbmod.addCell(null, 'code', nb, null, 'y = 1', junk);
+			expect(nbmod.listCells(nb).find((c) => c.id === cell.id)?.metadata?.cellar?.language).toBeUndefined();
+		}
+	});
+});
+
+describe('deleteCells - bulk delete', () => {
+	it('removes exactly the addressed cells, scattered ones included, and leaves the rest', () => {
+		const { nb, ids } = makeNotebook('bulk-delete.ipynb', 6);
+		const res = nbmod.deleteCells([ids[1], ids[3], ids[4]], nb);
+		expect(res.ok).toBe(true);
+		expect(res.ok && res.removed.slice().sort()).toEqual([ids[1], ids[3], ids[4]].sort());
+		expect(sources(nb)).toEqual(['a = 0', 'a = 2', 'a = 5']);
+	});
+
+	it('emits one ordinary `cell:deleted` per removed cell - no new event shape', () => {
+		const { nb, ids } = makeNotebook('bulk-delete-events.ipynb', 4);
+		nbmod.deleteCells([ids[0], ids[2]], nb);
+		const deleted = seen.filter((e) => e.type === 'cell:deleted').map((e) => e.cellId);
+		expect(deleted).toEqual([ids[0], ids[2]]);
+	});
+
+	it('ignores unknown ids rather than persisting a no-op write', () => {
+		const { nb, ids } = makeNotebook('bulk-delete-unknown.ipynb', 3);
+		expect(nbmod.deleteCells(['nope'], nb)).toEqual({ ok: true, removed: [] });
+		expect(idsOf(nb)).toEqual(ids);
+	});
+
+	// The invariant lives here, not only in the browser: the client compares against
+	// ITS cell count, which is stale while an agent's `cell:deleted` events are in
+	// flight, so only the server can refuse the batch that would empty the document.
+	it('refuses a batch covering every cell - nothing removed, nothing written', () => {
+		const { nb, ids } = makeNotebook('bulk-delete-all.ipynb', 3);
+		let res: ReturnType<typeof nbmod.deleteCells>;
+		const wrote = writeCount(() => {
+			res = nbmod.deleteCells(ids, nb);
+		});
+		expect(res!).toEqual({ ok: false, reason: 'would-empty-notebook' });
+		expect(wrote).toBe(0);
+		expect(idsOf(nb)).toEqual(ids);
+		expect(seen.filter((e) => e.type === 'cell:deleted')).toEqual([]);
+	});
+
+	it('still deletes all but one - the refusal is exactly at the boundary', () => {
+		const { nb, ids } = makeNotebook('bulk-delete-all-but-one.ipynb', 3);
+		const res = nbmod.deleteCells(ids.slice(0, 2), nb);
+		expect(res.ok).toBe(true);
+		expect(idsOf(nb)).toEqual([ids[2]]);
+	});
+});
+
+/**
+ * The singular path is the plural one of size 1, so the invariant holds for EVERY
+ * caller. Guarding only the batch left the identical race open through `DELETE
+ * /api/cells/[id]`: the client's own count is stale while an agent's
+ * `cell:deleted` events are in flight, so a `dd` on what the browser thinks is one
+ * of several would remove the server's LAST cell.
+ */
+describe('deleteCell - the single-cell path shares the invariant', () => {
+	it('refuses the last cell - nothing removed, nothing written, no event', () => {
+		const { nb, ids } = makeNotebook('single-delete-last.ipynb', 1);
+		let res: ReturnType<typeof nbmod.deleteCell>;
+		const wrote = writeCount(() => {
+			res = nbmod.deleteCell(ids[0], nb);
+		});
+		expect(res!).toEqual({ ok: false, reason: 'would-empty-notebook' });
+		expect(wrote).toBe(0);
+		expect(idsOf(nb)).toEqual(ids);
+		expect(seen.filter((e) => e.type === 'cell:deleted')).toEqual([]);
+	});
+
+	it('still deletes down TO one cell, emitting the ordinary event', () => {
+		const { nb, ids } = makeNotebook('single-delete-boundary.ipynb', 2);
+		expect(nbmod.deleteCell(ids[0], nb)).toEqual({ ok: true, removed: [ids[0]] });
+		expect(idsOf(nb)).toEqual([ids[1]]);
+		expect(seen.filter((e) => e.type === 'cell:deleted').map((e) => e.cellId)).toEqual([ids[0]]);
+	});
+
+	it('ignores an unknown id rather than persisting a no-op write', () => {
+		const { nb, ids } = makeNotebook('single-delete-unknown.ipynb', 2);
+		let res: ReturnType<typeof nbmod.deleteCell>;
+		const wrote = writeCount(() => {
+			res = nbmod.deleteCell('nope', nb);
+		});
+		expect(res!).toEqual({ ok: true, removed: [] });
+		expect(wrote).toBe(0);
+		expect(idsOf(nb)).toEqual(ids);
+	});
+});
+
+describe('DELETE /api/cells/[id] - surfaces the refusal', () => {
+	let DELETE: (evt: { params: { id: string }; url: URL }) => Response;
+	beforeAll(async () => {
+		const mod = await import('../../src/routes/api/cells/[id]/+server.js');
+		DELETE = mod.DELETE as unknown as typeof DELETE;
+	});
+
+	function call(id: string, nb: string): Response {
+		return DELETE({ params: { id }, url: new URL(`http://x/api/cells/${id}?nb=${encodeURIComponent(nb)}`) });
+	}
+
+	it('refuses the last cell with a 400 in the same shape as the bulk route', async () => {
+		const { nb, ids } = makeNotebook('route-single-delete-last.ipynb', 1);
+		const before = writes.length;
+		const res = call(ids[0], nb);
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({ ok: false, reason: 'would-empty-notebook' });
+		expect(writes.length).toBe(before);
+		expect(idsOf(nb)).toEqual(ids);
+
+		// …and the boundary: deleting down TO one cell goes through.
+		const two = makeNotebook('route-single-delete-boundary.ipynb', 2);
+		const ok = call(two.ids[0], two.nb);
+		expect(ok.status).toBe(200);
+		expect(idsOf(two.nb)).toEqual([two.ids[1]]);
+	});
+});
+
+describe('setCellTypes - bulk change type', () => {
+	it('converts every addressed cell and clears the outputs of the ones going to markdown', () => {
+		const { nb, ids } = makeNotebook('bulk-type.ipynb', 4);
+		nbmod.setOutputs(ids[1], [{ output_type: 'stream', name: 'stdout', text: 'hi\n' }], nb);
+		expect(nbmod.listCells(nb)[1].outputs).toHaveLength(1);
+
+		const changed = nbmod.setCellTypes([ids[1], ids[3]], 'markdown', nb);
+		expect(changed).toEqual([ids[1], ids[3]]);
+		const cells = nbmod.listCells(nb);
+		expect(cells.map((c) => c.cell_type)).toEqual(['code', 'markdown', 'code', 'markdown']);
+		// The single-cell rule, preserved per cell: markdown carries no outputs.
+		expect(cells[1].outputs).toEqual([]);
+		expect(cells[0].outputs).toEqual([]);
+	});
+
+	it('drops the imports role and the export flag from a cell leaving Python', () => {
+		const { nb, ids } = makeNotebook('bulk-type-roles.ipynb', 3);
+		nbmod.setCellRole(ids[0], 'imports', nb);
+		nbmod.setCellExport(ids[1], true, nb);
+		nbmod.setCellTypes([ids[0], ids[1]], 'markdown', nb);
+		const cells = nbmod.listCells(nb);
+		expect(cells[0].metadata?.cellar?.role).toBeUndefined();
+		expect(cells[1].metadata?.cellar?.export).toBeUndefined();
+	});
+
+	it('round-trips to SQL and back, and skips cells already of that type', () => {
+		const { nb, ids } = makeNotebook('bulk-type-sql.ipynb', 3);
+		expect(nbmod.setCellTypes([ids[0], ids[1]], 'sql', nb)).toEqual([ids[0], ids[1]]);
+		expect(nbmod.listCells(nb)[0].metadata?.cellar?.language).toBe('sql');
+		// Already SQL → nothing to change, so nothing is persisted or emitted.
+		seen = [];
+		expect(nbmod.setCellTypes([ids[0]], 'sql', nb)).toEqual([]);
+		expect(seen.filter((e) => e.type === 'cell:type')).toHaveLength(0);
+		expect(nbmod.setCellTypes([ids[0]], 'code', nb)).toEqual([ids[0]]);
+		expect(nbmod.listCells(nb)[0].metadata?.cellar?.language).toBeUndefined();
+	});
+
+	// A raw cell's LOGICAL type reads as 'code' (nbformat only defines
+	// code/markdown/raw and Cellar treats every non-markdown cell as code), so
+	// skipping on the logical type alone left it raw here while the single-cell
+	// setter - which has no "already" check at all - converted it. Both paths must
+	// answer the same, and the client predicts the batch's count from the same
+	// predicate, so a divergence here also reads as a refused batch.
+	it('converts an nbformat `raw` cell to code, exactly like the single-cell setter', () => {
+		const { nb, ids } = makeRawNotebook('bulk-type-raw.ipynb');
+		expect(nbmod.listCells(nb)[0].cell_type).toBe('raw');
+		expect(nbmod.setCellTypes([ids[0], ids[1]], 'code', nb)).toEqual([ids[0]]);
+		expect(nbmod.listCells(nb)[0].cell_type).toBe('code');
+		expect(seen.filter((e) => e.type === 'cell:type').map((e) => e.cellId)).toEqual([ids[0]]);
+
+		const single = makeRawNotebook('single-type-raw.ipynb');
+		nbmod.setCellType(single.ids[0], 'code', single.nb);
+		expect(nbmod.listCells(single.nb)[0].cell_type).toBe('code');
+	});
+
+	it('emits one ordinary `cell:type` per changed cell', () => {
+		const { nb, ids } = makeNotebook('bulk-type-events.ipynb', 3);
+		nbmod.setCellTypes([ids[0], ids[2]], 'markdown', nb);
+		expect(seen.filter((e) => e.type === 'cell:type').map((e) => e.cellId)).toEqual([ids[0], ids[2]]);
+	});
+});
+
+describe('moveCells - bulk move', () => {
+	it('slides a contiguous block as a unit', () => {
+		const { nb, ids } = makeNotebook('bulk-move-block.ipynb', 5);
+		nbmod.moveCells([ids[2], ids[3]], 'up', nb);
+		expect(sources(nb)).toEqual(['a = 0', 'a = 2', 'a = 3', 'a = 1', 'a = 4']);
+	});
+
+	it('steps a scattered selection one place each, keeping order and gaps', () => {
+		const { nb, ids } = makeNotebook('bulk-move-scattered.ipynb', 5);
+		nbmod.moveCells([ids[1], ids[3]], 'down', nb);
+		expect(sources(nb)).toEqual(['a = 0', 'a = 2', 'a = 1', 'a = 4', 'a = 3']);
+	});
+
+	it('is blocked - and persists nothing - when the selection is against that edge', () => {
+		const { nb, ids } = makeNotebook('bulk-move-edge.ipynb', 4);
+		expect(nbmod.moveCells([ids[0], ids[2]], 'up', nb)).toEqual([]);
+		expect(sources(nb)).toEqual(['a = 0', 'a = 1', 'a = 2', 'a = 3']);
+		expect(seen.filter((e) => e.type === 'cell:moved')).toHaveLength(0);
+	});
+
+	it('emitted `cell:moved` events REPLAY into the persisted order (what a second tab does)', () => {
+		const { nb, ids } = makeNotebook('bulk-move-replay.ipynb', 6);
+		const before = idsOf(nb);
+		nbmod.moveCells([ids[1], ids[2], ids[4]], 'down', nb);
+		const steps = seen
+			.filter((e) => e.type === 'cell:moved')
+			.map((e) => ({ id: e.cellId as string, toIndex: e.toIndex as number }));
+		expect(steps.length).toBeGreaterThan(0);
+		expect(applyMovePlan(before, steps)).toEqual(idsOf(nb));
+	});
+
+	it('ignores ids the notebook does not have', () => {
+		const { nb, ids } = makeNotebook('bulk-move-unknown.ipynb', 3);
+		nbmod.moveCells([ids[2], 'ghost'], 'up', nb);
+		expect(sources(nb)).toEqual(['a = 0', 'a = 2', 'a = 1']);
+	});
+});
+
+describe('atomicity: one user action is one document write', () => {
+	it('a bulk delete of five cells writes the .ipynb ONCE, not five times', () => {
+		const { nb, ids } = makeNotebook('atomic-delete.ipynb', 8);
+		const batched = writeCount(() => nbmod.deleteCells(ids.slice(0, 5), nb));
+		expect(batched).toBe(1);
+
+		// …versus the loop it replaces, on an identical notebook.
+		const other = makeNotebook('atomic-delete-loop.ipynb', 8);
+		const looped = writeCount(() => {
+			for (const id of other.ids.slice(0, 5)) nbmod.deleteCell(id, other.nb);
+		});
+		expect(looped).toBe(5);
+	});
+
+	it('a bulk retype of four cells writes ONCE', () => {
+		const { nb, ids } = makeNotebook('atomic-type.ipynb', 6);
+		expect(writeCount(() => nbmod.setCellTypes(ids.slice(0, 4), 'markdown', nb))).toBe(1);
+	});
+
+	it('a bulk move of a three-cell selection writes ONCE, however many swaps it takes', () => {
+		const { nb, ids } = makeNotebook('atomic-move.ipynb', 8);
+		expect(writeCount(() => nbmod.moveCells([ids[1], ids[3], ids[5]], 'down', nb))).toBe(1);
+	});
+});
+
+/**
+ * The route's own vocabulary. `dir` and `cellType` are validated rather than
+ * coerced because both ops rewrite and persist the user's `.ipynb`: a malformed
+ * request (a client bug, a hand-rolled call) must fail like `no-ids` /
+ * `unknown-op` instead of silently reordering or retyping cells.
+ */
+describe('POST /api/cells/bulk - argument validation', () => {
+	let POST: (evt: { request: Request }) => Promise<Response>;
+	beforeAll(async () => {
+		const mod = await import('../../src/routes/api/cells/bulk/+server.js');
+		POST = mod.POST as unknown as typeof POST;
+	});
+
+	function call(body: unknown): Promise<Response> {
+		return POST({ request: new Request('http://x/api/cells/bulk', { method: 'POST', body: JSON.stringify(body) }) });
+	}
+
+	it('refuses an out-of-vocabulary `dir` with 400 and touches nothing', async () => {
+		const { nb, ids } = makeNotebook('route-bad-dir.ipynb', 3);
+		const before = writes.length;
+		for (const dir of [undefined, 'sideways', 'UP', 1]) {
+			const res = await call({ op: 'move', ids, dir, nb });
+			expect(res.status).toBe(400);
+			expect(await res.json()).toEqual({ ok: false, reason: 'bad-dir' });
+		}
+		expect(writes.length).toBe(before);
+		expect(idsOf(nb)).toEqual(ids);
+	});
+
+	it('refuses an out-of-vocabulary `cellType` with 400 and touches nothing', async () => {
+		const { nb, ids } = makeNotebook('route-bad-type.ipynb', 3);
+		const before = writes.length;
+		for (const cellType of [undefined, 'raw', 'CODE', null]) {
+			const res = await call({ op: 'type', ids, cellType, nb });
+			expect(res.status).toBe(400);
+			expect(await res.json()).toEqual({ ok: false, reason: 'bad-cell-type' });
+		}
+		expect(writes.length).toBe(before);
+		expect(nbmod.listCells(nb).map((c) => c.cell_type)).toEqual(['code', 'code', 'code']);
+	});
+
+	it('surfaces the empty-notebook refusal as a 400 in the same shape', async () => {
+		const { nb, ids } = makeNotebook('route-delete-all.ipynb', 3);
+		const before = writes.length;
+		const res = await call({ op: 'delete', ids, nb });
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({ ok: false, reason: 'would-empty-notebook' });
+		expect(writes.length).toBe(before);
+		expect(idsOf(nb)).toEqual(ids);
+
+		// …and the boundary: all-but-one goes through.
+		const ok = await call({ op: 'delete', ids: ids.slice(0, 2), nb });
+		expect(ok.status).toBe(200);
+		expect((await ok.json()).removed).toHaveLength(2);
+		expect(idsOf(nb)).toEqual([ids[2]]);
+	});
+
+	it('still accepts every valid vocabulary word', async () => {
+		const { nb, ids } = makeNotebook('route-good.ipynb', 3);
+		expect((await (await call({ op: 'move', ids: [ids[0]], dir: 'down', nb })).json()).moved).toHaveLength(1);
+		expect((await (await call({ op: 'move', ids: [ids[0]], dir: 'up', nb })).json()).moved).toHaveLength(1);
+		for (const cellType of ['markdown', 'sql', 'code']) {
+			expect((await (await call({ op: 'type', ids: [ids[1]], cellType, nb })).json()).changed).toEqual([ids[1]]);
+		}
+	});
+});

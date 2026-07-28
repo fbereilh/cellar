@@ -159,7 +159,7 @@ Everything you'd expect from a notebook, plus the things that make sharing one w
 - **Interactive DataFrame grid**: pandas frames become a sortable, filterable, paginated table instead of a static repr.
 - **Run metadata** on every cell: when it last ran, how long it took, and who ran it (you or an agent).
 - **Checkpoints and undo** for agent actions - snapshot before a risky change and roll back.
-- **Command palette** and Jupyter-style modal keyboard shortcuts for fast navigation.
+- **Command palette** and Jupyter-style modal keyboard shortcuts for fast navigation, including **multi-cell selection**: `Shift`-click (or `Shift-J`/`Shift-K`) for a range, `Cmd`/`Ctrl`-click to pick out cells that aren't neighbours, `Cmd`/`Ctrl-A` for all of them - then delete, move, cut, copy, or change the type of the whole selection in one action.
 - **Find in notebook** with `Ctrl`/`Cmd-F` - search across cell source, rendered markdown, and outputs (with regex), and jump between highlighted matches.
 - **Variable and DataFrame inspection** to peek into the live kernel namespace.
 - **Git blame and diff gutters** right in the editor, and per-cell change bars in the notebook.

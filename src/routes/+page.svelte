@@ -19,6 +19,7 @@
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState';
 	import { resolveVirtualize, VIRTUALIZE_PREF_KEY } from '$lib/virtualizePref';
 	import { relativeTimeLong } from '$lib/relativeTime';
+	import { createNoticeChannel } from '$lib/notice.svelte';
 	import type { PageData } from './$types';
 	import type { Cell } from '$lib/server/types';
 	import type {
@@ -138,6 +139,16 @@
 	let notebooksRunState = $state<Record<string, { runningId: string | null; queued: Record<string, number> }>>({});
 	function handleRunStateChange(path: string, runningId: string | null, queued: Record<string, number>) {
 		notebooksRunState[path] = { runningId, queued };
+	}
+	// How many cells each open notebook has selected. The footer reports the ACTIVE
+	// notebook's, because that is the one place a multi-cell selection stays legible:
+	// the selection reaches past the viewport (windowing means most of its members
+	// may have no DOM at all), so the per-cell accent rails alone cannot say how big
+	// it is, and anything rendered inside the notebook scrolls away with it. Assign
+	// into the key rather than rebuilding the map, like `notebooksRunState`.
+	let notebooksSelection = $state<Record<string, number>>({});
+	function handleSelectionChange(path: string, count: number) {
+		notebooksSelection[path] = count;
 	}
 	// Imperative, not reactive: a plain map of path → the notebook's fold API
 	// ({toggle, collapseAll, expandAll}). The Outline drives every fold through this.
@@ -263,8 +274,13 @@
 	$effect(() => {
 		searchHighlight.notebookPath = findOpen ? activeNotebookPath : null;
 	});
-	// Transient, dismissable status line (jupytext env not ready, convert result, …).
-	let notice = $state('');
+	// Transient, dismissable status line (jupytext env not ready, convert progress
+	// and result, a notebook action the document invariants refused, …). The channel
+	// owns the auto-dismiss + repeat-nonce rules, so a `{sticky:true}` caller is the
+	// only thing that has to know it is posting progress rather than an outcome.
+	const notices = createNoticeChannel();
+	const showNotice = notices.show;
+	const clearNotice = notices.dismiss;
 	let theme = $state('dim');
 	// Follow-the-running-cell preference (default on). A viewer preference, not a
 	// notebook document property, so it lives in the per-project UI-state store
@@ -389,6 +405,8 @@
 					: null
 	);
 	const activeCells = $derived((activeNotebookPath && notebooksCells[activeNotebookPath]) || []);
+	/** The active notebook's multi-cell selection size (1 = an ordinary single selection). */
+	const activeSelectionCount = $derived((activeNotebookPath && notebooksSelection[activeNotebookPath]) || 0);
 	// The active notebook's search-text cache (registered by its LiveNotebook),
 	// handed to the sidebar Search so it runs the shared engine over it.
 	const activeSearchCache = $derived(
@@ -511,7 +529,7 @@
 				const b = await res.json();
 				kind = b.notebook && b.ready ? 'ipynb' : 'file';
 				if (b.notebook && !b.ready && b.message) {
-					notice = `Open as notebook needs jupytext: ${b.message}`;
+					showNotice(`Open as notebook needs jupytext: ${b.message}`);
 				}
 			}
 		} catch {}
@@ -791,14 +809,14 @@
 	async function exportPy() {
 		const api = activeNotebookApi();
 		if (!api) return;
-		notice = '';
+		clearNotice();
 		const r = await api.exportPy();
-		if (!r) notice = 'Export to .py failed.';
-		else if (r.reason === 'no-target') notice = 'Set a target .py path at the top of the notebook first.';
-		else if (r.reason === 'no-cells') notice = 'No cells are marked for export - use a cell’s ⋮ menu.';
+		if (!r) showNotice('Export to .py failed.');
+		else if (r.reason === 'no-target') showNotice('Set a target .py path at the top of the notebook first.');
+		else if (r.reason === 'no-cells') showNotice('No cells are marked for export - use a cell’s ⋮ menu.');
 		else {
 			fsRefreshSignal++; // a new/updated .py on disk → refresh the tree + git decorations
-			notice = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`;
+			showNotice(`Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`);
 		}
 	}
 
@@ -832,7 +850,7 @@
 	async function doSaveAsPy() {
 		if (saveAsPyBusy || !activeNotebookPath) return;
 		saveAsPyBusy = true;
-		notice = '';
+		clearNotice();
 		try {
 			const res = await fetch('/api/notebooks/jupytext', {
 				method: 'POST',
@@ -843,9 +861,9 @@
 			if (!res.ok) throw new Error(body?.message || 'export failed');
 			saveAsPyOpen = false;
 			fsRefreshSignal++; // a new file on disk → refresh the tree + git decorations
-			notice = `Saved ${body.path} (${body.format}).`;
+			showNotice(`Saved ${body.path} (${body.format}).`);
 		} catch (err) {
-			notice = `Save as .py failed: ${(err as Error)?.message ?? err}`;
+			showNotice(`Save as .py failed: ${(err as Error)?.message ?? err}`);
 		} finally {
 			saveAsPyBusy = false;
 		}
@@ -858,7 +876,12 @@
 		const source = activeTab.path;
 		const target = source.replace(/\.py$/i, '.ipynb');
 		converting = true;
-		notice = 'Converting: running all cells…';
+		// Progress, not a result: this runs EVERY cell of the notebook and can take
+		// minutes, so it must stay up until the outcome below replaces it. The only
+		// other signal is the app-menu spinner, inside a `:focus-within` dropdown the
+		// user has usually clicked away from - so a timeout here leaves them with no
+		// indication anything is in flight.
+		showNotice('Converting: running all cells…', { sticky: true });
 		try {
 			const res = await fetch('/api/notebooks/jupytext', {
 				method: 'POST',
@@ -869,10 +892,10 @@
 			if (!res.ok) throw new Error(body?.message || 'convert failed');
 			fsRefreshSignal++;
 			const r = body.ran ?? {};
-			notice = `Converted to ${body.path} — ran ${r.ok ?? 0}/${r.total ?? 0} cells${r.errors ? `, ${r.errors} with errors` : ''}.`;
+			showNotice(`Converted to ${body.path} — ran ${r.ok ?? 0}/${r.total ?? 0} cells${r.errors ? `, ${r.errors} with errors` : ''}.`);
 			await openFilePermanent(body.path);
 		} catch (err) {
-			notice = `Convert failed: ${(err as Error)?.message ?? err}`;
+			showNotice(`Convert failed: ${(err as Error)?.message ?? err}`);
 		} finally {
 			converting = false;
 		}
@@ -904,9 +927,9 @@
 				body: JSON.stringify({ path: activeNotebookPath, action: 'create' })
 			});
 			const body = await res.json().catch(() => ({}));
-			notice = res.ok ? 'Checkpoint saved.' : `Checkpoint failed: ${body?.message ?? ''}`;
+			showNotice(res.ok ? 'Checkpoint saved.' : `Checkpoint failed: ${body?.message ?? ''}`);
 		} catch (err) {
-			notice = `Checkpoint failed: ${(err as Error)?.message ?? err}`;
+			showNotice(`Checkpoint failed: ${(err as Error)?.message ?? err}`);
 		}
 	}
 
@@ -919,11 +942,11 @@
 				body: JSON.stringify({ path: activeNotebookPath, action: 'undo-agent', originId })
 			});
 			const body = await res.json().catch(() => ({}));
-			if (!res.ok) notice = `Undo failed: ${body?.message ?? ''}`;
-			else if (body.ok) notice = 'Reverted to the last automatic checkpoint.';
-			else notice = 'Nothing to undo - no agent action has been checkpointed yet.';
+			if (!res.ok) showNotice(`Undo failed: ${body?.message ?? ''}`);
+			else if (body.ok) showNotice('Reverted to the last automatic checkpoint.');
+			else showNotice('Nothing to undo - no agent action has been checkpointed yet.');
 		} catch (err) {
-			notice = `Undo failed: ${(err as Error)?.message ?? err}`;
+			showNotice(`Undo failed: ${(err as Error)?.message ?? err}`);
 		}
 	}
 
@@ -1459,6 +1482,8 @@
 						onNumberingChange={handleNumberingChange}
 						onHideAllCodeChange={handleHideAllCodeChange}
 						onRunStateChange={handleRunStateChange}
+						onSelectionChange={handleSelectionChange}
+						onNotice={showNotice}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
@@ -1485,6 +1510,8 @@
 						onNumberingChange={handleNumberingChange}
 						onHideAllCodeChange={handleHideAllCodeChange}
 						onRunStateChange={handleRunStateChange}
+						onSelectionChange={handleSelectionChange}
+						onNotice={showNotice}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
@@ -1592,7 +1619,19 @@
 			</span>
 		{/if}
 
-		<span class="font-mono">{activeCells.length} cells</span>
+		<!-- Notebook counts, grouped at the right end: the multi-cell selection size
+		     (only while there IS one) beside the cell count it is a fraction of. The
+		     footer is where it belongs because a selection can reach far past the
+		     viewport - under windowing most of its cells may have no DOM at all -
+		     so anything rendered inside the notebook scrolls away from it. -->
+		<div class="flex shrink-0 items-center gap-3">
+			{#if activeSelectionCount > 1}
+				<span class="font-mono text-primary" data-testid="selection-count" aria-live="polite">
+					{activeSelectionCount} selected
+				</span>
+			{/if}
+			<span class="font-mono">{activeCells.length} cells</span>
+		</div>
 	</footer>
 </div>
 
@@ -1664,17 +1703,41 @@
 	</div>
 {/if}
 
-<!-- Transient status line for jupytext actions (dismissable). -->
-{#if notice}
-	<div class="toast toast-end toast-bottom z-[100]" data-testid="jupytext-notice">
-		<div class="alert alert-info max-w-md text-sm shadow-lg">
-			<span class="min-w-0 break-words">{notice}</span>
-			<button class="btn btn-ghost btn-xs btn-square" onclick={() => (notice = '')} aria-label="Dismiss">✕</button>
+<!-- Transient status line for app-level actions and refusals (auto-dismissing
+     unless the caller marked it progress, and dismissable early either way).
+     Keyed on the nonce, not on the text: repeating an action that was refused must
+     re-show the toast, and re-rendering the same string would change nothing on
+     screen. -->
+{#if notices.message}
+	{#key notices.seq}
+		<div
+			class="toast toast-end toast-bottom z-[100]"
+			data-testid="app-notice"
+			data-seq={notices.seq}
+			data-sticky={notices.sticky}
+		>
+			<div class="alert alert-info cellar-notice max-w-md text-sm shadow-lg">
+				<span class="min-w-0 break-words">{notices.message}</span>
+				<button class="btn btn-ghost btn-xs btn-square" onclick={clearNotice} aria-label="Dismiss">✕</button>
+			</div>
 		</div>
-	</div>
+	{/key}
 {/if}
 
 <style>
+	.cellar-notice {
+		animation: cellar-notice-in 200ms ease-out;
+	}
+	@keyframes cellar-notice-in {
+		from {
+			opacity: 0.3;
+			transform: translateY(6px);
+		}
+		to {
+			opacity: 1;
+			transform: none;
+		}
+	}
 	:global(.cellar-flash) {
 		animation: cellar-flash 1.2s ease-out;
 	}

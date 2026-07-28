@@ -10,9 +10,25 @@
 
 import type { Cell } from '$lib/server/types';
 import type { Match } from '$lib/search';
+import type { SelectionGesture } from '$lib/cellSelection';
 
 /** Jupyter-style modal keyboard mode for the notebook. */
 export type KeyMode = 'command' | 'edit';
+
+/**
+ * How a cell asked to become the selected one.
+ *
+ * `extend`/`toggle` are the Shift and Cmd/Ctrl gestures the pure selection
+ * algebra understands ({@link SelectionGesture}). `fromFocus` is the browser
+ * layer's own bit: it marks the `focusin` that FOLLOWS a selection rather than
+ * making one. A plain pointerdown always collapses the selection to the clicked
+ * cell, but the focus a modifier click (or a keyboard selection) then places
+ * fires `focusin` with no modifiers - and collapsing there would undo the very
+ * range that was just built one event earlier.
+ */
+export interface CellActivation extends SelectionGesture {
+	fromFocus?: boolean;
+}
 
 /**
  * A remote (agent / other-tab) source edit handed to a live `Cell` via

@@ -144,6 +144,43 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		category: 'Navigation',
 		description: 'Select the cell below'
 	},
+	// Multi-cell selection. The head moves one cell; the contiguous range from the
+	// anchor to the head becomes the selection ($lib/cellSelection). `Shift-j` /
+	// `Shift-k` shadow a typable character, but only in command mode - exactly where
+	// bare letters belong - so `typingHazards` correctly reports none.
+	{
+		id: 'extend-select-prev',
+		keys: ['Shift-ArrowUp', 'Shift-k'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Extend the selection to the cell above'
+	},
+	{
+		id: 'extend-select-next',
+		keys: ['Shift-ArrowDown', 'Shift-j'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Extend the selection to the cell below'
+	},
+	{
+		id: 'select-all-cells',
+		keys: ['Mod-a'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Select every cell'
+	},
+	{
+		// Command mode's Escape. `command-mode` also binds Escape but in EDIT mode, and
+		// two modes that cannot be active together cannot collide (`modesOverlap`).
+		// The action declines the keystroke (returns NOT HANDLED) when there is no
+		// multi-selection to collapse, so Escape still reaches the app's other
+		// listeners - the notebook dispatcher is a capture-phase window listener.
+		id: 'clear-selection',
+		keys: ['Escape'],
+		mode: 'command',
+		category: 'Navigation',
+		description: 'Collapse a multi-cell selection to the selected cell'
+	},
 	{
 		id: 'fold-section',
 		keys: ['ArrowLeft', 'h'],
@@ -179,14 +216,14 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		keys: ['Mod-Shift-ArrowUp'],
 		mode: 'global',
 		category: 'Structure',
-		description: 'Move the selected cell up'
+		description: 'Move the selection up'
 	},
 	{
 		id: 'move-cell-down',
 		keys: ['Mod-Shift-ArrowDown'],
 		mode: 'global',
 		category: 'Structure',
-		description: 'Move the selected cell down'
+		description: 'Move the selection down'
 	},
 	{
 		id: 'insert-above',
@@ -207,14 +244,14 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		keys: ['m'],
 		mode: 'command',
 		category: 'Structure',
-		description: 'Change the selected cell to Markdown'
+		description: 'Change the selected cell(s) to Markdown'
 	},
 	{
 		id: 'to-code',
 		keys: ['y'],
 		mode: 'command',
 		category: 'Structure',
-		description: 'Change the selected cell to code'
+		description: 'Change the selected cell(s) to code'
 	},
 
 	// ---- Editing -----------------------------------------------------------
@@ -223,7 +260,7 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		keys: ['d d'],
 		mode: 'command',
 		category: 'Editing',
-		description: 'Delete the selected cell (press d twice)'
+		description: 'Delete the selected cell(s) (press d twice)'
 	},
 	{
 		id: 'undo-delete',
@@ -237,14 +274,14 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		keys: ['x'],
 		mode: 'command',
 		category: 'Editing',
-		description: 'Cut the selected cell'
+		description: 'Cut the selected cell(s)'
 	},
 	{
 		id: 'copy-cell',
 		keys: ['c'],
 		mode: 'command',
 		category: 'Editing',
-		description: 'Copy the selected cell'
+		description: 'Copy the selected cell(s)'
 	},
 	{
 		id: 'paste-below',
