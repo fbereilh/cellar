@@ -24,6 +24,18 @@ emitter.setMaxListeners(0);
 const seqs = new Map<string, number>(); // canonical notebook id (absolute path) -> last seq
 
 /**
+ * The last `seq` stamped for a notebook (0 before its first event). A CURSOR
+ * primitive: a consumer that wants "everything that happened since I last
+ * looked" snapshots this, does its work, and later asks for the events in
+ * between - which is exactly what the MCP user-activity digest
+ * (`mcp/userActivity.ts`) does around every tool call. Reading it is O(1) and
+ * publishes nothing.
+ */
+export function currentSeq(nb: string): number {
+	return seqs.get(nb) ?? 0;
+}
+
+/**
  * The full SSE frame for a dispatched event — computed ONCE here, then fanned out
  * to every subscriber. A runaway cell that emits many events would otherwise
  * `JSON.stringify` the same event once per open tab; serializing once and sharing

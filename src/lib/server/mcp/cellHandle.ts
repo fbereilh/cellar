@@ -22,7 +22,28 @@
  */
 
 /** The floor length for a handle; a UUID prefix this short is essentially always unique. */
-const MIN_HANDLE = 8;
+export const MIN_HANDLE = 8;
+
+/**
+ * Why a cell reference could not be resolved, as a CODE rather than only prose.
+ *
+ * The three failures call for different responses and a caller must be able to
+ * tell them apart WITHOUT matching on the message text: `not_found` is the one
+ * the MCP boundary enriches with a "the user deleted this cell" note when the id
+ * is in the notebook's tombstone registry (`userActivity.ts`), while `ambiguous`
+ * names a live collision that a deletion note would misdescribe. Message strings
+ * are unchanged, so nothing that only reads `.message` is affected.
+ */
+export type CellRefFailure = 'empty' | 'ambiguous' | 'not_found';
+
+export class CellRefError extends Error {
+	readonly code: CellRefFailure;
+	constructor(message: string, code: CellRefFailure) {
+		super(message);
+		this.name = 'CellRefError';
+		this.code = code;
+	}
+}
 
 /** Map each cell's full id to its short handle (shortest unique prefix >= 8). */
 export function computeHandles(cells: ReadonlyArray<{ id: string }>): Map<string, string> {
@@ -56,7 +77,7 @@ export function computeHandles(cells: ReadonlyArray<{ id: string }>): Map<string
  */
 export function resolveCellId(cells: ReadonlyArray<{ id: string }>, ref: string): string {
 	const r = (ref ?? '').trim();
-	if (!r) throw new Error('a cell id is required');
+	if (!r) throw new CellRefError('a cell id is required', 'empty');
 	// A full-id exact match wins outright, so a caller holding a whole UUID is
 	// unaffected even in the (impossible-in-practice) case that it also prefixes another id.
 	const exact = cells.find((c) => c.id === r);
@@ -64,9 +85,13 @@ export function resolveCellId(cells: ReadonlyArray<{ id: string }>, ref: string)
 	const matches = cells.filter((c) => c.id.startsWith(r));
 	if (matches.length === 1) return matches[0].id;
 	if (matches.length > 1) {
-		throw new Error(
-			`ambiguous cell id "${r}" — it matches ${matches.length} cells; pass more characters or the full id`
+		throw new CellRefError(
+			`ambiguous cell id "${r}" — it matches ${matches.length} cells; pass more characters or the full id`,
+			'ambiguous'
 		);
 	}
-	throw new Error(`no cell matches id "${r}" — use get_notebook_map to see current cell handles`);
+	throw new CellRefError(
+		`no cell matches id "${r}" — use get_notebook_map to see current cell handles`,
+		'not_found'
+	);
 }

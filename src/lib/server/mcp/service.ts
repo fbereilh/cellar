@@ -53,6 +53,7 @@ import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMim
 import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } from './image';
 import { autoCheckpointBeforeAgentAction, createCheckpoint, type CheckpointMeta } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
+import { forgetSessionActivity } from './userActivity';
 import type { CellView, CellOutput, SessionId, LogicalCellType, QueueState } from '../types';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
@@ -142,10 +143,10 @@ function isPinned(sessionId?: string | null): boolean {
 
 /**
  * Drop ALL per-session state for an ended MCP session (its transport closed, or
- * the idle reaper reclaimed it). Today the only session-keyed state in the
- * service layer is the pinned working notebook; this is the single place the
- * session lifecycle (server.ts) calls to release it, so anything else keyed by
- * `sessionId` added later must be cleared here too.
+ * the idle reaper reclaimed it). Session-keyed state today is the pinned working
+ * notebook here, plus the user-activity digest cursor in `userActivity.ts`; this
+ * is the single place the session lifecycle (server.ts) calls to release it, so
+ * anything else keyed by `sessionId` added later must be cleared here too.
  *
  * Deliberately SHARED-RESOURCE-SAFE: it forgets only this session's pin. The
  * notebook document and its per-notebook kernel are shared across sessions and
@@ -155,6 +156,7 @@ function isPinned(sessionId?: string | null): boolean {
  */
 export function forgetSession(sessionId: string): void {
 	sessionNotebooks.delete(sessionId);
+	forgetSessionActivity(sessionId);
 }
 
 /**

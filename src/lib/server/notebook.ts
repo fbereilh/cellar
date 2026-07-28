@@ -1026,15 +1026,22 @@ export type DeleteCellsResult =
 export function deleteCells(ids: readonly string[], nb?: string | null, originId?: string | null): DeleteCellsResult {
 	const doc = docFor(nb);
 	const wanted = new Set(ids);
-	const removed = doc.cells.filter((c) => wanted.has(c.id)).map((c) => c.id);
+	const going = doc.cells.filter((c) => wanted.has(c.id));
+	const removed = going.map((c) => c.id);
 	if (!removed.length) return { ok: true, removed: [] };
 	if (emptiesNotebook(doc, removed)) return { ok: false, reason: 'would-empty-notebook' };
+	// Whether each cell was hidden from the agent, captured BEFORE it leaves the
+	// document: `cell:deleted` is emitted after the splice, so a subscriber can no
+	// longer look the cell up, and the MCP tombstone registry must know not to
+	// disclose a hidden cell's deletion (`mcp/userActivity.ts`). Only ever `true`,
+	// so the ordinary event is byte-identical to before.
+	const hidden = new Map(going.map((c) => [c.id, c.metadata?.cellar?.hidden_from_agent === true]));
 	doc.cells = doc.cells.filter((c) => !wanted.has(c.id));
 	persist(doc);
 	for (const id of removed) {
 		// A deleted cell must not later dequeue and run.
 		cancelRun(doc.path, id);
-		emit(doc, 'cell:deleted', { cellId: id }, originId);
+		emit(doc, 'cell:deleted', { cellId: id, ...(hidden.get(id) ? { hiddenFromAgent: true } : {}) }, originId);
 	}
 	return { ok: true, removed };
 }
