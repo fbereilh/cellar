@@ -580,8 +580,7 @@ test('toggling the primary OUT mounts the survivor, so the keyboard still acts o
 		.poll(
 			() =>
 				page.evaluate(
-					(id) => document.activeElement?.closest('[data-testid="cell"]')?.getAttribute('data-cell-id') ?? null,
-					survivor
+					() => document.activeElement?.closest('[data-testid="cell"]')?.getAttribute('data-cell-id') ?? null
 				),
 			{ timeout: 10_000 }
 		)
