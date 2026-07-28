@@ -117,16 +117,32 @@
  * specificity: `:has()` takes the specificity of its most specific argument, and
  * every argument here is a type selector.
  *
- * KNOWN LIMIT, accepted deliberately: that escape keys off BLOCK-level content
- * only, so a label/value layout table whose cells hold bare inline text (the
- * shape some libraries' `_repr_html_` emits - statsmodels' `summary()`, dask's
- * array summary, pint, awkward) takes no escape and reads right-aligned. That is
- * the alignment half of the scope note above. Widening the signal with a
- * content-length heuristic was considered and REJECTED: it misfires in both
- * directions (a long id or numeric value wrongly left-aligned, a short label
- * still right-aligned). Right-align is the pandas numeric convention and the
- * intended default, and any library can style its own table - which rule 1
- * guarantees will win. Do not add a heuristic here.
+ * KNOWN LIMIT, accepted deliberately: the escape is a HARDCODED ALLOWLIST of
+ * block tags (`p,div,ul,ol,pre,table,h1..h6`), not a general test for block-level
+ * content, so it misfires in BOTH directions:
+ *
+ *   • UNDER-reach: a layout table whose prose cells use a block element that is
+ *     NOT on that list (`blockquote`, `section`, `figure`, `article`, `dl`) takes
+ *     no escape and reads ragged-right - and so does a label/value layout table
+ *     whose cells hold bare inline text at all (the shape some libraries'
+ *     `_repr_html_` emits - statsmodels' `summary()`, dask's array summary, pint,
+ *     awkward). That second case is the alignment half of the scope note above.
+ *
+ *   • OVER-reach: a genuine DATA cell that wraps its value in a `<div>` or
+ *     `<pre>` - the shape some nested HTML reprs emit, xarray/dask style - takes
+ *     the escape and silently loses the numeric right-align this block exists to
+ *     supply.
+ *
+ * Both are cosmetic and both are fully overridable (rule 1 guarantees an explicit
+ * user or library rule wins), which is why the allowlist is deliberately left
+ * exactly as it is rather than grown: adding the missing block tags would only
+ * widen the under-reach half and would leave the over-reach half untouched.
+ * Widening the signal with a content-length heuristic was considered and
+ * REJECTED for the same reason, more sharply: it misfires in both directions too
+ * (a long id or numeric value wrongly left-aligned, a short label still
+ * right-aligned). Right-align is the pandas numeric convention and the intended
+ * default, and any library can style its own table - which rule 1 guarantees will
+ * win. Do not add a heuristic here.
  *
  * Surface note: this block only reaches *rich `text/html`* outputs. A plain
  * DataFrame renders through the native `DataFrameGrid` (structured

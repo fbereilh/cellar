@@ -240,6 +240,19 @@ describe('HtmlOutput.svelte', () => {
 		expect(COMPONENT).toContain('${reportedHeight.toString()}');
 	});
 
+	// Evaluated from its SERIALIZED TEXT, in a scope holding no module bindings -
+	// which is exactly the srcdoc's condition, and exactly what a direct call
+	// cannot check. A free identifier in the body would still satisfy every other
+	// assertion here (the arithmetic tests above call the live function, where the
+	// binding resolves), and at runtime it throws a ReferenceError inside `send()`
+	// that the reporter's own `catch(e){}` swallows: no height is ever posted and
+	// every rich text/html output silently renders at the 120px default. The e2e
+	// that would catch it is deliberately outside CI and the no-mistakes gate.
+	it('is self-contained once serialized - no module-scope references', () => {
+		const deserialized = new Function('return ' + reportedHeight.toString())();
+		expect(deserialized(420, 1600, 800, 300, 285)).toBe(435);
+	});
+
 	// ARGUMENT ORDER is what this pins, not merely that the call exists. The
 	// arguments are five same-typed numbers, so `scrollWidth` and `clientWidth`
 	// swapping places still compiles and still type-checks - and it INVERTS
