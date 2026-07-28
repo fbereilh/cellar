@@ -393,10 +393,22 @@ test('a Shift+click in rendered markdown extends the TEXT selection, never the c
 	await prose.click({ position: { x: Math.round(Math.min(220, box!.width - 8)), y: 6 }, modifiers: ['Shift'] });
 
 	expect(await page.evaluate(() => (window.getSelection()?.toString() ?? '').trim().length)).toBeGreaterThan(0);
-	// And the press is NOT a range gesture: it behaves exactly like the plain click
-	// on the same spot would - it may make that cell the primary, but it never
-	// re-ranges the selection from the anchor.
+	// And the press is NOT a range gesture: it never re-ranges the selection from the
+	// anchor. The plain click that preceded it collapsed to this cell, as it always
+	// has.
 	await expect(page.getByTestId('selection-count')).toHaveCount(0);
+
+	// But it must not COLLAPSE one either, which is the other half of exempting it:
+	// the press belongs to the native text gesture, so it is not a cell-selection
+	// gesture at all, and Shift+dragging across part of a traceback used to discard a
+	// five-cell selection on its way past. With a multi-cell selection standing and
+	// this cell in it, the same press leaves the set alone.
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+	await prose.click({ position: { x: Math.round(Math.min(220, box!.width - 8)), y: 6 }, modifiers: ['Shift'] });
+	await page.waitForTimeout(200);
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+
 	await page.keyboard.press('Escape');
 });
 
@@ -591,6 +603,91 @@ test('a REFUSED bulk delete leaves no undo group, so `z` cannot duplicate cells'
 	expect(await serverOrder(page)).toEqual(before);
 });
 
+test('undo restores a deleted cell EXACTLY - language, role, export and hide_input', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openNotebook(page, '0');
+
+	// Undo is the one path where a user expects exact restoration, and the undo
+	// record used to carry the CLIPBOARD's shape (type + source + output_scrolled),
+	// so everything in the `cellar` namespace was silently dropped: ten deleted SQL
+	// cells came back as ten plain Python cells, and an imports cell / an
+	// export-marked cell lost its designation. Bulk delete is what turned that from
+	// a one-cell annoyance into a ten-cell one.
+	// Fold state is persisted per notebook and this file shares one workspace, so an
+	// earlier test's collapsed section would otherwise decide what is clickable.
+	await clickCell(page, (await visibleCellIds(page))[0]);
+	await page.keyboard.press('Shift+ArrowRight');
+	await page.waitForTimeout(300);
+
+	// Two ADJACENT code cells, both on screen: the imports role and the export flag
+	// are Python-code-only (a markdown cell cannot hold either), and the selection is
+	// built by clicking one and Shift+J-ing onto the next.
+	const order = await serverOrder(page);
+	const cells = await serverCells(page);
+	const visible = new Set(await visibleCellIds(page));
+	const at = order.findIndex(
+		(id, i) =>
+			i > 0 &&
+			cells[i]?.cell_type === 'code' &&
+			cells[i + 1]?.cell_type === 'code' &&
+			visible.has(id) &&
+			visible.has(order[i + 1])
+	);
+	expect(at).toBeGreaterThan(0);
+	const [sqlId, markedId] = [order[at], order[at + 1]];
+
+	await page.evaluate(
+		async ({ nb, sqlId, markedId }) => {
+			await fetch('/api/cells/bulk', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ op: 'type', ids: [sqlId], cellType: 'sql', nb })
+			});
+			await fetch(`/api/cells/${markedId}`, {
+				method: 'PATCH',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ role: 'imports', export: true, hideInput: true, nb })
+			});
+		},
+		{ nb: NB, sqlId, markedId }
+	);
+
+	// Reload so the browser model carries the metadata the snapshot has to capture.
+	await openNotebook(page, '0');
+	const meta = () =>
+		page.evaluate(async (nb) => {
+			const res = await fetch(`/api/notebooks?path=${encodeURIComponent(nb)}`);
+			const body = await res.json();
+			return (body.notebook.cells as { id: string; cell_type: string; metadata?: { cellar?: Record<string, unknown> } }[]).map(
+				(c) => ({ id: c.id, cell_type: c.cell_type, cellar: c.metadata?.cellar ?? {} })
+			);
+		}, NB);
+	const before = await meta();
+	expect(before.find((c) => c.id === sqlId)?.cellar.language).toBe('sql');
+	expect(before.find((c) => c.id === markedId)?.cellar).toMatchObject({ role: 'imports', export: true, hide_input: true });
+
+	await clickCell(page, sqlId);
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+	await page.keyboard.press('d');
+	await page.keyboard.press('d');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(order.length - 2);
+
+	await page.keyboard.press('z');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(order.length);
+
+	// Both cells are back in place, and back as what they WERE. The ids are fresh
+	// (a restore re-adds rather than resurrecting), so identity is by position.
+	const after = await meta();
+	expect(after[at].cellar.language).toBe('sql');
+	expect(after[at + 1].cellar).toMatchObject({ role: 'imports', export: true, hide_input: true });
+	// …and the runtime-only records are NOT forged back: `lastRun` is the sole
+	// evidence a cell ran against the LIVE kernel namespace, so it may only ever
+	// originate from an in-process run, never from a client-supplied snapshot.
+	expect(after[at].cellar.lastRun).toBeUndefined();
+	expect(after[at + 1].cellar.lastRun).toBeUndefined();
+});
+
 test('a delete covering every cell is refused - and SAYS why instead of doing nothing', async ({ page }) => {
 	test.setTimeout(120_000);
 	await openWindowed(page);
@@ -628,6 +725,62 @@ test('a delete covering every cell is refused - and SAYS why instead of doing no
 
 	// It takes itself down; a refusal the user will retry must not need dismissing.
 	await expect(page.getByTestId('app-notice')).toHaveCount(0, { timeout: 15_000 });
+	await page.keyboard.press('Escape');
+});
+
+test('a refusal the client did NOT predict says why too, and only when the server said so', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openNotebook(page, '0');
+	const before = await serverOrder(page);
+
+	// The client's own guard compares against ITS cell list, which is stale for as
+	// long as an agent's `cell:deleted` events are in flight - so the server can
+	// legitimately refuse a delete the browser already rendered as gone. The recovery
+	// is a refetch, and a refetch ALONE is the same silent refusal the keystroke path
+	// was fixed for: the cells simply reappear, with nothing to explain them (the
+	// events that would are echo-suppressed, carrying this tab's own `originId`).
+	await page.route('**/api/cells/bulk', (route) =>
+		route.fulfill({ status: 400, json: { ok: false, reason: 'would-empty-notebook' } })
+	);
+	const start = (await visibleCellIds(page))[1];
+	await clickCell(page, start);
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+	await page.keyboard.press('d');
+	await page.keyboard.press('d');
+	await expect(page.getByTestId('app-notice')).toContainText('at least one cell');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(before.length);
+
+	// …but the reason is READ, never assumed from the failure: a refetch caused by a
+	// dropped connection or any other error must not claim a rule the server never
+	// invoked. It takes itself down first, so what is asserted is a fresh absence.
+	await expect(page.getByTestId('app-notice')).toHaveCount(0, { timeout: 15_000 });
+	await page.unroute('**/api/cells/bulk');
+	await page.route('**/api/cells/bulk', (route) => route.fulfill({ status: 500, json: { ok: false, reason: 'boom' } }));
+	await clickCell(page, start);
+	await page.keyboard.press('Shift+j');
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+	await page.keyboard.press('d');
+	await page.keyboard.press('d');
+	await page.waitForTimeout(2000);
+	await expect(page.getByTestId('app-notice')).toHaveCount(0);
+	expect(await serverOrder(page)).toEqual(before);
+	await page.unroute('**/api/cells/bulk');
+
+	// The SINGLE-cell delete route carries the same invariant and the same refusal
+	// shape, so it must speak too - `dd` on one cell is the commonest way to meet it.
+	await page.route('**/api/cells/*', (route) =>
+		route.request().method() === 'DELETE'
+			? route.fulfill({ status: 400, json: { ok: false, reason: 'would-empty-notebook' } })
+			: route.fallback()
+	);
+	await clickCell(page, start);
+	await expect(page.getByTestId('selection-count')).toHaveCount(0);
+	await page.keyboard.press('d');
+	await page.keyboard.press('d');
+	await expect(page.getByTestId('app-notice')).toContainText('at least one cell');
+	await expect.poll(async () => (await serverOrder(page)).length, { timeout: 20_000 }).toBe(before.length);
+	await page.unroute('**/api/cells/*');
 	await page.keyboard.press('Escape');
 });
 
@@ -745,6 +898,29 @@ test('Cmd/Ctrl+A does not unfold anything, not even the section hiding the last 
 	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length} selected`);
 	await page.waitForTimeout(600);
 	await expect(lastCell).not.toBeVisible();
+
+	// A Cmd/Ctrl+click DESELECT is not a navigation either, and it reaches the same
+	// mount-without-unfold seam: it leaves the primary on that fold-hidden last cell
+	// (only toggling out the PRIMARY moves it), so it must not expand the section
+	// hiding it. It used to, and `saveFolds()` persisted the expansion - a mere
+	// deselect permanently opening a section the user collapsed.
+	await clickCell(page, cells[1].id, [MOD]);
+	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length - 1} selected`);
+	await page.waitForTimeout(400);
+	await expect(lastCell).not.toBeVisible();
+
+	// Plain `k` walks from that fold-hidden head by DOCUMENT position too - the same
+	// rule Shift+K uses, now shared rather than written twice. A bare `findIndex` miss
+	// read as "restart at the first entry", so the very next keystroke after Cmd/Ctrl+A
+	// flung the selection to the TOP of the notebook instead of stepping one cell.
+	await page.keyboard.press('k');
+	await expect(page.getByTestId('selection-count')).toHaveCount(0);
+	await expect(page.locator(`[data-cell-id="${cells[tail].id}"]`)).toHaveAttribute('data-active', 'true');
+	await expect(page.locator(`[data-cell-id="${cells[0].id}"]`)).not.toHaveAttribute('data-active', 'true');
+
+	await clickCell(page, cells[0].id);
+	await page.keyboard.press(`${MOD}+a`);
+	await expect(page.getByTestId('selection-count')).toHaveText(`${cells.length} selected`);
 
 	// A fold-hidden head still walks: Shift+K steps to the nearest VISIBLE cell above
 	// it by document position, contracting the selection rather than collapsing it.

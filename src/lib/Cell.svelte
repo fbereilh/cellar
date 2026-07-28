@@ -299,9 +299,16 @@
 	 *     Shift+click still EXTENDS a text selection over part of a traceback or a
 	 *     printed table - the everyday reason to click there. Reading is what those
 	 *     surfaces are for; the cell-range gesture stays on the card's chrome.
-	 * An exempted press falls through to the PLAIN activation below, exactly as an
-	 * unmodified click on the same spot would: it can make that cell the primary, but
-	 * it never re-ranges or toggles the selection.
+	 * An exempted MODIFIER press must also PRESERVE the selection, and for the same
+	 * reason it was exempted: the press belongs to the browser / CodeMirror / the
+	 * native text gesture, so it is not a cell-selection gesture at all and must not
+	 * COLLAPSE a five-cell selection on its way past - Shift+dragging across part of a
+	 * traceback would otherwise discard it. Preserved the way the non-primary branch
+	 * below preserves it, by not collapsing rather than by cancelling the press, so
+	 * every compatibility mouse event still fires. The `focusin` that follows carries
+	 * no modifiers and is tagged `fromFocus`, so it promotes this cell to primary when
+	 * the selection already holds it and collapses to it when it does not - which is
+	 * exactly what an unmodified click on the same spot does.
 	 */
 	function onCardPointerDown(e: PointerEvent) {
 		const t = e.target as HTMLElement | null;
@@ -332,7 +339,7 @@
 		// paste would stop working. The `focusin` a non-primary press may still trigger
 		// carries no modifiers and is tagged `fromFocus`, so it re-states the primary
 		// rather than rebuilding the selection.
-		if (e.button !== 0) return;
+		if (e.button !== 0 || extend || toggle) return;
 		onActivate?.(cell.id);
 	}
 

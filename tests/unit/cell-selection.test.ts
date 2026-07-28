@@ -21,6 +21,7 @@ import {
 	orderedSelection,
 	rangeIds,
 	selectionAfterRemoval,
+	stepFromUnwalkableHead,
 	toggled
 } from '../../src/lib/cellSelection';
 
@@ -132,6 +133,51 @@ describe('applyGesture - what a click does', () => {
 		const next = applyGesture(ORDER, state, 'c', { toggle: true });
 		expect([...next.selected]).toEqual(['a', 'e']);
 		expect(next.activeId).toBe('e'); // prefers the one below, as a deletion does
+	});
+
+	it('Cmd/Ctrl+click on a NON-primary leaves the primary and the anchor alone', () => {
+		// The companion of the case above, and the one that shipped through several
+		// reviews unwritten. `nearestSelected` answers "who replaces the primary", so
+		// applying it to ANY toggled-out cell silently relocated both ends: with {a,c,e}
+		// and the primary on `e`, deselecting `a` moved the primary (and with it DOM
+		// focus, which the caller places on it) to `c` and re-seated the origin of the
+		// next Shift range - none of which a deselect asked for.
+		const state = { activeId: 'e', anchorId: 'a', selected: set('a', 'c', 'e') };
+		const next = applyGesture(ORDER, state, 'a', { toggle: true });
+		expect([...next.selected]).toEqual(['c', 'e']); // shrank by exactly the toggled id
+		expect(next.activeId).toBe('e');
+		expect(next.anchorId).toBe('a');
+	});
+
+	it('…and that holds for a toggled-out cell BELOW the primary too', () => {
+		const state = { activeId: 'b', anchorId: 'b', selected: set('b', 'c', 'e') };
+		const next = applyGesture(ORDER, state, 'e', { toggle: true });
+		expect([...next.selected]).toEqual(['b', 'c']);
+		expect(next.activeId).toBe('b');
+		expect(next.anchorId).toBe('b');
+	});
+});
+
+describe('stepFromUnwalkableHead - the ONE fold-hidden-head rule, shared by j/k and Shift+J/K', () => {
+	// Exported so plain `j`/`k` resolves a head the walk does not contain exactly as
+	// Shift+J/K does. `selectRelative` used to take a bare `findIndex` miss as
+	// "restart at the first entry", so the very next keystroke after Cmd/Ctrl+A on a
+	// notebook whose tail section is collapsed flung the selection to the TOP.
+	const WALK = ['a', 'b', 'c']; // `d` and `e` hidden by a collapsed heading
+
+	it('steps to the nearest walkable cell in the direction of travel', () => {
+		expect(stepFromUnwalkableHead(ORDER, WALK, 'e', -1)).toBe('c');
+		expect(stepFromUnwalkableHead(ORDER, ['a', 'e'], 'c', 1)).toBe('e');
+	});
+
+	it('is undefined when nothing is left that way, so the caller stays put', () => {
+		expect(stepFromUnwalkableHead(ORDER, WALK, 'e', 1)).toBeUndefined();
+		expect(stepFromUnwalkableHead(ORDER, ['c', 'd'], 'a', -1)).toBeUndefined();
+	});
+
+	it('restarts the walk only when the head is gone from the document too', () => {
+		expect(stepFromUnwalkableHead(ORDER, WALK, 'deleted', 1)).toBe('a');
+		expect(stepFromUnwalkableHead(ORDER, WALK, null, -1)).toBe('a');
 	});
 });
 

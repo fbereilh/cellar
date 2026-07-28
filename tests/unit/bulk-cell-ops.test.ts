@@ -132,6 +132,76 @@ function writeCount(fn: () => void): number {
 	return writes.length - before;
 }
 
+describe('addCell - the metadata an undo restore brings back', () => {
+	// The server half of "undo restores a deleted cell EXACTLY". The undo record
+	// carries the cell's whole `cellar` namespace and hands it to the add, so a
+	// restore is ONE persist rather than an add trailed by a PATCH per key - and so a
+	// deleted SQL cell does not come back as a plain Python one.
+	it('seeds the durable `cellar` keys in a single write', () => {
+		const { nb } = makeNotebook('restore-metadata.ipynb', 2);
+		const before = writes.length;
+		const restored = nbmod.addCell(null, 'code', nb, null, 'q = 1', {
+			language: 'sql',
+			role: 'imports',
+			export: true,
+			hide_input: true,
+			output_scrolled: false,
+			hidden_from_agent: true
+		});
+		expect(writes.length - before).toBe(1);
+		expect(nbmod.listCells(nb).find((c) => c.id === restored.id)?.metadata?.cellar).toMatchObject({
+			language: 'sql',
+			role: 'imports',
+			export: true,
+			hide_input: true,
+			output_scrolled: false,
+			hidden_from_agent: true
+		});
+	});
+
+	it('strips the RUNTIME-only records, so a snapshot can never forge a run stamp', () => {
+		// `lastRun` is the sole evidence a cell ran against the LIVE kernel namespace
+		// and may only ever originate from an in-process run; `importBindings` was just
+		// recomputed for the source this cell is born with. Both come off through the
+		// same `stripRuntimeMeta` the disk write uses, so there is no second copy of
+		// that rule to drift.
+		const { nb } = makeNotebook('restore-runtime.ipynb', 2);
+		const restored = nbmod.addCell(null, 'code', nb, null, 'import os', {
+			role: 'imports',
+			lastRun: { at: 1, session: 1, status: 'ok', actor: 'user' },
+			editedAt: 12345,
+			importBindings: { os: { spec: 'import evil', at: 1, sinceAt: 1 } }
+		});
+		const cellar = nbmod.listCells(nb).find((c) => c.id === restored.id)?.metadata?.cellar ?? {};
+		expect(cellar.role).toBe('imports');
+		expect(cellar.lastRun).toBeUndefined();
+		expect(cellar.editedAt).toBeUndefined();
+		// Recomputed by `newCell` for the source it was born with, not the forged one.
+		expect(cellar.importBindings?.os?.spec).toBe('import os');
+	});
+
+	it('never restores a SECOND imports cell', () => {
+		// One imports cell per notebook is `setCellRole`'s invariant, and this path
+		// writes the namespace directly. A cell deleted while it held the role, the role
+		// re-designated elsewhere, then the delete undone would otherwise leave two -
+		// and every future routed import would go to whichever came first.
+		const { nb } = makeNotebook('restore-imports-role.ipynb', 2);
+		const first = nbmod.addCell(null, 'code', nb, null, 'import os', { role: 'imports' });
+		const second = nbmod.addCell(first.id, 'code', nb, null, 'import sys', { role: 'imports' });
+		const roles = nbmod.listCells(nb).filter((c) => c.metadata?.cellar?.role === 'imports');
+		expect(roles.map((c) => c.id)).toEqual([first.id]);
+		expect(nbmod.listCells(nb).find((c) => c.id === second.id)?.metadata?.cellar?.role).toBeUndefined();
+	});
+
+	it('is a no-op for a caller that passes nothing (or junk)', () => {
+		const { nb } = makeNotebook('restore-none.ipynb', 2);
+		for (const junk of [undefined, null, 'nope', 7, ['a']]) {
+			const cell = nbmod.addCell(null, 'code', nb, null, 'y = 1', junk);
+			expect(nbmod.listCells(nb).find((c) => c.id === cell.id)?.metadata?.cellar?.language).toBeUndefined();
+		}
+	});
+});
+
 describe('deleteCells - bulk delete', () => {
 	it('removes exactly the addressed cells, scattered ones included, and leaves the rest', () => {
 		const { nb, ids } = makeNotebook('bulk-delete.ipynb', 6);

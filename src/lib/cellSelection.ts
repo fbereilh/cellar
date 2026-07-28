@@ -205,8 +205,9 @@ export function applyMovePlan(order: readonly string[], steps: readonly MoveStep
  *
  * `extend` (Shift) REPLACES the selection with the anchor→id range and moves the
  * primary to `id` while leaving the anchor put, so a second Shift+click
- * re-ranges from the same origin. `toggle` (Cmd/Ctrl) flips `id` and makes it
- * both primary and anchor. A plain gesture collapses to `id` alone.
+ * re-ranges from the same origin. `toggle` (Cmd/Ctrl) flips `id`: toggling it IN
+ * makes it both primary and anchor, and toggling it OUT moves the primary ONLY
+ * when `id` WAS the primary. A plain gesture collapses to `id` alone.
  */
 export function applyGesture(
 	order: readonly string[],
@@ -220,8 +221,16 @@ export function applyGesture(
 	}
 	if (gesture.toggle) {
 		const selected = toggled(state.selected, id);
-		// Toggling the primary OUT hands primacy to the nearest survivor; the anchor
-		// follows the primary so the next Shift range starts where the user just was.
+		// Toggling a cell OUT only moves the primary when the cell WAS the primary -
+		// then primacy goes to the nearest survivor and the anchor follows it, so the
+		// next Shift range starts where the user just was. Deselecting ANY OTHER cell
+		// must leave both ends exactly where the user put them: moving them there would
+		// silently relocate DOM focus (the caller focuses the resulting primary) and
+		// re-seat the origin of the next Shift range, neither of which a deselect asked
+		// for. `nearestSelected`'s own contract is scoped to the primary's replacement.
+		if (!selected.has(id) && state.activeId != null && state.activeId !== id) {
+			return { activeId: state.activeId, anchorId: state.anchorId ?? state.activeId, selected };
+		}
 		const active = selected.has(id) ? id : (nearestSelected(order, selected, id) ?? id);
 		return { activeId: active, anchorId: active, selected };
 	}
@@ -233,8 +242,15 @@ export function applyGesture(
  * fold-hidden cell): the `delta`-th walkable cell past its DOCUMENT position, in
  * the direction of travel. Undefined when nothing is left that way; a head absent
  * from the document order too has no position to step from, so the walk restarts.
+ *
+ * Shared by BOTH keyboard moves - plain `j`/`k` and Shift+J/K - because both walk
+ * the selectable list from a head that may legitimately be fold-hidden (select-all
+ * leaves the head on the last cell of the document without revealing it, since a
+ * reveal writes persisted fold state). Restarting at `walk[0]` instead flings the
+ * selection to the TOP of the notebook on the first keystroke after Cmd/Ctrl+A;
+ * one rule here is what keeps the two paths from diverging on that again.
  */
-function stepFromUnwalkableHead(
+export function stepFromUnwalkableHead(
 	order: readonly string[],
 	walk: readonly string[],
 	activeId: string | null,

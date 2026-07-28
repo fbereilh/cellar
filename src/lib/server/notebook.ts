@@ -30,6 +30,7 @@ import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, type ExportResult } from './export-py';
 import { SQL_LANGUAGE, isLogicalCellType } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
+import { stripRuntimeMeta } from './clean';
 import type {
 	Cell,
 	CellView,
@@ -805,20 +806,52 @@ export function moveCellTo(id: string, index: number, nb?: string | null, origin
 }
 
 /**
+ * Seed a newly created cell with `cellar` metadata a caller is RESTORING - the
+ * undo stack re-inserting a deleted cell, which has to bring it back EXACTLY
+ * (`language`, so a SQL cell does not come back as Python; `role`, `export`,
+ * `hide_input`, `output_scrolled`, `hidden_from_agent`), and a paste carrying its
+ * view choice. Seeding at creation is what keeps that ONE persist and ONE
+ * `cell:added` event, rather than an add followed by a PATCH per key.
+ *
+ * The RUNTIME-only records are stripped first, through the same `stripRuntimeMeta`
+ * the disk write uses, so this can never become a forgery route: `lastRun` is the
+ * sole evidence a cell ran against the LIVE kernel namespace and may only ever
+ * originate from an in-process run, and `importBindings` was just recomputed by
+ * `newCell` for the source this cell is born with.
+ */
+function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): void {
+	if (!cellar || typeof cellar !== 'object' || Array.isArray(cellar)) return;
+	const durable = stripRuntimeMeta({ cellar: cellar as CellarNamespace }).cellar;
+	if (!durable) return;
+	Object.assign(cell.metadata.cellar, durable);
+	// The imports role is ONE PER NOTEBOOK (`setCellRole` enforces it by stripping
+	// any other), and this path writes the namespace directly, so it has to hold the
+	// same line: a cell deleted while it held the role, re-designated elsewhere, and
+	// then restored would otherwise leave two - and every future routed import would
+	// go to whichever came first.
+	if (cell.metadata.cellar.role === IMPORTS_ROLE && doc.cells.some((c) => isImportsCell(c))) {
+		delete cell.metadata.cellar.role;
+	}
+}
+
+/**
  * Add a cell after `afterId` (appended when it is absent or unknown).
  * `source` seeds the new cell, so a paste / split / undo-delete lands as ONE
  * persist and ONE `cell:added` event carrying the real text - rather than an
- * empty cell that a follow-up edit fills in.
+ * empty cell that a follow-up edit fills in. `cellar` seeds its metadata the same
+ * way, for the same reason (see `seedCellar`).
  */
 export function addCell(
 	afterId: string | null | undefined,
 	cellType: LogicalCellType = 'code',
 	nb?: string | null,
 	originId?: string | null,
-	source = ''
+	source = '',
+	cellar?: unknown
 ): Cell {
 	const doc = docFor(nb);
 	const cell = newCell(cellType, source);
+	seedCellar(doc, cell, cellar);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
 	if (idx >= 0) doc.cells.splice(idx + 1, 0, cell);
 	else doc.cells.push(cell);
