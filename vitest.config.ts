@@ -5,7 +5,10 @@ import { fileURLToPath } from 'node:url';
 // It deliberately does NOT load the SvelteKit vite plugin: these tests import
 // server modules by relative path and exercise pure logic, so booting the full
 // app toolchain would only add cost and flakiness. esbuild (via vite) handles
-// the TypeScript sources directly.
+// the TypeScript sources directly. The consequence: a Svelte component cannot be
+// MOUNTED here - component behavior is proved in the Playwright E2E suite, and an
+// invariant that is one expression wide gets a source guard instead (see
+// tests/unit/html-preview.test.ts, html-output-style.test.ts, dataframe-grid.test.ts).
 export default defineConfig({
 	// Some server modules import siblings via SvelteKit's `$lib` alias; map it to
 	// `src/lib` so those modules load under vitest (which skips the SvelteKit plugin).

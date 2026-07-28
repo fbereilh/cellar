@@ -34,7 +34,21 @@
 	const rawData = $derived(payload?.data ?? []);
 
 	// Pair each row with its index label once, so sorting/filtering keep them together.
-	const rows = $derived(rawData.map((cells, i) => ({ idx: index[i], cells })));
+	//
+	// `key` is the row's ORIGINAL POSITION, and the keyed `{#each}` below MUST use it
+	// rather than `idx`: a pandas index is NOT guaranteed unique. `set_index()` on a
+	// column with repeated values, `groupby().apply()`, `concat`, `explode`, `melt`
+	// and a flattened MultiIndex (whose parts dataframeHtml.ts joins with ' / ') all
+	// produce duplicate labels routinely. Keying by a duplicated label throws Svelte's
+	// `each_key_duplicate` DURING RENDER - and since nothing wraps a cell in an error
+	// boundary, that uncaught error takes down the whole notebook's render tree, not
+	// just this grid: with windowing on the render loop dies the moment the offending
+	// cell scrolls into the window (everything below it then stays blank forever),
+	// and with "Render all cells" on it throws at load and NOTHING renders at all.
+	// Positions are unique by construction and stable under this grid's own
+	// filter/sort, which reorder the rows but never change a row's identity.
+	type DfRow = { key: number; idx: DfValue; cells: DfValue[] };
+	const rows = $derived<DfRow[]>(rawData.map((cells, i) => ({ key: i, idx: index[i], cells })));
 
 	// ---- Global search -------------------------------------------------------
 	let query = $state('');
@@ -80,8 +94,8 @@
 		const dir = sortDir === 'asc' ? 1 : -1;
 		const get =
 			col === -1
-				? (r: { idx: DfValue; cells: DfValue[] }) => r.idx
-				: (r: { idx: DfValue; cells: DfValue[] }) => r.cells[col];
+				? (r: DfRow) => r.idx
+				: (r: DfRow) => r.cells[col];
 		// Copy before sort: never mutate the derived `filtered` array in place.
 		return [...filtered].sort((ra, rb) => dir * compare(get(ra), get(rb)));
 	});
@@ -177,7 +191,7 @@
 				</tr>
 			</thead>
 			<tbody>
-				{#each pageRows as row (row.idx)}
+				{#each pageRows as row (row.key)}
 					<tr class="odd:bg-base-100 even:bg-base-200/40 hover:bg-primary/5">
 						<td class="border-b border-base-300 px-2 py-1 font-mono text-base-content/50 whitespace-nowrap" data-testid="df-index-cell">{fmt(row.idx)}</td>
 						{#each row.cells as cell, ci}

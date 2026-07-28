@@ -138,7 +138,11 @@ export function parsePandasDataFrameHtml(html: string | null | undefined): DataF
 		const tds = Array.from(tr.querySelectorAll('td'));
 		if (tds.length === 0) continue; // skip a stray/blank body row
 		// The row header(s) are the index label; a MultiIndex row has several — join
-		// them so the label stays meaningful.
+		// them so the label stays meaningful. The result is NOT unique: a pandas index
+		// carries no uniqueness guarantee to begin with, and flattening a MultiIndex
+		// tuple onto one string can collide on top of that - so a consumer must never
+		// use `index` as an identity (DataFrameGrid keys its rows by position; keying
+		// by the label throws Svelte's `each_key_duplicate` mid-render).
 		const label = ths
 			.map((th) => th.textContent?.trim() ?? '')
 			.filter((s) => s !== '')

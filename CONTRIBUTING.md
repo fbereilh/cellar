@@ -45,6 +45,12 @@ The unit suite (`tests/unit/`) is the must-pass merge gate. Its crown jewel is
 clean-on-save: idempotent, git-clean round-trips, the metadata allowlist, and the
 notebook model. If you touch that pipeline, expect to touch its tests.
 
+Vitest deliberately runs **without** the SvelteKit plugin (`vitest.config.ts`), so
+a Svelte component cannot be mounted there: prove component behavior in the E2E
+suite below, and pin an invariant that is one expression wide - an iframe
+`sandbox` attribute, a CSS selector's specificity, an `{#each}` key - with a
+source guard in the unit suite instead.
+
 CI installs Node only - building and type-checking are pure Node, so CI stays
 fast and needs no kernel runtime. It pins **Node 20** (current LTS) while
 `package.json` `engines` declares `>=18`, so a **dev** dependency that needs a
