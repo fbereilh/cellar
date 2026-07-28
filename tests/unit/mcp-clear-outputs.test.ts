@@ -415,6 +415,16 @@ describe('the result never claims an undo it cannot deliver', () => {
 		expect(line).not.toMatch(/undoable/);
 		expect(line).toMatch(/throttled/);
 		expect(line).toMatch(/undo may not/);
+
+		// ...and honest WITHOUT growing: the same string is billed on every MCP
+		// session, so a correction has to be paid for by cutting words elsewhere.
+		// `mcp-ergonomics.spec.ts` asserts this same bound over the real wire, but
+		// e2e is deliberately out of CI and the no-mistakes gate, so a description
+		// that grew past it merged green and only failed much later. Carry the bound
+		// here too, where it actually runs.
+		const literal = line.match(/description: '((?:[^'\\]|\\.)*)'/)?.[1];
+		expect(literal, 'clear_outputs description is a single-quoted literal').toBeTruthy();
+		expect(literal!.replace(/\\(.)/g, '$1').length).toBeLessThan(700);
 	});
 });
 
