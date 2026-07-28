@@ -494,6 +494,17 @@ function registerTools(server: McpServer) {
 		const r = svc.removeCells(res.ids, target);
 		return r.ok ? text(r) : notFound(r.missing ? `cell ${r.missing} not found` : 'ids must not be empty');
 	});
+	server.registerTool('clear_outputs', { description: 'Clear the saved outputs of ONE OR SEVERAL cells by handle in one call; OMIT ids to clear EVERY cell in the notebook (an empty ids array is an error, never a clear-all). Nothing is cleared unless every id resolves, and the whole batch is one undoable checkpoint. Display/storage only - no source runs and no source is touched, and it does NOT change run_status, ran_this_session or staleness (those come from the run stamp, not from having outputs); only has_output flips. A cell with no outputs is a no-op. Returns {ok, cleared:[ids] (the cells that HAD outputs), count}.', inputSchema: { ids: z.array(z.string()).optional(), ...notebookParam } }, async ({ ids, notebook }, extra: ToolExtra) => {
+		const target = targetOf(extra, notebook);
+		let full = ids;
+		if (ids != null && ids.length) {
+			const res = resolveMany(target, ids);
+			if ('error' in res) return res.error;
+			full = res.ids;
+		}
+		const r = svc.clearOutputs(full, target);
+		return r.ok ? text(r) : notFound(r.missing ? `cell ${r.missing} not found` : 'ids must not be empty - omit ids entirely to clear every cell');
+	});
 	server.registerTool('move_cell', { description: 'Move a cell. Give exactly ONE destination: after_id / before_id (another cell\'s handle — no map fetch needed) or position (the 0-based index the cell ends up at). Returns {ok, id, index}.', inputSchema: { id: z.string(), after_id: z.string().optional(), before_id: z.string().optional(), position: z.number().int().optional(), ...notebookParam } }, async ({ id, after_id, before_id, position, notebook }, extra: ToolExtra) => {
 		const target = targetOf(extra, notebook);
 		const res = resolveOne(target, id);

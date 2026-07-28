@@ -18,6 +18,7 @@ import {
 	setSource,
 	setCellType,
 	deleteCells,
+	clearOutputsForCells,
 	moveCellTo,
 	setVisibility,
 	getHeaderNumbering,
@@ -1298,6 +1299,59 @@ export function removeCells(ids: string[], nb?: string | null) {
 	autoCheckpointBeforeAgentAction(target);
 	deleteCells(full, target);
 	return { ok: true as const, deleted, count: deleted.length };
+}
+
+/**
+ * MCP `clear_outputs`. Drop the saved outputs of the addressed cells - the agent
+ * counterpart of the UI's "Clear all outputs", and the only way an agent could
+ * previously shed a stale figure or a megabyte traceback was to delete and
+ * recreate the cell.
+ *
+ * ADDRESSING, one unambiguous rule: `ids` names the cells to clear; OMITTING it
+ * clears every cell in the notebook. An explicitly EMPTY list is a REFUSAL, not
+ * a clear-all - an agent that computed a list which came out empty must never
+ * accidentally wipe the whole notebook, and `delete_cells` already refuses an
+ * empty batch for the same reason.
+ *
+ * All-or-nothing on ADDRESSING, like `removeCells`: every ref resolves before
+ * anything is cleared, so a typo in the fifth handle cannot leave the first four
+ * blank. Duplicates collapse. ONE pre-action checkpoint covers the batch, so the
+ * human's undo restores the outputs as a whole (checkpoints snapshot outputs),
+ * and `clearOutputsForCells` makes it ONE document write.
+ *
+ * A cell with no outputs is a harmless no-op: it is neither cleared nor listed,
+ * and a batch that would change nothing takes no checkpoint and writes nothing.
+ * `lastRun` is untouched - this mirrors the UI clear exactly, so `run_status`,
+ * `ran_this_session` and staleness are unchanged by clearing (they come from the
+ * run stamp, never from `outputs.length`); only `has_output` flips.
+ */
+export function clearOutputs(ids: string[] | null | undefined, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	let full: string[];
+	if (ids == null) {
+		full = listCells(target).map((c) => c.id);
+	} else {
+		full = [];
+		const seen = new Set<string>();
+		for (const ref of ids) {
+			const id = asFullId(target, ref);
+			if (seen.has(id)) continue;
+			if (!getCell(id, target)) return { ok: false as const, missing: ref };
+			seen.add(id);
+			full.push(id);
+		}
+		if (!full.length) return { ok: false as const, missing: null };
+	}
+	// Handles are prefixes of the current cell set, and clearing changes no ids -
+	// but read them before mutating, exactly as removeCells does.
+	const toHandle = handleFn(target);
+	// Nothing to clear ⇒ no checkpoint and no write: a checkpoint for a no-op
+	// would push the human's real undo target one step further out of reach.
+	const withOutputs = full.filter((id) => getCell(id, target)?.outputs?.length);
+	if (!withOutputs.length) return { ok: true as const, cleared: [], count: 0 };
+	autoCheckpointBeforeAgentAction(target);
+	const cleared = clearOutputsForCells(withOutputs, target).map(toHandle);
+	return { ok: true as const, cleared, count: cleared.length };
 }
 
 /** Where a `move_cell` lands: beside another cell (a handle, like every other
