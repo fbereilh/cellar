@@ -6,10 +6,17 @@
 // cannot, and putting cell source on the system clipboard would silently
 // clobber whatever the user had copied from elsewhere.
 //
-// An entry carries only what the add-cell API can restore: `cell_type`,
-// `source`, and the `output_scrolled` view choice. Outputs are not carried -
-// a pasted cell would then show a saved result the live kernel never produced,
-// the exact stale-output trap the run-metadata design elsewhere avoids.
+// An entry carries `cell_type`, `source`, and the `output_scrolled` view choice.
+// Outputs are not carried - a pasted cell would then show a saved result the live
+// kernel never produced, the exact stale-output trap the run-metadata design
+// elsewhere avoids.
+//
+// That is NARROWER than what the add-cell API can now seed: `addCell` takes a
+// `cellar` namespace (see `seedCellar` in `server/notebook.ts`), which the undo
+// stack uses to bring a deleted cell back exactly - `language`, `role`, `export`,
+// `hide_input`. A paste still drops those, so a copied SQL cell pastes as Python;
+// widening this shape is a deliberate follow-up, not an oversight of the
+// multi-cell cut/copy that only made it easier to notice.
 
 import type { CellType } from '$lib/server/types';
 
@@ -22,7 +29,8 @@ export interface ClipboardCell {
 let entries: ClipboardCell[] = [];
 
 export const cellClipboard = {
-	/** Replace the clipboard contents (an array, so multi-cell copy can land later). */
+	/** Replace the clipboard contents - an array, because `x` / `c` act on the
+	 *  whole multi-cell selection (one entry per selected cell, in document order). */
 	copy(cells: ClipboardCell[]): void {
 		entries = cells.map((c) => ({ ...c }));
 	},

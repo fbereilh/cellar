@@ -206,6 +206,11 @@ export function mountedIds(plan: PlanItem[]): Set<string> {
 //   queued heads   — the cells about to run next, so a run starting does not have to
 //                    mount its cell from cold (and the queued affordance is real).
 //   active         — the selected cell must not vanish mid-series (j/k, a/b, dd).
+//                    The PRIMARY only: the rest of a multi-cell selection is
+//                    deliberately NOT pinned, or a range spanning 200 cells would
+//                    mount all of them and undo the window. Selection lives on
+//                    document-model ids ($lib/cellSelection), so a windowed-out
+//                    member simply renders selected when it scrolls back in.
 //   focused        — the cell holding DOM focus. Distinct from `active` on purpose:
 //                    a focus event may still be in flight, and the editing cell is
 //                    the one thing whose unmount would lose user state (CodeMirror
@@ -251,7 +256,7 @@ export interface PinInputs {
 	runningId?: string | null;
 	/** cell id → 1-based position in the kernel's global run queue. */
 	queued?: Record<string, number> | null;
-	/** The selected cell (command-mode target). */
+	/** The PRIMARY of the selection (command-mode target); never the whole set. */
 	activeId?: string | null;
 	/** The cell holding DOM focus (its editor, or the card itself). */
 	focusedId?: string | null;

@@ -344,6 +344,9 @@
 	// text selection is never hijacked. During a drag we show a thin insertion
 	// line at the top or bottom edge of the hovered cell, then commit the move to
 	// an absolute index via `onMoveToIndex` (which reuses the server move API).
+	// Deliberately SINGLE-cell, like the toolbar's trash and move arrows: the grip
+	// is drawn on one cell, so it moves that cell even when several are selected.
+	// The selection-wide move is the keyboard/palette one (`moveSelection`).
 	let dragId = $state<string | null>(null); // id of the cell being dragged
 	let dropIndex = $state<number | null>(null); // insertion index the drop would land at
 	let dropAtEnd = $state(false); // insertion line drawn below the last hovered cell
