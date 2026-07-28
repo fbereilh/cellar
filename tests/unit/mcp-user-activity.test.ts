@@ -128,6 +128,48 @@ describe('(B) a deleted cell fails legibly', () => {
 		expect(note).not.toContain('in the Cellar UI');
 	});
 
+	it('a SHORT ref is never claimed as a deletion, however many tombstones exist', async () => {
+		// The scan is a prefix match over up to TOMBSTONE_CAP UUIDs, so a 1-3 char
+		// hallucinated ref would hit one by coincidence and be reported as a deletion
+		// that never happened - the "always claims a deletion" degeneration the whole
+		// never-existed vs recently-deleted distinction exists to avoid. Every handle
+		// Cellar emits is >= 8 chars, so nothing legitimate is refused.
+		const nb = await seed('b-short.ipynb', 4);
+		const gone = ids(nb).slice(0, 3);
+		nbmod.deleteCells(gone, nb, TAB);
+		// Sanity: a real handle IS legible, so the test cannot pass by having no data.
+		expect(ua.deletionNote(nb, gone[0].slice(0, 8))).toBeTruthy();
+
+		for (const ref of [gone[0].slice(0, 1), gone[0].slice(0, 3), gone[0].slice(0, 7)])
+			expect(ua.deletionNote(nb, ref)).toBeNull();
+	});
+
+	it('a SELF delete reads as self-inflicted staleness, not a third-party editor', async () => {
+		// The commonest not-found path in practice: an agent re-referencing a cell it
+		// removed itself while working from a stale plan. Framing that as a concurrent
+		// editor pushes the model into re-planning around one that does not exist.
+		const nb = await seed('b-self.ipynb');
+		const gone = ids(nb)[0];
+		ua.runAsAgent('sess-A', () => nbmod.deleteCells([gone], nb));
+
+		const note = ua.deletionNote(nb, gone.slice(0, 8), 'sess-A');
+		expect(note).toContain('you deleted it');
+		expect(note).toContain('in this same session');
+		// It must not say or imply that anyone else touched the notebook.
+		expect(note).not.toContain('an agent deleted it');
+		expect(note).not.toContain('the user');
+	});
+
+	it('a CROSS-SESSION delete still reads as another agent', async () => {
+		const nb = await seed('b-cross.ipynb');
+		const gone = ids(nb)[0];
+		ua.runAsAgent('sess-A', () => nbmod.deleteCells([gone], nb));
+
+		const note = ua.deletionNote(nb, gone.slice(0, 8), 'sess-B');
+		expect(note).toContain('an agent deleted it');
+		expect(note).not.toContain('you deleted it');
+	});
+
 	it('a hidden_from_agent cell leaves NO tombstone (its deletion is not disclosed)', async () => {
 		const nb = await seed('b-hidden.ipynb');
 		const [hidden, visible] = ids(nb);
@@ -330,6 +372,22 @@ describe('(A) the user-activity digest', () => {
 		const note = digest('sess-6', nb)!;
 		expect(note).toContain(`edited cell ${id.slice(0, 8)}`);
 		expect(note.split(id.slice(0, 8)).length - 1).toBe(1);
+	});
+
+	it('typing churn on ONE cell never evicts an earlier DELETE from the ring', async () => {
+		// The activity ring is per-notebook capped, and a human typing in the UI emits
+		// one cell:edited per 500ms autosave. Without tail-collapsing, a long burst on
+		// one cell fills every slot and pushes out the deletion the agent most needed -
+		// the digest then reports only the edit. The burst is comfortably past the cap.
+		const nb = await seed('a-churn.ipynb', 3);
+		expect(digest('sess-churn', nb)).toBeNull();
+		const [gone, typed] = ids(nb);
+		nbmod.deleteCells([gone], nb, TAB);
+		for (let i = 0; i < 600; i++) nbmod.setSource(typed, `typing = ${i}`, nb, TAB);
+
+		const note = digest('sess-churn', nb)!;
+		expect(note).toContain(`deleted cell ${gone.slice(0, 8)}`);
+		expect(note).toContain(`edited cell ${typed.slice(0, 8)}`);
 	});
 
 	it('reports a checkpoint RESTORE as a wholesale revert, not as a list of cells', async () => {

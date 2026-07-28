@@ -187,6 +187,47 @@ function push<T>(map: Map<string, T[]>, nb: string, item: T, cap: number): void 
 	if (list.length > cap) list.splice(0, list.length - cap);
 }
 
+/**
+ * Append a change, COLLAPSING it into the list's TAIL when that tail already
+ * records the same (cellId, kind, by).
+ *
+ * Without this the ring is a flat FIFO and a human typing in the UI emits one
+ * `cell:edited` per 500ms debounced autosave, so sustained editing of ONE cell
+ * during a long agent operation (a multi-minute `run_cell`) fills all
+ * ACTIVITY_CAP slots with redundant entries for that cell and evicts the earlier
+ * `cell:deleted` / `cell:added` / `cell:moved` the agent most needed - the digest
+ * then reports the edit and silently omits the deletion. Collapsing is consistent
+ * with `summarize`'s own one-verb-per-cell rule (PRECEDENCE), applied across calls
+ * rather than only within one.
+ *
+ * The collapsed entry KEEPS ITS ORIGINAL `seq`; it is never moved forward. STATED
+ * RESIDUAL: once a cell's edit has been reported to a session, further CONSECUTIVE
+ * edits of that same cell - with no other reportable change in between - are not
+ * re-reported to that session, because the entry's seq stays below its cursor.
+ * That is the deliberate trade against advancing the seq, which would instead hide
+ * the change from a session whose cursor lands BETWEEN the two seqs. Tail-ness
+ * alone does not prove no cursor sits between them: the notebook's seq counter is
+ * bumped by EVERY published event, not only by reportable ones. So this is a
+ * bounded, stated trade, not an invariant.
+ *
+ * Only ever collapses a cell-scoped entry. A `restored` carries no cellId, and it
+ * is the one kind whose repetition genuinely matters (each restore invalidates the
+ * agent's handles afresh), so consecutive restores stay distinct.
+ */
+function recordChange(nb: string, entry: Entry): void {
+	const list = activity.get(nb);
+	const tail = list?.[list.length - 1];
+	if (
+		entry.cellId != null &&
+		tail &&
+		tail.cellId === entry.cellId &&
+		tail.kind === entry.kind &&
+		tail.by === entry.by
+	)
+		return;
+	push(activity, nb, entry, ACTIVITY_CAP);
+}
+
 function record(event: PublishedEvent): void {
 	const kind = KIND_OF[event.type];
 	if (!kind) return;
@@ -208,7 +249,7 @@ function record(event: PublishedEvent): void {
 	// at digest time, which is the honest moment ("is this hidden right now").
 	if (kind === 'deleted' && event.hiddenFromAgent === true) return;
 
-	push(activity, event.nb, { seq: event.seq, kind, cellId, by }, ACTIVITY_CAP);
+	recordChange(event.nb, { seq: event.seq, kind, cellId, by });
 	if (kind === 'deleted' && cellId) {
 		push(tombstones, event.nb, { id: cellId, at: Date.now(), by, origin }, TOMBSTONE_CAP);
 	}
@@ -262,35 +303,51 @@ function ago(ms: number): string {
  *
  * Matching is a prefix scan, like `resolveCellId`'s: handles are the shortest
  * unique prefix over the CURRENT cells, so a deletion can shorten a survivor's
- * handle and leave the agent holding a longer prefix of the cell that went.
+ * handle and leave the agent holding a longer prefix of the cell that went. It is
+ * floored at `MIN_HANDLE` for exactly that reason - the scan is over up to
+ * TOMBSTONE_CAP UUIDs, so a 1-3 character ref (a hallucinated id, never a handle:
+ * every handle Cellar emits is >= MIN_HANDLE and a full UUID is 36) would hit one
+ * by pure coincidence and be reported as a deletion that never happened. A ref
+ * that short falls back to the generic message, which is the truthful answer for
+ * it, and the never-existed vs recently-deleted distinction survives.
  *
- * Attribution is deliberately coarse - "the user" versus "an agent" - and it turns
- * on the SAME discriminator `actorPhrase` uses, the MCP session (`by`), never the
- * browser tab (`origin`). A UI action does not always carry an `originId`: the
- * navbar "Consolidate imports" sweep deletes emptied cells through a REST route
- * that deliberately threads none, so keying off `origin` reported a human's own
- * click as "an agent deleted it" - the exact misattribution this module exists to
- * prevent, and worse than the generic message it replaces (another agent's action
- * reads to the model as not its concern). Anything that is not an MCP session is
- * either the user or Cellar acting on their behalf, which reads as the user either
- * way. Naming WHICH agent would mean threading the caller's session id through
- * every `resolveOne` call site for a distinction the reported symptom does not
- * turn on.
+ * ATTRIBUTION IS THREE-WAY, decided by the tombstone's MCP session (`by`) against
+ * the CALLER's (`callerSession`) - never by the browser tab (`origin`):
+ *
+ *   - `by` equals the caller  => the CALLING agent deleted the cell itself earlier
+ *     in this session. Plausibly the commonest not-found path there is (an agent
+ *     re-referencing a cell it removed while working from a stale plan), and
+ *     describing self-inflicted staleness as a concurrent third-party editor pushes
+ *     the model into re-planning around an editor that does not exist. This branch
+ *     therefore must not say or imply that anyone else touched the notebook.
+ *   - `by` is a DIFFERENT session => genuinely another agent.
+ *   - `by` is null => the user, or Cellar acting on their behalf through a REST
+ *     route, which reads as the user either way. Keying this off `origin` instead
+ *     is the misattribution this module exists to prevent: a UI action does not
+ *     always carry an `originId` (the navbar "Consolidate imports" sweep deletes
+ *     emptied cells through a route that deliberately threads none), so it reported
+ *     a human's own click as "an agent deleted it" - worse than the generic message
+ *     it replaces, since another agent's action reads to the model as not its
+ *     concern.
  *
  * The " in the Cellar UI" clause stays gated on `origin`, because that clause
  * specifically asserts a browser tab and only a threaded `originId` establishes
  * one - a consolidate-driven deletion reads "the user deleted it just now." with
  * no UI clause, which is true rather than over-claimed.
  */
-export function deletionNote(nb: string, ref: string): string | null {
+export function deletionNote(nb: string, ref: string, callerSession?: string): string | null {
 	const r = (ref ?? '').trim();
-	if (!r) return null;
+	if (r.length < MIN_HANDLE) return null;
 	const hits = liveTombstones(nb, Date.now()).filter((t) => t.id === r || t.id.startsWith(r));
 	if (!hits.length) return null;
 	const t = hits[hits.length - 1]; // the most recent deletion this ref could name
+	const when = ago(Date.now() - t.at);
+	const tail = 'Your view of the notebook is out of date; the tool is working. Call get_notebook_map for the current handles.';
+	if (t.by != null && callerSession != null && t.by === callerSession)
+		return `cell "${r}" no longer exists - you deleted it ${when}, earlier in this same session. ${tail}`;
 	const who = t.by != null ? 'an agent deleted it' : 'the user deleted it';
 	const where = t.origin != null ? ' in the Cellar UI' : '';
-	return `cell "${r}" no longer exists - ${who} ${ago(Date.now() - t.at)}${where}. Your view of the notebook is out of date; the tool is working. Call get_notebook_map for the current handles.`;
+	return `cell "${r}" no longer exists - ${who} ${when}${where}. ${tail}`;
 }
 
 // --- (A) the digest ----------------------------------------------------------
