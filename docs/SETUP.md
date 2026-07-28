@@ -327,6 +327,16 @@ spec files at a time. Install its browser once with `npx playwright install chro
   Anything you style yourself (`set_table_styles`, `set_properties`, an inline
   `style`) overrides those defaults, so you keep full control of a table you have
   styled.
+- **A table from another library looks oddly aligned, or lost its grid lines** - those
+  defaults apply to *every* table in rich `text/html` output, not just pandas ones, so
+  a library's own `_repr_html_` (statsmodels' `summary()`, dask's array summary) picks
+  them up too. Three cosmetic side effects are accepted: a table that declares no
+  `<thead>` gets no header rule and its header row reads left-aligned like an index
+  column; a label/value layout table whose cells hold plain text inherits the numeric
+  right-align (a cell holding a paragraph, list, or other block content keeps normal
+  left alignment); and Cellar drops the default table border, so `<table border="1">`
+  no longer draws a grid. Style the table yourself - an inline `style`, a stylesheet
+  the output carries, or a pandas `Styler` - and your rules win.
 - **A long notebook keeps only its visible cells in the page** - by default Cellar
   renders the cells near the viewport and collapses the rest into a placeholder of
   the same height, so a several-hundred-cell notebook opens and scrolls like a short
