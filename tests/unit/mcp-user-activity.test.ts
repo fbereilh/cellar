@@ -108,6 +108,26 @@ describe('(B) a deleted cell fails legibly', () => {
 		expect(note).not.toContain('the user');
 	});
 
+	it('a UI action that threads NO originId is still the USER, not an agent', async () => {
+		// The navbar "Consolidate imports" sweep: POST /api/notebooks/imports runs with
+		// actor:'user' but deliberately threads no originId, and imports-cell.ts deletes
+		// each emptied cell with `deleteCell(id, abs)` outside any MCP session. So the
+		// tombstone carries origin == null AND by == null. Attribution must turn on the
+		// MCP session, exactly as `actorPhrase` does - keying it off the browser tab
+		// reported a human's own click as "an agent deleted it", which reads to the
+		// model as not its concern and is worse than the generic message it replaces.
+		const nb = await seed('b-no-origin.ipynb');
+		const gone = ids(nb)[0];
+		nbmod.deleteCell(gone, nb);
+
+		const note = ua.deletionNote(nb, gone.slice(0, 8));
+		expect(note).toContain('the user deleted it');
+		expect(note).not.toContain('an agent');
+		// But it must NOT claim a browser tab it cannot see: only a threaded originId
+		// establishes one, so this reads true rather than over-claimed.
+		expect(note).not.toContain('in the Cellar UI');
+	});
+
 	it('a hidden_from_agent cell leaves NO tombstone (its deletion is not disclosed)', async () => {
 		const nb = await seed('b-hidden.ipynb');
 		const [hidden, visible] = ids(nb);

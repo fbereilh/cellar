@@ -40,6 +40,22 @@
  * cursor, never an exhaustive diff. It says "since your last call", points at
  * get_notebook_map as the authority (stated once in INSTRUCTIONS, not repeated
  * on every emission), and reports nothing it cannot verify.
+ *
+ * TWO FURTHER BOUNDS, KNOWN AND ACCEPTED (stated so they do not read as
+ * oversights):
+ *
+ *   1. `activity` and `tombstones` are keyed by ABSOLUTE notebook path and are
+ *      NOT mirrored by `notebook.ts`'s `dropDocs`/`rekeyDocs`. So a notebook
+ *      rename orphans that notebook's entries under the old key, and a handle
+ *      deleted just before the rename degrades to the generic not-found message.
+ *      Both lists are per-notebook capped and tombstones expire by TTL, so this
+ *      is a legibility gap on a rare path, not unbounded growth.
+ *
+ *   2. The digest cursor advances when the note is BUILT, not when the result is
+ *      DELIVERED. A client that discards a response - the long-run client-timeout
+ *      case `withProgress` mitigates - therefore consumes that window's activity
+ *      and never sees it. A handler that THROWS correctly leaves the cursor
+ *      untouched, so the gap is only the discarded-result path.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { subscribe, currentSeq } from '../events';
@@ -245,10 +261,23 @@ function ago(ms: number): string {
  * unique prefix over the CURRENT cells, so a deletion can shorten a survivor's
  * handle and leave the agent holding a longer prefix of the cell that went.
  *
- * Attribution is deliberately coarse - "the user" (the ref carried a browser tab
- * origin) versus "an agent". Naming WHICH agent would mean threading the caller's
- * session id through every `resolveOne` call site for a distinction the reported
- * symptom does not turn on.
+ * Attribution is deliberately coarse - "the user" versus "an agent" - and it turns
+ * on the SAME discriminator `actorPhrase` uses, the MCP session (`by`), never the
+ * browser tab (`origin`). A UI action does not always carry an `originId`: the
+ * navbar "Consolidate imports" sweep deletes emptied cells through a REST route
+ * that deliberately threads none, so keying off `origin` reported a human's own
+ * click as "an agent deleted it" - the exact misattribution this module exists to
+ * prevent, and worse than the generic message it replaces (another agent's action
+ * reads to the model as not its concern). Anything that is not an MCP session is
+ * either the user or Cellar acting on their behalf, which reads as the user either
+ * way. Naming WHICH agent would mean threading the caller's session id through
+ * every `resolveOne` call site for a distinction the reported symptom does not
+ * turn on.
+ *
+ * The " in the Cellar UI" clause stays gated on `origin`, because that clause
+ * specifically asserts a browser tab and only a threaded `originId` establishes
+ * one - a consolidate-driven deletion reads "the user deleted it just now." with
+ * no UI clause, which is true rather than over-claimed.
  */
 export function deletionNote(nb: string, ref: string): string | null {
 	const r = (ref ?? '').trim();
@@ -256,7 +285,7 @@ export function deletionNote(nb: string, ref: string): string | null {
 	const hits = liveTombstones(nb, Date.now()).filter((t) => t.id === r || t.id.startsWith(r));
 	if (!hits.length) return null;
 	const t = hits[hits.length - 1]; // the most recent deletion this ref could name
-	const who = t.origin != null ? 'the user deleted it' : 'an agent deleted it';
+	const who = t.by != null ? 'an agent deleted it' : 'the user deleted it';
 	const where = t.origin != null ? ' in the Cellar UI' : '';
 	return `cell "${r}" no longer exists - ${who} ${ago(Date.now() - t.at)}${where}. Your view of the notebook is out of date; the tool is working. Call get_notebook_map for the current handles.`;
 }
