@@ -972,12 +972,21 @@ export function setOutputsLive(id: string, outputs: CellOutput[], nb?: string | 
 	if (cell) cell.outputs = outputs;
 }
 
+/**
+ * Clear ONE cell's outputs (the UI's per-cell clear), persist, and broadcast.
+ *
+ * The `.py` guard is the same one `setOutputs` documents and `clearOutputsForCells`
+ * applies: a text notebook carries no outputs on disk, so persisting would re-run
+ * the whole jupytext conversion to write byte-identical bytes and churn mtime -
+ * once per cell over the UI's clear-all loop. The EVENT still fires unconditionally,
+ * so every open tab clears whatever the format.
+ */
 export function clearOutputs(id: string, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell) {
 		cell.outputs = [];
-		persist(doc);
+		if (!doc.jpFormat) persist(doc);
 		emit(doc, 'cell:cleared', { cellId: id }, originId);
 	}
 }

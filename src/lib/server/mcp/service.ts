@@ -50,7 +50,7 @@ import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
 import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } from './image';
-import { autoCheckpointBeforeAgentAction, createCheckpoint } from '../checkpoints';
+import { autoCheckpointBeforeAgentAction, createCheckpoint, type CheckpointMeta } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
 import type { CellView, CellOutput, SessionId, LogicalCellType, QueueState } from '../types';
 
@@ -1315,9 +1315,21 @@ export function removeCells(ids: string[], nb?: string | null) {
  *
  * All-or-nothing on ADDRESSING, like `removeCells`: every ref resolves before
  * anything is cleared, so a typo in the fifth handle cannot leave the first four
- * blank. Duplicates collapse. ONE pre-action checkpoint covers the batch, so the
- * human's undo restores the outputs as a whole (checkpoints snapshot outputs),
- * and `clearOutputsForCells` makes it ONE document write.
+ * blank. Duplicates collapse, and `clearOutputsForCells` makes it ONE document
+ * write.
+ *
+ * UNDO IS NOT GUARANTEED, and the result says so rather than implying otherwise.
+ * The batch takes at most ONE pre-action checkpoint, but the shared checkpoint
+ * rules mean it may capture nothing useful for THIS tool: the auto-checkpoint is
+ * THROTTLED (`autoCheckpointBeforeAgentAction` returns null for an action folded
+ * into the batch protected by an earlier snapshot), and a snapshot past
+ * `MAX_SNAPSHOT_BYTES` keeps sources but DROPS every cell's outputs - which is
+ * exactly the output-heavy notebook this tool exists to shed weight from. Since
+ * the cleared document is then persisted, those outputs are gone for good. So the
+ * checkpoint's own metadata is read back and, whenever it cannot restore what was
+ * just cleared, the result carries `undo: {outputs_recoverable:false, reason}`.
+ * Never assert more than was verified: an agent must not be told its clear is
+ * reversible when it is not.
  *
  * A cell with no outputs is a harmless no-op: it is neither cleared nor listed,
  * and a batch that would change nothing takes no checkpoint and writes nothing.
@@ -1384,9 +1396,24 @@ export function clearOutputs(ids: string[] | null | undefined, nb?: string | nul
 	// Nothing to clear ⇒ no checkpoint and no write: a checkpoint for a no-op
 	// would push the human's real undo target one step further out of reach.
 	if (!withOutputs.length) return { ok: true as const, cleared: [], count: 0, ...skippedField };
-	autoCheckpointBeforeAgentAction(target);
+	const cp = autoCheckpointBeforeAgentAction(target);
 	const cleared = clearOutputsForCells(withOutputs, target).filter(reportable).map(toHandle);
-	return { ok: true as const, cleared, count: cleared.length, ...skippedField };
+	return { ok: true as const, cleared, count: cleared.length, ...skippedField, ...undoWarning(cp) };
+}
+
+/**
+ * The honesty half of `clearOutputs`: report when the pre-clear checkpoint cannot
+ * give the cleared outputs back. Present ONLY in that case, so an ordinary clear
+ * pays no tokens for it. Reads what `autoCheckpointBeforeAgentAction` already
+ * returns - it changes no checkpoint behavior, it only stops the result from
+ * over-claiming.
+ */
+function undoWarning(cp: CheckpointMeta | null) {
+	if (cp && !cp.outputsTruncated) return {};
+	const reason = cp
+		? 'the pre-clear checkpoint was too large to store outputs, so restoring it brings the cells back empty'
+		: 'no pre-clear checkpoint was due (they are throttled), so undo walks back to an earlier snapshot';
+	return { undo: { outputs_recoverable: false as const, reason } };
 }
 
 /** Where a `move_cell` lands: beside another cell (a handle, like every other

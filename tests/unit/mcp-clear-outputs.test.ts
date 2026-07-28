@@ -345,6 +345,79 @@ describe('the clear-all form never discloses a cell hidden from the agent', () =
 	});
 });
 
+describe('the result never claims an undo it cannot deliver', () => {
+	/**
+	 * A notebook built through the NOTEBOOK api, not the service - so no agent
+	 * action has been recorded for it and the clear below is its FIRST, which is
+	 * the one case the throttle always snapshots.
+	 */
+	function makeUntouchedNotebook(name: string, text: string): { target: string; ids: string[] } {
+		const target = abs(name);
+		nbmod.createNotebook(name);
+		const ids: string[] = [];
+		for (let i = 0; i < 2; i++) {
+			const cell = nbmod.addCell(null, 'code', target, null, `a = ${i}`);
+			nbmod.setOutputs(cell.id, out(text), target);
+			ids.push(cell.id);
+		}
+		return { target, ids };
+	}
+
+	it('says nothing when the pre-clear checkpoint really does hold the outputs', () => {
+		const { target } = makeUntouchedNotebook('undo-ok.ipynb', 'small\n');
+
+		// First agent action for this notebook ⇒ a checkpoint IS taken, and the
+		// snapshot is far under the size bound, so its outputs are stored. Undo works,
+		// so there is nothing to warn about and the agent pays no tokens for silence.
+		const r = svc.clearOutputs(undefined, target);
+		expect(r).toMatchObject({ ok: true, count: 2 });
+		expect(r).not.toHaveProperty('undo');
+	});
+
+	it('warns when the checkpoint was THROTTLED away, so undo lands on an earlier state', async () => {
+		// `makeNotebook` goes through the service, which spends this notebook's first
+		// agent action on the add - so the clear is folded into that batch and takes no
+		// snapshot of its own (auto-checkpoints are one per N actions).
+		const { target, handles } = await makeNotebook('undo-throttled.ipynb', 2);
+
+		const r = svc.clearOutputs([handles[0]], target);
+		expect(r).toMatchObject({ ok: true, count: 1 });
+		// The whole point: the agent is told the outputs it just destroyed are not
+		// coming back from undo, rather than being left to assume they are.
+		expect(r.ok && r.undo).toMatchObject({ outputs_recoverable: false });
+		expect(r.ok && r.undo?.reason).toMatch(/throttled/);
+	});
+
+	it('warns when the checkpoint was too big to keep outputs - this tool\'s own use case', () => {
+		// An output-heavy notebook is exactly what `clear_outputs` exists for, and it
+		// is exactly what blows past the snapshot size bound: the checkpoint then keeps
+		// sources and DROPS every cell's outputs. The cleared document is persisted
+		// straight afterwards, so those outputs are gone for good - the one case where
+		// a cheerful "undoable" would have been a lie.
+		const { target } = makeUntouchedNotebook('undo-truncated.ipynb', `${'x'.repeat(1_600_000)}\n`);
+
+		const r = svc.clearOutputs(undefined, target);
+		expect(r).toMatchObject({ ok: true, count: 2 });
+		expect(r.ok && r.undo).toMatchObject({ outputs_recoverable: false });
+		expect(r.ok && r.undo?.reason).toMatch(/too large/);
+	});
+
+	it('keeps the tool DESCRIPTION honest about that limit', () => {
+		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
+		const desc = src.slice(src.indexOf("registerTool('clear_outputs'"));
+		const line = desc.slice(0, desc.indexOf('\n'));
+
+		// A tool description is paid on every MCP session AND is the only thing most
+		// agents ever read, so an over-claim there does more damage than a wrong
+		// result field. This one promised "the whole batch is one undoable
+		// checkpoint" while both halves could fail; pin the correction so it cannot
+		// quietly regrow.
+		expect(line).not.toMatch(/undoable/);
+		expect(line).toMatch(/throttled/);
+		expect(line).toMatch(/undo may not/);
+	});
+});
+
 describe('a .py (jupytext) notebook clears in memory without a jupytext write', () => {
 	it('emits cell:cleared but never calls the writer', async () => {
 		const target = abs('text-notebook.py');
@@ -372,6 +445,33 @@ describe('a .py (jupytext) notebook clears in memory without a jupytext write', 
 		expect(py.writes).toEqual([]);
 		expect(seen).toEqual(cells.map((c) => c.id));
 		expect(r!).toMatchObject({ ok: true, count: 2 });
+		expect(withOutputs(target)).toEqual([]);
+	});
+
+	it('applies the same rule to the SINGLE-cell clear the UI drives', () => {
+		const target = abs('text-notebook-single.py');
+		writeFileSync(target, '# %%\na = 0\n\n# %%\na = 1\n');
+		const cells = nbmod.listCells(target);
+		for (const c of cells) nbmod.setOutputs(c.id, out('live only\n'), target);
+		py.writes.length = 0;
+
+		const seen: string[] = [];
+		const off = events.subscribe((e) => {
+			const ev = e as { type: string; nb?: string; cellId?: string };
+			if (ev.type === 'cell:cleared' && ev.nb === target) seen.push(ev.cellId!);
+		});
+		try {
+			// The UI clears one cell per request (and its "Clear all" loops over them),
+			// so an unguarded persist here is one blocking jupytext conversion PER CELL
+			// for a file that stores no outputs at all. The two clear paths must agree,
+			// or which surface the human used decides what the disk does.
+			for (const c of cells) nbmod.clearOutputs(c.id, target);
+		} finally {
+			off();
+		}
+
+		expect(py.writes).toEqual([]);
+		expect(seen).toEqual(cells.map((c) => c.id));
 		expect(withOutputs(target)).toEqual([]);
 	});
 });
