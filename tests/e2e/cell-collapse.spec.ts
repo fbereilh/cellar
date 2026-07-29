@@ -26,7 +26,12 @@ import { setScrollTop, isCellMounted } from './notebook-scroll';
  *      header (the output landing hidden, and there once expanded) and keyboard
  *      selection still lands on it without expanding it;
  *   E. deleting a collapsed cell drops its entry from the persisted record, so the
- *      per-notebook store cannot leak entries for cells that no longer exist;
+ *      per-notebook store cannot leak entries for cells that no longer exist - but
+ *      only once the server has CONFIRMED the delete, since that record is persisted
+ *      and a refused delete puts the cell back with nothing left to restore it from;
+ *   E2. a collapsed cell is strictly its toolbar row, the "changed on server" banner
+ *      included - and hiding that banner keeps the stashed remote edit, whether it is
+ *      expanded again or windowed out and remounted;
  *   F. the three collapse-ish features stay independent: a full collapse leaves the
  *      editor-collapse choice and the heading fold exactly as they were.
  *
@@ -76,6 +81,19 @@ async function setCellSource(page: Page, id: string, source: string): Promise<vo
 		},
 		{ nb: NB, cellId: id, src: source }
 	);
+}
+
+/**
+ * Put a cell back the way this test found it - source and collapse state.
+ *
+ * The tests below share one workspace AND one persisted collapse record, and the
+ * later ones select their target by SOURCE pattern (`def process_`, `print(`), so a
+ * test that rewrote a source or left a cell collapsed would silently re-point a
+ * later test's selector at a different, possibly windowed-out cell.
+ */
+async function restoreCell(page: Page, before: { id: string; source: string }): Promise<void> {
+	await setCollapsed(page, before.id, false);
+	await setCellSource(page, before.id, before.source);
 }
 
 const cell = (page: Page, id: string) => page.locator(`[data-cell-id="${id}"]`);
@@ -354,6 +372,123 @@ test('deleting a collapsed cell drops its entry from the persisted record', asyn
 	await cell(page, target.id).getByTestId('delete').click();
 	await expect.poll(async () => (await serverCells(page)).some((c) => c.id === target.id), { timeout: 10_000 }).toBe(false);
 	await expect.poll(() => persistedCollapsed(page).then((r) => target.id in r), { timeout: 10_000 }).toBe(false);
+});
+
+test('a collapse hides the "changed on server" banner without losing the stashed edit', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+
+	// The FIRST code cell, so it is inside the window at rest whatever the tests
+	// before this one left behind (a spacer has no static stand-in to click, and
+	// that click is what summons and focuses the editor).
+	const target = (await serverCells(page)).filter((c) => c.cell_type === 'code')[0];
+	expect(target).toBeTruthy();
+	await setCollapsed(page, target.id, false);
+	const card = cell(page, target.id);
+
+	// Focus the editor, so the editor-safety rule STASHES the remote edit behind the
+	// banner rather than applying it silently over what the user is doing.
+	await card.getByTestId('static-code').click();
+	await expect(card.getByTestId('cell-mode')).toHaveAttribute('data-mode', 'edit');
+
+	const remoteSource = 'REMOTE_MARKER = "changed-on-server"';
+	await setCellSource(page, target.id, remoteSource);
+	await expect(card.getByTestId('remote-changed')).toBeVisible();
+
+	// ---- collapsed: strictly the toolbar row, banner and Load button included ----
+	await setCollapsed(page, target.id, true);
+	await expect(card.getByTestId('remote-changed')).toHaveCount(0);
+	await expect(card.getByTestId('remote-changed-load')).toHaveCount(0);
+	expect(await cardHeight(page, target.id)).toBeLessThan(60);
+
+	// ---- expanding brings back the SAME banner: the collapse holds no state ----
+	await setCollapsed(page, target.id, false);
+	await expect(card.getByTestId('remote-changed')).toBeVisible();
+	await card.getByTestId('remote-changed-load').click();
+	await expect(card.getByTestId('remote-changed')).toHaveCount(0);
+	await expect(card.locator('.cm-content')).toContainText('REMOTE_MARKER');
+
+	await restoreCell(page, target);
+});
+
+test('a collapsed cell windowed out hands its stashed remote edit back', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+
+	const cells = await serverCells(page);
+	const target = cells.filter((c) => c.cell_type === 'code')[0];
+	await setCollapsed(page, target.id, false);
+	const card = cell(page, target.id);
+
+	await card.getByTestId('static-code').click();
+	await expect(card.getByTestId('cell-mode')).toHaveAttribute('data-mode', 'edit');
+	const remoteSource = 'UNMOUNT_MARKER = "handed-back"';
+	await setCellSource(page, target.id, remoteSource);
+	await expect(card.getByTestId('remote-changed')).toBeVisible();
+
+	await setCollapsed(page, target.id, true);
+	await expect(card.getByTestId('remote-changed')).toHaveCount(0);
+
+	// Move the selection (and DOM focus) off it: the PRIMARY and the focused cell are
+	// both PINNED mounted wherever they are, so a cell that is still either would
+	// never leave the window and this would prove nothing.
+	await setScrollTop(page, 0);
+	await page.waitForTimeout(300);
+	const other = cell(page, cells[0].id);
+	const otherBox = (await other.boundingBox())!;
+	await other.click({ position: { x: Math.round(otherBox.width / 2), y: 14 } });
+	await expect(other).toHaveAttribute('data-active', 'true');
+
+	// Scroll far enough that windowing tears this instance down. The stash lives only
+	// on the instance, so the teardown has to hand the marker back - hiding the banner
+	// must not have discarded it (that would silently drop the agent's edit and leave
+	// the cell showing, running and re-PATCHing the pre-edit source).
+	await setScrollTop(page, 20_000);
+	await page.waitForTimeout(400);
+	await expect.poll(() => isCellMounted(page, target.id), { timeout: 15_000 }).toBe(false);
+	await setScrollTop(page, 0);
+	await page.waitForTimeout(400);
+	await expect.poll(() => isCellMounted(page, target.id), { timeout: 15_000 }).toBe(true);
+
+	// Still collapsed, and the header now previews the REMOTE source: the marker was
+	// handed back and adopted by the fresh instance.
+	await expect(collapseToggle(page, target.id)).toHaveAttribute('data-collapsed', 'true');
+	await expect(card.getByTestId('collapsed-preview')).toHaveText(remoteSource);
+
+	await restoreCell(page, target);
+});
+
+test('a delete the server never confirms leaves the collapse entry intact', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openWindowed(page);
+
+	const before = await serverCells(page);
+	const target = before[1];
+
+	await setCollapsed(page, target.id, true);
+	await expect.poll(() => persistedCollapsed(page).then((r) => r[target.id]), { timeout: 10_000 }).toBe(true);
+
+	// The DELETE never reaches the server, so nothing ever confirms it. Unlike the
+	// raw-edit flag beside it, the collapse record is PERSISTED: pruning it
+	// optimistically would write the state away for good, because the refetch that
+	// puts the cell back re-reads the already-pruned record and so restores nothing.
+	await page.route('**/api/cells/**', (route) =>
+		route.request().method() === 'DELETE' ? route.abort() : route.continue()
+	);
+	await cell(page, target.id).getByTestId('delete').click();
+	await page.waitForTimeout(500);
+	await page.unroute('**/api/cells/**');
+
+	// The refetch put the cell back, and it came back collapsed - on screen and in
+	// the store, so a reload agrees too.
+	expect((await serverCells(page)).some((c) => c.id === target.id)).toBe(true);
+	await expect(collapseToggle(page, target.id)).toHaveAttribute('data-collapsed', 'true');
+	expect(await persistedCollapsed(page)).toHaveProperty(target.id, true);
+
+	await openWindowed(page);
+	await expect(collapseToggle(page, target.id)).toHaveAttribute('data-collapsed', 'true');
+
+	await restoreCell(page, target);
 });
 
 test('a full collapse leaves the editor-collapse choice and the heading fold untouched', async ({ page }) => {

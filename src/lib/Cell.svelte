@@ -1939,8 +1939,19 @@
 
 		<!-- "Changed on server" affordance: a remote (agent / other-tab) edit
 		     arrived while you were editing this cell, so it was held back rather
-		     than clobbering your typing. Load applies it to the editor. -->
-		{#if remoteChanged}
+		     than clobbering your typing. Load applies it to the editor.
+
+		     Collapse-guarded like every sibling block below the toolbar: a collapsed
+		     cell is strictly the toolbar row, which is what makes the header-only
+		     `COLLAPSED_CELL_PX` the window plans against true - a banner rendering
+		     there would overflow that estimate AND offer a Load button acting on an
+		     editor the user cannot see. Hiding it is safe because it holds no state:
+		     the stash lives in `remoteChanged`/`pendingRemoteSource`, which collapse
+		     never touches, so expanding shows the same banner and a teardown still
+		     hands the marker back (see the destroy handler). The `{#if}` form is
+		     right for the same reason `markdown-rendered` and `show-code` use it -
+		     the content is purely derived, so a re-mount resets nothing. -->
+		{#if remoteChanged && !cellCollapsed}
 			<div class="flex items-center justify-between gap-2 border-b border-warning/40 bg-warning/10 px-3 py-1 text-[11px] text-warning" data-testid="remote-changed">
 				<span>Changed on server while you were editing.</span>
 				<button class="btn btn-ghost btn-xs h-5 min-h-0 px-2 text-warning hover:bg-warning/20" onclick={loadRemote} data-testid="remote-changed-load">Load</button>

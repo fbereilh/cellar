@@ -2369,7 +2369,6 @@
 		const snapshot = [snapshotDeletedCell(cell, i)];
 		cells = cells.filter((c) => c.id !== id);
 		setRawEdit(id, false);
-		forgetCollapsed([id]);
 		// Keep a cell selected: command mode acts on the selection, so deleting the
 		// selected cell must hand the selection to its neighbor, not drop it. Focus
 		// follows, because the delete button that had it is gone with the cell.
@@ -2381,8 +2380,16 @@
 		// A refused/failed delete published no `cell:deleted`, and this tab suppresses
 		// its own echo anyway, so nothing else would ever correct the divergence - nor
 		// explain it, hence the notice before the refetch puts the cell back.
-		if (res?.ok) pushUndo(snapshot);
-		else {
+		// The collapse prune waits on the server too, and for a sharper reason than the
+		// undo group: unlike `setRawEdit` above it is PERSISTED, so pruning optimistically
+		// and then being refused leaves `load()` putting the cell back with its collapse
+		// state durably gone - `loadCellCollapsed()` re-reads the already-pruned record,
+		// so nothing restores it. A stale entry in the interim is harmless; the next
+		// load's `pruneCollapsedToCells` is the backstop.
+		if (res?.ok) {
+			pushUndo(snapshot);
+			forgetCollapsed([id]);
+		} else {
 			await noticeRefusal(res);
 			await load();
 		}
@@ -2484,11 +2491,17 @@
 		cells = cells.filter((c) => !removed.has(c.id));
 		const applied = before - cells.length;
 		for (const id of ids) setRawEdit(id, false);
-		forgetCollapsed(ids);
 		if (runningId && removed.has(runningId)) runningId = null;
 		selectOnly(nextActive);
 		if (nextActive) await selectAndFocus(nextActive);
-		if (await bulkOp({ op: 'delete', ids }, applied)) pushUndo(group);
+		// The persisted collapse record is pruned only on confirmation, for the same
+		// reason `deleteCell` defers it: a refused batch refetches the cells back, and
+		// an optimistic prune would have already written their collapse state away for
+		// good (the reload re-reads the pruned record, so nothing restores it).
+		if (await bulkOp({ op: 'delete', ids }, applied)) {
+			pushUndo(group);
+			forgetCollapsed(ids);
+		}
 		scheduleStaleness();
 	}
 
