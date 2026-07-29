@@ -16,6 +16,17 @@
  *   - heading folding (`$lib/headings`): hides a RANGE of cells under a markdown
  *     heading (`display:none`, so those cells render nothing at all).
  *
+ * ONE accepted seam between this and folding: the fold chevron and the "N cells
+ * hidden" chip are drawn inside the rendered markdown, so collapsing a markdown cell
+ * whose heading is currently FOLDED hides them along with the body - the folded range
+ * stays hidden with no in-notebook marker of why. It is cosmetic, reachable only by
+ * deliberately folding AND collapsing the same cell, recoverable three ways (expand
+ * the cell, the sidebar Outline chevron, `h`/`l`), and the collapsed header's preview
+ * still reads the heading itself (`## Setup`). Left as-is on purpose: a fold marker on
+ * the collapsed header would defeat the minimal row the feature exists for, and
+ * touching fold state on collapse - refusing, or auto-unfolding - would mean writing
+ * state the user never asked to change, which this codebase treats as a defect.
+ *
  * The state is keyed by cell id in a plain record - never off a mounted DOM node -
  * because windowed rendering destroys and rebuilds a Cell whenever it leaves and
  * re-enters the window (the "a Cell instance is DISPOSABLE" rule). It is persisted

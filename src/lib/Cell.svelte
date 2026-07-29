@@ -1344,7 +1344,10 @@
 		const shouldScroll = !!active && scrollKey !== lastScrollKey;
 		lastScrollKey = scrollKey;
 
-		const sourceVisible = !(isMarkdown && mode === 'rendered') && !codeHidden;
+		// A collapsed cell shows neither input nor output, so every surface CLEARS -
+		// leaving ranges registered against a hidden (or, for markdown, detached) node
+		// would keep this cell's entries in the shared registry with nothing to paint.
+		const sourceVisible = !cellCollapsed && !(isMarkdown && mode === 'rendered') && !codeHidden;
 		const sourceActive = active && (active.field === 'source' || active.field === 'markdown') ? active.ordinal : null;
 
 		// --- source surface: the built editor, else the static stand-in ---
@@ -1364,12 +1367,12 @@
 		}
 
 		// --- rendered markdown ---
-		const mdEl = isMarkdown && mode === 'rendered' ? (cardEl?.querySelector('[data-testid="markdown-rendered"]') as Element | null) : null;
+		const mdEl = !cellCollapsed && isMarkdown && mode === 'rendered' ? (cardEl?.querySelector('[data-testid="markdown-rendered"]') as Element | null) : null;
 		const mdActive = active && active.field === 'markdown' ? active.ordinal : null;
 		paintDomSurface(K_MD, mdEl, q, opts, mdActive, shouldScroll);
 
 		// --- output ---
-		const outEl = !isMarkdown && outputs.length ? outputInner : null;
+		const outEl = !cellCollapsed && !isMarkdown && outputs.length ? outputInner : null;
 		const outActive = active && active.field === 'output' ? active.ordinal : null;
 		paintDomSurface(K_OUT, outEl, q, opts, outActive, shouldScroll);
 	}
@@ -1427,6 +1430,14 @@
 		void isMarkdown;
 		void mode;
 		void codeHidden;
+		// Tracked because a full collapse DROPS the rendered-markdown block via `{#if}`,
+		// detaching the very nodes this cell's registered Ranges point at: without it
+		// nothing else changes on expand, so a re-expanded markdown cell painted no
+		// highlights while the find bar still counted its match. (Code cells survive on
+		// their own - editor and output are only `display:none`, so their nodes and
+		// Ranges stay valid - but both still clear here while collapsed, which is why
+		// this dep may not be "simplified" away.)
+		void cellCollapsed;
 		void outputs;
 		void liveSource;
 		if (!browser) return;
