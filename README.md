@@ -16,7 +16,7 @@ It saves ordinary `.ipynb` files that open in vanilla Jupyter, and it keeps them
 
 ## Why Cellar
 
-- 🤝 **You and your agent, one notebook.** An agent's runs and edits appear live in your open tab (streaming output, run badges, structural changes), and your edits flow back the same way. You are never looking at stale state.
+- 🤝 **You and your agent, one notebook.** An agent's runs and edits appear live in your open tab (streaming output, run badges, structural changes), and your edits flow back the same way - the agent is *told* when you change something under it, so it re-reads instead of treating your edit as a broken tool. You are never looking at stale state.
 - ⚡ **One command, zero setup.** Run `cellar` in any folder. It resolves (or creates) the project venv with [`uv`](https://docs.astral.sh/uv/), starts the kernel, and opens your browser.
 - 🔌 **Zero-config agent connection.** Cellar drops a `.mcp.json` in your workspace, so an agent opened in that folder connects automatically over MCP. Nothing to wire up.
 - 🧹 **Git-friendly by design.** Clean-on-save strips volatile metadata and normalizes outputs, so re-running a notebook with the same results produces *no* git diff.
@@ -184,6 +184,8 @@ claude mcp add cellar -- cellar mcp
 ```
 
 (or just run `cellar` and let the auto-written `.mcp.json` do it). On connect, the agent gets a house-style doctrine that frames the work as building *one coherent notebook*, plus a rich tool set: read the notebook map and live kernel state, add/edit/move cells, run them, and clear their outputs (`add_and_run` is the preferred write-and-execute flow; `clear_outputs` sheds a stale figure or a huge traceback without deleting the cell). Because the MCP session is independent of the kernel connection, restarting the kernel never drops the agent's session or your document.
+
+**Your agent is told what *you* changed.** You keep editing the notebook while the agent works, so Cellar reports your changes on the agent's own next tool call: a short "the user deleted cell a1b2c3d4 and edited cell e5f6a7b8" note rides along with the result, and only when there is something to say. If the agent reaches for a cell you just deleted, the error names the cause ("the user deleted it just now in the Cellar UI") instead of the bare "no cell matches id" it gets for a made-up handle - so a normal edit of yours no longer reads to the agent (or to you, watching it) as a broken tool. The note is a bounded summary and the agent is told to re-read the notebook for the details; anything the agent did itself is left out, a *second* agent's edits are reported the same way as yours, and a cell you hid from the agent stays hidden, changes included.
 
 **Your agent can see the plots it draws.** When a cell produces a figure, the run result carries the rendered chart as a real image the agent looks at - so it checks the axis labels and the data instead of saving the plot to a scratch file to read it back. It stays cheap by design: an oversized figure is downscaled for the reply (`get_full_output` with `size:"full"` returns the original), a run result inlines at most a few images, and the scan-style reads (the notebook map, cell reads, search) keep a terse `[image/png, 978×536, 44 KB]` marker instead of dumping every figure into the agent's context. A multi-cell run (`run_all` and friends) stays compact too: it flags which cells drew something with `has_image` and the agent fetches the ones that matter.
 

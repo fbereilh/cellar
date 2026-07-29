@@ -6,6 +6,13 @@
  * point (the UI `/run` route and the MCP run tools) publishes here, so an
  * agent-driven run reaches an already-open browser with no reload.
  *
+ * SSE is the main consumer but no longer the only one: `mcp/userActivity.ts`
+ * subscribes in-process (it never writes a frame) to record what the human
+ * changed, so an agent's next tool call can say so. Listeners run SYNCHRONOUSLY
+ * inside `publish()`, i.e. inside the caller's write path and async context -
+ * which is what lets that consumer attribute a change to the MCP session that
+ * caused it, and why a listener must never throw or block.
+ *
  * Runs in the same Node process as the notebook document, the kernel bridge,
  * and the in-process MCP server (`src/hooks.server.js`), so there is nothing to
  * serialize across processes — a plain `EventEmitter` is the whole transport.
@@ -18,10 +25,23 @@ import { EventEmitter } from 'node:events';
 import type { CellarEvent, PublishedEvent, GlobalEvent, DispatchedEvent } from './types';
 
 const emitter = new EventEmitter();
-// One listener per open SSE stream; a browser may hold several tabs open.
+// One listener per open SSE stream (a browser may hold several tabs open), plus
+// the in-process consumers.
 emitter.setMaxListeners(0);
 
 const seqs = new Map<string, number>(); // canonical notebook id (absolute path) -> last seq
+
+/**
+ * The last `seq` stamped for a notebook (0 before its first event). A CURSOR
+ * primitive: a consumer that wants "everything that happened since I last
+ * looked" snapshots this, does its work, and later asks for the events in
+ * between - which is exactly what the MCP user-activity digest
+ * (`mcp/userActivity.ts`) does around every tool call. Reading it is O(1) and
+ * publishes nothing.
+ */
+export function currentSeq(nb: string): number {
+	return seqs.get(nb) ?? 0;
+}
 
 /**
  * The full SSE frame for a dispatched event — computed ONCE here, then fanned out
@@ -43,8 +63,9 @@ function emit(event: DispatchedEvent): void {
 }
 
 /**
- * Publish an event to every open stream. Stamps a per-notebook monotonic `seq`
- * and returns the enriched event (with `seq`) for callers that want it.
+ * Publish an event to every subscriber (open SSE streams, plus the in-process
+ * consumers noted above). Stamps a per-notebook monotonic `seq` and returns the
+ * enriched event (with `seq`) for callers that want it.
  */
 export function publish(event: CellarEvent): PublishedEvent {
 	const nb = event.nb;
@@ -74,7 +95,8 @@ export function publishGlobal<T extends Record<string, unknown>>(
  * Subscribe to all events. The listener receives the event object AND its
  * pre-serialized SSE `frame` string (see `sseFrame`) — the SSE route writes the
  * shared frame directly, so the payload is serialized once per publish regardless
- * of how many tabs are connected. Returns an unsubscribe function.
+ * of how many tabs are connected. An in-process consumer (`mcp/userActivity.ts`)
+ * reads the event and ignores the frame. Returns an unsubscribe function.
  */
 export function subscribe(listener: (event: DispatchedEvent, frame: string) => void): () => void {
 	emitter.on('event', listener);
