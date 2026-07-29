@@ -25,6 +25,14 @@
 	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
+	import {
+		collapsedKeyFor,
+		sanitizeCollapsed,
+		withCollapse,
+		withoutCells,
+		retainCells,
+		type CollapsedRecord
+	} from '$lib/cellCollapse';
 	import type { CellView, CellOutput, CellType, LogicalCellType, Actor, RunningView, QueueEntryView, LastRun, CellarNamespace, PublishedEvent } from '$lib/server/types';
 	import type { CellActivation, UICell, KeyMode, FoldRegistryHandle, JumpOptions, NumberingRegistryHandle, NotebookApiHandle, CellRegisterApi } from '$lib/types';
 	import type { BlameLine } from '$lib/server/git';
@@ -335,10 +343,10 @@
 	// `onRegisterFolds`, so the outline's chevrons and the notebook's chevrons are
 	// one control over one state and cannot diverge.
 	//
-	// Kept runtime-only (localStorage keyed by this notebook), never written to
-	// the `.ipynb`, so folding a section produces zero git-diff noise. Folded
-	// cells stay in `cells` (they run/persist normally); we only hide them from
-	// the rendered flow.
+	// Kept runtime-only (the per-project UI store keyed by this notebook - see
+	// `$lib/uiState`), never written to the `.ipynb`, so folding a section produces
+	// zero git-diff noise. Folded cells stay in `cells` (they run/persist normally);
+	// we only hide them from the rendered flow.
 	let foldedIds = $state<Set<string>>(new Set());
 	// `computeFolding` is an O(N) fence-aware re-parse of every markdown cell, but it
 	// depends ONLY on the heading layout (`foldSignature`) and the folded set - not on
@@ -466,9 +474,9 @@
 
 	// ---- Collapsible code editors --------------------------------------------
 	// Per-cell "collapse the code editor to a fixed scrollable height" choice.
-	// Like the fold state above, kept runtime-only (localStorage keyed by this
-	// notebook), never written to the `.ipynb` — a pure view preference with zero
-	// git-diff (the deliberate contrast with `output_scrolled`, which does
+	// Like the fold state above, kept runtime-only (the per-project UI store keyed
+	// by this notebook), never written to the `.ipynb` — a pure view preference
+	// with zero git-diff (the deliberate contrast with `output_scrolled`, which does
 	// round-trip to disk). A cell id maps to an explicit boolean (true = force
 	// collapsed, false = force full height); an absent id means auto (the Cell
 	// collapses it only when the editor is taller than the cap).
@@ -494,6 +502,61 @@
 		else next[id] = collapsed;
 		editorCollapsed = next;
 		saveEditorCollapsed();
+	}
+
+	// ---- Fully collapsed cells -----------------------------------------------
+	// "Hide this whole cell": input AND output gone, only the header row (with the
+	// cell id) left. Distinct from `editorCollapsed` above, which only contracts a
+	// TALL editor to a scroll box and leaves the output alone, and from heading
+	// folding, which hides a RANGE of cells outright. The three are orthogonal:
+	// expanding a cell restores whatever its editor-collapse / fold state was.
+	//
+	// Persisted per notebook through the same UI store as `editorCollapsed` - "hide
+	// this cell" is a deliberate, durable intent, so it survives a reload - and, being
+	// a view preference, never reaches the `.ipynb` (zero git diff). Keyed by cell id,
+	// never off a mounted node: with windowing on, most cells have no DOM at all.
+	// The rules (key, shape, preview) are pure and unit-tested in `$lib/cellCollapse`.
+	let cellCollapsed = $state<CollapsedRecord>({});
+
+	function loadCellCollapsed() {
+		const key = collapsedKeyFor(canonicalId);
+		if (!key) return;
+		cellCollapsed = sanitizeCollapsed(getUi(key, null));
+	}
+	function saveCellCollapsed() {
+		const key = collapsedKeyFor(canonicalId);
+		if (key) setUi(key, cellCollapsed);
+	}
+	function setCellCollapsed(id: string, collapsed: boolean) {
+		const next = withCollapse(cellCollapsed, id, collapsed);
+		if (next === cellCollapsed) return; // already in that state - no write, no re-render
+		cellCollapsed = next;
+		saveCellCollapsed();
+	}
+	/** Drop the collapse entries of cells that no longer exist (the delete paths). */
+	function forgetCollapsed(ids: Iterable<string>) {
+		const next = withoutCells(cellCollapsed, ids);
+		if (next === cellCollapsed) return;
+		cellCollapsed = next;
+		saveCellCollapsed();
+	}
+	/**
+	 * Reconcile the record against the cells a load just returned.
+	 *
+	 * `forgetCollapsed` only fires for deletions THIS tab saw. A cell deleted while
+	 * the tab was disconnected (the reconnect / seq-gap refetch) or removed by a
+	 * checkpoint restore never reaches it, so without this its entry would sit in the
+	 * per-project JSON for good. Identity-preserving like the helpers above: a load
+	 * with nothing to drop writes nothing.
+	 */
+	function pruneCollapsedToCells() {
+		const next = retainCells(
+			cellCollapsed,
+			cells.map((c) => c.id)
+		);
+		if (next === cellCollapsed) return;
+		cellCollapsed = next;
+		saveCellCollapsed();
 	}
 
 	// ---- Markdown raw-edit mode ----------------------------------------------
@@ -1297,6 +1360,8 @@
 			else pruneSelection();
 			loadFolds(); // restore this notebook's collapsed sections (runtime-only, per notebook)
 			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
+			loadCellCollapsed(); // restore this notebook's fully collapsed cells (runtime-only)
+			pruneCollapsedToCells(); // drop entries for cells deleted while we were away
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
@@ -1392,6 +1457,7 @@
 		} else if (ev.type === 'cell:deleted') {
 			cells = cells.filter((c) => c.id !== ev.cellId);
 			setRawEdit(ev.cellId, false);
+			forgetCollapsed([ev.cellId]);
 			if (runningId === ev.cellId) runningId = null;
 			// A cell an agent (or another tab) removed leaves the selection: it no
 			// longer exists, so a bulk op must not still be aimed at it. Dropping the
@@ -2314,8 +2380,16 @@
 		// A refused/failed delete published no `cell:deleted`, and this tab suppresses
 		// its own echo anyway, so nothing else would ever correct the divergence - nor
 		// explain it, hence the notice before the refetch puts the cell back.
-		if (res?.ok) pushUndo(snapshot);
-		else {
+		// The collapse prune waits on the server too, and for a sharper reason than the
+		// undo group: unlike `setRawEdit` above it is PERSISTED, so pruning optimistically
+		// and then being refused leaves `load()` putting the cell back with its collapse
+		// state durably gone - `loadCellCollapsed()` re-reads the already-pruned record,
+		// so nothing restores it. A stale entry in the interim is harmless; the next
+		// load's `pruneCollapsedToCells` is the backstop.
+		if (res?.ok) {
+			pushUndo(snapshot);
+			forgetCollapsed([id]);
+		} else {
 			await noticeRefusal(res);
 			await load();
 		}
@@ -2420,7 +2494,14 @@
 		if (runningId && removed.has(runningId)) runningId = null;
 		selectOnly(nextActive);
 		if (nextActive) await selectAndFocus(nextActive);
-		if (await bulkOp({ op: 'delete', ids }, applied)) pushUndo(group);
+		// The persisted collapse record is pruned only on confirmation, for the same
+		// reason `deleteCell` defers it: a refused batch refetches the cells back, and
+		// an optimistic prune would have already written their collapse state away for
+		// good (the reload re-reads the pruned record, so nothing restores it).
+		if (await bulkOp({ op: 'delete', ids }, applied)) {
+			pushUndo(group);
+			forgetCollapsed(ids);
+		}
 		scheduleStaleness();
 	}
 
@@ -3071,6 +3152,8 @@
 			onSetHideInput={setHideInput}
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}
+			cellCollapsed={cellCollapsed}
+			onSetCellCollapsed={setCellCollapsed}
 			rawEdits={rawEdits}
 			onSetRawEdit={setRawEdit}
 			onActivate={activateCell}

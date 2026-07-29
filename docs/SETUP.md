@@ -348,6 +348,21 @@ spec files at a time. Install its browser once with `npx playwright install chro
   with `?virtualize=0` on the app URL (`=1` forces it back on). The URL parameter
   always wins, and both controls are then shown locked (Settings naming the
   parameter) so neither can pretend otherwise.
+- **A cell shows only a single header row** - it is collapsed: the chevron at the left
+  of a cell's toolbar hides that cell's input *and* its output, leaving the header
+  (cell id, type, run controls, run/stale badges) plus a one-line source preview. Click
+  the chevron again, or anywhere on the collapsed header, to expand it; a collapsed
+  cell can still be run, moved, selected, and deleted. A click carrying a selection
+  modifier (`Shift`, `Cmd`/`Ctrl`) or a right-click is a selection gesture, not a
+  disclosure one, so it leaves the cell collapsed. The choice is remembered per
+  notebook (in the workspace's `.cellar/` store, like folded headings), so it survives
+  a reload and never touches the `.ipynb` - no git diff.
+- **Find matched a cell but nothing is highlighted in it** - the match is inside a cell
+  whose content is currently hidden - a cell collapsed to its header row, or a source
+  match in a cell whose code is hidden by report view. Those matches are still counted,
+  so the `i / N` total stays honest, but there is nothing on screen to paint. Expand the
+  cell (or show its code) and the highlight appears; a search never expands a cell for
+  you, so it can't discard a collapse you set by hand.
 - **A run aborted with "The kernel connection is being refreshed; re-run the cell"** -
   the kernel websocket died (its reconnect retries were spent) while the process
   itself is still alive. Cellar rebuilds the socket in the background without

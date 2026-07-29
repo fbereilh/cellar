@@ -5,6 +5,7 @@
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
 	import type { CellHighlight } from '$lib/searchHighlight';
+	import type { CollapsedRecord } from '$lib/cellCollapse';
 	import {
 		planWindow,
 		pinnedCellIds,
@@ -87,6 +88,10 @@
 		/** cell id → explicit code-editor collapse choice (runtime-only) */
 		editorCollapsed?: Record<string, boolean | undefined>;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
+		/** cell id → this cell is FULLY collapsed: input + output hidden, header only
+		 *  (`$lib/cellCollapse`; runtime-only, persisted per notebook). */
+		cellCollapsed?: CollapsedRecord;
+		onSetCellCollapsed?: (id: string, collapsed: boolean) => void;
 		/** cell id → this markdown cell is open for raw source editing (runtime-only) */
 		rawEdits?: Record<string, boolean | undefined>;
 		onSetRawEdit?: (id: string, raw: boolean) => void;
@@ -162,6 +167,8 @@
 		onSetHideInput,
 		editorCollapsed = {},
 		onSetEditorCollapsed,
+		cellCollapsed = {},
+		onSetCellCollapsed,
 		rawEdits = {},
 		onSetRawEdit,
 		onActivate,
@@ -217,7 +224,11 @@
 	const DEFAULT_ESTIMATE_PX = 200;
 	function estimateFor(id: string): number {
 		const c = cellById?.get(id);
-		return c ? estimateHeight(c) : DEFAULT_ESTIMATE_PX;
+		// A fully collapsed cell renders its header row and nothing else, so estimating
+		// it from its source + outputs would reserve the space of a body it is not
+		// drawing - metres of phantom flow for a collapsed section of a big notebook.
+		// (Once it mounts, its MEASURED height replaces this either way.)
+		return c ? estimateHeight(c, !!cellCollapsed[id]) : DEFAULT_ESTIMATE_PX;
 	}
 	// The window walks the VISIBLE cell sequence: a folded (`hidden`) cell contributes
 	// 0 height and never mounts (report §5.5), so it is excluded from the order the
@@ -557,6 +568,8 @@
 			onSetHideInput={onSetHideInput}
 			editorCollapsed={editorCollapsed[cell.id]}
 			onSetEditorCollapsed={onSetEditorCollapsed}
+			cellCollapsed={!!cellCollapsed[cell.id]}
+			onSetCellCollapsed={onSetCellCollapsed}
 			rawEdit={rawEdits[cell.id] ?? false}
 			onSetRawEdit={onSetRawEdit}
 			onActivate={onActivate}

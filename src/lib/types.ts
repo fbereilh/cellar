@@ -155,13 +155,21 @@ export interface NotebookApiHandle {
  * editor state (not the debounced `cell.source`) is always the source of truth.
  */
 export interface CellRegisterApi {
-	/** Advance focus into this cell: its editor, or the card for rendered markdown. */
+	/**
+	 * Advance focus into this cell: its editor, or the card whenever that editor is
+	 * `display:none` and so cannot take focus - rendered markdown, or a FULLY
+	 * COLLAPSED cell (`$lib/cellCollapse`). Landing on a collapsed cell deliberately
+	 * does NOT expand it; only explicit edit-intent (`enterEdit`) does.
+	 */
 	focus: () => void;
 	/** Focus the cell's outer card (command mode acts on it). */
 	focusCell: () => void;
 	/** Leave the editor, handing focus back to the card. */
 	blur: () => void;
-	/** Enter edit mode (open the editor / raw markdown source). */
+	/**
+	 * Enter edit mode (open the editor / raw markdown source). Expands a fully
+	 * collapsed cell first - asking to type in a cell is asking to see it.
+	 */
 	enterEdit: () => void;
 	/** True while CodeMirror owns an overlay (completion tooltip / search panel). */
 	editorOverlayOpen: () => boolean;

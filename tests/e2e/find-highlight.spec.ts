@@ -275,6 +275,32 @@ test('closing the bar clears every highlight', async ({ page }) => {
 	await expect.poll(() => highlightCount(page, 'cellar-search-active')).toBe(0);
 });
 
+test('a full collapse clears a markdown cell\'s highlights, and expanding repaints them', async ({ page }) => {
+	await open(page);
+	await openFindBar(page);
+	await findInput(page).fill(TOKEN);
+
+	const md = page.locator(`[data-cell-id="${id(IDX.mdMatch)}"]`);
+	const toggle = md.getByTestId('cell-collapse-toggle');
+	const painted = async () =>
+		(await highlightCount(page, 'cellar-search')) + (await highlightCount(page, 'cellar-search-active'));
+	await expect.poll(painted).toBeGreaterThan(0);
+	const before = await painted();
+
+	// A full collapse DROPS the rendered-markdown block via `{#if}`, so this cell's
+	// ranges must be cleared rather than left pointing at detached nodes.
+	await toggle.click();
+	await expect(md.getByTestId('markdown-rendered')).toHaveCount(0);
+	await expect.poll(painted).toBe(before - 1);
+
+	// The regression this pins: expanding re-creates that block, but no other
+	// highlight input changed - so without `cellCollapsed` as a tracked dep the cell
+	// stayed unpainted while the find bar went on counting its match.
+	await toggle.click();
+	await expect(md.getByTestId('markdown-rendered')).toBeVisible();
+	await expect.poll(painted).toBe(before);
+});
+
 test('view-only: highlighting is a pure overlay (no <mark> mutation, source unchanged)', async ({ page }) => {
 	await open(page);
 	const read = (cid: string) =>
