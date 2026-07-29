@@ -352,7 +352,9 @@ spec files at a time. Install its browser once with `npx playwright install chro
   of a cell's toolbar hides that cell's input *and* its output, leaving the header
   (cell id, type, run controls, run/stale badges) plus a one-line source preview. Click
   the chevron again, or anywhere on the collapsed header, to expand it; a collapsed
-  cell can still be run, moved, selected, and deleted. The choice is remembered per
+  cell can still be run, moved, selected, and deleted. A click carrying a selection
+  modifier (`Shift`, `Cmd`/`Ctrl`) or a right-click is a selection gesture, not a
+  disclosure one, so it leaves the cell collapsed. The choice is remembered per
   notebook (in the workspace's `.cellar/` store, like folded headings), so it survives
   a reload and never touches the `.ipynb` - no git diff.
 - **Find matched a cell but nothing is highlighted in it** - the match is inside a cell

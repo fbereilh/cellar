@@ -738,7 +738,7 @@
 	// Mirrors the scrollable-outputs UX: a tall code editor can be contracted to
 	// a fixed-height scroll box instead of growing the cell. The per-cell choice
 	// is a tri-state (undefined = auto, true = force collapsed, false = force
-	// full) persisted runtime-only by LiveNotebook (localStorage, git-clean) via
+	// full) persisted runtime-only by LiveNotebook (the per-project UI store, git-clean) via
 	// `onSetEditorCollapsed` — never written to the `.ipynb`, the deliberate
 	// contrast with `output_scrolled`. Above the cap we auto-collapse unless the
 	// user set an explicit choice.

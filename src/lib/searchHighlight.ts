@@ -4,7 +4,11 @@
  * The find-bar (P3) produces a flat, document-ordered list of {@link Match}es and
  * an "active" index the user is stepping through. P4 turns those into the visual
  * layer: every match highlighted *where it appears* in a mounted cell, and the
- * active one emphasized + scrolled into view.
+ * active one emphasized + scrolled into view. A match on a surface the cell is
+ * not currently showing - a cell collapsed to its header (`$lib/cellCollapse`),
+ * or source hidden by report view (`$lib/hideInput`) - is still COUNTED by the
+ * engine but has nothing to paint; `Cell.svelte` clears those surfaces rather
+ * than leaving stale ranges, and a search never expands a cell to reach them.
  *
  * This module holds only the PURE, DOM-free pieces so they can be unit-tested:
  *  - {@link buildCellHighlights} maps the flat match list onto a per-cell payload
