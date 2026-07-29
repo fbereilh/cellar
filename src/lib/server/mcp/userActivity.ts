@@ -41,7 +41,7 @@
  * get_notebook_map as the authority (stated once in INSTRUCTIONS, not repeated
  * on every emission), and reports nothing it cannot verify.
  *
- * TWO FURTHER BOUNDS, KNOWN AND ACCEPTED (stated so they do not read as
+ * THREE FURTHER BOUNDS, KNOWN AND ACCEPTED (stated so they do not read as
  * oversights):
  *
  *   1. `activity` and `tombstones` are keyed by ABSOLUTE notebook path and are
@@ -56,11 +56,28 @@
  *      case `withProgress` mitigates - therefore consumes that window's activity
  *      and never sees it. A handler that THROWS correctly leaves the cursor
  *      untouched, so the gap is only the discarded-result path.
+ *
+ *   3. `DIGEST_PREFIX` IS A FIXED, UNAUTHENTICATED LITERAL, and the INSTRUCTIONS
+ *      clause declares that marker trustworthy ("emitted by Cellar itself ...
+ *      trustworthy facts about the document"). So a shared or downloaded notebook
+ *      whose CELL OUTPUT prints that literal can forge what reads as a trusted
+ *      Cellar note: output text is JSON-stringified into the tool payload block
+ *      and the digest is appended to that SAME content array, so both reach the
+ *      model as text with nothing distinguishing them. The irony is worth stating
+ *      so it is not lost on a future reader - this surface exists BECAUSE of the
+ *      pre-announcement clause, since the clause is what makes the marker trusted,
+ *      so it is the mirror image of the prompt-injection problem that clause
+ *      solves. This is a KNOWN, USER-ACCEPTED limitation, not an oversight. The
+ *      mitigation, should it ever matter: append a per-session random token to the
+ *      marker and interpolate it into INSTRUCTIONS exactly the way DIGEST_PREFIX
+ *      already is, so prose and payload still cannot drift but notebook content
+ *      cannot forge the marker.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { subscribe, currentSeq } from '../events';
 import { listCells } from '../notebook';
 import { computeHandles, MIN_HANDLE } from './cellHandle';
+import { isHiddenFromAgent } from '../../agentVisibility';
 import type { CellView, DispatchedEvent, PublishedEvent } from '../types';
 
 /**
@@ -165,6 +182,15 @@ const cursors = new Map<string, Map<string, number>>(); // mcp sessionId -> nb -
  * ALS propagates across `await`, so an async write tool is covered; work that
  * genuinely escapes the context (a detached timer) reads as foreign, i.e. it is
  * over-reported rather than silently attributed to the agent.
+ *
+ * THE COST, STATED SO THE ARGUMENT ABOVE IS NOT ONE-SIDED: the wire-byte reasoning
+ * is only half the ledger. The first `runAsAgent` call enables AsyncLocalStorage,
+ * which turns on async-hooks / promise-hook instrumentation for the WHOLE Node
+ * process for the rest of its lifetime - not only MCP handlers - and that same
+ * process carries the kernel websockets, the ~40ms output-delta fan-out and every
+ * SSE stream. On Node 20 (the pinned CI LTS, which predates AsyncContextFrame)
+ * that has a real promise-path cost. It has NOT been measured here; this is a
+ * known unquantified cost, not a claim that it is negligible.
  */
 const agentSession = new AsyncLocalStorage<string>();
 
@@ -352,8 +378,6 @@ export function deletionNote(nb: string, ref: string, callerSession?: string): s
 
 // --- (A) the digest ----------------------------------------------------------
 
-const hiddenFromAgent = (c: CellView): boolean => c.metadata?.cellar?.hidden_from_agent === true;
-
 function safeCells(nb: string): CellView[] {
 	try {
 		return listCells(nb);
@@ -427,7 +451,7 @@ function summarize(entries: Entry[], nb: string): string | null {
 			const cell = byId.get(id);
 			// Not in the document and not a recorded deletion: we cannot check whether
 			// it was hidden, so we do not disclose it. Never report what you cannot verify.
-			if (!cell || hiddenFromAgent(cell)) continue;
+			if (!cell || isHiddenFromAgent(cell)) continue;
 			handle = handles.get(id) ?? id.slice(0, MIN_HANDLE);
 		}
 		reported.add(id);

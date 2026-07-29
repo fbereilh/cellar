@@ -48,6 +48,7 @@ import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
+import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
 import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } from './image';
@@ -65,7 +66,7 @@ const asText = (s: unknown): string => (Array.isArray(s) ? s.join('') : ((s as s
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
 const stripAnsi = (s: string): string => (typeof s === 'string' ? s.replace(ANSI, '') : s);
 
-const isHidden = (c: CellView): boolean => c.metadata?.cellar?.hidden_from_agent === true;
+const isHidden = isHiddenFromAgent;
 const visibleCells = (nb?: string | null): CellView[] => listCells(nb).filter((c) => !isHidden(c));
 
 // --- short cell-id handles --------------------------------------------------
