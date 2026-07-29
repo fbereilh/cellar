@@ -17,6 +17,13 @@
  * the read tools', the digest would name a cell the read tools deliberately
  * refuse to show. It is the agent-visibility counterpart to `hideInput.ts`.
  *
+ * ONE literal comparison survives outside this module, deliberately named here so
+ * it is not mistaken for a stray copy: `notebook.ts`'s `deleteCells` reads the
+ * flag off each cell BEFORE the splice and carries it on the `cell:deleted` event
+ * (the cell is gone by the time a subscriber sees it, so the digest cannot look it
+ * up later). Same rule, read at the only moment it can be read - route it through
+ * this predicate if that site is ever touched.
+ *
  * DEFAULT-VISIBLE, and strictly `=== true`: the flag is an opt-in hide, so
  * anything else - absent, null, a truthy non-boolean out of a hand-edited
  * `.ipynb` - leaves the cell visible, which is the shape every caller expects.

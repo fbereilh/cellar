@@ -73,7 +73,8 @@ export function computeHandles(cells: ReadonlyArray<{ id: string }>): Map<string
  * and rejects a prefix that matches more than one cell (ambiguous) or none
  * (not found). It NEVER silently picks a cell: an ambiguous or unknown ref is an
  * error the caller surfaces, so a handle can only ever resolve to the exact cell
- * it was emitted for.
+ * it was emitted for. Every rejection throws a `CellRefError` carrying the `code`
+ * above, so a caller can tell the three apart without matching on message text.
  */
 export function resolveCellId(cells: ReadonlyArray<{ id: string }>, ref: string): string {
 	const r = (ref ?? '').trim();
