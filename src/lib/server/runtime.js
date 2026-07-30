@@ -9,11 +9,12 @@
  *   1. write `<workspace>/.cellar/runtime.json` on launch, recording the live
  *      instance's { mcpPort, appPort, pid } so `cellar mcp` (the stdio bridge)
  *      can discover the running server; and
- *   2. write/merge `<workspace>/.mcp.json` with a `cellar` stdio server entry
- *      that runs `cellar mcp` — the port never appears in config, so it never
- *      goes stale. That merge lives in `harness.js`, which does the same for
- *      every other supported agent harness (Codex's `.codex/config.toml`, …);
- *      `writeMcpConfig` here is just its Claude Code alias.
+ *   2. point each agent harness at that stdio bridge by writing/merging its own
+ *      config (Claude Code's `.mcp.json`, Codex's `.codex/config.toml`, …) with
+ *      a `cellar` server entry that runs `cellar mcp` — the port never appears
+ *      in config, so it never goes stale. That half lives entirely in
+ *      `harness.js`, the single source of truth for where those files are and
+ *      how they are merged; nothing here writes them.
  *
  * Node builtins + global fetch only, so this is importable by both the CLI
  * launcher (`../src/lib/server/runtime.js`) and, if ever needed, the SvelteKit
@@ -29,7 +30,6 @@ import {
 	linkSync,
 	unlinkSync
 } from 'node:fs';
-import { configureHarness, harnessConfigPath } from './harness.js';
 
 /** Absolute path of the runtime discovery file for a workspace. */
 export function runtimeFilePath(workspace) {
@@ -39,15 +39,6 @@ export function runtimeFilePath(workspace) {
 /** Absolute path of the single-instance lockfile for a workspace. */
 export function instanceLockPath(workspace) {
 	return join(workspace, '.cellar', 'instance.lock');
-}
-
-/**
- * Absolute path of Claude Code's project-scoped MCP config file for a
- * workspace. Derived from the harness registry so this and `cellar harness`
- * can never disagree about where that file lives.
- */
-export function mcpConfigPath(workspace) {
-	return harnessConfigPath('claude', workspace);
 }
 
 /**
@@ -233,22 +224,4 @@ export async function isInstanceAlive(rt) {
 	if (!rt) return false;
 	if (!pidAlive(rt.pid)) return false;
 	return mcpPortResponds(rt.mcpPort);
-}
-
-/**
- * Write/merge `<workspace>/.mcp.json` so an agent opened in this repo (Claude
- * Code) auto-connects over stdio via `cellar mcp` — no port in config, so it
- * never goes stale. Idempotent, and preserves any other servers the user has
- * already configured (merge, never clobber). Returns a short status string.
- *
- * A thin alias over the harness registry's `claude` entry — the merge itself
- * lives in `harness.js`, so the automatic per-launch write and an explicit
- * `cellar harness add claude` are the SAME code path and cannot drift. The
- * launcher reaches that path by iterating the registry's `auto` harnesses
- * rather than naming one, so this stays as the named alias for callers that
- * mean Claude Code's `.mcp.json` specifically.
- */
-export function writeMcpConfig(workspace) {
-	const r = configureHarness('claude', workspace);
-	return r.status === 'already' ? 'up to date' : r.status === 'skipped' ? `skipped (${r.message})` : r.message;
 }

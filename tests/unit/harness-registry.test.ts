@@ -807,6 +807,33 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 		expect(write).toMatch(/configureHarness\(h\.name, WORKSPACE\)/);
 	});
 
+	it('catches per harness at EVERY configureHarness call site', () => {
+		// A write can still fail on the filesystem (read-only workspace, ENOSPC,
+		// EACCES on `.codex/`) after the registry has agreed to edit. Unguarded, the
+		// prompt's own loop throws past `writeHarnessSetup` into the outer catch, so
+		// a successful SIBLING write goes unrecorded and the answer is discarded -
+		// the question then comes back on every later interactive launch.
+		const sites = [...src.matchAll(/configureHarness\(/g)].map((m) => m.index as number);
+		expect(sites.length).toBeGreaterThanOrEqual(3);
+		for (const at of sites) {
+			// The nearest preceding block opener must be a `try {`, and a `catch` must
+			// follow before the next site - the one-line-shape guard the verb uses.
+			const before = src.slice(Math.max(0, at - 400), at);
+			expect(before).toMatch(/try\s*\{[^{}]*$/);
+			expect(src.slice(at, at + 2000)).toMatch(/\}\s*catch\s*\(/);
+		}
+	});
+
+	it('records the prompt answer even when a chosen harness fails to write', () => {
+		// The marker write must not sit downstream of an unguarded throw.
+		const prompt = src.slice(src.indexOf('async function maybePromptHarnessSetup'));
+		const loop = prompt.indexOf('for (const name of chosen)');
+		const marker = prompt.indexOf('writeHarnessSetup(WORKSPACE, record)');
+		expect(loop).toBeGreaterThan(-1);
+		expect(marker).toBeGreaterThan(loop);
+		expect(prompt.slice(loop, marker)).toMatch(/\}\s*catch\s*\(/);
+	});
+
 	it('does not offer a harness `--no-mcp-config` refuses to write', () => {
 		// The flag's whole point is that `.mcp.json` is not written; a prompt that
 		// wrote it one answer later would contradict it.

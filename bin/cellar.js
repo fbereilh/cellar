@@ -874,7 +874,20 @@ async function maybePromptHarnessSetup() {
 		}
 
 		let wrote = false;
-		for (const name of chosen) wrote = printHarnessResult(configureHarness(name, WORKSPACE)) || wrote;
+		for (const name of chosen) {
+			// Caught PER harness, like `cellar harness add` and the launch-path write:
+			// a filesystem failure on one (read-only workspace, ENOSPC, EACCES on
+			// `.codex/`) must not throw past `writeHarnessSetup` below, which would
+			// discard both a successful sibling write and the answer itself - so the
+			// question would come back on every later interactive launch.
+			try {
+				wrote = printHarnessResult(configureHarness(name, WORKSPACE)) || wrote;
+			} catch (err) {
+				const h = getHarness(name);
+				const where = h ? ` → ${join(WORKSPACE, h.configPath)}` : '';
+				console.error(`[cellar] ${h?.label ?? name}: skipped (${err?.message ?? err})${where}`);
+			}
+		}
 		if (wrote) console.log(`[cellar] ${RUNNING_NOTE}`);
 		if (chosen.length === 0) {
 			console.log(`[cellar] skipped - run \`cellar harness add <${harnessNames().join('|')}>\` any time.`);
