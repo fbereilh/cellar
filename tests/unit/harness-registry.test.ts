@@ -16,7 +16,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -185,6 +185,33 @@ describe('claude (.mcp.json, JSON)', () => {
 		expect(configureHarness('claude', ws).status).toBe('skipped');
 		expect(read(claudeFile())).toBe('["an array"]');
 	});
+
+	it('refuses a non-object "mcpServers" instead of replacing it', () => {
+		// The merge below would swap the user's value for `{ cellar: … }` and report
+		// success - the clobber this module exists to refuse. The TOML sibling already
+		// refuses the analogous `mcp_servers = { … }`, so the two writers must agree.
+		for (const junk of ['"nope"', '42', '["a", "b"]', 'null']) {
+			const text = `{ "mcpServers": ${junk}, "keep": 1 }`;
+			writeFileSync(claudeFile(), text);
+			const r = configureHarness('claude', ws);
+			expect(r.status).toBe('skipped');
+			expect(r.message).toMatch(/mcpServers/);
+			expect(read(claudeFile())).toBe(text);
+		}
+		// And it is reported as unreadable, not as a harness simply not configured.
+		expect(harnessState('claude', ws)).toMatchObject({ unreadable: true, configured: false });
+	});
+
+	it('refuses a config it cannot read at all, rather than throwing', () => {
+		// A directory where the config should be (EISDIR) - the same class as a mode
+		// that denies us. The read used to be guarded here but not on the TOML side;
+		// both must answer with the module's actionable refusal.
+		mkdirSync(claudeFile(), { recursive: true });
+		const r = configureHarness('claude', ws);
+		expect(r.status).toBe('skipped');
+		expect(r.message).toMatch(/could not be read/);
+		expect(harnessState('claude', ws)?.unreadable).toBe(true);
+	});
 });
 
 describe('codex (.codex/config.toml, TOML)', () => {
@@ -325,6 +352,21 @@ describe('codex (.codex/config.toml, TOML)', () => {
 		expect(r.status).toBe('skipped');
 		expect(r.message).toContain('TOML');
 		expect(read(codexFile())).toBe(broken);
+	});
+
+	it('refuses a file it cannot read at all, rather than throwing', () => {
+		// The TOML read was unguarded while the JSON one was wrapped, so an EACCES /
+		// EISDIR config threw a raw stack trace out of `cellar harness list|add`
+		// instead of the documented refusal. Both formats now answer the same way.
+		mkdirSync(codexFile(), { recursive: true });
+		const r = configureHarness('codex', ws);
+		expect(r.status).toBe('skipped');
+		expect(r.message).toMatch(/could not be read/);
+		// `harnessState` reads the same file and must not throw either - it is what
+		// `cellar harness list` prints, and what the first-run prompt gates on.
+		expect(harnessState('codex', ws)).toMatchObject({ unreadable: true, configured: false });
+		expect(() => harnessStates(ws)).not.toThrow();
+		expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(true);
 	});
 
 	it('carries the trusted-project note, since project config is ignored without it', () => {
@@ -733,6 +775,18 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 		expect(src).toMatch(/HARNESS_PROMPT_TIMEOUT_MS = [\d_]+/);
 	});
 
+	it('gates the per-launch write on the registry `auto` flag, not a hardcoded name', () => {
+		// The prompt offers, and honors a decline for, every `auto` harness; a name
+		// pinned at the write would silently ignore a second one's decline - the
+		// prompt-contradicts-the-next-step failure the gate exists to prevent.
+		const write = mainBody.slice(mainBody.indexOf('agent connects via') - 1500);
+		expect(write).toMatch(/HARNESSES\.filter\(\(x\) => x\.auto\)/);
+		expect(write).toMatch(/harnessDeclined\(h\.name, WORKSPACE\)/);
+		expect(mainBody).not.toMatch(/harnessDeclined\('claude'/);
+		// Same registry-driven write as `cellar harness add`, so the two cannot drift.
+		expect(write).toMatch(/configureHarness\(h\.name, WORKSPACE\)/);
+	});
+
 	it('does not offer a harness `--no-mcp-config` refuses to write', () => {
 		// The flag's whole point is that `.mcp.json` is not written; a prompt that
 		// wrote it one answer later would contradict it.
@@ -919,6 +973,33 @@ describe('`cellar harness` CLI verb', () => {
 		run(['harness', 'add', 'all']);
 		expect(existsSync(join(ws, '.cellar', 'runtime.json'))).toBe(false);
 		expect(existsSync(join(ws, '.cellar', 'instance.lock'))).toBe(false);
+	});
+
+	it('reports a config it cannot read, and keeps going, instead of crashing', () => {
+		mkdirSync(codexFile(), { recursive: true });
+		const r = run(['harness', 'add', 'all']);
+		// Claude still gets configured: one bad harness does not abort `add all`.
+		expect(existsSync(claudeFile())).toBe(true);
+		expect(r.stdout + r.stderr).toMatch(/could not be read/);
+		expect(r.stderr).not.toMatch(/at .*harness\.js/);
+	});
+
+	// A refusal is the registry's job; the WRITE can still fail on the filesystem,
+	// and that used to leave the process on an unhandled exception.
+	const canDropWrite = process.platform !== 'win32' && process.getuid?.() !== 0;
+	it.skipIf(!canDropWrite)('reports a write failure per harness instead of throwing', () => {
+		chmodSync(ws, 0o555);
+		try {
+			const r = run(['harness', 'add', 'all']);
+			// Non-zero, so a script can still tell nothing was written…
+			expect(r.status).toBe(1);
+			// …and every harness is reported in the ordinary one-line shape, not a stack.
+			expect(r.stderr).toMatch(/Claude Code: skipped/);
+			expect(r.stderr).toMatch(/Codex: skipped/);
+			expect(r.stderr).not.toMatch(/^\s+at /m);
+		} finally {
+			chmodSync(ws, 0o755);
+		}
 	});
 
 	it('is documented in --help', () => {

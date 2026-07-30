@@ -243,7 +243,10 @@ export async function isInstanceAlive(rt) {
  *
  * A thin alias over the harness registry's `claude` entry — the merge itself
  * lives in `harness.js`, so the automatic per-launch write and an explicit
- * `cellar harness add claude` are the SAME code path and cannot drift.
+ * `cellar harness add claude` are the SAME code path and cannot drift. The
+ * launcher reaches that path by iterating the registry's `auto` harnesses
+ * rather than naming one, so this stays as the named alias for callers that
+ * mean Claude Code's `.mcp.json` specifically.
  */
 export function writeMcpConfig(workspace) {
 	const r = configureHarness('claude', workspace);

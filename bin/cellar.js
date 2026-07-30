@@ -98,7 +98,6 @@ import {
 import {
 	writeRuntime,
 	clearRuntime,
-	writeMcpConfig,
 	readRuntime,
 	acquireInstanceLock,
 	releaseInstanceLock
@@ -367,6 +366,9 @@ async function waitFor(url, { headers = {}, timeoutMs = 30000 } = {}) {
 	throw new Error(`timed out waiting for ${url}`);
 }
 
+// Known, pre-existing: `inForegroundJob()` guards the harness prompt only, so a
+// backgrounded `cellar &` can still be stopped by SIGTTIN here - deliberately
+// left alone, since refusing to read would change what such a launch DOES.
 function confirm(question) {
 	if (autoYes) return Promise.resolve(true);
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -745,20 +747,33 @@ function harnessCommand(args) {
 		let ok = true;
 		let wrote = false;
 		for (const name of names) {
-			const r = configureHarness(name, workspace);
-			if (!r.ok) ok = false;
-			// Asking for a harness explicitly RETRACTS an earlier first-run decline -
-			// otherwise the launcher would keep skipping its automatic write, and keep
-			// claiming a decline, over the config this command just put in place.
-			//
-			// Scoped to an `auto` harness, because that decline is the ONLY thing a
-			// decline switches off: nothing writes a non-auto harness's config on launch,
-			// so retracting one there would announce a per-launch setup that does not
-			// exist - the over-claim this codebase keeps retiring.
-			if (r.ok && r.status !== 'skipped' && getHarness(name)?.auto && clearHarnessDecline(name, workspace)) {
-				console.log(`[cellar]   (re-enabled automatic ${r.label} setup on launch)`);
+			// The registry refuses whatever it cannot edit confidently, but the WRITE
+			// itself can still fail on the filesystem (a read-only workspace, ENOSPC,
+			// EACCES on `.codex/`), and so can the marker rewrite below. Report that in
+			// the same one-line shape as every other outcome instead of exiting on an
+			// unhandled exception: `add all` then continues past one bad harness, and
+			// the exit code still says something failed.
+			try {
+				const r = configureHarness(name, workspace);
+				if (!r.ok) ok = false;
+				// Asking for a harness explicitly RETRACTS an earlier first-run decline -
+				// otherwise the launcher would keep skipping its automatic write, and keep
+				// claiming a decline, over the config this command just put in place.
+				//
+				// Scoped to an `auto` harness, because that decline is the ONLY thing a
+				// decline switches off: nothing writes a non-auto harness's config on launch,
+				// so retracting one there would announce a per-launch setup that does not
+				// exist - the over-claim this codebase keeps retiring.
+				if (r.ok && r.status !== 'skipped' && getHarness(name)?.auto && clearHarnessDecline(name, workspace)) {
+					console.log(`[cellar]   (re-enabled automatic ${r.label} setup on launch)`);
+				}
+				wrote = printHarnessResult(r) || wrote;
+			} catch (err) {
+				ok = false;
+				const h = getHarness(name);
+				const where = h ? ` → ${join(workspace, h.configPath)}` : '';
+				console.error(`[cellar] ${h?.label ?? name}: skipped (${err?.message ?? err})${where}`);
 			}
-			wrote = printHarnessResult(r) || wrote;
 		}
 		if (wrote) console.log(`[cellar] ${RUNNING_NOTE}`);
 		return ok ? 0 : 1;
@@ -1041,15 +1056,36 @@ async function main() {
 			mode: useDev ? 'dev' : 'build'
 		});
 	}
-	// Claude Code's `.mcp.json` is written on EVERY launch (the documented
-	// zero-config wiring) — unless `--no-mcp-config`, or the user was asked on
-	// first run and said no. Honoring that decline is what keeps the prompt
-	// truthful: otherwise it would offer a choice this line then overrides.
-	if (writeMcpConfigOptIn && !harnessDeclined('claude', WORKSPACE)) {
-		const status = writeMcpConfig(WORKSPACE);
-		console.log(`[cellar] .mcp.json: ${status} (agent connects via \`cellar mcp\`)`);
-	} else if (writeMcpConfigOptIn) {
-		console.log('[cellar] .mcp.json: skipped (you declined Claude Code setup; `cellar harness add claude` to enable)');
+	// Every `auto` harness's config is written on EVERY launch (today just Claude
+	// Code's `.mcp.json`, the documented zero-config wiring) - unless
+	// `--no-mcp-config`, or the user was asked on first run and said no. Honoring
+	// that decline is what keeps the prompt truthful: otherwise it would offer a
+	// choice this block then overrides.
+	//
+	// Driven off the registry's `auto` flag rather than a hardcoded name, like the
+	// prompt's `exclude` and `cellar harness add`'s decline retraction: adding a
+	// harness is meant to be a DATA change, and a name pinned here would silently
+	// ignore a second auto harness's decline - the exact prompt-contradicts-the-
+	// next-step failure this gate exists to prevent.
+	if (writeMcpConfigOptIn) {
+		for (const h of HARNESSES.filter((x) => x.auto)) {
+			if (harnessDeclined(h.name, WORKSPACE)) {
+				console.log(
+					`[cellar] ${h.configPath}: skipped (you declined ${h.label} setup; \`cellar harness add ${h.name}\` to enable)`
+				);
+				continue;
+			}
+			// Best-effort, exactly like the harness verb: a config we cannot write is
+			// never a reason to fail a notebook launch.
+			try {
+				const r = configureHarness(h.name, WORKSPACE);
+				const status =
+					r.status === 'already' ? 'up to date' : r.status === 'skipped' ? `skipped (${r.message})` : r.message;
+				console.log(`[cellar] ${h.configPath}: ${status} (agent connects via \`cellar mcp\`)`);
+			} catch (err) {
+				console.log(`[cellar] ${h.configPath}: skipped (${err?.message ?? err})`);
+			}
+		}
 	}
 
 	// Idle-kernel culling. With one kernel PER notebook, N idle Python processes

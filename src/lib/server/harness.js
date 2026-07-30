@@ -200,6 +200,32 @@ function writeFileAtomic(file, text) {
 	}
 }
 
+/**
+ * Read a config file's text. The ONE place a read failure is turned into a
+ * value, so both formats answer an unreadable file the same way instead of one
+ * of them throwing.
+ *
+ * `text: null` means the file is THERE but could not be read at all - a mode
+ * that denies us (EACCES), a directory where a config should be (EISDIR), an
+ * I/O error. That is not a parse problem and it is not "unconfigured": every
+ * caller must refuse, because the only honest thing to say about a file we
+ * cannot see is that we left it alone. Letting the read throw instead surfaces
+ * as a raw stack trace out of `cellar harness list` / `cellar harness add`.
+ */
+function readConfigText(file) {
+	if (!existsSync(file)) return { exists: false, text: '', error: null };
+	try {
+		return { exists: true, text: readFileSync(file, 'utf8'), error: null };
+	} catch (err) {
+		return { exists: true, text: null, error: err?.code || err?.message || 'unreadable' };
+	}
+}
+
+/** A plain `{…}` - never null, never an array (both spread into nonsense). */
+function plainObject(v) {
+	return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
 // ---- JSON (`.mcp.json`, Claude Code) --------------------------------------
 
 const JSON_ENTRY = { command: SERVER_COMMAND, args: [...SERVER_ARGS] };
@@ -215,31 +241,53 @@ function sameJsonEntry(entry) {
 
 /**
  * Inspect a `.mcp.json`-shaped config. Returns
- * `{ present, matches, unreadable }` — `unreadable` means the file exists but
- * is not a JSON object, which must never be overwritten.
+ * `{ present, matches, unreadable, reason }` - `unreadable` means the file
+ * exists but cannot be edited confidently, which must never be overwritten, and
+ * `reason` says which of the ways it is so the message can be honest about it.
+ *
+ * A non-object `mcpServers` is one of those ways: the merge below would replace
+ * whatever the user put there with `{ cellar: … }` and report success, which is
+ * exactly the clobber this module refuses to do. The TOML sibling already
+ * refuses the analogous `mcp_servers = { … }` shape; the two writers must agree.
  */
 function readJsonState(file) {
-	if (!existsSync(file)) return { present: false, matches: false, unreadable: false };
+	const src = readConfigText(file);
+	if (!src.exists) return { present: false, matches: false, unreadable: false };
+	if (src.text === null) {
+		return { present: false, matches: false, unreadable: true, reason: 'unreadable-file', error: src.error };
+	}
 	let config;
 	try {
-		config = JSON.parse(readFileSync(file, 'utf8'));
+		config = JSON.parse(src.text);
 	} catch {
-		return { present: false, matches: false, unreadable: true };
+		return { present: false, matches: false, unreadable: true, reason: 'not-json' };
 	}
-	if (config === null || typeof config !== 'object' || Array.isArray(config)) {
-		return { present: false, matches: false, unreadable: true };
+	if (!plainObject(config)) {
+		return { present: false, matches: false, unreadable: true, reason: 'not-json' };
 	}
-	const servers = config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {};
+	if (config.mcpServers !== undefined && !plainObject(config.mcpServers)) {
+		return { present: false, matches: false, unreadable: true, reason: 'bad-servers' };
+	}
+	const servers = plainObject(config.mcpServers) ? config.mcpServers : {};
 	const entry = servers[SERVER_NAME];
 	return { present: entry !== undefined, matches: sameJsonEntry(entry), unreadable: false, config };
 }
 
+/** The `add it by hand` tail every JSON refusal ends with. */
+const JSON_HAND_EDIT = `add an "${SERVER_NAME}" entry under "mcpServers" by hand`;
+
 function writeJsonConfig(file) {
 	const state = readJsonState(file);
 	if (state.unreadable) {
+		const why =
+			state.reason === 'unreadable-file'
+				? `could not be read (${state.error})`
+				: state.reason === 'bad-servers'
+					? 'has a non-object "mcpServers"'
+					: 'is not a JSON object';
 		return {
 			status: 'skipped',
-			message: `${file} is not a JSON object; leaving it untouched (add an "${SERVER_NAME}" entry under "mcpServers" by hand)`
+			message: `${file} ${why}; leaving it untouched (${JSON_HAND_EDIT})`
 		};
 	}
 	if (state.matches) {
@@ -251,14 +299,16 @@ function writeJsonConfig(file) {
 		return { status: 'already', message: 'already configured' };
 	}
 	const config = state.config ?? {};
-	const servers = config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {};
+	// `readJsonState` has already refused anything but a plain object (or nothing)
+	// here, so this can only ever merge into the user's own map.
+	const servers = plainObject(config.mcpServers) ? config.mcpServers : {};
 	const existing = servers[SERVER_NAME];
 	// Merge, like the TOML writer: `command`/`args` are Cellar's, every other key the
 	// user put on this entry (`env`, `type`, `cwd`) survives. Spreading `servers`
 	// first also keeps an existing `cellar` key in its POSITION, and every other
 	// server untouched. `existing` is spread only when it is a plain object - a
 	// string would spread into character-indexed keys.
-	const base = existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {};
+	const base = plainObject(existing) ? existing : {};
 	config.mcpServers = { ...servers, [SERVER_NAME]: { ...base, ...JSON_ENTRY } };
 	writeFileAtomic(file, JSON.stringify(config, null, 2) + '\n');
 	return state.present
@@ -672,14 +722,29 @@ function appendTable(text) {
 	return body + TOML_BLOCK.join('\n') + '\n';
 }
 
+/**
+ * `codexState` over a file on disk - the ONE place the TOML side reads one, so
+ * the writer and `harnessState` cannot disagree about what an unreadable file
+ * means. A read that fails is `malformed` with a `readError`: we know nothing
+ * about the contents, so the only safe verdict is refuse (never "unconfigured",
+ * which would then be appended to and could clobber a file we never saw).
+ */
+function readCodexFile(file) {
+	const src = readConfigText(file);
+	if (src.text === null) return { existing: '', state: { kind: 'malformed', readError: src.error } };
+	return { existing: src.text, state: codexState(src.text) };
+}
+
 function writeTomlConfig(file) {
-	const existing = existsSync(file) ? readFileSync(file, 'utf8') : '';
-	const state = codexState(existing);
+	const { existing, state } = readCodexFile(file);
 
 	if (state.kind === 'malformed') {
+		const why = state.readError
+			? `could not be read (${state.readError})`
+			: 'could not be read as TOML with confidence';
 		return {
 			status: 'skipped',
-			message: `${file} could not be read as TOML with confidence; leaving it untouched (add a [${TOML_TABLE.join('.')}] table by hand)`
+			message: `${file} ${why}; leaving it untouched (add a [${TOML_TABLE.join('.')}] table by hand)`
 		};
 	}
 	if (state.kind === 'other-form') {
@@ -728,7 +793,7 @@ export function harnessState(name, workspace) {
 		return { name: h.name, label: h.label, file, exists: existsSync(file), present: s.present, configured: s.matches, unreadable: s.unreadable };
 	}
 	const exists = existsSync(file);
-	const state = codexState(exists ? readFileSync(file, 'utf8') : '');
+	const { state } = readCodexFile(file);
 	const configured = state.kind === 'table' && tableMatches(state.doc, state.table);
 	return {
 		name: h.name,
