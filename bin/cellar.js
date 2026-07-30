@@ -848,6 +848,14 @@ async function maybePromptHarnessSetup() {
 			const flag = s.configured ? ' (already configured)' : s.present ? ' (has another entry)' : '';
 			console.log(`[cellar]   ${i + 1}) ${s.label.padEnd(12)} ${s.file}${flag}`);
 		});
+		// Say what an omission MEANS before the answer is given. The question reads as
+		// purely additive, but anything offered and passed over is recorded as a
+		// decline - and for the auto harness that also switches off the `.mcp.json`
+		// write Cellar does on every launch. Recoverable, so the retraction is named
+		// in the same breath. (Enter is an answer here, not a deferral.)
+		console.log(
+			`[cellar] Anything you skip (Enter skips all) is remembered as "no" - Cellar stops setting it up on later launches; \`cellar harness add <name>\` undoes that.`
+		);
 		const answer = await ask(`[cellar] Configure which? [numbers/names, "all", or Enter to skip] `, {
 			timeoutMs: HARNESS_PROMPT_TIMEOUT_MS
 		});

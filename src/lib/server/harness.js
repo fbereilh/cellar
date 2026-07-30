@@ -319,11 +319,32 @@ function writeJsonConfig(file) {
 // ---- TOML (`.codex/config.toml`, Codex) -----------------------------------
 
 const TOML_TABLE = ['mcp_servers', SERVER_NAME];
-const TOML_BLOCK = [
-	`[${TOML_TABLE.join('.')}]`,
-	`command = "${SERVER_COMMAND}"`,
-	`args = [${SERVER_ARGS.map((a) => JSON.stringify(a)).join(', ')}]`
+
+/**
+ * The two keys Cellar owns inside that table: the line it would write, and - the
+ * ONE place that decides it - whether a value already SAYS that. Every consumer
+ * reads it (the appended block, the idempotence check, the in-place rewrite), so
+ * "already correct" cannot mean one thing to one of them and something else to
+ * another. `matches` is only ever called later, so the hoisted helpers it uses
+ * are resolved by then.
+ */
+const TOML_KEYS = [
+	{
+		key: 'command',
+		text: `command = "${SERVER_COMMAND}"`,
+		matches: (value) => unquote(value) === SERVER_COMMAND
+	},
+	{
+		key: 'args',
+		text: `args = [${SERVER_ARGS.map((a) => JSON.stringify(a)).join(', ')}]`,
+		matches: (value) => {
+			const parsed = parseStringArray(value);
+			return !!parsed && JSON.stringify(parsed) === JSON.stringify(SERVER_ARGS);
+		}
+	}
 ];
+
+const TOML_BLOCK = [`[${TOML_TABLE.join('.')}]`, ...TOML_KEYS.map((k) => k.text)];
 
 /**
  * Walk one line, tracking TOML string state so structural characters inside a
@@ -684,28 +705,26 @@ function codexState(text) {
 
 /** True when the canonical table already says exactly what Cellar would write. */
 function tableMatches(doc, table) {
-	const cmd = readAssignment(doc, table, 'command');
-	const args = readAssignment(doc, table, 'args');
-	if (!cmd || !args) return false;
-	if (unquote(cmd.value) !== SERVER_COMMAND) return false;
-	const parsed = parseStringArray(args.value);
-	return !!parsed && JSON.stringify(parsed) === JSON.stringify(SERVER_ARGS);
+	return TOML_KEYS.every((spec) => {
+		const found = readAssignment(doc, table, spec.key);
+		return !!found && spec.matches(found.value);
+	});
 }
 
 /** Rewrite `command`/`args` inside the existing table, leaving all else intact. */
 function rewriteTable(doc, table) {
 	const lines = [...doc.lines];
 	// Replace from the bottom up so an earlier edit cannot shift a later index.
-	const edits = [];
-	for (const [key, text] of [
-		['command', `command = "${SERVER_COMMAND}"`],
-		['args', `args = [${SERVER_ARGS.map((a) => JSON.stringify(a)).join(', ')}]`]
-	]) {
-		const found = readAssignment(doc, table, key);
-		edits.push({ key, text, found });
-	}
+	const edits = TOML_KEYS.map((spec) => ({ ...spec, found: readAssignment(doc, table, spec.key) }));
 	for (const e of [...edits].sort((a, b) => (b.found?.first ?? -1) - (a.found?.first ?? -1))) {
-		if (e.found) lines.splice(e.found.first, e.found.last - e.found.first + 1, e.text);
+		// A key whose value already says what Cellar would write is LEFT ALONE. The
+		// splice replaces whole physical lines, so rewriting it would destroy that
+		// line's own trailing comment (and its spacing) to change nothing - the
+		// byte-preservation this writer exists for, applied per key rather than per
+		// table.
+		if (e.found && !e.matches(e.found.value)) {
+			lines.splice(e.found.first, e.found.last - e.found.first + 1, e.text);
+		}
 	}
 	// A table missing a key entirely (hand-written, or Cellar's shape changed):
 	// insert right after the header so the table stays self-describing.

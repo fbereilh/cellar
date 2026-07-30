@@ -292,6 +292,26 @@ describe('codex (.codex/config.toml, TOML)', () => {
 		expect(after.match(/\[mcp_servers\.cellar\]/g)).toHaveLength(1);
 	});
 
+	it('leaves an already-correct key line alone, comment and all, when its sibling is wrong', () => {
+		// The splice replaces whole physical lines, so rewriting a key that already
+		// says what Cellar would write costs that line its own trailing comment for
+		// no change at all. Byte preservation is per KEY, not merely per table.
+		writeCodex(
+			[
+				'[mcp_servers.cellar]',
+				'command = "cellar"   # the stdio bridge',
+				'args = ["mcp", "--stale"]  # wrong',
+				''
+			].join('\n')
+		);
+		expect(configureHarness('codex', ws).status).toBe('updated');
+		expect(read(codexFile())).toBe(
+			['[mcp_servers.cellar]', 'command = "cellar"   # the stdio bridge', 'args = ["mcp"]', ''].join(
+				'\n'
+			)
+		);
+	});
+
 	it('joins a multi-line args array when deciding, and rewrites it as one line', () => {
 		writeCodex('[mcp_servers.cellar]\ncommand = "cellar"\nargs = [\n  "mcp",\n  "--stale"\n]\n');
 		expect(configureHarness('codex', ws).status).toBe('updated');

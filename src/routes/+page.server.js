@@ -1,7 +1,6 @@
-import { existsSync, readFileSync } from 'node:fs';
 import { getDefaultNotebook } from '$lib/server/notebook';
 import { workspaceRoot } from '$lib/server/fstree';
-import { mcpConfigPath } from '$lib/server/runtime.js';
+import { harnessState } from '$lib/server/harness.js';
 import { getUiState } from '$lib/server/ui-state';
 import { parseMaxKernels } from '$lib/kernelCap';
 
@@ -9,15 +8,17 @@ import { parseMaxKernels } from '$lib/kernelCap';
  * Whether `<workspace>/.mcp.json` currently registers the `cellar` stdio server.
  * True → an agent opened in this repo auto-connects with zero config; false →
  * the launcher was run with `--no-mcp-config` (or the file was removed/edited),
- * so the manual `claude mcp add` path is the way in. Best-effort: any read/parse
- * trouble degrades to false rather than throwing.
+ * so the manual `claude mcp add` path is the way in.
+ *
+ * The verdict comes from `harness.js`, the ONE place that decides what a
+ * configured harness looks like - a second copy here (`…cellar?.command ===
+ * 'cellar'`, ignoring `args`) could report the panel's "wired up here" banner
+ * over an entry the launcher would rewrite on the very next run. Best-effort:
+ * any read/parse trouble degrades to false rather than throwing during SSR.
  */
 function detectMcpConfig() {
 	try {
-		const file = mcpConfigPath(workspaceRoot());
-		if (!existsSync(file)) return false;
-		const cfg = JSON.parse(readFileSync(file, 'utf8'));
-		return cfg?.mcpServers?.cellar?.command === 'cellar';
+		return harnessState('claude', workspaceRoot())?.configured === true;
 	} catch {
 		return false;
 	}

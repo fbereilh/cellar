@@ -1122,7 +1122,12 @@
 
 			<!-- Other harnesses read a DIFFERENT file: Codex reads .codex/config.toml
 			     and ignores .mcp.json entirely, so "agent-ready" above is a claim
-			     about Claude Code only. `cellar harness` is what covers the rest. -->
+			     about Claude Code only. `cellar harness` is what covers the rest.
+			     Known boundary: this row is STATIC copy - the registry that would
+			     name the other harnesses (and say which are already configured) is
+			     server-side and this panel carries no state for it, so the row
+			     neither tracks a future HARNESSES entry nor hides once Codex is
+			     wired up. Deliberate: the plumbing costs more than the row. -->
 			<p class="pt-2.5 pb-1 text-[10px] uppercase tracking-wide text-base-content/40">Another harness</p>
 			<p class="pb-1.5 text-[11px] leading-relaxed text-base-content/50">
 				Codex and friends read their own config file, not
