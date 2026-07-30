@@ -11,7 +11,9 @@
  *      can discover the running server; and
  *   2. write/merge `<workspace>/.mcp.json` with a `cellar` stdio server entry
  *      that runs `cellar mcp` — the port never appears in config, so it never
- *      goes stale.
+ *      goes stale. That merge lives in `harness.js`, which does the same for
+ *      every other supported agent harness (Codex's `.codex/config.toml`, …);
+ *      `writeMcpConfig` here is just its Claude Code alias.
  *
  * Node builtins + global fetch only, so this is importable by both the CLI
  * launcher (`../src/lib/server/runtime.js`) and, if ever needed, the SvelteKit
@@ -27,6 +29,7 @@ import {
 	linkSync,
 	unlinkSync
 } from 'node:fs';
+import { configureHarness, harnessConfigPath } from './harness.js';
 
 /** Absolute path of the runtime discovery file for a workspace. */
 export function runtimeFilePath(workspace) {
@@ -38,9 +41,13 @@ export function instanceLockPath(workspace) {
 	return join(workspace, '.cellar', 'instance.lock');
 }
 
-/** Absolute path of the project-scoped MCP config file for a workspace. */
+/**
+ * Absolute path of Claude Code's project-scoped MCP config file for a
+ * workspace. Derived from the harness registry so this and `cellar harness`
+ * can never disagree about where that file lives.
+ */
 export function mcpConfigPath(workspace) {
-	return join(workspace, '.mcp.json');
+	return harnessConfigPath('claude', workspace);
 }
 
 /**
@@ -233,39 +240,12 @@ export async function isInstanceAlive(rt) {
  * Code) auto-connects over stdio via `cellar mcp` — no port in config, so it
  * never goes stale. Idempotent, and preserves any other servers the user has
  * already configured (merge, never clobber). Returns a short status string.
+ *
+ * A thin alias over the harness registry's `claude` entry — the merge itself
+ * lives in `harness.js`, so the automatic per-launch write and an explicit
+ * `cellar harness add claude` are the SAME code path and cannot drift.
  */
 export function writeMcpConfig(workspace) {
-	const file = mcpConfigPath(workspace);
-	const entry = { command: 'cellar', args: ['mcp'] };
-
-	let config = {};
-	if (existsSync(file)) {
-		try {
-			config = JSON.parse(readFileSync(file, 'utf8'));
-		} catch {
-			// Corrupt/hand-edited JSON — do NOT clobber the user's file.
-			return `skipped (${file} is not valid JSON; leaving it untouched)`;
-		}
-		if (config === null || typeof config !== 'object' || Array.isArray(config)) {
-			return `skipped (${file} is not a JSON object; leaving it untouched)`;
-		}
-	}
-
-	const servers = config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {};
-	const existing = servers.cellar;
-	const already =
-		existing && existing.command === entry.command && JSON.stringify(existing.args) === JSON.stringify(entry.args);
-
-	config.mcpServers = { ...servers, cellar: entry };
-	const next = JSON.stringify(config, null, 2) + '\n';
-
-	// Idempotent: skip the write if nothing would change on disk.
-	if (existsSync(file) && already) {
-		try {
-			if (readFileSync(file, 'utf8') === next) return 'up to date';
-		} catch {}
-	}
-
-	writeFileSync(file, next);
-	return already ? 'updated' : 'wrote cellar server';
+	const r = configureHarness('claude', workspace);
+	return r.status === 'already' ? 'up to date' : r.status === 'skipped' ? `skipped (${r.message})` : r.message;
 }

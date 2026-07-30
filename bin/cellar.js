@@ -19,6 +19,12 @@
  *                                   instance (zero-config agent connection; see
  *                                   src/lib/server/mcp-bridge.js). Fails fast if
  *                                   no cellar is running in the workspace.
+ *   cellar harness list             show supported agent harnesses and whether
+ *                                   each is configured for this workspace.
+ *   cellar harness add <name…>      register Cellar's MCP server for a harness
+ *                                   (`claude` → .mcp.json, `codex` →
+ *                                   .codex/config.toml, or `all`). Merges
+ *                                   idempotently; see src/lib/server/harness.js.
  *   cellar ls                       list known cellar instances (registry +
  *                                   untracked orphans) with liveness.
  *   cellar cleanup [--all] [-y]     reap dead/orphaned instances (launcher gone,
@@ -98,6 +104,16 @@ import {
 	releaseInstanceLock
 } from '../src/lib/server/runtime.js';
 import {
+	RUNNING_NOTE,
+	configureHarness,
+	harnessDeclined,
+	harnessNames,
+	harnessStates,
+	parseHarnessAnswer,
+	shouldPromptHarnessSetup,
+	writeHarnessSetup
+} from '../src/lib/server/harness.js';
+import {
 	registerInstance,
 	updateInstance,
 	unregisterInstance,
@@ -154,6 +170,13 @@ if (argv.includes('--version') || argv.includes('-v')) {
 if (argv.includes('--update')) {
 	const { runUpdate } = await import('../src/lib/server/selfupdate.js');
 	process.exit(runUpdate(REPO));
+}
+
+// `cellar harness …` — configure an AI coding agent to use Cellar's MCP server.
+// Handled before normal arg parsing (like `mcp` / `ls`) so it never boots a
+// server and its own args can't trip the unknown-flag guard.
+if (argv[0] === 'harness' || argv[0] === 'harnesses') {
+	process.exit(harnessCommand(argv.slice(1)));
 }
 
 // `cellar ls` / `cellar cleanup` — inspect and reap cellar instances. Handled
@@ -455,18 +478,34 @@ function promptYesNo(question) {
 	});
 }
 
+/** Free-text prompt (the harness picker needs a list, not a yes/no). */
+function ask(question) {
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	return new Promise((res) => {
+		rl.question(question, (ans) => {
+			rl.close();
+			res(ans);
+		});
+	});
+}
+
 function printHelp() {
 	console.log(`cellar - run a live, agent-connected notebook in any project directory.
 
 Usage:
   cellar [path] [options]     start Cellar in a folder (default: cwd)
   cellar mcp [options]        stdio <-> HTTP MCP bridge for the running instance
+  cellar harness <cmd>        configure an AI coding agent to use Cellar's tools
   cellar ls                   list known cellar instances with liveness
   cellar cleanup [options]    reap dead / orphaned instances
 
 Subcommands:
   mcp        zero-config agent connection: bridge stdio to the live instance
              (fails fast if no cellar is running in the workspace)
+  harness    list         show supported harnesses + whether each is configured
+             add <name…>  register Cellar's MCP server for a harness, e.g.
+                          "cellar harness add codex" (claude | codex | all).
+                          Merges idempotently; never clobbers existing config.
   ls         list registered + untracked cellar instances and whether each is alive
   cleanup    reap dead/orphaned instances; --all also stops every live instance
 
@@ -488,9 +527,10 @@ Environment:
                           superset of --new that also skips registration)
 
 Examples:
-  cellar                  start Cellar in the current directory
-  cellar ../other-repo    start Cellar scoped to another repo
-  cellar --update         update Cellar to the latest version`);
+  cellar                    start Cellar in the current directory
+  cellar ../other-repo      start Cellar scoped to another repo
+  cellar harness add codex  point Codex at Cellar's MCP server for this project
+  cellar --update           update Cellar to the latest version`);
 }
 
 async function listInstancesCommand() {
@@ -570,6 +610,136 @@ async function cleanupCommand(flags) {
 	}
 	console.log('[cellar] cleanup done.');
 	return 0;
+}
+
+// ---- `cellar harness …` ---------------------------------------------------
+
+/** Human-readable state for one harness row. */
+function harnessStateLabel(s) {
+	if (s.unreadable) return 'unreadable';
+	if (s.configured) return 'configured';
+	if (s.present) return 'other entry';
+	return 'not configured';
+}
+
+/**
+ * Report the outcome of one configure call, then (once per command) the
+ * running-cellar note — a written config is inert on its own, because
+ * `cellar mcp` bridges to a LIVE instance rather than starting one.
+ */
+function printHarnessResult(r) {
+	if (!r.ok) {
+		console.error(`[cellar] ${r.message}`);
+		return false;
+	}
+	console.log(`[cellar] ${r.label}: ${r.message} → ${r.file}`);
+	if (r.note) console.log(`[cellar]   note: ${r.note}`);
+	return r.status !== 'skipped';
+}
+
+/**
+ * `cellar harness list` / `cellar harness add <name…|all>` — the explicit,
+ * any-time counterpart to the first-run prompt. Both drive the SAME registry
+ * (src/lib/server/harness.js), so neither can configure a harness the other
+ * cannot. Returns a process exit code; never boots a server.
+ */
+function harnessCommand(args) {
+	// Accept `--workspace <dir>` / `-w <dir>` so a harness can be configured for
+	// another repo without cd-ing, exactly like the launcher itself.
+	const rest = [];
+	let wsArg;
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] === '--workspace' || args[i] === '-w') {
+			wsArg = args[++i];
+			continue;
+		}
+		rest.push(args[i]);
+	}
+	const workspace = resolve(wsArg || process.cwd());
+	const sub = (rest[0] ?? 'list').toLowerCase();
+
+	if (sub === 'list' || sub === 'ls' || sub === 'status') {
+		console.log(`[cellar] agent harnesses for ${workspace}:`);
+		for (const s of harnessStates(workspace)) {
+			console.log(`  ${s.name.padEnd(8)} ${harnessStateLabel(s).padEnd(15)} ${s.file}`);
+		}
+		console.log(`[cellar] configure one with: cellar harness add <${harnessNames().join('|')}|all>`);
+		console.log(`[cellar] ${RUNNING_NOTE}`);
+		return 0;
+	}
+
+	if (sub === 'add' || sub === 'set' || sub === 'install') {
+		const names = rest.slice(1).flatMap((n) => (n.toLowerCase() === 'all' ? harnessNames() : [n]));
+		if (names.length === 0) {
+			console.error(`[cellar] usage: cellar harness add <${harnessNames().join('|')}|all> [--workspace <dir>]`);
+			return 1;
+		}
+		let ok = true;
+		let wrote = false;
+		for (const name of names) {
+			const r = configureHarness(name, workspace);
+			if (!r.ok) ok = false;
+			wrote = printHarnessResult(r) || wrote;
+		}
+		if (wrote) console.log(`[cellar] ${RUNNING_NOTE}`);
+		return ok ? 0 : 1;
+	}
+
+	console.error(`[cellar] unknown harness command: ${sub}`);
+	console.error('[cellar] usage: cellar harness list | cellar harness add <name…|all>');
+	return 1;
+}
+
+/**
+ * First run in a workspace: offer to wire up the user's agent harness(es).
+ *
+ * Three rules make this safe to have in the launch path. It is asked ONCE per
+ * workspace (a durable `.cellar/harness.json` marker, written whatever the
+ * answer — including a skip), it NEVER prompts without a TTY (`-y`, `$CI`, a
+ * piped stdin all fall through silently), and it can never abort a launch: any
+ * failure is caught and logged, exactly like the best-effort host-env prep.
+ *
+ * The answer is recorded rather than merely acted on, because the launcher also
+ * auto-writes Claude Code's `.mcp.json` on every run: an explicit decline here
+ * has to survive, or the prompt would be contradicted one step later.
+ */
+async function maybePromptHarnessSetup() {
+	try {
+		// Every gate (asked-once, nothing-to-ask, non-interactive) lives in the
+		// registry's `shouldPromptHarnessSetup` so it is unit-testable; `autoYes`
+		// already folds in `-y`, `$CI` and a non-TTY stdin.
+		const decision = shouldPromptHarnessSetup(WORKSPACE, { interactive: !autoYes });
+		if (!decision.prompt) {
+			if (decision.record) writeHarnessSetup(WORKSPACE, { configured: decision.offered, declined: [] });
+			return;
+		}
+		const states = decision.states;
+		const offered = decision.offered;
+		console.log('[cellar] First run here. Cellar can point your AI coding agent at its MCP tools:');
+		states.forEach((s, i) => {
+			const flag = s.configured ? ' (already configured)' : s.present ? ' (has another entry)' : '';
+			console.log(`[cellar]   ${i + 1}) ${s.label.padEnd(12)} ${s.file}${flag}`);
+		});
+		const answer = await ask(
+			`[cellar] Configure which? [numbers/names, "all", or Enter to skip] `
+		);
+		const { chosen, unknown } = parseHarnessAnswer(answer, offered);
+		for (const u of unknown) console.log(`[cellar] ignoring unrecognized choice: ${u}`);
+
+		let wrote = false;
+		for (const name of chosen) wrote = printHarnessResult(configureHarness(name, WORKSPACE)) || wrote;
+		if (wrote) console.log(`[cellar] ${RUNNING_NOTE}`);
+		if (chosen.length === 0) {
+			console.log(`[cellar] skipped - run \`cellar harness add <${harnessNames().join('|')}>\` any time.`);
+		}
+		writeHarnessSetup(WORKSPACE, {
+			configured: chosen,
+			declined: offered.filter((n) => !chosen.includes(n))
+		});
+	} catch (err) {
+		// Never let agent wiring block a notebook launch.
+		console.log(`[cellar] harness setup skipped: ${err?.message ?? err}`);
+	}
 }
 
 /**
@@ -681,6 +851,12 @@ async function main() {
 		if (stale && stale.pid !== process.pid) clearRuntime(WORKSPACE, stale.pid);
 	}
 
+	// First run in this workspace: offer to wire up the user's agent harness(es).
+	// Placed before the slow toolchain work (venv resolve/create, host env, the
+	// sidecar) so the one-time question is answered while the terminal is still
+	// quiet, and never after the ready URL. Non-interactive launches no-op.
+	await maybePromptHarnessSetup();
+
 	// uv is mandatory — fail fast with an actionable message, no silent fallback.
 	try {
 		await requireUv();
@@ -742,9 +918,15 @@ async function main() {
 			mode: useDev ? 'dev' : 'build'
 		});
 	}
-	if (writeMcpConfigOptIn) {
+	// Claude Code's `.mcp.json` is written on EVERY launch (the documented
+	// zero-config wiring) — unless `--no-mcp-config`, or the user was asked on
+	// first run and said no. Honoring that decline is what keeps the prompt
+	// truthful: otherwise it would offer a choice this line then overrides.
+	if (writeMcpConfigOptIn && !harnessDeclined('claude', WORKSPACE)) {
 		const status = writeMcpConfig(WORKSPACE);
 		console.log(`[cellar] .mcp.json: ${status} (agent connects via \`cellar mcp\`)`);
+	} else if (writeMcpConfigOptIn) {
+		console.log('[cellar] .mcp.json: skipped (you declined Claude Code setup; `cellar harness add claude` to enable)');
 	}
 
 	// Idle-kernel culling. With one kernel PER notebook, N idle Python processes

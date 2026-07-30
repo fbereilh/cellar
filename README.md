@@ -18,7 +18,7 @@ It saves ordinary `.ipynb` files that open in vanilla Jupyter, and it keeps them
 
 - 🤝 **You and your agent, one notebook.** An agent's runs and edits appear live in your open tab (streaming output, run badges, structural changes), and your edits flow back the same way - the agent is *told* when you change something under it, so it re-reads instead of treating your edit as a broken tool. You are never looking at stale state.
 - ⚡ **One command, zero setup.** Run `cellar` in any folder. It resolves (or creates) the project venv with [`uv`](https://docs.astral.sh/uv/), starts the kernel, and opens your browser.
-- 🔌 **Zero-config agent connection.** Cellar drops a `.mcp.json` in your workspace, so an agent opened in that folder connects automatically over MCP. Nothing to wire up.
+- 🔌 **Zero-config agent connection.** Cellar drops a `.mcp.json` in your workspace, so Claude Code opened in that folder connects automatically over MCP. Other harnesses read their own config file (Codex reads `.codex/config.toml`) - the first run offers to set them up, and `cellar harness add codex` does it any time.
 - 🧹 **Git-friendly by design.** Clean-on-save strips volatile metadata and normalizes outputs, so re-running a notebook with the same results produces *no* git diff.
 - 📊 **Rich outputs and data tools.** Matplotlib, Plotly, HTML, and full-size images render inline; sort and filter DataFrames in an interactive grid, and inspect the live namespace without leaving the page.
 - 🧱 **Databricks, natively.** Point-and-click connect binds `spark` and a `WorkspaceClient` in the kernel and gives you a Unity Catalog browser.
@@ -185,6 +185,15 @@ claude mcp add cellar -- cellar mcp
 ```
 
 (or just run `cellar` and let the auto-written `.mcp.json` do it). On connect, the agent gets a house-style doctrine that frames the work as building *one coherent notebook*, plus a rich tool set: read the notebook map and live kernel state, add/edit/move cells, run them, and clear their outputs (`add_and_run` is the preferred write-and-execute flow; `clear_outputs` sheds a stale figure or a huge traceback without deleting the cell). Because the MCP session is independent of the kernel connection, restarting the kernel never drops the agent's session or your document.
+
+**A harness that doesn't read `.mcp.json` gets set up too.** Codex reads a project `.codex/config.toml` and ignores `.mcp.json` entirely, so the first `cellar` run in a folder asks which harnesses you use and writes each one's own config file. Any time after that:
+
+```sh
+cellar harness add codex   # or: claude, or all
+cellar harness list        # what's supported, and what's wired up here
+```
+
+Both merge into an existing config - your other MCP servers and settings are left alone - and re-running is a no-op rather than a duplicate. Your agent gets Cellar's tools while `cellar` is running in that workspace, since `cellar mcp` bridges to the live instance rather than starting one of its own.
 
 **Your agent is told what *you* changed.** You keep editing the notebook while the agent works, so Cellar reports your changes on the agent's own next tool call: a short "the user deleted cell a1b2c3d4 and edited cell e5f6a7b8" note rides along with the result, and only when there is something to say. If the agent reaches for a cell you just deleted, the error names the cause ("the user deleted it just now in the Cellar UI") instead of the bare "no cell matches id" it gets for a made-up handle - so a normal edit of yours no longer reads to the agent (or to you, watching it) as a broken tool. The note is a bounded summary and the agent is told to re-read the notebook for the details; anything the agent did itself is left out, a *second* agent's edits are reported the same way as yours, and a cell you hid from the agent stays hidden, changes included.
 
