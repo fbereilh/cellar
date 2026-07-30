@@ -32,6 +32,12 @@
  * file. A hand-editable config the user must repair is a worse outcome than a
  * one-line manual step.
  *
+ * MERGE reaches INSIDE the cellar entry too, in both writers: Cellar owns
+ * `command`/`args` and nothing else, so a key the user added beside them (`env`,
+ * `type`, `cwd`) survives. And idempotence is decided on MEANING, never on our
+ * re-serialized bytes matching the user's formatting - otherwise a correct config
+ * indented differently would be reported `updated` and rewritten every launch.
+ *
  * The TOML writer is deliberately TEXT-SURGICAL rather than a parse/serialize
  * round-trip: it rewrites only the `command`/`args` lines inside
  * `[mcp_servers.cellar]` (or appends that table), so comments, key order,
@@ -236,20 +242,25 @@ function writeJsonConfig(file) {
 			message: `${file} is not a JSON object; leaving it untouched (add an "${SERVER_NAME}" entry under "mcpServers" by hand)`
 		};
 	}
+	if (state.matches) {
+		// Idempotent in the strong sense: the entry already says what Cellar would
+		// write, so there is nothing to merge and NOTHING is written - whatever the
+		// file's own formatting. Deciding this by comparing our re-serialized bytes
+		// against the user's would report `updated` (and rewrite the file) on every
+		// single launch for anyone whose config is indented differently.
+		return { status: 'already', message: 'already configured' };
+	}
 	const config = state.config ?? {};
 	const servers = config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {};
-	// Spread first so an existing `cellar` key keeps its POSITION while its value
-	// is replaced, and every other server survives untouched.
-	config.mcpServers = { ...servers, [SERVER_NAME]: { ...JSON_ENTRY } };
-	const next = JSON.stringify(config, null, 2) + '\n';
-
-	if (state.matches) {
-		// Idempotent in the strong sense: identical bytes on disk = no write at all.
-		try {
-			if (readFileSync(file, 'utf8') === next) return { status: 'already', message: 'already configured' };
-		} catch {}
-	}
-	writeFileAtomic(file, next);
+	const existing = servers[SERVER_NAME];
+	// Merge, like the TOML writer: `command`/`args` are Cellar's, every other key the
+	// user put on this entry (`env`, `type`, `cwd`) survives. Spreading `servers`
+	// first also keeps an existing `cellar` key in its POSITION, and every other
+	// server untouched. `existing` is spread only when it is a plain object - a
+	// string would spread into character-indexed keys.
+	const base = existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {};
+	config.mcpServers = { ...servers, [SERVER_NAME]: { ...base, ...JSON_ENTRY } };
+	writeFileAtomic(file, JSON.stringify(config, null, 2) + '\n');
 	return state.present
 		? { status: 'updated', message: `updated the ${SERVER_NAME} MCP server` }
 		: { status: 'wrote', message: `added the ${SERVER_NAME} MCP server` };
@@ -880,19 +891,32 @@ export function harnessDeclined(name, workspace) {
  * `non-interactive`: a `-y`/CI/piped launch has answered nothing, so a human
  * running `cellar` here later must still be asked.
  *
+ * `exclude` drops harnesses from BOTH `offered` and `states` — the launcher passes
+ * the `auto` harness when `--no-mcp-config` opts out of writing its config, so the
+ * prompt cannot offer to write the very file that flag refuses. An excluded
+ * harness is not offered, so it can never be recorded as declined either: it is
+ * absent from the `states` the decline is derived from.
+ *
  * @param {string} workspace
- * @param {{ interactive?: boolean }} [opts]
- * @returns {{ prompt: boolean, reason: 'already-asked'|'all-configured'|'non-interactive'|'ask',
+ * @param {{ interactive?: boolean, exclude?: string[] }} [opts]
+ * @returns {{ prompt: boolean,
+ *            reason: 'already-asked'|'nothing-offered'|'all-configured'|'non-interactive'|'ask',
  *            offered: string[], record: boolean, states?: HarnessStateInfo[] }}
  */
-export function shouldPromptHarnessSetup(workspace, { interactive = true } = {}) {
-	const offered = harnessNames();
+export function shouldPromptHarnessSetup(workspace, { interactive = true, exclude = [] } = {}) {
+	const skip = new Set(exclude.map((n) => getHarness(n)?.name).filter(Boolean));
+	const offered = harnessNames().filter((n) => !skip.has(n));
 	if (harnessSetupDone(workspace)) return { prompt: false, reason: 'already-asked', offered, record: false };
-	const states = harnessStates(workspace);
+	// Nothing left to ask about is not an answered question: record nothing, so a
+	// launch without the opt-out still asks.
+	if (offered.length === 0) {
+		return { prompt: false, reason: 'nothing-offered', offered, record: false, states: [] };
+	}
+	const states = harnessStates(workspace).filter((s) => !skip.has(s.name));
 	if (states.every((s) => s.configured)) {
 		return { prompt: false, reason: 'all-configured', offered, record: true, states };
 	}
-	if (!interactive) return { prompt: false, reason: 'non-interactive', offered, record: false };
+	if (!interactive) return { prompt: false, reason: 'non-interactive', offered, record: false, states };
 	return { prompt: true, reason: 'ask', offered, record: true, states };
 }
 

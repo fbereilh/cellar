@@ -75,7 +75,7 @@
  * all of this to run a deliberate second instance; `CELLAR_ISOLATED` does the same
  * and additionally skips the registry entry (so it is invisible to ls/cleanup too).
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -104,9 +104,11 @@ import {
 	releaseInstanceLock
 } from '../src/lib/server/runtime.js';
 import {
+	HARNESSES,
 	RUNNING_NOTE,
 	clearHarnessDecline,
 	configureHarness,
+	getHarness,
 	harnessDeclined,
 	harnessNames,
 	harnessStates,
@@ -480,14 +482,52 @@ function promptYesNo(question) {
 }
 
 /**
+ * Decide, from `ps -o pgid=,tpgid=` for THIS process, whether we are the
+ * terminal's FOREGROUND job. Pure so the parse is testable; `null` means the
+ * question could not be answered (no controlling terminal, or a `ps` that does
+ * not report `tpgid`), which callers must treat as unknown, never as a "no".
+ */
+function foregroundFromPs(text) {
+	const [pgid, tpgid] = String(text ?? '')
+		.trim()
+		.split(/\s+/)
+		.map(Number);
+	if (!Number.isInteger(pgid) || !Number.isInteger(tpgid) || tpgid <= 0) return null;
+	return pgid === tpgid;
+}
+
+/**
+ * Is this process the controlling terminal's foreground job? `false` means a
+ * backgrounded `cellar &`, which MUST NOT read stdin (see `maybePromptHarnessSetup`).
+ * `null` = unknown (Windows has no such job control; a `ps` without `tpgid`).
+ */
+function inForegroundJob() {
+	if (process.platform === 'win32') return null;
+	try {
+		const r = spawnSync('ps', ['-o', 'pgid=,tpgid=', '-p', String(process.pid)], { encoding: 'utf8' });
+		if (r.error || r.status !== 0) return null;
+		return foregroundFromPs(r.stdout);
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Free-text prompt (the harness picker needs a list, not a yes/no).
  *
  * Resolves `null` - "no answer" - rather than waiting forever, because this one
- * runs in the LAUNCH path: a `cellar &` reads `stdin.isTTY` as true yet is stopped
- * by SIGTTIN the moment it reads, and a stdin that closes (or errors) would
- * otherwise leave the promise pending and the notebook unstarted. So a closed
- * stdin, a read error and `timeoutMs` elapsing are all one outcome, which the
- * caller must treat as "not answered" - never as a decision.
+ * runs in the LAUNCH path: a stdin that closes (or errors) would otherwise leave
+ * the promise pending and the notebook unstarted. A closed stdin, a read error and
+ * `timeoutMs` elapsing are all one outcome, which the caller must treat as "not
+ * answered" - never as a decision.
+ *
+ * The timeout does NOT cover a backgrounded job, and nothing here can: reading the
+ * controlling terminal from a background process group raises SIGTTIN, whose default
+ * disposition STOPS the process, and a stopped process runs no timers. Installing a
+ * SIGTTIN listener to override that stop is worse, not better - measured: the read
+ * then fails with EIO, libuv retries it, and the process spins at 100% CPU without
+ * ever reaching the JS handler or the timer. So that case is kept out of here
+ * entirely, by not calling this at all off the foreground (see `inForegroundJob`).
  */
 function ask(question, { timeoutMs } = {}) {
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -499,6 +539,8 @@ function ask(question, { timeoutMs } = {}) {
 			settled = true;
 			if (timer) clearTimeout(timer);
 			rl.close();
+			// Nothing more will be read: don't leave a resumed stdin holding the loop.
+			if (value === null) process.stdin.pause();
 			res(value);
 		};
 		// Deliberately NOT unref'd: the launch is awaiting this promise, so a timer the
@@ -708,7 +750,12 @@ function harnessCommand(args) {
 			// Asking for a harness explicitly RETRACTS an earlier first-run decline -
 			// otherwise the launcher would keep skipping its automatic write, and keep
 			// claiming a decline, over the config this command just put in place.
-			if (r.ok && r.status !== 'skipped' && clearHarnessDecline(name, workspace)) {
+			//
+			// Scoped to an `auto` harness, because that decline is the ONLY thing a
+			// decline switches off: nothing writes a non-auto harness's config on launch,
+			// so retracting one there would announce a per-launch setup that does not
+			// exist - the over-claim this codebase keeps retiring.
+			if (r.ok && r.status !== 'skipped' && getHarness(name)?.auto && clearHarnessDecline(name, workspace)) {
 				console.log(`[cellar]   (re-enabled automatic ${r.label} setup on launch)`);
 			}
 			wrote = printHarnessResult(r) || wrote;
@@ -732,9 +779,21 @@ const HARNESS_PROMPT_TIMEOUT_MS = 30_000;
  * workspace (a durable `.cellar/harness.json` marker), it NEVER prompts without a
  * TTY (`-y`, `$CI`, a piped stdin all fall through silently), it can never abort a
  * launch (any failure is caught and logged, exactly like the best-effort host-env
- * prep), and it can never STALL one either: `ask` gives up on a closed stdin, a
- * read error or `HARNESS_PROMPT_TIMEOUT_MS`, so a backgrounded `cellar &` - whose
- * `stdin.isTTY` is true, so `autoYes` stays false - proceeds instead of hanging.
+ * prep), and it can never STALL or SUSPEND one either.
+ *
+ * That last rule takes TWO mechanisms, because they cover different failures.
+ * `ask` gives up on a closed stdin, a read error or `HARNESS_PROMPT_TIMEOUT_MS` -
+ * a stdin that is merely silent. A BACKGROUNDED `cellar &` is not that case: it
+ * reads `stdin.isTTY` as true (so `autoYes` stays false), and its first read of the
+ * controlling terminal raises SIGTTIN, which STOPS the process - and a stopped
+ * process runs no timers, so no timeout can rescue it. The only fix is not to read
+ * at all, so the prompt is gated on `inForegroundJob()`: a proven background job is
+ * skipped outright, recording nothing, and launches normally. Where that cannot be
+ * determined (no `tpgid`; Windows, which has no such stop) the prompt still runs
+ * behind its timeout, exactly as before.
+ *
+ * It also offers only what the launch is actually willing to write: under
+ * `--no-mcp-config` the `.mcp.json` harness is not on the list at all.
  *
  * What is recorded is as narrow as the question answered, because the launcher
  * also auto-writes Claude Code's `.mcp.json` on every run and honors a decline:
@@ -750,11 +809,23 @@ async function maybePromptHarnessSetup() {
 		// Every gate (asked-once, nothing-to-ask, non-interactive) lives in the
 		// registry's `shouldPromptHarnessSetup` so it is unit-testable; `autoYes`
 		// already folds in `-y`, `$CI` and a non-TTY stdin.
-		const decision = shouldPromptHarnessSetup(WORKSPACE, { interactive: !autoYes });
+		const decision = shouldPromptHarnessSetup(WORKSPACE, {
+			interactive: !autoYes,
+			// `--no-mcp-config` opts out of writing `.mcp.json`, so the harness that
+			// owns it must not be OFFERED here either - the prompt would otherwise
+			// write the exact file the flag refuses. Omitted, never declined: it was
+			// never on offer, and a decline would outlive the flag.
+			exclude: writeMcpConfigOptIn ? [] : HARNESSES.filter((h) => h.auto).map((h) => h.name)
+		});
 		if (!decision.prompt) {
 			if (decision.record) writeHarnessSetup(WORKSPACE, { configured: decision.offered, declined: [] });
 			return;
 		}
+		// A backgrounded job would be STOPPED by SIGTTIN on its first read, and no
+		// timeout can undo that (a stopped process runs no timers). So it is never
+		// asked, and - like every other unanswered outcome - records nothing, so the
+		// next foreground launch still asks.
+		if (inForegroundJob() === false) return;
 		const states = decision.states;
 		const offered = decision.offered;
 		console.log('[cellar] First run here. Cellar can point your AI coding agent at its MCP tools:');

@@ -141,6 +141,39 @@ describe('claude (.mcp.json, JSON)', () => {
 		expect(after.mcpServers.cellar).toEqual({ command: 'cellar', args: ['mcp'] });
 	});
 
+	it('merges INSIDE the cellar entry: keys Cellar does not own survive a repair', () => {
+		// Cellar owns `command`/`args` and nothing else - exactly like the TOML writer,
+		// which rewrites only those two lines. Replacing the entry wholesale silently
+		// dropped a user's `env`/`type`/`cwd`.
+		writeFileSync(
+			claudeFile(),
+			JSON.stringify(
+				{ mcpServers: { cellar: { type: 'stdio', command: 'cellar', args: ['mcp', '--stale'], env: { A: '1' } } } },
+				null,
+				2
+			) + '\n'
+		);
+		expect(configureHarness('claude', ws).status).toBe('updated');
+		expect(JSON.parse(read(claudeFile())).mcpServers.cellar).toEqual({
+			type: 'stdio',
+			command: 'cellar',
+			args: ['mcp'],
+			env: { A: '1' }
+		});
+	});
+
+	it('reports already-configured on a correct entry whatever the file formatting', () => {
+		// Idempotence is decided on MEANING, not on our re-serialized bytes matching
+		// the user's: a correct config indented differently was reported `updated` and
+		// rewritten on EVERY launch.
+		const odd = '{\n    "mcpServers": {\n        "cellar": {"command": "cellar", "args": ["mcp"], "env": {"A": "1"}}\n    }\n}';
+		writeFileSync(claudeFile(), odd);
+		const mtime = statSync(claudeFile()).mtimeMs;
+		expect(configureHarness('claude', ws).status).toBe('already');
+		expect(read(claudeFile())).toBe(odd);
+		expect(statSync(claudeFile()).mtimeMs).toBe(mtime);
+	});
+
 	it('refuses a file that is not a JSON object, leaving it byte-identical', () => {
 		const junk = '{ this is not json ';
 		writeFileSync(claudeFile(), junk);
@@ -461,6 +494,45 @@ describe('first-run marker', () => {
 		expect(d).toMatchObject({ prompt: false, reason: 'all-configured', record: true });
 	});
 
+	/**
+	 * `--no-mcp-config` opts out of the `.mcp.json` write. The prompt must not offer
+	 * to write the very file the flag refuses - and an omitted harness must not be
+	 * DECLINED either, since a decline outlives the flag and would keep the write off
+	 * on the next launch without it.
+	 */
+	it('omits an excluded harness from the offer, and never declines it', () => {
+		const auto = HARNESSES.filter((h) => h.auto).map((h) => h.name);
+		expect(auto).toEqual(['claude']);
+
+		const d = shouldPromptHarnessSetup(ws, { interactive: true, exclude: auto });
+		expect(d.prompt).toBe(true);
+		expect(d.offered).toEqual(['codex']);
+		expect(d.states?.map((s) => s.name)).toEqual(['codex']);
+
+		// The decline is derived from those same states, so the excluded harness cannot
+		// reach the marker - even on an explicit skip.
+		const r = resolveHarnessAnswer(d.states!, '', d.offered);
+		expect(r.record).toEqual({ configured: [], declined: ['codex'] });
+		writeHarnessSetup(ws, r.record!);
+		expect(harnessDeclined('claude', ws)).toBe(false);
+		expect(harnessDeclined('codex', ws)).toBe(true);
+	});
+
+	it('numbers the offer against the harnesses actually shown', () => {
+		// The prompt lists `states` and parses numbers against `offered`; excluding one
+		// must shift both together or "1" would configure a harness nobody was shown.
+		const d = shouldPromptHarnessSetup(ws, { interactive: true, exclude: ['claude'] });
+		expect(parseHarnessAnswer('1', d.offered).chosen).toEqual(['codex']);
+	});
+
+	it('records nothing when the exclusion leaves nothing to ask about', () => {
+		// Not an answered question: a launch without the opt-out must still ask.
+		const d = shouldPromptHarnessSetup(ws, { interactive: true, exclude: harnessNames() });
+		expect(d).toMatchObject({ prompt: false, reason: 'nothing-offered', record: false });
+		expect(d.offered).toEqual([]);
+		expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(true);
+	});
+
 	it('remembers an explicit decline, which is what the launcher honors', () => {
 		writeHarnessSetup(ws, { configured: ['codex'], declined: ['claude'] });
 		expect(harnessDeclined('claude', ws)).toBe(true);
@@ -599,6 +671,26 @@ describe('retracting a decline', () => {
 		expect(readHarnessSetup(ws)?.configured).toContain('claude');
 	});
 
+	it('claims nothing for a harness nothing writes on launch', () => {
+		// Only an `auto` harness is written per launch, so only its decline switches
+		// anything off. Retracting codex's would announce a per-launch Codex setup that
+		// does not exist.
+		expect(getHarness('codex')?.auto).toBeUndefined();
+		writeHarnessSetup(ws, { configured: [], declined: ['claude', 'codex'] });
+
+		const r = spawnSync(process.execPath, [CLI, 'harness', 'add', 'codex'], {
+			cwd: ws,
+			encoding: 'utf8',
+			env: { ...process.env, CI: '1' }
+		});
+		expect(r.status).toBe(0);
+		expect(r.stdout).not.toMatch(/re-enabled automatic/);
+		// And the retraction itself is gated too: codex's decline gates nothing, so it
+		// is left exactly as recorded.
+		expect(harnessDeclined('codex', ws)).toBe(true);
+		expect(harnessDeclined('claude', ws)).toBe(true);
+	});
+
 	it('keeps the original promptedAt, so the question is not re-asked', () => {
 		writeHarnessSetup(ws, { configured: [], declined: ['claude'], promptedAt: 1234 });
 		expect(clearHarnessDecline('claude', ws)).toBe(true);
@@ -641,11 +733,16 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 		expect(src).toMatch(/HARNESS_PROMPT_TIMEOUT_MS = [\d_]+/);
 	});
 
+	it('does not offer a harness `--no-mcp-config` refuses to write', () => {
+		// The flag's whole point is that `.mcp.json` is not written; a prompt that
+		// wrote it one answer later would contradict it.
+		const prompt = src.slice(src.indexOf('async function maybePromptHarnessSetup'));
+		expect(prompt).toMatch(/exclude:\s*writeMcpConfigOptIn\s*\?\s*\[\]\s*:\s*HARNESSES\.filter\(\(h\) => h\.auto\)/);
+	});
+
 	/**
-	 * The three ways the question can go unanswered, exercised against the SHIPPED
-	 * source of `ask` over fake stdio - a launcher cannot be booted here, and a real
-	 * TTY is what the failure needs (`cellar &` reads stdin.isTTY as true, so autoYes
-	 * stays false, then SIGTTIN stops it on the first read). All three must resolve
+	 * The ways the question can go unanswered, exercised against the SHIPPED source
+	 * of `ask` over fake stdio - a launcher cannot be booted here. All must resolve
 	 * the same "no answer" value, which records nothing.
 	 */
 	describe('gives up rather than stranding the launch', () => {
@@ -669,8 +766,8 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 			expect(resolveHarnessAnswer(harnessStates(ws), await p).chosen).toEqual(['codex']);
 		});
 
-		// A timeout far beyond this test's own budget, so only the close/error
-		// handler can be what resolves these - never the timer.
+		// A timeout far beyond this test's own budget, so only the close/error handler
+		// can be what resolves these - never the timer.
 		const NEVER = 10 * 60_000;
 
 		it('a stdin that closes with no answer resolves null, and records nothing', async () => {
@@ -689,15 +786,57 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 		});
 
 		it('the timeout fires and skips WITHOUT recording a decline', async () => {
-			// A silent stdin (the backgrounded job) must not hold the launch. And the
-			// timer must not be unref'd, or the process could fall out from under the
-			// prompt instead of giving up.
+			// A silent stdin must not hold the launch. And the timer must not be unref'd,
+			// or the process could fall out from under the prompt instead of giving up.
 			const answer = await makeAsk(fakeTty())('q? ', { timeoutMs: 120 });
 			expect(answer).toBeNull();
 			const { record } = resolveHarnessAnswer(harnessStates(ws), answer);
 			expect(record).toBeNull();
 			expect(existsSync(harnessMarkerPath(ws))).toBe(false);
 			expect(harnessDeclined('claude', ws)).toBe(false);
+		});
+	});
+
+	/**
+	 * The backgrounded `cellar &`, which the timeout above CANNOT cover: reading the
+	 * terminal from a background process group raises SIGTTIN, whose default
+	 * disposition STOPS the process, and a stopped process runs no timers. Overriding
+	 * that with a SIGTTIN listener is measurably worse - the read then fails with
+	 * EIO, libuv retries, and the process spins at 100% CPU without reaching either
+	 * the JS handler or the timer - so the only fix is not to read at all, which
+	 * makes the foreground test the whole mechanism.
+	 */
+	describe('never reads stdin off the foreground', () => {
+		const decide = new Function(
+			`${src.slice(src.indexOf('function foregroundFromPs'), src.indexOf('function inForegroundJob'))}; return foregroundFromPs;`
+		)();
+
+		it('reads `ps -o pgid=,tpgid=` as foreground / background / unknown', () => {
+			// A background job is exactly the case where the two differ - verified on a
+			// real pty: `set -m; node … &` reports pgid 78159 vs tpgid 78158 and the
+			// process sits in state T.
+			expect(decide(' 4242  4242\n')).toBe(true);
+			expect(decide(' 78159 78158\n')).toBe(false);
+			// No controlling terminal, or a `ps` that reports no tpgid: unknown, which
+			// must NOT read as "background" - that would silently kill the prompt for
+			// everyone on a platform whose ps differs.
+			expect(decide('4242 -1')).toBeNull();
+			expect(decide('4242')).toBeNull();
+			expect(decide('')).toBeNull();
+			expect(decide(undefined)).toBeNull();
+			expect(decide('nonsense output')).toBeNull();
+		});
+
+		it('skips the prompt only on a PROVEN background job', () => {
+			// `=== false` and not a falsy check: unknown must still prompt (behind the
+			// timeout), or Windows and any ps without tpgid would never be asked.
+			const prompt = src.slice(src.indexOf('async function maybePromptHarnessSetup'));
+			expect(prompt).toMatch(/if \(inForegroundJob\(\) === false\) return;/);
+			// Skipping records nothing, so the next foreground launch still asks: the
+			// only writes below the gate are the ones a real answer reaches.
+			const gate = prompt.indexOf('inForegroundJob() === false');
+			expect(gate).toBeGreaterThan(-1);
+			expect(prompt.slice(0, gate)).not.toMatch(/writeHarnessSetup\(WORKSPACE, record\)/);
 		});
 	});
 
