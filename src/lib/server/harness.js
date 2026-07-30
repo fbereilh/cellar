@@ -26,7 +26,8 @@
  * These files belong to the user: they hold other MCP servers and (for Codex)
  * unrelated settings like `model` or `approval_policy`. So every write MERGES,
  * is idempotent (an already-registered Cellar reports `already` and touches
- * nothing), and — the load-bearing half — **refuses on anything it cannot edit
+ * nothing), is ATOMIC (`writeFileAtomic` - a crash mid-write must not truncate
+ * a config), and - the load-bearing half - **refuses on anything it cannot edit
  * confidently**, returning an actionable `skipped` instead of rewriting the
  * file. A hand-editable config the user must repair is a worse outcome than a
  * one-line manual step.
@@ -40,6 +41,14 @@
  * `bin/cellar.js` can import it exactly like `venv.js`/`runtime.js`; it is in
  * `package.json` `files` for the same reason).
  *
+ * Being text-surgical means the scanner IS the safety property: it has to know
+ * what is structure and what is a value, in both directions - an open
+ * multi-line string AND an open bracket (see `parseTomlDoc`). Every structural
+ * decision reads a string-masked copy of the line, never the raw text, because
+ * getting this wrong does not surface as a parse error; it surfaces as a config
+ * that quietly lost a key, gained a duplicate one, or had text rewritten inside
+ * the user's own string while the real key kept its stale value.
+ *
  * ## The running-cellar dependency
  *
  * `cellar mcp` is a BRIDGE, not a standalone server: it attaches to the Cellar
@@ -49,8 +58,19 @@
  * is enough. The bridge resolves the workspace from its own cwd, which is the
  * project directory an agent launches it in, so no path ever appears in config.
  */
-import { join, dirname } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync
+} from 'node:fs';
+import { randomBytes } from 'node:crypto';
 
 /**
  * @typedef {Object} HarnessResult
@@ -141,6 +161,39 @@ export function harnessConfigPath(name, workspace) {
 	return h ? join(workspace, h.configPath) : null;
 }
 
+/**
+ * Replace a config file's contents atomically: a unique temp in the TARGET's own
+ * directory (a cross-device `/tmp` rename is not atomic), fsync, then rename over
+ * the target. These files are the user's - they hold other MCP servers, `model`,
+ * `approval_policy` - so a crash / full disk mid-write must never leave a
+ * truncated one behind: a reader sees the complete old bytes or the complete new
+ * ones. On any failure the temp is removed and the original is untouched, which
+ * is the same never-clobber contract the successful path keeps.
+ *
+ * Deliberately a few lines of `node:fs` rather than `atomic-write.ts`: this
+ * module is node-builtins-only so `bin/cellar.js` can import it (see the header).
+ */
+function writeFileAtomic(file, text) {
+	const dir = dirname(file);
+	mkdirSync(dir, { recursive: true });
+	const tmp = join(dir, `.${basename(file)}.cellar-${process.pid}-${randomBytes(6).toString('hex')}.tmp`);
+	try {
+		const fd = openSync(tmp, 'wx');
+		try {
+			writeFileSync(fd, text);
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+		renameSync(tmp, file);
+	} catch (err) {
+		try {
+			rmSync(tmp, { force: true });
+		} catch {}
+		throw err;
+	}
+}
+
 // ---- JSON (`.mcp.json`, Claude Code) --------------------------------------
 
 const JSON_ENTRY = { command: SERVER_COMMAND, args: [...SERVER_ARGS] };
@@ -196,8 +249,7 @@ function writeJsonConfig(file) {
 			if (readFileSync(file, 'utf8') === next) return { status: 'already', message: 'already configured' };
 		} catch {}
 	}
-	mkdirSync(dirname(file), { recursive: true });
-	writeFileSync(file, next);
+	writeFileAtomic(file, next);
 	return state.present
 		? { status: 'updated', message: `updated the ${SERVER_NAME} MCP server` }
 		: { status: 'wrote', message: `added the ${SERVER_NAME} MCP server` };
@@ -219,26 +271,56 @@ const TOML_BLOCK = [
  * `state` carries an OPEN multi-line string delimiter (`"""` / `'''`) across
  * lines — the reason a naive line scan cannot be trusted: a multi-line string
  * may contain text that looks exactly like a `[table]` header. Returns the
- * index where a real comment starts (or null), the state to carry forward, and
- * `malformed` for an unterminated single-line string (a file we must not edit).
+ * index where a real comment starts (or null), the state to carry forward,
+ * `malformed` for an unterminated single-line string (a file we must not edit),
+ * and `masked`.
+ *
+ * `masked` is the same line with every string span AND the comment blanked to
+ * spaces, same length, so an index into one indexes the other. It is what makes
+ * "is this character structure?" answerable by a plain scan: every structural
+ * decision downstream (a `[`/`]` depth count, the `=` that opens a value) reads
+ * `masked`, never the raw text - counting a `[` that lives inside a string is
+ * exactly how a value's span used to run away and swallow the keys after it.
  */
 function scanLine(line, state) {
 	let i = 0;
-	let malformed = false;
+	// Code UNITS, not code points: every index here comes from `indexOf`/a `[i]`
+	// walk over `line`, so a surrogate pair must not shift `masked` out of step.
+	const chars = line.split('');
+	const blank = (from, to) => {
+		for (let k = Math.max(0, from); k < to && k < chars.length; k++) chars[k] = ' ';
+	};
+	const out = (commentAt, nextState, malformed) => ({
+		commentAt,
+		state: nextState,
+		malformed,
+		masked: chars.join('')
+	});
 	if (state) {
 		const idx = line.indexOf(state);
-		if (idx === -1) return { commentAt: null, state, malformed };
+		if (idx === -1) {
+			blank(0, line.length);
+			return out(null, state, false);
+		}
+		blank(0, idx + state.length);
 		i = idx + state.length;
 		state = null;
 	}
 	while (i < line.length) {
 		const c = line[i];
-		if (c === '#') return { commentAt: i, state, malformed };
+		if (c === '#') {
+			blank(i, line.length);
+			return out(i, state, false);
+		}
 		if (c === '"' || c === "'") {
 			const triple = line.slice(i, i + 3);
 			if (triple === '"""' || triple === "'''") {
 				const close = line.indexOf(triple, i + 3);
-				if (close === -1) return { commentAt: null, state: triple, malformed };
+				if (close === -1) {
+					blank(i, line.length);
+					return out(null, triple, false);
+				}
+				blank(i, close + 3);
 				i = close + 3;
 				continue;
 			}
@@ -255,13 +337,27 @@ function scanLine(line, state) {
 				}
 				j++;
 			}
-			if (!closed) return { commentAt: null, state, malformed: true };
+			if (!closed) {
+				blank(i, line.length);
+				return out(null, state, true);
+			}
+			blank(i, j + 1);
 			i = j + 1;
 			continue;
 		}
 		i++;
 	}
-	return { commentAt: null, state, malformed };
+	return out(null, state, false);
+}
+
+/** Net `[` minus `]` over already-masked code - structure only, never a string. */
+function bracketDelta(masked) {
+	let d = 0;
+	for (const c of masked) {
+		if (c === '[') d++;
+		else if (c === ']') d--;
+	}
+	return d;
 }
 
 /** Strip a quoted TOML key/value token to its text; plain tokens pass through. */
@@ -374,27 +470,60 @@ function parseKeyPath(code) {
 }
 
 /**
- * Structural scan of a TOML document: every table span and every key line, with
- * the table each key belongs to. `malformed` means we could not read it with
- * confidence, and the caller must refuse to edit rather than guess.
+ * Structural scan of a TOML document: every table span, and every key with the
+ * table it belongs to AND the span of its value. `malformed` means we could not
+ * read it with confidence, and the caller must refuse to edit rather than guess.
+ *
+ * The scan is the ONE place that decides what is structure and what is a value,
+ * and it must track BOTH kinds of continuation to do so - an open multi-line
+ * string, and an open bracket. Anything inside either is data: `[1, 2]` as an
+ * element of a multi-line array is not a table header, and a `command = "…"` line
+ * inside a `"""…"""` block is not an assignment. Reading those as structure is
+ * not a cosmetic mistake - it truncated the enclosing table's span (so a key that
+ * IS present read as missing and got inserted a second time, i.e. invalid TOML)
+ * and it aimed a rewrite at text inside the user's own string while leaving the
+ * real key untouched. So a key is recorded with `valueFrom`/`last` here, once,
+ * rather than re-scanned later by whoever wants to read it.
  */
 function parseTomlDoc(text) {
 	const lines = text.split('\n');
+	const codes = [];
 	const tables = [];
 	const keys = [];
 	let state = null;
 	let malformed = false;
+	let depth = 0;
+	/** The key whose value is still open across lines; its `last` closes it. */
+	let pending = null;
 	let current = { key: [], isArray: false, start: 0, end: lines.length };
 	for (let i = 0; i < lines.length; i++) {
 		const r = scanLine(lines[i], state);
 		if (r.malformed) malformed = true;
 		const wasOpen = state !== null;
 		state = r.state;
+		const code = r.commentAt == null ? lines[i] : lines[i].slice(0, r.commentAt);
+		const maskedCode = r.commentAt == null ? r.masked : r.masked.slice(0, r.commentAt);
+		codes.push(code);
+		// Was this line's start already inside a multi-line value? Decide BEFORE
+		// folding this line's own brackets in, or a value's closing line would look
+		// like structure.
+		const inValue = depth > 0;
+		depth += bracketDelta(maskedCode);
+		if (depth < 0) {
+			// More `]` than `[`: we are not reading this file correctly.
+			malformed = true;
+			depth = 0;
+		}
+		// A value is closed once neither kind of continuation is open - a bracket
+		// depth back at 0 AND no multi-line string still running.
+		if (pending && depth === 0 && state === null) {
+			pending.last = i;
+			pending = null;
+		}
 		// A line that continues — or closes — an open multi-line string carries no
 		// structure we need: a table header is never legal there, and the tail after
 		// a closing delimiter can only finish a value. Skip it conservatively.
-		if (wasOpen) continue;
-		const code = r.commentAt == null ? lines[i] : lines[i].slice(0, r.commentAt);
+		if (wasOpen || inValue) continue;
 		if (code.trim() === '') continue;
 		const hdr = parseTableHeader(code);
 		if (hdr === 'malformed') {
@@ -408,11 +537,20 @@ function parseTomlDoc(text) {
 			continue;
 		}
 		const path = parseKeyPath(code);
-		if (path) keys.push({ table: current.key, path, line: i });
+		if (path) {
+			// The `=` is located on the MASKED line, so a quoted key containing one
+			// (`"a=b" = 1`) cannot be mistaken for the assignment.
+			const eq = maskedCode.indexOf('=');
+			const entry = { table: current.key, path, line: i, valueFrom: eq + 1, last: i };
+			keys.push(entry);
+			if (depth > 0 || state) pending = entry;
+		}
 	}
 	tables.push(current);
-	if (state) malformed = true; // unterminated multi-line string
-	return { lines, tables, keys, malformed };
+	// An unterminated multi-line string, or a value whose brackets never closed:
+	// either way the tail of this file is not what we think it is.
+	if (state || depth !== 0 || pending) malformed = true;
+	return { lines, codes, tables, keys, malformed };
 }
 
 const samePath = (a, b) => a.length === b.length && a.every((s, i) => s === b[i]);
@@ -434,28 +572,24 @@ function parseStringArray(text) {
 }
 
 /**
- * Read a `key = value` assignment out of a table's line span, joining a value
- * whose brackets continue onto later lines (`args = [\n "mcp"\n]`).
+ * Read a `key = value` assignment out of a table, using the span `parseTomlDoc`
+ * already resolved (so a value continuing onto later lines - `args = [\n "mcp"\n]`
+ * - is joined, and text that merely LOOKS like this key inside a multi-line
+ * string is not a candidate at all: it was never recorded as a key).
  */
-function readAssignment(lines, start, end, key) {
-	for (let i = start; i < end; i++) {
-		const r = scanLine(lines[i], null);
-		const code = r.commentAt == null ? lines[i] : lines[i].slice(0, r.commentAt);
-		const path = parseKeyPath(code);
-		if (!path || path.length !== 1 || path[0] !== key) continue;
-		let value = code.slice(code.indexOf('=') + 1);
-		let depth = (value.match(/\[/g) ?? []).length - (value.match(/\]/g) ?? []).length;
-		let last = i;
-		while (depth > 0 && last + 1 < end) {
-			last++;
-			const rr = scanLine(lines[last], null);
-			const more = rr.commentAt == null ? lines[last] : lines[last].slice(0, rr.commentAt);
-			value += '\n' + more;
-			depth += (more.match(/\[/g) ?? []).length - (more.match(/\]/g) ?? []).length;
-		}
-		return { first: i, last, value: value.trim() };
-	}
-	return null;
+function readAssignment(doc, table, key) {
+	const entry = doc.keys.find(
+		(k) =>
+			k.line > table.start &&
+			k.line < table.end &&
+			samePath(k.table, table.key) &&
+			k.path.length === 1 &&
+			k.path[0] === key
+	);
+	if (!entry) return null;
+	let value = doc.codes[entry.line].slice(entry.valueFrom);
+	for (let i = entry.line + 1; i <= entry.last; i++) value += '\n' + doc.codes[i];
+	return { first: entry.line, last: entry.last, value: value.trim() };
 }
 
 /**
@@ -473,7 +607,14 @@ function codexState(text) {
 	if (table) return { kind: 'table', doc, table };
 	for (const k of doc.keys) {
 		const full = [...k.table, ...k.path];
-		if (full.length >= TOML_TABLE.length && samePath(full.slice(0, TOML_TABLE.length), TOML_TABLE)) {
+		// Either this key IS (or is under) `mcp_servers.cellar` - an inline table or a
+		// dotted key - or it is a PREFIX of it, i.e. `mcp_servers` itself assigned as a
+		// value (`mcp_servers = { cellar = … }`). The prefix case has to refuse too:
+		// TOML forbids extending an inline table, so appending `[mcp_servers.cellar]`
+		// under it would leave the whole file unparseable, taking every other setting
+		// and every other MCP server down with it.
+		const shared = Math.min(full.length, TOML_TABLE.length);
+		if (samePath(full.slice(0, shared), TOML_TABLE.slice(0, shared))) {
 			return { kind: 'other-form', doc, line: k.line };
 		}
 	}
@@ -482,8 +623,8 @@ function codexState(text) {
 
 /** True when the canonical table already says exactly what Cellar would write. */
 function tableMatches(doc, table) {
-	const cmd = readAssignment(doc.lines, table.start + 1, table.end, 'command');
-	const args = readAssignment(doc.lines, table.start + 1, table.end, 'args');
+	const cmd = readAssignment(doc, table, 'command');
+	const args = readAssignment(doc, table, 'args');
 	if (!cmd || !args) return false;
 	if (unquote(cmd.value) !== SERVER_COMMAND) return false;
 	const parsed = parseStringArray(args.value);
@@ -499,7 +640,7 @@ function rewriteTable(doc, table) {
 		['command', `command = "${SERVER_COMMAND}"`],
 		['args', `args = [${SERVER_ARGS.map((a) => JSON.stringify(a)).join(', ')}]`]
 	]) {
-		const found = readAssignment(doc.lines, table.start + 1, table.end, key);
+		const found = readAssignment(doc, table, key);
 		edits.push({ key, text, found });
 	}
 	for (const e of [...edits].sort((a, b) => (b.found?.first ?? -1) - (a.found?.first ?? -1))) {
@@ -548,8 +689,7 @@ function writeTomlConfig(file) {
 		status = 'wrote';
 	}
 	if (next === existing) return { status: 'already', message: 'already configured' };
-	mkdirSync(dirname(file), { recursive: true });
-	writeFileSync(file, next);
+	writeFileAtomic(file, next);
 	return {
 		status,
 		message:
@@ -660,19 +800,58 @@ export function readHarnessSetup(workspace) {
 
 /**
  * Record the answer. `configured` are the harnesses the user chose; `declined`
- * are the ones they were offered and did not — an explicit "no" the launcher
- * honors for the auto-configured harness, so the prompt cannot be contradicted
- * one step later by the automatic `.mcp.json` write.
+ * is the narrow thing it says it is - a harness the user was offered as NOT yet
+ * configured and explicitly skipped. The launcher honors that for the
+ * auto-configured harness, so the prompt cannot be contradicted one step later
+ * by the automatic `.mcp.json` write.
+ *
+ * `declined` is deliberately NOT "everything not chosen": a harness that was
+ * ALREADY configured must never land here (declining it would switch off the
+ * per-launch write that repairs a stale entry, over a choice the user never
+ * made), and an answer nobody understood is not an answer at all - the caller
+ * records nothing in that case, so the next interactive launch asks again.
  *
  * @param {string} workspace
- * @param {{ configured?: string[], declined?: string[] }} [answer]
+ * @param {{ configured?: string[], declined?: string[], promptedAt?: number }} [answer]
  */
-export function writeHarnessSetup(workspace, { configured = [], declined = [] } = {}) {
+export function writeHarnessSetup(workspace, { configured = [], declined = [], promptedAt } = {}) {
 	const file = harnessMarkerPath(workspace);
-	mkdirSync(dirname(file), { recursive: true });
-	const data = { version: 1, promptedAt: Date.now(), configured, declined };
-	writeFileSync(file, JSON.stringify(data, null, 2) + '\n');
+	const data = {
+		version: 1,
+		promptedAt: typeof promptedAt === 'number' ? promptedAt : Date.now(),
+		configured,
+		declined
+	};
+	writeFileAtomic(file, JSON.stringify(data, null, 2) + '\n');
 	return data;
+}
+
+/**
+ * Retract a recorded decline for one harness - what makes the advice printed
+ * beside the skipped `.mcp.json` write ("`cellar harness add claude` to enable")
+ * TRUE. Without it the decline was permanent: the automatic write stayed off and
+ * the launcher kept claiming a decline on every launch, over a config the user
+ * had since asked for by hand, with no remedy short of deleting the marker.
+ *
+ * Keeps the original `promptedAt`, so the question still counts as asked.
+ *
+ * @param {string} name
+ * @param {string} workspace
+ * @returns {boolean} true when a decline was actually retracted
+ */
+export function clearHarnessDecline(name, workspace) {
+	const h = getHarness(name);
+	if (!h) return false;
+	const marker = readHarnessSetup(workspace);
+	const declined = Array.isArray(marker?.declined) ? marker.declined : [];
+	if (!declined.includes(h.name)) return false;
+	const configured = Array.isArray(marker?.configured) ? marker.configured : [];
+	writeHarnessSetup(workspace, {
+		configured: configured.includes(h.name) ? configured : [...configured, h.name],
+		declined: declined.filter((n) => n !== h.name),
+		promptedAt: typeof marker?.promptedAt === 'number' ? marker.promptedAt : undefined
+	});
+	return true;
 }
 
 /** Has the first-run harness question already been asked in this workspace? */
@@ -724,20 +903,26 @@ export function shouldPromptHarnessSetup(workspace, { interactive = true } = {})
  * tokens come back in `unknown` so the caller can say so instead of silently
  * dropping them.
  *
+ * `answered` separates a real reply from one nothing in it resolved: an all-typo
+ * answer is NOT a decision, so the caller must record nothing and ask again
+ * rather than treat it as "no to everything". An empty answer and an explicit
+ * no/skip ARE decisions.
+ *
  * @param {string} answer
  * @param {string[]} [offered]
- * @returns {{ chosen: string[], unknown: string[], skipped: boolean }}
+ * @returns {{ chosen: string[], unknown: string[], skipped: boolean, answered: boolean }}
  */
 export function parseHarnessAnswer(answer, offered = harnessNames()) {
 	const raw = String(answer ?? '').trim();
-	if (raw === '') return { chosen: [], unknown: [], skipped: true };
+	if (raw === '') return { chosen: [], unknown: [], skipped: true, answered: true };
 	const tokens = raw
 		.split(/[\s,]+/)
 		.map((t) => t.trim().toLowerCase())
 		.filter(Boolean);
-	if (tokens.some((t) => t === 'all' || t === 'a' || t === '*')) return { chosen: [...offered], unknown: [], skipped: false };
+	if (tokens.some((t) => t === 'all' || t === 'a' || t === '*'))
+		return { chosen: [...offered], unknown: [], skipped: false, answered: true };
 	if (tokens.length === 1 && ['n', 'no', 'none', 'skip', 's', 'q'].includes(tokens[0])) {
-		return { chosen: [], unknown: [], skipped: true };
+		return { chosen: [], unknown: [], skipped: true, answered: true };
 	}
 	const chosen = [];
 	const unknown = [];
@@ -758,5 +943,44 @@ export function parseHarnessAnswer(answer, offered = harnessNames()) {
 		}
 		unknown.push(t);
 	}
-	return { chosen, unknown, skipped: chosen.length === 0 };
+	// Tokens were given but none resolved: not a decision, so the caller records
+	// nothing and asks again next time.
+	return { chosen, unknown, skipped: chosen.length === 0, answered: chosen.length > 0 };
+}
+
+/**
+ * Turn one prompt answer into what should be RECORDED - the second half of
+ * `shouldPromptHarnessSetup`, kept here for the same reason: the marker outlives
+ * the launch and silently gates the automatic `.mcp.json` write, so getting it
+ * wrong has no visible symptom in the run that wrote it.
+ *
+ * `answer` is the raw reply, or `null` for "no answer at all" - a stdin that
+ * closed, a backgrounded job, or the prompt timing out. Those are indistinguishable
+ * by design, and none of them is a decision.
+ *
+ * `record` is null when nothing should be written (no answer, or an answer nothing
+ * in which resolved), so the next interactive launch asks again. Otherwise it
+ * carries `configured` (the picks) and `declined` - ONLY harnesses shown as not
+ * configured and passed over. An already-configured harness is never declined:
+ * saying no to it was never on offer, and recording it would switch off the write
+ * that keeps its entry current.
+ *
+ * @param {HarnessStateInfo[]} states
+ * @param {string | null | undefined} answer
+ * @param {string[]} [offered]
+ * @returns {{ chosen: string[], unknown: string[],
+ *            record: { configured: string[], declined: string[] } | null }}
+ */
+export function resolveHarnessAnswer(states, answer, offered = states.map((s) => s.name)) {
+	if (answer === null || answer === undefined) return { chosen: [], unknown: [], record: null };
+	const { chosen, unknown, answered } = parseHarnessAnswer(answer, offered);
+	if (!answered) return { chosen, unknown, record: null };
+	return {
+		chosen,
+		unknown,
+		record: {
+			configured: chosen,
+			declined: states.filter((s) => !s.configured && !chosen.includes(s.name)).map((s) => s.name)
+		}
+	};
 }

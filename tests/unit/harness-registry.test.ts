@@ -16,22 +16,27 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import {
 	HARNESSES,
+	clearHarnessDecline,
 	configureHarness,
 	getHarness,
 	harnessConfigPath,
 	harnessDeclined,
+	harnessMarkerPath,
 	harnessNames,
 	harnessSetupDone,
 	harnessState,
 	harnessStates,
 	parseHarnessAnswer,
 	readHarnessSetup,
+	resolveHarnessAnswer,
 	shouldPromptHarnessSetup,
 	writeHarnessSetup
 } from '../../src/lib/server/harness.js';
@@ -292,6 +297,122 @@ describe('codex (.codex/config.toml, TOML)', () => {
 	it('carries the trusted-project note, since project config is ignored without it', () => {
 		expect(configureHarness('codex', ws).note).toMatch(/trusted/i);
 	});
+
+	// The scanner has to know what is STRUCTURE and what is DATA in two directions
+	// - an open string and an open bracket - and getting either wrong does not look
+	// like a parse error, it looks like a config that quietly lost something. Each
+	// case below deleted or invalidated part of the user's file before the fix.
+	describe('never mistakes a value for structure', () => {
+		it('keeps sibling keys when a value string contains a bracket', () => {
+			// `args = [… "a[b"]` counted the in-string `[` as depth, so the value span
+			// ran to the end of the table and the rewrite spliced the rest away.
+			writeCodex(
+				[
+					'[mcp_servers.cellar]',
+					'command = "npx"',
+					'args = ["-p", "a[b"]',
+					'startup_timeout_sec = 30',
+					'env = { A = "1" }',
+					'',
+					'[mcp_servers.other]',
+					'command = "other"',
+					''
+				].join('\n')
+			);
+			expect(configureHarness('codex', ws).status).toBe('updated');
+			const after = read(codexFile());
+			expect(after).toContain('startup_timeout_sec = 30');
+			expect(after).toContain('env = { A = "1" }');
+			expect(after).toContain('[mcp_servers.other]');
+			expect(after).toContain('args = ["mcp"]');
+			expect(after).not.toContain('a[b');
+		});
+
+		it('rewrites the REAL command, not one written inside a multi-line string', () => {
+			// The worst shape: the string body was rewritten (corrupting the user's own
+			// text) while the actual `command` kept its wrong value, so Codex stayed broken.
+			writeCodex(
+				['[mcp_servers.cellar]', 'description = """', 'command = "evil"', '"""', 'command = "npx"', 'args = ["x"]', ''].join(
+					'\n'
+				)
+			);
+			expect(configureHarness('codex', ws).status).toBe('updated');
+			const after = read(codexFile());
+			// The string body reads exactly as authored; only the real key moved.
+			expect(after.match(/command = "evil"/g)).toHaveLength(1);
+			expect(after.match(/command = "cellar"/g)).toHaveLength(1);
+			expect(after).not.toContain('command = "npx"');
+			expect(harnessState('codex', ws)?.configured).toBe(true);
+		});
+
+		it('rewrites a key in place when a nested array sits above it (no duplicate key)', () => {
+			// A `[1, 2]` element read as a table header truncated the span, so `args`
+			// read as missing and a SECOND one was inserted - invalid TOML.
+			writeCodex(['[mcp_servers.cellar]', 'command = "npx"', 'matrix = [', '  [1, 2]', ']', 'args = ["x"]', ''].join('\n'));
+			expect(configureHarness('codex', ws).status).toBe('updated');
+			const after = read(codexFile());
+			expect(after.match(/^args = /gm)).toHaveLength(1);
+			expect(after).toContain('args = ["mcp"]');
+			expect(after).toContain('matrix = [\n  [1, 2]\n]');
+			expect(configureHarness('codex', ws).status).toBe('already');
+		});
+
+		it('replaces a multi-line-string value whole, leaving no orphan lines', () => {
+			writeCodex(['[mcp_servers.cellar]', 'command = """', 'cellar', '"""', 'args = ["mcp"]', 'keep = 1', ''].join('\n'));
+			expect(configureHarness('codex', ws).status).toBe('updated');
+			const after = read(codexFile());
+			expect(after).toBe('[mcp_servers.cellar]\ncommand = "cellar"\nargs = ["mcp"]\nkeep = 1\n');
+		});
+
+		it('refuses a root-level inline mcp_servers instead of appending an illegal table', () => {
+			// TOML forbids extending an inline table, so appending `[mcp_servers.cellar]`
+			// under it made the WHOLE file unparseable - every other setting lost with it.
+			const existing = 'mcp_servers = { cellar = { command = "cellar", args = ["mcp"] } }\nmodel = "gpt-5"\n';
+			writeCodex(existing);
+			const r = configureHarness('codex', ws);
+			expect(r.status).toBe('skipped');
+			expect(r.message).toContain('another form');
+			expect(read(codexFile())).toBe(existing);
+			// And it is reported as present-but-not-editable, never as absent.
+			expect(harnessState('codex', ws)).toMatchObject({ present: true, configured: false });
+		});
+
+		it('refuses a value whose brackets never close', () => {
+			const broken = '[mcp_servers.cellar]\nargs = [\n  "mcp"\n';
+			writeCodex(broken);
+			expect(configureHarness('codex', ws).status).toBe('skipped');
+			expect(read(codexFile())).toBe(broken);
+		});
+
+		it('still appends correctly below an array of tables and a multi-line array', () => {
+			const existing = [
+				'[[profiles]]',
+				'name = "a"',
+				'',
+				'[sandbox_workspace_write]',
+				'writable_roots = [',
+				'  "/tmp",',
+				'  "/var/folders"',
+				']',
+				''
+			].join('\n');
+			writeCodex(existing);
+			expect(configureHarness('codex', ws).status).toBe('wrote');
+			const after = read(codexFile());
+			expect(after.startsWith(existing)).toBe(true);
+			expect(after.trimEnd().endsWith('args = ["mcp"]')).toBe(true);
+			expect(configureHarness('codex', ws).status).toBe('already');
+		});
+	});
+
+	it('replaces the file atomically, leaving no temp file behind', () => {
+		// These files hold the user's other MCP servers and settings, so a crash
+		// mid-write must not be able to truncate one (the .ipynb rule, same reason).
+		configureHarness('codex', ws);
+		configureHarness('claude', ws);
+		const stray = [...readdirSync(join(ws, '.codex')), ...readdirSync(ws)].filter((f) => f.includes('.tmp'));
+		expect(stray).toEqual([]);
+	});
 });
 
 describe('harnessState', () => {
@@ -378,6 +499,218 @@ describe('parseHarnessAnswer', () => {
 		const r = parseHarnessAnswer('codex, opencode, 9');
 		expect(r.chosen).toEqual(['codex']);
 		expect(r.unknown).toEqual(['opencode', '9']);
+	});
+
+	it('separates a real answer from one nothing in it resolved', () => {
+		// A skip IS a decision; a typo is not, and must not be recorded as one.
+		expect(parseHarnessAnswer('').answered).toBe(true);
+		expect(parseHarnessAnswer('no').answered).toBe(true);
+		expect(parseHarnessAnswer('codex').answered).toBe(true);
+		expect(parseHarnessAnswer('codex opencode').answered).toBe(true);
+		expect(parseHarnessAnswer('opencode').answered).toBe(false);
+		expect(parseHarnessAnswer('9, zzz').answered).toBe(false);
+	});
+});
+
+/**
+ * What one prompt answer RECORDS. The marker outlives the launch and silently
+ * gates the launcher's automatic `.mcp.json` write, so a wrong entry here has no
+ * symptom in the run that wrote it - only later, as a write that never happens
+ * again and a decline the user never made.
+ */
+describe('resolveHarnessAnswer', () => {
+	const states = (over: Partial<Record<string, boolean>> = {}) =>
+		harnessNames().map((name) => ({
+			name,
+			label: name,
+			file: `/x/${name}`,
+			exists: false,
+			present: false,
+			configured: !!over[name],
+			unreadable: false
+		})) as any;
+
+	it('declines only what was offered as unconfigured and passed over', () => {
+		const r = resolveHarnessAnswer(states(), '2');
+		expect(r.chosen).toEqual(['codex']);
+		expect(r.record).toEqual({ configured: ['codex'], declined: ['claude'] });
+	});
+
+	it('never declines an ALREADY-CONFIGURED harness the user simply did not re-pick', () => {
+		// The prompt labels it "(already configured)", so there was nothing to say no
+		// to - and declining it would switch off the per-launch write that keeps its
+		// entry current.
+		const r = resolveHarnessAnswer(states({ claude: true }), '2');
+		expect(r.record).toEqual({ configured: ['codex'], declined: [] });
+	});
+
+	it('records an explicit skip, declining exactly the unconfigured harnesses', () => {
+		for (const answer of ['', '   ', 'n', 'no', 'none', 'skip']) {
+			expect(resolveHarnessAnswer(states({ claude: true }), answer).record).toEqual({
+				configured: [],
+				declined: ['codex']
+			});
+		}
+	});
+
+	it('records NOTHING for an answer nothing in which resolved', () => {
+		const r = resolveHarnessAnswer(states(), 'opencode');
+		expect(r.record).toBeNull();
+		expect(r.unknown).toEqual(['opencode']);
+	});
+
+	it('records NOTHING when there was no answer at all', () => {
+		// A timeout, a closed stdin and a backgrounded job are one outcome by design:
+		// not a decision, so the next interactive launch asks again.
+		expect(resolveHarnessAnswer(states(), null).record).toBeNull();
+		expect(resolveHarnessAnswer(states(), undefined).record).toBeNull();
+	});
+
+	it('the recorded decline is exactly what the launcher gate reads', () => {
+		// Ties the pure rule to the real gate: `harnessDeclined('claude')` is what
+		// suppresses the automatic .mcp.json write. Claude is already configured and
+		// the user skips, so nothing is declined for it - the write keeps running.
+		configureHarness('claude', ws);
+		const r = resolveHarnessAnswer(harnessStates(ws), '');
+		expect(r.record).toEqual({ configured: [], declined: ['codex'] });
+		writeHarnessSetup(ws, r.record!);
+		expect(harnessDeclined('claude', ws)).toBe(false);
+		expect(harnessDeclined('codex', ws)).toBe(true);
+	});
+});
+
+describe('retracting a decline', () => {
+	it('`cellar harness add` re-enables the automatic write it had switched off', () => {
+		writeHarnessSetup(ws, { configured: [], declined: ['claude', 'codex'] });
+		expect(harnessDeclined('claude', ws)).toBe(true);
+
+		const r = spawnSync(process.execPath, [CLI, 'harness', 'add', 'claude'], {
+			cwd: ws,
+			encoding: 'utf8',
+			env: { ...process.env, CI: '1' }
+		});
+		expect(r.status).toBe(0);
+		// The message beside the skipped launch write promises exactly this.
+		expect(harnessDeclined('claude', ws)).toBe(false);
+		// Scoped: the other harness's decline is untouched, and the question still
+		// counts as asked.
+		expect(harnessDeclined('codex', ws)).toBe(true);
+		expect(harnessSetupDone(ws)).toBe(true);
+		expect(readHarnessSetup(ws)?.configured).toContain('claude');
+	});
+
+	it('keeps the original promptedAt, so the question is not re-asked', () => {
+		writeHarnessSetup(ws, { configured: [], declined: ['claude'], promptedAt: 1234 });
+		expect(clearHarnessDecline('claude', ws)).toBe(true);
+		expect(readHarnessSetup(ws)?.promptedAt).toBe(1234);
+		expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(false);
+	});
+
+	it('is a no-op when there is nothing to retract', () => {
+		expect(clearHarnessDecline('claude', ws)).toBe(false);
+		expect(existsSync(harnessMarkerPath(ws))).toBe(false);
+		writeHarnessSetup(ws, { configured: ['claude'], declined: [] });
+		expect(clearHarnessDecline('claude', ws)).toBe(false);
+		expect(clearHarnessDecline('nope', ws)).toBe(false);
+	});
+});
+
+/**
+ * The first-run prompt sits in the LAUNCH path, so two properties matter that a
+ * unit suite cannot boot a launcher to observe. Both are asserted against the
+ * source: an ordering, and the shape of the wait.
+ */
+describe('first-run prompt placement + wait (bin/cellar.js)', () => {
+	const src = readFileSync(CLI, 'utf8');
+	const mainBody = src.slice(src.indexOf('async function main()'));
+
+	it('asks BEFORE the single-instance takeover claims/reaps the folder', () => {
+		// Otherwise a relaunch reaps the instance that owns this folder and then waits
+		// for an answer, leaving the user with no running Cellar at all.
+		const prompt = mainBody.indexOf('maybePromptHarnessSetup()');
+		const lock = mainBody.indexOf('acquireInstanceLock(WORKSPACE)');
+		const reap = mainBody.indexOf('reapInstance(');
+		expect(prompt).toBeGreaterThan(-1);
+		expect(lock).toBeGreaterThan(-1);
+		expect(prompt).toBeLessThan(lock);
+		expect(prompt).toBeLessThan(reap);
+	});
+
+	it('passes the prompt a bounded wait', () => {
+		expect(src).toMatch(/maybePromptHarnessSetup[\s\S]*?timeoutMs:\s*HARNESS_PROMPT_TIMEOUT_MS/);
+		expect(src).toMatch(/HARNESS_PROMPT_TIMEOUT_MS = [\d_]+/);
+	});
+
+	/**
+	 * The three ways the question can go unanswered, exercised against the SHIPPED
+	 * source of `ask` over fake stdio - a launcher cannot be booted here, and a real
+	 * TTY is what the failure needs (`cellar &` reads stdin.isTTY as true, so autoYes
+	 * stays false, then SIGTTIN stops it on the first read). All three must resolve
+	 * the same "no answer" value, which records nothing.
+	 */
+	describe('gives up rather than stranding the launch', () => {
+		const body = src.slice(src.indexOf('function ask('), src.indexOf('function printHelp('));
+		const makeAsk = (stdin: any) => {
+			const stdout: any = new PassThrough();
+			stdout.resume();
+			return new Function('createInterface', 'process', `${body}; return ask;`)(createInterface, { stdin, stdout });
+		};
+		const fakeTty = () => {
+			const s: any = new PassThrough();
+			s.isTTY = true;
+			return s;
+		};
+
+		it('still returns a real answer', async () => {
+			const stdin = fakeTty();
+			const p = makeAsk(stdin)('q? ', { timeoutMs: 5000 });
+			stdin.write('codex\n');
+			expect(await p).toBe('codex');
+			expect(resolveHarnessAnswer(harnessStates(ws), await p).chosen).toEqual(['codex']);
+		});
+
+		// A timeout far beyond this test's own budget, so only the close/error
+		// handler can be what resolves these - never the timer.
+		const NEVER = 10 * 60_000;
+
+		it('a stdin that closes with no answer resolves null, and records nothing', async () => {
+			const stdin = fakeTty();
+			const p = makeAsk(stdin)('q? ', { timeoutMs: NEVER });
+			stdin.end();
+			expect(await p).toBeNull();
+			expect(resolveHarnessAnswer(harnessStates(ws), await p).record).toBeNull();
+		});
+
+		it('a stdin error resolves null', async () => {
+			const stdin = fakeTty();
+			const p = makeAsk(stdin)('q? ', { timeoutMs: NEVER });
+			stdin.emit('error', new Error('EIO'));
+			expect(await p).toBeNull();
+		});
+
+		it('the timeout fires and skips WITHOUT recording a decline', async () => {
+			// A silent stdin (the backgrounded job) must not hold the launch. And the
+			// timer must not be unref'd, or the process could fall out from under the
+			// prompt instead of giving up.
+			const answer = await makeAsk(fakeTty())('q? ', { timeoutMs: 120 });
+			expect(answer).toBeNull();
+			const { record } = resolveHarnessAnswer(harnessStates(ws), answer);
+			expect(record).toBeNull();
+			expect(existsSync(harnessMarkerPath(ws))).toBe(false);
+			expect(harnessDeclined('claude', ws)).toBe(false);
+		});
+	});
+
+	it('still never prompts non-interactively, and records nothing when it does not', () => {
+		// A real launch with CI=1: no prompt, no marker, and the launch is unaffected.
+		const r = spawnSync(process.execPath, [CLI, 'harness', 'list'], {
+			cwd: ws,
+			encoding: 'utf8',
+			env: { ...process.env, CI: '1' }
+		});
+		expect(r.status).toBe(0);
+		expect(existsSync(harnessMarkerPath(ws))).toBe(false);
+		expect(shouldPromptHarnessSetup(ws, { interactive: false })).toMatchObject({ prompt: false, record: false });
 	});
 });
 

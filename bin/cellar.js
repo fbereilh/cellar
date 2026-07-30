@@ -105,11 +105,12 @@ import {
 } from '../src/lib/server/runtime.js';
 import {
 	RUNNING_NOTE,
+	clearHarnessDecline,
 	configureHarness,
 	harnessDeclined,
 	harnessNames,
 	harnessStates,
-	parseHarnessAnswer,
+	resolveHarnessAnswer,
 	shouldPromptHarnessSetup,
 	writeHarnessSetup
 } from '../src/lib/server/harness.js';
@@ -478,14 +479,39 @@ function promptYesNo(question) {
 	});
 }
 
-/** Free-text prompt (the harness picker needs a list, not a yes/no). */
-function ask(question) {
+/**
+ * Free-text prompt (the harness picker needs a list, not a yes/no).
+ *
+ * Resolves `null` - "no answer" - rather than waiting forever, because this one
+ * runs in the LAUNCH path: a `cellar &` reads `stdin.isTTY` as true yet is stopped
+ * by SIGTTIN the moment it reads, and a stdin that closes (or errors) would
+ * otherwise leave the promise pending and the notebook unstarted. So a closed
+ * stdin, a read error and `timeoutMs` elapsing are all one outcome, which the
+ * caller must treat as "not answered" - never as a decision.
+ */
+function ask(question, { timeoutMs } = {}) {
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
 	return new Promise((res) => {
-		rl.question(question, (ans) => {
+		let settled = false;
+		let timer = null;
+		const finish = (value) => {
+			if (settled) return;
+			settled = true;
+			if (timer) clearTimeout(timer);
 			rl.close();
-			res(ans);
-		});
+			res(value);
+		};
+		// Deliberately NOT unref'd: the launch is awaiting this promise, so a timer the
+		// loop is free to ignore would let the process fall out from under the prompt
+		// instead of giving up and continuing. Cleared by `finish`, so it holds nothing
+		// open once an answer (or any other outcome) arrives.
+		if (timeoutMs) timer = setTimeout(() => finish(null), timeoutMs);
+		// `close` covers a stdin that ends without answering; `error` covers a read
+		// that fails - readline forwards its input stream's errors here, which is what
+		// makes this the one listener that has to exist.
+		rl.on('close', () => finish(null));
+		rl.on('error', () => finish(null));
+		rl.question(question, (ans) => finish(ans));
 	});
 }
 
@@ -679,6 +705,12 @@ function harnessCommand(args) {
 		for (const name of names) {
 			const r = configureHarness(name, workspace);
 			if (!r.ok) ok = false;
+			// Asking for a harness explicitly RETRACTS an earlier first-run decline -
+			// otherwise the launcher would keep skipping its automatic write, and keep
+			// claiming a decline, over the config this command just put in place.
+			if (r.ok && r.status !== 'skipped' && clearHarnessDecline(name, workspace)) {
+				console.log(`[cellar]   (re-enabled automatic ${r.label} setup on launch)`);
+			}
 			wrote = printHarnessResult(r) || wrote;
 		}
 		if (wrote) console.log(`[cellar] ${RUNNING_NOTE}`);
@@ -690,18 +722,28 @@ function harnessCommand(args) {
 	return 1;
 }
 
+/** How long the one-time question waits before giving up and launching anyway. */
+const HARNESS_PROMPT_TIMEOUT_MS = 30_000;
+
 /**
  * First run in a workspace: offer to wire up the user's agent harness(es).
  *
- * Three rules make this safe to have in the launch path. It is asked ONCE per
- * workspace (a durable `.cellar/harness.json` marker, written whatever the
- * answer — including a skip), it NEVER prompts without a TTY (`-y`, `$CI`, a
- * piped stdin all fall through silently), and it can never abort a launch: any
- * failure is caught and logged, exactly like the best-effort host-env prep.
+ * Four rules make this safe to have in the launch path. It is asked ONCE per
+ * workspace (a durable `.cellar/harness.json` marker), it NEVER prompts without a
+ * TTY (`-y`, `$CI`, a piped stdin all fall through silently), it can never abort a
+ * launch (any failure is caught and logged, exactly like the best-effort host-env
+ * prep), and it can never STALL one either: `ask` gives up on a closed stdin, a
+ * read error or `HARNESS_PROMPT_TIMEOUT_MS`, so a backgrounded `cellar &` - whose
+ * `stdin.isTTY` is true, so `autoYes` stays false - proceeds instead of hanging.
  *
- * The answer is recorded rather than merely acted on, because the launcher also
- * auto-writes Claude Code's `.mcp.json` on every run: an explicit decline here
- * has to survive, or the prompt would be contradicted one step later.
+ * What is recorded is as narrow as the question answered, because the launcher
+ * also auto-writes Claude Code's `.mcp.json` on every run and honors a decline:
+ *   - a real answer      → marker written; declines are ONLY the harnesses that
+ *                          were offered as unconfigured and explicitly skipped
+ *   - no answer at all   → nothing written (timeout / closed stdin / all-typo
+ *                          answer), so the next interactive launch asks again
+ * An already-configured harness is never recorded as declined: that would switch
+ * off the write that keeps its entry current, over a choice nobody made.
  */
 async function maybePromptHarnessSetup() {
 	try {
@@ -720,11 +762,22 @@ async function maybePromptHarnessSetup() {
 			const flag = s.configured ? ' (already configured)' : s.present ? ' (has another entry)' : '';
 			console.log(`[cellar]   ${i + 1}) ${s.label.padEnd(12)} ${s.file}${flag}`);
 		});
-		const answer = await ask(
-			`[cellar] Configure which? [numbers/names, "all", or Enter to skip] `
-		);
-		const { chosen, unknown } = parseHarnessAnswer(answer, offered);
+		const answer = await ask(`[cellar] Configure which? [numbers/names, "all", or Enter to skip] `, {
+			timeoutMs: HARNESS_PROMPT_TIMEOUT_MS
+		});
+		// The answer→marker rule lives in the registry beside the other pure gates,
+		// for the same reason: a wrong marker gates the automatic `.mcp.json` write
+		// forever and shows no symptom in the run that wrote it.
+		const { chosen, unknown, record } = resolveHarnessAnswer(states, answer, offered);
 		for (const u of unknown) console.log(`[cellar] ignoring unrecognized choice: ${u}`);
+		if (!record) {
+			// Not a decision - no answer at all, or nothing in the reply resolved.
+			// Recording it would decline every harness over a typo or a stray EOF.
+			console.log(
+				`[cellar] ${answer === null ? 'no answer' : 'nothing recognized'} - continuing without agent setup (asked again next time; \`cellar harness add <${harnessNames().join('|')}>\` any time).`
+			);
+			return;
+		}
 
 		let wrote = false;
 		for (const name of chosen) wrote = printHarnessResult(configureHarness(name, WORKSPACE)) || wrote;
@@ -732,10 +785,7 @@ async function maybePromptHarnessSetup() {
 		if (chosen.length === 0) {
 			console.log(`[cellar] skipped - run \`cellar harness add <${harnessNames().join('|')}>\` any time.`);
 		}
-		writeHarnessSetup(WORKSPACE, {
-			configured: chosen,
-			declined: offered.filter((n) => !chosen.includes(n))
-		});
+		writeHarnessSetup(WORKSPACE, record);
 	} catch (err) {
 		// Never let agent wiring block a notebook launch.
 		console.log(`[cellar] harness setup skipped: ${err?.message ?? err}`);
@@ -779,6 +829,14 @@ async function main() {
 	console.log(`[cellar] workspace: ${WORKSPACE}`);
 
 	if (!assertUsableBuild()) return;
+
+	// First run in this workspace: offer to wire up the user's agent harness(es).
+	// Placed BEFORE the single-instance takeover (and before the slow toolchain
+	// work) for two reasons: the one-time question is answered while the terminal
+	// is still quiet, and - load-bearing - a launch must not reap the instance
+	// that owns this folder and then sit waiting for an answer, leaving the user
+	// with no running Cellar at all. Non-interactive launches no-op.
+	await maybePromptHarnessSetup();
 
 	// 0) Single-instance-per-folder + reap (unless --new/--force). The complaint
 	//    this fixes: old cellar servers pile up (launcher crashed → orphaned app
@@ -850,12 +908,6 @@ async function main() {
 		const stale = readRuntime(WORKSPACE);
 		if (stale && stale.pid !== process.pid) clearRuntime(WORKSPACE, stale.pid);
 	}
-
-	// First run in this workspace: offer to wire up the user's agent harness(es).
-	// Placed before the slow toolchain work (venv resolve/create, host env, the
-	// sidecar) so the one-time question is answered while the terminal is still
-	// quiet, and never after the ready URL. Non-interactive launches no-op.
-	await maybePromptHarnessSetup();
 
 	// uv is mandatory — fail fast with an actionable message, no silent fallback.
 	try {
