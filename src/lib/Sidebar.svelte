@@ -648,7 +648,8 @@
 	const addCommand = 'claude mcp add cellar -- cellar mcp';
 	// The other half of the story: a harness that does NOT read `.mcp.json`
 	// (Codex reads `.codex/config.toml`) is wired up by Cellar's own verb, which
-	// merges into whatever file that harness expects. See src/lib/server/harness.js.
+	// adds it to the workspace allow-list and merges into whatever file that
+	// harness expects - kept in place from then on. See src/lib/server/harness.js.
 	const harnessCommand = 'cellar harness add codex';
 	// Config snippet for a generic MCP client pointed straight at the raw HTTP
 	// endpoint (MCP Inspector, a custom SDK client). Demoted under "Advanced".
@@ -1087,8 +1088,8 @@
 					<svg class="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
 					<p class="text-[11px] leading-relaxed text-base-content/70">
 						<span class="font-semibold text-base-content/80">Claude Code is wired up here.</span>
-						Cellar wrote a <code class="font-mono text-[10px] text-primary">.mcp.json</code>, so Claude Code
-						opened in this repo auto-connects - no setup.
+						Cellar keeps a <code class="font-mono text-[10px] text-primary">.mcp.json</code> here - checked and
+						repaired on every start - so Claude Code opened in this repo auto-connects.
 					</p>
 				</div>
 			{:else}

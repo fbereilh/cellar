@@ -24,21 +24,26 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import {
 	HARNESSES,
-	clearHarnessDecline,
+	allowHarness,
 	configureHarness,
+	defaultAllowedHarnesses,
+	disallowHarness,
 	getHarness,
 	harnessConfigPath,
-	harnessDeclined,
 	harnessMarkerPath,
 	harnessNames,
 	harnessSetupDone,
 	harnessState,
 	harnessStates,
+	isHarnessAllowed,
+	markHarnessPrompted,
 	parseHarnessAnswer,
+	readAllowList,
 	readHarnessSetup,
-	resolveHarnessAnswer,
+	reconcileHarnesses,
 	shouldPromptHarnessSetup,
-	writeHarnessSetup
+	stripHarness,
+	writeAllowList
 } from '../../src/lib/server/harness.js';
 
 const REPO = fileURLToPath(new URL('../..', import.meta.url));
@@ -52,6 +57,20 @@ beforeEach(() => {
 afterEach(() => {
 	rmSync(ws, { recursive: true, force: true });
 });
+
+/** This process's umask, restored immediately - the only way to read it in node. */
+const PROCESS_UMASK = (() => {
+	const m = process.umask(0o022);
+	process.umask(m);
+	return m;
+})();
+
+/** Line feeds NOT preceded by a carriage return, i.e. the mixed-ending damage. */
+function countBare(buf: Buffer) {
+	let n = 0;
+	for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a && buf[i - 1] !== 0x0d) n++;
+	return n;
+}
 
 const claudeFile = () => join(ws, '.mcp.json');
 const codexFile = () => join(ws, '.codex', 'config.toml');
@@ -510,6 +529,52 @@ describe('codex (.codex/config.toml, TOML)', () => {
 	});
 });
 
+describe('writing the user\'s file', () => {
+	it('preserves the target\'s permissions across the atomic replace', () => {
+		// temp+rename installs a NEW inode, so without carrying the mode over, a
+		// `chmod 600` config comes back 0644. These files routinely hold another MCP
+		// server's `env` block with an API token, so that is a disclosure.
+		configureHarness('claude', ws);
+		chmodSync(claudeFile(), 0o600);
+		writeFileSync(claudeFile(), JSON.stringify({ mcpServers: { cellar: { command: 'stale' } } }));
+		chmodSync(claudeFile(), 0o600);
+		expect(configureHarness('claude', ws).status).toBe('updated');
+		expect(statSync(claudeFile()).mode & 0o777).toBe(0o600);
+	});
+
+	it('writes a NEW file at the ordinary default, not something exotic', () => {
+		configureHarness('claude', ws);
+		// Whatever the umask yields; the point is that nothing here narrows or widens
+		// a file the user has not got an opinion about yet.
+		expect(statSync(claudeFile()).mode & 0o777).toBe(0o666 & ~PROCESS_UMASK);
+	});
+
+	it('keeps a CRLF config on CRLF, in both the append and the rewrite path', () => {
+		// Emitting LF into a CRLF file leaves mixed endings - a two-line edit that
+		// diffs as the whole file, the opposite of what this writer promises.
+		const head = 'model = "gpt-5"\r\n\r\n[mcp_servers.serena]\r\ncommand = "uvx"\r\n';
+		writeCodex(head);
+		expect(configureHarness('codex', ws).status).toBe('wrote');
+		let bytes = readFileSync(codexFile());
+		expect(bytes.toString().startsWith(head)).toBe(true);
+		expect(bytes.includes(Buffer.from('\r\n[mcp_servers.cellar]\r\n'))).toBe(true);
+		expect(countBare(bytes)).toBe(0);
+
+		// The rewrite path too: an inserted line must wear the same ending.
+		writeCodex(head + '\r\n[mcp_servers.cellar]\r\ncommand = "npx"\r\nargs = ["old"]\r\n');
+		expect(configureHarness('codex', ws).status).toBe('updated');
+		bytes = readFileSync(codexFile());
+		expect(bytes.toString()).toContain('command = "cellar"');
+		expect(countBare(bytes)).toBe(0);
+	});
+
+	it('leaves an LF config on LF', () => {
+		writeCodex('model = "gpt-5"\n');
+		configureHarness('codex', ws);
+		expect(readFileSync(codexFile()).includes(Buffer.from('\r'))).toBe(false);
+	});
+});
+
 describe('harnessState', () => {
 	it('separates "an entry exists" from "it points at Cellar"', () => {
 		expect(harnessState('codex', ws)).toMatchObject({ exists: false, present: false, configured: false });
@@ -529,13 +594,201 @@ describe('harnessState', () => {
 	});
 });
 
-describe('first-run marker', () => {
-	it('asks once: unasked → prompt, then never again', () => {
-		expect(harnessSetupDone(ws)).toBe(false);
-		expect(shouldPromptHarnessSetup(ws, { interactive: true })).toMatchObject({ prompt: true, reason: 'ask' });
+describe('the allow-list', () => {
+	it('starts with the registry defaults, so zero-config works before anything is written', () => {
+		// No marker at all - a brand-new workspace behaves exactly as it always did.
+		expect(existsSync(harnessMarkerPath(ws))).toBe(false);
+		expect(readAllowList(ws)).toEqual(['claude']);
+		expect(defaultAllowedHarnesses()).toEqual(['claude']);
+		expect(isHarnessAllowed('claude', ws)).toBe(true);
+		expect(isHarnessAllowed('codex', ws)).toBe(false);
+	});
 
-		writeHarnessSetup(ws, { configured: ['codex'], declined: ['claude'] });
+	it('persists an addition, and survives a fresh read', () => {
+		expect(allowHarness('codex', ws)).toEqual({ ok: true, changed: true });
+		expect(readAllowList(ws)).toEqual(['claude', 'codex']);
+		// Round-trips through the file, not just in memory.
+		expect(JSON.parse(read(harnessMarkerPath(ws)))).toMatchObject({ version: 2, allowed: ['claude', 'codex'] });
+		// Idempotent: adding again changes nothing.
+		expect(allowHarness('codex', ws)).toEqual({ ok: true, changed: false });
+		expect(readAllowList(ws)).toEqual(['claude', 'codex']);
+	});
+
+	it('persists a REMOVAL of a default harness, which the defaults must not undo', () => {
+		// The trap: `readAllowList` falls back to the defaults when no list was ever
+		// written, so removing claude has to write an explicit list - otherwise the
+		// fallback silently re-adds it on the very next read and `harness remove`
+		// would appear to do nothing.
+		expect(disallowHarness('claude', ws)).toEqual({ ok: true, changed: true });
+		expect(readAllowList(ws)).toEqual([]);
+		expect(isHarnessAllowed('claude', ws)).toBe(false);
+		expect(disallowHarness('claude', ws)).toEqual({ ok: true, changed: false });
+	});
+
+	it('keeps the list in registry order and drops names it does not know', () => {
+		writeAllowList(ws, ['codex', 'opencode', 'claude', 'codex']);
+		expect(readAllowList(ws)).toEqual(['claude', 'codex']);
+	});
+
+	it('preserves promptedAt across an unrelated allow-list write', () => {
+		markHarnessPrompted(ws, 1234);
+		allowHarness('codex', ws);
+		expect(readHarnessSetup(ws)).toMatchObject({ promptedAt: 1234, allowed: ['claude', 'codex'] });
 		expect(harnessSetupDone(ws)).toBe(true);
+	});
+
+	it('treats a corrupt marker as never written rather than throwing', () => {
+		mkdirSync(join(ws, '.cellar'), { recursive: true });
+		writeFileSync(harnessMarkerPath(ws), '{ broken');
+		expect(readHarnessSetup(ws)).toBeNull();
+		expect(harnessSetupDone(ws)).toBe(false);
+		// …and falls back to the defaults, so a damaged marker cannot cost zero-config.
+		expect(readAllowList(ws)).toEqual(['claude']);
+	});
+
+	it('reads a pre-allow-list marker as defaults plus whatever was configured', () => {
+		// Never shipped in a release, but a dev machine may hold one. `declined` is
+		// deliberately ignored: nothing is declined in this model.
+		mkdirSync(join(ws, '.cellar'), { recursive: true });
+		writeFileSync(
+			harnessMarkerPath(ws),
+			JSON.stringify({ version: 1, promptedAt: 5, configured: ['codex'], declined: ['claude'] })
+		);
+		expect(readAllowList(ws)).toEqual(['claude', 'codex']);
+	});
+});
+
+describe('reconcile (the every-start self-heal)', () => {
+	it('writes an allowed harness that has no config yet', () => {
+		const out = reconcileHarnesses(ws);
+		expect(out.map((r) => r.name)).toEqual(['claude']);
+		expect(out[0].status).toBe('wrote');
+		expect(JSON.parse(read(claudeFile())).mcpServers.cellar).toEqual({ command: 'cellar', args: ['mcp'] });
+	});
+
+	it('REPAIRS a deleted config on the next start - the point of the model', () => {
+		reconcileHarnesses(ws);
+		rmSync(claudeFile());
+		expect(existsSync(claudeFile())).toBe(false);
+		const out = reconcileHarnesses(ws);
+		expect(out[0].status).toBe('wrote');
+		expect(JSON.parse(read(claudeFile())).mcpServers.cellar).toEqual({ command: 'cellar', args: ['mcp'] });
+	});
+
+	it('repairs an entry someone edited to something else', () => {
+		writeFileSync(claudeFile(), JSON.stringify({ mcpServers: { cellar: { command: 'nope', args: [] } } }, null, 2));
+		expect(reconcileHarnesses(ws)[0].status).toBe('updated');
+		expect(JSON.parse(read(claudeFile())).mcpServers.cellar).toEqual({ command: 'cellar', args: ['mcp'] });
+	});
+
+	it('writes NOTHING when every allowed config is already correct', () => {
+		reconcileHarnesses(ws);
+		const mtime = statSync(claudeFile()).mtimeMs;
+		expect(reconcileHarnesses(ws)[0].status).toBe('already');
+		expect(statSync(claudeFile()).mtimeMs).toBe(mtime);
+	});
+
+	it('touches only what is on the list', () => {
+		reconcileHarnesses(ws);
+		expect(existsSync(codexFile())).toBe(false);
+		allowHarness('codex', ws);
+		expect(reconcileHarnesses(ws).map((r) => r.name)).toEqual(['claude', 'codex']);
+		expect(read(codexFile())).toContain('[mcp_servers.cellar]');
+	});
+
+	it('stops reconciling a removed harness, leaving its config alone', () => {
+		allowHarness('codex', ws);
+		reconcileHarnesses(ws);
+		const before = read(codexFile());
+		disallowHarness('codex', ws);
+		expect(reconcileHarnesses(ws).map((r) => r.name)).toEqual(['claude']);
+		// Not managed is not deleted: the entry keeps working until asked otherwise.
+		expect(read(codexFile())).toBe(before);
+	});
+
+	it('excludes a harness for THIS launch without changing the list', () => {
+		allowHarness('codex', ws);
+		const out = reconcileHarnesses(ws, { exclude: ['claude'] });
+		expect(out.map((r) => r.name)).toEqual(['codex']);
+		expect(existsSync(claudeFile())).toBe(false);
+		// `--no-mcp-config` is a per-launch refusal, never a durable decision.
+		expect(readAllowList(ws)).toEqual(['claude', 'codex']);
+	});
+
+	it('never throws: an unwritable config is reported, not raised', () => {
+		// A directory where the config should be: the write cannot succeed, and a
+		// notebook launch must not fail because of it.
+		mkdirSync(claudeFile(), { recursive: true });
+		const out = reconcileHarnesses(ws);
+		expect(out[0].status).toBe('skipped');
+		expect(out[0].message).toBeTruthy();
+	});
+});
+
+describe('stripHarness (the opt-in destructive half of remove)', () => {
+	it('removes the cellar entry from JSON, leaving every other server', () => {
+		writeFileSync(
+			claudeFile(),
+			JSON.stringify(
+				{ mcpServers: { playwright: { command: 'npx' }, cellar: { command: 'cellar', args: ['mcp'] } }, other: 1 },
+				null,
+				2
+			) + '\n'
+		);
+		expect(stripHarness('claude', ws).status).toBe('updated');
+		const after = JSON.parse(read(claudeFile()));
+		expect(after.mcpServers).toEqual({ playwright: { command: 'npx' } });
+		expect(after.other).toBe(1);
+	});
+
+	it('removes the cellar TABLE from TOML, leaving every other setting byte-intact', () => {
+		const head = '# mine\nmodel = "gpt-5"\n\n[mcp_servers.serena]\ncommand = "uvx"\n';
+		writeCodex(head);
+		configureHarness('codex', ws);
+		expect(read(codexFile())).toContain('[mcp_servers.cellar]');
+		expect(stripHarness('codex', ws).status).toBe('updated');
+		expect(read(codexFile())).toBe(head);
+	});
+
+	it('is a no-op when there is nothing of ours to remove', () => {
+		expect(stripHarness('claude', ws).status).toBe('already');
+		writeCodex('model = "gpt-5"\n');
+		expect(stripHarness('codex', ws).status).toBe('already');
+		expect(read(codexFile())).toBe('model = "gpt-5"\n');
+	});
+
+	it('refuses a shape Cellar did not write, exactly as the writer refuses it', () => {
+		const inline = '[mcp_servers]\ncellar = { command = "cellar", args = ["mcp"] }\n';
+		writeCodex(inline);
+		const r = stripHarness('codex', ws);
+		expect(r.status).toBe('skipped');
+		expect(read(codexFile())).toBe(inline);
+
+		writeFileSync(claudeFile(), 'not json');
+		expect(stripHarness('claude', ws).status).toBe('skipped');
+		expect(read(claudeFile())).toBe('not json');
+	});
+});
+
+describe('the first-run question can only ADD', () => {
+	it('offers only harnesses not already managed', () => {
+		const d = shouldPromptHarnessSetup(ws, { interactive: true });
+		expect(d).toMatchObject({ prompt: true, reason: 'ask', record: true });
+		// claude is already managed, so there is nothing to ask about it.
+		expect(d.offered).toEqual(['codex']);
+	});
+
+	it('does not ask at all once everything is managed', () => {
+		allowHarness('codex', ws);
+		expect(shouldPromptHarnessSetup(ws, { interactive: true })).toMatchObject({
+			prompt: false,
+			reason: 'nothing-to-offer'
+		});
+	});
+
+	it('asks once: a recorded promptedAt closes the question', () => {
+		expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(true);
+		markHarnessPrompted(ws);
 		expect(shouldPromptHarnessSetup(ws, { interactive: true })).toMatchObject({
 			prompt: false,
 			reason: 'already-asked'
@@ -543,71 +796,56 @@ describe('first-run marker', () => {
 	});
 
 	it('never prompts non-interactively, and records nothing so a human is still asked', () => {
-		const d = shouldPromptHarnessSetup(ws, { interactive: false });
-		expect(d).toMatchObject({ prompt: false, reason: 'non-interactive', record: false });
-		expect(existsSync(join(ws, '.cellar', 'harness.json'))).toBe(false);
-		// A later interactive launch in the same workspace still asks.
+		expect(shouldPromptHarnessSetup(ws, { interactive: false })).toMatchObject({
+			prompt: false,
+			reason: 'non-interactive',
+			record: false
+		});
+		expect(existsSync(harnessMarkerPath(ws))).toBe(false);
 		expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(true);
 	});
 
-	it('does not ask when every harness is already configured, but records that', () => {
-		for (const n of harnessNames()) configureHarness(n, ws);
-		const d = shouldPromptHarnessSetup(ws, { interactive: true });
-		expect(d).toMatchObject({ prompt: false, reason: 'all-configured', record: true });
+	it('an ENTER (or any skip) removes nothing - the whole point of the model', () => {
+		// The failure this design retired: the most reflexive answer used to record a
+		// decline and permanently switch off the zero-config `.mcp.json` write.
+		for (const answer of ['', '   ', 'n', 'no', 'none', 'skip']) {
+			const { chosen, answered } = parseHarnessAnswer(answer, ['codex']);
+			expect(chosen).toEqual([]);
+			expect(answered).toBe(true); // a real answer - just not one that adds
+			// Nothing in the skip path can take claude off the list.
+			expect(readAllowList(ws)).toContain('claude');
+		}
+		markHarnessPrompted(ws);
+		expect(readAllowList(ws)).toEqual(['claude']);
+		expect(isHarnessAllowed('claude', ws)).toBe(true);
 	});
 
-	/**
-	 * `--no-mcp-config` opts out of the `.mcp.json` write. The prompt must not offer
-	 * to write the very file the flag refuses - and an omitted harness must not be
-	 * DECLINED either, since a decline outlives the flag and would keep the write off
-	 * on the next launch without it.
-	 */
-	it('omits an excluded harness from the offer, and never declines it', () => {
-		const auto = HARNESSES.filter((h) => h.auto).map((h) => h.name);
-		expect(auto).toEqual(['claude']);
-
-		const d = shouldPromptHarnessSetup(ws, { interactive: true, exclude: auto });
-		expect(d.prompt).toBe(true);
-		expect(d.offered).toEqual(['codex']);
-		expect(d.states?.map((s) => s.name)).toEqual(['codex']);
-
-		// The decline is derived from those same states, so the excluded harness cannot
-		// reach the marker - even on an explicit skip.
-		const r = resolveHarnessAnswer(d.states!, '', d.offered);
-		expect(r.record).toEqual({ configured: [], declined: ['codex'] });
-		writeHarnessSetup(ws, r.record!);
-		expect(harnessDeclined('claude', ws)).toBe(false);
-		expect(harnessDeclined('codex', ws)).toBe(true);
+	it('a NON-answer records nothing, so the question comes back', () => {
+		// No answer at all (timeout / closed stdin / background job), and an answer
+		// nothing in which resolved, are both "not a decision".
+		expect(parseHarnessAnswer(null, ['codex']).answered).toBe(false);
+		expect(parseHarnessAnswer(undefined, ['codex']).answered).toBe(false);
+		expect(parseHarnessAnswer('opencode zzz', ['codex'])).toMatchObject({ answered: false, unknown: ['opencode', 'zzz'] });
 	});
 
-	it('numbers the offer against the harnesses actually shown', () => {
-		// The prompt lists `states` and parses numbers against `offered`; excluding one
-		// must shift both together or "1" would configure a harness nobody was shown.
+	it('omits an excluded harness from the offer', () => {
 		const d = shouldPromptHarnessSetup(ws, { interactive: true, exclude: ['claude'] });
-		expect(parseHarnessAnswer('1', d.offered).chosen).toEqual(['codex']);
+		expect(d.offered).toEqual(['codex']);
+		// Excluding an ALREADY-MANAGED harness hides nothing that could have been
+		// asked about, so the question can still be closed.
+		expect(d.record).toBe(true);
 	});
 
-	it('records nothing when the exclusion leaves nothing to ask about', () => {
-		// Not an answered question: a launch without the opt-out must still ask.
-		const d = shouldPromptHarnessSetup(ws, { interactive: true, exclude: harnessNames() });
-		expect(d).toMatchObject({ prompt: false, reason: 'nothing-offered', record: false });
+	it('does NOT close the question when the exclusion hid something askable', () => {
+		// The trap: recording "asked" over a flag-filtered view suppresses the
+		// question forever for a harness this launch never showed. Here codex is not
+		// managed and not offered, so nothing may be recorded.
+		const d = shouldPromptHarnessSetup(ws, { interactive: true, exclude: ['codex'] });
 		expect(d.offered).toEqual([]);
-		expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(true);
-	});
-
-	it('remembers an explicit decline, which is what the launcher honors', () => {
-		writeHarnessSetup(ws, { configured: ['codex'], declined: ['claude'] });
-		expect(harnessDeclined('claude', ws)).toBe(true);
-		expect(harnessDeclined('codex', ws)).toBe(false);
-		expect(harnessDeclined('nope', ws)).toBe(false);
-		expect(readHarnessSetup(ws)).toMatchObject({ version: 1, configured: ['codex'], declined: ['claude'] });
-	});
-
-	it('treats a corrupt marker as unasked rather than throwing', () => {
-		mkdirSync(join(ws, '.cellar'), { recursive: true });
-		writeFileSync(join(ws, '.cellar', 'harness.json'), '{ broken');
-		expect(readHarnessSetup(ws)).toBeNull();
-		expect(harnessSetupDone(ws)).toBe(false);
+		expect(d.record).toBe(false);
+		expect(d.prompt).toBe(false);
+		// Unfiltered, it is askable again.
+		expect(shouldPromptHarnessSetup(ws, { interactive: true })).toMatchObject({ prompt: true, record: true });
 	});
 });
 
@@ -652,122 +890,6 @@ describe('parseHarnessAnswer', () => {
  * symptom in the run that wrote it - only later, as a write that never happens
  * again and a decline the user never made.
  */
-describe('resolveHarnessAnswer', () => {
-	const states = (over: Partial<Record<string, boolean>> = {}) =>
-		harnessNames().map((name) => ({
-			name,
-			label: name,
-			file: `/x/${name}`,
-			exists: false,
-			present: false,
-			configured: !!over[name],
-			unreadable: false
-		})) as any;
-
-	it('declines only what was offered as unconfigured and passed over', () => {
-		const r = resolveHarnessAnswer(states(), '2');
-		expect(r.chosen).toEqual(['codex']);
-		expect(r.record).toEqual({ configured: ['codex'], declined: ['claude'] });
-	});
-
-	it('never declines an ALREADY-CONFIGURED harness the user simply did not re-pick', () => {
-		// The prompt labels it "(already configured)", so there was nothing to say no
-		// to - and declining it would switch off the per-launch write that keeps its
-		// entry current.
-		const r = resolveHarnessAnswer(states({ claude: true }), '2');
-		expect(r.record).toEqual({ configured: ['codex'], declined: [] });
-	});
-
-	it('records an explicit skip, declining exactly the unconfigured harnesses', () => {
-		for (const answer of ['', '   ', 'n', 'no', 'none', 'skip']) {
-			expect(resolveHarnessAnswer(states({ claude: true }), answer).record).toEqual({
-				configured: [],
-				declined: ['codex']
-			});
-		}
-	});
-
-	it('records NOTHING for an answer nothing in which resolved', () => {
-		const r = resolveHarnessAnswer(states(), 'opencode');
-		expect(r.record).toBeNull();
-		expect(r.unknown).toEqual(['opencode']);
-	});
-
-	it('records NOTHING when there was no answer at all', () => {
-		// A timeout, a closed stdin and a backgrounded job are one outcome by design:
-		// not a decision, so the next interactive launch asks again.
-		expect(resolveHarnessAnswer(states(), null).record).toBeNull();
-		expect(resolveHarnessAnswer(states(), undefined).record).toBeNull();
-	});
-
-	it('the recorded decline is exactly what the launcher gate reads', () => {
-		// Ties the pure rule to the real gate: `harnessDeclined('claude')` is what
-		// suppresses the automatic .mcp.json write. Claude is already configured and
-		// the user skips, so nothing is declined for it - the write keeps running.
-		configureHarness('claude', ws);
-		const r = resolveHarnessAnswer(harnessStates(ws), '');
-		expect(r.record).toEqual({ configured: [], declined: ['codex'] });
-		writeHarnessSetup(ws, r.record!);
-		expect(harnessDeclined('claude', ws)).toBe(false);
-		expect(harnessDeclined('codex', ws)).toBe(true);
-	});
-});
-
-describe('retracting a decline', () => {
-	it('`cellar harness add` re-enables the automatic write it had switched off', () => {
-		writeHarnessSetup(ws, { configured: [], declined: ['claude', 'codex'] });
-		expect(harnessDeclined('claude', ws)).toBe(true);
-
-		const r = spawnSync(process.execPath, [CLI, 'harness', 'add', 'claude'], {
-			cwd: ws,
-			encoding: 'utf8',
-			env: { ...process.env, CI: '1' }
-		});
-		expect(r.status).toBe(0);
-		// The message beside the skipped launch write promises exactly this.
-		expect(harnessDeclined('claude', ws)).toBe(false);
-		// Scoped: the other harness's decline is untouched, and the question still
-		// counts as asked.
-		expect(harnessDeclined('codex', ws)).toBe(true);
-		expect(harnessSetupDone(ws)).toBe(true);
-		expect(readHarnessSetup(ws)?.configured).toContain('claude');
-	});
-
-	it('claims nothing for a harness nothing writes on launch', () => {
-		// Only an `auto` harness is written per launch, so only its decline switches
-		// anything off. Retracting codex's would announce a per-launch Codex setup that
-		// does not exist.
-		expect(getHarness('codex')?.auto).toBeUndefined();
-		writeHarnessSetup(ws, { configured: [], declined: ['claude', 'codex'] });
-
-		const r = spawnSync(process.execPath, [CLI, 'harness', 'add', 'codex'], {
-			cwd: ws,
-			encoding: 'utf8',
-			env: { ...process.env, CI: '1' }
-		});
-		expect(r.status).toBe(0);
-		expect(r.stdout).not.toMatch(/re-enabled automatic/);
-		// And the retraction itself is gated too: codex's decline gates nothing, so it
-		// is left exactly as recorded.
-		expect(harnessDeclined('codex', ws)).toBe(true);
-		expect(harnessDeclined('claude', ws)).toBe(true);
-	});
-
-	it('keeps the original promptedAt, so the question is not re-asked', () => {
-		writeHarnessSetup(ws, { configured: [], declined: ['claude'], promptedAt: 1234 });
-		expect(clearHarnessDecline('claude', ws)).toBe(true);
-		expect(readHarnessSetup(ws)?.promptedAt).toBe(1234);
-		expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(false);
-	});
-
-	it('is a no-op when there is nothing to retract', () => {
-		expect(clearHarnessDecline('claude', ws)).toBe(false);
-		expect(existsSync(harnessMarkerPath(ws))).toBe(false);
-		writeHarnessSetup(ws, { configured: ['claude'], declined: [] });
-		expect(clearHarnessDecline('claude', ws)).toBe(false);
-		expect(clearHarnessDecline('nope', ws)).toBe(false);
-	});
-});
 
 /**
  * The first-run prompt sits in the LAUNCH path, so two properties matter that a
@@ -795,16 +917,14 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 		expect(src).toMatch(/HARNESS_PROMPT_TIMEOUT_MS = [\d_]+/);
 	});
 
-	it('gates the per-launch write on the registry `auto` flag, not a hardcoded name', () => {
-		// The prompt offers, and honors a decline for, every `auto` harness; a name
-		// pinned at the write would silently ignore a second one's decline - the
-		// prompt-contradicts-the-next-step failure the gate exists to prevent.
-		const write = mainBody.slice(mainBody.indexOf('agent connects via') - 1500);
-		expect(write).toMatch(/HARNESSES\.filter\(\(x\) => x\.auto\)/);
-		expect(write).toMatch(/harnessDeclined\(h\.name, WORKSPACE\)/);
-		expect(mainBody).not.toMatch(/harnessDeclined\('claude'/);
-		// Same registry-driven write as `cellar harness add`, so the two cannot drift.
-		expect(write).toMatch(/configureHarness\(h\.name, WORKSPACE\)/);
+	it('RECONCILES the allow-list on every launch, rather than writing one fixed harness', () => {
+		// The launch-path write is the self-heal: whatever the workspace allows gets
+		// checked and repaired every start. A hardcoded harness here would both miss a
+		// second one and turn the allow-list back into a one-off write.
+		expect(mainBody).toMatch(/reconcileHarnesses\(WORKSPACE, \{ exclude: mcpConfigExcluded\(\) \}\)/);
+		expect(mainBody).not.toMatch(/configureHarness\('claude'/);
+		// The exclusion is derived from the FILE the flag names, not a pinned name.
+		expect(src).toMatch(/h\.configPath === MCP_JSON_CONFIG_PATH/);
 	});
 
 	it('catches per harness at EVERY configureHarness call site', () => {
@@ -814,7 +934,7 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 		// a successful SIBLING write goes unrecorded and the answer is discarded -
 		// the question then comes back on every later interactive launch.
 		const sites = [...src.matchAll(/configureHarness\(/g)].map((m) => m.index as number);
-		expect(sites.length).toBeGreaterThanOrEqual(3);
+		expect(sites.length).toBeGreaterThanOrEqual(2);
 		for (const at of sites) {
 			// The nearest preceding block opener must be a `try {`, and a `catch` must
 			// follow before the next site - the one-line-shape guard the verb uses.
@@ -828,17 +948,30 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 		// The marker write must not sit downstream of an unguarded throw.
 		const prompt = src.slice(src.indexOf('async function maybePromptHarnessSetup'));
 		const loop = prompt.indexOf('for (const name of chosen)');
-		const marker = prompt.indexOf('writeHarnessSetup(WORKSPACE, record)');
+		const marker = prompt.indexOf('markHarnessPrompted(WORKSPACE)');
 		expect(loop).toBeGreaterThan(-1);
 		expect(marker).toBeGreaterThan(loop);
 		expect(prompt.slice(loop, marker)).toMatch(/\}\s*catch\s*\(/);
 	});
 
+	it('never REMOVES from the allow-list anywhere in the prompt', () => {
+		// The invariant the whole redesign rests on: an answer - or the absence of one
+		// - can only ever add. Nothing on this path may call the removal API.
+		const prompt = src.slice(
+			src.indexOf('async function maybePromptHarnessSetup'),
+			src.indexOf('function mcpConfigExcluded')
+		);
+		expect(prompt).toMatch(/allowHarness\(name, WORKSPACE\)/);
+		expect(prompt).not.toMatch(/disallowHarness|writeAllowList/);
+	});
+
 	it('does not offer a harness `--no-mcp-config` refuses to write', () => {
 		// The flag's whole point is that `.mcp.json` is not written; a prompt that
-		// wrote it one answer later would contradict it.
+		// wrote it one answer later would contradict it. One shared helper feeds both
+		// the offer and the launch reconcile, so the two cannot disagree.
 		const prompt = src.slice(src.indexOf('async function maybePromptHarnessSetup'));
-		expect(prompt).toMatch(/exclude:\s*writeMcpConfigOptIn\s*\?\s*\[\]\s*:\s*HARNESSES\.filter\(\(h\) => h\.auto\)/);
+		expect(prompt).toMatch(/exclude:\s*mcpConfigExcluded\(\)/);
+		expect(src).toMatch(/function mcpConfigExcluded\(\)/);
 	});
 
 	/**
@@ -864,7 +997,7 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 			const p = makeAsk(stdin)('q? ', { timeoutMs: 5000 });
 			stdin.write('codex\n');
 			expect(await p).toBe('codex');
-			expect(resolveHarnessAnswer(harnessStates(ws), await p).chosen).toEqual(['codex']);
+			expect(parseHarnessAnswer(await p, ['codex']).chosen).toEqual(['codex']);
 		});
 
 		// A timeout far beyond this test's own budget, so only the close/error handler
@@ -876,7 +1009,7 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 			const p = makeAsk(stdin)('q? ', { timeoutMs: NEVER });
 			stdin.end();
 			expect(await p).toBeNull();
-			expect(resolveHarnessAnswer(harnessStates(ws), await p).record).toBeNull();
+			expect(parseHarnessAnswer(await p, ['codex']).answered).toBe(false);
 		});
 
 		it('a stdin error resolves null', async () => {
@@ -891,10 +1024,10 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 			// or the process could fall out from under the prompt instead of giving up.
 			const answer = await makeAsk(fakeTty())('q? ', { timeoutMs: 120 });
 			expect(answer).toBeNull();
-			const { record } = resolveHarnessAnswer(harnessStates(ws), answer);
-			expect(record).toBeNull();
+			expect(parseHarnessAnswer(answer, ['codex']).answered).toBe(false);
 			expect(existsSync(harnessMarkerPath(ws))).toBe(false);
-			expect(harnessDeclined('claude', ws)).toBe(false);
+			// And - the invariant - a timeout takes nothing away.
+			expect(isHarnessAllowed('claude', ws)).toBe(true);
 		});
 	});
 
@@ -937,7 +1070,7 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 			// only writes below the gate are the ones a real answer reaches.
 			const gate = prompt.indexOf('inForegroundJob() === false');
 			expect(gate).toBeGreaterThan(-1);
-			expect(prompt.slice(0, gate)).not.toMatch(/writeHarnessSetup\(WORKSPACE, record\)/);
+			expect(prompt.slice(0, gate)).not.toMatch(/markHarnessPrompted\(WORKSPACE\)/);
 		});
 	});
 
@@ -958,17 +1091,54 @@ describe('`cellar harness` CLI verb', () => {
 	const run = (args: string[]) =>
 		spawnSync(process.execPath, [CLI, ...args], { cwd: ws, encoding: 'utf8', env: { ...process.env, CI: '1' } });
 
-	it('lists supported harnesses with their configured state', () => {
+	it('lists each harness with BOTH facts: managed here, and configured right now', () => {
+		// They are independent, and the gap between them is the interesting state: a
+		// managed harness whose config is missing is exactly what the next start
+		// repairs. A list showing only one of them could not say that.
 		const before = run(['harness', 'list']);
 		expect(before.status).toBe(0);
-		expect(before.stdout).toContain('claude');
-		expect(before.stdout).toContain('codex');
-		expect(before.stdout).toContain('not configured');
+		// Claude Code is managed by default, before anything has been written.
+		expect(before.stdout).toMatch(/claude\s+managed\s+not configured/);
+		expect(before.stdout).toMatch(/codex\s+not managed\s+not configured/);
 
 		expect(run(['harness', 'add', 'codex']).status).toBe(0);
-		const after = run(['harness', 'list']);
-		expect(after.stdout).toMatch(/codex\s+configured/);
-		expect(after.stdout).toMatch(/claude\s+not configured/);
+		expect(run(['harness', 'list']).stdout).toMatch(/codex\s+managed\s+configured/);
+	});
+
+	it('add/remove move a harness in and out of the managed set', () => {
+		expect(run(['harness', 'add', 'codex']).status).toBe(0);
+		expect(read(codexFile())).toContain('[mcp_servers.cellar]');
+		expect(readAllowList(ws)).toEqual(['claude', 'codex']);
+
+		const removed = run(['harness', 'remove', 'codex']);
+		expect(removed.status).toBe(0);
+		expect(removed.stdout).toMatch(/no longer managed/);
+		expect(readAllowList(ws)).toEqual(['claude']);
+		// Removing does not delete: the entry keeps working until `--strip`.
+		expect(read(codexFile())).toContain('[mcp_servers.cellar]');
+		expect(run(['harness', 'list']).stdout).toMatch(/codex\s+not managed\s+configured/);
+
+		const stripped = run(['harness', 'remove', 'codex', '--strip']);
+		expect(stripped.status).toBe(0);
+		expect(read(codexFile())).not.toContain('[mcp_servers.cellar]');
+	});
+
+	it('can stop managing the default harness, and that sticks', () => {
+		expect(run(['harness', 'remove', 'claude']).status).toBe(0);
+		expect(readAllowList(ws)).toEqual([]);
+		// The defaults must not quietly put it back on the next read.
+		expect(run(['harness', 'list']).stdout).toMatch(/claude\s+not managed/);
+	});
+
+	it('exits non-zero when the registry REFUSES the write', () => {
+		// `skipped` is not success: a scripted `add` that configured nothing must say
+		// so, or `add all` reports 0 having done nothing.
+		writeFileSync(claudeFile(), 'not json');
+		const r = run(['harness', 'add', 'claude']);
+		expect(r.status).toBe(1);
+		// And it SAYS it refused, in the status word - not only inside the explanation.
+		expect(r.stdout + r.stderr).toMatch(/skipped:/);
+		expect(read(claudeFile())).toBe('not json');
 	});
 
 	it('adds a harness, is idempotent on a second run, and says nothing was duplicated', () => {
@@ -1049,10 +1219,25 @@ describe('`cellar harness` CLI verb', () => {
 		}
 	});
 
+	it('repairs a deleted config the way a real start does, over the real CLI', () => {
+		// The unit-level reconcile is proven above; this pins that the SHIPPED launch
+		// path is the one wired to it - `cellar harness add` and the launch reconcile
+		// must not drift into two different repair rules.
+		expect(run(['harness', 'add', 'claude']).status).toBe(0);
+		rmSync(claudeFile());
+		// The launcher's own reconcile, invoked exactly as `main()` invokes it.
+		reconcileHarnesses(ws);
+		expect(JSON.parse(read(claudeFile())).mcpServers.cellar).toEqual({ command: 'cellar', args: ['mcp'] });
+		expect(run(['harness', 'list']).stdout).toMatch(/claude\s+managed\s+configured/);
+	});
+
 	it('is documented in --help', () => {
 		const help = spawnSync(process.execPath, [CLI, '--help'], { encoding: 'utf8' });
 		expect(help.status).toBe(0);
 		expect(help.stdout).toContain('cellar harness');
 		expect(help.stdout).toContain('harness add codex');
+		expect(help.stdout).toMatch(/remove <name/);
+		// The self-heal is the model; a user reading --help should learn it there.
+		expect(help.stdout).toMatch(/repaired on\s*\n?\s*every start/);
 	});
 });

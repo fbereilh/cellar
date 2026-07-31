@@ -68,12 +68,14 @@ import { join, dirname, basename } from 'node:path';
 import {
 	closeSync,
 	existsSync,
+	fchmodSync,
 	fsyncSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -100,8 +102,8 @@ import { randomBytes } from 'node:crypto';
  * @typedef {Object} HarnessSetupMarker
  * @property {number} [version]
  * @property {number} [promptedAt]
- * @property {string[]} [configured]
- * @property {string[]} [declined]
+ * @property {string[]} [allowed]     the allow-list (v2)
+ * @property {string[]} [configured]  v1 only; read for migration, never written
  */
 
 /** The MCP server name Cellar registers itself under, in every harness. */
@@ -119,20 +121,27 @@ export const RUNNING_NOTE =
 	'your agent gets Cellar\'s tools while `cellar` is running in this workspace (start it here and leave it running).';
 
 /**
+ * The config file `--no-mcp-config` names. The flag is defined in terms of that
+ * FILE, so the harness it excludes is derived from the registry rather than
+ * pinned by name — adding a harness stays a data change.
+ */
+export const MCP_JSON_CONFIG_PATH = '.mcp.json';
+
+/**
  * Supported harnesses. Data only — see the header: adding one is an entry here.
  *
- * `auto: true` marks a harness Cellar wires up on EVERY launch (today only
- * Claude Code, whose `.mcp.json` write predates this registry and is the
- * documented zero-config behavior). The first-run prompt still offers it, and
- * an explicit decline is honored by the launcher.
+ * `defaultAllowed: true` seeds the workspace allow-list, i.e. Cellar keeps this
+ * harness's config in place from the very first launch with nothing recorded and
+ * nothing asked. Today only Claude Code, whose `.mcp.json` write predates this
+ * registry and is the documented zero-config behavior.
  */
 export const HARNESSES = [
 	{
 		name: 'claude',
 		label: 'Claude Code',
-		configPath: '.mcp.json',
+		configPath: MCP_JSON_CONFIG_PATH,
 		format: 'json',
-		auto: true
+		defaultAllowed: true
 	},
 	{
 		name: 'codex',
@@ -182,11 +191,25 @@ export function harnessConfigPath(name, workspace) {
 function writeFileAtomic(file, text) {
 	const dir = dirname(file);
 	mkdirSync(dir, { recursive: true });
+	// Carry the TARGET's permissions onto the replacement. temp+rename installs a
+	// NEW inode, so without this the file comes back at the default `0o666 & ~umask`
+	// (typically 0644) — whereas the in-place write this replaced truncated the
+	// existing file and kept whatever mode the user had set. An MCP config commonly
+	// holds another server's `env` block with an API token, so silently widening a
+	// `chmod 600` config to world-readable is a disclosure, not a cosmetic change.
+	// A missing target (first write) simply inherits the default.
+	let mode;
+	try {
+		mode = statSync(file).mode & 0o7777;
+	} catch {}
 	const tmp = join(dir, `.${basename(file)}.cellar-${process.pid}-${randomBytes(6).toString('hex')}.tmp`);
 	try {
 		const fd = openSync(tmp, 'wx');
 		try {
 			writeFileSync(fd, text);
+			// After the write, and via the fd: `openSync`'s mode argument is masked by
+			// the umask, so a 0600 target would still come back 0600 & ~umask.
+			if (mode !== undefined) fchmodSync(fd, mode);
 			fsyncSync(fd);
 		} finally {
 			closeSync(fd);
@@ -274,17 +297,24 @@ function readJsonState(file) {
 }
 
 /** The `add it by hand` tail every JSON refusal ends with. */
-const JSON_HAND_EDIT = `add an "${SERVER_NAME}" entry under "mcpServers" by hand`;
+const JSON_HAND_EDIT = `add a "${SERVER_NAME}" entry under "mcpServers" by hand`;
+
+/**
+ * Why a JSON config was refused, as a sentence fragment. Shared by the write and
+ * the strip path so the two cannot describe the same file differently.
+ */
+function jsonRefusal(state) {
+	return state.reason === 'unreadable-file'
+		? `could not be read (${state.error})`
+		: state.reason === 'bad-servers'
+			? 'has a non-object "mcpServers"'
+			: 'is not a JSON object';
+}
 
 function writeJsonConfig(file) {
 	const state = readJsonState(file);
 	if (state.unreadable) {
-		const why =
-			state.reason === 'unreadable-file'
-				? `could not be read (${state.error})`
-				: state.reason === 'bad-servers'
-					? 'has a non-object "mcpServers"'
-					: 'is not a JSON object';
+		const why = jsonRefusal(state);
 		return {
 			status: 'skipped',
 			message: `${file} ${why}; leaving it untouched (${JSON_HAND_EDIT})`
@@ -567,8 +597,24 @@ function parseKeyPath(code) {
  * real key untouched. So a key is recorded with `valueFrom`/`last` here, once,
  * rather than re-scanned later by whoever wants to read it.
  */
+/**
+ * The line ending a file predominantly uses. The writer preserves every line it
+ * does not touch verbatim, so this decides only what an INSERTED line ends with:
+ * emitting LF into a CRLF config left mixed endings, turning a two-line edit into
+ * a diff over the whole file - the opposite of what this writer promises.
+ */
+function dominantEol(text) {
+	const crlf = (text.match(/\r\n/g) ?? []).length;
+	const lf = (text.match(/\n/g) ?? []).length - crlf;
+	return crlf > lf ? '\r\n' : '\n';
+}
+
 function parseTomlDoc(text) {
 	const lines = text.split('\n');
+	// Lines keep their own terminator bytes (a CRLF file's lines each end in '\r'),
+	// so an untouched line rejoins byte-identically. Only the lines this writer
+	// INSERTS need to be told which ending to wear - see `eol`.
+	const eol = dominantEol(text);
 	const codes = [];
 	const tables = [];
 	const keys = [];
@@ -632,7 +678,7 @@ function parseTomlDoc(text) {
 	// An unterminated multi-line string, or a value whose brackets never closed:
 	// either way the tail of this file is not what we think it is.
 	if (state || depth !== 0 || pending) malformed = true;
-	return { lines, codes, tables, keys, malformed };
+	return { lines, codes, tables, keys, malformed, eol };
 }
 
 const samePath = (a, b) => a.length === b.length && a.every((s, i) => s === b[i]);
@@ -714,6 +760,9 @@ function tableMatches(doc, table) {
 /** Rewrite `command`/`args` inside the existing table, leaving all else intact. */
 function rewriteTable(doc, table) {
 	const lines = [...doc.lines];
+	// An inserted line wears the file's own ending; `lines` are joined with '\n'
+	// and each already carries its own '\r', so untouched lines are byte-identical.
+	const nl = (text) => (doc.eol === '\r\n' ? text + '\r' : text);
 	// Replace from the bottom up so an earlier edit cannot shift a later index.
 	const edits = TOML_KEYS.map((spec) => ({ ...spec, found: readAssignment(doc, table, spec.key) }));
 	for (const e of [...edits].sort((a, b) => (b.found?.first ?? -1) - (a.found?.first ?? -1))) {
@@ -723,22 +772,26 @@ function rewriteTable(doc, table) {
 		// byte-preservation this writer exists for, applied per key rather than per
 		// table.
 		if (e.found && !e.matches(e.found.value)) {
-			lines.splice(e.found.first, e.found.last - e.found.first + 1, e.text);
+			lines.splice(e.found.first, e.found.last - e.found.first + 1, nl(e.text));
 		}
 	}
 	// A table missing a key entirely (hand-written, or Cellar's shape changed):
 	// insert right after the header so the table stays self-describing.
-	const missing = edits.filter((e) => !e.found).map((e) => e.text);
+	const missing = edits.filter((e) => !e.found).map((e) => nl(e.text));
 	if (missing.length) lines.splice(table.start + 1, 0, ...missing);
 	return lines.join('\n');
 }
 
-/** Append the canonical table, separated by exactly one blank line. */
+/**
+ * Append the canonical table, separated by exactly one blank line, in the file's
+ * own line ending (an LF block appended to a CRLF config is a whole-file diff).
+ */
 function appendTable(text) {
+	const eol = dominantEol(text);
 	let body = text;
-	if (body !== '' && !body.endsWith('\n')) body += '\n';
-	if (body.trim() !== '' && !body.endsWith('\n\n')) body += '\n';
-	return body + TOML_BLOCK.join('\n') + '\n';
+	if (body !== '' && !body.endsWith('\n')) body += eol;
+	if (body.trim() !== '' && !body.endsWith(eol + eol)) body += eol;
+	return body + TOML_BLOCK.join(eol) + eol;
 }
 
 /**
@@ -860,168 +913,345 @@ export function configureHarness(name, workspace) {
 	const result = h.format === 'json' ? writeJsonConfig(file) : writeTomlConfig(file);
 	return { ok: true, name: h.name, label: h.label, file, note: h.note, ...result };
 }
-
-// ---- First-run marker -----------------------------------------------------
+// ---- Allow-list + reconcile ------------------------------------------------
 
 /**
- * Per-workspace record of the first-run harness question, so it is asked ONCE.
+ * WHICH harnesses Cellar may configure here — the one durable decision, and the
+ * model the whole feature turns on.
  *
- * It lives in `.cellar/` (gitignored, per-project, port-independent) beside the
- * other durable local state (`checkpoints.json`, the UI store) — NOT in
- * `runtime.json`, which the launcher deletes on shutdown, and not globally,
- * because harness wiring is per-project: a fresh clone should be asked.
+ * The alternative it replaced recorded DECLINES, and that shape had the failure
+ * baked in: the most reflexive answer to an unexpected prompt (Enter) was itself
+ * a decline, so it permanently switched off the zero-config `.mcp.json` write
+ * Cellar has always done. An allow-list inverts that. Nothing is ever declined;
+ * a harness is either on the list or simply not on it yet, so no answer — and no
+ * absence of an answer — can take capability away.
+ *
+ * Two consequences worth stating, because everything else follows from them:
+ *
+ *   1. Claude Code is on the list BY DEFAULT (`defaultAllowed`), so a workspace
+ *      with no marker at all behaves exactly as it always has. There is no
+ *      migration and no first-launch difference.
+ *   2. The list is RECONCILED on every start (`reconcileHarnesses`): each allowed
+ *      harness's config is checked and repaired if it is missing, stale or was
+ *      deleted. That is what makes the list a standing instruction rather than a
+ *      one-off write — delete `.mcp.json` and the next `cellar` puts it back.
+ *
+ * SCOPE: per-workspace, in the same `.cellar/harness.json` the prompt already
+ * used (gitignored, port-independent, beside `checkpoints.json` and the UI
+ * store). Deliberately not a global file: which agent you point at a project is
+ * a property of that project, and a fresh clone should get the defaults rather
+ * than inherit another machine's answer. The GLOBAL default lives in the
+ * registry instead, as `defaultAllowed` — code, not state, so it needs no
+ * precedence rules and cannot drift out of sync with the harness list.
+ */
+
+/** Harnesses on the allow-list before anyone records anything. */
+export function defaultAllowedHarnesses() {
+	return HARNESSES.filter((h) => h.defaultAllowed).map((h) => h.name);
+}
+
+/**
+ * Per-workspace record of the allow-list (and whether the first-run question has
+ * been asked). See the section header for why it lives here and not globally.
  */
 export function harnessMarkerPath(workspace) {
 	return join(workspace, '.cellar', 'harness.json');
 }
 
 /**
- * Read the marker, or null when absent/unreadable (→ treated as unasked).
+ * Read the marker, or null when absent/unreadable (→ treated as never written).
  *
  * @param {string} workspace
  * @returns {HarnessSetupMarker | null}
  */
 export function readHarnessSetup(workspace) {
-	const file = harnessMarkerPath(workspace);
-	if (!existsSync(file)) return null;
+	const src = readConfigText(harnessMarkerPath(workspace));
+	if (!src.exists || src.text === null) return null;
 	try {
-		const data = JSON.parse(readFileSync(file, 'utf8'));
-		if (data === null || typeof data !== 'object' || Array.isArray(data)) return null;
-		return data;
+		const data = JSON.parse(src.text);
+		return plainObject(data) ? data : null;
 	} catch {
 		return null;
 	}
 }
 
-/**
- * Record the answer. `configured` are the harnesses the user chose; `declined`
- * is the narrow thing it says it is - a harness the user was offered as NOT yet
- * configured and explicitly skipped. The launcher honors that for the
- * auto-configured harness, so the prompt cannot be contradicted one step later
- * by the automatic `.mcp.json` write.
- *
- * `declined` is deliberately NOT "everything not chosen": a harness that was
- * ALREADY configured must never land here (declining it would switch off the
- * per-launch write that repairs a stale entry, over a choice the user never
- * made), and an answer nobody understood is not an answer at all - the caller
- * records nothing in that case, so the next interactive launch asks again.
- *
- * @param {string} workspace
- * @param {{ configured?: string[], declined?: string[], promptedAt?: number }} [answer]
- */
-export function writeHarnessSetup(workspace, { configured = [], declined = [], promptedAt } = {}) {
-	const file = harnessMarkerPath(workspace);
-	const data = {
-		version: 1,
-		promptedAt: typeof promptedAt === 'number' ? promptedAt : Date.now(),
-		configured,
-		declined
-	};
-	writeFileAtomic(file, JSON.stringify(data, null, 2) + '\n');
-	return data;
+/** Known harness names from arbitrary input, deduped, in registry order. */
+function normalizeNames(names) {
+	const want = new Set(
+		(Array.isArray(names) ? names : []).map((n) => getHarness(n)?.name).filter(Boolean)
+	);
+	return harnessNames().filter((n) => want.has(n));
 }
 
 /**
- * Retract a recorded decline for one harness - what makes the advice printed
- * beside the skipped `.mcp.json` write ("`cellar harness add claude` to enable")
- * TRUE. Without it the decline was permanent: the automatic write stayed off and
- * the launcher kept claiming a decline on every launch, over a config the user
- * had since asked for by hand, with no remedy short of deleting the marker.
+ * The harnesses Cellar may configure for this workspace.
  *
- * Keeps the original `promptedAt`, so the question still counts as asked.
+ * No marker at all ⇒ the registry defaults, so zero-config works before anything
+ * is written. A marker with an explicit list wins outright, EMPTY INCLUDED — that
+ * is what makes `cellar harness remove claude` stick rather than being undone by
+ * the defaults on the next read.
+ *
+ * @param {string} workspace
+ * @returns {string[]}
+ */
+export function readAllowList(workspace) {
+	const m = readHarnessSetup(workspace);
+	if (!m) return defaultAllowedHarnesses();
+	if (Array.isArray(m.allowed)) return normalizeNames(m.allowed);
+	// A marker predating the allow-list (never shipped in a release, but a dev
+	// machine may hold one): its `configured` entries were harnesses the user asked
+	// for, so honor them on top of the defaults. `declined` is deliberately ignored
+	// — nothing is declined in this model.
+	return normalizeNames([...defaultAllowedHarnesses(), ...(Array.isArray(m.configured) ? m.configured : [])]);
+}
+
+/**
+ * Persist the allow-list. `promptedAt` is preserved across writes unless a new
+ * one is passed, so adding a harness later never re-opens the first-run question.
+ *
+ * @param {string} workspace
+ * @param {string[]} names
+ * @param {{ promptedAt?: number }} [opts]
+ */
+export function writeAllowList(workspace, names, { promptedAt } = {}) {
+	const prev = readHarnessSetup(workspace);
+	const kept = typeof promptedAt === 'number' ? promptedAt : prev?.promptedAt;
+	const data = { version: 2, allowed: normalizeNames(names) };
+	if (typeof kept === 'number') data.promptedAt = kept;
+	writeFileAtomic(harnessMarkerPath(workspace), JSON.stringify(data, null, 2) + '\n');
+	return data;
+}
+
+/** Is Cellar allowed to configure this harness here? */
+export function isHarnessAllowed(name, workspace) {
+	const h = getHarness(name);
+	return !!h && readAllowList(workspace).includes(h.name);
+}
+
+/**
+ * Add a harness to the allow-list. Idempotent; `changed` is false when it was
+ * already on the list (so a caller can stay quiet about a no-op).
+ *
+ * @returns {{ ok: boolean, changed: boolean }}
+ */
+export function allowHarness(name, workspace) {
+	const h = getHarness(name);
+	if (!h) return { ok: false, changed: false };
+	const allowed = readAllowList(workspace);
+	if (allowed.includes(h.name)) return { ok: true, changed: false };
+	writeAllowList(workspace, [...allowed, h.name]);
+	return { ok: true, changed: true };
+}
+
+/**
+ * Take a harness off the allow-list: Cellar stops reconciling it. This does NOT
+ * touch the harness's config file — the entry keeps working until the user asks
+ * for it to be stripped (`stripHarness`), because "stop managing this" and
+ * "delete this from my config" are different requests and only one of them is
+ * destructive.
+ *
+ * Removing a DEFAULT harness persists an explicit empty/short list, which is what
+ * makes the removal survive: `readAllowList` falls back to the defaults only when
+ * no list was ever written.
+ *
+ * @returns {{ ok: boolean, changed: boolean }}
+ */
+export function disallowHarness(name, workspace) {
+	const h = getHarness(name);
+	if (!h) return { ok: false, changed: false };
+	const allowed = readAllowList(workspace);
+	if (!allowed.includes(h.name)) return { ok: true, changed: false };
+	writeAllowList(
+		workspace,
+		allowed.filter((n) => n !== h.name)
+	);
+	return { ok: true, changed: true };
+}
+
+/**
+ * Bring every allowed harness's config back in line — the self-heal the launcher
+ * runs on EVERY start.
+ *
+ * It is just `configureHarness` per allowed harness, which is already idempotent
+ * (`already` when the entry is correct, so the common case writes nothing) and
+ * already repairs a missing or stale one. That is the whole mechanism: there is
+ * no separate "repair" path that could drift from the write path.
+ *
+ * Never throws: a config that cannot be written is reported as `skipped`, because
+ * agent wiring must never be a reason a notebook fails to launch.
+ *
+ * @param {string} workspace
+ * @param {{ exclude?: string[] }} [opts] harnesses to leave alone this launch
+ *        (`--no-mcp-config`); an exclusion is not a removal and is never persisted.
+ * @returns {HarnessResult[]} one entry per harness actually considered
+ */
+export function reconcileHarnesses(workspace, { exclude = [] } = {}) {
+	const skip = new Set(normalizeNames(exclude));
+	const out = [];
+	for (const name of readAllowList(workspace)) {
+		if (skip.has(name)) continue;
+		try {
+			out.push(configureHarness(name, workspace));
+		} catch (err) {
+			const h = /** @type {{name:string,label:string,configPath:string}} */ (getHarness(name));
+			out.push({
+				ok: true,
+				name: h.name,
+				label: h.label,
+				file: join(workspace, h.configPath),
+				status: 'skipped',
+				message: `could not be written (${err?.message ?? err})`
+			});
+		}
+	}
+	return out;
+}
+
+/**
+ * Remove Cellar's own entry from a harness's config — the opt-in destructive half
+ * of `cellar harness remove`.
+ *
+ * Refuses in exactly the cases the writers refuse (unreadable file, a `cellar`
+ * server defined in some other legal form), for the same reason: this edits the
+ * user's file, and a shape we did not write is not a shape we can safely remove.
+ * Everything else in the file is preserved the same way a write preserves it.
  *
  * @param {string} name
  * @param {string} workspace
- * @returns {boolean} true when a decline was actually retracted
+ * @returns {HarnessResult}
  */
-export function clearHarnessDecline(name, workspace) {
+export function stripHarness(name, workspace) {
 	const h = getHarness(name);
-	if (!h) return false;
-	const marker = readHarnessSetup(workspace);
-	const declined = Array.isArray(marker?.declined) ? marker.declined : [];
-	if (!declined.includes(h.name)) return false;
-	const configured = Array.isArray(marker?.configured) ? marker.configured : [];
-	writeHarnessSetup(workspace, {
-		configured: configured.includes(h.name) ? configured : [...configured, h.name],
-		declined: declined.filter((n) => n !== h.name),
-		promptedAt: typeof marker?.promptedAt === 'number' ? marker.promptedAt : undefined
-	});
-	return true;
+	if (!h) {
+		return {
+			ok: false,
+			name: String(name ?? ''),
+			status: 'unknown',
+			message: `unknown harness "${name}" (supported: ${harnessNames().join(', ')})`
+		};
+	}
+	const file = join(workspace, h.configPath);
+	const base = { ok: true, name: h.name, label: h.label, file };
+	const result = h.format === 'json' ? stripJsonConfig(file) : stripTomlConfig(file);
+	return { ...base, ...result };
 }
+
+function stripJsonConfig(file) {
+	const state = readJsonState(file);
+	if (state.unreadable) {
+		return { status: 'skipped', message: `${file} ${jsonRefusal(state)}; leaving it untouched` };
+	}
+	if (!state.present) return { status: 'already', message: 'no cellar entry to remove' };
+	const servers = { ...(plainObject(state.config?.mcpServers) ? state.config.mcpServers : {}) };
+	delete servers[SERVER_NAME];
+	const config = { ...state.config, mcpServers: servers };
+	writeFileAtomic(file, JSON.stringify(config, null, 2) + '\n');
+	return { status: 'updated', message: `removed the ${SERVER_NAME} MCP server` };
+}
+
+function stripTomlConfig(file) {
+	const { existing, state } = readCodexFile(file);
+	if (state.kind === 'malformed') {
+		const why = state.readError
+			? `could not be read (${state.readError})`
+			: 'could not be read as TOML with confidence';
+		return { status: 'skipped', message: `${file} ${why}; leaving it untouched` };
+	}
+	if (state.kind === 'other-form') {
+		return {
+			status: 'skipped',
+			message: `${file} defines ${TOML_TABLE.join('.')} in a form Cellar did not write (line ${state.line + 1}); remove it by hand`
+		};
+	}
+	if (state.kind !== 'table') return { status: 'already', message: 'no cellar table to remove' };
+	// The table's span runs from its header to the NEXT table header, so it already
+	// carries the blank line that separated it - removing the span leaves exactly
+	// one blank between the neighbours it sat between, and every other byte alone.
+	const lines = [...state.doc.lines];
+	lines.splice(state.table.start, state.table.end - state.table.start);
+	let next = lines.join('\n');
+	// Removing the LAST table leaves the separator blank line dangling at EOF.
+	if (state.table.end >= state.doc.lines.length) next = next.replace(/(\r?\n)[ \t\r\n]*$/, '$1');
+	if (next === existing) return { status: 'already', message: 'no cellar table to remove' };
+	writeFileAtomic(file, next);
+	return { status: 'updated', message: `removed [${TOML_TABLE.join('.')}]` };
+}
+
+// ---- First-run prompt ------------------------------------------------------
 
 /** Has the first-run harness question already been asked in this workspace? */
 export function harnessSetupDone(workspace) {
 	const m = readHarnessSetup(workspace);
-	return !!m && typeof m.promptedAt === 'number';
+	return typeof m?.promptedAt === 'number';
 }
 
-/** Did the user explicitly decline this harness when asked? */
-export function harnessDeclined(name, workspace) {
-	const h = getHarness(name);
-	if (!h) return false;
-	const m = readHarnessSetup(workspace);
-	return Array.isArray(m?.declined) && m.declined.includes(h.name);
+/** Record that the question was asked, leaving the allow-list itself untouched. */
+export function markHarnessPrompted(workspace, at = Date.now()) {
+	return writeAllowList(workspace, readAllowList(workspace), { promptedAt: at });
 }
 
 /**
- * Should the launcher ask the first-run harness question? Pure decision, kept
- * here rather than inline in `bin/cellar.js` so each rule is directly testable:
- * asking twice, or asking a script, are both regressions with no visible
- * symptom in a normal interactive run.
+ * Should the launcher ask the first-run question? Pure decision, kept here rather
+ * than inline in `bin/cellar.js` so each rule is directly testable: asking twice,
+ * or asking a script, are both regressions with no visible symptom in a normal
+ * interactive run.
  *
- * Returns `{ prompt, reason, offered, record }`, where `record` says whether the
- * caller should still write the marker — true for `all-configured` (nothing to
- * ask, and we should not re-check every launch) and deliberately FALSE for
- * `non-interactive`: a `-y`/CI/piped launch has answered nothing, so a human
- * running `cellar` here later must still be asked.
+ * The question is only ever about harnesses NOT yet on the allow-list — an
+ * allowed one is already being kept in place, so there is nothing to ask. That is
+ * what makes a bare Enter safe: the answer can only ADD, so skipping leaves every
+ * existing arrangement exactly as it was.
  *
- * `exclude` drops harnesses from BOTH `offered` and `states` — the launcher passes
- * the `auto` harness when `--no-mcp-config` opts out of writing its config, so the
- * prompt cannot offer to write the very file that flag refuses. An excluded
- * harness is not offered, so it can never be recorded as declined either: it is
- * absent from the `states` the decline is derived from.
+ * `exclude` drops harnesses from the offer (the launcher passes the `.mcp.json`
+ * harness when `--no-mcp-config` opts out of writing that file). An excluded
+ * harness that is not yet allowed also makes `record` false: recording "asked"
+ * over a partial view would suppress the question forever for a harness this
+ * launch never showed.
  *
  * @param {string} workspace
  * @param {{ interactive?: boolean, exclude?: string[] }} [opts]
  * @returns {{ prompt: boolean,
- *            reason: 'already-asked'|'nothing-offered'|'all-configured'|'non-interactive'|'ask',
- *            offered: string[], record: boolean, states?: HarnessStateInfo[] }}
+ *            reason: 'already-asked'|'nothing-to-offer'|'non-interactive'|'ask',
+ *            offered: string[], record: boolean, states: HarnessStateInfo[] }}
  */
 export function shouldPromptHarnessSetup(workspace, { interactive = true, exclude = [] } = {}) {
-	const skip = new Set(exclude.map((n) => getHarness(n)?.name).filter(Boolean));
-	const offered = harnessNames().filter((n) => !skip.has(n));
-	if (harnessSetupDone(workspace)) return { prompt: false, reason: 'already-asked', offered, record: false };
-	// Nothing left to ask about is not an answered question: record nothing, so a
-	// launch without the opt-out still asks.
+	const skip = new Set(normalizeNames(exclude));
+	const allowed = new Set(readAllowList(workspace));
+	const offered = harnessNames().filter((n) => !skip.has(n) && !allowed.has(n));
+	// Recording "asked" is only honest over the FULL set of harnesses this
+	// workspace could be offered; a flag-filtered view must not close the question.
+	const record = !harnessNames().some((n) => skip.has(n) && !allowed.has(n));
+	const states = () => offered.map((n) => /** @type {HarnessStateInfo} */ (harnessState(n, workspace)));
+	if (harnessSetupDone(workspace)) {
+		return { prompt: false, reason: 'already-asked', offered, record: false, states: [] };
+	}
 	if (offered.length === 0) {
-		return { prompt: false, reason: 'nothing-offered', offered, record: false, states: [] };
+		return { prompt: false, reason: 'nothing-to-offer', offered, record: false, states: [] };
 	}
-	const states = harnessStates(workspace).filter((s) => !skip.has(s.name));
-	if (states.every((s) => s.configured)) {
-		return { prompt: false, reason: 'all-configured', offered, record: true, states };
-	}
-	if (!interactive) return { prompt: false, reason: 'non-interactive', offered, record: false, states };
-	return { prompt: true, reason: 'ask', offered, record: true, states };
+	if (!interactive) return { prompt: false, reason: 'non-interactive', offered, record: false, states: [] };
+	return { prompt: true, reason: 'ask', offered, record, states: states() };
 }
 
 /**
  * Resolve a free-text answer to the first-run prompt against the offered
  * harnesses. Accepts 1-based numbers, names (case-insensitive), `all`, and any
- * comma/space mix; an empty answer or a no/none/skip token means skip. Unknown
- * tokens come back in `unknown` so the caller can say so instead of silently
- * dropping them.
+ * comma/space mix; an empty answer or a no/none/skip token means "no others".
+ * Unknown tokens come back in `unknown` so the caller can say so instead of
+ * silently dropping them.
  *
- * `answered` separates a real reply from one nothing in it resolved: an all-typo
- * answer is NOT a decision, so the caller must record nothing and ask again
- * rather than treat it as "no to everything". An empty answer and an explicit
- * no/skip ARE decisions.
+ * `answered` separates a real reply from one nothing in which resolved: an
+ * all-typo answer is NOT a decision, so the caller records nothing and asks
+ * again. An empty answer and an explicit no/skip ARE decisions — and harmless
+ * ones here, since the only thing an answer can do is add.
  *
- * @param {string} answer
+ * @param {string | null | undefined} answer
  * @param {string[]} [offered]
  * @returns {{ chosen: string[], unknown: string[], skipped: boolean, answered: boolean }}
  */
 export function parseHarnessAnswer(answer, offered = harnessNames()) {
-	const raw = String(answer ?? '').trim();
+	if (answer === null || answer === undefined) {
+		return { chosen: [], unknown: [], skipped: true, answered: false };
+	}
+	const raw = String(answer).trim();
 	if (raw === '') return { chosen: [], unknown: [], skipped: true, answered: true };
 	const tokens = raw
 		.split(/[\s,]+/)
@@ -1054,41 +1284,4 @@ export function parseHarnessAnswer(answer, offered = harnessNames()) {
 	// Tokens were given but none resolved: not a decision, so the caller records
 	// nothing and asks again next time.
 	return { chosen, unknown, skipped: chosen.length === 0, answered: chosen.length > 0 };
-}
-
-/**
- * Turn one prompt answer into what should be RECORDED - the second half of
- * `shouldPromptHarnessSetup`, kept here for the same reason: the marker outlives
- * the launch and silently gates the automatic `.mcp.json` write, so getting it
- * wrong has no visible symptom in the run that wrote it.
- *
- * `answer` is the raw reply, or `null` for "no answer at all" - a stdin that
- * closed, a backgrounded job, or the prompt timing out. Those are indistinguishable
- * by design, and none of them is a decision.
- *
- * `record` is null when nothing should be written (no answer, or an answer nothing
- * in which resolved), so the next interactive launch asks again. Otherwise it
- * carries `configured` (the picks) and `declined` - ONLY harnesses shown as not
- * configured and passed over. An already-configured harness is never declined:
- * saying no to it was never on offer, and recording it would switch off the write
- * that keeps its entry current.
- *
- * @param {HarnessStateInfo[]} states
- * @param {string | null | undefined} answer
- * @param {string[]} [offered]
- * @returns {{ chosen: string[], unknown: string[],
- *            record: { configured: string[], declined: string[] } | null }}
- */
-export function resolveHarnessAnswer(states, answer, offered = states.map((s) => s.name)) {
-	if (answer === null || answer === undefined) return { chosen: [], unknown: [], record: null };
-	const { chosen, unknown, answered } = parseHarnessAnswer(answer, offered);
-	if (!answered) return { chosen, unknown, record: null };
-	return {
-		chosen,
-		unknown,
-		record: {
-			configured: chosen,
-			declined: states.filter((s) => !s.configured && !chosen.includes(s.name)).map((s) => s.name)
-		}
-	};
 }
