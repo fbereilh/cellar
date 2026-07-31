@@ -43,7 +43,12 @@
 	/** MCP connection info the shell load resolves. */
 	interface McpInfo {
 		url?: string | null;
+		/** A project `.mcp.json` registers `cellar` right now. */
 		projectConfigured?: boolean;
+		/** Claude Code is on the allow-list, so every start repairs that entry. */
+		projectManaged?: boolean;
+		/** …but THIS instance was launched with `--no-mcp-config`, so it repairs nothing. */
+		projectRepairPaused?: boolean;
 	}
 	/** A tab-impacting file-system change reported up to the shell. */
 	interface FsChange {
@@ -646,6 +651,11 @@
 	// bridge (the port is discovered at runtime, never hardcoded). The one-time
 	// manual registration and the raw Streamable-HTTP endpoint are secondary.
 	const addCommand = 'claude mcp add cellar -- cellar mcp';
+	// The other half of the story: a harness that does NOT read `.mcp.json`
+	// (Codex reads `.codex/config.toml`) is wired up by Cellar's own verb, which
+	// adds it to the workspace allow-list and merges into whatever file that
+	// harness expects - kept in place from then on. See src/lib/server/harness.js.
+	const harnessCommand = 'cellar harness add codex';
 	// Config snippet for a generic MCP client pointed straight at the raw HTTP
 	// endpoint (MCP Inspector, a custom SDK client). Demoted under "Advanced".
 	const mcpSnippet = $derived(
@@ -654,7 +664,7 @@
 			: ''
 	);
 	let advancedOpen = $state(false);
-	let copied = $state(''); // 'add' | 'url' | 'snippet' | ''
+	let copied = $state(''); // 'add' | 'harness' | 'url' | 'snippet' | ''
 	let copyTimer: ReturnType<typeof setTimeout>;
 	async function copy(kind: string, textVal: string | null | undefined) {
 		if (!textVal) return;
@@ -1076,15 +1086,35 @@
 	</div>
 	{#if open.agent}
 		<div class="px-3 pb-3" data-testid="agent-body">
-			<!-- Lead: zero-config. `cellar` wrote a project .mcp.json, so an agent
-			     opened in this repo auto-connects with no setup. -->
+			<!-- Lead: zero-config. A project .mcp.json registers `cellar`, so an agent
+			     opened in this repo auto-connects with no setup.
+			     The self-heal is a SEPARATE fact and only claimed when it is true:
+			     `cellar harness remove claude` leaves the entry in place but takes the
+			     harness off the allow-list, so the entry keeps working while nothing
+			     checks it any more - and `cellar --no-mcp-config` pauses the repair for
+			     THIS instance while the harness stays managed. Different causes, different
+			     remedies. Promising a repair that will not happen is the
+			     assert-more-than-was-verified defect, so each case says only its own. -->
 			{#if mcp?.projectConfigured}
 				<div class="flex items-start gap-1.5 rounded-lg border border-success/30 bg-success/10 p-2" data-testid="mcp-zeroconfig">
 					<svg class="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
 					<p class="text-[11px] leading-relaxed text-base-content/70">
-						<span class="font-semibold text-base-content/80">This project is agent-ready.</span>
-						Cellar wrote a <code class="font-mono text-[10px] text-primary">.mcp.json</code> here, so an agent
-						(e.g. Claude Code) opened in this repo auto-connects - no setup.
+						<span class="font-semibold text-base-content/80">Claude Code is wired up here.</span>
+						{#if mcp?.projectRepairPaused}
+							A <code class="font-mono text-[10px] text-primary">.mcp.json</code> here registers
+							<code class="font-mono text-[10px]">cellar</code>, so Claude Code opened in this repo auto-connects.
+							This instance was started with <code class="font-mono text-[10px]">--no-mcp-config</code>, so it is
+							not checking or repairing that entry - restart without the flag to have it kept in place.
+						{:else if mcp?.projectManaged}
+							Cellar keeps a <code class="font-mono text-[10px] text-primary">.mcp.json</code> here - checked and
+							repaired on every start - so Claude Code opened in this repo auto-connects.
+						{:else}
+							A <code class="font-mono text-[10px] text-primary">.mcp.json</code> here registers
+							<code class="font-mono text-[10px]">cellar</code>, so Claude Code opened in this repo auto-connects.
+							Cellar is not maintaining that entry - run
+							<code class="font-mono text-[10px] text-primary">cellar harness add claude</code> to have it checked
+							and repaired on every start.
+						{/if}
 					</p>
 				</div>
 			{:else}
@@ -1109,6 +1139,36 @@
 					data-testid="mcp-copy-add"
 				>
 					{#if copied === 'add'}
+						<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+					{:else}
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+					{/if}
+				</button>
+			</div>
+
+			<!-- Other harnesses read a DIFFERENT file: Codex reads .codex/config.toml
+			     and ignores .mcp.json entirely, so "agent-ready" above is a claim
+			     about Claude Code only. `cellar harness` is what covers the rest.
+			     Known boundary: this row is STATIC copy - the registry that would
+			     name the other harnesses (and say which are already configured) is
+			     server-side and this panel carries no state for it, so the row
+			     neither tracks a future HARNESSES entry nor hides once Codex is
+			     wired up. Deliberate: the plumbing costs more than the row. -->
+			<p class="pt-2.5 pb-1 text-[10px] uppercase tracking-wide text-base-content/40">Another harness</p>
+			<p class="pb-1.5 text-[11px] leading-relaxed text-base-content/50">
+				Codex and friends read their own config file, not
+				<code class="font-mono text-[10px]">.mcp.json</code>. Run this in the project to wire one up:
+			</p>
+			<div class="flex items-center gap-1 rounded-lg border border-base-300 bg-base-100 p-1.5">
+				<code class="min-w-0 flex-1 truncate px-1 font-mono text-xs text-primary" title={harnessCommand} data-testid="mcp-harness-command">{harnessCommand}</code>
+				<button
+					class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
+					onclick={() => copy('harness', harnessCommand)}
+					title="Copy command"
+					aria-label="Copy command"
+					data-testid="mcp-copy-harness"
+				>
+					{#if copied === 'harness'}
 						<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
 					{:else}
 						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>

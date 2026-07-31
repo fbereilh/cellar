@@ -33,7 +33,18 @@ const log = (msg) => process.stderr.write(`[cellar mcp] ${msg}\n`);
 export async function runMcpBridge({ workspace }) {
 	const rt = readRuntime(workspace);
 	if (!(await isInstanceAlive(rt))) {
-		log(`no running cellar found in ${workspace} - run \`cellar\` here first`);
+		// This is the message a user meets when their agent config is CORRECT but
+		// nothing is serving it, so it must not read like a misconfiguration: say
+		// what is missing (a running instance), that the wiring itself is fine, and
+		// the exact command that fixes it. `cellar mcp` deliberately does not start
+		// an instance — it bridges to the one the human is working in, and silently
+		// booting a headless second Cellar behind their back is a different feature.
+		log(`no Cellar instance is running in ${workspace}.`);
+		log('this bridge attaches to a running Cellar - it never starts one - so there is nothing to connect to yet.');
+		log('that usually means Cellar simply is not running, NOT that your MCP config is wrong. Start it there:');
+		log(`    cd ${workspace} && cellar`);
+		log('then leave it running; the agent connects on its next tool call. If that path looks wrong, the agent');
+		log('launched this bridge from the wrong directory - `cellar harness list` shows the config it is reading.');
 		process.exit(1);
 	}
 

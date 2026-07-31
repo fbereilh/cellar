@@ -9,9 +9,12 @@
  *   1. write `<workspace>/.cellar/runtime.json` on launch, recording the live
  *      instance's { mcpPort, appPort, pid } so `cellar mcp` (the stdio bridge)
  *      can discover the running server; and
- *   2. write/merge `<workspace>/.mcp.json` with a `cellar` stdio server entry
- *      that runs `cellar mcp` — the port never appears in config, so it never
- *      goes stale.
+ *   2. point each agent harness at that stdio bridge by writing/merging its own
+ *      config (Claude Code's `.mcp.json`, Codex's `.codex/config.toml`, …) with
+ *      a `cellar` server entry that runs `cellar mcp` — the port never appears
+ *      in config, so it never goes stale. That half lives entirely in
+ *      `harness.js`, the single source of truth for where those files are and
+ *      how they are merged; nothing here writes them.
  *
  * Node builtins + global fetch only, so this is importable by both the CLI
  * launcher (`../src/lib/server/runtime.js`) and, if ever needed, the SvelteKit
@@ -36,11 +39,6 @@ export function runtimeFilePath(workspace) {
 /** Absolute path of the single-instance lockfile for a workspace. */
 export function instanceLockPath(workspace) {
 	return join(workspace, '.cellar', 'instance.lock');
-}
-
-/** Absolute path of the project-scoped MCP config file for a workspace. */
-export function mcpConfigPath(workspace) {
-	return join(workspace, '.mcp.json');
 }
 
 /**
@@ -226,46 +224,4 @@ export async function isInstanceAlive(rt) {
 	if (!rt) return false;
 	if (!pidAlive(rt.pid)) return false;
 	return mcpPortResponds(rt.mcpPort);
-}
-
-/**
- * Write/merge `<workspace>/.mcp.json` so an agent opened in this repo (Claude
- * Code) auto-connects over stdio via `cellar mcp` — no port in config, so it
- * never goes stale. Idempotent, and preserves any other servers the user has
- * already configured (merge, never clobber). Returns a short status string.
- */
-export function writeMcpConfig(workspace) {
-	const file = mcpConfigPath(workspace);
-	const entry = { command: 'cellar', args: ['mcp'] };
-
-	let config = {};
-	if (existsSync(file)) {
-		try {
-			config = JSON.parse(readFileSync(file, 'utf8'));
-		} catch {
-			// Corrupt/hand-edited JSON — do NOT clobber the user's file.
-			return `skipped (${file} is not valid JSON; leaving it untouched)`;
-		}
-		if (config === null || typeof config !== 'object' || Array.isArray(config)) {
-			return `skipped (${file} is not a JSON object; leaving it untouched)`;
-		}
-	}
-
-	const servers = config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {};
-	const existing = servers.cellar;
-	const already =
-		existing && existing.command === entry.command && JSON.stringify(existing.args) === JSON.stringify(entry.args);
-
-	config.mcpServers = { ...servers, cellar: entry };
-	const next = JSON.stringify(config, null, 2) + '\n';
-
-	// Idempotent: skip the write if nothing would change on disk.
-	if (existsSync(file) && already) {
-		try {
-			if (readFileSync(file, 'utf8') === next) return 'up to date';
-		} catch {}
-	}
-
-	writeFileSync(file, next);
-	return already ? 'updated' : 'wrote cellar server';
 }

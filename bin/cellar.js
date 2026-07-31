@@ -19,6 +19,15 @@
  *                                   instance (zero-config agent connection; see
  *                                   src/lib/server/mcp-bridge.js). Fails fast if
  *                                   no cellar is running in the workspace.
+ *   cellar harness list             show every supported agent harness: whether
+ *                                   Cellar manages it here, and whether its
+ *                                   config currently has the cellar entry.
+ *   cellar harness add <name…>      let Cellar manage a harness (`claude` →
+ *                                   .mcp.json, `codex` → .codex/config.toml, or
+ *                                   `all`) and configure it now. Merges
+ *                                   idempotently; see src/lib/server/harness.js.
+ *   cellar harness remove <name…>   stop managing one (its config entry is left
+ *                                   in place; `--strip` also removes it).
  *   cellar ls                       list known cellar instances (registry +
  *                                   untracked orphans) with liveness.
  *   cellar cleanup [--all] [-y]     reap dead/orphaned instances (launcher gone,
@@ -69,7 +78,7 @@
  * all of this to run a deliberate second instance; `CELLAR_ISOLATED` does the same
  * and additionally skips the registry entry (so it is invisible to ls/cleanup too).
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -92,11 +101,28 @@ import {
 import {
 	writeRuntime,
 	clearRuntime,
-	writeMcpConfig,
 	readRuntime,
 	acquireInstanceLock,
 	releaseInstanceLock
 } from '../src/lib/server/runtime.js';
+import {
+	RUNNING_NOTE,
+	allowHarness,
+	configureHarness,
+	disallowHarness,
+	getHarness,
+	harnessNames,
+	harnessState,
+	isHarnessAllowed,
+	markHarnessPrompted,
+	mcpJsonHarnessNames,
+	parseHarnessAnswer,
+	promptedHarnesses,
+	readAllowList,
+	reconcileHarnesses,
+	shouldPromptHarnessSetup,
+	stripHarness
+} from '../src/lib/server/harness.js';
 import {
 	registerInstance,
 	updateInstance,
@@ -154,6 +180,13 @@ if (argv.includes('--version') || argv.includes('-v')) {
 if (argv.includes('--update')) {
 	const { runUpdate } = await import('../src/lib/server/selfupdate.js');
 	process.exit(runUpdate(REPO));
+}
+
+// `cellar harness …` — configure an AI coding agent to use Cellar's MCP server.
+// Handled before normal arg parsing (like `mcp` / `ls`) so it never boots a
+// server and its own args can't trip the unknown-flag guard.
+if (argv[0] === 'harness' || argv[0] === 'harnesses') {
+	process.exit(harnessCommand(argv.slice(1)));
 }
 
 // `cellar ls` / `cellar cleanup` — inspect and reap cellar instances. Handled
@@ -341,6 +374,9 @@ async function waitFor(url, { headers = {}, timeoutMs = 30000 } = {}) {
 	throw new Error(`timed out waiting for ${url}`);
 }
 
+// Known, pre-existing: `inForegroundJob()` guards the harness prompt only, so a
+// backgrounded `cellar &` can still be stopped by SIGTTIN here - deliberately
+// left alone, since refusing to read would change what such a launch DOES.
 function confirm(question) {
 	if (autoYes) return Promise.resolve(true);
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -455,18 +491,116 @@ function promptYesNo(question) {
 	});
 }
 
+/**
+ * Decide, from `ps -o pgid=,tpgid=` for THIS process, whether we are the
+ * terminal's FOREGROUND job. Pure so the parse is testable; `null` means the
+ * question could not be answered (no controlling terminal, or a `ps` that does
+ * not report `tpgid`), which callers must treat as unknown, never as a "no".
+ */
+function foregroundFromPs(text) {
+	const [pgid, tpgid] = String(text ?? '')
+		.trim()
+		.split(/\s+/)
+		.map(Number);
+	if (!Number.isInteger(pgid) || !Number.isInteger(tpgid) || tpgid <= 0) return null;
+	return pgid === tpgid;
+}
+
+/**
+ * Is this process the controlling terminal's foreground job? `false` means a
+ * backgrounded `cellar &`, which MUST NOT read stdin (see `maybePromptHarnessSetup`).
+ * `null` = unknown (Windows has no such job control; a `ps` without `tpgid`).
+ */
+function inForegroundJob() {
+	if (process.platform === 'win32') return null;
+	try {
+		const r = spawnSync('ps', ['-o', 'pgid=,tpgid=', '-p', String(process.pid)], { encoding: 'utf8' });
+		if (r.error || r.status !== 0) return null;
+		return foregroundFromPs(r.stdout);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Free-text prompt (the harness picker needs a list, not a yes/no).
+ *
+ * Resolves `null` - "no answer" - rather than waiting forever, because this one
+ * runs in the LAUNCH path: a stdin that closes (or errors) would otherwise leave
+ * the promise pending and the notebook unstarted. A closed stdin, a read error and
+ * `timeoutMs` elapsing are all one outcome, which the caller must treat as "not
+ * answered" - never as a decision.
+ *
+ * The timeout does NOT cover a backgrounded job, and nothing here can: reading the
+ * controlling terminal from a background process group raises SIGTTIN, whose default
+ * disposition STOPS the process, and a stopped process runs no timers. Installing a
+ * SIGTTIN listener to override that stop is worse, not better - measured: the read
+ * then fails with EIO, libuv retries it, and the process spins at 100% CPU without
+ * ever reaching the JS handler or the timer. So that case is kept out of here
+ * entirely, by not calling this at all off the foreground (see `inForegroundJob`).
+ *
+ * Ctrl-C is its own outcome and needs its own listener: readline runs in terminal
+ * mode here (stdout is a TTY), which puts stdin in raw mode and SWALLOWS ^C, so the
+ * module-level `process.on('SIGINT')` never fires. Without the listener below the
+ * keystroke read as "no answer" and the launch carried on booting the sidecar and
+ * opening a browser - the opposite of what it means. It hands off to the launcher's
+ * one shutdown path; nothing is recorded, since that path never returns.
+ */
+function ask(question, { timeoutMs } = {}) {
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	return new Promise((res) => {
+		let settled = false;
+		let timer = null;
+		const finish = (value) => {
+			if (settled) return;
+			settled = true;
+			if (timer) clearTimeout(timer);
+			rl.close();
+			// Nothing more will be read: don't leave a resumed stdin holding the loop.
+			if (value === null) process.stdin.pause();
+			res(value);
+		};
+		// Deliberately NOT unref'd: the launch is awaiting this promise, so a timer the
+		// loop is free to ignore would let the process fall out from under the prompt
+		// instead of giving up and continuing. Cleared by `finish`, so it holds nothing
+		// open once an answer (or any other outcome) arrives.
+		if (timeoutMs) timer = setTimeout(() => finish(null), timeoutMs);
+		// `close` covers a stdin that ends without answering; `error` covers a read
+		// that fails - readline forwards its input stream's errors here, which is what
+		// makes this the one listener that has to exist.
+		rl.on('close', () => finish(null));
+		rl.on('error', () => finish(null));
+		// The user's explicit interrupt, not a prompt failure: close the interface
+		// (restoring the terminal out of raw mode) and hand off to the launcher's
+		// EXISTING teardown, which exits - so nothing after the prompt runs.
+		rl.on('SIGINT', () => {
+			if (timer) clearTimeout(timer);
+			rl.close();
+			shutdown(0, 'SIGINT (Ctrl-C at the harness prompt)');
+		});
+		rl.question(question, (ans) => finish(ans));
+	});
+}
+
 function printHelp() {
 	console.log(`cellar - run a live, agent-connected notebook in any project directory.
 
 Usage:
   cellar [path] [options]     start Cellar in a folder (default: cwd)
   cellar mcp [options]        stdio <-> HTTP MCP bridge for the running instance
+  cellar harness <cmd>        configure an AI coding agent to use Cellar's tools
   cellar ls                   list known cellar instances with liveness
   cellar cleanup [options]    reap dead / orphaned instances
 
 Subcommands:
   mcp        zero-config agent connection: bridge stdio to the live instance
              (fails fast if no cellar is running in the workspace)
+  harness    list            what Cellar manages here + each config's state
+             add <name…>     manage a harness and configure it now, e.g.
+                             "cellar harness add codex" (claude | codex | all).
+                             Managed harnesses are re-checked and repaired on
+                             every start. Merges; never clobbers existing config.
+             remove <name…>  stop managing one (--strip also removes its entry)
   ls         list registered + untracked cellar instances and whether each is alive
   cleanup    reap dead/orphaned instances; --all also stops every live instance
 
@@ -488,9 +622,10 @@ Environment:
                           superset of --new that also skips registration)
 
 Examples:
-  cellar                  start Cellar in the current directory
-  cellar ../other-repo    start Cellar scoped to another repo
-  cellar --update         update Cellar to the latest version`);
+  cellar                    start Cellar in the current directory
+  cellar ../other-repo      start Cellar scoped to another repo
+  cellar harness add codex  point Codex at Cellar's MCP server for this project
+  cellar --update           update Cellar to the latest version`);
 }
 
 async function listInstancesCommand() {
@@ -572,6 +707,334 @@ async function cleanupCommand(flags) {
 	return 0;
 }
 
+// ---- `cellar harness …` ---------------------------------------------------
+
+/** Human-readable state for one harness row. */
+function harnessStateLabel(s) {
+	if (s.unreadable) return 'unreadable';
+	if (s.configured) return 'configured';
+	if (s.present) return 'other entry';
+	return 'not configured';
+}
+
+/**
+ * Report the outcome of one configure call, then (once per command) the
+ * running-cellar note — a written config is inert on its own, because
+ * `cellar mcp` bridges to a LIVE instance rather than starting one.
+ */
+function printHarnessResult(r) {
+	if (!r.ok) {
+		console.error(`[cellar] ${r.message}`);
+		return false;
+	}
+	// A refusal says so in the status word, not only inside the explanation - and
+	// the file is appended only when the message does not already name it, so a
+	// refusal (which quotes the path) does not print it twice.
+	const what = r.status === 'skipped' ? `skipped: ${r.message}` : r.message;
+	const where = r.file && !what.includes(r.file) ? ` → ${r.file}` : '';
+	const say = r.status === 'skipped' ? console.error : console.log;
+	say(`[cellar] ${r.label}: ${what}${where}`);
+	if (r.note && r.status !== 'skipped') console.log(`[cellar]   note: ${r.note}`);
+	return r.status !== 'skipped';
+}
+
+/**
+ * `cellar harness list|add|remove` — the explicit, any-time counterpart to the
+ * first-run prompt. Both drive the SAME registry (src/lib/server/harness.js), so
+ * neither can configure a harness the other cannot. Returns a process exit code;
+ * never boots a server.
+ *
+ * `add`/`remove` operate on the workspace ALLOW-LIST — the standing instruction
+ * the launcher reconciles on every start — not on a one-off write. Adding also
+ * configures immediately so the command has a visible effect; removing only stops
+ * the reconciling, and needs `--strip` to also take Cellar's entry out of the
+ * harness's config (see `stripHarness`: "stop managing this" and "delete this"
+ * are different requests, and only one of them edits the user's file).
+ */
+function harnessCommand(args) {
+	// Accept `--workspace <dir>` / `-w <dir>` so a harness can be configured for
+	// another repo without cd-ing, exactly like the launcher itself.
+	const rest = [];
+	let wsArg;
+	let strip = false;
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] === '--workspace' || args[i] === '-w') {
+			wsArg = args[++i];
+			continue;
+		}
+		if (args[i] === '--strip') {
+			strip = true;
+			continue;
+		}
+		rest.push(args[i]);
+	}
+	const workspace = resolve(wsArg || process.cwd());
+	const sub = (rest[0] ?? 'list').toLowerCase();
+	const usage = `cellar harness list | cellar harness add <${harnessNames().join('|')}|all> | cellar harness remove <name…> [--strip]`;
+
+	if (sub === 'list' || sub === 'ls' || sub === 'status') {
+		const allowed = new Set(readAllowList(workspace));
+		console.log(`[cellar] agent harnesses for ${workspace}:`);
+		for (const name of harnessNames()) {
+			const s = harnessState(name, workspace);
+			// Two independent facts, so both are shown: whether Cellar is ALLOWED to
+			// keep this harness wired up (the durable decision it reconciles every
+			// start), and whether the config file says so RIGHT NOW. They differ
+			// exactly while something is wrong - a deleted config on an allowed
+			// harness is the case the next launch repairs.
+			const managedLabel = allowed.has(name) ? 'managed' : 'not managed';
+			console.log(`  ${name.padEnd(8)} ${managedLabel.padEnd(12)} ${harnessStateLabel(s).padEnd(15)} ${s.file}`);
+		}
+		console.log(`[cellar] managed harnesses are checked and repaired on every \`cellar\` start.`);
+		console.log(`[cellar] ${usage}`);
+		console.log(`[cellar] ${RUNNING_NOTE}`);
+		return 0;
+	}
+
+	if (sub === 'add' || sub === 'set' || sub === 'install') {
+		const names = rest.slice(1).flatMap((n) => (n.toLowerCase() === 'all' ? harnessNames() : [n]));
+		if (names.length === 0) {
+			console.error(`[cellar] usage: cellar harness add <${harnessNames().join('|')}|all> [--workspace <dir>]`);
+			return 1;
+		}
+		let ok = true;
+		let wrote = false;
+		for (const name of names) {
+			// The registry refuses whatever it cannot edit confidently, but the WRITE
+			// itself can still fail on the filesystem (a read-only workspace, ENOSPC,
+			// EACCES on `.codex/`), and so can the allow-list write. Report that in the
+			// same one-line shape as every other outcome instead of exiting on an
+			// unhandled exception: `add all` then continues past one bad harness, and
+			// the exit code still says something failed.
+			//
+			// The allow-list goes FIRST: it is the standing instruction, and the write
+			// is only its first reconcile. Ordered the other way, a filesystem failure
+			// loses the user's explicit "manage this harness" entirely - nothing
+			// recorded, so no later start repairs it either.
+			try {
+				const managedNow = allowHarness(name, workspace).changed;
+				const r = configureHarness(name, workspace);
+				// A REFUSAL is not success: without this, `cellar harness add codex`
+				// printed "skipped (… could not be read …)" and exited 0, so a script
+				// (or `add all`) reported success having configured nothing.
+				if (!r.ok || r.status === 'skipped') ok = false;
+				wrote = printHarnessResult(r) || wrote;
+				if (r.ok && managedNow) {
+					console.log(`[cellar]   (Cellar will keep ${r.label} wired up here - checked on every start)`);
+				}
+			} catch (err) {
+				ok = false;
+				const h = getHarness(name);
+				const where = h ? ` → ${join(workspace, h.configPath)}` : '';
+				console.error(`[cellar] ${h?.label ?? name}: skipped (${err?.message ?? err})${where}`);
+			}
+		}
+		if (wrote) console.log(`[cellar] ${RUNNING_NOTE}`);
+		return ok ? 0 : 1;
+	}
+
+	if (sub === 'remove' || sub === 'rm' || sub === 'forget') {
+		const names = rest.slice(1).flatMap((n) => (n.toLowerCase() === 'all' ? harnessNames() : [n]));
+		if (names.length === 0) {
+			console.error(`[cellar] usage: cellar harness remove <${harnessNames().join('|')}> [--strip] [--workspace <dir>]`);
+			return 1;
+		}
+		let ok = true;
+		for (const name of names) {
+			const h = getHarness(name);
+			if (!h) {
+				console.error(`[cellar] unknown harness "${name}" (supported: ${harnessNames().join(', ')})`);
+				ok = false;
+				continue;
+			}
+			try {
+				const changed = disallowHarness(name, workspace).changed;
+				console.log(
+					changed
+						? `[cellar] ${h.label}: no longer managed (Cellar stops checking it on start)`
+						: `[cellar] ${h.label}: was not managed`
+				);
+				// The config itself is left alone unless asked: the entry keeps working,
+				// which is what "stop managing" means. `--strip` is the destructive opt-in.
+				if (strip) {
+					const r = stripHarness(name, workspace);
+					if (!r.ok || r.status === 'skipped') ok = false;
+					printHarnessResult(r);
+				} else {
+					console.log(`[cellar]   its ${h.configPath} entry is left in place (\`--strip\` removes it)`);
+				}
+			} catch (err) {
+				ok = false;
+				console.error(`[cellar] ${h.label}: skipped (${err?.message ?? err}) → ${join(workspace, h.configPath)}`);
+			}
+		}
+		return ok ? 0 : 1;
+	}
+
+	console.error(`[cellar] unknown harness command: ${sub}`);
+	console.error(`[cellar] usage: ${usage}`);
+	return 1;
+}
+
+/** How long the one-time question waits before giving up and launching anyway. */
+const HARNESS_PROMPT_TIMEOUT_MS = 30_000;
+
+/**
+ * First run in a workspace: offer to ALSO wire up harnesses Cellar is not already
+ * keeping in place.
+ *
+ * The question can only ADD. Every harness Cellar manages here is on the
+ * workspace allow-list (Claude Code by default), the launch reconciles that list
+ * whatever happens below, and nothing in this function ever removes from it - so
+ * a bare Enter, a timeout, a closed stdin and a backgrounded job are all the same
+ * harmless outcome: no new harness, everything already managed still managed.
+ * That is the whole point of the allow-list model; a prompt that could take
+ * capability away is one whose most reflexive answer is its most destructive.
+ *
+ * Four rules keep it safe in the launch path. It is asked ONCE per workspace (a
+ * durable `.cellar/harness.json` marker), it NEVER prompts without a TTY (`-y`,
+ * `$CI`, a piped stdin all fall through silently), it can never abort a launch
+ * (any failure is caught and logged, exactly like the best-effort host-env prep),
+ * and it can never STALL or SUSPEND one either.
+ *
+ * That last rule takes TWO mechanisms, because they cover different failures.
+ * `ask` gives up on a closed stdin, a read error or `HARNESS_PROMPT_TIMEOUT_MS` -
+ * a stdin that is merely silent. A BACKGROUNDED `cellar &` is not that case: it
+ * reads `stdin.isTTY` as true (so `autoYes` stays false), and its first read of the
+ * controlling terminal raises SIGTTIN, which STOPS the process - and a stopped
+ * process runs no timers, so no timeout can rescue it. The only fix is not to read
+ * at all, so the prompt is gated on `inForegroundJob()`: a proven background job is
+ * skipped outright, recording nothing, and launches normally. Where that cannot be
+ * determined (no `tpgid`; Windows, which has no such stop) the prompt still runs
+ * behind its timeout, exactly as before.
+ *
+ * Ctrl-C is the ONE answer that stops the launch, and it does not weaken the rule
+ * above: "can never abort" is about the prompt failing on its own (Enter, "no", a
+ * typo, a closed stdin, the timeout, a background job - all of which record nothing
+ * and launch normally), whereas ^C is the user's explicit interrupt. `ask` has to
+ * catch it itself, because readline's terminal mode swallows it before the
+ * process-level SIGINT handler; it records nothing either, and hands off to the
+ * launcher's one shutdown path.
+ *
+ * It also offers only what the launch is actually willing to write: under
+ * `--no-mcp-config` the `.mcp.json` harness is not on the list at all, and because
+ * that is a filtered view the question is NOT recorded as asked (a later launch
+ * without the flag still asks).
+ */
+async function maybePromptHarnessSetup() {
+	try {
+		// Every gate (asked-once, nothing-to-offer, non-interactive) lives in the
+		// registry's `shouldPromptHarnessSetup` so it is unit-testable; `autoYes`
+		// already folds in `-y`, `$CI` and a non-TTY stdin.
+		const decision = shouldPromptHarnessSetup(WORKSPACE, {
+			interactive: !autoYes,
+			exclude: mcpConfigExcluded()
+		});
+		if (!decision.prompt) return;
+		// A backgrounded job would be STOPPED by SIGTTIN on its first read, and no
+		// timeout can undo that (a stopped process runs no timers). So it is never
+		// asked, and - like every other unanswered outcome - records nothing, so the
+		// next foreground launch still asks.
+		if (inForegroundJob() === false) return;
+
+		const { states, offered, record } = decision;
+		const managed = readAllowList(WORKSPACE)
+			.map((n) => getHarness(n)?.label)
+			.filter(Boolean);
+		// The question is settled per HARNESS, so this can also be a LATER launch
+		// asking about one Cellar has since learned to configure. Say which it is
+		// rather than greeting a long-standing workspace as a first run.
+		console.log(
+			promptedHarnesses(WORKSPACE).length
+				? '[cellar] Cellar can now point more AI coding agents at its MCP tools.'
+				: '[cellar] First run here. Cellar points your AI coding agent at its MCP tools.'
+		);
+		if (managed.length) {
+			// Say what is ALREADY handled before asking, so the question reads as what
+			// it is - purely additive - and Enter is visibly safe.
+			console.log(`[cellar] Already set up and kept in place: ${managed.join(', ')}.`);
+		}
+		console.log('[cellar] Also set up:');
+		states.forEach((s, i) => {
+			const flag = s.configured ? ' (config already present)' : s.present ? ' (has another entry)' : '';
+			console.log(`[cellar]   ${i + 1}) ${s.label.padEnd(12)} ${s.file}${flag}`);
+		});
+		const answer = await ask(`[cellar] Which? [numbers/names, "yes"/"all", or Enter for none] `, {
+			timeoutMs: HARNESS_PROMPT_TIMEOUT_MS
+		});
+		// The already-managed names are named one line above the question, so typing
+		// one is a natural reply - it is understood and needs no write, which is a
+		// different fact from a token nothing recognized.
+		const parsed = parseHarnessAnswer(answer, offered, { managed: readAllowList(WORKSPACE) });
+		const { chosen, unknown, answered } = parsed;
+		for (const u of unknown) console.log(`[cellar] ignoring unrecognized choice: ${u}`);
+		for (const m of parsed.managed) {
+			console.log(`[cellar] ${getHarness(m)?.label ?? m} is already set up here and kept in place - nothing to do.`);
+		}
+		for (const n of parsed.notOffered) {
+			// A registered harness this offer does not carry - it was taken off the
+			// allow-list, so the question is settled for it. Understood, just not
+			// something this prompt will do; name the command that does.
+			console.log(
+				`[cellar] ${getHarness(n)?.label ?? n} is not on this offer (it was removed here) - \`cellar harness add ${n}\` puts it back.`
+			);
+		}
+		if (!answered) {
+			// No answer at all, or nothing in the reply resolved - not a decision, so
+			// the question stands and the next interactive launch asks again.
+			console.log(
+				`[cellar] ${answer === null ? 'no answer' : 'nothing recognized'} - continuing (asked again next time; \`cellar harness add <${harnessNames().join('|')}>\` any time).`
+			);
+			return;
+		}
+
+		let wrote = false;
+		for (const name of chosen) {
+			// Caught PER harness, like `cellar harness add` and the launch reconcile: a
+			// filesystem failure on one (read-only workspace, ENOSPC, EACCES on
+			// `.codex/`) must not throw past the bookkeeping below, which would discard
+			// both a successful sibling write and the answer itself - so the question
+			// would come back on every later interactive launch.
+			//
+			// And the allow-list is recorded BEFORE the config is written, because the
+			// write is only its first reconcile and it is the half that can fail. The
+			// other order lost the user's explicit "wire up Codex" for good: nothing
+			// recorded, yet the marker below still closed the question, so no later
+			// start could repair it.
+			try {
+				allowHarness(name, WORKSPACE);
+				wrote = printHarnessResult(configureHarness(name, WORKSPACE)) || wrote;
+			} catch (err) {
+				const h = getHarness(name);
+				const where = h ? ` → ${join(WORKSPACE, h.configPath)}` : '';
+				console.error(`[cellar] ${h?.label ?? name}: skipped (${err?.message ?? err})${where}`);
+			}
+		}
+		if (wrote) console.log(`[cellar] ${RUNNING_NOTE}`);
+		if (chosen.length === 0) {
+			console.log(
+				`[cellar] none added - \`cellar harness add <${harnessNames().join('|')}>\` any time (nothing was turned off).`
+			);
+		}
+		// Only close the question when the offer covered everything it could. Under
+		// `--no-mcp-config` the view was filtered, so a later ordinary launch asks.
+		if (record) markHarnessPrompted(WORKSPACE);
+	} catch (err) {
+		// Never let agent wiring block a notebook launch.
+		console.log(`[cellar] harness setup skipped: ${err?.message ?? err}`);
+	}
+}
+
+/**
+ * Harnesses this launch must not write, as names. `--no-mcp-config` is defined in
+ * terms of the FILE it refuses, so the harness is derived from the registry
+ * rather than pinned by name — and it is an exclusion for this launch only, never
+ * a change to the allow-list.
+ */
+function mcpConfigExcluded() {
+	return writeMcpConfigOptIn ? [] : mcpJsonHarnessNames();
+}
+
 /**
  * Refuse to launch on an unusable production build, BEFORE any slow toolchain
  * work (venv resolve/create, host venv, Jupyter sidecar) — a build we will not
@@ -609,6 +1072,14 @@ async function main() {
 	console.log(`[cellar] workspace: ${WORKSPACE}`);
 
 	if (!assertUsableBuild()) return;
+
+	// First run in this workspace: offer to wire up the user's agent harness(es).
+	// Placed BEFORE the single-instance takeover (and before the slow toolchain
+	// work) for two reasons: the one-time question is answered while the terminal
+	// is still quiet, and - load-bearing - a launch must not reap the instance
+	// that owns this folder and then sit waiting for an answer, leaving the user
+	// with no running Cellar at all. Non-interactive launches no-op.
+	await maybePromptHarnessSetup();
 
 	// 0) Single-instance-per-folder + reap (unless --new/--force). The complaint
 	//    this fixes: old cellar servers pile up (launcher crashed → orphaned app
@@ -742,9 +1213,21 @@ async function main() {
 			mode: useDev ? 'dev' : 'build'
 		});
 	}
-	if (writeMcpConfigOptIn) {
-		const status = writeMcpConfig(WORKSPACE);
-		console.log(`[cellar] .mcp.json: ${status} (agent connects via \`cellar mcp\`)`);
+	// RECONCILE the workspace allow-list: every harness Cellar is allowed to manage
+	// here gets its config checked and, if it is missing, stale or was deleted,
+	// repaired. This runs on EVERY start, which is what makes the allow-list a
+	// standing instruction rather than a one-off write - delete `.mcp.json` and the
+	// next `cellar` puts it back, exactly as the zero-config promise implies.
+	//
+	// Claude Code is on that list by default, so a workspace that has never been
+	// asked anything behaves precisely as it always did. `--no-mcp-config` excludes
+	// the harness owning that file for THIS launch only - an exclusion, never a
+	// removal, so the flag cannot quietly rewrite a durable decision.
+	for (const r of reconcileHarnesses(WORKSPACE, { exclude: mcpConfigExcluded() })) {
+		const h = getHarness(r.name);
+		const status =
+			r.status === 'already' ? 'up to date' : r.status === 'skipped' ? `skipped (${r.message})` : r.message;
+		console.log(`[cellar] ${h?.configPath ?? r.name}: ${status} (agent connects via \`cellar mcp\`)`);
 	}
 
 	// Idle-kernel culling. With one kernel PER notebook, N idle Python processes
@@ -805,6 +1288,12 @@ async function main() {
 		CELLAR_MCP_PORT: String(mcpPort),
 		CELLAR_PROJECT_VENV: projectPython,
 		CELLAR_KERNELSPEC_DIR: kernelDir,
+		// `--no-mcp-config` is a per-LAUNCH exclusion, not a change to the allow-list,
+		// so the app cannot infer it from the workspace marker. Without it the
+		// "Connect an agent" banner claimed the every-start repair over a `.mcp.json`
+		// this instance deliberately leaves alone. Always set (never inherited), so a
+		// stale value from the surrounding environment cannot answer for this run.
+		CELLAR_NO_MCP_CONFIG: writeMcpConfigOptIn ? '0' : '1',
 		// Self-exit hook: the app watches this pid and exits if the launcher dies
 		// uncleanly (parent-watch.js), so it never lingers orphaned serving stale code.
 		CELLAR_LAUNCHER_PID: String(process.pid),

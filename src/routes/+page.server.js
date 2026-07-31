@@ -1,26 +1,57 @@
-import { existsSync, readFileSync } from 'node:fs';
 import { getDefaultNotebook } from '$lib/server/notebook';
 import { workspaceRoot } from '$lib/server/fstree';
-import { mcpConfigPath } from '$lib/server/runtime.js';
+import { harnessState, isHarnessAllowed, mcpJsonHarnessNames } from '$lib/server/harness.js';
 import { getUiState } from '$lib/server/ui-state';
 import { parseMaxKernels } from '$lib/kernelCap';
 
 /**
- * Whether `<workspace>/.mcp.json` currently registers the `cellar` stdio server.
- * True → an agent opened in this repo auto-connects with zero config; false →
- * the launcher was run with `--no-mcp-config` (or the file was removed/edited),
- * so the manual `claude mcp add` path is the way in. Best-effort: any read/parse
- * trouble degrades to false rather than throwing.
+ * The two INDEPENDENT facts the "Connect an agent" panel needs about Claude Code,
+ * exactly as `cellar harness list` prints them:
+ *
+ *   `configured` — `<workspace>/.mcp.json` registers the `cellar` stdio server
+ *                  right now, so an agent opened in this repo auto-connects.
+ *   `managed`    — Claude Code is on the workspace allow-list, so every `cellar`
+ *                  start CHECKS AND REPAIRS that entry.
+ *
+ * They are separate because they can honestly disagree: `cellar harness remove
+ * claude` deliberately leaves the entry in place, so a configured harness may no
+ * longer be maintained, and the banner must not promise a self-heal that will not
+ * happen. Both verdicts come from `harness.js`, the ONE place that decides what a
+ * configured/managed harness is - a second copy here (`…cellar?.command ===
+ * 'cellar'`, ignoring `args`) could claim "wired up" over an entry the launcher
+ * would rewrite on the very next run. Best-effort: any read/parse trouble degrades
+ * to false rather than throwing during SSR.
+ *
+ * `managed` is the DURABLE fact, so this instance's own opt-out is reported
+ * separately as `paused`: `--no-mcp-config` filters what THIS launch reconciles
+ * without touching the allow-list, so the harness stays managed while nothing is
+ * being checked or repaired right now - two different remedies (`cellar harness
+ * add` vs. relaunching without the flag), so they must not collapse into one
+ * boolean. Which harness the flag covers is derived from the registry
+ * (`mcpJsonHarnessNames`), exactly as the launcher derives it, never pinned here.
  */
 function detectMcpConfig() {
 	try {
-		const file = mcpConfigPath(workspaceRoot());
-		if (!existsSync(file)) return false;
-		const cfg = JSON.parse(readFileSync(file, 'utf8'));
-		return cfg?.mcpServers?.cellar?.command === 'cellar';
+		const ws = workspaceRoot();
+		const managed = isHarnessAllowed('claude', ws);
+		return {
+			configured: harnessState('claude', ws)?.configured === true,
+			managed,
+			// Only meaningful for a MANAGED harness: an unmanaged one is not repaired by
+			// any launch, so its remedy is `cellar harness add`, not dropping the flag.
+			paused: managed && mcpConfigDisabled() && mcpJsonHarnessNames().includes('claude')
+		};
 	} catch {
-		return false;
+		return { configured: false, managed: false, paused: false };
 	}
+}
+
+/** Was this instance launched with `--no-mcp-config`? (set by `bin/cellar.js`) */
+function mcpConfigDisabled() {
+	const v = String(process.env.CELLAR_NO_MCP_CONFIG ?? '')
+		.trim()
+		.toLowerCase();
+	return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
 /** Load the canonical notebook (cells + outputs) for the workspace. */
@@ -30,6 +61,7 @@ export function load() {
 	// server's own fallback), so the "Connect an agent" panel can show the real
 	// running value in the demoted raw-endpoint disclosure.
 	const mcpPort = Number(process.env.CELLAR_MCP_PORT || 39587);
+	const claude = detectMcpConfig();
 	return {
 		notebook: getDefaultNotebook(),
 		// Soft cap on live kernels: past this the Kernels sidebar shows a
@@ -44,8 +76,11 @@ export function load() {
 		mcp: {
 			port: mcpPort,
 			url: `http://127.0.0.1:${mcpPort}/mcp`,
-			// Zero-config: did the launcher write a project `.mcp.json` here?
-			projectConfigured: detectMcpConfig()
+			// Zero-config: does a project `.mcp.json` register `cellar` here, and is
+			// Cellar keeping it that way? Separate facts - see `detectMcpConfig`.
+			projectConfigured: claude.configured,
+			projectManaged: claude.managed,
+			projectRepairPaused: claude.paused
 		}
 	};
 }
