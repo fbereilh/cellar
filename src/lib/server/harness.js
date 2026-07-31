@@ -26,11 +26,13 @@
  * These files belong to the user: they hold other MCP servers and (for Codex)
  * unrelated settings like `model` or `approval_policy`. So every write MERGES,
  * is idempotent (an already-registered Cellar reports `already` and touches
- * nothing), is ATOMIC (`writeFileAtomic` - a crash mid-write must not truncate
- * a config), and - the load-bearing half - **refuses on anything it cannot edit
- * confidently**, returning an actionable `skipped` instead of rewriting the
- * file. A hand-editable config the user must repair is a worse outcome than a
- * one-line manual step.
+ * nothing), is ATOMIC while preserving the target's mode and FOLLOWING a symlink
+ * (`writeFileAtomic` - a crash mid-write must not truncate a config, and a
+ * dotfile-manager's link must not be quietly replaced by a regular file), and -
+ * the load-bearing half - **refuses on anything it cannot edit confidently**,
+ * returning an actionable `skipped` instead of rewriting the file. A
+ * hand-editable config the user must repair is a worse outcome than a one-line
+ * manual step.
  *
  * MERGE reaches INSIDE the cellar entry too, in both writers: Cellar owns
  * `command`/`args` and nothing else, so a key the user added beside them (`env`,
@@ -73,6 +75,7 @@ import {
 	mkdirSync,
 	openSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
@@ -165,6 +168,17 @@ export function harnessNames() {
 	return HARNESSES.map((h) => h.name);
 }
 
+/**
+ * The harnesses `--no-mcp-config` excludes, as names — every harness whose config
+ * IS that file. The ONE derivation of that rule: the launcher excludes them from
+ * its reconcile and prompt, and the page load must decide the sidebar's
+ * every-start-repair claim by exactly the same rule, or the banner would promise a
+ * repair this instance deliberately is not doing.
+ */
+export function mcpJsonHarnessNames() {
+	return HARNESSES.filter((h) => h.configPath === MCP_JSON_CONFIG_PATH).map((h) => h.name);
+}
+
 /** Look up a harness by name (case-insensitive, whitespace-tolerant), or null. */
 export function getHarness(name) {
 	const want = String(name ?? '')
@@ -189,11 +203,22 @@ export function harnessConfigPath(name, workspace) {
  * ones. On any failure the temp is removed and the original is untouched, which
  * is the same never-clobber contract the successful path keeps.
  *
+ * It FOLLOWS a symlink: an agent config is a plausible dotfile-manager symlink
+ * into a managed repo, and rename installs a new inode over whatever it lands on,
+ * so staging beside the LINK would replace the link itself with a regular file
+ * and silently detach that setup. Resolving the target first keeps both
+ * properties - the link survives and the real file is still replaced atomically.
+ * A target that does not exist yet resolves to nothing and is written in place.
+ *
  * Deliberately a few lines of `node:fs` rather than `atomic-write.ts`: this
  * module is node-builtins-only so `bin/cellar.js` can import it (see the header).
  */
 function writeFileAtomic(file, text) {
-	const dir = dirname(file);
+	let target = file;
+	try {
+		target = realpathSync(file);
+	} catch {}
+	const dir = dirname(target);
 	mkdirSync(dir, { recursive: true });
 	// Carry the TARGET's permissions onto the replacement. temp+rename installs a
 	// NEW inode, so without this the file comes back at the default `0o666 & ~umask`
@@ -204,9 +229,9 @@ function writeFileAtomic(file, text) {
 	// A missing target (first write) simply inherits the default.
 	let mode;
 	try {
-		mode = statSync(file).mode & 0o7777;
+		mode = statSync(target).mode & 0o7777;
 	} catch {}
-	const tmp = join(dir, `.${basename(file)}.cellar-${process.pid}-${randomBytes(6).toString('hex')}.tmp`);
+	const tmp = join(dir, `.${basename(target)}.cellar-${process.pid}-${randomBytes(6).toString('hex')}.tmp`);
 	try {
 		const fd = openSync(tmp, 'wx');
 		try {
@@ -223,7 +248,7 @@ function writeFileAtomic(file, text) {
 		} finally {
 			closeSync(fd);
 		}
-		renameSync(tmp, file);
+		renameSync(tmp, target);
 	} catch (err) {
 		try {
 			rmSync(tmp, { force: true });
@@ -1332,45 +1357,60 @@ export function shouldPromptHarnessSetup(workspace, { interactive = true, exclud
 
 /**
  * Resolve a free-text answer to the first-run prompt against the offered
- * harnesses. Accepts 1-based numbers, names (case-insensitive), `all`, and any
- * comma/space mix; an empty answer or a no/none/skip token means "no others".
- * Three token classes, kept apart because they are three different facts: a name
- * on the offer is a `chosen` addition; a registered harness that is already
- * MANAGED here comes back in `managed` (a valid, understood answer with nothing
- * to do — the prompt names those one line above the question, so typing one is
- * the natural reply, and reporting it as unrecognized asserts something false);
- * anything else is genuinely `unknown` so the caller can say so instead of
- * silently dropping it.
+ * harnesses. Accepts 1-based numbers, names (case-insensitive), `all`/`yes`, and
+ * any comma/space mix; an empty answer or a no/none/skip token means "no others".
+ * The affirmative set mirrors the (already generous) decline set on purpose: the
+ * offer is usually a SINGLE harness, so the question reads as a yes/no and `y` is
+ * the most reflexive positive reply — landing it in `unknown` meant the user said
+ * yes, nothing was wired up, and the same question came back next launch.
+ *
+ * FOUR token classes, kept apart because they are four different facts, and only
+ * the last may be reported as unrecognized:
+ *
+ *   `chosen`     — a name/number on the offer: the addition to make.
+ *   `managed`    — a registered harness already on the allow-list here. Understood,
+ *                  nothing to do; the prompt names these one line above the
+ *                  question, so typing one is the natural reply.
+ *   `notOffered` — a registered harness this offer does not carry (it was removed
+ *                  from the allow-list, so the question is settled for it). Also
+ *                  understood; the caller points at `cellar harness add <name>`.
+ *   `unknown`    — names no registered harness at all.
  *
  * `answered` separates a real reply from one nothing in which resolved: an
  * all-typo answer is NOT a decision, so the caller records nothing and asks
  * again. An empty answer, an explicit no/skip, and a reply naming only
  * already-managed harnesses ARE decisions — and harmless ones here, since the
- * only thing an answer can do is add.
+ * only thing an answer can do is add. A `notOffered` name deliberately is NOT:
+ * unlike a managed harness (whose state the reply merely confirms), it asks for
+ * something this prompt declined to offer and says nothing about what WAS
+ * offered, so closing the question on it would silently retire an open one.
  *
  * @param {string | null | undefined} answer
  * @param {string[]} [offered]
  * @param {{ managed?: string[] }} [opts] harnesses already on the allow-list here
- * @returns {{ chosen: string[], managed: string[], unknown: string[], skipped: boolean, answered: boolean }}
+ * @returns {{ chosen: string[], managed: string[], notOffered: string[], unknown: string[],
+ *             skipped: boolean, answered: boolean }}
  */
 export function parseHarnessAnswer(answer, offered = harnessNames(), { managed = [] } = {}) {
 	const already = new Set(normalizeNames(managed));
+	const empty = { chosen: [], managed: [], notOffered: [], unknown: [] };
 	if (answer === null || answer === undefined) {
-		return { chosen: [], managed: [], unknown: [], skipped: true, answered: false };
+		return { ...empty, skipped: true, answered: false };
 	}
 	const raw = String(answer).trim();
-	if (raw === '') return { chosen: [], managed: [], unknown: [], skipped: true, answered: true };
+	if (raw === '') return { ...empty, skipped: true, answered: true };
 	const tokens = raw
 		.split(/[\s,]+/)
 		.map((t) => t.trim().toLowerCase())
 		.filter(Boolean);
-	if (tokens.some((t) => t === 'all' || t === 'a' || t === '*'))
-		return { chosen: [...offered], managed: [], unknown: [], skipped: false, answered: true };
+	if (tokens.some((t) => ['all', 'a', '*', 'y', 'yes'].includes(t)))
+		return { ...empty, chosen: [...offered], skipped: false, answered: true };
 	if (tokens.length === 1 && ['n', 'no', 'none', 'skip', 's', 'q'].includes(tokens[0])) {
-		return { chosen: [], managed: [], unknown: [], skipped: true, answered: true };
+		return { ...empty, skipped: true, answered: true };
 	}
 	const chosen = [];
 	const known = [];
+	const notOffered = [];
 	const unknown = [];
 	for (const t of tokens) {
 		if (/^\d+$/.test(t)) {
@@ -1391,6 +1431,10 @@ export function parseHarnessAnswer(answer, offered = harnessNames(), { managed =
 			if (!known.includes(h.name)) known.push(h.name);
 			continue;
 		}
+		if (h) {
+			if (!notOffered.includes(h.name)) notOffered.push(h.name);
+			continue;
+		}
 		unknown.push(t);
 	}
 	// Tokens were given but nothing in them resolved: not a decision, so the caller
@@ -1399,6 +1443,7 @@ export function parseHarnessAnswer(answer, offered = harnessNames(), { managed =
 	return {
 		chosen,
 		managed: known,
+		notOffered,
 		unknown,
 		skipped: chosen.length === 0,
 		answered: chosen.length > 0 || known.length > 0

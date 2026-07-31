@@ -106,8 +106,6 @@ import {
 	releaseInstanceLock
 } from '../src/lib/server/runtime.js';
 import {
-	HARNESSES,
-	MCP_JSON_CONFIG_PATH,
 	RUNNING_NOTE,
 	allowHarness,
 	configureHarness,
@@ -117,6 +115,7 @@ import {
 	harnessState,
 	isHarnessAllowed,
 	markHarnessPrompted,
+	mcpJsonHarnessNames,
 	parseHarnessAnswer,
 	promptedHarnesses,
 	readAllowList,
@@ -937,7 +936,7 @@ async function maybePromptHarnessSetup() {
 			const flag = s.configured ? ' (config already present)' : s.present ? ' (has another entry)' : '';
 			console.log(`[cellar]   ${i + 1}) ${s.label.padEnd(12)} ${s.file}${flag}`);
 		});
-		const answer = await ask(`[cellar] Which? [numbers/names, "all", or Enter for none] `, {
+		const answer = await ask(`[cellar] Which? [numbers/names, "yes"/"all", or Enter for none] `, {
 			timeoutMs: HARNESS_PROMPT_TIMEOUT_MS
 		});
 		// The already-managed names are named one line above the question, so typing
@@ -948,6 +947,14 @@ async function maybePromptHarnessSetup() {
 		for (const u of unknown) console.log(`[cellar] ignoring unrecognized choice: ${u}`);
 		for (const m of parsed.managed) {
 			console.log(`[cellar] ${getHarness(m)?.label ?? m} is already set up here and kept in place - nothing to do.`);
+		}
+		for (const n of parsed.notOffered) {
+			// A registered harness this offer does not carry - it was taken off the
+			// allow-list, so the question is settled for it. Understood, just not
+			// something this prompt will do; name the command that does.
+			console.log(
+				`[cellar] ${getHarness(n)?.label ?? n} is not on this offer (it was removed here) - \`cellar harness add ${n}\` puts it back.`
+			);
 		}
 		if (!answered) {
 			// No answer at all, or nothing in the reply resolved - not a decision, so
@@ -1002,8 +1009,7 @@ async function maybePromptHarnessSetup() {
  * a change to the allow-list.
  */
 function mcpConfigExcluded() {
-	if (writeMcpConfigOptIn) return [];
-	return HARNESSES.filter((h) => h.configPath === MCP_JSON_CONFIG_PATH).map((h) => h.name);
+	return writeMcpConfigOptIn ? [] : mcpJsonHarnessNames();
 }
 
 /**
@@ -1259,6 +1265,12 @@ async function main() {
 		CELLAR_MCP_PORT: String(mcpPort),
 		CELLAR_PROJECT_VENV: projectPython,
 		CELLAR_KERNELSPEC_DIR: kernelDir,
+		// `--no-mcp-config` is a per-LAUNCH exclusion, not a change to the allow-list,
+		// so the app cannot infer it from the workspace marker. Without it the
+		// "Connect an agent" banner claimed the every-start repair over a `.mcp.json`
+		// this instance deliberately leaves alone. Always set (never inherited), so a
+		// stale value from the surrounding environment cannot answer for this run.
+		CELLAR_NO_MCP_CONFIG: writeMcpConfigOptIn ? '0' : '1',
 		// Self-exit hook: the app watches this pid and exits if the launcher dies
 		// uncleanly (parent-watch.js), so it never lingers orphaned serving stale code.
 		CELLAR_LAUNCHER_PID: String(process.pid),

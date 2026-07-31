@@ -1,6 +1,6 @@
 import { getDefaultNotebook } from '$lib/server/notebook';
 import { workspaceRoot } from '$lib/server/fstree';
-import { harnessState, isHarnessAllowed } from '$lib/server/harness.js';
+import { harnessState, isHarnessAllowed, mcpJsonHarnessNames } from '$lib/server/harness.js';
 import { getUiState } from '$lib/server/ui-state';
 import { parseMaxKernels } from '$lib/kernelCap';
 
@@ -21,17 +21,37 @@ import { parseMaxKernels } from '$lib/kernelCap';
  * 'cellar'`, ignoring `args`) could claim "wired up" over an entry the launcher
  * would rewrite on the very next run. Best-effort: any read/parse trouble degrades
  * to false rather than throwing during SSR.
+ *
+ * `managed` is the DURABLE fact, so this instance's own opt-out is reported
+ * separately as `paused`: `--no-mcp-config` filters what THIS launch reconciles
+ * without touching the allow-list, so the harness stays managed while nothing is
+ * being checked or repaired right now - two different remedies (`cellar harness
+ * add` vs. relaunching without the flag), so they must not collapse into one
+ * boolean. Which harness the flag covers is derived from the registry
+ * (`mcpJsonHarnessNames`), exactly as the launcher derives it, never pinned here.
  */
 function detectMcpConfig() {
 	try {
 		const ws = workspaceRoot();
+		const managed = isHarnessAllowed('claude', ws);
 		return {
 			configured: harnessState('claude', ws)?.configured === true,
-			managed: isHarnessAllowed('claude', ws)
+			managed,
+			// Only meaningful for a MANAGED harness: an unmanaged one is not repaired by
+			// any launch, so its remedy is `cellar harness add`, not dropping the flag.
+			paused: managed && mcpConfigDisabled() && mcpJsonHarnessNames().includes('claude')
 		};
 	} catch {
-		return { configured: false, managed: false };
+		return { configured: false, managed: false, paused: false };
 	}
+}
+
+/** Was this instance launched with `--no-mcp-config`? (set by `bin/cellar.js`) */
+function mcpConfigDisabled() {
+	const v = String(process.env.CELLAR_NO_MCP_CONFIG ?? '')
+		.trim()
+		.toLowerCase();
+	return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
 /** Load the canonical notebook (cells + outputs) for the workspace. */
@@ -59,7 +79,8 @@ export function load() {
 			// Zero-config: does a project `.mcp.json` register `cellar` here, and is
 			// Cellar keeping it that way? Separate facts - see `detectMcpConfig`.
 			projectConfigured: claude.configured,
-			projectManaged: claude.managed
+			projectManaged: claude.managed,
+			projectRepairPaused: claude.paused
 		}
 	};
 }

@@ -16,7 +16,20 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs';
+import {
+	chmodSync,
+	lstatSync,
+	mkdtempSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	symlinkSync,
+	writeFileSync,
+	rmSync,
+	existsSync,
+	statSync
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -24,6 +37,8 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import {
 	HARNESSES,
+	MCP_JSON_CONFIG_PATH,
+	mcpJsonHarnessNames,
 	allowHarness,
 	configureHarness,
 	defaultAllowedHarnesses,
@@ -585,6 +600,31 @@ describe('writing the user\'s file', () => {
 		configureHarness('codex', ws);
 		expect(readFileSync(codexFile()).includes(Buffer.from('\r'))).toBe(false);
 	});
+
+	it('writes THROUGH a symlinked config instead of replacing the link', () => {
+		// An agent config is a plausible dotfile-manager symlink into a managed repo,
+		// and rename installs a new inode over whatever it lands on - so staging beside
+		// the LINK would silently detach that setup. The link must survive and the real
+		// file must be the one that received the merge.
+		const store = mkdtempSync(join(tmpdir(), 'cellar-dotfiles-'));
+		try {
+			const real = join(store, 'mcp.json');
+			writeFileSync(real, JSON.stringify({ mcpServers: { serena: { command: 'uvx' } } }, null, 2) + '\n');
+			symlinkSync(real, claudeFile());
+
+			expect(configureHarness('claude', ws).status).toBe('wrote');
+			expect(lstatSync(claudeFile()).isSymbolicLink()).toBe(true);
+			expect(realpathSync(claudeFile())).toBe(realpathSync(real));
+
+			const cfg = JSON.parse(read(real));
+			expect(cfg.mcpServers.cellar).toEqual({ command: 'cellar', args: ['mcp'] });
+			expect(cfg.mcpServers.serena).toEqual({ command: 'uvx' });
+			// Nothing was staged (or left) beside the link.
+			expect(readdirSync(ws)).toEqual(['.mcp.json']);
+		} finally {
+			rmSync(store, { recursive: true, force: true });
+		}
+	});
 });
 
 describe('harnessState', () => {
@@ -997,14 +1037,49 @@ describe('parseHarnessAnswer', () => {
 		expect(parseHarnessAnswer('9, zzz').answered).toBe(false);
 	});
 
-	it('classifies all THREE token classes apart', () => {
+	it('takes a plain YES as everything offered', () => {
+		// The offer is usually a single harness, so the question reads as a yes/no and
+		// `y` is the most reflexive positive reply. Landing it in `unknown` meant the
+		// user said yes, nothing was wired up, and the question came back next launch.
+		for (const a of ['y', 'yes', 'Y', 'YES']) {
+			expect(parseHarnessAnswer(a, ['codex'])).toMatchObject({
+				chosen: ['codex'],
+				answered: true,
+				skipped: false
+			});
+		}
+		expect(parseHarnessAnswer('yes', ['claude', 'codex']).chosen).toEqual(['claude', 'codex']);
+	});
+
+	it('classifies all FOUR token classes apart', () => {
 		// The prompt names the already-managed harnesses one line above the question,
 		// so typing one is the natural reply: it is understood and needs no write,
-		// which is neither an addition nor an unrecognized token.
-		const r = parseHarnessAnswer('codex claude opencode', ['codex'], { managed: ['claude'] });
+		// which is neither an addition nor an unrecognized token. A registered harness
+		// this offer does not carry is understood too - it just is not something this
+		// prompt will do. Only a name that is no harness at all is unrecognized.
+		const r = parseHarnessAnswer('codex claude cursor opencode', ['codex'], { managed: ['claude'] });
 		expect(r.chosen).toEqual(['codex']);
 		expect(r.managed).toEqual(['claude']);
-		expect(r.unknown).toEqual(['opencode']);
+		expect(r.notOffered).toEqual([]);
+		expect(r.unknown).toEqual(['cursor', 'opencode']);
+
+		// The reachable shape: `harness remove claude` leaves it registered, off the
+		// allow-list, and settled - so a later prompt offers only codex.
+		const removed = parseHarnessAnswer('claude', ['codex'], { managed: [] });
+		expect(removed).toMatchObject({ chosen: [], managed: [], notOffered: ['claude'], unknown: [] });
+	});
+
+	it('does not let a NOT-OFFERED name close the question that WAS asked', () => {
+		// Unlike an already-managed name (whose state the reply merely confirms), this
+		// one asks for something the prompt declined to offer and says nothing about
+		// what it did offer - so the open question stays open and is asked again.
+		expect(parseHarnessAnswer('claude', ['codex']).answered).toBe(false);
+		// …but a reply that also picks something on the offer is still an answer.
+		expect(parseHarnessAnswer('claude codex', ['codex'])).toMatchObject({
+			chosen: ['codex'],
+			notOffered: ['claude'],
+			answered: true
+		});
 	});
 
 	it('counts an ALREADY-MANAGED reply as a real answer with nothing to write', () => {
@@ -1015,13 +1090,22 @@ describe('parseHarnessAnswer', () => {
 		expect(r).toMatchObject({ chosen: [], managed: ['claude'], unknown: [], answered: true, skipped: true });
 	});
 
-	it('still calls a name unrecognized when it is not a harness at all', () => {
-		expect(parseHarnessAnswer('claude', ['codex'])).toMatchObject({ managed: [], unknown: ['claude'] });
+	it('calls a name unrecognized ONLY when it is not a harness at all', () => {
 		expect(parseHarnessAnswer('opencode', ['codex'], { managed: ['claude'] })).toMatchObject({
 			managed: [],
+			notOffered: [],
 			unknown: ['opencode'],
 			answered: false
 		});
+		// Every REGISTERED name resolves somewhere other than `unknown`, whatever this
+		// offer happens to carry - that is the whole point of the extra buckets.
+		for (const name of harnessNames()) {
+			for (const offered of [[], [name], harnessNames()]) {
+				for (const managed of [[], [name]]) {
+					expect(parseHarnessAnswer(name, offered, { managed }).unknown).toEqual([]);
+				}
+			}
+		}
 	});
 });
 
@@ -1064,8 +1148,23 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 		// second one and turn the allow-list back into a one-off write.
 		expect(mainBody).toMatch(/reconcileHarnesses\(WORKSPACE, \{ exclude: mcpConfigExcluded\(\) \}\)/);
 		expect(mainBody).not.toMatch(/configureHarness\('claude'/);
-		// The exclusion is derived from the FILE the flag names, not a pinned name.
-		expect(src).toMatch(/h\.configPath === MCP_JSON_CONFIG_PATH/);
+		// The exclusion is derived from the FILE the flag names, not a pinned name -
+		// through the registry's own `mcpJsonHarnessNames`, so the launcher and the
+		// page load (whose banner claims the every-start repair) cannot disagree about
+		// which harness the flag covers.
+		expect(src).toMatch(/mcpJsonHarnessNames\(\)/);
+		expect(src).not.toMatch(/writeMcpConfigOptIn[\s\S]{0,80}'claude'/);
+		expect(mcpJsonHarnessNames()).toEqual(
+			HARNESSES.filter((h) => h.configPath === MCP_JSON_CONFIG_PATH).map((h) => h.name)
+		);
+	});
+
+	it('tells the app when THIS launch opted out of the .mcp.json write', () => {
+		// `--no-mcp-config` is a per-launch exclusion, not a change to the allow-list,
+		// so the app cannot infer it from the workspace marker - and without it the
+		// sidebar banner claimed the every-start repair over a file this instance
+		// deliberately leaves alone. Always set, never inherited from the environment.
+		expect(src).toMatch(/CELLAR_NO_MCP_CONFIG: writeMcpConfigOptIn \? '0' : '1'/);
 	});
 
 	it('catches per harness at EVERY configureHarness call site', () => {

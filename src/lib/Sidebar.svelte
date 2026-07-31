@@ -47,6 +47,8 @@
 		projectConfigured?: boolean;
 		/** Claude Code is on the allow-list, so every start repairs that entry. */
 		projectManaged?: boolean;
+		/** …but THIS instance was launched with `--no-mcp-config`, so it repairs nothing. */
+		projectRepairPaused?: boolean;
 	}
 	/** A tab-impacting file-system change reported up to the shell. */
 	interface FsChange {
@@ -1089,14 +1091,21 @@
 			     The self-heal is a SEPARATE fact and only claimed when it is true:
 			     `cellar harness remove claude` leaves the entry in place but takes the
 			     harness off the allow-list, so the entry keeps working while nothing
-			     checks it any more. Promising a repair that will not happen is the
+			     checks it any more - and `cellar --no-mcp-config` pauses the repair for
+			     THIS instance while the harness stays managed. Different causes, different
+			     remedies. Promising a repair that will not happen is the
 			     assert-more-than-was-verified defect, so each case says only its own. -->
 			{#if mcp?.projectConfigured}
 				<div class="flex items-start gap-1.5 rounded-lg border border-success/30 bg-success/10 p-2" data-testid="mcp-zeroconfig">
 					<svg class="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
 					<p class="text-[11px] leading-relaxed text-base-content/70">
 						<span class="font-semibold text-base-content/80">Claude Code is wired up here.</span>
-						{#if mcp?.projectManaged}
+						{#if mcp?.projectRepairPaused}
+							A <code class="font-mono text-[10px] text-primary">.mcp.json</code> here registers
+							<code class="font-mono text-[10px]">cellar</code>, so Claude Code opened in this repo auto-connects.
+							This instance was started with <code class="font-mono text-[10px]">--no-mcp-config</code>, so it is
+							not checking or repairing that entry - restart without the flag to have it kept in place.
+						{:else if mcp?.projectManaged}
 							Cellar keeps a <code class="font-mono text-[10px] text-primary">.mcp.json</code> here - checked and
 							repaired on every start - so Claude Code opened in this repo auto-connects.
 						{:else}
