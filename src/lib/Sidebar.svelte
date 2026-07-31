@@ -43,7 +43,10 @@
 	/** MCP connection info the shell load resolves. */
 	interface McpInfo {
 		url?: string | null;
+		/** A project `.mcp.json` registers `cellar` right now. */
 		projectConfigured?: boolean;
+		/** Claude Code is on the allow-list, so every start repairs that entry. */
+		projectManaged?: boolean;
 	}
 	/** A tab-impacting file-system change reported up to the shell. */
 	interface FsChange {
@@ -1081,15 +1084,28 @@
 	</div>
 	{#if open.agent}
 		<div class="px-3 pb-3" data-testid="agent-body">
-			<!-- Lead: zero-config. `cellar` wrote a project .mcp.json, so an agent
-			     opened in this repo auto-connects with no setup. -->
+			<!-- Lead: zero-config. A project .mcp.json registers `cellar`, so an agent
+			     opened in this repo auto-connects with no setup.
+			     The self-heal is a SEPARATE fact and only claimed when it is true:
+			     `cellar harness remove claude` leaves the entry in place but takes the
+			     harness off the allow-list, so the entry keeps working while nothing
+			     checks it any more. Promising a repair that will not happen is the
+			     assert-more-than-was-verified defect, so each case says only its own. -->
 			{#if mcp?.projectConfigured}
 				<div class="flex items-start gap-1.5 rounded-lg border border-success/30 bg-success/10 p-2" data-testid="mcp-zeroconfig">
 					<svg class="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
 					<p class="text-[11px] leading-relaxed text-base-content/70">
 						<span class="font-semibold text-base-content/80">Claude Code is wired up here.</span>
-						Cellar keeps a <code class="font-mono text-[10px] text-primary">.mcp.json</code> here - checked and
-						repaired on every start - so Claude Code opened in this repo auto-connects.
+						{#if mcp?.projectManaged}
+							Cellar keeps a <code class="font-mono text-[10px] text-primary">.mcp.json</code> here - checked and
+							repaired on every start - so Claude Code opened in this repo auto-connects.
+						{:else}
+							A <code class="font-mono text-[10px] text-primary">.mcp.json</code> here registers
+							<code class="font-mono text-[10px]">cellar</code>, so Claude Code opened in this repo auto-connects.
+							Cellar is not maintaining that entry - run
+							<code class="font-mono text-[10px] text-primary">cellar harness add claude</code> to have it checked
+							and repaired on every start.
+						{/if}
 					</p>
 				</div>
 			{:else}

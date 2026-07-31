@@ -186,7 +186,7 @@ claude mcp add cellar -- cellar mcp
 
 (or just run `cellar` and let the auto-written `.mcp.json` do it). On connect, the agent gets a house-style doctrine that frames the work as building *one coherent notebook*, plus a rich tool set: read the notebook map and live kernel state, add/edit/move cells, run them, and clear their outputs (`add_and_run` is the preferred write-and-execute flow; `clear_outputs` sheds a stale figure or a huge traceback without deleting the cell). Because the MCP session is independent of the kernel connection, restarting the kernel never drops the agent's session or your document.
 
-**A harness that doesn't read `.mcp.json` gets set up too.** Codex reads a project `.codex/config.toml` and ignores `.mcp.json` entirely, so the first `cellar` run in a folder asks which other harnesses you use. Any time after that:
+**A harness that doesn't read `.mcp.json` gets set up too.** Codex reads a project `.codex/config.toml` and ignores `.mcp.json` entirely, so the first `cellar` run in a folder asks which other harnesses you use (and asks once more if a later Cellar learns to set up one it couldn't before). Any time after that:
 
 ```sh
 cellar harness add codex      # or: claude, or all

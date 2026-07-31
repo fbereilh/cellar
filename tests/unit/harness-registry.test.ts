@@ -38,6 +38,7 @@ import {
 	isHarnessAllowed,
 	markHarnessPrompted,
 	parseHarnessAnswer,
+	promptedHarnesses,
 	readAllowList,
 	readHarnessSetup,
 	reconcileHarnesses,
@@ -625,15 +626,36 @@ describe('the allow-list', () => {
 		expect(disallowHarness('claude', ws)).toEqual({ ok: true, changed: false });
 	});
 
+	it('separates CONFIGURED from MANAGED, which the sidebar banner turns on', () => {
+		// `harness remove` deliberately leaves the entry in place, so the config can be
+		// correct while nothing checks it any more. The "Connect an agent" panel reads
+		// exactly these two predicates (`+page.server.js`), and may only promise the
+		// every-start repair on the second - asserting a self-heal that will not happen
+		// is the defect this split exists to prevent.
+		configureHarness('claude', ws);
+		expect(harnessState('claude', ws)?.configured).toBe(true);
+		expect(isHarnessAllowed('claude', ws)).toBe(true);
+
+		disallowHarness('claude', ws);
+		expect(harnessState('claude', ws)?.configured).toBe(true);
+		expect(isHarnessAllowed('claude', ws)).toBe(false);
+	});
+
 	it('keeps the list in registry order and drops names it does not know', () => {
 		writeAllowList(ws, ['codex', 'opencode', 'claude', 'codex']);
 		expect(readAllowList(ws)).toEqual(['claude', 'codex']);
 	});
 
-	it('preserves promptedAt across an unrelated allow-list write', () => {
-		markHarnessPrompted(ws, 1234);
+	it('preserves the question bookkeeping across an unrelated allow-list write', () => {
+		markHarnessPrompted(ws, { at: 1234 });
 		allowHarness('codex', ws);
-		expect(readHarnessSetup(ws)).toMatchObject({ promptedAt: 1234, allowed: ['claude', 'codex'] });
+		// Both halves must survive: dropping `promptedFor` would re-open a settled
+		// question, and dropping `promptedAt` would re-ask the whole thing.
+		expect(readHarnessSetup(ws)).toMatchObject({
+			promptedAt: 1234,
+			promptedFor: harnessNames(),
+			allowed: ['claude', 'codex']
+		});
 		expect(harnessSetupDone(ws)).toBe(true);
 	});
 
@@ -847,6 +869,59 @@ describe('the first-run question can only ADD', () => {
 		// Unfiltered, it is askable again.
 		expect(shouldPromptHarnessSetup(ws, { interactive: true })).toMatchObject({ prompt: true, record: true });
 	});
+
+	/**
+	 * The question is settled per HARNESS, which is what keeps a frozen allow-list
+	 * from also freezing discovery: the defaults SEED a workspace and are then
+	 * authoritative (an allow-list may only grow by an explicit act), so a harness
+	 * a later release adds would otherwise be invisible to every workspace that has
+	 * already been asked.
+	 */
+	describe('per-harness coverage', () => {
+		it('does not re-ask about a harness the question already showed', () => {
+			markHarnessPrompted(ws);
+			expect(promptedHarnesses(ws)).toEqual(harnessNames());
+			expect(shouldPromptHarnessSetup(ws, { interactive: true })).toMatchObject({
+				prompt: false,
+				reason: 'already-asked'
+			});
+		});
+
+		it('DOES ask about a harness it never showed', () => {
+			// A marker written when only claude existed: codex arrived later, so it has
+			// never been offered here and is still an open question.
+			markHarnessPrompted(ws, { covered: ['claude'] });
+			expect(promptedHarnesses(ws)).toEqual(['claude']);
+			const d = shouldPromptHarnessSetup(ws, { interactive: true });
+			expect(d).toMatchObject({ prompt: true, reason: 'ask', record: true });
+			expect(d.offered).toEqual(['codex']);
+			// Answering settles it, and the earlier coverage is not lost.
+			markHarnessPrompted(ws);
+			expect(promptedHarnesses(ws)).toEqual(harnessNames());
+			expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(false);
+		});
+
+		it('reads a marker with no promptedFor as having covered everything', () => {
+			// Absent means "everything registered when it was written" - an upgrade must
+			// not re-ask about harnesses the user has already been shown.
+			mkdirSync(join(ws, '.cellar'), { recursive: true });
+			writeFileSync(harnessMarkerPath(ws), JSON.stringify({ version: 2, promptedAt: 7, allowed: ['claude'] }));
+			expect(promptedHarnesses(ws)).toEqual(harnessNames());
+			expect(harnessSetupDone(ws)).toBe(true);
+			expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(false);
+		});
+
+		it('separates "already asked" from "nothing left to offer"', () => {
+			// Managing every harness settles the question without it ever being asked -
+			// a different fact, and the launcher's own copy turns on it.
+			allowHarness('codex', ws);
+			expect(promptedHarnesses(ws)).toEqual([]);
+			expect(shouldPromptHarnessSetup(ws, { interactive: true })).toMatchObject({
+				prompt: false,
+				reason: 'nothing-to-offer'
+			});
+		});
+	});
 });
 
 describe('parseHarnessAnswer', () => {
@@ -952,6 +1027,19 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 		expect(loop).toBeGreaterThan(-1);
 		expect(marker).toBeGreaterThan(loop);
 		expect(prompt.slice(loop, marker)).toMatch(/\}\s*catch\s*\(/);
+	});
+
+	it('records the allow-list BEFORE writing the config it chose', () => {
+		// Same rule as the `harness add` verb, and it matters more here: the marker
+		// below closes the question, so a write that throws after the allow-list would
+		// lose the user's explicit "wire up Codex" for good - the every-start reconcile
+		// cannot repair what was never recorded.
+		const loop = src.slice(
+			src.indexOf('for (const name of chosen)'),
+			src.indexOf('if (wrote) console.log', src.indexOf('for (const name of chosen)'))
+		);
+		expect(loop.indexOf('allowHarness(name, WORKSPACE)')).toBeGreaterThan(-1);
+		expect(loop.indexOf('allowHarness(name, WORKSPACE)')).toBeLessThan(loop.indexOf('configureHarness(name, WORKSPACE)'));
 	});
 
 	it('never REMOVES from the allow-list anywhere in the prompt', () => {
@@ -1139,6 +1227,25 @@ describe('`cellar harness` CLI verb', () => {
 		// And it SAYS it refused, in the status word - not only inside the explanation.
 		expect(r.stdout + r.stderr).toMatch(/skipped:/);
 		expect(read(claudeFile())).toBe('not json');
+	});
+
+	it('still MANAGES a harness whose config write failed, so a later start repairs it', () => {
+		// The allow-list is the standing instruction and the write is only its first
+		// reconcile, so the instruction must be recorded FIRST. Ordered the other way
+		// a filesystem failure (here: `.codex` is a regular file, so mkdir throws
+		// EEXIST) drops the user's explicit "manage this" on the floor - nothing
+		// recorded, so no later start repairs it either.
+		writeFileSync(join(ws, '.codex'), 'in the way');
+		const r = run(['harness', 'add', 'codex']);
+		expect(r.status).toBe(1);
+		expect(r.stdout + r.stderr).toMatch(/skipped/);
+		expect(readAllowList(ws)).toEqual(['claude', 'codex']);
+
+		// Clear the obstruction: the next start's reconcile now writes what the
+		// failed `add` could not, with nothing more asked of the user.
+		rmSync(join(ws, '.codex'));
+		expect(reconcileHarnesses(ws).find((x) => x.name === 'codex')?.status).toBe('wrote');
+		expect(read(codexFile())).toContain('[mcp_servers.cellar]');
 	});
 
 	it('adds a harness, is idempotent on a second run, and says nothing was duplicated', () => {

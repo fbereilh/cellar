@@ -103,6 +103,9 @@ import { randomBytes } from 'node:crypto';
  * @property {number} [version]
  * @property {number} [promptedAt]
  * @property {string[]} [allowed]     the allow-list (v2)
+ * @property {string[]} [promptedFor] harnesses the question has covered; absent
+ *                                    on an older marker, meaning "everything
+ *                                    registered when it was written"
  * @property {string[]} [configured]  v1 only; read for migration, never written
  */
 
@@ -940,9 +943,20 @@ export function configureHarness(name, workspace) {
  * used (gitignored, port-independent, beside `checkpoints.json` and the UI
  * store). Deliberately not a global file: which agent you point at a project is
  * a property of that project, and a fresh clone should get the defaults rather
- * than inherit another machine's answer. The GLOBAL default lives in the
- * registry instead, as `defaultAllowed` — code, not state, so it needs no
- * precedence rules and cannot drift out of sync with the harness list.
+ * than inherit another machine's answer.
+ *
+ * DEFAULTS SEED, THEY DO NOT OVERRIDE. `defaultAllowed` is the allow-list a
+ * workspace starts from while nothing has been written; the first write (an
+ * `allowHarness`, or closing the first-run question) freezes today's defaults
+ * into an explicit list, and from then on that list is AUTHORITATIVE — including
+ * against a harness a later release marks `defaultAllowed`. That is deliberate,
+ * and it is the whole meaning of an allow-list: it may only grow by an explicit
+ * act, so upgrading Cellar must never silently begin writing a NEW config file
+ * into a project the user already answered for. The cost is discoverability, and
+ * `promptedFor` on the marker is what pays it: the question is recorded per
+ * HARNESS, so one registered later is still presented once (see
+ * `promptedHarnesses`) rather than being invisible to every workspace that has
+ * already been asked.
  */
 
 /** Harnesses on the allow-list before anyone records anything. */
@@ -1006,18 +1020,26 @@ export function readAllowList(workspace) {
 }
 
 /**
- * Persist the allow-list. `promptedAt` is preserved across writes unless a new
- * one is passed, so adding a harness later never re-opens the first-run question.
+ * Persist the allow-list. The question's bookkeeping (`promptedAt` and which
+ * harnesses it covered) is preserved across writes unless new values are passed,
+ * so adding a harness later never re-opens the first-run question — nor loses the
+ * record of which harnesses it already covered.
  *
  * @param {string} workspace
  * @param {string[]} names
- * @param {{ promptedAt?: number }} [opts]
+ * @param {{ promptedAt?: number, promptedFor?: string[] }} [opts]
  */
-export function writeAllowList(workspace, names, { promptedAt } = {}) {
+export function writeAllowList(workspace, names, { promptedAt, promptedFor } = {}) {
 	const prev = readHarnessSetup(workspace);
 	const kept = typeof promptedAt === 'number' ? promptedAt : prev?.promptedAt;
+	const keptFor = Array.isArray(promptedFor)
+		? promptedFor
+		: Array.isArray(prev?.promptedFor)
+			? prev.promptedFor
+			: null;
 	const data = { version: 2, allowed: normalizeNames(names) };
 	if (typeof kept === 'number') data.promptedAt = kept;
+	if (keptFor) data.promptedFor = normalizeNames(keptFor);
 	writeFileAtomic(harnessMarkerPath(workspace), JSON.stringify(data, null, 2) + '\n');
 	return data;
 }
@@ -1179,15 +1201,59 @@ function stripTomlConfig(file) {
 
 // ---- First-run prompt ------------------------------------------------------
 
-/** Has the first-run harness question already been asked in this workspace? */
-export function harnessSetupDone(workspace) {
+/**
+ * Which harnesses the first-run question has already covered here — the record
+ * that keeps a frozen allow-list from also freezing DISCOVERY (see the allow-list
+ * header). Empty when the question has never been asked.
+ *
+ * A marker carrying `promptedAt` but no `promptedFor` predates this field: the
+ * question then covered every harness registered at the time, and since we cannot
+ * know which those were, it reads as covering today's registry. That direction is
+ * the deliberate one — upgrading must not re-ask about harnesses the user has
+ * already been shown — and its cost is stated rather than papered over: such a
+ * marker also silences the question for a harness registered after it was written,
+ * permanently, since nothing later gives it a `promptedFor`. The gap is bounded to
+ * markers predating this field (every one written since records what it covered).
+ *
+ * @param {string} workspace
+ * @returns {string[]}
+ */
+export function promptedHarnesses(workspace) {
 	const m = readHarnessSetup(workspace);
-	return typeof m?.promptedAt === 'number';
+	if (typeof m?.promptedAt !== 'number') return [];
+	return Array.isArray(m.promptedFor) ? normalizeNames(m.promptedFor) : harnessNames();
 }
 
-/** Record that the question was asked, leaving the allow-list itself untouched. */
-export function markHarnessPrompted(workspace, at = Date.now()) {
-	return writeAllowList(workspace, readAllowList(workspace), { promptedAt: at });
+/**
+ * Has the first-run question been settled for these harnesses (default: every
+ * registered one)? A harness the question never covered is still an open one.
+ *
+ * @param {string} workspace
+ * @param {string[]} [names]
+ */
+export function harnessSetupDone(workspace, names = harnessNames()) {
+	const covered = new Set(promptedHarnesses(workspace));
+	const want = normalizeNames(names);
+	return want.every((n) => covered.has(n));
+}
+
+/**
+ * Record that the question was asked, leaving the allow-list itself untouched.
+ *
+ * `covered` is which harnesses the question settled — every registered one by
+ * default, which is exactly what `shouldPromptHarnessSetup`'s `record` flag
+ * guarantees the caller saw (it is false for any filtered offer). Recording it
+ * per harness is what lets a harness added in a later release be asked about
+ * once, instead of inheriting this answer forever.
+ *
+ * @param {string} workspace
+ * @param {{ at?: number, covered?: string[] }} [opts]
+ */
+export function markHarnessPrompted(workspace, { at = Date.now(), covered = harnessNames() } = {}) {
+	return writeAllowList(workspace, readAllowList(workspace), {
+		promptedAt: at,
+		promptedFor: normalizeNames([...promptedHarnesses(workspace), ...covered])
+	});
 }
 
 /**
@@ -1201,11 +1267,17 @@ export function markHarnessPrompted(workspace, at = Date.now()) {
  * what makes a bare Enter safe: the answer can only ADD, so skipping leaves every
  * existing arrangement exactly as it was.
  *
+ * It is asked ONCE PER HARNESS, not once per workspace: an answer settles the
+ * harnesses it was shown (`promptedHarnesses`), so a harness registered by a
+ * later release is still presented once here rather than inheriting an answer
+ * given before it existed. That is what keeps the frozen allow-list (see the
+ * section header) from also freezing discovery.
+ *
  * `exclude` drops harnesses from the offer (the launcher passes the `.mcp.json`
  * harness when `--no-mcp-config` opts out of writing that file). An excluded
- * harness that is not yet allowed also makes `record` false: recording "asked"
- * over a partial view would suppress the question forever for a harness this
- * launch never showed.
+ * harness that is still an open question also makes `record` false: recording
+ * "asked" over a partial view would suppress the question forever for a harness
+ * this launch never showed.
  *
  * @param {string} workspace
  * @param {{ interactive?: boolean, exclude?: string[] }} [opts]
@@ -1216,13 +1288,19 @@ export function markHarnessPrompted(workspace, at = Date.now()) {
 export function shouldPromptHarnessSetup(workspace, { interactive = true, exclude = [] } = {}) {
 	const skip = new Set(normalizeNames(exclude));
 	const allowed = new Set(readAllowList(workspace));
-	const offered = harnessNames().filter((n) => !skip.has(n) && !allowed.has(n));
+	const covered = new Set(promptedHarnesses(workspace));
+	// Still open: neither already managed (nothing to ask) nor already asked about.
+	const open = harnessNames().filter((n) => !allowed.has(n) && !covered.has(n));
+	const offered = open.filter((n) => !skip.has(n));
 	// Recording "asked" is only honest over the FULL set of harnesses this
 	// workspace could be offered; a flag-filtered view must not close the question.
-	const record = !harnessNames().some((n) => skip.has(n) && !allowed.has(n));
+	const record = !open.some((n) => skip.has(n));
 	const states = () => offered.map((n) => /** @type {HarnessStateInfo} */ (harnessState(n, workspace)));
-	if (harnessSetupDone(workspace)) {
-		return { prompt: false, reason: 'already-asked', offered, record: false, states: [] };
+	if (open.length === 0) {
+		// Everything is settled - either because it is managed, or because the
+		// question already covered it. Only the latter is "already asked".
+		const reason = harnessSetupDone(workspace) ? 'already-asked' : 'nothing-to-offer';
+		return { prompt: false, reason, offered, record: false, states: [] };
 	}
 	if (offered.length === 0) {
 		return { prompt: false, reason: 'nothing-to-offer', offered, record: false, states: [] };

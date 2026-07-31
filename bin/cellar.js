@@ -118,6 +118,7 @@ import {
 	isHarnessAllowed,
 	markHarnessPrompted,
 	parseHarnessAnswer,
+	promptedHarnesses,
 	readAllowList,
 	reconcileHarnesses,
 	shouldPromptHarnessSetup,
@@ -791,14 +792,20 @@ function harnessCommand(args) {
 			// same one-line shape as every other outcome instead of exiting on an
 			// unhandled exception: `add all` then continues past one bad harness, and
 			// the exit code still says something failed.
+			//
+			// The allow-list goes FIRST: it is the standing instruction, and the write
+			// is only its first reconcile. Ordered the other way, a filesystem failure
+			// loses the user's explicit "manage this harness" entirely - nothing
+			// recorded, so no later start repairs it either.
 			try {
+				const managedNow = allowHarness(name, workspace).changed;
 				const r = configureHarness(name, workspace);
 				// A REFUSAL is not success: without this, `cellar harness add codex`
 				// printed "skipped (… could not be read …)" and exited 0, so a script
 				// (or `add all`) reported success having configured nothing.
 				if (!r.ok || r.status === 'skipped') ok = false;
 				wrote = printHarnessResult(r) || wrote;
-				if (r.ok && allowHarness(name, workspace).changed) {
+				if (r.ok && managedNow) {
 					console.log(`[cellar]   (Cellar will keep ${r.label} wired up here - checked on every start)`);
 				}
 			} catch (err) {
@@ -912,7 +919,14 @@ async function maybePromptHarnessSetup() {
 		const managed = readAllowList(WORKSPACE)
 			.map((n) => getHarness(n)?.label)
 			.filter(Boolean);
-		console.log('[cellar] First run here. Cellar points your AI coding agent at its MCP tools.');
+		// The question is settled per HARNESS, so this can also be a LATER launch
+		// asking about one Cellar has since learned to configure. Say which it is
+		// rather than greeting a long-standing workspace as a first run.
+		console.log(
+			promptedHarnesses(WORKSPACE).length
+				? '[cellar] Cellar can now point more AI coding agents at its MCP tools.'
+				: '[cellar] First run here. Cellar points your AI coding agent at its MCP tools.'
+		);
 		if (managed.length) {
 			// Say what is ALREADY handled before asking, so the question reads as what
 			// it is - purely additive - and Enter is visibly safe.
@@ -944,9 +958,15 @@ async function maybePromptHarnessSetup() {
 			// `.codex/`) must not throw past the bookkeeping below, which would discard
 			// both a successful sibling write and the answer itself - so the question
 			// would come back on every later interactive launch.
+			//
+			// And the allow-list is recorded BEFORE the config is written, because the
+			// write is only its first reconcile and it is the half that can fail. The
+			// other order lost the user's explicit "wire up Codex" for good: nothing
+			// recorded, yet the marker below still closed the question, so no later
+			// start could repair it.
 			try {
-				wrote = printHarnessResult(configureHarness(name, WORKSPACE)) || wrote;
 				allowHarness(name, WORKSPACE);
+				wrote = printHarnessResult(configureHarness(name, WORKSPACE)) || wrote;
 			} catch (err) {
 				const h = getHarness(name);
 				const where = h ? ` → ${join(WORKSPACE, h.configPath)}` : '';
