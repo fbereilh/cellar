@@ -543,6 +543,17 @@ describe('writing the user\'s file', () => {
 		expect(statSync(claudeFile()).mode & 0o777).toBe(0o600);
 	});
 
+	it('tightens the temp BEFORE writing the secret-bearing bytes into it', () => {
+		// The temp lives in the TARGET's own directory, so writing first leaves a
+		// complete copy of the merged config - another server's `env` block, API token
+		// included - readable at the default mode for as long as the write takes. The
+		// window is not observable from here, so the ORDER is what is pinned.
+		const mod = readFileSync(join(REPO, 'src', 'lib', 'server', 'harness.js'), 'utf8');
+		const body = mod.slice(mod.indexOf('function writeFileAtomic'), mod.indexOf('function readConfigText'));
+		expect(body.indexOf('fchmodSync(fd, mode)')).toBeGreaterThan(-1);
+		expect(body.indexOf('fchmodSync(fd, mode)')).toBeLessThan(body.indexOf('writeFileSync(fd, text)'));
+	});
+
 	it('writes a NEW file at the ordinary default, not something exotic', () => {
 		configureHarness('claude', ws);
 		// Whatever the umask yields; the point is that nothing here narrows or widens
@@ -911,6 +922,34 @@ describe('the first-run question can only ADD', () => {
 			expect(shouldPromptHarnessSetup(ws, { interactive: true }).prompt).toBe(false);
 		});
 
+		it('does not offer back a harness the user explicitly REMOVED', () => {
+			// `harness remove claude` before the first interactive launch leaves an empty
+			// allow-list and no `promptedAt`, so without recording the removal the next
+			// start offered to add back exactly what was just taken away.
+			disallowHarness('claude', ws);
+			expect(promptedHarnesses(ws)).toEqual(['claude']);
+			const d = shouldPromptHarnessSetup(ws, { interactive: true });
+			expect(d.offered).toEqual(['codex']);
+			expect(d.prompt).toBe(true);
+			// …and it is recorded per harness, never by stamping `promptedAt`, which
+			// would close the question for codex too.
+			expect(readHarnessSetup(ws)?.promptedAt).toBeUndefined();
+			expect(harnessSetupDone(ws)).toBe(false);
+		});
+
+		it('leaves a removal recorded even when the list was already without it', () => {
+			// A removal run twice, or one predating this record, is the same explicit
+			// answer - so the second call still settles the question rather than leaving
+			// it open forever.
+			writeAllowList(ws, []);
+			expect(disallowHarness('claude', ws)).toEqual({ ok: true, changed: false });
+			expect(promptedHarnesses(ws)).toEqual(['claude']);
+			// Now genuinely nothing left to do, and no further write.
+			const before = read(harnessMarkerPath(ws));
+			expect(disallowHarness('claude', ws)).toEqual({ ok: true, changed: false });
+			expect(read(harnessMarkerPath(ws))).toBe(before);
+		});
+
 		it('separates "already asked" from "nothing left to offer"', () => {
 			// Managing every harness settles the question without it ever being asked -
 			// a different fact, and the launcher's own copy turns on it.
@@ -956,6 +995,33 @@ describe('parseHarnessAnswer', () => {
 		expect(parseHarnessAnswer('codex opencode').answered).toBe(true);
 		expect(parseHarnessAnswer('opencode').answered).toBe(false);
 		expect(parseHarnessAnswer('9, zzz').answered).toBe(false);
+	});
+
+	it('classifies all THREE token classes apart', () => {
+		// The prompt names the already-managed harnesses one line above the question,
+		// so typing one is the natural reply: it is understood and needs no write,
+		// which is neither an addition nor an unrecognized token.
+		const r = parseHarnessAnswer('codex claude opencode', ['codex'], { managed: ['claude'] });
+		expect(r.chosen).toEqual(['codex']);
+		expect(r.managed).toEqual(['claude']);
+		expect(r.unknown).toEqual(['opencode']);
+	});
+
+	it('counts an ALREADY-MANAGED reply as a real answer with nothing to write', () => {
+		// It must settle the question rather than reading as "nothing recognized" and
+		// coming back on every later launch - and it must not be reported as a choice,
+		// or the caller would write a config it was never asked to touch.
+		const r = parseHarnessAnswer('claude', ['codex'], { managed: ['claude'] });
+		expect(r).toMatchObject({ chosen: [], managed: ['claude'], unknown: [], answered: true, skipped: true });
+	});
+
+	it('still calls a name unrecognized when it is not a harness at all', () => {
+		expect(parseHarnessAnswer('claude', ['codex'])).toMatchObject({ managed: [], unknown: ['claude'] });
+		expect(parseHarnessAnswer('opencode', ['codex'], { managed: ['claude'] })).toMatchObject({
+			managed: [],
+			unknown: ['opencode'],
+			answered: false
+		});
 	});
 });
 

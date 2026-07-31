@@ -103,9 +103,10 @@ import { randomBytes } from 'node:crypto';
  * @property {number} [version]
  * @property {number} [promptedAt]
  * @property {string[]} [allowed]     the allow-list (v2)
- * @property {string[]} [promptedFor] harnesses the question has covered; absent
- *                                    on an older marker, meaning "everything
- *                                    registered when it was written"
+ * @property {string[]} [promptedFor] harnesses the question is settled for - it was
+ *                                    offered, or explicitly removed; absent on an
+ *                                    older marker, meaning "everything registered
+ *                                    when it was written"
  * @property {string[]} [configured]  v1 only; read for migration, never written
  */
 
@@ -209,10 +210,15 @@ function writeFileAtomic(file, text) {
 	try {
 		const fd = openSync(tmp, 'wx');
 		try {
-			writeFileSync(fd, text);
-			// After the write, and via the fd: `openSync`'s mode argument is masked by
-			// the umask, so a 0600 target would still come back 0600 & ~umask.
+			// BEFORE the write, and via the fd. The obvious reading - set the mode on the
+			// finished file - is the wrong one: the temp lives in the TARGET's directory,
+			// so writing first leaves a complete copy of the merged config (another
+			// server's `env` block, API token included) readable at the default
+			// `0o666 & ~umask` for as long as the write takes. It goes through the fd
+			// because `openSync`'s mode argument is masked by the umask, so a 0600 target
+			// would still come back 0600 & ~umask.
 			if (mode !== undefined) fchmodSync(fd, mode);
+			writeFileSync(fd, text);
 			fsyncSync(fd);
 		} finally {
 			closeSync(fd);
@@ -1076,18 +1082,28 @@ export function allowHarness(name, workspace) {
  * makes the removal survive: `readAllowList` falls back to the defaults only when
  * no list was ever written.
  *
+ * It also records that harness in `promptedFor`, because an explicit removal IS an
+ * answer about it: otherwise a `harness remove claude` run before the first
+ * interactive launch left claude looking like an open question, and the next start
+ * offered to add back exactly what the user had just taken away. Recorded per
+ * harness rather than by stamping `promptedAt`, which would close the question for
+ * every OTHER harness too - including one never shown.
+ *
  * @returns {{ ok: boolean, changed: boolean }}
  */
 export function disallowHarness(name, workspace) {
 	const h = getHarness(name);
 	if (!h) return { ok: false, changed: false };
 	const allowed = readAllowList(workspace);
-	if (!allowed.includes(h.name)) return { ok: true, changed: false };
+	const changed = allowed.includes(h.name);
+	const covered = promptedHarnesses(workspace);
+	if (!changed && covered.includes(h.name)) return { ok: true, changed: false };
 	writeAllowList(
 		workspace,
-		allowed.filter((n) => n !== h.name)
+		allowed.filter((n) => n !== h.name),
+		{ promptedFor: [...covered, h.name] }
 	);
-	return { ok: true, changed: true };
+	return { ok: true, changed };
 }
 
 /**
@@ -1206,6 +1222,10 @@ function stripTomlConfig(file) {
  * that keeps a frozen allow-list from also freezing DISCOVERY (see the allow-list
  * header). Empty when the question has never been asked.
  *
+ * Written by an answer to the question and by an explicit `harness remove` (which
+ * settles that one harness - see `disallowHarness`), so an entry here does not
+ * imply the prompt itself ever ran.
+ *
  * A marker carrying `promptedAt` but no `promptedFor` predates this field: the
  * question then covered every harness registered at the time, and since we cannot
  * know which those were, it reads as covering today's registry. That direction is
@@ -1220,8 +1240,9 @@ function stripTomlConfig(file) {
  */
 export function promptedHarnesses(workspace) {
 	const m = readHarnessSetup(workspace);
-	if (typeof m?.promptedAt !== 'number') return [];
-	return Array.isArray(m.promptedFor) ? normalizeNames(m.promptedFor) : harnessNames();
+	if (!m) return [];
+	if (Array.isArray(m.promptedFor)) return normalizeNames(m.promptedFor);
+	return typeof m.promptedAt === 'number' ? harnessNames() : [];
 }
 
 /**
@@ -1313,34 +1334,43 @@ export function shouldPromptHarnessSetup(workspace, { interactive = true, exclud
  * Resolve a free-text answer to the first-run prompt against the offered
  * harnesses. Accepts 1-based numbers, names (case-insensitive), `all`, and any
  * comma/space mix; an empty answer or a no/none/skip token means "no others".
- * Unknown tokens come back in `unknown` so the caller can say so instead of
- * silently dropping them.
+ * Three token classes, kept apart because they are three different facts: a name
+ * on the offer is a `chosen` addition; a registered harness that is already
+ * MANAGED here comes back in `managed` (a valid, understood answer with nothing
+ * to do — the prompt names those one line above the question, so typing one is
+ * the natural reply, and reporting it as unrecognized asserts something false);
+ * anything else is genuinely `unknown` so the caller can say so instead of
+ * silently dropping it.
  *
  * `answered` separates a real reply from one nothing in which resolved: an
  * all-typo answer is NOT a decision, so the caller records nothing and asks
- * again. An empty answer and an explicit no/skip ARE decisions — and harmless
- * ones here, since the only thing an answer can do is add.
+ * again. An empty answer, an explicit no/skip, and a reply naming only
+ * already-managed harnesses ARE decisions — and harmless ones here, since the
+ * only thing an answer can do is add.
  *
  * @param {string | null | undefined} answer
  * @param {string[]} [offered]
- * @returns {{ chosen: string[], unknown: string[], skipped: boolean, answered: boolean }}
+ * @param {{ managed?: string[] }} [opts] harnesses already on the allow-list here
+ * @returns {{ chosen: string[], managed: string[], unknown: string[], skipped: boolean, answered: boolean }}
  */
-export function parseHarnessAnswer(answer, offered = harnessNames()) {
+export function parseHarnessAnswer(answer, offered = harnessNames(), { managed = [] } = {}) {
+	const already = new Set(normalizeNames(managed));
 	if (answer === null || answer === undefined) {
-		return { chosen: [], unknown: [], skipped: true, answered: false };
+		return { chosen: [], managed: [], unknown: [], skipped: true, answered: false };
 	}
 	const raw = String(answer).trim();
-	if (raw === '') return { chosen: [], unknown: [], skipped: true, answered: true };
+	if (raw === '') return { chosen: [], managed: [], unknown: [], skipped: true, answered: true };
 	const tokens = raw
 		.split(/[\s,]+/)
 		.map((t) => t.trim().toLowerCase())
 		.filter(Boolean);
 	if (tokens.some((t) => t === 'all' || t === 'a' || t === '*'))
-		return { chosen: [...offered], unknown: [], skipped: false, answered: true };
+		return { chosen: [...offered], managed: [], unknown: [], skipped: false, answered: true };
 	if (tokens.length === 1 && ['n', 'no', 'none', 'skip', 's', 'q'].includes(tokens[0])) {
-		return { chosen: [], unknown: [], skipped: true, answered: true };
+		return { chosen: [], managed: [], unknown: [], skipped: true, answered: true };
 	}
 	const chosen = [];
+	const known = [];
 	const unknown = [];
 	for (const t of tokens) {
 		if (/^\d+$/.test(t)) {
@@ -1357,9 +1387,20 @@ export function parseHarnessAnswer(answer, offered = harnessNames()) {
 			if (!chosen.includes(h.name)) chosen.push(h.name);
 			continue;
 		}
+		if (h && already.has(h.name)) {
+			if (!known.includes(h.name)) known.push(h.name);
+			continue;
+		}
 		unknown.push(t);
 	}
-	// Tokens were given but none resolved: not a decision, so the caller records
-	// nothing and asks again next time.
-	return { chosen, unknown, skipped: chosen.length === 0, answered: chosen.length > 0 };
+	// Tokens were given but nothing in them resolved: not a decision, so the caller
+	// records nothing and asks again next time. A name that is already managed DID
+	// resolve - the answer is understood, there is simply nothing to write for it.
+	return {
+		chosen,
+		managed: known,
+		unknown,
+		skipped: chosen.length === 0,
+		answered: chosen.length > 0 || known.length > 0
+	};
 }

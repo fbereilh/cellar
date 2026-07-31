@@ -940,8 +940,15 @@ async function maybePromptHarnessSetup() {
 		const answer = await ask(`[cellar] Which? [numbers/names, "all", or Enter for none] `, {
 			timeoutMs: HARNESS_PROMPT_TIMEOUT_MS
 		});
-		const { chosen, unknown, answered } = parseHarnessAnswer(answer, offered);
+		// The already-managed names are named one line above the question, so typing
+		// one is a natural reply - it is understood and needs no write, which is a
+		// different fact from a token nothing recognized.
+		const parsed = parseHarnessAnswer(answer, offered, { managed: readAllowList(WORKSPACE) });
+		const { chosen, unknown, answered } = parsed;
 		for (const u of unknown) console.log(`[cellar] ignoring unrecognized choice: ${u}`);
+		for (const m of parsed.managed) {
+			console.log(`[cellar] ${getHarness(m)?.label ?? m} is already set up here and kept in place - nothing to do.`);
+		}
 		if (!answered) {
 			// No answer at all, or nothing in the reply resolved - not a decision, so
 			// the question stands and the next interactive launch asks again.
