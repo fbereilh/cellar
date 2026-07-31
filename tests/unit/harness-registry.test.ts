@@ -823,6 +823,28 @@ describe('stripHarness (the opt-in destructive half of remove)', () => {
 		expect(read(codexFile())).toBe(head);
 	});
 
+	it('takes nested tables with it, so a later add is not refused forever', () => {
+		const head = '# mine\nmodel = "gpt-5"\n\n[mcp_servers.serena]\ncommand = "uvx"\n';
+		writeCodex(head);
+		configureHarness('codex', ws);
+		// A sub-table under ours - the shape the writer explicitly promises to keep
+		// through an UPDATE, so a strip has to be able to remove it.
+		writeCodex(read(codexFile()) + '\n[mcp_servers.cellar.env]\nFOO = "bar"\n\n[tools]\nweb_search = true\n');
+
+		expect(stripHarness('codex', ws).status).toBe('updated');
+		const after = read(codexFile());
+		expect(after).not.toContain('mcp_servers.cellar');
+		expect(after).not.toContain('FOO');
+		// Everything around it is untouched, before and after.
+		expect(after).toContain(head);
+		expect(after).toContain('[tools]\nweb_search = true\n');
+
+		// The regression that matters: an orphaned `[mcp_servers.cellar.env]` reads as
+		// `other-form`, which refuses every later write.
+		expect(configureHarness('codex', ws).status).toBe('wrote');
+		expect(harnessState('codex', ws)?.configured).toBe(true);
+	});
+
 	it('is a no-op when there is nothing of ours to remove', () => {
 		expect(stripHarness('claude', ws).status).toBe('already');
 		writeCodex('model = "gpt-5"\n');
@@ -1234,10 +1256,19 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 	 */
 	describe('gives up rather than stranding the launch', () => {
 		const body = src.slice(src.indexOf('function ask('), src.indexOf('function printHelp('));
-		const makeAsk = (stdin: any) => {
+		const makeAsk = (stdin: any, deps: { shutdown?: any; onInterface?: (rl: any) => void } = {}) => {
 			const stdout: any = new PassThrough();
 			stdout.resume();
-			return new Function('createInterface', 'process', `${body}; return ask;`)(createInterface, { stdin, stdout });
+			const create = (opts: any) => {
+				const rl = createInterface(opts);
+				deps.onInterface?.(rl);
+				return rl;
+			};
+			return new Function('createInterface', 'process', 'shutdown', `${body}; return ask;`)(
+				create,
+				{ stdin, stdout },
+				deps.shutdown ?? (() => {})
+			);
 		};
 		const fakeTty = () => {
 			const s: any = new PassThrough();
@@ -1280,6 +1311,32 @@ describe('first-run prompt placement + wait (bin/cellar.js)', () => {
 			expect(parseHarnessAnswer(answer, ['codex']).answered).toBe(false);
 			expect(existsSync(harnessMarkerPath(ws))).toBe(false);
 			// And - the invariant - a timeout takes nothing away.
+			expect(isHarnessAllowed('claude', ws)).toBe(true);
+		});
+
+		/**
+		 * Ctrl-C is the one answer that STOPS the launch, and it needs the interface's
+		 * own listener: readline runs in terminal mode here, which swallows ^C before
+		 * the process-level SIGINT handler ever sees it - so the keystroke used to read
+		 * as "no answer" and the launcher went on to boot the sidecar and open a
+		 * browser. It hands off to the launcher's existing shutdown, and records nothing.
+		 */
+		it('Ctrl-C hands off to the launcher shutdown instead of reading as no answer', async () => {
+			const calls: any[][] = [];
+			let iface: any;
+			const stdin = fakeTty();
+			const p = makeAsk(stdin, {
+				shutdown: (...args: any[]) => calls.push(args),
+				onInterface: (rl) => (iface = rl)
+			})('q? ', { timeoutMs: NEVER });
+			iface.emit('SIGINT');
+			expect(calls).toHaveLength(1);
+			expect(calls[0][0]).toBe(0);
+			expect(String(calls[0][1])).toMatch(/SIGINT/);
+			// Nothing is recorded - in the real launcher `shutdown` exits, so no code
+			// past the prompt runs at all.
+			expect(parseHarnessAnswer(await p, ['codex']).answered).toBe(false);
+			expect(existsSync(harnessMarkerPath(ws))).toBe(false);
 			expect(isHarnessAllowed('claude', ws)).toBe(true);
 		});
 	});

@@ -1227,14 +1227,24 @@ function stripTomlConfig(file) {
 		};
 	}
 	if (state.kind !== 'table') return { status: 'already', message: 'no cellar table to remove' };
-	// The table's span runs from its header to the NEXT table header, so it already
-	// carries the blank line that separated it - removing the span leaves exactly
-	// one blank between the neighbours it sat between, and every other byte alone.
+	// A strip must leave NOTHING of ours behind, so it takes the cellar table AND
+	// every table NESTED under it (`[mcp_servers.cellar.env]`, array-of-tables forms
+	// included). Removing only the parent left an orphan sub-table - a `cellar`
+	// server with an `env` and no `command` - which `codexState` then reads as
+	// `other-form`, so every later `configureHarness('codex')` refused for good.
+	// Nested tables need not be adjacent to the parent, so the spans are collected
+	// and spliced from the bottom up rather than merged into one range.
+	const spans = state.doc.tables
+		.filter((t) => t.key.length >= TOML_TABLE.length && samePath(t.key.slice(0, TOML_TABLE.length), TOML_TABLE))
+		.sort((a, b) => b.start - a.start);
+	// Each span runs from its header to the NEXT table header, so it already carries
+	// the blank line that separated it - removing it leaves exactly one blank between
+	// the neighbours it sat between, and every other byte alone.
 	const lines = [...state.doc.lines];
-	lines.splice(state.table.start, state.table.end - state.table.start);
+	for (const span of spans) lines.splice(span.start, span.end - span.start);
 	let next = lines.join('\n');
 	// Removing the LAST table leaves the separator blank line dangling at EOF.
-	if (state.table.end >= state.doc.lines.length) next = next.replace(/(\r?\n)[ \t\r\n]*$/, '$1');
+	if (spans.some((s) => s.end >= state.doc.lines.length)) next = next.replace(/(\r?\n)[ \t\r\n]*$/, '$1');
 	if (next === existing) return { status: 'already', message: 'no cellar table to remove' };
 	writeFileAtomic(file, next);
 	return { status: 'updated', message: `removed [${TOML_TABLE.join('.')}]` };

@@ -538,6 +538,13 @@ function inForegroundJob() {
  * then fails with EIO, libuv retries it, and the process spins at 100% CPU without
  * ever reaching the JS handler or the timer. So that case is kept out of here
  * entirely, by not calling this at all off the foreground (see `inForegroundJob`).
+ *
+ * Ctrl-C is its own outcome and needs its own listener: readline runs in terminal
+ * mode here (stdout is a TTY), which puts stdin in raw mode and SWALLOWS ^C, so the
+ * module-level `process.on('SIGINT')` never fires. Without the listener below the
+ * keystroke read as "no answer" and the launch carried on booting the sidecar and
+ * opening a browser - the opposite of what it means. It hands off to the launcher's
+ * one shutdown path; nothing is recorded, since that path never returns.
  */
 function ask(question, { timeoutMs } = {}) {
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -563,6 +570,14 @@ function ask(question, { timeoutMs } = {}) {
 		// makes this the one listener that has to exist.
 		rl.on('close', () => finish(null));
 		rl.on('error', () => finish(null));
+		// The user's explicit interrupt, not a prompt failure: close the interface
+		// (restoring the terminal out of raw mode) and hand off to the launcher's
+		// EXISTING teardown, which exits - so nothing after the prompt runs.
+		rl.on('SIGINT', () => {
+			if (timer) clearTimeout(timer);
+			rl.close();
+			shutdown(0, 'SIGINT (Ctrl-C at the harness prompt)');
+		});
 		rl.question(question, (ans) => finish(ans));
 	});
 }
@@ -892,6 +907,14 @@ const HARNESS_PROMPT_TIMEOUT_MS = 30_000;
  * skipped outright, recording nothing, and launches normally. Where that cannot be
  * determined (no `tpgid`; Windows, which has no such stop) the prompt still runs
  * behind its timeout, exactly as before.
+ *
+ * Ctrl-C is the ONE answer that stops the launch, and it does not weaken the rule
+ * above: "can never abort" is about the prompt failing on its own (Enter, "no", a
+ * typo, a closed stdin, the timeout, a background job - all of which record nothing
+ * and launch normally), whereas ^C is the user's explicit interrupt. `ask` has to
+ * catch it itself, because readline's terminal mode swallows it before the
+ * process-level SIGINT handler; it records nothing either, and hands off to the
+ * launcher's one shutdown path.
  *
  * It also offers only what the launch is actually willing to write: under
  * `--no-mcp-config` the `.mcp.json` harness is not on the list at all, and because
