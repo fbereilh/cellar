@@ -1,6 +1,7 @@
 /**
- * DOM highlight overlay for Search P4 - the browser half for the three *rendered*
- * surfaces (static-code stand-in, rendered markdown, cell outputs). CodeMirror
+ * DOM highlight overlay for Search P4 - the browser half for the *rendered*
+ * surfaces (static-code stand-in, rendered markdown, cell outputs, and the
+ * toolbar's `cell #xxxxxxxx` id chip for a `field: 'id'` match). CodeMirror
  * editors are handled separately (`cmSearchHighlight.ts`), because CM maintains its
  * own decorations across re-renders.
  *

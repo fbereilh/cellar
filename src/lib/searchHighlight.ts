@@ -9,16 +9,20 @@
  * or source hidden by report view (`$lib/hideInput`) - is still COUNTED by the
  * engine but has nothing to paint; `Cell.svelte` clears those surfaces rather
  * than leaving stale ranges, and a search never expands a cell to reach them.
+ * The one exception is a `field: 'id'` match (a query addressing a cell by its
+ * handle - `matchesCellId` in `$lib/search`): it paints on the toolbar's
+ * `cell #xxxxxxxx` chip, which is exactly what a collapsed cell keeps on screen,
+ * so that match stays visible where the content ones cannot.
  *
  * This module holds only the PURE, DOM-free pieces so they can be unit-tested:
  *  - {@link buildCellHighlights} maps the flat match list onto a per-cell payload
  *    (does this cell have matches, and - if the active match lands here - which
  *    surface + which occurrence within it).
  *  - {@link findOccurrences} is the single substring/whole-word scanner the DOM
- *    highlighters (static code, rendered markdown, output) reuse to locate the
- *    query inside a mounted surface's text. It mirrors the engine's own matching
- *    ({@link module:$lib/search} `scanField`) so the highlighted spans line up with
- *    the count the find-bar shows.
+ *    highlighters (static code, rendered markdown, output, the toolbar id chip)
+ *    reuse to locate the query inside a mounted surface's text. It mirrors the
+ *    engine's own matching ({@link module:$lib/search} `scanField`) so the
+ *    highlighted spans line up with the count the find-bar shows.
  *
  * The DOM/editor mechanics live in `domHighlight.ts` (CSS Custom Highlight API) and
  * `cmSearchHighlight.ts` (a CodeMirror decoration plugin); this file never touches
@@ -121,7 +125,10 @@ function findOccurrencesRegex(hay: string, needle: string, opts: OccurrenceOpts)
 	return out;
 }
 
-/** The three highlightable surfaces of a cell (matches {@link Match} `field`). */
+/**
+ * The highlightable surfaces of a cell (matches {@link Match} `field`): source,
+ * rendered markdown, an output, or the toolbar's cell-id chip (`id`).
+ */
 export type HighlightField = Match['field'];
 
 /**
@@ -173,8 +180,9 @@ export interface SearchHighlightState {
  * match does zero highlight work), and exactly one cell carries a non-null `active`.
  *
  * `ordinal` counts the active match's position among prior matches in the SAME cell
- * with the SAME field-group (`source` / `markdown` / `output`) - the ordinal a
- * document-order DOM re-scan of that surface will land on. Pure; input order (the
+ * with the SAME field-group (`source` / `markdown` / `output` / `id`) - the ordinal a
+ * document-order DOM re-scan of that surface will land on (an `id` match is one per
+ * cell by construction, so its ordinal is always 0). Pure; input order (the
  * engine's document order) is preserved.
  *
  * That correspondence is what `buildTextRanges` (`domHighlight.ts`) upholds from the

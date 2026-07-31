@@ -362,7 +362,14 @@ spec files at a time. Install its browser once with `npx playwright install chro
   match in a cell whose code is hidden by report view. Those matches are still counted,
   so the `i / N` total stays honest, but there is nothing on screen to paint. Expand the
   cell (or show its code) and the highlight appears; a search never expands a cell for
-  you, so it can't discard a collapse you set by hand.
+  you, so it can't discard a collapse you set by hand. The exception is a match on a
+  cell's **id**: it is painted on the toolbar's `cell #xxxxxxxx` chip, which a collapsed
+  cell still shows, so that one stays visible.
+- **Searching a cell id found nothing** - an id has to be matched by at least its first
+  8 characters (exactly what the toolbar chip shows, and what an agent quotes as a
+  handle); a shorter prefix is treated as ordinary text. Ids are matched from the
+  start, never in the middle, and a **regex** query searches cell content only - turn
+  the `.*` chip off to find a cell by its id.
 - **A run aborted with "The kernel connection is being refreshed; re-run the cell"** -
   the kernel websocket died (its reconnect retries were spent) while the process
   itself is still alive. Cellar rebuilds the socket in the background without

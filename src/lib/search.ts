@@ -54,7 +54,10 @@ export interface SearchOpts {
 	wholeWord: boolean;
 	/** Treat the query as a JS regular expression (P5). An invalid pattern matches nothing. */
 	regex: boolean;
-	/** `'source'` = code/markdown source only (P1). `'all'` = + outputs + rendered markdown (P2). */
+	/**
+	 * `'source'` = code/markdown source only (P1). `'all'` = + outputs + rendered
+	 * markdown (P2) + cell ids ({@link matchesCellId}).
+	 */
 	scope: 'source' | 'all';
 }
 
