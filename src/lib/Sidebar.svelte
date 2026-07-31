@@ -601,9 +601,11 @@
 	// instead of re-folding it.
 	let query = $state('');
 	let debouncedQuery = $state('');
-	// Scope toggle: 'all' (source + rendered markdown + outputs, the default per
-	// the captain's Q1 decision - Search covers what the user sees) or 'source'
-	// (raw code/markdown source only, P1 behavior).
+	// Scope toggle: 'all' (source + rendered markdown + outputs + cell ids, the
+	// default per the captain's Q1 decision - Search covers what the user sees, and
+	// a cell's id is the handle its toolbar shows) or 'source' (raw code/markdown
+	// source only, P1 behavior - so it matches no ids, exactly as it matches no
+	// outputs).
 	let searchScope = $state<'all' | 'source'>('all');
 	const searchOpts = $derived({ ...DEFAULT_SEARCH_OPTS, scope: searchScope });
 	// A private cache used until the active notebook registers its own (or when a
@@ -1389,7 +1391,7 @@
 				<button
 					class="btn btn-xs {searchScope === 'all' ? 'btn-primary' : 'btn-ghost'}"
 					aria-pressed={searchScope === 'all'}
-					title="Search source, rendered markdown, and outputs"
+					title="Search source, rendered markdown, outputs, and cell ids"
 					onclick={() => (searchScope = 'all')}
 					data-testid="search-scope-all">All</button
 				>
