@@ -145,11 +145,13 @@ than another machine's answer.
 
 The first run in a folder offers to *also* wire up the harnesses that are not on
 the list yet (and asks once more if a later Cellar learns to configure one it
-could not before). The question can only **add**: a bare Enter, an explicit no, a
+could not before). Answer with the listed numbers or names, or `yes` / `all` for
+everything offered. The question can only **add**: a bare Enter, an explicit no, a
 typo, a closed stdin, a 30s timeout, and a backgrounded `cellar &` are all
 harmless and turn nothing off - they only differ in whether the question is asked
 again next time. It is never asked without a TTY (`--yes`, `$CI`, or piped
-stdin).
+stdin). `Ctrl-C` at the question is the one keystroke that does more: it stops the
+launch, recording nothing, so the next run asks again.
 
 ### `cellar harness`
 
@@ -166,9 +168,12 @@ cellar harness remove codex --strip  # …and also remove that entry
 `list` prints two independent facts per harness - *managed here* and *configured
 right now* - because the gap between them is exactly what the next start repairs.
 `remove` and `--strip` are separated on purpose: "stop managing this" and "delete
-this from my config" are different requests, and only one edits your file. A
-harness Cellar refuses to configure (see below) makes `add` exit non-zero, so a
-scripted `add all` cannot report success having configured nothing.
+this from my config" are different requests, and only one edits your file
+(`--strip` takes the whole `cellar` entry, including anything nested under it such
+as a `[mcp_servers.cellar.env]` table). Removing a harness also settles the
+first-run question for it, so it is not offered back - `cellar harness add` is how
+it returns. A harness Cellar refuses to configure (see below) makes `add` exit
+non-zero, so a scripted `add all` cannot report success having configured nothing.
 
 ### What a write does, and does not, touch
 
