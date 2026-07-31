@@ -28,6 +28,7 @@
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
+	import { matchesCellId } from '$lib/search';
 	import { setSurfaceRanges, clearSurface, buildTextRanges, allocSurfaceKey } from '$lib/domHighlight';
 	import { isMac } from '$lib/shortcuts.svelte';
 	import { pointerIntent } from '$lib/cellSelection';
@@ -1306,6 +1307,7 @@
 			clearSurface(K_SRC);
 			clearSurface(K_MD);
 			clearSurface(K_OUT);
+			clearSurface(K_ID);
 			view?.destroy();
 		};
 	});
@@ -1318,6 +1320,8 @@
 	const K_SRC = `${hlBase}:src`;
 	const K_MD = `${hlBase}:md`;
 	const K_OUT = `${hlBase}:out`;
+	// The id chip in the toolbar - the one surface that survives a full collapse.
+	const K_ID = `${hlBase}:id`;
 	// The last (query, opts, active) target we scrolled to, so we scroll on a genuine
 	// navigation but NOT on incidental re-runs (a streaming output, a source edit).
 	let lastScrollKey = '';
@@ -1375,6 +1379,25 @@
 		const outEl = !cellCollapsed && !isMarkdown && outputs.length ? outputInner : null;
 		const outActive = active && active.field === 'output' ? active.ordinal : null;
 		paintDomSurface(K_OUT, outEl, q, opts, outActive, shouldScroll);
+
+		// --- cell id chip ---
+		// Deliberately NOT gated on `!cellCollapsed`: the toolbar (and its
+		// `cell #xxxxxxxx` chip) is exactly what a collapsed cell keeps on screen, so
+		// an id match on a collapsed cell is the one match a user can still SEE - the
+		// opposite of the source/output surfaces, which have nothing to paint there.
+		//
+		// Gated on the ENGINE's own predicate rather than on the query merely
+		// occurring in the chip: the chip reads `cell #<id-prefix>`, so an 8-char
+		// query like `cell #ab` occurs in every cell's chip while matching no id at
+		// all - painting it would show a highlight the count knows nothing about.
+		const idEl = matchesCellId(cell.id, q, opts)
+			? (cardEl?.querySelector('[data-testid="cell-id-copy"]') as Element | null)
+			: null;
+		const idActive = active && active.field === 'id' ? active.ordinal : null;
+		// The chip shows only the first `shortId.length` characters of the id, so a
+		// longer query (a fuller UUID) is painted over the part of it that is visible;
+		// the rest of the match simply has no glyphs to underline.
+		paintDomSurface(K_ID, idEl, q.slice(0, shortId.length), opts, idActive, shouldScroll);
 	}
 
 	/** Paint one DOM surface (or clear it when `el`/`query` is absent). */
@@ -1440,6 +1463,9 @@
 		void cellCollapsed;
 		void outputs;
 		void liveSource;
+		// The id chip swaps its text to "copied!" for ~1s, detaching the nodes an id
+		// match's Range points at; tracked so it repaints when the id comes back.
+		void copied;
 		if (!browser) return;
 		let cancelled = false;
 		tick().then(() => {

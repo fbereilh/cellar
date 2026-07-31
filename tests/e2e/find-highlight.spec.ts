@@ -342,3 +342,60 @@ test('with virtualization on, a windowed-out match highlights once navigated-to'
 	await expect(bottom).toBeVisible();
 	await expect.poll(() => activeEmphasisCount(page)).toBe(1);
 });
+
+/**
+ * The `data-testid` of the element each active-emphasis range sits inside - so a
+ * test can assert WHICH surface the emphasis landed on, not merely that one exists.
+ */
+function activeHighlightHosts(page: Page): Promise<string[]> {
+	return page.evaluate(() => {
+		const hi = (CSS as unknown as { highlights?: Map<string, Iterable<Range>> }).highlights?.get(
+			'cellar-search-active'
+		);
+		const out: string[] = [];
+		if (!hi) return out;
+		for (const r of hi) {
+			const n = r.startContainer;
+			const el = n.nodeType === Node.ELEMENT_NODE ? (n as Element) : n.parentElement;
+			out.push(el?.closest('[data-testid]')?.getAttribute('data-testid') ?? '');
+		}
+		return out;
+	});
+}
+
+test('a cell-id query highlights the toolbar id chip - and keeps doing so when collapsed', async ({
+	page
+}) => {
+	// A cell is findable by its id handle, and the surface that shows it - the
+	// toolbar `cell #xxxxxxxx` chip - is the ONE that survives a full collapse. So
+	// unlike a source/output match (counted but unpaintable on a collapsed cell), an
+	// id match on a collapsed cell is fully visible: the good case.
+	await open(page);
+	// A filler cell, deliberately holding no TOKEN, so collapsing it cannot disturb
+	// any other case in this file even if this one fails before restoring it.
+	const targetId = id(10);
+	const card = page.locator(`[data-cell-id="${targetId}"]`);
+	await card.scrollIntoViewIfNeeded();
+
+	await openFindBar(page);
+	await findInput(page).fill(targetId.slice(0, 8));
+	await expect(findCount(page)).toHaveText('1/1');
+
+	// Exactly one emphasis, and it is inside that cell's id chip.
+	await expect.poll(() => activeEmphasisCount(page)).toBe(1);
+	await expect.poll(() => activeHighlightHosts(page)).toEqual(['cell-id-copy']);
+	await expect(card.getByTestId('cell-id-copy')).toBeVisible();
+
+	try {
+		// Collapse the cell: input and output go, the toolbar (and the chip) stay.
+		await card.getByTestId('cell-collapse-toggle').click();
+		await expect(card.getByTestId('collapsed-preview')).toBeVisible();
+		await expect(card.getByTestId('cell-id-copy')).toBeVisible();
+		await expect.poll(() => activeHighlightHosts(page)).toEqual(['cell-id-copy']);
+	} finally {
+		// Collapse state is PERSISTED per project, so put it back for the rest of
+		// this file (which shares one workspace).
+		await card.getByTestId('cell-collapse-toggle').click();
+	}
+	await expect(card.getByTestId('collapsed-preview')).toHaveCount(0);
+});

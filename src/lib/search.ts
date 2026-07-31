@@ -19,6 +19,12 @@
  *    picks the `i` flag, `wholeWord` still enforces boundaries). Compiled once per
  *    call; an invalid pattern yields NO matches (a fail-safe, never a throw), which
  *    is what lets the find-bar show a subtle invalid state instead of crashing.
+ *  - **cell ids** (`scope: 'all'`): a query that is a PREFIX of a cell's id matches
+ *    that cell once, as `field: 'id'`. Cellar surfaces a cell's id as a handle in
+ *    its chrome (the toolbar's `cell #xxxxxxxx` chip, which survives a full
+ *    collapse), in multi-select and to agents, so finding a cell BY that handle is
+ *    a navigation the find bar should answer. See {@link matchesCellId} for the
+ *    rule (prefix, floored at {@link ID_HANDLE_MIN}) and why it is floored.
  *
  * ## The cache (the perf primitive)
  * Every keystroke used to re-`toLowerCase()` every cell's source - a fresh
@@ -55,8 +61,13 @@ export interface SearchOpts {
 /** A single match, in document order. `start`/`end` are offsets into the matched field's text. */
 export interface Match {
 	cellId: string;
-	/** Which field of the cell the match is in. `source` (raw), `markdown` (rendered), `output`. */
-	field: 'source' | 'markdown' | 'output';
+	/**
+	 * Which field of the cell the match is in. `source` (raw), `markdown`
+	 * (rendered), `output`, or `id` (the cell's id/handle - see
+	 * {@link matchesCellId}; the field text is the id itself, so a match there is
+	 * always the whole prefix at offset 0).
+	 */
+	field: 'source' | 'markdown' | 'output' | 'id';
 	/** Index into a cell's `outputs` when `field === 'output'`. */
 	outputIndex?: number;
 	/** Start offset of the match within the field text. */
@@ -96,6 +107,85 @@ const SNIPPET_CAP = 80;
  * server-only code into the browser bundle); kept in lockstep by value.
  */
 export const SEARCH_SCAN_CAP = 100_000;
+
+/**
+ * Minimum query length for a cell-id match: the same floor the agent surface's
+ * handles use (`MIN_HANDLE` in `src/lib/server/mcp/cellHandle.ts`, which a browser
+ * module may not import - `$lib/server` is server-only - so it is kept in lockstep
+ * by value, like {@link SEARCH_SCAN_CAP}).
+ *
+ * The floor is what keeps an id match a DELIBERATE act rather than a coincidence.
+ * A cell id is a UUID, so its characters are hex digits and dashes: an ordinary
+ * short query like `ca`, `de` or `abc` is a valid id prefix and would silently
+ * light up whichever cells happen to start with it, polluting the `i / N` count of
+ * a plain content search. At 8 characters - exactly what the toolbar's
+ * `cell #xxxxxxxx` chip shows, and what an agent handle is - a hit is what the
+ * user asked for. Same reasoning as the tombstone prefix scan on the MCP side.
+ */
+export const ID_HANDLE_MIN = 8;
+
+/**
+ * The id needle for a query, or `null` when this query can never match an id:
+ * regex mode (a pattern has no prefix semantics - see {@link matchesCellId}) or a
+ * query below {@link ID_HANDLE_MIN}. Case folding mirrors the rest of the engine:
+ * the default lowercases, `caseSensitive` compares as typed.
+ */
+function idNeedleFor(
+	query: string,
+	opts: { caseSensitive: boolean; regex?: boolean }
+): string | null {
+	if (opts.regex) return null;
+	if (!query || query.length < ID_HANDLE_MIN) return null;
+	return opts.caseSensitive ? query : query.toLowerCase();
+}
+
+/**
+ * Does `id` start with `needle` (already case-folded by {@link idNeedleFor})?
+ * Allocation-free: it folds ASCII case per character rather than lowercasing the
+ * id, so adding ids to the searchable set costs no per-cell string allocation on
+ * the keystroke hot path. Ids are UUIDs (ASCII hex + dashes), so ASCII folding is
+ * complete for the real domain.
+ */
+function idPrefixMatches(id: string, needle: string, caseSensitive: boolean): boolean {
+	if (needle.length > id.length) return false;
+	if (caseSensitive) return id.startsWith(needle);
+	for (let i = 0; i < needle.length; i++) {
+		const a = id.charCodeAt(i);
+		const b = needle.charCodeAt(i);
+		if (a === b) continue;
+		if (a >= 65 && a <= 90 && a + 32 === b) continue; // fold an uppercase id char
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Does `query` address the cell `cellId` by its id/handle?
+ *
+ * The rule, deliberately the same one the agent surface's `resolveCellId` uses:
+ * a **prefix** of the full id (so the 8-char handle shown in a cell's toolbar
+ * finds it, and so does the whole UUID), never a substring - an id is an address,
+ * and a mid-id hit addresses nothing. Floored at {@link ID_HANDLE_MIN}.
+ *
+ * Regex mode matches NO ids: a regular expression expresses a pattern, not a
+ * prefix, so `.*` (or any loose pattern) would tag every cell in the notebook with
+ * an invisible extra match. Content search is what regex mode is for.
+ * `wholeWord` is likewise not applied - an id is one opaque token, and requiring a
+ * boundary after the prefix would reject every prefix shorter than the whole id,
+ * i.e. exactly the handle this exists to find.
+ *
+ * Exported so the view layer (`Cell.svelte`, which paints the id chip) decides
+ * with the SAME predicate the engine counted with - a second copy could paint a
+ * highlight the count does not know about, or miss one it does.
+ */
+export function matchesCellId(
+	cellId: string,
+	query: string,
+	opts: { caseSensitive: boolean; regex?: boolean }
+): boolean {
+	const needle = idNeedleFor(query, opts);
+	return needle != null && idPrefixMatches(cellId, needle, opts.caseSensitive);
+}
 
 /** One extracted+lowercased output, tagged with its index in the cell's `outputs`. */
 interface OutputText {
@@ -505,9 +595,16 @@ function scanFieldRegex(
  * Pure: no side effects beyond populating the caller-owned `cache`. Returns `[]`
  * for an empty query, or for an invalid regex under `opts.regex` (a fail-safe -
  * never a throw). Honors `caseSensitive`, `wholeWord`, `regex`, and `scope`. Under
- * `scope: 'all'` (the default) a cell's source, its rendered markdown (markdown
- * cells), and its output text (bounded by {@link SEARCH_SCAN_CAP} per cell) are all
- * scanned, and each `Match` carries the `field` it came from.
+ * `scope: 'all'` (the default) a cell's id, its source, its rendered markdown
+ * (markdown cells), and its output text (bounded by {@link SEARCH_SCAN_CAP} per
+ * cell) are all scanned, and each `Match` carries the `field` it came from.
+ *
+ * A cell-id hit contributes exactly ONE match ({@link matchesCellId}), emitted
+ * before that cell's content matches: an id is an address, not a body of text, so
+ * it cannot occur twice, and a cell that matches by BOTH its id and its content
+ * counts as id + content matches rather than double-counting either. `scope:
+ * 'source'` narrows to raw source and so matches no ids, exactly as it matches no
+ * outputs.
  *
  * @param cells document-order cells (the authoritative model, not the DOM)
  * @param query the raw query (callers trim/​debounce as a UI concern)
@@ -536,10 +633,27 @@ export function searchNotebook(
 		needleLen = needle.length;
 	}
 	const all = opts.scope === 'all';
+	// Computed once per call, not per cell: it depends only on the query + opts.
+	// `null` means no cell id can match (regex mode, or a query below the handle
+	// floor), which is the common case for an ordinary content search.
+	const idNeedle = all ? idNeedleFor(query, opts) : null;
 
 	const matches: Match[] = [];
 	for (const cell of cells) {
 		const source = cell.source || '';
+
+		// --- cell id (`scope: 'all'`) ---
+		// First, so a cell found by its handle leads with the reason it was found.
+		if (idNeedle != null && idPrefixMatches(cell.id, idNeedle, opts.caseSensitive))
+			matches.push({
+				cellId: cell.id,
+				field: 'id',
+				start: 0,
+				end: idNeedle.length,
+				line: 1,
+				snippet: `#${cell.id}`
+			});
+
 		// Only the LC path touches the cache; the source view is refreshed here so
 		// the markdown/outputs helpers below share the same up-to-date entry.
 		const entry = source || all ? entryFor(cache, cell) : null;
@@ -601,7 +715,8 @@ export function searchNotebook(
  * only ever REMOVES characters from source, so a rendered occurrence with no
  * source counterpart (e.g. `a*b*c` -> `abc`) survives via the leftover, unpaired
  * `markdown` matches. Code cells (no `markdown` field) are returned untouched, so
- * source + output counts are unaffected. Pure; preserves document order.
+ * source + output counts are unaffected - as are `id` matches, which are one per
+ * cell by construction and pair with nothing. Pure; preserves document order.
  */
 export function dedupeMatchesForDisplay(matches: readonly Match[]): Match[] {
 	let anyMarkdown = false;

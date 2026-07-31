@@ -31,6 +31,16 @@ interface TCell {
 	outputs?: CellOutput[];
 }
 
+/**
+ * A deterministic UUID-shaped id, as `notebook.ts` mints them - so the harness
+ * exercises the cell-id field too (the engine prefix-tests every cell's id for any
+ * query at or past the handle floor, `read_csv` included).
+ */
+function uuid(i: number): string {
+	const h = ((i * 2654435761) >>> 0).toString(16).padStart(8, '0');
+	return `${h}-1111-4000-8000-${String(i).padStart(12, '0')}`;
+}
+
 /** A synthetic N-cell notebook with a mix of short/long code + markdown sources. */
 function makeNotebook(n: number): TCell[] {
 	const cells: TCell[] = [];
@@ -40,7 +50,7 @@ function makeNotebook(n: number): TCell[] {
 		const body = big
 			? `# Section ${i}\n` + `some Analysis text with Pandas and numpy `.repeat(60)
 			: `import pandas as pd\ndf${i} = pd.read_csv('data_${i}.csv')\nresult = df${i}.groupby('k').sum()`;
-		cells.push({ id: `cell-${i}`, cell_type: md ? 'markdown' : 'code', source: body });
+		cells.push({ id: uuid(i), cell_type: md ? 'markdown' : 'code', source: body });
 	}
 	return cells;
 }
@@ -121,6 +131,27 @@ describe('search keystroke latency (N=300)', () => {
 		// eslint-disable-next-line no-console
 		console.log(`[search-perf N=300] worst single call=${worstPerCall.toFixed(3)}ms`);
 		expect(worstPerCall).toBeLessThan(16);
+	});
+
+	it('a cell-id query stays within one animation frame (ids are free)', () => {
+		// Finding a cell by its handle prefix-tests all 300 ids on every keystroke,
+		// allocation-free (no per-cell lowercasing), on top of the ordinary content
+		// scan - so it must cost no more than an ordinary query.
+		const cache = createSearchCache();
+		const handle = cells[200].id.slice(0, 8);
+		searchNotebook(cells, handle, DEFAULT_SEARCH_OPTS, cache); // warm
+		let best = Infinity;
+		let hits = 0;
+		for (let r = 0; r < 9; r++) {
+			const start = performance.now();
+			const m = searchNotebook(cells, handle, DEFAULT_SEARCH_OPTS, cache);
+			best = Math.min(best, performance.now() - start);
+			hits = m.filter((x) => x.field === 'id').length;
+		}
+		// eslint-disable-next-line no-console
+		console.log(`[search-perf N=300 id-query] best call=${best.toFixed(3)}ms`);
+		expect(hits).toBe(1);
+		expect(best).toBeLessThan(16);
 	});
 
 	it('scope:all with multi-MB outputs stays bounded (the per-cell cap holds)', () => {

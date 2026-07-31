@@ -15,6 +15,8 @@ import {
 	contentSignature,
 	strippedMarkdown,
 	SEARCH_SCAN_CAP,
+	ID_HANDLE_MIN,
+	matchesCellId,
 	DEFAULT_SEARCH_OPTS,
 	type SearchOpts
 } from '../../src/lib/search';
@@ -605,5 +607,125 @@ describe('searchNotebook - output cache invalidation (scope:all)', () => {
 		} finally {
 			spy.mockRestore();
 		}
+	});
+});
+
+describe('searchNotebook - cell ids (find a cell by its handle)', () => {
+	// UUID-shaped ids, as notebook.ts mints them. `A` and `B` differ from the very
+	// first character, so an 8-char prefix of one can never address the other.
+	const A = 'a1b2c3d4-1111-4000-8000-000000000001';
+	const B = 'f9e8d7c6-2222-4000-8000-000000000002';
+	const idCells: TCell[] = [
+		{ id: A, cell_type: 'code', source: 'alpha = 1' },
+		{ id: B, cell_type: 'code', source: 'beta = 2' }
+	];
+
+	it('matches a cell by its FULL id, once, and only that cell', () => {
+		const m = searchNotebook(idCells, A, allOpts());
+		expect(m).toHaveLength(1);
+		expect(m[0]).toMatchObject({ cellId: A, field: 'id', start: 0, end: A.length, line: 1 });
+		expect(m[0].snippet).toContain(A);
+	});
+
+	it('matches a PREFIX of an id - the 8-char handle the toolbar chip shows', () => {
+		const handle = A.slice(0, 8);
+		const m = searchNotebook(idCells, handle, allOpts());
+		expect(m).toHaveLength(1);
+		expect(m[0].cellId).toBe(A);
+		expect(m[0].end).toBe(handle.length);
+		// A longer prefix (into the dashed section) still addresses the same cell.
+		expect(searchNotebook(idCells, A.slice(0, 13), allOpts()).map((x) => x.cellId)).toEqual([A]);
+	});
+
+	it('ignores a query shorter than the handle floor (a hex-looking word is not an address)', () => {
+		// `a1b2c3d` is a real prefix of A but one char under ID_HANDLE_MIN: below the
+		// floor an ordinary content query (`de`, `abc`, `cafe`) would coincidentally
+		// address whichever cells happen to start with it.
+		expect(ID_HANDLE_MIN).toBe(8);
+		expect(searchNotebook(idCells, A.slice(0, ID_HANDLE_MIN - 1), allOpts())).toEqual([]);
+		expect(matchesCellId(A, A.slice(0, ID_HANDLE_MIN - 1), DEFAULT_SEARCH_OPTS)).toBe(false);
+		expect(matchesCellId(A, A.slice(0, ID_HANDLE_MIN), DEFAULT_SEARCH_OPTS)).toBe(true);
+	});
+
+	it('is a PREFIX match, never a substring of the id', () => {
+		// A slice from the middle of A, long enough to clear the floor.
+		expect(searchNotebook(idCells, A.slice(4, 16), allOpts())).toEqual([]);
+	});
+
+	it('counts an id hit ONCE alongside the cell content matches (no double count)', () => {
+		const handle = A.slice(0, 8);
+		const both: TCell[] = [
+			// The same 8-char handle also appears twice in this cell's own source.
+			{ id: A, cell_type: 'code', source: `x = '${handle}'  # ${handle}` },
+			...idCells.slice(1)
+		];
+		const m = dedupeMatchesForDisplay(searchNotebook(both, handle, allOpts()));
+		expect(m.map((x) => x.field)).toEqual(['id', 'source', 'source']);
+		expect(m.filter((x) => x.field === 'id')).toHaveLength(1);
+	});
+
+	it('emits the id match before that cell content, in document order across cells', () => {
+		// A query that is B's handle AND appears in the FIRST cell's source: the
+		// document order of the cells is preserved, and B leads with its id.
+		const handle = B.slice(0, 8);
+		const cells: TCell[] = [
+			{ id: A, cell_type: 'code', source: `note = '${handle}'` },
+			{ id: B, cell_type: 'code', source: 'beta = 2' }
+		];
+		expect(
+			searchNotebook(cells, handle, allOpts()).map((m) => `${m.cellId === A ? 'A' : 'B'}:${m.field}`)
+		).toEqual(['A:source', 'B:id']);
+	});
+
+	it('is case-insensitive by default and exact under caseSensitive', () => {
+		const handle = A.slice(0, 8);
+		expect(searchNotebook(idCells, handle.toUpperCase(), allOpts())).toHaveLength(1);
+		expect(searchNotebook(idCells, handle.toUpperCase(), allOpts({ caseSensitive: true }))).toEqual(
+			[]
+		);
+		expect(searchNotebook(idCells, handle, allOpts({ caseSensitive: true }))).toHaveLength(1);
+	});
+
+	it('matches no ids in regex mode (a pattern has no prefix semantics)', () => {
+		// `.*` would otherwise tag every cell in the notebook with an invisible match.
+		expect(
+			searchNotebook(idCells, '.*', allOpts({ regex: true })).filter((m) => m.field === 'id')
+		).toEqual([]);
+		expect(
+			searchNotebook(idCells, A.slice(0, 8), allOpts({ regex: true })).some((m) => m.field === 'id')
+		).toBe(false);
+		expect(matchesCellId(A, A, { caseSensitive: false, regex: true })).toBe(false);
+	});
+
+	it('matches no ids under scope:source (which narrows to raw source)', () => {
+		expect(searchNotebook(idCells, A, opts())).toEqual([]);
+	});
+
+	it('still matches when whole-word is on (an id is one opaque token)', () => {
+		expect(searchNotebook(idCells, A.slice(0, 8), allOpts({ wholeWord: true }))).toHaveLength(1);
+	});
+
+	it('groups an id-only match into a navigable row for the sidebar', () => {
+		const groups = groupByCell(searchNotebook(idCells, B.slice(0, 8), allOpts()), () => 'code');
+		expect(groups).toHaveLength(1);
+		expect(groups[0]).toMatchObject({ cellId: B, count: 1, field: 'id' });
+	});
+
+	it('matchesCellId agrees with the engine for every cell (one rule, two callers)', () => {
+		for (const q of [A, A.slice(0, 8), A.slice(0, 7), B.slice(0, 8), 'read_csv', 'cafe']) {
+			const engine = new Set(
+				searchNotebook(idCells, q, allOpts())
+					.filter((m) => m.field === 'id')
+					.map((m) => m.cellId)
+			);
+			for (const c of idCells)
+				expect(matchesCellId(c.id, q, DEFAULT_SEARCH_OPTS)).toBe(engine.has(c.id));
+		}
+	});
+
+	it('leaves ordinary content search untouched (a word query never addresses a cell)', () => {
+		const m = searchNotebook(idCells, 'alpha', allOpts());
+		expect(m).toHaveLength(1);
+		expect(m[0].field).toBe('source');
 	});
 });

@@ -245,3 +245,34 @@ test('case and whole-word toggles change the result set', async ({ page }) => {
 	await page.getByTestId('find-word').click();
 	await expect(findCount(page)).toHaveText('1/5');
 });
+
+test('finds a cell by its id handle - prefix + full, and mounts a windowed-out one', async ({
+	page
+}) => {
+	// A cell's id is a handle the app puts on screen (the toolbar `cell #xxxxxxxx`
+	// chip) and hands to agents, so the find bar answers it. Windowed on, against
+	// the far-down cell: an id match must reach a cell with no DOM node, exactly
+	// like a content match.
+	await open(page, /* virtualize */ true);
+	const target = id(IDX.matchBottom);
+	const bottom = page.locator(`[data-cell-id="${target}"]`);
+	await expect(bottom).toHaveCount(0); // windowed out: a spacer, not a node
+
+	await openFindBar(page);
+	// The 8-char handle: exactly what the chip shows.
+	await findInput(page).fill(target.slice(0, 8));
+	await expect(findCount(page)).toHaveText('1/1');
+	await expect(bottom).toHaveCount(1);
+	await expect(bottom).toBeVisible();
+	// The chip on the found cell carries the highlight, so the match is visible.
+	await expect(bottom.getByTestId('cell-id-copy')).toBeVisible();
+
+	// The whole UUID addresses the same single cell.
+	await findInput(page).fill(target);
+	await expect(findCount(page)).toHaveText('1/1');
+
+	// One character under the handle floor is NOT an address - a short hex-looking
+	// query must never pollute an ordinary content search.
+	await findInput(page).fill(target.slice(0, 7));
+	await expect(findCount(page)).toHaveText('0/0');
+});

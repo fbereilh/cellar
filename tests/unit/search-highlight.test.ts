@@ -121,4 +121,19 @@ describe('buildCellHighlights', () => {
 	it('returns an empty map for no matches', () => {
 		expect(buildCellHighlights([], 0).size).toBe(0);
 	});
+
+	it('carries an `id` match through as its own surface (the toolbar id chip)', () => {
+		// A cell found by its handle: the id is a fourth highlightable surface, and
+		// the one that survives a full collapse. It is one match per cell, so its
+		// ordinal is always 0 - and it must not be confused with the source ordinal
+		// of a cell that ALSO matches by content.
+		const matches = [m('a', 'id', 0), m('a', 'source', 4), m('b', 'id', 0)];
+		const map = buildCellHighlights(matches, 0);
+		expect(map.get('a')!.active).toEqual({ field: 'id', ordinal: 0 });
+		expect(buildCellHighlights(matches, 1).get('a')!.active).toEqual({
+			field: 'source',
+			ordinal: 0
+		});
+		expect(buildCellHighlights(matches, 2).get('b')!.active).toEqual({ field: 'id', ordinal: 0 });
+	});
 });
