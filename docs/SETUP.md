@@ -53,18 +53,24 @@ cellar               # boots both servers, opens your browser, workspace = cwd
 
 On this first run Cellar will, with your confirmation on a TTY:
 
-1. Create `~/.cellar/host-venv` and install `jupyter-server` into it (cached; one-time).
-2. Resolve (or create) the **project** venv for the kernel - see
+1. Ask which **other** AI coding harnesses to wire up to its MCP server (Claude
+   Code is already set up for you) - see
+   [Connecting an agent](#connecting-an-agent-mcp). The question only ever
+   *adds*: pressing Enter turns nothing off.
+2. Create `~/.cellar/host-venv` and install `jupyter-server` into it (cached; one-time).
+3. Resolve (or create) the **project** venv for the kernel - see
    [Kernel / venv resolution](#kernel--venv-resolution) below.
-3. Ensure `ipykernel` is present in the project venv, and best-effort install
+4. Ensure `ipykernel` is present in the project venv, and best-effort install
    `ipywidgets` (a soft feature dependency for Databricks-style parameter
    widgets and other interactive widgets - it never prompts, and a failure is a
    quiet no-op rather than an error).
-4. Start the Jupyter sidecar and the app, allocate free ports, and open the browser.
+5. Start the Jupyter sidecar and the app, allocate free ports, and open the browser.
 
 `Ctrl-C` shuts everything down cleanly. `cellar ../other-repo` opens a different
 folder without `cd`-ing. Pass `--yes` (or run under `$CI` / a non-TTY) to
-auto-approve the venv create/install prompts.
+auto-approve the venv create/install prompts; the harness question is *skipped*
+rather than auto-answered there, so nothing is decided for you (use
+`cellar harness add` when you want it).
 
 ### Without a global `npm link`
 
@@ -101,20 +107,91 @@ launched Jupyter there yourself.
 
 ## Connecting an agent (MCP)
 
-Running `cellar` writes (or idempotently merges) a `.mcp.json` into the workspace
-with a `cellar` stdio entry, so an agent opened in that folder auto-connects.
+Connecting an agent means registering one stdio MCP server - `cellar mcp` - in
+whatever config file that agent reads. The command is the same everywhere; only
+the file and its format differ, which is exactly why configuring one harness does
+nothing for another:
+
+| Harness | Config file | Format |
+| --- | --- | --- |
+| `claude` (Claude Code) | `<workspace>/.mcp.json` | JSON (`mcpServers`) |
+| `codex` (OpenAI Codex) | `<workspace>/.codex/config.toml` | TOML (`[mcp_servers.cellar]`) |
+
 Because the MCP port is chosen dynamically per run, agents are pointed at the
-**stdio command** `cellar mcp`, never a fixed URL - so nothing to reconfigure when
-ports change:
+**stdio command**, never a fixed URL - so nothing to reconfigure when ports
+change. The equivalent manual step for Claude Code is:
 
 ```sh
 claude mcp add cellar -- cellar mcp
 ```
 
-Pass `--no-mcp-config` to `cellar` to opt out of writing `.mcp.json`. The raw
-Streamable-HTTP endpoint (for an HTTP-capable client) is
+`cellar mcp` is a *bridge*, not a standalone server: it attaches to the Cellar
+instance running in that workspace. So a configured harness gets Cellar's tools
+only while `cellar` is running there.
+
+### Which harnesses Cellar manages
+
+Cellar keeps a per-workspace **allow-list** of harnesses it may configure, stored
+in the (gitignored) `.cellar/harness.json`. On **every** start it reconciles that
+list: each allowed harness's config is checked and repaired if the entry is
+missing, stale, or was deleted. So the wiring is a standing instruction, not a
+one-off write - delete `.mcp.json` and the next `cellar` puts it back.
+
+**Claude Code is on the list by default**, which is what makes the zero-config
+`.mcp.json` self-healing; a workspace with no marker behaves exactly as it always
+has. Scope is deliberately per-workspace, not global: which agent you point at a
+project is a property of that project, so a fresh clone gets the defaults rather
+than another machine's answer.
+
+The first run in a folder offers to *also* wire up the harnesses that are not on
+the list yet (and asks once more if a later Cellar learns to configure one it
+could not before). The question can only **add**: a bare Enter, an explicit no, a
+typo, a closed stdin, a 30s timeout, and a backgrounded `cellar &` are all
+harmless and turn nothing off - they only differ in whether the question is asked
+again next time. It is never asked without a TTY (`--yes`, `$CI`, or piped
+stdin).
+
+### `cellar harness`
+
+The explicit, any-time counterpart to that prompt (it never boots a server, and
+honors `--workspace <dir>`):
+
+```sh
+cellar harness list                  # what Cellar manages here + each config's state
+cellar harness add codex             # manage a harness and configure it now (claude | codex | all)
+cellar harness remove codex          # stop managing it; its config entry is LEFT in place
+cellar harness remove codex --strip  # …and also remove that entry
+```
+
+`list` prints two independent facts per harness - *managed here* and *configured
+right now* - because the gap between them is exactly what the next start repairs.
+`remove` and `--strip` are separated on purpose: "stop managing this" and "delete
+this from my config" are different requests, and only one edits your file. A
+harness Cellar refuses to configure (see below) makes `add` exit non-zero, so a
+scripted `add all` cannot report success having configured nothing.
+
+### What a write does, and does not, touch
+
+These files are yours - they hold your other MCP servers and, for Codex, settings
+like `model` or `approval_policy` - so every write **merges** into the existing
+file, replaces it atomically (preserving its mode, and following a symlink rather
+than replacing it with a regular file), and is idempotent: an already-correct
+entry is left alone, whatever its formatting. The merge reaches inside the
+`cellar` entry too, so keys you added beside `command`/`args` (`env`, `type`,
+`cwd`) survive. Anything Cellar cannot edit confidently - an unreadable file, a
+`cellar` server defined in another legal TOML form - is **refused** with a
+one-line explanation instead of being rewritten.
+
+Codex reads project config only for a project you have **trusted**; that trust
+lives in your global `~/.codex/config.toml` and widens Codex's sandbox, so Cellar
+deliberately does not write it - approve the folder when Codex asks.
+
+Pass `--no-mcp-config` to `cellar` to skip writing/repairing `.mcp.json` for that
+launch only; it never changes the allow-list, and the sidebar's **Connect an
+agent** panel says the repair is paused rather than claiming a self-heal that is
+not happening. The raw Streamable-HTTP endpoint (for an HTTP-capable client) is
 `http://127.0.0.1:<CELLAR_MCP_PORT>/mcp`; the live port is shown in the launcher
-banner and in the sidebar's **Connect an agent** panel.
+banner and in that same panel.
 
 ## Databricks
 
@@ -245,9 +322,10 @@ to publish, e.g. inside a container.
 | `BODY_SIZE_LIMIT` | `512K` | adapter-node's app-wide cap on a request body, which is what bounds how large a file a tab may **save** (reading is unaffected - a 15 MB HTML export still opens and previews). Cellar deliberately leaves it alone, since raising it raises how much memory any request can make the server buffer; a document that would not fit opens view-only instead. Set it (e.g. `2M`) to widen the editable range - the app reports the value actually in force to each file tab. `cellar --dev` runs Vite, which applies no body cap at all. |
 
 > **Internal, do not set by hand:** `CELLAR_WORKSPACE`, `CELLAR_KERNELSPEC_DIR`,
-> `CELLAR_PROJECT_VENV`, `CELLAR_LAUNCHER_PID`, and `CELLAR_KEYS` are set by the
-> launcher for the child processes it spawns. Setting them yourself will confuse
-> the runtime.
+> `CELLAR_PROJECT_VENV`, `CELLAR_LAUNCHER_PID`, `CELLAR_NO_MCP_CONFIG` (the
+> launcher's own `--no-mcp-config` flag, passed through so the sidebar can say the
+> `.mcp.json` repair is paused), and `CELLAR_KEYS` are set by the launcher for the
+> child processes it spawns. Setting them yourself will confuse the runtime.
 
 ### Docker-only
 
@@ -289,6 +367,13 @@ spec files at a time. Install its browser once with `npx playwright install chro
 - **Port already in use** - Cellar picks free ports by default, so this only
   happens if you pinned `CELLAR_APP_PORT` / `CELLAR_MCP_PORT` / `CELLAR_JUPYTER_PORT`.
   Unset them to let Cellar choose.
+- **An agent doesn't see Cellar's tools** - run `cellar harness list` in the
+  project: it shows whether Cellar manages that harness here and whether its
+  config registers `cellar` right now. `cellar harness add <name>` fixes both (and
+  keeps it fixed - managed harnesses are repaired on every start). If the config
+  is correct, check that `cellar` is actually **running** in that folder: `cellar
+  mcp` bridges to a live instance and does not start one. For Codex, also approve
+  the project when it asks - it ignores project config for an untrusted folder.
 - **A stale/duplicate instance in a folder** - `cellar ls` lists instances,
   `cellar cleanup` reaps orphans (`--all` stops every live one). A relaunch in a
   folder takes over its previous instance automatically.
