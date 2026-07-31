@@ -1391,7 +1391,7 @@
 				<button
 					class="btn btn-xs {searchScope === 'all' ? 'btn-primary' : 'btn-ghost'}"
 					aria-pressed={searchScope === 'all'}
-					title="Search source, rendered markdown, and outputs"
+					title="Search source, rendered markdown, outputs, and cell ids"
 					onclick={() => (searchScope = 'all')}
 					data-testid="search-scope-all">All</button
 				>
