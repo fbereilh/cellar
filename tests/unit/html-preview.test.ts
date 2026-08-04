@@ -547,10 +547,16 @@ describe('save transport limit', () => {
 	it('the file tab opens an over-transport document read-only, with an affordance', () => {
 		const src = readFileSync(join(REPO, 'src/lib/FileTab.svelte'), 'utf8');
 		expect(src).toContain("from '$lib/saveLimit'");
-		// …against the limit the SERVER reports, never a client-side guess.
-		expect(src).toMatch(
-			/saveTooLarge = !saveFitsTransport\(path, content, resolveBodyLimit\(body\.bodyLimit\)\)/
-		);
+		// …against the limit the SERVER reports, never a client-side guess. Captured
+		// once from the load GET, because every later re-decision has to be made
+		// against the same number rather than a re-fetched one.
+		expect(src).toMatch(/bodyLimit = resolveBodyLimit\(body\.bodyLimit\)/);
+		expect(src).toMatch(/saveTooLarge = !saveFitsTransport\(path, content, bodyLimit\)/);
+		// And RE-decided whenever an external sync changes the document's size:
+		// `view.dispatch` applies changes whatever `readOnly` says, so a verdict
+		// frozen into the initial editor state goes stale in both directions.
+		expect(src).toMatch(/viewOnly\.reconfigure\(viewOnlyExtensions\(/);
+		expect(src).toMatch(/const tooLarge = !saveFitsTransport\(path, next, bodyLimit\)/);
 		expect(src).toContain('EditorState.readOnly.of(true)');
 		expect(src).toContain('data-testid="file-view-only"');
 		// A read-only editor sets `contenteditable="false"` and NO tabindex, so

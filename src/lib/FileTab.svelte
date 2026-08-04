@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { EditorView, type ViewUpdate } from '@codemirror/view';
-	import { Annotation, EditorState, type Extension } from '@codemirror/state';
+	import { Annotation, Compartment, EditorState, type Extension } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
@@ -64,17 +64,47 @@
 	let dirty = $state(false);
 	let saving = $state(false);
 	let savedFlash = $state(false);
-	// The loaded document is bigger than the save PUT's request body may be, so it
-	// opens VIEW-ONLY: the editor is read-only and Save is replaced by a chip that
-	// says why. Offering an edit whose PUT the server front-end would 413 before
-	// any handler runs is the failure this retires - the read cap admits files
-	// (a 15 MB self-contained export) far past what the transport accepts, and
-	// that transport limit is app-wide and deliberately not raised. The ceiling
-	// compared against is the one the RUNNING server enforces (`body.bodyLimit`,
-	// uncapped under the Vite dev server), never a client-side guess. Decided
-	// ONCE, from the loaded content: a read-only document cannot grow past the
-	// line it was measured against, so nothing needs re-measuring per keystroke.
+	// The document is bigger than the save PUT's request body may be, so it is
+	// VIEW-ONLY: the editor is read-only and Save is replaced by a chip that says
+	// why. Offering an edit whose PUT the server front-end would 413 before any
+	// handler runs is the failure this retires - the read cap admits files (a 15 MB
+	// self-contained export) far past what the transport accepts, and that
+	// transport limit is app-wide and deliberately not raised. The ceiling compared
+	// against is the one the RUNNING server enforces (`body.bodyLimit`, uncapped
+	// under the Vite dev server), never a client-side guess.
+	//
+	// Decided at LOAD and re-decided on every EXTERNAL APPLY, never per keystroke.
+	// The keystroke half still holds for the reason it always did - a read-only
+	// document cannot be typed past the line it was measured against - but an
+	// external sync is not typing: `view.dispatch` applies changes regardless of
+	// `EditorState.readOnly`, so a file really can cross the line in either
+	// direction while open. Decided once, a file grown past it stayed editable and
+	// only failed as a 413 on save, and a file shrunk back under it kept a
+	// now-false "too large" chip for the life of the tab. Hence the compartment:
+	// the read-only extensions are reconfigured with the verdict rather than being
+	// frozen into the initial state.
 	let saveTooLarge = $state(false);
+	/** The in-force request-body ceiling, captured from the load GET. */
+	let bodyLimit = Infinity;
+	const viewOnly = new Compartment();
+
+	// View-only: only editing goes. The explicit `tabindex` is what keeps the rest
+	// true - `editable.of(false)` sets `contenteditable="false"` and adds NO
+	// tabindex, so `.cm-content` (where CodeMirror attaches its key handlers) could
+	// not take focus at all: a click landed on `.cm-scroller` and every keystroke
+	// died there, costing keyboard selection and the editor's own search panel.
+	// With it, the document is focusable, selectable and searchable, and still not
+	// editable. Cmd/Ctrl+S is not this element's business either way - the shell
+	// owns it for every file tab, in every view (see `requestSave`).
+	function viewOnlyExtensions(tooLarge: boolean): Extension {
+		return tooLarge
+			? [
+					EditorState.readOnly.of(true),
+					EditorView.editable.of(false),
+					EditorView.contentAttributes.of({ tabindex: '0' })
+				]
+			: [];
+	}
 	// Cmd/Ctrl+S in a view-only tab is still HANDLED (the shell's capture handler
 	// suppresses the browser's own "Save page as…" dialog for every file tab), but
 	// there is nothing to persist — and a keystroke that appears to do nothing
@@ -288,9 +318,18 @@
 	function applyDiskContent(next: string) {
 		if (!view) return;
 		const edits = externalEdits(view.state.doc.toString(), next);
+		// The document just changed size under the view-only decision, so re-decide
+		// it against the same in-force ceiling the load used. Both directions matter:
+		// grown past it the tab must stop offering a save that would 413, shrunk back
+		// under it the tab must stop claiming a limit it no longer breaches.
+		const tooLarge = !saveFitsTransport(path, next, bodyLimit);
+		const effects = tooLarge === saveTooLarge ? [] : [viewOnly.reconfigure(viewOnlyExtensions(tooLarge))];
+		saveTooLarge = tooLarge;
 		// An empty edit list means the buffer already matches; dispatching it would
 		// only push a no-op onto the undo history.
-		if (edits.length) view.dispatch({ changes: edits, annotations: externalSync.of(true) });
+		if (edits.length || effects.length) {
+			view.dispatch({ changes: edits, effects, annotations: externalSync.of(true) });
+		}
 		savedContent = next;
 		// Assign explicitly: `liveSource` is SAMPLED on entering a preview, never
 		// mirrored per keystroke, so without this the rendered markdown would keep
@@ -315,7 +354,18 @@
 		// the SSE stream never carries a multi-MB payload; fetch it instead.
 		const next = ev.content ?? (await fetchDiskContent());
 		if (next == null) return;
-		if (next === savedContent) return; // nothing new to say
+		if (next === savedContent) {
+			// Disk agrees with what we believe it holds, so there is nothing new to
+			// say - AND anything we were holding back describes a state that no longer
+			// exists: a stash whose content an external revert has since undone (the
+			// banner would offer to Reload bytes disk does not hold), or a deletion
+			// banner for a file that has come back with exactly the content we had.
+			// Clearing before the return is what stops either outliving its cause.
+			pendingDisk = null;
+			preReadyDisk = null;
+			diskState = 'clean';
+			return;
+		}
 		if (!view) {
 			preReadyDisk = next;
 			return;
@@ -364,7 +414,11 @@
 		if (status !== 'ready') return;
 		const next = await fetchDiskContent();
 		// A read failure is not a deletion - the watcher is what reports those.
-		if (next == null || next === savedContent) return;
+		if (next == null) return;
+		// Content EQUAL to what we hold is deliberately not short-circuited here:
+		// it is `handleDiskChange` that decides what "disk already agrees" means,
+		// and it means dropping a stash the world has moved past, not just staying
+		// quiet. Two copies of that rule is how a stale banner survives the backstop.
 		void handleDiskChange({ type: 'file:changed', path, hash: '', deleted: false, content: next });
 	}
 
@@ -475,7 +529,11 @@
 			content = body.content;
 			liveSource = content;
 			savedContent = content;
-			saveTooLarge = !saveFitsTransport(path, content, resolveBodyLimit(body.bodyLimit));
+			// Kept for the life of the tab: the ceiling belongs to the running server,
+			// so it cannot move under us, and every later re-decision must be made
+			// against the same number the load used rather than a re-fetched one.
+			bodyLimit = resolveBodyLimit(body.bodyLimit);
+			saveTooLarge = !saveFitsTransport(path, content, bodyLimit);
 			status = 'ready';
 		} catch (err) {
 			status = 'error';
@@ -494,22 +552,9 @@
 					// against the code (VS Code's placement).
 					gitGutterExtension(),
 					EDITOR_THEME,
-					// View-only: only editing goes. The explicit `tabindex` is what keeps
-					// the rest true - `editable.of(false)` sets `contenteditable="false"`
-					// and adds NO tabindex, so `.cm-content` (where CodeMirror attaches
-					// its key handlers) could not take focus at all: a click landed on
-					// `.cm-scroller` and every keystroke died there, costing keyboard
-					// selection and the editor's own search panel. With it, the document
-					// is focusable, selectable and searchable, and still not editable.
-					// Cmd/Ctrl+S is not this element's business either way - the shell
-					// owns it for every file tab, in every view (see `requestSave`).
-					...(saveTooLarge
-						? [
-								EditorState.readOnly.of(true),
-								EditorView.editable.of(false),
-								EditorView.contentAttributes.of({ tabindex: '0' })
-							]
-						: []),
+					// In a compartment so an external sync that changes the document's
+					// size can re-decide it (see `saveTooLarge` and `applyDiskContent`).
+					viewOnly.of(viewOnlyExtensions(saveTooLarge)),
 					EditorView.updateListener.of((v: ViewUpdate) => {
 						// Content pulled in FROM disk is not an unsaved local edit.
 						const fromDisk = v.transactions.some((t) => t.annotation(externalSync));

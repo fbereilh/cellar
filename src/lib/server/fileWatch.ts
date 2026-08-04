@@ -50,10 +50,11 @@
  * pure `fileChangedEvent` below, which is what lets the whole watcher be unit
  * tested against a real filesystem with no server running.
  */
-import { watch, existsSync, type FSWatcher } from 'node:fs';
+import { watch, existsSync, statSync, type FSWatcher } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, basename } from 'node:path';
 import { resolveInWorkspace, readWorkspaceFile } from './fstree';
+import { MAX_FILE_BYTES } from './limits.js';
 
 /**
  * Quiet period before a watcher event is acted on. Long enough to collapse a
@@ -79,6 +80,27 @@ export const MAX_WATCHED_FILES = 64;
  * used to move a multi-MB export.
  */
 export const MAX_INLINE_EVENT_BYTES = 256 * 1024;
+
+/**
+ * Largest file this module will WATCH at all - the sibling of `git.ts`'s
+ * `MAX_DECORATION_BYTES`, and a deliberate decision rather than an oversight.
+ *
+ * Every settled event costs a synchronous `readFileSync` + sha256 over the WHOLE
+ * file, on the one process that also carries the kernel websockets, the ~40ms SSE
+ * output-delta fan-out and the in-process MCP server. `readWorkspaceFile` admits
+ * `.html` up to `MAX_HTML_FILE_BYTES` (15 MB) - exactly the self-contained export
+ * this feature otherwise wants to keep live - so without a ceiling an agent
+ * regenerating one in a loop charges a 15 MB read+hash per settle, and again on
+ * the refetch the inline-size gate forces.
+ *
+ * The ceiling is `MAX_FILE_BYTES` uniformly, WITHOUT the per-path `.html`
+ * exception: it bounds the worst case hard while keeping live sync for every text
+ * file the feature targets (`.md`/`.py`/`.json`/`.toml` are all far under it). The
+ * accepted cost is that a >2 MB export no longer live-syncs and falls back to the
+ * tab's window-focus revalidation - one GET when the user looks at it, rather than
+ * a multi-MB read on every write.
+ */
+export const MAX_WATCHED_FILE_BYTES = MAX_FILE_BYTES;
 
 /** A real, settled content change to a watched file. `content: null` = deleted. */
 export interface ExternalChange {
@@ -137,6 +159,21 @@ function absOf(relPath: string): string | null {
 }
 
 /**
+ * Is this file past `MAX_WATCHED_FILE_BYTES`? One `stat`, no read - which is the
+ * point: it is what keeps a file we will not deliver from costing a full
+ * read+hash. A path that cannot be stat'd (absent, unreadable) is NOT refused:
+ * there is no evidence of size, and a deletion still has to be reportable.
+ */
+function overWatchCeiling(abs: string): boolean {
+	try {
+		const st = statSync(abs);
+		return st.isFile() && st.size > MAX_WATCHED_FILE_BYTES;
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Start watching `relPath` for external changes, idempotently.
  *
  * Called from `GET /api/fs/file` - the read that opens a file into a tab IS the
@@ -160,6 +197,15 @@ function absOf(relPath: string): string | null {
 export function watchFileForChanges(relPath: string, currentContent?: string): void {
 	const abs = absOf(relPath);
 	if (!abs) return;
+
+	// Past the ceiling: refuse BEFORE any state is recorded, so an oversize file
+	// leaves neither an LRU entry nor a directory watcher behind. `unwatchFile`
+	// rather than a bare return, because this path is also reached by a re-read of
+	// a file that has GROWN past the ceiling since it was registered.
+	if (overWatchCeiling(abs)) {
+		unwatchFile(relPath);
+		return;
+	}
 
 	// Seed the known hash from the content the caller already holds. Without a
 	// content argument, read it - a wrong seed here is not cosmetic: it would
@@ -188,7 +234,12 @@ export function watchFileForChanges(relPath: string, currentContent?: string): v
 		} catch {
 			// No watch available for this directory (unsupported filesystem, gone,
 			// permissions). Degrade to today's behaviour - no live sync - rather
-			// than failing the read that triggered it.
+			// than failing the read that triggered it. The hash seeded above is dead
+			// state now (nothing will ever consult it) and the LRU only prunes what a
+			// successful registration added, so drop it: on a filesystem where
+			// `fs.watch` never works, every read would otherwise add a permanent
+			// entry and the map would grow for the life of the process.
+			known.delete(relPath);
 			return;
 		}
 		entry = { watcher, files: new Map() };
@@ -258,11 +309,16 @@ export function fileChangedEvent(change: ExternalChange): FileChangedEvent {
 	};
 }
 
-/** Introspection for tests: how many directory watchers and files are live. */
-export function watchStats(): { dirs: number; files: number } {
+/**
+ * Introspection for tests: how many directory watchers and files are live, and
+ * how many paths hold a known-hash entry. `tracked` is reported separately
+ * because the two can only ever agree by construction - an entry with no watcher
+ * behind it is a leak the LRU cannot prune, so a test has to be able to see it.
+ */
+export function watchStats(): { dirs: number; files: number; tracked: number } {
 	let files = 0;
 	for (const entry of dirs.values()) files += entry.files.size;
-	return { dirs: dirs.size, files };
+	return { dirs: dirs.size, files, tracked: known.size };
 }
 
 function closeDir(dir: string): void {
@@ -313,6 +369,13 @@ function settle(relPath: string): void {
 	if (!known.has(relPath)) return; // unwatched while the timer was pending
 	const abs = absOf(relPath);
 	if (!abs) return;
+	// It grew past the ceiling after registration. Stop watching it outright
+	// rather than paying a `stat` per event forever: the read+hash this guards is
+	// the whole cost, and the tab's window-focus revalidation still covers it.
+	if (overWatchCeiling(abs)) {
+		unwatchFile(relPath);
+		return;
+	}
 
 	let content: string | null;
 	if (!existsSync(abs)) {

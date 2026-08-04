@@ -29,6 +29,17 @@ const PREVIEW_MD = '# Preview doc\n\noriginal prose\n';
 const CONFLICT_MD = '# Conflict doc\n\nline one\n';
 const ECHO_MD = '# Echo doc\n\nsaved by cellar\n';
 const DELETE_MD = '# Delete doc\n\nabout to vanish\n';
+const REVERT_MD = '# Revert doc\n\nthe original\n';
+const RESURRECT_MD = '# Resurrect doc\n\ncomes back unchanged\n';
+const GROW_MD = '# Grow doc\n\nsmall for now\n';
+/**
+ * Past adapter-node's 512 K request-body ceiling (which the e2e harness runs
+ * under - it boots the production build, not Vite) but well inside the 2 MB read
+ * ceiling, so it still opens and still live-syncs. Also past the inline-event
+ * ceiling, so it arrives as an announcement the tab refetches.
+ */
+const BIG_MD =
+	'# Grow doc\n\n' + Array.from({ length: 7000 }, (_, i) => `pad ${i} ${'y'.repeat(80)}`).join('\n') + '\n';
 /** Tall enough that the editor really scrolls, so the scroll claim can be checked. */
 const LONG_LINES = Array.from({ length: 400 }, (_, i) => `line ${String(i).padStart(3, '0')}`);
 const LONG_MD = LONG_LINES.join('\n') + '\n';
@@ -52,6 +63,9 @@ test.beforeAll(async () => {
 	writeFileSync(join(workspace, 'echo.md'), ECHO_MD);
 	writeFileSync(join(workspace, 'delete.md'), DELETE_MD);
 	writeFileSync(join(workspace, 'long.md'), LONG_MD);
+	writeFileSync(join(workspace, 'revert.md'), REVERT_MD);
+	writeFileSync(join(workspace, 'resurrect.md'), RESURRECT_MD);
+	writeFileSync(join(workspace, 'grow.md'), GROW_MD);
 	const booted = await bootCellar(workspace);
 	launcher = booted.proc;
 	baseURL = booted.url;
@@ -267,4 +281,103 @@ test('a file deleted on disk says so and keeps the buffer', async ({ page }) => 
 	await expect(async () => {
 		expect(readFileSync(join(workspace, 'delete.md'), 'utf8')).toContain('about to vanish');
 	}).toPass();
+});
+
+/**
+ * A banner is a claim about what disk holds RIGHT NOW, so it has to be retired
+ * when disk stops holding it - not merely when something else arrives. Both
+ * shapes below reach the tab as "disk now equals what we already believed",
+ * which is the one path that used to return before it could clear anything.
+ */
+test('a banner does not outlive the disk state it describes', async ({ page }) => {
+	// ---- A stash the world has moved past ----------------------------------
+	await openFile(page, 'revert.md');
+	const editor = page.locator('.cm-content:visible');
+	await expect(editor).toContainText('the original');
+
+	await editor.click();
+	await page.keyboard.type('MY-DRAFT');
+	await expect(editor).toContainText('MY-DRAFT');
+
+	const abs = join(workspace, 'revert.md');
+	agentWrite(abs, '# Revert doc\n\nAGENT-VERSION\n');
+	const banner = page.locator('[data-testid="file-disk-changed"]:visible');
+	await expect(banner).toHaveAttribute('data-disk-state', 'changed');
+
+	// The agent undoes itself - the file is byte-for-byte what the tab loaded. The
+	// stashed "AGENT-VERSION" is no longer on disk, so offering to Reload it would
+	// write content nothing holds.
+	agentWrite(abs, REVERT_MD);
+	await expect(page.locator('[data-testid="file-disk-changed"]:visible')).toHaveCount(0);
+	// …and the unsaved draft was never touched by any of it.
+	await expect(editor).toContainText('MY-DRAFT');
+
+	// ---- A deletion that came back ------------------------------------------
+	await openFile(page, 'resurrect.md');
+	const editor2 = page.locator('.cm-content:visible');
+	await expect(editor2).toContainText('comes back unchanged');
+
+	const abs2 = join(workspace, 'resurrect.md');
+	unlinkSync(abs2);
+	await expect(page.locator('[data-testid="file-disk-changed"]:visible')).toHaveAttribute(
+		'data-disk-state',
+		'deleted'
+	);
+
+	// Restored with exactly the bytes the tab already had (a `git checkout`, an
+	// agent rewriting a file it had just removed). The file is back, so the "deleted
+	// on disk" banner is simply false.
+	agentWrite(abs2, RESURRECT_MD);
+	await expect(page.locator('[data-testid="file-disk-changed"]:visible')).toHaveCount(0);
+	await expect(editor2).toContainText('comes back unchanged');
+});
+
+/**
+ * The view-only decision is about the CURRENT document, and an external sync
+ * changes the document - `view.dispatch` applies changes whatever
+ * `EditorState.readOnly` says. Decided once at load it went stale in both
+ * directions: a file grown past the request-body ceiling stayed editable and only
+ * failed as a 413 on save, and one shrunk back under it kept a now-false "too
+ * large" chip and no Save for the life of the tab.
+ */
+test('an external change that crosses the save-transport limit flips the tab view-only, and back', async ({
+	page
+}) => {
+	await openFile(page, 'grow.md');
+	const editor = page.locator('.cm-content:visible');
+	await expect(editor).toContainText('small for now');
+	await expect(page.locator('[data-testid="file-save"]:visible')).toBeVisible();
+	await expect(page.locator('[data-testid="file-view-only"]:visible')).toHaveCount(0);
+
+	const abs = join(workspace, 'grow.md');
+
+	// Grown past the ceiling: the tab must stop offering a save that could not be
+	// transported, rather than accepting edits and 413-ing later.
+	agentWrite(abs, BIG_MD);
+	await expect(page.locator('[data-testid="file-view-only"]:visible')).toBeVisible();
+	await expect(page.locator('[data-testid="file-save"]:visible')).toHaveCount(0);
+	await expect(editor).toHaveAttribute('contenteditable', 'false');
+	const beforeTyping = readFileSync(abs, 'utf8');
+	await editor.click();
+	await page.keyboard.type('MUST-NOT-APPEAR');
+	await expect(editor).not.toContainText('MUST-NOT-APPEAR');
+
+	// Shrunk back under it: the chip is no longer true, so it goes - and the file
+	// is editable and saveable again, not stranded read-only for the tab's life.
+	agentWrite(abs, '# Grow doc\n\nsmall again\n');
+	await expect(editor).toContainText('small again');
+	await expect(page.locator('[data-testid="file-view-only"]:visible')).toHaveCount(0);
+	await expect(page.locator('[data-testid="file-save"]:visible')).toBeVisible();
+	await expect(editor).toHaveAttribute('contenteditable', 'true');
+
+	await editor.click();
+	await page.keyboard.press('ControlOrMeta+End');
+	await page.keyboard.type('\nEDITABLE-AGAIN');
+	await page.locator('[data-testid="file-save"]:visible').click();
+	await expect(async () => {
+		expect(readFileSync(abs, 'utf8')).toContain('EDITABLE-AGAIN');
+	}).toPass();
+	// The read-only spell really did hold the buffer: nothing typed then reached disk.
+	expect(beforeTyping).not.toContain('MUST-NOT-APPEAR');
+	expect(readFileSync(abs, 'utf8')).not.toContain('MUST-NOT-APPEAR');
 });

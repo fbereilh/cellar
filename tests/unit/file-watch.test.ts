@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import {
 	SETTLE_MS,
 	MAX_WATCHED_FILES,
+	MAX_WATCHED_FILE_BYTES,
 	MAX_INLINE_EVENT_BYTES,
 	watchFileForChanges,
 	unwatchFile,
@@ -224,14 +225,14 @@ describe('external file watcher', () => {
 		watchFileForChanges('sub/c.md', 'c');
 		// Three files, two directories - the handle count is bounded by where the
 		// open files live, not by how many there are.
-		expect(watchStats()).toEqual({ dirs: 2, files: 3 });
+		expect(watchStats()).toEqual({ dirs: 2, files: 3, tracked: 3 });
 
 		unwatchFile('a.md');
 		expect(watchStats().dirs).toBe(2); // b.md still holds the root open
 		unwatchFile('b.md');
 		expect(watchStats().dirs).toBe(1);
 		unwatchFile('sub/c.md');
-		expect(watchStats()).toEqual({ dirs: 0, files: 0 });
+		expect(watchStats()).toEqual({ dirs: 0, files: 0, tracked: 0 });
 	});
 
 	it('bounds the watched set with an LRU, keeping the most recently opened', async () => {
@@ -270,7 +271,52 @@ describe('external file watcher', () => {
 
 	it('refuses to watch a path outside the workspace', () => {
 		watchFileForChanges('../escape.md', 'x');
-		expect(watchStats()).toEqual({ dirs: 0, files: 0 });
+		expect(watchStats()).toEqual({ dirs: 0, files: 0, tracked: 0 });
+	});
+
+	it('refuses to watch a file past the size ceiling', async () => {
+		// Every settled event costs a synchronous read + sha256 of the WHOLE file on
+		// the process that also carries the kernel sockets and the SSE fan-out, so
+		// the ceiling is a hard bound rather than a hint. Nothing is recorded for a
+		// refused file - no watcher, and no LRU entry the LRU could never prune.
+		const abs = join(ws, 'huge.md');
+		const huge = 'x'.repeat(MAX_WATCHED_FILE_BYTES + 1);
+		writeFileSync(abs, huge);
+
+		watchFileForChanges('huge.md', huge);
+		expect(watchStats()).toEqual({ dirs: 0, files: 0, tracked: 0 });
+
+		agentWrite(abs, `${huge}y`);
+		await sleep(SETTLE_MS * 4);
+		expect(seen).toHaveLength(0);
+	});
+
+	it('stops watching a file that GROWS past the ceiling while open', async () => {
+		const abs = join(ws, 'grows.md');
+		writeFileSync(abs, 'small\n');
+		watchFileForChanges('grows.md', 'small\n');
+
+		// Under the ceiling it syncs like anything else…
+		agentWrite(abs, 'still small\n');
+		await waitForChanges(1);
+		expect(seen.map((c) => c.content)).toEqual(['still small\n']);
+
+		// …and once it is over, it is dropped outright rather than being stat'd,
+		// read and hashed on every event for the rest of the session.
+		agentWrite(abs, 'y'.repeat(MAX_WATCHED_FILE_BYTES + 1));
+		await sleep(SETTLE_MS * 6);
+		expect(seen).toHaveLength(1);
+		expect(watchStats()).toEqual({ dirs: 0, files: 0, tracked: 0 });
+	});
+
+	it('records nothing when the directory cannot be watched at all', () => {
+		// `fs.watch` throwing is not hypothetical - some network mounts and container
+		// overlays never support it, and there the registration retries on every
+		// read. A known-hash entry survives that only as dead state no watcher backs
+		// and no LRU eviction reaches, so the map would grow for the life of the
+		// process. A missing directory reproduces the throw exactly.
+		for (let i = 0; i < 8; i++) watchFileForChanges(`nodir/f${i}.md`, `${i}`);
+		expect(watchStats()).toEqual({ dirs: 0, files: 0, tracked: 0 });
 	});
 });
 
