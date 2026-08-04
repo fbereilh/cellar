@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { EditorView, type ViewUpdate } from '@codemirror/view';
-	import { EditorState, type Extension } from '@codemirror/state';
+	import { Annotation, EditorState, type Extension } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
@@ -16,6 +16,9 @@
 	import HtmlPreview from '$lib/HtmlPreview.svelte';
 	import { isHtmlPath, hasRelativeAssetRefs } from '$lib/htmlPreview';
 	import { saveFitsTransport, resolveBodyLimit } from '$lib/saveLimit';
+	import { subscribeEvents } from '$lib/events-client';
+	import { externalEdits } from '$lib/externalSync';
+	import type { FileChangedEvent } from '$lib/server/fileWatch';
 	import type { BlameLine } from '$lib/server/git';
 	import type { BlameReport } from '$lib/blame';
 	import type { FileTabApiHandle } from '$lib/types';
@@ -212,6 +215,11 @@
 				throw new Error(body?.message || `save failed (${res.status})`);
 			}
 			setDirty(false);
+			savedContent = content;
+			// Our bytes are now the disk's bytes, so any stashed external change is
+			// resolved: the user chose theirs.
+			diskState = 'clean';
+			pendingDisk = null;
 			savedFlash = true;
 			setTimeout(() => (savedFlash = false), 1200);
 			// The working-tree file just changed → re-blame so newly-saved lines
@@ -222,6 +230,142 @@
 		} finally {
 			saving = false;
 		}
+	}
+
+	// ---- External on-disk changes --------------------------------------------
+	// A `FileTab` used to read its file exactly once, in `onMount`: no polling, no
+	// revalidation, so its content was a snapshot taken at open time forever - and
+	// a save from that stale tab wrote the snapshot back over whatever an agent had
+	// since written. The server now watches the file (`$lib/server/fileWatch.ts`)
+	// and publishes `file:changed` on the ordinary event bus; this is the tab's
+	// half of that.
+	//
+	// The rule mirrors the notebook's "changed on server" banner, because the hard
+	// thinking about never clobbering active typing was already done there:
+	//
+	//   clean   → apply silently. This is the common case and the thing being asked
+	//             for. Applied as the MINIMAL edit (see `externalEdits`) so the
+	//             caret, selection, scroll and undo history survive.
+	//   dirty   → do NOT touch the buffer. Stash the incoming content and offer
+	//             Reload / Keep mine.
+	//   deleted → banner only, whatever the dirty state. The buffer is kept (a save
+	//             recreates the file); clearing the editor would destroy work in
+	//             response to something the user did not do here.
+	//
+	// Cellar's OWN saves never reach this path - the watcher suppresses them by
+	// content hash server-side (`noteKnownContent`), so a save cannot bounce back.
+
+	/**
+	 * Marks a transaction as an external sync rather than the user's typing, so
+	 * the update listener does not report the tab dirty for content that came FROM
+	 * disk. An annotation rather than a mutable flag: it travels with the
+	 * transaction, so it cannot be left set by an early return.
+	 */
+	const externalSync = Annotation.define<boolean>();
+
+	/** What we believe is on disk right now: the last content read, applied, or saved. */
+	let savedContent = '';
+	let diskState = $state<'clean' | 'changed' | 'deleted'>('clean');
+	/** Disk content held back because the buffer is dirty; applied by Reload. */
+	let pendingDisk: string | null = null;
+	/** An event that arrived before the editor existed, flushed once it does. */
+	let preReadyDisk: string | null = null;
+
+	const diskBanner = $derived(status === 'ready' && diskState !== 'clean');
+
+	async function fetchDiskContent(): Promise<string | null> {
+		try {
+			const res = await fetch(`/api/fs/file?path=${encodeURIComponent(path)}`);
+			const body = await res.json();
+			if (!res.ok) return null;
+			return body.content as string;
+		} catch {
+			return null;
+		}
+	}
+
+	/** Apply disk content to a CLEAN buffer as one minimal, caret-preserving edit. */
+	function applyDiskContent(next: string) {
+		if (!view) return;
+		const edits = externalEdits(view.state.doc.toString(), next);
+		// An empty edit list means the buffer already matches; dispatching it would
+		// only push a no-op onto the undo history.
+		if (edits.length) view.dispatch({ changes: edits, annotations: externalSync.of(true) });
+		savedContent = next;
+		// Assign explicitly: `liveSource` is SAMPLED on entering a preview, never
+		// mirrored per keystroke, so without this the rendered markdown would keep
+		// showing the pre-sync text while the hidden editor held the new one.
+		liveSource = next;
+		setDirty(false);
+		diskState = 'clean';
+		pendingDisk = null;
+		// The working tree moved under the gutter and the blame cache.
+		loadGitBaseline();
+		loadBlame();
+	}
+
+	async function handleDiskChange(ev: FileChangedEvent) {
+		if (status === 'error') return;
+		if (ev.deleted) {
+			diskState = 'deleted';
+			pendingDisk = null;
+			return;
+		}
+		// A file past the inline-event ceiling is announced without its content, so
+		// the SSE stream never carries a multi-MB payload; fetch it instead.
+		const next = ev.content ?? (await fetchDiskContent());
+		if (next == null) return;
+		if (next === savedContent) return; // nothing new to say
+		if (!view) {
+			preReadyDisk = next;
+			return;
+		}
+		if (dirty) {
+			pendingDisk = next;
+			diskState = 'changed';
+			return;
+		}
+		applyDiskContent(next);
+	}
+
+	function reloadFromDisk() {
+		if (pendingDisk == null) return;
+		applyDiskContent(pendingDisk);
+	}
+
+	/**
+	 * Dismiss without touching the buffer. `savedContent` is advanced to what disk
+	 * holds so the same change is not re-announced on every window focus - the user
+	 * has seen it and chosen their own version; a LATER, different disk change
+	 * still raises the banner again.
+	 */
+	function keepLocalVersion() {
+		if (pendingDisk != null) savedContent = pendingDisk;
+		pendingDisk = null;
+		diskState = 'clean';
+	}
+
+	onMount(() =>
+		subscribeEvents((ev) => {
+			if (ev.type !== 'file:changed') return;
+			const fe = ev as unknown as FileChangedEvent;
+			if (fe.path !== path) return;
+			void handleDiskChange(fe);
+		})
+	);
+
+	/**
+	 * Backstop for any watcher event the platform drops (network/virtual
+	 * filesystems deliver unreliably) and for a file evicted from the watcher's
+	 * LRU. Costs one GET per window focus, and short-circuits when disk matches
+	 * what we already have.
+	 */
+	async function revalidateFromDisk() {
+		if (status !== 'ready') return;
+		const next = await fetchDiskContent();
+		// A read failure is not a deletion - the watcher is what reports those.
+		if (next == null || next === savedContent) return;
+		void handleDiskChange({ type: 'file:changed', path, hash: '', deleted: false, content: next });
 	}
 
 	// ---- Git change bars (gutter) --------------------------------------------
@@ -293,11 +437,14 @@
 		blameTimer = setTimeout(reportBlame, 90);
 	}
 
-	// A commit / checkout / stash made outside Cellar changes HEAD under us.
+	// A commit / checkout / stash made outside Cellar changes HEAD under us — and
+	// so may the file's own content, which is why the content revalidation rides
+	// this same "the world may have moved" signal.
 	onMount(() => {
 		const onFocus = () => {
 			loadGitBaseline();
 			loadBlame();
+			void revalidateFromDisk();
 		};
 		window.addEventListener('focus', onFocus);
 		return () => window.removeEventListener('focus', onFocus);
@@ -327,6 +474,7 @@
 			if (!res.ok) throw new Error(body?.message || 'could not open file');
 			content = body.content;
 			liveSource = content;
+			savedContent = content;
 			saveTooLarge = !saveFitsTransport(path, content, resolveBodyLimit(body.bodyLimit));
 			status = 'ready';
 		} catch (err) {
@@ -363,7 +511,9 @@
 							]
 						: []),
 					EditorView.updateListener.of((v: ViewUpdate) => {
-						if (v.docChanged) {
+						// Content pulled in FROM disk is not an unsaved local edit.
+						const fromDisk = v.transactions.some((t) => t.annotation(externalSync));
+						if (v.docChanged && !fromDisk) {
 							setDirty(true);
 							// The message described content the user has since changed.
 							if (saveError) saveError = '';
@@ -379,6 +529,14 @@
 				]
 			})
 		});
+
+		// A disk change that landed between the read and the editor existing: the
+		// buffer is clean by construction, so apply it rather than drop it.
+		if (preReadyDisk != null) {
+			const pending = preReadyDisk;
+			preReadyDisk = null;
+			applyDiskContent(pending);
+		}
 	});
 </script>
 
@@ -423,6 +581,47 @@
 			{/if}
 		</div>
 	</div>
+
+	{#if diskBanner}
+		<!-- The buffer is untouched behind this: an external change never discards
+		     unsaved work, it asks. Shown in both Source and Preview, since the file
+		     is equally stale in either.
+		     Takes the notebook banner's warning TINT (border + background), but its
+		     copy is `base-content`, not `text-warning`. Amber-on-amber measures
+		     1.8:1 against this background in the light theme - far under WCAG AA -
+		     so the icon carries the signal and the words stay readable. Both buttons
+		     are equally quiet on purpose: Reload DISCARDS unsaved edits, so
+		     emphasising it would make the destructive choice the one a misclick
+		     lands on. -->
+		<div
+			class="flex items-center gap-2 border-b border-warning/40 bg-warning/10 px-4 py-1.5 text-xs text-base-content/80"
+			data-testid="file-disk-changed"
+			data-disk-state={diskState}
+		>
+			<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+			<span>
+				{#if diskState === 'deleted'}
+					Deleted on disk. Your version is still open here - save to recreate the file.
+				{:else}
+					Changed on disk outside Cellar. Your unsaved edits are kept.
+				{/if}
+			</span>
+			<div class="ml-auto flex shrink-0 items-center gap-1">
+				{#if diskState === 'changed'}
+					<button
+						class="btn btn-ghost btn-xs h-5 min-h-0 px-2 hover:bg-warning/20"
+						onclick={reloadFromDisk}
+						data-testid="file-disk-reload">Reload</button
+					>
+				{/if}
+				<button
+					class="btn btn-ghost btn-xs h-5 min-h-0 px-2 hover:bg-warning/20"
+					onclick={keepLocalVersion}
+					data-testid="file-disk-dismiss">{diskState === 'deleted' ? 'Dismiss' : 'Keep mine'}</button
+				>
+			</div>
+		</div>
+	{/if}
 
 	{#if status === 'error'}
 		<div class="p-6 text-sm text-error" data-testid="file-error">Could not open <code class="font-mono">{path}</code>: {errorMsg}</div>
