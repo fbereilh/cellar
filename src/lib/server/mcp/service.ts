@@ -27,6 +27,7 @@ import {
 	setHideAllCode as setHideAllCodeDoc,
 	setHideInput as setHideInputDoc,
 	setExportTarget as setExportTargetDoc,
+	setCellExports as setCellExportsDoc,
 	getActiveNotebookPath,
 	resolveNotebookPath,
 	workspaceRelative,
@@ -48,6 +49,7 @@ import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
+import { isExportCell } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
@@ -689,6 +691,12 @@ export async function getNotebookMap(nb?: string | null) {
 		run_status: runStatus(c, sid),
 		...staleFields(stale[c.id], toHandle),
 		has_output: hasOutput(c),
+		// `export: true` only when the cell is marked for the `.py` module, so a
+		// notebook that exports nothing pays no tokens for it (the same compact
+		// conditional shape as hideInputFields). This is the READ side of
+		// set_cell_export: it is what lets an agent see which cells the
+		// `display.export_target` module is built from before it changes them.
+		...(isExportCell(c) ? { export: true } : {}),
 		...hideInputFields(c, view.hideAllCode)
 	});
 	for (const c of cells) {
@@ -1547,6 +1555,66 @@ export function setExportTarget(target: string | null | undefined, nb?: string |
 	const nbTarget = nb ?? getActiveNotebookPath();
 	setExportTargetDoc(target ?? null, nbTarget);
 	return { export_target: getNotebook(nbTarget).exportTarget };
+}
+
+/**
+ * MCP `set_cell_export`. The per-cell half of the nbdev export flow and the pair
+ * of `setExportTarget`: mark (or unmark) code cells with `cellar.export`, the
+ * `#|export` flag `export-py.ts` reads to decide WHICH cells become the `.py`
+ * module. Without it an agent could name the target but never choose its
+ * contents - the flag was settable only in the UI.
+ *
+ * Batch + handle-addressed like `removeCells`/`clearOutputs`, and ALL-OR-NOTHING
+ * on addressing: every ref resolves (and every marked cell is checked to BE a
+ * code cell) before anything is written, so a bad handle - or a markdown cell -
+ * in the fifth slot cannot leave the first four rewritten. Duplicates collapse,
+ * and `setCellExports` makes the whole batch ONE document write, which matters
+ * doubly here because `persist` regenerates the `.py` on every write.
+ *
+ * Only a CODE cell can be marked: `isExportCell` requires one, so setting the
+ * flag on a markdown/SQL cell would record something the exporter silently
+ * ignores. That is refused by id (`not_code`) rather than no-op'd, so an agent
+ * building a module is never told a cell is in it when it is not. UNMARKING is
+ * allowed on any cell - it asks for a state a non-code cell is already in, and it
+ * is how a stale flag on a hand-edited `.ipynb` is cleared.
+ *
+ * `exported` reports the RESULTING state - every addressed cell that now carries
+ * the requested value - not a change count, so a repeated mark reports the same
+ * list rather than an empty one an agent would read as a failure. A cell already
+ * at that value is not rewritten, so an idempotent call persists nothing and
+ * regenerates nothing (zero git diff, no `.py` mtime churn).
+ *
+ * VISIBILITY follows the READ tools, not `delete_cells`: a cell hidden from the
+ * agent reads as NOT FOUND here, exactly as `readCell` treats it. Marking copies
+ * a cell's SOURCE into a `.py` the agent can then open, so unlike deleting or
+ * retyping a cell - which disclose nothing - this would be a route around
+ * `hidden_from_agent`. No read tool ever emits a hidden cell's handle, so this
+ * refuses nothing an agent could legitimately be holding.
+ *
+ * Like the other metadata setters (`setCellVisibility`, `setHideInput`,
+ * `setExportTarget`) it takes no pre-action checkpoint: no cell source is
+ * touched, and the generated `.py` is derived from these flags, so there is no
+ * cell state an undo would need to bring back.
+ */
+export function setCellExport(ids: string[], exported: boolean, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	const full: string[] = [];
+	const seen = new Set<string>();
+	for (const ref of ids) {
+		const id = asFullId(target, ref);
+		if (seen.has(id)) continue;
+		const cell = getCell(id, target);
+		if (!cell || isHidden(cell)) return { ok: false as const, missing: ref };
+		// Checked for the WHOLE batch before the first write - see all-or-nothing.
+		if (exported && cell.cell_type !== 'code') return { ok: false as const, notCode: ref };
+		seen.add(id);
+		full.push(id);
+	}
+	if (!full.length) return { ok: false as const, missing: null };
+	setCellExportsDoc(full, exported, target);
+	const toHandle = handleFn(target);
+	const marked = full.map(toHandle);
+	return { ok: true as const, exported: marked, count: marked.length, export_target: getNotebook(target).exportTarget };
 }
 
 /**

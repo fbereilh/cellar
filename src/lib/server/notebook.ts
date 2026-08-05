@@ -679,18 +679,66 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
  * namespace, so the flag round-trips through clean-on-save. Only a code cell can
  * carry it (a markdown/SQL cell has no module source). `persist` regenerates the
  * `.py` module as a side effect (auto-on-save).
+ *
+ * This IS `setCellExports` of one - one implementation, one rule - so the UI's
+ * per-cell toggle and MCP's batch tool cannot drift about what marking means.
+ * Returns whether the cell now carries the requested value (false = there is no
+ * such cell, or marking a non-code one, which `isExportCell` would ignore).
  */
 export function setCellExport(id: string, exported: boolean, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
-	if (!cell || cell.cell_type !== 'code') return false;
-	cell.metadata = cell.metadata ?? {};
-	cell.metadata.cellar = cell.metadata.cellar ?? {};
-	if (exported) cell.metadata.cellar.export = true;
-	else delete cell.metadata.cellar.export;
-	persist(doc);
-	emit(doc, 'cell:export', { cellId: id, exported: !!exported }, originId);
+	if (!cell) return false;
+	if (exported && cell.cell_type !== 'code') return false;
+	setCellExports([id], exported, nb, originId);
 	return true;
+}
+
+/**
+ * Mark (or unmark) SEVERAL cells for export in one document write - the batch
+ * `setCellExport`, mirroring `setCellTypes`/`clearOutputsForCells`. A loop over
+ * the single-cell form would serialize + fsync + rename the whole `.ipynb` once
+ * per cell AND regenerate the `.py` module once per cell (`persist` auto-exports),
+ * walking both files through every intermediate state.
+ *
+ * Only cells that actually CHANGE are touched, so a re-mark of an
+ * already-marked cell writes nothing and emits nothing (zero git diff, no `.py`
+ * mtime churn). Marking requires a code cell - a markdown/SQL cell has no module
+ * source, so setting the flag there would be a lie `isExportCell` ignores -
+ * while UNMARKING clears the flag wherever it is found, which is also how a stale
+ * flag on a hand-edited `.ipynb` is cleared. Returns the ids actually changed.
+ */
+export function setCellExports(
+	ids: readonly string[],
+	exported: boolean,
+	nb?: string | null,
+	originId?: string | null
+): string[] {
+	const doc = docFor(nb);
+	const changed: Cell[] = [];
+	const seen = new Set<string>();
+	for (const id of ids) {
+		if (seen.has(id)) continue;
+		seen.add(id);
+		const cell = find(doc, id);
+		if (!cell) continue;
+		const marked = cell.metadata?.cellar?.export === true;
+		if (exported) {
+			if (cell.cell_type !== 'code' || marked) continue;
+			cell.metadata = cell.metadata ?? {};
+			cell.metadata.cellar = cell.metadata.cellar ?? {};
+			cell.metadata.cellar.export = true;
+		} else {
+			const cellar = cell.metadata?.cellar;
+			if (!cellar || !marked) continue;
+			delete cellar.export;
+		}
+		changed.push(cell);
+	}
+	if (!changed.length) return [];
+	persist(doc);
+	for (const cell of changed) emit(doc, 'cell:export', { cellId: cell.id, exported }, originId);
+	return changed.map((c) => c.id);
 }
 
 /** The notebook's configured export target (`.py` module path), or null. */
