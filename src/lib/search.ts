@@ -45,6 +45,7 @@
  */
 
 import type { CellOutput } from '$lib/server/types';
+import { asText, stripAnsi, type DataFramePayload } from '$lib/outputText';
 
 /** Search options. */
 export interface SearchOpts {
@@ -283,25 +284,24 @@ function entryFor(cache: SearchCache, cell: SearchableCell): CacheEntry {
 }
 
 // ---- Output text extraction (browser-safe, mirrors Cell.svelte's renderOutput) --
-
-/** nbformat text fields are string | string[]; join a multiline array. */
-function asText(v: unknown): string {
-	if (Array.isArray(v)) return v.join('');
-	return typeof v === 'string' ? v : v == null ? '' : String(v);
-}
-
-/** Strip ANSI SGR color codes (ESC[…m) that Jupyter puts in tracebacks. */
-// eslint-disable-next-line no-control-regex
-const ANSI = /\x1b\[[0-9;]*m/g;
-const stripAnsi = (s: string): string => s.replace(ANSI, '');
-
-/** Cellar's structured DataFrame payload (kernel.js `application/vnd.cellar.dataframe+json`). */
-interface DataFramePayload {
-	columns?: unknown[];
-	index?: unknown[];
-	index_name?: unknown;
-	data?: unknown[][];
-}
+//
+// `asText` / `stripAnsi` / `DataFramePayload` are shared with `$lib/copyCell` (see
+// `$lib/outputText`). The PRIORITY below is deliberately NOT shared, and differs in
+// two places today:
+//
+//   1. A PICTURE. Search wants every string a user might look for, so it returns
+//      matplotlib's `<Figure … with N Axes>` `text/plain` placeholder, while copy
+//      returns nothing for a picture so its button is honestly disabled.
+//   2. A SAVED DataFrame. Clean-on-save strips the structured MIME, leaving only
+//      pandas' `text/html` repr: copy parses that back into the full grid table,
+//      while this scanner never touches html and falls through to the elided
+//      `text/plain` repr - so a value the grid shows but the repr elided is
+//      copyable yet not findable here. That gap is PRE-EXISTING and unchanged;
+//      closing it means putting a DOMParser parse on this hot path, which is a
+//      separate piece of work with its own perf implications.
+//
+// Changing what an output contributes as text means deciding for BOTH, not
+// editing one.
 
 /** Flatten a structured DataFrame payload to searchable text (headers + index + cell values). */
 function dataframeText(df: DataFramePayload): string {

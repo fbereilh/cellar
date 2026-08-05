@@ -29,6 +29,7 @@
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
 	import { matchesCellId } from '$lib/search';
+	import { copyOutputText, hasCopyableOutput } from '$lib/copyCell';
 	import { setSurfaceRanges, clearSurface, buildTextRanges, allocSurfaceKey } from '$lib/domHighlight';
 	import { isMac } from '$lib/shortcuts.svelte';
 	import { pointerIntent } from '$lib/cellSelection';
@@ -414,39 +415,84 @@
 	const ranText = $derived(lastRun ? `ran ${relativeTime(lastRun.at, nowMs())} · ${formatDuration(lastRun.durationMs)}` : '');
 	const isAgentRun = $derived(lastRun?.actor === 'agent');
 
-	// ---- Click-to-copy cell id ----------------------------------------------
-	// The label shows `cell #<first-8>`; a click copies exactly that short id
-	// (no "cell " / "#" prefix) and briefly flips to "copied!". View-only:
-	// touches neither the doc nor the kernel. Falls back to execCommand when
-	// navigator.clipboard is absent (non-secure context); worst case a no-op.
-	const shortId = $derived(cell.id.slice(0, 8));
-	let copied = $state(false);
-	let copiedTimer: ReturnType<typeof setTimeout> | null = null;
-	async function copyCellId(e: Event) {
-		e.stopPropagation();
-		e.preventDefault();
-		let ok = false;
+	// ---- Clipboard: cell id, input, output ----------------------------------
+	// Three view-only copies sharing ONE writer and ONE transient "copied" flash,
+	// so a second copy affordance can never drift from the first. None of them
+	// touches the doc or the kernel.
+	//
+	// `writeClipboard` prefers the async clipboard API and falls back to
+	// execCommand when it is absent (a non-secure context). A REJECTED promise -
+	// the permission-denied case - is caught and reported as `false`, so a denied
+	// copy simply shows no confirmation rather than throwing.
+	async function writeClipboard(text: string): Promise<boolean> {
 		try {
 			if (browser && navigator.clipboard?.writeText) {
-				await navigator.clipboard.writeText(shortId);
-				ok = true;
-			} else if (browser && typeof document !== 'undefined') {
+				await navigator.clipboard.writeText(text);
+				return true;
+			}
+			if (browser && typeof document !== 'undefined') {
 				const ta = document.createElement('textarea');
-				ta.value = shortId;
+				ta.value = text;
 				ta.style.position = 'fixed';
 				ta.style.opacity = '0';
 				document.body.appendChild(ta);
 				ta.select();
-				ok = document.execCommand('copy');
+				const ok = document.execCommand('copy');
 				document.body.removeChild(ta);
+				return ok;
 			}
 		} catch {
-			ok = false;
+			return false;
 		}
-		if (!ok) return;
-		copied = true;
+		return false;
+	}
+
+	/** Which copy affordance is showing its confirmation right now (one at a time). */
+	type CopyFlash = 'id' | 'input' | 'output';
+	let copiedFlash = $state<CopyFlash | null>(null);
+	let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+	function flashCopied(kind: CopyFlash) {
+		copiedFlash = kind;
 		if (copiedTimer) clearTimeout(copiedTimer);
-		copiedTimer = setTimeout(() => (copied = false), 1000);
+		copiedTimer = setTimeout(() => (copiedFlash = null), 1000);
+	}
+
+	// The label shows `cell #<first-8>`; a click copies exactly that short id
+	// (no "cell " / "#" prefix) and briefly flips to "copied!".
+	const shortId = $derived(cell.id.slice(0, 8));
+	const copied = $derived(copiedFlash === 'id');
+	async function copyCellId(e: Event) {
+		e.stopPropagation();
+		e.preventDefault();
+		if (await writeClipboard(shortId)) flashCopied('id');
+	}
+
+	// Copy this cell's SOURCE exactly as it would be edited (a SQL cell copies its
+	// SQL, a markdown cell its markdown). `currentSource()` is the live editor doc
+	// when one is built and the doc-backed source otherwise, so an edit still
+	// inside the 500ms autosave debounce copies as typed.
+	async function copyInput(e: Event) {
+		e.stopPropagation();
+		e.preventDefault();
+		if (await writeClipboard(currentSource())) flashCopied('input');
+	}
+
+	// Copy a text form of every output, built from the cell MODEL (`cell.outputs`)
+	// rather than the rendered DOM - see `$lib/copyCell` for the mime rule and for
+	// why that matters under windowing. The enabled state is decided on the
+	// CONVERTED text, so the button is disabled exactly when the copy would be
+	// empty (`hasCopyableOutput` and `copyOutputText` read one memoized per-output
+	// conversion, so they cannot disagree). The empty guard below is therefore
+	// unreachable EXCEPT under a run landing between render and click - `run:start`
+	// clearing `cell.outputs`, or a `cell:cleared` SSE event - which is exactly the
+	// case it covers.
+	const canCopyOutput = $derived(!isMarkdown && hasCopyableOutput(cell.outputs));
+	async function copyOutput(e: Event) {
+		e.stopPropagation();
+		e.preventDefault();
+		const text = copyOutputText(cell.outputs);
+		if (!text) return;
+		if (await writeClipboard(text)) flashCopied('output');
 	}
 
 	// ---- Staleness indicator -------------------------------------------------
@@ -1604,6 +1650,54 @@
 						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 							<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" />
 						</svg>
+					</button>
+				{/if}
+				<!-- Copy this cell's source. Always available (a cell always has source;
+				     an empty one copies empty). Both copy buttons confirm by flipping
+				     their glyph to a check for a moment - the lightest signal that fits
+				     a btn-square toolbar, and the same one the cell-id copy uses. -->
+				<button
+					class="btn btn-ghost btn-xs btn-square {copiedFlash === 'input' ? 'text-success' : 'text-base-content/60 hover:text-base-content/90'}"
+					onclick={copyInput}
+					title={copiedFlash === 'input' ? 'Copied input' : 'Copy input'}
+					aria-label={copiedFlash === 'input' ? 'Copied input' : 'Copy cell input'}
+					data-testid="copy-input"
+					data-copied={copiedFlash === 'input' ? 'true' : undefined}
+				>
+					{#if copiedFlash === 'input'}
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m20 6-11 11-5-5" /></svg>
+					{:else}
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+					{/if}
+				</button>
+				{#if !isMarkdown}
+					<!-- Copy a text form of the output, built from the cell MODEL (see
+					     $lib/copyCell). Disabled when there is nothing textual to copy -
+					     no outputs at all, or only pictures / charts / live widgets - so
+					     the button is never a silent no-op. A disabled control receives
+					     no pointer events, so its `title` can never be hovered: the
+					     REASON therefore rides the aria-label, the one label both a
+					     screen reader and the accessibility tree still report. -->
+					<button
+						class="btn btn-ghost btn-xs btn-square disabled:text-base-content/20 {copiedFlash === 'output'
+							? 'text-success'
+							: 'text-base-content/60 hover:text-base-content/90'}"
+						onclick={copyOutput}
+						disabled={!canCopyOutput}
+						title={copiedFlash === 'output' ? 'Copied output' : canCopyOutput ? 'Copy output' : 'No output to copy'}
+						aria-label={copiedFlash === 'output'
+							? 'Copied output'
+							: canCopyOutput
+								? 'Copy cell output'
+								: 'Copy cell output - no output to copy'}
+						data-testid="copy-output"
+						data-copied={copiedFlash === 'output' ? 'true' : undefined}
+					>
+						{#if copiedFlash === 'output'}
+							<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m20 6-11 11-5-5" /></svg>
+						{:else}
+							<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" /><rect x="8" y="2" width="8" height="4" rx="1" /><path d="M9 12h6" /><path d="M9 16h4" /></svg>
+						{/if}
 					</button>
 				{/if}
 				{#if isImports}

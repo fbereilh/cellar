@@ -494,6 +494,17 @@ spec files at a time. Install its browser once with `npx playwright install chro
   handle); a shorter prefix is treated as ordinary text. Ids are matched from the
   start, never in the middle, and a **regex** query searches cell content only - turn
   the `.*` chip off to find a cell by its id.
+- **The "copy output" button on a cell is greyed out** - that cell has nothing textual
+  to copy. Cellar copies what a cell *shows*, as text, so a picture (a matplotlib
+  figure), a Plotly chart, a live widget, or a rich HTML object that is nothing but
+  script (a folium map, a Bokeh chart) has no text form, and the button is disabled
+  rather than pasting the `<Figure ...>` / `<folium.folium.Map ...>` placeholder Python
+  prints for such an object. The same applies to a cell that has not run, and to one
+  that printed only a blank line. A markdown cell has no output at all, so it carries
+  no copy-output button in the first place. Copy *input* is never disabled - every
+  cell has source. Everything else copies as text you can paste: stream output and tracebacks
+  (with the terminal colors stripped), and a DataFrame or an HTML table as a
+  tab-separated table a spreadsheet reads as columns.
 - **A run aborted with "The kernel connection is being refreshed; re-run the cell"** -
   the kernel websocket died (its reconnect retries were spent) while the process
   itself is still alive. Cellar rebuilds the socket in the background without
