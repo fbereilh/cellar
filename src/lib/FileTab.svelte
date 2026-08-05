@@ -247,8 +247,13 @@
 			}
 			// The bytes have landed, so this is now the newest word on what disk holds -
 			// claimed before reading the response body, so a revalidation still in
-			// flight cannot slip in between and be believed.
-			claimDisk();
+			// flight cannot slip in between and be believed. Reading the body is itself
+			// an await, though, so this path FETCHES and must therefore re-check its
+			// claim afterwards like every other one: an inline `file:changed` landing
+			// in that window claims a higher seq and (with `dirty` still true) stashes
+			// the newer content behind the banner, which the writes below would
+			// otherwise discard while recording OUR bytes as what disk holds.
+			const seq = claimDisk();
 			// The stat of what we just wrote becomes the baseline, which is what stops
 			// the next window focus re-reading a file this tab wrote itself. `parseStat`
 			// answers null on anything less than a complete stat, and null simply means
@@ -259,14 +264,17 @@
 			// flag does not merely mislabel them any more - it routes the next external
 			// change down the SILENT-apply path instead of the Reload / Keep-mine
 			// banner, so those characters would be replaced without being offered.
-			// `savedContent` is advanced either way: disk really does hold these bytes.
+			// It is decided on the buffer alone, so it holds whether or not this save
+			// is still the newest word on disk.
 			if (view?.state.doc.toString() === content) setDirty(false);
-			savedContent = content;
-			diskStatBaseline = parseStat(written?.stat);
-			// Our bytes are now the disk's bytes, so any stashed external change is
-			// resolved: the user chose theirs.
-			diskState = 'clean';
-			pendingDisk = null;
+			if (seq === diskSeq) {
+				savedContent = content;
+				diskStatBaseline = parseStat(written?.stat);
+				// Our bytes are now the disk's bytes, so any stashed external change is
+				// resolved: the user chose theirs.
+				diskState = 'clean';
+				pendingDisk = null;
+			}
 			savedFlash = true;
 			setTimeout(() => (savedFlash = false), 1200);
 			// The working-tree file just changed → re-blame so newly-saved lines

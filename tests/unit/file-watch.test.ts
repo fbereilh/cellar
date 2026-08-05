@@ -51,6 +51,9 @@ let off: () => void = () => {};
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** How long `fs.watch` needs before it is observing (see `arm`). */
+const WATCH_ARM_MS = 40;
+
 /** Wait until `n` changes have been delivered (or give up). */
 async function waitForChanges(n: number, timeout = 4000): Promise<ExternalChange[]> {
 	const started = Date.now();
@@ -67,6 +70,20 @@ function agentWrite(abs: string, text: string): void {
 	const temp = `${abs}.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`;
 	writeFileSync(temp, text, 'utf8');
 	renameSync(temp, abs);
+}
+
+/**
+ * Arm the watch and let the platform actually install it. Measured on macOS: a
+ * write issued in the same tick as `fs.watch(dir)` returning is LOST outright a
+ * few percent of the time (60-trial probe: 2 lost when written immediately, 0
+ * when the watch was armed first), and a lost event never arrives - so under a
+ * loaded full-suite run this surfaced as whichever test wrote first timing out.
+ * Real use arms the watch when the file is OPENED, long before any external
+ * write, so waiting here reproduces that rather than papering over anything.
+ */
+async function arm(rel: string, content?: string): Promise<void> {
+	watchFileForChanges(rel, content);
+	await sleep(WATCH_ARM_MS);
 }
 
 beforeEach(() => {
@@ -91,7 +108,7 @@ describe('external file watcher', () => {
 	it('survives repeated temp+rename writes (the agent write pattern)', async () => {
 		const abs = join(ws, 'doc.md');
 		writeFileSync(abs, '# v0\n');
-		watchFileForChanges('doc.md', '# v0\n');
+		await arm('doc.md', '# v0\n');
 
 		// Three edits in a row. This is the regression a per-file watcher passes
 		// once and then fails forever: the second and third never arrive.
@@ -109,7 +126,7 @@ describe('external file watcher', () => {
 	it('catches a plain in-place overwrite too', async () => {
 		const abs = join(ws, 'notes.md');
 		writeFileSync(abs, 'one\n');
-		watchFileForChanges('notes.md', 'one\n');
+		await arm('notes.md', 'one\n');
 
 		writeFileSync(abs, 'two\n');
 		await waitForChanges(1);
@@ -121,7 +138,7 @@ describe('external file watcher', () => {
 	it('debounces a burst into ONE notification carrying the final content', async () => {
 		const abs = join(ws, 'burst.md');
 		writeFileSync(abs, 'start\n');
-		watchFileForChanges('burst.md', 'start\n');
+		await arm('burst.md', 'start\n');
 
 		for (let i = 1; i <= 6; i++) {
 			writeFileSync(abs, `burst-${i}\n`);
@@ -136,7 +153,7 @@ describe('external file watcher', () => {
 	it("suppresses Cellar's own write as an echo, and still delivers the next real edit", async () => {
 		const abs = join(ws, 'saved.md');
 		writeFileSync(abs, 'v0\n');
-		watchFileForChanges('saved.md', 'v0\n');
+		await arm('saved.md', 'v0\n');
 
 		// What `PUT /api/fs/file` does: declare the content, then write it.
 		noteKnownContent('saved.md', 'from-cellar\n');
@@ -161,7 +178,7 @@ describe('external file watcher', () => {
 		// it, since an existing entry now wins over a re-read's content.
 		const abs = join(ws, 'failed.md');
 		writeFileSync(abs, 'on-disk\n');
-		watchFileForChanges('failed.md', 'on-disk\n');
+		await arm('failed.md', 'on-disk\n');
 
 		noteKnownContent('failed.md', 'never-written\n'); // the PUT's declaration...
 		resyncKnownContent('failed.md'); // ...and its write throwing
@@ -183,7 +200,7 @@ describe('external file watcher', () => {
 	it('says nothing when the file is touched but its content did not change', async () => {
 		const abs = join(ws, 'same.md');
 		writeFileSync(abs, 'unchanged\n');
-		watchFileForChanges('same.md', 'unchanged\n');
+		await arm('same.md', 'unchanged\n');
 
 		// A rewrite with identical bytes, and an atomic one - both produce watcher
 		// events (macOS calls them `rename` either way) and neither is a change.
@@ -207,7 +224,7 @@ describe('external file watcher', () => {
 		// exists to keep working.
 		const abs = join(ws, 'shared.md');
 		writeFileSync(abs, 'v0\n');
-		watchFileForChanges('shared.md', 'v0\n');
+		await arm('shared.md', 'v0\n');
 
 		agentWrite(abs, 'from-agent\n');
 		// One window's GET, inside the quiet period - it reads the NEW content and
@@ -224,7 +241,7 @@ describe('external file watcher', () => {
 		// ordinary revalidating read into a phantom change.
 		const abs = join(ws, 'quiet.md');
 		writeFileSync(abs, 'v0\n');
-		watchFileForChanges('quiet.md', 'v0\n');
+		await arm('quiet.md', 'v0\n');
 
 		watchFileForChanges('quiet.md', 'v0\n');
 		writeFileSync(abs, 'v0\n'); // a touch, so a settle really runs
@@ -239,7 +256,7 @@ describe('external file watcher', () => {
 		// reading as an edit the first time anything touches the directory.
 		const abs = join(ws, 'fresh.md');
 		writeFileSync(abs, 'already-here\n');
-		watchFileForChanges('fresh.md', 'already-here\n');
+		await arm('fresh.md', 'already-here\n');
 
 		writeFileSync(join(ws, 'sibling.md'), 'x\n'); // stirs the directory watcher
 		writeFileSync(abs, 'already-here\n');
@@ -259,7 +276,7 @@ describe('external file watcher', () => {
 		writeFileSync(join(ws, 'keep.md'), 'keep');
 		watchFileForChanges('dir/a.md', 'a');
 		watchFileForChanges('dir/nested/b.md', 'b');
-		watchFileForChanges('keep.md', 'keep');
+		await arm('keep.md', 'keep');
 		expect(watchStats().tracked).toBe(3);
 
 		unwatchUnder('dir');
@@ -271,10 +288,44 @@ describe('external file watcher', () => {
 		expect(seen.map((c) => c.path)).toEqual(['keep.md']);
 	});
 
+	it('a NO-OP rename/move through the explorer route leaves the watch intact', async () => {
+		// The explorer unwatches the OLD path because it is gone - but both ops have
+		// a no-op form that moves nothing: `renameEntry` returns no `from` for a
+		// rename to the same name, and `moveEntry` returns `from === path` for a
+		// same-parent move. The file is still open there, and the tab cannot repair
+		// the loss (it never remaps, so it never remounts and never re-issues the
+		// read that is the sole registration point) - so live sync would be switched
+		// off silently, with no user-visible signal. Driven through the REAL route,
+		// because the guard is the route's.
+		const { POST } = await import('../../src/routes/api/fs/op/+server.js');
+		const call = (body: unknown) =>
+			POST({
+				request: new Request('http://x/api/fs/op', { method: 'POST', body: JSON.stringify(body) })
+			} as never);
+
+		mkdirSync(join(ws, 'sub'), { recursive: true });
+		writeFileSync(join(ws, 'sub', 'open.md'), 'v0\n');
+		await arm('sub/open.md', 'v0\n');
+		expect(watchStats().tracked).toBe(1);
+
+		await call({ op: 'rename', path: 'sub/open.md', name: 'open.md' }); // same name
+		await call({ op: 'move', path: 'sub/open.md', dest: 'sub' }); // same parent
+		expect(watchStats().tracked).toBe(1);
+
+		agentWrite(join(ws, 'sub', 'open.md'), 'v1\n');
+		await waitForChanges(1);
+		expect(seen.map((c) => c.content)).toEqual(['v1\n']);
+
+		// A rename that really moves the file still drops the dead entry.
+		seen = [];
+		await call({ op: 'rename', path: 'sub/open.md', name: 'renamed.md' });
+		expect(watchStats().tracked).toBe(0);
+	});
+
 	it('reports a delete as content:null', async () => {
 		const abs = join(ws, 'gone.md');
 		writeFileSync(abs, 'here\n');
-		watchFileForChanges('gone.md', 'here\n');
+		await arm('gone.md', 'here\n');
 
 		unlinkSync(abs);
 		await waitForChanges(1);
@@ -287,7 +338,7 @@ describe('external file watcher', () => {
 	it('ignores sibling files in the watched directory', async () => {
 		const abs = join(ws, 'watched.md');
 		writeFileSync(abs, 'watched\n');
-		watchFileForChanges('watched.md', 'watched\n');
+		await arm('watched.md', 'watched\n');
 
 		// Including the `<name>.tmp.<pid>.<hex>` shape an atomic writer stages.
 		writeFileSync(join(ws, 'other.md'), 'other\n');
@@ -303,7 +354,7 @@ describe('external file watcher', () => {
 
 		const perFile: string[] = [];
 		const naive = watch(abs, () => perFile.push('event'));
-		watchFileForChanges('control.md', 'v0\n');
+		await arm('control.md', 'v0\n');
 
 		for (const v of ['a\n', 'b\n', 'c\n']) {
 			agentWrite(abs, v);
@@ -352,6 +403,7 @@ describe('external file watcher', () => {
 			watchFileForChanges(rel, `${i}\n`);
 		}
 		expect(watchStats().files).toBe(MAX_WATCHED_FILES);
+		await sleep(WATCH_ARM_MS);
 
 		// The newest survived and still reports changes…
 		const newest = `f${total - 1}.md`;
@@ -368,7 +420,7 @@ describe('external file watcher', () => {
 	it('stops reporting a file once it is unwatched', async () => {
 		const abs = join(ws, 'closed.md');
 		writeFileSync(abs, 'v0\n');
-		watchFileForChanges('closed.md', 'v0\n');
+		await arm('closed.md', 'v0\n');
 		unwatchFile('closed.md');
 
 		agentWrite(abs, 'v1\n');
@@ -390,7 +442,7 @@ describe('external file watcher', () => {
 		const huge = 'x'.repeat(MAX_WATCHED_FILE_BYTES + 1);
 		writeFileSync(abs, huge);
 
-		watchFileForChanges('huge.md', huge);
+		await arm('huge.md', huge);
 		expect(watchStats()).toEqual({ dirs: 0, files: 0, tracked: 0 });
 
 		agentWrite(abs, `${huge}y`);
@@ -401,7 +453,7 @@ describe('external file watcher', () => {
 	it('stops watching a file that GROWS past the ceiling while open', async () => {
 		const abs = join(ws, 'grows.md');
 		writeFileSync(abs, 'small\n');
-		watchFileForChanges('grows.md', 'small\n');
+		await arm('grows.md', 'small\n');
 
 		// Under the ceiling it syncs like anything else…
 		agentWrite(abs, 'still small\n');

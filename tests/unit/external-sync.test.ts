@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { externalEdits, applyTextEdits } from '../../src/lib/externalSync';
 
 /**
@@ -105,5 +108,43 @@ describe('externalEdits', () => {
 			const after = next.join('\n') + (rnd() < 0.5 ? '\n' : '');
 			expect(applyTextEdits(before, externalEdits(before, after))).toBe(after);
 		}
+	});
+});
+
+/**
+ * The tab's side of the same feature, source-level: every path that settles what
+ * we believe disk holds claims the newest-observation slot, and every path that
+ * had to FETCH re-checks that claim before writing what it learned. A save reads
+ * a response body after claiming, so it fetches too - and without the re-check it
+ * discarded a stash raised while that body was in flight and recorded its own
+ * bytes as disk's, leaving the tab stale with no banner. One line wide in either
+ * direction, hence a guard on the source.
+ */
+describe('the file tab disk-observation funnel', () => {
+	const src = readFileSync(
+		join(dirname(fileURLToPath(import.meta.url)), '../../src/lib/FileTab.svelte'),
+		'utf8'
+	);
+	const saveFn = src.slice(
+		src.indexOf('async function save()'),
+		src.indexOf('// ---- External on-disk changes')
+	);
+
+	it('the save captures its claim and re-checks it before recording what disk holds', () => {
+		expect(saveFn).toContain('const seq = claimDisk();');
+		const guarded = saveFn.slice(saveFn.indexOf('if (seq === diskSeq) {'));
+		expect(guarded).toContain('savedContent = content;');
+		expect(guarded).toContain('diskStatBaseline = parseStat(');
+		expect(guarded).toContain("diskState = 'clean';");
+		expect(guarded).toContain('pendingDisk = null;');
+	});
+
+	it('every OBSERVATION goes through the funnel, which drops a superseded claim', () => {
+		expect(src).toContain('if (seq !== diskSeq) return;');
+		// The pre-editor flush is an observation like any other, so it funnels too;
+		// only the user's own Reload applies a stash directly, having just claimed.
+		expect(src).toContain('applyDiskObservation(claimDisk(), pending)');
+		const reload = src.slice(src.indexOf('function reloadFromDisk()'));
+		expect(reload.slice(0, reload.indexOf('}'))).toContain('claimDisk();');
 	});
 });
