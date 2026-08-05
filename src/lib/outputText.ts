@@ -42,4 +42,14 @@ export interface DataFramePayload {
 	index?: unknown[];
 	index_name?: unknown;
 	data?: unknown[][];
+	/**
+	 * The completeness half: both sources populate it (the kernel formatter caps at
+	 * 500 rows x 100 cols; `$lib/dataframeHtml` recovers the totals from pandas'
+	 * own `N rows x M columns` footer). Untyped like the rest - a hand-edited
+	 * `.ipynb` can carry anything here, so a reader must validate before printing.
+	 */
+	total_rows?: unknown;
+	total_cols?: unknown;
+	truncated_rows?: unknown;
+	truncated_cols?: unknown;
 }

@@ -105,6 +105,25 @@ describe('outputCopyText - rich bundles', () => {
 		expect(outputCopyText(df)).toBe('\ta\tb\n0\t1\tx\n1\t2\t');
 	});
 
+	it('keeps a row whose last cells are empty at full width', () => {
+		// The separator of an empty last column is a real column: trimming it pastes
+		// this row one column short of its siblings.
+		const df = display({
+			'application/vnd.cellar.dataframe+json': {
+				columns: ['a', 'b', 'c'],
+				index: [0, 1],
+				index_name: '',
+				data: [
+					[1, 2, 3],
+					[4, null, null]
+				]
+			}
+		});
+		const lines = outputCopyText(df).split('\n');
+		expect(lines).toEqual(['\ta\tb\tc', '0\t1\t2\t3', '1\t4\t\t']);
+		for (const line of lines) expect(line.split('\t').length).toBe(4);
+	});
+
 	it('names a genuinely unhandled mimetype as nothing to copy', () => {
 		expect(outputCopyText(display({ 'application/x-weird': 'zzz' }))).toBe('');
 	});
@@ -141,6 +160,30 @@ describe('outputCopyText - text/html (the pandas Styler case: no text/plain)', (
 
 	it('turns <br> into line breaks', () => {
 		expect(htmlToPlainText('one<br>two')).toBe('one\ntwo');
+	});
+
+	it('keeps a row whose last cells are empty at its siblings width', () => {
+		// Exactly ONE trailing separator goes (the one `</td>` emitted); the rest are
+		// real, empty columns. Trimming the run pasted this row as 1 column beside
+		// 3-column siblings.
+		const html =
+			'<table><tbody>' +
+			'<tr><td>a</td><td>b</td><td>c</td></tr>' +
+			'<tr><td>a</td><td></td><td></td></tr>' +
+			'</tbody></table>';
+		const lines = htmlToPlainText(html).split('\n');
+		expect(lines).toEqual(['a\tb\tc', 'a\t\t']);
+		for (const line of lines) expect(line.split('\t').length).toBe(3);
+	});
+
+	it('still drops the one separator an ordinary row ends with', () => {
+		expect(htmlToPlainText('<table><tbody><tr><td>a</td><td>b</td></tr></tbody></table>')).toBe('a\tb');
+	});
+
+	it('is still nothing to copy when every cell is empty', () => {
+		const empty = '<table><tbody><tr><td></td><td></td></tr></tbody></table>';
+		expect(htmlToPlainText(empty)).toBe('');
+		expect(hasCopyableOutput([result({ 'text/html': empty })])).toBe(false);
 	});
 });
 
@@ -215,6 +258,81 @@ describe('outputCopyText - a SAVED DataFrame (structured MIME stripped by clean-
 		} finally {
 			globalThis.DOMParser = savedParser;
 		}
+	});
+});
+
+describe('a TRUNCATED DataFrame keeps its completeness footer', () => {
+	// The grid captions a truncated frame; the elided text/plain repr the payload
+	// now outranks ended in `[N rows x M columns]`. Without the footer a 1M-row
+	// frame pastes its shown rows and says nothing about the rest.
+	const TRUNCATED_HTML =
+		'<div><table border="1" class="dataframe"><thead>' +
+		'<tr style="text-align: right;"><th></th><th>a</th><th>b</th></tr></thead><tbody>' +
+		'<tr><th>0</th><td>1</td><td>x</td></tr>' +
+		'<tr><th>1</th><td>2</td><td>y</td></tr>' +
+		'</tbody></table><p>1000000 rows × 5 columns</p></div>';
+	const LIVE_TRUNCATED = {
+		columns: ['a', 'b'],
+		index: [0, 1],
+		index_name: '',
+		data: [
+			[1, 'x'],
+			[2, 'y']
+		],
+		total_rows: 1000000,
+		total_cols: 5,
+		truncated_rows: true,
+		truncated_cols: true
+	};
+
+	it('appends pandas own footer, naming the totals rather than the shown rows', () => {
+		expect(outputCopyText(display({ 'application/vnd.cellar.dataframe+json': LIVE_TRUNCATED }))).toBe(
+			'\ta\tb\n0\t1\tx\n1\t2\ty\n[1000000 rows x 5 columns]'
+		);
+	});
+
+	it('copies identically live and re-opened, footer included', () => {
+		// The parity the payload-over-text/plain rule exists for: the SAVED repr's
+		// totals come from pandas own footer, the live ones from the kernel formatter,
+		// and both render through the one dataframeTable.
+		const saved = outputCopyText(display({ 'text/html': TRUNCATED_HTML }));
+		expect(saved).toBe(outputCopyText(display({ 'application/vnd.cellar.dataframe+json': LIVE_TRUNCATED })));
+		expect(saved).toContain('[1000000 rows x 5 columns]');
+	});
+
+	it('adds NO footer to a frame that is not truncated', () => {
+		expect(
+			outputCopyText(
+				display({
+					'application/vnd.cellar.dataframe+json': {
+						columns: ['a'],
+						index: [0],
+						index_name: '',
+						data: [[1]],
+						total_rows: 1,
+						total_cols: 1,
+						truncated_rows: false,
+						truncated_cols: false
+					}
+				})
+			)
+		).toBe('\ta\n0\t1');
+	});
+
+	it('falls back to the counts present when the totals are missing or not numbers', () => {
+		// A hand-edited or externally-authored .ipynb can carry anything here; the
+		// footer must never read "[undefined rows x undefined columns]".
+		const shaky = {
+			columns: ['a', 'b'],
+			index: [0],
+			index_name: '',
+			data: [[1, 2]],
+			total_rows: 'lots',
+			truncated_rows: true
+		};
+		expect(outputCopyText(display({ 'application/vnd.cellar.dataframe+json': shaky }))).toBe(
+			'\ta\tb\n0\t1\t2\n[1 rows x 2 columns]'
+		);
 	});
 });
 

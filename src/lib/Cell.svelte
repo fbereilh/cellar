@@ -482,8 +482,10 @@
 	// why that matters under windowing. The enabled state is decided on the
 	// CONVERTED text, so the button is disabled exactly when the copy would be
 	// empty (`hasCopyableOutput` and `copyOutputText` read one memoized per-output
-	// conversion, so they cannot disagree); the empty guard below is therefore
-	// unreachable and kept only as a belt-and-braces no-op.
+	// conversion, so they cannot disagree). The empty guard below is therefore
+	// unreachable EXCEPT under a run landing between render and click - `run:start`
+	// clearing `cell.outputs`, or a `cell:cleared` SSE event - which is exactly the
+	// case it covers.
 	const canCopyOutput = $derived(!isMarkdown && hasCopyableOutput(cell.outputs));
 	async function copyOutput(e: Event) {
 		e.stopPropagation();

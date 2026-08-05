@@ -88,6 +88,13 @@ function inferDtype(data: (string | number | null)[][], col: number): string {
  */
 export function parsePandasDataFrameHtml(html: string | null | undefined): DataFramePayload | null {
 	if (!html || typeof DOMParser === 'undefined') return null;
+	// The table this parser requires is `table.dataframe`, so html that never says
+	// "dataframe" cannot be one - answered here by a scan rather than by parsing a
+	// possibly multi-MB Bokeh/Altair/folium bundle into a DOM only to reject it.
+	// Case-insensitively, and with a regex (never `toLowerCase()`, which would copy
+	// that whole bundle) because a fragment parsed without a doctype lands in quirks
+	// mode, where class matching is case-insensitive.
+	if (!/dataframe/i.test(html)) return null;
 	let doc: Document;
 	try {
 		doc = new DOMParser().parseFromString(html, 'text/html');

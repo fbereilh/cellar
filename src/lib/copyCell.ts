@@ -14,7 +14,11 @@
 //   2. the structured DataFrame payload -> a tab-separated table. The grid is
 //                                          what the cell SHOWS (up to 500 rows),
 //                                          so it outranks pandas' own elided
-//                                          `text/plain` repr.
+//                                          `text/plain` repr. A TRUNCATED frame
+//                                          keeps pandas' `[N rows x M columns]`
+//                                          footer, the completeness signal the
+//                                          grid's truncation banner gives and the
+//                                          elided repr used to carry.
 //   3. a plotly figure                  -> ''  (an interactive chart)
 //   4. an image (matplotlib, svg)       -> ''  (a picture; deliberately NOT its
 //                                              `<Figure … with N Axes>` repr,
@@ -57,6 +61,17 @@ import type { CellOutput } from '$lib/server/types';
 import { asText, stripAnsi, type DataFramePayload } from '$lib/outputText';
 import { parsePandasDataFrameHtml } from '$lib/dataframeHtml';
 
+/**
+ * Trailing whitespace goes, EXCEPT a trailing tab: that tab is the separator of a
+ * real (empty) last column, so eating it pastes that row one column short of its
+ * siblings. Text that is nothing but whitespace is nothing to copy at all, which
+ * is what makes a bare `print()` (stream text `"\n"`) disable the button.
+ */
+function trimCopyText(s: string): string {
+	if (!/\S/.test(s)) return '';
+	return s.replace(/[^\S\t]+$/, '');
+}
+
 /** Cheap "is there anything here" test that does NOT materialize the joined text. */
 function nonEmpty(v: unknown): boolean {
 	if (Array.isArray(v)) return v.some((p) => typeof p === 'string' && p.length > 0);
@@ -65,7 +80,29 @@ function nonEmpty(v: unknown): boolean {
 
 const cellStr = (v: unknown): string => (v == null ? '' : String(v));
 
-/** Flatten a structured DataFrame payload to a tab-separated table (index column first). */
+/**
+ * A total from the payload, or the count actually present when the payload does
+ * not carry a usable one. `total_rows`/`total_cols` arrive over the wire and can
+ * be missing or non-numeric on a hand-edited `.ipynb`, so a value that is not a
+ * finite count at least as large as what we hold is not trusted - the shown count
+ * is then the honest number, never `undefined`.
+ */
+function totalOr(total: unknown, shown: number): number {
+	return typeof total === 'number' && Number.isFinite(total) && total >= shown ? total : shown;
+}
+
+/**
+ * Flatten a structured DataFrame payload to a tab-separated table (index column
+ * first).
+ *
+ * A TRUNCATED frame gains pandas' own `[N rows x M columns]` footer line, the
+ * completeness signal the on-screen grid gives as a truncation banner. It is what
+ * the elided `text/plain` repr used to carry for free, before the payload started
+ * outranking it - without it a 1M-row frame pastes 500 rows saying nothing. Built
+ * here, in the ONE place that renders a payload, so the live kernel payload and a
+ * SAVED one recovered by `$lib/dataframeHtml` copy identically. A non-truncated
+ * frame gets no footer: the common case stays noise-free.
+ */
 function dataframeTable(df: DataFramePayload): string {
 	const cols = Array.isArray(df.columns) ? df.columns.map(cellStr) : [];
 	const index = Array.isArray(df.index) ? df.index : [];
@@ -75,6 +112,9 @@ function dataframeTable(df: DataFramePayload): string {
 	for (let i = 0; i < rows.length; i++) {
 		const row = Array.isArray(rows[i]) ? rows[i] : [];
 		lines.push([cellStr(index[i]), ...row.map(cellStr)].join('\t'));
+	}
+	if (df.truncated_rows || df.truncated_cols) {
+		lines.push(`[${totalOr(df.total_rows, rows.length)} rows x ${totalOr(df.total_cols, cols.length)} columns]`);
 	}
 	return lines.join('\n');
 }
@@ -139,14 +179,19 @@ export function htmlToPlainText(html: string): string {
 	s = s.replace(/<\/(tr|p|div|li|h[1-6]|caption|table|pre|blockquote)\s*>/gi, '\n');
 	s = s.replace(/<[^>]*>/g, '');
 	s = decodeEntities(s);
-	// Tidy: collapse runs of spaces (HTML whitespace is not significant), drop a
-	// trailing cell separator per line, and squeeze blank-line runs.
-	return s
+	// Tidy: collapse runs of spaces (HTML whitespace is not significant), drop
+	// EXACTLY ONE trailing cell separator per line, and squeeze blank-line runs.
+	// One, not a greedy run: a row whose last cells are empty ends in several tabs
+	// and every one of them but the last is a real column, so trimming them all
+	// pastes that row into a spreadsheet with fewer columns than its siblings.
+	const joined = s
 		.split('\n')
-		.map((line) => line.replace(/[^\S\t\n]+/g, ' ').replace(/[ \t]+$/, '').replace(/^[ ]+/, ''))
+		.map((line) => line.replace(/[^\S\t\n]+/g, ' ').replace(/ *\t? *$/, '').replace(/^[ ]+/, ''))
 		.join('\n')
-		.replace(/\n{3,}/g, '\n\n')
-		.trim();
+		.replace(/\n{3,}/g, '\n\n');
+	// Not `.trim()`: it would eat the last row's own trailing separator, the very
+	// column the per-line rule above just preserved.
+	return trimCopyText(joined.replace(/^\s+/, ''));
 }
 
 // ---- Per-output text ------------------------------------------------------
@@ -193,8 +238,9 @@ export function outputCopyText(o: CellOutput): string {
 }
 
 /**
- * One output's contribution to the clipboard: its text with trailing whitespace
- * trimmed, so a `print()` that emitted only `"\n"` reads as the nothing it is.
+ * One output's contribution to the clipboard: its text through
+ * {@link trimCopyText}, so a `print()` that emitted only `"\n"` reads as the
+ * nothing it is while a table row ending in an empty column keeps its separator.
  *
  * MEMOIZED on the output OBJECT (a WeakMap, exactly like `renderCache` in
  * Cell.svelte and the outputs cache in `$lib/search.ts`): the enabled state below
@@ -210,7 +256,7 @@ const partCache = new WeakMap<CellOutput, string>();
 function copyPart(o: CellOutput): string {
 	let part = partCache.get(o);
 	if (part === undefined) {
-		part = outputCopyText(o).replace(/\s+$/, '');
+		part = trimCopyText(outputCopyText(o));
 		partCache.set(o, part);
 	}
 	return part;

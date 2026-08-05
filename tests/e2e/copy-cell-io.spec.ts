@@ -34,6 +34,7 @@ const SRC_STDOUT = 'print("hello from cellar")';
 const SRC_ERROR = 'raise ValueError("boom")';
 const SRC_TABLE = 'styler()';
 const SRC_DF = 'df';
+const SRC_DF_BIG = 'big_df';
 const SRC_IMAGE = 'plot()';
 const SRC_MULTI = 'multi()';
 const SRC_EMPTY = 'x = 1';
@@ -140,6 +141,25 @@ function notebookJson(): string {
 			]),
 			cell('copy-empty-aaaaa', SRC_EMPTY, []),
 			cell('copy-sql-aaaaaa', SRC_SQL, [stream('one\n1\n')], { cellar: { language: 'sql' } }),
+			// The same, TRUNCATED: pandas' `N rows × M columns` footer is the only
+			// record of how much the frame really holds once its structured MIME is
+			// gone, and the grid captions it as truncated on screen.
+			cell('copy-dfbig-aaaaa', SRC_DF_BIG, [
+				{
+					output_type: 'execute_result',
+					metadata: {},
+					execution_count: 1,
+					data: {
+						'text/html':
+							'<div><table border="1" class="dataframe"><thead>' +
+							'<tr style="text-align: right;"><th></th><th>a</th><th>b</th></tr></thead><tbody>' +
+							'<tr><th>0</th><td>1</td><td>x</td></tr>' +
+							'<tr><th>1</th><td>2</td><td>y</td></tr>' +
+							'</tbody></table><p>1000000 rows × 5 columns</p></div>',
+						'text/plain': '   a  b\n0  1  x\n1  2  y\n\n[1000000 rows x 5 columns]'
+					}
+				}
+			]),
 			{ cell_type: 'markdown', id: 'copy-md-aaaaaaaa', metadata: {}, source: [SRC_MD] },
 			...filler(),
 			cell('copy-far-aaaaaaa', SRC_FAR, [stream('far away\n')])
@@ -298,6 +318,16 @@ test('copy output copies a SAVED DataFrame as the table the grid shows, not the 
 	await reveal(page, 'copy-df-aaaaaaaa');
 	await cellEl(page, 'copy-df-aaaaaaaa').getByTestId('copy-output').click();
 	expect(await lastCopied(page)).toBe('\ta\tb\n0\t1\tx\n1\t2\ty');
+});
+
+test('copy output of a TRUNCATED DataFrame carries the completeness footer', async ({ page }) => {
+	// The grid captions this frame as truncated; the elided text/plain repr the
+	// payload now outranks ended in the same footer. Without it the paste is a
+	// silently partial frame.
+	await openNotebook(page);
+	await reveal(page, 'copy-dfbig-aaaaa');
+	await cellEl(page, 'copy-dfbig-aaaaa').getByTestId('copy-output').click();
+	expect(await lastCopied(page)).toBe('\ta\tb\n0\t1\tx\n1\t2\ty\n[1000000 rows x 5 columns]');
 });
 
 test('copy output concatenates several outputs and skips the image among them', async ({ page }) => {
