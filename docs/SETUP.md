@@ -426,6 +426,17 @@ spec files at a time. Install its browser once with `npx playwright install chro
   blame line and the change bars) are skipped above 2 MB, since blaming a multi-MB
   file costs seconds on the same thread that carries kernel streaming, SSE, and MCP.
   The file itself opens and previews normally; only the per-line decorations are absent.
+- **An open file tab didn't update when an agent (or another editor) changed the file** -
+  Cellar watches the files you have open and applies an external change in place, so
+  this should be immediate; if you had unsaved edits it waits behind a Reload / Keep
+  mine banner instead of overwriting them. Three cases fall back to refreshing when
+  you switch back to the browser window: a file over **2 MB** (re-reading and hashing
+  a multi-MB file on every write would cost the same thread that carries kernel
+  streaming, SSE, and MCP), a filesystem where directory watching is unavailable
+  (some network mounts and container overlays), and more than **64** files open at
+  once - the coldest stop being watched. Notebooks (`.ipynb`, and jupytext `.py`
+  opened as notebooks) are not covered at all yet: reopen the tab to pick up an
+  edit made to one outside Cellar.
 - **An `.html` preview says "This page loads files stored next to it"** - the preview
   is origin-isolated (it cannot read the app's DOM, cookies, or storage), and the cost
   of that isolation is that a page pulling sibling files off disk

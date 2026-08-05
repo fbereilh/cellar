@@ -1,11 +1,12 @@
 /**
  * Cellar — shared client event stream (one `EventSource` per browser tab).
  *
- * Every mounted `LiveNotebook` subscribes here rather than opening its own
+ * Every mounted `LiveNotebook` — and every mounted `FileTab`, for the global
+ * `file:changed` its file may raise — subscribes here rather than opening its own
  * `EventSource`, so a tab holds a single `/api/events` connection no matter how
- * many notebooks are open — staying well under the HTTP/1.1 ~6-connection cap
- * that would otherwise starve regular API calls. The connection is opened
- * lazily on the first subscriber and closed when the last one leaves.
+ * many notebooks and files are open — staying well under the HTTP/1.1
+ * ~6-connection cap that would otherwise starve regular API calls. The connection
+ * is opened lazily on the first subscriber and closed when the last one leaves.
  *
  * Listeners receive parsed event objects, plus a synthetic `{ type: 'sse:open' }`
  * on every (re)connect so each notebook can resync itself as the correctness

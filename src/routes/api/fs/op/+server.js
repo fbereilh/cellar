@@ -9,6 +9,7 @@ import {
 import { dropDocs, rekeyDocs } from '$lib/server/notebook';
 import { shutdownKernelsUnder } from '$lib/server/kernel';
 import { invalidateGitStatusCache } from '$lib/server/git';
+import { unwatchUnder } from '$lib/server/fileWatch';
 
 /**
  * File-management operations for the sidebar file explorer. A single POST
@@ -35,12 +36,27 @@ export async function POST({ request }) {
 				return json({ ok: true, ...createEntry(body.parent ?? '', body.name, body.kind) });
 			case 'rename': {
 				const res = renameEntry(body.path, body.name);
-				if (res.from && res.from !== res.path) rekeyDocs(res.from, res.path);
+				// This guard and the one in `move` answer the same question the neighbouring
+				// `rekeyDocs` does - did this path actually move? - so they read alike.
+				// `renameEntry` returns NO `from` for a rename to the same name, and
+				// `moveEntry` returns `from === path` for a same-parent move: nothing moved
+				// on disk and the file is still open, so unwatching there would silently
+				// switch off that tab's live sync (it never remaps, so it never remounts and
+				// never re-issues the read that is the sole registration point).
+				if (res.from && res.from !== res.path) {
+					rekeyDocs(res.from, res.path);
+					// The old name no longer exists, so its watcher entry can only settle
+					// into a deletion nobody is listening for - and it would hold an LRU slot
+					// a genuinely open file could use. The remapped tab re-registers the new
+					// path on its next read / window-focus revalidation.
+					unwatchUnder(res.from);
+				}
 				return json({ ok: true, ...res });
 			}
 			case 'delete': {
 				const res = deleteEntry(body.path);
 				dropDocs(res.path);
+				unwatchUnder(res.path);
 				// Free the kernel process(es) of the deleted notebook (or every notebook
 				// under a deleted folder), not just the in-memory doc. Best-effort: a
 				// failed shutdown must not fail the delete the user already committed to.
@@ -49,7 +65,12 @@ export async function POST({ request }) {
 			}
 			case 'move': {
 				const res = moveEntry(body.path, body.dest ?? '');
-				if (res.from && res.from !== res.path) rekeyDocs(res.from, res.path);
+				// Same guard as `rename` above, for the same reason: a same-parent move
+				// returns `from === path` and moved nothing.
+				if (res.from && res.from !== res.path) {
+					rekeyDocs(res.from, res.path);
+					unwatchUnder(res.from);
+				}
 				return json({ ok: true, ...res });
 			}
 			case 'copy':

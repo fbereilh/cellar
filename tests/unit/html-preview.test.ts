@@ -283,6 +283,7 @@ describe('readWorkspaceFile size caps', () => {
 	let priorWorkspace: string | undefined;
 	let readWorkspaceFile: (relPath: string) => string;
 	let writeWorkspaceFile: (relPath: string, content: string) => void;
+	let statWorkspaceFile: (relPath: string) => { size: number; mtimeMs: number };
 
 	const fill = (name: string, bytes: number) =>
 		writeFileSync(join(dir, name), Buffer.alloc(bytes, 0x61));
@@ -291,7 +292,9 @@ describe('readWorkspaceFile size caps', () => {
 		dir = mkdtempSync(join(tmpdir(), 'cellar-fsize-'));
 		priorWorkspace = process.env.CELLAR_WORKSPACE;
 		process.env.CELLAR_WORKSPACE = dir;
-		({ readWorkspaceFile, writeWorkspaceFile } = await import('../../src/lib/server/fstree'));
+		({ readWorkspaceFile, writeWorkspaceFile, statWorkspaceFile } = await import(
+			'../../src/lib/server/fstree'
+		));
 		fill('small.html', 1 * MB);
 		fill('report.html', 5 * MB); // a plotly write_html(include_plotlyjs=True)
 		fill('huge.html', 16 * MB);
@@ -352,6 +355,31 @@ describe('readWorkspaceFile size caps', () => {
 		// Bytes, not characters: the ceiling the reader enforces is a file size.
 		it('measures UTF-8 bytes, not string length', () => {
 			expect(() => writeWorkspaceFile('multibyte.txt', '€'.repeat(MB))).toThrow(/too large to save/);
+		});
+	});
+
+	/**
+	 * `statWorkspaceFile` is what makes the caps above affordable on the tab's
+	 * window-focus revalidation: every mounted file tab revalidates, and an
+	 * unconditional read there put a whole 5 MB export through read + serialize +
+	 * transfer on each alt-tab back into Cellar. It is a SHORT-CIRCUIT, so it must
+	 * only ever cause an extra read, never a missed change - which is why it
+	 * answers a real stat or throws, and never guesses.
+	 */
+	describe('statWorkspaceFile (the cheap half of revalidation)', () => {
+		it('answers size + mtime with no read, and no size ceiling of its own', () => {
+			// Deliberately the file `readWorkspaceFile` refuses: focus revalidation is
+			// the ONLY sync mechanism for one past the ceilings, so its stat must work.
+			const st = statWorkspaceFile('huge.html');
+			expect(st.size).toBe(16 * MB);
+			expect(st.mtimeMs).toBeGreaterThan(0);
+			expect(statWorkspaceFile('small.txt').size).toBe(1 * MB);
+		});
+
+		it('throws rather than guessing, so the caller falls back to the read', () => {
+			expect(() => statWorkspaceFile('nope.txt')).toThrow();
+			expect(() => statWorkspaceFile('')).toThrow(/not a file/); // the workspace root
+			expect(() => statWorkspaceFile('../escape.txt')).toThrow(/escapes workspace/);
 		});
 	});
 });
@@ -547,10 +575,16 @@ describe('save transport limit', () => {
 	it('the file tab opens an over-transport document read-only, with an affordance', () => {
 		const src = readFileSync(join(REPO, 'src/lib/FileTab.svelte'), 'utf8');
 		expect(src).toContain("from '$lib/saveLimit'");
-		// …against the limit the SERVER reports, never a client-side guess.
-		expect(src).toMatch(
-			/saveTooLarge = !saveFitsTransport\(path, content, resolveBodyLimit\(body\.bodyLimit\)\)/
-		);
+		// …against the limit the SERVER reports, never a client-side guess. Captured
+		// once from the load GET, because every later re-decision has to be made
+		// against the same number rather than a re-fetched one.
+		expect(src).toMatch(/bodyLimit = resolveBodyLimit\(body\.bodyLimit\)/);
+		expect(src).toMatch(/saveTooLarge = !saveFitsTransport\(path, content, bodyLimit\)/);
+		// And RE-decided whenever an external sync changes the document's size:
+		// `view.dispatch` applies changes whatever `readOnly` says, so a verdict
+		// frozen into the initial editor state goes stale in both directions.
+		expect(src).toMatch(/viewOnly\.reconfigure\(viewOnlyExtensions\(/);
+		expect(src).toMatch(/const tooLarge = !saveFitsTransport\(path, next, bodyLimit\)/);
 		expect(src).toContain('EditorState.readOnly.of(true)');
 		expect(src).toContain('data-testid="file-view-only"');
 		// A read-only editor sets `contenteditable="false"` and NO tabindex, so

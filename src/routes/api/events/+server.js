@@ -7,7 +7,9 @@ import { createBackpressureMonitor } from '$lib/server/sse-backpressure';
 /**
  * Server-Sent Events stream — one per browser tab, carrying live document/run
  * events for *all* notebooks (each tagged with its canonical `nb` id; the
- * client filters per mounted notebook). Chosen over WebSocket because the push
+ * client filters per mounted notebook), plus the global events that belong to no
+ * notebook: the kernel queue/status snapshots, ipywidgets, and `file:changed` for
+ * an open workspace file rewritten on disk. Chosen over WebSocket because the push
  * is one-directional (every client action already goes over REST/NDJSON) and a
  * long-lived `ReadableStream` `Response` is first-class under adapter-node.
  *
@@ -108,6 +110,10 @@ export function GET({ request }) {
 			// Seed the live kernel list so the Kernels sidebar reflects kernels already
 			// running when this tab connects. Also a full snapshot — self-healing.
 			seed({ type: 'kernel:status', global: true, kernels: listKernels() });
+			// `file:changed` is deliberately NOT seeded: it is an event, not a
+			// snapshot, and the server does not know what each tab holds. A file tab
+			// closes the same window itself by revalidating its file against disk on
+			// the client's synthetic `sse:open` frame (and on window focus).
 			unsubscribe = subscribe(send);
 			heartbeat = setInterval(() => enqueue(': heartbeat\n\n'), HEARTBEAT_MS);
 			// Sample `desiredSize` on a steady cadence so a stuck peer is reaped even
