@@ -63,8 +63,52 @@ describe('outputCopyText - error', () => {
 });
 
 describe('outputCopyText - rich bundles', () => {
-	it('prefers text/plain over ordinary rich html', () => {
+	it('reads rich html rather than the text/plain beside it - html is what the cell shows', () => {
 		expect(outputCopyText(result({ 'text/plain': '42', 'text/html': '<b>42</b>' }))).toBe('42');
+		// The two agree above; here they do not, and the html wins.
+		expect(outputCopyText(result({ 'text/plain': '<Styler object>', 'text/html': '<b>42</b>' }))).toBe('42');
+	});
+
+	it('copies NOTHING for an html-rendered object with a placeholder repr (a folium map)', () => {
+		// The common shape this rule exists for: IPython attaches a `text/plain` repr
+		// to almost every rich object, and folium/ipyleaflet/pygwalker render as an
+		// all-script iframe. Preferring the repr pasted `<folium.folium.Map ...>` for
+		// a map the cell shows in full; the html strips to nothing, so the button is
+		// honestly DISABLED instead - the image/plotly outcome, never a placeholder.
+		const map = display({
+			'text/html':
+				'<div id="map_9f3"></div><script>var map_9f3 = L.map("map_9f3");' +
+				'L.tileLayer("https://tile/{z}/{x}/{y}.png").addTo(map_9f3);</script>',
+			'text/plain': '<folium.folium.Map object at 0x7f8b1c0d5e10>'
+		});
+		expect(outputCopyText(map)).toBe('');
+		expect(hasCopyableOutput([map])).toBe(false);
+		expect(copyOutputText([map])).toBe('');
+	});
+
+	it('copies an html-rendered object that DOES carry text, still never its repr', () => {
+		const rich = display({
+			'text/html': '<div><h3>Summary</h3><p>3 rows loaded</p></div>',
+			'text/plain': '<pygwalker.Walker object at 0x1>'
+		});
+		expect(outputCopyText(rich)).toBe('Summary\n3 rows loaded');
+	});
+
+	it('refuses an OVERSIZED html payload rather than converting it', () => {
+		// The bound is load-bearing: `hasCopyableOutput` runs inside a $derived on the
+		// cell-mount path AND during SSR, and every rich bundle now reaches the html
+		// path. A payload this large is an inline JS bundle (Bokeh INLINE, plotly
+		// include_plotlyjs=True), which strips to nothing anyway - so the bound
+		// reaches the same verdict without the multi-pass conversion.
+		const huge = '<div>' + 'x'.repeat(600 * 1024) + '</div>';
+		const out = display({ 'text/html': huge, 'text/plain': '<Big object>' });
+		expect(outputCopyText(out)).toBe('');
+		expect(hasCopyableOutput([out])).toBe(false);
+		// Measured on the LINE ARRAY nbformat really stores, without joining it.
+		const lines = Array.from({ length: 700 }, () => 'y'.repeat(1024) + '\n');
+		expect(outputCopyText(display({ 'text/html': lines }))).toBe('');
+		// A payload under the bound still converts.
+		expect(outputCopyText(display({ 'text/html': '<div>' + 'z'.repeat(1024) + '</div>' }))).toBe('z'.repeat(1024));
 	});
 
 	it('copies NOTHING for an image, not its "<Figure …>" placeholder repr', () => {
@@ -206,10 +250,41 @@ describe('outputCopyText - text/html (the pandas Styler case: no text/plain)', (
 		// The reason the absorption is scoped to table tags rather than to every
 		// inter-tag gap: in pygments-highlighted code the newline between two spans
 		// IS the line break.
-		expect(htmlToPlainText('<pre><span class="k">def</span> <span class="nf">f</span>():\n    <span>pass</span></pre>')).toBe(
-			'def f():\npass'
-		);
 		expect(htmlToPlainText('<div><span>a</span>\n<span>b</span></div>')).toBe('a\nb');
+	});
+
+	it('keeps the whitespace inside a <pre>, where it is the content', () => {
+		// The four-space indent below is DELIBERATE and load-bearing - do not "tidy"
+		// it back. Inside a <pre> whitespace is significant, so collapsing space runs
+		// and stripping leading indentation (which the per-line tidy does everywhere
+		// else) silently destroys the alignment of pygments-highlighted code, an
+		// aligned ASCII table, or a <pre>-wrapped `to_string()`.
+		expect(htmlToPlainText('<pre><span class="k">def</span> <span class="nf">f</span>():\n    <span>pass</span></pre>')).toBe(
+			'def f():\n    pass'
+		);
+		expect(htmlToPlainText('<div class="highlight"><pre>if x:\n        y = 1\nelse:\n        y = 2</pre></div>')).toBe(
+			'if x:\n        y = 1\nelse:\n        y = 2'
+		);
+		// Column alignment survives: this is what a `to_string()` paste depends on.
+		const table = '<pre>name    qty\napple     3\npear      5</pre>';
+		expect(htmlToPlainText(table)).toBe('name    qty\napple     3\npear      5');
+		// ...while OUTSIDE a <pre> the tidy is unchanged.
+		expect(htmlToPlainText('<p>a     b</p><p>    indented</p>')).toBe('a b\nindented');
+	});
+
+	it('keeps <pre> and non-<pre> content apart in one payload', () => {
+		// The preformatted line keeps its own leading AND trailing spaces (both are
+		// content inside a <pre>) while the paragraphs around it are still tidied,
+		// and no blank line opens between them.
+		expect(htmlToPlainText('<p>before     it</p><pre>  keep  me  </pre><p>after     it</p>')).toBe(
+			'before it\n  keep  me  \nafter it'
+		);
+	});
+
+	it('cannot have a <pre> slot forged by an entity in the surrounding markup', () => {
+		// The lifted bodies are parked behind a NUL sentinel, so a payload that could
+		// mint one would have someone else's <pre> substituted into its own text.
+		expect(htmlToPlainText('<p>&#0;0&#0;</p><pre>secret</pre>')).toBe('&#0;0&#0;\nsecret');
 	});
 
 	it('decodes entities and drops script/style bodies', () => {
@@ -335,23 +410,26 @@ describe('outputCopyText - a SAVED DataFrame (structured MIME stripped by clean-
 		expect(outputCopyText(display({ 'text/html': PANDAS_HTML }))).toBe(outputCopyText(display(LIVE)));
 	});
 
-	it('leaves a non-dataframe table to text/plain, then to the tag-strip', () => {
+	it('leaves a non-dataframe table to the tag-strip, text/plain sibling or not', () => {
 		const styler = '<table id="T_x"><thead><tr><th>name</th></tr></thead><tbody><tr><td>apple</td></tr></tbody></table>';
-		// A pandas Styler carries no `class="dataframe"`, so it does not parse: with a
-		// text/plain sibling that still wins, and alone it falls to the tag-strip.
-		expect(outputCopyText(display({ 'text/html': styler, 'text/plain': 'plain wins' }))).toBe('plain wins');
+		// A pandas Styler carries no `class="dataframe"`, so it does not parse - but it
+		// is still the table the cell SHOWS, so it outranks the repr beside it.
+		expect(outputCopyText(display({ 'text/html': styler, 'text/plain': '<Styler object>' }))).toBe('name\napple');
 		expect(outputCopyText(display({ 'text/html': styler }))).toBe('name\napple');
 	});
 
-	it('falls back to text/plain outside a browser (the parser needs DOMParser)', () => {
+	it('falls through to the tag-strip outside a browser (the parser needs DOMParser)', () => {
 		// Pinned explicitly so the jsdom-only path above can never pass for the wrong
-		// reason in a `node` environment: with no DOMParser the parse returns null.
+		// reason in a `node` environment: with no DOMParser the parse returns null and
+		// the same html is tag-stripped instead - never the elided repr beside it.
 		const saved = display({ 'text/html': PANDAS_HTML, 'text/plain': 'repr fallback' });
 		const savedParser = globalThis.DOMParser;
 		try {
 			// @ts-expect-error - simulating the non-DOM environment the parser guards for.
 			delete globalThis.DOMParser;
-			expect(outputCopyText(saved)).toBe('repr fallback');
+			const text = outputCopyText(saved);
+			expect(text).not.toBe('repr fallback');
+			expect(text).toBe('\ta\tb\n0\t1\tx\n1\t2\ty');
 		} finally {
 			globalThis.DOMParser = savedParser;
 		}
@@ -478,7 +556,21 @@ describe('the enabled rule and the copy can never disagree', () => {
 		['a plotly figure', [display({ 'application/vnd.plotly.v1+json': { data: [] } })]],
 		['a live widget view', [display({ 'application/vnd.jupyter.widget-view+json': { model_id: 'm' } })]],
 		['an all-script html bundle', [display({ 'text/html': '<div id="c"></div><script>go()</script>' })]],
+		[
+			'a folium map (all-script html + a placeholder repr)',
+			[display({ 'text/html': '<div id="m"></div><script>L.map("m")</script>', 'text/plain': '<folium.folium.Map>' })]
+		],
 		['an html-wrapped image', [result({ 'text/html': '<div><img src="x.png"/></div>' })]],
+		[
+			'an html-wrapped image WITH a repr beside it',
+			[result({ 'text/html': '<div><img src="x.png"/></div>', 'text/plain': '<IPython.core.display.HTML>' })]
+		],
+		[
+			'an oversized html bundle',
+			[display({ 'text/html': '<div>' + 'x'.repeat(600 * 1024) + '</div>', 'text/plain': '<Big object>' })]
+		],
+		['rich html that does carry text', [display({ 'text/html': '<p>hello</p>', 'text/plain': '<Obj>' })]],
+		['preformatted html', [display({ 'text/html': '<pre>  a  b</pre>' })]],
 		['a Styler table', [display({ 'text/html': '<table><tbody><tr><td>a</td></tr></tbody></table>' })]],
 		[
 			'a live DataFrame',

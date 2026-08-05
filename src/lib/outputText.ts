@@ -14,15 +14,19 @@
 //      for "Figure" should still land on that cell; copy returns NOTHING,
 //      precisely so an image-only cell's copy button is honestly disabled instead
 //      of pasting a placeholder.
-//   2. A SAVED DataFrame. Clean-on-save strips the structured
+//   2. `text/html`. Search never looks at html AT ALL and falls through to
+//      `text/plain`; copy reads the html, because that is what the cell SHOWS.
+//      Two consequences. A SAVED DataFrame (clean-on-save strips the structured
 //      `application/vnd.cellar.dataframe+json` MIME, leaving only pandas'
-//      `text/html` repr - which copy parses back into the full grid table (via
-//      `$lib/dataframeHtml`), while search never looks at html at all and falls
-//      through to the elided `text/plain` repr. So a value that the grid shows but
-//      the repr elided is copyable yet NOT findable by Ctrl+F. The search side
-//      here is PRE-EXISTING and unchanged - this is a known gap, not a regression
-//      and not something already fixed; closing it would put a DOMParser parse on
-//      the search hot path, which is its own piece of work.
+//      `text/html` repr) copies back as the full grid table via
+//      `$lib/dataframeHtml`, so a value the grid shows but the repr elided is
+//      copyable yet NOT findable by Ctrl+F. And any other rich html copies
+//      tag-stripped, so a folium map - all `<script>`, with a
+//      `<folium.folium.Map>` repr beside it - is findable by that placeholder yet
+//      honestly not copyable. The search side here is PRE-EXISTING and unchanged -
+//      a known gap, not a regression and not something already fixed; closing it
+//      would put a DOMParser parse and a multi-pass string conversion on the
+//      search hot path, which is its own piece of work.
 //
 // So a change to "what counts as an output's text" may well belong in only one of
 // them - but check BOTH before deciding, and keep these shared helpers here so the

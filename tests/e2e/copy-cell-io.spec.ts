@@ -44,6 +44,8 @@ const SRC_MULTI = 'multi()';
 const SRC_EMPTY = 'x = 1';
 const SRC_BLANK = 'print()';
 const SRC_SCRIPT = 'chart.show()';
+const SRC_MAP = 'folium_map()';
+const SRC_PRE = 'highlighted()';
 const SRC_SQL = 'SELECT 1 AS one';
 const SRC_MD = '## A heading\n\nsome *prose*';
 // Far below the initial window: proves the copy reads the model, not a node that
@@ -159,6 +161,34 @@ function notebookJson(): string {
 					output_type: 'display_data',
 					metadata: {},
 					data: { 'text/html': '<div id="chart-1"></div><script>(function () { window.__chartEmbedded = "chart-1"; })();</script>' }
+				}
+			]),
+			// A folium map: all-script html PLUS IPython's placeholder text/plain repr.
+			// The common rich-object shape - preferring that repr pasted
+			// `<folium.folium.Map ...>` for a map the cell renders in full.
+			cell('copy-map-aaaaaaa', SRC_MAP, [
+				{
+					output_type: 'display_data',
+					metadata: {},
+					data: {
+						'text/html':
+							'<div id="map_9f3" style="height:120px"></div><script>(function () { window.__mapEmbedded = "map_9f3"; })();</script>',
+						'text/plain': '<folium.folium.Map object at 0x7f8b1c0d5e10>'
+					}
+				}
+			]),
+			// html-only preformatted text (pygments code, an aligned `to_string()`):
+			// inside a <pre> the whitespace IS the content, so the per-line tidy that
+			// applies everywhere else must not reach it.
+			cell('copy-pre-aaaaaaa', SRC_PRE, [
+				{
+					output_type: 'display_data',
+					metadata: {},
+					data: {
+						'text/html':
+							'<div class="highlight"><pre><span class="k">def</span> <span class="nf">f</span>():\n' +
+							'    <span class="k">return</span> <span class="mi">1</span></pre></div>'
+					}
 				}
 			]),
 			// Image only - matplotlib ships a `<Figure …>` text/plain repr alongside,
@@ -419,6 +449,30 @@ test('copy output is disabled when the text CONVERTS to nothing, not merely when
 	await reveal(page, 'copy-script-aaaa');
 	await expect(cellEl(page, 'copy-script-aaaa').getByTestId('copy-output')).toBeDisabled();
 	expect(await copied(page)).toEqual([]);
+});
+
+test('copy output is disabled for an html-rendered map, never pasting its placeholder repr', async ({ page }) => {
+	// IPython attaches a text/plain repr to almost every rich object, so this is the
+	// common shape, not an edge case: the cell SHOWS a folium map in a sandboxed
+	// iframe, and the repr beside it is a placeholder. Preferring the repr pasted
+	// `<folium.folium.Map ...>`; the html is all script, so nothing is copyable and
+	// the button is honestly disabled - the image/plotly outcome.
+	await openNotebook(page);
+	await reveal(page, 'copy-map-aaaaaaa');
+	const button = cellEl(page, 'copy-map-aaaaaaa').getByTestId('copy-output');
+	await expect(button).toBeDisabled();
+	await expect(button).toHaveAttribute('aria-label', /no output to copy/i);
+	expect(await copied(page)).toEqual([]);
+});
+
+test('copy output keeps the indentation of preformatted html', async ({ page }) => {
+	// Inside a <pre> whitespace is the content, so the per-line tidy that collapses
+	// space runs and strips indentation everywhere else must not reach it - else
+	// pygments-highlighted code and an aligned `to_string()` paste unaligned.
+	await openNotebook(page);
+	await reveal(page, 'copy-pre-aaaaaaa');
+	await cellEl(page, 'copy-pre-aaaaaaa').getByTestId('copy-output').click();
+	expect(await lastCopied(page)).toBe('def f():\n    return 1');
 });
 
 test('a disabled copy-output SAYS why, in the label a disabled control can still report', async ({ page }) => {

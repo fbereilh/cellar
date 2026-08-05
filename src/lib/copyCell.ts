@@ -34,24 +34,36 @@
 //                                          so a live and a re-opened DataFrame
 //                                          copy the same shape. Browser-only
 //                                          (DOMParser); outside a DOM it simply
-//                                          falls through to `text/plain`.
-//   6. `text/plain`                     -> that text (Jupyter's canonical plain
-//                                          form). Only html that parses as a
-//                                          DataFrame outranks it; for any OTHER
-//                                          rich html it still wins.
-//   7. `text/html`                      -> tag-stripped text, table cells
-//                                          tab-separated (the pandas *Styler*
-//                                          case: it emits no text/plain). Raw
-//                                          markup is never pasted. Every row keeps
-//                                          its column count whether the markup is
-//                                          written compactly or pretty-printed one
-//                                          cell per line, which is how a Styler's
-//                                          jinja template really emits it.
+//                                          falls through to step 6.
+//   6. any OTHER `text/html`            -> tag-stripped text, table cells
+//                                          tab-separated. Raw markup is never
+//                                          pasted. Every row keeps its column
+//                                          count whether the markup is written
+//                                          compactly or pretty-printed one cell
+//                                          per line, which is how a Styler's jinja
+//                                          template really emits it. This OUTRANKS
+//                                          `text/plain`, because html is what
+//                                          renderOutput SHOWS (in a sandboxed
+//                                          iframe) - and IPython attaches a
+//                                          placeholder `text/plain` repr to almost
+//                                          every rich object, so preferring the
+//                                          repr pasted `<folium.folium.Map>` for a
+//                                          map the cell renders in full. An
+//                                          all-script bundle strips to nothing, so
+//                                          such a cell's button ends up DISABLED -
+//                                          the same honest outcome as steps 1, 3
+//                                          and 4, never a placeholder.
+//   7. `text/plain`                     -> that text (Jupyter's canonical plain
+//                                          form). The answer for an output with no
+//                                          `text/html` at all.
 //   8. anything else                    -> ''
 //
 // Steps 2-4 sit in `renderOutput`'s own order (it prefers the structured payload
 // over plotly/image); the two can only differ for a bundle carrying both, and
 // matching what is on screen is the rule.
+//
+// ONE BOUND on step 5/6: an oversized `text/html` payload is not copyable at all
+// (see {@link MAX_HTML_COPY_CHARS}).
 //
 // ONE STATED EXCEPTION to "copy gives you what the cell SHOWS": a MISSING value
 // copies as a BLANK cell, where the grid draws an italic "NaN"
@@ -72,10 +84,12 @@
 // `asText` / `stripAnsi` / `DataFramePayload` are shared with `$lib/search.ts`
 // (see `$lib/outputText`), whose PRIORITY deliberately differs in TWO places:
 // search returns matplotlib's `<Figure …>` placeholder as searchable text where
-// copy returns nothing, and for a SAVED DataFrame copy parses the pandas
-// `text/html` repr back into the full grid table (step 5) where search never
-// touches html and falls through to the elided `text/plain` repr. Decide for both
-// before changing either.
+// copy returns nothing, and search never looks at `text/html` AT ALL - it falls
+// through to `text/plain` - where copy reads it in both of the ways above (a
+// SAVED DataFrame back into the full grid table at step 5, any other rich html
+// tag-stripped at step 6). So a value the grid shows but the elided repr hid is
+// copyable yet not findable, and a folium map is findable by its placeholder repr
+// yet not copyable. Decide for both before changing either.
 
 import type { CellOutput } from '$lib/server/types';
 import { asText, stripAnsi, type DataFramePayload } from '$lib/outputText';
@@ -92,11 +106,50 @@ function trimCopyText(s: string): string {
 	return s.replace(/[^\S\t]+$/, '');
 }
 
-/** Cheap "is there anything here" test that does NOT materialize the joined text. */
-function nonEmpty(v: unknown): boolean {
-	if (Array.isArray(v)) return v.some((p) => typeof p === 'string' && p.length > 0);
-	return typeof v === 'string' && v.length > 0;
+/**
+ * The size of an nbformat text field, WITHOUT materializing the joined string:
+ * the field is a line ARRAY, so summing the parts is what lets the bound below be
+ * checked before a multi-MB payload is ever copied into one buffer. Doubles as
+ * the "is there anything here" test (`> 0`).
+ *
+ * Counts UTF-16 code units rather than UTF-8 bytes; output HTML is
+ * ASCII-dominant, so the two agree closely enough for a size bound and a byte
+ * count would need its own scan of the very payload this avoids touching.
+ */
+function mimeChars(v: unknown): number {
+	if (typeof v === 'string') return v.length;
+	if (!Array.isArray(v)) return 0;
+	let n = 0;
+	for (const p of v) if (typeof p === 'string') n += p.length;
+	return n;
 }
+
+/**
+ * Above this, a `text/html` output is treated as having no copyable text at all -
+ * neither joined, nor parsed, nor converted.
+ *
+ * This is load-bearing, not an optimization. `hasCopyableOutput` runs inside a
+ * Svelte `$derived` re-evaluated on every outputs change of every mounted cell,
+ * SYNCHRONOUSLY on the cell-mount path (a jank frame while scrolling under
+ * windowing) and again during SSR of the notebook page - on the single Node
+ * process that also carries the kernel websockets and the SSE fan-out. Since html
+ * now outranks `text/plain` (step 6 above), every rich bundle reaches this path,
+ * including the ones that used to go straight to an iframe `srcdoc` unscanned.
+ * The memo below bounds it to once per output object but does nothing for that
+ * first hit.
+ *
+ * 512 KiB separates the two populations cleanly. A genuine Styler or a
+ * hand-written `display(HTML(...))` table is tens of KiB, and pandas' own
+ * `_repr_html_` is bounded by its display options (60 rows x 20 columns by
+ * default) to about 25 KiB - three orders of magnitude of headroom. What actually
+ * exceeds it is an INLINE JS BUNDLE: Bokeh's `output_notebook()` with
+ * `INLINE` resources, or plotly's `include_plotlyjs=True`, both megabytes. Those
+ * are all `<script>`, so they strip to nothing and would disable the button
+ * anyway - the bound reaches the same verdict without the work. Same spirit as
+ * the `/dataframe/i` pre-check in `$lib/dataframeHtml`: refuse cheaply, on a
+ * signal that cannot be wrong about the common case.
+ */
+const MAX_HTML_COPY_CHARS = 512 * 1024;
 
 const cellStr = (v: unknown): string => (v == null ? '' : String(v));
 
@@ -164,7 +217,10 @@ function decodeEntities(s: string): string {
 	return s.replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (whole, body: string) => {
 		if (body[0] === '#') {
 			const code = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
-			if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return whole;
+			// NUL is refused, not merely useless in copied text: it is the marker the
+			// `<pre>` placeholder below is keyed on, so decoding `&#0;` here would let
+			// a payload forge a placeholder slot.
+			if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) return whole;
 			try {
 				return String.fromCodePoint(code);
 			} catch {
@@ -189,6 +245,37 @@ function decodeEntities(s: string): string {
  */
 const TABLE_LAYOUT_WS = /\s*<(\/?)(table|thead|tbody|tfoot|tr|th|td|caption|colgroup|col)((?:\s[^>]*)?)>\s*/gi;
 
+/** A `<pre>` body, up to its close tag (or the end of a truncated payload). */
+const PRE_BLOCK = /<pre\b[^>]*>([\s\S]*?)(?:<\/pre\s*>|$)/gi;
+
+/**
+ * The sentinel a lifted `<pre>` body is parked behind while the rest of the
+ * markup goes through the per-line tidy. NUL, because real output HTML never
+ * carries one - and the two places that could introduce one (the raw payload,
+ * and `decodeEntities` resolving `&#0;`) both refuse it, so no payload can forge
+ * a slot and have someone else's `<pre>` substituted into it.
+ */
+const PRE_MARK = '\u0000';
+const PRE_MARK_RE = /\u0000/g;
+const PRE_SLOT_RE = /\u0000(\d+)\u0000/g;
+
+/**
+ * The text of a `<pre>` body: tags out, entities decoded, and NOTHING else.
+ *
+ * The per-line tidy in {@link htmlToPlainText} is deliberately skipped here,
+ * because inside a `<pre>` whitespace is the CONTENT: collapsing space runs and
+ * stripping leading indentation destroys the alignment of exactly the outputs
+ * this path exists for - pygments-highlighted code (which pandas, IPython and
+ * every syntax-highlighting repr emit as `<div class="highlight"><pre>`), an
+ * aligned ASCII table, a `<pre>`-wrapped `to_string()`. Elsewhere HTML
+ * whitespace really is insignificant, so the tidy stays as it was.
+ */
+function preformattedText(body: string): string {
+	// A single newline straight after `<pre>` is layout, not content: the HTML
+	// parser drops it, so the cell never shows it either.
+	return decodeEntities(body.replace(/^\r?\n/, '').replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]*>/g, ''));
+}
+
 /**
  * A readable plain-text rendering of an output's `text/html`.
  *
@@ -196,16 +283,28 @@ const TABLE_LAYOUT_WS = /\s*<(\/?)(table|thead|tbody|tfoot|tr|th|td|caption|colg
  * Styler pastes as a table - for pretty-printed markup as much as for markup
  * written with no whitespace between its tags (see {@link TABLE_LAYOUT_WS}).
  * `<script>`/`<style>` bodies are dropped whole (they are machinery, not
- * output), remaining tags are removed, and entities decoded. Returns `''` for
- * markup that carries no text (an html-wrapped image, a Bokeh bundle that is all
- * script) - the caller then treats it as nothing to copy.
+ * output), `<pre>` bodies keep their own whitespace (see
+ * {@link preformattedText}), remaining tags are removed, and entities decoded.
+ * Returns `''` for markup that carries no text (an html-wrapped image, a Bokeh
+ * bundle that is all script, a folium map that is all script) - the caller then
+ * treats it as nothing to copy, so its button is honestly disabled.
  */
 export function htmlToPlainText(html: string): string {
-	let s = html;
+	// NUL is the `<pre>` placeholder marker below. Real output HTML carries none,
+	// and dropping any up front (with `decodeEntities` refusing to mint one) means
+	// no payload can forge a placeholder slot.
+	let s = html.replace(PRE_MARK_RE, '');
 	// Drop non-text bodies wholesale (an unclosed tag swallows the rest, which is
 	// the right answer for a truncated bundle: the tail is machinery too).
 	s = s.replace(/<(script|style)\b[^>]*>[\s\S]*?(<\/\1\s*>|$)/gi, ' ');
 	s = s.replace(/<!--[\s\S]*?(-->|$)/g, ' ');
+	// Lift preformatted bodies out BEFORE the tidy, and put them back after it.
+	// The placeholder carries the SAME trailing newline the `</pre>` it replaces
+	// would have emitted below, and no leading one - so block boundaries around a
+	// `<pre>` come out exactly as they did before it was lifted, with no blank line
+	// opened after the paragraph in front of it.
+	const pre: string[] = [];
+	s = s.replace(PRE_BLOCK, (_whole, body: string) => `${PRE_MARK}${pre.push(preformattedText(body)) - 1}${PRE_MARK}\n`);
 	s = s.replace(TABLE_LAYOUT_WS, '<$1$2$3>');
 	// Cell boundaries become tabs, block boundaries newlines, BEFORE tags go.
 	s = s.replace(/<\/(td|th)\s*>/gi, '\t');
@@ -225,12 +324,16 @@ export function htmlToPlainText(html: string): string {
 		.map((line) => line.replace(/[^\S\t\n]+/g, ' ').replace(/ *\t? *$/, '').replace(/^[ ]+/, ''))
 		.join('\n')
 		.replace(/\n{3,}/g, '\n\n');
+	// Put the preformatted bodies back, now that the tidy cannot reach their
+	// whitespace. Substituted text is never re-scanned, so a `<pre>` that itself
+	// looks like a slot cannot pull in another one.
+	const restored = pre.length === 0 ? joined : joined.replace(PRE_SLOT_RE, (whole, i: string) => pre[Number(i)] ?? whole);
 	// Drop leading blank LINES only. Not `.trim()` and not `/^\s+/`: either would
 	// eat a leading TAB, and the first line of a pandas Styler starts with exactly
 	// that - the separator of the blank index heading, a real (empty) first column,
 	// whose loss left the header one column short of every row below it. The
 	// symmetric trailing case is `trimCopyText`'s.
-	return trimCopyText(joined.replace(/^\n+/, ''));
+	return trimCopyText(restored.replace(/^\n+/, ''));
 }
 
 // ---- Per-output text ------------------------------------------------------
@@ -260,19 +363,25 @@ export function outputCopyText(o: CellOutput): string {
 			if (df) return dataframeTable(df);
 			if (d[PLOTLY_MIME]) return '';
 			if (Object.keys(d).some((k) => k.startsWith('image/'))) return '';
-			// Joined ONCE, above both branches: an nbformat `text/html` is a line ARRAY,
-			// so a multi-MB Bokeh/Altair bundle that does not parse as a DataFrame would
-			// otherwise allocate the whole joined string twice on this path.
-			const html = nonEmpty(d['text/html']) ? asText(d['text/html']) : null;
-			if (html !== null) {
+			// html OUTRANKS text/plain (steps 5-7 in the header): it is what the cell
+			// SHOWS, and the text/plain beside it is usually IPython's placeholder repr.
+			// Measured before joining, so an oversized bundle is refused without ever
+			// being materialized into one buffer.
+			const htmlChars = mimeChars(d['text/html']);
+			if (htmlChars > 0) {
+				if (htmlChars > MAX_HTML_COPY_CHARS) return '';
+				// Joined ONCE, above both branches: an nbformat `text/html` is a line ARRAY,
+				// so a bundle that does not parse as a DataFrame would otherwise allocate
+				// the whole joined string twice on this path.
+				const html = asText(d['text/html']);
 				// A SAVED DataFrame: clean-on-save stripped the structured MIME, so this
 				// pandas repr is what renderOutput itself re-parses back into the grid.
 				// Same parser, same table - never a second one.
 				const parsed = parsePandasDataFrameHtml(html);
 				if (parsed) return dataframeTable(parsed);
+				return htmlToPlainText(html);
 			}
-			if (nonEmpty(d['text/plain'])) return asText(d['text/plain']);
-			if (html !== null) return htmlToPlainText(html);
+			if (mimeChars(d['text/plain']) > 0) return asText(d['text/plain']);
 			return '';
 		}
 		default:
