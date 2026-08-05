@@ -44,9 +44,13 @@
 	}
 
 	// A workspace file opened into an editor tab. Owns its own load/save; reports
-	// dirty state up so the tab bar can show the unsaved indicator. `gitRefresh`
-	// is the shell's `fsRefreshSignal`: a bump means the workspace's git state may
-	// have moved, so re-fetch the HEAD baseline the gutter diffs against.
+	// dirty state up so the tab bar can show the unsaved indicator. It also tracks
+	// the file on DISK — the server watches it and publishes `file:changed`, which
+	// this tab applies as a minimal edit when the buffer is clean and offers behind
+	// a Reload / Keep-mine banner when it is not (see the "External on-disk
+	// changes" section below for the full rule). `gitRefresh` is the shell's
+	// `fsRefreshSignal`: a bump means the workspace's git state may have moved, so
+	// re-fetch the HEAD baseline the gutter diffs against.
 	// `onBlame(path, record|null)` reports the git-blame record for the line the
 	// cursor sits on, so the shell's bottom status bar can show "who last edited
 	// this line, and when" (GitLens-style). `null` = no blame (untracked / non-repo).

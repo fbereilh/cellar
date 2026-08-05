@@ -15,7 +15,15 @@
  * rides the normal bundle into `build/` — the launcher does not import it.
  */
 
-/** Ordinary text file ceiling: don't stream a giant file into a CodeMirror tab. */
+/**
+ * Ordinary text file ceiling: don't stream a giant file into a CodeMirror tab.
+ *
+ * A third consumer reuses this value with different semantics, so changing it
+ * moves more than the tab: `fileWatch.ts`'s `MAX_WATCHED_FILE_BYTES` is this
+ * ceiling applied UNIFORMLY — deliberately without the `.html` exception below —
+ * to how big a file the external-change watcher will read+hash on every settled
+ * event (see that module for why).
+ */
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 /**

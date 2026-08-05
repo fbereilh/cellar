@@ -77,11 +77,14 @@ export function publish(event: CellarEvent): PublishedEvent {
 }
 
 /**
- * Publish an event that belongs to no single notebook — today, the kernel run
- * queue, which spans every open notebook because the kernel does. It carries no
- * `seq`: each such event is a FULL state snapshot, so a missed one is corrected
- * by the next rather than needing gap detection. The client dispatches these
- * before its per-notebook `nb`/`seq` filter.
+ * Publish an event that belongs to no single notebook — the kernel run queue and
+ * the live kernel list (both span every open notebook because the kernel does),
+ * the ipywidgets snapshot, and `file:changed`, which is about a workspace file
+ * rather than a notebook at all. It carries no `seq`: each such event is a FULL
+ * statement (a state snapshot, or in `file:changed`'s case everything there is to
+ * say about one file), so a missed one is corrected by the next rather than
+ * needing gap detection. The client dispatches these before its per-notebook
+ * `nb`/`seq` filter.
  */
 export function publishGlobal<T extends Record<string, unknown>>(
 	event: T
