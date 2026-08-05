@@ -29,15 +29,26 @@ const SHELL = join(process.cwd(), 'src/routes/+page.svelte');
 const src = readFileSync(SHELL, 'utf8');
 
 /**
- * The brace-balanced block that opens at `marker` (which must end with `{`).
+ * The brace-balanced block that opens at `marker`'s FIRST `{`.
  * Reading the real block - not a window of N lines - is what keeps the guard
  * honest when the surrounding code is reshuffled.
+ *
+ * The scan starts at the marker's own first `{` rather than at its last
+ * character, so a marker whose brace is INTERIOR (one that reaches past the
+ * opening line to disambiguate which of several identical openers it means) is
+ * measured from the same brace as a marker that ends in one. Scanning from the
+ * end instead let such a marker open at depth 0, so the first `}` drove it
+ * negative and the block silently ran on to wherever a later `}` restored the
+ * balance - a slice covering unrelated code, which is a guard that passes by
+ * accident.
  */
 function blockAt(marker: string): string {
 	const start = src.indexOf(marker);
 	expect(start, `anchor not found in +page.svelte: ${marker}`).toBeGreaterThan(-1);
+	const brace = marker.indexOf('{');
+	expect(brace, `anchor opens no block: ${marker}`).toBeGreaterThan(-1);
 	let depth = 0;
-	for (let i = start + marker.length - 1; i < src.length; i++) {
+	for (let i = start + brace; i < src.length; i++) {
 		if (src[i] === '{') depth++;
 		else if (src[i] === '}') {
 			depth--;
@@ -50,10 +61,18 @@ function blockAt(marker: string): string {
 describe('a run this tab did NOT initiate refreshes what its own run does', () => {
 	const foreign = blockAt("if (ev.type === 'run:end' && ev.originId !== originId) {");
 	const own = blockAt('function onRunEnd() {');
+	const debounced = blockAt('function scheduleForeignVariablesRefresh() {');
+	// The foreign branch reaches the inspector THROUGH the coalescing helper (a
+	// foreign `run:end` arrives once per cell of an agent batch, and the probe runs
+	// real python), so resolve that one level of indirection before comparing the
+	// refresh SETS - what must match is which panels get refreshed, not how.
+	const foreignEffective = foreign.includes('scheduleForeignVariablesRefresh()')
+		? foreign + debounced
+		: foreign;
 
 	it('refreshes the kernel badge AND the variable inspector', () => {
 		expect(foreign).toContain('refreshKernel()');
-		expect(foreign).toContain('refreshVariables()');
+		expect(foreignEffective).toContain('refreshVariables()');
 	});
 
 	it('refreshes every panel the own-run path refreshes', () => {
@@ -61,7 +80,58 @@ describe('a run this tab did NOT initiate refreshes what its own run does', () =
 		// subset of it. Compare the refresh calls, not the whole body.
 		const refreshes = (block: string) =>
 			[...block.matchAll(/\brefresh[A-Za-z]+\(/g)].map((m) => m[0]).sort();
-		for (const call of new Set(refreshes(own))) expect(refreshes(foreign)).toContain(call);
+		for (const call of new Set(refreshes(own))) expect(refreshes(foreignEffective)).toContain(call);
+	});
+
+	it('coalesces the inspector probe but never the kernel badge', () => {
+		// The badge is a cheap READ (`/api/kernel` never probes), so it stays
+		// immediate and ungated; the inspector probe must not be reachable directly
+		// from this branch, or a burst would cost one kernel execution per cell.
+		expect(foreign).toContain('scheduleForeignVariablesRefresh()');
+		expect(foreign).not.toMatch(/(?<!scheduleForeign)\brefreshVariables\(/);
+		expect(foreign.indexOf('refreshKernel()')).toBeLessThan(
+			foreign.indexOf('foreignRunTouchesActiveNotebook(')
+		);
+	});
+
+	it('restarts the pending timer so a burst collapses into one probe', () => {
+		// A trailing debounce that did not CLEAR the pending timer would fire once per
+		// event after a fixed delay - i.e. N probes, exactly what this exists to stop.
+		expect(debounced).toContain('clearTimeout(foreignVarsTimer)');
+		expect(debounced.indexOf('clearTimeout(foreignVarsTimer)')).toBeLessThan(
+			debounced.indexOf('setTimeout(')
+		);
+		expect(debounced).toContain('FOREIGN_VARS_REFRESH_MS');
+	});
+
+	it('probes only for a run in the notebook the inspector reflects', () => {
+		// `inspectVariables` probes the ACTIVE notebook's kernel, so a run elsewhere
+		// can only ever probe the wrong one. Undecidable cases must fall back to
+		// refreshing - a missed refresh is the bug this whole path exists to fix.
+		const gate = blockAt('function foreignRunTouchesActiveNotebook(nb: unknown): boolean {');
+		const failsOpen = [
+			/typeof nb !== 'string' \|\| !nb\) return true/, // no path on the event
+			/!activeNotebookPath\) return true/, // no notebook active
+			/!nb\.startsWith\(workspace\)\) return true/ // outside the workspace
+		];
+		for (const fallback of failsOpen) expect(gate).toMatch(fallback);
+		// The only verdict that may SKIP is a decided mismatch, so no other path here
+		// is allowed to answer false.
+		expect(gate).not.toMatch(/return false/);
+	});
+});
+
+describe('an inspector response that is no longer the newest is dropped', () => {
+	// Several probes can be in flight at once and responses are unordered, so an
+	// older namespace landing last would stick - the `kernelReqSeq` convention.
+	const refresh = blockAt('async function refreshVariables() {');
+
+	it('guards every write with a monotonic generation', () => {
+		expect(refresh).toContain('const seq = ++varsReqSeq;');
+		expect(refresh.indexOf('const seq = ++varsReqSeq;')).toBeLessThan(refresh.indexOf('await fetch('));
+		expect(refresh).toMatch(/if \(seq !== varsReqSeq\) return;[\s\S]*variables = body\.variables/);
+		expect(refresh).toMatch(/if \(seq !== varsReqSeq\) return;[\s\S]*varsError =/);
+		expect(refresh).toContain('if (seq === varsReqSeq) varsLoading = false;');
 	});
 });
 
@@ -71,6 +141,15 @@ describe('the initial inspect is not gated on a kernel this page already knows a
 	// case where an AGENT booted the kernel.
 	const restore = blockAt('onMount(() => {\n\t\tconst saved = getUi(');
 	const mountTail = restore.slice(restore.indexOf('LOGS_HEIGHT_KEY'));
+
+	it('is anchored on the restore block, not a slice running past it', () => {
+		// The marker's `{` is INTERIOR, so a scan starting at its last character
+		// opened at depth 0 and ran on into the NEXT `onMount`'s SSE callback. That
+		// silently unscoped the guard below - it would have passed with the mount
+		// inspect re-gated, which is precisely what it exists to prevent.
+		expect(restore).toContain('LOGS_OPEN_KEY');
+		expect(restore).not.toContain('subscribeEvents');
+	});
 
 	it('inspects variables unconditionally on mount', () => {
 		expect(mountTail).toContain('refreshVariables();');

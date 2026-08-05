@@ -1080,22 +1080,73 @@
 		refreshVariables();
 	}
 
+	// Monotonic generation for writes to `variables`, the sibling of `kernelReqSeq`
+	// (and of `statusSeq`/`uploadSeq`/`diskSeq` elsewhere). Several probes can be in
+	// flight at once — a Databricks session change, the mount-time restore and a run
+	// all reach here — and the responses are unordered, so without this an OLDER
+	// namespace can land last and stick until something else happens to refresh.
+	let varsReqSeq = 0;
+
 	async function refreshVariables() {
+		const seq = ++varsReqSeq;
 		varsLoading = true;
 		varsError = '';
 		try {
 			const res = await fetch('/api/kernel/variables');
 			const body = await res.json();
+			if (seq !== varsReqSeq) return; // superseded while in flight → drop it
 			if (!res.ok) throw new Error(body?.message || 'inspect failed');
 			// `busy` means the kernel was running a cell, so the server skipped the probe
 			// (an internal probe must never queue behind a run). Keep the variables we
 			// already show rather than clearing them; the next idle refresh updates them.
 			if (!body.busy) variables = body.variables;
 		} catch (err) {
+			if (seq !== varsReqSeq) return; // superseded → its error is stale too
 			varsError = String((err as Error)?.message ?? err);
 		} finally {
-			varsLoading = false;
+			if (seq === varsReqSeq) varsLoading = false;
 		}
+	}
+
+	/**
+	 * A foreign `run:end` arrives once per CELL, and the variable inspector is a
+	 * REAL kernel probe (`/api/kernel/variables` → `inspectVariables`, which
+	 * `execute`s python on the ACTIVE notebook's kernel). So an agent's
+	 * `run_cells`/`run_all` batch would cost one probe per cell per open tab, each
+	 * serializing on that kernel's exec lock and inserting latency between the
+	 * agent's own cells. A short trailing debounce collapses a burst into ONE probe
+	 * while staying far below what a human reads as lag. The kernel badge is
+	 * deliberately NOT debounced — `/api/kernel` only reads state, it never probes.
+	 */
+	const FOREIGN_VARS_REFRESH_MS = 300;
+	let foreignVarsTimer: ReturnType<typeof setTimeout> | null = null;
+	function scheduleForeignVariablesRefresh() {
+		if (foreignVarsTimer) clearTimeout(foreignVarsTimer);
+		foreignVarsTimer = setTimeout(() => {
+			foreignVarsTimer = null;
+			refreshVariables();
+		}, FOREIGN_VARS_REFRESH_MS);
+	}
+
+	/**
+	 * Does a foreign run's notebook (an ABSOLUTE path, as every bus event carries)
+	 * belong to the notebook the inspector reflects (a workspace-RELATIVE path)?
+	 *
+	 * `inspectVariables` probes the ACTIVE notebook's kernel, so a run elsewhere can
+	 * only ever probe the wrong one. The two path shapes differ, so the answer is
+	 * derived through the same prefix rule `canonicalNotebookRel` uses — and every
+	 * case where it cannot be derived confidently falls back to TRUE: a missed
+	 * refresh is the bug this whole path exists to fix, so over-refreshing is the
+	 * safe direction and silently skipping is never one.
+	 */
+	function foreignRunTouchesActiveNotebook(nb: unknown): boolean {
+		if (typeof nb !== 'string' || !nb) return true; // no path on the event → can't tell
+		if (!activeNotebookPath) return true; // no notebook active → can't tell
+		if (!nb.startsWith(workspace)) return true; // outside the workspace → can't tell
+		const rel = nb.slice(workspace.length).replace(/^[/\\]+/, '');
+		if (!rel) return true;
+		const norm = (p: string) => p.replace(/\\/g, '/');
+		return norm(rel) === norm(activeNotebookPath);
 	}
 
 	// Per-notebook kernel controls. Each targets ONE notebook's kernel (by its
@@ -1199,8 +1250,8 @@
 	// this tab's `originId` and are skipped. `openFilePermanent` maps the default
 	// notebook's relative path to the canonical 'notebook' tab and any other
 	// `.ipynb` to a live `ipynb` tab — the same paths a tree double-click uses.
-	onMount(() =>
-		subscribeEvents((ev: ClientEvent) => {
+	onMount(() => {
+		const unsubscribe = subscribeEvents((ev: ClientEvent) => {
 			// Flag errors that arrive while the logs drawer is closed, so the status-bar
 			// toggle can show a red dot the user can act on.
 			if (ev.type === 'log' && (ev.entry as { level?: string } | undefined)?.level === 'error' && !logsOpen) {
@@ -1220,9 +1271,13 @@
 			// AND the namespace, and refreshing only the badge left the inspector empty
 			// for the whole session on a page that loaded before the agent booted the
 			// kernel (the mount-time inspect is a one-shot with nothing to read yet).
+			// The SET matches `onRunEnd`; the inspector half is COALESCED and SCOPED to
+			// the active notebook, because unlike a user's own run a foreign one arrives
+			// once per cell of an agent batch and the probe is a real kernel execution.
 			if (ev.type === 'run:end' && ev.originId !== originId) {
 				refreshKernel();
-				refreshVariables();
+				if (foreignRunTouchesActiveNotebook((ev as { nb?: unknown }).nb))
+					scheduleForeignVariablesRefresh();
 			}
 			if (ev.type !== 'notebook:opened') return;
 			if (ev.originId && ev.originId === originId) return;
@@ -1236,8 +1291,12 @@
 			// own open/create (focus:true, or the field absent on older events) focuses.
 			if (ev.focus === false) surfaceFilePermanent(ev.relPath as string);
 			else openFilePermanent(ev.relPath as string);
-		})
-	);
+		});
+		return () => {
+			unsubscribe();
+			if (foreignVarsTimer) clearTimeout(foreignVarsTimer);
+		};
+	});
 
 	// ---- Command palette (Cmd/Ctrl+K) ---------------------------------------
 	// The palette invokes notebook commands through the active notebook's

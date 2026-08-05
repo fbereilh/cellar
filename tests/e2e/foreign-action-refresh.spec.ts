@@ -152,6 +152,96 @@ test('a notebook the AGENT creates appears in the file tree with its git decorat
 	await expect(row.getByTestId('tree-git-letter')).toHaveText('U');
 });
 
+/**
+ * Count the page's OWN requests to a path, by EXACT pathname: `/api/kernel` is a
+ * prefix of `/api/kernel/variables`, and the whole point of these two tests is
+ * telling the cheap status READ apart from the real kernel PROBE.
+ */
+function countRequests(page: import('@playwright/test').Page) {
+	const counts = {
+		status: 0,
+		probe: 0,
+		/** Zero the counters once the page has settled, so setup traffic is excluded. */
+		reset() {
+			this.status = 0;
+			this.probe = 0;
+		}
+	};
+	page.on('request', (req) => {
+		let path = '';
+		try {
+			path = new URL(req.url()).pathname;
+		} catch {
+			return;
+		}
+		if (path === '/api/kernel') counts.status++;
+		else if (path === '/api/kernel/variables') counts.probe++;
+	});
+	return counts;
+}
+
+test('an AGENT batch costs ONE inspector probe, not one per cell', async ({ page }) => {
+	// The inspector is a real kernel execution, and a foreign `run:end` arrives once
+	// per CELL - so mirroring the own-run refresh naively made an agent's `run_all`
+	// cost N probes per open tab, each serializing on the kernel the agent is using.
+	const BATCH_NB = 'batch-run.ipynb';
+	const CELLS = 8;
+	await call('use_notebook', { name: BATCH_NB });
+	for (let i = 0; i < CELLS; i++)
+		await call('add_cell', { source: `batch_var_${i} = ${i}`, route_imports: false });
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.getByTestId('tree-file').filter({ hasText: BATCH_NB }).dblclick();
+	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+	await expect(page.getByTestId('vars-body')).toBeVisible();
+
+	const counts = countRequests(page);
+	// The mount-time inspect is setup, not the batch: settle, then start counting.
+	await page.waitForTimeout(1_000);
+	counts.reset();
+	await call('run_all');
+
+	// The batch really did reach the inspector...
+	await expect(page.getByTestId('var-row').filter({ hasText: `batch_var_${CELLS - 1}` })).toBeVisible({
+		timeout: 45_000
+	});
+	// ...but coalesced. Without the debounce this is one probe per cell; the margin
+	// is generous so a slow cell that outruns the window is not a flake.
+	expect(counts.probe).toBeGreaterThan(0);
+	expect(counts.probe).toBeLessThanOrEqual(3);
+});
+
+test('an AGENT run in a notebook the user is NOT viewing never probes the kernel', async ({ page }) => {
+	// `inspectVariables` probes the ACTIVE notebook's kernel, so a run anywhere else
+	// can only ever probe the wrong one - wasted work on the kernel the user IS
+	// using. The badge half still refreshes: it belongs to no single notebook.
+	const OTHER_NB = 'agent-only.ipynb';
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.getByTestId('tree-file').filter({ hasText: NB }).dblclick();
+	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+	await expect(page.getByTestId('vars-body')).toBeVisible();
+
+	const counts = countRequests(page);
+	// The mount-time inspect is setup, not the agent's run: settle, then count.
+	await page.waitForTimeout(1_000);
+	counts.reset();
+	await call('use_notebook', { name: OTHER_NB });
+	await call('add_and_run', { source: 'unrelated_var = 1', route_imports: false });
+
+	// The foreign `run:end` DID reach this tab - the ungated badge refresh proves
+	// the branch ran, so a zero probe count is the gate, not a missing event.
+	await expect
+		.poll(() => counts.status, { timeout: 45_000 })
+		.toBeGreaterThan(0);
+	await expect(page.getByTestId('kernel-notebook').filter({ hasText: OTHER_NB })).toBeVisible({
+		timeout: 20_000
+	});
+	// Well past the debounce window, so a probe that was merely late would show up.
+	await page.waitForTimeout(2_000);
+	expect(counts.probe).toBe(0);
+	await expect(page.getByTestId('var-row').filter({ hasText: 'unrelated_var' })).toHaveCount(0);
+});
+
 test("the page's OWN run still refreshes the Variables panel", async ({ page }) => {
 	// No-regression guard for the path that always worked (`onRunEnd`). The tab
 	// session is server-owned (`.cellar/`, not localStorage), so a fresh browser
