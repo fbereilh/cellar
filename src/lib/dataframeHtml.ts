@@ -13,7 +13,12 @@
 //
 // Everything is best-effort and never throws: any shape we can't confidently map
 // (no `class="dataframe"` table, MultiIndex column headers with colspans, an
-// empty body) returns null so the caller falls back to HtmlOutput.
+// empty body) returns null so the caller falls back to its own rendering.
+//
+// TWO consumers, and this is deliberately the ONE parser they share: Cell.svelte's
+// `renderOutput` (which falls back to HtmlOutput) and `$lib/copyCell` (which falls
+// back to tag-stripped text), so a live and a re-opened DataFrame copy the same
+// table the grid shows.
 
 // Mirror of DataFrameGrid's payload. Cells are strings/numbers/null; the grid's
 // DfValue already tolerates string cells, so HTML text is a valid value.
@@ -82,9 +87,10 @@ function inferDtype(data: (string | number | null)[][], col: number): string {
 
 /**
  * Parse a pandas DataFrame `text/html` repr into a DataFramePayload, or return
- * null when the HTML is not a recognizable pandas dataframe table (so the caller
- * renders it via HtmlOutput). Browser-only (uses DOMParser); returns null in a
- * non-DOM context.
+ * null when the HTML is not a recognizable pandas dataframe table (the caller
+ * then falls back: HtmlOutput when rendering, tag-stripped text when copying).
+ * Browser-only (uses DOMParser); returns null in a non-DOM context - which is why
+ * a saved DataFrame repr copies as a stripped table outside a browser.
  */
 export function parsePandasDataFrameHtml(html: string | null | undefined): DataFramePayload | null {
 	if (!html || typeof DOMParser === 'undefined') return null;
