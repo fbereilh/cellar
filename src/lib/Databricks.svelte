@@ -405,7 +405,7 @@
 	// ---- Status (profiles + install + connection) ----------------------------
 	let status = $state<DbxStatus | null>(null);
 	let statusError = $state('');
-	let busy = $state(''); // 'connect' | 'disconnect' | 'logout' | 'login' | 'reconnect' | 'install' | ''
+	let busy = $state(''); // 'connect' | 'disconnect' | 'logout' | 'login' | 'reconnect' | 'install' | 'upload' | ''
 
 	const connection = $derived<DbxConnection>(status?.connection ?? { connected: false });
 	const connected = $derived(!!connection.connected);
@@ -664,6 +664,11 @@
 			return;
 		}
 		if (lastKey === key && lastSession === sid) return;
+		// The upload feedback names a workspace path THIS notebook was copied to, so
+		// it must not follow the panel onto another one - least of all the pending
+		// replace confirm, which would then overwrite on behalf of a different file.
+		// A mere epoch change is not a notebook change: the uploaded copy is still there.
+		if (lastKey !== key) clearUploadFeedback();
 		lastKey = key;
 		lastSession = sid;
 		loadStatus();
@@ -880,6 +885,9 @@
 		// Same reason as `signIn`: a live session is the loudest possible contradiction
 		// of "signed out everywhere", and connecting is not a selection change.
 		clearLogoutFeedback();
+		// A pending replace confirm names a path in the workspace we are leaving, so
+		// acting on it after the switch would overwrite in the wrong one.
+		clearUploadFeedback();
 		try {
 			const res = await fetch('/api/databricks/connect', {
 				method: 'POST',
@@ -916,6 +924,7 @@
 		// would have it still claiming the sign-out is unfinished right after the
 		// user finished it.
 		clearLogoutFeedback();
+		clearUploadFeedback();
 		try {
 			const res = await fetch(`/api/databricks/connect${pathQuery()}`, { method: 'DELETE' });
 			if (!res.ok) throw await res.json();
@@ -924,6 +933,72 @@
 			onSessionChange?.();
 		} catch (err) {
 			connectError = toDbxError(err);
+		} finally {
+			busy = '';
+		}
+	}
+
+	// ---- Upload the open notebook to the workspace ----------------------------
+	// Workspace FILES only: it copies the notebook into `/Users/<you>/` through the
+	// same authenticated WorkspaceClient every listing uses, and never touches
+	// compute (nothing here starts, stops or restarts a cluster).
+	let uploadError = $state<DbxError | null>(null);
+	/**
+	 * The outcome of the last upload, kept STRUCTURED rather than as one sentence so
+	 * the workspace path can be rendered on its own line in mono. In a ~200px panel a
+	 * path interpolated into prose has to break mid-segment (`…/not` / `ebook`), which
+	 * is exactly the part of the message the user needs to read.
+	 */
+	let uploadDone = $state<{ headline: string; path: string; url: string } | null>(null);
+	/**
+	 * The workspace path an upload found ALREADY OCCUPIED, which arms the inline
+	 * replace confirm. Nothing was written when this is set - the server reports
+	 * `status:'exists'` and writes nothing - so the only way to overwrite is this
+	 * second, deliberate click.
+	 */
+	let uploadExistsPath = $state('');
+
+	/** Drop the previous attempt's feedback: it describes one moment, not a standing state. */
+	function clearUploadFeedback() {
+		uploadError = null;
+		uploadDone = null;
+		uploadExistsPath = '';
+	}
+
+	/**
+	 * Upload the open notebook into the connected user's own workspace folder as a
+	 * cells-intact Databricks notebook.
+	 *
+	 * `overwrite` is never implicit: the first click asks for it without it, and a
+	 * notebook already at that path comes back as `exists` (nothing written) so the
+	 * user gets a Replace confirm rather than a silent clobber.
+	 */
+	async function uploadToWorkspace(overwrite = false) {
+		if (busy) return;
+		busy = 'upload';
+		clearUploadFeedback();
+		try {
+			const res = await fetch('/api/databricks/upload', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ path: notebookPath ?? undefined, overwrite })
+			});
+			const body = await res.json();
+			if (!res.ok) throw body;
+			const out = body as { status?: string; path?: string; url?: string | null; overwritten?: boolean };
+			if (out.status === 'exists') {
+				uploadExistsPath = out.path ?? '';
+				return;
+			}
+			uploadDone = {
+				headline: out.overwritten
+					? 'Replaced in your Databricks workspace:'
+					: 'Uploaded to your Databricks workspace:',
+				path: out.path ?? '',
+				url: out.url ?? ''
+			};
+		} catch (err) {
+			uploadError = toDbxError(err);
 		} finally {
 			busy = '';
 		}
@@ -984,6 +1059,7 @@
 		if (busy) return;
 		busy = 'logout';
 		clearLogoutFeedback();
+		clearUploadFeedback();
 		connectError = null;
 		reconnectError = null;
 		reconnectNote = '';
@@ -1236,7 +1312,8 @@
 		version_mismatch: 'databricks-connect is newer than the cluster’s runtime. Cellar re-pins a matching client automatically on your next connect - just click the cluster again.',
 		read_failed: 'Spark could not read that table.',
 		kernel_unavailable: 'Cellar could not reach the Python kernel. Restart Cellar, then connect again.',
-		busy: 'Another Databricks operation is still running.'
+		busy: 'Another Databricks operation is still running.',
+		workspace_conflict: 'Something that is not a notebook already occupies that path in your workspace. Nothing was uploaded.'
 	};
 
 	/**
@@ -1486,6 +1563,73 @@
 		</p>
 	{/if}
 	{#if logoutError}{@render errorBox(logoutError, 'databricks-logout-error')}{/if}
+{/snippet}
+
+<!--
+  Copy the open notebook into the connected user's own workspace folder
+  (/Users/<you>/) as a real Databricks notebook.
+
+  Shown only on the CONNECTED card: the upload authenticates as the live
+  connection's own identity, so without one there is no user folder to resolve
+  and nothing to upload as. It is a workspace-FILES action - it never starts,
+  stops or restarts a cluster - which is why it sits with Switch/Disconnect
+  rather than in the Runtime card.
+
+  Overwriting is a second, deliberate click. The first attempt sends no
+  overwrite flag; a notebook already at that path comes back untouched as
+  `exists`, which arms this confirm.
+-->
+{#snippet uploadRow()}
+	<div class="mt-1.5">
+		{#if uploadExistsPath}
+			<div class="rounded border border-warning/40 bg-warning/10 px-2 py-1.5" data-testid="databricks-upload-confirm-box">
+				<p class="text-[11px] leading-relaxed text-base-content/80">A notebook already exists in your workspace at</p>
+				<p class="font-mono text-[10px] leading-snug text-base-content/70 [overflow-wrap:anywhere]">{uploadExistsPath}</p>
+				<p class="mt-1 text-[11px] leading-relaxed text-base-content/80">
+					Replacing it overwrites that notebook in Databricks - its cells and outputs are lost.
+				</p>
+				<div class="mt-1.5 flex justify-end gap-1">
+					<button
+						class="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[11px] font-normal text-base-content/60"
+						onclick={clearUploadFeedback}
+						data-testid="databricks-upload-cancel"
+					>
+						Cancel
+					</button>
+					<button
+						class="btn btn-warning btn-xs h-5 min-h-0 px-1.5 text-[11px]"
+						onclick={() => uploadToWorkspace(true)}
+						disabled={!!busy || runtimeApplying}
+						data-testid="databricks-upload-replace"
+					>
+						{#if busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Replacing…{:else}Replace{/if}
+					</button>
+				</div>
+			</div>
+		{:else}
+			<button
+				class="btn btn-outline btn-xs w-full"
+				onclick={() => uploadToWorkspace(false)}
+				disabled={!connected || !!busy || runtimeApplying}
+				title="Copy this notebook into /Users/<you>/ in the connected Databricks workspace"
+				data-testid="databricks-upload"
+			>
+				{#if busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Uploading…{:else}Upload notebook to workspace{/if}
+			</button>
+		{/if}
+	</div>
+	{#if uploadDone}
+		<div class="mt-1.5 text-[11px] leading-relaxed text-base-content/70" data-testid="databricks-upload-note">
+			<p>{uploadDone.headline}</p>
+			<!-- Its own line, in mono: the path is the answer to "where did it go", and in
+			     this width it cannot share a line with prose without breaking mid-segment. -->
+			<p class="font-mono text-[10px] text-base-content/60 [overflow-wrap:anywhere]">{uploadDone.path}</p>
+			{#if uploadDone.url}
+				<a class="link link-primary" href={uploadDone.url} target="_blank" rel="noreferrer noopener" data-testid="databricks-upload-link">Open in Databricks</a>
+			{/if}
+		</div>
+	{/if}
+	{#if uploadError}{@render errorBox(uploadError, 'databricks-upload-error')}{/if}
 {/snippet}
 
 {#snippet cardLabel(text: string)}
@@ -1972,6 +2116,7 @@
 							{#if busy === 'disconnect'}<span class="loading loading-spinner loading-xs"></span>{:else}Disconnect{/if}
 						</button>
 					</div>
+					{@render uploadRow()}
 					{@render logoutRow(true)}
 					{#if switching}
 						<div class="mt-2 border-t border-base-300 pt-2">

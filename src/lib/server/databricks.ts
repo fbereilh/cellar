@@ -109,7 +109,7 @@ import {
 } from './dbrVersion';
 import { normalizeDatabricksHost } from '../databricksHost';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
-import { resolveNotebookPath } from './notebook';
+import { notebookIpynb, resolveNotebookPath } from './notebook';
 import { databricksRuntimeForced, databricksRuntimeVersionForced } from './ui-state';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
@@ -149,6 +149,9 @@ interface ProbeRequest {
 	catalog?: string;
 	schema?: string;
 	cluster_id?: string;
+	/** `workspace_upload`: the notebook's name in the workspace (its content rides stdin). */
+	name?: string;
+	overwrite?: boolean;
 }
 
 /**
@@ -582,6 +585,51 @@ def tables(w, catalog, schema):
     rows.sort(key=lambda r: r['name'].lower())
     return {'ok': True, 'tables': rows, 'truncated': truncated}
 
+def workspace_home(w):
+    # The user's own workspace folder, resolved from the CONNECTED identity - never
+    # a path Cellar guessed or the user typed. \`user_name\` is the login (an email
+    # for most workspaces), which is exactly what /Users/<...> is keyed by.
+    me = w.current_user.me()
+    name = getattr(me, 'user_name', None)
+    if not name:
+        raise RuntimeError('the workspace did not report a user name for the signed-in identity')
+    return '/Users/' + name
+
+def workspace_upload(w, name, overwrite):
+    # Import the notebook the user has open into their own workspace folder, as a
+    # real Databricks notebook: format=JUPYTER keeps the .ipynb's cells (and their
+    # outputs) intact, where SOURCE would flatten it into one .py script.
+    #
+    # The base64 payload arrives on STDIN, not in argv: a notebook with outputs is
+    # routinely megabytes, and an argv that large is refused by the OS (E2BIG)
+    # long before the SDK ever sees it.
+    from databricks.sdk.service.workspace import ImportFormat
+    content = sys.stdin.read().strip()
+    if not content:
+        return {'ok': False, 'code': 'bad_request', 'message': 'no notebook content reached the upload'}
+    path = workspace_home(w) + '/' + name
+    host = w.config.host
+    if not overwrite:
+        # Never clobber silently: report what is already there and let the caller
+        # decide. A non-notebook object is NOT offered as a replace - an import
+        # over a directory fails, and over a file it would destroy something the
+        # user never meant this button to touch.
+        existing = None
+        try:
+            existing = w.workspace.get_status(path)
+        except Exception as e:
+            if classify(e) != 'not_found':
+                raise
+        if existing is not None:
+            kind = (enum_value(getattr(existing, 'object_type', None)) or 'OBJECT').upper()
+            if kind != 'NOTEBOOK':
+                return {'ok': False, 'code': 'workspace_conflict',
+                        'message': 'A %s already exists at %s. Rename this notebook, or remove that object in Databricks, then upload again.'
+                                   % (kind.lower(), path)}
+            return {'ok': True, 'status': 'exists', 'path': path, 'host': host, 'overwritten': False}
+    w.workspace.import_(path=path, format=ImportFormat.JUPYTER, content=content, overwrite=bool(overwrite))
+    return {'ok': True, 'status': 'uploaded', 'path': path, 'host': host, 'overwritten': bool(overwrite)}
+
 def build_client(auth):
     # One place that turns the resolved auth descriptor into a WorkspaceClient, so
     # the listing subprocess and (mirrored in CONNECT_CODE) the kernel session
@@ -854,6 +902,8 @@ def main():
             return schemas(w, req['catalog'])
         if op == 'tables':
             return tables(w, req['catalog'], req['schema'])
+        if op == 'workspace_upload':
+            return workspace_upload(w, req['name'], req.get('overwrite'))
     except Exception as e:
         return fail(e)
     return {'ok': False, 'code': 'error', 'message': 'unknown op: %r' % (op,)}
@@ -905,6 +955,7 @@ export function statusFor(code: string): number {
 		case 'version_mismatch':
 		case 'cluster_terminated':
 		case 'reconnect_failed':
+		case 'workspace_conflict':
 			return 409;
 		case 'sdk_missing':
 		case 'connect_missing':
@@ -978,15 +1029,30 @@ function profileReauthVerdict(err: unknown): DatabricksError | undefined {
 	return err instanceof DatabricksError && err.code === PROFILE_REAUTH_CODE && err.profile ? err : undefined;
 }
 
-/** Run one `PROBE` command in the project venv and return its parsed result. */
-function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS): Promise<ProbeResult> {
+/**
+ * Run one `PROBE` command in the project venv and return its parsed result.
+ *
+ * `stdin` is the payload channel for an op whose input is too big for `argv` -
+ * only `workspace_upload` uses it (a notebook with outputs is routinely
+ * megabytes, and the OS refuses an argv that large with E2BIG). Every other op
+ * leaves stdin at `'ignore'`, so its `sys.stdin` is /dev/null exactly as before.
+ */
+function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS, stdin?: string): Promise<ProbeResult> {
 	const python = requirePython();
 	return new Promise<ProbeResult>((resolve, reject) => {
 		const child = spawn(python, ['-c', PROBE, JSON.stringify(request)], {
 			env: scrubEnv(),
 			cwd: workspace(),
-			stdio: ['ignore', 'pipe', 'pipe']
+			stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe']
 		});
+		if (stdin !== undefined) {
+			// A child that died before reading (a `sdk_missing` exit) leaves the pipe
+			// broken; that is not the failure to report - the sentinel line, or the
+			// exit handler below, is - so an EPIPE here must not become an unhandled
+			// error event.
+			child.stdin!.on('error', () => {});
+			child.stdin!.end(stdin);
+		}
 		let stdout = '';
 		let stderr = '';
 		let killedByTimeout = false;
@@ -3443,6 +3509,94 @@ export async function previewTable({
 		({ result } = await runInKernel(abs, PREVIEW_CODE({ name, limit: n })));
 	}
 	return payload<PreviewResult>(unwrap(result));
+}
+
+// --- upload the open notebook to the workspace ------------------------------
+
+/**
+ * The name a notebook takes in the Databricks workspace: its own basename with
+ * the extension dropped.
+ *
+ * Databricks names a workspace notebook by its path segment, so keeping the
+ * suffix would produce a notebook literally called `analysis.ipynb` sitting
+ * beside every other one that is not. Validated rather than escaped: a workspace
+ * path is `/`-delimited, so a segment carrying a separator (or a control
+ * character) would silently land the upload somewhere else.
+ */
+function workspaceNotebookName(fileName: string): string {
+	const name = fileName.replace(/\.(ipynb|py)$/i, '').trim();
+	if (!name || name === '.' || name === '..' || /[\u0000-\u001f/\\]/.test(name)) {
+		throw new DatabricksError(
+			'bad_request',
+			`"${fileName}" is not a name Databricks can give a workspace notebook. Rename the file, then upload again.`
+		);
+	}
+	return name;
+}
+
+/** What an upload attempt reports back: it landed, or something is already there. */
+export interface UploadResult {
+	ok: true;
+	/** `uploaded` - it is in the workspace. `exists` - nothing was written; a notebook is already at `path`. */
+	status: 'uploaded' | 'exists';
+	/** The full workspace path, e.g. `/Users/me@corp.com/analysis`. */
+	path: string;
+	/** A deep link to the notebook in the workspace UI, or null if the host is unknown. */
+	url: string | null;
+	/** Whether an existing notebook was replaced. */
+	overwritten: boolean;
+}
+
+/**
+ * Import the open notebook into the connected user's own workspace folder
+ * (`/Users/<user>/<name>`) as a real Databricks notebook.
+ *
+ * Runs entirely through the EXISTING authenticated path - the notebook's live
+ * connection selection (`requireConnectedSel`) → `resolveAuth` → the same
+ * `WorkspaceClient` every listing builds - so there is no second auth mechanism,
+ * and an expired profile surfaces the very same `profile_reauth_required` (with
+ * its exact `databricks auth login --profile <name>` command) as everything else.
+ *
+ * It is a **workspace-files** operation: a short-lived server subprocess, never
+ * the kernel, and it never touches compute. Uploading does not need - and must
+ * not cause - a cluster to start, stop or restart; a connection is required only
+ * because that is what identifies the workspace and the user to upload as.
+ *
+ * `overwrite` defaults to **false**, and that is the safe default rather than an
+ * omission: without it the op reports `status:'exists'` and writes NOTHING, so
+ * replacing a notebook is always a second, deliberate call. The notebook bytes
+ * come from the live document (`notebookIpynb`), so they match the `.ipynb` on
+ * disk exactly, and a `.py` jupytext notebook uploads as a proper `.ipynb`.
+ */
+export async function uploadNotebook({
+	nb,
+	overwrite = false
+}: { nb?: string | null; overwrite?: boolean } = {}): Promise<UploadResult> {
+	const abs = resolveNotebookPath(nb);
+	// Gated exactly like every other connected op: not connected is an actionable
+	// `not_connected`, and a gated OAuth selection still has to have signed in.
+	const auth = authForListing(requireConnectedSel(abs));
+	const { name, json } = notebookIpynb(abs);
+	const target = workspaceNotebookName(name);
+	const result = payload<{ status?: string; path?: string; host?: string; overwritten?: boolean }>(
+		unwrap(
+			await probe(
+				{ op: 'workspace_upload', auth, name: target, overwrite },
+				PROBE_TIMEOUT_MS,
+				Buffer.from(json, 'utf8').toString('base64')
+			)
+		)
+	);
+	const path = result.path ?? '';
+	const host = result.host ?? auth.host ?? '';
+	return {
+		ok: true,
+		status: result.status === 'exists' ? 'exists' : 'uploaded',
+		path,
+		// The workspace UI addresses an object by its path; no host, no honest link.
+		url: host && path ? `${host.replace(/\/+$/, '')}/#workspace${path}` : null,
+		overwritten: !!result.overwritten
+	};
 }
 
 /** Stop a notebook's session and drop `spark`/`w` from its kernel namespace. */

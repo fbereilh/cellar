@@ -21,7 +21,7 @@
 import { join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { readNotebook, deserialize, writeNotebook } from './ipynb';
+import { readNotebook, deserialize, writeNotebook, serialize, stringify } from './ipynb';
 import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
@@ -292,6 +292,28 @@ function readHeaderNumbering(doc: NotebookDoc): number[] {
 	return [...new Set(raw.filter((l): l is number => Number.isInteger(l) && l >= 1 && l <= 6))].sort(
 		(a, b) => a - b
 	);
+}
+
+/**
+ * The notebook as nbformat 4.5 JSON text, produced from the LIVE in-memory
+ * document rather than re-read from disk.
+ *
+ * Byte-identical to what `writeNotebook` persists - the same `serialize` (which
+ * runs clean-on-save) and the same deterministic `stringify` - so anything that
+ * ships a notebook elsewhere (the Databricks workspace upload) can never
+ * disagree with the `.ipynb` on disk. Building it from the live doc is also what
+ * makes a `.py` jupytext/Databricks notebook exportable at all: its disk file is
+ * text with no outputs, while the doc holds real cells.
+ *
+ * `name` is the file's own basename, the natural default name for a copy.
+ */
+export function notebookIpynb(nb?: string | null): { path: string; name: string; json: string } {
+	const doc = docFor(nb);
+	return {
+		path: doc.path,
+		name: doc.path.split(sep).pop() || '',
+		json: stringify(serialize({ cells: doc.cells, metadata: doc.metadata }))
+	};
 }
 
 /**
