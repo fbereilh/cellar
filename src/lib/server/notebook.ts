@@ -27,7 +27,7 @@ import { publish } from './events';
 import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
-import { exportNotebookToPy, type ExportResult } from './export-py';
+import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
 import { SQL_LANGUAGE, isLogicalCellType } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
@@ -776,6 +776,21 @@ export function getExportTarget(nb?: string | null): string | null {
 	const doc = docFor(nb);
 	const t = doc.metadata?.cellar?.export_target;
 	return typeof t === 'string' && t.trim() ? t.trim() : null;
+}
+
+/**
+ * The target the EXPORTER will actually write to: the notebook-level
+ * `export_target`, or — when there is none — a `#|default_exp <module>` directive
+ * in any code cell (nbdev's own spelling). This is `resolveTarget`'s rule REUSED,
+ * never a second copy, so a caller reporting where the marks land can never
+ * disagree with where they go.
+ *
+ * `getExportTarget` above stays the metadata-only reader (what `setExportTarget`
+ * stores and clears); the two are deliberately separate, because a directive
+ * lives in a cell and no notebook-level setter can clear it.
+ */
+export function effectiveExportTarget(nb?: string | null): string | null {
+	return resolveTarget(docFor(nb));
 }
 
 /**

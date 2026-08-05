@@ -28,6 +28,8 @@ import {
 	setHideInput as setHideInputDoc,
 	setExportTarget as setExportTargetDoc,
 	setCellExports as setCellExportsDoc,
+	getExportTarget,
+	effectiveExportTarget,
 	isPyTextNotebook,
 	getActiveNotebookPath,
 	resolveNotebookPath,
@@ -44,6 +46,7 @@ import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree, resolveInWorkspace } from '../fstree';
 import { buildNotebookHtml, exportFilename } from '../export-html';
+import { moduleExists } from '../export-py';
 import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
@@ -733,6 +736,9 @@ export async function getNotebookMap(nb?: string | null) {
 	// cells for export can see where they land and set it (see set_export_target).
 	// export_target is the one settling that is not purely display: it drives the
 	// auto-generated `.py` module, but it lives in the same `cellar` metadata seam.
+	// It is reported through `exportTargetFields` - the EXPORTER's own resolution,
+	// so a `#|default_exp` directive is visible here too: "where they land" is a
+	// claim this block may only make about the target that is actually used.
 	return {
 		notebook: view.path,
 		kernel: kernelSession(nb),
@@ -740,7 +746,7 @@ export async function getNotebookMap(nb?: string | null) {
 		display: {
 			header_numbering: view.headerNumbering,
 			report_view: view.hideAllCode,
-			export_target: view.exportTarget
+			...exportTargetFields(nb)
 		},
 		cell_count: cells.length,
 		sections: root
@@ -1559,12 +1565,21 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * regeneration. Accepting it while the other half refuses would leave an agent
  * following the export flow holding a target it was told is set, for a module
  * that can never be built.
+ *
+ * It reports through the SAME `exportTargetFields` as `setCellExport` and the map,
+ * which is what keeps the description's "the same value get_notebook_map's display
+ * block reports" literally true. It therefore reports the EFFECTIVE target, not
+ * merely what was stored: clearing the setting on a notebook that also carries a
+ * `#|default_exp` directive answers with that directive's path (flagged
+ * `export_target_source`) rather than a null that would read as "nothing is
+ * targeted any more" - a directive lives in a cell, so no notebook-level setter
+ * can clear it.
  */
 export function setExportTarget(target: string | null | undefined, nb?: string | null) {
 	const nbTarget = nb ?? getActiveNotebookPath();
 	if (isPyTextNotebook(nbTarget)) return { ok: false as const, refused: 'py-notebook' as const };
 	setExportTargetDoc(target ?? null, nbTarget);
-	return { export_target: getNotebook(nbTarget).exportTarget };
+	return exportTargetFields(nbTarget);
 }
 
 /**
@@ -1604,6 +1619,11 @@ export function setExportTarget(target: string | null | undefined, nb?: string |
  * that are now OUT of the module, never the ones in it. A cell already at that
  * value is not rewritten, so an idempotent call persists nothing and regenerates
  * nothing (zero git diff, no `.py` mtime churn).
+ *
+ * `export_target` answers "do these marks land anywhere", so it is the EFFECTIVE
+ * target (`exportTargetFields`), a `#|default_exp` directive included - never the
+ * notebook metadata alone, which reported null over a notebook whose marks really
+ * do build a module.
  *
  * The regeneration is reported HONESTLY rather than promised, via `moduleWarning`:
  * `exportNotebookToPy` writes nothing when NO cell is marked, so unmarking the
@@ -1645,13 +1665,39 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 	setCellExportsDoc(full, exported, target);
 	const toHandle = handleFn(target);
 	const marked = full.map(toHandle);
-	const exportTarget = getNotebook(target).exportTarget;
+	const where = exportTargetFields(target);
 	return {
 		ok: true as const,
 		exported: marked,
 		count: marked.length,
-		export_target: exportTarget,
-		...moduleWarning(target, exportTarget)
+		...where,
+		...moduleWarning(target, where.export_target)
+	};
+}
+
+/**
+ * WHERE the marks land, reported the way the EXPORTER resolves it
+ * (`effectiveExportTarget` = `resolveTarget`): the notebook-level
+ * `export_target`, else a `#|default_exp` directive in a cell.
+ *
+ * Reading the notebook metadata alone was wrong in both directions on a
+ * directive-targeted notebook (the nbdev-native spelling): the marks really do
+ * generate a module, yet the result said `export_target:null` - "my marks land
+ * nowhere" - and, because `moduleWarning` short-circuits on a null target,
+ * unmarking the last cell there warned nothing, which is precisely the case the
+ * warning exists for.
+ *
+ * `export_target_source` is present ONLY for the directive case, so an ordinary
+ * call pays no tokens for it (the `module`/`undo` conditional shape) - and it is
+ * what keeps the reported target from being read as the notebook SETTING: a
+ * directive lives in a cell, so `set_export_target(null)` cannot clear it.
+ */
+function exportTargetFields(nb?: string | null) {
+	const target = effectiveExportTarget(nb);
+	const fromDirective = target != null && target !== getExportTarget(nb);
+	return {
+		export_target: target,
+		...(fromDirective ? { export_target_source: 'default_exp' as const } : {})
 	};
 }
 
@@ -1662,18 +1708,29 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
  * last marked cell leaves the previously exported symbols on disk, and an
  * `import` of that module still resolves them.
  *
- * Present ONLY in that case (a target IS set and nothing is marked any more), so
+ * Present ONLY in that case (a target IS resolvable and nothing is marked), so
  * an ordinary call pays no tokens for it - the `undo` field on `clearOutputs` is
  * the same conditional shape for the same reason. Purely a projection of state
  * this function already has in hand: it changes no export behavior, it only stops
  * the result from claiming a regeneration that did not happen.
+ *
+ * The reason may only state what was VERIFIED, which takes the `moduleExists`
+ * check: the gate is "a target, and nothing marked", which is ALSO true when
+ * nothing was ever marked and no module was ever generated (a target just set, or
+ * repointed to a fresh path). Saying the file was "left on disk" there invents a
+ * file and invites the agent to delete nothing - the assert-more-than-was-verified
+ * defect this field exists to retire, with the sign flipped. Nor may it say the
+ * marks were dropped "any more": the gate cannot see a transition, only the
+ * resulting state.
  */
 function moduleWarning(target: string, exportTarget: string | null) {
 	if (!exportTarget || exportCellCount(listCells(target))) return {};
 	return {
 		module: {
 			regenerated: false as const,
-			reason: `no cell is marked for export any more, so ${exportTarget} was left on disk exactly as it was - remove it by hand if it should be gone`
+			reason: moduleExists(exportTarget)
+				? `no cell is marked for export, so ${exportTarget} was left on disk exactly as it was - remove it by hand if it should be gone`
+				: `no cell is marked for export, so no module was generated at ${exportTarget}`
 		}
 	};
 }

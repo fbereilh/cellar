@@ -233,12 +233,17 @@ describe('only code cells can be exported', () => {
 
 	it('never writes a SQL cell into the module even if the flag is already on it', async () => {
 		const { target, code } = await makeNotebook('sql-stale-flag.ipynb');
-		const sql = nbmod.getCell(svc.resolveRef(target, code[1]), target)!;
+		const sqlId = svc.resolveRef(target, code[1]);
+		// The SOURCE goes through the document: `getCell` hands back a projection
+		// whose `source` is a copied string, so assigning it changes nothing and the
+		// module assertion below would pass vacuously against the original `def two`.
+		nbmod.setSource(sqlId, 'SELECT 1', target);
+		const sql = nbmod.getCell(sqlId, target)!;
 		sql.metadata = sql.metadata ?? {};
 		sql.metadata.cellar = { ...(sql.metadata.cellar ?? {}), language: 'sql' };
-		sql.source = 'SELECT 1';
 		// A hand-edited .ipynb (or a flag predating the guard) can carry it anyway.
 		sql.metadata.cellar.export = true;
+		expect(nbmod.getCell(sqlId, target)?.source).toBe('SELECT 1');
 
 		svc.setExportTarget('lib/sql-stale.py', target);
 		svc.setCellExport([code[0]], true, target);
@@ -381,7 +386,23 @@ describe('the generated module follows the marks', () => {
 		expect(r).toMatchObject({ ok: true, count: 1, export_target: 'lib/last.py' });
 		expect(r.ok ? r.module : null).toMatchObject({ regenerated: false });
 		expect(r.ok ? r.module?.reason : '').toContain('lib/last.py');
+		expect(r.ok ? r.module?.reason : '').toContain('left on disk');
 		expect(readFileSync(py, 'utf8')).toBe(generated);
+	});
+
+	it('does not claim a module was left on disk when none was ever generated', async () => {
+		const { target, code } = await makeNotebook('module-never-built.ipynb');
+		svc.setExportTarget('lib/never.py', target);
+
+		// The gate is "a target, and nothing marked" - which is ALSO true here, where
+		// no cell was EVER marked. Inviting the agent to delete a file that does not
+		// exist is the same assert-more-than-was-verified defect with the sign flipped.
+		const r = svc.setCellExport([code[0]], false, target);
+		expect(existsSync(join(WS, 'lib/never.py'))).toBe(false);
+		expect(r.ok ? r.module : null).toMatchObject({ regenerated: false });
+		expect(r.ok ? r.module?.reason : '').toContain('no module was generated');
+		expect(r.ok ? r.module?.reason : '').not.toContain('left on disk');
+		expect(r.ok ? r.module?.reason : '').not.toContain('by hand');
 	});
 
 	it('carries no module warning when there is no target to regenerate', async () => {
@@ -392,6 +413,47 @@ describe('the generated module follows the marks', () => {
 		const r = svc.setCellExport([code[0]], false, target);
 		expect(r).toMatchObject({ ok: true, export_target: null });
 		expect(r.ok && 'module' in r).toBe(false);
+	});
+
+	it('reports a `#|default_exp` directive target, and warns about its module too', async () => {
+		const { target, code } = await makeNotebook('module-directive.ipynb');
+		// The nbdev-native spelling: no notebook-level setting, the target lives in a
+		// cell. `resolveTarget` honors it, so the marks DO build a module - reading the
+		// metadata alone reported `export_target:null` ("my marks land nowhere") and,
+		// because the warning short-circuits on a null target, silenced it entirely.
+		nbmod.setSource(svc.resolveRef(target, code[1]), '#|default_exp lib.directive', target);
+
+		const on = svc.setCellExport([code[0]], true, target);
+		expect(on).toMatchObject({
+			ok: true,
+			export_target: 'lib/directive.py',
+			// Flagged so it is never read as the notebook SETTING: a directive lives in
+			// a cell, so `set_export_target(null)` cannot clear it.
+			export_target_source: 'default_exp'
+		});
+		const py = join(WS, 'lib/directive.py');
+		expect(readFileSync(py, 'utf8')).toContain('def one():');
+
+		const off = svc.setCellExport([code[0]], false, target);
+		expect(off.ok ? off.module : null).toMatchObject({ regenerated: false });
+		expect(off.ok ? off.module?.reason : '').toContain('lib/directive.py');
+		expect(readFileSync(py, 'utf8')).toContain('def one():');
+
+		const map = await svc.getNotebookMap(target);
+		expect(map.display).toMatchObject({
+			export_target: 'lib/directive.py',
+			export_target_source: 'default_exp'
+		});
+	});
+
+	it('flags no source for an ordinary notebook-level target', async () => {
+		const { target, code } = await makeNotebook('module-plain-target.ipynb');
+		svc.setExportTarget('lib/plain.py', target);
+		const r = svc.setCellExport([code[0]], true, target);
+		// The marker is conditional, so the ordinary call pays no tokens for it.
+		expect(r).toMatchObject({ ok: true, export_target: 'lib/plain.py' });
+		expect(r.ok && 'export_target_source' in r).toBe(false);
+		expect('export_target_source' in (await svc.getNotebookMap(target)).display).toBe(false);
 	});
 
 	it('reports the ADDRESSED cells on an unmark, which are now OUT of the module', async () => {
@@ -556,5 +618,18 @@ describe('the tool registration', () => {
 		const desc = line.match(/description: '(.*?)', inputSchema/);
 		expect(desc, 'the description stays a single-quoted one-line literal').toBeTruthy();
 		expect(desc![1].length).toBeLessThan(700);
+	});
+
+	it('keeps INSTRUCTIONS clause 5 free of the unconditional regeneration claim', () => {
+		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
+		const clause = src.slice(src.indexOf('EXPORT TARGET is the notebook'), src.indexOf('6. DECLARE YOUR WORKING NOTEBOOK'));
+		expect(clause).toBeTruthy();
+
+		// INSTRUCTIONS is delivered once at connect, BEFORE any tool schema, so an
+		// unconditional promise here contradicts the descriptions it frames - the very
+		// claim both of them had to drop.
+		expect(clause).not.toMatch(/regenerate the\s+module immediately/);
+		expect(clause).toMatch(/stays? marked/);
+		expect(clause).toMatch(/set_cell_export/);
 	});
 });

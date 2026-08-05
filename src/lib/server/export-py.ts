@@ -172,6 +172,24 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	return { written: true, target, count: exported.length };
 }
 
+/**
+ * Is a generated module already on disk at this workspace-relative target?
+ *
+ * The one fact a caller needs before it may say a previously generated module was
+ * LEFT in place: `exportNotebookToPy` returns `no-cells` without writing when
+ * nothing is marked, and that says nothing about whether a file is there — a
+ * target set but never used, or repointed to a fresh path, has generated none. A
+ * target that escapes the workspace can hold no module of ours, so the throw
+ * `resolveInWorkspace` raises reads as false rather than propagating.
+ */
+export function moduleExists(target: string): boolean {
+	try {
+		return existsSync(resolveInWorkspace(target));
+	} catch {
+		return false;
+	}
+}
+
 function safeRead(abs: string): string | null {
 	try {
 		return readFileSync(abs, 'utf8');

@@ -94,6 +94,39 @@ describe('set_export_target', () => {
 		expect(svc.setExportTarget('   ', nb)).toEqual({ export_target: null });
 		expect(nbmod.getExportTarget(nb)).toBeNull();
 	});
+
+	it('reports the EFFECTIVE target, so clearing does not hide a `#|default_exp` cell', async () => {
+		const nb = svc.targetFor('sessDirective');
+		svc.useNotebook('sessDirective', 'directive-nb.ipynb');
+		const target = svc.targetFor('sessDirective');
+		await svc.addCells([{ cell_type: 'code', source: '#|default_exp lib.fromcell' }], null, {
+			nb: target,
+			routeImports: false
+		});
+		expect(nb).not.toBe(target);
+
+		// The setting wins while it is there, and is reported plainly.
+		expect(svc.setExportTarget('lib/explicit.py', target)).toEqual({
+			export_target: 'lib/explicit.py'
+		});
+
+		// Clearing it does NOT untarget the notebook: the directive lives in a cell,
+		// and the exporter still resolves it - so a bare `export_target:null` here
+		// would read as "nothing is targeted" while a module keeps being generated.
+		// The flag is what stops the answer being mistaken for the notebook SETTING.
+		expect(svc.setExportTarget(null, target)).toEqual({
+			export_target: 'lib/fromcell.py',
+			export_target_source: 'default_exp'
+		});
+		expect(nbmod.getExportTarget(target)).toBeNull();
+
+		// The description promises this is the same value the map reports; all three
+		// surfaces resolve through the one `exportTargetFields`, so they cannot drift.
+		expect((await svc.getNotebookMap(target)).display).toMatchObject({
+			export_target: 'lib/fromcell.py',
+			export_target_source: 'default_exp'
+		});
+	});
 });
 
 describe('per-session notebook targeting', () => {
