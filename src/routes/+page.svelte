@@ -1183,11 +1183,14 @@
 		logsOpen = getUi<string>(LOGS_OPEN_KEY, '0') === '1';
 		const h = Number(getUi(LOGS_HEIGHT_KEY, 0));
 		if (h) logsHeight = Math.min(LOGS_MAX, Math.max(LOGS_MIN, h));
-		// Restore live kernel + variables after a reload — but only inspect if a
-		// kernel already exists, so a fresh page load never boots one on its own.
-		refreshKernel().then(() => {
-			if (kernelInfo.started) refreshVariables();
-		});
+		// Restore live kernel + variables after a reload. The inspect is
+		// UNCONDITIONAL: `inspectVariables` short-circuits a not-started kernel
+		// server-side (it only READS the status, it never boots one), so gating it on
+		// a kernel this page already knows about bought nothing and encoded a false
+		// premise — that whoever boots the kernel is us. An agent booting it (before
+		// this load, or a moment after) is the case that gate could never see.
+		refreshKernel();
+		refreshVariables();
 	});
 
 	// Surface an agent-created / newly-active notebook live: when the MCP
@@ -1213,12 +1216,21 @@
 			// A run this tab did NOT initiate (an agent, or another tab) may load a
 			// notebook into the kernel for the first time. Our own runs already refresh
 			// via `onRunEnd`; this keeps the ACTIVE-notebook badge/inspector live too.
+			// Both halves, exactly as `onRunEnd` does: a foreign run changes the kernel
+			// AND the namespace, and refreshing only the badge left the inspector empty
+			// for the whole session on a page that loaded before the agent booted the
+			// kernel (the mount-time inspect is a one-shot with nothing to read yet).
 			if (ev.type === 'run:end' && ev.originId !== originId) {
 				refreshKernel();
+				refreshVariables();
 			}
 			if (ev.type !== 'notebook:opened') return;
 			if (ev.originId && ev.originId === originId) return;
 			if (!ev.relPath) return;
+			// An agent's open-or-create (and another tab's) may have just written a new
+			// .ipynb, so the tree + git decorations are stale exactly as they are after
+			// our own create — every new-file path here bumps this for the same reason.
+			fsRefreshSignal++; // a new file on disk → refresh the tree + git decorations
 			// focus:false is an AGENT declaring its working notebook — surface it as an
 			// available tab, but never yank the user off the tab they are on. A human's
 			// own open/create (focus:true, or the field absent on older events) focuses.
