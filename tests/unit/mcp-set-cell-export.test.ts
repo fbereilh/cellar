@@ -20,7 +20,7 @@
  * kernel or the python dataflow subprocess.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -31,6 +31,24 @@ vi.mock('../../src/lib/server/dataflow', () => ({
 	getNotebookStaleness: async () => ({ sid: null, cells: {} }),
 	analyzeDataflow: async () => ({})
 }));
+
+// A `.py` text notebook without the python toolchain: the reader yields two code
+// cells and the writer only RECORDS, so "did this path spend a jupytext write"
+// is observable.
+const py = vi.hoisted(() => ({ writes: [] as string[] }));
+vi.mock('../../src/lib/server/jupytext', async (importOriginal) => {
+	const real = await importOriginal<typeof import('../../src/lib/server/jupytext')>();
+	return {
+		...real,
+		readPyNotebook: () => ({
+			format: 'percent',
+			cells: [0, 1].map((i) => ({ id: null, cell_type: 'code', source: `a = ${i}`, outputs: [], metadata: {} }))
+		}),
+		writePyNotebook: (path: string) => {
+			py.writes.push(path);
+		}
+	};
+});
 
 // The REAL exporter, wrapped only to count how often a write path regenerates the
 // module - the cost claim a per-cell loop would break.
@@ -173,6 +191,73 @@ describe('only code cells can be exported', () => {
 		expect(marked(target, code[0])).toBe(false);
 	});
 
+	it('refuses to mark a SQL cell, which is an nbformat code cell', async () => {
+		const { target, code } = await makeNotebook('mark-sql.ipynb');
+		svc.setType(code[1], 'sql', target);
+		svc.setExportTarget('lib/sql-guard.py', target);
+
+		// A SQL cell IS `cell_type:'code'` (tagged cellar.language='sql'), so a
+		// nbformat-type test admits one and its raw SQL is concatenated into a module
+		// git tracks - invalid Python in a committed file.
+		const r = svc.setCellExport([code[1]], true, target);
+		expect(r).toEqual({ ok: false, notCode: code[1] });
+		expect(marked(target, code[1])).toBe(false);
+
+		svc.setCellExport([code[0]], true, target);
+		expect(readFileSync(join(WS, 'lib/sql-guard.py'), 'utf8')).toContain('def one():');
+	});
+
+	it('refuses an nbformat raw cell, which the logical type alone reads as code', () => {
+		// `ipynb.ts` passes an externally-authored `raw` cell through untouched, and
+		// `logicalCellType` maps everything non-markdown to 'code' - so the guard is the
+		// STRICT `isLogicalCellType`, or a raw cell's contents reach the module.
+		const target = abs('mark-raw.ipynb');
+		writeFileSync(
+			target,
+			JSON.stringify({
+				nbformat: 4,
+				nbformat_minor: 5,
+				metadata: {},
+				cells: [
+					{ id: 'py-cell', cell_type: 'code', source: ['def one():\n', '    return 1'], metadata: {}, outputs: [], execution_count: null },
+					{ id: 'raw-cell', cell_type: 'raw', source: ['not python at all'], metadata: {} }
+				]
+			})
+		);
+		const cells = nbmod.listCells(target);
+		expect(cells[1].cell_type).toBe('raw');
+
+		expect(svc.setCellExport([cells[1].id], true, target)).toEqual({ ok: false, notCode: cells[1].id });
+		expect(nbmod.getCell(cells[1].id, target)?.metadata?.cellar?.export).toBeUndefined();
+	});
+
+	it('never writes a SQL cell into the module even if the flag is already on it', async () => {
+		const { target, code } = await makeNotebook('sql-stale-flag.ipynb');
+		const sql = nbmod.getCell(svc.resolveRef(target, code[1]), target)!;
+		sql.metadata = sql.metadata ?? {};
+		sql.metadata.cellar = { ...(sql.metadata.cellar ?? {}), language: 'sql' };
+		sql.source = 'SELECT 1';
+		// A hand-edited .ipynb (or a flag predating the guard) can carry it anyway.
+		sql.metadata.cellar.export = true;
+
+		svc.setExportTarget('lib/sql-stale.py', target);
+		svc.setCellExport([code[0]], true, target);
+		const module = readFileSync(join(WS, 'lib/sql-stale.py'), 'utf8');
+		// `isExportCell` is the ONE identity the exporter, the badge and the agent map
+		// all read, so a stale flag is inert everywhere rather than only at the setter.
+		expect(module).toContain('def one():');
+		expect(module).not.toContain('SELECT 1');
+
+		const map = await svc.getNotebookMap(target);
+		const flat = (map.sections as { id: string; export?: boolean; children?: unknown[] }[]).flatMap(
+			function walk(n): { id: string; export?: boolean }[] {
+				return [n, ...((n.children ?? []) as typeof n[]).flatMap(walk)];
+			}
+		);
+		expect(flat.find((n) => n.id === code[0])?.export).toBe(true);
+		expect(flat.find((n) => n.id === code[1])?.export).toBeUndefined();
+	});
+
 	it('unmarks any cell, which is how a stale flag is cleared', async () => {
 		const { target, code, md } = await makeNotebook('unmark-md.ipynb');
 		// A hand-edited .ipynb can carry the flag on a non-code cell; `isExportCell`
@@ -210,6 +295,48 @@ describe('addressing is all-or-nothing', () => {
 		expect(svc.setCellExport([code[0], code[1]], true, target)).toEqual({ ok: false, missing: code[1] });
 		expect(marked(target, code[0])).toBe(false);
 		expect(marked(target, code[1])).toBe(false);
+	});
+});
+
+describe('a .py text notebook is refused up front', () => {
+	it('stores nothing, spends no jupytext write, and names the cause', async () => {
+		const target = abs('text-export.py');
+		writeFileSync(target, '# %%\na = 0\n\n# %%\na = 1\n');
+		const cells = nbmod.listCells(target);
+		py.writes.length = 0;
+		exp.calls = 0;
+
+		// A `.py` notebook carries no cellar cell metadata, so the flag could never be
+		// stored and `autoExportPy` generates no module - persisting would only spend a
+		// blocking jupytext rewrite to produce byte-identical bytes while claiming a
+		// mark that does not exist.
+		const r = svc.setCellExport([cells[0].id], true, target);
+		expect(r).toEqual({ ok: false, refused: 'py-notebook' });
+		expect(py.writes).toEqual([]);
+		expect(exp.calls).toBe(0);
+		expect(nbmod.getCell(cells[0].id, target)?.metadata?.cellar?.export).toBeUndefined();
+	});
+
+	it('does not spend a jupytext write on the doc-layer path either', () => {
+		const target = abs('text-export-doc.py');
+		writeFileSync(target, '# %%\na = 0\n\n# %%\na = 1\n');
+		const cells = nbmod.listCells(target);
+		py.writes.length = 0;
+
+		const seen: string[] = [];
+		const off = events.subscribe((e) => {
+			const ev = e as { type: string; nb?: string; cellId?: string };
+			if (ev.type === 'cell:export' && ev.nb === target) seen.push(ev.cellId!);
+		});
+		try {
+			// The UI PATCH route reaches this directly, so the guard belongs here too -
+			// but the EVENTS must still fire, or an open tab keeps the stale badge.
+			nbmod.setCellExports([cells[0].id], true, target);
+		} finally {
+			off();
+		}
+		expect(py.writes).toEqual([]);
+		expect(seen).toEqual([cells[0].id]);
 	});
 });
 
@@ -319,7 +446,39 @@ describe('at the wire: the tool is really callable', () => {
 			arguments: { ids: [md], export: true, notebook: rel }
 		})) as CallResult;
 		expect(bad.isError).toBe(true);
-		expect(body(bad)).toContain('not a code cell');
+		expect(body(bad)).toContain('not a Python code cell');
+	});
+
+	it('names the handle the agent supplied, not the UUID it resolved to', async () => {
+		const rel = 'wire-handle.ipynb';
+		const { md } = await makeNotebook(rel);
+		const client = await connect();
+		const short = md.slice(0, 8);
+
+		const bad = (await client.callTool({
+			name: 'set_cell_export',
+			arguments: { ids: [short], export: true, notebook: rel }
+		})) as CallResult;
+		// An id the model cannot find anywhere in its own call reads as the tool
+		// answering about some other cell (`set_hide_input`/`delete_cells` echo the ref).
+		expect(bad.isError).toBe(true);
+		expect(body(bad)).toContain(`cell ${short} is not a Python code cell`);
+	});
+
+	it('refuses a .py text notebook by naming the cause, not as a missing cell', async () => {
+		const rel = 'wire-text.py';
+		const target = abs(rel);
+		writeFileSync(target, '# %%\na = 0\n\n# %%\na = 1\n');
+		const cells = nbmod.listCells(target);
+		const client = await connect();
+
+		const r = (await client.callTool({
+			name: 'set_cell_export',
+			arguments: { ids: [cells[0].id], export: true, notebook: rel }
+		})) as CallResult;
+		expect(r.isError).toBe(true);
+		expect(body(r)).toContain('.py text notebook');
+		expect(body(r)).not.toContain('not found');
 	});
 });
 

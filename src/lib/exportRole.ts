@@ -14,6 +14,7 @@
  */
 
 import type { CellMetadata } from '$lib/server/types';
+import { isLogicalCellType } from '$lib/cellLanguage';
 
 /** The minimal cell shape this rule reads (Cell/CellView are assignable). */
 type ExportCell = { cell_type?: string; metadata?: CellMetadata | null } | null | undefined;
@@ -22,9 +23,21 @@ type ExportCell = { cell_type?: string; metadata?: CellMetadata | null } | null 
  * Is this cell marked for export to the `.py` module? Only a Python code cell can
  * be — a markdown/SQL cell has no module source, and `setCellType` drops the flag
  * when a cell is converted away from plain code.
+ *
+ * The test is `isLogicalCellType(cell, 'code')`, never a bare nbformat
+ * `cell_type === 'code'`: a SQL cell IS an nbformat `code` cell tagged
+ * `cellar.language='sql'` (see `cellLanguage.ts`), so that test admits one — and
+ * its raw SQL would then be concatenated into the generated module, a file nbdev
+ * commits to git. It is deliberately the STRICT predicate rather than
+ * `logicalCellType(cell) === 'code'`, which maps an nbformat `raw` cell (passed
+ * through untouched from an externally-authored notebook) to `code` too. Being the
+ * one identity every surface reads (`export-py.ts` builds the module from it,
+ * `Cell.svelte` draws the badge from it, the agent map reports it), fixing the
+ * rule here is what keeps a stale or hand-edited flag on such a cell inert
+ * everywhere rather than only at whichever setter last remembered to check.
  */
 export function isExportCell(cell: ExportCell): boolean {
-	return !!cell && cell.cell_type === 'code' && cell.metadata?.cellar?.export === true;
+	return isLogicalCellType(cell, 'code') && cell?.metadata?.cellar?.export === true;
 }
 
 /** Count of cells currently marked for export. */

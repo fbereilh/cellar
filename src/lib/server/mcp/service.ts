@@ -28,6 +28,7 @@ import {
 	setHideInput as setHideInputDoc,
 	setExportTarget as setExportTargetDoc,
 	setCellExports as setCellExportsDoc,
+	isPyTextNotebook,
 	getActiveNotebookPath,
 	resolveNotebookPath,
 	workspaceRelative,
@@ -47,7 +48,7 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { isSqlCell } from '../../cellLanguage';
+import { isSqlCell, isLogicalCellType } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { isExportCell } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
@@ -1571,12 +1572,20 @@ export function setExportTarget(target: string | null | undefined, nb?: string |
  * and `setCellExports` makes the whole batch ONE document write, which matters
  * doubly here because `persist` regenerates the `.py` on every write.
  *
- * Only a CODE cell can be marked: `isExportCell` requires one, so setting the
- * flag on a markdown/SQL cell would record something the exporter silently
- * ignores. That is refused by id (`not_code`) rather than no-op'd, so an agent
- * building a module is never told a cell is in it when it is not. UNMARKING is
- * allowed on any cell - it asks for a state a non-code cell is already in, and it
- * is how a stale flag on a hand-edited `.ipynb` is cleared.
+ * Only a PYTHON code cell can be marked, tested with `isLogicalCellType(_, 'code')`
+ * (`isExportCell`'s own rule) and never a bare nbformat `cell_type`: a SQL cell is
+ * an nbformat `code` cell tagged `cellar.language`, so that test admits one and its
+ * raw SQL is then concatenated into a generated module git tracks. That is
+ * refused by id (`notCode`) rather than no-op'd, so an agent building a module is
+ * never told a cell is in it when it is not. UNMARKING is allowed on any cell - it
+ * asks for a state a non-Python cell is already in, and it is how a stale flag on
+ * a hand-edited `.ipynb` is cleared.
+ *
+ * A `.py` TEXT notebook (jupytext/Databricks source) is refused UP FRONT
+ * (`refused:'py-notebook'`), like `exportPy`: it carries no cellar cell metadata,
+ * so the flag can never be stored and no module can ever be regenerated. Refusing
+ * loses nothing an agent could have had, and unlike reporting success it claims
+ * nothing false and spends no blocking jupytext rewrite.
  *
  * `exported` reports the RESULTING state - every addressed cell that now carries
  * the requested value - not a change count, so a repeated mark reports the same
@@ -1598,6 +1607,7 @@ export function setExportTarget(target: string | null | undefined, nb?: string |
  */
 export function setCellExport(ids: string[], exported: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
+	if (isPyTextNotebook(target)) return { ok: false as const, refused: 'py-notebook' as const };
 	const full: string[] = [];
 	const seen = new Set<string>();
 	for (const ref of ids) {
@@ -1606,7 +1616,7 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		const cell = getCell(id, target);
 		if (!cell || isHidden(cell)) return { ok: false as const, missing: ref };
 		// Checked for the WHOLE batch before the first write - see all-or-nothing.
-		if (exported && cell.cell_type !== 'code') return { ok: false as const, notCode: ref };
+		if (exported && !isLogicalCellType(cell, 'code')) return { ok: false as const, notCode: ref };
 		seen.add(id);
 		full.push(id);
 	}

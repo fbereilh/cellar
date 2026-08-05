@@ -347,9 +347,10 @@ Follow this house style:
    get_notebook_map's display block reports export_target (null when unset), and
    each marked cell as export:true. To build a module: set_export_target(path)
    names the file (path:null clears it) and set_cell_export(ids, export:true|false)
-   marks/unmarks the CODE cells that go in it. Both persist in metadata and
-   regenerate the module immediately - no cell source changes, so never hand-write
-   an #|export comment.
+   marks/unmarks the PYTHON code cells that go in it (a markdown or SQL cell has no
+   module source and is refused). Both persist in metadata and regenerate the
+   module immediately - no cell source changes, so never hand-write an #|export
+   comment.
 
 6. DECLARE YOUR WORKING NOTEBOOK FIRST. Your read/write/run tools target YOUR
    session's working notebook — not whichever tab the user happens to be looking
@@ -649,14 +650,19 @@ export function registerTools(server: McpServer) {
 	server.registerTool('set_header_numbering', { description: 'Set WHICH markdown heading levels render with an automatic number (levels:[2] numbers every H2 "1.", "2."; levels:[1,2] numbers hierarchically "1.", "1.1"; levels:[] turns it off). Notebook-level and DISPLAY-ONLY: numbers are computed at render time and no cell source is ever edited, so never type one into a header yourself. Returns the sanitized levels stored (deduped, 1-6, ascending) and how many headings now carry a number.', inputSchema: { levels: z.array(z.number().int().min(1).max(6)), ...notebookParam } }, async ({ levels, notebook }, extra: ToolExtra) => text(svc.setHeaderNumbering(levels, targetOf(extra, notebook))));
 	server.registerTool('set_report_view', { description: 'Turn the notebook-wide report view on/off: enabled:true renders every code cell OUTPUT-only, so a human reads results and markdown without the code; enabled:false shows code again. Display-only — no source is touched and cells still run. A per-cell set_hide_input override beats it in either direction. Returns the resulting report_view.', inputSchema: { enabled: z.boolean(), ...notebookParam } }, async ({ enabled, notebook }, extra: ToolExtra) => text(svc.setReportView(enabled, targetOf(extra, notebook))));
 	server.registerTool('set_hide_input', { description: 'Show or hide ONE code cell\'s input, overriding report view for that cell: hidden:true forces its code hidden, hidden:false forces it shown even under report view, hidden:null clears the choice so it follows the notebook-wide report_view again. The per-cell value ALWAYS wins over set_report_view, so this is how you keep one cell visible in a report, or hide a single cell without one. Display-only — no source is touched and the cell still runs; code cells only. Returns {hide_input (explicit value or null), code_hidden (effective), report_view (notebook default)}.', inputSchema: { id: z.string(), hidden: z.boolean().nullable(), ...notebookParam } }, async ({ id, hidden, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveOne(target, id, extra?.sessionId); if ('error' in res) return res.error; const r = svc.setHideInput(res.id, hidden, target); return r.ok ? text({ id: svc.handleFor(target, res.id), ...r }) : notFound(`cell ${id} is not a code cell (only a code cell can hide its input)`); });
-	server.registerTool('set_cell_export', { description: 'Mark or unmark ONE OR SEVERAL code cells for export to the nbdev-style `.py` module (metadata.cellar.export): export:true marks, false unmarks. Only CODE cells can be exported - a markdown/SQL cell is refused by id, never silently ignored. Nothing is written unless every id resolves. Regenerates the `.py` immediately when an export target is set (see set_export_target); get_notebook_map reports each marked cell as export:true. Returns {ok, exported:[ids], count, export_target}.', inputSchema: { ids: z.array(z.string()), export: z.boolean(), ...notebookParam } }, async ({ ids, export: exported, notebook }, extra: ToolExtra) => {
+	server.registerTool('set_cell_export', { description: 'Mark or unmark ONE OR SEVERAL cells for export to the nbdev-style `.py` module (metadata.cellar.export): export:true marks, false unmarks. Only PYTHON code cells can be exported - a markdown or SQL cell is refused by id, never silently ignored. Nothing is written unless every id resolves. Regenerates the `.py` immediately when an export target is set (see set_export_target); get_notebook_map reports each marked cell as export:true. Refused outright on a `.py` text notebook, which stores no cell metadata and generates no module. Returns {ok, exported:[ids], count, export_target}.', inputSchema: { ids: z.array(z.string()), export: z.boolean(), ...notebookParam } }, async ({ ids, export: exported, notebook }, extra: ToolExtra) => {
 		const target = targetOf(extra, notebook);
 		const res = resolveMany(target, ids, extra?.sessionId);
 		if ('error' in res) return res.error;
 		const r = svc.setCellExport(res.ids, exported, target);
 		if (r.ok) return text(r);
-		if ('notCode' in r) return notFound(`cell ${r.notCode} is not a code cell (only a code cell can be exported to the .py module)`);
-		return notFound(r.missing ? `cell ${r.missing} not found` : 'ids must not be empty');
+		if ('refused' in r) return notFound('refused: this is a .py text notebook (jupytext/Databricks source). It carries no per-cell metadata and generates no module, so a cell cannot be marked for export - convert it to .ipynb first.');
+		// A per-cell refusal names the handle the AGENT supplied, not the full UUID
+		// resolveMany expanded it to: an id the model cannot find anywhere in its own
+		// call reads as the tool answering about some other cell.
+		const asGiven = (full: string | undefined) => (full == null ? full : (ids[res.ids.indexOf(full)] ?? full));
+		if ('notCode' in r) return notFound(`cell ${asGiven(r.notCode)} is not a Python code cell (only a Python code cell can be exported to the .py module)`);
+		return notFound(r.missing ? `cell ${asGiven(r.missing)} not found` : 'ids must not be empty');
 	});
 	server.registerTool('set_export_target', { description: 'Set (or clear) your working notebook\'s EXPORT TARGET — the nbdev-style `#|default_exp` module: the workspace-relative `.py` file the cells marked for export (metadata.cellar.export) are written to. path:"lib/foo.py" sets it; path:null or "" clears it. Persisted in the notebook metadata and regenerates the `.py` immediately; no cell source is touched. Returns {export_target}, the same value get_notebook_map\'s `display` block reports.', inputSchema: { path: z.string().nullable(), ...notebookParam } }, async ({ path, notebook }, extra: ToolExtra) => text(svc.setExportTarget(path, targetOf(extra, notebook))));
 

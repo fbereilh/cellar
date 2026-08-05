@@ -683,15 +683,27 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
  * This IS `setCellExports` of one - one implementation, one rule - so the UI's
  * per-cell toggle and MCP's batch tool cannot drift about what marking means.
  * Returns whether the cell now carries the requested value (false = there is no
- * such cell, or marking a non-code one, which `isExportCell` would ignore).
+ * such cell, or marking a non-Python one, which `isExportCell` would ignore).
  */
 export function setCellExport(id: string, exported: boolean, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return false;
-	if (exported && cell.cell_type !== 'code') return false;
+	if (exported && !canExport(cell)) return false;
 	setCellExports([id], exported, nb, originId);
 	return true;
+}
+
+/**
+ * May this cell carry the export flag? `isLogicalCellType(cell, 'code')`, never a
+ * bare nbformat `cell_type === 'code'`: a SQL cell is an nbformat `code` cell
+ * tagged `cellar.language`, so that test lets one into the generated module as raw
+ * SQL. The one rule behind both setters, and the same predicate `isExportCell`
+ * (the exporter's own identity) reads, so a cell can never be marked into a state
+ * the exporter then ignores.
+ */
+function canExport(cell: Cell): boolean {
+	return isLogicalCellType(cell, 'code');
 }
 
 /**
@@ -703,10 +715,17 @@ export function setCellExport(id: string, exported: boolean, nb?: string | null,
  *
  * Only cells that actually CHANGE are touched, so a re-mark of an
  * already-marked cell writes nothing and emits nothing (zero git diff, no `.py`
- * mtime churn). Marking requires a code cell - a markdown/SQL cell has no module
- * source, so setting the flag there would be a lie `isExportCell` ignores -
- * while UNMARKING clears the flag wherever it is found, which is also how a stale
- * flag on a hand-edited `.ipynb` is cleared. Returns the ids actually changed.
+ * mtime churn). Marking requires a PYTHON code cell (`canExport`, the logical
+ * type - a markdown or SQL cell has no module source, so setting the flag there
+ * would be a lie `isExportCell` ignores) while UNMARKING clears the flag wherever
+ * it is found, which is also how a stale flag on a hand-edited `.ipynb` is
+ * cleared. Returns the ids actually changed.
+ *
+ * The persist is guarded on `jpFormat` like `clearOutputsForCells`: a `.py` text
+ * notebook carries no cellar cell metadata, so the write would spend a blocking
+ * jupytext `spawnSync` producing byte-identical output while silently losing the
+ * very flag it was asked to store (and `autoExportPy` skips it anyway). The
+ * events still fire unconditionally, so open tabs update either way.
  */
 export function setCellExports(
 	ids: readonly string[],
@@ -724,7 +743,7 @@ export function setCellExports(
 		if (!cell) continue;
 		const marked = cell.metadata?.cellar?.export === true;
 		if (exported) {
-			if (cell.cell_type !== 'code' || marked) continue;
+			if (!canExport(cell) || marked) continue;
 			cell.metadata = cell.metadata ?? {};
 			cell.metadata.cellar = cell.metadata.cellar ?? {};
 			cell.metadata.cellar.export = true;
@@ -736,9 +755,20 @@ export function setCellExports(
 		changed.push(cell);
 	}
 	if (!changed.length) return [];
-	persist(doc);
+	if (!doc.jpFormat) persist(doc);
 	for (const cell of changed) emit(doc, 'cell:export', { cellId: cell.id, exported }, originId);
 	return changed.map((c) => c.id);
+}
+
+/**
+ * Is this notebook a `.py` TEXT notebook (jupytext percent/light, or Databricks
+ * source) rather than an `.ipynb`? Such a document carries NO cellar cell
+ * metadata and generates no module (`persist` writes it through jupytext,
+ * `autoExportPy` skips it), so every export-flow caller has to refuse rather
+ * than claim a mark it cannot store - `exportPy` already throws on it.
+ */
+export function isPyTextNotebook(nb?: string | null): boolean {
+	return !!docFor(nb).jpFormat;
 }
 
 /** The notebook's configured export target (`.py` module path), or null. */
