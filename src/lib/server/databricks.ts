@@ -56,7 +56,12 @@
  *     *server-side*, in a short-lived subprocess of the project venv's python
  *     (`projectPython()`), one process per request. Read-only metadata calls
  *     have no business occupying the single shared kernel, and the browser stays
- *     responsive while a Unity Catalog page loads.
+ *     responsive while a Unity Catalog page loads. The one **write** that shares
+ *     this half is the workspace notebook upload (`uploadNotebook`): it is a
+ *     workspace-*files* call - it never touches compute, and it has nothing to do
+ *     with the user's namespace - so it belongs here rather than in the kernel,
+ *     on its own longer timeout (`UPLOAD_TIMEOUT_MS`) because its request is the
+ *     one large one.
  *   - **The session** (`spark`, `w`) is created *inside the kernel*, because
  *     that is the only place a user's cells can reach it. `connect()` executes
  *     the bootstrap through the ordinary `execute()` bridge and leaves `spark`
@@ -109,7 +114,7 @@ import {
 } from './dbrVersion';
 import { normalizeDatabricksHost } from '../databricksHost';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
-import { resolveNotebookPath } from './notebook';
+import { notebookIpynb, resolveNotebookPath } from './notebook';
 import { databricksRuntimeForced, databricksRuntimeVersionForced } from './ui-state';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
@@ -149,6 +154,9 @@ interface ProbeRequest {
 	catalog?: string;
 	schema?: string;
 	cluster_id?: string;
+	/** `workspace_upload`: the notebook's name in the workspace (its content rides stdin). */
+	name?: string;
+	overwrite?: boolean;
 }
 
 /**
@@ -231,6 +239,41 @@ const PROBE_TIMEOUT_MS = 45_000;
  * not completed", not "the workspace is down".
  */
 const LOGIN_TIMEOUT_MS = 300_000;
+
+/**
+ * How long the `workspace_upload` subprocess may run.
+ *
+ * Every other probe op is a small metadata read, so `PROBE_TIMEOUT_MS` sizes them
+ * fine; this one PUTs the whole notebook (megabytes, once outputs are in it), and
+ * on a slow uplink that is minutes of legitimate transfer - which the listing
+ * window would cut short as "Databricks did not respond within 45s", blaming the
+ * workspace for the user's upstream.
+ *
+ * It is the OUTERMOST of three nested budgets, and the ordering is what makes the
+ * SDK - not this SIGKILL - the thing that reports a wedged or slow upload: the
+ * python side bounds its retry budget (`UPLOAD_RETRY_TIMEOUT`, 120s) and its
+ * per-request read (`UPLOAD_HTTP_TIMEOUT`, 120s) so the worst case it can spend
+ * (the retry budget plus one full in-flight request, 240s) still lands inside this
+ * window with a minute to spare. Edit any of the three and re-check that sum -
+ * left at the SDK's 300s retry default the inner budget exactly equalled this one,
+ * so a retrying upload died here with the generic "did not respond" message the
+ * dedicated constant exists to avoid.
+ */
+const UPLOAD_TIMEOUT_MS = 300_000;
+
+/**
+ * The largest notebook JSON an upload will send.
+ *
+ * The Databricks workspace import API accepts roughly 10 MB of content, and
+ * `content` is base64 - about 4/3 the size of the bytes it encodes - so the real
+ * ceiling on the JSON is ~7.5 MB. Expressing the limit in JSON bytes and stopping
+ * short of that leaves the expansion headroom, and means the refusal happens
+ * BEFORE the ~1.33x copy is materialized in a process that also carries the
+ * kernel websockets, the SSE fan-out and the MCP server. A notebook only reaches
+ * this size through its OUTPUTS, which is why clearing them is the remedy the
+ * message names.
+ */
+const MAX_UPLOAD_JSON_BYTES = 7 * 1024 * 1024;
 
 /** Env vars the boilerplate clears. `DATABRICKS_CONFIG_FILE` is deliberately kept. */
 const KEEP_ENV = new Set(['DATABRICKS_CONFIG_FILE']);
@@ -443,6 +486,22 @@ MAX_ROWS = 500
 # connection, never on a legitimately large-but-flowing response.
 HTTP_TIMEOUT = 30
 
+# The upload is the one op whose request is LARGE: it PUTs the whole notebook, so
+# the listing-sized window above would abort a perfectly healthy transfer on a
+# slow uplink. It is per-request, so a wedged socket still fails well inside the
+# parent's UPLOAD_TIMEOUT_MS - the listing ops keep HTTP_TIMEOUT unchanged.
+UPLOAD_HTTP_TIMEOUT = 120
+
+# The SDK's own retry budget for the upload, bounded so the WHOLE op finishes
+# inside the parent's UPLOAD_TIMEOUT_MS (300s): the deadline is checked before
+# each attempt, so the worst case is this budget plus one full in-flight
+# UPLOAD_HTTP_TIMEOUT request = 240s, leaving a minute of margin. Left at the
+# SDK's 300s default it exactly equalled the parent budget, so a retrying upload
+# (or a Config() whose /.well-known discovery inherits the same budget against an
+# unreachable host) was SIGKILLed and reported as the generic "did not respond
+# within 300s" instead of the SDK's own message. Edit any of the three together.
+UPLOAD_RETRY_TIMEOUT = 120
+
 def classify(e):
     n = type(e).__name__
     m = str(e)
@@ -582,18 +641,83 @@ def tables(w, catalog, schema):
     rows.sort(key=lambda r: r['name'].lower())
     return {'ok': True, 'tables': rows, 'truncated': truncated}
 
-def build_client(auth):
+def workspace_home(w):
+    # The user's own workspace folder, resolved from the CONNECTED identity - never
+    # a path Cellar guessed or the user typed. \`user_name\` is the login (an email
+    # for most workspaces), which is exactly what /Users/<...> is keyed by.
+    me = w.current_user.me()
+    name = getattr(me, 'user_name', None)
+    if not name:
+        raise RuntimeError('the workspace did not report a user name for the signed-in identity')
+    return '/Users/' + name
+
+def workspace_upload(w, name, overwrite):
+    # Import the notebook the user has open into their own workspace folder, as a
+    # real Databricks notebook: format=JUPYTER keeps the .ipynb's cells (and their
+    # outputs) intact, where SOURCE would flatten it into one .py script.
+    #
+    # The base64 payload arrives on STDIN, not in argv: a notebook with outputs is
+    # routinely megabytes, and an argv that large is refused by the OS (E2BIG)
+    # long before the SDK ever sees it.
+    from databricks.sdk.service.workspace import ImportFormat
+    content = sys.stdin.read().strip()
+    if not content:
+        return {'ok': False, 'code': 'bad_request', 'message': 'no notebook content reached the upload'}
+    path = workspace_home(w) + '/' + name
+    host = w.config.host
+    if not overwrite:
+        # Never clobber silently: report what is already there and let the caller
+        # decide. A non-notebook object is NOT offered as a replace - an import
+        # over a directory fails, and over a file it would destroy something the
+        # user never meant this button to touch.
+        existing = None
+        try:
+            existing = w.workspace.get_status(path)
+        except Exception as e:
+            # The free-path case is keyed off the exception TYPE, never classify():
+            # classify matches the MESSAGE before the type name, and a workspace
+            # not-found message embeds the path being looked up - so a notebook (or
+            # a user login) containing 'oauth', 'consent', 'authorization code',
+            # 'external-browser' or 'authenticate' read as oauth_login_required and
+            # failed the very first upload of a path that simply did not exist,
+            # permanently, with a sign-in prompt. classify is for the FINAL message,
+            # not for control flow. Anything else re-raises, so a genuine
+            # permission/auth/network failure surfaces honestly instead of being
+            # taken for a free path and overwriting.
+            if type(e).__name__ not in ('NotFound', 'ResourceDoesNotExist'):
+                raise
+        if existing is not None:
+            kind = (enum_value(getattr(existing, 'object_type', None)) or 'OBJECT').upper()
+            if kind != 'NOTEBOOK':
+                return {'ok': False, 'code': 'workspace_conflict',
+                        'message': 'A %s already exists at %s. Rename this notebook, or remove that object in Databricks, then upload again.'
+                                   % (kind.lower(), path)}
+            return {'ok': True, 'status': 'exists', 'path': path, 'host': host, 'overwritten': False}
+    w.workspace.import_(path=path, format=ImportFormat.JUPYTER, content=content, overwrite=bool(overwrite))
+    return {'ok': True, 'status': 'uploaded', 'path': path, 'host': host, 'overwritten': bool(overwrite)}
+
+def build_client(auth, http_timeout=HTTP_TIMEOUT, retry_timeout=None):
     # One place that turns the resolved auth descriptor into a WorkspaceClient, so
     # the listing subprocess and (mirrored in CONNECT_CODE) the kernel session
     # build byte-identical Configs -> the OAuth token cache key matches -> a token
-    # minted by 'login' is reused everywhere with no second browser.
+    # minted by 'login' is reused everywhere with no second browser. The request
+    # timeout is NOT part of that cache key (it hashes host/client_id/scopes/
+    # profile), so an op may widen its own without breaking the shared token.
+    #
+    # retry_timeout is passed only by the op that needs it bounded (the upload);
+    # omitting the kwarg leaves every listing on the SDK's own default, which is
+    # what they have always run with. It goes to Config, not just the request, so
+    # the constructor's /.well-known discovery is covered by the same budget.
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.core import Config
+    kw = {'http_timeout_seconds': http_timeout}
+    if retry_timeout is not None:
+        kw['retry_timeout_seconds'] = retry_timeout
     mode = auth.get('mode')
     if mode == 'profile':
-        cfg = Config(profile=auth['profile'], http_timeout_seconds=HTTP_TIMEOUT)
+        cfg = Config(profile=auth['profile'], **kw)
     elif mode == 'oauth':
-        cfg = Config(host=auth['host'], auth_type='external-browser', http_timeout_seconds=HTTP_TIMEOUT)
+        cfg = Config(host=auth['host'], auth_type='external-browser', **kw)
     else:
         raise ValueError('unknown auth mode: %r' % (mode,))
     return WorkspaceClient(config=cfg)
@@ -834,7 +958,13 @@ def main():
     if op == 'logout':
         return logout(auth)
     try:
-        w = build_client(auth)
+        # Only the upload carries a large request body, so only it widens the
+        # per-request timeout and bounds the retry budget below the parent's kill
+        # window; every listing keeps the tight one and the SDK's own default.
+        if op == 'workspace_upload':
+            w = build_client(auth, UPLOAD_HTTP_TIMEOUT, UPLOAD_RETRY_TIMEOUT)
+        else:
+            w = build_client(auth, HTTP_TIMEOUT)
     except Exception as e:
         return fail(e)
     try:
@@ -854,6 +984,8 @@ def main():
             return schemas(w, req['catalog'])
         if op == 'tables':
             return tables(w, req['catalog'], req['schema'])
+        if op == 'workspace_upload':
+            return workspace_upload(w, req['name'], req.get('overwrite'))
     except Exception as e:
         return fail(e)
     return {'ok': False, 'code': 'error', 'message': 'unknown op: %r' % (op,)}
@@ -905,12 +1037,15 @@ export function statusFor(code: string): number {
 		case 'version_mismatch':
 		case 'cluster_terminated':
 		case 'reconnect_failed':
+		case 'workspace_conflict':
 			return 409;
 		case 'sdk_missing':
 		case 'connect_missing':
 		case 'no_python':
 		case 'no_uv':
 			return 412; // precondition: the environment is not ready
+		case 'notebook_too_large':
+			return 413;
 		case 'kernel_unavailable':
 			return 503;
 		case 'timeout':
@@ -978,15 +1113,30 @@ function profileReauthVerdict(err: unknown): DatabricksError | undefined {
 	return err instanceof DatabricksError && err.code === PROFILE_REAUTH_CODE && err.profile ? err : undefined;
 }
 
-/** Run one `PROBE` command in the project venv and return its parsed result. */
-function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS): Promise<ProbeResult> {
+/**
+ * Run one `PROBE` command in the project venv and return its parsed result.
+ *
+ * `stdin` is the payload channel for an op whose input is too big for `argv` -
+ * only `workspace_upload` uses it (a notebook with outputs is routinely
+ * megabytes, and the OS refuses an argv that large with E2BIG). Every other op
+ * leaves stdin at `'ignore'`, so its `sys.stdin` is /dev/null exactly as before.
+ */
+function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS, stdin?: string): Promise<ProbeResult> {
 	const python = requirePython();
 	return new Promise<ProbeResult>((resolve, reject) => {
 		const child = spawn(python, ['-c', PROBE, JSON.stringify(request)], {
 			env: scrubEnv(),
 			cwd: workspace(),
-			stdio: ['ignore', 'pipe', 'pipe']
+			stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe']
 		});
+		if (stdin !== undefined) {
+			// A child that died before reading (a `sdk_missing` exit) leaves the pipe
+			// broken; that is not the failure to report - the sentinel line, or the
+			// exit handler below, is - so an EPIPE here must not become an unhandled
+			// error event.
+			child.stdin!.on('error', () => {});
+			child.stdin!.end(stdin);
+		}
 		let stdout = '';
 		let stderr = '';
 		let killedByTimeout = false;
@@ -3443,6 +3593,123 @@ export async function previewTable({
 		({ result } = await runInKernel(abs, PREVIEW_CODE({ name, limit: n })));
 	}
 	return payload<PreviewResult>(unwrap(result));
+}
+
+// --- upload the open notebook to the workspace ------------------------------
+
+/**
+ * The name a notebook takes in the Databricks workspace: its own basename with
+ * the extension dropped.
+ *
+ * Databricks names a workspace notebook by its path segment, so keeping the
+ * suffix would produce a notebook literally called `analysis.ipynb` sitting
+ * beside every other one that is not. Validated rather than escaped: a workspace
+ * path is `/`-delimited, so a segment carrying a separator (or a control
+ * character) would silently land the upload somewhere else.
+ */
+function workspaceNotebookName(fileName: string): string {
+	const name = fileName.replace(/\.(ipynb|py)$/i, '').trim();
+	if (!name || name === '.' || name === '..' || /[\u0000-\u001f/\\]/.test(name)) {
+		throw new DatabricksError(
+			'bad_request',
+			`"${fileName}" is not a name Databricks can give a workspace notebook. Rename the file, then upload again.`
+		);
+	}
+	return name;
+}
+
+/** A byte count as the refusal message should read it. */
+function megabytes(bytes: number): string {
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Refuse a notebook the workspace import API would reject anyway - BEFORE the
+ * base64 copy is built, so an oversized payload never costs the shared Node
+ * process its ~1.33x expansion on the way to a failure.
+ *
+ * The message names the size, the limit and the remedy: the notebook is this big
+ * because of its OUTPUTS (its source is kilobytes), so clearing them is what
+ * makes the upload fit. Its own code, not the shared `bad_request`, so the
+ * sidebar can carry copy that would be wrong for every other caller of that code.
+ */
+function assertUploadableSize(json: string, name: string): void {
+	const bytes = Buffer.byteLength(json, 'utf8');
+	if (bytes <= MAX_UPLOAD_JSON_BYTES) return;
+	throw new DatabricksError(
+		'notebook_too_large',
+		`"${name}" is ${megabytes(bytes)}, past the ${megabytes(MAX_UPLOAD_JSON_BYTES)} a Databricks workspace import accepts. Clear the notebook's outputs, then upload again - they are what makes it this large, and the workspace re-runs it anyway.`
+	);
+}
+
+/** What an upload attempt reports back: it landed, or something is already there. */
+export interface UploadResult {
+	ok: true;
+	/** `uploaded` - it is in the workspace. `exists` - nothing was written; a notebook is already at `path`. */
+	status: 'uploaded' | 'exists';
+	/** The full workspace path, e.g. `/Users/me@corp.com/analysis`. */
+	path: string;
+	/** A deep link to the notebook in the workspace UI, or null if the host is unknown. */
+	url: string | null;
+	/** Whether an existing notebook was replaced. */
+	overwritten: boolean;
+}
+
+/**
+ * Import the open notebook into the connected user's own workspace folder
+ * (`/Users/<user>/<name>`) as a real Databricks notebook.
+ *
+ * Runs entirely through the EXISTING authenticated path - the notebook's live
+ * connection selection (`requireConnectedSel`) → `resolveAuth` → the same
+ * `WorkspaceClient` every listing builds - so there is no second auth mechanism,
+ * and an expired profile surfaces the very same `profile_reauth_required` (with
+ * its exact `databricks auth login --profile <name>` command) as everything else.
+ *
+ * It is a **workspace-files** operation: a short-lived server subprocess, never
+ * the kernel, and it never touches compute. Uploading does not need - and must
+ * not cause - a cluster to start, stop or restart; a connection is required only
+ * because that is what identifies the workspace and the user to upload as.
+ *
+ * `overwrite` defaults to **false**, and that is the safe default rather than an
+ * omission: without it the op reports `status:'exists'` and writes NOTHING, so
+ * replacing a notebook is always a second, deliberate call. The notebook bytes
+ * come from the live document (`notebookIpynb`), so they match the `.ipynb` on
+ * disk exactly, and a `.py` jupytext notebook uploads as a proper `.ipynb`.
+ *
+ * Bounded on both axes the payload can grow along: `MAX_UPLOAD_JSON_BYTES` is
+ * checked before the base64 copy exists, and the subprocess runs on the upload's
+ * own `UPLOAD_TIMEOUT_MS` rather than the listing-sized window.
+ */
+export async function uploadNotebook({
+	nb,
+	overwrite = false
+}: { nb?: string | null; overwrite?: boolean } = {}): Promise<UploadResult> {
+	const abs = resolveNotebookPath(nb);
+	// Gated exactly like every other connected op: not connected is an actionable
+	// `not_connected`, and a gated OAuth selection still has to have signed in.
+	const auth = authForListing(requireConnectedSel(abs));
+	const { name, json } = notebookIpynb(abs);
+	const target = workspaceNotebookName(name);
+	assertUploadableSize(json, name);
+	const result = payload<{ status?: string; path?: string; host?: string; overwritten?: boolean }>(
+		unwrap(
+			await probe(
+				{ op: 'workspace_upload', auth, name: target, overwrite },
+				UPLOAD_TIMEOUT_MS,
+				Buffer.from(json, 'utf8').toString('base64')
+			)
+		)
+	);
+	const path = result.path ?? '';
+	const host = result.host ?? auth.host ?? '';
+	return {
+		ok: true,
+		status: result.status === 'exists' ? 'exists' : 'uploaded',
+		path,
+		// The workspace UI addresses an object by its path; no host, no honest link.
+		url: host && path ? `${host.replace(/\/+$/, '')}/#workspace${path}` : null,
+		overwritten: !!result.overwritten
+	};
 }
 
 /** Stop a notebook's session and drop `spark`/`w` from its kernel namespace. */

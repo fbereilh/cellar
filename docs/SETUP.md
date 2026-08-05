@@ -252,6 +252,29 @@ up - and `off` otherwise. Force the setting headless with
 reference below) - the card then says the environment is in control and disables the
 control that override holds, since no toggle or restart can change it.
 
+**Upload the open notebook to your workspace.** While connected, the Cluster card
+carries an **Upload notebook to workspace** button. It copies the notebook you have
+open into your own Databricks folder - `/Users/<you>/<name>`, where the user folder
+comes from the connected identity (`current_user.me()`) rather than anything you
+type, and the name is the file's basename with the extension dropped, since
+Databricks names a workspace notebook by its path segment. It imports in **JUPYTER**
+format, so the notebook lands with its cells intact instead of being flattened into
+one `.py` script; a `.py` jupytext or Databricks-source notebook is uploaded as a
+proper `.ipynb`, built from the live document so it matches what Cellar saves on
+disk. It authenticates through the connection you already made - the same
+`WorkspaceClient` every listing uses, so an expired profile reports the same
+`databricks auth login --profile <name>` remedy as everywhere else - and it is a
+**workspace-files** operation only: it never starts, stops or restarts a cluster (a
+connection is needed only to identify the workspace and the user). Nothing is
+overwritten silently: the first attempt sends no overwrite flag, so a notebook
+already at that path comes back untouched and the panel asks you to confirm a
+**Replace**, while a path occupied by something that is not a notebook is refused
+rather than offered as a replace. A successful upload shows the workspace path and
+an **Open in Databricks** link. A notebook whose JSON is larger than ~7 MB is
+refused before anything is sent (the workspace import API accepts roughly 10 MB of
+base64 content); clearing the outputs, which are what make a notebook that large, is
+the fix.
+
 **Disconnect vs Log out.** Disconnect ends that notebook's Spark session and
 leaves you authenticated. **Log out** - the quiet button under the Cluster card's
 Switch/Disconnect row - also signs you out: it disconnects every bound notebook
