@@ -8,7 +8,7 @@ import { statusFor } from '$lib/server/databricks';
  * name to render the exact `databricks auth login --profile <name>` command
  * rather than a hardcoded one.
  *
- * Shared so the shape cannot drift between the eight routes that catch a
+ * Shared so the shape cannot drift between the nine routes that catch a
  * `DatabricksError`; the UI keys its copy off `code`, so a route that quietly
  * dropped a field would silently lose the remedy.
  */

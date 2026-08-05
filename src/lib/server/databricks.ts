@@ -56,7 +56,12 @@
  *     *server-side*, in a short-lived subprocess of the project venv's python
  *     (`projectPython()`), one process per request. Read-only metadata calls
  *     have no business occupying the single shared kernel, and the browser stays
- *     responsive while a Unity Catalog page loads.
+ *     responsive while a Unity Catalog page loads. The one **write** that shares
+ *     this half is the workspace notebook upload (`uploadNotebook`): it is a
+ *     workspace-*files* call - it never touches compute, and it has nothing to do
+ *     with the user's namespace - so it belongs here rather than in the kernel,
+ *     on its own longer timeout (`UPLOAD_TIMEOUT_MS`) because its request is the
+ *     one large one.
  *   - **The session** (`spark`, `w`) is created *inside the kernel*, because
  *     that is the only place a user's cells can reach it. `connect()` executes
  *     the bootstrap through the ordinary `execute()` bridge and leaves `spark`
