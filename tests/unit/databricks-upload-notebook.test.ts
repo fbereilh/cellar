@@ -170,6 +170,9 @@ function writeFakeSdkInterpreter(): string {
 			'    def __init__(self, profile=None, host=None, auth_type=None, **kw):',
 			'        self.profile = profile',
 			"        self.host = host or os.environ.get('CELLAR_FAKE_DBX_HOST')",
+			// Kept so a test can read WHICH per-request timeout an op asked for: the
+			// upload's request is the only large one, so it is the only one widened.
+			"        self.http_timeout_seconds = kw.get('http_timeout_seconds')",
 			''
 		].join('\n')
 	);
@@ -232,6 +235,8 @@ function writeFakeSdkInterpreter(): string {
 			'',
 			'class WorkspaceClient:',
 			'    def __init__(self, config=None, **kw):',
+			"        _record({'call': 'client',",
+			"                 'http_timeout_seconds': getattr(config, 'http_timeout_seconds', None)})",
 			'        self.config = config',
 			'        self.workspace = _Workspace()',
 			'        self.current_user = _CurrentUser()',
@@ -417,6 +422,43 @@ describe('uploadNotebook — the server op', () => {
 		await expect(dbx.uploadNotebook({ nb: odd })).rejects.toMatchObject({ code: 'bad_request' });
 		expect(existsSync(reqFile)).toBe(false);
 	});
+
+	it('refuses a notebook past what a workspace import accepts - before anything is spawned', async () => {
+		// Big because of its OUTPUTS, which is the only way a notebook gets this large
+		// and the reason the remedy is "clear them", not "split the notebook".
+		const huge = join(dir, 'huge.ipynb');
+		writeFileSync(
+			huge,
+			JSON.stringify({
+				...FIXTURE,
+				cells: [
+					{
+						cell_type: 'code',
+						id: 'c-huge',
+						metadata: {},
+						execution_count: null,
+						source: ['print("big")\n'],
+						outputs: [{ output_type: 'stream', name: 'stdout', text: ['y'.repeat(9 * 1024 * 1024)] }]
+					}
+				]
+			})
+		);
+		useNoPython();
+		await dbx.connect({ profile: 'pat', clusterId: '0725-abc', clusterName: 'Test Cluster', nb: huge });
+		useStub(writeRecordingStub('stub-unused-huge', { ok: true, status: 'uploaded', path: '/Users/x/y', host: HOST }));
+
+		const err = await dbx.uploadNotebook({ nb: huge }).catch((e) => e);
+		// Its OWN code, not the shared `bad_request`: the sidebar's remedy for this
+		// (clear the outputs) would be wrong copy for every other `bad_request` caller.
+		expect(err).toMatchObject({ code: 'notebook_too_large' });
+		// Actionable: it names the size, the limit and what to do about it.
+		expect(err.message).toMatch(/\d+\.\d MB/);
+		expect(err.message).toContain('outputs');
+		// The whole point of a PRE-flight check is not paying for the payload: the
+		// refusal happens before the subprocess (and so before the base64 copy).
+		expect(existsSync(reqFile)).toBe(false);
+		expect(existsSync(stdinFile)).toBe(false);
+	});
 });
 
 describe('the workspace_upload op — the SHIPPED probe against a fake databricks SDK', () => {
@@ -428,8 +470,9 @@ describe('the workspace_upload op — the SHIPPED probe against a fake databrick
 		const out = await dbx.uploadNotebook({ nb: NB });
 
 		expect(out.status).toBe('uploaded');
-		// The home folder comes from `current_user.me()`, never a guess.
-		expect(sdkCalls()[0]).toMatchObject({ call: 'me' });
+		// The home folder comes from `current_user.me()`, never a guess: it is the very
+		// first thing asked of the workspace, before any path is built.
+		expect(sdkCalls().filter((c) => c.call !== 'client')[0]).toMatchObject({ call: 'me' });
 		expect(out.path).toBe(`/Users/${USER}/analysis`);
 
 		const imported = sdkCalls().find((c) => c.call === 'import_')!;
@@ -494,7 +537,25 @@ describe('the workspace_upload op — the SHIPPED probe against a fake databrick
 
 		// The fake exposes `workspace` and `current_user` and nothing else, so a call to
 		// `clusters.*` would have raised; assert the intent positively too.
-		expect(sdkCalls().map((c) => c.call).sort()).toEqual(['get_status', 'import_', 'me']);
+		expect(sdkCalls().map((c) => c.call).sort()).toEqual(['client', 'get_status', 'import_', 'me']);
 		expect(dbx.connectionStatus(NB).connected).toBe(true); // the session is untouched
+	});
+
+	it.skipIf(!python)(`gives the upload its OWN wider request timeout, leaving the listings' alone [${python ? 'ok' : NO_PYTHON}]`, async () => {
+		await freshConnect();
+		process.env.CELLAR_FAKE_DBX_LOG = callLog;
+		useStub(writeFakeSdkInterpreter());
+
+		await dbx.uploadNotebook({ nb: NB });
+		// The upload PUTs the whole notebook: on a slow uplink the listing-sized window
+		// would cut a healthy transfer short and blame the workspace for it.
+		expect(sdkCalls().find((c) => c.call === 'client')!.http_timeout_seconds).toBe(120);
+
+		// The small metadata reads are NOT widened - a wedged socket must still fail
+		// fast there. The fake has no `clusters`, so the op fails after building the
+		// client, which is all this needs to read.
+		rmSync(callLog, { force: true });
+		await dbx.listClusters({ profile: 'pat', host: null }).catch(() => {});
+		expect(sdkCalls().find((c) => c.call === 'client')!.http_timeout_seconds).toBe(30);
 	});
 });

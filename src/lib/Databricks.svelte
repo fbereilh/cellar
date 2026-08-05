@@ -958,8 +958,21 @@
 	 */
 	let uploadExistsPath = $state('');
 
+	/**
+	 * The generation guard for an upload, the same shape as `statusSeq` above and
+	 * for the same reason: a reply that is no longer the newest word on its subject
+	 * must not be applied. Here that is load-bearing rather than cosmetic - a stale
+	 * reply arming the replace confirm would name a path belonging to a notebook the
+	 * panel has since left, while Replace posts the CURRENT `notebookPath`, so the
+	 * user would confirm one path and overwrite another. Bumped by every clear too,
+	 * which is what makes Cancel (and the notebook-switch clear) authoritative
+	 * against a request that is still in flight.
+	 */
+	let uploadSeq = 0;
+
 	/** Drop the previous attempt's feedback: it describes one moment, not a standing state. */
 	function clearUploadFeedback() {
+		uploadSeq++;
 		uploadError = null;
 		uploadDone = null;
 		uploadExistsPath = '';
@@ -976,20 +989,32 @@
 	async function uploadToWorkspace(overwrite = false) {
 		if (busy) return;
 		busy = 'upload';
-		clearUploadFeedback();
+		const seq = ++uploadSeq;
+		const target = notebookPath;
+		// The previous attempt's outcome is stale the moment a new one starts, but the
+		// pending replace confirm deliberately STAYS: it names the path being
+		// overwritten, which is exactly what the user must keep seeing while the
+		// replace runs. It is torn down below, once this attempt settles.
+		uploadError = null;
+		uploadDone = null;
 		try {
 			const res = await fetch('/api/databricks/upload', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ path: notebookPath ?? undefined, overwrite })
+				body: JSON.stringify({ path: target ?? undefined, overwrite })
 			});
 			const body = await res.json();
+			// Superseded - the panel moved to another notebook, or the user cancelled.
+			// This reply describes a file the panel no longer names, so NOTHING of it is
+			// written: an armed confirm would overwrite on behalf of a different notebook.
+			if (seq !== uploadSeq || target !== notebookPath) return;
 			if (!res.ok) throw body;
 			const out = body as { status?: string; path?: string; url?: string | null; overwritten?: boolean };
 			if (out.status === 'exists') {
 				uploadExistsPath = out.path ?? '';
 				return;
 			}
+			uploadExistsPath = '';
 			uploadDone = {
 				headline: out.overwritten
 					? 'Replaced in your Databricks workspace:'
@@ -998,6 +1023,10 @@
 				url: out.url ?? ''
 			};
 		} catch (err) {
+			if (seq !== uploadSeq || target !== notebookPath) return;
+			// A failed replace must not strand the user inside a confirm box whose
+			// Replace button just failed: drop back to the plain button, with the error.
+			uploadExistsPath = '';
 			uploadError = toDbxError(err);
 		} finally {
 			busy = '';
@@ -1313,7 +1342,8 @@
 		read_failed: 'Spark could not read that table.',
 		kernel_unavailable: 'Cellar could not reach the Python kernel. Restart Cellar, then connect again.',
 		busy: 'Another Databricks operation is still running.',
-		workspace_conflict: 'Something that is not a notebook already occupies that path in your workspace. Nothing was uploaded.'
+		workspace_conflict: 'Something that is not a notebook already occupies that path in your workspace. Nothing was uploaded.',
+		notebook_too_large: 'This notebook is too large for a Databricks workspace import. Run “Clear all outputs” from the command palette, then upload again - the outputs are what make it this large.'
 	};
 
 	/**

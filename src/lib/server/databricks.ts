@@ -235,6 +235,33 @@ const PROBE_TIMEOUT_MS = 45_000;
  */
 const LOGIN_TIMEOUT_MS = 300_000;
 
+/**
+ * How long the `workspace_upload` subprocess may run.
+ *
+ * Every other probe op is a small metadata read, so `PROBE_TIMEOUT_MS` sizes them
+ * fine; this one PUTs the whole notebook (megabytes, once outputs are in it), and
+ * on a slow uplink that is minutes of legitimate transfer - which the listing
+ * window would cut short as "Databricks did not respond within 45s", blaming the
+ * workspace for the user's upstream. It stays comfortably above the python side's
+ * own `UPLOAD_HTTP_TIMEOUT`, so a genuinely wedged socket is still reported by the
+ * SDK (with a real message) rather than by the parent's SIGKILL.
+ */
+const UPLOAD_TIMEOUT_MS = 300_000;
+
+/**
+ * The largest notebook JSON an upload will send.
+ *
+ * The Databricks workspace import API accepts roughly 10 MB of content, and
+ * `content` is base64 - about 4/3 the size of the bytes it encodes - so the real
+ * ceiling on the JSON is ~7.5 MB. Expressing the limit in JSON bytes and stopping
+ * short of that leaves the expansion headroom, and means the refusal happens
+ * BEFORE the ~1.33x copy is materialized in a process that also carries the
+ * kernel websockets, the SSE fan-out and the MCP server. A notebook only reaches
+ * this size through its OUTPUTS, which is why clearing them is the remedy the
+ * message names.
+ */
+const MAX_UPLOAD_JSON_BYTES = 7 * 1024 * 1024;
+
 /** Env vars the boilerplate clears. `DATABRICKS_CONFIG_FILE` is deliberately kept. */
 const KEEP_ENV = new Set(['DATABRICKS_CONFIG_FILE']);
 const isStaleEnv = (k: string): boolean =>
@@ -446,6 +473,12 @@ MAX_ROWS = 500
 # connection, never on a legitimately large-but-flowing response.
 HTTP_TIMEOUT = 30
 
+# The upload is the one op whose request is LARGE: it PUTs the whole notebook, so
+# the listing-sized window above would abort a perfectly healthy transfer on a
+# slow uplink. It is per-request, so a wedged socket still fails well inside the
+# parent's UPLOAD_TIMEOUT_MS - the listing ops keep HTTP_TIMEOUT unchanged.
+UPLOAD_HTTP_TIMEOUT = 120
+
 def classify(e):
     n = type(e).__name__
     m = str(e)
@@ -630,18 +663,20 @@ def workspace_upload(w, name, overwrite):
     w.workspace.import_(path=path, format=ImportFormat.JUPYTER, content=content, overwrite=bool(overwrite))
     return {'ok': True, 'status': 'uploaded', 'path': path, 'host': host, 'overwritten': bool(overwrite)}
 
-def build_client(auth):
+def build_client(auth, http_timeout=HTTP_TIMEOUT):
     # One place that turns the resolved auth descriptor into a WorkspaceClient, so
     # the listing subprocess and (mirrored in CONNECT_CODE) the kernel session
     # build byte-identical Configs -> the OAuth token cache key matches -> a token
-    # minted by 'login' is reused everywhere with no second browser.
+    # minted by 'login' is reused everywhere with no second browser. The request
+    # timeout is NOT part of that cache key (it hashes host/client_id/scopes/
+    # profile), so an op may widen its own without breaking the shared token.
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.core import Config
     mode = auth.get('mode')
     if mode == 'profile':
-        cfg = Config(profile=auth['profile'], http_timeout_seconds=HTTP_TIMEOUT)
+        cfg = Config(profile=auth['profile'], http_timeout_seconds=http_timeout)
     elif mode == 'oauth':
-        cfg = Config(host=auth['host'], auth_type='external-browser', http_timeout_seconds=HTTP_TIMEOUT)
+        cfg = Config(host=auth['host'], auth_type='external-browser', http_timeout_seconds=http_timeout)
     else:
         raise ValueError('unknown auth mode: %r' % (mode,))
     return WorkspaceClient(config=cfg)
@@ -882,7 +917,9 @@ def main():
     if op == 'logout':
         return logout(auth)
     try:
-        w = build_client(auth)
+        # Only the upload carries a large request body, so only it widens the
+        # per-request timeout; every listing keeps the tight one.
+        w = build_client(auth, UPLOAD_HTTP_TIMEOUT if op == 'workspace_upload' else HTTP_TIMEOUT)
     except Exception as e:
         return fail(e)
     try:
@@ -962,6 +999,8 @@ export function statusFor(code: string): number {
 		case 'no_python':
 		case 'no_uv':
 			return 412; // precondition: the environment is not ready
+		case 'notebook_too_large':
+			return 413;
 		case 'kernel_unavailable':
 			return 503;
 		case 'timeout':
@@ -3534,6 +3573,30 @@ function workspaceNotebookName(fileName: string): string {
 	return name;
 }
 
+/** A byte count as the refusal message should read it. */
+function megabytes(bytes: number): string {
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Refuse a notebook the workspace import API would reject anyway - BEFORE the
+ * base64 copy is built, so an oversized payload never costs the shared Node
+ * process its ~1.33x expansion on the way to a failure.
+ *
+ * The message names the size, the limit and the remedy: the notebook is this big
+ * because of its OUTPUTS (its source is kilobytes), so clearing them is what
+ * makes the upload fit. Its own code, not the shared `bad_request`, so the
+ * sidebar can carry copy that would be wrong for every other caller of that code.
+ */
+function assertUploadableSize(json: string, name: string): void {
+	const bytes = Buffer.byteLength(json, 'utf8');
+	if (bytes <= MAX_UPLOAD_JSON_BYTES) return;
+	throw new DatabricksError(
+		'notebook_too_large',
+		`"${name}" is ${megabytes(bytes)}, past the ${megabytes(MAX_UPLOAD_JSON_BYTES)} a Databricks workspace import accepts. Clear the notebook's outputs, then upload again - they are what makes it this large, and the workspace re-runs it anyway.`
+	);
+}
+
 /** What an upload attempt reports back: it landed, or something is already there. */
 export interface UploadResult {
 	ok: true;
@@ -3567,6 +3630,10 @@ export interface UploadResult {
  * replacing a notebook is always a second, deliberate call. The notebook bytes
  * come from the live document (`notebookIpynb`), so they match the `.ipynb` on
  * disk exactly, and a `.py` jupytext notebook uploads as a proper `.ipynb`.
+ *
+ * Bounded on both axes the payload can grow along: `MAX_UPLOAD_JSON_BYTES` is
+ * checked before the base64 copy exists, and the subprocess runs on the upload's
+ * own `UPLOAD_TIMEOUT_MS` rather than the listing-sized window.
  */
 export async function uploadNotebook({
 	nb,
@@ -3578,11 +3645,12 @@ export async function uploadNotebook({
 	const auth = authForListing(requireConnectedSel(abs));
 	const { name, json } = notebookIpynb(abs);
 	const target = workspaceNotebookName(name);
+	assertUploadableSize(json, name);
 	const result = payload<{ status?: string; path?: string; host?: string; overwritten?: boolean }>(
 		unwrap(
 			await probe(
 				{ op: 'workspace_upload', auth, name: target, overwrite },
-				PROBE_TIMEOUT_MS,
+				UPLOAD_TIMEOUT_MS,
 				Buffer.from(json, 'utf8').toString('base64')
 			)
 		)
