@@ -31,8 +31,12 @@ const NB = 'notebook.ipynb';
 const ESC = String.fromCharCode(27);
 
 const SRC_STDOUT = 'print("hello from cellar")';
+// Its own cell, so the one test that CLEARS an output mutates nothing another
+// test reads. Every test here shares one launcher and one workspace notebook.
+const SRC_CLEARABLE = 'print("clear me")';
 const SRC_ERROR = 'raise ValueError("boom")';
 const SRC_TABLE = 'styler()';
+const SRC_TABLE_PRETTY = 'styler_pretty()';
 const SRC_DF = 'df';
 const SRC_DF_BIG = 'big_df';
 const SRC_IMAGE = 'plot()';
@@ -66,6 +70,7 @@ function notebookJson(): string {
 		metadata: { kernelspec: { name: 'python3', display_name: 'python3' } },
 		cells: [
 			cell('copy-stdout-aaaa', SRC_STDOUT, [stream('hello from cellar\n')]),
+			cell('copy-clearme-aaa', SRC_CLEARABLE, [stream('clear me\n')]),
 			cell('copy-error-aaaaa', SRC_ERROR, [
 				{
 					output_type: 'error',
@@ -83,6 +88,45 @@ function notebookJson(): string {
 						'text/html':
 							'<style>#T_x td{color:red}</style><table id="T_x"><thead><tr><th>name</th><th>qty</th></tr></thead>' +
 							'<tbody><tr><td>apple</td><td>3</td></tr><tr><td>pear</td><td>5</td></tr></tbody></table>'
+					}
+				}
+			]),
+			// The SAME Styler as its jinja template really emits it: a newline and an
+			// indent between every tag, plus the blank index heading. Those newlines
+			// survive the tag strip, so this is the shape that pasted as ONE vertical
+			// column while the compact fixture above looked perfect.
+			cell('copy-pretty-aaaaa', SRC_TABLE_PRETTY, [
+				{
+					output_type: 'display_data',
+					metadata: {},
+					data: {
+						'text/html': [
+							'<style type="text/css">',
+							'#T_p td { color: red; }',
+							'</style>',
+							'<table id="T_p">',
+							'  <thead>',
+							'    <tr>',
+							'      <th class="blank level0" >&nbsp;</th>',
+							'      <th id="T_p_level0_col0" class="col_heading level0 col0" >name</th>',
+							'      <th id="T_p_level0_col1" class="col_heading level0 col1" >qty</th>',
+							'    </tr>',
+							'  </thead>',
+							'  <tbody>',
+							'    <tr>',
+							'      <th id="T_p_level0_row0" class="row_heading level0 row0" >0</th>',
+							'      <td id="T_p_row0_col0" class="data row0 col0" >apple</td>',
+							'      <td id="T_p_row0_col1" class="data row0 col1" >3</td>',
+							'    </tr>',
+							'    <tr>',
+							'      <th id="T_p_level0_row1" class="row_heading level0 row1" >1</th>',
+							'      <td id="T_p_row1_col0" class="data row1 col0" >pear</td>',
+							'      <td id="T_p_row1_col1" class="data row1 col1" >5</td>',
+							'    </tr>',
+							'  </tbody>',
+							'</table>',
+							''
+						].join('\n')
 					}
 				}
 			]),
@@ -308,6 +352,19 @@ test('copy output copies an html table as readable text, never markup', async ({
 	expect(text).not.toContain('color:red');
 });
 
+test('copy output keeps the table shape when the Styler markup is pretty-printed', async ({ page }) => {
+	// The shape a real jinja-templated Styler emits. Its inter-tag newlines used to
+	// survive the tag strip and put every cell on its own line, so the frame pasted
+	// one column wide; the leading tab is the blank index heading, a real empty
+	// first column, so all three lines are the same width.
+	await openNotebook(page);
+	await reveal(page, 'copy-pretty-aaaaa');
+	await cellEl(page, 'copy-pretty-aaaaa').getByTestId('copy-output').click();
+	const text = await lastCopied(page);
+	expect(text).toBe('\tname\tqty\n0\tapple\t3\n1\tpear\t5');
+	expect(text?.split('\n').map((l) => l.split('\t').length)).toEqual([3, 3, 3]);
+});
+
 test('copy output copies a SAVED DataFrame as the table the grid shows, not the elided repr', async ({ page }) => {
 	// The structured MIME is gone (clean-on-save), so this is the pandas
 	// `_repr_html_` the notebook carries on disk - the same repr renderOutput
@@ -453,7 +510,17 @@ test('the copy buttons leave the existing cell controls alone', async ({ page })
 	for (const id of ['run', 'clear', 'delete', 'move-up', 'move-down', 'drag-handle', 'cell-actions']) {
 		await expect(target.getByTestId(id)).toHaveCount(1);
 	}
-	// Clearing the output disables copy-output, and does not touch copy-input.
+});
+
+test('clearing a cell disables its copy-output and leaves copy-input alone', async ({ page }) => {
+	// Its OWN cell: three other tests read `copy-stdout-aaaa` as the ENABLED
+	// copy-output reference, and every test here shares one workspace notebook, so
+	// clearing that one would break them the moment this test stopped being last.
+	await openNotebook(page);
+	await reveal(page, 'copy-clearme-aaa');
+	const target = cellEl(page, 'copy-clearme-aaa');
+	await expect(target.getByTestId('copy-output')).toBeEnabled();
+
 	await target.getByTestId('clear').click();
 	await expect(target.getByTestId('copy-output')).toBeDisabled({ timeout: 10_000 });
 	await expect(target.getByTestId('copy-input')).toBeEnabled();

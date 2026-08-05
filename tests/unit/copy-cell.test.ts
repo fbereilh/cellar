@@ -142,6 +142,76 @@ describe('outputCopyText - text/html (the pandas Styler case: no text/plain)', (
 		expect(text).not.toContain('<');
 	});
 
+	it('keeps the table shape when the markup is pretty-printed, as a real Styler emits it', () => {
+		// The shape pandas' jinja template actually writes: a newline and an indent
+		// between every tag, plus the blank index heading. Those newlines survive the
+		// tag strip, so without absorbing the table layout whitespace each cell landed
+		// on its own line and the whole frame pasted as ONE vertical column. The
+		// compact fixture above cannot see that - it has no whitespace to survive.
+		const html = [
+			'<style type="text/css">',
+			'#T_x td { color: red; }',
+			'</style>',
+			'<table id="T_x">',
+			'  <thead>',
+			'    <tr>',
+			'      <th class="blank level0" >&nbsp;</th>',
+			'      <th id="T_x_level0_col0" class="col_heading level0 col0" >name</th>',
+			'      <th id="T_x_level0_col1" class="col_heading level0 col1" >qty</th>',
+			'    </tr>',
+			'  </thead>',
+			'  <tbody>',
+			'    <tr>',
+			'      <th id="T_x_level0_row0" class="row_heading level0 row0" >0</th>',
+			'      <td id="T_x_row0_col0" class="data row0 col0" >apple</td>',
+			'      <td id="T_x_row0_col1" class="data row0 col1" >3</td>',
+			'    </tr>',
+			'    <tr>',
+			'      <th id="T_x_level0_row1" class="row_heading level0 row1" >1</th>',
+			'      <td id="T_x_row1_col0" class="data row1 col0" >pear</td>',
+			'      <td id="T_x_row1_col1" class="data row1 col1" >5</td>',
+			'    </tr>',
+			'  </tbody>',
+			'</table>',
+			''
+		].join('\n');
+		const text = outputCopyText(display({ 'text/html': html }));
+		// The header's leading tab is the blank index heading: a real, empty first
+		// column, so every line is three fields wide.
+		expect(text).toBe('\tname\tqty\n0\tapple\t3\n1\tpear\t5');
+		for (const line of text.split('\n')) expect(line.split('\t').length).toBe(3);
+	});
+
+	it('pretty-printed and compact markup for the same table copy identically', () => {
+		const compact = '<table><tbody><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></tbody></table>';
+		const pretty = [
+			'<table>',
+			'  <tbody>',
+			'    <tr>',
+			'      <td>a</td>',
+			'      <td>b</td>',
+			'    </tr>',
+			'    <tr>',
+			'      <td>c</td>',
+			'      <td>d</td>',
+			'    </tr>',
+			'  </tbody>',
+			'</table>'
+		].join('\n');
+		expect(htmlToPlainText(pretty)).toBe(htmlToPlainText(compact));
+		expect(htmlToPlainText(pretty)).toBe('a\tb\nc\td');
+	});
+
+	it('absorbs table layout whitespace WITHOUT joining lines a newline really separated', () => {
+		// The reason the absorption is scoped to table tags rather than to every
+		// inter-tag gap: in pygments-highlighted code the newline between two spans
+		// IS the line break.
+		expect(htmlToPlainText('<pre><span class="k">def</span> <span class="nf">f</span>():\n    <span>pass</span></pre>')).toBe(
+			'def f():\npass'
+		);
+		expect(htmlToPlainText('<div><span>a</span>\n<span>b</span></div>')).toBe('a\nb');
+	});
+
 	it('decodes entities and drops script/style bodies', () => {
 		const html = '<style>td{color:red}</style><p>a &amp; b &lt;ok&gt;</p><script>evil()</script>';
 		expect(htmlToPlainText(html)).toBe('a & b <ok>');
@@ -174,6 +244,30 @@ describe('outputCopyText - text/html (the pandas Styler case: no text/plain)', (
 			'<tr><td>a</td><td>b</td><td>c</td></tr>' +
 			'<tr><td>a</td><td></td><td></td></tr>' +
 			'</tbody></table>';
+		const lines = htmlToPlainText(html).split('\n');
+		expect(lines).toEqual(['a\tb\tc', 'a\t\t']);
+		for (const line of lines) expect(line.split('\t').length).toBe(3);
+	});
+
+	it('keeps that row at full width when the same table is pretty-printed', () => {
+		// The layout-whitespace absorption must not collapse a genuinely empty cell:
+		// its separator is still a real column.
+		const html = [
+			'<table>',
+			'  <tbody>',
+			'    <tr>',
+			'      <td>a</td>',
+			'      <td>b</td>',
+			'      <td>c</td>',
+			'    </tr>',
+			'    <tr>',
+			'      <td>a</td>',
+			'      <td></td>',
+			'      <td></td>',
+			'    </tr>',
+			'  </tbody>',
+			'</table>'
+		].join('\n');
 		const lines = htmlToPlainText(html).split('\n');
 		expect(lines).toEqual(['a\tb\tc', 'a\t\t']);
 		for (const line of lines) expect(line.split('\t').length).toBe(3);

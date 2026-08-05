@@ -42,7 +42,11 @@
 //   7. `text/html`                      -> tag-stripped text, table cells
 //                                          tab-separated (the pandas *Styler*
 //                                          case: it emits no text/plain). Raw
-//                                          markup is never pasted.
+//                                          markup is never pasted. Every row keeps
+//                                          its column count whether the markup is
+//                                          written compactly or pretty-printed one
+//                                          cell per line, which is how a Styler's
+//                                          jinja template really emits it.
 //   8. anything else                    -> ''
 //
 // Steps 2-4 sit in `renderOutput`'s own order (it prefers the structured payload
@@ -173,13 +177,28 @@ function decodeEntities(s: string): string {
 }
 
 /**
+ * Whitespace touching a TABLE-STRUCTURE tag is layout, not content: a jinja
+ * templated pandas Styler (and any pretty-printed table) puts a newline plus an
+ * indent between every cell, and those newlines survive the tag strip below - so
+ * without this every cell landed on its own line and the "tab-separated table"
+ * this function promises pasted as a single vertical column.
+ *
+ * Scoped to the table tags on purpose, NOT a blanket inter-tag collapse: a
+ * newline between two `<span>`s IS the line break in pygments-highlighted code,
+ * so collapsing those would join lines that the source really did separate.
+ */
+const TABLE_LAYOUT_WS = /\s*<(\/?)(table|thead|tbody|tfoot|tr|th|td|caption|colgroup|col)((?:\s[^>]*)?)>\s*/gi;
+
+/**
  * A readable plain-text rendering of an output's `text/html`.
  *
  * Table cells become tab-separated and rows newline-separated, so a pandas
- * Styler pastes as a table. `<script>`/`<style>` bodies are dropped whole (they
- * are machinery, not output), remaining tags are removed, and entities decoded.
- * Returns `''` for markup that carries no text (an html-wrapped image, a Bokeh
- * bundle that is all script) - the caller then treats it as nothing to copy.
+ * Styler pastes as a table - for pretty-printed markup as much as for markup
+ * written with no whitespace between its tags (see {@link TABLE_LAYOUT_WS}).
+ * `<script>`/`<style>` bodies are dropped whole (they are machinery, not
+ * output), remaining tags are removed, and entities decoded. Returns `''` for
+ * markup that carries no text (an html-wrapped image, a Bokeh bundle that is all
+ * script) - the caller then treats it as nothing to copy.
  */
 export function htmlToPlainText(html: string): string {
 	let s = html;
@@ -187,6 +206,7 @@ export function htmlToPlainText(html: string): string {
 	// the right answer for a truncated bundle: the tail is machinery too).
 	s = s.replace(/<(script|style)\b[^>]*>[\s\S]*?(<\/\1\s*>|$)/gi, ' ');
 	s = s.replace(/<!--[\s\S]*?(-->|$)/g, ' ');
+	s = s.replace(TABLE_LAYOUT_WS, '<$1$2$3>');
 	// Cell boundaries become tabs, block boundaries newlines, BEFORE tags go.
 	s = s.replace(/<\/(td|th)\s*>/gi, '\t');
 	s = s.replace(/<br\s*\/?>/gi, '\n');
@@ -205,9 +225,12 @@ export function htmlToPlainText(html: string): string {
 		.map((line) => line.replace(/[^\S\t\n]+/g, ' ').replace(/ *\t? *$/, '').replace(/^[ ]+/, ''))
 		.join('\n')
 		.replace(/\n{3,}/g, '\n\n');
-	// Not `.trim()`: it would eat the last row's own trailing separator, the very
-	// column the per-line rule above just preserved.
-	return trimCopyText(joined.replace(/^\s+/, ''));
+	// Drop leading blank LINES only. Not `.trim()` and not `/^\s+/`: either would
+	// eat a leading TAB, and the first line of a pandas Styler starts with exactly
+	// that - the separator of the blank index heading, a real (empty) first column,
+	// whose loss left the header one column short of every row below it. The
+	// symmetric trailing case is `trimCopyText`'s.
+	return trimCopyText(joined.replace(/^\n+/, ''));
 }
 
 // ---- Per-output text ------------------------------------------------------
@@ -237,15 +260,19 @@ export function outputCopyText(o: CellOutput): string {
 			if (df) return dataframeTable(df);
 			if (d[PLOTLY_MIME]) return '';
 			if (Object.keys(d).some((k) => k.startsWith('image/'))) return '';
-			if (nonEmpty(d['text/html'])) {
+			// Joined ONCE, above both branches: an nbformat `text/html` is a line ARRAY,
+			// so a multi-MB Bokeh/Altair bundle that does not parse as a DataFrame would
+			// otherwise allocate the whole joined string twice on this path.
+			const html = nonEmpty(d['text/html']) ? asText(d['text/html']) : null;
+			if (html !== null) {
 				// A SAVED DataFrame: clean-on-save stripped the structured MIME, so this
 				// pandas repr is what renderOutput itself re-parses back into the grid.
 				// Same parser, same table - never a second one.
-				const parsed = parsePandasDataFrameHtml(asText(d['text/html']));
+				const parsed = parsePandasDataFrameHtml(html);
 				if (parsed) return dataframeTable(parsed);
 			}
 			if (nonEmpty(d['text/plain'])) return asText(d['text/plain']);
-			if (nonEmpty(d['text/html'])) return htmlToPlainText(asText(d['text/html']));
+			if (html !== null) return htmlToPlainText(html);
 			return '';
 		}
 		default:
