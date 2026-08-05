@@ -242,9 +242,17 @@ const LOGIN_TIMEOUT_MS = 300_000;
  * fine; this one PUTs the whole notebook (megabytes, once outputs are in it), and
  * on a slow uplink that is minutes of legitimate transfer - which the listing
  * window would cut short as "Databricks did not respond within 45s", blaming the
- * workspace for the user's upstream. It stays comfortably above the python side's
- * own `UPLOAD_HTTP_TIMEOUT`, so a genuinely wedged socket is still reported by the
- * SDK (with a real message) rather than by the parent's SIGKILL.
+ * workspace for the user's upstream.
+ *
+ * It is the OUTERMOST of three nested budgets, and the ordering is what makes the
+ * SDK - not this SIGKILL - the thing that reports a wedged or slow upload: the
+ * python side bounds its retry budget (`UPLOAD_RETRY_TIMEOUT`, 120s) and its
+ * per-request read (`UPLOAD_HTTP_TIMEOUT`, 120s) so the worst case it can spend
+ * (the retry budget plus one full in-flight request, 240s) still lands inside this
+ * window with a minute to spare. Edit any of the three and re-check that sum -
+ * left at the SDK's 300s retry default the inner budget exactly equalled this one,
+ * so a retrying upload died here with the generic "did not respond" message the
+ * dedicated constant exists to avoid.
  */
 const UPLOAD_TIMEOUT_MS = 300_000;
 
@@ -479,6 +487,16 @@ HTTP_TIMEOUT = 30
 # parent's UPLOAD_TIMEOUT_MS - the listing ops keep HTTP_TIMEOUT unchanged.
 UPLOAD_HTTP_TIMEOUT = 120
 
+# The SDK's own retry budget for the upload, bounded so the WHOLE op finishes
+# inside the parent's UPLOAD_TIMEOUT_MS (300s): the deadline is checked before
+# each attempt, so the worst case is this budget plus one full in-flight
+# UPLOAD_HTTP_TIMEOUT request = 240s, leaving a minute of margin. Left at the
+# SDK's 300s default it exactly equalled the parent budget, so a retrying upload
+# (or a Config() whose /.well-known discovery inherits the same budget against an
+# unreachable host) was SIGKILLed and reported as the generic "did not respond
+# within 300s" instead of the SDK's own message. Edit any of the three together.
+UPLOAD_RETRY_TIMEOUT = 120
+
 def classify(e):
     n = type(e).__name__
     m = str(e)
@@ -673,20 +691,28 @@ def workspace_upload(w, name, overwrite):
     w.workspace.import_(path=path, format=ImportFormat.JUPYTER, content=content, overwrite=bool(overwrite))
     return {'ok': True, 'status': 'uploaded', 'path': path, 'host': host, 'overwritten': bool(overwrite)}
 
-def build_client(auth, http_timeout=HTTP_TIMEOUT):
+def build_client(auth, http_timeout=HTTP_TIMEOUT, retry_timeout=None):
     # One place that turns the resolved auth descriptor into a WorkspaceClient, so
     # the listing subprocess and (mirrored in CONNECT_CODE) the kernel session
     # build byte-identical Configs -> the OAuth token cache key matches -> a token
     # minted by 'login' is reused everywhere with no second browser. The request
     # timeout is NOT part of that cache key (it hashes host/client_id/scopes/
     # profile), so an op may widen its own without breaking the shared token.
+    #
+    # retry_timeout is passed only by the op that needs it bounded (the upload);
+    # omitting the kwarg leaves every listing on the SDK's own default, which is
+    # what they have always run with. It goes to Config, not just the request, so
+    # the constructor's /.well-known discovery is covered by the same budget.
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.core import Config
+    kw = {'http_timeout_seconds': http_timeout}
+    if retry_timeout is not None:
+        kw['retry_timeout_seconds'] = retry_timeout
     mode = auth.get('mode')
     if mode == 'profile':
-        cfg = Config(profile=auth['profile'], http_timeout_seconds=http_timeout)
+        cfg = Config(profile=auth['profile'], **kw)
     elif mode == 'oauth':
-        cfg = Config(host=auth['host'], auth_type='external-browser', http_timeout_seconds=http_timeout)
+        cfg = Config(host=auth['host'], auth_type='external-browser', **kw)
     else:
         raise ValueError('unknown auth mode: %r' % (mode,))
     return WorkspaceClient(config=cfg)
@@ -928,8 +954,12 @@ def main():
         return logout(auth)
     try:
         # Only the upload carries a large request body, so only it widens the
-        # per-request timeout; every listing keeps the tight one.
-        w = build_client(auth, UPLOAD_HTTP_TIMEOUT if op == 'workspace_upload' else HTTP_TIMEOUT)
+        # per-request timeout and bounds the retry budget below the parent's kill
+        # window; every listing keeps the tight one and the SDK's own default.
+        if op == 'workspace_upload':
+            w = build_client(auth, UPLOAD_HTTP_TIMEOUT, UPLOAD_RETRY_TIMEOUT)
+        else:
+            w = build_client(auth, HTTP_TIMEOUT)
     except Exception as e:
         return fail(e)
     try:

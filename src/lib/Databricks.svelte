@@ -971,7 +971,9 @@
 	let uploadSeq = 0;
 
 	/**
-	 * Whether the confirm box's buttons are inert. Cancel shares Replace's ONE
+	 * Whether an upload can neither be started nor interrupted right now - the ONE
+	 * owner of that rule, so every upload control (the plain button and both of the
+	 * confirm box's) reads it instead of re-deriving it. Cancel shares Replace's
 	 * condition rather than carrying its own: the overwrite request cannot be
 	 * recalled once sent, so a Cancel that merely dismissed the box would present a
 	 * replace that IS happening as one the user aborted - exactly the silent clobber
@@ -1653,7 +1655,7 @@
 			<button
 				class="btn btn-outline btn-xs w-full"
 				onclick={() => uploadToWorkspace(false)}
-				disabled={!connected || !!busy || runtimeApplying}
+				disabled={!connected || uploadConfirmBusy}
 				title="Copy this notebook into /Users/<you>/ in the connected Databricks workspace"
 				data-testid="databricks-upload"
 			>

@@ -173,7 +173,10 @@ function writeFakeSdkInterpreter(): string {
 			"        self.host = host or os.environ.get('CELLAR_FAKE_DBX_HOST')",
 			// Kept so a test can read WHICH per-request timeout an op asked for: the
 			// upload's request is the only large one, so it is the only one widened.
+			// The retry budget rides along because the upload is also the only op that
+			// bounds it - the real SDK defaults it to the parent's whole kill window.
 			"        self.http_timeout_seconds = kw.get('http_timeout_seconds')",
+			"        self.retry_timeout_seconds = kw.get('retry_timeout_seconds')",
 			''
 		].join('\n')
 	);
@@ -244,7 +247,8 @@ function writeFakeSdkInterpreter(): string {
 			'class WorkspaceClient:',
 			'    def __init__(self, config=None, **kw):',
 			"        _record({'call': 'client',",
-			"                 'http_timeout_seconds': getattr(config, 'http_timeout_seconds', None)})",
+			"                 'http_timeout_seconds': getattr(config, 'http_timeout_seconds', None),",
+			"                 'retry_timeout_seconds': getattr(config, 'retry_timeout_seconds', None)})",
 			'        self.config = config',
 			'        self.workspace = _Workspace()',
 			'        self.current_user = _CurrentUser()',
@@ -586,7 +590,7 @@ describe('the workspace_upload op — the SHIPPED probe against a fake databrick
 		expect(dbx.connectionStatus(NB).connected).toBe(true); // the session is untouched
 	});
 
-	it.skipIf(!python)(`gives the upload its OWN wider request timeout, leaving the listings' alone [${python ? 'ok' : NO_PYTHON}]`, async () => {
+	it.skipIf(!python)(`gives the upload its OWN wider request timeout and a bounded retry budget, leaving the listings' alone [${python ? 'ok' : NO_PYTHON}]`, async () => {
 		await freshConnect();
 		process.env.CELLAR_FAKE_DBX_LOG = callLog;
 		useStub(writeFakeSdkInterpreter());
@@ -594,13 +598,24 @@ describe('the workspace_upload op — the SHIPPED probe against a fake databrick
 		await dbx.uploadNotebook({ nb: NB });
 		// The upload PUTs the whole notebook: on a slow uplink the listing-sized window
 		// would cut a healthy transfer short and blame the workspace for it.
-		expect(sdkCalls().find((c) => c.call === 'client')!.http_timeout_seconds).toBe(120);
+		const upload = sdkCalls().find((c) => c.call === 'client')!;
+		expect(upload.http_timeout_seconds).toBe(120);
+		// And its retry budget is bounded BELOW the parent's kill window, so the SDK's
+		// own message - not a SIGKILL - is what reports a wedged upload. Asserted as a
+		// relation, not a magic number: retries plus one full in-flight request must
+		// still fit inside UPLOAD_TIMEOUT_MS.
+		const retry = upload.retry_timeout_seconds as number;
+		expect(retry).toBeGreaterThan(0);
+		expect(retry + (upload.http_timeout_seconds as number)).toBeLessThan(300 - 30);
 
 		// The small metadata reads are NOT widened - a wedged socket must still fail
-		// fast there. The fake has no `clusters`, so the op fails after building the
-		// client, which is all this needs to read.
+		// fast there - and they keep the SDK's own retry default. The fake has no
+		// `clusters`, so the op fails after building the client, which is all this
+		// needs to read.
 		rmSync(callLog, { force: true });
 		await dbx.listClusters({ profile: 'pat', host: null }).catch(() => {});
-		expect(sdkCalls().find((c) => c.call === 'client')!.http_timeout_seconds).toBe(30);
+		const listing = sdkCalls().find((c) => c.call === 'client')!;
+		expect(listing.http_timeout_seconds).toBe(30);
+		expect(listing.retry_timeout_seconds).toBe(null);
 	});
 });
