@@ -4,15 +4,25 @@
 // the cell MODEL (`cell.outputs`) rather than a rendered node - that is what keeps
 // them complete under windowing, where most of a large notebook has no DOM at all.
 //
-// Two consumers today, and they deliberately DIVERGE on PRIORITY while sharing
-// these primitives:
+// Two consumers today - `$lib/search.ts` (what an output contributes to
+// find-in-page) and `$lib/copyCell.ts` (what "copy output" puts on the clipboard).
+// They share these primitives and deliberately DIVERGE on PRIORITY, in exactly two
+// places today:
 //
-//   - `$lib/search.ts` - what an output contributes to find-in-page. It returns
-//     matplotlib's `<Figure … with N Axes>` `text/plain` placeholder, because a
-//     user searching for "Figure" should still land on that cell.
-//   - `$lib/copyCell.ts` - what "copy output" puts on the clipboard. It returns
-//     NOTHING for a picture / chart / live widget, precisely so an image-only
-//     cell's copy button is honestly disabled instead of pasting a placeholder.
+//   1. A PICTURE / chart / live widget. Search returns matplotlib's
+//      `<Figure … with N Axes>` `text/plain` placeholder, because a user searching
+//      for "Figure" should still land on that cell; copy returns NOTHING,
+//      precisely so an image-only cell's copy button is honestly disabled instead
+//      of pasting a placeholder.
+//   2. A SAVED DataFrame. Clean-on-save strips the structured
+//      `application/vnd.cellar.dataframe+json` MIME, leaving only pandas'
+//      `text/html` repr - which copy parses back into the full grid table (via
+//      `$lib/dataframeHtml`), while search never looks at html at all and falls
+//      through to the elided `text/plain` repr. So a value that the grid shows but
+//      the repr elided is copyable yet NOT findable by Ctrl+F. The search side
+//      here is PRE-EXISTING and unchanged - this is a known gap, not a regression
+//      and not something already fixed; closing it would put a DOMParser parse on
+//      the search hot path, which is its own piece of work.
 //
 // So a change to "what counts as an output's text" may well belong in only one of
 // them - but check BOTH before deciding, and keep these shared helpers here so the

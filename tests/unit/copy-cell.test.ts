@@ -102,6 +102,9 @@ describe('outputCopyText - rich bundles', () => {
 			},
 			'text/plain': '   a  b\n0  1  x\n1  2  NaN\n\n[500 rows x 2 columns]'
 		});
+		// The trailing empty cell is the deliberate blank a missing value copies as:
+		// a blank pastes as a real empty/NA cell where the literal "NaN" the grid
+		// draws would paste as text (stated exception in copyCell.ts's header).
 		expect(outputCopyText(df)).toBe('\ta\tb\n0\t1\tx\n1\t2\t');
 	});
 

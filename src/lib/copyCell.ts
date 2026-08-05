@@ -49,13 +49,29 @@
 // over plotly/image); the two can only differ for a bundle carrying both, and
 // matching what is on screen is the rule.
 //
+// ONE STATED EXCEPTION to "copy gives you what the cell SHOWS": a MISSING value
+// copies as a BLANK cell, where the grid draws an italic "NaN"
+// (`DataFrameGrid.svelte`). Both payload sources reach it as `null` - the kernel
+// formatter emits NaN -> null, and `$lib/dataframeHtml`'s `coerceCell` maps
+// pandas' `NaN`/`None`/`NaT`/`<NA>` tokens to null - and `cellStr` renders that
+// null as ''. Deliberate: a blank pastes into a spreadsheet as a real empty/NA
+// cell, whereas the literal string "NaN" pastes as TEXT, so paste fidelity is
+// worth more here than literal visual parity. Do not "fix" it back into a literal
+// "NaN". Accepted cost: a missing value and a genuinely empty-string cell (which
+// `coerceCell` returns as '') copy identically. The live-vs-saved parity is
+// UNAFFECTED - both sources feed their nulls through this same path, so the two
+// still copy the same string; only the shows-what-you-see rule has this exception.
+//
 // stream output copies its text; an error copies its traceback with the ANSI SGR
 // colors stripped, exactly as the cell renders it.
 //
 // `asText` / `stripAnsi` / `DataFramePayload` are shared with `$lib/search.ts`
-// (see `$lib/outputText`), whose PRIORITY deliberately differs: search returns
-// matplotlib's `<Figure …>` placeholder as searchable text where copy returns
-// nothing. Decide for both before changing either.
+// (see `$lib/outputText`), whose PRIORITY deliberately differs in TWO places:
+// search returns matplotlib's `<Figure …>` placeholder as searchable text where
+// copy returns nothing, and for a SAVED DataFrame copy parses the pandas
+// `text/html` repr back into the full grid table (step 5) where search never
+// touches html and falls through to the elided `text/plain` repr. Decide for both
+// before changing either.
 
 import type { CellOutput } from '$lib/server/types';
 import { asText, stripAnsi, type DataFramePayload } from '$lib/outputText';
