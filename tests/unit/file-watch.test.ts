@@ -20,6 +20,7 @@ import {
 	unwatchUnder,
 	unwatchAll,
 	noteKnownContent,
+	resyncKnownContent,
 	onExternalChange,
 	fileChangedEvent,
 	watchStats,
@@ -148,6 +149,35 @@ describe('external file watcher', () => {
 		agentWrite(abs, 'from-agent\n');
 		await waitForChanges(1);
 		expect(seen.map((c) => c.content)).toEqual(['from-agent\n']);
+	});
+
+	it('re-seeds the known hash when the write that declared it never landed', async () => {
+		// `PUT /api/fs/file` declares the content BEFORE writing (the event can arrive
+		// as soon as the bytes do), so a write that then FAILS - refused for size,
+		// EACCES, ENOSPC - leaves the hash describing bytes disk never got. Left
+		// there, echo suppression would silently drop a later genuine external change
+		// producing exactly those bytes: the everyday agent shape, where the agent
+		// writes the very edit the user was racing to save. And nothing else corrects
+		// it, since an existing entry now wins over a re-read's content.
+		const abs = join(ws, 'failed.md');
+		writeFileSync(abs, 'on-disk\n');
+		watchFileForChanges('failed.md', 'on-disk\n');
+
+		noteKnownContent('failed.md', 'never-written\n'); // the PUT's declaration...
+		resyncKnownContent('failed.md'); // ...and its write throwing
+
+		// An agent now writes exactly what that failed save would have.
+		agentWrite(abs, 'never-written\n');
+		await waitForChanges(1);
+		expect(seen.map((c) => c.content)).toEqual(['never-written\n']);
+	});
+
+	it('re-seeding an unwatched path adds no entry', () => {
+		// Same rule as `noteKnownContent`: an entry no directory watcher backs is a
+		// leak the LRU cannot prune.
+		writeFileSync(join(ws, 'stray.md'), 'x\n');
+		resyncKnownContent('stray.md');
+		expect(watchStats().tracked).toBe(0);
 	});
 
 	it('says nothing when the file is touched but its content did not change', async () => {

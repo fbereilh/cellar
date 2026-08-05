@@ -34,6 +34,7 @@ const RESURRECT_MD = '# Resurrect doc\n\ncomes back unchanged\n';
 const GROW_MD = '# Grow doc\n\nsmall for now\n';
 const INFLIGHT_MD = '# In-flight doc\n\nbefore the save\n';
 const ORDER_MD = '# Order doc\n\nthe stale version\n';
+const STATFIRST_MD = '# Stat-first doc\n\nunchanged on disk\n';
 /**
  * Past adapter-node's 512 K request-body ceiling (which the e2e harness runs
  * under - it boots the production build, not Vite) but well inside the 2 MB read
@@ -70,6 +71,7 @@ test.beforeAll(async () => {
 	writeFileSync(join(workspace, 'grow.md'), GROW_MD);
 	writeFileSync(join(workspace, 'inflight.md'), INFLIGHT_MD);
 	writeFileSync(join(workspace, 'order.md'), ORDER_MD);
+	writeFileSync(join(workspace, 'statfirst.md'), STATFIRST_MD);
 	const booted = await bootCellar(workspace);
 	launcher = booted.proc;
 	baseURL = booted.url;
@@ -268,6 +270,53 @@ test('characters typed during an in-flight save are offered, never silently repl
 	await expect(editor).not.toContainText('AGENT-REWROTE-THIS');
 });
 
+test('window focus stats before it reads, and still reads whenever disk may have moved', async ({
+	page
+}) => {
+	// Every mounted file tab revalidates on focus, and the read ceiling admits a
+	// 15 MB `.html` export - the very file the watcher declines for its size, so
+	// focus is its ONLY sync mechanism. An unconditional read there put that whole
+	// file through a read + serialize + transfer on each alt-tab back into Cellar.
+	// The stat is the short-circuit; the rule it must obey is that it may only ever
+	// cause an EXTRA read, never a missed change.
+	await openFile(page, 'statfirst.md');
+	const editor = page.locator('.cm-content:visible');
+	await expect(editor).toContainText('unchanged on disk');
+
+	let contentGets = 0;
+	let stats = 0;
+	await page.route(
+		(u) => u.pathname === '/api/fs/file',
+		(route) => {
+			if (route.request().method() === 'GET') contentGets++;
+			return route.continue();
+		}
+	);
+	await page.route(
+		(u) => u.pathname === '/api/fs/file/stat',
+		(route) => {
+			stats++;
+			return route.continue();
+		}
+	);
+
+	// Nothing changed: each focus costs one stat and no read at all.
+	for (let i = 0; i < 3; i++) await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+	await expect(async () => expect(stats).toBeGreaterThanOrEqual(3)).toPass();
+	await page.waitForTimeout(500);
+	expect(contentGets).toBe(0);
+
+	// A real external change still lands (over SSE here), and it leaves the tab
+	// with no stat baseline for the new bytes - so the very next focus falls back
+	// to reading, which is the direction this is allowed to fail in.
+	agentWrite(join(workspace, 'statfirst.md'), '# Stat-first doc\n\nCHANGED-EXTERNALLY\n');
+	await expect(editor).toContainText('CHANGED-EXTERNALLY');
+	await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+	await expect(async () => expect(contentGets).toBeGreaterThanOrEqual(1)).toPass();
+	await expect(editor).toContainText('CHANGED-EXTERNALLY');
+	await expect(page.locator('[data-testid="file-disk-changed"]:visible')).toHaveCount(0);
+});
+
 test('a slow revalidation cannot revert a newer change that landed while it was in flight', async ({
 	page
 }) => {
@@ -280,6 +329,13 @@ test('a slow revalidation cannot revert a newer change that landed while it was 
 	await openFile(page, 'order.md');
 	const editor = page.locator('.cm-content:visible');
 	await expect(editor).toContainText('the stale version');
+
+	// Break the stat short-circuit. Two things at once: the focus revalidation is
+	// stat-FIRST now, so without this it would settle for one `stat` and never
+	// issue the GET this test is about - and a failing stat MUST fall through to
+	// the read rather than read as "nothing changed", which is the fail-safe
+	// direction the whole short-circuit rests on.
+	await page.route((u) => u.pathname === '/api/fs/file/stat', (route) => route.fulfill({ status: 500, body: '{}' }));
 
 	// Serve exactly one GET as a slow, STALE response. Delaying the real request
 	// would not do: the server reads at continue-time and would return the NEW

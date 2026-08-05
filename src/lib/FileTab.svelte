@@ -19,6 +19,7 @@
 	import { subscribeEvents } from '$lib/events-client';
 	import { externalEdits } from '$lib/externalSync';
 	import type { FileChangedEvent } from '$lib/server/fileWatch';
+	import type { FileStat } from '$lib/server/fstree';
 	import type { BlameLine } from '$lib/server/git';
 	import type { BlameReport } from '$lib/blame';
 	import type { FileTabApiHandle } from '$lib/types';
@@ -244,6 +245,15 @@
 				const body = (await res.json().catch(() => null)) as { message?: string } | null;
 				throw new Error(body?.message || `save failed (${res.status})`);
 			}
+			// The bytes have landed, so this is now the newest word on what disk holds -
+			// claimed before reading the response body, so a revalidation still in
+			// flight cannot slip in between and be believed.
+			claimDisk();
+			// The stat of what we just wrote becomes the baseline, which is what stops
+			// the next window focus re-reading a file this tab wrote itself. `parseStat`
+			// answers null on anything less than a complete stat, and null simply means
+			// "read it next time".
+			const written = (await res.json().catch(() => null)) as { stat?: unknown } | null;
 			// Only clear dirty if the buffer STILL holds exactly what we just wrote:
 			// keystrokes typed during the in-flight PUT are unsaved, and a false clean
 			// flag does not merely mislabel them any more - it routes the next external
@@ -251,8 +261,8 @@
 			// banner, so those characters would be replaced without being offered.
 			// `savedContent` is advanced either way: disk really does hold these bytes.
 			if (view?.state.doc.toString() === content) setDirty(false);
-			claimDisk();
 			savedContent = content;
+			diskStatBaseline = parseStat(written?.stat);
 			// Our bytes are now the disk's bytes, so any stashed external change is
 			// resolved: the user chose theirs.
 			diskState = 'clean';
@@ -308,17 +318,66 @@
 	/** An event that arrived before the editor existed, flushed once it does. */
 	let preReadyDisk: string | null = null;
 
+	/**
+	 * The `stat` that describes the content we believe disk holds, or null when we
+	 * do not know - the baseline for the stat-first revalidation below. Recorded
+	 * wherever that belief changes (the load, an accepted observation that carried
+	 * a stat, a successful save), and deliberately CLEARED wherever it changes
+	 * without one: correctness must never depend on catching every such path, so a
+	 * stale or absent baseline has to degrade to an extra read, never to a swallowed
+	 * change.
+	 */
+	let diskStatBaseline: FileStat | null = null;
+
 	const diskBanner = $derived(status === 'ready' && diskState !== 'clean');
 
-	async function fetchDiskContent(): Promise<string | null> {
+	/** A stat is only usable if it is fully there: anything else counts as "unknown". */
+	function parseStat(raw: unknown): FileStat | null {
+		if (!raw || typeof raw !== 'object') return null;
+		const { size, mtimeMs } = raw as { size?: unknown; mtimeMs?: unknown };
+		return typeof size === 'number' && typeof mtimeMs === 'number' ? { size, mtimeMs } : null;
+	}
+
+	async function fetchDiskContent(): Promise<{ content: string; stat: FileStat | null } | null> {
 		try {
 			const res = await fetch(`/api/fs/file?path=${encodeURIComponent(path)}`);
 			const body = await res.json();
 			if (!res.ok) return null;
-			return body.content as string;
+			return { content: body.content as string, stat: parseStat(body.stat) };
 		} catch {
 			return null;
 		}
+	}
+
+	/**
+	 * Has disk moved since we last recorded a stat for it? The cheap half of the
+	 * window-focus revalidation - one `stat` instead of a whole-file read.
+	 *
+	 * THE INVARIANT: this is a short-circuit that may only ever cause an EXTRA
+	 * read, never a MISSED change. So every form of doubt answers `true` (go read
+	 * it): no baseline recorded, a stat request that failed, an unparseable body,
+	 * a file that is gone. A failure is emphatically NOT a deletion either -
+	 * reporting one is the watcher's job, and `revalidateFromDisk` returns rather
+	 * than inventing one.
+	 *
+	 * The one residual, stated honestly: a write leaving BOTH size and mtime
+	 * identical is not detected on this path. That is a non-issue for every file
+	 * under `MAX_WATCHED_FILE_BYTES`, whose content HASH the watcher checks on each
+	 * settle; this fallback only carries the oversize and LRU-evicted cases.
+	 */
+	async function diskMayHaveMoved(): Promise<boolean> {
+		const baseline = diskStatBaseline;
+		if (!baseline) return true;
+		let stat: FileStat | null = null;
+		try {
+			const res = await fetch(`/api/fs/file/stat?path=${encodeURIComponent(path)}`);
+			const body = await res.json();
+			if (res.ok) stat = parseStat(body?.stat);
+		} catch {
+			return true;
+		}
+		if (!stat) return true;
+		return stat.size !== baseline.size || stat.mtimeMs !== baseline.mtimeMs;
 	}
 
 	/** Apply disk content to a CLEAN buffer as one minimal, caret-preserving edit. */
@@ -382,9 +441,18 @@
 	 * points funnel here so the no-clobber rules - and what "disk already agrees"
 	 * means - exist once; a second copy is how a stale banner survives the backstop.
 	 */
-	function applyDiskObservation(seq: number, next: string | null) {
+	function applyDiskObservation(seq: number, next: string | null, stat: FileStat | null = null) {
 		if (seq !== diskSeq) return; // a newer observation landed while this was in flight
 		if (status === 'error') return;
+		// The stat baseline follows what we believe disk holds. An observation that
+		// carried one records it; one that did not (an inline event carries content,
+		// never a stat) CLEARS it, so the next focus re-reads rather than trusting a
+		// baseline that now describes older bytes. The exception is an observation
+		// that moves nothing: disk agreeing with `savedContent` leaves whatever
+		// baseline already described `savedContent` perfectly valid, and clearing it
+		// there would buy a pointless read on every focus.
+		if (stat) diskStatBaseline = stat;
+		else if (next !== savedContent) diskStatBaseline = null;
 		if (next === null) {
 			diskState = 'deleted';
 			pendingDisk = null;
@@ -426,7 +494,7 @@
 		// is why this path needs the claim re-checked inside `applyDiskObservation`.
 		const next = await fetchDiskContent();
 		if (next == null) return;
-		applyDiskObservation(seq, next);
+		applyDiskObservation(seq, next.content, next.stat);
 	}
 
 	function reloadFromDisk() {
@@ -450,6 +518,19 @@
 
 	onMount(() =>
 		subscribeEvents((ev) => {
+			// The stream (re)connected. `file:changed` is published globally and is
+			// NOT replayed to a late subscriber the way `queue:changed`/`kernel:status`
+			// are, so anything published while this tab was disconnected is simply
+			// gone - and the only other backstop is `window.focus`, which never fires
+			// when the browser window kept focus throughout. So an app-server restart
+			// (the documented single-instance takeover) or a transient drop would leave
+			// the tab permanently stale. Revalidating here is the same backstop
+			// `LiveNotebook` already runs on this frame, and it is stat-first, so a
+			// reconnect is cheap.
+			if (ev.type === 'sse:open') {
+				void revalidateFromDisk();
+				return;
+			}
 			if (ev.type !== 'file:changed') return;
 			const fe = ev as unknown as FileChangedEvent;
 			if (fe.path !== path) return;
@@ -459,12 +540,21 @@
 
 	/**
 	 * Backstop for any watcher event the platform drops (network/virtual
-	 * filesystems deliver unreliably) and for a file evicted from the watcher's
-	 * LRU. Costs one GET per window focus, and short-circuits when disk matches
-	 * what we already have.
+	 * filesystems deliver unreliably), for a file the watcher refuses for its size,
+	 * and for one evicted from its LRU. Runs on window focus and on an SSE
+	 * reconnect.
+	 *
+	 * STAT-FIRST: every mounted file tab runs this, and `readWorkspaceFile` admits
+	 * an `.html` export up to 15 MB - the very file the watcher declines, so this is
+	 * its ONLY mechanism - so an unconditional read here would put a multi-MB read +
+	 * serialize + transfer on the shared event loop for every open tab on each
+	 * alt-tab back into the browser. `diskMayHaveMoved` settles the unchanged case
+	 * for one `stat` and, per the invariant stated there, only ever errs toward
+	 * doing the read anyway.
 	 */
 	async function revalidateFromDisk() {
 		if (status !== 'ready') return;
+		if (!(await diskMayHaveMoved())) return;
 		const seq = claimDisk();
 		const next = await fetchDiskContent();
 		// A read failure is not a deletion - the watcher is what reports those.
@@ -475,7 +565,7 @@
 		// staying quiet. Two copies of that rule is how a stale banner survives the
 		// backstop. The seq claimed BEFORE the fetch is what stops this slow read
 		// reverting a newer change that landed while it was in flight.
-		applyDiskObservation(seq, next);
+		applyDiskObservation(seq, next.content, next.stat);
 	}
 
 	// ---- Git change bars (gutter) --------------------------------------------
@@ -585,6 +675,10 @@
 			content = body.content;
 			liveSource = content;
 			savedContent = content;
+			// The route stats BEFORE it reads, so a write landing between the two
+			// leaves this describing the OLDER file and the next focus re-reads -
+			// the only direction the short-circuit may fail in.
+			diskStatBaseline = parseStat(body.stat);
 			// Kept for the life of the tab: the ceiling belongs to the running server,
 			// so it cannot move under us, and every later re-decision must be made
 			// against the same number the load used rather than a re-fetched one.
@@ -632,12 +726,18 @@
 		});
 
 		// A disk change that landed between the read and the editor existing: the
-		// buffer is clean by construction, so apply it rather than drop it.
+		// buffer is clean by construction, so apply it rather than drop it. Through
+		// the observation funnel, never straight to `applyDiskContent` - a second
+		// entry point is exactly what that funnel's contract forbids, and skipping it
+		// cost both of its rules here: the "disk already agrees" short-circuit (the
+		// common case, where the event carries the same bytes the load GET returned,
+		// yet a full apply ran including a redundant git-baseline + `git blame` pair)
+		// and the seq check (an event whose settle-read PREDATES the load's read
+		// would revert the editor).
 		if (preReadyDisk != null) {
 			const pending = preReadyDisk;
 			preReadyDisk = null;
-			claimDisk();
-			applyDiskContent(pending);
+			applyDiskObservation(claimDisk(), pending);
 		}
 	});
 </script>

@@ -124,6 +124,29 @@ export function buildTree(): WorkspaceTree {
 	return { root, name: basename(root) || root, tree: walk(root, 0) };
 }
 
+/** A file's identity for change detection: what a `stat` can tell us, and nothing more. */
+export interface FileStat {
+	size: number;
+	mtimeMs: number;
+}
+
+/**
+ * `stat` a workspace file - no read, no size ceiling.
+ *
+ * This is the cheap half of the tab's window-focus revalidation: one `stat`
+ * instead of a whole-file read + serialize + transfer for a file that has not
+ * moved. It is a SHORT-CIRCUIT, so it may only ever cause an EXTRA read, never a
+ * missed change - which is why it throws rather than guessing on anything it
+ * cannot answer (absent, not a file, escaping the workspace); the caller falls
+ * back to the full read.
+ */
+export function statWorkspaceFile(relPath: string): FileStat {
+	const abs = resolveInWorkspace(relPath);
+	const st = statSync(abs);
+	if (!st.isFile()) throw new Error('not a file');
+	return { size: st.size, mtimeMs: st.mtimeMs };
+}
+
 /** Read a workspace file's text content. Throws on escape / too-large / binary. */
 export function readWorkspaceFile(relPath: string): string {
 	const abs = resolveInWorkspace(relPath);

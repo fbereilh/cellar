@@ -326,6 +326,31 @@ export function noteKnownContent(relPath: string, content: string): void {
 	if (known.has(relPath)) known.set(relPath, hashOf(content));
 }
 
+/**
+ * Re-seed the known hash from what disk ACTUALLY holds, for a write that was
+ * announced through `noteKnownContent` and then failed (refused for size,
+ * EACCES, ENOSPC). Without it the entry describes bytes that never landed, so
+ * echo suppression would drop a later genuine external change producing exactly
+ * those bytes - and `watchFileForChanges` deliberately gives an existing entry
+ * precedence, so nothing else corrects it.
+ *
+ * Only for a file already watched, like `noteKnownContent`: an unwatched path
+ * must not gain an entry no directory watcher backs.
+ */
+export function resyncKnownContent(relPath: string): void {
+	if (!known.has(relPath)) return;
+	const abs = absOf(relPath);
+	if (!abs) return;
+	try {
+		known.set(relPath, existsSync(abs) ? hashOf(readWorkspaceFile(relPath)) : DELETED_HASH);
+	} catch {
+		// Unreadable right now (too large, binary, vanished mid-read). Stop watching
+		// rather than leave a hash we cannot vouch for: the next open re-registers,
+		// and until then the tab's focus revalidation covers it.
+		unwatchFile(relPath);
+	}
+}
+
 /** Subscribe to settled external changes. Returns an unsubscribe function. */
 export function onExternalChange(fn: (change: ExternalChange) => void): () => void {
 	listeners.add(fn);
