@@ -348,28 +348,23 @@ describe('external file watcher', () => {
 		expect(seen).toHaveLength(0);
 	});
 
-	it('CONTROL: a per-file fs.watch loses the file to temp+rename', async () => {
+	it('CONTROL: the directory watch delivers every one of three temp+rename writes', async () => {
 		const abs = join(ws, 'control.md');
 		writeFileSync(abs, 'v0\n');
-
-		const perFile: string[] = [];
-		const naive = watch(abs, () => perFile.push('event'));
 		await arm('control.md', 'v0\n');
 
 		for (const v of ['a\n', 'b\n', 'c\n']) {
 			agentWrite(abs, v);
 			await waitForChanges(seen.length + 1);
 		}
-		naive.close();
 
-		// The directory watch caught every edit…
+		// The portable, load-bearing half: three rename-replaces in a row ALL
+		// arrive, which is what a per-file watch cannot be relied on to do. The
+		// comparison against a per-file watch lives in the darwin-only suite at the
+		// bottom of this file, because whether it fails is PLATFORM behaviour - so
+		// asserting it here would either be a false claim on Linux or a tautology
+		// weak enough to pass against a broken implementation.
 		expect(seen.map((c) => c.content)).toEqual(['a\n', 'b\n', 'c\n']);
-		// …and the per-file watch did not. HOW MANY it catches before going silent
-		// is not even stable across filesystems (zero under $TMPDIR, one under
-		// /private/tmp), so the assertion is only what holds either way: it misses
-		// changes. Anyone tempted to "simplify" the directory watch away has to
-		// make this pass first.
-		expect(perFile.length).toBeLessThan(3);
 	});
 
 	it('watches one fs.watch per DIRECTORY, and drops it when the last file closes', async () => {
@@ -478,6 +473,53 @@ describe('external file watcher', () => {
 		expect(watchStats()).toEqual({ dirs: 0, files: 0, tracked: 0 });
 	});
 });
+
+/**
+ * The defect this whole module exists to route around, pinned where it actually
+ * reproduces. Keep it - without it nothing stops someone "simplifying" the
+ * directory watch into a per-file one, which is the change that looks obviously
+ * equivalent and silently breaks live sync after a single agent edit.
+ *
+ * It is DARWIN-ONLY, and that is a platform fact rather than a Cellar one. On
+ * macOS `fs.watch(<file>)` is bound to the inode, so a rename-replace orphans it
+ * and it goes quiet - measured by the scout, and the reason for the directory
+ * watch. On the Linux CI runner the same watcher reported ALL THREE
+ * rename-replaces (measured: this assertion failed there with 3, not <3), the
+ * usual explanation being that libuv's inotify backend watches the containing
+ * directory and filters by name, i.e. Linux already does what this module does
+ * by hand. So the assertion is scoped rather than deleted or weakened into
+ * something that would pass everywhere by saying nothing.
+ *
+ * The skip reason is IN THE SUITE NAME on purpose (the convention this repo uses
+ * for the pandas-dependent probes): a green Linux run must never read as though
+ * the defect was checked and found absent.
+ */
+describe.skipIf(process.platform !== 'darwin')(
+	'per-file fs.watch, on darwin only (Linux libuv watches the parent dir, so the defect does not reproduce there)',
+	() => {
+		it('loses the file to temp+rename while the directory watch keeps every write', async () => {
+			const abs = join(ws, 'control-darwin.md');
+			writeFileSync(abs, 'v0\n');
+
+			const perFile: string[] = [];
+			const naive = watch(abs, () => perFile.push('event'));
+			await arm('control-darwin.md', 'v0\n');
+
+			for (const v of ['a\n', 'b\n', 'c\n']) {
+				agentWrite(abs, v);
+				await waitForChanges(seen.length + 1);
+			}
+			naive.close();
+
+			expect(seen.map((c) => c.content)).toEqual(['a\n', 'b\n', 'c\n']);
+			// HOW MANY it catches before going silent is not stable even across macOS
+			// filesystems (zero under $TMPDIR, one under /private/tmp), so the
+			// assertion is only what holds either way: it misses changes the
+			// directory watch delivered.
+			expect(perFile.length).toBeLessThan(3);
+		});
+	}
+);
 
 describe('fileChangedEvent (the bus projection)', () => {
 	it('inlines a small file and omits a large one, without either reading as a deletion', () => {
