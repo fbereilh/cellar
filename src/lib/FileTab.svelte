@@ -244,7 +244,14 @@
 				const body = (await res.json().catch(() => null)) as { message?: string } | null;
 				throw new Error(body?.message || `save failed (${res.status})`);
 			}
-			setDirty(false);
+			// Only clear dirty if the buffer STILL holds exactly what we just wrote:
+			// keystrokes typed during the in-flight PUT are unsaved, and a false clean
+			// flag does not merely mislabel them any more - it routes the next external
+			// change down the SILENT-apply path instead of the Reload / Keep-mine
+			// banner, so those characters would be replaced without being offered.
+			// `savedContent` is advanced either way: disk really does hold these bytes.
+			if (view?.state.doc.toString() === content) setDirty(false);
+			claimDisk();
 			savedContent = content;
 			// Our bytes are now the disk's bytes, so any stashed external change is
 			// resolved: the user chose theirs.
@@ -343,17 +350,46 @@
 		loadBlame();
 	}
 
-	async function handleDiskChange(ev: FileChangedEvent) {
+	/**
+	 * Ordering guard for disk observations, the convention this codebase already
+	 * uses for unordered responses (`kernelReqSeq` in `+page.svelte`, `statusSeq`
+	 * in `Databricks.svelte`). Every observation claims the newest slot before it
+	 * can act; one that had to fetch re-checks its claim afterwards and drops the
+	 * result if anything newer landed while it was in flight.
+	 *
+	 * Without it a slow GET silently REVERTS the editor and then records the stale
+	 * bytes as `savedContent`, which suppresses the correction: a window-focus
+	 * revalidation fetches A; an inline `file:changed` carrying newer content B
+	 * arrives and is applied synchronously; A resolves, differs from B, finds a
+	 * clean buffer and overwrites it. No further watcher event follows (the
+	 * server's known hash is already B's), so the tab shows A until the next focus.
+	 * A synchronous apply therefore has to claim the slot too, not just a fetch.
+	 */
+	let diskSeq = 0;
+
+	/**
+	 * Claim the newest-observation slot, superseding any fetch still in flight.
+	 * Called by every path that settles what we believe disk holds - an inline
+	 * event, a save, a Reload, a Keep-mine - not just by the fetching ones, since
+	 * a stale GET resolving after any of those reverts it just as surely.
+	 */
+	function claimDisk(): number {
+		return ++diskSeq;
+	}
+
+	/**
+	 * The ONE place a disk observation is acted on (`null` = deleted). Both entry
+	 * points funnel here so the no-clobber rules - and what "disk already agrees"
+	 * means - exist once; a second copy is how a stale banner survives the backstop.
+	 */
+	function applyDiskObservation(seq: number, next: string | null) {
+		if (seq !== diskSeq) return; // a newer observation landed while this was in flight
 		if (status === 'error') return;
-		if (ev.deleted) {
+		if (next === null) {
 			diskState = 'deleted';
 			pendingDisk = null;
 			return;
 		}
-		// A file past the inline-event ceiling is announced without its content, so
-		// the SSE stream never carries a multi-MB payload; fetch it instead.
-		const next = ev.content ?? (await fetchDiskContent());
-		if (next == null) return;
 		if (next === savedContent) {
 			// Disk agrees with what we believe it holds, so there is nothing new to
 			// say - AND anything we were holding back describes a state that no longer
@@ -378,8 +414,24 @@
 		applyDiskContent(next);
 	}
 
+	async function handleDiskChange(ev: FileChangedEvent) {
+		if (status === 'error') return;
+		const seq = claimDisk();
+		if (ev.deleted || ev.content != null) {
+			applyDiskObservation(seq, ev.deleted ? null : (ev.content as string));
+			return;
+		}
+		// A file past the inline-event ceiling is announced without its content, so
+		// the SSE stream never carries a multi-MB payload; fetch it instead - which
+		// is why this path needs the claim re-checked inside `applyDiskObservation`.
+		const next = await fetchDiskContent();
+		if (next == null) return;
+		applyDiskObservation(seq, next);
+	}
+
 	function reloadFromDisk() {
 		if (pendingDisk == null) return;
+		claimDisk();
 		applyDiskContent(pendingDisk);
 	}
 
@@ -390,6 +442,7 @@
 	 * still raises the banner again.
 	 */
 	function keepLocalVersion() {
+		claimDisk();
 		if (pendingDisk != null) savedContent = pendingDisk;
 		pendingDisk = null;
 		diskState = 'clean';
@@ -412,14 +465,17 @@
 	 */
 	async function revalidateFromDisk() {
 		if (status !== 'ready') return;
+		const seq = claimDisk();
 		const next = await fetchDiskContent();
 		// A read failure is not a deletion - the watcher is what reports those.
 		if (next == null) return;
 		// Content EQUAL to what we hold is deliberately not short-circuited here:
-		// it is `handleDiskChange` that decides what "disk already agrees" means,
-		// and it means dropping a stash the world has moved past, not just staying
-		// quiet. Two copies of that rule is how a stale banner survives the backstop.
-		void handleDiskChange({ type: 'file:changed', path, hash: '', deleted: false, content: next });
+		// it is `applyDiskObservation` that decides what "disk already agrees"
+		// means, and it means dropping a stash the world has moved past, not just
+		// staying quiet. Two copies of that rule is how a stale banner survives the
+		// backstop. The seq claimed BEFORE the fetch is what stops this slow read
+		// reverting a newer change that landed while it was in flight.
+		applyDiskObservation(seq, next);
 	}
 
 	// ---- Git change bars (gutter) --------------------------------------------
@@ -580,6 +636,7 @@
 		if (preReadyDisk != null) {
 			const pending = preReadyDisk;
 			preReadyDisk = null;
+			claimDisk();
 			applyDiskContent(pending);
 		}
 	});

@@ -32,6 +32,8 @@ const DELETE_MD = '# Delete doc\n\nabout to vanish\n';
 const REVERT_MD = '# Revert doc\n\nthe original\n';
 const RESURRECT_MD = '# Resurrect doc\n\ncomes back unchanged\n';
 const GROW_MD = '# Grow doc\n\nsmall for now\n';
+const INFLIGHT_MD = '# In-flight doc\n\nbefore the save\n';
+const ORDER_MD = '# Order doc\n\nthe stale version\n';
 /**
  * Past adapter-node's 512 K request-body ceiling (which the e2e harness runs
  * under - it boots the production build, not Vite) but well inside the 2 MB read
@@ -66,6 +68,8 @@ test.beforeAll(async () => {
 	writeFileSync(join(workspace, 'revert.md'), REVERT_MD);
 	writeFileSync(join(workspace, 'resurrect.md'), RESURRECT_MD);
 	writeFileSync(join(workspace, 'grow.md'), GROW_MD);
+	writeFileSync(join(workspace, 'inflight.md'), INFLIGHT_MD);
+	writeFileSync(join(workspace, 'order.md'), ORDER_MD);
 	const booted = await bootCellar(workspace);
 	launcher = booted.proc;
 	baseURL = booted.url;
@@ -215,6 +219,99 @@ test("Cellar's own save does not bounce back as a phantom external change", asyn
 	// event, is what decides).
 	agentWrite(abs, readFileSync(abs, 'utf8'));
 	await page.waitForTimeout(1200);
+	await expect(page.locator('[data-testid="file-disk-changed"]:visible')).toHaveCount(0);
+});
+
+test('characters typed during an in-flight save are offered, never silently replaced', async ({
+	page
+}) => {
+	// A save clears the dirty flag when its PUT resolves, but the buffer may have
+	// moved on since the bytes were captured. Clearing it unconditionally does not
+	// merely mislabel those keystrokes: it routes the NEXT external change down the
+	// silent-apply path, so they are overwritten without ever being offered.
+	await openFile(page, 'inflight.md');
+	const editor = page.locator('.cm-content:visible');
+	await expect(editor).toContainText('before the save');
+
+	// Hold the PUT open so a keystroke really lands inside its window.
+	await page.route(
+		(u) => u.pathname === '/api/fs/file',
+		async (route) => {
+			if (route.request().method() !== 'PUT') return route.continue();
+			await new Promise((r) => setTimeout(r, 1500));
+			await route.continue();
+		}
+	);
+
+	await editor.click();
+	await page.keyboard.press('ControlOrMeta+a');
+	await page.keyboard.press('ArrowRight');
+	await page.keyboard.type('\nSAVED-TEXT');
+	// The shell owns Cmd/Ctrl+S for every file tab, so focus stays in the editor
+	// and the next keystrokes land in the document rather than on a button.
+	await page.keyboard.press('ControlOrMeta+s');
+	await page.keyboard.type('\nTYPED-DURING-SAVE');
+
+	const abs = join(workspace, 'inflight.md');
+	await expect(async () => {
+		expect(readFileSync(abs, 'utf8')).toContain('SAVED-TEXT');
+	}).toPass();
+	// Disk holds what was written, and the extra characters are still unsaved.
+	expect(readFileSync(abs, 'utf8')).not.toContain('TYPED-DURING-SAVE');
+
+	agentWrite(abs, '# In-flight doc\n\nAGENT-REWROTE-THIS\n');
+
+	const banner = page.locator('[data-testid="file-disk-changed"]:visible');
+	await expect(banner).toBeVisible();
+	await expect(banner).toHaveAttribute('data-disk-state', 'changed');
+	await expect(editor).toContainText('TYPED-DURING-SAVE');
+	await expect(editor).not.toContainText('AGENT-REWROTE-THIS');
+});
+
+test('a slow revalidation cannot revert a newer change that landed while it was in flight', async ({
+	page
+}) => {
+	// Two async paths can apply disk content (the window-focus revalidation and the
+	// refetch for a file past the inline-event ceiling), and responses are
+	// unordered. A stale one resolving last used to overwrite the editor AND record
+	// its bytes as what disk holds - which suppresses the correction, since the
+	// server's known hash is already the newer content's and no further event
+	// follows. The monotonic claim is what drops it.
+	await openFile(page, 'order.md');
+	const editor = page.locator('.cm-content:visible');
+	await expect(editor).toContainText('the stale version');
+
+	// Serve exactly one GET as a slow, STALE response. Delaying the real request
+	// would not do: the server reads at continue-time and would return the NEW
+	// content, so there would be nothing out of order to drop.
+	let stubbed = false;
+	await page.route(
+		(u) => u.pathname === '/api/fs/file',
+		async (route) => {
+			if (route.request().method() !== 'GET' || stubbed) return route.continue();
+			stubbed = true;
+			await new Promise((r) => setTimeout(r, 2500));
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({ path: 'order.md', content: ORDER_MD })
+			});
+		}
+	);
+
+	// Window focus is the backstop that issues that GET.
+	await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+
+	// While it is in flight, a real external change arrives inline over SSE and is
+	// applied synchronously.
+	const abs = join(workspace, 'order.md');
+	agentWrite(abs, '# Order doc\n\nTHE-NEWEST-VERSION\n');
+	await expect(editor).toContainText('THE-NEWEST-VERSION');
+
+	// Now let the stale response land. It must change nothing.
+	await page.waitForTimeout(3000);
+	await expect(editor).toContainText('THE-NEWEST-VERSION');
+	await expect(editor).not.toContainText('the stale version');
 	await expect(page.locator('[data-testid="file-disk-changed"]:visible')).toHaveCount(0);
 });
 

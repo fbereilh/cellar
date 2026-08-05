@@ -52,7 +52,7 @@
  */
 import { watch, existsSync, statSync, type FSWatcher } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { dirname, basename } from 'node:path';
+import { dirname, basename, sep } from 'node:path';
 import { resolveInWorkspace, readWorkspaceFile } from './fstree';
 import { MAX_FILE_BYTES } from './limits.js';
 
@@ -193,6 +193,12 @@ function overWatchCeiling(abs: string): boolean {
  * The LRU bounds the set regardless of any of that, which is what makes "no
  * client lifecycle plumbing" safe rather than merely cheap. A file evicted while
  * still open falls back to the tab's window-focus revalidation.
+ *
+ * That multi-window guarantee is only as good as the seeding rule below: because
+ * every window's focus revalidation lands here, a re-read must never overwrite
+ * the known hash, or one window's read swallows the change for all the others.
+ * `unwatchUnder` is the one deliberate stop, for a path the explorer has just
+ * destroyed or renamed away - no window can be watching a name that is gone.
  */
 export function watchFileForChanges(relPath: string, currentContent?: string): void {
 	const abs = absOf(relPath);
@@ -207,13 +213,25 @@ export function watchFileForChanges(relPath: string, currentContent?: string): v
 		return;
 	}
 
-	// Seed the known hash from the content the caller already holds. Without a
-	// content argument, read it - a wrong seed here is not cosmetic: it would
-	// make the file's CURRENT state look like a change and fire a spurious
-	// reload the first time anything touches the directory.
+	// Seed the known hash ONLY on first registration, from the content the caller
+	// already holds (without one, read it). A wrong seed is not cosmetic: it would
+	// make the file's CURRENT state look like a change and fire a spurious reload
+	// the first time anything touches the directory.
+	//
+	// An EXISTING entry therefore wins over the caller's content, and that ordering
+	// is load-bearing rather than tidiness. Registration is on READ, and the read is
+	// also issued by each tab's window-focus revalidation - so a read landing inside
+	// a pending settle window would otherwise re-seed the hash to the very content
+	// that settle is about to deliver, `settle` would find no change, and it would
+	// publish NOTHING. The reading tab is fine (it has the content in its own
+	// response); every OTHER browser window on this workspace silently misses the
+	// change until its own focus - which is exactly the multi-window live sync the
+	// no-unwatch-on-close rule below exists to protect. Delivering the change once
+	// more to the tab that read it is the harmless direction: the client
+	// short-circuits when the content already matches what it holds.
 	let hash: string;
-	if (currentContent != null) hash = hashOf(currentContent);
-	else if (known.has(relPath)) hash = known.get(relPath)!;
+	if (known.has(relPath)) hash = known.get(relPath)!;
+	else if (currentContent != null) hash = hashOf(currentContent);
 	else {
 		try {
 			hash = existsSync(abs) ? hashOf(readWorkspaceFile(relPath)) : DELETED_HASH;
@@ -265,6 +283,27 @@ export function unwatchFile(relPath: string): void {
 	if (!entry) return;
 	entry.files.delete(basename(abs));
 	if (entry.files.size === 0) closeDir(dir);
+}
+
+/**
+ * Stop watching `relPath` AND everything nested under it.
+ *
+ * The sidebar's delete/rename/move ops are the callers, beside the `dropDocs` /
+ * `shutdownKernelsUnder` they already run: that name is gone, so its entry can
+ * only ever settle into a deletion nobody is listening for, and until the LRU
+ * evicted it, it occupied a slot a genuinely open file could have held. Folder
+ * shaped for the same reason those two are - a folder op takes every file under
+ * it with it, and each of those leaves an entry of its own.
+ */
+export function unwatchUnder(relPath: string): void {
+	unwatchFile(relPath);
+	const abs = absOf(relPath);
+	if (!abs) return;
+	const prefix = abs + sep;
+	for (const key of [...known.keys()]) {
+		const keyAbs = absOf(key);
+		if (keyAbs != null && keyAbs.startsWith(prefix)) unwatchFile(key);
+	}
 }
 
 /** Close every watcher and forget all state (server shutdown; test teardown). */

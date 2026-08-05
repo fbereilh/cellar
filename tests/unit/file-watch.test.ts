@@ -17,6 +17,7 @@ import {
 	MAX_INLINE_EVENT_BYTES,
 	watchFileForChanges,
 	unwatchFile,
+	unwatchUnder,
 	unwatchAll,
 	noteKnownContent,
 	onExternalChange,
@@ -162,6 +163,82 @@ describe('external file watcher', () => {
 		await sleep(SETTLE_MS * 3);
 
 		expect(seen).toHaveLength(0);
+	});
+
+	it('a re-read inside a pending settle window does NOT swallow the change', async () => {
+		// The multi-window property, and the reason an EXISTING known-hash entry wins
+		// over the content a caller hands in. Registration is on READ, and every
+		// window's focus revalidation issues that same read - so a read landing
+		// mid-settle used to re-seed the hash to the very content settle was about to
+		// deliver, `settle` found no change, and NOTHING was published. The reading
+		// tab was fine (it had the content in its own response); every other browser
+		// window on the workspace silently missed the edit until its own focus, which
+		// is exactly the live sync `watchFileForChanges`'s no-unwatch-on-close rule
+		// exists to keep working.
+		const abs = join(ws, 'shared.md');
+		writeFileSync(abs, 'v0\n');
+		watchFileForChanges('shared.md', 'v0\n');
+
+		agentWrite(abs, 'from-agent\n');
+		// One window's GET, inside the quiet period - it reads the NEW content and
+		// hands it back to the watcher, exactly as `GET /api/fs/file` does.
+		await sleep(SETTLE_MS / 3);
+		watchFileForChanges('shared.md', 'from-agent\n');
+
+		await waitForChanges(1);
+		expect(seen.map((c) => c.content)).toEqual(['from-agent\n']);
+	});
+
+	it('a re-read of an UNCHANGED file still reports nothing', async () => {
+		// The other half: giving the existing entry precedence must not turn an
+		// ordinary revalidating read into a phantom change.
+		const abs = join(ws, 'quiet.md');
+		writeFileSync(abs, 'v0\n');
+		watchFileForChanges('quiet.md', 'v0\n');
+
+		watchFileForChanges('quiet.md', 'v0\n');
+		writeFileSync(abs, 'v0\n'); // a touch, so a settle really runs
+		await sleep(SETTLE_MS * 4);
+
+		expect(seen).toHaveLength(0);
+	});
+
+	it('a FIRST registration still seeds from the caller, so the open is not a change', async () => {
+		// The seed's original purpose, unaffected by the precedence rule: with no
+		// existing entry the caller's content is what stops the file's CURRENT state
+		// reading as an edit the first time anything touches the directory.
+		const abs = join(ws, 'fresh.md');
+		writeFileSync(abs, 'already-here\n');
+		watchFileForChanges('fresh.md', 'already-here\n');
+
+		writeFileSync(join(ws, 'sibling.md'), 'x\n'); // stirs the directory watcher
+		writeFileSync(abs, 'already-here\n');
+		await sleep(SETTLE_MS * 4);
+
+		expect(seen).toHaveLength(0);
+	});
+
+	it('unwatchUnder drops a deleted path and everything nested below it', async () => {
+		// What the explorer's delete/rename/move ops call, beside their existing
+		// `dropDocs`/`shutdownKernelsUnder`: the name is gone, so its entry can only
+		// settle into a deletion nobody is listening for, and it would hold an LRU
+		// slot a genuinely open file could use.
+		mkdirSync(join(ws, 'dir', 'nested'), { recursive: true });
+		writeFileSync(join(ws, 'dir', 'a.md'), 'a');
+		writeFileSync(join(ws, 'dir', 'nested', 'b.md'), 'b');
+		writeFileSync(join(ws, 'keep.md'), 'keep');
+		watchFileForChanges('dir/a.md', 'a');
+		watchFileForChanges('dir/nested/b.md', 'b');
+		watchFileForChanges('keep.md', 'keep');
+		expect(watchStats().tracked).toBe(3);
+
+		unwatchUnder('dir');
+
+		// The folder took every file under it; the sibling outside is untouched.
+		expect(watchStats().tracked).toBe(1);
+		agentWrite(join(ws, 'keep.md'), 'keep2');
+		await waitForChanges(1);
+		expect(seen.map((c) => c.path)).toEqual(['keep.md']);
 	});
 
 	it('reports a delete as content:null', async () => {
