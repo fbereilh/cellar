@@ -358,8 +358,56 @@ describe('the generated module follows the marks', () => {
 		expect(both).toContain("__all__ = ['one', 'two']");
 
 		// Unmarking regenerates the module WITHOUT that cell.
-		svc.setCellExport([code[1]], false, target);
+		const partial = svc.setCellExport([code[1]], false, target);
 		expect(readFileSync(py, 'utf8')).not.toContain('def two():');
+		// A regeneration DID happen, so no warning is attached - an ordinary call pays
+		// no tokens for the honesty field.
+		expect(partial.ok && 'module' in partial).toBe(false);
+	});
+
+	it('says so when unmarking the LAST cell leaves the old module on disk', async () => {
+		const { target, code } = await makeNotebook('module-last-unmark.ipynb');
+		svc.setExportTarget('lib/last.py', target);
+		const py = join(WS, 'lib/last.py');
+		svc.setCellExport([code[0]], true, target);
+		const generated = readFileSync(py, 'utf8');
+		expect(generated).toContain('def one():');
+
+		// `exportNotebookToPy` returns early with `no-cells`, so it neither rewrites nor
+		// removes the file: `import lib.last` still resolves the symbol just unmarked.
+		// Deleting a git-tracked, nbdev-committed module is out of scope, so the RESULT
+		// must not claim a regeneration that did not happen.
+		const r = svc.setCellExport([code[0]], false, target);
+		expect(r).toMatchObject({ ok: true, count: 1, export_target: 'lib/last.py' });
+		expect(r.ok ? r.module : null).toMatchObject({ regenerated: false });
+		expect(r.ok ? r.module?.reason : '').toContain('lib/last.py');
+		expect(readFileSync(py, 'utf8')).toBe(generated);
+	});
+
+	it('carries no module warning when there is no target to regenerate', async () => {
+		const { target, code } = await makeNotebook('module-no-target.ipynb');
+		svc.setCellExport([code[0]], true, target);
+		// Nothing was generated, so nothing is stale - the warning is about a module
+		// left BEHIND, not about the absent target (`export_target:null` says that).
+		const r = svc.setCellExport([code[0]], false, target);
+		expect(r).toMatchObject({ ok: true, export_target: null });
+		expect(r.ok && 'module' in r).toBe(false);
+	});
+
+	it('reports the ADDRESSED cells on an unmark, which are now OUT of the module', async () => {
+		const { target, code } = await makeNotebook('unmark-reports.ipynb');
+		svc.setExportTarget('lib/unmark.py', target);
+		svc.setCellExport(code, true, target);
+
+		const off = svc.setCellExport([code[0]], false, target);
+		// `exported` names the cells that now carry the REQUESTED value - here the one
+		// that is no longer in the module. The description says so, because the field
+		// name alone reads the other way round.
+		expect(off.ok && off.exported).toEqual([code[0]]);
+		expect(marked(target, code[0])).toBe(false);
+		const module = readFileSync(join(WS, 'lib/unmark.py'), 'utf8');
+		expect(module).not.toContain('def one():');
+		expect(module).toContain('def two():');
 	});
 
 	it('marks fine with no target set, and the module appears once one is', async () => {
@@ -495,6 +543,14 @@ describe('the tool registration', () => {
 		expect(line).toMatch(/[Cc]ode cells? can be exported|Only CODE cells/);
 		expect(line).toMatch(/[Rr]egenerates/);
 		expect(line).toMatch(/set_export_target/);
+		// The regeneration claim must stay CONDITIONAL: unmarking the last marked cell
+		// writes nothing, so an unqualified "regenerates immediately" is false exactly
+		// where an agent most needs the truth.
+		expect(line).not.toMatch(/[Rr]egenerates the `\.py` immediately/);
+		expect(line).toMatch(/module\.regenerated:false/);
+		// `exported` names the ADDRESSED cells, which on export:false are the ones NOT
+		// in the module - the field name alone reads the other way round.
+		expect(line).toMatch(/REQUESTED value/);
 		// The mechanical bound `clear_outputs` set: an honesty correction here has to
 		// be paid for by cutting words, not by growing what every session is billed.
 		const desc = line.match(/description: '(.*?)', inputSchema/);

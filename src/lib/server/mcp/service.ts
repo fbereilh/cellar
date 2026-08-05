@@ -50,7 +50,7 @@ import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isSqlCell, isLogicalCellType } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
-import { isExportCell } from '../../exportRole';
+import { isExportCell, exportCellCount } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
@@ -1551,9 +1551,18 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * Unlike the pure display setters this one DOES have a side effect (it drives the
  * generated `.py`), but it changes no cell source, so like them it takes no
  * pre-action checkpoint — there is no cell state an undo would need to bring back.
+ *
+ * A `.py` TEXT notebook is refused through the SAME `isPyTextNotebook` predicate
+ * as its pair `setCellExport`, and that symmetry is the point: such a document is
+ * written through jupytext, which stores no cellar metadata, and `autoExportPy`
+ * skips it entirely — so a target set here survives neither a reload nor a
+ * regeneration. Accepting it while the other half refuses would leave an agent
+ * following the export flow holding a target it was told is set, for a module
+ * that can never be built.
  */
 export function setExportTarget(target: string | null | undefined, nb?: string | null) {
 	const nbTarget = nb ?? getActiveNotebookPath();
+	if (isPyTextNotebook(nbTarget)) return { ok: false as const, refused: 'py-notebook' as const };
 	setExportTargetDoc(target ?? null, nbTarget);
 	return { export_target: getNotebook(nbTarget).exportTarget };
 }
@@ -1587,11 +1596,23 @@ export function setExportTarget(target: string | null | undefined, nb?: string |
  * loses nothing an agent could have had, and unlike reporting success it claims
  * nothing false and spends no blocking jupytext rewrite.
  *
- * `exported` reports the RESULTING state - every addressed cell that now carries
- * the requested value - not a change count, so a repeated mark reports the same
- * list rather than an empty one an agent would read as a failure. A cell already
- * at that value is not rewritten, so an idempotent call persists nothing and
- * regenerates nothing (zero git diff, no `.py` mtime churn).
+ * `exported` reports the RESULTING state - every ADDRESSED cell that now carries
+ * the REQUESTED value - not a change count, so a repeated mark reports the same
+ * list rather than an empty one an agent would read as a failure. Note what that
+ * means in the unmark direction, which the name alone does not say and the tool
+ * description therefore spells out: on `export:false` the list names the cells
+ * that are now OUT of the module, never the ones in it. A cell already at that
+ * value is not rewritten, so an idempotent call persists nothing and regenerates
+ * nothing (zero git diff, no `.py` mtime churn).
+ *
+ * The regeneration is reported HONESTLY rather than promised, via `moduleWarning`:
+ * `exportNotebookToPy` writes nothing when NO cell is marked, so unmarking the
+ * last one leaves the previously generated module - a git-tracked, nbdev-committed
+ * file - on disk exactly as it was. Deleting or truncating it here is deliberately
+ * NOT done (that behavior is shared with the UI toggle, and removing a committed
+ * module is destructive), so the RESULT states it instead. Do not re-add an
+ * unconditional regeneration claim to the description: that is the one case where
+ * it is false.
  *
  * VISIBILITY follows the READ tools, not `delete_cells`: a cell hidden from the
  * agent reads as NOT FOUND here, exactly as `readCell` treats it. Marking copies
@@ -1624,7 +1645,37 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 	setCellExportsDoc(full, exported, target);
 	const toHandle = handleFn(target);
 	const marked = full.map(toHandle);
-	return { ok: true as const, exported: marked, count: marked.length, export_target: getNotebook(target).exportTarget };
+	const exportTarget = getNotebook(target).exportTarget;
+	return {
+		ok: true as const,
+		exported: marked,
+		count: marked.length,
+		export_target: exportTarget,
+		...moduleWarning(target, exportTarget)
+	};
+}
+
+/**
+ * The honesty half of `setCellExport`: report when the call left the generated
+ * module UNREGENERATED. `exportNotebookToPy` returns early with `no-cells` when
+ * nothing is marked, so it neither rewrites nor removes the file - unmarking the
+ * last marked cell leaves the previously exported symbols on disk, and an
+ * `import` of that module still resolves them.
+ *
+ * Present ONLY in that case (a target IS set and nothing is marked any more), so
+ * an ordinary call pays no tokens for it - the `undo` field on `clearOutputs` is
+ * the same conditional shape for the same reason. Purely a projection of state
+ * this function already has in hand: it changes no export behavior, it only stops
+ * the result from claiming a regeneration that did not happen.
+ */
+function moduleWarning(target: string, exportTarget: string | null) {
+	if (!exportTarget || exportCellCount(listCells(target))) return {};
+	return {
+		module: {
+			regenerated: false as const,
+			reason: `no cell is marked for export any more, so ${exportTarget} was left on disk exactly as it was - remove it by hand if it should be gone`
+		}
+	};
 }
 
 /**

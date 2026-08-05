@@ -16,7 +16,7 @@
  * kernel or subprocess is involved.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -24,6 +24,24 @@ vi.mock('../../src/lib/server/dataflow', () => ({
 	getNotebookStaleness: async () => ({ sid: null, cells: {} }),
 	analyzeDataflow: async () => ({})
 }));
+
+// A `.py` text notebook without the python toolchain: the reader yields a code
+// cell and the writer only RECORDS, so "did this path spend a jupytext write" is
+// observable.
+const py = vi.hoisted(() => ({ writes: [] as string[] }));
+vi.mock('../../src/lib/server/jupytext', async (importOriginal) => {
+	const real = await importOriginal<typeof import('../../src/lib/server/jupytext')>();
+	return {
+		...real,
+		readPyNotebook: () => ({
+			format: 'percent',
+			cells: [{ id: null, cell_type: 'code', source: 'a = 0', outputs: [], metadata: {} }]
+		}),
+		writePyNotebook: (path: string) => {
+			py.writes.push(path);
+		}
+	};
+});
 
 let WS: string;
 let svc: typeof import('../../src/lib/server/mcp/service');
@@ -124,6 +142,22 @@ describe('persistence', () => {
 		svc.setExportTarget(null, nb);
 		const disk = JSON.parse(readFileSync(nb, 'utf8'));
 		expect(disk.metadata.cellar?.export_target).toBeUndefined();
+	});
+});
+
+describe('a .py text notebook is refused, like its pair set_cell_export', () => {
+	it('stores nothing and spends no jupytext write', () => {
+		const target = nbmod.resolveNotebookPath('text-target.py');
+		writeFileSync(target, '# %%\na = 0\n');
+		py.writes.length = 0;
+
+		// Such a doc is written through jupytext (which stores no cellar metadata) and
+		// `autoExportPy` skips it, so a target set here survives neither a reload nor a
+		// regeneration. Accepting it while set_cell_export refuses would leave an agent
+		// holding a target for a module that can never be built.
+		expect(svc.setExportTarget('lib/text.py', target)).toEqual({ ok: false, refused: 'py-notebook' });
+		expect(nbmod.getExportTarget(target)).toBe(null);
+		expect(py.writes).toEqual([]);
 	});
 });
 
