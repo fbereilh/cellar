@@ -479,9 +479,11 @@
 
 	// Copy a text form of every output, built from the cell MODEL (`cell.outputs`)
 	// rather than the rendered DOM - see `$lib/copyCell` for the mime rule and for
-	// why that matters under windowing. `canCopyOutput` already disables the
-	// button when nothing has a text form; the empty guard covers the one
-	// conservative case it admits (html that strips to nothing).
+	// why that matters under windowing. The enabled state is decided on the
+	// CONVERTED text, so the button is disabled exactly when the copy would be
+	// empty (`hasCopyableOutput` and `copyOutputText` read one memoized per-output
+	// conversion, so they cannot disagree); the empty guard below is therefore
+	// unreachable and kept only as a belt-and-braces no-op.
 	const canCopyOutput = $derived(!isMarkdown && hasCopyableOutput(cell.outputs));
 	async function copyOutput(e: Event) {
 		e.stopPropagation();
@@ -1670,7 +1672,10 @@
 					<!-- Copy a text form of the output, built from the cell MODEL (see
 					     $lib/copyCell). Disabled when there is nothing textual to copy -
 					     no outputs at all, or only pictures / charts / live widgets - so
-					     the button is never a silent no-op. -->
+					     the button is never a silent no-op. A disabled control receives
+					     no pointer events, so its `title` can never be hovered: the
+					     REASON therefore rides the aria-label, the one label both a
+					     screen reader and the accessibility tree still report. -->
 					<button
 						class="btn btn-ghost btn-xs btn-square disabled:text-base-content/20 {copiedFlash === 'output'
 							? 'text-success'
@@ -1678,7 +1683,11 @@
 						onclick={copyOutput}
 						disabled={!canCopyOutput}
 						title={copiedFlash === 'output' ? 'Copied output' : canCopyOutput ? 'Copy output' : 'No output to copy'}
-						aria-label={copiedFlash === 'output' ? 'Copied output' : 'Copy cell output'}
+						aria-label={copiedFlash === 'output'
+							? 'Copied output'
+							: canCopyOutput
+								? 'Copy cell output'
+								: 'Copy cell output - no output to copy'}
 						data-testid="copy-output"
 						data-copied={copiedFlash === 'output' ? 'true' : undefined}
 					>

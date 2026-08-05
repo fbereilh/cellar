@@ -33,9 +33,12 @@ const ESC = String.fromCharCode(27);
 const SRC_STDOUT = 'print("hello from cellar")';
 const SRC_ERROR = 'raise ValueError("boom")';
 const SRC_TABLE = 'styler()';
+const SRC_DF = 'df';
 const SRC_IMAGE = 'plot()';
 const SRC_MULTI = 'multi()';
 const SRC_EMPTY = 'x = 1';
+const SRC_BLANK = 'print()';
+const SRC_SCRIPT = 'chart.show()';
 const SRC_SQL = 'SELECT 1 AS one';
 const SRC_MD = '## A heading\n\nsome *prose*';
 // Far below the initial window: proves the copy reads the model, not a node that
@@ -80,6 +83,37 @@ function notebookJson(): string {
 							'<style>#T_x td{color:red}</style><table id="T_x"><thead><tr><th>name</th><th>qty</th></tr></thead>' +
 							'<tbody><tr><td>apple</td><td>3</td></tr><tr><td>pear</td><td>5</td></tr></tbody></table>'
 					}
+				}
+			]),
+			// A SAVED DataFrame: clean-on-save stripped the structured MIME, so all
+			// that is left is pandas' own `_repr_html_` (which Cellar re-parses back
+			// into the grid) plus its elided text/plain repr.
+			cell('copy-df-aaaaaaaa', SRC_DF, [
+				{
+					output_type: 'execute_result',
+					metadata: {},
+					execution_count: 1,
+					data: {
+						'text/html':
+							'<div><table border="1" class="dataframe"><thead>' +
+							'<tr style="text-align: right;"><th></th><th>a</th><th>b</th></tr></thead><tbody>' +
+							'<tr><th>0</th><td>1</td><td>x</td></tr>' +
+							'<tr><th>1</th><td>2</td><td>y</td></tr>' +
+							'</tbody></table></div>',
+						'text/plain': '   a  b\n0  1  x\n1  2  y'
+					}
+				}
+			]),
+			// A run that printed nothing but a newline: enabled-looking under a
+			// mime-presence rule, and the click would then copy nothing.
+			cell('copy-blank-aaaaa', SRC_BLANK, [stream('\n')]),
+			// An all-script rich bundle (Bokeh / Altair / plotly's HTML renderer):
+			// html is present, but it strips to no text at all.
+			cell('copy-script-aaaa', SRC_SCRIPT, [
+				{
+					output_type: 'display_data',
+					metadata: {},
+					data: { 'text/html': '<div id="chart-1"></div><script>(function () { window.__chartEmbedded = "chart-1"; })();</script>' }
 				}
 			]),
 			// Image only - matplotlib ships a `<Figure …>` text/plain repr alongside,
@@ -254,6 +288,18 @@ test('copy output copies an html table as readable text, never markup', async ({
 	expect(text).not.toContain('color:red');
 });
 
+test('copy output copies a SAVED DataFrame as the table the grid shows, not the elided repr', async ({ page }) => {
+	// The structured MIME is gone (clean-on-save), so this is the pandas
+	// `_repr_html_` the notebook carries on disk - the same repr renderOutput
+	// re-parses into the interactive grid. Copy runs it through that ONE parser,
+	// so what lands on the clipboard is the grid's table rather than the elided
+	// text/plain repr shipped beside it.
+	await openNotebook(page);
+	await reveal(page, 'copy-df-aaaaaaaa');
+	await cellEl(page, 'copy-df-aaaaaaaa').getByTestId('copy-output').click();
+	expect(await lastCopied(page)).toBe('\ta\tb\n0\t1\tx\n1\t2\ty');
+});
+
 test('copy output concatenates several outputs and skips the image among them', async ({ page }) => {
 	await openNotebook(page);
 	await reveal(page, 'copy-multi-aaaaa');
@@ -273,6 +319,35 @@ test('copy output is disabled for an image-only cell and for one with no output'
 
 	// Nothing reached the clipboard from either.
 	expect(await copied(page)).toEqual([]);
+});
+
+test('copy output is disabled when the text CONVERTS to nothing, not merely when a mime is absent', async ({ page }) => {
+	// The two cases a mime-presence rule got wrong: a bare `print()` whose stream
+	// text is only a newline, and an all-script rich bundle whose html strips to
+	// no text. Both used to look enabled and copy nothing on click - the silent
+	// no-op the disabled rule exists to prevent.
+	await openNotebook(page);
+	await reveal(page, 'copy-blank-aaaaa');
+	await expect(cellEl(page, 'copy-blank-aaaaa').getByTestId('copy-output')).toBeDisabled();
+	await reveal(page, 'copy-script-aaaa');
+	await expect(cellEl(page, 'copy-script-aaaa').getByTestId('copy-output')).toBeDisabled();
+	expect(await copied(page)).toEqual([]);
+});
+
+test('a disabled copy-output SAYS why, in the label a disabled control can still report', async ({ page }) => {
+	// A disabled control receives no pointer events, so its `title` can never be
+	// hovered: the reason has to ride the aria-label or nobody ever learns it.
+	await openNotebook(page);
+	await reveal(page, 'copy-empty-aaaaa');
+	await expect(cellEl(page, 'copy-empty-aaaaa').getByTestId('copy-output')).toHaveAttribute(
+		'aria-label',
+		/no output to copy/i
+	);
+	await reveal(page, 'copy-stdout-aaaa');
+	await expect(cellEl(page, 'copy-stdout-aaaa').getByTestId('copy-output')).toHaveAttribute(
+		'aria-label',
+		'Copy cell output'
+	);
 });
 
 test("a disabled copy-output LOOKS disabled, at daisyUI's own ghost-button alpha", async ({ page }) => {
