@@ -651,7 +651,17 @@ def workspace_upload(w, name, overwrite):
         try:
             existing = w.workspace.get_status(path)
         except Exception as e:
-            if classify(e) != 'not_found':
+            # The free-path case is keyed off the exception TYPE, never classify():
+            # classify matches the MESSAGE before the type name, and a workspace
+            # not-found message embeds the path being looked up - so a notebook (or
+            # a user login) containing 'oauth', 'consent', 'authorization code',
+            # 'external-browser' or 'authenticate' read as oauth_login_required and
+            # failed the very first upload of a path that simply did not exist,
+            # permanently, with a sign-in prompt. classify is for the FINAL message,
+            # not for control flow. Anything else re-raises, so a genuine
+            # permission/auth/network failure surfaces honestly instead of being
+            # taken for a free path and overwriting.
+            if type(e).__name__ not in ('NotFound', 'ResourceDoesNotExist'):
                 raise
         if existing is not None:
             kind = (enum_value(getattr(existing, 'object_type', None)) or 'OBJECT').upper()

@@ -970,6 +970,18 @@
 	 */
 	let uploadSeq = 0;
 
+	/**
+	 * Whether the confirm box's buttons are inert. Cancel shares Replace's ONE
+	 * condition rather than carrying its own: the overwrite request cannot be
+	 * recalled once sent, so a Cancel that merely dismissed the box would present a
+	 * replace that IS happening as one the user aborted - exactly the silent clobber
+	 * this feature exists to prevent. While it is in flight the box stays mounted and
+	 * the settled reply renders the outcome (the note with its path and link, or the
+	 * error); with nothing in flight Cancel is live again - before the first click,
+	 * and after a failed replace, so the box is never a dead end.
+	 */
+	const uploadConfirmBusy = $derived(!!busy || runtimeApplying);
+
 	/** Drop the previous attempt's feedback: it describes one moment, not a standing state. */
 	function clearUploadFeedback() {
 		uploadSeq++;
@@ -1622,6 +1634,7 @@
 					<button
 						class="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[11px] font-normal text-base-content/60"
 						onclick={clearUploadFeedback}
+						disabled={uploadConfirmBusy}
 						data-testid="databricks-upload-cancel"
 					>
 						Cancel
@@ -1629,7 +1642,7 @@
 					<button
 						class="btn btn-warning btn-xs h-5 min-h-0 px-1.5 text-[11px]"
 						onclick={() => uploadToWorkspace(true)}
-						disabled={!!busy || runtimeApplying}
+						disabled={uploadConfirmBusy}
 						data-testid="databricks-upload-replace"
 					>
 						{#if busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Replacing…{:else}Replace{/if}

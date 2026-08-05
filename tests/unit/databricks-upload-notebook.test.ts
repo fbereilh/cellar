@@ -63,6 +63,7 @@ vi.mock('../../src/lib/server/kernel', () => ({
 let dbx: typeof import('../../src/lib/server/databricks');
 let dir = '';
 let NB = '';
+let OAUTH_NB = '';
 /** Where the recording stub writes what it was asked (argv request) and fed (stdin). */
 let reqFile = '';
 let stdinFile = '';
@@ -203,9 +204,12 @@ function writeFakeSdkInterpreter(): string {
 			'class _Value:',
 			'    def __init__(self, value): self.value = value',
 			'',
-			'# The SDK error a missing workspace path raises. `classify()` keys off the',
-			"# TYPE NAME, so the name is the contract - not this module's identity.",
+			'# The SDK error a missing workspace path raises. The probe keys off the TYPE',
+			"# NAME, so the name is the contract - not this module's identity.",
 			'class ResourceDoesNotExist(Exception):',
+			'    pass',
+			'',
+			'class PermissionDenied(Exception):',
 			'    pass',
 			'',
 			'class _ObjectInfo:',
@@ -215,7 +219,11 @@ function writeFakeSdkInterpreter(): string {
 			'    def get_status(self, path):',
 			"        _record({'call': 'get_status', 'path': path})",
 			"        kind = os.environ.get('CELLAR_FAKE_DBX_EXISTS', 'none')",
+			"        if kind == 'denied':",
+			"            raise PermissionDenied('PERMISSION_DENIED: cannot read ' + path)",
 			"        if kind == 'none':",
+			// The real workspace not-found message names the path it looked up, which is
+			// what lets a notebook NAME collide with `classify()`'s message rules.
 			"            raise ResourceDoesNotExist('RESOURCE_DOES_NOT_EXIST: ' + path)",
 			'        return _ObjectInfo(kind)',
 			'',
@@ -285,6 +293,11 @@ beforeAll(async () => {
 	callLog = join(dir, 'sdk-calls.jsonl');
 	NB = join(dir, 'analysis.ipynb');
 	writeFileSync(NB, JSON.stringify(FIXTURE, null, 1));
+	// A name that is ORDINARY to a user and a landmine to `classify()`: the workspace
+	// not-found message embeds the path, so 'oauth' in the filename reads as an OAuth
+	// failure to a message-matching check.
+	OAUTH_NB = join(dir, 'oauth-notes.ipynb');
+	writeFileSync(OAUTH_NB, JSON.stringify(FIXTURE, null, 1));
 	dbx = await import('../../src/lib/server/databricks');
 });
 
@@ -514,6 +527,38 @@ describe('the workspace_upload op — the SHIPPED probe against a fake databrick
 		const imported = sdkCalls().find((c) => c.call === 'import_')!;
 		expect(imported.overwrite).toBe(true);
 		expect(imported.format).toBe('JUPYTER');
+	});
+
+	it.skipIf(!python)(`reads a FREE path off the exception TYPE, so a notebook name classify() mistakes for an auth failure still uploads [${python ? 'ok' : NO_PYTHON}]`, async () => {
+		useNoPython();
+		state.session = 1;
+		await dbx.connect({ profile: 'pat', clusterId: '0725-abc', clusterName: 'Test Cluster', nb: OAUTH_NB });
+		process.env.CELLAR_FAKE_DBX_LOG = callLog;
+		process.env.CELLAR_FAKE_DBX_EXISTS = 'none';
+		useStub(writeFakeSdkInterpreter());
+
+		const out = await dbx.uploadNotebook({ nb: OAUTH_NB });
+
+		// `classify()` matches the MESSAGE first, and the not-found message names the
+		// path - so a message-keyed check read this ordinary name as
+		// `oauth_login_required` and failed the very FIRST upload of it, permanently,
+		// with a sign-in prompt for a path that simply did not exist.
+		expect(out.status).toBe('uploaded');
+		expect(out.path).toBe(`/Users/${USER}/oauth-notes`);
+		expect(sdkCalls().map((c) => c.call)).toContain('import_');
+	});
+
+	it.skipIf(!python)(`re-raises anything that is NOT a not-found rather than reading it as a free path [${python ? 'ok' : NO_PYTHON}]`, async () => {
+		await freshConnect();
+		process.env.CELLAR_FAKE_DBX_LOG = callLog;
+		process.env.CELLAR_FAKE_DBX_EXISTS = 'denied';
+		useStub(writeFakeSdkInterpreter());
+
+		// The other half of keying off the type: a genuine permission/auth/network
+		// failure must surface honestly, never be taken for "nothing is there" and
+		// overwrite whatever the check could not see.
+		await expect(dbx.uploadNotebook({ nb: NB })).rejects.toMatchObject({ code: 'permission_denied' });
+		expect(sdkCalls().map((c) => c.call)).not.toContain('import_');
 	});
 
 	it.skipIf(!python)(`refuses a path occupied by something that is not a notebook [${python ? 'ok' : NO_PYTHON}]`, async () => {

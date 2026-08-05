@@ -18,8 +18,11 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  *                      radius, Cancel leaves it alone, and only Replace sends
  *                      `overwrite:true`. The confirm stays MOUNTED for the whole
  *                      replace, so the path being overwritten is on screen while
- *                      it happens, and a failed replace drops back to the button
- *                      with the error rather than into a dead end.
+ *                      it happens - with BOTH its buttons inert, since the request
+ *                      cannot be recalled and a Cancel that only dismissed the box
+ *                      would present a replace that happened as one that did not.
+ *                      A failed replace drops back to the button with the error
+ *                      rather than into a dead end.
  *   - switched away  → a reply that lands after the panel moved to another
  *                      notebook is dropped entirely: it could otherwise arm the
  *                      confirm for one path while Replace posted another's.
@@ -260,6 +263,8 @@ test('replacing keeps the confirm box up, so the path being overwritten stays on
 	await page.getByTestId('databricks-upload').click();
 	const box = page.getByTestId('databricks-upload-confirm-box');
 	await expect(box).toBeVisible();
+	// With nothing in flight the way out is live: the box is never a dead end.
+	await expect(page.getByTestId('databricks-upload-cancel')).toBeEnabled();
 
 	await page.getByTestId('databricks-upload-replace').click();
 
@@ -270,6 +275,12 @@ test('replacing keeps the confirm box up, so the path being overwritten stays on
 	await expect(box).toBeVisible();
 	await expect(box).toContainText(WS_PATH);
 	await expect(page.getByTestId('databricks-upload')).toHaveCount(0);
+	// And Cancel is inert exactly as Replace is: the overwrite request cannot be
+	// recalled once sent, so a Cancel that merely dismissed the box would present a
+	// replace that IS happening as one the user aborted - the silent clobber this
+	// whole confirm exists to prevent.
+	await expect(page.getByTestId('databricks-upload-cancel')).toBeDisabled();
+	await expect(page.getByTestId('databricks-upload-replace')).toBeDisabled();
 
 	release();
 
