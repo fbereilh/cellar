@@ -74,7 +74,7 @@
 		onRunAdvance: (id: string, source: string, opts: { focusNext: boolean }) => void;
 		/** Run every code cell above this one (exclusive), in document order. */
 		onRunAbove?: (id: string) => void;
-		/** Interrupt the shared kernel (reuses the Kernels-section handler). */
+		/** Interrupt this notebook's kernel (reuses the Kernels-section handler). */
 		onInterrupt?: () => void;
 		onClear: (id: string) => void;
 		onDelete: (id: string) => void;
@@ -395,7 +395,7 @@
 		return () => clearTimeout(runIndicatorTimer);
 	});
 
-	// Queued = submitted, waiting for the shared kernel to free. Deliberately a
+	// Queued = submitted, waiting for this notebook's kernel to free. Deliberately a
 	// *quieter* sibling of the running affordance (same `warning` hue, no pulse,
 	// no spinner): the eye should still land on the one cell that is executing.
 	// A run that starts before its queue event lands would otherwise show both.
@@ -1919,8 +1919,8 @@
 						<span class="flex items-center gap-1 text-[11px] text-warning" data-testid="running-indicator">
 							<span class="loading loading-spinner loading-xs"></span> running
 						</span>
-						<!-- Stop control: interrupts the one shared kernel (KeyboardInterrupt),
-						     which halts the currently-executing cell. Same handler as the
+						<!-- Stop control: interrupts this notebook's kernel (KeyboardInterrupt),
+						     which halts its currently-executing cell. Same handler as the
 						     Kernels sidebar's Interrupt button; shown only while running. -->
 						<button
 							class="btn btn-ghost btn-xs h-5 min-h-0 w-5 p-0 text-error hover:bg-error/10 hover:text-error"
@@ -1940,7 +1940,7 @@
 							class="flex items-center gap-1 text-[11px] text-base-content/70"
 							data-testid="queued-indicator"
 							data-queue-position={queuedPosition}
-							title={`Waiting for the shared kernel — ${queuedPosition === 1 ? 'next to run' : `${queuedPosition! - 1} run${queuedPosition === 2 ? '' : 's'} ahead`}`}
+							title={`Waiting for this notebook's kernel — ${queuedPosition === 1 ? 'next to run' : `${queuedPosition! - 1} run${queuedPosition === 2 ? '' : 's'} ahead`}`}
 						>
 							<!-- clock: waiting, not working -->
 							<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>

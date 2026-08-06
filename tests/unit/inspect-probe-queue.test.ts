@@ -26,6 +26,10 @@ vi.mock('../../src/lib/server/kernel', () => ({
 }));
 
 vi.mock('../../src/lib/server/notebook', () => ({
+	// kernel.ts resolves each notebook's declared code root through notebookRoot.ts,
+	// which reads it from here. None of these fixtures declares one, so every kernel
+	// starts at the workspace root — the unchanged single-root behavior.
+	getNotebookRoot: () => null,
 	getActiveNotebookPath: () => '/ws/nb.ipynb',
 	resolveNotebookPath: (nb?: string | null) => nb ?? '/ws/nb.ipynb'
 }));

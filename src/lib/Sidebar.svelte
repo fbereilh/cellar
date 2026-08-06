@@ -68,7 +68,7 @@
 		searchCache?: SearchCache;
 		foldedIds?: Set<string>;
 		foldCounts?: Record<string, number>;
-		/** The active notebook's currently-running cell (from the shared kernel), or null. */
+		/** The active notebook's currently-running cell (from its own kernel), or null. */
 		runningId?: string | null;
 		/** The active notebook's queued cells (id → global queue position). */
 		queued?: Record<string, number>;
@@ -769,7 +769,7 @@
 		</div>
 		<label
 			class="mx-2 mb-2 flex cursor-pointer items-center gap-2 border-t border-base-300 px-1 pt-2 text-[11px] text-base-content/60"
-			title="Add the workspace root to each kernel's Python path (sys.path), so a notebook in any subfolder can import project modules."
+			title="Add the notebook's project root to its kernel's Python path (sys.path), so a notebook in any subfolder can import project modules."
 		>
 			<input
 				type="checkbox"

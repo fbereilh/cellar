@@ -6,7 +6,8 @@
 #
 # It mounts the CURRENT directory as the workspace, publishes the app + MCP
 # ports, and (optionally) mounts your Databricks config read-only. Everything is
-# single-user local use — Cellar has one shared kernel and no auth.
+# single-user local use - Cellar has no auth, and one workspace and one Python
+# environment per instance.
 services:
   cellar:
     build:

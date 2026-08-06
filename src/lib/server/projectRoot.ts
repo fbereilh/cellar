@@ -4,9 +4,14 @@
  * A Jupyter kernel starts with the notebook's OWN directory on `sys.path`, but
  * not necessarily the workspace/project root, so a notebook in a subfolder can't
  * `import mypackage` (nor the `.py` module Cellar's nbdev-style export writes at
- * the root). Adding the workspace root fixes that. It is a per-workspace setting,
+ * the root). Adding that root fixes that. It is a per-workspace setting,
  * default ON, persisted in the UI-state store and honored at kernel-start time
  * (and applied live to running kernels on toggle) — see `kernel.ts`.
+ *
+ * WHICH root is per KERNEL, not per workspace: `kernel.ts` passes the directory
+ * that kernel's process was started at: the notebook's declared code root when
+ * it has one (`server/notebookRoot.ts`), else the workspace root, which is the
+ * default and what every notebook got before code roots existed.
  *
  * This module holds only the pure bits (no fs, no jupyter, no `$lib` server
  * imports) so they are cheap to unit-test: the setting predicate + the two

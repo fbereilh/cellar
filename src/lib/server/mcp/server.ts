@@ -419,6 +419,17 @@ Follow this house style:
        or restart just because a run is slow — that drops your own queued runs.
      - run_queue returns a per-notebook map ({working, notebooks:{path:{running,
        queue}}}) so you can see your own queue and whether other notebooks are busy.
+     - A notebook may declare a CODE ROOT: a directory inside the workspace
+       (normally a git worktree) its kernel runs in and imports from, so two
+       notebooks can run two checkouts of the same repo side by side. Most have
+       none and run at the workspace root — get_notebook_map reports yours as
+       "root" (null = the workspace), list_roots shows what is available, and
+       use_notebook(name, root) sets it — or use_notebook(root) alone re-roots the
+       notebook you already pinned — which frees that kernel, clearing its
+       namespace. Only the kernel's cwd and sys.path follow a root: the file tree,
+       git, checkpoints and the interpreter stay workspace-wide, so a file path you
+       read or write is still workspace-relative. Do not create roots yourself —
+       the user makes them.
 
 9. DATABRICKS: USE THE SESSION, DO NOT BUILD ONE. kernel_state and
    get_notebook_map carry a "databricks" block for YOUR working notebook (each
@@ -556,7 +567,24 @@ export function registerTools(server: McpServer) {
 	server.registerTool('kernel_status', { description: 'Status of YOUR working notebook\'s kernel and its live session: {started, session_id, execs_this_session}. execs_this_session:0 means no cell has run against this namespace yet, whatever the saved outputs suggest.', inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(svc.kernel.status(targetOf(extra, notebook))));
 	server.registerTool('run_queue', { description: 'The run queue as a per-notebook map: {working, notebooks:{"<path>":{running, queue}}}, where `working` is YOUR notebook\'s path. Each notebook has its OWN kernel running one cell at a time, so your run only ever queues behind YOUR notebook\'s cells — notebooks run in parallel. Each entry carries {nb, cellId, actor, position} (position 1 = next up); `running` is that notebook\'s executing cell or null, and a notebook with nothing running or queued is absent. Reads only; never boots a kernel.', inputSchema: {} }, async (_args, extra: ToolExtra) => text(svc.getRunQueue(extra?.sessionId)));
 	server.registerTool('list_notebooks', { description: 'List every .ipynb in the workspace (workspace-relative paths). Each entry is flagged `working` (THIS session\'s notebook — where your edits land) and `active` (the one the USER is looking at); the two differ whenever you pinned your own. Set yours with use_notebook.', inputSchema: {} }, async (_args, extra: ToolExtra) => text(svc.listNotebooks(extra?.sessionId)));
-	server.registerTool('use_notebook', { description: 'DECLARE this session\'s working notebook (a workspace .ipynb) — OPEN-OR-CREATE: opens the named notebook, or creates it if it does not exist (omit name for an untitled one). From then on your read/write/run tools default to it, independent of which tab the USER focuses and of what any OTHER agent is doing — and it does NOT steal the user\'s focus (the notebook is surfaced as an available tab). Call this FIRST when you start working, especially when several agents share one Cellar. Pass create_if_missing:false for open-only (error if it does not exist). To reach another notebook just once, pass that tool\'s `notebook` param instead.', inputSchema: { name: z.string().optional(), create_if_missing: z.boolean().optional() } }, async ({ name, create_if_missing }, extra: ToolExtra) => { try { return text(svc.useNotebook(extra?.sessionId, name, create_if_missing ?? true)); } catch (e) { return notFound(String((e as Error)?.message ?? e)); } });
+	server.registerTool('use_notebook', { description: 'DECLARE this session\'s working notebook (a workspace .ipynb) — OPEN-OR-CREATE: opens the named notebook, or creates it if it does not exist (omit name for an untitled one). From then on your read/write/run tools default to it, independent of which tab the USER focuses and of what any OTHER agent is doing — and it does NOT steal the user\'s focus (the notebook is surfaced as an available tab). Call this FIRST when you start working, especially when several agents share one Cellar. Pass create_if_missing:false for open-only (error if it does not exist). Optional `root`: a workspace-relative directory (see list_roots) this notebook\'s KERNEL runs in and imports from — use it to point a notebook at a specific checkout; "" clears it back to the workspace root. Omit it to leave the notebook\'s root alone. `root` WITHOUT `name` re-roots the notebook you already pinned (it never creates one). To reach another notebook just once, pass that tool\'s `notebook` param instead.', inputSchema: { name: z.string().optional(), create_if_missing: z.boolean().optional(), root: z.string().optional() } }, async ({ name, create_if_missing, root }, extra: ToolExtra) => {
+		try {
+			// A root is RESOLVED FIRST, before the notebook is opened/created and the
+			// session is pinned: those are irreversible by the time setNotebookRoot
+			// could throw, so a mistyped root used to leave a fresh untitled.ipynb
+			// pinned behind its own error.
+			if (root !== undefined) svc.assertRootUsable(root);
+			// `root` with no `name` means "re-root the notebook I am working in".
+			// Falling through to useNotebook's `untitled` default would silently
+			// repoint the session at a new notebook instead.
+			if (root !== undefined && !(name ?? '').trim()) return text(await svc.setRootOnWorkingNotebook(extra?.sessionId, root));
+			const opened = svc.useNotebook(extra?.sessionId, name, create_if_missing ?? true);
+			return text(root === undefined ? opened : { ...opened, ...(await svc.setNotebookRoot(root, opened.path)) });
+		} catch (e) {
+			return notFound(String((e as Error)?.message ?? e));
+		}
+	});
+	server.registerTool('list_roots', { description: 'List this workspace\'s CODE ROOTS: directories inside the workspace (normally git worktrees under `roots/`) that a notebook\'s kernel can be rooted at, each with the branch/commit checked out there and which notebooks point at it. A root changes only where a kernel runs and imports from — the file tree, git, checkpoints and the interpreter stay workspace-wide. Declare one with use_notebook(name, root). An empty list means every notebook runs at the workspace root.', inputSchema: {} }, async (_args, extra: ToolExtra) => text(await svc.listRoots(extra?.sessionId)));
 	server.registerTool('current_notebook', { description: 'Report THIS session\'s working notebook (where your edits land) and whether it is a genuine pin or the fallback to the user\'s active tab. When unpinned, your target follows the user\'s tab switches — call use_notebook to pin your own.', inputSchema: {} }, async (_args, extra: ToolExtra) => text(svc.currentNotebook(extra?.sessionId)));
 
 	// --- read ---

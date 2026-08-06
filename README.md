@@ -6,13 +6,13 @@
 
 **A Python notebook built for you and your AI agent to share.**
 
-Cellar runs an interactive notebook in your browser on one shared Jupyter kernel, with a first-class agent interface built in. Open a folder and both you and an AI agent (like Claude Code) work the *same* live notebook: the agent adds and runs cells, and the results stream into your browser in real time. No copy-paste, no context handoff, no drift.
+Cellar runs an interactive notebook in your browser on a live Jupyter kernel, with a first-class agent interface built in. Open a folder and both you and an AI agent (like Claude Code) work the *same* live notebook: the agent adds and runs cells, and the results stream into your browser in real time. No copy-paste, no context handoff, no drift.
 
 It saves ordinary `.ipynb` files that open in vanilla Jupyter, and it keeps them git-clean so your diffs stay meaningful.
 
 ![Cellar running a live analysis notebook: a markdown heading, Python cells, and an interactive DataFrame grid, with an outline and live variable inspector in the sidebar](docs/images/hero.png)
 
-<p align="center"><em>One live notebook, one shared kernel - markdown, code, and rich outputs, with an outline and live kernel inspector alongside. (Shown in the dark theme; a light theme ships too.)</em></p>
+<p align="center"><em>One live notebook on its own kernel - markdown, code, and rich outputs, with an outline and live kernel inspector alongside. (Shown in the dark theme; a light theme ships too.)</em></p>
 
 ## Why Cellar
 
@@ -92,7 +92,7 @@ Ran it with Docker instead? Nothing was installed on the host - `docker rmi cell
 
 ## Run with Docker
 
-Prefer to skip installing anything? If you have Docker, you have Cellar. This path needs **only Docker on the host** - no Node, Python, or `uv` - and bakes a **reproducible, pinned kernel environment** into the image so every run is identical. It's meant for single-user, reproducible, zero-prerequisite use: Cellar has one shared kernel and no auth, so it is **not** for multi-user hosting.
+Prefer to skip installing anything? If you have Docker, you have Cellar. This path needs **only Docker on the host** - no Node, Python, or `uv` - and bakes a **reproducible, pinned kernel environment** into the image so every run is identical. It's meant for single-user, reproducible, zero-prerequisite use: Cellar has no auth, and one workspace and one Python environment per instance, so it is **not** for multi-user hosting.
 
 Build the image once, then point it at any project folder:
 
@@ -168,7 +168,8 @@ Everything you'd expect from a notebook, plus the things that make sharing one w
 - **Git blame and diff gutters** right in the editor, and per-cell change bars in the notebook.
 - **Workspace files in tabs**: open any file from the sidebar to read or edit it with syntax highlighting. Markdown and `.html` also get a **Source/Preview** toggle, so a saved plotly, bokeh, or nbconvert export just renders - inside a sandboxed frame that cannot reach the app. An open file **follows the disk**: when an agent, a terminal command, or another editor rewrites it, the tab updates in place - editor and rendered preview both - keeping your cursor, scroll position, and undo history. Your unsaved edits are never overwritten: if you have any, the change waits behind a banner offering **Reload** or **Keep mine**, and a file deleted underneath you keeps its buffer so saving recreates it. (Files over 2 MB refresh when you switch back to the window rather than the moment they change; notebooks aren't covered yet.)
 - **Long notebooks stay fast**: only the cells near what you're looking at are kept in the page, so a several-hundred-cell notebook opens and scrolls like a short one. Find, the outline, running, and printing still reach every cell; **Settings → Windowed rendering** (or the **View** menu) turns it off if you'd rather have them all rendered at once.
-- One shared kernel across notebooks, with a sidebar showing what's actually loaded in memory.
+- **Code roots** - point a notebook's kernel at a directory inside your workspace instead of the workspace itself, so one Cellar can serve several checkouts of the same repo. Create a worktree (`git worktree add roots/pr-482 some-branch`), pick it in the **Code root** bar at the top of the notebook, and that notebook's kernel runs there and imports from there - handy for a review notebook you re-run against a branch to see which findings clear. Two notebooks on two roots run side by side, each importing its own copy. Changing a root restarts that notebook's kernel, so its variables are cleared. Only the kernel moves: files, git, checkpoints, and the Python environment stay workspace-wide, so a notebook that declares no root behaves exactly as before. (A `.py` notebook stores no notebook-level metadata, so it cannot hold a code root - it shows no picker, and a root set on one is refused rather than lost on the next reload; convert it to `.ipynb` first. Worktrees under `roots/` show up as untracked in the outer repo - add `roots/` to your `.gitignore` if that bothers you. Git decorations for files *inside* a root are not accurate yet, since they are read from the outer checkout.)
+- One kernel per notebook - isolated namespaces, notebooks running in parallel - with a sidebar showing what's actually loaded in memory.
 
 ![A pandas DataFrame rendered as Cellar's interactive grid, sorted by a column, with dtype headers, a filter box, and pagination](docs/images/dataframe-grid.png)
 
@@ -186,7 +187,7 @@ Cellar exposes an in-process **MCP server** that shares the live document and ke
 claude mcp add cellar -- cellar mcp
 ```
 
-(or just run `cellar` and let the auto-written `.mcp.json` do it). On connect, the agent gets a house-style doctrine that frames the work as building *one coherent notebook*, plus a rich tool set: read the notebook map and live kernel state, add/edit/move cells, run them, and clear their outputs (`add_and_run` is the preferred write-and-execute flow; `clear_outputs` sheds a stale figure or a huge traceback without deleting the cell). Because the MCP session is independent of the kernel connection, restarting the kernel never drops the agent's session or your document.
+(or just run `cellar` and let the auto-written `.mcp.json` do it). On connect, the agent gets a house-style doctrine that frames the work as building *one coherent notebook*, plus a rich tool set: read the notebook map and live kernel state, add/edit/move cells, run them, and clear their outputs (`add_and_run` is the preferred write-and-execute flow; `clear_outputs` sheds a stale figure or a huge traceback without deleting the cell). It can also see the workspace's **code roots** (`list_roots`, with the branch each one has checked out) and point its own notebook at one (`use_notebook(name, root)`), so you can ask an agent to run its notebook against a specific checkout. Because the MCP session is independent of the kernel connection, restarting the kernel never drops the agent's session or your document.
 
 **A harness that doesn't read `.mcp.json` gets set up too.** Codex reads a project `.codex/config.toml` and ignores `.mcp.json` entirely, so the first `cellar` run in a folder asks which other harnesses you use (and asks once more if a later Cellar learns to set up one it couldn't before). Any time after that:
 

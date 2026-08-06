@@ -9,7 +9,7 @@
 
 import type { KernelStatus, SessionId } from '$lib/server/types';
 
-/** A notebook whose state is loaded in the shared kernel session (from `/api/kernel`). */
+/** A notebook whose state is loaded in its own kernel session (from `/api/kernel`). */
 export interface LoadedNotebook {
 	path: string;
 	name: string;

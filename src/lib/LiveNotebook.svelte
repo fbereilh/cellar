@@ -18,6 +18,7 @@
 	} from '$lib/cellSelection';
 	import { exportCellCount } from '$lib/exportRole';
 	import { splitInheritedCellar } from '$lib/splitCell';
+	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { createSearchCache } from '$lib/search';
 	import type { SearchCache } from '$lib/search';
 	import { buildCellHighlights, type SearchHighlightState } from '$lib/searchHighlight';
@@ -90,7 +91,7 @@
 		onRegisterSearchCache?: (path: string, cache: SearchCache | null) => void;
 		onRunStart?: (path: string, id: string) => void;
 		onRunEnd?: () => void;
-		/** Interrupt the shared kernel (same handler the Kernels sidebar uses). */
+		/** Interrupt this notebook's kernel (same handler the Kernels sidebar uses). */
 		onInterruptKernel?: () => void;
 		/** (path, record|null): the focused cell's git blame, for the shell footer. */
 		onBlame?: (path: string, record: BlameLine | null) => void;
@@ -116,6 +117,7 @@
 		| { type: 'cell:rendered'; cellId: string }
 		| { type: 'cell:edited'; cellId: string; source: string }
 		| { type: 'notebook:export-target'; target: string | null }
+		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
 		| { type: 'notebook:hide-all-code'; hidden: boolean };
 
@@ -143,8 +145,8 @@
 	// Owns its own cell array + all cell operations (every request carries
 	// `nb: path` so it mutates *this* notebook's file, not the active one). The
 	// default workspace notebook and every opened `.ipynb` use this same
-	// component — one code path, one behavior. Runs go through the single shared
-	// kernel, which serializes them itself: a run requested while it is busy is
+	// component — one code path, one behavior. Runs go through this notebook's OWN
+	// kernel, which serializes its own cells: a run requested while it is busy is
 	// queued server-side (`run-queue.js`), so this component never gates a run.
 	// `gitRefresh` is the shell's `fsRefreshSignal`: a bump means the workspace's
 	// git state may have moved, so re-fetch the HEAD baseline the cells diff against.
@@ -194,6 +196,28 @@
 	// the notebook (Notebook.svelte) once either is set.
 	let exportTarget = $state<string | null>(null);
 	const exportCount = $derived(exportCellCount(cells));
+	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
+	// imports from (null = the workspace root, the default and today's behavior).
+	// Mirrors `notebook.metadata.cellar.root`, kept live via the `notebook:root` SSE
+	// event. `availableRoots` is the workspace's `roots/` directories, fetched on
+	// mount and whenever the root changes — when both are empty the notebook renders
+	// no root control at all, so a workspace that never adopts roots looks exactly
+	// as before. `isPy` is a `.py` text notebook, which stores no notebook metadata
+	// and therefore cannot hold a root at all (the server refuses one).
+	let root = $state<string | null>(null);
+	let isPy = $state(false);
+	let availableRoots = $state<WorkspaceRootOption[]>([]);
+	let rootBusy = $state(false);
+	let rootFeedback = $state('');
+	// Generation guard for the root list (the statusSeq / kernelReqSeq convention):
+	// a mount fetch and a `notebook:root` fetch are unordered, so only the NEWEST
+	// one may apply — an older reply landing last would restore a stale list, and
+	// with it a "missing on disk" banner for a root that has since come back.
+	let rootsSeq = 0;
+	let rootsFetched = false;
+	let rootFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+	/** How long the root bar keeps reporting the outcome of a root change. */
+	const ROOT_FEEDBACK_MS = 8000;
 	// Display-only automatic header numbering. `headerNumbering` mirrors
 	// `notebook.metadata.cellar.header_numbering` (loaded on mount, kept live via
 	// the `notebook:header-numbering` SSE event); the per-heading numbers are
@@ -241,12 +265,12 @@
 		onHideAllCodeChange?.(path, hideAllCode);
 	});
 	let runningId = $state<string | null>(null); // the cell running in THIS notebook (≤1)
-	// Cells of THIS notebook waiting in the kernel's global FIFO → their 1-based
-	// position in that queue (1 = next up). The positions are global on purpose:
-	// a cell queued here may be waiting behind a cell in another notebook, and
-	// "queued · 3" should say so. Mirrored from the server's `queue:changed`
-	// snapshot, never derived locally — the queue spans notebooks and tabs, so no
-	// single client can compute it.
+	// Cells of THIS notebook waiting in ITS kernel's FIFO → their 1-based
+	// position in that queue (1 = next up). Positions are per notebook: a cell
+	// only ever waits behind its own notebook's cells (notebooks run in
+	// parallel), so "queued · 3" means three of THIS notebook's runs are ahead of
+	// it. Mirrored from the server's `queue:changed` snapshot, never derived
+	// locally — the queue spans tabs and agents, so no single client can compute it.
 	let queued = $state<Record<string, number>>({});
 
 	// Live run requests this tab has in flight (or still held by the browser's
@@ -1352,6 +1376,17 @@
 			exportTarget = body.notebook.exportTarget ?? null; // nbdev export target
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
+			root = body.notebook.root ?? null; // code root (kernel cwd + sys.path)
+			isPy = !!body.notebook.isPy; // a `.py` text notebook holds no root at all
+			// ONCE, not on every load: `load()` is also the reconnect / seq-gap /
+			// output-append resync backstop, and the root list costs a git read per root
+			// on the process carrying the kernel websockets and the SSE fan-out. It only
+			// decides whether a picker is OFFERED, never what runs, and a genuine change
+			// arrives on `notebook:root`. Detached, so the cells render immediately.
+			if (!rootsFetched && !isPy) {
+				rootsFetched = true;
+				void loadRoots();
+			}
 			// A notebook always has a selected cell (command mode acts on it), so
 			// j/k and the rest work the moment the notebook opens. A refetch can also
 			// have removed cells out from under a multi-selection, so prune it to what
@@ -1388,6 +1423,13 @@
 	// edits (rather than a stale snapshot), and cells are only created once the
 	// real source is known — so each Cell's editor seeds with correct content.
 	onMount(load);
+
+	// The root-feedback line is the one timer this component owns outside a
+	// subscription; drop it with the notebook so a torn-down tab writes nothing.
+	onMount(() => () => {
+		if (rootFeedbackTimer) clearTimeout(rootFeedbackTimer);
+		rootFeedbackTimer = null;
+	});
 
 	// Live server→client sync. Subscribe to the shared per-tab event stream and
 	// apply run-lifecycle events that target THIS notebook, so an agent-driven run
@@ -1450,6 +1492,17 @@
 			}
 		} else if (ev.type === 'notebook:export-target') {
 			exportTarget = ev.target;
+		} else if (ev.type === 'notebook:root') {
+			// The code root changed in another tab or from an agent (this tab's own
+			// change is echo-suppressed by originId and refreshes the list itself). The
+			// picker follows; the kernel was already freed server-side, so the cells'
+			// run status refreshes through the `kernel:shutdown` event as usual. Any
+			// feedback about OUR last change is about the root someone else just moved,
+			// so it goes rather than staying to describe a state that no longer holds.
+			root = ev.root ?? null;
+			showRootFeedback('');
+			rootsFetched = true;
+			void loadRoots();
 		} else if (ev.type === 'notebook:header-numbering') {
 			headerNumbering = ev.levels ?? [];
 		} else if (ev.type === 'notebook:hide-all-code') {
@@ -1703,7 +1756,8 @@
 				pe.type?.startsWith('cell:') ||
 				pe.type === 'notebook:export-target' ||
 				pe.type === 'notebook:header-numbering' ||
-				pe.type === 'notebook:hide-all-code'
+				pe.type === 'notebook:hide-all-code' ||
+				pe.type === 'notebook:root'
 			)
 				applyStructuralEvent(pe as unknown as StructuralEvent);
 			else applyRunEvent(pe as unknown as RunEvent);
@@ -1736,9 +1790,10 @@
 	});
 
 	/**
-	 * Request a run. The single shared kernel runs one cell at a time app-wide,
-	 * but the serialization lives on the SERVER (`run-queue.js`): a run requested
-	 * while the kernel is busy waits its turn in a kernel-global FIFO instead of
+	 * Request a run. This notebook's own kernel runs one of its cells at a time
+	 * (other notebooks' kernels run in parallel), but the serialization lives on
+	 * the SERVER (`run-queue.js`): a run requested while this notebook's kernel is
+	 * busy waits its turn in that notebook's FIFO instead of
 	 * being dropped, and the `/run` response stream simply stays open across the
 	 * wait. So this function no longer gates on a busy flag — it POSTs, and the
 	 * server decides when the cell actually executes.
@@ -2069,6 +2124,79 @@
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ hidden: next, path, originId })
 		}).catch(() => {});
+	}
+
+	/**
+	 * Fetch the workspace's code roots (for the picker). Never throws: a failure
+	 * leaves the list as it was, and the notebook's OWN root — which is what
+	 * actually runs — comes from the notebook load, not from here.
+	 *
+	 * Generation-guarded: only the newest fetch may apply, so an older reply landing
+	 * last cannot restore a stale list (and with it a "missing on disk" banner for a
+	 * directory that has since been restored).
+	 */
+	async function loadRoots() {
+		const seq = ++rootsSeq;
+		try {
+			const res = await fetch(`/api/notebooks/root?path=${encodeURIComponent(path)}`);
+			const body = await res.json();
+			if (res.ok && seq === rootsSeq) availableRoots = body.roots ?? [];
+		} catch {
+			// Offline / route error: keep whatever the picker already had.
+		}
+	}
+
+	/**
+	 * The outcome of the last root change, shown beside the picker. Self-dismissing:
+	 * it describes ONE action at ONE moment, so leaving it in the bar indefinitely
+	 * would keep asserting it over a notebook the user has since moved on from.
+	 */
+	function showRootFeedback(msg: string) {
+		rootFeedback = msg;
+		if (rootFeedbackTimer) clearTimeout(rootFeedbackTimer);
+		rootFeedbackTimer = msg
+			? setTimeout(() => {
+					rootFeedback = '';
+					rootFeedbackTimer = null;
+				}, ROOT_FEEDBACK_MS)
+			: null;
+	}
+
+	/**
+	 * Declare (or clear, with '') this notebook's code root, then let the server's
+	 * answer settle the state — NOT optimistically, unlike the display settings
+	 * beside it: this one frees the kernel and can be REFUSED (a root that is not a
+	 * usable directory inside the workspace), so showing it as applied before the
+	 * server agrees would claim the notebook runs somewhere it does not.
+	 */
+	async function setRootValue(next: string) {
+		rootBusy = true;
+		showRootFeedback('');
+		try {
+			const res = await fetch('/api/notebooks/root', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ root: next, path, originId })
+			});
+			const body = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(body?.message || 'could not set the code root');
+			root = body.root ?? null;
+			// This tab suppresses its OWN `notebook:root` echo (originId), so nothing
+			// else refreshes the list — and it has just changed: a newly declared root
+			// gains a notebook, and one whose directory came back stops being "missing".
+			void loadRoots();
+			showRootFeedback(
+				!body.changed
+					? 'Already running there.'
+					: body.namespace_cleared
+						? 'Kernel freed — variables cleared; the next run starts in the new root.'
+						: 'Applied — the kernel will start in the new root.'
+			);
+		} catch (err) {
+			showRootFeedback(String((err as Error)?.message ?? err));
+		} finally {
+			rootBusy = false;
+		}
 	}
 
 	/**
@@ -3316,6 +3444,12 @@
 			exportCount={exportCount}
 			onSetExportTarget={setExportTargetValue}
 			onExportPy={exportPy}
+			root={root}
+			isPy={isPy}
+			availableRoots={availableRoots}
+			rootBusy={rootBusy}
+			rootFeedback={rootFeedback}
+			onSetRoot={setRootValue}
 			onSetScrolled={setScrolled}
 			hideAllCode={hideAllCode}
 			onSetHideInput={setHideInput}
