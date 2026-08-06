@@ -526,8 +526,8 @@ export async function gitRefAt(absDir: string): Promise<{ branch: string | null;
 
 /**
  * The commit an ARBITRARY directory inside the workspace has checked out —
- * branch, short/full SHA, subject, committer date, and whether that checkout is
- * dirty.
+ * branch, short/full SHA, subject, committer date, and whether it has uncommitted
+ * changes (scoped to that directory; see the pathspec at the status call below).
  *
  * Directory-scoped rather than workspace-scoped because a notebook's CODE ROOT is
  * normally a git worktree (`git worktree add roots/pr-482 <branch>`), i.e. a
@@ -573,7 +573,21 @@ export async function gitCommitAt(absDir: string): Promise<GitDirCommit> {
 		// One bit is all that is read, but git cannot short-circuit a status; this is
 		// the same cost class as the workspace `gitStatus()` that already runs on
 		// every focus, and the cache above is what keeps it to one per root.
-		runGit(absDir, ['status', '--porcelain=v1', '--untracked-files=normal', '-z'])
+		//
+		// `-- .` scopes the walk to the directory being probed (`runGit` already runs
+		// `git -C absDir`), so "dirty" uniformly means "uncommitted changes in the
+		// directory this kernel runs in", the same convention the file tree in this
+		// very sidebar follows. Without it, a workspace that is a SUBDIRECTORY of a
+		// larger repo lights this marker for changes elsewhere in that repo, so the
+		// panel says "uncommitted changes" beside a visibly clean tree. For a worktree
+		// root the pathspec is a NO-OP (a root IS its checkout), which is what makes
+		// this uniform rather than a special case.
+		//
+		// No `pre.prefix` strip here, unlike `runStatus()`/`parse()`: those must turn
+		// porcelain's repo-root-relative paths into workspace-relative KEYS for the
+		// file tree, while this reads only EMPTINESS and never looks at a path. Once
+		// the pathspec has scoped the walk, a strip would be dead code.
+		runGit(absDir, ['status', '--porcelain=v1', '--untracked-files=normal', '-z', '--', '.'])
 	]);
 
 	const value = buildDirCommit(sym, log, status);

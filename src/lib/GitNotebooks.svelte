@@ -45,6 +45,13 @@
 		root: string | null;
 		/** Why the declared root is unusable — the same refusal a run of it would raise. */
 		error: string | null;
+		/**
+		 * The notebook's DOCUMENT could not be read at all (deleted/renamed outside
+		 * Cellar with its tab still open), so nothing here knows what root it declares.
+		 * A different fact from an unusable root, and the reason the root chip is
+		 * withheld rather than defaulting to "workspace".
+		 */
+		unreadable?: boolean;
 		git: GitDirCommit | null;
 	}
 
@@ -178,18 +185,35 @@
 						</button>
 						<!-- A DECLARED root is a value the reader acts on, so it is legible; the
 						     "workspace" default is the absence of one, deliberately quiet, so a
-						     rooted notebook stands out in a list where most are not. -->
-						<span
-							class="flex max-w-[52%] shrink-0 items-center gap-1 text-[11px] {row?.root ? 'text-base-content/70' : 'text-base-content/35'}"
-							title={row?.root ? `Code root: ${row.root} — this notebook's kernel runs and imports from here` : 'No code root declared: the kernel runs at the workspace root'}
-							data-testid="git-root"
-						>
-							<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2z" /></svg>
-							<span class="truncate">{row?.root ?? 'workspace'}</span>
-						</span>
+						     rooted notebook stands out in a list where most are not. Withheld
+						     entirely when the document could not be read: there the absence of a
+						     root is unknown, not observed, and "workspace" would assert it. -->
+						{#if !row?.unreadable}
+							<span
+								class="flex max-w-[52%] shrink-0 items-center gap-1 text-[11px] {row?.root ? 'text-base-content/70' : 'text-base-content/35'}"
+								title={row?.root ? `Code root: ${row.root} — this notebook's kernel runs and imports from here` : 'No code root declared: the kernel runs at the workspace root'}
+								data-testid="git-root"
+							>
+								<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2z" /></svg>
+								<span class="truncate">{row?.root ?? 'workspace'}</span>
+							</span>
+						{/if}
 					</div>
 
-					{#if row?.error}
+					{#if row?.unreadable}
+						<!-- The document itself could not be read: deleted or renamed outside
+						     Cellar while its tab stayed open. Deliberately its OWN line rather
+						     than the root-refusal one above, which names a root this row does
+						     not have; there is no commit to report either, because we never
+						     learned which checkout this notebook runs from. Same icon-carries-
+						     the-hue treatment as the root refusal, for the same contrast reason. -->
+						<div class="mt-1 flex items-start gap-1.5" data-testid="git-notebook-error">
+							<svg class="mt-px h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+							<p class="text-[11px] leading-snug text-base-content/70">
+								This notebook could not be read, so its code root is unknown. It may have been deleted or moved outside Cellar.
+							</p>
+						</div>
+					{:else if row?.error}
 						<!-- A declared root that is not a usable directory. This is the state a
 						     RUN of this notebook is about to refuse, so it is reported, not hidden.
 						     The ICON carries the warning hue and the words stay `base-content`:

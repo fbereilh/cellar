@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -186,6 +186,35 @@ describe('gitCommitAt', () => {
 		invalidateGitStatusCache();
 
 		expect((await gitCommitAt(main)).dirty).toBe(true);
+	});
+
+	it('scopes dirty to the probed DIRECTORY, not the whole repo around it', async () => {
+		// `cd repo/analysis && cellar`: the workspace is a subdirectory of a larger
+		// repo. Unscoped, the row lit for uncommitted work anywhere in that repo,
+		// including paths the file tree in the same sidebar deliberately never shows,
+		// so the panel claimed "uncommitted changes" beside a visibly clean tree.
+		const repo = tempDir();
+		initRepo(repo);
+		mkdirSync(join(repo, 'analysis'), { recursive: true });
+		mkdirSync(join(repo, 'elsewhere'), { recursive: true });
+		writeFileSync(join(repo, 'analysis', 'a.txt'), 'hi');
+		writeFileSync(join(repo, 'elsewhere', 'b.txt'), 'hi');
+		commitAll(repo, 'c');
+		const sub = join(repo, 'analysis');
+		expect((await gitCommitAt(sub)).dirty).toBe(false);
+
+		// A change OUTSIDE the probed directory is not this directory's business...
+		writeFileSync(join(repo, 'elsewhere', 'b.txt'), 'changed elsewhere');
+		invalidateGitStatusCache();
+		expect((await gitCommitAt(sub)).dirty).toBe(false);
+		// ...while the repo as a whole genuinely is dirty, so the scoping is what
+		// separates them rather than the change simply not registering.
+		expect((await gitCommitAt(repo)).dirty).toBe(true);
+
+		// ...and a change INSIDE it still reports, so nothing was scoped away.
+		writeFileSync(join(sub, 'a.txt'), 'changed here');
+		invalidateGitStatusCache();
+		expect((await gitCommitAt(sub)).dirty).toBe(true);
 	});
 
 	it('reports a detached HEAD as detached, with no branch', async () => {

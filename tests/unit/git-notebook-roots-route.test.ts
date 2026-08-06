@@ -147,6 +147,32 @@ describe('GET /api/fs/git/roots', () => {
 		expect(row.error).toContain('roots/deleted-worktree');
 	});
 
+	it('reports an UNREADABLE notebook document on its own channel, claiming no root', async () => {
+		// A notebook deleted or renamed outside Cellar while its tab stayed open. With
+		// no document there is no declaration to read, so this must NOT ride the
+		// root-refusal `error` channel: the row renders `root ?? 'workspace'`, which
+		// would assert a root nothing here verified.
+		const row = (await get('never-existed.ipynb')).notebooks[0];
+
+		expect(row.unreadable).toBe(true);
+		expect(row.error).toBeNull();
+		expect(row.root).toBeNull();
+		expect(row.git).toBeNull();
+
+		// A REAL root refusal keeps the other channel, so the two stay distinguishable
+		// structurally rather than by matching message text.
+		const refused = (await get(notebookAt('gone-root.ipynb', 'roots/not-here'))).notebooks[0];
+		expect(refused.unreadable).toBe(false);
+		expect(refused.error).toContain('roots/not-here');
+	});
+
+	it('never leaks an absolute server path for an unreadable notebook', async () => {
+		// The only thing the throw knows is `notebook not found: <abs path>`; the
+		// client owns the wording precisely so that never rides to the browser.
+		const row = (await get('also-never-existed.ipynb')).notebooks[0];
+		expect(JSON.stringify(row)).not.toContain(WS);
+	});
+
 	it('reports the workspace HEAD even with no notebooks named', async () => {
 		const body = await get();
 		expect(body.notebooks).toEqual([]);

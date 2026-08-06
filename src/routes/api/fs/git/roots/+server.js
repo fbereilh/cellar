@@ -10,7 +10,7 @@ import { resolveRootDir } from '$lib/server/notebookRoot';
  * section's whole payload, in one round trip.
  *
  *   GET /api/fs/git/roots?path=a.ipynb&path=roots/x/b.ipynb
- *     → { workspace: <GitDirCommit>, notebooks: [{ path, root, dir, error, git }] }
+ *     → { workspace: <GitDirCommit>, notebooks: [{ path, root, error, unreadable, git }] }
  *
  * `path` repeats, one per open notebook tab; unknown/omitted is not an error, it
  * just yields an empty list (a workspace with no notebook open still reports its
@@ -28,6 +28,15 @@ import { resolveRootDir } from '$lib/server/notebookRoot';
  * A root that is a real directory but not a git checkout is not an error at all:
  * it answers `isRepo:false` and the section says "no commit info".
  *
+ * A notebook whose DOCUMENT cannot be read at all (deleted or renamed outside
+ * Cellar while its tab is still open) is a DIFFERENT fact and gets its own
+ * structural flag, `unreadable`, never the `error` channel above: with no document
+ * there is no declaration to report, so routing it through `error` left the row
+ * naming the workspace as the notebook's root, i.e. asserting a root it never
+ * verified. It carries no message, because the only thing the throw knows is an
+ * absolute server path, which has no business reaching the browser; the client
+ * owns the wording.
+ *
  * Probing is DEDUPED by directory: several notebooks reviewing one worktree cost
  * one probe, and `gitCommitAt`'s own cache collapses repeat requests on top.
  */
@@ -44,16 +53,20 @@ export async function GET({ url }) {
 		let declared = null;
 		try {
 			declared = getNotebookRoot(path);
-		} catch (err) {
-			return { path, root: null, dir: null, error: String(err?.message ?? err) };
+		} catch {
+			// The DOCUMENT is gone/unreadable, so nothing here knows what root it
+			// declares. Reported as its own fact rather than as a root refusal — see
+			// the header — and deliberately without the thrown message, which is an
+			// absolute server path.
+			return { path, root: null, dir: null, error: null, unreadable: true };
 		}
 		try {
 			// Throws (NotebookRootError) for a declared root that is not a usable
 			// directory inside the workspace; null means "the workspace root".
 			const resolved = resolveRootDir(declared);
-			return { path, root: resolved?.rel ?? null, dir: resolved?.dir ?? ws, error: null };
+			return { path, root: resolved?.rel ?? null, dir: resolved?.dir ?? ws, error: null, unreadable: false };
 		} catch (err) {
-			return { path, root: declared, dir: null, error: String(err?.message ?? err) };
+			return { path, root: declared, dir: null, error: String(err?.message ?? err), unreadable: false };
 		}
 	});
 
@@ -69,6 +82,7 @@ export async function GET({ url }) {
 			path: t.path,
 			root: t.root,
 			error: t.error,
+			unreadable: t.unreadable,
 			git: t.dir ? commits.get(t.dir) : null
 		}))
 	});
