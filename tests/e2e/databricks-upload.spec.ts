@@ -414,6 +414,24 @@ test('an expired profile sign-in surfaces the exact re-auth command, not a bare 
 	);
 });
 
+const PREFIX_KEY = 'cellar-databricks-upload-prefix';
+const POSTFIX_KEY = 'cellar-databricks-upload-postfix';
+
+/**
+ * The affixes as the SERVER store actually holds them.
+ *
+ * The browser's write is DEBOUNCED, and it is the server copy - not the field - that
+ * a reload reads back, so every assertion about persistence has to poll this rather
+ * than sleep past the debounce: a fixed wait followed by `page.reload()` can abort
+ * the (non-keepalive) PUT still in flight, leaving the test resting on a localhost
+ * timing margin. `/api/ui-state` is untouched by this file's route mocks.
+ */
+async function storedAffixes(page: Page): Promise<Record<string, unknown>> {
+	const res = await page.request.get(`${baseURL}/api/ui-state`);
+	const store = (await res.json()) as Record<string, unknown>;
+	return { prefix: store[PREFIX_KEY], postfix: store[POSTFIX_KEY] };
+}
+
 /**
  * The affix fields persist per PROJECT (the server-side `.cellar/` store), and every
  * test in this file shares one workspace - so anything typed here would follow the
@@ -423,8 +441,11 @@ async function clearAffixes(page: Page): Promise<void> {
 	await page.getByTestId('databricks-upload-prefix').fill('');
 	await page.getByTestId('databricks-upload-postfix').fill('');
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('notebook');
-	// The write is debounced; give it the flush before the page goes away.
-	await page.waitForTimeout(500);
+	// Cleared to the SERVER's satisfaction, not merely on screen: an empty affix is
+	// persisted as a deletion, and the next test reads the store, not this page.
+	await expect
+		.poll(() => storedAffixes(page))
+		.toEqual({ prefix: undefined, postfix: undefined });
 }
 
 /** Today, local - the same clock the browser expands `{YYYY-MM-DD}` against. */
@@ -483,7 +504,9 @@ test('the last-used prefix/postfix survive a reload', async ({ page }) => {
 	await page.getByTestId('databricks-upload-prefix').fill('daily_');
 	await page.getByTestId('databricks-upload-postfix').fill('_v2');
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('daily_notebook_v2');
-	await page.waitForTimeout(500); // the store write is debounced
+	// Wait for the debounced write to LAND, not for a wall-clock guess: reloading with
+	// the PUT still in flight would abort it and lose the very thing under test.
+	await expect.poll(() => storedAffixes(page)).toEqual({ prefix: 'daily_', postfix: '_v2' });
 
 	await page.reload();
 	await openNotebook(page);
@@ -493,6 +516,43 @@ test('the last-used prefix/postfix survive a reload', async ({ page }) => {
 	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('daily_');
 	await expect(page.getByTestId('databricks-upload-postfix')).toHaveValue('_v2');
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('daily_notebook_v2');
+
+	await clearAffixes(page);
+});
+
+test('a panel left open across midnight previews the NEW day, not the one it opened on', async ({ page }) => {
+	await mockDatabricksStatus(page, connectedStatus);
+	await mockDatabricksClusters(page);
+	const seen = await mockUpload(page, (body) => {
+		const path = `/Users/${USER}/${String(body.prefix ?? '')}notebook`;
+		return { status: 200, json: { ok: true, status: 'uploaded', path, url: null, overwritten: false } };
+	});
+
+	// `setFixedTime` pins what the page reads as "now" while leaving every timer
+	// running, so the app behaves normally - only the date moves.
+	await page.clock.setFixedTime(new Date(2026, 7, 5, 23, 59));
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+	await openDatabricksSection(page);
+
+	await page.getByTestId('databricks-upload-prefix').fill('{YYYY-MM-DD}_');
+	const preview = page.getByTestId('databricks-upload-preview');
+	await expect(preview).toHaveText('2026-08-05_notebook');
+
+	// The laptop slept through the rollover, so no timer ever fired - the panel learns
+	// of the new day only when the window comes back. That wake path is the one that
+	// matters, which is why it is what this asserts.
+	await page.clock.setFixedTime(new Date(2026, 7, 6, 8, 30));
+	await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+	await expect(preview).toHaveText('2026-08-06_notebook');
+
+	// And the promise is kept: the click sends the date the preview is showing, not
+	// the one it was opened on. A frozen preview would have promised 08-05 here.
+	await page.getByTestId('databricks-upload').click();
+	expect(seen).toHaveLength(1);
+	expect(seen[0].prefix).toBe('2026-08-06_');
+	await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/2026-08-06_notebook`);
 
 	await clearAffixes(page);
 });

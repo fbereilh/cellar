@@ -27,7 +27,7 @@
 		reauthDetail,
 		reauthExplanation
 	} from '$lib/databricksReauth';
-	import { UPLOAD_DATE_TOKENS, resolveUploadName } from '$lib/databricksUploadName';
+	import { UPLOAD_DATE_TOKENS, expandDateTokens, resolveUploadName } from '$lib/databricksUploadName';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -189,13 +189,22 @@
 		/** Called after a successful connect/disconnect/reconnect so the shell refreshes its kernel + variables. */
 		onSessionChange = null,
 		/** Restart the active notebook's kernel - used to apply the Databricks-runtime toggle. */
-		onRestartKernel = null
+		onRestartKernel = null,
+		/**
+		 * Whether the sidebar section is EXPANDED right now. The panel stays MOUNTED
+		 * when it is collapsed (so the connection, the cluster list and a half-expanded
+		 * catalog tree survive a fold), so this prop is the only thing that can tell it
+		 * not to spend work on something nobody can see - today, the upload preview's
+		 * clock. Defaults to true so a standalone mount behaves as if it were open.
+		 */
+		visible = true
 	}: {
 		notebookPath?: string | null;
 		kernelSessionId?: SessionId | null;
 		onInsertAndRun?: ((source: string) => void) | null;
 		onSessionChange?: (() => void) | null;
 		onRestartKernel?: ((path: string) => void | Promise<void>) | null;
+		visible?: boolean;
 	} = $props();
 
 	/** Let the section header's refresh button re-read status (bind:this in Sidebar). */
@@ -986,6 +995,43 @@
 	 */
 	let uploadExistsAffixes: { prefix: string; postfix: string } | null = null;
 
+	/**
+	 * The clock the PREVIEW resolves its date tokens against.
+	 *
+	 * It has to be reactive state, not a `new Date()` inside the derived: that one is
+	 * captured whenever a dependency last changed and then never moves, so a panel
+	 * left open across a date boundary previewed yesterday's name while the click
+	 * (which resolves fresh, and must - the user uploading today wants today's date)
+	 * sent today's. Preview == upload is the entire point of showing a preview, so the
+	 * preview is what has to catch up.
+	 *
+	 * Refreshed on a coarse tick AND on wake, and the wake half is the one that
+	 * matters: a laptop is far more often asleep across midnight than awake, and a
+	 * suspended machine fires no timers. The tick only has to notice a date rollover,
+	 * so a minute is ample; the tokens carry no time of day, so nothing finer is
+	 * observable. Armed only while the section is EXPANDED (the panel stays mounted
+	 * when it is folded away) and torn down with the component.
+	 */
+	const UPLOAD_CLOCK_TICK_MS = 60_000;
+	let uploadNow = $state(new Date());
+	$effect(() => {
+		if (!visible) return;
+		// Catch up FIRST: reopening the section (or returning to the tab) is exactly the
+		// moment the held value is most likely to be from another day.
+		const wake = () => {
+			uploadNow = new Date();
+		};
+		wake();
+		const tick = setInterval(wake, UPLOAD_CLOCK_TICK_MS);
+		window.addEventListener('focus', wake);
+		document.addEventListener('visibilitychange', wake);
+		return () => {
+			clearInterval(tick);
+			window.removeEventListener('focus', wake);
+			document.removeEventListener('visibilitychange', wake);
+		};
+	});
+
 	/** The open notebook's file name - what the workspace name is built from. */
 	const uploadFileName = $derived(notebookPath ? (notebookPath.split(/[\\/]/).pop() ?? '') : '');
 	/**
@@ -995,14 +1041,25 @@
 	 * whether a name is actually shown.
 	 */
 	const uploadResolved = $derived(
-		resolveUploadName(uploadFileName || 'notebook', { prefix: uploadPrefix, postfix: uploadPostfix })
+		resolveUploadName(
+			uploadFileName || 'notebook',
+			{ prefix: uploadPrefix, postfix: uploadPostfix },
+			uploadNow
+		)
 	);
 	/** The final name to show before the click, or '' when the notebook is unnamed. */
 	const uploadPreview = $derived(uploadFileName ? uploadResolved.name : '');
 	/** Why the affixes cannot be used, or ''. Blocks the button rather than repairing them. */
 	const uploadNameError = $derived(uploadResolved.error ?? '');
-	/** The token vocabulary, for the fields' tooltip - built from the module's own list. */
-	const uploadTokenHelp = `Date tokens: ${UPLOAD_DATE_TOKENS.map((t) => `${t.token} → ${t.example}`).join(', ')}. Anything else in braces stays literal.`;
+	/**
+	 * The token vocabulary, for the fields' tooltip. Each example is the token's REAL
+	 * expansion against the same clock the preview uses, never a stored string - a
+	 * literal example goes stale on the next New Year and then advertises a date the
+	 * expander would never produce.
+	 */
+	const uploadTokenHelp = $derived(
+		`Date tokens: ${UPLOAD_DATE_TOKENS.map((t) => `${t} → ${expandDateTokens(t, uploadNow)}`).join(', ')}. Anything else in braces stays literal.`
+	);
 
 	/**
 	 * The generation guard for an upload, the same shape as `statusSeq` above and

@@ -50,11 +50,18 @@ describe('date tokens', () => {
 		expect(expandDateTokens('{MM}-{DD}', PADDED)).toBe('03-09');
 	});
 
-	it('every token the UI advertises really expands, to the example it advertises', () => {
-		// The tooltip is built from this list, so a token documented but not handled
-		// would be offered to the user and then land literally in their notebook name.
-		for (const { token, example } of UPLOAD_DATE_TOKENS) {
-			expect(expandDateTokens(token, DAY)).toBe(example);
+	it('every token the UI advertises is one the expander really handles', () => {
+		// The tooltip renders `<token> → expandDateTokens(<token>)`, so its examples can
+		// no longer go stale by construction (a stored `2026` would still be advertised
+		// years later). What that leaves worth pinning is the vocabulary itself: a token
+		// offered here but not handled would be shown to the user as if it worked and
+		// then land LITERALLY in their notebook name.
+		for (const token of UPLOAD_DATE_TOKENS) {
+			const shown = expandDateTokens(token, DAY);
+			expect(shown).not.toBe(token);
+			// …and the tooltip's example is the same expansion the NAME is built from,
+			// not a second clock that could disagree with it.
+			expect(resolveUploadName('analysis.ipynb', { prefix: token }, DAY).prefix).toBe(shown);
 		}
 	});
 
@@ -181,12 +188,29 @@ describe('an affix can never move the upload out of /Users/<you>/', () => {
 		});
 	}
 
-	it('refuses an affix that would leave the whole name `.` or `..`', () => {
-		// No separator, so nothing traverses - but the SEGMENT itself would be the home
-		// folder or its parent, which is not a notebook the user asked to create.
+	it('refuses a notebook with NO stem even when an affix would fill the name out', () => {
+		// `.ipynb` leaves an empty stem, so there is no notebook name to affix around -
+		// and an affix must not be allowed to stand in for one, or the workspace would
+		// receive a notebook called nothing but the user's naming pattern.
+		//
+		// The remedy is the FILENAME's, not the affix's, which is what the assertion
+		// pins: this goes through the stem check, NOT the post-assembly one (that branch
+		// is unreachable - see `resolveUploadName`), and a bare `toBeTruthy()` could not
+		// tell the two apart, so it would keep passing if the stem check ever went away.
 		const out = resolveUploadName('.ipynb', { prefix: '..' }, DAY);
 		expect(out.name).toBe('');
-		expect(out.error).toBeTruthy();
+		expect(out.error).toContain('Rename the file');
+		expect(out.error).not.toContain('prefix');
+	});
+
+	it('refuses a notebook whose whole stem is `..`, which would name the parent folder', () => {
+		// `...ipynb` strips to `..`: no separator, so nothing traverses - but the SEGMENT
+		// itself would be the home folder's parent, which is not a notebook the user
+		// asked to create. Again the stem, not the assembled name.
+		expect(notebookStem('...ipynb')).toBe('..');
+		const out = resolveUploadName('...ipynb', {}, DAY);
+		expect(out.name).toBe('');
+		expect(out.error).toContain('Rename the file');
 	});
 
 	it('allows a leading dot, which traverses nowhere', () => {

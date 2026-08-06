@@ -28,10 +28,12 @@
  * the preview and fixable, while silently dropping it would produce a name the
  * user never asked for and cannot see the cause of.
  *
- * **Expansion is idempotent**, which is what keeps the preview honest across the
- * client/server hop: the browser expands at click time and sends literal text, so
- * the server's own expansion finds no tokens left and changes nothing - not even
- * across midnight.
+ * **Expansion is idempotent**, which is what makes the CLIENT/SERVER hop exact:
+ * the browser expands at click time and sends literal text, so the server's own
+ * expansion finds no tokens left and changes nothing. That covers the hop alone -
+ * keeping the PREVIEW itself in step with the day is the browser's job (it
+ * re-resolves against a clock that ticks while the panel is open), because nothing
+ * here can know when the date the caller passed stopped being today.
  *
  * Browser-safe by construction: no imports, pure string work.
  */
@@ -58,13 +60,20 @@ const BRACED = /\{[^{}]*\}/g;
  */
 const FORBIDDEN = /[\u0000-\u001f\u007f/\\]/;
 
-/** The tokens an affix may carry, in the order the UI should list them. */
-export const UPLOAD_DATE_TOKENS: readonly { token: string; example: string }[] = [
-	{ token: '{YYYY-MM-DD}', example: '2026-08-05' },
-	{ token: '{YYYYMMDD}', example: '20260805' },
-	{ token: '{YYYY}', example: '2026' },
-	{ token: '{MM}', example: '08' },
-	{ token: '{DD}', example: '05' }
+/**
+ * The tokens an affix may carry, in the order the UI should list them.
+ *
+ * Deliberately the tokens ALONE: the UI shows each one beside its expansion, and
+ * that example is produced by running `expandDateTokens` on it rather than stored
+ * here, so the vocabulary it advertises cannot drift from what the expander does
+ * (a literal example would have gone on claiming `{YYYY} → 2026` for years).
+ */
+export const UPLOAD_DATE_TOKENS: readonly string[] = [
+	'{YYYY-MM-DD}',
+	'{YYYYMMDD}',
+	'{YYYY}',
+	'{MM}',
+	'{DD}'
 ];
 
 /** Two digits, zero-padded - `{MM}` of March is `03`, never `3`. */
@@ -178,6 +187,14 @@ export function resolveUploadName(
 	// invisible in the UI and impossible to type back. With no affixes this is the
 	// already-trimmed stem, so the no-affix upload is unchanged.
 	const name = `${prefix}${stem}${postfix}`.trim();
+	// Defence in depth, and NOT reachable through the call order above: the stem has
+	// already been proven non-empty, trimmed, neither `.` nor `..` and forbidden-free,
+	// and both affixes have already been FORBIDDEN-checked, so their concatenation
+	// cannot be any of those things either. It stays because the guarantee is an
+	// emergent property of that order rather than of this line - reordering the checks,
+	// or adding a THIRD source of text to the name, would otherwise let an unusable
+	// name reach the workspace silently. Every refusal a caller can actually trigger is
+	// raised above this, with a message naming the field they can fix.
 	if (nameProblem(name)) {
 		return {
 			name: '',

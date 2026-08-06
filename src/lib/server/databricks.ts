@@ -3610,9 +3610,9 @@ export async function previewTable({
  * the upload out of the user's own folder, and is refused rather than repaired.
  *
  * Date tokens are expanded HERE too, not only in the browser. Expansion is
- * idempotent, so a client that already expanded them (which is what makes its
- * preview exact, even across midnight) is unaffected, while a caller that posts
- * the tokens raw still gets them.
+ * idempotent, so a client that already expanded them - which is what makes the
+ * client/server hop exact, whatever this process thinks the date is - is
+ * unaffected, while a caller that posts the tokens raw still gets them.
  */
 function workspaceNotebookName(fileName: string, affixes: UploadNameAffixes): string {
 	const resolved = resolveUploadName(fileName, affixes);
