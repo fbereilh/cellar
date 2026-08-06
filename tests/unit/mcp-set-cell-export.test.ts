@@ -20,7 +20,7 @@
  * kernel or the python dataflow subprocess.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -546,6 +546,75 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 		expect(nbmod.getExportTarget(target)).toBe(null);
 		expect(() => nbmod.setExportTarget('/etc/passwd.py', target)).toThrow(/escapes workspace/);
 		expect(nbmod.getExportTarget(target)).toBe(null);
+	});
+
+	/**
+	 * The exporter WRITES to this path, and this tool is what completes the chain: an
+	 * agent could name any workspace file and then mark a cell, destroying it in one
+	 * turn. The field is documented as the nbdev module path, so refusing a non-`.py`
+	 * one rejects nothing legitimate.
+	 */
+	it('refuses a target that is not a .py module', async () => {
+		const { target, code } = await makeNotebook('target-not-py.ipynb');
+		writeFileSync(join(WS, 'precious.ts'), 'export const keep = 1;\n');
+
+		const r = svc.setExportTarget('precious.ts', target);
+		expect('invalid' in r && r.ok).toBe(false);
+		expect('invalid' in r ? r.invalid : '').toMatch(/not a \.py file/);
+		expect(nbmod.getExportTarget(target)).toBe(null);
+
+		// And the chain the refusal breaks: marking a cell cannot reach that file.
+		svc.setCellExport([code[0]], true, target);
+		expect(readFileSync(join(WS, 'precious.ts'), 'utf8')).toBe('export const keep = 1;\n');
+	});
+
+	/**
+	 * The second half of that guard, for the path that never passes the setter: a
+	 * `#|default_exp` directive resolves straight to a target, and a `.py` path may
+	 * perfectly well be a hand-written module. Every generated module opens with the
+	 * header, so a file without one is not ours to replace.
+	 */
+	it('refuses to overwrite a .py file it did not generate, and reports why', async () => {
+		const { target, code } = await makeNotebook('target-clobber.ipynb');
+		const handwritten = 'def precious():\n    return "do not lose me"\n';
+		writeFileSync(join(WS, 'handwritten.py'), handwritten);
+		svc.setExportTarget('handwritten.py', target);
+
+		const r = svc.setCellExport([code[0]], true, target);
+		expect(readFileSync(join(WS, 'handwritten.py'), 'utf8')).toBe(handwritten);
+		expect(r).toMatchObject({ ok: true, export_target: 'handwritten.py' });
+		expect(r.ok ? r.module : null).toMatchObject({ regenerated: false });
+		expect(r.ok ? r.module?.reason : '').toMatch(/refusing to overwrite/);
+		// The manual button surfaces the same refusal directly rather than swallowing it.
+		expect(() => nbmod.exportPy(target)).toThrow(/refusing to overwrite/);
+		// A module Cellar DID generate is still rewritten in place.
+		svc.setExportTarget('lib/ours.py', target);
+		expect(readFileSync(join(WS, 'lib/ours.py'), 'utf8')).toContain('def one():');
+		svc.setCellExport([code[1]], true, target);
+		expect(readFileSync(join(WS, 'lib/ours.py'), 'utf8')).toContain('def two():');
+	});
+
+	/**
+	 * `exportPy` writes without going through `persist`, so it never refreshed the
+	 * record `autoExportPy` keeps. Left standing, a failure the user then FIXED and
+	 * resolved with the manual button was still reported by the next idempotent
+	 * `set_cell_export` - which skips the persist that would have cleared it.
+	 */
+	it('a successful manual export clears a recorded failure', async () => {
+		const { target, code } = await makeNotebook('manual-clears.ipynb');
+		writeFileSync(join(WS, 'blocked4'), 'not a directory\n');
+		svc.setExportTarget('blocked4/mod.py', target);
+		expect(svc.setCellExport([code[0]], true, target).ok && nbmod.lastExportError(target)).toBeTruthy();
+
+		// The user clears the obstruction on disk and clicks "Export to .py". No
+		// persist runs, so only this path can bring the record back in step.
+		unlinkSync(join(WS, 'blocked4'));
+		expect(nbmod.exportPy(target)).toMatchObject({ written: true });
+		expect(nbmod.lastExportError(target)).toBe(null);
+		// An idempotent call (already marked) persists nothing, so it can only read
+		// the record back - and it must no longer claim a failure that is over.
+		const again = svc.setCellExport([code[0]], true, target);
+		expect(again.ok && 'module' in again).toBe(false);
 	});
 });
 

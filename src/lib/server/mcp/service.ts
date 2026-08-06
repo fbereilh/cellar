@@ -1571,7 +1571,9 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * `setExportTargetDoc` validates through the exporter's own `resolveInWorkspace`,
  * because `autoExportPy` is best-effort, so such a target would otherwise sit in
  * the metadata generating nothing on every later save while this call reported it
- * set. It shares `moduleFailure` with `setCellExport` for the same reason - this
+ * set. A path that is not a `.py` module is refused the same way and for a sharper
+ * reason: the exporter WRITES to it, so an ordinary source file named here would be
+ * overwritten the moment a cell is marked. It shares `moduleFailure` with `setCellExport` for the same reason - this
  * call regenerates too, so a write that THREW must not read as one that landed.
  * Only that half: "no cell is marked" is the normal state right after naming a
  * target, so warning about it here would restate the caller's own step.

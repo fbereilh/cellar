@@ -1350,6 +1350,7 @@
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
 			exportTarget = body.notebook.exportTarget ?? null; // nbdev export target
+			confirmedExportTarget = exportTarget; // the revert baseline: what the server holds
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			// A notebook always has a selected cell (command mode acts on it), so
@@ -1450,6 +1451,7 @@
 			}
 		} else if (ev.type === 'notebook:export-target') {
 			exportTarget = ev.target;
+			confirmedExportTarget = ev.target;
 		} else if (ev.type === 'notebook:header-numbering') {
 			headerNumbering = ev.levels ?? [];
 		} else if (ev.type === 'notebook:hide-all-code') {
@@ -2072,18 +2074,26 @@
 	}
 
 	/**
-	 * Generation guard for the optimistic export-target write. The input fires one
-	 * request per keystroke, so responses are unordered: a refusal resolving after a
-	 * newer write must neither revert that newer value nor speak for it.
+	 * Generation guard for the optimistic export-target write. Responses are
+	 * unordered, so a refusal resolving after a newer write must neither revert that
+	 * newer value nor speak for it.
 	 */
 	let exportTargetSeq = 0;
+	let exportTargetTimer: ReturnType<typeof setTimeout> | undefined;
+	/**
+	 * The last value the SERVER confirmed - what a refusal reverts to. The previous
+	 * OPTIMISTIC value is the wrong baseline: under consecutive refusals it was
+	 * itself never stored, so the input settled on a path the server had rejected,
+	 * i.e. the very state the revert exists to prevent.
+	 */
+	let confirmedExportTarget: string | null = null;
 
 	/**
 	 * Set (or clear) the notebook's `.py` export target. Optimistic + persisted, and
 	 * REVERTED when the server refuses.
 	 *
-	 * The route has two refusals - a `.py` text notebook (which stores no cellar
-	 * metadata) and a target escaping the workspace - and it emits
+	 * The route refuses a `.py` text notebook (which stores no cellar metadata), a
+	 * target escaping the workspace and one that is not a `.py` module, and it emits
 	 * `notebook:export-target` only on success, which this tab would echo-suppress
 	 * anyway. So without reading the response the input kept showing a rejected path
 	 * and the export bar read as configured over metadata holding nothing, reverting
@@ -2091,18 +2101,35 @@
 	 * failure those refusals were added to prevent, one layer up. The reason goes to
 	 * the shell's existing transient notice channel, like every other refused write
 	 * here - a refusal with no surface is indistinguishable from a dead control.
+	 *
+	 * The POST is DEBOUNCED like the editor's own source autosave, because the input
+	 * fires one per keystroke and its DOM value is state-driven: undebounced, typing
+	 * a path the server refuses made EVERY keystroke 400, revert the field, move the
+	 * caret and raise another notice. A refusal is only acted on while the value it
+	 * refused is still the one in the field, so a prefix the user is typing through
+	 * never yanks the caret either.
 	 */
-	async function setExportTargetValue(target: string) {
-		const previous = exportTarget;
+	function setExportTargetValue(target: string) {
+		const next = target.trim() || null;
+		exportTarget = next;
 		const seq = ++exportTargetSeq;
-		exportTarget = target.trim() || null;
+		clearTimeout(exportTargetTimer);
+		exportTargetTimer = setTimeout(() => void commitExportTarget(target, next, seq), 500);
+	}
+
+	async function commitExportTarget(raw: string, next: string | null, seq: number) {
 		const res = await fetch('/api/notebooks/export-py', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ op: 'set-target', target, path, originId })
+			body: JSON.stringify({ op: 'set-target', target: raw, path, originId })
 		}).catch(() => null);
-		if (!res || res.ok || seq !== exportTargetSeq) return;
-		exportTarget = previous;
+		if (seq !== exportTargetSeq) return; // a newer write owns the field
+		if (res?.ok) {
+			confirmedExportTarget = next;
+			return;
+		}
+		if (!res || exportTarget !== next) return; // no refusal, or the field moved on
+		exportTarget = confirmedExportTarget;
 		const message = await res
 			.json()
 			.then((body) => body?.message)

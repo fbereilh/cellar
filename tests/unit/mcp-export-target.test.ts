@@ -213,6 +213,23 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 		expect(nbmod.getExportTarget(target)).toBe(null);
 		expect(py.writes).toEqual([]);
 	});
+
+	it('the UI route also refuses a target that is not a .py module', async () => {
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const nb = svc.targetFor('sessRoutePy');
+		// The exporter WRITES to this path, so an ordinary source file named here would
+		// be overwritten the moment a cell is marked - the human's input reaches the
+		// same setter an agent does, so it takes the same refusal.
+		await expect(
+			(POST as unknown as (e: { request: Request }) => Promise<Response>)({
+				request: new Request('http://x/api/notebooks/export-py', {
+					method: 'POST',
+					body: JSON.stringify({ op: 'set-target', target: 'src/app.ts' })
+				})
+			})
+		).rejects.toMatchObject({ status: 400 });
+		expect(nbmod.getExportTarget(nb)).toBe(null);
+	});
 });
 
 describe('the client half of that refusal (source guard)', () => {
@@ -221,7 +238,7 @@ describe('the client half of that refusal (source guard)', () => {
 	// the human sees, so they are pinned against the source instead.
 	const src = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
 	const fn = src.slice(
-		src.indexOf('async function setExportTargetValue'),
+		src.indexOf('function setExportTargetValue'),
 		src.indexOf('async function setNumberingLevel')
 	);
 
@@ -230,17 +247,32 @@ describe('the client half of that refusal (source guard)', () => {
 		// A swallowing `.catch(() => {})` with no `res.ok` read is the regression: the
 		// input keeps a rejected path while the metadata holds nothing.
 		expect(fn).not.toMatch(/\.catch\(\(\)\s*=>\s*\{\}\)/);
-		expect(fn).toMatch(/const previous = exportTarget/);
-		expect(fn).toMatch(/res\.ok/);
-		expect(fn).toMatch(/exportTarget = previous/);
+		expect(fn).toMatch(/res\?\.ok/);
+		expect(fn).toMatch(/exportTarget = confirmedExportTarget/);
 		expect(fn).toMatch(/onNotice\?\./);
 	});
 
-	it('guards the revert against a newer write (one request per keystroke)', () => {
+	it('guards the revert against a newer write, and against the field moving on', () => {
 		// Responses are unordered, so a refusal resolving after a newer write must
-		// neither revert that newer value nor speak for it.
+		// neither revert that newer value nor speak for it - and a refusal for a value
+		// the field no longer holds must not yank the caret back either.
 		expect(fn).toMatch(/const seq = \+\+exportTargetSeq/);
 		expect(fn).toMatch(/seq !== exportTargetSeq/);
+		expect(fn).toMatch(/exportTarget !== next/);
+	});
+
+	it('debounces the write and reverts to the SERVER-confirmed value', () => {
+		// The input fires one request per keystroke and its DOM value is state-driven,
+		// so an undebounced write made every keystroke of a refused path 400, revert the
+		// field, move the caret and raise another notice. And `previous` was the previous
+		// OPTIMISTIC value - itself never stored under consecutive refusals - so the
+		// field settled on a path the server had rejected.
+		expect(fn).toMatch(/clearTimeout\(exportTargetTimer\)/);
+		expect(fn).toMatch(/setTimeout\(.*commitExportTarget/);
+		expect(fn).not.toMatch(/const previous = exportTarget/);
+		// The baseline is only ever written where the server states it.
+		const writes = src.match(/confirmedExportTarget = /g) ?? [];
+		expect(writes.length).toBe(3); // load, the SSE event, a confirmed write
 	});
 });
 

@@ -816,11 +816,25 @@ export function effectiveExportTarget(nb?: string | null): string | null {
  * the user their notebook save), so an unwritable target accepted here would sit
  * in the metadata silently generating nothing on every later save. Refusing it at
  * the point it is set is the honest moment - the caller has a value to correct.
+ *
+ * A target that is not a `.py` file is refused for a sharper reason: the exporter
+ * WRITES the generated module to this path, so a target naming an ordinary source
+ * file would have that file overwritten the moment a cell is marked. The field is
+ * documented (here, in both tool descriptions and in nbdev itself) as the module
+ * path, so this rejects nothing legitimate. `exportNotebookToPy` carries the
+ * second half of that guard - it refuses to overwrite a file it did not generate -
+ * because a `#|default_exp` directive reaches it without passing here.
  */
 export function setExportTarget(target: string | null, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
 	const trimmed = (target ?? '').trim();
-	if (trimmed) resolveInWorkspace(trimmed); // throws when the path escapes the workspace
+	if (trimmed) {
+		resolveInWorkspace(trimmed); // throws when the path escapes the workspace
+		if (!/\.py$/i.test(trimmed))
+			throw new Error(
+				`export target ${trimmed} is not a .py file: the generated module is written to this path, so it must name a .py module`
+			);
+	}
 	doc.metadata = doc.metadata ?? {};
 	doc.metadata.cellar = doc.metadata.cellar ?? {};
 	if (trimmed) doc.metadata.cellar.export_target = trimmed;
@@ -886,11 +900,19 @@ export function setHideAllCode(hidden: boolean, nb?: string | null, originId?: s
  * Regenerate the `.py` module on demand (the manual "Export to .py" action).
  * Unlike the auto-on-save path, this surfaces a real error (bad target) to the
  * caller rather than swallowing it.
+ *
+ * A success CLEARS `lastExportError`, for the same reason `autoExportPy` refreshes
+ * it on every persist: the record describes what is on disk, and this path writes
+ * the module without going through `persist`. Left standing, a failure the user
+ * then fixed and resolved with this button would still be reported by the next
+ * idempotent `set_cell_export` - which skips the persist that would have cleared it.
  */
 export function exportPy(nb?: string | null): ExportResult {
 	const doc = docFor(nb);
 	if (doc.jpFormat) throw new Error('cannot export a .py text notebook to a module');
-	return exportNotebookToPy(doc);
+	const res = exportNotebookToPy(doc);
+	doc.lastExportError = null;
+	return res;
 }
 
 /**
