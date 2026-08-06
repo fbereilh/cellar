@@ -32,6 +32,9 @@ import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
  *   - a default changed while a Databricks panel is ALREADY OPEN reaches it with no
  *     reload (the panel is mounted lazily and then kept mounted for the session, so
  *     a one-shot read left the Settings copy promising something it did not do);
+ *   - a default change that MOVES the affix drops the armed replace confirm, which
+ *     names a path built from the OLD one - while a seed that changes nothing
+ *     (reopening the section) leaves a still-accurate box alone;
  *   - clearing a project's field is an ANSWER ("no prefix here"), so the default
  *     does not creep back on the next load;
  *   - the default is a FILE, not per-origin state, which is the whole reason it is
@@ -261,6 +264,67 @@ test('a default changed with the panel ALREADY OPEN reaches it - no reload', asy
 	// The browser's write is debounced, so ending the test here would tear the context
 	// down with the PUT still queued - and what the tests after this one read is the
 	// FILE, not this page.
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
+});
+
+test('a default change that MOVES the affix drops the confirm built from the old one', async ({
+	page
+}) => {
+	// The armed replace confirm names one workspace path, resolved from the affixes as
+	// they were when it armed. A default changed in Settings re-seeds the field, so
+	// leaving the box up would put two disagreeing names on screen at once - the
+	// preview saying `NEW_notebook` over a confirm offering to overwrite
+	// `GLOBAL_notebook`. Typing already drops it; a seed has to as well, or the rule
+	// holds for one writer of the affixes and not the other.
+	await mockDatabricks(page);
+	await page.route(/\/api\/databricks\/upload$/, async (route) => {
+		const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				ok: true,
+				status: 'exists',
+				path: `/Users/${USER}/${String(body.prefix ?? '')}notebook`
+			})
+		});
+	});
+	await openProject(page, urlB);
+	await openDatabricksSection(page);
+	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('GLOBAL_');
+
+	await page.getByTestId('databricks-upload').click();
+	const confirm = page.getByTestId('databricks-upload-confirm-box');
+	await expect(confirm).toBeVisible();
+	await expect(confirm).toContainText('GLOBAL_notebook');
+
+	await openSettings(page);
+	await page.getByTestId('settings-upload-prefix').fill('NEW_');
+	await closeSettings(page);
+	// Confirm it REACHED the file. The previous test left `GLOBAL_` there, so polling
+	// only for the restore below would pass against that pre-existing value - before
+	// this write had even landed - and the test would end with two writes still in
+	// flight behind a torn-down page.
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('NEW_');
+
+	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('NEW_');
+	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('NEW_notebook');
+	await expect(confirm).toHaveCount(0);
+
+	// A seed that changes NOTHING must not dismiss a still-accurate box, so re-arm and
+	// fold the section away and back - the other trigger, and the common one.
+	await page.getByTestId('databricks-upload').click();
+	await expect(confirm).toContainText('NEW_notebook');
+	await page.getByTestId('section-databricks').click();
+	await expect(page.getByTestId('databricks-body')).toBeHidden();
+	await openDatabricksSection(page);
+	await expect(confirm).toContainText('NEW_notebook');
+	await page.getByTestId('databricks-upload-cancel').click();
+
+	// Put the default back for the tests after this one.
+	await openSettings(page);
+	await page.getByTestId('settings-upload-prefix').fill('GLOBAL_');
+	await closeSettings(page);
 	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
 });
 

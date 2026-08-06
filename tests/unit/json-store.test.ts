@@ -1,5 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import {
+	chmodSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	utimesSync,
+	writeFileSync
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -88,6 +100,37 @@ describe('re-reading a store another instance is writing', () => {
 		expect(hooks.duringRead).not.toBeNull();
 	});
 
+	it('catches another instance whose write kept the mtime AND the size', () => {
+		// The shape a coarse-granularity filesystem (NFS, some container overlays)
+		// produces: a same-size write inside one timestamp tick. On mtime+size alone
+		// the stamp compares EQUAL and nothing else ever moves it, so the cache would
+		// be stale for good - the permanent staleness the reload exists to prevent, and
+		// the module's own `GLOBAL_` → `OTHER_` example is same-length. Every writer
+		// here goes through temp+rename, so the inode moves even when neither of the
+		// other two does.
+		const ours = createJsonStore(() => file);
+		const theirs = createJsonStore(() => file);
+		// A whole second, so pinning it back is exact rather than truncated - the point
+		// is a timestamp that genuinely does not move between the two writes.
+		const tick = new Date(1_700_000_000_000);
+
+		theirs.set({ k: 'AAA' });
+		theirs.flush();
+		utimesSync(file, tick, tick);
+		expect(ours.get().k).toBe('AAA');
+		const before = statSync(file, { bigint: true });
+
+		theirs.set({ k: 'BBB' });
+		theirs.flush();
+		utimesSync(file, tick, tick);
+		const after = statSync(file, { bigint: true });
+		expect(after.size).toBe(before.size);
+		expect(after.mtimeNs).toBe(before.mtimeNs);
+		expect(after.ino).not.toBe(before.ino);
+
+		expect(ours.get().k).toBe('BBB');
+	});
+
 	it('still catches an external write made after our OWN flush', () => {
 		// The flush stamps the file it just wrote so its own bytes are not a change to
 		// catch up on - that must not blind the store to somebody else's.
@@ -113,6 +156,37 @@ describe('persisting the store', () => {
 		store.set({ k: 'b' });
 		store.flush();
 		expect(statSync(file).ino).not.toBe(first);
+	});
+
+	it('keeps a symlinked store a symlink, and writes through to the real file', () => {
+		// `~/.cellar/settings.json` is a plausible dotfile-manager symlink, and rename
+		// installs a new inode over whatever it lands on - so staging beside the LINK
+		// would replace the setup with a regular file and silently detach it.
+		const real = join(dir, 'real-store.json');
+		writeFileSync(real, JSON.stringify({ k: 'old' }));
+		const link = join(dir, 'linked.json');
+		symlinkSync(real, link);
+
+		const store = createJsonStore(() => link);
+		store.set({ k: 'new' });
+		store.flush();
+
+		expect(lstatSync(link).isSymbolicLink()).toBe(true);
+		expect(JSON.parse(readFileSync(real, 'utf8')).k).toBe('new');
+	});
+
+	it("carries the target's permission bits across the replacement", () => {
+		// temp+rename installs a NEW inode, so without carrying the mode a `chmod 600`
+		// store comes back at the umask default. And the temp sits in the target's own
+		// directory, so the mode has to be on it BEFORE the bytes go in.
+		const store = createJsonStore(() => file);
+		store.set({ k: 'a' });
+		store.flush();
+		chmodSync(file, 0o600);
+
+		store.set({ k: 'b' });
+		store.flush();
+		expect(statSync(file).mode & 0o777).toBe(0o600);
 	});
 
 	it('leaves no temp file behind', () => {

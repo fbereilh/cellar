@@ -563,8 +563,8 @@ describe('writing the user\'s file', () => {
 		// complete copy of the merged config - another server's `env` block, API token
 		// included - readable at the default mode for as long as the write takes. The
 		// window is not observable from here, so the ORDER is what is pinned.
-		const mod = readFileSync(join(REPO, 'src', 'lib', 'server', 'harness.js'), 'utf8');
-		const body = mod.slice(mod.indexOf('function writeFileAtomic'), mod.indexOf('function readConfigText'));
+		const mod = readFileSync(join(REPO, 'src', 'lib', 'server', 'write-file-atomic.js'), 'utf8');
+		const body = mod.slice(mod.indexOf('export function writeFileAtomic'));
 		expect(body.indexOf('fchmodSync(fd, mode)')).toBeGreaterThan(-1);
 		expect(body.indexOf('fchmodSync(fd, mode)')).toBeLessThan(body.indexOf('writeFileSync(fd, text)'));
 	});

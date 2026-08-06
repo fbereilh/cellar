@@ -1024,10 +1024,23 @@
 	 * answer of its own always wins, and every keystroke writes that answer through
 	 * `setUi` (which updates the client cache synchronously), so a re-read while the
 	 * user is typing returns exactly what they typed and can never clobber it.
+	 *
+	 * A seed that MOVES an affix drops the previous attempt's feedback, exactly as
+	 * typing does (`setUploadAffix`): the "uploaded to" note and the armed replace
+	 * confirm each name a workspace path built from the OLD affixes, so a default
+	 * changed in Settings would otherwise leave the box naming one path while the
+	 * preview a line above named another. The guard is what makes it callable from
+	 * both triggers - most seeds change nothing (reopening the section, a change to
+	 * some OTHER setting), and dismissing a still-accurate note there would be the
+	 * same defect with the sign flipped.
 	 */
 	function seedUploadAffixes() {
-		uploadPrefix = storedAffix(DBX_UPLOAD_PREFIX_KEY, UPLOAD_PREFIX_DEFAULT_KEY);
-		uploadPostfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY, UPLOAD_POSTFIX_DEFAULT_KEY);
+		const prefix = storedAffix(DBX_UPLOAD_PREFIX_KEY, UPLOAD_PREFIX_DEFAULT_KEY);
+		const postfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY, UPLOAD_POSTFIX_DEFAULT_KEY);
+		if (prefix === uploadPrefix && postfix === uploadPostfix) return;
+		uploadPrefix = prefix;
+		uploadPostfix = postfix;
+		clearUploadFeedback();
 	}
 	$effect(() => {
 		// The SUBSCRIPTION is the case that matters: the Settings modal sits OVER an

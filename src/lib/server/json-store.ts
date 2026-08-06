@@ -22,24 +22,24 @@
  * independent - a write to one can never flush the other.
  */
 
-import { existsSync, readFileSync, mkdirSync, statSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { atomicWriteFileSync } from '$lib/server/atomic-write';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { writeFileAtomic } from '$lib/server/write-file-atomic.js';
 
 const WRITE_DEBOUNCE_MS = 250;
 
 /** A flat `key → value` map, as persisted. */
 export type JsonStoreData = Record<string, unknown>;
 
-/** The identity of a file's contents: nanosecond mtime plus size. */
+/** The identity of a file's contents: inode, nanosecond mtime, size. */
 interface FileStamp {
+	ino: bigint;
 	mtimeNs: bigint;
 	size: bigint;
 }
 
 function sameStamp(a: FileStamp | null, b: FileStamp | null): boolean {
 	if (a === null || b === null) return a === b;
-	return a.mtimeNs === b.mtimeNs && a.size === b.size;
+	return a.ino === b.ino && a.mtimeNs === b.mtimeNs && a.size === b.size;
 }
 
 export interface JsonStore {
@@ -70,13 +70,21 @@ export function createJsonStore(storePath: () => string): JsonStore {
 	 *
 	 * `bigint` for the NANOSECOND mtime rather than the millisecond one: the whole
 	 * point is telling two writes apart, and a same-size edit (`GLOBAL_` → `OTHER_`)
-	 * inside one millisecond is not far-fetched. Size is folded in so a filesystem
-	 * with a coarse timestamp still catches the common case.
+	 * inside one millisecond is not far-fetched.
+	 *
+	 * Size and INODE are folded in because mtime alone is not a discriminator on
+	 * every filesystem: NFS and some container overlays keep coarse timestamps, so a
+	 * same-size external write inside one tick would compare EQUAL, and since nothing
+	 * else moves the stamp the cache would then be stale for good - the exact
+	 * permanent staleness `load` orders its stamp to avoid, and the module's own
+	 * `GLOBAL_` → `OTHER_` example is same-length. The inode closes it at zero cost:
+	 * `statSync` already returns it, and every write here goes through temp+rename,
+	 * which installs a NEW inode even when mtime and size do not move.
 	 */
 	function fileStamp(p: string): FileStamp | null {
 		try {
 			const st = statSync(p, { bigint: true });
-			return { mtimeNs: st.mtimeNs, size: st.size };
+			return { ino: st.ino, mtimeNs: st.mtimeNs, size: st.size };
 		} catch {
 			return null;
 		}
@@ -140,10 +148,16 @@ export function createJsonStore(storePath: () => string): JsonStore {
 	 * ATOMICALLY, because the global store is one file under `~/.cellar/` that every
 	 * running instance reads and writes: a crash / SIGKILL / ENOSPC mid-write leaves a
 	 * truncated file, which the (correct) corrupt-file-reads-empty rule then turns
-	 * into a SILENT loss of the user's cross-project defaults on the next boot. The
-	 * `.ipynb` path already answers exactly this with `atomicWriteFileSync`
-	 * (unique temp in the target's OWN directory → fsync → rename), so it is shared
-	 * rather than reimplemented here.
+	 * into a SILENT loss of the user's cross-project defaults on the next boot.
+	 *
+	 * Through `write-file-atomic.js`'s `writeFileAtomic` rather than `atomic-write.ts`'s
+	 * `atomicWriteFileSync`, and the difference is the point: temp+rename installs a
+	 * NEW inode, so a writer that does not resolve a symlink first replaces a
+	 * dotfile-manager's link with a regular file, and one that does not carry the
+	 * target's mode across reverts a `chmod 600` store to the umask default. Both are
+	 * live cases for `~/.cellar/settings.json`. The two atomic writers coexist
+	 * deliberately for now: the other one serves the `.ipynb` path, i.e. the user's
+	 * PRIMARY data, so unifying them is its own change (see `write-file-atomic.js`).
 	 */
 	function flush(): void {
 		if (writeTimer) {
@@ -155,8 +169,7 @@ export function createJsonStore(storePath: () => string): JsonStore {
 		try {
 			const p = storePath();
 			const payload = JSON.stringify(cache, null, 2) + '\n';
-			mkdirSync(dirname(p), { recursive: true });
-			atomicWriteFileSync(p, payload);
+			writeFileAtomic(p, payload);
 			// Our own write is not a change to catch up on - but only while the file
 			// still IS the one we wrote. A concurrent write landing between the rename
 			// and this stat would otherwise be recorded as loaded, the same permanent
