@@ -120,12 +120,38 @@ describe('set_export_target', () => {
 		});
 		expect(nbmod.getExportTarget(target)).toBeNull();
 
-		// The description promises this is the same value the map reports; all three
-		// surfaces resolve through the one `exportTargetFields`, so they cannot drift.
+		// The map reports the same value; all three surfaces resolve through the one
+		// `exportTargetFields`, so they cannot drift (which is why the tool description
+		// does not spend words restating what the map's own description already says).
 		expect((await svc.getNotebookMap(target)).display).toMatchObject({
 			export_target: 'lib/fromcell.py',
 			export_target_source: 'default_exp'
 		});
+	});
+
+	it('keeps its registration description compact, with every claim an agent acts on', () => {
+		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
+		const line = src.slice(src.indexOf("registerTool('set_export_target'")).split('\n')[0];
+
+		// The claims an agent acts on: what clearing does and does not reach, that the
+		// module is rewritten only while a cell stays marked (and how a failed write is
+		// reported), the refusals this path can hit, and the flag that tells a clearable
+		// SETTING from a non-clearable cell directive.
+		expect(line).toMatch(/clears the SETTING/);
+		expect(line).toMatch(/#\|default_exp` directive written in a cell is NOT/);
+		expect(line).toMatch(/while a cell stays marked/);
+		expect(line).toMatch(/module\.regenerated:false/);
+		expect(line).toMatch(/outside the workspace/);
+		expect(line).toMatch(/text notebook/);
+		expect(line).toMatch(/export_target_source/);
+
+		// The same mechanical bound its pair `set_cell_export` carries: a description is
+		// paid on EVERY session, so an honesty correction has to be bought by cutting
+		// words rather than by growing what every session is billed for. Asserted on the
+		// registration literal, so a restatement can never creep back in unnoticed.
+		const desc = line.match(/description: '(.*?)', inputSchema/);
+		expect(desc, 'the description stays a single-quoted one-line literal').toBeTruthy();
+		expect(desc![1].length).toBeLessThan(700);
 	});
 });
 
@@ -332,9 +358,16 @@ describe('the client half of that refusal (source guard)', () => {
 		// The navbar entry point must not REPLACE that reason with a generic string -
 		// one nonce-keyed notice channel, so the last write wins.
 		const shell = readFileSync(join(process.cwd(), 'src/routes/+page.svelte'), 'utf8');
-		const shellExport = shell.slice(shell.indexOf('async function exportPy'), shell.indexOf('async function exportPy') + 900);
+		const shellStart = shell.indexOf('async function exportPy');
+		const shellExport = shell.slice(shellStart, shell.indexOf('function toggleHideAllCode', shellStart));
 		expect(shellExport).toMatch(/if \(!r\) return;/);
 		expect(shellExport).not.toMatch(/Export to \.py failed/);
+		// Nor ERASE it before it has been read: opening the app menu blurs the target
+		// input, so its `change` commit has usually already SETTLED and posted its
+		// refusal by the time the item is clicked - a pre-emptive clear then wiped a
+		// message this action had not yet replaced (the in-flight case survived it only
+		// by accident of ordering). Every branch below ends in exactly one message.
+		expect(shellExport).not.toMatch(/clearNotice\(\)/);
 	});
 });
 
