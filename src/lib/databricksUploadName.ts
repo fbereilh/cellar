@@ -138,6 +138,30 @@ export function unknownAffixTokens(affixes: UploadNameAffixes, now: Date = new D
 	return [...seen];
 }
 
+/**
+ * The sentence a surface shows for the runs `unknownAffixTokens` named.
+ *
+ * The scan was centralised so the two surfaces that warn (the sidebar's affix
+ * fields and the Settings pane's defaults) could not each get it wrong; the
+ * SENTENCE is the other half of that, and the half a reword or a pluralisation fix
+ * would otherwise reach only one of. `remedy` is the one deliberate difference,
+ * passed rather than kept as a second function: the sidebar can point at the token
+ * buttons sitting directly below the message, and Settings has no such thing in
+ * view to point at.
+ *
+ * Empty for an empty list, so a caller can render it directly - there is nothing to
+ * warn about, which is not the same as a warning that happens to say nothing.
+ */
+export function unknownTokenWarning(tokens: readonly string[], remedy = ''): string {
+	if (tokens.length === 0) return '';
+	const one = tokens.length === 1;
+	const names = tokens.map((t) => `"${t}"`).join(' and ');
+	const tail = remedy ? ` ${remedy}` : '';
+	return `${names} ${one ? 'is not a date token' : 'are not date tokens'} - ${
+		one ? 'it uploads' : 'they upload'
+	} exactly as written.${tail}`;
+}
+
 /** An affix with a token inserted, and where the caret belongs afterwards. */
 export interface TokenInsertion {
 	value: string;

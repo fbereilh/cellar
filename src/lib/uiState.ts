@@ -5,7 +5,7 @@
  * the workspace's `.cellar/`). They are delivered to the browser via SSR
  * (`+page.server.js` → `data.uiState`) and handed here through `hydrateUiState`
  * during `+page.svelte`'s init, so every consumer reads them **synchronously**
- * from the in-memory `cache` with no fetch and no flash - the fix for the
+ * from the in-memory cache with no fetch and no flash - the fix for the
  * dynamic-port bug where a per-origin `localStorage` reset every preference on
  * each relaunch.
  *
@@ -13,11 +13,15 @@
  * the cache immediately and PUT back to the server, debounced so a rapid burst
  * (dragging a resizer) coalesces into one request. The server store is the
  * cross-launch source of truth; there is deliberately no `localStorage` mirror.
+ *
+ * The cache, the debounce and the unload flush are `$lib/clientStore`'s, shared
+ * with the cross-project `$lib/userSettings` rather than mirrored there. What is
+ * local to this store is what is genuinely local: the one-time `localStorage`
+ * migration below, and `setUiNow`.
  */
 
-import { browser } from '$app/environment';
+import { createClientStore } from '$lib/clientStore';
 
-const FLUSH_DEBOUNCE_MS = 300;
 /** localStorage keys we one-time migrate; everything under this prefix except… */
 const LS_PREFIX = 'cellar-';
 /**
@@ -27,11 +31,7 @@ const LS_PREFIX = 'cellar-';
  */
 const LS_SKIP = new Set(['cellar-shortcuts']);
 
-let cache: Record<string, unknown> = {};
-let hydrated = false;
-
-let pending: Record<string, unknown> = {};
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
+const store = createClientStore('/api/ui-state');
 
 /**
  * Seed the cache from the SSR-provided store, then one-time migrate any prefs a
@@ -39,32 +39,18 @@ let flushTimer: ReturnType<typeof setTimeout> | null = null;
  * `+page.svelte` before any child reads a preference.
  */
 export function hydrateUiState(initial: unknown): void {
-	if (initial && typeof initial === 'object' && !Array.isArray(initial)) {
-		cache = { ...(initial as Record<string, unknown>) };
-	}
-	hydrated = true;
-	if (browser) {
-		migrateFromLocalStorage();
-		// A preference changed just before the tab closes must still reach the
-		// server; flush synchronously past the debounce window.
-		window.addEventListener('pagehide', () => flushNow(true));
-	}
+	store.hydrate(initial, migrateFromLocalStorage);
 }
 
 /** Current value for `key`, or `fallback` if unset / before hydration. The store
  * is untyped JSON, so the caller states the expected shape via `fallback`. */
 export function getUi<T>(key: string, fallback: T): T {
-	return hydrated && Object.prototype.hasOwnProperty.call(cache, key)
-		? (cache[key] as T)
-		: fallback;
+	return store.get(key, fallback);
 }
 
 /** Set `key` to `value` (pass `null` to delete) and schedule a server write. */
 export function setUi(key: string, value: unknown): void {
-	if (value === null) delete cache[key];
-	else cache[key] = value;
-	pending[key] = value;
-	scheduleFlush();
+	store.set(key, value);
 }
 
 /**
@@ -76,22 +62,12 @@ export function setUi(key: string, value: unknown): void {
  * re-reads the store to decide whether to inject `DATABRICKS_RUNTIME_VERSION`, and
  * the debounced `setUi` PUT could still be in flight. This write supersedes any
  * value the debounced path had queued for the same key. A no-op off the browser.
+ *
+ * A failed persist degrades to "runtime applies on the next kernel start"; the
+ * caller's optimistic local state still reflects the user's choice.
  */
 export async function setUiNow(key: string, value: unknown): Promise<void> {
-	if (value === null) delete cache[key];
-	else cache[key] = value;
-	delete pending[key]; // this synchronous write wins over any queued debounced value
-	if (!browser) return;
-	try {
-		await fetch('/api/ui-state', {
-			method: 'PUT',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ [key]: value })
-		});
-	} catch {
-		// A failed persist degrades to "runtime applies on the next kernel start"; the
-		// caller's optimistic local state still reflects the user's choice.
-	}
+	await store.setNow(key, value);
 }
 
 /**
@@ -100,12 +76,11 @@ export async function setUiNow(key: string, value: unknown): Promise<void> {
  * A key the server already knows always wins (it is never overwritten).
  */
 function migrateFromLocalStorage() {
-	let seeded = false;
 	try {
 		for (let i = 0; i < localStorage.length; i++) {
 			const key = localStorage.key(i);
 			if (!key || !key.startsWith(LS_PREFIX) || LS_SKIP.has(key)) continue;
-			if (Object.prototype.hasOwnProperty.call(cache, key)) continue;
+			if (store.has(key)) continue;
 			const raw = localStorage.getItem(key);
 			if (raw == null) continue;
 			let value: unknown;
@@ -114,33 +89,7 @@ function migrateFromLocalStorage() {
 			} catch {
 				value = raw; // legacy non-JSON value (e.g. the raw theme name)
 			}
-			cache[key] = value;
-			pending[key] = value;
-			seeded = true;
+			store.set(key, value);
 		}
-	} catch {}
-	if (seeded) scheduleFlush();
-}
-
-function scheduleFlush(): void {
-	if (!browser || flushTimer) return;
-	flushTimer = setTimeout(() => flushNow(false), FLUSH_DEBOUNCE_MS);
-}
-
-function flushNow(keepalive: boolean): void {
-	if (flushTimer) {
-		clearTimeout(flushTimer);
-		flushTimer = null;
-	}
-	const body = pending;
-	if (Object.keys(body).length === 0) return;
-	pending = {};
-	try {
-		fetch('/api/ui-state', {
-			method: 'PUT',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(body),
-			keepalive
-		}).catch(() => {});
 	} catch {}
 }

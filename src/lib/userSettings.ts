@@ -4,7 +4,9 @@
  * The exact shape of `$lib/uiState`, one store up: the server owns the file
  * (`$lib/server/user-settings.ts`, under `~/.cellar/`), it is delivered by SSR
  * (`+page.server.js` → `data.userSettings`) and hydrated during `+page.svelte`'s
- * init, so a reader gets it **synchronously** with no fetch and no flash.
+ * init, so a reader gets it **synchronously** with no fetch and no flash. The
+ * cache, the debounce and the unload flush are literally the same code
+ * (`$lib/clientStore`), so a fix to any of them reaches both stores.
  *
  * There is no `localStorage` migration here, and that is not an omission: this
  * store has no `localStorage` past to migrate FROM, and a per-origin mirror would
@@ -14,44 +16,51 @@
  * What it holds is a DEFAULT, and only ever that. The per-project store answers
  * for a project that has an answer; this answers for a project that has never been
  * asked. Readers seed from it, never override with it - see the `getUi` /
- * `getUserSetting` pairing at the Databricks affix fields.
+ * `getUserSettingText` pairing at the Databricks affix fields.
  */
 
-import { browser } from '$app/environment';
+import { createClientStore } from '$lib/clientStore';
 
-const FLUSH_DEBOUNCE_MS = 300;
-
-let cache: Record<string, unknown> = {};
-let hydrated = false;
-
-let pending: Record<string, unknown> = {};
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
+const store = createClientStore('/api/user-settings');
 
 /** Seed the cache from the SSR-provided store. Called once from `+page.svelte`. */
 export function hydrateUserSettings(initial: unknown): void {
-	if (initial && typeof initial === 'object' && !Array.isArray(initial)) {
-		cache = { ...(initial as Record<string, unknown>) };
-	}
-	hydrated = true;
-	// A setting changed just before the tab closes must still reach the server;
-	// flush synchronously past the debounce window.
-	if (browser) window.addEventListener('pagehide', () => flushNow(true));
+	store.hydrate(initial);
 }
 
-/** Current value for `key`, or `fallback` if unset / before hydration. */
+/**
+ * Current value for `key`, or `fallback` if unset / before hydration.
+ *
+ * The store is untyped JSON, so `fallback` states the expected shape but proves
+ * nothing about what is really there - a caller that will USE the value as a string
+ * wants `getUserSettingText` below, not a `<string>` type argument.
+ */
 export function getUserSetting<T>(key: string, fallback: T): T {
-	return hydrated && Object.prototype.hasOwnProperty.call(cache, key)
-		? (cache[key] as T)
-		: fallback;
+	return store.get(key, fallback);
+}
+
+/**
+ * A setting read as TEXT, with anything that is not a string degrading to `''`.
+ *
+ * The ONE read every surface that puts a setting into a NAME must use, and the
+ * reason it is shared rather than a `typeof` check at each of them. This store is
+ * untyped JSON on disk and `/api/user-settings` accepts any JSON value, so a
+ * hand-edited `~/.cellar/settings.json` (or a PUT) can put a number where a prefix
+ * belongs - and the consumers hand it straight to `expandDateTokens`, whose
+ * `text.replace` then throws inside a render-time `$derived`. Nothing in this app
+ * mounts a `<svelte:boundary>`, so that throw does not cost one field: it takes the
+ * whole render tree with it. Degrading to "no affix" is both the safe reading and
+ * the honest one - a value that is not text was never an affix.
+ */
+export function getUserSettingText(key: string): string {
+	const value = store.get<unknown>(key, '');
+	return typeof value === 'string' ? value : '';
 }
 
 /** Set `key` to `value` (pass `null` to delete) and schedule a server write. */
 export function setUserSetting(key: string, value: unknown): void {
-	if (value === null) delete cache[key];
-	else cache[key] = value;
-	pending[key] = value;
+	store.set(key, value);
 	for (const fn of listeners) fn();
-	scheduleFlush();
 }
 
 const listeners = new Set<() => void>();
@@ -70,27 +79,4 @@ const listeners = new Set<() => void>();
 export function onUserSettingsChange(fn: () => void): () => void {
 	listeners.add(fn);
 	return () => listeners.delete(fn);
-}
-
-function scheduleFlush(): void {
-	if (!browser || flushTimer) return;
-	flushTimer = setTimeout(() => flushNow(false), FLUSH_DEBOUNCE_MS);
-}
-
-function flushNow(keepalive: boolean): void {
-	if (flushTimer) {
-		clearTimeout(flushTimer);
-		flushTimer = null;
-	}
-	const body = pending;
-	if (Object.keys(body).length === 0) return;
-	pending = {};
-	try {
-		fetch('/api/user-settings', {
-			method: 'PUT',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(body),
-			keepalive
-		}).catch(() => {});
-	} catch {}
 }

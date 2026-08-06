@@ -4,15 +4,16 @@
 	// (view + rebind).
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
-	import { getUserSetting, setUserSetting } from '$lib/userSettings';
+	import { getUserSettingText, setUserSetting } from '$lib/userSettings';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import {
 		UPLOAD_DATE_TOKENS,
 		expandDateTokens,
-		insertUploadToken,
 		resolveUploadName,
-		unknownAffixTokens
+		unknownAffixTokens,
+		unknownTokenWarning
 	} from '$lib/databricksUploadName';
+	import { insertTokenIntoField } from '$lib/uploadTokenField';
 
 	interface Props {
 		open: boolean;
@@ -68,8 +69,11 @@
 		// value for the whole session.
 		if (!open || defaultsHydrated) return;
 		defaultsHydrated = true;
-		uploadPrefixDefault = getUserSetting<string>(UPLOAD_PREFIX_DEFAULT_KEY, '');
-		uploadPostfixDefault = getUserSetting<string>(UPLOAD_POSTFIX_DEFAULT_KEY, '');
+		// Read as TEXT through the shared guard, exactly as the Databricks panel's
+		// `storedAffix` does: the store is untyped JSON, so a non-string here would
+		// reach `expandDateTokens` and throw out of a render-time `$derived`.
+		uploadPrefixDefault = getUserSettingText(UPLOAD_PREFIX_DEFAULT_KEY);
+		uploadPostfixDefault = getUserSettingText(UPLOAD_POSTFIX_DEFAULT_KEY);
 	});
 
 	/**
@@ -129,31 +133,25 @@
 					defaultsNow
 				)
 	);
-	const defaultsWarning = $derived(
-		defaultsUnknown.length === 0
-			? ''
-			: `${defaultsUnknown.map((t) => `"${t}"`).join(' and ')} ${
-					defaultsUnknown.length === 1 ? 'is not a date token' : 'are not date tokens'
-				} - ${defaultsUnknown.length === 1 ? 'it uploads' : 'they upload'} exactly as written.`
-	);
+	// No remedy clause: the sidebar's copy points at the token buttons directly under
+	// it, and this pane's are elsewhere on screen.
+	const defaultsWarning = $derived(unknownTokenWarning(defaultsUnknown));
 
 	// Which default field a token button writes into, and the elements themselves -
 	// the insertion point is the caret, which only the DOM node knows. Mirrors the
-	// sidebar's own token buttons; the shared rule is `insertUploadToken`.
+	// sidebar's own token buttons, down to the shared `insertTokenIntoField` glue.
 	let prefixDefaultEl = $state<HTMLInputElement | null>(null);
 	let postfixDefaultEl = $state<HTMLInputElement | null>(null);
 	let defaultTokenTarget = $state<'prefix' | 'postfix'>('prefix');
 
 	function insertDefaultToken(token: string) {
 		const which = defaultTokenTarget;
-		const el = which === 'prefix' ? prefixDefaultEl : postfixDefaultEl;
-		const current = which === 'prefix' ? uploadPrefixDefault : uploadPostfixDefault;
-		const { value, caret } = insertUploadToken(current, token, el?.selectionStart, el?.selectionEnd);
-		setUploadDefault(which, value);
-		if (!el) return;
-		el.value = value;
-		el.focus();
-		el.setSelectionRange(caret, caret);
+		insertTokenIntoField(
+			which === 'prefix' ? prefixDefaultEl : postfixDefaultEl,
+			which === 'prefix' ? uploadPrefixDefault : uploadPostfixDefault,
+			token,
+			(value) => setUploadDefault(which, value)
+		);
 	}
 
 	// ---- Keyboard shortcuts --------------------------------------------------

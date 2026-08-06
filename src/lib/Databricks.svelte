@@ -18,7 +18,7 @@
 	import { onMount } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
 	import { getUi, setUi, setUiNow } from '$lib/uiState';
-	import { getUserSetting, onUserSettingsChange } from '$lib/userSettings';
+	import { getUserSettingText, onUserSettingsChange } from '$lib/userSettings';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import { normalizeDatabricksHost } from '$lib/databricksHost';
 	import {
@@ -32,10 +32,11 @@
 	import {
 		UPLOAD_DATE_TOKENS,
 		expandDateTokens,
-		insertUploadToken,
 		resolveUploadName,
-		unknownAffixTokens
+		unknownAffixTokens,
+		unknownTokenWarning
 	} from '$lib/databricksUploadName';
+	import { insertTokenIntoField } from '$lib/uploadTokenField';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -1009,8 +1010,7 @@
 	function storedAffix(key: string, defaultKey: string): string {
 		const own = getUi<unknown>(key, undefined);
 		if (typeof own === 'string') return own;
-		const fallback = getUserSetting<unknown>(defaultKey, '');
-		return typeof fallback === 'string' ? fallback : '';
+		return getUserSettingText(defaultKey);
 	}
 	/**
 	 * Re-read both affixes from the stores.
@@ -1134,11 +1134,7 @@
 		uploadNameError ? [] : unknownAffixTokens({ prefix: uploadPrefix, postfix: uploadPostfix }, uploadNow)
 	);
 	const uploadTokenWarning = $derived(
-		uploadUnknownTokens.length === 0
-			? ''
-			: `${uploadUnknownTokens.map((t) => `"${t}"`).join(' and ')} ${
-					uploadUnknownTokens.length === 1 ? 'is not a date token' : 'are not date tokens'
-				} - ${uploadUnknownTokens.length === 1 ? 'it uploads' : 'they upload'} exactly as written. The buttons below are the ones that expand.`
+		unknownTokenWarning(uploadUnknownTokens, 'The buttons below are the ones that expand.')
 	);
 	/** Ties that reason to both affix fields, so it is announced and not merely shown. */
 	const uploadNameErrorId = $props.id();
@@ -1244,17 +1240,12 @@
 	function insertUploadDateToken(token: string) {
 		if (uploadConfirmBusy) return;
 		const which = uploadTokenTarget;
-		const el = which === 'prefix' ? uploadPrefixEl : uploadPostfixEl;
-		const current = which === 'prefix' ? uploadPrefix : uploadPostfix;
-		const { value, caret } = insertUploadToken(current, token, el?.selectionStart, el?.selectionEnd);
-		setUploadAffix(which, value);
-		if (!el) return;
-		// The input is `value=`-bound rather than two-way, so the DOM node is written
-		// here as well: Svelte will not re-render an unchanged-from-its-view element,
-		// and the caret has to be restored on the node in any case.
-		el.value = value;
-		el.focus();
-		el.setSelectionRange(caret, caret);
+		insertTokenIntoField(
+			which === 'prefix' ? uploadPrefixEl : uploadPostfixEl,
+			which === 'prefix' ? uploadPrefix : uploadPostfix,
+			token,
+			(value) => setUploadAffix(which, value)
+		);
 	}
 
 	/**

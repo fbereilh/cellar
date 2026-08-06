@@ -10,6 +10,8 @@ import {
 	UPLOAD_POSTFIX_DEFAULT_KEY
 } from '../../src/lib/server/user-settings';
 import * as shared from '../../src/lib/uploadDefaults';
+import { hydrateUserSettings, getUserSettingText } from '../../src/lib/userSettings';
+import { resolveUploadName } from '../../src/lib/databricksUploadName';
 
 /**
  * **The cross-project user-setting store** (`$lib/server/user-settings.ts`).
@@ -159,5 +161,46 @@ describe('the cross-project user-setting store', () => {
 		// throw - it would read as a default the user set and Cellar silently ignored.
 		expect(UPLOAD_PREFIX_DEFAULT_KEY).toBe(shared.UPLOAD_PREFIX_DEFAULT_KEY);
 		expect(UPLOAD_POSTFIX_DEFAULT_KEY).toBe(shared.UPLOAD_POSTFIX_DEFAULT_KEY);
+	});
+});
+
+/**
+ * The BROWSER side of the same store (`$lib/userSettings`), and specifically the
+ * one read every surface that puts a setting into a NAME goes through.
+ *
+ * The file is untyped JSON and `/api/user-settings` accepts any JSON value, so a
+ * hand-edit (or a PUT) can put a number where a prefix belongs. Both readers hand
+ * that straight to `expandDateTokens`, whose `text.replace` throws inside a
+ * render-time `$derived` - and nothing in this app mounts a `<svelte:boundary>`, so
+ * the throw would take the whole render tree rather than one field.
+ */
+describe('reading a default that is not text', () => {
+	it('degrades a non-string default to NO affix instead of throwing', () => {
+		for (const junk of [123, true, { a: 1 }, ['x'], null]) {
+			hydrateUserSettings({ [UPLOAD_PREFIX_DEFAULT_KEY]: junk });
+			expect(getUserSettingText(UPLOAD_PREFIX_DEFAULT_KEY)).toBe('');
+		}
+	});
+
+	it('still hands back a real string default unchanged', () => {
+		hydrateUserSettings({ [UPLOAD_PREFIX_DEFAULT_KEY]: '{YYYYMM}_' });
+		expect(getUserSettingText(UPLOAD_PREFIX_DEFAULT_KEY)).toBe('{YYYYMM}_');
+	});
+
+	it('is what keeps the name resolver - and the render tree - alive', () => {
+		hydrateUserSettings({
+			[UPLOAD_PREFIX_DEFAULT_KEY]: 123,
+			[UPLOAD_POSTFIX_DEFAULT_KEY]: { nope: true }
+		});
+		const resolved = resolveUploadName(
+			'analysis.ipynb',
+			{
+				prefix: getUserSettingText(UPLOAD_PREFIX_DEFAULT_KEY),
+				postfix: getUserSettingText(UPLOAD_POSTFIX_DEFAULT_KEY)
+			},
+			new Date(2026, 7, 5)
+		);
+		expect(resolved.error).toBeNull();
+		expect(resolved.name).toBe('analysis');
 	});
 });

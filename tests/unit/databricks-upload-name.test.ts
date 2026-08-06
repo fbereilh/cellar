@@ -7,7 +7,8 @@ import {
 	notebookStem,
 	resolveUploadName,
 	unknownDateTokens,
-	unknownAffixTokens
+	unknownAffixTokens,
+	unknownTokenWarning
 } from '../../src/lib/databricksUploadName';
 
 /**
@@ -188,6 +189,32 @@ describe('naming a brace that is NOT a token', () => {
 		for (const token of UPLOAD_DATE_TOKENS) {
 			expect(expandDateTokens(token, DAY)).not.toContain('{');
 		}
+	});
+});
+
+describe('the sentence that names them', () => {
+	// Shared by both surfaces that warn, so a reword or a pluralisation fix can never
+	// reach only one of them - the same reason the SCAN is shared.
+	it('says nothing when there is nothing to say', () => {
+		expect(unknownTokenWarning([])).toBe('');
+		expect(unknownTokenWarning([], 'The buttons below are the ones that expand.')).toBe('');
+	});
+
+	it('reads as one problem for one run, and as several for several', () => {
+		expect(unknownTokenWarning(['{FOO}'])).toBe(
+			'"{FOO}" is not a date token - it uploads exactly as written.'
+		);
+		expect(unknownTokenWarning(['{FOO}', '{BAR}'])).toBe(
+			'"{FOO}" and "{BAR}" are not date tokens - they upload exactly as written.'
+		);
+	});
+
+	it('carries a remedy only where the surface has one to point at', () => {
+		// The sidebar's token buttons sit directly under its message; the Settings pane's
+		// are elsewhere on screen, so it passes none rather than promising a "below".
+		expect(unknownTokenWarning(['{FOO}'], 'The buttons below are the ones that expand.')).toBe(
+			'"{FOO}" is not a date token - it uploads exactly as written. The buttons below are the ones that expand.'
+		);
 	});
 });
 
