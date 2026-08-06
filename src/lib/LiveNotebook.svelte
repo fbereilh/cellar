@@ -2080,8 +2080,12 @@
 	 * i.e. the very state the revert exists to prevent.
 	 */
 	let confirmedExportTarget: string | null = null;
-	/** The in-flight target write, so the manual export can wait for it to land. */
-	let exportTargetCommit: Promise<void> | null = null;
+	/**
+	 * The in-flight target write, so the manual export can wait for it to land -
+	 * and learn whether it was REFUSED (`false`), since pressing Export blurs the
+	 * input and therefore commits the edit first.
+	 */
+	let exportTargetCommit: Promise<boolean> | null = null;
 
 	/**
 	 * Set (or clear) the notebook's `.py` export target. Optimistic + persisted, and
@@ -2114,7 +2118,7 @@
 		exportTargetCommit = commitExportTarget(target, next);
 	}
 
-	async function commitExportTarget(raw: string, next: string | null) {
+	async function commitExportTarget(raw: string, next: string | null): Promise<boolean> {
 		const res = await fetch('/api/notebooks/export-py', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
@@ -2122,15 +2126,17 @@
 		}).catch(() => null);
 		if (res?.ok) {
 			confirmedExportTarget = next;
-			return;
+			return true;
 		}
-		if (!res || exportTarget !== next) return; // no refusal, or the field moved on
+		if (!res) return true; // a network failure is not a refusal - nothing to revert to
+		if (exportTarget !== next) return false; // the field moved on; a newer commit owns it
 		exportTarget = confirmedExportTarget;
 		const message = await res
 			.json()
 			.then((body) => body?.message)
 			.catch(() => null);
 		onNotice?.(`Export target not set${message ? `: ${message}` : '.'}`);
+		return false;
 	}
 
 	/**
@@ -2158,14 +2164,23 @@
 	 * An in-flight target write is AWAITED first, so the export runs against the path
 	 * the field is showing rather than the previous one: pressing the button blurs the
 	 * input, which commits the edit, but that POST would otherwise still be on the
-	 * wire. A failure carries the server's
+	 * wire. A commit the server REFUSED ABORTS the export, because that path was never
+	 * stored: exporting on would run against the previous (or absent) target and its
+	 * generic outcome would REPLACE the refusal's own reason on the single notice
+	 * channel - telling the user to set a target they just tried to set. The refusal
+	 * already explained itself, so nothing more is said here. A failure carries the server's
 	 * own reason - the refusals this path can hit ("it is not a Cellar-generated
 	 * module", a non-`.py` or escaping target) exist for their actionable message, and
 	 * a generic "Export failed." names no cause - reported through the same transient
 	 * notice channel as every other refused write here.
 	 */
 	async function exportPy() {
-		await exportTargetCommit?.catch(() => {});
+		// Consumed, so a refusal cannot abort every LATER export too (the field has been
+		// reverted to the confirmed value, so a second click is a fresh request).
+		const pending = exportTargetCommit;
+		exportTargetCommit = null;
+		const targetCommitted = (await pending?.catch(() => true)) ?? true;
+		if (!targetCommitted) return null;
 		try {
 			const res = await fetch('/api/notebooks/export-py', {
 				method: 'POST',

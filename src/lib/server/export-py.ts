@@ -167,6 +167,12 @@ export function resolveTarget(doc: NotebookDoc): string | null {
  * opens with `HEADER`, so testing the file already on disk for it rejects nothing
  * Cellar wrote. The refusal throws, which auto-on-save records as `lastExportError`
  * (never breaking the notebook save) and the manual button surfaces directly.
+ *
+ * An EMPTY file (zero bytes, or whitespace only) is overwritten, not refused: the
+ * guard exists to protect CONTENT, and there is none. Pre-creating the module
+ * (`touch utils.py`, or the explorer's "New file") before naming the target is an
+ * ordinary workflow, and refusing it stopped the module regenerating on every
+ * later save through a path no UI surface reads.
  */
 export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	const target = resolveTarget(doc);
@@ -195,9 +201,9 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 			throw new Error(
 				`refusing to overwrite ${target}: it exists but could not be read, so it cannot be verified as a Cellar-generated module`
 			);
-		if (!isGeneratedModule(existing))
+		if (!isGeneratedModule(existing) && existing.trim() !== '')
 			throw new Error(
-				`refusing to overwrite ${target}: it is not a Cellar-generated module (it does not begin with "${HEADER}") - point the export target at a path Cellar owns`
+				`refusing to overwrite ${target}: it is not a Cellar-generated module (it does not begin with "${HEADER}") - point the export target at a path Cellar owns, or delete that file`
 			);
 	}
 	mkdirSync(dirname(abs), { recursive: true });

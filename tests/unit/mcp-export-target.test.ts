@@ -276,12 +276,23 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(nbSrc).not.toMatch(/oninput=\{onExportTarget/);
 	});
 
-	it('awaits an in-flight target write before the export button posts', () => {
+	it('awaits an in-flight target write before the export button posts, and aborts on a refused one', () => {
 		// Pressing the button blurs the input, which commits the edit - but that POST is
 		// still on the wire, so without the await a freshly typed target exported against
 		// the previous one while the field visibly showed the new.
 		const exportFn = src.slice(src.indexOf('async function exportPy'), src.indexOf('UNDO_LIMIT'));
-		expect(exportFn).toMatch(/await exportTargetCommit\?\./);
+		expect(exportFn).toMatch(/const pending = exportTargetCommit;/);
+		expect(exportFn).toMatch(/await pending\?\./);
+		// A REFUSED commit aborts: that path was never stored, so exporting on would run
+		// against the previous/absent target and its generic outcome would REPLACE the
+		// refusal's own reason on the single nonce-keyed notice channel.
+		expect(exportFn).toMatch(/if \(!targetCommitted\) return null;/);
+		// The promise is consumed, so one refusal cannot mute every later export.
+		expect(exportFn).toMatch(/exportTargetCommit = null;/);
+		// The commit reports refusal rather than swallowing it.
+		const commitFn = src.slice(src.indexOf('async function commitExportTarget'), src.indexOf('async function setNumberingLevel'));
+		expect(commitFn).toMatch(/Promise<boolean>/);
+		expect(commitFn).toMatch(/return false;/);
 		// And the manual export reports the SERVER's reason (the clobber / non-.py
 		// refusals exist for their message; "Export failed." names no cause).
 		expect(exportFn).toMatch(/onNotice\?\./);

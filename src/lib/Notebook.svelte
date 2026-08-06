@@ -77,8 +77,9 @@
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
 		/**
-		 * Set (or clear, with '') the notebook's `.py` export target. The write is
-		 * debounced; `flush` commits it immediately (the input's blur).
+		 * Set (or clear, with '') the notebook's `.py` export target. Called ONCE PER
+		 * EDIT, from the input's `change` (a blur after typing, or Enter) - never per
+		 * keystroke, since the write can be refused.
 		 */
 		onSetExportTarget?: (target: string) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */

@@ -1683,7 +1683,7 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		full.push(id);
 	}
 	if (!full.length) return { ok: false as const, missing: null };
-	setCellExportsDoc(full, exported, target);
+	const wrote = setCellExportsDoc(full, exported, target).length > 0;
 	const toHandle = handleFn(target);
 	const marked = full.map(toHandle);
 	const where = exportTargetFields(target);
@@ -1692,7 +1692,7 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		exported: marked,
 		count: marked.length,
 		...where,
-		...moduleWarning(target, where.export_target)
+		...moduleWarning(target, where.export_target, wrote)
 	};
 }
 
@@ -1761,10 +1761,21 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * ordinary call pays no tokens for it - the `undo` field on `clearOutputs` is the
  * same conditional shape for the same reason.
  *
- * Two ways it can happen, ordered by urgency: the write THREW (`moduleFailure`),
+ * Three ways it can happen, ordered by urgency: the write THREW (`moduleFailure`),
  * or NOTHING IS MARKED - `exportNotebookToPy` returns early with `no-cells`, so it
  * neither rewrites nor removes the file, and unmarking the last marked cell leaves
- * the previously exported symbols on disk where an `import` still resolves them.
+ * the previously exported symbols on disk where an `import` still resolves them -
+ * or the call WROTE NOTHING and no module is on disk.
+ *
+ * That third case is what `wrote` is for. `lastExportError` is doc state this
+ * process may never have written: an idempotent call (every addressed cell already
+ * at the requested value) skips the persist entirely, so on a freshly opened doc -
+ * after a restart, with the module since deleted or replaced outside Cellar - the
+ * record is null, no field is emitted, and under the conditional contract that
+ * absence reads as a module that WAS regenerated. A call that really did write is
+ * already covered: it either succeeded, so the module is there, or it threw, which
+ * `moduleFailure` reports - so only the no-write path consults the disk, and it
+ * decides from what is actually there rather than from a record nobody wrote.
  *
  * That second case is deliberately NOT reported by `setExportTarget`, which shares
  * only `moduleFailure`: naming a target before marking anything is the normal
@@ -1787,10 +1798,19 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * clobber guard exists to protect - so the "left on disk" wording is reserved for
  * a file Cellar really generated; anything else reads as no module of ours.
  */
-function moduleWarning(target: string, exportTarget: string | null) {
+function moduleWarning(target: string, exportTarget: string | null, wrote: boolean) {
 	const failed = moduleFailure(target, exportTarget);
 	if ('module' in failed) return failed;
-	if (!exportTarget || exportCellCount(listCells(target))) return {};
+	if (!exportTarget) return {};
+	if (exportCellCount(listCells(target))) {
+		if (wrote || generatedModuleExists(exportTarget)) return {};
+		return {
+			module: {
+				regenerated: false as const,
+				reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - edit a marked cell, or export the notebook, to write it`
+			}
+		};
+	}
 	return {
 		module: {
 			regenerated: false as const,

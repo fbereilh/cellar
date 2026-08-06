@@ -613,6 +613,62 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 	});
 
 	/**
+	 * The guard protects CONTENT, and an empty file has none. Pre-creating the module
+	 * (`touch utils.py`, the explorer's "New file") before naming the target is an
+	 * ordinary workflow, and refusing it stopped the module regenerating on EVERY
+	 * later save through a path no UI surface reads - a permanent silent dead end.
+	 */
+	it('overwrites an EMPTY file at the target rather than refusing it', async () => {
+		const { target, code } = await makeNotebook('target-empty.ipynb');
+		writeFileSync(join(WS, 'touched.py'), '');
+		writeFileSync(join(WS, 'blank.py'), '\n  \n');
+		svc.setExportTarget('touched.py', target);
+
+		const r = svc.setCellExport([code[0]], true, target);
+		expect(r.ok && 'module' in r).toBe(false); // nothing to report - it was written
+		expect(nbmod.lastExportError(target)).toBe(null);
+		expect(readFileSync(join(WS, 'touched.py'), 'utf8')).toContain('def one():');
+
+		// Whitespace only is the same case (a "New file" that was saved once).
+		svc.setExportTarget('blank.py', target);
+		expect(readFileSync(join(WS, 'blank.py'), 'utf8')).toContain('def one():');
+		expect(nbmod.lastExportError(target)).toBe(null);
+	});
+
+	/**
+	 * `lastExportError` is doc state THIS PROCESS may never have written: an idempotent
+	 * call (every addressed cell already at the requested value) skips the persist, so
+	 * on a freshly opened doc - or after the module is deleted/replaced outside Cellar -
+	 * the record is null, no field is emitted, and under the conditional contract that
+	 * absence reads as a module that WAS regenerated. The no-write path therefore
+	 * decides from the DISK, through the same provenance predicate.
+	 */
+	it('an idempotent call that wrote nothing reports a module missing from disk', async () => {
+		const { target, code } = await makeNotebook('module-gone.ipynb');
+		svc.setExportTarget('lib/gone.py', target);
+		expect(svc.setCellExport([code[0]], true, target).ok).toBe(true);
+		expect(nbmod.lastExportError(target)).toBe(null);
+
+		// Re-marking an already-marked cell changes nothing, so nothing persists and
+		// nothing regenerates - only the disk can answer whether the module is there.
+		const still = svc.setCellExport([code[0]], true, target);
+		expect(still.ok && 'module' in still).toBe(false);
+
+		unlinkSync(join(WS, 'lib/gone.py'));
+		const after = svc.setCellExport([code[0]], true, target);
+		expect(after.ok ? after.module : null).toMatchObject({ regenerated: false });
+		expect(after.ok ? after.module?.reason : '').toContain('lib/gone.py');
+		expect(after.ok ? after.module?.reason : '').toContain('wrote none');
+		// It reports STATE, never a claim that these marks were dropped.
+		expect(after.ok ? after.module?.reason : '').not.toContain('no cell is marked');
+
+		// A call that really does write is unaffected - it regenerates the module.
+		const wrote = svc.setCellExport([code[1]], true, target);
+		expect(wrote.ok && 'module' in wrote).toBe(false);
+		expect(readFileSync(join(WS, 'lib/gone.py'), 'utf8')).toContain('def two():');
+	});
+
+	/**
 	 * `exportPy` writes without going through `persist`, so it never refreshed the
 	 * record `autoExportPy` keeps. Left standing, a failure the user then FIXED and
 	 * resolved with the manual button was still reported by the next idempotent
