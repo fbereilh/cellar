@@ -457,9 +457,8 @@
 	 * `{:else if fetching}` gate), which an SSE reconnect, a seq gap from an agent's
 	 * edit, `notebook:restored` or a refused bulk op all trigger - so a teardown commit
 	 * fired mid-edit from a background event the user never caused, raising a spurious
-	 * refusal for a half-typed path or silently persisting one that happened to parse
-	 * (and racing the resolving load over `sentExportTarget`). Losing an uncommitted
-	 * value to a refetch is the far better half of that trade.
+	 * refusal for a half-typed path or silently persisting one that happened to parse.
+	 * Losing an uncommitted value to a refetch is the far better half of that trade.
 	 */
 	function flushExportTarget(keepalive = false) {
 		const el = exportTargetEl;

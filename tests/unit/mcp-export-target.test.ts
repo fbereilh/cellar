@@ -251,7 +251,8 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 					body: JSON.stringify({ op: 'set-target', target: 'lib/text.py', path: 'text-target-route.py' })
 				})
 			});
-		await expect(call()).rejects.toMatchObject({ status: 400 });
+		const res = await call();
+		expect(res.status).toBe(400);
 		expect(nbmod.getExportTarget(target)).toBe(null);
 		expect(py.writes).toEqual([]);
 	});
@@ -262,15 +263,47 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 		// The exporter WRITES to this path, so an ordinary source file named here would
 		// be overwritten the moment a cell is marked - the human's input reaches the
 		// same setter an agent does, so it takes the same refusal.
-		await expect(
-			(POST as unknown as (e: { request: Request }) => Promise<Response>)({
+		const res = await (POST as unknown as (e: { request: Request }) => Promise<Response>)({
+			request: new Request('http://x/api/notebooks/export-py', {
+				method: 'POST',
+				body: JSON.stringify({ op: 'set-target', target: 'src/app.ts' })
+			})
+		});
+		expect(res.status).toBe(400);
+		expect(nbmod.getExportTarget(nb)).toBe(null);
+	});
+
+	/**
+	 * A refusal must tell the tab what the document HOLDS, because that is what its
+	 * input goes back to. Answering with a bare message forced the client to remember
+	 * a baseline of its own, and keeping that in step with the server needed a rule
+	 * per failure mode - each of which had its own hole.
+	 */
+	it('every set-target reply reports the target the document holds', async () => {
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const post = POST as unknown as (e: { request: Request }) => Promise<Response>;
+		svc.useNotebook('sessHeld', 'held-target.ipynb');
+		const nb = svc.targetFor('sessHeld');
+		await svc.addCells([{ cell_type: 'code', source: 'h = 1' }], null, { nb, routeImports: false });
+		const call = (target: string) =>
+			post({
 				request: new Request('http://x/api/notebooks/export-py', {
 					method: 'POST',
-					body: JSON.stringify({ op: 'set-target', target: 'src/app.ts' })
+					body: JSON.stringify({ op: 'set-target', target, path: 'held-target.ipynb' })
 				})
-			})
-		).rejects.toMatchObject({ status: 400 });
-		expect(nbmod.getExportTarget(nb)).toBe(null);
+			});
+
+		expect(await (await call('lib/held.py')).json()).toEqual({ ok: true, target: 'lib/held.py' });
+		// Refused, and the reply names the target still in force - so the field reverts to
+		// what the server really holds rather than to whatever it last remembered.
+		const refused = await call('src/app.ts');
+		expect(refused.status).toBe(400);
+		expect(await refused.json()).toMatchObject({
+			ok: false,
+			target: 'lib/held.py',
+			message: expect.stringMatching(/not a \.py file/)
+		});
+		expect(nbmod.getExportTarget(nb)).toBe('lib/held.py');
 	});
 });
 
@@ -341,7 +374,9 @@ describe('the client half of that refusal (source guard)', () => {
 		// input keeps a rejected path while the metadata holds nothing.
 		expect(fn).not.toMatch(/\.catch\(\(\)\s*=>\s*\{\}\)/);
 		expect(fn).toMatch(/res\?\.ok/);
-		expect(fn).toMatch(/exportTarget = confirmedExportTarget/);
+		// The revert target comes from the SERVER's own reply, never from a remembered
+		// baseline (see the no-shadow-state block below).
+		expect(fn).toMatch(/exportTarget = held/);
 		expect(fn).toMatch(/onNotice\?\./);
 	});
 
@@ -362,15 +397,13 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(commitFn).not.toMatch(/if \(!res\) return true/);
 		expect(commitFn).toMatch(/return 'unreachable';/);
 		expect(commitFn).toMatch(/could not be reached/);
-		// Four outcomes, not a boolean: the baseline advances on exactly one of them.
+		// Five outcomes, not a boolean.
 		expect(commitFn).toMatch(/Promise<TargetCommit>/);
 		expect(commitFn).toMatch(/return 'committed';/);
 		expect(commitFn).toMatch(/return 'refused';/);
 		// The field moving on is neither a refusal nor a failure - touch nothing - and it
-		// is decided BEFORE either revert.
-		expect(commitFn.indexOf("return 'superseded';")).toBeLessThan(
-			commitFn.indexOf('exportTarget = confirmedExportTarget')
-		);
+		// is decided BEFORE anything is written back, the success path included.
+		expect(commitFn.indexOf("return 'superseded';")).toBeLessThan(commitFn.indexOf('exportTarget = held'));
 	});
 
 	it('adopts the value the SERVER stored, not the one it sent', () => {
@@ -379,15 +412,14 @@ describe('the client half of that refusal (source guard)', () => {
 			src.indexOf('async function setNumberingLevel')
 		);
 		// The server normalizes an absolute in-workspace path, and this tab
-		// echo-suppresses its own `notebook:export-target`, so recording the SENT value
+		// echo-suppresses its own `notebook:export-target`, so keeping the SENT value
 		// left the input showing a path the document does not hold.
 		const ok = commitFn.slice(commitFn.indexOf('if (res?.ok)'), commitFn.indexOf("return 'committed';"));
-		expect(ok).toMatch(/body\?\.target/);
-		expect(ok).toMatch(/confirmedExportTarget = stored/);
-		expect(ok).not.toMatch(/confirmedExportTarget = next/);
+		expect(ok).toMatch(/exportTarget = held/);
+		expect(ok).not.toMatch(/exportTarget = next/);
 	});
 
-	it('commits ONCE PER EDIT, and reverts to the SERVER-confirmed value', () => {
+	it('commits ONCE PER EDIT, and puts the field back to what the SERVER reports', () => {
 		// The input's DOM value is state-driven, so writing per keystroke made every
 		// character of a refused path 400, revert the field and move the caret - and the
 		// debounce + generation guard + pending mirror stacked to contain that were
@@ -399,9 +431,6 @@ describe('the client half of that refusal (source guard)', () => {
 		// only thing that reads it back is the unload flush in `Notebook.svelte` below.
 		expect(src).not.toMatch(/flushExportTarget/);
 		expect(fn).not.toMatch(/const previous = exportTarget/);
-		// The baseline is only ever written where the server states it.
-		const writes = src.match(/confirmedExportTarget = /g) ?? [];
-		expect(writes.length).toBe(3); // load, the SSE event, a confirmed write
 
 		const nbSrc = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
 		expect(nbSrc).toMatch(/onchange=\{onExportTargetCommit\}/);
@@ -571,7 +600,7 @@ describe('a refused path and a failed write are told apart', () => {
 			});
 
 		// A path REFUSAL keeps today's 400 (the client reverts and says to fix the path).
-		await expect(call('src/app.ts')).rejects.toMatchObject({ status: 400 });
+		expect((await call('src/app.ts')).status).toBe(400);
 
 		disk.failFor = 'disk-route.ipynb';
 		let res: Response;
@@ -586,32 +615,83 @@ describe('a refused path and a failed write are told apart', () => {
 		expect(res.status).toBe(500);
 		expect(await res.json()).toMatchObject({
 			ok: false,
-			writeFailed: expect.stringMatching(/ENOSPC/)
+			writeFailed: expect.stringMatching(/ENOSPC/),
+			// The path was accepted, so the target it reports as held is the NEW one - the
+			// field keeps it and cannot diverge from the document.
+			target: 'lib/disk-route.py'
 		});
 		expect(nbmod.getExportTarget(nb)).toBe('lib/disk-route.py');
 
-		// The client half: a 5xx keeps the field (the document holds it) and only says so,
-		// while the 400 above still reverts. vitest runs without the SvelteKit plugin, so
-		// `LiveNotebook.svelte` cannot be mounted - pinned against the source instead.
+		// The client half: a failed write keeps the field (the document holds it) and only
+		// says so, while the 400 above still reverts. vitest runs without the SvelteKit
+		// plugin, so `LiveNotebook.svelte` cannot be mounted - pinned against the source.
 		const live = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
 		const commitFn = live.slice(
 			live.indexOf('async function commitExportTarget'),
 			live.indexOf('async function setNumberingLevel')
 		);
-		const writeBranch = commitFn.slice(
-			commitFn.indexOf('res.status >= 500'),
-			commitFn.indexOf("return 'writeFailed';")
-		);
-		expect(writeBranch, 'a 5xx should have its own branch').not.toBe('');
-		expect(writeBranch).not.toMatch(/exportTarget = confirmedExportTarget/);
+		const writeBranch = commitFn.slice(commitFn.indexOf('if (failure)'), commitFn.indexOf("return 'writeFailed';"));
+		expect(writeBranch, 'a failed write should have its own branch').not.toBe('');
 		expect(writeBranch).toMatch(/accepted but not saved/);
-		// It is decided BEFORE the revert every other failure takes.
-		expect(commitFn.indexOf('res.status >= 500')).toBeLessThan(
-			commitFn.indexOf('exportTarget = confirmedExportTarget')
+		// Decided by the FLAG the route sets, never by the status code: any OTHER 5xx (a
+		// proxy 502/503, an HTML error page) landed no verdict at all, so reporting it as
+		// accepted left the field claiming a value the server may never have received -
+		// the false acceptance the `unreachable` branch exists to prevent, reached through
+		// the other door.
+		expect(commitFn).not.toMatch(/status >= 500/);
+		expect(commitFn).toMatch(/body\?\.writeFailed/);
+	});
+});
+
+/**
+ * The tab keeps NO copy of the server's target. Two of them (the last confirmed
+ * value and the last sent one) each needed a rule to stay agreeing, and every rule
+ * had a hole: a failed write left them describing different paths, so retyping the
+ * previous one wrote nothing while the server kept the newer; and a background
+ * refetch resolving inside a commit window seeded them staler than the write in
+ * flight. Every reply states what the document holds, so there is nothing to
+ * reconcile - pinned against the source, since vitest cannot mount the component.
+ */
+describe('the client mirrors no server state (source guard)', () => {
+	const live = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
+
+	it('keeps neither a confirmed nor a sent baseline', () => {
+		expect(live).not.toMatch(/confirmedExportTarget/);
+		expect(live).not.toMatch(/sentExportTarget/);
+	});
+
+	it('has no skip-check, so a value can always be committed again', () => {
+		// The `next === sentExportTarget` early return made a retry of the same path a
+		// no-op - which, after a failed write, was the only way back to a saved state. A
+		// redundant identical POST is the accepted price: the setter is idempotent.
+		const fn = live.slice(
+			live.indexOf('function setExportTargetValue'),
+			live.indexOf('async function commitExportTarget')
 		);
-		// And the same path can be committed again once the disk recovers (the early
-		// `next === sentExportTarget` return would otherwise make a retry a no-op).
-		expect(writeBranch).toMatch(/sentExportTarget = confirmedExportTarget/);
+		expect(fn).not.toMatch(/if \(next === /);
+		expect(fn).toMatch(/commitExportTarget\(target, next, keepalive\)/);
+	});
+
+	it('load() and the SSE event just show what the server returned', () => {
+		// Nothing for a refetch to seed staler than an in-flight commit.
+		const load = live.slice(live.indexOf('async function load'), live.indexOf('loadFolds();'));
+		expect(load).toMatch(/exportTarget = body\.notebook\.exportTarget \?\? null;/);
+		expect(load.split('exportTarget')).toHaveLength(3); // exactly the one assignment
+		const ev = live.slice(live.indexOf("ev.type === 'notebook:export-target'"));
+		expect(ev.slice(0, ev.indexOf('} else if'))).toMatch(/^[^]*exportTarget = ev\.target;\s*$/);
+	});
+
+	it('reads the reply ONCE and takes the held target from it', () => {
+		const commitFn = live.slice(
+			live.indexOf('async function commitExportTarget'),
+			live.indexOf('async function setNumberingLevel')
+		);
+		expect(commitFn.match(/\.json\(\)/g) ?? []).toHaveLength(1);
+		expect(commitFn).toMatch(/'target' in body/);
+		// A reply we cannot read as either outcome must not claim the target took.
+		const unknown = commitFn.slice(commitFn.lastIndexOf('onNotice?.('));
+		expect(unknown).toMatch(/not saved/);
+		expect(unknown).not.toMatch(/accepted/);
 	});
 });
 

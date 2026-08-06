@@ -1350,7 +1350,6 @@
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
 			exportTarget = body.notebook.exportTarget ?? null; // nbdev export target
-			confirmedExportTarget = sentExportTarget = exportTarget; // what the server holds
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			// A notebook always has a selected cell (command mode acts on it), so
@@ -1451,7 +1450,6 @@
 			}
 		} else if (ev.type === 'notebook:export-target') {
 			exportTarget = ev.target;
-			confirmedExportTarget = sentExportTarget = ev.target;
 		} else if (ev.type === 'notebook:header-numbering') {
 			headerNumbering = ev.levels ?? [];
 		} else if (ev.type === 'notebook:hide-all-code') {
@@ -2074,24 +2072,6 @@
 	}
 
 	/**
-	 * The last value the SERVER confirmed - what a refusal reverts to. The previous
-	 * OPTIMISTIC value is the wrong baseline: under consecutive refusals it was
-	 * itself never stored, so the input settled on a path the server had rejected,
-	 * i.e. the very state the revert exists to prevent.
-	 */
-	let confirmedExportTarget: string | null = null;
-	/**
-	 * The last value SENT (or last known held, seeded at load and by the SSE event),
-	 * which is what the "nothing changed, write nothing" check keys on. Keyed on the
-	 * CONFIRMED value instead, a commit issued while an earlier one was still in
-	 * flight was dropped: typing `a.py` then clearing the field before the first
-	 * response landed compared null against a baseline the first write had not yet
-	 * advanced, so no clear was ever sent and the input read empty while the server
-	 * kept regenerating to `a.py` (this tab echo-suppresses its own event, so nothing
-	 * corrected it until a reload).
-	 */
-	let sentExportTarget: string | null = null;
-	/**
 	 * What became of a target write. Five OUTCOMES, not a boolean: a single flag
 	 * conflated three of them and each conflation surfaced as its own defect -
 	 * an unreachable server read as success (the field kept a value the server
@@ -2099,16 +2079,18 @@
 	 * while a merely SUPERSEDED write read as a refusal and turned the export
 	 * button into a dead control that issued no request and said nothing.
 	 *
-	 * - `committed`   the server stored it (the only outcome that advances the baseline)
-	 * - `refused`     the server REJECTED the path; reverted + explained
-	 * - `unreachable` the request never landed a verdict; reverted + explained
-	 * - `writeFailed` the path was ACCEPTED but could not be saved; kept + explained
+	 * - `committed`   the server stored it
+	 * - `refused`     the server REJECTED the path; explained
+	 * - `unreachable` the request landed no verdict we can read; explained
+	 * - `writeFailed` the path was ACCEPTED but could not be saved; explained
 	 * - `superseded`  the field moved on, so a newer value owns it: touch nothing
 	 *
 	 * `writeFailed` is the fifth because the route validates before it mutates: a
-	 * disk failure leaves the live document HOLDING the target, so reverting the
-	 * field there showed a value the server no longer agrees with and sent the user
-	 * to fix a path that was never wrong.
+	 * disk failure leaves the live document HOLDING the target, so saying it was not
+	 * set sent the user to fix a path that was never wrong. It is decided by the
+	 * `writeFailed` FLAG the route sets, never by the status code - any other 5xx (a
+	 * proxy 502/503, an HTML error page) landed no verdict and is `unreachable`,
+	 * which must never claim the target was accepted.
 	 */
 	type TargetCommit = 'committed' | 'refused' | 'unreachable' | 'writeFailed' | 'superseded';
 	/**
@@ -2119,17 +2101,26 @@
 	 * It is dropped the moment it SETTLES, because that is what makes the abort in
 	 * `exportPy` belong to the blur-then-click interaction and nothing else: a
 	 * refusal kept here after settling silently aborted the NEXT manual export -
-	 * one that would have run fine against the confirmed target - and produced no
+	 * one that would have run fine against the stored target - and produced no
 	 * message at all, since the export never issued a request to report on.
 	 */
 	let exportTargetCommit: Promise<TargetCommit> | null = null;
 
 	/**
-	 * Set (or clear) the notebook's `.py` export target. Optimistic + persisted, and
-	 * REVERTED (with the reason said out loud) whenever the write did not land - a
-	 * server refusal, or a server that could not be reached at all. A target the
-	 * server ACCEPTED but could not save (a disk failure, `writeFailed`) is the one
-	 * failure that is kept rather than reverted: the live document holds it.
+	 * Set (or clear) the notebook's `.py` export target. Optimistic + persisted; the
+	 * field then ADOPTS whatever the reply says the document holds, and the reason is
+	 * said out loud whenever that is not what was sent.
+	 *
+	 * The SERVER is the only place this value lives. The tab deliberately keeps no
+	 * copy of it: two of them (the last confirmed value and the last sent one) needed
+	 * a rule apiece to stay agreeing with each other and with the server, and each
+	 * rule had its own hole - a write failure left the two describing different paths,
+	 * so retyping the previous one wrote nothing while the server kept the newer; and
+	 * a background refetch resolving inside a commit window seeded them staler than
+	 * the write in flight. Every reply carries `target`, so there is nothing to
+	 * reconcile: a refusal reverts to what the server really holds, and a redundant
+	 * identical POST (the setter is idempotent and writes byte-identically) is the
+	 * accepted price of having no skip-check to get wrong.
 	 *
 	 * The route refuses a `.py` text notebook (which stores no cellar metadata), a
 	 * target escaping the workspace and one that is not a `.py` module, and it emits
@@ -2145,22 +2136,19 @@
 	 * - never per keystroke. Per-keystroke writing was harmless only while the route
 	 * could refuse nothing: with real refusals it made every character of a bad path
 	 * 400, revert the field and move the caret, and the debounce + generation guard +
-	 * pending-value mirror stacked to contain that were themselves a race (a
-	 * superseded-but-successful write never advanced the confirmed baseline). One
-	 * commit per edit removes all of it: an unmodified blur fires no `change`, so
-	 * clicking through the field still writes nothing.
+	 * pending-value mirror stacked to contain that were themselves a race. One commit
+	 * per edit removes all of it: an unmodified blur fires no `change`, so clicking
+	 * through the field still writes nothing.
 	 *
 	 * `change` is not reliably delivered before unload, though, so a value typed and
 	 * never blurred would be lost on a reload or a tab close - which is why the field
-	 * also flushes on `pagehide` and on unmount (`Notebook.svelte`), the idiom
-	 * `Cell.svelte` already uses for its debounced edit. That flush passes
+	 * also flushes on `pagehide` (`Notebook.svelte`), the idiom `Cell.svelte` already
+	 * uses for its debounced edit, and on unload ONLY. That flush passes
 	 * `keepalive`, so the write survives the page going away.
 	 */
 	function setExportTargetValue(target: string, { keepalive = false }: { keepalive?: boolean } = {}) {
 		const next = target.trim() || null;
 		exportTarget = next;
-		if (next === sentExportTarget) return;
-		sentExportTarget = next;
 		const commit = commitExportTarget(target, next, keepalive);
 		exportTargetCommit = commit;
 		const drop = () => {
@@ -2178,62 +2166,57 @@
 			// is one path, far under the ~64KB a keepalive body is capped at.
 			keepalive
 		}).catch(() => null);
+		// Read ONCE. Every set-target reply states the target the document HOLDS, which
+		// is what the field adopts on every outcome the server answered at all - that
+		// reply is the only copy of this value the tab has.
+		const body = res
+			? await res
+					.json()
+					.then((b) => (b && typeof b === 'object' ? (b as Record<string, unknown>) : null))
+					.catch(() => null)
+			: null;
+		// The one comparison left, and it is against the FIELD rather than any memory of
+		// server state: while this write was on the wire the value moved on (the user
+		// typed again, or an agent's / another tab's `notebook:export-target` landed, or
+		// a refetch did), so a newer value owns it and writing our reply back would
+		// discard state this write knows nothing about.
+		if (exportTarget !== next) return 'superseded';
+		const knowsHeld = !!body && 'target' in body;
+		const held = knowsHeld ? ((body!.target ?? null) as string | null) : null;
 		if (res?.ok) {
-			// The baseline is what the server STORED, not what we sent: `setExportTarget`
-			// normalizes an absolute in-workspace path to its relative form, and this tab
-			// echo-suppresses its own `notebook:export-target`, so recording the sent value
-			// left the field showing a path the document does not hold. A body we cannot
-			// read falls back to the sent value (the pre-normalization behavior).
-			const stored = await res
-				.json()
-				.then((body) => (body?.target ?? null) as string | null)
-				.catch(() => next);
-			// Only the LATEST write may advance the baseline: an older response landing
-			// after a newer one would otherwise record a value the server no longer holds.
-			if (sentExportTarget === next) {
-				confirmedExportTarget = stored;
-				sentExportTarget = stored;
-				// Adopted only while the field still shows what this write sent - otherwise
-				// the user (or an event) has moved on and owns it.
-				if (exportTarget === next) exportTarget = stored;
-			}
+			// What the server STORED, not what we sent: `setExportTarget` normalizes an
+			// absolute in-workspace path to its relative form, and this tab echo-suppresses
+			// its own `notebook:export-target`, so keeping the sent value left the field
+			// showing a path the document does not hold. An unreadable body keeps what was
+			// sent (the pre-normalization behavior).
+			if (knowsHeld) exportTarget = held;
 			return 'committed';
 		}
-		// Checked before either revert: the field moved on (an agent's or another tab's
-		// `notebook:export-target`, or a refetch), so a newer value owns it and yanking
-		// it back to our baseline would discard state this write knows nothing about.
-		if (exportTarget !== next) return 'superseded';
-		if (res && res.status >= 500) {
-			// NOT a refusal: the route validates the path BEFORE it mutates, so a 5xx is the
+		const failure = typeof body?.writeFailed === 'string' ? body.writeFailed : null;
+		const message = typeof body?.message === 'string' ? body.message : null;
+		if (failure) {
+			// NOT a refusal: the route validates the path BEFORE it mutates, so this is the
 			// notebook WRITE failing (EACCES, ENOSPC, a read-only checkout) over a target the
-			// live document already holds and will save with its next successful write. So the
-			// field KEEPS it - reverting showed a value the server no longer agrees with, under
-			// a "fix the path" remedy for a problem that did not occur. Only the baseline stays
-			// put (nothing reached disk), and `sentExportTarget` falls back to it so committing
-			// the SAME path again re-issues the write once the disk recovers.
-			if (sentExportTarget === next) sentExportTarget = confirmedExportTarget;
-			const failure = await res
-				.json()
-				.then((body) => body?.writeFailed ?? body?.message)
-				.catch(() => null);
-			onNotice?.(`Export target accepted but not saved${failure ? `: ${failure}` : '.'}`);
+			// live document already holds and will save with its next successful write - which
+			// is why `held` is the NEW path here and the field keeps it. Saying it was not set
+			// was a "fix the path" remedy for a problem that did not occur.
+			if (knowsHeld) exportTarget = held;
+			onNotice?.(`Export target accepted but not saved: ${failure}`);
 			return 'writeFailed';
 		}
-		exportTarget = confirmedExportTarget;
-		sentExportTarget = confirmedExportTarget;
-		if (!res) {
-			// An unreachable server is NOT a success: leaving the typed path in the field
-			// showed a target the server may never have stored, and the export then ran on
-			// to report "Exported N cells -> <old target>" over it.
-			onNotice?.('Export target not saved: the server could not be reached.');
-			return 'unreachable';
+		if (knowsHeld) {
+			exportTarget = held;
+			onNotice?.(`Export target not set${message ? `: ${message}` : '.'}`);
+			return 'refused';
 		}
-		const message = await res
-			.json()
-			.then((body) => body?.message)
-			.catch(() => null);
-		onNotice?.(`Export target not set${message ? `: ${message}` : '.'}`);
-		return 'refused';
+		// No verdict we can read: the server was unreachable, or something other than
+		// this route answered (a proxy 502/503, an HTML error page). We do not know what
+		// the server holds, so the field is left alone and the reply is NOT claimed as an
+		// acceptance - leaving the typed path while implying it took showed a target the
+		// server may never have stored, and the export then ran on to report a success
+		// against the old one.
+		onNotice?.(`Export target not saved${message ? `: ${message}` : ': the server could not be reached.'}`);
+		return 'unreachable';
 	}
 
 	/**
@@ -2281,8 +2264,8 @@
 	 * through the same transient notice channel as every other refused write here.
 	 */
 	async function exportPy() {
-		// Consumed, so one refusal cannot abort two exports (the field has been reverted
-		// to the confirmed value, so a second click is a fresh request).
+		// Consumed, so one refusal cannot abort two exports (the field has been put back
+		// to the value the server reported holding, so a second click is a fresh request).
 		const pending = exportTargetCommit;
 		exportTargetCommit = null;
 		const outcome = pending ? await pending.catch(() => null) : null;
