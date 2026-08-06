@@ -1807,7 +1807,7 @@ function moduleWarning(target: string, exportTarget: string | null, wrote: boole
 		return {
 			module: {
 				regenerated: false as const,
-				reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - edit a marked cell, or export the notebook, to write it`
+				reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - edit a marked cell, or re-call set_export_target with the same path, to write it`
 			}
 		};
 	}

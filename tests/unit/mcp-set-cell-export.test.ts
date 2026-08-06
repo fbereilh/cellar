@@ -679,6 +679,16 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 		// It reports STATE, never a claim that these marks were dropped.
 		expect(after.ok ? after.module?.reason : '').not.toContain('no cell is marked');
 
+		// And the remedy it names must be one this caller HAS: there is no MCP tool that
+		// exports the module (`export_html` is a different artifact and the Export button
+		// is a human surface), so the reason names the tools an agent can reach - and
+		// re-setting the same target really does persist, hence regenerate.
+		expect(after.ok ? after.module?.reason : '').toContain('set_export_target');
+		expect(after.ok ? after.module?.reason : '').not.toContain('export the notebook');
+		svc.setExportTarget('lib/gone.py', target);
+		expect(readFileSync(join(WS, 'lib/gone.py'), 'utf8')).toContain('def one():');
+		unlinkSync(join(WS, 'lib/gone.py'));
+
 		// A call that really does write is unaffected - it regenerates the module.
 		const wrote = svc.setCellExport([code[1]], true, target);
 		expect(wrote.ok && 'module' in wrote).toBe(false);

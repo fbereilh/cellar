@@ -834,8 +834,19 @@ export function effectiveExportTarget(nb?: string | null): string | null {
  * the one place the target is validated and stored, so every caller gets it -
  * keeps the notebook portable. An absolute path OUTSIDE the workspace is still
  * refused by `resolveInWorkspace`, unchanged.
+ *
+ * It RETURNS the value it stored, not the one it was handed, so a caller reports
+ * what the document holds: normalizing without reporting it left the UI route
+ * answering with the raw absolute path, which the tab then recorded as its
+ * baseline and kept in the input while the server held the relative form - and
+ * the `notebook:export-target` event that would have corrected it is
+ * echo-suppressed in the initiating tab.
  */
-export function setExportTarget(target: string | null, nb?: string | null, originId?: string | null): boolean {
+export function setExportTarget(
+	target: string | null,
+	nb?: string | null,
+	originId?: string | null
+): string | null {
 	const doc = docFor(nb);
 	const raw = (target ?? '').trim();
 	let stored = '';
@@ -853,7 +864,7 @@ export function setExportTarget(target: string | null, nb?: string | null, origi
 	else delete doc.metadata.cellar.export_target;
 	persist(doc);
 	emit(doc, 'notebook:export-target', { target: stored || null }, originId);
-	return true;
+	return stored || null;
 }
 
 /** The notebook's enabled heading-numbering levels (unique, 1-6, ascending). */

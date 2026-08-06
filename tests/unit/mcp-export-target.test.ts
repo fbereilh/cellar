@@ -258,6 +258,57 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 	});
 });
 
+/**
+ * A write endpoint must report the value it PERSISTED, never the one it was handed.
+ * `setExportTarget` normalizes an absolute in-workspace path to its relative form,
+ * and the initiating tab echo-suppresses its own `notebook:export-target`, so a
+ * route answering with the raw request left the input showing an absolute path the
+ * document does not hold - with nothing to correct it short of a reload.
+ */
+describe('the stored value is what is reported back', () => {
+	it('the UI route answers with the normalized target, not the request', async () => {
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		svc.useNotebook('sessStored', 'stored-target.ipynb');
+		const nb = svc.targetFor('sessStored');
+		await svc.addCells([{ cell_type: 'code', source: 'x = 1' }], null, { nb, routeImports: false });
+
+		const res = await (POST as unknown as (e: { request: Request }) => Promise<Response>)({
+			request: new Request('http://x/api/notebooks/export-py', {
+				method: 'POST',
+				body: JSON.stringify({
+					op: 'set-target',
+					target: join(WS, 'lib', 'stored.py'),
+					path: 'stored-target.ipynb'
+				})
+			})
+		});
+		expect(await res.json()).toEqual({ ok: true, target: 'lib/stored.py' });
+		expect(nbmod.getExportTarget(nb)).toBe('lib/stored.py');
+	});
+
+	it('and clearing reports the null it stored', async () => {
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const res = await (POST as unknown as (e: { request: Request }) => Promise<Response>)({
+			request: new Request('http://x/api/notebooks/export-py', {
+				method: 'POST',
+				body: JSON.stringify({ op: 'set-target', target: '  ', path: 'stored-target.ipynb' })
+			})
+		});
+		expect(await res.json()).toEqual({ ok: true, target: null });
+		expect(nbmod.getExportTarget(svc.targetFor('sessStored'))).toBeNull();
+	});
+
+	it('the MCP result reports it too (it reads the effective target back)', async () => {
+		svc.useNotebook('sessStoredMcp', 'stored-target-mcp.ipynb');
+		const nb = svc.targetFor('sessStoredMcp');
+		await svc.addCells([{ cell_type: 'code', source: 'y = 1' }], null, { nb, routeImports: false });
+		expect(svc.setExportTarget(join(WS, 'lib', 'mcp-stored.py'), nb)).toEqual({
+			export_target: 'lib/mcp-stored.py'
+		});
+		expect(nbmod.getExportTarget(nb)).toBe('lib/mcp-stored.py');
+	});
+});
+
 describe('the client half of that refusal (source guard)', () => {
 	// vitest runs without the SvelteKit plugin, so `LiveNotebook.svelte` cannot be
 	// mounted here; the properties below are what turn the route's 400 into something
@@ -304,6 +355,20 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(commitFn.indexOf("return 'superseded';")).toBeLessThan(
 			commitFn.indexOf('exportTarget = confirmedExportTarget')
 		);
+	});
+
+	it('adopts the value the SERVER stored, not the one it sent', () => {
+		const commitFn = src.slice(
+			src.indexOf('async function commitExportTarget'),
+			src.indexOf('async function setNumberingLevel')
+		);
+		// The server normalizes an absolute in-workspace path, and this tab
+		// echo-suppresses its own `notebook:export-target`, so recording the SENT value
+		// left the input showing a path the document does not hold.
+		const ok = commitFn.slice(commitFn.indexOf('if (res?.ok)'), commitFn.indexOf("return 'committed';"));
+		expect(ok).toMatch(/body\?\.target/);
+		expect(ok).toMatch(/confirmedExportTarget = stored/);
+		expect(ok).not.toMatch(/confirmedExportTarget = next/);
 	});
 
 	it('commits ONCE PER EDIT, and reverts to the SERVER-confirmed value', () => {

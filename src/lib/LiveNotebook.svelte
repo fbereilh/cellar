@@ -2163,9 +2163,24 @@
 			body: JSON.stringify({ op: 'set-target', target: raw, path, originId })
 		}).catch(() => null);
 		if (res?.ok) {
+			// The baseline is what the server STORED, not what we sent: `setExportTarget`
+			// normalizes an absolute in-workspace path to its relative form, and this tab
+			// echo-suppresses its own `notebook:export-target`, so recording the sent value
+			// left the field showing a path the document does not hold. A body we cannot
+			// read falls back to the sent value (the pre-normalization behavior).
+			const stored = await res
+				.json()
+				.then((body) => (body?.target ?? null) as string | null)
+				.catch(() => next);
 			// Only the LATEST write may advance the baseline: an older response landing
 			// after a newer one would otherwise record a value the server no longer holds.
-			if (sentExportTarget === next) confirmedExportTarget = next;
+			if (sentExportTarget === next) {
+				confirmedExportTarget = stored;
+				sentExportTarget = stored;
+				// Adopted only while the field still shows what this write sent - otherwise
+				// the user (or an event) has moved on and owns it.
+				if (exportTarget === next) exportTarget = stored;
+			}
 			return 'committed';
 		}
 		// Checked before either revert: the field moved on (an agent's or another tab's
