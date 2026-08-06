@@ -1302,8 +1302,16 @@
 			// for the whole session on a page that loaded before the agent booted the
 			// kernel (the mount-time inspect is a one-shot with nothing to read yet).
 			// The SET matches `onRunEnd`; the inspector half is COALESCED and SCOPED to
-			// the active notebook, because unlike a user's own run a foreign one arrives
-			// once per cell of an agent batch and the probe is a real kernel execution.
+			// the active notebook, because a foreign run arrives once per cell of an
+			// agent batch and the probe is a real kernel execution. `onRunEnd` is left
+			// IMMEDIATE so a single interactive run's result lands as soon as it exists;
+			// that is a deliberate choice, NOT a claim that the own path cannot burst -
+			// a human bulk run (Run all / above / below / stale) drives `runCodeIds`
+			// sequentially and so does still probe once per cell. That cost is known and
+			// accepted: many of those probes short-circuit server-side once the next cell
+			// has claimed the kernel (`inspectVariables` returns `busy` without executing),
+			// though that is a race rather than a guarantee, and debouncing here too would
+			// delay the ordinary single-run feedback the immediacy exists for.
 			if (ev.type === 'run:end' && ev.originId !== originId) {
 				refreshKernel();
 				if (foreignRunTouchesActiveNotebook((ev as { nb?: unknown }).nb))
