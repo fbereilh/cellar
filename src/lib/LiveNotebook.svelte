@@ -199,13 +199,25 @@
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
 	// imports from (null = the workspace root, the default and today's behavior).
 	// Mirrors `notebook.metadata.cellar.root`, kept live via the `notebook:root` SSE
-	// event. `availableRoots` is the workspace's `roots/` directories, fetched
-	// alongside the notebook — when both are empty the notebook renders no root
-	// control at all, so a workspace that never adopts roots looks exactly as before.
+	// event. `availableRoots` is the workspace's `roots/` directories, fetched on
+	// mount and whenever the root changes — when both are empty the notebook renders
+	// no root control at all, so a workspace that never adopts roots looks exactly
+	// as before. `isPy` is a `.py` text notebook, which stores no notebook metadata
+	// and therefore cannot hold a root at all (the server refuses one).
 	let root = $state<string | null>(null);
+	let isPy = $state(false);
 	let availableRoots = $state<WorkspaceRootOption[]>([]);
 	let rootBusy = $state(false);
 	let rootFeedback = $state('');
+	// Generation guard for the root list (the statusSeq / kernelReqSeq convention):
+	// a mount fetch and a `notebook:root` fetch are unordered, so only the NEWEST
+	// one may apply — an older reply landing last would restore a stale list, and
+	// with it a "missing on disk" banner for a root that has since come back.
+	let rootsSeq = 0;
+	let rootsFetched = false;
+	let rootFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+	/** How long the root bar keeps reporting the outcome of a root change. */
+	const ROOT_FEEDBACK_MS = 8000;
 	// Display-only automatic header numbering. `headerNumbering` mirrors
 	// `notebook.metadata.cellar.header_numbering` (loaded on mount, kept live via
 	// the `notebook:header-numbering` SSE event); the per-heading numbers are
@@ -1365,9 +1377,16 @@
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			root = body.notebook.root ?? null; // code root (kernel cwd + sys.path)
-			// Detached: the notebook must render the instant its cells arrive, and the
-			// root list only decides whether a picker is OFFERED, never what runs.
-			void loadRoots();
+			isPy = !!body.notebook.isPy; // a `.py` text notebook holds no root at all
+			// ONCE, not on every load: `load()` is also the reconnect / seq-gap /
+			// output-append resync backstop, and the root list costs a git read per root
+			// on the process carrying the kernel websockets and the SSE fan-out. It only
+			// decides whether a picker is OFFERED, never what runs, and a genuine change
+			// arrives on `notebook:root`. Detached, so the cells render immediately.
+			if (!rootsFetched && !isPy) {
+				rootsFetched = true;
+				void loadRoots();
+			}
 			// A notebook always has a selected cell (command mode acts on it), so
 			// j/k and the rest work the moment the notebook opens. A refetch can also
 			// have removed cells out from under a multi-selection, so prune it to what
@@ -1404,6 +1423,13 @@
 	// edits (rather than a stale snapshot), and cells are only created once the
 	// real source is known — so each Cell's editor seeds with correct content.
 	onMount(load);
+
+	// The root-feedback line is the one timer this component owns outside a
+	// subscription; drop it with the notebook so a torn-down tab writes nothing.
+	onMount(() => () => {
+		if (rootFeedbackTimer) clearTimeout(rootFeedbackTimer);
+		rootFeedbackTimer = null;
+	});
 
 	// Live server→client sync. Subscribe to the shared per-tab event stream and
 	// apply run-lifecycle events that target THIS notebook, so an agent-driven run
@@ -1467,10 +1493,15 @@
 		} else if (ev.type === 'notebook:export-target') {
 			exportTarget = ev.target;
 		} else if (ev.type === 'notebook:root') {
-			// The code root changed (here, in another tab, or from an agent). The
+			// The code root changed in another tab or from an agent (this tab's own
+			// change is echo-suppressed by originId and refreshes the list itself). The
 			// picker follows; the kernel was already freed server-side, so the cells'
-			// run status refreshes through the `kernel:shutdown` event as usual.
+			// run status refreshes through the `kernel:shutdown` event as usual. Any
+			// feedback about OUR last change is about the root someone else just moved,
+			// so it goes rather than staying to describe a state that no longer holds.
 			root = ev.root ?? null;
+			showRootFeedback('');
+			rootsFetched = true;
 			void loadRoots();
 		} else if (ev.type === 'notebook:header-numbering') {
 			headerNumbering = ev.levels ?? [];
@@ -2098,15 +2129,36 @@
 	 * Fetch the workspace's code roots (for the picker). Never throws: a failure
 	 * leaves the list as it was, and the notebook's OWN root — which is what
 	 * actually runs — comes from the notebook load, not from here.
+	 *
+	 * Generation-guarded: only the newest fetch may apply, so an older reply landing
+	 * last cannot restore a stale list (and with it a "missing on disk" banner for a
+	 * directory that has since been restored).
 	 */
 	async function loadRoots() {
+		const seq = ++rootsSeq;
 		try {
 			const res = await fetch(`/api/notebooks/root?path=${encodeURIComponent(path)}`);
 			const body = await res.json();
-			if (res.ok) availableRoots = body.roots ?? [];
+			if (res.ok && seq === rootsSeq) availableRoots = body.roots ?? [];
 		} catch {
 			// Offline / route error: keep whatever the picker already had.
 		}
+	}
+
+	/**
+	 * The outcome of the last root change, shown beside the picker. Self-dismissing:
+	 * it describes ONE action at ONE moment, so leaving it in the bar indefinitely
+	 * would keep asserting it over a notebook the user has since moved on from.
+	 */
+	function showRootFeedback(msg: string) {
+		rootFeedback = msg;
+		if (rootFeedbackTimer) clearTimeout(rootFeedbackTimer);
+		rootFeedbackTimer = msg
+			? setTimeout(() => {
+					rootFeedback = '';
+					rootFeedbackTimer = null;
+				}, ROOT_FEEDBACK_MS)
+			: null;
 	}
 
 	/**
@@ -2118,7 +2170,7 @@
 	 */
 	async function setRootValue(next: string) {
 		rootBusy = true;
-		rootFeedback = '';
+		showRootFeedback('');
 		try {
 			const res = await fetch('/api/notebooks/root', {
 				method: 'POST',
@@ -2128,13 +2180,19 @@
 			const body = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(body?.message || 'could not set the code root');
 			root = body.root ?? null;
-			rootFeedback = !body.changed
-				? 'Already running there.'
-				: body.namespace_cleared
-					? 'Kernel freed — variables cleared; the next run starts in the new root.'
-					: 'Applied — the kernel will start in the new root.';
+			// This tab suppresses its OWN `notebook:root` echo (originId), so nothing
+			// else refreshes the list — and it has just changed: a newly declared root
+			// gains a notebook, and one whose directory came back stops being "missing".
+			void loadRoots();
+			showRootFeedback(
+				!body.changed
+					? 'Already running there.'
+					: body.namespace_cleared
+						? 'Kernel freed — variables cleared; the next run starts in the new root.'
+						: 'Applied — the kernel will start in the new root.'
+			);
 		} catch (err) {
-			rootFeedback = String((err as Error)?.message ?? err);
+			showRootFeedback(String((err as Error)?.message ?? err));
 		} finally {
 			rootBusy = false;
 		}
@@ -3217,6 +3275,7 @@
 			onSetExportTarget={setExportTargetValue}
 			onExportPy={exportPy}
 			root={root}
+			isPy={isPy}
 			availableRoots={availableRoots}
 			rootBusy={rootBusy}
 			rootFeedback={rootFeedback}

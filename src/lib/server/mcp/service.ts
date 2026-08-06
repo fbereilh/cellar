@@ -35,6 +35,7 @@ import {
 	getNotebookRoot
 } from '../notebook';
 import { setNotebookRootAndRestart, listWorkspaceRoots } from '../notebook-root-actions';
+import { resolveRootDir } from '../notebookRoot';
 import { ROOTS_DIR } from '../../notebookRoot';
 import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel';
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
@@ -241,6 +242,46 @@ export async function setNotebookRoot(root: string | null, nb?: string | null) {
 		...(change.changed
 			? { kernel_restarted: change.kernel_restarted, namespace_cleared: change.namespace_cleared }
 			: {})
+	};
+}
+
+/**
+ * Refuse an unusable code root BEFORE anything else happens.
+ *
+ * `use_notebook` OPENS-OR-CREATES its notebook and pins the session to it, both
+ * of which are already done by the time `setNotebookRoot` could throw — so a
+ * mistyped root used to leave a freshly created `untitled.ipynb` pinned behind
+ * its own error. This is the SAME resolver the write path runs (never a second
+ * validation rule), called first so a refused root creates and pins nothing.
+ */
+export function assertRootUsable(root: string | null | undefined): void {
+	resolveRootDir(root);
+}
+
+/**
+ * Apply a code root to the session's ALREADY-PINNED working notebook — the
+ * `use_notebook(root)`-without-a-name case.
+ *
+ * Re-rooting the notebook you are working in must not silently repoint your
+ * session at a new notebook, which is what falling through to `useNotebook`'s
+ * `untitled` default did. With nothing pinned there is no notebook the root could
+ * belong to, so that is an error naming the ambiguity rather than an invented
+ * notebook.
+ */
+export async function setRootOnWorkingNotebook(sessionId: string | undefined, root: string | null) {
+	if (!isPinned(sessionId)) {
+		throw new Error(
+			'use_notebook: `root` without `name` re-roots THIS session\'s working notebook, but this session has not pinned one yet. Call use_notebook(name) first, or pass name and root together to say which notebook the root belongs to.'
+		);
+	}
+	const abs = targetFor(sessionId);
+	return {
+		working_notebook: workspaceRelative(abs),
+		path: abs,
+		created: false,
+		pinned: true,
+		cells: cellCount(getNotebook(abs)),
+		...(await setNotebookRoot(root, abs))
 	};
 }
 

@@ -108,6 +108,26 @@ export function normalizeRootPath(raw: string | null | undefined): string | null
 }
 
 /**
+ * The refusal for a root declared on a `.py` (jupytext / Databricks source)
+ * notebook.
+ *
+ * A `.py` notebook is written back through jupytext / the Databricks converter,
+ * which rebuilds the file from its CELLS: it carries no notebook-level metadata
+ * on disk at all. So the declaration would live only in memory and be gone on the
+ * next reload, after which the notebook would silently run at the workspace root
+ * while still looking like the tree under review — the exact silent degrade
+ * `resolveRootDir` refuses everywhere else. Refused by name instead.
+ *
+ * CLEARING a root on a `.py` notebook is always allowed: it can only remove
+ * state, never strand it.
+ */
+export function textNotebookRootError(rel: string): NotebookRootError {
+	return new NotebookRootError(
+		`Cannot set a code root on a .py notebook: ${JSON.stringify(rel)} could not survive a reload, because a .py (jupytext / Databricks source) notebook stores no notebook metadata on disk — it would silently run at the workspace root instead. Convert it to .ipynb first, or leave it running at the workspace root. Clearing a root is still allowed.`
+	);
+}
+
+/**
  * True when two declared roots mean the same thing. Both sides are normalized
  * first, so `"./roots/a/"` and `"roots/a"` are one root and re-declaring it
  * costs the user no kernel restart.

@@ -31,7 +31,7 @@ import { exportNotebookToPy, type ExportResult } from './export-py';
 import { SQL_LANGUAGE, isLogicalCellType } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
-import { normalizeRootPath } from '../notebookRoot';
+import { normalizeRootPath, textNotebookRootError } from '../notebookRoot';
 import type {
 	Cell,
 	CellView,
@@ -282,6 +282,7 @@ export function getNotebook(nb?: string | null): NotebookView {
 		cells: doc.cells.map(cellView),
 		exportTarget: typeof t === 'string' && t.trim() ? t.trim() : null,
 		root: readRoot(doc),
+		isPy: !!doc.jpFormat,
 		headerNumbering: readHeaderNumbering(doc),
 		hideAllCode: !!doc.metadata?.cellar?.hide_all_code
 	};
@@ -790,11 +791,26 @@ export function getNotebookRoot(nb?: string | null): string | null {
 }
 
 /**
+ * True when the notebook is a `.py` TEXT notebook (jupytext percent/light or
+ * Databricks source), i.e. one written back from its cells alone and therefore
+ * carrying no notebook-level metadata on disk. Anything that would persist a
+ * notebook-level setting must consult this first — see `setNotebookRoot`.
+ */
+export function isTextNotebook(nb?: string | null): boolean {
+	return !!docFor(nb).jpFormat;
+}
+
+/**
  * Set (or clear, with null/'') the notebook's code root in the allowlisted
  * `cellar` namespace, so it round-trips through clean-on-save with zero git diff
  * like the rest of the namespace. The declared value is NORMALIZED before it is
  * persisted (idempotent, so re-saving never churns the file) and a value that is
  * not a workspace-relative path throws before anything is written.
+ *
+ * A `.py` text notebook REFUSES a non-empty root here, because `persist` writes
+ * it back from its cells alone and would drop the declaration — see
+ * `textNotebookRootError`. That guard lives at this single writer so no surface
+ * can route around it; clearing stays allowed everywhere.
  *
  * This function only records the declaration. Because a kernel's cwd is fixed
  * when its process spawns, a root that CHANGES also has to free that notebook's
@@ -804,6 +820,7 @@ export function getNotebookRoot(nb?: string | null): string | null {
 export function setNotebookRoot(root: string | null | undefined, nb?: string | null, originId?: string | null): string | null {
 	const normalized = normalizeRootPath(root);
 	const doc = docFor(nb);
+	if (normalized && doc.jpFormat) throw textNotebookRootError(normalized);
 	doc.metadata = doc.metadata ?? {};
 	doc.metadata.cellar = doc.metadata.cellar ?? {};
 	if (normalized) doc.metadata.cellar.root = normalized;

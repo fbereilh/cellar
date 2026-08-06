@@ -13,9 +13,12 @@
  * `notebook-root-restart.test.ts`.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 vi.mock('../../src/lib/server/dataflow', () => ({
 	getNotebookStaleness: async () => ({ sid: null, cells: {} }),
@@ -25,6 +28,7 @@ vi.mock('../../src/lib/server/dataflow', () => ({
 let WS: string;
 let svc: typeof import('../../src/lib/server/mcp/service');
 let nbmod: typeof import('../../src/lib/server/notebook');
+let srv: typeof import('../../src/lib/server/mcp/server');
 
 beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-mcp-root-'));
@@ -33,7 +37,30 @@ beforeAll(async () => {
 	mkdirSync(join(WS, 'roots', 'baseline'), { recursive: true });
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
+	srv = await import('../../src/lib/server/mcp/server');
 });
+
+type CallResult = { content: { type: string; text?: string }[]; isError?: boolean };
+const bodyOf = (r: CallResult) =>
+	r.content
+		.filter((c) => c.type === 'text')
+		.map((c) => c.text ?? '')
+		.join('\n');
+
+/**
+ * A real MCP client over the REAL `registerTools` registration — the only level
+ * that exercises the tool HANDLER, which is where `use_notebook` composes the
+ * open-or-create with the root (and therefore where the ordering matters).
+ */
+async function connect(sessionId: string) {
+	const server = new McpServer({ name: 'cellar-test', version: '0.0.0' });
+	srv.registerTools(server);
+	const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+	(serverTransport as { sessionId?: string }).sessionId = sessionId;
+	const client = new Client({ name: 'test-agent', version: '0.0.0' });
+	await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+	return client;
+}
 
 describe('list_roots', () => {
 	it('enumerates the workspace roots with the notebooks pointing at them', async () => {
@@ -113,6 +140,21 @@ describe('use_notebook + root', () => {
 		expect(nbmod.getNotebookRoot(opened.path)).toBeNull();
 	});
 
+	it('a REFUSED root creates and pins nothing — the resolve runs first', async () => {
+		// The open-or-create and the pin are irreversible by the time the write could
+		// throw, so an agent typing a bad root used to be left pinned to a notebook it
+		// never meant to make.
+		const client = await connect('sessAtomic');
+		const res = (await client.callTool({
+			name: 'use_notebook',
+			arguments: { name: 'never-made', root: 'roots/typo' }
+		})) as CallResult;
+		expect(res.isError).toBe(true);
+		expect(bodyOf(res)).toMatch(/does not exist/i);
+		expect(existsSync(join(WS, 'never-made.ipynb'))).toBe(false);
+		expect(svc.currentNotebook('sessAtomic').pinned).toBe(false);
+	});
+
 	it('two sessions work two roots in one instance, independently', async () => {
 		const a = svc.useNotebook('sessA', 'a.ipynb');
 		const b = svc.useNotebook('sessB', 'b.ipynb');
@@ -123,5 +165,33 @@ describe('use_notebook + root', () => {
 		const listed = await svc.listRoots('sessA');
 		expect(listed.working_root).toBe('roots/pr-482');
 		expect(listed.roots.find((r) => r.path === 'roots/baseline')?.notebooks).toContain('b.ipynb');
+	});
+});
+
+/**
+ * `use_notebook` with a `root` but NO `name`. Over the real registration, because
+ * the composition of open-or-create with the root lives in the tool handler.
+ */
+describe('use_notebook(root) with no name re-roots the notebook you are working in', () => {
+	it('applies the root to the PINNED notebook, creating no untitled one', async () => {
+		const client = await connect('sessReroot');
+		await client.callTool({ name: 'use_notebook', arguments: { name: 'working.ipynb' } });
+		const res = (await client.callTool({ name: 'use_notebook', arguments: { root: 'roots/pr-482' } })) as CallResult;
+		expect(res.isError).toBeFalsy();
+		const body = JSON.parse(bodyOf(res));
+		expect(body).toMatchObject({ working_notebook: 'working.ipynb', root: 'roots/pr-482', root_changed: true, created: false });
+		// The session still points where it did, and no untitled notebook appeared.
+		expect(svc.currentNotebook('sessReroot').working_notebook).toBe('working.ipynb');
+		expect(existsSync(join(WS, 'untitled.ipynb'))).toBe(false);
+		expect(nbmod.getNotebookRoot(join(WS, 'working.ipynb'))).toBe('roots/pr-482');
+	});
+
+	it('with NOTHING pinned it is an error naming the ambiguity, not an untitled notebook', async () => {
+		const client = await connect('sessNoPin');
+		const res = (await client.callTool({ name: 'use_notebook', arguments: { root: 'roots/baseline' } })) as CallResult;
+		expect(res.isError).toBe(true);
+		expect(bodyOf(res)).toMatch(/has not pinned one yet/i);
+		expect(existsSync(join(WS, 'untitled.ipynb'))).toBe(false);
+		expect(svc.currentNotebook('sessNoPin').pinned).toBe(false);
 	});
 });

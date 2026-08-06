@@ -188,6 +188,12 @@ test('the notebook shows a Code root picker labelled with each root’s branch',
 	expect(options.join('|')).toContain('roots/baseline — baseline');
 	expect(options.join('|')).toContain('roots/under-review — under-review');
 
+	// The cost is stated BEFORE the click, not only afterwards in the feedback line:
+	// selecting a root frees the kernel, so both facts (what a root reaches, and
+	// what changing it costs) are on screen while the user decides.
+	await expect(bar).toContainText(/files, git and checkpoints stay workspace-wide/i);
+	await expect(bar).toContainText(/restarts the kernel - variables are cleared/i);
+
 	// Switching in the UI re-roots the kernel and says the namespace went with it.
 	await select.selectOption('roots/under-review');
 	await expect(page.getByTestId('root-feedback')).toContainText(/variables cleared|new root/i);

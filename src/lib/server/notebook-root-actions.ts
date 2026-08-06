@@ -19,11 +19,18 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { workspaceRoot } from './fstree';
-import { getNotebookRoot, setNotebookRoot, resolveNotebookPath, workspaceRelative, listOpenNotebookPaths } from './notebook';
+import {
+	getNotebookRoot,
+	setNotebookRoot,
+	resolveNotebookPath,
+	workspaceRelative,
+	listOpenNotebookPaths,
+	isTextNotebook
+} from './notebook';
 import { resolveRootDir } from './notebookRoot';
 import { rebindKernel } from './kernel';
 import { gitRefAt } from './git';
-import { ROOTS_DIR, normalizeRootPath, sameRoot } from '../notebookRoot';
+import { ROOTS_DIR, normalizeRootPath, sameRoot, textNotebookRootError } from '../notebookRoot';
 import type { WorkspaceRootOption } from '../notebookRoot';
 
 /** Outcome of declaring (or clearing) a notebook's code root. */
@@ -45,10 +52,11 @@ export interface SetRootResult {
  * line.
  *
  * The root is RESOLVED FIRST — an absolute path, a `..` escape, a missing
- * directory or a file all throw here — so a refusal never writes a declaration
- * into the user's `.ipynb` nor frees a working kernel. An unchanged declaration
- * is a genuine no-op: nothing is persisted, and the kernel keeps its namespace
- * (re-declaring the root you are already on must not cost you your variables).
+ * directory, a file, or a `.py` notebook that could not keep the declaration all
+ * throw here — so a refusal never writes a declaration into the user's `.ipynb`
+ * nor frees a working kernel. An unchanged declaration is a genuine no-op:
+ * nothing is persisted, and the kernel keeps its namespace (re-declaring the root
+ * you are already on must not cost you your variables).
  */
 export async function setNotebookRootAndRestart(
 	root: string | null | undefined,
@@ -56,6 +64,12 @@ export async function setNotebookRootAndRestart(
 	originId?: string | null
 ): Promise<SetRootResult> {
 	const abs = resolveNotebookPath(nb ?? undefined);
+	// A `.py` notebook stores no notebook metadata, so a root declared on one could
+	// not survive a reload. Refused BEFORE the directory is resolved, so the message
+	// names the real reason rather than reporting a perfectly good directory as the
+	// problem. Clearing stays allowed: it can only remove state, never strand it.
+	const declared = normalizeRootPath(root);
+	if (declared && isTextNotebook(abs)) throw textNotebookRootError(declared);
 	// Throws (NotebookRootError) on anything that is not a usable directory inside
 	// the workspace, BEFORE the document or the kernel is touched.
 	const resolved = resolveRootDir(root);

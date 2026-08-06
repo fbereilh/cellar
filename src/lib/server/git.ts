@@ -465,8 +465,13 @@ export async function gitStatus(): Promise<GitStatusResult> {
  * Returns null when the directory is not inside a git repository at all.
  */
 export async function gitRefAt(absDir: string): Promise<{ branch: string | null; commit: string | null } | null> {
-	const sym = await runGit(absDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
-	const sha = await runGit(absDir, ['rev-parse', '--short', 'HEAD']);
+	// The two reads are independent, so they run CONCURRENTLY: a root list spawns
+	// this once per root on the process that also carries the kernel websockets and
+	// the SSE fan-out, and serializing them doubled that wall-clock for nothing.
+	const [sym, sha] = await Promise.all([
+		runGit(absDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']),
+		runGit(absDir, ['rev-parse', '--short', 'HEAD'])
+	]);
 	if (sym == null && sha == null) return null;
 	const commit = sha?.trim() || null;
 	return { branch: sym?.trim() || commit, commit };

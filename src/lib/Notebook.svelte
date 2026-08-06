@@ -83,6 +83,8 @@
 		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
 		/** This notebook's declared code root (kernel cwd + sys.path), or null for the workspace. */
 		root?: string | null;
+		/** True for a `.py` text notebook, which stores no notebook metadata (no root picker). */
+		isPy?: boolean;
 		/** The workspace's code roots — an empty list renders no root control at all. */
 		availableRoots?: WorkspaceRootOption[];
 		/** True while a root change is in flight (the picker is disabled). */
@@ -174,6 +176,7 @@
 		onSetExportTarget,
 		onExportPy,
 		root = null,
+		isPy = false,
 		availableRoots = [],
 		rootBusy = false,
 		rootFeedback = '',
@@ -459,7 +462,11 @@
 		}
 		return opts;
 	});
-	const showRootBar = $derived(rootOptions.length > 0);
+	// A `.py` (jupytext / Databricks source) notebook is written back from its cells
+	// alone, so it stores no notebook metadata and could not keep a root across a
+	// reload — the server REFUSES one there. No control is offered, so the picker
+	// being absent and the declaration being refused say the same thing.
+	const showRootBar = $derived(rootOptions.length > 0 && !isPy);
 	const currentRootOption = $derived(rootOptions.find((o) => o.path === root) ?? null);
 	function rootLabel(o: WorkspaceRootOption): string {
 		const ref = o.branch ? ` — ${o.branch}` : '';
@@ -684,8 +691,11 @@
 						missing on disk — runs will fail until it is restored or cleared
 					</span>
 				{:else}
+					<!-- Both facts, BEFORE the click: what a root reaches, and what changing
+					     it costs. Selecting one frees the kernel, so the price is stated
+					     here rather than only afterwards in the feedback line. -->
 					<span class="text-xs text-base-content/55">
-						kernel cwd + imports only; files, git and checkpoints stay workspace-wide
+						kernel cwd + imports only; files, git and checkpoints stay workspace-wide. Changing it restarts the kernel - variables are cleared.
 					</span>
 				{/if}
 				{#if rootFeedback}
