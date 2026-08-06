@@ -445,12 +445,21 @@
 		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value);
 	}
 	/**
-	 * Commit a target typed but never committed. `change` is not reliably delivered
-	 * before unload, so without this a path the user typed and then reloaded (or
-	 * closed the tab) on was simply lost - the same sub-commit window `Cell.svelte`
-	 * flushes on `pagehide`, and the same idiom. The per-edit commit model is
-	 * unchanged: this fires only when the field still differs from what the model
-	 * holds, so an already-committed value writes nothing.
+	 * Commit a target typed but never committed, on PAGE UNLOAD only. `change` is not
+	 * reliably delivered before unload, so without this a path the user typed and then
+	 * reloaded (or closed the tab) on was simply lost - the same sub-commit window
+	 * `Cell.svelte` flushes on `pagehide`, and the same idiom. The per-edit commit
+	 * model is unchanged: this fires only when the field still differs from what the
+	 * model holds, so an already-committed value writes nothing.
+	 *
+	 * Deliberately NOT flushed on teardown, unlike `Cell.svelte`'s: this component is
+	 * destroyed by every `LiveNotebook.load()` refetch (it renders behind an
+	 * `{:else if fetching}` gate), which an SSE reconnect, a seq gap from an agent's
+	 * edit, `notebook:restored` or a refused bulk op all trigger - so a teardown commit
+	 * fired mid-edit from a background event the user never caused, raising a spurious
+	 * refusal for a half-typed path or silently persisting one that happened to parse
+	 * (and racing the resolving load over `sentExportTarget`). Losing an uncommitted
+	 * value to a refetch is the far better half of that trade.
 	 */
 	function flushExportTarget(keepalive = false) {
 		const el = exportTargetEl;
@@ -460,10 +469,7 @@
 	$effect(() => {
 		const onUnload = () => flushExportTarget(true);
 		window.addEventListener('pagehide', onUnload);
-		return () => {
-			window.removeEventListener('pagehide', onUnload);
-			flushExportTarget();
-		};
+		return () => window.removeEventListener('pagehide', onUnload);
 	});
 	async function doExport() {
 		if (exporting) return;

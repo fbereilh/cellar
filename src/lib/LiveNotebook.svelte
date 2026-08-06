@@ -2092,7 +2092,7 @@
 	 */
 	let sentExportTarget: string | null = null;
 	/**
-	 * What became of a target write. Four OUTCOMES, not a boolean: a single flag
+	 * What became of a target write. Five OUTCOMES, not a boolean: a single flag
 	 * conflated three of them and each conflation surfaced as its own defect -
 	 * an unreachable server read as success (the field kept a value the server
 	 * never stored, and the export then reported success against the OLD target),
@@ -2102,9 +2102,15 @@
 	 * - `committed`   the server stored it (the only outcome that advances the baseline)
 	 * - `refused`     the server REJECTED the path; reverted + explained
 	 * - `unreachable` the request never landed a verdict; reverted + explained
+	 * - `writeFailed` the path was ACCEPTED but could not be saved; kept + explained
 	 * - `superseded`  the field moved on, so a newer value owns it: touch nothing
+	 *
+	 * `writeFailed` is the fifth because the route validates before it mutates: a
+	 * disk failure leaves the live document HOLDING the target, so reverting the
+	 * field there showed a value the server no longer agrees with and sent the user
+	 * to fix a path that was never wrong.
 	 */
-	type TargetCommit = 'committed' | 'refused' | 'unreachable' | 'superseded';
+	type TargetCommit = 'committed' | 'refused' | 'unreachable' | 'writeFailed' | 'superseded';
 	/**
 	 * The IN-FLIGHT target write, so the manual export can wait for it to land -
 	 * and learn its outcome, since pressing Export blurs the input and therefore
@@ -2121,7 +2127,9 @@
 	/**
 	 * Set (or clear) the notebook's `.py` export target. Optimistic + persisted, and
 	 * REVERTED (with the reason said out loud) whenever the write did not land - a
-	 * server refusal, or a server that could not be reached at all.
+	 * server refusal, or a server that could not be reached at all. A target the
+	 * server ACCEPTED but could not save (a disk failure, `writeFailed`) is the one
+	 * failure that is kept rather than reverted: the live document holds it.
 	 *
 	 * The route refuses a `.py` text notebook (which stores no cellar metadata), a
 	 * target escaping the workspace and one that is not a `.py` module, and it emits
@@ -2195,6 +2203,22 @@
 		// `notebook:export-target`, or a refetch), so a newer value owns it and yanking
 		// it back to our baseline would discard state this write knows nothing about.
 		if (exportTarget !== next) return 'superseded';
+		if (res && res.status >= 500) {
+			// NOT a refusal: the route validates the path BEFORE it mutates, so a 5xx is the
+			// notebook WRITE failing (EACCES, ENOSPC, a read-only checkout) over a target the
+			// live document already holds and will save with its next successful write. So the
+			// field KEEPS it - reverting showed a value the server no longer agrees with, under
+			// a "fix the path" remedy for a problem that did not occur. Only the baseline stays
+			// put (nothing reached disk), and `sentExportTarget` falls back to it so committing
+			// the SAME path again re-issues the write once the disk recovers.
+			if (sentExportTarget === next) sentExportTarget = confirmedExportTarget;
+			const failure = await res
+				.json()
+				.then((body) => body?.writeFailed ?? body?.message)
+				.catch(() => null);
+			onNotice?.(`Export target accepted but not saved${failure ? `: ${failure}` : '.'}`);
+			return 'writeFailed';
+		}
 		exportTarget = confirmedExportTarget;
 		sentExportTarget = confirmedExportTarget;
 		if (!res) {
@@ -2245,7 +2269,10 @@
 	 * does not show. Each of those outcomes already explained itself, so nothing more
 	 * is said here. A `superseded` commit is NOT an abort: nothing was refused, the
 	 * field simply moved on, and aborting made the button a dead control that issued
-	 * no request and rendered no message. That abort is scoped to a commit still IN
+	 * no request and rendered no message. Nor is a `writeFailed` one: the target WAS
+	 * accepted and the live document holds it, so the export runs against the path the
+	 * field shows - and if the disk is still failing, the export says so itself. That
+	 * abort is scoped to a commit still IN
 	 * FLIGHT (an already-settled one drops itself), so a refusal the user has since
 	 * moved on from can never silently abort a later export. A failure carries the
 	 * server's own reason - the refusals this path can hit ("it is not a

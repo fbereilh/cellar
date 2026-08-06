@@ -408,7 +408,7 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(nbSrc).not.toMatch(/oninput=\{onExportTarget/);
 	});
 
-	it('flushes a target typed but never committed on pagehide and on unmount', () => {
+	it('flushes a target typed but never committed on pagehide, and NEVER on teardown', () => {
 		// `change` is not reliably delivered before unload, so a value typed and then
 		// reloaded (or tab-closed) on was simply lost - the same sub-commit window
 		// `Cell.svelte` flushes on `pagehide`, and the same idiom.
@@ -423,9 +423,19 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(flush).toMatch(/el\.value === \(exportTarget \?\? ''\)/);
 		expect(flush).toMatch(/addEventListener\('pagehide'/);
 		expect(flush).toMatch(/removeEventListener\('pagehide'/);
-		// The teardown flush is what covers an unmount (a tab close, a notebook closed).
-		const teardown = flush.slice(flush.indexOf('return () => {'));
-		expect(teardown).toMatch(/flushExportTarget\(\);/);
+		// But NOT on teardown, unlike Cell.svelte's: `LiveNotebook` renders this component
+		// behind an `{:else if fetching}` gate, so EVERY `load()` refetch destroys it - an
+		// SSE reconnect, a seq gap from an agent's edit, `notebook:restored`, a refused
+		// bulk op. A teardown commit therefore fired mid-edit from a background event the
+		// user never caused, refusing a half-typed path (or silently persisting one that
+		// happened to parse). Losing an uncommitted value to a refetch is the better half.
+		const effect = flush.slice(flush.indexOf('$effect('));
+		const teardown = effect.slice(effect.indexOf('return () =>'));
+		expect(teardown).not.toMatch(/flushExportTarget\(/);
+		// LiveNotebook really does re-mount it on every refetch, which is what makes the
+		// teardown an unreliable proxy for an unmount.
+		expect(src).toMatch(/\{:else if fetching\}/);
+		expect(src.slice(src.indexOf('async function load'))).toMatch(/fetching = true;/);
 		expect(nbSrc).toMatch(/bind:this=\{exportTargetEl\}/);
 
 		// And the unload path must SURVIVE the page going away: the write goes out with
@@ -543,6 +553,65 @@ describe('a refused path and a failed write are told apart', () => {
 		const writeBranch = handler.slice(handler.indexOf("'writeFailed' in r"));
 		expect(writeBranch.split('\n')[0]).not.toMatch(/must be a workspace-relative \.py path/);
 		expect(writeBranch).toMatch(/could not be saved/);
+	});
+
+	it('the UI route answers a failed write apart from a refusal, and the client keeps the value', async () => {
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const post = POST as unknown as (e: { request: Request }) => Promise<Response>;
+		svc.useNotebook('sessDiskRoute', 'disk-route.ipynb');
+		const nb = svc.targetFor('sessDiskRoute');
+		await svc.addCells([{ cell_type: 'code', source: 'v = 1' }], null, { nb, routeImports: false });
+
+		const call = (target: string) =>
+			post({
+				request: new Request('http://x/api/notebooks/export-py', {
+					method: 'POST',
+					body: JSON.stringify({ op: 'set-target', target, path: 'disk-route.ipynb' })
+				})
+			});
+
+		// A path REFUSAL keeps today's 400 (the client reverts and says to fix the path).
+		await expect(call('src/app.ts')).rejects.toMatchObject({ status: 400 });
+
+		disk.failFor = 'disk-route.ipynb';
+		let res: Response;
+		try {
+			res = await call('lib/disk-route.py');
+		} finally {
+			disk.failFor = null;
+		}
+		// NOT a 400: the setter validates before it mutates, so this is the notebook write
+		// failing over a path that was never wrong - reported as 400 the tab reverted the
+		// field and told the user the target was not set, over a change that DID take.
+		expect(res.status).toBe(500);
+		expect(await res.json()).toMatchObject({
+			ok: false,
+			writeFailed: expect.stringMatching(/ENOSPC/)
+		});
+		expect(nbmod.getExportTarget(nb)).toBe('lib/disk-route.py');
+
+		// The client half: a 5xx keeps the field (the document holds it) and only says so,
+		// while the 400 above still reverts. vitest runs without the SvelteKit plugin, so
+		// `LiveNotebook.svelte` cannot be mounted - pinned against the source instead.
+		const live = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
+		const commitFn = live.slice(
+			live.indexOf('async function commitExportTarget'),
+			live.indexOf('async function setNumberingLevel')
+		);
+		const writeBranch = commitFn.slice(
+			commitFn.indexOf('res.status >= 500'),
+			commitFn.indexOf("return 'writeFailed';")
+		);
+		expect(writeBranch, 'a 5xx should have its own branch').not.toBe('');
+		expect(writeBranch).not.toMatch(/exportTarget = confirmedExportTarget/);
+		expect(writeBranch).toMatch(/accepted but not saved/);
+		// It is decided BEFORE the revert every other failure takes.
+		expect(commitFn.indexOf('res.status >= 500')).toBeLessThan(
+			commitFn.indexOf('exportTarget = confirmedExportTarget')
+		);
+		// And the same path can be committed again once the disk recovers (the early
+		// `next === sentExportTarget` return would otherwise make a retry a no-op).
+		expect(writeBranch).toMatch(/sentExportTarget = confirmedExportTarget/);
 	});
 });
 
