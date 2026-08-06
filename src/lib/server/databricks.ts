@@ -3614,8 +3614,28 @@ export async function previewTable({
  * client/server hop exact, whatever this process thinks the date is - is
  * unaffected, while a caller that posts the tokens raw still gets them.
  */
+function affixText(value: unknown, which: 'prefix' | 'postfix'): string | null {
+	// ABSENT and NULL are the no-affix path and must stay byte-for-byte the upload
+	// that existed before affixes did. Anything else PRESENT but not a string is
+	// REFUSED rather than coerced to no-affix, the same refuse-don't-repair rule
+	// `resolveUploadName` applies to a separator: a caller reaching this layer
+	// directly has no preview to notice the repair with, so a 200 reporting success
+	// over a name they never asked for would be the worst outcome available.
+	if (value == null || typeof value === 'string') return (value ?? null) as string | null;
+	// The TYPE, never the value: the caller knows what they sent, and echoing an
+	// arbitrary posted payload back into a message is unbounded.
+	const got = Array.isArray(value) ? 'an array' : `a ${typeof value}`;
+	throw new DatabricksError(
+		'bad_request',
+		`invalid ${which}: expected a string, got ${got}. Omit it (or send "") for no ${which}.`
+	);
+}
+
 function workspaceNotebookName(fileName: string, affixes: UploadNameAffixes): string {
-	const resolved = resolveUploadName(fileName, affixes);
+	const resolved = resolveUploadName(fileName, {
+		prefix: affixText(affixes.prefix, 'prefix'),
+		postfix: affixText(affixes.postfix, 'postfix')
+	});
 	if (resolved.error) throw new DatabricksError('bad_request', resolved.error);
 	return resolved.name;
 }

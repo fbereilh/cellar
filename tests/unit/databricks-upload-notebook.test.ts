@@ -472,6 +472,42 @@ describe('uploadNotebook — the server op', () => {
 		expect(lastRequest().name).toBe('analysis');
 	});
 
+	it('a present NON-STRING affix is refused - never quietly treated as no affix', async () => {
+		// The sidebar always sends strings; a direct API caller might send a number
+		// (`prefix: 20260805`), and it has NO preview to notice a repair with - so a 200
+		// reporting success over a name nobody asked for is the worst outcome available.
+		// Refuse-don't-repair, the same rule that governs a separator.
+		await freshConnect();
+		useStub(writeRecordingStub('stub-unused-type', { ok: true, status: 'uploaded', path: '/Users/x/y', host: HOST }));
+
+		for (const bad of [20260805, true, ['a'], { a: 1 }] as unknown[]) {
+			await expect(
+				dbx.uploadNotebook({ nb: NB, prefix: bad as string })
+			).rejects.toMatchObject({ code: 'bad_request' });
+			await expect(
+				dbx.uploadNotebook({ nb: NB, postfix: bad as string })
+			).rejects.toMatchObject({ code: 'bad_request' });
+		}
+		// It names the field and the type, and never echoes the posted value back.
+		await expect(dbx.uploadNotebook({ nb: NB, prefix: 20260805 as unknown as string })).rejects.toThrow(
+			/invalid prefix: expected a string, got a number/
+		);
+		// The gate is before the subprocess: the workspace was never asked anything.
+		expect(existsSync(reqFile)).toBe(false);
+	});
+
+	it('an ABSENT or NULL affix is still the plain, unaffixed name', async () => {
+		// The other half of that rule: omitting an affix is the no-affix path and has to
+		// stay byte-for-byte the upload that existed before affixes did.
+		await freshConnect();
+		useStub(writeRecordingStub('stub-null-affix', { ok: true, status: 'uploaded', path: `/Users/${USER}/analysis`, host: HOST }));
+
+		await dbx.uploadNotebook({ nb: NB, prefix: null, postfix: null });
+		expect(lastRequest().name).toBe('analysis');
+		await dbx.uploadNotebook({ nb: NB, prefix: undefined, postfix: undefined });
+		expect(lastRequest().name).toBe('analysis');
+	});
+
 	it('an affix that could leave /Users/<you>/ is REFUSED - nothing is spawned, nothing repaired', async () => {
 		await freshConnect();
 		useStub(writeRecordingStub('stub-unused-affix', { ok: true, status: 'uploaded', path: '/Users/x/y', host: HOST }));

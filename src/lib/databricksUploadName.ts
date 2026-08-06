@@ -112,11 +112,27 @@ export function notebookStem(fileName: string): string {
 	return fileName.trim().replace(NOTEBOOK_EXT, '').trim();
 }
 
-/** Why `name` is not something Databricks can call a workspace notebook, or null. */
-function nameProblem(name: string): string | null {
+/**
+ * The longest workspace name this will assemble.
+ *
+ * It is bounding the DATABRICKS side: a workspace object's name is the tighter of
+ * the two ceilings by orders of magnitude (a name past it fails only after a round
+ * trip, with the SDK's own message), while the same string also rides `argv` as
+ * part of the probe's JSON request - the very limit the notebook bytes are base64'd
+ * onto stdin to stay under, so an unbounded pasted affix would surface as a bare
+ * `spawn E2BIG` instead of anything the user could act on. 200 is far past any real
+ * naming pattern (a date stamp plus a word is ~20) and comfortably inside both.
+ */
+export const MAX_UPLOAD_NAME_CHARS = 200;
+
+/** Which way `name` is unusable as a workspace notebook name, or null. */
+type NameProblem = 'empty' | 'dots' | 'forbidden' | 'too-long';
+
+function nameProblem(name: string): NameProblem | null {
 	if (!name) return 'empty';
 	if (name === '.' || name === '..') return 'dots';
 	if (FORBIDDEN.test(name)) return 'forbidden';
+	if (name.length > MAX_UPLOAD_NAME_CHARS) return 'too-long';
 	return null;
 }
 
@@ -175,32 +191,43 @@ export function resolveUploadName(
 			};
 		}
 	}
-	if (nameProblem(stem)) {
+	const stemProblem = nameProblem(stem);
+	if (stemProblem) {
 		return {
 			name: '',
 			prefix,
 			postfix,
-			error: `"${fileName}" is not a name Databricks can give a workspace notebook. Rename the file, then upload again.`
+			error:
+				stemProblem === 'too-long'
+					? `The notebook's own name is ${stem.length} characters, past the ${MAX_UPLOAD_NAME_CHARS} a Databricks workspace notebook name can be. Rename the file, then upload again.`
+					: `"${fileName}" is not a name Databricks can give a workspace notebook. Rename the file, then upload again.`
 		};
 	}
 	// Trimmed as a whole: a leading or trailing space in a workspace name is
 	// invisible in the UI and impossible to type back. With no affixes this is the
 	// already-trimmed stem, so the no-affix upload is unchanged.
 	const name = `${prefix}${stem}${postfix}`.trim();
-	// Defence in depth, and NOT reachable through the call order above: the stem has
-	// already been proven non-empty, trimmed, neither `.` nor `..` and forbidden-free,
-	// and both affixes have already been FORBIDDEN-checked, so their concatenation
-	// cannot be any of those things either. It stays because the guarantee is an
-	// emergent property of that order rather than of this line - reordering the checks,
-	// or adding a THIRD source of text to the name, would otherwise let an unusable
-	// name reach the workspace silently. Every refusal a caller can actually trigger is
-	// raised above this, with a message naming the field they can fix.
-	if (nameProblem(name)) {
+	// LENGTH is the one kind that is genuinely reachable here: each part can be inside
+	// the limit while their concatenation is not, and only the assembled name is what
+	// the workspace (and the probe's argv) actually receives.
+	//
+	// The other kinds are defence in depth, NOT reachable through the call order above:
+	// the stem has already been proven non-empty, trimmed, neither `.` nor `..` and
+	// forbidden-free, and both affixes have already been FORBIDDEN-checked, so their
+	// concatenation cannot be any of those things either. They stay because that
+	// guarantee is an emergent property of the order rather than of this line -
+	// reordering the checks, or adding a THIRD source of text to the name, would
+	// otherwise let an unusable name reach the workspace silently.
+	const assembledProblem = nameProblem(name);
+	if (assembledProblem) {
 		return {
 			name: '',
 			prefix,
 			postfix,
-			error: `"${name}" is not a name Databricks can give a workspace notebook. Change the prefix or postfix, then upload again.`
+			error:
+				assembledProblem === 'too-long'
+					? `The prefix and postfix make the name ${name.length} characters, past the ${MAX_UPLOAD_NAME_CHARS} a Databricks workspace notebook name can be. Shorten the prefix or postfix, then upload again.`
+					: `"${name}" is not a name Databricks can give a workspace notebook. Change the prefix or postfix, then upload again.`
 		};
 	}
 	return { name, prefix, postfix, error: null };

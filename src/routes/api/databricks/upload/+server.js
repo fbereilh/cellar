@@ -18,7 +18,8 @@ import { databricksErrorResponse } from '../error-response.js';
  * them already date-token-expanded, which is what makes its preview exact); both
  * omitted is the original behaviour, unchanged. They cannot move the upload out
  * of the user's folder - `$lib/databricksUploadName` refuses a separator or a
- * control character rather than repairing it.
+ * control character rather than repairing it, and a present non-string affix is
+ * a `bad_request` rather than a silent no-affix.
  */
 export async function POST({ request }) {
 	const { path, overwrite, prefix, postfix } = await request.json().catch(() => ({}));
@@ -29,10 +30,12 @@ export async function POST({ request }) {
 			await uploadNotebook({
 				nb: path,
 				overwrite: overwrite === true,
-				// Anything that is not a string is no affix at all: a number or an object
-				// interpolated into a workspace name is never what a caller meant.
-				prefix: typeof prefix === 'string' ? prefix : '',
-				postfix: typeof postfix === 'string' ? postfix : ''
+				// Forwarded RAW, deliberately: omitted/null is the no-affix path, and a
+				// present non-string is REFUSED as `bad_request` one layer down rather
+				// than coerced to no-affix here - a caller with no preview must not get a
+				// 200 over a name they never asked for.
+				prefix,
+				postfix
 			})
 		);
 	} catch (err) {

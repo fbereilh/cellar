@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+	MAX_UPLOAD_NAME_CHARS,
 	UPLOAD_DATE_TOKENS,
 	expandDateTokens,
 	notebookStem,
@@ -227,5 +228,55 @@ describe('an affix can never move the upload out of /Users/<you>/', () => {
 
 	it('an affix that empties to nothing still leaves a usable name', () => {
 		expect(resolveUploadName('analysis.ipynb', { prefix: '   ', postfix: '' }, DAY).error).toBeNull();
+	});
+});
+
+describe('the assembled name is bounded in LENGTH, not only in content', () => {
+	// The resolved name rides `argv` as part of the probe's JSON request - the exact
+	// limit the notebook's own bytes are base64'd onto stdin to stay under - and a
+	// workspace object name has a ceiling of its own. Unbounded, a pasted affix
+	// surfaced as a bare `spawn E2BIG` (or a round trip to an SDK refusal); bounded
+	// here, it is refused with the same actionable message the preview shows.
+	const stem = 'analysis';
+
+	it('allows a name exactly at the limit', () => {
+		const postfix = '_'.repeat(MAX_UPLOAD_NAME_CHARS - stem.length);
+		const out = resolveUploadName(`${stem}.ipynb`, { postfix }, DAY);
+		expect(out.error).toBeNull();
+		expect(out.name).toHaveLength(MAX_UPLOAD_NAME_CHARS);
+	});
+
+	it('refuses one character past it, naming the limit and the field to shorten', () => {
+		const postfix = '_'.repeat(MAX_UPLOAD_NAME_CHARS - stem.length + 1);
+		const out = resolveUploadName(`${stem}.ipynb`, { postfix }, DAY);
+		expect(out.name).toBe('');
+		expect(out.error).toContain(String(MAX_UPLOAD_NAME_CHARS));
+		expect(out.error).toContain('Shorten the prefix or postfix');
+	});
+
+	it('counts the ASSEMBLED name, so two individually-short affixes can still overrun', () => {
+		const half = 'a'.repeat(MAX_UPLOAD_NAME_CHARS);
+		expect(resolveUploadName(`${stem}.ipynb`, { prefix: half, postfix: half }, DAY).error).toContain(
+			'Shorten the prefix or postfix'
+		);
+	});
+
+	it('measures the EXPANDED affix, not the token that produced it', () => {
+		// `{YYYY-MM-DD}` is 12 characters and expands to 10, so a name that only fits
+		// once the tokens are resolved must be allowed - the bound is on what the
+		// workspace receives.
+		const postfix = `${'_'.repeat(MAX_UPLOAD_NAME_CHARS - stem.length - 10)}{YYYY-MM-DD}`;
+		expect(postfix.length + stem.length).toBeGreaterThan(MAX_UPLOAD_NAME_CHARS);
+		const out = resolveUploadName(`${stem}.ipynb`, { postfix }, DAY);
+		expect(out.error).toBeNull();
+		expect(out.name).toHaveLength(MAX_UPLOAD_NAME_CHARS);
+	});
+
+	it('blames the FILENAME when the notebook alone is past the limit', () => {
+		// Nothing the affixes can do about it, so the remedy has to name the file.
+		const out = resolveUploadName(`${'n'.repeat(MAX_UPLOAD_NAME_CHARS + 1)}.ipynb`, {}, DAY);
+		expect(out.name).toBe('');
+		expect(out.error).toContain('Rename the file');
+		expect(out.error).toContain(String(MAX_UPLOAD_NAME_CHARS));
 	});
 });

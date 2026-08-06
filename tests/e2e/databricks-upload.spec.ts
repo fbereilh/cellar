@@ -445,12 +445,27 @@ async function storedAffixes(page: Page): Promise<Record<string, unknown>> {
  * best-effort and the SERVER store is what is driven to empty - it is what the next
  * test reads. The reset is inside the poll so it re-runs: the browser's own write is
  * debounced, and a stale one landing late is simply overwritten by the next pass.
+ *
+ * Every best-effort step therefore carries its OWN short timeout: the states this
+ * hook exists for are exactly the ones where a field is missing or disabled (the
+ * section closed, `uploadConfirmBusy` mid-replace), and at the config's default an
+ * auto-waiting `fill()` would sit there until the HOOK's budget was gone - which the
+ * try/catch cannot rescue, since a hook timeout is not a rejection - leaving the
+ * authoritative server reset below unreachable and the store polluted after all.
  */
+const UI_CLEAR_TIMEOUT_MS = 2000;
+
 async function clearAffixes(page: Page): Promise<void> {
 	try {
-		await page.getByTestId('databricks-upload-prefix').fill('');
-		await page.getByTestId('databricks-upload-postfix').fill('');
-		await expect(page.getByTestId('databricks-upload-preview')).toHaveText('notebook');
+		await page
+			.getByTestId('databricks-upload-prefix')
+			.fill('', { timeout: UI_CLEAR_TIMEOUT_MS });
+		await page
+			.getByTestId('databricks-upload-postfix')
+			.fill('', { timeout: UI_CLEAR_TIMEOUT_MS });
+		await expect(page.getByTestId('databricks-upload-preview')).toHaveText('notebook', {
+			timeout: UI_CLEAR_TIMEOUT_MS
+		});
 	} catch {
 		// The panel is not in a state to type into - the store below is the authority.
 	}
