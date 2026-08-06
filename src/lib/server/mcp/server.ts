@@ -677,6 +677,11 @@ export function registerTools(server: McpServer) {
 		const r = svc.setExportTarget(path, targetOf(extra, notebook));
 		if ('refused' in r) return notFound(pyNotebookRefusal('an export target cannot be stored'));
 		if ('invalid' in r) return notFound(`refused: ${r.invalid} - the export target must be a workspace-relative .py path`);
+		// A valid path the notebook write could not save: say what happened, and do NOT
+		// hand back the invalid-path remedy above - the path is fine, and the notebook
+		// in memory already carries it, so retrying the same call once the write can
+		// succeed is the fix.
+		if ('writeFailed' in r) return notFound(`the export target was accepted but the notebook could not be saved: ${r.writeFailed} - the path is valid and the open notebook already holds it; it is written with the notebook's next successful save`);
 		return text(r);
 	});
 

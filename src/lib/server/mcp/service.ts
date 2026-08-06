@@ -27,6 +27,7 @@ import {
 	setHideAllCode as setHideAllCodeDoc,
 	setHideInput as setHideInputDoc,
 	setExportTarget as setExportTargetDoc,
+	InvalidExportTargetError,
 	setCellExports as setCellExportsDoc,
 	getExportTarget,
 	effectiveExportTarget,
@@ -1573,7 +1574,12 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * the metadata generating nothing on every later save while this call reported it
  * set. A path that is not a `.py` module is refused the same way and for a sharper
  * reason: the exporter WRITES to it, so an ordinary source file named here would be
- * overwritten the moment a cell is marked. It shares `moduleFailure` with `setCellExport` for the same reason - this
+ * overwritten the moment a cell is marked. Only a refusal of the PATH is reported as
+ * `invalid` (told apart by `InvalidExportTargetError`, thrown where the path is
+ * checked): the doc layer validates before it mutates, so a failed notebook WRITE
+ * comes back as `writeFailed`, because the target was accepted and the live document
+ * holds it - answering "fix the path" there names a problem that did not occur.
+ * It shares `moduleFailure` with `setCellExport` for the same reason - this
  * call regenerates too, so a write that THREW must not read as one that landed.
  * Only that half: "no cell is marked" is the normal state right after naming a
  * target, so warning about it here would restate the caller's own step.
@@ -1595,7 +1601,13 @@ export function setExportTarget(target: string | null | undefined, nb?: string |
 	} catch (err) {
 		// A path that escapes the workspace is refused where it is SET, not stored to
 		// generate nothing on every later save (see `setExportTarget` in notebook.ts).
-		return { ok: false as const, invalid: String((err as Error)?.message ?? err) };
+		if (err instanceof InvalidExportTargetError)
+			return { ok: false as const, invalid: err.message };
+		// NOT a refusal: the doc layer validates before it mutates, so the only other
+		// throw is the notebook write (EACCES, ENOSPC, a read-only checkout). The target
+		// was accepted and the live document HOLDS it - reporting that as an invalid path
+		// sends the caller to fix one that was never wrong, over a change that did take.
+		return { ok: false as const, writeFailed: String((err as Error)?.message ?? err) };
 	}
 	const where = exportTargetFields(nbTarget);
 	return { ...where, ...moduleFailure(nbTarget, where.export_target) };

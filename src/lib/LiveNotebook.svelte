@@ -2140,15 +2140,20 @@
 	 * pending-value mirror stacked to contain that were themselves a race (a
 	 * superseded-but-successful write never advanced the confirmed baseline). One
 	 * commit per edit removes all of it: an unmodified blur fires no `change`, so
-	 * clicking through the field still writes nothing, and there is no pending value
-	 * to drop on unmount.
+	 * clicking through the field still writes nothing.
+	 *
+	 * `change` is not reliably delivered before unload, though, so a value typed and
+	 * never blurred would be lost on a reload or a tab close - which is why the field
+	 * also flushes on `pagehide` and on unmount (`Notebook.svelte`), the idiom
+	 * `Cell.svelte` already uses for its debounced edit. That flush passes
+	 * `keepalive`, so the write survives the page going away.
 	 */
-	function setExportTargetValue(target: string) {
+	function setExportTargetValue(target: string, { keepalive = false }: { keepalive?: boolean } = {}) {
 		const next = target.trim() || null;
 		exportTarget = next;
 		if (next === sentExportTarget) return;
 		sentExportTarget = next;
-		const commit = commitExportTarget(target, next);
+		const commit = commitExportTarget(target, next, keepalive);
 		exportTargetCommit = commit;
 		const drop = () => {
 			if (exportTargetCommit === commit) exportTargetCommit = null;
@@ -2156,11 +2161,14 @@
 		commit.then(drop, drop);
 	}
 
-	async function commitExportTarget(raw: string, next: string | null): Promise<TargetCommit> {
+	async function commitExportTarget(raw: string, next: string | null, keepalive = false): Promise<TargetCommit> {
 		const res = await fetch('/api/notebooks/export-py', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ op: 'set-target', target: raw, path, originId })
+			body: JSON.stringify({ op: 'set-target', target: raw, path, originId }),
+			// Only from the unload flush: the request must outlive the page, and this body
+			// is one path, far under the ~64KB a keepalive body is capped at.
+			keepalive
 		}).catch(() => null);
 		if (res?.ok) {
 			// The baseline is what the server STORED, not what we sent: `setExportTarget`

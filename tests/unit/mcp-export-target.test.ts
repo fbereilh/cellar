@@ -43,6 +43,22 @@ vi.mock('../../src/lib/server/jupytext', async (importOriginal) => {
 	};
 });
 
+// A notebook write that FAILS (a read-only checkout, EACCES, ENOSPC), so the one
+// throw `setExportTarget` has after it mutates is observable without touching the
+// real filesystem's permissions.
+const disk = vi.hoisted(() => ({ failFor: null as string | null }));
+vi.mock('../../src/lib/server/ipynb', async (importOriginal) => {
+	const real = await importOriginal<typeof import('../../src/lib/server/ipynb')>();
+	return {
+		...real,
+		writeNotebook: (path: string, doc: Parameters<typeof real.writeNotebook>[1]) => {
+			if (disk.failFor && path.endsWith(disk.failFor))
+				throw new Error('ENOSPC: no space left on device, write');
+			return real.writeNotebook(path, doc);
+		}
+	};
+});
+
 let WS: string;
 let svc: typeof import('../../src/lib/server/mcp/service');
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -379,6 +395,8 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(fn).not.toMatch(/setTimeout/);
 		expect(fn).not.toMatch(/exportTargetSeq/);
 		expect(fn).not.toMatch(/pendingExportTarget/);
+		// No pending-value mirror HERE: the field itself is the pending value, and the
+		// only thing that reads it back is the unload flush in `Notebook.svelte` below.
 		expect(src).not.toMatch(/flushExportTarget/);
 		expect(fn).not.toMatch(/const previous = exportTarget/);
 		// The baseline is only ever written where the server states it.
@@ -388,6 +406,37 @@ describe('the client half of that refusal (source guard)', () => {
 		const nbSrc = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
 		expect(nbSrc).toMatch(/onchange=\{onExportTargetCommit\}/);
 		expect(nbSrc).not.toMatch(/oninput=\{onExportTarget/);
+	});
+
+	it('flushes a target typed but never committed on pagehide and on unmount', () => {
+		// `change` is not reliably delivered before unload, so a value typed and then
+		// reloaded (or tab-closed) on was simply lost - the same sub-commit window
+		// `Cell.svelte` flushes on `pagehide`, and the same idiom.
+		const nbSrc = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
+		const flush = nbSrc.slice(
+			nbSrc.indexOf('function flushExportTarget'),
+			nbSrc.indexOf('</script>')
+		);
+		expect(flush, 'flushExportTarget should exist in Notebook.svelte').not.toBe('');
+		// It reads the LIVE field, and writes only when it diverges from the model - so
+		// the per-edit commit model is unchanged and a committed value writes nothing.
+		expect(flush).toMatch(/el\.value === \(exportTarget \?\? ''\)/);
+		expect(flush).toMatch(/addEventListener\('pagehide'/);
+		expect(flush).toMatch(/removeEventListener\('pagehide'/);
+		// The teardown flush is what covers an unmount (a tab close, a notebook closed).
+		const teardown = flush.slice(flush.indexOf('return () => {'));
+		expect(teardown).toMatch(/flushExportTarget\(\);/);
+		expect(nbSrc).toMatch(/bind:this=\{exportTargetEl\}/);
+
+		// And the unload path must SURVIVE the page going away: the write goes out with
+		// `keepalive`, like Cell.svelte's unload edit flush (this body is one path, far
+		// under the ~64KB cap that rules keepalive out for ordinary saves).
+		expect(flush).toMatch(/flushExportTarget\(true\)/);
+		const commitFn = src.slice(
+			src.indexOf('async function commitExportTarget'),
+			src.indexOf('async function setNumberingLevel')
+		);
+		expect(commitFn).toMatch(/keepalive/);
 	});
 
 	it('awaits an in-flight target write before the export button posts, and aborts on a refused one', () => {
@@ -433,6 +482,67 @@ describe('the client half of that refusal (source guard)', () => {
 		// message this action had not yet replaced (the in-flight case survived it only
 		// by accident of ordering). Every branch below ends in exactly one message.
 		expect(shellExport).not.toMatch(/clearNotice\(\)/);
+	});
+});
+
+/**
+ * A refused PATH and a failed WRITE are different facts with different remedies,
+ * and the doc layer validates BEFORE it mutates - so the only throw left after the
+ * mutation is the notebook write. Reporting that as an invalid path sends the
+ * caller to fix a path that was never wrong, over a change the live document DID
+ * take. They are told apart by TYPE (`InvalidExportTargetError`), never by matching
+ * the message text.
+ */
+describe('a refused path and a failed write are told apart', () => {
+	it('a path refusal is `invalid`, and the document is left untouched', async () => {
+		svc.useNotebook('sessRefuse', 'refuse-target.ipynb');
+		const nb = svc.targetFor('sessRefuse');
+		await svc.addCells([{ cell_type: 'code', source: 'z = 1' }], null, { nb, routeImports: false });
+		svc.setExportTarget('lib/kept.py', nb);
+
+		const escaping = svc.setExportTarget('../outside.py', nb);
+		expect(escaping).toMatchObject({ ok: false, invalid: expect.stringMatching(/escapes workspace/) });
+		expect(escaping).not.toHaveProperty('writeFailed');
+
+		const notPy = svc.setExportTarget('src/app.ts', nb);
+		expect(notPy).toMatchObject({ ok: false, invalid: expect.stringMatching(/not a \.py file/) });
+		expect(notPy).not.toHaveProperty('writeFailed');
+
+		// Validation runs before the mutation, so a refusal changes nothing.
+		expect(nbmod.getExportTarget(nb)).toBe('lib/kept.py');
+	});
+
+	it('a failed notebook write is `writeFailed`, over a target the document HOLDS', async () => {
+		svc.useNotebook('sessDisk', 'disk-target.ipynb');
+		const nb = svc.targetFor('sessDisk');
+		await svc.addCells([{ cell_type: 'code', source: 'w = 1' }], null, { nb, routeImports: false });
+
+		disk.failFor = 'disk-target.ipynb';
+		try {
+			const r = svc.setExportTarget('lib/disk.py', nb);
+			// NOT an `invalid`: the MCP layer renders that as "the export target must be a
+			// workspace-relative .py path", a remedy for a problem that did not occur.
+			expect(r).not.toHaveProperty('invalid');
+			expect(r).toMatchObject({ ok: false, writeFailed: expect.stringMatching(/ENOSPC/) });
+		} finally {
+			disk.failFor = null;
+		}
+		// The path was accepted: the live document carries it and writes it with the
+		// notebook's next successful save.
+		expect(nbmod.getExportTarget(nb)).toBe('lib/disk.py');
+	});
+
+	it('the MCP handler renders the two differently (source guard)', () => {
+		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
+		const handler = src.slice(
+			src.indexOf("registerTool('set_export_target'"),
+			src.indexOf('// --- execute ---')
+		);
+		expect(handler).toMatch(/'invalid' in r/);
+		expect(handler).toMatch(/'writeFailed' in r/);
+		const writeBranch = handler.slice(handler.indexOf("'writeFailed' in r"));
+		expect(writeBranch.split('\n')[0]).not.toMatch(/must be a workspace-relative \.py path/);
+		expect(writeBranch).toMatch(/could not be saved/);
 	});
 });
 

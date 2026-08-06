@@ -805,6 +805,22 @@ export function effectiveExportTarget(nb?: string | null): string | null {
 }
 
 /**
+ * The path itself was REFUSED - it escapes the workspace, or does not name a `.py`
+ * module. Typed (the `CellRefError` precedent) because `setExportTarget` validates
+ * BEFORE it mutates, so its only other throw is the `persist`: a disk failure over
+ * a path that is perfectly valid and that the live document has already taken.
+ * Reported as a refusal, that sends the caller to fix a path that was never wrong,
+ * over a change that DID take - so the two are told apart by TYPE here rather than
+ * by matching the message text at the catch.
+ */
+export class InvalidExportTargetError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'InvalidExportTargetError';
+	}
+}
+
+/**
  * Set (or clear, with null/'') the notebook-level export target in the
  * allowlisted `cellar` namespace, so it round-trips through clean-on-save.
  * Materializes `doc.metadata` if the notebook had none yet. `persist` regenerates
@@ -841,6 +857,11 @@ export function effectiveExportTarget(nb?: string | null): string | null {
  * baseline and kept in the input while the server held the relative form - and
  * the `notebook:export-target` event that would have corrected it is
  * echo-suppressed in the initiating tab.
+ *
+ * Every REFUSAL of the path itself is thrown as an `InvalidExportTargetError`,
+ * so a caller can tell it apart from the one other throw this function has - the
+ * `persist` below, i.e. a disk failure over a path that was never wrong. See that
+ * class for why the distinction is load-bearing.
  */
 export function setExportTarget(
 	target: string | null,
@@ -851,9 +872,14 @@ export function setExportTarget(
 	const raw = (target ?? '').trim();
 	let stored = '';
 	if (raw) {
-		const abs = resolveInWorkspace(raw); // throws when the path escapes the workspace
+		let abs: string;
+		try {
+			abs = resolveInWorkspace(raw); // throws when the path escapes the workspace
+		} catch (err) {
+			throw new InvalidExportTargetError(String((err as Error)?.message ?? err));
+		}
 		if (!/\.py$/i.test(raw))
-			throw new Error(
+			throw new InvalidExportTargetError(
 				`export target ${raw} is not a .py file: the generated module is written to this path, so it must name a .py module`
 			);
 		stored = relative(resolve(workspace()), abs).split(sep).join('/');

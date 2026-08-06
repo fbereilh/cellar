@@ -79,9 +79,10 @@
 		/**
 		 * Set (or clear, with '') the notebook's `.py` export target. Called ONCE PER
 		 * EDIT, from the input's `change` (a blur after typing, or Enter) - never per
-		 * keystroke, since the write can be refused.
+		 * keystroke, since the write can be refused. `keepalive` is set only by the
+		 * unload flush (`pagehide`), the same rule as `Cell.svelte`'s edit flush.
 		 */
-		onSetExportTarget?: (target: string) => void;
+		onSetExportTarget?: (target: string, opts?: { keepalive?: boolean }) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
 		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
@@ -439,9 +440,31 @@
 	// workspace, a `.py` text notebook), and refusing one character at a time fought
 	// the typist. `change` does not fire on an unmodified blur, so merely clicking
 	// through the field writes nothing.
+	let exportTargetEl = $state<HTMLInputElement | undefined>(undefined);
 	function onExportTargetCommit(e: Event) {
 		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value);
 	}
+	/**
+	 * Commit a target typed but never committed. `change` is not reliably delivered
+	 * before unload, so without this a path the user typed and then reloaded (or
+	 * closed the tab) on was simply lost - the same sub-commit window `Cell.svelte`
+	 * flushes on `pagehide`, and the same idiom. The per-edit commit model is
+	 * unchanged: this fires only when the field still differs from what the model
+	 * holds, so an already-committed value writes nothing.
+	 */
+	function flushExportTarget(keepalive = false) {
+		const el = exportTargetEl;
+		if (!el || el.value === (exportTarget ?? '')) return;
+		onSetExportTarget?.(el.value, { keepalive });
+	}
+	$effect(() => {
+		const onUnload = () => flushExportTarget(true);
+		window.addEventListener('pagehide', onUnload);
+		return () => {
+			window.removeEventListener('pagehide', onUnload);
+			flushExportTarget();
+		};
+	});
 	async function doExport() {
 		if (exporting) return;
 		exporting = true;
@@ -638,6 +661,7 @@
 					Export to
 				</span>
 				<input
+					bind:this={exportTargetEl}
 					type="text"
 					class="input input-bordered input-xs w-56 font-mono"
 					placeholder="utils.py"
