@@ -111,6 +111,12 @@ describe('a run this tab did NOT initiate refreshes what its own run does', () =
 		const gate = blockAt('function foreignRunTouchesActiveNotebook(nb: unknown): boolean {');
 		const failsOpen = [
 			/typeof nb !== 'string' \|\| !nb\) return true/, // no path on the event
+			// The SERVER's active notebook (what the probe reads) moves only when a
+			// LiveNotebook becomes active, so a plain FILE tab holding focus leaves it
+			// pointing elsewhere while `activeNotebookPath` falls back to the canonical
+			// notebook. Comparing there answers about the wrong notebook - and answers
+			// FALSE, i.e. the missed refresh this path exists to fix.
+			/!activeTabIsNotebook\) return true/, // the tab is not the notebook it names
 			/!activeNotebookPath\) return true/, // no notebook active
 			/!nb\.startsWith\(workspace\)\) return true/ // outside the workspace
 		];
@@ -132,6 +138,23 @@ describe('an inspector response that is no longer the newest is dropped', () => 
 		expect(refresh).toMatch(/if \(seq !== varsReqSeq\) return;[\s\S]*variables = body\.variables/);
 		expect(refresh).toMatch(/if \(seq !== varsReqSeq\) return;[\s\S]*varsError =/);
 		expect(refresh).toContain('if (seq === varsReqSeq) varsLoading = false;');
+	});
+
+	it('supersedes an in-flight probe when a restart/shutdown wipes the namespace', () => {
+		// A LOCAL write to `variables` is the other half of the same guard - the
+		// `markKernelStarted` convention. Without the bump, a probe issued a moment
+		// before the restart lands after the wipe and repopulates the inspector with
+		// the dead session's namespace, and nothing is scheduled to correct it.
+		const wipe = blockAt('function wipeVariablesLocally() {');
+		expect(wipe).toContain('varsReqSeq++');
+		expect(wipe.indexOf('varsReqSeq++')).toBeLessThan(wipe.indexOf('variables = []'));
+		for (const anchor of ['async function restartKernel(path: string) {', 'async function shutdownKernel(path: string) {']) {
+			const block = blockAt(anchor);
+			expect(block, anchor).toContain('/api/kernel/'); // the slice really is this control
+			expect(block, anchor).toContain('wipeVariablesLocally()');
+			// A raw `variables = []` here would bypass the bump - the exact regression.
+			expect(block, anchor).not.toMatch(/variables = \[\]/);
+		}
 	});
 });
 

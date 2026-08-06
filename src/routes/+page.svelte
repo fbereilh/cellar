@@ -1109,6 +1109,19 @@
 	}
 
 	/**
+	 * The active notebook's namespace is gone (a restart / shutdown wiped it), so
+	 * drop the rows we show. The generation bump is what makes that stick: it is the
+	 * local-write sibling of `markKernelStarted`, superseding any probe already in
+	 * flight — one issued a moment before the restart would otherwise land AFTER
+	 * this and repopulate the inspector with the dead session's namespace, with
+	 * nothing scheduled to correct it.
+	 */
+	function wipeVariablesLocally() {
+		varsReqSeq++;
+		variables = [];
+	}
+
+	/**
 	 * A foreign `run:end` arrives once per CELL, and the variable inspector is a
 	 * REAL kernel probe (`/api/kernel/variables` → `inspectVariables`, which
 	 * `execute`s python on the ACTIVE notebook's kernel). So an agent's
@@ -1138,9 +1151,18 @@
 	 * case where it cannot be derived confidently falls back to TRUE: a missed
 	 * refresh is the bug this whole path exists to fix, so over-refreshing is the
 	 * safe direction and silently skipping is never one.
+	 *
+	 * `activeTabIsNotebook` is one such case, and it is the load-bearing one: the
+	 * SERVER's notion of the active notebook (what the probe really reads) moves
+	 * only when a `LiveNotebook` becomes `active`, so a plain FILE tab holding focus
+	 * leaves it pointing at the last-focused notebook while `activeNotebookPath`
+	 * falls back to the canonical one. The comparison may only be trusted while the
+	 * active TAB is itself the notebook it names; otherwise the client cannot know
+	 * the probe's subject and must refresh.
 	 */
 	function foreignRunTouchesActiveNotebook(nb: unknown): boolean {
 		if (typeof nb !== 'string' || !nb) return true; // no path on the event → can't tell
+		if (!activeTabIsNotebook) return true; // the server's active notebook may differ → can't tell
 		if (!activeNotebookPath) return true; // no notebook active → can't tell
 		if (!nb.startsWith(workspace)) return true; // outside the workspace → can't tell
 		const rel = nb.slice(workspace.length).replace(/^[/\\]+/, '');
@@ -1174,14 +1196,14 @@
 	async function restartKernel(path: string) {
 		try {
 			await fetch('/api/kernel/restart', { ...kernelJson, body: JSON.stringify({ path }) });
-			if (path === activeNotebookPath) variables = [];
+			if (path === activeNotebookPath) wipeVariablesLocally();
 		} catch {}
 		refreshKernel();
 	}
 	async function shutdownKernel(path: string) {
 		try {
 			await fetch('/api/kernel/shutdown', { ...kernelJson, body: JSON.stringify({ path }) });
-			if (path === activeNotebookPath) variables = [];
+			if (path === activeNotebookPath) wipeVariablesLocally();
 		} catch {}
 		refreshKernel();
 	}
