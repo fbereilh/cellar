@@ -15,7 +15,7 @@
   session itself is built in the kernel. See `src/lib/server/databricks.js`.
 -->
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
 	import { getUi, setUi, setUiNow } from '$lib/uiState';
 	import { getUserSettingText, onUserSettingsChange } from '$lib/userSettings';
@@ -1033,28 +1033,71 @@
 	 * both triggers - most seeds change nothing (reopening the section, a change to
 	 * some OTHER setting), and dismissing a still-accurate note there would be the
 	 * same defect with the sign flipped.
+	 *
+	 * An upload IN FLIGHT DEFERS the whole seed rather than clearing over it. The
+	 * attempt pinned its own affixes at the click, and clearing bumps `uploadSeq` -
+	 * which makes `uploadToWorkspace` discard the settled reply as superseded: the
+	 * replace really happened, the panel said nothing about it, and the box vanished
+	 * mid-flight, the same silent clobber Cancel is deliberately inert for. Deferring
+	 * self-heals because the effect below tracks that gate, so the seed lands the
+	 * moment the attempt settles.
+	 *
+	 * What a deferred seed then keeps is decided by KIND, not by age: an outcome that
+	 * arrived while it waited (the "uploaded to"/"replaced" note, or an error) is a
+	 * past-tense record of an attempt the user themself confirmed and is the very
+	 * thing they are still waiting to read, so it survives - while an armed replace
+	 * confirm is a PENDING action naming a path these fields would no longer upload
+	 * to, so it goes in every case, exactly as typing drops it.
 	 */
+	let uploadSeedDeferred = false;
+	let uploadSeedDeferredAt = 0;
 	function seedUploadAffixes() {
 		const prefix = storedAffix(DBX_UPLOAD_PREFIX_KEY, UPLOAD_PREFIX_DEFAULT_KEY);
 		const postfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY, UPLOAD_POSTFIX_DEFAULT_KEY);
-		if (prefix === uploadPrefix && postfix === uploadPostfix) return;
+		if (prefix === uploadPrefix && postfix === uploadPostfix) {
+			uploadSeedDeferred = false;
+			return;
+		}
+		if (uploadConfirmBusy) {
+			// Recorded ONCE per deferral: re-reading it on every re-run while still gated
+			// would forget that an outcome arrived in between.
+			if (!uploadSeedDeferred) {
+				uploadSeedDeferred = true;
+				uploadSeedDeferredAt = uploadFeedbackSeq;
+			}
+			return;
+		}
+		const arrived = uploadSeedDeferred && uploadFeedbackSeq !== uploadSeedDeferredAt;
+		uploadSeedDeferred = false;
 		uploadPrefix = prefix;
 		uploadPostfix = postfix;
-		clearUploadFeedback();
+		if (arrived) {
+			// Keep the outcome, drop the pending action. Nothing is in flight here (the
+			// gate has lifted), so this deliberately does NOT bump `uploadSeq`.
+			uploadExistsPath = '';
+			uploadExistsAffixes = null;
+		} else {
+			clearUploadFeedback();
+		}
 	}
 	$effect(() => {
 		// The SUBSCRIPTION is the case that matters: the Settings modal sits OVER an
 		// expanded sidebar, so nothing about this panel changes while the default is
 		// being edited, and without a change signal it would still catch up only on a
-		// reload - which is exactly what the reported gap was.
-		seedUploadAffixes();
-		return onUserSettingsChange(seedUploadAffixes);
+		// reload - which is exactly what the reported gap was. Registered ONCE: the
+		// callback reads (and writes) the affixes, so tracking it here would tear the
+		// listener down and re-register it on every keystroke, an effect whose own
+		// write feeds its own dependencies.
+		return onUserSettingsChange(() => untrack(seedUploadAffixes));
 	});
 	$effect(() => {
-		// Reopening the section is the other moment worth catching up on: the panel
-		// stays mounted while it is folded away, so this is the closest thing it has to
-		// being opened afresh.
-		if (visible) seedUploadAffixes();
+		// The catch-up triggers, read explicitly so the untracked seed still re-runs on
+		// them: the section being reopened (the panel stays mounted while folded away,
+		// so this is the closest it has to being opened afresh), and the in-flight gate
+		// lifting, which is what applies a deferred seed.
+		void visible;
+		void uploadConfirmBusy;
+		untrack(seedUploadAffixes);
 	});
 	/**
 	 * The affixes the ARMED replace confirm was resolved with, pinned at the moment
@@ -1172,6 +1215,17 @@
 	 * against a request that is still in flight.
 	 */
 	let uploadSeq = 0;
+
+	/**
+	 * How many settled upload outcomes this panel has rendered.
+	 *
+	 * Bumped wherever a reply survives the guard above and becomes something on
+	 * screen, so a DEFERRED affix seed can tell "the outcome I was waiting for has
+	 * arrived" from "nothing happened while I waited" - the first must not be cleared
+	 * away the instant it lands, the second is exactly what the clear is for. It is a
+	 * different question from `uploadSeq`, which counts attempts and supersessions.
+	 */
+	let uploadFeedbackSeq = 0;
 
 	/**
 	 * Whether an upload can neither be started nor interrupted right now - the ONE
@@ -1320,6 +1374,7 @@
 			// This reply describes a file the panel no longer names, so NOTHING of it is
 			// written: an armed confirm would overwrite on behalf of a different notebook.
 			if (seq !== uploadSeq || target !== notebookPath) return;
+			uploadFeedbackSeq++;
 			if (!res.ok) throw body;
 			const out = body as { status?: string; path?: string; url?: string | null; overwritten?: boolean };
 			if (out.status === 'exists') {
@@ -1340,6 +1395,7 @@
 			};
 		} catch (err) {
 			if (seq !== uploadSeq || target !== notebookPath) return;
+			uploadFeedbackSeq++;
 			// A failed replace must not strand the user inside a confirm box whose
 			// Replace button just failed: drop back to the plain button, with the error.
 			uploadExistsPath = '';

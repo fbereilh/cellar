@@ -35,6 +35,8 @@ import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
  *   - a default change that MOVES the affix drops the armed replace confirm, which
  *     names a path built from the OLD one - while a seed that changes nothing
  *     (reopening the section) leaves a still-accurate box alone;
+ *   - the same change made while a replace is IN FLIGHT defers instead, so the
+ *     settled reply is never discarded as superseded, and applies once it lands;
  *   - clearing a project's field is an ANSWER ("no prefix here"), so the default
  *     does not creep back on the next load;
  *   - the default is a FILE, not per-origin state, which is the whole reason it is
@@ -260,7 +262,10 @@ test('project B - a different workspace, never asked - inherits it, and uploads 
 
 	// …and it is a real default, not decoration: the upload goes out under it, expanded.
 	await page.getByTestId('databricks-upload').click();
-	expect(seen).toHaveLength(1);
+	// Polled, never read straight after the click: `click()` resolves once the event is
+	// dispatched in the renderer, while the request and the route interception are two
+	// further hops back into Node - so a synchronous read fails against working code.
+	await expect.poll(() => seen.length).toBe(1);
 	expect(seen[0].prefix).toBe(`${yyyymm}_`);
 });
 
@@ -341,6 +346,80 @@ test('a default change that MOVES the affix drops the confirm built from the old
 	await openDatabricksSection(page);
 	await expect(confirm).toContainText('NEW_notebook');
 	await page.getByTestId('databricks-upload-cancel').click();
+
+	// Put the default back for the tests after this one.
+	await openSettings(page);
+	await page.getByTestId('settings-upload-prefix').fill('GLOBAL_');
+	await closeSettings(page);
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
+});
+
+test('a default changed MID-REPLACE never discards the reply, and lands once it settles', async ({
+	page
+}) => {
+	// The other side of the rule above, and the dangerous one: clearing the feedback
+	// also bumps the upload's generation guard, so a seed firing while a replace is IN
+	// FLIGHT made the settled reply be dropped as superseded - the file was overwritten
+	// in Databricks, the panel said nothing about it, and the box the user was watching
+	// vanished mid-replace. That is exactly the silent clobber Cancel is deliberately
+	// inert for. So an in-flight upload DEFERS the whole seed.
+	await mockDatabricks(page);
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => (release = resolve));
+	await page.route(/\/api\/databricks\/upload$/, async (route) => {
+		const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;
+		const path = `/Users/${USER}/${String(body.prefix ?? '')}notebook`;
+		if (body.overwrite !== true) {
+			return route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({ ok: true, status: 'exists', path, url: null, overwritten: false })
+			});
+		}
+		await held;
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ ok: true, status: 'uploaded', path, url: null, overwritten: true })
+		});
+	});
+	await openProject(page, urlB);
+	await openDatabricksSection(page);
+	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('GLOBAL_');
+
+	await page.getByTestId('databricks-upload').click();
+	const confirm = page.getByTestId('databricks-upload-confirm-box');
+	await expect(confirm).toContainText('GLOBAL_notebook');
+	await page.getByTestId('databricks-upload-replace').click();
+	await expect(page.getByTestId('databricks-upload-replace')).toBeDisabled();
+
+	// The user wanders off to Settings while the big notebook uploads.
+	await openSettings(page);
+	await page.getByTestId('settings-upload-prefix').fill('HELD_');
+	await closeSettings(page);
+	// The box is still up, still naming the path being overwritten - it must not be
+	// pulled out from under a replace that is happening.
+	await expect(confirm).toContainText('GLOBAL_notebook');
+	// Confirm it REACHED the file before the restore below, which polls for a value the
+	// previous test already left there: polling only for that would pass against the
+	// pre-existing `GLOBAL_` and leave this write to land afterwards, so the tests that
+	// follow would read `HELD_`.
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('HELD_');
+
+	release();
+
+	// The outcome renders: the reply was not thrown away, and it names the affixes the
+	// confirm pinned rather than the one Settings has since moved to.
+	const note = page.getByTestId('databricks-upload-note');
+	await expect(note).toContainText('Replaced in your Databricks workspace');
+	await expect(note).toContainText(`/Users/${USER}/GLOBAL_notebook`);
+	await expect(confirm).toHaveCount(0);
+
+	// …and the deferred seed then lands, WITHOUT taking the outcome with it: the note is
+	// a past-tense record of what happened, the field is a promise about what is next.
+	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('HELD_');
+	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('HELD_notebook');
+	await expect(note).toContainText(`/Users/${USER}/GLOBAL_notebook`);
 
 	// Put the default back for the tests after this one.
 	await openSettings(page);

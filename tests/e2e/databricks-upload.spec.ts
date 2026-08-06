@@ -536,7 +536,7 @@ test.describe('upload name affixes', () => {
 
 		// What was SENT is the already-expanded text, so the server has no date of its own
 		// to disagree about - and the path it reports is the name the preview showed.
-		expect(seen).toHaveLength(1);
+		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe(`${dashed}_`);
 		expect(seen[0].postfix).toBe(`_${compact}`);
 		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/${promised}`);
@@ -572,7 +572,7 @@ test.describe('upload name affixes', () => {
 
 		// And the wire carries the same thing the preview promised - the client expands
 		// once, at the click, so the server has no token left to disagree about.
-		expect(seen).toHaveLength(1);
+		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe(compact);
 		expect(seen[0].postfix).toBe(compact);
 		await expect(page.getByTestId('databricks-upload-note')).toContainText(
@@ -613,7 +613,7 @@ test.describe('upload name affixes', () => {
 		await expect(page.getByTestId('databricks-upload')).toBeEnabled();
 		await expect(page.getByTestId('databricks-upload-name-error')).toHaveCount(0);
 		await page.getByTestId('databricks-upload').click();
-		expect(seen).toHaveLength(1);
+		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe('{YYYYMMD}_');
 
 		// And the remedy is right there among the buttons. Once the token is real, the
@@ -691,7 +691,7 @@ test.describe('upload name affixes', () => {
 		// And a chip-built affix uploads exactly as a typed one does - same single path,
 		// so what the preview promised is what the wire carries.
 		await page.getByTestId('databricks-upload').click();
-		expect(seen).toHaveLength(1);
+		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe(`${dashed}_${dashed.slice(-2)}`);
 		expect(seen[0].postfix).toBe(compact);
 		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/${promised}`);
@@ -773,7 +773,7 @@ test.describe('upload name affixes', () => {
 		// And the promise is kept: the click sends the date the preview is showing, not
 		// the one it was opened on. A frozen preview would have promised 08-05 here.
 		await page.getByTestId('databricks-upload').click();
-		expect(seen).toHaveLength(1);
+		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe('2026-08-06_');
 		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/2026-08-06_notebook`);
 	});
@@ -806,7 +806,7 @@ test.describe('upload name affixes', () => {
 		// The click reads the clock once and moves the preview onto that same instant, so
 		// the two cannot disagree: today's date is uploaded (never the previewed stale
 		// one) AND the name left on screen is the one that landed.
-		expect(seen).toHaveLength(1);
+		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe('2026-08-06_');
 		await expect(preview).toHaveText('2026-08-06_notebook');
 		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/2026-08-06_notebook`);
