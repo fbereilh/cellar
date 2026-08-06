@@ -451,6 +451,28 @@ export async function gitStatus(): Promise<GitStatusResult> {
 }
 
 /**
+ * What ref an ARBITRARY directory inside the workspace has checked out — the
+ * branch (or short SHA when detached) plus the short commit.
+ *
+ * Distinct from `gitBranch()`, which answers for the workspace and is cached
+ * against the workspace index. This one takes a directory because a notebook code
+ * root is normally a git WORKTREE inside the workspace (`git worktree add
+ * roots/pr-482 <branch>`), i.e. a different checkout of the same repo — naming
+ * which branch each root holds is the whole point of the review workflow. Not
+ * cached: it is read only when a root list is requested, and a worktree's branch
+ * legitimately moves under Cellar's feet.
+ *
+ * Returns null when the directory is not inside a git repository at all.
+ */
+export async function gitRefAt(absDir: string): Promise<{ branch: string | null; commit: string | null } | null> {
+	const sym = await runGit(absDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+	const sha = await runGit(absDir, ['rev-parse', '--short', 'HEAD']);
+	if (sym == null && sha == null) return null;
+	const commit = sha?.trim() || null;
+	return { branch: sym?.trim() || commit, commit };
+}
+
+/**
  * The current git branch for the workspace.
  *
  * A normal (even unborn/no-commits-yet) branch resolves via `symbolic-ref`; a

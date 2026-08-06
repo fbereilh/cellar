@@ -6,6 +6,7 @@
 	import type { CellChangeStatus } from '$lib/gitdiff';
 	import type { CellHighlight } from '$lib/searchHighlight';
 	import type { CollapsedRecord } from '$lib/cellCollapse';
+	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import {
 		planWindow,
 		pinnedCellIds,
@@ -80,6 +81,16 @@
 		onSetExportTarget?: (target: string) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
 		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
+		/** This notebook's declared code root (kernel cwd + sys.path), or null for the workspace. */
+		root?: string | null;
+		/** The workspace's code roots — an empty list renders no root control at all. */
+		availableRoots?: WorkspaceRootOption[];
+		/** True while a root change is in flight (the picker is disabled). */
+		rootBusy?: boolean;
+		/** Outcome of the last root change (applied / refused), shown beside the picker. */
+		rootFeedback?: string;
+		/** Declare (or clear, with '') the notebook's code root. */
+		onSetRoot?: (root: string) => void;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
 		hideAllCode?: boolean;
@@ -162,6 +173,11 @@
 		exportCount = 0,
 		onSetExportTarget,
 		onExportPy,
+		root = null,
+		availableRoots = [],
+		rootBusy = false,
+		rootFeedback = '',
+		onSetRoot,
 		onSetScrolled,
 		hideAllCode = false,
 		onSetHideInput,
@@ -430,6 +446,29 @@
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 
+	// ---- code-root bar --------------------------------------------------------
+	// Shown only when the workspace actually has roots, or this notebook already
+	// declares one. A workspace that never adopts roots therefore renders exactly
+	// what it always did — the feature costs it no chrome. The picker always offers
+	// the notebook's CURRENT root even when its directory is gone, so a broken
+	// declaration is visible and clearable rather than silently absent.
+	const rootOptions = $derived.by(() => {
+		const opts = availableRoots.map((r) => ({ ...r }));
+		if (root && !opts.some((o) => o.path === root)) {
+			opts.push({ path: root, absolute: '', exists: false, branch: null, commit: null, declared: true, notebooks: [] });
+		}
+		return opts;
+	});
+	const showRootBar = $derived(rootOptions.length > 0);
+	const currentRootOption = $derived(rootOptions.find((o) => o.path === root) ?? null);
+	function rootLabel(o: WorkspaceRootOption): string {
+		const ref = o.branch ? ` — ${o.branch}` : '';
+		return o.exists ? `${o.path}${ref}` : `${o.path} (missing)`;
+	}
+	function onRootSelect(e: Event) {
+		onSetRoot?.((e.currentTarget as HTMLSelectElement).value);
+	}
+
 	function onExportTargetInput(e: Event) {
 		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value);
 	}
@@ -613,6 +652,47 @@
 				Run all
 			</button>
 		</div>
+		{#if showRootBar}
+			<!-- Code root: the directory THIS notebook's kernel runs in and imports from
+			     (normally a git worktree under `roots/`). Rendered only where the
+			     workspace has roots, so a workspace that never adopts them is untouched.
+			     Deliberately quieter than the export bar: it is a property of the
+			     notebook, not an action, and changing it costs the user their kernel. -->
+			<div
+				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-100 px-3 py-2 text-sm"
+				data-testid="root-bar"
+			>
+				<span class="flex items-center gap-1.5 font-medium text-base-content/70">
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v2" /><path d="M3 7h18v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg>
+					Code root
+				</span>
+				<select
+					class="select select-bordered select-xs w-auto min-w-56 max-w-md pr-7 font-mono"
+					value={root ?? ''}
+					onchange={onRootSelect}
+					disabled={rootBusy}
+					data-testid="root-select"
+					aria-label="Directory this notebook's kernel runs in"
+				>
+					<option value="">workspace root (default)</option>
+					{#each rootOptions as opt (opt.path)}
+						<option value={opt.path}>{rootLabel(opt)}</option>
+					{/each}
+				</select>
+				{#if currentRootOption && !currentRootOption.exists}
+					<span class="text-xs text-error" data-testid="root-missing">
+						missing on disk — runs will fail until it is restored or cleared
+					</span>
+				{:else}
+					<span class="text-xs text-base-content/55">
+						kernel cwd + imports only; files, git and checkpoints stay workspace-wide
+					</span>
+				{/if}
+				{#if rootFeedback}
+					<span class="text-xs text-base-content/70" data-testid="root-feedback">{rootFeedback}</span>
+				{/if}
+			</div>
+		{/if}
 		{#if showExportBar}
 			<!-- nbdev-style export: the notebook-level target `.py` module + a manual
 			     "Export to .py" button. Appears once any cell is marked for export or a

@@ -31,6 +31,7 @@ import { exportNotebookToPy, type ExportResult } from './export-py';
 import { SQL_LANGUAGE, isLogicalCellType } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
+import { normalizeRootPath } from '../notebookRoot';
 import type {
 	Cell,
 	CellView,
@@ -280,9 +281,24 @@ export function getNotebook(nb?: string | null): NotebookView {
 		path: doc.path,
 		cells: doc.cells.map(cellView),
 		exportTarget: typeof t === 'string' && t.trim() ? t.trim() : null,
+		root: readRoot(doc),
 		headerNumbering: readHeaderNumbering(doc),
 		hideAllCode: !!doc.metadata?.cellar?.hide_all_code
 	};
+}
+
+/**
+ * The declared code root of a LOADED doc, normalized (see `getNotebookRoot` for
+ * why an unusable value comes back verbatim rather than as null).
+ */
+function readRoot(doc: NotebookDoc): string | null {
+	const raw = doc.metadata?.cellar?.root;
+	if (typeof raw !== 'string') return null;
+	try {
+		return normalizeRootPath(raw);
+	} catch {
+		return raw.trim() || null;
+	}
 }
 
 /** Sanitized heading-numbering levels (unique, 1-6, ascending) from a doc. */
@@ -335,6 +351,17 @@ export function setActiveNotebook(nb?: string | null): NotebookView {
 	loadDoc(abs);
 	activePath = abs;
 	return getNotebook(abs);
+}
+
+/**
+ * Absolute paths of the notebooks this instance currently holds in memory.
+ *
+ * Deliberately the LIVE documents, not a walk of the workspace: callers use this
+ * to report per-notebook settings (which notebooks declare a code root), and
+ * answering that from disk would mean parsing every `.ipynb` in the workspace.
+ */
+export function listOpenNotebookPaths(): string[] {
+	return [...docs.keys()].sort();
 }
 
 /** Absolute path of the active notebook (defaults to the workspace notebook). */
@@ -746,6 +773,44 @@ export function setHeaderNumbering(
 	persist(doc);
 	emit(doc, 'notebook:header-numbering', { levels: clean }, originId);
 	return clean;
+}
+
+/**
+ * The notebook's declared code root — the workspace-relative directory its
+ * KERNEL resolves code from (cwd + `sys.path`), or null for the workspace (the
+ * default, and today's behavior). Normalized on read as well as on write, so a
+ * hand-edited or externally-authored `.ipynb` carrying `"./roots/x/"` reads as
+ * the same root the UI would have written; a value that is not a
+ * workspace-relative path at all reads as its raw trimmed self, so the resolver
+ * refuses it by name rather than this getter silently answering "no root" (which
+ * would run the notebook against the workspace it explicitly declined).
+ */
+export function getNotebookRoot(nb?: string | null): string | null {
+	return readRoot(docFor(nb));
+}
+
+/**
+ * Set (or clear, with null/'') the notebook's code root in the allowlisted
+ * `cellar` namespace, so it round-trips through clean-on-save with zero git diff
+ * like the rest of the namespace. The declared value is NORMALIZED before it is
+ * persisted (idempotent, so re-saving never churns the file) and a value that is
+ * not a workspace-relative path throws before anything is written.
+ *
+ * This function only records the declaration. Because a kernel's cwd is fixed
+ * when its process spawns, a root that CHANGES also has to free that notebook's
+ * kernel — see `notebook-root-actions.ts`, which is the one place that pairs the
+ * two (the REST route and the MCP tool both go through it).
+ */
+export function setNotebookRoot(root: string | null | undefined, nb?: string | null, originId?: string | null): string | null {
+	const normalized = normalizeRootPath(root);
+	const doc = docFor(nb);
+	doc.metadata = doc.metadata ?? {};
+	doc.metadata.cellar = doc.metadata.cellar ?? {};
+	if (normalized) doc.metadata.cellar.root = normalized;
+	else delete doc.metadata.cellar.root;
+	persist(doc);
+	emit(doc, 'notebook:root', { root: normalized }, originId);
+	return normalized;
 }
 
 /** Whether the notebook-wide "hide all code inputs" (report view) default is on. */

@@ -31,8 +31,11 @@ import {
 	resolveNotebookPath,
 	workspaceRelative,
 	createNotebook as createNotebookDoc,
-	notebookExists
+	notebookExists,
+	getNotebookRoot
 } from '../notebook';
+import { setNotebookRootAndRestart, listWorkspaceRoots } from '../notebook-root-actions';
+import { ROOTS_DIR } from '../../notebookRoot';
 import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel';
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
 import { agentStatus as databricksStatus, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable, reconnectSession as databricksReconnect, connectCluster as databricksConnect, listClustersForAgent as databricksClusters } from '../databricks';
@@ -40,7 +43,7 @@ import { publish } from '../events';
 import { enqueueRun, queuesByNotebook, queuePosition, queueStateFor } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
-import { buildTree, resolveInWorkspace } from '../fstree';
+import { buildTree, resolveInWorkspace, workspaceRoot } from '../fstree';
 import { buildNotebookHtml, exportFilename } from '../export-html';
 import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
@@ -213,9 +216,55 @@ export function useNotebook(sessionId: string | undefined, name?: string, create
 		created: !existed,
 		pinned: !!sessionId,
 		cells: cellCount(nb),
+		root: getNotebookRoot(nb.path),
 		note: sessionId
 			? 'Pinned as this session\'s working notebook. Your reads/writes/runs now default to it; pass notebook:"other.ipynb" for a one-off cross-notebook op.'
 			: 'Opened, but this connection exposes no session id, so it could not be pinned; operations still default to the active notebook.'
+	};
+}
+
+/**
+ * Declare (or clear, with '') a notebook's CODE ROOT: the workspace-relative
+ * directory its kernel runs in and imports from. Kept apart from `useNotebook`
+ * (which stays synchronous) because applying a root frees that notebook's kernel,
+ * which is async — `use_notebook`'s handler composes the two, so an agent still
+ * declares its notebook and its root in one call.
+ *
+ * Throws (naming the path and the fix) when the root is not a usable directory
+ * inside the workspace; nothing is written and no kernel is freed.
+ */
+export async function setNotebookRoot(root: string | null, nb?: string | null) {
+	const change = await setNotebookRootAndRestart(root, nb);
+	return {
+		root: change.root,
+		root_changed: change.changed,
+		...(change.changed
+			? { kernel_restarted: change.kernel_restarted, namespace_cleared: change.namespace_cleared }
+			: {})
+	};
+}
+
+/**
+ * MCP `list_roots`. The workspace's code roots: every directory under the
+ * conventional `roots/`, plus any root a live notebook declares elsewhere. Each
+ * entry names the branch/commit checked out there (a root is normally a git
+ * worktree, so that is what identifies the code under review) and which notebooks
+ * currently point at it.
+ *
+ * A workspace that has never adopted roots returns an empty list — nothing to
+ * declare, and every notebook runs at the workspace root exactly as before.
+ */
+export async function listRoots(sessionId?: string) {
+	const roots = await listWorkspaceRoots();
+	const workingAbs = targetFor(sessionId);
+	return {
+		workspace: workspaceRoot(),
+		working_notebook: workspaceRelative(workingAbs),
+		working_root: getNotebookRoot(workingAbs),
+		roots,
+		note: roots.length
+			? 'A root is a directory inside the workspace (normally a git worktree) that a notebook\'s KERNEL runs in and imports from. Declare one with use_notebook(name, root:"roots/…"); pass root:"" to run at the workspace root again. Changing it frees that notebook\'s kernel (its namespace is cleared).'
+			: `No code roots in this workspace: every notebook runs at the workspace root. Roots are directories under \`${ROOTS_DIR}/\` (normally \`git worktree add ${ROOTS_DIR}/<name> <branch>\`), created by the user.`
 	};
 }
 
@@ -727,6 +776,10 @@ export async function getNotebookMap(nb?: string | null) {
 	return {
 		notebook: view.path,
 		kernel: kernelSession(nb),
+		// The directory this notebook's KERNEL runs in and imports from (null = the
+		// workspace root, the default). Not a display setting: it decides which
+		// checkout the code you run comes from, so it rides beside `kernel`.
+		root: view.root,
 		databricks: { connected: dbx.connected === true },
 		display: {
 			header_numbering: view.headerNumbering,

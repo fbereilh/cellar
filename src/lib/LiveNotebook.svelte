@@ -18,6 +18,7 @@
 	} from '$lib/cellSelection';
 	import { exportCellCount } from '$lib/exportRole';
 	import { splitInheritedCellar } from '$lib/splitCell';
+	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { createSearchCache } from '$lib/search';
 	import type { SearchCache } from '$lib/search';
 	import { buildCellHighlights, type SearchHighlightState } from '$lib/searchHighlight';
@@ -116,6 +117,7 @@
 		| { type: 'cell:rendered'; cellId: string }
 		| { type: 'cell:edited'; cellId: string; source: string }
 		| { type: 'notebook:export-target'; target: string | null }
+		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
 		| { type: 'notebook:hide-all-code'; hidden: boolean };
 
@@ -194,6 +196,16 @@
 	// the notebook (Notebook.svelte) once either is set.
 	let exportTarget = $state<string | null>(null);
 	const exportCount = $derived(exportCellCount(cells));
+	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
+	// imports from (null = the workspace root, the default and today's behavior).
+	// Mirrors `notebook.metadata.cellar.root`, kept live via the `notebook:root` SSE
+	// event. `availableRoots` is the workspace's `roots/` directories, fetched
+	// alongside the notebook — when both are empty the notebook renders no root
+	// control at all, so a workspace that never adopts roots looks exactly as before.
+	let root = $state<string | null>(null);
+	let availableRoots = $state<WorkspaceRootOption[]>([]);
+	let rootBusy = $state(false);
+	let rootFeedback = $state('');
 	// Display-only automatic header numbering. `headerNumbering` mirrors
 	// `notebook.metadata.cellar.header_numbering` (loaded on mount, kept live via
 	// the `notebook:header-numbering` SSE event); the per-heading numbers are
@@ -1352,6 +1364,10 @@
 			exportTarget = body.notebook.exportTarget ?? null; // nbdev export target
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
+			root = body.notebook.root ?? null; // code root (kernel cwd + sys.path)
+			// Detached: the notebook must render the instant its cells arrive, and the
+			// root list only decides whether a picker is OFFERED, never what runs.
+			void loadRoots();
 			// A notebook always has a selected cell (command mode acts on it), so
 			// j/k and the rest work the moment the notebook opens. A refetch can also
 			// have removed cells out from under a multi-selection, so prune it to what
@@ -1450,6 +1466,12 @@
 			}
 		} else if (ev.type === 'notebook:export-target') {
 			exportTarget = ev.target;
+		} else if (ev.type === 'notebook:root') {
+			// The code root changed (here, in another tab, or from an agent). The
+			// picker follows; the kernel was already freed server-side, so the cells'
+			// run status refreshes through the `kernel:shutdown` event as usual.
+			root = ev.root ?? null;
+			void loadRoots();
 		} else if (ev.type === 'notebook:header-numbering') {
 			headerNumbering = ev.levels ?? [];
 		} else if (ev.type === 'notebook:hide-all-code') {
@@ -1703,7 +1725,8 @@
 				pe.type?.startsWith('cell:') ||
 				pe.type === 'notebook:export-target' ||
 				pe.type === 'notebook:header-numbering' ||
-				pe.type === 'notebook:hide-all-code'
+				pe.type === 'notebook:hide-all-code' ||
+				pe.type === 'notebook:root'
 			)
 				applyStructuralEvent(pe as unknown as StructuralEvent);
 			else applyRunEvent(pe as unknown as RunEvent);
@@ -2069,6 +2092,52 @@
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ hidden: next, path, originId })
 		}).catch(() => {});
+	}
+
+	/**
+	 * Fetch the workspace's code roots (for the picker). Never throws: a failure
+	 * leaves the list as it was, and the notebook's OWN root — which is what
+	 * actually runs — comes from the notebook load, not from here.
+	 */
+	async function loadRoots() {
+		try {
+			const res = await fetch(`/api/notebooks/root?path=${encodeURIComponent(path)}`);
+			const body = await res.json();
+			if (res.ok) availableRoots = body.roots ?? [];
+		} catch {
+			// Offline / route error: keep whatever the picker already had.
+		}
+	}
+
+	/**
+	 * Declare (or clear, with '') this notebook's code root, then let the server's
+	 * answer settle the state — NOT optimistically, unlike the display settings
+	 * beside it: this one frees the kernel and can be REFUSED (a root that is not a
+	 * usable directory inside the workspace), so showing it as applied before the
+	 * server agrees would claim the notebook runs somewhere it does not.
+	 */
+	async function setRootValue(next: string) {
+		rootBusy = true;
+		rootFeedback = '';
+		try {
+			const res = await fetch('/api/notebooks/root', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ root: next, path, originId })
+			});
+			const body = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(body?.message || 'could not set the code root');
+			root = body.root ?? null;
+			rootFeedback = !body.changed
+				? 'Already running there.'
+				: body.namespace_cleared
+					? 'Kernel freed — variables cleared; the next run starts in the new root.'
+					: 'Applied — the kernel will start in the new root.';
+		} catch (err) {
+			rootFeedback = String((err as Error)?.message ?? err);
+		} finally {
+			rootBusy = false;
+		}
 	}
 
 	/** Set (or clear) the notebook's `.py` export target. Optimistic + persisted. */
@@ -3147,6 +3216,11 @@
 			exportCount={exportCount}
 			onSetExportTarget={setExportTargetValue}
 			onExportPy={exportPy}
+			root={root}
+			availableRoots={availableRoots}
+			rootBusy={rootBusy}
+			rootFeedback={rootFeedback}
+			onSetRoot={setRootValue}
 			onSetScrolled={setScrolled}
 			hideAllCode={hideAllCode}
 			onSetHideInput={setHideInput}

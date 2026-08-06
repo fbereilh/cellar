@@ -47,6 +47,10 @@ vi.mock('@jupyterlab/services', () => ({
 }));
 
 vi.mock('../../src/lib/server/notebook', () => ({
+	// kernel.ts resolves each notebook's declared code root through notebookRoot.ts,
+	// which reads it from here. None of these fixtures declares one, so every kernel
+	// starts at the workspace root — the unchanged single-root behavior.
+	getNotebookRoot: () => null,
 	getActiveNotebookPath: () => h.activeNb,
 	// listKernels() (via the kernel:status publish) maps each absolute path to its
 	// workspace-relative id; the fake workspace is '/ws'.
