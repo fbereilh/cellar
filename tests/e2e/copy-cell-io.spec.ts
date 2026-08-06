@@ -268,6 +268,18 @@ const setClipboardMode = (page: Page, m: 'ok' | 'deny') =>
 
 const cellEl = (page: Page, id: string) => page.locator(`[data-cell-id="${id}"]`);
 
+/** The computed `color` of one control, failing loudly when the cell is not mounted. */
+async function colorOf(page: Page, cellId: string, testId: string): Promise<string> {
+	return page.evaluate(
+		({ cellId: c, testId: t }) => {
+			const el = document.querySelector(`[data-cell-id="${c}"] [data-testid="${t}"]`);
+			if (!el) throw new Error(`${c} / ${t} is not mounted`);
+			return getComputedStyle(el).color;
+		},
+		{ cellId, testId }
+	);
+}
+
 /**
  * Scroll a cell into the render window and wait for it to mount.
  *
@@ -496,21 +508,18 @@ test("a disabled copy-output LOOKS disabled, at daisyUI's own ghost-button alpha
 	// color, so without the `disabled:` variant the button reads as clickable and
 	// only silently refuses the click. Measured against a sibling daisyUI button
 	// that is disabled for its own reason, so the two can never drift apart.
+	// Read each button once its OWN cell is mounted: the two reference cells are
+	// far enough apart that the render window never holds both, and a class-derived
+	// color does not depend on where the notebook is scrolled.
 	await openNotebook(page);
-	await reveal(page, 'copy-empty-aaaaa');
 	await reveal(page, 'copy-stdout-aaaa');
-	await expect(cellEl(page, 'copy-empty-aaaaa')).toBeVisible();
-	const alphas = await page.evaluate(() => {
-		const at = (sel: string) => getComputedStyle(document.querySelector(sel) as Element).color;
-		return {
-			enabled: at('[data-cell-id="copy-stdout-aaaa"] [data-testid="copy-output"]'),
-			disabled: at('[data-cell-id="copy-empty-aaaaa"] [data-testid="copy-output"]'),
-			daisyDisabled: at('[data-cell-id="copy-stdout-aaaa"] [data-testid="move-up"]')
-		};
-	});
+	const enabled = await colorOf(page, 'copy-stdout-aaaa', 'copy-output');
+	const daisyDisabled = await colorOf(page, 'copy-stdout-aaaa', 'move-up');
+	await reveal(page, 'copy-empty-aaaaa');
+	const disabled = await colorOf(page, 'copy-empty-aaaaa', 'copy-output');
 	const alpha = (c: string) => Number(/\/\s*([\d.]+)\s*\)/.exec(c)?.[1] ?? '1');
-	expect(alpha(alphas.disabled)).toBeLessThan(alpha(alphas.enabled));
-	expect(alpha(alphas.disabled)).toBeCloseTo(alpha(alphas.daisyDisabled), 2);
+	expect(alpha(disabled)).toBeLessThan(alpha(enabled));
+	expect(alpha(disabled)).toBeCloseTo(alpha(daisyDisabled), 2);
 });
 
 test('a markdown cell offers copy input (its raw markdown) and no copy output', async ({ page }) => {

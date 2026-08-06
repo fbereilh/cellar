@@ -468,6 +468,21 @@
 	// being absent and the declaration being refused say the same thing.
 	const showRootBar = $derived(rootOptions.length > 0 && !isPy);
 	const currentRootOption = $derived(rootOptions.find((o) => o.path === root) ?? null);
+	// The select is DRIVEN by `root`, never by the click: the change is applied
+	// non-optimistically and can be REFUSED (the picker deliberately offers a
+	// `(missing)` entry so a broken declaration can be seen and cleared, and
+	// selecting one is refused), and a one-way `value={root}` re-applies only when
+	// `root` MOVES - so a refusal left the control showing a root the notebook does
+	// not run at, beside a `currentRootOption` hint describing the old one. The
+	// resync is held back while the attempt is in flight (the control is disabled
+	// there, so the pending choice stays legible) and forced the moment it settles,
+	// whichever way it went.
+	let selectedRoot = $state('');
+	$effect(() => {
+		const settled = root ?? '';
+		if (rootBusy) return;
+		selectedRoot = settled;
+	});
 	function rootLabel(o: WorkspaceRootOption): string {
 		const ref = o.branch ? ` — ${o.branch}` : '';
 		return o.exists ? `${o.path}${ref}` : `${o.path} (missing)`;
@@ -675,7 +690,7 @@
 				</span>
 				<select
 					class="select select-bordered select-xs w-auto min-w-56 max-w-md pr-7 font-mono"
-					value={root ?? ''}
+					bind:value={selectedRoot}
 					onchange={onRootSelect}
 					disabled={rootBusy}
 					data-testid="root-select"

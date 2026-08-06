@@ -25,6 +25,24 @@
  * prevent. So a declared-but-unusable root throws with a message naming the path
  * and the fix, and the run fails loudly instead of quietly answering from the
  * wrong checkout.
+ *
+ * WHAT "INSIDE THE WORKSPACE" MEANS HERE, stated exactly: `resolveInWorkspace` is
+ * a LEXICAL prefix check with no `realpathSync`, so it refuses an absolute path
+ * and a `..` traversal by name - and a root declared as a SYMLINK pointing outside
+ * the workspace resolves, since `statSync` follows it. That narrowing is ACCEPTED,
+ * not an oversight, and must not be "fixed" here: the same lexical guard is what
+ * the file tree and `/api/fs/file` resolve through, so such a symlink already
+ * reads outside the workspace everywhere else - making a code root uniquely
+ * stricter than every other path in the app would be inconsistent, and widening
+ * the guard app-wide is a separate task. Do NOT reach for `realpathSync` on the
+ * root alone: on macOS a `mkdtemp` workspace lives under `/tmp` -> `/private/tmp`,
+ * so realpathing one side and not the other refuses legitimate setups (real users
+ * and the e2e harness both). The exposure is bounded: the picker cannot offer one
+ * (`readdirSync` dirents report a symlink as `isDirectory() === false`, so
+ * `listWorkspaceRoots` never enumerates it), it takes a hand-edited
+ * `metadata.cellar.root` or an explicit MCP call, and the kernel executes
+ * arbitrary user code regardless - so a symlinked root grants nothing a cell
+ * could not already do.
  */
 import { statSync } from 'node:fs';
 import { resolve } from 'node:path';

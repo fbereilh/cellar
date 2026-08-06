@@ -1,7 +1,7 @@
 import { test, expect, type APIRequestContext } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
@@ -213,6 +213,37 @@ test('a workspace with no roots renders no root control at all', async ({ page, 
 	await page.getByTestId('empty-open-notebook').click();
 	await expect(page.getByTestId('cell').first()).toBeVisible();
 	await expect(page.getByTestId('root-bar')).toHaveCount(0);
+});
+
+test('a REFUSED root leaves the picker showing the root the notebook still runs at', async ({
+	page,
+	request
+}) => {
+	// The refusal is REAL and reached through the picker itself: the root list is
+	// fetched when the notebook mounts, so a directory removed afterwards is still
+	// an offered option - and selecting it is refused ("does not exist"). Because
+	// the change is applied non-optimistically, the control must snap back to the
+	// root actually in force rather than keep the rejected choice on screen.
+	const scratch = join(workspace, 'roots', 'scratch');
+	mkdirSync(scratch, { recursive: true });
+	await request.post(`${baseURL}/api/notebooks/root`, {
+		data: { root: 'roots/baseline', path: 'notebook.ipynb' }
+	});
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.getByTestId('empty-open-notebook').click();
+	await expect(page.getByTestId('cell').first()).toBeVisible();
+
+	const select = page.getByTestId('root-select');
+	await expect(select).toHaveValue('roots/baseline');
+	await expect(select.locator('option[value="roots/scratch"]')).toHaveCount(1);
+
+	rmSync(scratch, { recursive: true, force: true });
+	await select.selectOption('roots/scratch');
+	await expect(page.getByTestId('root-feedback')).toContainText(/does not exist/i);
+	await expect(select).toHaveValue('roots/baseline');
+	// ...and the hint line, derived from the same root, cannot describe a different
+	// one: the notebook still runs at a root that is present, so nothing is missing.
+	await expect(page.getByTestId('root-missing')).toHaveCount(0);
 });
 
 test('a root outside the workspace is REFUSED, and the notebook is untouched', async ({ request }) => {
