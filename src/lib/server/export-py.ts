@@ -124,12 +124,19 @@ export function generateModule(exportedSources: string[], sourceName: string): s
  * (workspace-relative `.py` path), or a `#|default_exp <module>` directive found
  * in any cell (nbdev familiarity; the UI field is the primary mechanism). Returns
  * null when neither is present.
+ *
+ * The directive scan is guarded by a `includes('default_exp')` substring test
+ * (`dataframeHtml.ts`'s `/dataframe/i` pre-check, same reason): this is the ONE
+ * resolution rule the exporter AND the agent map read, and the map short-circuits
+ * only when a notebook-level target IS set — so the COMMON case, a notebook with
+ * no export configured at all, would otherwise run a multiline regex over every
+ * code cell's full source on the most frequently called agent read tool.
  */
 export function resolveTarget(doc: NotebookDoc): string | null {
 	const explicit = doc.metadata?.cellar?.export_target;
 	if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
 	for (const c of doc.cells) {
-		if (c.cell_type !== 'code') continue;
+		if (c.cell_type !== 'code' || !c.source.includes('default_exp')) continue;
 		const m = c.source.match(/^\s*#\s*\|\s*default_exp\s+([^\s#]+)/m);
 		if (m) {
 			// nbdev writes a dotted module path (`pkg.utils`); map it to a file path.

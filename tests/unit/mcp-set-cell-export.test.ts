@@ -484,6 +484,72 @@ describe('the generated module follows the marks', () => {
 	});
 });
 
+describe('a regeneration that FAILED is reported, never read as a success', () => {
+	/**
+	 * The other half of the honesty contract, and the one an agent cannot see any
+	 * other way: `autoExportPy` swallows the throw so a bad target can never break
+	 * the notebook save, and `module` is CONDITIONAL - so its absence is what says
+	 * the module was written. A target whose parent is a FILE (the same shape as an
+	 * EACCES or an ENOSPC) leaves the module unwritten; there is no MCP export tool
+	 * through which the agent could ever learn that.
+	 */
+	it('says the module could not be written, and names why', async () => {
+		const { target, code } = await makeNotebook('module-unwritable.ipynb');
+		// A regular file where the module's PARENT DIRECTORY would have to be, so
+		// `mkdirSync` throws ENOTDIR/EEXIST on a real filesystem.
+		writeFileSync(join(WS, 'blocked'), 'not a directory\n');
+		svc.setExportTarget('blocked/mod.py', target);
+
+		const r = svc.setCellExport([code[0]], true, target);
+		expect(r).toMatchObject({ ok: true, export_target: 'blocked/mod.py' });
+		expect(r.ok ? r.module : null).toMatchObject({ regenerated: false });
+		expect(r.ok ? r.module?.reason : '').toContain('could not be written');
+		expect(r.ok ? r.module?.reason : '').toContain('blocked/mod.py');
+		// The flag itself still landed - the notebook write is unaffected.
+		expect(marked(target, code[0])).toBe(true);
+		expect(existsSync(join(WS, 'blocked/mod.py'))).toBe(false);
+	});
+
+	it('stops reporting it once a regeneration succeeds', async () => {
+		const { target, code } = await makeNotebook('module-recovers.ipynb');
+		writeFileSync(join(WS, 'blocked2'), 'not a directory\n');
+		svc.setExportTarget('blocked2/mod.py', target);
+		const failed = svc.setCellExport([code[0]], true, target);
+		expect(failed.ok && 'module' in failed).toBe(true);
+
+		// Repointed at a writable path: the record is refreshed by the very persist
+		// that succeeds, so a stale failure can never outlive its cause.
+		svc.setExportTarget('lib/recovered.py', target);
+		const r = svc.setCellExport([code[1]], true, target);
+		expect(r.ok && 'module' in r).toBe(false);
+		expect(readFileSync(join(WS, 'lib/recovered.py'), 'utf8')).toContain('def one():');
+	});
+
+	it('set_export_target reports a failed write too, but not "nothing is marked"', async () => {
+		const { target, code } = await makeNotebook('target-unwritable.ipynb');
+		// Naming a target BEFORE marking anything is the normal first step of the
+		// flow, so that state is not a warning - it restates what the caller just did.
+		expect(svc.setExportTarget('lib/quiet.py', target)).toEqual({ export_target: 'lib/quiet.py' });
+
+		svc.setCellExport([code[0]], true, target);
+		writeFileSync(join(WS, 'blocked3'), 'not a directory\n');
+		const r = svc.setExportTarget('blocked3/mod.py', target);
+		expect('module' in r && r.module).toMatchObject({ regenerated: false });
+	});
+
+	it('refuses a target that escapes the workspace where it is SET', async () => {
+		const { target } = await makeNotebook('target-escape.ipynb');
+		// Stored, it would sit in the metadata generating nothing on every later
+		// save while the call reported it set. Refused, the caller has a value to fix.
+		const r = svc.setExportTarget('../outside.py', target);
+		expect('invalid' in r && r.ok).toBe(false);
+		expect(nbmod.getExportTarget(target)).toBe(null);
+		expect(() => nbmod.setExportTarget('/etc/passwd.py', target)).toThrow(/escapes workspace/);
+		expect(nbmod.getExportTarget(target)).toBe(null);
+	});
+});
+
+
 describe('persistence and the read surface', () => {
 	it('round-trips through metadata.cellar.export on disk', async () => {
 		const { target, code } = await makeNotebook('persist.ipynb');

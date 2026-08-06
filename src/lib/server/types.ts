@@ -131,6 +131,12 @@ export interface NotebookDoc {
 	cells: Cell[];
 	metadata?: NotebookMetadata;
 	jpFormat?: string;
+	/**
+	 * Runtime-only (never serialized): why the last auto-export of the nbdev-style
+	 * `.py` module threw, or null when it wrote / had nothing to write. See
+	 * `notebook.ts`'s `autoExportPy` - best-effort must not mean silent.
+	 */
+	lastExportError?: string | null;
 }
 
 /** Serializable notebook view for the browser (SSR + REST). */

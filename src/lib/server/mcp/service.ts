@@ -31,6 +31,7 @@ import {
 	getExportTarget,
 	effectiveExportTarget,
 	isPyTextNotebook,
+	lastExportError,
 	getActiveNotebookPath,
 	resolveNotebookPath,
 	workspaceRelative,
@@ -51,9 +52,9 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { isSqlCell, isLogicalCellType } from '../../cellLanguage';
+import { isSqlCell } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
-import { isExportCell, exportCellCount } from '../../exportRole';
+import { isExportCell, canExportCell, exportCellCount } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
@@ -1566,6 +1567,15 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * following the export flow holding a target it was told is set, for a module
  * that can never be built.
  *
+ * A path that ESCAPES the workspace is refused (`invalid`) rather than stored:
+ * `setExportTargetDoc` validates through the exporter's own `resolveInWorkspace`,
+ * because `autoExportPy` is best-effort, so such a target would otherwise sit in
+ * the metadata generating nothing on every later save while this call reported it
+ * set. It shares `moduleFailure` with `setCellExport` for the same reason - this
+ * call regenerates too, so a write that THREW must not read as one that landed.
+ * Only that half: "no cell is marked" is the normal state right after naming a
+ * target, so warning about it here would restate the caller's own step.
+ *
  * It reports through the SAME `exportTargetFields` as `setCellExport` and the map,
  * which is what keeps the description's "the same value get_notebook_map's display
  * block reports" literally true. It therefore reports the EFFECTIVE target, not
@@ -1578,8 +1588,15 @@ export function setReportView(enabled: boolean, nb?: string | null) {
 export function setExportTarget(target: string | null | undefined, nb?: string | null) {
 	const nbTarget = nb ?? getActiveNotebookPath();
 	if (isPyTextNotebook(nbTarget)) return { ok: false as const, refused: 'py-notebook' as const };
-	setExportTargetDoc(target ?? null, nbTarget);
-	return exportTargetFields(nbTarget);
+	try {
+		setExportTargetDoc(target ?? null, nbTarget);
+	} catch (err) {
+		// A path that escapes the workspace is refused where it is SET, not stored to
+		// generate nothing on every later save (see `setExportTarget` in notebook.ts).
+		return { ok: false as const, invalid: String((err as Error)?.message ?? err) };
+	}
+	const where = exportTargetFields(nbTarget);
+	return { ...where, ...moduleFailure(nbTarget, where.export_target) };
 }
 
 /**
@@ -1596,8 +1613,9 @@ export function setExportTarget(target: string | null | undefined, nb?: string |
  * and `setCellExports` makes the whole batch ONE document write, which matters
  * doubly here because `persist` regenerates the `.py` on every write.
  *
- * Only a PYTHON code cell can be marked, tested with `isLogicalCellType(_, 'code')`
- * (`isExportCell`'s own rule) and never a bare nbformat `cell_type`: a SQL cell is
+ * Only a PYTHON code cell can be marked, tested with `canExportCell`
+ * (`isExportCell`'s own eligibility half, shared with the doc-layer setter so the
+ * two cannot drift) and never a bare nbformat `cell_type`: a SQL cell is
  * an nbformat `code` cell tagged `cellar.language`, so that test admits one and its
  * raw SQL is then concatenated into a generated module git tracks. That is
  * refused by id (`notCode`) rather than no-op'd, so an agent building a module is
@@ -1625,14 +1643,15 @@ export function setExportTarget(target: string | null | undefined, nb?: string |
  * notebook metadata alone, which reported null over a notebook whose marks really
  * do build a module.
  *
- * The regeneration is reported HONESTLY rather than promised, via `moduleWarning`:
- * `exportNotebookToPy` writes nothing when NO cell is marked, so unmarking the
- * last one leaves the previously generated module - a git-tracked, nbdev-committed
- * file - on disk exactly as it was. Deleting or truncating it here is deliberately
- * NOT done (that behavior is shared with the UI toggle, and removing a committed
- * module is destructive), so the RESULT states it instead. Do not re-add an
- * unconditional regeneration claim to the description: that is the one case where
- * it is false.
+ * The regeneration is reported HONESTLY rather than promised, via `moduleWarning`,
+ * which covers BOTH ways it can fail to happen - nothing marked, and a write that
+ * THREW. `exportNotebookToPy` writes nothing when NO cell is marked, so unmarking
+ * the last one leaves the previously generated module - a git-tracked,
+ * nbdev-committed file - on disk exactly as it was. Deleting or truncating it here
+ * is deliberately NOT done (that behavior is shared with the UI toggle, and
+ * removing a committed module is destructive), so the RESULT states it instead. Do
+ * not re-add an unconditional regeneration claim to the description: those are the
+ * cases where it is false.
  *
  * VISIBILITY follows the READ tools, not `delete_cells`: a cell hidden from the
  * agent reads as NOT FOUND here, exactly as `readCell` treats it. Marking copies
@@ -1657,7 +1676,7 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		const cell = getCell(id, target);
 		if (!cell || isHidden(cell)) return { ok: false as const, missing: ref };
 		// Checked for the WHOLE batch before the first write - see all-or-nothing.
-		if (exported && !isLogicalCellType(cell, 'code')) return { ok: false as const, notCode: ref };
+		if (exported && !canExportCell(cell)) return { ok: false as const, notCode: ref };
 		seen.add(id);
 		full.push(id);
 	}
@@ -1702,28 +1721,60 @@ function exportTargetFields(nb?: string | null) {
 }
 
 /**
+ * The regeneration this call triggered FAILED. `autoExportPy` is best-effort by
+ * design (a bad target must not cost the user their notebook save), so a target
+ * whose parent is a file, an EACCES or an ENOSPC left the module unwritten while
+ * the result claimed nothing at all - and since `module` is CONDITIONAL, its
+ * absence is precisely what says the module was regenerated, with no MCP export
+ * tool through which the agent could ever learn otherwise.
+ *
+ * Read back from the doc (`lastExportError`), i.e. from the attempt the persist
+ * ACTUALLY made, rather than by re-running the export here - that would be a
+ * second export path, and a second chance to disagree with the first.
+ *
+ * Shared by BOTH export write tools, since both regenerate: one field, one place
+ * an agent reads what happened to the module.
+ */
+function moduleFailure(target: string, exportTarget: string | null) {
+	const failure = lastExportError(target);
+	if (!failure) return {};
+	return {
+		module: {
+			regenerated: false as const,
+			reason: `the module could not be written${exportTarget ? ` to ${exportTarget}` : ''}: ${failure}`
+		}
+	};
+}
+
+/**
  * The honesty half of `setCellExport`: report when the call left the generated
- * module UNREGENERATED. `exportNotebookToPy` returns early with `no-cells` when
- * nothing is marked, so it neither rewrites nor removes the file - unmarking the
- * last marked cell leaves the previously exported symbols on disk, and an
- * `import` of that module still resolves them.
+ * module UNREGENERATED, through the one `module` field. Present ONLY then, so an
+ * ordinary call pays no tokens for it - the `undo` field on `clearOutputs` is the
+ * same conditional shape for the same reason.
  *
- * Present ONLY in that case (a target IS resolvable and nothing is marked), so
- * an ordinary call pays no tokens for it - the `undo` field on `clearOutputs` is
- * the same conditional shape for the same reason. Purely a projection of state
- * this function already has in hand: it changes no export behavior, it only stops
- * the result from claiming a regeneration that did not happen.
+ * Two ways it can happen, ordered by urgency: the write THREW (`moduleFailure`),
+ * or NOTHING IS MARKED - `exportNotebookToPy` returns early with `no-cells`, so it
+ * neither rewrites nor removes the file, and unmarking the last marked cell leaves
+ * the previously exported symbols on disk where an `import` still resolves them.
  *
- * The reason may only state what was VERIFIED, which takes the `moduleExists`
- * check: the gate is "a target, and nothing marked", which is ALSO true when
- * nothing was ever marked and no module was ever generated (a target just set, or
- * repointed to a fresh path). Saying the file was "left on disk" there invents a
- * file and invites the agent to delete nothing - the assert-more-than-was-verified
- * defect this field exists to retire, with the sign flipped. Nor may it say the
- * marks were dropped "any more": the gate cannot see a transition, only the
- * resulting state.
+ * That second case is deliberately NOT reported by `setExportTarget`, which shares
+ * only `moduleFailure`: naming a target before marking anything is the normal
+ * first step of the export flow, so "no cell is marked" there states back what the
+ * caller just did rather than a surprise. Here it IS the surprise - this tool's
+ * whole subject is which cells are in the module.
+ *
+ * The reason may only state what was VERIFIED, which is what takes the
+ * `moduleExists` check: the gate is "a target, and nothing marked", which is ALSO
+ * true when nothing was ever marked and no module was ever generated (a target
+ * just set, or repointed to a fresh path). Saying the file was "left on disk"
+ * there invents a file and invites the agent to delete nothing - the
+ * assert-more-than-was-verified defect this field exists to retire, with the sign
+ * flipped. Nor may it say the marks were dropped "any more": the gate cannot see a
+ * transition, only the resulting state.
  */
 function moduleWarning(target: string, exportTarget: string | null) {
+	const failed = moduleFailure(target, exportTarget);
+	if ('module' in failed) return failed;
 	if (!exportTarget || exportCellCount(listCells(target))) return {};
 	return {
 		module: {

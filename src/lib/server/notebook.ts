@@ -28,6 +28,8 @@ import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
+import { canExportCell } from '../exportRole';
+import { resolveInWorkspace } from './fstree';
 import { SQL_LANGUAGE, isLogicalCellType } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
@@ -193,15 +195,35 @@ function persist(doc: NotebookDoc): void {
  * target is configured AND at least one cell is marked for export (see
  * `exportNotebookToPy`), and idempotent (skips the write when the bytes are
  * unchanged). Never lets an export failure break the notebook save: a bad target
- * only surfaces through the explicit "Export to .py" action.
+ * must not cost the user their notebook write.
+ *
+ * Best-effort is NOT the same as silent, though: the failure is RECORDED on the
+ * doc (`lastExportError`, read back by `lastExportError()`) instead of being
+ * swallowed outright. Every export-flow caller reports the module conditionally -
+ * present only when nothing was regenerated - so an absent `module` field reads
+ * as "the module was written", and a thrown write (a target whose parent is a
+ * file, EACCES, ENOSPC) would otherwise be indistinguishable from a success. The
+ * record is refreshed on EVERY persist of this doc, so a later successful write
+ * clears it.
  */
 function autoExportPy(doc: NotebookDoc): void {
 	if (doc.jpFormat) return; // `.py` text notebooks carry no cellar cell metadata
 	try {
 		exportNotebookToPy(doc);
-	} catch {
-		/* auto-export is best-effort; the manual button surfaces real errors */
+		doc.lastExportError = null;
+	} catch (err) {
+		doc.lastExportError = String((err as Error)?.message ?? err);
 	}
+}
+
+/**
+ * Why the last auto-export of this notebook's `.py` module FAILED, or null when
+ * the last attempt wrote (or had nothing to write). The one fact a caller needs
+ * before it may let an absent `module` warning stand for a successful
+ * regeneration - see `autoExportPy`.
+ */
+export function lastExportError(nb?: string | null): string | null {
+	return docFor(nb).lastExportError ?? null;
 }
 
 /**
@@ -689,21 +711,9 @@ export function setCellExport(id: string, exported: boolean, nb?: string | null,
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return false;
-	if (exported && !canExport(cell)) return false;
+	if (exported && !canExportCell(cell)) return false;
 	setCellExports([id], exported, nb, originId);
 	return true;
-}
-
-/**
- * May this cell carry the export flag? `isLogicalCellType(cell, 'code')`, never a
- * bare nbformat `cell_type === 'code'`: a SQL cell is an nbformat `code` cell
- * tagged `cellar.language`, so that test lets one into the generated module as raw
- * SQL. The one rule behind both setters, and the same predicate `isExportCell`
- * (the exporter's own identity) reads, so a cell can never be marked into a state
- * the exporter then ignores.
- */
-function canExport(cell: Cell): boolean {
-	return isLogicalCellType(cell, 'code');
 }
 
 /**
@@ -715,9 +725,10 @@ function canExport(cell: Cell): boolean {
  *
  * Only cells that actually CHANGE are touched, so a re-mark of an
  * already-marked cell writes nothing and emits nothing (zero git diff, no `.py`
- * mtime churn). Marking requires a PYTHON code cell (`canExport`, the logical
- * type - a markdown or SQL cell has no module source, so setting the flag there
- * would be a lie `isExportCell` ignores) while UNMARKING clears the flag wherever
+ * mtime churn). Marking requires a PYTHON code cell (`canExportCell`, the shared
+ * eligibility half of `isExportCell` itself - a markdown or SQL cell has no module
+ * source, so setting the flag there would be a lie the exporter ignores) while
+ * UNMARKING clears the flag wherever
  * it is found, which is also how a stale flag on a hand-edited `.ipynb` is
  * cleared. Returns the ids actually changed.
  *
@@ -743,7 +754,7 @@ export function setCellExports(
 		if (!cell) continue;
 		const marked = cell.metadata?.cellar?.export === true;
 		if (exported) {
-			if (!canExport(cell) || marked) continue;
+			if (!canExportCell(cell) || marked) continue;
 			cell.metadata = cell.metadata ?? {};
 			cell.metadata.cellar = cell.metadata.cellar ?? {};
 			cell.metadata.cellar.export = true;
@@ -798,12 +809,20 @@ export function effectiveExportTarget(nb?: string | null): string | null {
  * allowlisted `cellar` namespace, so it round-trips through clean-on-save.
  * Materializes `doc.metadata` if the notebook had none yet. `persist` regenerates
  * the `.py` module as a side effect (auto-on-save).
+ *
+ * The path is VALIDATED here, through the same `resolveInWorkspace` the exporter
+ * writes with, and a target that escapes the workspace THROWS rather than being
+ * stored: `autoExportPy` is deliberately best-effort (a bad target must not cost
+ * the user their notebook save), so an unwritable target accepted here would sit
+ * in the metadata silently generating nothing on every later save. Refusing it at
+ * the point it is set is the honest moment - the caller has a value to correct.
  */
 export function setExportTarget(target: string | null, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
+	const trimmed = (target ?? '').trim();
+	if (trimmed) resolveInWorkspace(trimmed); // throws when the path escapes the workspace
 	doc.metadata = doc.metadata ?? {};
 	doc.metadata.cellar = doc.metadata.cellar ?? {};
-	const trimmed = (target ?? '').trim();
 	if (trimmed) doc.metadata.cellar.export_target = trimmed;
 	else delete doc.metadata.cellar.export_target;
 	persist(doc);

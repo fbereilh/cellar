@@ -1,5 +1,5 @@
 import { json, error } from '@sveltejs/kit';
-import { setExportTarget, exportPy } from '$lib/server/notebook';
+import { setExportTarget, exportPy, isPyTextNotebook } from '$lib/server/notebook';
 
 /**
  * nbdev-style selective export of a notebook to a `.py` module (distinct from the
@@ -12,11 +12,22 @@ import { setExportTarget, exportPy } from '$lib/server/notebook';
  *   marked cells) reports its `reason` rather than erroring.
  *
  * `path` is the workspace-relative notebook (defaults to the active one).
+ *
+ * A `.py` TEXT notebook is refused through the SAME `isPyTextNotebook` predicate
+ * MCP's `set_export_target` uses — never a second check — because the reason is
+ * the same on both surfaces: such a document is written through jupytext, which
+ * stores no cellar metadata, so a target accepted here would survive neither a
+ * reload nor a regeneration and the user would be shown a setting that does
+ * nothing. (`op:'export'` is already refused inside `exportPy`.)
  */
 export async function POST({ request }) {
 	const body = await request.json().catch(() => ({}));
 	try {
 		if (body.op === 'set-target') {
+			if (isPyTextNotebook(body.path))
+				throw new Error(
+					'cannot set an export target on a .py text notebook: it stores no cell metadata and generates no module - convert it to .ipynb first'
+				);
 			setExportTarget(body.target ?? null, body.path, body.originId);
 			return json({ ok: true, target: (body.target ?? '').trim() || null });
 		}

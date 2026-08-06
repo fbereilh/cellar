@@ -20,9 +20,9 @@ import { isLogicalCellType } from '$lib/cellLanguage';
 type ExportCell = { cell_type?: string; metadata?: CellMetadata | null } | null | undefined;
 
 /**
- * Is this cell marked for export to the `.py` module? Only a Python code cell can
- * be — a markdown/SQL cell has no module source, and `setCellType` drops the flag
- * when a cell is converted away from plain code.
+ * MAY this cell carry the export flag? Only a Python code cell — a markdown/SQL
+ * cell has no module source, and `setCellType` drops the flag when a cell is
+ * converted away from plain code.
  *
  * The test is `isLogicalCellType(cell, 'code')`, never a bare nbformat
  * `cell_type === 'code'`: a SQL cell IS an nbformat `code` cell tagged
@@ -30,14 +30,30 @@ type ExportCell = { cell_type?: string; metadata?: CellMetadata | null } | null 
  * its raw SQL would then be concatenated into the generated module, a file nbdev
  * commits to git. It is deliberately the STRICT predicate rather than
  * `logicalCellType(cell) === 'code'`, which maps an nbformat `raw` cell (passed
- * through untouched from an externally-authored notebook) to `code` too. Being the
- * one identity every surface reads (`export-py.ts` builds the module from it,
- * `Cell.svelte` draws the badge from it, the agent map reports it), fixing the
- * rule here is what keeps a stale or hand-edited flag on such a cell inert
- * everywhere rather than only at whichever setter last remembered to check.
+ * through untouched from an externally-authored notebook) to `code` too.
+ *
+ * This is the ELIGIBILITY rule, exported so the two SETTERS (`notebook.ts`'s
+ * `setCellExports`, MCP's `setCellExport`) test it through the same function
+ * `isExportCell` is built from, rather than each re-deriving it from
+ * `isLogicalCellType` and agreeing only by coincidence. A cell can then never be
+ * marked into a state the exporter ignores.
+ */
+export function canExportCell(cell: ExportCell): boolean {
+	return isLogicalCellType(cell, 'code');
+}
+
+/**
+ * Is this cell marked for export to the `.py` module? Eligible (`canExportCell`)
+ * AND flagged.
+ *
+ * Being the one identity every surface reads (`export-py.ts` builds the module
+ * from it, `Cell.svelte` draws the badge from it, the agent map reports it),
+ * keeping the eligibility half here is what makes a stale or hand-edited flag on
+ * a markdown/SQL/raw cell inert everywhere rather than only at whichever setter
+ * last remembered to check.
  */
 export function isExportCell(cell: ExportCell): boolean {
-	return isLogicalCellType(cell, 'code') && cell?.metadata?.cellar?.export === true;
+	return canExportCell(cell) && cell?.metadata?.cellar?.export === true;
 }
 
 /** Count of cells currently marked for export. */

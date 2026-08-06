@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { topLevelNames, generateModule, resolveTarget } from '../../src/lib/server/export-py';
 import type { NotebookDoc } from '../../src/lib/server/types';
 
@@ -63,5 +63,26 @@ describe('resolveTarget', () => {
 
 	it('returns null when neither is present', () => {
 		expect(resolveTarget(doc({}))).toBeNull();
+	});
+
+	it('refuses cheaply, running no regex over a notebook that mentions no directive', () => {
+		// This is the ONE resolution rule the exporter and `get_notebook_map` share,
+		// and the map short-circuits only when a notebook-level target IS set - so the
+		// COMMON case (no export configured at all) resolves on every call of the most
+		// frequently used agent read tool. It must cost a substring test, not a
+		// multiline regex over every code cell's full source.
+		const source = 'x = 1\ndf = load()\n'.repeat(200);
+		const cells = Array.from({ length: 40 }, (_, i) => ({ id: `c${i}`, cell_type: 'code' as const, source }));
+		const spy = vi.spyOn(String.prototype, 'match');
+		try {
+			expect(resolveTarget(doc({ cells }))).toBeNull();
+			expect(spy).not.toHaveBeenCalled();
+		} finally {
+			spy.mockRestore();
+		}
+
+		// ...and the guard never costs a real directive its match.
+		const withDirective = doc({ cells: [{ id: 'a', cell_type: 'code', source: `${source}#|default_exp lib.cheap` }] });
+		expect(resolveTarget(withDirective)).toBe('lib/cheap.py');
 	});
 });

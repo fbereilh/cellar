@@ -192,6 +192,27 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 		expect(nbmod.getExportTarget(target)).toBe(null);
 		expect(py.writes).toEqual([]);
 	});
+
+	it('the UI route refuses it through the SAME predicate, with an actionable 400', async () => {
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const target = nbmod.resolveNotebookPath('text-target-route.py');
+		writeFileSync(target, '# %%\na = 0\n');
+		py.writes.length = 0;
+
+		// The human's own target input reaches this route, not MCP - so without the
+		// same refusal the UI showed a target that survives neither a reload nor a
+		// regeneration, the very gap the agent-side check closed.
+		const call = () =>
+			(POST as unknown as (e: { request: Request }) => Promise<Response>)({
+				request: new Request('http://x/api/notebooks/export-py', {
+					method: 'POST',
+					body: JSON.stringify({ op: 'set-target', target: 'lib/text.py', path: 'text-target-route.py' })
+				})
+			});
+		await expect(call()).rejects.toMatchObject({ status: 400 });
+		expect(nbmod.getExportTarget(target)).toBe(null);
+		expect(py.writes).toEqual([]);
+	});
 });
 
 describe('SSE', () => {
