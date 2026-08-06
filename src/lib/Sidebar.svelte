@@ -1055,6 +1055,7 @@
 		<div class:hidden={!open.databricks}>
 			<Databricks
 				bind:this={databricksComp}
+				visible={open.databricks}
 				notebookPath={activeNotebookPath}
 				kernelSessionId={kernelInfo?.session_id ?? null}
 				{onInsertAndRun}

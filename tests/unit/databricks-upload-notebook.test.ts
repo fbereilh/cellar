@@ -428,6 +428,107 @@ describe('uploadNotebook — the server op', () => {
 		await expect(dbx.uploadNotebook({ nb: NB })).rejects.toMatchObject({ code: 'permission_denied' });
 	});
 
+	it('wraps the name in the caller\'s prefix/postfix - around the STEM, not the extension', async () => {
+		await freshConnect();
+		useStub(writeRecordingStub('stub-affixed', { ok: true, status: 'uploaded', path: `/Users/${USER}/2026-08-05_analysis_v2`, host: HOST }));
+
+		await dbx.uploadNotebook({ nb: NB, prefix: '2026-08-05_', postfix: '_v2' });
+
+		// `analysis.ipynb` + `_v2` is `analysis_v2`, never `analysis.ipynb_v2`: the
+		// extension is dropped before anything is affixed.
+		expect(lastRequest().name).toBe('2026-08-05_analysis_v2');
+	});
+
+	it('expands date tokens server-side too, so a caller that posts them raw still gets them', async () => {
+		await freshConnect();
+		useStub(writeRecordingStub('stub-tokens', { ok: true, status: 'uploaded', path: `/Users/${USER}/x`, host: HOST }));
+
+		await dbx.uploadNotebook({ nb: NB, prefix: '{YYYYMMDD}_' });
+
+		const now = new Date();
+		const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+		expect(lastRequest().name).toBe(`${stamp}_analysis`);
+	});
+
+	it('an ALREADY-expanded affix is unchanged by that second pass — which is what makes the preview exact', async () => {
+		// The sidebar expands at click time and sends literal text; if the server's own
+		// expansion could move it, the workspace would get a name the preview never
+		// showed (across midnight, a different date entirely).
+		await freshConnect();
+		useStub(writeRecordingStub('stub-expanded', { ok: true, status: 'uploaded', path: `/Users/${USER}/x`, host: HOST }));
+
+		await dbx.uploadNotebook({ nb: NB, prefix: '2026-08-05_', postfix: '_20260805' });
+
+		expect(lastRequest().name).toBe('2026-08-05_analysis_20260805');
+	});
+
+	it('no affixes is byte-for-byte the name it always uploaded under', async () => {
+		await freshConnect();
+		useStub(writeRecordingStub('stub-none', { ok: true, status: 'uploaded', path: `/Users/${USER}/analysis`, host: HOST }));
+
+		await dbx.uploadNotebook({ nb: NB, prefix: '', postfix: '' });
+		expect(lastRequest().name).toBe('analysis');
+		await dbx.uploadNotebook({ nb: NB });
+		expect(lastRequest().name).toBe('analysis');
+	});
+
+	it('a present NON-STRING affix is refused - never quietly treated as no affix', async () => {
+		// The sidebar always sends strings; a direct API caller might send a number
+		// (`prefix: 20260805`), and it has NO preview to notice a repair with - so a 200
+		// reporting success over a name nobody asked for is the worst outcome available.
+		// Refuse-don't-repair, the same rule that governs a separator.
+		await freshConnect();
+		useStub(writeRecordingStub('stub-unused-type', { ok: true, status: 'uploaded', path: '/Users/x/y', host: HOST }));
+
+		for (const bad of [20260805, true, ['a'], { a: 1 }] as unknown[]) {
+			await expect(
+				dbx.uploadNotebook({ nb: NB, prefix: bad as string })
+			).rejects.toMatchObject({ code: 'bad_request' });
+			await expect(
+				dbx.uploadNotebook({ nb: NB, postfix: bad as string })
+			).rejects.toMatchObject({ code: 'bad_request' });
+		}
+		// It names the field and the type, and never echoes the posted value back.
+		await expect(dbx.uploadNotebook({ nb: NB, prefix: 20260805 as unknown as string })).rejects.toThrow(
+			/invalid prefix: expected a string, got a number/
+		);
+		// The gate is before the subprocess: the workspace was never asked anything.
+		expect(existsSync(reqFile)).toBe(false);
+	});
+
+	it('an ABSENT or NULL affix is still the plain, unaffixed name', async () => {
+		// The other half of that rule: omitting an affix is the no-affix path and has to
+		// stay byte-for-byte the upload that existed before affixes did.
+		await freshConnect();
+		useStub(writeRecordingStub('stub-null-affix', { ok: true, status: 'uploaded', path: `/Users/${USER}/analysis`, host: HOST }));
+
+		await dbx.uploadNotebook({ nb: NB, prefix: null, postfix: null });
+		expect(lastRequest().name).toBe('analysis');
+		await dbx.uploadNotebook({ nb: NB, prefix: undefined, postfix: undefined });
+		expect(lastRequest().name).toBe('analysis');
+	});
+
+	it('an affix that could leave /Users/<you>/ is REFUSED - nothing is spawned, nothing repaired', async () => {
+		await freshConnect();
+		useStub(writeRecordingStub('stub-unused-affix', { ok: true, status: 'uploaded', path: '/Users/x/y', host: HOST }));
+
+		// A `/` would make the segment a path: `../../Shared/analysis` lands the
+		// notebook in someone else's tree. Refused rather than sanitized - a quietly
+		// repaired name is one the sidebar's preview promised and the workspace
+		// never received.
+		await expect(dbx.uploadNotebook({ nb: NB, prefix: '../../Shared/' })).rejects.toMatchObject({
+			code: 'bad_request'
+		});
+		await expect(dbx.uploadNotebook({ nb: NB, postfix: '/evil' })).rejects.toMatchObject({
+			code: 'bad_request'
+		});
+		await expect(dbx.uploadNotebook({ nb: NB, prefix: 'a\u0000b' })).rejects.toMatchObject({
+			code: 'bad_request'
+		});
+		// The gate is before the subprocess: the workspace was never asked anything.
+		expect(existsSync(reqFile)).toBe(false);
+	});
+
 	it('a name Databricks cannot give a workspace notebook is refused before any upload', async () => {
 		// A `/` in the segment would silently land the notebook somewhere else in the
 		// workspace tree, so the name is validated rather than escaped.
