@@ -27,6 +27,7 @@
 		reauthDetail,
 		reauthExplanation
 	} from '$lib/databricksReauth';
+	import { UPLOAD_DATE_TOKENS, resolveUploadName } from '$lib/databricksUploadName';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -244,6 +245,11 @@
 		runtimeOn = getUi<unknown>(DBX_RUNTIME_KEY, false) === true;
 		runtimeVersion = getUi<string>(DBX_RUNTIME_VERSION_KEY, DBX_RUNTIME_VERSION_DEFAULT);
 		appliedVersion = runtimeVersion;
+		// The upload affixes: someone who uploads regularly should not have to retype a
+		// naming pattern every session. The store is untyped JSON, so anything that is
+		// not a string reads as "no affix" rather than being interpolated into a name.
+		uploadPrefix = storedAffix(DBX_UPLOAD_PREFIX_KEY);
+		uploadPostfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY);
 	});
 
 	/**
@@ -958,6 +964,46 @@
 	 */
 	let uploadExistsPath = $state('');
 
+	// ---- The uploaded name: an optional prefix + postfix around the notebook's own
+	// The rule (assembly, date tokens, the separator refusal) is NOT here - it is
+	// `$lib/databricksUploadName`, shared with the server, so the name previewed
+	// below and the name the workspace receives cannot drift apart.
+	const DBX_UPLOAD_PREFIX_KEY = 'cellar-databricks-upload-prefix';
+	const DBX_UPLOAD_POSTFIX_KEY = 'cellar-databricks-upload-postfix';
+	let uploadPrefix = $state('');
+	let uploadPostfix = $state('');
+	/** A persisted affix, or '' - the store is untyped JSON and this ends up in a name. */
+	function storedAffix(key: string): string {
+		const v = getUi<unknown>(key, '');
+		return typeof v === 'string' ? v : '';
+	}
+	/**
+	 * The affixes the ARMED replace confirm was resolved with, pinned at the moment
+	 * it armed. Replace re-sends these rather than re-resolving, for the same reason
+	 * `uploadSeq` exists: the box names one workspace path, and a `{YYYY-MM-DD}`
+	 * prefix crossing midnight (or an edit to the fields) between the two clicks
+	 * would otherwise overwrite a different one than the user confirmed.
+	 */
+	let uploadExistsAffixes: { prefix: string; postfix: string } | null = null;
+
+	/** The open notebook's file name - what the workspace name is built from. */
+	const uploadFileName = $derived(notebookPath ? (notebookPath.split(/[\\/]/).pop() ?? '') : '');
+	/**
+	 * The name this upload would land under, resolved live as the user types. The
+	 * placeholder stands in only when no notebook is named (nothing to preview, but
+	 * an unusable affix is still worth refusing); `uploadPreview` is what decides
+	 * whether a name is actually shown.
+	 */
+	const uploadResolved = $derived(
+		resolveUploadName(uploadFileName || 'notebook', { prefix: uploadPrefix, postfix: uploadPostfix })
+	);
+	/** The final name to show before the click, or '' when the notebook is unnamed. */
+	const uploadPreview = $derived(uploadFileName ? uploadResolved.name : '');
+	/** Why the affixes cannot be used, or ''. Blocks the button rather than repairing them. */
+	const uploadNameError = $derived(uploadResolved.error ?? '');
+	/** The token vocabulary, for the fields' tooltip - built from the module's own list. */
+	const uploadTokenHelp = `Date tokens: ${UPLOAD_DATE_TOKENS.map((t) => `${t.token} → ${t.example}`).join(', ')}. Anything else in braces stays literal.`;
+
 	/**
 	 * The generation guard for an upload, the same shape as `statusSeq` above and
 	 * for the same reason: a reply that is no longer the newest word on its subject
@@ -990,6 +1036,23 @@
 		uploadError = null;
 		uploadDone = null;
 		uploadExistsPath = '';
+		uploadExistsAffixes = null;
+	}
+
+	/**
+	 * Reflect + persist an affix as it is typed, and drop the previous attempt's
+	 * feedback: both the "uploaded to" note and the armed replace confirm name a
+	 * workspace path built from the OLD affixes, so leaving them up would show a
+	 * path this panel would no longer upload to. Persisted per project (the same
+	 * `.cellar/` store as every other preference here, never `localStorage`) so a
+	 * regular pattern survives a relaunch on a new port.
+	 */
+	function onUploadAffixInput(which: 'prefix' | 'postfix', e: Event) {
+		const v = (e.currentTarget as HTMLInputElement).value;
+		if (which === 'prefix') uploadPrefix = v;
+		else uploadPostfix = v;
+		setUi(which === 'prefix' ? DBX_UPLOAD_PREFIX_KEY : DBX_UPLOAD_POSTFIX_KEY, v === '' ? null : v);
+		clearUploadFeedback();
 	}
 
 	/**
@@ -999,9 +1062,29 @@
 	 * `overwrite` is never implicit: the first click asks for it without it, and a
 	 * notebook already at that path comes back as `exists` (nothing written) so the
 	 * user gets a Replace confirm rather than a silent clobber.
+	 *
+	 * Date tokens are expanded HERE, once, and the resulting literal text is what is
+	 * sent - so the name the workspace receives is exactly the one the preview showed
+	 * (the server's own expansion finds nothing left to expand). `pinned` is how a
+	 * Replace re-uses the affixes its confirm was armed with instead of re-resolving
+	 * them: the box names a path, and that must be the path that gets overwritten.
 	 */
-	async function uploadToWorkspace(overwrite = false) {
+	async function uploadToWorkspace(overwrite = false, pinned?: { prefix: string; postfix: string }) {
 		if (busy) return;
+		let affixes = pinned;
+		if (!affixes) {
+			const resolved = resolveUploadName(uploadFileName || 'notebook', {
+				prefix: uploadPrefix,
+				postfix: uploadPostfix
+			});
+			if (resolved.error) {
+				// Refused, not repaired: a silently sanitized affix would upload under a
+				// name the preview never showed. Nothing is sent.
+				uploadError = { code: 'bad_request', message: resolved.error };
+				return;
+			}
+			affixes = { prefix: resolved.prefix, postfix: resolved.postfix };
+		}
 		busy = 'upload';
 		const seq = ++uploadSeq;
 		const target = notebookPath;
@@ -1015,7 +1098,7 @@
 			const res = await fetch('/api/databricks/upload', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ path: target ?? undefined, overwrite })
+				body: JSON.stringify({ path: target ?? undefined, overwrite, ...affixes })
 			});
 			const body = await res.json();
 			// Superseded - the panel moved to another notebook, or the user cancelled.
@@ -1026,9 +1109,13 @@
 			const out = body as { status?: string; path?: string; url?: string | null; overwritten?: boolean };
 			if (out.status === 'exists') {
 				uploadExistsPath = out.path ?? '';
+				// Pin what produced that path, so Replace overwrites THIS one - not a name
+				// a later keystroke (or a date token crossing midnight) would resolve to.
+				uploadExistsAffixes = affixes;
 				return;
 			}
 			uploadExistsPath = '';
+			uploadExistsAffixes = null;
 			uploadDone = {
 				headline: out.overwritten
 					? 'Replaced in your Databricks workspace:'
@@ -1041,6 +1128,7 @@
 			// A failed replace must not strand the user inside a confirm box whose
 			// Replace button just failed: drop back to the plain button, with the error.
 			uploadExistsPath = '';
+			uploadExistsAffixes = null;
 			uploadError = toDbxError(err);
 		} finally {
 			busy = '';
@@ -1624,6 +1712,48 @@
   `exists`, which arms this confirm.
 -->
 {#snippet uploadRow()}
+	<!-- Optional affixes around the notebook's own name, with the resolved name shown
+	     BEFORE the click: the preview and the upload resolve through the one shared
+	     `resolveUploadName`, so what is read here is what lands in the workspace.
+	     Both empty is the original behaviour - `/Users/<you>/<notebook>`. -->
+	<div class="mt-1.5 grid grid-cols-2 gap-1">
+		<label class="flex flex-col gap-0.5">
+			<span class="text-[10px] text-base-content/50">Prefix</span>
+			<input
+				class="input input-xs w-full font-mono text-[10px]"
+				value={uploadPrefix}
+				oninput={(e) => onUploadAffixInput('prefix', e)}
+				disabled={uploadConfirmBusy}
+				placeholder="{'{YYYY-MM-DD}'}_"
+				title={uploadTokenHelp}
+				data-testid="databricks-upload-prefix"
+			/>
+		</label>
+		<label class="flex flex-col gap-0.5">
+			<span class="text-[10px] text-base-content/50">Postfix</span>
+			<input
+				class="input input-xs w-full font-mono text-[10px]"
+				value={uploadPostfix}
+				oninput={(e) => onUploadAffixInput('postfix', e)}
+				disabled={uploadConfirmBusy}
+				placeholder="_{'{YYYYMMDD}'}"
+				title={uploadTokenHelp}
+				data-testid="databricks-upload-postfix"
+			/>
+		</label>
+	</div>
+	{#if uploadNameError}
+		<p class="mt-1 text-[11px] leading-relaxed text-error" data-testid="databricks-upload-name-error">
+			{uploadNameError}
+		</p>
+	{:else if uploadPreview}
+		<p class="mt-1 text-[10px] leading-snug text-base-content/50">
+			Uploads as
+			<span class="font-mono text-base-content/70 [overflow-wrap:anywhere]" data-testid="databricks-upload-preview"
+				>{uploadPreview}</span
+			>
+		</p>
+	{/if}
 	<div class="mt-1.5">
 		{#if uploadExistsPath}
 			<div class="rounded border border-warning/40 bg-warning/10 px-2 py-1.5" data-testid="databricks-upload-confirm-box">
@@ -1643,7 +1773,7 @@
 					</button>
 					<button
 						class="btn btn-warning btn-xs h-5 min-h-0 px-1.5 text-[11px]"
-						onclick={() => uploadToWorkspace(true)}
+						onclick={() => uploadToWorkspace(true, uploadExistsAffixes ?? undefined)}
 						disabled={uploadConfirmBusy}
 						data-testid="databricks-upload-replace"
 					>
@@ -1655,7 +1785,7 @@
 			<button
 				class="btn btn-outline btn-xs w-full"
 				onclick={() => uploadToWorkspace(false)}
-				disabled={!connected || uploadConfirmBusy}
+				disabled={!connected || uploadConfirmBusy || !!uploadNameError}
 				title="Copy this notebook into /Users/<you>/ in the connected Databricks workspace"
 				data-testid="databricks-upload"
 			>

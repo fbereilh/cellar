@@ -114,6 +114,7 @@ import {
 } from './dbrVersion';
 import { normalizeDatabricksHost } from '../databricksHost';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
+import { resolveUploadName, type UploadNameAffixes } from '../databricksUploadName';
 import { notebookIpynb, resolveNotebookPath } from './notebook';
 import { databricksRuntimeForced, databricksRuntimeVersionForced } from './ui-state';
 import { publishGlobal } from './events';
@@ -3599,23 +3600,24 @@ export async function previewTable({
 
 /**
  * The name a notebook takes in the Databricks workspace: its own basename with
- * the extension dropped.
+ * the extension dropped, wrapped in the caller's optional prefix/postfix.
  *
- * Databricks names a workspace notebook by its path segment, so keeping the
- * suffix would produce a notebook literally called `analysis.ipynb` sitting
- * beside every other one that is not. Validated rather than escaped: a workspace
- * path is `/`-delimited, so a segment carrying a separator (or a control
- * character) would silently land the upload somewhere else.
+ * The rule itself lives in `$lib/databricksUploadName`, because the SIDEBAR
+ * resolves the very same name to preview it before the click - a second copy
+ * here would let the preview promise one name while the upload landed another.
+ * That module also owns the refusal: a workspace path is `/`-delimited, so an
+ * affix carrying a separator (or a control character) would silently redirect
+ * the upload out of the user's own folder, and is refused rather than repaired.
+ *
+ * Date tokens are expanded HERE too, not only in the browser. Expansion is
+ * idempotent, so a client that already expanded them (which is what makes its
+ * preview exact, even across midnight) is unaffected, while a caller that posts
+ * the tokens raw still gets them.
  */
-function workspaceNotebookName(fileName: string): string {
-	const name = fileName.replace(/\.(ipynb|py)$/i, '').trim();
-	if (!name || name === '.' || name === '..' || /[\u0000-\u001f/\\]/.test(name)) {
-		throw new DatabricksError(
-			'bad_request',
-			`"${fileName}" is not a name Databricks can give a workspace notebook. Rename the file, then upload again.`
-		);
-	}
-	return name;
+function workspaceNotebookName(fileName: string, affixes: UploadNameAffixes): string {
+	const resolved = resolveUploadName(fileName, affixes);
+	if (resolved.error) throw new DatabricksError('bad_request', resolved.error);
+	return resolved.name;
 }
 
 /** A byte count as the refusal message should read it. */
@@ -3659,6 +3661,13 @@ export interface UploadResult {
  * Import the open notebook into the connected user's own workspace folder
  * (`/Users/<user>/<name>`) as a real Databricks notebook.
  *
+ * `name` is the notebook's basename with its extension dropped, optionally
+ * wrapped in `prefix`/`postfix` (which may carry the `{YYYY-MM-DD}`-style date
+ * tokens `$lib/databricksUploadName` documents). With neither, the name - and so
+ * the whole upload - is exactly what it was before affixes existed. An affix that
+ * could redirect the upload out of the user's own folder is REFUSED there, so the
+ * target always resolves under `/Users/<user>/`.
+ *
  * Runs entirely through the EXISTING authenticated path - the notebook's live
  * connection selection (`requireConnectedSel`) → `resolveAuth` → the same
  * `WorkspaceClient` every listing builds - so there is no second auth mechanism,
@@ -3682,14 +3691,16 @@ export interface UploadResult {
  */
 export async function uploadNotebook({
 	nb,
-	overwrite = false
-}: { nb?: string | null; overwrite?: boolean } = {}): Promise<UploadResult> {
+	overwrite = false,
+	prefix,
+	postfix
+}: { nb?: string | null; overwrite?: boolean } & UploadNameAffixes = {}): Promise<UploadResult> {
 	const abs = resolveNotebookPath(nb);
 	// Gated exactly like every other connected op: not connected is an actionable
 	// `not_connected`, and a gated OAuth selection still has to have signed in.
 	const auth = authForListing(requireConnectedSel(abs));
 	const { name, json } = notebookIpynb(abs);
-	const target = workspaceNotebookName(name);
+	const target = workspaceNotebookName(name, { prefix, postfix });
 	assertUploadableSize(json, name);
 	const result = payload<{ status?: string; path?: string; host?: string; overwritten?: boolean }>(
 		unwrap(
