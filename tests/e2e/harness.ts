@@ -23,8 +23,19 @@ export function runtimeAvailable(): boolean {
 	return has('uv') && has('python3') && existsSync(hostVenv);
 }
 
-/** Spawn the launcher and resolve the app URL it prints once fully up. */
-export function bootCellar(ws: string): Promise<{ proc: ChildProcess; url: string }> {
+/**
+ * Spawn the launcher and resolve the app URL it prints once fully up.
+ *
+ * `env` adds to the launcher's environment. It exists for state that is GLOBAL to
+ * the machine rather than scoped to the throwaway workspace - `CELLAR_USER_SETTINGS`
+ * being the case it was added for: that store defaults to a real file in the home
+ * directory, so a spec touching it without redirecting it first would be rewriting
+ * the settings of whoever ran the suite.
+ */
+export function bootCellar(
+	ws: string,
+	env: Record<string, string> = {}
+): Promise<{ proc: ChildProcess; url: string }> {
 	// A no-op `open`/`xdg-open` on PATH so the launcher's "open the browser" step
 	// is suppressed — Playwright drives its own browser against the URL.
 	const shim = join(ws, '.shim');
@@ -40,7 +51,7 @@ export function bootCellar(ws: string): Promise<{ proc: ChildProcess; url: strin
 		[join(REPO, 'bin', 'cellar.js'), '-w', ws, '--new', '--no-mcp-config', '-y'],
 		{
 			cwd: REPO,
-			env: { ...process.env, PATH: `${shim}:${process.env.PATH}`, CI: '1' },
+			env: { ...process.env, PATH: `${shim}:${process.env.PATH}`, CI: '1', ...env },
 			stdio: ['ignore', 'pipe', 'pipe'],
 			detached: true
 		}

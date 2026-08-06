@@ -19,14 +19,26 @@
  * nonsense `analysis.ipynb_20260805`; there is no "postfix before the extension"
  * decision left to get wrong, because by then there is no extension.
  *
- * **Date tokens** (`{YYYY-MM-DD}`, `{YYYYMMDD}`, `{YYYY}`, `{MM}`, `{DD}`) expand
- * against the LOCAL date - the user is naming a notebook after the day they are
- * working, not after UTC. They are deliberately CASE-SENSITIVE and the set is
- * deliberately small: no time-of-day tokens, so `{mm}` (minutes by every other
- * convention) can never silently mean the month. Anything else in braces is left
- * LITERAL - `{FOO}` uploads as `{FOO}` - because a typo in a name is visible in
- * the preview and fixable, while silently dropping it would produce a name the
- * user never asked for and cannot see the cause of.
+ * **Date tokens** (`{YYYY-MM-DD}`, `{YYYYMMDD}`, `{YYYY-MM}`, `{YYYYMM}`, `{YYYY}`,
+ * `{MM}`, `{DD}`) expand against the LOCAL date - the user is naming a notebook after the
+ * day they are working, not after UTC. They are deliberately CASE-SENSITIVE and the
+ * set is deliberately small: no time-of-day tokens, so `{mm}` (minutes by every
+ * other convention) can never silently mean the month. Anything else in braces is
+ * left LITERAL - `{FOO}` uploads as `{FOO}` - because silently dropping it would
+ * produce a name the user never asked for and cannot see the cause of.
+ *
+ * **Leaving it literal is not enough on its own, and that is a lesson paid for.** A
+ * user who has seen `{YYYYMMDD}` work writes `{YYYYMM}` for a year-month stamp, and
+ * `{YYYYMM}_analysis` in the preview reads as a token that has not expanded YET
+ * rather than one that never will - so a spelling that was never supported was
+ * reported, twice, as an expander that was broken. Two things answer that and both
+ * must stay: `unknownDateTokens` below, which lets the UI NAME an unrecognized run,
+ * and the UI's token buttons, which insert the braced form so the vocabulary never
+ * has to be guessed. The month stamps `{YYYYMM}`/`{YYYY-MM}` were added for the same
+ * reason: both are unambiguous (contractions of the day stamps, on the identical
+ * convention) and are what people actually reach for. That is not licence to admit a
+ * spelling whose meaning could be read two ways - `{mm}` is still refused for
+ * precisely that reason.
  *
  * **Expansion is idempotent**, which is what makes the CLIENT/SERVER hop exact:
  * the browser expands at click time and sends literal text, so the server's own
@@ -71,10 +83,89 @@ const FORBIDDEN = /[\u0000-\u001f\u007f/\\]/;
 export const UPLOAD_DATE_TOKENS: readonly string[] = [
 	'{YYYY-MM-DD}',
 	'{YYYYMMDD}',
+	'{YYYY-MM}',
+	'{YYYYMM}',
 	'{YYYY}',
 	'{MM}',
 	'{DD}'
 ];
+
+/**
+ * The braced runs in `text` that are NOT date tokens, in order, deduped.
+ *
+ * A run this returns will upload EXACTLY as written. That is the documented rule
+ * (an unknown brace is left literal rather than dropped), and it is deliberately
+ * not being changed here - `{FOO}` can be a name someone means. What was missing is
+ * that it failed SILENTLY: the vocabulary is small and case-sensitive, so a user who
+ * knows `{YYYYMMDD}` and `{YYYY}` work reasonably writes `{YYYYMM}` for a
+ * year-month stamp, and the preview then reads `{YYYYMM}_analysis`, which looks far
+ * more like "not expanded YET" than like "never will be". The reported bug was
+ * exactly that: a token that never existed, read as an expander that was broken.
+ *
+ * So this is what lets the UI SAY so. It is a warning and not a refusal, because
+ * the upload really is legal and the literal really may be intended.
+ *
+ * Membership is decided by ASKING the expander (a run it changes is one it knows),
+ * never by a second copy of the token list - a hand-kept list here would eventually
+ * warn about a token that works, or stay silent about one that does not. Safe
+ * because no expansion can contain a brace, so a known token never looks unchanged.
+ */
+export function unknownDateTokens(text: string, now: Date = new Date()): string[] {
+	const seen = new Set<string>();
+	for (const run of text.match(BRACED) ?? []) {
+		if (expandDateTokens(run, now) === run) seen.add(run);
+	}
+	return [...seen];
+}
+
+/** An affix with a token inserted, and where the caret belongs afterwards. */
+export interface TokenInsertion {
+	value: string;
+	/** Just past what was inserted, so the next keystroke continues after it. */
+	caret: number;
+}
+
+/**
+ * Insert `token` into an affix field's `value` at `[selectionStart, selectionEnd)`,
+ * replacing whatever that range covers.
+ *
+ * The braces are REQUIRED by the expander and deliberately stay so - bare `MM`/`DD`
+ * collide with ordinary words, so `march` cannot be allowed to become `03arch`. That
+ * makes the syntax something a user has to be TOLD rather than guess, which is what
+ * the token chips exist for, and this is the rule behind them: whatever the field
+ * already holds, the text a chip adds is the exact braced form `expandDateTokens`
+ * recognises, so a chip can never insert something that then fails to expand.
+ *
+ * A null/absent caret means the field is not being edited (nothing focused it yet),
+ * and the token APPENDS - the affix is read left to right, so appending is what
+ * "add this on" means when there is no position to speak of. Offsets are clamped
+ * and ordered rather than trusted: they come from the DOM, and an out-of-range one
+ * would otherwise silently drop text the user typed.
+ *
+ * Pure and caret-only: it does not expand, so the field keeps showing `{YYYYMMDD}`
+ * (the reusable pattern the user is building and that persists between sessions),
+ * while the preview beside it shows what that resolves to today.
+ */
+export function insertUploadToken(
+	value: string,
+	token: string,
+	selectionStart?: number | null,
+	selectionEnd?: number | null
+): TokenInsertion {
+	const clamp = (n: number) => Math.max(0, Math.min(value.length, Math.trunc(n)));
+	const hasCaret = typeof selectionStart === 'number' && Number.isFinite(selectionStart);
+	const a = hasCaret ? clamp(selectionStart as number) : value.length;
+	const b =
+		typeof selectionEnd === 'number' && Number.isFinite(selectionEnd) && hasCaret
+			? clamp(selectionEnd)
+			: a;
+	const start = Math.min(a, b);
+	const end = Math.max(a, b);
+	return {
+		value: `${value.slice(0, start)}${token}${value.slice(end)}`,
+		caret: start + token.length
+	};
+}
 
 /** Two digits, zero-padded - `{MM}` of March is `03`, never `3`. */
 function pad2(n: number): string {
@@ -93,6 +184,12 @@ export function expandDateTokens(text: string, now: Date = new Date()): string {
 	const values: Record<string, string> = {
 		'{YYYY-MM-DD}': `${yyyy}-${mm}-${dd}`,
 		'{YYYYMMDD}': `${yyyy}${mm}${dd}`,
+		// A month stamp in both spellings, matching the two day stamps above it. There is
+		// no longest-match hazard to weigh: `BRACED` captures a whole `{…}` group and each
+		// group is ONE independent lookup, so `{YYYYMM}` can never be read as a `{YYYY}`
+		// followed by a stray `MM}` the way a sequential token-by-token replace would.
+		'{YYYY-MM}': `${yyyy}-${mm}`,
+		'{YYYYMM}': `${yyyy}${mm}`,
 		'{YYYY}': yyyy,
 		'{MM}': mm,
 		'{DD}': dd

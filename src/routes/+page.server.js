@@ -2,6 +2,7 @@ import { getDefaultNotebook } from '$lib/server/notebook';
 import { workspaceRoot } from '$lib/server/fstree';
 import { harnessState, isHarnessAllowed, mcpJsonHarnessNames } from '$lib/server/harness.js';
 import { getUiState } from '$lib/server/ui-state';
+import { getUserSettings } from '$lib/server/user-settings';
 import { parseMaxKernels } from '$lib/kernelCap';
 
 /**
@@ -73,6 +74,10 @@ export function load() {
 		// Delivered via SSR so the client seeds them synchronously - no flash, and
 		// they survive the dynamic app port that resets `localStorage` each launch.
 		uiState: getUiState(),
+		// Cross-project user settings (see `$lib/server/user-settings.ts`) - the global
+		// sibling of `uiState`, delivered the same way and for the same reason. It holds
+		// DEFAULTS a project inherits only when it has no answer of its own.
+		userSettings: getUserSettings(),
 		mcp: {
 			port: mcpPort,
 			url: `http://127.0.0.1:${mcpPort}/mcp`,

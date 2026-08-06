@@ -3,8 +3,10 @@ import {
 	MAX_UPLOAD_NAME_CHARS,
 	UPLOAD_DATE_TOKENS,
 	expandDateTokens,
+	insertUploadToken,
 	notebookStem,
-	resolveUploadName
+	resolveUploadName,
+	unknownDateTokens
 } from '../../src/lib/databricksUploadName';
 
 /**
@@ -93,6 +95,121 @@ describe('date tokens', () => {
 	it('expands several tokens in one affix', () => {
 		expect(expandDateTokens('{YYYY}-{MM}', DAY)).toBe('2026-08');
 		expect(expandDateTokens('{DD}{MM}{YYYY}', DAY)).toBe('05082026');
+	});
+});
+
+describe('naming a brace that is NOT a token', () => {
+	it('names a near-miss of a REAL token, which is how the reported bug happened', () => {
+		// The bug as it actually happened: someone who has seen `{YYYYMMDD}` and `{YYYY}`
+		// work reaches for a shorter stamp. Left literal (correctly - dropping it would be
+		// worse), the preview reads `{YYYYMMD}_analysis`, which looks like a token waiting
+		// to expand rather than one that never will. Naming it is what makes the failure
+		// visible at all; `{YYYYMM}` itself is now real, and is covered below.
+		expect(unknownDateTokens('{YYYYMMD}_', DAY)).toEqual(['{YYYYMMD}']);
+		expect(expandDateTokens('{YYYYMMD}_', DAY)).toBe('{YYYYMMD}_');
+	});
+
+	it('the MONTH stamps are real tokens - the stamp the report was reaching for', () => {
+		// Both spellings, matching the two day stamps. Unambiguous contractions on the
+		// identical convention, and what people actually type - so they expand rather than
+		// being explained away.
+		expect(expandDateTokens('{YYYYMM}_', DAY)).toBe('202608_');
+		expect(expandDateTokens('{YYYY-MM}_', DAY)).toBe('2026-08_');
+		expect(expandDateTokens('{YYYYMM}', PADDED)).toBe('202603');
+		expect(expandDateTokens('{YYYY-MM}', PADDED)).toBe('2026-03');
+		expect(unknownDateTokens('{YYYYMM}_{YYYY-MM}', DAY)).toEqual([]);
+		// …and each means the same as spelling it out, so neither is a trap.
+		expect(expandDateTokens('{YYYY}{MM}_', DAY)).toBe(expandDateTokens('{YYYYMM}_', DAY));
+		expect(expandDateTokens('{YYYY}-{MM}_', DAY)).toBe(expandDateTokens('{YYYY-MM}_', DAY));
+	});
+
+	it('a month stamp is ONE lookup, so it can never be read as a shorter token plus junk', () => {
+		// The hazard a sequential token-by-token replace would have: `{YYYY}` matching
+		// INSIDE `{YYYYMM}` and leaving `2026MM}`. `BRACED` captures the whole group and
+		// each group is looked up once, so the longest and shortest spellings coexist.
+		expect(expandDateTokens('{YYYYMM}', DAY)).toBe('202608');
+		expect(expandDateTokens('{YYYYMMDD}', DAY)).toBe('20260805');
+		expect(expandDateTokens('{YYYY}', DAY)).toBe('2026');
+		expect(expandDateTokens('{YYYYMM}{YYYY}{YYYYMMDD}', DAY)).toBe('202608202620260805');
+		// The order they are declared in cannot matter either, for the same reason.
+		expect(expandDateTokens('{YYYY}{YYYYMM}', DAY)).toBe('2026202608');
+	});
+
+	it('stays silent on every token the UI offers - a false warning is worse than none', () => {
+		for (const token of UPLOAD_DATE_TOKENS) {
+			expect(unknownDateTokens(token, DAY)).toEqual([]);
+		}
+		expect(unknownDateTokens('{YYYY}-{MM}-{DD}_report', DAY)).toEqual([]);
+		// Nothing braced at all is nothing to say.
+		expect(unknownDateTokens('daily_', DAY)).toEqual([]);
+		expect(unknownDateTokens('', DAY)).toEqual([]);
+	});
+
+	it('catches the other near-misses the same way, wrong CASE included', () => {
+		// Case sensitivity is deliberate (`{mm}` is minutes by every other convention),
+		// which makes it exactly the kind of near-miss that needs saying out loud.
+		expect(unknownDateTokens('{yyyy}', DAY)).toEqual(['{yyyy}']);
+		expect(unknownDateTokens('{MMDD}', DAY)).toEqual(['{MMDD}']);
+		expect(unknownDateTokens('{YY}', DAY)).toEqual(['{YY}']);
+	});
+
+	it('lists each unknown run ONCE, in order, and only the unknown ones', () => {
+		// The message names them, so a repeated token must not read as two problems.
+		expect(unknownDateTokens('{FOO}-{YYYY}-{FOO}-{BAR}', DAY)).toEqual(['{FOO}', '{BAR}']);
+	});
+
+	it('is decided by the EXPANDER, so it cannot drift from what really expands', () => {
+		// The membership test is "did expanding change it", not a second copy of the token
+		// list - a copy would eventually warn about a token that works, or stay quiet
+		// about one that does not. Every known token expands to something brace-free, so
+		// the test can never mistake one for unknown.
+		for (const token of UPLOAD_DATE_TOKENS) {
+			expect(expandDateTokens(token, DAY)).not.toContain('{');
+		}
+	});
+});
+
+describe('inserting a token from a chip', () => {
+	it('appends when the field has never been focused, so the first click still lands', () => {
+		expect(insertUploadToken('', '{YYYYMMDD}')).toEqual({ value: '{YYYYMMDD}', caret: 10 });
+		expect(insertUploadToken('daily_', '{DD}')).toEqual({ value: 'daily_{DD}', caret: 10 });
+		// An explicit null is the same statement as an absent one - the DOM hands back
+		// `null` for an element that was never edited.
+		expect(insertUploadToken('daily_', '{DD}', null, null).value).toBe('daily_{DD}');
+	});
+
+	it('inserts at the caret, and leaves the caret past what it inserted', () => {
+		// Continuing where the user was is the whole reason the caret is threaded through:
+		// two chips in a row must read `{YYYY}{MM}`, not `{MM}` stranded at the end.
+		const first = insertUploadToken('report__v2', '{YYYY}', 7, 7);
+		expect(first).toEqual({ value: 'report_{YYYY}_v2', caret: 13 });
+		const second = insertUploadToken(first.value, '{MM}', first.caret, first.caret);
+		expect(second.value).toBe('report_{YYYY}{MM}_v2');
+	});
+
+	it('replaces a SELECTED run rather than pushing it aside', () => {
+		// Selecting the wrong token and clicking the right one is the obvious way to fix
+		// one; keeping both would leave a name carrying two dates.
+		expect(insertUploadToken('{YYYY}_notes', '{YYYYMMDD}', 0, 6).value).toBe('{YYYYMMDD}_notes');
+	});
+
+	it('clamps and orders offsets instead of trusting them', () => {
+		// They come from the DOM. An out-of-range one taken literally slices text the user
+		// typed straight out of the field, which is silent data loss in a persisted field.
+		expect(insertUploadToken('abc', '{DD}', 99, 99).value).toBe('abc{DD}');
+		expect(insertUploadToken('abc', '{DD}', -5, -5).value).toBe('{DD}abc');
+		expect(insertUploadToken('abcdef', '{DD}', 4, 2).value).toBe('ab{DD}ef');
+		expect(insertUploadToken('abc', '{DD}', Number.NaN, Number.NaN).value).toBe('abc{DD}');
+	});
+
+	it('inserts the BRACED form, so anything a chip writes really does expand', () => {
+		// The chips are the answer to "how was I supposed to know about the braces", so a
+		// chip that inserted a bare token would teach exactly the syntax that fails.
+		for (const token of UPLOAD_DATE_TOKENS) {
+			const { value } = insertUploadToken('', token);
+			expect(value).toBe(token);
+			expect(expandDateTokens(value, DAY)).not.toContain('{');
+		}
 	});
 });
 

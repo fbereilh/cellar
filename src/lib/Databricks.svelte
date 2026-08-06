@@ -18,6 +18,8 @@
 	import { onMount } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
 	import { getUi, setUi, setUiNow } from '$lib/uiState';
+	import { getUserSetting } from '$lib/userSettings';
+	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import { normalizeDatabricksHost } from '$lib/databricksHost';
 	import {
 		PROFILE_REAUTH_CODE,
@@ -27,7 +29,13 @@
 		reauthDetail,
 		reauthExplanation
 	} from '$lib/databricksReauth';
-	import { UPLOAD_DATE_TOKENS, expandDateTokens, resolveUploadName } from '$lib/databricksUploadName';
+	import {
+		UPLOAD_DATE_TOKENS,
+		expandDateTokens,
+		insertUploadToken,
+		resolveUploadName,
+		unknownDateTokens
+	} from '$lib/databricksUploadName';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -257,8 +265,8 @@
 		// The upload affixes: someone who uploads regularly should not have to retype a
 		// naming pattern every session. The store is untyped JSON, so anything that is
 		// not a string reads as "no affix" rather than being interpolated into a name.
-		uploadPrefix = storedAffix(DBX_UPLOAD_PREFIX_KEY);
-		uploadPostfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY);
+		uploadPrefix = storedAffix(DBX_UPLOAD_PREFIX_KEY, UPLOAD_PREFIX_DEFAULT_KEY);
+		uploadPostfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY, UPLOAD_POSTFIX_DEFAULT_KEY);
 	});
 
 	/**
@@ -981,10 +989,30 @@
 	const DBX_UPLOAD_POSTFIX_KEY = 'cellar-databricks-upload-postfix';
 	let uploadPrefix = $state('');
 	let uploadPostfix = $state('');
-	/** A persisted affix, or '' - the store is untyped JSON and this ends up in a name. */
-	function storedAffix(key: string): string {
-		const v = getUi<unknown>(key, '');
-		return typeof v === 'string' ? v : '';
+	/**
+	 * This project's affix, or the user's cross-project DEFAULT when this project has
+	 * never had one of its own.
+	 *
+	 * The direction is the whole rule and must not be inverted: the per-project store
+	 * is authoritative wherever it has an answer, and the global default only supplies
+	 * one where it does not. A default that overrode would silently rewrite naming a
+	 * user set deliberately, project by project, the first time they changed it.
+	 *
+	 * "Has an answer" is `typeof === 'string'`, so an EXPLICITLY EMPTY affix counts -
+	 * which is why the input persists `''` rather than deleting the key. Clearing the
+	 * field is an edit like any other ("no prefix on this project"), and deleting would
+	 * make it indistinguishable from never having set one, so the default would come
+	 * back on the next load and undo exactly what the user just did.
+	 *
+	 * Both are raw text, never expanded: a default is a PATTERN reused across projects
+	 * and days, so storing what it resolved to on the day it was set would stamp every
+	 * later upload with a stale date.
+	 */
+	function storedAffix(key: string, defaultKey: string): string {
+		const own = getUi<unknown>(key, undefined);
+		if (typeof own === 'string') return own;
+		const fallback = getUserSetting<unknown>(defaultKey, '');
+		return typeof fallback === 'string' ? fallback : '';
 	}
 	/**
 	 * The affixes the ARMED replace confirm was resolved with, pinned at the moment
@@ -1057,6 +1085,32 @@
 	const uploadPreview = $derived(uploadFileName ? uploadResolved.name : '');
 	/** Why the affixes cannot be used, or ''. Blocks the button rather than repairing them. */
 	const uploadNameError = $derived(uploadResolved.error ?? '');
+	/**
+	 * Braced runs in either affix that are NOT date tokens, and so will upload exactly
+	 * as typed.
+	 *
+	 * This is the reported bug's real shape: the vocabulary is small and
+	 * case-sensitive, so `{YYYYMM}` (or `{MMDD}`, or `{yyyy}`) is a reasonable guess
+	 * from someone who has seen `{YYYYMMDD}` work - and leaving it literal, which is
+	 * the right thing to DO with it, previewed as `{YYYYMM}_analysis`, which reads as
+	 * a token waiting to expand rather than one that never will. Naming it is the
+	 * whole fix; nothing about the expansion rule changes.
+	 *
+	 * A WARNING, never a refusal: the name is legal and the literal braces may be
+	 * meant. It also yields to `uploadNameError`, which blocks the upload outright -
+	 * two messages about the same two fields at once is noise, and only one of them
+	 * is the reason nothing can be sent.
+	 */
+	const uploadUnknownTokens = $derived(
+		uploadNameError ? [] : unknownDateTokens(`${uploadPrefix}${uploadPostfix}`, uploadNow)
+	);
+	const uploadTokenWarning = $derived(
+		uploadUnknownTokens.length === 0
+			? ''
+			: `${uploadUnknownTokens.map((t) => `"${t}"`).join(' and ')} ${
+					uploadUnknownTokens.length === 1 ? 'is not a date token' : 'are not date tokens'
+				} - ${uploadUnknownTokens.length === 1 ? 'it uploads' : 'they upload'} exactly as written. The buttons below are the ones that expand.`
+	);
 	/** Ties that reason to both affix fields, so it is announced and not merely shown. */
 	const uploadNameErrorId = $props.id();
 	/**
@@ -1112,12 +1166,66 @@
 	 * `.cellar/` store as every other preference here, never `localStorage`) so a
 	 * regular pattern survives a relaunch on a new port.
 	 */
-	function onUploadAffixInput(which: 'prefix' | 'postfix', e: Event) {
-		const v = (e.currentTarget as HTMLInputElement).value;
+	function setUploadAffix(which: 'prefix' | 'postfix', v: string) {
 		if (which === 'prefix') uploadPrefix = v;
 		else uploadPostfix = v;
-		setUi(which === 'prefix' ? DBX_UPLOAD_PREFIX_KEY : DBX_UPLOAD_POSTFIX_KEY, v === '' ? null : v);
+		// The literal string, EMPTY INCLUDED - see `storedAffix`. Deleting the key on an
+		// empty field would read back as "this project never set one", so the global
+		// default would re-seed it on the next load and undo the clearing.
+		setUi(which === 'prefix' ? DBX_UPLOAD_PREFIX_KEY : DBX_UPLOAD_POSTFIX_KEY, v);
 		clearUploadFeedback();
+	}
+
+	function onUploadAffixInput(which: 'prefix' | 'postfix', e: Event) {
+		setUploadAffix(which, (e.currentTarget as HTMLInputElement).value);
+	}
+
+	/**
+	 * The two affix inputs, and which of them a token chip writes into.
+	 *
+	 * The chips need the ELEMENT, not just the state: the insertion point is the
+	 * caret, which only the DOM node knows, and the caret has to be put back after
+	 * the write or a second chip click would append to the end of what the first one
+	 * inserted instead of continuing where the user was.
+	 *
+	 * The target follows FOCUS and is remembered after it - a chip is a button, so
+	 * clicking one necessarily takes focus away from the field it is meant to write
+	 * into, and "the field you were last in" is the only reading of that gesture that
+	 * matches what the user is looking at. It starts on the prefix so the very first
+	 * click (nothing focused yet) still lands somewhere predictable rather than
+	 * doing nothing.
+	 */
+	let uploadPrefixEl = $state<HTMLInputElement | null>(null);
+	let uploadPostfixEl = $state<HTMLInputElement | null>(null);
+	let uploadTokenTarget = $state<'prefix' | 'postfix'>('prefix');
+
+	/**
+	 * Insert a date token into the affix field the user was last in, at the caret.
+	 *
+	 * The braces are what the expander recognises and they are easy to miss (the
+	 * placeholder is the only other place they appear, and a placeholder disappears
+	 * the moment anything is typed) - so the chips are how the syntax is LEARNED:
+	 * clicking one writes the exact braced form, which the preview immediately
+	 * resolves, and after seeing that once the user can type the rest by hand.
+	 *
+	 * The field keeps the TOKEN, never its expansion: it is a reusable pattern that
+	 * persists between sessions, so a field holding today's literal date would upload
+	 * under a stale name tomorrow - the one failure the tokens exist to prevent.
+	 */
+	function insertUploadDateToken(token: string) {
+		if (uploadConfirmBusy) return;
+		const which = uploadTokenTarget;
+		const el = which === 'prefix' ? uploadPrefixEl : uploadPostfixEl;
+		const current = which === 'prefix' ? uploadPrefix : uploadPostfix;
+		const { value, caret } = insertUploadToken(current, token, el?.selectionStart, el?.selectionEnd);
+		setUploadAffix(which, value);
+		if (!el) return;
+		// The input is `value=`-bound rather than two-way, so the DOM node is written
+		// here as well: Svelte will not re-render an unchanged-from-its-view element,
+		// and the caret has to be restored on the node in any case.
+		el.value = value;
+		el.focus();
+		el.setSelectionRange(caret, caret);
 	}
 
 	/**
@@ -1794,9 +1902,11 @@
 		<label class="flex flex-col gap-0.5">
 			<span class="text-[10px] text-base-content/50">Prefix</span>
 			<input
+				bind:this={uploadPrefixEl}
 				class="input input-xs w-full font-mono text-[10px]"
 				value={uploadPrefix}
 				oninput={(e) => onUploadAffixInput('prefix', e)}
+				onfocus={() => (uploadTokenTarget = 'prefix')}
 				disabled={uploadConfirmBusy}
 				placeholder="{'{YYYY-MM-DD}'}_"
 				title={uploadTokenHelp}
@@ -1808,9 +1918,11 @@
 		<label class="flex flex-col gap-0.5">
 			<span class="text-[10px] text-base-content/50">Postfix</span>
 			<input
+				bind:this={uploadPostfixEl}
 				class="input input-xs w-full font-mono text-[10px]"
 				value={uploadPostfix}
 				oninput={(e) => onUploadAffixInput('postfix', e)}
+				onfocus={() => (uploadTokenTarget = 'postfix')}
 				disabled={uploadConfirmBusy}
 				placeholder="_{'{YYYYMMDD}'}"
 				title={uploadTokenHelp}
@@ -1839,6 +1951,55 @@
 			>
 		</p>
 	{/if}
+	{#if uploadTokenWarning}
+		<!-- Says what the preview alone could not: this brace is never going to become a
+		     date. It sits directly under the preview that shows it landing literally, and
+		     above the buttons that are the remedy - and it stays a WARNING, because the
+		     name is legal and `{FOO}` may be exactly what someone means. -->
+		<p
+			class="mt-1 text-[10px] leading-snug text-warning"
+			role="status"
+			data-testid="databricks-upload-token-warning"
+		>
+			{uploadTokenWarning}
+		</p>
+	{/if}
+	<!-- The token vocabulary, VISIBLE rather than hidden in a `title`. The braces are
+	     required (bare `MM`/`DD` would collide with ordinary words, so they can never be
+	     optional) and the SET is small and case-sensitive - which is the part that has to
+	     be discoverable: the reported failure was someone who had seen a token work
+	     reasonably guessing a spelling that does not exist, and a tooltip is not something
+	     anyone finds before typing. Each button writes its exact braced form into the
+	     field last focused and names its live expansion, so it reads as "click to insert
+	     today's date". Driven off `UPLOAD_DATE_TOKENS`, so what is offered cannot drift
+	     from what the expander knows. The preview above is the live worked example, which
+	     is why there is no second one spelled out down here. -->
+	<div class="mt-1 flex flex-wrap items-center gap-1">
+		<span
+			class="text-[10px] leading-snug text-base-content/50"
+			data-testid="databricks-upload-token-hint"
+		>
+			Date tokens (braces needed) - click to insert:
+		</span>
+		{#each UPLOAD_DATE_TOKENS as token (token)}
+			<button
+				type="button"
+				class="btn btn-ghost btn-xs h-4 min-h-0 rounded border border-base-300 px-1 font-mono text-[10px] font-normal text-base-content/70"
+				onmousedown={(e) => e.preventDefault()}
+				onclick={() => insertUploadDateToken(token)}
+				disabled={uploadConfirmBusy}
+				title="{token} → {expandDateTokens(token, uploadNow)}"
+				aria-label="Insert {token} into the {uploadTokenTarget}, which becomes {expandDateTokens(
+					token,
+					uploadNow
+				)}"
+				data-testid="databricks-upload-token"
+				data-token={token}
+			>
+				{token}
+			</button>
+		{/each}
+	</div>
 	<div class="mt-1.5">
 		{#if uploadExistsPath}
 			<div class="rounded border border-warning/40 bg-warning/10 px-2 py-1.5" data-testid="databricks-upload-confirm-box">
