@@ -256,7 +256,7 @@ describe('the client half of that refusal (source guard)', () => {
 		// Responses are unordered, so a refusal resolving after a newer write must
 		// neither revert that newer value nor speak for it - and a refusal for a value
 		// the field no longer holds must not yank the caret back either.
-		expect(fn).toMatch(/const seq = \+\+exportTargetSeq/);
+		expect(fn).toMatch(/\+\+exportTargetSeq/);
 		expect(fn).toMatch(/seq !== exportTargetSeq/);
 		expect(fn).toMatch(/exportTarget !== next/);
 	});
@@ -268,11 +268,30 @@ describe('the client half of that refusal (source guard)', () => {
 		// OPTIMISTIC value - itself never stored under consecutive refusals - so the
 		// field settled on a path the server had rejected.
 		expect(fn).toMatch(/clearTimeout\(exportTargetTimer\)/);
-		expect(fn).toMatch(/setTimeout\(.*commitExportTarget/);
+		expect(fn).toMatch(/setTimeout\(.*flushExportTarget/);
 		expect(fn).not.toMatch(/const previous = exportTarget/);
 		// The baseline is only ever written where the server states it.
 		const writes = src.match(/confirmedExportTarget = /g) ?? [];
 		expect(writes.length).toBe(3); // load, the SSE event, a confirmed write
+	});
+
+	it('flushes the debounced write on blur, on unmount and before the export button', () => {
+		// A debounce with no flush loses whatever was typed inside the last window -
+		// the editor's own autosave, which this copies, flushes for exactly that
+		// reason. The export button posts immediately, so without the flush a freshly
+		// typed target exported against the previous one while the field showed the new.
+		expect(fn).toMatch(/function flushExportTarget/);
+		expect(fn).toMatch(/onMount\(\(\) => \(\) => void flushExportTarget\(\)\)/);
+
+		const exportFn = src.slice(src.indexOf('async function exportPy'), src.indexOf('UNDO_LIMIT'));
+		expect(exportFn).toMatch(/await flushExportTarget\(\)/);
+		// And the manual export reports the SERVER's reason (the clobber / non-.py
+		// refusals exist for their message; "Export failed." names no cause).
+		expect(exportFn).toMatch(/onNotice\?\./);
+
+		const nbSrc = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
+		expect(nbSrc).toMatch(/onblur=\{onExportTargetBlur\}/);
+		expect(nbSrc).toMatch(/onSetExportTarget\?\.\(.*\{ flush: true \}\)/);
 	});
 });
 

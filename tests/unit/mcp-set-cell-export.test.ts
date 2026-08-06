@@ -616,6 +616,31 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 		const again = svc.setCellExport([code[0]], true, target);
 		expect(again.ok && 'module' in again).toBe(false);
 	});
+
+	/**
+	 * The same record in the other direction, and the more dangerous one: with the
+	 * last save successful the record is null, so a manual export that FAILS and
+	 * records nothing leaves the doc asserting the module is fine - and the next
+	 * idempotent `set_cell_export` skips the persist that would refresh it, emitting
+	 * no `module` field at all, which under the conditional contract reads as a
+	 * module that WAS regenerated.
+	 */
+	it('a failed manual export records why, so a later idempotent call still reports it', async () => {
+		const { target, code } = await makeNotebook('manual-records.ipynb');
+		svc.setExportTarget('lib/records.py', target);
+		expect(svc.setCellExport([code[0]], true, target).ok).toBe(true);
+		expect(nbmod.lastExportError(target)).toBe(null);
+
+		// The module is replaced on disk by a hand-written file. Nothing persists, so
+		// only the manual button can discover it - and it must write down what it hit.
+		writeFileSync(join(WS, 'lib/records.py'), 'def mine():\n    return 1\n');
+		expect(() => nbmod.exportPy(target)).toThrow(/refusing to overwrite/);
+		expect(nbmod.lastExportError(target)).toMatch(/refusing to overwrite/);
+
+		const again = svc.setCellExport([code[0]], true, target);
+		expect(again.ok ? again.module : null).toMatchObject({ regenerated: false });
+		expect(again.ok ? again.module?.reason : '').toMatch(/refusing to overwrite/);
+	});
 });
 
 

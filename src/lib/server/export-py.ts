@@ -175,6 +175,12 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	const exported = doc.cells.filter((c: Cell) => isExportCell(c)).map((c) => c.source);
 	if (!exported.length) return { written: false, target, count: 0, reason: 'no-cells' };
 
+	// KNOWN LIMITATION: `resolveInWorkspace` resolves LEXICALLY (no `realpath`), so a
+	// DANGLING `*.py` symlink inside the workspace is followed by the write below and
+	// the module lands outside the root. Bounded - an existing destination is still
+	// caught by the not-a-generated-module refusal, so nothing is destroyed - and the
+	// property is shared by every file writer in the app, so the fix belongs in that
+	// one helper (`$lib/server/fstree`), not here.
 	const abs = resolveInWorkspace(target); // throws on workspace escape
 	const sourceName = basename(doc.path);
 	const text = generateModule(exported, sourceName);

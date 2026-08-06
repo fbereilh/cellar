@@ -901,18 +901,25 @@ export function setHideAllCode(hidden: boolean, nb?: string | null, originId?: s
  * Unlike the auto-on-save path, this surfaces a real error (bad target) to the
  * caller rather than swallowing it.
  *
- * A success CLEARS `lastExportError`, for the same reason `autoExportPy` refreshes
- * it on every persist: the record describes what is on disk, and this path writes
- * the module without going through `persist`. Left standing, a failure the user
- * then fixed and resolved with this button would still be reported by the next
- * idempotent `set_cell_export` - which skips the persist that would have cleared it.
+ * It REFRESHES `lastExportError` in BOTH directions, exactly as `autoExportPy`
+ * does on every persist: the record describes what is on disk, and this path
+ * writes the module without going through `persist`. A stale success would be
+ * reported by the next idempotent `set_cell_export` (which skips the persist that
+ * would have cleared it); a failure left unrecorded is worse - with the record
+ * null the same call emits no `module` field at all, which under the conditional
+ * contract reads as a module that WAS regenerated.
  */
 export function exportPy(nb?: string | null): ExportResult {
 	const doc = docFor(nb);
 	if (doc.jpFormat) throw new Error('cannot export a .py text notebook to a module');
-	const res = exportNotebookToPy(doc);
-	doc.lastExportError = null;
-	return res;
+	try {
+		const res = exportNotebookToPy(doc);
+		doc.lastExportError = null;
+		return res;
+	} catch (err) {
+		doc.lastExportError = String((err as Error)?.message ?? err);
+		throw err;
+	}
 }
 
 /**

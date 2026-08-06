@@ -76,8 +76,11 @@
 		exportTarget?: string | null;
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
-		/** Set (or clear, with '') the notebook's `.py` export target. */
-		onSetExportTarget?: (target: string) => void;
+		/**
+		 * Set (or clear, with '') the notebook's `.py` export target. The write is
+		 * debounced; `flush` commits it immediately (the input's blur).
+		 */
+		onSetExportTarget?: (target: string, opts?: { flush?: boolean }) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
 		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
@@ -433,14 +436,22 @@
 	function onExportTargetInput(e: Event) {
 		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value);
 	}
+	// Leaving the field commits what is in it, so the debounced write can't lose a
+	// target the user typed and then clicked away from.
+	function onExportTargetBlur(e: Event) {
+		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value, { flush: true });
+	}
 	async function doExport() {
 		if (exporting) return;
 		exporting = true;
 		exportFeedback = '';
 		const r = await onExportPy?.();
 		exporting = false;
-		if (!r) exportFeedback = 'Export failed.';
-		else if (r.reason === 'no-target') exportFeedback = 'Set a target .py path first.';
+		// A failure is reported by the caller through the shell's notice channel,
+		// carrying the server's own reason; a bare "Export failed." here would be a
+		// second, less informative surface for the same event.
+		if (!r) return;
+		if (r.reason === 'no-target') exportFeedback = 'Set a target .py path first.';
 		else if (r.reason === 'no-cells') exportFeedback = 'No cells are marked for export.';
 		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
 	}
@@ -631,6 +642,7 @@
 					placeholder="utils.py"
 					value={exportTarget ?? ''}
 					oninput={onExportTargetInput}
+					onblur={onExportTargetBlur}
 					data-testid="export-target-input"
 					aria-label="Export target .py module path"
 				/>
