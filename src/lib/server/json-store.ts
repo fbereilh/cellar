@@ -22,13 +22,25 @@
  * independent - a write to one can never flush the other.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { atomicWriteFileSync } from '$lib/server/atomic-write';
 
 const WRITE_DEBOUNCE_MS = 250;
 
 /** A flat `key → value` map, as persisted. */
 export type JsonStoreData = Record<string, unknown>;
+
+/** The identity of a file's contents: nanosecond mtime plus size. */
+interface FileStamp {
+	mtimeNs: bigint;
+	size: bigint;
+}
+
+function sameStamp(a: FileStamp | null, b: FileStamp | null): boolean {
+	if (a === null || b === null) return a === b;
+	return a.mtimeNs === b.mtimeNs && a.size === b.size;
+}
 
 export interface JsonStore {
 	/** The whole map (a copy, so callers can't mutate the cache). */
@@ -51,7 +63,7 @@ export function createJsonStore(storePath: () => string): JsonStore {
 	let dirty = false;
 	let exitHookInstalled = false;
 	/** What the file looked like when this cache was loaded, or last written. */
-	let loadedStamp: string | null = null;
+	let loadedStamp: FileStamp | null = null;
 
 	/**
 	 * A cheap identity for the file's current contents - `null` when it is not there.
@@ -61,10 +73,10 @@ export function createJsonStore(storePath: () => string): JsonStore {
 	 * inside one millisecond is not far-fetched. Size is folded in so a filesystem
 	 * with a coarse timestamp still catches the common case.
 	 */
-	function fileStamp(p: string): string | null {
+	function fileStamp(p: string): FileStamp | null {
 		try {
 			const st = statSync(p, { bigint: true });
-			return `${st.mtimeNs}:${st.size}`;
+			return { mtimeNs: st.mtimeNs, size: st.size };
 		} catch {
 			return null;
 		}
@@ -75,9 +87,17 @@ export function createJsonStore(storePath: () => string): JsonStore {
 	 * fails: a FIRST load has nothing to keep, so a missing or unparseable file is an
 	 * empty store - but a RE-load must not wipe a good cache, since the likeliest way
 	 * a parse fails on a file we already read is catching another process mid-write.
+	 *
+	 * The stamp is taken BEFORE the read, and that ordering is the whole guarantee.
+	 * Another instance's write can land inside the read window; stamped afterwards it
+	 * would mark content this cache does NOT hold as already loaded, and since nothing
+	 * else moves the stamp the store would then be stale for good - exactly the
+	 * failure the reload exists to prevent, and one no test would ever see. Taken
+	 * first, the same race costs one redundant re-read on the next access instead.
 	 */
 	function load(keep: JsonStoreData | null): JsonStoreData {
 		const p = storePath();
+		const stamp = fileStamp(p);
 		let next: JsonStoreData | null = null;
 		try {
 			// Dynamic boundary: our own on-disk JSON.
@@ -88,7 +108,7 @@ export function createJsonStore(storePath: () => string): JsonStore {
 			next = keep;
 		}
 		cache = next ?? {};
-		loadedStamp = fileStamp(p);
+		loadedStamp = stamp;
 		return cache;
 	}
 
@@ -110,10 +130,21 @@ export function createJsonStore(storePath: () => string): JsonStore {
 	function ensureLoaded(): JsonStoreData {
 		if (cache === null) return load(null);
 		if (dirty) return cache;
-		if (fileStamp(storePath()) === loadedStamp) return cache;
+		if (sameStamp(fileStamp(storePath()), loadedStamp)) return cache;
 		return load(cache);
 	}
 
+	/**
+	 * Persist the cache.
+	 *
+	 * ATOMICALLY, because the global store is one file under `~/.cellar/` that every
+	 * running instance reads and writes: a crash / SIGKILL / ENOSPC mid-write leaves a
+	 * truncated file, which the (correct) corrupt-file-reads-empty rule then turns
+	 * into a SILENT loss of the user's cross-project defaults on the next boot. The
+	 * `.ipynb` path already answers exactly this with `atomicWriteFileSync`
+	 * (unique temp in the target's OWN directory → fsync → rename), so it is shared
+	 * rather than reimplemented here.
+	 */
 	function flush(): void {
 		if (writeTimer) {
 			clearTimeout(writeTimer);
@@ -123,10 +154,16 @@ export function createJsonStore(storePath: () => string): JsonStore {
 		dirty = false;
 		try {
 			const p = storePath();
+			const payload = JSON.stringify(cache, null, 2) + '\n';
 			mkdirSync(dirname(p), { recursive: true });
-			writeFileSync(p, JSON.stringify(cache, null, 2) + '\n');
-			// Our own write is not a change to catch up on.
-			loadedStamp = fileStamp(p);
+			atomicWriteFileSync(p, payload);
+			// Our own write is not a change to catch up on - but only while the file
+			// still IS the one we wrote. A concurrent write landing between the rename
+			// and this stat would otherwise be recorded as loaded, the same permanent
+			// staleness `load` orders its stamp to avoid; a size that disagrees with the
+			// bytes we just wrote proves that happened, and drops us to a re-read.
+			const stamp = fileStamp(p);
+			loadedStamp = stamp && stamp.size === BigInt(Buffer.byteLength(payload)) ? stamp : null;
 		} catch {}
 	}
 

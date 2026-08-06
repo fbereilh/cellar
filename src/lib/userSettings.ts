@@ -31,29 +31,33 @@ export function hydrateUserSettings(initial: unknown): void {
 /**
  * Current value for `key`, or `fallback` if unset / before hydration.
  *
- * The store is untyped JSON, so `fallback` states the expected shape but proves
- * nothing about what is really there - a caller that will USE the value as a string
- * wants `getUserSettingText` below, not a `<string>` type argument.
+ * MODULE-PRIVATE, deliberately. The store is untyped JSON, so `fallback` states the
+ * expected shape but proves nothing about what is really there - and every value
+ * this store holds today ends up in a NAME. Exporting the untyped read beside the
+ * guarded one left the rule below as documentation a caller had to remember; keeping
+ * it in here makes `getUserSettingText` the only way in, so there is nothing to
+ * remember. A future caller that genuinely needs a non-text setting exports its own
+ * guarded accessor beside that one, rather than reopening this.
  */
-export function getUserSetting<T>(key: string, fallback: T): T {
+function getUserSetting<T>(key: string, fallback: T): T {
 	return store.get(key, fallback);
 }
 
 /**
  * A setting read as TEXT, with anything that is not a string degrading to `''`.
  *
- * The ONE read every surface that puts a setting into a NAME must use, and the
- * reason it is shared rather than a `typeof` check at each of them. This store is
- * untyped JSON on disk and `/api/user-settings` accepts any JSON value, so a
- * hand-edited `~/.cellar/settings.json` (or a PUT) can put a number where a prefix
- * belongs - and the consumers hand it straight to `expandDateTokens`, whose
- * `text.replace` then throws inside a render-time `$derived`. Nothing in this app
- * mounts a `<svelte:boundary>`, so that throw does not cost one field: it takes the
- * whole render tree with it. Degrading to "no affix" is both the safe reading and
- * the honest one - a value that is not text was never an affix.
+ * The ONE read this module offers, and the reason it is shared rather than a
+ * `typeof` check at each surface. This store is untyped JSON on disk and
+ * `/api/user-settings` accepts any JSON value, so a hand-edited
+ * `~/.cellar/settings.json` (or a PUT) can put a number where a prefix belongs - and
+ * the consumers hand it straight to `expandDateTokens`, whose `text.replace` then
+ * throws inside a render-time `$derived`. Nothing in this app mounts a
+ * `<svelte:boundary>`, so that throw does not cost one field: it takes the whole
+ * render tree with it. Degrading to "no affix" is both the safe reading and the
+ * honest one - a value that is not text was never an affix.
  */
 export function getUserSettingText(key: string): string {
-	const value = store.get<unknown>(key, '');
+	const value = getUserSetting<unknown>(key, '');
 	return typeof value === 'string' ? value : '';
 }
 
