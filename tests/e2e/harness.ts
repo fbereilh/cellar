@@ -40,6 +40,11 @@ export function runtimeAvailable(): boolean {
  * throwaway workspace, so it dies with it. A spec that needs two launchers to SHARE
  * one global store passes the same path to both, which is the one case the default
  * cannot serve.
+ *
+ * It goes under the workspace's `.cellar/`, not its root: that directory is the one
+ * place Cellar treats as gitignored runtime state, and specs that `git init` their
+ * workspace assert on git decorations and `status` - so a redirected store at the
+ * root would surface as an untracked file the moment any spec wrote a setting.
  */
 export function bootCellar(
 	ws: string,
@@ -64,7 +69,7 @@ export function bootCellar(
 				...process.env,
 				PATH: `${shim}:${process.env.PATH}`,
 				CI: '1',
-				CELLAR_USER_SETTINGS: join(ws, '.cellar-user-settings.json'),
+				CELLAR_USER_SETTINGS: join(ws, '.cellar', 'user-settings.json'),
 				...env
 			},
 			stdio: ['ignore', 'pipe', 'pipe'],

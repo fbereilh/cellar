@@ -62,6 +62,7 @@ let urlB = '';
 const HOST = 'https://dbc-demo.cloud.databricks.com';
 const USER = 'me@corp.example.com';
 const PREFIX_DEFAULT_KEY = 'cellar-databricks-upload-prefix-default';
+const PREFIX_KEY = 'cellar-databricks-upload-prefix';
 
 function connectedStatus() {
 	return {
@@ -140,6 +141,25 @@ async function closeSettings(page: Page): Promise<void> {
 	await expect(page.getByTestId('settings-modal')).toHaveCount(0);
 }
 
+/**
+ * That project's OWN prefix, as the SERVER store holds it - what a reload reads back.
+ *
+ * The field's write is debounced client-side, so `fill()` followed straight by
+ * `page.reload()` rests on the unload-time `keepalive` PUT being PROCESSED before the
+ * new document's SSR read: the browser guarantees the request survives the navigation,
+ * not that the server has finished with it. Losing that race re-seeds the global
+ * default, which is precisely the symptom these tests exist to catch - so a flake here
+ * would read as a real regression. Poll this until the write has landed, then reload.
+ *
+ * Note the value polled for after CLEARING is the empty string, not `undefined`: an
+ * emptied field persists as `''` on purpose, because that is what outranks the global
+ * default. Waiting for the key to be absent would be waiting for the opposite rule.
+ */
+async function storedProjectPrefix(page: Page, url: string): Promise<unknown> {
+	const res = await page.request.get(`${url}/api/ui-state`);
+	return ((await res.json()) as Record<string, unknown>)[PREFIX_KEY];
+}
+
 /** The global store as it is ON DISK - what another instance would read back. */
 function storedDefaults(): Record<string, unknown> {
 	try {
@@ -198,6 +218,7 @@ test('project A sets its own affix, then a default - and keeps its own', async (
 	// This project answers for itself.
 	await page.getByTestId('databricks-upload-prefix').fill('team_');
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('team_notebook');
+	await expect.poll(() => storedProjectPrefix(page, urlA)).toBe('team_');
 
 	// The user then sets a cross-project default that says something quite different.
 	await openSettings(page);
@@ -336,6 +357,10 @@ test('CLEARING a project field is an answer, so the default does not creep back'
 	// "No prefix on this project" - said by emptying the field, the only way to say it.
 	await page.getByTestId('databricks-upload-prefix').fill('');
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('notebook');
+	// The empty string, not an absent key - saying "no prefix here" is exactly what has
+	// to reach the store for the reload below to be a test of the rule rather than of
+	// which of the two won a race.
+	await expect.poll(() => storedProjectPrefix(page, urlB)).toBe('');
 
 	await page.reload();
 	await openProject(page, urlB);
