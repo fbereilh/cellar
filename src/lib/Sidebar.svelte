@@ -3,6 +3,7 @@
 	import Databricks from '$lib/Databricks.svelte';
 	import Environment from '$lib/Environment.svelte';
 	import Checkpoints from '$lib/Checkpoints.svelte';
+	import GitNotebooks from '$lib/GitNotebooks.svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelStatusLabel, kernelDotClass, formatMemory } from '$lib/kernelBadge';
@@ -24,6 +25,7 @@
 	import type { GitStatusLetter } from '$lib/server/git';
 	import type { KernelInfo, KernelCard } from '$lib/kernelBadge';
 	import type { CellarFileOps, FileClipboard, NewEntry, FileDescriptor } from '$lib/fileOps';
+	import type { NotebookRef } from '$lib/types';
 
 	/** A file/dir/root descriptor the context menu + selection act on. */
 	type MenuNode = { type: 'file' | 'dir' | 'root'; path: string; name?: string; children?: TreeNode[] };
@@ -86,6 +88,14 @@
 		kernelInfo?: KernelInfo | null;
 		/** One card per notebook (open tab or live kernel) for the Kernels section. */
 		kernelCards?: KernelCard[];
+		/**
+		 * The shell's OPEN notebook tabs, in tab order — one row per entry in the Git
+		 * section. Deliberately not `kernelCards`, which is a different set (it drops
+		 * an open-but-unrun notebook that isn't active, and keeps a live kernel whose
+		 * tab was closed); this section is about notebooks you have open, whether or
+		 * not they have ever run.
+		 */
+		openNotebooks?: NotebookRef[];
 		/** Soft cap on live kernels; past it the section warns (0 = disabled). */
 		maxKernels?: number;
 		variables?: VariableInfo[];
@@ -138,6 +148,7 @@
 		mcp = null,
 		kernelInfo,
 		kernelCards = [],
+		openNotebooks = [],
 		maxKernels = 8,
 		variables,
 		varsLoading,
@@ -169,7 +180,7 @@
 	// Which foldable sections are open. All start expanded (agent panel collapsed),
 	// then overridden by the persisted state on mount.
 	const OPEN_KEY = 'cellar-sidebar-open';
-	let open = $state<Record<string, boolean>>({ files: true, kernels: true, databricks: false, environment: false, agent: false, outline: true, history: false, vars: true, search: false });
+	let open = $state<Record<string, boolean>>({ files: true, git: false, kernels: true, databricks: false, environment: false, agent: false, outline: true, history: false, vars: true, search: false });
 	function toggle(k: string) {
 		open[k] = !open[k];
 		persist(OPEN_KEY, open);
@@ -193,6 +204,10 @@
 	// The History (checkpoints) panel component, for its header's "Checkpoint now" +
 	// refresh buttons. Mounted with the section (it's cheap: one metadata GET).
 	let checkpointsComp = $state<{ refresh: () => void; checkpointNow: () => void } | null>(null);
+	// The Git panel component, for its header's refresh button. Mounted only while
+	// the section is open (like History): its data costs `git` subprocesses per code
+	// root, which a user who keeps the section closed should not pay for.
+	let gitComp = $state<{ refresh: () => void } | null>(null);
 	$effect(() => {
 		if (open.environment) environmentMounted = true;
 	});
@@ -780,6 +795,21 @@
 			/>
 			<span>Project root on Python path</span>
 		</label>
+	{/if}
+{/snippet}
+
+{#snippet gitSection()}
+	<div class="flex items-center">
+		{@render header('git', 'Git', 'section-git')}
+		<!-- The refresh button is offered only while the panel is mounted: the section
+		     is unmounted when collapsed, so there is nothing to refresh (and no stale
+		     data to be refreshed) until it is open. -->
+		{#if open.git}
+			{@render refreshBtn(() => gitComp?.refresh(), 'Refresh git info')}
+		{/if}
+	</div>
+	{#if open.git}
+		<GitNotebooks bind:this={gitComp} notebooks={openNotebooks} {onFocusNotebook} {fsRefreshSignal} />
 	{/if}
 {/snippet}
 
@@ -1488,6 +1518,7 @@
 
 {#snippet sectionBody(key: string)}
 	{#if key === 'files'}{@render filesSection()}
+	{:else if key === 'git'}{@render gitSection()}
 	{:else if key === 'kernels'}{@render kernelsSection()}
 	{:else if key === 'databricks'}{@render databricksSection()}
 	{:else if key === 'environment'}{@render environmentSection()}

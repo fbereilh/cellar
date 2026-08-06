@@ -58,6 +58,25 @@ export interface FoldRegistryHandle {
 	expandAll: () => void;
 }
 
+/**
+ * One open notebook tab, as the shell knows it — the list the sidebar's Git
+ * section renders a row per.
+ *
+ * Derived from the shell's own tab set, never from the server's `docs` map: a
+ * document stays loaded server-side after its tab is closed (and the canonical
+ * notebook is materialized on SSR whether or not anyone opened it), so the docs
+ * map would list notebooks the user is not looking at.
+ */
+export interface NotebookRef {
+	/** Tab id — what a focus handler takes. */
+	id: string;
+	/** Workspace-relative notebook path — the id the APIs are keyed on. */
+	path: string;
+	name: string;
+	/** True for the notebook the sidebar currently reflects. */
+	active: boolean;
+}
+
 /** Imperative heading-numbering controls a notebook publishes to the sidebar Outline. */
 export interface NumberingRegistryHandle {
 	/** Turn the display-only auto-number for heading level (1-6) on or off. */

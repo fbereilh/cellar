@@ -7,6 +7,9 @@
  * `gitHeadFile()` hands out one file's content at HEAD, which the browser diffs
  * the live buffer against (see `src/lib/gitdiff.js`) — diffing client-side keeps
  * the markers live as you type without a `git` process per keystroke.
+ * `gitCommitAt()` answers for a DIRECTORY rather than a file: which commit that
+ * checkout is on, for the Git sidebar section — a notebook code root is normally
+ * a worktree, so its HEAD legitimately differs from the workspace's.
  *
  * Everything degrades gracefully when the workspace is not a git repository:
  * `isRepo:false`, never an error.
@@ -241,6 +244,13 @@ interface CacheEntry<T> {
 const headCache = new Map<string, CacheEntry<GitHeadFileResult>>();
 const blameFileCache = new Map<string, CacheEntry<GitBlameFileResult>>();
 const blameNbCache = new Map<string, CacheEntry<GitBlameNotebookResult>>();
+/**
+ * Per-DIRECTORY HEAD/dirty readings (`gitCommitAt`), keyed by absolute directory
+ * — one entry per notebook code root, not per file. Bounded in practice by how
+ * many roots a workspace has (a handful of worktrees), and each entry is a dozen
+ * short strings.
+ */
+const dirCommitCache = new Map<string, CacheEntry<GitDirCommit>>();
 let statusCache: CacheEntry<GitStatusResult> | null = null;
 let branchCache: CacheEntry<GitBranchResult> | null = null;
 
@@ -261,6 +271,11 @@ function fresh<T>(entry: CacheEntry<T> | null | undefined, sig: string, ttl = CA
  */
 export function invalidateGitStatusCache(): void {
 	statusCache = null;
+	// The per-directory readings carry a `dirty` bit derived from the same
+	// working-tree status, and a cellar-side write into a code root dirties it
+	// without touching that root's index — the identical blind spot, so it is
+	// dropped on the identical hook rather than left to the TTL.
+	dirCommitCache.clear();
 }
 
 /**
@@ -272,6 +287,7 @@ export function invalidateGitCaches(): void {
 	headCache.clear();
 	blameFileCache.clear();
 	blameNbCache.clear();
+	dirCommitCache.clear();
 	statusCache = null;
 	branchCache = null;
 }
@@ -300,6 +316,37 @@ export interface GitBranchResult {
 	branch: string | null;
 	/** True when HEAD is detached — the client renders the SHA in parentheses. */
 	detached: boolean;
+}
+
+/**
+ * What ONE directory's checkout is at — the answer the Git sidebar section shows
+ * per notebook, since a notebook code root is normally a git WORKTREE whose HEAD
+ * differs from the workspace's.
+ *
+ * `isRepo:false` (everything else null/false) is the honest degrade for a
+ * directory that is not inside a git work tree, one that no longer exists, or a
+ * machine with no `git` at all — never an error, exactly like every other reader
+ * here. A repo with no commits yet reports `isRepo:true` with a branch and a null
+ * commit, which is a different fact from "not a repo" and reads as such.
+ */
+export interface GitDirCommit {
+	isRepo: boolean;
+	/** Branch name, or null when HEAD is detached (or unresolvable). */
+	branch: string | null;
+	/** True when HEAD is detached — the client renders the SHA in its place. */
+	detached: boolean;
+	/** Abbreviated commit SHA, null before the first commit. */
+	shortSha: string | null;
+	/** Full commit SHA (the stable id; the short one is for display). */
+	commit: string | null;
+	/** First line of the commit message. */
+	subject: string | null;
+	/** Commit author. */
+	author: string | null;
+	/** Commit date, ms epoch (the COMMITTER date — what "when was this checkout's HEAD made" means). */
+	commitTime: number | null;
+	/** True when that checkout has uncommitted changes (tracked edits, staged work, or untracked files). */
+	dirty: boolean;
 }
 
 /** Result of `gitHeadFile()`: one file's content as of git HEAD. */
@@ -458,23 +505,120 @@ export async function gitStatus(): Promise<GitStatusResult> {
  * against the workspace index. This one takes a directory because a notebook code
  * root is normally a git WORKTREE inside the workspace (`git worktree add
  * roots/pr-482 <branch>`), i.e. a different checkout of the same repo — naming
- * which branch each root holds is the whole point of the review workflow. Not
- * cached: it is read only when a root list is requested, and a worktree's branch
- * legitimately moves under Cellar's feet.
+ * which branch each root holds is the whole point of the review workflow.
+ *
+ * A NARROWING of `gitCommitAt`, not a second reader of the directory: the picker
+ * renders one string whether HEAD is on a branch or detached, so the fallback to
+ * the short SHA is collapsed here while the fuller shape keeps the two apart. It
+ * therefore inherits that function's short-lived cache, which a worktree's branch
+ * moving under Cellar's feet still invalidates — a checkout rewrites the index,
+ * and the index mtime is the cache's signature.
  *
  * Returns null when the directory is not inside a git repository at all.
  */
 export async function gitRefAt(absDir: string): Promise<{ branch: string | null; commit: string | null } | null> {
-	// The two reads are independent, so they run CONCURRENTLY: a root list spawns
-	// this once per root on the process that also carries the kernel websockets and
-	// the SSE fan-out, and serializing them doubled that wall-clock for nothing.
-	const [sym, sha] = await Promise.all([
+	const at = await gitCommitAt(absDir);
+	if (!at.isRepo) return null;
+	return { branch: at.branch ?? at.shortSha, commit: at.shortSha };
+}
+
+/**
+ * The commit an ARBITRARY directory inside the workspace has checked out —
+ * branch, short/full SHA, subject, committer date, and whether that checkout is
+ * dirty.
+ *
+ * Directory-scoped rather than workspace-scoped because a notebook's CODE ROOT is
+ * normally a git worktree (`git worktree add roots/pr-482 <branch>`), i.e. a
+ * different checkout of the same repo at a different commit. Surfacing exactly
+ * that difference — "this notebook is running PR-482 @ abc1234, that one is on
+ * main" — is what the Git sidebar section exists for, so the whole shape is read
+ * for one directory in one place.
+ *
+ * THREE spawns, run CONCURRENTLY (they are independent, and this runs on the
+ * process that also carries the kernel websockets and the SSE fan-out): the
+ * branch, the commit metadata, and the dirty bit. They are collapsed by the cache
+ * below, so N notebooks sharing one root cost one probe, and a burst of requests
+ * within one window costs one too.
+ *
+ * The cache is keyed on the directory + its own git index mtime (a worktree has
+ * its OWN index under `.git/worktrees/<name>/`, so `preflight`'s `--absolute-git-dir`
+ * gives the right one) and expires on `STATUS_TTL_MS`, the tighter of the two
+ * backstops — the dirty bit answers to an UNSTAGED working edit, which touches
+ * neither the index nor anything else we key on, exactly the blind spot
+ * `gitStatus()` uses that TTL for.
+ */
+export async function gitCommitAt(absDir: string): Promise<GitDirCommit> {
+	const pre = await preflight(absDir);
+	if (!pre.inside) return notARepo();
+
+	const sig = cacheSig(null, pre.gitDir);
+	const hit = fresh(dirCommitCache.get(absDir), sig, STATUS_TTL_MS);
+	if (hit) return hit;
+
+	// NUL-separated so a subject containing any other character (including a tab)
+	// survives verbatim; `%cI`-style dates are avoided in favour of the raw epoch
+	// `%ct`, which needs no locale or timezone parsing on the way to the browser.
+	const [sym, log, status] = await Promise.all([
 		runGit(absDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']),
-		runGit(absDir, ['rev-parse', '--short', 'HEAD'])
+		runGit(absDir, ['log', '-1', '--no-color', '--format=%H%x00%h%x00%ct%x00%an%x00%s', 'HEAD']),
+		// One bit is all that is read, but git cannot short-circuit a status; this is
+		// the same cost class as the workspace `gitStatus()` that already runs on
+		// every focus, and the cache above is what keeps it to one per root.
+		runGit(absDir, ['status', '--porcelain=v1', '--untracked-files=normal', '-z'])
 	]);
-	if (sym == null && sha == null) return null;
-	const commit = sha?.trim() || null;
-	return { branch: sym?.trim() || commit, commit };
+
+	const value = buildDirCommit(sym, log, status);
+	dirCommitCache.set(absDir, { sig, at: Date.now(), value });
+	return value;
+}
+
+/** The honest "this directory is not a git checkout" answer. */
+function notARepo(): GitDirCommit {
+	return {
+		isRepo: false,
+		branch: null,
+		detached: false,
+		shortSha: null,
+		commit: null,
+		subject: null,
+		author: null,
+		commitTime: null,
+		dirty: false
+	};
+}
+
+/** Assemble one `GitDirCommit` from the three raw `git` outputs (null = that call failed). */
+function buildDirCommit(sym: string | null, log: string | null, status: string | null): GitDirCommit {
+	// EVERY call failed, so nothing observed this as a repo. The preflight says
+	// otherwise, but a positive preflight is memoized for the process lifetime by
+	// design — a root worktree removed (or replaced by a plain directory) since
+	// then would otherwise be reported as a repo with no branch, no commit and no
+	// changes, which is a claim nothing here verified. `status` is the reliable
+	// discriminator: a clean checkout answers with an EMPTY string, never null.
+	if (sym == null && log == null && status == null) return notARepo();
+	const branch = sym?.trim() || null;
+	// `log -1` fails on an unborn HEAD (a fresh `git init`, or a worktree whose
+	// branch has no commits): that is a repo with nothing checked out yet, not a
+	// missing repo, so the branch above still stands and the commit fields stay null.
+	const [commit, shortSha, ct, author, subject] = (log ?? '').replace(/\n$/, '').split('\0');
+	const commitTime = Number(ct) * 1000;
+	return {
+		// The preflight already proved this is inside a work tree; every field below
+		// is allowed to be absent without demoting that fact.
+		isRepo: true,
+		branch,
+		// Detached only when git really answered "no branch" AND there is a commit to
+		// name instead — an unborn HEAD is neither detached nor commit-bearing.
+		detached: !branch && !!commit,
+		shortSha: shortSha || null,
+		commit: commit || null,
+		subject: subject || null,
+		author: author || null,
+		commitTime: Number.isFinite(commitTime) && commitTime > 0 ? commitTime : null,
+		// A failed status is NOT reported as dirty: this drives a visual marker, and
+		// claiming uncommitted work that was never observed is the wrong direction.
+		dirty: !!status && status.length > 0
+	};
 }
 
 /**

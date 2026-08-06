@@ -28,7 +28,8 @@
 		FoldRegistryHandle,
 		NumberingRegistryHandle,
 		NotebookApiHandle,
-		FileTabApiHandle
+		FileTabApiHandle,
+		NotebookRef
 	} from '$lib/types';
 	import type { SearchCache } from '$lib/search';
 	import type { SearchHighlightState } from '$lib/searchHighlight';
@@ -452,6 +453,25 @@
 		blameByPath = { ...blameByPath, [path]: record };
 	}
 	const activeBlame = $derived(activeBlameFor(activeFilePath, activeNotebookPath, blameByPath));
+
+	// Every OPEN notebook tab, in tab order — the sidebar's Git section renders one
+	// row per entry (which commit that notebook's code root is checked out at).
+	// Read from the shell's own tab set, the single source of truth for "what is
+	// open": the server's `docs` map keeps a document loaded after its tab closes
+	// and materializes the canonical notebook on SSR, so it would list notebooks
+	// the user is not looking at. Deliberately not `kernelCards` either — that set
+	// answers a different question (which kernels exist), so it drops an open
+	// notebook that has never run and keeps a closed tab whose kernel is alive.
+	const openNotebooks = $derived.by<NotebookRef[]>(() =>
+		tabs
+			.filter((t) => t.kind === 'notebook' || t.kind === 'ipynb')
+			.map((t) => ({
+				id: t.id,
+				path: t.path,
+				name: t.title || t.path,
+				active: t.path === activeNotebookPath
+			}))
+	);
 
 	// One card per notebook's kernel in the Kernels sidebar. Cellar runs one kernel
 	// PER notebook (lazy, started on that notebook's first run). The card set is:
@@ -1536,6 +1556,7 @@
 					{mcp}
 					kernelInfo={displayKernel}
 					{kernelCards}
+					{openNotebooks}
 					{maxKernels}
 					{variables}
 					{varsLoading}

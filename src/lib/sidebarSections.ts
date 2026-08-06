@@ -10,6 +10,10 @@
 /** Section keys in the order they ship. `sectionBody` in Sidebar.svelte renders exactly these. */
 export const DEFAULT_SECTION_ORDER: readonly string[] = Object.freeze([
 	'files',
+	// Directly under Files, where VS Code puts Source Control — and because what it
+	// reports (which commit each notebook's code root is on) reads as a property of
+	// the tree above it.
+	'git',
 	'kernels',
 	'databricks',
 	'environment',
