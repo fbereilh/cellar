@@ -2081,9 +2081,23 @@
 	 */
 	let confirmedExportTarget: string | null = null;
 	/**
+	 * What became of a target write. Four OUTCOMES, not a boolean: a single flag
+	 * conflated three of them and each conflation surfaced as its own defect -
+	 * an unreachable server read as success (the field kept a value the server
+	 * never stored, and the export then reported success against the OLD target),
+	 * while a merely SUPERSEDED write read as a refusal and turned the export
+	 * button into a dead control that issued no request and said nothing.
+	 *
+	 * - `committed`   the server stored it (the only outcome that advances the baseline)
+	 * - `refused`     the server REJECTED the path; reverted + explained
+	 * - `unreachable` the request never landed a verdict; reverted + explained
+	 * - `superseded`  the field moved on, so a newer value owns it: touch nothing
+	 */
+	type TargetCommit = 'committed' | 'refused' | 'unreachable' | 'superseded';
+	/**
 	 * The IN-FLIGHT target write, so the manual export can wait for it to land -
-	 * and learn whether it was REFUSED (`false`), since pressing Export blurs the
-	 * input and therefore commits the edit first.
+	 * and learn its outcome, since pressing Export blurs the input and therefore
+	 * commits the edit first.
 	 *
 	 * It is dropped the moment it SETTLES, because that is what makes the abort in
 	 * `exportPy` belong to the blur-then-click interaction and nothing else: a
@@ -2091,11 +2105,12 @@
 	 * one that would have run fine against the confirmed target - and produced no
 	 * message at all, since the export never issued a request to report on.
 	 */
-	let exportTargetCommit: Promise<boolean> | null = null;
+	let exportTargetCommit: Promise<TargetCommit> | null = null;
 
 	/**
 	 * Set (or clear) the notebook's `.py` export target. Optimistic + persisted, and
-	 * REVERTED when the server refuses.
+	 * REVERTED (with the reason said out loud) whenever the write did not land - a
+	 * server refusal, or a server that could not be reached at all.
 	 *
 	 * The route refuses a `.py` text notebook (which stores no cellar metadata), a
 	 * target escaping the workspace and one that is not a `.py` module, and it emits
@@ -2129,7 +2144,7 @@
 		commit.then(drop, drop);
 	}
 
-	async function commitExportTarget(raw: string, next: string | null): Promise<boolean> {
+	async function commitExportTarget(raw: string, next: string | null): Promise<TargetCommit> {
 		const res = await fetch('/api/notebooks/export-py', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
@@ -2137,17 +2152,26 @@
 		}).catch(() => null);
 		if (res?.ok) {
 			confirmedExportTarget = next;
-			return true;
+			return 'committed';
 		}
-		if (!res) return true; // a network failure is not a refusal - nothing to revert to
-		if (exportTarget !== next) return false; // the field moved on; a newer commit owns it
+		// Checked before either revert: the field moved on (an agent's or another tab's
+		// `notebook:export-target`, or a refetch), so a newer value owns it and yanking
+		// it back to our baseline would discard state this write knows nothing about.
+		if (exportTarget !== next) return 'superseded';
 		exportTarget = confirmedExportTarget;
+		if (!res) {
+			// An unreachable server is NOT a success: leaving the typed path in the field
+			// showed a target the server may never have stored, and the export then ran on
+			// to report "Exported N cells -> <old target>" over it.
+			onNotice?.('Export target not saved: the server could not be reached.');
+			return 'unreachable';
+		}
 		const message = await res
 			.json()
 			.then((body) => body?.message)
 			.catch(() => null);
 		onNotice?.(`Export target not set${message ? `: ${message}` : '.'}`);
-		return false;
+		return 'refused';
 	}
 
 	/**
@@ -2175,25 +2199,29 @@
 	 * An in-flight target write is AWAITED first, so the export runs against the path
 	 * the field is showing rather than the previous one: pressing the button blurs the
 	 * input, which commits the edit, but that POST would otherwise still be on the
-	 * wire. A commit the server REFUSED ABORTS the export, because that path was never
-	 * stored: exporting on would run against the previous (or absent) target and its
-	 * generic outcome would REPLACE the refusal's own reason on the single notice
-	 * channel - telling the user to set a target they just tried to set. The refusal
-	 * already explained itself, so nothing more is said here. That abort is scoped to a
-	 * commit still IN FLIGHT (an already-settled one drops itself), so a refusal the
-	 * user has since moved on from can never silently abort a later export. A failure carries the server's
-	 * own reason - the refusals this path can hit ("it is not a Cellar-generated
-	 * module", a non-`.py` or escaping target) exist for their actionable message, and
-	 * a generic "Export failed." names no cause - reported through the same transient
-	 * notice channel as every other refused write here.
+	 * wire. A commit that did NOT land - `refused` or `unreachable` - ABORTS the
+	 * export, because that path was never (verifiably) stored: exporting on would run
+	 * against the previous (or absent) target and its outcome would REPLACE that
+	 * commit's own reason on the single notice channel - telling the user to set a
+	 * target they just tried to set, or reporting a success against a path the field
+	 * does not show. Each of those outcomes already explained itself, so nothing more
+	 * is said here. A `superseded` commit is NOT an abort: nothing was refused, the
+	 * field simply moved on, and aborting made the button a dead control that issued
+	 * no request and rendered no message. That abort is scoped to a commit still IN
+	 * FLIGHT (an already-settled one drops itself), so a refusal the user has since
+	 * moved on from can never silently abort a later export. A failure carries the
+	 * server's own reason - the refusals this path can hit ("it is not a
+	 * Cellar-generated module", a non-`.py` or escaping target) exist for their
+	 * actionable message, and a generic "Export failed." names no cause - reported
+	 * through the same transient notice channel as every other refused write here.
 	 */
 	async function exportPy() {
 		// Consumed, so one refusal cannot abort two exports (the field has been reverted
 		// to the confirmed value, so a second click is a fresh request).
 		const pending = exportTargetCommit;
 		exportTargetCommit = null;
-		const targetCommitted = (await pending?.catch(() => true)) ?? true;
-		if (!targetCommitted) return null;
+		const outcome = pending ? await pending.catch(() => null) : null;
+		if (outcome === 'refused' || outcome === 'unreachable') return null;
 		try {
 			const res = await fetch('/api/notebooks/export-py', {
 				method: 'POST',

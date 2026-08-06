@@ -257,6 +257,29 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(fn).toMatch(/exportTarget !== next/);
 	});
 
+	it('treats an unreachable server as NOT committed, and a superseded write as neither', () => {
+		const commitFn = src.slice(
+			src.indexOf('async function commitExportTarget'),
+			src.indexOf('async function setNumberingLevel')
+		);
+		// The regression: `if (!res) return true` reported a request that never landed a
+		// verdict as a success, so the field kept a path the server may never have stored
+		// while `confirmedExportTarget` still held the old one - and the export then ran
+		// on to report a success against THAT old target.
+		expect(commitFn).not.toMatch(/if \(!res\) return true/);
+		expect(commitFn).toMatch(/return 'unreachable';/);
+		expect(commitFn).toMatch(/could not be reached/);
+		// Four outcomes, not a boolean: the baseline advances on exactly one of them.
+		expect(commitFn).toMatch(/Promise<TargetCommit>/);
+		expect(commitFn).toMatch(/return 'committed';/);
+		expect(commitFn).toMatch(/return 'refused';/);
+		// The field moving on is neither a refusal nor a failure - touch nothing - and it
+		// is decided BEFORE either revert.
+		expect(commitFn.indexOf("return 'superseded';")).toBeLessThan(
+			commitFn.indexOf('exportTarget = confirmedExportTarget')
+		);
+	});
+
 	it('commits ONCE PER EDIT, and reverts to the SERVER-confirmed value', () => {
 		// The input's DOM value is state-driven, so writing per keystroke made every
 		// character of a refused path 400, revert the field and move the caret - and the
@@ -282,11 +305,14 @@ describe('the client half of that refusal (source guard)', () => {
 		// the previous one while the field visibly showed the new.
 		const exportFn = src.slice(src.indexOf('async function exportPy'), src.indexOf('UNDO_LIMIT'));
 		expect(exportFn).toMatch(/const pending = exportTargetCommit;/);
-		expect(exportFn).toMatch(/await pending\?\./);
-		// A REFUSED commit aborts: that path was never stored, so exporting on would run
-		// against the previous/absent target and its generic outcome would REPLACE the
-		// refusal's own reason on the single nonce-keyed notice channel.
-		expect(exportFn).toMatch(/if \(!targetCommitted\) return null;/);
+		expect(exportFn).toMatch(/await pending\.catch/);
+		// A commit that did NOT land aborts: that path was never (verifiably) stored, so
+		// exporting on would run against the previous/absent target and its outcome would
+		// REPLACE that commit's own reason on the single nonce-keyed notice channel.
+		expect(exportFn).toMatch(/if \(outcome === 'refused' \|\| outcome === 'unreachable'\) return null;/);
+		// A merely SUPERSEDED commit is not an abort - nothing was refused, so aborting
+		// made the button a dead control that issued no request and said nothing.
+		expect(exportFn).not.toMatch(/'superseded'/);
 		// The promise is consumed, so one refusal cannot mute every later export.
 		expect(exportFn).toMatch(/exportTargetCommit = null;/);
 		// And it DROPS ITSELF once it settles, so the abort belongs to the
@@ -297,8 +323,8 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(fn).toMatch(/if \(exportTargetCommit === commit\) exportTargetCommit = null;/);
 		// The commit reports refusal rather than swallowing it.
 		const commitFn = src.slice(src.indexOf('async function commitExportTarget'), src.indexOf('async function setNumberingLevel'));
-		expect(commitFn).toMatch(/Promise<boolean>/);
-		expect(commitFn).toMatch(/return false;/);
+		expect(commitFn).toMatch(/Promise<TargetCommit>/);
+		expect(commitFn).toMatch(/return 'refused';/);
 		// And the manual export reports the SERVER's reason (the clobber / non-.py
 		// refusals exist for their message; "Export failed." names no cause).
 		expect(exportFn).toMatch(/onNotice\?\./);
