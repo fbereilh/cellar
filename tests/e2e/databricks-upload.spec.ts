@@ -51,6 +51,7 @@ import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
+let settingsDir = '';
 let baseURL = '';
 
 const HOST = 'https://dbc-demo.cloud.databricks.com';
@@ -167,7 +168,14 @@ test.beforeAll(async () => {
 			cells: [{ cell_type: 'code', id: 'other-0', metadata: {}, execution_count: null, outputs: [], source: ['1\n'] }]
 		})
 	);
-	const booted = await bootCellar(workspace);
+	// The affix fields SEED from the cross-project default (`~/.cellar/settings.json`),
+	// so without redirecting that store this file would read whatever the person
+	// running the suite has set - and every assertion here that a field is empty, or
+	// holds exactly what a chip inserted, would fail on their machine and nowhere else.
+	settingsDir = mkdtempSync(join(tmpdir(), 'cellar-e2e-dbx-upload-home-'));
+	const booted = await bootCellar(workspace, {
+		CELLAR_USER_SETTINGS: join(settingsDir, 'settings.json')
+	});
 	launcher = booted.proc;
 	baseURL = booted.url;
 });
@@ -175,11 +183,13 @@ test.beforeAll(async () => {
 test.afterAll(async () => {
 	if (launcher) killCellar(launcher);
 	launcher = null;
-	if (workspace && existsSync(workspace)) {
-		try {
-			rmSync(workspace, { recursive: true, force: true });
-		} catch {
-			/* best effort */
+	for (const dir of [workspace, settingsDir]) {
+		if (dir && existsSync(dir)) {
+			try {
+				rmSync(dir, { recursive: true, force: true });
+			} catch {
+				/* best effort */
+			}
 		}
 	}
 });

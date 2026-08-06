@@ -50,7 +50,26 @@ export function setUserSetting(key: string, value: unknown): void {
 	if (value === null) delete cache[key];
 	else cache[key] = value;
 	pending[key] = value;
+	for (const fn of listeners) fn();
 	scheduleFlush();
+}
+
+const listeners = new Set<() => void>();
+
+/**
+ * Run `fn` whenever a setting changes; returns the unsubscribe.
+ *
+ * A DEFAULT is read by long-lived surfaces (the Databricks panel is mounted lazily
+ * and then kept mounted for the session), so a one-shot read latches whatever the
+ * store held when they happened to mount - which is how a default set in Settings
+ * came to reach the sidebar only after a reload. The notification is what lets a
+ * reader stay a reader; it is deliberately a bare "something changed" rather than a
+ * key/value, so the subscriber re-derives through its own precedence rule instead
+ * of learning a second, drifting copy of it.
+ */
+export function onUserSettingsChange(fn: () => void): () => void {
+	listeners.add(fn);
+	return () => listeners.delete(fn);
 }
 
 function scheduleFlush(): void {

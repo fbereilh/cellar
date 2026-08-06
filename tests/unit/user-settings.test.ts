@@ -115,6 +115,44 @@ describe('the cross-project user-setting store', () => {
 		}).not.toThrow();
 	});
 
+	it('picks up a write by ANOTHER instance - the store is global, so it is shared', () => {
+		// Cellar runs an instance per repo, and this store is one file under `~/.cellar/`
+		// that all of them read. A cache that only ever loaded once made a default set in
+		// one instance invisible to every instance already running, permanently - which is
+		// the whole feature failing in exactly the multi-project case it exists for. So
+		// what another writer put on disk is picked up on the next read, with no reset.
+		writeFileSync(file, JSON.stringify({ [UPLOAD_PREFIX_DEFAULT_KEY]: 'at_boot_' }));
+		__resetUserSettingsCache();
+		expect(getUserSettings()[UPLOAD_PREFIX_DEFAULT_KEY]).toBe('at_boot_'); // now cached
+		// Another instance sets the default. No reset here, deliberately: this instance is
+		// still running, and "restart it" was the only way to see the change before.
+		writeFileSync(file, JSON.stringify({ [UPLOAD_PREFIX_DEFAULT_KEY]: 'from_the_other_one_' }));
+		expect(getUserSettings()[UPLOAD_PREFIX_DEFAULT_KEY]).toBe('from_the_other_one_');
+	});
+
+	it('our OWN pending change always wins over the file - it is the newer of the two', () => {
+		// The write is debounced, so between setting a preference and it reaching disk the
+		// cache is newer by definition. Re-reading there would revert what the user just
+		// did, which is worse than the staleness the re-read exists to fix.
+		writeFileSync(file, JSON.stringify({ k: 'on-disk' }));
+		__resetUserSettingsCache();
+		setUserSettings({ k: 'just-set' });
+		writeFileSync(file, JSON.stringify({ k: 'changed-underneath' }));
+		expect(getUserSettings().k).toBe('just-set');
+	});
+
+	it('a re-read that fails KEEPS the cache, rather than emptying it', () => {
+		// A first load has nothing to keep, so a corrupt file is an empty store (above).
+		// A RE-read is different: the likeliest way parsing fails on a file we already
+		// read is catching another process mid-write, and wiping good settings over a
+		// half-written byte range would then persist the wipe on the next change.
+		setUserSettings({ k: 'good' });
+		__resetUserSettingsCache();
+		expect(getUserSettings().k).toBe('good');
+		writeFileSync(file, '{"k": "half-writ');
+		expect(getUserSettings().k).toBe('good');
+	});
+
 	it('keys are shared with the browser, never re-spelled here', () => {
 		// Both writers are browser modules that cannot import this one, so the constants
 		// live in `$lib/uploadDefaults` and are re-exported. A second spelling would not

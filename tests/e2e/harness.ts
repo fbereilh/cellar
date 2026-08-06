@@ -31,6 +31,15 @@ export function runtimeAvailable(): boolean {
  * being the case it was added for: that store defaults to a real file in the home
  * directory, so a spec touching it without redirecting it first would be rewriting
  * the settings of whoever ran the suite.
+ *
+ * Which is why redirecting it is the DEFAULT here rather than each spec's job: every
+ * booted app READS that store on its first SSR load (the upload-affix default is
+ * hydrated from it), so "only the specs that write it need to opt in" is already
+ * wrong - and a spec that does write it is exactly the one whose author is least
+ * likely to notice. Unless `env` names its own, the store is redirected into the
+ * throwaway workspace, so it dies with it. A spec that needs two launchers to SHARE
+ * one global store passes the same path to both, which is the one case the default
+ * cannot serve.
  */
 export function bootCellar(
 	ws: string,
@@ -51,7 +60,13 @@ export function bootCellar(
 		[join(REPO, 'bin', 'cellar.js'), '-w', ws, '--new', '--no-mcp-config', '-y'],
 		{
 			cwd: REPO,
-			env: { ...process.env, PATH: `${shim}:${process.env.PATH}`, CI: '1', ...env },
+			env: {
+				...process.env,
+				PATH: `${shim}:${process.env.PATH}`,
+				CI: '1',
+				CELLAR_USER_SETTINGS: join(ws, '.cellar-user-settings.json'),
+				...env
+			},
 			stdio: ['ignore', 'pipe', 'pipe'],
 			detached: true
 		}

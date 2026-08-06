@@ -118,6 +118,26 @@ export function unknownDateTokens(text: string, now: Date = new Date()): string[
 	return [...seen];
 }
 
+/**
+ * The same, over a prefix/postfix PAIR - what every surface that warns actually has.
+ *
+ * Each affix is scanned SEPARATELY and the results merged (deduped, in order),
+ * because the name is `prefix + stem + postfix`: a braced run can never span the
+ * two fields, so there is nothing a concatenated scan could see that is real.
+ * What it CAN see is a run present in neither - `a{` and `}b` concatenate into a
+ * `{}` that gets warned about, and `{FOO` plus `BAR}` into a `{FOOBAR}` the user
+ * never wrote - so the warning would name a token nothing on screen contains.
+ * Merging is what keeps that impossible, which is why it lives here rather than at
+ * the two call sites that would each have to get it right.
+ */
+export function unknownAffixTokens(affixes: UploadNameAffixes, now: Date = new Date()): string[] {
+	const seen = new Set<string>();
+	for (const text of [affixes.prefix ?? '', affixes.postfix ?? '']) {
+		for (const run of unknownDateTokens(text, now)) seen.add(run);
+	}
+	return [...seen];
+}
+
 /** An affix with a token inserted, and where the caret belongs afterwards. */
 export interface TokenInsertion {
 	value: string;

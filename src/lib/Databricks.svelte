@@ -18,7 +18,7 @@
 	import { onMount } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
 	import { getUi, setUi, setUiNow } from '$lib/uiState';
-	import { getUserSetting } from '$lib/userSettings';
+	import { getUserSetting, onUserSettingsChange } from '$lib/userSettings';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import { normalizeDatabricksHost } from '$lib/databricksHost';
 	import {
@@ -34,7 +34,7 @@
 		expandDateTokens,
 		insertUploadToken,
 		resolveUploadName,
-		unknownDateTokens
+		unknownAffixTokens
 	} from '$lib/databricksUploadName';
 	import type { SessionId } from '$lib/server/types';
 
@@ -262,11 +262,9 @@
 		runtimeOn = getUi<unknown>(DBX_RUNTIME_KEY, false) === true;
 		runtimeVersion = getUi<string>(DBX_RUNTIME_VERSION_KEY, DBX_RUNTIME_VERSION_DEFAULT);
 		appliedVersion = runtimeVersion;
-		// The upload affixes: someone who uploads regularly should not have to retype a
-		// naming pattern every session. The store is untyped JSON, so anything that is
-		// not a string reads as "no affix" rather than being interpolated into a name.
-		uploadPrefix = storedAffix(DBX_UPLOAD_PREFIX_KEY, UPLOAD_PREFIX_DEFAULT_KEY);
-		uploadPostfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY, UPLOAD_POSTFIX_DEFAULT_KEY);
+		// The upload affixes are seeded by their own effect (`seedUploadAffixes`), not
+		// here: a one-shot mount read is exactly what left a default set in Settings
+		// invisible to a panel that was already open.
 	});
 
 	/**
@@ -1015,6 +1013,37 @@
 		return typeof fallback === 'string' ? fallback : '';
 	}
 	/**
+	 * Re-read both affixes from the stores.
+	 *
+	 * Deliberately RE-readable rather than a one-shot mount seed: this panel is
+	 * mounted lazily and then kept mounted for the session, so a default set in
+	 * Settings afterwards reached it only on a reload - the field sat empty while the
+	 * Settings copy promised it applied to every project that had not set its own.
+	 *
+	 * Safe to run at any time precisely BECAUSE of the direction: a project with an
+	 * answer of its own always wins, and every keystroke writes that answer through
+	 * `setUi` (which updates the client cache synchronously), so a re-read while the
+	 * user is typing returns exactly what they typed and can never clobber it.
+	 */
+	function seedUploadAffixes() {
+		uploadPrefix = storedAffix(DBX_UPLOAD_PREFIX_KEY, UPLOAD_PREFIX_DEFAULT_KEY);
+		uploadPostfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY, UPLOAD_POSTFIX_DEFAULT_KEY);
+	}
+	$effect(() => {
+		// The SUBSCRIPTION is the case that matters: the Settings modal sits OVER an
+		// expanded sidebar, so nothing about this panel changes while the default is
+		// being edited, and without a change signal it would still catch up only on a
+		// reload - which is exactly what the reported gap was.
+		seedUploadAffixes();
+		return onUserSettingsChange(seedUploadAffixes);
+	});
+	$effect(() => {
+		// Reopening the section is the other moment worth catching up on: the panel
+		// stays mounted while it is folded away, so this is the closest thing it has to
+		// being opened afresh.
+		if (visible) seedUploadAffixes();
+	});
+	/**
 	 * The affixes the ARMED replace confirm was resolved with, pinned at the moment
 	 * it armed. Replace re-sends these rather than re-resolving, for the same reason
 	 * `uploadSeq` exists: the box names one workspace path, and a `{YYYY-MM-DD}`
@@ -1102,7 +1131,7 @@
 	 * is the reason nothing can be sent.
 	 */
 	const uploadUnknownTokens = $derived(
-		uploadNameError ? [] : unknownDateTokens(`${uploadPrefix}${uploadPostfix}`, uploadNow)
+		uploadNameError ? [] : unknownAffixTokens({ prefix: uploadPrefix, postfix: uploadPostfix }, uploadNow)
 	);
 	const uploadTokenWarning = $derived(
 		uploadUnknownTokens.length === 0

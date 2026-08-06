@@ -11,7 +11,7 @@
 		expandDateTokens,
 		insertUploadToken,
 		resolveUploadName,
-		unknownDateTokens
+		unknownAffixTokens
 	} from '$lib/databricksUploadName';
 
 	interface Props {
@@ -124,7 +124,10 @@
 	const defaultsUnknown = $derived(
 		defaultsError
 			? []
-			: unknownDateTokens(`${uploadPrefixDefault}${uploadPostfixDefault}`, defaultsNow)
+			: unknownAffixTokens(
+					{ prefix: uploadPrefixDefault, postfix: uploadPostfixDefault },
+					defaultsNow
+				)
 	);
 	const defaultsWarning = $derived(
 		defaultsUnknown.length === 0

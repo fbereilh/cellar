@@ -13,33 +13,52 @@ import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
  * per repo, so the default lives in the global `~/.cellar/` store - and the rule
  * that makes that safe is a DIRECTION: a project with an affix of its own always
  * wins, and the default only fills in for a project that has never been asked.
- * Getting that backwards would silently rewrite naming a user set deliberately, so
- * this pins both halves against the real store, over two workspaces:
+ * Getting that backwards would silently rewrite naming a user set deliberately.
  *
- *   - a FRESH project seeds from the default (and uploads under it);
- *   - a project that already has its own keeps it when the default changes;
+ * **Two launchers, two workspaces, one global store.** Cross-project apply is the
+ * entire point of the feature, so it is exercised across two REAL projects rather
+ * than asserted about one: `A` is opened, given an affix of its own and used to set
+ * the default; `B` is a different workspace served by a different launcher on a
+ * different port, and never asked anything. Both are pointed at the same
+ * `CELLAR_USER_SETTINGS` file, which is what makes them one user with two projects.
+ * (That file also has to be redirected at all: it defaults to a real file in the
+ * home directory, so a spec touching it would rewrite the settings of whoever ran
+ * the suite.)
+ *
+ * What is pinned:
+ *
+ *   - the default set in A reaches B - a project that has never been asked seeds
+ *     from it and uploads under it - while A keeps its own affix untouched;
+ *   - a default changed while a Databricks panel is ALREADY OPEN reaches it with no
+ *     reload (the panel is mounted lazily and then kept mounted for the session, so
+ *     a one-shot read left the Settings copy promising something it did not do);
  *   - clearing a project's field is an ANSWER ("no prefix here"), so the default
  *     does not creep back on the next load;
- *   - the default survives a RELAUNCH on a new port, which is the whole reason it
- *     is not `localStorage`;
- *   - it takes the same tokens (`{YYYYMM}` and friends) and the same
- *     not-a-token warning as the sidebar's own fields.
+ *   - the default is a FILE, not per-origin state, which is the whole reason it is
+ *     not `localStorage`;
+ *   - it takes the same tokens (`{YYYYMM}` and friends) and the same not-a-token
+ *     warning as the sidebar's own fields.
  *
- * `CELLAR_USER_SETTINGS` redirects that global store into a temp file: it defaults
- * to a real file in the home directory, so without it this spec would rewrite the
- * settings of whoever ran the suite.
+ * Deliberately NOT claimed: that a default written by one running instance reaches
+ * another that has ALREADY read the store. Each app process caches the file on its
+ * first read, so B picking A's default up is a first-read-from-disk (which is what
+ * the ordering below arranges); two instances open side by side reconcile on the
+ * next launch, not live.
  */
 
-let launcher: ChildProcess | null = null;
-/** `fresh` has never had an affix; `owned` sets one of its own. */
-let fresh = '';
-let owned = '';
+let launcherA: ChildProcess | null = null;
+let launcherB: ChildProcess | null = null;
+/** `projectA` sets an affix of its own; `projectB` is never asked. */
+let projectA = '';
+let projectB = '';
 let settingsFile = '';
 let settingsDir = '';
-let baseURL = '';
+let urlA = '';
+let urlB = '';
 
 const HOST = 'https://dbc-demo.cloud.databricks.com';
 const USER = 'me@corp.example.com';
+const PREFIX_DEFAULT_KEY = 'cellar-databricks-upload-prefix-default';
 
 function connectedStatus() {
 	return {
@@ -85,8 +104,16 @@ async function mockDatabricks(page: Page): Promise<Record<string, unknown>[]> {
 	return seen;
 }
 
-async function openWorkspace(page: Page, ws: string): Promise<void> {
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(ws)}`);
+/**
+ * Open one of the two instances.
+ *
+ * The workspace is fixed by that launcher's own `-w`, so WHICH project this is, is
+ * decided by which URL is passed - there is deliberately no `?ws=` query parameter,
+ * which the app does not read (`workspaceRoot()` is `CELLAR_WORKSPACE || cwd`) and
+ * which would have read as if a single instance could be pointed at either project.
+ */
+async function openProject(page: Page, url: string): Promise<void> {
+	await page.goto(url);
 	const openBtn = page.getByTestId('empty-open-notebook');
 	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
@@ -110,7 +137,7 @@ async function closeSettings(page: Page): Promise<void> {
 	await expect(page.getByTestId('settings-modal')).toHaveCount(0);
 }
 
-/** The global store as it is ON DISK - what a relaunch would actually read back. */
+/** The global store as it is ON DISK - what another instance would read back. */
 function storedDefaults(): Record<string, unknown> {
 	try {
 		return JSON.parse(readFileSync(settingsFile, 'utf8'));
@@ -128,19 +155,28 @@ function localToday() {
 
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available — E2E is local-only');
-	fresh = mkdtempSync(join(tmpdir(), 'cellar-e2e-defaults-fresh-'));
-	owned = mkdtempSync(join(tmpdir(), 'cellar-e2e-defaults-owned-'));
+	projectA = mkdtempSync(join(tmpdir(), 'cellar-e2e-defaults-a-'));
+	projectB = mkdtempSync(join(tmpdir(), 'cellar-e2e-defaults-b-'));
 	settingsDir = mkdtempSync(join(tmpdir(), 'cellar-e2e-defaults-home-'));
 	settingsFile = join(settingsDir, 'settings.json');
-	const booted = await bootCellar(fresh, { CELLAR_USER_SETTINGS: settingsFile });
-	launcher = booted.proc;
-	baseURL = booted.url;
+	// The SAME global store for both: one user, two projects. Booting alone reads
+	// nothing - each app loads the file on its first SSR page load, which is what lets
+	// the ordering below have A write it before B ever looks.
+	const [a, b] = await Promise.all([
+		bootCellar(projectA, { CELLAR_USER_SETTINGS: settingsFile }),
+		bootCellar(projectB, { CELLAR_USER_SETTINGS: settingsFile })
+	]);
+	launcherA = a.proc;
+	urlA = a.url;
+	launcherB = b.proc;
+	urlB = b.url;
 });
 
 test.afterAll(async () => {
-	if (launcher) killCellar(launcher);
-	launcher = null;
-	for (const d of [fresh, owned, settingsDir]) {
+	for (const proc of [launcherA, launcherB]) if (proc) killCellar(proc);
+	launcherA = null;
+	launcherB = null;
+	for (const d of [projectA, projectB, settingsDir]) {
 		if (d && existsSync(d)) {
 			try {
 				rmSync(d, { recursive: true, force: true });
@@ -151,10 +187,16 @@ test.afterAll(async () => {
 	}
 });
 
-test('a default set in Settings seeds a project that has none - and uploads under it', async ({ page }) => {
-	const seen = await mockDatabricks(page);
-	await openWorkspace(page, fresh);
+test('project A sets its own affix, then a default - and keeps its own', async ({ page }) => {
+	await mockDatabricks(page);
+	await openProject(page, urlA);
+	await openDatabricksSection(page);
 
+	// This project answers for itself.
+	await page.getByTestId('databricks-upload-prefix').fill('team_');
+	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('team_notebook');
+
+	// The user then sets a cross-project default that says something quite different.
 	await openSettings(page);
 	// The token buttons are here too: this is where the pattern is authored, so it is
 	// where the vocabulary is worth the most.
@@ -165,15 +207,30 @@ test('a default set in Settings seeds a project that has none - and uploads unde
 	const { yyyymm } = localToday();
 	await expect(page.getByTestId('settings-upload-preview')).toHaveText(`${yyyymm}_notebook`);
 	// It is the PATTERN that persists, not today's resolved date.
-	await expect
-		.poll(() => storedDefaults()['cellar-databricks-upload-prefix-default'])
-		.toBe('{YYYYMM}_');
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('{YYYYMM}_');
 	await closeSettings(page);
 
-	// A project that has never set an affix inherits it - visibly, in the field.
+	// A is UNTOUCHED by it - a default that overrode would silently rewrite naming the
+	// user set deliberately, project by project.
 	await page.reload();
-	await openWorkspace(page, fresh);
+	await openProject(page, urlA);
 	await openDatabricksSection(page);
+	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('team_');
+	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('team_notebook');
+});
+
+test('project B - a different workspace, never asked - inherits it, and uploads under it', async ({
+	page
+}) => {
+	// The cross-project half, and the whole reason the default exists: B is a separate
+	// project served by a separate launcher on a separate port, which has never had an
+	// affix of its own. It has also never read the global store until now, so this is a
+	// genuine first read of the file A wrote.
+	const seen = await mockDatabricks(page);
+	await openProject(page, urlB);
+	await openDatabricksSection(page);
+
+	const { yyyymm } = localToday();
 	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('{YYYYMM}_');
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText(`${yyyymm}_notebook`);
 
@@ -183,35 +240,33 @@ test('a default set in Settings seeds a project that has none - and uploads unde
 	expect(seen[0].prefix).toBe(`${yyyymm}_`);
 });
 
-test('a project that set its OWN affix keeps it when the default changes', async ({ page }) => {
+test('a default changed with the panel ALREADY OPEN reaches it - no reload', async ({ page }) => {
+	// The Databricks section mounts lazily and is then kept mounted for the session, so
+	// a one-shot read at mount left a default set afterwards invisible until a reload -
+	// while the Settings copy promised it applied to every project without one of its
+	// own. This is the ordinary flow: the panel is open, and Settings is opened over it.
 	await mockDatabricks(page);
-	await openWorkspace(page, owned);
+	await openProject(page, urlB);
 	await openDatabricksSection(page);
+	const prefixField = page.getByTestId('databricks-upload-prefix');
+	await expect(prefixField).toHaveValue('{YYYYMM}_');
 
-	// This project answers for itself.
-	await page.getByTestId('databricks-upload-prefix').fill('team_');
-	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('team_notebook');
-
-	// The user then changes the global default to something quite different.
 	await openSettings(page);
 	await page.getByTestId('settings-upload-prefix').fill('GLOBAL_');
-	await expect
-		.poll(() => storedDefaults()['cellar-databricks-upload-prefix-default'])
-		.toBe('GLOBAL_');
 	await closeSettings(page);
 
-	// The project is UNTOUCHED - a default that overrode would silently rewrite naming
-	// the user set deliberately, project by project.
-	await page.reload();
-	await openWorkspace(page, owned);
-	await openDatabricksSection(page);
-	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('team_');
-	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('team_notebook');
+	// No `page.reload()` here, deliberately: reloading is what hid this.
+	await expect(prefixField).toHaveValue('GLOBAL_');
+	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('GLOBAL_notebook');
+	// The browser's write is debounced, so ending the test here would tear the context
+	// down with the PUT still queued - and what the tests after this one read is the
+	// FILE, not this page.
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
 });
 
 test('CLEARING a project field is an answer, so the default does not creep back', async ({ page }) => {
 	await mockDatabricks(page);
-	await openWorkspace(page, owned);
+	await openProject(page, urlB);
 	await openDatabricksSection(page);
 
 	// "No prefix on this project" - said by emptying the field, the only way to say it.
@@ -219,7 +274,7 @@ test('CLEARING a project field is an answer, so the default does not creep back'
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('notebook');
 
 	await page.reload();
-	await openWorkspace(page, owned);
+	await openProject(page, urlB);
 	await openDatabricksSection(page);
 	// Re-seeding `GLOBAL_` here would undo the clearing the moment the page reloaded,
 	// leaving no way at all to opt one project out of a default.
@@ -227,21 +282,21 @@ test('CLEARING a project field is an answer, so the default does not creep back'
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('notebook');
 });
 
-test('the default survives a RELAUNCH on a new port - the reason it is not localStorage', async ({
+test('the default is a FILE, not per-origin state - the reason it is not localStorage', async ({
 	page
 }) => {
-	// The store is the file, not the browser: a relaunch means a brand-new origin, so
-	// anything kept per-origin would be gone. Restarting the launcher here would cost
-	// the whole suite its instance, so this asserts the same thing at the layer that
-	// decides it - what is ON DISK, and what a fresh SSR load hands the browser.
-	expect(storedDefaults()['cellar-databricks-upload-prefix-default']).toBe('GLOBAL_');
-	const res = await page.request.get(`${baseURL}/api/user-settings`);
-	expect((await res.json())['cellar-databricks-upload-prefix-default']).toBe('GLOBAL_');
+	// A relaunch means a brand-new origin, so anything kept per-origin would be gone.
+	// Restarting a launcher here would cost the suite its instance, so this asserts the
+	// same thing at the layer that decides it - what is ON DISK, and what a fresh SSR
+	// load hands the browser.
+	expect(storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
+	const res = await page.request.get(`${urlB}/api/user-settings`);
+	expect((await res.json())[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
 });
 
 test('the default field takes the same tokens - and the same not-a-token warning', async ({ page }) => {
 	await mockDatabricks(page);
-	await openWorkspace(page, fresh);
+	await openProject(page, urlB);
 	await openSettings(page);
 
 	const prefix = page.getByTestId('settings-upload-prefix');
@@ -253,7 +308,15 @@ test('the default field takes the same tokens - and the same not-a-token warning
 	await expect(warning).toBeVisible();
 	await expect(warning).toContainText('{YYYYMMD}');
 
+	// A brace SPLIT across the two fields is not a run at all - the name is
+	// prefix + stem + postfix, so nothing braced can span them, and warning about a
+	// `{}` that appears in neither field would be a warning about nothing.
+	await prefix.fill('a{');
+	await page.getByTestId('settings-upload-postfix').fill('}b');
+	await expect(warning).toHaveCount(0);
+
 	// A chip writes the exact braced form into the field last focused.
+	await page.getByTestId('settings-upload-postfix').fill('');
 	await prefix.fill('');
 	await page.locator('[data-testid="settings-upload-token"][data-token="{YYYY-MM}"]').click();
 	await expect(prefix).toHaveValue('{YYYY-MM}');
@@ -263,6 +326,5 @@ test('the default field takes the same tokens - and the same not-a-token warning
 
 	// Leave the global store clean for anything that runs after this file.
 	await prefix.fill('');
-	await page.getByTestId('settings-upload-postfix').fill('');
-	await expect.poll(() => storedDefaults()['cellar-databricks-upload-prefix-default']).toBeUndefined();
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBeUndefined();
 });

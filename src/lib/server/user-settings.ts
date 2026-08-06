@@ -15,7 +15,9 @@
  * Deliberately the same flat `key → value` shape, the same debounce and the same
  * exit-flush as `ui-state.ts`: two stores are enough, and a second CONVENTION on
  * top of a second store is what makes a third one expensive to reason about. What
- * differs is only WHERE it is and, therefore, what belongs in it.
+ * differs is only WHERE it is and, therefore, what belongs in it - so the
+ * mechanism itself is literally shared (`json-store.ts`) rather than mirrored,
+ * and this module is only a PATH plus the keys that belong at it.
  *
  * **What belongs here is a DEFAULT, never the live value.** The per-project store
  * stays authoritative for a project that has an answer of its own; this supplies
@@ -26,14 +28,12 @@
  * `~/.cellar/` is outside every checkout, so nothing here can show up as a git diff.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
-
-const WRITE_DEBOUNCE_MS = 250;
+import { join } from 'node:path';
+import { createJsonStore, type JsonStoreData } from '$lib/server/json-store';
 
 /** The flat setting map persisted to `~/.cellar/settings.json`. */
-export type UserSettings = Record<string, unknown>;
+export type UserSettings = JsonStoreData;
 
 /**
  * The default prefix/postfix a project inherits when it has none of its own.
@@ -44,11 +44,6 @@ export type UserSettings = Record<string, unknown>;
  * would not throw - it would read as a default the user set and Cellar ignored.
  */
 export { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
-
-let cache: UserSettings | null = null;
-let writeTimer: ReturnType<typeof setTimeout> | null = null;
-let dirty = false;
-let exitHookInstalled = false;
 
 /**
  * `~/.cellar/settings.json`, or whatever `CELLAR_USER_SETTINGS` names.
@@ -65,24 +60,11 @@ function storePath(): string {
 	return override && override.trim() ? override : join(homedir(), '.cellar', 'settings.json');
 }
 
-/** Load the store from disk once; a missing / unparseable file is an empty store. */
-function ensureLoaded(): UserSettings {
-	if (cache !== null) return cache;
-	try {
-		const p = storePath();
-		// Dynamic boundary: our own on-disk JSON.
-		const parsed: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {};
-		cache =
-			parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as UserSettings) : {};
-	} catch {
-		cache = {};
-	}
-	return cache;
-}
+const store = createJsonStore(storePath);
 
 /** The whole setting map (a copy, so callers can't mutate the cache). */
 export function getUserSettings(): UserSettings {
-	return { ...ensureLoaded() };
+	return store.get();
 }
 
 /**
@@ -90,50 +72,10 @@ export function getUserSettings(): UserSettings {
  * deletes the key. Returns the updated map. Disk write is debounced.
  */
 export function setUserSettings(patch: UserSettings | null | undefined): UserSettings {
-	const store = ensureLoaded();
-	if (patch && typeof patch === 'object' && !Array.isArray(patch)) {
-		for (const [key, value] of Object.entries(patch)) {
-			if (value === null) delete store[key];
-			else store[key] = value;
-		}
-	}
-	scheduleWrite();
-	return { ...store };
+	return store.set(patch);
 }
 
 /** Drop the in-memory copy, so the next read comes from disk. Tests only. */
 export function __resetUserSettingsCache(): void {
-	flush();
-	cache = null;
-}
-
-function scheduleWrite(): void {
-	dirty = true;
-	installExitHook();
-	if (writeTimer) return;
-	writeTimer = setTimeout(flush, WRITE_DEBOUNCE_MS);
-	// Don't keep the process alive just for a pending settings write.
-	if (typeof writeTimer.unref === 'function') writeTimer.unref();
-}
-
-function flush(): void {
-	if (writeTimer) {
-		clearTimeout(writeTimer);
-		writeTimer = null;
-	}
-	if (!dirty || cache === null) return;
-	dirty = false;
-	try {
-		const p = storePath();
-		mkdirSync(dirname(p), { recursive: true });
-		writeFileSync(p, JSON.stringify(cache, null, 2) + '\n');
-	} catch {}
-}
-
-// The unref'd debounce timer won't fire if the process exits inside its window;
-// flush synchronously on exit so a just-changed setting is never dropped.
-function installExitHook(): void {
-	if (exitHookInstalled) return;
-	exitHookInstalled = true;
-	process.once('exit', flush);
+	store.reset();
 }

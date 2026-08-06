@@ -6,7 +6,8 @@ import {
 	insertUploadToken,
 	notebookStem,
 	resolveUploadName,
-	unknownDateTokens
+	unknownDateTokens,
+	unknownAffixTokens
 } from '../../src/lib/databricksUploadName';
 
 /**
@@ -156,6 +157,27 @@ describe('naming a brace that is NOT a token', () => {
 	it('lists each unknown run ONCE, in order, and only the unknown ones', () => {
 		// The message names them, so a repeated token must not read as two problems.
 		expect(unknownDateTokens('{FOO}-{YYYY}-{FOO}-{BAR}', DAY)).toEqual(['{FOO}', '{BAR}']);
+	});
+
+	it('scans the two affixes SEPARATELY, so a split brace is never a warning', () => {
+		// The name is `prefix + stem + postfix`, so a braced run cannot span the fields.
+		// Scanning their concatenation would invent one: `a{` and `}b` become a `{}` and
+		// `{FOO` plus `BAR}` a `{FOOBAR}` - a warning naming a token that is nowhere on
+		// screen, about an upload that is perfectly fine.
+		expect(unknownAffixTokens({ prefix: 'a{', postfix: '}b' }, DAY)).toEqual([]);
+		expect(unknownAffixTokens({ prefix: '{FOO', postfix: 'BAR}' }, DAY)).toEqual([]);
+		// A real unknown in EITHER field is still named, from whichever it is in…
+		expect(unknownAffixTokens({ prefix: '{YYYYMMD}_', postfix: '' }, DAY)).toEqual(['{YYYYMMD}']);
+		expect(unknownAffixTokens({ prefix: '', postfix: '_{yyyy}' }, DAY)).toEqual(['{yyyy}']);
+		// …and the two are merged in order, deduped, so one mistake in both fields reads
+		// as one problem rather than two.
+		expect(unknownAffixTokens({ prefix: '{FOO}{YYYY}', postfix: '{BAR}{FOO}' }, DAY)).toEqual([
+			'{FOO}',
+			'{BAR}'
+		]);
+		// Absent affixes are simply nothing to say.
+		expect(unknownAffixTokens({}, DAY)).toEqual([]);
+		expect(unknownAffixTokens({ prefix: null, postfix: null }, DAY)).toEqual([]);
 	});
 
 	it('is decided by the EXPANDER, so it cannot drift from what really expands', () => {
