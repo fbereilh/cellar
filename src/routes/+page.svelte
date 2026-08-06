@@ -19,6 +19,7 @@
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState';
 	import { resolveVirtualize, VIRTUALIZE_PREF_KEY } from '$lib/virtualizePref';
 	import { relativeTimeLong } from '$lib/relativeTime';
+	import { toWorkspaceRel } from '$lib/workspacePath';
 	import { createNoticeChannel } from '$lib/notice.svelte';
 	import type { PageData } from './$types';
 	import type { Cell } from '$lib/server/types';
@@ -80,10 +81,11 @@
 	const notebookName = notebookPath.split('/').pop() ?? notebookPath;
 
 	// Workspace-relative path of the canonical (default) notebook. Opening it from
-	// the file tree routes to the live notebook tab (id 'notebook').
-	const canonicalNotebookRel = notebookPath.startsWith(workspace)
-		? notebookPath.slice(workspace.length).replace(/^[/\\]+/, '')
-		: notebookName;
+	// the file tree routes to the live notebook tab (id 'notebook'). The absolute →
+	// relative rule itself lives in `$lib/workspacePath` and is shared with the
+	// foreign-run gate below, so the two cannot drift; a path it cannot derive
+	// falls back to the bare name here.
+	const canonicalNotebookRel = toWorkspaceRel(workspace, notebookPath) ?? notebookName;
 
 	// Live cells per open notebook (path → the notebook's reactive cell array),
 	// reported up by each LiveNotebook so the sidebar (outline / search) can read
@@ -1115,10 +1117,17 @@
 	 * flight — one issued a moment before the restart would otherwise land AFTER
 	 * this and repopulate the inspector with the dead session's namespace, with
 	 * nothing scheduled to correct it.
+	 *
+	 * The bump issues no replacement request, and `refreshVariables`'s `finally`
+	 * deliberately declines to clear the spinner once superseded — so this owns the
+	 * in-flight probe's leftovers too, or the Variables header keeps a permanent
+	 * spinner (and a stale error) with nothing scheduled to clear them.
 	 */
 	function wipeVariablesLocally() {
 		varsReqSeq++;
 		variables = [];
+		varsLoading = false;
+		varsError = '';
 	}
 
 	/**
@@ -1164,9 +1173,8 @@
 		if (typeof nb !== 'string' || !nb) return true; // no path on the event → can't tell
 		if (!activeTabIsNotebook) return true; // the server's active notebook may differ → can't tell
 		if (!activeNotebookPath) return true; // no notebook active → can't tell
-		if (!nb.startsWith(workspace)) return true; // outside the workspace → can't tell
-		const rel = nb.slice(workspace.length).replace(/^[/\\]+/, '');
-		if (!rel) return true;
+		const rel = toWorkspaceRel(workspace, nb);
+		if (!rel) return true; // outside the workspace (or a prefix-sharing sibling) → can't tell
 		const norm = (p: string) => p.replace(/\\/g, '/');
 		return norm(rel) === norm(activeNotebookPath);
 	}
@@ -1762,8 +1770,11 @@
 	onSetTheme={applyTheme}
 	onToggleVirtualizeCells={toggleVirtualizeCells}
 	onVenvRebound={() => {
-		// New interpreter → namespace is empty; drop stale inspector rows and refresh status.
-		variables = [];
+		// New interpreter → every live kernel was torn down, so the namespace is empty.
+		// Drop the stale rows through the generation-bumping wipe: a probe in flight
+		// would otherwise land after this and repopulate the inspector with the DEAD
+		// interpreter's namespace, with only refreshKernel() following to correct it.
+		wipeVariablesLocally();
 		refreshKernel();
 	}}
 />

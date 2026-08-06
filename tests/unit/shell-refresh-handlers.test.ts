@@ -24,6 +24,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { toWorkspaceRel } from '../../src/lib/workspacePath';
 
 const SHELL = join(process.cwd(), 'src/routes/+page.svelte');
 const src = readFileSync(SHELL, 'utf8');
@@ -118,7 +119,10 @@ describe('a run this tab did NOT initiate refreshes what its own run does', () =
 			// FALSE, i.e. the missed refresh this path exists to fix.
 			/!activeTabIsNotebook\) return true/, // the tab is not the notebook it names
 			/!activeNotebookPath\) return true/, // no notebook active
-			/!nb\.startsWith\(workspace\)\) return true/ // outside the workspace
+			// Outside the workspace - and, since the rule is boundary-aware, a sibling
+			// merely sharing its name as a prefix lands here too rather than being
+			// decided as a mismatch.
+			/!rel\) return true/
 		];
 		for (const fallback of failsOpen) expect(gate).toMatch(fallback);
 		// The only verdict that may SKIP is a decided mismatch, so no other path here
@@ -152,9 +156,60 @@ describe('an inspector response that is no longer the newest is dropped', () => 
 			const block = blockAt(anchor);
 			expect(block, anchor).toContain('/api/kernel/'); // the slice really is this control
 			expect(block, anchor).toContain('wipeVariablesLocally()');
-			// A raw `variables = []` here would bypass the bump - the exact regression.
-			expect(block, anchor).not.toMatch(/variables = \[\]/);
 		}
+	});
+
+	it('routes EVERY local wipe through that one helper', () => {
+		// Scoping this per known call site let a THIRD one (the venv rebind, which
+		// tears down every live kernel) bypass the generation entirely, so an
+		// in-flight probe repopulated the inspector with the DEAD interpreter's
+		// namespace. Asserted over the whole file so a future fourth site cannot
+		// quietly do the same: the only raw `variables = []` is the helper's own.
+		const raw = [...src.matchAll(/variables = \[\]/g)];
+		expect(raw.length, 'expected exactly one raw wipe - the helper itself').toBe(1);
+		const wipe = blockAt('function wipeVariablesLocally() {');
+		expect(wipe).toContain('variables = []');
+		expect(blockAt('onVenvRebound={() => {')).toContain('wipeVariablesLocally()');
+	});
+
+	it('does not strand the spinner when it supersedes an in-flight probe', () => {
+		// The bump issues no replacement request, and `refreshVariables`'s `finally`
+		// clears `varsLoading` only while it is still the newest generation - so a
+		// probe superseded by a wipe would leave a permanent spinner (and a stale
+		// error) in the Variables header, with nothing scheduled to clear it.
+		const wipe = blockAt('function wipeVariablesLocally() {');
+		expect(wipe).toMatch(/varsLoading = false/);
+		expect(wipe).toMatch(/varsError = ''/);
+	});
+});
+
+describe('the absolute → workspace-relative rule has ONE boundary-aware owner', () => {
+	it('is derived by the shared helper at both call sites', () => {
+		// Two copies of this rule lived here and both were a bare `startsWith`. That
+		// is not merely duplication: a SIBLING sharing the workspace name as a prefix
+		// (/tmp/ws vs /tmp/ws2/x.ipynb) read as INSIDE the workspace, so the gate
+		// decided it as a MISMATCH and skipped the refresh - the missed-refresh
+		// failure its fail-open doctrine exists to prevent, reached through the one
+		// path that did not fail open.
+		expect(src).toContain("import { toWorkspaceRel } from '$lib/workspacePath';");
+		expect(src).toContain('const canonicalNotebookRel = toWorkspaceRel(workspace, notebookPath) ?? notebookName;');
+		expect(blockAt('function foreignRunTouchesActiveNotebook(nb: unknown): boolean {')).toContain(
+			'toWorkspaceRel(workspace, nb)'
+		);
+		// No hand-rolled copy may come back alongside it.
+		expect(src).not.toMatch(/\.slice\(workspace\.length\)/);
+		expect(src).not.toMatch(/startsWith\(workspace\)/);
+	});
+
+	it('treats a prefix-sharing sibling as undecidable, not as a mismatch', () => {
+		const ws = '/tmp/ws';
+		expect(toWorkspaceRel(ws, '/tmp/ws/a/x.ipynb')).toBe('a/x.ipynb');
+		expect(toWorkspaceRel(ws + '/', '/tmp/ws/a/x.ipynb')).toBe('a/x.ipynb');
+		expect(toWorkspaceRel(ws, '/tmp/ws2/x.ipynb')).toBe(null); // the sibling
+		expect(toWorkspaceRel(ws, '/tmp/other/x.ipynb')).toBe(null);
+		expect(toWorkspaceRel(ws, ws)).toBe(null); // the root is no file in itself
+		expect(toWorkspaceRel('C:\\ws', 'C:\\ws\\a\\x.ipynb')).toBe('a\\x.ipynb');
+		expect(toWorkspaceRel('C:\\ws', 'C:\\ws2\\x.ipynb')).toBe(null);
 	});
 });
 
