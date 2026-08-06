@@ -81,9 +81,12 @@ export function setUiState(patch: UiState | null | undefined): UiState {
 }
 
 /**
- * Whether a notebook's kernel should have the workspace root on `sys.path`
- * (default TRUE). Read at kernel-start time by `kernel.ts`; an env override
- * (`CELLAR_ADD_PROJECT_ROOT`) wins over the stored value. See `projectRoot.ts`.
+ * Whether a notebook's kernel should have its project root on `sys.path`
+ * (default TRUE). That root is the one the kernel PROCESS was started at: the
+ * notebook's declared code root when it has one, else the workspace root - the
+ * default (see `notebookRoot.ts`). Read at kernel-start time by `kernel.ts`; an
+ * env override (`CELLAR_ADD_PROJECT_ROOT`) wins over the stored value. See
+ * `projectRoot.ts`.
  */
 export function addProjectRootToPath(): boolean {
 	return projectRootEnabled(ensureLoaded()[ADD_PROJECT_ROOT_KEY], process.env.CELLAR_ADD_PROJECT_ROOT);

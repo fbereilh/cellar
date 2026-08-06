@@ -140,6 +140,18 @@ export interface NotebookView {
 	cells: CellView[];
 	/** nbdev-style export target (`.py` module path), or null when unset. */
 	exportTarget: string | null;
+	/**
+	 * Declared code root: the workspace-relative directory this notebook's KERNEL
+	 * resolves code from (cwd + `sys.path`), or null for the workspace root.
+	 */
+	root: string | null;
+	/**
+	 * True for a `.py` (jupytext / Databricks source) notebook, which is written
+	 * back from its cells alone and so stores no notebook-level metadata: the
+	 * browser needs this to hide the settings such a notebook cannot keep (the
+	 * code-root picker).
+	 */
+	isPy: boolean;
 	/** Heading levels (1-6) rendered with a display-only auto-number. */
 	headerNumbering: number[];
 	/** Notebook-wide "hide all code inputs" (report view) default. */
@@ -158,6 +170,11 @@ export interface KernelSpec {
 export interface NotebookCellarNamespace {
 	/** nbdev-style export target: a workspace-relative `.py` module path. */
 	export_target?: string;
+	/**
+	 * Code root: the workspace-relative directory this notebook's kernel runs in
+	 * and imports from. Absent = the workspace root. See `$lib/notebookRoot`.
+	 */
+	root?: string;
 	/** Heading levels (1-6) rendered with a display-only auto-number. */
 	header_numbering?: number[];
 	/**

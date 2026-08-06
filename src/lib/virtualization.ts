@@ -236,14 +236,14 @@ export function mountedIds(plan: PlanItem[]): Set<string> {
 // the queue, selection/focus moves, the jump settles); a cell outside the window
 // with no live reason then collapses back into a spacer on the next re-plan.
 
-/** How many queued cells (nearest the front of the kernel's FIFO) stay pinned. */
+/** How many queued cells (nearest the front of the notebook's FIFO) stay pinned. */
 export const QUEUED_PIN_LIMIT = 3;
 
 /**
- * The queued cells nearest the front of the kernel's global FIFO, in run order.
+ * The queued cells nearest the front of this notebook's kernel FIFO, in run order.
  *
- * Capped on purpose: `queued` is a GLOBAL queue that an agent's `run_cells` (or a
- * user mashing Run) can fill with dozens of this notebook's cells, and pinning all
+ * Capped on purpose: an agent's `run_cells` (or a
+ * user mashing Run) can fill that queue with dozens of this notebook's cells, and pinning all
  * of them would mount most of the notebook — defeating the window exactly when the
  * machine is busiest. The heads are the only ones about to need a node.
  */
@@ -265,7 +265,7 @@ export function queuedHeadIds(
 export interface PinInputs {
 	/** The cell running in THIS notebook (≤1). */
 	runningId?: string | null;
-	/** cell id → 1-based position in the kernel's global run queue. */
+	/** cell id → 1-based position in this notebook's kernel run queue. */
 	queued?: Record<string, number> | null;
 	/** The PRIMARY of the selection (command-mode target); never the whole set. */
 	activeId?: string | null;

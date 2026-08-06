@@ -33,6 +33,7 @@ import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from '.
 import { workspaceRoot } from './fstree';
 import { addProjectRootToPath, injectDatabricksRuntime, databricksRuntimeVersion } from './ui-state';
 import { projectRootAddCode, projectRootRemoveCode } from './projectRoot';
+import { notebookRoot } from './notebookRoot';
 import { databricksRuntimeEnvCode } from './databricksRuntime';
 import { CONTROL_COMM_TARGET, RESTART_MAGIC_CODE, controlOp } from './controlMagic';
 import { WIDGETS_SHIM_CODE } from './widgetsShim';
@@ -77,6 +78,17 @@ interface NotebookKernel {
 	sessionId: number;
 	/** Cell executions run in this notebook's current epoch (internal probes excluded). */
 	execsThisSession: number;
+	/**
+	 * The absolute directory this kernel PROCESS was rooted at — the notebook's
+	 * declared `metadata.cellar.root` resolved at start time, or the workspace root
+	 * when it declared none. Recorded here (like `databricksRuntime`) because a
+	 * kernel's cwd is fixed when its process spawns: `restart()` reuses the same
+	 * process argv and cwd, so `initKernel` must re-inject `sys.path` for the root
+	 * the namespace ACTUALLY runs in, not for whatever the document says now. A
+	 * root that CHANGES tears the kernel down instead (see notebook-root-actions),
+	 * which is what keeps cwd and `sys.path` in lockstep for a process's whole life.
+	 */
+	codeRoot: string;
 	/**
 	 * The `DATABRICKS_RUNTIME_VERSION` this kernel's CURRENT session was actually
 	 * started with, or null when it was started without one. Written by `initKernel`
@@ -1198,12 +1210,17 @@ async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): P
 		// The %restart_python line magic (managed restart via the control comm).
 		RESTART_MAGIC_CODE
 	);
-	// Add the workspace root to sys.path so a notebook in any subfolder can import
+	// Add the project root to sys.path so a notebook in any subfolder can import
 	// project modules (and the `.py` module the export writes at the root). Gated by
 	// the per-workspace setting (default ON) and re-read here so a restart /
 	// autorestart re-applies the current choice. Idempotent — never inserts a
 	// duplicate (see projectRoot.ts).
-	if (addProjectRootToPath()) parts.push(projectRootAddCode(workspaceRoot()));
+	//
+	// "The project root" is the root this kernel's PROCESS was started at: the
+	// notebook's declared `metadata.cellar.root` when it has one, else the workspace
+	// (unchanged, the default). Read off the session rather than the document so it
+	// can never disagree with the process's real cwd — see `codeRoot`.
+	if (addProjectRootToPath()) parts.push(projectRootAddCode(nbKernel.codeRoot));
 	await runSilent(kernel, parts.join('\n\n'));
 }
 
@@ -1216,12 +1233,20 @@ async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): P
  * kernel finishing start mid-apply reads the new value. Idempotent.
  */
 export async function applyProjectRootToLiveKernels(enabled: boolean): Promise<void> {
-	const root = workspaceRoot();
-	const code = enabled ? projectRootAddCode(root) : projectRootRemoveCode(root);
-	const live = [...kernels.values()]
-		.map((k) => k.connection)
-		.filter((c): c is KernelConnection => c !== null);
-	await Promise.all(live.map((c) => runSilent(c, code)));
+	// Per kernel, not once for the workspace: a kernel started for a notebook that
+	// declares a code root has THAT directory on its `sys.path`, so toggling the
+	// setting off must remove the path it actually inserted. `codeRoot` is the
+	// workspace root for every notebook that declares none, so the single-root case
+	// is unchanged.
+	const live = [...kernels.values()].filter((k) => k.connection !== null);
+	await Promise.all(
+		live.map((k) =>
+			runSilent(
+				k.connection as KernelConnection,
+				enabled ? projectRootAddCode(k.codeRoot) : projectRootRemoveCode(k.codeRoot)
+			)
+		)
+	);
 }
 
 /**
@@ -1234,12 +1259,21 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 	const existing = kernels.get(nbPath);
 	if (existing) return existing.startPromise;
 
+	// The notebook's declared code root, resolved BEFORE anything is registered: an
+	// unusable declaration (missing directory, a file, outside the workspace) throws
+	// here, so no half-built entry is left in the Map and the run reports the real
+	// cause. Refusing is deliberate — jupyter would silently walk a bad path up to
+	// `root_dir` and run the notebook against the workspace it declined. Null (no
+	// declaration) is the default and sends no `path` at all, exactly as before.
+	const root = notebookRoot(nbPath);
+
 	const nbKernel: NotebookKernel = {
 		nbPath,
 		startPromise: undefined as unknown as Promise<KernelConnection>,
 		connection: null,
 		sessionId: 0,
 		execsThisSession: 0,
+		codeRoot: root?.dir ?? workspaceRoot(),
 		databricksRuntime: null,
 		userRuns: 0,
 		statusHandler: null,
@@ -1251,7 +1285,22 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 
 	nbKernel.startPromise = (async () => {
 		const mgr = await getManager();
-		const kernel = await mgr.startNew({ name: 'python3' });
+		// A notebook with no declared root sends the SAME request it always did (no
+		// `path` field), so the kernel keeps inheriting the sidecar's cwd = the
+		// workspace. A declared root rides along as `path`: jupyter_server resolves it
+		// under its `root_dir` (the workspace) via `cwd_for_path` and spawns the kernel
+		// process there.
+		//
+		// The cast is required, not sloppiness: @jupyterlab types `IKernelOptions` as
+		// `Partial<Pick<IModel,'name'>>` — it models no `path` — while the REST layer
+		// simply `JSON.stringify`s whatever it is given, and the Jupyter server reads
+		// `model.get("path")`. Going through `mgr.startNew` (rather than a raw fetch)
+		// keeps the connection registered with the shared manager, which is what the
+		// idle-cull reconciliation and `runningChanged` depend on.
+		const startOptions = (root
+			? { name: 'python3', path: root.rel }
+			: { name: 'python3' }) as KernelAPI.IKernelOptions;
+		const kernel = await mgr.startNew(startOptions);
 		nbKernel.connection = kernel;
 		// Run every comm on the kernel's MAIN shell, not a per-comm-target subshell
 		// (@jupyterlab/services' default under ipykernel 7). Cellar serializes runs

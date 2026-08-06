@@ -110,10 +110,10 @@ export function ensureImportsCell(nb?: string | null, originId?: string | null):
 }
 
 /**
- * Run the imports cell against the shared kernel, taking its turn in the
- * kernel-global FIFO like any other run (`run-queue.js`): one kernel means one
- * run at a time, and an import block is not special enough to jump a human's
- * queued cell.
+ * Run the imports cell against its notebook's kernel, taking its turn in that
+ * notebook's FIFO like any other run (`run-queue.js`): one kernel per notebook
+ * means one of its cells runs at a time, and an import block is not special
+ * enough to jump a human's queued cell.
  *
  * Returns a run result, or a non-executing status when the queue refused or
  * dropped the ticket. The `duplicate` case is not an error: the imports cell is
