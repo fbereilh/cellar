@@ -77,8 +77,13 @@
 		exportTarget?: string | null;
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
-		/** Set (or clear, with '') the notebook's `.py` export target. */
-		onSetExportTarget?: (target: string) => void;
+		/**
+		 * Set (or clear, with '') the notebook's `.py` export target. Called ONCE PER
+		 * EDIT, from the input's `change` (a blur after typing, or Enter) - never per
+		 * keystroke, since the write can be refused. `keepalive` is set only by the
+		 * unload flush (`pagehide`), the same rule as `Cell.svelte`'s edit flush.
+		 */
+		onSetExportTarget?: (target: string, opts?: { keepalive?: boolean }) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
 		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
 		/** This notebook's declared code root (kernel cwd + sys.path), or null for the workspace. */
@@ -491,17 +496,52 @@
 		onSetRoot?.((e.currentTarget as HTMLSelectElement).value);
 	}
 
-	function onExportTargetInput(e: Event) {
+	// A path field commits on CHANGE - a blur after an edit, or Enter - never per
+	// keystroke: the route can REFUSE a target (a non-`.py` path, one escaping the
+	// workspace, a `.py` text notebook), and refusing one character at a time fought
+	// the typist. `change` does not fire on an unmodified blur, so merely clicking
+	// through the field writes nothing.
+	let exportTargetEl = $state<HTMLInputElement | undefined>(undefined);
+	function onExportTargetCommit(e: Event) {
 		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value);
 	}
+	/**
+	 * Commit a target typed but never committed, on PAGE UNLOAD only. `change` is not
+	 * reliably delivered before unload, so without this a path the user typed and then
+	 * reloaded (or closed the tab) on was simply lost - the same sub-commit window
+	 * `Cell.svelte` flushes on `pagehide`, and the same idiom. The per-edit commit
+	 * model is unchanged: this fires only when the field still differs from what the
+	 * model holds, so an already-committed value writes nothing.
+	 *
+	 * Deliberately NOT flushed on teardown, unlike `Cell.svelte`'s: this component is
+	 * destroyed by every `LiveNotebook.load()` refetch (it renders behind an
+	 * `{:else if fetching}` gate), which an SSE reconnect, a seq gap from an agent's
+	 * edit, `notebook:restored` or a refused bulk op all trigger - so a teardown commit
+	 * fired mid-edit from a background event the user never caused, raising a spurious
+	 * refusal for a half-typed path or silently persisting one that happened to parse.
+	 * Losing an uncommitted value to a refetch is the far better half of that trade.
+	 */
+	function flushExportTarget(keepalive = false) {
+		const el = exportTargetEl;
+		if (!el || el.value === (exportTarget ?? '')) return;
+		onSetExportTarget?.(el.value, { keepalive });
+	}
+	$effect(() => {
+		const onUnload = () => flushExportTarget(true);
+		window.addEventListener('pagehide', onUnload);
+		return () => window.removeEventListener('pagehide', onUnload);
+	});
 	async function doExport() {
 		if (exporting) return;
 		exporting = true;
 		exportFeedback = '';
 		const r = await onExportPy?.();
 		exporting = false;
-		if (!r) exportFeedback = 'Export failed.';
-		else if (r.reason === 'no-target') exportFeedback = 'Set a target .py path first.';
+		// A failure is reported by the caller through the shell's notice channel,
+		// carrying the server's own reason; a bare "Export failed." here would be a
+		// second, less informative surface for the same event.
+		if (!r) return;
+		if (r.reason === 'no-target') exportFeedback = 'Set a target .py path first.';
 		else if (r.reason === 'no-cells') exportFeedback = 'No cells are marked for export.';
 		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
 	}
@@ -731,11 +771,12 @@
 					Export to
 				</span>
 				<input
+					bind:this={exportTargetEl}
 					type="text"
 					class="input input-bordered input-xs w-56 font-mono"
 					placeholder="utils.py"
 					value={exportTarget ?? ''}
-					oninput={onExportTargetInput}
+					onchange={onExportTargetCommit}
 					data-testid="export-target-input"
 					aria-label="Export target .py module path"
 				/>

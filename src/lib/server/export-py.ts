@@ -124,12 +124,19 @@ export function generateModule(exportedSources: string[], sourceName: string): s
  * (workspace-relative `.py` path), or a `#|default_exp <module>` directive found
  * in any cell (nbdev familiarity; the UI field is the primary mechanism). Returns
  * null when neither is present.
+ *
+ * The directive scan is guarded by a `includes('default_exp')` substring test
+ * (`dataframeHtml.ts`'s `/dataframe/i` pre-check, same reason): this is the ONE
+ * resolution rule the exporter AND the agent map read, and the map short-circuits
+ * only when a notebook-level target IS set — so the COMMON case, a notebook with
+ * no export configured at all, would otherwise run a multiline regex over every
+ * code cell's full source on the most frequently called agent read tool.
  */
 export function resolveTarget(doc: NotebookDoc): string | null {
 	const explicit = doc.metadata?.cellar?.export_target;
 	if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
 	for (const c of doc.cells) {
-		if (c.cell_type !== 'code') continue;
+		if (c.cell_type !== 'code' || !c.source.includes('default_exp')) continue;
 		const m = c.source.match(/^\s*#\s*\|\s*default_exp\s+([^\s#]+)/m);
 		if (m) {
 			// nbdev writes a dotted module path (`pkg.utils`); map it to a file path.
@@ -151,6 +158,21 @@ export function resolveTarget(doc: NotebookDoc): string | null {
  * caller (auto-on-save) must not have a save broken by an absent target. A bad
  * target path (escapes the workspace) still throws — that is a real error the
  * manual button surfaces to the user.
+ *
+ * It also REFUSES to overwrite a file it did not generate. The write is a
+ * whole-file replacement, so a target naming an ordinary source file would destroy
+ * it — and while `setExportTarget` refuses a non-`.py` path, a `#|default_exp`
+ * directive resolves straight to a path here without passing that setter, and a
+ * `.py` path may perfectly well be a hand-written module. Every generated module
+ * opens with `HEADER`, so testing the file already on disk for it rejects nothing
+ * Cellar wrote. The refusal throws, which auto-on-save records as `lastExportError`
+ * (never breaking the notebook save) and the manual button surfaces directly.
+ *
+ * An EMPTY file (zero bytes, or whitespace only) is overwritten, not refused: the
+ * guard exists to protect CONTENT, and there is none. Pre-creating the module
+ * (`touch utils.py`, or the explorer's "New file") before naming the target is an
+ * ordinary workflow, and refusing it stopped the module regenerating on every
+ * later save through a path no UI surface reads.
  */
 export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	const target = resolveTarget(doc);
@@ -159,17 +181,70 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	const exported = doc.cells.filter((c: Cell) => isExportCell(c)).map((c) => c.source);
 	if (!exported.length) return { written: false, target, count: 0, reason: 'no-cells' };
 
+	// KNOWN LIMITATION: `resolveInWorkspace` resolves LEXICALLY (no `realpath`), so a
+	// DANGLING `*.py` symlink inside the workspace is followed by the write below and
+	// the module lands outside the root. Bounded - an existing destination is still
+	// caught by the not-a-generated-module refusal, so nothing is destroyed - and the
+	// property is shared by every file writer in the app, so the fix belongs in that
+	// one helper (`$lib/server/fstree`), not here.
 	const abs = resolveInWorkspace(target); // throws on workspace escape
 	const sourceName = basename(doc.path);
 	const text = generateModule(exported, sourceName);
 
-	// Idempotent: skip the write when the file already holds identical bytes.
-	if (existsSync(abs) && safeRead(abs) === text) {
-		return { written: false, target, count: exported.length, reason: 'unchanged' };
+	if (existsSync(abs)) {
+		const existing = safeRead(abs);
+		// Idempotent: skip the write when the file already holds identical bytes.
+		if (existing === text) {
+			return { written: false, target, count: exported.length, reason: 'unchanged' };
+		}
+		if (existing === null)
+			throw new Error(
+				`refusing to overwrite ${target}: it exists but could not be read, so it cannot be verified as a Cellar-generated module`
+			);
+		if (!isGeneratedModule(existing) && existing.trim() !== '')
+			throw new Error(
+				`refusing to overwrite ${target}: it is not a Cellar-generated module (it does not begin with "${HEADER}") - point the export target at a path Cellar owns, or delete that file`
+			);
 	}
 	mkdirSync(dirname(abs), { recursive: true });
 	writeFileSync(abs, text);
 	return { written: true, target, count: exported.length };
+}
+
+/**
+ * Is a module WE GENERATED already on disk at this workspace-relative target?
+ *
+ * The one fact a caller needs before it may say a previously generated module was
+ * LEFT in place: `exportNotebookToPy` returns `no-cells` without writing when
+ * nothing is marked, and that says nothing about whether a file is there — a
+ * target set but never used, or repointed to a fresh path, has generated none. A
+ * target that escapes the workspace can hold no module of ours, so the throw
+ * `resolveInWorkspace` raises reads as false rather than propagating.
+ *
+ * PROVENANCE, not mere existence, and through the SAME `isGeneratedModule` test the
+ * write site refuses on — the two halves must agree about what "the module" is.
+ * The setter only requires a `.py` path inside the workspace, so a target may name
+ * a HAND-WRITTEN module; a bare `existsSync` then reported the user's own source
+ * file as the leftover module and invited deleting it, which is the sibling clobber
+ * guard's whole purpose with the sign flipped. A file we cannot read is not
+ * verified as ours, so it reads false too.
+ */
+export function generatedModuleExists(target: string): boolean {
+	try {
+		const existing = safeRead(resolveInWorkspace(target));
+		return existing !== null && isGeneratedModule(existing);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Was this file text generated by Cellar? Every generated module opens with
+ * `HEADER` on its first line (`generateModule`), so a first-line test is exact in
+ * the direction that matters: it can never reject a module Cellar wrote.
+ */
+function isGeneratedModule(text: string): boolean {
+	return text.split('\n', 1)[0].replace(/\r$/, '') === HEADER;
 }
 
 function safeRead(abs: string): string | null {

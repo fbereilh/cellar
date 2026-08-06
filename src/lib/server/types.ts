@@ -76,7 +76,12 @@ export interface CellarNamespace {
 	language?: string;
 	/** Cell role, e.g. the pinned imports cell ('imports'). */
 	role?: string | null;
-	/** nbdev-style export flag: include this code cell in the `.py` module. */
+	/**
+	 * nbdev-style export flag: include this cell in the `.py` module. Only a PYTHON
+	 * code cell may carry it - a SQL cell is an nbformat `code` cell too, so the
+	 * eligibility test lives in `exportRole.ts` (`canExportCell`/`isExportCell`),
+	 * which every surface reads; a stale or hand-edited flag anywhere else is inert.
+	 */
 	export?: boolean;
 	/** Runtime-only run stamp (never persisted). */
 	lastRun?: LastRun;
@@ -131,6 +136,12 @@ export interface NotebookDoc {
 	cells: Cell[];
 	metadata?: NotebookMetadata;
 	jpFormat?: string;
+	/**
+	 * Runtime-only (never serialized): why the last auto-export of the nbdev-style
+	 * `.py` module threw, or null when it wrote / had nothing to write. See
+	 * `notebook.ts`'s `autoExportPy` - best-effort must not mean silent.
+	 */
+	lastExportError?: string | null;
 }
 
 /** Serializable notebook view for the browser (SSR + REST). */
@@ -138,7 +149,12 @@ export interface NotebookView {
 	workspace: string;
 	path: string;
 	cells: CellView[];
-	/** nbdev-style export target (`.py` module path), or null when unset. */
+	/**
+	 * nbdev-style export target (`.py` module path), or null when unset. The STORED
+	 * setting (what the target input edits), not the EFFECTIVE target the exporter
+	 * resolves - a `#|default_exp` directive written in a cell is absent here; see
+	 * `effectiveExportTarget` for that.
+	 */
 	exportTarget: string | null;
 	/**
 	 * Declared code root: the workspace-relative directory this notebook's KERNEL
@@ -168,7 +184,12 @@ export interface KernelSpec {
 
 /** Notebook-level `cellar` metadata namespace (round-trips through clean-on-save). */
 export interface NotebookCellarNamespace {
-	/** nbdev-style export target: a workspace-relative `.py` module path. */
+	/**
+	 * nbdev-style export target: a workspace-relative `.py` module path. Always
+	 * STORED relative, whatever a caller passed - `setExportTarget` validates the
+	 * path (inside the workspace, and a `.py` file, since the exporter WRITES it)
+	 * and normalizes it there, so the committed `.ipynb` stays portable.
+	 */
 	export_target?: string;
 	/**
 	 * Code root: the workspace-relative directory this notebook's kernel runs in

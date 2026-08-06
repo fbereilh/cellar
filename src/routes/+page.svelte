@@ -812,10 +812,19 @@
 	async function exportPy() {
 		const api = activeNotebookApi();
 		if (!api) return;
-		clearNotice();
+		// Deliberately NO pre-emptive clear: every branch below (and every failure
+		// path inside `LiveNotebook.exportPy`) ends in exactly one message, so there
+		// is nothing to clear that this action does not itself replace. Clearing up
+		// front instead erased a message the user had not read yet - opening the app
+		// menu BLURS the target input, so its `change` commit has usually already
+		// SETTLED and posted its refusal reason by the time the item is clicked.
 		const r = await api.exportPy();
-		if (!r) showNotice('Export to .py failed.');
-		else if (r.reason === 'no-target') showNotice('Set a target .py path at the top of the notebook first.');
+		// A failure already reported the SERVER's own reason through this same channel
+		// (`LiveNotebook.exportPy`). A generic string here would REPLACE it - one
+		// nonce-keyed notice - burying exactly the messages those refusals exist for
+		// ("it is not a Cellar-generated module", a non-.py or escaping target).
+		if (!r) return;
+		if (r.reason === 'no-target') showNotice('Set a target .py path at the top of the notebook first.');
 		else if (r.reason === 'no-cells') showNotice('No cells are marked for export - use a cell’s ⋮ menu.');
 		else {
 			fsRefreshSignal++; // a new/updated .py on disk → refresh the tree + git decorations

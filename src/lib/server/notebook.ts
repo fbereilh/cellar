@@ -27,7 +27,9 @@ import { publish } from './events';
 import { cancelRun } from './run-queue';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
-import { exportNotebookToPy, type ExportResult } from './export-py';
+import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
+import { canExportCell } from '../exportRole';
+import { resolveInWorkspace } from './fstree';
 import { SQL_LANGUAGE, isLogicalCellType } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
@@ -194,15 +196,35 @@ function persist(doc: NotebookDoc): void {
  * target is configured AND at least one cell is marked for export (see
  * `exportNotebookToPy`), and idempotent (skips the write when the bytes are
  * unchanged). Never lets an export failure break the notebook save: a bad target
- * only surfaces through the explicit "Export to .py" action.
+ * must not cost the user their notebook write.
+ *
+ * Best-effort is NOT the same as silent, though: the failure is RECORDED on the
+ * doc (`lastExportError`, read back by `lastExportError()`) instead of being
+ * swallowed outright. Every export-flow caller reports the module conditionally -
+ * present only when nothing was regenerated - so an absent `module` field reads
+ * as "the module was written", and a thrown write (a target whose parent is a
+ * file, EACCES, ENOSPC) would otherwise be indistinguishable from a success. The
+ * record is refreshed on EVERY persist of this doc, so a later successful write
+ * clears it.
  */
 function autoExportPy(doc: NotebookDoc): void {
 	if (doc.jpFormat) return; // `.py` text notebooks carry no cellar cell metadata
 	try {
 		exportNotebookToPy(doc);
-	} catch {
-		/* auto-export is best-effort; the manual button surfaces real errors */
+		doc.lastExportError = null;
+	} catch (err) {
+		doc.lastExportError = String((err as Error)?.message ?? err);
 	}
+}
+
+/**
+ * Why the last auto-export of this notebook's `.py` module FAILED, or null when
+ * the last attempt wrote (or had nothing to write). The one fact a caller needs
+ * before it may let an absent `module` warning stand for a successful
+ * regeneration - see `autoExportPy`.
+ */
+export function lastExportError(nb?: string | null): string | null {
+	return docFor(nb).lastExportError ?? null;
 }
 
 /**
@@ -707,18 +729,85 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
  * namespace, so the flag round-trips through clean-on-save. Only a code cell can
  * carry it (a markdown/SQL cell has no module source). `persist` regenerates the
  * `.py` module as a side effect (auto-on-save).
+ *
+ * This IS `setCellExports` of one - one implementation, one rule - so the UI's
+ * per-cell toggle and MCP's batch tool cannot drift about what marking means.
+ * Returns whether the cell now carries the requested value (false = there is no
+ * such cell, or marking a non-Python one, which `isExportCell` would ignore).
  */
 export function setCellExport(id: string, exported: boolean, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
-	if (!cell || cell.cell_type !== 'code') return false;
-	cell.metadata = cell.metadata ?? {};
-	cell.metadata.cellar = cell.metadata.cellar ?? {};
-	if (exported) cell.metadata.cellar.export = true;
-	else delete cell.metadata.cellar.export;
-	persist(doc);
-	emit(doc, 'cell:export', { cellId: id, exported: !!exported }, originId);
+	if (!cell) return false;
+	if (exported && !canExportCell(cell)) return false;
+	setCellExports([id], exported, nb, originId);
 	return true;
+}
+
+/**
+ * Mark (or unmark) SEVERAL cells for export in one document write - the batch
+ * `setCellExport`, mirroring `setCellTypes`/`clearOutputsForCells`. A loop over
+ * the single-cell form would serialize + fsync + rename the whole `.ipynb` once
+ * per cell AND regenerate the `.py` module once per cell (`persist` auto-exports),
+ * walking both files through every intermediate state.
+ *
+ * Only cells that actually CHANGE are touched, so a re-mark of an
+ * already-marked cell writes nothing and emits nothing (zero git diff, no `.py`
+ * mtime churn). Marking requires a PYTHON code cell (`canExportCell`, the shared
+ * eligibility half of `isExportCell` itself - a markdown or SQL cell has no module
+ * source, so setting the flag there would be a lie the exporter ignores) while
+ * UNMARKING clears the flag wherever
+ * it is found, which is also how a stale flag on a hand-edited `.ipynb` is
+ * cleared. Returns the ids actually changed.
+ *
+ * The persist is guarded on `jpFormat` like `clearOutputsForCells`: a `.py` text
+ * notebook carries no cellar cell metadata, so the write would spend a blocking
+ * jupytext `spawnSync` producing byte-identical output while silently losing the
+ * very flag it was asked to store (and `autoExportPy` skips it anyway). The
+ * events still fire unconditionally, so open tabs update either way.
+ */
+export function setCellExports(
+	ids: readonly string[],
+	exported: boolean,
+	nb?: string | null,
+	originId?: string | null
+): string[] {
+	const doc = docFor(nb);
+	const changed: Cell[] = [];
+	const seen = new Set<string>();
+	for (const id of ids) {
+		if (seen.has(id)) continue;
+		seen.add(id);
+		const cell = find(doc, id);
+		if (!cell) continue;
+		const marked = cell.metadata?.cellar?.export === true;
+		if (exported) {
+			if (!canExportCell(cell) || marked) continue;
+			cell.metadata = cell.metadata ?? {};
+			cell.metadata.cellar = cell.metadata.cellar ?? {};
+			cell.metadata.cellar.export = true;
+		} else {
+			const cellar = cell.metadata?.cellar;
+			if (!cellar || !marked) continue;
+			delete cellar.export;
+		}
+		changed.push(cell);
+	}
+	if (!changed.length) return [];
+	if (!doc.jpFormat) persist(doc);
+	for (const cell of changed) emit(doc, 'cell:export', { cellId: cell.id, exported }, originId);
+	return changed.map((c) => c.id);
+}
+
+/**
+ * Is this notebook a `.py` TEXT notebook (jupytext percent/light, or Databricks
+ * source) rather than an `.ipynb`? Such a document carries NO cellar cell
+ * metadata and generates no module (`persist` writes it through jupytext,
+ * `autoExportPy` skips it), so every export-flow caller has to refuse rather
+ * than claim a mark it cannot store - `exportPy` already throws on it.
+ */
+export function isPyTextNotebook(nb?: string | null): boolean {
+	return !!docFor(nb).jpFormat;
 }
 
 /** The notebook's configured export target (`.py` module path), or null. */
@@ -729,21 +818,107 @@ export function getExportTarget(nb?: string | null): string | null {
 }
 
 /**
+ * The target the EXPORTER will actually write to: the notebook-level
+ * `export_target`, or — when there is none — a `#|default_exp <module>` directive
+ * in any code cell (nbdev's own spelling). This is `resolveTarget`'s rule REUSED,
+ * never a second copy, so a caller reporting where the marks land can never
+ * disagree with where they go.
+ *
+ * `getExportTarget` above stays the metadata-only reader (what `setExportTarget`
+ * stores and clears); the two are deliberately separate, because a directive
+ * lives in a cell and no notebook-level setter can clear it.
+ */
+export function effectiveExportTarget(nb?: string | null): string | null {
+	return resolveTarget(docFor(nb));
+}
+
+/**
+ * The path itself was REFUSED - it escapes the workspace, or does not name a `.py`
+ * module. Typed (the `CellRefError` precedent) because `setExportTarget` validates
+ * BEFORE it mutates, so its only other throw is the `persist`: a disk failure over
+ * a path that is perfectly valid and that the live document has already taken.
+ * Reported as a refusal, that sends the caller to fix a path that was never wrong,
+ * over a change that DID take - so the two are told apart by TYPE here rather than
+ * by matching the message text at the catch.
+ */
+export class InvalidExportTargetError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'InvalidExportTargetError';
+	}
+}
+
+/**
  * Set (or clear, with null/'') the notebook-level export target in the
  * allowlisted `cellar` namespace, so it round-trips through clean-on-save.
  * Materializes `doc.metadata` if the notebook had none yet. `persist` regenerates
  * the `.py` module as a side effect (auto-on-save).
+ *
+ * The path is VALIDATED here, through the same `resolveInWorkspace` the exporter
+ * writes with, and a target that escapes the workspace THROWS rather than being
+ * stored: `autoExportPy` is deliberately best-effort (a bad target must not cost
+ * the user their notebook save), so an unwritable target accepted here would sit
+ * in the metadata silently generating nothing on every later save. Refusing it at
+ * the point it is set is the honest moment - the caller has a value to correct.
+ *
+ * A target that is not a `.py` file is refused for a sharper reason: the exporter
+ * WRITES the generated module to this path, so a target naming an ordinary source
+ * file would have that file overwritten the moment a cell is marked. The field is
+ * documented (here, in both tool descriptions and in nbdev itself) as the module
+ * path, so this rejects nothing legitimate. `exportNotebookToPy` carries the
+ * second half of that guard - it refuses to overwrite a file it did not generate -
+ * because a `#|default_exp` directive reaches it without passing here.
+ *
+ * What is STORED is the workspace-RELATIVE form, whatever was passed: this value
+ * lands in the committed `.ipynb`, and `resolveInWorkspace` accepts an absolute
+ * path that happens to resolve inside THIS workspace - so an absolute target
+ * stored verbatim contradicted every description of the field and, on any other
+ * checkout, threw from `autoExportPy` (best-effort, so the record is silent) and
+ * the module simply never regenerated again for that clone. Normalizing here -
+ * the one place the target is validated and stored, so every caller gets it -
+ * keeps the notebook portable. An absolute path OUTSIDE the workspace is still
+ * refused by `resolveInWorkspace`, unchanged.
+ *
+ * It RETURNS the value it stored, not the one it was handed, so a caller reports
+ * what the document holds: normalizing without reporting it left the UI route
+ * answering with the raw absolute path, which the tab then recorded as its
+ * baseline and kept in the input while the server held the relative form - and
+ * the `notebook:export-target` event that would have corrected it is
+ * echo-suppressed in the initiating tab.
+ *
+ * Every REFUSAL of the path itself is thrown as an `InvalidExportTargetError`,
+ * so a caller can tell it apart from the one other throw this function has - the
+ * `persist` below, i.e. a disk failure over a path that was never wrong. See that
+ * class for why the distinction is load-bearing.
  */
-export function setExportTarget(target: string | null, nb?: string | null, originId?: string | null): boolean {
+export function setExportTarget(
+	target: string | null,
+	nb?: string | null,
+	originId?: string | null
+): string | null {
 	const doc = docFor(nb);
+	const raw = (target ?? '').trim();
+	let stored = '';
+	if (raw) {
+		let abs: string;
+		try {
+			abs = resolveInWorkspace(raw); // throws when the path escapes the workspace
+		} catch (err) {
+			throw new InvalidExportTargetError(String((err as Error)?.message ?? err));
+		}
+		if (!/\.py$/i.test(raw))
+			throw new InvalidExportTargetError(
+				`export target ${raw} is not a .py file: the generated module is written to this path, so it must name a .py module`
+			);
+		stored = relative(resolve(workspace()), abs).split(sep).join('/');
+	}
 	doc.metadata = doc.metadata ?? {};
 	doc.metadata.cellar = doc.metadata.cellar ?? {};
-	const trimmed = (target ?? '').trim();
-	if (trimmed) doc.metadata.cellar.export_target = trimmed;
+	if (stored) doc.metadata.cellar.export_target = stored;
 	else delete doc.metadata.cellar.export_target;
 	persist(doc);
-	emit(doc, 'notebook:export-target', { target: trimmed || null }, originId);
-	return true;
+	emit(doc, 'notebook:export-target', { target: stored || null }, originId);
+	return stored || null;
 }
 
 /** The notebook's enabled heading-numbering levels (unique, 1-6, ascending). */
@@ -856,11 +1031,26 @@ export function setHideAllCode(hidden: boolean, nb?: string | null, originId?: s
  * Regenerate the `.py` module on demand (the manual "Export to .py" action).
  * Unlike the auto-on-save path, this surfaces a real error (bad target) to the
  * caller rather than swallowing it.
+ *
+ * It REFRESHES `lastExportError` in BOTH directions, exactly as `autoExportPy`
+ * does on every persist: the record describes what is on disk, and this path
+ * writes the module without going through `persist`. A stale success would be
+ * reported by the next idempotent `set_cell_export` (which skips the persist that
+ * would have cleared it); a failure left unrecorded is worse - with the record
+ * null the same call emits no `module` field at all, which under the conditional
+ * contract reads as a module that WAS regenerated.
  */
 export function exportPy(nb?: string | null): ExportResult {
 	const doc = docFor(nb);
 	if (doc.jpFormat) throw new Error('cannot export a .py text notebook to a module');
-	return exportNotebookToPy(doc);
+	try {
+		const res = exportNotebookToPy(doc);
+		doc.lastExportError = null;
+		return res;
+	} catch (err) {
+		doc.lastExportError = String((err as Error)?.message ?? err);
+		throw err;
+	}
 }
 
 /**
