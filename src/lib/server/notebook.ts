@@ -5,7 +5,7 @@
  * committed `.ipynb` on load (spec §4). The workspace has a default notebook
  * (`notebook.ipynb`), but any `.ipynb` under the workspace can also be opened
  * as a live, kernel-attached document — each keyed by its absolute path in
- * `docs`. One shared kernel backs them all; each doc persists to its own file.
+ * `docs`. Each notebook gets its OWN kernel; each doc persists to its own file.
  *
  * `activePath` tracks which notebook the agent-facing tools (MCP) operate on by
  * default: it starts as the default notebook and follows whichever notebook the

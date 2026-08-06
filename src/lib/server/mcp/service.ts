@@ -1714,9 +1714,10 @@ export function getRunQueue(sessionId?: string) {
  * with no reload. `runCells`/`runAll`/`runRange` all funnel through here, so
  * every MCP run path broadcasts.
  *
- * QUEUEING. One kernel means one run at a time app-wide, so an agent's run
- * requested while a user's (or another agent call's) cell is executing takes a
- * ticket in the kernel-global FIFO instead of being dropped or racing into the
+ * QUEUEING. One kernel per notebook means one run at a time WITHIN a notebook
+ * (different notebooks execute in parallel), so an agent's run requested while a
+ * user's (or another agent call's) cell of that SAME notebook is executing takes
+ * a ticket in that notebook's FIFO instead of being dropped or racing into the
  * kernel. Two shapes tell the agent what happened, and neither ever claims a run
  * finished when it did not:
  *

@@ -24,7 +24,7 @@
 	interface Props {
 		cells: UICell[];
 		runningId: string | null;
-		/** cell id → 1-based position in the kernel's global run queue */
+		/** cell id → 1-based position in this notebook's kernel run queue */
 		queued?: Record<string, number>;
 		activeId?: string | null;
 		/**

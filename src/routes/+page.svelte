@@ -135,7 +135,7 @@
 	}
 
 	// Live run/queue state per open notebook, reported up by each LiveNotebook from
-	// the shared kernel's `queue:changed` snapshot. The sidebar Outline maps it onto
+	// the cross-notebook `queue:changed` snapshot. The sidebar Outline maps it onto
 	// heading sections (running spinner / queued badge). Assign into the key (never
 	// rebuild the map) for the same loop-avoidance reason as `notebooksFolds`.
 	let notebooksRunState = $state<Record<string, { runningId: string | null; queued: Record<string, number> }>>({});
@@ -218,9 +218,10 @@
 	// gate reads `activeNotebookPath`, which is - the api is looked up at call time.
 	const canInsertAndRun = $derived.by(() => (activeNotebookPath ? insertAndRunInActiveNotebook : null));
 
-	// Single shared kernel → at most one cell runs at a time across ALL notebooks.
+	// One kernel per notebook → at most one cell of a notebook runs at a time,
+	// while different notebooks run in parallel.
 	// Serializing them is the SERVER's job (`run-queue.js`): a run requested while
-	// the kernel is busy is queued, not dropped, so this is no longer a gate — it
+	// that notebook's kernel is busy is queued, not dropped, so this is no longer a gate — it
 	// is a count of runs this browser has in flight (a queued one included), used
 	// only to keep the kernel badge reading "busy" while they resolve. A count,
 	// not a boolean, because several runs can now legitimately overlap here.

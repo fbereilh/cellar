@@ -62,7 +62,7 @@ export async function exportNotebookAsPy({
 
 /**
  * Run every code cell of the `.py` notebook `nb` (an ABSOLUTE path) in order,
- * taking a ticket in the kernel-global FIFO for each like any other run. Returns
+ * taking a ticket in that notebook's kernel FIFO for each like any other run. Returns
  * a `{ total, ok, errors }` summary. Errors are not fatal — the whole point of
  * convert is to capture them as outputs.
  */

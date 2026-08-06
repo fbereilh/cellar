@@ -91,7 +91,7 @@
 		onRegisterSearchCache?: (path: string, cache: SearchCache | null) => void;
 		onRunStart?: (path: string, id: string) => void;
 		onRunEnd?: () => void;
-		/** Interrupt the shared kernel (same handler the Kernels sidebar uses). */
+		/** Interrupt this notebook's kernel (same handler the Kernels sidebar uses). */
 		onInterruptKernel?: () => void;
 		/** (path, record|null): the focused cell's git blame, for the shell footer. */
 		onBlame?: (path: string, record: BlameLine | null) => void;
@@ -145,8 +145,8 @@
 	// Owns its own cell array + all cell operations (every request carries
 	// `nb: path` so it mutates *this* notebook's file, not the active one). The
 	// default workspace notebook and every opened `.ipynb` use this same
-	// component — one code path, one behavior. Runs go through the single shared
-	// kernel, which serializes them itself: a run requested while it is busy is
+	// component — one code path, one behavior. Runs go through this notebook's OWN
+	// kernel, which serializes its own cells: a run requested while it is busy is
 	// queued server-side (`run-queue.js`), so this component never gates a run.
 	// `gitRefresh` is the shell's `fsRefreshSignal`: a bump means the workspace's
 	// git state may have moved, so re-fetch the HEAD baseline the cells diff against.
@@ -265,12 +265,12 @@
 		onHideAllCodeChange?.(path, hideAllCode);
 	});
 	let runningId = $state<string | null>(null); // the cell running in THIS notebook (≤1)
-	// Cells of THIS notebook waiting in the kernel's global FIFO → their 1-based
-	// position in that queue (1 = next up). The positions are global on purpose:
-	// a cell queued here may be waiting behind a cell in another notebook, and
-	// "queued · 3" should say so. Mirrored from the server's `queue:changed`
-	// snapshot, never derived locally — the queue spans notebooks and tabs, so no
-	// single client can compute it.
+	// Cells of THIS notebook waiting in ITS kernel's FIFO → their 1-based
+	// position in that queue (1 = next up). Positions are per notebook: a cell
+	// only ever waits behind its own notebook's cells (notebooks run in
+	// parallel), so "queued · 3" means three of THIS notebook's runs are ahead of
+	// it. Mirrored from the server's `queue:changed` snapshot, never derived
+	// locally — the queue spans tabs and agents, so no single client can compute it.
 	let queued = $state<Record<string, number>>({});
 
 	// Live run requests this tab has in flight (or still held by the browser's
@@ -1790,9 +1790,10 @@
 	});
 
 	/**
-	 * Request a run. The single shared kernel runs one cell at a time app-wide,
-	 * but the serialization lives on the SERVER (`run-queue.js`): a run requested
-	 * while the kernel is busy waits its turn in a kernel-global FIFO instead of
+	 * Request a run. This notebook's own kernel runs one of its cells at a time
+	 * (other notebooks' kernels run in parallel), but the serialization lives on
+	 * the SERVER (`run-queue.js`): a run requested while this notebook's kernel is
+	 * busy waits its turn in that notebook's FIFO instead of
 	 * being dropped, and the `/run` response stream simply stays open across the
 	 * wait. So this function no longer gates on a busy flag — it POSTs, and the
 	 * server decides when the cell actually executes.

@@ -1,6 +1,6 @@
 # Kernel-per-notebook: architecture + phased migration plan
 
-**Status:** proposed (design only - no app code changes in this PR)
+**Status:** SHIPPED - kept as the historical design record. Every phase below has landed (Phase 6 completed the migration), so the "as-is" section describes the *pre-migration* architecture, not today's. For how the shipped system behaves, read `AGENTS.md` and the modules themselves.
 **Decision:** the captain has decided to move Cellar from **one shared kernel** to **one kernel per notebook** (true variable isolation + parallel execution across notebooks).
 **Scope of this doc:** describe the as-is architecture, the to-be architecture, recommend a path for each hard decision, and lay out an ordered, independently-shippable phased build. The build lands as separate PRs; this is the plan those PRs are cut from.
 
