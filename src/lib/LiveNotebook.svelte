@@ -1350,7 +1350,7 @@
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
 			exportTarget = body.notebook.exportTarget ?? null; // nbdev export target
-			confirmedExportTarget = exportTarget; // the revert baseline: what the server holds
+			confirmedExportTarget = sentExportTarget = exportTarget; // what the server holds
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			// A notebook always has a selected cell (command mode acts on it), so
@@ -1451,7 +1451,7 @@
 			}
 		} else if (ev.type === 'notebook:export-target') {
 			exportTarget = ev.target;
-			confirmedExportTarget = ev.target;
+			confirmedExportTarget = sentExportTarget = ev.target;
 		} else if (ev.type === 'notebook:header-numbering') {
 			headerNumbering = ev.levels ?? [];
 		} else if (ev.type === 'notebook:hide-all-code') {
@@ -2081,6 +2081,17 @@
 	 */
 	let confirmedExportTarget: string | null = null;
 	/**
+	 * The last value SENT (or last known held, seeded at load and by the SSE event),
+	 * which is what the "nothing changed, write nothing" check keys on. Keyed on the
+	 * CONFIRMED value instead, a commit issued while an earlier one was still in
+	 * flight was dropped: typing `a.py` then clearing the field before the first
+	 * response landed compared null against a baseline the first write had not yet
+	 * advanced, so no clear was ever sent and the input read empty while the server
+	 * kept regenerating to `a.py` (this tab echo-suppresses its own event, so nothing
+	 * corrected it until a reload).
+	 */
+	let sentExportTarget: string | null = null;
+	/**
 	 * What became of a target write. Four OUTCOMES, not a boolean: a single flag
 	 * conflated three of them and each conflation surfaced as its own defect -
 	 * an unreachable server read as success (the field kept a value the server
@@ -2135,7 +2146,8 @@
 	function setExportTargetValue(target: string) {
 		const next = target.trim() || null;
 		exportTarget = next;
-		if (next === confirmedExportTarget) return;
+		if (next === sentExportTarget) return;
+		sentExportTarget = next;
 		const commit = commitExportTarget(target, next);
 		exportTargetCommit = commit;
 		const drop = () => {
@@ -2151,7 +2163,9 @@
 			body: JSON.stringify({ op: 'set-target', target: raw, path, originId })
 		}).catch(() => null);
 		if (res?.ok) {
-			confirmedExportTarget = next;
+			// Only the LATEST write may advance the baseline: an older response landing
+			// after a newer one would otherwise record a value the server no longer holds.
+			if (sentExportTarget === next) confirmedExportTarget = next;
 			return 'committed';
 		}
 		// Checked before either revert: the field moved on (an agent's or another tab's
@@ -2159,6 +2173,7 @@
 		// it back to our baseline would discard state this write knows nothing about.
 		if (exportTarget !== next) return 'superseded';
 		exportTarget = confirmedExportTarget;
+		sentExportTarget = confirmedExportTarget;
 		if (!res) {
 			// An unreachable server is NOT a success: leaving the typed path in the field
 			// showed a target the server may never have stored, and the export then ran on

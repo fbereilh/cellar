@@ -824,23 +824,35 @@ export function effectiveExportTarget(nb?: string | null): string | null {
  * path, so this rejects nothing legitimate. `exportNotebookToPy` carries the
  * second half of that guard - it refuses to overwrite a file it did not generate -
  * because a `#|default_exp` directive reaches it without passing here.
+ *
+ * What is STORED is the workspace-RELATIVE form, whatever was passed: this value
+ * lands in the committed `.ipynb`, and `resolveInWorkspace` accepts an absolute
+ * path that happens to resolve inside THIS workspace - so an absolute target
+ * stored verbatim contradicted every description of the field and, on any other
+ * checkout, threw from `autoExportPy` (best-effort, so the record is silent) and
+ * the module simply never regenerated again for that clone. Normalizing here -
+ * the one place the target is validated and stored, so every caller gets it -
+ * keeps the notebook portable. An absolute path OUTSIDE the workspace is still
+ * refused by `resolveInWorkspace`, unchanged.
  */
 export function setExportTarget(target: string | null, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
-	const trimmed = (target ?? '').trim();
-	if (trimmed) {
-		resolveInWorkspace(trimmed); // throws when the path escapes the workspace
-		if (!/\.py$/i.test(trimmed))
+	const raw = (target ?? '').trim();
+	let stored = '';
+	if (raw) {
+		const abs = resolveInWorkspace(raw); // throws when the path escapes the workspace
+		if (!/\.py$/i.test(raw))
 			throw new Error(
-				`export target ${trimmed} is not a .py file: the generated module is written to this path, so it must name a .py module`
+				`export target ${raw} is not a .py file: the generated module is written to this path, so it must name a .py module`
 			);
+		stored = relative(resolve(workspace()), abs).split(sep).join('/');
 	}
 	doc.metadata = doc.metadata ?? {};
 	doc.metadata.cellar = doc.metadata.cellar ?? {};
-	if (trimmed) doc.metadata.cellar.export_target = trimmed;
+	if (stored) doc.metadata.cellar.export_target = stored;
 	else delete doc.metadata.cellar.export_target;
 	persist(doc);
-	emit(doc, 'notebook:export-target', { target: trimmed || null }, originId);
+	emit(doc, 'notebook:export-target', { target: stored || null }, originId);
 	return true;
 }
 

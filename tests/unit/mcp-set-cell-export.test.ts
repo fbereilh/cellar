@@ -566,6 +566,24 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 	});
 
 	/**
+	 * The stored value lands in the COMMITTED `.ipynb`, and `resolveInWorkspace`
+	 * accepts an absolute path that happens to resolve inside THIS workspace - so
+	 * stored verbatim it contradicted every description of the field and, on another
+	 * checkout, threw from the best-effort auto-export, silently ending regeneration
+	 * for that clone. It is normalized to the relative form it is documented as.
+	 */
+	it('stores an absolute in-workspace target in its workspace-relative form', async () => {
+		const { target, code } = await makeNotebook('target-absolute.ipynb');
+		const r = svc.setExportTarget(join(WS, 'lib', 'abs.py'), target);
+		expect(r).toMatchObject({ export_target: 'lib/abs.py' });
+		expect(nbmod.getExportTarget(target)).toBe('lib/abs.py');
+
+		// And it really is that path the module is written to.
+		svc.setCellExport([code[0]], true, target);
+		expect(existsSync(join(WS, 'lib', 'abs.py'))).toBe(true);
+	});
+
+	/**
 	 * The exporter WRITES to this path, and this tool is what completes the chain: an
 	 * agent could name any workspace file and then mark a cell, destroying it in one
 	 * turn. The field is documented as the nbdev module path, so refusing a non-`.py`
