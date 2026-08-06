@@ -256,12 +256,13 @@ control that override holds, since no toggle or restart can change it.
 carries an **Upload notebook to workspace** button. It copies the notebook you have
 open into your own Databricks folder - `/Users/<you>/<name>`, where the user folder
 comes from the connected identity (`current_user.me()`) rather than anything you
-type, and the name is the file's basename with the extension dropped, since
-Databricks names a workspace notebook by its path segment. It imports in **JUPYTER**
-format, so the notebook lands with its cells intact instead of being flattened into
-one `.py` script; a `.py` jupytext or Databricks-source notebook is uploaded as a
-proper `.ipynb`, built from the live document so it matches what Cellar saves on
-disk. It authenticates through the connection you already made - the same
+type, and the name is the file's basename with the extension dropped (optionally
+wrapped in the prefix/postfix described below), since Databricks names a workspace
+notebook by its path segment. It imports in **JUPYTER** format, so the notebook
+lands with its cells intact instead of being flattened into one `.py` script; a
+`.py` jupytext or Databricks-source notebook is uploaded as a proper `.ipynb`,
+built from the live document so it matches what Cellar saves on disk. It
+authenticates through the connection you already made - the same
 `WorkspaceClient` every listing uses, so an expired profile reports the same
 `databricks auth login --profile <name>` remedy as everywhere else - and it is a
 **workspace-files** operation only: it never starts, stops or restarts a cluster (a
@@ -274,6 +275,32 @@ an **Open in Databricks** link. A notebook whose JSON is larger than ~7 MB is
 refused before anything is sent (the workspace import API accepts roughly 10 MB of
 base64 content); clearing the outputs, which are what make a notebook that large, is
 the fix.
+
+**Naming the upload (prefix / postfix).** Two optional fields above the button wrap
+the notebook's own name, so a file can land as `2026-08-05_analysis` or
+`analysis_20260805` without renaming it first. Both may carry date tokens -
+`{YYYY-MM-DD}`, `{YYYYMMDD}`, `{YYYY}`, `{MM}`, `{DD}` - which expand against the
+**local** date and are **case-sensitive** (so `{mm}`, minutes by every other
+convention, can never silently mean the month); there are deliberately no
+time-of-day tokens, and anything else in braces is left literal, so a typo shows up
+in the preview instead of vanishing from the name. The panel previews the resolved
+name as you type, and that preview is exactly what the workspace receives - the
+browser and the server share one rule (`$lib/databricksUploadName`), and the browser
+expands the tokens at click time so the two cannot disagree even across midnight.
+Because a Databricks workspace notebook carries no suffix, the postfix attaches to
+the extension-less stem: `analysis.ipynb` plus `_{YYYYMMDD}` is `analysis_20260805`,
+never `analysis.ipynb_20260805`. Leave both empty and the upload is exactly what it
+was before: `/Users/<you>/<basename-without-extension>`. An affix that could move
+the upload out of your own folder - a `/`, a `\` or a control character - is
+**refused** with the reason on screen and the button disabled, rather than quietly
+cleaned up into a name the preview never showed; so is a prefix/postfix combination
+that pushes the assembled name past 200 characters. A **Replace** confirm always
+overwrites the path it named: the affixes it resolved with are pinned when it arms,
+so a date token rolling over between the two clicks cannot redirect it, and typing
+in either field dismisses the confirm (and the previous attempt's result) rather
+than leaving a path on screen this panel would no longer upload to. Your last-used
+prefix and postfix are remembered per project in the workspace's `.cellar/` store,
+so a regular naming pattern survives a relaunch.
 
 **Disconnect vs Log out.** Disconnect ends that notebook's Spark session and
 leaves you authenticated. **Log out** - the quiet button under the Cluster card's
