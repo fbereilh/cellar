@@ -20,7 +20,7 @@
  * kernel or the python dataflow subprocess.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync, writeFileSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -403,6 +403,24 @@ describe('the generated module follows the marks', () => {
 		expect(r.ok ? r.module?.reason : '').toContain('no module was generated');
 		expect(r.ok ? r.module?.reason : '').not.toContain('left on disk');
 		expect(r.ok ? r.module?.reason : '').not.toContain('by hand');
+	});
+
+	it('never calls a HAND-WRITTEN file at the target the module left on disk', async () => {
+		const { target, code } = await makeNotebook('module-handwritten.ipynb');
+		mkdirSync(join(WS, 'lib'), { recursive: true });
+		const py = join(WS, 'lib/mine.py');
+		const handWritten = 'def keep_me():\n    return 1\n';
+		writeFileSync(py, handWritten);
+		svc.setExportTarget('lib/mine.py', target);
+
+		// The setter only requires a `.py` path inside the workspace, so the target may
+		// name the user's OWN source file. "Remove it by hand if it should be gone" would
+		// then invite deleting exactly the file the clobber guard exists to protect.
+		const r = svc.setCellExport([code[0]], false, target);
+		expect(r.ok ? r.module?.reason : '').toContain('no module was generated');
+		expect(r.ok ? r.module?.reason : '').not.toContain('left on disk');
+		expect(r.ok ? r.module?.reason : '').not.toContain('by hand');
+		expect(readFileSync(py, 'utf8')).toBe(handWritten);
 	});
 
 	it('carries no module warning when there is no target to regenerate', async () => {

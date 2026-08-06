@@ -813,8 +813,12 @@
 		if (!api) return;
 		clearNotice();
 		const r = await api.exportPy();
-		if (!r) showNotice('Export to .py failed.');
-		else if (r.reason === 'no-target') showNotice('Set a target .py path at the top of the notebook first.');
+		// A failure already reported the SERVER's own reason through this same channel
+		// (`LiveNotebook.exportPy`). A generic string here would REPLACE it - one
+		// nonce-keyed notice - burying exactly the messages those refusals exist for
+		// ("it is not a Cellar-generated module", a non-.py or escaping target).
+		if (!r) return;
+		if (r.reason === 'no-target') showNotice('Set a target .py path at the top of the notebook first.');
 		else if (r.reason === 'no-cells') showNotice('No cells are marked for export - use a cell’s ⋮ menu.');
 		else {
 			fsRefreshSignal++; // a new/updated .py on disk → refresh the tree + git decorations

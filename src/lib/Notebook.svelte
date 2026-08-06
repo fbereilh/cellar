@@ -80,7 +80,7 @@
 		 * Set (or clear, with '') the notebook's `.py` export target. The write is
 		 * debounced; `flush` commits it immediately (the input's blur).
 		 */
-		onSetExportTarget?: (target: string, opts?: { flush?: boolean }) => void;
+		onSetExportTarget?: (target: string) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
 		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
@@ -433,13 +433,13 @@
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 
-	function onExportTargetInput(e: Event) {
+	// A path field commits on CHANGE - a blur after an edit, or Enter - never per
+	// keystroke: the route can REFUSE a target (a non-`.py` path, one escaping the
+	// workspace, a `.py` text notebook), and refusing one character at a time fought
+	// the typist. `change` does not fire on an unmodified blur, so merely clicking
+	// through the field writes nothing.
+	function onExportTargetCommit(e: Event) {
 		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value);
-	}
-	// Leaving the field commits what is in it, so the debounced write can't lose a
-	// target the user typed and then clicked away from.
-	function onExportTargetBlur(e: Event) {
-		onSetExportTarget?.((e.currentTarget as HTMLInputElement).value, { flush: true });
 	}
 	async function doExport() {
 		if (exporting) return;
@@ -641,8 +641,7 @@
 					class="input input-bordered input-xs w-56 font-mono"
 					placeholder="utils.py"
 					value={exportTarget ?? ''}
-					oninput={onExportTargetInput}
-					onblur={onExportTargetBlur}
+					onchange={onExportTargetCommit}
 					data-testid="export-target-input"
 					aria-label="Export target .py module path"
 				/>

@@ -252,46 +252,46 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(fn).toMatch(/onNotice\?\./);
 	});
 
-	it('guards the revert against a newer write, and against the field moving on', () => {
-		// Responses are unordered, so a refusal resolving after a newer write must
-		// neither revert that newer value nor speak for it - and a refusal for a value
-		// the field no longer holds must not yank the caret back either.
-		expect(fn).toMatch(/\+\+exportTargetSeq/);
-		expect(fn).toMatch(/seq !== exportTargetSeq/);
+	it('guards the revert against the field moving on', () => {
+		// A refusal for a value the field no longer holds must not yank the caret back.
 		expect(fn).toMatch(/exportTarget !== next/);
 	});
 
-	it('debounces the write and reverts to the SERVER-confirmed value', () => {
-		// The input fires one request per keystroke and its DOM value is state-driven,
-		// so an undebounced write made every keystroke of a refused path 400, revert the
-		// field, move the caret and raise another notice. And `previous` was the previous
-		// OPTIMISTIC value - itself never stored under consecutive refusals - so the
-		// field settled on a path the server had rejected.
-		expect(fn).toMatch(/clearTimeout\(exportTargetTimer\)/);
-		expect(fn).toMatch(/setTimeout\(.*flushExportTarget/);
+	it('commits ONCE PER EDIT, and reverts to the SERVER-confirmed value', () => {
+		// The input's DOM value is state-driven, so writing per keystroke made every
+		// character of a refused path 400, revert the field and move the caret - and the
+		// debounce + generation guard + pending mirror stacked to contain that were
+		// themselves a race. One commit per `change` leaves none of that machinery.
+		expect(fn).not.toMatch(/setTimeout/);
+		expect(fn).not.toMatch(/exportTargetSeq/);
+		expect(fn).not.toMatch(/pendingExportTarget/);
+		expect(src).not.toMatch(/flushExportTarget/);
 		expect(fn).not.toMatch(/const previous = exportTarget/);
 		// The baseline is only ever written where the server states it.
 		const writes = src.match(/confirmedExportTarget = /g) ?? [];
 		expect(writes.length).toBe(3); // load, the SSE event, a confirmed write
+
+		const nbSrc = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
+		expect(nbSrc).toMatch(/onchange=\{onExportTargetCommit\}/);
+		expect(nbSrc).not.toMatch(/oninput=\{onExportTarget/);
 	});
 
-	it('flushes the debounced write on blur, on unmount and before the export button', () => {
-		// A debounce with no flush loses whatever was typed inside the last window -
-		// the editor's own autosave, which this copies, flushes for exactly that
-		// reason. The export button posts immediately, so without the flush a freshly
-		// typed target exported against the previous one while the field showed the new.
-		expect(fn).toMatch(/function flushExportTarget/);
-		expect(fn).toMatch(/onMount\(\(\) => \(\) => void flushExportTarget\(\)\)/);
-
+	it('awaits an in-flight target write before the export button posts', () => {
+		// Pressing the button blurs the input, which commits the edit - but that POST is
+		// still on the wire, so without the await a freshly typed target exported against
+		// the previous one while the field visibly showed the new.
 		const exportFn = src.slice(src.indexOf('async function exportPy'), src.indexOf('UNDO_LIMIT'));
-		expect(exportFn).toMatch(/await flushExportTarget\(\)/);
+		expect(exportFn).toMatch(/await exportTargetCommit\?\./);
 		// And the manual export reports the SERVER's reason (the clobber / non-.py
 		// refusals exist for their message; "Export failed." names no cause).
 		expect(exportFn).toMatch(/onNotice\?\./);
 
-		const nbSrc = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
-		expect(nbSrc).toMatch(/onblur=\{onExportTargetBlur\}/);
-		expect(nbSrc).toMatch(/onSetExportTarget\?\.\(.*\{ flush: true \}\)/);
+		// The navbar entry point must not REPLACE that reason with a generic string -
+		// one nonce-keyed notice channel, so the last write wins.
+		const shell = readFileSync(join(process.cwd(), 'src/routes/+page.svelte'), 'utf8');
+		const shellExport = shell.slice(shell.indexOf('async function exportPy'), shell.indexOf('async function exportPy') + 900);
+		expect(shellExport).toMatch(/if \(!r\) return;/);
+		expect(shellExport).not.toMatch(/Export to \.py failed/);
 	});
 });
 

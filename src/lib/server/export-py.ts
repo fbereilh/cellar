@@ -206,7 +206,7 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 }
 
 /**
- * Is a generated module already on disk at this workspace-relative target?
+ * Is a module WE GENERATED already on disk at this workspace-relative target?
  *
  * The one fact a caller needs before it may say a previously generated module was
  * LEFT in place: `exportNotebookToPy` returns `no-cells` without writing when
@@ -214,10 +214,19 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
  * target set but never used, or repointed to a fresh path, has generated none. A
  * target that escapes the workspace can hold no module of ours, so the throw
  * `resolveInWorkspace` raises reads as false rather than propagating.
+ *
+ * PROVENANCE, not mere existence, and through the SAME `isGeneratedModule` test the
+ * write site refuses on — the two halves must agree about what "the module" is.
+ * The setter only requires a `.py` path inside the workspace, so a target may name
+ * a HAND-WRITTEN module; a bare `existsSync` then reported the user's own source
+ * file as the leftover module and invited deleting it, which is the sibling clobber
+ * guard's whole purpose with the sign flipped. A file we cannot read is not
+ * verified as ours, so it reads false too.
  */
-export function moduleExists(target: string): boolean {
+export function generatedModuleExists(target: string): boolean {
 	try {
-		return existsSync(resolveInWorkspace(target));
+		const existing = safeRead(resolveInWorkspace(target));
+		return existing !== null && isGeneratedModule(existing);
 	} catch {
 		return false;
 	}

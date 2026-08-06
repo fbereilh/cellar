@@ -47,7 +47,7 @@ import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree, resolveInWorkspace } from '../fstree';
 import { buildNotebookHtml, exportFilename } from '../export-html';
-import { moduleExists } from '../export-py';
+import { generatedModuleExists } from '../export-py';
 import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
@@ -1773,13 +1773,19 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * whole subject is which cells are in the module.
  *
  * The reason may only state what was VERIFIED, which is what takes the
- * `moduleExists` check: the gate is "a target, and nothing marked", which is ALSO
- * true when nothing was ever marked and no module was ever generated (a target
- * just set, or repointed to a fresh path). Saying the file was "left on disk"
- * there invents a file and invites the agent to delete nothing - the
+ * `generatedModuleExists` check: the gate is "a target, and nothing marked", which
+ * is ALSO true when nothing was ever marked and no module was ever generated (a
+ * target just set, or repointed to a fresh path). Saying the file was "left on
+ * disk" there invents a file and invites the agent to delete nothing - the
  * assert-more-than-was-verified defect this field exists to retire, with the sign
  * flipped. Nor may it say the marks were dropped "any more": the gate cannot see a
  * transition, only the resulting state.
+ *
+ * PROVENANCE is half of that: the setter only requires a `.py` path inside the
+ * workspace, so a target may name a HAND-WRITTEN module. Inviting a manual delete
+ * of one is advice that destroys the user's own work - and the file the sibling
+ * clobber guard exists to protect - so the "left on disk" wording is reserved for
+ * a file Cellar really generated; anything else reads as no module of ours.
  */
 function moduleWarning(target: string, exportTarget: string | null) {
 	const failed = moduleFailure(target, exportTarget);
@@ -1788,7 +1794,7 @@ function moduleWarning(target: string, exportTarget: string | null) {
 	return {
 		module: {
 			regenerated: false as const,
-			reason: moduleExists(exportTarget)
+			reason: generatedModuleExists(exportTarget)
 				? `no cell is marked for export, so ${exportTarget} was left on disk exactly as it was - remove it by hand if it should be gone`
 				: `no cell is marked for export, so no module was generated at ${exportTarget}`
 		}

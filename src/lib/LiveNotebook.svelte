@@ -2074,21 +2074,14 @@
 	}
 
 	/**
-	 * Generation guard for the optimistic export-target write. Responses are
-	 * unordered, so a refusal resolving after a newer write must neither revert that
-	 * newer value nor speak for it.
-	 */
-	let exportTargetSeq = 0;
-	let exportTargetTimer: ReturnType<typeof setTimeout> | undefined;
-	/**
 	 * The last value the SERVER confirmed - what a refusal reverts to. The previous
 	 * OPTIMISTIC value is the wrong baseline: under consecutive refusals it was
 	 * itself never stored, so the input settled on a path the server had rejected,
 	 * i.e. the very state the revert exists to prevent.
 	 */
 	let confirmedExportTarget: string | null = null;
-	/** The value the debounce still owes the server, or null when nothing is pending. */
-	let pendingExportTarget: { raw: string; next: string | null; seq: number } | null = null;
+	/** The in-flight target write, so the manual export can wait for it to land. */
+	let exportTargetCommit: Promise<void> | null = null;
 
 	/**
 	 * Set (or clear) the notebook's `.py` export target. Optimistic + persisted, and
@@ -2104,56 +2097,29 @@
 	 * the shell's existing transient notice channel, like every other refused write
 	 * here - a refusal with no surface is indistinguishable from a dead control.
 	 *
-	 * The POST is DEBOUNCED like the editor's own source autosave, because the input
-	 * fires one per keystroke and its DOM value is state-driven: undebounced, typing
-	 * a path the server refuses made EVERY keystroke 400, revert the field, move the
-	 * caret and raise another notice. A refusal is only acted on while the value it
-	 * refused is still the one in the field, so a prefix the user is typing through
-	 * never yanks the caret either.
-	 *
-	 * Like that autosave, the debounce is paired with a FLUSH (`flushExportTarget`):
-	 * a debounced write with no flush loses whatever the user typed inside the last
-	 * window. It fires on the input's blur, on unmount, and before the sibling
-	 * "Export to .py" button - which posts immediately, so without it a freshly typed
-	 * target exported against the previous one while the field visibly showed the new.
+	 * Called ONCE PER EDIT, from the input's `change` (a blur after typing, or Enter)
+	 * - never per keystroke. Per-keystroke writing was harmless only while the route
+	 * could refuse nothing: with real refusals it made every character of a bad path
+	 * 400, revert the field and move the caret, and the debounce + generation guard +
+	 * pending-value mirror stacked to contain that were themselves a race (a
+	 * superseded-but-successful write never advanced the confirmed baseline). One
+	 * commit per edit removes all of it: an unmodified blur fires no `change`, so
+	 * clicking through the field still writes nothing, and there is no pending value
+	 * to drop on unmount.
 	 */
-	function setExportTargetValue(target: string, { flush = false }: { flush?: boolean } = {}) {
+	function setExportTargetValue(target: string) {
 		const next = target.trim() || null;
 		exportTarget = next;
-		clearTimeout(exportTargetTimer);
-		// Nothing to send when the field already holds what the server confirmed -
-		// `flushEdit`'s own `liveSource !== savedSource` guard, so merely clicking
-		// through the input never writes (nor broadcasts) an unchanged target.
-		if (flush && next === confirmedExportTarget) {
-			pendingExportTarget = null;
-			return;
-		}
-		pendingExportTarget = { raw: target, next, seq: ++exportTargetSeq };
-		if (flush) return flushExportTarget();
-		exportTargetTimer = setTimeout(() => void flushExportTarget(), 500);
+		if (next === confirmedExportTarget) return;
+		exportTargetCommit = commitExportTarget(target, next);
 	}
 
-	/** Send the pending export target now, cancelling the debounce. */
-	function flushExportTarget(): Promise<void> | void {
-		clearTimeout(exportTargetTimer);
-		const pending = pendingExportTarget;
-		if (!pending) return;
-		pendingExportTarget = null;
-		return commitExportTarget(pending.raw, pending.next, pending.seq);
-	}
-
-	// Closing the notebook tab inside the debounce window would otherwise drop the
-	// typed target entirely - the same reason `Cell.svelte` flushes its edit on
-	// teardown. The request outlives this component; the app page does not unload.
-	onMount(() => () => void flushExportTarget());
-
-	async function commitExportTarget(raw: string, next: string | null, seq: number) {
+	async function commitExportTarget(raw: string, next: string | null) {
 		const res = await fetch('/api/notebooks/export-py', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ op: 'set-target', target: raw, path, originId })
 		}).catch(() => null);
-		if (seq !== exportTargetSeq) return; // a newer write owns the field
 		if (res?.ok) {
 			confirmedExportTarget = next;
 			return;
@@ -2189,15 +2155,17 @@
 	/**
 	 * Regenerate the `.py` module now (manual trigger). Returns the server result.
 	 *
-	 * A pending target edit is FLUSHED first, so the export runs against the path the
-	 * field is showing rather than the previous one. A failure carries the server's
+	 * An in-flight target write is AWAITED first, so the export runs against the path
+	 * the field is showing rather than the previous one: pressing the button blurs the
+	 * input, which commits the edit, but that POST would otherwise still be on the
+	 * wire. A failure carries the server's
 	 * own reason - the refusals this path can hit ("it is not a Cellar-generated
 	 * module", a non-`.py` or escaping target) exist for their actionable message, and
 	 * a generic "Export failed." names no cause - reported through the same transient
 	 * notice channel as every other refused write here.
 	 */
 	async function exportPy() {
-		await flushExportTarget();
+		await exportTargetCommit?.catch(() => {});
 		try {
 			const res = await fetch('/api/notebooks/export-py', {
 				method: 'POST',
