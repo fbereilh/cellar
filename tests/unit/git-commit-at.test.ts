@@ -266,7 +266,7 @@ describe('gitCommitAt', () => {
 	});
 });
 
-describe('gitRefAt (delegates to gitCommitAt — its own contract is unchanged)', () => {
+describe('gitRefAt (its own cheap two-spawn path — contract regression guard)', () => {
 	it('names the branch a worktree holds', async () => {
 		const main = tempDir();
 		initRepo(main);

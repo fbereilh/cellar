@@ -505,21 +505,23 @@ export async function gitStatus(): Promise<GitStatusResult> {
  * against the workspace index. This one takes a directory because a notebook code
  * root is normally a git WORKTREE inside the workspace (`git worktree add
  * roots/pr-482 <branch>`), i.e. a different checkout of the same repo — naming
- * which branch each root holds is the whole point of the review workflow.
- *
- * A NARROWING of `gitCommitAt`, not a second reader of the directory: the picker
- * renders one string whether HEAD is on a branch or detached, so the fallback to
- * the short SHA is collapsed here while the fuller shape keeps the two apart. It
- * therefore inherits that function's short-lived cache, which a worktree's branch
- * moving under Cellar's feet still invalidates — a checkout rewrites the index,
- * and the index mtime is the cache's signature.
+ * which branch each root holds is the whole point of the review workflow. Not
+ * cached: it is read only when a root list is requested, and a worktree's branch
+ * legitimately moves under Cellar's feet.
  *
  * Returns null when the directory is not inside a git repository at all.
  */
 export async function gitRefAt(absDir: string): Promise<{ branch: string | null; commit: string | null } | null> {
-	const at = await gitCommitAt(absDir);
-	if (!at.isRepo) return null;
-	return { branch: at.branch ?? at.shortSha, commit: at.shortSha };
+	// The two reads are independent, so they run CONCURRENTLY: a root list spawns
+	// this once per root on the process that also carries the kernel websockets and
+	// the SSE fan-out, and serializing them doubled that wall-clock for nothing.
+	const [sym, sha] = await Promise.all([
+		runGit(absDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']),
+		runGit(absDir, ['rev-parse', '--short', 'HEAD'])
+	]);
+	if (sym == null && sha == null) return null;
+	const commit = sha?.trim() || null;
+	return { branch: sym?.trim() || commit, commit };
 }
 
 /**
@@ -546,6 +548,13 @@ export async function gitRefAt(absDir: string): Promise<{ branch: string | null;
  * backstops — the dirty bit answers to an UNSTAGED working edit, which touches
  * neither the index nor anything else we key on, exactly the blind spot
  * `gitStatus()` uses that TTL for.
+ *
+ * `gitRefAt` above deliberately keeps its own cheap two-spawn path rather than
+ * narrowing this one: it answers the notebook root picker and MCP `list_roots`,
+ * once per root, and neither needs the dirty bit — so narrowing would put a
+ * whole-tree `git status` walk per root on that path for a value nothing reads.
+ * The few lines they share are the accepted cost of two different questions at
+ * two different prices.
  */
 export async function gitCommitAt(absDir: string): Promise<GitDirCommit> {
 	const pre = await preflight(absDir);

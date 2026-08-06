@@ -31,7 +31,7 @@
   No timer.
 -->
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
 	import { relativeTimeLong } from '$lib/relativeTime';
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
@@ -113,10 +113,15 @@
 
 	// Reload when the open-notebook set changes, and on the shell's fs signal (a
 	// file created/renamed/deleted, which is also how a new worktree shows up).
+	// `load()` reads `notebooks` synchronously, so it is UNTRACKED: the shell
+	// rebuilds that array on every tab switch and every dirty-flag write, and
+	// tracking its identity would refetch (three git spawns per distinct root once
+	// the cache lapses) for a set that did not change. `pathsKey` is the content
+	// signature that decides it.
 	$effect(() => {
 		pathsKey; // track
 		fsRefreshSignal; // track
-		load();
+		untrack(() => load());
 	});
 
 	/** Exposed to the section header's refresh button (bind:this in Sidebar). */
