@@ -2071,14 +2071,43 @@
 		}).catch(() => {});
 	}
 
-	/** Set (or clear) the notebook's `.py` export target. Optimistic + persisted. */
+	/**
+	 * Generation guard for the optimistic export-target write. The input fires one
+	 * request per keystroke, so responses are unordered: a refusal resolving after a
+	 * newer write must neither revert that newer value nor speak for it.
+	 */
+	let exportTargetSeq = 0;
+
+	/**
+	 * Set (or clear) the notebook's `.py` export target. Optimistic + persisted, and
+	 * REVERTED when the server refuses.
+	 *
+	 * The route has two refusals - a `.py` text notebook (which stores no cellar
+	 * metadata) and a target escaping the workspace - and it emits
+	 * `notebook:export-target` only on success, which this tab would echo-suppress
+	 * anyway. So without reading the response the input kept showing a rejected path
+	 * and the export bar read as configured over metadata holding nothing, reverting
+	 * silently on the next reload: the very "shown a setting that does nothing"
+	 * failure those refusals were added to prevent, one layer up. The reason goes to
+	 * the shell's existing transient notice channel, like every other refused write
+	 * here - a refusal with no surface is indistinguishable from a dead control.
+	 */
 	async function setExportTargetValue(target: string) {
+		const previous = exportTarget;
+		const seq = ++exportTargetSeq;
 		exportTarget = target.trim() || null;
-		await fetch('/api/notebooks/export-py', {
+		const res = await fetch('/api/notebooks/export-py', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ op: 'set-target', target, path, originId })
-		}).catch(() => {});
+		}).catch(() => null);
+		if (!res || res.ok || seq !== exportTargetSeq) return;
+		exportTarget = previous;
+		const message = await res
+			.json()
+			.then((body) => body?.message)
+			.catch(() => null);
+		onNotice?.(`Export target not set${message ? `: ${message}` : '.'}`);
 	}
 
 	/**

@@ -215,6 +215,35 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 	});
 });
 
+describe('the client half of that refusal (source guard)', () => {
+	// vitest runs without the SvelteKit plugin, so `LiveNotebook.svelte` cannot be
+	// mounted here; the properties below are what turn the route's 400 into something
+	// the human sees, so they are pinned against the source instead.
+	const src = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
+	const fn = src.slice(
+		src.indexOf('async function setExportTargetValue'),
+		src.indexOf('async function setNumberingLevel')
+	);
+
+	it('reads the response, reverts the optimistic value and says why', () => {
+		expect(fn, 'setExportTargetValue should still exist').not.toBe('');
+		// A swallowing `.catch(() => {})` with no `res.ok` read is the regression: the
+		// input keeps a rejected path while the metadata holds nothing.
+		expect(fn).not.toMatch(/\.catch\(\(\)\s*=>\s*\{\}\)/);
+		expect(fn).toMatch(/const previous = exportTarget/);
+		expect(fn).toMatch(/res\.ok/);
+		expect(fn).toMatch(/exportTarget = previous/);
+		expect(fn).toMatch(/onNotice\?\./);
+	});
+
+	it('guards the revert against a newer write (one request per keystroke)', () => {
+		// Responses are unordered, so a refusal resolving after a newer write must
+		// neither revert that newer value nor speak for it.
+		expect(fn).toMatch(/const seq = \+\+exportTargetSeq/);
+		expect(fn).toMatch(/seq !== exportTargetSeq/);
+	});
+});
+
 describe('SSE', () => {
 	it('setting the export target emits a notebook:export-target event for the UI', () => {
 		const nb = svc.targetFor('sessA');

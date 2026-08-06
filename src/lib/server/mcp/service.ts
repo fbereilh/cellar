@@ -1721,16 +1721,23 @@ function exportTargetFields(nb?: string | null) {
 }
 
 /**
- * The regeneration this call triggered FAILED. `autoExportPy` is best-effort by
- * design (a bad target must not cost the user their notebook save), so a target
- * whose parent is a file, an EACCES or an ENOSPC left the module unwritten while
- * the result claimed nothing at all - and since `module` is CONDITIONAL, its
- * absence is precisely what says the module was regenerated, with no MCP export
- * tool through which the agent could ever learn otherwise.
+ * The generated module is NOT on disk as this notebook's marks describe it: the
+ * last export attempt threw. `autoExportPy` is best-effort by design (a bad target
+ * must not cost the user their notebook save), so a target whose parent is a file,
+ * an EACCES or an ENOSPC left the module unwritten while the result claimed nothing
+ * at all - and since `module` is CONDITIONAL, its absence is precisely what says the
+ * module was regenerated, with no MCP export tool through which the agent could ever
+ * learn otherwise.
  *
- * Read back from the doc (`lastExportError`), i.e. from the attempt the persist
- * ACTUALLY made, rather than by re-running the export here - that would be a
- * second export path, and a second chance to disagree with the first.
+ * A STATE, not an attribution: `lastExportError` is doc state refreshed by every
+ * persist, and an idempotent call (every cell already at the requested value) skips
+ * the persist entirely, so the failure it reports may belong to an earlier write. The
+ * agent-facing `reason` is worded for exactly that - it says what is on disk, never
+ * that this call caused it.
+ *
+ * Read back from the doc, i.e. from the attempt the persist ACTUALLY made, rather
+ * than by re-running the export here - that would be a second export path, and a
+ * second chance to disagree with the first.
  *
  * Shared by BOTH export write tools, since both regenerate: one field, one place
  * an agent reads what happened to the module.
