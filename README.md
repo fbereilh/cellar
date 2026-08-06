@@ -6,13 +6,13 @@
 
 **A Python notebook built for you and your AI agent to share.**
 
-Cellar runs an interactive notebook in your browser on one shared Jupyter kernel, with a first-class agent interface built in. Open a folder and both you and an AI agent (like Claude Code) work the *same* live notebook: the agent adds and runs cells, and the results stream into your browser in real time. No copy-paste, no context handoff, no drift.
+Cellar runs an interactive notebook in your browser on a live Jupyter kernel, with a first-class agent interface built in. Open a folder and both you and an AI agent (like Claude Code) work the *same* live notebook: the agent adds and runs cells, and the results stream into your browser in real time. No copy-paste, no context handoff, no drift.
 
 It saves ordinary `.ipynb` files that open in vanilla Jupyter, and it keeps them git-clean so your diffs stay meaningful.
 
 ![Cellar running a live analysis notebook: a markdown heading, Python cells, and an interactive DataFrame grid, with an outline and live variable inspector in the sidebar](docs/images/hero.png)
 
-<p align="center"><em>One live notebook, one shared kernel - markdown, code, and rich outputs, with an outline and live kernel inspector alongside. (Shown in the dark theme; a light theme ships too.)</em></p>
+<p align="center"><em>One live notebook on its own kernel - markdown, code, and rich outputs, with an outline and live kernel inspector alongside. (Shown in the dark theme; a light theme ships too.)</em></p>
 
 ## Why Cellar
 
@@ -92,7 +92,7 @@ Ran it with Docker instead? Nothing was installed on the host - `docker rmi cell
 
 ## Run with Docker
 
-Prefer to skip installing anything? If you have Docker, you have Cellar. This path needs **only Docker on the host** - no Node, Python, or `uv` - and bakes a **reproducible, pinned kernel environment** into the image so every run is identical. It's meant for single-user, reproducible, zero-prerequisite use: Cellar has one shared kernel and no auth, so it is **not** for multi-user hosting.
+Prefer to skip installing anything? If you have Docker, you have Cellar. This path needs **only Docker on the host** - no Node, Python, or `uv` - and bakes a **reproducible, pinned kernel environment** into the image so every run is identical. It's meant for single-user, reproducible, zero-prerequisite use: Cellar has no auth, and one workspace and one Python environment per instance, so it is **not** for multi-user hosting.
 
 Build the image once, then point it at any project folder:
 
@@ -186,7 +186,7 @@ Cellar exposes an in-process **MCP server** that shares the live document and ke
 claude mcp add cellar -- cellar mcp
 ```
 
-(or just run `cellar` and let the auto-written `.mcp.json` do it). On connect, the agent gets a house-style doctrine that frames the work as building *one coherent notebook*, plus a rich tool set: read the notebook map and live kernel state, add/edit/move cells, run them, and clear their outputs (`add_and_run` is the preferred write-and-execute flow; `clear_outputs` sheds a stale figure or a huge traceback without deleting the cell). Because the MCP session is independent of the kernel connection, restarting the kernel never drops the agent's session or your document.
+(or just run `cellar` and let the auto-written `.mcp.json` do it). On connect, the agent gets a house-style doctrine that frames the work as building *one coherent notebook*, plus a rich tool set: read the notebook map and live kernel state, add/edit/move cells, run them, and clear their outputs (`add_and_run` is the preferred write-and-execute flow; `clear_outputs` sheds a stale figure or a huge traceback without deleting the cell). It can also see the workspace's **code roots** (`list_roots`, with the branch each one has checked out) and point its own notebook at one (`use_notebook(name, root)`), so you can ask an agent to run its notebook against a specific checkout. Because the MCP session is independent of the kernel connection, restarting the kernel never drops the agent's session or your document.
 
 **A harness that doesn't read `.mcp.json` gets set up too.** Codex reads a project `.codex/config.toml` and ignores `.mcp.json` entirely, so the first `cellar` run in a folder asks which other harnesses you use (and asks once more if a later Cellar learns to set up one it couldn't before). Any time after that:
 

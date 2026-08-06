@@ -1256,12 +1256,14 @@ async function main() {
 			'--ServerApp.disable_check_xsrf=True',
 			...cullArgs
 		],
-		// cwd must agree with root_dir: a kernel started without a notebook path
-		// (kernel.js `startNew({name:'python3'})`) inherits the sidecar's process
-		// cwd, so anchoring it at WORKSPACE (not REPO) is what makes os.getcwd(),
-		// relative reads/writes, and repo-root walks resolve in the user's project
-		// rather than Cellar's install dir. All args/env here are absolute paths
-		// (host python, JUPYTER_PATH temp dir), so they still resolve.
+		// cwd must agree with root_dir: a kernel started without a path (kernel.ts
+		// `startNew({name:'python3'})`, what a notebook that declares no code root
+		// sends) inherits the sidecar's process cwd, so anchoring it at WORKSPACE
+		// (not REPO) is what makes os.getcwd(), relative reads/writes, and repo-root
+		// walks resolve in the user's project rather than Cellar's install dir. A
+		// notebook that DOES declare a code root sends it as `path`, which
+		// jupyter_server resolves under this same root_dir. All args/env here are
+		// absolute paths (host python, JUPYTER_PATH temp dir), so they still resolve.
 		{ cwd: WORKSPACE, env: { ...process.env, JUPYTER_PATH: jupyterDir }, stdio: ['ignore', 'inherit', 'inherit'] }
 	);
 	children.push(jupyter);

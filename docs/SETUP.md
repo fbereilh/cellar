@@ -105,6 +105,50 @@ Because the kernel runs in the project venv, `import`s, `os.getcwd()`, and
 relative file reads all resolve inside your project - exactly as if you had
 launched Jupyter there yourself.
 
+### Code roots (several checkouts, one instance)
+
+A notebook may declare a **code root**: a workspace-relative directory - normally
+a git worktree created inside the workspace - that *its* kernel runs in and
+imports from, so one instance can serve several checkouts of the same repo:
+
+```sh
+git worktree add roots/pr-482 some-branch
+```
+
+Pick it in the **Code root** bar at the top of the notebook, or let an agent set it
+(`use_notebook(name, root)`; `list_roots` shows what is available). It is stored
+as `metadata.cellar.root` in the `.ipynb`, so it survives a reload and stays
+git-clean.
+
+The bar only appears once the workspace has a root (or the notebook already
+declares one), so a workspace that never adopts roots gains no new UI. The list
+is read when the notebook opens, so reload the tab if you created the worktree
+after opening it.
+
+A root moves exactly two things: the kernel process's working directory and the
+entry Cellar adds to its `sys.path`. Everything else stays workspace-wide - the
+file tree, git, search, checkpoints, `.cellar/`, and **the interpreter**: a root
+never changes which venv the kernel runs, so all of the resolution above is
+unaffected. A notebook that declares no root behaves exactly as before.
+
+Three things worth knowing before you set one:
+
+- **Changing a root frees that notebook's kernel** (a process's working directory
+  is fixed when it spawns), so its variables are cleared and its cells read "not
+  run this session". Re-declaring the root a notebook already has is a no-op.
+- **A root that is not a usable directory inside the workspace is refused**, by
+  name, rather than quietly falling back to the workspace - a notebook must never
+  claim to run against a checkout it is not running against.
+- **A `.py` (jupytext / Databricks source) notebook cannot hold one.** It is
+  written back from its cells alone and stores no notebook-level metadata, so the
+  picker is not shown and setting a root is refused; convert it to `.ipynb` first.
+  Clearing a root is always allowed.
+
+Worktrees under `roots/` are untracked files in the outer checkout - add `roots/`
+to that repo's `.gitignore` if you would rather not see them (Cellar does not edit
+your `.gitignore`). Git decorations for files *inside* a root are read from the
+outer checkout, so they may be wrong or absent.
+
 ## Connecting an agent (MCP)
 
 Connecting an agent means registering one stdio MCP server - `cellar mcp` - in
@@ -439,6 +483,18 @@ spec files at a time. Install its browser once with `npx playwright install chro
   however long it runs. Restart the kernel from the sidebar's Kernels section, and
   see `CELLAR_KERNEL_IDLE_TIMEOUT_MS` above - set it to `0` to disable the per-run
   watchdog entirely if you hit a false abort.
+- **A notebook will not run: "Notebook root ... does not exist in this workspace"** -
+  it declares a [code root](#code-roots-several-checkouts-one-instance) whose
+  directory is gone or misspelled (a worktree you removed, or a hand-edited
+  `metadata.cellar.root`). Cellar refuses to start the kernel rather than silently
+  running the notebook at the workspace root. Re-create the directory
+  (`git worktree add <root> <branch>`) or clear the root in the notebook's
+  **Code root** bar - a missing root is still listed there, marked `(missing)`,
+  so you can select the workspace and carry on.
+- **"Cannot set a code root on a .py notebook"** - a jupytext / Databricks source
+  notebook is written back from its cells alone and stores no notebook-level
+  metadata, so a root could not survive a reload. Convert it to `.ipynb` (app menu
+  → **Convert to .ipynb**) if you need one; clearing a root is always allowed.
 - **A file tab says "view-only · too large to save"** - the document is larger than a
   save request may carry (`BODY_SIZE_LIMIT`, `512K` by default), so Cellar opens it
   read-only rather than offering an edit it could never persist. Reading, syntax
