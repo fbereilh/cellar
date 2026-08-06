@@ -435,16 +435,32 @@ async function storedAffixes(page: Page): Promise<Record<string, unknown>> {
 /**
  * The affix fields persist per PROJECT (the server-side `.cellar/` store), and every
  * test in this file shares one workspace - so anything typed here would follow the
- * next test into its own upload. These tests run last and each puts the fields back.
+ * next test into its own upload, previewing and uploading under a name that test
+ * never asked for. That makes this load-bearing rather than tidiness, and it is why
+ * it runs from `afterEach` instead of as each test's last statement: a trailing call
+ * is skipped by the very failure that leaves an affix behind, so ONE genuine failure
+ * would present as several unrelated ones in the tests after it.
+ *
+ * Running after a failure means the page may be in any state, so the UI clear is
+ * best-effort and the SERVER store is what is driven to empty - it is what the next
+ * test reads. The reset is inside the poll so it re-runs: the browser's own write is
+ * debounced, and a stale one landing late is simply overwritten by the next pass.
  */
 async function clearAffixes(page: Page): Promise<void> {
-	await page.getByTestId('databricks-upload-prefix').fill('');
-	await page.getByTestId('databricks-upload-postfix').fill('');
-	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('notebook');
-	// Cleared to the SERVER's satisfaction, not merely on screen: an empty affix is
-	// persisted as a deletion, and the next test reads the store, not this page.
+	try {
+		await page.getByTestId('databricks-upload-prefix').fill('');
+		await page.getByTestId('databricks-upload-postfix').fill('');
+		await expect(page.getByTestId('databricks-upload-preview')).toHaveText('notebook');
+	} catch {
+		// The panel is not in a state to type into - the store below is the authority.
+	}
 	await expect
-		.poll(() => storedAffixes(page))
+		.poll(async () => {
+			await page.request.put(`${baseURL}/api/ui-state`, {
+				data: { [PREFIX_KEY]: null, [POSTFIX_KEY]: null }
+			});
+			return storedAffixes(page);
+		})
 		.toEqual({ prefix: undefined, postfix: undefined });
 }
 
@@ -457,132 +473,176 @@ function localToday(): { dashed: string; compact: string } {
 	return { dashed: `${yyyy}-${mm}-${dd}`, compact: `${yyyy}${mm}${dd}` };
 }
 
-test('a date prefix/postfix previews the exact name it then uploads under', async ({ page }) => {
-	await mockDatabricksStatus(page, connectedStatus);
-	await mockDatabricksClusters(page);
-	const seen = await mockUpload(page, (body) => {
-		const name = `${String(body.prefix ?? '')}notebook${String(body.postfix ?? '')}`;
-		const path = `/Users/${USER}/${name}`;
-		return { status: 200, json: { ok: true, status: 'uploaded', path, url: `${HOST}/#workspace${path}`, overwritten: false } };
+test.describe('upload name affixes', () => {
+	/* Unconditional, and `clearAffixes` explains why that matters. */
+	test.afterEach(async ({ page }) => {
+		await clearAffixes(page);
 	});
 
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await openNotebook(page);
-	await openDatabricksSection(page);
+	test('a date prefix/postfix previews the exact name it then uploads under', async ({ page }) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+		const seen = await mockUpload(page, (body) => {
+			const name = `${String(body.prefix ?? '')}notebook${String(body.postfix ?? '')}`;
+			const path = `/Users/${USER}/${name}`;
+			return { status: 200, json: { ok: true, status: 'uploaded', path, url: `${HOST}/#workspace${path}`, overwritten: false } };
+		});
 
-	const { dashed, compact } = localToday();
-	await page.getByTestId('databricks-upload-prefix').fill('{YYYY-MM-DD}_');
-	await page.getByTestId('databricks-upload-postfix').fill('_{YYYYMMDD}');
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
 
-	// The preview is the promise: tokens resolved, affixed around the notebook's own
-	// name, the extension already gone.
-	const preview = page.getByTestId('databricks-upload-preview');
-	await expect(preview).toHaveText(`${dashed}_notebook_${compact}`);
-	const promised = await preview.textContent();
+		const { dashed, compact } = localToday();
+		await page.getByTestId('databricks-upload-prefix').fill('{YYYY-MM-DD}_');
+		await page.getByTestId('databricks-upload-postfix').fill('_{YYYYMMDD}');
 
-	await page.getByTestId('databricks-upload').click();
+		// The preview is the promise: tokens resolved, affixed around the notebook's own
+		// name, the extension already gone.
+		const preview = page.getByTestId('databricks-upload-preview');
+		await expect(preview).toHaveText(`${dashed}_notebook_${compact}`);
+		const promised = await preview.textContent();
 
-	// What was SENT is the already-expanded text, so the server has no date of its own
-	// to disagree about - and the path it reports is the name the preview showed.
-	expect(seen).toHaveLength(1);
-	expect(seen[0].prefix).toBe(`${dashed}_`);
-	expect(seen[0].postfix).toBe(`_${compact}`);
-	await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/${promised}`);
+		await page.getByTestId('databricks-upload').click();
 
-	await clearAffixes(page);
-});
-
-test('the last-used prefix/postfix survive a reload', async ({ page }) => {
-	await mockDatabricksStatus(page, connectedStatus);
-	await mockDatabricksClusters(page);
-	await mockUpload(page, () => ({ status: 200, json: { ok: true, status: 'uploaded', path: WS_PATH, url: null, overwritten: false } }));
-
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await openNotebook(page);
-	await openDatabricksSection(page);
-
-	await page.getByTestId('databricks-upload-prefix').fill('daily_');
-	await page.getByTestId('databricks-upload-postfix').fill('_v2');
-	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('daily_notebook_v2');
-	// Wait for the debounced write to LAND, not for a wall-clock guess: reloading with
-	// the PUT still in flight would abort it and lose the very thing under test.
-	await expect.poll(() => storedAffixes(page)).toEqual({ prefix: 'daily_', postfix: '_v2' });
-
-	await page.reload();
-	await openNotebook(page);
-	await openDatabricksSection(page);
-
-	// Someone who uploads on a pattern should not retype it every session.
-	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('daily_');
-	await expect(page.getByTestId('databricks-upload-postfix')).toHaveValue('_v2');
-	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('daily_notebook_v2');
-
-	await clearAffixes(page);
-});
-
-test('a panel left open across midnight previews the NEW day, not the one it opened on', async ({ page }) => {
-	await mockDatabricksStatus(page, connectedStatus);
-	await mockDatabricksClusters(page);
-	const seen = await mockUpload(page, (body) => {
-		const path = `/Users/${USER}/${String(body.prefix ?? '')}notebook`;
-		return { status: 200, json: { ok: true, status: 'uploaded', path, url: null, overwritten: false } };
+		// What was SENT is the already-expanded text, so the server has no date of its own
+		// to disagree about - and the path it reports is the name the preview showed.
+		expect(seen).toHaveLength(1);
+		expect(seen[0].prefix).toBe(`${dashed}_`);
+		expect(seen[0].postfix).toBe(`_${compact}`);
+		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/${promised}`);
 	});
 
-	// `setFixedTime` pins what the page reads as "now" while leaving every timer
-	// running, so the app behaves normally - only the date moves.
-	await page.clock.setFixedTime(new Date(2026, 7, 5, 23, 59));
+	test('the last-used prefix/postfix survive a reload', async ({ page }) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+		await mockUpload(page, () => ({ status: 200, json: { ok: true, status: 'uploaded', path: WS_PATH, url: null, overwritten: false } }));
 
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await openNotebook(page);
-	await openDatabricksSection(page);
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
 
-	await page.getByTestId('databricks-upload-prefix').fill('{YYYY-MM-DD}_');
-	const preview = page.getByTestId('databricks-upload-preview');
-	await expect(preview).toHaveText('2026-08-05_notebook');
+		await page.getByTestId('databricks-upload-prefix').fill('daily_');
+		await page.getByTestId('databricks-upload-postfix').fill('_v2');
+		await expect(page.getByTestId('databricks-upload-preview')).toHaveText('daily_notebook_v2');
+		// Wait for the debounced write to LAND, not for a wall-clock guess: reloading with
+		// the PUT still in flight would abort it and lose the very thing under test.
+		await expect.poll(() => storedAffixes(page)).toEqual({ prefix: 'daily_', postfix: '_v2' });
 
-	// The laptop slept through the rollover, so no timer ever fired - the panel learns
-	// of the new day only when the window comes back. That wake path is the one that
-	// matters, which is why it is what this asserts.
-	await page.clock.setFixedTime(new Date(2026, 7, 6, 8, 30));
-	await page.evaluate(() => window.dispatchEvent(new Event('focus')));
-	await expect(preview).toHaveText('2026-08-06_notebook');
+		await page.reload();
+		await openNotebook(page);
+		await openDatabricksSection(page);
 
-	// And the promise is kept: the click sends the date the preview is showing, not
-	// the one it was opened on. A frozen preview would have promised 08-05 here.
-	await page.getByTestId('databricks-upload').click();
-	expect(seen).toHaveLength(1);
-	expect(seen[0].prefix).toBe('2026-08-06_');
-	await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/2026-08-06_notebook`);
+		// Someone who uploads on a pattern should not retype it every session.
+		await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('daily_');
+		await expect(page.getByTestId('databricks-upload-postfix')).toHaveValue('_v2');
+		await expect(page.getByTestId('databricks-upload-preview')).toHaveText('daily_notebook_v2');
+	});
 
-	await clearAffixes(page);
-});
+	test('a panel left open across midnight previews the NEW day, not the one it opened on', async ({ page }) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+		const seen = await mockUpload(page, (body) => {
+			const path = `/Users/${USER}/${String(body.prefix ?? '')}notebook`;
+			return { status: 200, json: { ok: true, status: 'uploaded', path, url: null, overwritten: false } };
+		});
 
-test('an affix that would leave your workspace folder is refused, and nothing is sent', async ({ page }) => {
-	await mockDatabricksStatus(page, connectedStatus);
-	await mockDatabricksClusters(page);
-	const seen = await mockUpload(page, () => ({
-		status: 200,
-		json: { ok: true, status: 'uploaded', path: WS_PATH, url: null, overwritten: false }
-	}));
+		// `setFixedTime` pins what the page reads as "now" while leaving every timer
+		// running, so the app behaves normally - only the date moves.
+		await page.clock.setFixedTime(new Date(2026, 7, 5, 23, 59));
 
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await openNotebook(page);
-	await openDatabricksSection(page);
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
 
-	await page.getByTestId('databricks-upload-prefix').fill('../../Shared/');
+		await page.getByTestId('databricks-upload-prefix').fill('{YYYY-MM-DD}_');
+		const preview = page.getByTestId('databricks-upload-preview');
+		await expect(preview).toHaveText('2026-08-05_notebook');
 
-	// Refused, not quietly repaired: a sanitized name is one the preview promised and
-	// the workspace never received. No preview, no upload, and the reason names the
-	// field the user can fix.
-	await expect(page.getByTestId('databricks-upload-name-error')).toContainText('prefix');
-	await expect(page.getByTestId('databricks-upload-preview')).toHaveCount(0);
-	await expect(page.getByTestId('databricks-upload')).toBeDisabled();
-	expect(seen).toHaveLength(0);
+		// The laptop slept through the rollover, so no timer ever fired - the panel learns
+		// of the new day only when the window comes back. That wake path is the one that
+		// matters, which is why it is what this asserts.
+		await page.clock.setFixedTime(new Date(2026, 7, 6, 8, 30));
+		await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+		await expect(preview).toHaveText('2026-08-06_notebook');
 
-	// And it recovers the moment the separator goes.
-	await page.getByTestId('databricks-upload-prefix').fill('shared_');
-	await expect(page.getByTestId('databricks-upload-name-error')).toHaveCount(0);
-	await expect(page.getByTestId('databricks-upload')).toBeEnabled();
+		// And the promise is kept: the click sends the date the preview is showing, not
+		// the one it was opened on. A frozen preview would have promised 08-05 here.
+		await page.getByTestId('databricks-upload').click();
+		expect(seen).toHaveLength(1);
+		expect(seen[0].prefix).toBe('2026-08-06_');
+		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/2026-08-06_notebook`);
+	});
 
-	await clearAffixes(page);
+	test('a rollover on an AWAKE machine cannot leave the preview a day behind the click', async ({ page }) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+		const seen = await mockUpload(page, (body) => {
+			const path = `/Users/${USER}/${String(body.prefix ?? '')}notebook`;
+			return { status: 200, json: { ok: true, status: 'uploaded', path, url: null, overwritten: false } };
+		});
+
+		await page.clock.setFixedTime(new Date(2026, 7, 5, 23, 59, 30));
+
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
+
+		await page.getByTestId('databricks-upload-prefix').fill('{YYYY-MM-DD}_');
+		const preview = page.getByTestId('databricks-upload-preview');
+		await expect(preview).toHaveText('2026-08-05_notebook');
+
+		// The day turns with the window still focused and nothing touched, so the wake
+		// path the test above covers never fires and the coarse tick has not come round.
+		// This is the gap the tick alone leaves.
+		await page.clock.setFixedTime(new Date(2026, 7, 6, 0, 0, 30));
+
+		await page.getByTestId('databricks-upload').click();
+
+		// The click reads the clock once and moves the preview onto that same instant, so
+		// the two cannot disagree: today's date is uploaded (never the previewed stale
+		// one) AND the name left on screen is the one that landed.
+		expect(seen).toHaveLength(1);
+		expect(seen[0].prefix).toBe('2026-08-06_');
+		await expect(preview).toHaveText('2026-08-06_notebook');
+		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/2026-08-06_notebook`);
+	});
+
+	test('an affix that would leave your workspace folder is refused, and nothing is sent', async ({ page }) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+		const seen = await mockUpload(page, () => ({
+			status: 200,
+			json: { ok: true, status: 'uploaded', path: WS_PATH, url: null, overwritten: false }
+		}));
+
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
+
+		await page.getByTestId('databricks-upload-prefix').fill('../../Shared/');
+
+		// Refused, not quietly repaired: a sanitized name is one the preview promised and
+		// the workspace never received. No preview, no upload, and the reason names the
+		// field the user can fix.
+		const nameError = page.getByTestId('databricks-upload-name-error');
+		await expect(nameError).toContainText('prefix');
+		await expect(page.getByTestId('databricks-upload-preview')).toHaveCount(0);
+		await expect(page.getByTestId('databricks-upload')).toBeDisabled();
+		expect(seen).toHaveLength(0);
+
+		// The reason is ANNOUNCED, not merely on screen: the button it disables says
+		// nothing, so a reader tabbing off the field would otherwise get no reason at all.
+		const errorId = await nameError.getAttribute('id');
+		expect(errorId).toBeTruthy();
+		for (const field of ['databricks-upload-prefix', 'databricks-upload-postfix']) {
+			await expect(page.getByTestId(field)).toHaveAttribute('aria-invalid', 'true');
+			await expect(page.getByTestId(field)).toHaveAttribute('aria-describedby', errorId!);
+		}
+
+		// And it recovers the moment the separator goes - the link goes with the reason.
+		await page.getByTestId('databricks-upload-prefix').fill('shared_');
+		await expect(nameError).toHaveCount(0);
+		await expect(page.getByTestId('databricks-upload')).toBeEnabled();
+		await expect(page.getByTestId('databricks-upload-prefix')).not.toHaveAttribute('aria-describedby');
+	});
 });

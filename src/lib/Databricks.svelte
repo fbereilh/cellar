@@ -1011,6 +1011,12 @@
 	 * so a minute is ample; the tokens carry no time of day, so nothing finer is
 	 * observable. Armed only while the section is EXPANDED (the panel stays mounted
 	 * when it is folded away) and torn down with the component.
+	 *
+	 * The tick alone would still leave a gap on an AWAKE machine: for up to one
+	 * interval after a rollover the preview names yesterday while the click resolves
+	 * today. So `uploadToWorkspace` reads the clock once and moves this onto that same
+	 * instant, which closes the gap without ever letting a stale preview decide what is
+	 * uploaded.
 	 */
 	const UPLOAD_CLOCK_TICK_MS = 60_000;
 	let uploadNow = $state(new Date());
@@ -1051,6 +1057,8 @@
 	const uploadPreview = $derived(uploadFileName ? uploadResolved.name : '');
 	/** Why the affixes cannot be used, or ''. Blocks the button rather than repairing them. */
 	const uploadNameError = $derived(uploadResolved.error ?? '');
+	/** Ties that reason to both affix fields, so it is announced and not merely shown. */
+	const uploadNameErrorId = $props.id();
 	/**
 	 * The token vocabulary, for the fields' tooltip. Each example is the token's REAL
 	 * expansion against the same clock the preview uses, never a stored string - a
@@ -1125,15 +1133,24 @@
 	 * (the server's own expansion finds nothing left to expand). `pinned` is how a
 	 * Replace re-uses the affixes its confirm was armed with instead of re-resolving
 	 * them: the box names a path, and that must be the path that gets overwritten.
+	 *
+	 * The clock is read FRESH here and the preview is moved onto that same instant -
+	 * one read, used twice - so the two cannot disagree even in the window between
+	 * ticks right after a date rollover. The direction matters: the preview catches up
+	 * to the click, never the reverse, because someone uploading today must get today's
+	 * date whatever the panel has been showing.
 	 */
 	async function uploadToWorkspace(overwrite = false, pinned?: { prefix: string; postfix: string }) {
 		if (busy) return;
 		let affixes = pinned;
 		if (!affixes) {
-			const resolved = resolveUploadName(uploadFileName || 'notebook', {
-				prefix: uploadPrefix,
-				postfix: uploadPostfix
-			});
+			const now = new Date();
+			uploadNow = now;
+			const resolved = resolveUploadName(
+				uploadFileName || 'notebook',
+				{ prefix: uploadPrefix, postfix: uploadPostfix },
+				now
+			);
 			if (resolved.error) {
 				// Refused, not repaired: a silently sanitized affix would upload under a
 				// name the preview never showed. Nothing is sent.
@@ -1783,6 +1800,8 @@
 				disabled={uploadConfirmBusy}
 				placeholder="{'{YYYY-MM-DD}'}_"
 				title={uploadTokenHelp}
+				aria-invalid={!!uploadNameError}
+				aria-describedby={uploadNameError ? uploadNameErrorId : undefined}
 				data-testid="databricks-upload-prefix"
 			/>
 		</label>
@@ -1795,12 +1814,21 @@
 				disabled={uploadConfirmBusy}
 				placeholder="_{'{YYYYMMDD}'}"
 				title={uploadTokenHelp}
+				aria-invalid={!!uploadNameError}
+				aria-describedby={uploadNameError ? uploadNameErrorId : undefined}
 				data-testid="databricks-upload-postfix"
 			/>
 		</label>
 	</div>
 	{#if uploadNameError}
-		<p class="mt-1 text-[11px] leading-relaxed text-error" data-testid="databricks-upload-name-error">
+		<!-- Linked to BOTH fields, not merely rendered beside them: the refusal disables
+		     the button, so a reader tabbing off the field lands on a control that says
+		     nothing, and this sentence is the whole reason the upload did not happen. -->
+		<p
+			id={uploadNameErrorId}
+			class="mt-1 text-[11px] leading-relaxed text-error"
+			data-testid="databricks-upload-name-error"
+		>
 			{uploadNameError}
 		</p>
 	{:else if uploadPreview}
