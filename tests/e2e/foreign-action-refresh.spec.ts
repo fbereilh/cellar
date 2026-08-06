@@ -220,6 +220,9 @@ test('an AGENT run in a notebook the user is NOT viewing never probes the kernel
 	// can only ever probe the wrong one - wasted work on the kernel the user IS
 	// using. The badge half still refreshes: it belongs to no single notebook.
 	const OTHER_NB = 'agent-only.ipynb';
+	// Open-or-create the notebook this test VIEWS, so it never leans on an earlier
+	// test having made it; the `use_notebook(OTHER_NB)` below re-pins the session.
+	await call('use_notebook', { name: NB });
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await page.getByTestId('tree-file').filter({ hasText: NB }).dblclick();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
