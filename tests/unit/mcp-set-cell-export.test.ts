@@ -111,7 +111,7 @@ describe('set_cell_export marks and unmarks code cells', () => {
 		const r = svc.setCellExport([code[0]], true, target);
 
 		expect(r).toMatchObject({ ok: true, count: 1 });
-		expect(r.ok && r.exported).toEqual([code[0]]);
+		expect(r.ok && r.cells).toEqual([code[0]]);
 		expect(marked(target, code[0])).toBe(true);
 		expect(marked(target, code[1])).toBe(false);
 	});
@@ -129,7 +129,7 @@ describe('set_cell_export marks and unmarks code cells', () => {
 	it('collapses duplicate ids instead of reporting the cell twice', async () => {
 		const { target, code } = await makeNotebook('mark-dupes.ipynb');
 		const r = svc.setCellExport([code[0], code[0], code[1]], true, target);
-		expect(r.ok && r.exported).toEqual([code[0], code[1]]);
+		expect(r.ok && r.cells).toEqual([code[0], code[1]]);
 		expect(r.ok && r.count).toBe(2);
 	});
 
@@ -149,7 +149,7 @@ describe('set_cell_export marks and unmarks code cells', () => {
 		off();
 
 		expect(again).toMatchObject({ ok: true, count: 2 });
-		expect(again.ok && again.exported).toEqual(code);
+		expect(again.ok && again.cells).toEqual(code);
 		expect(readFileSync(target, 'utf8')).toBe(before);
 		expect(seen).toHaveLength(0);
 		expect(exp.calls).toBe(0);
@@ -480,10 +480,9 @@ describe('the generated module follows the marks', () => {
 		svc.setCellExport(code, true, target);
 
 		const off = svc.setCellExport([code[0]], false, target);
-		// `exported` names the cells that now carry the REQUESTED value - here the one
-		// that is no longer in the module. The description says so, because the field
-		// name alone reads the other way round.
-		expect(off.ok && off.exported).toEqual([code[0]]);
+		// `cells` names the cells that now carry the REQUESTED value - here the one
+		// that is no longer in the module, which is why it is not called `exported`.
+		expect(off.ok && off.cells).toEqual([code[0]]);
 		expect(marked(target, code[0])).toBe(false);
 		const module = readFileSync(join(WS, 'lib/unmark.py'), 'utf8');
 		expect(module).not.toContain('def one():');
@@ -783,6 +782,10 @@ describe('at the wire: the tool is really callable', () => {
 		})) as CallResult;
 		expect(ok.isError).toBeFalsy();
 		expect(JSON.parse(body(ok))).toMatchObject({ ok: true, count: 1, export_target: 'lib/wire.py' });
+		// The list is named for what it HOLDS - the addressed cells now carrying the
+		// requested value - so it cannot misname itself on an unmark.
+		expect(Object.keys(JSON.parse(body(ok)))).toContain('cells');
+		expect(Object.keys(JSON.parse(body(ok)))).not.toContain('exported');
 		expect(readFileSync(join(WS, 'lib/wire.py'), 'utf8')).toContain('def one():');
 
 		const bad = (await client.callTool({
@@ -844,9 +847,10 @@ describe('the tool registration', () => {
 		// where an agent most needs the truth.
 		expect(line).not.toMatch(/[Rr]egenerates the `\.py` immediately/);
 		expect(line).toMatch(/module\.regenerated:false/);
-		// `exported` names the ADDRESSED cells, which on export:false are the ones NOT
-		// in the module - the field name alone reads the other way round.
+		// `cells` names the ADDRESSED cells, which on export:false are the ones NOT
+		// in the module, so the description has to say which direction it means.
 		expect(line).toMatch(/REQUESTED value/);
+		expect(line).toMatch(/\{ok, cells, count, export_target\}/);
 		// The mechanical bound `clear_outputs` set: an honesty correction here has to
 		// be paid for by cutting words, not by growing what every session is billed.
 		const desc = line.match(/description: '(.*?)', inputSchema/);

@@ -1631,12 +1631,12 @@ export function setExportTarget(target: string | null | undefined, nb?: string |
  * loses nothing an agent could have had, and unlike reporting success it claims
  * nothing false and spends no blocking jupytext rewrite.
  *
- * `exported` reports the RESULTING state - every ADDRESSED cell that now carries
+ * `cells` reports the RESULTING state - every ADDRESSED cell that now carries
  * the REQUESTED value - not a change count, so a repeated mark reports the same
- * list rather than an empty one an agent would read as a failure. Note what that
- * means in the unmark direction, which the name alone does not say and the tool
- * description therefore spells out: on `export:false` the list names the cells
- * that are now OUT of the module, never the ones in it. A cell already at that
+ * list rather than an empty one an agent would read as a failure. It is named for
+ * what it holds rather than for one direction of the call: `exported` actively
+ * misnamed it on `export:false`, where the list is the cells now OUT of the
+ * module, never the ones in it (the tool description says so too). A cell already at that
  * value is not rewritten, so an idempotent call persists nothing and regenerates
  * nothing (zero git diff, no `.py` mtime churn).
  *
@@ -1689,7 +1689,7 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 	const where = exportTargetFields(target);
 	return {
 		ok: true as const,
-		exported: marked,
+		cells: marked,
 		count: marked.length,
 		...where,
 		...moduleWarning(target, where.export_target, wrote)

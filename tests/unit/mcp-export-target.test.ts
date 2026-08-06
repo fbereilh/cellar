@@ -289,6 +289,12 @@ describe('the client half of that refusal (source guard)', () => {
 		expect(exportFn).toMatch(/if \(!targetCommitted\) return null;/);
 		// The promise is consumed, so one refusal cannot mute every later export.
 		expect(exportFn).toMatch(/exportTargetCommit = null;/);
+		// And it DROPS ITSELF once it settles, so the abort belongs to the
+		// blur-then-click interaction and nothing else: a settled refusal left here
+		// aborted the NEXT export - one that would have run fine - with no message at
+		// all, since that export never issued a request to report on.
+		expect(fn).toMatch(/commit\.then\(drop, drop\)/);
+		expect(fn).toMatch(/if \(exportTargetCommit === commit\) exportTargetCommit = null;/);
 		// The commit reports refusal rather than swallowing it.
 		const commitFn = src.slice(src.indexOf('async function commitExportTarget'), src.indexOf('async function setNumberingLevel'));
 		expect(commitFn).toMatch(/Promise<boolean>/);

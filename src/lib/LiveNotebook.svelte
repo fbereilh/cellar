@@ -2081,9 +2081,15 @@
 	 */
 	let confirmedExportTarget: string | null = null;
 	/**
-	 * The in-flight target write, so the manual export can wait for it to land -
+	 * The IN-FLIGHT target write, so the manual export can wait for it to land -
 	 * and learn whether it was REFUSED (`false`), since pressing Export blurs the
 	 * input and therefore commits the edit first.
+	 *
+	 * It is dropped the moment it SETTLES, because that is what makes the abort in
+	 * `exportPy` belong to the blur-then-click interaction and nothing else: a
+	 * refusal kept here after settling silently aborted the NEXT manual export -
+	 * one that would have run fine against the confirmed target - and produced no
+	 * message at all, since the export never issued a request to report on.
 	 */
 	let exportTargetCommit: Promise<boolean> | null = null;
 
@@ -2115,7 +2121,12 @@
 		const next = target.trim() || null;
 		exportTarget = next;
 		if (next === confirmedExportTarget) return;
-		exportTargetCommit = commitExportTarget(target, next);
+		const commit = commitExportTarget(target, next);
+		exportTargetCommit = commit;
+		const drop = () => {
+			if (exportTargetCommit === commit) exportTargetCommit = null;
+		};
+		commit.then(drop, drop);
 	}
 
 	async function commitExportTarget(raw: string, next: string | null): Promise<boolean> {
@@ -2168,15 +2179,17 @@
 	 * stored: exporting on would run against the previous (or absent) target and its
 	 * generic outcome would REPLACE the refusal's own reason on the single notice
 	 * channel - telling the user to set a target they just tried to set. The refusal
-	 * already explained itself, so nothing more is said here. A failure carries the server's
+	 * already explained itself, so nothing more is said here. That abort is scoped to a
+	 * commit still IN FLIGHT (an already-settled one drops itself), so a refusal the
+	 * user has since moved on from can never silently abort a later export. A failure carries the server's
 	 * own reason - the refusals this path can hit ("it is not a Cellar-generated
 	 * module", a non-`.py` or escaping target) exist for their actionable message, and
 	 * a generic "Export failed." names no cause - reported through the same transient
 	 * notice channel as every other refused write here.
 	 */
 	async function exportPy() {
-		// Consumed, so a refusal cannot abort every LATER export too (the field has been
-		// reverted to the confirmed value, so a second click is a fresh request).
+		// Consumed, so one refusal cannot abort two exports (the field has been reverted
+		// to the confirmed value, so a second click is a fresh request).
 		const pending = exportTargetCommit;
 		exportTargetCommit = null;
 		const targetCommitted = (await pending?.catch(() => true)) ?? true;
