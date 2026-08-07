@@ -9,6 +9,7 @@
 	import {
 		UPLOAD_DATE_TOKENS,
 		expandDateTokens,
+		isStorableAffix,
 		resolveUploadName,
 		unknownAffixTokens,
 		unknownTokenWarning
@@ -107,11 +108,22 @@
 		// unusable DEFAULT disables it in every project that never set its own, under a
 		// message naming a field the user never typed into there.
 		//
+		// Judged PER FIELD, from the affix being written and nothing else - deliberately
+		// NOT through the pane's `defaultsResolved`, which is what is SHOWN below and
+		// validates the PAIR. Each field is its own key, so a combined verdict silently
+		// refused to store a perfectly good postfix while the prefix was invalid, and the
+		// write that ran when the prefix was fixed carried only the prefix: the typed
+		// postfix was never persisted by anything. `isStorableAffix` also leaves out the
+		// assembled name's LENGTH, which is measured here against a placeholder stem and
+		// is no fact about a default that meets a different stem in every project.
+		//
 		// The consequence is deliberate: a previously VALID stored default is left
-		// untouched while the field holds invalid text, so reopening Settings shows the
-		// last good value. Do NOT "fix" that by deleting the stored default - that would
-		// discard a working setting over a half-typed character.
-		if (defaultsResolved.error) return;
+		// untouched while the field holds invalid text, so a RELOAD shows the last good
+		// value. Within the session the field keeps the invalid text - this component is
+		// mounted for the life of the shell and seeds once, so closing and reopening the
+		// modal re-reads nothing. Do NOT "fix" that by deleting the stored default - that
+		// would discard a working setting over a half-typed character.
+		if (!isStorableAffix(v, defaultsNow)) return;
 		// An empty default is NO default, so the key is deleted rather than stored as
 		// `''`. That is the opposite of the per-project field - deliberately: there,
 		// empty is a real answer ("no prefix on this project") that has to outrank this

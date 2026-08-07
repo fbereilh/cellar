@@ -612,6 +612,37 @@ test('an invalid default is refused, and the last valid one survives it', async 
 	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('FIXED_');
 });
 
+test('one invalid field never costs the OTHER field its value', async ({ page }) => {
+	// The two defaults are independent keys, so the verdict has to be per FIELD. Judged
+	// by the assembled PAIR, a broken prefix refused to store a perfectly good postfix,
+	// and the write that ran when the prefix was fixed carried only the prefix - so the
+	// postfix the user typed was lost with nothing left that would ever write it.
+	await mockDatabricks(page);
+	await openProject(page, urlB);
+	await openSettings(page);
+
+	const prefix = page.getByTestId('settings-upload-prefix');
+	const postfix = page.getByTestId('settings-upload-postfix');
+
+	await prefix.fill('bad/name_');
+	await expect(page.getByTestId('settings-upload-error')).toBeVisible();
+
+	// Typed while the pane is showing an error about the OTHER field. It is a usable
+	// affix on its own, so it is stored on its own.
+	await postfix.fill('_end');
+	await expect.poll(() => storedDefaults()[POSTFIX_DEFAULT_KEY]).toBe('_end');
+	// …while the prefix is still refused.
+	expect(storedDefaults()[PREFIX_DEFAULT_KEY]).toBeUndefined();
+
+	// Fixing the prefix leaves BOTH in the store - nothing typed along the way is
+	// stranded, which is what the per-field rule buys.
+	await prefix.fill('x_');
+	await expect(page.getByTestId('settings-upload-error')).toHaveCount(0);
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('x_');
+	expect(storedDefaults()[POSTFIX_DEFAULT_KEY]).toBe('_end');
+	await expect(page.getByTestId('settings-upload-preview')).toHaveText('x_notebook_end');
+});
+
 test('CLEARING a project field is an answer, so the default does not creep back', async ({ page }) => {
 	// A default has to be in force, or there would be nothing to creep back.
 	await seedGlobalDefault(page, urlB, 'GLOBAL_');

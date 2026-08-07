@@ -4,6 +4,7 @@ import {
 	UPLOAD_DATE_TOKENS,
 	expandDateTokens,
 	insertUploadToken,
+	isStorableAffix,
 	notebookStem,
 	resolveUploadName,
 	unknownDateTokens,
@@ -394,6 +395,54 @@ describe('an affix can never move the upload out of /Users/<you>/', () => {
 
 	it('an affix that empties to nothing still leaves a usable name', () => {
 		expect(resolveUploadName('analysis.ipynb', { prefix: '   ', postfix: '' }, DAY).error).toBeNull();
+	});
+});
+
+describe('whether ONE affix is worth storing, judged on its own', () => {
+	// The cross-project default has two independent fields written to two keys, so it
+	// has to decide each separately. Judged by the PAIR, an invalid prefix refused to
+	// store a perfectly good postfix, and the write that ran once the prefix was fixed
+	// carried only the prefix - the typed postfix was lost with nothing left to write it.
+
+	it('accepts an ordinary affix, empty included', () => {
+		expect(isStorableAffix('report_', DAY)).toBe(true);
+		expect(isStorableAffix('', DAY)).toBe(true);
+		expect(isStorableAffix(null, DAY)).toBe(true);
+		expect(isStorableAffix(undefined, DAY)).toBe(true);
+	});
+
+	it('keeps the tokens usable - it judges what they EXPAND to', () => {
+		expect(isStorableAffix('{YYYY-MM-DD}_', DAY)).toBe(true);
+		// A brace nothing recognises stays literal, and a literal is not unusable.
+		expect(isStorableAffix('{FOO}_', DAY)).toBe(true);
+	});
+
+	it('refuses a separator or a control character - the one fact about the affix itself', () => {
+		expect(isStorableAffix('bad/name_', DAY)).toBe(false);
+		expect(isStorableAffix('bad\\name_', DAY)).toBe(false);
+		expect(isStorableAffix('bad\u0007name_', DAY)).toBe(false);
+	});
+
+	it('does NOT judge LENGTH, which is a fact about the assembled name', () => {
+		// A default meets a different stem in every project, so a verdict measured from
+		// any one of them would refuse to save a pattern that is fine everywhere real.
+		const long = 'a'.repeat(MAX_UPLOAD_NAME_CHARS + 50);
+		expect(isStorableAffix(long, DAY)).toBe(true);
+		// The bound still bites where it belongs: on the name being uploaded.
+		expect(resolveUploadName('analysis.ipynb', { prefix: long }, DAY).error).toContain(
+			'Shorten the prefix or postfix'
+		);
+	});
+
+	it('agrees with the resolver about the affix it refuses', () => {
+		// One rule, one owner: whatever this refuses is exactly what `resolveUploadName`
+		// blames the affix (rather than the file) for.
+		for (const bad of ['a/b', 'a\\b', 'a\u001fb']) {
+			expect(isStorableAffix(bad, DAY)).toBe(false);
+			expect(resolveUploadName('analysis.ipynb', { prefix: bad }, DAY).error).toContain(
+				'The prefix cannot contain'
+			);
+		}
 	});
 });
 

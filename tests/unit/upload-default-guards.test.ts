@@ -10,6 +10,9 @@
  *      GLOBAL default disables it in every project that never set its own, under a
  *      message naming a field the user never typed into there. Refuse, never repair -
  *      and never delete a previously valid stored default over a half-typed character.
+ *      The verdict must be PER FIELD (`isStorableAffix`), never the pane's combined
+ *      `defaultsResolved`: each affix is its own key, so a paired verdict refuses to
+ *      store a good postfix while the prefix is invalid and then never writes it.
  *
  *   2. `Databricks.svelte`'s DEFERRED affix seed must not drop an armed replace confirm.
  *      For a `status:'exists'` reply that box is the ENTIRE outcome (`uploadDone` and
@@ -45,6 +48,19 @@ function blockAt(src: string, marker: string, where: string): string {
 	throw new Error(`unbalanced block at anchor: ${marker}`);
 }
 
+/**
+ * `src` with its `//` comments dropped.
+ *
+ * A guard that asserts something is ABSENT has to read the code alone: these blocks
+ * carry long comments that NAME the mechanism they were changed away from - which is
+ * exactly the prose worth keeping - and a raw scan reads that as the mechanism still
+ * being there. (Naive about a `//` inside a string or a regex; neither appears in the
+ * blocks pinned here, and a false positive would fail loudly rather than pass.)
+ */
+function codeOnly(src: string): string {
+	return src.replace(/^\s*\/\/.*$/gm, '');
+}
+
 describe('Settings: an invalid upload default is refused, not persisted', () => {
 	const fn = blockAt(
 		SETTINGS,
@@ -52,8 +68,10 @@ describe('Settings: an invalid upload default is refused, not persisted', () => 
 		'Settings.svelte'
 	);
 
-	it('returns on a resolve error BEFORE reaching the store', () => {
-		const guard = fn.indexOf('if (defaultsResolved.error) return;');
+	const GUARD = 'if (!isStorableAffix(v, defaultsNow)) return;';
+
+	it('returns on an unusable affix BEFORE reaching the store', () => {
+		const guard = fn.indexOf(GUARD);
 		const write = fn.indexOf('setUserSetting(');
 		expect(guard, 'no validation guard in setUploadDefault').toBeGreaterThan(-1);
 		expect(write, 'setUploadDefault no longer writes the store').toBeGreaterThan(-1);
@@ -61,12 +79,19 @@ describe('Settings: an invalid upload default is refused, not persisted', () => 
 		expect(guard).toBeLessThan(write);
 	});
 
+	it('judges the field being written, never the pane-wide resolve', () => {
+		// `defaultsResolved` validates the PAIR against one assembled name, so gating on
+		// it lost a valid postfix typed while the prefix was broken - and the recovering
+		// write carries only `which`, so nothing ever put that postfix back.
+		expect(codeOnly(fn)).not.toContain('defaultsResolved');
+	});
+
 	it('still reflects what was typed, so the field shows it and the error explains it', () => {
 		// Local state is assigned unconditionally, ahead of the guard - the refusal is
 		// about the STORE, never about repairing or discarding the user's text.
 		const local = fn.indexOf('uploadPrefixDefault = v;');
 		expect(local).toBeGreaterThan(-1);
-		expect(local).toBeLessThan(fn.indexOf('if (defaultsResolved.error) return;'));
+		expect(local).toBeLessThan(fn.indexOf(GUARD));
 	});
 });
 
@@ -81,7 +106,7 @@ describe('Databricks: a deferred affix seed keeps the armed replace confirm', ()
 		// `clearUploadFeedback` is the one owner of that teardown, and it is reachable
 		// here only on the not-arrived path above. A direct write would resurrect the
 		// bug: the box dismissed a frame after an `exists` reply put it on screen.
-		expect(fn).not.toMatch(/uploadExistsPath\s*=/);
-		expect(fn).not.toMatch(/uploadExistsAffixes\s*=/);
+		expect(codeOnly(fn)).not.toMatch(/uploadExistsPath\s*=/);
+		expect(codeOnly(fn)).not.toMatch(/uploadExistsAffixes\s*=/);
 	});
 });

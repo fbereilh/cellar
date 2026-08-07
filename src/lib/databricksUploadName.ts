@@ -72,6 +72,39 @@ const BRACED = /\{[^{}]*\}/g;
  */
 const FORBIDDEN = /[\u0000-\u001f\u007f/\\]/;
 
+/** The one reader of `FORBIDDEN`, so the rule keeps a single owner. */
+function hasForbiddenChars(value: string): boolean {
+	return FORBIDDEN.test(value);
+}
+
+/**
+ * Whether `affix` is worth STORING as a reusable pattern, judged from its own text
+ * ALONE.
+ *
+ * The cross-project default in the Settings pane is the caller, and is why this
+ * exists: it holds two INDEPENDENT fields, each written to its own key, so it has to
+ * decide each one's fate separately. `resolveUploadName`'s verdict is the wrong
+ * instrument for that - it validates the PAIR against one assembled name, so an
+ * invalid prefix silently refused to store a perfectly good postfix, and once the
+ * prefix was fixed nothing ever wrote that postfix either (the recovering write
+ * persists only the field being edited). The typed value was simply lost.
+ *
+ * Exactly one of the resolver's checks is a fact about the affix itself, and it is
+ * the one that matters here: FORBIDDEN characters. A separator would redirect the
+ * upload out of the user's own workspace folder, and a control character is
+ * invisible - in every project, whatever else the name is made of.
+ *
+ * What is deliberately NOT applied is the LENGTH ceiling. That bounds the ASSEMBLED
+ * name, and a cross-project default meets a different stem in every project, so a
+ * verdict computed from any one of them is no fact about the pattern: it would refuse
+ * to save a default that fits perfectly well in every real project, and could not
+ * promise it fits in any. Length stays where it belongs, on the name actually being
+ * uploaded, which `resolveUploadName` still checks and every preview still shows.
+ */
+export function isStorableAffix(affix: string | null | undefined, now: Date = new Date()): boolean {
+	return !hasForbiddenChars(expandDateTokens(affix ?? '', now));
+}
+
 /**
  * The tokens an affix may carry, in the order the UI should list them.
  *
@@ -272,7 +305,7 @@ type NameProblem = 'empty' | 'dots' | 'forbidden' | 'too-long';
 function nameProblem(name: string): NameProblem | null {
 	if (!name) return 'empty';
 	if (name === '.' || name === '..') return 'dots';
-	if (FORBIDDEN.test(name)) return 'forbidden';
+	if (hasForbiddenChars(name)) return 'forbidden';
 	if (name.length > MAX_UPLOAD_NAME_CHARS) return 'too-long';
 	return null;
 }
@@ -323,7 +356,7 @@ export function resolveUploadName(
 		['prefix', prefix],
 		['postfix', postfix]
 	] as [Affix, string][]) {
-		if (FORBIDDEN.test(value)) {
+		if (hasForbiddenChars(value)) {
 			return {
 				name: '',
 				prefix,
