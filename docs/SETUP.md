@@ -149,6 +149,13 @@ to that repo's `.gitignore` if you would rather not see them (Cellar does not ed
 your `.gitignore`). Git decorations for files *inside* a root are read from the
 outer checkout, so they may be wrong or absent.
 
+The one surface that reads a root's OWN checkout is the sidebar's **Git** section:
+one row per open notebook, naming the code root it runs from and that checkout's
+branch, short SHA, commit subject and date, with a dot when it has uncommitted
+changes. It is read-only - it reports where each kernel's code comes from and does
+not stage, commit, push, or switch branches - and it is collapsed by default,
+running `git` only while it is open. Clicking a row focuses that notebook's tab.
+
 ## Connecting an agent (MCP)
 
 Connecting an agent means registering one stdio MCP server - `cellar mcp` - in
