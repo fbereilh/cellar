@@ -83,6 +83,14 @@ failures burning ~18 minutes of expect-timeouts on results that were meaningless
 in both directions. The launcher now refuses a stale build outright
 (`src/lib/server/build-freshness.js`; `CELLAR_SKIP_BUILD_CHECK=1` overrides).
 
+`bootCellar` (`tests/e2e/harness.ts`) points `CELLAR_USER_SETTINGS` at the
+throwaway workspace's `.cellar/` **by default**, so no spec can rewrite the
+cross-project settings of whoever ran the suite - every booted app reads that
+store on its first SSR load, so this can't be left to the specs that write it.
+Pass the same path through `bootCellar`'s second argument when two launchers must
+share one global store (that is what proves a default reaches a second project);
+otherwise leave it alone.
+
 The suite runs at **`workers: 2`** locally (`playwright.config.ts`) - ~2.5 min
 instead of ~6, verified green across repeated full runs. `fullyParallel` stays
 `false` (tests within a file share one launcher, workspace and kernel). Don't
