@@ -1042,12 +1042,18 @@
 	 * self-heals because the effect below tracks that gate, so the seed lands the
 	 * moment the attempt settles.
 	 *
-	 * What a deferred seed then keeps is decided by KIND, not by age: an outcome that
-	 * arrived while it waited (the "uploaded to"/"replaced" note, or an error) is a
-	 * past-tense record of an attempt the user themself confirmed and is the very
-	 * thing they are still waiting to read, so it survives - while an armed replace
-	 * confirm is a PENDING action naming a path these fields would no longer upload
-	 * to, so it goes in every case, exactly as typing drops it.
+	 * A deferred seed then keeps WHATEVER the attempt it waited on produced, and the
+	 * asymmetry with typing is the point. The "uploaded to"/"replaced" note (or an
+	 * error) is a past-tense record of an attempt the user themself confirmed and is
+	 * the very thing they are still waiting to read. An armed replace confirm survives
+	 * for a stronger reason still: a `status:'exists'` reply leaves both of those null,
+	 * so the box IS the entire outcome, and dropping it would leave NOTHING on screen
+	 * for an attempt that has just settled - indistinguishable from an upload that
+	 * silently did nothing. That the box names a path built from the OLD affixes is not
+	 * a reason to drop it either: `uploadExistsAffixes` PINS them, so Replace overwrites
+	 * exactly the path the box names, which is what makes keeping it self-consistent.
+	 * An IMMEDIATE seed - nothing was in flight, so nothing arrived - still clears
+	 * everything, exactly as typing does.
 	 */
 	let uploadSeedDeferred = false;
 	let uploadSeedDeferredAt = 0;
@@ -1071,14 +1077,9 @@
 		uploadSeedDeferred = false;
 		uploadPrefix = prefix;
 		uploadPostfix = postfix;
-		if (arrived) {
-			// Keep the outcome, drop the pending action. Nothing is in flight here (the
-			// gate has lifted), so this deliberately does NOT bump `uploadSeq`.
-			uploadExistsPath = '';
-			uploadExistsAffixes = null;
-		} else {
-			clearUploadFeedback();
-		}
+		// Whatever arrived while this seed waited is kept, armed confirm included - see
+		// the note above for why the `exists` shape is the case that decides this.
+		if (!arrived) clearUploadFeedback();
 	}
 	$effect(() => {
 		// The SUBSCRIPTION is the case that matters: the Settings modal sits OVER an

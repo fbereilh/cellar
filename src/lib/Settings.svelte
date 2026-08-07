@@ -99,6 +99,19 @@
 	function setUploadDefault(which: 'prefix' | 'postfix', v: string) {
 		if (which === 'prefix') uploadPrefixDefault = v;
 		else uploadPostfixDefault = v;
+		// Refused, never repaired - the same rule the upload itself follows, applied at
+		// the moment the pattern is authored. The field keeps exactly what was typed and
+		// the error below says why, but nothing unusable reaches the global store. The
+		// BLAST RADIUS is what makes this stricter than the sidebar's own field: an
+		// unusable affix there disables the upload in the one project on screen, while an
+		// unusable DEFAULT disables it in every project that never set its own, under a
+		// message naming a field the user never typed into there.
+		//
+		// The consequence is deliberate: a previously VALID stored default is left
+		// untouched while the field holds invalid text, so reopening Settings shows the
+		// last good value. Do NOT "fix" that by deleting the stored default - that would
+		// discard a working setting over a half-typed character.
+		if (defaultsResolved.error) return;
 		// An empty default is NO default, so the key is deleted rather than stored as
 		// `''`. That is the opposite of the per-project field - deliberately: there,
 		// empty is a real answer ("no prefix on this project") that has to outrank this

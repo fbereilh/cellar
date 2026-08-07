@@ -36,7 +36,11 @@ import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
  *     names a path built from the OLD one - while a seed that changes nothing
  *     (reopening the section) leaves a still-accurate box alone;
  *   - the same change made while a replace is IN FLIGHT defers instead, so the
- *     settled reply is never discarded as superseded, and applies once it lands;
+ *     settled reply is never discarded as superseded, and applies once it lands -
+ *     and when that reply is an `exists`, the confirm it arms SURVIVES the deferred
+ *     seed, because there it is the only outcome there is;
+ *   - a default that fails validation is refused rather than persisted, and the last
+ *     valid one is left standing;
  *   - clearing a project's field is an ANSWER ("no prefix here"), so the default
  *     does not creep back on the next load;
  *   - the default is a FILE, not per-origin state, which is the whole reason it is
@@ -505,6 +509,107 @@ test('a default changed MID-REPLACE never discards the reply, and lands once it 
 	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('HELD_');
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('HELD_notebook');
 	await expect(note).toContainText(`/Users/${USER}/GLOBAL_notebook`);
+});
+
+test('a default changed mid-upload never leaves an `exists` reply with nothing on screen', async ({
+	page
+}) => {
+	// The sibling of the test above, and the case where "keep the outcome, drop the
+	// pending action" was wrong. An `exists` reply sets NEITHER the note nor an error,
+	// so the confirm box is the entire outcome: dropping it left the user watching an
+	// upload that appeared to have done nothing, with the file still unwritten and the
+	// one control that could resolve that gone.
+	await seedGlobalDefault(page, urlB, 'GLOBAL_');
+	await mockDatabricks(page);
+	const seen: Record<string, unknown>[] = [];
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => (release = resolve));
+	await page.route(/\/api\/databricks\/upload$/, async (route) => {
+		const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;
+		seen.push(body);
+		const path = `/Users/${USER}/${String(body.prefix ?? '')}notebook`;
+		if (body.overwrite === true) {
+			return route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({ ok: true, status: 'uploaded', path, url: null, overwritten: true })
+			});
+		}
+		// Held, so the default below really does change while THIS reply is in flight -
+		// which is what makes the seed defer and land on top of the armed box.
+		await held;
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ ok: true, status: 'exists', path, url: null, overwritten: false })
+		});
+	});
+	await openProject(page, urlB);
+	await openDatabricksSection(page);
+	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('GLOBAL_');
+
+	await page.getByTestId('databricks-upload').click();
+	await expect(page.getByTestId('databricks-upload')).toBeDisabled();
+
+	await openSettings(page);
+	await page.getByTestId('settings-upload-prefix').fill('HELD_');
+	await closeSettings(page);
+	// Confirm it REACHED the file, so the reset is not racing a debounced write still
+	// queued behind a page this test is about to be finished with.
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('HELD_');
+
+	release();
+
+	// The box arms and STAYS - and still names its own path, which is what makes
+	// keeping it honest rather than merely kinder.
+	const confirm = page.getByTestId('databricks-upload-confirm-box');
+	await expect(confirm).toBeVisible();
+	await expect(confirm).toContainText(`/Users/${USER}/GLOBAL_notebook`);
+	// …while the fields themselves have moved on to the new default.
+	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('HELD_');
+	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('HELD_notebook');
+
+	// Replace overwrites the path the BOX named, not the one these fields would resolve
+	// to now: the pinned affixes are precisely why the box was safe to keep.
+	await page.getByTestId('databricks-upload-replace').click();
+	await expect.poll(() => seen.length).toBe(2);
+	expect(seen[1]).toMatchObject({ overwrite: true, prefix: 'GLOBAL_' });
+	await expect(page.getByTestId('databricks-upload-note')).toContainText(
+		`/Users/${USER}/GLOBAL_notebook`
+	);
+});
+
+test('an invalid default is refused, and the last valid one survives it', async ({ page }) => {
+	// Blast radius is what makes this stricter than the sidebar's own field: an unusable
+	// affix there disables the upload in the one project on screen, while an unusable
+	// DEFAULT disables it in every project that never set its own - under a message
+	// naming a "prefix" the user never typed into there, and which clearing that
+	// project's field only opts that one project out of.
+	await mockDatabricks(page);
+	await openProject(page, urlB);
+	await openSettings(page);
+
+	const prefix = page.getByTestId('settings-upload-prefix');
+	await prefix.fill('GOOD_');
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GOOD_');
+
+	// A separator would silently redirect the upload elsewhere in the workspace tree.
+	await prefix.fill('bad/name_');
+	await expect(page.getByTestId('settings-upload-error')).toBeVisible();
+	// Refused, never repaired: the field still shows exactly what was typed, so the
+	// error explains something the user can see.
+	await expect(prefix).toHaveValue('bad/name_');
+	// Nothing invalid reaches the store, and the last VALID default is left standing -
+	// deleting it would discard a working setting over a half-typed character. Waited
+	// out rather than polled: the write is debounced, so this is a claim about what does
+	// NOT happen.
+	await page.waitForTimeout(1_000);
+	expect(storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GOOD_');
+
+	// Fixing it persists again - the refusal is a gate, not a latch.
+	await prefix.fill('FIXED_');
+	await expect(page.getByTestId('settings-upload-error')).toHaveCount(0);
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('FIXED_');
 });
 
 test('CLEARING a project field is an answer, so the default does not creep back', async ({ page }) => {
