@@ -39,6 +39,7 @@
 -->
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
+	import { createCoalescedReload } from '$lib/coalescedReload';
 	import { subscribeEvents } from '$lib/events-client';
 	import { relativeTimeLong } from '$lib/relativeTime';
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
@@ -100,13 +101,41 @@
 	// spawns have finished, so concurrent callers all miss it and each re-spawns
 	// three `git` processes per distinct root. Keyed rather than blanket, so a
 	// request whose notebook set has since changed is never shared as this one's
-	// answer.
-	let inFlight: { key: string; done: Promise<void> } | null = null;
+	// answer — and with a trailing re-read, so a `notebook:root` landing mid-request
+	// is not answered by a reply issued before the very change it announces (see
+	// `coalescedReload.ts`).
+	const reload = createCoalescedReload(fetchRoots);
 
 	/** Identity of the open-notebook set, so the reload effect tracks CONTENT, not array identity. */
 	const pathsKey = $derived(notebooks.map((n) => n.path).join('\n'));
-	/** How many rows the server named but never opened, because the request was past its cap. */
-	const notReadCount = $derived(rows.filter((r) => r.notRead).length);
+	/**
+	 * How many of the rows ON SCREEN the route named but never opened.
+	 *
+	 * Counted off the notebooks actually DRAWN joined to their row, never off the
+	 * last payload: the list renders from `notebooks` (the live tab set) while `rows`
+	 * is the previous answer, so between closing a tab and its refetch landing the
+	 * two disagree — and the notice would say "6 above show no commit" over 5 such
+	 * rows, or keep claiming a cap the closed tab just took the set back under.
+	 */
+	const notReadCount = $derived(notebooks.filter((n) => rowFor(n.path)?.notRead).length);
+
+	/**
+	 * The order the notebooks are ASKED about — the active one first, then tab order.
+	 *
+	 * The route truncates by request order, so past its cap the rows it drops are
+	 * whatever came last. Sending tab order verbatim made that the rightmost tabs,
+	 * which can include the notebook the reader is looking at (the one row this panel
+	 * marks with a dot) while 64 notebooks they are not looking at show commits. This
+	 * is query order ONLY: the list is rendered straight from `notebooks`, so what is
+	 * on screen stays in tab order. A tab switch deliberately does not refetch (see
+	 * the reload effect), so a newly-activated row past the cap is re-prioritised at
+	 * the next trigger rather than immediately.
+	 */
+	function queryOrder(): NotebookRef[] {
+		const at = notebooks.findIndex((n) => n.active);
+		if (at <= 0) return notebooks;
+		return [notebooks[at], ...notebooks.filter((_, i) => i !== at)];
+	}
 
 	function load(): Promise<void> {
 		// With no notebook open the template short-circuits to `git-empty` and every
@@ -117,7 +146,7 @@
 		// tracks `pathsKey`, so opening a tab resumes fetching.
 		if (!notebooks.length) {
 			seq++;
-			inFlight = null;
+			reload.reset();
 			rows = [];
 			workspaceGit = null;
 			readLimit = 0;
@@ -125,13 +154,7 @@
 			loading = false;
 			return Promise.resolve();
 		}
-		const key = notebooks.map((n) => `path=${encodeURIComponent(n.path)}`).join('&');
-		if (inFlight?.key === key) return inFlight.done;
-		const done = fetchRoots(key).finally(() => {
-			if (inFlight?.done === done) inFlight = null;
-		});
-		inFlight = { key, done };
-		return done;
+		return reload.run(queryOrder().map((n) => `path=${encodeURIComponent(n.path)}`).join('&'));
 	}
 
 	async function fetchRoots(query: string) {

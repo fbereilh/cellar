@@ -150,7 +150,7 @@ describe('GitNotebooks — what it asks the server for', () => {
 		const body = fnBody('load');
 		const guard = body.indexOf('if (!notebooks.length)');
 		expect(guard).toBeGreaterThan(-1);
-		expect(guard).toBeLessThan(body.indexOf('fetchRoots'));
+		expect(guard).toBeLessThan(body.indexOf('reload.run('));
 		// The generation guard still advances, so a reply from a request issued while
 		// a tab WAS open cannot land afterwards and repopulate the emptied list…
 		const empty = body.slice(guard, body.indexOf('}', body.indexOf('return Promise.resolve()')));
@@ -159,16 +159,45 @@ describe('GitNotebooks — what it asks the server for', () => {
 		expect(empty).toContain('loading = false');
 	});
 
-	it('coalesces concurrent triggers onto ONE in-flight request, keyed by the query', () => {
+	it('coalesces concurrent triggers through the shared reload, never a second rule here', () => {
 		// Mount racing `sse:open`, focus racing an fs-refresh bump: the seq guard
 		// discards the loser's REPLY but never stopped its request, and `gitCommitAt`
-		// writes its cache entry only after its spawns finish, so both re-spawned.
+		// writes its cache entry only after its spawns finish, so both re-spawned. The
+		// trailing-re-read half — a trigger arriving mid-request must not be answered
+		// by a reply issued before it — is `coalescedReload.ts`'s, and is exercised
+		// with real promises in `coalesced-reload.test.ts`; a private copy here would
+		// be the one place it could regress unseen.
+		expect(SRC).toContain("import { createCoalescedReload } from '$lib/coalescedReload'");
+		expect(SRC).toContain('createCoalescedReload(fetchRoots)');
 		const body = fnBody('load');
-		expect(body).toContain('if (inFlight?.key === key) return inFlight.done');
-		// Keyed, so a request for a DIFFERENT notebook set is never handed back as
-		// this one's answer, and cleared only by its own settle so a later request
-		// cannot be cancelled by an earlier one finishing.
-		expect(body).toContain('inFlight = { key, done }');
-		expect(body).toContain('if (inFlight?.done === done) inFlight = null');
+		expect(body).toContain('reload.run(');
+		// The "no notebook open" path abandons the in-flight run rather than leaving it
+		// to replay into a list it just emptied.
+		expect(body).toContain('reload.reset()');
+		expect(SRC).not.toContain('inFlight');
+	});
+
+	it('asks about the ACTIVE notebook first, so the route cap never drops it', () => {
+		// The route truncates by REQUEST order, so tab order verbatim dropped whatever
+		// sat rightmost — possibly the one row the panel marks with a dot.
+		const body = fnBody('queryOrder');
+		expect(body).toContain('n.active');
+		expect(body).toContain('notebooks[at]');
+		expect(fnBody('load')).toContain('queryOrder()');
+		// Query order ONLY: the rendered list stays tab order, straight off the prop.
+		expect(SRC).toContain('{#each notebooks as nb (nb.path)}');
+		expect(SRC).not.toContain('{#each queryOrder()');
+	});
+
+	it('counts the not-read notice off the rows on SCREEN, not off the last payload', () => {
+		// `rows` is the previous answer while the list renders from the live tab set, so
+		// between closing a tab and its refetch landing the notice would name rows that
+		// are not there — or keep claiming a cap that close just took the set back under.
+		const at = SRC.indexOf('const notReadCount = $derived(');
+		expect(at, 'notReadCount is gone').toBeGreaterThan(-1);
+		const decl = SRC.slice(at, SRC.indexOf('\n', at));
+		expect(decl).toContain('notebooks.filter');
+		expect(decl).toContain('rowFor(n.path)?.notRead');
+		expect(decl).not.toContain('rows.filter');
 	});
 });
