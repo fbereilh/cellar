@@ -23,8 +23,33 @@ export function runtimeAvailable(): boolean {
 	return has('uv') && has('python3') && existsSync(hostVenv);
 }
 
-/** Spawn the launcher and resolve the app URL it prints once fully up. */
-export function bootCellar(ws: string): Promise<{ proc: ChildProcess; url: string }> {
+/**
+ * Spawn the launcher and resolve the app URL it prints once fully up.
+ *
+ * `env` adds to the launcher's environment. It exists for state that is GLOBAL to
+ * the machine rather than scoped to the throwaway workspace - `CELLAR_USER_SETTINGS`
+ * being the case it was added for: that store defaults to a real file in the home
+ * directory, so a spec touching it without redirecting it first would be rewriting
+ * the settings of whoever ran the suite.
+ *
+ * Which is why redirecting it is the DEFAULT here rather than each spec's job: every
+ * booted app READS that store on its first SSR load (the upload-affix default is
+ * hydrated from it), so "only the specs that write it need to opt in" is already
+ * wrong - and a spec that does write it is exactly the one whose author is least
+ * likely to notice. Unless `env` names its own, the store is redirected into the
+ * throwaway workspace, so it dies with it. A spec that needs two launchers to SHARE
+ * one global store passes the same path to both, which is the one case the default
+ * cannot serve.
+ *
+ * It goes under the workspace's `.cellar/`, not its root: that directory is the one
+ * place Cellar treats as gitignored runtime state, and specs that `git init` their
+ * workspace assert on git decorations and `status` - so a redirected store at the
+ * root would surface as an untracked file the moment any spec wrote a setting.
+ */
+export function bootCellar(
+	ws: string,
+	env: Record<string, string> = {}
+): Promise<{ proc: ChildProcess; url: string }> {
 	// A no-op `open`/`xdg-open` on PATH so the launcher's "open the browser" step
 	// is suppressed — Playwright drives its own browser against the URL.
 	const shim = join(ws, '.shim');
@@ -40,7 +65,13 @@ export function bootCellar(ws: string): Promise<{ proc: ChildProcess; url: strin
 		[join(REPO, 'bin', 'cellar.js'), '-w', ws, '--new', '--no-mcp-config', '-y'],
 		{
 			cwd: REPO,
-			env: { ...process.env, PATH: `${shim}:${process.env.PATH}`, CI: '1' },
+			env: {
+				...process.env,
+				PATH: `${shim}:${process.env.PATH}`,
+				CI: '1',
+				CELLAR_USER_SETTINGS: join(ws, '.cellar', 'user-settings.json'),
+				...env
+			},
 			stdio: ['ignore', 'pipe', 'pipe'],
 			detached: true
 		}

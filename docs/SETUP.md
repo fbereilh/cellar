@@ -330,12 +330,20 @@ the fix.
 **Naming the upload (prefix / postfix).** Two optional fields above the button wrap
 the notebook's own name, so a file can land as `2026-08-05_analysis` or
 `analysis_20260805` without renaming it first. Both may carry date tokens -
-`{YYYY-MM-DD}`, `{YYYYMMDD}`, `{YYYY}`, `{MM}`, `{DD}` - which expand against the
-**local** date and are **case-sensitive** (so `{mm}`, minutes by every other
-convention, can never silently mean the month); there are deliberately no
-time-of-day tokens, and anything else in braces is left literal, so a typo shows up
-in the preview instead of vanishing from the name. The panel previews the resolved
-name as you type, and that preview is exactly what the workspace receives - the
+`{YYYY-MM-DD}`, `{YYYYMMDD}`, `{YYYY-MM}`, `{YYYYMM}`, `{YYYY}`, `{MM}`, `{DD}` -
+which expand against the **local** date and are **case-sensitive** (so `{mm}`,
+minutes by every other convention, can never silently mean the month); there are
+deliberately no time-of-day tokens, and anything else in braces is left literal, so
+a typo shows up in the preview instead of vanishing from the name. The braces are
+**required** (a bare `MM` would turn `march` into `03arch`), so the vocabulary is
+listed as clickable buttons under the fields: each one inserts its exact braced
+form at the caret of whichever field you were last in, and its tooltip shows what
+that becomes today. A braced run that is *not* a token is named in a warning under
+the preview ("`{mm}` is not a date token - it uploads exactly as written"), because
+a literal left literal in silence reads like a token that has not expanded yet
+rather than one that never will; it stays a warning and never a refusal, since
+`{FOO}` may be exactly what you meant. The panel previews the resolved name as you
+type, and that preview is exactly what the workspace receives - the
 browser and the server share one rule (`$lib/databricksUploadName`), and the browser
 expands the tokens at click time so the two cannot disagree even across midnight.
 Because a Databricks workspace notebook carries no suffix, the postfix attaches to
@@ -352,6 +360,28 @@ in either field dismisses the confirm (and the previous attempt's result) rather
 than leaving a path on screen this panel would no longer upload to. Your last-used
 prefix and postfix are remembered per project in the workspace's `.cellar/` store,
 so a regular naming pattern survives a relaunch.
+
+**A default prefix/postfix for every project.** If you stamp every upload the same
+way, set it once in **Settings → Default Databricks upload name** instead of once
+per repo. It takes the same tokens, the same token buttons and the same
+not-a-token warning as the sidebar's fields, and it is stored **per user, not per
+project** - in `~/.cellar/settings.json`, beside the instance registry and the host
+venv, so it outlives both the workspace and the relaunch that changes the app port
+(`CELLAR_USER_SETTINGS` redirects that file; see the reference below). The
+direction is fixed and is the point: **a project that has set its own prefix or
+postfix always wins**, and the default only fills in for a project that was never
+asked - changing it never rewrites naming you set deliberately somewhere else. A
+Databricks panel already open in this Cellar picks the change up with no reload; a
+Cellar running in another project picks it up on its next page load. Clearing a
+**project's** field is itself an answer ("no prefix here"), so that project opts
+out of the default rather than inheriting it again; clearing the **default** simply
+removes it. What is stored either way is the raw pattern with its tokens
+unexpanded, so tomorrow's upload gets tomorrow's date. An affix that could never be
+uploaded (a slash, a backslash or a control character) is refused rather than
+stored - the field keeps what you typed, with the reason on screen and the last
+usable default left untouched. The 200-character ceiling is *not* applied here: it
+bounds an assembled name, and a default meets a different notebook name in every
+project, so it stays where the upload itself is previewed.
 
 **Disconnect vs Log out.** Disconnect ends that notebook's Spark session and
 leaves you authenticated. **Log out** - the quiet button under the Cluster card's
@@ -422,6 +452,7 @@ to publish, e.g. inside a container.
 | `CELLAR_ADD_PROJECT_ROOT` | UI setting | Force whether the project root is added to the kernel's `sys.path` (overrides the persisted UI toggle). |
 | `CELLAR_DATABRICKS_RUNTIME` | UI setting (default off) | Force whether `DATABRICKS_RUNTIME_VERSION` is advertised in the kernel environment, so notebook code that checks whether it is running on Databricks takes its `dbutils.widgets` path. Overrides the persisted UI toggle and bypasses the connected-notebook scope; the sidebar then reports the setting as environment-controlled and disables the toggle. Applied at kernel start/restart only. |
 | `CELLAR_DATABRICKS_RUNTIME_VERSION` | `15.4` | The runtime version string advertised when the runtime is on. Overrides the persisted UI value (and disables the card's version field), independently of `CELLAR_DATABRICKS_RUNTIME` - either can be set without the other. |
+| `CELLAR_USER_SETTINGS` | `~/.cellar/settings.json` | Path of the cross-project user-settings file (today: the default Databricks upload prefix/postfix). Point it elsewhere to keep those settings with a dotfile setup, or to isolate them in a test run. Per-project state stays in each workspace's own `.cellar/` and is unaffected. |
 | `CELLAR_JUPYTER_URL` | `http://127.0.0.1:8888` | Point the kernel bridge at an external Jupyter server (the launcher sets this automatically for the managed sidecar). |
 | `CELLAR_JUPYTER_TOKEN` | `` (empty) | Token for an external Jupyter server. |
 | `DATABRICKS_CONFIG_FILE` | `~/.databrickscfg` | Standard SDK variable for the Databricks config location. |

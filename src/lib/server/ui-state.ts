@@ -12,14 +12,17 @@
  * `.cellar/` is already gitignored in full, so this file is local per-checkout
  * state and never shows up as a git diff.
  *
- * The in-memory `cache` is the source of truth once loaded; disk writes are
- * debounced so a rapid burst (dragging the sidebar resizer) coalesces into one
- * write, with a synchronous flush on process exit so nothing in the debounce
- * window is lost on shutdown.
+ * Disk writes are debounced so a rapid burst (dragging the sidebar resizer)
+ * coalesces into one write, with a synchronous flush on process exit so nothing
+ * in the debounce window is lost on shutdown, and the cache re-reads the file
+ * when it changes underneath it. That whole mechanism is `json-store.ts`, shared
+ * with the cross-project `user-settings.ts`: the two stores differ only in WHERE
+ * the file is, so a fix to the debounce or the exit flush has to reach both, and
+ * what lives here is the path plus the preferences that belong at it.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
+import { createJsonStore, type JsonStoreData } from '$lib/server/json-store';
 import { workspaceRoot } from '$lib/server/fstree';
 import { ADD_PROJECT_ROOT_KEY, projectRootEnabled } from '$lib/server/projectRoot';
 import {
@@ -31,37 +34,18 @@ import {
 	databricksRuntimeVersion as resolveDatabricksRuntimeVersion
 } from '$lib/server/databricksRuntime';
 
-const WRITE_DEBOUNCE_MS = 250;
-
 /** The flat preference map persisted to `.cellar/ui-state.json`. */
-export type UiState = Record<string, unknown>;
-
-let cache: UiState | null = null;
-let writeTimer: ReturnType<typeof setTimeout> | null = null;
-let dirty = false;
-let exitHookInstalled = false;
+export type UiState = JsonStoreData;
 
 function storePath(): string {
 	return join(workspaceRoot(), '.cellar', 'ui-state.json');
 }
 
-/** Load the store from disk once; a missing / unparseable file is an empty store. */
-function ensureLoaded(): UiState {
-	if (cache !== null) return cache;
-	try {
-		const p = storePath();
-		// Dynamic boundary: our own on-disk JSON.
-		const parsed: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {};
-		cache = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as UiState) : {};
-	} catch {
-		cache = {};
-	}
-	return cache;
-}
+const store = createJsonStore(storePath);
 
 /** The whole preference map (a copy, so callers can't mutate the cache). */
 export function getUiState(): UiState {
-	return { ...ensureLoaded() };
+	return store.get();
 }
 
 /**
@@ -69,15 +53,7 @@ export function getUiState(): UiState {
  * deletes the key. Returns the updated map. Disk write is debounced.
  */
 export function setUiState(patch: UiState | null | undefined): UiState {
-	const store = ensureLoaded();
-	if (patch && typeof patch === 'object' && !Array.isArray(patch)) {
-		for (const [key, value] of Object.entries(patch)) {
-			if (value === null) delete store[key];
-			else store[key] = value;
-		}
-	}
-	scheduleWrite();
-	return { ...store };
+	return store.set(patch);
 }
 
 /**
@@ -89,7 +65,7 @@ export function setUiState(patch: UiState | null | undefined): UiState {
  * `projectRoot.ts`.
  */
 export function addProjectRootToPath(): boolean {
-	return projectRootEnabled(ensureLoaded()[ADD_PROJECT_ROOT_KEY], process.env.CELLAR_ADD_PROJECT_ROOT);
+	return projectRootEnabled(store.get()[ADD_PROJECT_ROOT_KEY], process.env.CELLAR_ADD_PROJECT_ROOT);
 }
 
 /**
@@ -103,7 +79,7 @@ export function addProjectRootToPath(): boolean {
  */
 export function injectDatabricksRuntime(bound: boolean): boolean {
 	return shouldInjectDatabricksRuntime(
-		ensureLoaded()[DBX_RUNTIME_KEY],
+		store.get()[DBX_RUNTIME_KEY],
 		process.env.CELLAR_DATABRICKS_RUNTIME,
 		bound
 	);
@@ -128,7 +104,7 @@ export function databricksRuntimeForced(): boolean | null {
  */
 export function databricksRuntimeVersion(): string {
 	return resolveDatabricksRuntimeVersion(
-		ensureLoaded()[DBX_RUNTIME_VERSION_KEY],
+		store.get()[DBX_RUNTIME_VERSION_KEY],
 		process.env.CELLAR_DATABRICKS_RUNTIME_VERSION
 	);
 }
@@ -143,35 +119,4 @@ export function databricksRuntimeVersion(): string {
  */
 export function databricksRuntimeVersionForced(): string | null {
 	return databricksRuntimeVersionOverride(process.env.CELLAR_DATABRICKS_RUNTIME_VERSION);
-}
-
-function scheduleWrite(): void {
-	dirty = true;
-	installExitHook();
-	if (writeTimer) return;
-	writeTimer = setTimeout(flush, WRITE_DEBOUNCE_MS);
-	// Don't keep the process alive just for a pending prefs write.
-	if (typeof writeTimer.unref === 'function') writeTimer.unref();
-}
-
-function flush(): void {
-	if (writeTimer) {
-		clearTimeout(writeTimer);
-		writeTimer = null;
-	}
-	if (!dirty || cache === null) return;
-	dirty = false;
-	try {
-		const p = storePath();
-		mkdirSync(dirname(p), { recursive: true });
-		writeFileSync(p, JSON.stringify(cache, null, 2) + '\n');
-	} catch {}
-}
-
-// The unref'd debounce timer won't fire if the process exits inside its window;
-// flush synchronously on exit so a just-changed preference is never dropped.
-function installExitHook(): void {
-	if (exitHookInstalled) return;
-	exitHookInstalled = true;
-	process.once('exit', flush);
 }

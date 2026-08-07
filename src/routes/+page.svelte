@@ -17,6 +17,7 @@
 	import { subscribeEvents, originId } from '$lib/events-client';
 	import type { ClientEvent } from '$lib/events-client';
 	import { hydrateUiState, getUi, setUi } from '$lib/uiState';
+	import { hydrateUserSettings } from '$lib/userSettings';
 	import { resolveVirtualize, VIRTUALIZE_PREF_KEY } from '$lib/virtualizePref';
 	import { relativeTimeLong } from '$lib/relativeTime';
 	import { toWorkspaceRel } from '$lib/workspacePath';
@@ -71,6 +72,7 @@
 	// preference (this runs during init, ahead of every onMount). Port-independent:
 	// this is what survives the dynamic app port that empties `localStorage`.
 	hydrateUiState(data.uiState);
+	hydrateUserSettings(data.userSettings);
 
 	const EMPTY_FOLDS = new Set<string>(); // no notebook active → the Outline folds nothing
 	const EMPTY_QUEUED: Record<string, number> = {}; // no notebook active → nothing queued

@@ -15,9 +15,11 @@
   session itself is built in the kernel. See `src/lib/server/databricks.js`.
 -->
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { subscribeEvents } from '$lib/events-client';
 	import { getUi, setUi, setUiNow } from '$lib/uiState';
+	import { getUserSettingText, onUserSettingsChange } from '$lib/userSettings';
+	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import { normalizeDatabricksHost } from '$lib/databricksHost';
 	import {
 		PROFILE_REAUTH_CODE,
@@ -27,7 +29,14 @@
 		reauthDetail,
 		reauthExplanation
 	} from '$lib/databricksReauth';
-	import { UPLOAD_DATE_TOKENS, expandDateTokens, resolveUploadName } from '$lib/databricksUploadName';
+	import {
+		UPLOAD_DATE_TOKENS,
+		expandDateTokens,
+		resolveUploadName,
+		unknownAffixTokens,
+		unknownTokenWarning
+	} from '$lib/databricksUploadName';
+	import { insertTokenIntoField } from '$lib/uploadTokenField';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -254,11 +263,9 @@
 		runtimeOn = getUi<unknown>(DBX_RUNTIME_KEY, false) === true;
 		runtimeVersion = getUi<string>(DBX_RUNTIME_VERSION_KEY, DBX_RUNTIME_VERSION_DEFAULT);
 		appliedVersion = runtimeVersion;
-		// The upload affixes: someone who uploads regularly should not have to retype a
-		// naming pattern every session. The store is untyped JSON, so anything that is
-		// not a string reads as "no affix" rather than being interpolated into a name.
-		uploadPrefix = storedAffix(DBX_UPLOAD_PREFIX_KEY);
-		uploadPostfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY);
+		// The upload affixes are seeded by their own effect (`seedUploadAffixes`), not
+		// here: a one-shot mount read is exactly what left a default set in Settings
+		// invisible to a panel that was already open.
 	});
 
 	/**
@@ -981,11 +988,118 @@
 	const DBX_UPLOAD_POSTFIX_KEY = 'cellar-databricks-upload-postfix';
 	let uploadPrefix = $state('');
 	let uploadPostfix = $state('');
-	/** A persisted affix, or '' - the store is untyped JSON and this ends up in a name. */
-	function storedAffix(key: string): string {
-		const v = getUi<unknown>(key, '');
-		return typeof v === 'string' ? v : '';
+	/**
+	 * This project's affix, or the user's cross-project DEFAULT when this project has
+	 * never had one of its own.
+	 *
+	 * The direction is the whole rule and must not be inverted: the per-project store
+	 * is authoritative wherever it has an answer, and the global default only supplies
+	 * one where it does not. A default that overrode would silently rewrite naming a
+	 * user set deliberately, project by project, the first time they changed it.
+	 *
+	 * "Has an answer" is `typeof === 'string'`, so an EXPLICITLY EMPTY affix counts -
+	 * which is why the input persists `''` rather than deleting the key. Clearing the
+	 * field is an edit like any other ("no prefix on this project"), and deleting would
+	 * make it indistinguishable from never having set one, so the default would come
+	 * back on the next load and undo exactly what the user just did.
+	 *
+	 * Both are raw text, never expanded: a default is a PATTERN reused across projects
+	 * and days, so storing what it resolved to on the day it was set would stamp every
+	 * later upload with a stale date.
+	 */
+	function storedAffix(key: string, defaultKey: string): string {
+		const own = getUi<unknown>(key, undefined);
+		if (typeof own === 'string') return own;
+		return getUserSettingText(defaultKey);
 	}
+	/**
+	 * Re-read both affixes from the stores.
+	 *
+	 * Deliberately RE-readable rather than a one-shot mount seed: this panel is
+	 * mounted lazily and then kept mounted for the session, so a default set in
+	 * Settings afterwards reached it only on a reload - the field sat empty while the
+	 * Settings copy promised it applied to every project that had not set its own.
+	 *
+	 * Safe to run at any time precisely BECAUSE of the direction: a project with an
+	 * answer of its own always wins, and every keystroke writes that answer through
+	 * `setUi` (which updates the client cache synchronously), so a re-read while the
+	 * user is typing returns exactly what they typed and can never clobber it.
+	 *
+	 * A seed that MOVES an affix drops the previous attempt's feedback, exactly as
+	 * typing does (`setUploadAffix`): the "uploaded to" note and the armed replace
+	 * confirm each name a workspace path built from the OLD affixes, so a default
+	 * changed in Settings would otherwise leave the box naming one path while the
+	 * preview a line above named another. The guard is what makes it callable from
+	 * both triggers - most seeds change nothing (reopening the section, a change to
+	 * some OTHER setting), and dismissing a still-accurate note there would be the
+	 * same defect with the sign flipped.
+	 *
+	 * An upload IN FLIGHT DEFERS the whole seed rather than clearing over it. The
+	 * attempt pinned its own affixes at the click, and clearing bumps `uploadSeq` -
+	 * which makes `uploadToWorkspace` discard the settled reply as superseded: the
+	 * replace really happened, the panel said nothing about it, and the box vanished
+	 * mid-flight, the same silent clobber Cancel is deliberately inert for. Deferring
+	 * self-heals because the effect below tracks that gate, so the seed lands the
+	 * moment the attempt settles.
+	 *
+	 * A deferred seed then keeps WHATEVER the attempt it waited on produced, and the
+	 * asymmetry with typing is the point. The "uploaded to"/"replaced" note (or an
+	 * error) is a past-tense record of an attempt the user themself confirmed and is
+	 * the very thing they are still waiting to read. An armed replace confirm survives
+	 * for a stronger reason still: a `status:'exists'` reply leaves both of those null,
+	 * so the box IS the entire outcome, and dropping it would leave NOTHING on screen
+	 * for an attempt that has just settled - indistinguishable from an upload that
+	 * silently did nothing. That the box names a path built from the OLD affixes is not
+	 * a reason to drop it either: `uploadExistsAffixes` PINS them, so Replace overwrites
+	 * exactly the path the box names, which is what makes keeping it self-consistent.
+	 * An IMMEDIATE seed - nothing was in flight, so nothing arrived - still clears
+	 * everything, exactly as typing does.
+	 */
+	let uploadSeedDeferred = false;
+	let uploadSeedDeferredAt = 0;
+	function seedUploadAffixes() {
+		const prefix = storedAffix(DBX_UPLOAD_PREFIX_KEY, UPLOAD_PREFIX_DEFAULT_KEY);
+		const postfix = storedAffix(DBX_UPLOAD_POSTFIX_KEY, UPLOAD_POSTFIX_DEFAULT_KEY);
+		if (prefix === uploadPrefix && postfix === uploadPostfix) {
+			uploadSeedDeferred = false;
+			return;
+		}
+		if (uploadConfirmBusy) {
+			// Recorded ONCE per deferral: re-reading it on every re-run while still gated
+			// would forget that an outcome arrived in between.
+			if (!uploadSeedDeferred) {
+				uploadSeedDeferred = true;
+				uploadSeedDeferredAt = uploadFeedbackSeq;
+			}
+			return;
+		}
+		const arrived = uploadSeedDeferred && uploadFeedbackSeq !== uploadSeedDeferredAt;
+		uploadSeedDeferred = false;
+		uploadPrefix = prefix;
+		uploadPostfix = postfix;
+		// Whatever arrived while this seed waited is kept, armed confirm included - see
+		// the note above for why the `exists` shape is the case that decides this.
+		if (!arrived) clearUploadFeedback();
+	}
+	$effect(() => {
+		// The SUBSCRIPTION is the case that matters: the Settings modal sits OVER an
+		// expanded sidebar, so nothing about this panel changes while the default is
+		// being edited, and without a change signal it would still catch up only on a
+		// reload - which is exactly what the reported gap was. Registered ONCE: the
+		// callback reads (and writes) the affixes, so tracking it here would tear the
+		// listener down and re-register it on every keystroke, an effect whose own
+		// write feeds its own dependencies.
+		return onUserSettingsChange(() => untrack(seedUploadAffixes));
+	});
+	$effect(() => {
+		// The catch-up triggers, read explicitly so the untracked seed still re-runs on
+		// them: the section being reopened (the panel stays mounted while folded away,
+		// so this is the closest it has to being opened afresh), and the in-flight gate
+		// lifting, which is what applies a deferred seed.
+		void visible;
+		void uploadConfirmBusy;
+		untrack(seedUploadAffixes);
+	});
 	/**
 	 * The affixes the ARMED replace confirm was resolved with, pinned at the moment
 	 * it armed. Replace re-sends these rather than re-resolving, for the same reason
@@ -1057,6 +1171,28 @@
 	const uploadPreview = $derived(uploadFileName ? uploadResolved.name : '');
 	/** Why the affixes cannot be used, or ''. Blocks the button rather than repairing them. */
 	const uploadNameError = $derived(uploadResolved.error ?? '');
+	/**
+	 * Braced runs in either affix that are NOT date tokens, and so will upload exactly
+	 * as typed.
+	 *
+	 * This is the reported bug's real shape: the vocabulary is small and
+	 * case-sensitive, so `{YYYYMM}` (or `{MMDD}`, or `{yyyy}`) is a reasonable guess
+	 * from someone who has seen `{YYYYMMDD}` work - and leaving it literal, which is
+	 * the right thing to DO with it, previewed as `{YYYYMM}_analysis`, which reads as
+	 * a token waiting to expand rather than one that never will. Naming it is the
+	 * whole fix; nothing about the expansion rule changes.
+	 *
+	 * A WARNING, never a refusal: the name is legal and the literal braces may be
+	 * meant. It also yields to `uploadNameError`, which blocks the upload outright -
+	 * two messages about the same two fields at once is noise, and only one of them
+	 * is the reason nothing can be sent.
+	 */
+	const uploadUnknownTokens = $derived(
+		uploadNameError ? [] : unknownAffixTokens({ prefix: uploadPrefix, postfix: uploadPostfix }, uploadNow)
+	);
+	const uploadTokenWarning = $derived(
+		unknownTokenWarning(uploadUnknownTokens, 'The buttons below are the ones that expand.')
+	);
 	/** Ties that reason to both affix fields, so it is announced and not merely shown. */
 	const uploadNameErrorId = $props.id();
 	/**
@@ -1080,6 +1216,17 @@
 	 * against a request that is still in flight.
 	 */
 	let uploadSeq = 0;
+
+	/**
+	 * How many settled upload outcomes this panel has rendered.
+	 *
+	 * Bumped wherever a reply survives the guard above and becomes something on
+	 * screen, so a DEFERRED affix seed can tell "the outcome I was waiting for has
+	 * arrived" from "nothing happened while I waited" - the first must not be cleared
+	 * away the instant it lands, the second is exactly what the clear is for. It is a
+	 * different question from `uploadSeq`, which counts attempts and supersessions.
+	 */
+	let uploadFeedbackSeq = 0;
 
 	/**
 	 * Whether an upload can neither be started nor interrupted right now - the ONE
@@ -1112,12 +1259,61 @@
 	 * `.cellar/` store as every other preference here, never `localStorage`) so a
 	 * regular pattern survives a relaunch on a new port.
 	 */
-	function onUploadAffixInput(which: 'prefix' | 'postfix', e: Event) {
-		const v = (e.currentTarget as HTMLInputElement).value;
+	function setUploadAffix(which: 'prefix' | 'postfix', v: string) {
 		if (which === 'prefix') uploadPrefix = v;
 		else uploadPostfix = v;
-		setUi(which === 'prefix' ? DBX_UPLOAD_PREFIX_KEY : DBX_UPLOAD_POSTFIX_KEY, v === '' ? null : v);
+		// The literal string, EMPTY INCLUDED - see `storedAffix`. Deleting the key on an
+		// empty field would read back as "this project never set one", so the global
+		// default would re-seed it on the next load and undo the clearing.
+		setUi(which === 'prefix' ? DBX_UPLOAD_PREFIX_KEY : DBX_UPLOAD_POSTFIX_KEY, v);
 		clearUploadFeedback();
+	}
+
+	function onUploadAffixInput(which: 'prefix' | 'postfix', e: Event) {
+		setUploadAffix(which, (e.currentTarget as HTMLInputElement).value);
+	}
+
+	/**
+	 * The two affix inputs, and which of them a token chip writes into.
+	 *
+	 * The chips need the ELEMENT, not just the state: the insertion point is the
+	 * caret, which only the DOM node knows, and the caret has to be put back after
+	 * the write or a second chip click would append to the end of what the first one
+	 * inserted instead of continuing where the user was.
+	 *
+	 * The target follows FOCUS and is remembered after it - a chip is a button, so
+	 * clicking one necessarily takes focus away from the field it is meant to write
+	 * into, and "the field you were last in" is the only reading of that gesture that
+	 * matches what the user is looking at. It starts on the prefix so the very first
+	 * click (nothing focused yet) still lands somewhere predictable rather than
+	 * doing nothing.
+	 */
+	let uploadPrefixEl = $state<HTMLInputElement | null>(null);
+	let uploadPostfixEl = $state<HTMLInputElement | null>(null);
+	let uploadTokenTarget = $state<'prefix' | 'postfix'>('prefix');
+
+	/**
+	 * Insert a date token into the affix field the user was last in, at the caret.
+	 *
+	 * The braces are what the expander recognises and they are easy to miss (the
+	 * placeholder is the only other place they appear, and a placeholder disappears
+	 * the moment anything is typed) - so the chips are how the syntax is LEARNED:
+	 * clicking one writes the exact braced form, which the preview immediately
+	 * resolves, and after seeing that once the user can type the rest by hand.
+	 *
+	 * The field keeps the TOKEN, never its expansion: it is a reusable pattern that
+	 * persists between sessions, so a field holding today's literal date would upload
+	 * under a stale name tomorrow - the one failure the tokens exist to prevent.
+	 */
+	function insertUploadDateToken(token: string) {
+		if (uploadConfirmBusy) return;
+		const which = uploadTokenTarget;
+		insertTokenIntoField(
+			which === 'prefix' ? uploadPrefixEl : uploadPostfixEl,
+			which === 'prefix' ? uploadPrefix : uploadPostfix,
+			token,
+			(value) => setUploadAffix(which, value)
+		);
 	}
 
 	/**
@@ -1179,6 +1375,7 @@
 			// This reply describes a file the panel no longer names, so NOTHING of it is
 			// written: an armed confirm would overwrite on behalf of a different notebook.
 			if (seq !== uploadSeq || target !== notebookPath) return;
+			uploadFeedbackSeq++;
 			if (!res.ok) throw body;
 			const out = body as { status?: string; path?: string; url?: string | null; overwritten?: boolean };
 			if (out.status === 'exists') {
@@ -1199,6 +1396,7 @@
 			};
 		} catch (err) {
 			if (seq !== uploadSeq || target !== notebookPath) return;
+			uploadFeedbackSeq++;
 			// A failed replace must not strand the user inside a confirm box whose
 			// Replace button just failed: drop back to the plain button, with the error.
 			uploadExistsPath = '';
@@ -1794,9 +1992,11 @@
 		<label class="flex flex-col gap-0.5">
 			<span class="text-[10px] text-base-content/50">Prefix</span>
 			<input
+				bind:this={uploadPrefixEl}
 				class="input input-xs w-full font-mono text-[10px]"
 				value={uploadPrefix}
 				oninput={(e) => onUploadAffixInput('prefix', e)}
+				onfocus={() => (uploadTokenTarget = 'prefix')}
 				disabled={uploadConfirmBusy}
 				placeholder="{'{YYYY-MM-DD}'}_"
 				title={uploadTokenHelp}
@@ -1808,9 +2008,11 @@
 		<label class="flex flex-col gap-0.5">
 			<span class="text-[10px] text-base-content/50">Postfix</span>
 			<input
+				bind:this={uploadPostfixEl}
 				class="input input-xs w-full font-mono text-[10px]"
 				value={uploadPostfix}
 				oninput={(e) => onUploadAffixInput('postfix', e)}
+				onfocus={() => (uploadTokenTarget = 'postfix')}
 				disabled={uploadConfirmBusy}
 				placeholder="_{'{YYYYMMDD}'}"
 				title={uploadTokenHelp}
@@ -1839,6 +2041,55 @@
 			>
 		</p>
 	{/if}
+	{#if uploadTokenWarning}
+		<!-- Says what the preview alone could not: this brace is never going to become a
+		     date. It sits directly under the preview that shows it landing literally, and
+		     above the buttons that are the remedy - and it stays a WARNING, because the
+		     name is legal and `{FOO}` may be exactly what someone means. -->
+		<p
+			class="mt-1 text-[10px] leading-snug text-warning"
+			role="status"
+			data-testid="databricks-upload-token-warning"
+		>
+			{uploadTokenWarning}
+		</p>
+	{/if}
+	<!-- The token vocabulary, VISIBLE rather than hidden in a `title`. The braces are
+	     required (bare `MM`/`DD` would collide with ordinary words, so they can never be
+	     optional) and the SET is small and case-sensitive - which is the part that has to
+	     be discoverable: the reported failure was someone who had seen a token work
+	     reasonably guessing a spelling that does not exist, and a tooltip is not something
+	     anyone finds before typing. Each button writes its exact braced form into the
+	     field last focused and names its live expansion, so it reads as "click to insert
+	     today's date". Driven off `UPLOAD_DATE_TOKENS`, so what is offered cannot drift
+	     from what the expander knows. The preview above is the live worked example, which
+	     is why there is no second one spelled out down here. -->
+	<div class="mt-1 flex flex-wrap items-center gap-1">
+		<span
+			class="text-[10px] leading-snug text-base-content/50"
+			data-testid="databricks-upload-token-hint"
+		>
+			Date tokens (braces needed) - click to insert:
+		</span>
+		{#each UPLOAD_DATE_TOKENS as token (token)}
+			<button
+				type="button"
+				class="btn btn-ghost btn-xs h-4 min-h-0 rounded border border-base-300 px-1 font-mono text-[10px] font-normal text-base-content/70"
+				onmousedown={(e) => e.preventDefault()}
+				onclick={() => insertUploadDateToken(token)}
+				disabled={uploadConfirmBusy}
+				title="{token} → {expandDateTokens(token, uploadNow)}"
+				aria-label="Insert {token} into the {uploadTokenTarget}, which becomes {expandDateTokens(
+					token,
+					uploadNow
+				)}"
+				data-testid="databricks-upload-token"
+				data-token={token}
+			>
+				{token}
+			</button>
+		{/each}
+	</div>
 	<div class="mt-1.5">
 		{#if uploadExistsPath}
 			<div class="rounded border border-warning/40 bg-warning/10 px-2 py-1.5" data-testid="databricks-upload-confirm-box">

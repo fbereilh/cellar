@@ -4,6 +4,17 @@
 	// (view + rebind).
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
+	import { getUserSettingText, setUserSetting } from '$lib/userSettings';
+	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
+	import {
+		UPLOAD_DATE_TOKENS,
+		expandDateTokens,
+		isStorableAffix,
+		resolveUploadName,
+		unknownAffixTokens,
+		unknownTokenWarning
+	} from '$lib/databricksUploadName';
+	import { insertTokenIntoField } from '$lib/uploadTokenField';
 
 	interface Props {
 		open: boolean;
@@ -38,6 +49,135 @@
 		{ id: 'dim', label: 'Dark', hint: 'dim' },
 		{ id: 'cellar-light', label: 'Light', hint: 'cellar-light' }
 	];
+
+	// ---- Default Databricks upload name ---------------------------------------
+	// A cross-PROJECT default for the sidebar's upload prefix/postfix: someone who
+	// stamps every upload the same way should say so once, not once per repo. It
+	// lives in the global `~/.cellar/` store (`$lib/userSettings`), because the
+	// per-project `.cellar/` store cannot answer for a project it is not in and
+	// `localStorage` dies with the dynamic port on every relaunch.
+	//
+	// Strictly a DEFAULT: the Databricks panel seeds from it only where the project
+	// has no affix of its own, so editing it never rewrites naming someone already
+	// set per project. What is stored is the raw pattern, tokens unexpanded.
+	let uploadPrefixDefault = $state('');
+	let uploadPostfixDefault = $state('');
+	let defaultsHydrated = false;
+	$effect(() => {
+		// Seeded when the modal first opens rather than at construction: `Settings` is
+		// mounted for the life of the shell, and at that point `hydrateUserSettings`
+		// may not have run yet, so a read there would latch the empty pre-hydration
+		// value for the whole session.
+		if (!open || defaultsHydrated) return;
+		defaultsHydrated = true;
+		// Read as TEXT through the shared guard, exactly as the Databricks panel's
+		// `storedAffix` does: the store is untyped JSON, so a non-string here would
+		// reach `expandDateTokens` and throw out of a render-time `$derived`.
+		uploadPrefixDefault = getUserSettingText(UPLOAD_PREFIX_DEFAULT_KEY);
+		uploadPostfixDefault = getUserSettingText(UPLOAD_POSTFIX_DEFAULT_KEY);
+	});
+
+	/**
+	 * The same clock the sidebar's preview uses, for the same reason: the tokens
+	 * shown here would otherwise be frozen at whenever this component last
+	 * re-rendered, and a settings pane left open across midnight would advertise
+	 * yesterday. Only armed while the modal is open - nothing behind it is on screen.
+	 */
+	const DEFAULT_CLOCK_TICK_MS = 60_000;
+	let defaultsNow = $state(new Date());
+	$effect(() => {
+		if (!open) return;
+		const wake = () => (defaultsNow = new Date());
+		wake();
+		const tick = setInterval(wake, DEFAULT_CLOCK_TICK_MS);
+		window.addEventListener('focus', wake);
+		return () => {
+			clearInterval(tick);
+			window.removeEventListener('focus', wake);
+		};
+	});
+
+	function setUploadDefault(which: 'prefix' | 'postfix', v: string) {
+		if (which === 'prefix') uploadPrefixDefault = v;
+		else uploadPostfixDefault = v;
+		// Refused, never repaired - the same rule the upload itself follows, applied at
+		// the moment the pattern is authored. The field keeps exactly what was typed and
+		// the error below says why, but nothing unusable reaches the global store. The
+		// BLAST RADIUS is what makes this stricter than the sidebar's own field: an
+		// unusable affix there disables the upload in the one project on screen, while an
+		// unusable DEFAULT disables it in every project that never set its own, under a
+		// message naming a field the user never typed into there.
+		//
+		// Judged PER FIELD, from the affix being written and nothing else - deliberately
+		// NOT through the pane's `defaultsResolved`, which is what is SHOWN below and
+		// validates the PAIR. Each field is its own key, so a combined verdict silently
+		// refused to store a perfectly good postfix while the prefix was invalid, and the
+		// write that ran when the prefix was fixed carried only the prefix: the typed
+		// postfix was never persisted by anything. `isStorableAffix` also leaves out the
+		// assembled name's LENGTH, which is measured here against a placeholder stem and
+		// is no fact about a default that meets a different stem in every project.
+		//
+		// The consequence is deliberate: a previously VALID stored default is left
+		// untouched while the field holds invalid text, so a RELOAD shows the last good
+		// value. Within the session the field keeps the invalid text - this component is
+		// mounted for the life of the shell and seeds once, so closing and reopening the
+		// modal re-reads nothing. Do NOT "fix" that by deleting the stored default - that
+		// would discard a working setting over a half-typed character.
+		if (!isStorableAffix(v, defaultsNow)) return;
+		// An empty default is NO default, so the key is deleted rather than stored as
+		// `''`. That is the opposite of the per-project field - deliberately: there,
+		// empty is a real answer ("no prefix on this project") that has to outrank this
+		// default; here there is nothing below to outrank.
+		setUserSetting(
+			which === 'prefix' ? UPLOAD_PREFIX_DEFAULT_KEY : UPLOAD_POSTFIX_DEFAULT_KEY,
+			v === '' ? null : v
+		);
+	}
+
+	/**
+	 * What these defaults would name a notebook today, resolved through the SAME
+	 * `resolveUploadName` the sidebar previews with and the server uploads with - a
+	 * settings pane that showed a name built any other way would be a fourth opinion
+	 * about the one thing this feature promises to agree on.
+	 */
+	const defaultsResolved = $derived(
+		resolveUploadName(
+			'notebook.ipynb',
+			{ prefix: uploadPrefixDefault, postfix: uploadPostfixDefault },
+			defaultsNow
+		)
+	);
+	const defaultsError = $derived(defaultsResolved.error ?? '');
+	/** Braced runs that are not tokens - the same warning the sidebar gives, in the
+	 *  place the pattern is actually authored, which is where it is worth more. */
+	const defaultsUnknown = $derived(
+		defaultsError
+			? []
+			: unknownAffixTokens(
+					{ prefix: uploadPrefixDefault, postfix: uploadPostfixDefault },
+					defaultsNow
+				)
+	);
+	// No remedy clause: the sidebar's copy points at the token buttons directly under
+	// it, and this pane's are elsewhere on screen.
+	const defaultsWarning = $derived(unknownTokenWarning(defaultsUnknown));
+
+	// Which default field a token button writes into, and the elements themselves -
+	// the insertion point is the caret, which only the DOM node knows. Mirrors the
+	// sidebar's own token buttons, down to the shared `insertTokenIntoField` glue.
+	let prefixDefaultEl = $state<HTMLInputElement | null>(null);
+	let postfixDefaultEl = $state<HTMLInputElement | null>(null);
+	let defaultTokenTarget = $state<'prefix' | 'postfix'>('prefix');
+
+	function insertDefaultToken(token: string) {
+		const which = defaultTokenTarget;
+		insertTokenIntoField(
+			which === 'prefix' ? prefixDefaultEl : postfixDefaultEl,
+			which === 'prefix' ? uploadPrefixDefault : uploadPostfixDefault,
+			token,
+			(value) => setUploadDefault(which, value)
+		);
+	}
 
 	// ---- Keyboard shortcuts --------------------------------------------------
 	// Rendered straight from the registry, so this list can never drift from what
@@ -240,6 +380,85 @@
 							(windowed rendering {virtualizeCells ? 'on' : 'off'}); reload without it to change this.
 						</p>
 					{/if}
+				</div>
+
+				<div class="divider my-1"></div>
+
+				<!-- Default Databricks upload name. A cross-PROJECT pattern, which is why it
+				     is here and not only in the sidebar: it is about how this PERSON names
+				     uploads, so it belongs beside the other person-level settings. Every
+				     affordance the sidebar's fields grew is repeated because this is where
+				     the pattern is authored - the token buttons and the not-a-token warning
+				     are worth more here than anywhere. -->
+				<div data-testid="upload-defaults-control">
+					<div class="mb-1 text-sm font-medium">Default Databricks upload name</div>
+					<p class="mb-2 text-xs text-base-content/50">
+						Used in every project that has not set its own prefix/postfix in the Databricks
+						sidebar. Changing it never touches a project you have already set.
+					</p>
+					<div class="grid grid-cols-2 gap-2">
+						<label class="flex flex-col gap-1">
+							<span class="text-xs text-base-content/60">Prefix</span>
+							<input
+								bind:this={prefixDefaultEl}
+								class="input input-sm w-full font-mono text-xs"
+								value={uploadPrefixDefault}
+								oninput={(e) => setUploadDefault('prefix', (e.currentTarget as HTMLInputElement).value)}
+								onfocus={() => (defaultTokenTarget = 'prefix')}
+								placeholder="{'{YYYY-MM-DD}'}_"
+								aria-invalid={!!defaultsError}
+								data-testid="settings-upload-prefix"
+							/>
+						</label>
+						<label class="flex flex-col gap-1">
+							<span class="text-xs text-base-content/60">Postfix</span>
+							<input
+								bind:this={postfixDefaultEl}
+								class="input input-sm w-full font-mono text-xs"
+								value={uploadPostfixDefault}
+								oninput={(e) => setUploadDefault('postfix', (e.currentTarget as HTMLInputElement).value)}
+								onfocus={() => (defaultTokenTarget = 'postfix')}
+								placeholder="_{'{YYYYMMDD}'}"
+								aria-invalid={!!defaultsError}
+								data-testid="settings-upload-postfix"
+							/>
+						</label>
+					</div>
+					{#if defaultsError}
+						<p class="mt-1 text-xs text-error" data-testid="settings-upload-error">{defaultsError}</p>
+					{:else}
+						<p class="mt-1 text-xs text-base-content/50">
+							A notebook called <span class="font-mono">notebook.ipynb</span> would upload as
+							<span class="font-mono text-base-content/70" data-testid="settings-upload-preview"
+								>{defaultsResolved.name}</span
+							>
+						</p>
+					{/if}
+					{#if defaultsWarning}
+						<p class="mt-1 text-xs text-warning" role="status" data-testid="settings-upload-token-warning">
+							{defaultsWarning}
+						</p>
+					{/if}
+					<div class="mt-1.5 flex flex-wrap items-center gap-1">
+						<span class="text-xs text-base-content/50">Date tokens (braces needed) - click to insert:</span>
+						{#each UPLOAD_DATE_TOKENS as token (token)}
+							<button
+								type="button"
+								class="btn btn-ghost btn-xs h-5 min-h-0 rounded border border-base-300 px-1 font-mono text-[11px] font-normal text-base-content/70"
+								onmousedown={(e) => e.preventDefault()}
+								onclick={() => insertDefaultToken(token)}
+								title="{token} → {expandDateTokens(token, defaultsNow)}"
+								aria-label="Insert {token} into the default {defaultTokenTarget}, which becomes {expandDateTokens(
+									token,
+									defaultsNow
+								)}"
+								data-testid="settings-upload-token"
+								data-token={token}
+							>
+								{token}
+							</button>
+						{/each}
+					</div>
 				</div>
 
 				<div class="divider my-1"></div>

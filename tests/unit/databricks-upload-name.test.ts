@@ -3,8 +3,13 @@ import {
 	MAX_UPLOAD_NAME_CHARS,
 	UPLOAD_DATE_TOKENS,
 	expandDateTokens,
+	insertUploadToken,
+	isStorableAffix,
 	notebookStem,
-	resolveUploadName
+	resolveUploadName,
+	unknownDateTokens,
+	unknownAffixTokens,
+	unknownTokenWarning
 } from '../../src/lib/databricksUploadName';
 
 /**
@@ -93,6 +98,168 @@ describe('date tokens', () => {
 	it('expands several tokens in one affix', () => {
 		expect(expandDateTokens('{YYYY}-{MM}', DAY)).toBe('2026-08');
 		expect(expandDateTokens('{DD}{MM}{YYYY}', DAY)).toBe('05082026');
+	});
+});
+
+describe('naming a brace that is NOT a token', () => {
+	it('names a near-miss of a REAL token, which is how the reported bug happened', () => {
+		// The bug as it actually happened: someone who has seen `{YYYYMMDD}` and `{YYYY}`
+		// work reaches for a shorter stamp. Left literal (correctly - dropping it would be
+		// worse), the preview reads `{YYYYMMD}_analysis`, which looks like a token waiting
+		// to expand rather than one that never will. Naming it is what makes the failure
+		// visible at all; `{YYYYMM}` itself is now real, and is covered below.
+		expect(unknownDateTokens('{YYYYMMD}_', DAY)).toEqual(['{YYYYMMD}']);
+		expect(expandDateTokens('{YYYYMMD}_', DAY)).toBe('{YYYYMMD}_');
+	});
+
+	it('the MONTH stamps are real tokens - the stamp the report was reaching for', () => {
+		// Both spellings, matching the two day stamps. Unambiguous contractions on the
+		// identical convention, and what people actually type - so they expand rather than
+		// being explained away.
+		expect(expandDateTokens('{YYYYMM}_', DAY)).toBe('202608_');
+		expect(expandDateTokens('{YYYY-MM}_', DAY)).toBe('2026-08_');
+		expect(expandDateTokens('{YYYYMM}', PADDED)).toBe('202603');
+		expect(expandDateTokens('{YYYY-MM}', PADDED)).toBe('2026-03');
+		expect(unknownDateTokens('{YYYYMM}_{YYYY-MM}', DAY)).toEqual([]);
+		// …and each means the same as spelling it out, so neither is a trap.
+		expect(expandDateTokens('{YYYY}{MM}_', DAY)).toBe(expandDateTokens('{YYYYMM}_', DAY));
+		expect(expandDateTokens('{YYYY}-{MM}_', DAY)).toBe(expandDateTokens('{YYYY-MM}_', DAY));
+	});
+
+	it('a month stamp is ONE lookup, so it can never be read as a shorter token plus junk', () => {
+		// The hazard a sequential token-by-token replace would have: `{YYYY}` matching
+		// INSIDE `{YYYYMM}` and leaving `2026MM}`. `BRACED` captures the whole group and
+		// each group is looked up once, so the longest and shortest spellings coexist.
+		expect(expandDateTokens('{YYYYMM}', DAY)).toBe('202608');
+		expect(expandDateTokens('{YYYYMMDD}', DAY)).toBe('20260805');
+		expect(expandDateTokens('{YYYY}', DAY)).toBe('2026');
+		expect(expandDateTokens('{YYYYMM}{YYYY}{YYYYMMDD}', DAY)).toBe('202608202620260805');
+		// The order they are declared in cannot matter either, for the same reason.
+		expect(expandDateTokens('{YYYY}{YYYYMM}', DAY)).toBe('2026202608');
+	});
+
+	it('stays silent on every token the UI offers - a false warning is worse than none', () => {
+		for (const token of UPLOAD_DATE_TOKENS) {
+			expect(unknownDateTokens(token, DAY)).toEqual([]);
+		}
+		expect(unknownDateTokens('{YYYY}-{MM}-{DD}_report', DAY)).toEqual([]);
+		// Nothing braced at all is nothing to say.
+		expect(unknownDateTokens('daily_', DAY)).toEqual([]);
+		expect(unknownDateTokens('', DAY)).toEqual([]);
+	});
+
+	it('catches the other near-misses the same way, wrong CASE included', () => {
+		// Case sensitivity is deliberate (`{mm}` is minutes by every other convention),
+		// which makes it exactly the kind of near-miss that needs saying out loud.
+		expect(unknownDateTokens('{yyyy}', DAY)).toEqual(['{yyyy}']);
+		expect(unknownDateTokens('{MMDD}', DAY)).toEqual(['{MMDD}']);
+		expect(unknownDateTokens('{YY}', DAY)).toEqual(['{YY}']);
+	});
+
+	it('lists each unknown run ONCE, in order, and only the unknown ones', () => {
+		// The message names them, so a repeated token must not read as two problems.
+		expect(unknownDateTokens('{FOO}-{YYYY}-{FOO}-{BAR}', DAY)).toEqual(['{FOO}', '{BAR}']);
+	});
+
+	it('scans the two affixes SEPARATELY, so a split brace is never a warning', () => {
+		// The name is `prefix + stem + postfix`, so a braced run cannot span the fields.
+		// Scanning their concatenation would invent one: `a{` and `}b` become a `{}` and
+		// `{FOO` plus `BAR}` a `{FOOBAR}` - a warning naming a token that is nowhere on
+		// screen, about an upload that is perfectly fine.
+		expect(unknownAffixTokens({ prefix: 'a{', postfix: '}b' }, DAY)).toEqual([]);
+		expect(unknownAffixTokens({ prefix: '{FOO', postfix: 'BAR}' }, DAY)).toEqual([]);
+		// A real unknown in EITHER field is still named, from whichever it is in…
+		expect(unknownAffixTokens({ prefix: '{YYYYMMD}_', postfix: '' }, DAY)).toEqual(['{YYYYMMD}']);
+		expect(unknownAffixTokens({ prefix: '', postfix: '_{yyyy}' }, DAY)).toEqual(['{yyyy}']);
+		// …and the two are merged in order, deduped, so one mistake in both fields reads
+		// as one problem rather than two.
+		expect(unknownAffixTokens({ prefix: '{FOO}{YYYY}', postfix: '{BAR}{FOO}' }, DAY)).toEqual([
+			'{FOO}',
+			'{BAR}'
+		]);
+		// Absent affixes are simply nothing to say.
+		expect(unknownAffixTokens({}, DAY)).toEqual([]);
+		expect(unknownAffixTokens({ prefix: null, postfix: null }, DAY)).toEqual([]);
+	});
+
+	it('is decided by the EXPANDER, so it cannot drift from what really expands', () => {
+		// The membership test is "did expanding change it", not a second copy of the token
+		// list - a copy would eventually warn about a token that works, or stay quiet
+		// about one that does not. Every known token expands to something brace-free, so
+		// the test can never mistake one for unknown.
+		for (const token of UPLOAD_DATE_TOKENS) {
+			expect(expandDateTokens(token, DAY)).not.toContain('{');
+		}
+	});
+});
+
+describe('the sentence that names them', () => {
+	// Shared by both surfaces that warn, so a reword or a pluralisation fix can never
+	// reach only one of them - the same reason the SCAN is shared.
+	it('says nothing when there is nothing to say', () => {
+		expect(unknownTokenWarning([])).toBe('');
+		expect(unknownTokenWarning([], 'The buttons below are the ones that expand.')).toBe('');
+	});
+
+	it('reads as one problem for one run, and as several for several', () => {
+		expect(unknownTokenWarning(['{FOO}'])).toBe(
+			'"{FOO}" is not a date token - it uploads exactly as written.'
+		);
+		expect(unknownTokenWarning(['{FOO}', '{BAR}'])).toBe(
+			'"{FOO}" and "{BAR}" are not date tokens - they upload exactly as written.'
+		);
+	});
+
+	it('carries a remedy only where the surface has one to point at', () => {
+		// The sidebar's token buttons sit directly under its message; the Settings pane's
+		// are elsewhere on screen, so it passes none rather than promising a "below".
+		expect(unknownTokenWarning(['{FOO}'], 'The buttons below are the ones that expand.')).toBe(
+			'"{FOO}" is not a date token - it uploads exactly as written. The buttons below are the ones that expand.'
+		);
+	});
+});
+
+describe('inserting a token from a chip', () => {
+	it('appends when the field has never been focused, so the first click still lands', () => {
+		expect(insertUploadToken('', '{YYYYMMDD}')).toEqual({ value: '{YYYYMMDD}', caret: 10 });
+		expect(insertUploadToken('daily_', '{DD}')).toEqual({ value: 'daily_{DD}', caret: 10 });
+		// An explicit null is the same statement as an absent one - the DOM hands back
+		// `null` for an element that was never edited.
+		expect(insertUploadToken('daily_', '{DD}', null, null).value).toBe('daily_{DD}');
+	});
+
+	it('inserts at the caret, and leaves the caret past what it inserted', () => {
+		// Continuing where the user was is the whole reason the caret is threaded through:
+		// two chips in a row must read `{YYYY}{MM}`, not `{MM}` stranded at the end.
+		const first = insertUploadToken('report__v2', '{YYYY}', 7, 7);
+		expect(first).toEqual({ value: 'report_{YYYY}_v2', caret: 13 });
+		const second = insertUploadToken(first.value, '{MM}', first.caret, first.caret);
+		expect(second.value).toBe('report_{YYYY}{MM}_v2');
+	});
+
+	it('replaces a SELECTED run rather than pushing it aside', () => {
+		// Selecting the wrong token and clicking the right one is the obvious way to fix
+		// one; keeping both would leave a name carrying two dates.
+		expect(insertUploadToken('{YYYY}_notes', '{YYYYMMDD}', 0, 6).value).toBe('{YYYYMMDD}_notes');
+	});
+
+	it('clamps and orders offsets instead of trusting them', () => {
+		// They come from the DOM. An out-of-range one taken literally slices text the user
+		// typed straight out of the field, which is silent data loss in a persisted field.
+		expect(insertUploadToken('abc', '{DD}', 99, 99).value).toBe('abc{DD}');
+		expect(insertUploadToken('abc', '{DD}', -5, -5).value).toBe('{DD}abc');
+		expect(insertUploadToken('abcdef', '{DD}', 4, 2).value).toBe('ab{DD}ef');
+		expect(insertUploadToken('abc', '{DD}', Number.NaN, Number.NaN).value).toBe('abc{DD}');
+	});
+
+	it('inserts the BRACED form, so anything a chip writes really does expand', () => {
+		// The chips are the answer to "how was I supposed to know about the braces", so a
+		// chip that inserted a bare token would teach exactly the syntax that fails.
+		for (const token of UPLOAD_DATE_TOKENS) {
+			const { value } = insertUploadToken('', token);
+			expect(value).toBe(token);
+			expect(expandDateTokens(value, DAY)).not.toContain('{');
+		}
 	});
 });
 
@@ -228,6 +395,54 @@ describe('an affix can never move the upload out of /Users/<you>/', () => {
 
 	it('an affix that empties to nothing still leaves a usable name', () => {
 		expect(resolveUploadName('analysis.ipynb', { prefix: '   ', postfix: '' }, DAY).error).toBeNull();
+	});
+});
+
+describe('whether ONE affix is worth storing, judged on its own', () => {
+	// The cross-project default has two independent fields written to two keys, so it
+	// has to decide each separately. Judged by the PAIR, an invalid prefix refused to
+	// store a perfectly good postfix, and the write that ran once the prefix was fixed
+	// carried only the prefix - the typed postfix was lost with nothing left to write it.
+
+	it('accepts an ordinary affix, empty included', () => {
+		expect(isStorableAffix('report_', DAY)).toBe(true);
+		expect(isStorableAffix('', DAY)).toBe(true);
+		expect(isStorableAffix(null, DAY)).toBe(true);
+		expect(isStorableAffix(undefined, DAY)).toBe(true);
+	});
+
+	it('keeps the tokens usable - it judges what they EXPAND to', () => {
+		expect(isStorableAffix('{YYYY-MM-DD}_', DAY)).toBe(true);
+		// A brace nothing recognises stays literal, and a literal is not unusable.
+		expect(isStorableAffix('{FOO}_', DAY)).toBe(true);
+	});
+
+	it('refuses a separator or a control character - the one fact about the affix itself', () => {
+		expect(isStorableAffix('bad/name_', DAY)).toBe(false);
+		expect(isStorableAffix('bad\\name_', DAY)).toBe(false);
+		expect(isStorableAffix('bad\u0007name_', DAY)).toBe(false);
+	});
+
+	it('does NOT judge LENGTH, which is a fact about the assembled name', () => {
+		// A default meets a different stem in every project, so a verdict measured from
+		// any one of them would refuse to save a pattern that is fine everywhere real.
+		const long = 'a'.repeat(MAX_UPLOAD_NAME_CHARS + 50);
+		expect(isStorableAffix(long, DAY)).toBe(true);
+		// The bound still bites where it belongs: on the name being uploaded.
+		expect(resolveUploadName('analysis.ipynb', { prefix: long }, DAY).error).toContain(
+			'Shorten the prefix or postfix'
+		);
+	});
+
+	it('agrees with the resolver about the affix it refuses', () => {
+		// One rule, one owner: whatever this refuses is exactly what `resolveUploadName`
+		// blames the affix (rather than the file) for.
+		for (const bad of ['a/b', 'a\\b', 'a\u001fb']) {
+			expect(isStorableAffix(bad, DAY)).toBe(false);
+			expect(resolveUploadName('analysis.ipynb', { prefix: bad }, DAY).error).toContain(
+				'The prefix cannot contain'
+			);
+		}
 	});
 });
 

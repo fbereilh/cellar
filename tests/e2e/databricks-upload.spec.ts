@@ -4,6 +4,7 @@ import { mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
 
 /**
  * E2E for the Databricks sidebar's **Upload notebook to workspace** control.
@@ -37,6 +38,10 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  *                      tokens) previews the EXACT name it then uploads under, the
  *                      pattern survives a reload, and an affix that could leave
  *                      `/Users/<you>/` is refused with nothing sent.
+ *   - date tokens    → a BRACED token expands in the preview AND in what is sent,
+ *                      while a brace that is NOT a token SAYS so instead of failing
+ *                      silently (the reported bug), and the token buttons insert
+ *                      the exact braced form so it never has to be guessed.
  *
  * The server op (auth path, JUPYTER format, the exists check gating `import_`) is
  * proven in `tests/unit/databricks-upload-notebook.test.ts`. Here the routes are
@@ -46,6 +51,7 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
+let settingsDir = '';
 let baseURL = '';
 
 const HOST = 'https://dbc-demo.cloud.databricks.com';
@@ -162,7 +168,14 @@ test.beforeAll(async () => {
 			cells: [{ cell_type: 'code', id: 'other-0', metadata: {}, execution_count: null, outputs: [], source: ['1\n'] }]
 		})
 	);
-	const booted = await bootCellar(workspace);
+	// The affix fields SEED from the cross-project default (`~/.cellar/settings.json`),
+	// so without redirecting that store this file would read whatever the person
+	// running the suite has set - and every assertion here that a field is empty, or
+	// holds exactly what a chip inserted, would fail on their machine and nowhere else.
+	settingsDir = mkdtempSync(join(tmpdir(), 'cellar-e2e-dbx-upload-home-'));
+	const booted = await bootCellar(workspace, {
+		CELLAR_USER_SETTINGS: join(settingsDir, 'settings.json')
+	});
 	launcher = booted.proc;
 	baseURL = booted.url;
 });
@@ -170,11 +183,13 @@ test.beforeAll(async () => {
 test.afterAll(async () => {
 	if (launcher) killCellar(launcher);
 	launcher = null;
-	if (workspace && existsSync(workspace)) {
-		try {
-			rmSync(workspace, { recursive: true, force: true });
-		} catch {
-			/* best effort */
+	for (const dir of [workspace, settingsDir]) {
+		if (dir && existsSync(dir)) {
+			try {
+				rmSync(dir, { recursive: true, force: true });
+			} catch {
+				/* best effort */
+			}
 		}
 	}
 });
@@ -521,10 +536,185 @@ test.describe('upload name affixes', () => {
 
 		// What was SENT is the already-expanded text, so the server has no date of its own
 		// to disagree about - and the path it reports is the name the preview showed.
-		expect(seen).toHaveLength(1);
+		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe(`${dashed}_`);
 		expect(seen[0].postfix).toBe(`_${compact}`);
 		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/${promised}`);
+	});
+
+	test('a BRACED token TYPED on its own expands - in the preview and in what is sent', async ({ page }) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+		const seen = await mockUpload(page, (body) => {
+			const path = `/Users/${USER}/${String(body.prefix ?? '')}notebook${String(body.postfix ?? '')}`;
+			return { status: 200, json: { ok: true, status: 'uploaded', path, url: null, overwritten: false } };
+		});
+
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
+
+		// The reported shape, exactly: the token ALONE, with nothing around it to make
+		// the surrounding text look like the thing that worked - and TYPED rather than
+		// `fill()`ed, so it goes through the same per-keystroke `oninput` path a user
+		// does (a `{` arriving on its own must not be treated as anything special).
+		const { compact } = localToday();
+		await page.getByTestId('databricks-upload-prefix').pressSequentially('{YYYYMMDD}');
+		await page.getByTestId('databricks-upload-postfix').pressSequentially('{YYYYMMDD}');
+
+		const preview = page.getByTestId('databricks-upload-preview');
+		await expect(preview).toHaveText(`${compact}notebook${compact}`);
+		// The literal is the failure being guarded against, so say so rather than only
+		// asserting the date: a preview reading `{YYYYMMDD}notebook` is the bug.
+		await expect(preview).not.toContainText('{');
+
+		await page.getByTestId('databricks-upload').click();
+
+		// And the wire carries the same thing the preview promised - the client expands
+		// once, at the click, so the server has no token left to disagree about.
+		await expect.poll(() => seen.length).toBe(1);
+		expect(seen[0].prefix).toBe(compact);
+		expect(seen[0].postfix).toBe(compact);
+		await expect(page.getByTestId('databricks-upload-note')).toContainText(
+			`/Users/${USER}/${compact}notebook${compact}`
+		);
+	});
+
+	test('a brace that is NOT a token SAYS so, instead of silently uploading literally', async ({
+		page
+	}) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+		const seen = await mockUpload(page, (body) => {
+			const path = `/Users/${USER}/${String(body.prefix ?? '')}notebook`;
+			return { status: 200, json: { ok: true, status: 'uploaded', path, url: null, overwritten: false } };
+		});
+
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
+
+		// The shape the reported failure had: a near-miss of a real token. Left literal
+		// (dropping it would be worse), the preview then reads like a token that has not
+		// expanded YET rather than one that never will - which is exactly how a spelling
+		// that never existed got reported as an expander that was broken.
+		const prefix = page.getByTestId('databricks-upload-prefix');
+		await prefix.fill('{YYYYMMD}_');
+
+		const warning = page.getByTestId('databricks-upload-token-warning');
+		await expect(warning).toBeVisible();
+		await expect(warning).toContainText('{YYYYMMD}');
+		await expect(warning).toContainText('not a date token');
+		// The preview keeps telling the literal truth about what will land.
+		await expect(page.getByTestId('databricks-upload-preview')).toHaveText('{YYYYMMD}_notebook');
+
+		// A WARNING, not a refusal: the name is legal and the braces may be meant, so the
+		// upload is still offered and still sends exactly what was previewed.
+		await expect(page.getByTestId('databricks-upload')).toBeEnabled();
+		await expect(page.getByTestId('databricks-upload-name-error')).toHaveCount(0);
+		await page.getByTestId('databricks-upload').click();
+		await expect.poll(() => seen.length).toBe(1);
+		expect(seen[0].prefix).toBe('{YYYYMMD}_');
+
+		// And the remedy is right there among the buttons. Once the token is real, the
+		// warning goes - the month stamps, which are what the report was reaching for,
+		// being two of them, in both spellings.
+		const { dashed, compact } = localToday();
+		await prefix.fill('{YYYYMM}_');
+		await expect(warning).toHaveCount(0);
+		await expect(page.getByTestId('databricks-upload-preview')).toHaveText(
+			`${compact.slice(0, 6)}_notebook`
+		);
+		await prefix.fill('{YYYY-MM}_');
+		await expect(warning).toHaveCount(0);
+		await expect(page.getByTestId('databricks-upload-preview')).toHaveText(
+			`${dashed.slice(0, 7)}_notebook`
+		);
+	});
+
+	test('a token chip inserts the BRACED token into the field last focused, at the caret', async ({
+		page
+	}) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+		const seen = await mockUpload(page, (body) => {
+			const path = `/Users/${USER}/${String(body.prefix ?? '')}notebook${String(body.postfix ?? '')}`;
+			return { status: 200, json: { ok: true, status: 'uploaded', path, url: null, overwritten: false } };
+		});
+
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
+
+		const { dashed, compact } = localToday();
+		const chip = (token: string) => page.locator(`[data-testid="databricks-upload-token"][data-token="${token}"]`);
+		const prefix = page.getByTestId('databricks-upload-prefix');
+		const postfix = page.getByTestId('databricks-upload-postfix');
+		const preview = page.getByTestId('databricks-upload-preview');
+
+		// Every token the expander knows is offered, and each chip shows the token itself -
+		// the braces are the thing being taught, so they have to be what is on screen.
+		await expect(page.getByTestId('databricks-upload-token')).toHaveCount(UPLOAD_DATE_TOKENS.length);
+		await expect(chip('{YYYYMMDD}')).toHaveText('{YYYYMMDD}');
+		// The month stamps are offered in both spellings - a chip list that omitted the
+		// stamp people actually reach for is how the vocabulary got guessed in the first
+		// place.
+		await expect(chip('{YYYYMM}')).toHaveAttribute('title', `{YYYYMM} → ${compact.slice(0, 6)}`);
+		await expect(chip('{YYYY-MM}')).toHaveAttribute('title', `{YYYY-MM} → ${dashed.slice(0, 7)}`);
+		// …and each says what it will become, so it reads as "insert today's date".
+		await expect(chip('{YYYYMMDD}')).toHaveAttribute('title', `{YYYYMMDD} → ${compact}`);
+
+		// Nothing focused yet: the click still lands somewhere predictable (the prefix).
+		await chip('{YYYY-MM-DD}').click();
+		await expect(prefix).toHaveValue('{YYYY-MM-DD}');
+		// The FIELD keeps the token - it is a reusable pattern that outlives today - while
+		// the preview beside it resolves it. Storing the expansion instead would upload
+		// under a stale date tomorrow.
+		await expect(preview).toHaveText(`${dashed}notebook`);
+
+		// A chip continues where the caret is, not at the end: typing `_` after the first
+		// insert and clicking again must read `{YYYY-MM-DD}_{DD}`.
+		await prefix.press('End');
+		await prefix.pressSequentially('_');
+		await chip('{DD}').click();
+		await expect(prefix).toHaveValue('{YYYY-MM-DD}_{DD}');
+
+		// The target FOLLOWS focus: after touching the postfix, the chips write there.
+		await postfix.click();
+		await chip('{YYYYMMDD}').click();
+		await expect(postfix).toHaveValue('{YYYYMMDD}');
+		await expect(prefix).toHaveValue('{YYYY-MM-DD}_{DD}');
+
+		const promised = await preview.textContent();
+		expect(promised).toBe(`${dashed}_${dashed.slice(-2)}notebook${compact}`);
+
+		// And a chip-built affix uploads exactly as a typed one does - same single path,
+		// so what the preview promised is what the wire carries.
+		await page.getByTestId('databricks-upload').click();
+		await expect.poll(() => seen.length).toBe(1);
+		expect(seen[0].prefix).toBe(`${dashed}_${dashed.slice(-2)}`);
+		expect(seen[0].postfix).toBe(compact);
+		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/${promised}`);
+	});
+
+	test('the token hint is VISIBLE, not hidden in a tooltip', async ({ page }) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
+
+		// The reported failure was someone guessing the syntax, and a `title` is not
+		// something anyone finds before typing. The braces requirement has to be readable
+		// without hovering anything.
+		await expect(page.getByTestId('databricks-upload-token-hint')).toBeVisible();
+		const chips = page.getByTestId('databricks-upload-token');
+		await expect(chips.first()).toBeVisible();
+		// A real, reachable button - not a decorative span someone has to guess is live.
+		await expect(chips.first()).toBeEnabled();
+		expect(await chips.first().evaluate((el) => el.tagName)).toBe('BUTTON');
+		expect(await chips.first().getAttribute('aria-label')).toContain('Insert');
 	});
 
 	test('the last-used prefix/postfix survive a reload', async ({ page }) => {
@@ -583,7 +773,7 @@ test.describe('upload name affixes', () => {
 		// And the promise is kept: the click sends the date the preview is showing, not
 		// the one it was opened on. A frozen preview would have promised 08-05 here.
 		await page.getByTestId('databricks-upload').click();
-		expect(seen).toHaveLength(1);
+		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe('2026-08-06_');
 		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/2026-08-06_notebook`);
 	});
@@ -616,7 +806,7 @@ test.describe('upload name affixes', () => {
 		// The click reads the clock once and moves the preview onto that same instant, so
 		// the two cannot disagree: today's date is uploaded (never the previewed stale
 		// one) AND the name left on screen is the one that landed.
-		expect(seen).toHaveLength(1);
+		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe('2026-08-06_');
 		await expect(preview).toHaveText('2026-08-06_notebook');
 		await expect(page.getByTestId('databricks-upload-note')).toContainText(`/Users/${USER}/2026-08-06_notebook`);
