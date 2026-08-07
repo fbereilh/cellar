@@ -45,10 +45,15 @@ import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
  *     warning as the sidebar's own fields.
  *
  * Deliberately NOT claimed: that a default written by one running instance reaches
- * another that has ALREADY read the store. Each app process caches the file on its
- * first read, so B picking A's default up is a first-read-from-disk (which is what
- * the ordering below arranges); two instances open side by side reconcile on the
- * next launch, not live.
+ * another whose PAGE is already open. The server store re-reads the file when its
+ * stamp moves, so a fresh load of B always sees what A wrote; a browser sitting on a
+ * rendered page is not pushed to.
+ *
+ * **Every test establishes the state it needs, and the `afterEach` puts the shared
+ * stores back.** There is one global store and two per-project ones behind these
+ * tests, so a test that leaned on the value its predecessor left would turn a single
+ * genuine regression into a cascade of unrelated red - and the restore, written as a
+ * trailing statement, would be skipped by exactly the failure that poisons the store.
  */
 
 let launcherA: ChildProcess | null = null;
@@ -64,7 +69,20 @@ let urlB = '';
 const HOST = 'https://dbc-demo.cloud.databricks.com';
 const USER = 'me@corp.example.com';
 const PREFIX_DEFAULT_KEY = 'cellar-databricks-upload-prefix-default';
+const POSTFIX_DEFAULT_KEY = 'cellar-databricks-upload-postfix-default';
 const PREFIX_KEY = 'cellar-databricks-upload-prefix';
+const POSTFIX_KEY = 'cellar-databricks-upload-postfix';
+/** Short enough that a wedged page cannot eat the hook's budget before the reset. */
+const UI_CLEAR_TIMEOUT_MS = 2_000;
+
+/**
+ * The instances a test has actually opened, so the reset touches those and no others.
+ *
+ * Which of the two has read the global store, and when, is part of what this file
+ * says: B inherits a default on a load that comes AFTER A wrote it. Resetting through
+ * an instance a test never went near would quietly make that ordering untrue.
+ */
+const touched = new Set<string>();
 
 function connectedStatus() {
 	return {
@@ -119,6 +137,7 @@ async function mockDatabricks(page: Page): Promise<Record<string, unknown>[]> {
  * which would have read as if a single instance could be pointed at either project.
  */
 async function openProject(page: Page, url: string): Promise<void> {
+	touched.add(url);
 	await page.goto(url);
 	const openBtn = page.getByTestId('empty-open-notebook');
 	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
@@ -171,6 +190,74 @@ function storedDefaults(): Record<string, unknown> {
 	}
 }
 
+/**
+ * Set the cross-project default THROUGH one instance's own store, and wait for it to
+ * reach the file - which is what another instance reads back.
+ *
+ * Writing it through a server rather than into the file behind everyone's back is
+ * what keeps the seeding honest: this is the same store the Settings pane writes, so
+ * a test that needs a default in place starts from the state the UI would have left.
+ */
+async function seedGlobalDefault(page: Page, url: string, prefix: string): Promise<void> {
+	touched.add(url);
+	await expect
+		.poll(async () => {
+			await page.request.put(`${url}/api/user-settings`, { data: { [PREFIX_DEFAULT_KEY]: prefix } });
+			return storedDefaults()[PREFIX_DEFAULT_KEY];
+		})
+		.toBe(prefix);
+}
+
+/**
+ * Put the shared stores back, unconditionally - the whole reason this is a hook.
+ *
+ * Three stores sit behind this file: one global default, and one per-project affix per
+ * instance. Restoring them as a trailing statement inside each test meant the restore
+ * was skipped by precisely the failure that left them dirty, so one genuine regression
+ * surfaced as several unrelated red tests.
+ *
+ * The UI clear is best-effort and carries its OWN short timeout: after a failure the
+ * page can be in any state at all, and an auto-waiting `fill()` would burn the hook's
+ * budget without ever reaching the authoritative reset below. The SERVER store is that
+ * authority, and the PUT sits INSIDE the poll so a debounced write still in flight from
+ * the page is simply overwritten by the next pass rather than racing the last one.
+ */
+async function resetStores(page: Page): Promise<void> {
+	for (const id of ['settings-upload-prefix', 'settings-upload-postfix', 'databricks-upload-prefix', 'databricks-upload-postfix']) {
+		const field = page.getByTestId(id);
+		try {
+			if (await field.isVisible().catch(() => false)) {
+				await field.fill('', { timeout: UI_CLEAR_TIMEOUT_MS });
+			}
+		} catch {
+			// Not in a state to type into - the stores below are the authority.
+		}
+	}
+	const urls = [...touched];
+	await expect
+		.poll(async () => {
+			const left: unknown[] = [];
+			for (const url of urls) {
+				try {
+					await page.request.put(`${url}/api/user-settings`, {
+						data: { [PREFIX_DEFAULT_KEY]: null, [POSTFIX_DEFAULT_KEY]: null }
+					});
+					await page.request.put(`${url}/api/ui-state`, {
+						data: { [PREFIX_KEY]: null, [POSTFIX_KEY]: null }
+					});
+					left.push(await storedProjectPrefix(page, url));
+				} catch {
+					// A request that did not land says nothing about the store - keep polling.
+					left.push('unread');
+				}
+			}
+			const defaults = storedDefaults();
+			left.push(defaults[PREFIX_DEFAULT_KEY], defaults[POSTFIX_DEFAULT_KEY]);
+			return left.every((v) => v === undefined);
+		})
+		.toBe(true);
+}
+
 function localToday() {
 	const d = new Date();
 	const yyyy = String(d.getFullYear());
@@ -212,6 +299,11 @@ test.afterAll(async () => {
 	}
 });
 
+/* Unconditional, and `resetStores` explains why that matters. */
+test.afterEach(async ({ page }) => {
+	await resetStores(page);
+});
+
 test('project A sets its own affix, then a default - and keeps its own', async ({ page }) => {
 	await mockDatabricks(page);
 	await openProject(page, urlA);
@@ -250,8 +342,9 @@ test('project B - a different workspace, never asked - inherits it, and uploads 
 }) => {
 	// The cross-project half, and the whole reason the default exists: B is a separate
 	// project served by a separate launcher on a separate port, which has never had an
-	// affix of its own. It has also never read the global store until now, so this is a
-	// genuine first read of the file A wrote.
+	// affix of its own. The default is written through A's store, so what B reads is a
+	// file another instance wrote - never one this test handed it directly.
+	await seedGlobalDefault(page, urlA, '{YYYYMM}_');
 	const seen = await mockDatabricks(page);
 	await openProject(page, urlB);
 	await openDatabricksSection(page);
@@ -274,6 +367,7 @@ test('a default changed with the panel ALREADY OPEN reaches it - no reload', asy
 	// a one-shot read at mount left a default set afterwards invisible until a reload -
 	// while the Settings copy promised it applied to every project without one of its
 	// own. This is the ordinary flow: the panel is open, and Settings is opened over it.
+	await seedGlobalDefault(page, urlB, '{YYYYMM}_');
 	await mockDatabricks(page);
 	await openProject(page, urlB);
 	await openDatabricksSection(page);
@@ -288,8 +382,7 @@ test('a default changed with the panel ALREADY OPEN reaches it - no reload', asy
 	await expect(prefixField).toHaveValue('GLOBAL_');
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('GLOBAL_notebook');
 	// The browser's write is debounced, so ending the test here would tear the context
-	// down with the PUT still queued - and what the tests after this one read is the
-	// FILE, not this page.
+	// down with the PUT still queued, and the reset would then be racing it.
 	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
 });
 
@@ -302,6 +395,7 @@ test('a default change that MOVES the affix drops the confirm built from the old
 	// preview saying `NEW_notebook` over a confirm offering to overwrite
 	// `GLOBAL_notebook`. Typing already drops it; a seed has to as well, or the rule
 	// holds for one writer of the affixes and not the other.
+	await seedGlobalDefault(page, urlB, 'GLOBAL_');
 	await mockDatabricks(page);
 	await page.route(/\/api\/databricks\/upload$/, async (route) => {
 		const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;
@@ -327,10 +421,8 @@ test('a default change that MOVES the affix drops the confirm built from the old
 	await openSettings(page);
 	await page.getByTestId('settings-upload-prefix').fill('NEW_');
 	await closeSettings(page);
-	// Confirm it REACHED the file. The previous test left `GLOBAL_` there, so polling
-	// only for the restore below would pass against that pre-existing value - before
-	// this write had even landed - and the test would end with two writes still in
-	// flight behind a torn-down page.
+	// Confirm it REACHED the file, so the reset is not racing a debounced write still
+	// queued behind a page this test is about to be finished with.
 	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('NEW_');
 
 	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('NEW_');
@@ -346,12 +438,6 @@ test('a default change that MOVES the affix drops the confirm built from the old
 	await openDatabricksSection(page);
 	await expect(confirm).toContainText('NEW_notebook');
 	await page.getByTestId('databricks-upload-cancel').click();
-
-	// Put the default back for the tests after this one.
-	await openSettings(page);
-	await page.getByTestId('settings-upload-prefix').fill('GLOBAL_');
-	await closeSettings(page);
-	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
 });
 
 test('a default changed MID-REPLACE never discards the reply, and lands once it settles', async ({
@@ -363,6 +449,7 @@ test('a default changed MID-REPLACE never discards the reply, and lands once it 
 	// in Databricks, the panel said nothing about it, and the box the user was watching
 	// vanished mid-replace. That is exactly the silent clobber Cancel is deliberately
 	// inert for. So an in-flight upload DEFERS the whole seed.
+	await seedGlobalDefault(page, urlB, 'GLOBAL_');
 	await mockDatabricks(page);
 	let release!: () => void;
 	const held = new Promise<void>((resolve) => (release = resolve));
@@ -400,10 +487,8 @@ test('a default changed MID-REPLACE never discards the reply, and lands once it 
 	// The box is still up, still naming the path being overwritten - it must not be
 	// pulled out from under a replace that is happening.
 	await expect(confirm).toContainText('GLOBAL_notebook');
-	// Confirm it REACHED the file before the restore below, which polls for a value the
-	// previous test already left there: polling only for that would pass against the
-	// pre-existing `GLOBAL_` and leave this write to land afterwards, so the tests that
-	// follow would read `HELD_`.
+	// Confirm it REACHED the file, so the reset is not racing a debounced write still
+	// queued behind a page this test is about to be finished with.
 	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('HELD_');
 
 	release();
@@ -420,18 +505,15 @@ test('a default changed MID-REPLACE never discards the reply, and lands once it 
 	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('HELD_');
 	await expect(page.getByTestId('databricks-upload-preview')).toHaveText('HELD_notebook');
 	await expect(note).toContainText(`/Users/${USER}/GLOBAL_notebook`);
-
-	// Put the default back for the tests after this one.
-	await openSettings(page);
-	await page.getByTestId('settings-upload-prefix').fill('GLOBAL_');
-	await closeSettings(page);
-	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
 });
 
 test('CLEARING a project field is an answer, so the default does not creep back', async ({ page }) => {
+	// A default has to be in force, or there would be nothing to creep back.
+	await seedGlobalDefault(page, urlB, 'GLOBAL_');
 	await mockDatabricks(page);
 	await openProject(page, urlB);
 	await openDatabricksSection(page);
+	await expect(page.getByTestId('databricks-upload-prefix')).toHaveValue('GLOBAL_');
 
 	// "No prefix on this project" - said by emptying the field, the only way to say it.
 	await page.getByTestId('databricks-upload-prefix').fill('');
@@ -456,7 +538,10 @@ test('the default is a FILE, not per-origin state - the reason it is not localSt
 	// A relaunch means a brand-new origin, so anything kept per-origin would be gone.
 	// Restarting a launcher here would cost the suite its instance, so this asserts the
 	// same thing at the layer that decides it - what is ON DISK, and what a fresh SSR
-	// load hands the browser.
+	// load hands the browser. Written through A, read back through B: two origins, one
+	// file, which is the whole claim.
+	await seedGlobalDefault(page, urlA, 'GLOBAL_');
+	touched.add(urlB);
 	expect(storedDefaults()[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
 	const res = await page.request.get(`${urlB}/api/user-settings`);
 	expect((await res.json())[PREFIX_DEFAULT_KEY]).toBe('GLOBAL_');
@@ -491,8 +576,4 @@ test('the default field takes the same tokens - and the same not-a-token warning
 	await expect(warning).toHaveCount(0);
 	const { dashed } = localToday();
 	await expect(page.getByTestId('settings-upload-preview')).toHaveText(`${dashed}notebook`);
-
-	// Leave the global store clean for anything that runs after this file.
-	await prefix.fill('');
-	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBeUndefined();
 });

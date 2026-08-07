@@ -158,6 +158,17 @@ export function createJsonStore(storePath: () => string): JsonStore {
 	 * live cases for `~/.cellar/settings.json`. The two atomic writers coexist
 	 * deliberately for now: the other one serves the `.ipynb` path, i.e. the user's
 	 * PRIMARY data, so unifying them is its own change (see `write-file-atomic.js`).
+	 *
+	 * `dirty` is cleared only once the write has RETURNED, and that ordering is the
+	 * whole protection against a failed one. Cleared first, a throw (ENOSPC, EACCES, a
+	 * read-only home, a directory where the file belongs) dropped both guards at once:
+	 * the exit hook's flush saw a clean store and no-opped, so nothing retried, and
+	 * `loadedStamp` still described the file we never replaced - so the moment any
+	 * other instance wrote it the stamp moved, `ensureLoaded` reloaded, and the setting
+	 * the user had just made silently REVERTED to the other instance's value. Left set,
+	 * the cache stays authoritative and every later `set` reschedules a write; a
+	 * persistently failing one keeps an unpersisted value, which is strictly better
+	 * than a silent revert (hence no retry counter that would eventually give up).
 	 */
 	function flush(): void {
 		if (writeTimer) {
@@ -165,11 +176,11 @@ export function createJsonStore(storePath: () => string): JsonStore {
 			writeTimer = null;
 		}
 		if (!dirty || cache === null) return;
-		dirty = false;
 		try {
 			const p = storePath();
 			const payload = JSON.stringify(cache, null, 2) + '\n';
 			writeFileAtomic(p, payload);
+			dirty = false;
 			// Our own write is not a change to catch up on - but only while the file
 			// still IS the one we wrote. A concurrent write landing between the rename
 			// and this stat would otherwise be recorded as loaded, the same permanent
@@ -215,7 +226,11 @@ export function createJsonStore(storePath: () => string): JsonStore {
 		flush,
 		reset() {
 			flush();
+			// Dropping the copy discards whatever a failed flush left unwritten, so the
+			// dirty flag has to go with it - kept, it would short-circuit `ensureLoaded`
+			// and the next read would never reach the disk this exists to re-read from.
 			cache = null;
+			dirty = false;
 			loadedStamp = null;
 		}
 	};

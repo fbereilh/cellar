@@ -211,4 +211,30 @@ describe('persisting the store', () => {
 		expect(() => blocked.flush()).not.toThrow();
 		expect(readdirSync(blockedDir)).toEqual(['store.json']);
 	});
+
+	it('a write that FAILED keeps the value, and another instance cannot revert it', () => {
+		// The failure this store exists to avoid, arriving from the other direction: not a
+		// stale read but the silent LOSS of a fresh write. Clearing `dirty` before the
+		// write dropped both guards at once - the exit hook saw a clean store so nothing
+		// retried, and `loadedStamp` still described a file we never replaced, so the next
+		// time any other instance wrote it the stamp moved, the cache reloaded, and the
+		// setting the user had just made reverted to the other instance's value.
+		let writable = false;
+		const path = join(dir, 'shared.json');
+		const store = createJsonStore(() => (writable ? path : join(dir, 'blocked', 'store.json')));
+		mkdirSync(join(dir, 'blocked', 'store.json'), { recursive: true });
+
+		writeFileSync(path, JSON.stringify({ k: 'theirs' }));
+		store.set({ k: 'ours' });
+		store.flush();
+
+		// Another instance rewrites the shared file, i.e. the stamp moves.
+		writable = true;
+		writeFileSync(path, JSON.stringify({ k: 'theirs-again' }));
+		expect(store.get().k).toBe('ours');
+
+		// …and the change is still pending, so it is written the moment a flush can land.
+		store.flush();
+		expect(JSON.parse(readFileSync(path, 'utf8')).k).toBe('ours');
+	});
 });
