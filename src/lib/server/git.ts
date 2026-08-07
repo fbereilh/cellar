@@ -539,8 +539,14 @@ export async function gitRefAt(absDir: string): Promise<{ branch: string | null;
  * THREE spawns, run CONCURRENTLY (they are independent, and this runs on the
  * process that also carries the kernel websockets and the SSE fan-out): the
  * branch, the commit metadata, and the dirty bit. They are collapsed by the cache
- * below, so N notebooks sharing one root cost one probe, and a burst of requests
- * within one window costs one too.
+ * below, so N notebooks sharing one root cost one probe, and a SEQUENTIAL repeat
+ * within one window costs nothing. Note what that does NOT cover: the entry is
+ * written only once the three spawns have finished, so genuinely CONCURRENT
+ * callers all miss it and each spawns its own three. There is deliberately no
+ * single-flight promise here — the one caller that can overlap with itself is the
+ * Git sidebar panel (mount racing `sse:open`, focus racing an fs-refresh bump),
+ * and it coalesces its own in-flight request, which collapses the whole round trip
+ * rather than just this directory's reads.
  *
  * The cache is keyed on the directory + its own git index mtime (a worktree has
  * its OWN index under `.git/worktrees/<name>/`, so `preflight`'s `--absolute-git-dir`

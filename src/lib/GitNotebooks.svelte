@@ -74,16 +74,51 @@
 	// change and a tab opening can each have a request in flight at once, and
 	// responses are unordered — only the newest may apply.
 	let seq = 0;
+	// Single-flight, keyed on the query this panel would send (the `livenessInFlight`
+	// / `workspaceProbes` convention). The generation guard above only DISCARDS a
+	// superseded reply; it does not stop the request being made, and the triggers
+	// here genuinely overlap — the mount effect races `sse:open` on the initial
+	// connect, and window focus races an `fsRefreshSignal` bump. `gitCommitAt`'s
+	// server cache cannot collapse those: it writes its entry only once its three
+	// spawns have finished, so concurrent callers all miss it and each re-spawns
+	// three `git` processes per distinct root. Keyed rather than blanket, so a
+	// request whose notebook set has since changed is never shared as this one's
+	// answer.
+	let inFlight: { key: string; done: Promise<void> } | null = null;
 
 	/** Identity of the open-notebook set, so the reload effect tracks CONTENT, not array identity. */
 	const pathsKey = $derived(notebooks.map((n) => n.path).join('\n'));
 
-	async function load() {
+	function load(): Promise<void> {
+		// With no notebook open the template short-circuits to `git-empty` and every
+		// field this would fetch is discarded, so the request is not made at all —
+		// the workspace probe behind it is three `git` spawns for a payload nothing
+		// reads. `seq` still advances, so a reply from a request issued while a tab
+		// WAS open cannot land afterwards and repopulate the list; the reload effect
+		// tracks `pathsKey`, so opening a tab resumes fetching.
+		if (!notebooks.length) {
+			seq++;
+			inFlight = null;
+			rows = [];
+			workspaceGit = null;
+			error = '';
+			loading = false;
+			return Promise.resolve();
+		}
+		const key = notebooks.map((n) => `path=${encodeURIComponent(n.path)}`).join('&');
+		if (inFlight?.key === key) return inFlight.done;
+		const done = fetchRoots(key).finally(() => {
+			if (inFlight?.done === done) inFlight = null;
+		});
+		inFlight = { key, done };
+		return done;
+	}
+
+	async function fetchRoots(query: string) {
 		const mine = ++seq;
 		loading = true;
 		try {
-			const q = notebooks.map((n) => `path=${encodeURIComponent(n.path)}`).join('&');
-			const res = await fetch(`/api/fs/git/roots${q ? `?${q}` : ''}`);
+			const res = await fetch(`/api/fs/git/roots?${query}`);
 			const body = await res.json();
 			if (mine !== seq) return;
 			if (!res.ok) throw new Error(body?.message || 'could not read git info');
@@ -142,13 +177,19 @@
 	}
 
 	/**
-	 * What to render as the checkout's ref: the branch, or the short SHA in
-	 * parentheses when HEAD is detached — the same convention the file tree's
-	 * branch chip uses.
+	 * What to render as the checkout's ref: the branch, or the word "detached"
+	 * when HEAD is one.
+	 *
+	 * Deliberately NOT the file tree's parenthesised-SHA convention: that chip is
+	 * the only place its row names a commit, so `(abc1234)` reads as the ref there.
+	 * This row already renders the short SHA in its own chip a few pixels to the
+	 * right, so borrowing it printed the same seven characters twice side by side
+	 * (three times counting the tooltip). The tooltip still names the SHA, so
+	 * nothing is lost by saying only what the branch slot knows: there is no branch.
 	 */
 	function refLabel(git: GitDirCommit): string | null {
 		if (git.branch) return git.branch;
-		return git.shortSha ? `(${git.shortSha})` : null;
+		return git.shortSha ? 'detached' : null;
 	}
 </script>
 
@@ -183,19 +224,33 @@
 							<span class="min-w-0 truncate">{nb.name}</span>
 							{#if nb.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
 						</button>
-						<!-- A DECLARED root is a value the reader acts on, so it is legible; the
+						<!-- THREE states, and the difference between the first two is a claim:
+						     a row that has NOT ARRIVED yet knows nothing about this notebook, so
+						     it gets a neutral dimmed placeholder — the same icon and a fixed-width
+						     bar, so the slot is already occupied and the row does not jump when the
+						     real chip lands — with no "workspace" text and no tooltip. A LOADED row
+						     whose root is null genuinely declares none, which is worth saying, so it
+						     keeps the real chip and its tooltip. `data-testid=git-root` marks the
+						     REAL chip only: it is asserted on for exact text.
+
+						     A DECLARED root is a value the reader acts on, so it is legible; the
 						     "workspace" default is the absence of one, deliberately quiet, so a
 						     rooted notebook stands out in a list where most are not. Withheld
 						     entirely when the document could not be read: there the absence of a
 						     root is unknown, not observed, and "workspace" would assert it. -->
-						{#if !row?.unreadable}
+						{#if !row}
+							<span class="flex shrink-0 items-center gap-1 text-[11px] text-base-content/20" aria-hidden="true" data-testid="git-root-pending">
+								<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2z" /></svg>
+								<span class="h-2 w-14 rounded bg-current"></span>
+							</span>
+						{:else if !row.unreadable}
 							<span
-								class="flex max-w-[52%] shrink-0 items-center gap-1 text-[11px] {row?.root ? 'text-base-content/70' : 'text-base-content/35'}"
-								title={row?.root ? `Code root: ${row.root} — this notebook's kernel runs and imports from here` : 'No code root declared: the kernel runs at the workspace root'}
+								class="flex max-w-[52%] shrink-0 items-center gap-1 text-[11px] {row.root ? 'text-base-content/70' : 'text-base-content/35'}"
+								title={row.root ? `Code root: ${row.root} — this notebook's kernel runs and imports from here` : 'No code root declared: the kernel runs at the workspace root'}
 								data-testid="git-root"
 							>
 								<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2z" /></svg>
-								<span class="truncate">{row?.root ?? 'workspace'}</span>
+								<span class="truncate">{row.root ?? 'workspace'}</span>
 							</span>
 						{/if}
 					</div>

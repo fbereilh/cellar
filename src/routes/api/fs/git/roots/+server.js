@@ -39,10 +39,31 @@ import { resolveRootDir } from '$lib/server/notebookRoot';
  *
  * Probing is DEDUPED by directory: several notebooks reviewing one worktree cost
  * one probe, and `gitCommitAt`'s own cache collapses repeat requests on top.
+ *
+ * BOUNDED at `MAX_PATHS` distinct paths, because the fan-out is per path and lands
+ * on the process that also carries the kernel websockets and the SSE fan-out: each
+ * one loads that notebook's DOCUMENT (`getNotebookRoot` → `loadDoc`, a blocking
+ * `spawnSync` jupytext conversion for a `.py` notebook), and each distinct root it
+ * resolves to costs three concurrent `git` spawns below. The real caller is the
+ * sidebar's open-tab list, an order of magnitude under the cap, so the bound only
+ * ever bites a hand-made request. It REFUSES rather than truncating: a truncated
+ * answer leaves the notebooks it dropped rendering as never-arrived forever, which
+ * says nothing about them and offers no way to notice, while the refusal names the
+ * cap and what to do about it.
  */
+
+/** Distinct `path` params one request may ask about; see the header. */
+const MAX_PATHS = 64;
+
 export async function GET({ url }) {
 	const ws = resolve(workspaceRoot());
 	const paths = [...new Set(url.searchParams.getAll('path').filter(Boolean))];
+	if (paths.length > MAX_PATHS) {
+		return json(
+			{ message: `too many notebooks in one request (${paths.length}); this reads at most ${MAX_PATHS} at a time` },
+			{ status: 400 }
+		);
+	}
 
 	/** Declared root + resolved directory (or the refusal) for one notebook. */
 	const targets = paths.map((path) => {

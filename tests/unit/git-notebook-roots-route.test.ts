@@ -32,10 +32,14 @@ function git(cwd: string, ...args: string[]) {
 
 /** Call the route the way SvelteKit does, with `path` repeated once per notebook. */
 async function get(...paths: string[]) {
+	return (await raw(...paths)).json();
+}
+
+/** The same, keeping the Response so a refusal's status can be asserted. */
+async function raw(...paths: string[]) {
 	const url = new URL('http://localhost/api/fs/git/roots');
 	for (const p of paths) url.searchParams.append('path', p);
-	const res = await route.GET({ url } as Parameters<typeof route.GET>[0]);
-	return res.json();
+	return route.GET({ url } as Parameters<typeof route.GET>[0]);
 }
 
 /** Create a notebook and declare its root, straight through the document layer. */
@@ -194,6 +198,27 @@ describe('GET /api/fs/git/roots', () => {
 		// that, and the section is refetched on every window focus.
 		expect(gitmod.gitSpawnCount()).toBeLessThanOrEqual(6);
 		for (const row of body.notebooks) expect(row.git.branch).toBe('pr-482');
+	});
+
+	it('REFUSES an over-large request instead of fanning out, and reads nothing', async () => {
+		// The fan-out is per path — a document load each (a blocking jupytext
+		// conversion for a `.py` notebook) plus three `git` spawns per distinct root —
+		// on the process carrying the kernel websockets and the SSE fan-out.
+		const gitmod = await import('../../src/lib/server/git');
+		gitmod.resetGitSpawnCount();
+		const tooMany = Array.from({ length: 65 }, (_, i) => `bulk-${i}.ipynb`);
+		const res = await raw(...tooMany);
+
+		expect(res.status).toBe(400);
+		expect((await res.json()).message).toMatch(/at most 64/);
+		// Refused BEFORE any work: the point is not paying for it, not discarding it.
+		expect(gitmod.gitSpawnCount()).toBe(0);
+
+		// The bound counts DISTINCT paths, so a repeated one is not a way past it and
+		// is not a way to trip it either.
+		const one = notebookAt('dupe.ipynb', null);
+		const dupes = Array.from({ length: 200 }, () => one);
+		expect((await raw(...dupes)).status).toBe(200);
 	});
 
 	it('answers about the notebooks asked for, in the order asked', async () => {
