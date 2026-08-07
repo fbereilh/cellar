@@ -29,6 +29,13 @@
   changes (`notebook:root`), on the shell's file-system refresh signal, and on
   window focus — a commit made in a terminal moves HEAD with nothing to notify us.
   No timer.
+
+  Every "nothing to report" here is a DIFFERENT fact and is rendered as one, because
+  the alternative is a row asserting something nobody read: a row still in flight
+  gets a neutral placeholder, a row whose DOCUMENT could not be read says so and
+  withholds the root, a row the route never opened (past its path cap) says only
+  "not read" with the reason stated once below the list, and a checkout with no
+  commits yet keeps its branch and says so where the SHA would be.
 -->
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
@@ -52,6 +59,15 @@
 		 * withheld rather than defaulting to "workspace".
 		 */
 		unreadable?: boolean;
+		/**
+		 * The request asked about more notebooks than the route probes at once, and
+		 * this one fell past the cap, so it was never opened. A THIRD kind of "nothing
+		 * to report", structurally apart from a row still in flight and from an
+		 * unreadable document: those two are about ONE notebook, while this one is
+		 * about the request as a whole — hence the single notice below the list rather
+		 * than a per-row explanation.
+		 */
+		notRead?: boolean;
 		git: GitDirCommit | null;
 	}
 
@@ -68,6 +84,7 @@
 
 	let rows = $state<RootCommit[]>([]);
 	let workspaceGit = $state<GitDirCommit | null>(null);
+	let readLimit = $state(0);
 	let error = $state('');
 	let loading = $state(false);
 	// Generation guard (the statusSeq / kernelReqSeq convention): focus, a root
@@ -88,6 +105,8 @@
 
 	/** Identity of the open-notebook set, so the reload effect tracks CONTENT, not array identity. */
 	const pathsKey = $derived(notebooks.map((n) => n.path).join('\n'));
+	/** How many rows the server named but never opened, because the request was past its cap. */
+	const notReadCount = $derived(rows.filter((r) => r.notRead).length);
 
 	function load(): Promise<void> {
 		// With no notebook open the template short-circuits to `git-empty` and every
@@ -101,6 +120,7 @@
 			inFlight = null;
 			rows = [];
 			workspaceGit = null;
+			readLimit = 0;
 			error = '';
 			loading = false;
 			return Promise.resolve();
@@ -124,6 +144,7 @@
 			if (!res.ok) throw new Error(body?.message || 'could not read git info');
 			rows = body.notebooks ?? [];
 			workspaceGit = body.workspace ?? null;
+			readLimit = Number(body.readLimit) || 0;
 			error = '';
 		} catch (err) {
 			if (mine !== seq) return;
@@ -186,10 +207,35 @@
 	 * right, so borrowing it printed the same seven characters twice side by side
 	 * (three times counting the tooltip). The tooltip still names the SHA, so
 	 * nothing is lost by saying only what the branch slot knows: there is no branch.
+	 *
+	 * Null when git named neither — the branch slot then renders nothing rather than
+	 * a stand-in. It deliberately does NOT answer for a checkout with no commits yet:
+	 * that state keeps its branch name here (`symbolic-ref` succeeds on an unborn
+	 * HEAD) and is reported once, where the SHA would go — see `unbornHead` below.
 	 */
 	function refLabel(git: GitDirCommit): string | null {
 		if (git.branch) return git.branch;
 		return git.shortSha ? 'detached' : null;
+	}
+
+	/** The branch tooltip, or nothing when there is no ref to describe. */
+	function refTitle(git: GitDirCommit): string | undefined {
+		if (git.detached) return `detached HEAD @ ${git.shortSha}`;
+		return git.branch ? `branch: ${git.branch}` : undefined;
+	}
+
+	/**
+	 * A checkout that IS a repo but holds no commit yet — a fresh `git init`, or a
+	 * worktree on a branch nothing has landed on.
+	 *
+	 * Read off the commit, never off `refLabel` returning null: `symbolic-ref`
+	 * SUCCEEDS on an unborn HEAD (only `log -1` fails), so this row carries a real
+	 * branch name and used to render as a bare branch with no SHA and no subject —
+	 * indistinguishable from a commit line that half-failed to load. The one place
+	 * that decides it, so the marker and the missing SHA chip cannot disagree.
+	 */
+	function unbornHead(git: GitDirCommit): boolean {
+		return git.isRepo && !git.commit;
 	}
 </script>
 
@@ -243,6 +289,10 @@
 								<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2z" /></svg>
 								<span class="h-2 w-14 rounded bg-current"></span>
 							</span>
+						{:else if row.notRead}
+							<!-- Named but never opened (the request was past the route's cap), so
+							     there is no declaration to show. Withheld outright rather than
+							     placeheld: unlike a row still in flight, nothing here is coming. -->
 						{:else if !row.unreadable}
 							<span
 								class="flex max-w-[52%] shrink-0 items-center gap-1 text-[11px] {row.root ? 'text-base-content/70' : 'text-base-content/35'}"
@@ -255,7 +305,13 @@
 						{/if}
 					</div>
 
-					{#if row?.unreadable}
+					{#if row?.notRead}
+						<!-- Never opened, so this row states only that. The REASON lives once
+						     below the list, not per row: it is a fact about the request, and
+						     repeating it on every dropped notebook would drown the ones that
+						     were read. -->
+						<p class="mt-1 text-[11px] text-base-content/35" data-testid="git-not-read">not read</p>
+					{:else if row?.unreadable}
 						<!-- The document itself could not be read: deleted or renamed outside
 						     Cellar while its tab stayed open. Deliberately its OWN line rather
 						     than the root-refusal one above, which names a root this row does
@@ -290,13 +346,22 @@
 						     rather than squeezing it into `pr-482-re…`. The dirty marker sits at
 						     the row's right edge, where the file tree puts its status letter, so
 						     it reads as a status rather than as punctuation between two values. -->
+						{@const label = refLabel(git)}
 						<div class="mt-1 flex items-center gap-1.5 text-[11px]">
-							<span class="flex min-w-0 flex-1 items-center gap-1 text-base-content/75" title={git.detached ? `detached HEAD @ ${git.shortSha}` : `branch: ${git.branch}`}>
-								<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg>
-								<span class="truncate" data-testid="git-branch-name">{refLabel(git) ?? 'no commits yet'}</span>
+							<span class="flex min-w-0 flex-1 items-center gap-1 text-base-content/75" title={refTitle(git)}>
+								{#if label}
+									<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg>
+									<span class="truncate" data-testid="git-branch-name">{label}</span>
+								{/if}
 							</span>
 							{#if git.shortSha}
 								<span class="shrink-0 font-mono tabular-nums text-base-content/70" title={git.commit ?? undefined} data-testid="git-sha">{git.shortSha}</span>
+							{:else if unbornHead(git)}
+								<!-- Where the SHA chip would be, because that is the value this
+								     checkout does not have yet. Keeping the branch name in its own
+								     slot beside it is what makes the row read as "this branch, no
+								     commits" rather than as a commit line that failed to load. -->
+								<span class="shrink-0 text-base-content/45" title="This checkout has no commits yet" data-testid="git-unborn">no commits yet</span>
 							{/if}
 							{#if git.dirty}
 								<!-- VS Code's "this checkout has uncommitted work" cue, in the file
@@ -328,6 +393,14 @@
 				</div>
 			{/each}
 		</div>
+		{#if notReadCount}
+			<!-- Said ONCE, for however many rows were dropped: the cap is a property of
+			     the request, not of any one notebook, and it names the remedy because
+			     closing a tab is the only thing that brings those rows back. -->
+			<p class="px-1 pt-1.5 text-[11px] text-base-content/45" data-testid="git-not-read-notice">
+				Too many notebooks open: only the first {readLimit} are read, so {notReadCount} above show no commit. Close some to see them.
+			</p>
+		{/if}
 		{#if workspaceGit && !workspaceGit.isRepo}
 			<p class="px-1 pt-1.5 text-[11px] text-base-content/35" data-testid="git-not-a-repo">
 				This workspace is not a git repository.

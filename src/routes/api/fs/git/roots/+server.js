@@ -10,7 +10,7 @@ import { resolveRootDir } from '$lib/server/notebookRoot';
  * section's whole payload, in one round trip.
  *
  *   GET /api/fs/git/roots?path=a.ipynb&path=roots/x/b.ipynb
- *     → { workspace: <GitDirCommit>, notebooks: [{ path, root, error, unreadable, git }] }
+ *     → { workspace: <GitDirCommit>, readLimit, notebooks: [{ path, root, error, unreadable, notRead, git }] }
  *
  * `path` repeats, one per open notebook tab; unknown/omitted is not an error, it
  * just yields an empty list (a workspace with no notebook open still reports its
@@ -44,26 +44,31 @@ import { resolveRootDir } from '$lib/server/notebookRoot';
  * on the process that also carries the kernel websockets and the SSE fan-out: each
  * one loads that notebook's DOCUMENT (`getNotebookRoot` → `loadDoc`, a blocking
  * `spawnSync` jupytext conversion for a `.py` notebook), and each distinct root it
- * resolves to costs three concurrent `git` spawns below. The real caller is the
- * sidebar's open-tab list, an order of magnitude under the cap, so the bound only
- * ever bites a hand-made request. It REFUSES rather than truncating: a truncated
- * answer leaves the notebooks it dropped rendering as never-arrived forever, which
- * says nothing about them and offers no way to notice, while the refusal names the
- * cap and what to do about it.
+ * resolves to costs three concurrent `git` spawns below.
+ *
+ * Past the cap it READS THE FIRST `MAX_PATHS` AND REPORTS THE REMAINDER as
+ * `notRead:true` — a row with no root, no commit and no error, i.e. asserting
+ * nothing at all — rather than refusing the whole request. Refusing bounded the
+ * work correctly but dead-ended the only real caller: the panel's own list is every
+ * open notebook tab, unclamped, so one workspace with enough tabs turned every
+ * fetch into a 400 and the section rendered an error paragraph and no rows at all,
+ * permanently. That is strictly worse than the truncation it was avoiding — it
+ * drops the notebooks it COULD have read too. A hand-made oversized request is not
+ * a reason to make the sidebar useless, and `notRead` is what keeps the truncation
+ * from being silent: the dropped rows are still named and are structurally
+ * distinguishable from a row still loading and from one whose document could not be
+ * read, so the panel can mark them and say why, once, instead of leaving them
+ * rendering as never-arrived. `readLimit` rides along so it can name the cap.
  */
 
-/** Distinct `path` params one request may ask about; see the header. */
+/** Distinct `path` params one request PROBES; the rest come back `notRead`. See the header. */
 const MAX_PATHS = 64;
 
 export async function GET({ url }) {
 	const ws = resolve(workspaceRoot());
-	const paths = [...new Set(url.searchParams.getAll('path').filter(Boolean))];
-	if (paths.length > MAX_PATHS) {
-		return json(
-			{ message: `too many notebooks in one request (${paths.length}); this reads at most ${MAX_PATHS} at a time` },
-			{ status: 400 }
-		);
-	}
+	const asked = [...new Set(url.searchParams.getAll('path').filter(Boolean))];
+	const paths = asked.slice(0, MAX_PATHS);
+	const notRead = asked.slice(MAX_PATHS);
 
 	/** Declared root + resolved directory (or the refusal) for one notebook. */
 	const targets = paths.map((path) => {
@@ -99,12 +104,26 @@ export async function GET({ url }) {
 
 	return json({
 		workspace: commits.get(ws),
-		notebooks: targets.map((t) => ({
-			path: t.path,
-			root: t.root,
-			error: t.error,
-			unreadable: t.unreadable,
-			git: t.dir ? commits.get(t.dir) : null
-		}))
+		readLimit: MAX_PATHS,
+		notebooks: [
+			...targets.map((t) => ({
+				path: t.path,
+				root: t.root,
+				error: t.error,
+				unreadable: t.unreadable,
+				notRead: false,
+				git: t.dir ? commits.get(t.dir) : null
+			})),
+			// Named, so the panel can mark them; empty on every other field, so the row
+			// claims nothing about a notebook this request never opened.
+			...notRead.map((path) => ({
+				path,
+				root: null,
+				error: null,
+				unreadable: false,
+				notRead: true,
+				git: null
+			}))
+		]
 	});
 }

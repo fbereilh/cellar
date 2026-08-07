@@ -46,6 +46,68 @@ describe('GitNotebooks — the detached row', () => {
 	});
 });
 
+describe('GitNotebooks — a checkout with no commits yet', () => {
+	it('decides it off the COMMIT, not off a missing branch', () => {
+		// `symbolic-ref` SUCCEEDS on an unborn HEAD — only `log -1` fails — so this row
+		// carries a real branch name. Keying the hint off `refLabel` returning null
+		// therefore never fired for the case it was written for, and the row rendered a
+		// bare branch with no SHA and no subject: indistinguishable from a commit line
+		// that half-failed to load.
+		const body = fnBody('unbornHead');
+		expect(body).toContain('git.isRepo');
+		expect(body).toContain('!git.commit');
+	});
+
+	it('keeps the branch in its own slot and marks the missing commit where the SHA goes', () => {
+		// The two halves of "this branch, no commits": the label must NOT be replaced.
+		expect(SRC).toContain('{:else if unbornHead(git)}');
+		expect(SRC).toContain('data-testid="git-unborn"');
+		expect(SRC).toContain('{label}');
+	});
+
+	it('leaves no second, unreachable place deciding the same thing', () => {
+		// The dead `?? 'no commits yet'` fallback inside the branch slot: it could only
+		// fire when git named neither a branch nor a SHA, which is not this state.
+		expect(fnBody('refLabel')).not.toContain('no commits yet');
+		expect(SRC).not.toContain("refLabel(git) ?? 'no commits yet'");
+	});
+});
+
+describe('GitNotebooks — a notebook the route never opened', () => {
+	it('asserts nothing about it: no root chip, no commit', () => {
+		// Past the route's path cap, so it was named but never read. Unlike a row still
+		// in flight, nothing is coming — so the root slot is withheld outright rather
+		// than placeheld, and it must not fall through to the real chip's "workspace".
+		const from = SRC.indexOf('{:else if row.notRead}');
+		const to = SRC.indexOf('{:else if !row.unreadable}');
+		expect(from, 'the not-read root-slot branch is gone').toBeGreaterThan(-1);
+		expect(to, 'the loaded-row branch is gone').toBeGreaterThan(from);
+		const slot = SRC.slice(from, to);
+		expect(slot).not.toContain('workspace');
+		expect(slot).not.toContain('data-testid=');
+	});
+
+	it('is structurally distinct from BOTH the pending row and the unreadable one', () => {
+		// Three different facts, three different markers — a reused flag would make the
+		// panel say one of them about a notebook in a different state entirely.
+		for (const id of ['git-root-pending', 'git-not-read', 'git-notebook-error']) {
+			expect(SRC.match(new RegExp(`data-testid="${id}"`, 'g')), id).toHaveLength(1);
+		}
+		// The not-read row's own line is checked FIRST, so it can never be reported as
+		// an unreadable document (which would blame the notebook for a request cap).
+		expect(SRC.indexOf('{#if row?.notRead}')).toBeLessThan(SRC.indexOf('{:else if row?.unreadable}'));
+	});
+
+	it('states the reason ONCE, below the list, not on every dropped row', () => {
+		const row = SRC.slice(SRC.indexOf('{#if row?.notRead}'), SRC.indexOf('{:else if row?.unreadable}'));
+		expect(row).not.toMatch(/Too many|Close some/);
+		expect(SRC.match(/data-testid="git-not-read-notice"/g)).toHaveLength(1);
+		// …and it names the remedy, since closing a tab is the only thing that brings
+		// those rows back.
+		expect(SRC).toContain('Close some to see them.');
+	});
+});
+
 describe('GitNotebooks — the root chip has THREE states', () => {
 	it('marks only the REAL chip `git-root`, so the pending one cannot be asserted on', () => {
 		// The e2e asserts EXACT text on `git-root`; a second element wearing it would

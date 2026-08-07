@@ -200,25 +200,47 @@ describe('GET /api/fs/git/roots', () => {
 		for (const row of body.notebooks) expect(row.git.branch).toBe('pr-482');
 	});
 
-	it('REFUSES an over-large request instead of fanning out, and reads nothing', async () => {
+	it('READS UP TO the cap and REPORTS the remainder, rather than dead-ending', async () => {
 		// The fan-out is per path — a document load each (a blocking jupytext
 		// conversion for a `.py` notebook) plus three `git` spawns per distinct root —
-		// on the process carrying the kernel websockets and the SSE fan-out.
-		const gitmod = await import('../../src/lib/server/git');
-		gitmod.resetGitSpawnCount();
-		const tooMany = Array.from({ length: 65 }, (_, i) => `bulk-${i}.ipynb`);
-		const res = await raw(...tooMany);
+		// on the process carrying the kernel websockets and the SSE fan-out, so it is
+		// bounded. But the real caller is the sidebar's own open-tab list, so refusing
+		// the whole request turned the section into an error paragraph with NO rows:
+		// worse than truncating, since it drops the notebooks it could have read too.
+		const real = notebookAt('capped-real.ipynb', 'roots/pr-482');
+		const filler = Array.from({ length: 63 }, (_, i) => notebookAt(`cap-${i}.ipynb`, null));
+		const past = Array.from({ length: 5 }, (_, i) => notebookAt(`cap-past-${i}.ipynb`, 'roots/baseline'));
 
-		expect(res.status).toBe(400);
-		expect((await res.json()).message).toMatch(/at most 64/);
-		// Refused BEFORE any work: the point is not paying for it, not discarding it.
-		expect(gitmod.gitSpawnCount()).toBe(0);
+		const res = await raw(real, ...filler, ...past);
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.readLimit).toBe(64);
+
+		const by = Object.fromEntries(body.notebooks.map((n: { path: string }) => [n.path, n]));
+		// Everything up to the cap is read for real…
+		expect(by[real].notRead).toBe(false);
+		expect(by[real].git.branch).toBe('pr-482');
+
+		// …and everything past it is NAMED but asserts nothing at all: no root claim,
+		// no commit, and no error (nothing went wrong with these notebooks — they were
+		// simply never opened). `notRead` is its own channel, so the client can tell
+		// them from a row still in flight AND from an unreadable document.
+		expect(body.notebooks).toHaveLength(69);
+		for (const p of past) {
+			expect(by[p].notRead).toBe(true);
+			expect(by[p].root).toBeNull();
+			expect(by[p].git).toBeNull();
+			expect(by[p].error).toBeNull();
+			expect(by[p].unreadable).toBe(false);
+		}
 
 		// The bound counts DISTINCT paths, so a repeated one is not a way past it and
 		// is not a way to trip it either.
 		const one = notebookAt('dupe.ipynb', null);
 		const dupes = Array.from({ length: 200 }, () => one);
-		expect((await raw(...dupes)).status).toBe(200);
+		const deduped = await (await raw(...dupes)).json();
+		expect(deduped.notebooks).toHaveLength(1);
+		expect(deduped.notebooks[0].notRead).toBe(false);
 	});
 
 	it('answers about the notebooks asked for, in the order asked', async () => {
