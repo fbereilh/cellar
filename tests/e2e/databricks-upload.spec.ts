@@ -619,7 +619,8 @@ test.describe('upload name affixes', () => {
 		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe('{YYYYMMD}_');
 
-		// And the remedy is right there among the buttons. Once the token is real, the
+		// And the remedy is the dropdown beside the field, which is what the warning
+		// itself points at - there is no chip row here any more. Once the token is real, the
 		// warning goes - the month stamps, which are what the report was reaching for,
 		// being two of them, in both spellings.
 		const { dashed, compact } = localToday();
@@ -682,6 +683,11 @@ test.describe('upload name affixes', () => {
 		await expect(preview).toHaveText(`${dashed}notebook`);
 		// The select is an ACTION, not a value: it snaps back to its placeholder, so it
 		// never reads as "the affix is {YYYY-MM-DD}" and the same token can be picked again.
+		// (That a token is inserted only on an EXPLICIT pick - never on the bare `change`
+		// a CLOSED select fires per arrow key on Windows and Linux - is pinned in
+		// tests/unit/databricks-upload-card.test.ts instead: the behaviour differs by
+		// platform and by whether the option list is browser- or OS-rendered, so an
+		// assertion here would be testing this runner's own popup, not the rule.)
 		await expect(picker('prefix')).toHaveValue('');
 
 		// A pick continues where the caret is, not at the end: typing `_` after the first

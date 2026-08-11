@@ -14,7 +14,7 @@
 		unknownAffixTokens,
 		unknownTokenWarning
 	} from '$lib/databricksUploadName';
-	import { insertTokenIntoField } from '$lib/uploadTokenField';
+	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
 
 	interface Props {
 		open: boolean;
@@ -401,6 +401,7 @@
 							<span class="text-xs text-base-content/60">Prefix</span>
 							<input
 								bind:this={prefixDefaultEl}
+								use:tokenField
 								class="input input-sm w-full font-mono text-xs"
 								value={uploadPrefixDefault}
 								oninput={(e) => setUploadDefault('prefix', (e.currentTarget as HTMLInputElement).value)}
@@ -414,6 +415,7 @@
 							<span class="text-xs text-base-content/60">Postfix</span>
 							<input
 								bind:this={postfixDefaultEl}
+								use:tokenField
 								class="input input-sm w-full font-mono text-xs"
 								value={uploadPostfixDefault}
 								oninput={(e) => setUploadDefault('postfix', (e.currentTarget as HTMLInputElement).value)}

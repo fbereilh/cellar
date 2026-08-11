@@ -1,5 +1,5 @@
 /**
- * Three rules about the Databricks sidebar's **upload** UI that live in the component,
+ * Four rules about the Databricks sidebar's **upload** UI that live in the component,
  * and therefore cannot be mounted here (vitest runs without the SvelteKit plugin - see
  * `vitest.config.ts`). Their behavioural proof is `tests/e2e/databricks-upload.spec.ts`,
  * which neither CI nor the no-mistakes gate runs, so the call sites are pinned here too
@@ -20,6 +20,10 @@
  *   3. A pick INSERTS into the affix rather than replacing it. That is what keeps both
  *      fields free text: a token lands beside whatever is typed, and an affix built by
  *      hand is never overwritten by reaching for one token.
+ *
+ *   4. Only an EXPLICIT pick inserts. A closed select fires `change` on every arrow
+ *      key on Windows and Linux, so committing on the bare event let merely tabbing
+ *      to the control and pressing Down write a token nobody chose.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -57,6 +61,28 @@ function elementAt(src: string, marker: string): string {
 		}
 	}
 	throw new Error(`unbalanced element at anchor: ${marker}`);
+}
+
+/**
+ * The brace-balanced body of the function whose signature is `signature`.
+ *
+ * By balance rather than by "the `}` after some call inside it": these handlers now
+ * call each other, so an index-of on a shared call string can land in a SIBLING and
+ * silently yield an empty slice - a guard that then asserts nothing while passing.
+ * None of these bodies carries a brace inside a string, so the scan is exact.
+ */
+function functionAt(src: string, signature: string): string {
+	const start = src.indexOf(signature);
+	expect(start, `function not found: ${signature}`).toBeGreaterThan(-1);
+	let depth = 0;
+	for (let i = start; i < src.length; i++) {
+		if (src[i] === '{') depth++;
+		else if (src[i] === '}') {
+			depth--;
+			if (depth === 0) return src.slice(start, i + 1);
+		}
+	}
+	throw new Error(`unbalanced function: ${signature}`);
 }
 
 /** `src` with its `//` comments dropped - see `upload-default-guards` for why. */
@@ -102,13 +128,7 @@ describe('the upload is its own card, not a row in the cluster card', () => {
 
 describe('an affix token dropdown is an action, not a value', () => {
 	const fn = codeOnly(
-		PANEL.slice(
-			PANEL.indexOf("function onUploadTokenPick(which: 'prefix' | 'postfix', e: Event) {"),
-			PANEL.indexOf(
-				'}',
-				PANEL.indexOf('insertUploadDateToken(which, token);')
-			) + 1
-		)
+		functionAt(PANEL, "function commitUploadToken(which: 'prefix' | 'postfix', el: HTMLSelectElement) {")
 	);
 
 	it('reads the picked token BEFORE resetting the select', () => {
@@ -125,12 +145,54 @@ describe('an affix token dropdown is an action, not a value', () => {
 	});
 });
 
+/**
+ * Rule 4, learned from the swap itself: a `change` is not by itself a pick. Arrowing
+ * over a CLOSED select changes its value and fires `change` per press on Windows and
+ * Linux, so committing on the bare event made merely tabbing to this control and
+ * pressing Down insert a token nobody chose - something the row of buttons it
+ * replaced could never do. The keyboard half is the dangerous direction to get
+ * wrong, so both are pinned: the guard has to stay AND Enter has to keep committing.
+ */
+describe('a token is inserted only on an explicit pick', () => {
+	const change = codeOnly(
+		functionAt(PANEL, "function onUploadTokenChange(which: 'prefix' | 'postfix', e: Event) {")
+	);
+	const keydown = codeOnly(
+		functionAt(PANEL, "function onUploadTokenKeydown(which: 'prefix' | 'postfix', e: KeyboardEvent) {")
+	);
+
+	it('ignores a change that a key moved a closed select through', () => {
+		const guard = change.indexOf('if (uploadTokenKeyNav) return;');
+		const commit = change.indexOf('commitUploadToken(');
+		expect(guard, 'a bare change commits again - arrowing inserts a token nobody picked').toBeGreaterThan(-1);
+		expect(commit).toBeGreaterThan(-1);
+		expect(guard).toBeLessThan(commit);
+	});
+
+	it('still lets a keyboard user commit, and never holds the flag past the task', () => {
+		// Without the Enter path the closed-select flow has no commit at all, which is a
+		// worse regression than the one being fixed.
+		expect(keydown).toContain("if (e.key === 'Enter')");
+		expect(keydown).toContain('commitUploadToken(which, e.currentTarget as HTMLSelectElement);');
+		expect(keydown).toContain('uploadTokenKeyNav = true;');
+		// Cleared on the NEXT task, never sticky: held across one it would swallow the
+		// pick that follows the key which OPENED the option list.
+		expect(keydown).toMatch(/setTimeout\(\(\) => \(uploadTokenKeyNav = false\), 0\)/);
+	});
+
+	it('wires the keydown on the select itself', () => {
+		const select = snippetBody(PANEL, 'tokenSelect');
+		expect(select).toContain('onkeydown={(e) => onUploadTokenKeydown(which, e)}');
+		expect(select).toContain('onchange={(e) => onUploadTokenChange(which, e)}');
+		// Leaving without committing puts the placeholder back, so a token arrowed past
+		// is never left sitting in the closed control reading as a setting.
+		expect(select).toContain('onblur={onUploadTokenBlur}');
+	});
+});
+
 describe('a picked token composes with typed text', () => {
 	const fn = codeOnly(
-		PANEL.slice(
-			PANEL.indexOf("function insertUploadDateToken(which: 'prefix' | 'postfix', token: string) {"),
-			PANEL.indexOf("function onUploadTokenPick(which: 'prefix' | 'postfix', e: Event) {")
-		)
+		functionAt(PANEL, "function insertUploadDateToken(which: 'prefix' | 'postfix', token: string) {")
 	);
 
 	it('inserts at the caret through the shared glue, never assigning the affix outright', () => {

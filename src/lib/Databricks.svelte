@@ -36,7 +36,7 @@
 		unknownAffixTokens,
 		unknownTokenWarning
 	} from '$lib/databricksUploadName';
-	import { insertTokenIntoField } from '$lib/uploadTokenField';
+	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -1321,19 +1321,75 @@
 	}
 
 	/**
-	 * A token picked from an affix's dropdown.
+	 * A token COMMITTED from an affix's dropdown, by whichever gesture committed it.
 	 *
 	 * The select is an ACTION, not a value: it holds no state of its own, so it is
 	 * reset to its placeholder immediately. Without that reset the same token could not
 	 * be picked twice in a row (no `change` fires when the value does not move), and
 	 * the closed control would sit there reading like a setting - claiming one token is
 	 * "the" affix while the field beside it says otherwise.
+	 *
+	 * Reading the token BEFORE that reset is the load-bearing order: reversed, `token`
+	 * is the empty placeholder and every pick silently does nothing. It is also what
+	 * makes a commit IDEMPOTENT - a second one in the same gesture reads the blanked
+	 * value and returns - which is what lets the two commit paths below overlap in the
+	 * browsers where they both fire.
 	 */
-	function onUploadTokenPick(which: 'prefix' | 'postfix', e: Event) {
-		const el = e.currentTarget as HTMLSelectElement;
+	function commitUploadToken(which: 'prefix' | 'postfix', el: HTMLSelectElement) {
 		const token = el.value;
 		el.value = '';
 		insertUploadDateToken(which, token);
+	}
+
+	/**
+	 * Whether a key that moves a CLOSED select's own value is being handled right now.
+	 *
+	 * A `change` is NOT by itself a pick. On Windows and Linux, arrowing over a closed
+	 * select changes its value and fires `change` on every press, so a keyboard user
+	 * who merely tabs to this control and presses Down would insert a token they never
+	 * chose - a real regression from the row of buttons this replaced, which only ever
+	 * acted on Enter or Space. So a token is inserted only on an EXPLICIT pick.
+	 *
+	 * The discriminator is that a browser dispatches key events to the page only while
+	 * its option list is CLOSED: once the list is open (macOS always, elsewhere via
+	 * Alt+Down/F4/Space) the keystrokes belong to it, and the `change` that ends it
+	 * arrives with no keydown of ours in the same task. So a `change` that lands in the
+	 * same task as a key we saw is that key moving a closed select, and is ignored;
+	 * anything else - a mouse pick, a commit out of an open list, assistive technology
+	 * setting the value - is a pick. The flag is therefore cleared on the next task,
+	 * never held across one: kept sticky it would swallow the genuine pick that follows
+	 * the Down which OPENED the list, i.e. it would make the control unusable by
+	 * keyboard, which is worse than the surprise being fixed here.
+	 *
+	 * Enter is the other half, and the one that keeps the closed-select flow usable:
+	 * having arrowed to a token the user commits it, exactly as they always could.
+	 *
+	 * Shared by both dropdowns deliberately - the window is one task, so no user can
+	 * have a keystroke in one and a commit in the other inside it.
+	 */
+	let uploadTokenKeyNav = false;
+
+	function onUploadTokenKeydown(which: 'prefix' | 'postfix', e: KeyboardEvent) {
+		if (e.key === 'Enter') {
+			commitUploadToken(which, e.currentTarget as HTMLSelectElement);
+			return;
+		}
+		uploadTokenKeyNav = true;
+		setTimeout(() => (uploadTokenKeyNav = false), 0);
+	}
+
+	function onUploadTokenChange(which: 'prefix' | 'postfix', e: Event) {
+		if (uploadTokenKeyNav) return;
+		commitUploadToken(which, e.currentTarget as HTMLSelectElement);
+	}
+
+	/**
+	 * Leaving the control without committing discards what was arrowed past, so the
+	 * closed select is back to its placeholder rather than sitting there naming a token
+	 * that was never inserted - the same reason a commit resets it.
+	 */
+	function onUploadTokenBlur(e: FocusEvent) {
+		(e.currentTarget as HTMLSelectElement).value = '';
 	}
 
 	/**
@@ -1999,10 +2055,14 @@
   seven chips already wrapped to three lines in a narrow sidebar, ahead of the
   Upload button they were pushing off screen.
 
-  It is an ACTION, not a value: `onUploadTokenPick` resets it the instant it
+  It is an ACTION, not a value: `commitUploadToken` resets it the instant it
   fires, so the closed control never reads as a setting and the same token can be
   picked twice running. The affix stays free text throughout - a pick INSERTS at
   the caret, so it composes with whatever is typed and never overwrites it.
+
+  A token is inserted only on an EXPLICIT pick, never on the bare `change` a
+  closed select fires per arrow key on Windows and Linux - see
+  `uploadTokenKeyNav`.
 
   Driven off `UPLOAD_DATE_TOKENS` with each expansion computed live, so what is
   offered - and what it claims to become - cannot drift from what the expander does.
@@ -2015,7 +2075,9 @@
 	<select
 		class="select select-xs select-bordered h-5 w-[4.75rem] min-h-0 min-w-0 shrink-0 py-0 pe-5 ps-1.5 text-[10px] text-base-content/60"
 		value=""
-		onchange={(e) => onUploadTokenPick(which, e)}
+		onchange={(e) => onUploadTokenChange(which, e)}
+		onkeydown={(e) => onUploadTokenKeydown(which, e)}
+		onblur={onUploadTokenBlur}
 		disabled={uploadConfirmBusy}
 		title={uploadTokenHelp}
 		aria-label="Insert a date token into the {which}"
@@ -2064,6 +2126,7 @@
 					<span class="text-[10px] text-base-content/50">Prefix</span>
 					<input
 						bind:this={uploadPrefixEl}
+						use:tokenField
 						class="input input-xs input-bordered mt-0.5 h-5 min-h-0 w-full py-0 font-mono text-[10px]"
 						value={uploadPrefix}
 						oninput={(e) => onUploadAffixInput('prefix', e)}
@@ -2082,6 +2145,7 @@
 					<span class="text-[10px] text-base-content/50">Postfix</span>
 					<input
 						bind:this={uploadPostfixEl}
+						use:tokenField
 						class="input input-xs input-bordered mt-0.5 h-5 min-h-0 w-full py-0 font-mono text-[10px]"
 						value={uploadPostfix}
 						oninput={(e) => onUploadAffixInput('postfix', e)}
