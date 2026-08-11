@@ -9,9 +9,9 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 let WS: string;
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -318,21 +318,37 @@ describe('GET /api/fs/git/roots', () => {
 		for (const name of bulk) {
 			git(WS, 'worktree', 'add', '-q', '--detach', join(WS, 'roots', name), 'main');
 		}
-		// The LAST one registered — i.e. the one furthest past the budget — is also
-		// some notebook's root, which is precisely the row that must survive.
-		const nb = notebookAt('bulk-root.ipynb', `roots/${bulk[bulk.length - 1]}`);
 		// The listing is cached on the tight status tier and the tests above warmed it;
 		// creating a worktree touches neither the index nor anything else it keys on.
-		(await import('../../src/lib/server/git')).invalidateGitCaches();
+		const gitmod = await import('../../src/lib/server/git');
+		gitmod.invalidateGitCaches();
 
+		// The exempted worktree is chosen from GIT'S OWN ORDERING — the order the route
+		// spends the budget in — and taken from PAST the budget, never by name. `git
+		// worktree list` orders alphabetically, so a hand-picked `bulk-24` sits 19th of
+		// 27 and is probed whether or not the exemption works: that is precisely how a
+		// lexical-vs-realpath mismatch which defeated the exemption entirely passed.
+		const wsReal = realpathSync(WS);
+		const listed = gitmod
+			.listWorktreesAt(WS)
+			.filter((w) => !w.bare && realpathSync(w.path) !== wsReal);
+		expect(listed.length).toBeGreaterThan(24);
+		const victim = `roots/${basename(listed[listed.length - 1].path)}`;
+
+		const nb = notebookAt('bulk-root.ipynb', victim);
 		const body = await get(nb);
 		expect(body.worktreeReadLimit).toBe(24);
 
 		const byPath = Object.fromEntries(body.worktrees.map((w: { path: string }) => [w.path, w]));
 		// Free, because it is already being probed as a notebook's ROOT: the checkouts
 		// a kernel actually runs in are the last thing this can drop.
-		expect(byPath[`roots/${bulk[bulk.length - 1]}`].notRead).toBe(false);
-		expect(byPath[`roots/${bulk[bulk.length - 1]}`].dirty).toBe(false);
+		expect(byPath[victim].notRead).toBe(false);
+		expect(byPath[victim].dirty).toBe(false);
+		// And both rows really describe the SAME directory — one probe pooled across
+		// them, not two spellings of one path each probed on its own.
+		expect(body.notebooks[0].root).toBe(victim);
+		expect(body.notebooks[0].git?.isRepo).toBe(true);
+		expect(body.notebooks[0].git?.shortSha).toBe(byPath[victim].shortSha);
 
 		// Something WAS dropped, and it is named rather than silently omitted: the row
 		// keeps every fact the porcelain listing already gave it and loses only what a

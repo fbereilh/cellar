@@ -50,8 +50,14 @@
  * the worktree still reports `?? .mcp.json` and `git check-ignore` says it is not
  * ignored, while the same entry in `<main>/.git/info/exclude` does ignore it. So
  * the entry goes to the common dir, and it therefore applies to EVERY worktree of
- * that clone AND to the main checkout — one line ignoring one filename Cellar
- * itself writes, which is the cost of the mitigation working at all.
+ * that clone AND to the main checkout — one line ignoring one file Cellar itself
+ * writes, which is the cost of the mitigation working at all.
+ *
+ * It is ANCHORED (`/.mcp.json`), so that scope is "the ROOT of every working tree
+ * of this clone" and not "anywhere in it": a slashless gitignore pattern matches
+ * at any depth, which would have made every untracked `.mcp.json` in the whole
+ * clone invisible to `git status` and unaddable by `git add` — a wider and worse
+ * surprise than the dirty checkout this removes.
  *
  * What the on-by-default decision actually rests on is unchanged and still true:
  * `info/exclude` is never committed and never reaches teammates, so no `git add
@@ -106,18 +112,29 @@ function targetHarnesses(): string[] {
 }
 
 /**
- * Ensure `entry` is ignored inside `worktreeDir`, via the repo's COMMON
- * `info/exclude`. Best-effort and idempotent; returns false when it could not be
- * arranged (not a repo, unwritable), which is the caller's cue to say so rather
- * than to claim a clean checkout.
+ * Ensure `rel` — a path relative to a working tree's ROOT — is ignored, via the
+ * repo's COMMON `info/exclude`. Best-effort and idempotent; returns false when it
+ * could not be arranged (not a repo, unwritable), which is the caller's cue to say
+ * so rather than to claim a clean checkout.
  *
  * `--git-common-dir`, never `--absolute-git-dir`: see the header — `info/` is in
  * git's `common_list`, so an exclude written to a linked worktree's own git dir is
  * read by nothing. Its output is relative to the git process's cwd (which `-C`
  * sets to `worktreeDir`) in a main checkout and absolute in a linked one, so it is
  * resolved against `worktreeDir` rather than trusted as absolute.
+ *
+ * ANCHORED WITH A LEADING SLASH, and that is not cosmetic. A gitignore pattern
+ * with no slash in it matches at ANY DEPTH, so a bare `.mcp.json` — and this entry
+ * lives in the repo-COMMON exclude — made every untracked `.mcp.json` anywhere in
+ * every working tree of the clone invisible to `git status`, with `git add`
+ * refusing it as ignored. That is far wider than the file Cellar writes, and it is
+ * a worse surprise than the dirty checkout the mitigation exists to remove.
+ * Anchored, it ignores the working-tree ROOT's file and nothing else — which also
+ * makes the two harnesses consistent, since `.codex/config.toml` contains a slash
+ * and was therefore already root-anchored.
  */
-function ensureGitExclude(worktreeDir: string, entry: string): boolean {
+function ensureGitExclude(worktreeDir: string, rel: string): boolean {
+	const entry = `/${rel}`;
 	const r = spawnSync('git', ['-C', worktreeDir, '--no-optional-locks', 'rev-parse', '--git-common-dir'], {
 		encoding: 'utf8'
 	});
@@ -192,11 +209,23 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 	const first = results[0];
 	const wrote = results.find((r) => r.status === 'created' || r.status === 'updated') ?? first;
 	if (!wrote) return undefined;
-	if (!excluded && (wrote.status === 'created' || wrote.status === 'updated')) {
+	// THE ONE CASE THAT MUST NEVER BE SILENT is the one that leaves the user's
+	// checkout dirty — and whether it does is a fact about what is ON DISK, not
+	// about whether THIS call wrote it. Gating on `created`/`updated` said it
+	// exactly once: a re-adoption takes the `already` path (the config is correct),
+	// so an exclude that still could not be arranged — the entry deleted by hand,
+	// the common git dir gone unwritable, or a first adoption that failed and is
+	// being retried — reported nothing at all while `?? .mcp.json` really was there.
+	//
+	// A `skipped` result is deliberately NOT covered: the writer refused a file it
+	// could not edit, so that file is not Cellar's config and its own message says
+	// what happened.
+	const present = wrote.status === 'created' || wrote.status === 'updated' || wrote.status === 'already';
+	if (!excluded && present && wrote.file && existsSync(wrote.file)) {
 		return {
 			...wrote,
 			message:
-				'agent config was written, but it could not be added to the repository\'s .git/info/exclude, so the checkout will show it as an untracked file.'
+				"Cellar's agent config is in this worktree, but it could not be added to the repository's .git/info/exclude, so the checkout will show it as an untracked file."
 		};
 	}
 	return results.length > 1 ? { ...wrote, message: wrote.message ?? `${results.length} harnesses configured` } : wrote;

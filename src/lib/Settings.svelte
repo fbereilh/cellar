@@ -15,7 +15,7 @@
 		unknownTokenWarning
 	} from '$lib/databricksUploadName';
 	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
-	import { getUi, setUi } from '$lib/uiState';
+	import { getUi, setUiNow } from '$lib/uiState';
 	import { WORKTREE_AGENT_CONFIG_KEY } from '$lib/notebookRoot';
 
 	interface Props {
@@ -57,7 +57,7 @@
 	// key is imported rather than mirrored, so this control and the writer cannot
 	// drift. Re-seeded whenever the modal OPENS rather than once on mount, because
 	// this component stays mounted for the life of the shell — a read, never a
-	// write, so it cannot fight the toggle (`setUi` updates the client cache
+	// write, so it cannot fight the toggle (`setUiNow` updates the client cache
 	// synchronously, so re-reading returns exactly what was just set).
 	let worktreeAgentConfig = $state(true);
 	$effect(() => {
@@ -66,7 +66,12 @@
 	});
 	function toggleWorktreeAgentConfig() {
 		worktreeAgentConfig = !worktreeAgentConfig;
-		setUi(WORKTREE_AGENT_CONFIG_KEY, worktreeAgentConfig);
+		// `setUiNow`, NOT the debounced `setUi`: the SERVER re-reads this preference
+		// during a LATER user action (adopting a worktree root), so an opt-out still
+		// sitting in the debounce window would let that adoption write `.mcp.json`
+		// into the user's checkout — precisely what the setting exists to prevent.
+		// The Databricks runtime toggle documents the same shape for the same reason.
+		void setUiNow(WORKTREE_AGENT_CONFIG_KEY, worktreeAgentConfig);
 	}
 
 	// ---- Default Databricks upload name ---------------------------------------
@@ -426,8 +431,8 @@
 						checkout can reach this Cellar. It is also added to that repository's
 						<span class="font-mono">.git/info/exclude</span>, so the checkout does not show it as an
 						untracked change and it cannot be committed. Git keeps that file per clone rather than per
-						worktree, so the entry covers every worktree of that repository and its main checkout — it
-						is never committed, so no collaborator inherits it.
+						worktree, so the entry covers the top level of every worktree of that repository and its
+						main checkout — it is never committed, so no collaborator inherits it.
 					</p>
 				</div>
 

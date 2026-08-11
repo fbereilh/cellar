@@ -47,8 +47,12 @@ import { resolveRootDir, worktreeDeclaration } from '$lib/server/notebookRoot';
  * absolute server path, which has no business reaching the browser; the client
  * owns the wording.
  *
- * Probing is DEDUPED by directory: several notebooks reviewing one worktree cost
- * one probe, and `gitCommitAt`'s own cache collapses repeat requests on top.
+ * Probing is DEDUPED by directory IDENTITY IN THE REAL NAMESPACE: several
+ * notebooks reviewing one worktree cost one probe, and `gitCommitAt`'s own cache
+ * collapses repeat requests on top. Realpath is what makes that true rather than
+ * nominal — Cellar's paths are lexical while `git worktree list` realpaths its
+ * output, so a raw-string key holds both spellings of one directory (the
+ * two-namespace rule; see `notebookRoot.ts`).
  *
  * BOUNDED at `MAX_PATHS` distinct paths, because the fan-out is per path and lands
  * on the process that also carries the kernel websockets and the SSE fan-out: each
@@ -171,42 +175,62 @@ export async function GET({ url }) {
 		// that is what a run of a notebook rooted here would ask. A missing one is
 		// never probed: there is no status to read, and it would spawn three
 		// processes to learn nothing.
-		.map((w) => ({ w, exists: isDir(w.path) }));
+		// `key` is the REAL-namespace identity, computed once: it is what every
+		// comparison and every commit lookup below goes through, so a lexical Cellar
+		// path and git's realpath'd one can never read as two directories.
+		.map((w) => ({ w, exists: isDir(w.path), key: realpathOrSelf(w.path) }));
 
 	// One probe per DISTINCT directory (three `git` spawns), shared by every
 	// notebook rooted there — plus the workspace itself, which every no-root
 	// notebook reports and which is usually already one of them. Pooling the
-	// worktrees into this SAME set is what keeps the cost per-directory rather
+	// worktrees into this SAME map is what keeps the cost per-directory rather
 	// than per-row.
-	const rootDirs = new Set([ws, ...targets.map((t) => t.dir).filter(Boolean)]);
+	//
+	// KEYED BY REALPATH, valued by the LEXICAL directory to probe — the
+	// two-namespace rule, which is what makes the pooling real rather than
+	// nominal. `ws` and every `t.dir` are lexical (`resolveRootDir` never
+	// realpaths), while `git worktree list` realpaths its output, so on macOS
+	// (every `/var/folders` workspace) a set keyed on the raw strings holds BOTH
+	// spellings of one directory: the same checkout was probed twice, spent budget
+	// it was documented never to spend, and past the budget came back `notRead`,
+	// falsifying "a kernel's own checkout is the last thing this can drop".
+	const rootDirs = new Map([[wsReal, ws]]);
+	for (const t of targets) {
+		if (!t.dir) continue;
+		const key = realpathOrSelf(t.dir);
+		if (!rootDirs.has(key)) rootDirs.set(key, t.dir);
+	}
 
 	// Worktrees are bounded on top of that, and the budget is spent on the ones
 	// that are NOT already free: a worktree that is some notebook's root is in
 	// `rootDirs` already, so probing it costs nothing extra and it can never be the
 	// row that gets truncated — which also means the checkouts a kernel is actually
 	// running in are the last thing this can drop.
+	const probeDirs = new Map(rootDirs);
 	let budget = MAX_WORKTREE_PROBES;
-	const probes = wtrees.map(({ w, exists }) => {
+	const probes = wtrees.map(({ w, exists, key }) => {
 		// A missing one is never probed: there is no status to read, and it would
 		// spawn three processes to learn nothing. It is not truncation either — the
 		// row already states it is gone.
-		if (!exists) return { w, exists, probed: false, truncated: false };
-		if (rootDirs.has(w.path)) return { w, exists, probed: true, truncated: false };
-		if (budget <= 0) return { w, exists, probed: false, truncated: true };
+		if (!exists) return { w, exists, key, probed: false, truncated: false };
+		if (rootDirs.has(key)) return { w, exists, key, probed: true, truncated: false };
+		if (budget <= 0) return { w, exists, key, probed: false, truncated: true };
 		budget -= 1;
-		return { w, exists, probed: true, truncated: false };
+		probeDirs.set(key, w.path);
+		return { w, exists, key, probed: true, truncated: false };
 	});
 
-	const dirs = [...new Set([...rootDirs, ...probes.filter((p) => p.probed).map((p) => p.w.path)])];
-	const commits = new Map(await Promise.all(dirs.map(async (dir) => [dir, await gitCommitAt(dir)])));
+	const commits = new Map(
+		await Promise.all([...probeDirs].map(async ([key, dir]) => [key, await gitCommitAt(dir)]))
+	);
 
-	const worktrees = probes.map(({ w, exists, probed, truncated }) => ({
+	const worktrees = probes.map(({ w, exists, key, probed, truncated }) => ({
 		// The LEXICAL declaration for the realpath'd path git printed — through the
 		// ONE helper that owns the two-namespace rule, so "Use as root" posts exactly
 		// the value the picker would and exactly the value that gets persisted.
 		path: worktreeDeclaration(w.path),
 		absolute: w.path,
-		external: !isInside(realpathOrSelf(w.path), wsReal),
+		external: !isInside(key, wsReal),
 		exists,
 		branch: w.branch,
 		detached: w.detached,
@@ -216,11 +240,11 @@ export async function GET({ url }) {
 		// LISTING already gave it (path, branch, sha, existence) and drops only what a
 		// probe would have added, so it claims nothing this request did not read.
 		notRead: truncated,
-		dirty: probed ? (commits.get(w.path)?.dirty ?? false) : false
+		dirty: probed ? (commits.get(key)?.dirty ?? false) : false
 	}));
 
 	return json({
-		workspace: commits.get(ws),
+		workspace: commits.get(wsReal),
 		readLimit: MAX_PATHS,
 		worktreeReadLimit: MAX_WORKTREE_PROBES,
 		worktrees,
@@ -231,7 +255,7 @@ export async function GET({ url }) {
 				error: t.error,
 				unreadable: t.unreadable,
 				notRead: false,
-				git: t.dir ? commits.get(t.dir) : null
+				git: t.dir ? commits.get(realpathOrSelf(t.dir)) : null
 			})),
 			// Named, so the panel can mark them; empty on every other field, so the row
 			// claims nothing about a notebook this request never opened.

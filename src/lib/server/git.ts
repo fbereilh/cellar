@@ -641,7 +641,21 @@ export interface GitWorktree {
 }
 
 /** Registered-worktree listings, keyed by the directory the listing was taken in. */
-const worktreeCache = new Map<string, { at: number; value: GitWorktree[] }>();
+const worktreeCache = new Map<string, { at: number; forcedAt: number; value: GitWorktree[] }>();
+
+/**
+ * How long one FORCED listing satisfies later forced reads (see `listWorktreesAt`).
+ *
+ * Deliberately far tighter than `STATUS_TTL_MS`: it exists to collapse a BURST —
+ * the roots route resolves up to `MAX_PATHS` notebooks in one request, so a
+ * workspace with a few pruned roots forced one blocking spawn PER NOTEBOOK, per
+ * request, on the process carrying the kernel websockets and the SSE fan-out, and
+ * that panel refetches on mount, on `sse:open`, on `fsRefreshSignal` and on every
+ * window focus. A burst is milliseconds wide, while the gap between `git worktree
+ * add` and pointing a notebook at it is a human one, so this bounds the cost
+ * without reopening the staleness window the force exists to close.
+ */
+const WORKTREE_FORCE_TTL_MS = 250;
 
 /**
  * Every git worktree registered for the repository containing `absDir` — the
@@ -671,16 +685,29 @@ const worktreeCache = new Map<string, { at: number; value: GitWorktree[] }>();
  * index anyway — so the TTL is the whole backstop here, which is why it is the
  * tight one.
  *
- * `{ refresh: true }` bypasses the cache for one read. It exists for exactly one
- * caller — the admission rule, about to REFUSE a root — because a cached listing
- * makes the TTL a window in which a worktree the user created seconds ago is
- * reported as unregistered. Paying one spawn on the refusal path (rare, and the
- * user is about to read an error either way) is what turns the rule from
- * eventually-correct into correct, and it costs the happy path nothing.
+ * `{ refresh: true }` bypasses the ordinary TTL for one read. It exists for
+ * exactly one caller — the admission rule, about to REFUSE a root — because a
+ * cached listing makes the TTL a window in which a worktree the user created
+ * seconds ago is reported as unregistered.
+ *
+ * It is itself bounded by `WORKTREE_FORCE_TTL_MS`, and by the FORCED reads alone:
+ * a forced read is served from cache only when a previous FORCED spawn is that
+ * recent, never merely because some ordinary read happened to repopulate the
+ * entry. That distinction is the whole point — an ordinary listing may predate
+ * the `git worktree add` this caller is about to refuse, which is exactly what
+ * the force exists to get past, while a forced listing milliseconds old cannot
+ * tell a different story to the next refusal in the same burst. So the refusal
+ * path costs at most one spawn per burst instead of one per notebook per request,
+ * and the happy path still never reaches it.
  */
 export function listWorktreesAt(absDir: string, opts?: { refresh?: boolean }): GitWorktree[] {
-	const hit = opts?.refresh ? null : worktreeCache.get(absDir);
-	if (hit && Date.now() - hit.at < STATUS_TTL_MS) return hit.value;
+	const now = Date.now();
+	const hit = worktreeCache.get(absDir);
+	if (hit) {
+		const ttl = opts?.refresh ? WORKTREE_FORCE_TTL_MS : STATUS_TTL_MS;
+		const since = opts?.refresh ? hit.forcedAt : hit.at;
+		if (now - since < ttl) return hit.value;
+	}
 
 	const args = ['worktree', 'list', '--porcelain'];
 	noteSpawn(args);
@@ -691,7 +718,10 @@ export function listWorktreesAt(absDir: string, opts?: { refresh?: boolean }): G
 	// Not a repo (or no git at all) degrades to "no worktrees", matching `runGit`'s
 	// honest null — a caller must not be able to tell those apart by a throw.
 	const value = r.status === 0 && typeof r.stdout === 'string' ? parseWorktreePorcelain(r.stdout) : [];
-	worktreeCache.set(absDir, { at: Date.now(), value });
+	const at = Date.now();
+	// An ordinary spawn must NOT advance `forcedAt`: it may predate the very
+	// `git worktree add` a later refusal is about to force a read for.
+	worktreeCache.set(absDir, { at, forcedAt: opts?.refresh ? at : (hit?.forcedAt ?? 0), value });
 	return value;
 }
 

@@ -159,6 +159,30 @@ describe('what gets written into an adopted worktree', () => {
 			rmSync(join(WS, '.mcp.json'), { force: true });
 		}
 	});
+
+	it('is ANCHORED to the working-tree root: a NESTED .mcp.json stays visible', () => {
+		// The other half of that scope, and the half a root-only assertion cannot see:
+		// a gitignore pattern with no slash matches at ANY DEPTH, so an unanchored
+		// entry in the repo-COMMON exclude made every untracked `.mcp.json` anywhere in
+		// the clone invisible to `git status` and unaddable by `git add` — wider, and a
+		// worse surprise, than the dirty checkout this mitigation removes.
+		mod.configureAdoptedWorktree(SIBLING);
+		const nested = join(SIBLING, 'sub', 'deeper');
+		mkdirSync(nested, { recursive: true });
+		writeFileSync(join(nested, '.mcp.json'), '{}\n');
+		try {
+			// Asserted through git itself, in BOTH directions at once, and BEFORE the
+			// pattern is read back — the claim is about what git does, and an assertion
+			// on the written text alone would pass any spelling that happened to look
+			// anchored.
+			expect(git(SIBLING, 'check-ignore', '-v', '.mcp.json')).toContain('info/exclude');
+			expect(() => git(SIBLING, 'check-ignore', '-q', 'sub/deeper/.mcp.json')).toThrow();
+			expect(git(SIBLING, 'status', '--porcelain', '-uall')).toContain('sub/deeper/.mcp.json');
+		} finally {
+			rmSync(join(SIBLING, 'sub'), { recursive: true, force: true });
+		}
+		expect(readFileSync(EXCLUDE, 'utf8')).toContain('/.mcp.json');
+	});
 });
 
 describe('when it must NOT write', () => {
@@ -228,6 +252,24 @@ describe('failure is REPORTED, never thrown', () => {
 		expect(r?.status).toBe('created');
 		expect(r?.message).toMatch(/untracked/i);
 		rmSync(plain, { recursive: true, force: true });
+	});
+
+	it('keeps saying so on a RE-adoption, where the config is already correct', () => {
+		// The state that must never be silent is "this checkout is dirty", which is a
+		// fact about what is ON DISK — not about whether THIS call wrote it. Gated on
+		// created/updated it was said exactly once, so a re-adoption (the `already`
+		// path: a retry after a failed first attempt, or the entry deleted by hand)
+		// reported nothing at all while `?? .mcp.json` really was there.
+		const plain = join(ROOT, 'plain-again');
+		mkdirSync(plain, { recursive: true });
+		try {
+			expect(mod.configureAdoptedWorktree(plain)?.status).toBe('created');
+			const again = mod.configureAdoptedWorktree(plain);
+			expect(again?.status).toBe('already');
+			expect(again?.message).toMatch(/untracked/i);
+		} finally {
+			rmSync(plain, { recursive: true, force: true });
+		}
 	});
 });
 

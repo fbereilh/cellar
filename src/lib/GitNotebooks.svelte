@@ -114,8 +114,17 @@
 	let worktrees = $state<WorktreeRow[]>([]);
 	/** Which worktree's "Use as root" is in flight, so only that button shows it. */
 	let adopting = $state('');
-	/** Outcome of the last adoption, cleared by the next one. */
+	/**
+	 * Outcome of the last adoption. SELF-DISMISSING, the same rule its sibling
+	 * surface follows (the notebook root bar's feedback line): it describes ONE
+	 * action, on ONE notebook, at ONE moment — so left standing it goes on
+	 * asserting "analysis.ipynb now runs in ../pr-398" over a panel that has since
+	 * moved to a different notebook, which is worse than saying nothing.
+	 */
 	let adoptFeedback = $state('');
+	let adoptFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+	/** How long the WORKTREES block keeps reporting the outcome of an adoption. */
+	const ADOPT_FEEDBACK_MS = 8000;
 	let workspaceGit = $state<GitDirCommit | null>(null);
 	let readLimit = $state(0);
 	let worktreeReadLimit = $state(0);
@@ -308,6 +317,37 @@
 	/** The notebook a "Use as root" click applies to: the active tab. */
 	const activeNotebook = $derived(notebooks.find((n) => n.active) ?? null);
 
+	/**
+	 * Show (or clear) the adoption outcome, and arm its dismissal — the ONE writer,
+	 * so no path can leave a line standing with no timer behind it.
+	 */
+	function showAdoptFeedback(msg: string) {
+		adoptFeedback = msg;
+		if (adoptFeedbackTimer) clearTimeout(adoptFeedbackTimer);
+		adoptFeedbackTimer = msg
+			? setTimeout(() => {
+					adoptFeedback = '';
+					adoptFeedbackTimer = null;
+				}, ADOPT_FEEDBACK_MS)
+			: null;
+	}
+
+	// The message names a NOTEBOOK, so switching to another one retires it at once
+	// rather than waiting out the timer: it would otherwise describe a notebook the
+	// panel is no longer showing. Keyed on the PATH STRING, never on
+	// `activeNotebook` itself — that derives an OBJECT out of the `notebooks` prop,
+	// so any re-render of the parent's list re-fires the effect and would wipe the
+	// line the click had just produced, while a string re-derives to itself.
+	const activeNotebookPath = $derived(activeNotebook?.path ?? '');
+	$effect(() => {
+		activeNotebookPath;
+		untrack(() => showAdoptFeedback(''));
+	});
+
+	$effect(() => () => {
+		if (adoptFeedbackTimer) clearTimeout(adoptFeedbackTimer);
+	});
+
 	/** The root the active notebook already declares, so its own row reads as adopted. */
 	const activeRoot = $derived(activeNotebook ? (rowFor(activeNotebook.path)?.root ?? null) : null);
 
@@ -322,7 +362,7 @@
 		const nb = activeNotebook;
 		if (!nb || adopting) return;
 		adopting = w.path;
-		adoptFeedback = '';
+		showAdoptFeedback('');
 		try {
 			const res = await fetch('/api/notebooks/root', {
 				method: 'POST',
@@ -339,12 +379,12 @@
 			const applied = body.changed
 				? `${nb.name} now runs in ${w.path}${body.namespace_cleared ? ' — variables cleared' : ''}.`
 				: `${nb.name} already runs in ${w.path}.`;
-			adoptFeedback = agentNote ? `${applied} Note: ${agentNote}` : applied;
+			showAdoptFeedback(agentNote ? `${applied} Note: ${agentNote}` : applied);
 			// The row set above is keyed on each notebook's declared root, so it must
 			// be re-read for the dot and the disabled state to agree with the server.
 			load();
 		} catch (err) {
-			adoptFeedback = String((err as Error)?.message ?? err);
+			showAdoptFeedback(String((err as Error)?.message ?? err));
 		} finally {
 			adopting = '';
 		}

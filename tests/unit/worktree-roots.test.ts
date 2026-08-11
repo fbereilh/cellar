@@ -401,6 +401,22 @@ describe('a JUST-CREATED worktree is admitted immediately', () => {
 		expect(rootmod.resolveRootDir('../pr-398')?.kind).toBe('worktree');
 		expect(gitmod.gitSpawnCount()).toBe(0);
 	});
+
+	it('a BURST of refusals costs ONE forced spawn, not one per refusal', () => {
+		// The re-read is unbounded per MISS, and misses come in bursts: the roots route
+		// resolves every open notebook in ONE request (up to `MAX_PATHS`), and that
+		// panel refetches on mount, on `sse:open`, on `fsRefreshSignal` and on every
+		// window focus — so a workspace with a few pruned roots paid a blocking
+		// `spawnSync` per notebook per focus, on the process carrying the kernel
+		// websockets and the SSE fan-out.
+		gitmod.invalidateGitCaches();
+		gitmod.resetGitSpawnCount();
+		for (let i = 0; i < 10; i++) {
+			expect(() => rootmod.resolveRootDir('../never-registered')).toThrow(/not a registered git worktree/i);
+		}
+		// One ordinary listing (the first, cold) plus at most one FORCED re-read.
+		expect(gitmod.gitSpawnCount()).toBeLessThanOrEqual(2);
+	});
 });
 
 describe('detection is not authorisation', () => {
