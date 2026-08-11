@@ -55,8 +55,10 @@
 	// ---- Agent config in an adopted external worktree (default ON) ------------
 	// Per-workspace, in the `.cellar/` store the server reads at adoption time; the
 	// key is imported rather than mirrored, so this control and the writer cannot
-	// drift. Seeded once — this component is mounted for the life of the shell, and
-	// nothing else writes this preference.
+	// drift. Re-seeded whenever the modal OPENS rather than once on mount, because
+	// this component stays mounted for the life of the shell — a read, never a
+	// write, so it cannot fight the toggle (`setUi` updates the client cache
+	// synchronously, so re-reading returns exactly what was just set).
 	let worktreeAgentConfig = $state(true);
 	$effect(() => {
 		if (!open) return;

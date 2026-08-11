@@ -248,13 +248,42 @@ test('the sidebar lists the sibling worktree, labelled external', async ({ reque
 	const inside = body.worktrees.find((w: { path: string }) => w.path === 'roots/baseline');
 	expect(inside).toMatchObject({ external: false, branch: 'baseline' });
 
-	// The picker's own list offers it as a detected, external root. Its notebook is
-	// created HERE rather than borrowed from an earlier test: a failure restarts the
-	// worker into a fresh workspace, so a spec that leans on another test's leftovers
-	// fails for a reason that has nothing to do with what it is asserting.
+	// The picker's own list offers it, labelled external. Its notebook is created
+	// HERE rather than borrowed from an earlier test: a failure restarts the worker
+	// into a fresh workspace, so a spec that leans on another test's leftovers fails
+	// for a reason that has nothing to do with what it is asserting.
+	//
+	// `source` is deliberately NOT asserted for this one: earlier tests in this file
+	// point notebooks at `../pr-398`, so by now it is a DECLARED root and is reported
+	// as such — which is correct (a root a notebook holds is reported from the
+	// declaration, not from the scan). `external` is the label that matters here, and
+	// it holds either way because it is decided by the resolved path, never by the
+	// source. Pure detection is asserted just below, on a worktree nothing declares.
 	const nb = await makeNotebook(request, 'picker.ipynb');
 	const picker = await request.get(`${baseURL}/api/notebooks/root?path=${encodeURIComponent(nb)}`);
 	expect(picker.ok(), await picker.text()).toBeTruthy();
 	const opts = (await picker.json()).roots as { path: string; external: boolean; source: string }[];
-	expect(opts.find((o) => o.path === '../pr-398')).toMatchObject({ external: true, source: 'worktree' });
+	expect(opts.find((o) => o.path === '../pr-398')).toMatchObject({ external: true });
+
+	// DETECTION over the real wire: a worktree created now, that NO notebook
+	// declares, is offered by the running server with no restart and no picker
+	// setup — the ergonomic payload of the whole change.
+	//
+	// POLLED rather than read once, and that is the honest assertion: the listing is
+	// cached on a 1.5s TTL (the tight tier, chosen so a `git worktree add` typed in a
+	// terminal shows up PROMPTLY), so a read taken in the same instant as the `add`
+	// may still serve the previous answer. "Promptly" is the promise; "within the
+	// same millisecond" is not, and asserting it would be testing the cache. The
+	// ADMISSION path makes no such trade — it re-reads before refusing, so pasting
+	// the path in that same instant is accepted, which the unit suite pins.
+	git(workspace, 'worktree', 'add', '-q', join(outer, 'detected-only'), '-b', 'detected-only');
+	await expect
+		.poll(
+			async () => {
+				const res = await request.get(`${baseURL}/api/notebooks/root?path=${encodeURIComponent(nb)}`);
+				return ((await res.json()).roots as typeof opts).find((o) => o.path === '../detected-only') ?? null;
+			},
+			{ message: 'a newly added worktree must be offered with no restart', timeout: 10_000 }
+		)
+		.toMatchObject({ external: true, source: 'worktree' });
 });
