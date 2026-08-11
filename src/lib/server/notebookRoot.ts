@@ -30,11 +30,17 @@
  *
  * ── TWO ADMISSION RULES ────────────────────────────────────────────────────────
  *
- * `resolveRootDir` branches ONCE, on the declaration's shape, and the branches
- * are not equals:
+ * `resolveRootDir` branches ONCE, and the branches are not equals:
  *
  *   inside  -> `resolveInWorkspace` (UNCHANGED, never widened) -> statSync
  *   outside -> registered-worktree gate                        -> statSync
+ *
+ * THE GUARD ITSELF PICKS THE BRANCH, and that is structural rather than
+ * decorative: `resolveRootDir` ASKS `resolveInWorkspace` and treats its throw as
+ * the outside branch, so this module holds no containment rule of its own. A
+ * local copy of the guard's lexical prefix test deciding the branch — and then
+ * calling the guard inside it, unreachably — would make the claim below true only
+ * for as long as the two rules happened to agree.
  *
  * `resolveInWorkspace` is the app-wide guard and stays byte-for-byte as it is:
  * every FILE path in the app resolves through it (the tree, `/api/fs/*`,
@@ -102,7 +108,7 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { workspaceRoot, resolveInWorkspace } from './fstree';
 import { getNotebookRoot } from './notebook';
 import { listWorktreesAt, type GitWorktree } from './git';
-import { NotebookRootError, ROOTS_DIR, classifyRootPath } from '../notebookRoot';
+import { NotebookRootError, classifyRootPath } from '../notebookRoot';
 
 /** How a root was admitted — for messages, and for the UI to label it. */
 export type RootKind = 'workspace' | 'worktree';
@@ -203,12 +209,6 @@ function toRel(dir: string): string {
 	// `relative` yields the platform separator; the declaration is stored with `/`
 	// so it round-trips a `.ipynb` written on either platform.
 	return relative(ws(), dir).split(sep).join('/');
-}
-
-/** True when `abs` is lexically inside the workspace (the guard's own rule). */
-function insideWorkspace(abs: string): boolean {
-	const root = ws();
-	return abs === root || abs.startsWith(root + sep);
 }
 
 /**
@@ -327,26 +327,35 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 		return null;
 	}
 
+	// THE SHARED GUARD MAKES THE DECISION — it is asked, never paraphrased.
+	//
+	// This module holds no containment rule of its own. A local `insideWorkspace`
+	// copy of the guard's lexical test used to decide the branch and then call
+	// `resolveInWorkspace` inside it, which made that call (and its catch)
+	// unreachable by construction — so the doctrine's claim that the untouched
+	// guard is the authority for the inside branch was true only by coincidence of
+	// the two rules agreeing. Asking the guard and treating its THROW as the
+	// outside branch is what makes the claim structural: there is exactly one
+	// implementation of "inside the workspace" in the app, and this is a caller of
+	// it, not a second copy.
 	let kind: RootKind;
-	if (insideWorkspace(dir)) {
+	let inside = true;
+	try {
 		// INSIDE — including an `outside`-SHAPED declaration that lexically lands
 		// back in the workspace (`roots/../pr-1`, or an absolute path that happens
-		// to be under it). Those go through the unchanged guard and are stored in
-		// the canonical workspace-relative form, so one directory has one
-		// declaration however it was typed.
-		try {
-			resolveInWorkspace(toRel(dir));
-		} catch {
-			// The shared guard's own message ("path escapes workspace") is correct but
-			// says nothing about roots; restate it in this feature's vocabulary.
-			throw new NotebookRootError(
-				`A notebook root must stay inside the workspace; ${JSON.stringify(declared)} escapes it. Create the root inside the workspace (e.g. \`git worktree add ${ROOTS_DIR}/pr-482 <branch>\`).`
-			);
-		}
+		// to be under it). Those are stored in the canonical workspace-relative
+		// form, so one directory has one declaration however it was typed.
+		resolveInWorkspace(toRel(dir));
+	} catch {
+		inside = false;
+	}
+	if (inside) {
 		kind = 'workspace';
 	} else {
 		// OUTSIDE — the second, narrower admission rule. Throws unless the listing
-		// names this exact directory.
+		// names this exact directory, and its refusal names the repair, so a path
+		// that simply escapes the workspace is answered by the gate rather than by
+		// a separate escape message this branch would have to keep in sync.
 		assertRegisteredWorktree(dir, declared);
 		kind = 'worktree';
 	}

@@ -42,6 +42,7 @@
 	import { createCoalescedReload } from '$lib/coalescedReload';
 	import { subscribeEvents } from '$lib/events-client';
 	import { relativeTimeLong } from '$lib/relativeTime';
+	import { agentConfigNotice } from '$lib/notebookRoot';
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
 	import type { GitDirCommit } from '$lib/server/git';
 	import type { NotebookRef } from '$lib/types';
@@ -89,6 +90,13 @@
 		detached: boolean;
 		shortSha: string | null;
 		dirty: boolean;
+		/**
+		 * True when the request listed this checkout but did not probe its commit
+		 * (too many registered worktrees). Everything else on the row came from the
+		 * listing and is real; only `dirty` is unread, so the row must not draw the
+		 * dirty marker — an unprobed checkout is not a clean one.
+		 */
+		notRead?: boolean;
 	}
 
 	interface Props {
@@ -110,6 +118,7 @@
 	let adoptFeedback = $state('');
 	let workspaceGit = $state<GitDirCommit | null>(null);
 	let readLimit = $state(0);
+	let worktreeReadLimit = $state(0);
 	let error = $state('');
 	let loading = $state(false);
 	// Generation guard (the statusSeq / kernelReqSeq convention): focus, a root
@@ -144,6 +153,13 @@
 	const notReadCount = $derived(notebooks.filter((n) => rowFor(n.path)?.notRead).length);
 
 	/**
+	 * Registered worktrees this request listed but did not probe. Counted off
+	 * `worktrees` rather than off a separate number, because that array IS what
+	 * renders — so the sentence can never name more rows than are on screen.
+	 */
+	const worktreeNotReadCount = $derived(worktrees.filter((w) => w.notRead).length);
+
+	/**
 	 * The order the notebooks are ASKED about — the active one first, then tab order.
 	 *
 	 * The route truncates by request order, so past its cap the rows it drops are
@@ -175,6 +191,7 @@
 			worktrees = [];
 			workspaceGit = null;
 			readLimit = 0;
+			worktreeReadLimit = 0;
 			error = '';
 			loading = false;
 			return Promise.resolve();
@@ -194,6 +211,7 @@
 			worktrees = body.worktrees ?? [];
 			workspaceGit = body.workspace ?? null;
 			readLimit = Number(body.readLimit) || 0;
+			worktreeReadLimit = Number(body.worktreeReadLimit) || 0;
 			error = '';
 		} catch (err) {
 			if (mine !== seq) return;
@@ -313,9 +331,15 @@
 			});
 			const body = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(body?.message || 'could not set the root');
-			adoptFeedback = body.changed
+			// The same reporting rule as the notebook's own root picker, through the ONE
+			// shared wording: agent config written into an adopted worktree is reported,
+			// never thrown, so a write that leaves this checkout untracked-dirty must be
+			// said here too rather than discarded.
+			const agentNote = agentConfigNotice(body.agent_config);
+			const applied = body.changed
 				? `${nb.name} now runs in ${w.path}${body.namespace_cleared ? ' — variables cleared' : ''}.`
 				: `${nb.name} already runs in ${w.path}.`;
+			adoptFeedback = agentNote ? `${applied} Note: ${agentNote}` : applied;
 			// The row set above is keyed on each notebook's declared root, so it must
 			// be re-read for the dot and the disabled state to agree with the server.
 			load();
@@ -549,6 +573,16 @@
 						</div>
 					{/each}
 				</div>
+				<!-- No silent caps: past the route's probe budget a row still lists its
+				     path, branch and sha, but nothing read whether it has uncommitted
+				     changes — so say that once, below the list, rather than letting those
+				     rows read as clean. -->
+				{#if worktreeNotReadCount}
+					<p class="px-1 pt-1 text-[11px] text-base-content/45" data-testid="git-worktree-not-read">
+						{worktreeNotReadCount} more registered {worktreeNotReadCount === 1 ? 'worktree' : 'worktrees'}: only
+						{worktreeReadLimit} are checked for uncommitted changes.
+					</p>
+				{/if}
 				{#if adoptFeedback}
 					<p class="px-1 pt-1 text-[11px] text-base-content/60" data-testid="git-worktree-feedback">{adoptFeedback}</p>
 				{/if}

@@ -303,4 +303,49 @@ describe('GET /api/fs/git/roots', () => {
 		expect((await get(a, b)).notebooks.map((n: { path: string }) => n.path)).toEqual([a, b]);
 		expect((await get(b, a)).notebooks.map((n: { path: string }) => n.path)).toEqual([b, a]);
 	});
+
+	// LAST in the file on purpose: it registers enough worktrees to trip the probe
+	// budget, and every assertion above is about the small worktree set created in
+	// `beforeAll`.
+	it('BOUNDS worktree probing the same way, and a notebook’s own root is never what gets dropped', async () => {
+		// Same reason as the notebook cap: each probe is three concurrent `git` spawns
+		// on the process carrying the kernel websockets and the SSE fan-out, and this
+		// panel refetches on mount, on `sse:open`, on `fsRefreshSignal` and on every
+		// window focus. Worktrees accumulate from `git worktree add` runs that have
+		// nothing to do with Cellar, so the list is both larger and less deliberate
+		// than the open-tab list — which is why it was the unbounded one.
+		const bulk = Array.from({ length: 25 }, (_, i) => `bulk-${i}`);
+		for (const name of bulk) {
+			git(WS, 'worktree', 'add', '-q', '--detach', join(WS, 'roots', name), 'main');
+		}
+		// The LAST one registered — i.e. the one furthest past the budget — is also
+		// some notebook's root, which is precisely the row that must survive.
+		const nb = notebookAt('bulk-root.ipynb', `roots/${bulk[bulk.length - 1]}`);
+		// The listing is cached on the tight status tier and the tests above warmed it;
+		// creating a worktree touches neither the index nor anything else it keys on.
+		(await import('../../src/lib/server/git')).invalidateGitCaches();
+
+		const body = await get(nb);
+		expect(body.worktreeReadLimit).toBe(24);
+
+		const byPath = Object.fromEntries(body.worktrees.map((w: { path: string }) => [w.path, w]));
+		// Free, because it is already being probed as a notebook's ROOT: the checkouts
+		// a kernel actually runs in are the last thing this can drop.
+		expect(byPath[`roots/${bulk[bulk.length - 1]}`].notRead).toBe(false);
+		expect(byPath[`roots/${bulk[bulk.length - 1]}`].dirty).toBe(false);
+
+		// Something WAS dropped, and it is named rather than silently omitted: the row
+		// keeps every fact the porcelain listing already gave it and loses only what a
+		// probe would have added.
+		const dropped = body.worktrees.filter((w: { notRead: boolean }) => w.notRead);
+		expect(dropped.length).toBeGreaterThan(0);
+		for (const w of dropped) {
+			expect(w.path).toBeTruthy();
+			expect(w.exists).toBe(true);
+			// An UNPROBED checkout must never draw the dirty marker — unread is not clean.
+			expect(w.dirty).toBe(false);
+		}
+		// Every registered worktree is still LISTED; only the probe is bounded.
+		expect(body.worktrees.length).toBeGreaterThanOrEqual(bulk.length);
+	});
 });

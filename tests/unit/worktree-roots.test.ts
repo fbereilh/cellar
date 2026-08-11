@@ -243,6 +243,33 @@ describe('the app-wide path guard is NOT what changed', () => {
 		// And the guard itself is still the plain lexical prefix test.
 		expect(src).toMatch(/abs !== root && !abs\.startsWith\(root \+ sep\)/);
 	});
+
+	it('SOURCE GUARD: notebookRoot.ts keeps NO containment rule of its own', () => {
+		// The doctrine says the untouched workspace guard is the authority for the
+		// inside branch. A local copy of its lexical prefix test deciding the branch —
+		// and then calling the guard inside it, unreachably — made that true only for
+		// as long as the two rules happened to agree, which is not an invariant, it is
+		// a coincidence. So this module must ASK the guard and treat its throw as the
+		// outside branch, and hold no prefix test at all.
+		const src = readFileSync(new URL('../../src/lib/server/notebookRoot.ts', import.meta.url), 'utf8');
+		expect(src).not.toMatch(/startsWith\([^)]*\+ sep\)/);
+		expect(src).not.toMatch(/function insideWorkspace/);
+		expect(src).toMatch(/resolveInWorkspace\(toRel\(dir\)\)/);
+	});
+
+	it('SOURCE GUARD: the root bar is not opened by a merely DETECTED worktree', () => {
+		// The chrome promise: "a workspace that never adopts roots renders exactly what
+		// it always did". `git worktree list` is populated by work that has nothing to
+		// do with Cellar (a worktree-per-task agent workflow, a PR checkout), so keying
+		// the bar off `rootOptions.length` put a picker on every notebook of every
+		// multi-worktree repo. Detected worktrees still POPULATE the picker whenever it
+		// is shown, and the sidebar's WORKTREES block is the discovery surface, so
+		// nothing became unreachable. A source guard because vitest runs without the
+		// SvelteKit plugin and this component cannot be mounted here.
+		const src = readFileSync(new URL('../../src/lib/Notebook.svelte', import.meta.url), 'utf8');
+		expect(src).toMatch(/rootsInUse = \$derived\(rootOptions\.some\(\(o\) => o\.source !== 'worktree'\)\)/);
+		expect(src).toMatch(/showRootBar = \$derived\(rootsInUse && !isPy\)/);
+	});
 });
 
 describe('declaring one end to end', () => {

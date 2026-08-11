@@ -423,9 +423,11 @@
 					<p class="mt-1 text-xs text-base-content/50">
 						When a notebook's code root is set to a git worktree outside this workspace, write Cellar's
 						agent config (<span class="font-mono">.mcp.json</span>) there, so an agent working in that
-						checkout can reach this Cellar. It is also added to that worktree's
-						<span class="font-mono">.git/info/exclude</span>, so the checkout never shows it as an
-						untracked change and it cannot be committed.
+						checkout can reach this Cellar. It is also added to that repository's
+						<span class="font-mono">.git/info/exclude</span>, so the checkout does not show it as an
+						untracked change and it cannot be committed. Git keeps that file per clone rather than per
+						worktree, so the entry covers every worktree of that repository and its main checkout — it
+						is never committed, so no collaborator inherits it.
 					</p>
 				</div>
 

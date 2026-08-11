@@ -89,6 +89,38 @@ export interface WorkspaceRootOption {
 	external: boolean;
 }
 
+/**
+ * What Cellar did about agent config in an ADOPTED external worktree, as it
+ * reaches a caller. Mirrors `server/worktree-agent-config.ts`'s own shape; the
+ * browser cannot import that module, so the shape lives here for the same reason
+ * `WorkspaceRootOption` does.
+ */
+export interface AgentConfigReport {
+	file?: string;
+	status: 'created' | 'updated' | 'already' | 'skipped';
+	message?: string;
+}
+
+/**
+ * The sentence a HUMAN should be shown about an adopted worktree's agent config,
+ * or null when there is nothing worth saying.
+ *
+ * Agent wiring is REPORTED and never thrown (worktree-agent-config.ts rule 4),
+ * which only means anything if a surface actually says it — so this is the ONE
+ * place the wording lives, shared by the notebook's root picker and the sidebar's
+ * WORKTREES block rather than written twice and drifting.
+ *
+ * SILENT ON SUCCESS, deliberately: `created`/`updated`/`already` with no message
+ * is the everyday outcome and needs no sentence beside the root change the user
+ * asked for. What must never be silent is the case that leaves their checkout
+ * dirty — config written but the ignore entry could not be arranged — and a
+ * `skipped` that explains itself, both of which carry a message.
+ */
+export function agentConfigNotice(report: AgentConfigReport | null | undefined): string | null {
+	if (!report?.message) return null;
+	return report.message;
+}
+
 /** Thrown for a declared root that is not a usable workspace-relative directory. */
 export class NotebookRootError extends Error {
 	constructor(message: string) {

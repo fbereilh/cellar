@@ -69,10 +69,41 @@ import { resolveRootDir, worktreeDeclaration } from '$lib/server/notebookRoot';
  * distinguishable from a row still loading and from one whose document could not be
  * read, so the panel can mark them and say why, once, instead of leaving them
  * rendering as never-arrived. `readLimit` rides along so it can name the cap.
+ *
+ * The WORKTREE list is bounded the same way and for the same reason, by
+ * `MAX_WORKTREE_PROBES` (reported as `worktreeReadLimit`): past it a row is still
+ * listed with everything the porcelain listing already knew — path, branch, sha,
+ * whether it exists — and only its commit probe is dropped, marked `notRead`. A
+ * worktree that is already being probed as some notebook's ROOT is free and never
+ * counts against the budget, so the checkouts a kernel actually runs in are the
+ * last thing that can be dropped.
  */
 
 /** Distinct `path` params one request PROBES; the rest come back `notRead`. See the header. */
 const MAX_PATHS = 64;
+
+/**
+ * Registered worktrees one request probes for a commit, beyond those it was going
+ * to probe anyway as some notebook's root.
+ *
+ * The SAME reason `MAX_PATHS` exists: each probe is three concurrent `git` spawns
+ * on the process carrying the kernel websockets and the SSE fan-out, and this
+ * panel refetches on mount, on `sse:open`, on `fsRefreshSignal` and on every
+ * window focus. The notebook side was bounded while this one was not, and the
+ * feature's own use case is a worktree per PR under review — so a repo with a few
+ * dozen registrations turned each cold-cache refresh into a hundred-odd
+ * concurrent git processes.
+ *
+ * Lower than `MAX_PATHS` deliberately: notebooks are what the user opened, one at
+ * a time, whereas worktrees accumulate from `git worktree add` runs that have
+ * nothing to do with Cellar, so the list is both larger and less deliberate.
+ *
+ * Truncation is REPORTED, never silent (the row keeps its identity and drops only
+ * its commit — see `notRead` on the notebook side), and a worktree that is
+ * ALREADY being probed as a notebook's root never counts against it, because it
+ * costs nothing extra.
+ */
+const MAX_WORKTREE_PROBES = 24;
 
 /** `realpathSync` where possible, else the path itself (it may not exist). */
 function realpathOrSelf(p) {
@@ -144,16 +175,32 @@ export async function GET({ url }) {
 
 	// One probe per DISTINCT directory (three `git` spawns), shared by every
 	// notebook rooted there — plus the workspace itself, which every no-root
-	// notebook reports and which is usually already one of them, plus each live
-	// worktree. Pooling the worktrees into this SAME set is what keeps the cost
-	// per-directory rather than per-row: a worktree that is also some notebook's
-	// root is already in it and costs nothing extra.
-	const dirs = [
-		...new Set([ws, ...targets.map((t) => t.dir).filter(Boolean), ...wtrees.filter((e) => e.exists).map((e) => e.w.path)])
-	];
+	// notebook reports and which is usually already one of them. Pooling the
+	// worktrees into this SAME set is what keeps the cost per-directory rather
+	// than per-row.
+	const rootDirs = new Set([ws, ...targets.map((t) => t.dir).filter(Boolean)]);
+
+	// Worktrees are bounded on top of that, and the budget is spent on the ones
+	// that are NOT already free: a worktree that is some notebook's root is in
+	// `rootDirs` already, so probing it costs nothing extra and it can never be the
+	// row that gets truncated — which also means the checkouts a kernel is actually
+	// running in are the last thing this can drop.
+	let budget = MAX_WORKTREE_PROBES;
+	const probes = wtrees.map(({ w, exists }) => {
+		// A missing one is never probed: there is no status to read, and it would
+		// spawn three processes to learn nothing. It is not truncation either — the
+		// row already states it is gone.
+		if (!exists) return { w, exists, probed: false, truncated: false };
+		if (rootDirs.has(w.path)) return { w, exists, probed: true, truncated: false };
+		if (budget <= 0) return { w, exists, probed: false, truncated: true };
+		budget -= 1;
+		return { w, exists, probed: true, truncated: false };
+	});
+
+	const dirs = [...new Set([...rootDirs, ...probes.filter((p) => p.probed).map((p) => p.w.path)])];
 	const commits = new Map(await Promise.all(dirs.map(async (dir) => [dir, await gitCommitAt(dir)])));
 
-	const worktrees = wtrees.map(({ w, exists }) => ({
+	const worktrees = probes.map(({ w, exists, probed, truncated }) => ({
 		// The LEXICAL declaration for the realpath'd path git printed — through the
 		// ONE helper that owns the two-namespace rule, so "Use as root" posts exactly
 		// the value the picker would and exactly the value that gets persisted.
@@ -165,12 +212,17 @@ export async function GET({ url }) {
 		detached: w.detached,
 		shortSha: w.head ? w.head.slice(0, 7) : null,
 		prunable: w.prunable,
-		dirty: exists ? (commits.get(w.path)?.dirty ?? false) : false
+		// Named, so the panel can mark it and say why — the row keeps every fact the
+		// LISTING already gave it (path, branch, sha, existence) and drops only what a
+		// probe would have added, so it claims nothing this request did not read.
+		notRead: truncated,
+		dirty: probed ? (commits.get(w.path)?.dirty ?? false) : false
 	}));
 
 	return json({
 		workspace: commits.get(ws),
 		readLimit: MAX_PATHS,
+		worktreeReadLimit: MAX_WORKTREE_PROBES,
 		worktrees,
 		notebooks: [
 			...targets.map((t) => ({

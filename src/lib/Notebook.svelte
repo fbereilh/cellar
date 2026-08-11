@@ -457,11 +457,12 @@
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 
 	// ---- code-root bar --------------------------------------------------------
-	// Shown only when the workspace actually has roots, or this notebook already
-	// declares one. A workspace that never adopts roots therefore renders exactly
-	// what it always did — the feature costs it no chrome. The picker always offers
-	// the notebook's CURRENT root even when its directory is gone, so a broken
-	// declaration is visible and clearable rather than silently absent.
+	// Shown only when the workspace actually has roots (a `roots/` directory), or
+	// some notebook already declares one — see `rootsInUse` below. A workspace that
+	// never adopts roots therefore renders exactly what it always did — the feature
+	// costs it no chrome. The picker always offers the notebook's CURRENT root even
+	// when its directory is gone, so a broken declaration is visible and clearable
+	// rather than silently absent.
 	const rootOptions = $derived.by(() => {
 		const opts = availableRoots.map((r) => ({ ...r }));
 		if (root && !opts.some((o) => o.path === root)) {
@@ -487,7 +488,18 @@
 	// alone, so it stores no notebook metadata and could not keep a root across a
 	// reload — the server REFUSES one there. No control is offered, so the picker
 	// being absent and the declaration being refused say the same thing.
-	const showRootBar = $derived(rootOptions.length > 0 && !isPy);
+	// The bar appears only once roots are IN USE here: a `roots/` directory exists,
+	// or some notebook declares one. A merely DETECTED worktree does not open it —
+	// `git worktree list` is populated by work that has nothing to do with Cellar
+	// (a worktree-per-task agent workflow, a PR checkout), so keying the bar off it
+	// put new chrome on every notebook of every multi-worktree repo, which is the
+	// "a workspace that never adopts roots renders exactly what it always did"
+	// promise dropped. Detected worktrees still POPULATE the picker whenever it is
+	// shown, so "offered by default" is untouched; the sidebar's WORKTREES block is
+	// the discovery surface for a workspace that has not adopted one yet, so
+	// nothing becomes unreachable.
+	const rootsInUse = $derived(rootOptions.some((o) => o.source !== 'worktree'));
+	const showRootBar = $derived(rootsInUse && !isPy);
 	const currentRootOption = $derived(rootOptions.find((o) => o.path === root) ?? null);
 	// The select is DRIVEN by `root`, never by the click: the change is applied
 	// non-optimistically and can be REFUSED (the picker deliberately offers a

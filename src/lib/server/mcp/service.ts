@@ -316,7 +316,13 @@ export async function setNotebookRoot(root: string | null, nb?: string | null) {
 		root_changed: change.changed,
 		...(change.changed
 			? { kernel_restarted: change.kernel_restarted, namespace_cleared: change.namespace_cleared }
-			: {})
+			: {}),
+		// Agent wiring into an adopted worktree is REPORTED, never thrown (see
+		// worktree-agent-config.ts rule 4) — so it has to reach a caller, or the
+		// guarantee is unobservable and a `skipped` write, an EACCES, or an exclude
+		// that could not be arranged (which leaves the user's checkout dirty) are all
+		// discarded silently. Conditional, so an ordinary root change is unchanged.
+		...(change.agent_config ? { agent_config: change.agent_config } : {})
 	};
 }
 

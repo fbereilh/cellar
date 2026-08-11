@@ -22,6 +22,8 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 const h = vi.hoisted(() => {
 	let seq = 0;
 	const execCodes: string[] = [];
+	/** What the fake kernel reports as its cwd, or null to print nothing at all. */
+	const fakeCwd: { value: string | null } = { value: null };
 	function makeFakeKernel() {
 		seq += 1;
 		return {
@@ -33,10 +35,25 @@ const h = vi.hoisted(() => {
 			iopubMessage: { connect: vi.fn() },
 			requestExecute: vi.fn((args: { code: string }) => {
 				execCodes.push(args.code);
-				return {
-					onIOPub: null as unknown,
-					done: Promise.resolve({ content: { status: 'ok', execution_count: 1 } })
+				const future: { onIOPub: null | ((msg: unknown) => void); done: Promise<unknown> } = {
+					onIOPub: null,
+					// Resolved a microtask later, so `onIOPub` — which the caller assigns
+					// AFTER this returns — is in place before any output is delivered.
+					done: Promise.resolve().then(() => {
+						// The startup cwd verification is the one injection whose ANSWER
+						// matters, so the fake kernel can be told to report a cwd. Left unset
+						// it prints nothing, which `verifyKernelCwd` treats as unverifiable
+						// (never a mismatch), so every other test here is unaffected.
+						if (fakeCwd.value !== null && args.code.includes('getcwd')) {
+							future.onIOPub?.({
+								header: { msg_type: 'stream' },
+								content: { name: 'stdout', text: `${fakeCwd.value}\n` }
+							});
+						}
+						return { content: { status: 'ok', execution_count: 1 } };
+					})
 				};
+				return future;
 			}),
 			restart: vi.fn(async () => {}),
 			interrupt: vi.fn(async () => {}),
@@ -45,6 +62,7 @@ const h = vi.hoisted(() => {
 	}
 	return {
 		execCodes,
+		fakeCwd,
 		startNew: vi.fn(async () => makeFakeKernel()),
 		dispose: vi.fn(),
 		// nbPath -> declared workspace-relative root (null = the workspace root).
@@ -176,5 +194,51 @@ describe('a notebook WITH a declared root', () => {
 		expect(startArg(0)).toEqual({ name: 'python3', path: 'roots/other' });
 		expect(injectedSysPathRoot()).toBe('/ws/roots/other');
 		await shutdownKernel(ROOTED);
+	});
+});
+
+describe('a kernel whose cwd is REFUSED is never left serving runs', () => {
+	const WT = '/ws/wt.ipynb';
+
+	beforeEach(() => {
+		h.roots.set(WT, '../pr-398');
+		h.fakeCwd.value = null;
+	});
+
+	it('a START that fails verification shuts the process down and refuses', async () => {
+		h.fakeCwd.value = '/somewhere/else';
+		await expect(execute(WT, 'x=1', noop)).rejects.toThrow(/declared code root/i);
+		// The refused start left no process behind, so nothing would ever reap it…
+		const started = h.startNew.mock.results[0].value as Promise<{ shutdown: { mock: { calls: unknown[] } } }>;
+		expect((await started).shutdown.mock.calls.length).toBe(1);
+		// …and no entry behind either: the next run is a fresh START, not a reuse.
+		h.fakeCwd.value = null;
+		h.startNew.mockClear();
+		await execute(WT, 'x=1', noop);
+		expect(h.startNew).toHaveBeenCalledTimes(1);
+		await shutdownKernel(WT);
+	});
+
+	it('a RESTART that fails verification tears the kernel down instead of keeping it', async () => {
+		// The regression: `getKernel` short-circuits on an EXISTING map entry without
+		// re-verifying, and a restart's entry is already there with a resolved
+		// `startPromise` — so a refusal that merely propagated left every LATER run
+		// executing against the kernel whose cwd had just been refused, which is
+		// exactly the silent degrade the verification exists to prevent.
+		await execute(WT, 'x=1', noop);
+		const first = await (h.startNew.mock.results[0].value as Promise<{ id: string; shutdown: { mock: { calls: unknown[] } } }>);
+
+		h.fakeCwd.value = '/somewhere/else';
+		await expect(restartKernel(WT)).rejects.toThrow(/declared code root/i);
+		expect(first.shutdown.mock.calls.length).toBe(1);
+
+		// The proof that matters: the next run gets a NEW kernel, never the refused one.
+		h.fakeCwd.value = null;
+		h.startNew.mockClear();
+		await execute(WT, 'y=2', noop);
+		expect(h.startNew).toHaveBeenCalledTimes(1);
+		const next = await (h.startNew.mock.results[0].value as Promise<{ id: string }>);
+		expect(next.id).not.toBe(first.id);
+		await shutdownKernel(WT);
 	});
 });

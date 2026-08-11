@@ -1555,7 +1555,19 @@ export async function restartKernel(nbPath?: string | null) {
 		beginSession(nbKernel);
 	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
-	await initKernel(nbKernel, kernel);
+	try {
+		await initKernel(nbKernel, kernel);
+	} catch (err) {
+		// The one thing in `initKernel` that may legitimately refuse is the code-root
+		// cwd verification, and `getKernel` handles that by not leaving a half-verified
+		// kernel behind. The same must hold here, and for a stronger reason: this entry
+		// is ALREADY in the map with a resolved `startPromise`, and `getKernel`
+		// short-circuits on an existing entry without re-verifying — so a refusal that
+		// merely propagated left every later run executing against the kernel whose cwd
+		// was just refused, the exact silent degrade the verification exists to prevent.
+		await teardownKernel(nbKernel, 'kernel_restart_failed');
+		throw err;
+	}
 	publishKernelStatus();
 	// If this notebook had a live Databricks session, rebuild it against the same
 	// profile+cluster now the namespace is fresh. Detached (void) so it never blocks

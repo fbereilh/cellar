@@ -39,19 +39,30 @@
  * reporting on. Worse, a `git add -A` in a review worktree would commit Cellar's
  * config onto the branch under review.
  *
- * So the write is paired with an entry in the worktree's `$GIT_DIR/info/exclude`.
- * For a LINKED worktree `$GIT_DIR` is `<main>/.git/worktrees/<name>`, and git
- * really does honour a per-worktree `info/exclude` there (verified: with the
- * entry in place, `git status` in the worktree is clean and the main checkout is
- * untouched). That is per-worktree, never committed, and invisible to teammates —
- * which is the condition that makes writing by default defensible at all. It is
- * therefore written BEFORE the config, so the file is never briefly visible as an
- * untracked change.
+ * So the write is paired with an entry in `info/exclude`.
+ *
+ * ITS SCOPE IS REPO-COMMON, NOT PER-WORKTREE — state that plainly rather than
+ * glossing it. `info/` is in git's `common_list`, so git resolves `info/exclude`
+ * through the COMMON git dir (`git rev-parse --git-common-dir`) whatever worktree
+ * asks. A LINKED worktree's own `$GIT_DIR` is `<main>/.git/worktrees/<name>`, and
+ * an `info/exclude` written THERE is read by nothing at all — verified against
+ * real git (2.50.1): with the entry in that per-worktree location `git status` in
+ * the worktree still reports `?? .mcp.json` and `git check-ignore` says it is not
+ * ignored, while the same entry in `<main>/.git/info/exclude` does ignore it. So
+ * the entry goes to the common dir, and it therefore applies to EVERY worktree of
+ * that clone AND to the main checkout — one line ignoring one filename Cellar
+ * itself writes, which is the cost of the mitigation working at all.
+ *
+ * What the on-by-default decision actually rests on is unchanged and still true:
+ * `info/exclude` is never committed and never reaches teammates, so no `git add
+ * -A` can put Cellar's config onto the branch under review and no collaborator
+ * inherits the entry. It is written BEFORE the config, so the file is never
+ * briefly visible as an untracked change.
  */
 import { existsSync, mkdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join, dirname } from 'node:path';
-import { configureHarness, isHarnessAllowed, mcpJsonHarnessNames, harnessConfigPath, readAllowList } from './harness.js';
+import { join, dirname, resolve } from 'node:path';
+import { configureHarness, mcpJsonHarnessNames, harnessConfigPath, readAllowList } from './harness.js';
 import { workspaceRoot } from './fstree';
 import { getUiState } from './ui-state';
 import { logWarn } from './logs';
@@ -88,24 +99,32 @@ function targetHarnesses(): string[] {
 	// harness it excludes is DERIVED from the registry rather than pinned by name —
 	// the same rule the launch-path write follows.
 	const excluded = process.env.CELLAR_NO_MCP_CONFIG ? new Set(mcpJsonHarnessNames()) : new Set<string>();
-	const ws = workspaceRoot();
-	return readAllowList(ws).filter((name) => !excluded.has(name) && isHarnessAllowed(name, ws));
+	// `readAllowList` already answers "allowed here", normalized against the
+	// registry, so re-asking `isHarnessAllowed` per name only re-read and re-parsed
+	// `.cellar/harness.json` to reach the same verdict.
+	return readAllowList(workspaceRoot()).filter((name) => !excluded.has(name));
 }
 
 /**
- * Ensure `entry` is ignored inside `worktreeDir`, via that worktree's OWN
- * `$GIT_DIR/info/exclude`. Best-effort and idempotent; returns false when it
- * could not be arranged (not a repo, unwritable), which is the caller's cue to
- * say so rather than to claim a clean checkout.
+ * Ensure `entry` is ignored inside `worktreeDir`, via the repo's COMMON
+ * `info/exclude`. Best-effort and idempotent; returns false when it could not be
+ * arranged (not a repo, unwritable), which is the caller's cue to say so rather
+ * than to claim a clean checkout.
+ *
+ * `--git-common-dir`, never `--absolute-git-dir`: see the header — `info/` is in
+ * git's `common_list`, so an exclude written to a linked worktree's own git dir is
+ * read by nothing. Its output is relative to the git process's cwd (which `-C`
+ * sets to `worktreeDir`) in a main checkout and absolute in a linked one, so it is
+ * resolved against `worktreeDir` rather than trusted as absolute.
  */
 function ensureGitExclude(worktreeDir: string, entry: string): boolean {
-	const r = spawnSync('git', ['-C', worktreeDir, '--no-optional-locks', 'rev-parse', '--absolute-git-dir'], {
+	const r = spawnSync('git', ['-C', worktreeDir, '--no-optional-locks', 'rev-parse', '--git-common-dir'], {
 		encoding: 'utf8'
 	});
 	if (r.status !== 0) return false;
-	const gitDir = (r.stdout ?? '').trim();
-	if (!gitDir) return false;
-	const file = join(gitDir, 'info', 'exclude');
+	const common = (r.stdout ?? '').trim();
+	if (!common) return false;
+	const file = join(resolve(worktreeDir, common), 'info', 'exclude');
 	try {
 		const existing = existsSync(file) ? readFileSync(file, 'utf8') : '';
 		// Idempotent on the ENTRY, not on the whole line: a user may have added it
@@ -139,10 +158,16 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 
 	// The exclude first, so the config file is never momentarily visible as an
 	// untracked change in the user's checkout.
-	const excluded = names.every((name) => {
-		const file = harnessConfigPath(name, worktreeDir);
-		return !file || ensureGitExclude(worktreeDir, file.slice(worktreeDir.length + 1));
-	});
+	// Mapped THEN reduced, never `.every` directly: that short-circuits on the first
+	// failure, so a harness whose exclude could not be arranged silently skipped the
+	// attempt for every later one — and their config files were then written with no
+	// ignore entry at all, though those excludes would have succeeded.
+	const excluded = names
+		.map((name) => {
+			const file = harnessConfigPath(name, worktreeDir);
+			return !file || ensureGitExclude(worktreeDir, file.slice(worktreeDir.length + 1));
+		})
+		.every(Boolean);
 
 	const results: WorktreeAgentConfig[] = [];
 	for (const name of names) {
@@ -171,7 +196,7 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 		return {
 			...wrote,
 			message:
-				'agent config was written, but it could not be added to this worktree\'s .git/info/exclude, so the checkout will show it as an untracked file.'
+				'agent config was written, but it could not be added to the repository\'s .git/info/exclude, so the checkout will show it as an untracked file.'
 		};
 	}
 	return results.length > 1 ? { ...wrote, message: wrote.message ?? `${results.length} harnesses configured` } : wrote;

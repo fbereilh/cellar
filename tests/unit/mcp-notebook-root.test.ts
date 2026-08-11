@@ -118,6 +118,27 @@ describe('list_roots', () => {
 		await svc.setNotebookRoot('', opened.path);
 	});
 
+	it('REPORTS what adopting the worktree did about agent config', async () => {
+		// Writing `.mcp.json` into an adopted worktree is caught and REPORTED rather
+		// than thrown (agent wiring may never abort a root change) — which only means
+		// anything if it reaches a caller. Rebuilding the result field by field used to
+		// drop it, so a `skipped` write, an EACCES, and above all "written, but the
+		// ignore entry could not be arranged, so this checkout is now dirty" were all
+		// discarded silently, on the one surface with no other channel to say it.
+		const opened = svc.useNotebook('sessAgentCfg', 'agentcfg.ipynb');
+		const change = await svc.setNotebookRoot(SIBLING, opened.path);
+		expect(change.agent_config).toMatchObject({ status: expect.stringMatching(/^(created|updated|already|skipped)$/) });
+		await svc.setNotebookRoot('', opened.path);
+	});
+
+	it('carries NO agent_config for an internal root — the field is for adopted worktrees only', async () => {
+		const opened = svc.useNotebook('sessInternalCfg', 'internalcfg.ipynb');
+		const change = await svc.setNotebookRoot('roots/pr-482', opened.path);
+		expect(change.root_changed).toBe(true);
+		expect(change).not.toHaveProperty('agent_config');
+		await svc.setNotebookRoot('', opened.path);
+	});
+
 	it('a workspace with no roots reports an empty list and says so', async () => {
 		const bare = mkdtempSync(join(tmpdir(), 'cellar-mcp-noroots-'));
 		const prev = process.env.CELLAR_WORKSPACE;
