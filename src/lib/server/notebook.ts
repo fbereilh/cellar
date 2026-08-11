@@ -99,6 +99,10 @@ function enforceUniqueIds(cells: Cell[]): void {
 	}
 }
 
+/** The three nbformat 4.5 cell types. The vocabulary a foreign/stored cell type is
+ * VALIDATED against (`replaceCells`), never coerced into - see that function. */
+const NB_CELL_TYPES = new Set<string>(['code', 'markdown', 'raw']);
+
 function starterCell(): Cell {
 	return {
 		id: mintId(),
@@ -1493,6 +1497,15 @@ export function clearOutputsForCells(ids: readonly string[], nb?: string | null,
  * ids are re-checked for uniqueness defensively. Used by the checkpoint restore
  * path (`checkpoints.js`); `clean.js` strips runtime metadata on persist, so a
  * restore leaves the `.ipynb` git-clean.
+ *
+ * A snapshot's `cell_type` is VALIDATED against the nbformat vocabulary, never
+ * coerced to it. The old `=== 'markdown' ? 'markdown' : 'code'` shorthand read
+ * every third type as code, so restoring a checkpoint of a notebook carrying an
+ * nbformat `raw` cell (Quarto/nbdev frontmatter) silently retyped it to code and
+ * broke the notebook for the tool that reads it - and `checkpoints.ts` snapshots
+ * through `structuredClone(listCells(nb))`, which PRESERVES the type, so the loss
+ * was entirely on this side. The fallback stays for a genuinely malformed
+ * snapshot; the point is that a legitimate type survives.
  */
 export function replaceCells(
 	nb: string | null | undefined,
@@ -1502,7 +1515,7 @@ export function replaceCells(
 	const doc = docFor(nb);
 	const cloned: Cell[] = (Array.isArray(cells) ? cells : []).map((c) => ({
 		id: c.id ?? '',
-		cell_type: (c.cell_type === 'markdown' ? 'markdown' : 'code') as Cell['cell_type'],
+		cell_type: (NB_CELL_TYPES.has(c.cell_type as string) ? c.cell_type : 'code') as Cell['cell_type'],
 		source: typeof c.source === 'string' ? c.source : '',
 		outputs: Array.isArray(c.outputs) ? structuredClone(c.outputs) : [],
 		metadata: c.metadata ? structuredClone(c.metadata) : {}
