@@ -9,7 +9,7 @@
  * search, section, or execution result.
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, extname } from 'node:path';
 import {
 	listCells,
 	getCell,
@@ -51,6 +51,7 @@ import { enqueueRun, queuesByNotebook, queuePosition, queueStateFor } from '../r
 import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree, resolveInWorkspace, workspaceRoot } from '../fstree';
+import { isPyPath, isPyNotebookFile } from '../jupytext';
 import { buildNotebookHtml, exportFilename } from '../export-html';
 import { generatedModuleExists } from '../export-py';
 import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
@@ -67,7 +68,7 @@ import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } fro
 import { autoCheckpointBeforeAgentAction, createCheckpoint, type CheckpointMeta } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
 import { forgetSessionActivity } from './userActivity';
-import type { CellView, CellOutput, SessionId, LogicalCellType, QueueState } from '../types';
+import type { CellView, CellOutput, NotebookView, SessionId, LogicalCellType, QueueState } from '../types';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -210,7 +211,8 @@ export function useNotebook(sessionId: string | undefined, name?: string, create
 		if (!createIfMissing) throw new Error('use_notebook requires a notebook name to open. Use list_notebooks to see existing notebooks.');
 		rel = 'untitled';
 	}
-	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
+	rel = notebookNameToPath(rel);
+	if (isPyPath(rel)) return usePyNotebook(sessionId, rel);
 	const existed = notebookExists(rel);
 	if (!existed && !createIfMissing) {
 		throw new Error(`Notebook "${rel}" does not exist. Use list_notebooks to see workspace notebooks, or call use_notebook without create_if_missing:false (create is the default) to create it.`);
@@ -218,11 +220,71 @@ export function useNotebook(sessionId: string | undefined, name?: string, create
 	// createNotebookDoc opens an existing file or creates a new one; focus:false
 	// keeps the user's tab where it is.
 	const nb = createNotebookDoc(rel, null, { focus: false });
+	return pinnedPayload(sessionId, nb, !existed);
+}
+
+/**
+ * Resolve the `name` an agent passed into the workspace-relative path to open.
+ *
+ * A path that already NAMES its format is taken literally — `.ipynb` and, the fix
+ * this rule exists for, `.py`: a jupytext / Databricks-source `.py` is a first-class
+ * live notebook everywhere else in Cellar, and unconditionally appending `.ipynb`
+ * rewrote `analysis.py` into a nonexistent `analysis.py.ipynb`. That was not merely
+ * a discovery gap: `use_notebook` was the ONLY way to pin a session's working
+ * notebook, so an agent working a `.py` could not pin at all, its target silently
+ * followed the USER'S focused tab, and a later `add_and_run`/`edit_cell` could land
+ * in whatever notebook the human had switched to. A `.py` that does not exist is
+ * therefore an ERROR (see `usePyNotebook`), never a rewrite: an agent that typed a
+ * path means that path.
+ *
+ * Everything else gets `.ipynb` appended — the bare-name case (`untitled`,
+ * `analysis`) this has always served, plus any other extension, which stays
+ * append-on-suffix ONLY when no notebook exists at the literal path, so a real file
+ * is never rewritten out from under the caller.
+ */
+function notebookNameToPath(rel: string): string {
+	if (/\.ipynb$/i.test(rel) || isPyPath(rel)) return rel;
+	if (extname(rel) !== '' && notebookExists(rel)) return rel;
+	return rel + '.ipynb';
+}
+
+/**
+ * Open-and-pin a `.py` notebook. Split out because the two things `useNotebook`
+ * does for an `.ipynb` — create-if-missing, and trusting the extension — are both
+ * wrong here:
+ *
+ *   - Cellar cannot CREATE a `.py` notebook. `jpFormat` (which format to write it
+ *     back in) is recorded by `loadDoc` when it PARSES the file, so a doc invented
+ *     for a path with no file would persist as nbformat JSON into a `.py` — a
+ *     corrupt file, silently. Missing is an error naming the way to get one.
+ *   - Being a `.py` does not make a file a notebook. A plain module has no cell
+ *     structure; opening one would hand the agent a document whose cells are an
+ *     artifact of the converter. `isPyNotebookFile` is the SAME marker rule the UI
+ *     opens on, so what `list_notebooks` offers is exactly what this accepts.
+ */
+function usePyNotebook(sessionId: string | undefined, rel: string) {
+	if (!notebookExists(rel)) {
+		throw new Error(
+			`Notebook "${rel}" does not exist, and Cellar cannot create a .py notebook (its format is read from the file). Use list_notebooks to see workspace notebooks, or create a .ipynb (use_notebook without the .py) and save it as .py from the app.`
+		);
+	}
+	if (!isPyNotebookFile(resolveNotebookPath(rel))) {
+		throw new Error(
+			`"${rel}" is a plain Python file, not a notebook: it carries no jupytext/Databricks cell marker (a "# Databricks notebook source" header, "# %%", or jupytext front matter), so Cellar opens it as text. Use list_notebooks to see the workspace's notebooks.`
+		);
+	}
+	// Opens the existing file (loadDoc parses it and records its `.py` format) and
+	// surfaces it as an available tab; focus:false keeps the user's tab where it is.
+	return pinnedPayload(sessionId, createNotebookDoc(rel, null, { focus: false }), false);
+}
+
+/** The one `use_notebook` result shape, so the `.ipynb` and `.py` paths cannot drift. */
+function pinnedPayload(sessionId: string | undefined, nb: NotebookView, created: boolean) {
 	if (sessionId) sessionNotebooks.set(sessionId, nb.path);
 	return {
 		working_notebook: workspaceRelative(nb.path),
 		path: nb.path,
-		created: !existed,
+		created,
 		pinned: !!sessionId,
 		cells: cellCount(nb),
 		root: getNotebookRoot(nb.path),
@@ -705,9 +767,20 @@ export const kernel = {
 };
 
 /**
- * List every `.ipynb` in the workspace so the agent can discover names to open.
+ * List every notebook in the workspace so the agent can discover names to open.
  * Walks the workspace file tree (skipping noise dirs) and marks which notebook
  * is currently active. Paths are workspace-relative (what `use_notebook` accepts).
+ *
+ * "Notebook" means every `.ipynb`, PLUS a `.py` carrying a jupytext / Databricks
+ * cell marker — those are live, kernel-attached notebooks everywhere else in
+ * Cellar, and omitting them here left an agent unable to discover the one thing
+ * `use_notebook` needs in order to PIN its working notebook (see
+ * `notebookNameToPath` for why an unpinnable notebook is a correctness problem,
+ * not a nicety). A plain `.py` module is deliberately NOT listed: it has no cell
+ * structure, and the marker rule here is the same `isPyNotebookFile` the open path
+ * enforces, so everything listed can actually be opened. That sniff costs one
+ * bounded read per `.py` in the workspace, which is why it reads a header prefix
+ * rather than the file.
  */
 export function listNotebooks(sessionId?: string) {
 	const activeAbs = getActiveNotebookPath();
@@ -723,7 +796,8 @@ export function listNotebooks(sessionId?: string) {
 	const walk = (nodes: TreeNodeLike[]) => {
 		for (const n of nodes) {
 			if (n.type === 'dir') walk(n.children || []);
-			else if (n.type === 'file' && /\.ipynb$/i.test(n.name)) paths.push(n.path);
+			else if (n.type !== 'file') continue;
+			else if (/\.ipynb$/i.test(n.name) || (isPyPath(n.name) && isPyNotebookFile(resolveNotebookPath(n.path)))) paths.push(n.path);
 		}
 	};
 	const { root, tree } = buildTree();

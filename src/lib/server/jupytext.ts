@@ -32,7 +32,7 @@
  * lets a traceback be the only answer.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readSync } from 'node:fs';
 import { join, resolve, extname, sep } from 'node:path';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
 import { invalidateGitStatusCache } from './git';
@@ -116,6 +116,52 @@ export function detectPyNotebook(text: string): { notebook: boolean; format: str
 	if (/^# %%/m.test(text)) return { notebook: true, format: 'percent' };
 	if (/^# ---\s*$/m.test(text) && /^#\s+jupytext:/m.test(text)) return { notebook: true, format: null };
 	return { notebook: false, format: null };
+}
+
+/**
+ * How much of a `.py` file `isPyNotebookFile` reads to look for a marker. Every
+ * marker `detectPyNotebook` recognizes is a HEADER fact — the Databricks line is
+ * line 1, jupytext front-matter opens the file, and a percent notebook's first
+ * `# %%` sits above its first cell — so a bounded prefix answers the question a
+ * whole-file read would, at one `read` syscall per file whatever the file's size.
+ * That bound is the point: the caller (`list_notebooks`) sniffs EVERY `.py` in the
+ * workspace, which in a real python project is hundreds of ordinary modules, on
+ * the process that also carries the kernel websockets and the SSE fan-out.
+ */
+const DETECT_PREFIX_BYTES = 64 * 1024;
+
+/**
+ * Whether the `.py` file at `abs` is a notebook Cellar can OPEN — the on-disk
+ * counterpart of `detectPyNotebook`, for callers that hold a path rather than the
+ * text. Same rule (an explicit marker, never a markerless script), so what
+ * `list_notebooks` offers and what `use_notebook` accepts cannot drift.
+ *
+ * Reads a bounded prefix (see `DETECT_PREFIX_BYTES`) and answers FALSE for
+ * anything it cannot read at all (missing, a directory, EACCES, binary): "not a
+ * notebook" is the safe direction here — a file we cannot read is one we could not
+ * open as a notebook either, and the alternative is a listing that throws on one
+ * unreadable file. A multi-byte character clipped at the boundary decodes to a
+ * replacement char, which is harmless: every marker is line-anchored ASCII, so a
+ * clip can only ever cost the final partial line.
+ */
+export function isPyNotebookFile(abs: string): boolean {
+	let fd: number | undefined;
+	try {
+		fd = openSync(abs, 'r');
+		const buf = Buffer.allocUnsafe(DETECT_PREFIX_BYTES);
+		const n = readSync(fd, buf, 0, DETECT_PREFIX_BYTES, 0);
+		return detectPyNotebook(buf.subarray(0, n).toString('utf8')).notebook;
+	} catch {
+		return false;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch {
+				/* already gone */
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
