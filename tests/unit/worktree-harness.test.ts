@@ -435,6 +435,37 @@ describe('failure is REPORTED, never thrown', () => {
 		}
 	});
 
+	it('removes a created exclude file with TWO harnesses skipped, where only ONE saw it absent', () => {
+		// The multi-harness shape, and the ordinary one in a checkout that already holds
+		// the user's own config files: the exclude loop runs for EVERY allow-listed
+		// harness before any config is written, so with no `info/exclude` in the repo
+		// claude's append CREATES the file and codex's appends to the now-existing one.
+		// Recorded per harness, reverting both spliced claude's bytes out (leaving
+		// codex's, so the file was rewritten) and then codex's with nothing left but
+		// `created:false` — writing back a zero-byte `info/exclude` in a repo that had
+		// none. The single-harness assertion above cannot see it, because there the one
+		// append is also the one that created the file.
+		harness.allowHarness('codex', WS);
+		rmSync(EXCLUDE, { force: true });
+		expect(existsSync(EXCLUDE)).toBe(false);
+		// Both refused: an existing `.mcp.json` the writer will not edit, and a `.codex`
+		// that is a FILE where the directory would go.
+		writeFileSync(join(SIBLING, '.mcp.json'), 'not json at all\n');
+		writeFileSync(join(SIBLING, '.codex'), 'not a directory\n');
+		try {
+			const r = mod.configureAdoptedWorktree(SIBLING);
+			expect(r?.status).toBe('skipped');
+			expect(existsSync(EXCLUDE)).toBe(false);
+			// And git agrees the user's own file is theirs again — the point of reverting.
+			expect(() => git(SIBLING, 'check-ignore', '-q', '.mcp.json')).toThrow();
+		} finally {
+			harness.disallowHarness('codex', WS);
+			harness.allowHarness('claude', WS);
+			rmSync(join(SIBLING, '.codex'), { force: true });
+			rmSync(join(SIBLING, '.mcp.json'), { force: true });
+		}
+	});
+
 	it('never removes an exclude entry it did not add', () => {
 		// The revert is scoped to the bytes THIS call appended. An entry the user (or an
 		// earlier adoption) already had is not ours to take back, and a skipped write

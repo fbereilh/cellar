@@ -86,6 +86,15 @@
  * containment test, which is asymmetric. Identity has no such asymmetry, and
  * here it is required.
  *
+ * SO EVERY "are these the same directory" TEST IS CANONICAL — the listing scan,
+ * the workspace-exclusion in `nameWorktrees`, and the "this declaration IS the
+ * workspace" short-circuit in `resolveRootDir`. A LEXICAL `===` may only ever be
+ * a fast path in front of one, never the whole rule: git prints the MAIN CHECKOUT
+ * as the first line of `git worktree list`, so a workspace whose own path
+ * traverses a symlink has a second, realpath'd spelling of itself that a user can
+ * paste — and a lexical-only test lets it fall through to the worktree gate, which
+ * matches it.
+ *
  * EVERY declaration naming a git-reported path is minted by ONE function,
  * `worktreeDeclaration` — the picker, the sidebar route, and `resolveRootDir`
  * itself. This rule has been got wrong once per site that re-derived it, always
@@ -342,14 +351,12 @@ function nameWorktrees(list: GitWorktree[]): string {
 /**
  * Admit an out-of-workspace declaration, or throw naming why it was refused.
  *
- * `dir` is the LEXICALLY resolved candidate. Verification is realpath identity
- * against the listing (the two-namespace rule); nothing lexical is compared,
- * because `git worktree list` realpaths its output.
+ * `dir` is the LEXICALLY resolved candidate and `canonDir` its REAL-namespace form,
+ * supplied by the caller because it has already paid for it. Verification is
+ * realpath identity against the listing (the two-namespace rule); nothing lexical
+ * is compared, because `git worktree list` realpaths its output.
  */
-function assertRegisteredWorktree(dir: string, declared: string): GitWorktree {
-	// Resolved ONCE and reused by every comparison below - the ordinary listing scan,
-	// the refreshed re-check, and the moved-worktree lookup. See `canonicalWorktreePath`.
-	const canonDir = canonicalPath(dir);
+function assertRegisteredWorktree(dir: string, canonDir: string, declared: string): GitWorktree {
 	let list = listWorktreesAt(ws());
 	let match = list.find((w) => isWorktreeAt(w, dir, canonDir));
 	// A MISS is re-checked against a FRESH listing before it becomes a refusal.
@@ -420,13 +427,16 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 
 	// The declared text, for messages: what the user actually wrote.
 	const declared = shape.kind === 'inside' ? shape.rel : shape.raw;
+	const wsDir = ws();
 	// Lexical resolution serves both shapes: `resolve(ws, '../sib')` escapes,
 	// `resolve(ws, '/abs')` returns the absolute path untouched.
-	const dir = resolve(ws(), declared);
+	const dir = resolve(wsDir, declared);
 
-	if (dir === ws()) {
+	if (dir === wsDir) {
 		// Reachable via a value the classifier accepted that still resolves to the
-		// workspace itself; that is the same thing as declaring no root.
+		// workspace itself; that is the same thing as declaring no root. Free, and
+		// exact for every declaration written in Cellar's own lexical namespace — but
+		// NOT sufficient on its own, which is what the canonical re-check below is for.
 		return null;
 	}
 
@@ -446,11 +456,30 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 	// directory has one declaration however it was typed.
 	let match: GitWorktree | null = null;
 	if (isOutsideWorkspace(dir)) {
+		// Resolved ONCE here and threaded through every comparison the gate makes —
+		// the listing scan, the refreshed re-check, the moved-worktree lookup. See
+		// `canonicalWorktreePath`.
+		const canonDir = canonicalPath(dir);
+		// IDENTITY IS COMPARED BY REALPATH, and this is the last site in the module
+		// that was still doing it lexically — reached by exactly the input the branch
+		// accepts absolute paths FOR. `git worktree list`'s FIRST line is the MAIN
+		// CHECKOUT, realpath'd; on a workspace whose own path traverses a symlink
+		// (`/var/folders`, `/tmp`, a symlinked home) pasting it lands here rather than
+		// in the lexical short-circuit above, and the gate then MATCHES it, since the
+		// main checkout is a listed worktree and nothing there excludes it. The result
+		// was a root that IS the workspace, declared as `../../../private/var/…` in a
+		// COMMITTED `.ipynb` and labelled `kind:'worktree'` — so `initKernel` would run
+		// its external-root cwd verification against the workspace and
+		// `setNotebookRootAndRestart` would write agent config INTO it, rewriting the
+		// very `<ws>/.mcp.json` that "an ordinary workspace launch is untouched" is
+		// about. Asked canonically it is what it always was: no root at all. The cost
+		// is confined to this branch, so an ordinary `roots/…` root pays nothing.
+		if (canonDir === canonicalPath(wsDir)) return null;
 		// OUTSIDE — the second, narrower admission rule. Throws unless the listing
 		// names this exact directory, and its refusal names the repair, so a path
 		// that simply escapes the workspace is answered by the gate rather than by
 		// a separate escape message this branch would have to keep in sync.
-		match = assertRegisteredWorktree(dir, declared);
+		match = assertRegisteredWorktree(dir, canonDir, declared);
 	}
 
 	// THE CANONICAL DECLARATION, through the ONE helper that owns the two-namespace
@@ -467,7 +496,7 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 	// however the root was typed — which is what lets `isSameDeclaredRoot` compare
 	// resolved directories and see a re-declaration in the other spelling as the
 	// no-op it is.
-	const rootDir = resolve(ws(), rel);
+	const rootDir = resolve(wsDir, rel);
 	// KIND IS A PROPERTY OF THE DIRECTORY, not of the shape that was typed and not of
 	// which admission rule answered. Reading it off the branch above made it a
 	// property of the INPUT: on a workspace whose path traverses a symlink, pasting

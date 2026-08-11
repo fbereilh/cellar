@@ -235,7 +235,14 @@ interface ExcludeWrite {
 	file?: string;
 	/** The exact bytes THIS call appended; absent when the entry was already there. */
 	appended?: string;
-	/** Whether THIS call created the exclude file — the repo had none before it. */
+	/**
+	 * Whether THIS append is the one that brought the file into existence.
+	 *
+	 * Per-write, which is NOT the question a revert asks: with two harnesses
+	 * allow-listed the loop runs before any config is written, so the first append
+	 * creates the file and the second sees one already there. `configureAdoptedWorktree`
+	 * folds these into a single verdict for the CALL and hands it to `revertGitExclude`.
+	 */
 	created?: boolean;
 }
 
@@ -259,14 +266,25 @@ interface ExcludeWrite {
  * — put there is untouched, and an exclude that already held the entry is never
  * reverted at all (no `appended`). Removing the exact appended slice is also what
  * makes the file byte-identical to what it was before the call — INCLUDING the case
- * where there was no file: `ensureGitExclude` records that it created one, and the
- * revert then removes it rather than leaving a zero-byte `info/exclude` in a repo
+ * where there was no file: `createdFile` says the CALL brought it into existence, and
+ * the revert then removes it rather than leaving a zero-byte `info/exclude` in a repo
  * that had none. Git treats an absent and an empty exclude the same, so that is a
  * claim about honesty rather than behavior; it is asserted, so it has to hold.
+ *
+ * `createdFile` IS A FACT ABOUT THE CALL, never about one harness's append — that
+ * distinction is the whole of it. The exclude loop runs for every allow-listed
+ * harness BEFORE any config is written, so with claude and codex both allowed and no
+ * `info/exclude` in the repo, claude's append creates the file and codex's appends to
+ * the now-existing one. Read per harness, reverting BOTH (the ordinary shape in a
+ * checkout that already holds the user's own config files, which the writer refuses)
+ * spliced claude's bytes out first — leaving codex's, so the file was rewritten — and
+ * then codex's with nothing left but `created:false`, writing back an empty file where
+ * the repo had none.
+ *
  * Best-effort, like the write: a revert that cannot be done leaves the warning the
  * skip already earns.
  */
-function revertGitExclude(e: ExcludeWrite): void {
+function revertGitExclude(e: ExcludeWrite, createdFile: boolean): void {
 	if (!e.file || !e.appended) return;
 	try {
 		const content = readFileSync(e.file, 'utf8');
@@ -276,7 +294,7 @@ function revertGitExclude(e: ExcludeWrite): void {
 		// Only when this call BOTH created the file and left nothing else in it: a file
 		// that already existed (empty or not) is the user's, and a file this call created
 		// but which has since gained other lines is no longer only ours to remove.
-		if (e.created && rest === '') rmSync(e.file, { force: true });
+		if (createdFile && rest === '') rmSync(e.file, { force: true });
 		else writeFileAtomic(e.file, rest);
 	} catch {
 		/* best-effort: the skip's own warning is what the user acts on */
@@ -320,6 +338,10 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 		const file = harnessConfigPath(name, worktreeDir);
 		excludedByName.set(name, file ? ensureGitExclude(worktreeDir, file.slice(worktreeDir.length + 1)) : { ok: true });
 	}
+	// Whether the repo HAD an exclude file before this call, decided ONCE for the call:
+	// the loop above appends for every harness, so only the first of them can observe
+	// the absence. See `revertGitExclude`.
+	const createdExclude = [...excludedByName.values()].some((e) => e.created);
 
 	const results: HarnessOutcome[] = [];
 	for (const name of names) {
@@ -349,7 +371,7 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 		// own `.mcp.json`, which the writer refused to edit precisely because it is
 		// theirs. See `revertGitExclude`. `already` keeps its entry: Cellar's config IS
 		// there, so ignoring it is still correct.
-		if (results[results.length - 1].status === 'skipped') revertGitExclude(wroteExclude);
+		if (results[results.length - 1].status === 'skipped') revertGitExclude(wroteExclude, createdExclude);
 	}
 
 	const first = results[0];

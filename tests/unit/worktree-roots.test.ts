@@ -245,6 +245,8 @@ describe('the two-namespace rule, over a SYMLINKED workspace', () => {
 	let GIT_SIBLING: string;
 	/** The path git reports for a worktree that lives INSIDE the workspace, under `roots/`. */
 	let GIT_INSIDE: string;
+	/** The path git reports for the MAIN CHECKOUT — the first line of `git worktree list`. */
+	let GIT_MAIN: string;
 	let prevWs: string | undefined;
 
 	beforeAll(() => {
@@ -272,9 +274,14 @@ describe('the two-namespace rule, over a SYMLINKED workspace', () => {
 		const listed = gitmod.listWorktreesAt(join(LINK_ROOT, 'link', 'ws'));
 		GIT_SIBLING = listed.find((w) => w.path.endsWith('sib'))!.path;
 		GIT_INSIDE = listed.find((w) => w.path.endsWith(join('roots', 'inside')))!.path;
+		GIT_MAIN = listed.find((w) => !w.path.endsWith('sib') && !w.path.endsWith(join('roots', 'inside')))!.path;
 		// The premise of every assertion below: the path git prints is NOT the one a
 		// lexical `relative()` from the workspace would measure against.
 		expect(GIT_SIBLING).toBe(join(realpathSync(join(LINK_ROOT, 'real')), 'sib'));
+		// …and the workspace ITSELF has two spellings here, which is what makes the
+		// main-checkout case below reachable at all.
+		expect(GIT_MAIN).toBe(realpathSync(join(LINK_ROOT, 'link', 'ws')));
+		expect(GIT_MAIN).not.toBe(resolve(join(LINK_ROOT, 'link', 'ws')));
 		expect(relative(resolve(join(LINK_ROOT, 'link', 'ws')), GIT_SIBLING)).not.toBe('../sib');
 		expect(relative(resolve(join(LINK_ROOT, 'link', 'ws')), GIT_INSIDE)).not.toBe(join('roots', 'inside'));
 	});
@@ -313,6 +320,24 @@ describe('the two-namespace rule, over a SYMLINKED workspace', () => {
 		// The label every surface renders is that same one rule, so it agrees too.
 		expect(rootmod.isOutsideWorkspace(viaAbs!.dir)).toBe(false);
 		expect(rootmod.isOutsideWorkspace(rootmod.resolveRootDir(GIT_SIBLING)!.dir)).toBe(true);
+	});
+
+	it('THE MAIN CHECKOUT, exactly as git prints it, is NO ROOT — never kind:"worktree"', () => {
+		// `git worktree list`'s FIRST line is the main checkout, realpath'd, and this
+		// branch accepts absolute paths precisely so that a user can paste what git
+		// printed. Compared LEXICALLY, the "this declaration IS the workspace"
+		// short-circuit missed it here (the two namespaces differ), so it reached the
+		// worktree gate — which MATCHED, the main checkout being a listed worktree and
+		// nothing there excluding it. What came back was a root that IS the workspace,
+		// declared `../../../private/var/…` in a COMMITTED `.ipynb` and labelled
+		// `kind:'worktree'`: `initKernel` would run its external-root cwd verification
+		// against the workspace, and `setNotebookRootAndRestart` would write agent
+		// config INTO it — rewriting the very `<ws>/.mcp.json` that "an ordinary
+		// workspace launch is untouched" is a promise about.
+		expect(rootmod.resolveRootDir(GIT_MAIN)).toBeNull();
+		expect(rootmod.resolveRootDir(`${GIT_MAIN}/`)).toBeNull();
+		// The lexical spelling was always answered by the free fast path, and still is.
+		expect(rootmod.resolveRootDir(join(LINK_ROOT, 'link', 'ws'))).toBeNull();
 	});
 
 	it('RESOLVE FROM ..: the same declaration, and the SAME resolved directory', () => {
@@ -393,6 +418,21 @@ describe('the app-wide path guard is NOT what changed', () => {
 		expect(src).not.toMatch(/startsWith\([^)]*\+ sep\)/);
 		expect(src).not.toMatch(/function insideWorkspace/);
 		expect(src).toMatch(/resolveInWorkspace\(toRel\(dir\)\)/);
+	});
+
+	it('SOURCE GUARD: workspace IDENTITY is compared canonically, not only lexically', () => {
+		// The guard above watched the CONTAINMENT rule and nothing else, which is why
+		// the last lexical IDENTITY comparison in this module survived six rounds: it
+		// is a different question with the same failure mode, since git reports the
+		// main checkout realpath'd while Cellar's workspace is the lexical resolve. A
+		// bare `===` may be a fast path in front of the canonical test — identical
+		// strings really are the same directory — but it may never BE the test, so the
+		// canonical one is asserted present rather than the lexical one absent.
+		const src = readFileSync(new URL('../../src/lib/server/notebookRoot.ts', import.meta.url), 'utf8');
+		expect(src).toMatch(/canonDir === canonicalPath\(wsDir\)/);
+		// And the module has no OTHER workspace comparison that reads `ws()` inline: the
+		// two that decide something both go through `canonicalPath`/`isWorktreeAt`.
+		expect(src).not.toMatch(/[!=]== ws\(\)/);
 	});
 
 	it('SOURCE GUARD: no OTHER module keeps a copy of that containment rule either', () => {
