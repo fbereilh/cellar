@@ -207,16 +207,28 @@ test('pins the running + queued cells: streaming stays live and honest off-scree
 	// server-side. They sit far outside the window, so only the queued-head pin can
 	// keep them mounted. Their ids come from the server model — under windowing the
 	// DOM only knows the mounted cells.
-	const modelIds: string[] = await page.evaluate(async (nb) => {
+	//
+	// They must be CODE cells: only a code cell takes a queue slot, since the run
+	// route refuses a markdown or raw cell outright (a terminal `run:refused`
+	// frame, before `enqueueRun`) rather than sending its prose to the kernel. The
+	// generator emits a mix, so the indices are asserted rather than assumed - an
+	// index that drifted onto a markdown cell would make this test fail for a
+	// reason that has nothing to do with pinning.
+	const model: { id: string; cell_type: string }[] = await page.evaluate(async (nb) => {
 		const res = await fetch(`/api/notebooks?path=${encodeURIComponent(nb)}`);
 		const body = await res.json();
-		return body.notebook.cells.map((c: { id: string }) => c.id);
+		return body.notebook.cells.map((c: { id: string; cell_type: string }) => ({ id: c.id, cell_type: c.cell_type }));
 	}, NB);
+	const modelIds = model.map((c) => c.id);
 	expect(modelIds.length).toBe(CELL_COUNT);
 
-	const queuedA = modelIds[120];
-	const queuedB = modelIds[121];
-	const neverQueued = modelIds[124];
+	const [aIdx, bIdx, neverIdx] = [121, 122, 124];
+	for (const i of [aIdx, bIdx, neverIdx]) {
+		expect(model[i].cell_type, `cell ${i} must be a code cell for this test to mean anything`).toBe('code');
+	}
+	const queuedA = modelIds[aIdx];
+	const queuedB = modelIds[bIdx];
+	const neverQueued = modelIds[neverIdx];
 	await runOutOfBand(page, queuedA, 'import time\ntime.sleep(1)\nprint("queued A")\n');
 	await runOutOfBand(page, queuedB, 'import time\ntime.sleep(1)\nprint("queued B")\n');
 

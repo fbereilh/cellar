@@ -1806,7 +1806,12 @@
 		const cell = findCell(id);
 		if (!cell) return;
 		// Markdown "runs" by rendering client-side (in the Cell) — no kernel.
-		if (cell.cell_type === 'markdown') {
+		// A raw cell is verbatim text for a downstream tool and never executes at
+		// all; both persist the submitted source, which is what a Mod-Enter in such
+		// a cell should do. The server refuses either shape too (`run:refused`), so
+		// this is defence in depth - it only spares the round trip and the queue
+		// churn, and the authoritative rule stays on the server.
+		if (cell.cell_type !== 'code') {
 			await editCell(id, source);
 			return;
 		}

@@ -22,6 +22,16 @@ import { executeCellRun, clearOutputsForQueue } from '$lib/server/run';
  * queue ticket and the NDJSON stream: `onEvent` forwards the run lifecycle to the
  * initiating tab, which drops its own `originId`-tagged SSE echo and would
  * otherwise never learn its run started.
+ *
+ * ONLY A CODE CELL EXECUTES, and this route is where that is enforced for the
+ * HTTP entry point - MCP's `run_cell` refuses the same shape in `mcp/service.ts`.
+ * Two entry points, ONE rule, not two rules. Without it the route handed whatever
+ * source it was POSTed straight to the kernel: a raw cell (verbatim text for a
+ * downstream tool) sent its YAML frontmatter to Python, and the resulting
+ * `SyntaxError` was written into that cell's in-memory `outputs` where the UI
+ * showed it - then vanished on reload, because `serialize` drops outputs for any
+ * non-code cell. The submitted source is still SAVED first, so a `Mod-Enter` in a
+ * raw cell persists the edit rather than losing it.
  */
 export async function POST({ params, request }) {
 	const { source, nb, originId } = await request.json();
@@ -29,6 +39,21 @@ export async function POST({ params, request }) {
 
 	const canonicalNb = resolveNotebookPath(nb);
 	const cellId = params.id;
+
+	// Refused BEFORE `enqueueRun`, so a cell that can never execute never takes a
+	// queue slot. A terminal NDJSON frame at HTTP 200 rather than a 400: this route
+	// already answers "accepted but did not run" that way (`run:duplicate`,
+	// `run:cancelled`), and the client's reader ignores frame types it has no
+	// branch for - so `started` stays false, the outputs are untouched and no
+	// spinner is ever set, with no client change required for correctness.
+	const target = getCell(cellId, nb);
+	if (target && target.cell_type !== 'code') {
+		const refusal =
+			JSON.stringify({ type: 'run:refused', cellId, reason: 'not-a-code-cell', cell_type: target.cell_type }) + '\n';
+		return new Response(refusal, {
+			headers: { 'content-type': 'application/x-ndjson', 'cache-control': 'no-cache' }
+		});
+	}
 
 	const encoder = new TextEncoder();
 
