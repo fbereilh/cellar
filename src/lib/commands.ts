@@ -102,6 +102,7 @@ export function buildCommands({ notebook, app }: CommandContext): PaletteCommand
 		nb('insert-below', 'Insert cell below', 'Cells'),
 		nb('to-code', 'Change cell(s) to code', 'Cells'),
 		nb('to-markdown', 'Change cell(s) to Markdown', 'Cells'),
+		nb('to-raw', 'Change cell(s) to raw', 'Cells'),
 		nb('move-cell-up', 'Move selection up', 'Cells'),
 		nb('move-cell-down', 'Move selection down', 'Cells'),
 		nb('cut-cell', 'Cut cell(s)', 'Cells'),

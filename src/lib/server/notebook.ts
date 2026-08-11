@@ -1216,9 +1216,15 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
 
 /**
  * The in-place half of a type switch, shared by the single-cell setter and the
- * `setCellTypes` batch so the two can never diverge on the metadata rules
- * (markdown clears outputs; markdown/SQL drop the imports role and the export
- * flag, neither of which a non-Python cell may hold).
+ * `setCellTypes` batch so the two can never diverge on the metadata rules: any
+ * non-code type (markdown, raw) clears outputs and drops the `hide_input`
+ * report-view override, and anything holding no Python (those two plus SQL)
+ * drops the imports role and the nbdev export flag.
+ *
+ * `LiveNotebook.applyCellTypeLocally` is the browser's copy of exactly these
+ * rules - `cell:type` carries no metadata, so a client half that skipped one
+ * would keep drawing a badge the server has already stripped, with no event able
+ * to correct it before a reload. Two implementations, not one per call site.
  */
 function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	const isSql = cellType === 'sql';

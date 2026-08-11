@@ -1503,7 +1503,7 @@
 				<div class="pt-1">
 					{#each matchGroups as g (g.cellId)}
 						<button class="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left hover:bg-base-300/60" onclick={() => onScrollToCell(g.cellId)} data-testid="search-result">
-							<span class="badge badge-xs {g.cellType === 'markdown' ? 'badge-secondary' : 'badge-primary'} badge-soft">{g.cellType === 'markdown' ? 'md' : 'py'}</span>
+							<span class="badge badge-xs {g.cellType === 'markdown' ? 'badge-secondary' : g.cellType === 'raw' ? 'badge-ghost' : 'badge-primary'} badge-soft">{g.cellType === 'markdown' ? 'md' : g.cellType === 'raw' ? 'raw' : 'py'}</span>
 							<span class="min-w-0 grow truncate font-mono text-xs text-base-content/70">{g.snippet}</span>
 							{#if g.count > 1}
 								<span class="badge badge-ghost badge-xs shrink-0 tabular-nums" data-testid="search-result-count" title="{g.count} matches in this cell">{g.count}</span>

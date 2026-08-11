@@ -11,6 +11,10 @@
 // kernel never produced, the exact stale-output trap the run-metadata design
 // elsewhere avoids.
 //
+// `cell_type` is the nbformat type, so it now covers `raw` for free: copying a raw
+// cell pastes a raw cell, since the type IS what the entry carries. (Its verbatim
+// source rides along like any other; there are no outputs to drop.)
+//
 // That is NARROWER than what the add-cell API can now seed: `addCell` takes a
 // `cellar` namespace (see `seedCellar` in `server/notebook.ts`), which the undo
 // stack uses to bring a deleted cell back exactly - `language`, `role`, `export`,

@@ -19,6 +19,10 @@ function markdown(source: string): CellView {
 	return { id: Math.random().toString(36).slice(2), cell_type: 'markdown', source, outputs: [], metadata: {} };
 }
 
+function raw(source: string): CellView {
+	return { id: Math.random().toString(36).slice(2), cell_type: 'raw', source, outputs: [], metadata: {} };
+}
+
 const streamOut = (text: string): CellOutput => ({ output_type: 'stream', name: 'stdout', text });
 const imageOut = (b64: string): CellOutput => ({
 	output_type: 'display_data',
@@ -91,6 +95,39 @@ describe('renderNotebookHtml — per-cell hide_input overrides the notebook defa
 		expect(html).not.toContain('secret');
 		expect(html).not.toContain('class="cell-input"');
 		expect(html).toContain('code-hidden');
+	});
+});
+
+describe('renderNotebookHtml - raw cells', () => {
+	// The export shows what the notebook CONTAINS, so a raw cell is rendered - but
+	// muted and unhighlighted, since it is neither code nor prose.
+	it('renders a raw cell as a muted pre block', () => {
+		const html = renderNotebookHtml({ cells: [raw('---\ntitle: Post\n---'), code('x = 1')] });
+		expect(html).toContain('class="cell raw-cell"');
+		expect(html).toContain('pre class="code raw"');
+		expect(html).toContain('title: Post');
+		// No output block and no code-input block: a raw cell holds neither.
+		expect(html).not.toContain('<section class="cell raw-cell"><div class="cell-input"');
+	});
+
+	// The load-bearing one: a raw cell's source reaches the report ESCAPED. It is
+	// arbitrary text from a downloaded notebook, and this file is meant to be
+	// shared - rendering it as HTML would make the export an XSS surface.
+	it('escapes a raw cell rather than emitting it as HTML', () => {
+		const html = renderNotebookHtml({ cells: [raw('<script>alert(1)</script>\n<b>x</b>')] });
+		expect(html).not.toContain('<script>alert(1)</script>');
+		expect(html).not.toContain('<b>x</b>');
+		expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+	});
+
+	// Report view hides CODE inputs; a raw cell is not code, and dropping it would
+	// silently remove content from the report. It renders either way.
+	it('keeps a raw cell under report view, and drops an empty one', () => {
+		// Match the SECTION, not the string: the stylesheet always names the class.
+		expect(renderNotebookHtml({ cells: [raw('---\n---'), code('x = 1')], hideAllCode: true })).toContain(
+			'<section class="cell raw-cell">'
+		);
+		expect(renderNotebookHtml({ cells: [raw('   \n')] })).not.toContain('<section class="cell raw-cell">');
 	});
 });
 

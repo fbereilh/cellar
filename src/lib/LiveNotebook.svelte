@@ -6,7 +6,7 @@
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
-	import { isLogicalCellType, SQL_LANGUAGE } from '$lib/cellLanguage';
+	import { isLogicalCellType, nbCellType, SQL_LANGUAGE } from '$lib/cellLanguage';
 	import {
 		applyGesture,
 		extendSelection,
@@ -1542,7 +1542,13 @@
 			// drawing the imports/export badge over a cell the server had stripped, with
 			// no further event able to correct it before a reload.
 			const logical: LogicalCellType =
-				ev.cell_type === 'markdown' ? 'markdown' : ev.language === SQL_LANGUAGE ? 'sql' : 'code';
+				ev.cell_type === 'markdown'
+					? 'markdown'
+					: ev.cell_type === 'raw'
+						? 'raw'
+						: ev.language === SQL_LANGUAGE
+							? 'sql'
+							: 'code';
 			applyCellTypeLocally(ev.cellId, logical);
 		} else if (ev.type === 'cell:cleared') {
 			const cell = findCell(ev.cellId);
@@ -2026,21 +2032,24 @@
 		// 'code' clears that tag. Reassign metadata (the cell may have had no cellar
 		// namespace) so the SQL/Python grammar switch in Cell.svelte reacts.
 		const isSql = cellType === 'sql';
-		cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
+		cell.cell_type = nbCellType(cellType);
 		const cellar = { ...(cell.metadata?.cellar ?? {}) };
 		if (isSql) cellar.language = 'sql';
 		else delete cellar.language;
-		// The same two drops the server's `applyCellType` makes - neither the imports
-		// role nor the export flag may sit on a non-Python cell - mirrored here for the
+		// The same drops the server's `applyCellType` makes - neither the imports role
+		// nor the export flag may sit on a cell holding no Python, and a cell with no
+		// code input has no report-view override to keep - mirrored here for the
 		// `clampMoveIndex` reason: `cell:type` carries no metadata, so a client half
 		// that skipped them would keep drawing the imports/export badge over a cell the
 		// server has already stripped, with no event able to correct it before reload.
-		if (cell.cell_type === 'markdown' || isSql) {
+		const runnable = cell.cell_type === 'code' && !isSql;
+		if (!runnable) {
 			if (cellar.role === IMPORTS_ROLE) delete cellar.role;
 			if (cellar.export) delete cellar.export;
 		}
+		if (cell.cell_type !== 'code') delete cellar.hide_input;
 		cell.metadata = { ...(cell.metadata ?? {}), cellar };
-		if (cell.cell_type === 'markdown') cell.outputs = [];
+		if (cell.cell_type !== 'code') cell.outputs = [];
 	}
 
 	async function setType(id: string, cellType: LogicalCellType) {
@@ -3267,6 +3276,7 @@
 		'insert-below': () => insertCell('below'),
 		'to-markdown': () => setTypeSelection('markdown'),
 		'to-code': () => setTypeSelection('code'),
+		'to-raw': () => setTypeSelection('raw'),
 		'run-insert-below': () => runAndInsertBelow(),
 		'delete-cell': () => deleteSelection(),
 		'undo-delete': () => undoDelete(),
