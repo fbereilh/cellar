@@ -40,8 +40,11 @@ import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
  *                      `/Users/<you>/` is refused with nothing sent.
  *   - date tokens    → a BRACED token expands in the preview AND in what is sent,
  *                      while a brace that is NOT a token SAYS so instead of failing
- *                      silently (the reported bug), and the token buttons insert
- *                      the exact braced form so it never has to be guessed.
+ *                      silently (the reported bug), and each field's token dropdown
+ *                      inserts the exact braced form so it never has to be guessed.
+ *   - its own card   → the upload lives in a card of its own, separate from the
+ *                      cluster/connection card: it acts on workspace FILES and
+ *                      never touches compute.
  *
  * The server op (auth path, JUPYTER format, the exists check gating `import_`) is
  * proven in `tests/unit/databricks-upload-notebook.test.ts`. Here the routes are
@@ -632,7 +635,7 @@ test.describe('upload name affixes', () => {
 		);
 	});
 
-	test('a token chip inserts the BRACED token into the field last focused, at the caret', async ({
+	test("each field's token dropdown inserts the BRACED token into THAT field, at the caret", async ({
 		page
 	}) => {
 		await mockDatabricksStatus(page, connectedStatus);
@@ -647,49 +650,65 @@ test.describe('upload name affixes', () => {
 		await openDatabricksSection(page);
 
 		const { dashed, compact } = localToday();
-		const chip = (token: string) => page.locator(`[data-testid="databricks-upload-token"][data-token="${token}"]`);
+		const picker = (which: 'prefix' | 'postfix') =>
+			page.locator(`[data-testid="databricks-upload-token-select"][data-affix="${which}"]`);
+		const option = (which: 'prefix' | 'postfix', token: string) =>
+			picker(which).locator(`option[data-token="${token}"]`);
 		const prefix = page.getByTestId('databricks-upload-prefix');
 		const postfix = page.getByTestId('databricks-upload-postfix');
 		const preview = page.getByTestId('databricks-upload-preview');
 
-		// Every token the expander knows is offered, and each chip shows the token itself -
-		// the braces are the thing being taught, so they have to be what is on screen.
-		await expect(page.getByTestId('databricks-upload-token')).toHaveCount(UPLOAD_DATE_TOKENS.length);
-		await expect(chip('{YYYYMMDD}')).toHaveText('{YYYYMMDD}');
-		// The month stamps are offered in both spellings - a chip list that omitted the
-		// stamp people actually reach for is how the vocabulary got guessed in the first
-		// place.
-		await expect(chip('{YYYYMM}')).toHaveAttribute('title', `{YYYYMM} → ${compact.slice(0, 6)}`);
-		await expect(chip('{YYYY-MM}')).toHaveAttribute('title', `{YYYY-MM} → ${dashed.slice(0, 7)}`);
-		// …and each says what it will become, so it reads as "insert today's date".
-		await expect(chip('{YYYYMMDD}')).toHaveAttribute('title', `{YYYYMMDD} → ${compact}`);
+		// One dropdown per field - which is the point of the per-field control: the target
+		// is NAMED rather than inferred from whichever field was last focused.
+		await expect(page.getByTestId('databricks-upload-token-select')).toHaveCount(2);
+		// Every token the expander knows is offered in each, and each option shows the
+		// token itself - the braces are the thing being taught, so they have to be what is
+		// on screen - beside the date it becomes, so it reads as "insert today's date".
+		for (const which of ['prefix', 'postfix'] as const) {
+			await expect(picker(which).locator('option[data-token]')).toHaveCount(UPLOAD_DATE_TOKENS.length);
+		}
+		await expect(option('prefix', '{YYYYMMDD}')).toHaveText(`{YYYYMMDD} → ${compact}`);
+		// The month stamps are offered in both spellings - a list that omitted the stamp
+		// people actually reach for is how the vocabulary got guessed in the first place.
+		await expect(option('prefix', '{YYYYMM}')).toHaveText(`{YYYYMM} → ${compact.slice(0, 6)}`);
+		await expect(option('prefix', '{YYYY-MM}')).toHaveText(`{YYYY-MM} → ${dashed.slice(0, 7)}`);
 
-		// Nothing focused yet: the click still lands somewhere predictable (the prefix).
-		await chip('{YYYY-MM-DD}').click();
+		// Nothing focused yet: the pick lands in the field this dropdown belongs to.
+		await picker('prefix').selectOption('{YYYY-MM-DD}');
 		await expect(prefix).toHaveValue('{YYYY-MM-DD}');
 		// The FIELD keeps the token - it is a reusable pattern that outlives today - while
 		// the preview beside it resolves it. Storing the expansion instead would upload
 		// under a stale date tomorrow.
 		await expect(preview).toHaveText(`${dashed}notebook`);
+		// The select is an ACTION, not a value: it snaps back to its placeholder, so it
+		// never reads as "the affix is {YYYY-MM-DD}" and the same token can be picked again.
+		await expect(picker('prefix')).toHaveValue('');
 
-		// A chip continues where the caret is, not at the end: typing `_` after the first
-		// insert and clicking again must read `{YYYY-MM-DD}_{DD}`.
+		// A pick continues where the caret is, not at the end: typing `_` after the first
+		// insert and picking again must read `{YYYY-MM-DD}_{DD}`.
 		await prefix.press('End');
 		await prefix.pressSequentially('_');
-		await chip('{DD}').click();
+		await picker('prefix').selectOption('{DD}');
 		await expect(prefix).toHaveValue('{YYYY-MM-DD}_{DD}');
 
-		// The target FOLLOWS focus: after touching the postfix, the chips write there.
-		await postfix.click();
-		await chip('{YYYYMMDD}').click();
+		// The postfix dropdown writes the POSTFIX, whatever was focused last - it is the
+		// prefix that has focus here, and it must be left alone.
+		await picker('postfix').selectOption('{YYYYMMDD}');
 		await expect(postfix).toHaveValue('{YYYYMMDD}');
 		await expect(prefix).toHaveValue('{YYYY-MM-DD}_{DD}');
+
+		// Free text and a picked token compose: typing after a pick appends to it rather
+		// than being swallowed, so the field stays fully editable by hand.
+		await postfix.press('End');
+		await postfix.pressSequentially('_v2');
+		await expect(postfix).toHaveValue('{YYYYMMDD}_v2');
+		await postfix.fill('{YYYYMMDD}');
 
 		const promised = await preview.textContent();
 		expect(promised).toBe(`${dashed}_${dashed.slice(-2)}notebook${compact}`);
 
-		// And a chip-built affix uploads exactly as a typed one does - same single path,
-		// so what the preview promised is what the wire carries.
+		// And a dropdown-built affix uploads exactly as a typed one does - same single
+		// path, so what the preview promised is what the wire carries.
 		await page.getByTestId('databricks-upload').click();
 		await expect.poll(() => seen.length).toBe(1);
 		expect(seen[0].prefix).toBe(`${dashed}_${dashed.slice(-2)}`);
@@ -706,15 +725,53 @@ test.describe('upload name affixes', () => {
 		await openDatabricksSection(page);
 
 		// The reported failure was someone guessing the syntax, and a `title` is not
-		// something anyone finds before typing. The braces requirement has to be readable
-		// without hovering anything.
-		await expect(page.getByTestId('databricks-upload-token-hint')).toBeVisible();
-		const chips = page.getByTestId('databricks-upload-token');
-		await expect(chips.first()).toBeVisible();
-		// A real, reachable button - not a decorative span someone has to guess is live.
-		await expect(chips.first()).toBeEnabled();
-		expect(await chips.first().evaluate((el) => el.tagName)).toBe('BUTTON');
-		expect(await chips.first().getAttribute('aria-label')).toContain('Insert');
+		// something anyone finds before typing. That the tokens exist, that they need
+		// braces, and where to get them has to be readable without hovering anything -
+		// the vocabulary itself may sit one click inside the dropdown, but the pointer to
+		// it may not.
+		const hint = page.getByTestId('databricks-upload-token-hint');
+		await expect(hint).toBeVisible();
+		await expect(hint).toContainText('braces');
+		await expect(hint).toContainText('dropdown');
+
+		// A real, reachable control - not a decorative span someone has to guess is live.
+		const picker = page.getByTestId('databricks-upload-token-select').first();
+		await expect(picker).toBeVisible();
+		await expect(picker).toBeEnabled();
+		expect(await picker.evaluate((el) => el.tagName)).toBe('SELECT');
+		expect(await picker.getAttribute('aria-label')).toContain('Insert');
+	});
+
+	test('the upload is its OWN card, separate from the cluster card', async ({ page }) => {
+		await mockDatabricksStatus(page, connectedStatus);
+		await mockDatabricksClusters(page);
+
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await openNotebook(page);
+		await openDatabricksSection(page);
+
+		// Sending a notebook to the workspace is not a connection control: it touches
+		// FILES and never compute, and it carries enough of its own UI (two fields, their
+		// dropdowns, a preview, a two-step replace confirm) that nested inside the cluster
+		// card it read as more cluster controls.
+		const card = page.getByTestId('databricks-upload-card');
+		await expect(card).toBeVisible();
+		await expect(card).toContainText('upload');
+		await expect(card.getByTestId('databricks-upload')).toBeVisible();
+		await expect(card.getByTestId('databricks-upload-prefix')).toBeVisible();
+
+		// Genuinely separate: the cluster card neither contains it nor any of its parts,
+		// and the connection's own controls stay where they were.
+		const cluster = page.getByTestId('databricks-connected');
+		await expect(cluster).toBeVisible();
+		await expect(cluster.getByTestId('databricks-upload-card')).toHaveCount(0);
+		await expect(cluster.getByTestId('databricks-upload')).toHaveCount(0);
+		await expect(cluster.getByTestId('databricks-switch')).toBeVisible();
+		await expect(cluster.getByTestId('databricks-disconnect')).toBeVisible();
+
+		// …and it is a sibling of the Runtime card, in the same card language.
+		await expect(page.getByTestId('databricks-runtime-card')).toBeVisible();
+		expect(await card.evaluate((el) => el.className)).toContain('rounded-lg');
 	});
 
 	test('the last-used prefix/postfix survive a reload', async ({ page }) => {

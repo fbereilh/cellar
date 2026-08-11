@@ -33,8 +33,9 @@
  * rather than one that never will - so a spelling that was never supported was
  * reported, twice, as an expander that was broken. Two things answer that and both
  * must stay: `unknownDateTokens` below, which lets the UI NAME an unrecognized run,
- * and the UI's token buttons, which insert the braced form so the vocabulary never
- * has to be guessed. The month stamps `{YYYYMM}`/`{YYYY-MM}` were added for the same
+ * and the UI's token controls (a dropdown per field in the Databricks sidebar, a row
+ * of chips in Settings), which insert the braced form so the vocabulary never has to
+ * be guessed. The month stamps `{YYYYMM}`/`{YYYY-MM}` were added for the same
  * reason: both are unambiguous (contractions of the day stamps, on the identical
  * convention) and are what people actually reach for. That is not licence to admit a
  * spelling whose meaning could be read two ways - `{mm}` is still refused for
@@ -209,9 +210,9 @@ export interface TokenInsertion {
  * The braces are REQUIRED by the expander and deliberately stay so - bare `MM`/`DD`
  * collide with ordinary words, so `march` cannot be allowed to become `03arch`. That
  * makes the syntax something a user has to be TOLD rather than guess, which is what
- * the token chips exist for, and this is the rule behind them: whatever the field
- * already holds, the text a chip adds is the exact braced form `expandDateTokens`
- * recognises, so a chip can never insert something that then fails to expand.
+ * the token controls exist for, and this is the rule behind them: whatever the field
+ * already holds, the text a pick adds is the exact braced form `expandDateTokens`
+ * recognises, so one can never insert something that then fails to expand.
  *
  * A null/absent caret means the field is not being edited (nothing focused it yet),
  * and the token APPENDS - the affix is read left to right, so appending is what

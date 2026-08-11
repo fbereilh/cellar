@@ -1191,7 +1191,7 @@
 		uploadNameError ? [] : unknownAffixTokens({ prefix: uploadPrefix, postfix: uploadPostfix }, uploadNow)
 	);
 	const uploadTokenWarning = $derived(
-		unknownTokenWarning(uploadUnknownTokens, 'The buttons below are the ones that expand.')
+		unknownTokenWarning(uploadUnknownTokens, 'The dropdown beside each field lists the ones that expand.')
 	);
 	/** Ties that reason to both affix fields, so it is announced and not merely shown. */
 	const uploadNameErrorId = $props.id();
@@ -1274,46 +1274,66 @@
 	}
 
 	/**
-	 * The two affix inputs, and which of them a token chip writes into.
+	 * The two affix inputs, so a token pick can be written AT THE CARET.
 	 *
-	 * The chips need the ELEMENT, not just the state: the insertion point is the
-	 * caret, which only the DOM node knows, and the caret has to be put back after
-	 * the write or a second chip click would append to the end of what the first one
+	 * The token dropdowns need the ELEMENT, not just the state: the insertion point is
+	 * the caret, which only the DOM node knows, and the caret has to be put back after
+	 * the write or a second pick would append to the end of what the first one
 	 * inserted instead of continuing where the user was.
 	 *
-	 * The target follows FOCUS and is remembered after it - a chip is a button, so
-	 * clicking one necessarily takes focus away from the field it is meant to write
-	 * into, and "the field you were last in" is the only reading of that gesture that
-	 * matches what the user is looking at. It starts on the prefix so the very first
-	 * click (nothing focused yet) still lands somewhere predictable rather than
-	 * doing nothing.
+	 * There is no "which field was last focused" any more: each affix carries its OWN
+	 * dropdown, so the target is named by the control rather than inferred from focus.
+	 * That is what the per-field control buys beyond looks - the previous shared button
+	 * row had to guess, and guessed wrong for anyone who reached for it before touching
+	 * a field.
 	 */
 	let uploadPrefixEl = $state<HTMLInputElement | null>(null);
 	let uploadPostfixEl = $state<HTMLInputElement | null>(null);
-	let uploadTokenTarget = $state<'prefix' | 'postfix'>('prefix');
 
 	/**
-	 * Insert a date token into the affix field the user was last in, at the caret.
+	 * Insert a date token into `which` affix, at that field's caret.
 	 *
 	 * The braces are what the expander recognises and they are easy to miss (the
 	 * placeholder is the only other place they appear, and a placeholder disappears
-	 * the moment anything is typed) - so the chips are how the syntax is LEARNED:
-	 * clicking one writes the exact braced form, which the preview immediately
-	 * resolves, and after seeing that once the user can type the rest by hand.
+	 * the moment anything is typed) - so the dropdown is how the syntax is LEARNED:
+	 * picking an option writes the exact braced form, which the preview immediately
+	 * resolves, and after seeing that once the user can type the rest by hand. Each
+	 * option names its live expansion beside the token, so the vocabulary AND what it
+	 * becomes are read together.
 	 *
 	 * The field keeps the TOKEN, never its expansion: it is a reusable pattern that
 	 * persists between sessions, so a field holding today's literal date would upload
 	 * under a stale name tomorrow - the one failure the tokens exist to prevent.
+	 *
+	 * INSERT rather than replace, which is what keeps the field "fully editable by
+	 * hand": a pick lands beside whatever is already typed (`{YYYY-MM}` then `_` then
+	 * `{DD}`), and an affix built entirely by hand is never overwritten by reaching for
+	 * one token.
 	 */
-	function insertUploadDateToken(token: string) {
-		if (uploadConfirmBusy) return;
-		const which = uploadTokenTarget;
+	function insertUploadDateToken(which: 'prefix' | 'postfix', token: string) {
+		if (uploadConfirmBusy || !token) return;
 		insertTokenIntoField(
 			which === 'prefix' ? uploadPrefixEl : uploadPostfixEl,
 			which === 'prefix' ? uploadPrefix : uploadPostfix,
 			token,
 			(value) => setUploadAffix(which, value)
 		);
+	}
+
+	/**
+	 * A token picked from an affix's dropdown.
+	 *
+	 * The select is an ACTION, not a value: it holds no state of its own, so it is
+	 * reset to its placeholder immediately. Without that reset the same token could not
+	 * be picked twice in a row (no `change` fires when the value does not move), and
+	 * the closed control would sit there reading like a setting - claiming one token is
+	 * "the" affix while the field beside it says otherwise.
+	 */
+	function onUploadTokenPick(which: 'prefix' | 'postfix', e: Event) {
+		const el = e.currentTarget as HTMLSelectElement;
+		const token = el.value;
+		el.value = '';
+		insertUploadDateToken(which, token);
 	}
 
 	/**
@@ -1970,177 +1990,215 @@
 {/snippet}
 
 <!--
+  The date-token picker for ONE affix field.
+
+  A dropdown rather than the row of chips this replaced, for two reasons beyond
+  looks. It is PER FIELD, so the target is named by the control instead of
+  inferred from "the field you were last in" - which guessed wrong for anyone who
+  reached for a token before touching a field. And it scales with the vocabulary:
+  seven chips already wrapped to three lines in a narrow sidebar, ahead of the
+  Upload button they were pushing off screen.
+
+  It is an ACTION, not a value: `onUploadTokenPick` resets it the instant it
+  fires, so the closed control never reads as a setting and the same token can be
+  picked twice running. The affix stays free text throughout - a pick INSERTS at
+  the caret, so it composes with whatever is typed and never overwrites it.
+
+  Driven off `UPLOAD_DATE_TOKENS` with each expansion computed live, so what is
+  offered - and what it claims to become - cannot drift from what the expander does.
+-->
+{#snippet tokenSelect(which: 'prefix' | 'postfix')}
+	<!-- `min-w-0` is load-bearing, not tidiness: daisyUI gives `.select` a 10rem
+	     min-width, which at the sidebar's narrower widths won the flex row outright and
+	     squeezed the affix input beside it to zero. The explicit width is what the
+	     placeholder needs and nothing more; the field keeps the rest of the row. -->
+	<select
+		class="select select-xs select-bordered h-5 w-[4.75rem] min-h-0 min-w-0 shrink-0 py-0 pe-5 ps-1.5 text-[10px] text-base-content/60"
+		value=""
+		onchange={(e) => onUploadTokenPick(which, e)}
+		disabled={uploadConfirmBusy}
+		title={uploadTokenHelp}
+		aria-label="Insert a date token into the {which}"
+		data-testid="databricks-upload-token-select"
+		data-affix={which}
+	>
+		<option value="">token</option>
+		{#each UPLOAD_DATE_TOKENS as token (token)}
+			<option value={token} data-testid="databricks-upload-token" data-token={token}>
+				{token} → {expandDateTokens(token, uploadNow)}
+			</option>
+		{/each}
+	</select>
+{/snippet}
+
+<!--
   Copy the open notebook into the connected user's own workspace folder
   (/Users/<you>/) as a real Databricks notebook.
 
-  Shown only on the CONNECTED card: the upload authenticates as the live
+  Its OWN card, beside the Cluster and Runtime cards rather than tucked under
+  Switch/Disconnect: it is a workspace-FILES action - it never starts, stops or
+  restarts a cluster - and it carries its own inputs, preview and two-step replace
+  confirm, which inside the connection card read as more connection controls.
+
+  Still rendered only while CONNECTED: the upload authenticates as the live
   connection's own identity, so without one there is no user folder to resolve
-  and nothing to upload as. It is a workspace-FILES action - it never starts,
-  stops or restarts a cluster - which is why it sits with Switch/Disconnect
-  rather than in the Runtime card.
+  and nothing to upload as.
 
   Overwriting is a second, deliberate click. The first attempt sends no
   overwrite flag; a notebook already at that path comes back untouched as
   `exists`, which arms this confirm.
 -->
-{#snippet uploadRow()}
-	<!-- Optional affixes around the notebook's own name, with the resolved name shown
-	     BEFORE the click: the preview and the upload resolve through the one shared
-	     `resolveUploadName`, so what is read here is what lands in the workspace.
-	     Both empty is the original behaviour - `/Users/<you>/<notebook>`. -->
-	<div class="mt-1.5 grid grid-cols-2 gap-1">
-		<label class="flex flex-col gap-0.5">
-			<span class="text-[10px] text-base-content/50">Prefix</span>
-			<input
-				bind:this={uploadPrefixEl}
-				class="input input-xs w-full font-mono text-[10px]"
-				value={uploadPrefix}
-				oninput={(e) => onUploadAffixInput('prefix', e)}
-				onfocus={() => (uploadTokenTarget = 'prefix')}
-				disabled={uploadConfirmBusy}
-				placeholder="{'{YYYY-MM-DD}'}_"
-				title={uploadTokenHelp}
-				aria-invalid={!!uploadNameError}
-				aria-describedby={uploadNameError ? uploadNameErrorId : undefined}
-				data-testid="databricks-upload-prefix"
-			/>
-		</label>
-		<label class="flex flex-col gap-0.5">
-			<span class="text-[10px] text-base-content/50">Postfix</span>
-			<input
-				bind:this={uploadPostfixEl}
-				class="input input-xs w-full font-mono text-[10px]"
-				value={uploadPostfix}
-				oninput={(e) => onUploadAffixInput('postfix', e)}
-				onfocus={() => (uploadTokenTarget = 'postfix')}
-				disabled={uploadConfirmBusy}
-				placeholder="_{'{YYYYMMDD}'}"
-				title={uploadTokenHelp}
-				aria-invalid={!!uploadNameError}
-				aria-describedby={uploadNameError ? uploadNameErrorId : undefined}
-				data-testid="databricks-upload-postfix"
-			/>
-		</label>
-	</div>
-	{#if uploadNameError}
-		<!-- Linked to BOTH fields, not merely rendered beside them: the refusal disables
-		     the button, so a reader tabbing off the field lands on a control that says
-		     nothing, and this sentence is the whole reason the upload did not happen. -->
-		<p
-			id={uploadNameErrorId}
-			class="mt-1 text-[11px] leading-relaxed text-error"
-			data-testid="databricks-upload-name-error"
-		>
-			{uploadNameError}
-		</p>
-	{:else if uploadPreview}
-		<p class="mt-1 text-[10px] leading-snug text-base-content/50">
-			Uploads as
-			<span class="font-mono text-base-content/70 [overflow-wrap:anywhere]" data-testid="databricks-upload-preview"
-				>{uploadPreview}</span
-			>
-		</p>
-	{/if}
-	{#if uploadTokenWarning}
-		<!-- Says what the preview alone could not: this brace is never going to become a
-		     date. It sits directly under the preview that shows it landing literally, and
-		     above the buttons that are the remedy - and it stays a WARNING, because the
-		     name is legal and `{FOO}` may be exactly what someone means. -->
-		<p
-			class="mt-1 text-[10px] leading-snug text-warning"
-			role="status"
-			data-testid="databricks-upload-token-warning"
-		>
-			{uploadTokenWarning}
-		</p>
-	{/if}
-	<!-- The token vocabulary, VISIBLE rather than hidden in a `title`. The braces are
-	     required (bare `MM`/`DD` would collide with ordinary words, so they can never be
-	     optional) and the SET is small and case-sensitive - which is the part that has to
-	     be discoverable: the reported failure was someone who had seen a token work
-	     reasonably guessing a spelling that does not exist, and a tooltip is not something
-	     anyone finds before typing. Each button writes its exact braced form into the
-	     field last focused and names its live expansion, so it reads as "click to insert
-	     today's date". Driven off `UPLOAD_DATE_TOKENS`, so what is offered cannot drift
-	     from what the expander knows. The preview above is the live worked example, which
-	     is why there is no second one spelled out down here. -->
-	<div class="mt-1 flex flex-wrap items-center gap-1">
-		<span
-			class="text-[10px] leading-snug text-base-content/50"
-			data-testid="databricks-upload-token-hint"
-		>
-			Date tokens (braces needed) - click to insert:
-		</span>
-		{#each UPLOAD_DATE_TOKENS as token (token)}
-			<button
-				type="button"
-				class="btn btn-ghost btn-xs h-4 min-h-0 rounded border border-base-300 px-1 font-mono text-[10px] font-normal text-base-content/70"
-				onmousedown={(e) => e.preventDefault()}
-				onclick={() => insertUploadDateToken(token)}
-				disabled={uploadConfirmBusy}
-				title="{token} → {expandDateTokens(token, uploadNow)}"
-				aria-label="Insert {token} into the {uploadTokenTarget}, which becomes {expandDateTokens(
-					token,
-					uploadNow
-				)}"
-				data-testid="databricks-upload-token"
-				data-token={token}
-			>
-				{token}
-			</button>
-		{/each}
-	</div>
-	<div class="mt-1.5">
-		{#if uploadExistsPath}
-			<div class="rounded border border-warning/40 bg-warning/10 px-2 py-1.5" data-testid="databricks-upload-confirm-box">
-				<p class="text-[11px] leading-relaxed text-base-content/80">A notebook already exists in your workspace at</p>
-				<p class="font-mono text-[10px] leading-snug text-base-content/70 [overflow-wrap:anywhere]">{uploadExistsPath}</p>
-				<p class="mt-1 text-[11px] leading-relaxed text-base-content/80">
-					Replacing it overwrites that notebook in Databricks - its cells and outputs are lost.
-				</p>
-				<div class="mt-1.5 flex justify-end gap-1">
-					<button
-						class="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[11px] font-normal text-base-content/60"
-						onclick={clearUploadFeedback}
+{#snippet uploadCard()}
+	<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-upload-card">
+		{@render cardLabel('upload')}
+		<!-- Optional affixes around the notebook's own name, with the resolved name shown
+		     BEFORE the click: the preview and the upload resolve through the one shared
+		     `resolveUploadName`, so what is read here is what lands in the workspace.
+		     Both empty is the original behaviour - `/Users/<you>/<notebook>`. -->
+		<div class="mt-1.5 space-y-1.5">
+			<!-- The dropdown is a SIBLING of the label, not inside it: a label takes its
+			     first labelable descendant, so nesting both would leave the select silently
+			     unassociated while looking associated. It carries its own `aria-label`. -->
+			<div class="flex items-end gap-1">
+				<label class="block min-w-0 flex-1">
+					<span class="text-[10px] text-base-content/50">Prefix</span>
+					<input
+						bind:this={uploadPrefixEl}
+						class="input input-xs input-bordered mt-0.5 h-5 min-h-0 w-full py-0 font-mono text-[10px]"
+						value={uploadPrefix}
+						oninput={(e) => onUploadAffixInput('prefix', e)}
 						disabled={uploadConfirmBusy}
-						data-testid="databricks-upload-cancel"
-					>
-						Cancel
-					</button>
-					<button
-						class="btn btn-warning btn-xs h-5 min-h-0 px-1.5 text-[11px]"
-						onclick={() => uploadToWorkspace(true, uploadExistsAffixes ?? undefined)}
-						disabled={uploadConfirmBusy}
-						data-testid="databricks-upload-replace"
-					>
-						{#if busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Replacing…{:else}Replace{/if}
-					</button>
-				</div>
+						placeholder="{'{YYYY-MM-DD}'}_"
+						title={uploadTokenHelp}
+						aria-invalid={!!uploadNameError}
+						aria-describedby={uploadNameError ? uploadNameErrorId : undefined}
+						data-testid="databricks-upload-prefix"
+					/>
+				</label>
+				{@render tokenSelect('prefix')}
 			</div>
-		{:else}
-			<button
-				class="btn btn-outline btn-xs w-full"
-				onclick={() => uploadToWorkspace(false)}
-				disabled={!connected || uploadConfirmBusy || !!uploadNameError}
-				title="Copy this notebook into /Users/<you>/ in the connected Databricks workspace"
-				data-testid="databricks-upload"
+			<div class="flex items-end gap-1">
+				<label class="block min-w-0 flex-1">
+					<span class="text-[10px] text-base-content/50">Postfix</span>
+					<input
+						bind:this={uploadPostfixEl}
+						class="input input-xs input-bordered mt-0.5 h-5 min-h-0 w-full py-0 font-mono text-[10px]"
+						value={uploadPostfix}
+						oninput={(e) => onUploadAffixInput('postfix', e)}
+						disabled={uploadConfirmBusy}
+						placeholder="_{'{YYYYMMDD}'}"
+						title={uploadTokenHelp}
+						aria-invalid={!!uploadNameError}
+						aria-describedby={uploadNameError ? uploadNameErrorId : undefined}
+						data-testid="databricks-upload-postfix"
+					/>
+				</label>
+				{@render tokenSelect('postfix')}
+			</div>
+		</div>
+		{#if uploadNameError}
+			<!-- Linked to BOTH fields, not merely rendered beside them: the refusal disables
+			     the button, so a reader tabbing off the field lands on a control that says
+			     nothing, and this sentence is the whole reason the upload did not happen. -->
+			<p
+				id={uploadNameErrorId}
+				class="mt-1 text-[11px] leading-relaxed text-error"
+				data-testid="databricks-upload-name-error"
 			>
-				{#if busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Uploading…{:else}Upload notebook to workspace{/if}
-			</button>
+				{uploadNameError}
+			</p>
+		{:else if uploadPreview}
+			<p class="mt-1 text-[10px] leading-snug text-base-content/50">
+				Uploads as
+				<span class="font-mono text-base-content/70 [overflow-wrap:anywhere]" data-testid="databricks-upload-preview"
+					>{uploadPreview}</span
+				>
+			</p>
 		{/if}
-	</div>
-	{#if uploadDone}
-		<div class="mt-1.5 text-[11px] leading-relaxed text-base-content/70" data-testid="databricks-upload-note">
-			<p>{uploadDone.headline}</p>
-			<!-- Its own line, in mono: the path is the answer to "where did it go", and in
-			     this width it cannot share a line with prose without breaking mid-segment. -->
-			<p class="font-mono text-[10px] text-base-content/60 [overflow-wrap:anywhere]">{uploadDone.path}</p>
-			{#if uploadDone.url}
-				<a class="link link-primary" href={uploadDone.url} target="_blank" rel="noreferrer noopener" data-testid="databricks-upload-link">Open in Databricks</a>
+		{#if uploadTokenWarning}
+			<!-- Says what the preview alone could not: this brace is never going to become a
+			     date. It sits directly under the preview that shows it landing literally, and
+			     names the dropdowns beside the fields as the remedy - and it stays a WARNING,
+			     because the name is legal and `{FOO}` may be exactly what someone means. -->
+			<p
+				class="mt-1 text-[10px] leading-snug text-warning"
+				role="status"
+				data-testid="databricks-upload-token-warning"
+			>
+				{uploadTokenWarning}
+			</p>
+		{/if}
+		<!-- That the tokens EXIST, and that the braces are part of them, stays VISIBLE rather
+		     than living only inside the dropdown or a `title`: the reported failure was
+		     someone who had seen a token work reasonably guessing a spelling that does not
+		     exist, and neither a tooltip nor a closed select is something anyone finds
+		     before typing. The vocabulary itself is one click away in the dropdown beside
+		     each field (which is also where each token's live expansion is spelled out), and
+		     both fields remain free text - the dropdown adds a token, it never owns the
+		     value. The preview above is the live worked example, which is why there is no
+		     second one spelled out down here.
+
+		     It YIELDS to the token warning, exactly as that warning yields to
+		     `uploadNameError`: the warning names the same dropdown as the remedy, so both
+		     at once is one sentence of standing advice restating the specific one directly
+		     above it - and it is the specific one the user needs to read. -->
+		{#if !uploadTokenWarning}
+			<p class="mt-1 text-[10px] leading-snug text-base-content/50" data-testid="databricks-upload-token-hint">
+				Type any name. Date tokens (braces needed) are in the dropdown beside each field.
+			</p>
+		{/if}
+		<div class="mt-1.5">
+			{#if uploadExistsPath}
+				<div class="rounded border border-warning/40 bg-warning/10 px-2 py-1.5" data-testid="databricks-upload-confirm-box">
+					<p class="text-[11px] leading-relaxed text-base-content/80">A notebook already exists in your workspace at</p>
+					<p class="font-mono text-[10px] leading-snug text-base-content/70 [overflow-wrap:anywhere]">{uploadExistsPath}</p>
+					<p class="mt-1 text-[11px] leading-relaxed text-base-content/80">
+						Replacing it overwrites that notebook in Databricks - its cells and outputs are lost.
+					</p>
+					<div class="mt-1.5 flex justify-end gap-1">
+						<button
+							class="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[11px] font-normal text-base-content/60"
+							onclick={clearUploadFeedback}
+							disabled={uploadConfirmBusy}
+							data-testid="databricks-upload-cancel"
+						>
+							Cancel
+						</button>
+						<button
+							class="btn btn-warning btn-xs h-5 min-h-0 px-1.5 text-[11px]"
+							onclick={() => uploadToWorkspace(true, uploadExistsAffixes ?? undefined)}
+							disabled={uploadConfirmBusy}
+							data-testid="databricks-upload-replace"
+						>
+							{#if busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Replacing…{:else}Replace{/if}
+						</button>
+					</div>
+				</div>
+			{:else}
+				<button
+					class="btn btn-outline btn-xs w-full"
+					onclick={() => uploadToWorkspace(false)}
+					disabled={!connected || uploadConfirmBusy || !!uploadNameError}
+					title="Copy this notebook into /Users/<you>/ in the connected Databricks workspace"
+					data-testid="databricks-upload"
+				>
+					{#if busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Uploading…{:else}Upload notebook to workspace{/if}
+				</button>
 			{/if}
 		</div>
-	{/if}
-	{#if uploadError}{@render errorBox(uploadError, 'databricks-upload-error')}{/if}
+		{#if uploadDone}
+			<div class="mt-1.5 text-[11px] leading-relaxed text-base-content/70" data-testid="databricks-upload-note">
+				<p>{uploadDone.headline}</p>
+				<!-- Its own line, in mono: the path is the answer to "where did it go", and in
+				     this width it cannot share a line with prose without breaking mid-segment. -->
+				<p class="font-mono text-[10px] text-base-content/60 [overflow-wrap:anywhere]">{uploadDone.path}</p>
+				{#if uploadDone.url}
+					<a class="link link-primary" href={uploadDone.url} target="_blank" rel="noreferrer noopener" data-testid="databricks-upload-link">Open in Databricks</a>
+				{/if}
+			</div>
+		{/if}
+		{#if uploadError}{@render errorBox(uploadError, 'databricks-upload-error')}{/if}
+	</div>
 {/snippet}
 
 {#snippet cardLabel(text: string)}
@@ -2559,8 +2617,10 @@
 			{#if installError}{@render errorBox(installError, 'databricks-install-error')}{/if}
 		</div>
 
-		<!-- 3. Ready: the connection (Cluster card) + a separate Runtime card + the
-		     subordinate Unity Catalog browser. Two clearly separated cards. -->
+		<!-- 3. Ready: the connection (Cluster card) + a separate Upload card + a separate
+		     Runtime card + the subordinate Unity Catalog browser. Three clearly separated
+		     cards, one concern each: what we are connected to, what we send to the
+		     workspace, and what the kernel advertises. -->
 	{:else}
 		<div class="space-y-2">
 			{#if busy === 'connect' || (expectedRestart && !runtimeApplying)}
@@ -2627,7 +2687,6 @@
 							{#if busy === 'disconnect'}<span class="loading loading-spinner loading-xs"></span>{:else}Disconnect{/if}
 						</button>
 					</div>
-					{@render uploadRow()}
 					{@render logoutRow(true)}
 					{#if switching}
 						<div class="mt-2 border-t border-base-300 pt-2">
@@ -2635,6 +2694,12 @@
 						</div>
 					{/if}
 				</div>
+
+				<!-- Upload card: its own card, not a row inside the connection - it acts on
+				     workspace FILES, and it carries enough of its own controls (two fields,
+				     their token dropdowns, a preview and a two-step replace confirm) that
+				     nested under Switch/Disconnect they read as more connection controls. -->
+				{@render uploadCard()}
 
 				<!-- Runtime card: a SEPARATE card from the connection (requirement #1). -->
 				{@render runtimeCard()}
