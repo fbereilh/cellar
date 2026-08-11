@@ -107,16 +107,26 @@ export interface WorktreeAgentConfig {
 	warning?: string;
 }
 
-/** The harnesses whose config file is `.mcp.json`, minus any this launch excludes. */
-function targetHarnesses(): string[] {
-	// `--no-mcp-config` is threaded to the app as CELLAR_NO_MCP_CONFIG, and the
-	// harness it excludes is DERIVED from the registry rather than pinned by name —
-	// the same rule the launch-path write follows.
+/**
+ * Every harness this WORKSPACE allow-lists, and which of them this launch writes.
+ *
+ * NOT "the `.mcp.json` harnesses": `names` is whatever the workspace allows, so a
+ * workspace where the user ran `cellar harness add codex` addresses
+ * `.codex/config.toml` here too - which is the several-harness case `warnings()`
+ * and `summarize()` below exist for. `--no-mcp-config` is the only thing that
+ * subtracts, and it subtracts exactly the harnesses whose config file IS
+ * `.mcp.json`, DERIVED from the registry rather than pinned by name (the same rule
+ * the launch-path write follows).
+ *
+ * `allowed` rides along so the caller can tell an empty `names` caused by the flag
+ * from one that was empty anyway: `readAllowList` already answers "allowed here",
+ * normalized against the registry, so re-asking `isHarnessAllowed` per name only
+ * re-read and re-parsed `.cellar/harness.json` to reach the same verdict.
+ */
+function targetHarnesses(): { allowed: string[]; names: string[] } {
 	const excluded = process.env.CELLAR_NO_MCP_CONFIG ? new Set(mcpJsonHarnessNames()) : new Set<string>();
-	// `readAllowList` already answers "allowed here", normalized against the
-	// registry, so re-asking `isHarnessAllowed` per name only re-read and re-parsed
-	// `.cellar/harness.json` to reach the same verdict.
-	return readAllowList(workspaceRoot()).filter((name) => !excluded.has(name));
+	const allowed = readAllowList(workspaceRoot());
+	return { allowed, names: allowed.filter((name) => !excluded.has(name)) };
 }
 
 /**
@@ -174,9 +184,15 @@ function ensureGitExclude(worktreeDir: string, rel: string): boolean {
  */
 export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConfig | undefined {
 	if (!worktreeAgentConfigEnabled()) return undefined;
-	const names = targetHarnesses();
+	const { allowed, names } = targetHarnesses();
 	if (!names.length) {
-		return process.env.CELLAR_NO_MCP_CONFIG
+		// ONLY THE FLAG MAY BE BLAMED FOR THE FLAG'S EFFECT. `cellar harness remove
+		// claude` leaves an explicitly EMPTY allow-list, so `names` is empty there for a
+		// reason that has nothing to do with `--no-mcp-config` - and this message rides
+		// `agentConfigNotice` onto the root bar and the sidebar, where naming a cause
+		// that did not happen is worse than saying nothing. An allow-list that was
+		// empty anyway addressed nothing at all, which is what `undefined` says.
+		return allowed.length
 			? { status: 'skipped', message: 'agent config was not written: this instance was launched with --no-mcp-config.' }
 			: undefined;
 	}

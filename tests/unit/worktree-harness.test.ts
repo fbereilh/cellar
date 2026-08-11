@@ -203,6 +203,21 @@ describe('when it must NOT write', () => {
 		expect(r?.message).toMatch(/--no-mcp-config/);
 	});
 
+	it('does NOT blame --no-mcp-config when the allow-list was empty anyway', () => {
+		// `cellar harness remove claude` leaves an explicitly EMPTY allow-list, so
+		// nothing would have been written whatever the flag said - and this message
+		// rides `agentConfigNotice` onto the root bar and the sidebar, where naming a
+		// cause that did not happen is worse than saying nothing at all.
+		harness.disallowHarness('claude', WS);
+		process.env.CELLAR_NO_MCP_CONFIG = '1';
+		try {
+			expect(mod.configureAdoptedWorktree(SIBLING)).toBeUndefined();
+			expect(existsSync(join(SIBLING, '.mcp.json'))).toBe(false);
+		} finally {
+			harness.allowHarness('claude', WS);
+		}
+	});
+
 	it('writes nothing for a harness the WORKSPACE does not allow', () => {
 		// The workspace is where the user answered the harness question; a worktree
 		// has no independent answer and cannot be prompted for one.

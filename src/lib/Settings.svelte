@@ -413,7 +413,10 @@
 				<!-- Agent config in an adopted external worktree. Written ONLY when a
 				     notebook is actually pointed AT that worktree, never on merely
 				     detecting one — and the copy states what it costs, because this puts a
-				     file into a checkout the user did not open. -->
+				     file into a checkout the user did not open. It therefore names EVERY
+				     file that can land there: the writer addresses each harness the
+				     workspace allow-lists, not `.mcp.json` alone, so naming one file
+				     understated what this control authorizes. -->
 				<div data-testid="worktree-agent-config-control">
 					<label class="flex cursor-pointer items-center justify-between gap-4">
 						<span class="text-sm font-medium">Set up agents in adopted worktrees</span>
@@ -426,13 +429,15 @@
 						/>
 					</label>
 					<p class="mt-1 text-xs text-base-content/50">
-						When a notebook's code root is set to a git worktree outside this workspace, write Cellar's
-						agent config (<span class="font-mono">.mcp.json</span>) there, so an agent working in that
-						checkout can reach this Cellar. It is also added to that repository's
-						<span class="font-mono">.git/info/exclude</span>, so the checkout does not show it as an
-						untracked change and it cannot be committed. Git keeps that file per clone rather than per
-						worktree, so the entry covers the top level of every worktree of that repository and its
-						main checkout — it is never committed, so no collaborator inherits it.
+						When a notebook's code root is set to a git worktree outside this workspace, write the
+						Cellar config for each agent harness set up in this workspace there
+						(<span class="font-mono">.mcp.json</span> for Claude Code,
+						<span class="font-mono">.codex/config.toml</span> for Codex), so an agent working in that
+						checkout can reach this Cellar. Each is also added to that repository's
+						<span class="font-mono">.git/info/exclude</span>, so the checkout does not show them as
+						untracked changes and they cannot be committed. Git keeps that file per clone rather than per
+						worktree, so those entries cover the top level of every worktree of that repository and its
+						main checkout - it is never committed, so no collaborator inherits them.
 					</p>
 				</div>
 

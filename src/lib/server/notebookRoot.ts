@@ -191,6 +191,40 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
+ * `canonicalPath` for a worktree the listing reported, memoized on the ENTRY.
+ *
+ * `samePath` resolves BOTH sides, and its `a === b` fast path essentially never
+ * hits against a listing (the candidate is lexical, git's path is realpath'd -
+ * which is the whole reason `samePath` exists), so scanning the listing cost a
+ * `realpathSync` walk per entry. `listWorkspaceRoots` then resolves once per
+ * DETECTED worktree, making that O(N²) blocking syscalls on a path `LiveNotebook`
+ * runs at every notebook mount, for a workspace with a worktree per PR under
+ * review - this feature's own headline use case, i.e. exactly the N where it bites.
+ *
+ * Keyed on the object rather than the string because `listWorktreesAt` hands back
+ * the same entries for the life of its (1.5s) cache and mints fresh ones on the
+ * next spawn: the memo therefore expires with the listing it belongs to, so it
+ * cannot outlive the answer it caches. The comparison itself is unchanged.
+ */
+const worktreeCanonical = new WeakMap<GitWorktree, string>();
+function canonicalWorktreePath(w: GitWorktree): string {
+	let canon = worktreeCanonical.get(w);
+	if (canon === undefined) {
+		canon = canonicalPath(w.path);
+		worktreeCanonical.set(w, canon);
+	}
+	return canon;
+}
+
+/**
+ * `samePath(w.path, dir)` with `dir`'s canonical form supplied by the caller, so a
+ * scan of the listing resolves the candidate ONCE instead of once per entry.
+ */
+function isWorktreeAt(w: GitWorktree, dir: string, canonDir: string): boolean {
+	return w.path === dir || canonicalWorktreePath(w) === canonDir;
+}
+
+/**
  * A linked worktree's REGISTRATION NAME — the `<name>` in
  * `<repo>/.git/worktrees/<name>`, read from the worktree's own `.git` file.
  *
@@ -253,7 +287,9 @@ export function worktreeDeclaration(worktreePath: string): string {
 
 /** Short, deterministic rendering of what IS registered, for a refusal message. */
 function nameWorktrees(list: GitWorktree[]): string {
-	const others = list.filter((w) => !samePath(w.path, ws()));
+	const wsDir = ws();
+	const canonWs = canonicalPath(wsDir);
+	const others = list.filter((w) => !isWorktreeAt(w, wsDir, canonWs));
 	if (!others.length) return 'This repository has no other worktrees registered.';
 	const shown = others.slice(0, 5).map((w) => w.path);
 	const more = others.length - shown.length;
@@ -268,8 +304,11 @@ function nameWorktrees(list: GitWorktree[]): string {
  * because `git worktree list` realpaths its output.
  */
 function assertRegisteredWorktree(dir: string, declared: string): GitWorktree {
+	// Resolved ONCE and reused by every comparison below - the ordinary listing scan,
+	// the refreshed re-check, and the moved-worktree lookup. See `canonicalWorktreePath`.
+	const canonDir = canonicalPath(dir);
 	let list = listWorktreesAt(ws());
-	let match = list.find((w) => samePath(w.path, dir));
+	let match = list.find((w) => isWorktreeAt(w, dir, canonDir));
 	// A MISS is re-checked against a FRESH listing before it becomes a refusal.
 	// The listing is cached for 1.5s, which would otherwise be a window in which a
 	// worktree the user created seconds ago — the very next thing they do after
@@ -279,7 +318,7 @@ function assertRegisteredWorktree(dir: string, declared: string): GitWorktree {
 	// path never reaches this.
 	if (!match) {
 		list = listWorktreesAt(ws(), { refresh: true });
-		match = list.find((w) => samePath(w.path, dir));
+		match = list.find((w) => isWorktreeAt(w, dir, canonDir));
 	}
 	if (match) return match;
 
@@ -293,7 +332,9 @@ function assertRegisteredWorktree(dir: string, declared: string): GitWorktree {
 	// `.ipynb` because a directory moved is a silent change to the user's file.
 	if (!existsDir(dir)) {
 		const wanted = basename(dir);
-		const moved = list.find((w) => !samePath(w.path, ws()) && registrationName(w.path) === wanted);
+		const wsDir = ws();
+		const canonWs = canonicalPath(wsDir);
+		const moved = list.find((w) => !isWorktreeAt(w, wsDir, canonWs) && registrationName(w.path) === wanted);
 		if (moved) {
 			throw new NotebookRootError(
 				`Notebook root ${JSON.stringify(declared)} is no longer registered at that path — that worktree was moved to ${JSON.stringify(moved.path)}. Update the notebook's root to the new path, or clear it to run at the workspace root.`
