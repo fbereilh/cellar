@@ -1742,7 +1742,11 @@ async function workspaceProbes(): Promise<WorkspaceProbes> {
  * diverge - the env is read at import time, so a preference changed after the kernel
  * started, or a connect that binds a kernel which started unbound, only takes effect
  * on the next start - and the Runtime card reports this so it can never claim a
- * runtime the running kernel does not advertise. Never boots a kernel.
+ * runtime the running kernel does not advertise. Never boots a kernel. It carries
+ * one more live reading, `sdkDbutils`, and that one costs a kernel round-trip: it
+ * is asked ONLY of a session that really advertises a runtime, skipped on a busy
+ * kernel, single-flight and cached per kernel session (see `sdkDbutilsState`), so
+ * the sidebar poll stays cheap here too.
  */
 export async function getStatus(nb?: string | null) {
 	const { configPath: path, exists, profiles, error } = readProfiles();
@@ -1779,6 +1783,15 @@ export async function getStatus(nb?: string | null) {
  * names whichever is actually in force. Without it the version input would keep offering
  * an edit whose apply-restart wipes the namespace to advertise a value the override
  * discards.
+ *
+ * `sdkDbutils` is which `dbutils` the SDK import path resolves to in that kernel
+ * (`sdkDbutilsState`), the detect half of the SDK-import bypass. `foreign` is the
+ * one state the card warns on - the SDK's own object renders parameter widgets and
+ * discards every entered value on re-declaration, so nothing else can tell. It is
+ * reported as `unknown` unless the live session actually advertises a runtime:
+ * that is both when the rebind is installed and the only case the answer means
+ * anything, and it is what keeps the probe off a status read for a kernel with no
+ * runtime to be wrong about.
  */
 async function runtimeStatus(nb?: string | null): Promise<{
 	kernelStarted: boolean;

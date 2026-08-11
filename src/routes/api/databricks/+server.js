@@ -8,12 +8,15 @@ import { databricksErrorResponse } from './error-response.js';
  * live connection (epoch-checked, so a kernel restart reads as disconnected - and
  * flagged `restarting` while an expected rebuild is in flight), and the `runtime`
  * block describing what the LIVE kernel session was started with plus which
- * decisions the environment forces.
+ * decisions the environment forces - including `sdkDbutils`, which `dbutils` the
+ * SDK import path resolves to in that kernel (only ever asked of a session that
+ * advertises a Databricks runtime).
  *
  * Never boots a kernel, and safe to POLL (the panel does, ~1.2s, for as long as a
  * restart rebuild is in flight): the workspace probes are memoized behind a short
- * TTL and the liveness probe is memoized too, skipped while the kernel is busy and
- * never blocking on a reconnect.
+ * TTL, and both kernel-side probes - the liveness `SELECT 1` and the `dbutils`
+ * binding read - are memoized too, skipped while the kernel is busy, and never
+ * blocking on a reconnect.
  */
 export async function GET({ url }) {
 	try {

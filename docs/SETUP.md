@@ -330,6 +330,20 @@ because only a deliberate edit of that field writes it - flipping the toggle, or
 **Apply now**, moves the advertisement alone and applies whatever version is stored -
 and the badge reports the running kernel throughout.
 
+**Parameter widgets and the SDK import.** Cellar binds its own `dbutils` in every
+kernel, so `dbutils.widgets.text(...)` and `.get(...)` draw real controls and read
+back the value you typed, with or without a Databricks connection. Library code
+written to run both on and off a cluster usually reaches for
+`from databricks.sdk.runtime import dbutils` rather than the bare name, so while a
+runtime is advertised Cellar points that import at the same widgets - otherwise the
+SDK's own object answers it, and that one rebuilds each widget at its default every
+time a cell re-declares it, silently discarding what you entered while still drawing
+the controls. If Cellar finds that import holding anything other than its own
+widgets, the Databricks panel says so (on the Runtime card, and on the Cluster card
+when no session is live) and a kernel restart rebinds it. It only ever reports what
+it could check: with no kernel, a busy one, or no advertised runtime, it stays quiet
+rather than guessing.
+
 **Upload the open notebook to your workspace.** While connected, the **Upload**
 card - its own card between Cluster and Runtime, since this acts on workspace files
 and never on compute - carries an **Upload notebook to workspace** button (the
@@ -487,7 +501,7 @@ to publish, e.g. inside a container.
 | `CELLAR_DATAFLOW_BACKOFF_BASE_MS` | `30000` (ms, = 30s) | First backoff window after a dataflow batch times out; doubles per consecutive timeout. A timed-out batch is not re-probed until its window elapses or its source content changes, so a persistently-slow notebook converges instead of re-spawning the probe every pass. |
 | `CELLAR_DATAFLOW_BACKOFF_MAX_MS` | `300000` (ms, = 5min) | Ceiling on the dataflow backoff window, so a persistently-slow notebook still re-probes rarely rather than never. |
 | `CELLAR_ADD_PROJECT_ROOT` | UI setting | Force whether the project root is added to the kernel's `sys.path` (overrides the persisted UI toggle). |
-| `CELLAR_DATABRICKS_RUNTIME` | UI setting (default off) | Force whether `DATABRICKS_RUNTIME_VERSION` is advertised in the kernel environment, so notebook code that checks whether it is running on Databricks takes its `dbutils.widgets` path. Overrides the persisted UI toggle and bypasses the connected-notebook scope; the sidebar then reports the setting as environment-controlled and disables the toggle, and an agent's `databricks_runtime` call is refused (`runtime_env_forced`) rather than restarting a kernel to change nothing. Applied at kernel start/restart only. |
+| `CELLAR_DATABRICKS_RUNTIME` | UI setting (default off) | Force whether `DATABRICKS_RUNTIME_VERSION` is advertised in the kernel environment, so notebook code that checks whether it is running on Databricks takes its `dbutils.widgets` path. It is also what makes `from databricks.sdk.runtime import dbutils` resolve to Cellar's own widgets instead of the SDK's value-discarding ones. Overrides the persisted UI toggle and bypasses the connected-notebook scope; the sidebar then reports the setting as environment-controlled and disables the toggle, and an agent's `databricks_runtime` call is refused (`runtime_env_forced`) rather than restarting a kernel to change nothing. Applied at kernel start/restart only. |
 | `CELLAR_DATABRICKS_RUNTIME_VERSION` | `15.4` | The runtime version string advertised when the runtime is on. Overrides the persisted UI value (and disables the card's version field), independently of `CELLAR_DATABRICKS_RUNTIME` - either can be set without the other. Unlike that one it refuses nothing: a version an agent passes to `databricks_runtime` is stored as the preference and reported back as overridden, so it takes effect once this is unset. |
 | `CELLAR_USER_SETTINGS` | `~/.cellar/settings.json` | Path of the cross-project user-settings file (today: the default Databricks upload prefix/postfix). Point it elsewhere to keep those settings with a dotfile setup, or to isolate them in a test run. Per-project state stays in each workspace's own `.cellar/` and is unaffected. |
 | `CELLAR_JUPYTER_URL` | `http://127.0.0.1:8888` | Point the kernel bridge at an external Jupyter server (the launcher sets this automatically for the managed sidecar). |
@@ -570,6 +584,14 @@ spec files at a time. Install its browser once with `npx playwright install chro
   notebook is written back from its cells alone and stores no notebook-level
   metadata, so a root could not survive a reload. Convert it to `.ipynb` (app menu
   → **Convert to .ipynb**) if you need one; clearing a root is always allowed.
+- **Parameter widgets render but keep coming back at their defaults** - the code is
+  reaching the Databricks SDK's own `dbutils` rather than Cellar's, and the SDK's one
+  rebuilds a widget from scratch every time a cell re-declares it, so the value you
+  typed is gone before the same cell reads it. The Databricks panel says so when it
+  can see it. Cellar points `from databricks.sdk.runtime import dbutils` at its own
+  widgets only while a Databricks runtime is advertised, so turn the **Runtime**
+  toggle on (or set `CELLAR_DATABRICKS_RUNTIME`) and restart the kernel - the rebind
+  happens at kernel start, and it also covers an import that has not happened yet.
 - **A file tab says "view-only · too large to save"** - the document is larger than a
   save request may carry (`BODY_SIZE_LIMIT`, `512K` by default), so Cellar opens it
   read-only rather than offering an edit it could never persist. Reading, syntax

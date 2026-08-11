@@ -1185,7 +1185,11 @@ async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): P
 	// FIRST: advertise a Databricks runtime (set DATABRICKS_RUNTIME_VERSION) so a
 	// notebook's `IS_DATABRICKS`-gated code takes its `dbutils.widgets` path - set
 	// before every other injected snippet AND before the user's first import (the
-	// gate is import-time). Default OFF (the sidebar's Runtime toggle is the opt-in,
+	// gate is import-time). The order is load-bearing for the injections too, not
+	// just for user code: `WIDGETS_SHIM_CODE` below reads this same env var to
+	// decide whether to point `databricks.sdk.runtime.dbutils` at Cellar's shim
+	// (see widgetsShim.ts), so the env IS that decision and must already be set.
+	// Default OFF (the sidebar's Runtime toggle is the opt-in,
 	// and the only thing that restarts the kernel for it), and additionally scoped to
 	// notebooks BOUND to a Databricks cluster so a purely-local kernel is never told
 	// it is on Databricks; an explicit env override can force it. Re-read here so a
