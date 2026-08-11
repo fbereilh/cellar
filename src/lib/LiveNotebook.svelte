@@ -2043,17 +2043,16 @@
 		if (isSql) cellar.language = 'sql';
 		else delete cellar.language;
 		// The same drops the server's `applyCellType` makes - neither the imports role
-		// nor the export flag may sit on a cell holding no Python, and a cell with no
-		// code input has no report-view override to keep - mirrored here for the
-		// `clampMoveIndex` reason: `cell:type` carries no metadata, so a client half
-		// that skipped them would keep drawing the imports/export badge over a cell the
-		// server has already stripped, with no event able to correct it before reload.
+		// nor the export flag may sit on a cell holding no Python - mirrored here for
+		// the `clampMoveIndex` reason: `cell:type` carries no metadata, so a client
+		// half that skipped them would keep drawing the imports/export badge over a
+		// cell the server has already stripped, with no event able to correct it
+		// before reload. `hide_input` is KEPT, exactly as the server keeps it.
 		const runnable = cell.cell_type === 'code' && !isSql;
 		if (!runnable) {
 			if (cellar.role === IMPORTS_ROLE) delete cellar.role;
 			if (cellar.export) delete cellar.export;
 		}
-		if (cell.cell_type !== 'code') delete cellar.hide_input;
 		cell.metadata = { ...(cell.metadata ?? {}), cellar };
 		if (cell.cell_type !== 'code') cell.outputs = [];
 	}

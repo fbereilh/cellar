@@ -203,7 +203,7 @@ describe('authoring', () => {
 		expect(cell.metadata?.cellar?.importBindings).toBeUndefined();
 	});
 
-	it('drops the imports role, the export flag and hide_input on conversion to raw', () => {
+	it('drops the imports role and the export flag on conversion to raw, but KEEPS hide_input', () => {
 		const nb = makeRawNotebook('raw-convert.ipynb');
 		const codeId = nbmod.listCells(nb)[1].id;
 		nbmod.setCellRole(codeId, 'imports', nb);
@@ -216,14 +216,18 @@ describe('authoring', () => {
 		expect(asRaw.cell_type).toBe('raw');
 		expect(asRaw.metadata?.cellar?.role).toBeUndefined();
 		expect(asRaw.metadata?.cellar?.export).toBeUndefined();
-		expect(asRaw.metadata?.cellar?.hide_input).toBeUndefined();
 		expect(asRaw.outputs).toEqual([]);
+		// KEPT: `$lib/hideInput` reads it only for a code cell, so it is already inert
+		// here - dropping it would silently lose the choice across a round trip.
+		expect(asRaw.metadata?.cellar?.hide_input).toBe(true);
 
-		// Converting back yields a plain Python cell - no leftover language tag.
+		// Converting back yields a plain Python cell - no leftover language tag, and
+		// the report-view choice the user made is still there.
 		nbmod.setCellType(codeId, 'code', nb);
 		const back = nbmod.listCells(nb).find((c) => c.id === codeId)!;
 		expect(back.cell_type).toBe('code');
 		expect(back.metadata?.cellar?.language).toBeUndefined();
+		expect(back.metadata?.cellar?.hide_input).toBe(true);
 	});
 });
 

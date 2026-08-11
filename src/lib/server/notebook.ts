@@ -1240,9 +1240,8 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
 /**
  * The in-place half of a type switch, shared by the single-cell setter and the
  * `setCellTypes` batch so the two can never diverge on the metadata rules: any
- * non-code type (markdown, raw) clears outputs and drops the `hide_input`
- * report-view override, and anything holding no Python (those two plus SQL)
- * drops the imports role and the nbdev export flag.
+ * non-code type (markdown, raw) clears outputs, and anything holding no Python
+ * (those two plus SQL) drops the imports role and the nbdev export flag.
  *
  * `LiveNotebook.applyCellTypeLocally` is the browser's copy of exactly these
  * rules - `cell:type` carries no metadata, so a client half that skipped one
@@ -1267,12 +1266,9 @@ function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	// source is not Python.
 	if (!runnable && cell.metadata.cellar.role === IMPORTS_ROLE) delete cell.metadata.cellar.role;
 	if (!runnable && cell.metadata.cellar.export) delete cell.metadata.cellar.export;
-	// A markdown or raw cell has no code input to hide, so the report-view override
-	// is meaningless on it - and `$lib/hideInput` reads it only for code cells, so
-	// leaving it would re-apply silently if the cell were converted back.
-	if (cell.cell_type !== 'code' && cell.metadata.cellar.hide_input !== undefined) {
-		delete cell.metadata.cellar.hide_input;
-	}
+	// `hide_input` is deliberately KEPT: `$lib/hideInput` reads it only for a code
+	// cell, so it is already inert on a markdown or raw one, and dropping it would
+	// silently lose a report-view choice across a there-and-back conversion.
 }
 
 /**

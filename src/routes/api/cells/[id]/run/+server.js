@@ -23,14 +23,18 @@ import { executeCellRun, clearOutputsForQueue } from '$lib/server/run';
  * initiating tab, which drops its own `originId`-tagged SSE echo and would
  * otherwise never learn its run started.
  *
- * ONLY A CODE CELL EXECUTES, and this route is where that is enforced for the
- * HTTP entry point - MCP's `run_cell` refuses the same shape in `mcp/service.ts`.
- * Two entry points, ONE rule, not two rules. Without it the route handed whatever
- * source it was POSTed straight to the kernel: a raw cell (verbatim text for a
- * downstream tool) sent its YAML frontmatter to Python, and the resulting
- * `SyntaxError` was written into that cell's in-memory `outputs` where the UI
- * showed it - then vanished on reload, because `serialize` drops outputs for any
- * non-code cell. The submitted source is still SAVED first, so a `Mod-Enter` in a
+ * ONLY A CODE CELL EXECUTES, and that is enforced at EACH ENTRY POINT rather than
+ * in the shared core: here for HTTP, in `mcp/service.ts` for `run_cell`, and in
+ * `jupytext-actions.ts`'s `runAllCells`, which filters to `cell_type === 'code'`
+ * before calling `executeCellRun`. `executeCellRun` is deliberately NOT the gate -
+ * each door owes its caller a different refusal SHAPE (this route's terminal
+ * `run:refused` NDJSON frame, MCP's `status:'skipped'` result), which the core has
+ * no way to speak - so a new run path must bring its own check, not inherit one.
+ * Without it the route handed whatever source it was POSTed straight to the
+ * kernel: a raw cell (verbatim text for a downstream tool) sent its YAML
+ * frontmatter to Python, and the resulting `SyntaxError` was written into that
+ * cell's in-memory `outputs` where the UI showed it - then vanished on reload,
+ * because `serialize` drops outputs for any non-code cell. The submitted source is still SAVED first, so a `Mod-Enter` in a
  * raw cell persists the edit rather than losing it.
  */
 export async function POST({ params, request }) {
