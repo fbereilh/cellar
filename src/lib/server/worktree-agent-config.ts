@@ -6,7 +6,7 @@
  * cannot reach the Cellar instance that is serving the notebook. This module
  * closes that, and nothing more.
  *
- * FOUR RULES, each of which was a decision rather than an implementation detail:
+ * FIVE RULES, each of which was a decision rather than an implementation detail:
  *
  * 1. **ADOPTION-SCOPED — never on detection.** Only a worktree actually SET as a
  *    notebook's root is written to. Detection happens whenever a picker opens or
@@ -14,10 +14,12 @@
  *    files into every checkout of the repo as the side effect of a read.
  *
  * 2. **The EXISTING harness writer, never a second one.** `configureHarness(name,
- *    dir)` is already parameterised on a directory and carries every guarantee
- *    that matters here — merge rather than clobber, `already` => zero bytes
- *    written, symlink-following atomic replace, mode + CRLF preservation, and a
- *    refusal on anything it cannot edit confidently.
+ *    dir, opts)` is parameterised on the directory and on the args (rule 5 —
+ *    parameterising the one writer is in scope, adding a parallel one here is
+ *    not), and carries every guarantee that matters here — merge rather than
+ *    clobber, `already` => zero bytes written, symlink-following atomic replace,
+ *    mode + CRLF preservation, and a refusal on anything it cannot edit
+ *    confidently.
  *
  * 3. **The WORKSPACE's allow-list decides, and `--no-mcp-config` suppresses.**
  *    The workspace is where the user answered the harness question; a worktree
@@ -29,6 +31,24 @@
  *    change is the user's actual request. A read-only mount, an EACCES, a
  *    malformed existing config — all are caught per harness and REPORTED on the
  *    result, never thrown.
+ *
+ * 5. **The entry NAMES THE INSTANCE (`instanceArgs`), because the canonical one
+ *    cannot reach it.** `cellar mcp` with no argument resolves the instance from
+ *    the agent's own cwd — it reads `<cwd>/.cellar/runtime.json` and does NOT walk
+ *    up — so the canonical `{command:"cellar", args:["mcp"]}` is correct only for
+ *    a config sitting at the root of the workspace Cellar runs in. Written into a
+ *    worktree it is INERT: the agent's cwd is that worktree, no instance is running
+ *    there, and the bridge exits 1 saying so — i.e. Cellar would drop a file into a
+ *    checkout the user did not open, add a repo-common ignore rule for it, and the
+ *    agent would still have no Cellar tools. So the worktree copy carries
+ *    `--workspace <absolute workspace path>`, which is exactly what that flag is
+ *    for. The path is machine-specific, and that is acceptable HERE AND ONLY HERE
+ *    because this file is excluded from git and never committed; do not "fix" it
+ *    into a relative path, which cannot resolve from an arbitrary agent cwd. It
+ *    applies to EVERY allow-listed harness's format — a `.codex/config.toml`
+ *    written without the selector is inert in exactly the same way. What a normal
+ *    workspace launch writes is untouched: the selector is a per-call override on
+ *    the one writer, not a change to the canonical entry.
  *
  * ── WHY THE `.git/info/exclude` WRITE IS PART OF THIS, NOT AN EXTRA ────────────
  *
@@ -74,14 +94,22 @@
  * and makes `git add` refuse it. So a skipped harness's entry is taken back
  * (`revertGitExclude`), and ONLY the bytes this call appended: an entry the user or
  * an earlier adoption already had is never touched, and the file comes back
- * byte-identical. Cellar does not leave an ignore rule behind for a file it did not
- * write.
+ * byte-identical — a file this call CREATED is removed rather than left behind
+ * empty, so "byte-identical" holds literally, including for a repo that had no
+ * exclude file at all. Cellar does not leave an ignore rule behind for a file it
+ * did not write.
  */
-import { existsSync, mkdirSync, readFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, appendFileSync, rmSync } from 'node:fs';
 import { writeFileAtomic } from './write-file-atomic.js';
 import { spawnSync } from 'node:child_process';
 import { join, dirname, relative, resolve } from 'node:path';
-import { configureHarness, mcpJsonHarnessNames, harnessConfigPath, readAllowList } from './harness.js';
+import {
+	configureHarness,
+	instanceArgs,
+	mcpJsonHarnessNames,
+	harnessConfigPath,
+	readAllowList
+} from './harness.js';
 import { workspaceRoot } from './fstree';
 import { getUiState } from './ui-state';
 import { logWarn } from './logs';
@@ -178,7 +206,11 @@ function ensureGitExclude(worktreeDir: string, rel: string): ExcludeWrite {
 	if (!common) return { ok: false };
 	const file = join(resolve(worktreeDir, common), 'info', 'exclude');
 	try {
-		const existing = existsSync(file) ? readFileSync(file, 'utf8') : '';
+		// Whether the repo HAD an exclude file at all, recorded before we touch it: a
+		// revert has to be able to leave the repo exactly as it found it, and an empty
+		// file where there was none is not that (see `revertGitExclude`).
+		const created = !existsSync(file);
+		const existing = created ? '' : readFileSync(file, 'utf8');
 		// Idempotent on the ENTRY, not on the whole line: a user may have added it
 		// themselves with different spacing, and a second copy is noise in a file
 		// they can read. An entry that was ALREADY there carries no `appended`, which
@@ -188,7 +220,7 @@ function ensureGitExclude(worktreeDir: string, rel: string): ExcludeWrite {
 		const prefix = !existing || existing.endsWith('\n') ? '' : '\n';
 		const appended = `${prefix}${EXCLUDE_MARKER}\n${entry}\n`;
 		appendFileSync(file, appended);
-		return { ok: true, file, appended };
+		return { ok: true, file, appended, created };
 	} catch {
 		return { ok: false };
 	}
@@ -203,6 +235,8 @@ interface ExcludeWrite {
 	file?: string;
 	/** The exact bytes THIS call appended; absent when the entry was already there. */
 	appended?: string;
+	/** Whether THIS call created the exclude file — the repo had none before it. */
+	created?: boolean;
 }
 
 /**
@@ -224,9 +258,13 @@ interface ExcludeWrite {
  * line the user — or an earlier adoption, or the sibling harness in this same call
  * — put there is untouched, and an exclude that already held the entry is never
  * reverted at all (no `appended`). Removing the exact appended slice is also what
- * makes the file byte-identical to what it was before the call. Best-effort, like
- * the write: a revert that cannot be done leaves the warning the skip already
- * earns.
+ * makes the file byte-identical to what it was before the call — INCLUDING the case
+ * where there was no file: `ensureGitExclude` records that it created one, and the
+ * revert then removes it rather than leaving a zero-byte `info/exclude` in a repo
+ * that had none. Git treats an absent and an empty exclude the same, so that is a
+ * claim about honesty rather than behavior; it is asserted, so it has to hold.
+ * Best-effort, like the write: a revert that cannot be done leaves the warning the
+ * skip already earns.
  */
 function revertGitExclude(e: ExcludeWrite): void {
 	if (!e.file || !e.appended) return;
@@ -234,7 +272,12 @@ function revertGitExclude(e: ExcludeWrite): void {
 		const content = readFileSync(e.file, 'utf8');
 		const at = content.lastIndexOf(e.appended);
 		if (at < 0) return;
-		writeFileAtomic(e.file, content.slice(0, at) + content.slice(at + e.appended.length));
+		const rest = content.slice(0, at) + content.slice(at + e.appended.length);
+		// Only when this call BOTH created the file and left nothing else in it: a file
+		// that already existed (empty or not) is the user's, and a file this call created
+		// but which has since gained other lines is no longer only ours to remove.
+		if (e.created && rest === '') rmSync(e.file, { force: true });
+		else writeFileAtomic(e.file, rest);
 	} catch {
 		/* best-effort: the skip's own warning is what the user acts on */
 	}
@@ -283,7 +326,10 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 		const wroteExclude = excludedByName.get(name) ?? { ok: false };
 		const excluded = wroteExclude.ok;
 		try {
-			const r = configureHarness(name, worktreeDir);
+			// `instanceArgs`, never the bare canonical entry: see rule 5 in the header —
+			// a config in a worktree has to NAME the instance, or the agent's `cellar mcp`
+			// looks for a runtime file in the worktree and finds none.
+			const r = configureHarness(name, worktreeDir, { args: instanceArgs(workspaceRoot()) });
 			results.push({
 				name,
 				file: r.file,

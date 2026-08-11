@@ -105,8 +105,32 @@ import { writeFileAtomic } from './write-file-atomic.js';
 export const SERVER_NAME = 'cellar';
 /** The stdio command an agent runs to reach the live instance (never a URL). */
 export const SERVER_COMMAND = 'cellar';
-/** Args for that command. */
+/**
+ * Args for that command — the CANONICAL entry, written into a workspace's own
+ * config. `cellar mcp` with no argument resolves the instance from the agent's
+ * cwd, which is exactly right when the config sits at the root of the workspace
+ * Cellar is running in.
+ */
 export const SERVER_ARGS = ['mcp'];
+
+/**
+ * The same command, told WHICH instance to bridge to.
+ *
+ * `cellar mcp` reads `<cwd>/.cellar/runtime.json` and does not walk up, so a
+ * config written into a directory that is NOT the workspace (the adopted-worktree
+ * case — see `worktree-agent-config.ts`) is inert without this: the agent's cwd is
+ * the worktree, no instance is running there, and the bridge exits 1 saying so.
+ * `--workspace` is precisely an instance selector, so this is its intended use.
+ *
+ * The path is ABSOLUTE and therefore machine-specific. That is acceptable HERE AND
+ * ONLY HERE, because the only config carrying it is the one Cellar writes into an
+ * adopted worktree, which is excluded from git and never committed. Do not
+ * "portable-ise" it into a relative path: it has to resolve from whatever cwd the
+ * agent happens to have, which is the whole reason it exists.
+ */
+export function instanceArgs(workspace) {
+	return [...SERVER_ARGS, '--workspace', workspace];
+}
 
 /**
  * One-line reminder printed after every successful configure. The config alone
@@ -210,14 +234,17 @@ function plainObject(v) {
 
 // ---- JSON (`.mcp.json`, Claude Code) --------------------------------------
 
-const JSON_ENTRY = { command: SERVER_COMMAND, args: [...SERVER_ARGS] };
+/** The entry Cellar owns, for a given arg vector (see `instanceArgs`). */
+function jsonEntry(args) {
+	return { command: SERVER_COMMAND, args: [...args] };
+}
 
-function sameJsonEntry(entry) {
+function sameJsonEntry(entry, args) {
 	return (
 		!!entry &&
 		typeof entry === 'object' &&
-		entry.command === JSON_ENTRY.command &&
-		JSON.stringify(entry.args) === JSON.stringify(JSON_ENTRY.args)
+		entry.command === SERVER_COMMAND &&
+		JSON.stringify(entry.args) === JSON.stringify(args)
 	);
 }
 
@@ -232,7 +259,7 @@ function sameJsonEntry(entry) {
  * exactly the clobber this module refuses to do. The TOML sibling already
  * refuses the analogous `mcp_servers = { … }` shape; the two writers must agree.
  */
-function readJsonState(file) {
+function readJsonState(file, args = SERVER_ARGS) {
 	const src = readConfigText(file);
 	if (!src.exists) return { present: false, matches: false, unreadable: false };
 	if (src.text === null) {
@@ -252,7 +279,7 @@ function readJsonState(file) {
 	}
 	const servers = plainObject(config.mcpServers) ? config.mcpServers : {};
 	const entry = servers[SERVER_NAME];
-	return { present: entry !== undefined, matches: sameJsonEntry(entry), unreadable: false, config };
+	return { present: entry !== undefined, matches: sameJsonEntry(entry, args), unreadable: false, config };
 }
 
 /** The `add it by hand` tail every JSON refusal ends with. */
@@ -270,8 +297,8 @@ function jsonRefusal(state) {
 			: 'is not a JSON object';
 }
 
-function writeJsonConfig(file) {
-	const state = readJsonState(file);
+function writeJsonConfig(file, args) {
+	const state = readJsonState(file, args);
 	if (state.unreadable) {
 		const why = jsonRefusal(state);
 		return {
@@ -298,7 +325,7 @@ function writeJsonConfig(file) {
 	// server untouched. `existing` is spread only when it is a plain object - a
 	// string would spread into character-indexed keys.
 	const base = plainObject(existing) ? existing : {};
-	config.mcpServers = { ...servers, [SERVER_NAME]: { ...base, ...JSON_ENTRY } };
+	config.mcpServers = { ...servers, [SERVER_NAME]: { ...base, ...jsonEntry(args) } };
 	writeFileAtomic(file, JSON.stringify(config, null, 2) + '\n');
 	return state.present
 		? { status: 'updated', message: `updated the ${SERVER_NAME} MCP server` }
@@ -316,24 +343,33 @@ const TOML_TABLE = ['mcp_servers', SERVER_NAME];
  * "already correct" cannot mean one thing to one of them and something else to
  * another. `matches` is only ever called later, so the hoisted helpers it uses
  * are resolved by then.
+ *
+ * Parameterised on `args` for the same reason the JSON writer is: an adopted
+ * worktree's config must name the instance (`instanceArgs`), and both formats have
+ * to carry the SAME selector or Codex gets the inert entry `.mcp.json` no longer
+ * has.
  */
-const TOML_KEYS = [
-	{
-		key: 'command',
-		text: `command = "${SERVER_COMMAND}"`,
-		matches: (value) => unquote(value) === SERVER_COMMAND
-	},
-	{
-		key: 'args',
-		text: `args = [${SERVER_ARGS.map((a) => JSON.stringify(a)).join(', ')}]`,
-		matches: (value) => {
-			const parsed = parseStringArray(value);
-			return !!parsed && JSON.stringify(parsed) === JSON.stringify(SERVER_ARGS);
+function tomlKeys(args) {
+	return [
+		{
+			key: 'command',
+			text: `command = "${SERVER_COMMAND}"`,
+			matches: (value) => unquote(value) === SERVER_COMMAND
+		},
+		{
+			key: 'args',
+			text: `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]`,
+			matches: (value) => {
+				const parsed = parseStringArray(value);
+				return !!parsed && JSON.stringify(parsed) === JSON.stringify(args);
+			}
 		}
-	}
-];
+	];
+}
 
-const TOML_BLOCK = [`[${TOML_TABLE.join('.')}]`, ...TOML_KEYS.map((k) => k.text)];
+function tomlBlock(args) {
+	return [`[${TOML_TABLE.join('.')}]`, ...tomlKeys(args).map((k) => k.text)];
+}
 
 /**
  * Walk one line, tracking TOML string state so structural characters inside a
@@ -709,21 +745,21 @@ function codexState(text) {
 }
 
 /** True when the canonical table already says exactly what Cellar would write. */
-function tableMatches(doc, table) {
-	return TOML_KEYS.every((spec) => {
+function tableMatches(doc, table, args = SERVER_ARGS) {
+	return tomlKeys(args).every((spec) => {
 		const found = readAssignment(doc, table, spec.key);
 		return !!found && spec.matches(found.value);
 	});
 }
 
 /** Rewrite `command`/`args` inside the existing table, leaving all else intact. */
-function rewriteTable(doc, table) {
+function rewriteTable(doc, table, args) {
 	const lines = [...doc.lines];
 	// An inserted line wears the file's own ending; `lines` are joined with '\n'
 	// and each already carries its own '\r', so untouched lines are byte-identical.
 	const nl = (text) => (doc.eol === '\r\n' ? text + '\r' : text);
 	// Replace from the bottom up so an earlier edit cannot shift a later index.
-	const edits = TOML_KEYS.map((spec) => ({ ...spec, found: readAssignment(doc, table, spec.key) }));
+	const edits = tomlKeys(args).map((spec) => ({ ...spec, found: readAssignment(doc, table, spec.key) }));
 	for (const e of [...edits].sort((a, b) => (b.found?.first ?? -1) - (a.found?.first ?? -1))) {
 		// A key whose value already says what Cellar would write is LEFT ALONE. The
 		// splice replaces whole physical lines, so rewriting it would destroy that
@@ -745,12 +781,12 @@ function rewriteTable(doc, table) {
  * Append the canonical table, separated by exactly one blank line, in the file's
  * own line ending (an LF block appended to a CRLF config is a whole-file diff).
  */
-function appendTable(text) {
+function appendTable(text, args) {
 	const eol = dominantEol(text);
 	let body = text;
 	if (body !== '' && !body.endsWith('\n')) body += eol;
 	if (body.trim() !== '' && !body.endsWith(eol + eol)) body += eol;
-	return body + TOML_BLOCK.join(eol) + eol;
+	return body + tomlBlock(args).join(eol) + eol;
 }
 
 /**
@@ -766,7 +802,7 @@ function readCodexFile(file) {
 	return { existing: src.text, state: codexState(src.text) };
 }
 
-function writeTomlConfig(file) {
+function writeTomlConfig(file, args) {
 	const { existing, state } = readCodexFile(file);
 
 	if (state.kind === 'malformed') {
@@ -788,11 +824,11 @@ function writeTomlConfig(file) {
 	let next;
 	let status;
 	if (state.kind === 'table') {
-		if (tableMatches(state.doc, state.table)) return { status: 'already', message: 'already configured' };
-		next = rewriteTable(state.doc, state.table);
+		if (tableMatches(state.doc, state.table, args)) return { status: 'already', message: 'already configured' };
+		next = rewriteTable(state.doc, state.table, args);
 		status = 'updated';
 	} else {
-		next = appendTable(existing);
+		next = appendTable(existing, args);
 		status = 'wrote';
 	}
 	if (next === existing) return { status: 'already', message: 'already configured' };
@@ -848,17 +884,26 @@ export function harnessStates(workspace) {
 }
 
 /**
- * Register Cellar's MCP server for `name` in `workspace`. Idempotent and
+ * Register Cellar's MCP server for `name` in `dir`. Idempotent and
  * non-destructive (see the header). Returns
  * `{ ok, name, label, file, status, message, note }` where `status` is one of
  * `already` | `wrote` | `updated` | `skipped`, and `ok` is false only for an
  * unknown harness.
  *
+ * `opts.args` overrides the command's arguments, and is the ONE way a caller may
+ * vary what gets written — there is still exactly one writer. It exists for the
+ * adopted-worktree case, where `dir` is NOT the workspace and the entry therefore
+ * has to name the instance (`instanceArgs`); omitted, the canonical `SERVER_ARGS`
+ * are written, so an ordinary workspace launch is byte-identical to what it always
+ * was. It also decides IDEMPOTENCE, so a config carrying different args than the
+ * caller asked for is rewritten rather than reported `already`.
+ *
  * @param {string} name
- * @param {string} workspace
+ * @param {string} dir
+ * @param {{ args?: string[] }} [opts]
  * @returns {HarnessResult}
  */
-export function configureHarness(name, workspace) {
+export function configureHarness(name, dir, opts = {}) {
 	const h = getHarness(name);
 	if (!h) {
 		return {
@@ -868,8 +913,9 @@ export function configureHarness(name, workspace) {
 			message: `unknown harness "${name}" (supported: ${harnessNames().join(', ')})`
 		};
 	}
-	const file = join(workspace, h.configPath);
-	const result = h.format === 'json' ? writeJsonConfig(file) : writeTomlConfig(file);
+	const args = opts.args ?? SERVER_ARGS;
+	const file = join(dir, h.configPath);
+	const result = h.format === 'json' ? writeJsonConfig(file, args) : writeTomlConfig(file, args);
 	return { ok: true, name: h.name, label: h.label, file, note: h.note, ...result };
 }
 // ---- Allow-list + reconcile ------------------------------------------------

@@ -77,7 +77,12 @@ beforeAll(async () => {
 	mkdirSync(WS, { recursive: true });
 	git(WS, 'init', '-q', '-b', 'main');
 	writeFileSync(join(WS, 'f.txt'), 'x\n');
-	git(WS, 'add', 'f.txt');
+	// `.cellar/` is runtime state Cellar gitignores in every real project (the harness
+	// allow-list this suite writes lives there). Committed BEFORE the worktree is added
+	// so both checkouts carry it — without it the clean-checkout assertions below hold
+	// or not depending on which test last touched the allow-list.
+	writeFileSync(join(WS, '.gitignore'), '.cellar/\n');
+	git(WS, 'add', 'f.txt', '.gitignore');
 	git(WS, 'commit', '-q', '-m', 'init');
 	git(WS, 'worktree', 'add', '-q', SIBLING, '-b', 'under-review');
 
@@ -110,9 +115,50 @@ describe('what gets written into an adopted worktree', () => {
 		expect(r?.file).toBe(join(SIBLING, '.mcp.json'));
 
 		// The content is the harness writer's, unchanged — this module adds no second
-		// writer, it only decides WHEN and WHERE.
+		// writer, it only decides WHEN and WHERE (and, per rule 5, WITH WHICH ARGS).
 		const cfg = JSON.parse(readFileSync(join(SIBLING, '.mcp.json'), 'utf8'));
 		expect(cfg.mcpServers.cellar).toMatchObject({ command: 'cellar' });
+	});
+
+	it('NAMES THE INSTANCE: the worktree entry carries --workspace, the workspace’s does not', () => {
+		// The whole point of writing at all. `cellar mcp` reads `<cwd>/.cellar/runtime.json`
+		// and does NOT walk up, so the canonical bare `["mcp"]` entry — correct at the root
+		// of the workspace Cellar runs in — is INERT in a worktree: the agent's cwd is the
+		// worktree, no instance is running there, and the bridge exits 1. Cellar would have
+		// dropped a file into a checkout the user did not open, added a repo-common ignore
+		// rule for it, and left the agent with no Cellar tools.
+		mod.configureAdoptedWorktree(SIBLING);
+		const wt = JSON.parse(readFileSync(join(SIBLING, '.mcp.json'), 'utf8'));
+		expect(wt.mcpServers.cellar.args).toEqual(['mcp', '--workspace', WS]);
+
+		// …and the OTHER direction, which is what keeps today's zero-config behavior
+		// byte-identical: the workspace's own config still gets the bare canonical entry,
+		// because there `cellar mcp` resolves the instance from the cwd already.
+		try {
+			expect(harness.configureHarness('claude', WS).status).toBe('wrote');
+			const own = JSON.parse(readFileSync(join(WS, '.mcp.json'), 'utf8'));
+			expect(own.mcpServers.cellar.args).toEqual(['mcp']);
+		} finally {
+			rmSync(join(WS, '.mcp.json'), { force: true });
+		}
+	});
+
+	it('the selector reaches EVERY harness format, not just JSON', () => {
+		// A `.codex/config.toml` written without it is inert in exactly the same way, so
+		// the override has to be a property of the writer rather than of one format.
+		harness.allowHarness('codex', WS);
+		try {
+			mod.configureAdoptedWorktree(SIBLING);
+			const toml = readFileSync(join(SIBLING, '.codex', 'config.toml'), 'utf8');
+			expect(toml).toContain(`args = ["mcp", "--workspace", ${JSON.stringify(WS)}]`);
+			// And a re-adoption is still idempotent against those args, not against the
+			// canonical ones — else every launch would rewrite the file.
+			expect(mod.configureAdoptedWorktree(SIBLING)?.status).toBe('already');
+		} finally {
+			harness.disallowHarness('codex', WS);
+			harness.allowHarness('claude', WS);
+			rmSync(join(SIBLING, '.codex'), { recursive: true, force: true });
+		}
 	});
 
 	it('leaves the checkout CLEAN, via the repo-common .git/info/exclude', () => {
@@ -367,6 +413,23 @@ describe('failure is REPORTED, never thrown', () => {
 			// And git agrees — the user's own file is visible again, which is the whole point.
 			expect(() => git(SIBLING, 'check-ignore', '-q', '.mcp.json')).toThrow();
 			expect(git(SIBLING, 'status', '--porcelain', '-uall')).toContain('.mcp.json');
+		} finally {
+			rmSync(join(SIBLING, '.mcp.json'), { force: true });
+		}
+	});
+
+	it('removes an exclude FILE it created, rather than leaving an empty one behind', () => {
+		// The same rule at the other edge: with no `info/exclude` in the repo, the write
+		// creates one, so a revert that only splices its own bytes out leaves a zero-byte
+		// file where there was none. Git treats absent and empty the same, so this is the
+		// header's byte-identity claim rather than behavior — and a claim that is asserted
+		// has to hold literally, because that is what a future change relies on.
+		rmSync(EXCLUDE, { force: true });
+		expect(existsSync(EXCLUDE)).toBe(false);
+		writeFileSync(join(SIBLING, '.mcp.json'), 'not json at all\n');
+		try {
+			expect(mod.configureAdoptedWorktree(SIBLING)?.status).toBe('skipped');
+			expect(existsSync(EXCLUDE)).toBe(false);
 		} finally {
 			rmSync(join(SIBLING, '.mcp.json'), { force: true });
 		}
