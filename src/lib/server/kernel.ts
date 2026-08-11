@@ -25,7 +25,7 @@
  * request's response, so one run == one stream. No global broadcast, so there is
  * no way for outputs to be duplicated or cross runs.
  */
-import { basename, sep } from 'node:path';
+import { sep } from 'node:path';
 import { KernelManager, ServerConnection, CommsOverSubshells, KernelAPI } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
