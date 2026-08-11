@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { SDK_DBUTILS_FOREIGN_WARNING } from '../../src/lib/dbutilsShim';
 
 /**
  * THE connect-leaves-runtime-off invariant.
@@ -30,7 +31,18 @@ const hoisted = vi.hoisted(() => ({
 	session: 1 as number | null,
 	connect: { ok: true, host: 'https://test.databricks.com', spark_version: '3.5.0' } as Record<string, unknown>,
 	/** What the LIVE kernel session was started with - the thing the sidebar reports. */
-	liveRuntime: { started: true, version: null as string | null }
+	liveRuntime: { started: true, version: null as string | null },
+	/**
+	 * What the kernel answers the `dbutils` binding probe with. Default: the shim is
+	 * installed and no cell has imported `databricks.sdk.runtime` yet.
+	 */
+	binding: { ok: true, sdk_imported: false, sdk_is_shim: null } as Record<string, unknown>,
+	/** How many times the kernel was asked that question - the probe must stay bounded. */
+	bindingProbes: 0,
+	/** Makes the binding probe FAIL, so the failure path can be exercised too. */
+	bindingThrows: false,
+	/** The live kernel's status, so a BUSY kernel can be exercised. */
+	kernelStatus: 'idle' as string
 }));
 
 vi.mock('../../src/lib/server/kernel', () => ({
@@ -40,6 +52,11 @@ vi.mock('../../src/lib/server/kernel', () => ({
 		if (code.includes('_cellar_dbx_ping')) payload = { ok: true, alive: true, expired: false };
 		else if (code.includes('_cellar_dbx_connect')) payload = hoisted.connect;
 		else if (code.includes('_cellar_dbx_disconnect')) payload = { ok: true, stopped: true };
+		else if (code.includes('_cellar_dbutils_binding')) {
+			hoisted.bindingProbes++;
+			if (hoisted.bindingThrows) throw new Error('kernel unreachable');
+			payload = hoisted.binding;
+		}
 		else payload = { ok: true };
 		onEvent({
 			type: 'output',
@@ -48,7 +65,7 @@ vi.mock('../../src/lib/server/kernel', () => ({
 		return {};
 	},
 	currentSessionId: () => hoisted.session,
-	kernelStatus: () => ({ status: 'idle', id: 'k1' }),
+	kernelStatus: () => ({ status: hoisted.kernelStatus, id: 'k1' }),
 	liveDatabricksRuntime: () => hoisted.liveRuntime
 }));
 
@@ -76,6 +93,10 @@ beforeEach(async () => {
 	hoisted.session = 1;
 	hoisted.connect = { ok: true, host: 'https://test.databricks.com', spark_version: '3.5.0' };
 	hoisted.liveRuntime = { started: true, version: null };
+	hoisted.binding = { ok: true, sdk_imported: false, sdk_is_shim: null };
+	hoisted.bindingProbes = 0;
+	hoisted.bindingThrows = false;
+	hoisted.kernelStatus = 'idle';
 	// A clean preference store for every case: the whole point is what a connect
 	// leaves behind, so a leftover opt-in from a previous case would mask it.
 	ui.setUiState({ [keys.DBX_RUNTIME_KEY]: null });
@@ -155,7 +176,9 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 			// shows) - the point of this suite is that it never becomes `liveVersion`.
 			preference: true,
 			envForced: null,
-			versionEnvForced: null
+			versionEnvForced: null,
+			// Nothing advertised, so the SDK-import binding is deliberately NOT probed.
+			sdkDbutils: 'unknown'
 		});
 	});
 
@@ -168,7 +191,8 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 			// …and it reports the live version even though nothing opted in.
 			preference: false,
 			envForced: null,
-			versionEnvForced: null
+			versionEnvForced: null,
+			sdkDbutils: 'not_imported'
 		});
 	});
 
@@ -181,8 +205,146 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 			liveVersion: null,
 			preference: true,
 			envForced: null,
-			versionEnvForced: null
+			versionEnvForced: null,
+			sdkDbutils: 'unknown'
 		});
+	});
+});
+
+/**
+ * The `dbutils` SDK-import bypass, as the two surfaces report it.
+ *
+ * `from databricks.sdk.runtime import dbutils` must reach Cellar's shim; when it
+ * does not, the SDK's own object renders the parameter widgets and then discards
+ * every entered value on re-declaration. Nothing on screen says so - which is why
+ * both the Runtime card (`getStatus().runtime.sdkDbutils`) and the agent surface
+ * (`databricks_status`) have to say it instead. The rebind itself is proven
+ * against real Python in `dbutils-sdk-import.test.ts`; this pins the WIRING: what
+ * each surface reports, and that asking costs a bounded, kernel-safe probe.
+ *
+ * Each case picks its own kernel SESSION before connecting, because the reading is
+ * cached per (notebook, session) - a restart re-runs the shim installer, so a
+ * reading from another epoch says nothing about this one.
+ */
+describe('the SDK-import dbutils binding is reported, never left silent', () => {
+	const FOREIGN = { ok: true, sdk_imported: true, sdk_is_shim: false };
+	const BOUND = { ok: true, sdk_imported: true, sdk_is_shim: true };
+
+	async function connectWith(session: number, binding: Record<string, unknown>, version = '15.4') {
+		hoisted.session = session;
+		hoisted.binding = binding;
+		await connectA();
+		hoisted.liveRuntime = { started: true, version };
+	}
+
+	it('warns on both surfaces when the module holds something other than the shim', async () => {
+		await connectWith(11, FOREIGN);
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('foreign');
+		const agent = (await dbx.agentStatus(A())) as Record<string, unknown>;
+		// Same sentence for the human and the agent - one source, so they cannot drift.
+		expect(agent.dbutils_widgets_warning).toBe(SDK_DBUTILS_FOREIGN_WARNING);
+		// ...and the connection answer it decorates is still intact.
+		expect(agent.connected).toBe(true);
+	});
+
+	it('says nothing when the import path really does reach the shim', async () => {
+		await connectWith(12, BOUND);
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('shim');
+		expect((await dbx.agentStatus(A())) as Record<string, unknown>).not.toHaveProperty(
+			'dbutils_widgets_warning'
+		);
+	});
+
+	it('does not ask - and never warns - when no runtime is advertised', async () => {
+		// Without the runtime the rebind is deliberately not installed, so the SDK
+		// holding its own `dbutils` is expected, not a defect. This is also what keeps
+		// the probe off every ordinary status read.
+		await connectWith(13, FOREIGN, null as unknown as string);
+		hoisted.liveRuntime = { started: true, version: null };
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+		expect((await dbx.agentStatus(A())) as Record<string, unknown>).not.toHaveProperty(
+			'dbutils_widgets_warning'
+		);
+		expect(hoisted.bindingProbes).toBe(0);
+	});
+
+	it('never queues behind a running cell: a BUSY kernel is skipped, not warned about', async () => {
+		await connectWith(14, FOREIGN);
+		hoisted.kernelStatus = 'busy';
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+		expect(hoisted.bindingProbes).toBe(0);
+	});
+
+	it('is skipped by the run QUEUE too, before jupyter has flipped to busy', async () => {
+		// The check-then-act window `kernelState`/`inspectVariables` already close: a
+		// run claims the kernel synchronously at dequeue while jupyter's idle->busy
+		// flip lands a beat later. Reading only the status let the probe dispatch into
+		// the kernel's exec lock and block for the WHOLE cell - and since this is
+		// single-flight and awaited inside `getStatus`, a multi-minute Spark cell would
+		// strand the Databricks panel and `databricks_status` with it. Driven through
+		// the REAL queue, so it cannot pass against a re-stated rule that has drifted.
+		const { enqueueRun } = await import('../../src/lib/server/run-queue');
+		await connectWith(17, FOREIGN);
+		const ticket = enqueueRun({ nb: A(), cellId: 'cell-1' });
+		try {
+			// jupyter still says idle - the queue is the only thing that knows.
+			expect(hoisted.kernelStatus).toBe('idle');
+			expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+			expect((await dbx.agentStatus(A())) as Record<string, unknown>).not.toHaveProperty(
+				'dbutils_widgets_warning'
+			);
+			expect(hoisted.bindingProbes).toBe(0);
+		} finally {
+			if (!ticket.duplicate) ticket.done();
+		}
+		// ...and the moment the run releases the kernel, the reading is taken again.
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('foreign');
+		expect(hoisted.bindingProbes).toBe(1);
+	});
+
+	it('caches the reading, so a burst of status reads costs one probe', async () => {
+		await connectWith(15, FOREIGN);
+		await Promise.all([dbx.getStatus(A()), dbx.getStatus(A())]);
+		await dbx.getStatus(A());
+		expect(hoisted.bindingProbes).toBe(1);
+	});
+
+	it('bounds a FAILING probe the same way, so a wedged kernel is asked once per window', async () => {
+		// The round-trip is unbounded from `sdkDbutilsState`'s point of view: a wedged
+		// kernel settles only via the watchdog's probe/strike path (~90-210s), and this
+		// is awaited inside `getStatus`. Single-flight collapses concurrent readers but
+		// not sequential ones, so an uncached failure made EVERY later status read pay
+		// that again. The cached failure still reads `unknown` and still never warns.
+		hoisted.bindingThrows = true;
+		await connectWith(18, FOREIGN);
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+		expect((await dbx.agentStatus(A())) as Record<string, unknown>).not.toHaveProperty(
+			'dbutils_widgets_warning'
+		);
+		expect(hoisted.bindingProbes).toBe(1);
+	});
+
+	it('a cached failure never shadows the next genuine reading in a new session', async () => {
+		hoisted.bindingThrows = true;
+		await connectWith(19, FOREIGN);
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+		// A restart re-runs the shim installer, so the epoch moves and the cached
+		// failure - which was about the previous namespace - cannot answer for it.
+		hoisted.bindingThrows = false;
+		hoisted.session = 20;
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('foreign');
+		expect(hoisted.bindingProbes).toBe(2);
+	});
+
+	it('reads an unusable answer as unknown rather than as a defect', async () => {
+		// Over-reporting is the one direction this must not fail in: a warning over a
+		// reading nobody obtained sends the user restarting a healthy kernel.
+		await connectWith(16, { ok: false, message: 'boom' });
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+		expect((await dbx.agentStatus(A())) as Record<string, unknown>).not.toHaveProperty(
+			'dbutils_widgets_warning'
+		);
 	});
 });
 

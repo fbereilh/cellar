@@ -16,6 +16,16 @@
  * per-workspace setting, persisted in the UI-state store and honored at
  * kernel-start time (see `kernel.ts`).
  *
+ * The user's own `IS_DATABRICKS` gate is no longer the only reader of that
+ * variable: the widgets shim's installer (`widgetsShim.ts`, injected later in the
+ * SAME coalesced startup exec) reads it straight from `os.environ` and, when it is
+ * set, points `databricks.sdk.runtime.dbutils` at Cellar's shim - because library
+ * code that runs both on and off a cluster imports `dbutils` from there rather
+ * than using the bare name, and the SDK's own object discards entered widget
+ * values on re-declaration. The env IS that decision, so the gate cannot drift
+ * from this module and needs no second flag; it is also why the env snippet must
+ * stay the FIRST startup part.
+ *
  * Two deliberate divergences from the sibling `projectRoot.ts` toggle:
  *
  *   1. **Default OFF, and additionally scoped to a Databricks-connected notebook.**

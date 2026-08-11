@@ -29,11 +29,34 @@
  * the bare `dbutils.widgets.*` name that pasted Databricks code uses, and the
  * SDK's own `w.dbutils` stays untouched and reachable. No double-binding.
  *
+ * THE SDK IMPORT PATH (and why binding the bare global is not enough). Databricks
+ * library code that must run both on and off a cluster does not use the bare name -
+ * it writes `from databricks.sdk.runtime import dbutils`. Off a cluster that yields
+ * the SDK's own `RemoteDbUtils` -> `IPyWidgetUtil`, which on re-declaration
+ * DISCARDS the existing widget and builds a fresh one at the default
+ * (`databricks/sdk/_widgets/ipywidgets_utils.py`). The idiomatic parser declares
+ * and reads in one pass, so on that path an edited value can never be observed -
+ * not on re-run, not ever - while the controls still render (the SDK uses
+ * ipywidgets too). That is SILENT inertness: rendered controls are exactly the
+ * signal a user reads as "this works". So when Cellar is advertising a Databricks
+ * runtime (`DATABRICKS_RUNTIME_VERSION`, the whole point of which is to send
+ * `IS_DATABRICKS`-gated code down its `dbutils.widgets` path), the installer ALSO
+ * points `databricks.sdk.runtime.dbutils` at this same shim instance, so both
+ * access paths share one value-preserving registry. Scoped to the advertised
+ * runtime deliberately: mutating a third-party module's attribute is defensible
+ * exactly where Cellar is already emulating the runtime that module is written
+ * for. `w.dbutils` is a DIFFERENT object and stays untouched (above).
+ *
  * TESTABILITY (mirrors `SPARK_PROGRESS_CORE_PY`). The pure core is
  * parameterized by an injected widget factory (`_ipw`) and `display`, so
  * `tests/unit/widgets-shim.test.ts` drives it with a FAKE ipywidgets module — no
  * real ipywidgets needed to prove the value/return-type behavior.
  */
+
+// The module name, the probe→state rule and the user-facing sentence live in the
+// browser-safe `$lib/dbutilsShim` so the sidebar renders the same copy this file's
+// probe drives (the `databricksReauth.ts` precedent).
+import { SDK_RUNTIME_MODULE } from '../dbutilsShim';
 
 /**
  * The pure, ipywidgets-agnostic core: the value coercion + the `_CellarWidgets`
@@ -236,15 +259,141 @@ class _CellarDbUtils:
         # A compatible entry_point so driver-API-probing libraries (mlflow, ...)
         # see honest undefined/None values instead of an AttributeError at import.
         self.entry_point = _CellarEntryPoint()
+
+
+_CELLAR_SDK_RUNTIME = '${SDK_RUNTIME_MODULE}'
+
+
+class _CellarSdkRuntimeLoader:
+    # Wraps the REAL loader for \`databricks.sdk.runtime\` and repoints its
+    # \`dbutils\` the instant the module finishes executing - i.e. before the
+    # \`from ... import dbutils\` that triggered the import reads the attribute.
+    # Python has no built-in post-import hook (PEP 369 was withdrawn), so wrapping
+    # the loader is the mechanism; everything else is delegated untouched.
+    #
+    # STRICTLY NO WORSE THAN NO WRAPPER. importlib feature-detects on the loader it
+    # is handed, which is now this wrapper rather than the real one - so a method
+    # defined here unconditionally makes importlib take a path the inner loader may
+    # not support, and the delegation then raises AttributeError and the import
+    # FAILS. That would turn a discarded-widget-value bug (recoverable) into an
+    # unimportable module (not), against this module's own best-effort contract. So
+    # \`create_module\` is guarded, and the finder declines to wrap at all when the
+    # inner loader has no \`exec_module\` (a legacy \`load_module\`-only loader).
+    def __init__(self, inner, bind):
+        self._inner = inner
+        self._bind = bind
+
+    def create_module(self, spec):
+        _create = getattr(self._inner, 'create_module', None)
+        # None means "use default module creation" - what importlib does for an
+        # inner loader that defines no create_module of its own.
+        return _create(spec) if _create is not None else None
+
+    def exec_module(self, module):
+        self._inner.exec_module(module)
+        self._bind(module)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _CellarSdkRuntimeFinder:
+    # A meta-path finder that claims ONLY \`databricks.sdk.runtime\`, re-resolves it
+    # through the normal machinery (skipping itself via _busy, so the real spec is
+    # found) and hands back the same spec with a wrapping loader. Anything it
+    # cannot resolve it declines, so a workspace without databricks-sdk imports
+    # exactly as before. This is the half that covers an import happening AFTER
+    # the shim ran; the installer covers a module already in sys.modules.
+    #
+    # SELF-CONTAINED ON PURPOSE: this instance lives in \`sys.meta_path\`, which
+    # OUTLIVES the kernel's user namespace, so it must never read a module-level
+    # name. A namespace clear that is not a process restart (\`%reset -f\` being the
+    # everyday one) removes the shim's globals while leaving this finder installed;
+    # resolving the module name or the loader class as globals then raised NameError
+    # on the very first comparison, and the import system does not swallow a
+    # finder's exception - so EVERY import in the kernel failed, not just this one.
+    # Everything it needs is captured on the instance in __init__, and the body is
+    # additionally wrapped so a broken finder can only ever DECLINE.
+    _cellar_sdk_runtime_finder = True
+
+    def __init__(self, name, loader_cls, bind):
+        self._name = name
+        self._loader_cls = loader_cls
+        self._bind = bind
+        self._busy = False
+
+    def find_spec(self, fullname, path=None, target=None):
+        try:
+            if fullname != self._name or self._busy:
+                return None
+            import importlib.util as _util
+            self._busy = True
+            try:
+                _spec = _util.find_spec(fullname)
+            except Exception:
+                return None
+            finally:
+                self._busy = False
+            if _spec is None or getattr(_spec, 'loader', None) is None:
+                return None
+            # Only wrap a loader this wrapper can faithfully proxy. A legacy
+            # \`load_module\`-only loader is left alone: declining costs the rebind
+            # for that exotic case, substituting would cost the import itself.
+            if not hasattr(_spec.loader, 'exec_module'):
+                return None
+            _spec.loader = self._loader_cls(_spec.loader, self._bind)
+            return _spec
+        except Exception:
+            return None
+
+
+def _cellar_bind_sdk_dbutils(_db):
+    # Make \`from databricks.sdk.runtime import dbutils\` reach the SAME shim
+    # instance as the bare global - whether that module is imported BEFORE this
+    # runs (patch it in place) or AFTER (the finder above). Best-effort
+    # throughout: a failure here must never break kernel bring-up, and the
+    # detect-and-report probe surfaces a binding that did not take.
+    import sys as _sys
+
+    # Read the module name and the loader class HERE, while the shim's globals are
+    # known to exist, and hand them to the finder as instance state: the finder
+    # outlives this namespace (see its own note), so it may not look them up later.
+    _name = _CELLAR_SDK_RUNTIME
+    _loader_cls = _CellarSdkRuntimeLoader
+
+    def _bind(_mod):
+        try:
+            _mod.dbutils = _db
+        except Exception:
+            pass
+
+    _mod = _sys.modules.get(_name)
+    if _mod is not None:
+        _bind(_mod)
+    # Idempotent: drop a finder left by an earlier install (it closes over a stale
+    # shim instance) rather than stacking a second one.
+    _sys.meta_path[:] = [
+        _f for _f in _sys.meta_path
+        if getattr(_f, '_cellar_sdk_runtime_finder', False) is not True
+    ]
+    _sys.meta_path.insert(0, _CellarSdkRuntimeFinder(_name, _loader_cls, _bind))
 `;
 
 /**
  * The guarded installer: import ipywidgets + IPython.display (silent value-only
- * degrade if either is absent), build the registry, bind the global `dbutils`.
- * Runs on every fresh start AND after a restart (which clears the namespace), so
- * `dbutils` is always present and a restart resets the widget registry.
+ * degrade if either is absent), build the registry, bind the global `dbutils`, and
+ * - only while a Databricks runtime is being advertised - point the SDK import
+ * path at that same shim. Runs on every fresh start AND after a restart (which
+ * clears the namespace), so `dbutils` is always present and a restart resets the
+ * widget registry.
+ *
+ * The runtime gate reads `DATABRICKS_RUNTIME_VERSION` straight from the
+ * environment rather than taking a flag from TypeScript: `kernel.ts` injects that
+ * env var (from `shouldInjectDatabricksRuntime`) as the FIRST startup part of the
+ * same coalesced exec, so the env IS the decision - reading it here cannot drift
+ * from it, and it needs no new plumbing.
  */
-const WIDGETS_SHIM_INSTALL_PY = `
+export const WIDGETS_SHIM_INSTALL_PY = `
 def _cellar_install_widgets():
     _g = globals()
     try:
@@ -258,10 +407,62 @@ def _cellar_install_widgets():
         except Exception:
             _ipw = None
             _display = None
-    _g['dbutils'] = _CellarDbUtils(_CellarWidgets(_ipw, _display))
+    _db = _CellarDbUtils(_CellarWidgets(_ipw, _display))
+    _g['dbutils'] = _db
+    import os as _os
+    if _os.environ.get('DATABRICKS_RUNTIME_VERSION'):
+        try:
+            _cellar_bind_sdk_dbutils(_db)
+        except Exception:
+            pass
 _cellar_install_widgets()
 del _cellar_install_widgets
 `;
+
+/**
+ * Kernel-side probe for the above. Self-contained on purpose - it looks every
+ * shim name up through `globals()` rather than calling into the shim, so it still
+ * answers honestly when the shim install itself failed instead of dying with a
+ * NameError. Prints ONE `sentinel`-prefixed JSON line, like the Databricks
+ * `PROBE`/`PING_CODE` it is run alongside, and cleans up after itself.
+ *
+ * `sdk_is_shim` answers EXACTLY what the warning claims - "the module's `dbutils`
+ * is not a Cellar shim" - so it is an `isinstance` test on that attribute alone,
+ * never a comparison against whatever the bare global happens to hold now. Those
+ * two diverge in both directions: after a `%reset -f` the bare name and the class
+ * are gone from the namespace while the surviving finder still binds the module to
+ * a fully working shim, and a user rebinding `dbutils = w.dbutils` moves the bare
+ * name without touching the import path. Reporting either as `foreign` would tell
+ * the user their widget values are being discarded when they are not.
+ *
+ * When the class itself is gone (a cleared namespace) nothing here can decide
+ * whether an object IS a shim, so it reports `None` - which the classifier reads as
+ * `unknown`, and `unknown` never warns.
+ */
+export function dbutilsBindingProbeCode(sentinel: string): string {
+	return `
+import json as _cellar_json, sys as _cellar_sys
+
+def _cellar_dbutils_binding():
+    _cls = globals().get('_CellarDbUtils')
+    _mod = _cellar_sys.modules.get('${SDK_RUNTIME_MODULE}')
+    if _mod is None:
+        return {'ok': True, 'sdk_imported': False, 'sdk_is_shim': None}
+    if _cls is None:
+        return {'ok': True, 'sdk_imported': True, 'sdk_is_shim': None}
+    return {'ok': True, 'sdk_imported': True,
+            'sdk_is_shim': isinstance(getattr(_mod, 'dbutils', None), _cls)}
+
+try:
+    print('${sentinel}' + _cellar_json.dumps(_cellar_dbutils_binding()))
+except Exception as _e:
+    print('${sentinel}' + _cellar_json.dumps(
+        {'ok': False, 'message': '%s: %s' % (type(_e).__name__, _e)}))
+finally:
+    del _cellar_dbutils_binding, _cellar_json, _cellar_sys
+`;
+}
+
 
 /**
  * Full injection: the core (classes) + the installer that binds `dbutils`. Added
