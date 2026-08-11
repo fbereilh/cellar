@@ -3570,8 +3570,11 @@ export async function connectCluster({
  *     `databricksRuntime.ts`), so enabling it on an unconnected one stores the
  *     preference and advertises nothing. Stored-and-said, never a restart that
  *     would clear the namespace to change nothing.
- *   - a version forced by `CELLAR_DATABRICKS_RUNTIME_VERSION` discards the
- *     `version` argument; the result names it.
+ *   - a version forced by `CELLAR_DATABRICKS_RUNTIME_VERSION` OVERRIDES the
+ *     `version` argument for as long as it is set; the result names it. The passed
+ *     value is still STORED as the preference (never claim it was ignored - it
+ *     becomes the effective version the moment the override is removed), which is
+ *     also why nothing here skips the store write.
  * An on/off decision forced by `CELLAR_DATABRICKS_RUNTIME` is refused outright
  * (`runtime_env_forced`) - nothing this function does could move it.
  *
@@ -3651,7 +3654,7 @@ function runtimeNote({
 }): string {
 	const versionNote =
 		versionForcedByEnv && requested && requested !== versionForcedByEnv
-			? ` The version you passed was ignored: CELLAR_DATABRICKS_RUNTIME_VERSION pins it to "${versionForcedByEnv}".`
+			? ` The version you passed was stored as the preference, but it is currently overridden: CELLAR_DATABRICKS_RUNTIME_VERSION pins the advertised version to "${versionForcedByEnv}". Your value applies once that override is removed.`
 			: '';
 	// Enabling on a notebook with no Databricks session: stored, but the injection is
 	// scoped to a connected notebook, so nothing is advertised yet. Say so - a restart

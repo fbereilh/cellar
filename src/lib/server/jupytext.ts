@@ -127,14 +127,22 @@ export function detectPyNotebook(text: string): { notebook: boolean; format: str
  * That bound is the point: the caller (`list_notebooks`) sniffs EVERY `.py` in the
  * workspace, which in a real python project is hundreds of ordinary modules, on
  * the process that also carries the kernel websockets and the SSE fan-out.
+ *
+ * It is therefore the same marker VOCABULARY as the UI's detection route, applied
+ * to a bounded prefix rather than to the whole file, so the two can disagree at the
+ * extremes in BOTH directions: a percent notebook whose first `# %%` sits past this
+ * bound is opened by the UI and refused here, and a `.py` past the UI's own read
+ * cap (`MAX_FILE_BYTES`) is accepted here while the UI opens it as text. Both are
+ * accepted, and neither is a parity claim - do not read the shared predicate as one.
  */
 const DETECT_PREFIX_BYTES = 64 * 1024;
 
 /**
  * Whether the `.py` file at `abs` is a notebook Cellar can OPEN — the on-disk
  * counterpart of `detectPyNotebook`, for callers that hold a path rather than the
- * text. Same rule (an explicit marker, never a markerless script), so what
- * `list_notebooks` offers and what `use_notebook` accepts cannot drift.
+ * text. Same marker rule (an explicit marker, never a markerless script) over a
+ * bounded prefix, so what `list_notebooks` offers and what `use_notebook` accepts
+ * cannot drift from each other.
  *
  * Reads a bounded prefix (see `DETECT_PREFIX_BYTES`) and answers FALSE for
  * anything it cannot read at all (missing, a directory, EACCES, binary): "not a

@@ -18,7 +18,7 @@
  * so it is the thing under test.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -56,6 +56,8 @@ beforeAll(async () => {
 	writeFileSync(join(WS, 'scripts', 'parity.py'), DBX);
 	writeFileSync(join(WS, 'percent_nb.py'), PERCENT);
 	writeFileSync(join(WS, 'helpers.py'), PLAIN);
+	// A real, non-notebook file with an extension: `use_notebook` must not take it.
+	writeFileSync(join(WS, 'package.json'), '{\n  "name": "not-a-notebook"\n}\n');
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
 	// An ordinary notebook to switch the user's focus to.
@@ -90,6 +92,18 @@ describe('use_notebook resolves a .py notebook literally', () => {
 
 	it('a plain .py module is refused as a notebook', () => {
 		expect(() => svc.useNotebook('sessPlain', 'helpers.py')).toThrow(/plain Python file/i);
+	});
+
+	it('an existing NON-notebook file is never opened as one, whatever its extension', () => {
+		// Only a path naming a notebook FORMAT resolves literally. Resolving any existing
+		// file would pin it, and the first add_cell/edit_cell would then persist nbformat
+		// JSON straight over the user's file.
+		const pkg = join(WS, 'package.json');
+		const before = readFileSync(pkg);
+		const r = svc.useNotebook('sessPkg', 'package.json');
+		expect(r.working_notebook).toBe('package.json.ipynb');
+		expect(svc.targetFor('sessPkg')).toBe(nbmod.resolveNotebookPath('package.json.ipynb'));
+		expect(readFileSync(pkg)).toEqual(before);
 	});
 });
 

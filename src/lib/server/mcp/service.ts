@@ -9,7 +9,7 @@
  * search, section, or execution result.
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
-import { dirname, extname } from 'node:path';
+import { dirname } from 'node:path';
 import {
 	listCells,
 	getCell,
@@ -237,14 +237,16 @@ export function useNotebook(sessionId: string | undefined, name?: string, create
  * therefore an ERROR (see `usePyNotebook`), never a rewrite: an agent that typed a
  * path means that path.
  *
- * Everything else gets `.ipynb` appended — the bare-name case (`untitled`,
- * `analysis`) this has always served, plus any other extension, which stays
- * append-on-suffix ONLY when no notebook exists at the literal path, so a real file
- * is never rewritten out from under the caller.
+ * Only a path naming a NOTEBOOK FORMAT is taken literally, and that is the whole
+ * rule: `.ipynb` and `.py`, nothing else. Everything else gets `.ipynb` appended -
+ * the bare-name case (`untitled`, `analysis`) this has always served, AND any other
+ * extension, whether or not a file exists there. Resolving `package.json` (or any
+ * other real file) literally would pin it as the session's working notebook and let
+ * the first `add_cell`/`edit_cell` persist nbformat JSON over the user's file, so
+ * mere existence must never make a path notebook-shaped.
  */
 function notebookNameToPath(rel: string): string {
 	if (/\.ipynb$/i.test(rel) || isPyPath(rel)) return rel;
-	if (extname(rel) !== '' && notebookExists(rel)) return rel;
 	return rel + '.ipynb';
 }
 
@@ -259,8 +261,10 @@ function notebookNameToPath(rel: string): string {
  *     corrupt file, silently. Missing is an error naming the way to get one.
  *   - Being a `.py` does not make a file a notebook. A plain module has no cell
  *     structure; opening one would hand the agent a document whose cells are an
- *     artifact of the converter. `isPyNotebookFile` is the SAME marker rule the UI
- *     opens on, so what `list_notebooks` offers is exactly what this accepts.
+ *     artifact of the converter. `isPyNotebookFile` applies the same marker
+ *     VOCABULARY the UI's detection route opens on, over a bounded header prefix
+ *     rather than the whole file, so what `list_notebooks` offers is exactly what
+ *     this accepts (see `DETECT_PREFIX_BYTES` for where the two can disagree).
  */
 function usePyNotebook(sessionId: string | undefined, rel: string) {
 	if (!notebookExists(rel)) {

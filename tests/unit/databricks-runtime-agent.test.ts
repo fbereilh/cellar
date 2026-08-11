@@ -227,6 +227,13 @@ describe('databricks_runtime applies the advertisement', () => {
 		expect(r.version_forced_by_env).toBe('13.3');
 		expect(r.runtime.version).toBe('13.3');
 		expect(r.note).toMatch(/CELLAR_DATABRICKS_RUNTIME_VERSION/);
+		// The note must not claim the value was discarded: it IS stored, and it becomes
+		// the effective version the moment the override is removed.
+		expect(r.note).not.toMatch(/ignored/i);
+		expect(r.note).toMatch(/stored/i);
+		expect(r.note).toMatch(/overridden/i);
+		delete process.env.CELLAR_DATABRICKS_RUNTIME_VERSION;
+		expect(ui.databricksRuntimeVersion()).toBe('14.3');
 	});
 });
 
