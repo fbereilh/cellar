@@ -1081,6 +1081,7 @@ export function addCellAt(
 	role?: string | null
 ): Cell {
 	const doc = docFor(nb);
+	assertCanHoldRaw(doc, cellType);
 	const cell = newCell(cellType, source);
 	if (role) cell.metadata.cellar.role = role;
 	const at = Math.max(0, Math.min(index, doc.cells.length));
@@ -1173,12 +1174,15 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
  * converter, which rebuilds it from its cells and coerces every `cell_type` to
  * markdown|code - so a raw cell would live only in memory and come back from
  * disk as a runnable Python cell (see `textNotebookRawCellError`, which owns the
- * reasoning and the message). The guard sits at the doc-layer writers - the two
- * that CONVERT a cell and the one that CREATES one - so every surface offering a
- * raw cell (the type menu, the `r` chord, the bulk route, MCP `set_cell_type` /
- * `add_cell` / `add_cells` / `add_and_run`) is covered by this ONE rule rather
- * than by a check each of them could forget. Every other type is unaffected, and
- * an `.ipynb` never reaches the throw.
+ * reasoning and the message). The guard sits at EVERY doc-layer writer that can
+ * put `raw` into a document - the two that CONVERT a cell (`setCellType`,
+ * `setCellTypes`) and the two that CREATE one (`addCell`, `addCellAt`) - so every
+ * surface offering a raw cell (the type menu, the `r` chord, the bulk route, MCP
+ * `set_cell_type` / `add_cell` / `add_cells` / `add_and_run`) is covered by this
+ * ONE rule rather than by a check each of them could forget. `addCellAt`'s only
+ * caller passes 'code' today, so it is guarded to make the claim true by
+ * construction rather than by that caller's argument. Every other type is
+ * unaffected, and an `.ipynb` never reaches the throw.
  */
 function assertCanHoldRaw(doc: NotebookDoc, cellType: LogicalCellType): void {
 	if (cellType === 'raw' && doc.jpFormat) throw textNotebookRawCellError();
@@ -1247,12 +1251,31 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
  * rules - `cell:type` carries no metadata, so a client half that skipped one
  * would keep drawing a badge the server has already stripped, with no event able
  * to correct it before a reload. Two implementations, not one per call site.
+ *
+ * The import-binding seed below is the one rule with NO client half, deliberately:
+ * `importBindings` is a runtime-only staleness input the browser never reads (it
+ * fetches `/api/notebooks/staleness`), so there is nothing there to keep in step.
  */
 function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	const isSql = cellType === 'sql';
+	const wasCode = cell.cell_type === 'code';
 	cell.cell_type = nbCellType(cellType);
 	cell.metadata = cell.metadata ?? {};
 	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	// Becoming a code cell is the other way a cell acquires Python bindings without an
+	// edit, so it takes the same birth stamp `newCell` gives a code cell born with a
+	// source - and for the same reason: `newCell` stamps only a CODE cell, so a
+	// markdown/raw cell created with an imports-only source carries none, and an absent
+	// stamp reads as "these bindings have not changed", which would exempt the very edge
+	// this conversion just rebound (`edgeCarriesChange`). Folded from an EMPTY previous
+	// source, since nothing about this cell's bindings was ever proven while it held no
+	// Python; a birth records no removal, so there is nothing for the prune to date.
+	// Only on the way IN (a code→code sql toggle must not re-stamp and claim a change
+	// that did not happen), and never over an existing stamp - a cell that was code
+	// before carries real history a there-and-back conversion must not discard.
+	if (!wasCode && cell.cell_type === 'code' && !cell.metadata.cellar.importBindings) {
+		setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
+	}
 	if (isSql) cell.metadata.cellar.language = SQL_LANGUAGE;
 	else delete cell.metadata.cellar.language;
 	// A cell the kernel actually executes as Python. Markdown and raw never reach

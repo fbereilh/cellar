@@ -192,6 +192,38 @@ describe('an imports-cell edit stales only the affected dependents', () => {
 		expect(state(m, usesNp)).toBe(STALE_STATE.FRESH); // `np` still comes from the imports cell
 	});
 
+	it('a cell CONVERTED into code with a rebinding import stales its readers', async () => {
+		// The other way a cell acquires bindings without an edit. `newCell` stamps only a
+		// CODE cell, so one born markdown/raw with an imports-only source carries none -
+		// and an absent stamp reads as "unchanged", which would exempt the edge this
+		// conversion just rebound. `applyCellType` therefore seeds the birth stamp on the
+		// way in. No intervening `setSource`: a real edit re-seeds the baseline anyway,
+		// so only the conversion can decide this.
+		const { imports, usesPd, usesNp } = notebook();
+		const converted = nb.addCell(imports, 'markdown', abs, null, 'import polars as pd');
+		nb.setCellType(converted.id, 'code', abs);
+		const cell = nb.listCells(abs).find((c) => c.id === converted.id)!;
+		cell.metadata.cellar = { ...(cell.metadata.cellar ?? {}), lastRun: ranStamp(RAN_AT + 5000) };
+
+		const m = await staleness();
+		expect(state(m, usesPd)).toBe(STALE_STATE.STALE);
+		expect(state(m, usesNp)).toBe(STALE_STATE.FRESH); // `np` still comes from the imports cell
+	});
+
+	it('converting a code cell to markdown and back does not invent a rebinding', async () => {
+		// The seed must never CLOBBER a stamp a cell earned as code: its bindings really
+		// did stop changing when it last ran, and re-stamping them `now` would stale every
+		// reader after a round trip that ended where it started.
+		const { imports, usesPd, usesNp, joins } = notebook();
+		nb.setCellType(imports, 'markdown', abs);
+		nb.setCellType(imports, 'code', abs);
+
+		const m = await staleness();
+		expect(state(m, usesPd)).toBe(STALE_STATE.FRESH);
+		expect(state(m, usesNp)).toBe(STALE_STATE.FRESH);
+		expect(state(m, joins)).toBe(STALE_STATE.FRESH);
+	});
+
 	it('a transient unparseable mid-edit save does not re-stale the notebook', async () => {
 		// Cell.svelte autosaves on a 500ms debounce, so an intermediate snapshot of an
 		// imports-cell edit (here: the instant after a select-all) really is persisted.

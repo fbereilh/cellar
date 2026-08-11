@@ -9,9 +9,11 @@
  * exact silent degrade a first-class raw type exists to prevent, and worse from
  * MARKDOWN, whose prose would lose its markers on the way too.
  *
- * The rule therefore lives at the doc-layer WRITERS (`assertCanHoldRaw`), so the
- * type menu, the `r` chord, the bulk route, the REST routes and every MCP add /
- * convert tool are covered by ONE rule rather than by a check each could forget.
+ * The rule therefore lives at EVERY doc-layer WRITER that can put `raw` into a
+ * document (`assertCanHoldRaw`: the two that convert a cell and the two that
+ * create one), so the type menu, the `r` chord, the bulk route, the REST routes
+ * and every MCP add / convert tool are covered by ONE rule rather than by a check
+ * each could forget.
  * Everything else is untouched: any other conversion on a `.py` notebook, and
  * every raw cell in an `.ipynb`.
  *
@@ -116,6 +118,17 @@ describe('a .py notebook cannot hold a raw cell', () => {
 		expect(pyIds().length).toBe(before);
 		// The types it CAN hold still add.
 		nbmod.addCell(null, 'markdown', PY);
+		expect(pyIds().length).toBe(before + 1);
+	});
+
+	it('refuses the OTHER creator too (addCellAt), so the guard holds by construction', () => {
+		// Its only caller passes 'code' today, so this is unreachable in practice - but
+		// `assertCanHoldRaw` claims to sit at every writer, and a second creator that
+		// merely happens not to be asked for raw is not that claim.
+		const before = pyIds().length;
+		expect(() => nbmod.addCellAt(0, 'raw', PY)).toThrow(RawCellTypeError);
+		expect(pyIds().length).toBe(before);
+		nbmod.addCellAt(0, 'code', PY);
 		expect(pyIds().length).toBe(before + 1);
 	});
 });
@@ -270,7 +283,8 @@ describe('NO path can leave a .py notebook holding a degraded raw cell', () => {
 		for (const write of [
 			() => nbmod.setCellType(id, 'raw', PY),
 			() => nbmod.setCellTypes(pyIds(), 'raw', PY),
-			() => nbmod.addCell(id, 'raw', PY)
+			() => nbmod.addCell(id, 'raw', PY),
+			() => nbmod.addCellAt(0, 'raw', PY)
 		]) {
 			expect(write).toThrow(RawCellTypeError);
 		}
