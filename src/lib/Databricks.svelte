@@ -21,6 +21,7 @@
 	import { getUserSettingText, onUserSettingsChange } from '$lib/userSettings';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import { normalizeDatabricksHost } from '$lib/databricksHost';
+	import { SDK_DBUTILS_FOREIGN_WARNING } from '$lib/dbutilsShim';
 	import {
 		PROFILE_REAUTH_CODE,
 		REAUTH_COMMAND_HEAD,
@@ -134,6 +135,15 @@
 			preference?: boolean;
 			envForced?: boolean | null;
 			versionEnvForced?: string | null;
+			/**
+			 * Which `dbutils` the SDK import path (`from databricks.sdk.runtime import
+			 * dbutils`) resolves to in the running kernel. `foreign` is the one state
+			 * with something to say: the SDK's own object renders parameter widgets and
+			 * then discards every entered value on re-declaration, so the feature looks
+			 * like it works while doing nothing. Anything else - including a state the
+			 * server could not determine (`unknown`) - is silent.
+			 */
+			sdkDbutils?: 'shim' | 'foreign' | 'not_imported' | 'unknown';
 		};
 	}
 	/** What `POST /api/databricks/logout` reports, so the note can be honest about what was cleared. */
@@ -564,6 +574,16 @@
 	const runtimeApplicable = $derived(
 		runtimePending && runtimeKernelStarted && !runtimeEnvControlled && runtimeRestartable
 	);
+	/**
+	 * The running kernel advertises the runtime, a cell has imported
+	 * `databricks.sdk.runtime`, and its `dbutils` is NOT Cellar's shim - so widget
+	 * values entered through that import are being thrown away on every
+	 * re-declaration. Surfaced because it is otherwise INVISIBLE: the SDK draws the
+	 * same controls, so a user reads rendered widgets as proof the parameters work.
+	 * Reported only for the state the server actually observed - `unknown` (no
+	 * kernel, a busy one, a failed probe) says nothing.
+	 */
+	const runtimeSdkForeign = $derived(status?.runtime?.sdkDbutils === 'foreign');
 	const profiles = $derived(status?.config?.profiles ?? []);
 	const hasProfiles = $derived(profiles.length > 0);
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
@@ -2593,6 +2613,20 @@
 				<code class="font-mono text-[10px]">CELLAR_DATABRICKS_RUNTIME_VERSION</code> environment variable, not here.
 			{/if}
 		</p>
+		<!-- Silent inertness, made loud. With the runtime advertised, code that does
+		     `from databricks.sdk.runtime import dbutils` normally reaches Cellar's shim;
+		     when it does not, the SDK's own object renders the same controls and throws
+		     every entered value away on the next re-declaration, so nothing on screen
+		     says the parameters are dead. Warning-TINTED with `base-content` copy, never
+		     `text-warning` body text (amber on amber is ~2:1 on the light card). -->
+		{#if runtimeSdkForeign}
+			<p
+				class="mt-1.5 rounded border border-warning/40 bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-base-content/80"
+				data-testid="databricks-runtime-sdk-warning"
+			>
+				{SDK_DBUTILS_FOREIGN_WARNING}
+			</p>
+		{/if}
 		<!-- The one state with something to apply: the runtime is on and the running
 		     kernel does not carry it. Rendered ONLY here - anywhere else this would be a
 		     restart (and a namespace wipe) nobody asked for. It reuses `applyRuntime`, so

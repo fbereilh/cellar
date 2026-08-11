@@ -112,6 +112,12 @@ import {
 	pinTargetForConnect,
 	versionMismatchMessage
 } from './dbrVersion';
+import { dbutilsBindingProbeCode } from './widgetsShim';
+import {
+	classifySdkDbutils,
+	SDK_DBUTILS_FOREIGN_WARNING,
+	type SdkDbutilsState
+} from '../dbutilsShim';
 import { normalizeDatabricksHost } from '../databricksHost';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
 import { resolveUploadName, type UploadNameAffixes } from '../databricksUploadName';
@@ -1748,7 +1754,7 @@ export async function getStatus(nb?: string | null) {
 		signedInHosts: [...signedInHosts],
 		signedInProfiles: [...signedInProfiles],
 		connection: await liveConnection(nb),
-		runtime: runtimeStatus(nb)
+		runtime: await runtimeStatus(nb)
 	};
 }
 
@@ -1773,20 +1779,25 @@ export async function getStatus(nb?: string | null) {
  * an edit whose apply-restart wipes the namespace to advertise a value the override
  * discards.
  */
-function runtimeStatus(nb?: string | null): {
+async function runtimeStatus(nb?: string | null): Promise<{
 	kernelStarted: boolean;
 	liveVersion: string | null;
 	preference: boolean;
 	envForced: boolean | null;
 	versionEnvForced: string | null;
-} {
-	const live = liveDatabricksRuntime(resolveNotebookPath(nb));
+	sdkDbutils: SdkDbutilsState;
+}> {
+	const abs = resolveNotebookPath(nb);
+	const live = liveDatabricksRuntime(abs);
 	return {
 		kernelStarted: live.started,
 		liveVersion: live.version,
 		preference: databricksRuntimePreference(),
 		envForced: databricksRuntimeForced(),
-		versionEnvForced: databricksRuntimeVersionForced()
+		versionEnvForced: databricksRuntimeVersionForced(),
+		// Only asked while this session really advertises a runtime: that is both
+		// when the rebind is installed and the only case the answer means anything.
+		sdkDbutils: live.version === null ? 'unknown' : await sdkDbutilsState(abs)
 	};
 }
 
@@ -1833,6 +1844,98 @@ export function agentRuntimeBlock(nb?: string | null): AgentRuntimeBlock {
 		version: live.version,
 		forced_by_env: databricksRuntimeForced() !== null
 	};
+}
+
+/**
+ * How long a binding reading stays good. The Databricks panel does not poll
+ * `getStatus` on a timer (it loads on mount / visibility / `databricks:changed` /
+ * a kernel-session change), so this only has to collapse the bursts those
+ * triggers arrive in - the answer itself can change at any time, when a user cell
+ * imports the SDK, so it must stay short.
+ */
+const DBUTILS_BINDING_TTL_MS = 5_000;
+
+interface DbutilsBinding {
+	session: SessionId | null;
+	checkedAt: number;
+	state: SdkDbutilsState;
+}
+const dbutilsBindings = new Map<string, DbutilsBinding>();
+const dbutilsBindingInFlight = new Map<string, Promise<SdkDbutilsState>>();
+
+/**
+ * Which `dbutils` the SDK import path resolves to in this notebook's kernel - the
+ * detect half of the SDK-import bypass (see `widgetsShim.ts`). The bug it guards
+ * against is SILENT: the SDK's own `IPyWidgetUtil` renders controls and then
+ * throws every entered value away on the next re-declaration, so nothing on
+ * screen says anything is wrong. This is the only thing that can tell.
+ *
+ * It costs a kernel round-trip, so it is bounded the way every other Cellar probe
+ * is: it NEVER boots a kernel, never queues behind a running cell (a busy kernel
+ * is skipped, like `kernelState`), runs `internal: true` so it stays out of the
+ * run queue and out of `execs_this_session`, is single-flight, and is cached per
+ * kernel SESSION (a restart re-runs the installer, so a reading from a previous
+ * epoch says nothing about this one).
+ *
+ * Every failure resolves to `unknown`, never a warning: reporting a defect over a
+ * reading nobody obtained is the one direction this must not fail in.
+ */
+async function sdkDbutilsState(abs: string): Promise<SdkDbutilsState> {
+	const session = currentSessionId(abs);
+	const cached = dbutilsBindings.get(abs);
+	if (cached && cached.session === session && Date.now() - cached.checkedAt < DBUTILS_BINDING_TTL_MS) {
+		return cached.state;
+	}
+	const status = kernelStatus(abs).status;
+	// No kernel to ask (never start one for a status read), or one whose shell
+	// channel is blocked by the user's own cell. Fall back to the last reading for
+	// this session if there is one - it is stale but was true of this namespace -
+	// else say so.
+	if (status === 'not_started' || status === 'busy') {
+		return cached && cached.session === session ? cached.state : 'unknown';
+	}
+	const running = dbutilsBindingInFlight.get(abs);
+	if (running) return running;
+	const probe = (async (): Promise<SdkDbutilsState> => {
+		try {
+			const { result, session: ran } = await runInKernel(abs, dbutilsBindingProbeCode(SENTINEL));
+			const state = classifySdkDbutils(result);
+			dbutilsBindings.set(abs, { session: ran ?? session, checkedAt: Date.now(), state });
+			return state;
+		} catch {
+			// A kernel that could not be reached, an error output, an unparseable
+			// reply: all of them mean we did not learn anything.
+			return 'unknown';
+		} finally {
+			dbutilsBindingInFlight.delete(abs);
+		}
+	})();
+	dbutilsBindingInFlight.set(abs, probe);
+	return probe;
+}
+
+/**
+ * The agent-facing half of that detection: the warning to fold into
+ * `databricks_status`, or null when there is nothing to report. Same source of
+ * truth (and same sentence) as the Runtime card, so the human and the agent are
+ * never told different things about the same kernel.
+ */
+async function dbutilsShimWarning(abs: string): Promise<{ dbutils_widgets_warning: string } | null> {
+	// Best-effort throughout: this is a DECORATION on an answer the agent needs, so
+	// nothing here may take that answer down with it. Every failure resolves to "no
+	// warning", which is the same fail-safe direction `classifySdkDbutils` takes -
+	// never assert a defect over a reading nobody obtained.
+	try {
+		// Cheap gate first: with no runtime advertised the rebind is deliberately not
+		// installed, so the SDK holding its own `dbutils` is expected rather than a
+		// defect - and this is what keeps the kernel probe off every ordinary status
+		// read (`get_kernel_state` calls this on a notebook that may have no kernel).
+		if (liveDatabricksRuntime(abs).version === null) return null;
+		const state = await sdkDbutilsState(abs);
+		return state === 'foreign' ? { dbutils_widgets_warning: SDK_DBUTILS_FOREIGN_WARNING } : null;
+	} catch {
+		return null;
+	}
 }
 
 interface CatalogList {
@@ -3120,7 +3223,16 @@ export async function agentStatus(nb?: string | null) {
 	// orthogonal fact about the KERNEL, true or false independently of whether a
 	// session is bound, and a shape that silently omitted it would read as
 	// "advertised:false" to an agent that has been told the field is always there.
-	return { ...(await agentConnection(abs)), runtime: agentRuntimeBlock(abs) };
+	const base = { ...(await agentConnection(abs)), runtime: agentRuntimeBlock(abs) };
+	// Orthogonal to the connection in the same way, and folded in at the same one
+	// place for the same reason: the widgets shim is installed on EVERY kernel, so a
+	// session that advertises a runtime can be silently discarding parameter values
+	// whether or not a cluster is attached. Reported here because that failure has no
+	// other signal - the SDK renders the controls perfectly and then throws each edit
+	// away - and an agent reading a parsed parameter object would otherwise act on
+	// defaults believing they are the user's choices.
+	const warning = await dbutilsShimWarning(abs);
+	return warning ? { ...base, ...warning } : base;
 }
 
 /** `agentStatus`'s connection half; see it for the contract. */
