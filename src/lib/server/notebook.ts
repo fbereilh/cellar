@@ -30,7 +30,7 @@ import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
 import { canExportCell } from '../exportRole';
 import { resolveInWorkspace } from './fstree';
-import { SQL_LANGUAGE, isLogicalCellType, nbCellType } from '../cellLanguage';
+import { SQL_LANGUAGE, isLogicalCellType, nbCellType, textNotebookRawCellError } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
 import { normalizeRootPath, textNotebookRootError } from '../notebookRoot';
@@ -1167,6 +1167,24 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
 }
 
 /**
+ * Refuse `raw` on a `.py` TEXT notebook, BEFORE anything is written.
+ *
+ * `persist` writes such a document back through jupytext / the Databricks
+ * converter, which rebuilds it from its cells and coerces every `cell_type` to
+ * markdown|code - so a raw cell would live only in memory and come back from
+ * disk as a runnable Python cell (see `textNotebookRawCellError`, which owns the
+ * reasoning and the message). The guard sits at the doc-layer writers - the two
+ * that CONVERT a cell and the one that CREATES one - so every surface offering a
+ * raw cell (the type menu, the `r` chord, the bulk route, MCP `set_cell_type` /
+ * `add_cell` / `add_cells` / `add_and_run`) is covered by this ONE rule rather
+ * than by a check each of them could forget. Every other type is unaffected, and
+ * an `.ipynb` never reaches the throw.
+ */
+function assertCanHoldRaw(doc: NotebookDoc, cellType: LogicalCellType): void {
+	if (cellType === 'raw' && doc.jpFormat) throw textNotebookRawCellError();
+}
+
+/**
  * Add a cell after `afterId` (appended when it is absent or unknown).
  * `source` seeds the new cell, so a paste / split / undo-delete lands as ONE
  * persist and ONE `cell:added` event carrying the real text - rather than an
@@ -1182,6 +1200,7 @@ export function addCell(
 	cellar?: unknown
 ): Cell {
 	const doc = docFor(nb);
+	assertCanHoldRaw(doc, cellType);
 	const cell = newCell(cellType, source);
 	seedCellar(doc, cell, cellar);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
@@ -1204,9 +1223,13 @@ export function addCell(
  *
  * The `cell:type` event carries the new `language` so live sync updates the
  * editor's syntax highlighting (SQL ↔ Python) without a reload.
+ *
+ * A `.py` text notebook REFUSES 'raw' here - see `assertCanHoldRaw`; every other
+ * conversion stays allowed on one.
  */
 export function setCellType(id: string, cellType: LogicalCellType, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
+	assertCanHoldRaw(doc, cellType);
 	const cell = find(doc, id);
 	if (!cell) return;
 	applyCellType(cell, cellType);
@@ -1275,6 +1298,10 @@ export function setCellTypes(
 	originId?: string | null
 ): string[] {
 	const doc = docFor(nb);
+	// Refused for the WHOLE batch before the first write, so a `.py` notebook can
+	// never be left half-retyped - and, because nothing is changed, the caller's
+	// `changed` count can never report a refused cell as converted.
+	assertCanHoldRaw(doc, cellType);
 	const isSql = cellType === 'sql';
 	const changed: Cell[] = [];
 	for (const id of ids) {

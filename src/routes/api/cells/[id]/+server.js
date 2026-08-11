@@ -1,15 +1,33 @@
 import { json } from '@sveltejs/kit';
 import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setHideInput } from '$lib/server/notebook';
+import { RAW_UNSUPPORTED_REASON, RawCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
 
-/** Edit a cell's source, type ('code' | 'markdown'), imports-cell role, and/or
- *  its output-scroll choice in notebook `nb` (body field; workspace-relative
- *  path, defaults to the active notebook). `role` is 'imports' to designate this
- *  cell the notebook's imports cell (clearing any other) or null to un-designate;
- *  `setCellRole` enforces the one-imports-cell-per-notebook rule. */
+/** Edit a cell's source, type ('code' | 'sql' | 'markdown' | 'raw'), imports-cell
+ *  role, and/or its output-scroll choice in notebook `nb` (body field;
+ *  workspace-relative path, defaults to the active notebook). `role` is 'imports'
+ *  to designate this cell the notebook's imports cell (clearing any other) or null
+ *  to un-designate; `setCellRole` enforces the one-imports-cell-per-notebook rule.
+ *
+ *  `cell_type` is VALIDATED against `$lib/cellLanguage`'s vocabulary — the same one
+ *  the bulk and add routes use — rather than coerced: `nbCellType` maps anything it
+ *  does not recognize onto `code`, so a typo ('RAW', a trailing space) would
+ *  silently turn a raw cell holding frontmatter into a runnable Python cell. `raw`
+ *  on a `.py` notebook is refused by `setCellType` itself and reported the way the
+ *  bulk route reports its own refusals, so the caller can resync instead of
+ *  rendering a conversion the document never took. */
 export async function PATCH({ params, request }) {
 	const body = await request.json();
 	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
-	if (body.cell_type) setCellType(params.id, body.cell_type, body.nb, body.originId);
+	if (body.cell_type != null) {
+		if (!isLogicalCellTypeName(body.cell_type)) return json({ ok: false, reason: 'bad-cell-type' }, { status: 400 });
+		try {
+			setCellType(params.id, body.cell_type, body.nb, body.originId);
+		} catch (err) {
+			if (err instanceof RawCellTypeError)
+				return json({ ok: false, reason: RAW_UNSUPPORTED_REASON, message: err.message }, { status: 400 });
+			throw err;
+		}
+	}
 	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
 	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
 	if ('export' in body) setCellExport(params.id, !!body.export, body.nb, body.originId);

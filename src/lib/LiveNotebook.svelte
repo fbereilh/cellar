@@ -6,7 +6,13 @@
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
-	import { isLogicalCellType, nbCellType, SQL_LANGUAGE } from '$lib/cellLanguage';
+	import {
+		isLogicalCellType,
+		nbCellType,
+		RAW_UNSUPPORTED_REASON,
+		SQL_LANGUAGE,
+		TEXT_NOTEBOOK_RAW_MESSAGE
+	} from '$lib/cellLanguage';
 	import {
 		applyGesture,
 		extendSelection,
@@ -2052,13 +2058,36 @@
 		if (cell.cell_type !== 'code') cell.outputs = [];
 	}
 
+	/**
+	 * Would `cellType` be refused by the server for this notebook? The optimistic
+	 * mirror of the doc layer's `assertCanHoldRaw` - the `clampMoveIndex` pairing -
+	 * so a `.py` notebook never renders a conversion the server is about to refuse.
+	 * It SAYS so on the shell's transient status line rather than returning
+	 * silently, because the keyboard paths (`r`, the palette) send no request that
+	 * could fail and disable no control, so a bare return is indistinguishable from
+	 * a dead key. Enforcement stays the server's.
+	 */
+	function refuseUnsupportedType(cellType: LogicalCellType): boolean {
+		if (cellType !== 'raw' || !isPy) return false;
+		noticeRawUnsupported();
+		return true;
+	}
+
 	async function setType(id: string, cellType: LogicalCellType) {
+		if (refuseUnsupportedType(cellType)) return;
 		applyCellTypeLocally(id, cellType);
-		await fetch(`/api/cells/${id}`, {
+		const res = await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ cell_type: cellType, nb: path, originId })
-		});
+		}).catch(() => null);
+		// A refusal this tab did not predict must SAY why and put the cell back: the
+		// route emits no `cell:type` when it refuses, and this tab would suppress its
+		// own echo anyway, so nothing else would ever correct the optimistic apply.
+		if (!res || !res.ok) {
+			await noticeRefusal(res);
+			await load();
+		}
 		scheduleStaleness();
 	}
 
@@ -2559,6 +2588,16 @@
 	const KEEP_ONE_CELL_REASON = 'would-empty-notebook';
 
 	/**
+	 * Say why a raw conversion the client thought legal came back refused - the same
+	 * silent-refusal gap `noticeKeepOneCell` closes, for the notebook's OTHER
+	 * write-side rule. The message is the SHARED one the server threw with, so the
+	 * two surfaces cannot describe the refusal differently.
+	 */
+	function noticeRawUnsupported() {
+		onNotice?.(TEXT_NOTEBOOK_RAW_MESSAGE);
+	}
+
+	/**
 	 * Say why a delete the client thought legal came back refused.
 	 *
 	 * The optimistic guards above catch the ordinary case, but they compare against
@@ -2580,6 +2619,7 @@
 			.then((body) => body?.reason)
 			.catch(() => null);
 		if (reason === KEEP_ONE_CELL_REASON) noticeKeepOneCell();
+		else if (reason === RAW_UNSUPPORTED_REASON) noticeRawUnsupported();
 	}
 
 	// Copy/cut take the whole selection, in document order. The clipboard has always
@@ -2608,6 +2648,11 @@
 	async function pasteCells(where: 'above' | 'below') {
 		const entries = cellClipboard.read();
 		if (!entries.length) return;
+		// The clipboard is shared by every notebook in the tab, so a raw cell copied
+		// from an .ipynb can be pasted into a `.py` one, which cannot hold it. Refused
+		// for the WHOLE paste rather than by entry: pasting three of five cells and
+		// silently dropping the rest is the degrade this refusal exists to prevent.
+		if (isPy && entries.some((e) => e.cell_type === 'raw')) return noticeRawUnsupported();
 		const i = cells.findIndex((c) => c.id === activeId);
 		// No selection (an empty notebook) → paste at the end.
 		let index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
@@ -2615,11 +2660,17 @@
 		// on the whole set and undo restores the whole group, so leaving five pasted
 		// cells with one selected would be an asymmetry this path invented.
 		const inserted: string[] = [];
-		for (const entry of entries) {
-			inserted.push((await insertCellAt(index, pasteSpec(entry))).id);
-			index++;
+		try {
+			for (const entry of entries) {
+				inserted.push((await insertCellAt(index, pasteSpec(entry))).id);
+				index++;
+			}
+		} catch {
+			// An insert the server rejected has already said why and resynced; select
+			// whatever DID land rather than escaping as an unhandled rejection, which
+			// would also skip the selection below.
 		}
-		await selectGroup(inserted);
+		if (inserted.length) await selectGroup(inserted);
 	}
 
 	async function undoDelete() {
@@ -2848,13 +2899,16 @@
 		scheduleStaleness(); // reordering changes the preceding-definer graph
 	}
 
-	/** Change every selected cell's type in one action (`m` / `y` / the palette). */
+	/** Change every selected cell's type in one action (`m` / `y` / `r` / the palette). */
 	async function setTypeSelection(cellType: LogicalCellType) {
 		const ids = selectionTargets();
 		if (ids.length <= 1) {
 			if (ids[0]) await setType(ids[0], cellType);
+			// An empty selection has no single-cell path to say it for us.
+			else refuseUnsupportedType(cellType);
 			return;
 		}
+		if (refuseUnsupportedType(cellType)) return;
 		// A cell already of the target type is a no-op the server skips too
 		// (`setCellTypes` uses this same `isLogicalCellType` rule), so counting the ones
 		// that really change is what keeps that legitimate skip from reading as a
@@ -2942,7 +2996,17 @@
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ afterId, cellType, source, cellar, nb: path, originId })
-		});
+		}).catch(() => null);
+		// An add the server did not make is REPORTED and resynced, never read as one it
+		// did: the body of a refusal carries no `cell`, so reaching into it produced a
+		// bare TypeError that said nothing and left the model unreconciled. Throwing is
+		// the "an insert can reject" contract `undoDelete` already handles - it keeps
+		// the record for another `z` rather than dropping a cell that never came back.
+		if (!res || !res.ok) {
+			await noticeRefusal(res);
+			await load();
+			throw new Error('the cell was not added');
+		}
 		const { cell } = await res.json();
 		const view: UICell = { id: cell.id, cell_type: cell.cell_type, source: cell.source, outputs: cell.outputs, metadata: cell.metadata ?? {} };
 		if (afterId) {

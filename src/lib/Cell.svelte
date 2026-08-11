@@ -90,6 +90,8 @@
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
 		hideAllCode?: boolean;
+		/** This is a `.py` TEXT notebook, which cannot hold a raw cell (see `typeOptions`). */
+		isPy?: boolean;
 		/** Hide (or show) this code cell's input in place. */
 		onSetHideInput?: (id: string, hidden: boolean) => void;
 		/** Per-cell code-editor collapse choice (undefined = auto / true / false). */
@@ -154,6 +156,7 @@
 		onSetExport,
 		onSetScrolled,
 		hideAllCode = false,
+		isPy = false,
 		onSetHideInput,
 		editorCollapsed,
 		onSetEditorCollapsed,
@@ -934,12 +937,18 @@
 	// The cell-type menu options (Python / SQL / Markdown / Raw). This menu is the
 	// create-and-convert path for raw - there is deliberately no "+ Raw" insert
 	// button, a once-per-notebook type not being worth a third button on every gap.
-	const TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
+	//
+	// Raw is DROPPED on a `.py` text notebook: such a document is rebuilt from its
+	// cells on every save and has no raw marker, so the server refuses it
+	// (`assertCanHoldRaw`) - and a notebook that cannot hold a raw cell must not be
+	// offered a control for one.
+	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
 		{ v: 'markdown', label: 'Markdown', hint: 'text' },
 		{ v: 'raw', label: 'Raw', hint: 'verbatim' }
 	];
+	const typeOptions = $derived(isPy ? ALL_TYPE_OPTIONS.filter((o) => o.v !== 'raw') : ALL_TYPE_OPTIONS);
 	function chooseType(type: LogicalCellType) {
 		typeMenuEl?.hidePopover();
 		if (type !== logicalType) onSetType(cell.id, type);
@@ -2011,7 +2020,7 @@
 							data-testid="type-menu"
 						>
 							<div class="flex w-36 flex-col gap-0.5">
-								{#each TYPE_OPTIONS as opt}
+								{#each typeOptions as opt}
 									<button
 										class="flex items-center justify-between rounded px-2 py-1 text-left hover:bg-base-200 {logicalType === opt.v ? 'font-semibold text-primary' : 'text-base-content'}"
 										onclick={() => chooseType(opt.v)}

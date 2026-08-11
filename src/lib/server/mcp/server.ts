@@ -22,6 +22,7 @@ import { INSPECT_HEAD_ROWS, INSPECT_ARRAY_HEAD_ROWS, INSPECT_ARRAY_ITEMS, INSPEC
 import { McpSessionRegistry, SESSION_IDLE_MS, REAPER_INTERVAL_MS } from './sessions';
 import { runAsAgent, digestFor, deletionNote, currentSeq, DIGEST_PREFIX } from './userActivity';
 import { CellRefError } from './cellHandle';
+import { RawCellTypeError } from '../../cellLanguage';
 
 const text = (obj: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(obj) }] });
 const notFound = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true });
@@ -34,6 +35,28 @@ const notFound = (msg: string) => ({ content: [{ type: 'text' as const, text: ms
  */
 const pyNotebookRefusal = (what: string) =>
 	`refused: this is a .py text notebook (jupytext/Databricks source). It carries no per-cell metadata and generates no module, so ${what} - convert it to .ipynb first.`;
+
+/**
+ * Run an ADD handler, turning the doc layer's `.py`-notebook RAW refusal into a
+ * tool error that NAMES the cause instead of an unexplained throw.
+ *
+ * A different refusal from `pyNotebookRefusal` above, deliberately carrying its
+ * own cause: that one is about a `.py` notebook storing no per-cell metadata,
+ * while this is about it being REBUILT FROM ITS CELLS, which is what drops the
+ * raw type. The rule and its message live once, in `$lib/cellLanguage` — the
+ * writers throw it (`assertCanHoldRaw`) and `addCells` raises it for a whole
+ * batch before anything is written, so this only reports a verdict. Wrapping is
+ * what keeps all three add tools (`add_cell`, `add_cells`, `add_and_run`) on that
+ * one rule rather than each re-deriving when a raw cell is allowed.
+ */
+async function rawRefusable<T extends { content: unknown[] }>(fn: () => Promise<T>) {
+	try {
+		return await fn();
+	} catch (err) {
+		if (err instanceof RawCellTypeError) return notFound(err.message);
+		throw err;
+	}
+}
 
 type ImagePayload = { output_index: number; mime: string; data: string; [k: string]: unknown };
 
@@ -488,7 +511,9 @@ Follow this house style:
    byte-for-byte for a downstream tool (Quarto/nbdev frontmatter, nbconvert
    directives). Use it ONLY when the notebook is consumed by such a tool. Never
    put explanatory prose in a raw cell (that is markdown) and never put code
-   there (it will not run). run_cell on a raw cell returns status "skipped".
+   there (it will not run). run_cell on a raw cell returns status "skipped". A
+   .py text notebook is rebuilt from its cells on every save and has no raw
+   marker, so every tool that would create or convert one there refuses.
 
 The goal: a notebook a human would be happy to have written — imports up top,
 shared state, a clean section outline, and a continuous line of reasoning from
@@ -620,14 +645,16 @@ export function registerTools(server: McpServer) {
 		const target = targetOf(extra, notebook);
 		let after = after_id;
 		if (after_id != null) { const res = resolveOne(target, after_id, extra?.sessionId); if ('error' in res) return res.error; after = res.id; }
-		const { ids, imports } = await svc.addCells([{ cell_type, source }], after, { routeImports: route_imports ?? true, nb: target });
-		// Source that was nothing but imports creates no cell of its own — they went
-		// straight to the imports cell, which is then the cell this call produced.
-		return ids.length
-			? text({ id: ids[0], ...(imports ? { imports } : {}) })
-			: text({ id: imports!.cell_id, routed_to_imports: true, imports });
+		return rawRefusable(async () => {
+			const { ids, imports } = await svc.addCells([{ cell_type, source }], after, { routeImports: route_imports ?? true, nb: target });
+			// Source that was nothing but imports creates no cell of its own — they went
+			// straight to the imports cell, which is then the cell this call produced.
+			return ids.length
+				? text({ id: ids[0], ...(imports ? { imports } : {}) })
+				: text({ id: imports!.cell_id, routed_to_imports: true, imports });
+		});
 	});
-	server.registerTool('add_cells', { description: `Add multiple cells in order (optionally after a cell).${ROUTE_IMPORTS_PTR}`, inputSchema: { cells: z.array(z.object({ cell_type: z.enum(['code', 'sql', 'markdown', 'raw']).optional(), source: z.string().optional() })), after_id: z.string().optional(), route_imports: z.boolean().optional(), ...notebookParam } }, async ({ cells, after_id, route_imports, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); let after = after_id; if (after_id != null) { const res = resolveOne(target, after_id, extra?.sessionId); if ('error' in res) return res.error; after = res.id; } return text(await svc.addCells(cells, after, { routeImports: route_imports ?? true, nb: target })); });
+	server.registerTool('add_cells', { description: `Add multiple cells in order (optionally after a cell).${ROUTE_IMPORTS_PTR}`, inputSchema: { cells: z.array(z.object({ cell_type: z.enum(['code', 'sql', 'markdown', 'raw']).optional(), source: z.string().optional() })), after_id: z.string().optional(), route_imports: z.boolean().optional(), ...notebookParam } }, async ({ cells, after_id, route_imports, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); let after = after_id; if (after_id != null) { const res = resolveOne(target, after_id, extra?.sessionId); if ('error' in res) return res.error; after = res.id; } return rawRefusable(async () => text(await svc.addCells(cells, after, { routeImports: route_imports ?? true, nb: target }))); });
 	server.registerTool('edit_cell', { description: `Replace a cell source in place.${ROUTE_IMPORTS_PTR} (Editing the imports cell itself never routes — you are already writing into it.)`, inputSchema: { id: z.string(), source: z.string(), route_imports: z.boolean().optional(), ...notebookParam } }, async ({ id, source, route_imports, notebook }, extra: ToolExtra) => {
 		const target = targetOf(extra, notebook);
 		const res = resolveOne(target, id, extra?.sessionId);
@@ -688,7 +715,7 @@ export function registerTools(server: McpServer) {
 						: `cell ${id} not found`
 		);
 	});
-	server.registerTool('set_cell_type', { description: 'Set a cell type to code, sql, markdown, or raw. sql tags the code cell as a SQL query (runs against the connected Databricks spark session); code reverts it to Python. raw is verbatim text (frontmatter/directives): never executed, never rendered. Converting away from code drops that cell\'s outputs, imports role and export flag.', inputSchema: { id: z.string(), cell_type: z.enum(['code', 'sql', 'markdown', 'raw']), ...notebookParam } }, async ({ id, cell_type, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveOne(target, id, extra?.sessionId); if ('error' in res) return res.error; return svc.setType(res.id, cell_type, target) ? text({ ok: true }) : notFound(`cell ${id} not found`); });
+	server.registerTool('set_cell_type', { description: 'Set a cell type to code, sql, markdown, or raw. sql tags the code cell as a SQL query (runs against the connected Databricks spark session); code reverts it to Python. raw is verbatim text (frontmatter/directives): never executed, never rendered, and refused on a .py text notebook, which cannot store it. Converting away from code drops that cell\'s outputs, imports role and export flag.', inputSchema: { id: z.string(), cell_type: z.enum(['code', 'sql', 'markdown', 'raw']), ...notebookParam } }, async ({ id, cell_type, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveOne(target, id, extra?.sessionId); if ('error' in res) return res.error; const r = svc.setType(res.id, cell_type, target); return r.ok ? text({ ok: true }) : notFound(r.refused ?? `cell ${id} not found`); });
 	server.registerTool('set_cell_visibility', { description: 'Show/hide a cell from the agent (cellar.hidden_from_agent).', inputSchema: { id: z.string(), hidden: z.boolean(), ...notebookParam } }, async ({ id, hidden, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveOne(target, id, extra?.sessionId); if ('error' in res) return res.error; return svc.setCellVisibility(res.id, hidden, target) ? text({ ok: true, id: svc.handleFor(target, res.id), hidden }) : notFound(`cell ${id} not found`); });
 
 	server.registerTool('set_header_numbering', { description: 'Set WHICH markdown heading levels render with an automatic number (levels:[2] numbers every H2 "1.", "2."; levels:[1,2] numbers hierarchically "1.", "1.1"; levels:[] turns it off). Notebook-level and DISPLAY-ONLY: numbers are computed at render time and no cell source is ever edited, so never type one into a header yourself. Returns the sanitized levels stored (deduped, 1-6, ascending) and how many headings now carry a number.', inputSchema: { levels: z.array(z.number().int().min(1).max(6)), ...notebookParam } }, async ({ levels, notebook }, extra: ToolExtra) => text(svc.setHeaderNumbering(levels, targetOf(extra, notebook))));
@@ -721,7 +748,7 @@ export function registerTools(server: McpServer) {
 	});
 
 	// --- execute ---
-	server.registerTool('add_and_run', { description: `PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|sql|markdown|raw cell (default code) with the given source, after a cell (after_id) or at the end, runs it, and returns run_cell's result (status + outputs) plus the new cell id. Code that raises returns the error as the result — the cell still exists. A markdown cell is created AND rendered (status "rendered"), which is how to add markdown so it shows rendered rather than raw source. A raw cell is created but NOT run (status "skipped") — raw cells never execute. Reserve add_cell for a cell you want left un-run.${ROUTE_IMPORTS_DOC} Routing happens BEFORE this cell runs, so an import it needs is already in the kernel. Source that is ONLY imports creates no cell at all and returns routed_to_imports:true.${IMAGE_DOC}`, inputSchema: { source: z.string(), cell_type: z.enum(['code', 'sql', 'markdown', 'raw']).optional(), after_id: z.string().optional(), route_imports: z.boolean().optional(), ...notebookParam } }, async ({ source, cell_type, after_id, route_imports, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); let after = after_id; if (after_id != null) { const res = resolveOne(target, after_id, extra?.sessionId); if ('error' in res) return res.error; after = res.id; } return textWithImages(await withProgress(extra, () => svc.addAndRun({ source, cellType: cell_type, afterId: after, routeImports: route_imports ?? true, nb: target }))); });
+	server.registerTool('add_and_run', { description: `PREFERRED write-and-execute: create a cell AND run it in one call (fewer round-trips than add_cell then run_cell). Adds a code|sql|markdown|raw cell (default code) with the given source, after a cell (after_id) or at the end, runs it, and returns run_cell's result (status + outputs) plus the new cell id. Code that raises returns the error as the result — the cell still exists. A markdown cell is created AND rendered (status "rendered"), which is how to add markdown so it shows rendered rather than raw source. A raw cell is created but NOT run (status "skipped") — raw cells never execute. Reserve add_cell for a cell you want left un-run.${ROUTE_IMPORTS_DOC} Routing happens BEFORE this cell runs, so an import it needs is already in the kernel. Source that is ONLY imports creates no cell at all and returns routed_to_imports:true.${IMAGE_DOC}`, inputSchema: { source: z.string(), cell_type: z.enum(['code', 'sql', 'markdown', 'raw']).optional(), after_id: z.string().optional(), route_imports: z.boolean().optional(), ...notebookParam } }, async ({ source, cell_type, after_id, route_imports, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); let after = after_id; if (after_id != null) { const res = resolveOne(target, after_id, extra?.sessionId); if ('error' in res) return res.error; after = res.id; } return rawRefusable(async () => textWithImages(await withProgress(extra, () => svc.addAndRun({ source, cellType: cell_type, afterId: after, routeImports: route_imports ?? true, nb: target })))); });
 	server.registerTool('run_cell', { description: 'Run one cell by handle. Running a MARKDOWN cell renders it (no code executes) and returns status "rendered" — use this (or add_and_run) so markdown shows rendered rather than raw source. Your notebook\'s kernel runs one cell at a time: if it is busy your run is QUEUED (never dropped) and this call waits its turn, then returns the real outputs annotated queued:true + queue_position + waited_ms; another notebook\'s run never queues yours (parallel kernels). A cell already queued or running is not enqueued twice — the call returns immediately with status "queued"/"running" and its queue_position, and a pending run has its source refreshed. status "cancelled" = an interrupt/restart dropped the queued run before it started; nothing executed. See run_queue.' + IMAGE_DOC, inputSchema: { id: z.string(), ...notebookParam } }, async ({ id, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveOne(target, id, extra?.sessionId); if ('error' in res) return res.error; const r = await withProgress(extra, () => svc.runCell(res.id, target)); return r ? textWithImages(r) : notFound(`cell ${id} not found`); });
 	server.registerTool('run_cells', { description: 'Run several cells in order, each waiting its turn in your notebook\'s kernel queue. Returns a COMPACT batch summary {ran, errored, results}, one record per cell. An OK cell is a status line only — {id, run_status, has_output, has_image, + stale fields if still stale} — its output is one get_full_output(id) away. A batch never inlines figures (a huge token bill across N cells): has_image:true flags a cell that DREW one. An ERRORED cell carries its {ename, evalue, traceback} in full (capped, library frames elided; whole stack via get_full_output(id, size:"full")), so a batch failure is actionable without a second call. Stops at the first cell whose queued run an interrupt/restart cancelled (status "cancelled") — the rest would run against a namespace their predecessors never populated.', inputSchema: { ids: z.array(z.string()), ...notebookParam } }, async ({ ids, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveMany(target, ids, extra?.sessionId); if ('error' in res) return res.error; return text(await withProgress(extra, () => svc.runCells(res.ids, target))); });
 	server.registerTool('run_all', { description: 'Run all code cells in document order. Returns the same compact {ran, errored, results} batch summary as run_cells (OK cells as status lines with output one get_full_output away; errored cells with full traceback), and the same queueing + cancellation semantics.', inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await withProgress(extra, () => svc.runAll(targetOf(extra, notebook)))));

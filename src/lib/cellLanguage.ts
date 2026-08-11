@@ -60,6 +60,61 @@ export function isRawCell(cell: LanguageCell): boolean {
 }
 
 /**
+ * The four LOGICAL cell types the UI toggle, the REST routes and the MCP
+ * `cell_type` argument speak. The ONE vocabulary: a route that hand-maintained
+ * its own copy would keep accepting three while the others accept four (this
+ * list grew by one when `raw` landed), and an out-of-vocabulary value is not
+ * inert - `nbCellType` maps anything it does not recognize onto `code`, so a
+ * typo would silently turn a raw cell holding frontmatter into a runnable
+ * Python cell.
+ */
+export const LOGICAL_CELL_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'markdown', 'raw'];
+
+/**
+ * Is `value` one of the four logical cell types? The predicate every entry point
+ * that accepts a `cell_type` from a request body validates with, so a malformed
+ * value is REFUSED rather than falling through `nbCellType`'s `code` default.
+ */
+export function isLogicalCellTypeName(value: unknown): value is LogicalCellType {
+	return typeof value === 'string' && (LOGICAL_CELL_TYPES as readonly string[]).includes(value);
+}
+
+/** The refusal code a route reports when `raw` was asked for on a `.py` notebook. */
+export const RAW_UNSUPPORTED_REASON = 'raw-in-py-notebook';
+
+/** The one message for that refusal, shared by the server writers and the browser. */
+export const TEXT_NOTEBOOK_RAW_MESSAGE =
+	'A .py notebook cannot hold a raw cell: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and has no raw marker, so the cell would come back after a reload as a RUNNABLE Python cell holding what was meant to be verbatim text. Convert it to .ipynb first.';
+
+/**
+ * A `raw` cell was asked for on a `.py` TEXT notebook, which cannot hold one.
+ *
+ * Such a notebook is written back through jupytext / the Databricks converter,
+ * which rebuilds the file from its cells and coerces every `cell_type` to
+ * markdown|code (`jupytext.ts`) - and coerces again on read. So the declaration
+ * would live only in memory while disk held a `code` cell: after a reload the
+ * frontmatter sits in a cell with a Run button, the exact silent degrade a raw
+ * cell exists to prevent, and worse from MARKDOWN, whose prose would lose its
+ * markers on the way too.
+ *
+ * Refused by name instead, at the doc-layer writers, so no surface can route
+ * around it - the `textNotebookRootError` precedent, for the identical
+ * rebuilt-from-cells reason. Only `raw`, and only on a `.py` doc: every other
+ * conversion, and every raw cell in an `.ipynb`, is untouched.
+ */
+export class RawCellTypeError extends Error {
+	constructor(message = TEXT_NOTEBOOK_RAW_MESSAGE) {
+		super(message);
+		this.name = 'RawCellTypeError';
+	}
+}
+
+/** The refusal above, as a throwable. */
+export function textNotebookRawCellError(): RawCellTypeError {
+	return new RawCellTypeError();
+}
+
+/**
  * The nbformat `cell_type` a LOGICAL type maps onto. `sql` is a `code` cell
  * tagged `cellar.language='sql'`; `markdown` and `raw` are nbformat types of
  * their own.

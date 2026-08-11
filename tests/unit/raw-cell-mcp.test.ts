@@ -65,9 +65,9 @@ describe('creating and converting', () => {
 	it('converts a code cell to raw and back', async () => {
 		const nb = open('mcp-raw-settype.ipynb');
 		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'a = 1' }], null, { nb, routeImports: false });
-		expect(svc.setType(ids[0], 'raw', nb)).toBeTruthy();
+		expect(svc.setType(ids[0], 'raw', nb).ok).toBe(true);
 		expect(byHandle(nb, ids[0]).cell_type).toBe('raw');
-		expect(svc.setType(ids[0], 'code', nb)).toBeTruthy();
+		expect(svc.setType(ids[0], 'code', nb).ok).toBe(true);
 		expect(byHandle(nb, ids[0]).cell_type).toBe('code');
 	});
 });

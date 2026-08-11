@@ -57,7 +57,7 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { isSqlCell, isRawCell, logicalCellType } from '../../cellLanguage';
+import { TEXT_NOTEBOOK_RAW_MESSAGE, isSqlCell, isRawCell, logicalCellType, textNotebookRawCellError } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { isExportCell, canExportCell, exportCellCount } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
@@ -1331,6 +1331,15 @@ export function exportHtml({
  * A spec that routing empties (its source was nothing but imports) creates no
  * cell: its imports are in the imports cell, and an empty cell beside them is
  * litter. An explicitly empty source still creates its empty cell.
+ *
+ * A `raw` spec on a `.py` TEXT notebook throws `RawCellTypeError` for the WHOLE
+ * batch before anything is written - `addCell` would throw on it anyway (the doc
+ * layer owns the rule), but only once routing had already merged the earlier
+ * specs' imports into the imports cell and run it, leaving the notebook
+ * half-written behind an error. Raised here for the same all-or-nothing reason
+ * `setCellExport` resolves its whole batch first, and before the pre-action
+ * checkpoint, since a refused call changes nothing. The tool handlers turn it
+ * into a refusal naming the cause.
  */
 export async function addCells(
 	specs: Array<{ cell_type?: string; source?: string }>,
@@ -1338,6 +1347,7 @@ export async function addCells(
 	{ routeImports: routeEnabled = true, nb: nbArg }: { routeImports?: boolean; nb?: string | null } = {}
 ) {
 	const nb = nbArg ?? getActiveNotebookPath();
+	if (specs.some((s) => s.cell_type === 'raw') && isPyTextNotebook(nb)) throw textNotebookRawCellError();
 	autoCheckpointBeforeAgentAction(nb);
 	const bodies: Array<{ cellType: string; source: string }> = [];
 	const added: string[] = [];
@@ -1597,13 +1607,25 @@ export function moveCell(id: string, dest: MoveDest, nb?: string | null) {
 	return { ok: true as const, id: handleFor(target, full), index: listCells(target).findIndex((c) => c.id === full) };
 }
 
+/**
+ * MCP `set_cell_type`. A `.py` TEXT notebook REFUSES 'raw' - the doc layer's rule
+ * (`assertCanHoldRaw`), looked up here through the SAME `isPyTextNotebook`
+ * predicate the export tools use so the agent gets a refusal NAMING the cause
+ * rather than a throw, and so nothing is written: checked BEFORE the pre-action
+ * checkpoint, because a refused call changes nothing and a snapshot for it would
+ * spend the throttle slot the next real mutation is owed (`removeCells`'
+ * precedent). Every other conversion is unaffected on a `.py` notebook, and an
+ * `.ipynb` never reaches the check.
+ */
 export function setType(id: string, type: LogicalCellType, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	id = asFullId(target, id);
-	if (!getCell(id, target)) return false;
+	if (!getCell(id, target)) return { ok: false as const, missing: true as const };
+	if (type === 'raw' && isPyTextNotebook(target))
+		return { ok: false as const, refused: TEXT_NOTEBOOK_RAW_MESSAGE };
 	autoCheckpointBeforeAgentAction(target);
 	setCellType(id, type, target);
-	return true;
+	return { ok: true as const };
 }
 
 export function setCellVisibility(id: string, hidden: boolean, nb?: string | null) {
@@ -2188,7 +2210,9 @@ export async function addAndRun({ source, cellType = 'code', afterId, routeImpor
 			outputs: cell ? summarizeOutputs(cell, READ_CAP) : []
 		};
 	}
-	// Routing already happened (once), so the add must not route a second time.
+	// Routing already happened (once), so the add must not route a second time. A
+	// `raw` cell on a `.py` notebook throws here (`addCells`), before any cell is
+	// created, and the tool handler reports that refusal.
 	const { ids } = await addCells([{ cell_type: cellType, source: body }], afterId, { routeImports: false, nb });
 	// addCells emits a handle; runCell accepts it (resolves it back to the full id).
 	const result = await runCell(ids[0], nb);
