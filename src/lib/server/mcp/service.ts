@@ -42,7 +42,7 @@ import {
 } from '../notebook';
 import { setNotebookRootAndRestart, listWorkspaceRoots } from '../notebook-root-actions';
 import { resolveRootDir } from '../notebookRoot';
-import { ROOTS_DIR } from '../../notebookRoot';
+import { ROOTS_DIR, normalizeRootPath, textNotebookRootError } from '../../notebookRoot';
 import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel';
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
 import { agentStatus as databricksStatus, agentRuntimeBlock, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable, reconnectSession as databricksReconnect, connectCluster as databricksConnect, setRuntimeAdvertisement as databricksSetRuntime, listClustersForAgent as databricksClusters } from '../databricks';
@@ -261,10 +261,11 @@ function notebookNameToPath(rel: string): string {
  *     corrupt file, silently. Missing is an error naming the way to get one.
  *   - Being a `.py` does not make a file a notebook. A plain module has no cell
  *     structure; opening one would hand the agent a document whose cells are an
- *     artifact of the converter. `isPyNotebookFile` applies the same marker
- *     VOCABULARY the UI's detection route opens on, over a bounded header prefix
- *     rather than the whole file, so what `list_notebooks` offers is exactly what
- *     this accepts (see `DETECT_PREFIX_BYTES` for where the two can disagree).
+ *     artifact of the converter. `isPyNotebookFile` is the ONE predicate this and
+ *     `list_notebooks` share, so what is offered is exactly what is accepted. It
+ *     applies the same marker VOCABULARY as the UI's detection route over a bounded
+ *     header prefix rather than the whole file, which is NOT a parity claim against
+ *     the UI - see `DETECT_PREFIX_BYTES` for where the two can disagree.
  */
 function usePyNotebook(sessionId: string | undefined, rel: string) {
 	if (!notebookExists(rel)) {
@@ -320,15 +321,28 @@ export async function setNotebookRoot(root: string | null, nb?: string | null) {
 }
 
 /**
- * Refuse an unusable code root BEFORE anything else happens.
+ * Refuse a root `use_notebook` could not apply BEFORE anything else happens.
  *
  * `use_notebook` OPENS-OR-CREATES its notebook and pins the session to it, both
  * of which are already done by the time `setNotebookRoot` could throw — so a
  * mistyped root used to leave a freshly created `untitled.ipynb` pinned behind
- * its own error. This is the SAME resolver the write path runs (never a second
- * validation rule), called first so a refused root creates and pins nothing.
+ * its own error. Both refusals the write path can raise are therefore raised here
+ * first, each through that path's OWN rule (never a second validation rule or a
+ * second message), so a refused root creates and pins nothing:
+ *
+ *   - a `.py` notebook cannot HOLD a root (it stores no notebook metadata, so the
+ *     declaration would be gone on the next reload). Checked from the resolved
+ *     NAME, which is what decides the format here: `useNotebook` dispatches a
+ *     `.py` path to `usePyNotebook`, which opens only a real `.py` notebook, and
+ *     an `.ipynb` never carries a `jpFormat` - so this and the write path's
+ *     `isTextNotebook` agree, without loading a document to find out. Clearing
+ *     ('' / null) stays allowed: it can only remove state, never strand it.
+ *   - anything that is not a usable directory inside the workspace.
  */
-export function assertRootUsable(root: string | null | undefined): void {
+export function assertRootUsable(root: string | null | undefined, name?: string): void {
+	const rel = (name ?? '').trim();
+	const declared = normalizeRootPath(root);
+	if (declared && rel && isPyPath(notebookNameToPath(rel))) throw textNotebookRootError(declared);
 	resolveRootDir(root);
 }
 

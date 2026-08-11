@@ -3569,7 +3569,11 @@ export async function connectCluster({
  *   - `bound`: the injection is SCOPED to a Databricks-connected notebook (see
  *     `databricksRuntime.ts`), so enabling it on an unconnected one stores the
  *     preference and advertises nothing. Stored-and-said, never a restart that
- *     would clear the namespace to change nothing.
+ *     would clear the namespace to change nothing - EXCEPT where such a kernel is
+ *     still carrying an advertisement from before it was disconnected, which the
+ *     conditional restart above genuinely removes. `runtimeNote` therefore reads
+ *     the real `kernelRestarted` FIRST and reports that removal, rather than
+ *     asserting from the request that nothing happened.
  *   - a version forced by `CELLAR_DATABRICKS_RUNTIME_VERSION` OVERRIDES the
  *     `version` argument for as long as it is set; the result names it. The passed
  *     value is still STORED as the preference (never claim it was ignored - it
@@ -3656,16 +3660,30 @@ function runtimeNote({
 		versionForcedByEnv && requested && requested !== versionForcedByEnv
 			? ` The version you passed was stored as the preference, but it is currently overridden: CELLAR_DATABRICKS_RUNTIME_VERSION pins the advertised version to "${versionForcedByEnv}". Your value applies once that override is removed.`
 			: '';
-	// Enabling on a notebook with no Databricks session: stored, but the injection is
-	// scoped to a connected notebook, so nothing is advertised yet. Say so - a restart
-	// here would cost the namespace and still leave advertised:false.
-	if (enable && !bound) {
-		return `Preference stored, but this notebook is not connected to a Databricks cluster, so nothing is advertised yet (IS_DATABRICKS still reads false) and the kernel was NOT restarted. Connect a cluster (databricks_connect), then call this again to apply it.${versionNote}`;
-	}
+	// The RESTART is decided first, because it is the fact the caller has to act on and
+	// the one the structured `kernel_restarted`/`namespace_cleared` pair already states.
+	// Deriving the sentence from what was REQUESTED instead let the unbound branch below
+	// assert "the kernel was NOT restarted" over a run that really had restarted (a
+	// notebook connected, enabled, then DISCONNECTED still carries the advertisement, so
+	// the scope gate makes `desired` null and the kernel is torn down to remove it).
 	if (kernelRestarted) {
+		// Enable on a notebook that is not connected: the advertisement is scoped to a
+		// connected notebook, so the kernel that came back carries NONE - what this run
+		// did was REMOVE the one the old kernel was still carrying. Report the restart
+		// and the removal, never the request.
+		if (enable && !bound) {
+			return `The kernel was RESTARTED, so every Python variable is gone (ran_this_session is now false for every cell) - re-run the cells you need. The advertisement was REMOVED, not applied: this notebook is not connected to a Databricks cluster and the advertisement is scoped to a connected one, so IS_DATABRICKS now reads false. The preference is stored; connect a cluster (databricks_connect), then call this again to apply it.${versionNote}`;
+		}
 		return enable
 			? `DATABRICKS_RUNTIME_VERSION="${runtime.version}" is now set in the kernel, so IS_DATABRICKS reads true and dbutils.widgets is the parameter path. The kernel was RESTARTED to apply it: every Python variable is gone (ran_this_session is now false for every cell), so re-run the cells you need.${versionNote}`
 			: `The runtime advertisement is off: IS_DATABRICKS now reads false. The kernel was RESTARTED to apply it, so every Python variable is gone - re-run the cells you need.${versionNote}`;
+	}
+	// Enabling on a notebook with no Databricks session and nothing to tear down:
+	// stored, but the injection is scoped to a connected notebook, so nothing is
+	// advertised. A restart here would cost the namespace and still leave
+	// advertised:false.
+	if (enable && !bound) {
+		return `Preference stored, but this notebook is not connected to a Databricks cluster, so nothing is advertised yet (IS_DATABRICKS still reads false) and the kernel was NOT restarted. Connect a cluster (databricks_connect), then call this again to apply it.${versionNote}`;
 	}
 	// Nothing to apply: the kernel already carries the requested state, or there is no
 	// kernel yet (the next start reads the preference).

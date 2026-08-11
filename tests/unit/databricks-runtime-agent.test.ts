@@ -202,6 +202,34 @@ describe('databricks_runtime applies the advertisement', () => {
 		expect(ui.injectDatabricksRuntime(true)).toBe(true);
 	});
 
+	// The one path where the outcome contradicts the request: the kernel is still
+	// carrying an advertisement from before the notebook was disconnected, so applying
+	// the scope gate REMOVES it. The note used to be picked from the request (an
+	// enable on an unbound notebook) and flatly denied the restart the same result
+	// reported - the assert-more-than-was-verified defect this feature exists to
+	// retire, on the one path least able to afford it (the namespace really is gone).
+	it('reports the restart and the REMOVAL when enabling on a notebook disconnected since it was applied', async () => {
+		await connectA();
+		await dbx.setRuntimeAdvertisement({ enable: true, nb: A() });
+		expect(dbx.agentRuntimeBlock(A()).advertised).toBe(true);
+		await dbx.disconnect(A());
+		hoisted.restarts = 0;
+
+		const r = await dbx.setRuntimeAdvertisement({ enable: true, nb: A() });
+		expect(hoisted.restarts).toBe(1);
+		expect(r.kernel_restarted).toBe(true);
+		expect(r.namespace_cleared).toBe(true);
+		// enable:true, but the scope gate means the fresh kernel advertises nothing.
+		expect(r.runtime.advertised).toBe(false);
+
+		// The sentence must state BOTH facts, and may not deny either.
+		expect(r.note).toMatch(/RESTARTED/);
+		expect(r.note).toMatch(/re-run the cells/i);
+		expect(r.note).toMatch(/REMOVED/);
+		expect(r.note).not.toMatch(/NOT restarted/i);
+		expect(r.note).not.toMatch(/nothing is advertised yet/i);
+	});
+
 	it('does not restart a notebook whose kernel has not started', async () => {
 		await connectA();
 		hoisted.liveRuntime = { started: false, version: null };

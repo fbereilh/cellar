@@ -138,6 +138,15 @@ export function detectPyNotebook(text: string): { notebook: boolean; format: str
 const DETECT_PREFIX_BYTES = 64 * 1024;
 
 /**
+ * The one sniff buffer, reused by every `isPyNotebookFile` call rather than
+ * allocated per file. 64 KB is past `Buffer.poolSize`, so a fresh one is a real
+ * malloc, and `list_notebooks` sniffs EVERY `.py` in the workspace in one pass.
+ * Sharing it is safe because the read below is SYNCHRONOUS: the bytes are decoded
+ * into a string before anything else can run, so no second caller can observe it.
+ */
+const detectBuf = Buffer.allocUnsafe(DETECT_PREFIX_BYTES);
+
+/**
  * Whether the `.py` file at `abs` is a notebook Cellar can OPEN — the on-disk
  * counterpart of `detectPyNotebook`, for callers that hold a path rather than the
  * text. Same marker rule (an explicit marker, never a markerless script) over a
@@ -156,9 +165,8 @@ export function isPyNotebookFile(abs: string): boolean {
 	let fd: number | undefined;
 	try {
 		fd = openSync(abs, 'r');
-		const buf = Buffer.allocUnsafe(DETECT_PREFIX_BYTES);
-		const n = readSync(fd, buf, 0, DETECT_PREFIX_BYTES, 0);
-		return detectPyNotebook(buf.subarray(0, n).toString('utf8')).notebook;
+		const n = readSync(fd, detectBuf, 0, DETECT_PREFIX_BYTES, 0);
+		return detectPyNotebook(detectBuf.subarray(0, n).toString('utf8')).notebook;
 	} catch {
 		return false;
 	} finally {
