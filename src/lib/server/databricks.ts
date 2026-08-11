@@ -116,7 +116,15 @@ import { normalizeDatabricksHost } from '../databricksHost';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
 import { resolveUploadName, type UploadNameAffixes } from '../databricksUploadName';
 import { notebookIpynb, resolveNotebookPath } from './notebook';
-import { databricksRuntimeForced, databricksRuntimeVersionForced } from './ui-state';
+import {
+	databricksRuntimeForced,
+	databricksRuntimePreference,
+	databricksRuntimeVersion,
+	databricksRuntimeVersionForced,
+	injectDatabricksRuntime,
+	setUiState
+} from './ui-state';
+import { DBX_RUNTIME_KEY, DBX_RUNTIME_VERSION_KEY } from './databricksRuntime';
 import { publishGlobal } from './events';
 import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
@@ -1007,6 +1015,14 @@ export class DatabricksError extends Error {
 	 * exact `databricks auth login --profile <name>` command (never hardcoded).
 	 */
 	profile?: string;
+	/**
+	 * Whether the kernel was restarted (so the namespace is gone) BEFORE the failure.
+	 * Set only where an operation can fail with that side effect already paid, so the
+	 * caller learns it instead of being told only that the call failed. Reported with
+	 * the same `kernel_restarted`/`namespace_cleared` pair a success carries - never a
+	 * second reporting shape.
+	 */
+	kernelRestarted?: boolean;
 	constructor(code: string, message: string, profile?: string) {
 		super(message);
 		this.name = 'DatabricksError';
@@ -1039,6 +1055,7 @@ export function statusFor(code: string): number {
 		case 'cluster_terminated':
 		case 'reconnect_failed':
 		case 'workspace_conflict':
+		case 'runtime_env_forced':
 			return 409;
 		case 'sdk_missing':
 		case 'connect_missing':
@@ -1759,6 +1776,7 @@ export async function getStatus(nb?: string | null) {
 function runtimeStatus(nb?: string | null): {
 	kernelStarted: boolean;
 	liveVersion: string | null;
+	preference: boolean;
 	envForced: boolean | null;
 	versionEnvForced: string | null;
 } {
@@ -1766,8 +1784,54 @@ function runtimeStatus(nb?: string | null): {
 	return {
 		kernelStarted: live.started,
 		liveVersion: live.version,
+		preference: databricksRuntimePreference(),
 		envForced: databricksRuntimeForced(),
 		versionEnvForced: databricksRuntimeVersionForced()
+	};
+}
+
+/** What an agent is told about the Databricks-runtime advertisement (see `agentRuntimeBlock`). */
+export interface AgentRuntimeBlock {
+	advertised: boolean;
+	version: string | null;
+	forced_by_env: boolean;
+}
+
+/**
+ * The Databricks-runtime advertisement as an *agent* sees it - the ONE builder
+ * behind `databricks_status`, `kernel_state` and `get_notebook_map`, so those three
+ * can never describe the same kernel differently.
+ *
+ * It exists because a notebook full of `dbutils.widgets` looks identical whether or
+ * not `DATABRICKS_RUNTIME_VERSION` is set, and nothing on the agent surface said
+ * which. `advertised:false` on such a notebook is the whole signal: the code's
+ * `IS_DATABRICKS` gate is reading false, so it is taking its non-Databricks branch,
+ * and `databricks_runtime(enable:true)` is what changes that.
+ *
+ * Read LIVE (`liveDatabricksRuntime`), never from the stored preference - the same
+ * rule the sidebar's Runtime card follows, for the same reason. The env is read at
+ * IMPORT time, so a preference set after the kernel started, or a connect that bound
+ * a kernel which started unbound, honestly disagrees with what the running namespace
+ * carries; reporting the preference would claim a runtime the kernel does not have.
+ * A kernel that has not started yet advertises nothing, so it reads `false` too.
+ *
+ * `forced_by_env` is the on/off decision being held by `CELLAR_DATABRICKS_RUNTIME`:
+ * when true, `databricks_runtime` cannot move it and there is no point asking the
+ * user to. Deliberately the on/off override ALONE - the independent version override
+ * is reported by the setter, where it can actually bite, rather than collapsed into
+ * this flag (see `databricksRuntime.ts`: the two are never one boolean).
+ *
+ * Cheap and synchronous by construction - a Map lookup plus an env read, no kernel
+ * boot and no probe - which is what lets `get_notebook_map` carry it. That map is a
+ * structural read that fires on every edit and deliberately avoids `agentStatus`'s
+ * live `SELECT 1`; this must stay as cheap, or it does not belong there.
+ */
+export function agentRuntimeBlock(nb?: string | null): AgentRuntimeBlock {
+	const live = liveDatabricksRuntime(resolveNotebookPath(nb));
+	return {
+		advertised: live.version != null,
+		version: live.version,
+		forced_by_env: databricksRuntimeForced() !== null
 	};
 }
 
@@ -3050,6 +3114,17 @@ function reauthFields(profile: string) {
  */
 export async function agentStatus(nb?: string | null) {
 	const abs = resolveNotebookPath(nb);
+	// One wrap, so EVERY shape below - connected, healed, expired, reauth,
+	// never-connected - carries the runtime block. Added here rather than at the six
+	// return sites precisely so a future branch cannot forget it: the runtime is an
+	// orthogonal fact about the KERNEL, true or false independently of whether a
+	// session is bound, and a shape that silently omitted it would read as
+	// "advertised:false" to an agent that has been told the field is always there.
+	return { ...(await agentConnection(abs)), runtime: agentRuntimeBlock(abs) };
+}
+
+/** `agentStatus`'s connection half; see it for the contract. */
+async function agentConnection(abs: string) {
 	const s = stateFor(abs);
 	const status: ConnectionStatus = connectionStatus(abs);
 	if (!status.connected) {
@@ -3228,6 +3303,18 @@ function requireConnectedSel(nb: string): Selection {
 
 /** Cluster states in which a Databricks Connect session cannot be built. */
 const DOWN_CLUSTER_STATES = new Set(['TERMINATED', 'TERMINATING', 'ERROR']);
+
+/**
+ * Appended to every `databricks_connect` note. Connecting binds `spark`/`w` and
+ * stops there: it deliberately does NOT advertise a runtime (an older build did,
+ * and reversing that is documented in `databricksRuntime.ts` - advertising changes
+ * what EVERY library believes about its environment, so it costs a namespace and is
+ * an explicit opt-in). Said here because this is where the wrong assumption is
+ * formed: an agent that has just connected a cluster will otherwise expect
+ * `IS_DATABRICKS` to be true and read a widgets-gated notebook's silence as a bug.
+ */
+const CONNECT_RUNTIME_CLAUSE =
+	' Connecting does NOT advertise a Databricks runtime - IS_DATABRICKS still reads false, so dbutils.widgets-style code takes its non-Databricks branch. Toggle that separately with databricks_runtime (it restarts the kernel).';
 
 /**
  * The cluster's lifecycle state (`RUNNING`, `TERMINATED`, `PENDING`, …), or null
@@ -3459,10 +3546,222 @@ export async function connectCluster({
 		...connectedPayload(status),
 		kernel_restarted: kernelRestarted,
 		namespace_cleared: kernelRestarted,
-		note: kernelRestarted
-			? 'Connected to the cluster above — BUT connecting had to reinstall databricks-connect to match the cluster runtime, which RESTARTED your kernel: every Python variable you had is gone (ran_this_session is now false for every cell). Re-run the cells you need. `spark` and `w` are live; use them directly.'
-			: 'Connected to the cluster above. `spark` and `w` are live in the kernel namespace; use them directly — do not re-create a DatabricksSession.'
+		note:
+			(kernelRestarted
+				? 'Connected to the cluster above — BUT connecting had to reinstall databricks-connect to match the cluster runtime, which RESTARTED your kernel: every Python variable you had is gone (ran_this_session is now false for every cell). Re-run the cells you need. `spark` and `w` are live; use them directly.'
+				: 'Connected to the cluster above. `spark` and `w` are live in the kernel namespace; use them directly — do not re-create a DatabricksSession.') +
+			// The deliberate reversal an agent will otherwise get wrong: connecting used
+			// to advertise a runtime and no longer does (see `databricksRuntime.ts`), so
+			// `IS_DATABRICKS` still reads false here and dbutils.widgets code takes its
+			// non-Databricks branch. Named at the moment the assumption is formed.
+			CONNECT_RUNTIME_CLAUSE
 	};
+}
+
+/**
+ * Turn the Databricks-runtime advertisement on or off for this workspace and apply
+ * it to `nb`'s live kernel - the agent-facing counterpart of the sidebar's Runtime
+ * toggle, and NOT a second mechanism: it writes the same two preference keys and
+ * then calls the same `restartKernel`, so `initKernel` makes the one decision
+ * (`injectDatabricksRuntime`) it has always made.
+ *
+ * THE RESTART IS CONDITIONAL, and that is the whole care in this function. Applying
+ * costs the user their namespace, so it is only paid where it changes something:
+ * the restart happens exactly when the version the kernel WOULD start with differs
+ * from the one it is carrying. So enabling what is already advertised, or disabling
+ * what was never advertised, is a genuine no-op (`kernel_restarted:false`), and a
+ * notebook with no kernel yet simply picks the preference up when it starts.
+ *
+ * Two things are reported rather than silently swallowed, because both make the
+ * result diverge from what the caller asked for:
+ *   - `bound`: the injection is SCOPED to a Databricks-connected notebook (see
+ *     `databricksRuntime.ts`), so enabling it on an unconnected one stores the
+ *     preference and advertises nothing. Stored-and-said, never a restart that
+ *     would clear the namespace to change nothing - EXCEPT where such a kernel is
+ *     still carrying an advertisement from before it was disconnected, which the
+ *     conditional restart above genuinely removes. `runtimeNote` therefore derives
+ *     every sentence from what was OBSERVED - the epoch delta and the resulting
+ *     `runtime` block - rather than from the request that produced it.
+ *   - a version forced by `CELLAR_DATABRICKS_RUNTIME_VERSION` OVERRIDES the
+ *     `version` argument for as long as it is set; the result names it. The passed
+ *     value is still STORED as the preference (never claim it was ignored - it
+ *     becomes the effective version the moment the override is removed), which is
+ *     also why nothing here skips the store write.
+ * An on/off decision forced by `CELLAR_DATABRICKS_RUNTIME` is refused outright
+ * (`runtime_env_forced`) - nothing this function does could move it.
+ *
+ * The preference is written BEFORE the restart is considered, deliberately: it is
+ * the standing instruction and the restart is only its first reconcile, so a restart
+ * that fails must leave a preference the next kernel start still honors (the same
+ * ordering `harness.js` records its allow-list with). And a `databricks:changed` is
+ * published so an open sidebar re-reads: the restart path already prompts one via
+ * the kernel epoch, but the no-op path prompts nothing, and the Runtime card's toggle
+ * re-seeds from that read.
+ */
+export async function setRuntimeAdvertisement({
+	enable,
+	version,
+	nb
+}: {
+	enable: boolean;
+	version?: string | null;
+	nb?: string | null;
+}) {
+	const abs = resolveNotebookPath(nb);
+	const forced = databricksRuntimeForced();
+	if (forced !== null) {
+		throw new DatabricksError(
+			'runtime_env_forced',
+			`The Databricks runtime advertisement is held ${forced ? 'ON' : 'OFF'} by the CELLAR_DATABRICKS_RUNTIME environment variable, so it cannot be changed from here (a restart would clear the namespace and change nothing). Ask the user to relaunch Cellar without that variable to make it settable.`
+		);
+	}
+	const versionForcedByEnv = databricksRuntimeVersionForced();
+	const requested = typeof version === 'string' ? version.trim() : null;
+	setUiState({
+		[DBX_RUNTIME_KEY]: enable,
+		// Only touch the version when one was passed; `null` clears it back to the
+		// default. An omitted argument must leave the user's setting alone.
+		...(version === undefined ? {} : { [DBX_RUNTIME_VERSION_KEY]: requested || null })
+	});
+
+	// What a kernel starting NOW would advertise, read through the same accessors
+	// `initKernel` uses - never re-derived here, or the prediction and the injection
+	// could disagree about the very thing this reports.
+	const bound = databricksBound(abs);
+	const desired = injectDatabricksRuntime(bound) ? databricksRuntimeVersion() : null;
+	const live = liveDatabricksRuntime(abs);
+	const epochBefore = currentSessionId(abs);
+	let restartFailure: unknown = null;
+	if (live.started && live.version !== desired) {
+		try {
+			await restartKernel(abs);
+		} catch (err) {
+			restartFailure = err;
+		}
+	}
+	// The EPOCH decides whether the namespace survived - never whether the call threw.
+	// `restartKernel` bumps it in a `finally` precisely because the namespace is gone
+	// once the REST restart has been issued, even when the websocket reconnect or
+	// `initKernel` then rejects. Reading the throw instead would report nothing about a
+	// namespace that really was cleared, which is the NameError trap the whole run-status
+	// doctrine exists to prevent.
+	const kernelRestarted = epochBefore != null && currentSessionId(abs) !== epochBefore;
+
+	publishGlobal({ type: 'databricks:changed' });
+	// A failed restart still leaves the preference stored (the standing instruction) and
+	// still has to STATE its side effects, so it is rethrown carrying the same
+	// `kernelRestarted` fact the success shape reports rather than a bare failure.
+	if (restartFailure !== null) throw runtimeRestartFailed(restartFailure, kernelRestarted);
+	const runtime = agentRuntimeBlock(abs);
+	return {
+		enabled: enable,
+		runtime,
+		kernel_restarted: kernelRestarted,
+		namespace_cleared: kernelRestarted,
+		...(versionForcedByEnv && requested && requested !== versionForcedByEnv
+			? { version_forced_by_env: versionForcedByEnv }
+			: {}),
+		note: runtimeNote({ enable, bound, runtime, kernelRestarted, versionForcedByEnv, requested })
+	};
+}
+
+/**
+ * The failure `setRuntimeAdvertisement` raises when the restart that APPLIES the
+ * preference threw. It leads with the namespace, because that is the fact the caller
+ * has to act on and the one a bare failure hides: a restart that reaches the kernel
+ * and then fails to come back has already destroyed every variable. `kernelRestarted`
+ * comes from the epoch, so the sentence and the structured pair can never disagree,
+ * and the underlying failure rides the same message rather than being swallowed.
+ */
+function runtimeRestartFailed(cause: unknown, kernelRestarted: boolean): DatabricksError {
+	const detail = String((cause as { message?: string } | null)?.message ?? cause);
+	const err = new DatabricksError(
+		'runtime_restart_failed',
+		kernelRestarted
+			? `The preference was STORED, but the kernel restart that applies it failed after the restart had already been issued: every Python variable is GONE (ran_this_session is now false for every cell) and ${QUEUED_RUNS_DROPPED}, so re-run the cells you need. The kernel may not be usable until it is restarted again (restart_kernel). Underlying failure: ${detail}`
+			: `The preference was STORED, but the kernel restart that applies it failed before the kernel session changed: your Python variables are intact and the kernel still advertises what it did before, so the preference applies at the next kernel start. The restart had been issued, though, so ${QUEUED_RUNS_DROPPED} and any active run was aborted. Underlying failure: ${detail}`
+	);
+	err.kernelRestarted = kernelRestarted;
+	return err;
+}
+
+/**
+ * The restart's other two side effects, stated wherever it is reported.
+ *
+ * `restartKernel` clears this notebook's pending runs and force-aborts its active one
+ * BEFORE it issues the restart, so a note that named only the namespace under-reported
+ * what the caller lost - an agent whose own `run_cells` batch was still queued watched
+ * it vanish and its next call stop on a bare `cancelled`. Worded to match
+ * `restart_kernel`'s own description, so the two surfaces read as one rule.
+ *
+ * The session rebuild is the mirror case: `restartKernel` fires it DETACHED (`void`),
+ * so `spark`/`w` are NOT bound when this returns and a cold cluster can take minutes.
+ * Telling the caller to re-run its cells without saying so sends a `spark.*` cell
+ * straight into a NameError. It reports that a rebuild is under way and names the tool
+ * that observes it - never that the rebuild will succeed.
+ */
+const QUEUED_RUNS_DROPPED = "this notebook's queued runs were DROPPED (they were submitted against the namespace you cleared)";
+const SESSION_REBUILDING =
+	' If this notebook had a Databricks session, Cellar is rebuilding it in the background: `spark`/`w` are NOT bound yet, so check databricks_status before a cell uses them.';
+
+/**
+ * The one honest sentence for each outcome of `setRuntimeAdvertisement`.
+ *
+ * Every branch turns on what was OBSERVED - whether the kernel session really changed
+ * (the epoch delta) and what the resulting `runtime` block says the kernel now carries
+ * - never on the `enable`/`bound` inputs, which are a REQUEST and a snapshot taken
+ * before the work. Both had already produced a sentence contradicting the structured
+ * result in the same payload: `bound` is re-evaluated by `initKernel` DURING the
+ * restart, so a disconnect landing in that window claimed `IS_DATABRICKS` reads true
+ * beside `advertised:false`, and the request-shaped branch flatly denied a restart that
+ * had happened. They survive only to explain WHY an observed outcome happened (the
+ * connection scope is the sole reason an enable can end up advertising nothing), which
+ * is a claim about a rule, not about this run.
+ */
+function runtimeNote({
+	enable,
+	bound,
+	runtime,
+	kernelRestarted,
+	versionForcedByEnv,
+	requested
+}: {
+	enable: boolean;
+	bound: boolean;
+	runtime: AgentRuntimeBlock;
+	kernelRestarted: boolean;
+	versionForcedByEnv: string | null;
+	requested: string | null;
+}): string {
+	const versionNote =
+		versionForcedByEnv && requested && requested !== versionForcedByEnv
+			? ` The version you passed was stored as the preference, but it is currently overridden: CELLAR_DATABRICKS_RUNTIME_VERSION pins the advertised version to "${versionForcedByEnv}". Your value applies once that override is removed.`
+			: '';
+	// The RESTART is stated first, because it is the fact the caller has to act on and
+	// the one the structured `kernel_restarted`/`namespace_cleared` pair already carries.
+	if (kernelRestarted) {
+		const outcome = runtime.advertised
+			? `DATABRICKS_RUNTIME_VERSION="${runtime.version}" is now set in the kernel, so IS_DATABRICKS reads true and dbutils.widgets is the parameter path.`
+			: enable
+				? // Asked to enable, yet the kernel that came back advertises nothing: the
+					// only thing that can produce that is the connection scope, so what this
+					// run did was REMOVE the advertisement the old kernel still carried.
+					'The advertisement was REMOVED, not applied: it is scoped to a Databricks-connected notebook and this one is not connected, so IS_DATABRICKS now reads false. The preference is stored; connect a cluster (databricks_connect), then call this again to apply it.'
+				: 'The runtime advertisement is off: IS_DATABRICKS now reads false.';
+		return `The kernel was RESTARTED: every Python variable is gone (ran_this_session is now false for every cell) and ${QUEUED_RUNS_DROPPED}, so re-run the cells you need. ${outcome}${SESSION_REBUILDING}${versionNote}`;
+	}
+	// Nothing was restarted, so the kernel carries exactly what it carried before and
+	// every branch here can say the namespace is intact.
+	if (runtime.advertised) {
+		return `Already advertised as "${runtime.version}" - nothing to apply, so the kernel was not restarted and your namespace is intact.${versionNote}`;
+	}
+	// Nothing is advertised and nothing was torn down. The connection scope is why an
+	// enable can land here, and it is also what decides the remedy: an unconnected
+	// notebook will not pick the preference up at its next kernel start either.
+	if (enable && !bound) {
+		return `Preference stored, but this notebook is not connected to a Databricks cluster, so nothing is advertised yet (IS_DATABRICKS still reads false) and the kernel was NOT restarted. Connect a cluster (databricks_connect), then call this again to apply it.${versionNote}`;
+	}
+	return `Stored. No kernel is advertising a runtime right now${enable ? ', so it applies the next time this notebook\'s kernel starts' : ' and none was, so nothing was restarted'}.${versionNote}`;
 }
 
 /**

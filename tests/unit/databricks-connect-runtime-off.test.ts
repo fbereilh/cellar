@@ -151,6 +151,9 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 		expect(st.runtime).toEqual({
 			kernelStarted: true,
 			liveVersion: null,
+			// The stored preference rides ALONGSIDE the live fact (it is what the toggle
+			// shows) - the point of this suite is that it never becomes `liveVersion`.
+			preference: true,
 			envForced: null,
 			versionEnvForced: null
 		});
@@ -162,6 +165,8 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 		expect((await dbx.getStatus(A())).runtime).toEqual({
 			kernelStarted: true,
 			liveVersion: '15.4',
+			// …and it reports the live version even though nothing opted in.
+			preference: false,
 			envForced: null,
 			versionEnvForced: null
 		});
@@ -174,6 +179,7 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
 		expect((await dbx.getStatus(A())).runtime).toEqual({
 			kernelStarted: false,
 			liveVersion: null,
+			preference: true,
 			envForced: null,
 			versionEnvForced: null
 		});

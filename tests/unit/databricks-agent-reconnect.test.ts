@@ -58,6 +58,8 @@ vi.mock('../../src/lib/server/kernel', () => {
 			return {};
 		},
 		currentSessionId: (nbPath?: string | null) => sess(nbPath),
+		// `agentStatus` also reports what the live session advertises; none here.
+		liveDatabricksRuntime: () => ({ started: true, version: null }),
 		kernelStatus: (nbPath?: string | null) => ({
 			status: nbPath != null && state.busy.has(nbPath) ? 'busy' : sess(nbPath) == null ? 'not_started' : 'idle',
 			id: sess(nbPath) == null ? null : 'k1'

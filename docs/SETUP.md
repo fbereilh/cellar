@@ -304,6 +304,32 @@ up - and `off` otherwise. Force the setting headless with
 reference below) - the card then says the environment is in control and disables the
 control that override holds, since no toggle or restart can change it.
 
+**An agent can read and set it too.** Whether a kernel advertises a runtime decides
+which branch a notebook's own `IS_DATABRICKS` gate takes, and a notebook full of
+`dbutils.widgets` reads identically either way - so the agent tools that describe a
+notebook (`databricks_status`, `kernel_state`, `get_notebook_map`) all carry a
+`runtime: {advertised, version, forced_by_env}` block taken from the **running
+kernel**, exactly like the card's badge. `databricks_runtime(enable, version?)` sets
+it: the same preference, the same restart, the same "every variable is cleared" cost,
+reported back as `kernel_restarted` / `namespace_cleared` so the agent knows to re-run
+its cells. It restarts only when the state really changes, so re-enabling what is
+already advertised costs nothing; enabling on a notebook with no Databricks session
+stores the preference and says nothing is advertised yet rather than restarting to
+change nothing; and while `CELLAR_DATABRICKS_RUNTIME` holds the decision the call is
+refused (`runtime_env_forced`), since no restart could move it. Connecting a cluster
+still advertises nothing - that reversal is exactly the assumption an agent forms on
+connecting, so it is spelled out in the doctrine it is given.
+
+The preference is per workspace, so an agent turning it on also governs what your
+other connected notebooks advertise at their next kernel start (only the notebook it
+addressed restarts now). The card's toggle follows the stored preference rather than a
+snapshot taken when the panel mounted, so a change an agent makes shows up there with
+no reload. The version field is the one exception, since it is a field you may be
+typing in: a version an agent set shows there only after a reload. That stays cosmetic
+because only a deliberate edit of that field writes it - flipping the toggle, or
+**Apply now**, moves the advertisement alone and applies whatever version is stored -
+and the badge reports the running kernel throughout.
+
 **Upload the open notebook to your workspace.** While connected, the **Upload**
 card - its own card between Cluster and Runtime, since this acts on workspace files
 and never on compute - carries an **Upload notebook to workspace** button (the
@@ -461,8 +487,8 @@ to publish, e.g. inside a container.
 | `CELLAR_DATAFLOW_BACKOFF_BASE_MS` | `30000` (ms, = 30s) | First backoff window after a dataflow batch times out; doubles per consecutive timeout. A timed-out batch is not re-probed until its window elapses or its source content changes, so a persistently-slow notebook converges instead of re-spawning the probe every pass. |
 | `CELLAR_DATAFLOW_BACKOFF_MAX_MS` | `300000` (ms, = 5min) | Ceiling on the dataflow backoff window, so a persistently-slow notebook still re-probes rarely rather than never. |
 | `CELLAR_ADD_PROJECT_ROOT` | UI setting | Force whether the project root is added to the kernel's `sys.path` (overrides the persisted UI toggle). |
-| `CELLAR_DATABRICKS_RUNTIME` | UI setting (default off) | Force whether `DATABRICKS_RUNTIME_VERSION` is advertised in the kernel environment, so notebook code that checks whether it is running on Databricks takes its `dbutils.widgets` path. Overrides the persisted UI toggle and bypasses the connected-notebook scope; the sidebar then reports the setting as environment-controlled and disables the toggle. Applied at kernel start/restart only. |
-| `CELLAR_DATABRICKS_RUNTIME_VERSION` | `15.4` | The runtime version string advertised when the runtime is on. Overrides the persisted UI value (and disables the card's version field), independently of `CELLAR_DATABRICKS_RUNTIME` - either can be set without the other. |
+| `CELLAR_DATABRICKS_RUNTIME` | UI setting (default off) | Force whether `DATABRICKS_RUNTIME_VERSION` is advertised in the kernel environment, so notebook code that checks whether it is running on Databricks takes its `dbutils.widgets` path. Overrides the persisted UI toggle and bypasses the connected-notebook scope; the sidebar then reports the setting as environment-controlled and disables the toggle, and an agent's `databricks_runtime` call is refused (`runtime_env_forced`) rather than restarting a kernel to change nothing. Applied at kernel start/restart only. |
+| `CELLAR_DATABRICKS_RUNTIME_VERSION` | `15.4` | The runtime version string advertised when the runtime is on. Overrides the persisted UI value (and disables the card's version field), independently of `CELLAR_DATABRICKS_RUNTIME` - either can be set without the other. Unlike that one it refuses nothing: a version an agent passes to `databricks_runtime` is stored as the preference and reported back as overridden, so it takes effect once this is unset. |
 | `CELLAR_USER_SETTINGS` | `~/.cellar/settings.json` | Path of the cross-project user-settings file (today: the default Databricks upload prefix/postfix). Point it elsewhere to keep those settings with a dotfile setup, or to isolate them in a test run. Per-project state stays in each workspace's own `.cellar/` and is unaffected. |
 | `CELLAR_JUPYTER_URL` | `http://127.0.0.1:8888` | Point the kernel bridge at an external Jupyter server (the launcher sets this automatically for the managed sidecar). |
 | `CELLAR_JUPYTER_TOKEN` | `` (empty) | Token for an external Jupyter server. |

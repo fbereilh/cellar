@@ -32,7 +32,7 @@
  * lets a traceback be the only answer.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readSync } from 'node:fs';
 import { join, resolve, extname, sep } from 'node:path';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
 import { invalidateGitStatusCache } from './git';
@@ -100,6 +100,28 @@ export function isPyPath(path: string): boolean {
 }
 
 /**
+ * The first line of `text` that is not blank, trimmed - `''` when there is none.
+ *
+ * Walks the leading lines rather than splitting the whole string, because the ONE
+ * thing this answers is a HEADER fact: `isPyNotebookFile` hands over a 64 KB prefix
+ * for every `.py` in the workspace, on the process that also carries the kernel
+ * websockets and the SSE fan-out, and a split allocated an array of every line in it
+ * to read one. Same rule as before: only the first non-blank line can be the
+ * Databricks header, and a line is blank when it trims to nothing.
+ */
+function firstNonBlankLine(text: string): string {
+	let from = 0;
+	while (from < text.length) {
+		let end = text.indexOf('\n', from);
+		if (end === -1) end = text.length;
+		const line = text.slice(from, end).trim();
+		if (line !== '') return line;
+		from = end + 1;
+	}
+	return '';
+}
+
+/**
  * Decide, from a `.py` file's TEXT alone, whether Cellar should open it as a live
  * notebook — and never boot python to do it. A plain script must still open as
  * text (matching VS Code / the task), so only an explicit notebook marker counts:
@@ -111,11 +133,72 @@ export function isPyPath(path: string): boolean {
  * Python helper re-detects authoritatively on read and reports the real one.
  */
 export function detectPyNotebook(text: string): { notebook: boolean; format: string | null } {
-	const firstNonBlank = (text.split('\n').find((l) => l.trim() !== '') ?? '').trim();
-	if (firstNonBlank === DBX_HEADER) return { notebook: true, format: 'databricks' };
+	if (firstNonBlankLine(text) === DBX_HEADER) return { notebook: true, format: 'databricks' };
 	if (/^# %%/m.test(text)) return { notebook: true, format: 'percent' };
 	if (/^# ---\s*$/m.test(text) && /^#\s+jupytext:/m.test(text)) return { notebook: true, format: null };
 	return { notebook: false, format: null };
+}
+
+/**
+ * How much of a `.py` file `isPyNotebookFile` reads to look for a marker. Every
+ * marker `detectPyNotebook` recognizes is a HEADER fact — the Databricks line is
+ * line 1, jupytext front-matter opens the file, and a percent notebook's first
+ * `# %%` sits above its first cell — so a bounded prefix answers the question a
+ * whole-file read would, at one `read` syscall per file whatever the file's size.
+ * That bound is the point: the caller (`list_notebooks`) sniffs EVERY `.py` in the
+ * workspace, which in a real python project is hundreds of ordinary modules, on
+ * the process that also carries the kernel websockets and the SSE fan-out.
+ *
+ * It is therefore the same marker VOCABULARY as the UI's detection route, applied
+ * to a bounded prefix rather than to the whole file, so the two can disagree at the
+ * extremes in BOTH directions: a percent notebook whose first `# %%` sits past this
+ * bound is opened by the UI and refused here, and a `.py` past the UI's own read
+ * cap (`MAX_FILE_BYTES`) is accepted here while the UI opens it as text. Both are
+ * accepted, and neither is a parity claim - do not read the shared predicate as one.
+ */
+const DETECT_PREFIX_BYTES = 64 * 1024;
+
+/**
+ * The one sniff buffer, reused by every `isPyNotebookFile` call rather than
+ * allocated per file. 64 KB is past `Buffer.poolSize`, so a fresh one is a real
+ * malloc, and `list_notebooks` sniffs EVERY `.py` in the workspace in one pass.
+ * Sharing it is safe because the read below is SYNCHRONOUS: the bytes are decoded
+ * into a string before anything else can run, so no second caller can observe it.
+ */
+const detectBuf = Buffer.allocUnsafe(DETECT_PREFIX_BYTES);
+
+/**
+ * Whether the `.py` file at `abs` is a notebook Cellar can OPEN — the on-disk
+ * counterpart of `detectPyNotebook`, for callers that hold a path rather than the
+ * text. Same marker rule (an explicit marker, never a markerless script) over a
+ * bounded prefix, so what `list_notebooks` offers and what `use_notebook` accepts
+ * cannot drift from each other.
+ *
+ * Reads a bounded prefix (see `DETECT_PREFIX_BYTES`) and answers FALSE for
+ * anything it cannot read at all (missing, a directory, EACCES, binary): "not a
+ * notebook" is the safe direction here — a file we cannot read is one we could not
+ * open as a notebook either, and the alternative is a listing that throws on one
+ * unreadable file. A multi-byte character clipped at the boundary decodes to a
+ * replacement char, which is harmless: every marker is line-anchored ASCII, so a
+ * clip can only ever cost the final partial line.
+ */
+export function isPyNotebookFile(abs: string): boolean {
+	let fd: number | undefined;
+	try {
+		fd = openSync(abs, 'r');
+		const n = readSync(fd, detectBuf, 0, DETECT_PREFIX_BYTES, 0);
+		return detectPyNotebook(detectBuf.subarray(0, n).toString('utf8')).notebook;
+	} catch {
+		return false;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch {
+				/* already gone */
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

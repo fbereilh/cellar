@@ -13,7 +13,7 @@
  * `notebook-root-restart.test.ts`.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -153,6 +153,36 @@ describe('use_notebook + root', () => {
 		expect(bodyOf(res)).toMatch(/does not exist/i);
 		expect(existsSync(join(WS, 'never-made.ipynb'))).toBe(false);
 		expect(svc.currentNotebook('sessAtomic').pinned).toBe(false);
+	});
+
+	it('a root a .py notebook cannot HOLD is refused before the pin too', async () => {
+		// Same ordering rule, second refusal: a `.py` stores no notebook metadata, so a
+		// root declared on one could not survive a reload. That refusal came only from
+		// `setNotebookRoot`, i.e. AFTER the open and the pin, so the agent read an error
+		// while its session had silently moved to the `.py`. Newly reachable, since a
+		// `.py` name used to resolve to a nonexistent `.py.ipynb`.
+		writeFileSync(join(WS, 'parity.py'), '# Databricks notebook source\nx = 1\n');
+		const client = await connect('sessPyRoot');
+		const res = (await client.callTool({
+			name: 'use_notebook',
+			arguments: { name: 'parity.py', root: 'roots/pr-482' }
+		})) as CallResult;
+		expect(res.isError).toBe(true);
+		// The write path's OWN message, not a second rule.
+		expect(bodyOf(res)).toMatch(/Cannot set a code root on a \.py notebook/);
+		expect(svc.currentNotebook('sessPyRoot').pinned).toBe(false);
+		expect(existsSync(join(WS, 'parity.py.ipynb'))).toBe(false);
+	});
+
+	it('clearing a root is still allowed on a .py (it can only remove state)', async () => {
+		const client = await connect('sessPyClear');
+		const res = (await client.callTool({
+			name: 'use_notebook',
+			arguments: { name: 'parity.py', root: '' }
+		})) as CallResult;
+		// It gets past the up-front refusal; whether the open succeeds is the `.py`
+		// reader's business (no python here), not this rule's.
+		expect(bodyOf(res)).not.toMatch(/Cannot set a code root/);
 	});
 
 	it('two sessions work two roots in one instance, independently', async () => {

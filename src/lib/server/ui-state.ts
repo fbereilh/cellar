@@ -29,6 +29,7 @@ import {
 	DBX_RUNTIME_KEY,
 	DBX_RUNTIME_VERSION_KEY,
 	shouldInjectDatabricksRuntime,
+	databricksRuntimeEnabled,
 	databricksRuntimeOverride,
 	databricksRuntimeVersionOverride,
 	databricksRuntimeVersion as resolveDatabricksRuntimeVersion
@@ -83,6 +84,28 @@ export function injectDatabricksRuntime(bound: boolean): boolean {
 		process.env.CELLAR_DATABRICKS_RUNTIME,
 		bound
 	);
+}
+
+/**
+ * The STORED runtime preference, with no env override folded in - what the sidebar's
+ * Runtime toggle reflects, as opposed to `injectDatabricksRuntime`'s decision (which
+ * also weighs the override and the connection scope).
+ *
+ * The panel used to read this once, from the browser's own copy of the store, at
+ * mount. That was fine while the toggle was the only writer; it is not now that
+ * `databricks_runtime` (MCP) writes the same preference server-side. A stale toggle
+ * is not cosmetic here: clicking it applies `!runtimeOn`, so a toggle showing OFF
+ * over an already-ON preference restarts the kernel, wipes the namespace, and
+ * changes nothing - exactly the "a control that cannot do its work must not claim
+ * it did" defect the card's other states are built to avoid. Reported from the
+ * server so the panel can re-seed from the one authority, which also covers a
+ * second Cellar instance or a hand-edited store.
+ *
+ * Resolved through `databricksRuntimeEnabled` with NO env value, so the
+ * only-an-explicit-stored-true rule is reused rather than copied.
+ */
+export function databricksRuntimePreference(): boolean {
+	return databricksRuntimeEnabled(store.get()[DBX_RUNTIME_KEY]);
 }
 
 /**

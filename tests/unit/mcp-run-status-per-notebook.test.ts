@@ -228,8 +228,12 @@ describe('trimmed read/map/output shapes', () => {
 		// Kept (the only session signal + the output presence boolean).
 		expect(leaf!.run_status).toBe('ok_session');
 		expect('has_output' in leaf!).toBe(true);
-		// The map's databricks block is the minimal boolean, not the boilerplate note.
-		expect(map.databricks).toEqual({ connected: false });
+		// The map's databricks block stays minimal - a boolean plus the runtime fact,
+		// never the ~150-char actionable note `databricks_status` carries.
+		expect(map.databricks).toEqual({
+			connected: false,
+			runtime: { advertised: false, version: null, forced_by_env: false }
+		});
 	});
 
 	it('map section nodes drop kind + the duplicated summary but keep title/level/children', async () => {

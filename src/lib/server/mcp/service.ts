@@ -42,15 +42,16 @@ import {
 } from '../notebook';
 import { setNotebookRootAndRestart, listWorkspaceRoots } from '../notebook-root-actions';
 import { resolveRootDir } from '../notebookRoot';
-import { ROOTS_DIR } from '../../notebookRoot';
+import { ROOTS_DIR, normalizeRootPath, textNotebookRootError } from '../../notebookRoot';
 import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel';
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
-import { agentStatus as databricksStatus, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable, reconnectSession as databricksReconnect, connectCluster as databricksConnect, listClustersForAgent as databricksClusters } from '../databricks';
+import { agentStatus as databricksStatus, agentRuntimeBlock, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable, reconnectSession as databricksReconnect, connectCluster as databricksConnect, setRuntimeAdvertisement as databricksSetRuntime, listClustersForAgent as databricksClusters } from '../databricks';
 import { publish } from '../events';
 import { enqueueRun, queuesByNotebook, queuePosition, queueStateFor } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
 import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree, resolveInWorkspace, workspaceRoot } from '../fstree';
+import { isPyPath, isPyNotebookFile } from '../jupytext';
 import { buildNotebookHtml, exportFilename } from '../export-html';
 import { generatedModuleExists } from '../export-py';
 import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
@@ -67,7 +68,7 @@ import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } fro
 import { autoCheckpointBeforeAgentAction, createCheckpoint, type CheckpointMeta } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
 import { forgetSessionActivity } from './userActivity';
-import type { CellView, CellOutput, SessionId, LogicalCellType, QueueState } from '../types';
+import type { CellView, CellOutput, NotebookView, SessionId, LogicalCellType, QueueState } from '../types';
 
 // Output tiering caps (chars). Reads summarize; get_full_output is medium by
 // default and only returns everything on explicit size=full.
@@ -210,7 +211,8 @@ export function useNotebook(sessionId: string | undefined, name?: string, create
 		if (!createIfMissing) throw new Error('use_notebook requires a notebook name to open. Use list_notebooks to see existing notebooks.');
 		rel = 'untitled';
 	}
-	if (!/\.ipynb$/i.test(rel)) rel += '.ipynb';
+	rel = notebookNameToPath(rel);
+	if (isPyPath(rel)) return usePyNotebook(sessionId, rel);
 	const existed = notebookExists(rel);
 	if (!existed && !createIfMissing) {
 		throw new Error(`Notebook "${rel}" does not exist. Use list_notebooks to see workspace notebooks, or call use_notebook without create_if_missing:false (create is the default) to create it.`);
@@ -218,11 +220,76 @@ export function useNotebook(sessionId: string | undefined, name?: string, create
 	// createNotebookDoc opens an existing file or creates a new one; focus:false
 	// keeps the user's tab where it is.
 	const nb = createNotebookDoc(rel, null, { focus: false });
+	return pinnedPayload(sessionId, nb, !existed);
+}
+
+/**
+ * Resolve the `name` an agent passed into the workspace-relative path to open.
+ *
+ * A path that already NAMES its format is taken literally — `.ipynb` and, the fix
+ * this rule exists for, `.py`: a jupytext / Databricks-source `.py` is a first-class
+ * live notebook everywhere else in Cellar, and unconditionally appending `.ipynb`
+ * rewrote `analysis.py` into a nonexistent `analysis.py.ipynb`. That was not merely
+ * a discovery gap: `use_notebook` was the ONLY way to pin a session's working
+ * notebook, so an agent working a `.py` could not pin at all, its target silently
+ * followed the USER'S focused tab, and a later `add_and_run`/`edit_cell` could land
+ * in whatever notebook the human had switched to. A `.py` that does not exist is
+ * therefore an ERROR (see `usePyNotebook`), never a rewrite: an agent that typed a
+ * path means that path.
+ *
+ * Only a path naming a NOTEBOOK FORMAT is taken literally, and that is the whole
+ * rule: `.ipynb` and `.py`, nothing else. Everything else gets `.ipynb` appended -
+ * the bare-name case (`untitled`, `analysis`) this has always served, AND any other
+ * extension, whether or not a file exists there. Resolving `package.json` (or any
+ * other real file) literally would pin it as the session's working notebook and let
+ * the first `add_cell`/`edit_cell` persist nbformat JSON over the user's file, so
+ * mere existence must never make a path notebook-shaped.
+ */
+function notebookNameToPath(rel: string): string {
+	if (/\.ipynb$/i.test(rel) || isPyPath(rel)) return rel;
+	return rel + '.ipynb';
+}
+
+/**
+ * Open-and-pin a `.py` notebook. Split out because the two things `useNotebook`
+ * does for an `.ipynb` — create-if-missing, and trusting the extension — are both
+ * wrong here:
+ *
+ *   - Cellar cannot CREATE a `.py` notebook. `jpFormat` (which format to write it
+ *     back in) is recorded by `loadDoc` when it PARSES the file, so a doc invented
+ *     for a path with no file would persist as nbformat JSON into a `.py` - a
+ *     corrupt file, silently. Missing is an error naming the way to get one.
+ *   - Being a `.py` does not make a file a notebook. A plain module has no cell
+ *     structure; opening one would hand the agent a document whose cells are an
+ *     artifact of the converter. `isPyNotebookFile` is the ONE predicate this and
+ *     `list_notebooks` share, so what is offered is exactly what is accepted. It
+ *     applies the same marker VOCABULARY as the UI's detection route over a bounded
+ *     header prefix rather than the whole file, which is NOT a parity claim against
+ *     the UI - see `DETECT_PREFIX_BYTES` for where the two can disagree.
+ */
+function usePyNotebook(sessionId: string | undefined, rel: string) {
+	if (!notebookExists(rel)) {
+		throw new Error(
+			`Notebook "${rel}" does not exist, and Cellar cannot create a .py notebook (its format is read from the file). Use list_notebooks to see workspace notebooks, or create a .ipynb (use_notebook without the .py) and save it as .py from the app.`
+		);
+	}
+	if (!isPyNotebookFile(resolveNotebookPath(rel))) {
+		throw new Error(
+			`"${rel}" is a plain Python file, not a notebook: it carries no jupytext/Databricks cell marker (a "# Databricks notebook source" header, "# %%", or jupytext front matter), so Cellar opens it as text. Use list_notebooks to see the workspace's notebooks.`
+		);
+	}
+	// Opens the existing file (loadDoc parses it and records its `.py` format) and
+	// surfaces it as an available tab; focus:false keeps the user's tab where it is.
+	return pinnedPayload(sessionId, createNotebookDoc(rel, null, { focus: false }), false);
+}
+
+/** The one `use_notebook` result shape, so the `.ipynb` and `.py` paths cannot drift. */
+function pinnedPayload(sessionId: string | undefined, nb: NotebookView, created: boolean) {
 	if (sessionId) sessionNotebooks.set(sessionId, nb.path);
 	return {
 		working_notebook: workspaceRelative(nb.path),
 		path: nb.path,
-		created: !existed,
+		created,
 		pinned: !!sessionId,
 		cells: cellCount(nb),
 		root: getNotebookRoot(nb.path),
@@ -254,15 +321,28 @@ export async function setNotebookRoot(root: string | null, nb?: string | null) {
 }
 
 /**
- * Refuse an unusable code root BEFORE anything else happens.
+ * Refuse a root `use_notebook` could not apply BEFORE anything else happens.
  *
  * `use_notebook` OPENS-OR-CREATES its notebook and pins the session to it, both
  * of which are already done by the time `setNotebookRoot` could throw — so a
  * mistyped root used to leave a freshly created `untitled.ipynb` pinned behind
- * its own error. This is the SAME resolver the write path runs (never a second
- * validation rule), called first so a refused root creates and pins nothing.
+ * its own error. Both refusals the write path can raise are therefore raised here
+ * first, each through that path's OWN rule (never a second validation rule or a
+ * second message), so a refused root creates and pins nothing:
+ *
+ *   - a `.py` notebook cannot HOLD a root (it stores no notebook metadata, so the
+ *     declaration would be gone on the next reload). Checked from the resolved
+ *     NAME, which is what decides the format here: `useNotebook` dispatches a
+ *     `.py` path to `usePyNotebook`, which opens only a real `.py` notebook, and
+ *     an `.ipynb` never carries a `jpFormat` - so this and the write path's
+ *     `isTextNotebook` agree, without loading a document to find out. Clearing
+ *     ('' / null) stays allowed: it can only remove state, never strand it.
+ *   - anything that is not a usable directory inside the workspace.
  */
-export function assertRootUsable(root: string | null | undefined): void {
+export function assertRootUsable(root: string | null | undefined, name?: string): void {
+	const rel = (name ?? '').trim();
+	const declared = normalizeRootPath(root);
+	if (declared && rel && isPyPath(notebookNameToPath(rel))) throw textNotebookRootError(declared);
 	resolveRootDir(root);
 }
 
@@ -705,9 +785,20 @@ export const kernel = {
 };
 
 /**
- * List every `.ipynb` in the workspace so the agent can discover names to open.
+ * List every notebook in the workspace so the agent can discover names to open.
  * Walks the workspace file tree (skipping noise dirs) and marks which notebook
  * is currently active. Paths are workspace-relative (what `use_notebook` accepts).
+ *
+ * "Notebook" means every `.ipynb`, PLUS a `.py` carrying a jupytext / Databricks
+ * cell marker — those are live, kernel-attached notebooks everywhere else in
+ * Cellar, and omitting them here left an agent unable to discover the one thing
+ * `use_notebook` needs in order to PIN its working notebook (see
+ * `notebookNameToPath` for why an unpinnable notebook is a correctness problem,
+ * not a nicety). A plain `.py` module is deliberately NOT listed: it has no cell
+ * structure, and the marker rule here is the same `isPyNotebookFile` the open path
+ * enforces, so everything listed can actually be opened. That sniff costs one
+ * bounded read per `.py` in the workspace, which is why it reads a header prefix
+ * rather than the file.
  */
 export function listNotebooks(sessionId?: string) {
 	const activeAbs = getActiveNotebookPath();
@@ -723,7 +814,8 @@ export function listNotebooks(sessionId?: string) {
 	const walk = (nodes: TreeNodeLike[]) => {
 		for (const n of nodes) {
 			if (n.type === 'dir') walk(n.children || []);
-			else if (n.type === 'file' && /\.ipynb$/i.test(n.name)) paths.push(n.path);
+			else if (n.type !== 'file') continue;
+			else if (/\.ipynb$/i.test(n.name) || (isPyPath(n.name) && isPyNotebookFile(resolveNotebookPath(n.path)))) paths.push(n.path);
 		}
 	};
 	const { root, tree } = buildTree();
@@ -838,7 +930,14 @@ export async function getNotebookMap(nb?: string | null) {
 		// workspace root, the default). Not a display setting: it decides which
 		// checkout the code you run comes from, so it rides beside `kernel`.
 		root: view.root,
-		databricks: { connected: dbx.connected === true },
+		// `runtime` comes from the SAME builder `databricks_status`/`kernel_state`
+		// use, so the three surfaces cannot describe one kernel differently, and it
+		// is cheap enough for this hot structural read by construction (a Map lookup
+		// + an env read - no kernel boot, no probe). It rides here even with no
+		// session because that is the case it is FOR: a notebook whose code gates on
+		// `IS_DATABRICKS` looks identical either way, and this is the only thing that
+		// says which branch it is taking.
+		databricks: { connected: dbx.connected === true, runtime: agentRuntimeBlock(nb) },
 		display: {
 			header_numbering: view.headerNumbering,
 			report_view: view.hideAllCode,
@@ -920,6 +1019,7 @@ export const databricks = {
 	reconnect: (nb?: string | null) => databricksReconnect(nb),
 	connect: (opts: { clusterId: string; clusterName?: string | null; profile?: string | null; host?: string | null; nb?: string | null }) =>
 		databricksConnect(opts),
+	setRuntime: (opts: { enable: boolean; version?: string | null; nb?: string | null }) => databricksSetRuntime(opts),
 	listClusters: (sel: { profile?: string | null; host?: string | null }, nb?: string | null) => databricksClusters(nb, sel),
 	catalogs: (nb?: string | null) => databricksCatalog.catalogs(nb),
 	schemas: (catalog: string, nb?: string | null) => databricksCatalog.schemas(catalog, nb),

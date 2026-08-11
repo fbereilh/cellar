@@ -130,6 +130,8 @@
 		runtime?: {
 			kernelStarted: boolean;
 			liveVersion: string | null;
+			/** The STORED on/off preference - what the toggle shows; see its re-seed effect. */
+			preference?: boolean;
 			envForced?: boolean | null;
 			versionEnvForced?: string | null;
 		};
@@ -269,19 +271,73 @@
 	});
 
 	/**
-	 * Apply the runtime preference to the LIVE kernel: persist on/off (+ version)
-	 * server-side FIRST (race-free via `setUiNow`, so the restart re-reads the new
-	 * value), then restart the kernel so `initKernel` injects/omits the env for the
-	 * fresh imports and `reconnectAfterKernelRestart` rebuilds spark/w. The one and
-	 * only "apply runtime" path: the toggle and a version edit are its callers, and
-	 * connecting a cluster deliberately is not.
+	 * Re-seed the toggle from the SERVER's copy of the preference whenever a status
+	 * lands, the same lesson as `seedUploadAffixes` one field over: a one-shot mount
+	 * read is only correct while this panel is the sole writer, and it is not - the
+	 * `databricks_runtime` MCP tool writes the same preference server-side (as would a
+	 * second Cellar instance, or a hand-edited store).
+	 *
+	 * A stale toggle here is destructive rather than cosmetic. `toggleRuntime` applies
+	 * `!runtimeOn`, so a toggle still showing OFF over an already-ON preference
+	 * restarts the kernel, clears every variable, and leaves the state exactly where it
+	 * was - the "a control that cannot do its work must not claim it did" defect the
+	 * card's env-forced and no-notebook states exist to avoid.
+	 *
+	 * Guarded on nothing being in flight: `applyRuntime` sets `runtimeOn` optimistically
+	 * before its awaited write lands, so a status read resolving inside that window
+	 * would bounce the toggle back to the value being replaced. Deliberately NOT
+	 * extended to the version INPUT - that binds a field the user may be typing in, and
+	 * its stored value is written per keystroke, so seeding it would clobber an edit in
+	 * progress. What makes that residual purely cosmetic is the rule one function down:
+	 * a plain toggle (and "Apply now") never WRITES the version key, so a stale input
+	 * cannot clobber a version an agent set through `databricks_runtime` - it merely
+	 * displays the old value until a reload, while the card's live pill and
+	 * `runtimeEffectiveVersion` report what is really in force.
+	 *
+	 * `appliedVersion` IS re-seeded here, from the version the running kernel actually
+	 * carries: it exists solely as `commitVersion`'s "did the version really change"
+	 * comparand, so it has to track what was applied by ANY writer, not just by this
+	 * panel. A kernel carrying none (off, or not started) leaves it alone - there is no
+	 * live value to learn from, and clearing it would make the next edit restart to
+	 * apply a version that is already stored.
 	 */
-	async function applyRuntime(on: boolean): Promise<void> {
+	$effect(() => {
+		const stored = status?.runtime?.preference;
+		const live = runtimeLiveVersion;
+		if (runtimeApplying || busy) return;
+		untrack(() => {
+			if (typeof stored === 'boolean') runtimeOn = stored;
+			if (live) appliedVersion = live;
+		});
+	});
+
+	/**
+	 * Apply the runtime preference to the LIVE kernel: persist on/off server-side FIRST
+	 * (race-free via `setUiNow`, so the restart re-reads the new value), then restart the
+	 * kernel so `initKernel` injects/omits the env for the fresh imports and
+	 * `reconnectAfterKernelRestart` rebuilds spark/w. The one and only "apply runtime"
+	 * path: the toggle, "Apply now" and a version edit are its callers, and connecting a
+	 * cluster deliberately is not.
+	 *
+	 * `writeVersion` is the load-bearing half, and it is opt-in for exactly ONE caller.
+	 * The version key may only be written by a deliberate version EDIT (`commitVersion`),
+	 * never by an on/off toggle and never by "Apply now": neither is a statement about
+	 * the version, and this panel's `runtimeVersion` is a mount-time snapshot that the
+	 * re-seed effect above deliberately does not refresh. Writing it unconditionally
+	 * meant the user's next toggle silently reverted a version an agent had set through
+	 * `databricks_runtime` and restarted the kernel onto the stale one. A toggle flips
+	 * the ADVERTISEMENT only; whatever version is stored is the one it applies.
+	 */
+	async function applyRuntime(on: boolean, { writeVersion = false } = {}): Promise<void> {
 		runtimeOn = on; // optimistic
-		const v = runtimeVersion.trim();
 		await setUiNow(DBX_RUNTIME_KEY, on);
-		await setUiNow(DBX_RUNTIME_VERSION_KEY, v === '' ? null : v);
-		appliedVersion = v || DBX_RUNTIME_VERSION_DEFAULT;
+		if (writeVersion) {
+			const v = runtimeVersion.trim();
+			await setUiNow(DBX_RUNTIME_VERSION_KEY, v === '' ? null : v);
+			// Optimistic, like `runtimeOn`: the re-seed effect confirms it from the version
+			// the restarted kernel really carries.
+			appliedVersion = v || DBX_RUNTIME_VERSION_DEFAULT;
+		}
 		if (onRestartKernel && notebookPath) {
 			// Mark the expected-restart window BEFORE issuing it, so the transient
 			// mid-restart "session lost" the epoch bump reports is read as "connecting",
@@ -300,6 +356,9 @@
 	 * toggle off beside a live "active" pill, under a hint claiming variables were cleared
 	 * by a restart that never ran. The toggle is disabled in both states for the same
 	 * reason "Apply now" is: a control that cannot do its work must not claim it did.
+	 *
+	 * It flips the ADVERTISEMENT only - no `writeVersion`, so it can never revert a
+	 * version set elsewhere (see `applyRuntime`).
 	 */
 	async function toggleRuntime() {
 		if (runtimeApplying || busy || runtimeEnvControlled || !runtimeRestartable) return;
@@ -326,7 +385,8 @@
 	 * for the restart the pending copy says is needed, instead of leaving the toggle's
 	 * off-then-on double restart as the only route. Third caller of `applyRuntime`,
 	 * same shape as the other two, so the restart, the suppressed lost-flash and the
-	 * settle handling are identical.
+	 * settle handling are identical - and, like the toggle, it is not a version edit,
+	 * so it passes no `writeVersion` and applies whatever version is stored.
 	 *
 	 * Guarded by `runtimeApplicable`, so it can only ever run where a restart really
 	 * applies the runtime: an env-forced decision and a missing notebook path both make
@@ -350,6 +410,11 @@
 	 * Same rule as the toggle - refused when `CELLAR_DATABRICKS_RUNTIME_VERSION` holds the
 	 * version (the restart would advertise the override's value again) or when there is no
 	 * kernel to restart. The input is disabled in both states, so this is the backstop.
+	 *
+	 * The ONE caller that passes `writeVersion`, because it is the only one stating
+	 * anything about the version. Its "did it really change" comparand is
+	 * `appliedVersion`, which the re-seed effect keeps tracking the running kernel, so
+	 * an agent-set version is compared against too.
 	 */
 	async function commitVersion() {
 		if (runtimeApplying || busy || !runtimeEffectiveOn) return;
@@ -360,7 +425,7 @@
 			// Pass the STORED preference, not `true`: under an env override the runtime is
 			// on without the user having opted in, and a version edit must not silently
 			// write an opt-in they never made.
-			await applyRuntime(runtimeOn);
+			await applyRuntime(runtimeOn, { writeVersion: true });
 			await settleConnection();
 		} finally {
 			runtimeApplying = false;
