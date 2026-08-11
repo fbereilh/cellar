@@ -292,27 +292,42 @@ class _CellarSdkRuntimeFinder:
     # cannot resolve it declines, so a workspace without databricks-sdk imports
     # exactly as before. This is the half that covers an import happening AFTER
     # the shim ran; the installer covers a module already in sys.modules.
+    #
+    # SELF-CONTAINED ON PURPOSE: this instance lives in \`sys.meta_path\`, which
+    # OUTLIVES the kernel's user namespace, so it must never read a module-level
+    # name. A namespace clear that is not a process restart (\`%reset -f\` being the
+    # everyday one) removes the shim's globals while leaving this finder installed;
+    # resolving the module name or the loader class as globals then raised NameError
+    # on the very first comparison, and the import system does not swallow a
+    # finder's exception - so EVERY import in the kernel failed, not just this one.
+    # Everything it needs is captured on the instance in __init__, and the body is
+    # additionally wrapped so a broken finder can only ever DECLINE.
     _cellar_sdk_runtime_finder = True
 
-    def __init__(self, bind):
+    def __init__(self, name, loader_cls, bind):
+        self._name = name
+        self._loader_cls = loader_cls
         self._bind = bind
         self._busy = False
 
     def find_spec(self, fullname, path=None, target=None):
-        if fullname != _CELLAR_SDK_RUNTIME or self._busy:
-            return None
-        import importlib.util as _util
-        self._busy = True
         try:
-            _spec = _util.find_spec(fullname)
+            if fullname != self._name or self._busy:
+                return None
+            import importlib.util as _util
+            self._busy = True
+            try:
+                _spec = _util.find_spec(fullname)
+            except Exception:
+                return None
+            finally:
+                self._busy = False
+            if _spec is None or getattr(_spec, 'loader', None) is None:
+                return None
+            _spec.loader = self._loader_cls(_spec.loader, self._bind)
+            return _spec
         except Exception:
             return None
-        finally:
-            self._busy = False
-        if _spec is None or getattr(_spec, 'loader', None) is None:
-            return None
-        _spec.loader = _CellarSdkRuntimeLoader(_spec.loader, self._bind)
-        return _spec
 
 
 def _cellar_bind_sdk_dbutils(_db):
@@ -323,13 +338,19 @@ def _cellar_bind_sdk_dbutils(_db):
     # detect-and-report probe surfaces a binding that did not take.
     import sys as _sys
 
+    # Read the module name and the loader class HERE, while the shim's globals are
+    # known to exist, and hand them to the finder as instance state: the finder
+    # outlives this namespace (see its own note), so it may not look them up later.
+    _name = _CELLAR_SDK_RUNTIME
+    _loader_cls = _CellarSdkRuntimeLoader
+
     def _bind(_mod):
         try:
             _mod.dbutils = _db
         except Exception:
             pass
 
-    _mod = _sys.modules.get(_CELLAR_SDK_RUNTIME)
+    _mod = _sys.modules.get(_name)
     if _mod is not None:
         _bind(_mod)
     # Idempotent: drop a finder left by an earlier install (it closes over a stale
@@ -338,7 +359,7 @@ def _cellar_bind_sdk_dbutils(_db):
         _f for _f in _sys.meta_path
         if getattr(_f, '_cellar_sdk_runtime_finder', False) is not True
     ]
-    _sys.meta_path.insert(0, _CellarSdkRuntimeFinder(_bind))
+    _sys.meta_path.insert(0, _CellarSdkRuntimeFinder(_name, _loader_cls, _bind))
 `;
 
 /**

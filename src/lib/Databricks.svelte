@@ -2030,6 +2030,35 @@
 	{/if}
 {/snippet}
 
+<!--
+  Silent inertness, made loud. With the runtime advertised, code that does
+  `from databricks.sdk.runtime import dbutils` normally reaches Cellar's shim; when
+  it does not, the SDK's own object renders the same controls and throws every
+  entered value away on the next re-declaration, so nothing on screen says the
+  parameters are dead.
+
+  Rendered on EVERY card state (connected via the Runtime card, and the expired /
+  lost / picker Cluster cards) exactly as `agentStatus` folds the same sentence
+  into every shape it returns: the shim is installed on every kernel and the
+  runtime env is read at kernel start, so a session whose cluster connection has
+  expired or was never made still has dead widgets. The human and the agent must
+  agree - that parity is why `dbutilsShim.ts` exists. One branch shows at a time,
+  so the testid stays unique in the DOM.
+
+  Warning-TINTED with `base-content` copy, never `text-warning` body text (amber on
+  amber is ~2:1 on the light card).
+-->
+{#snippet sdkDbutilsWarning()}
+	{#if runtimeSdkForeign}
+		<p
+			class="mt-1.5 rounded border border-warning/40 bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-base-content/80"
+			data-testid="databricks-runtime-sdk-warning"
+		>
+			{SDK_DBUTILS_FOREIGN_WARNING}
+		</p>
+	{/if}
+{/snippet}
+
 {#snippet hint(text: string)}
 	<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/40">{text}</p>
 {/snippet}
@@ -2613,20 +2642,7 @@
 				<code class="font-mono text-[10px]">CELLAR_DATABRICKS_RUNTIME_VERSION</code> environment variable, not here.
 			{/if}
 		</p>
-		<!-- Silent inertness, made loud. With the runtime advertised, code that does
-		     `from databricks.sdk.runtime import dbutils` normally reaches Cellar's shim;
-		     when it does not, the SDK's own object renders the same controls and throws
-		     every entered value away on the next re-declaration, so nothing on screen
-		     says the parameters are dead. Warning-TINTED with `base-content` copy, never
-		     `text-warning` body text (amber on amber is ~2:1 on the light card). -->
-		{#if runtimeSdkForeign}
-			<p
-				class="mt-1.5 rounded border border-warning/40 bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-base-content/80"
-				data-testid="databricks-runtime-sdk-warning"
-			>
-				{SDK_DBUTILS_FOREIGN_WARNING}
-			</p>
-		{/if}
+		{@render sdkDbutilsWarning()}
 		<!-- The one state with something to apply: the runtime is on and the running
 		     kernel does not carry it. Rendered ONLY here - anywhere else this would be a
 		     restart (and a namespace wipe) nobody asked for. It reuses `applyRuntime`, so
@@ -2889,6 +2905,7 @@
 						{/if}
 					</p>
 					{@render sessionReauthBox()}
+					{@render sdkDbutilsWarning()}
 					{@render reconnectButton()}
 					<div class="mt-2 border-t border-warning/20 pt-2">
 						{@render picker()}
@@ -2907,6 +2924,7 @@
 						The session on <span class="font-mono">{connection.lost.clusterName}</span> ended when the kernel restarted. Reconnect to restore <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code>.
 					</p>
 					{@render sessionReauthBox()}
+					{@render sdkDbutilsWarning()}
 					{@render reconnectButton()}
 					<div class="mt-2 border-t border-warning/20 pt-2">
 						{@render picker()}
@@ -2921,6 +2939,7 @@
 					     with Databricks", and for an expired CLI-managed profile that button
 					     cannot help. Say why before the user reaches for it. -->
 					{@render sessionReauthBox()}
+					{@render sdkDbutilsWarning()}
 					<div class="mt-1.5">
 						{@render picker()}
 						{@render logoutRow(false)}

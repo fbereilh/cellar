@@ -106,6 +106,7 @@ import {
 	refreshKernelConnection,
 	liveDatabricksRuntime
 } from './kernel';
+import { queueStateFor } from './run-queue';
 import {
 	dbrMajorMinor,
 	parseVersionMismatch,
@@ -1891,7 +1892,16 @@ async function sdkDbutilsState(abs: string): Promise<SdkDbutilsState> {
 	// channel is blocked by the user's own cell. Fall back to the last reading for
 	// this session if there is one - it is stale but was true of this namespace -
 	// else say so.
-	if (status === 'not_started' || status === 'busy') {
+	//
+	// Busy is read from the run queue's OWN truth as well as jupyter's status,
+	// exactly as `kernelState`/`inspectVariables` do: a run claims the kernel
+	// synchronously at dequeue while jupyter's idle->busy flip lands a beat later,
+	// so reading only the status leaves a check-then-act window in which this probe
+	// dispatches into the kernel's exec lock and blocks for the WHOLE user cell.
+	// That would be far worse here than for those two - this is single-flight and
+	// awaited inside `getStatus`, so a multi-minute Spark cell would strand the
+	// Databricks panel and `databricks_status`/`kernel_state` for its duration.
+	if (status === 'not_started' || status === 'busy' || queueStateFor(abs).running != null) {
 		return cached && cached.session === session ? cached.state : 'unknown';
 	}
 	const running = dbutilsBindingInFlight.get(abs);

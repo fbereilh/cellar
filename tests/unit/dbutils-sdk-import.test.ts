@@ -22,7 +22,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WIDGETS_SHIM_CORE_PY, WIDGETS_SHIM_INSTALL_PY, dbutilsBindingProbeCode } from '../../src/lib/server/widgetsShim';
@@ -230,26 +230,95 @@ out['finder_declines'] = sys.meta_path[0].find_spec('textwrap') is None
 	});
 
 	it('never breaks kernel bring-up when databricks-sdk is not installed at all', () => {
-		// No fake package on sys.path: the import must simply fail as it always did,
-		// and the shim must still have bound the bare global.
+		// No fake package - and the absence is ENFORCED rather than assumed: a
+		// meta-path blocker installed before the shim makes `databricks` unresolvable
+		// whatever the ambient interpreter's site-packages happen to hold (this
+		// project may well have databricks-sdk installed). The import must simply fail
+		// as it always did, and the shim must still have bound the bare global.
 		const driver = `
 import sys, json
+
+
+class _NoDatabricks:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'databricks' or fullname.startswith('databricks.'):
+            raise ModuleNotFoundError("No module named 'databricks'", name=fullname)
+        return None
+
+
+sys.meta_path.insert(0, _NoDatabricks())
 ${WIDGETS_SHIM_CORE_PY}
 ${WIDGETS_SHIM_INSTALL_PY}
 out = {}
 out['bare_is_shim'] = isinstance(dbutils, _CellarDbUtils)
+# the install still armed the hook - it must not need the SDK to be present
+out['hook_installed'] = any(
+    getattr(f, '_cellar_sdk_runtime_finder', False) is True for f in sys.meta_path
+)
 try:
     import databricks.sdk.runtime  # noqa
     out['import_raised'] = False
 except ImportError:
     out['import_raised'] = True
+# an unrelated import is untouched by a hook that could not resolve its module
+import textwrap as _tw
+out['unrelated_imports_ok'] = _tw.dedent('  x') == 'x'
 print(json.dumps(out))
 `;
 		const env: NodeJS.ProcessEnv = { ...process.env, DATABRICKS_RUNTIME_VERSION: '15.4' };
 		const stdout = execFileSync('python3', ['-'], { input: driver, encoding: 'utf8', env, cwd: tmpdir() });
 		const out = JSON.parse(stdout.trim().split('\n').pop() as string);
 		expect(out.bare_is_shim).toBe(true);
+		expect(out.hook_installed).toBe(true);
 		expect(out.import_raised).toBe(true);
+		expect(out.unrelated_imports_ok).toBe(true);
+	});
+
+	it('survives a namespace clear: the finder in sys.meta_path outlives the shim globals', () => {
+		// `%reset -f` wipes the user namespace but NOT `sys.meta_path`, so the finder
+		// instance keeps being consulted for every import in the kernel. Resolving the
+		// module name or the loader class as globals there raised NameError on the
+		// first comparison - and the import system does not swallow a finder's
+		// exception, so EVERY import failed, not just this one. A fresh-process test
+		// cannot see it; only a clear after the install can.
+		//
+		// SCOPE: what must survive a namespace clear is the IMPORT SYSTEM and the
+		// binding, not the shim's callables. The shim's classes live in the user
+		// namespace like every other startup injection, so a cleared namespace takes
+		// the bare `dbutils` global with it and its methods can no longer resolve
+		// their siblings - a loud NameError the user recovers from by restarting the
+		// kernel (which re-runs the installer). The finder is different in kind
+		// precisely because it OUTLIVES that namespace, silently, for every import.
+		const out = run(`
+${INSTALL}
+_kept_shim = dbutils
+
+# %reset -f: every name the shim put in the namespace goes, the finder stays.
+for _n in [n for n in list(globals()) if n.startswith(('_Cellar', '_CELLAR', '_cellar')) or n == 'dbutils']:
+    del globals()[_n]
+out['globals_cleared'] = not any(
+    n.startswith(('_Cellar', '_CELLAR')) or n == 'dbutils' for n in globals()
+)
+
+import sys
+out['hook_survived'] = any(
+    getattr(f, '_cellar_sdk_runtime_finder', False) is True for f in sys.meta_path
+)
+
+# an UNRELATED import must still work - this is the blast radius of the bug
+import textwrap as _tw
+out['unrelated_imports_ok'] = _tw.dedent('  x') == 'x'
+
+# and the target import must still bind the very shim the finder closed over
+from databricks.sdk.runtime import dbutils as imported
+out['bound_type'] = type(imported).__name__
+out['bound_same_instance'] = imported is _kept_shim
+`);
+		expect(out.globals_cleared).toBe(true);
+		expect(out.hook_survived).toBe(true);
+		expect(out.unrelated_imports_ok).toBe(true);
+		expect(out.bound_type).toBe('_CellarDbUtils');
+		expect(out.bound_same_instance).toBe(true);
 	});
 });
 
@@ -339,6 +408,52 @@ out['shim_intact'] = isinstance(dbutils, _CellarDbUtils)
 `);
 		expect(out.leaked).toEqual([]);
 		expect(out.shim_intact).toBe(true);
+	});
+});
+
+/**
+ * The sidebar half of the report, pinned at the SOURCE. `Databricks.svelte` cannot
+ * be mounted here (vitest runs without the SvelteKit plugin) and e2e is absent from
+ * CI and the no-mistakes gate, so the rules that make the human and the agent agree
+ * are guarded here - the `upload-default-guards` precedent.
+ */
+describe('the Runtime/Cluster cards report the same thing the agent is told', () => {
+	const PANEL = readFileSync(join(process.cwd(), 'src/lib/Databricks.svelte'), 'utf8');
+	const SNIPPET = PANEL.slice(
+		PANEL.indexOf('{#snippet sdkDbutilsWarning()}'),
+		PANEL.indexOf('{/snippet}', PANEL.indexOf('{#snippet sdkDbutilsWarning()}'))
+	);
+
+	it('is ONE shared snippet, not markup copy-pasted per card', () => {
+		expect(PANEL.split('{#snippet sdkDbutilsWarning()}').length - 1).toBe(1);
+		// The testid lives in the snippet alone, so it stays unique in the DOM.
+		expect(PANEL.split('data-testid="databricks-runtime-sdk-warning"').length - 1).toBe(1);
+		expect(SNIPPET).toContain('data-testid="databricks-runtime-sdk-warning"');
+	});
+
+	it('shows on every card state, exactly as `agentStatus` folds the warning into every shape', () => {
+		// The widgets bug is orthogonal to the cluster connection: the shim is installed
+		// on EVERY kernel and the runtime env is read at kernel start, so an expired /
+		// lost / never-connected session still has dead widgets and must warn the human.
+		// Wherever the not-connected cards render `sessionReauthBox`, this rides with it.
+		const afterReauth = [...PANEL.matchAll(/\{@render sessionReauthBox\(\)\}\s*\n\s*([^\n]*)/g)].map(
+			(m) => m[1].trim()
+		);
+		expect(afterReauth.length).toBe(3); // expired, lost, picker
+		for (const next of afterReauth) expect(next).toBe('{@render sdkDbutilsWarning()}');
+		// ...plus the Runtime card, which is the connected state's home for it.
+		expect(PANEL.split('{@render sdkDbutilsWarning()}').length - 1).toBe(4);
+	});
+
+	it('renders only for the OBSERVED foreign state, never for `unknown`', () => {
+		expect(SNIPPET).toContain('{#if runtimeSdkForeign}');
+		expect(PANEL).toContain("status?.runtime?.sdkDbutils === 'foreign'");
+	});
+
+	it('keeps the warning TINT with readable copy (amber on amber is ~2:1 on the light card)', () => {
+		expect(SNIPPET).toContain('bg-warning/10');
+		expect(SNIPPET).toContain('text-base-content/80');
+		expect(SNIPPET).not.toContain('text-warning');
 	});
 });
 

@@ -271,6 +271,33 @@ describe('the SDK-import dbutils binding is reported, never left silent', () => 
 		expect(hoisted.bindingProbes).toBe(0);
 	});
 
+	it('is skipped by the run QUEUE too, before jupyter has flipped to busy', async () => {
+		// The check-then-act window `kernelState`/`inspectVariables` already close: a
+		// run claims the kernel synchronously at dequeue while jupyter's idle->busy
+		// flip lands a beat later. Reading only the status let the probe dispatch into
+		// the kernel's exec lock and block for the WHOLE cell - and since this is
+		// single-flight and awaited inside `getStatus`, a multi-minute Spark cell would
+		// strand the Databricks panel and `databricks_status` with it. Driven through
+		// the REAL queue, so it cannot pass against a re-stated rule that has drifted.
+		const { enqueueRun } = await import('../../src/lib/server/run-queue');
+		await connectWith(17, FOREIGN);
+		const ticket = enqueueRun({ nb: A(), cellId: 'cell-1' });
+		try {
+			// jupyter still says idle - the queue is the only thing that knows.
+			expect(hoisted.kernelStatus).toBe('idle');
+			expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+			expect((await dbx.agentStatus(A())) as Record<string, unknown>).not.toHaveProperty(
+				'dbutils_widgets_warning'
+			);
+			expect(hoisted.bindingProbes).toBe(0);
+		} finally {
+			if (!ticket.duplicate) ticket.done();
+		}
+		// ...and the moment the run releases the kernel, the reading is taken again.
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('foreign');
+		expect(hoisted.bindingProbes).toBe(1);
+	});
+
 	it('caches the reading, so a burst of status reads costs one probe', async () => {
 		await connectWith(15, FOREIGN);
 		await Promise.all([dbx.getStatus(A()), dbx.getStatus(A())]);
