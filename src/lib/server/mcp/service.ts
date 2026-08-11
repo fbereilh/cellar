@@ -392,8 +392,8 @@ export async function listRoots(sessionId?: string) {
 		working_root: getNotebookRoot(workingAbs),
 		roots,
 		note: roots.length
-			? 'A root is a directory inside the workspace (normally a git worktree) that a notebook\'s KERNEL runs in and imports from. Declare one with use_notebook(name, root:"roots/…"); pass root:"" to run at the workspace root again. Changing it frees that notebook\'s kernel (its namespace is cleared).'
-			: `No code roots in this workspace: every notebook runs at the workspace root. Roots are directories under \`${ROOTS_DIR}/\` (normally \`git worktree add ${ROOTS_DIR}/<name> <branch>\`), created by the user.`
+			? 'A root is a directory (normally a git worktree) that a notebook\'s KERNEL runs in and imports from. Declare one with use_notebook(name, root:"roots/…"); pass root:"" to run at the workspace root again. Changing it frees that notebook\'s kernel (its namespace is cleared). An entry marked external:true lies OUTSIDE the workspace (a sibling worktree of this repo): its kernel runs there, but every file path you read or write stays workspace-relative and cannot reach into it.'
+			: `No code roots in this workspace: every notebook runs at the workspace root. Roots are directories under \`${ROOTS_DIR}/\` or any registered worktree of this repo (\`git worktree add ${ROOTS_DIR}/<name> <branch>\`, or a sibling \`git worktree add ../<name> <branch>\`), created by the user.`
 	};
 }
 

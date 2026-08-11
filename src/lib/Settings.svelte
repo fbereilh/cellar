@@ -15,6 +15,8 @@
 		unknownTokenWarning
 	} from '$lib/databricksUploadName';
 	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
+	import { getUi, setUi } from '$lib/uiState';
+	import { WORKTREE_AGENT_CONFIG_KEY } from '$lib/notebookRoot';
 
 	interface Props {
 		open: boolean;
@@ -49,6 +51,21 @@
 		{ id: 'dim', label: 'Dark', hint: 'dim' },
 		{ id: 'cellar-light', label: 'Light', hint: 'cellar-light' }
 	];
+
+	// ---- Agent config in an adopted external worktree (default ON) ------------
+	// Per-workspace, in the `.cellar/` store the server reads at adoption time; the
+	// key is imported rather than mirrored, so this control and the writer cannot
+	// drift. Seeded once — this component is mounted for the life of the shell, and
+	// nothing else writes this preference.
+	let worktreeAgentConfig = $state(true);
+	$effect(() => {
+		if (!open) return;
+		worktreeAgentConfig = getUi<boolean>(WORKTREE_AGENT_CONFIG_KEY, true);
+	});
+	function toggleWorktreeAgentConfig() {
+		worktreeAgentConfig = !worktreeAgentConfig;
+		setUi(WORKTREE_AGENT_CONFIG_KEY, worktreeAgentConfig);
+	}
 
 	// ---- Default Databricks upload name ---------------------------------------
 	// A cross-PROJECT default for the sidebar's upload prefix/postfix: someone who
@@ -382,6 +399,32 @@
 							(windowed rendering {virtualizeCells ? 'on' : 'off'}); reload without it to change this.
 						</p>
 					{/if}
+				</div>
+
+				<div class="divider my-1"></div>
+
+				<!-- Agent config in an adopted external worktree. Written ONLY when a
+				     notebook is actually pointed AT that worktree, never on merely
+				     detecting one — and the copy states what it costs, because this puts a
+				     file into a checkout the user did not open. -->
+				<div data-testid="worktree-agent-config-control">
+					<label class="flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Set up agents in adopted worktrees</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={worktreeAgentConfig}
+							onchange={toggleWorktreeAgentConfig}
+							data-testid="settings-worktree-agent-config"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						When a notebook's code root is set to a git worktree outside this workspace, write Cellar's
+						agent config (<span class="font-mono">.mcp.json</span>) there, so an agent working in that
+						checkout can reach this Cellar. It is also added to that worktree's
+						<span class="font-mono">.git/info/exclude</span>, so the checkout never shows it as an
+						untracked change and it cannot be committed.
+					</p>
 				</div>
 
 				<div class="divider my-1"></div>

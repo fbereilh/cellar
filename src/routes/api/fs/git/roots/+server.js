@@ -1,16 +1,26 @@
 import { json } from '@sveltejs/kit';
-import { resolve } from 'node:path';
-import { gitCommitAt } from '$lib/server/git';
+import { existsSync, realpathSync, statSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
+import { gitCommitAt, listWorktreesAt } from '$lib/server/git';
 import { workspaceRoot } from '$lib/server/fstree';
 import { getNotebookRoot } from '$lib/server/notebook';
-import { resolveRootDir } from '$lib/server/notebookRoot';
+import { resolveRootDir, worktreeDeclaration } from '$lib/server/notebookRoot';
 
 /**
  * Which commit each open notebook's CODE ROOT is checked out at — the Git sidebar
  * section's whole payload, in one round trip.
  *
  *   GET /api/fs/git/roots?path=a.ipynb&path=roots/x/b.ipynb
- *     → { workspace: <GitDirCommit>, readLimit, notebooks: [{ path, root, error, unreadable, notRead, git }] }
+ *     → { workspace: <GitDirCommit>, readLimit,
+ *         notebooks: [{ path, root, error, unreadable, notRead, git }],
+ *         worktrees: [{ path, absolute, external, exists, branch, detached, shortSha, dirty }] }
+ *
+ * `worktrees` is every OTHER registered worktree of the workspace's repo (its own
+ * checkout excluded, since that is what `workspace` above already reports) — the
+ * sidebar's WORKTREES block. It rides THIS route rather than a new one because it
+ * is the same question ("which checkout is what") already coalesced and
+ * generation-guarded, and it is empty in a single-checkout repo, where the block
+ * renders nothing at all.
  *
  * `path` repeats, one per open notebook tab; unknown/omitted is not an error, it
  * just yields an empty list (a workspace with no notebook open still reports its
@@ -64,6 +74,29 @@ import { resolveRootDir } from '$lib/server/notebookRoot';
 /** Distinct `path` params one request PROBES; the rest come back `notRead`. See the header. */
 const MAX_PATHS = 64;
 
+/** `realpathSync` where possible, else the path itself (it may not exist). */
+function realpathOrSelf(p) {
+	try {
+		return realpathSync(p);
+	} catch {
+		return p;
+	}
+}
+
+/** True when `abs` exists and is a directory. */
+function isDir(abs) {
+	try {
+		return existsSync(abs) && statSync(abs).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/** Lexical containment, the same rule the workspace path guard applies. */
+function isInside(abs, ws) {
+	return abs === ws || abs.startsWith(ws + sep);
+}
+
 export async function GET({ url }) {
 	const ws = resolve(workspaceRoot());
 	const asked = [...new Set(url.searchParams.getAll('path').filter(Boolean))];
@@ -96,15 +129,49 @@ export async function GET({ url }) {
 		}
 	});
 
+	// Every other registered worktree of this repo. The workspace's own checkout is
+	// dropped (matched by REALPATH — `git worktree list` realpaths its output while
+	// `ws` is the lexical resolve, and on macOS those differ), because `workspace`
+	// below already reports it and a duplicate row would read as a second checkout.
+	const wsReal = realpathOrSelf(ws);
+	const wtrees = listWorktreesAt(ws)
+		.filter((w) => !w.bare && realpathOrSelf(w.path) !== wsReal)
+		// A registered worktree can be GONE (`prunable`); `statSync` decides, since
+		// that is what a run of a notebook rooted here would ask. A missing one is
+		// never probed: there is no status to read, and it would spawn three
+		// processes to learn nothing.
+		.map((w) => ({ w, exists: isDir(w.path) }));
+
 	// One probe per DISTINCT directory (three `git` spawns), shared by every
 	// notebook rooted there — plus the workspace itself, which every no-root
-	// notebook reports and which is usually already one of them.
-	const dirs = [...new Set([ws, ...targets.map((t) => t.dir).filter(Boolean)])];
+	// notebook reports and which is usually already one of them, plus each live
+	// worktree. Pooling the worktrees into this SAME set is what keeps the cost
+	// per-directory rather than per-row: a worktree that is also some notebook's
+	// root is already in it and costs nothing extra.
+	const dirs = [
+		...new Set([ws, ...targets.map((t) => t.dir).filter(Boolean), ...wtrees.filter((e) => e.exists).map((e) => e.w.path)])
+	];
 	const commits = new Map(await Promise.all(dirs.map(async (dir) => [dir, await gitCommitAt(dir)])));
+
+	const worktrees = wtrees.map(({ w, exists }) => ({
+		// The LEXICAL declaration for the realpath'd path git printed — through the
+		// ONE helper that owns the two-namespace rule, so "Use as root" posts exactly
+		// the value the picker would and exactly the value that gets persisted.
+		path: worktreeDeclaration(w.path),
+		absolute: w.path,
+		external: !isInside(realpathOrSelf(w.path), wsReal),
+		exists,
+		branch: w.branch,
+		detached: w.detached,
+		shortSha: w.head ? w.head.slice(0, 7) : null,
+		prunable: w.prunable,
+		dirty: exists ? (commits.get(w.path)?.dirty ?? false) : false
+	}));
 
 	return json({
 		workspace: commits.get(ws),
 		readLimit: MAX_PATHS,
+		worktrees,
 		notebooks: [
 			...targets.map((t) => ({
 				path: t.path,

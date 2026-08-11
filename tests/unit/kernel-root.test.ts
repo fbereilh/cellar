@@ -74,7 +74,18 @@ vi.mock('../../src/lib/server/notebook', () => ({
 vi.mock('../../src/lib/server/notebookRoot', () => ({
 	notebookRoot: (nb: string) => {
 		const rel = h.roots.get(nb) ?? null;
-		return rel ? { rel, dir: `/ws/${rel}` } : null;
+		// The real `ResolvedRoot` shape: `apiPath` is what jupyter is sent and is
+		// deliberately a SEPARATE field from the persisted declaration, so that the
+		// wiring assertions below are about the field the kernel actually reads.
+		// An external worktree is `../name`, resolved outside the fake workspace.
+		if (!rel) return null;
+		const external = rel.startsWith('../');
+		return {
+			rel,
+			dir: external ? `/${rel.replace(/^\.\.\//, '')}` : `/ws/${rel}`,
+			apiPath: rel,
+			kind: external ? 'worktree' : 'workspace'
+		};
 	}
 }));
 

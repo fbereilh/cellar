@@ -16,8 +16,8 @@
  * every cell honestly reads "not run this session" — the namespace really is
  * gone, and the result says so.
  */
-import { existsSync, readdirSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { join, resolve, sep } from 'node:path';
 import { workspaceRoot } from './fstree';
 import {
 	getNotebookRoot,
@@ -27,9 +27,10 @@ import {
 	listOpenNotebookPaths,
 	isTextNotebook
 } from './notebook';
-import { resolveRootDir } from './notebookRoot';
+import { resolveRootDir, worktreeDeclaration } from './notebookRoot';
 import { rebindKernel } from './kernel';
-import { gitRefAt } from './git';
+import { gitRefAt, listWorktreesAt } from './git';
+import { configureAdoptedWorktree, type WorktreeAgentConfig } from './worktree-agent-config';
 import { ROOTS_DIR, normalizeRootPath, sameRoot, textNotebookRootError } from '../notebookRoot';
 import type { WorkspaceRootOption } from '../notebookRoot';
 
@@ -45,6 +46,13 @@ export interface SetRootResult {
 	kernel_restarted: boolean;
 	/** True whenever a kernel was freed: its variables and imports are gone. */
 	namespace_cleared: boolean;
+	/**
+	 * Agent config written INTO the root, for an external worktree only. Absent
+	 * when nothing was addressed (a workspace-internal root, or the setting off) —
+	 * so an ordinary root change is unchanged. A failure is reported HERE rather
+	 * than thrown: agent wiring may never abort a root change.
+	 */
+	agent_config?: WorktreeAgentConfig;
 }
 
 /**
@@ -75,7 +83,7 @@ export async function setNotebookRootAndRestart(
 	const resolved = resolveRootDir(root);
 	const next = resolved?.rel ?? null;
 	const current = getNotebookRoot(abs);
-	if (sameRoot(current, next)) {
+	if (isSameDeclaredRoot(current, resolved)) {
 		return {
 			root: current,
 			absolute: resolved?.dir ?? resolve(workspaceRoot()),
@@ -85,6 +93,10 @@ export async function setNotebookRootAndRestart(
 		};
 	}
 	setNotebookRoot(next, abs, originId);
+	// Only for a root that really is an external worktree, and only once it has
+	// been ADOPTED (this line is past every refusal, so a rejected declaration
+	// never writes into a checkout). Never throws — see worktree-agent-config.ts.
+	const agent_config = resolved?.kind === 'worktree' ? configureAdoptedWorktree(resolved.dir) : undefined;
 	// Only a notebook that HAS a kernel loses one; a notebook that never ran simply
 	// starts at the new root on its first run. `rebindKernel` reports how many it
 	// actually freed, which is the honest source for the two flags below — asking
@@ -96,20 +108,72 @@ export async function setNotebookRootAndRestart(
 		absolute: resolved?.dir ?? resolve(workspaceRoot()),
 		changed: true,
 		kernel_restarted: rebound > 0,
-		namespace_cleared: rebound > 0
+		namespace_cleared: rebound > 0,
+		...(agent_config ? { agent_config } : {})
 	};
+}
+
+/**
+ * Whether a notebook already runs at the root now being declared — the test that
+ * decides a genuine no-op (no write, no kernel teardown, no lost namespace).
+ *
+ * Compares the resolved DIRECTORIES when both sides resolve, because one
+ * directory has two legal spellings: `/Users/me/code/sibling` and `../sibling`
+ * name the same checkout, and re-declaring the root you are already on in the
+ * other form must not cost you your variables. `sameRoot` cannot answer that — it
+ * is pure and browser-safe, so it has no workspace to resolve against — and it
+ * remains the fallback for the case where it IS the right answer: a declaration
+ * that no longer resolves can only equal itself verbatim, which is exactly its
+ * own doctrine.
+ */
+function isSameDeclaredRoot(current: string | null, resolved: { dir: string; rel: string } | null): boolean {
+	if (!current || !resolved) return !current && !resolved;
+	try {
+		const now = resolveRootDir(current);
+		if (now) return now.dir === resolved.dir;
+	} catch {
+		// The stored declaration is unusable, so it names no directory to compare;
+		// fall through to the text rule below.
+	}
+	return sameRoot(current, resolved.rel);
 }
 
 /** One entry of `listWorkspaceRoots()` — the shape the picker and `list_roots` share. */
 export type WorkspaceRootInfo = WorkspaceRootOption;
 
+/** `realpathSync` where possible, else the path itself — the identity key for dedupe. */
+function realpathOrSelf(p: string): string {
+	try {
+		return realpathSync(p);
+	} catch {
+		return p;
+	}
+}
+
 /**
- * Enumerate the workspace's code roots: every immediate subdirectory of the
- * conventional `roots/` directory, plus any root a notebook declares that lives
- * elsewhere — so a hand-set root is still discoverable, and a declaration whose
- * directory has since been removed is reported with `exists:false` rather than
- * silently missing (that is the state a run is about to refuse, so it must be
- * visible here).
+ * Enumerate the workspace's code roots, from THREE sources:
+ *
+ *   1. `roots/`      — the convention: every immediate subdirectory.
+ *   2. declarations  — any root a live notebook points at, wherever it lives, so
+ *                      a hand-set root is discoverable and one whose directory has
+ *                      since been removed is reported `exists:false` rather than
+ *                      silently missing (that is the state a run is about to
+ *                      refuse, so it must be visible here).
+ *   3. `git worktree list` — every OTHER registered worktree of the workspace's
+ *                      own repo, including siblings outside the workspace.
+ *
+ * The workspace's own checkout is EXCLUDED from (3): `git worktree list` includes
+ * it, and offering it would duplicate the picker's existing "workspace root
+ * (default)" entry.
+ *
+ * DEDUPE IS BY REALPATH, not by string: a worktree created under `roots/` appears
+ * in both (1) and (3), and on macOS the two spellings differ anyway (`/tmp` vs
+ * `/private/tmp`). Where both forms exist the workspace-relative declaration WINS
+ * — `roots/pr-1` is the better thing to persist than `..`-gymnastics, and it keeps
+ * existing notebooks' stored values stable.
+ *
+ * Being listed is NOT being authorised: `resolveRootDir` re-verifies on every
+ * resolve, so a worktree removed after this listing was taken is still refused.
  *
  * Which notebooks declare which root is read from the LIVE documents, not from a
  * walk of the workspace: answering it from disk would mean parsing every `.ipynb`
@@ -122,7 +186,14 @@ export async function listWorkspaceRoots(): Promise<WorkspaceRootInfo[]> {
 		for (const entry of readdirSync(join(ws, ROOTS_DIR), { withFileTypes: true })) {
 			// Dot-prefixed entries are invisible in the file tree, so they are not
 			// offered as roots either (see ROOTS_DIR on why the convention is visible).
-			if (entry.name.startsWith('.') || !entry.isDirectory()) continue;
+			if (entry.name.startsWith('.')) continue;
+			// A SYMLINK to a directory counts. Such a root already resolves and already
+			// runs (the guard is lexical and `statSync` follows the link — see
+			// server/notebookRoot.ts, where that narrowing is stated and accepted), so
+			// the dirent test alone made the picker the one surface that could not see a
+			// root the rest of the app happily uses. `statSync` follows, `isDirectory()`
+			// on the dirent does not.
+			if (!entry.isDirectory() && !isDirectory(join(ws, ROOTS_DIR, entry.name))) continue;
 			fromConvention.add(`${ROOTS_DIR}/${entry.name}`);
 		}
 	} catch {
@@ -145,11 +216,60 @@ export async function listWorkspaceRoots(): Promise<WorkspaceRootInfo[]> {
 		list.push(workspaceRelative(nbAbs));
 		byRoot.set(rel, list);
 	}
+
+	// (1) + (2): everything named workspace-relative-ly, in the form it is declared.
 	const rels = [...new Set([...fromConvention, ...byRoot.keys()])].sort();
-	return Promise.all(
+	const seen = new Set(rels.map((rel) => realpathOrSelf(absoluteOf(rel, ws))));
+	seen.add(realpathOrSelf(ws));
+
+	// (3): registered worktrees not already covered above. Their branch/HEAD come
+	// straight from the porcelain stanza, so a detected root costs no extra `git`
+	// spawn at all — `gitRefAt` below is only paid by the declared/convention ones.
+	const detected = listWorktreesAt(ws)
+		.filter((w) => !w.bare)
+		.filter((w) => {
+			const real = realpathOrSelf(w.path);
+			if (seen.has(real)) return false;
+			seen.add(real);
+			return true;
+		})
+		.map((w) => {
+			// The lexical declaration for a realpath'd path git printed — the
+			// two-namespace rule, owned by `notebookRoot.ts` so the picker and the
+			// sidebar route cannot end up with different spellings of one worktree.
+			const rel = worktreeDeclaration(w.path);
+			// Then validated through the ONE resolver, so the picker can only ever offer
+			// a declaration that really resolves — and `rel` comes back canonicalized by
+			// the same code that will later read it. A worktree that is registered but
+			// gone (`prunable`) throws here and is simply not offered: nothing declares
+			// it, so unlike a broken DECLARATION there is nothing to see and clear.
+			try {
+				const resolved = resolveRootDir(rel);
+				if (!resolved) return null;
+				return {
+					path: resolved.rel,
+					absolute: resolved.dir,
+					exists: true,
+					// Branch and HEAD ride the porcelain stanza we already have, so a
+					// detected root costs no `gitRefAt` spawns of its own.
+					branch: w.branch ?? (w.head ? w.head.slice(0, 7) : null),
+					commit: w.head ? w.head.slice(0, 7) : null,
+					declared: false,
+					notebooks: [] as string[],
+					source: 'worktree' as const,
+					external: resolved.kind === 'worktree'
+				};
+			} catch {
+				return null;
+			}
+		})
+		.filter((r): r is NonNullable<typeof r> => r !== null)
+		.sort((a, b) => a.path.localeCompare(b.path));
+
+	const named = await Promise.all(
 		rels.map(async (rel) => {
-			const absolute = join(ws, ...rel.split('/'));
-			const exists = existsSync(absolute) && statSync(absolute).isDirectory();
+			const absolute = absoluteOf(rel, ws);
+			const exists = isDirectory(absolute);
 			const ref = exists ? await gitRefAt(absolute) : null;
 			return {
 				path: rel,
@@ -158,8 +278,46 @@ export async function listWorkspaceRoots(): Promise<WorkspaceRootInfo[]> {
 				branch: ref?.branch ?? null,
 				commit: ref?.commit ?? null,
 				declared: !fromConvention.has(rel),
-				notebooks: (byRoot.get(rel) ?? []).sort()
+				notebooks: (byRoot.get(rel) ?? []).sort(),
+				source: (fromConvention.has(rel) ? 'convention' : 'declared') as 'convention' | 'declared',
+				// A declared root may itself be external (a sibling worktree already in
+				// use), so this is decided by the resolved path, never by the source.
+				external: !isInsideWorkspace(absolute, ws)
 			};
 		})
 	);
+
+	// Workspace-internal roots first — they are the established convention, so a
+	// workspace that has already adopted `roots/` sees no reordering of what it had
+	// — then external worktrees, each group alphabetical.
+	const internal = named.filter((r) => !r.external);
+	const externalNamed = named.filter((r) => r.external);
+	return [...internal, ...externalNamed, ...detected];
+}
+
+/**
+ * The absolute directory a DECLARATION names.
+ *
+ * `resolve`, never `join(ws, ...rel.split('/'))`: a declaration is no longer
+ * always workspace-relative — it may be `../sibling`, and a hand-edited one may
+ * be absolute. `join` would fold `/somewhere/else` into `<ws>/somewhere/else`,
+ * which both points at the wrong directory and reads as INSIDE the workspace,
+ * mislabelling an external root as internal.
+ */
+function absoluteOf(rel: string, ws: string): string {
+	return resolve(ws, rel);
+}
+
+/** True when `abs` exists and is a directory (symlinks followed, like the resolver). */
+function isDirectory(abs: string): boolean {
+	try {
+		return existsSync(abs) && statSync(abs).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/** Lexical containment, the same rule the workspace guard applies. */
+function isInsideWorkspace(abs: string, ws: string): boolean {
+	return abs === ws || abs.startsWith(ws + sep);
 }

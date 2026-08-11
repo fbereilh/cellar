@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -189,15 +189,69 @@ describe('GET /api/fs/git/roots', () => {
 		const c = notebookAt('share-c.ipynb', 'roots/pr-482');
 
 		const gitmod = await import('../../src/lib/server/git');
-		gitmod.invalidateGitCaches();
-		gitmod.resetGitSpawnCount();
-		const body = await get(a, b, c);
 
-		// Two directories are involved (the shared root + the workspace), each read
-		// with the three reads `gitCommitAt` makes. Per-notebook probing would be 4x
-		// that, and the section is refetched on every window focus.
-		expect(gitmod.gitSpawnCount()).toBeLessThanOrEqual(6);
-		for (const row of body.notebooks) expect(row.git.branch).toBe('pr-482');
+		/** Spawns for one uncached request. */
+		const cost = async (...paths: string[]) => {
+			gitmod.invalidateGitCaches();
+			gitmod.resetGitSpawnCount();
+			const body = await get(...paths);
+			return { spawns: gitmod.gitSpawnCount(), body };
+		};
+
+		// The property, asserted as a property rather than as a magic number: THREE
+		// notebooks sharing one root cost exactly what ONE costs. A per-notebook probe
+		// would be 3x, on a section refetched on every window focus. Stated this way
+		// it also stays true as the payload grows (the worktree block added its own
+		// per-directory reads), where a fixed bound would only encode this fixture.
+		const one = await cost(a);
+		const three = await cost(a, b, c);
+		expect(three.spawns).toBe(one.spawns);
+		for (const row of three.body.notebooks) expect(row.git.branch).toBe('pr-482');
+	});
+
+	it('reports the repo’s WORKTREES, excluding the workspace’s own checkout', async () => {
+		const gitmod = await import('../../src/lib/server/git');
+		gitmod.invalidateGitCaches();
+		const body = await get();
+
+		const byPath = Object.fromEntries(body.worktrees.map((w: { path: string }) => [w.path, w]));
+		expect(Object.keys(byPath).sort()).toEqual(['roots/baseline', 'roots/pr-482']);
+		// The workspace's own checkout is reported by `workspace` above; a duplicate
+		// row here would read as a second checkout of the same tree. Matched by
+		// REALPATH server-side, since git realpaths its output and `ws` is lexical.
+		expect(body.worktrees.some((w: { absolute: string }) => w.absolute === WS)).toBe(false);
+
+		expect(byPath['roots/pr-482']).toMatchObject({
+			branch: 'pr-482',
+			detached: false,
+			exists: true,
+			// Inside the workspace, so NOT external — the label is decided by the
+			// resolved path, never by the source.
+			external: false
+		});
+		expect(byPath['roots/pr-482'].shortSha).toMatch(/^[0-9a-f]{7}$/);
+	});
+
+	it('reports a PRUNABLE worktree as missing, and never probes it', async () => {
+		const gitmod = await import('../../src/lib/server/git');
+		const doomed = join(WS, 'roots', 'doomed');
+		git(WS, 'worktree', 'add', '-q', doomed, '-b', 'doomed');
+		rmSync(doomed, { recursive: true, force: true });
+		gitmod.invalidateGitCaches();
+
+		const body = await get();
+		const row = body.worktrees.find((w: { path: string }) => w.path === 'roots/doomed');
+		// It really is still registered — being listed is not being on disk, which is
+		// exactly the state a run rooted here would refuse. The panel renders it as
+		// missing with its "Use as root" disabled.
+		expect(row).toBeTruthy();
+		expect(row.exists).toBe(false);
+		expect(row.prunable).toBe(true);
+		// A missing directory has no status to read, so it is never probed: `dirty`
+		// claims nothing rather than guessing.
+		expect(row.dirty).toBe(false);
+
+		git(WS, 'worktree', 'prune');
 	});
 
 	it('READS UP TO the cap and REPORTS the remainder, rather than dead-ending', async () => {

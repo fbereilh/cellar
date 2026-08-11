@@ -18,7 +18,8 @@
  * `kernel-root.test.ts`).
  */
 import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -36,15 +37,41 @@ vi.mock('../../src/lib/server/kernel', () => ({
 	})
 }));
 
+let OUTER: string;
 let WS: string;
+let SIBLING: string;
 let nbmod: typeof import('../../src/lib/server/notebook');
 let actions: typeof import('../../src/lib/server/notebook-root-actions');
 
+/** A real repo, so the two SPELLINGS of one external worktree can be exercised. */
+function git(cwd: string, ...args: string[]) {
+	execFileSync('git', ['-C', cwd, ...args], {
+		stdio: 'pipe',
+		env: {
+			...process.env,
+			GIT_AUTHOR_NAME: 'Ada L',
+			GIT_AUTHOR_EMAIL: 'ada@example.com',
+			GIT_COMMITTER_NAME: 'Ada L',
+			GIT_COMMITTER_EMAIL: 'ada@example.com'
+		}
+	});
+}
+
 beforeAll(async () => {
-	WS = mkdtempSync(join(tmpdir(), 'cellar-root-restart-'));
+	OUTER = mkdtempSync(join(tmpdir(), 'cellar-root-restart-'));
+	WS = join(OUTER, 'workspace');
+	SIBLING = join(OUTER, 'pr-398');
+	mkdirSync(WS, { recursive: true });
 	process.env.CELLAR_WORKSPACE = WS;
 	mkdirSync(join(WS, 'roots', 'pr-482'), { recursive: true });
 	mkdirSync(join(WS, 'roots', 'main'), { recursive: true });
+	// A registered SIBLING worktree outside the workspace: the only way to have one
+	// directory with two legal declarations (absolute, and `../pr-398`).
+	git(WS, 'init', '-q', '-b', 'main');
+	writeFileSync(join(WS, 'f.txt'), 'x\n');
+	git(WS, 'add', 'f.txt');
+	git(WS, 'commit', '-q', '-m', 'init');
+	git(WS, 'worktree', 'add', '-q', SIBLING, '-b', 'under-review');
 	nbmod = await import('../../src/lib/server/notebook');
 	actions = await import('../../src/lib/server/notebook-root-actions');
 });
@@ -115,6 +142,28 @@ describe('changing a notebook’s root', () => {
 		expect(r.absolute).toBe(WS);
 		expect(h.rebound).toEqual([nb]);
 		expect(nbmod.getNotebookRoot(nb)).toBeNull();
+	});
+
+	it('is a NO-OP across the two SPELLINGS of one external worktree', async () => {
+		// The case a pure text comparison cannot see: `/abs/path/pr-398` and
+		// `../pr-398` are one directory, and re-declaring the root you are already on
+		// must not free the kernel. Getting this wrong costs the user their namespace
+		// on every re-declare — which is why the resolved DIRECTORIES decide.
+		const nb = nbmod.createNotebook('two-spellings.ipynb').path;
+		const first = await actions.setNotebookRootAndRestart(SIBLING, nb);
+		// Stored ..-relative whichever form was typed.
+		expect(first.root).toBe('../pr-398');
+		const bytes = readFileSync(nb, 'utf8');
+		h.rebound.length = 0;
+		h.live.add(nb);
+
+		for (const spelling of [SIBLING, '../pr-398', `${SIBLING}/`]) {
+			const again = await actions.setNotebookRootAndRestart(spelling, nb);
+			expect(again).toMatchObject({ root: '../pr-398', changed: false, namespace_cleared: false });
+		}
+		expect(h.rebound).toEqual([]);
+		expect(h.live.has(nb)).toBe(true);
+		expect(readFileSync(nb, 'utf8')).toBe(bytes);
 	});
 
 	it('a REFUSED root writes nothing and frees nothing', async () => {

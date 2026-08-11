@@ -465,7 +465,21 @@
 	const rootOptions = $derived.by(() => {
 		const opts = availableRoots.map((r) => ({ ...r }));
 		if (root && !opts.some((o) => o.path === root)) {
-			opts.push({ path: root, absolute: '', exists: false, branch: null, commit: null, declared: true, notebooks: [] });
+			opts.push({
+				path: root,
+				absolute: '',
+				exists: false,
+				branch: null,
+				commit: null,
+				declared: true,
+				notebooks: [],
+				source: 'declared',
+				// The stand-in describes a root whose directory is GONE, so nothing can
+				// verify where it was; `..` in the declaration is the only fact in hand,
+				// and it is the one the label reads. Never a guess about a path we cannot
+				// resolve — the entry exists to be seen and cleared, not to be adopted.
+				external: root.startsWith('../')
+			});
 		}
 		return opts;
 	});
@@ -490,9 +504,16 @@
 		if (rootBusy) return;
 		selectedRoot = settled;
 	});
+	// An EXTERNAL root (a sibling worktree of this repo, outside the workspace) is
+	// marked in the label itself, not only by its `../` prefix: adopting a checkout
+	// while believing it sits inside the workspace is the one misreading this
+	// feature can cause, and the file tree will keep showing the workspace either
+	// way. The marker rides ON the option text because a `<select>` option cannot
+	// carry a badge.
 	function rootLabel(o: WorkspaceRootOption): string {
 		const ref = o.branch ? ` — ${o.branch}` : '';
-		return o.exists ? `${o.path}${ref}` : `${o.path} (missing)`;
+		const tag = o.external ? ' (external worktree)' : '';
+		return o.exists ? `${o.path}${ref}${tag}` : `${o.path}${tag} (missing)`;
 	}
 	function onRootSelect(e: Event) {
 		onSetRoot?.((e.currentTarget as HTMLSelectElement).value);
@@ -752,8 +773,14 @@
 					<!-- Both facts, BEFORE the click: what a root reaches, and what changing
 					     it costs. Selecting one frees the kernel, so the price is stated
 					     here rather than only afterwards in the feedback line. -->
+					<!-- The workspace-wide clause matters MORE once a root may sit outside
+					     the workspace, not less: your kernel runs in the worktree while the
+					     file tree still shows the workspace, which is genuinely surprising
+					     the first time. Do not trim it. -->
 					<span class="text-xs text-base-content/55">
-						kernel cwd + imports only; files, git and checkpoints stay workspace-wide. Changing it restarts the kernel - variables are cleared.
+						kernel cwd + imports only; files, git and checkpoints stay workspace-wide{currentRootOption?.external
+							? ' (an external worktree runs the kernel outside this workspace)'
+							: ''}. Changing it restarts the kernel - variables are cleared.
 					</span>
 				{/if}
 				{#if rootFeedback}

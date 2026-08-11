@@ -13,6 +13,7 @@
  * `notebook-root-restart.test.ts`.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -25,16 +26,33 @@ vi.mock('../../src/lib/server/dataflow', () => ({
 	analyzeDataflow: async () => ({})
 }));
 
+let OUTER: string;
 let WS: string;
+let SIBLING: string;
 let svc: typeof import('../../src/lib/server/mcp/service');
 let nbmod: typeof import('../../src/lib/server/notebook');
 let srv: typeof import('../../src/lib/server/mcp/server');
 
 beforeAll(async () => {
-	WS = mkdtempSync(join(tmpdir(), 'cellar-mcp-root-'));
+	OUTER = mkdtempSync(join(tmpdir(), 'cellar-mcp-root-'));
+	WS = join(OUTER, 'workspace');
+	SIBLING = join(OUTER, 'pr-398');
+	mkdirSync(WS, { recursive: true });
 	process.env.CELLAR_WORKSPACE = WS;
 	mkdirSync(join(WS, 'roots', 'pr-482'), { recursive: true });
 	mkdirSync(join(WS, 'roots', 'baseline'), { recursive: true });
+	// A registered SIBLING worktree, so the agent surface can be exercised on a root
+	// OUTSIDE the workspace — the shape `git worktree add ../name <branch>` makes.
+	const git = (...args: string[]) =>
+		execFileSync('git', ['-C', WS, ...args], {
+			stdio: 'pipe',
+			env: { ...process.env, GIT_AUTHOR_NAME: 'A', GIT_AUTHOR_EMAIL: 'a@b.c', GIT_COMMITTER_NAME: 'A', GIT_COMMITTER_EMAIL: 'a@b.c' }
+		});
+	git('init', '-q', '-b', 'main');
+	writeFileSync(join(WS, 'f.txt'), 'x\n');
+	git('add', 'f.txt');
+	git('commit', '-q', '-m', 'init');
+	git('worktree', 'add', '-q', SIBLING, '-b', 'under-review');
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
 	srv = await import('../../src/lib/server/mcp/server');
@@ -71,11 +89,33 @@ describe('list_roots', () => {
 		expect(res.workspace).toBe(WS);
 		expect(res.working_notebook).toBe('reviewer.ipynb');
 		expect(res.working_root).toBe('roots/pr-482');
-		expect(res.roots.map((r) => r.path)).toEqual(['roots/baseline', 'roots/pr-482']);
+		// Workspace-internal roots first, then the DETECTED sibling worktree — offered
+		// by default, which is the ergonomic payload of the whole feature.
+		expect(res.roots.map((r) => r.path)).toEqual(['roots/baseline', 'roots/pr-482', '../pr-398']);
 		const pr = res.roots.find((r) => r.path === 'roots/pr-482');
 		expect(pr?.exists).toBe(true);
 		expect(pr?.notebooks).toEqual(['reviewer.ipynb']);
+		expect(pr?.external).toBe(false);
+
+		// …and the external one is LABELLED, so an agent cannot adopt a sibling
+		// checkout believing it sits inside the workspace.
+		const sibling = res.roots.find((r) => r.path === '../pr-398');
+		expect(sibling).toMatchObject({ external: true, source: 'worktree', branch: 'under-review' });
+		// The note must say what `external` costs it: a kernel runs there, but every
+		// file path it reads or writes is still workspace-relative.
+		expect(res.note).toMatch(/external:true/i);
+		expect(res.note).toMatch(/cannot reach into it/i);
 		await svc.setNotebookRoot(null, nb);
+	});
+
+	it('declares an EXTERNAL worktree root, storing the ..-relative form', async () => {
+		// The agent may paste the absolute path `git worktree add` printed; what lands
+		// in the committed `.ipynb` must be portable and leak no home directory.
+		const opened = svc.useNotebook('sessExternal', 'external.ipynb');
+		const change = await svc.setNotebookRoot(SIBLING, opened.path);
+		expect(change).toMatchObject({ root: '../pr-398', root_changed: true });
+		expect((await svc.getNotebookMap(opened.path)).root).toBe('../pr-398');
+		await svc.setNotebookRoot('', opened.path);
 	});
 
 	it('a workspace with no roots reports an empty list and says so', async () => {
@@ -134,8 +174,11 @@ describe('use_notebook + root', () => {
 
 	it('REFUSES a root outside the workspace, naming the rule', async () => {
 		const opened = svc.useNotebook('sessBad', 'bad.ipynb');
-		await expect(svc.setNotebookRoot('../escape', opened.path)).rejects.toThrow(/inside the workspace/i);
-		await expect(svc.setNotebookRoot('/etc', opened.path)).rejects.toThrow(/workspace-relative/i);
+		// Out-of-workspace paths are refused by the WORKTREE gate rather than by shape.
+		// This workspace IS a repo with a registered sibling, so these two prove the
+		// gate is narrow: neither is one of ITS worktrees, so neither is admitted.
+		await expect(svc.setNotebookRoot('../escape', opened.path)).rejects.toThrow(/not a registered git worktree/i);
+		await expect(svc.setNotebookRoot('/etc', opened.path)).rejects.toThrow(/not a registered git worktree/i);
 		await expect(svc.setNotebookRoot('roots/nope', opened.path)).rejects.toThrow(/does not exist/i);
 		expect(nbmod.getNotebookRoot(opened.path)).toBeNull();
 	});

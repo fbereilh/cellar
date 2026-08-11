@@ -15,7 +15,9 @@
  * WHAT STAYS WORKSPACE-SCOPED (do not "extend" a root into these): the file
  * tree, git status/decorations/blame, search, checkpoints, the UI-state store,
  * the `.cellar/` runtime + harness config, the instance registry, and the
- * interpreter — one venv per instance, unaffected by any notebook's root.
+ * interpreter — one venv per instance, unaffected by any notebook's root. This
+ * holds for an out-of-workspace worktree root too: it grants the kernel a cwd,
+ * and NOT one byte of file reach through any Cellar API.
  *
  * WHY EXISTENCE IS CHECKED HERE, and why a bad root REFUSES rather than degrades:
  * jupyter_server's `cwd_for_path` walks UP to `root_dir` when the path is not a
@@ -26,6 +28,58 @@
  * and the fix, and the run fails loudly instead of quietly answering from the
  * wrong checkout.
  *
+ * ── TWO ADMISSION RULES ────────────────────────────────────────────────────────
+ *
+ * `resolveRootDir` branches ONCE, on the declaration's shape, and the branches
+ * are not equals:
+ *
+ *   inside  -> `resolveInWorkspace` (UNCHANGED, never widened) -> statSync
+ *   outside -> registered-worktree gate                        -> statSync
+ *
+ * `resolveInWorkspace` is the app-wide guard and stays byte-for-byte as it is:
+ * every FILE path in the app resolves through it (the tree, `/api/fs/*`,
+ * `gitHeadFile`, `gitBlameFile`, the export target, the notebook path guard), so
+ * the moment it learns about worktrees every one of them inherits the reach. The
+ * worktree gate is therefore a SIBLING rule, and a strictly narrower one: a path
+ * is admitted only when `git worktree list --porcelain`, run in the workspace,
+ * names that exact directory — i.e. the set is authored by the user's own
+ * `git worktree add` runs against the workspace's OWN repository. Not "any
+ * absolute path", not "any git repo", not "anything under $HOME". Both branches
+ * then share the same existence + directory-ness checks, because a REMOVED
+ * worktree still lists (`prunable`): the listing authorises, `statSync` decides
+ * usability.
+ *
+ * ── THE TWO-NAMESPACE RULE (verify by realpath, bind and persist lexically) ────
+ *
+ * The subtlest thing in this module, and the one that gets "simplified" into a
+ * single `realpathSync` and then breaks on one platform.
+ *
+ *   • `git worktree list` returns REALPATH'd paths. Cellar's `CELLAR_WORKSPACE`
+ *     and jupyter's `root_dir` are the LEXICAL `resolve()`d string. On macOS
+ *     these differ constantly (`/tmp` -> `/private/tmp`, `/var/folders` ->
+ *     `/private/var/folders` — every `mkdtemp` workspace, so real users and the
+ *     e2e harness both). So VERIFICATION compares `realpathSync` of both sides
+ *     for IDENTITY.
+ *   • But BINDING and PERSISTING stay LEXICAL. jupyter's `to_os_path` joins the
+ *     API path onto the lexical `root_dir` and `normpath`s it WITHOUT resolving
+ *     symlinks, so a realpath'd relative path would persist the machine-specific
+ *     `../../private/tmp/...` form into the committed `.ipynb`.
+ *
+ * Identity comparison of two absolute paths is safe and is NOT what the symlink
+ * note below forbids: that warns against realpathing ONE side of a PREFIX
+ * containment test, which is asymmetric. Identity has no such asymmetry, and
+ * here it is required.
+ *
+ * NEVER HAND JUPYTER AN ABSOLUTE PATH. `to_os_path` strips the leading `/` and
+ * joins, so `/Users/x/repo` becomes `<ws>/Users/x/repo`, which does not exist —
+ * and `cwd_for_path` then walks UP, starting the kernel somewhere arbitrary. A
+ * `..`-relative API path, by contrast, escapes `root_dir` cleanly and is returned
+ * verbatim when it is a directory. That is why `apiPath` is a named field rather
+ * than a reuse of `rel`: a future admission rule cannot silently send an absolute
+ * path without going past the field that says what it is for. The transport is
+ * additionally verified once at kernel start (see `initKernel`), so relying on
+ * that upstream behaviour cannot fail silently.
+ *
  * WHAT "INSIDE THE WORKSPACE" MEANS HERE, stated exactly: `resolveInWorkspace` is
  * a LEXICAL prefix check with no `realpathSync`, so it refuses an absolute path
  * and a `..` traversal by name - and a root declared as a SYMLINK pointing outside
@@ -35,62 +89,279 @@
  * reads outside the workspace everywhere else - making a code root uniquely
  * stricter than every other path in the app would be inconsistent, and widening
  * the guard app-wide is a separate task. Do NOT reach for `realpathSync` on the
- * root alone: on macOS a `mkdtemp` workspace lives under `/tmp` -> `/private/tmp`,
- * so realpathing one side and not the other refuses legitimate setups (real users
- * and the e2e harness both). The exposure is bounded: the picker cannot offer one
- * (`readdirSync` dirents report a symlink as `isDirectory() === false`, so
- * `listWorkspaceRoots` never enumerates it), it takes a hand-edited
- * `metadata.cellar.root` or an explicit MCP call, and the kernel executes
- * arbitrary user code regardless - so a symlinked root grants nothing a cell
- * could not already do.
+ * root alone, for the prefix-asymmetry reason above. The exposure is bounded and
+ * is now the WIDER of the two out-of-workspace routes: a symlink may point
+ * anywhere, whereas the worktree gate admits only checkouts of this repo. It
+ * takes a hand-edited `metadata.cellar.root` or an explicit MCP call to reach
+ * (the picker enumerates a symlinked root but offers nothing a `readdirSync` of
+ * the workspace cannot see), and the kernel executes arbitrary user code
+ * regardless - so a symlinked root grants nothing a cell could not already do.
  */
-import { statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { workspaceRoot, resolveInWorkspace } from './fstree';
 import { getNotebookRoot } from './notebook';
-import { NotebookRootError, ROOTS_DIR, normalizeRootPath } from '../notebookRoot';
+import { listWorktreesAt, type GitWorktree } from './git';
+import { NotebookRootError, ROOTS_DIR, classifyRootPath } from '../notebookRoot';
 
-/** A notebook's resolved root: the declared workspace-relative path + its absolute dir. */
+/** How a root was admitted — for messages, and for the UI to label it. */
+export type RootKind = 'workspace' | 'worktree';
+
+/** A notebook's resolved root: the canonical declaration + its absolute dir. */
 export interface ResolvedRoot {
-	/** Canonical workspace-relative path, e.g. `roots/pr-482`. Also the jupyter API path. */
+	/**
+	 * Canonical PERSISTED declaration: `roots/pr-482` for a root inside the
+	 * workspace, `../winrate-model-pr398` for an external worktree. Never
+	 * absolute — see §"what is persisted" in the header.
+	 */
 	rel: string;
-	/** Absolute directory the kernel is rooted at. */
+	/**
+	 * Absolute directory the kernel is rooted at. LEXICAL (never realpath'd), so
+	 * it agrees with the workspace it is relative to.
+	 */
 	dir: string;
+	/**
+	 * The jupyter kernel-start `path`. Equals `rel`, and is never absolute: an
+	 * absolute API path collapses INTO the workspace (see the header).
+	 */
+	apiPath: string;
+	/** Which admission rule let this root through. */
+	kind: RootKind;
+}
+
+/** The lexical workspace root, as every path here is relative to. */
+function ws(): string {
+	return resolve(workspaceRoot());
+}
+
+/** `realpathSync` where possible, else the path itself (it may not exist yet). */
+function realpathOrSelf(p: string): string {
+	try {
+		return realpathSync(p);
+	} catch {
+		return p;
+	}
+}
+
+/**
+ * A path in the REAL namespace, resolving as much of it as exists.
+ *
+ * A plain `realpathSync` throws for a path that is GONE, which is exactly the
+ * case that matters here: a `prunable` worktree is still listed at a realpath'd
+ * path while Cellar's candidate is lexical, so falling back to the raw string
+ * leaves `/var/…` to be compared against `/private/var/…` and the entry reads as
+ * "not registered" instead of "registered but missing" — the wrong refusal, with
+ * the wrong repair. So the deepest existing ANCESTOR is resolved and the missing
+ * tail re-appended.
+ */
+function canonicalPath(p: string): string {
+	let head = p;
+	const tail: string[] = [];
+	// Bounded by the path's own depth; `dirname('/')` is `/`, which stops it.
+	for (let i = 0; i < 64; i++) {
+		try {
+			return tail.length ? join(realpathSync(head), ...tail) : realpathSync(head);
+		} catch {
+			const parent = dirname(head);
+			if (parent === head) return p;
+			tail.unshift(basename(head));
+			head = parent;
+		}
+	}
+	return p;
+}
+
+/** True when two absolute paths name the same directory, across namespaces. */
+function samePath(a: string, b: string): boolean {
+	return a === b || canonicalPath(a) === canonicalPath(b);
+}
+
+/**
+ * A linked worktree's REGISTRATION NAME — the `<name>` in
+ * `<repo>/.git/worktrees/<name>`, read from the worktree's own `.git` file.
+ *
+ * This is the one identifier that SURVIVES `git worktree move` (verified: moving
+ * a worktree rewrites nothing in `.git/worktrees/<name>`), which is what makes
+ * naming the new path a fact rather than a guess. The basename cannot do it — a
+ * move usually changes it, which is the whole reason the old path stopped
+ * working. Null for the main checkout (whose `.git` is a directory) and whenever
+ * the file cannot be read.
+ */
+function registrationName(worktreeDir: string): string | null {
+	try {
+		const dotGit = join(worktreeDir, '.git');
+		if (statSync(dotGit).isDirectory()) return null;
+		const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, 'utf8'));
+		return m ? basename(m[1].trim()) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** A declaration's absolute directory, kept in the LEXICAL namespace. */
+function toRel(dir: string): string {
+	// `relative` yields the platform separator; the declaration is stored with `/`
+	// so it round-trips a `.ipynb` written on either platform.
+	return relative(ws(), dir).split(sep).join('/');
+}
+
+/** True when `abs` is lexically inside the workspace (the guard's own rule). */
+function insideWorkspace(abs: string): boolean {
+	const root = ws();
+	return abs === root || abs.startsWith(root + sep);
+}
+
+/**
+ * The DECLARATION that names a worktree `git worktree list` reported.
+ *
+ * THE TWO-NAMESPACE RULE, applied in the direction detection needs it — and the
+ * one place it lives, because it has to be got right identically by the picker
+ * (`listWorkspaceRoots`) and by the sidebar route, and writing it twice is how
+ * one of them ends up with the other spelling.
+ *
+ * git hands back a REALPATH'd absolute path; a declaration must be LEXICAL,
+ * because it is what gets persisted and what jupyter joins onto its lexical
+ * `root_dir`. So the hop between the two checkouts is measured in the REAL
+ * namespace and then applied lexically from the workspace. Measuring it as
+ * `relative(lexicalWs, realPath)` instead yields the machine-specific
+ * `../../../private/var/folders/…` form on macOS: it resolves, but it is not a
+ * declaration anyone should have in a committed `.ipynb`, and it is not even the
+ * shortest path to the same directory.
+ */
+export function worktreeDeclaration(worktreePath: string): string {
+	return relative(realpathOrSelf(ws()), worktreePath).split(sep).join('/');
+}
+
+/** Short, deterministic rendering of what IS registered, for a refusal message. */
+function nameWorktrees(list: GitWorktree[]): string {
+	const others = list.filter((w) => !samePath(w.path, ws()));
+	if (!others.length) return 'This repository has no other worktrees registered.';
+	const shown = others.slice(0, 5).map((w) => w.path);
+	const more = others.length - shown.length;
+	return `Cellar found ${others.length} registered worktree${others.length === 1 ? '' : 's'}: ${shown.join(', ')}${more > 0 ? `, and ${more} more` : ''}.`;
+}
+
+/**
+ * Admit an out-of-workspace declaration, or throw naming why it was refused.
+ *
+ * `dir` is the LEXICALLY resolved candidate. Verification is realpath identity
+ * against the listing (the two-namespace rule); nothing lexical is compared,
+ * because `git worktree list` realpaths its output.
+ */
+function assertRegisteredWorktree(dir: string, declared: string): GitWorktree {
+	let list = listWorktreesAt(ws());
+	let match = list.find((w) => samePath(w.path, dir));
+	// A MISS is re-checked against a FRESH listing before it becomes a refusal.
+	// The listing is cached for 1.5s, which would otherwise be a window in which a
+	// worktree the user created seconds ago — the very next thing they do after
+	// `git worktree add` is point a notebook at it — is reported as unregistered.
+	// One extra spawn on the refusal path is cheap (refusals are rare, and the
+	// alternative is telling the user their worktree does not exist), and the happy
+	// path never reaches this.
+	if (!match) {
+		list = listWorktreesAt(ws(), { refresh: true });
+		match = list.find((w) => samePath(w.path, dir));
+	}
+	if (match) return match;
+
+	// MOVED (`git worktree move` is an ordinary thing to do): the declared path is
+	// gone, and a registered worktree carries the REGISTRATION NAME that path had.
+	// That name is stable across a move, so this identifies the same worktree
+	// rather than guessing from a basename — which a move usually changes, and
+	// which would otherwise match an unrelated checkout that merely shares a name.
+	// Naming the new path turns a dead end into a one-line fix, and the listing is
+	// already in hand. Deliberately NOT auto-followed: rewriting a committed
+	// `.ipynb` because a directory moved is a silent change to the user's file.
+	if (!existsDir(dir)) {
+		const wanted = basename(dir);
+		const moved = list.find((w) => !samePath(w.path, ws()) && registrationName(w.path) === wanted);
+		if (moved) {
+			throw new NotebookRootError(
+				`Notebook root ${JSON.stringify(declared)} is no longer registered at that path — that worktree was moved to ${JSON.stringify(moved.path)}. Update the notebook's root to the new path, or clear it to run at the workspace root.`
+			);
+		}
+	}
+
+	throw new NotebookRootError(
+		`Notebook root ${JSON.stringify(declared)} is outside the workspace and is not a registered git worktree of this repository. A root must be a directory inside the workspace, or a worktree of the workspace's own repo (\`git worktree add <path> <branch>\`, then \`git worktree list\` to confirm). ${nameWorktrees(list)}`
+	);
+}
+
+/** True when `dir` exists and is a directory (following symlinks, like `statSync`). */
+function existsDir(dir: string): boolean {
+	try {
+		return statSync(dir).isDirectory();
+	} catch {
+		return false;
+	}
 }
 
 /**
  * Resolve a declared root to an absolute directory, refusing anything that is not
- * a usable directory inside the workspace.
+ * a usable directory the workspace may root a kernel at.
  *
- * Layered deliberately: the pure rules reject the wrong SHAPE with a message that
- * explains what a root is, `resolveInWorkspace` (unchanged, never widened) is
- * still the authority on the boundary, and only then is the filesystem consulted.
- * Returns null when the declaration means "the workspace root" (absent/empty).
+ * Layered deliberately: the pure rules classify the SHAPE, then the shape picks
+ * its admission rule (the untouched workspace guard, or the registered-worktree
+ * gate), and only then is the filesystem consulted for existence. Returns null
+ * when the declaration means "the workspace root" (absent/empty).
+ *
+ * This is also the ONE validate-and-store site: it returns the canonical
+ * `..`-relative form for an external worktree, so an ABSOLUTE path may be typed
+ * at the API (it is what `git worktree add` prints and what a user pastes) while
+ * what lands in the committed `.ipynb` is portable and leaks no home directory —
+ * the same decision, for the same reasons, as the nbdev export target.
  */
 export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | null {
-	const rel = normalizeRootPath(raw);
-	if (!rel) return null;
-	let dir: string;
-	try {
-		dir = resolveInWorkspace(rel);
-	} catch {
-		// The shared guard's own message ("path escapes workspace") is correct but
-		// says nothing about roots; restate it in this feature's vocabulary.
-		throw new NotebookRootError(
-			`A notebook root must stay inside the workspace; ${JSON.stringify(rel)} escapes it. Create the root inside the workspace (e.g. \`git worktree add ${ROOTS_DIR}/pr-482 <branch>\`).`
-		);
-	}
-	if (dir === resolve(workspaceRoot())) {
-		// Reachable only via a value the normalizer accepted that still resolves to
-		// the workspace itself; that is the same thing as declaring no root.
+	const shape = classifyRootPath(raw);
+	if (shape.kind === 'none') return null;
+
+	// The declared text, for messages: what the user actually wrote.
+	const declared = shape.kind === 'inside' ? shape.rel : shape.raw;
+	// Lexical resolution serves both shapes: `resolve(ws, '../sib')` escapes,
+	// `resolve(ws, '/abs')` returns the absolute path untouched.
+	const dir = resolve(ws(), declared);
+
+	if (dir === ws()) {
+		// Reachable via a value the classifier accepted that still resolves to the
+		// workspace itself; that is the same thing as declaring no root.
 		return null;
 	}
+
+	let kind: RootKind;
+	if (insideWorkspace(dir)) {
+		// INSIDE — including an `outside`-SHAPED declaration that lexically lands
+		// back in the workspace (`roots/../pr-1`, or an absolute path that happens
+		// to be under it). Those go through the unchanged guard and are stored in
+		// the canonical workspace-relative form, so one directory has one
+		// declaration however it was typed.
+		try {
+			resolveInWorkspace(toRel(dir));
+		} catch {
+			// The shared guard's own message ("path escapes workspace") is correct but
+			// says nothing about roots; restate it in this feature's vocabulary.
+			throw new NotebookRootError(
+				`A notebook root must stay inside the workspace; ${JSON.stringify(declared)} escapes it. Create the root inside the workspace (e.g. \`git worktree add ${ROOTS_DIR}/pr-482 <branch>\`).`
+			);
+		}
+		kind = 'workspace';
+	} else {
+		// OUTSIDE — the second, narrower admission rule. Throws unless the listing
+		// names this exact directory.
+		assertRegisteredWorktree(dir, declared);
+		kind = 'worktree';
+	}
+
+	const rel = toRel(dir);
 	let stat;
 	try {
 		stat = statSync(dir);
 	} catch {
+		// Being LISTED is not proof of existing: a removed worktree still lists,
+		// tagged `prunable`. So each kind names its own repair.
 		throw new NotebookRootError(
-			`Notebook root ${JSON.stringify(rel)} does not exist in this workspace. Create it (e.g. \`git worktree add ${rel} <branch>\`) or clear the notebook's root to run against the workspace.`
+			kind === 'worktree'
+				? `Notebook root ${JSON.stringify(rel)} is a registered worktree but its directory no longer exists. Run \`git worktree prune\`, re-create it (\`git worktree add ${rel} <branch>\`), or clear the notebook's root to run against the workspace.`
+				: `Notebook root ${JSON.stringify(rel)} does not exist in this workspace. Create it (e.g. \`git worktree add ${rel} <branch>\`) or clear the notebook's root to run against the workspace.`
 		);
 	}
 	if (!stat.isDirectory()) {
@@ -98,7 +369,7 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 			`Notebook root ${JSON.stringify(rel)} is a file, not a directory. A root is a directory the kernel runs in — normally a git worktree.`
 		);
 	}
-	return { rel, dir };
+	return { rel, dir, apiPath: rel, kind };
 }
 
 /**
