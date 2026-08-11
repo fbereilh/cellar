@@ -54,22 +54,31 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** How long `fs.watch` needs before it is observing (see `arm`). */
 const WATCH_ARM_MS = 40;
 
-/** How long ONE wait may spend before it gives up. */
-const WAIT_MS = 4000;
+/**
+ * How long ONE wait may spend before it gives up.
+ *
+ * Polling to a GENEROUS deadline is load-independent and costs nothing when the
+ * machine is idle - a delivered change ends the wait on its next 15ms tick. The
+ * budget only has to exceed what a correct watcher may spend under the full
+ * suite's own parallelism (arm + the 120ms settle debounce + a whole-file read
+ * and hash, on a box running ~140 test files across `cpus - 1` forks), which at
+ * 4s it did not: a slow-but-CORRECT delivery read as a lost change.
+ */
+const WAIT_MS = 10_000;
 
 /**
  * The per-test allowance a test that does SEVERAL waits in a row must be given.
  *
- * Vitest's default is 5s, which is LESS than the budget one three-write loop below
- * may legitimately spend (`arm` + 3 x `WAIT_MS`), so a slow-but-CORRECT watcher -
- * three real temp+rename writes, each behind the 120ms settle debounce, on a
- * machine running the whole suite in parallel - reported a vitest timeout instead
- * of the waiter's own assertion. That is arithmetic in the harness, not a defect in
- * the watcher, and it is what made these tests flaky under load; the waits
- * themselves are unchanged, so a genuinely lost change still fails fast on the
- * assertion rather than by running out the clock.
+ * The suite-wide default (see vitest.config.ts) is LESS than the budget one
+ * three-write loop below may legitimately spend (`arm` + 3 x `WAIT_MS`), so a
+ * slow-but-CORRECT watcher - three real temp+rename writes, each behind the 120ms
+ * settle debounce, on a machine running the whole suite in parallel - reported a
+ * vitest timeout instead of the waiter's own assertion. That is arithmetic in the
+ * harness, not a defect in the watcher, and it is what made these tests flaky
+ * under load; a genuinely lost change still fails on the waiter's own assertion
+ * rather than by running out the clock.
  */
-const MULTI_WAIT_TIMEOUT_MS = 20_000;
+const MULTI_WAIT_TIMEOUT_MS = 60_000;
 
 /** Wait until `n` changes have been delivered (or give up). */
 async function waitForChanges(n: number, timeout = WAIT_MS): Promise<ExternalChange[]> {

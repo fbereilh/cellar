@@ -27,6 +27,19 @@ export default defineConfig({
 		environment: 'node',
 		// Load-time shim so `.svelte.ts` modules using runes at module scope import
 		// under the plugin-less unit runner (see tests/setup/runes-shim.ts).
-		setupFiles: ['./tests/setup/runes-shim.ts']
+		setupFiles: ['./tests/setup/runes-shim.ts'],
+		// Vitest's 5s default is a WALL-CLOCK budget written for a quiet machine, and
+		// a large part of this suite drives real subprocesses (the python dataflow and
+		// databricks probes, `git`, the SDK) and real timers. The suite runs ~140 files
+		// across `cpus - 1` forks, and those forks each spawn again, so a correct-but-
+		// contended test legitimately spends 10-20x its idle time - which surfaced as a
+		// vitest timeout in whichever file happened to be scheduled alongside the
+		// heaviest ones, rotating run to run. That is arithmetic in the harness, not a
+		// defect in the code under test, so the allowance is the repo's existing
+		// real-subprocess one (see databricks-logout.test.ts) applied by default rather
+		// than per test. A genuinely hung test still fails; it just no longer fails
+		// merely for being scheduled next to `git worktree`.
+		testTimeout: 30_000,
+		hookTimeout: 30_000
 	}
 });
