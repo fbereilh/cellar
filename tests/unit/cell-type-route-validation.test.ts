@@ -93,6 +93,21 @@ describe('PATCH /api/cells/[id] - cell_type vocabulary', () => {
 		expect(nbmod.listCells(nb)[1].source).toBe('b = 2');
 		expect(typesOf(nb)).toEqual(['raw', 'code']);
 	});
+
+	// A refused PATCH is ALL-OR-NOTHING: the vocabulary check settles before any
+	// other field is written, so a body carrying `source` alongside a rejected
+	// `cell_type` persists neither. Every caller sends one field today; validating
+	// after the first write is how a future batched body silently half-applies.
+	it('applies NOTHING else when the cell_type is refused', async () => {
+		const { nb, ids } = makeNotebook('patch-atomic.ipynb');
+		const res = await patch(ids[1], { source: 'clobbered = 1', cell_type: 'RAW', scrolled: true, nb });
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({ ok: false, reason: 'bad-cell-type' });
+		const cell = nbmod.listCells(nb)[1];
+		expect(cell.source).toBe('a = 1');
+		expect(cell.metadata?.cellar?.output_scrolled).toBeUndefined();
+		expect(typesOf(nb)).toEqual(['raw', 'code']);
+	});
 });
 
 describe('POST /api/cells - cellType vocabulary', () => {

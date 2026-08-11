@@ -2055,6 +2055,20 @@ export async function runCell(
 	// The agent addresses cells by short handle; every result echoes the handle, not
 	// the stored full UUID.
 	const outId = handleFor(nbAtCall, id);
+	// A raw cell is verbatim text for a downstream tool - it has no rendered form
+	// either, so unlike markdown there is nothing to do but say so. Named
+	// specifically, or an agent is left guessing why its call did nothing. Checked
+	// BEFORE the pre-action checkpoint, because this call changes nothing at all and
+	// a snapshot for it would spend the throttle slot the next real mutation is
+	// owed (the same rule `setType` states for its own refusal). Markdown keeps its
+	// place below it: rendering publishes `cell:rendered`, so it is a real action.
+	if (isRawCell(c)) {
+		return {
+			id: outId,
+			status: 'skipped',
+			note: 'raw cell - Cellar never executes raw cells (verbatim text for a downstream tool).'
+		};
+	}
 	// Snapshot before this agent run so it can be undone (throttled: one checkpoint
 	// per N agent actions, not one per cell). Captures the pre-run outputs.
 	autoCheckpointBeforeAgentAction(nbAtCall);
@@ -2066,16 +2080,6 @@ export async function runCell(
 		// run has none, so every tab renders it).
 		publish({ type: 'cell:rendered', nb: nbAtCall, cellId: id });
 		return { id: outId, status: 'rendered', note: 'markdown cell rendered (no kernel execution)' };
-	}
-	// A raw cell is verbatim text for a downstream tool - it has no rendered form
-	// either, so unlike markdown there is nothing to do but say so. Named
-	// specifically, or an agent is left guessing why its call did nothing.
-	if (isRawCell(c)) {
-		return {
-			id: outId,
-			status: 'skipped',
-			note: 'raw cell - Cellar never executes raw cells (verbatim text for a downstream tool).'
-		};
 	}
 	if (c.cell_type !== 'code') return { id: outId, status: 'skipped', note: 'not a code cell' };
 	// Pin the notebook now: the UI may focus another one while we wait in the

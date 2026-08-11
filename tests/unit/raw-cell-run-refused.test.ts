@@ -8,7 +8,11 @@
  * the Python kernel. For a raw cell (verbatim frontmatter for a downstream tool)
  * that meant a `SyntaxError` written into the cell's in-memory `outputs`, shown in
  * the UI, then silently gone on reload - `serialize` drops outputs for any
- * non-code cell. Two entry points, ONE rule.
+ * non-code cell. The rule is enforced at EACH entry point (this route, MCP's
+ * `run_cell`, and `jupytext-actions.ts`'s `runAllCells`); `executeCellRun`, the
+ * shared core, is deliberately NOT the gate, because each door owes its caller a
+ * different refusal SHAPE - this route's terminal `run:refused` NDJSON frame,
+ * MCP's `status:'skipped'` result - which the core has no way to speak.
  *
  * The refusal must ALSO leave the submitted source saved: pressing Mod-Enter in a
  * raw cell is an edit, and refusing to run it must never be refusing to keep it.

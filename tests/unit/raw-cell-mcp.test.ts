@@ -24,6 +24,7 @@ let WS: string;
 let svc: typeof import('../../src/lib/server/mcp/service');
 let nbmod: typeof import('../../src/lib/server/notebook');
 let queue: typeof import('../../src/lib/server/run-queue');
+let checkpoints: typeof import('../../src/lib/server/checkpoints');
 
 const abs = (rel: string) => nbmod.resolveNotebookPath(rel);
 const FRONTMATTER = '---\ntitle: Post\n---';
@@ -34,6 +35,7 @@ beforeAll(async () => {
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
 	queue = await import('../../src/lib/server/run-queue');
+	checkpoints = await import('../../src/lib/server/checkpoints');
 });
 
 /** An empty-ish notebook this session is pinned to. */
@@ -87,6 +89,17 @@ describe('running', () => {
 		expect(cell.outputs ?? []).toEqual([]);
 		expect(cell.metadata?.cellar?.lastRun).toBeUndefined();
 		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+	});
+
+	// The skip changes NOTHING, so it must not spend the throttled pre-action
+	// checkpoint slot the next real mutation is owed (one snapshot per N agent
+	// actions). Enough runs to trip the throttle several times over.
+	it('takes no checkpoint for a run it skips, however many times it is called', async () => {
+		const nb = open('mcp-raw-run-checkpoint.ipynb');
+		const { ids } = await svc.addCells([{ cell_type: 'raw', source: FRONTMATTER }], null, { nb, routeImports: false });
+		const before = checkpoints.listCheckpoints(nb).length;
+		for (let i = 0; i < 12; i++) expect((await svc.runCell(ids[0], nb))!.status).toBe('skipped');
+		expect(checkpoints.listCheckpoints(nb).length).toBe(before);
 	});
 
 	it('creates but does not run a raw cell through add_and_run', async () => {

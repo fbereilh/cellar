@@ -14,10 +14,15 @@ import { RAW_UNSUPPORTED_REASON, RawCellTypeError, isLogicalCellTypeName } from 
  *  silently turn a raw cell holding frontmatter into a runnable Python cell. `raw`
  *  on a `.py` notebook is refused by `setCellType` itself and reported the way the
  *  bulk route reports its own refusals, so the caller can resync instead of
- *  rendering a conversion the document never took. */
+ *  rendering a conversion the document never took.
+ *
+ *  Both refusals are settled BEFORE any other field is written, so a refused PATCH
+ *  applies NOTHING: every caller today sends a single field, but a body carrying
+ *  `source` alongside a rejected `cell_type` would otherwise have persisted the
+ *  source and dropped the fields after it. `setCellType` throws before it mutates,
+ *  so it is the writer's own rule that decides here — not a second copy of it. */
 export async function PATCH({ params, request }) {
 	const body = await request.json();
-	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
 	if (body.cell_type != null) {
 		if (!isLogicalCellTypeName(body.cell_type)) return json({ ok: false, reason: 'bad-cell-type' }, { status: 400 });
 		try {
@@ -28,6 +33,7 @@ export async function PATCH({ params, request }) {
 			throw err;
 		}
 	}
+	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
 	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
 	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
 	if ('export' in body) setCellExport(params.id, !!body.export, body.nb, body.originId);

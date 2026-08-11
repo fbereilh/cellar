@@ -186,6 +186,20 @@ describe('the REST routes report the refusal in the shape the browser resyncs on
 		expect(nbmod.listCells(PY).every((c) => c.cell_type !== 'raw')).toBe(true);
 	});
 
+	it('PATCH writes NO other field of a body whose raw conversion it refuses', async () => {
+		const id = pyIds()[0];
+		const before = nbmod.listCells(PY)[0].source;
+		const res = await PATCH({
+			params: { id },
+			request: new Request(`http://x/api/cells/${id}`, {
+				method: 'PATCH',
+				body: JSON.stringify({ source: 'clobbered = 1', cell_type: 'raw', nb: PY })
+			})
+		});
+		expect(res.status).toBe(400);
+		expect(nbmod.listCells(PY)[0].source).toBe(before);
+	});
+
 	it('a refusal is not a 500: nothing escapes as an unhandled throw', async () => {
 		const id = pyIds()[0];
 		const res = await BULK({ request: body('http://x/api/cells/bulk', { op: 'type', ids: [id], cellType: 'raw', nb: PY }) });
