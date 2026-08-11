@@ -602,6 +602,26 @@ spec files at a time. Install its browser once with `npx playwright install chro
   disclosure one, so it leaves the cell collapsed. The choice is remembered per
   notebook (in the workspace's `.cellar/` store, like folded headings), so it survives
   a reload and never touches the `.ipynb` - no git diff.
+- **A cell has no Run button, and `⌘/Ctrl+Enter` does nothing in it** - it is a **raw**
+  cell (the `raw` label on its toolbar): nbformat's type for verbatim text a downstream
+  tool reads - Quarto or nbdev frontmatter, an nbconvert directive. Cellar never executes
+  it and never renders it, so it shows its source unhighlighted and carries none of the
+  execution controls (no Run, no Run-above, no Clear, no output area, no run or stale
+  badges); it still drags, collapses, moves, deletes, and copies its input. Both run paths
+  refuse it rather than erroring - the UI simply offers none, and an agent's `run_cell`
+  returns status `skipped`. Its own nbformat metadata survives a save (`raw_mimetype` and
+  `format`, which Jupyter's *Raw NBConvert Format* menu writes), so the cell keeps naming
+  the output formats it belongs to. Change it back from the type label at the right of its
+  toolbar, the command palette (*Change cell(s) to code*), or `y`/`m`/`r` in command mode
+  (`r` is the chord that makes a cell raw in the first place).
+- **A cell will not become raw: "A .py notebook cannot hold a raw cell"** - a jupytext /
+  Databricks-source notebook is rebuilt from its cells on every save and the format has no
+  raw marker, so the declaration would be gone after a reload and the text would come back
+  in a **runnable** Python cell. Cellar refuses it instead - in the type menu (where Raw
+  isn't offered), on the `r` chord, and for an agent's `add_cell` / `set_cell_type`.
+  Convert the notebook to `.ipynb` (app menu → **Convert to .ipynb**) if you need one. The
+  same limit applies in the other direction: **Save as .py** writes a raw cell out as code,
+  so a Quarto notebook exported that way loses its frontmatter cell's type.
 - **Find matched a cell but nothing is highlighted in it** - the match is inside a cell
   whose content is currently hidden - a cell collapsed to its header row, or a source
   match in a cell whose code is hidden by report view. Those matches are still counted,
@@ -621,8 +641,8 @@ spec files at a time. Install its browser once with `npx playwright install chro
   script (a folium map, a Bokeh chart) has no text form, and the button is disabled
   rather than pasting the `<Figure ...>` / `<folium.folium.Map ...>` placeholder Python
   prints for such an object. The same applies to a cell that has not run, and to one
-  that printed only a blank line. A markdown cell has no output at all, so it carries
-  no copy-output button in the first place. Copy *input* is never disabled - every
+  that printed only a blank line. A markdown or raw cell has no output at all, so it
+  carries no copy-output button in the first place. Copy *input* is never disabled - every
   cell has source. Everything else copies as text you can paste: stream output and tracebacks
   (with the terminal colors stripped), and a DataFrame or an HTML table as a
   tab-separated table a spreadsheet reads as columns.
