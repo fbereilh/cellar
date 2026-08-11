@@ -76,6 +76,14 @@
  * containment test, which is asymmetric. Identity has no such asymmetry, and
  * here it is required.
  *
+ * EVERY declaration naming a git-reported path is minted by ONE function,
+ * `worktreeDeclaration` — the picker, the sidebar route, and `resolveRootDir`
+ * itself. This rule has been got wrong once per site that re-derived it, always
+ * the same way (measuring the hop with `relative(lexicalWorkspace, gitPath)`),
+ * and always silently, because the wrong form still resolves. So a new surface
+ * that turns a worktree into a declaration CALLS that function; it does not
+ * measure the hop itself.
+ *
  * NEVER HAND JUPYTER AN ABSOLUTE PATH. `to_os_path` strips the leading `/` and
  * joins, so `/Users/x/repo` becomes `<ws>/Users/x/repo`, which does not exist —
  * and `cwd_for_path` then walks UP, starting the kernel somewhere arbitrary. A
@@ -227,9 +235,20 @@ function toRel(dir: string): string {
  * `../../../private/var/folders/…` form on macOS: it resolves, but it is not a
  * declaration anyone should have in a committed `.ipynb`, and it is not even the
  * shortest path to the same directory.
+ *
+ * The hop is then VERIFIED rather than assumed, because it is measured in one
+ * namespace and applied in the other: that is exact whenever the symlink
+ * separating them sits ABOVE the hop (macOS's `/var` -> `/private/var`, and every
+ * layout seen in practice), and where it does not, the `..` count would name a
+ * DIFFERENT directory. So a declaration that does not resolve back to the very
+ * worktree git reported falls back to the lexical measurement — machine-specific,
+ * but naming the right directory. An ugly declaration is a cosmetic cost; one
+ * that points somewhere else is the silent degrade this feature exists to prevent.
  */
 export function worktreeDeclaration(worktreePath: string): string {
-	return relative(realpathOrSelf(ws()), worktreePath).split(sep).join('/');
+	const rel = relative(realpathOrSelf(ws()), worktreePath).split(sep).join('/');
+	if (rel && samePath(resolve(ws(), rel), worktreePath)) return rel;
+	return toRel(worktreePath);
 }
 
 /** Short, deterministic rendering of what IS registered, for a refusal message. */
@@ -339,6 +358,7 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 	// implementation of "inside the workspace" in the app, and this is a caller of
 	// it, not a second copy.
 	let kind: RootKind;
+	let match: GitWorktree | null = null;
 	let inside = true;
 	try {
 		// INSIDE — including an `outside`-SHAPED declaration that lexically lands
@@ -356,14 +376,28 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 		// names this exact directory, and its refusal names the repair, so a path
 		// that simply escapes the workspace is answered by the gate rather than by
 		// a separate escape message this branch would have to keep in sync.
-		assertRegisteredWorktree(dir, declared);
+		match = assertRegisteredWorktree(dir, declared);
 		kind = 'worktree';
 	}
 
-	const rel = toRel(dir);
+	// THE CANONICAL DECLARATION, through the ONE helper that owns the two-namespace
+	// rule. The gate returns the worktree it matched, and it is git's REALPATH'd
+	// path that has to be turned into a declaration — measuring the hop from the
+	// LEXICAL workspace instead (`toRel`) is what this branch used to do, and it
+	// persists `../../../private/var/folders/…` into a COMMITTED `.ipynb` on any
+	// workspace whose path traverses a symlink, i.e. exactly the input this branch
+	// accepts absolute paths FOR (what `git worktree add` printed is realpath'd).
+	// It also gave one checkout two spellings, so the sidebar kept offering "Use as
+	// root" for a worktree the notebook was already rooted at.
+	const rel = match ? worktreeDeclaration(match.path) : toRel(dir);
+	// Bound from the DECLARATION, so `dir` and `rel` are two views of one directory
+	// however the root was typed — which is what lets `isSameDeclaredRoot` compare
+	// resolved directories and see a re-declaration in the other spelling as the
+	// no-op it is.
+	const rootDir = resolve(ws(), rel);
 	let stat;
 	try {
-		stat = statSync(dir);
+		stat = statSync(rootDir);
 	} catch {
 		// Being LISTED is not proof of existing: a removed worktree still lists,
 		// tagged `prunable`. So each kind names its own repair.
@@ -378,7 +412,7 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 			`Notebook root ${JSON.stringify(rel)} is a file, not a directory. A root is a directory the kernel runs in — normally a git worktree.`
 		);
 	}
-	return { rel, dir, apiPath: rel, kind };
+	return { rel, dir: rootDir, apiPath: rel, kind };
 }
 
 /**

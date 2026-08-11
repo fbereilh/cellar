@@ -992,13 +992,20 @@ export function isTextNotebook(nb?: string | null): boolean {
  * Set (or clear, with null/'') the notebook's code root in the allowlisted
  * `cellar` namespace, so it round-trips through clean-on-save with zero git diff
  * like the rest of the namespace. The declared value is NORMALIZED before it is
- * persisted (idempotent, so re-saving never churns the file) and a value that is
- * not a workspace-relative path throws before anything is written.
+ * persisted (idempotent, so re-saving never churns the file); `~` is the one shape
+ * refused here, since Cellar never expands it.
+ *
+ * IT DOES NOT DECIDE WHAT A ROOT MAY BE, and a caller must not read it as though
+ * it did. A declaration may now name a directory outside the workspace (a
+ * registered git worktree of this repo), so admission — including the canonical
+ * `..`-relative form this then persists — belongs to the ONE validate-and-store
+ * site, `server/notebookRoot.ts`'s `resolveRootDir`, which is what every surface
+ * goes through via `notebook-root-actions.ts`. This writer records text.
  *
  * A `.py` text notebook REFUSES a non-empty root here, because `persist` writes
  * it back from its cells alone and would drop the declaration — see
- * `textNotebookRootError`. That guard lives at this single writer so no surface
- * can route around it; clearing stays allowed everywhere.
+ * `textNotebookRootError`. THAT guard does live at this single writer so no
+ * surface can route around it; clearing stays allowed everywhere.
  *
  * This function only records the declaration. Because a kernel's cwd is fixed
  * when its process spawns, a root that CHANGES also has to free that notebook's

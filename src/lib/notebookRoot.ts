@@ -99,6 +99,7 @@ export interface AgentConfigReport {
 	file?: string;
 	status: 'created' | 'updated' | 'already' | 'skipped';
 	message?: string;
+	warning?: string;
 }
 
 /**
@@ -110,15 +111,21 @@ export interface AgentConfigReport {
  * place the wording lives, shared by the notebook's root picker and the sidebar's
  * WORKTREES block rather than written twice and drifting.
  *
- * SILENT ON SUCCESS, deliberately: `created`/`updated`/`already` with no message
- * is the everyday outcome and needs no sentence beside the root change the user
- * asked for. What must never be silent is the case that leaves their checkout
- * dirty — config written but the ignore entry could not be arranged — and a
- * `skipped` that explains itself, both of which carry a message.
+ * SILENT ON SUCCESS, deliberately: `created`/`updated`/`already` is the everyday
+ * outcome and needs no sentence beside the root change the user asked for. What
+ * must never be silent is the case that leaves their checkout dirty — config
+ * written but the ignore entry could not be arranged — and a `skipped` that
+ * explains itself.
+ *
+ * DECIDED FROM THE STATUS AND `warning`, never from the presence of a `message`:
+ * the writer sets one on EVERY outcome ("added the cellar MCP server",
+ * "already configured"), so keying off it appended a note to every adoption and
+ * left the one case this exists to surface indistinguishable from that chatter.
  */
 export function agentConfigNotice(report: AgentConfigReport | null | undefined): string | null {
-	if (!report?.message) return null;
-	return report.message;
+	if (!report) return null;
+	if (report.warning) return report.warning;
+	return report.status === 'skipped' ? (report.message ?? null) : null;
 }
 
 /** Thrown for a declared root that is not a usable workspace-relative directory. */

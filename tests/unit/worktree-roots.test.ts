@@ -220,6 +220,117 @@ describe('the two-namespace rule', () => {
 	});
 });
 
+/**
+ * The two-namespace rule for EVERY path that can mint or accept a declaration,
+ * over a workspace whose path traverses a symlink.
+ *
+ * This rule has now been got wrong once per site that re-derived it, always the
+ * same way — measuring the hop as `relative(lexicalWorkspace, gitReportedPath)` —
+ * and always silently, because the wrong form still resolves. What made each fix
+ * look verified was that its test passed a LEXICAL path (`mkdtemp` returns one),
+ * so the two namespaces coincided and nothing could tell the two rules apart.
+ *
+ * So the input here is the path GIT ITSELF PRINTS, taken from the listing rather
+ * than reconstructed, which is also what a user pastes out of `git worktree add`.
+ * Every surface that produces or consumes a declaration is asserted to agree on
+ * ONE spelling: two that disagree still work individually, which is exactly why
+ * this needs asserting — a divergence shows up only as a machine-specific path in
+ * a committed `.ipynb`, and as a sidebar that keeps offering "Use as root" for a
+ * worktree the notebook is already rooted at.
+ */
+describe('the two-namespace rule, over a SYMLINKED workspace', () => {
+	let LINK_ROOT: string;
+	let LINK_WS: string;
+	/** The path git reports for the sibling worktree — realpath'd, as git always is. */
+	let GIT_SIBLING: string;
+	let prevWs: string | undefined;
+
+	beforeAll(() => {
+		LINK_ROOT = mkdtempSync(join(tmpdir(), 'cellar-ns-all-'));
+		const realDir = join(LINK_ROOT, 'real');
+		mkdirSync(realDir, { recursive: true });
+		symlinkSync(realDir, join(LINK_ROOT, 'link'));
+
+		const wsReal = join(realDir, 'ws');
+		mkdirSync(wsReal, { recursive: true });
+		git(wsReal, 'init', '-q', '-b', 'main');
+		writeFileSync(join(wsReal, 'probe.py'), "VALUE = 'ws'\n");
+		git(wsReal, 'add', 'probe.py');
+		git(wsReal, 'commit', '-q', '-m', 'init');
+		git(wsReal, 'worktree', 'add', '-q', join(realDir, 'sib'), '-b', 'sib');
+
+		prevWs = process.env.CELLAR_WORKSPACE;
+		// The workspace addressed THROUGH the symlink — the lexical namespace Cellar
+		// and jupyter both live in, and the one git never reports back.
+		process.env.CELLAR_WORKSPACE = join(LINK_ROOT, 'link', 'ws');
+		gitmod.invalidateGitCaches();
+		GIT_SIBLING = gitmod.listWorktreesAt(join(LINK_ROOT, 'link', 'ws')).find((w) => w.path.endsWith('sib'))!.path;
+		// The premise of every assertion below: the path git prints is NOT the one a
+		// lexical `relative()` from the workspace would measure against.
+		expect(GIT_SIBLING).toBe(join(realpathSync(join(LINK_ROOT, 'real')), 'sib'));
+		expect(relative(resolve(join(LINK_ROOT, 'link', 'ws')), GIT_SIBLING)).not.toBe('../sib');
+	});
+
+	afterAll(() => {
+		process.env.CELLAR_WORKSPACE = prevWs;
+		gitmod.invalidateGitCaches();
+		if (LINK_ROOT) rmSync(LINK_ROOT, { recursive: true, force: true });
+	});
+
+	it('RESOLVE FROM ABSOLUTE: the path git printed persists as the portable ..-relative form', () => {
+		// The very input this branch accepts absolute paths FOR. Measured lexically it
+		// stores `../../../private/var/folders/…` — machine-specific, useless on any
+		// other checkout, and in a file the user COMMITS.
+		const r = rootmod.resolveRootDir(GIT_SIBLING);
+		expect(r?.kind).toBe('worktree');
+		expect(r?.rel).toBe('../sib');
+		expect(r?.apiPath).toBe('../sib');
+		expect(realpathSync(r!.dir)).toBe(realpathSync(GIT_SIBLING));
+	});
+
+	it('RESOLVE FROM ..: the same declaration, and the SAME resolved directory', () => {
+		// One directory, one declaration, whichever spelling it was typed as — which is
+		// what lets the no-op test compare resolved directories at all.
+		const viaRel = rootmod.resolveRootDir('../sib');
+		const viaAbs = rootmod.resolveRootDir(GIT_SIBLING);
+		expect(viaRel?.rel).toBe('../sib');
+		expect(viaAbs).toEqual(viaRel);
+	});
+
+	it('DETECTION: the picker offers that same one spelling', async () => {
+		const actions = await import('../../src/lib/server/notebook-root-actions');
+		gitmod.invalidateGitCaches();
+		const roots = await actions.listWorkspaceRoots();
+		const sib = roots.find((r) => r.source === 'worktree');
+		expect(sib?.path).toBe('../sib');
+		expect(sib?.external).toBe(true);
+	});
+
+	it('THE ROUTE: an adopted worktree reads as the notebook’s CURRENT root, not as one to adopt', async () => {
+		// The sidebar decides "already adopted" by comparing the notebook's stored root
+		// against the worktree row's path. Both are declarations, so two spellings of
+		// one checkout leave the row offering "Use as root" for the root it is already
+		// on — and clicking it would tear down a perfectly good kernel.
+		const route = await import('../../src/routes/api/fs/git/roots/+server.js');
+		const rel = `ns-${Math.random().toString(36).slice(2, 8)}.ipynb`;
+		nbmod.createNotebook(rel);
+		// Declared the way a user pastes it: the absolute path git printed.
+		await (await import('../../src/lib/server/notebook-root-actions')).setNotebookRootAndRestart(GIT_SIBLING, rel);
+
+		gitmod.invalidateGitCaches();
+		const url = new URL('http://localhost/api/fs/git/roots');
+		url.searchParams.append('path', rel);
+		const body = await (await route.GET({ url } as Parameters<typeof route.GET>[0])).json();
+
+		const row = body.notebooks.find((n: { path: string }) => n.path === rel);
+		const wt = body.worktrees.find((w: { path: string }) => w.path.endsWith('sib'));
+		expect(row.root).toBe('../sib');
+		expect(wt.path).toBe('../sib');
+		expect(row.root).toBe(wt.path);
+		expect(wt.external).toBe(true);
+	});
+});
+
 describe('the app-wide path guard is NOT what changed', () => {
 	it('resolveInWorkspace still refuses every out-of-workspace path', async () => {
 		const { resolveInWorkspace } = await import('../../src/lib/server/fstree');

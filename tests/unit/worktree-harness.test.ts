@@ -23,6 +23,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { agentConfigNotice } from '../../src/lib/notebookRoot';
 
 let ROOT: string;
 let WS: string;
@@ -250,7 +251,12 @@ describe('failure is REPORTED, never thrown', () => {
 		mkdirSync(plain, { recursive: true });
 		const r = mod.configureAdoptedWorktree(plain);
 		expect(r?.status).toBe('created');
-		expect(r?.message).toMatch(/untracked/i);
+		// Asserted through the SHARED notice, i.e. the sentence a human is really
+		// shown, not merely through a field one of the two surfaces might read.
+		expect(agentConfigNotice(r)).toMatch(/untracked/i);
+		// And it names the file that is untracked, so with several harnesses it can
+		// never point at the one that WAS excluded.
+		expect(agentConfigNotice(r)).toContain('.mcp.json');
 		rmSync(plain, { recursive: true, force: true });
 	});
 
@@ -266,9 +272,73 @@ describe('failure is REPORTED, never thrown', () => {
 			expect(mod.configureAdoptedWorktree(plain)?.status).toBe('created');
 			const again = mod.configureAdoptedWorktree(plain);
 			expect(again?.status).toBe('already');
-			expect(again?.message).toMatch(/untracked/i);
+			expect(agentConfigNotice(again)).toMatch(/untracked/i);
 		} finally {
 			rmSync(plain, { recursive: true, force: true });
+		}
+	});
+
+	it('says NOTHING on an ordinary success — the notice reads the STATUS, not the message', () => {
+		// `configureHarness` sets a message on every outcome it reports ("added the
+		// cellar MCP server", "already configured"), so a notice gated on the message
+		// being present appended a note to EVERY adoption — and buried the one case
+		// this mechanism exists to surface in that chatter.
+		const r = mod.configureAdoptedWorktree(SIBLING);
+		expect(r?.status).toBe('created');
+		expect(r?.message).toBeTruthy();
+		expect(agentConfigNotice(r)).toBeNull();
+
+		const again = mod.configureAdoptedWorktree(SIBLING);
+		expect(again?.status).toBe('already');
+		expect(agentConfigNotice(again)).toBeNull();
+		rmSync(join(SIBLING, '.mcp.json'), { force: true });
+	});
+
+	it('with TWO harnesses, the summary claims only what happened and names each file', () => {
+		// The aggregate used to be the FIRST written result plus `N harnesses
+		// configured`: it claimed both were configured when one was refused, discarded
+		// the refusal's reason — the actionable part — and, since the exclude verdict
+		// was a single AND over both, named the file that WAS excluded as the untracked
+		// one. In a module whose header is about not asserting more than was verified,
+		// that is the honesty rule failing at the summary step.
+		harness.allowHarness('codex', WS);
+		// A plain directory, so nothing can ignore either file — both earn a warning,
+		// and each must name its OWN file.
+		const plain = join(ROOT, 'two-harnesses');
+		mkdirSync(plain, { recursive: true });
+		// `.codex` as a FILE: the writer refuses what it cannot edit confidently, which
+		// is the `skipped` this must not summarise away.
+		writeFileSync(join(plain, '.codex'), 'not a directory\n');
+		try {
+			const r = mod.configureAdoptedWorktree(plain);
+			expect(r?.status).toBe('created');
+			expect(existsSync(join(plain, '.mcp.json'))).toBe(true);
+
+			const note = agentConfigNotice(r) ?? '';
+			expect(note).not.toMatch(/\d+ harnesses configured/);
+			// The refused harness is named, with its own reason…
+			expect(note).toMatch(/codex/);
+			// …and the untracked-file warning names the file it is about, so it can never
+			// report the wrong one.
+			expect(note).toContain('.mcp.json');
+		} finally {
+			harness.disallowHarness('codex', WS);
+			harness.allowHarness('claude', WS);
+			rmSync(plain, { recursive: true, force: true });
+		}
+	});
+
+	it('a SKIPPED harness still speaks, and its reason is never summarised away', () => {
+		// The reason is the actionable part: an aggregate that reported a count claimed
+		// every harness was configured and discarded the one explanation worth having.
+		process.env.CELLAR_NO_MCP_CONFIG = '1';
+		try {
+			const r = mod.configureAdoptedWorktree(SIBLING);
+			expect(r?.status).toBe('skipped');
+			expect(agentConfigNotice(r)).toMatch(/--no-mcp-config/);
+			expect(agentConfigNotice(r)).not.toMatch(/\d+ harnesses configured/);
+		} finally {
+			delete process.env.CELLAR_NO_MCP_CONFIG;
 		}
 	});
 });

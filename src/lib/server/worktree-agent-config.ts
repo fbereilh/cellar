@@ -67,7 +67,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join, dirname, resolve } from 'node:path';
+import { join, dirname, relative, resolve } from 'node:path';
 import { configureHarness, mcpJsonHarnessNames, harnessConfigPath, readAllowList } from './harness.js';
 import { workspaceRoot } from './fstree';
 import { getUiState } from './ui-state';
@@ -97,6 +97,14 @@ export interface WorktreeAgentConfig {
 	status: 'created' | 'updated' | 'already' | 'skipped';
 	/** Why, whenever the status alone does not say it. */
 	message?: string;
+	/**
+	 * The part a HUMAN must be shown — a harness that was NOT configured, or a
+	 * config file left visible as an untracked change. Structural rather than
+	 * inferred from `message`, which the writer sets on every outcome including the
+	 * everyday successes: keyed off the message's presence, the one thing worth
+	 * saying was buried in "added the cellar MCP server" on every adoption.
+	 */
+	warning?: string;
 }
 
 /** The harnesses whose config file is `.mcp.json`, minus any this launch excludes. */
@@ -175,58 +183,103 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 
 	// The exclude first, so the config file is never momentarily visible as an
 	// untracked change in the user's checkout.
-	// Mapped THEN reduced, never `.every` directly: that short-circuits on the first
-	// failure, so a harness whose exclude could not be arranged silently skipped the
-	// attempt for every later one — and their config files were then written with no
-	// ignore entry at all, though those excludes would have succeeded.
-	const excluded = names
-		.map((name) => {
-			const file = harnessConfigPath(name, worktreeDir);
-			return !file || ensureGitExclude(worktreeDir, file.slice(worktreeDir.length + 1));
-		})
-		.every(Boolean);
-
-	const results: WorktreeAgentConfig[] = [];
+	//
+	// EVERY harness is attempted, and each one's verdict is KEPT AGAINST ITS OWN
+	// NAME. A short-circuiting `.every` skipped the attempt for every harness after
+	// the first failure, so their config files were written with no ignore entry
+	// though those excludes would have succeeded; and a single AND'ed boolean then
+	// made the warning name whichever file happened to be written FIRST, telling the
+	// user that `.mcp.json` was untracked-dirty when the file that really was is
+	// `.codex/config.toml`.
+	const excludedByName = new Map<string, boolean>();
 	for (const name of names) {
+		const file = harnessConfigPath(name, worktreeDir);
+		excludedByName.set(name, !file || ensureGitExclude(worktreeDir, file.slice(worktreeDir.length + 1)));
+	}
+
+	const results: HarnessOutcome[] = [];
+	for (const name of names) {
+		const excluded = excludedByName.get(name) ?? false;
 		try {
 			const r = configureHarness(name, worktreeDir);
 			results.push({
+				name,
 				file: r.file,
 				status: r.status === 'wrote' ? 'created' : (r.status as WorktreeAgentConfig['status']),
-				message: r.message
+				message: r.message,
+				excluded
 			});
 		} catch (err) {
 			// Caught PER HARNESS: agent wiring may never abort a root change, and one
 			// unwritable worktree must not hide a sibling that wrote fine.
 			const message = err instanceof Error ? err.message : String(err);
 			logWarn('roots', `agent config for ${name} in ${worktreeDir} failed: ${message}`);
-			results.push({ status: 'skipped', message: `agent config could not be written: ${message}` });
+			results.push({ name, status: 'skipped', message: `agent config could not be written: ${message}`, excluded });
 		}
 	}
 
-	// One field, so the common single-harness case reads plainly; several are
-	// summarised rather than dropped.
 	const first = results[0];
+	if (!first) return undefined;
+	// The headline is the write that really happened; anything the headline does not
+	// cover rides `warning` rather than being summarised away. The old aggregate
+	// reported `${results.length} harnesses configured`, which CLAIMED both when one
+	// was skipped and discarded the skipped one's reason — the actionable part — in
+	// a module whose whole header is about not asserting more than was verified.
 	const wrote = results.find((r) => r.status === 'created' || r.status === 'updated') ?? first;
-	if (!wrote) return undefined;
-	// THE ONE CASE THAT MUST NEVER BE SILENT is the one that leaves the user's
-	// checkout dirty — and whether it does is a fact about what is ON DISK, not
-	// about whether THIS call wrote it. Gating on `created`/`updated` said it
-	// exactly once: a re-adoption takes the `already` path (the config is correct),
-	// so an exclude that still could not be arranged — the entry deleted by hand,
-	// the common git dir gone unwritable, or a first adoption that failed and is
-	// being retried — reported nothing at all while `?? .mcp.json` really was there.
-	//
-	// A `skipped` result is deliberately NOT covered: the writer refused a file it
-	// could not edit, so that file is not Cellar's config and its own message says
-	// what happened.
-	const present = wrote.status === 'created' || wrote.status === 'updated' || wrote.status === 'already';
-	if (!excluded && present && wrote.file && existsSync(wrote.file)) {
-		return {
-			...wrote,
-			message:
-				"Cellar's agent config is in this worktree, but it could not be added to the repository's .git/info/exclude, so the checkout will show it as an untracked file."
-		};
+	const warning = warnings(results, worktreeDir).join(' ') || undefined;
+	return {
+		file: wrote.file,
+		status: wrote.status,
+		message: summarize(results),
+		...(warning ? { warning } : {})
+	};
+}
+
+/** One harness's outcome, with the exclude verdict for ITS OWN file. */
+interface HarnessOutcome {
+	name: string;
+	file?: string;
+	status: WorktreeAgentConfig['status'];
+	message?: string;
+	excluded: boolean;
+}
+
+/**
+ * The sentences a human must be shown, one per harness that earned one.
+ *
+ * THE CASE THAT MUST NEVER BE SILENT is the one that leaves the user's checkout
+ * dirty — and whether it does is a fact about what is ON DISK, not about whether
+ * THIS call wrote it. Gating it on `created`/`updated` said it exactly once: a
+ * re-adoption takes the `already` path (the config is correct), so an exclude that
+ * still could not be arranged — the entry deleted by hand, the common git dir gone
+ * unwritable, or a first adoption that failed and is being retried — reported
+ * nothing while `?? .mcp.json` really was there.
+ *
+ * A `skipped` harness earns one too, and it is named: the writer refused a file it
+ * could not edit, so that file is not Cellar's config, and with several harnesses
+ * the message must say which one it is talking about.
+ */
+function warnings(results: HarnessOutcome[], worktreeDir: string): string[] {
+	const out: string[] = [];
+	for (const r of results) {
+		if (r.status === 'skipped') {
+			if (r.message) out.push(results.length > 1 ? `${r.name}: ${r.message}` : r.message);
+			continue;
+		}
+		if (!r.excluded && r.file && existsSync(r.file)) {
+			// Named the way `git status` will show it, so the sentence points at the row
+			// the user is about to see rather than at an absolute server path.
+			const rel = relative(worktreeDir, r.file) || r.file;
+			out.push(
+				`Cellar's agent config (${rel}) is in this worktree, but it could not be added to the repository's .git/info/exclude, so the checkout will show it as an untracked file.`
+			);
+		}
 	}
-	return results.length > 1 ? { ...wrote, message: wrote.message ?? `${results.length} harnesses configured` } : wrote;
+	return out;
+}
+
+/** What each harness reported, named when there is more than one to tell apart. */
+function summarize(results: HarnessOutcome[]): string | undefined {
+	if (results.length === 1) return results[0].message;
+	return results.map((r) => `${r.name}: ${r.message ?? r.status}`).join('; ');
 }

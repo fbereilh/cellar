@@ -476,10 +476,13 @@
 				notebooks: [],
 				source: 'declared',
 				// The stand-in describes a root whose directory is GONE, so nothing can
-				// verify where it was; `..` in the declaration is the only fact in hand,
-				// and it is the one the label reads. Never a guess about a path we cannot
-				// resolve — the entry exists to be seen and cleared, not to be adopted.
-				external: root.startsWith('../')
+				// verify where it was; the DECLARATION's own shape is the only fact in
+				// hand, and it is the one the label reads. Both out-of-workspace shapes
+				// count: a hand-edited declaration may be ABSOLUTE (the resolver accepts
+				// one and normalizes it, so one can be written), and reading a leading `/`
+				// as internal labels a sibling checkout as sitting inside the workspace —
+				// the single misreading the "external worktree" tag exists to prevent.
+				external: root.startsWith('../') || root.startsWith('/')
 			});
 		}
 		return opts;
