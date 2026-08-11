@@ -143,6 +143,67 @@ describe('what gets written into an adopted worktree', () => {
 		}
 	});
 
+	it('NEVER takes over a cellar entry that is already there and says something else', () => {
+		// The cost of rule 5, and the case it creates: once the entry NAMES an instance,
+		// rewriting someone else's is a REDIRECT, not a repair. A worktree the user also
+		// runs Cellar in has the canonical bare entry, written by ITS OWN launcher (which
+		// needs no selector, the instance being reachable from that cwd). Rewriting it to
+		// name THIS workspace silently bridges every agent working there to a different
+		// notebook server — and that instance's next launch reconciles it back, so the two
+		// churn the file and each redirects the other's agent.
+		const other = join(SIBLING, '.mcp.json');
+		const before = JSON.stringify({ mcpServers: { cellar: { command: 'cellar', args: ['mcp'] } } }, null, 2) + '\n';
+		writeFileSync(other, before);
+		try {
+			const r = mod.configureAdoptedWorktree(SIBLING);
+			expect(r?.status).toBe('skipped');
+			// Byte-identical: refused, not merged, not reformatted.
+			expect(readFileSync(other, 'utf8')).toBe(before);
+			// And the refusal NAMES the conflict rather than reading as a generic failure.
+			expect(r?.message).toMatch(/pointing somewhere else/);
+			expect(r?.warning).toMatch(/\.mcp\.json/);
+			// Nothing was written, so the exclude that would have covered it is taken back —
+			// the user's own file stays visible to git.
+			expect(() => git(SIBLING, 'check-ignore', '-q', '.mcp.json')).toThrow();
+		} finally {
+			rmSync(other, { force: true });
+		}
+	});
+
+	it('the WORKSPACE’s own config is still repaired on every start — the rule is worktree-only', () => {
+		// The other direction, and what makes the allow-list a standing instruction:
+		// "delete `.mcp.json` and the next `cellar` puts it back" must keep holding, so a
+		// stale entry in the workspace's OWN config is still rewritten.
+		writeFileSync(
+			join(WS, '.mcp.json'),
+			JSON.stringify({ mcpServers: { cellar: { command: 'cellar', args: ['mcp', '--stale'] } } }, null, 2) + '\n'
+		);
+		try {
+			expect(harness.configureHarness('claude', WS).status).toBe('updated');
+			const own = JSON.parse(readFileSync(join(WS, '.mcp.json'), 'utf8'));
+			expect(own.mcpServers.cellar.args).toEqual(['mcp']);
+		} finally {
+			rmSync(join(WS, '.mcp.json'), { force: true });
+		}
+	});
+
+	it('refuses a foreign entry in the TOML format too', () => {
+		harness.allowHarness('codex', WS);
+		const file = join(SIBLING, '.codex', 'config.toml');
+		mkdirSync(join(SIBLING, '.codex'), { recursive: true });
+		const before = '[mcp_servers.cellar]\ncommand = "cellar"\nargs = ["mcp"]\n';
+		writeFileSync(file, before);
+		try {
+			// Claude Code's config is absent, so it writes; Codex's is the foreign one.
+			mod.configureAdoptedWorktree(SIBLING);
+			expect(readFileSync(file, 'utf8')).toBe(before);
+		} finally {
+			harness.disallowHarness('codex', WS);
+			harness.allowHarness('claude', WS);
+			rmSync(join(SIBLING, '.codex'), { recursive: true, force: true });
+		}
+	});
+
 	it('the selector reaches EVERY harness format, not just JSON', () => {
 		// A `.codex/config.toml` written without it is inert in exactly the same way, so
 		// the override has to be a property of the writer rather than of one format.

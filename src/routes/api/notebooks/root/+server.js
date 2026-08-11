@@ -24,8 +24,10 @@ import { setNotebookRootAndRestart, listWorkspaceRoots } from '$lib/server/noteb
  * leaks no home directory.
  *
  * Anything else — a path that escapes the workspace without being a registered
- * worktree, a missing directory, a file, or a `.py` notebook that cannot hold a
- * declaration at all — is refused with a 400 naming the path and its own repair.
+ * worktree, a registered checkout that CONTAINS the workspace (`git worktree list`
+ * walks up, so a workspace inside a repo sees its own parent listed), a missing
+ * directory, a file, or a `.py` notebook that cannot hold a declaration at all —
+ * is refused with a 400 naming the path and its own repair.
  * Nothing is written and no kernel is freed.
  *
  * Adopting an EXTERNAL worktree may additionally write Cellar's agent config into

@@ -6,7 +6,7 @@
  * cannot reach the Cellar instance that is serving the notebook. This module
  * closes that, and nothing more.
  *
- * FIVE RULES, each of which was a decision rather than an implementation detail:
+ * SIX RULES, each of which was a decision rather than an implementation detail:
  *
  * 1. **ADOPTION-SCOPED — never on detection.** Only a worktree actually SET as a
  *    notebook's root is written to. Detection happens whenever a picker opens or
@@ -49,6 +49,22 @@
  *    written without the selector is inert in exactly the same way. What a normal
  *    workspace launch writes is untouched: the selector is a per-call override on
  *    the one writer, not a change to the canonical entry.
+ *
+ * 6. **AN EXISTING `cellar` ENTRY IS NEVER TAKEN OVER** (`preserveExisting`), and
+ *    that follows directly from rule 5: once the entry NAMES an instance, writing
+ *    it over someone else's is not a repair, it is a redirect. The live case is a
+ *    worktree the user ALSO runs Cellar in — its own launcher wrote the canonical
+ *    `args:['mcp']` there, correctly carrying no selector because that instance is
+ *    reachable from that cwd — and adopting it would rewrite that to name the
+ *    ADOPTING workspace, so every agent working in that checkout is silently
+ *    bridged to a different notebook server; then that instance's next launch
+ *    reconciles it back, and the two churn the file, each redirecting the other's
+ *    agent. So a `cellar` entry that says something else is left alone and reported
+ *    `skipped` with the conflict named — the refuse-rather-than-clobber stance both
+ *    writers already take for every shape they cannot edit confidently — and the
+ *    exclude for that harness is taken back with it, since nothing was written.
+ *    It applies HERE ONLY: the WORKSPACE's own config is still repaired on every
+ *    start, which is what makes the allow-list a standing instruction.
  *
  * ── WHY THE `.git/info/exclude` WRITE IS PART OF THIS, NOT AN EXTRA ────────────
  *
@@ -174,17 +190,37 @@ function targetHarnesses(): { allowed: string[]; names: string[] } {
 const EXCLUDE_MARKER = '# added by cellar: agent config for a notebook code root';
 
 /**
- * Ensure `rel` — a path relative to a working tree's ROOT — is ignored, via the
- * repo's COMMON `info/exclude`. Best-effort and idempotent; `ok:false` says it
- * could not be arranged (not a repo, unwritable), which is the caller's cue to say
- * so rather than to claim a clean checkout, and `appended` records the exact bytes
- * THIS call added so the write can be taken back if the config never lands.
+ * The repo's COMMON git directory for `worktreeDir`, or null when there is none.
  *
  * `--git-common-dir`, never `--absolute-git-dir`: see the header — `info/` is in
  * git's `common_list`, so an exclude written to a linked worktree's own git dir is
  * read by nothing. Its output is relative to the git process's cwd (which `-C`
  * sets to `worktreeDir`) in a main checkout and absolute in a linked one, so it is
  * resolved against `worktreeDir` rather than trusted as absolute.
+ *
+ * Resolved ONCE PER CALL and threaded into every harness's `ensureGitExclude`: the
+ * exclude loop runs per allow-listed harness for the SAME directory, so asking git
+ * inside it paid an identical blocking `spawnSync` per harness on the process that
+ * carries the kernel websockets and the SSE fan-out. The per-harness VERDICTS the
+ * loop exists to produce are unchanged — only the question that has one answer for
+ * the whole call moved out of it.
+ */
+function gitCommonDir(worktreeDir: string): string | null {
+	const r = spawnSync('git', ['-C', worktreeDir, '--no-optional-locks', 'rev-parse', '--git-common-dir'], {
+		encoding: 'utf8'
+	});
+	if (r.status !== 0) return null;
+	const common = (r.stdout ?? '').trim();
+	return common ? resolve(worktreeDir, common) : null;
+}
+
+/**
+ * Ensure `rel` — a path relative to a working tree's ROOT — is ignored, via the
+ * repo's COMMON `info/exclude` (`commonDir`, resolved once by the caller; null when
+ * there is no repo to write into). Best-effort and idempotent; `ok:false` says it
+ * could not be arranged (not a repo, unwritable), which is the caller's cue to say
+ * so rather than to claim a clean checkout, and `appended` records the exact bytes
+ * THIS call added so the write can be taken back if the config never lands.
  *
  * ANCHORED WITH A LEADING SLASH, and that is not cosmetic. A gitignore pattern
  * with no slash in it matches at ANY DEPTH, so a bare `.mcp.json` — and this entry
@@ -196,15 +232,10 @@ const EXCLUDE_MARKER = '# added by cellar: agent config for a notebook code root
  * makes the two harnesses consistent, since `.codex/config.toml` contains a slash
  * and was therefore already root-anchored.
  */
-function ensureGitExclude(worktreeDir: string, rel: string): ExcludeWrite {
+function ensureGitExclude(commonDir: string | null, rel: string): ExcludeWrite {
 	const entry = `/${rel}`;
-	const r = spawnSync('git', ['-C', worktreeDir, '--no-optional-locks', 'rev-parse', '--git-common-dir'], {
-		encoding: 'utf8'
-	});
-	if (r.status !== 0) return { ok: false };
-	const common = (r.stdout ?? '').trim();
-	if (!common) return { ok: false };
-	const file = join(resolve(worktreeDir, common), 'info', 'exclude');
+	if (!commonDir) return { ok: false };
+	const file = join(commonDir, 'info', 'exclude');
 	try {
 		// Whether the repo HAD an exclude file at all, recorded before we touch it: a
 		// revert has to be able to leave the repo exactly as it found it, and an empty
@@ -334,9 +365,11 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 	// user that `.mcp.json` was untracked-dirty when the file that really was is
 	// `.codex/config.toml`.
 	const excludedByName = new Map<string, ExcludeWrite>();
+	// One question, one answer, one spawn — see `gitCommonDir`.
+	const commonDir = gitCommonDir(worktreeDir);
 	for (const name of names) {
 		const file = harnessConfigPath(name, worktreeDir);
-		excludedByName.set(name, file ? ensureGitExclude(worktreeDir, file.slice(worktreeDir.length + 1)) : { ok: true });
+		excludedByName.set(name, file ? ensureGitExclude(commonDir, file.slice(worktreeDir.length + 1)) : { ok: true });
 	}
 	// Whether the repo HAD an exclude file before this call, decided ONCE for the call:
 	// the loop above appends for every harness, so only the first of them can observe
@@ -351,7 +384,17 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 			// `instanceArgs`, never the bare canonical entry: see rule 5 in the header —
 			// a config in a worktree has to NAME the instance, or the agent's `cellar mcp`
 			// looks for a runtime file in the worktree and finds none.
-			const r = configureHarness(name, worktreeDir, { args: instanceArgs(workspaceRoot()) });
+			//
+			// `preserveExisting` because naming the instance is exactly what makes taking
+			// over someone else's entry destructive: a worktree the user ALSO runs Cellar
+			// in already has a `cellar` entry, written by its own launcher and correctly
+			// carrying no selector, and rewriting it to name THIS workspace re-bridges
+			// every agent working there — after which that instance's next launch
+			// reconciles it back and the two churn the file. See rule 6.
+			const r = configureHarness(name, worktreeDir, {
+				args: instanceArgs(workspaceRoot()),
+				preserveExisting: true
+			});
 			results.push({
 				name,
 				file: r.file,

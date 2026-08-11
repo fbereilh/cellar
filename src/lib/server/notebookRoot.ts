@@ -65,6 +65,20 @@
  * worktree still lists (`prunable`): the listing authorises, `statSync` decides
  * usability.
  *
+ * REGISTERED IS NOT SUFFICIENT: a checkout that CONTAINS the workspace is refused
+ * (`enclosesWorkspace`). `git worktree list` walks UP to find the repo, so when the
+ * workspace is a SUBDIRECTORY of a checkout (`cd repo/analysis && cellar`) the
+ * listing's first entry is the ENCLOSING repo root — and the gate's only exclusion
+ * was the workspace ITSELF. Admitted, it roots the kernel ABOVE the tree Cellar is
+ * serving and writes agent config into the workspace's parent, which is the
+ * opposite of the sibling-checkout model this is written around; it was reachable
+ * purely as a side effect of the main checkout always being listed. It is refused
+ * AFTER the gate so the refusal can say what is true — that it is registered, and
+ * that it encloses — rather than the gate's "not a registered worktree", which
+ * would be false here; and it is dropped from the detection listing, the sidebar's
+ * worktree rows and the gate's own "what IS registered" message, so it is never
+ * offered either.
+ *
  * ── THE TWO-NAMESPACE RULE (verify by realpath, bind and persist lexically) ────
  *
  * The subtlest thing in this module, and the one that gets "simplified" into a
@@ -131,7 +145,7 @@
  * regardless - so a symlinked root grants nothing a cell could not already do.
  */
 import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { basename, dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { workspaceRoot, resolveInWorkspace } from './fstree';
 import { getNotebookRoot } from './notebook';
 import { listWorktreesAt, type GitWorktree } from './git';
@@ -306,6 +320,40 @@ export function isOutsideWorkspace(dir: string): boolean {
 }
 
 /**
+ * Whether `dir` CONTAINS the workspace — an ENCLOSING checkout, which is refused.
+ *
+ * A DIFFERENT question from `isOutsideWorkspace`, and one the shared guard cannot
+ * answer: `resolveInWorkspace` is anchored AT the workspace, so it decides whether
+ * something lies inside it and has no way to decide whether the workspace lies
+ * inside something. So this is a second rule, and like its sibling it lives in
+ * exactly ONE place and every site asks it — the picker's validation (through
+ * `resolveRootDir`), the gate's refusal listing, and the sidebar's worktree rows.
+ *
+ * WHY IT EXISTS: `git worktree list` walks UP to find the repo, so when the
+ * workspace is a SUBDIRECTORY of a checkout (`cd repo/analysis && cellar`, a layout
+ * Cellar already recognises elsewhere) the listing's first entry is the ENCLOSING
+ * repo root — and nothing else in the gate excluded it, since the only directory
+ * filtered there is the workspace ITSELF. Admitted, it roots the kernel at the
+ * directory that CONTAINS the tree Cellar is serving (its cwd and `sys.path` cover
+ * the workspace), and `setNotebookRootAndRestart` then writes `.mcp.json` into the
+ * workspace's PARENT. That is the opposite of the sibling-checkout model everything
+ * here is written around; it was admitted purely as a side effect of the main
+ * checkout always being listed, and it was never a designed capability.
+ *
+ * Compared CANONICALLY, like every other identity/containment question here: git
+ * realpaths its output while Cellar's workspace is the lexical resolve.
+ */
+export function enclosesWorkspace(dir: string): boolean {
+	const inner = relative(canonicalPath(dir), canonicalPath(ws()));
+	// '' is the workspace itself (identity, not enclosure) and an absolute result
+	// means no relative path exists at all (a different Windows drive).
+	if (inner === '' || isAbsolute(inner)) return false;
+	// A first segment of `..` means the workspace lies OUTSIDE `dir`. Split rather
+	// than prefix-tested, so no separator arithmetic is re-derived here.
+	return inner.split(sep)[0] !== '..';
+}
+
+/**
  * The DECLARATION that names a worktree `git worktree list` reported.
  *
  * THE TWO-NAMESPACE RULE, applied in the direction detection needs it — and the
@@ -341,7 +389,9 @@ export function worktreeDeclaration(worktreePath: string): string {
 function nameWorktrees(list: GitWorktree[]): string {
 	const wsDir = ws();
 	const canonWs = canonicalPath(wsDir);
-	const others = list.filter((w) => !isWorktreeAt(w, wsDir, canonWs));
+	// Neither the workspace itself nor a checkout that ENCLOSES it: a refusal that
+	// offers a candidate the very next resolve would refuse is worse than a short list.
+	const others = list.filter((w) => !isWorktreeAt(w, wsDir, canonWs) && !enclosesWorkspace(w.path));
 	if (!others.length) return 'This repository has no other worktrees registered.';
 	const shown = others.slice(0, 5).map((w) => w.path);
 	const more = others.length - shown.length;
@@ -480,6 +530,15 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 		// that simply escapes the workspace is answered by the gate rather than by
 		// a separate escape message this branch would have to keep in sync.
 		match = assertRegisteredWorktree(dir, canonDir, declared);
+		// REGISTERED IS NOT ENOUGH: a checkout that CONTAINS the workspace is refused
+		// after the gate, not before it, so a path that is merely outside keeps the
+		// gate's own repair message. Named honestly for what it is — saying it is not
+		// a registered worktree would be false here, since it demonstrably is.
+		if (enclosesWorkspace(canonDir)) {
+			throw new NotebookRootError(
+				`Notebook root ${JSON.stringify(declared)} is a registered worktree of this repository, but it CONTAINS the workspace — rooting a kernel there would run it above the directory Cellar is serving. A root must be a separate checkout (a sibling worktree), or a directory inside the workspace.`
+			);
+		}
 	}
 
 	// THE CANONICAL DECLARATION, through the ONE helper that owns the two-namespace

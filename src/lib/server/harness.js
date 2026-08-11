@@ -282,6 +282,25 @@ function readJsonState(file, args = SERVER_ARGS) {
 	return { present: entry !== undefined, matches: sameJsonEntry(entry, args), unreadable: false, config };
 }
 
+/**
+ * The refusal for a `cellar` entry that is ALREADY there and says something else,
+ * when the caller asked not to take it over (`opts.preserveExisting`).
+ *
+ * Shared by both formats, because the situation is one thing: the directory being
+ * written is NOT the workspace (only the adopted-worktree path passes the flag),
+ * and a `cellar` entry already sitting in a checkout is most likely that
+ * checkout's OWN — written by a Cellar instance running there, whose entry names
+ * no instance because it does not have to. Rewriting it to name the ADOPTING
+ * workspace silently re-bridges every agent working in that checkout to a
+ * different notebook server, and the other instance's next launch reconciles it
+ * straight back, so the two churn the file and each redirects the other's agent.
+ * Refusing is the same refuse-rather-than-clobber stance both writers already take
+ * for every other shape they cannot edit confidently.
+ */
+function foreignEntryRefusal(file) {
+	return `${file} already defines a "${SERVER_NAME}" MCP server pointing somewhere else; leaving it untouched (it is most likely a Cellar instance running in that checkout)`;
+}
+
 /** The `add it by hand` tail every JSON refusal ends with. */
 const JSON_HAND_EDIT = `add a "${SERVER_NAME}" entry under "mcpServers" by hand`;
 
@@ -297,7 +316,7 @@ function jsonRefusal(state) {
 			: 'is not a JSON object';
 }
 
-function writeJsonConfig(file, args) {
+function writeJsonConfig(file, args, preserveExisting) {
 	const state = readJsonState(file, args);
 	if (state.unreadable) {
 		const why = jsonRefusal(state);
@@ -313,6 +332,9 @@ function writeJsonConfig(file, args) {
 		// against the user's would report `updated` (and rewrite the file) on every
 		// single launch for anyone whose config is indented differently.
 		return { status: 'already', message: 'already configured' };
+	}
+	if (state.present && preserveExisting) {
+		return { status: 'skipped', message: foreignEntryRefusal(file) };
 	}
 	const config = state.config ?? {};
 	// `readJsonState` has already refused anything but a plain object (or nothing)
@@ -802,7 +824,7 @@ function readCodexFile(file) {
 	return { existing: src.text, state: codexState(src.text) };
 }
 
-function writeTomlConfig(file, args) {
+function writeTomlConfig(file, args, preserveExisting) {
 	const { existing, state } = readCodexFile(file);
 
 	if (state.kind === 'malformed') {
@@ -825,6 +847,10 @@ function writeTomlConfig(file, args) {
 	let status;
 	if (state.kind === 'table') {
 		if (tableMatches(state.doc, state.table, args)) return { status: 'already', message: 'already configured' };
+		// Same rule as the JSON writer, and it must be the same rule: a worktree the
+		// user also runs Cellar in has a `[mcp_servers.cellar]` of its own, and Codex
+		// would be re-bridged exactly as Claude Code would.
+		if (preserveExisting) return { status: 'skipped', message: foreignEntryRefusal(file) };
 		next = rewriteTable(state.doc, state.table, args);
 		status = 'updated';
 	} else {
@@ -898,9 +924,18 @@ export function harnessStates(workspace) {
  * was. It also decides IDEMPOTENCE, so a config carrying different args than the
  * caller asked for is rewritten rather than reported `already`.
  *
+ * `opts.preserveExisting` refuses to TAKE OVER an existing `cellar` entry that
+ * says something else, reporting `skipped` with the conflict named instead of
+ * rewriting it — see `foreignEntryRefusal`. It belongs with `opts.args` and only
+ * with it: the every-start repair of the WORKSPACE's own config is what makes the
+ * allow-list a standing instruction ("delete `.mcp.json` and the next `cellar`
+ * puts it back"), so the launch path must keep rewriting a stale entry, while a
+ * config in a checkout Cellar does not run in is far more likely to be someone
+ * else's than stale.
+ *
  * @param {string} name
  * @param {string} dir
- * @param {{ args?: string[] }} [opts]
+ * @param {{ args?: string[], preserveExisting?: boolean }} [opts]
  * @returns {HarnessResult}
  */
 export function configureHarness(name, dir, opts = {}) {
@@ -914,8 +949,10 @@ export function configureHarness(name, dir, opts = {}) {
 		};
 	}
 	const args = opts.args ?? SERVER_ARGS;
+	const preserve = opts.preserveExisting === true;
 	const file = join(dir, h.configPath);
-	const result = h.format === 'json' ? writeJsonConfig(file, args) : writeTomlConfig(file, args);
+	const result =
+		h.format === 'json' ? writeJsonConfig(file, args, preserve) : writeTomlConfig(file, args, preserve);
 	return { ok: true, name: h.name, label: h.label, file, note: h.note, ...result };
 }
 // ---- Allow-list + reconcile ------------------------------------------------

@@ -4,7 +4,12 @@ import { resolve } from 'node:path';
 import { gitCommitAt, listWorktreesAt } from '$lib/server/git';
 import { workspaceRoot } from '$lib/server/fstree';
 import { getNotebookRoot } from '$lib/server/notebook';
-import { isOutsideWorkspace, resolveRootDir, worktreeDeclaration } from '$lib/server/notebookRoot';
+import {
+	enclosesWorkspace,
+	isOutsideWorkspace,
+	resolveRootDir,
+	worktreeDeclaration
+} from '$lib/server/notebookRoot';
 
 /**
  * Which commit each open notebook's CODE ROOT is checked out at — the Git sidebar
@@ -163,9 +168,15 @@ export async function GET({ url }) {
 	// dropped (matched by REALPATH — `git worktree list` realpaths its output while
 	// `ws` is the lexical resolve, and on macOS those differ), because `workspace`
 	// below already reports it and a duplicate row would read as a second checkout.
+	//
+	// A checkout that ENCLOSES the workspace is dropped too, through the ONE shared
+	// rule the resolver refuses on: `git worktree list` walks up, so a workspace that
+	// is a subdirectory of a repo (`cd repo/analysis && cellar`) sees its own PARENT
+	// listed, and offering it a "Use as root" button would offer exactly what a run
+	// there refuses.
 	const wsReal = realpathOrSelf(ws);
 	const wtrees = listWorktreesAt(ws)
-		.filter((w) => !w.bare && realpathOrSelf(w.path) !== wsReal)
+		.filter((w) => !w.bare && realpathOrSelf(w.path) !== wsReal && !enclosesWorkspace(w.path))
 		// A registered worktree can be GONE (`prunable`); `statSync` decides, since
 		// that is what a run of a notebook rooted here would ask. A missing one is
 		// never probed: there is no status to read, and it would spawn three

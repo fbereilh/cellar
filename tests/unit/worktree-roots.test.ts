@@ -450,6 +450,24 @@ describe('the app-wide path guard is NOT what changed', () => {
 		}
 	});
 
+	it('SOURCE GUARD: the ENCLOSURE rule is one function too, defined once and asked', () => {
+		// Its sibling, and the same failure mode: "does this contain the workspace" is a
+		// second containment question the app-wide guard structurally cannot answer (it
+		// is anchored AT the workspace), so it is a rule of our own — which is exactly
+		// the shape that got written three times and disagreed twice. Defined in ONE
+		// module; every other site asks it.
+		const owner = readFileSync(new URL('../../src/lib/server/notebookRoot.ts', import.meta.url), 'utf8');
+		expect(owner).toMatch(/export function enclosesWorkspace/);
+		for (const rel of ['src/lib/server/notebook-root-actions.ts', 'src/routes/api/fs/git/roots/+server.js']) {
+			const src = readFileSync(new URL(`../../${rel}`, import.meta.url), 'utf8');
+			expect(src, rel).not.toMatch(/function enclosesWorkspace/);
+		}
+		// And the surface that OFFERS worktrees really asks it, rather than filtering
+		// the workspace alone as it used to.
+		const route = readFileSync(new URL('../../src/routes/api/fs/git/roots/+server.js', import.meta.url), 'utf8');
+		expect(route).toMatch(/enclosesWorkspace\(w\.path\)/);
+	});
+
 	it('SOURCE GUARD: the root bar is not opened by a merely DETECTED worktree', () => {
 		// The chrome promise: "a workspace that never adopts roots renders exactly what
 		// it always did". `git worktree list` is populated by work that has nothing to
@@ -624,6 +642,84 @@ describe('detection is not authorisation', () => {
 		git(WS, 'worktree', 'remove', '--force', temp);
 		gitmod.invalidateGitCaches();
 		expect(() => rootmod.resolveRootDir('../transient')).toThrow(/not a registered git worktree/i);
+	});
+});
+
+describe('a workspace INSIDE a checkout — the ENCLOSING repo is never a root', () => {
+	// `cd repo/analysis && cellar`: a layout Cellar already recognises elsewhere (the
+	// git-status pathspec is scoped for it). `git worktree list` walks UP to find the
+	// repo, so run from the workspace its FIRST line names the enclosing checkout —
+	// and the only directory the gate filtered was the workspace ITSELF. Admitted, it
+	// roots the kernel ABOVE the tree Cellar is serving and writes agent config into
+	// the workspace's parent.
+	let ENC_ROOT: string;
+	let REPO: string;
+	let SUB: string;
+	let prevWs: string | undefined;
+
+	beforeAll(() => {
+		ENC_ROOT = mkdtempSync(join(tmpdir(), 'cellar-enclosing-'));
+		REPO = join(ENC_ROOT, 'repo');
+		SUB = join(REPO, 'analysis');
+		mkdirSync(SUB, { recursive: true });
+		git(REPO, 'init', '-q', '-b', 'main');
+		writeFileSync(join(SUB, 'probe.py'), "VALUE = 'sub'\n");
+		git(REPO, 'add', '.');
+		git(REPO, 'commit', '-q', '-m', 'init');
+		// A genuine SIBLING worktree as well, so the assertions below distinguish
+		// "the enclosing checkout is refused" from "nothing resolves here at all".
+		git(REPO, 'worktree', 'add', '-q', join(ENC_ROOT, 'pr-9'), '-b', 'pr-9');
+
+		prevWs = process.env.CELLAR_WORKSPACE;
+		process.env.CELLAR_WORKSPACE = SUB;
+		gitmod.invalidateGitCaches();
+		// The premise: git really does report the enclosing checkout from down here.
+		const listed = gitmod.listWorktreesAt(SUB).map((w) => realpathSync(w.path));
+		expect(listed).toContain(realpathSync(REPO));
+	});
+
+	afterAll(() => {
+		process.env.CELLAR_WORKSPACE = prevWs;
+		gitmod.invalidateGitCaches();
+		if (ENC_ROOT) rmSync(ENC_ROOT, { recursive: true, force: true });
+	});
+
+	it('REFUSES it, whether declared as ".." or as the absolute path git printed', () => {
+		for (const declared of ['..', REPO, realpathSync(REPO)]) {
+			expect(() => rootmod.resolveRootDir(declared)).toThrow(/CONTAINS the workspace/);
+		}
+	});
+
+	it('names the enclosure, not a registration it demonstrably HAS', () => {
+		// It IS a registered worktree, so the generic "not a registered git worktree"
+		// refusal would be false — the honesty rule this module is built on.
+		expect(() => rootmod.resolveRootDir('..')).toThrow(/registered worktree of this repository/);
+		expect(() => rootmod.resolveRootDir('..')).not.toThrow(/is not a registered/);
+	});
+
+	it('never OFFERS it — not in the picker, not in the sidebar, not in a refusal', async () => {
+		const { listWorkspaceRoots } = await import('../../src/lib/server/notebook-root-actions');
+		const offered = await listWorkspaceRoots();
+		const real = realpathSync(REPO);
+		expect(offered.map((o) => realpathSync(o.absolute))).not.toContain(real);
+		// …and the SIBLING still is, so the filter is the enclosure and nothing wider.
+		expect(offered.map((o) => o.path)).toContain('../../pr-9');
+
+		const { GET } = await import('../../src/routes/api/fs/git/roots/+server.js');
+		const res = await GET({ url: new URL('http://x/api/fs/git/roots') });
+		const body = await res.json();
+		expect(body.worktrees.map((w: { absolute: string }) => realpathSync(w.absolute))).not.toContain(real);
+		expect(body.worktrees.map((w: { path: string }) => w.path)).toContain('../../pr-9');
+
+		// A refusal must not list it as a candidate either: the message names what IS
+		// available, and offering a directory the very next resolve refuses is worse
+		// than a short list.
+		expect(() => rootmod.resolveRootDir('../nope')).toThrow(/not a registered git worktree/i);
+		try {
+			rootmod.resolveRootDir('../nope');
+		} catch (err) {
+			expect(String((err as Error).message)).not.toContain(REPO);
+		}
 	});
 });
 
