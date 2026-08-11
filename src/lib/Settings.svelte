@@ -14,7 +14,7 @@
 		unknownAffixTokens,
 		unknownTokenWarning
 	} from '$lib/databricksUploadName';
-	import { insertTokenIntoField } from '$lib/uploadTokenField';
+	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
 
 	interface Props {
 		open: boolean;
@@ -158,13 +158,15 @@
 					defaultsNow
 				)
 	);
-	// No remedy clause: the sidebar's copy points at the token buttons directly under
-	// it, and this pane's are elsewhere on screen.
+	// No remedy clause: the sidebar's copy points at the token dropdown beside each of
+	// its fields, and this pane's buttons are elsewhere on screen.
 	const defaultsWarning = $derived(unknownTokenWarning(defaultsUnknown));
 
 	// Which default field a token button writes into, and the elements themselves -
-	// the insertion point is the caret, which only the DOM node knows. Mirrors the
-	// sidebar's own token buttons, down to the shared `insertTokenIntoField` glue.
+	// the insertion point is the caret, which only the DOM node knows. This pane keeps
+	// a row of chips writing into the field last focused, where the sidebar gives each
+	// affix its own dropdown; only the control's LOOK differs, the gesture is the same
+	// shared `insertTokenIntoField` glue.
 	let prefixDefaultEl = $state<HTMLInputElement | null>(null);
 	let postfixDefaultEl = $state<HTMLInputElement | null>(null);
 	let defaultTokenTarget = $state<'prefix' | 'postfix'>('prefix');
@@ -388,8 +390,11 @@
 				     is here and not only in the sidebar: it is about how this PERSON names
 				     uploads, so it belongs beside the other person-level settings. Every
 				     affordance the sidebar's fields grew is repeated because this is where
-				     the pattern is authored - the token buttons and the not-a-token warning
-				     are worth more here than anywhere. -->
+				     the pattern is authored - the token vocabulary and the not-a-token
+				     warning are worth more here than anywhere. The vocabulary stays a row of
+				     chips rather than the sidebar's per-field dropdown: this pane is wide
+				     enough for it, and the narrow sidebar - where seven chips wrapped to
+				     three lines - is what the dropdown was for. -->
 				<div data-testid="upload-defaults-control">
 					<div class="mb-1 text-sm font-medium">Default Databricks upload name</div>
 					<p class="mb-2 text-xs text-base-content/50">
@@ -401,6 +406,7 @@
 							<span class="text-xs text-base-content/60">Prefix</span>
 							<input
 								bind:this={prefixDefaultEl}
+								use:tokenField
 								class="input input-sm w-full font-mono text-xs"
 								value={uploadPrefixDefault}
 								oninput={(e) => setUploadDefault('prefix', (e.currentTarget as HTMLInputElement).value)}
@@ -414,6 +420,7 @@
 							<span class="text-xs text-base-content/60">Postfix</span>
 							<input
 								bind:this={postfixDefaultEl}
+								use:tokenField
 								class="input input-sm w-full font-mono text-xs"
 								value={uploadPostfixDefault}
 								oninput={(e) => setUploadDefault('postfix', (e.currentTarget as HTMLInputElement).value)}

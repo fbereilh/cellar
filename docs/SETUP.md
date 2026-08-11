@@ -278,9 +278,10 @@ does not show that dropped-session warning: the panel says it is reconnecting wh
 the session is rebuilt, and only reports the session as lost if the rebuild
 actually fails.
 
-Once connected, the **Databricks** section shows two cards - a **Cluster** card
+Once connected, the **Databricks** section shows three cards - a **Cluster** card
 (the connection identity plus Switch/Disconnect, or Reconnect when a session
-dropped) and a separate **Runtime** card carrying the **Databricks runtime**
+dropped), an **Upload** card (the notebook upload and its naming fields, described
+below), and a separate **Runtime** card carrying the **Databricks runtime**
 toggle (**off by default**). The runtime setting advertises
 `DATABRICKS_RUNTIME_VERSION` in the kernel so pasted Databricks-notebook code that
 checks whether it is running on Databricks takes its interactive `dbutils.widgets`
@@ -303,13 +304,15 @@ up - and `off` otherwise. Force the setting headless with
 reference below) - the card then says the environment is in control and disables the
 control that override holds, since no toggle or restart can change it.
 
-**Upload the open notebook to your workspace.** While connected, the Cluster card
-carries an **Upload notebook to workspace** button. It copies the notebook you have
-open into your own Databricks folder - `/Users/<you>/<name>`, where the user folder
-comes from the connected identity (`current_user.me()`) rather than anything you
-type, and the name is the file's basename with the extension dropped (optionally
-wrapped in the prefix/postfix described below), since Databricks names a workspace
-notebook by its path segment. It imports in **JUPYTER** format, so the notebook
+**Upload the open notebook to your workspace.** While connected, the **Upload**
+card - its own card between Cluster and Runtime, since this acts on workspace files
+and never on compute - carries an **Upload notebook to workspace** button (the
+connection controls, Switch/Disconnect/Log out, stay on the Cluster card). It copies
+the notebook you have open into your own Databricks folder - `/Users/<you>/<name>`,
+where the user folder comes from the connected identity (`current_user.me()`) rather
+than anything you type, and the name is the file's basename with the extension
+dropped (optionally wrapped in the prefix/postfix described below), since Databricks
+names a workspace notebook by its path segment. It imports in **JUPYTER** format, so the notebook
 lands with its cells intact instead of being flattened into one `.py` script; a
 `.py` jupytext or Databricks-source notebook is uploaded as a proper `.ipynb`,
 built from the live document so it matches what Cellar saves on disk. It
@@ -335,10 +338,16 @@ which expand against the **local** date and are **case-sensitive** (so `{mm}`,
 minutes by every other convention, can never silently mean the month); there are
 deliberately no time-of-day tokens, and anything else in braces is left literal, so
 a typo shows up in the preview instead of vanishing from the name. The braces are
-**required** (a bare `MM` would turn `march` into `03arch`), so the vocabulary is
-listed as clickable buttons under the fields: each one inserts its exact braced
-form at the caret of whichever field you were last in, and its tooltip shows what
-that becomes today. A braced run that is *not* a token is named in a warning under
+**required** (a bare `MM` would turn `march` into `03arch`), so the vocabulary sits
+in a **dropdown beside each field**, listing every token next to what it becomes
+today. Picking one inserts its exact braced form into *that* field - the control
+names the field, rather than writing into whichever one you happened to be in last -
+at the caret, beside what you have typed and never over it, so both affixes stay
+free text. A field you have not typed in yet has no caret you chose, so the token
+appends to the end of it. A short line under the fields keeps saying that the tokens
+exist and that the braces are part of them, since a closed dropdown is not something
+you find before typing; it steps aside when the warning below has something more
+specific to say. A braced run that is *not* a token is named in a warning under
 the preview ("`{mm}` is not a date token - it uploads exactly as written"), because
 a literal left literal in silence reads like a token that has not expanded yet
 rather than one that never will; it stays a warning and never a refusal, since
@@ -363,9 +372,11 @@ so a regular naming pattern survives a relaunch.
 
 **A default prefix/postfix for every project.** If you stamp every upload the same
 way, set it once in **Settings → Default Databricks upload name** instead of once
-per repo. It takes the same tokens, the same token buttons and the same
-not-a-token warning as the sidebar's fields, and it is stored **per user, not per
-project** - in `~/.cellar/settings.json`, beside the instance registry and the host
+per repo. It takes the same tokens and the same not-a-token warning as the sidebar's
+fields - offered here as a row of clickable chips writing into the field you were
+last in, rather than the sidebar's per-field dropdown, this pane having the width for
+them - and it is stored **per user, not per project** - in
+`~/.cellar/settings.json`, beside the instance registry and the host
 venv, so it outlives both the workspace and the relaunch that changes the app port
 (`CELLAR_USER_SETTINGS` redirects that file; see the reference below). The
 direction is fixed and is the point: **a project that has set its own prefix or
