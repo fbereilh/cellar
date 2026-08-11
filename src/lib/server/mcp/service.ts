@@ -57,7 +57,7 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { isSqlCell } from '../../cellLanguage';
+import { isSqlCell, isRawCell, logicalCellType } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { isExportCell, canExportCell, exportCellCount } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
@@ -1374,8 +1374,9 @@ export async function editCell(id: string, source: string, { routeImports: route
 	if (!cell) return null;
 	autoCheckpointBeforeAgentAction(nb);
 	// A SQL cell is a `code` cell on disk, but its source is SQL - never route
-	// "imports" out of it. Pass the LOGICAL type so routeOne's `!== 'code'` guard skips it.
-	const logicalType = isSqlCell(cell) ? 'sql' : cell.cell_type;
+	// "imports" out of it, and the same holds for a raw cell's verbatim text. Pass
+	// the LOGICAL type so routeOne's `!== 'code'` guard skips both.
+	const logicalType = logicalCellType(cell);
 	const routed = routeOne(source, nb, { routeEnabled, cellType: logicalType, skipCellId: id });
 	setSource(id, routed ? routed.source : source, nb);
 	const imports = routed ? await finishImportRouting(nb, routed.importsCellId, routed.added) : null;
@@ -2043,6 +2044,16 @@ export async function runCell(
 		// run has none, so every tab renders it).
 		publish({ type: 'cell:rendered', nb: nbAtCall, cellId: id });
 		return { id: outId, status: 'rendered', note: 'markdown cell rendered (no kernel execution)' };
+	}
+	// A raw cell is verbatim text for a downstream tool - it has no rendered form
+	// either, so unlike markdown there is nothing to do but say so. Named
+	// specifically, or an agent is left guessing why its call did nothing.
+	if (isRawCell(c)) {
+		return {
+			id: outId,
+			status: 'skipped',
+			note: 'raw cell - Cellar never executes raw cells (verbatim text for a downstream tool).'
+		};
 	}
 	if (c.cell_type !== 'code') return { id: outId, status: 'skipped', note: 'not a code cell' };
 	// Pin the notebook now: the UI may focus another one while we wait in the
