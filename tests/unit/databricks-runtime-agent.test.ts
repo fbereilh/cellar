@@ -32,6 +32,12 @@ const hoisted = vi.hoisted(() => ({
 	liveRuntime: { started: true, version: null as string | null },
 	restarts: 0,
 	/**
+	 * Disconnect the notebook mid-restart, which is what makes the pre-restart `bound`
+	 * snapshot stale: `initKernel` re-evaluates it, so the kernel comes back carrying
+	 * nothing while the caller's own snapshot still says connected.
+	 */
+	disconnectDuringRestart: false,
+	/**
 	 * Make the next restart fail, on either side of the epoch bump. `'after-epoch'` is
 	 * the real shape: the real `restartKernel` bumps the epoch in a `finally`, because
 	 * the namespace is gone once the REST restart has been issued, and only then does
@@ -72,7 +78,9 @@ vi.mock('../../src/lib/server/kernel', () => ({
 			throw new Error('websocket reconnect failed');
 		}
 		const inject = await import('../../src/lib/server/ui-state');
-		const bound = (await import('../../src/lib/server/databricks')).databricksBound(A());
+		const db = await import('../../src/lib/server/databricks');
+		if (hoisted.disconnectDuringRestart) await db.disconnect(A());
+		const bound = db.databricksBound(A());
 		hoisted.liveRuntime = {
 			started: true,
 			version: inject.injectDatabricksRuntime(bound) ? inject.databricksRuntimeVersion() : null
@@ -107,6 +115,7 @@ beforeEach(async () => {
 	hoisted.liveRuntime = { started: true, version: null };
 	hoisted.restarts = 0;
 	hoisted.restartThrows = null;
+	hoisted.disconnectDuringRestart = false;
 	delete process.env.CELLAR_DATABRICKS_RUNTIME;
 	delete process.env.CELLAR_DATABRICKS_RUNTIME_VERSION;
 	ui.setUiState({ [keys.DBX_RUNTIME_KEY]: null, [keys.DBX_RUNTIME_VERSION_KEY]: null });
@@ -245,6 +254,46 @@ describe('databricks_runtime applies the advertisement', () => {
 		expect(r.note).not.toMatch(/nothing is advertised yet/i);
 	});
 
+	// The same defect one layer down: the note used to branch on the `bound` snapshot
+	// taken BEFORE the restart, while `initKernel` re-evaluates it DURING one. A
+	// disconnect landing in that window made the sentence assert the opposite of the
+	// `runtime` block sitting beside it in the same payload.
+	it('never claims IS_DATABRICKS reads true when the resulting block says advertised:false', async () => {
+		await connectA();
+		hoisted.disconnectDuringRestart = true;
+
+		const r = await dbx.setRuntimeAdvertisement({ enable: true, nb: A() });
+		expect(r.kernel_restarted).toBe(true);
+		expect(r.runtime.advertised).toBe(false);
+		expect(r.runtime.version).toBe(null);
+		// The sentence must agree with the block: no "reads true", and above all no
+		// interpolated null where a version would go.
+		expect(r.note).not.toMatch(/IS_DATABRICKS reads true/);
+		expect(r.note).not.toMatch(/"null"/);
+		expect(r.note).toMatch(/IS_DATABRICKS now reads false/);
+		expect(r.note).toMatch(/RESTARTED/);
+	});
+
+	// A restart is not only a namespace: it drops this notebook's queued runs and
+	// aborts the running one, and the session it rebuilds is not bound yet when this
+	// returns. Both were invisible on this surface.
+	it('names the dropped queue and the still-rebuilding session whenever it restarts', async () => {
+		await connectA();
+		const r = await dbx.setRuntimeAdvertisement({ enable: true, nb: A() });
+		expect(r.kernel_restarted).toBe(true);
+		expect(r.note).toMatch(/queued runs were DROPPED/);
+		// It must point at what OBSERVES the rebuild, and must not promise it succeeds.
+		expect(r.note).toMatch(/rebuilding it in the background/);
+		expect(r.note).toMatch(/databricks_status/);
+		expect(r.note).toMatch(/NOT bound yet/);
+
+		// …and a run that restarted nothing claims none of it.
+		const again = await dbx.setRuntimeAdvertisement({ enable: true, nb: A() });
+		expect(again.kernel_restarted).toBe(false);
+		expect(again.note).not.toMatch(/DROPPED/);
+		expect(again.note).not.toMatch(/rebuilding/);
+	});
+
 	// A restart that reaches the kernel and then fails to come back has ALREADY
 	// destroyed the namespace (`restartKernel` bumps the epoch in a `finally` for
 	// exactly that reason), so a failure that reported only "it failed" would leave the
@@ -272,7 +321,11 @@ describe('databricks_runtime applies the advertisement', () => {
 		expect(ui.injectDatabricksRuntime(true)).toBe(true);
 	});
 
-	it('says the namespace is INTACT when the restart failed before tearing anything down', async () => {
+	// The mirror case, and the one that must not overclaim in the OTHER direction: the
+	// namespace really did survive, but `restartKernel` drops the pending queue and
+	// force-aborts the active run BEFORE it can throw, so "nothing was torn down" was
+	// never true even here.
+	it('says the namespace is INTACT when the restart failed, without claiming nothing was torn down', async () => {
 		await connectA();
 		hoisted.restartThrows = 'before-epoch';
 
@@ -283,6 +336,9 @@ describe('databricks_runtime applies the advertisement', () => {
 		expect(err?.kernelRestarted).toBe(false);
 		expect(err?.message).toMatch(/intact/i);
 		expect(err?.message).not.toMatch(/GONE/);
+		expect(err?.message).not.toMatch(/nothing was torn down/i);
+		expect(err?.message).toMatch(/queued runs were DROPPED/);
+		expect(err?.message).toMatch(/active run was aborted/i);
 		expect(err?.message).toMatch(/websocket reconnect failed/);
 	});
 
