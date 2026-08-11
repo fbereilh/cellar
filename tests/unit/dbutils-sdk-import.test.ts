@@ -320,6 +320,50 @@ out['bound_same_instance'] = imported is _kept_shim
 		expect(out.bound_type).toBe('_CellarDbUtils');
 		expect(out.bound_same_instance).toBe(true);
 	});
+
+	it('declines to wrap a loader it cannot faithfully proxy, rather than breaking the import', () => {
+		// importlib feature-detects on the loader it is HANDED, which is the wrapper -
+		// so wrapping a legacy `load_module`-only loader would make it take an
+		// `exec_module` path the real loader does not have, and the import would fail
+		// outright. That trades a recoverable discarded-value bug for an unimportable
+		// module. Declining costs only the rebind for that exotic case.
+		const out = run(`
+${INSTALL}
+
+import sys
+from importlib.machinery import ModuleSpec
+
+class _LegacyLoader:
+    def load_module(self, fullname):
+        raise ImportError('never reached')
+
+_finder = [f for f in sys.meta_path if getattr(f, '_cellar_sdk_runtime_finder', False) is True][0]
+
+class _LegacyFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != '${SDK_RUNTIME_MODULE}':
+            return None
+        return ModuleSpec(fullname, _LegacyLoader())
+
+sys.meta_path.insert(1, _LegacyFinder())
+out['declined_legacy_loader'] = _finder.find_spec('${SDK_RUNTIME_MODULE}') is None
+
+# ...while an ordinary loader is still wrapped, so the fix itself is not disabled
+sys.meta_path.remove(sys.meta_path[1])
+_spec = _finder.find_spec('${SDK_RUNTIME_MODULE}')
+out['wrapped_normal_loader'] = type(_spec.loader).__name__ == '_CellarSdkRuntimeLoader'
+
+# and the wrapper's create_module delegates only when the inner loader has one
+class _NoCreate:
+    def exec_module(self, module):
+        pass
+
+out['create_module_without_inner'] = _CellarSdkRuntimeLoader(_NoCreate(), lambda m: None).create_module(None)
+`);
+		expect(out.declined_legacy_loader).toBe(true);
+		expect(out.wrapped_normal_loader).toBe(true);
+		expect(out.create_module_without_inner).toBe(null);
+	});
 });
 
 describe('dbutils SDK import path - detect and report', () => {
@@ -348,7 +392,6 @@ out['probe'] = json.loads(_line[len('${SENTINEL}'):])
 	it('reports `not_imported` before any cell imports the SDK', () => {
 		const p = probe(INSTALL);
 		expect(p.ok).toBe(true);
-		expect(p.shim).toBe(true);
 		expect(p.sdk_imported).toBe(false);
 		expect(classifySdkDbutils(p)).toBe('not_imported');
 	});
@@ -385,8 +428,39 @@ _mod.dbutils = _mod._SdkDbUtils()
 		// namespace has no shim at all, rather than dying and reporting nothing.
 		const p = probe('');
 		expect(p.ok).toBe(true);
-		expect(p.shim).toBe(false);
 		expect(classifySdkDbutils(p)).toBe('not_imported');
+	});
+
+	it('reports `shim` when the module holds one even though the bare name was rebound', () => {
+		// The warning is about the IMPORT PATH, so what the bare global happens to hold
+		// now says nothing about it. A user pointing `dbutils` at the SDK's own object
+		// for one cell has not made the import path discard anything.
+		const p = probe(`
+${INSTALL}
+import databricks.sdk.runtime as _mod
+dbutils = _mod._SdkDbUtils()
+`);
+		expect(p.sdk_imported).toBe(true);
+		expect(p.sdk_is_shim).toBe(true);
+		expect(classifySdkDbutils(p)).toBe('shim');
+	});
+
+	it('reports `unknown`, NOT `foreign`, after a namespace clear left a working binding', () => {
+		// `%reset -f` takes the shim's class and the bare `dbutils` with it while the
+		// finder keeps the module bound to a fully working shim (pinned by the rebind
+		// suite above). With nothing left to recognize a shim BY, the honest answer is
+		// "could not determine" - reporting `foreign` here would tell the user their
+		// widget values are being discarded when every one of them is preserved.
+		const p = probe(`
+${INSTALL}
+from databricks.sdk.runtime import dbutils as _imported
+
+for _n in [n for n in list(globals()) if n.startswith(('_Cellar', '_CELLAR', '_cellar')) or n == 'dbutils']:
+    del globals()[_n]
+`);
+		expect(p.sdk_imported).toBe(true);
+		expect(p.sdk_is_shim).toBe(null);
+		expect(classifySdkDbutils(p)).toBe('unknown');
 	});
 
 	it('leaves the namespace clean (the probe is bookkeeping, not a user cell)', () => {
@@ -472,8 +546,15 @@ describe('classifySdkDbutils - the pure rule', () => {
 		expect(classifySdkDbutils('nope')).toBe('unknown');
 		expect(classifySdkDbutils({})).toBe('unknown');
 		expect(classifySdkDbutils({ ok: false, message: 'boom' })).toBe('unknown');
-		// a truthy-but-not-true flag is not a confirmation either
-		expect(classifySdkDbutils({ ok: true, sdk_imported: true, sdk_is_shim: 1 })).toBe('foreign');
+		// `foreign` needs an explicit `false`, never merely the absence of a `true`:
+		// the probe reports `null` for a reading it could not take (a cleared namespace
+		// has nothing left to recognize a shim by), and a non-boolean is no reading at
+		// all - reading either as the defect is what would warn over a healthy kernel.
+		expect(classifySdkDbutils({ ok: true, sdk_imported: true, sdk_is_shim: null })).toBe('unknown');
+		expect(classifySdkDbutils({ ok: true, sdk_imported: true })).toBe('unknown');
+		expect(classifySdkDbutils({ ok: true, sdk_imported: true, sdk_is_shim: 1 })).toBe('unknown');
+		// ...but a real `false` still reports the defect - the whole point of the probe
+		expect(classifySdkDbutils({ ok: true, sdk_imported: true, sdk_is_shim: false })).toBe('foreign');
 	});
 
 	it('names the module and the remedy in the shared warning', () => {

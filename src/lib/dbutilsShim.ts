@@ -27,15 +27,16 @@ export const SDK_RUNTIME_MODULE = 'databricks.sdk.runtime';
 /**
  * Which `dbutils` the SDK import path resolves to in a live kernel:
  *
- *   - `shim`         - it IS this kernel's shim (the very instance the bare global
- *                      holds), so both paths share one value-preserving registry;
+ *   - `shim`         - the module's `dbutils` IS a Cellar shim, so both paths share
+ *                      one value-preserving registry;
  *   - `foreign`      - the module is imported and its `dbutils` is something else,
  *                      so values entered on that path are discarded. The ONE state
  *                      worth warning about;
  *   - `not_imported` - the module has not been imported, so nothing can be wrong yet;
  *   - `unknown`      - not checked, or not determinable (no kernel, a busy kernel, a
- *                      failed probe, no advertised runtime). NEVER a warning: a
- *                      state nobody verified may not be reported as a defect.
+ *                      failed probe, no advertised runtime, or a namespace clear that
+ *                      left nothing to recognize a shim by). NEVER a warning: a state
+ *                      nobody verified may not be reported as a defect.
  */
 export type SdkDbutilsState = 'shim' | 'foreign' | 'not_imported' | 'unknown';
 
@@ -43,14 +44,17 @@ export type SdkDbutilsState = 'shim' | 'foreign' | 'not_imported' | 'unknown';
  * The kernel probe's payload → the reported state. Pure, so the rule both
  * surfaces render is testable without a kernel. Anything unrecognized reads
  * `unknown`: over-reporting a defect nobody observed is the one direction this
- * must not fail in.
+ * must not fail in - so `foreign` needs an explicit `false`, never merely the
+ * absence of a `true` (the probe reports `null` for a reading it could not take).
  */
 export function classifySdkDbutils(probe: unknown): SdkDbutilsState {
 	if (!probe || typeof probe !== 'object') return 'unknown';
 	const p = probe as Record<string, unknown>;
 	if (p.ok !== true) return 'unknown';
 	if (p.sdk_imported !== true) return 'not_imported';
-	return p.sdk_is_shim === true ? 'shim' : 'foreign';
+	if (p.sdk_is_shim === true) return 'shim';
+	if (p.sdk_is_shim === false) return 'foreign';
+	return 'unknown';
 }
 
 /**

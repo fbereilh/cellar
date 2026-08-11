@@ -21,7 +21,7 @@
 	import { getUserSettingText, onUserSettingsChange } from '$lib/userSettings';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import { normalizeDatabricksHost } from '$lib/databricksHost';
-	import { SDK_DBUTILS_FOREIGN_WARNING } from '$lib/dbutilsShim';
+	import { SDK_DBUTILS_FOREIGN_WARNING, type SdkDbutilsState } from '$lib/dbutilsShim';
 	import {
 		PROFILE_REAUTH_CODE,
 		REAUTH_COMMAND_HEAD,
@@ -143,7 +143,7 @@
 			 * like it works while doing nothing. Anything else - including a state the
 			 * server could not determine (`unknown`) - is silent.
 			 */
-			sdkDbutils?: 'shim' | 'foreign' | 'not_imported' | 'unknown';
+			sdkDbutils?: SdkDbutilsState;
 		};
 	}
 	/** What `POST /api/databricks/logout` reports, so the note can be honest about what was cleared. */

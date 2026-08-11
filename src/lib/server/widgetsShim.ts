@@ -270,12 +270,24 @@ class _CellarSdkRuntimeLoader:
     # \`from ... import dbutils\` that triggered the import reads the attribute.
     # Python has no built-in post-import hook (PEP 369 was withdrawn), so wrapping
     # the loader is the mechanism; everything else is delegated untouched.
+    #
+    # STRICTLY NO WORSE THAN NO WRAPPER. importlib feature-detects on the loader it
+    # is handed, which is now this wrapper rather than the real one - so a method
+    # defined here unconditionally makes importlib take a path the inner loader may
+    # not support, and the delegation then raises AttributeError and the import
+    # FAILS. That would turn a discarded-widget-value bug (recoverable) into an
+    # unimportable module (not), against this module's own best-effort contract. So
+    # \`create_module\` is guarded, and the finder declines to wrap at all when the
+    # inner loader has no \`exec_module\` (a legacy \`load_module\`-only loader).
     def __init__(self, inner, bind):
         self._inner = inner
         self._bind = bind
 
     def create_module(self, spec):
-        return self._inner.create_module(spec)
+        _create = getattr(self._inner, 'create_module', None)
+        # None means "use default module creation" - what importlib does for an
+        # inner loader that defines no create_module of its own.
+        return _create(spec) if _create is not None else None
 
     def exec_module(self, module):
         self._inner.exec_module(module)
@@ -323,6 +335,11 @@ class _CellarSdkRuntimeFinder:
             finally:
                 self._busy = False
             if _spec is None or getattr(_spec, 'loader', None) is None:
+                return None
+            # Only wrap a loader this wrapper can faithfully proxy. A legacy
+            # \`load_module\`-only loader is left alone: declining costs the rebind
+            # for that exotic case, substituting would cost the import itself.
+            if not hasattr(_spec.loader, 'exec_module'):
                 return None
             _spec.loader = self._loader_cls(_spec.loader, self._bind)
             return _spec
@@ -405,24 +422,36 @@ del _cellar_install_widgets
 /**
  * Kernel-side probe for the above. Self-contained on purpose - it looks every
  * shim name up through `globals()` rather than calling into the shim, so it still
- * answers honestly when the shim install itself failed (`shim: false`) instead of
- * dying with a NameError. Prints ONE `sentinel`-prefixed JSON line, like the
- * Databricks `PROBE`/`PING_CODE` it is run alongside, and cleans up after itself.
+ * answers honestly when the shim install itself failed instead of dying with a
+ * NameError. Prints ONE `sentinel`-prefixed JSON line, like the Databricks
+ * `PROBE`/`PING_CODE` it is run alongside, and cleans up after itself.
+ *
+ * `sdk_is_shim` answers EXACTLY what the warning claims - "the module's `dbutils`
+ * is not a Cellar shim" - so it is an `isinstance` test on that attribute alone,
+ * never a comparison against whatever the bare global happens to hold now. Those
+ * two diverge in both directions: after a `%reset -f` the bare name and the class
+ * are gone from the namespace while the surviving finder still binds the module to
+ * a fully working shim, and a user rebinding `dbutils = w.dbutils` moves the bare
+ * name without touching the import path. Reporting either as `foreign` would tell
+ * the user their widget values are being discarded when they are not.
+ *
+ * When the class itself is gone (a cleared namespace) nothing here can decide
+ * whether an object IS a shim, so it reports `None` - which the classifier reads as
+ * `unknown`, and `unknown` never warns.
  */
 export function dbutilsBindingProbeCode(sentinel: string): string {
 	return `
 import json as _cellar_json, sys as _cellar_sys
 
 def _cellar_dbutils_binding():
-    _g = globals()
-    _cls = _g.get('_CellarDbUtils')
-    _db = _g.get('dbutils')
-    _is_shim = _cls is not None and isinstance(_db, _cls)
+    _cls = globals().get('_CellarDbUtils')
     _mod = _cellar_sys.modules.get('${SDK_RUNTIME_MODULE}')
     if _mod is None:
-        return {'ok': True, 'shim': _is_shim, 'sdk_imported': False, 'sdk_is_shim': None}
-    return {'ok': True, 'shim': _is_shim, 'sdk_imported': True,
-            'sdk_is_shim': _is_shim and getattr(_mod, 'dbutils', None) is _db}
+        return {'ok': True, 'sdk_imported': False, 'sdk_is_shim': None}
+    if _cls is None:
+        return {'ok': True, 'sdk_imported': True, 'sdk_is_shim': None}
+    return {'ok': True, 'sdk_imported': True,
+            'sdk_is_shim': isinstance(getattr(_mod, 'dbutils', None), _cls)}
 
 try:
     print('${sentinel}' + _cellar_json.dumps(_cellar_dbutils_binding()))

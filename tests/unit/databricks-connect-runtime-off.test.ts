@@ -36,9 +36,11 @@ const hoisted = vi.hoisted(() => ({
 	 * What the kernel answers the `dbutils` binding probe with. Default: the shim is
 	 * installed and no cell has imported `databricks.sdk.runtime` yet.
 	 */
-	binding: { ok: true, shim: true, sdk_imported: false, sdk_is_shim: null } as Record<string, unknown>,
+	binding: { ok: true, sdk_imported: false, sdk_is_shim: null } as Record<string, unknown>,
 	/** How many times the kernel was asked that question - the probe must stay bounded. */
 	bindingProbes: 0,
+	/** Makes the binding probe FAIL, so the failure path can be exercised too. */
+	bindingThrows: false,
 	/** The live kernel's status, so a BUSY kernel can be exercised. */
 	kernelStatus: 'idle' as string
 }));
@@ -52,6 +54,7 @@ vi.mock('../../src/lib/server/kernel', () => ({
 		else if (code.includes('_cellar_dbx_disconnect')) payload = { ok: true, stopped: true };
 		else if (code.includes('_cellar_dbutils_binding')) {
 			hoisted.bindingProbes++;
+			if (hoisted.bindingThrows) throw new Error('kernel unreachable');
 			payload = hoisted.binding;
 		}
 		else payload = { ok: true };
@@ -90,8 +93,9 @@ beforeEach(async () => {
 	hoisted.session = 1;
 	hoisted.connect = { ok: true, host: 'https://test.databricks.com', spark_version: '3.5.0' };
 	hoisted.liveRuntime = { started: true, version: null };
-	hoisted.binding = { ok: true, shim: true, sdk_imported: false, sdk_is_shim: null };
+	hoisted.binding = { ok: true, sdk_imported: false, sdk_is_shim: null };
 	hoisted.bindingProbes = 0;
+	hoisted.bindingThrows = false;
 	hoisted.kernelStatus = 'idle';
 	// A clean preference store for every case: the whole point is what a connect
 	// leaves behind, so a leftover opt-in from a previous case would mask it.
@@ -223,8 +227,8 @@ describe('the reported runtime state is the KERNEL, not the preference', () => {
  * reading from another epoch says nothing about this one.
  */
 describe('the SDK-import dbutils binding is reported, never left silent', () => {
-	const FOREIGN = { ok: true, shim: true, sdk_imported: true, sdk_is_shim: false };
-	const BOUND = { ok: true, shim: true, sdk_imported: true, sdk_is_shim: true };
+	const FOREIGN = { ok: true, sdk_imported: true, sdk_is_shim: false };
+	const BOUND = { ok: true, sdk_imported: true, sdk_is_shim: true };
 
 	async function connectWith(session: number, binding: Record<string, unknown>, version = '15.4') {
 		hoisted.session = session;
@@ -303,6 +307,34 @@ describe('the SDK-import dbutils binding is reported, never left silent', () => 
 		await Promise.all([dbx.getStatus(A()), dbx.getStatus(A())]);
 		await dbx.getStatus(A());
 		expect(hoisted.bindingProbes).toBe(1);
+	});
+
+	it('bounds a FAILING probe the same way, so a wedged kernel is asked once per window', async () => {
+		// The round-trip is unbounded from `sdkDbutilsState`'s point of view: a wedged
+		// kernel settles only via the watchdog's probe/strike path (~90-210s), and this
+		// is awaited inside `getStatus`. Single-flight collapses concurrent readers but
+		// not sequential ones, so an uncached failure made EVERY later status read pay
+		// that again. The cached failure still reads `unknown` and still never warns.
+		hoisted.bindingThrows = true;
+		await connectWith(18, FOREIGN);
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+		expect((await dbx.agentStatus(A())) as Record<string, unknown>).not.toHaveProperty(
+			'dbutils_widgets_warning'
+		);
+		expect(hoisted.bindingProbes).toBe(1);
+	});
+
+	it('a cached failure never shadows the next genuine reading in a new session', async () => {
+		hoisted.bindingThrows = true;
+		await connectWith(19, FOREIGN);
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('unknown');
+		// A restart re-runs the shim installer, so the epoch moves and the cached
+		// failure - which was about the previous namespace - cannot answer for it.
+		hoisted.bindingThrows = false;
+		hoisted.session = 20;
+		expect((await dbx.getStatus(A())).runtime.sdkDbutils).toBe('foreign');
+		expect(hoisted.bindingProbes).toBe(2);
 	});
 
 	it('reads an unusable answer as unknown rather than as a defect', async () => {

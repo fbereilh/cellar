@@ -1914,7 +1914,14 @@ async function sdkDbutilsState(abs: string): Promise<SdkDbutilsState> {
 			return state;
 		} catch {
 			// A kernel that could not be reached, an error output, an unparseable
-			// reply: all of them mean we did not learn anything.
+			// reply: all of them mean we did not learn anything. Cached under the SAME
+			// TTL as a real reading, because the round-trip is unbounded from here - a
+			// wedged kernel settles only via the watchdog's probe/strike path (~90-210s)
+			// and this is awaited inside `getStatus`, while single-flight collapses
+			// concurrent readers but not sequential ones, so an uncached failure made
+			// EVERY later status read pay that again. `unknown` still never warns, and
+			// the TTL is what keeps it from shadowing a later genuine reading.
+			dbutilsBindings.set(abs, { session, checkedAt: Date.now(), state: 'unknown' });
 			return 'unknown';
 		} finally {
 			dbutilsBindingInFlight.delete(abs);
