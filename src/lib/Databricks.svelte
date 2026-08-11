@@ -130,6 +130,8 @@
 		runtime?: {
 			kernelStarted: boolean;
 			liveVersion: string | null;
+			/** The STORED on/off preference - what the toggle shows; see its re-seed effect. */
+			preference?: boolean;
 			envForced?: boolean | null;
 			versionEnvForced?: string | null;
 		};
@@ -266,6 +268,36 @@
 		// The upload affixes are seeded by their own effect (`seedUploadAffixes`), not
 		// here: a one-shot mount read is exactly what left a default set in Settings
 		// invisible to a panel that was already open.
+	});
+
+	/**
+	 * Re-seed the toggle from the SERVER's copy of the preference whenever a status
+	 * lands, the same lesson as `seedUploadAffixes` one field over: a one-shot mount
+	 * read is only correct while this panel is the sole writer, and it is not - the
+	 * `databricks_runtime` MCP tool writes the same preference server-side (as would a
+	 * second Cellar instance, or a hand-edited store).
+	 *
+	 * A stale toggle here is destructive rather than cosmetic. `toggleRuntime` applies
+	 * `!runtimeOn`, so a toggle still showing OFF over an already-ON preference
+	 * restarts the kernel, clears every variable, and leaves the state exactly where it
+	 * was - the "a control that cannot do its work must not claim it did" defect the
+	 * card's env-forced and no-notebook states exist to avoid.
+	 *
+	 * Guarded on nothing being in flight: `applyRuntime` sets `runtimeOn` optimistically
+	 * before its awaited write lands, so a status read resolving inside that window
+	 * would bounce the toggle back to the value being replaced. Deliberately NOT
+	 * extended to the version input - that binds a field the user may be typing in, and
+	 * its stored value is written per keystroke, so seeding it would clobber an edit in
+	 * progress. A version an agent set therefore still shows stale in the input until
+	 * reload (the card's live pill and `runtimeEffectiveVersion` stay honest), which is
+	 * a display gap rather than a namespace-clearing click.
+	 */
+	$effect(() => {
+		const stored = status?.runtime?.preference;
+		if (typeof stored !== 'boolean' || runtimeApplying || busy) return;
+		untrack(() => {
+			runtimeOn = stored;
+		});
 	});
 
 	/**

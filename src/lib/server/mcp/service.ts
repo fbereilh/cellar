@@ -45,7 +45,7 @@ import { resolveRootDir } from '../notebookRoot';
 import { ROOTS_DIR } from '../../notebookRoot';
 import { restartKernel, interruptKernel, kernelStatus, kernelSession, currentSessionId } from '../kernel';
 import { kernelState, listVariables as _listVariables, inspectVariable as _inspectVariable } from '../inspect';
-import { agentStatus as databricksStatus, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable, reconnectSession as databricksReconnect, connectCluster as databricksConnect, listClustersForAgent as databricksClusters } from '../databricks';
+import { agentStatus as databricksStatus, agentRuntimeBlock, connectionStatus as databricksConnection, forAgent as databricksCatalog, previewTable, reconnectSession as databricksReconnect, connectCluster as databricksConnect, setRuntimeAdvertisement as databricksSetRuntime, listClustersForAgent as databricksClusters } from '../databricks';
 import { publish } from '../events';
 import { enqueueRun, queuesByNotebook, queuePosition, queueStateFor } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
@@ -255,7 +255,7 @@ function notebookNameToPath(rel: string): string {
  *
  *   - Cellar cannot CREATE a `.py` notebook. `jpFormat` (which format to write it
  *     back in) is recorded by `loadDoc` when it PARSES the file, so a doc invented
- *     for a path with no file would persist as nbformat JSON into a `.py` — a
+ *     for a path with no file would persist as nbformat JSON into a `.py` - a
  *     corrupt file, silently. Missing is an error naming the way to get one.
  *   - Being a `.py` does not make a file a notebook. A plain module has no cell
  *     structure; opening one would hand the agent a document whose cells are an
@@ -912,7 +912,14 @@ export async function getNotebookMap(nb?: string | null) {
 		// workspace root, the default). Not a display setting: it decides which
 		// checkout the code you run comes from, so it rides beside `kernel`.
 		root: view.root,
-		databricks: { connected: dbx.connected === true },
+		// `runtime` comes from the SAME builder `databricks_status`/`kernel_state`
+		// use, so the three surfaces cannot describe one kernel differently, and it
+		// is cheap enough for this hot structural read by construction (a Map lookup
+		// + an env read - no kernel boot, no probe). It rides here even with no
+		// session because that is the case it is FOR: a notebook whose code gates on
+		// `IS_DATABRICKS` looks identical either way, and this is the only thing that
+		// says which branch it is taking.
+		databricks: { connected: dbx.connected === true, runtime: agentRuntimeBlock(nb) },
 		display: {
 			header_numbering: view.headerNumbering,
 			report_view: view.hideAllCode,
@@ -994,6 +1001,7 @@ export const databricks = {
 	reconnect: (nb?: string | null) => databricksReconnect(nb),
 	connect: (opts: { clusterId: string; clusterName?: string | null; profile?: string | null; host?: string | null; nb?: string | null }) =>
 		databricksConnect(opts),
+	setRuntime: (opts: { enable: boolean; version?: string | null; nb?: string | null }) => databricksSetRuntime(opts),
 	listClusters: (sel: { profile?: string | null; host?: string | null }, nb?: string | null) => databricksClusters(nb, sel),
 	catalogs: (nb?: string | null) => databricksCatalog.catalogs(nb),
 	schemas: (catalog: string, nb?: string | null) => databricksCatalog.schemas(catalog, nb),

@@ -53,7 +53,7 @@ vi.mock('../../src/lib/server/dataflow', async () => {
 });
 
 // The databricks module, mocked to COUNT which status path each tool takes.
-const db = vi.hoisted(() => ({ agent: 0, conn: 0 }));
+const db = vi.hoisted(() => ({ agent: 0, conn: 0, runtime: 0 }));
 vi.mock('../../src/lib/server/databricks', () => ({
 	// The LIVE-probe path — must NOT be hit by the map.
 	agentStatus: async () => {
@@ -64,6 +64,13 @@ vi.mock('../../src/lib/server/databricks', () => ({
 	connectionStatus: () => {
 		db.conn++;
 		return { connected: true };
+	},
+	// The runtime block the map also carries: cheap and synchronous by contract (a
+	// Map lookup + an env read), so it belongs on this hot path - counted here so a
+	// future version that started probing would show up as a live call above.
+	agentRuntimeBlock: () => {
+		db.runtime++;
+		return { advertised: false, version: null, forced_by_env: false };
 	},
 	forAgent: { catalogs: vi.fn(), schemas: vi.fn(), tables: vi.fn() },
 	previewTable: vi.fn()
@@ -91,14 +98,19 @@ beforeAll(async () => {
 beforeEach(() => {
 	db.agent = 0;
 	db.conn = 0;
+	db.runtime = 0;
 });
 
 describe('get_notebook_map — cached databricks status', () => {
 	it('uses connectionStatus (cached), NOT the live agentStatus probe', async () => {
-		const map = (await svc.getNotebookMap(abs())) as { databricks: { connected: boolean } };
+		const map = (await svc.getNotebookMap(abs())) as { databricks: Record<string, unknown> };
 		expect(db.conn).toBeGreaterThanOrEqual(1); // read the cached connection
 		expect(db.agent).toBe(0); // never fired the live SELECT 1 liveness probe
-		expect(map.databricks).toEqual({ connected: true }); // field still meaningful
+		expect(db.runtime).toBe(1); // …and the runtime block came from the cheap builder
+		expect(map.databricks).toEqual({
+			connected: true,
+			runtime: { advertised: false, version: null, forced_by_env: false }
+		}); // fields still meaningful
 	});
 
 	it('repeated structural map reads never trigger a live probe', async () => {
