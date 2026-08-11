@@ -343,6 +343,67 @@ describe('failure is REPORTED, never thrown', () => {
 		}
 	});
 
+	it('TAKES THE EXCLUDE BACK when the config was not written', () => {
+		// The exclude goes in FIRST (so the config is never momentarily untracked), which
+		// means it is already in place before the writer says whether it will write
+		// anything. When it REFUSES — here an existing `.mcp.json` it will not edit,
+		// i.e. the user's OWN file — the entry would be left ignoring a file Cellar never
+		// wrote; and since it lives in the repo-COMMON exclude, that hides their root
+		// `.mcp.json` from `git status` in every working tree of the clone and makes
+		// `git add` refuse it as ignored. Cellar must not leave an ignore rule behind for
+		// a file it did not write.
+		mkdirSync(join(WS, '.git', 'info'), { recursive: true });
+		// A file that already has content, including an entry of the user's own: byte
+		// identity is what proves only OUR bytes came back out.
+		const before = '# git ls-files --others --exclude-from=.git/info/exclude\nbuild/\n';
+		writeFileSync(EXCLUDE, before);
+		writeFileSync(join(SIBLING, '.mcp.json'), 'not json at all\n');
+		try {
+			const r = mod.configureAdoptedWorktree(SIBLING);
+			expect(r?.status).toBe('skipped');
+			// Byte-identical, not merely "no `.mcp.json` line": the revert splices out the
+			// exact slice it appended, so the user's file is untouched down to its newlines.
+			expect(readFileSync(EXCLUDE, 'utf8')).toBe(before);
+			// And git agrees — the user's own file is visible again, which is the whole point.
+			expect(() => git(SIBLING, 'check-ignore', '-q', '.mcp.json')).toThrow();
+			expect(git(SIBLING, 'status', '--porcelain', '-uall')).toContain('.mcp.json');
+		} finally {
+			rmSync(join(SIBLING, '.mcp.json'), { force: true });
+		}
+	});
+
+	it('never removes an exclude entry it did not add', () => {
+		// The revert is scoped to the bytes THIS call appended. An entry the user (or an
+		// earlier adoption) already had is not ours to take back, and a skipped write
+		// must not delete it.
+		mkdirSync(join(WS, '.git', 'info'), { recursive: true });
+		const before = '# mine\n/.mcp.json\n';
+		writeFileSync(EXCLUDE, before);
+		writeFileSync(join(SIBLING, '.mcp.json'), 'not json at all\n');
+		try {
+			expect(mod.configureAdoptedWorktree(SIBLING)?.status).toBe('skipped');
+			expect(readFileSync(EXCLUDE, 'utf8')).toBe(before);
+			expect(git(SIBLING, 'check-ignore', '-v', '.mcp.json')).toContain('info/exclude');
+		} finally {
+			rmSync(join(SIBLING, '.mcp.json'), { force: true });
+		}
+	});
+
+	it('KEEPS an exclude it just re-added on the idempotent path — the config IS there', () => {
+		// `already` is not a refusal: Cellar's config is on disk, so ignoring it is still
+		// correct. The case that distinguishes keeping from reverting is a re-adoption
+		// whose exclude entry was deleted by hand — this call appends it, so there is
+		// something to take back, and taking it back would re-dirty the very checkout the
+		// mitigation exists for.
+		mod.configureAdoptedWorktree(SIBLING);
+		writeFileSync(EXCLUDE, '# emptied by hand\n');
+		const again = mod.configureAdoptedWorktree(SIBLING);
+		expect(again?.status).toBe('already');
+		expect(readFileSync(EXCLUDE, 'utf8')).toContain('/.mcp.json');
+		expect(git(SIBLING, 'check-ignore', '-v', '.mcp.json')).toContain('info/exclude');
+		expect(git(SIBLING, 'status', '--porcelain', '-uall').trim()).toBe('');
+	});
+
 	it('a SKIPPED harness still speaks, and its reason is never summarised away', () => {
 		// The reason is the actionable part: an aggregate that reported a count claimed
 		// every harness was configured and discarded the one explanation worth having.

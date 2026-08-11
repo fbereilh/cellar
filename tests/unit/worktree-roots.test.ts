@@ -243,6 +243,8 @@ describe('the two-namespace rule, over a SYMLINKED workspace', () => {
 	let LINK_WS: string;
 	/** The path git reports for the sibling worktree — realpath'd, as git always is. */
 	let GIT_SIBLING: string;
+	/** The path git reports for a worktree that lives INSIDE the workspace, under `roots/`. */
+	let GIT_INSIDE: string;
 	let prevWs: string | undefined;
 
 	beforeAll(() => {
@@ -258,17 +260,23 @@ describe('the two-namespace rule, over a SYMLINKED workspace', () => {
 		git(wsReal, 'add', 'probe.py');
 		git(wsReal, 'commit', '-q', '-m', 'init');
 		git(wsReal, 'worktree', 'add', '-q', join(realDir, 'sib'), '-b', 'sib');
+		// And one INSIDE the workspace, which is what makes `kind` testable here: it is
+		// a registered worktree AND a workspace subdirectory at once.
+		git(wsReal, 'worktree', 'add', '-q', join(wsReal, 'roots', 'inside'), '-b', 'inside');
 
 		prevWs = process.env.CELLAR_WORKSPACE;
 		// The workspace addressed THROUGH the symlink — the lexical namespace Cellar
 		// and jupyter both live in, and the one git never reports back.
 		process.env.CELLAR_WORKSPACE = join(LINK_ROOT, 'link', 'ws');
 		gitmod.invalidateGitCaches();
-		GIT_SIBLING = gitmod.listWorktreesAt(join(LINK_ROOT, 'link', 'ws')).find((w) => w.path.endsWith('sib'))!.path;
+		const listed = gitmod.listWorktreesAt(join(LINK_ROOT, 'link', 'ws'));
+		GIT_SIBLING = listed.find((w) => w.path.endsWith('sib'))!.path;
+		GIT_INSIDE = listed.find((w) => w.path.endsWith(join('roots', 'inside')))!.path;
 		// The premise of every assertion below: the path git prints is NOT the one a
 		// lexical `relative()` from the workspace would measure against.
 		expect(GIT_SIBLING).toBe(join(realpathSync(join(LINK_ROOT, 'real')), 'sib'));
 		expect(relative(resolve(join(LINK_ROOT, 'link', 'ws')), GIT_SIBLING)).not.toBe('../sib');
+		expect(relative(resolve(join(LINK_ROOT, 'link', 'ws')), GIT_INSIDE)).not.toBe(join('roots', 'inside'));
 	});
 
 	afterAll(() => {
@@ -286,6 +294,25 @@ describe('the two-namespace rule, over a SYMLINKED workspace', () => {
 		expect(r?.rel).toBe('../sib');
 		expect(r?.apiPath).toBe('../sib');
 		expect(realpathSync(r!.dir)).toBe(realpathSync(GIT_SIBLING));
+	});
+
+	it('KIND FOLLOWS THE DIRECTORY, not the shape that was typed', () => {
+		// `roots/inside` is a registered worktree AND a workspace subdirectory. Declared
+		// by the absolute path git printed, the raw candidate fails the lexical guard (a
+		// symlink separates the two namespaces), so the worktree gate is what admits it
+		// — and `kind` read off that branch came back `'worktree'` while `rel`
+		// normalized straight back to `roots/inside`. Both of `kind`'s consumers act on
+		// it: agent config would be written into a workspace subdirectory, and the
+		// kernel start would run its external-root cwd verification. Worse, the SAME
+		// directory declared relatively classified as `'workspace'`, so one directory
+		// had two kinds depending on how it was typed.
+		const viaAbs = rootmod.resolveRootDir(GIT_INSIDE);
+		expect(viaAbs?.rel).toBe('roots/inside');
+		expect(viaAbs?.kind).toBe('workspace');
+		expect(rootmod.resolveRootDir('roots/inside')).toEqual(viaAbs);
+		// The label every surface renders is that same one rule, so it agrees too.
+		expect(rootmod.isOutsideWorkspace(viaAbs!.dir)).toBe(false);
+		expect(rootmod.isOutsideWorkspace(rootmod.resolveRootDir(GIT_SIBLING)!.dir)).toBe(true);
 	});
 
 	it('RESOLVE FROM ..: the same declaration, and the SAME resolved directory', () => {
@@ -366,6 +393,21 @@ describe('the app-wide path guard is NOT what changed', () => {
 		expect(src).not.toMatch(/startsWith\([^)]*\+ sep\)/);
 		expect(src).not.toMatch(/function insideWorkspace/);
 		expect(src).toMatch(/resolveInWorkspace\(toRel\(dir\)\)/);
+	});
+
+	it('SOURCE GUARD: no OTHER module keeps a copy of that containment rule either', () => {
+		// The guard above watched ONE file, and the rule was then written again in two
+		// others — `notebook-root-actions.ts` comparing LEXICAL paths and the sidebar
+		// route comparing REALPATH'd ones. Both decide the user-facing `external`
+		// label, so for a root reached through a symlink the picker could call a
+		// checkout internal while the sidebar called the same checkout external, which
+		// is exactly the misreading that tag exists to prevent. So every site asks the
+		// ONE exported helper, and none of them holds a prefix test.
+		for (const rel of ['src/lib/server/notebook-root-actions.ts', 'src/routes/api/fs/git/roots/+server.js']) {
+			const src = readFileSync(new URL(`../../${rel}`, import.meta.url), 'utf8');
+			expect(src, rel).not.toMatch(/startsWith\([^)]*\+ sep\)/);
+			expect(src, rel).toMatch(/isOutsideWorkspace\(/);
+		}
 	});
 
 	it('SOURCE GUARD: the root bar is not opened by a merely DETECTED worktree', () => {

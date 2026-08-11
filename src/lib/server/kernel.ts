@@ -1566,6 +1566,12 @@ export async function restartKernel(nbPath?: string | null) {
 		// merely propagated left every later run executing against the kernel whose cwd
 		// was just refused, the exact silent degrade the verification exists to prevent.
 		await teardownKernel(nbKernel, 'kernel_restart_failed');
+		// `teardownKernel` publishes only the per-notebook `kernel:shutdown`; the
+		// sidebar's Kernels cards come from the separate `kernel:status` snapshot, so
+		// every other teardown caller publishes it too. Without it a refused restart
+		// left a card on screen — with Interrupt/Restart/Shut down enabled — for a
+		// kernel that no longer exists.
+		publishKernelStatus();
 		throw err;
 	}
 	publishKernelStatus();

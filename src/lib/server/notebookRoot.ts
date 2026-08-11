@@ -36,11 +36,21 @@
  *   outside -> registered-worktree gate                        -> statSync
  *
  * THE GUARD ITSELF PICKS THE BRANCH, and that is structural rather than
- * decorative: `resolveRootDir` ASKS `resolveInWorkspace` and treats its throw as
- * the outside branch, so this module holds no containment rule of its own. A
+ * decorative: `isOutsideWorkspace` ASKS `resolveInWorkspace` and treats its throw
+ * as the outside verdict, so this module holds no containment rule of its own. A
  * local copy of the guard's lexical prefix test deciding the branch — and then
  * calling the guard inside it, unreachably — would make the claim below true only
- * for as long as the two rules happened to agree.
+ * for as long as the two rules happened to agree. That helper is EXPORTED and is
+ * the app's one answer to "is this directory inside the workspace": the picker and
+ * the sidebar's worktree rows label `external` with it too, because two local
+ * copies of the rule (one comparing lexical paths, one realpath'd) had them
+ * labelling the same checkout differently.
+ *
+ * WHICH RULE ADMITTED A ROOT AND WHERE THAT ROOT SITS ARE TWO QUESTIONS. The gate
+ * answers the first (and its `GitWorktree` is what names the repair for a
+ * registered-but-gone directory); `kind` answers the second, off the CANONICAL
+ * directory, so a worktree that happens to live inside the workspace is
+ * `kind:'workspace'` however its declaration was typed.
  *
  * `resolveInWorkspace` is the app-wide guard and stays byte-for-byte as it is:
  * every FILE path in the app resolves through it (the tree, `/api/fs/*`,
@@ -118,7 +128,7 @@ import { getNotebookRoot } from './notebook';
 import { listWorktreesAt, type GitWorktree } from './git';
 import { NotebookRootError, classifyRootPath } from '../notebookRoot';
 
-/** How a root was admitted — for messages, and for the UI to label it. */
+/** Where a root's directory sits relative to the workspace — see `ResolvedRoot.kind`. */
 export type RootKind = 'workspace' | 'worktree';
 
 /** A notebook's resolved root: the canonical declaration + its absolute dir. */
@@ -139,7 +149,13 @@ export interface ResolvedRoot {
 	 * absolute API path collapses INTO the workspace (see the header).
 	 */
 	apiPath: string;
-	/** Which admission rule let this root through. */
+	/**
+	 * Where the resolved DIRECTORY sits — inside the workspace, or outside it. A
+	 * fact about `dir`/`rel`, decided by the shared guard (`isOutsideWorkspace`),
+	 * NOT about which admission rule answered nor about the shape that was typed:
+	 * its consumers (the agent-config write, the startup cwd verification) act on
+	 * where the kernel really runs.
+	 */
 	kind: RootKind;
 }
 
@@ -251,6 +267,33 @@ function toRel(dir: string): string {
 	// `relative` yields the platform separator; the declaration is stored with `/`
 	// so it round-trips a `.ipynb` written on either platform.
 	return relative(ws(), dir).split(sep).join('/');
+}
+
+/**
+ * Whether an absolute LEXICAL directory lies OUTSIDE the workspace.
+ *
+ * THE ONE IMPLEMENTATION OF THAT QUESTION IN THE APP, and it is the app-wide
+ * guard's own ANSWER rather than a copy of its rule: the guard is asked, and its
+ * throw IS the outside verdict. That is what makes "there is exactly one
+ * containment rule" structural — a local copy of the guard's lexical prefix test
+ * had been written three times in this feature, and two of the copies did not
+ * agree (one comparing lexical operands, the other realpath'd ones), so the
+ * notebook picker could label a checkout internal while the sidebar's worktree row
+ * labelled the same checkout external — the exact misreading the `external` tag
+ * exists to prevent.
+ *
+ * `dir` must be LEXICAL. A path git reported is realpath'd, so it is turned into a
+ * declaration by `worktreeDeclaration` first and resolved from the lexical
+ * workspace — otherwise a worktree genuinely inside a workspace whose own path
+ * traverses a symlink (`/var/folders`, `/tmp`, a symlinked home) reads as outside.
+ */
+export function isOutsideWorkspace(dir: string): boolean {
+	try {
+		resolveInWorkspace(toRel(dir));
+		return false;
+	} catch {
+		return true;
+	}
 }
 
 /**
@@ -389,36 +432,25 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 
 	// THE SHARED GUARD MAKES THE DECISION — it is asked, never paraphrased.
 	//
-	// This module holds no containment rule of its own. A local `insideWorkspace`
-	// copy of the guard's lexical test used to decide the branch and then call
-	// `resolveInWorkspace` inside it, which made that call (and its catch)
-	// unreachable by construction — so the doctrine's claim that the untouched
-	// guard is the authority for the inside branch was true only by coincidence of
-	// the two rules agreeing. Asking the guard and treating its THROW as the
-	// outside branch is what makes the claim structural: there is exactly one
-	// implementation of "inside the workspace" in the app, and this is a caller of
-	// it, not a second copy.
-	let kind: RootKind;
+	// This module holds no containment rule of its own: `isOutsideWorkspace` ASKS
+	// `resolveInWorkspace` and treats its throw as the outside verdict. A local
+	// `insideWorkspace` copy of the guard's lexical test used to decide the branch
+	// and then call the guard inside it, which made that call (and its catch)
+	// unreachable by construction — so the doctrine's claim that the untouched guard
+	// is the authority for the inside branch was true only by coincidence of the two
+	// rules agreeing.
+	//
+	// An `outside`-SHAPED declaration that lexically lands back in the workspace
+	// (`roots/../pr-1`, or an absolute path that happens to be under it) takes the
+	// inside branch and is stored in the canonical workspace-relative form, so one
+	// directory has one declaration however it was typed.
 	let match: GitWorktree | null = null;
-	let inside = true;
-	try {
-		// INSIDE — including an `outside`-SHAPED declaration that lexically lands
-		// back in the workspace (`roots/../pr-1`, or an absolute path that happens
-		// to be under it). Those are stored in the canonical workspace-relative
-		// form, so one directory has one declaration however it was typed.
-		resolveInWorkspace(toRel(dir));
-	} catch {
-		inside = false;
-	}
-	if (inside) {
-		kind = 'workspace';
-	} else {
+	if (isOutsideWorkspace(dir)) {
 		// OUTSIDE — the second, narrower admission rule. Throws unless the listing
 		// names this exact directory, and its refusal names the repair, so a path
 		// that simply escapes the workspace is answered by the gate rather than by
 		// a separate escape message this branch would have to keep in sync.
 		match = assertRegisteredWorktree(dir, declared);
-		kind = 'worktree';
 	}
 
 	// THE CANONICAL DECLARATION, through the ONE helper that owns the two-namespace
@@ -436,14 +468,30 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 	// resolved directories and see a re-declaration in the other spelling as the
 	// no-op it is.
 	const rootDir = resolve(ws(), rel);
+	// KIND IS A PROPERTY OF THE DIRECTORY, not of the shape that was typed and not of
+	// which admission rule answered. Reading it off the branch above made it a
+	// property of the INPUT: on a workspace whose path traverses a symlink, pasting
+	// the absolute path git printed for a worktree that lives INSIDE `roots/` makes
+	// the raw candidate fail the lexical guard, so the gate answered and `kind` came
+	// back `'worktree'` — while `rel` normalized straight back to `roots/pr-1` and
+	// the directory is plainly inside the workspace. Its two consumers act on that:
+	// `setNotebookRootAndRestart` would write agent config into a workspace
+	// subdirectory, and `initKernel` would run its external-root cwd verification —
+	// and the SAME directory declared relatively classified as `'workspace'`, so one
+	// directory had two kinds depending on how it was typed. Asked about the CANONICAL
+	// directory, `kind` and `rel` can never disagree.
+	const kind: RootKind = isOutsideWorkspace(rootDir) ? 'worktree' : 'workspace';
 	let stat;
 	try {
 		stat = statSync(rootDir);
 	} catch {
 		// Being LISTED is not proof of existing: a removed worktree still lists,
-		// tagged `prunable`. So each kind names its own repair.
+		// tagged `prunable`. So the repair names how this root was ADMITTED — `match`,
+		// not `kind`: a registered worktree needs `git worktree prune` whether or not
+		// its directory happens to sit inside the workspace, and `kind` is now a fact
+		// about the directory rather than about the listing.
 		throw new NotebookRootError(
-			kind === 'worktree'
+			match
 				? `Notebook root ${JSON.stringify(rel)} is a registered worktree but its directory no longer exists. Run \`git worktree prune\`, re-create it (\`git worktree add ${rel} <branch>\`), or clear the notebook's root to run against the workspace.`
 				: `Notebook root ${JSON.stringify(rel)} does not exist in this workspace. Create it (e.g. \`git worktree add ${rel} <branch>\`) or clear the notebook's root to run against the workspace.`
 		);

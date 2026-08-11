@@ -1,10 +1,10 @@
 import { json } from '@sveltejs/kit';
 import { existsSync, realpathSync, statSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { resolve } from 'node:path';
 import { gitCommitAt, listWorktreesAt } from '$lib/server/git';
 import { workspaceRoot } from '$lib/server/fstree';
 import { getNotebookRoot } from '$lib/server/notebook';
-import { resolveRootDir, worktreeDeclaration } from '$lib/server/notebookRoot';
+import { isOutsideWorkspace, resolveRootDir, worktreeDeclaration } from '$lib/server/notebookRoot';
 
 /**
  * Which commit each open notebook's CODE ROOT is checked out at — the Git sidebar
@@ -127,11 +127,6 @@ function isDir(abs) {
 	}
 }
 
-/** Lexical containment, the same rule the workspace path guard applies. */
-function isInside(abs, ws) {
-	return abs === ws || abs.startsWith(ws + sep);
-}
-
 export async function GET({ url }) {
 	const ws = resolve(workspaceRoot());
 	const asked = [...new Set(url.searchParams.getAll('path').filter(Boolean))];
@@ -178,7 +173,17 @@ export async function GET({ url }) {
 		// `key` is the REAL-namespace identity, computed once: it is what every
 		// comparison and every commit lookup below goes through, so a lexical Cellar
 		// path and git's realpath'd one can never read as two directories.
-		.map((w) => ({ w, exists: isDir(w.path), key: realpathOrSelf(w.path) }));
+		//
+		// `decl` is the row's LEXICAL identity, minted once by the ONE helper that owns
+		// the two-namespace rule: it is both what the row reports as `path` (so "Use as
+		// root" posts exactly the value the picker would) and what the `external` label
+		// is decided from, since the shared containment rule must be asked about a
+		// lexical path — git's realpath'd one would read a worktree genuinely inside a
+		// symlink-traversing workspace as external.
+		.map((w) => {
+			const decl = worktreeDeclaration(w.path);
+			return { w, exists: isDir(w.path), key: realpathOrSelf(w.path), decl };
+		});
 
 	// One probe per DISTINCT directory (three `git` spawns), shared by every
 	// notebook rooted there — plus the workspace itself, which every no-root
@@ -208,29 +213,34 @@ export async function GET({ url }) {
 	// running in are the last thing this can drop.
 	const probeDirs = new Map(rootDirs);
 	let budget = MAX_WORKTREE_PROBES;
-	const probes = wtrees.map(({ w, exists, key }) => {
+	const probes = wtrees.map(({ w, exists, key, decl }) => {
 		// A missing one is never probed: there is no status to read, and it would
 		// spawn three processes to learn nothing. It is not truncation either — the
 		// row already states it is gone.
-		if (!exists) return { w, exists, key, probed: false, truncated: false };
-		if (rootDirs.has(key)) return { w, exists, key, probed: true, truncated: false };
-		if (budget <= 0) return { w, exists, key, probed: false, truncated: true };
+		if (!exists) return { w, exists, key, decl, probed: false, truncated: false };
+		if (rootDirs.has(key)) return { w, exists, key, decl, probed: true, truncated: false };
+		if (budget <= 0) return { w, exists, key, decl, probed: false, truncated: true };
 		budget -= 1;
 		probeDirs.set(key, w.path);
-		return { w, exists, key, probed: true, truncated: false };
+		return { w, exists, key, decl, probed: true, truncated: false };
 	});
 
 	const commits = new Map(
 		await Promise.all([...probeDirs].map(async ([key, dir]) => [key, await gitCommitAt(dir)]))
 	);
 
-	const worktrees = probes.map(({ w, exists, key, probed, truncated }) => ({
+	const worktrees = probes.map(({ w, exists, key, decl, probed, truncated }) => ({
 		// The LEXICAL declaration for the realpath'd path git printed — through the
 		// ONE helper that owns the two-namespace rule, so "Use as root" posts exactly
 		// the value the picker would and exactly the value that gets persisted.
-		path: worktreeDeclaration(w.path),
+		path: decl,
 		absolute: w.path,
-		external: !isInside(key, wsReal),
+		// Asked of the ONE shared containment rule (`resolveInWorkspace`, via
+		// `isOutsideWorkspace`), about the LEXICAL directory the declaration names — so
+		// this row, the notebook picker's `external`, and the `kind` a run resolves are
+		// three readings of one rule rather than three local copies of it, two of which
+		// disagreed and so labelled the same checkout differently.
+		external: isOutsideWorkspace(resolve(ws, decl)),
 		exists,
 		branch: w.branch,
 		detached: w.detached,

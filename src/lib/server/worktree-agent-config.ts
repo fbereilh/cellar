@@ -64,8 +64,21 @@
  * -A` can put Cellar's config onto the branch under review and no collaborator
  * inherits the entry. It is written BEFORE the config, so the file is never
  * briefly visible as an untracked change.
+ *
+ * AND IT IS TRANSACTIONAL, which that ordering makes necessary rather than
+ * optional: the entry is in place before the writer has said whether it will write
+ * anything, so a harness that comes back `skipped` — an existing `.mcp.json` the
+ * writer refuses to edit, an unreadable one, an EACCES — would leave an ignore rule
+ * for a file Cellar never wrote. Given the repo-common scope above, that hides the
+ * user's OWN root `.mcp.json` from `git status` in every working tree of the clone
+ * and makes `git add` refuse it. So a skipped harness's entry is taken back
+ * (`revertGitExclude`), and ONLY the bytes this call appended: an entry the user or
+ * an earlier adoption already had is never touched, and the file comes back
+ * byte-identical. Cellar does not leave an ignore rule behind for a file it did not
+ * write.
  */
 import { existsSync, mkdirSync, readFileSync, appendFileSync } from 'node:fs';
+import { writeFileAtomic } from './write-file-atomic.js';
 import { spawnSync } from 'node:child_process';
 import { join, dirname, relative, resolve } from 'node:path';
 import { configureHarness, mcpJsonHarnessNames, harnessConfigPath, readAllowList } from './harness.js';
@@ -129,11 +142,15 @@ function targetHarnesses(): { allowed: string[]; names: string[] } {
 	return { allowed, names: allowed.filter((name) => !excluded.has(name)) };
 }
 
+/** The comment line Cellar writes above its own exclude entry — its signature there. */
+const EXCLUDE_MARKER = '# added by cellar: agent config for a notebook code root';
+
 /**
  * Ensure `rel` — a path relative to a working tree's ROOT — is ignored, via the
- * repo's COMMON `info/exclude`. Best-effort and idempotent; returns false when it
+ * repo's COMMON `info/exclude`. Best-effort and idempotent; `ok:false` says it
  * could not be arranged (not a repo, unwritable), which is the caller's cue to say
- * so rather than to claim a clean checkout.
+ * so rather than to claim a clean checkout, and `appended` records the exact bytes
+ * THIS call added so the write can be taken back if the config never lands.
  *
  * `--git-common-dir`, never `--absolute-git-dir`: see the header — `info/` is in
  * git's `common_list`, so an exclude written to a linked worktree's own git dir is
@@ -151,27 +168,75 @@ function targetHarnesses(): { allowed: string[]; names: string[] } {
  * makes the two harnesses consistent, since `.codex/config.toml` contains a slash
  * and was therefore already root-anchored.
  */
-function ensureGitExclude(worktreeDir: string, rel: string): boolean {
+function ensureGitExclude(worktreeDir: string, rel: string): ExcludeWrite {
 	const entry = `/${rel}`;
 	const r = spawnSync('git', ['-C', worktreeDir, '--no-optional-locks', 'rev-parse', '--git-common-dir'], {
 		encoding: 'utf8'
 	});
-	if (r.status !== 0) return false;
+	if (r.status !== 0) return { ok: false };
 	const common = (r.stdout ?? '').trim();
-	if (!common) return false;
+	if (!common) return { ok: false };
 	const file = join(resolve(worktreeDir, common), 'info', 'exclude');
 	try {
 		const existing = existsSync(file) ? readFileSync(file, 'utf8') : '';
 		// Idempotent on the ENTRY, not on the whole line: a user may have added it
 		// themselves with different spacing, and a second copy is noise in a file
-		// they can read.
-		if (existing.split('\n').some((line) => line.trim() === entry)) return true;
+		// they can read. An entry that was ALREADY there carries no `appended`, which
+		// is what stops the revert below from removing a line this call did not write.
+		if (existing.split('\n').some((line) => line.trim() === entry)) return { ok: true, file };
 		mkdirSync(dirname(file), { recursive: true });
 		const prefix = !existing || existing.endsWith('\n') ? '' : '\n';
-		appendFileSync(file, `${prefix}# added by cellar: agent config for a notebook code root\n${entry}\n`);
-		return true;
+		const appended = `${prefix}${EXCLUDE_MARKER}\n${entry}\n`;
+		appendFileSync(file, appended);
+		return { ok: true, file, appended };
 	} catch {
-		return false;
+		return { ok: false };
+	}
+}
+
+
+/** What `ensureGitExclude` did, and exactly what a revert would have to undo. */
+interface ExcludeWrite {
+	/** Whether the entry is now present — false means nothing could be arranged. */
+	ok: boolean;
+	/** The exclude file, when one was reached. */
+	file?: string;
+	/** The exact bytes THIS call appended; absent when the entry was already there. */
+	appended?: string;
+}
+
+/**
+ * Take back an exclude entry this call added, because the config it was ignoring
+ * was never written.
+ *
+ * WHY IT EXISTS: the entry lands in the repo-COMMON exclude, so it is an ignore
+ * rule for `/.mcp.json` at the ROOT of every working tree of the clone, the main
+ * checkout included. If the writer then REFUSES the config (an existing
+ * `.mcp.json` it will not edit, an unreadable one, an EACCES), the entry is left
+ * ignoring a file Cellar never wrote — the user's OWN untracked `.mcp.json`
+ * silently disappears from `git status` and `git add` refuses it as ignored.
+ * Cellar must not leave an ignore rule behind for a file it did not write.
+ *
+ * The ordering stays exclude-first (so the config is never momentarily visible as
+ * an untracked change); this is what makes it transactional instead.
+ *
+ * ONLY the bytes THIS call appended are removed, spliced out by exact match, so a
+ * line the user — or an earlier adoption, or the sibling harness in this same call
+ * — put there is untouched, and an exclude that already held the entry is never
+ * reverted at all (no `appended`). Removing the exact appended slice is also what
+ * makes the file byte-identical to what it was before the call. Best-effort, like
+ * the write: a revert that cannot be done leaves the warning the skip already
+ * earns.
+ */
+function revertGitExclude(e: ExcludeWrite): void {
+	if (!e.file || !e.appended) return;
+	try {
+		const content = readFileSync(e.file, 'utf8');
+		const at = content.lastIndexOf(e.appended);
+		if (at < 0) return;
+		writeFileAtomic(e.file, content.slice(0, at) + content.slice(at + e.appended.length));
+	} catch {
+		/* best-effort: the skip's own warning is what the user acts on */
 	}
 }
 
@@ -207,15 +272,16 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 	// made the warning name whichever file happened to be written FIRST, telling the
 	// user that `.mcp.json` was untracked-dirty when the file that really was is
 	// `.codex/config.toml`.
-	const excludedByName = new Map<string, boolean>();
+	const excludedByName = new Map<string, ExcludeWrite>();
 	for (const name of names) {
 		const file = harnessConfigPath(name, worktreeDir);
-		excludedByName.set(name, !file || ensureGitExclude(worktreeDir, file.slice(worktreeDir.length + 1)));
+		excludedByName.set(name, file ? ensureGitExclude(worktreeDir, file.slice(worktreeDir.length + 1)) : { ok: true });
 	}
 
 	const results: HarnessOutcome[] = [];
 	for (const name of names) {
-		const excluded = excludedByName.get(name) ?? false;
+		const wroteExclude = excludedByName.get(name) ?? { ok: false };
+		const excluded = wroteExclude.ok;
 		try {
 			const r = configureHarness(name, worktreeDir);
 			results.push({
@@ -232,6 +298,12 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 			logWarn('roots', `agent config for ${name} in ${worktreeDir} failed: ${message}`);
 			results.push({ name, status: 'skipped', message: `agent config could not be written: ${message}`, excluded });
 		}
+		// TRANSACTIONAL, per harness: the config was NOT written, so the ignore rule
+		// this call added covers a file Cellar does not own — most likely the user's
+		// own `.mcp.json`, which the writer refused to edit precisely because it is
+		// theirs. See `revertGitExclude`. `already` keeps its entry: Cellar's config IS
+		// there, so ignoring it is still correct.
+		if (results[results.length - 1].status === 'skipped') revertGitExclude(wroteExclude);
 	}
 
 	const first = results[0];

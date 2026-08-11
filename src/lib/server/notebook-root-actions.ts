@@ -17,7 +17,7 @@
  * gone, and the result says so.
  */
 import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
-import { join, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 import { workspaceRoot } from './fstree';
 import {
 	getNotebookRoot,
@@ -27,7 +27,7 @@ import {
 	listOpenNotebookPaths,
 	isTextNotebook
 } from './notebook';
-import { resolveRootDir, worktreeDeclaration } from './notebookRoot';
+import { isOutsideWorkspace, resolveRootDir, worktreeDeclaration } from './notebookRoot';
 import { rebindKernel } from './kernel';
 import { gitRefAt, listWorktreesAt } from './git';
 import { configureAdoptedWorktree, type WorktreeAgentConfig } from './worktree-agent-config';
@@ -257,6 +257,9 @@ export async function listWorkspaceRoots(): Promise<WorkspaceRootInfo[]> {
 					declared: false,
 					notebooks: [] as string[],
 					source: 'worktree' as const,
+					// `kind` IS the shared containment rule's verdict on the resolved
+					// directory, so this is the same one answer the row below computes and the
+					// sidebar's worktree rows render — not a third reading of it.
 					external: resolved.kind === 'worktree'
 				};
 			} catch {
@@ -281,8 +284,11 @@ export async function listWorkspaceRoots(): Promise<WorkspaceRootInfo[]> {
 				notebooks: (byRoot.get(rel) ?? []).sort(),
 				source: (fromConvention.has(rel) ? 'convention' : 'declared') as 'convention' | 'declared',
 				// A declared root may itself be external (a sibling worktree already in
-				// use), so this is decided by the resolved path, never by the source.
-				external: !isInsideWorkspace(absolute, ws)
+				// use), so this is decided by the resolved path, never by the source — and
+				// through the ONE containment rule the resolver itself asks, so this label
+				// can never disagree with the sidebar's worktree rows or with the `kind` a
+				// run of this notebook resolves.
+				external: isOutsideWorkspace(absolute)
 			};
 		})
 	);
@@ -315,9 +321,4 @@ function isDirectory(abs: string): boolean {
 	} catch {
 		return false;
 	}
-}
-
-/** Lexical containment, the same rule the workspace guard applies. */
-function isInsideWorkspace(abs: string, ws: string): boolean {
-	return abs === ws || abs.startsWith(ws + sep);
 }
