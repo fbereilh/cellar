@@ -253,6 +253,15 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		category: 'Structure',
 		description: 'Change the selected cell(s) to code'
 	},
+	{
+		// Jupyter's own chord for this. A raw cell is verbatim text Cellar never
+		// executes or renders (Quarto/nbdev frontmatter, nbconvert directives).
+		id: 'to-raw',
+		keys: ['r'],
+		mode: 'command',
+		category: 'Structure',
+		description: 'Change the selected cell(s) to raw'
+	},
 
 	// ---- Editing -----------------------------------------------------------
 	{

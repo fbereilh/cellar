@@ -330,13 +330,30 @@ function renderCodeCell(cell: CellView, hidden: boolean): string {
 	return `<section class="cell code-cell">${code}${output}</section>`;
 }
 
+/**
+ * An nbformat `raw` cell: verbatim text for a downstream tool (Quarto/nbdev
+ * frontmatter, nbconvert directives).
+ *
+ * Rendered as a MUTED `<pre>` block, deliberately: the export shows what the
+ * notebook CONTAINS. Emphatically NOT as raw HTML - that would be an XSS surface
+ * in a file the user shares - so the source is escaped exactly like a code cell's,
+ * and it takes no syntax highlighting, since its source is not a language.
+ * (nbconvert instead OMITS a raw cell whose mimetype is not text/html; Cellar
+ * shows it, muted, so nothing in the notebook silently disappears from the
+ * report.)
+ */
+function renderRawCell(cell: CellView): string {
+	if (!cell.source.trim()) return '';
+	return `<section class="cell raw-cell"><pre class="code raw">${esc(cell.source)}</pre></section>`;
+}
+
 function renderCell(cell: CellView, hideAllCode: boolean): string {
 	// `isCodeHidden` is the shared precedence rule (per-cell hide_input wins over
 	// the notebook-wide hideAllCode default), so the export reads like the app's
 	// report view and cannot drift from Cell.svelte / the agent map.
-	return cell.cell_type === 'markdown'
-		? renderMarkdownCell(cell)
-		: renderCodeCell(cell, isCodeHidden(cell, hideAllCode));
+	if (cell.cell_type === 'markdown') return renderMarkdownCell(cell);
+	if (cell.cell_type === 'raw') return renderRawCell(cell);
+	return renderCodeCell(cell, isCodeHidden(cell, hideAllCode));
 }
 
 /**
@@ -540,6 +557,10 @@ pre.code{
 	white-space: pre; color: var(--fg);
 }
 pre.code code{ font: inherit; }
+/* A raw cell: verbatim text a downstream tool reads, not code and not prose. It
+   is shown, but muted and unhighlighted, so it reads as neither. */
+.raw-cell{ background: var(--code-bg); }
+pre.code.raw{ color: var(--muted); white-space: pre-wrap; }
 
 .cell-output{ border-top: 1px solid var(--border); background: var(--output); padding: 0.35rem 0; }
 /* Report view: an output-only (code-hidden) cell has no input above its output,

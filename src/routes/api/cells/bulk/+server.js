@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
 import { deleteCells, moveCells, setCellTypes } from '$lib/server/notebook';
+import { RAW_UNSUPPORTED_REASON, RawCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
 
 /**
  * Bulk cell operations over a multi-cell SELECTION — one request, one document
@@ -21,11 +22,13 @@ import { deleteCells, moveCells, setCellTypes } from '$lib/server/notebook';
  * `dir` and `cellType` are VALIDATED, not coerced: both ops rewrite and persist the
  * user's `.ipynb`, so an out-of-vocabulary value must fail like `no-ids` /
  * `unknown-op` rather than silently reorder or retype cells in a direction nobody
- * asked for. A delete that would empty the notebook fails the same way, but the
- * rule itself is `deleteCells`' - the route only reports its verdict.
+ * asked for. The cell-type vocabulary is `$lib/cellLanguage`'s, shared with the
+ * single-cell PATCH and add routes so one of them cannot start accepting a type
+ * the others refuse. A delete that would empty the notebook fails the same way,
+ * as does `raw` on a `.py` notebook, but both rules are the doc layer's - the
+ * route only reports its verdict.
  */
 const MOVE_DIRS = new Set(['up', 'down']);
-const CELL_TYPES = new Set(['code', 'sql', 'markdown']);
 
 export async function POST({ request }) {
 	const { op, ids, nb, originId, dir, cellType } = await request.json().catch(() => ({}));
@@ -44,8 +47,14 @@ export async function POST({ request }) {
 		return json({ ok: true, moved: moveCells(list, dir, nb, originId) });
 	}
 	if (op === 'type') {
-		if (!CELL_TYPES.has(cellType)) return json({ ok: false, reason: 'bad-cell-type' }, { status: 400 });
-		return json({ ok: true, changed: setCellTypes(list, cellType, nb, originId) });
+		if (!isLogicalCellTypeName(cellType)) return json({ ok: false, reason: 'bad-cell-type' }, { status: 400 });
+		try {
+			return json({ ok: true, changed: setCellTypes(list, cellType, nb, originId) });
+		} catch (err) {
+			if (err instanceof RawCellTypeError)
+				return json({ ok: false, reason: RAW_UNSUPPORTED_REASON, message: err.message }, { status: 400 });
+			throw err;
+		}
 	}
 	return json({ ok: false, reason: 'unknown-op' }, { status: 400 });
 }

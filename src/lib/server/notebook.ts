@@ -30,7 +30,7 @@ import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
 import { canExportCell } from '../exportRole';
 import { resolveInWorkspace } from './fstree';
-import { SQL_LANGUAGE, isLogicalCellType } from '../cellLanguage';
+import { SQL_LANGUAGE, isLogicalCellType, nbCellType, textNotebookRawCellError } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
 import { normalizeRootPath, textNotebookRootError } from '../notebookRoot';
@@ -99,6 +99,10 @@ function enforceUniqueIds(cells: Cell[]): void {
 	}
 }
 
+/** The three nbformat 4.5 cell types. The vocabulary a foreign/stored cell type is
+ * VALIDATED against (`replaceCells`), never coerced into - see that function. */
+const NB_CELL_TYPES = new Set<string>(['code', 'markdown', 'raw']);
+
 function starterCell(): Cell {
 	return {
 		id: mintId(),
@@ -113,11 +117,12 @@ function starterCell(): Cell {
 
 function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCellar {
 	// 'sql' is a LOGICAL type: an nbformat `code` cell tagged cellar.language='sql'
-	// (see $lib/cellLanguage.js). markdown/code map to their nbformat cell_type.
+	// (see $lib/cellLanguage.js). code/markdown/raw are nbformat types of their
+	// own, and `nbCellType` is the ONE mapping.
 	const isSql = cellType === 'sql';
 	const cell: CellWithCellar = {
 		id: mintId(),
-		cell_type: cellType === 'markdown' ? 'markdown' : 'code',
+		cell_type: nbCellType(cellType),
 		source: typeof source === 'string' ? source : '',
 		outputs: [],
 		metadata: { cellar: { extract: false, visible: true, ...(isSql ? { language: SQL_LANGUAGE } : {}) } }
@@ -130,7 +135,15 @@ function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCella
 	// verdict staleness must never invent. Folded from an EMPTY previous source: the
 	// cell did not exist before, so nothing about it was ever proven stable. A birth
 	// records no removal, so there is nothing here for the prune to date (null).
-	setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
+	//
+	// Only a CODE cell, though: a markdown or raw cell's source is not Python, so
+	// it binds no module-level imports and stamping it as if it might would be a
+	// claim nothing verified. (Staleness filters to code cells, so this is honesty
+	// rather than a correctness fix - but the stamp rides `cell:edited` and every
+	// checkpoint, so an invented one is not free either.)
+	if (cell.cell_type === 'code') {
+		setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
+	}
 	return cell;
 }
 
@@ -1068,6 +1081,7 @@ export function addCellAt(
 	role?: string | null
 ): Cell {
 	const doc = docFor(nb);
+	assertCanHoldRaw(doc, cellType);
 	const cell = newCell(cellType, source);
 	if (role) cell.metadata.cellar.role = role;
 	const at = Math.max(0, Math.min(index, doc.cells.length));
@@ -1154,6 +1168,27 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
 }
 
 /**
+ * Refuse `raw` on a `.py` TEXT notebook, BEFORE anything is written.
+ *
+ * `persist` writes such a document back through jupytext / the Databricks
+ * converter, which rebuilds it from its cells and coerces every `cell_type` to
+ * markdown|code - so a raw cell would live only in memory and come back from
+ * disk as a runnable Python cell (see `textNotebookRawCellError`, which owns the
+ * reasoning and the message). The guard sits at EVERY doc-layer writer that can
+ * put `raw` into a document - the two that CONVERT a cell (`setCellType`,
+ * `setCellTypes`) and the two that CREATE one (`addCell`, `addCellAt`) - so every
+ * surface offering a raw cell (the type menu, the `r` chord, the bulk route, MCP
+ * `set_cell_type` / `add_cell` / `add_cells` / `add_and_run`) is covered by this
+ * ONE rule rather than by a check each of them could forget. `addCellAt`'s only
+ * caller passes 'code' today, so it is guarded to make the claim true by
+ * construction rather than by that caller's argument. Every other type is
+ * unaffected, and an `.ipynb` never reaches the throw.
+ */
+function assertCanHoldRaw(doc: NotebookDoc, cellType: LogicalCellType): void {
+	if (cellType === 'raw' && doc.jpFormat) throw textNotebookRawCellError();
+}
+
+/**
  * Add a cell after `afterId` (appended when it is absent or unknown).
  * `source` seeds the new cell, so a paste / split / undo-delete lands as ONE
  * persist and ONE `cell:added` event carrying the real text - rather than an
@@ -1169,6 +1204,7 @@ export function addCell(
 	cellar?: unknown
 ): Cell {
 	const doc = docFor(nb);
+	assertCanHoldRaw(doc, cellType);
 	const cell = newCell(cellType, source);
 	seedCellar(doc, cell, cellar);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
@@ -1191,9 +1227,13 @@ export function addCell(
  *
  * The `cell:type` event carries the new `language` so live sync updates the
  * editor's syntax highlighting (SQL ↔ Python) without a reload.
+ *
+ * A `.py` text notebook REFUSES 'raw' here - see `assertCanHoldRaw`; every other
+ * conversion stays allowed on one.
  */
 export function setCellType(id: string, cellType: LogicalCellType, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
+	assertCanHoldRaw(doc, cellType);
 	const cell = find(doc, id);
 	if (!cell) return;
 	applyCellType(cell, cellType);
@@ -1203,26 +1243,55 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
 
 /**
  * The in-place half of a type switch, shared by the single-cell setter and the
- * `setCellTypes` batch so the two can never diverge on the metadata rules
- * (markdown clears outputs; markdown/SQL drop the imports role and the export
- * flag, neither of which a non-Python cell may hold).
+ * `setCellTypes` batch so the two can never diverge on the metadata rules: any
+ * non-code type (markdown, raw) clears outputs, and anything holding no Python
+ * (those two plus SQL) drops the imports role and the nbdev export flag.
+ *
+ * `LiveNotebook.applyCellTypeLocally` is the browser's copy of exactly these
+ * rules - `cell:type` carries no metadata, so a client half that skipped one
+ * would keep drawing a badge the server has already stripped, with no event able
+ * to correct it before a reload. Two implementations, not one per call site.
+ *
+ * The import-binding seed below is the one rule with NO client half, deliberately:
+ * `importBindings` is a runtime-only staleness input the browser never reads (it
+ * fetches `/api/notebooks/staleness`), so there is nothing there to keep in step.
  */
 function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	const isSql = cellType === 'sql';
-	cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
+	const wasCode = cell.cell_type === 'code';
+	cell.cell_type = nbCellType(cellType);
 	cell.metadata = cell.metadata ?? {};
 	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	// Becoming a code cell is the other way a cell acquires Python bindings without an
+	// edit, so it takes the same birth stamp `newCell` gives a code cell born with a
+	// source - and for the same reason: `newCell` stamps only a CODE cell, so a
+	// markdown/raw cell created with an imports-only source carries none, and an absent
+	// stamp reads as "these bindings have not changed", which would exempt the very edge
+	// this conversion just rebound (`edgeCarriesChange`). Folded from an EMPTY previous
+	// source, since nothing about this cell's bindings was ever proven while it held no
+	// Python; a birth records no removal, so there is nothing for the prune to date.
+	// Only on the way IN (a code→code sql toggle must not re-stamp and claim a change
+	// that did not happen), and never over an existing stamp - a cell that was code
+	// before carries real history a there-and-back conversion must not discard.
+	if (!wasCode && cell.cell_type === 'code' && !cell.metadata.cellar.importBindings) {
+		setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
+	}
 	if (isSql) cell.metadata.cellar.language = SQL_LANGUAGE;
 	else delete cell.metadata.cellar.language;
-	if (cell.cell_type === 'markdown') cell.outputs = [];
-	// SQL and markdown cells cannot be the Python imports cell.
-	if ((cell.cell_type === 'markdown' || isSql) && cell.metadata.cellar.role === IMPORTS_ROLE) {
-		delete cell.metadata.cellar.role;
-	}
-	// Only a Python code cell exports to the module; converting away drops the flag.
-	if ((cell.cell_type === 'markdown' || isSql) && cell.metadata.cellar.export) {
-		delete cell.metadata.cellar.export;
-	}
+	// A cell the kernel actually executes as Python. Markdown and raw never reach
+	// it at all; SQL reaches it compiled, so it holds no Python either.
+	const runnable = cell.cell_type === 'code' && !isSql;
+	// Only a code cell holds outputs - markdown and raw carry none, and
+	// `serialize` would drop them anyway.
+	if (cell.cell_type !== 'code') cell.outputs = [];
+	// Neither the imports role nor the nbdev export flag may sit on a cell holding
+	// no Python: the kernel never sees a markdown or raw cell, and a SQL cell's
+	// source is not Python.
+	if (!runnable && cell.metadata.cellar.role === IMPORTS_ROLE) delete cell.metadata.cellar.role;
+	if (!runnable && cell.metadata.cellar.export) delete cell.metadata.cellar.export;
+	// `hide_input` is deliberately KEPT: `$lib/hideInput` reads it only for a code
+	// cell, so it is already inert on a markdown or raw one, and dropping it would
+	// silently lose a report-view choice across a there-and-back conversion.
 }
 
 /**
@@ -1248,6 +1317,10 @@ export function setCellTypes(
 	originId?: string | null
 ): string[] {
 	const doc = docFor(nb);
+	// Refused for the WHOLE batch before the first write, so a `.py` notebook can
+	// never be left half-retyped - and, because nothing is changed, the caller's
+	// `changed` count can never report a refused cell as converted.
+	assertCanHoldRaw(doc, cellType);
 	const isSql = cellType === 'sql';
 	const changed: Cell[] = [];
 	for (const id of ids) {
@@ -1493,6 +1566,15 @@ export function clearOutputsForCells(ids: readonly string[], nb?: string | null,
  * ids are re-checked for uniqueness defensively. Used by the checkpoint restore
  * path (`checkpoints.js`); `clean.js` strips runtime metadata on persist, so a
  * restore leaves the `.ipynb` git-clean.
+ *
+ * A snapshot's `cell_type` is VALIDATED against the nbformat vocabulary, never
+ * coerced to it. The old `=== 'markdown' ? 'markdown' : 'code'` shorthand read
+ * every third type as code, so restoring a checkpoint of a notebook carrying an
+ * nbformat `raw` cell (Quarto/nbdev frontmatter) silently retyped it to code and
+ * broke the notebook for the tool that reads it - and `checkpoints.ts` snapshots
+ * through `structuredClone(listCells(nb))`, which PRESERVES the type, so the loss
+ * was entirely on this side. The fallback stays for a genuinely malformed
+ * snapshot; the point is that a legitimate type survives.
  */
 export function replaceCells(
 	nb: string | null | undefined,
@@ -1502,7 +1584,7 @@ export function replaceCells(
 	const doc = docFor(nb);
 	const cloned: Cell[] = (Array.isArray(cells) ? cells : []).map((c) => ({
 		id: c.id ?? '',
-		cell_type: (c.cell_type === 'markdown' ? 'markdown' : 'code') as Cell['cell_type'],
+		cell_type: (NB_CELL_TYPES.has(c.cell_type as string) ? c.cell_type : 'code') as Cell['cell_type'],
 		source: typeof c.source === 'string' ? c.source : '',
 		outputs: Array.isArray(c.outputs) ? structuredClone(c.outputs) : [],
 		metadata: c.metadata ? structuredClone(c.metadata) : {}

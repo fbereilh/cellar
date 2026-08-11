@@ -23,7 +23,7 @@
 	import { isExportCell } from '$lib/exportRole';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
-	import { isSqlCell, logicalCellType } from '$lib/cellLanguage';
+	import { isSqlCell, isRawCell, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration } from '$lib/relativeTime';
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
@@ -90,6 +90,8 @@
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
 		hideAllCode?: boolean;
+		/** This is a `.py` TEXT notebook, which cannot hold a raw cell (see `typeOptions`). */
+		isPy?: boolean;
 		/** Hide (or show) this code cell's input in place. */
 		onSetHideInput?: (id: string, hidden: boolean) => void;
 		/** Per-cell code-editor collapse choice (undefined = auto / true / false). */
@@ -154,6 +156,7 @@
 		onSetExport,
 		onSetScrolled,
 		hideAllCode = false,
+		isPy = false,
 		onSetHideInput,
 		editorCollapsed,
 		onSetEditorCollapsed,
@@ -223,9 +226,26 @@
 	// A SQL cell: a code cell tagged cellar.language='sql'. Its source is SQL, run
 	// against `spark` (see server/sql.js); the editor highlights it as SQL.
 	const isSql = $derived(isSqlCell(cell));
-	// The logical cell type the type menu speaks: 'code' | 'sql' | 'markdown'.
+	// An nbformat `raw` cell: verbatim text Cellar never executes and never renders
+	// (Quarto/nbdev frontmatter, nbconvert directives). It has NO rendered mode -
+	// the deliberate contrast with markdown - so it is always shown as its source.
+	const isRaw = $derived(isRawCell(cell));
+	// A cell the kernel executes: python or sql, never markdown or raw. Every
+	// execution-shaped affordance below gates on THIS, not on `!isMarkdown` - that
+	// shorthand is what rendered a Run button on a raw cell and posted YAML
+	// frontmatter to Python.
+	const isRunnable = $derived(!isMarkdown && !isRaw);
+	// The logical cell type the type menu speaks: 'code' | 'sql' | 'markdown' | 'raw'.
 	const logicalType = $derived(logicalCellType(cell));
-	const typeLabel = $derived(logicalType === 'sql' ? 'SQL' : logicalType === 'markdown' ? 'markdown' : 'python3');
+	const typeLabel = $derived(
+		logicalType === 'sql'
+			? 'SQL'
+			: logicalType === 'markdown'
+				? 'markdown'
+				: logicalType === 'raw'
+					? 'raw'
+					: 'python3'
+	);
 	// The notebook's designated imports cell: user-choosable, marked in the toolbar
 	// with the "imports" badge, and free to live at any index. Only a Python code
 	// cell can hold the role, so the mark action is offered only when `canBeImports`.
@@ -486,7 +506,7 @@
 	// unreachable EXCEPT under a run landing between render and click - `run:start`
 	// clearing `cell.outputs`, or a `cell:cleared` SSE event - which is exactly the
 	// case it covers.
-	const canCopyOutput = $derived(!isMarkdown && hasCopyableOutput(cell.outputs));
+	const canCopyOutput = $derived(isRunnable && hasCopyableOutput(cell.outputs));
 	async function copyOutput(e: Event) {
 		e.stopPropagation();
 		e.preventDefault();
@@ -504,9 +524,9 @@
 	// to distrust (saved outputs, or a run badge). Suppressed while running/queued,
 	// which are the louder, more immediate states.
 	const staleState_ = $derived(staleState?.state ?? null);
-	const isStale = $derived(!isMarkdown && staleState_ === 'stale' && !showRunning && !isQueued);
+	const isStale = $derived(isRunnable && staleState_ === 'stale' && !showRunning && !isQueued);
 	const notRunThisSession = $derived(
-		!isMarkdown && staleState_ === 'not_run' && !showRunning && !isQueued && (lastRun || (cell.outputs || []).length > 0)
+		isRunnable && staleState_ === 'not_run' && !showRunning && !isQueued && (lastRun || (cell.outputs || []).length > 0)
 	);
 	const staleTitle = $derived(
 		staleState?.reason ? `Stale — ${staleState.reason}. Re-run to refresh.` : 'Stale — an input changed after this cell ran. Re-run to refresh.'
@@ -914,12 +934,21 @@
 		typeMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
 		typeMenuEl.style.top = r.bottom + 4 + 'px';
 	}
-	// The cell-type menu options (Python / SQL / Markdown).
-	const TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
+	// The cell-type menu options (Python / SQL / Markdown / Raw). This menu is the
+	// create-and-convert path for raw - there is deliberately no "+ Raw" insert
+	// button, a once-per-notebook type not being worth a third button on every gap.
+	//
+	// Raw is DROPPED on a `.py` text notebook: such a document is rebuilt from its
+	// cells on every save and has no raw marker, so the server refuses it
+	// (`assertCanHoldRaw`) - and a notebook that cannot hold a raw cell must not be
+	// offered a control for one.
+	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
-		{ v: 'markdown', label: 'Markdown', hint: 'text' }
+		{ v: 'markdown', label: 'Markdown', hint: 'text' },
+		{ v: 'raw', label: 'Raw', hint: 'verbatim' }
 	];
+	const typeOptions = $derived(isPy ? ALL_TYPE_OPTIONS.filter((o) => o.v !== 'raw') : ALL_TYPE_OPTIONS);
 	function chooseType(type: LogicalCellType) {
 		typeMenuEl?.hidePopover();
 		if (type !== logicalType) onSetType(cell.id, type);
@@ -1126,14 +1155,20 @@
 	}
 
 	const language = new Compartment();
-	// Editor grammar by LOGICAL type: markdown, SQL (spark queries), or python.
+	// Editor grammar by LOGICAL type: markdown, SQL (spark queries), or python -
+	// and NO grammar at all for raw, whose source is not a language Cellar knows or
+	// should guess at. CodeMirror with no language extension is plain text: no
+	// tokens, so nothing resolves the `--cellar-cm-tok-*` properties and the source
+	// renders in the theme's base ink. (`Compartment.reconfigure` accepts any
+	// Extension, an empty array included.)
 	function langFor() {
 		if (cell.cell_type === 'markdown') return markdown();
+		if (isRaw) return [];
 		return isSql ? sql() : python();
 	}
 	// The same grammar choice, for the static (no-editor) render. Kept in lockstep
 	// with `langFor` so the read-only view highlights like the editor it precedes.
-	const staticLang = $derived<StaticLang>(isMarkdown ? 'markdown' : isSql ? 'sql' : 'python');
+	const staticLang = $derived<StaticLang>(isRaw ? 'plain' : isMarkdown ? 'markdown' : isSql ? 'sql' : 'python');
 
 	// Reconfigure the editor language when the cell type OR its SQL/Python language
 	// toggles; after a manual cell_type toggle, drop into edit mode so the user sees
@@ -1614,17 +1649,22 @@
 				>
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6" /><circle cx="15" cy="6" r="1.6" /><circle cx="9" cy="12" r="1.6" /><circle cx="15" cy="12" r="1.6" /><circle cx="9" cy="18" r="1.6" /><circle cx="15" cy="18" r="1.6" /></svg>
 				</button>
-				<button
-					class="btn btn-ghost btn-xs btn-square text-success"
-					onclick={() => doRun(false)}
-					disabled={running || isQueued}
-					title={isMarkdown ? 'Render (⌘/Ctrl+Enter · Shift+Enter to advance)' : 'Run cell (⌘/Ctrl+Enter · Shift+Enter to advance)'}
-					aria-label={isMarkdown ? 'Render cell' : 'Run cell'}
-					data-testid="run"
-				>
-					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
-				</button>
-				{#if !isMarkdown}
+				<!-- A raw cell has nothing to run and nothing to render, so it is offered
+				     no Run button at all - the one control whose absence says "this cell
+				     is not executed" more clearly than any badge. -->
+				{#if !isRaw}
+					<button
+						class="btn btn-ghost btn-xs btn-square text-success"
+						onclick={() => doRun(false)}
+						disabled={running || isQueued}
+						title={isMarkdown ? 'Render (⌘/Ctrl+Enter · Shift+Enter to advance)' : 'Run cell (⌘/Ctrl+Enter · Shift+Enter to advance)'}
+						aria-label={isMarkdown ? 'Render cell' : 'Run cell'}
+						data-testid="run"
+					>
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
+					</button>
+				{/if}
+				{#if isRunnable}
 					<!-- Run every code cell above this one (exclusive), in document order —
 					     the Jupyter "Run All Above" convention. No-op / disabled on the first
 					     cell (nothing above). Runs through the same bulk-run/queue path. -->
@@ -1645,7 +1685,7 @@
 							<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg>
 						</button>
 					{/if}
-				{:else}
+				{:else if isRunnable}
 					<button class="btn btn-ghost btn-xs btn-square text-base-content/60" onclick={() => onClear(cell.id)} title="Clear output" aria-label="Clear output" data-testid="clear">
 						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 							<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" />
@@ -1670,7 +1710,7 @@
 						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
 					{/if}
 				</button>
-				{#if !isMarkdown}
+				{#if isRunnable}
 					<!-- Copy a text form of the output, built from the cell MODEL (see
 					     $lib/copyCell). Disabled when there is nothing textual to copy -
 					     no outputs at all, or only pictures / charts / live widgets - so
@@ -1732,6 +1772,16 @@
 						data-testid="sql-badge">SQL</span
 					>
 				{/if}
+				{#if isRaw}
+					<!-- Raw indicator, deliberately NEUTRAL where the SQL badge is tinted:
+					     raw is not an execution mode, it is the absence of one. Without it
+					     a raw cell reads as a code cell that has lost its highlighting. -->
+					<span
+						class="badge badge-xs ml-1.5 badge-ghost font-medium"
+						title="Raw cell - verbatim text, never executed or rendered (frontmatter/directives for a downstream tool)"
+						data-testid="raw-badge">raw</span
+					>
+				{/if}
 				<!-- Click-to-copy short cell id. Real button so it is keyboard-
 				     focusable; stops propagation so copying never selects/activates
 				     the cell. Flips to "copied!" for ~1s on success. -->
@@ -1749,7 +1799,7 @@
 						cell <span class="text-base-content/70">#{shortId}</span>
 					{/if}
 				</button>
-				{#if !isMarkdown && lastRun && !showRunning}
+				{#if isRunnable && lastRun && !showRunning}
 					<span
 						class="ml-2 flex items-center gap-1 text-[11px] text-base-content/45"
 						data-testid="run-meta"
@@ -1852,7 +1902,7 @@
 				<button class="btn btn-ghost btn-xs btn-square" onclick={() => onMove(cell.id, 'down')} disabled={index === count - 1} title="Move down" aria-label="Move cell down" data-testid="move-down">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 				</button>
-				{#if !isMarkdown}
+				{#if isRunnable}
 					<!-- Cell-actions menu: hide/show this code cell's input, and (for a plain
 					     Python code cell) designate it the imports cell or mark it for export. -->
 					<button
@@ -1951,7 +2001,7 @@
 							bind:this={typeBtnEl}
 							class="btn btn-ghost btn-xs flex h-5 min-h-0 items-center gap-0.5 px-1.5 font-mono text-[11px] font-normal text-base-content/40 hover:text-base-content/80"
 							onclick={openTypeMenu}
-							title="Change cell type (Python · SQL · Markdown)"
+							title="Change cell type (Python · SQL · Markdown · Raw)"
 							data-testid="type-toggle"
 						>
 							{typeLabel}
@@ -1970,7 +2020,7 @@
 							data-testid="type-menu"
 						>
 							<div class="flex w-36 flex-col gap-0.5">
-								{#each TYPE_OPTIONS as opt}
+								{#each typeOptions as opt}
 									<button
 										class="flex items-center justify-between rounded px-2 py-1 text-left hover:bg-base-200 {logicalType === opt.v ? 'font-semibold text-primary' : 'text-base-content'}"
 										onclick={() => chooseType(opt.v)}
@@ -2145,7 +2195,7 @@
 		</div>
 
 		<!-- Output (code cells only) -->
-		{#if !isMarkdown && outputs.length}
+		{#if isRunnable && outputs.length}
 			<div class="relative border-t border-base-300 bg-(--cellar-surface-output) {cellCollapsed ? 'hidden' : ''}" data-testid="output">
 				<!-- Scroll-outputs toggle (Jupyter "Enable Scrolling for Outputs"). The
 				     DataFrame grid and a full-size image own their own scroll, so the

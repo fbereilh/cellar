@@ -322,6 +322,15 @@ export function readPyNotebook(absPath: string, format?: string): { cells: Cell[
 /**
  * Write canonical cells to a `.py` file in the given jupytext/Databricks format.
  * Only source + cell type are written (a text notebook has no outputs).
+ *
+ * KNOWN LIMIT, deliberate and out of scope: both this writer and `readPyNotebook`
+ * coerce `cell_type` to markdown|code, so an nbformat `raw` cell does NOT survive
+ * a `.py` round trip - "Save as .py" a Quarto notebook and the frontmatter cell
+ * comes back as code. Cellar's Databricks/percent converter has no raw marker to
+ * speak (jupytext itself encodes one as `# %% [raw]`), so carrying it is a
+ * separate task with its own format questions. This is recorded so the next
+ * reader does not take it for an oversight - do not "fix" it by widening the
+ * coercion, which would emit a cell type the converter cannot read back.
  */
 export function writePyNotebook(absPath: string, cells: Cell[], format: string): void {
 	const payload = cells.map((c) => ({

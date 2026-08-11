@@ -18,12 +18,17 @@ export type { ImportChangeStamps };
 
 // --- cells + notebook document --------------------------------------------
 
-/** nbformat cell type as stored on disk. `sql` is a logical Cellar type that
- * maps onto a `code` cell tagged `cellar.language = 'sql'`. */
-export type CellType = 'code' | 'markdown';
+/** nbformat cell type as stored on disk. All THREE nbformat 4.5 types are real
+ * Cellar types; `sql` is a logical Cellar type that maps onto a `code` cell
+ * tagged `cellar.language = 'sql'` (see `$lib/cellLanguage` for why the
+ * reasoning inverts between the two). */
+export type CellType = 'code' | 'markdown' | 'raw';
 
-/** The logical cell types the UI/agent choose between. `sql` is a `code` cell. */
-export type LogicalCellType = 'code' | 'markdown' | 'sql';
+/** The logical cell types the UI/agent choose between. `sql` is a `code` cell;
+ * `code`/`markdown`/`raw` are nbformat types of their own. Keep `CellType` a
+ * SUBSET of this - the clipboard, the undo stack and the insert specs all assign
+ * one into the other. */
+export type LogicalCellType = 'code' | 'markdown' | 'sql' | 'raw';
 
 /** Who initiated a run: a human via the UI, or an agent via MCP. */
 export type Actor = 'user' | 'agent';

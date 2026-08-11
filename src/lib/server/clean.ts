@@ -34,6 +34,22 @@ import type { CellMetadata } from './types';
 
 /** Cell-metadata keys preserved through a clean. Everything else is dropped. */
 export const ALLOWED_CELL_METADATA = ['cellar'];
+/**
+ * The extra cell-metadata keys a `raw` cell keeps, ON TOP of the allowlist above
+ * and ONLY for `cell_type === 'raw'`.
+ *
+ * nbformat defines `format` on a raw cell and Jupyter's "Raw NBConvert Format"
+ * toolbar writes `raw_mimetype`; both tell nbconvert which output formats the
+ * cell belongs to, so dropping them silently repurposes the cell. They are the
+ * cell's own content, not runtime state - unlike everything the deny-by-default
+ * policy exists to strip.
+ *
+ * Deliberately NOT a widening of `ALLOWED_CELL_METADATA`: a code or markdown
+ * cell's foreign metadata is still dropped, so the zero-git-diff clean policy the
+ * rest of this codebase rests on is untouched. Keep this list narrow - a key
+ * belongs here only if nbformat defines it ON a raw cell.
+ */
+export const ALLOWED_RAW_CELL_METADATA = ['raw_mimetype', 'format'];
 /** Notebook-metadata keys preserved through a clean. */
 export const ALLOWED_NB_METADATA = ['kernelspec', 'cellar'];
 
@@ -297,8 +313,11 @@ function cleanCell(cell: RawCell): RawCell {
 			out.outputs = cleanOutputs(out.outputs as RawOutput[]);
 		}
 	}
-	// deny-by-default metadata allowlist (keeps the `cellar` namespace intact)
-	out.metadata = stripRuntimeMeta(pick(cell.metadata, ALLOWED_CELL_METADATA) as CellMetadata);
+	// deny-by-default metadata allowlist (keeps the `cellar` namespace intact),
+	// widened for a RAW cell alone by the two keys nbformat defines on one.
+	const allowed =
+		out.cell_type === 'raw' ? [...ALLOWED_CELL_METADATA, ...ALLOWED_RAW_CELL_METADATA] : ALLOWED_CELL_METADATA;
+	out.metadata = stripRuntimeMeta(pick(cell.metadata, allowed) as CellMetadata);
 	return out;
 }
 

@@ -22,7 +22,11 @@ import { markdownLanguage } from '@codemirror/lang-markdown';
 import { StandardSQL } from '@codemirror/lang-sql';
 import { cellarHighlightStyle } from '$lib/editorTheme';
 
-export type StaticLang = 'python' | 'markdown' | 'sql';
+/** 'plain' = no grammar at all: an nbformat `raw` cell, whose source is verbatim
+ *  text for a downstream tool and not a language to guess at. It matches the
+ *  editor, which reconfigures its language Compartment to an empty extension for
+ *  the same cell - the pixel-for-pixel contract this module exists to keep. */
+export type StaticLang = 'python' | 'markdown' | 'sql' | 'plain';
 
 // Above this source size we skip the parse+highlight and fall back to plain
 // escaped text. A cell this large is rare, and highlighting it eagerly for every
@@ -75,6 +79,7 @@ function plainLines(source: string): string[] {
  * into the render path.
  */
 export function highlightLines(source: string, lang: StaticLang): string[] {
+	if (lang === 'plain') return plainLines(source);
 	if (source.length > MAX_HIGHLIGHT_CHARS) return plainLines(source);
 	ensureStyleMounted();
 	let tree;

@@ -88,7 +88,9 @@
 		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
 		/** This notebook's declared code root (kernel cwd + sys.path), or null for the workspace. */
 		root?: string | null;
-		/** True for a `.py` text notebook, which stores no notebook metadata (no root picker). */
+		/** True for a `.py` text notebook, which stores no notebook metadata (no root
+		 *  picker) and, being rebuilt from its cells on save, cannot hold a raw cell
+		 *  (no Raw entry in a cell's type menu). */
 		isPy?: boolean;
 		/** The workspace's code roots — an empty list renders no root control at all. */
 		availableRoots?: WorkspaceRootOption[];
@@ -666,6 +668,7 @@
 			onSetExport={onSetExport}
 			onSetScrolled={onSetScrolled}
 			{hideAllCode}
+			{isPy}
 			onSetHideInput={onSetHideInput}
 			editorCollapsed={editorCollapsed[cell.id]}
 			onSetEditorCollapsed={onSetEditorCollapsed}
