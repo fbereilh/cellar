@@ -367,12 +367,22 @@ describe('setCellTypes - bulk change type', () => {
 		expect(nbmod.listCells(nb)[0].metadata?.cellar?.language).toBeUndefined();
 	});
 
-	// A raw cell's LOGICAL type reads as 'code' (nbformat only defines
-	// code/markdown/raw and Cellar treats every non-markdown cell as code), so
-	// skipping on the logical type alone left it raw here while the single-cell
-	// setter - which has no "already" check at all - converted it. Both paths must
-	// answer the same, and the client predicts the batch's count from the same
-	// predicate, so a divergence here also reads as a refused batch.
+	it('retypes a selection to raw', () => {
+		const { nb, ids } = makeNotebook('bulk-type-raw-target.ipynb', 3);
+		expect(nbmod.setCellTypes([ids[0]], 'raw', nb)).toEqual([ids[0]]);
+		expect(nbmod.listCells(nb)[0].cell_type).toBe('raw');
+		// Already raw → nothing to change, so nothing is persisted or emitted.
+		seen = [];
+		expect(nbmod.setCellTypes([ids[0]], 'raw', nb)).toEqual([]);
+		expect(seen.filter((e) => e.type === 'cell:type')).toHaveLength(0);
+	});
+
+	// `isLogicalCellType(rawCell, 'code')` is FALSE - the nbformat half of that
+	// predicate is what keeps it so. If it ever flipped, this bulk retype would
+	// silently stop converting a raw cell while the single-cell setter - which has
+	// no "already" check at all - still did. Both paths must answer the same, and
+	// the client predicts the batch's count from the same predicate, so a
+	// divergence here also reads as a refused batch.
 	it('converts an nbformat `raw` cell to code, exactly like the single-cell setter', () => {
 		const { nb, ids } = makeRawNotebook('bulk-type-raw.ipynb');
 		expect(nbmod.listCells(nb)[0].cell_type).toBe('raw');
@@ -487,7 +497,9 @@ describe('POST /api/cells/bulk - argument validation', () => {
 	it('refuses an out-of-vocabulary `cellType` with 400 and touches nothing', async () => {
 		const { nb, ids } = makeNotebook('route-bad-type.ipynb', 3);
 		const before = writes.length;
-		for (const cellType of [undefined, 'raw', 'CODE', null]) {
+		// `raw` is deliberately NOT in this list: it is a real logical type now, and
+		// the positive case for it lives in `setCellTypes - bulk change type`.
+		for (const cellType of [undefined, 'text', 'CODE', null]) {
 			const res = await call({ op: 'type', ids, cellType, nb });
 			expect(res.status).toBe(400);
 			expect(await res.json()).toEqual({ ok: false, reason: 'bad-cell-type' });

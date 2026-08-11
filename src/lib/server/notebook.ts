@@ -30,7 +30,7 @@ import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
 import { canExportCell } from '../exportRole';
 import { resolveInWorkspace } from './fstree';
-import { SQL_LANGUAGE, isLogicalCellType } from '../cellLanguage';
+import { SQL_LANGUAGE, isLogicalCellType, nbCellType } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
 import { normalizeRootPath, textNotebookRootError } from '../notebookRoot';
@@ -117,11 +117,12 @@ function starterCell(): Cell {
 
 function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCellar {
 	// 'sql' is a LOGICAL type: an nbformat `code` cell tagged cellar.language='sql'
-	// (see $lib/cellLanguage.js). markdown/code map to their nbformat cell_type.
+	// (see $lib/cellLanguage.js). code/markdown/raw are nbformat types of their
+	// own, and `nbCellType` is the ONE mapping.
 	const isSql = cellType === 'sql';
 	const cell: CellWithCellar = {
 		id: mintId(),
-		cell_type: cellType === 'markdown' ? 'markdown' : 'code',
+		cell_type: nbCellType(cellType),
 		source: typeof source === 'string' ? source : '',
 		outputs: [],
 		metadata: { cellar: { extract: false, visible: true, ...(isSql ? { language: SQL_LANGUAGE } : {}) } }
@@ -134,7 +135,15 @@ function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCella
 	// verdict staleness must never invent. Folded from an EMPTY previous source: the
 	// cell did not exist before, so nothing about it was ever proven stable. A birth
 	// records no removal, so there is nothing here for the prune to date (null).
-	setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
+	//
+	// Only a CODE cell, though: a markdown or raw cell's source is not Python, so
+	// it binds no module-level imports and stamping it as if it might would be a
+	// claim nothing verified. (Staleness filters to code cells, so this is honesty
+	// rather than a correctness fix - but the stamp rides `cell:edited` and every
+	// checkpoint, so an invented one is not free either.)
+	if (cell.cell_type === 'code') {
+		setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
+	}
 	return cell;
 }
 
@@ -1213,19 +1222,27 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
  */
 function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	const isSql = cellType === 'sql';
-	cell.cell_type = cellType === 'markdown' ? 'markdown' : 'code';
+	cell.cell_type = nbCellType(cellType);
 	cell.metadata = cell.metadata ?? {};
 	cell.metadata.cellar = cell.metadata.cellar ?? {};
 	if (isSql) cell.metadata.cellar.language = SQL_LANGUAGE;
 	else delete cell.metadata.cellar.language;
-	if (cell.cell_type === 'markdown') cell.outputs = [];
-	// SQL and markdown cells cannot be the Python imports cell.
-	if ((cell.cell_type === 'markdown' || isSql) && cell.metadata.cellar.role === IMPORTS_ROLE) {
-		delete cell.metadata.cellar.role;
-	}
-	// Only a Python code cell exports to the module; converting away drops the flag.
-	if ((cell.cell_type === 'markdown' || isSql) && cell.metadata.cellar.export) {
-		delete cell.metadata.cellar.export;
+	// A cell the kernel actually executes as Python. Markdown and raw never reach
+	// it at all; SQL reaches it compiled, so it holds no Python either.
+	const runnable = cell.cell_type === 'code' && !isSql;
+	// Only a code cell holds outputs - markdown and raw carry none, and
+	// `serialize` would drop them anyway.
+	if (cell.cell_type !== 'code') cell.outputs = [];
+	// Neither the imports role nor the nbdev export flag may sit on a cell holding
+	// no Python: the kernel never sees a markdown or raw cell, and a SQL cell's
+	// source is not Python.
+	if (!runnable && cell.metadata.cellar.role === IMPORTS_ROLE) delete cell.metadata.cellar.role;
+	if (!runnable && cell.metadata.cellar.export) delete cell.metadata.cellar.export;
+	// A markdown or raw cell has no code input to hide, so the report-view override
+	// is meaningless on it - and `$lib/hideInput` reads it only for code cells, so
+	// leaving it would re-apply silently if the cell were converted back.
+	if (cell.cell_type !== 'code' && cell.metadata.cellar.hide_input !== undefined) {
+		delete cell.metadata.cellar.hide_input;
 	}
 }
 

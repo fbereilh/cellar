@@ -25,7 +25,7 @@ import { deleteCells, moveCells, setCellTypes } from '$lib/server/notebook';
  * rule itself is `deleteCells`' - the route only reports its verdict.
  */
 const MOVE_DIRS = new Set(['up', 'down']);
-const CELL_TYPES = new Set(['code', 'sql', 'markdown']);
+const CELL_TYPES = new Set(['code', 'sql', 'markdown', 'raw']);
 
 export async function POST({ request }) {
 	const { op, ids, nb, originId, dir, cellType } = await request.json().catch(() => ({}));
