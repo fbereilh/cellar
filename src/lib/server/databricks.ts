@@ -1015,6 +1015,14 @@ export class DatabricksError extends Error {
 	 * exact `databricks auth login --profile <name>` command (never hardcoded).
 	 */
 	profile?: string;
+	/**
+	 * Whether the kernel was restarted (so the namespace is gone) BEFORE the failure.
+	 * Set only where an operation can fail with that side effect already paid, so the
+	 * caller learns it instead of being told only that the call failed. Reported with
+	 * the same `kernel_restarted`/`namespace_cleared` pair a success carries - never a
+	 * second reporting shape.
+	 */
+	kernelRestarted?: boolean;
 	constructor(code: string, message: string, profile?: string) {
 		super(message);
 		this.name = 'DatabricksError';
@@ -3623,10 +3631,27 @@ export async function setRuntimeAdvertisement({
 	const desired = injectDatabricksRuntime(bound) ? databricksRuntimeVersion() : null;
 	const live = liveDatabricksRuntime(abs);
 	const epochBefore = currentSessionId(abs);
-	if (live.started && live.version !== desired) await restartKernel(abs);
+	let restartFailure: unknown = null;
+	if (live.started && live.version !== desired) {
+		try {
+			await restartKernel(abs);
+		} catch (err) {
+			restartFailure = err;
+		}
+	}
+	// The EPOCH decides whether the namespace survived - never whether the call threw.
+	// `restartKernel` bumps it in a `finally` precisely because the namespace is gone
+	// once the REST restart has been issued, even when the websocket reconnect or
+	// `initKernel` then rejects. Reading the throw instead would report nothing about a
+	// namespace that really was cleared, which is the NameError trap the whole run-status
+	// doctrine exists to prevent.
 	const kernelRestarted = epochBefore != null && currentSessionId(abs) !== epochBefore;
 
 	publishGlobal({ type: 'databricks:changed' });
+	// A failed restart still leaves the preference stored (the standing instruction) and
+	// still has to STATE its side effects, so it is rethrown carrying the same
+	// `kernelRestarted` fact the success shape reports rather than a bare failure.
+	if (restartFailure !== null) throw runtimeRestartFailed(restartFailure, kernelRestarted);
 	const runtime = agentRuntimeBlock(abs);
 	return {
 		enabled: enable,
@@ -3638,6 +3663,26 @@ export async function setRuntimeAdvertisement({
 			: {}),
 		note: runtimeNote({ enable, bound, runtime, kernelRestarted, versionForcedByEnv, requested })
 	};
+}
+
+/**
+ * The failure `setRuntimeAdvertisement` raises when the restart that APPLIES the
+ * preference threw. It leads with the namespace, because that is the fact the caller
+ * has to act on and the one a bare failure hides: a restart that reaches the kernel
+ * and then fails to come back has already destroyed every variable. `kernelRestarted`
+ * comes from the epoch, so the sentence and the structured pair can never disagree,
+ * and the underlying failure rides the same message rather than being swallowed.
+ */
+function runtimeRestartFailed(cause: unknown, kernelRestarted: boolean): DatabricksError {
+	const detail = String((cause as { message?: string } | null)?.message ?? cause);
+	const err = new DatabricksError(
+		'runtime_restart_failed',
+		kernelRestarted
+			? `The preference was STORED, but the kernel restart that applies it failed after the restart had already been issued: every Python variable is GONE (ran_this_session is now false for every cell), so re-run the cells you need. The kernel may not be usable until it is restarted again (restart_kernel). Underlying failure: ${detail}`
+			: `The preference was STORED, but the kernel restart that applies it failed before anything was torn down: your namespace is intact and the kernel still advertises what it did before, so the preference applies at the next kernel start. Underlying failure: ${detail}`
+	);
+	err.kernelRestarted = kernelRestarted;
+	return err;
 }
 
 /** The one honest sentence for each outcome of `setRuntimeAdvertisement`. */

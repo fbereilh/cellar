@@ -100,6 +100,28 @@ export function isPyPath(path: string): boolean {
 }
 
 /**
+ * The first line of `text` that is not blank, trimmed - `''` when there is none.
+ *
+ * Walks the leading lines rather than splitting the whole string, because the ONE
+ * thing this answers is a HEADER fact: `isPyNotebookFile` hands over a 64 KB prefix
+ * for every `.py` in the workspace, on the process that also carries the kernel
+ * websockets and the SSE fan-out, and a split allocated an array of every line in it
+ * to read one. Same rule as before: only the first non-blank line can be the
+ * Databricks header, and a line is blank when it trims to nothing.
+ */
+function firstNonBlankLine(text: string): string {
+	let from = 0;
+	while (from < text.length) {
+		let end = text.indexOf('\n', from);
+		if (end === -1) end = text.length;
+		const line = text.slice(from, end).trim();
+		if (line !== '') return line;
+		from = end + 1;
+	}
+	return '';
+}
+
+/**
  * Decide, from a `.py` file's TEXT alone, whether Cellar should open it as a live
  * notebook — and never boot python to do it. A plain script must still open as
  * text (matching VS Code / the task), so only an explicit notebook marker counts:
@@ -111,8 +133,7 @@ export function isPyPath(path: string): boolean {
  * Python helper re-detects authoritatively on read and reports the real one.
  */
 export function detectPyNotebook(text: string): { notebook: boolean; format: string | null } {
-	const firstNonBlank = (text.split('\n').find((l) => l.trim() !== '') ?? '').trim();
-	if (firstNonBlank === DBX_HEADER) return { notebook: true, format: 'databricks' };
+	if (firstNonBlankLine(text) === DBX_HEADER) return { notebook: true, format: 'databricks' };
 	if (/^# %%/m.test(text)) return { notebook: true, format: 'percent' };
 	if (/^# ---\s*$/m.test(text) && /^#\s+jupytext:/m.test(text)) return { notebook: true, format: null };
 	return { notebook: false, format: null };

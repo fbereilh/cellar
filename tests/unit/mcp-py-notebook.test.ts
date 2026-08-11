@@ -48,6 +48,8 @@ let nbmod: typeof import('../../src/lib/server/notebook');
 const DBX = '# Databricks notebook source\nx = 1\n\n# COMMAND ----------\n\nprint(x)\n';
 const PERCENT = '"""A module docstring."""\n\n# %%\nx = 1\n';
 const PLAIN = 'def helper():\n    return 42\n';
+/** The Databricks header is the first NON-BLANK line, so a blank run above it counts. */
+const BLANK_LEAD = '\n\n   \n' + DBX;
 
 beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-mcp-py-'));
@@ -56,6 +58,7 @@ beforeAll(async () => {
 	writeFileSync(join(WS, 'scripts', 'parity.py'), DBX);
 	writeFileSync(join(WS, 'percent_nb.py'), PERCENT);
 	writeFileSync(join(WS, 'helpers.py'), PLAIN);
+	writeFileSync(join(WS, 'blank_lead.py'), BLANK_LEAD);
 	// A real, non-notebook file with an extension: `use_notebook` must not take it.
 	writeFileSync(join(WS, 'package.json'), '{\n  "name": "not-a-notebook"\n}\n');
 	svc = await import('../../src/lib/server/mcp/service');
@@ -112,6 +115,9 @@ describe('list_notebooks discovers .py notebooks', () => {
 		const paths = svc.listNotebooks().notebooks.map((n) => n.path);
 		expect(paths).toContain('scripts/parity.py'); // Databricks header
 		expect(paths).toContain('percent_nb.py'); // `# %%` below a docstring
+		// The header is the first NON-BLANK line, so a blank run above it is still one -
+		// the edge the sniff's line walk has to preserve.
+		expect(paths).toContain('blank_lead.py');
 		expect(paths).not.toContain('helpers.py'); // no marker: a module, not a notebook
 		expect(paths).toContain('other.ipynb'); // .ipynb listing unchanged
 	});

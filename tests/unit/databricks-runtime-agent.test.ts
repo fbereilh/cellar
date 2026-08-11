@@ -30,7 +30,14 @@ const hoisted = vi.hoisted(() => ({
 	session: 1 as number | null,
 	/** What the LIVE kernel session was started with - the one fact only a kernel knows. */
 	liveRuntime: { started: true, version: null as string | null },
-	restarts: 0
+	restarts: 0,
+	/**
+	 * Make the next restart fail, on either side of the epoch bump. `'after-epoch'` is
+	 * the real shape: the real `restartKernel` bumps the epoch in a `finally`, because
+	 * the namespace is gone once the REST restart has been issued, and only then does
+	 * the reconnect reject. `'before-epoch'` is the failure that tore nothing down.
+	 */
+	restartThrows: null as null | 'after-epoch' | 'before-epoch'
 }));
 
 vi.mock('../../src/lib/server/kernel', () => ({
@@ -56,7 +63,14 @@ vi.mock('../../src/lib/server/kernel', () => ({
 	// the production code observes it.
 	restartKernel: async () => {
 		hoisted.restarts++;
+		if (hoisted.restartThrows === 'before-epoch') throw new Error('websocket reconnect failed');
 		hoisted.session = (hoisted.session ?? 0) + 1;
+		if (hoisted.restartThrows === 'after-epoch') {
+			// The namespace is already gone: the process was torn down and nothing was
+			// re-injected into the replacement, which is what a failed reconnect leaves.
+			hoisted.liveRuntime = { started: true, version: null };
+			throw new Error('websocket reconnect failed');
+		}
 		const inject = await import('../../src/lib/server/ui-state');
 		const bound = (await import('../../src/lib/server/databricks')).databricksBound(A());
 		hoisted.liveRuntime = {
@@ -92,6 +106,7 @@ beforeEach(async () => {
 	hoisted.session = 1;
 	hoisted.liveRuntime = { started: true, version: null };
 	hoisted.restarts = 0;
+	hoisted.restartThrows = null;
 	delete process.env.CELLAR_DATABRICKS_RUNTIME;
 	delete process.env.CELLAR_DATABRICKS_RUNTIME_VERSION;
 	ui.setUiState({ [keys.DBX_RUNTIME_KEY]: null, [keys.DBX_RUNTIME_VERSION_KEY]: null });
@@ -228,6 +243,47 @@ describe('databricks_runtime applies the advertisement', () => {
 		expect(r.note).toMatch(/REMOVED/);
 		expect(r.note).not.toMatch(/NOT restarted/i);
 		expect(r.note).not.toMatch(/nothing is advertised yet/i);
+	});
+
+	// A restart that reaches the kernel and then fails to come back has ALREADY
+	// destroyed the namespace (`restartKernel` bumps the epoch in a `finally` for
+	// exactly that reason), so a failure that reported only "it failed" would leave the
+	// agent building on variables that are gone - the NameError trap the run-status
+	// doctrine exists to prevent. The side effects are keyed off the EPOCH, never off
+	// whether the call threw.
+	it('still reports the cleared namespace when the restart itself fails', async () => {
+		await connectA();
+		hoisted.restarts = 0;
+		hoisted.restartThrows = 'after-epoch';
+
+		const err = await dbx
+			.setRuntimeAdvertisement({ enable: true, nb: A() })
+			.then(() => null, (e) => e as { code?: string; message?: string; kernelRestarted?: boolean });
+		expect(hoisted.restarts).toBe(1);
+		expect(err?.code).toBe('runtime_restart_failed');
+		expect(err?.kernelRestarted).toBe(true);
+		// The sentence has to say it too, and must not deny the restart.
+		expect(err?.message).toMatch(/GONE/);
+		expect(err?.message).toMatch(/re-run the cells/i);
+		// The underlying failure is surfaced, not swallowed.
+		expect(err?.message).toMatch(/websocket reconnect failed/);
+		// And the preference is still stored: it is the standing instruction, so the
+		// next kernel start honors it even though this reconcile failed.
+		expect(ui.injectDatabricksRuntime(true)).toBe(true);
+	});
+
+	it('says the namespace is INTACT when the restart failed before tearing anything down', async () => {
+		await connectA();
+		hoisted.restartThrows = 'before-epoch';
+
+		const err = await dbx
+			.setRuntimeAdvertisement({ enable: true, nb: A() })
+			.then(() => null, (e) => e as { code?: string; message?: string; kernelRestarted?: boolean });
+		expect(err?.code).toBe('runtime_restart_failed');
+		expect(err?.kernelRestarted).toBe(false);
+		expect(err?.message).toMatch(/intact/i);
+		expect(err?.message).not.toMatch(/GONE/);
+		expect(err?.message).toMatch(/websocket reconnect failed/);
 	});
 
 	it('does not restart a notebook whose kernel has not started', async () => {

@@ -119,4 +119,19 @@ describe('databricks_runtime at the wire', () => {
 		expect(payload.runtime).toEqual({ advertised: false, version: null, forced_by_env: false });
 		expect(payload.note).toMatch(/not connected/i);
 	});
+
+	// A restart can fail with the namespace ALREADY gone (`restartKernel` bumps the
+	// epoch in a `finally`), so `setRuntimeAdvertisement` raises that fact on the error.
+	// The error path is the one that must not drop it: an agent told only "it failed"
+	// keeps using variables that no longer exist. Source-guarded because a failure this
+	// deep is not reachable over the in-memory wire, and e2e is absent from CI.
+	it('the databricks error path forwards a side effect already paid', async () => {
+		const { readFileSync } = await import('node:fs');
+		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
+		const fn = src.slice(src.indexOf('async function databricksTool('), src.indexOf('\n}\n', src.indexOf('async function databricksTool(')));
+		expect(fn).toMatch(/kernelRestarted/);
+		// Reported as the SAME pair a success carries, never a second shape.
+		expect(fn).toMatch(/kernel_restarted: e\.kernelRestarted/);
+		expect(fn).toMatch(/namespace_cleared: e\.kernelRestarted/);
+	});
 });
