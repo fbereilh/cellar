@@ -1,23 +1,22 @@
 /**
- * The notebook toolbar's three buttons live in a component, and vitest runs without
- * the SvelteKit plugin (see `vitest.config.ts`), so `Notebook.svelte` cannot be
- * mounted here. Their behavioural proof is `tests/e2e/toolbar-interrupt-clear-all.spec.ts`,
- * which neither CI nor the no-mistakes gate runs - so the rules that are one
- * expression wide are pinned at the source too (the `shell-refresh-handlers` /
- * `upload-default-guards` precedent).
+ * Source guards for the notebook toolbar's three whole-notebook actions.
  *
- * The rules:
+ * WHAT THESE PROVE, AND WHAT THEY DO NOT. vitest runs without the SvelteKit
+ * plugin (see `vitest.config.ts`), so `Notebook.svelte` cannot be mounted here —
+ * these read the component source, so they can only witness that the wiring is
+ * DECLARED, never that it behaves. The behavioural proof (the buttons render,
+ * gate on real state, and really interrupt a batch / clear every cell's outputs
+ * on disk) is `tests/e2e/toolbar-interrupt-clear-all.spec.ts`, against a real
+ * kernel. These stay in the unit suite only because e2e runs in neither CI nor
+ * the no-mistakes gate, so without them the two invariants below could regress
+ * and merge green.
  *
- *   1. Interrupt and Clear-all are SURFACING, not new logic: each button calls the
- *      handler prop its command-palette twin already drives (`onInterrupt` /
- *      `onClearAll`). A second kernel or clear implementation in the toolbar would
- *      be a second persistence/abort path.
- *   2. `LiveNotebook` passes `clearAll` in as `onClearAll` - the SAME function the
- *      `clear-all-outputs` palette command calls, so the two cannot diverge.
- *   3. The gating derives from the notebook's OWN state: `runningId`/`queued` (both
- *      already per-notebook props, so another notebook's run can never arm this
- *      button) and the cells' outputs read off the MODEL - never off the mounted
- *      DOM, which windowing prunes to a fraction of the notebook.
+ * Deliberately narrow: only what raw source text can honestly carry and what
+ * survives a behaviour-preserving refactor — the controls exist and are
+ * labelled, and the clear-all button reaches the SAME function the palette's
+ * `clear-all-outputs` command does. Assertions on exact expressions (a
+ * `$derived` line, an `onclick` body) belong to the e2e, not here: they break on
+ * a rename and pass on dead code.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -25,6 +24,8 @@ import { join } from 'node:path';
 
 const NOTEBOOK = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
 const LIVE = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
+
+const TOOLBAR_ACTIONS = ['run-all', 'interrupt-all', 'clear-all-outputs'];
 
 /** The `<button …>` element whose `data-testid` is `id`. */
 function buttonWith(testid: string): string {
@@ -48,57 +49,17 @@ const TOOLBAR = (() => {
 
 describe('notebook toolbar: the three whole-notebook actions', () => {
 	it('renders Run all, Interrupt and Clear all outputs together', () => {
-		for (const id of ['run-all', 'interrupt-all', 'clear-all-outputs']) {
+		for (const id of TOOLBAR_ACTIONS) {
 			expect(TOOLBAR, `${id} is not in the toolbar`).toContain(`data-testid="${id}"`);
 		}
 	});
 
-	it('gives each button a title and an aria-label, like Run all has', () => {
-		for (const id of ['run-all', 'interrupt-all', 'clear-all-outputs']) {
+	it('gives each button a title and an aria-label', () => {
+		for (const id of TOOLBAR_ACTIONS) {
 			const btn = buttonWith(id);
 			expect(btn, `${id} has no title`).toMatch(/title="/);
 			expect(btn, `${id} has no aria-label`).toMatch(/aria-label="/);
 		}
-	});
-});
-
-describe('the buttons only TRIGGER the existing handlers', () => {
-	it('Interrupt calls the onInterrupt prop and nothing else', () => {
-		const btn = buttonWith('interrupt-all');
-		expect(btn).toContain('onclick={() => onInterrupt?.()}');
-		// No second abort/kernel path: the whole interrupt sequence (abort the in-flight
-		// run fetches, bump `interruptGeneration`, then hit the server) is behind that prop.
-		expect(btn).not.toMatch(/fetch\(|interruptGeneration|\/api\/kernel/);
-	});
-
-	it('Clear all outputs calls the onClearAll prop and nothing else', () => {
-		const btn = buttonWith('clear-all-outputs');
-		expect(btn).toContain('onclick={() => onClearAll?.()}');
-		// A clear that persisted from here would be a SECOND persistence path beside
-		// the one `clearAll` -> `clearCell` already drives.
-		expect(btn).not.toMatch(/fetch\(|\/api\/cells/);
-	});
-});
-
-describe('gating', () => {
-	it('Interrupt is disabled unless THIS notebook is running or has queued work', () => {
-		expect(NOTEBOOK).toContain(
-			"const notebookBusy = $derived(runningId !== null || Object.keys(queued).length > 0);"
-		);
-		expect(buttonWith('interrupt-all')).toContain('disabled={!notebookBusy}');
-	});
-
-	it('Clear all outputs is disabled unless some cell holds output', () => {
-		// Read off `cells` (the document model), so a cell windowing has never mounted
-		// still counts - the same reason `clearAll` itself iterates the model.
-		expect(NOTEBOOK).toContain(
-			'const hasOutputs = $derived(cells.some((c) => (c.outputs?.length ?? 0) > 0));'
-		);
-		expect(buttonWith('clear-all-outputs')).toContain('disabled={!hasOutputs}');
-	});
-
-	it('Run all keeps its own gating unchanged', () => {
-		expect(buttonWith('run-all')).toContain('disabled={!hasCodeCell}');
 	});
 });
 

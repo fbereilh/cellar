@@ -292,6 +292,16 @@
 	// advancing to the next cell after its current run is aborted, instead of firing
 	// the rest of the batch (nothing is queued server-side there to clear).
 	let interruptGeneration = 0;
+	// How many sequential bulk-run loops (`runCodeIds`: Run all / above / below /
+	// stale) are in flight. This is the ONE signal that a batch is still going:
+	// `runningId` and `queued` both go empty BETWEEN two cells of a batch, because
+	// `runCell`'s finally clears `runningId` and dispatch is sequential, so only one
+	// `/run` stream is ever open and nothing is ever server-side queued - so a
+	// toolbar control gated on those alone would flicker off for a round trip per
+	// cell. A counter, not a boolean, so two overlapping batches (Run all clicked
+	// twice) cannot have the first to finish declare the notebook idle.
+	let bulkRuns = $state(0);
+	const bulkRunning = $derived(bulkRuns > 0);
 
 	// ---- Selection -----------------------------------------------------------
 	// THE authoritative selection model (the pure algebra lives in
@@ -1948,13 +1958,20 @@
 		// is awaited in turn, so an aborted cell's `runCell` returns like a normal
 		// finish and the loop would otherwise advance to the next cell.
 		const gen = interruptGeneration;
-		for (const id of ids) {
-			const cell = findCell(id);
-			if (!cell || cell.cell_type !== 'code') continue;
-			// Use the editor's LIVE text, not the debounced `cell.source`.
-			const src = cellApis[id]?.currentSource?.() ?? cell.source;
-			await runCell(id, src);
-			if (interruptGeneration !== gen) return; // interrupted mid-batch
+		bulkRuns += 1;
+		try {
+			for (const id of ids) {
+				const cell = findCell(id);
+				if (!cell || cell.cell_type !== 'code') continue;
+				// Use the editor's LIVE text, not the debounced `cell.source`.
+				const src = cellApis[id]?.currentSource?.() ?? cell.source;
+				await runCell(id, src);
+				if (interruptGeneration !== gen) return; // interrupted mid-batch
+			}
+		} finally {
+			// In a `finally` so an early return (interrupted mid-batch) or a throw can
+			// never leave the batch claiming to run forever.
+			bulkRuns -= 1;
 		}
 		refreshStaleness();
 	}
@@ -3496,6 +3513,7 @@
 			{focusedId}
 			runningId={runningId}
 			{queued}
+			{bulkRunning}
 			{activeId}
 			{selectedIds}
 			{keyMode}

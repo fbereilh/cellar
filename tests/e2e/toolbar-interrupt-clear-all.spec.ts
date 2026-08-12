@@ -15,6 +15,9 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  *  - Interrupt is disabled while nothing runs, arms while a run is in flight, and
  *    clicking it really stops the batch (the sleeper ends far short of its sleep
  *    and no later cell runs) — the same effect as the palette command;
+ *  - Interrupt stays armed ACROSS a cell-to-cell transition of a bulk run: a
+ *    sequential batch leaves nothing running and nothing queued between two cells,
+ *    so gating on those alone would drop the button for a round trip per cell;
  *  - Clear all outputs is disabled when there is nothing to clear, clears EVERY
  *    cell including ones virtualization has windowed out (it reads the document
  *    model, not the mounted DOM), and the cleared state is on DISK — asserted
@@ -172,6 +175,49 @@ test('Interrupt is disabled until a run is in flight, then stops the whole batch
 
 	// With nothing left running the button disarms again.
 	await expect(interrupt).toBeDisabled();
+});
+
+test('Interrupt stays armed between the cells of a bulk run, and disarms after it', async ({ page }) => {
+	test.setTimeout(180_000);
+	// Three quick cells: each run is short, so the gap BETWEEN them is what this is
+	// about — the moment cell N has ended and cell N+1's `run:start` has not arrived,
+	// where nothing is running and (sequential dispatch) nothing is queued either.
+	await boot(buildNotebook([0, 1, 2].map((i) => ({ type: 'code' as const, source: `step_${i} = ${i}` }))));
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebook(page);
+
+	// Widen that gap to something observable by delaying the run POST itself. This
+	// slows the real request; it invents no state — the gap exists at full speed too,
+	// it is just one round trip wide and would make the assertion below a race.
+	const GAP_MS = 2000;
+	await page.route('**/api/cells/*/run', async (route) => {
+		await new Promise((r) => setTimeout(r, GAP_MS));
+		await route.continue();
+	});
+
+	const interrupt = page.getByTestId('notebook-toolbar').getByTestId('interrupt-all');
+	await expect(interrupt).toBeDisabled();
+
+	await page.getByTestId('notebook-toolbar').getByTestId('run-all').click();
+	await expect(page.locator('[data-cell-id="c0"] [data-testid="running-bar"]')).toBeVisible({ timeout: 90_000 });
+	await expect(interrupt).toBeEnabled();
+
+	// The first cell has finished and the second has not started: the batch is
+	// between cells. Single-shot reads — `toBeEnabled()` retries, so it would hide a
+	// button that is disabled right now and re-arms when the next cell starts.
+	await expect(page.locator('[data-cell-id="c0"] [data-testid="running-bar"]')).toBeHidden({ timeout: 60_000 });
+	expect(await interrupt.isDisabled(), 'Interrupt dropped out between two cells of Run all').toBe(false);
+	await page.waitForTimeout(GAP_MS / 2);
+	expect(await interrupt.isDisabled(), 'Interrupt dropped out between two cells of Run all').toBe(false);
+
+	// The batch really did advance across that gap (so the window above was a
+	// cell-to-cell transition, not the end of the run).
+	await expect(page.locator('[data-cell-id="c1"] [data-testid="running-bar"]')).toBeVisible({ timeout: 60_000 });
+	await expect(interrupt).toBeEnabled();
+
+	// Once the whole batch is done — not merely between cells — it disarms.
+	await page.unroute('**/api/cells/*/run');
+	await expect(interrupt).toBeDisabled({ timeout: 90_000 });
 });
 
 test('Clear all outputs clears every cell — windowed-out ones included — and persists', async ({ page }) => {

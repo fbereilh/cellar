@@ -26,6 +26,13 @@
 		runningId: string | null;
 		/** cell id → 1-based position in this notebook's kernel run queue */
 		queued?: Record<string, number>;
+		/**
+		 * Whether a sequential bulk run (Run all / above / below / stale) of THIS
+		 * notebook is still working through its cells. `runningId`/`queued` both go
+		 * empty between two cells of such a batch, so this is what keeps "Interrupt"
+		 * armed for the whole batch rather than flickering off once per cell.
+		 */
+		bulkRunning?: boolean;
 		activeId?: string | null;
 		/**
 		 * The multi-cell selection, as document-model ids. Always contains `activeId`
@@ -154,6 +161,7 @@
 		cells,
 		runningId,
 		queued = {},
+		bulkRunning = false,
 		activeId = null,
 		selectedIds = EMPTY_SELECTION,
 		keyMode = 'command',
@@ -462,8 +470,10 @@
 	// "Interrupt". Read off the same per-notebook `runningId`/`queued` the cells
 	// render their running/queued affordances from (never a global run counter:
 	// notebooks run in parallel, so another notebook's run must not arm this
-	// button), so the button is live exactly while there is something to stop.
-	const notebookBusy = $derived(runningId !== null || Object.keys(queued).length > 0);
+	// button), plus `bulkRunning` — those two go empty BETWEEN the cells of a
+	// sequential bulk run, so without it the button would flicker disabled for a
+	// round trip per cell and drop a click landing in that window.
+	const notebookBusy = $derived(runningId !== null || Object.keys(queued).length > 0 || bulkRunning);
 	// Whether any cell holds output to clear — gates "Clear all outputs". Read off
 	// the MODEL, not the mounted cells, so a windowed-out cell's output counts.
 	const hasOutputs = $derived(cells.some((c) => (c.outputs?.length ?? 0) > 0));
