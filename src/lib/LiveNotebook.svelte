@@ -3397,11 +3397,19 @@
 	// skipped and nothing is reported - but the free is TEMPORARY, and that is the
 	// part to know: the clear empties that cell in the document and on disk, while
 	// the run's accumulator still holds the whole buffer, so `run:end` writes the
-	// full transcript back - the pre-clear output included. This tab meanwhile
-	// renders the cell blank until then (its delta no longer matches the emptied
-	// array, so the append no-ops). (MCP `clear_outputs` deliberately answers
-	// differently for an agent, whose call is a one-shot report rather than a live
-	// view; the two surfaces differ on purpose.)
+	// full transcript back - the pre-clear output included.
+	//
+	// THIS tab does not follow that write, and not only until the run ends: the
+	// NDJSON `run:end` branch only stamps `lastRun`, the server's own `run:end` SSE
+	// is dropped here by the `originId` gate, and `lastSeq` advances on our echoes
+	// so no seq-gap refetch fires. So the cell keeps rendering empty AFTER the run
+	// too - and `hasOutputs` reads those same emptied model outputs, so the toolbar's
+	// clear-all button sits DISABLED over a notebook whose `.ipynb` does hold
+	// outputs - until a reload or some other resyncing `load()`.
+	//
+	// (MCP `clear_outputs` deliberately answers differently for an agent, whose call
+	// is a one-shot report rather than a live view; the two surfaces differ on
+	// purpose.)
 	async function clearAll() {
 		for (const c of cells) {
 			if (c.outputs?.length) await clearCell(c.id);
