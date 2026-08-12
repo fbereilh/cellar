@@ -25,6 +25,7 @@ import { readNotebook, deserialize, writeNotebook, serialize, stringify } from '
 import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
+import { truncateActiveRunOutputs } from './run-output-registry';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
@@ -1514,11 +1515,17 @@ export function setOutputsLive(id: string, outputs: CellOutput[], nb?: string | 
  * the whole jupytext conversion to write byte-identical bytes and churn mtime -
  * once per cell over the UI's clear-all loop. The EVENT still fires unconditionally,
  * so every open tab clears whatever the format.
+ *
+ * A cell whose run is IN FLIGHT is cleared like any other, and the clear reaches
+ * that run too (`truncateActiveRunOutputs`), so the output it produced before this
+ * point is gone for good rather than restored by the next flush and written back at
+ * `run:end`. See the truncation note on `clearOutputsForCells`.
  */
 export function clearOutputs(id: string, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (cell) {
+		truncateActiveRunOutputs(doc.path, id);
 		cell.outputs = [];
 		if (!doc.jpFormat) persist(doc);
 		emit(doc, 'cell:cleared', { cellId: id }, originId);
@@ -1553,6 +1560,10 @@ export function clearOutputsForCells(ids: readonly string[], nb?: string | null,
 	const cleared: string[] = [];
 	for (const cell of doc.cells) {
 		if (!wanted.has(cell.id) || !cell.outputs?.length) continue;
+		// BEFORE emptying the document, so no flush of an in-flight run can interleave
+		// and put its buffer back. A no-op for the cells that are not running, which is
+		// almost all of them.
+		truncateActiveRunOutputs(doc.path, cell.id);
 		cell.outputs = [];
 		cleared.push(cell.id);
 	}

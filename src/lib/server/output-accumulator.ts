@@ -145,6 +145,36 @@ export class OutputAccumulator {
 		this.caps = caps;
 	}
 
+	/**
+	 * Drop everything accumulated so far and return to the just-constructed state —
+	 * what a mid-run "clear outputs" of THIS cell means on the server.
+	 *
+	 * The clear empties the document; without this the accumulator would keep its
+	 * buffer and its element indices, so (a) the next flush would restore the whole
+	 * pre-clear text into the live doc and `run:end` would persist it, undoing the
+	 * clear, and (b) the next element would be emitted at index N against a client
+	 * array the clear emptied, leaving a HOLE at 0 — which throws while rendering
+	 * and, with no error boundary anywhere in `src/`, takes the whole notebook's
+	 * render tree down. Resetting the indices too is what keeps the two in step.
+	 *
+	 * `outputs` is emptied IN PLACE: callers hold the reference (run.ts persists
+	 * `finish()`'s return, and each emit mirrors `outputs.slice()` into the doc).
+	 * Dropping `pending` takes its `emitted` delta baseline with it, so the next
+	 * element materializes as a FULL frame at index 0 rather than as a delta against
+	 * a baseline the client no longer has.
+	 */
+	reset(): void {
+		this.outputs.length = 0;
+		this.pending = null;
+		this.streamBytes = 0;
+		this.totalBytes = 0;
+		this.capped = false;
+		this.markerIndex = null;
+		this.droppedItems = 0;
+		this.droppedBytes = 0;
+		this.capReason = '';
+	}
+
 	/** Feed one raw output from the kernel. */
 	push(output: CellOutput): void {
 		if (output.output_type === 'stream') this.pushStream(output.name, asText(output.text));

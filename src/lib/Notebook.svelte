@@ -777,11 +777,12 @@
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
 				Run all
 			</button>
-			<!-- Disabled only while this notebook is genuinely idle, where the whole
-			     sequence would be a no-op: no interrupt request is fired at a kernel
-			     with nothing to stop and no queue to drop. Queued runs (this tab's,
-			     another tab's or an agent's) put entries in `queued`, so the button
-			     is ENABLED exactly when there is something for it to cancel. -->
+			<!-- Disabled only while this notebook looks idle from here, so no interrupt
+			     request is fired at a kernel with nothing to stop and no queue to drop.
+			     That is what the disable buys, and no more: `queued` is this tab's
+			     mirror of the server snapshot, so between another tab's or an agent's
+			     run being enqueued and the `queue:changed` broadcast landing, the
+			     button is briefly disabled while there really is something to cancel. -->
 			<button
 				class="btn btn-ghost btn-sm gap-1.5"
 				onclick={() => onInterrupt?.()}

@@ -1647,9 +1647,19 @@
 	// per chunk. Reassigning the element (not mutating in place) keeps Svelte's deep
 	// `$state` proxy reactive. Events without an index (defensive / older shapes)
 	// simply append.
-	function applyOutput(cell: UICell, output: CellOutput, index?: number) {
+	// Defence in depth, like applyOutputAppend's base check: an index PAST the end of
+	// our array would leave a hole, and a hole throws while rendering — with no error
+	// boundary anywhere in the app that takes the whole notebook's render tree down,
+	// not just this cell. So an index we cannot place contiguously means this tab is
+	// out of sync: bail and let the caller resync. The server keeps the two in step
+	// (a mid-run clear resets that run's accumulator, so its indices restart at 0
+	// alongside our emptied array), so this should be unreachable.
+	function applyOutput(cell: UICell, output: CellOutput, index?: number): boolean {
 		if (!cell.outputs) cell.outputs = [];
-		cell.outputs[index ?? cell.outputs.length] = output;
+		const at = index ?? cell.outputs.length;
+		if (at > cell.outputs.length) return false;
+		cell.outputs[at] = output;
+		return true;
 	}
 
 	// Apply a streamed-output DELTA (`run:output-append`) to a growing stream
@@ -1692,7 +1702,7 @@
 				cell.outputs = [];
 			}
 		} else if (ev.type === 'run:output') {
-			if (cell) applyOutput(cell, ev.output, ev.index);
+			if (cell && !applyOutput(cell, ev.output, ev.index) && !fetching) load();
 		} else if (ev.type === 'run:output-append') {
 			// A stream delta whose base doesn't match means we're out of sync (a dropped
 			// establishing frame / earlier delta, or a reconnect refetch racing a live
@@ -1882,7 +1892,9 @@
 						runningId = id;
 						cell.outputs = [];
 					} else if (ev.type === 'output') {
-						applyOutput(cell, ev.output, ev.index);
+						// A refused index means this tab is out of sync (see applyOutput); the
+						// SSE path resyncs, so do the same here rather than dropping the frame.
+						if (!applyOutput(cell, ev.output, ev.index) && !fetching) load();
 					} else if (ev.type === 'output-append') {
 						// Streamed-output delta on our own run's stream (see applyOutputAppend).
 						// A base mismatch here would only happen if we missed the establishing
@@ -3394,18 +3406,13 @@
 	// clear-all button are both this function, so the two cannot diverge.
 	//
 	// A cell whose run is IN FLIGHT is cleared like any other - nothing here is
-	// skipped and nothing is reported - but the free is TEMPORARY, and that is the
-	// part to know: the clear empties that cell in the document and on disk, while
-	// the run's accumulator still holds the whole buffer, so `run:end` writes the
-	// full transcript back - the pre-clear output included.
-	//
-	// THIS tab does not follow that write, and not only until the run ends: the
-	// NDJSON `run:end` branch only stamps `lastRun`, the server's own `run:end` SSE
-	// is dropped here by the `originId` gate, and `lastSeq` advances on our echoes
-	// so no seq-gap refetch fires. So the cell keeps rendering empty AFTER the run
-	// too - and `hasOutputs` reads those same emptied model outputs, so the toolbar's
-	// clear-all button sits DISABLED over a notebook whose `.ipynb` does hold
-	// outputs - until a reload or some other resyncing `load()`.
+	// skipped and nothing is reported - and the clear is PERMANENT: the server's
+	// clear path truncates that run's own output accumulator
+	// (`run-output-registry`), so the output produced before the clear is dropped
+	// for good. Only what the cell produces AFTERWARDS accumulates, and that is what
+	// `run:end` persists. Resetting the accumulator also restarts its element
+	// indices at 0 alongside our emptied array, which is what keeps the next frame
+	// from landing past the end of it.
 	//
 	// (MCP `clear_outputs` deliberately answers differently for an agent, whose call
 	// is a one-shot report rather than a live view; the two surfaces differ on

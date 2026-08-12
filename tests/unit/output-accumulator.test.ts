@@ -390,3 +390,89 @@ describe('OutputAccumulator — terminal-style reduction', () => {
 		expect((out[0] as { text: string }).text).not.toContain('\r');
 	});
 });
+
+/**
+ * `reset()` is what a mid-run "clear outputs" does to the run that is producing
+ * them: everything buffered so far is dropped, and the accumulator behaves exactly
+ * as if the run had just started. Two halves matter downstream — nothing pre-clear
+ * survives into what `finish()` persists, and the next element is emitted as a FULL
+ * frame at index 0, so the client's just-emptied array and the server's indices stay
+ * in step (an index past the end would leave a hole, which throws while rendering).
+ */
+describe('OutputAccumulator.reset — a mid-run clear', () => {
+	it('drops committed outputs, the pending element and its delta baseline', () => {
+		const { acc, emits } = withRecorder();
+		acc.push(stream('stdout', 'before 1\n'));
+		acc.flush();
+		acc.push({ output_type: 'execute_result', data: { 'text/plain': 'pre' }, metadata: {}, execution_count: 1 });
+		acc.push(stream('stdout', 'before 2\n'));
+		acc.flush();
+		expect(acc.outputs.length).toBeGreaterThan(1);
+		const before = emits.length;
+
+		acc.reset();
+
+		expect(acc.outputs).toEqual([]);
+		// The reset itself emits nothing — the clear path broadcasts `cell:cleared`.
+		expect(emits.length).toBe(before);
+		// A flush right after the reset has no pending element left to re-emit, so the
+		// dropped text cannot come back on the next tick.
+		acc.flush();
+		expect(acc.outputs).toEqual([]);
+		expect(emits.length).toBe(before);
+	});
+
+	it('empties `outputs` IN PLACE, since run.ts holds that reference', () => {
+		const { acc } = withRecorder();
+		const held = acc.outputs;
+		acc.push(stream('stdout', 'gone\n'));
+		acc.flush();
+		acc.reset();
+		expect(acc.outputs).toBe(held);
+		expect(held).toEqual([]);
+	});
+
+	it('emits the next element as a FULL frame at index 0, never a delta', () => {
+		const { acc, emits } = withRecorder();
+		acc.push(stream('stdout', 'pre-clear\n'));
+		acc.flush();
+		acc.push(stream('stdout', 'more\n'));
+		acc.flush(); // now emitting deltas against an established baseline
+		expect(emits.some((e) => e.delta)).toBe(true);
+
+		acc.reset();
+		emits.length = 0;
+		acc.push(stream('stdout', 'post-clear\n'));
+		acc.flush();
+
+		expect(emits).toHaveLength(1);
+		expect(emits[0].index).toBe(0);
+		expect(emits[0].delta).toBeUndefined();
+		expect((emits[0].output as { text: string }).text).toBe('post-clear\n');
+	});
+
+	it('persists only post-clear output at run end', () => {
+		const { acc } = withRecorder();
+		acc.push(stream('stdout', 'pre-clear\n'));
+		acc.flush();
+		acc.reset();
+		acc.push(stream('stdout', 'post-clear\n'));
+		const out = acc.finish();
+		expect(out).toEqual([{ output_type: 'stream', name: 'stdout', text: 'post-clear\n' }]);
+	});
+
+	it('clears the cap state, so a capped run can accumulate again', () => {
+		const { acc } = withRecorder({ maxStreamBytes: 40, maxTotalBytes: 1_000 });
+		for (let i = 0; i < 20; i++) acc.push(stream('stdout', `line ${i} padding padding\n`));
+		expect(acc.wasCapped).toBe(true);
+
+		acc.reset();
+		expect(acc.wasCapped).toBe(false);
+
+		acc.push(stream('stdout', 'after\n'));
+		const out = acc.finish();
+		// No truncation marker survives, and the byte counters started over: this fits.
+		expect(out).toEqual([{ output_type: 'stream', name: 'stdout', text: 'after\n' }]);
+		expect(acc.wasCapped).toBe(false);
+	});
+});
