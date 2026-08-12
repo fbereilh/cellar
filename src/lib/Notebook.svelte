@@ -26,6 +26,13 @@
 		runningId: string | null;
 		/** cell id → 1-based position in this notebook's kernel run queue */
 		queued?: Record<string, number>;
+		/**
+		 * Whether a sequential bulk run (Run all / above / below / stale) of THIS
+		 * notebook is still working through its cells. `runningId`/`queued` both go
+		 * empty between two cells of such a batch, so this is what keeps "Interrupt"
+		 * armed for the whole batch rather than flickering off once per cell.
+		 */
+		bulkRunning?: boolean;
 		activeId?: string | null;
 		/**
 		 * The multi-cell selection, as document-model ids. Always contains `activeId`
@@ -64,6 +71,8 @@
 		onRunAll?: () => void;
 		onInterrupt?: () => void;
 		onClear: (id: string) => void;
+		/** Clear every cell's outputs — the same action as the palette's "Clear all outputs". */
+		onClearAll?: () => void;
 		onDelete: (id: string) => void;
 		onMove: (id: string, dir: 'up' | 'down') => void;
 		onMoveToIndex?: (id: string, toIndex: number) => void;
@@ -152,6 +161,7 @@
 		cells,
 		runningId,
 		queued = {},
+		bulkRunning = false,
 		activeId = null,
 		selectedIds = EMPTY_SELECTION,
 		keyMode = 'command',
@@ -171,6 +181,7 @@
 		onRunAll,
 		onInterrupt,
 		onClear,
+		onClearAll,
 		onDelete,
 		onMove,
 		onMoveToIndex,
@@ -455,6 +466,17 @@
 	const showExportBar = $derived(!!exportTarget || exportCount > 0);
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
+	// Whether THIS notebook's kernel is executing or has work waiting — gates
+	// "Interrupt". Read off the same per-notebook `runningId`/`queued` the cells
+	// render their running/queued affordances from (never a global run counter:
+	// notebooks run in parallel, so another notebook's run must not arm this
+	// button), plus `bulkRunning` — those two go empty BETWEEN the cells of a
+	// sequential bulk run, so without it the button would flicker disabled for a
+	// round trip per cell and drop a click landing in that window.
+	const notebookBusy = $derived(runningId !== null || Object.keys(queued).length > 0 || bulkRunning);
+	// Whether any cell holds output to clear — gates "Clear all outputs". Read off
+	// the MODEL, not the mounted cells, so a windowed-out cell's output counts.
+	const hasOutputs = $derived(cells.some((c) => (c.outputs?.length ?? 0) > 0));
 
 	// ---- code-root bar --------------------------------------------------------
 	// Shown only when the workspace actually has roots (a `roots/` directory), or
@@ -736,8 +758,11 @@
 	     cells use more horizontal space on wide monitors without going full-bleed
 	     on ultrawide. -->
 	<div class="mx-auto w-full max-w-[clamp(48rem,92%,88rem)] px-4 py-6" data-testid="notebook">
-		<!-- Notebook toolbar: the discoverable, top-of-notebook entry point for
-		     running the whole notebook. Enqueues every code cell through the same
+		<!-- Notebook toolbar: the discoverable, top-of-notebook entry points for
+		     acting on the whole notebook. Each button triggers the SAME handler its
+		     command-palette twin does (`run-all` / `kernel-interrupt` /
+		     `clear-all-outputs`) — this bar surfaces those actions, it owns none of
+		     their logic. Run all enqueues every code cell through the same
 		     server-side FIFO run queue as any other run, so interrupting cancels
 		     the whole batch. -->
 		<div class="mb-4 flex items-center gap-2" data-testid="notebook-toolbar">
@@ -751,6 +776,36 @@
 			>
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
 				Run all
+			</button>
+			<!-- Disabled only while this notebook looks idle from here, so no interrupt
+			     request is fired at a kernel with nothing to stop and no queue to drop.
+			     That is what the disable buys, and no more: `queued` is this tab's
+			     mirror of the server snapshot, so between another tab's or an agent's
+			     run being enqueued and the `queue:changed` broadcast landing, the
+			     button is briefly disabled while there really is something to cancel. -->
+			<button
+				class="btn btn-ghost btn-sm gap-1.5"
+				onclick={() => onInterrupt?.()}
+				disabled={!notebookBusy}
+				title="Interrupt the kernel (stop the running cell and drop this notebook's queued runs)"
+				aria-label="Interrupt the kernel"
+				data-testid="interrupt-all"
+			>
+				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
+				Interrupt
+			</button>
+			<button
+				class="btn btn-ghost btn-sm gap-1.5"
+				onclick={() => onClearAll?.()}
+				disabled={!hasOutputs}
+				title="Clear every cell's outputs"
+				aria-label="Clear all outputs"
+				data-testid="clear-all-outputs"
+			>
+				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+					<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" />
+				</svg>
+				Clear all outputs
 			</button>
 		</div>
 		{#if showRootBar}

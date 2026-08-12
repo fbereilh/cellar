@@ -23,6 +23,7 @@ import { publish } from './events';
 import { isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
 import { OutputAccumulator, OUTPUT_FLUSH_MS, type StreamDelta } from './output-accumulator';
+import { registerRunOutputs, unregisterRunOutputs } from './run-output-registry';
 import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types';
 
 /** Arguments to `executeCellRun`. */
@@ -106,6 +107,11 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 		setOutputsLive(cellId, acc.outputs.slice(), nb);
 	};
 	const acc = new OutputAccumulator(emit);
+	// Publish this run's accumulator so a mid-run "clear outputs" of this cell can
+	// discard what it has produced so far (see run-output-registry). Removed in the
+	// `finally` below, which spans the persist: a clear landing between the last
+	// flush and `setOutputs` must still be able to keep the pre-clear buffer off disk.
+	registerRunOutputs(nb, cellId, acc);
 	// Flush buffered stream text on a ~40ms tick so a long run shows live progress;
 	// ordering with rich outputs is preserved by flushing immediately before each
 	// (in `acc.push`) and at run end (`acc.finish`), not by this timer.
@@ -115,41 +121,46 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	let status = 'ok';
 	let session: SessionId | null = null;
 	let kernelDown = false;
+	let outputs: CellOutput[];
 	try {
-		const reply = await execute(nb, execSource, (ev) => {
-			if (ev.type === 'output') {
-				acc.push(ev.output);
-			} else if (ev.type === 'kernel') {
-				session = ev.session;
-				onEvent?.(ev);
-			} else {
-				onEvent?.(ev);
-			}
-		});
-		status = reply?.status ?? 'ok';
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		acc.push({
-			output_type: 'error',
-			ename: 'CellarError',
-			evalue: message,
-			traceback: [message]
-		});
-		status = 'error';
-		// execute() threw before it ever had a kernel in hand, so there is no session
-		// to stamp: this failure is the run the caller just asked for, not a leftover.
-		if (session === null) kernelDown = true;
+		try {
+			const reply = await execute(nb, execSource, (ev) => {
+				if (ev.type === 'output') {
+					acc.push(ev.output);
+				} else if (ev.type === 'kernel') {
+					session = ev.session;
+					onEvent?.(ev);
+				} else {
+					onEvent?.(ev);
+				}
+			});
+			status = reply?.status ?? 'ok';
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			acc.push({
+				output_type: 'error',
+				ename: 'CellarError',
+				evalue: message,
+				traceback: [message]
+			});
+			status = 'error';
+			// execute() threw before it ever had a kernel in hand, so there is no session
+			// to stamp: this failure is the run the caller just asked for, not a leftover.
+			if (session === null) kernelDown = true;
+		} finally {
+			clearInterval(flushTimer);
+		}
+		// Flush the tail + finalize the truncation marker; this is the array we persist.
+		outputs = acc.finish();
+
+		// A notebook is "loaded in the kernel" iff it has a live kernel entry, which the
+		// manager tracks directly — no separate marking step. A kernel-down run (session
+		// === null) touched no namespace; either way there is nothing to record here.
+
+		setOutputs(cellId, outputs, nb); // clean-on-save persists the .ipynb
 	} finally {
-		clearInterval(flushTimer);
+		unregisterRunOutputs(nb, cellId);
 	}
-	// Flush the tail + finalize the truncation marker; this is the array we persist.
-	const outputs = acc.finish();
-
-	// A notebook is "loaded in the kernel" iff it has a live kernel entry, which the
-	// manager tracks directly — no separate marking step. A kernel-down run (session
-	// === null) touched no namespace; either way there is nothing to record here.
-
-	setOutputs(cellId, outputs, nb); // clean-on-save persists the .ipynb
 	// Runtime-only run metadata (stripped from disk by clean.js); `at` = run start,
 	// so "ran X ago" reads as when the run began.
 	const lastRun: LastRun = {

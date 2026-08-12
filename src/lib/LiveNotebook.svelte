@@ -292,6 +292,16 @@
 	// advancing to the next cell after its current run is aborted, instead of firing
 	// the rest of the batch (nothing is queued server-side there to clear).
 	let interruptGeneration = 0;
+	// How many sequential bulk-run loops (`runCodeIds`: Run all / above / below /
+	// stale) are in flight. This is the ONE signal that a batch is still going:
+	// `runningId` and `queued` both go empty BETWEEN two cells of a batch, because
+	// `runCell`'s finally clears `runningId` and dispatch is sequential, so only one
+	// `/run` stream is ever open and nothing is ever server-side queued - so a
+	// toolbar control gated on those alone would flicker off for a round trip per
+	// cell. A counter, not a boolean, so two overlapping batches (Run all clicked
+	// twice) cannot have the first to finish declare the notebook idle.
+	let bulkRuns = $state(0);
+	const bulkRunning = $derived(bulkRuns > 0);
 
 	// ---- Selection -----------------------------------------------------------
 	// THE authoritative selection model (the pure algebra lives in
@@ -1637,9 +1647,19 @@
 	// per chunk. Reassigning the element (not mutating in place) keeps Svelte's deep
 	// `$state` proxy reactive. Events without an index (defensive / older shapes)
 	// simply append.
-	function applyOutput(cell: UICell, output: CellOutput, index?: number) {
+	// Defence in depth, like applyOutputAppend's base check: an index PAST the end of
+	// our array would leave a hole, and a hole throws while rendering — with no error
+	// boundary anywhere in the app that takes the whole notebook's render tree down,
+	// not just this cell. So an index we cannot place contiguously means this tab is
+	// out of sync: bail and let the caller resync. The server keeps the two in step
+	// (a mid-run clear resets that run's accumulator, so its indices restart at 0
+	// alongside our emptied array), so this should be unreachable.
+	function applyOutput(cell: UICell, output: CellOutput, index?: number): boolean {
 		if (!cell.outputs) cell.outputs = [];
-		cell.outputs[index ?? cell.outputs.length] = output;
+		const at = index ?? cell.outputs.length;
+		if (at > cell.outputs.length) return false;
+		cell.outputs[at] = output;
+		return true;
 	}
 
 	// Apply a streamed-output DELTA (`run:output-append`) to a growing stream
@@ -1682,7 +1702,7 @@
 				cell.outputs = [];
 			}
 		} else if (ev.type === 'run:output') {
-			if (cell) applyOutput(cell, ev.output, ev.index);
+			if (cell && !applyOutput(cell, ev.output, ev.index) && !fetching) load();
 		} else if (ev.type === 'run:output-append') {
 			// A stream delta whose base doesn't match means we're out of sync (a dropped
 			// establishing frame / earlier delta, or a reconnect refetch racing a live
@@ -1872,6 +1892,17 @@
 						runningId = id;
 						cell.outputs = [];
 					} else if (ev.type === 'output') {
+						// A refused index (see applyOutput) is a NO-OP here, exactly like the
+						// delta branch below — never a `load()`. Dropping it loses nothing: the
+						// only way to reach it is the window between this tab emptying
+						// `cell.outputs` optimistically and the server truncating that run's
+						// accumulator, so the refused element is one the truncate is about to
+						// discard anyway. A refetch would be actively harmful — it rebinds
+						// `cells` and nulls `runningId`, while this loop captured `cell` once
+						// before the await, so every later frame and `run:end`'s stampLastRun
+						// would write into a detached object with nothing left to correct it
+						// (our own `run:end` SSE is echo-suppressed and `lastSeq` was reset):
+						// a frozen cell body and no running bar for the rest of the run.
 						applyOutput(cell, ev.output, ev.index);
 					} else if (ev.type === 'output-append') {
 						// Streamed-output delta on our own run's stream (see applyOutputAppend).
@@ -1948,13 +1979,20 @@
 		// is awaited in turn, so an aborted cell's `runCell` returns like a normal
 		// finish and the loop would otherwise advance to the next cell.
 		const gen = interruptGeneration;
-		for (const id of ids) {
-			const cell = findCell(id);
-			if (!cell || cell.cell_type !== 'code') continue;
-			// Use the editor's LIVE text, not the debounced `cell.source`.
-			const src = cellApis[id]?.currentSource?.() ?? cell.source;
-			await runCell(id, src);
-			if (interruptGeneration !== gen) return; // interrupted mid-batch
+		bulkRuns += 1;
+		try {
+			for (const id of ids) {
+				const cell = findCell(id);
+				if (!cell || cell.cell_type !== 'code') continue;
+				// Use the editor's LIVE text, not the debounced `cell.source`.
+				const src = cellApis[id]?.currentSource?.() ?? cell.source;
+				await runCell(id, src);
+				if (interruptGeneration !== gen) return; // interrupted mid-batch
+			}
+		} finally {
+			// In a `finally` so an early return (interrupted mid-batch) or a throw can
+			// never leave the batch claiming to run forever.
+			bulkRuns -= 1;
 		}
 		refreshStaleness();
 	}
@@ -3373,7 +3411,21 @@
 		runCodeIds(codeIdsAll(cells));
 	}
 
-	// Clear every cell's outputs. Palette "Clear all outputs".
+	// Clear every cell's outputs. Palette "Clear all outputs" and the top toolbar's
+	// clear-all button are both this function, so the two cannot diverge.
+	//
+	// A cell whose run is IN FLIGHT is cleared like any other - nothing here is
+	// skipped and nothing is reported - and the clear is PERMANENT: the server's
+	// clear path truncates that run's own output accumulator
+	// (`run-output-registry`), so the output produced before the clear is dropped
+	// for good. Only what the cell produces AFTERWARDS accumulates, and that is what
+	// `run:end` persists. Resetting the accumulator also restarts its element
+	// indices at 0 alongside our emptied array, which is what keeps the next frame
+	// from landing past the end of it.
+	//
+	// (MCP `clear_outputs` deliberately answers differently for an agent, whose call
+	// is a one-shot report rather than a live view; the two surfaces differ on
+	// purpose.)
 	async function clearAll() {
 		for (const c of cells) {
 			if (c.outputs?.length) await clearCell(c.id);
@@ -3496,6 +3548,7 @@
 			{focusedId}
 			runningId={runningId}
 			{queued}
+			{bulkRunning}
 			{activeId}
 			{selectedIds}
 			{keyMode}
@@ -3515,6 +3568,7 @@
 			onRunAll={runAll}
 			onInterrupt={onInterruptKernel}
 			onClear={clearCell}
+			onClearAll={clearAll}
 			onDelete={deleteCell}
 			onMove={moveCell}
 			onMoveToIndex={moveCellToIndex}

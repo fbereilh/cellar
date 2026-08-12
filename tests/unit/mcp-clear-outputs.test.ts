@@ -12,8 +12,8 @@
  * semantics — `lastRun` survives, so `run_status` / `ran_this_session` are
  * untouched and only `has_output` flips — and two rules about what the result
  * may CLAIM: a cell whose run is in flight is skipped rather than reported
- * cleared (the run would write its outputs straight back), and the clear-all
- * form never discloses a cell the agent is not allowed to see.
+ * cleared (the call is a one-shot report, so a live run would outrun it), and
+ * the clear-all form never discloses a cell the agent is not allowed to see.
  *
  * Drives the REAL service + notebook singletons against a scratch workspace,
  * with import-free sources (routeImports:false) so nothing touches the kernel or
@@ -239,7 +239,7 @@ describe('clearing OUTPUT does not change RUN semantics', () => {
 	});
 });
 
-describe('a cell whose run is IN FLIGHT is skipped, not silently un-cleared', () => {
+describe('a cell whose run is IN FLIGHT is skipped, not reported as a clear it cannot promise', () => {
 	/** Hold a notebook's kernel slot for one cell, exactly as a real run does. */
 	function holdKernel(target: string, fullId: string) {
 		const ticket = queue.enqueueRun({ nb: target, cellId: fullId, actor: 'user', source: 'a = 1' });
@@ -252,10 +252,11 @@ describe('a cell whose run is IN FLIGHT is skipped, not silently un-cleared', ()
 		const { target, handles } = await makeNotebook('clear-running-all.ipynb', 3);
 		const release = holdKernel(target, svc.resolveRef(target, handles[1]));
 		try {
-			// Clearing a running cell would be undone seconds later: the run's next
-			// accumulator flush (setOutputsLive) and its run:end (setOutputs) write the
-			// outputs straight back. Reporting it as cleared would be a success the
-			// notebook never keeps, so the tool says what it did NOT do instead.
+			// The shared clear path truncates the run's accumulator, so a clear of a
+			// running cell would STICK - but this call is a one-shot report, not a live
+			// view, and the run goes on emitting, so "cleared" describes a state the
+			// very next flush has already moved past. It says what it did NOT do
+			// instead. (The UI's clear-all deliberately diverges and does clear it.)
 			const r = svc.clearOutputs(undefined, target);
 			expect(r).toMatchObject({ ok: true, count: 2, skipped: [handles[1]] });
 			// Cell index 2 is the running one (index 0 is the empty starter cell).

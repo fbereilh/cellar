@@ -1,0 +1,65 @@
+/**
+ * Cellar — the in-flight runs' output accumulators, by (notebook, cell).
+ *
+ * Clearing a cell's outputs has to reach the RUN that is producing them, not just
+ * the document: the accumulator holds the whole buffer and owns the element
+ * indices the wire protocol is keyed on, so a clear that empties only the document
+ * is undone by the next flush and desynchronizes the client's array from the
+ * server's indices (see `OutputAccumulator.reset`). This is the seam between the
+ * two — `run.ts` publishes the accumulator of the run it is driving, `notebook.ts`
+ * reaches for it from the shared clear path.
+ *
+ * It is its OWN module rather than an export of either side because `run.ts`
+ * already imports `notebook.ts` (`setOutputs`/`setOutputsLive`), so putting the
+ * registry in `run.ts` would make `notebook.ts` import it back and close an import
+ * cycle. Nothing here imports either one, so neither can be reached through it.
+ *
+ * Keys are the ABSOLUTE notebook path plus the cell id, matching how the rest of
+ * the server keys per-notebook state (`kernels`, `docs`). Callers resolve the path
+ * — `run.ts` is documented as taking one, and `notebook.ts` reads it off the doc.
+ */
+
+/** What the clear path needs of an accumulator: drop everything buffered so far. */
+export interface ResettableRunOutputs {
+	reset(): void;
+}
+
+const active = new Map<string, ResettableRunOutputs>();
+
+function key(nb: string, cellId: string): string {
+	// NUL cannot occur in a path or a cell id, so the two halves can never blur.
+	return `${nb}\0${cellId}`;
+}
+
+/** Publish the accumulator of a starting run. Paired with `unregisterRunOutputs`. */
+export function registerRunOutputs(nb: string, cellId: string, acc: ResettableRunOutputs): void {
+	active.set(key(nb, cellId), acc);
+}
+
+/**
+ * Drop a finished run's entry. Called from the run's `finally`, so a run that threw
+ * leaves nothing behind for a later clear to truncate.
+ */
+export function unregisterRunOutputs(nb: string, cellId: string): void {
+	active.delete(key(nb, cellId));
+}
+
+/**
+ * Discard whatever the in-flight run of this cell has produced so far, so only
+ * output produced AFTER this point accumulates and is persisted at `run:end`.
+ *
+ * A silent no-op when that cell has no run in flight, which is the ordinary case —
+ * every clear goes through here, and almost none of them lands on a running cell.
+ * Returns whether an accumulator was reset, for tests and callers that care.
+ */
+export function truncateActiveRunOutputs(nb: string, cellId: string): boolean {
+	const acc = active.get(key(nb, cellId));
+	if (!acc) return false;
+	acc.reset();
+	return true;
+}
+
+/** Test seam: forget every registration (no run survives a test file). */
+export function __resetRunOutputRegistry(): void {
+	active.clear();
+}

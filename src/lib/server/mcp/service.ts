@@ -1584,10 +1584,14 @@ export function removeCells(ids: string[], nb?: string | null) {
  * run stamp, never from `outputs.length`); only `has_output` flips.
  *
  * A cell whose run is IN FLIGHT is SKIPPED, never cleared, and named in
- * `skipped`: the run's next accumulator flush (`setOutputsLive`) and its
- * `run:end` (`setOutputs`) write the outputs straight back, so clearing it would
- * report a success that silently does not stick. A QUEUED run has produced
- * nothing yet, so clearing a queued cell is honest and is NOT skipped.
+ * `skipped`: this call is a ONE-SHOT REPORT rather than a live view, so reporting
+ * a cell as cleared while its run goes on emitting describes a state the very
+ * next flush has already moved past. Note this is no longer because the outputs
+ * would be written straight back - the shared clear path truncates that run's
+ * accumulator first (`truncateActiveRunOutputs`), so the UI's clear of a running
+ * cell does stick and only post-clear output is persisted. The two surfaces
+ * differ here on purpose. A QUEUED run has produced nothing yet, so clearing a
+ * queued cell is honest and is NOT skipped.
  *
  * VISIBILITY. The clear-all form addresses cells the agent never named, so a
  * cell hidden from the agent is cleared but kept OUT of `cleared`/`count`/
