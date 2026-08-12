@@ -1,16 +1,32 @@
 import { json } from '@sveltejs/kit';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { gitCommitAt } from '$lib/server/git';
+import { gitCommitAt, listWorktreesAt } from '$lib/server/git';
 import { workspaceRoot } from '$lib/server/fstree';
 import { getNotebookRoot } from '$lib/server/notebook';
-import { resolveRootDir } from '$lib/server/notebookRoot';
+import {
+	canonicalWorkspace,
+	enclosesWorkspace,
+	isOutsideWorkspace,
+	resolveRootDir,
+	worktreeDeclaration
+} from '$lib/server/notebookRoot';
 
 /**
  * Which commit each open notebook's CODE ROOT is checked out at — the Git sidebar
  * section's whole payload, in one round trip.
  *
  *   GET /api/fs/git/roots?path=a.ipynb&path=roots/x/b.ipynb
- *     → { workspace: <GitDirCommit>, readLimit, notebooks: [{ path, root, error, unreadable, notRead, git }] }
+ *     → { workspace: <GitDirCommit>, readLimit,
+ *         notebooks: [{ path, root, error, unreadable, notRead, git }],
+ *         worktrees: [{ path, absolute, external, exists, branch, detached, shortSha, dirty }] }
+ *
+ * `worktrees` is every OTHER registered worktree of the workspace's repo (its own
+ * checkout excluded, since that is what `workspace` above already reports) — the
+ * sidebar's WORKTREES block. It rides THIS route rather than a new one because it
+ * is the same question ("which checkout is what") already coalesced and
+ * generation-guarded, and it is empty in a single-checkout repo, where the block
+ * renders nothing at all.
  *
  * `path` repeats, one per open notebook tab; unknown/omitted is not an error, it
  * just yields an empty list (a workspace with no notebook open still reports its
@@ -37,8 +53,12 @@ import { resolveRootDir } from '$lib/server/notebookRoot';
  * absolute server path, which has no business reaching the browser; the client
  * owns the wording.
  *
- * Probing is DEDUPED by directory: several notebooks reviewing one worktree cost
- * one probe, and `gitCommitAt`'s own cache collapses repeat requests on top.
+ * Probing is DEDUPED by directory IDENTITY IN THE REAL NAMESPACE: several
+ * notebooks reviewing one worktree cost one probe, and `gitCommitAt`'s own cache
+ * collapses repeat requests on top. Realpath is what makes that true rather than
+ * nominal — Cellar's paths are lexical while `git worktree list` realpaths its
+ * output, so a raw-string key holds both spellings of one directory (the
+ * two-namespace rule; see `notebookRoot.ts`).
  *
  * BOUNDED at `MAX_PATHS` distinct paths, because the fan-out is per path and lands
  * on the process that also carries the kernel websockets and the SSE fan-out: each
@@ -59,10 +79,59 @@ import { resolveRootDir } from '$lib/server/notebookRoot';
  * distinguishable from a row still loading and from one whose document could not be
  * read, so the panel can mark them and say why, once, instead of leaving them
  * rendering as never-arrived. `readLimit` rides along so it can name the cap.
+ *
+ * The WORKTREE list is bounded the same way and for the same reason, by
+ * `MAX_WORKTREE_PROBES` (reported as `worktreeReadLimit`): past it a row is still
+ * listed with everything the porcelain listing already knew — path, branch, sha,
+ * whether it exists — and only its commit probe is dropped, marked `notRead`. A
+ * worktree that is already being probed as some notebook's ROOT is free and never
+ * counts against the budget, so the checkouts a kernel actually runs in are the
+ * last thing that can be dropped.
  */
 
 /** Distinct `path` params one request PROBES; the rest come back `notRead`. See the header. */
 const MAX_PATHS = 64;
+
+/**
+ * Registered worktrees one request probes for a commit, beyond those it was going
+ * to probe anyway as some notebook's root.
+ *
+ * The SAME reason `MAX_PATHS` exists: each probe is three concurrent `git` spawns
+ * on the process carrying the kernel websockets and the SSE fan-out, and this
+ * panel refetches on mount, on `sse:open`, on `fsRefreshSignal` and on every
+ * window focus. The notebook side was bounded while this one was not, and the
+ * feature's own use case is a worktree per PR under review — so a repo with a few
+ * dozen registrations turned each cold-cache refresh into a hundred-odd
+ * concurrent git processes.
+ *
+ * Lower than `MAX_PATHS` deliberately: notebooks are what the user opened, one at
+ * a time, whereas worktrees accumulate from `git worktree add` runs that have
+ * nothing to do with Cellar, so the list is both larger and less deliberate.
+ *
+ * Truncation is REPORTED, never silent (the row keeps its identity and drops only
+ * its commit — see `notRead` on the notebook side), and a worktree that is
+ * ALREADY being probed as a notebook's root never counts against it, because it
+ * costs nothing extra.
+ */
+const MAX_WORKTREE_PROBES = 24;
+
+/** `realpathSync` where possible, else the path itself (it may not exist). */
+function realpathOrSelf(p) {
+	try {
+		return realpathSync(p);
+	} catch {
+		return p;
+	}
+}
+
+/** True when `abs` exists and is a directory. */
+function isDir(abs) {
+	try {
+		return existsSync(abs) && statSync(abs).isDirectory();
+	} catch {
+		return false;
+	}
+}
 
 export async function GET({ url }) {
 	const ws = resolve(workspaceRoot());
@@ -96,15 +165,125 @@ export async function GET({ url }) {
 		}
 	});
 
+	// Every other registered worktree of this repo. Identity against the workspace is
+	// compared by REALPATH — `git worktree list` realpaths its output while `ws` is
+	// the lexical resolve, and on macOS those differ.
+	const wsReal = realpathOrSelf(ws);
+	// The workspace in the REAL namespace, resolved ONCE for the whole request and
+	// threaded into every per-row question that asks about it. Left to their
+	// defaults, `enclosesWorkspace` and `worktreeDeclaration` each re-walk it, so a
+	// repo with a worktree per PR under review — this feature's own use case — paid
+	// three `realpathSync` walks of the workspace PER ROW, on a panel that refetches
+	// on mount, on `sse:open`, on every `fsRefreshSignal` and on every window focus,
+	// on the process carrying the kernel websockets and the SSE fan-out. The
+	// comparisons are unchanged; only the operand that is constant across the request
+	// stopped being recomputed. (`MAX_WORKTREE_PROBES` bounds the git subprocesses,
+	// never these syscalls.)
+	const canonWs = canonicalWorkspace();
+	// `key` is the REAL-namespace identity, computed ONCE PER ROW and reused by the
+	// workspace-exclusion test below and by every commit lookup further down, so a
+	// lexical Cellar path and git's realpath'd one can never read as two directories
+	// — and so the row is not walked twice to ask the same thing.
+	//
+	// A registered worktree can be GONE (`prunable`); `statSync` decides, since that
+	// is what a run of a notebook rooted here would ask. A missing one is never
+	// probed: there is no status to read, and it would spawn three processes to learn
+	// nothing.
+	//
+	// `decl` is the row's LEXICAL identity, minted by the ONE helper that owns the
+	// two-namespace rule: it is both what the row reports as `path` (so "Use as root"
+	// posts exactly the value the picker would) and what the `external` label is
+	// decided from, since the shared containment rule must be asked about a lexical
+	// path — git's realpath'd one would read a worktree genuinely inside a
+	// symlink-traversing workspace as external.
+	const wtrees = [];
+	for (const w of listWorktreesAt(ws)) {
+		if (w.bare) continue;
+		const key = realpathOrSelf(w.path);
+		// The workspace's own checkout is dropped (matched by REALPATH — see above),
+		// because `workspace` below already reports it and a duplicate row would read
+		// as a second checkout. A checkout that ENCLOSES the workspace is dropped too,
+		// through the ONE shared rule the resolver refuses on: `git worktree list`
+		// walks up, so a workspace that is a subdirectory of a repo (`cd repo/analysis
+		// && cellar`) sees its own PARENT listed, and offering it a "Use as root"
+		// button would offer exactly what a run there refuses.
+		if (key === wsReal || enclosesWorkspace(w.path, canonWs)) continue;
+		wtrees.push({ w, exists: isDir(w.path), key, decl: worktreeDeclaration(w.path, canonWs) });
+	}
+
 	// One probe per DISTINCT directory (three `git` spawns), shared by every
 	// notebook rooted there — plus the workspace itself, which every no-root
-	// notebook reports and which is usually already one of them.
-	const dirs = [...new Set([ws, ...targets.map((t) => t.dir).filter(Boolean)])];
-	const commits = new Map(await Promise.all(dirs.map(async (dir) => [dir, await gitCommitAt(dir)])));
+	// notebook reports and which is usually already one of them. Pooling the
+	// worktrees into this SAME map is what keeps the cost per-directory rather
+	// than per-row.
+	//
+	// KEYED BY REALPATH, valued by the LEXICAL directory to probe — the
+	// two-namespace rule, which is what makes the pooling real rather than
+	// nominal. `ws` and every `t.dir` are lexical (`resolveRootDir` never
+	// realpaths), while `git worktree list` realpaths its output, so on macOS
+	// (every `/var/folders` workspace) a set keyed on the raw strings holds BOTH
+	// spellings of one directory: the same checkout was probed twice, spent budget
+	// it was documented never to spend, and past the budget came back `notRead`,
+	// falsifying "a kernel's own checkout is the last thing this can drop".
+	const rootDirs = new Map([[wsReal, ws]]);
+	for (const t of targets) {
+		if (!t.dir) continue;
+		const key = realpathOrSelf(t.dir);
+		if (!rootDirs.has(key)) rootDirs.set(key, t.dir);
+	}
+
+	// Worktrees are bounded on top of that, and the budget is spent on the ones
+	// that are NOT already free: a worktree that is some notebook's root is in
+	// `rootDirs` already, so probing it costs nothing extra and it can never be the
+	// row that gets truncated — which also means the checkouts a kernel is actually
+	// running in are the last thing this can drop.
+	const probeDirs = new Map(rootDirs);
+	let budget = MAX_WORKTREE_PROBES;
+	const probes = wtrees.map(({ w, exists, key, decl }) => {
+		// A missing one is never probed: there is no status to read, and it would
+		// spawn three processes to learn nothing. It is not truncation either — the
+		// row already states it is gone.
+		if (!exists) return { w, exists, key, decl, probed: false, truncated: false };
+		if (rootDirs.has(key)) return { w, exists, key, decl, probed: true, truncated: false };
+		if (budget <= 0) return { w, exists, key, decl, probed: false, truncated: true };
+		budget -= 1;
+		probeDirs.set(key, w.path);
+		return { w, exists, key, decl, probed: true, truncated: false };
+	});
+
+	const commits = new Map(
+		await Promise.all([...probeDirs].map(async ([key, dir]) => [key, await gitCommitAt(dir)]))
+	);
+
+	const worktrees = probes.map(({ w, exists, key, decl, probed, truncated }) => ({
+		// The LEXICAL declaration for the realpath'd path git printed — through the
+		// ONE helper that owns the two-namespace rule, so "Use as root" posts exactly
+		// the value the picker would and exactly the value that gets persisted.
+		path: decl,
+		absolute: w.path,
+		// Asked of the ONE shared containment rule (`resolveInWorkspace`, via
+		// `isOutsideWorkspace`), about the LEXICAL directory the declaration names — so
+		// this row, the notebook picker's `external`, and the `kind` a run resolves are
+		// three readings of one rule rather than three local copies of it, two of which
+		// disagreed and so labelled the same checkout differently.
+		external: isOutsideWorkspace(resolve(ws, decl)),
+		exists,
+		branch: w.branch,
+		detached: w.detached,
+		shortSha: w.head ? w.head.slice(0, 7) : null,
+		prunable: w.prunable,
+		// Named, so the panel can mark it and say why — the row keeps every fact the
+		// LISTING already gave it (path, branch, sha, existence) and drops only what a
+		// probe would have added, so it claims nothing this request did not read.
+		notRead: truncated,
+		dirty: probed ? (commits.get(key)?.dirty ?? false) : false
+	}));
 
 	return json({
-		workspace: commits.get(ws),
+		workspace: commits.get(wsReal),
 		readLimit: MAX_PATHS,
+		worktreeReadLimit: MAX_WORKTREE_PROBES,
+		worktrees,
 		notebooks: [
 			...targets.map((t) => ({
 				path: t.path,
@@ -112,7 +291,7 @@ export async function GET({ url }) {
 				error: t.error,
 				unreadable: t.unreadable,
 				notRead: false,
-				git: t.dir ? commits.get(t.dir) : null
+				git: t.dir ? commits.get(realpathOrSelf(t.dir)) : null
 			})),
 			// Named, so the panel can mark them; empty on every other field, so the row
 			// claims nothing about a notebook this request never opened.

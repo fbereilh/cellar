@@ -25,7 +25,8 @@
  * request's response, so one run == one stream. No global broadcast, so there is
  * no way for outputs to be duplicated or cross runs.
  */
-import { sep } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { basename, sep } from 'node:path';
 import { KernelManager, ServerConnection, CommsOverSubshells, KernelAPI } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
@@ -89,6 +90,15 @@ interface NotebookKernel {
 	 * which is what keeps cwd and `sys.path` in lockstep for a process's whole life.
 	 */
 	codeRoot: string;
+	/**
+	 * Which admission rule `codeRoot` came through, recorded for the same reason
+	 * the directory is: a `worktree` root sits OUTSIDE the workspace and therefore
+	 * reaches the kernel only through jupyter's `..`-relative `path` handling, so
+	 * its cwd is verified once at startup (see `verifyKernelCwd`). Null when the
+	 * notebook declares no root — the workspace path, which is left byte-for-byte
+	 * as it was and is not verified.
+	 */
+	codeRootKind: 'workspace' | 'worktree' | null;
 	/**
 	 * The `DATABRICKS_RUNTIME_VERSION` this kernel's CURRENT session was actually
 	 * started with, or null when it was started without one. Written by `initKernel`
@@ -1226,6 +1236,84 @@ async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): P
 	// can never disagree with the process's real cwd — see `codeRoot`.
 	if (addProjectRootToPath()) parts.push(projectRootAddCode(nbKernel.codeRoot));
 	await runSilent(kernel, parts.join('\n\n'));
+	await verifyKernelCwd(nbKernel, kernel);
+}
+
+/**
+ * Run `code` silently and return what it printed to stdout (trimmed).
+ *
+ * The sibling of `runSilent` for the one startup step whose ANSWER matters rather
+ * than only its effect. Same exec-lock discipline — two `requestExecute` in
+ * flight on one kernel wedge a run's `future.done` — and the same best-effort
+ * stance on the lock; unlike `runSilent` it does NOT swallow failures, because a
+ * probe that could not run must not read as a probe that agreed.
+ */
+async function runCapture(kernel: KernelConnection, code: string): Promise<string> {
+	const nbKernel = nbKernelForConnection(kernel);
+	const release = nbKernel ? await acquireExecLock(nbKernel) : null;
+	try {
+		const future = kernel.requestExecute({ code, silent: true, store_history: false, stop_on_error: false });
+		let out = '';
+		future.onIOPub = (msg) => {
+			const content = msg.content as { name?: string; text?: string };
+			if (msg.header.msg_type === 'stream' && content?.name === 'stdout') out += content.text ?? '';
+		};
+		await future.done;
+		return out.trim();
+	} finally {
+		release?.();
+	}
+}
+
+/**
+ * For a root OUTSIDE the workspace, prove the kernel really is running there —
+ * and FAIL THE START if it is not.
+ *
+ * The feature's core promise ("a declared root never silently degrades") is
+ * enforced against the filesystem by `resolveRootDir`, but reaching an external
+ * worktree at all depends on jupyter's `to_os_path` NOT containment-checking the
+ * kernel-start `path`, i.e. on an ABSENCE in an upstream library. If that ever
+ * changes, `cwd_for_path` walks up and the kernel starts in the workspace — every
+ * import then silently resolves from the wrong branch, which is exactly the bug
+ * this feature exists to remove. One comparison at startup turns that from a
+ * silent wrong answer into a loud refusal.
+ *
+ * Realpath on BOTH sides deliberately: the workspace (and so a `../sibling`
+ * resolved from it) is a lexical path, while Python reports the resolved one —
+ * on macOS `/tmp/ws` vs `/private/tmp/ws`. Comparing raw would fail every
+ * `mkdtemp` workspace.
+ *
+ * Scoped to `worktree` roots: a workspace-internal root reaches the kernel the
+ * way it always has, and this leaves that path byte-for-byte as it was. A probe
+ * that cannot answer (no output, a kernel that raised) is NOT treated as a
+ * mismatch — refusing on an unverifiable reading would fail starts for a reason
+ * nothing observed.
+ */
+async function verifyKernelCwd(nbKernel: NotebookKernel, kernel: KernelConnection): Promise<void> {
+	if (nbKernel.codeRootKind !== 'worktree') return;
+	const expected = realpathOrSelf(nbKernel.codeRoot);
+	let actual = '';
+	try {
+		actual = await runCapture(kernel, 'import os as _c_os\nprint(_c_os.path.realpath(_c_os.getcwd()))\ndel _c_os');
+	} catch {
+		// The probe itself failed to run; see the header — silence is not disagreement.
+		return;
+	}
+	if (!actual || actual === expected) return;
+	throw new Error(
+		`Kernel for ${nbKernel.nbPath} started in ${JSON.stringify(actual)}, but its declared code root is ${JSON.stringify(expected)}. ` +
+			`Refusing the start rather than running this notebook against the wrong checkout — imports would silently resolve from there. ` +
+			`Check that the root directory still exists, or clear the notebook's root to run at the workspace root.`
+	);
+}
+
+/** `realpathSync` where possible, else the path itself. */
+function realpathOrSelf(p: string): string {
+	try {
+		return realpathSync(p);
+	} catch {
+		return p;
+	}
 }
 
 /**
@@ -1278,6 +1366,7 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		sessionId: 0,
 		execsThisSession: 0,
 		codeRoot: root?.dir ?? workspaceRoot(),
+		codeRootKind: root?.kind ?? null,
 		databricksRuntime: null,
 		userRuns: 0,
 		statusHandler: null,
@@ -1301,8 +1390,15 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		// `model.get("path")`. Going through `mgr.startNew` (rather than a raw fetch)
 		// keeps the connection registered with the shared manager, which is what the
 		// idle-cull reconciliation and `runningChanged` depend on.
+		//
+		// `apiPath`, never `dir`: an ABSOLUTE path is not "the same thing more
+		// precisely" here, it is actively wrong — `to_os_path` strips the leading
+		// slash and joins it onto `root_dir`, so `/Users/x/repo` becomes
+		// `<ws>/Users/x/repo`, which does not exist, and `cwd_for_path` then walks
+		// UP and starts the kernel somewhere else entirely. The `..`-relative form
+		// escapes cleanly and is returned verbatim (see server/notebookRoot.ts).
 		const startOptions = (root
-			? { name: 'python3', path: root.rel }
+			? { name: 'python3', path: root.apiPath }
 			: { name: 'python3' }) as KernelAPI.IKernelOptions;
 		const kernel = await mgr.startNew(startOptions);
 		nbKernel.connection = kernel;
@@ -1364,10 +1460,39 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 			// Detached so a jupyter-driven autorestart is never blocked by either.
 			void initKernel(nbKernel, kernel)
 				.then(() => reconnectDatabricksAfterRestart(nbPath))
-				.catch(() => {});
+				// An autorestart is jupyter's doing, not a start we can refuse, so a
+				// failure here (including the code-root cwd verification disagreeing
+				// about the replacement process) is LOGGED rather than swallowed — it
+				// is the only trace of a namespace that came back rooted elsewhere.
+				.catch((err: unknown) => logWarn('kernel', `post-autorestart init for ${nbPath} failed: ${err instanceof Error ? err.message : String(err)}`));
 		};
 		kernel.statusChanged.connect(nbKernel.statusHandler);
-		await initKernel(nbKernel, kernel);
+		try {
+			await initKernel(nbKernel, kernel);
+		} catch (err) {
+			// The one thing in `initKernel` that may legitimately refuse is the code-root
+			// cwd verification, and a refused start must not leave its Python process
+			// behind: the map entry is dropped by the `startPromise.catch` below, so
+			// nothing would ever reap it. Best-effort, then rethrow the real reason.
+			//
+			// The listener comes off FIRST, as every other teardown path does
+			// (`teardownKernel`): `nbKernel.connection` still points at this kernel and
+			// the map entry outlives the shutdown, so a status flip emitted while the
+			// process goes away would otherwise fan a `kernel:status` snapshot out to
+			// every tab for a kernel that is already refused.
+			try {
+				if (nbKernel.statusHandler) kernel.statusChanged.disconnect(nbKernel.statusHandler);
+			} catch {
+				/* already disconnected, or the connection is gone */
+			}
+			nbKernel.statusHandler = null;
+			try {
+				await kernel.shutdown();
+			} catch {
+				/* the process may already be gone; the refusal below is what matters */
+			}
+			throw err;
+		}
 		logInfo('kernel', `kernel for ${nbPath} started (session ${nbKernel.sessionId})`);
 		// The kernel is up: refresh its card from "starting" to its live status, and
 		// begin sampling its resident memory (the poller self-stops when no kernel
@@ -1442,7 +1567,25 @@ export async function restartKernel(nbPath?: string | null) {
 		beginSession(nbKernel);
 	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
-	await initKernel(nbKernel, kernel);
+	try {
+		await initKernel(nbKernel, kernel);
+	} catch (err) {
+		// The one thing in `initKernel` that may legitimately refuse is the code-root
+		// cwd verification, and `getKernel` handles that by not leaving a half-verified
+		// kernel behind. The same must hold here, and for a stronger reason: this entry
+		// is ALREADY in the map with a resolved `startPromise`, and `getKernel`
+		// short-circuits on an existing entry without re-verifying — so a refusal that
+		// merely propagated left every later run executing against the kernel whose cwd
+		// was just refused, the exact silent degrade the verification exists to prevent.
+		await teardownKernel(nbKernel, 'kernel_restart_failed');
+		// `teardownKernel` publishes only the per-notebook `kernel:shutdown`; the
+		// sidebar's Kernels cards come from the separate `kernel:status` snapshot, so
+		// every other teardown caller publishes it too. Without it a refused restart
+		// left a card on screen — with Interrupt/Restart/Shut down enabled — for a
+		// kernel that no longer exists.
+		publishKernelStatus();
+		throw err;
+	}
 	publishKernelStatus();
 	// If this notebook had a live Databricks session, rebuild it against the same
 	// profile+cluster now the namespace is fresh. Detached (void) so it never blocks

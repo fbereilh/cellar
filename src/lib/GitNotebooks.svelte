@@ -42,6 +42,7 @@
 	import { createCoalescedReload } from '$lib/coalescedReload';
 	import { subscribeEvents } from '$lib/events-client';
 	import { relativeTimeLong } from '$lib/relativeTime';
+	import { agentConfigNotice } from '$lib/notebookRoot';
 	import { nowMs, subscribeNow } from '$lib/now.svelte';
 	import type { GitDirCommit } from '$lib/server/git';
 	import type { NotebookRef } from '$lib/types';
@@ -72,6 +73,32 @@
 		git: GitDirCommit | null;
 	}
 
+	/**
+	 * One registered worktree of this repo, as `/api/fs/git/roots` reports it —
+	 * the WORKTREES block below. A different axis from the rows above: one entry
+	 * per CHECKOUT, whether or not any notebook points at it.
+	 */
+	interface WorktreeRow {
+		/** The declaration a root would use: `roots/pr-1`, or `../sibling`. */
+		path: string;
+		absolute: string;
+		/** Outside the workspace — labelled, because the file tree still shows the workspace. */
+		external: boolean;
+		/** False for a registered worktree whose directory is gone (`prunable`). */
+		exists: boolean;
+		branch: string | null;
+		detached: boolean;
+		shortSha: string | null;
+		dirty: boolean;
+		/**
+		 * True when the request listed this checkout but did not probe its commit
+		 * (too many registered worktrees). Everything else on the row came from the
+		 * listing and is real; only `dirty` is unread, so the row must not draw the
+		 * dirty marker — an unprobed checkout is not a clean one.
+		 */
+		notRead?: boolean;
+	}
+
 	interface Props {
 		/** Open notebook tabs, in tab order (the shell's own list). */
 		notebooks?: NotebookRef[];
@@ -84,8 +111,23 @@
 	let { notebooks = [], onFocusNotebook, fsRefreshSignal = 0 }: Props = $props();
 
 	let rows = $state<RootCommit[]>([]);
+	let worktrees = $state<WorktreeRow[]>([]);
+	/** Which worktree's "Use as root" is in flight, so only that button shows it. */
+	let adopting = $state('');
+	/**
+	 * Outcome of the last adoption. SELF-DISMISSING, the same rule its sibling
+	 * surface follows (the notebook root bar's feedback line): it describes ONE
+	 * action, on ONE notebook, at ONE moment — so left standing it goes on
+	 * asserting "analysis.ipynb now runs in ../pr-398" over a panel that has since
+	 * moved to a different notebook, which is worse than saying nothing.
+	 */
+	let adoptFeedback = $state('');
+	let adoptFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+	/** How long the WORKTREES block keeps reporting the outcome of an adoption. */
+	const ADOPT_FEEDBACK_MS = 8000;
 	let workspaceGit = $state<GitDirCommit | null>(null);
 	let readLimit = $state(0);
+	let worktreeReadLimit = $state(0);
 	let error = $state('');
 	let loading = $state(false);
 	// Generation guard (the statusSeq / kernelReqSeq convention): focus, a root
@@ -120,6 +162,13 @@
 	const notReadCount = $derived(notebooks.filter((n) => rowFor(n.path)?.notRead).length);
 
 	/**
+	 * Registered worktrees this request listed but did not probe. Counted off
+	 * `worktrees` rather than off a separate number, because that array IS what
+	 * renders — so the sentence can never name more rows than are on screen.
+	 */
+	const worktreeNotReadCount = $derived(worktrees.filter((w) => w.notRead).length);
+
+	/**
 	 * The order the notebooks are ASKED about — the active one first, then tab order.
 	 *
 	 * The route truncates by request order, so past its cap the rows it drops are
@@ -148,8 +197,10 @@
 			seq++;
 			reload.reset();
 			rows = [];
+			worktrees = [];
 			workspaceGit = null;
 			readLimit = 0;
+			worktreeReadLimit = 0;
 			error = '';
 			loading = false;
 			return Promise.resolve();
@@ -166,8 +217,10 @@
 			if (mine !== seq) return;
 			if (!res.ok) throw new Error(body?.message || 'could not read git info');
 			rows = body.notebooks ?? [];
+			worktrees = body.worktrees ?? [];
 			workspaceGit = body.workspace ?? null;
 			readLimit = Number(body.readLimit) || 0;
+			worktreeReadLimit = Number(body.worktreeReadLimit) || 0;
 			error = '';
 		} catch (err) {
 			if (mine !== seq) return;
@@ -259,6 +312,82 @@
 	 */
 	function unbornHead(git: GitDirCommit): boolean {
 		return git.isRepo && !git.commit;
+	}
+
+	/** The notebook a "Use as root" click applies to: the active tab. */
+	const activeNotebook = $derived(notebooks.find((n) => n.active) ?? null);
+
+	/**
+	 * Show (or clear) the adoption outcome, and arm its dismissal — the ONE writer,
+	 * so no path can leave a line standing with no timer behind it.
+	 */
+	function showAdoptFeedback(msg: string) {
+		adoptFeedback = msg;
+		if (adoptFeedbackTimer) clearTimeout(adoptFeedbackTimer);
+		adoptFeedbackTimer = msg
+			? setTimeout(() => {
+					adoptFeedback = '';
+					adoptFeedbackTimer = null;
+				}, ADOPT_FEEDBACK_MS)
+			: null;
+	}
+
+	// The message names a NOTEBOOK, so switching to another one retires it at once
+	// rather than waiting out the timer: it would otherwise describe a notebook the
+	// panel is no longer showing. Keyed on the PATH STRING, never on
+	// `activeNotebook` itself — that derives an OBJECT out of the `notebooks` prop,
+	// so any re-render of the parent's list re-fires the effect and would wipe the
+	// line the click had just produced, while a string re-derives to itself.
+	const activeNotebookPath = $derived(activeNotebook?.path ?? '');
+	$effect(() => {
+		activeNotebookPath;
+		untrack(() => showAdoptFeedback(''));
+	});
+
+	$effect(() => () => {
+		if (adoptFeedbackTimer) clearTimeout(adoptFeedbackTimer);
+	});
+
+	/** The root the active notebook already declares, so its own row reads as adopted. */
+	const activeRoot = $derived(activeNotebook ? (rowFor(activeNotebook.path)?.root ?? null) : null);
+
+	/**
+	 * Point the ACTIVE notebook at this worktree, through the very same
+	 * `POST /api/notebooks/root` the root picker uses — never a second write path,
+	 * so every refusal, the `.py` refusal included, and every side effect (the
+	 * kernel is freed, its namespace cleared) are identical whichever surface was
+	 * clicked. The reply is authoritative: the panel says what the SERVER did.
+	 */
+	async function useAsRoot(w: WorktreeRow) {
+		const nb = activeNotebook;
+		if (!nb || adopting) return;
+		adopting = w.path;
+		showAdoptFeedback('');
+		try {
+			const res = await fetch('/api/notebooks/root', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ root: w.path, path: nb.path })
+			});
+			const body = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(body?.message || 'could not set the root');
+			// The same reporting rule as the notebook's own root picker, through the ONE
+			// shared wording: agent config written into an adopted worktree is reported,
+			// never thrown, so a write that leaves this checkout untracked-dirty must be
+			// said here too rather than discarded.
+			const agentNote = agentConfigNotice(body.agent_config);
+			const applied = body.changed
+				? `${nb.name} now runs in ${w.path}${body.namespace_cleared ? ' — variables cleared' : ''}.`
+				: `${nb.name} already runs in ${w.path}.`;
+			showAdoptFeedback(agentNote ? `${applied} Note: ${agentNote}` : applied);
+			// The row set above is keyed on each notebook's declared root, so it must
+			// be re-read for the dot and the disabled state to agree with the server.
+			load();
+		} catch (err) {
+			showAdoptFeedback(String((err as Error)?.message ?? err));
+		} finally {
+			adopting = '';
+		}
 	}
 </script>
 
@@ -423,6 +552,81 @@
 			<p class="px-1 pt-1.5 text-[11px] text-base-content/45" data-testid="git-not-read-notice">
 				Too many notebooks open: only the first {readLimit} are read, so {notReadCount} above show no commit. Close some to see them.
 			</p>
+		{/if}
+		{#if worktrees.length}
+			<!-- WORKTREES: one row per CHECKOUT of this repo, whether or not a notebook
+			     points at it — a different axis from the rows above, which are one per
+			     open notebook. A sub-block rather than a ninth sidebar section: same
+			     subject ("which checkout is what"), same fetch/coalesce/refresh
+			     machinery, and it renders NOTHING in a single-checkout repo, which is
+			     most of them. -->
+			<div class="mt-3 border-t border-base-300 pt-2" data-testid="git-worktrees">
+				<p class="px-1 pb-1 text-[10px] font-semibold uppercase tracking-wider text-base-content/40">Worktrees</p>
+				<div class="max-h-56 space-y-1 overflow-y-auto">
+					{#each worktrees as w (w.absolute)}
+						{@const adopted = activeRoot === w.path}
+						<div class="rounded-lg border border-base-300 bg-base-100 px-2 py-1.5" data-testid="git-worktree" data-worktree-path={w.path}>
+							<div class="flex items-center gap-1.5 text-xs">
+								<span class="min-w-0 flex-1 truncate font-mono text-[11px] text-base-content/75" title={w.absolute} data-testid="git-worktree-path">
+									{w.path}
+								</span>
+								{#if w.external}
+									<!-- Stated, not implied by the leading `../`: adopting a sibling
+									     checkout while believing it sits inside the workspace is the one
+									     misreading this feature can cause. -->
+									<span class="shrink-0 rounded bg-base-200 px-1 text-[10px] text-base-content/60" title="Outside this workspace: the kernel runs here, but the file tree, git decorations and checkpoints stay workspace-wide" data-testid="git-worktree-external">external</span>
+								{/if}
+								{#if w.dirty}
+									<span class="shrink-0 text-[13px] leading-none text-(--cellar-git-tree-modified)" title="Uncommitted changes in this checkout" data-testid="git-worktree-dirty">
+										●<span class="sr-only">uncommitted changes</span>
+									</span>
+								{/if}
+							</div>
+							<div class="mt-0.5 flex items-center gap-1.5 text-[11px]">
+								<span class="min-w-0 flex-1 truncate text-base-content/60" data-testid="git-worktree-branch">
+									{w.branch ?? (w.detached ? 'detached' : '')}
+								</span>
+								{#if w.shortSha}
+									<span class="shrink-0 font-mono tabular-nums text-base-content/60">{w.shortSha}</span>
+								{/if}
+								<!-- A registered-but-MISSING worktree states that and offers no button:
+								     that is exactly the state a run rooted here would refuse, so an
+								     enabled control would promise something the server declines. -->
+								{#if !w.exists}
+									<span class="shrink-0 text-base-content/45" data-testid="git-worktree-missing">missing on disk</span>
+								{:else if adopted}
+									<span class="shrink-0 text-base-content/45" data-testid="git-worktree-current">current root</span>
+								{:else}
+									<button
+										class="btn btn-ghost btn-xs shrink-0 h-5 min-h-0 px-1.5 text-[11px]"
+										onclick={() => useAsRoot(w)}
+										disabled={!activeNotebook || !!adopting}
+										title={activeNotebook
+											? `Run ${activeNotebook.name}'s kernel in this checkout — its variables are cleared`
+											: 'Open a notebook to point it at a checkout'}
+										data-testid="git-worktree-use"
+									>
+										{adopting === w.path ? 'setting…' : 'Use as root'}
+									</button>
+								{/if}
+							</div>
+						</div>
+					{/each}
+				</div>
+				<!-- No silent caps: past the route's probe budget a row still lists its
+				     path, branch and sha, but nothing read whether it has uncommitted
+				     changes — so say that once, below the list, rather than letting those
+				     rows read as clean. -->
+				{#if worktreeNotReadCount}
+					<p class="px-1 pt-1 text-[11px] text-base-content/45" data-testid="git-worktree-not-read">
+						{worktreeNotReadCount} more registered {worktreeNotReadCount === 1 ? 'worktree' : 'worktrees'}: only
+						{worktreeReadLimit} are checked for uncommitted changes.
+					</p>
+				{/if}
+				{#if adoptFeedback}
+					<p class="px-1 pt-1 text-[11px] text-base-content/60" data-testid="git-worktree-feedback">{adoptFeedback}</p>
+				{/if}
+			</div>
 		{/if}
 		{#if workspaceGit && !workspaceGit.isRepo}
 			<p class="px-1 pt-1.5 text-[11px] text-base-content/35" data-testid="git-not-a-repo">

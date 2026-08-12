@@ -54,8 +54,34 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** How long `fs.watch` needs before it is observing (see `arm`). */
 const WATCH_ARM_MS = 40;
 
+/**
+ * How long ONE wait may spend before it gives up.
+ *
+ * Polling to a GENEROUS deadline is load-independent and costs nothing when the
+ * machine is idle - a delivered change ends the wait on its next 15ms tick. The
+ * budget only has to exceed what a correct watcher may spend under the full
+ * suite's own parallelism (arm + the 120ms settle debounce + a whole-file read
+ * and hash, on a box running ~140 test files across `cpus - 1` forks), which at
+ * 4s it did not: a slow-but-CORRECT delivery read as a lost change.
+ */
+const WAIT_MS = 10_000;
+
+/**
+ * The per-test allowance a test that does SEVERAL waits in a row must be given.
+ *
+ * The suite-wide default (see vitest.config.ts) is LESS than the budget one
+ * three-write loop below may legitimately spend (`arm` + 3 x `WAIT_MS`), so a
+ * slow-but-CORRECT watcher - three real temp+rename writes, each behind the 120ms
+ * settle debounce, on a machine running the whole suite in parallel - reported a
+ * vitest timeout instead of the waiter's own assertion. That is arithmetic in the
+ * harness, not a defect in the watcher, and it is what made these tests flaky
+ * under load; a genuinely lost change still fails on the waiter's own assertion
+ * rather than by running out the clock.
+ */
+const MULTI_WAIT_TIMEOUT_MS = 60_000;
+
 /** Wait until `n` changes have been delivered (or give up). */
-async function waitForChanges(n: number, timeout = 4000): Promise<ExternalChange[]> {
+async function waitForChanges(n: number, timeout = WAIT_MS): Promise<ExternalChange[]> {
 	const started = Date.now();
 	while (seen.length < n && Date.now() - started < timeout) await sleep(15);
 	return seen;
@@ -121,7 +147,7 @@ describe('external file watcher', () => {
 		expect(seen.every((c) => c.path === 'doc.md')).toBe(true);
 		// Every change carries a hash of its own content.
 		expect(new Set(seen.map((c) => c.hash)).size).toBe(3);
-	});
+	}, MULTI_WAIT_TIMEOUT_MS);
 
 	it('catches a plain in-place overwrite too', async () => {
 		const abs = join(ws, 'notes.md');
@@ -365,7 +391,7 @@ describe('external file watcher', () => {
 		// asserting it here would either be a false claim on Linux or a tautology
 		// weak enough to pass against a broken implementation.
 		expect(seen.map((c) => c.content)).toEqual(['a\n', 'b\n', 'c\n']);
-	});
+	}, MULTI_WAIT_TIMEOUT_MS);
 
 	it('watches one fs.watch per DIRECTORY, and drops it when the last file closes', async () => {
 		mkdirSync(join(ws, 'sub'));
@@ -517,7 +543,7 @@ describe.skipIf(process.platform !== 'darwin')(
 			// assertion is only what holds either way: it misses changes the
 			// directory watch delivered.
 			expect(perFile.length).toBeLessThan(3);
-		});
+		}, MULTI_WAIT_TIMEOUT_MS);
 	}
 );
 

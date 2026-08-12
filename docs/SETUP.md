@@ -107,38 +107,64 @@ launched Jupyter there yourself.
 
 ### Code roots (several checkouts, one instance)
 
-A notebook may declare a **code root**: a workspace-relative directory - normally
-a git worktree created inside the workspace - that *its* kernel runs in and
-imports from, so one instance can serve several checkouts of the same repo:
+A notebook may declare a **code root**: a directory - normally a git worktree -
+that *its* kernel runs in and imports from, so one instance can serve several
+checkouts of the same repo:
 
 ```sh
-git worktree add roots/pr-482 some-branch
+git worktree add roots/pr-482 some-branch        # inside the workspace
+git worktree add ../winrate-model-pr398 some-branch   # a sibling checkout
 ```
 
-Pick it in the **Code root** bar at the top of the notebook, or let an agent set it
+Pick it in the **Code root** bar at the top of the notebook, in the sidebar **Git**
+section's **Worktrees** block (**Use as root**), or let an agent set it
 (`use_notebook(name, root)`; `list_roots` shows what is available). It is stored
 as `metadata.cellar.root` in the `.ipynb`, so it survives a reload and stays
 git-clean.
 
-The bar only appears once the workspace has a root (or the notebook already
-declares one), so a workspace that never adopts roots gains no new UI. The list
-is read when the notebook opens, so reload the tab if you created the worktree
-after opening it.
+**A root outside the workspace must be a registered worktree of the workspace's
+own repo.** That is the whole admission rule for an outside directory: `git
+worktree list`, run in the workspace, has to name that exact directory - so the
+set of directories Cellar will accept is the set *you* created with `git worktree
+add` against this repo. A worktree of some other repo, an arbitrary path, and a
+checkout that *contains* the workspace are all refused, by name. Give it either
+the absolute path `git worktree add` printed or a `../`-relative one; Cellar
+stores the `../`-relative form, so the notebook stays portable to any machine
+that reproduces the layout. Everything below applies to roots inside and outside
+the workspace alike.
+
+The bar only appears once roots are in use here - the conventional `roots/`
+directory has something in it, or some notebook already declares a root - so a
+workspace that never adopts roots gains
+no new UI, even in a repo with worktrees of its own. Detected worktrees still fill
+the picker whenever it is shown, and the sidebar's **Worktrees** block is where you
+find them before then. Both lists are read when the notebook opens (and the sidebar
+block when it refreshes), so reload the tab if you created the worktree after
+opening it.
 
 A root moves exactly two things: the kernel process's working directory and the
 entry Cellar adds to its `sys.path`. Everything else stays workspace-wide - the
 file tree, git, search, checkpoints, `.cellar/`, and **the interpreter**: a root
 never changes which venv the kernel runs, so all of the resolution above is
-unaffected. A notebook that declares no root behaves exactly as before.
+unaffected. A notebook that declares no root behaves exactly as before. That holds
+for an external worktree too, and it is the surprising half: your kernel runs in
+the sibling checkout while the file tree still shows the workspace. A root grants
+no file access, so nothing Cellar serves - the tree, a file tab, an agent's reads
+and writes - follows it into that worktree.
 
-Three things worth knowing before you set one:
+Four things worth knowing before you set one:
 
 - **Changing a root frees that notebook's kernel** (a process's working directory
   is fixed when it spawns), so its variables are cleared and its cells read "not
-  run this session". Re-declaring the root a notebook already has is a no-op.
-- **A root that is not a usable directory inside the workspace is refused**, by
-  name, rather than quietly falling back to the workspace - a notebook must never
-  claim to run against a checkout it is not running against.
+  run this session". Re-declaring the root a notebook already has is a no-op, in
+  either spelling of the same directory.
+- **A root that is not a usable directory is refused**, by name and with the
+  repair, rather than quietly falling back to the workspace - a notebook must
+  never claim to run against a checkout it is not running against. The same check
+  runs when the kernel starts: if it somehow came up somewhere other than the
+  declared root, the start fails instead of importing from the wrong checkout.
+- **Adopting an external worktree writes Cellar's agent config there** - see the
+  next subsection.
 - **A `.py` (jupytext / Databricks source) notebook cannot hold one.** It is
   written back from its cells alone and stores no notebook-level metadata, so the
   picker is not shown and setting a root is refused; convert it to `.ipynb` first.
@@ -152,9 +178,45 @@ outer checkout, so they may be wrong or absent.
 The one surface that reads a root's OWN checkout is the sidebar's **Git** section:
 one row per open notebook, naming the code root it runs from and that checkout's
 branch, short SHA, commit subject and date, with a dot when it has uncommitted
-changes. It is read-only - it reports where each kernel's code comes from and does
-not stage, commit, push, or switch branches - and it is collapsed by default,
-running `git` only while it is open. Clicking a row focuses that notebook's tab.
+changes. Under those rows, a **Worktrees** block lists every checkout `git worktree
+list` reports - one per row, the ones outside the workspace tagged `external`, each
+with a **Use as root** button that points the notebook you are looking at at it.
+A worktree that is registered but whose directory is gone says *missing on disk*
+and offers no button, because a kernel rooted there would be refused anyway. Both
+are read-only otherwise - they report where each kernel's code comes from and do
+not stage, commit, push, or switch branches - and the section is collapsed by
+default, running `git` only while it is open. Clicking a notebook row focuses that
+notebook's tab.
+
+#### Agent config in an adopted worktree
+
+An agent working in a review notebook runs its own tools with that notebook's root
+as the working directory, so once the root is a worktree *outside* the workspace it
+can no longer find this Cellar: `cellar mcp` resolves the instance from its own cwd
+and does not walk up. So **setting an external worktree as a root writes Cellar's
+agent config into that checkout** - one file per harness this workspace has set up
+(`.mcp.json` for Claude Code, `.codex/config.toml` for Codex), each naming this
+instance with `--workspace <path>` so the bridge reaches it from there.
+
+Four things bound that write:
+
+- It happens only when a notebook is actually **pointed at** the worktree, never
+  when one is merely listed in the picker or by `list_roots`.
+- Each file is paired with an entry in that repository's `.git/info/exclude`,
+  written first, so the checkout never shows it as an untracked change and a
+  `git add -A` cannot commit it onto the branch under review. Git keeps that file
+  per clone rather than per worktree, so the entries cover the top level of every
+  worktree of that repo and its main checkout; it is never committed, so no
+  collaborator inherits them.
+- An existing `cellar` entry that says something else is left alone and reported as
+  skipped - a worktree you also run Cellar in keeps pointing at its own instance.
+- It can never break a root change: anything that fails (a read-only checkout, a
+  config Cellar will not rewrite, an exclude it could not arrange) is reported back
+  on the root-bar feedback line, in the sidebar, and to agents on `agent_config`.
+
+Turn it off with **Settings → Set up agents in adopted worktrees**; `--no-mcp-config`
+also suppresses the `.mcp.json` half for that launch, and only harnesses this
+workspace allow-lists are written at all (`cellar harness list`).
 
 ## Connecting an agent (MCP)
 
@@ -245,7 +307,9 @@ deliberately does not write it - approve the folder when Codex asks.
 Pass `--no-mcp-config` to `cellar` to skip writing/repairing `.mcp.json` for that
 launch only; it never changes the allow-list, and the sidebar's **Connect an
 agent** panel says the repair is paused rather than claiming a self-heal that is
-not happening. The raw Streamable-HTTP endpoint (for an HTTP-capable client) is
+not happening. It covers the whole launch, so no `.mcp.json` is written into an
+[adopted worktree](#agent-config-in-an-adopted-worktree) either (a harness whose
+config is a different file, such as Codex, is unaffected). The raw Streamable-HTTP endpoint (for an HTTP-capable client) is
 `http://127.0.0.1:<CELLAR_MCP_PORT>/mcp`; the live port is shown in the launcher
 banner and in that same panel.
 
@@ -512,7 +576,8 @@ to publish, e.g. inside a container.
 > **Internal, do not set by hand:** `CELLAR_WORKSPACE`, `CELLAR_KERNELSPEC_DIR`,
 > `CELLAR_PROJECT_VENV`, `CELLAR_LAUNCHER_PID`, `CELLAR_NO_MCP_CONFIG` (the
 > launcher's own `--no-mcp-config` flag, passed through so the sidebar can say the
-> `.mcp.json` repair is paused), and `CELLAR_KEYS` are set by the launcher for the
+> `.mcp.json` repair is paused and so an adopted worktree gets no `.mcp.json`
+> either), and `CELLAR_KEYS` are set by the launcher for the
 > child processes it spawns. Setting them yourself will confuse the runtime.
 
 ### Docker-only
@@ -580,6 +645,28 @@ spec files at a time. Install its browser once with `npx playwright install chro
   (`git worktree add <root> <branch>`) or clear the root in the notebook's
   **Code root** bar - a missing root is still listed there, marked `(missing)`,
   so you can select the workspace and carry on.
+- **A root outside the workspace is refused** - each refusal names its own repair,
+  so read the message rather than guessing. *"is not a registered git worktree of
+  this repository"*: only a worktree of the workspace's own repo is admitted, so
+  create it with `git worktree add <path> <branch>` and confirm with `git worktree
+  list` (the message also names the worktrees Cellar can see). *"is a registered
+  worktree but its directory no longer exists"*: run `git worktree prune`, or
+  re-create it. *"that worktree was moved to ..."*: `git worktree move` leaves the
+  old path registered nowhere - point the notebook at the new path Cellar names
+  (Cellar will not rewrite your `.ipynb` for you). *"it CONTAINS the workspace"*:
+  you pointed at the checkout the workspace lives inside, which would run the
+  kernel above the tree Cellar is serving - pick a sibling worktree instead.
+- **The kernel refuses to start: "started in ... but its declared code root is ..."** -
+  the kernel came up somewhere other than the worktree the notebook declares, so
+  Cellar fails the start instead of letting imports resolve from the wrong
+  checkout. Check the root directory still exists (`git worktree list`), or clear
+  the notebook's root to run at the workspace root.
+- **Cellar wrote `.mcp.json` into another checkout** - that is the
+  [adopted-worktree agent config](#agent-config-in-an-adopted-worktree): pointing a
+  notebook at a worktree outside the workspace wires an agent working there back to
+  this instance. It is added to that repo's `.git/info/exclude`, so it is never
+  committed. Turn it off with **Settings → Set up agents in adopted worktrees**;
+  files already written stay until you delete them.
 - **"Cannot set a code root on a .py notebook"** - a jupytext / Databricks source
   notebook is written back from its cells alone and stores no notebook-level
   metadata, so a root could not survive a reload. Convert it to `.ipynb` (app menu

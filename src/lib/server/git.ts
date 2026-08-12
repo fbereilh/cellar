@@ -17,7 +17,7 @@
  * Independent of the notebook document/kernel — this only shells out to `git`
  * with the workspace root as the working directory.
  */
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { workspaceRoot, resolveInWorkspace } from './fstree';
@@ -74,6 +74,18 @@ export function gitSpawnLog(): string[] {
 export function resetGitSpawnCount(): void {
 	spawnCount = 0;
 	spawnLog = [];
+}
+
+/**
+ * Record one `git` spawn. Shared by the async `runGit` and the one SYNC reader
+ * (`listWorktreesAt`) so the counter above stays the whole truth about this
+ * module's subprocesses — a second, unlogged spawn path would silently break the
+ * measurements that prove a refusal really refused (see `gitSpawnLog`).
+ */
+function noteSpawn(args: string[]): void {
+	spawnCount++;
+	if (spawnLog.length >= SPAWN_LOG_MAX) spawnLog.shift();
+	spawnLog.push(args[0] ?? '');
 }
 
 /**
@@ -288,6 +300,7 @@ export function invalidateGitCaches(): void {
 	blameFileCache.clear();
 	blameNbCache.clear();
 	dirCommitCache.clear();
+	worktreeCache.clear();
 	statusCache = null;
 	branchCache = null;
 }
@@ -601,6 +614,158 @@ export async function gitCommitAt(absDir: string): Promise<GitDirCommit> {
 	return value;
 }
 
+/**
+ * One registered git worktree, as `git worktree list --porcelain` reports it.
+ *
+ * `path` is exactly what git printed, which is **REALPATH'd** — on macOS a
+ * `/tmp` workspace lists as `/private/tmp/...`. Never compare it lexically
+ * against a Cellar path (`CELLAR_WORKSPACE` is the lexical `resolve()`d string);
+ * see the two-namespace rule in `notebookRoot.ts`.
+ */
+export interface GitWorktree {
+	/** Absolute, realpath'd, as git printed it. */
+	path: string;
+	/** Full HEAD sha, or null (a `bare` main repo stanza carries none). */
+	head: string | null;
+	/** Short branch name (`refs/heads/` stripped), or null when detached/bare. */
+	branch: string | null;
+	detached: boolean;
+	bare: boolean;
+	locked: boolean;
+	/**
+	 * git considers this registration removable — in practice the directory is
+	 * gone. Load-bearing: a removed worktree STILL LISTS, so being listed is not
+	 * proof of existence and the caller's own `statSync` stays authoritative.
+	 */
+	prunable: boolean;
+}
+
+/** Registered-worktree listings, keyed by the directory the listing was taken in. */
+const worktreeCache = new Map<string, { at: number; forcedAt: number; value: GitWorktree[] }>();
+
+/**
+ * How long one FORCED listing satisfies later forced reads (see `listWorktreesAt`).
+ *
+ * Deliberately far tighter than `STATUS_TTL_MS`: it exists to collapse a BURST —
+ * the roots route resolves up to `MAX_PATHS` notebooks in one request, so a
+ * workspace with a few pruned roots forced one blocking spawn PER NOTEBOOK, per
+ * request, on the process carrying the kernel websockets and the SSE fan-out, and
+ * that panel refetches on mount, on `sse:open`, on `fsRefreshSignal` and on every
+ * window focus. A burst is milliseconds wide, while the gap between `git worktree
+ * add` and pointing a notebook at it is a human one, so this bounds the cost
+ * without reopening the staleness window the force exists to close.
+ */
+const WORKTREE_FORCE_TTL_MS = 250;
+
+/**
+ * Every git worktree registered for the repository containing `absDir` — the
+ * main checkout FIRST, then each linked worktree. Empty when `absDir` is not
+ * inside a repository at all (never a throw).
+ *
+ * This is the admission set for an out-of-workspace notebook code root: run in
+ * the workspace, it names exactly the checkouts of the workspace's OWN repo, so
+ * "is this path a worktree of this repo" is answerable without widening any path
+ * guard (see `server/notebookRoot.ts`).
+ *
+ * SYNCHRONOUS, deliberately, and the ONE reader — `resolveRootDir` is called
+ * synchronously from `getKernel`, `assertRootUsable` and the roots route, and
+ * making the admission rule async would thread through all three while a second
+ * async reader beside this one could answer differently. One cheap `spawnSync`
+ * (it reads `.git/worktrees/*`, touches no objects) on the `jupytext.ts` persist
+ * precedent; async callers simply use the value directly.
+ *
+ * Cached on a plain 1.5s TTL — the `STATUS_TTL_MS` tier, so a burst (a picker
+ * open + `list_roots` + the sidebar) is one spawn while a `git worktree add`
+ * typed in a terminal shows up promptly. Deliberately NOT memoized for the
+ * process lifetime the way `preflight` is: preflight caches repo IDENTITY, which
+ * does not change, whereas the worktree set changing is the entire point. And
+ * deliberately time-only rather than signature-keyed: the cheap signatures this
+ * module keys on (a file mtime, the index mtime) are read via the async
+ * preflight, and nothing about a worktree add/remove is guaranteed to move the
+ * index anyway — so the TTL is the whole backstop here, which is why it is the
+ * tight one.
+ *
+ * `{ refresh: true }` bypasses the ordinary TTL for one read. It exists for
+ * exactly one caller — the admission rule, about to REFUSE a root — because a
+ * cached listing makes the TTL a window in which a worktree the user created
+ * seconds ago is reported as unregistered.
+ *
+ * It is itself bounded by `WORKTREE_FORCE_TTL_MS`, and by the FORCED reads alone:
+ * a forced read is served from cache only when a previous FORCED spawn is that
+ * recent, never merely because some ordinary read happened to repopulate the
+ * entry. That distinction is the whole point — an ordinary listing may predate
+ * the `git worktree add` this caller is about to refuse, which is exactly what
+ * the force exists to get past, while a forced listing milliseconds old cannot
+ * tell a different story to the next refusal in the same burst. So the refusal
+ * path costs at most one spawn per burst instead of one per notebook per request,
+ * and the happy path still never reaches it.
+ */
+export function listWorktreesAt(absDir: string, opts?: { refresh?: boolean }): GitWorktree[] {
+	const now = Date.now();
+	const hit = worktreeCache.get(absDir);
+	if (hit) {
+		const ttl = opts?.refresh ? WORKTREE_FORCE_TTL_MS : STATUS_TTL_MS;
+		const since = opts?.refresh ? hit.forcedAt : hit.at;
+		if (now - since < ttl) return hit.value;
+	}
+
+	const args = ['worktree', 'list', '--porcelain'];
+	noteSpawn(args);
+	const r = spawnSync('git', ['-C', absDir, '--no-optional-locks', ...args], {
+		encoding: 'utf8',
+		maxBuffer: MAX_GIT_BUFFER
+	});
+	// Not a repo (or no git at all) degrades to "no worktrees", matching `runGit`'s
+	// honest null — a caller must not be able to tell those apart by a throw.
+	const value = r.status === 0 && typeof r.stdout === 'string' ? parseWorktreePorcelain(r.stdout) : [];
+	const at = Date.now();
+	// An ordinary spawn must NOT advance `forcedAt`: it may predate the very
+	// `git worktree add` a later refusal is about to force a read for.
+	worktreeCache.set(absDir, { at, forcedAt: opts?.refresh ? at : (hit?.forcedAt ?? 0), value });
+	return value;
+}
+
+/**
+ * Parse `git worktree list --porcelain`: blank-line-separated stanzas, each
+ * opening with `worktree <abspath>`, then `HEAD <sha>`, then `branch <fullref>`
+ * OR `detached`, plus optional `bare` / `locked [reason]` / `prunable [reason]`.
+ *
+ * The `worktree` line's value is the REST OF THE LINE, not a whitespace token: a
+ * checkout path may legitimately contain spaces. Only `worktree` opens a stanza,
+ * so a malformed run of lines is ignored rather than producing a pathless entry.
+ */
+function parseWorktreePorcelain(out: string): GitWorktree[] {
+	const list: GitWorktree[] = [];
+	let cur: GitWorktree | null = null;
+	for (const raw of out.split('\n')) {
+		const line = raw.replace(/\r$/, '');
+		if (!line.trim()) continue;
+		if (line.startsWith('worktree ')) {
+			cur = {
+				path: line.slice('worktree '.length),
+				head: null,
+				branch: null,
+				detached: false,
+				bare: false,
+				locked: false,
+				prunable: false
+			};
+			list.push(cur);
+			continue;
+		}
+		if (!cur) continue;
+		if (line.startsWith('HEAD ')) cur.head = line.slice('HEAD '.length).trim() || null;
+		else if (line.startsWith('branch ')) cur.branch = line.slice('branch '.length).trim().replace(/^refs\/heads\//, '') || null;
+		else if (line === 'detached') cur.detached = true;
+		else if (line === 'bare') cur.bare = true;
+		// Both may carry a trailing reason (`prunable gitdir file points to …`), so
+		// they are matched as a prefix rather than by equality.
+		else if (line === 'locked' || line.startsWith('locked ')) cur.locked = true;
+		else if (line === 'prunable' || line.startsWith('prunable ')) cur.prunable = true;
+	}
+	return list;
+}
+
 /** The honest "this directory is not a git checkout" answer. */
 function notARepo(): GitDirCommit {
 	return {
@@ -700,9 +865,7 @@ async function resolveBranch(root: string, pre: Preflight): Promise<GitBranchRes
  * with a concurrent terminal git); the command's output is unaffected.
  */
 function runGit(root: string, args: string[]): Promise<string | null> {
-	spawnCount++;
-	if (spawnLog.length >= SPAWN_LOG_MAX) spawnLog.shift();
-	spawnLog.push(args[0] ?? '');
+	noteSpawn(args);
 	return new Promise((resolve) => {
 		execFile('git', ['-C', root, '--no-optional-locks', ...args], { maxBuffer: MAX_GIT_BUFFER }, (err, stdout) => {
 			// A maxBuffer overflow returns truncated stdout ALONGSIDE the error, and the

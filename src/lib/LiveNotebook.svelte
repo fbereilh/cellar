@@ -24,7 +24,7 @@
 	} from '$lib/cellSelection';
 	import { exportCellCount } from '$lib/exportRole';
 	import { splitInheritedCellar } from '$lib/splitCell';
-	import type { WorkspaceRootOption } from '$lib/notebookRoot';
+	import { agentConfigNotice, type WorkspaceRootOption } from '$lib/notebookRoot';
 	import { createSearchCache } from '$lib/search';
 	import type { SearchCache } from '$lib/search';
 	import { buildCellHighlights, type SearchHighlightState } from '$lib/searchHighlight';
@@ -2227,13 +2227,17 @@
 			// else refreshes the list — and it has just changed: a newly declared root
 			// gains a notebook, and one whose directory came back stops being "missing".
 			void loadRoots();
-			showRootFeedback(
-				!body.changed
-					? 'Already running there.'
-					: body.namespace_cleared
-						? 'Kernel freed — variables cleared; the next run starts in the new root.'
-						: 'Applied — the kernel will start in the new root.'
-			);
+			// Adopting an external worktree may also have written agent config there,
+			// and that write is REPORTED rather than thrown — so anything it has to say
+			// (most importantly: written, but the checkout will show it as untracked)
+			// rides the same feedback line instead of being discarded.
+			const agentNote = agentConfigNotice(body.agent_config);
+			const applied = !body.changed
+				? 'Already running there.'
+				: body.namespace_cleared
+					? 'Kernel freed — variables cleared; the next run starts in the new root.'
+					: 'Applied — the kernel will start in the new root.';
+			showRootFeedback(agentNote ? `${applied} Note: ${agentNote}` : applied);
 		} catch (err) {
 			showRootFeedback(String((err as Error)?.message ?? err));
 		} finally {

@@ -204,11 +204,21 @@ function startRun(cellId: string, source: string) {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/**
+ * How long one `waitForProbes` may spend before it gives up. The idle window here
+ * is 40ms, so a healthy watchdog ends the wait almost at once and this budget is
+ * only ever spent on a genuine failure - which is why it is generous: under the
+ * full suite's own parallelism a correct watchdog's timers legitimately drift far
+ * past 4s, and reported that as probes that never happened.
+ */
+const PROBE_WAIT_MS = 10_000;
+
 /** Wait until at least `n` liveness probes have run (i.e. `n` idle windows elapsed). */
 async function waitForProbes(n: number) {
-	const deadline = Date.now() + 4000;
+	const deadline = Date.now() + PROBE_WAIT_MS;
 	while (h.probeCalls < n && Date.now() < deadline) await sleep(10);
-	if (h.probeCalls < n) throw new Error(`only ${h.probeCalls} probes after 4s, wanted ${n}`);
+	if (h.probeCalls < n)
+		throw new Error(`only ${h.probeCalls} probes after ${PROBE_WAIT_MS}ms, wanted ${n}`);
 }
 
 beforeAll(async () => {

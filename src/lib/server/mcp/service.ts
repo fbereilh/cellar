@@ -316,7 +316,13 @@ export async function setNotebookRoot(root: string | null, nb?: string | null) {
 		root_changed: change.changed,
 		...(change.changed
 			? { kernel_restarted: change.kernel_restarted, namespace_cleared: change.namespace_cleared }
-			: {})
+			: {}),
+		// Agent wiring into an adopted worktree is REPORTED, never thrown (see
+		// worktree-agent-config.ts rule 4) — so it has to reach a caller, or the
+		// guarantee is unobservable and a `skipped` write, an EACCES, or an exclude
+		// that could not be arranged (which leaves the user's checkout dirty) are all
+		// discarded silently. Conditional, so an ordinary root change is unchanged.
+		...(change.agent_config ? { agent_config: change.agent_config } : {})
 	};
 }
 
@@ -392,8 +398,8 @@ export async function listRoots(sessionId?: string) {
 		working_root: getNotebookRoot(workingAbs),
 		roots,
 		note: roots.length
-			? 'A root is a directory inside the workspace (normally a git worktree) that a notebook\'s KERNEL runs in and imports from. Declare one with use_notebook(name, root:"roots/…"); pass root:"" to run at the workspace root again. Changing it frees that notebook\'s kernel (its namespace is cleared).'
-			: `No code roots in this workspace: every notebook runs at the workspace root. Roots are directories under \`${ROOTS_DIR}/\` (normally \`git worktree add ${ROOTS_DIR}/<name> <branch>\`), created by the user.`
+			? 'A root is a directory (normally a git worktree) that a notebook\'s KERNEL runs in and imports from. Declare one with use_notebook(name, root:"roots/…"); pass root:"" to run at the workspace root again. Changing it frees that notebook\'s kernel (its namespace is cleared). An entry marked external:true lies OUTSIDE the workspace (a sibling worktree of this repo): its kernel runs there, but every file path you read or write stays workspace-relative and cannot reach into it.'
+			: `No code roots in this workspace: every notebook runs at the workspace root. Roots are directories under \`${ROOTS_DIR}/\` or any registered worktree of this repo (\`git worktree add ${ROOTS_DIR}/<name> <branch>\`, or a sibling \`git worktree add ../<name> <branch>\`), created by the user.`
 	};
 }
 

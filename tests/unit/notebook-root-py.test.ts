@@ -77,6 +77,22 @@ describe('a .py notebook cannot hold a code root', () => {
 		await expect(actions.setNotebookRootAndRestart('roots/gone', PY)).rejects.toThrow(/\.py notebook/i);
 	});
 
+	it('refuses an OUT-OF-WORKSPACE path with the .py reason, spawning NO git', async () => {
+		// The ordering became more valuable once a path outside the workspace can be
+		// admitted: without it, a `.py` notebook given a worktree path would spawn a
+		// `git worktree list`, quite possibly answer "not a registered worktree", and
+		// send the user off to fix git when the real problem is the notebook format.
+		const gitmod = await import('../../src/lib/server/git');
+		gitmod.invalidateGitCaches();
+		gitmod.resetGitSpawnCount();
+
+		await expect(actions.setNotebookRootAndRestart('../elsewhere', PY)).rejects.toThrow(/\.py notebook/i);
+		await expect(actions.setNotebookRootAndRestart('/tmp/elsewhere', PY)).rejects.toThrow(/\.py notebook/i);
+
+		// The count IS the assertion: the refusal must not have consulted git at all.
+		expect(gitmod.gitSpawnCount()).toBe(0);
+	});
+
 	it('CLEARING is still allowed — it can only remove state', async () => {
 		expect(nbmod.setNotebookRoot('', PY)).toBeNull();
 		expect(nbmod.setNotebookRoot(null, PY)).toBeNull();

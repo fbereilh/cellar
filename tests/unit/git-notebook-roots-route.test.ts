@@ -9,9 +9,9 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 let WS: string;
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -189,15 +189,69 @@ describe('GET /api/fs/git/roots', () => {
 		const c = notebookAt('share-c.ipynb', 'roots/pr-482');
 
 		const gitmod = await import('../../src/lib/server/git');
-		gitmod.invalidateGitCaches();
-		gitmod.resetGitSpawnCount();
-		const body = await get(a, b, c);
 
-		// Two directories are involved (the shared root + the workspace), each read
-		// with the three reads `gitCommitAt` makes. Per-notebook probing would be 4x
-		// that, and the section is refetched on every window focus.
-		expect(gitmod.gitSpawnCount()).toBeLessThanOrEqual(6);
-		for (const row of body.notebooks) expect(row.git.branch).toBe('pr-482');
+		/** Spawns for one uncached request. */
+		const cost = async (...paths: string[]) => {
+			gitmod.invalidateGitCaches();
+			gitmod.resetGitSpawnCount();
+			const body = await get(...paths);
+			return { spawns: gitmod.gitSpawnCount(), body };
+		};
+
+		// The property, asserted as a property rather than as a magic number: THREE
+		// notebooks sharing one root cost exactly what ONE costs. A per-notebook probe
+		// would be 3x, on a section refetched on every window focus. Stated this way
+		// it also stays true as the payload grows (the worktree block added its own
+		// per-directory reads), where a fixed bound would only encode this fixture.
+		const one = await cost(a);
+		const three = await cost(a, b, c);
+		expect(three.spawns).toBe(one.spawns);
+		for (const row of three.body.notebooks) expect(row.git.branch).toBe('pr-482');
+	});
+
+	it('reports the repo’s WORKTREES, excluding the workspace’s own checkout', async () => {
+		const gitmod = await import('../../src/lib/server/git');
+		gitmod.invalidateGitCaches();
+		const body = await get();
+
+		const byPath = Object.fromEntries(body.worktrees.map((w: { path: string }) => [w.path, w]));
+		expect(Object.keys(byPath).sort()).toEqual(['roots/baseline', 'roots/pr-482']);
+		// The workspace's own checkout is reported by `workspace` above; a duplicate
+		// row here would read as a second checkout of the same tree. Matched by
+		// REALPATH server-side, since git realpaths its output and `ws` is lexical.
+		expect(body.worktrees.some((w: { absolute: string }) => w.absolute === WS)).toBe(false);
+
+		expect(byPath['roots/pr-482']).toMatchObject({
+			branch: 'pr-482',
+			detached: false,
+			exists: true,
+			// Inside the workspace, so NOT external — the label is decided by the
+			// resolved path, never by the source.
+			external: false
+		});
+		expect(byPath['roots/pr-482'].shortSha).toMatch(/^[0-9a-f]{7}$/);
+	});
+
+	it('reports a PRUNABLE worktree as missing, and never probes it', async () => {
+		const gitmod = await import('../../src/lib/server/git');
+		const doomed = join(WS, 'roots', 'doomed');
+		git(WS, 'worktree', 'add', '-q', doomed, '-b', 'doomed');
+		rmSync(doomed, { recursive: true, force: true });
+		gitmod.invalidateGitCaches();
+
+		const body = await get();
+		const row = body.worktrees.find((w: { path: string }) => w.path === 'roots/doomed');
+		// It really is still registered — being listed is not being on disk, which is
+		// exactly the state a run rooted here would refuse. The panel renders it as
+		// missing with its "Use as root" disabled.
+		expect(row).toBeTruthy();
+		expect(row.exists).toBe(false);
+		expect(row.prunable).toBe(true);
+		// A missing directory has no status to read, so it is never probed: `dirty`
+		// claims nothing rather than guessing.
+		expect(row.dirty).toBe(false);
+
+		git(WS, 'worktree', 'prune');
 	});
 
 	it('READS UP TO the cap and REPORTS the remainder, rather than dead-ending', async () => {
@@ -248,5 +302,66 @@ describe('GET /api/fs/git/roots', () => {
 		const b = notebookAt('order-b.ipynb', null);
 		expect((await get(a, b)).notebooks.map((n: { path: string }) => n.path)).toEqual([a, b]);
 		expect((await get(b, a)).notebooks.map((n: { path: string }) => n.path)).toEqual([b, a]);
+	});
+
+	// LAST in the file on purpose: it registers enough worktrees to trip the probe
+	// budget, and every assertion above is about the small worktree set created in
+	// `beforeAll`.
+	it('BOUNDS worktree probing the same way, and a notebook’s own root is never what gets dropped', async () => {
+		// Same reason as the notebook cap: each probe is three concurrent `git` spawns
+		// on the process carrying the kernel websockets and the SSE fan-out, and this
+		// panel refetches on mount, on `sse:open`, on `fsRefreshSignal` and on every
+		// window focus. Worktrees accumulate from `git worktree add` runs that have
+		// nothing to do with Cellar, so the list is both larger and less deliberate
+		// than the open-tab list — which is why it was the unbounded one.
+		const bulk = Array.from({ length: 25 }, (_, i) => `bulk-${i}`);
+		for (const name of bulk) {
+			git(WS, 'worktree', 'add', '-q', '--detach', join(WS, 'roots', name), 'main');
+		}
+		// The listing is cached on the tight status tier and the tests above warmed it;
+		// creating a worktree touches neither the index nor anything else it keys on.
+		const gitmod = await import('../../src/lib/server/git');
+		gitmod.invalidateGitCaches();
+
+		// The exempted worktree is chosen from GIT'S OWN ORDERING — the order the route
+		// spends the budget in — and taken from PAST the budget, never by name. `git
+		// worktree list` orders alphabetically, so a hand-picked `bulk-24` sits 19th of
+		// 27 and is probed whether or not the exemption works: that is precisely how a
+		// lexical-vs-realpath mismatch which defeated the exemption entirely passed.
+		const wsReal = realpathSync(WS);
+		const listed = gitmod
+			.listWorktreesAt(WS)
+			.filter((w) => !w.bare && realpathSync(w.path) !== wsReal);
+		expect(listed.length).toBeGreaterThan(24);
+		const victim = `roots/${basename(listed[listed.length - 1].path)}`;
+
+		const nb = notebookAt('bulk-root.ipynb', victim);
+		const body = await get(nb);
+		expect(body.worktreeReadLimit).toBe(24);
+
+		const byPath = Object.fromEntries(body.worktrees.map((w: { path: string }) => [w.path, w]));
+		// Free, because it is already being probed as a notebook's ROOT: the checkouts
+		// a kernel actually runs in are the last thing this can drop.
+		expect(byPath[victim].notRead).toBe(false);
+		expect(byPath[victim].dirty).toBe(false);
+		// And both rows really describe the SAME directory — one probe pooled across
+		// them, not two spellings of one path each probed on its own.
+		expect(body.notebooks[0].root).toBe(victim);
+		expect(body.notebooks[0].git?.isRepo).toBe(true);
+		expect(body.notebooks[0].git?.shortSha).toBe(byPath[victim].shortSha);
+
+		// Something WAS dropped, and it is named rather than silently omitted: the row
+		// keeps every fact the porcelain listing already gave it and loses only what a
+		// probe would have added.
+		const dropped = body.worktrees.filter((w: { notRead: boolean }) => w.notRead);
+		expect(dropped.length).toBeGreaterThan(0);
+		for (const w of dropped) {
+			expect(w.path).toBeTruthy();
+			expect(w.exists).toBe(true);
+			// An UNPROBED checkout must never draw the dirty marker — unread is not clean.
+			expect(w.dirty).toBe(false);
+		}
+		// Every registered worktree is still LISTED; only the probe is bounded.
+		expect(body.worktrees.length).toBeGreaterThanOrEqual(bulk.length);
 	});
 });

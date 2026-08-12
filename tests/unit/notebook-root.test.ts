@@ -17,7 +17,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { normalizeRootPath, sameRoot, NotebookRootError, ROOTS_DIR } from '../../src/lib/notebookRoot';
+import { classifyRootPath, normalizeRootPath, sameRoot, NotebookRootError, ROOTS_DIR } from '../../src/lib/notebookRoot';
 
 let WS: string;
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -56,17 +56,29 @@ describe('normalizeRootPath — the pure shape rules', () => {
 		expect(normalizeRootPath(normalizeRootPath('./roots/pr-482/'))).toBe('roots/pr-482');
 	});
 
-	it('REFUSES an absolute path, naming what a root is', () => {
-		expect(() => normalizeRootPath('/etc')).toThrow(NotebookRootError);
-		expect(() => normalizeRootPath('/etc')).toThrow(/workspace-relative/i);
-		expect(() => normalizeRootPath('C:/Windows')).toThrow(/absolute/i);
+	// The pure half CLASSIFIES; it can no longer refuse an out-of-workspace shape,
+	// because deciding whether one is a registered worktree needs git. These are the
+	// deliberate updates that come with the second admission rule — the refusal
+	// still happens, one layer down, and is asserted in `worktree-roots.test.ts`.
+	it('classifies an absolute path as an OUTSIDE candidate, never an admission', () => {
+		expect(classifyRootPath('/etc')).toEqual({ kind: 'outside', raw: '/etc' });
+		expect(classifyRootPath('C:/Windows')).toEqual({ kind: 'outside', raw: 'C:/Windows' });
+		// Carried through verbatim by the text normalizer, so the SERVER decides.
+		expect(normalizeRootPath('/etc')).toBe('/etc');
+	});
+
+	it('still REFUSES a home-relative path outright: Cellar never expands "~"', () => {
+		expect(() => normalizeRootPath('~/elsewhere')).toThrow(NotebookRootError);
 		expect(() => normalizeRootPath('~/elsewhere')).toThrow(/home-relative/i);
 	});
 
-	it('REFUSES a traversal escape, wherever the ".." sits', () => {
+	it('classifies a traversal as OUTSIDE, wherever the ".." sits', () => {
 		for (const v of ['../outside', 'roots/../../outside', 'roots/pr-482/..']) {
-			expect(() => normalizeRootPath(v)).toThrow(/inside the workspace/i);
+			expect(classifyRootPath(v).kind).toBe('outside');
 		}
+		// `..` segments are deliberately NOT collapsed here: only the resolver knows
+		// the workspace, and `a/../b` and `b` can differ once symlinks are involved.
+		expect(normalizeRootPath('../outside')).toBe('../outside');
 	});
 
 	it('sameRoot compares MEANING, so re-declaring the same root is a no-op', () => {
@@ -82,7 +94,25 @@ describe('resolveRootDir — the filesystem rules', () => {
 	it('resolves a real directory inside the workspace to its absolute path', () => {
 		expect(rootmod.resolveRootDir('roots/pr-482')).toEqual({
 			rel: 'roots/pr-482',
-			dir: join(WS, 'roots', 'pr-482')
+			dir: join(WS, 'roots', 'pr-482'),
+			// `apiPath` equals `rel` for an in-workspace root, and `kind` says WHICH
+			// admission rule let it through — the workspace guard, untouched.
+			apiPath: 'roots/pr-482',
+			kind: 'workspace'
+		});
+	});
+
+	it('folds an outside-SHAPED declaration that lands back inside into the workspace form', () => {
+		// `roots/../roots/pr-482` carries a `..`, so the pure half calls it `outside`
+		// — but it resolves INSIDE, so it goes through the unchanged guard and is
+		// stored in the one canonical spelling. One directory, one declaration.
+		expect(rootmod.resolveRootDir('roots/../roots/pr-482')).toMatchObject({
+			rel: 'roots/pr-482',
+			kind: 'workspace'
+		});
+		expect(rootmod.resolveRootDir(join(WS, 'roots', 'pr-482'))).toMatchObject({
+			rel: 'roots/pr-482',
+			kind: 'workspace'
 		});
 	});
 
@@ -92,10 +122,13 @@ describe('resolveRootDir — the filesystem rules', () => {
 		expect(rootmod.resolveRootDir('.')).toBeNull();
 	});
 
-	it('REFUSES a root outside the workspace without widening the path guard', async () => {
+	it('REFUSES a root outside the workspace that is not a registered worktree', async () => {
 		// Both spellings of "outside": a traversal, and an absolute path elsewhere.
-		expect(() => rootmod.resolveRootDir('../escape')).toThrow(/inside the workspace/i);
-		expect(() => rootmod.resolveRootDir(resolve(tmpdir()))).toThrow(/workspace-relative/i);
+		// This workspace is not a git repo at all, so the listing is empty and NOTHING
+		// outside it is admitted — the message says so instead of the old, now-false
+		// "roots live inside the workspace".
+		expect(() => rootmod.resolveRootDir('../escape')).toThrow(/not a registered git worktree/i);
+		expect(() => rootmod.resolveRootDir(resolve(tmpdir()))).toThrow(/not a registered git worktree/i);
 		// The shared guard itself is untouched: it still admits only in-workspace paths.
 		const { resolveInWorkspace } = await import('../../src/lib/server/fstree');
 		expect(() => resolveInWorkspace('../escape')).toThrow(/escapes workspace/i);
@@ -129,7 +162,12 @@ describe('the declaration on the document', () => {
 		expect(nbmod.setNotebookRoot('./roots/pr-482/', nb)).toBe('roots/pr-482');
 		expect(nbmod.getNotebookRoot(nb)).toBe('roots/pr-482');
 		expect(nbmod.getNotebook(nb).root).toBe('roots/pr-482');
-		expect(rootmod.notebookRoot(nb)).toEqual({ rel: 'roots/pr-482', dir: join(WS, 'roots', 'pr-482') });
+		expect(rootmod.notebookRoot(nb)).toEqual({
+			rel: 'roots/pr-482',
+			dir: join(WS, 'roots', 'pr-482'),
+			apiPath: 'roots/pr-482',
+			kind: 'workspace'
+		});
 		const onDisk = JSON.parse(readFileSync(nb, 'utf8'));
 		expect(onDisk.metadata.cellar.root).toBe('roots/pr-482');
 	});
@@ -156,8 +194,14 @@ describe('the declaration on the document', () => {
 		expect(readFileSync(nb, 'utf8')).toBe(first);
 	});
 
-	it('REFUSES to write a root it would then be unable to resolve', () => {
-		expect(() => nbmod.setNotebookRoot('../escape', nb)).toThrow(/inside the workspace/i);
+	it('REFUSES to write a root it would then be unable to resolve', async () => {
+		// Asserted at the layer that OWNS the rule. Deciding whether an
+		// out-of-workspace path is a registered worktree needs git, so the low-level
+		// writer (pure text canonicalization) can no longer refuse by shape — the
+		// public entry point resolves FIRST, which is what keeps a refusal from ever
+		// landing a declaration in the user's `.ipynb`.
+		const actions = await import('../../src/lib/server/notebook-root-actions');
+		await expect(actions.setNotebookRootAndRestart('../escape', nb)).rejects.toThrow(/not a registered git worktree/i);
 		const onDisk = JSON.parse(readFileSync(nb, 'utf8'));
 		expect(onDisk.metadata?.cellar ?? {}).not.toHaveProperty('root');
 	});
@@ -170,7 +214,11 @@ describe('the declaration on the document', () => {
 		writeFileSync(nb, JSON.stringify(doc));
 		nbmod.dropDocs(nb);
 		expect(nbmod.getNotebookRoot(nb)).toBe('/somewhere/else');
-		expect(() => rootmod.notebookRoot(nb)).toThrow(/workspace-relative/i);
+		expect(() => rootmod.notebookRoot(nb)).toThrow(/not a registered git worktree/i);
+		// This test deliberately poisons a live document, and `listWorkspaceRoots`
+		// reads declarations off the LIVE documents — so the poison must not leak into
+		// a later test's listing. (It used to be swallowed by the shape refusal.)
+		nbmod.setNotebookRoot(null, nb);
 	});
 
 	it('emits notebook:root so open tabs follow the change', async () => {
