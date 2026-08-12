@@ -239,7 +239,7 @@ describe('clearing OUTPUT does not change RUN semantics', () => {
 	});
 });
 
-describe('a cell whose run is IN FLIGHT is skipped, not silently un-cleared', () => {
+describe('a cell whose run is IN FLIGHT is skipped, not reported as a clear it cannot promise', () => {
 	/** Hold a notebook's kernel slot for one cell, exactly as a real run does. */
 	function holdKernel(target: string, fullId: string) {
 		const ticket = queue.enqueueRun({ nb: target, cellId: fullId, actor: 'user', source: 'a = 1' });
