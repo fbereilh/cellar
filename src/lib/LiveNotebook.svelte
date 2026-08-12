@@ -3515,6 +3515,7 @@
 			onRunAll={runAll}
 			onInterrupt={onInterruptKernel}
 			onClear={clearCell}
+			onClearAll={clearAll}
 			onDelete={deleteCell}
 			onMove={moveCell}
 			onMoveToIndex={moveCellToIndex}
