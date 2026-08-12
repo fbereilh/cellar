@@ -1892,9 +1892,18 @@
 						runningId = id;
 						cell.outputs = [];
 					} else if (ev.type === 'output') {
-						// A refused index means this tab is out of sync (see applyOutput); the
-						// SSE path resyncs, so do the same here rather than dropping the frame.
-						if (!applyOutput(cell, ev.output, ev.index) && !fetching) load();
+						// A refused index (see applyOutput) is a NO-OP here, exactly like the
+						// delta branch below — never a `load()`. Dropping it loses nothing: the
+						// only way to reach it is the window between this tab emptying
+						// `cell.outputs` optimistically and the server truncating that run's
+						// accumulator, so the refused element is one the truncate is about to
+						// discard anyway. A refetch would be actively harmful — it rebinds
+						// `cells` and nulls `runningId`, while this loop captured `cell` once
+						// before the await, so every later frame and `run:end`'s stampLastRun
+						// would write into a detached object with nothing left to correct it
+						// (our own `run:end` SSE is echo-suppressed and `lastSeq` was reset):
+						// a frozen cell body and no running bar for the rest of the run.
+						applyOutput(cell, ev.output, ev.index);
 					} else if (ev.type === 'output-append') {
 						// Streamed-output delta on our own run's stream (see applyOutputAppend).
 						// A base mismatch here would only happen if we missed the establishing
