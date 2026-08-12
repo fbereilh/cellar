@@ -46,7 +46,9 @@ const NB = {
 	interrupt: 'interrupt.ipynb',
 	bulkGap: 'bulk-gap.ipynb',
 	clearAll: 'clear-all.ipynb',
-	clearMidRun: 'clear-mid-run.ipynb'
+	clearMidRun: 'clear-mid-run.ipynb',
+	parityClear: 'parity-clear.ipynb',
+	parityInterrupt: 'parity-interrupt.ipynb'
 } as const;
 
 type CellSpec = { type: 'code' | 'markdown'; source: string; output?: string };
@@ -121,6 +123,20 @@ function streamingNotebook(): string {
 	return buildNotebook(specs);
 }
 
+/**
+ * Run a command from the command palette by its label — the OTHER user-facing route
+ * to these same two actions, and the one the toolbar buttons are claimed not to
+ * diverge from.
+ */
+async function runViaPalette(page: Page, label: string): Promise<void> {
+	await page.keyboard.press(process.platform === 'darwin' ? 'Meta+k' : 'Control+k');
+	await expect(page.getByTestId('command-palette')).toBeVisible({ timeout: 10_000 });
+	await page.getByTestId('command-palette-input').fill(label);
+	await expect(page.getByTestId('command-palette-item').first()).toContainText(label);
+	await page.getByTestId('command-palette-input').press('Enter');
+	await expect(page.getByTestId('command-palette')).toBeHidden({ timeout: 10_000 });
+}
+
 /** Open `file` from the file tree in a fresh page and wait for its notebook to render. */
 async function openNotebook(page: Page, file: string): Promise<void> {
 	await page.goto(baseURL);
@@ -191,6 +207,16 @@ test.beforeAll(async () => {
 	);
 	writeFileSync(join(workspace, NB.clearAll), manyOutputsNotebook(60));
 	writeFileSync(join(workspace, NB.clearMidRun), streamingNotebook());
+	// Two code cells, each carrying a saved output, so a clear has something to do
+	// twice over — once per surface.
+	writeFileSync(
+		join(workspace, NB.parityClear),
+		buildNotebook([
+			{ type: 'code', source: "print('alpha')", output: 'alpha' },
+			{ type: 'code', source: "print('beta')", output: 'beta' }
+		])
+	);
+	writeFileSync(join(workspace, NB.parityInterrupt), sleeperNotebook());
 	const booted = await bootCellar(workspace);
 	launcher = booted.proc;
 	baseURL = booted.url;
@@ -323,6 +349,72 @@ test('Clear all outputs clears every cell — windowed-out ones included — and
 	await page.getByTestId('tree-file').filter({ hasText: NB.clearAll }).first().click();
 	await expect(page.getByTestId('notebook-toolbar').getByTestId('clear-all-outputs')).toBeDisabled();
 	expect(cellsWithOutputsOnDisk(NB.clearAll)).toBe(0);
+});
+
+/**
+ * The two buttons are pure SURFACING: each is claimed to reach the very action its
+ * command-palette twin does. The unit suite pins that as a source guard (it cannot
+ * mount the component); this is the BEHAVIOURAL half — drive both surfaces against
+ * the same notebook and assert they produce the same observable outcome, so a
+ * button silently wired to a second, divergent path would fail here.
+ */
+test('the toolbar`s Clear all outputs does the same thing as its palette twin', async ({ page }) => {
+	test.setTimeout(180_000);
+	await openNotebook(page, NB.parityClear);
+	const clearAll = page.getByTestId('notebook-toolbar').getByTestId('clear-all-outputs');
+
+	// Baseline: both cells hold a saved output on disk.
+	expect(cellIdsWithOutputsOnDisk(NB.parityClear)).toEqual(['c0', 'c1']);
+	await expect(clearAll).toBeEnabled();
+
+	// Route 1 — the palette command.
+	await runViaPalette(page, 'Clear all outputs');
+	await expect.poll(() => cellsWithOutputsOnDisk(NB.parityClear), { timeout: 60_000 }).toBe(0);
+	await expect(clearAll).toBeDisabled();
+
+	// Put the same two outputs back, this time by really running the cells.
+	await page.locator('[data-cell-id="c0"] [data-testid="run"]').click();
+	await page.locator('[data-cell-id="c1"] [data-testid="run"]').click();
+	await expect.poll(() => cellIdsWithOutputsOnDisk(NB.parityClear), { timeout: 90_000 }).toEqual(['c0', 'c1']);
+	await expect(clearAll).toBeEnabled();
+
+	// Route 2 — the new toolbar button. Same end state, from the same starting one.
+	await clearAll.click();
+	await expect.poll(() => cellsWithOutputsOnDisk(NB.parityClear), { timeout: 60_000 }).toBe(0);
+	await expect(clearAll).toBeDisabled();
+});
+
+test('the toolbar`s Interrupt does the same thing as its palette twin', async ({ page }) => {
+	test.setTimeout(240_000);
+	await openNotebook(page, NB.parityInterrupt);
+	const interrupt = page.getByTestId('notebook-toolbar').getByTestId('interrupt-all');
+	const sleeperBar = page.locator('[data-cell-id="c0"] [data-testid="running-bar"]');
+	const sleeperOutput = page.locator('[data-cell-id="c0"] [data-testid="output"]');
+	const runSleeper = page.locator('[data-cell-id="c0"] [data-testid="run"]');
+
+	// Route 1 — the palette command stops the 20s sleeper.
+	await runSleeper.click();
+	await expect(sleeperBar).toBeVisible({ timeout: 90_000 });
+	await expect(interrupt).toBeEnabled();
+	await page.waitForTimeout(2000);
+	await runViaPalette(page, 'Interrupt kernel');
+	await expect(sleeperBar).toBeHidden({ timeout: 20_000 });
+	await expect(sleeperOutput).toContainText('KeyboardInterrupt', { timeout: 20_000 });
+	await expect(interrupt).toBeDisabled();
+
+	// Route 2 — the new toolbar button, from the same starting state. Same outcome:
+	// the sleeper ends far short of its 20s sleep, with a KeyboardInterrupt.
+	await runSleeper.click();
+	await expect(sleeperBar).toBeVisible({ timeout: 60_000 });
+	await expect(interrupt).toBeEnabled();
+	await page.waitForTimeout(2000);
+	await interrupt.click();
+	await expect(sleeperBar).toBeHidden({ timeout: 20_000 });
+	await expect(sleeperOutput).toContainText('KeyboardInterrupt', { timeout: 20_000 });
+	await expect(interrupt).toBeDisabled();
+
+	// Neither route let the batch behind the sleeper run.
+	expect(await definedMarkers(page, NB.parityInterrupt)).toEqual([]);
 });
 
 test('a mid-run Clear all drops the streaming cell`s output for good and keeps what follows', async ({ page }) => {
