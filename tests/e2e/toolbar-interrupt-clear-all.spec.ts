@@ -21,7 +21,10 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  *  - Clear all outputs is disabled when there is nothing to clear, clears EVERY
  *    cell including ones virtualization has windowed out (it reads the document
  *    model, not the mounted DOM), and the cleared state is on DISK — asserted
- *    against the `.ipynb` itself, not just the in-memory doc, plus a reload.
+ *    against the `.ipynb` itself, not just the in-memory doc, plus a reload;
+ *  - Clear all outputs SKIPS the cell whose run is in flight, matching MCP
+ *    `clear_outputs`: its buffer would be written straight back, so clearing it
+ *    would report a success the notebook never keeps.
  */
 
 let launcher: ChildProcess | null = null;
@@ -98,10 +101,27 @@ async function definedMarkers(page: Page): Promise<string[]> {
 	});
 }
 
+type DiskCell = { id: string; outputs?: { text?: string[] }[] };
+
+/** The `.ipynb` ON DISK — the persisted document, not the in-memory doc. */
+function notebookOnDisk(): DiskCell[] {
+	return JSON.parse(readFileSync(join(workspace, 'notebook.ipynb'), 'utf8')).cells;
+}
+
 /** How many code cells still hold outputs, read from the `.ipynb` ON DISK. */
 function cellsWithOutputsOnDisk(): number {
-	const nb = JSON.parse(readFileSync(join(workspace, 'notebook.ipynb'), 'utf8'));
-	return nb.cells.filter((c: { outputs?: unknown[] }) => (c.outputs?.length ?? 0) > 0).length;
+	return notebookOnDisk().filter((c) => (c.outputs?.length ?? 0) > 0).length;
+}
+
+/** Ids of the cells that still hold outputs on disk, in document order. */
+function cellIdsWithOutputsOnDisk(): string[] {
+	return notebookOnDisk().filter((c) => (c.outputs?.length ?? 0) > 0).map((c) => c.id);
+}
+
+/** One cell's persisted stream output, concatenated. */
+function outputTextOnDisk(id: string): string {
+	const cell = notebookOnDisk().find((c) => c.id === id);
+	return (cell?.outputs ?? []).flatMap((o) => o.text ?? []).join('');
 }
 
 test.beforeEach(() => {
@@ -125,7 +145,7 @@ test('the toolbar renders Run all, Interrupt and Clear all outputs, each gated o
 	test.setTimeout(120_000);
 	// One code cell WITHOUT output, so clear-all has nothing to do at load.
 	await boot(buildNotebook([{ type: 'markdown', source: '# Report' }, { type: 'code', source: "print('hi')" }]));
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.goto(baseURL);
 	await openNotebook(page);
 
 	const toolbar = page.getByTestId('notebook-toolbar');
@@ -153,7 +173,7 @@ test('the toolbar renders Run all, Interrupt and Clear all outputs, each gated o
 test('Interrupt is disabled until a run is in flight, then stops the whole batch', async ({ page }) => {
 	test.setTimeout(180_000);
 	await boot(sleeperNotebook());
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.goto(baseURL);
 	await openNotebook(page);
 
 	const interrupt = page.getByTestId('notebook-toolbar').getByTestId('interrupt-all');
@@ -183,7 +203,7 @@ test('Interrupt stays armed between the cells of a bulk run, and disarms after i
 	// about — the moment cell N has ended and cell N+1's `run:start` has not arrived,
 	// where nothing is running and (sequential dispatch) nothing is queued either.
 	await boot(buildNotebook([0, 1, 2].map((i) => ({ type: 'code' as const, source: `step_${i} = ${i}` }))));
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.goto(baseURL);
 	await openNotebook(page);
 
 	// Widen that gap to something observable by delaying the run POST itself. This
@@ -224,7 +244,7 @@ test('Clear all outputs clears every cell — windowed-out ones included — and
 	test.setTimeout(180_000);
 	const CODE_CELLS = 60;
 	await boot(manyOutputsNotebook(CODE_CELLS));
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.goto(baseURL);
 	await openNotebook(page);
 
 	// Windowing is on by default: most cells have no DOM at all, so this really is
@@ -246,4 +266,45 @@ test('Clear all outputs clears every cell — windowed-out ones included — and
 	await openNotebook(page);
 	await expect(page.getByTestId('notebook-toolbar').getByTestId('clear-all-outputs')).toBeDisabled();
 	expect(cellsWithOutputsOnDisk()).toBe(0);
+});
+
+test('Clear all outputs skips the running cell, whose output survives the clear intact', async ({ page }) => {
+	test.setTimeout(180_000);
+	const TICKS = 8;
+	// c1 streams for ~8s; c0 and c2 carry saved outputs to prove the clear did run.
+	await boot(
+		buildNotebook([
+			{ type: 'code', source: 'print("before")', output: 'before' },
+			{ type: 'code', source: `import time\nfor i in range(${TICKS}):\n    print(f"tick {i}", flush=True)\n    time.sleep(1)` },
+			{ type: 'code', source: 'print("after")', output: 'after' }
+		])
+	);
+	await page.goto(baseURL);
+	await openNotebook(page);
+	expect(cellIdsWithOutputsOnDisk()).toEqual(['c0', 'c2']);
+
+	// Run the streamer alone and wait until it has really emitted something, so the
+	// clear below lands on a cell with a live, non-empty buffer.
+	await page.locator('[data-cell-id="c1"] [data-testid="run"]').click();
+	const streaming = page.locator('[data-cell-id="c1"] [data-testid="output"]');
+	await expect(streaming).toContainText('tick 0', { timeout: 90_000 });
+	await expect(page.locator('[data-cell-id="c1"] [data-testid="running-bar"]')).toBeVisible();
+
+	await page.getByTestId('notebook-toolbar').getByTestId('clear-all-outputs').click();
+
+	// The clear reached the other cells...
+	await expect.poll(() => cellIdsWithOutputsOnDisk(), { timeout: 60_000 }).toEqual(['c1']);
+	// ...and left the running cell alone. Clearing it would have persisted
+	// `outputs: []` here and only refilled at `run:end` seconds later, so this is
+	// the window in which a clear-the-running-cell regression is visible on disk.
+	expect(outputTextOnDisk('c1')).toContain('tick 0');
+	await expect(streaming).toContainText('tick 0');
+
+	// The stream is unbroken: every tick is there when the run ends.
+	await expect(page.locator('[data-cell-id="c1"] [data-testid="running-bar"]')).toBeHidden({ timeout: 90_000 });
+	await expect.poll(() => outputTextOnDisk('c1'), { timeout: 30_000 }).toContain(`tick ${TICKS - 1}`);
+	const persisted = outputTextOnDisk('c1');
+	for (let i = 0; i < TICKS; i++) expect(persisted).toContain(`tick ${i}`);
+	// The cells the clear DID address stay cleared.
+	expect(cellIdsWithOutputsOnDisk()).toEqual(['c1']);
 });
