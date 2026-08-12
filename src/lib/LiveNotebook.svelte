@@ -3393,14 +3393,15 @@
 	// Clear every cell's outputs. Palette "Clear all outputs" and the top toolbar's
 	// clear-all button are both this function, so the two cannot diverge.
 	//
-	// A cell whose run is IN FLIGHT is cleared like any other: the clear takes the
-	// outputs it has produced SO FAR, and the stream goes on writing the ones it
-	// produces AFTER the clear. Keeping those later outputs is the designed
-	// behavior - the run is still going, so its remaining output is current, not
-	// leftover - so nothing here is skipped and nothing is reported. (MCP
-	// `clear_outputs` deliberately answers differently for an agent, whose call is
-	// a one-shot report rather than a live view; the two surfaces differ on
-	// purpose.)
+	// A cell whose run is IN FLIGHT is cleared like any other - nothing here is
+	// skipped and nothing is reported - but the free is TEMPORARY, and that is the
+	// part to know: the clear empties that cell in the document and on disk, while
+	// the run's accumulator still holds the whole buffer, so `run:end` writes the
+	// full transcript back - the pre-clear output included. This tab meanwhile
+	// renders the cell blank until then (its delta no longer matches the emptied
+	// array, so the append no-ops). (MCP `clear_outputs` deliberately answers
+	// differently for an agent, whose call is a one-shot report rather than a live
+	// view; the two surfaces differ on purpose.)
 	async function clearAll() {
 		for (const c of cells) {
 			if (c.outputs?.length) await clearCell(c.id);

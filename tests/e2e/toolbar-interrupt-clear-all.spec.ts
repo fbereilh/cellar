@@ -22,10 +22,11 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  *    cell including ones virtualization has windowed out (it reads the document
  *    model, not the mounted DOM), and the cleared state is on DISK — asserted
  *    against the `.ipynb` itself, not just the in-memory doc, plus a reload;
- *  - clearing while a cell streams clears that cell too (its produced-so-far
- *    output really leaves disk while it is still running), the run goes on
- *    writing, and at `run:end` the whole transcript — the pre-clear ticks
- *    included — is persisted back from the run's accumulator.
+ *  - clearing while a cell streams clears that cell too: its output really leaves
+ *    disk while it is still running and the clicking tab renders it blank for the
+ *    rest of the run — but the free is temporary, because `run:end` persists the
+ *    run's accumulator, so the notebook ends up holding the whole transcript,
+ *    the ticks from before the clear included.
  *
  * ONE launcher for the whole file (`beforeAll`), like every sibling spec in this
  * suite. Kernels are per notebook, so each test gets its isolation from its OWN
@@ -88,13 +89,21 @@ function manyOutputsNotebook(count: number): string {
 /** How many ticks the mid-run streamer prints, one per second. */
 const TICKS = 14;
 
-/** c1 streams for ~TICKS seconds; c0 and c2 carry saved outputs. */
+/**
+ * c1 streams for ~TICKS seconds. All THREE cells carry a saved output, c1 included:
+ * that is what puts a real output for the streaming cell on DISK for the duration of
+ * the run, so removing it there is a fact about the clear rather than about a cell
+ * that never had one. (Disk is written once per run, at `run:end`; what keeps c1
+ * present during the run is that clearing any OTHER cell persists the whole
+ * document, and `setOutputsLive` keeps c1's live buffer in it.)
+ */
 function streamingNotebook(): string {
 	return buildNotebook([
 		{ type: 'code', source: 'print("before")', output: 'before' },
 		{
 			type: 'code',
-			source: `import time\nfor i in range(${TICKS}):\n    print(f"tick {i}", flush=True)\n    time.sleep(1)`
+			source: `import time\nfor i in range(${TICKS}):\n    print(f"tick {i}", flush=True)\n    time.sleep(1)`,
+			output: 'saved run'
 		},
 		{ type: 'code', source: 'print("after")', output: 'after' }
 	]);
@@ -301,7 +310,8 @@ test('Clear all outputs clears every cell — windowed-out ones included — and
 test('Clear all outputs clears a streaming cell too, and the run keeps writing after it', async ({ page }) => {
 	test.setTimeout(180_000);
 	await openNotebook(page, NB.clearMidRun);
-	expect(cellIdsWithOutputsOnDisk(NB.clearMidRun)).toEqual(['c0', 'c2']);
+	// Every cell starts with an output on disk — the streaming one included.
+	expect(cellIdsWithOutputsOnDisk(NB.clearMidRun)).toEqual(['c0', 'c1', 'c2']);
 
 	// Run the streamer alone and wait until it has emitted its first two ticks, so
 	// "produced before the clear" is a fact about specific text rather than timing.
@@ -311,29 +321,39 @@ test('Clear all outputs clears a streaming cell too, and the run keeps writing a
 
 	await page.getByTestId('notebook-toolbar').getByTestId('clear-all-outputs').click();
 
-	// Poll for the STREAMING cell's own outputs leaving disk — that is the claim, and
-	// it is what a skip-the-running-cell implementation would never satisfy. The
-	// other cells clear in the same sequential loop, so polling on one of them
-	// would fire before this one had been reached.
+	// The streaming cell's output really leaves DISK — the assertion a
+	// skip-the-running-cell implementation cannot satisfy, since it would leave that
+	// cell's output there (clearing its siblings re-persists the whole document,
+	// c1's live buffer with it). Polling a sibling instead would fire before the
+	// sequential loop had reached this cell at all.
 	await expect.poll(() => cellIdsWithOutputsOnDisk(NB.clearMidRun), { timeout: 60_000 }).not.toContain('c1');
-	// One shot, so it is provably still INSIDE the run rather than after some later
-	// state settled: the cell whose produced-so-far output just went is the very
-	// cell still executing.
+	// One shot, so the read above is provably from INSIDE the run rather than from
+	// some later settled state: the cell just cleared is the one still executing.
 	const stillRunning = await page.locator('[data-cell-id="c1"] [data-testid="running-bar"]').isVisible();
 	expect(stillRunning, 'the streamer finished before the mid-run read — raise TICKS').toBe(true);
 
-	// The run goes on writing, and what it produces AFTER the clear is kept.
+	// And in THIS tab it renders blank and stays blank while the run continues: the
+	// deltas that follow carry a `base` the emptied array no longer matches, so the
+	// append no-ops. (A skip would leave the ticks on screen throughout.)
+	await expect(streaming).toBeHidden({ timeout: 20_000 });
+	await page.waitForTimeout(3000);
+	await expect(streaming).toBeHidden();
+	await expect(page.locator('[data-cell-id="c1"] [data-testid="running-bar"]')).toBeVisible();
+
+	// The free lasts only as long as the run: `run:end` persists `acc.finish()`, the
+	// run's whole buffer, which the clear never touched (it emptied the document,
+	// not the accumulator). So the notebook ends up holding the FULL transcript —
+	// the ticks from before the clear included. Pinned because it is surprising and
+	// because the honest statement of what this button does to a running cell
+	// depends on it, not because it is desirable.
 	await expect(page.locator('[data-cell-id="c1"] [data-testid="running-bar"]')).toBeHidden({ timeout: 90_000 });
 	await expect.poll(() => outputTextOnDisk(NB.clearMidRun, 'c1'), { timeout: 30_000 }).toContain(`tick ${TICKS - 1}`);
-	// ...and so are the ticks from BEFORE it: `run:end` persists `acc.finish()`, the
-	// run's whole buffer, which the clear never touched (it emptied the document,
-	// not the accumulator). So a mid-run clear frees the streaming cell's outputs
-	// only until that run ends, at which point the full transcript is written back.
-	// Pinned because it is surprising and because the honest statement of what this
-	// button does to a running cell depends on it, not because it is desirable.
 	const persisted = outputTextOnDisk(NB.clearMidRun, 'c1');
 	expect(persisted).toContain('tick 0');
 	expect(persisted).toContain('tick 1');
+	// The saved output that cell carried before the run is gone, though — that one
+	// the clear really did remove, and the accumulator never had it.
+	expect(persisted).not.toContain('saved run');
 	// The cells that were not running stay cleared.
 	expect(cellIdsWithOutputsOnDisk(NB.clearMidRun)).toEqual(['c1']);
 });
