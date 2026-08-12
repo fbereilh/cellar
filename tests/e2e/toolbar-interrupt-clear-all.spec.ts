@@ -11,7 +11,7 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  * `kernel-interrupt` / `clear-all-outputs`), so what is proven here is the wiring
  * and the gating, not the underlying kernel/output logic:
  *
- *  - all three buttons render in the toolbar;
+ *  - all three buttons render in the toolbar and gate on real state;
  *  - Interrupt is disabled while nothing runs, arms while a run is in flight, and
  *    clicking it really stops the batch (the sleeper ends far short of its sleep
  *    and no later cell runs) — the same effect as the palette command;
@@ -22,14 +22,29 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  *    cell including ones virtualization has windowed out (it reads the document
  *    model, not the mounted DOM), and the cleared state is on DISK — asserted
  *    against the `.ipynb` itself, not just the in-memory doc, plus a reload;
- *  - Clear all outputs SKIPS the cell whose run is in flight, matching MCP
- *    `clear_outputs`: its buffer would be written straight back, so clearing it
- *    would report a success the notebook never keeps.
+ *  - clearing while a cell streams clears that cell too (its produced-so-far
+ *    output really leaves disk while it is still running), the run goes on
+ *    writing, and at `run:end` the whole transcript — the pre-clear ticks
+ *    included — is persisted back from the run's accumulator.
+ *
+ * ONE launcher for the whole file (`beforeAll`), like every sibling spec in this
+ * suite. Kernels are per notebook, so each test gets its isolation from its OWN
+ * seeded `.ipynb` — opened from the file tree — not from its own launcher; every
+ * test drives a different notebook, so they do not depend on each other's order.
  */
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
 let baseURL = '';
+
+/** One notebook per test — the unit of isolation here, since kernels are per notebook. */
+const NB = {
+	gating: 'gating.ipynb',
+	interrupt: 'interrupt.ipynb',
+	bulkGap: 'bulk-gap.ipynb',
+	clearAll: 'clear-all.ipynb',
+	clearMidRun: 'clear-mid-run.ipynb'
+} as const;
 
 type CellSpec = { type: 'code' | 'markdown'; source: string; output?: string };
 
@@ -70,65 +85,91 @@ function manyOutputsNotebook(count: number): string {
 	return buildNotebook(specs);
 }
 
-/** Boot a fresh launcher + workspace seeded with `nbJson` as `notebook.ipynb`. */
-async function boot(nbJson: string): Promise<void> {
-	workspace = mkdtempSync(join(tmpdir(), 'cellar-toolbar-'));
-	writeFileSync(join(workspace, 'notebook.ipynb'), nbJson);
-	const booted = await bootCellar(workspace);
-	launcher = booted.proc;
-	baseURL = booted.url;
+/** How many ticks the mid-run streamer prints, one per second. */
+const TICKS = 14;
+
+/** c1 streams for ~TICKS seconds; c0 and c2 carry saved outputs. */
+function streamingNotebook(): string {
+	return buildNotebook([
+		{ type: 'code', source: 'print("before")', output: 'before' },
+		{
+			type: 'code',
+			source: `import time\nfor i in range(${TICKS}):\n    print(f"tick {i}", flush=True)\n    time.sleep(1)`
+		},
+		{ type: 'code', source: 'print("after")', output: 'after' }
+	]);
 }
 
-async function openNotebook(page: Page): Promise<void> {
-	const emptyOpen = page.getByTestId('empty-open-notebook');
-	await Promise.race([
-		emptyOpen.waitFor({ timeout: 30_000 }).catch(() => {}),
-		page.getByTestId('cell').first().waitFor({ timeout: 30_000 }).catch(() => {})
-	]);
-	if (await emptyOpen.isVisible().catch(() => false)) await emptyOpen.click();
+/** Open `file` from the file tree in a fresh page and wait for its notebook to render. */
+async function openNotebook(page: Page, file: string): Promise<void> {
+	await page.goto(baseURL);
+	await page.getByTestId('tree-file').filter({ hasText: file }).first().click();
 	await expect(page.getByTestId('notebook-toolbar')).toBeVisible({ timeout: 30_000 });
 	await expect.poll(async () => page.getByTestId('cell').count(), { timeout: 30_000 }).toBeGreaterThan(0);
 }
 
-/** Marker variable names currently defined in the live kernel namespace. */
-async function definedMarkers(page: Page): Promise<string[]> {
-	return page.evaluate(async () => {
-		const res = await fetch('/api/kernel/variables?path=notebook.ipynb');
+/** Marker variable names currently defined in `file`'s kernel namespace. */
+async function definedMarkers(page: Page, file: string): Promise<string[]> {
+	return page.evaluate(async (nb) => {
+		const res = await fetch(`/api/kernel/variables?path=${encodeURIComponent(nb)}`);
 		if (!res.ok) return [];
 		const body = await res.json();
 		const vars: { name: string }[] = body.variables ?? body ?? [];
 		return vars.map((v) => v.name).filter((n) => n.startsWith('marker_')).sort();
-	});
+	}, file);
 }
 
 type DiskCell = { id: string; outputs?: { text?: string[] }[] };
 
-/** The `.ipynb` ON DISK — the persisted document, not the in-memory doc. */
-function notebookOnDisk(): DiskCell[] {
-	return JSON.parse(readFileSync(join(workspace, 'notebook.ipynb'), 'utf8')).cells;
+/** A notebook ON DISK — the persisted document, not the in-memory doc. */
+function notebookOnDisk(file: string): DiskCell[] {
+	return JSON.parse(readFileSync(join(workspace, file), 'utf8')).cells;
 }
 
-/** How many code cells still hold outputs, read from the `.ipynb` ON DISK. */
-function cellsWithOutputsOnDisk(): number {
-	return notebookOnDisk().filter((c) => (c.outputs?.length ?? 0) > 0).length;
+/** How many code cells in `file` still hold outputs, read from the `.ipynb` ON DISK. */
+function cellsWithOutputsOnDisk(file: string): number {
+	return notebookOnDisk(file).filter((c) => (c.outputs?.length ?? 0) > 0).length;
 }
 
-/** Ids of the cells that still hold outputs on disk, in document order. */
-function cellIdsWithOutputsOnDisk(): string[] {
-	return notebookOnDisk().filter((c) => (c.outputs?.length ?? 0) > 0).map((c) => c.id);
+/** Ids of the cells in `file` that still hold outputs on disk, in document order. */
+function cellIdsWithOutputsOnDisk(file: string): string[] {
+	return notebookOnDisk(file)
+		.filter((c) => (c.outputs?.length ?? 0) > 0)
+		.map((c) => c.id);
 }
 
 /** One cell's persisted stream output, concatenated. */
-function outputTextOnDisk(id: string): string {
-	const cell = notebookOnDisk().find((c) => c.id === id);
+function outputTextOnDisk(file: string, id: string): string {
+	const cell = notebookOnDisk(file).find((c) => c.id === id);
 	return (cell?.outputs ?? []).flatMap((o) => o.text ?? []).join('');
 }
 
-test.beforeEach(() => {
+test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available — E2E is local-only');
+	workspace = mkdtempSync(join(tmpdir(), 'cellar-toolbar-'));
+	// One code cell WITHOUT output, so clear-all has nothing to do at load.
+	writeFileSync(
+		join(workspace, NB.gating),
+		buildNotebook([{ type: 'markdown', source: '# Report' }, { type: 'code', source: "print('hi')" }])
+	);
+	writeFileSync(join(workspace, NB.interrupt), sleeperNotebook());
+	// Three cells that each take a beat: long enough that a cell's running state is
+	// observable, short enough that the batch is quick. What the test is about is
+	// the gap BETWEEN two of them.
+	writeFileSync(
+		join(workspace, NB.bulkGap),
+		buildNotebook(
+			[0, 1, 2].map((i) => ({ type: 'code' as const, source: `import time\nstep_${i} = ${i}\ntime.sleep(2)` }))
+		)
+	);
+	writeFileSync(join(workspace, NB.clearAll), manyOutputsNotebook(60));
+	writeFileSync(join(workspace, NB.clearMidRun), streamingNotebook());
+	const booted = await bootCellar(workspace);
+	launcher = booted.proc;
+	baseURL = booted.url;
 });
 
-test.afterEach(async () => {
+test.afterAll(async () => {
 	if (launcher) killCellar(launcher);
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
@@ -143,10 +184,7 @@ test.afterEach(async () => {
 
 test('the toolbar renders Run all, Interrupt and Clear all outputs, each gated on state', async ({ page }) => {
 	test.setTimeout(120_000);
-	// One code cell WITHOUT output, so clear-all has nothing to do at load.
-	await boot(buildNotebook([{ type: 'markdown', source: '# Report' }, { type: 'code', source: "print('hi')" }]));
-	await page.goto(baseURL);
-	await openNotebook(page);
+	await openNotebook(page, NB.gating);
 
 	const toolbar = page.getByTestId('notebook-toolbar');
 	const runAll = toolbar.getByTestId('run-all');
@@ -172,9 +210,7 @@ test('the toolbar renders Run all, Interrupt and Clear all outputs, each gated o
 
 test('Interrupt is disabled until a run is in flight, then stops the whole batch', async ({ page }) => {
 	test.setTimeout(180_000);
-	await boot(sleeperNotebook());
-	await page.goto(baseURL);
-	await openNotebook(page);
+	await openNotebook(page, NB.interrupt);
 
 	const interrupt = page.getByTestId('notebook-toolbar').getByTestId('interrupt-all');
 	await expect(interrupt).toBeDisabled();
@@ -191,7 +227,7 @@ test('Interrupt is disabled until a run is in flight, then stops the whole batch
 	// The sleeper stops well short of its 20s sleep, and the batch does not continue.
 	await expect(page.locator('[data-cell-id="c0"] [data-testid="running-bar"]')).toBeHidden({ timeout: 20_000 });
 	await page.waitForTimeout(6000);
-	expect(await definedMarkers(page)).toEqual([]);
+	expect(await definedMarkers(page, NB.interrupt)).toEqual([]);
 
 	// With nothing left running the button disarms again.
 	await expect(interrupt).toBeDisabled();
@@ -199,16 +235,12 @@ test('Interrupt is disabled until a run is in flight, then stops the whole batch
 
 test('Interrupt stays armed between the cells of a bulk run, and disarms after it', async ({ page }) => {
 	test.setTimeout(180_000);
-	// Three quick cells: each run is short, so the gap BETWEEN them is what this is
-	// about — the moment cell N has ended and cell N+1's `run:start` has not arrived,
-	// where nothing is running and (sequential dispatch) nothing is queued either.
-	await boot(buildNotebook([0, 1, 2].map((i) => ({ type: 'code' as const, source: `step_${i} = ${i}` }))));
-	await page.goto(baseURL);
-	await openNotebook(page);
+	await openNotebook(page, NB.bulkGap);
 
-	// Widen that gap to something observable by delaying the run POST itself. This
-	// slows the real request; it invents no state — the gap exists at full speed too,
-	// it is just one round trip wide and would make the assertion below a race.
+	// Widen the inter-cell gap to something observable by delaying the run POST
+	// itself. This slows the real request; it invents no state — the gap exists at
+	// full speed too, it is just one round trip wide and would make the assertion
+	// below a race.
 	const GAP_MS = 2000;
 	await page.route('**/api/cells/*/run', async (route) => {
 		await new Promise((r) => setTimeout(r, GAP_MS));
@@ -243,68 +275,66 @@ test('Interrupt stays armed between the cells of a bulk run, and disarms after i
 test('Clear all outputs clears every cell — windowed-out ones included — and persists', async ({ page }) => {
 	test.setTimeout(180_000);
 	const CODE_CELLS = 60;
-	await boot(manyOutputsNotebook(CODE_CELLS));
-	await page.goto(baseURL);
-	await openNotebook(page);
+	await openNotebook(page, NB.clearAll);
 
 	// Windowing is on by default: most cells have no DOM at all, so this really is
 	// the "clear must read the model, not the mounted cells" case.
 	const mounted = await page.getByTestId('cell').count();
 	expect(mounted).toBeLessThan(CODE_CELLS * 2);
-	expect(cellsWithOutputsOnDisk()).toBe(CODE_CELLS);
+	expect(cellsWithOutputsOnDisk(NB.clearAll)).toBe(CODE_CELLS);
 
 	const clearAll = page.getByTestId('notebook-toolbar').getByTestId('clear-all-outputs');
 	await expect(clearAll).toBeEnabled();
 	await clearAll.click();
 
 	// Every cell's outputs are gone on DISK — including the ones never mounted.
-	await expect.poll(() => cellsWithOutputsOnDisk(), { timeout: 90_000 }).toBe(0);
+	await expect.poll(() => cellsWithOutputsOnDisk(NB.clearAll), { timeout: 90_000 }).toBe(0);
 	await expect(clearAll).toBeDisabled();
 
 	// And the cleared state survives a reload.
 	await page.reload();
-	await openNotebook(page);
+	await page.getByTestId('tree-file').filter({ hasText: NB.clearAll }).first().click();
 	await expect(page.getByTestId('notebook-toolbar').getByTestId('clear-all-outputs')).toBeDisabled();
-	expect(cellsWithOutputsOnDisk()).toBe(0);
+	expect(cellsWithOutputsOnDisk(NB.clearAll)).toBe(0);
 });
 
-test('Clear all outputs skips the running cell, whose output survives the clear intact', async ({ page }) => {
+test('Clear all outputs clears a streaming cell too, and the run keeps writing after it', async ({ page }) => {
 	test.setTimeout(180_000);
-	const TICKS = 8;
-	// c1 streams for ~8s; c0 and c2 carry saved outputs to prove the clear did run.
-	await boot(
-		buildNotebook([
-			{ type: 'code', source: 'print("before")', output: 'before' },
-			{ type: 'code', source: `import time\nfor i in range(${TICKS}):\n    print(f"tick {i}", flush=True)\n    time.sleep(1)` },
-			{ type: 'code', source: 'print("after")', output: 'after' }
-		])
-	);
-	await page.goto(baseURL);
-	await openNotebook(page);
-	expect(cellIdsWithOutputsOnDisk()).toEqual(['c0', 'c2']);
+	await openNotebook(page, NB.clearMidRun);
+	expect(cellIdsWithOutputsOnDisk(NB.clearMidRun)).toEqual(['c0', 'c2']);
 
-	// Run the streamer alone and wait until it has really emitted something, so the
-	// clear below lands on a cell with a live, non-empty buffer.
+	// Run the streamer alone and wait until it has emitted its first two ticks, so
+	// "produced before the clear" is a fact about specific text rather than timing.
 	await page.locator('[data-cell-id="c1"] [data-testid="run"]').click();
 	const streaming = page.locator('[data-cell-id="c1"] [data-testid="output"]');
-	await expect(streaming).toContainText('tick 0', { timeout: 90_000 });
-	await expect(page.locator('[data-cell-id="c1"] [data-testid="running-bar"]')).toBeVisible();
+	await expect(streaming).toContainText('tick 1', { timeout: 90_000 });
 
 	await page.getByTestId('notebook-toolbar').getByTestId('clear-all-outputs').click();
 
-	// The clear reached the other cells...
-	await expect.poll(() => cellIdsWithOutputsOnDisk(), { timeout: 60_000 }).toEqual(['c1']);
-	// ...and left the running cell alone. Clearing it would have persisted
-	// `outputs: []` here and only refilled at `run:end` seconds later, so this is
-	// the window in which a clear-the-running-cell regression is visible on disk.
-	expect(outputTextOnDisk('c1')).toContain('tick 0');
-	await expect(streaming).toContainText('tick 0');
+	// Poll for the STREAMING cell's own outputs leaving disk — that is the claim, and
+	// it is what a skip-the-running-cell implementation would never satisfy. The
+	// other cells clear in the same sequential loop, so polling on one of them
+	// would fire before this one had been reached.
+	await expect.poll(() => cellIdsWithOutputsOnDisk(NB.clearMidRun), { timeout: 60_000 }).not.toContain('c1');
+	// One shot, so it is provably still INSIDE the run rather than after some later
+	// state settled: the cell whose produced-so-far output just went is the very
+	// cell still executing.
+	const stillRunning = await page.locator('[data-cell-id="c1"] [data-testid="running-bar"]').isVisible();
+	expect(stillRunning, 'the streamer finished before the mid-run read — raise TICKS').toBe(true);
 
-	// The stream is unbroken: every tick is there when the run ends.
+	// The run goes on writing, and what it produces AFTER the clear is kept.
 	await expect(page.locator('[data-cell-id="c1"] [data-testid="running-bar"]')).toBeHidden({ timeout: 90_000 });
-	await expect.poll(() => outputTextOnDisk('c1'), { timeout: 30_000 }).toContain(`tick ${TICKS - 1}`);
-	const persisted = outputTextOnDisk('c1');
-	for (let i = 0; i < TICKS; i++) expect(persisted).toContain(`tick ${i}`);
-	// The cells the clear DID address stay cleared.
-	expect(cellIdsWithOutputsOnDisk()).toEqual(['c1']);
+	await expect.poll(() => outputTextOnDisk(NB.clearMidRun, 'c1'), { timeout: 30_000 }).toContain(`tick ${TICKS - 1}`);
+	// ...and so are the ticks from BEFORE it: `run:end` persists `acc.finish()`, the
+	// run's whole buffer, which the clear never touched (it emptied the document,
+	// not the accumulator). So a mid-run clear frees the streaming cell's outputs
+	// only until that run ends, at which point the full transcript is written back.
+	// Pinned because it is surprising and because the honest statement of what this
+	// button does to a running cell depends on it, not because it is desirable.
+	const persisted = outputTextOnDisk(NB.clearMidRun, 'c1');
+	expect(persisted).toContain('tick 0');
+	expect(persisted).toContain('tick 1');
+	// The cells that were not running stay cleared.
+	expect(cellIdsWithOutputsOnDisk(NB.clearMidRun)).toEqual(['c1']);
 });
+

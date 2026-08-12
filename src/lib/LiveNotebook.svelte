@@ -3393,20 +3393,16 @@
 	// Clear every cell's outputs. Palette "Clear all outputs" and the top toolbar's
 	// clear-all button are both this function, so the two cannot diverge.
 	//
-	// The cell whose run is IN FLIGHT is SKIPPED, never cleared - MCP
-	// `clear_outputs` takes exactly this stance and for exactly this reason: the
-	// run's accumulator holds the whole buffer, so its next `setOutputsLive` flush
-	// and its `run:end` `setOutputs` write those outputs straight back to memory
-	// and disk, and clearing it would report a success the notebook never keeps.
-	// `runningId` is this notebook's mirror of the server queue's `running` entry;
-	// a merely QUEUED cell has emitted nothing yet, so clearing it is honest and it
-	// is deliberately not skipped (it appears in `queued`, not `runningId`).
-	// Checked BEFORE the has-outputs guard, like the MCP rule: the skip is about
-	// the cell being in the kernel's hands, not about whether its buffer happens to
-	// be empty at this instant.
+	// A cell whose run is IN FLIGHT is cleared like any other: the clear takes the
+	// outputs it has produced SO FAR, and the stream goes on writing the ones it
+	// produces AFTER the clear. Keeping those later outputs is the designed
+	// behavior - the run is still going, so its remaining output is current, not
+	// leftover - so nothing here is skipped and nothing is reported. (MCP
+	// `clear_outputs` deliberately answers differently for an agent, whose call is
+	// a one-shot report rather than a live view; the two surfaces differ on
+	// purpose.)
 	async function clearAll() {
 		for (const c of cells) {
-			if (c.id === runningId) continue;
 			if (c.outputs?.length) await clearCell(c.id);
 		}
 	}

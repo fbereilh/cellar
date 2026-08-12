@@ -777,8 +777,11 @@
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
 				Run all
 			</button>
-			<!-- Disabled while nothing is running, so it can never fire a no-op that
-			     silently drops another tab's or an agent's queued runs. -->
+			<!-- Disabled only while this notebook is genuinely idle, where the whole
+			     sequence would be a no-op: no interrupt request is fired at a kernel
+			     with nothing to stop and no queue to drop. Queued runs (this tab's,
+			     another tab's or an agent's) put entries in `queued`, so the button
+			     is ENABLED exactly when there is something for it to cancel. -->
 			<button
 				class="btn btn-ghost btn-sm gap-1.5"
 				onclick={() => onInterrupt?.()}
