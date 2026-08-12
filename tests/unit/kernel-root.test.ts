@@ -209,8 +209,18 @@ describe('a kernel whose cwd is REFUSED is never left serving runs', () => {
 		h.fakeCwd.value = '/somewhere/else';
 		await expect(execute(WT, 'x=1', noop)).rejects.toThrow(/declared code root/i);
 		// The refused start left no process behind, so nothing would ever reap it…
-		const started = h.startNew.mock.results[0].value as Promise<{ shutdown: { mock: { calls: unknown[] } } }>;
+		const started = h.startNew.mock.results[0].value as Promise<{
+			shutdown: { mock: { calls: unknown[] } };
+			statusChanged: { disconnect: { mock: { calls: unknown[] } } };
+		}>;
 		expect((await started).shutdown.mock.calls.length).toBe(1);
+		// …and no LISTENER behind either. Every other teardown path disconnects the
+		// status handler (`teardownKernel`), and this one must match: the map entry
+		// outlives the shutdown (the `startPromise.catch` drops it), and
+		// `nbKernel.connection` still points at this kernel, so a flip emitted while
+		// the process goes away would otherwise fan a `kernel:status` snapshot out to
+		// every tab for a kernel that has already been refused.
+		expect((await started).statusChanged.disconnect.mock.calls.length).toBe(1);
 		// …and no entry behind either: the next run is a fresh START, not a reuse.
 		h.fakeCwd.value = null;
 		h.startNew.mockClear();

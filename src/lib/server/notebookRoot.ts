@@ -187,15 +187,6 @@ function ws(): string {
 	return resolve(workspaceRoot());
 }
 
-/** `realpathSync` where possible, else the path itself (it may not exist yet). */
-function realpathOrSelf(p: string): string {
-	try {
-		return realpathSync(p);
-	} catch {
-		return p;
-	}
-}
-
 /**
  * A path in the REAL namespace, resolving as much of it as exists.
  *
@@ -227,6 +218,29 @@ function canonicalPath(p: string): string {
 /** True when two absolute paths name the same directory, across namespaces. */
 function samePath(a: string, b: string): boolean {
 	return a === b || canonicalPath(a) === canonicalPath(b);
+}
+
+/**
+ * The workspace in the REAL namespace — the right-hand side of nearly every
+ * identity/containment question here, and therefore the one worth HOISTING.
+ *
+ * Exported so a caller that asks several of those questions in one pass resolves it
+ * ONCE and threads it in, the way `resolveRootDir` already threads `canonDir` into
+ * the gate. Every such helper below takes it as an optional argument defaulting to
+ * this, so the semantics are identical whether or not a caller hoists — the sidebar
+ * route was paying three `realpathSync` WALKS of the workspace per registered
+ * worktree (one in `enclosesWorkspace`, two in `worktreeDeclaration`), on a panel
+ * that refetches on mount, on `sse:open`, on every `fsRefreshSignal` and on every
+ * window focus, on the process carrying the kernel websockets and the SSE fan-out —
+ * with a worktree per PR under review, which is this feature's own use case.
+ *
+ * Deliberately NOT memoized process-wide: the workspace's canonical form is stable
+ * in practice, but a cache keyed on a path that can be re-created underneath it is
+ * the kind of silent staleness this module is written against. Hoisting is explicit
+ * and expires with the request.
+ */
+export function canonicalWorkspace(): string {
+	return canonicalPath(ws());
 }
 
 /**
@@ -341,10 +355,12 @@ export function isOutsideWorkspace(dir: string): boolean {
  * checkout always being listed, and it was never a designed capability.
  *
  * Compared CANONICALLY, like every other identity/containment question here: git
- * realpaths its output while Cellar's workspace is the lexical resolve.
+ * realpaths its output while Cellar's workspace is the lexical resolve. `canonWs`
+ * is that side, hoisted by a caller asking this of many candidates in one pass; the
+ * default keeps a lone call identical to what it always was.
  */
-export function enclosesWorkspace(dir: string): boolean {
-	const inner = relative(canonicalPath(dir), canonicalPath(ws()));
+export function enclosesWorkspace(dir: string, canonWs: string = canonicalWorkspace()): boolean {
+	const inner = relative(canonicalPath(dir), canonWs);
 	// '' is the workspace itself (identity, not enclosure) and an absolute result
 	// means no relative path exists at all (a different Windows drive).
 	if (inner === '' || isAbsolute(inner)) return false;
@@ -364,7 +380,8 @@ export function enclosesWorkspace(dir: string): boolean {
  * git hands back a REALPATH'd absolute path; a declaration must be LEXICAL,
  * because it is what gets persisted and what jupyter joins onto its lexical
  * `root_dir`. So the hop between the two checkouts is measured in the REAL
- * namespace and then applied lexically from the workspace. Measuring it as
+ * namespace (`canonWs`, hoistable by a caller minting many declarations in one
+ * pass) and then applied lexically from the workspace. Measuring it as
  * `relative(lexicalWs, realPath)` instead yields the machine-specific
  * `../../../private/var/folders/…` form on macOS: it resolves, but it is not a
  * declaration anyone should have in a committed `.ipynb`, and it is not even the
@@ -379,8 +396,8 @@ export function enclosesWorkspace(dir: string): boolean {
  * but naming the right directory. An ugly declaration is a cosmetic cost; one
  * that points somewhere else is the silent degrade this feature exists to prevent.
  */
-export function worktreeDeclaration(worktreePath: string): string {
-	const rel = relative(realpathOrSelf(ws()), worktreePath).split(sep).join('/');
+export function worktreeDeclaration(worktreePath: string, canonWs: string = canonicalWorkspace()): string {
+	const rel = relative(canonWs, worktreePath).split(sep).join('/');
 	if (rel && samePath(resolve(ws(), rel), worktreePath)) return rel;
 	return toRel(worktreePath);
 }
@@ -391,7 +408,7 @@ function nameWorktrees(list: GitWorktree[]): string {
 	const canonWs = canonicalPath(wsDir);
 	// Neither the workspace itself nor a checkout that ENCLOSES it: a refusal that
 	// offers a candidate the very next resolve would refuse is worse than a short list.
-	const others = list.filter((w) => !isWorktreeAt(w, wsDir, canonWs) && !enclosesWorkspace(w.path));
+	const others = list.filter((w) => !isWorktreeAt(w, wsDir, canonWs) && !enclosesWorkspace(w.path, canonWs));
 	if (!others.length) return 'This repository has no other worktrees registered.';
 	const shown = others.slice(0, 5).map((w) => w.path);
 	const more = others.length - shown.length;
@@ -524,7 +541,8 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 		// very `<ws>/.mcp.json` that "an ordinary workspace launch is untouched" is
 		// about. Asked canonically it is what it always was: no root at all. The cost
 		// is confined to this branch, so an ordinary `roots/…` root pays nothing.
-		if (canonDir === canonicalPath(wsDir)) return null;
+		const canonWs = canonicalWorkspace();
+		if (canonDir === canonWs) return null;
 		// OUTSIDE — the second, narrower admission rule. Throws unless the listing
 		// names this exact directory, and its refusal names the repair, so a path
 		// that simply escapes the workspace is answered by the gate rather than by
@@ -534,7 +552,7 @@ export function resolveRootDir(raw: string | null | undefined): ResolvedRoot | n
 		// after the gate, not before it, so a path that is merely outside keeps the
 		// gate's own repair message. Named honestly for what it is — saying it is not
 		// a registered worktree would be false here, since it demonstrably is.
-		if (enclosesWorkspace(canonDir)) {
+		if (enclosesWorkspace(canonDir, canonWs)) {
 			throw new NotebookRootError(
 				`Notebook root ${JSON.stringify(declared)} is a registered worktree of this repository, but it CONTAINS the workspace — rooting a kernel there would run it above the directory Cellar is serving. A root must be a separate checkout (a sibling worktree), or a directory inside the workspace.`
 			);

@@ -527,6 +527,87 @@ describe('failure is REPORTED, never thrown', () => {
 		}
 	});
 
+	it('a PARTIAL revert never eats the newline that terminated the user’s own last line', () => {
+		// THE SHAPE EVERY OTHER CASE HERE MISSES: an exclude file that does NOT end with
+		// a newline, two harnesses, and only ONE of them reverted.
+		//
+		// A trailing newline has to be written before an entry can be appended at all,
+		// and that newline is OURS — but it terminates the USER's last line, and once
+		// the second harness has appended after it, it is load-bearing for a block that
+		// is staying. Recorded inside the first harness's own appended slice, splicing
+		// that slice back out took the newline with it and joined the user's final entry
+		// to the surviving marker: `build/# added by cellar…`. Their `build/` pattern was
+		// gone, and the marker line — no longer starting with `#` — became an ACTIVE
+		// ignore pattern in the repo-COMMON exclude, i.e. across every working tree of
+		// the clone. Every existing case above uses an exclude that ends with `\n` or
+		// does not exist, so none of them can see it.
+		harness.allowHarness('codex', WS);
+		mkdirSync(join(WS, '.git', 'info'), { recursive: true });
+		const before = '# git ls-files --others --exclude-from=.git/info/exclude\nbuild/';
+		writeFileSync(EXCLUDE, before);
+		// claude is REFUSED (the user's own `.mcp.json`, which the writer will not edit)
+		// while codex is written — so exactly one of the two blocks is taken back.
+		writeFileSync(join(SIBLING, '.mcp.json'), 'not json at all\n');
+		try {
+			mod.configureAdoptedWorktree(SIBLING);
+			// The surviving file is the user's ORIGINAL bytes plus ONLY the surviving
+			// harness's block — asserted as a whole string, because "does not contain
+			// /.mcp.json" passes against the corrupted form too.
+			const after = readFileSync(EXCLUDE, 'utf8');
+			expect(after).toBe(`${before}\n# added by cellar: agent config for a notebook code root\n/.codex/config.toml\n`);
+			// And git agrees about both halves: the user's pattern still works, the
+			// refused harness's file is theirs again, and the written one is ignored.
+			mkdirSync(join(SIBLING, 'build'), { recursive: true });
+			writeFileSync(join(SIBLING, 'build', 'out.txt'), 'x\n');
+			expect(git(SIBLING, 'check-ignore', '-v', 'build/out.txt')).toContain('info/exclude');
+			expect(() => git(SIBLING, 'check-ignore', '-q', '.mcp.json')).toThrow();
+			expect(git(SIBLING, 'check-ignore', '-v', '.codex/config.toml')).toContain('info/exclude');
+		} finally {
+			harness.disallowHarness('codex', WS);
+			harness.allowHarness('claude', WS);
+			rmSync(join(SIBLING, 'build'), { recursive: true, force: true });
+			rmSync(join(SIBLING, '.codex'), { recursive: true, force: true });
+			rmSync(join(SIBLING, '.mcp.json'), { force: true });
+		}
+	});
+
+	it('puts the missing trailing newline back when EVERY block is reverted', () => {
+		// The other end of the same rule: the separator is ours, so once nothing of this
+		// call's is left to need it, it goes too and the file is byte-identical. Kept
+		// per-write it could never be restored — only the FIRST append can observe the
+		// missing newline, and the LAST revert is what has to put it back.
+		harness.allowHarness('codex', WS);
+		mkdirSync(join(WS, '.git', 'info'), { recursive: true });
+		const before = 'build/';
+		writeFileSync(EXCLUDE, before);
+		writeFileSync(join(SIBLING, '.mcp.json'), 'not json at all\n');
+		writeFileSync(join(SIBLING, '.codex'), 'not a directory\n');
+		try {
+			expect(mod.configureAdoptedWorktree(SIBLING)?.status).toBe('skipped');
+			expect(readFileSync(EXCLUDE, 'utf8')).toBe(before);
+		} finally {
+			harness.disallowHarness('codex', WS);
+			harness.allowHarness('claude', WS);
+			rmSync(join(SIBLING, '.codex'), { force: true });
+			rmSync(join(SIBLING, '.mcp.json'), { force: true });
+		}
+	});
+
+	it('SOURCE GUARD: the exclude PATTERN is `/`-separated, never the platform separator', () => {
+		// A gitignore pattern is `/`-separated on every platform, while `HARNESSES`
+		// builds codex's path with `join('.codex','config.toml')`. Sliced off the
+		// worktree prefix verbatim, a Windows run wrote `/.codex\config.toml` — which
+		// matches nothing, so the file stayed visible as an untracked change while
+		// `warnings()` read the exclude as arranged and said nothing: a silently false
+		// "ok", and the one outcome this module's transactional exclude exists to
+		// prevent. A source guard because on POSIX `join` already yields `/`, so a
+		// behavioural assertion here passes against the broken form too.
+		const src = readFileSync(new URL('../../src/lib/server/worktree-agent-config.ts', import.meta.url), 'utf8');
+		expect(src).not.toMatch(/slice\(worktreeDir\.length/);
+		expect(src).toMatch(/return relative\(worktreeDir, file\)\.split\(sep\)\.join\('\/'\)/);
+		expect(src).toMatch(/ensureGitExclude\(commonDir, excludePattern\(worktreeDir, file\)\)/);
+	});
+
 	it('never removes an exclude entry it did not add', () => {
 		// The revert is scoped to the bytes THIS call appended. An entry the user (or an
 		// earlier adoption) already had is not ours to take back, and a skipped write

@@ -1474,6 +1474,18 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 			// cwd verification, and a refused start must not leave its Python process
 			// behind: the map entry is dropped by the `startPromise.catch` below, so
 			// nothing would ever reap it. Best-effort, then rethrow the real reason.
+			//
+			// The listener comes off FIRST, as every other teardown path does
+			// (`teardownKernel`): `nbKernel.connection` still points at this kernel and
+			// the map entry outlives the shutdown, so a status flip emitted while the
+			// process goes away would otherwise fan a `kernel:status` snapshot out to
+			// every tab for a kernel that is already refused.
+			try {
+				if (nbKernel.statusHandler) kernel.statusChanged.disconnect(nbKernel.statusHandler);
+			} catch {
+				/* already disconnected, or the connection is gone */
+			}
+			nbKernel.statusHandler = null;
 			try {
 				await kernel.shutdown();
 			} catch {

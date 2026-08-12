@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -287,5 +287,63 @@ describe('use_notebook(root) with no name re-roots the notebook you are working 
 		expect(bodyOf(res)).toMatch(/has not pinned one yet/i);
 		expect(existsSync(join(WS, 'untitled.ipynb'))).toBe(false);
 		expect(svc.currentNotebook('sessNoPin').pinned).toBe(false);
+	});
+});
+
+/**
+ * The one thing adopting an EXTERNAL root writes outside the workspace, disclosed
+ * on every surface an agent reads BEFORE it chooses one.
+ *
+ * All three of these emphasise that an external root grants no file reach — which
+ * is true of the kernel and of every file API, and is load-bearing — but adoption
+ * DOES write Cellar's agent config into that checkout and adds a repo-common ignore
+ * entry for it. The human path states that cost twice before the click (the root
+ * bar's copy and the Settings toggle); the agent path had only the post-hoc
+ * `agent_config` field on the result, so an agent picking a root on the strength of
+ * "this touches nothing" was being misinformed by us. Pinned as source guards
+ * because these are STRINGS an agent is billed for and a reword is exactly how an
+ * honesty clause quietly goes missing.
+ */
+describe('the agent is told what adopting an external root writes', () => {
+	const src = () => readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
+
+	/** One registered tool's description literal. */
+	function descriptionOf(name: string): string {
+		const line = src()
+			.split('\n')
+			.find((l) => l.includes(`server.registerTool('${name}'`));
+		expect(line, `${name} is registered on one line`).toBeTruthy();
+		const m = line!.match(/description: '(.*?)', inputSchema/);
+		expect(m, `${name}'s description is a single-quoted one-line literal`).toBeTruthy();
+		return m![1].replace(/\\(.)/g, '$1');
+	}
+
+	it('use_notebook says it, where the root is actually chosen', () => {
+		const d = descriptionOf('use_notebook');
+		expect(d).toMatch(/EXTERNAL worktree root also writes Cellar's agent config/);
+		// Never committed, and reversible — the two facts that make it acceptable.
+		expect(d).toMatch(/git-excluded and never committed/);
+		expect(d).toMatch(/Settings toggle/);
+		expect(d).toMatch(/agent_config/);
+	});
+
+	it('list_roots says it too, and KEEPS the no-file-reach claim rather than replacing it', () => {
+		const d = descriptionOf('list_roots');
+		// The exception is added TO the invariant, not swapped for it: the invariant is
+		// true and is what stops an agent expecting to read files through a root.
+		expect(d).toMatch(/an external root grants no file access/);
+		expect(d).toMatch(/ADOPTING one writes there is Cellar's agent config/);
+		expect(d).toMatch(/never committed/);
+		expect(d).toMatch(/Settings toggle turns it off/);
+	});
+
+	it('INSTRUCTIONS clause 8 says it — it frames both descriptions and lands first', () => {
+		const all = src();
+		const clause = all.slice(all.indexOf('A notebook may declare a CODE ROOT'), all.indexOf('9. DATABRICKS'));
+		expect(clause).toBeTruthy();
+		expect(clause).toMatch(/CANNOT reach inside an external worktree/);
+		expect(clause).toMatch(/SETTING an external root does write there is Cellar's own\s+agent\s+config/);
+		expect(clause).toMatch(/git-excluded, never committed/);
+		expect(clause).toMatch(/Settings toggle turns it off/);
 	});
 });

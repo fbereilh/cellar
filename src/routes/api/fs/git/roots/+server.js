@@ -5,6 +5,7 @@ import { gitCommitAt, listWorktreesAt } from '$lib/server/git';
 import { workspaceRoot } from '$lib/server/fstree';
 import { getNotebookRoot } from '$lib/server/notebook';
 import {
+	canonicalWorkspace,
 	enclosesWorkspace,
 	isOutsideWorkspace,
 	resolveRootDir,
@@ -164,37 +165,51 @@ export async function GET({ url }) {
 		}
 	});
 
-	// Every other registered worktree of this repo. The workspace's own checkout is
-	// dropped (matched by REALPATH — `git worktree list` realpaths its output while
-	// `ws` is the lexical resolve, and on macOS those differ), because `workspace`
-	// below already reports it and a duplicate row would read as a second checkout.
-	//
-	// A checkout that ENCLOSES the workspace is dropped too, through the ONE shared
-	// rule the resolver refuses on: `git worktree list` walks up, so a workspace that
-	// is a subdirectory of a repo (`cd repo/analysis && cellar`) sees its own PARENT
-	// listed, and offering it a "Use as root" button would offer exactly what a run
-	// there refuses.
+	// Every other registered worktree of this repo. Identity against the workspace is
+	// compared by REALPATH — `git worktree list` realpaths its output while `ws` is
+	// the lexical resolve, and on macOS those differ.
 	const wsReal = realpathOrSelf(ws);
-	const wtrees = listWorktreesAt(ws)
-		.filter((w) => !w.bare && realpathOrSelf(w.path) !== wsReal && !enclosesWorkspace(w.path))
-		// A registered worktree can be GONE (`prunable`); `statSync` decides, since
-		// that is what a run of a notebook rooted here would ask. A missing one is
-		// never probed: there is no status to read, and it would spawn three
-		// processes to learn nothing.
-		// `key` is the REAL-namespace identity, computed once: it is what every
-		// comparison and every commit lookup below goes through, so a lexical Cellar
-		// path and git's realpath'd one can never read as two directories.
-		//
-		// `decl` is the row's LEXICAL identity, minted once by the ONE helper that owns
-		// the two-namespace rule: it is both what the row reports as `path` (so "Use as
-		// root" posts exactly the value the picker would) and what the `external` label
-		// is decided from, since the shared containment rule must be asked about a
-		// lexical path — git's realpath'd one would read a worktree genuinely inside a
-		// symlink-traversing workspace as external.
-		.map((w) => {
-			const decl = worktreeDeclaration(w.path);
-			return { w, exists: isDir(w.path), key: realpathOrSelf(w.path), decl };
-		});
+	// The workspace in the REAL namespace, resolved ONCE for the whole request and
+	// threaded into every per-row question that asks about it. Left to their
+	// defaults, `enclosesWorkspace` and `worktreeDeclaration` each re-walk it, so a
+	// repo with a worktree per PR under review — this feature's own use case — paid
+	// three `realpathSync` walks of the workspace PER ROW, on a panel that refetches
+	// on mount, on `sse:open`, on every `fsRefreshSignal` and on every window focus,
+	// on the process carrying the kernel websockets and the SSE fan-out. The
+	// comparisons are unchanged; only the operand that is constant across the request
+	// stopped being recomputed. (`MAX_WORKTREE_PROBES` bounds the git subprocesses,
+	// never these syscalls.)
+	const canonWs = canonicalWorkspace();
+	// `key` is the REAL-namespace identity, computed ONCE PER ROW and reused by the
+	// workspace-exclusion test below and by every commit lookup further down, so a
+	// lexical Cellar path and git's realpath'd one can never read as two directories
+	// — and so the row is not walked twice to ask the same thing.
+	//
+	// A registered worktree can be GONE (`prunable`); `statSync` decides, since that
+	// is what a run of a notebook rooted here would ask. A missing one is never
+	// probed: there is no status to read, and it would spawn three processes to learn
+	// nothing.
+	//
+	// `decl` is the row's LEXICAL identity, minted by the ONE helper that owns the
+	// two-namespace rule: it is both what the row reports as `path` (so "Use as root"
+	// posts exactly the value the picker would) and what the `external` label is
+	// decided from, since the shared containment rule must be asked about a lexical
+	// path — git's realpath'd one would read a worktree genuinely inside a
+	// symlink-traversing workspace as external.
+	const wtrees = [];
+	for (const w of listWorktreesAt(ws)) {
+		if (w.bare) continue;
+		const key = realpathOrSelf(w.path);
+		// The workspace's own checkout is dropped (matched by REALPATH — see above),
+		// because `workspace` below already reports it and a duplicate row would read
+		// as a second checkout. A checkout that ENCLOSES the workspace is dropped too,
+		// through the ONE shared rule the resolver refuses on: `git worktree list`
+		// walks up, so a workspace that is a subdirectory of a repo (`cd repo/analysis
+		// && cellar`) sees its own PARENT listed, and offering it a "Use as root"
+		// button would offer exactly what a run there refuses.
+		if (key === wsReal || enclosesWorkspace(w.path, canonWs)) continue;
+		wtrees.push({ w, exists: isDir(w.path), key, decl: worktreeDeclaration(w.path, canonWs) });
+	}
 
 	// One probe per DISTINCT directory (three `git` spawns), shared by every
 	// notebook rooted there — plus the workspace itself, which every no-root

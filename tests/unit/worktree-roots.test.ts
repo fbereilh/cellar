@@ -429,7 +429,12 @@ describe('the app-wide path guard is NOT what changed', () => {
 		// strings really are the same directory — but it may never BE the test, so the
 		// canonical one is asserted present rather than the lexical one absent.
 		const src = readFileSync(new URL('../../src/lib/server/notebookRoot.ts', import.meta.url), 'utf8');
-		expect(src).toMatch(/canonDir === canonicalPath\(wsDir\)/);
+		// The workspace side is now hoisted (one walk per pass instead of one per
+		// candidate), so the guard pins BOTH halves: the comparison names the hoisted
+		// value, and that value is the CANONICAL workspace rather than a lexical one.
+		expect(src).toMatch(/canonDir === canonWs\b/);
+		expect(src).toMatch(/const canonWs = canonicalWorkspace\(\)/);
+		expect(src).toMatch(/export function canonicalWorkspace\(\): string \{\n\treturn canonicalPath\(ws\(\)\);/);
 		// And the module has no OTHER workspace comparison that reads `ws()` inline: the
 		// two that decide something both go through `canonicalPath`/`isWorktreeAt`.
 		expect(src).not.toMatch(/[!=]== ws\(\)/);
@@ -463,9 +468,10 @@ describe('the app-wide path guard is NOT what changed', () => {
 			expect(src, rel).not.toMatch(/function enclosesWorkspace/);
 		}
 		// And the surface that OFFERS worktrees really asks it, rather than filtering
-		// the workspace alone as it used to.
+		// the workspace alone as it used to. The workspace operand may be hoisted for
+		// the request (it is constant across rows), so the candidate is what is pinned.
 		const route = readFileSync(new URL('../../src/routes/api/fs/git/roots/+server.js', import.meta.url), 'utf8');
-		expect(route).toMatch(/enclosesWorkspace\(w\.path\)/);
+		expect(route).toMatch(/enclosesWorkspace\(w\.path[,)]/);
 	});
 
 	it('SOURCE GUARD: the root bar is not opened by a merely DETECTED worktree', () => {

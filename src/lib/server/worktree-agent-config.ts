@@ -114,11 +114,25 @@
  * empty, so "byte-identical" holds literally, including for a repo that had no
  * exclude file at all. Cellar does not leave an ignore rule behind for a file it
  * did not write.
+ *
+ * A REVERT MAY ONLY EVER REMOVE BYTES THIS CALL ADDED — never alter a byte the user
+ * wrote — and the SEPARATOR is what makes that a structural rule rather than a
+ * hope. An exclude file that does not end with a newline needs one before an entry
+ * can be appended at all, and that newline is OURS; but it TERMINATES the user's
+ * last line, and once a second harness has appended after it, it is load-bearing
+ * for a block that is staying. Recorded inside a harness's own appended slice, a
+ * PARTIAL revert (claude refused, codex written) spliced it out with claude's block
+ * and joined the user's final entry to codex's marker line — `x` + `# added by
+ * cellar…` — which is not a comment, so their `x` pattern was gone and a nonsense
+ * pattern was ignoring files in every working tree of the clone. So the separator
+ * is a fact about the CALL (`ExcludeCall`), not about one write: each harness's
+ * `appended` is self-contained, and the separator is removed only once the call's
+ * every block is gone and the file is provably back to its original bytes.
  */
 import { existsSync, mkdirSync, readFileSync, appendFileSync, rmSync } from 'node:fs';
 import { writeFileAtomic } from './write-file-atomic.js';
 import { spawnSync } from 'node:child_process';
-import { join, dirname, relative, resolve } from 'node:path';
+import { join, dirname, relative, resolve, sep } from 'node:path';
 import {
 	configureHarness,
 	instanceArgs,
@@ -221,12 +235,51 @@ function gitCommonDir(worktreeDir: string): string | null {
 }
 
 /**
- * Ensure `rel` — a path relative to a working tree's ROOT — is ignored, via the
- * repo's COMMON `info/exclude` (`commonDir`, resolved once by the caller; null when
- * there is no repo to write into). Best-effort and idempotent; `ok:false` says it
- * could not be arranged (not a repo, unwritable), which is the caller's cue to say
- * so rather than to claim a clean checkout, and `appended` records the exact bytes
- * THIS call added so the write can be taken back if the config never lands.
+ * A harness config file as a gitignore PATTERN body — relative to the working
+ * tree's root and always `/`-separated.
+ *
+ * A gitignore pattern is `/`-separated on every platform, while `HARNESSES` builds
+ * codex's path with `join('.codex','config.toml')`. Taken verbatim, a Windows run
+ * wrote `/.codex\config.toml`, which matches nothing — so the file stayed visible as
+ * an untracked change while `warnings()` read the exclude as arranged and said
+ * nothing: a silently false "ok", which is the one outcome this module's whole
+ * transactional treatment of the exclude exists to prevent. The sibling writer in
+ * `harness.js` pays the same attention to CRLF and to Windows paths.
+ */
+function excludePattern(worktreeDir: string, file: string): string {
+	return relative(worktreeDir, file).split(sep).join('/');
+}
+
+/** The repo-common `info/exclude` for `commonDir`, or null when there is no repo. */
+function excludeFileIn(commonDir: string | null): string | null {
+	return commonDir ? join(commonDir, 'info', 'exclude') : null;
+}
+
+/**
+ * The exclude file's bytes BEFORE this call touched it; null when there was none.
+ *
+ * Read ONCE per call rather than per write, because it is the baseline a revert
+ * restores TO — see `ExcludeCall`. Per write it can only be observed by whichever
+ * harness happened to append first, which is exactly how the separator and the
+ * created-file facts were got wrong.
+ */
+function readExcludeOriginal(file: string | null): string | null {
+	if (!file) return null;
+	try {
+		return readFileSync(file, 'utf8');
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Ensure `rel` — a path relative to a working tree's ROOT, always `/`-separated —
+ * is ignored, via the repo's COMMON `info/exclude` (`commonDir`, resolved once by
+ * the caller; null when there is no repo to write into). Best-effort and
+ * idempotent; `ok:false` says it could not be arranged (not a repo, unwritable),
+ * which is the caller's cue to say so rather than to claim a clean checkout, and
+ * `appended` records the exact bytes THIS write added so it can be taken back if
+ * the config never lands.
  *
  * ANCHORED WITH A LEADING SLASH, and that is not cosmetic. A gitignore pattern
  * with no slash in it matches at ANY DEPTH, so a bare `.mcp.json` — and this entry
@@ -240,29 +293,29 @@ function gitCommonDir(worktreeDir: string): string | null {
  */
 function ensureGitExclude(commonDir: string | null, rel: string): ExcludeWrite {
 	const entry = `/${rel}`;
-	if (!commonDir) return { ok: false };
-	const file = join(commonDir, 'info', 'exclude');
+	const file = excludeFileIn(commonDir);
+	if (!file) return { ok: false };
 	try {
-		// Whether the repo HAD an exclude file at all, recorded before we touch it: a
-		// revert has to be able to leave the repo exactly as it found it, and an empty
-		// file where there was none is not that (see `revertGitExclude`).
-		const created = !existsSync(file);
-		const existing = created ? '' : readFileSync(file, 'utf8');
+		const existing = existsSync(file) ? readFileSync(file, 'utf8') : '';
 		// Idempotent on the ENTRY, not on the whole line: a user may have added it
 		// themselves with different spacing, and a second copy is noise in a file
 		// they can read. An entry that was ALREADY there carries no `appended`, which
 		// is what stops the revert below from removing a line this call did not write.
 		if (existing.split('\n').some((line) => line.trim() === entry)) return { ok: true, file };
 		mkdirSync(dirname(file), { recursive: true });
-		const prefix = !existing || existing.endsWith('\n') ? '' : '\n';
-		const appended = `${prefix}${EXCLUDE_MARKER}\n${entry}\n`;
-		appendFileSync(file, appended);
-		return { ok: true, file, appended, created };
+		// The separator is written in the SAME append but recorded OUTSIDE `appended`,
+		// because it belongs to the CALL and not to this write: it terminates the
+		// user's last line, and the next harness's block relies on it. Folded into the
+		// slice, a partial revert spliced it out and joined the user's final entry to
+		// the surviving marker line. See the header and `ExcludeCall`.
+		const separator = existing !== '' && !existing.endsWith('\n');
+		const appended = `${EXCLUDE_MARKER}\n${entry}\n`;
+		appendFileSync(file, separator ? `\n${appended}` : appended);
+		return { ok: true, file, appended, separator };
 	} catch {
 		return { ok: false };
 	}
 }
-
 
 /** What `ensureGitExclude` did, and exactly what a revert would have to undo. */
 interface ExcludeWrite {
@@ -270,17 +323,30 @@ interface ExcludeWrite {
 	ok: boolean;
 	/** The exclude file, when one was reached. */
 	file?: string;
-	/** The exact bytes THIS call appended; absent when the entry was already there. */
-	appended?: string;
 	/**
-	 * Whether THIS append is the one that brought the file into existence.
-	 *
-	 * Per-write, which is NOT the question a revert asks: with two harnesses
-	 * allow-listed the loop runs before any config is written, so the first append
-	 * creates the file and the second sees one already there. `configureAdoptedWorktree`
-	 * folds these into a single verdict for the CALL and hands it to `revertGitExclude`.
+	 * The exact bytes of THIS write's own block; absent when the entry was already
+	 * there. SELF-CONTAINED: it never includes the separator newline, which is a
+	 * fact about the call (see `ExcludeCall`).
 	 */
-	created?: boolean;
+	appended?: string;
+	/** Whether THIS write added the separator newline terminating the user's last line. */
+	separator?: boolean;
+}
+
+/**
+ * The two facts a revert needs that are true of the CALL rather than of one write,
+ * plus the baseline it restores to.
+ *
+ * Both were got wrong by being read per harness, and in the same way: the exclude
+ * loop runs for every allow-listed harness BEFORE any config is written, so only
+ * the FIRST append can observe an absent file or a missing trailing newline, while
+ * the LAST revert is the one that has to put either back.
+ */
+interface ExcludeCall {
+	/** The file's bytes before this call touched it; null when there was none. */
+	original: string | null;
+	/** Whether any write in this call added the separator newline. */
+	separator: boolean;
 }
 
 /**
@@ -302,36 +368,52 @@ interface ExcludeWrite {
  * line the user — or an earlier adoption, or the sibling harness in this same call
  * — put there is untouched, and an exclude that already held the entry is never
  * reverted at all (no `appended`). Removing the exact appended slice is also what
- * makes the file byte-identical to what it was before the call — INCLUDING the case
- * where there was no file: `createdFile` says the CALL brought it into existence, and
- * the revert then removes it rather than leaving a zero-byte `info/exclude` in a repo
- * that had none. Git treats an absent and an empty exclude the same, so that is a
- * claim about honesty rather than behavior; it is asserted, so it has to hold.
+ * makes the file byte-identical to what it was before the call — INCLUDING the two
+ * edges where the call had to touch something that was not its own block:
  *
- * `createdFile` IS A FACT ABOUT THE CALL, never about one harness's append — that
- * distinction is the whole of it. The exclude loop runs for every allow-listed
- * harness BEFORE any config is written, so with claude and codex both allowed and no
- * `info/exclude` in the repo, claude's append creates the file and codex's appends to
- * the now-existing one. Read per harness, reverting BOTH (the ordinary shape in a
- * checkout that already holds the user's own config files, which the writer refuses)
- * spliced claude's bytes out first — leaving codex's, so the file was rewritten — and
- * then codex's with nothing left but `created:false`, writing back an empty file where
- * the repo had none.
+ *   • THE FILE DID NOT EXIST. `call.original === null` says the CALL brought it into
+ *     existence, so the revert removes it rather than leaving a zero-byte
+ *     `info/exclude` in a repo that had none. Git treats absent and empty the same,
+ *     so that is a claim about honesty rather than behavior; it is asserted, so it
+ *     has to hold.
+ *   • THE FILE DID NOT END WITH A NEWLINE. `call.separator` says the call added one
+ *     to terminate the user's last line. It is OURS, so it goes — but ONLY once the
+ *     remainder is exactly the original bytes plus that newline, i.e. every block
+ *     this call wrote is gone. While a sibling harness's block is still there the
+ *     newline is what keeps it a line of its own, and removing it would splice the
+ *     user's final entry onto our marker (`x# added by cellar…`) — destroying their
+ *     pattern and leaving a nonsense one active across the whole clone.
+ *
+ * BOTH ARE FACTS ABOUT THE CALL, never about one harness's append, and that is the
+ * whole of it: the exclude loop runs for every allow-listed harness BEFORE any config
+ * is written, so only the FIRST append can see an absent file or a missing trailing
+ * newline, while the LAST revert is the one that must put either back. Read per
+ * harness, reverting BOTH spliced the first block out (leaving the second, so the
+ * file was rewritten) and then the second with nothing recorded — writing back an
+ * empty file where the repo had none, and eating the user's terminating newline.
+ *
+ * The comparison against `call.original` is also what makes the restore SAFE rather
+ * than merely tidy: the separator is dropped only when the file is provably back to
+ * the bytes it started with, so a line something else appended meanwhile keeps it.
  *
  * Best-effort, like the write: a revert that cannot be done leaves the warning the
  * skip already earns.
  */
-function revertGitExclude(e: ExcludeWrite, createdFile: boolean): void {
+function revertGitExclude(e: ExcludeWrite, call: ExcludeCall): void {
 	if (!e.file || !e.appended) return;
 	try {
 		const content = readFileSync(e.file, 'utf8');
 		const at = content.lastIndexOf(e.appended);
 		if (at < 0) return;
-		const rest = content.slice(0, at) + content.slice(at + e.appended.length);
+		let rest = content.slice(0, at) + content.slice(at + e.appended.length);
+		// The separator, once nothing of this call's is left to need it. Compared
+		// against the ORIGINAL bytes, so it can only ever be removed when the file is
+		// otherwise exactly as this call found it.
+		if (call.separator && call.original !== null && rest === `${call.original}\n`) rest = call.original;
 		// Only when this call BOTH created the file and left nothing else in it: a file
 		// that already existed (empty or not) is the user's, and a file this call created
 		// but which has since gained other lines is no longer only ours to remove.
-		if (createdFile && rest === '') rmSync(e.file, { force: true });
+		if (call.original === null && rest === '') rmSync(e.file, { force: true });
 		else writeFileAtomic(e.file, rest);
 	} catch {
 		/* best-effort: the skip's own warning is what the user acts on */
@@ -373,14 +455,18 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 	const excludedByName = new Map<string, ExcludeWrite>();
 	// One question, one answer, one spawn — see `gitCommonDir`.
 	const commonDir = gitCommonDir(worktreeDir);
+	// The baseline a revert restores to, read ONCE before anything is appended — see
+	// `ExcludeCall`. Only the first append can observe an absent file or a missing
+	// trailing newline, and it is the last revert that has to put either back.
+	const originalExclude = readExcludeOriginal(excludeFileIn(commonDir));
 	for (const name of names) {
 		const file = harnessConfigPath(name, worktreeDir);
-		excludedByName.set(name, file ? ensureGitExclude(commonDir, file.slice(worktreeDir.length + 1)) : { ok: true });
+		excludedByName.set(name, file ? ensureGitExclude(commonDir, excludePattern(worktreeDir, file)) : { ok: true });
 	}
-	// Whether the repo HAD an exclude file before this call, decided ONCE for the call:
-	// the loop above appends for every harness, so only the first of them can observe
-	// the absence. See `revertGitExclude`.
-	const createdExclude = [...excludedByName.values()].some((e) => e.created);
+	const excludeCall: ExcludeCall = {
+		original: originalExclude,
+		separator: [...excludedByName.values()].some((e) => e.separator)
+	};
 
 	const results: HarnessOutcome[] = [];
 	for (const name of names) {
@@ -420,7 +506,7 @@ export function configureAdoptedWorktree(worktreeDir: string): WorktreeAgentConf
 		// own `.mcp.json`, which the writer refused to edit precisely because it is
 		// theirs. See `revertGitExclude`. `already` keeps its entry: Cellar's config IS
 		// there, so ignoring it is still correct.
-		if (results[results.length - 1].status === 'skipped') revertGitExclude(wroteExclude, createdExclude);
+		if (results[results.length - 1].status === 'skipped') revertGitExclude(wroteExclude, excludeCall);
 	}
 
 	const first = results[0];
