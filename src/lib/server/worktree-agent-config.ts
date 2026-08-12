@@ -124,7 +124,8 @@ import {
 	instanceArgs,
 	mcpJsonHarnessNames,
 	harnessConfigPath,
-	readAllowList
+	readAllowList,
+	mcpConfigDisabled
 } from './harness.js';
 import { workspaceRoot } from './fstree';
 import { getUiState } from './ui-state';
@@ -181,7 +182,12 @@ export interface WorktreeAgentConfig {
  * re-read and re-parsed `.cellar/harness.json` to reach the same verdict.
  */
 function targetHarnesses(): { allowed: string[]; names: string[] } {
-	const excluded = process.env.CELLAR_NO_MCP_CONFIG ? new Set(mcpJsonHarnessNames()) : new Set<string>();
+	// `mcpConfigDisabled()`, never a raw truthiness test: the launcher always SETS
+	// this variable, to the string '0' when the flag is absent, and '0' is truthy —
+	// so a bare `process.env.CELLAR_NO_MCP_CONFIG ?` excluded the `.mcp.json`
+	// harnesses on every launch and made this whole module inert while blaming a
+	// flag nobody passed. One reader of that encoding, in harness.js.
+	const excluded = mcpConfigDisabled() ? new Set(mcpJsonHarnessNames()) : new Set<string>();
 	const allowed = readAllowList(workspaceRoot());
 	return { allowed, names: allowed.filter((name) => !excluded.has(name)) };
 }

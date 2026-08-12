@@ -1,6 +1,6 @@
 import { getDefaultNotebook } from '$lib/server/notebook';
 import { workspaceRoot } from '$lib/server/fstree';
-import { harnessState, isHarnessAllowed, mcpJsonHarnessNames } from '$lib/server/harness.js';
+import { harnessState, isHarnessAllowed, mcpJsonHarnessNames, mcpConfigDisabled } from '$lib/server/harness.js';
 import { getUiState } from '$lib/server/ui-state';
 import { getUserSettings } from '$lib/server/user-settings';
 import { parseMaxKernels } from '$lib/kernelCap';
@@ -45,14 +45,6 @@ function detectMcpConfig() {
 	} catch {
 		return { configured: false, managed: false, paused: false };
 	}
-}
-
-/** Was this instance launched with `--no-mcp-config`? (set by `bin/cellar.js`) */
-function mcpConfigDisabled() {
-	const v = String(process.env.CELLAR_NO_MCP_CONFIG ?? '')
-		.trim()
-		.toLowerCase();
-	return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
 /** Load the canonical notebook (cells + outputs) for the workspace. */

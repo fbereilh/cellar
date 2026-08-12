@@ -181,6 +181,28 @@ export function harnessNames() {
 }
 
 /**
+ * Was this instance launched with `--no-mcp-config`?
+ *
+ * The ONE reader of that flag's encoding, and it has to be, because the encoding
+ * is a trap: `bin/cellar.js` ALWAYS sets `CELLAR_NO_MCP_CONFIG` — to the string
+ * `'0'` when the flag is ABSENT — and `'0'` is truthy in JS. So a raw
+ * `process.env.CELLAR_NO_MCP_CONFIG ? …` reads EVERY launch as "the flag was
+ * passed". That is not hypothetical: it silently made the adopted-worktree agent
+ * config inert on every real launch, while reporting `--no-mcp-config` as the
+ * reason when the flag had not been passed at all.
+ *
+ * Lives here, beside `mcpJsonHarnessNames()` (the other half of the same rule),
+ * so every consumer of the flag shares one interpretation rather than each
+ * re-deriving it from an environment variable whose value lies.
+ */
+export function mcpConfigDisabled() {
+	const v = String(process.env.CELLAR_NO_MCP_CONFIG ?? '')
+		.trim()
+		.toLowerCase();
+	return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+/**
  * The harnesses `--no-mcp-config` excludes, as names — every harness whose config
  * IS that file. The ONE derivation of that rule: the launcher excludes them from
  * its reconcile and prompt, and the page load must decide the sidebar's

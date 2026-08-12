@@ -706,7 +706,10 @@ describe('a workspace INSIDE a checkout — the ENCLOSING repo is never a root',
 		expect(offered.map((o) => o.path)).toContain('../../pr-9');
 
 		const { GET } = await import('../../src/routes/api/fs/git/roots/+server.js');
-		const res = await GET({ url: new URL('http://x/api/fs/git/roots') });
+		// Called the way SvelteKit does, with the same cast the sibling route test uses
+		// (`git-notebook-roots-route.test.ts`): the handler reads only `url`, and
+		// building a whole RequestEvent to satisfy the type would assert nothing.
+		const res = await GET({ url: new URL('http://x/api/fs/git/roots') } as Parameters<typeof GET>[0]);
 		const body = await res.json();
 		expect(body.worktrees.map((w: { absolute: string }) => realpathSync(w.absolute))).not.toContain(real);
 		expect(body.worktrees.map((w: { path: string }) => w.path)).toContain('../../pr-9');
