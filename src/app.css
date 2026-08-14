@@ -267,6 +267,31 @@ mark.cellar-search-mark-active {
 }
 
 /*
+ * Notebook content column (`.cellar-notebook-column`).
+ *
+ * The ONE width rule for the notebook's content column, shared by
+ * `Notebook.svelte` and `LiveNotebook.svelte`'s two pre-render states so a
+ * loading/error view cannot be laid out differently from the notebook it turns
+ * into. It is FLUID with no upper bound: the column keeps growing with the
+ * window on a large display, which is the whole point of this rule.
+ *
+ * `max(48rem, 92%)` reads oddly for a MAX-width and both halves are
+ * load-bearing:
+ *   - `92%` is the proportional side gutter, so cells never run edge-to-edge
+ *     against the window frame. It is what applies at every ordinary width.
+ *   - `48rem` is a FLOOR on the max-width, not a minimum width. Below ~52rem of
+ *     available space it exceeds the container, so the `w-full` element is
+ *     simply not constrained at all and uses the full width - the gutters are
+ *     dropped where there is no room to spend them. Removing it would take 8%
+ *     off an already-narrow window.
+ * (This replaced `clamp(48rem, 92%, 88rem)`, whose 88rem upper bound froze the
+ * column at a fixed width on wide displays; the two other terms are unchanged.)
+ */
+.cellar-notebook-column {
+	max-width: max(48rem, 92%);
+}
+
+/*
  * Rendered markdown (`.cellar-md`).
  *
  * Shared by notebook markdown cells (`Cell.svelte`) and the `.md` file preview

@@ -3524,13 +3524,13 @@
 </script>
 
 {#if loadError}
-	<div class="mx-auto w-full max-w-[clamp(48rem,92%,88rem)] px-4 py-6">
+	<div class="mx-auto w-full cellar-notebook-column px-4 py-6">
 		<div class="p-4 text-sm text-error" data-testid="notebook-load-error">
 			Could not open <code class="font-mono">{path}</code>: {loadError}
 		</div>
 	</div>
 {:else if fetching}
-	<div class="mx-auto w-full max-w-[clamp(48rem,92%,88rem)] px-4 py-6">
+	<div class="mx-auto w-full cellar-notebook-column px-4 py-6">
 		<p class="px-2 text-sm text-base-content/40">loading…</p>
 	</div>
 {:else}

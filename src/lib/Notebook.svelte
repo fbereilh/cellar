@@ -754,10 +754,11 @@
 <!-- The notebook page: a faintly-grey plane in light themes, so a cell's white
      output and grey editor each read as their own surface. -->
 <div bind:this={containerEl} class="min-h-full bg-(--cellar-surface-page)">
-	<!-- Fluid content column: fills the available width up to a readable cap, so
-	     cells use more horizontal space on wide monitors without going full-bleed
-	     on ultrawide. -->
-	<div class="mx-auto w-full max-w-[clamp(48rem,92%,88rem)] px-4 py-6" data-testid="notebook">
+	<!-- Fluid content column: keeps growing with the window (no upper cap), minus
+	     a proportional side gutter so cells never run edge-to-edge. The rule lives
+	     once in `app.css` as `.cellar-notebook-column` — see its comment for why
+	     the floor term is load-bearing. -->
+	<div class="mx-auto w-full cellar-notebook-column px-4 py-6" data-testid="notebook">
 		<!-- Notebook toolbar: the discoverable, top-of-notebook entry points for
 		     acting on the whole notebook. Each button triggers the SAME handler its
 		     command-palette twin does (`run-all` / `kernel-interrupt` /
