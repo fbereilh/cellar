@@ -52,7 +52,10 @@ function notebook(): string {
 	return JSON.stringify(
 		{
 			cells: [
-				cell(SLOW, 'import time\ntime.sleep(6)\nprint("slow done")'),
+				// Long enough that the clock provably crosses 9s -> 10s while it runs: phase
+				// B's layout probe has to STRADDLE a digit-count change, or it measures the
+				// same width twice and would pass against the very regression it exists for.
+				cell(SLOW, 'import time\ntime.sleep(20)\nprint("slow done")'),
 				cell(FAST, 'print("fast done")'),
 				cell(AGENT, 'import time\ntime.sleep(5)\nprint("agent done")')
 			],
@@ -140,10 +143,14 @@ test('live elapsed: ticks up beside the spinner, holds the layout, hands over to
 	expect(first!).toBeLessThan(3);
 
 	// ---- B. it does not shove the toolbar as its digits grow ---------------
-	// The slot is justify-end, so an unreserved width would nudge everything to
-	// the clock's left once a second. Measure the neighbouring control.
-	const stop = cellFor(page, SLOW).getByTestId('cell-interrupt');
-	const boxBefore = await stop.boundingBox();
+	// The far-right slot is `justify-end`, so the group grows LEFTWARD and every
+	// control to the clock's LEFT is displaced when its digit count changes.
+	// `cell-interrupt` is the LAST child of that slot, pinned to the row's padding
+	// edge — it cannot move whatever the clock does, so measuring it would pass
+	// against the very regression this exists to catch. `delete` sits to the LEFT
+	// of the indicator and really is pushed (measured: 7px at 9s → 10s without the
+	// reserved `min-w-[2.75rem]`, ~34px over an hour).
+	const probe = cellFor(page, SLOW).getByTestId('delete');
 
 	// It must not merely INCREMENT — it must track real time. Two readings a
 	// measured wall-clock interval apart have to differ by that interval (±1s for
@@ -164,13 +171,28 @@ test('live elapsed: ticks up beside the spinner, holds the layout, hands over to
 	expect(later).toBeGreaterThan(first!);
 	expect(Math.abs(later - e0 - realDelta), `clock drifted: ${e0}s → ${later}s over ${realDelta}s`).toBeLessThanOrEqual(1.5);
 
-	const boxAfter = await stop.boundingBox();
+	// Straddle the 9s → 10s digit-count change EXPLICITLY: two readings of the same
+	// width prove nothing, so anchor the first measurement while the clock is still
+	// single-digit and the second once it has grown a digit.
+	const oneDigit = (await elapsedSeconds(page, SLOW))!;
+	expect(oneDigit, `the layout probe must anchor while the clock is single-digit, got ${oneDigit}s`).toBeLessThan(10);
+	const boxBefore = await probe.boundingBox();
+
+	await expect
+		.poll(async () => (await elapsedSeconds(page, SLOW)) ?? -1, {
+			timeout: 30_000,
+			message: 'the clock must reach two digits so the layout probe straddles a width change'
+		})
+		.toBeGreaterThanOrEqual(10);
+	const twoDigits = (await elapsedSeconds(page, SLOW))!;
+
+	const boxAfter = await probe.boundingBox();
 	expect(boxBefore).not.toBeNull();
 	expect(boxAfter).not.toBeNull();
 	// Sub-pixel layout jitter is tolerable; a digit's width (~6px) is not.
 	expect(
 		Math.abs(boxAfter!.x - boxBefore!.x),
-		'the controls beside the clock must not move as its digits grow'
+		`the controls left of the clock must not move as its digits grow (${oneDigit}s → ${twoDigits}s)`
 	).toBeLessThan(1.5);
 
 	await page.screenshot({ path: join(EVIDENCE, 'running-elapsed.png'), fullPage: false });
@@ -192,7 +214,7 @@ test('live elapsed: ticks up beside the spinner, holds the layout, hands over to
 	// hand over to a smaller number.) Note the first run's duration legitimately
 	// includes the lazy kernel boot, which is exactly why this is a floor and not a
 	// window around the cell's sleep.
-	expect(settled, `settled ${settled}s must not be below the live ${later}s`).toBeGreaterThanOrEqual(later);
+	expect(settled, `settled ${settled}s must not be below the live ${twoDigits}s`).toBeGreaterThanOrEqual(twoDigits);
 
 	// ---- D. an agent's run gets the same clock ----------------------------
 	// This tab never started it and never sees an NDJSON stream for it: the start

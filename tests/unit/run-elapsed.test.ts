@@ -262,19 +262,152 @@ describe('the run start on the queue snapshot', () => {
 });
 
 describe('the run reports its own start (run.ts)', () => {
-	const RUN = readFileSync(fileURLToPath(new URL('../../src/lib/server/run.ts', import.meta.url)), 'utf8');
+	// Drives the REAL `executeCellRun` with only the Jupyter-facing `execute` and the
+	// document writes faked, so the three channels a client can learn a run's start
+	// from are OBSERVED rather than grepped for: the SSE `run:start`, this run's own
+	// NDJSON `run:start` frame, and the queue snapshot (`noteRunStarted`). All three
+	// must carry ONE instant, and the closing `run:end` must measure `durationMs`
+	// from that same instant — which is what makes the live clock hand over to the
+	// settled badge without ever going backwards.
+	const NB = '/ws/run-origin.ipynb';
+	const CELL = 'c1';
+	const T0 = 1_700_000_000_000;
 
-	it('publishes ONE `startedAt` to all three channels', () => {
-		// `run:end`'s durationMs is `Date.now() - startedAt`, so the live clock and
-		// the badge that replaces it share an origin and cannot disagree. A second
-		// clock (the queue stamping at dequeue) is exactly what this pins out.
-		expect(RUN).toContain('noteRunStarted(nb, cellId, startedAt)');
-		expect(RUN).toContain('publish({ type: \'run:start\', nb, cellId, actor, at: startedAt, originId })');
-		expect(RUN).toContain('onEvent?.({ type: \'run:start\', cellId, at: startedAt })');
-		expect(RUN).toContain('durationMs: Date.now() - startedAt');
-		// The queue must not mint its own.
-		const QUEUE = readFileSync(fileURLToPath(new URL('../../src/lib/server/run-queue.ts', import.meta.url)), 'utf8');
-		expect(QUEUE).not.toMatch(/startedAt\s*[:=]\s*Date\.now\(\)/);
+	type RunMod = typeof import('../../src/lib/server/run');
+	type QueueMod = typeof import('../../src/lib/server/run-queue');
+	type EventsMod = typeof import('../../src/lib/server/events');
+	type ExecuteImpl = (nb: string, code: string, onEvent: (ev: Record<string, unknown>) => void) => Promise<unknown>;
+
+	let clock = T0;
+
+	beforeEach(() => {
+		clock = T0;
+		// A controllable wall clock: deterministic and indifferent to HOW MANY times
+		// the run reads it, so `durationMs` can be asserted exactly rather than within
+		// a window. Fake timers are deliberately avoided — the run arms a real flush
+		// interval it clears itself.
+		vi.spyOn(Date, 'now').mockImplementation(() => clock);
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.doUnmock('../../src/lib/server/kernel');
+		vi.doUnmock('../../src/lib/server/notebook');
+		vi.resetModules();
+	});
+
+	async function load(execute: ExecuteImpl): Promise<{ run: RunMod; queue: QueueMod; events: EventsMod }> {
+		vi.resetModules();
+		vi.doMock('../../src/lib/server/kernel', () => ({ execute }));
+		vi.doMock('../../src/lib/server/notebook', () => ({
+			setOutputs: () => {},
+			setOutputsLive: () => {},
+			setLastRun: () => {},
+			clearOutputsLive: () => {},
+			getCell: () => ({ cell_type: 'code', metadata: {} })
+		}));
+		const [run, queue, events] = await Promise.all([
+			import('../../src/lib/server/run'),
+			import('../../src/lib/server/run-queue'),
+			import('../../src/lib/server/events')
+		]);
+		return { run, queue, events };
+	}
+
+	it('hands ONE server-stamped instant to all three channels, and measures durationMs from it', async () => {
+		let queue!: QueueMod;
+		let snapshotDuringRun: { cellId: string; startedAt?: number } | null = null;
+
+		const mods = await load(async (nb, _code, onEvent) => {
+			onEvent({ type: 'kernel', session: 9 });
+			// Read the live queue while the run holds the kernel: this is exactly what a
+			// tab connecting (or a notebook mounting) mid-run is seeded with.
+			snapshotDuringRun = queue.queueStateFor(nb).running;
+			clock = T0 + 5_000; // the run takes 5s of wall clock
+			return { status: 'ok' };
+		});
+		queue = mods.queue;
+
+		const published: Record<string, unknown>[] = [];
+		const off = mods.events.subscribe((ev) => published.push(ev as unknown as Record<string, unknown>));
+		const ndjson: Record<string, unknown>[] = [];
+
+		const ticket = mods.queue.enqueueRun({ nb: NB, cellId: CELL, actor: 'user', source: 'x = 1' });
+		if (ticket.duplicate) throw new Error('unreachable: fresh ticket expected');
+		await ticket.wait();
+		try {
+			await mods.run.executeCellRun({
+				nb: NB,
+				cellId: CELL,
+				actor: 'user',
+				source: 'x = 1',
+				onEvent: (ev) => ndjson.push(ev as unknown as Record<string, unknown>)
+			});
+		} finally {
+			ticket.done();
+			off();
+		}
+
+		// Channel 1 — the SSE event every other tab learns the run from.
+		const sseStart = published.find((e) => e.type === 'run:start');
+		expect(sseStart, 'the run must publish run:start').toBeTruthy();
+		expect(sseStart!.at).toBe(T0);
+
+		// Channel 2 — this run's own NDJSON frame (its initiating tab suppresses the
+		// SSE echo by originId, so this is the only way it learns its run started).
+		const ndjsonStart = ndjson.find((e) => e.type === 'run:start');
+		expect(ndjsonStart, 'the run must emit run:start on its own stream').toBeTruthy();
+		expect(ndjsonStart!.at).toBe(T0);
+
+		// Channel 3 — the queue snapshot, read live AND as broadcast.
+		expect(snapshotDuringRun).toMatchObject({ cellId: CELL, startedAt: T0 });
+		const broadcastStarts = published
+			.filter((e) => e.type === 'queue:changed')
+			.flatMap((e) => (e.running as { cellId: string; startedAt?: number }[]) ?? [])
+			.filter((r) => r.cellId === CELL && r.startedAt != null);
+		expect(broadcastStarts.length, 'the start must be broadcast so a late joiner is seeded').toBeGreaterThan(0);
+		for (const r of broadcastStarts) expect(r.startedAt).toBe(T0);
+
+		// And the settled duration is measured from that SAME instant, so the last
+		// live tick and the badge that replaces it can never disagree.
+		const ndjsonEnd = ndjson.find((e) => e.type === 'run:end');
+		const sseEnd = published.find((e) => e.type === 'run:end');
+		expect(ndjsonEnd).toMatchObject({ at: T0, durationMs: 5_000 });
+		expect(sseEnd).toMatchObject({ at: T0, durationMs: 5_000 });
+	});
+
+	it('never lets a client see a start LATER than the duration it hands over to', async () => {
+		// The failure this rules out: an origin minted anywhere other than the run
+		// itself (the queue at dequeue, or a client noticing `running` flip) sits after
+		// the run's own start, so the live clock would read higher than the settled
+		// badge and the handover would go BACKWARDS.
+		const mods = await load(async () => {
+			clock = T0 + 1_234;
+			return { status: 'ok' };
+		});
+
+		const ndjson: Record<string, unknown>[] = [];
+		const ticket = mods.queue.enqueueRun({ nb: NB, cellId: CELL, actor: 'agent', source: 'y = 2' });
+		if (ticket.duplicate) throw new Error('unreachable: fresh ticket expected');
+		await ticket.wait();
+		try {
+			await mods.run.executeCellRun({
+				nb: NB,
+				cellId: CELL,
+				actor: 'agent',
+				source: 'y = 2',
+				onEvent: (ev) => ndjson.push(ev as unknown as Record<string, unknown>)
+			});
+		} finally {
+			ticket.done();
+		}
+
+		const start = ndjson.find((e) => e.type === 'run:start') as { at: number };
+		const end = ndjson.find((e) => e.type === 'run:end') as { at: number; durationMs: number };
+		// The elapsed a client would render at the last tick before run:end.
+		const liveAtHandover = clock - start.at;
+		expect(end.durationMs).toBeGreaterThanOrEqual(liveAtHandover);
+		expect(end.at).toBe(start.at);
 	});
 });
 
