@@ -24,6 +24,7 @@ import { isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
 import { OutputAccumulator, OUTPUT_FLUSH_MS, type StreamDelta } from './output-accumulator';
 import { registerRunOutputs, unregisterRunOutputs } from './run-output-registry';
+import { noteRunStarted } from './run-queue';
 import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types';
 
 /** Arguments to `executeCellRun`. */
@@ -71,6 +72,13 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// keeps the live in-memory model in step so a tab loading mid-run reads an empty
 	// cell rather than the prior run's outputs.
 	clearOutputsLive(cellId, nb);
+	// Publish the start on all three channels a client can learn it from, all
+	// carrying THIS `startedAt` — the same origin `durationMs` below is measured
+	// from, so a live elapsed clock and the settled badge that replaces it can never
+	// disagree. The queue snapshot is the one a client that missed the events reads
+	// (a tab connecting, or a notebook mounting, mid-run); the other two are for
+	// clients already listening (SSE) and for this run's own caller (NDJSON).
+	noteRunStarted(nb, cellId, startedAt);
 	publish({ type: 'run:start', nb, cellId, actor, at: startedAt, originId });
 	onEvent?.({ type: 'run:start', cellId, at: startedAt });
 

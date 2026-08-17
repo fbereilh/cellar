@@ -24,8 +24,8 @@
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
 	import { isSqlCell, isRawCell, logicalCellType } from '$lib/cellLanguage';
-	import { relativeTime, formatDuration } from '$lib/relativeTime';
-	import { nowMs, subscribeNow } from '$lib/now.svelte';
+	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
+	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
 	import { matchesCellId } from '$lib/search';
@@ -44,6 +44,14 @@
 		index: number;
 		count: number;
 		running: boolean;
+		/**
+		 * Server wall-clock ms at which THIS cell's in-flight run began executing, for
+		 * the live elapsed clock beside the running indicator. Null when the cell is
+		 * not the running one, or when the start is genuinely unknown (a tab seeded
+		 * from a queue snapshot taken before the run reported in) — the indicator then
+		 * renders without a clock rather than inventing an origin.
+		 */
+		runStartedAt?: number | null;
 		/** 1-based place in the kernel's run queue, or null. */
 		queuedPosition?: number | null;
 		active?: boolean;
@@ -131,6 +139,7 @@
 		index,
 		count,
 		running,
+		runStartedAt = null,
 		queuedPosition = null,
 		active = false,
 		selected = false,
@@ -414,6 +423,24 @@
 		}
 		return () => clearTimeout(runIndicatorTimer);
 	});
+
+	// Live elapsed for the cell executing RIGHT NOW ("running 12s"), the in-flight
+	// counterpart of the settled `ran … · 1.2s` badge below. It rides the FAST
+	// shared ticker (ONE 1s interval for the whole app; see $lib/now.svelte.ts) and
+	// subscribes only while this cell is visibly running — so the interval starts
+	// when a run starts and stops with the last one, and a notebook at rest ticks
+	// nothing. Never a per-cell setInterval: at most one cell per notebook runs, but
+	// every cell mounts this component.
+	//
+	// Gated on `showRunning`, not `running`, so a cell fast enough never to reveal
+	// the indicator never arms the timer either. `runStartedAt` is the SERVER's run
+	// start, so this is right for a run that was already going when this tab
+	// arrived, and no `at` (unknown start) simply shows no clock.
+	$effect(() => {
+		if (!showRunning || runStartedAt == null) return;
+		return subscribeRunNow();
+	});
+	const elapsedText = $derived(showRunning && runStartedAt != null ? formatElapsed(runNowMs() - runStartedAt) : '');
 
 	// Queued = submitted, waiting for this notebook's kernel to free. Deliberately a
 	// *quieter* sibling of the running affordance (same `warning` hue, no pulse,
@@ -1968,6 +1995,20 @@
 					{#if showRunning}
 						<span class="flex items-center gap-1 text-[11px] text-warning" data-testid="running-indicator">
 							<span class="loading loading-spinner loading-xs"></span> running
+							<!-- Live elapsed, ticking once a second. The slot is `justify-end`, so this
+							     group grows LEFTWARD and every control before it (delete, the ⋮ menu)
+							     moves as the digits do: measured in a browser, an UNRESERVED clock shifts
+							     them 7px at 9s → 10s — inside the first ten seconds of every run — and
+							     34px over an hour. A reserved, `tabular-nums` box holds them dead still
+							     from `0s` through `9m 59s` (the row's own slack absorbs the little past
+							     that). Reserving it HERE rather than on the whole group is what keeps the
+							     spinner and the word still too: only the digits move, inside their own
+							     box. Left-aligned so the number reads with its label and the slack falls
+							     before the stop button — a control boundary — rather than splitting the
+							     phrase. -->
+							{#if elapsedText}
+								<span class="min-w-[2.75rem] text-left tabular-nums" data-testid="running-elapsed">{elapsedText}</span>
+							{/if}
 						</span>
 						<!-- Stop control: interrupts this notebook's kernel (KeyboardInterrupt),
 						     which halts its currently-executing cell. Same handler as the

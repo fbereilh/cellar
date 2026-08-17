@@ -24,6 +24,13 @@
 	interface Props {
 		cells: UICell[];
 		runningId: string | null;
+		/**
+		 * Server wall-clock ms at which `runningId`'s run began executing, or null when
+		 * that is unknown (no run, or a run whose start this tab never learned). Only
+		 * the running cell is handed it, so a cell can never show an elapsed clock
+		 * without also showing the running affordance it belongs to.
+		 */
+		runningSince?: number | null;
 		/** cell id → 1-based position in this notebook's kernel run queue */
 		queued?: Record<string, number>;
 		/**
@@ -160,6 +167,7 @@
 	let {
 		cells,
 		runningId,
+		runningSince = null,
 		queued = {},
 		bulkRunning = false,
 		activeId = null,
@@ -702,6 +710,7 @@
 			index={i}
 			count={cells.length}
 			running={runningId === cell.id}
+			runStartedAt={runningId === cell.id ? runningSince : null}
 			queuedPosition={queued[cell.id] ?? null}
 			active={activeId === cell.id}
 			selected={selectedIds.has(cell.id)}
