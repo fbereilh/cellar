@@ -64,15 +64,17 @@
  * left that can answer and a `DATABRICKS_CONFIG_PROFILE` exported in the user's
  * shell does not survive to be a mitigation.
  *
- * **That is why the notice is gated on the notebook being CONNECTED** (`Databricks.svelte`
- * renders the card only from the panel's own `connected` signal). Before a connect
- * the scrub has not run, so a shell `DATABRICKS_HOST`+`DATABRICKS_TOKEN` is still
- * present and short-circuits `_known_file_config_loader` outright - a bare `Config()`
- * resolves without reading this file at all, and the notice would be a false nag,
- * the one thing it must not be. Gating is the right half of that fix and consulting
- * the SERVER's own env is the wrong one: after connect the scrub has removed those
- * vars from the KERNEL, so an env-aware server would fall silent exactly when the
- * warning becomes true.
+ * **That is why the notice is gated on a kernel that has really run `CONNECT_CODE`**
+ * (`Databricks.svelte`'s `needsDefaultProfile`: the panel's own `connected` signal,
+ * or an `expired` session - which its server only ever reports for a session that
+ * WAS live, i.e. the same process, and never for a lost/restarting one that may be
+ * a fresh kernel). Before a connect the scrub has not run, so a shell
+ * `DATABRICKS_HOST`+`DATABRICKS_TOKEN` is still present and short-circuits
+ * `_known_file_config_loader` outright - a bare `Config()` resolves without reading
+ * this file at all, and the notice would be a false nag, the one thing it must not
+ * be. Gating is the right half of that fix and consulting the SERVER's own env is
+ * the wrong one: after connect the scrub has removed those vars from the KERNEL, so
+ * an env-aware server would fall silent exactly when the warning becomes true.
  */
 
 /** The reserved bookkeeping section the Databricks CLI writes `default_profile` into. */

@@ -613,16 +613,28 @@
 	 * between, are silent by construction rather than by a second rule kept in step
 	 * here.
 	 *
-	 * `connected` is the other half and is load-bearing, not caution: the verdict
-	 * reads the config FILE alone, which is the whole truth only once `CONNECT_CODE`
-	 * has scrubbed every `DATABRICKS_*` var out of the kernel. Before a connect a
-	 * shell `DATABRICKS_HOST`+`DATABRICKS_TOKEN` short-circuits the SDK's file loader
-	 * outright, so a bare `Config()` resolves without reading the file and the notice
-	 * would be a false nag. Reusing the panel's OWN `connected` signal - never a
-	 * second one - renders it exactly where the failure it warns about is real.
+	 * The other half is "has this KERNEL PROCESS run `CONNECT_CODE`", and it is
+	 * load-bearing rather than caution: the verdict reads the config FILE alone,
+	 * which is the whole truth only once that scrub has taken every `DATABRICKS_*`
+	 * var out of the kernel. Before a connect a shell `DATABRICKS_HOST`+`DATABRICKS_TOKEN`
+	 * short-circuits the SDK's file loader outright, so a bare `Config()` resolves
+	 * without reading the file and the notice would be a false nag.
+	 *
+	 * `expired` is admitted alongside `connected` and the LOST/restarting states are
+	 * NOT, which is the exact boundary rather than an approximation. `liveConnection`
+	 * only reaches its expiry branch AFTER `status.connected` was true (the
+	 * `!status.connected` case returns above it), so an expired session is provably
+	 * the SAME process that ran the scrub - and it is where the user is most likely
+	 * troubleshooting, their own `WorkspaceClient()` failing while the card that
+	 * explains it went missing. A lost/restarting session is the opposite: it may be
+	 * a FRESH kernel whose env was never scrubbed, so the premise does not hold and
+	 * the card stays silent. Both halves reuse signals the panel already receives -
+	 * never a second one.
 	 */
 	const defaultProfile = $derived(status?.config?.defaultProfile);
-	const needsDefaultProfile = $derived(defaultProfile?.needsDefault === true && connected);
+	const needsDefaultProfile = $derived(
+		defaultProfile?.needsDefault === true && (connected || connection.expired === true)
+	);
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
 	const installed = $derived(!!install.sdk && !!install.connect);
 	/**
@@ -2435,10 +2447,10 @@
   tints in this panel mean "something you were doing failed"; nothing failed here.
 
   It is gated on the server's `needsDefault`, which is already false when there is
-  no profile to offer, AND on the notebook being connected, which is where the
-  kernel's DATABRICKS_* env has provably been scrubbed and the config file is
-  therefore the whole answer - so it can never nag a machine it has no advice for,
-  nor one whose credentials resolve from the environment (see
+  no profile to offer, AND on this kernel having really run CONNECT_CODE - connected
+  or expired - which is where its DATABRICKS_* env has provably been scrubbed and the
+  config file is therefore the whole answer. So it can never nag a machine it has no
+  advice for, nor one whose credentials resolve from the environment (see
   `needsDefaultProfile`). Every candidate gets its OWN command row rather than a
   picker with a pre-selected
   value: which profile becomes the machine-wide default is the user's call, so
@@ -2910,10 +2922,10 @@
 	{:else}
 		<div class="space-y-2">
 			<!-- Above the Cluster card: it is a precondition of everything below it. It
-			     sits outside the connection branches so one copy serves them all, but it
-			     is GATED on `connected` (see `needsDefaultProfile`) - the verdict reads
-			     the config file alone, which is the whole truth only once CONNECT_CODE
-			     has scrubbed the kernel's DATABRICKS_* env. -->
+			     sits outside the connection branches so ONE copy serves the connected
+			     and expired cards alike, but which branches it appears over is decided
+			     by `needsDefaultProfile` (connected, or expired - never lost/restarting,
+			     which may be a fresh kernel whose DATABRICKS_* env was never scrubbed). -->
 			{#if needsDefaultProfile && defaultProfile}
 				{@render defaultProfileCard(defaultProfile)}
 			{/if}
