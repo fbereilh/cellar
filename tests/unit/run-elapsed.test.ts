@@ -172,6 +172,15 @@ describe('the run start on the queue snapshot', () => {
 		return import('../../src/lib/server/run-queue');
 	}
 
+	// The broadcast case below mocks the event bus. Undoing that from a trailing
+	// statement in the test body only runs on the happy path, so ONE genuine failure
+	// there leaked the mock into every later test in the file and reported six
+	// failures for one defect. Teardown belongs in a hook that always runs.
+	afterEach(() => {
+		vi.doUnmock('../../src/lib/server/events');
+		vi.resetModules();
+	});
+
 	it('is absent until the run reports in, then carries the run\'s OWN instant', async () => {
 		const { enqueueRun, queueStateFor, noteRunStarted } = await freshQueue();
 		const nb = '/ws/a.ipynb';
@@ -226,8 +235,6 @@ describe('the run start on the queue snapshot', () => {
 		// changes nothing and must not fan another snapshot out to every tab.
 		noteRunStarted(nb, 'c1', 99_000);
 		expect(seen.length).toBe(beforeStart + 1);
-		vi.doUnmock('../../src/lib/server/events');
-		vi.resetModules();
 	});
 
 	it('is a silent no-op for a cell that does not hold the kernel', async () => {
@@ -376,20 +383,31 @@ describe('the run reports its own start (run.ts)', () => {
 		expect(sseEnd).toMatchObject({ at: T0, durationMs: 5_000 });
 	});
 
-	it('never lets a client see a start LATER than the duration it hands over to', async () => {
-		// The failure this rules out: an origin minted anywhere other than the run
-		// itself (the queue at dequeue, or a client noticing `running` flip) sits after
-		// the run's own start, so the live clock would read higher than the settled
-		// badge and the handover would go BACKWARDS.
-		const mods = await load(async () => {
-			clock = T0 + 1_234;
+	it('reports when the run BEGAN EXECUTING, not when the kernel was claimed', async () => {
+		// The discriminating case the test above cannot make: there, the enqueue and the
+		// run share one clock reading, so a queue that stamped `startedAt` itself at
+		// dequeue would produce the very same number and go unnoticed. Here the kernel
+		// is claimed at T0 and the run only begins WAITED_MS later, so the two origins
+		// are different numbers — and the queue snapshot must carry the RUN's.
+		const WAITED_MS = 2_000;
+		const RAN_MS = 7_500;
+		const seen: { snapshot?: { startedAt?: number } | null } = {};
+
+		const mods = await load(async (nb) => {
+			seen.snapshot = mods.queue.queueStateFor(nb).running;
+			clock = T0 + WAITED_MS + RAN_MS;
 			return { status: 'ok' };
 		});
 
+		const published: Record<string, unknown>[] = [];
+		const off = mods.events.subscribe((ev) => published.push(ev as unknown as Record<string, unknown>));
 		const ndjson: Record<string, unknown>[] = [];
+
 		const ticket = mods.queue.enqueueRun({ nb: NB, cellId: CELL, actor: 'agent', source: 'y = 2' });
 		if (ticket.duplicate) throw new Error('unreachable: fresh ticket expected');
 		await ticket.wait();
+		// The kernel is ours, but the run has not begun: time passes before it does.
+		clock = T0 + WAITED_MS;
 		try {
 			await mods.run.executeCellRun({
 				nb: NB,
@@ -400,14 +418,21 @@ describe('the run reports its own start (run.ts)', () => {
 			});
 		} finally {
 			ticket.done();
+			off();
 		}
 
 		const start = ndjson.find((e) => e.type === 'run:start') as { at: number };
 		const end = ndjson.find((e) => e.type === 'run:end') as { at: number; durationMs: number };
-		// The elapsed a client would render at the last tick before run:end.
-		const liveAtHandover = clock - start.at;
-		expect(end.durationMs).toBeGreaterThanOrEqual(liveAtHandover);
+		const sseStart = published.find((e) => e.type === 'run:start') as { at: number };
+
+		// The claim is not the start: nothing may report T0.
+		expect(start.at).toBe(T0 + WAITED_MS);
+		// …and the queue snapshot — the channel a mid-run mount reads — agrees, which
+		// is what ties `run:end`'s duration to the number a late joiner would time from.
+		expect(seen.snapshot?.startedAt).toBe(start.at);
+		expect(sseStart.at).toBe(start.at);
 		expect(end.at).toBe(start.at);
+		expect(end.durationMs).toBe(RAN_MS);
 	});
 });
 

@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page, type Locator } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, writeFileSync, existsSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -70,14 +70,56 @@ function notebook(): string {
 
 const cellFor = (page: Page, id: string) => page.locator(`[data-testid="cell"][data-cell-id="${id}"]`);
 
+/** The whole seconds a `12s` / `1m 5s` clock reading names, or null if it is neither. */
+function parseElapsed(text: string): number | null {
+	const m = /^(?:(\d+)m )?(\d+)s$/.exec(text);
+	if (!m) return null;
+	return (m[1] ? Number(m[1]) * 60 : 0) + Number(m[2]);
+}
+
 /** The whole seconds the live clock currently reads, or null when there is none. */
 async function elapsedSeconds(page: Page, id: string): Promise<number | null> {
 	const el = cellFor(page, id).getByTestId('running-elapsed');
 	if ((await el.count()) === 0) return null;
-	const text = (await el.textContent())?.trim() ?? '';
-	const m = /^(?:(\d+)m )?(\d+)s$/.exec(text);
-	if (!m) return null;
-	return (m[1] ? Number(m[1]) * 60 : 0) + Number(m[2]);
+	return parseElapsed((await el.textContent())?.trim() ?? '');
+}
+
+/**
+ * One layout observation: the clock's TEXT and the neighbouring control's `x`,
+ * taken together and known to belong to each other.
+ *
+ * Driven by the clock's OWN readings, never by inferring elapsed from accumulated
+ * wall clock — under load an inferred anchor either fails outright or silently
+ * measures the wrong side of the digit-count change, which is the vacuity this
+ * whole probe exists to rule out. `wants` selects the reading to anchor on; the
+ * text is re-read AFTER the box and must be unchanged, so a tick landing
+ * mid-measurement retries instead of pairing an `x` with the wrong width.
+ */
+async function measureAt(
+	page: Page,
+	id: string,
+	probe: Locator,
+	wants: (text: string) => boolean,
+	message: string
+): Promise<{ text: string; x: number }> {
+	let taken: { text: string; x: number } | null = null;
+	const clock = cellFor(page, id).getByTestId('running-elapsed');
+	await expect
+		.poll(
+			async () => {
+				if ((await clock.count()) === 0) return false;
+				const before = (await clock.textContent())?.trim() ?? '';
+				if (parseElapsed(before) === null || !wants(before)) return false;
+				const box = await probe.boundingBox();
+				const after = (await clock.textContent())?.trim() ?? '';
+				if (!box || after !== before) return false;
+				taken = { text: before, x: box.x };
+				return true;
+			},
+			{ timeout: 60_000, intervals: [100, 100, 200, 250, 500], message }
+		)
+		.toBe(true);
+	return taken!;
 }
 
 /** Fire a run with NO originId, so the viewing tab treats it as an agent/other-tab
@@ -152,6 +194,11 @@ test('live elapsed: ticks up beside the spinner, holds the layout, hands over to
 	// reserved `min-w-[2.75rem]`, ~34px over an hour).
 	const probe = cellFor(page, SLOW).getByTestId('delete');
 
+	// Anchor FIRST, while the clock is still single-digit — the run has only just
+	// started, so this side of the crossing is reached immediately and the ~10s of
+	// single-digit readings that follow are all margin.
+	const narrow = await measureAt(page, SLOW, probe, (t) => /^\ds$/.test(t), 'the clock must read a single digit to anchor the layout probe');
+
 	// It must not merely INCREMENT — it must track real time. Two readings a
 	// measured wall-clock interval apart have to differ by that interval (±1s for
 	// the tick's phase against our sampling), which a counter driven by anything
@@ -171,28 +218,25 @@ test('live elapsed: ticks up beside the spinner, holds the layout, hands over to
 	expect(later).toBeGreaterThan(first!);
 	expect(Math.abs(later - e0 - realDelta), `clock drifted: ${e0}s → ${later}s over ${realDelta}s`).toBeLessThanOrEqual(1.5);
 
-	// Straddle the 9s → 10s digit-count change EXPLICITLY: two readings of the same
-	// width prove nothing, so anchor the first measurement while the clock is still
-	// single-digit and the second once it has grown a digit.
-	const oneDigit = (await elapsedSeconds(page, SLOW))!;
-	expect(oneDigit, `the layout probe must anchor while the clock is single-digit, got ${oneDigit}s`).toBeLessThan(10);
-	const boxBefore = await probe.boundingBox();
+	// The other side of the crossing: wait for a reading that is genuinely WIDER
+	// than the anchor's. Comparing the texts the two boxes were taken with is what
+	// proves the straddle from the same observations, rather than from a separate
+	// reading that may have moved since.
+	const wide = await measureAt(
+		page,
+		SLOW,
+		probe,
+		(t) => t.length > narrow.text.length,
+		`the clock must grow past "${narrow.text}" so the layout probe straddles a width change`
+	);
+	expect(wide.text.length, `the two measurements must straddle a digit-count change, got "${narrow.text}" and "${wide.text}"`).toBeGreaterThan(
+		narrow.text.length
+	);
 
-	await expect
-		.poll(async () => (await elapsedSeconds(page, SLOW)) ?? -1, {
-			timeout: 30_000,
-			message: 'the clock must reach two digits so the layout probe straddles a width change'
-		})
-		.toBeGreaterThanOrEqual(10);
-	const twoDigits = (await elapsedSeconds(page, SLOW))!;
-
-	const boxAfter = await probe.boundingBox();
-	expect(boxBefore).not.toBeNull();
-	expect(boxAfter).not.toBeNull();
 	// Sub-pixel layout jitter is tolerable; a digit's width (~6px) is not.
 	expect(
-		Math.abs(boxAfter!.x - boxBefore!.x),
-		`the controls left of the clock must not move as its digits grow (${oneDigit}s → ${twoDigits}s)`
+		Math.abs(wide.x - narrow.x),
+		`the controls left of the clock must not move as its digits grow ("${narrow.text}" → "${wide.text}")`
 	).toBeLessThan(1.5);
 
 	await page.screenshot({ path: join(EVIDENCE, 'running-elapsed.png'), fullPage: false });
@@ -214,7 +258,8 @@ test('live elapsed: ticks up beside the spinner, holds the layout, hands over to
 	// hand over to a smaller number.) Note the first run's duration legitimately
 	// includes the lazy kernel boot, which is exactly why this is a floor and not a
 	// window around the cell's sleep.
-	expect(settled, `settled ${settled}s must not be below the live ${twoDigits}s`).toBeGreaterThanOrEqual(twoDigits);
+	const lastLive = parseElapsed(wide.text)!;
+	expect(settled, `settled ${settled}s must not be below the live ${wide.text}`).toBeGreaterThanOrEqual(lastLive);
 
 	// ---- D. an agent's run gets the same clock ----------------------------
 	// This tab never started it and never sees an NDJSON stream for it: the start
