@@ -31,6 +31,15 @@
 		reauthExplanation
 	} from '$lib/databricksReauth';
 	import {
+		DEFAULT_PROFILE_CONSEQUENCE,
+		DEFAULT_PROFILE_REMEDY,
+		SWITCH_COMMAND_HEAD,
+		SWITCH_PROFILE_FLAG,
+		defaultProfileProblem,
+		switchDefaultProfileCommand,
+		type DefaultProfileVerdict
+	} from '$lib/databricksDefaultProfile';
+	import {
 		UPLOAD_DATE_TOKENS,
 		expandDateTokens,
 		resolveUploadName,
@@ -105,7 +114,16 @@
 	}
 	interface DbxStatus {
 		connection?: DbxConnection;
-		config?: { profiles?: DbxProfile[] };
+		config?: {
+			profiles?: DbxProfile[];
+			/**
+			 * Would a bare `Config()` - the kind a user's own library builds - resolve
+			 * any credentials on this machine? Read from `~/.databrickscfg` server-side;
+			 * see `$lib/databricksDefaultProfile`. Absent on an older server payload,
+			 * which reads as "say nothing".
+			 */
+			defaultProfile?: DefaultProfileVerdict;
+		};
 		install?: DbxInstall;
 		/** Whether uv is available to install packages. */
 		uv?: boolean;
@@ -586,6 +604,15 @@
 	const runtimeSdkForeign = $derived(status?.runtime?.sdkDbutils === 'foreign');
 	const profiles = $derived(status?.config?.profiles ?? []);
 	const hasProfiles = $derived(profiles.length > 0);
+	/**
+	 * The default-profile notice's ONE gate. `needsDefault` is the server's own
+	 * predicate (`$lib/databricksDefaultProfile`), which is already false both when
+	 * resolution succeeds and when there is no profile to offer as a default - so a
+	 * machine that is fine, and one with nothing to choose between, are silent by
+	 * construction rather than by a second rule kept in step here.
+	 */
+	const defaultProfile = $derived(status?.config?.defaultProfile);
+	const needsDefaultProfile = $derived(defaultProfile?.needsDefault === true);
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
 	const installed = $derived(!!install.sdk && !!install.connect);
 	/**
@@ -1919,20 +1946,23 @@
 		return !!name && name === reauthProfile(session);
 	}
 
-	// Copy-the-command affordance for the re-auth box - the same idiom as the
-	// sidebar's "Connect an agent" panel. Keyed by the box's own `key`, NOT its
-	// testid: a testid is a SELECTOR, not an identity - `databricks-node-error` is
-	// rendered once per catalog-tree node, and one expired profile fails every one
-	// of them at once, so keying the tick off it flipped the checkmark in every
-	// sibling box. Each rendered box therefore passes a key unique to it.
-	let copiedReauth = $state('');
-	let copyReauthTimer: ReturnType<typeof setTimeout>;
-	async function copyReauth(key: string, text: string) {
+	// Copy-the-command affordance shared by the two places Cellar hands the user a
+	// terminal command rather than running it (the re-auth box, and the
+	// default-profile card) - the same idiom as the sidebar's "Connect an agent"
+	// panel. Keyed by the caller's own `key`, NOT its testid: a testid is a
+	// SELECTOR, not an identity - `databricks-node-error` is rendered once per
+	// catalog-tree node, and one expired profile fails every one of them at once, so
+	// keying the tick off it flipped the checkmark in every sibling box. The
+	// default-profile card renders one row PER PROFILE for the same reason, so each
+	// row likewise passes a key unique to it.
+	let copiedCommand = $state('');
+	let copyCommandTimer: ReturnType<typeof setTimeout>;
+	async function copyCommand(key: string, text: string) {
 		try {
 			await navigator.clipboard.writeText(text);
-			copiedReauth = key;
-			clearTimeout(copyReauthTimer);
-			copyReauthTimer = setTimeout(() => (copiedReauth = ''), 1400);
+			copiedCommand = key;
+			clearTimeout(copyCommandTimer);
+			copyCommandTimer = setTimeout(() => (copiedCommand = ''), 1400);
 		} catch {
 			/* a denied clipboard permission must not break the error box */
 		}
@@ -1964,12 +1994,12 @@
 			<code class="min-w-0 flex-1 px-1 py-0.5 font-mono text-[11px] leading-snug text-primary [overflow-wrap:break-word]" title={command} data-testid="{testid}-command">{REAUTH_COMMAND_HEAD} <span class="whitespace-nowrap">{REAUTH_PROFILE_FLAG}</span> {name}</code>
 			<button
 				class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
-				onclick={() => copyReauth(key, command)}
+				onclick={() => copyCommand(key, command)}
 				title="Copy command"
 				aria-label="Copy command"
 				data-testid="{testid}-copy"
 			>
-				{#if copiedReauth === key}
+				{#if copiedCommand === key}
 					<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
 				{:else}
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
@@ -2381,6 +2411,69 @@
 
 {#snippet cardLabel(text: string)}
 	<span class="text-[10px] font-semibold uppercase tracking-wide text-base-content/40">{text}</span>
+{/snippet}
+
+<!--
+  A heads-up, not an error: this machine's `~/.databrickscfg` marks no profile as
+  the default, so anything in the kernel that resolves Databricks credentials for
+  ITSELF finds none. Cellar's own connection passes its profile explicitly and is
+  unaffected - which is exactly why this is worth saying out loud, since `spark`
+  working while the user's own `import` dies reads as a Cellar bug and is not one.
+
+  Toned as information, deliberately: `border-base-300 bg-base-100` like every
+  other card here, with the only colour on the small info glyph. The error/warning
+  tints in this panel mean "something you were doing failed"; nothing failed here.
+
+  It is gated on the server's `needsDefault`, which is already false when there is
+  no profile to offer - so it can never nag a machine it has no advice for. Every
+  candidate gets its OWN command row rather than a picker with a pre-selected
+  value: which profile becomes the machine-wide default is the user's call, so
+  nothing here is preferred for them, and the list IS the choice (which is also why
+  it is not truncated - hiding a candidate could hide the only one they wanted).
+
+  Cellar shows the command and does not run it. See `$lib/databricksDefaultProfile`
+  for that decision; the short version is that Cellar never shells out to the
+  `databricks` CLI and never writes the user's credential config.
+-->
+{#snippet defaultProfileCard(v: DefaultProfileVerdict)}
+	<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-default-profile">
+		<div class="flex items-center gap-1.5">
+			<svg class="h-3 w-3 shrink-0 text-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M12 16v-4M12 8h.01" /></svg>
+			{@render cardLabel('default profile')}
+		</div>
+		<p class="mt-1.5 text-[11px] font-medium leading-relaxed text-base-content/80" data-testid="databricks-default-profile-problem">
+			{defaultProfileProblem(v)}
+		</p>
+		<p class="mt-1 text-[11px] leading-relaxed text-base-content/55" data-testid="databricks-default-profile-consequence">
+			{DEFAULT_PROFILE_CONSEQUENCE}
+		</p>
+		<p class="mt-2 text-[11px] leading-relaxed text-base-content/70">{DEFAULT_PROFILE_REMEDY}</p>
+		<div class="mt-1 space-y-1">
+			{#each v.candidates as name (name)}
+				{@const command = switchDefaultProfileCommand(name)}
+				<!-- Wraps rather than truncates: the tail is the profile name, i.e. the one
+				     part the user must read. The flag sits in a no-wrap span because a
+				     browser breaks after a hyphen, splitting `--profile` into `-` /
+				     `-profile` - a command a reader could mistype. -->
+				<div class="flex items-start gap-1 rounded-md border border-base-300 bg-base-200/40 p-1">
+					<code class="min-w-0 flex-1 px-1 py-0.5 font-mono text-[11px] leading-snug text-primary [overflow-wrap:break-word]" title={command} data-testid="databricks-default-profile-command">{SWITCH_COMMAND_HEAD} <span class="whitespace-nowrap">{SWITCH_PROFILE_FLAG}</span> {name}</code>
+					<button
+						class="btn btn-ghost btn-xs btn-square shrink-0 text-base-content/50 hover:text-base-content"
+						onclick={() => copyCommand(`default-profile:${name}`, command)}
+						title="Copy command"
+						aria-label="Copy command for profile {name}"
+						data-testid="databricks-default-profile-copy"
+					>
+						{#if copiedCommand === `default-profile:${name}`}
+							<svg class="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+						{:else}
+							<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+						{/if}
+					</button>
+				</div>
+			{/each}
+		</div>
+	</div>
 {/snippet}
 
 <!-- The connect form: pick an auth source (a saved profile, or a typed workspace
@@ -2802,6 +2895,12 @@
 		     workspace, and what the kernel advertises. -->
 	{:else}
 		<div class="space-y-2">
+			<!-- Above the Cluster card: it is a precondition of everything below it, and
+			     it is true whether or not a cluster is connected, so it sits outside the
+			     connection branches rather than inside one of them. -->
+			{#if needsDefaultProfile && defaultProfile}
+				{@render defaultProfileCard(defaultProfile)}
+			{/if}
 			{#if busy === 'connect' || (expectedRestart && !runtimeApplying)}
 				<!-- Connecting: one calm state in the Cluster card, held until the session
 				     settles - so the panel never flashes the "session lost" card. Shown for a
