@@ -605,14 +605,24 @@
 	const profiles = $derived(status?.config?.profiles ?? []);
 	const hasProfiles = $derived(profiles.length > 0);
 	/**
-	 * The default-profile notice's ONE gate. `needsDefault` is the server's own
-	 * predicate (`$lib/databricksDefaultProfile`), which is already false both when
-	 * resolution succeeds and when there is no profile to offer as a default - so a
-	 * machine that is fine, and one with nothing to choose between, are silent by
-	 * construction rather than by a second rule kept in step here.
+	 * The default-profile notice's ONE gate, and it has TWO halves.
+	 *
+	 * `needsDefault` is the server's own predicate (`$lib/databricksDefaultProfile`),
+	 * already false both when resolution succeeds and when there is no profile to
+	 * offer as a default - so a machine that is fine, and one with nothing to choose
+	 * between, are silent by construction rather than by a second rule kept in step
+	 * here.
+	 *
+	 * `connected` is the other half and is load-bearing, not caution: the verdict
+	 * reads the config FILE alone, which is the whole truth only once `CONNECT_CODE`
+	 * has scrubbed every `DATABRICKS_*` var out of the kernel. Before a connect a
+	 * shell `DATABRICKS_HOST`+`DATABRICKS_TOKEN` short-circuits the SDK's file loader
+	 * outright, so a bare `Config()` resolves without reading the file and the notice
+	 * would be a false nag. Reusing the panel's OWN `connected` signal - never a
+	 * second one - renders it exactly where the failure it warns about is real.
 	 */
 	const defaultProfile = $derived(status?.config?.defaultProfile);
-	const needsDefaultProfile = $derived(defaultProfile?.needsDefault === true);
+	const needsDefaultProfile = $derived(defaultProfile?.needsDefault === true && connected);
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
 	const installed = $derived(!!install.sdk && !!install.connect);
 	/**
@@ -2425,8 +2435,12 @@
   tints in this panel mean "something you were doing failed"; nothing failed here.
 
   It is gated on the server's `needsDefault`, which is already false when there is
-  no profile to offer - so it can never nag a machine it has no advice for. Every
-  candidate gets its OWN command row rather than a picker with a pre-selected
+  no profile to offer, AND on the notebook being connected, which is where the
+  kernel's DATABRICKS_* env has provably been scrubbed and the config file is
+  therefore the whole answer - so it can never nag a machine it has no advice for,
+  nor one whose credentials resolve from the environment (see
+  `needsDefaultProfile`). Every candidate gets its OWN command row rather than a
+  picker with a pre-selected
   value: which profile becomes the machine-wide default is the user's call, so
   nothing here is preferred for them, and the list IS the choice (which is also why
   it is not truncated - hiding a candidate could hide the only one they wanted).
@@ -2895,9 +2909,11 @@
 		     workspace, and what the kernel advertises. -->
 	{:else}
 		<div class="space-y-2">
-			<!-- Above the Cluster card: it is a precondition of everything below it, and
-			     it is true whether or not a cluster is connected, so it sits outside the
-			     connection branches rather than inside one of them. -->
+			<!-- Above the Cluster card: it is a precondition of everything below it. It
+			     sits outside the connection branches so one copy serves them all, but it
+			     is GATED on `connected` (see `needsDefaultProfile`) - the verdict reads
+			     the config file alone, which is the whole truth only once CONNECT_CODE
+			     has scrubbed the kernel's DATABRICKS_* env. -->
 			{#if needsDefaultProfile && defaultProfile}
 				{@render defaultProfileCard(defaultProfile)}
 			{/if}

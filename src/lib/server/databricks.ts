@@ -408,9 +408,19 @@ function readConfig(): { configPath: string; exists: boolean; error?: string; se
 			continue;
 		}
 		if (!current) continue;
+		// configparser's DEFAULT delimiters are `('=', ':')`, and its option pattern is
+		// non-greedy, so whichever appears FIRST on the line separates key from value.
+		// Reading `=` alone was not a narrower parse but a WRONG one: a colon-delimited
+		// file (`default_profile: work`, or a `[DEFAULT]` whose keys all use `:`) parsed
+		// to zero keys, so `defaultProfileOf` reported `no_default` and the sidebar
+		// nagged a machine the SDK resolves perfectly - the one thing this notice must
+		// never do. Taking the first also keeps `host = https://x` intact, since its
+		// `=` precedes the URL's own colon.
 		const eq = line.indexOf('=');
-		if (eq === -1) continue;
-		current.keys.set(line.slice(0, eq).trim().toLowerCase(), line.slice(eq + 1).trim());
+		const colon = line.indexOf(':');
+		const delim = eq === -1 ? colon : colon === -1 ? eq : Math.min(eq, colon);
+		if (delim === -1) continue;
+		current.keys.set(line.slice(0, delim).trim().toLowerCase(), line.slice(delim + 1).trim());
 	}
 	return { configPath: path, exists: true, sections };
 }

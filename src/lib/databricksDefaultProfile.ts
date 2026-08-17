@@ -56,13 +56,23 @@
  * honestly answer. Over-claiming here would nag a user whose machine is fine,
  * which is the one thing this must not do.
  *
- * Environment variables are deliberately NOT consulted either, and that is a fact
- * about Cellar rather than an omission: `CONNECT_CODE` scrubs every `DATABRICKS_*`
- * var from `os.environ` before it builds the session (databricks-connect refuses to
- * build a REMOTE session while it believes it is on a runtime), so inside a
- * connected kernel the config file is the only thing left that can answer. A
- * `DATABRICKS_CONFIG_PROFILE` exported in the user's shell does not survive to be
- * a mitigation.
+ * Environment variables are deliberately NOT consulted either, and the reason is a
+ * fact about Cellar that holds only INSIDE A CONNECTED KERNEL: `CONNECT_CODE`
+ * scrubs every `DATABRICKS_*` var from `os.environ` before it builds the session
+ * (databricks-connect refuses to build a REMOTE session while it believes it is on
+ * a runtime), so once a connect has run, the config file really is the only thing
+ * left that can answer and a `DATABRICKS_CONFIG_PROFILE` exported in the user's
+ * shell does not survive to be a mitigation.
+ *
+ * **That is why the notice is gated on the notebook being CONNECTED** (`Databricks.svelte`
+ * renders the card only from the panel's own `connected` signal). Before a connect
+ * the scrub has not run, so a shell `DATABRICKS_HOST`+`DATABRICKS_TOKEN` is still
+ * present and short-circuits `_known_file_config_loader` outright - a bare `Config()`
+ * resolves without reading this file at all, and the notice would be a false nag,
+ * the one thing it must not be. Gating is the right half of that fix and consulting
+ * the SERVER's own env is the wrong one: after connect the scrub has removed those
+ * vars from the KERNEL, so an env-aware server would fall silent exactly when the
+ * warning becomes true.
  */
 
 /** The reserved bookkeeping section the Databricks CLI writes `default_profile` into. */

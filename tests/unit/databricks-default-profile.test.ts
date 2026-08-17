@@ -55,10 +55,8 @@ const input = (over: Partial<DefaultProfileInput> = {}): DefaultProfileInput => 
 describe('the SDK rule: _resolve_profile, branch by branch', () => {
 	// Branch 1 (an explicit `profile=` argument) is deliberately absent: it is what
 	// Cellar's OWN connect passes, and the whole point of this detector is the BARE
-	// case a user's library hits. Asserted below as a property of the input shape.
-	it('takes no requested-profile input at all - it models the bare Config() only', () => {
-		expect(Object.keys(input())).not.toContain('requestedProfile');
-	});
+	// case a user's library hits. There is nothing to assert here - `DefaultProfileInput`
+	// carries no such field, so the type enforces it structurally.
 
 	it('rule 2: [__settings__] default_profile wins', () => {
 		const v = resolveDefaultProfile(
@@ -310,6 +308,34 @@ describe('readDefaultProfile over a real ~/.databrickscfg', () => {
 		expect(verdict).toMatchObject({ resolves: true, reason: 'default_section' });
 	});
 
+	it('a colon-delimited [DEFAULT] resolves, exactly as configparser reads it', () => {
+		// configparser's default delimiters are `('=', ':')`. A reader that knew only
+		// `=` saw zero keys here, reported `no_default`, and nagged a machine whose bare
+		// `Config()` resolves perfectly - the false nag this notice must never produce.
+		const { verdict } = verdictFor('[DEFAULT]\nhost: https://x.cloud.databricks.com\ntoken: pat\n');
+		expect(verdict).toMatchObject({ resolves: true, reason: 'default_section', needsDefault: false });
+	});
+
+	it('a colon-delimited default_profile resolves, and its value keeps its own colons', () => {
+		const { cfg, verdict } = verdictFor(
+			'[work]\nhost: https://x.cloud.databricks.com\ntoken: pat\n\n[__settings__]\ndefault_profile: work\n'
+		);
+		expect(verdict).toMatchObject({ resolves: true, reason: 'default_profile', profile: 'work', needsDefault: false });
+		// The picker reads the same parse, so a colon-delimited host must survive whole -
+		// the value's own `://` must not be mistaken for the delimiter.
+		process.env.DATABRICKS_CONFIG_FILE = cfg;
+		expect(dbx.readProfiles().profiles).toEqual([
+			{ name: 'work', host: 'https://x.cloud.databricks.com', hasToken: true, authType: null }
+		]);
+	});
+
+	it('whichever of = or : comes FIRST separates the key, so a URL value stays intact', () => {
+		const { cfg, verdict } = verdictFor('[work]\nhost = https://x.cloud.databricks.com\ntoken = pat\n');
+		expect(verdict.candidates).toEqual(['work']);
+		process.env.DATABRICKS_CONFIG_FILE = cfg;
+		expect(dbx.readProfiles().profiles[0].host).toBe('https://x.cloud.databricks.com');
+	});
+
 	it('comments and blank lines do not create sections or keys', () => {
 		const { verdict } = verdictFor(
 			'# a comment\n; another\n\n[DEFAULT]\n# host = https://commented-out\n\n[work]\nhost = https://x.cloud.databricks.com\ntoken = pat\n'
@@ -417,6 +443,31 @@ describe.skipIf(!sdkPython)('differential: the rule agrees with the real databri
 		{
 			name: 'default_profile naming a host-less section',
 			text: '[partial]\nnot_a_host = x\n[work]\nhost = https://unreachable.invalid\ntoken = pat\n[__settings__]\ndefault_profile = partial\n'
+		},
+		// The two branches where the detector claims `Config()` RAISES rather than
+		// quietly resolving nothing. `RESOLVE_PROBE` already catches an exception into
+		// `resolves:false`, so they replay like any other case - and they are the two
+		// worth replaying most, being the least obvious halves of the transcription.
+		{
+			name: 'default_profile = __settings__, the reserved name',
+			text: '[work]\nhost = https://unreachable.invalid\ntoken = pat\n[__settings__]\ndefault_profile = __settings__\n'
+		},
+		{
+			name: 'default_profile = DEFAULT over an empty [DEFAULT] header',
+			// configparser keeps DEFAULT in `_defaults`, never in `_sections`, and the SDK
+			// adds it to the candidate set only when `defaults()` is truthy - so an empty
+			// one is a section that does not exist for resolution purposes.
+			text: '[DEFAULT]\n\n[work]\nhost = https://unreachable.invalid\ntoken = pat\n[__settings__]\ndefault_profile = DEFAULT\n'
+		},
+		// The delimiter configparser accepts alongside `=`. A reader that knew only `=`
+		// disagreed with the SDK on exactly this file.
+		{
+			name: 'colon-delimited [DEFAULT]',
+			text: '[DEFAULT]\nhost: https://unreachable.invalid\ntoken: pat\n'
+		},
+		{
+			name: 'colon-delimited default_profile',
+			text: '[work]\nhost: https://unreachable.invalid\ntoken: pat\n[__settings__]\ndefault_profile: work\n'
 		}
 	];
 
