@@ -22,7 +22,6 @@ import {
 	resolveWorkspacePorts,
 	REMEMBERED_PORTS,
 	PORT_RELEASE_GRACE_MS,
-	MCP_PORT_RELEASE_GRACE_MS,
 	bindHosts,
 	MOVE_CAUSE
 } from '../../src/lib/server/ports.js';
@@ -285,46 +284,13 @@ describe('choosePort - the stable-port rule', () => {
 		expect(PORT_RELEASE_GRACE_MS).toBeGreaterThan(0);
 	});
 
-	it('waits out the measured MCP hold on the MCP window, but not on the app one', async () => {
-		// A Ctrl-C restart races the previous run letting go, and the two ports were
-		// measured behaving completely differently: the app port is back at ~0ms,
-		// the MCP port stays held ~5-7s because nothing closes the in-process MCP
-		// http server. Applying the app's window to both moved the MCP port on
-		// essentially every quick restart - and never converged, since the
-		// replacement it remembered was busy again next time.
+	it('gives up on a remembered port the previous run is still holding, rather than stalling', async () => {
+		// The measured hold on the MCP port is ~5-7s (nothing closes the in-process
+		// MCP http server, so it goes only when the app process finally exits). This
+		// window deliberately does NOT wait that out: the address appears in no
+		// config and `cellar mcp` re-attaches by itself, so stalling every restart to
+		// preserve it would trade real launch latency for nothing.
 		const HOLD_MS = 6800;
-		const run = async (graceMs: number) => {
-			const realNow = Date.now;
-			let clock = 0;
-			try {
-				return await choosePort({
-					remembered: 51348,
-					sticky: true,
-					bindGraceMs: graceMs,
-					// Frees exactly when the previous instance would have let go.
-					canBind: async (p: number) => p !== 51348 || clock >= HOLD_MS,
-					freePort,
-					sleep: async (ms: number) => {
-						clock += ms;
-						Date.now = () => realNow() + clock;
-					}
-				});
-			} finally {
-				Date.now = realNow;
-			}
-		};
-
-		expect(await run(MCP_PORT_RELEASE_GRACE_MS)).toEqual({ port: 51348, source: 'remembered' });
-		expect(await run(PORT_RELEASE_GRACE_MS)).toEqual({
-			port: 40000,
-			source: 'fresh',
-			reason: 'port-unavailable'
-		});
-	});
-
-	it('returns the moment the port frees rather than sleeping out the window', async () => {
-		// "Detecting the exit" IS the port binding again - it must not become a
-		// fixed sleep, or every quick restart would stall for the whole window.
 		let clock = 0;
 		const realNow = Date.now;
 		let r;
@@ -332,8 +298,33 @@ describe('choosePort - the stable-port rule', () => {
 			r = await choosePort({
 				remembered: 51348,
 				sticky: true,
-				bindGraceMs: MCP_PORT_RELEASE_GRACE_MS,
-				canBind: async (p: number) => p !== 51348 || clock >= 200,
+				canBind: async (p: number) => p !== 51348 || clock >= HOLD_MS,
+				freePort,
+				sleep: async (ms: number) => {
+					clock += ms;
+					Date.now = () => realNow() + clock;
+				}
+			});
+		} finally {
+			Date.now = realNow;
+		}
+		expect(r).toEqual({ port: 40000, source: 'fresh', reason: 'port-unavailable' });
+		// It gave up near its own window, nowhere near the hold.
+		expect(clock).toBeLessThan(HOLD_MS / 2);
+	});
+
+	it('returns the moment the port frees rather than sleeping out the window', async () => {
+		// The window is a bound, not a delay: a port that comes back inside it is
+		// taken at once, so the everyday restart pays nothing for the app port.
+		let clock = 0;
+		const realNow = Date.now;
+		let r;
+		try {
+			r = await choosePort({
+				remembered: 51348,
+				sticky: true,
+				bindGraceMs: 5000,
+				canBind: async (p: number) => p !== 51348 || clock >= 100,
 				freePort,
 				sleep: async (ms: number) => {
 					clock += ms;
@@ -344,41 +335,7 @@ describe('choosePort - the stable-port rule', () => {
 			Date.now = realNow;
 		}
 		expect(r).toEqual({ port: 51348, source: 'remembered' });
-		// It gave up waiting as soon as the port came back, not at the deadline.
-		expect(clock).toBeLessThan(MCP_PORT_RELEASE_GRACE_MS / 2);
-	});
-
-	it('announces a real wait exactly once, and says nothing when the port is free', async () => {
-		const quiet: unknown[][] = [];
-		await choosePort({
-			remembered: 51348,
-			sticky: true,
-			canBind: probe(),
-			freePort,
-			onWaiting: (...args: unknown[]) => quiet.push(args)
-		});
-		expect(quiet).toEqual([]);
-
-		const said: [number, number][] = [];
-		let clock = 0;
-		const realNow = Date.now;
-		try {
-			await choosePort({
-				remembered: 51348,
-				sticky: true,
-				bindGraceMs: 400,
-				canBind: async (p: number) => p !== 51348,
-				freePort,
-				onWaiting: (port: number, ms: number) => said.push([port, ms]),
-				sleep: async (ms: number) => {
-					clock += ms;
-					Date.now = () => realNow() + clock;
-				}
-			});
-		} finally {
-			Date.now = realNow;
-		}
-		expect(said).toEqual([[51348, 400]]);
+		expect(clock).toBeLessThan(1000);
 	});
 
 	it('leaves the wall clock alone for every later test in this file', () => {
@@ -611,7 +568,7 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 	const launch = (opts: Record<string, unknown> = {}) =>
 		// bindGraceMs 0 unless a test is specifically about the release grace: a
 		// squatted port would otherwise make every such test wait it out.
-		resolveWorkspacePorts({ workspace: ws, sticky: true, env: {}, freePort, bindGraceMs: 0, mcpBindGraceMs: 0, ...opts });
+		resolveWorkspacePorts({ workspace: ws, sticky: true, env: {}, freePort, bindGraceMs: 0, ...opts });
 
 	it('gives the SAME folder the SAME app/MCP ports on the next restart', async () => {
 		const first = await launch();
@@ -705,7 +662,6 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 				env: { HOST: '127.0.0.1', CELLAR_MCP_HOST: '0.0.0.0' },
 				freePort,
 				bindGraceMs: 0,
-				mcpBindGraceMs: 0,
 				canBind: async (port: number, host: string) => {
 					asked2.push({ port, host });
 					return true;
@@ -750,7 +706,6 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 				env: { HOST: '0.0.0.0' },
 				freePort,
 				bindGraceMs: 0,
-				mcpBindGraceMs: 0,
 				canBind: async (port: number, host: string) => {
 					askedHost.push({ port, host });
 					return true;
@@ -864,8 +819,7 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 			instances: [{ launcherPid: 999, appPort: 41000, mcpPort: 41001 }],
 			isAlive: () => true,
 			canBind: async () => true,
-			bindGraceMs: 0,
-			mcpBindGraceMs: 0
+			bindGraceMs: 0
 		});
 		for (const p of [isolated.appPort, isolated.mcpPort, isolated.jupyterPort]) {
 			expect([41000, 41001]).not.toContain(p);
@@ -888,8 +842,7 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 				sticky: false,
 				env: {},
 				freePort: async () => 41000,
-				bindGraceMs: 0,
-			mcpBindGraceMs: 0
+				bindGraceMs: 0
 			})
 		).rejects.toThrow(/free port/i);
 	});
@@ -909,7 +862,6 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 			freePort: scriptedFreePort(42000, 42002, 42003),
 			canBind: async () => true,
 			bindGraceMs: 0,
-			mcpBindGraceMs: 0,
 			log: (m: string) => notes.push(m)
 		});
 		expect(r.app).toEqual({ port: 42000, source: 'remembered' });
@@ -934,46 +886,15 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 		expect(new Set([r.appPort, r.mcpPort, r.jupyterPort]).size).toBe(3);
 	});
 
-	it('reclaims the remembered MCP port across a quick restart, and says nothing alarming', async () => {
+	it('says NOTHING when the MCP port moves on a routine self-restart', async () => {
 		// The everyday gesture: Ctrl-C, then relaunch. The previous launcher has
-		// already unregistered itself and cleared runtime.json, so the take-over
-		// sweep finds nothing to await - but its orphaned app is still holding the
-		// MCP port. The MCP role waits it out and keeps the address; the app role,
-		// whose port is measured back at ~0ms, is deliberately not slowed for it.
-		const first = await launch();
-		let held = true;
-		setTimeout(() => {
-			held = false;
-		}, 120);
-		const notes: string[] = [];
-		const second = await resolveWorkspacePorts({
-			workspace: ws,
-			sticky: true,
-			env: {},
-			freePort,
-			// The app port is free at once; only the MCP one is still held.
-			canBind: async (port: number) => !(held && port === first.mcpPort),
-			bindGraceMs: 0,
-			mcpBindGraceMs: 2000,
-			log: (m: string) => notes.push(m)
-		});
-
-		expect(second.mcpPort).toBe(first.mcpPort);
-		expect(second.mcp.source).toBe('remembered');
-		expect(second.appPort).toBe(first.appPort);
-		// A routine self-restart must not announce that the stable address moved.
-		expect(notes.join('\n')).not.toContain('was unavailable');
-		// It does explain the pause it just took, once, rather than stalling mutely.
-		expect(notes.filter((m) => m.includes('waiting up to'))).toHaveLength(1);
-		expect(notes.join('\n')).toContain(`MCP port ${first.mcpPort}`);
-		// ...and the folder still remembers the address it was told is stable.
-		expect(readPortPrefs(ws)).toEqual({ appPort: first.appPort, mcpPort: first.mcpPort });
-	});
-
-	it('still moves - and says so - when the remembered port truly cannot be had', async () => {
-		// The fallback is unchanged: something else really holds it for longer than
-		// the window, so the port moves, the move is announced with its cause, and
-		// the replacement is remembered so the NEXT launch is stable again.
+		// already unregistered itself and cleared runtime.json, so the take-over sweep
+		// finds nothing to await - and its orphaned app still holds the MCP port for
+		// several seconds. That port is deliberately not waited out (it appears in no
+		// config and the bridge re-attaches by itself), so it reliably MOVES here.
+		// Announcing that made the commonest restart print an alarming
+		// "was unavailable (another process is using it)" about a conflict the user
+		// has no reason to care about, naming a holder the probe never identified.
 		const first = await launch();
 		const notes: string[] = [];
 		const second = await resolveWorkspacePorts({
@@ -981,19 +902,44 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 			sticky: true,
 			env: {},
 			freePort,
+			// The app port is back at once; only the MCP one is still held.
 			canBind: async (port: number) => port !== first.mcpPort,
 			bindGraceMs: 0,
-			mcpBindGraceMs: 150,
 			log: (m: string) => notes.push(m)
 		});
+
+		// The app port - the address a human actually holds onto - is unmoved.
+		expect(second.appPort).toBe(first.appPort);
+		expect(second.app.source).toBe('remembered');
+		// The MCP port moved, silently, and the replacement is remembered so the next
+		// launch is stable again.
 		expect(second.mcpPort).not.toBe(first.mcpPort);
 		expect(second.mcp.reason).toBe('port-unavailable');
-		expect(notes.join('\n')).toContain(`MCP port ${first.mcpPort} was unavailable`);
+		expect(notes).toEqual([]);
 		expect(readPortPrefs(ws)).toEqual({ appPort: first.appPort, mcpPort: second.mcpPort });
-		// Converged: the replacement is free, so a third launch keeps it silently.
-		const third = await launch();
-		expect(third.mcpPort).toBe(second.mcpPort);
-		expect(third.mcp.source).toBe('remembered');
+	});
+
+	it('still announces an APP port move, and a genuine MCP conflict', async () => {
+		// Silence is scoped to the one routine case. The app port is the address the
+		// user was told is stable, so ANY move of it speaks; and an MCP port a LIVE
+		// REGISTERED instance holds is a fact `claimedBy` positively established, not
+		// the everyday self-restart, so that speaks too.
+		const first = await launch();
+		const notes: string[] = [];
+		const second = await launch({
+			canBind: async (port: number) => port !== first.appPort,
+			instances: [{ launcherPid: 999, mcpPort: first.mcpPort }],
+			isAlive: () => true,
+			log: (m: string) => notes.push(m)
+		});
+
+		expect(second.appPort).not.toBe(first.appPort);
+		expect(second.mcp.reason).toBe('held-by-live-instance');
+		const said = notes.join('\n');
+		expect(said).toContain(`app port ${first.appPort} was unavailable`);
+		expect(said).toContain(MOVE_CAUSE['port-unavailable']);
+		expect(said).toContain(`MCP port ${first.mcpPort} was unavailable`);
+		expect(said).toContain(MOVE_CAUSE['held-by-live-instance']);
 	});
 
 	it('blames THIS launch, not a live instance, when it already took the port itself', async () => {

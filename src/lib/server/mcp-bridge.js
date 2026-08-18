@@ -391,6 +391,12 @@ export async function runMcpBridge({
 	let closing = false;
 	let attachedPort = rt.mcpPort;
 	/**
+	 * The pid of the instance we are attached to, when it recorded one. The PORT
+	 * alone stopped identifying an instance once a folder started reclaiming its
+	 * remembered address across a restart - see `instanceGone`.
+	 */
+	let attachedPid = rt.pid;
+	/**
 	 * Handshake messages the BRIDGE sent, keyed by the synthetic id it gave them (a
 	 * string, which JSON-RPC allows, so it can never be mistaken for one of the
 	 * agent's). The value is who the reply belongs to: `null` for a re-handshake
@@ -493,6 +499,7 @@ export async function runMcpBridge({
 		await t.start();
 		upstream = t;
 		attachedPort = cur.mcpPort;
+		attachedPid = cur.pid;
 		// Re-run the handshake so the new server mints a session for us (the
 		// transport picks its `Mcp-Session-Id` up off the initialize response, which
 		// is what every later message then carries). Only ever needed on a
@@ -585,16 +592,31 @@ export async function runMcpBridge({
 	 * Is the instance we are attached to really gone?
 	 *
 	 * Asked only about an ambiguous `connection` failure, to keep a transient blip
-	 * from tearing down a session with long runs streaming on it. Two independent
-	 * signals, either of which settles it: runtime.json now names a DIFFERENT mcp
-	 * port (a replacement registered itself), or the instance it names does not
-	 * answer. Unverifiable reads as gone - the caller then re-attaches, which
-	 * simply refuses if nothing is serving.
+	 * from tearing down a session with long runs streaming on it. Three independent
+	 * signals, any of which settles it: runtime.json now names a DIFFERENT mcp
+	 * PORT, or a different PID, or the instance it names does not answer.
+	 * Unverifiable reads as gone - the caller then re-attaches, which simply
+	 * refuses if nothing is serving.
+	 *
+	 * THE PID IS LOAD-BEARING, and the port alone is no longer sufficient. It used
+	 * to be: an address was ephemeral per run, so a restart essentially always
+	 * moved the mcp port and the port comparison caught every replacement. A folder
+	 * that REMEMBERS its ports (see ports.js) breaks that premise - the same port
+	 * coming back is now the EXPECTED shape of a restart, so the comparison passed,
+	 * the liveness probe was answered by the REPLACEMENT, and a genuinely replaced
+	 * instance read as present. The cost was precise: a request failing
+	 * ambiguously on a stale keep-alive socket declined its resend AND skipped the
+	 * heal, so a long run already in flight - whose reply provably could no longer
+	 * arrive - hung until the host's timeout, which is the very symptom this bridge
+	 * exists to remove. A different pid is POSITIVE evidence of replacement, so
+	 * this strengthens the evidence rule rather than loosening it; an instance that
+	 * records no pid falls back to the port-and-liveness signals unchanged.
 	 */
 	const instanceGone = async () => {
 		try {
 			const cur = readRuntimeFn(workspace);
 			if (!cur || cur.mcpPort !== attachedPort) return true;
+			if (attachedPid != null && cur.pid != null && cur.pid !== attachedPid) return true;
 			return !(await isAliveFn(cur));
 		} catch (err) {
 			log(`could not confirm the instance (${err?.message ?? err}); treating it as gone`);

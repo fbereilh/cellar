@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import http, { type Server } from 'node:http';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -251,6 +252,7 @@ function fakeStdio() {
  */
 function startFlakyProxy(targetPort: number) {
 	let dropPosts = 0;
+	let target = targetPort;
 	const sockets = new Set<import('node:net').Socket>();
 	let server: Server;
 	const listening = new Promise<number>((resolve) => {
@@ -261,7 +263,7 @@ function startFlakyProxy(targetPort: number) {
 				return;
 			}
 			const up = http.request(
-				{ host: '127.0.0.1', port: targetPort, path: req.url, method: req.method, headers: req.headers },
+				{ host: '127.0.0.1', port: target, path: req.url, method: req.method, headers: req.headers },
 				(upRes) => {
 					res.writeHead(upRes.statusCode ?? 502, upRes.headers);
 					// Node holds the headers back until the first body write, so a proxied
@@ -289,6 +291,14 @@ function startFlakyProxy(targetPort: number) {
 		/** Drop the next `n` POSTs. GETs pass through, so the liveness probe still answers. */
 		dropNext: (n = 1) => {
 			dropPosts = n;
+		},
+		/**
+		 * Point at a different instance while keeping this address. That is what a
+		 * folder reclaiming its remembered MCP port looks like to the bridge: the
+		 * SAME port, a DIFFERENT instance behind it.
+		 */
+		retarget: (port: number) => {
+			target = port;
 		},
 		close: () =>
 			new Promise<void>((r) => {
@@ -733,6 +743,59 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		expect(reply.error).toBeUndefined();
 		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
 		expect(second.sessionCount()).toBe(1);
+	});
+
+	it('sees a replacement that reclaimed the SAME port, because the pid changed', async () => {
+		// A folder that REMEMBERS its ports makes "same mcp port" the expected shape
+		// of a restart, not evidence of continuity - so identifying the attached
+		// instance by its address alone stopped working. The port matched and the
+		// REPLACEMENT answered the liveness probe, so a genuinely replaced instance
+		// read as present: the failing request was answered honestly but the session
+		// was never healed, and a long run already in flight hung until the host's
+		// timeout - the very symptom this bridge exists to remove.
+		const first = await bootCellar();
+		const proxy = startFlakyProxy(first.port);
+		const proxyPort = await proxy.listening;
+		running.push(proxy);
+		// The bridge's address for the whole test is the proxy's, so it never changes.
+		writeRuntime(ws, { mcpPort: proxyPort, appPort: proxyPort + 1, jupyterPort: proxyPort + 2, pid: process.pid });
+
+		const { stdio, inFlight } = await startBridge();
+		await stdio.request(INIT);
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+		// A long call is established on the session that is about to die.
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => first.heldCount() === 1 && inFlight.has(2));
+
+		// The instance is replaced behind the SAME address, and it records a DIFFERENT
+		// pid - one that is genuinely alive, so the liveness probe cannot be what
+		// gives the replacement away.
+		const alive = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], { stdio: 'ignore' });
+		running.push({ close: async () => void alive.kill() });
+		await killCellar(first, { clear: false });
+		const second = await bootCellar();
+		proxy.retarget(second.port);
+		writeRuntime(ws, { mcpPort: proxyPort, appPort: proxyPort + 1, jupyterPort: proxyPort + 2, pid: alive.pid });
+
+		// The next POST is reset under us - AMBIGUOUS, so it may not be replayed.
+		proxy.dropNext();
+		const reply = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/call' }, 8000);
+		const ambiguous = reply.error as { code: number; message: string };
+		expect(ambiguous).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(ambiguous.message).toMatch(/may or may not have been applied/i);
+
+		// The SESSION question was still answered correctly, so the bridge re-attached
+		// and its sweep answered the long call instead of leaving it to hang.
+		const lost = (await stdio.awaitReply(2, 8000)).error as { code: number; message: string };
+		expect(lost).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(lost.message).toMatch(/may or may not have been applied/i);
+		expect(second.sessionCount()).toBe(1);
+
+		// ...and the healed session really works, on the very same address.
+		expect(await stdio.request({ jsonrpc: '2.0', id: 4, method: 'tools/list' }, 8000)).toMatchObject({
+			result: { echoed: 'tools/list' }
+		});
 	});
 
 	it('never re-attaches on a SECOND blip while the instance is provably alive on our port', async () => {

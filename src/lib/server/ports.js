@@ -202,46 +202,43 @@ export function portsHeldByLiveInstances(entries, { isAlive, excludePid } = {}) 
 /**
  * How long to keep re-probing a remembered port that is momentarily busy.
  *
- * PER ROLE, because the measurement is per role and one number sized for the app
- * silently governed the MCP port too. The launcher SIGTERMs its children and
- * exits immediately (`shutdown()` in `bin/cellar.js`), so a Ctrl-C followed
- * straight away by `cellar` races the previous run letting go - and measured
+ * Deliberately SHORT, and the measurement is why. The launcher SIGTERMs its
+ * children and exits immediately (`shutdown()` in `bin/cellar.js`), so a Ctrl-C
+ * followed straight away by `cellar` races the previous run letting go. Measured
  * against a real instance, twice, the two ports behave completely differently:
  *
  *   - the APP port is free at ~0ms - adapter-node handles SIGTERM by closing its
  *     own http server promptly, so the address the user actually cares about
- *     (the URL in their browser) needs no waiting at all, and 500ms is pure
- *     scheduling-jitter margin; and
+ *     (the URL in their browser, the bookmark, the open tab) needs no waiting at
+ *     all and stays stable for free; and
  *   - the MCP port stays held for ~5-7s, because nothing closes the in-process
- *     MCP http server and it carries `timeout = 0`, so that port is released
- *     only when the app process finally exits. On the Ctrl-C path that exit is
- *     the ORPHAN self-exit in `parent-watch.ts` (`CONFIRM_STRIKES` consecutive
- *     dead readings at `CHECK_MS`), which nothing in the new launch can hurry
- *     along: the previous launcher already unregistered itself and cleared
- *     `runtime.json`, so the take-over sweep finds nothing to await.
+ *     MCP http server and it carries `timeout = 0`, so it is released only when
+ *     the app process finally exits - which on the Ctrl-C path is the ORPHAN
+ *     self-exit in `parent-watch.ts` (`CONFIRM_STRIKES` consecutive dead
+ *     readings at `CHECK_MS`), something the new launch cannot hurry along: the
+ *     previous launcher already unregistered itself and cleared `runtime.json`,
+ *     so the take-over sweep finds nothing to await.
  *
- * Applying the app's 500ms to both meant the MCP role moved on essentially every
- * quick restart, told the user its stable address had gone with the cause read
- * as "another process is using it" (the holder being Cellar's own dying app),
- * and never converged - the port it remembered instead was busy again next time.
- * So the MCP role gets a window sized to its own hold.
+ * So this window covers scheduling jitter around the FIRST case, and explicitly
+ * does NOT try to wait out the second. **Do not "fix" that by raising it.**
+ * Stalling every restart by seven-odd seconds to preserve the MCP port would be
+ * a bad trade: that port appears in no config (see runtime.js) and `cellar mcp`
+ * now re-attaches by itself across a restart (see mcp-bridge.js), so its address
+ * is genuinely disposable - whereas launch latency on the everyday
+ * stop-and-start gesture is not. Deliberate non-goal, recorded here because it
+ * has been proposed and rejected twice.
  *
- * This is NOT a fixed sleep and must not become one: the loop re-probes every
- * `PORT_RETRY_MS` and returns the instant the port binds, so the port becoming
- * free IS the detection of the old process exiting. It is paid only when the
- * remembered port is actually busy - a free port answers on the first probe -
- * and at most once per role, because a port genuinely held by something else
- * falls back to a fresh one which is then remembered instead. A port held by a
- * live REGISTERED instance never reaches here at all: that is a settled answer,
- * not a transient one.
+ * The consequence is that the MCP role usually MOVES on a quick restart, which
+ * is why that move is not announced - see the notice rule in
+ * `resolveWorkspacePorts`.
  *
- * The residual is stated rather than hidden: a previous app that outlives the
- * window (parent-watch can need up to `CONFIRM_STRIKES * CHECK_MS`) still moves
- * the port. That is the safe direction and it converges - the replacement is
- * remembered and is free on the next launch.
+ * Bounded, and paid only when the remembered port is actually busy: a free port
+ * answers on the first probe, and a port genuinely held by something else costs
+ * this once, because the fresh port we fall back to is then remembered instead.
+ * A port held by a live REGISTERED instance never reaches here at all - that is
+ * a settled answer, not a transient one.
  */
 export const PORT_RELEASE_GRACE_MS = 500;
-export const MCP_PORT_RELEASE_GRACE_MS = 8000;
 const PORT_RETRY_MS = 50;
 
 /**
@@ -359,7 +356,6 @@ export function bindHosts(env = process.env, { dev = false } = {}) {
  *   claimedBy?: (port: number) => PortClaim | null | undefined,
  *   freePort: () => Promise<number> | number,
  *   bindGraceMs?: number,
- *   onWaiting?: (port: number, graceMs: number) => void,
  *   sleep?: (ms: number) => Promise<void>
  * }} opts
  * @returns {Promise<PortChoice>}
@@ -373,7 +369,6 @@ export async function choosePort({
 	claimedBy = () => null,
 	freePort,
 	bindGraceMs = PORT_RELEASE_GRACE_MS,
-	onWaiting = () => {},
 	sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 }) {
 	// An explicit pin is an instruction, not a preference: honour it verbatim and
@@ -429,16 +424,9 @@ export async function choosePort({
 	// already free, and returns the instant it binds rather than sleeping out the
 	// window - the port coming back IS the old process exiting.
 	const deadline = Date.now() + Math.max(0, bindGraceMs);
-	let announced = false;
 	for (;;) {
 		if (await canBind(remembered, host)) return { port: remembered, source: 'remembered' };
 		if (Date.now() >= deadline) return fresh('port-unavailable');
-		// Only once, and only when we are really about to wait: an unexplained
-		// multi-second pause on the everyday restart is its own kind of alarming.
-		if (!announced) {
-			announced = true;
-			onWaiting(remembered, bindGraceMs);
-		}
 		await sleep(PORT_RETRY_MS);
 	}
 }
@@ -470,7 +458,6 @@ export async function choosePort({
  *   excludePid?: number,
  *   canBind?: (port: number, host: string) => Promise<boolean> | boolean,
  *   bindGraceMs?: number,
- *   mcpBindGraceMs?: number,
  *   log?: (msg: string) => void
  * }} opts
  * @returns {Promise<{ appPort: number, mcpPort: number, jupyterPort: number, app: PortChoice, mcp: PortChoice, jupyter: PortChoice }>}
@@ -486,7 +473,6 @@ export async function resolveWorkspacePorts({
 	excludePid,
 	canBind = canBindPort,
 	bindGraceMs = PORT_RELEASE_GRACE_MS,
-	mcpBindGraceMs = MCP_PORT_RELEASE_GRACE_MS,
 	log = () => {}
 }) {
 	const prefs = sticky ? readPortPrefs(workspace) : {};
@@ -509,19 +495,14 @@ export async function resolveWorkspacePorts({
 	/** @param {number} p @returns {PortClaim | null} */
 	const claimedBy = (p) =>
 		heldByInstances.has(p) ? 'held-by-live-instance' : takenHere.has(p) ? 'taken-by-this-launch' : null;
-	/** @param {string} label @param {string} pinnedEnv @param {Partial<Parameters<typeof choosePort>[0]>} opts */
-	const take = async (label, pinnedEnv, opts) => {
+	/** @param {string} pinnedEnv @param {Partial<Parameters<typeof choosePort>[0]>} opts */
+	const take = async (pinnedEnv, opts) => {
 		const r = await choosePort({
 			pinned: env[pinnedEnv],
 			claimedBy,
 			canBind,
 			freePort,
 			bindGraceMs,
-			onWaiting: (port, ms) =>
-				log(
-					`[cellar] ${label} port ${port} is still held by the previous instance; ` +
-						`waiting up to ${Math.round(ms / 1000)}s for it so the address stays stable.`
-				),
 			...opts
 		});
 		takenHere.add(r.port);
@@ -536,20 +517,17 @@ export async function resolveWorkspacePorts({
 	// losing the stable address this whole file exists to keep. Last, it simply
 	// skips whatever the sticky roles took, which its own `fresh()` already does.
 	const hosts = bindHosts(env, { dev });
-	const app = await take('app', 'CELLAR_APP_PORT', {
+	const app = await take('CELLAR_APP_PORT', {
 		sticky,
 		remembered: prefs.appPort,
 		host: hosts.app
 	});
-	// The MCP role gets its OWN window: nothing closes the in-process MCP http
-	// server, so this is the port a Ctrl-C restart really races (see the constants).
-	const mcp = await take('MCP', 'CELLAR_MCP_PORT', {
+	const mcp = await take('CELLAR_MCP_PORT', {
 		sticky,
 		remembered: prefs.mcpPort,
-		host: hosts.mcp,
-		bindGraceMs: mcpBindGraceMs
+		host: hosts.mcp
 	});
-	const jupyter = await take('Jupyter', 'CELLAR_JUPYTER_PORT', {
+	const jupyter = await take('CELLAR_JUPYTER_PORT', {
 		sticky: false,
 		host: hosts.jupyter
 	});
@@ -557,13 +535,24 @@ export async function resolveWorkspacePorts({
 	if (sticky) {
 		// Say so when a port the user was told is stable had to move, and why - a
 		// silently different address is the confusion this feature exists to remove.
-		/** @type {[string, PortChoice, number | undefined][]} */
+		//
+		// EXCEPT the MCP role's ROUTINE move, which is neither unexpected nor worth
+		// a line. `PORT_RELEASE_GRACE_MS` deliberately does not wait out that port,
+		// so a Ctrl-C-then-relaunch reliably finds it still held by our own dying app
+		// and moves - and the address appears in no config and self-heals through the
+		// `cellar mcp` bridge, so nothing downstream even notices. Announcing it made
+		// the everyday restart print an alarming "was unavailable (another process is
+		// using it)" naming a conflict the user has no reason to care about and a
+		// holder the probe never identified. A genuine surprise still speaks: a LIVE
+		// registered instance holding it, or this launch having already taken it for
+		// another role, are both facts `claimedBy` positively established.
+		/** @type {[string, PortChoice, number | undefined, boolean][]} */
 		const moved = [
-			['app', app, prefs.appPort],
-			['MCP', mcp, prefs.mcpPort]
+			['app', app, prefs.appPort, true],
+			['MCP', mcp, prefs.mcpPort, mcp.reason !== 'port-unavailable']
 		];
-		for (const [label, r, want] of moved) {
-			if (r.source === 'fresh' && want != null)
+		for (const [label, r, want, notable] of moved) {
+			if (r.source === 'fresh' && want != null && notable)
 				log(
 					`[cellar] ${label} port ${want} was unavailable (${MOVE_CAUSE[r.reason] ?? r.reason}); ` +
 						`using ${r.port} and remembering it.`
