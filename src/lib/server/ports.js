@@ -70,10 +70,29 @@ export const REMEMBERED_PORTS = /** @type {const} */ (['appPort', 'mcpPort']);
 /**
  * @typedef {{ appPort?: number, mcpPort?: number }} PortPrefs
  * @typedef {'pinned' | 'remembered' | 'fresh'} PortSource
- * @typedef {'not-sticky' | 'no-preference' | 'held-by-live-instance' | 'port-unavailable'} FreshReason
+ * @typedef {'not-sticky' | 'no-preference' | 'held-by-live-instance' | 'taken-by-this-launch' | 'port-unavailable'} FreshReason
+ * @typedef {'held-by-live-instance' | 'taken-by-this-launch'} PortClaim
  * @typedef {{ port: number, source: PortSource, reason?: FreshReason }} PortChoice
  * @typedef {{ launcherPid?: number, appPid?: number, appPort?: number, mcpPort?: number, jupyterPort?: number }} InstanceEntry
  */
+
+/**
+ * Why a port the user was told is stable had to move, in words rather than in
+ * this file's vocabulary. Keyed by `FreshReason` so a new reason cannot be
+ * announced without deciding what it SAYS: the announcement is the honesty
+ * contract of the whole feature, and naming a live instance for a port this very
+ * launch had already taken for another role reports a conflict that does not
+ * exist.
+ *
+ * @type {Record<FreshReason, string>}
+ */
+export const MOVE_CAUSE = {
+	'held-by-live-instance': 'another running Cellar instance is using it',
+	'taken-by-this-launch': 'this launch had already taken it for another port',
+	'port-unavailable': 'another process is using it',
+	'no-preference': 'it is no longer a usable preference',
+	'not-sticky': 'this launch is isolated'
+};
 
 /** Absolute path of the durable per-workspace port preference file. */
 export function portPrefsPath(workspace) {
@@ -278,9 +297,13 @@ export function bindHosts(env = process.env) {
  * without booting a server:
  *   - `canBind(port, host)` - can we actually listen on it right now, asked
  *                             about the host this role's server really binds
- *   - `isUnavailable(port)` - cheap synchronous "someone else has claimed this"
- *                             (a live registered instance, or a port this very
- *                             launch already took for another role)
+ *   - `claimedBy(port)`     - cheap synchronous "who has already claimed this",
+ *                             answering `'held-by-live-instance'`,
+ *                             `'taken-by-this-launch'` or null. It returns the
+ *                             CLAIMANT rather than a boolean because the two are
+ *                             announced to the user, and a launch that had merely
+ *                             taken the port for another of its own roles must
+ *                             not be reported as a live instance holding it.
  *   - `freePort()`          - the ephemeral fallback
  *
  * Returns `{ port, source, reason }`. `source` is 'pinned' | 'remembered' |
@@ -295,7 +318,7 @@ export function bindHosts(env = process.env) {
  *   sticky?: boolean,
  *   host?: string,
  *   canBind?: (port: number, host: string) => Promise<boolean> | boolean,
- *   isUnavailable?: (port: number) => boolean,
+ *   claimedBy?: (port: number) => PortClaim | null | undefined,
  *   freePort: () => Promise<number> | number,
  *   bindGraceMs?: number,
  *   sleep?: (ms: number) => Promise<void>
@@ -308,7 +331,7 @@ export async function choosePort({
 	sticky = true,
 	host = '127.0.0.1',
 	canBind = canBindPort,
-	isUnavailable = () => false,
+	claimedBy = () => null,
 	freePort,
 	bindGraceMs = PORT_RELEASE_GRACE_MS,
 	sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -327,16 +350,26 @@ export async function choosePort({
 		// Guard the fallback against a port this launch has already claimed for
 		// another role: `freePort()` probes and releases, so two calls could in
 		// principle agree, and a hand-edited preference could name one port twice.
+		//
+		// Then probe it on THIS ROLE's own bind host, for exactly the reason the
+		// remembered path does (see `canBindPort`): the launcher's `freePort()` asks
+		// the kernel for a free `127.0.0.1` port, while adapter-node binds the
+		// wildcard - and on macOS a loopback bind succeeds against a wildcard holder,
+		// so a kernel-assigned port can still be one the app's own `listen()` cannot
+		// take. One probe per candidate, no grace loop: an ephemeral port that is
+		// already busy is a coincidence to step over, not a previous run letting go.
 		for (let i = 0; i < FRESH_PORT_ATTEMPTS; i++) {
 			const port = await freePort();
-			if (!isUnavailable(port)) return { port, source: 'fresh', reason };
+			if (claimedBy(port)) continue;
+			if (!(await canBind(port, host))) continue;
+			return { port, source: 'fresh', reason };
 		}
 		// Never hand back a port we KNOW is taken - that is the one outcome this
 		// loop exists to prevent, and it would surface much later as two roles
 		// racing for one address. Refusing to launch is the honest failure.
 		throw new Error(
 			`could not find a free port after ${FRESH_PORT_ATTEMPTS} attempts - every port offered is already ` +
-				'claimed by a live instance or by another role of this launch.'
+				`claimed by a live instance, by another role of this launch, or unbindable on ${host}.`
 		);
 	};
 
@@ -346,8 +379,11 @@ export async function choosePort({
 	// and a remembered port is precisely a port another instance is likely to hold.
 	if (!sticky) return fresh('not-sticky');
 	if (!isRememberablePort(remembered)) return fresh('no-preference');
-	// Yield to a live instance rather than race it. Never reclaim.
-	if (isUnavailable(remembered)) return fresh('held-by-live-instance');
+	// Yield to whoever already has it rather than race them. Never reclaim - and
+	// report WHICH of the two claimants it was, because they are different facts
+	// with different messages (see MOVE_CAUSE).
+	const claim = claimedBy(remembered);
+	if (claim) return fresh(claim);
 	// Re-probe briefly: the previous run may still be letting go (see
 	// PORT_RELEASE_GRACE_MS). Costs nothing when the port is already free.
 	const deadline = Date.now() + Math.max(0, bindGraceMs);
@@ -402,7 +438,6 @@ export async function resolveWorkspacePorts({
 }) {
 	const prefs = sticky ? readPortPrefs(workspace) : {};
 	// Ports a live registered instance holds. Never reclaimed - we always yield.
-	// Doubles as this launch's own claim set, so two roles can never agree.
 	//
 	// Consulted on the ISOLATED path too, which does not weaken its guarantee:
 	// what an isolated launch must never touch is the PREFERENCE (read above,
@@ -410,20 +445,28 @@ export async function resolveWorkspacePorts({
 	// registry lookup. It only makes a collision less likely - which matters
 	// because a bind probe races (and, on macOS, a loopback probe cannot even see
 	// a wildcard holder), while the registry answers before anything is serving.
-	const claimed = portsHeldByLiveInstances(instances, { isAlive, excludePid });
-	/** @param {number} p */
-	const isUnavailable = (p) => claimed.has(p);
+	const heldByInstances = portsHeldByLiveInstances(instances, { isAlive, excludePid });
+	// Ports THIS launch has already handed to one of its own roles. Kept apart
+	// from the set above rather than folded into it: both make a port unusable,
+	// but only one of them is a live instance, and the move is ANNOUNCED - a
+	// merged set told the user "another running Cellar instance is using it" about
+	// a conflict with this very launch, naming an instance that does not exist.
+	/** @type {Set<number>} */
+	const takenHere = new Set();
+	/** @param {number} p @returns {PortClaim | null} */
+	const claimedBy = (p) =>
+		heldByInstances.has(p) ? 'held-by-live-instance' : takenHere.has(p) ? 'taken-by-this-launch' : null;
 	/** @param {string} pinnedEnv @param {Partial<Parameters<typeof choosePort>[0]>} opts */
 	const take = async (pinnedEnv, opts) => {
 		const r = await choosePort({
 			pinned: env[pinnedEnv],
-			isUnavailable,
+			claimedBy,
 			canBind,
 			freePort,
 			bindGraceMs,
 			...opts
 		});
-		claimed.add(r.port);
+		takenHere.add(r.port);
 		return r;
 	};
 
@@ -431,10 +474,9 @@ export async function resolveWorkspacePorts({
 	// Jupyter is deliberately never sticky (see the module header), so it takes a
 	// kernel-assigned ephemeral port and claims it - and an ephemeral port can land
 	// on the very port this folder remembers. Resolved first, that pushed the
-	// sticky role off its remembered address, reported it as `held-by-live-instance`
-	// (which nothing does), and then PERSISTED the replacement, losing the stable
-	// address this whole file exists to keep. Last, it simply skips whatever the
-	// sticky roles took, which its own `fresh()` already does.
+	// sticky role off its remembered address and then PERSISTED the replacement,
+	// losing the stable address this whole file exists to keep. Last, it simply
+	// skips whatever the sticky roles took, which its own `fresh()` already does.
 	const hosts = bindHosts(env);
 	const app = await take('CELLAR_APP_PORT', {
 		sticky,
@@ -462,7 +504,8 @@ export async function resolveWorkspacePorts({
 		for (const [label, r, want] of moved) {
 			if (r.source === 'fresh' && want != null)
 				log(
-					`[cellar] ${label} port ${want} was unavailable (${r.reason}); using ${r.port} and remembering it.`
+					`[cellar] ${label} port ${want} was unavailable (${MOVE_CAUSE[r.reason] ?? r.reason}); ` +
+						`using ${r.port} and remembering it.`
 				);
 		}
 		// Remember only what we CHOSE. A pinned port is not a preference -

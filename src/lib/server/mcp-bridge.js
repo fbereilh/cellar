@@ -71,6 +71,31 @@
  *     bad params). Relayed as an error for that request alone: no detach, no
  *     re-handshake, and above all no disturbing the other in-flight requests.
  *
+ * ## Re-SENDING is a second, narrower question, and its answer is ASYMMETRIC
+ *
+ * Whether to re-attach asks about the SESSION. Whether to put the failed message
+ * on the wire AGAIN asks about that MESSAGE, and the two must not be conflated,
+ * because a resend is a duplicate DELIVERY and Cellar's write tools are not
+ * idempotent: `add_cells` / `delete_cells` / `edit_cell` applied twice corrupt
+ * the user's notebook, which is their primary data. So `provesNotDelivered`
+ * gates every resend path, and a REQUEST is resent only where the failure PROVES
+ * nothing ran - a server that ANSWERED with a session refusal (it rejected the
+ * message before dispatching it) or a connection that was never ESTABLISHED
+ * (ECONNREFUSED and friends: nothing was written). Those two are exactly the two
+ * shapes a restart takes - same port, and moved port - so the headline "restart
+ * Cellar and the agent's next call just works" flow is untouched.
+ *
+ * A socket that opened and then broke (`ECONNRESET`, `socket hang up`, a bare
+ * `fetch failed`, an abort from our own `detach()`) cannot distinguish "never
+ * arrived" from "arrived, ran, and the reply died with the socket". A REQUEST is
+ * therefore NOT replayed there: it is failed with a message saying the call may
+ * or may not have been applied, because a visible failure beats a silent
+ * duplicate mutation and only the agent can decide what to do about it. A
+ * NOTIFICATION carries no id and earns no response, so a duplicate delivery of
+ * one is invisible - it keeps the full recovery, which is what makes the
+ * asymmetry free (the handshake's `notifications/initialized` still survives a
+ * blip).
+ *
  * Other pending requests are failed ONLY after a genuine re-attach, when their
  * answers provably can never arrive, and exactly ONCE per re-attach (in the
  * single-flight continuation, not per caller - per caller, two concurrent
@@ -128,6 +153,23 @@ const CONNECTION_ERROR_CODES = new Set([
 	'UND_ERR_SOCKET',
 	'UND_ERR_CONNECT_TIMEOUT'
 ]);
+/**
+ * The strict subset of those that mean the connection was never ESTABLISHED -
+ * we never reached a server at all, so nothing of ours can have run. The rest
+ * (`ECONNRESET`, `EPIPE`, `ETIMEDOUT`, `UND_ERR_SOCKET`) are failures of a
+ * connection that DID open, and say nothing about whether the request on it was
+ * processed before it broke.
+ */
+const CONNECT_FAILED_CODES = new Set([
+	'ECONNREFUSED',
+	'ENOTFOUND',
+	'EHOSTUNREACH',
+	'ENETUNREACH',
+	'EAI_AGAIN',
+	'UND_ERR_CONNECT_TIMEOUT'
+]);
+/** The same thing said in prose, for a transport that carries no code. */
+const CONNECT_FAILED_MESSAGE = /connection refused|econnrefused|enotfound|ehostunreach|enetunreach|getaddrinfo/i;
 /**
  * The same thing said in prose, for a transport that carries no code. `aborted`
  * belongs here rather than with the rejections: an aborted request never got a
@@ -191,6 +233,52 @@ export function classifyUpstreamFailure(err) {
 	if (CONNECTION_MESSAGE.test(text)) return 'connection';
 	return 'other';
 }
+
+/**
+ * Does this failure PROVE the message never reached the server's dispatcher?
+ *
+ * A DIFFERENT question from `classifyUpstreamFailure`, which answers "what does
+ * this say about the SESSION" and so decides whether to re-attach. This one
+ * decides whether the message may be put on the wire a SECOND time, and the two
+ * must not be conflated: a resend is a duplicate DELIVERY, and Cellar's write
+ * tools are not idempotent - `add_cells` / `delete_cells` / `edit_cell` applied
+ * twice corrupt the user's notebook, which is their primary data.
+ *
+ * Exactly two failures prove non-delivery:
+ *   - a server ANSWERED with a session refusal (`-32000 No valid session`, or a
+ *     404 to a request carrying a session id). It rejected the message before
+ *     dispatching it, so nothing ran - and this is the dominant restart case,
+ *     which is why the headline "the agent's next call just works" flow survives.
+ *   - the connection was never ESTABLISHED (ECONNREFUSED and friends). Nothing
+ *     was written, so nothing can have been executed - which covers the other
+ *     restart shape, where the replacement instance came up on a different port
+ *     and the old address simply refuses.
+ *
+ * Everything else is AMBIGUOUS: a socket that opened and then broke
+ * (`ECONNRESET`, `socket hang up`, `premature close`, a bare `fetch failed`, or
+ * an abort from our own `detach()`) cannot distinguish "never arrived" from
+ * "arrived, was executed, and the reply was lost with the socket".
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function provesNotDelivered(err) {
+	if (classifyUpstreamFailure(err) === 'session-gone') return true;
+	for (const e of errorChain(err)) {
+		if (typeof e?.code === 'string' && CONNECT_FAILED_CODES.has(e.code)) return true;
+	}
+	return CONNECT_FAILED_MESSAGE.test(String(err?.message ?? err ?? ''));
+}
+
+/**
+ * What a request is told when its send failed AMBIGUOUSLY. It deliberately does
+ * not claim the call did not happen: the honest answer is that we cannot tell,
+ * and this codebase's rule is that a visible failure beats a silent duplicate.
+ */
+export const AMBIGUOUS_SEND_MESSAGE =
+	'The connection to Cellar broke while this request was in flight, so it may or may not have been ' +
+	'applied. It was deliberately NOT re-sent, because re-sending a write would risk applying it twice. ' +
+	'Check the notebook state before calling again.';
 
 /**
  * Run the bridge for `workspace`. The returned promise stays pending for the
@@ -330,10 +418,14 @@ export async function runMcpBridge({
 					// it would hand the agent a second `initialize` result for a handshake
 					// it finished long ago, under an id it is no longer waiting on.
 					if (forAgent == null) return;
-					// This replay stood in for the agent's OWN initialize, which is still
-					// unanswered: give it the result under the id it is waiting on.
+					// This replay stood in for the agent's OWN initialize: give it the
+					// result under the id it is waiting on - but only while that id really
+					// is still unanswered. Membership of `pending` IS that record, so the
+					// delete's own verdict is the guard, exactly as in `failRequest`:
+					// JSON-RPC allows ONE response per id, and a second re-attach can
+					// replay a handshake whose id something else has since answered.
 					handedOff.delete(forAgent);
-					pending.delete(forAgent);
+					if (!pending.delete(forAgent)) return;
 					sendDown({ ...msg, id: forAgent });
 					return;
 				}
@@ -411,8 +503,14 @@ export async function runMcpBridge({
 					// concurrent failures each failed the OTHER's request and then
 					// retried it, giving one id both an error and a result. A relay
 					// still running answers its own id, so it is exempt.
+					// `handedOff` is exempt for the same reason `relaying` is: the attach
+					// that just succeeded replayed the agent's own `initialize` under a
+					// synthetic id, so its answer is ALREADY on the wire and comes back
+					// under the agent's id. Sweeping it gave that id an error AND, moments
+					// later, the replay's result - and it failed the very handshake this
+					// recovery exists to complete.
 					for (const id of [...pending]) {
-						if (relaying.has(id)) continue;
+						if (relaying.has(id) || handedOff.has(id)) continue;
 						failRequest(
 							id,
 							'Cellar restarted while this request was in flight; it was not completed. Call again.'
@@ -503,6 +601,33 @@ export async function runMcpBridge({
 						return;
 					}
 					log(`upstream send failed (${err?.message ?? err})`);
+					// THE RESEND GATE, and it is deliberately ASYMMETRIC between a request
+					// and a notification - both go through here, and this is the ONE place
+					// any of the three resend paths below can be reached from.
+					//
+					// A REQUEST may only be put on the wire again when the failure PROVES
+					// it never reached the server's dispatcher (see `provesNotDelivered`),
+					// because Cellar's write tools are NOT idempotent: `add_cells` /
+					// `delete_cells` / `edit_cell` applied twice corrupt the user's
+					// notebook, which is their primary data. An ambiguous socket failure
+					// cannot tell "never arrived" from "arrived, ran, and the reply died
+					// with the socket", so it is reported honestly rather than replayed -
+					// a visible failure beats a silent duplicate mutation, and the agent
+					// can check state and decide for itself.
+					//
+					// A NOTIFICATION carries no id and earns no response, so a duplicate
+					// delivery of one is invisible; it keeps the full recovery. That is why
+					// the asymmetry costs the bridge nothing structurally: the handshake's
+					// `notifications/initialized` still survives a blip.
+					//
+					// This does NOT weaken the headline flow. A restart is answered either
+					// by a session refusal (same port) or by a refused connection (new
+					// port), and both PROVE non-delivery - so "restart Cellar, the agent's
+					// next call just works" is untouched.
+					if (isReq && !provesNotDelivered(err)) {
+						failRequest(msg.id, AMBIGUOUS_SEND_MESSAGE);
+						return;
+					}
 				}
 				// A concurrent relay re-attached while we were failing: its session is
 				// ours too. Take it rather than minting a second one, which would close

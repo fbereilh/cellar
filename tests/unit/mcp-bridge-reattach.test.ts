@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { runMcpBridge, NO_INSTANCE_ERROR_CODE } from '../../src/lib/server/mcp-bridge.js';
+import { runMcpBridge, NO_INSTANCE_ERROR_CODE, provesNotDelivered } from '../../src/lib/server/mcp-bridge.js';
 import { writeRuntime, clearRuntime } from '../../src/lib/server/runtime.js';
 
 /**
@@ -44,11 +44,27 @@ const SLOW = 'tools/call/slow';
  */
 function startFakeCellar(
 	port = 0,
-	{ failStatus = {}, failBody = {} }: { failStatus?: Record<string, number>; failBody?: Record<string, string> } = {}
+	{
+		failStatus = {},
+		failBody = {},
+		holdInitialize = false
+	}: {
+		failStatus?: Record<string, number>;
+		failBody?: Record<string, string>;
+		/**
+		 * Answer `initialize` with its session header and an OPEN event stream,
+		 * flushing the RESULT only on `releaseInitialize()`. That is the same
+		 * headers-now-body-later shape `SLOW` uses, and it is the only way to hold
+		 * a handshake un-answered while the bridge's own re-attach carries on -
+		 * which is what a second re-attach then races.
+		 */
+		holdInitialize?: boolean;
+	} = {}
 ) {
 	const sessions = new Set<string>();
 	const seen: { method?: string; sessionId?: string }[] = [];
 	const held: { id: unknown; res: http.ServerResponse }[] = [];
+	const heldInit: { id: unknown; res: http.ServerResponse }[] = [];
 	const sockets = new Set<import('node:net').Socket>();
 	let server: Server;
 	const listening = new Promise<number>((resolve) => {
@@ -68,6 +84,16 @@ function startFakeCellar(
 				if (isInit) {
 					const id = randomUUID();
 					sessions.add(id);
+					if (holdInitialize) {
+						res.writeHead(200, {
+							'content-type': 'text/event-stream',
+							'cache-control': 'no-cache',
+							'mcp-session-id': id
+						});
+						res.flushHeaders();
+						heldInit.push({ id: msg.id, res });
+						return;
+					}
 					res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': id });
 					res.end(
 						JSON.stringify({
@@ -130,6 +156,19 @@ function startFakeCellar(
 		sessionCount: () => sessions.size,
 		seen,
 		heldCount: () => held.length,
+		/** Flush a handshake that was held open by `holdInitialize`. */
+		releaseInitialize: () => {
+			for (const h of heldInit.splice(0)) {
+				h.res.write(
+					`event: message\ndata: ${JSON.stringify({
+						jsonrpc: '2.0',
+						id: h.id,
+						result: { protocolVersion: '2025-06-18', capabilities: {}, serverInfo: { name: 'fake', version: '0' } }
+					})}\n\n`
+				);
+				h.res.end();
+			}
+		},
 		/** Answer every held request, the way a finished run flushes its result. */
 		release: () => {
 			for (const h of held.splice(0)) {
@@ -144,6 +183,8 @@ function startFakeCellar(
 		// server (and the test) waiting forever.
 		close: () =>
 			new Promise<void>((r) => {
+				held.length = 0;
+				heldInit.length = 0;
 				for (const s of sockets) s.destroy();
 				server.close(() => r());
 			})
@@ -313,7 +354,7 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 	/** Bring an "instance" up for `ws` and publish it the way a launch does. */
 	async function bootCellar(
 		port = 0,
-		opts?: { failStatus?: Record<string, number>; failBody?: Record<string, string> }
+		opts?: { failStatus?: Record<string, number>; failBody?: Record<string, string>; holdInitialize?: boolean }
 	) {
 		const c = startFakeCellar(port, opts);
 		const p = await c.listening;
@@ -495,22 +536,29 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		});
 	});
 
-	it('retries a dropped connection on the SAME session while the instance is still alive', async () => {
-		// A connection-level failure is ambiguous: a replaced instance looks like
-		// this, and so does a stale keep-alive socket against a healthy one. Read as
-		// a replacement it destroys the session, and with it a cell run that is
-		// minutes in - a worse failure than the one the re-attach exists to fix.
+	/** Bridge + flaky proxy in front of one instance, ready to drop a POST. */
+	async function bridgeBehindFlakyProxy() {
 		const cellar = await bootCellar();
 		const proxy = startFlakyProxy(cellar.port);
 		const proxyPort = await proxy.listening;
 		running.push(proxy);
 		// The bridge attaches through the proxy, so runtime.json names it: the
-		// instance stays registered, alive, and on the SAME port throughout.
+		// instance stays registered, alive, and on the SAME port throughout, which
+		// is what makes a dropped POST a BLIP rather than a replacement.
 		writeRuntime(ws, { mcpPort: proxyPort, appPort: proxyPort + 1, jupyterPort: proxyPort + 2, pid: process.pid });
-
 		const { stdio } = await startBridge();
 		await stdio.request(INIT);
 		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		return { cellar, proxy, stdio };
+	}
+
+	it('never re-sends a REQUEST whose connection broke ambiguously - it says so instead', async () => {
+		// A socket that OPENED and then broke cannot distinguish "never arrived"
+		// from "arrived, ran, and the reply died with the socket". Cellar's write
+		// tools are not idempotent, so re-sending one there can apply an
+		// `add_cells` / `delete_cells` twice and corrupt the user's notebook. The
+		// honest answer is a visible failure that names the uncertainty.
+		const { cellar, proxy, stdio } = await bridgeBehindFlakyProxy();
 		const sessionsBefore = cellar.sessionCount();
 
 		// A long call is in flight on this session.
@@ -519,15 +567,59 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 
 		// The next POST hits a socket the server drops under it.
 		proxy.dropNext();
-		const reply = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, 8000);
+		const reply = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/call' }, 8000);
 
-		// It recovered by retrying, not by re-handshaking: same session, so the
-		// long call is untouched and still completes.
-		expect(reply).toMatchObject({ result: { echoed: 'tools/list' } });
+		// Reported, not replayed - and the report does not claim the call did not
+		// happen, because that is exactly what cannot be known here.
+		expect(reply.error).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(String((reply.error as { message: string }).message)).toMatch(/may or may not have been applied/i);
+		expect(stdio.repliesFor(3)).toHaveLength(1);
+		// It really was not put on the wire again: the proxy ate the only copy, so
+		// the server never saw it at all.
+		expect(cellar.seen.filter((m) => m.method === 'tools/call')).toHaveLength(0);
+
+		// And the session was NOT torn down over it, so the long call is untouched
+		// and still completes - the work this bridge exists to protect.
 		expect(cellar.sessionCount()).toBe(sessionsBefore);
 		expect(stdio.repliesFor(2)).toHaveLength(0);
 		cellar.release();
 		expect(await stdio.awaitReply(2)).toMatchObject({ result: { echoed: SLOW } });
+	});
+
+	it('still re-sends a NOTIFICATION dropped the same way - it has no id and earns no reply', async () => {
+		// The asymmetry that keeps the recovery free: a duplicate delivery of a
+		// notification is invisible, so a blip costs nothing there. Without the
+		// retry the message is simply lost, and the server never sees it.
+		const { cellar, proxy, stdio } = await bridgeBehindFlakyProxy();
+		const sessionsBefore = cellar.sessionCount();
+
+		proxy.dropNext();
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/progress', params: { n: 1 } });
+
+		await until(() => cellar.seen.some((m) => m.method === 'notifications/progress'), 8000);
+		// Recovered by retrying on the SAME session, not by re-handshaking.
+		expect(cellar.sessionCount()).toBe(sessionsBefore);
+	});
+
+	it('re-sends a request the server REFUSED, because a refusal proves it never ran', async () => {
+		// The other half of the rule, and the dominant restart case: a server that
+		// answers `-32000 No valid session` rejected the message before dispatching
+		// it, so replaying it cannot duplicate anything. This is what keeps
+		// "restart Cellar and the agent's next call just works" true.
+		const first = await bootCellar();
+		const { stdio } = await startBridge();
+		await stdio.request(INIT);
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+		// Same address, new instance: the send reaches a LIVE server that refuses
+		// our session, rather than failing to connect at all.
+		const port = first.port;
+		await killCellar(first);
+		const replacement = await bootCellar(port);
+
+		const reply = await stdio.request({ jsonrpc: '2.0', id: 7, method: 'tools/call' }, 8000);
+		expect(reply).toMatchObject({ result: { echoed: 'tools/call' } });
+		expect(replacement.seen.some((m) => m.method === 'tools/call')).toBe(true);
 	});
 
 	it('answers every request exactly once when several fail at once across a restart', async () => {
@@ -564,6 +656,53 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		expect(second.sessionCount()).toBe(1);
 	});
 
+	it('answers a handed-off initialize exactly ONCE when a second re-attach fires first', async () => {
+		// The agent's own handshake is the one request a re-attach takes over: the
+		// replay stands IN for it, so its reply comes back under the agent's id.
+		// While that reply is still on the wire the id sits in `pending` but no
+		// longer in `relaying`, so a SECOND re-attach used to sweep it - handing the
+		// agent an error AND, moments later, the replay's result for one id, and
+		// failing the very handshake the recovery exists to complete.
+		const first = await bootCellar();
+		const { stdio } = await startBridge();
+		await killCellar(first);
+		// Its handshake is held open, so the hand-off is genuinely unanswered.
+		const second = await bootCellar(0, { holdInitialize: true });
+
+		stdio.post(INIT);
+		await until(() => second.seen.some((m) => m.method === 'initialize'), 8000);
+
+		// Cellar is replaced AGAIN before that reply ever lands. The third instance
+		// holds its handshake too, so the sweep runs while the id is still pending.
+		await killCellar(second);
+		const third = await bootCellar(0, { holdInitialize: true });
+
+		// A notification is enough to drive the second re-attach: it carries no id,
+		// so it cannot itself be what answers the handshake.
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		await until(() => third.seen.some((m) => m.method === 'notifications/initialized'), 8000);
+		// Let the re-attach's continuation (which is where the sweep lives) run.
+		await new Promise((r) => setTimeout(r, 100));
+
+		third.releaseInitialize();
+		await stdio.awaitReply(INIT.id, 8000);
+		// Let any SECOND response for that id land before judging: the sweep's error
+		// and the replay's result arrive in that order, milliseconds apart, so an
+		// assertion taken at the first reply would pass against the double.
+		await new Promise((r) => setTimeout(r, 200));
+
+		// Exactly one response for that id, and it is the HANDSHAKE RESULT - not the
+		// sweep's error, which would leave the agent's connection unusable.
+		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
+		const [reply] = stdio.repliesFor(INIT.id);
+		expect(reply).toMatchObject({ id: INIT.id, result: { protocolVersion: '2025-06-18' } });
+		expect(reply.error).toBeUndefined();
+		// ...and the session it minted really works.
+		expect(await stdio.request({ jsonrpc: '2.0', id: 12, method: 'tools/list' }, 8000)).toMatchObject({
+			result: { echoed: 'tools/list' }
+		});
+	});
+
 	it('never relays its own re-handshake reply to the agent', async () => {
 		const first = await bootCellar();
 		const { stdio } = await startBridge();
@@ -577,5 +716,59 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		const inits = stdio.sent.filter((m) => m.id === INIT.id);
 		expect(inits).toHaveLength(1);
 		expect(stdio.sent.some((m) => String(m.id ?? '').startsWith('cellar-bridge-init'))).toBe(false);
+	});
+});
+
+describe('provesNotDelivered - may this message be put on the wire again?', () => {
+	/** An undici-shaped failure: `TypeError: fetch failed` wrapping a socket error. */
+	const fetchFailed = (code: string, message = code) =>
+		Object.assign(new TypeError('fetch failed'), {
+			cause: Object.assign(new Error(message), { code })
+		});
+	/** A `StreamableHTTPError`-shaped failure: the HTTP status on a NUMERIC code. */
+	const httpError = (status: number, message: string) => Object.assign(new Error(message), { code: status });
+
+	it('is true when a server ANSWERED with a session refusal - it never dispatched it', () => {
+		expect(
+			provesNotDelivered(httpError(400, 'Error POSTing: -32000 No valid session; send an initialize request first.'))
+		).toBe(true);
+		expect(provesNotDelivered(httpError(404, 'Not Found'))).toBe(true);
+	});
+
+	it('is true when the connection was never ESTABLISHED - nothing was written', () => {
+		for (const code of ['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT']) {
+			expect(provesNotDelivered(fetchFailed(code))).toBe(true);
+		}
+		// ...including a transport that carries no code at all.
+		expect(provesNotDelivered(new Error('connect ECONNREFUSED 127.0.0.1:39587'))).toBe(true);
+	});
+
+	it('is FALSE for a socket that opened and then broke - that is the ambiguous case', () => {
+		// These cannot tell "never arrived" from "arrived, ran, and the reply died
+		// with the socket", so a non-idempotent write must not be replayed.
+		for (const code of ['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET']) {
+			expect(provesNotDelivered(fetchFailed(code))).toBe(false);
+		}
+		expect(provesNotDelivered(new Error('socket hang up'))).toBe(false);
+		expect(provesNotDelivered(new TypeError('fetch failed'))).toBe(false);
+		// Our own detach() aborts in-flight sends, and the request may have run.
+		expect(provesNotDelivered(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }))).toBe(
+			false
+		);
+	});
+
+	it('is FALSE for a live, session-valid server refusing this one message', () => {
+		// It answered - but from inside the dispatcher, so the tool may well have run.
+		expect(provesNotDelivered(httpError(500, 'mcp error: Error: boom'))).toBe(false);
+		expect(provesNotDelivered(httpError(429, 'Too Many Requests'))).toBe(false);
+	});
+
+	it('does not read a session phrase in a 500 body as a refusal', () => {
+		// The same over-trigger the re-attach guard closes, asked of the resend
+		// rule: a tool failure that merely MENTIONS a session is not our session
+		// being refused, so its request is not eligible for a replay.
+		expect(
+			provesNotDelivered(httpError(500, 'mcp error: Error: [SESSION_CLOSED] Spark Connect session expired'))
+		).toBe(false);
 	});
 });

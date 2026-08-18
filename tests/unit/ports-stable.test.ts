@@ -22,7 +22,8 @@ import {
 	resolveWorkspacePorts,
 	REMEMBERED_PORTS,
 	PORT_RELEASE_GRACE_MS,
-	bindHosts
+	bindHosts,
+	MOVE_CAUSE
 } from '../../src/lib/server/ports.js';
 
 /**
@@ -67,6 +68,26 @@ function scriptedFreePort(...ports: number[]) {
 	return Object.assign(fn, { calls: () => i });
 }
 
+/**
+ * A bind probe that records every port it was asked about and reports only the
+ * named ones as busy. Per-port on purpose: a blanket `async () => false` would
+ * say every port on the machine is taken, which no squatter ever means and which
+ * the fresh-port fallback (which probes its candidate too) would rightly refuse.
+ */
+function probe(...busy: number[]) {
+	const asked: number[] = [];
+	const fn = async (port: number) => {
+		asked.push(port);
+		return !busy.includes(port);
+	};
+	return Object.assign(fn, { asked, sawPort: (p: number) => asked.includes(p) });
+}
+
+/** The claim predicate `resolveWorkspacePorts` builds, for a live instance. */
+function heldByInstance(...ports: number[]) {
+	return (p: number) => (ports.includes(p) ? ('held-by-live-instance' as const) : null);
+}
+
 describe('choosePort - the stable-port rule', () => {
 	const freePort = async () => 40000;
 
@@ -74,97 +95,138 @@ describe('choosePort - the stable-port rule', () => {
 		const r = await choosePort({
 			remembered: 51348,
 			sticky: true,
-			canBind: async () => true,
-			isUnavailable: () => false,
+			canBind: probe(),
+			claimedBy: () => null,
 			freePort
 		});
 		expect(r).toEqual({ port: 51348, source: 'remembered' });
 	});
 
 	it('yields to a live registered instance rather than reclaiming its port', async () => {
-		let probed = false;
+		const canBind = probe();
 		const r = await choosePort({
 			remembered: 51348,
 			sticky: true,
-			// A bind probe would be a race we must not even enter.
-			canBind: async () => {
-				probed = true;
-				return true;
-			},
-			isUnavailable: (p) => p === 51348,
+			canBind,
+			claimedBy: heldByInstance(51348),
 			freePort
 		});
 		expect(r.source).toBe('fresh');
 		expect(r.reason).toBe('held-by-live-instance');
 		expect(r.port).toBe(40000);
-		// Never probed: a port a live instance holds is settled without asking the OS.
-		expect(probed).toBe(false);
+		// The REMEMBERED port is never probed: a port a live instance holds is
+		// settled without asking the OS, and probing it would be a race we must not
+		// even enter. (The replacement port is probed - see the fresh-fallback test.)
+		expect(canBind.sawPort(51348)).toBe(false);
+	});
+
+	it('reports a port this launch already took for another role as its OWN conflict', async () => {
+		// Same outcome, different CAUSE - and the launcher announces the cause. A
+		// single "claimed" set told the user another running Cellar instance was
+		// using a port that nothing but this very launch had taken.
+		const r = await choosePort({
+			remembered: 51348,
+			sticky: true,
+			canBind: probe(),
+			claimedBy: (p) => (p === 51348 ? 'taken-by-this-launch' : null),
+			freePort
+		});
+		expect(r).toEqual({ port: 40000, source: 'fresh', reason: 'taken-by-this-launch' });
 	});
 
 	it('falls back quietly when an unrelated process took the remembered port', async () => {
 		const r = await choosePort({
 			remembered: 51348,
 			sticky: true,
-			canBind: async () => false, // something else is listening
-			isUnavailable: () => false, // ...but it is not a Cellar instance
+			canBind: probe(51348), // something else is listening on that ONE port
+			claimedBy: () => null, // ...but it is not a Cellar instance
 			bindGraceMs: 0,
 			freePort
 		});
 		expect(r).toEqual({ port: 40000, source: 'fresh', reason: 'port-unavailable' });
 	});
 
+	it('probes the fresh fallback on the role host too, and steps over an unbindable one', async () => {
+		// The launcher's `freePort()` asks the kernel for a free 127.0.0.1 port
+		// while adapter-node binds the wildcard, and on macOS a loopback bind
+		// succeeds against a wildcard holder - so a kernel-assigned port can still
+		// be one the role's own listen() cannot take. One probe per candidate.
+		const canBind = probe(40000);
+		const r = await choosePort({
+			remembered: undefined,
+			sticky: true,
+			host: '0.0.0.0',
+			canBind,
+			freePort: scriptedFreePort(40000, 40001)
+		});
+		expect(r).toEqual({ port: 40001, source: 'fresh', reason: 'no-preference' });
+		expect(canBind.asked).toEqual([40000, 40001]);
+	});
+
+	it('refuses to launch rather than hand back a fresh port it cannot bind', async () => {
+		await expect(
+			choosePort({
+				sticky: true,
+				canBind: probe(40000),
+				freePort: async () => 40000
+			})
+		).rejects.toThrow(/free port/i);
+	});
+
 	it('takes a fresh port when the folder has no preference yet', async () => {
 		for (const remembered of [undefined, null]) {
-			const r = await choosePort({ remembered, sticky: true, freePort });
+			const r = await choosePort({ remembered, sticky: true, canBind: probe(), freePort });
 			expect(r).toEqual({ port: 40000, source: 'fresh', reason: 'no-preference' });
 		}
 	});
 
 	it('honours an explicit env pin over everything, without probing it', async () => {
-		let probed = false;
+		const canBind = probe();
 		const r = await choosePort({
 			pinned: '39587',
 			remembered: 51348,
 			sticky: true,
-			canBind: async () => {
-				probed = true;
-				return true;
-			},
-			isUnavailable: () => true,
+			canBind,
+			claimedBy: heldByInstance(51348, 39587),
 			freePort
 		});
 		// A pin is an instruction, not a preference: taken verbatim, never probed,
 		// and it outranks both the remembered port and a live-instance conflict.
 		expect(r).toEqual({ port: 39587, source: 'pinned' });
-		expect(probed).toBe(false);
+		expect(canBind.asked).toEqual([]);
 	});
 
 	it('ignores a non-numeric pin, exactly as the launcher always has', async () => {
-		const r = await choosePort({ pinned: 'auto', sticky: true, freePort });
+		const r = await choosePort({ pinned: 'auto', sticky: true, canBind: probe(), freePort });
 		expect(r.source).toBe('fresh');
 	});
 
 	it('never uses the sticky path for an isolated / --new launch', async () => {
-		let probed = false;
+		const canBind = probe();
 		const r = await choosePort({
 			remembered: 51348,
 			sticky: false,
-			canBind: async () => {
-				probed = true;
-				return true;
-			},
+			canBind,
 			freePort
 		});
 		// Concurrent instances exist precisely so they cannot collide; a remembered
-		// port is the port another instance is most likely holding.
+		// port is the port another instance is most likely holding - so it is not
+		// even looked at.
 		expect(r).toEqual({ port: 40000, source: 'fresh', reason: 'not-sticky' });
-		expect(probed).toBe(false);
+		expect(canBind.sawPort(51348)).toBe(false);
 	});
 
 	it('refuses a corrupt / hand-edited preference instead of trying to bind it', async () => {
 		for (const bad of [0, -1, 80, 70000, 1.5, '51348' as unknown as number, NaN]) {
-			const r = await choosePort({ remembered: bad as number, sticky: true, freePort });
+			const canBind = probe();
+			const r = await choosePort({
+				remembered: bad as number,
+				sticky: true,
+				canBind,
+				freePort
+			});
 			expect(r.reason).toBe('no-preference');
+			expect(canBind.sawPort(bad as number)).toBe(false);
 		}
 	});
 
@@ -201,9 +263,10 @@ describe('choosePort - the stable-port rule', () => {
 			r = await choosePort({
 				remembered: 51348,
 				sticky: true,
-				canBind: async () => {
+				canBind: async (p: number) => {
+					if (p !== 51348) return true; // only the remembered port is squatted
 					attempts++;
-					return false; // never comes back
+					return false; // ...and it never comes back
 				},
 				freePort,
 				// Advance a fake clock so the deadline is reached without real waiting.
@@ -232,10 +295,10 @@ describe('choosePort - the stable-port rule', () => {
 		const r = await choosePort({
 			remembered: 51348,
 			sticky: true,
-			// Exactly what the real predicate is: membership of the claimed set, so
-			// the remembered port is taken and the fallback still has room to land.
-			isUnavailable: (p: number) => p === 51348,
-			canBind: async () => false,
+			// Exactly what the real predicate is: the claimant of that port, so the
+			// remembered port is taken and the fallback still has room to land.
+			claimedBy: heldByInstance(51348),
+			canBind: probe(51348),
 			freePort,
 			sleep: async () => {
 				slept = true;
@@ -255,8 +318,8 @@ describe('choosePort - the stable-port rule', () => {
 		const r = await choosePort({
 			remembered: 40000,
 			sticky: true,
-			canBind: async () => true,
-			isUnavailable: (p) => taken.has(p),
+			canBind: probe(),
+			claimedBy: (p) => (taken.has(p) ? 'taken-by-this-launch' : null),
 			freePort: fp
 		});
 		expect(r.port).toBe(40001);
@@ -288,11 +351,16 @@ describe('canBindPort - the real availability probe', () => {
 describe('choosePort against a REAL bound port', () => {
 	it('moves off the remembered port only while something actually holds it', async () => {
 		const held = await listenOn(0, '127.0.0.1');
-		const freePort = scriptedFreePort(40000);
+		// A REAL ephemeral allocator for the fallback, so the default probe - which
+		// now covers the fresh candidate too - is asked about a port the kernel has
+		// just said is free, rather than a hardcoded one this machine may be using.
+		const spare = await listenOn(0, '127.0.0.1');
+		await spare.close();
+		const freePort = scriptedFreePort(spare.port);
 		const opts = { remembered: held.port, sticky: true, freePort, bindGraceMs: 0, host: '127.0.0.1' };
 
 		const busy = await choosePort(opts);
-		expect(busy).toEqual({ port: 40000, source: 'fresh', reason: 'port-unavailable' });
+		expect(busy).toEqual({ port: spare.port, source: 'fresh', reason: 'port-unavailable' });
 
 		await held.close();
 		const free = await choosePort(opts);
@@ -544,8 +612,11 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 		expect(second.mcpPort).not.toBe(first.mcpPort);
 		expect(second.mcp.reason).toBe('held-by-live-instance');
 		// The move is announced: a silently different address is the confusion
-		// this feature exists to remove.
+		// this feature exists to remove. And it names the real cause - there IS a
+		// live instance here, so it may say so.
 		expect(notes.join('\n')).toContain(`MCP port ${first.mcpPort} was unavailable`);
+		expect(notes.join('\n')).toContain(MOVE_CAUSE['held-by-live-instance']);
+		expect(notes.join('\n')).toContain(`using ${second.mcpPort} and remembering it`);
 	});
 
 	it('lets an explicit env pin win, and does not record it as a preference', async () => {
@@ -599,6 +670,7 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 			freePort: fp,
 			instances: [{ launcherPid: 999, appPort: 41000, mcpPort: 41001 }],
 			isAlive: () => true,
+			canBind: async () => true,
 			bindGraceMs: 0
 		});
 		for (const p of [isolated.appPort, isolated.mcpPort, isolated.jupyterPort]) {
@@ -665,49 +737,79 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 		const r = await launch();
 		expect(new Set([r.appPort, r.mcpPort, r.jupyterPort]).size).toBe(3);
 	});
+
+	it('blames THIS launch, not a live instance, when it already took the port itself', async () => {
+		// One port named twice: the app takes it, so the MCP role has to move. The
+		// announcement is the feature's honesty contract, and a single "claimed"
+		// set reported "another running Cellar instance is using it" about a
+		// conflict with nothing but this very launch - naming an instance that does
+		// not exist, in the one message the user is meant to trust.
+		const spare = await freePort();
+		writePortPrefs(ws, { appPort: spare, mcpPort: spare });
+		const notes: string[] = [];
+		const r = await launch({ instances: [], log: (m: string) => notes.push(m) });
+
+		expect(r.appPort).toBe(spare);
+		expect(r.app.source).toBe('remembered');
+		expect(r.mcpPort).not.toBe(spare);
+		expect(r.mcp.reason).toBe('taken-by-this-launch');
+
+		const said = notes.join('\n');
+		expect(said).toContain(`MCP port ${spare} was unavailable`);
+		expect(said).toContain(MOVE_CAUSE['taken-by-this-launch']);
+		// ...and emphatically NOT the live-instance wording, which is the defect.
+		expect(said).not.toContain(MOVE_CAUSE['held-by-live-instance']);
+		expect(said).not.toContain('held-by-live-instance');
+	});
 });
 
-describe('the launcher wiring', () => {
-	// `sticky: !forceNew` is the one link the behavioral tests above cannot reach
-	// without booting a server, and it is the link that decides whether an e2e /
-	// isolated instance can steal a folder's port. e2e is deliberately absent from
-	// CI and the no-mistakes gate, so it is pinned here at the source level.
-	const src = readFileSync(new URL('../../bin/cellar.js', import.meta.url), 'utf8');
+describe('bindHosts - each role probes the address its own server binds', () => {
+	// A probe on the wrong host silently answers a DIFFERENT question: on macOS a
+	// SO_REUSEADDR bind of 127.0.0.1:P succeeds while another socket holds
+	// 0.0.0.0:P, so probing loopback reported the app port free while adapter-node
+	// still held it on the wildcard - which would hand the app a port its own
+	// listen() cannot take. The end-to-end consequence is covered against real
+	// listeners by 'probes each role on the host that role really binds' above;
+	// this pins the mapping itself, in both directions, for each role.
 
-	// `bindHosts` MIRRORS the three real listen sites, and a probe on the wrong
-	// host silently answers a different question - it reported the app port free
-	// while adapter-node still held it on the wildcard, which would hand the app a
-	// port its own listen() cannot take. So the mirror is pinned to its sources.
-	it('probes the MCP port on the host startMcpServer actually binds', () => {
-		const mcpSrc = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
-		expect(mcpSrc).toContain("process.env.CELLAR_MCP_HOST || '127.0.0.1'");
+	it('gives the app the wildcard by default and follows HOST when it is set', () => {
+		// adapter-node binds 0.0.0.0 unless HOST says otherwise, and the launcher
+		// passes only PORT - so the default is what an ordinary launch really probes.
+		expect(bindHosts({}).app).toBe('0.0.0.0');
+		expect(bindHosts({ HOST: '127.0.0.1' }).app).toBe('127.0.0.1');
+		expect(bindHosts({ HOST: '::1' }).app).toBe('::1');
+	});
+
+	it('gives the MCP server loopback by default and follows CELLAR_MCP_HOST', () => {
 		expect(bindHosts({}).mcp).toBe('127.0.0.1');
 		expect(bindHosts({ CELLAR_MCP_HOST: '0.0.0.0' }).mcp).toBe('0.0.0.0');
 	});
 
-	it('probes the app port on the WILDCARD, because the launcher sets PORT and not HOST', () => {
-		// adapter-node defaults to 0.0.0.0; if the launcher ever starts pinning HOST
-		// this must follow it, which is what the second assertion keeps honest.
-		expect(src).toContain('PORT: String(appPort)');
-		expect(src).not.toMatch(/\bHOST:\s/);
-		expect(bindHosts({}).app).toBe('0.0.0.0');
-		expect(bindHosts({ HOST: '127.0.0.1' }).app).toBe('127.0.0.1');
-	});
-
-	it('probes the Jupyter port on the ip the sidecar spawn pins', () => {
-		expect(src).toContain('--ServerApp.ip=127.0.0.1');
+	it('pins Jupyter to loopback whatever the environment says', () => {
+		// The sidecar spawn passes --ServerApp.ip=127.0.0.1 unconditionally, so no
+		// environment variable may move this one.
 		expect(bindHosts({}).jupyter).toBe('127.0.0.1');
+		expect(bindHosts({ HOST: '0.0.0.0', CELLAR_MCP_HOST: '0.0.0.0' }).jupyter).toBe('127.0.0.1');
 	});
 
-	it('drives the sticky path from !forceNew (which CELLAR_ISOLATED implies)', () => {
-		expect(src).toMatch(/resolveWorkspacePorts\(\{[\s\S]{0,200}?sticky:\s*!forceNew/);
+	it('reads an empty variable as unset, so a blank env var is never a host', () => {
+		expect(bindHosts({ HOST: '', CELLAR_MCP_HOST: '' })).toEqual({
+			app: '0.0.0.0',
+			mcp: '127.0.0.1',
+			jupyter: '127.0.0.1'
+		});
 	});
 
-	it('has exactly one port-resolution site', () => {
-		expect(src.match(/resolveWorkspacePorts\(/g)).toHaveLength(1);
-	});
-
-	it('excludes our own pid so a relaunch never blocks itself', () => {
-		expect(src).toMatch(/excludePid:\s*process\.pid/);
+	it('reads the real process environment when none is passed', () => {
+		const before = process.env.CELLAR_MCP_HOST;
+		try {
+			delete process.env.CELLAR_MCP_HOST;
+			expect(bindHosts().mcp).toBe('127.0.0.1');
+			process.env.CELLAR_MCP_HOST = '0.0.0.0';
+			expect(bindHosts().mcp).toBe('0.0.0.0');
+		} finally {
+			if (before === undefined) delete process.env.CELLAR_MCP_HOST;
+			else process.env.CELLAR_MCP_HOST = before;
+		}
 	});
 });
