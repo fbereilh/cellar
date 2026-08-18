@@ -285,6 +285,21 @@ describe('connect publishes the cluster id, and only after the session is built'
 		expect(steps.find((s) => s.event === 'build')!.cluster_id_env).toBeNull();
 	});
 
+	it('publishes the cluster id and NOTHING else - notably no DATABRICKS_CONFIG_PROFILE', async () => {
+		// The identity Cellar connects with stays inside its own `Config`, and exporting
+		// it was ruled OUT of scope: `DATABRICKS_CONFIG_PROFILE` names a profile for
+		// every later resolution in the process, which is a machine-wide default the
+		// user never chose - the same decision the sidebar card refuses to make for
+		// them. So a connect must leave exactly ONE var behind, and a stale one the
+		// user's shell exported must be scrubbed rather than honoured.
+		const { env, result } = runKernelCode(await connectCode(CLUSTER_A), {
+			DATABRICKS_CONFIG_PROFILE: 'someone-elses-profile'
+		});
+		expect(result).toMatchObject({ ok: true });
+		expect(env.DATABRICKS_CONFIG_PROFILE).toBeUndefined();
+		expect(Object.keys(env).sort()).toEqual(['DATABRICKS_CLUSTER_ID']);
+	});
+
 	it('the sibling DATABRICKS_RUNTIME_VERSION restore is unaffected, and other vars are still scrubbed', async () => {
 		const { env } = runKernelCode(await connectCode(CLUSTER_A), {
 			DATABRICKS_RUNTIME_VERSION: '15.4',
