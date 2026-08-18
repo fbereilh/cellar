@@ -228,9 +228,12 @@ export function portsHeldByLiveInstances(entries, { isAlive, excludePid } = {}) 
  * stop-and-start gesture is not. Deliberate non-goal, recorded here because it
  * has been proposed and rejected twice.
  *
- * The consequence is that the MCP role usually MOVES on a quick restart, which
- * is why that move is not announced - see the notice rule in
- * `resolveWorkspacePorts`.
+ * That non-goal is affordable only because the app now RELEASES the MCP listening
+ * socket on SIGTERM (`mcp/server.ts`): nothing used to close it, so the port
+ * stayed bound until the process itself exited and this window could never have
+ * covered it. Closed at the source, the port is free again by the time the next
+ * launch asks - which is why waiting for it buys nothing rather than why the
+ * move is hidden. Every move is still announced (see `resolveWorkspacePorts`).
  *
  * Bounded, and paid only when the remembered port is actually busy: a free port
  * answers on the first probe, and a port genuinely held by something else costs
@@ -536,23 +539,21 @@ export async function resolveWorkspacePorts({
 		// Say so when a port the user was told is stable had to move, and why - a
 		// silently different address is the confusion this feature exists to remove.
 		//
-		// EXCEPT the MCP role's ROUTINE move, which is neither unexpected nor worth
-		// a line. `PORT_RELEASE_GRACE_MS` deliberately does not wait out that port,
-		// so a Ctrl-C-then-relaunch reliably finds it still held by our own dying app
-		// and moves - and the address appears in no config and self-heals through the
-		// `cellar mcp` bridge, so nothing downstream even notices. Announcing it made
-		// the everyday restart print an alarming "was unavailable (another process is
-		// using it)" naming a conflict the user has no reason to care about and a
-		// holder the probe never identified. A genuine surprise still speaks: a LIVE
-		// registered instance holding it, or this launch having already taken it for
-		// another role, are both facts `claimedBy` positively established.
-		/** @type {[string, PortChoice, number | undefined, boolean][]} */
+		// EVERY move speaks, including the MCP role's. The routine Ctrl-C relaunch
+		// used to move that port reliably, which made this line the commonest thing
+		// the feature said and turned an honest notice into noise - but the cause was
+		// the app never releasing the MCP listening socket on SIGTERM, and that is
+		// fixed at the source (`mcp/server.ts` now closes it), so the port is free
+		// again by the time the next launch asks. A routine restart is therefore
+		// silent because NOTHING MOVED, which is what the user was promised - not
+		// because a real move was suppressed.
+		/** @type {[string, PortChoice, number | undefined][]} */
 		const moved = [
-			['app', app, prefs.appPort, true],
-			['MCP', mcp, prefs.mcpPort, mcp.reason !== 'port-unavailable']
+			['app', app, prefs.appPort],
+			['MCP', mcp, prefs.mcpPort]
 		];
-		for (const [label, r, want, notable] of moved) {
-			if (r.source === 'fresh' && want != null && notable)
+		for (const [label, r, want] of moved) {
+			if (r.source === 'fresh' && want != null)
 				log(
 					`[cellar] ${label} port ${want} was unavailable (${MOVE_CAUSE[r.reason] ?? r.reason}); ` +
 						`using ${r.port} and remembering it.`

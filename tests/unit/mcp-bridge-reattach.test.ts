@@ -176,6 +176,14 @@ function startFakeCellar(
 				h.res.end();
 			}
 		},
+		/**
+		 * Break the stream carrying a held request WITHOUT taking the instance down.
+		 * That is the one shape the bridge must not over-react to: the reply is
+		 * gone, but the session (and every other run on it) is provably fine.
+		 */
+		dropHeld: () => {
+			for (const h of held.splice(0)) h.res.destroy();
+		},
 		/** Answer every held request, the way a finished run flushes its result. */
 		release: () => {
 			for (const h of held.splice(0)) {
@@ -743,6 +751,62 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		expect(reply.error).toBeUndefined();
 		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
 		expect(second.sessionCount()).toBe(1);
+	});
+
+	it('answers a request whose stream died, with NO follow-up call from the agent', async () => {
+		// The headline case. A long `run_cell` is in flight when Cellar restarts: its
+		// POST already resolved, so the id sits in `pending` with nothing left to
+		// answer it, and MCP hosts serialize tool calls - so there is no next message
+		// to drive the per-send recovery. It used to hang until the host's 60s
+		// timeout, the very symptom this bridge exists to remove.
+		const first = await bootCellar();
+		const { stdio, inFlight } = await startBridge();
+		await stdio.request(INIT);
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => first.heldCount() === 1 && inFlight.has(2));
+		const sentBefore = stdio.sent.length;
+
+		// Cellar goes away. The agent sends NOTHING further.
+		await killCellar(first);
+
+		const lost = (await stdio.awaitReply(2, 8000)).error as { code: number; message: string };
+		expect(lost).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		// Honest on both counts: the result can never arrive, and whether the call was
+		// applied is unknown - it must not read as an invitation to blindly retry.
+		expect(lost.message).toMatch(/may or may not have been applied/i);
+		expect(lost.message).not.toMatch(/call again/i);
+		// Exactly one response, and it is the only thing that went down.
+		expect(stdio.repliesFor(2)).toHaveLength(1);
+		expect(stdio.sent.length).toBe(sentBefore + 1);
+	});
+
+	it('leaves a session alone when the stream dies but the instance is ALIVE', async () => {
+		// The other half of the same rule: the error itself is never the trigger.
+		// `instanceGone()` is asked first, and a live instance means nothing happens -
+		// tearing the session down here would abort exactly the long work this bridge
+		// protects, which is the cardinal sin the module names.
+		const cellar = await bootCellar();
+		const { stdio, inFlight } = await startBridge();
+		await stdio.request(INIT);
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		const sessionsBefore = cellar.sessionCount();
+
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => cellar.heldCount() === 1 && inFlight.has(2));
+
+		// The stream breaks; the instance behind it never moves.
+		cellar.dropHeld();
+		await new Promise((r) => setTimeout(r, 400));
+
+		expect(cellar.sessionCount()).toBe(sessionsBefore);
+		// Nothing was answered on the strength of an error alone - the stated residual.
+		expect(stdio.repliesFor(2)).toHaveLength(0);
+		// ...and the session is still usable.
+		expect(await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, 8000)).toMatchObject({
+			result: { echoed: 'tools/list' }
+		});
 	});
 
 	it('sees a replacement that reclaimed the SAME port, because the pid changed', async () => {

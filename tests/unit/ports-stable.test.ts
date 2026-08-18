@@ -886,60 +886,48 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 		expect(new Set([r.appPort, r.mcpPort, r.jupyterPort]).size).toBe(3);
 	});
 
-	it('says NOTHING when the MCP port moves on a routine self-restart', async () => {
-		// The everyday gesture: Ctrl-C, then relaunch. The previous launcher has
-		// already unregistered itself and cleared runtime.json, so the take-over sweep
-		// finds nothing to await - and its orphaned app still holds the MCP port for
-		// several seconds. That port is deliberately not waited out (it appears in no
-		// config and the bridge re-attaches by itself), so it reliably MOVES here.
-		// Announcing that made the commonest restart print an alarming
-		// "was unavailable (another process is using it)" about a conflict the user
-		// has no reason to care about, naming a holder the probe never identified.
+	it('keeps BOTH sticky ports across a restart once the previous app released them', async () => {
+		// The everyday gesture: Ctrl-C, then relaunch. Both sticky addresses come
+		// back, so nothing moves and nothing is announced - silent because the
+		// preference was HONOURED, not because a real move was suppressed. That rests
+		// on the app releasing its MCP listening socket on SIGTERM (mcp/server.ts);
+		// while nothing closed it, this role moved on essentially every restart.
 		const first = await launch();
 		const notes: string[] = [];
-		const second = await resolveWorkspacePorts({
-			workspace: ws,
-			sticky: true,
-			env: {},
-			freePort,
-			// The app port is back at once; only the MCP one is still held.
-			canBind: async (port: number) => port !== first.mcpPort,
-			bindGraceMs: 0,
-			log: (m: string) => notes.push(m)
-		});
+		const second = await launch({ log: (m: string) => notes.push(m) });
 
-		// The app port - the address a human actually holds onto - is unmoved.
 		expect(second.appPort).toBe(first.appPort);
+		expect(second.mcpPort).toBe(first.mcpPort);
 		expect(second.app.source).toBe('remembered');
-		// The MCP port moved, silently, and the replacement is remembered so the next
-		// launch is stable again.
-		expect(second.mcpPort).not.toBe(first.mcpPort);
-		expect(second.mcp.reason).toBe('port-unavailable');
+		expect(second.mcp.source).toBe('remembered');
 		expect(notes).toEqual([]);
-		expect(readPortPrefs(ws)).toEqual({ appPort: first.appPort, mcpPort: second.mcpPort });
+		expect(readPortPrefs(ws)).toEqual({ appPort: first.appPort, mcpPort: first.mcpPort });
 	});
 
-	it('still announces an APP port move, and a genuine MCP conflict', async () => {
-		// Silence is scoped to the one routine case. The app port is the address the
-		// user was told is stable, so ANY move of it speaks; and an MCP port a LIVE
-		// REGISTERED instance holds is a fact `claimedBy` positively established, not
-		// the everyday self-restart, so that speaks too.
+	it('announces EVERY move with its own cause, the MCP role included', async () => {
+		// A move the user was not expecting is exactly what the announcement exists
+		// for, and it must not be narrowed to one role: silently changing an address
+		// the user was told is stable is the confusion this feature removes.
 		const first = await launch();
 		const notes: string[] = [];
 		const second = await launch({
-			canBind: async (port: number) => port !== first.appPort,
-			instances: [{ launcherPid: 999, mcpPort: first.mcpPort }],
-			isAlive: () => true,
+			// Something genuinely holds the MCP port; the app port is free.
+			canBind: async (port: number) => port !== first.mcpPort,
 			log: (m: string) => notes.push(m)
 		});
 
-		expect(second.appPort).not.toBe(first.appPort);
-		expect(second.mcp.reason).toBe('held-by-live-instance');
+		expect(second.appPort).toBe(first.appPort);
+		expect(second.mcpPort).not.toBe(first.mcpPort);
+		expect(second.mcp.reason).toBe('port-unavailable');
 		const said = notes.join('\n');
-		expect(said).toContain(`app port ${first.appPort} was unavailable`);
-		expect(said).toContain(MOVE_CAUSE['port-unavailable']);
 		expect(said).toContain(`MCP port ${first.mcpPort} was unavailable`);
-		expect(said).toContain(MOVE_CAUSE['held-by-live-instance']);
+		expect(said).toContain(MOVE_CAUSE['port-unavailable']);
+		expect(said).toContain(`using ${second.mcpPort} and remembering it`);
+		// Converged: the replacement is free, so a third launch keeps it silently.
+		const after: string[] = [];
+		const third = await launch({ log: (m: string) => after.push(m) });
+		expect(third.mcpPort).toBe(second.mcpPort);
+		expect(after).toEqual([]);
 	});
 
 	it('blames THIS launch, not a live instance, when it already took the port itself', async () => {

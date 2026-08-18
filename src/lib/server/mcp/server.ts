@@ -912,4 +912,29 @@ export function startMcpServer() {
 		const shown = host === '0.0.0.0' ? '127.0.0.1' : host;
 		console.log(`[cellar-mcp] MCP agent interface on http://${shown}:${port}/mcp`);
 	});
+
+	// RELEASE THE PORT ON SHUTDOWN. adapter-node's graceful shutdown unbinds only
+	// its OWN listener, and nothing else owned this one - so the app process kept
+	// this socket bound until it finally exited, which on the Ctrl-C path is the
+	// orphan self-exit in `parent-watch.ts`, 5-10s later. That is what made the
+	// remembered MCP port busy on essentially every quick relaunch (`ports.js`
+	// deliberately does not wait it out), so that half of the folder's preference
+	// never converged: each launch moved and then remembered a port that would be
+	// busy again next time. `close()` stops accepting and frees the LISTENING
+	// socket at once, which is all the next launch needs.
+	//
+	// Deliberately NOT `closeAllConnections()`: an established POST is a run
+	// streaming its progress, and killing it here would abort the work more
+	// abruptly than the process exit already will. And deliberately no
+	// `process.exit` - adapter-node owns that, and these listeners stay additive.
+	let released = false;
+	for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+		process.on(sig, () => {
+			if (released) return;
+			released = true;
+			try {
+				httpServer.close();
+			} catch {}
+		});
+	}
 }

@@ -436,6 +436,22 @@ export async function runMcpBridge({
 		sendDown({ jsonrpc: '2.0', id, error: { code: NO_INSTANCE_ERROR_CODE, message } });
 	};
 
+	/**
+	 * Requests whose reply could only ever have come over the CURRENT stream:
+	 * outstanding, not about to be answered by a relay that is still running, and
+	 * not handed off to a replay already on the wire.
+	 */
+	const lostRequestIds = () => [...pending].filter((id) => !relaying.has(id) && !handedOff.has(id));
+
+	/**
+	 * Answer every request whose reply died with the old server. Idempotent through
+	 * `failRequest`, so the two callers - the post-re-attach sweep and the
+	 * stream-loss heal - can both run without giving one id two responses.
+	 */
+	const failLostRequests = () => {
+		for (const id of lostRequestIds()) failRequest(id, LOST_RESULT_MESSAGE);
+	};
+
 	/** Detach the current upstream without letting its close cascade a shutdown. */
 	const detach = async () => {
 		const old = upstream;
@@ -477,11 +493,16 @@ export async function runMcpBridge({
 			}
 			sendDown(msg);
 		};
-		// Upstream errors are NOT fatal and must never shut the bridge down. They
-		// are also not the re-attach trigger: this fires for a failed SSE stream on
-		// a perfectly healthy session, and it carries no message to classify or to
-		// answer. Recovery is decided per send, where both exist. Log only.
-		t.onerror = (err) => log(`upstream error: ${err?.message ?? err}`);
+		// Upstream errors are NOT fatal and must never shut the bridge down, and they
+		// are NOT themselves the re-attach trigger: this fires for a failed SSE stream
+		// on a perfectly healthy session, and it carries no message to classify or to
+		// answer. But declining to CLASSIFY it is not a reason to decline to ASK - see
+		// `healAfterStreamLoss`, which is the only path that answers a request already
+		// in flight when the instance dies.
+		t.onerror = (err) => {
+			log(`upstream error: ${err?.message ?? err}`);
+			healAfterStreamLoss(t).catch(() => {});
+		};
 		t.onclose = () => log('upstream connection closed');
 	};
 
@@ -574,13 +595,7 @@ export async function runMcpBridge({
 					// under the agent's id. Sweeping it gave that id an error AND, moments
 					// later, the replay's result - and it failed the very handshake this
 					// recovery exists to complete.
-					for (const id of [...pending]) {
-						if (relaying.has(id) || handedOff.has(id)) continue;
-						failRequest(
-							id,
-							LOST_RESULT_MESSAGE
-						);
-					}
+					failLostRequests();
 				}
 				return ok;
 			})();
@@ -649,6 +664,52 @@ export async function runMcpBridge({
 	 * life of that spawn - the exact handshake the hand-off exists to complete.
 	 */
 	const settledByRecovery = (msg, isReq) => isReq && (!pending.has(msg.id) || handedOff.has(msg.id));
+
+	/**
+	 * Recover after the stream carrying a reply DIED, which is the one failure the
+	 * per-send path cannot see.
+	 *
+	 * `deliver` drives every other recovery, so a request already IN FLIGHT when the
+	 * instance is replaced was answered only if the agent happened to send ANOTHER
+	 * message - and MCP hosts serialize tool calls, so for the headline case (a long
+	 * `run_cell` in flight across a restart) there IS no next message. The POST had
+	 * already resolved, so the id sat in `pending` with nothing left to answer it,
+	 * and the call hung until the host's 60s timeout: exactly the symptom this
+	 * bridge exists to remove, reached through the one door it was not watching.
+	 *
+	 * The doctrine is unchanged, only applied here too. It NEVER re-attaches on the
+	 * error itself - `instanceGone()` is an independent evidence check that needs no
+	 * error message, so it is asked first and a live instance means we do nothing at
+	 * all. That is what keeps a transient SSE blip from tearing down a session with
+	 * long runs streaming on it, which is the cardinal sin this module names.
+	 * Nothing is ever RE-SENT here; the ambiguity contract is untouched, and the
+	 * requests are answered with `LOST_RESULT_MESSAGE` - honest about the reply
+	 * being unrecoverable and about the call's own outcome being unknown.
+	 *
+	 * Stated residual: a stream that dies against an instance that is still ALIVE
+	 * leaves its request unanswered, because tearing down that session would abort
+	 * the very work this protects and the SDK may still resume the stream itself.
+	 */
+	let healingStream = false;
+	const healAfterStreamLoss = async (t) => {
+		// A late error from a transport we already replaced says nothing about the
+		// live session; and while a re-attach is in flight its own sweep owns these
+		// ids, so a second pass here could answer one the attach is handing off.
+		if (closing || healingStream || reattaching || upstream !== t) return;
+		if (lostRequestIds().length === 0) return;
+		healingStream = true;
+		try {
+			if (!(await instanceGone())) return;
+			await reattach();
+			// Also answered when the re-attach found nothing serving: the evidence is
+			// about the OLD instance, and their replies rode its stream either way.
+			failLostRequests();
+		} catch (err) {
+			log(`could not recover after the stream was lost (${err?.message ?? err})`);
+		} finally {
+			healingStream = false;
+		}
+	};
 
 	/** Answer one request with the "nothing is serving this folder" error. */
 	const failUnreachable = (msg) => {
