@@ -112,11 +112,17 @@ function startFakeCellar(
 					);
 					return;
 				}
-				if (msg.id === undefined || msg.id === null) {
-					res.writeHead(202).end(); // a notification
+				// `failStatus` is consulted BEFORE the notification short-circuit, so a
+				// test can refuse a notification too - which is how the handshake's own
+				// `notifications/initialized` is made to fail while its `initialize`
+				// succeeds, the one ordering the bridge must not read as a failed
+				// handshake.
+				const fail = failStatus[msg.method as string];
+				const isNotification = msg.id === undefined || msg.id === null;
+				if (isNotification && fail === undefined) {
+					res.writeHead(202).end();
 					return;
 				}
-				const fail = failStatus[msg.method as string];
 				if (fail !== undefined) {
 					// A live server that KNOWS our session refusing this one message.
 					// Deliberately not a session refusal: no -32000 under a 400.
@@ -697,6 +703,36 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		expect(await stdio.request({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, 8000)).toMatchObject({
 			result: { echoed: 'tools/list' }
 		});
+	});
+
+	it("keeps the agent's initialize when only the re-handshake's NOTIFICATION fails", async () => {
+		// `attach()` sends two messages: the replay, which carries the handshake and
+		// mints the session, and `notifications/initialized`, a courtesy that
+		// follows it. A failure of the SECOND says nothing about the FIRST, and must
+		// not retroactively fail it - the replay's result is already on its way, so
+		// answering the agent's id with an error drops that result as a duplicate
+		// and leaves the connection unusable while a working session sits attached.
+		const first = await bootCellar();
+		const { stdio } = await startBridge();
+		await killCellar(first);
+		// Holds its handshake open (so the hand-off is genuinely unanswered when the
+		// notification fails) and refuses the notification that follows it.
+		const second = await bootCellar(0, {
+			holdInitialize: true,
+			failStatus: { 'notifications/initialized': 500 }
+		});
+
+		stdio.post(INIT);
+		await until(() => second.seen.some((m) => m.method === 'notifications/initialized'), 8000);
+		// Let the failed notification's verdict land while the replay is in flight.
+		await new Promise((r) => setTimeout(r, 100));
+		second.releaseInitialize();
+
+		const reply = await stdio.awaitReply(INIT.id, 8000);
+		expect(reply).toMatchObject({ id: INIT.id, result: { protocolVersion: '2025-06-18' } });
+		expect(reply.error).toBeUndefined();
+		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
+		expect(second.sessionCount()).toBe(1);
 	});
 
 	it('never re-attaches on a SECOND blip while the instance is provably alive on our port', async () => {

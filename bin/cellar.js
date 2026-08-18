@@ -1189,6 +1189,7 @@ async function main() {
 	const { appPort, mcpPort, jupyterPort } = await resolveWorkspacePorts({
 		workspace: WORKSPACE,
 		sticky: !forceNew,
+		dev: useDev,
 		freePort,
 		instances: listInstances(),
 		isAlive: (e) => pidAlive(e?.launcherPid) || pidAlive(e?.appPid),

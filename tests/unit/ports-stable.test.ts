@@ -621,6 +621,48 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 		}
 	});
 
+	it('probes the app port on LOOPBACK under --dev, because that is what vite binds', async () => {
+		// The launcher spawns a different app server per branch: `node build/index.js`
+		// (adapter-node, wildcard) by default, and `vite dev --port <p> --strictPort`
+		// with no `--host` under `--dev`, where vite's own loopback default applies.
+		// Probing the wildcard there answers a different question: on macOS it
+		// succeeds while an unrelated process holds 127.0.0.1:P, so the remembered
+		// port is kept, vite fails --strictPort and the launch dies - persistently,
+		// since the "successful" remembered path rewrites the preference.
+		const asked: { port: number; host: string }[] = [];
+		const spy = async (port: number, host: string) => {
+			asked.push({ port, host });
+			return true;
+		};
+		const r = await launch({ dev: true, canBind: spy });
+		expect(asked.find((a) => a.port === r.appPort)?.host).toBe('127.0.0.1');
+		// The other two roles are unmoved by the branch.
+		expect(asked.find((a) => a.port === r.mcpPort)?.host).toBe('127.0.0.1');
+		expect(asked.find((a) => a.port === r.jupyterPort)?.host).toBe('127.0.0.1');
+
+		// ...and HOST does not override it, because vite never reads HOST - only the
+		// production branch does.
+		const askedHost: { port: number; host: string }[] = [];
+		const other = mkdtempSync(join(tmpdir(), 'cellar-devhost-'));
+		try {
+			const r2 = await resolveWorkspacePorts({
+				workspace: other,
+				sticky: false,
+				dev: true,
+				env: { HOST: '0.0.0.0' },
+				freePort,
+				bindGraceMs: 0,
+				canBind: async (port: number, host: string) => {
+					askedHost.push({ port, host });
+					return true;
+				}
+			});
+			expect(askedHost.find((a) => a.port === r2.appPort)?.host).toBe('127.0.0.1');
+		} finally {
+			rmSync(other, { recursive: true, force: true });
+		}
+	});
+
 	// The CONSEQUENCE of getting that routing wrong is only observable where the
 	// kernel lets a wildcard bind and a loopback bind of one port coexist. That
 	// permissive overlap is BSD/macOS SO_REUSEADDR behaviour (measured); Linux
@@ -825,6 +867,19 @@ describe('bindHosts - each role probes the address its own server binds', () => 
 	// covered unconditionally by 'asks about each role on the host that role really
 	// binds';
 	// this pins the mapping itself, in both directions, for each role.
+
+	it('gives the app LOOPBACK under --dev, whatever HOST says', () => {
+		// vite dev is spawned with no --host and does not read HOST, so the dev
+		// branch has exactly one answer.
+		expect(bindHosts({}, { dev: true }).app).toBe('127.0.0.1');
+		expect(bindHosts({ HOST: '0.0.0.0' }, { dev: true }).app).toBe('127.0.0.1');
+		// ...and it moves nothing else.
+		expect(bindHosts({ CELLAR_MCP_HOST: '0.0.0.0' }, { dev: true })).toEqual({
+			app: '127.0.0.1',
+			mcp: '0.0.0.0',
+			jupyter: '127.0.0.1'
+		});
+	});
 
 	it('gives the app the wildcard by default and follows HOST when it is set', () => {
 		// adapter-node binds 0.0.0.0 unless HOST says otherwise, and the launcher

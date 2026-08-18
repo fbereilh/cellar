@@ -505,10 +505,30 @@ export async function runMcpBridge({
 			// not send it a second time.
 			const forAgent = pending.has(initRequest.id) ? initRequest.id : null;
 			const id = `cellar-bridge-init-${++handshakeSeq}`;
+			// The mapping must exist BEFORE the send - an inline JSON reply arrives
+			// while `send()` is still awaiting - but the hand-off is only registered
+			// AFTER it resolves, because `handedOff` means "the replay is provably on
+			// the wire and its reply is coming". Registered first, a throw in the send
+			// left the id marked handed-off with nothing on the wire, so nothing would
+			// ever answer it. The `pending` re-check covers the opposite case: a reply
+			// delivered inline has already answered the id, so it is not outstanding.
 			ownIds.set(id, forAgent);
-			if (forAgent != null) handedOff.add(forAgent);
 			await t.send({ ...initRequest, id });
-			await t.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+			if (forAgent != null && pending.has(forAgent)) handedOff.add(forAgent);
+			// The session is MINTED at this point: the reply above carried the
+			// `Mcp-Session-Id` the transport now holds, and the replay's own result is
+			// on its way. `notifications/initialized` is the protocol courtesy that
+			// follows, and its failure says nothing about the handshake that already
+			// succeeded - so it may NOT retroactively fail this attach. Failing it
+			// answered the agent's `initialize` with an error while a working session
+			// sat attached, and the real result was then dropped as a duplicate. If a
+			// server does refuse later messages for want of it, that refusal arrives on
+			// its own terms and drives recovery through the ordinary classification.
+			try {
+				await t.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+			} catch (err) {
+				log(`re-handshake notification failed (${err?.message ?? err}); the session is minted regardless`);
+			}
 		}
 		return true;
 	};
@@ -656,6 +676,11 @@ export async function runMcpBridge({
 		// timeout, which is the exact symptom this bridge exists to remove.
 		let mayResend = true;
 		for (let attempt = 0; attempt < 4; attempt++) {
+			// Asked before EVERY send, not only after a re-attach of our own: a
+			// concurrent relay's re-attach can hand this id off in the gap a `continue`
+			// leaves, and re-sending an `initialize` whose replay is already on the wire
+			// earns `-32600 Server already initialized`.
+			if (settledByRecovery(msg, isReq)) return;
 			const t = upstream;
 			if (t) {
 				let kind;
@@ -741,14 +766,14 @@ export async function runMcpBridge({
 			// heals the transport for every other message riding it, and its sweep is
 			// what promptly answers the requests whose replies died with the old server.
 			const ok = await reattach();
-			// A failed re-attach is checked FIRST, because `attach()` registers the
-			// hand-off before it sends the replay: a throw in between leaves the id
-			// marked handed-off with nothing on the wire, so it must still be answered.
-			if (!ok) return mayResend ? failUnreachable(msg) : failAmbiguous(msg);
-			// Then the recovery's own claim on this id - already answered, or handshook
-			// on its behalf - which outranks the resend verdict below: there is nothing
-			// left to send and nothing ambiguous left to report.
+			// The recovery's own claim on this id - already answered, or handshook on
+			// its behalf - outranks EVERY verdict below, the failed-re-attach one
+			// included: `attach()` registers the hand-off only once the replay really is
+			// on the wire, so a claim here means a result is coming whatever else went
+			// wrong afterwards, and answering the id would drop that result as a
+			// duplicate and fail a handshake a working session had already completed.
 			if (settledByRecovery(msg, isReq)) return;
+			if (!ok) return mayResend ? failUnreachable(msg) : failAmbiguous(msg);
 			if (!mayResend) return failAmbiguous(msg);
 		}
 		if (isReq) {

@@ -272,19 +272,35 @@ export function canBindPort(port, host = '127.0.0.1') {
 
 /**
  * The address each role's server really binds, which is what its probe must ask
- * about (see `canBindPort`). These mirror the three listen sites and must move
- * with them:
- *   - app     - adapter-node, `HOST` or its `0.0.0.0` default; the launcher sets
- *               only `PORT`, so in practice the wildcard.
- *   - mcp     - `startMcpServer` (`CELLAR_MCP_HOST || '127.0.0.1'`).
- *   - jupyter - the sidecar spawn's `--ServerApp.ip=127.0.0.1`.
+ * about (see `canBindPort`). These mirror the real listen sites and must move
+ * with them - and the APP has TWO, because the launcher spawns a different
+ * server per branch:
+ *   - app (default)  - `node build/index.js`, i.e. adapter-node: `HOST` or its
+ *                      `0.0.0.0` default; the launcher sets only `PORT`, so in
+ *                      practice the wildcard.
+ *   - app (`--dev`)  - `vite dev --port <appPort> --strictPort`, spawned with no
+ *                      `--host`, so vite's own loopback default applies and
+ *                      `HOST` is not read at all. Probing the wildcard there
+ *                      asks a DIFFERENT question than the one that matters: on
+ *                      macOS it succeeds while an unrelated process holds
+ *                      `127.0.0.1:P`, so the remembered port is kept, `vite`
+ *                      fails `--strictPort`, the app child exits and the launch
+ *                      dies - and, because the remembered path "succeeded", the
+ *                      preference is rewritten and every later `--dev` launch in
+ *                      that folder fails the same way.
+ *   - mcp            - `startMcpServer` (`CELLAR_MCP_HOST || '127.0.0.1'`).
+ *   - jupyter        - the sidecar spawn's `--ServerApp.ip=127.0.0.1`.
+ *
+ * `dev` is threaded in from the launcher rather than guessed here, because only
+ * the launcher knows which of the two app servers this run will spawn.
  *
  * @param {Record<string, string | undefined>} env
+ * @param {{ dev?: boolean }} [opts]
  * @returns {{ app: string, mcp: string, jupyter: string }}
  */
-export function bindHosts(env = process.env) {
+export function bindHosts(env = process.env, { dev = false } = {}) {
 	return {
-		app: env.HOST || '0.0.0.0',
+		app: dev ? '127.0.0.1' : env.HOST || '0.0.0.0',
 		mcp: env.CELLAR_MCP_HOST || '127.0.0.1',
 		jupyter: '127.0.0.1'
 	};
@@ -413,6 +429,7 @@ export async function choosePort({
  * @param {{
  *   workspace: string,
  *   sticky: boolean,
+ *   dev?: boolean,
  *   env?: Record<string, string | undefined>,
  *   freePort: () => Promise<number> | number,
  *   instances?: (InstanceEntry | null | undefined)[],
@@ -427,6 +444,7 @@ export async function choosePort({
 export async function resolveWorkspacePorts({
 	workspace,
 	sticky,
+	dev = false,
 	env = process.env,
 	freePort,
 	instances = [],
@@ -477,7 +495,7 @@ export async function resolveWorkspacePorts({
 	// sticky role off its remembered address and then PERSISTED the replacement,
 	// losing the stable address this whole file exists to keep. Last, it simply
 	// skips whatever the sticky roles took, which its own `fresh()` already does.
-	const hosts = bindHosts(env);
+	const hosts = bindHosts(env, { dev });
 	const app = await take('CELLAR_APP_PORT', {
 		sticky,
 		remembered: prefs.appPort,
