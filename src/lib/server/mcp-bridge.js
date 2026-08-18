@@ -104,11 +104,19 @@
  * long `run_cell` already in flight hung on a dead session until the host's 60s
  * timeout - the exact symptom this bridge exists to remove.
  *
+ * Both of those are bounded by their OWN counter and neither may switch the other
+ * off: `sameSessionRetried` bounds how many times one message goes back on the
+ * wire, while `instanceGone()` is asked before EVERY re-attach. Collapsing them
+ * let a second blip re-attach with no evidence at all, against an instance
+ * provably alive on our own port.
+ *
  * Other pending requests are failed ONLY after a genuine re-attach, when their
  * answers provably can never arrive, and exactly ONCE per re-attach (in the
  * single-flight continuation, not per caller - per caller, two concurrent
  * failures each failed the other's request AND then retried it, so one id got
- * both an error and a result).
+ * both an error and a result). A request the recovery has already taken over -
+ * answered, or handed off so its replay is on the wire - is exempt from every
+ * verdict `deliver` would otherwise reach (`settledByRecovery`).
  *
  * This is the ONLY place with protocol awareness, and it is kept to the minimum
  * that a re-handshake requires: remember the agent's `initialize` request so it
@@ -584,6 +592,22 @@ export async function runMcpBridge({
 		failRequest(msg.id, AMBIGUOUS_SEND_MESSAGE);
 	};
 
+	/**
+	 * Has the recovery already taken responsibility for answering this request?
+	 *
+	 * Asked BEFORE any verdict `deliver` would otherwise reach, at every site where
+	 * a re-attach may have run, because a yes makes every other question moot: the
+	 * id is either already answered (`pending` no longer holds it - the sweep, the
+	 * real server, an earlier failure) or HANDED OFF, meaning `attach()` replayed
+	 * the agent's own `initialize` under a synthetic id and its reply is already on
+	 * the wire under this one. Reached after a resend verdict instead, an
+	 * ambiguously-failed handshake was answered with the ambiguous-write error while
+	 * a perfectly good session sat attached: the replay's real result then arrived,
+	 * found the id gone and was dropped, so the agent's `initialize` failed for the
+	 * life of that spawn - the exact handshake the hand-off exists to complete.
+	 */
+	const settledByRecovery = (msg, isReq) => isReq && (!pending.has(msg.id) || handedOff.has(msg.id));
+
 	/** Answer one request with the "nothing is serving this folder" error. */
 	const failUnreachable = (msg) => {
 		if (!isRequest(msg)) return;
@@ -681,20 +705,35 @@ export async function runMcpBridge({
 				// question is already answered here - it healed - so all that is left is
 				// whether THIS message may ride it.
 				if (upstream && upstream !== t) {
+					if (settledByRecovery(msg, isReq)) return;
 					if (mayResend) continue;
 					return failAmbiguous(msg);
 				}
-				if (kind === 'connection' && !sameSessionRetried && !(await instanceGone())) {
-					// The recorded instance still names our port and answers, so this was
-					// a blip (a stale keep-alive socket), not a replacement. A fresh
-					// socket is all it takes, and the session - with whatever long run is
-					// streaming on it - survives. That is the SESSION question answered:
-					// there is nothing to heal, so a message we may not resend simply ends
-					// here rather than tearing down a session that is provably fine.
-					if (!mayResend) return failAmbiguous(msg);
-					sameSessionRetried = true;
-					log('the instance is still alive; retrying on the same session');
-					continue;
+				if (kind === 'connection') {
+					// THE SESSION QUESTION, asked on EVERY connection-class failure and
+					// never switched off by a resend counter. `sameSessionRetried` bounds
+					// how many times ONE MESSAGE goes back on the wire; `instanceGone()`
+					// answers whether the SESSION is gone. Letting one flag decide both -
+					// skipping the confirmation once a retry had been spent - meant a second
+					// blip fell straight through to `reattach()` with no evidence at all,
+					// tearing down a session against an instance provably alive on our own
+					// port: every in-flight POST aborted and every pending request swept as
+					// lost, which is the cardinal sin this module's header names.
+					if (!(await instanceGone())) {
+						// The recorded instance still names our port and answers, so this was
+						// a blip (a stale keep-alive socket), not a replacement. A fresh
+						// socket is all it takes, and the session - with whatever long run is
+						// streaming on it - survives. There is nothing to heal, so nothing
+						// here may re-attach, whatever this message's own fate.
+						if (!mayResend) return failAmbiguous(msg);
+						if (sameSessionRetried) {
+							log('the instance is alive but the connection keeps failing; giving up on this message');
+							break;
+						}
+						sameSessionRetried = true;
+						log('the instance is still alive; retrying on the same session');
+						continue;
+					}
 				}
 			}
 
@@ -702,15 +741,15 @@ export async function runMcpBridge({
 			// heals the transport for every other message riding it, and its sweep is
 			// what promptly answers the requests whose replies died with the old server.
 			const ok = await reattach();
+			// A failed re-attach is checked FIRST, because `attach()` registers the
+			// hand-off before it sends the replay: a throw in between leaves the id
+			// marked handed-off with nothing on the wire, so it must still be answered.
+			if (!ok) return mayResend ? failUnreachable(msg) : failAmbiguous(msg);
+			// Then the recovery's own claim on this id - already answered, or handshook
+			// on its behalf - which outranks the resend verdict below: there is nothing
+			// left to send and nothing ambiguous left to report.
+			if (settledByRecovery(msg, isReq)) return;
 			if (!mayResend) return failAmbiguous(msg);
-			if (!ok) return failUnreachable(msg);
-			// Belt to the `relaying` braces: if this id was answered anyway while we
-			// were re-attaching, it is done. Re-sending would answer it twice, and
-			// JSON-RPC allows exactly one response per id.
-			if (isReq && !pending.has(msg.id)) return;
-			// The re-attach handshook on this request's behalf, so it is already on
-			// the wire; the reply comes back under its id.
-			if (isReq && handedOff.has(msg.id)) return;
 		}
 		if (isReq) {
 			failRequest(

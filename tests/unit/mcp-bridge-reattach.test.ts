@@ -244,13 +244,13 @@ function fakeStdio() {
  * bridge must not read a blip as a replacement.
  */
 function startFlakyProxy(targetPort: number) {
-	let dropNextPost = false;
+	let dropPosts = 0;
 	const sockets = new Set<import('node:net').Socket>();
 	let server: Server;
 	const listening = new Promise<number>((resolve) => {
 		server = http.createServer((req, res) => {
-			if (dropNextPost && req.method === 'POST') {
-				dropNextPost = false;
+			if (dropPosts > 0 && req.method === 'POST') {
+				dropPosts--;
 				req.socket.destroy();
 				return;
 			}
@@ -280,8 +280,9 @@ function startFlakyProxy(targetPort: number) {
 	});
 	return {
 		listening,
-		dropNext: () => {
-			dropNextPost = true;
+		/** Drop the next `n` POSTs. GETs pass through, so the liveness probe still answers. */
+		dropNext: (n = 1) => {
+			dropPosts = n;
 		},
 		close: () =>
 			new Promise<void>((r) => {
@@ -650,6 +651,95 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 
 		// ...and the healed session really works, with no further intervention.
 		expect(await stdio.request({ jsonrpc: '2.0', id: 4, method: 'tools/list' }, 8000)).toMatchObject({
+			result: { echoed: 'tools/list' }
+		});
+	});
+
+	it("completes the agent's OWN initialize when it fails AMBIGUOUSLY, not just when it is refused", async () => {
+		// The hand-off is what completes a handshake the agent is still waiting on:
+		// the re-attach replays that very `initialize`, so its reply comes back
+		// under the agent's id. Answering the id with the ambiguous-write verdict
+		// first fails exactly that handshake - and the replay's real result then
+		// arrives to find the id gone and is dropped, leaving the connection
+		// unusable for the whole spawn while a working session sits attached.
+		const cellar = await bootCellar();
+		const proxy = startFlakyProxy(cellar.port);
+		const proxyPort = await proxy.listening;
+		running.push(proxy);
+		writeRuntime(ws, { mcpPort: proxyPort, appPort: proxyPort + 1, jupyterPort: proxyPort + 2, pid: process.pid });
+
+		// The bridge attaches at startup, before the agent has said anything.
+		const { stdio } = await startBridge();
+
+		// The instance is replaced, and the agent's handshake lands on a socket that
+		// is RESET rather than refused - which is ambiguous, not proof. Its
+		// handshake is HELD open, so the hand-off is genuinely still unanswered when
+		// the recovery reaches its verdict for this message; answered inline it
+		// would leave nothing for a premature verdict to destroy.
+		await killCellar(cellar);
+		const replacement = await bootCellar(0, { holdInitialize: true });
+		proxy.dropNext();
+
+		stdio.post(INIT);
+		await until(() => replacement.seen.some((m) => m.method === 'initialize'), 8000);
+		// Let the recovery settle while the replayed handshake is still in flight.
+		await new Promise((r) => setTimeout(r, 100));
+		replacement.releaseInitialize();
+
+		const reply = await stdio.awaitReply(INIT.id, 8000);
+		expect(reply).toMatchObject({ id: INIT.id, result: { protocolVersion: '2025-06-18' } });
+		expect(reply.error).toBeUndefined();
+		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
+		expect(replacement.sessionCount()).toBe(1);
+
+		// ...and the session it minted really works.
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		expect(await stdio.request({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, 8000)).toMatchObject({
+			result: { echoed: 'tools/list' }
+		});
+	});
+
+	it('never re-attaches on a SECOND blip while the instance is provably alive on our port', async () => {
+		// `sameSessionRetried` bounds how many times one message goes back on the
+		// wire; it must not also switch off the evidence check. Skipping
+		// `instanceGone()` once a retry was spent let a second reset fall straight
+		// through to a re-attach with no evidence, tearing down a healthy session:
+		// every in-flight POST aborted and every pending request swept as lost.
+		const cellar = await bootCellar();
+		const proxy = startFlakyProxy(cellar.port);
+		const proxyPort = await proxy.listening;
+		running.push(proxy);
+		writeRuntime(ws, { mcpPort: proxyPort, appPort: proxyPort + 1, jupyterPort: proxyPort + 2, pid: process.pid });
+
+		const { stdio } = await startBridge();
+		await stdio.request(INIT);
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		const sessionsBefore = cellar.sessionCount();
+
+		// A long call is streaming on this session - the work the bridge exists to
+		// protect.
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => cellar.heldCount() === 1);
+
+		// A notification is the only message that survives an ambiguous failure
+		// still eligible to be re-sent, so it is what reaches the second blip. Both
+		// its attempts are dropped; the instance behind the proxy never moves.
+		proxy.dropNext(2);
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/progress', params: { n: 1 } });
+
+		// Give the retry and the second failure time to play out.
+		await new Promise((r) => setTimeout(r, 400));
+
+		// No re-handshake: the session is provably fine, so it was left alone.
+		expect(cellar.sessionCount()).toBe(sessionsBefore);
+		// ...and the long call was neither aborted nor reported lost.
+		expect(stdio.repliesFor(2)).toHaveLength(0);
+		cellar.release();
+		expect(await stdio.awaitReply(2, 8000)).toMatchObject({ result: { echoed: SLOW } });
+		// The notification really was given up on rather than escalated.
+		expect(cellar.seen.filter((m) => m.method === 'notifications/progress')).toHaveLength(0);
+		// ...and the session is still usable.
+		expect(await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, 8000)).toMatchObject({
 			result: { echoed: 'tools/list' }
 		});
 	});
