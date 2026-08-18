@@ -258,6 +258,11 @@ function startFlakyProxy(targetPort: number) {
 				{ host: '127.0.0.1', port: targetPort, path: req.url, method: req.method, headers: req.headers },
 				(upRes) => {
 					res.writeHead(upRes.statusCode ?? 502, upRes.headers);
+					// Node holds the headers back until the first body write, so a proxied
+					// event-stream reply would never reach the client until the run ended -
+					// i.e. the POST would not resolve and the request would not be "in
+					// flight" at all. A real reverse proxy passes them straight through.
+					res.flushHeaders();
 					upRes.pipe(res);
 				}
 			);
@@ -601,6 +606,54 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		expect(cellar.sessionCount()).toBe(sessionsBefore);
 	});
 
+	it('still heals the SESSION on an ambiguous failure, even though it will not re-send', async () => {
+		// Two independent questions. Declining the resend is about THIS message;
+		// whether the session is gone is about every OTHER message riding it. Asked
+		// only the first, the bridge sat on a dead session, so a long call already
+		// in flight - whose reply provably can no longer arrive - hung until the
+		// host's 60s timeout, which is the exact symptom this bridge removes.
+		const cellar = await bootCellar();
+		const proxy = startFlakyProxy(cellar.port);
+		const proxyPort = await proxy.listening;
+		running.push(proxy);
+		writeRuntime(ws, { mcpPort: proxyPort, appPort: proxyPort + 1, jupyterPort: proxyPort + 2, pid: process.pid });
+
+		const { stdio, inFlight } = await startBridge();
+		await stdio.request(INIT);
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+		// A long call is established on the session that is about to die.
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => cellar.heldCount() === 1 && inFlight.has(2));
+
+		// The instance is REALLY replaced - a new one registers on its own port.
+		await killCellar(cellar);
+		const replacement = await bootCellar();
+
+		// ...and the next POST is reset under us, which is AMBIGUOUS: it may have
+		// been delivered to something, so it may not be replayed.
+		proxy.dropNext();
+		const reply = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/call' }, 8000);
+		const ambiguous = reply.error as { code: number; message: string };
+		expect(ambiguous).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(ambiguous.message).toMatch(/may or may not have been applied/i);
+		expect(replacement.seen.filter((m) => m.method === 'tools/call')).toHaveLength(0);
+
+		// The SESSION question was still asked, so the bridge re-attached - and its
+		// sweep answered the long call promptly instead of leaving it to hang.
+		const lost = (await stdio.awaitReply(2, 8000)).error as { code: number; message: string };
+		expect(lost).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(lost.message).toMatch(/may or may not have been applied/i);
+		expect(replacement.sessionCount()).toBe(1);
+		expect(stdio.repliesFor(2)).toHaveLength(1);
+		expect(stdio.repliesFor(3)).toHaveLength(1);
+
+		// ...and the healed session really works, with no further intervention.
+		expect(await stdio.request({ jsonrpc: '2.0', id: 4, method: 'tools/list' }, 8000)).toMatchObject({
+			result: { echoed: 'tools/list' }
+		});
+	});
+
 	it('re-sends a request the server REFUSED, because a refusal proves it never ran', async () => {
 		// The other half of the rule, and the dominant restart case: a server that
 		// answers `-32000 No valid session` rejected the message before dispatching
@@ -650,8 +703,16 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		// Both retried calls really ran against the replacement ...
 		expect(stdio.repliesFor(3)[0]).toMatchObject({ result: { echoed: 'tools/list' } });
 		expect(stdio.repliesFor(4)[0]).toMatchObject({ result: { echoed: 'tools/list' } });
-		// ...and only the one genuinely lost with the dead session is reported lost.
-		expect(stdio.repliesFor(2)[0].error).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		// ...and only the one genuinely lost with the dead session is reported lost -
+		// honestly. Its send had RESOLVED, and the SDK resolves a send once the POST
+		// headers arrive, so the old server had ACCEPTED it and its handler was
+		// running or had run (the fake was holding it open). Claiming it "was not
+		// completed" and inviting a plain retry is what applies a write twice.
+		const lost = stdio.repliesFor(2)[0].error as { code: number; message: string };
+		expect(lost).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(lost.message).toMatch(/may or may not have been applied/i);
+		expect(lost.message).not.toMatch(/was not completed/i);
+		expect(lost.message).not.toMatch(/call again/i);
 		// One re-attach for the burst, not one per failing request.
 		expect(second.sessionCount()).toBe(1);
 	});
@@ -761,6 +822,16 @@ describe('provesNotDelivered - may this message be put on the wire again?', () =
 		// It answered - but from inside the dispatcher, so the tool may well have run.
 		expect(provesNotDelivered(httpError(500, 'mcp error: Error: boom'))).toBe(false);
 		expect(provesNotDelivered(httpError(429, 'Too Many Requests'))).toBe(false);
+	});
+
+	it('never judges a status-carrying failure by its message text', () => {
+		// The SDK folds the response BODY into the error message, so a tool failure
+		// that merely mentions a refused connection is not OUR connection being
+		// refused - and a live server that ANSWERED may already have run the handler.
+		expect(
+			provesNotDelivered(httpError(500, 'mcp error: Error: connection refused by the Spark cluster'))
+		).toBe(false);
+		expect(provesNotDelivered(httpError(502, 'ECONNREFUSED reported by an upstream proxy'))).toBe(false);
 	});
 
 	it('does not read a session phrase in a 500 body as a refusal', () => {

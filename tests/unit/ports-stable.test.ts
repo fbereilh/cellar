@@ -581,25 +581,77 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 		expect(third.app.source).toBe('remembered');
 	});
 
-	it('probes each role on the host that role really binds', async () => {
-		const first = await launch();
-		// Loopback-only squatters. The MCP server binds 127.0.0.1, so its port is
-		// genuinely taken; the app binds the wildcard, so its port is genuinely
-		// still free - probing both on one host would get one of them wrong, and
-		// getting the APP one wrong hands adapter-node a port it cannot listen on.
-		const onApp = await listenOn(first.appPort, '127.0.0.1');
-		const onMcp = await listenOn(first.mcpPort, '127.0.0.1');
+	it('asks about each role on the host that role really binds', async () => {
+		// The ROUTING is the portable claim, and asking it of the probe directly is
+		// a stronger test than a real socket: it proves WHICH question was asked
+		// rather than leaning on kernel behaviour to imply it, and it runs the same
+		// on every platform.
+		const asked: { port: number; host: string }[] = [];
+		const r = await launch({
+			canBind: async (port: number, host: string) => {
+				asked.push({ port, host });
+				return true;
+			}
+		});
+		const hostFor = (port: number) => asked.find((a) => a.port === port)?.host;
+		expect(hostFor(r.appPort)).toBe('0.0.0.0');
+		expect(hostFor(r.mcpPort)).toBe('127.0.0.1');
+		expect(hostFor(r.jupyterPort)).toBe('127.0.0.1');
+		// ...and the app follows HOST / the MCP server CELLAR_MCP_HOST, so the probe
+		// tracks a server that was told to bind somewhere else.
+		const asked2: { port: number; host: string }[] = [];
+		const other = mkdtempSync(join(tmpdir(), 'cellar-hosts-'));
 		try {
-			const second = await launch();
-			expect(second.app.source).toBe('remembered');
-			expect(second.appPort).toBe(first.appPort);
-			expect(second.mcp.source).toBe('fresh');
-			expect(second.mcp.reason).toBe('port-unavailable');
+			const r2 = await resolveWorkspacePorts({
+				workspace: other,
+				sticky: false,
+				env: { HOST: '127.0.0.1', CELLAR_MCP_HOST: '0.0.0.0' },
+				freePort,
+				bindGraceMs: 0,
+				canBind: async (port: number, host: string) => {
+					asked2.push({ port, host });
+					return true;
+				}
+			});
+			expect(asked2.find((a) => a.port === r2.appPort)?.host).toBe('127.0.0.1');
+			expect(asked2.find((a) => a.port === r2.mcpPort)?.host).toBe('0.0.0.0');
+			expect(asked2.find((a) => a.port === r2.jupyterPort)?.host).toBe('127.0.0.1');
 		} finally {
-			await onApp.close();
-			await onMcp.close();
+			rmSync(other, { recursive: true, force: true });
 		}
 	});
+
+	// The CONSEQUENCE of getting that routing wrong is only observable where the
+	// kernel lets a wildcard bind and a loopback bind of one port coexist. That
+	// permissive overlap is BSD/macOS SO_REUSEADDR behaviour (measured); Linux
+	// treats wildcard-vs-specific as a conflict once the holder is LISTENing, so
+	// the app half would simply read as taken there and prove nothing about which
+	// host was probed. The routing itself is covered unconditionally above.
+	describe.skipIf(process.platform !== 'darwin')(
+		'wildcard-vs-loopback overlap (darwin only: BSD SO_REUSEADDR lets these coexist)',
+		() => {
+			it('leaves the app on its remembered port while a loopback-only squatter holds it', async () => {
+				const first = await launch();
+				// Loopback-only squatters. The MCP server binds 127.0.0.1, so its port
+				// is genuinely taken; the app binds the wildcard, so on this platform
+				// its port is genuinely still free - probing both on one host would get
+				// one of them wrong, and getting the APP one wrong hands adapter-node a
+				// port it cannot listen on.
+				const onApp = await listenOn(first.appPort, '127.0.0.1');
+				const onMcp = await listenOn(first.mcpPort, '127.0.0.1');
+				try {
+					const second = await launch();
+					expect(second.app.source).toBe('remembered');
+					expect(second.appPort).toBe(first.appPort);
+					expect(second.mcp.source).toBe('fresh');
+					expect(second.mcp.reason).toBe('port-unavailable');
+				} finally {
+					await onApp.close();
+					await onMcp.close();
+				}
+			});
+		}
+	);
 
 	it('yields to a live registered instance holding the remembered port', async () => {
 		const first = await launch();
@@ -769,7 +821,9 @@ describe('bindHosts - each role probes the address its own server binds', () => 
 	// 0.0.0.0:P, so probing loopback reported the app port free while adapter-node
 	// still held it on the wildcard - which would hand the app a port its own
 	// listen() cannot take. The end-to-end consequence is covered against real
-	// listeners by 'probes each role on the host that role really binds' above;
+	// listeners by the darwin-gated overlap suite above, and the routing itself is
+	// covered unconditionally by 'asks about each role on the host that role really
+	// binds';
 	// this pins the mapping itself, in both directions, for each role.
 
 	it('gives the app the wildcard by default and follows HOST when it is set', () => {

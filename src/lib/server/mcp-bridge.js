@@ -96,6 +96,14 @@
  * asymmetry free (the handshake's `notifications/initialized` still survives a
  * blip).
  *
+ * DECLINING THE RESEND IS NOT DECLINING THE HEAL. The two questions stay
+ * independent all the way down `deliver`: an ambiguous failure still asks
+ * `instanceGone()` and still re-attaches, because that repairs the transport for
+ * every OTHER message riding it and its sweep is what promptly answers requests
+ * whose replies died with the old server. Collapsed into one early return, a
+ * long `run_cell` already in flight hung on a dead session until the host's 60s
+ * timeout - the exact symptom this bridge exists to remove.
+ *
  * Other pending requests are failed ONLY after a genuine re-attach, when their
  * answers provably can never arrive, and exactly ONCE per re-attach (in the
  * single-flight continuation, not per caller - per caller, two concurrent
@@ -264,6 +272,15 @@ export function classifyUpstreamFailure(err) {
  */
 export function provesNotDelivered(err) {
 	if (classifyUpstreamFailure(err) === 'session-gone') return true;
+	// The status short-circuit outranks everything below it, for the same reason
+	// `classifyUpstreamFailure` documents: the SDK folds the response BODY into the
+	// error message, so a live server that ANSWERED - from inside its dispatcher,
+	// after the handler may already have run - must never be judged by text. A tool
+	// failure reading `mcp error: ... connection refused by the Spark cluster` would
+	// otherwise come back "safe to replay". This predicate decides whether a
+	// mutation may be re-applied, so it has to be sound on its own terms rather
+	// than by a caller's ordering.
+	if (httpStatusOf(err) != null) return false;
 	for (const e of errorChain(err)) {
 		if (typeof e?.code === 'string' && CONNECT_FAILED_CODES.has(e.code)) return true;
 	}
@@ -279,6 +296,19 @@ export const AMBIGUOUS_SEND_MESSAGE =
 	'The connection to Cellar broke while this request was in flight, so it may or may not have been ' +
 	'applied. It was deliberately NOT re-sent, because re-sending a write would risk applying it twice. ' +
 	'Check the notebook state before calling again.';
+
+/**
+ * What a request swept by a re-attach is told. Its send had RESOLVED, and the
+ * SDK resolves a send once the POST's headers arrive, so the old server had
+ * ACCEPTED the message and its handler was running or had already run - which
+ * makes this the more confident case of the two, not the less. So it may not say
+ * the call "was not completed" and may not invite a plain retry: only the RESULT
+ * is provably lost.
+ */
+export const LOST_RESULT_MESSAGE =
+	'The connection to the Cellar instance that was executing this request was lost, so its result can ' +
+	'never be delivered; the call may or may not have been applied. Check the notebook state before ' +
+	'retrying it.';
 
 /**
  * Run the bridge for `workspace`. The returned promise stays pending for the
@@ -513,7 +543,7 @@ export async function runMcpBridge({
 						if (relaying.has(id) || handedOff.has(id)) continue;
 						failRequest(
 							id,
-							'Cellar restarted while this request was in flight; it was not completed. Call again.'
+							LOST_RESULT_MESSAGE
 						);
 					}
 				}
@@ -542,6 +572,16 @@ export async function runMcpBridge({
 			log(`could not confirm the instance (${err?.message ?? err}); treating it as gone`);
 			return true;
 		}
+	};
+
+	/**
+	 * Answer one request whose send failed AMBIGUOUSLY. Separate from the two
+	 * messages above because it is a different fact: we do not know whether it
+	 * arrived, so it is neither "lost" nor "not completed".
+	 */
+	const failAmbiguous = (msg) => {
+		if (!isRequest(msg)) return;
+		failRequest(msg.id, AMBIGUOUS_SEND_MESSAGE);
 	};
 
 	/** Answer one request with the "nothing is serving this folder" error. */
@@ -582,6 +622,15 @@ export async function runMcpBridge({
 	 */
 	const deliver = async (msg, isReq) => {
 		let sameSessionRetried = false;
+		// TWO INDEPENDENT QUESTIONS, and they must not be collapsed into one return.
+		// "Is the SESSION gone" is answered below by `instanceGone()` / `reattach()`
+		// and heals the transport for every OTHER message riding it; "may THIS message
+		// go on the wire again" is answered by `provesNotDelivered` and belongs to
+		// this call alone. Answering only the second one left the bridge sitting on a
+		// dead session after an ambiguous failure, so a long `run_cell` already in
+		// flight - whose reply provably could no longer arrive - hung until the host's
+		// timeout, which is the exact symptom this bridge exists to remove.
+		let mayResend = true;
 		for (let attempt = 0; attempt < 4; attempt++) {
 			const t = upstream;
 			if (t) {
@@ -624,27 +673,36 @@ export async function runMcpBridge({
 					// by a session refusal (same port) or by a refused connection (new
 					// port), and both PROVE non-delivery - so "restart Cellar, the agent's
 					// next call just works" is untouched.
-					if (isReq && !provesNotDelivered(err)) {
-						failRequest(msg.id, AMBIGUOUS_SEND_MESSAGE);
-						return;
-					}
+					if (isReq && !provesNotDelivered(err)) mayResend = false;
 				}
 				// A concurrent relay re-attached while we were failing: its session is
 				// ours too. Take it rather than minting a second one, which would close
-				// the transport that relay is still using out from under it.
-				if (upstream && upstream !== t) continue;
+				// the transport that relay is still using out from under it. The session
+				// question is already answered here - it healed - so all that is left is
+				// whether THIS message may ride it.
+				if (upstream && upstream !== t) {
+					if (mayResend) continue;
+					return failAmbiguous(msg);
+				}
 				if (kind === 'connection' && !sameSessionRetried && !(await instanceGone())) {
 					// The recorded instance still names our port and answers, so this was
 					// a blip (a stale keep-alive socket), not a replacement. A fresh
 					// socket is all it takes, and the session - with whatever long run is
-					// streaming on it - survives.
+					// streaming on it - survives. That is the SESSION question answered:
+					// there is nothing to heal, so a message we may not resend simply ends
+					// here rather than tearing down a session that is provably fine.
+					if (!mayResend) return failAmbiguous(msg);
 					sameSessionRetried = true;
 					log('the instance is still alive; retrying on the same session');
 					continue;
 				}
 			}
 
+			// The SESSION question, asked whatever this message's own fate: a re-attach
+			// heals the transport for every other message riding it, and its sweep is
+			// what promptly answers the requests whose replies died with the old server.
 			const ok = await reattach();
+			if (!mayResend) return failAmbiguous(msg);
 			if (!ok) return failUnreachable(msg);
 			// Belt to the `relaying` braces: if this id was answered anyway while we
 			// were re-attaching, it is done. Re-sending would answer it twice, and
