@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import {
 	DEFAULT_PROFILE_CONSEQUENCE,
 	SETTINGS_SECTION,
+	defaultProfileNoticeApplies,
 	defaultProfileProblem,
 	resolveDefaultProfile,
 	switchDefaultProfileCommand,
@@ -244,6 +245,76 @@ describe('what the user is shown', () => {
 	});
 });
 
+describe('WHERE the notice may appear: defaultProfileNoticeApplies', () => {
+	/**
+	 * The gate that keeps the notice off a machine that is fine.
+	 *
+	 * It lives in this module rather than in `Databricks.svelte` precisely so it is
+	 * covered by the suite CI and the no-mistakes gate actually run - both of which
+	 * run the unit tests only. `tests/e2e/databricks-default-profile.spec.ts` proves
+	 * the panel renders what this answers; this proves the answer.
+	 */
+
+	/** A file with profiles and no default anywhere - the reported failing shape. */
+	const needsOne = resolveDefaultProfile(
+		input({ sections: ['work', 'staging'], candidates: ['work', 'staging'] })
+	);
+	/** The same file once `databricks auth switch` has run. */
+	const resolvesFine = resolveDefaultProfile(
+		input({
+			sections: [SETTINGS_SECTION, 'work'],
+			settingsDefaultProfile: 'work',
+			candidates: ['work']
+		})
+	);
+
+	it('a machine whose default resolves is silent in EVERY connection state', () => {
+		expect(resolvesFine.needsDefault).toBe(false);
+		for (const connection of [
+			{ connected: true },
+			{ connected: false },
+			{ connected: false, expired: true },
+			{ connected: false, restarting: true },
+			{ connected: false, lost: { clusterName: 'c' } }
+		]) {
+			expect(defaultProfileNoticeApplies(resolvesFine, connection)).toBe(false);
+		}
+	});
+
+	it('connected: shown - CONNECT_CODE has scrubbed this kernel, so the file is the whole answer', () => {
+		expect(defaultProfileNoticeApplies(needsOne, { connected: true })).toBe(true);
+	});
+
+	it('expired: shown - the server only reports it for a session that WAS live, i.e. the same process', () => {
+		// And it is where the user is most likely troubleshooting: their own
+		// WorkspaceClient() is failing right now.
+		expect(defaultProfileNoticeApplies(needsOne, { connected: false, expired: true })).toBe(true);
+	});
+
+	it('never connected: SILENT, even though the file itself needs a default', () => {
+		// The false nag. This kernel never ran CONNECT_CODE, so a shell
+		// DATABRICKS_HOST+DATABRICKS_TOKEN is still in its env and short-circuits the
+		// SDK's file loader - a bare Config() resolves without reading the file at all.
+		expect(needsOne.needsDefault).toBe(true);
+		expect(defaultProfileNoticeApplies(needsOne, { connected: false })).toBe(false);
+	});
+
+	it('lost / restarting: SILENT - that may be a FRESH kernel whose env was never scrubbed', () => {
+		// The boundary `expired` must not be widened past: a kernel restart gives a new
+		// process which inherits the shell's DATABRICKS_* again.
+		expect(defaultProfileNoticeApplies(needsOne, { connected: false, lost: { clusterName: 'c' } })).toBe(false);
+		expect(defaultProfileNoticeApplies(needsOne, { connected: false, restarting: true })).toBe(false);
+	});
+
+	it('claims nothing with no verdict and no connection to read', () => {
+		// An older server payload carries no `defaultProfile`; the panel must stay quiet
+		// rather than throw or guess.
+		expect(defaultProfileNoticeApplies(undefined, { connected: true })).toBe(false);
+		expect(defaultProfileNoticeApplies(null, { connected: true })).toBe(false);
+		expect(defaultProfileNoticeApplies(needsOne, undefined)).toBe(false);
+	});
+});
+
 // ---------------------------------------------------------------------------
 // Layer 2: the reader, over real files.
 // ---------------------------------------------------------------------------
@@ -334,6 +405,23 @@ describe('readDefaultProfile over a real ~/.databrickscfg', () => {
 		expect(verdict.candidates).toEqual(['work']);
 		process.env.DATABRICKS_CONFIG_FILE = cfg;
 		expect(dbx.readProfiles().profiles[0].host).toBe('https://x.cloud.databricks.com');
+	});
+
+	it('two sections that trim to ONE name are offered once - a duplicate key crashes the page', () => {
+		// configparser's SECTCRE does not trim, so `[work]` and `[work ]` are two legal,
+		// distinct sections to the SDK; this reader trims, so both arrive as `work`. Every
+		// surface renders the list through a keyed `{#each … (name)}`, and a duplicate key
+		// throws Svelte's `each_key_duplicate` during render - which, with no
+		// `<svelte:boundary>` anywhere in `src/`, takes down the whole page rather than one
+		// card. Deduped where the list is BUILT, so both the picker and the notice inherit it.
+		const { cfg, verdict } = verdictFor(
+			'[work]\nhost = https://a.cloud.databricks.com\ntoken = pat\n[work ]\nhost = https://b.cloud.databricks.com\ntoken = pat\n'
+		);
+		expect(verdict.candidates).toEqual(['work']);
+		process.env.DATABRICKS_CONFIG_FILE = cfg;
+		expect(dbx.readProfiles().profiles.map((p) => p.name)).toEqual(['work']);
+		// First occurrence wins, so the surviving row still describes a real section.
+		expect(dbx.readProfiles().profiles[0].host).toBe('https://a.cloud.databricks.com');
 	});
 
 	it('comments and blank lines do not create sections or keys', () => {

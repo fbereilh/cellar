@@ -65,10 +65,8 @@
  * shell does not survive to be a mitigation.
  *
  * **That is why the notice is gated on a kernel that has really run `CONNECT_CODE`**
- * (`Databricks.svelte`'s `needsDefaultProfile`: the panel's own `connected` signal,
- * or an `expired` session - which its server only ever reports for a session that
- * WAS live, i.e. the same process, and never for a lost/restarting one that may be
- * a fresh kernel). Before a connect the scrub has not run, so a shell
+ * - see `defaultProfileNoticeApplies` below, which owns that rule so the component
+ * holds no copy of it. Before a connect the scrub has not run, so a shell
  * `DATABRICKS_HOST`+`DATABRICKS_TOKEN` is still present and short-circuits
  * `_known_file_config_loader` outright - a bare `Config()` resolves without reading
  * this file at all, and the notice would be a false nag, the one thing it must not
@@ -190,6 +188,69 @@ export function resolveDefaultProfile(input: DefaultProfileInput): DefaultProfil
 
 	// Rule 4.
 	return fail('no_default');
+}
+
+/**
+ * The connection facts the notice rule reads. A subset of the panel's own
+ * `DbxConnection`, so the component passes what it already has.
+ */
+export interface DefaultProfileConnection {
+	/** A live Spark Connect session in this kernel. */
+	connected?: boolean;
+	/**
+	 * The session expired server-side (idle timeout / cluster GC / a closed client).
+	 * Reported as `connected:false` with a `lost` cluster.
+	 */
+	expired?: boolean;
+	/**
+	 * The session ended when the kernel restarted. Declared, and deliberately NOT
+	 * read: a restart gives a FRESH process which inherits the shell's `DATABRICKS_*`
+	 * again, so the file is no longer the whole answer. Naming it here is what keeps
+	 * that boundary visible at the rule rather than only in prose.
+	 */
+	lost?: { clusterName?: string; profile?: string } | null;
+	/** A restart is in flight. Not read, for the same reason as `lost`. */
+	restarting?: boolean;
+}
+
+/**
+ * Should the "no default profile" notice be shown for this verdict, in a notebook
+ * whose connection looks like this?
+ *
+ * THE RULE, and it lives here rather than in the component on purpose: it is a
+ * decision, not a rendering, and the only suite this repo's CI and its gate run is
+ * the unit one - so a rule kept as an expression inside `Databricks.svelte` could be
+ * deleted and merge green, taking the false nag below with it. `Databricks.svelte`
+ * calls this and holds no copy of it; `tests/e2e/databricks-default-profile.spec.ts`
+ * proves the panel really renders what it answers.
+ *
+ * Two halves:
+ *
+ *   - `needsDefault` - the file's own verdict, already false both when resolution
+ *     succeeds and when there is no profile to offer as a default, so a machine that
+ *     is fine and one with nothing to choose between are silent by construction.
+ *   - has this KERNEL PROCESS run `CONNECT_CODE`? Load-bearing, not caution: the
+ *     verdict reads the config FILE alone, which is the whole truth only once that
+ *     scrub has taken every `DATABRICKS_*` var out of the kernel. Before a connect a
+ *     shell `DATABRICKS_HOST`+`DATABRICKS_TOKEN` short-circuits the SDK's file loader
+ *     outright, so a bare `Config()` resolves without reading the file at all and the
+ *     notice would be a false nag - the one thing this feature must never be.
+ *
+ * `expired` counts and `lost`/`restarting` does NOT, which is the exact boundary
+ * rather than an approximation. The server only reaches its expiry branch AFTER the
+ * session was live (`liveConnection` returns on `!status.connected` above it), so an
+ * expired session is provably the SAME process that ran the scrub - and it is where
+ * the user is most likely troubleshooting, their own `WorkspaceClient()` failing
+ * while the card explaining it went missing. A lost/restarting session is the
+ * opposite: a kernel restart gives a FRESH process which inherits the shell's
+ * `DATABRICKS_*` again, so the premise does not hold and the notice stays silent.
+ */
+export function defaultProfileNoticeApplies(
+	verdict: DefaultProfileVerdict | null | undefined,
+	connection: DefaultProfileConnection | null | undefined
+): boolean {
+	if (verdict?.needsDefault !== true) return false;
+	return !!connection?.connected || connection?.expired === true;
 }
 
 /**

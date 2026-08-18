@@ -35,6 +35,7 @@
 		DEFAULT_PROFILE_REMEDY,
 		SWITCH_COMMAND_HEAD,
 		SWITCH_PROFILE_FLAG,
+		defaultProfileNoticeApplies,
 		defaultProfileProblem,
 		switchDefaultProfileCommand,
 		type DefaultProfileVerdict
@@ -605,36 +606,15 @@
 	const profiles = $derived(status?.config?.profiles ?? []);
 	const hasProfiles = $derived(profiles.length > 0);
 	/**
-	 * The default-profile notice's ONE gate, and it has TWO halves.
-	 *
-	 * `needsDefault` is the server's own predicate (`$lib/databricksDefaultProfile`),
-	 * already false both when resolution succeeds and when there is no profile to
-	 * offer as a default - so a machine that is fine, and one with nothing to choose
-	 * between, are silent by construction rather than by a second rule kept in step
-	 * here.
-	 *
-	 * The other half is "has this KERNEL PROCESS run `CONNECT_CODE`", and it is
-	 * load-bearing rather than caution: the verdict reads the config FILE alone,
-	 * which is the whole truth only once that scrub has taken every `DATABRICKS_*`
-	 * var out of the kernel. Before a connect a shell `DATABRICKS_HOST`+`DATABRICKS_TOKEN`
-	 * short-circuits the SDK's file loader outright, so a bare `Config()` resolves
-	 * without reading the file and the notice would be a false nag.
-	 *
-	 * `expired` is admitted alongside `connected` and the LOST/restarting states are
-	 * NOT, which is the exact boundary rather than an approximation. `liveConnection`
-	 * only reaches its expiry branch AFTER `status.connected` was true (the
-	 * `!status.connected` case returns above it), so an expired session is provably
-	 * the SAME process that ran the scrub - and it is where the user is most likely
-	 * troubleshooting, their own `WorkspaceClient()` failing while the card that
-	 * explains it went missing. A lost/restarting session is the opposite: it may be
-	 * a FRESH kernel whose env was never scrubbed, so the premise does not hold and
-	 * the card stays silent. Both halves reuse signals the panel already receives -
-	 * never a second one.
+	 * The default-profile notice, decided by `$lib/databricksDefaultProfile`'s
+	 * `defaultProfileNoticeApplies` - the ONE owner of that rule (which states the
+	 * two halves and why `expired` counts while `lost`/`restarting` does not). Kept
+	 * out of this component deliberately: it is a decision rather than a rendering,
+	 * and only the unit suite runs in CI and in the gate, so a rule living here as an
+	 * expression could be deleted and merge green.
 	 */
 	const defaultProfile = $derived(status?.config?.defaultProfile);
-	const needsDefaultProfile = $derived(
-		defaultProfile?.needsDefault === true && (connected || connection.expired === true)
-	);
+	const needsDefaultProfile = $derived(defaultProfileNoticeApplies(defaultProfile, connection));
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
 	const installed = $derived(!!install.sdk && !!install.connect);
 	/**

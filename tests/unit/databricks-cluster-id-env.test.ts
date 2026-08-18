@@ -306,9 +306,20 @@ describe('disconnect removes it', () => {
 		return state.lastDisconnectCode;
 	}
 
-	it('drops DATABRICKS_CLUSTER_ID', async () => {
-		const { env, result } = runKernelCode(await disconnectCode(), { DATABRICKS_CLUSTER_ID: CLUSTER_A });
-		expect(result).toMatchObject({ ok: true });
+	/**
+	 * Bind a session first, so the code takes the branch that really stops one. Without
+	 * this every disconnect case runs in a fresh interpreter where `spark` was never
+	 * bound, so they all take the early return and the ordinary path - the one a user
+	 * actually hits - goes unexercised.
+	 */
+	const WITH_SESSION = ['from databricks.connect import _Session', 'spark = _Session()', ''].join('\n');
+
+	it('drops DATABRICKS_CLUSTER_ID when it really stops a session', async () => {
+		const { env, result } = runKernelCode(WITH_SESSION + (await disconnectCode()), {
+			DATABRICKS_CLUSTER_ID: CLUSTER_A
+		});
+		// `stopped: true` is what proves the session branch ran, not the early return.
+		expect(result).toMatchObject({ ok: true, stopped: true });
 		expect(env.DATABRICKS_CLUSTER_ID).toBeUndefined();
 	});
 
