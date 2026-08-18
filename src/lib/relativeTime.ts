@@ -64,3 +64,32 @@ export function formatDuration(ms: number | null | undefined): string {
 	const rem = Math.round(s % 60);
 	return `${m}m ${rem}s`;
 }
+
+/**
+ * The LIVE sibling of `formatDuration`: elapsed wall-clock for a run that is still
+ * going (`running 12s` beside the cell's spinner), ticking once a second.
+ *
+ * Deliberately not a second duration vocabulary — the minutes tier DELEGATES to
+ * `formatDuration`, so `1m 5s` is spelled in exactly one place and the live clock
+ * and the settled badge that replaces it cannot drift. Only the sub-minute tier
+ * differs, and it has to: `formatDuration`'s `1.2s`/`820ms` are written for a
+ * value that has stopped moving, whereas a once-a-second clock rendering them
+ * would read `1.0s`, `2.0s`, … (a decimal that is always `.0`) and jitter the row
+ * width as the digit count changes. So under a minute this floors to whole
+ * seconds. Both then agree on the units either side of the handover: `12s` becomes
+ * `12.3s`, `1m 5s` stays `1m 5s`.
+ *
+ * The delegation is fed a WHOLE second (`ms` floored), which is also what keeps
+ * `formatDuration`'s `Math.round(s % 60)` from ever rendering the impossible
+ * `1m 60s` here — with an integer second the round is the identity.
+ *
+ * Anything not a usable positive duration reads `0s`, never a negative or a blank:
+ * the one way to get there is reading a `runNowMs()` frozen since before this run
+ * started (see `now.svelte.ts`), which is a just-started run — exactly `0s`.
+ */
+export function formatElapsed(ms: number | null | undefined): string {
+	if (ms == null || !Number.isFinite(ms) || ms <= 0) return '0s';
+	const whole = Math.floor(ms / 1000) * 1000;
+	if (whole < 60000) return `${whole / 1000}s`;
+	return formatDuration(whole);
+}

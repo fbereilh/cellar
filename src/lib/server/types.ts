@@ -361,6 +361,20 @@ export interface RunningView {
 	nb: string;
 	cellId: string;
 	actor: Actor;
+	/**
+	 * Wall-clock ms at which this run began EXECUTING — the same instant the
+	 * `run:start` event carries as `at` and the closing `run:end` measures its
+	 * `durationMs` from, reported by the run itself (`noteRunStarted`) so there is
+	 * one origin rather than one per surface. It is how a client that missed
+	 * `run:start` (a tab whose SSE stream connects, or a notebook that mounts,
+	 * mid-run) still knows how long the running cell has been going.
+	 *
+	 * Absent for the sub-millisecond window between the kernel being claimed and the
+	 * run reporting in — and for a claim whose owner then bails before executing
+	 * (`cell_removed`). "Running, start unknown" is the honest reading; a consumer
+	 * must render the run without an elapsed rather than inventing an origin.
+	 */
+	startedAt?: number;
 }
 
 /** The whole kernel-queue state (broadcast + the `run_queue` MCP tool). */

@@ -15,6 +15,21 @@
 /** Default refresh cadence for the run-badge relative labels. */
 export const NOW_TICK_MS = 15000;
 
+/**
+ * Cadence for the LIVE elapsed clock on a cell that is executing right now
+ * (`running 12s`). Deliberately a SECOND ticker instance rather than a faster
+ * `NOW_TICK_MS`: the 15s cadence exists because "ran 2m ago" cannot get staler
+ * than its own unit, and dropping it to 1s would wake every idle run badge in the
+ * notebook 15x more often to redraw text that has not changed. A running cell is
+ * the opposite case - its label changes every second and there is at most one such
+ * cell per notebook - so it gets its own ref-counted instance that runs ONLY while
+ * something is executing and stops with the last run (see `now.svelte.ts`).
+ *
+ * 1000ms matches the whole-second display (`formatElapsed`); a faster cadence
+ * would redraw the same string, a slower one would visibly skip numbers.
+ */
+export const RUN_TICK_MS = 1000;
+
 export interface NowTicker {
 	/**
 	 * Register interest in a live `now`. Starts the single interval on the first

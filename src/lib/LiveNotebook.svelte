@@ -130,7 +130,9 @@
 	/** A run-lifecycle event (run:cleared / run:start / run:output / run:output-append / run:end). */
 	type RunEvent =
 		| { type: 'run:cleared'; cellId?: string }
-		| { type: 'run:start'; cellId?: string; actor?: Actor }
+		// `at` is the server's run-start instant, the same origin `run:end` measures
+		// `durationMs` from — see RunningView.startedAt.
+		| { type: 'run:start'; cellId?: string; at?: number; actor?: Actor }
 		| { type: 'run:output'; cellId?: string; output: CellOutput; index?: number }
 		| { type: 'run:output-append'; cellId?: string; index: number; base: number; keep: number; chunk: string }
 		| { type: 'run:end'; cellId?: string; at?: number; durationMs?: number; actor?: Actor };
@@ -271,6 +273,33 @@
 		onHideAllCodeChange?.(path, hideAllCode);
 	});
 	let runningId = $state<string | null>(null); // the cell running in THIS notebook (≤1)
+	// When that run began executing (server wall-clock ms), so the running cell can
+	// show a live elapsed clock. Server-stamped, never derived from when THIS tab
+	// noticed `running` flip: the three ways a tab learns a run started
+	// (`run:start` on its own NDJSON stream, `run:start` over SSE, the
+	// `queue:changed` snapshot a mid-run mount/reconnect is seeded from) all carry
+	// the same origin, which is also what `run:end` measures `durationMs` from — so
+	// the clock is right for a run that was already 10 minutes old when this tab
+	// arrived, and hands over to the settled badge with no jump. Null means the
+	// start is genuinely unknown (a pre-`startedAt` snapshot); the cell then renders
+	// as running with no clock rather than inventing an origin.
+	let runningSince = $state<number | null>(null);
+
+	// `runningId` and `runningSince` are ONE fact and must move together — a stale
+	// `runningSince` would time the wrong run. These two are the ONLY writers of
+	// either (pinned by a source guard in tests/unit/run-elapsed.test.ts), so a new
+	// run path has to state the start rather than silently inherit the last one's.
+	/** This notebook's kernel is now executing `id`, which began at `since` (null = unknown). */
+	function markRunning(id: string, since: number | null) {
+		runningId = id;
+		runningSince = since;
+	}
+	/** This notebook's kernel is no longer executing anything of ours. */
+	function clearRunning() {
+		runningId = null;
+		runningSince = null;
+	}
+
 	// Cells of THIS notebook waiting in ITS kernel's FIFO → their 1-based
 	// position in that queue (1 = next up). Positions are per notebook: a cell
 	// only ever waits behind its own notebook's cells (notebooks run in
@@ -1418,7 +1447,7 @@
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
 			// finished server-side) would leave the spinner stuck and, via runCell's
 			// `runningId === id` double-submit guard, permanently refuse to re-run it.
-			runningId = null;
+			clearRunning();
 			lastSeq = null; // reconnect refetches once here; don't also trip the seq-gap check
 			// `queued` is NOT reset: the queue lives on the server and outlives this
 			// refetch. Apply any snapshot that arrived before we knew our absolute id.
@@ -1527,7 +1556,7 @@
 			cells = cells.filter((c) => c.id !== ev.cellId);
 			setRawEdit(ev.cellId, false);
 			forgetCollapsed([ev.cellId]);
-			if (runningId === ev.cellId) runningId = null;
+			if (runningId === ev.cellId) clearRunning();
 			// A cell an agent (or another tab) removed leaves the selection: it no
 			// longer exists, so a bulk op must not still be aimed at it. Dropping the
 			// PRIMARY deliberately leaves `activeId` null rather than moving it - a
@@ -1629,13 +1658,18 @@
 		// notebook will follow it - which is the intended behavior (it is looking at
 		// the notebook that is running); a background tab stays put via the `active`
 		// guard on the follow effect.
-		const running = ev.running?.find((r) => r.nb === canonicalId)?.cellId ?? null;
-		if (running) {
-			if (findCell(running)) runningId = running;
+		// It also carries WHEN that run started, so the elapsed clock on a run this tab
+		// never saw begin is measured from the real start rather than from our arrival —
+		// a query already 10 minutes in reads `10m 4s`, not `0s`. A snapshot without it
+		// (the sub-ms window before the run reports in) leaves the start unknown and the
+		// cell renders running with no clock.
+		const running = ev.running?.find((r) => r.nb === canonicalId) ?? null;
+		if (running?.cellId) {
+			if (findCell(running.cellId)) markRunning(running.cellId, running.startedAt ?? null);
 		} else if (runningId) {
 			// This notebook's kernel is idle: nothing of ours runs (another notebook's
 			// kernel may still be busy — that is not ours to reflect).
-			runningId = null;
+			clearRunning();
 		}
 	}
 
@@ -1690,8 +1724,11 @@
 			// "queued · N" badge, instead of lingering until its turn comes.
 			if (cell) cell.outputs = [];
 		} else if (ev.type === 'run:start') {
-			if (cell) {
-				runningId = ev.cellId ?? null;
+			if (cell && ev.cellId) {
+				// `ev.at` is the server's run-start instant, which is also what this run's
+				// `run:end` measures `durationMs` from — so the live clock hands over to
+				// the settled badge with no jump.
+				markRunning(ev.cellId, ev.at ?? null);
 				// Following is driven by `runningId` + the viewed-notebook (`active`)
 				// guard, so any run in the viewed notebook follows and a background
 				// notebook's run never does - no per-actor bookkeeping needed here.
@@ -1714,7 +1751,7 @@
 			if (cell && !applyOutputAppend(cell, ev.index, ev.base, ev.keep, ev.chunk) && !fetching) load();
 		} else if (ev.type === 'run:end') {
 			stampLastRun(cell, ev); // update the run-metadata badge (agent / other-tab runs)
-			if (runningId === ev.cellId) runningId = null;
+			if (runningId === ev.cellId) clearRunning();
 			scheduleStaleness(); // a finished run clears/creates staleness downstream
 		}
 	}
@@ -1888,8 +1925,11 @@
 						// The kernel is ours now (immediately, or after a wait in the queue).
 						// Clear stale output at execution start so the cell reads as
 						// "running, no output yet" until fresh output streams in.
+						// `ev.at` is the server's start instant — the same one this run's
+						// `run:end` measures `durationMs` from — so the live elapsed clock is
+						// timed from the run itself, not from when this frame reached us.
 						started = true;
-						runningId = id;
+						markRunning(id, typeof ev.at === 'number' ? ev.at : null);
 						cell.outputs = [];
 					} else if (ev.type === 'output') {
 						// A refused index (see applyOutput) is a NO-OP here, exactly like the
@@ -1932,7 +1972,7 @@
 			// answered `run:duplicate` was refused precisely because that cell is running
 			// (here or in another tab), and clearing then would erase a live indicator.
 			// The `=== id` test additionally keeps an overlapping run's spinner alone.
-			if (started && runningId === id) runningId = null;
+			if (started && runningId === id) clearRunning();
 			onRunEnd?.();
 			scheduleStaleness(); // this cell (and its dependents) may have changed staleness
 		}
@@ -2894,7 +2934,7 @@
 		cells = cells.filter((c) => !removed.has(c.id));
 		const applied = before - cells.length;
 		for (const id of ids) setRawEdit(id, false);
-		if (runningId && removed.has(runningId)) runningId = null;
+		if (runningId && removed.has(runningId)) clearRunning();
 		selectOnly(nextActive);
 		if (nextActive) await selectAndFocus(nextActive);
 		// The persisted collapse record is pruned only on confirmation, for the same
@@ -3547,6 +3587,7 @@
 			{scrollPins}
 			{focusedId}
 			runningId={runningId}
+			{runningSince}
 			{queued}
 			{bulkRunning}
 			{activeId}

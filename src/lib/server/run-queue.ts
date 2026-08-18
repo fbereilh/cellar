@@ -54,6 +54,16 @@ interface QueueEntry {
 	cellId: string;
 	actor: Actor;
 	source: string;
+	/**
+	 * When this entry's run actually began executing, reported by the run itself
+	 * (`noteRunStarted`) rather than stamped here at dequeue. The queue must not
+	 * mint its own clock for this: `run:end`'s `durationMs` is measured from the
+	 * run's own `startedAt`, so a second origin here would let a client that learned
+	 * the start from the SNAPSHOT show an elapsed that disagrees with the duration
+	 * the badge replaces it with — and would claim a start for a claim whose owner
+	 * bails before executing. Undefined until the run reports in.
+	 */
+	startedAt?: number;
 	promise?: Promise<void>;
 	resolve?: () => void;
 	reject?: (err: Error) => void;
@@ -116,6 +126,15 @@ function pendingSnapshot(q: NotebookQueue): QueueEntryView[] {
 }
 
 /**
+ * The `running` view of a notebook's active entry. One builder for all three
+ * snapshot shapes below, so a field added to `RunningView` cannot reach two of
+ * them and quietly miss the third.
+ */
+function runningSnapshot(active: QueueEntry): RunningView {
+	return { nb: active.nb, cellId: active.cellId, actor: active.actor, startedAt: active.startedAt };
+}
+
+/**
  * One notebook's queue state, in the exact `{ running, queue }` shape the MCP
  * `run_queue` tool has always returned (single running cell). Resolving a
  * kernel-surface call to the active notebook keeps that shape unchanged while the
@@ -125,7 +144,7 @@ export function queueStateFor(nb: string): QueueState {
 	const q = queues.get(nb);
 	if (!q) return { running: null, queue: [] };
 	return {
-		running: q.active ? { nb: q.active.nb, cellId: q.active.cellId, actor: q.active.actor } : null,
+		running: q.active ? runningSnapshot(q.active) : null,
 		queue: pendingSnapshot(q)
 	};
 }
@@ -141,7 +160,7 @@ export function queueStateAll(): { running: RunningView[]; queue: QueueEntryView
 	const running: RunningView[] = [];
 	const queue: QueueEntryView[] = [];
 	for (const q of queues.values()) {
-		if (q.active) running.push({ nb: q.active.nb, cellId: q.active.cellId, actor: q.active.actor });
+		if (q.active) running.push(runningSnapshot(q.active));
 		for (const item of pendingSnapshot(q)) queue.push(item);
 	}
 	return { running, queue };
@@ -161,7 +180,7 @@ export function queuesByNotebook(): Record<string, QueueState> {
 	const out: Record<string, QueueState> = {};
 	for (const [nb, q] of queues) {
 		out[nb] = {
-			running: q.active ? { nb: q.active.nb, cellId: q.active.cellId, actor: q.active.actor } : null,
+			running: q.active ? runningSnapshot(q.active) : null,
 			queue: pendingSnapshot(q)
 		};
 	}
@@ -170,6 +189,32 @@ export function queuesByNotebook(): Record<string, QueueState> {
 
 function broadcast() {
 	publishGlobal({ type: 'queue:changed', ...queueStateAll() });
+}
+
+/**
+ * Record that the run holding `nb`'s kernel has begun EXECUTING, at `at`.
+ *
+ * Called by `executeCellRun` with the very instant its closing `run:end` measures
+ * `durationMs` from, so the snapshot's `startedAt` and the eventual duration share
+ * one origin. That is why the queue does not stamp this itself at dequeue: a
+ * second clock would let a client seeded from the snapshot show an elapsed the
+ * settled badge then contradicts, and would claim a start for a kernel claim whose
+ * owner bails before executing (`cell_removed`).
+ *
+ * It broadcasts, so the snapshot a late joiner is handed always carries the start.
+ * That is one extra `queue:changed` per RUN — the same order as the `run:start` it
+ * accompanies, not per output flush — and without it a notebook mounting mid-run
+ * would be served the replayed pre-start snapshot and show a running cell whose
+ * clock never appears until the queue next changes.
+ *
+ * A silent no-op when that cell is not the one holding the kernel: nothing else in
+ * a run may fail because its bookkeeping did.
+ */
+export function noteRunStarted(nb: string, cellId: string, at: number): void {
+	const active = queues.get(nb)?.active;
+	if (!active || active.cellId !== cellId || active.startedAt === at) return;
+	active.startedAt = at;
+	broadcast();
 }
 
 /** 1-based position of a pending run in its notebook, or 0 when running / not queued. */
