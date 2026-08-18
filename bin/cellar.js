@@ -59,9 +59,13 @@
  *                               the environment (a superset of --new; --new still
  *                               registers, isolated does not). Unset = normal.
  *   CELLAR_APP_PORT / CELLAR_MCP_PORT / CELLAR_JUPYTER_PORT
- *                               pin these ports instead of picking a free one per
- *                               run — needed to publish/map them in Docker or any
- *                               container. Unset = free ephemeral port (default).
+ *                               pin these ports - needed to publish/map them in
+ *                               Docker or any container. A pin always wins. Unset:
+ *                               an ordinary launch REUSES the app/MCP ports this
+ *                               folder had last time when they are still free
+ *                               (`.cellar/ports.json`, see ports.js), falling back
+ *                               to a fresh ephemeral port; Jupyter, and every
+ *                               isolated / --new launch, is always ephemeral.
  *   CELLAR_NO_BROWSER=1|true|yes  do not try to open a browser (headless /
  *                               container launches; the user opens the printed URL).
  *
@@ -103,7 +107,8 @@ import {
 	clearRuntime,
 	readRuntime,
 	acquireInstanceLock,
-	releaseInstanceLock
+	releaseInstanceLock,
+	pidAlive
 } from '../src/lib/server/runtime.js';
 import {
 	RUNNING_NOTE,
@@ -139,6 +144,7 @@ import {
 	scanUntrackedCellarProcesses,
 	isIsolatedEnv
 } from '../src/lib/server/instances.js';
+import { resolveWorkspacePorts } from '../src/lib/server/ports.js';
 import { buildFreshness, stalenessReason, SKIP_ENV } from '../src/lib/server/build-freshness.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -155,7 +161,9 @@ if (argv[0] === 'mcp') {
 	const wsArg = wsIdx !== -1 ? sub[wsIdx + 1] : undefined;
 	const workspace = resolve(wsArg || process.cwd());
 	const { runMcpBridge } = await import('../src/lib/server/mcp-bridge.js');
-	// Resolves only on clean shutdown (stdin close / signal / upstream close).
+	// Resolves only on clean shutdown (stdin close / signal). An upstream that
+	// goes away is NOT a shutdown: the bridge re-attaches to whatever instance
+	// serves the folder next (see mcp-bridge.js).
 	await runMcpBridge({ workspace });
 	process.exit(0);
 }
@@ -348,18 +356,6 @@ function freePort() {
 			srv.close(() => resolvePort(port));
 		});
 	});
-}
-
-/**
- * Resolve a port: honor an explicit `CELLAR_*_PORT` env var when set (fixed,
- * predictable ports — needed to publish/map them in Docker or any container),
- * otherwise fall back to a free ephemeral one (the normal per-run behavior, so
- * concurrent local instances never collide). Unset = unchanged behavior.
- */
-async function resolvePort(envName) {
-	const v = process.env[envName];
-	if (v && /^\d+$/.test(v)) return Number(v);
-	return freePort();
 }
 
 async function waitFor(url, { headers = {}, timeoutMs = 30000 } = {}) {
@@ -1178,12 +1174,27 @@ async function main() {
 	writeKernelspec(kernelDir, projectPython);
 	console.log(`[cellar] kernel bound to: ${projectPython}`);
 
-	// 4) Ports — a free ephemeral port each by default (fixes the concurrent-
-	//    instance collision on the previously-fixed 39587), or a pinned one when
-	//    the matching CELLAR_*_PORT env is set (Docker / container publishing).
-	const jupyterPort = await resolvePort('CELLAR_JUPYTER_PORT');
-	const appPort = await resolvePort('CELLAR_APP_PORT');
-	const mcpPort = await resolvePort('CELLAR_MCP_PORT');
+	// 4) Ports - pinned when the matching CELLAR_*_PORT env is set (Docker /
+	//    container publishing), else the port this FOLDER used last time when it
+	//    is still free, else a fresh ephemeral one. The remembered half (ports.js)
+	//    is what stops a folder's address moving on every restart; it is a
+	//    preference re-earned on each launch, never a claim, so it yields to any
+	//    live instance and falls back cleanly. Jupyter is deliberately NOT sticky
+	//    - nothing outside the launcher + app ever sees its port (see ports.js).
+	//
+	//    `sticky` is the SAME gate as the lock/reap block above (`!forceNew`, which
+	//    `CELLAR_ISOLATED` implies): isolated / --new launches exist so concurrent
+	//    instances never collide, and a remembered port is exactly the port another
+	//    instance is most likely to be holding.
+	const { appPort, mcpPort, jupyterPort } = await resolveWorkspacePorts({
+		workspace: WORKSPACE,
+		sticky: !forceNew,
+		freePort,
+		instances: listInstances(),
+		isAlive: (e) => pidAlive(e?.launcherPid) || pidAlive(e?.appPid),
+		excludePid: process.pid,
+		log: (m) => console.log(m)
+	});
 	const token = randomBytes(24).toString('hex');
 	const jupyterUrl = `http://127.0.0.1:${jupyterPort}`;
 

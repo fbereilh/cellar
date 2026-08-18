@@ -1,0 +1,458 @@
+/**
+ * Cellar - stable per-workspace ports.
+ *
+ * Cellar allocates an ephemeral port per run so concurrent instances in
+ * different folders never collide. The cost is that a folder's address moves on
+ * every restart: the browser tab you left open 404s, a bookmark goes stale, and
+ * the raw `http://127.0.0.1:<port>/mcp` endpoint the sidebar publishes under
+ * "Advanced" is only ever true for one run. This module makes a folder REMEMBER
+ * the ports it got and ask for them again next time - while keeping the
+ * collision-freedom that made them dynamic in the first place, because a
+ * remembered port is a PREFERENCE that must be re-earned on every launch, never
+ * a claim.
+ *
+ * ## What is remembered, and what deliberately is not
+ *
+ * The **app** and **MCP** ports are remembered; the **Jupyter** port is not. The
+ * Jupyter sidecar is reached only by the launcher and the app, which learn its
+ * port in-process and never publish it, so remembering it would buy nothing
+ * while adding one more port to lose a race for on startup. Every remembered
+ * port is a small liability (an unrelated process may have taken it while we
+ * were down), so the set is kept to the ports that actually earn it.
+ *
+ * The two are NOT equally important, and the difference decides how hard this
+ * file tries for each. The **app** port is the one a human holds onto - the URL
+ * in the browser, the bookmark, the tab left open - and it is also the one that
+ * is cheap to keep: measured against a real instance, adapter-node closes its
+ * http server on SIGTERM so the app port is bindable again within milliseconds
+ * of a Ctrl-C. The **MCP** port appears in no agent config at all (that is the
+ * whole point of the `cellar mcp` stdio bridge - see runtime.js), and a bridge
+ * that outlives a restart now re-attaches by itself (see mcp-bridge.js), so its
+ * address is genuinely disposable; it is also the expensive one, held for ~7s
+ * after a Ctrl-C because nothing closes the in-process MCP server. So the MCP
+ * port is remembered on a best-effort basis and NOT waited for - see
+ * PORT_RELEASE_GRACE_MS, which is sized for the first case and explicitly not
+ * the second.
+ *
+ * ## Why a separate file from runtime.json
+ *
+ * `runtime.json` (runtime.js) is a LIVE-INSTANCE record - `clearRuntime` deletes
+ * it on exit precisely so a dead instance can never be discovered - which is the
+ * opposite of what a preference needs. So the preference lives beside it in
+ * `<workspace>/.cellar/ports.json` and is never cleared. `.cellar/` is where
+ * every other per-project, port-independent, git-ignored piece of state already
+ * lives (checkpoints, ui-state), so this adds no new footprint: a deleted
+ * worktree takes its preference with it, and nothing accumulates in $HOME for
+ * folders that no longer exist.
+ *
+ * ## The rule (choosePort)
+ *
+ * An explicit `CELLAR_*_PORT` pin always wins - it is a deliberate instruction
+ * (Docker publishing, a container port map), and a preference must never quietly
+ * outrank it. Otherwise a remembered port is used only when it is BOTH not held
+ * by a live registered instance AND actually bindable right now; anything else
+ * falls back to a fresh ephemeral port, which is then remembered so the NEXT
+ * restart is stable again. A remembered port is never reclaimed from a live
+ * instance - Cellar has a painful history of a launch disturbing someone else's
+ * session, so this path only ever yields.
+ *
+ * Node builtins only, so `bin/cellar.js` can import it like `venv.js` /
+ * `runtime.js`; it is in `package.json` `files` for the same reason.
+ */
+import { join } from 'node:path';
+import { createServer } from 'node:net';
+import { existsSync, readFileSync } from 'node:fs';
+import { writeFileAtomic } from './write-file-atomic.js';
+
+/** The ports a workspace remembers. Jupyter is deliberately absent (see header). */
+export const REMEMBERED_PORTS = /** @type {const} */ (['appPort', 'mcpPort']);
+
+/**
+ * @typedef {{ appPort?: number, mcpPort?: number }} PortPrefs
+ * @typedef {'pinned' | 'remembered' | 'fresh'} PortSource
+ * @typedef {'not-sticky' | 'no-preference' | 'held-by-live-instance' | 'port-unavailable'} FreshReason
+ * @typedef {{ port: number, source: PortSource, reason?: FreshReason }} PortChoice
+ * @typedef {{ launcherPid?: number, appPid?: number, appPort?: number, mcpPort?: number, jupyterPort?: number }} InstanceEntry
+ */
+
+/** Absolute path of the durable per-workspace port preference file. */
+export function portPrefsPath(workspace) {
+	return join(workspace, '.cellar', 'ports.json');
+}
+
+/**
+ * Is `n` a port we are willing to REMEMBER and re-request?
+ *
+ * Deliberately stricter than the `CELLAR_*_PORT` pin rule, and it must stay so:
+ * a pin is the user speaking, while this validates an untrusted file that a
+ * previous run wrote, a hand edit may have mangled, or a merge may have
+ * corrupted. Our own ephemeral allocator can only ever produce an unprivileged
+ * port, so anything below 1024 (or out of range, or not an integer) is garbage
+ * rather than a preference - refuse it up front instead of failing to bind it.
+ */
+export function isRememberablePort(n) {
+	return Number.isInteger(n) && n >= 1024 && n <= 65535;
+}
+
+/**
+ * Read `<workspace>/.cellar/ports.json`. Returns only the keys that are present
+ * AND valid, so a truncated, hand-edited or partially-corrupt file degrades to
+ * "no preference for that port" rather than to an error - this file is a
+ * convenience, and a launch must never fail because of it.
+ */
+export function readPortPrefs(workspace) {
+	const file = portPrefsPath(workspace);
+	if (!existsSync(file)) return {};
+	let raw;
+	try {
+		raw = JSON.parse(readFileSync(file, 'utf8'));
+	} catch {
+		return {};
+	}
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+	/** @type {PortPrefs} */
+	const out = {};
+	for (const key of REMEMBERED_PORTS) {
+		if (isRememberablePort(raw[key])) out[key] = raw[key];
+	}
+	return out;
+}
+
+/**
+ * Merge `prefs` into the workspace's remembered ports.
+ *
+ * Merges rather than replaces so a run that pinned one port (and therefore
+ * records nothing for it - a pin is not a preference) cannot erase the
+ * remembered value of the other. Writes NOTHING when the merged result already
+ * matches what is on disk, so an ordinary restart that reuses both ports leaves
+ * the file's mtime alone. Best effort: a read-only workspace loses stickiness,
+ * never the launch.
+ *
+ * @param {string} workspace
+ * @param {PortPrefs} prefs
+ * @returns {{ written: boolean, prefs: PortPrefs }}
+ */
+export function writePortPrefs(workspace, prefs) {
+	const current = readPortPrefs(workspace);
+	const next = { ...current };
+	for (const key of REMEMBERED_PORTS) {
+		if (isRememberablePort(prefs?.[key])) next[key] = prefs[key];
+	}
+	const changed = REMEMBERED_PORTS.some((k) => next[k] !== current[k]);
+	if (!changed) return { written: false, prefs: next };
+	try {
+		writeFileAtomic(portPrefsPath(workspace), JSON.stringify(next, null, 2) + '\n');
+		return { written: true, prefs: next };
+	} catch {
+		return { written: false, prefs: next };
+	}
+}
+
+/**
+ * Every port currently held by a LIVE registered instance, across all
+ * workspaces. This is the "check the running instances ports" half: it is what
+ * lets a remembered port yield to whoever actually holds it instead of racing
+ * for it, and it catches an instance that is registered but not yet listening
+ * (mid-boot), which a bind probe alone cannot see.
+ *
+ * Liveness is a pid check rather than an HTTP probe: this runs on the launch
+ * path before anything is serving, it must be cheap and synchronous, and over-
+ * reporting a port as held costs only a fresh port while under-reporting would
+ * mean racing a live instance.
+ *
+ * `entries` are registry records (`instances.js` `listInstances()`); `isAlive`
+ * and `excludePid` are injected so this stays pure and testable.
+ *
+ * @param {(InstanceEntry | null | undefined)[] | undefined} entries
+ * @param {{ isAlive?: (e: InstanceEntry) => boolean, excludePid?: number }} [opts]
+ * @returns {Set<number>}
+ */
+export function portsHeldByLiveInstances(entries, { isAlive, excludePid } = {}) {
+	/** @type {Set<number>} */
+	const held = new Set();
+	for (const e of entries ?? []) {
+		if (excludePid != null && e?.launcherPid === excludePid) continue;
+		if (isAlive && !isAlive(e)) continue;
+		for (const p of [e?.appPort, e?.mcpPort, e?.jupyterPort]) {
+			if (Number.isInteger(p)) held.add(p);
+		}
+	}
+	return held;
+}
+
+/**
+ * How long to keep re-probing a remembered port that is momentarily busy.
+ *
+ * Deliberately SHORT, and the measurement is why. The launcher SIGTERMs its
+ * children and exits immediately (`shutdown()` in `bin/cellar.js`), so a Ctrl-C
+ * followed straight away by `cellar` races the previous run letting go. Measured
+ * against a real instance, twice, the two ports behave completely differently:
+ *
+ *   - the APP port is free at ~0ms - adapter-node handles SIGTERM by closing its
+ *     own http server promptly, so the address the user actually cares about
+ *     (the URL in their browser) needs no waiting at all; and
+ *   - the MCP port stays held for ~6.8s, because nothing closes the in-process
+ *     MCP http server and it carries `timeout = 0`, so that port is released
+ *     only when the app process finally exits.
+ *
+ * So this window covers scheduling jitter around the first case, and explicitly
+ * does NOT try to wait out the second. Stalling every restart by seven seconds
+ * to preserve the MCP port would be a bad trade: that port appears in no config
+ * (see runtime.js) and `cellar mcp` now re-attaches by itself across a restart
+ * (see mcp-bridge.js), so its address is disposable - whereas launch latency on
+ * the everyday stop-and-start gesture is not.
+ *
+ * Bounded, and paid only when the remembered port is actually busy: a free port
+ * answers on the first probe, and a port genuinely held by something else costs
+ * this once, because the fresh port we fall back to is then remembered instead.
+ * A port held by a live REGISTERED instance never reaches here at all - that is
+ * a settled answer, not a transient one.
+ */
+export const PORT_RELEASE_GRACE_MS = 500;
+const PORT_RETRY_MS = 50;
+
+/**
+ * Can we bind `port` on `host` right now?
+ *
+ * `host` MUST be the address the server that will own this port actually binds,
+ * because on macOS a `SO_REUSEADDR` bind of `127.0.0.1:P` SUCCEEDS while another
+ * process holds `0.0.0.0:P` (measured; the reverse is permissive too). A probe
+ * on the wrong host therefore answers a different question than the one asked:
+ * probing loopback reported the app port free while adapter-node still held it
+ * on the wildcard, which would hand the app a port its own `listen()` cannot
+ * take. Each role passes its real host - see `BIND_HOSTS`.
+ *
+ * Carries the SAME known TOCTOU as `freePort()` in the launcher: the probe
+ * socket is closed before the port is handed to the real `listen()`, so it is
+ * briefly unclaimed. That exposure is unchanged rather than widened - a
+ * remembered port is asked for by exactly one folder, and the caller falls back
+ * cleanly on a lost race - and the harden-if-it-ever-flakes options are the
+ * ones documented at `freePort`.
+ *
+ * @param {number | null | undefined} port
+ * @param {string} [host]
+ * @returns {Promise<boolean>}
+ */
+export function canBindPort(port, host = '127.0.0.1') {
+	return new Promise((resolve) => {
+		if (!isRememberablePort(port)) return resolve(false);
+		const srv = createServer();
+		srv.unref();
+		srv.on('error', () => resolve(false));
+		srv.listen(port, host, () => srv.close(() => resolve(true)));
+	});
+}
+
+/**
+ * The address each role's server really binds, which is what its probe must ask
+ * about (see `canBindPort`). These mirror the three listen sites and must move
+ * with them:
+ *   - app     - adapter-node, `HOST` or its `0.0.0.0` default; the launcher sets
+ *               only `PORT`, so in practice the wildcard.
+ *   - mcp     - `startMcpServer` (`CELLAR_MCP_HOST || '127.0.0.1'`).
+ *   - jupyter - the sidecar spawn's `--ServerApp.ip=127.0.0.1`.
+ *
+ * @param {Record<string, string | undefined>} env
+ * @returns {{ app: string, mcp: string, jupyter: string }}
+ */
+export function bindHosts(env = process.env) {
+	return {
+		app: env.HOST || '0.0.0.0',
+		mcp: env.CELLAR_MCP_HOST || '127.0.0.1',
+		jupyter: '127.0.0.1'
+	};
+}
+
+/**
+ * Decide one port.
+ *
+ * Pure apart from the three injected effects, so the whole rule is unit-testable
+ * without booting a server:
+ *   - `canBind(port, host)` - can we actually listen on it right now, asked
+ *                             about the host this role's server really binds
+ *   - `isUnavailable(port)` - cheap synchronous "someone else has claimed this"
+ *                             (a live registered instance, or a port this very
+ *                             launch already took for another role)
+ *   - `freePort()`          - the ephemeral fallback
+ *
+ * Returns `{ port, source, reason }`. `source` is 'pinned' | 'remembered' |
+ * 'fresh'; on a fresh port `reason` says WHY the preference was not honoured, so
+ * the launcher can tell the user their stable port moved and what took it -
+ * silently changing an address the user was told is stable is exactly the
+ * confusion this feature exists to remove.
+ *
+ * @param {{
+ *   pinned?: string | undefined,
+ *   remembered?: number | null | undefined,
+ *   sticky?: boolean,
+ *   host?: string,
+ *   canBind?: (port: number, host: string) => Promise<boolean> | boolean,
+ *   isUnavailable?: (port: number) => boolean,
+ *   freePort: () => Promise<number> | number,
+ *   bindGraceMs?: number,
+ *   sleep?: (ms: number) => Promise<void>
+ * }} opts
+ * @returns {Promise<PortChoice>}
+ */
+export async function choosePort({
+	pinned,
+	remembered,
+	sticky = true,
+	host = '127.0.0.1',
+	canBind = canBindPort,
+	isUnavailable = () => false,
+	freePort,
+	bindGraceMs = PORT_RELEASE_GRACE_MS,
+	sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+}) {
+	// An explicit pin is an instruction, not a preference: honour it verbatim and
+	// never probe it. Deliberately the SAME lenient rule the launcher has always
+	// applied (`/^\d+$/`), so pinning behaves byte-for-byte as before - including
+	// failing loudly at listen() if the port is busy, which is the right outcome
+	// for a port the user named.
+	if (pinned && /^\d+$/.test(pinned)) {
+		return { port: Number(pinned), source: 'pinned' };
+	}
+
+	/** @param {FreshReason} reason @returns {Promise<PortChoice>} */
+	const fresh = async (reason) => {
+		// Guard the fallback against a port this launch has already claimed for
+		// another role: `freePort()` probes and releases, so two calls could in
+		// principle agree, and a hand-edited preference could name one port twice.
+		for (let i = 0; i < 10; i++) {
+			const port = await freePort();
+			if (!isUnavailable(port)) return { port, source: 'fresh', reason };
+		}
+		return { port: await freePort(), source: 'fresh', reason };
+	};
+
+	// Isolated / `--new` launches never use the sticky path: they exist so
+	// concurrent instances (e2e at workers:2, throwaway mkdtemp workspaces, a
+	// deliberate second instance in a folder that already has one) cannot collide,
+	// and a remembered port is precisely a port another instance is likely to hold.
+	if (!sticky) return fresh('not-sticky');
+	if (!isRememberablePort(remembered)) return fresh('no-preference');
+	// Yield to a live instance rather than race it. Never reclaim.
+	if (isUnavailable(remembered)) return fresh('held-by-live-instance');
+	// Re-probe briefly: the previous run may still be letting go (see
+	// PORT_RELEASE_GRACE_MS). Costs nothing when the port is already free.
+	const deadline = Date.now() + Math.max(0, bindGraceMs);
+	for (;;) {
+		if (await canBind(remembered, host)) return { port: remembered, source: 'remembered' };
+		if (Date.now() >= deadline) return fresh('port-unavailable');
+		await sleep(PORT_RETRY_MS);
+	}
+}
+
+/**
+ * Resolve all three of a launch's ports and persist the preference.
+ *
+ * The whole policy lives here rather than in `bin/cellar.js` so it is reachable
+ * without booting a server - which is what lets the isolated/`--new` guarantee
+ * (never sticky, so concurrent instances cannot collide) be a tested behavior
+ * instead of a claim about a line of launcher code.
+ *
+ * `sticky` is the launcher's `!forceNew` - the SAME gate as the single-instance
+ * lock and the reap sweep, and `CELLAR_ISOLATED` implies it. A non-sticky launch
+ * neither reads nor writes the preference: it must not adopt a port another
+ * instance probably holds, and it must not overwrite the folder's memory with
+ * the throwaway ports it happened to get.
+ *
+ * Returns each role's full `choosePort` result alongside the plain port numbers.
+ *
+ * @param {{
+ *   workspace: string,
+ *   sticky: boolean,
+ *   env?: Record<string, string | undefined>,
+ *   freePort: () => Promise<number> | number,
+ *   instances?: (InstanceEntry | null | undefined)[],
+ *   isAlive?: (e: InstanceEntry) => boolean,
+ *   excludePid?: number,
+ *   canBind?: (port: number, host: string) => Promise<boolean> | boolean,
+ *   bindGraceMs?: number,
+ *   log?: (msg: string) => void
+ * }} opts
+ * @returns {Promise<{ appPort: number, mcpPort: number, jupyterPort: number, app: PortChoice, mcp: PortChoice, jupyter: PortChoice }>}
+ */
+export async function resolveWorkspacePorts({
+	workspace,
+	sticky,
+	env = process.env,
+	freePort,
+	instances = [],
+	isAlive,
+	excludePid,
+	canBind = canBindPort,
+	bindGraceMs = PORT_RELEASE_GRACE_MS,
+	log = () => {}
+}) {
+	const prefs = sticky ? readPortPrefs(workspace) : {};
+	// Ports a live registered instance holds. Never reclaimed - we always yield.
+	// Doubles as this launch's own claim set, so two roles can never agree.
+	const claimed = sticky ? portsHeldByLiveInstances(instances, { isAlive, excludePid }) : new Set();
+	/** @param {number} p */
+	const isUnavailable = (p) => claimed.has(p);
+	/** @param {string} pinnedEnv @param {Partial<Parameters<typeof choosePort>[0]>} opts */
+	const take = async (pinnedEnv, opts) => {
+		const r = await choosePort({
+			pinned: env[pinnedEnv],
+			isUnavailable,
+			canBind,
+			freePort,
+			bindGraceMs,
+			...opts
+		});
+		claimed.add(r.port);
+		return r;
+	};
+
+	// Jupyter is deliberately never sticky (see the module header): its port is
+	// reached only by the launcher and the app, which learn it in-process.
+	const hosts = bindHosts(env);
+	const jupyter = await take('CELLAR_JUPYTER_PORT', {
+		sticky: false,
+		host: hosts.jupyter
+	});
+	const app = await take('CELLAR_APP_PORT', {
+		sticky,
+		remembered: prefs.appPort,
+		host: hosts.app
+	});
+	const mcp = await take('CELLAR_MCP_PORT', {
+		sticky,
+		remembered: prefs.mcpPort,
+		host: hosts.mcp
+	});
+
+	if (sticky) {
+		// Say so when a port the user was told is stable had to move, and why - a
+		// silently different address is the confusion this feature exists to remove.
+		/** @type {[string, PortChoice, number | undefined][]} */
+		const moved = [
+			['app', app, prefs.appPort],
+			['MCP', mcp, prefs.mcpPort]
+		];
+		for (const [label, r, want] of moved) {
+			if (r.source === 'fresh' && want != null)
+				log(
+					`[cellar] ${label} port ${want} was unavailable (${r.reason}); using ${r.port} and remembering it.`
+				);
+		}
+		// Remember only what we CHOSE. A pinned port is not a preference -
+		// recording it would let an explicit pin silently outlive the run that
+		// asked for it, and reappear on a later launch that pinned nothing.
+		writePortPrefs(workspace, {
+			...(app.source === 'pinned' ? {} : { appPort: app.port }),
+			...(mcp.source === 'pinned' ? {} : { mcpPort: mcp.port })
+		});
+	}
+
+	return {
+		appPort: app.port,
+		mcpPort: mcp.port,
+		jupyterPort: jupyter.port,
+		app,
+		mcp,
+		jupyter
+	};
+}

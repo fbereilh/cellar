@@ -1,10 +1,11 @@
 /**
  * Cellar — per-workspace runtime discovery + zero-config agent wiring.
  *
- * The launcher allocates a fresh MCP port each run (so concurrent `cellar`
- * instances never collide), which means a static `http://127.0.0.1:<port>/mcp`
- * URL in an agent's MCP config goes stale every launch. To make connecting an
- * agent zero-config, we instead:
+ * A `cellar` instance's MCP port can move between runs (a folder now prefers the
+ * port it had last time - see ports.js - but that preference yields to anything
+ * holding it, and an isolated / `--new` launch is always ephemeral), so a static
+ * `http://127.0.0.1:<port>/mcp` URL in an agent's MCP config is not something to
+ * rely on. To make connecting an agent zero-config, we instead:
  *
  *   1. write `<workspace>/.cellar/runtime.json` on launch, recording the live
  *      instance's { mcpPort, appPort, pid } so `cellar mcp` (the stdio bridge)
@@ -15,6 +16,20 @@
  *      in config, so it never goes stale. That half lives entirely in
  *      `harness.js`, the single source of truth for where those files are and
  *      how they are merged; nothing here writes them.
+ *
+ * ## This file is a LIVE-INSTANCE record, not a preference
+ *
+ * `clearRuntime` deletes it on exit, precisely so a dead instance can never be
+ * discovered. That is the opposite of what a durable per-folder setting needs,
+ * which is why the remembered-port preference lives in its own
+ * `.cellar/ports.json` (ports.js) rather than being folded in here.
+ *
+ * ## What discovery alone does NOT fix
+ *
+ * Discovery only covers finding the instance at CONNECT time. A `cellar mcp`
+ * bridge already running when the instance is replaced holds a session no new
+ * server recognises, and it must re-read this file and re-handshake to recover -
+ * see the header of `mcp-bridge.js`, which is where that lives.
  *
  * Node builtins + global fetch only, so this is importable by both the CLI
  * launcher (`../src/lib/server/runtime.js`) and, if ever needed, the SvelteKit
@@ -44,6 +59,9 @@ export function instanceLockPath(workspace) {
 /**
  * Record the live instance so `cellar mcp` can find it. Writes
  * `<workspace>/.cellar/runtime.json` with at least { mcpPort, appPort, pid }.
+ *
+ * @param {string} workspace
+ * @param {{ mcpPort?: number, appPort?: number, jupyterPort?: number, pid?: number }} [info]
  */
 export function writeRuntime(workspace, { mcpPort, appPort, jupyterPort, pid = process.pid } = {}) {
 	const dir = join(workspace, '.cellar');

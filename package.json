@@ -22,7 +22,8 @@
     "src/lib/server/runtime.js",
     "src/lib/server/mcp-bridge.js",
     "src/lib/server/selfupdate.js",
-    "src/lib/server/instances.js"
+    "src/lib/server/instances.js",
+    "src/lib/server/ports.js"
   ],
   "engines": {
     "node": ">=18"
