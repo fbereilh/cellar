@@ -120,6 +120,12 @@ import {
 	type SdkDbutilsState
 } from '../dbutilsShim';
 import { normalizeDatabricksHost } from '../databricksHost';
+import {
+	DEFAULT_SECTION,
+	SETTINGS_SECTION,
+	resolveDefaultProfile,
+	type DefaultProfileVerdict
+} from '../databricksDefaultProfile';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
 import { resolveUploadName, type UploadNameAffixes } from '../databricksUploadName';
 import { notebookIpynb, resolveNotebookPath } from './notebook';
@@ -356,8 +362,29 @@ export function readProfiles(): {
 	profiles: Profile[];
 	error?: string;
 } {
+	return profilesOf(readConfig());
+}
+
+/** One section of `~/.databrickscfg`, with its own keys (lowercased) as written. */
+interface ConfigSection {
+	name: string;
+	keys: Map<string, string>;
+}
+
+/**
+ * `~/.databrickscfg`, parsed once into raw sections.
+ *
+ * The ONE reader. Two different questions are asked of this file - "which profiles
+ * may the picker offer" (`profilesOf`, which drops host-less and unnameable
+ * sections) and "would a bare `Config()` resolve anything" (`defaultProfileOf`,
+ * which needs the very sections the first one drops: `[__settings__]` carries
+ * `default_profile`, and an empty `[DEFAULT]` is the difference between the SDK's
+ * rule 3 and rule 4). A second parser beside this one could answer them
+ * inconsistently for the same file, so both are projections of this.
+ */
+function readConfig(): { configPath: string; exists: boolean; error?: string; sections: ConfigSection[] } {
 	const path = configPath();
-	if (!existsSync(path)) return { configPath: path, exists: false, profiles: [] };
+	if (!existsSync(path)) return { configPath: path, exists: false, sections: [] };
 	let text: string;
 	try {
 		text = readFileSync(path, 'utf8');
@@ -366,32 +393,110 @@ export function readProfiles(): {
 			configPath: path,
 			exists: true,
 			error: err instanceof Error ? err.message : String(err),
-			profiles: []
+			sections: []
 		};
 	}
-	const sections: Profile[] = [];
-	let current: Profile | null = null;
+	const sections: ConfigSection[] = [];
+	let current: ConfigSection | null = null;
 	for (const raw of text.split(/\r?\n/)) {
 		const line = raw.trim();
 		if (!line || line.startsWith('#') || line.startsWith(';')) continue;
 		const section = /^\[(.+)]$/.exec(line);
 		if (section) {
-			current = { name: section[1].trim(), host: '', hasToken: false, authType: null };
+			current = { name: section[1].trim(), keys: new Map() };
 			sections.push(current);
 			continue;
 		}
 		if (!current) continue;
+		// configparser's DEFAULT delimiters are `('=', ':')`, and its option pattern is
+		// non-greedy, so whichever appears FIRST on the line separates key from value.
+		// Reading `=` alone was not a narrower parse but a WRONG one: a colon-delimited
+		// file (`default_profile: work`, or a `[DEFAULT]` whose keys all use `:`) parsed
+		// to zero keys, so `defaultProfileOf` reported `no_default` and the sidebar
+		// nagged a machine the SDK resolves perfectly - the one thing this notice must
+		// never do. Taking the first also keeps `host = https://x` intact, since its
+		// `=` precedes the URL's own colon.
 		const eq = line.indexOf('=');
-		if (eq === -1) continue;
-		const key = line.slice(0, eq).trim().toLowerCase();
-		const value = line.slice(eq + 1).trim();
-		if (key === 'host') current.host = value;
-		else if (key === 'token') current.hasToken = !!value;
-		else if (key === 'auth_type') current.authType = value;
+		const colon = line.indexOf(':');
+		const delim = eq === -1 ? colon : colon === -1 ? eq : Math.min(eq, colon);
+		if (delim === -1) continue;
+		current.keys.set(line.slice(0, delim).trim().toLowerCase(), line.slice(delim + 1).trim());
 	}
-	// Also drop anything the SDK could not accept as a `profile=` value.
-	const profiles = sections.filter((s) => s.host && PROFILE_RE.test(s.name));
-	return { configPath: path, exists: true, profiles };
+	return { configPath: path, exists: true, sections };
+}
+
+/**
+ * The picker's view: sections that declare a `host` and are nameable to the SDK.
+ *
+ * **The name is UNIQUE, and that is a correctness rule rather than tidiness.** Every
+ * surface renders this list through a keyed `{#each … (name)}` - the picker, and the
+ * default-profile notice's one command row per candidate - and a duplicate key
+ * throws Svelte's `each_key_duplicate` DURING RENDER. Nothing in `src/` mounts a
+ * `<svelte:boundary>`, so that throw takes down the whole page, not one card. It is
+ * reachable from an ordinary hand-edited file: configparser's `SECTCRE` does NOT
+ * trim, so `[work]` and `[work ]` are two legal, distinct sections to the SDK, while
+ * this reader trims and both arrive as `work`. Deduped HERE, where the list is
+ * built, so every consumer inherits it rather than each keyed block defending
+ * itself. First occurrence wins - the later spelling is the odd one out, and a name
+ * this reader cannot tell apart is one the picker could not let the user choose
+ * between anyway.
+ */
+function profilesOf(cfg: ReturnType<typeof readConfig>): {
+	configPath: string;
+	exists: boolean;
+	profiles: Profile[];
+	error?: string;
+} {
+	const seen = new Set<string>();
+	const profiles = cfg.sections
+		.map((s) => ({
+			name: s.name,
+			host: s.keys.get('host') ?? '',
+			hasToken: !!s.keys.get('token'),
+			authType: s.keys.get('auth_type') ?? null
+		}))
+		// Also drop anything the SDK could not accept as a `profile=` value.
+		.filter((p) => p.host && PROFILE_RE.test(p.name))
+		.filter((p) => {
+			if (seen.has(p.name)) return false;
+			seen.add(p.name);
+			return true;
+		});
+	const out: { configPath: string; exists: boolean; profiles: Profile[]; error?: string } = {
+		configPath: cfg.configPath,
+		exists: cfg.exists,
+		profiles
+	};
+	if (cfg.error !== undefined) out.error = cfg.error;
+	return out;
+}
+
+/**
+ * Would a bare `Config()` - the kind a user's own library builds - find any
+ * credentials on this machine? See `$lib/databricksDefaultProfile` for the rule and
+ * for why Cellar answers this at all.
+ *
+ * A file that exists but could not be READ is reported as absent: nothing was
+ * observed, so nothing is claimed, and the notice stays silent rather than telling
+ * a user to fix a file we never saw. `readProfiles` already surfaces that read
+ * error on its own.
+ */
+function defaultProfileOf(cfg: ReturnType<typeof readConfig>): DefaultProfileVerdict {
+	return resolveDefaultProfile({
+		exists: cfg.exists && cfg.error === undefined,
+		sections: cfg.sections.map((s) => s.name),
+		settingsDefaultProfile:
+			cfg.sections.find((s) => s.name === SETTINGS_SECTION)?.keys.get('default_profile') ?? null,
+		// KEYS, not the header: an empty `[DEFAULT]` leaves configparser's
+		// `defaults()` falsy, which is the SDK's rule-3/rule-4 boundary.
+		defaultSectionHasKeys: cfg.sections.some((s) => s.name === DEFAULT_SECTION && s.keys.size > 0),
+		candidates: profilesOf(cfg).profiles.map((p) => p.name)
+	});
+}
+
+/** The default-resolution verdict for the machine's config file. */
+export function readDefaultProfile(): DefaultProfileVerdict {
+	return defaultProfileOf(readConfig());
 }
 
 /**
@@ -1749,10 +1854,13 @@ async function workspaceProbes(): Promise<WorkspaceProbes> {
  * the sidebar poll stays cheap here too.
  */
 export async function getStatus(nb?: string | null) {
-	const { configPath: path, exists, profiles, error } = readProfiles();
+	// ONE read of `~/.databrickscfg`, projected twice: what the picker may offer,
+	// and whether a bare `Config()` would resolve anything at all.
+	const cfg = readConfig();
+	const { configPath: path, exists, profiles, error } = profilesOf(cfg);
 	const { install, installError, uv } = await workspaceProbes();
 	return {
-		config: { path, exists, profiles, error: error ?? null },
+		config: { path, exists, profiles, error: error ?? null, defaultProfile: defaultProfileOf(cfg) },
 		install,
 		installError,
 		uv,
@@ -2278,6 +2386,35 @@ def _cellar_dbx_connect(_cfg):
         return {'ok': False, 'code': 'session_failed', 'message': '%s: %s' % (type(_e).__name__, _e)}
     _g['spark'] = _spark
     _g['w'] = _w
+    # Publish the CLUSTER the notebook is now bound to, so a library that builds
+    # its own session finds the same compute. Cellar passes the cluster inside its
+    # own Config, which lives nowhere a SECOND resolution can look - so
+    # DatabricksSession.builder.getOrCreate() elsewhere in the kernel (notably
+    # databricks.sdk.runtime's module body) failed with "Cluster id or serverless
+    # are required but were not specified." even once its credentials resolved. With
+    # this set it hands back THIS session object rather than building a second one,
+    # so it costs no extra compute.
+    #
+    # AFTER the build, never before: the scrub above is required - databricks-connect
+    # refuses to build a REMOTE session while a DATABRICKS_* runtime advertisement is
+    # in the env - so the session is still constructed with a clean env, exactly like
+    # the DATABRICKS_RUNTIME_VERSION save/restore below. This is why a KEEP_ENV entry
+    # would be the wrong fix.
+    #
+    # The scrub is also what keeps it FRESH: it pops any previous value at the top of
+    # every connect, and only a successful build writes one back. So a reconnect to a
+    # different cluster rewrites it, and a connect that FAILS leaves none behind - a
+    # stale id would silently point a later bare getOrCreate() at the old cluster.
+    #
+    # Measured against databricks-connect 17.3.13 / databricks-sdk 0.131.0: it changes
+    # NOTHING about credential resolution (cluster_id is not an auth attribute, so a
+    # bare Config() still loads its profile from the file exactly as before), and a
+    # later builder that names its own cluster or uses .remote() behaves identically
+    # with and without it. The ONE observed interaction is narrow and stated rather
+    # than hidden: Config.sql_http_path refuses to have both a cluster_id and a
+    # warehouse_id, so user code that sets warehouse_id AND reads that property now
+    # raises where it did not. Nothing in the SDK or in databricks-connect reads it.
+    os.environ['DATABRICKS_CLUSTER_ID'] = _cfg['cluster_id']
     # Deliberately NOT rebinding dbutils: the Cellar-native dbutils.widgets shim
     # injected at kernel start (widgetsShim.ts) owns the bare dbutils name so
     # parameter widgets work with or without a connection. The SDK's own
@@ -2334,11 +2471,21 @@ print('${SENTINEL}' + _cellar_json.dumps({'ok': True, 'imported': 'databricks.co
 del _cellar_json, _cellar_sys
 `;
 
-/** Stop the session and unbind both names. Idempotent: a missing `spark` is fine. */
+/**
+ * Stop the session and unbind both names. Idempotent: a missing `spark` is fine.
+ *
+ * Also drops the `DATABRICKS_CLUSTER_ID` that connect published. That removal is
+ * UNCONDITIONAL - before the no-session early return - because it is about the env
+ * rather than about this call: a disconnected notebook must not leave an id behind
+ * that silently points a later bare `getOrCreate()` at a cluster nothing is
+ * connected to.
+ */
 const DISCONNECT_CODE = `
 import json as _cellar_json
 
 def _cellar_dbx_disconnect():
+    import os
+    os.environ.pop('DATABRICKS_CLUSTER_ID', None)
     _g = globals()
     _old = _g.pop('spark', None)
     _g.pop('w', None)

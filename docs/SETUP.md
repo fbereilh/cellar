@@ -394,6 +394,40 @@ because only a deliberate edit of that field writes it - flipping the toggle, or
 **Apply now**, moves the advertisement alone and applies whatever version is stored -
 and the badge reports the running kernel throughout.
 
+**Library code that resolves credentials for itself.** Cellar connects with an
+*explicit* profile, so the identity behind `spark` and `w` lives inside Cellar's own
+`Config` and nowhere a second resolution can look. Your own library therefore starts
+from zero: a bare `WorkspaceClient()`, or the `from databricks.sdk.runtime import ...`
+that builds one while the module body runs, resolves credentials exactly as it would
+with no Cellar involved. Two things follow.
+
+A connected kernel carries `DATABRICKS_CLUSTER_ID`, published *after* the session is
+built - the connect scrubs every `DATABRICKS_*` variable first, since
+databricks-connect refuses to build a remote session while it believes it is on a
+runtime. A later bare `DatabricksSession.builder.getOrCreate()` therefore hands back
+the session you already have, instead of failing with "Cluster id or serverless are
+required but were not specified", and it costs no extra compute. Every connect
+rewrites it (a connect that fails leaves none behind) and disconnect removes it, so a
+stale id can never point later code at a cluster you are no longer on. Cellar
+deliberately does *not* export `DATABRICKS_CONFIG_PROFILE`: which profile a process
+falls back to is a machine-wide choice, and it is not Cellar's to make.
+
+Credentials are the half Cellar cannot supply for you, so it detects the gap instead.
+If `~/.databrickscfg` marks no profile as the default - no `[__settings__]
+default_profile` and no `[DEFAULT]` section carrying keys - or marks one the SDK
+refuses (a name the file does not define, or the reserved `__settings__` itself), then
+code resolving credentials for itself fails, with `cannot configure default
+credentials` or with the SDK's own error for a default it cannot use, while Cellar's
+own `spark` keeps working - which reads as a Cellar bug and is not one. A **default
+profile** card then appears at the top of the Databricks section, on a connected (or
+expired) notebook, carrying one ready-to-copy `databricks auth switch --profile <name>`
+command per profile you could choose. It is a heads-up rather than an error: nothing
+failed, and your connection is unaffected. Cellar shows the command and does not run
+it - it shells out to no CLI, it never writes your credential config, and which
+profile becomes the machine default is your call, so nothing in that list is
+pre-selected. A machine that already resolves a default, or one with no profile to
+offer, sees nothing at all.
+
 **Parameter widgets and the SDK import.** Cellar binds its own `dbutils` in every
 kernel, so `dbutils.widgets.text(...)` and `.get(...)` draw real controls and read
 back the value you typed, with or without a Databricks connection. Library code
@@ -671,6 +705,12 @@ spec files at a time. Install its browser once with `npx playwright install chro
   notebook is written back from its cells alone and stores no notebook-level
   metadata, so a root could not survive a reload. Convert it to `.ipynb` (app menu
   → **Convert to .ipynb**) if you need one; clearing a root is always allowed.
+- **Your own `WorkspaceClient()` fails with "cannot configure default credentials"
+  while Cellar's `spark` works** - Cellar passes its profile explicitly, so its
+  identity is not this machine's default; code that resolves credentials for itself
+  finds none because `~/.databrickscfg` marks no profile as the default. The
+  Databricks panel's **default profile** card names the fix - see
+  [Databricks](#databricks).
 - **Parameter widgets render but keep coming back at their defaults** - the code is
   reaching the Databricks SDK's own `dbutils` rather than Cellar's, and the SDK's one
   rebuilds a widget from scratch every time a cell re-declares it, so the value you
