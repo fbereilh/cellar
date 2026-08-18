@@ -232,7 +232,9 @@ describe('choosePort - the stable-port rule', () => {
 		const r = await choosePort({
 			remembered: 51348,
 			sticky: true,
-			isUnavailable: () => true,
+			// Exactly what the real predicate is: membership of the claimed set, so
+			// the remembered port is taken and the fallback still has room to land.
+			isUnavailable: (p: number) => p === 51348,
 			canBind: async () => false,
 			freePort,
 			sleep: async () => {
@@ -240,6 +242,7 @@ describe('choosePort - the stable-port rule', () => {
 			}
 		});
 		expect(r.reason).toBe('held-by-live-instance');
+		expect(r.port).not.toBe(51348);
 		expect(slept).toBe(false);
 	});
 
@@ -588,7 +591,7 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 		// a registry can: it races, and on macOS a loopback probe does not even
 		// notice a wildcard holder. So the read-only "who is live" lookup applies
 		// here too, and only makes a collision less likely.
-		const fp = scriptedFreePort(41000, 41001, 41002, 41003);
+		const fp = scriptedFreePort(41000, 41001, 41002, 41003, 41004);
 		const isolated = await resolveWorkspacePorts({
 			workspace: ws,
 			sticky: false,
@@ -601,8 +604,54 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 		for (const p of [isolated.appPort, isolated.mcpPort, isolated.jupyterPort]) {
 			expect([41000, 41001]).not.toContain(p);
 		}
+		// The point of the test: three roles, three ports. A fallback that gave up
+		// and handed back a port it knew was claimed would satisfy the check above
+		// while binding two roles to one address.
+		expect(new Set([isolated.appPort, isolated.mcpPort, isolated.jupyterPort]).size).toBe(3);
 		// ...and it is still isolated: nothing was remembered.
 		expect(existsSync(portPrefsPath(ws))).toBe(false);
+	});
+
+	it('refuses to launch rather than hand two roles the same port', async () => {
+		// A free-port source that only ever offers one address. Silently returning
+		// it twice is the one outcome the retry loop exists to prevent, and it would
+		// surface much later as two servers racing for the same port.
+		await expect(
+			resolveWorkspacePorts({
+				workspace: ws,
+				sticky: false,
+				env: {},
+				freePort: async () => 41000,
+				bindGraceMs: 0
+			})
+		).rejects.toThrow(/free port/i);
+	});
+
+	it('resolves the sticky roles before Jupyter, which never takes a remembered port', async () => {
+		// Jupyter is never sticky, so it takes an ephemeral port - which can land on
+		// the very address this folder remembers. Resolved first it claimed that
+		// port, pushed the app off its stable address, blamed a live instance that
+		// does not exist, and then persisted the replacement.
+		writePortPrefs(ws, { appPort: 42000, mcpPort: 42001 });
+		const notes: string[] = [];
+		const r = await resolveWorkspacePorts({
+			workspace: ws,
+			sticky: true,
+			env: {},
+			// The first port offered is exactly the remembered app port.
+			freePort: scriptedFreePort(42000, 42002, 42003),
+			canBind: async () => true,
+			bindGraceMs: 0,
+			log: (m: string) => notes.push(m)
+		});
+		expect(r.app).toEqual({ port: 42000, source: 'remembered' });
+		expect(r.mcp).toEqual({ port: 42001, source: 'remembered' });
+		expect(r.jupyterPort).not.toBe(42000);
+		expect(new Set([r.appPort, r.mcpPort, r.jupyterPort]).size).toBe(3);
+		// Nothing moved, so nothing was announced - and the folder still remembers
+		// the address it was told is stable.
+		expect(notes).toEqual([]);
+		expect(readPortPrefs(ws)).toEqual({ appPort: 42000, mcpPort: 42001 });
 	});
 
 	it('an isolated launch in a never-launched folder writes no preference at all', async () => {

@@ -42,7 +42,10 @@ const SLOW = 'tools/call/slow';
  * `release()`, which is how a real `run_cell` behaves for the length of a run:
  * the POST resolves immediately, and the reply arrives later over SSE.
  */
-function startFakeCellar(port = 0, { failStatus = {} }: { failStatus?: Record<string, number> } = {}) {
+function startFakeCellar(
+	port = 0,
+	{ failStatus = {}, failBody = {} }: { failStatus?: Record<string, number>; failBody?: Record<string, string> } = {}
+) {
 	const sessions = new Set<string>();
 	const seen: { method?: string; sessionId?: string }[] = [];
 	const held: { id: unknown; res: http.ServerResponse }[] = [];
@@ -90,9 +93,10 @@ function startFakeCellar(port = 0, { failStatus = {} }: { failStatus?: Record<st
 				const fail = failStatus[msg.method as string];
 				if (fail !== undefined) {
 					// A live server that KNOWS our session refusing this one message.
-					// Deliberately not a session refusal: no -32000, no "initialize".
+					// Deliberately not a session refusal: no -32000 under a 400.
 					res.writeHead(fail, { 'content-type': 'application/json' }).end(
-						JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null })
+						failBody[msg.method as string] ??
+							JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null })
 					);
 					return;
 				}
@@ -307,7 +311,10 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 	}
 
 	/** Bring an "instance" up for `ws` and publish it the way a launch does. */
-	async function bootCellar(port = 0, opts?: { failStatus?: Record<string, number> }) {
+	async function bootCellar(
+		port = 0,
+		opts?: { failStatus?: Record<string, number>; failBody?: Record<string, string> }
+	) {
 		const c = startFakeCellar(port, opts);
 		const p = await c.listening;
 		running.push(c);
@@ -436,6 +443,56 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		cellar.release();
 		expect(await stdio.awaitReply(2)).toMatchObject({ result: { echoed: SLOW } });
 		expect(stdio.repliesFor(3)).toHaveLength(1);
+	});
+
+	it('does not read a session phrase in a 500 body as a session refusal', async () => {
+		// The SDK folds the response BODY into the error message, and Cellar's own
+		// outer catch answers `500 'mcp error: ' + String(err)`. A tool failure that
+		// merely MENTIONS a session (a Spark Connect session, say) must not be read
+		// as the server refusing ours: that is the over-trigger reached by the other
+		// door, and it would abort every run streaming on a healthy session.
+		const cellar = await bootCellar(0, {
+			failStatus: { 'tools/call': 500 },
+			failBody: { 'tools/call': 'mcp error: Error: [SESSION_CLOSED] Spark Connect session expired' }
+		});
+		const { stdio } = await startBridge();
+		await stdio.request(INIT);
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		const sessionsBefore = cellar.sessionCount();
+
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => cellar.heldCount() === 1);
+
+		const refused = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/call' });
+		expect(refused.error).toBeDefined();
+		expect(cellar.sessionCount()).toBe(sessionsBefore);
+		expect(stdio.repliesFor(2)).toHaveLength(0);
+		cellar.release();
+		expect(await stdio.awaitReply(2)).toMatchObject({ result: { echoed: SLOW } });
+	});
+
+	it("completes the agent's OWN initialize when it is what hits the dead instance", async () => {
+		// The bridge attached at startup, then Cellar was replaced before the agent
+		// got its handshake in. The re-attach replays that very initialize to mint a
+		// session, so re-sending it too would earn `-32600 Server already
+		// initialized` and leave the connection unusable for this whole spawn.
+		const first = await bootCellar();
+		const { stdio } = await startBridge();
+		await killCellar(first);
+		const second = await bootCellar();
+
+		const reply = await stdio.request(INIT, 8000);
+		expect(reply).toMatchObject({ id: INIT.id, result: { protocolVersion: '2025-06-18' } });
+		expect(reply.error).toBeUndefined();
+		// Exactly one response for the handshake id, and exactly one session minted.
+		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
+		expect(second.sessionCount()).toBe(1);
+
+		// ...and the session really works.
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		expect(await stdio.request({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, 8000)).toMatchObject({
+			result: { echoed: 'tools/list' }
+		});
 	});
 
 	it('retries a dropped connection on the SAME session while the instance is still alive', async () => {

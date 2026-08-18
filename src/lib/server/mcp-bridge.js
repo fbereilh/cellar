@@ -173,11 +173,17 @@ export function classifyUpstreamFailure(err) {
 	// A 404 to a request carrying a session id means "start a new session" per the
 	// Streamable HTTP spec; Cellar's own server says the same with a 400 -32000.
 	if (status === 404) return 'session-gone';
-	if ((status === 400 || status === 404) && text.includes('-32000')) return 'session-gone';
-	if (SESSION_GONE_MESSAGE.test(text)) return 'session-gone';
+	if (status === 400 && (text.includes('-32000') || SESSION_GONE_MESSAGE.test(text))) {
+		return 'session-gone';
+	}
 	// Any OTHER status means a live server that knows our session answered and
-	// refused this one message. Nothing about the session is gone.
+	// refused this one message. Nothing about the session is gone, and the text is
+	// NOT consulted: the SDK folds the response BODY into this message, so a 500
+	// from Cellar's own outer catch (`mcp error: <anything>`) relaying a tool
+	// failure that merely mentions a session would otherwise tear down a healthy
+	// session and abort every run streaming on it.
 	if (status != null) return 'other';
+	if (SESSION_GONE_MESSAGE.test(text)) return 'session-gone';
 	for (const e of errorChain(err)) {
 		if (e?.name === 'AbortError' || e?.code === 'ABORT_ERR') return 'connection';
 		if (typeof e?.code === 'string' && CONNECTION_ERROR_CODES.has(e.code)) return 'connection';
@@ -259,12 +265,22 @@ export async function runMcpBridge({
 	let closing = false;
 	let attachedPort = rt.mcpPort;
 	/**
-	 * Ids of handshake messages the BRIDGE sent on its own behalf. Their responses
-	 * belong to us, not to the agent - which already completed its handshake - so
-	 * they are swallowed rather than relayed. They carry a synthetic id (a string,
-	 * which JSON-RPC allows) so they can never be mistaken for one of the agent's.
+	 * Handshake messages the BRIDGE sent, keyed by the synthetic id it gave them (a
+	 * string, which JSON-RPC allows, so it can never be mistaken for one of the
+	 * agent's). The value is who the reply belongs to: `null` for a re-handshake
+	 * the agent knows nothing about - swallowed, since the agent completed its own
+	 * long ago and is waiting on no such id - or the agent's OWN initialize id when
+	 * this replay stands IN for a handshake the agent is still waiting for, in
+	 * which case the reply is relayed under that id.
 	 */
-	const ownIds = new Set();
+	const ownIds = new Map();
+	/**
+	 * Agent request ids whose handshake a replay has taken over. They must never be
+	 * re-sent: a transport is initialized exactly once, and a second initialize is
+	 * answered `-32600 Server already initialized`, which would fail the very
+	 * handshake the recovery is completing.
+	 */
+	const handedOff = new Set();
 	let handshakeSeq = 0;
 
 	const sendDown = (msg) =>
@@ -284,6 +300,7 @@ export async function runMcpBridge({
 	 */
 	const failRequest = (id, message) => {
 		if (!pending.delete(id)) return;
+		handedOff.delete(id);
 		sendDown({ jsonrpc: '2.0', id, error: { code: NO_INSTANCE_ERROR_CODE, message } });
 	};
 
@@ -306,10 +323,20 @@ export async function runMcpBridge({
 	const wire = (t) => {
 		t.onmessage = (msg) => {
 			if (isResponse(msg)) {
-				// Our own re-handshake's reply: consume it. Relaying it would hand the
-				// agent a second `initialize` result for a handshake it finished long
-				// ago, under an id it is no longer waiting on.
-				if (ownIds.delete(msg.id)) return;
+				if (ownIds.has(msg.id)) {
+					const forAgent = ownIds.get(msg.id);
+					ownIds.delete(msg.id);
+					// A re-handshake the agent knows nothing about: consume it. Relaying
+					// it would hand the agent a second `initialize` result for a handshake
+					// it finished long ago, under an id it is no longer waiting on.
+					if (forAgent == null) return;
+					// This replay stood in for the agent's OWN initialize, which is still
+					// unanswered: give it the result under the id it is waiting on.
+					handedOff.delete(forAgent);
+					pending.delete(forAgent);
+					sendDown({ ...msg, id: forAgent });
+					return;
+				}
 				pending.delete(msg.id);
 			}
 			sendDown(msg);
@@ -342,8 +369,14 @@ export async function runMcpBridge({
 		// RE-attach: on the first attach the agent's own initialize is still to come
 		// and flows through the ordinary relay.
 		if (initRequest) {
+			// If the agent's OWN initialize is what is still unanswered - its send is
+			// what failed and brought us here - this replay IS its handshake, so the
+			// reply is relayed under its id rather than swallowed, and the caller must
+			// not send it a second time.
+			const forAgent = pending.has(initRequest.id) ? initRequest.id : null;
 			const id = `cellar-bridge-init-${++handshakeSeq}`;
-			ownIds.add(id);
+			ownIds.set(id, forAgent);
+			if (forAgent != null) handedOff.add(forAgent);
 			await t.send({ ...initRequest, id });
 			await t.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
 		}
@@ -492,6 +525,9 @@ export async function runMcpBridge({
 			// were re-attaching, it is done. Re-sending would answer it twice, and
 			// JSON-RPC allows exactly one response per id.
 			if (isReq && !pending.has(msg.id)) return;
+			// The re-attach handshook on this request's behalf, so it is already on
+			// the wire; the reply comes back under its id.
+			if (isReq && handedOff.has(msg.id)) return;
 		}
 		if (isReq) {
 			failRequest(

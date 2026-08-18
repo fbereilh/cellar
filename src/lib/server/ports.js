@@ -212,6 +212,14 @@ export const PORT_RELEASE_GRACE_MS = 500;
 const PORT_RETRY_MS = 50;
 
 /**
+ * How many ephemeral ports to ask for before giving up on finding one nothing
+ * else has claimed. Generous, because each attempt is a kernel-assigned port and
+ * a repeat is a coincidence: reaching the bound means the machine really has
+ * nothing to give, which is a launch failure rather than something to paper over.
+ */
+const FRESH_PORT_ATTEMPTS = 50;
+
+/**
  * Can we bind `port` on `host` right now?
  *
  * `host` MUST be the address the server that will own this port actually binds,
@@ -319,11 +327,17 @@ export async function choosePort({
 		// Guard the fallback against a port this launch has already claimed for
 		// another role: `freePort()` probes and releases, so two calls could in
 		// principle agree, and a hand-edited preference could name one port twice.
-		for (let i = 0; i < 10; i++) {
+		for (let i = 0; i < FRESH_PORT_ATTEMPTS; i++) {
 			const port = await freePort();
 			if (!isUnavailable(port)) return { port, source: 'fresh', reason };
 		}
-		return { port: await freePort(), source: 'fresh', reason };
+		// Never hand back a port we KNOW is taken - that is the one outcome this
+		// loop exists to prevent, and it would surface much later as two roles
+		// racing for one address. Refusing to launch is the honest failure.
+		throw new Error(
+			`could not find a free port after ${FRESH_PORT_ATTEMPTS} attempts - every port offered is already ` +
+				'claimed by a live instance or by another role of this launch.'
+		);
 	};
 
 	// Isolated / `--new` launches never use the sticky path: they exist so
@@ -413,13 +427,15 @@ export async function resolveWorkspacePorts({
 		return r;
 	};
 
-	// Jupyter is deliberately never sticky (see the module header): its port is
-	// reached only by the launcher and the app, which learn it in-process.
+	// ORDER IS LOAD-BEARING: the sticky roles are resolved FIRST and Jupyter last.
+	// Jupyter is deliberately never sticky (see the module header), so it takes a
+	// kernel-assigned ephemeral port and claims it - and an ephemeral port can land
+	// on the very port this folder remembers. Resolved first, that pushed the
+	// sticky role off its remembered address, reported it as `held-by-live-instance`
+	// (which nothing does), and then PERSISTED the replacement, losing the stable
+	// address this whole file exists to keep. Last, it simply skips whatever the
+	// sticky roles took, which its own `fresh()` already does.
 	const hosts = bindHosts(env);
-	const jupyter = await take('CELLAR_JUPYTER_PORT', {
-		sticky: false,
-		host: hosts.jupyter
-	});
 	const app = await take('CELLAR_APP_PORT', {
 		sticky,
 		remembered: prefs.appPort,
@@ -429,6 +445,10 @@ export async function resolveWorkspacePorts({
 		sticky,
 		remembered: prefs.mcpPort,
 		host: hosts.mcp
+	});
+	const jupyter = await take('CELLAR_JUPYTER_PORT', {
+		sticky: false,
+		host: hosts.jupyter
 	});
 
 	if (sticky) {
