@@ -42,11 +42,40 @@
  *
  * The port is NOT the cause and a stable port is NOT the cure: holding the MCP
  * port fixed across a restart reproduces the failure identically, because what
- * died is the SESSION, not the address. So the fix belongs here: on an upstream
- * failure the bridge re-reads `runtime.json` (picking up whatever instance now
- * serves the folder, on whatever port), re-runs the MCP handshake to mint a
- * fresh session, and retries the message that failed. The agent sees a normal
- * response and never learns anything happened.
+ * died is the SESSION, not the address. So the fix belongs here: when the
+ * session is gone the bridge re-reads `runtime.json` (picking up whatever
+ * instance now serves the folder, on whatever port), re-runs the MCP handshake
+ * to mint a fresh session, and retries the message that failed. The agent sees a
+ * normal response and never learns anything happened.
+ *
+ * ## Re-attaching is driven by EVIDENCE THE SESSION IS GONE, never by any failure
+ *
+ * A re-attach is destructive: it closes the session, and with it the open POST
+ * and SSE stream every in-flight request is riding. Cellar's run tools hold that
+ * POST open for the WHOLE cell run (minutes, streaming progress notifications),
+ * so over-triggering here would abort exactly the long work this bridge exists
+ * to protect - a worse failure than the one being fixed. `send()` rejects for
+ * three quite different reasons, and only two of them say anything about the
+ * session (see `classifyUpstreamFailure`):
+ *
+ *   - `session-gone` - the server itself refused us (`-32000 No valid session`,
+ *     or a 404 to a request carrying a session id, which the spec defines as
+ *     "re-initialize"). This IS the evidence; re-attach at once.
+ *   - `connection` - nothing answered (`fetch failed`, ECONNREFUSED/ECONNRESET,
+ *     socket hang up). Ambiguous: a replaced instance looks like this, but so
+ *     does a stale keep-alive socket against a perfectly healthy one. So it is
+ *     CONFIRMED first - runtime.json naming a different port, or the recorded
+ *     instance not answering - and an unconfirmed blip is retried once on the
+ *     SAME session, which a fresh socket satisfies.
+ *   - `other` - a live, session-valid server rejecting THIS message (429, 500,
+ *     bad params). Relayed as an error for that request alone: no detach, no
+ *     re-handshake, and above all no disturbing the other in-flight requests.
+ *
+ * Other pending requests are failed ONLY after a genuine re-attach, when their
+ * answers provably can never arrive, and exactly ONCE per re-attach (in the
+ * single-flight continuation, not per caller - per caller, two concurrent
+ * failures each failed the other's request AND then retried it, so one id got
+ * both an error and a result).
  *
  * This is the ONLY place with protocol awareness, and it is kept to the minimum
  * that a re-handshake requires: remember the agent's `initialize` request so it
@@ -84,6 +113,77 @@ export function isResponse(msg) {
 /** True for the MCP `initialize` request, whose params we must replay to re-handshake. */
 export function isInitializeRequest(msg) {
 	return isRequest(msg) && msg.method === 'initialize';
+}
+
+/** Node/undici codes that mean the connection itself failed, not that a server answered. */
+const CONNECTION_ERROR_CODES = new Set([
+	'ECONNREFUSED',
+	'ECONNRESET',
+	'EPIPE',
+	'ETIMEDOUT',
+	'ENOTFOUND',
+	'EHOSTUNREACH',
+	'ENETUNREACH',
+	'EAI_AGAIN',
+	'UND_ERR_SOCKET',
+	'UND_ERR_CONNECT_TIMEOUT'
+]);
+/**
+ * The same thing said in prose, for a transport that carries no code. `aborted`
+ * belongs here rather than with the rejections: an aborted request never got a
+ * verdict from the server, and our OWN `detach()` aborts in-flight sends.
+ */
+const CONNECTION_MESSAGE =
+	/fetch failed|socket hang up|premature close|other side closed|connection (?:closed|refused|reset|error)|network error|terminated|(?:was|operation) aborted/i;
+/** A server telling us the session we carry is not one it knows. */
+const SESSION_GONE_MESSAGE =
+	/no valid session|session (?:not found|expired|has expired|is invalid|invalid)|send an initialize request/i;
+
+/** Walk an error's `cause` chain - undici wraps the real socket error one level down. */
+function* errorChain(err, depth = 5) {
+	let cur = err;
+	for (let i = 0; cur && i < depth; i++) {
+		yield cur;
+		cur = cur.cause;
+	}
+}
+
+/**
+ * The HTTP status an upstream failure carries, or null if it never reached one.
+ * `StreamableHTTPError` records the status on a NUMERIC `code`; a node socket
+ * error puts a STRING there, so the type check is what tells them apart.
+ */
+function httpStatusOf(err) {
+	for (const e of errorChain(err)) {
+		if (typeof e?.code === 'number' && e.code >= 100 && e.code <= 599) return e.code;
+	}
+	return null;
+}
+
+/**
+ * Why an `upstream.send` rejected - the decision that gates tearing the session
+ * down (see the module header for why that must be evidence-driven).
+ *
+ * @param {unknown} err
+ * @returns {'session-gone' | 'connection' | 'other'}
+ */
+export function classifyUpstreamFailure(err) {
+	const status = httpStatusOf(err);
+	const text = String(err?.message ?? err ?? '');
+	// A 404 to a request carrying a session id means "start a new session" per the
+	// Streamable HTTP spec; Cellar's own server says the same with a 400 -32000.
+	if (status === 404) return 'session-gone';
+	if ((status === 400 || status === 404) && text.includes('-32000')) return 'session-gone';
+	if (SESSION_GONE_MESSAGE.test(text)) return 'session-gone';
+	// Any OTHER status means a live server that knows our session answered and
+	// refused this one message. Nothing about the session is gone.
+	if (status != null) return 'other';
+	for (const e of errorChain(err)) {
+		if (e?.name === 'AbortError' || e?.code === 'ABORT_ERR') return 'connection';
+		if (typeof e?.code === 'string' && CONNECTION_ERROR_CODES.has(e.code)) return 'connection';
+	}
+	if (CONNECTION_MESSAGE.test(text)) return 'connection';
+	return 'other';
 }
 
 /**
@@ -146,6 +246,14 @@ export async function runMcpBridge({
 	let initRequest = null;
 	/** Ids of requests relayed upstream and not yet answered. */
 	const pending = new Set();
+	/**
+	 * Ids whose `relayUp` call has not returned yet, and which will therefore be
+	 * answered by that call itself. Exempt from the post-re-attach sweep, because
+	 * sweeping an id that is still going to be answered gives it two responses.
+	 * Registered SYNCHRONOUSLY at the top of `relayUp`, before any await, so a
+	 * re-attach can never start in the gap.
+	 */
+	const relaying = new Set();
 	/** Single-flight re-attach, so a burst of failures triggers one reconnect. */
 	let reattaching = null;
 	let closing = false;
@@ -167,9 +275,15 @@ export async function runMcpBridge({
 	 * lost with the dead server hangs until the HOST's timeout (60s in the
 	 * measured case) - a prompt, actionable failure is strictly better, and the
 	 * agent can simply call again once Cellar is back.
+	 *
+	 * Idempotent, and that is load-bearing: JSON-RPC allows exactly ONE response
+	 * per id, so an id already answered - by the real server (the relay deletes it
+	 * on the way down) or by an earlier failure - must never be answered twice.
+	 * Membership in `pending` IS the "still unanswered" record, so the delete's
+	 * own verdict is the guard.
 	 */
 	const failRequest = (id, message) => {
-		pending.delete(id);
+		if (!pending.delete(id)) return;
 		sendDown({ jsonrpc: '2.0', id, error: { code: NO_INSTANCE_ERROR_CODE, message } });
 	};
 
@@ -200,9 +314,10 @@ export async function runMcpBridge({
 			}
 			sendDown(msg);
 		};
-		// Upstream errors are NOT fatal and must never shut the bridge down: they
-		// are how a replaced instance announces itself, and the re-attach below is
-		// driven by the send that fails, not by this. Log only.
+		// Upstream errors are NOT fatal and must never shut the bridge down. They
+		// are also not the re-attach trigger: this fires for a failed SSE stream on
+		// a perfectly healthy session, and it carries no message to classify or to
+		// answer. Recovery is decided per send, where both exist. Log only.
 		t.onerror = (err) => log(`upstream error: ${err?.message ?? err}`);
 		t.onclose = () => log('upstream connection closed');
 	};
@@ -242,11 +357,12 @@ export async function runMcpBridge({
 	const reattach = () => {
 		if (!reattaching) {
 			reattaching = (async () => {
+				let ok = false;
 				try {
-					return await attach();
+					ok = await attach();
 				} catch (err) {
 					log(`re-attach failed: ${err?.message ?? err}`);
-					return false;
+					ok = false;
 				} finally {
 					// Cleared in a microtask so every caller awaiting THIS attempt sees
 					// the same result before a new one can start.
@@ -254,55 +370,134 @@ export async function runMcpBridge({
 						reattaching = null;
 					});
 				}
+				if (ok) {
+					log(`re-attached to http://127.0.0.1:${attachedPort}/mcp`);
+					// Only NOW can we say these can never be answered: we really did
+					// mint a new session, so the stream carrying their replies is gone.
+					// Swept here, once, rather than by each caller - per caller, two
+					// concurrent failures each failed the OTHER's request and then
+					// retried it, giving one id both an error and a result. A relay
+					// still running answers its own id, so it is exempt.
+					for (const id of [...pending]) {
+						if (relaying.has(id)) continue;
+						failRequest(
+							id,
+							'Cellar restarted while this request was in flight; it was not completed. Call again.'
+						);
+					}
+				}
+				return ok;
 			})();
 		}
 		return reattaching;
 	};
 
 	/**
-	 * Relay one agent message upstream, re-attaching and retrying once if the
-	 * instance behind us has been replaced.
+	 * Is the instance we are attached to really gone?
+	 *
+	 * Asked only about an ambiguous `connection` failure, to keep a transient blip
+	 * from tearing down a session with long runs streaming on it. Two independent
+	 * signals, either of which settles it: runtime.json now names a DIFFERENT mcp
+	 * port (a replacement registered itself), or the instance it names does not
+	 * answer. Unverifiable reads as gone - the caller then re-attaches, which
+	 * simply refuses if nothing is serving.
+	 */
+	const instanceGone = async () => {
+		try {
+			const cur = readRuntimeFn(workspace);
+			if (!cur || cur.mcpPort !== attachedPort) return true;
+			return !(await isAliveFn(cur));
+		} catch (err) {
+			log(`could not confirm the instance (${err?.message ?? err}); treating it as gone`);
+			return true;
+		}
+	};
+
+	/** Answer one request with the "nothing is serving this folder" error. */
+	const failUnreachable = (msg) => {
+		if (!isRequest(msg)) return;
+		failRequest(
+			msg.id,
+			`Cellar is not reachable in ${workspace}: no running instance answered. ` +
+				'Start it there (`cd ' +
+				workspace +
+				' && cellar`) and call again - this bridge reconnects on its own.'
+		);
+	};
+
+	/**
+	 * Relay one agent message upstream, recovering only from a failure that is
+	 * evidence the SESSION is gone (see the module header).
 	 */
 	const relayUp = async (msg) => {
 		if (isInitializeRequest(msg)) initRequest = msg;
-		if (isRequest(msg)) pending.add(msg.id);
-		try {
-			if (!upstream) throw new Error('not attached');
-			await upstream.send(msg);
-			return;
-		} catch (err) {
-			if (closing) return;
-			log(`upstream send failed (${err?.message ?? err}); re-attaching …`);
+		const isReq = isRequest(msg);
+		if (isReq) {
+			pending.add(msg.id);
+			relaying.add(msg.id);
 		}
+		try {
+			await deliver(msg, isReq);
+		} finally {
+			if (isReq) relaying.delete(msg.id);
+		}
+	};
 
-		const ok = await reattach();
-		if (!ok) {
-			if (isRequest(msg)) {
-				failRequest(
-					msg.id,
-					`Cellar is not reachable in ${workspace}: no running instance answered. ` +
-						'Start it there (`cd ' +
-						workspace +
-						' && cellar`) and call again - this bridge reconnects on its own.'
-				);
+	/**
+	 * The body of one relay: send, and recover only from a failure that is
+	 * evidence the session is gone. Bounded so a flapping instance can never spin
+	 * here - at most the current session, one same-session retry, and a session
+	 * adopted from (or minted by) a re-attach.
+	 */
+	const deliver = async (msg, isReq) => {
+		let sameSessionRetried = false;
+		for (let attempt = 0; attempt < 4; attempt++) {
+			const t = upstream;
+			if (t) {
+				let kind;
+				try {
+					await t.send(msg);
+					return;
+				} catch (err) {
+					if (closing) return;
+					kind = classifyUpstreamFailure(err);
+					if (kind === 'other') {
+						// A live, session-valid server rejecting THIS message. Detaching
+						// here would abort every other in-flight run over a failure that
+						// belongs to one request, so relay it and leave the session alone.
+						log(`upstream rejected the request (${err?.message ?? err})`);
+						if (isReq) failRequest(msg.id, `Cellar rejected the request: ${err?.message ?? err}`);
+						return;
+					}
+					log(`upstream send failed (${err?.message ?? err})`);
+				}
+				// A concurrent relay re-attached while we were failing: its session is
+				// ours too. Take it rather than minting a second one, which would close
+				// the transport that relay is still using out from under it.
+				if (upstream && upstream !== t) continue;
+				if (kind === 'connection' && !sameSessionRetried && !(await instanceGone())) {
+					// The recorded instance still names our port and answers, so this was
+					// a blip (a stale keep-alive socket), not a replacement. A fresh
+					// socket is all it takes, and the session - with whatever long run is
+					// streaming on it - survives.
+					sameSessionRetried = true;
+					log('the instance is still alive; retrying on the same session');
+					continue;
+				}
 			}
-			return;
-		}
-		log(`re-attached to http://127.0.0.1:${attachedPort}/mcp`);
 
-		// Requests already in flight against the dead server can never be answered:
-		// fail them now rather than let them hang. The message we are about to
-		// retry is deliberately exempt - the new server WILL answer it.
-		for (const id of [...pending]) {
-			if (id === msg.id) continue;
-			failRequest(id, 'Cellar restarted while this request was in flight; it was not completed. Call again.');
+			const ok = await reattach();
+			if (!ok) return failUnreachable(msg);
+			// Belt to the `relaying` braces: if this id was answered anyway while we
+			// were re-attaching, it is done. Re-sending would answer it twice, and
+			// JSON-RPC allows exactly one response per id.
+			if (isReq && !pending.has(msg.id)) return;
 		}
-
-		try {
-			await upstream.send(msg);
-		} catch (err) {
-			log(`retry after re-attach failed: ${err?.message ?? err}`);
-			if (isRequest(msg)) failRequest(msg.id, `Cellar is reachable but rejected the request: ${err?.message ?? err}`);
+		if (isReq) {
+			failRequest(
+				msg.id,
+				'Cellar kept dropping the connection, so the request was not completed. Call again.'
+			);
 		}
 	};
 

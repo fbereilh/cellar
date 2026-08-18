@@ -389,7 +389,14 @@ export async function resolveWorkspacePorts({
 	const prefs = sticky ? readPortPrefs(workspace) : {};
 	// Ports a live registered instance holds. Never reclaimed - we always yield.
 	// Doubles as this launch's own claim set, so two roles can never agree.
-	const claimed = sticky ? portsHeldByLiveInstances(instances, { isAlive, excludePid }) : new Set();
+	//
+	// Consulted on the ISOLATED path too, which does not weaken its guarantee:
+	// what an isolated launch must never touch is the PREFERENCE (read above,
+	// written below, both still gated on `sticky`), and this is a read-only
+	// registry lookup. It only makes a collision less likely - which matters
+	// because a bind probe races (and, on macOS, a loopback probe cannot even see
+	// a wildcard holder), while the registry answers before anything is serving.
+	const claimed = portsHeldByLiveInstances(instances, { isAlive, excludePid });
 	/** @param {number} p */
 	const isUnavailable = (p) => claimed.has(p);
 	/** @param {string} pinnedEnv @param {Partial<Parameters<typeof choosePort>[0]>} opts */

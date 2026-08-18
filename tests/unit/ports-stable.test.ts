@@ -191,25 +191,40 @@ describe('choosePort - the stable-port rule', () => {
 	it('gives up on the grace rather than blocking the launch forever', async () => {
 		let attempts = 0;
 		let clock = 0;
-		const r = await choosePort({
-			remembered: 51348,
-			sticky: true,
-			canBind: async () => {
-				attempts++;
-				return false; // never comes back
-			},
-			freePort,
-			// Advance a fake clock so the deadline is reached without real waiting.
-			sleep: async () => {
-				clock += 10_000;
-				const orig = Date.now;
-				Date.now = () => orig() + clock;
-			}
-		});
+		// Capture the REAL clock once and restore it in a finally: patched in place
+		// from inside `sleep`, the offset compounded on every call and then leaked
+		// into every later test in this file, where it would fail somewhere with no
+		// visible cause.
+		const realNow = Date.now;
+		let r;
+		try {
+			r = await choosePort({
+				remembered: 51348,
+				sticky: true,
+				canBind: async () => {
+					attempts++;
+					return false; // never comes back
+				},
+				freePort,
+				// Advance a fake clock so the deadline is reached without real waiting.
+				sleep: async () => {
+					clock += 10_000;
+					Date.now = () => realNow() + clock;
+				}
+			});
+		} finally {
+			Date.now = realNow;
+		}
 		expect(r.source).toBe('fresh');
 		expect(r.reason).toBe('port-unavailable');
 		expect(attempts).toBeGreaterThanOrEqual(1);
 		expect(PORT_RELEASE_GRACE_MS).toBeGreaterThan(0);
+	});
+
+	it('leaves the wall clock alone for every later test in this file', () => {
+		// The guard for the leak above: a patch left in place shifts `Date.now` for
+		// the rest of the file, so this must agree with an independent reading.
+		expect(Math.abs(Date.now() - new Date().getTime())).toBeLessThan(1000);
 	});
 
 	it('never spends the grace on a port a live instance holds - that answer is settled', async () => {
@@ -565,6 +580,29 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 		expect(isolated.mcp.reason).toBe('not-sticky');
 		// ...and it must not OVERWRITE the folder's memory with its throwaway ports.
 		expect(readPortPrefs(ws)).toEqual(remembered);
+	});
+
+	it('an isolated launch still yields to a port a live registered instance holds', async () => {
+		// The isolated guarantee is about the PREFERENCE (never read, never
+		// written), not about the registry - and a bind probe cannot see everything
+		// a registry can: it races, and on macOS a loopback probe does not even
+		// notice a wildcard holder. So the read-only "who is live" lookup applies
+		// here too, and only makes a collision less likely.
+		const fp = scriptedFreePort(41000, 41001, 41002, 41003);
+		const isolated = await resolveWorkspacePorts({
+			workspace: ws,
+			sticky: false,
+			env: {},
+			freePort: fp,
+			instances: [{ launcherPid: 999, appPort: 41000, mcpPort: 41001 }],
+			isAlive: () => true,
+			bindGraceMs: 0
+		});
+		for (const p of [isolated.appPort, isolated.mcpPort, isolated.jupyterPort]) {
+			expect([41000, 41001]).not.toContain(p);
+		}
+		// ...and it is still isolated: nothing was remembered.
+		expect(existsSync(portPrefsPath(ws))).toBe(false);
 	});
 
 	it('an isolated launch in a never-launched folder writes no preference at all', async () => {
