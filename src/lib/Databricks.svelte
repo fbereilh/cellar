@@ -288,6 +288,22 @@
 	// a reconnect that genuinely fails still falls through to the real lost/expired
 	// state with its Reconnect button.
 	let restarting = $state(false);
+	/**
+	 * The notebook the panel's OWN in-flight transition (a connect, or the kernel
+	 * restart an `applyRuntime` issues) was latched for. This panel is ONE long-lived
+	 * component whose `notebookPath` follows the active tab while `busy`/`restarting`/
+	 * `runtimeApplying`/`connectOverLive` are panel-wide, so without it a connect that
+	 * can run to MINUTES held the whole connected view over whichever notebook the user
+	 * tabbed to next - one with no session of its own. Same idiom as
+	 * `uploadToWorkspace`'s `const target = notebookPath`; the rule that reads it is
+	 * `panelOwnsTransition` in `$lib/databricksPanelState`.
+	 *
+	 * Set at the start of every transition and deliberately NEVER cleared: it is only
+	 * ever consulted while a transition flag is set, and clearing it in a `finally`
+	 * would let a connect settling on notebook A wipe the ownership a runtime apply
+	 * started on B in the meantime.
+	 */
+	let transitionPath = $state<string | null | undefined>(undefined);
 	onMount(() => {
 		// `=== true` mirrors the server's `databricksRuntimeEnabled` exactly: only an
 		// explicit stored true is ON, so the toggle can never render on over a value the
@@ -359,6 +375,9 @@
 	 * the ADVERTISEMENT only; whatever version is stored is the one it applies.
 	 */
 	async function applyRuntime(on: boolean, { writeVersion = false } = {}): Promise<void> {
+		// Whose restart this is, for the same reason `connect` latches it: the panel
+		// follows the active tab, the restart does not follow with it.
+		transitionPath = notebookPath;
 		runtimeOn = on; // optimistic
 		await setUiNow(DBX_RUNTIME_KEY, on);
 		if (writeVersion) {
@@ -526,15 +545,6 @@
 
 	const connection = $derived<DbxConnection>(status?.connection ?? { connected: false });
 	const connected = $derived(!!connection.connected);
-	/**
-	 * An EXPECTED kernel restart is in flight, from either of the two things that can
-	 * know it: the panel itself (`restarting`, set around its own `applyRuntime`) and
-	 * the server (`connection.restarting`, its grace window around the epoch change -
-	 * which is what covers a restart the panel did NOT initiate, e.g. the Kernels
-	 * sidebar or `%restart_python`). Either way the lost/expired cards are held back
-	 * in favour of the connecting/connected presentation.
-	 */
-	const expectedRestart = $derived(restarting || !!connection.restarting);
 	/**
 	 * The Databricks runtime the RUNNING kernel actually carries, straight from the
 	 * server (`getStatus().runtime`) - deliberately NOT `runtimeOn`, which is only the
@@ -884,9 +894,12 @@
 	 */
 	const panel = $derived(
 		databricksPanelState({
+			notebookPath,
+			transitionPath,
 			busy,
 			connected,
-			expectedRestart,
+			restarting,
+			serverRestarting: !!connection.restarting,
 			runtimeApplying,
 			connectOverLive,
 			expired: !!connection.expired,
@@ -1048,6 +1061,10 @@
 		// (a re-pin kernel restart), and this is what keeps the panel from unmounting
 		// around that frame. See `holdsConnectedView` in `$lib/databricksPanelState`.
 		connectOverLive = connected;
+		// ...and WHOSE frame it is. A connect can run to minutes, so the user may well
+		// tab to another notebook while it does; that notebook must show its own state,
+		// not this one's held connected view. See `panelOwnsTransition`.
+		transitionPath = notebookPath;
 		// Collapse the picker on the CLICK, not on the reply. The list has served its
 		// purpose the moment a cluster is chosen, and the card above now names the
 		// target, so leaving it open (disabled) only means the panel jumps at the very
@@ -1933,11 +1950,18 @@
 
 	// A single muted "profile · host · spark" line replacing the connected card's
 	// former <dl> grid - shorter and calmer, still complete.
+	//
+	// The DBR is dropped while the card wears its connecting face: it is a property of
+	// the session, so during a switch it is the OUTGOING cluster's runtime rendered
+	// directly under an identity row that already reads "Connecting to <new cluster>…"
+	// - the same stale claim the `spark`/`w`-are-ready line was swapped out to avoid.
+	// The workspace half (profile · host) is what the connect targets and survives, so
+	// the line stays one line and the card keeps its height.
 	const connMeta = $derived(
 		[
 			connection.profile,
 			connection.host ? connection.host.replace(/^https?:\/\//, '') : null,
-			connection.sparkVersion
+			panel.connecting ? null : connection.sparkVersion
 		]
 			.filter(Boolean)
 			.join(' · ')
@@ -2971,12 +2995,13 @@
 				     nothing to hold, so the standalone card IS the progression (picker →
 				     connecting → connected) rather than a collapse. Shown for a connect
 				     (`busy === 'connect'`) AND for any expected kernel restart still in
-				     flight (`expectedRestart` - this panel's own, or the server's grace
-				     window around a restart triggered elsewhere), EXCEPT a runtime toggle:
+				     flight (this panel's own `restarting`, or the server's grace window
+				     around a restart triggered elsewhere), EXCEPT a runtime toggle:
 				     that keeps the connected card with its "restarting" pill. Because
 				     the transition covers the whole window, the lost/expired branches
 				     below are unreachable during it: an expected restart can never be
-				     mistaken for an unexpected loss. -->
+				     mistaken for an unexpected loss. A transition latched for ANOTHER
+				     notebook speaks for none of this - see `panelOwnsTransition`. -->
 				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-connecting">
 					{@render cardLabel('cluster')}
 					<div class="mt-1.5 flex items-center gap-2">

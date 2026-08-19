@@ -4,6 +4,7 @@ import {
 	databricksPanelState,
 	expectedTransition,
 	holdsConnectedView,
+	panelOwnsTransition,
 	type DbxPanelInputs
 } from '../../src/lib/databricksPanelState';
 
@@ -25,11 +26,18 @@ import {
  * cannot be mounted here) into a pure module.
  */
 
+/** The notebook the panel is showing, and a second one the user can tab to. */
+const NB = 'analysis.ipynb';
+const OTHER = 'scratch.ipynb';
+
 /** Disconnected and idle: nothing in flight, no session. */
 const IDLE: DbxPanelInputs = {
+	notebookPath: NB,
+	transitionPath: NB,
 	busy: '',
 	connected: false,
-	expectedRestart: false,
+	restarting: false,
+	serverRestarting: false,
 	runtimeApplying: false,
 	connectOverLive: false,
 	expired: false,
@@ -55,9 +63,19 @@ describe('the connected view is HELD across a cluster switch', () => {
 			// is the frame the latch exists for.
 			{
 				label: 're-pin restart mid-connect',
-				s: { ...IDLE, busy: 'connect', connectOverLive: true, connected: false, lost: true, expectedRestart: true }
+				s: {
+					...IDLE,
+					busy: 'connect',
+					connectOverLive: true,
+					connected: false,
+					lost: true,
+					serverRestarting: true
+				}
 			},
-			{ label: 'server grace window', s: { ...IDLE, busy: 'connect', connectOverLive: true, expectedRestart: true } },
+			{
+				label: 'server grace window',
+				s: { ...IDLE, busy: 'connect', connectOverLive: true, serverRestarting: true }
+			},
 			// The reply lands and the status is re-read before `busy` clears.
 			{ label: 'status back, still busy', s: { ...CONNECTED, busy: 'connect', connectOverLive: true } },
 			{ label: 'connected to B', s: CONNECTED }
@@ -86,13 +104,99 @@ describe('the connected view is HELD across a cluster switch', () => {
 			busy: 'connect',
 			connected: false,
 			lost: true,
-			expectedRestart: true,
+			serverRestarting: true,
 			connectOverLive: true
 		};
 		expect(holdsConnectedView(lostMidConnect)).toBe(true);
 		expect(databricksPanelState(lostMidConnect).view).toBe('connected');
 		// The same frame WITHOUT the latch is a first connect: nothing to hold.
 		expect(databricksPanelState({ ...lostMidConnect, connectOverLive: false }).view).toBe('connecting');
+	});
+});
+
+/**
+ * The panel is ONE long-lived component whose `notebookPath` follows the active tab,
+ * while every transition flag it owns is panel-wide. A connect can run to MINUTES, so
+ * tabbing to another notebook mid-connect is an ordinary thing to do - and that
+ * notebook must show ITS state, not the held connected view of the one being connected.
+ */
+describe('a transition speaks only for the notebook it was latched for', () => {
+	/** The connect from the timeline above, still in flight, after the user tabs away. */
+	const switchInFlight: DbxPanelInputs = {
+		...CONNECTED,
+		busy: 'connect',
+		connectOverLive: true,
+		transitionPath: NB
+	};
+
+	it('does not hold a connected view over a notebook with no session of its own', () => {
+		const moved: DbxPanelInputs = { ...switchInFlight, notebookPath: OTHER, connected: false };
+		expect(panelOwnsTransition(moved)).toBe(false);
+		expect(holdsConnectedView(moved)).toBe(false);
+		expect(expectedTransition(moved)).toBe(false);
+		expect(databricksPanelState(moved).view).toBe('picker');
+	});
+
+	it('does not suppress the other notebook`s real lost/expired card', () => {
+		const lostElsewhere: DbxPanelInputs = {
+			...switchInFlight,
+			notebookPath: OTHER,
+			connected: false,
+			lost: true
+		};
+		expect(databricksPanelState(lostElsewhere).view).toBe('lost');
+		expect(databricksPanelState({ ...lostElsewhere, lost: false, expired: true }).view).toBe('expired');
+	});
+
+	it('leaves a notebook that IS connected reading plainly connected, with no face', () => {
+		const otherConnected: DbxPanelInputs = { ...switchInFlight, notebookPath: OTHER };
+		expect(databricksPanelState(otherConnected)).toEqual({
+			view: 'connected',
+			connecting: false,
+			restarting: false
+		});
+	});
+
+	it('does not put another notebook`s card into the runtime-restart face', () => {
+		const applyingHere: DbxPanelInputs = {
+			...IDLE,
+			runtimeApplying: true,
+			restarting: true,
+			lost: true,
+			connected: false
+		};
+		expect(databricksPanelState(applyingHere)).toEqual({
+			view: 'connected',
+			connecting: false,
+			restarting: true
+		});
+		// The panel moves to a notebook whose session really did end: its own card wins.
+		const moved = { ...applyingHere, notebookPath: OTHER };
+		expect(databricksPanelState(moved).view).toBe('lost');
+	});
+
+	it('still honours the SERVER grace window, which arrives on this notebook`s status', () => {
+		// `connection.restarting` is read from the status of whichever notebook the panel
+		// is showing, so it is already scoped and ownership must not silence it.
+		const serverSide: DbxPanelInputs = {
+			...IDLE,
+			notebookPath: OTHER,
+			transitionPath: NB,
+			serverRestarting: true,
+			lost: true
+		};
+		expect(panelOwnsTransition(serverSide)).toBe(false);
+		expect(expectedTransition(serverSide)).toBe(true);
+		expect(databricksPanelState(serverSide).view).toBe('connecting');
+	});
+
+	it('treats a panel that has never started a transition as owning nothing', () => {
+		// `transitionPath` starts `undefined`; a real `notebookPath` is never equal to it.
+		expect(panelOwnsTransition({ ...IDLE, transitionPath: undefined })).toBe(false);
+		// A pathless panel (no notebook open) that starts a connect latches `null`, and
+		// that IS its own transition.
+		expect(panelOwnsTransition({ ...IDLE, notebookPath: null, transitionPath: null })).toBe(true);
+		expect(panelOwnsTransition({ ...IDLE, notebookPath: null, transitionPath: undefined })).toBe(false);
 	});
 });
 
@@ -125,20 +229,21 @@ describe('real lost/expired state is still reported', () => {
 	});
 
 	it('does NOT report them mid-restart - that is the lost-flash the transition suppresses', () => {
-		const restarting: DbxPanelInputs = { ...IDLE, expectedRestart: true, lost: true };
+		const restarting: DbxPanelInputs = { ...IDLE, serverRestarting: true, lost: true };
 		expect(databricksPanelState(restarting).view).toBe('connecting');
 	});
 });
 
 describe('the runtime toggle keeps its own face', () => {
 	it('holds the connected view and reads "restarting", never "connecting"', () => {
-		const applying: DbxPanelInputs = { ...IDLE, runtimeApplying: true, expectedRestart: true, lost: true };
+		const applying: DbxPanelInputs = { ...IDLE, runtimeApplying: true, restarting: true, lost: true };
 		expect(databricksPanelState(applying)).toEqual({ view: 'connected', connecting: false, restarting: true });
 	});
 
 	it('a runtime apply is not an `expectedTransition`', () => {
-		expect(expectedTransition({ ...IDLE, expectedRestart: true, runtimeApplying: true })).toBe(false);
-		expect(expectedTransition({ ...IDLE, expectedRestart: true })).toBe(true);
+		expect(expectedTransition({ ...IDLE, restarting: true, runtimeApplying: true })).toBe(false);
+		expect(expectedTransition({ ...IDLE, restarting: true })).toBe(true);
+		expect(expectedTransition({ ...IDLE, serverRestarting: true })).toBe(true);
 		expect(expectedTransition({ ...IDLE, busy: 'connect' })).toBe(true);
 		// Any other verb is not a connect.
 		expect(expectedTransition({ ...IDLE, busy: 'disconnect' })).toBe(false);
@@ -149,72 +254,176 @@ describe('the runtime toggle keeps its own face', () => {
 describe('exactly one view, and only the connected one carries a face', () => {
 	it('over every combination of inputs', () => {
 		const bools = [false, true];
-		for (const busy of ['', 'connect', 'disconnect'])
-			for (const connected of bools)
-				for (const expectedRestart of bools)
-					for (const runtimeApplying of bools)
-						for (const connectOverLive of bools)
-							for (const expired of bools)
-								for (const lost of bools) {
-									const i: DbxPanelInputs = {
-										busy,
-										connected,
-										expectedRestart,
-										runtimeApplying,
-										connectOverLive,
-										expired,
-										lost
-									};
-									const s = databricksPanelState(i);
-									const label = JSON.stringify(i);
-									expect(['connecting', 'connected', 'expired', 'lost', 'picker'], label).toContain(s.view);
-									// A face is a state OF the Cluster card, so it can only ever ride the
-									// connected view - a standalone/expired/lost card has no face to wear.
-									if (s.view !== 'connected') {
-										expect(s.connecting, label).toBe(false);
-										expect(s.restarting, label).toBe(false);
-									}
-									// The two faces are mutually exclusive: the header renders one badge slot.
-									expect(s.connecting && s.restarting, label).toBe(false);
-									// A held view is never claimed without something to hold it.
-									if (s.view === 'connected') expect(holdsConnectedView(i), label).toBe(true);
-								}
+		for (const notebookPath of [NB, OTHER])
+			for (const busy of ['', 'connect', 'disconnect'])
+				for (const connected of bools)
+					for (const restarting of bools)
+						for (const serverRestarting of bools)
+							for (const runtimeApplying of bools)
+								for (const connectOverLive of bools)
+									for (const expired of bools)
+										for (const lost of bools) {
+											const i: DbxPanelInputs = {
+												notebookPath,
+												transitionPath: NB,
+												busy,
+												connected,
+												restarting,
+												serverRestarting,
+												runtimeApplying,
+												connectOverLive,
+												expired,
+												lost
+											};
+											const s = databricksPanelState(i);
+											const label = JSON.stringify(i);
+											expect(['connecting', 'connected', 'expired', 'lost', 'picker'], label).toContain(s.view);
+											// A face is a state OF the Cluster card, so it can only ever ride the
+											// connected view - a standalone/expired/lost card has no face to wear.
+											if (s.view !== 'connected') {
+												expect(s.connecting, label).toBe(false);
+												expect(s.restarting, label).toBe(false);
+											}
+											// The two faces are mutually exclusive: the header renders one badge slot.
+											expect(s.connecting && s.restarting, label).toBe(false);
+											// A held view is never claimed without something to hold it.
+											if (s.view === 'connected') expect(holdsConnectedView(i), label).toBe(true);
+											// A transition owned by ANOTHER notebook contributes nothing: the only
+											// thing that may still move an unowned panel is the server's own
+											// per-notebook grace window.
+											if (!panelOwnsTransition(i) && !serverRestarting) {
+												expect(expectedTransition(i), label).toBe(false);
+												expect(s.restarting, label).toBe(false);
+												expect(s.connecting, label).toBe(false);
+												expect(holdsConnectedView(i), label).toBe(connected);
+											}
+										}
 	});
 });
 
-/**
- * SOURCE GUARDS. The rule above is only load-bearing if the component actually asks
- * it - re-inlining the branch conditions into the template would restore the defect
- * with every test here still green. vitest cannot mount `Databricks.svelte`, so these
- * read the source, which is the same mechanism `databricks-upload-card.test.ts` and
- * `git-notebooks-panel.test.ts` already use for component rules of this shape.
- */
-describe('source guards: the panel really asks the shared rule', () => {
-	const src = readFileSync(new URL('../../src/lib/Databricks.svelte', import.meta.url), 'utf8');
+// ---- The template really asks the rule -------------------------------------
+//
+// The rule above is only load-bearing if the component actually asks it: re-inlining
+// the branch conditions into the template would restore the defect with every test
+// above still green. vitest cannot mount `Databricks.svelte`, so these read the
+// source - the same mechanism `databricks-upload-card.test.ts` and
+// `git-notebooks-panel.test.ts` already use for component rules of this shape.
+//
+// The branch-shape guards below parse the template's `{#if}` nesting rather than
+// grepping for a pre-fix string, so a standalone connecting branch re-added in ANY
+// spelling fails them - as an arm of the chain (its condition is not a `panel.view`
+// test) or as a sibling of it (the standalone card is no longer inside the chain).
 
+const SRC = readFileSync(new URL('../../src/lib/Databricks.svelte', import.meta.url), 'utf8');
+
+/** An arm of an `{#if}` chain: its condition (`null` for a bare `{:else}`) + its body. */
+interface TemplateArm {
+	cond: string | null;
+	start: number;
+	end: number;
+}
+interface TemplateChain {
+	arms: TemplateArm[];
+	start: number;
+}
+
+/**
+ * The template's `{#if}` chains as a nesting model. HTML comments are blanked first
+ * (length-preserving, so offsets still line up): this file's prose mentions block tags
+ * like `{#each}`, which are not markup.
+ */
+function parseIfChains(src: string): { code: string; chains: TemplateChain[] } {
+	const code = src.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '));
+	const re = /\{#if\s([^}]*)\}|\{:else if\s([^}]*)\}|\{:else\}|\{\/if\}/g;
+	const open: { start: number; arms: { cond: string | null; tagStart: number; bodyStart: number }[] }[] = [];
+	const chains: TemplateChain[] = [];
+	for (let m: RegExpExecArray | null; (m = re.exec(code)); ) {
+		const tag = m[0];
+		if (tag.startsWith('{#if')) {
+			open.push({ start: m.index, arms: [{ cond: m[1].trim(), tagStart: m.index, bodyStart: re.lastIndex }] });
+		} else if (tag === '{/if}') {
+			const chain = open.pop();
+			if (!chain) throw new Error(`unbalanced {/if} at offset ${m.index}`);
+			const close = m.index;
+			chains.push({
+				start: chain.start,
+				arms: chain.arms.map((a, k) => ({
+					cond: a.cond,
+					start: a.bodyStart,
+					end: k + 1 < chain.arms.length ? chain.arms[k + 1].tagStart : close
+				}))
+			});
+		} else {
+			const chain = open[open.length - 1];
+			if (!chain) throw new Error(`stray ${tag} at offset ${m.index}`);
+			const cond = tag.startsWith('{:else if') ? m[2].trim() : null;
+			chain.arms.push({ cond, tagStart: m.index, bodyStart: re.lastIndex });
+		}
+	}
+	if (open.length) throw new Error(`${open.length} unclosed {#if}`);
+	return { code, chains };
+}
+
+/** The chain arm that DIRECTLY renders `marker` (innermost wins). */
+function armRendering(parsed: ReturnType<typeof parseIfChains>, marker: string) {
+	const at = parsed.code.indexOf(marker);
+	expect(at, marker).toBeGreaterThan(-1);
+	let best: { chain: TemplateChain; arm: TemplateArm } | null = null;
+	for (const chain of parsed.chains)
+		for (const arm of chain.arms)
+			if (arm.start <= at && at < arm.end && (!best || arm.start > best.arm.start)) best = { chain, arm };
+	if (!best) throw new Error(`${marker} is not inside any {#if}`);
+	return best;
+}
+
+const count = (hay: string, needle: string) => hay.split(needle).length - 1;
+
+describe('source guards: the panel really asks the shared rule', () => {
 	it('imports and derives the panel state from the one module', () => {
-		expect(src).toMatch(/import \{ databricksPanelState \} from '\$lib\/databricksPanelState'/);
-		expect(src).toMatch(/const panel = \$derived\(\s*databricksPanelState\(/);
+		expect(SRC).toMatch(/import \{ databricksPanelState \} from '\$lib\/databricksPanelState'/);
+		expect(SRC).toMatch(/const panel = \$derived\(\s*databricksPanelState\(/);
 	});
 
 	it('every connection branch is decided by it, not by a re-inlined condition', () => {
 		for (const view of ['connecting', 'connected', 'expired', 'lost']) {
-			expect(src, view).toContain(`panel.view === '${view}'`);
+			expect(SRC, view).toContain(`panel.view === '${view}'`);
 		}
-		// The pre-fix condition, in the shape that caused the collapse: a standalone
-		// connecting card rendered as a sibling of the connected view.
-		expect(src).not.toContain("{#if busy === 'connect' || (expectedRestart");
-		expect(src).not.toContain('{:else if connected || runtimeApplying}');
+	});
+
+	/**
+	 * The shape the collapse came from: the standalone connecting card as a SIBLING of
+	 * the connected view. Asserted structurally - the connection area is ONE chain whose
+	 * every arm is a `panel.view` test - so any re-added branch fails, whatever it says.
+	 */
+	it('the connection area is one chain, every arm of it decided by panel.view', () => {
+		const parsed = parseIfChains(SRC);
+		const { chain } = armRendering(parsed, 'data-testid="databricks-connected"');
+		expect(chain.arms.map((a) => a.cond)).toEqual([
+			"panel.view === 'connecting'",
+			"panel.view === 'connected'",
+			"panel.view === 'expired'",
+			"panel.view === 'lost'",
+			// The disconnected fallback; the only arm that needs no condition.
+			null
+		]);
+	});
+
+	it('the standalone connecting card exists only as that chain`s connecting arm', () => {
+		const marker = 'data-testid="databricks-connecting"';
+		const parsed = parseIfChains(SRC);
+		expect(count(parsed.code, marker)).toBe(1);
+		const standalone = armRendering(parsed, marker);
+		const connected = armRendering(parsed, 'data-testid="databricks-connected"');
+		expect(standalone.chain.start).toBe(connected.chain.start);
+		expect(standalone.arm.cond).toBe("panel.view === 'connecting'");
 	});
 
 	it('the Cluster card keeps its siblings mounted in the connected branch', () => {
 		// The cards the collapse used to take with it. They must live under the
 		// connected view, which the switch now holds.
-		const at = src.indexOf("{:else if panel.view === 'connected'}");
-		const end = src.indexOf("{:else if panel.view === 'expired'}");
-		expect(at).toBeGreaterThan(-1);
-		expect(end).toBeGreaterThan(at);
-		const branch = src.slice(at, end);
+		const parsed = parseIfChains(SRC);
+		const { arm } = armRendering(parsed, 'data-testid="databricks-connected"');
+		const branch = parsed.code.slice(arm.start, arm.end);
 		for (const card of ['uploadCard()', 'runtimeCard()', 'dataBrowser()']) {
 			expect(branch, card).toContain(card);
 		}
@@ -223,12 +432,26 @@ describe('source guards: the panel really asks the shared rule', () => {
 	it('latches `connectOverLive` from `connected` BEFORE the request, and always clears it', () => {
 		// Read off `connected` per frame instead, the re-pin-restart frame collapses the
 		// panel - which is what the latch (and its timeline test above) exists for.
-		const body = src.slice(src.indexOf('async function connect('), src.indexOf('async function disconnect('));
+		const body = SRC.slice(SRC.indexOf('async function connect('), SRC.indexOf('async function disconnect('));
 		const latch = body.indexOf('connectOverLive = connected');
 		const fetched = body.indexOf('await fetch(');
 		expect(latch).toBeGreaterThan(-1);
 		expect(fetched).toBeGreaterThan(latch);
 		expect(body).toMatch(/finally \{[\s\S]*connectOverLive = false/);
+	});
+
+	it('latches WHOSE transition it is, at the start of both paths that start one', () => {
+		// Without it, a connect that can run to minutes holds the connected view over
+		// whichever notebook the user tabs to next. See `panelOwnsTransition`.
+		for (const fn of ['async function connect(', 'async function applyRuntime(']) {
+			const at = SRC.indexOf(fn);
+			expect(at, fn).toBeGreaterThan(-1);
+			const body = SRC.slice(at, SRC.indexOf('\n\t}', at));
+			const latch = body.indexOf('transitionPath = notebookPath');
+			expect(latch, fn).toBeGreaterThan(-1);
+			const awaited = body.indexOf('await ');
+			if (awaited > -1) expect(awaited, fn).toBeGreaterThan(latch);
+		}
 	});
 });
 
@@ -240,19 +463,17 @@ describe('source guards: the panel really asks the shared rule', () => {
  * all: `connectionParams()` sends `profile`/`host` and nothing else.
  */
 describe('source guard: the catalog tree is keyed on the workspace, not the cluster', () => {
-	const src = readFileSync(new URL('../../src/lib/Databricks.svelte', import.meta.url), 'utf8');
-
 	it('the catalogs effect key carries no clusterId', () => {
-		const at = src.indexOf('const key = connected ?');
+		const at = SRC.indexOf('const key = connected ?');
 		expect(at).toBeGreaterThan(-1);
-		const line = src.slice(at, src.indexOf('\n', at));
+		const line = SRC.slice(at, SRC.indexOf('\n', at));
 		expect(line).not.toContain('clusterId');
 		expect(line).toContain('connection.profile');
 		expect(line).toContain('connection.host');
 	});
 
 	it('the listing really is workspace-scoped, so the key is right', () => {
-		const params = src.slice(src.indexOf('function connectionParams()'));
+		const params = SRC.slice(SRC.indexOf('function connectionParams()'));
 		const body = params.slice(0, params.indexOf('\n\t}'));
 		expect(body).not.toContain('clusterId');
 	});

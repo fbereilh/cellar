@@ -185,6 +185,14 @@ test('switching clusters never collapses the panel: the cards stay put and the h
 	// is never rendered over a live session.
 	await expect(page.getByTestId('databricks-connecting')).toHaveCount(0);
 
+	// The DBR is a property of the SESSION, so mid-switch the outgoing cluster's
+	// runtime must not sit under an identity row already naming the incoming one -
+	// the same stale claim the `spark`/`w`-are-ready line was swapped out to avoid.
+	await expect(page.getByTestId('databricks-connected')).not.toContainText(CLUSTER_A.ver);
+	// The workspace half of that line survives, so it stays one line and the card
+	// keeps its height (asserted below).
+	await expect(page.getByTestId('databricks-connected')).toContainText('DEFAULT');
+
 	// Every card the collapse used to take with it is still mounted, throughout.
 	await expect(page.getByTestId('databricks-connected')).toBeVisible();
 	await expect(page.getByTestId('databricks-upload-card')).toBeVisible();
@@ -204,6 +212,9 @@ test('switching clusters never collapses the panel: the cards stay put and the h
 	// Landed on the new cluster, back to the resting card, same height.
 	await expect(page.getByTestId('databricks-connection-status')).toBeVisible({ timeout: 15000 });
 	await expect(page.getByTestId('databricks-connected')).toContainText(CLUSTER_B.name);
+	// ...and the new session's own DBR is back, so the line was suppressed for the
+	// transition rather than dropped for good.
+	await expect(page.getByTestId('databricks-connected')).toContainText(CLUSTER_B.ver);
 	await page.waitForTimeout(400);
 	expect(Math.abs((await panelHeight(page)) - before)).toBeLessThanOrEqual(2);
 });

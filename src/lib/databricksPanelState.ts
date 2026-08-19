@@ -25,21 +25,46 @@
  * What it does NOT do is hide real state. `expired` and `lost` are still reported
  * whenever no expected transition explains them; the connected view is held only for a
  * transition this panel or the server actually told us to expect.
+ *
+ * OWNERSHIP is the other half of that honesty, and it belongs to this rule rather than
+ * to the caller. The panel is ONE long-lived component whose `notebookPath` follows the
+ * active tab, while its transition flags (`busy`, `restarting`, `runtimeApplying`,
+ * `connectOverLive`) are panel-wide - so switching notebooks during a connect that can
+ * run to MINUTES left the whole connected view held over a notebook with no session at
+ * all. A transition therefore carries the notebook it was latched for, exactly as
+ * `uploadToWorkspace` latches its target path, and a panel showing a different notebook
+ * reads it as not its own and falls through to that notebook's honest state.
  */
 
 /** Which card the connection area renders. */
 export type DbxPanelView = 'connecting' | 'connected' | 'expired' | 'lost' | 'picker';
 
 export interface DbxPanelInputs {
+	/** The notebook the panel is showing right now (its `notebookPath` prop). */
+	notebookPath: string | null;
+	/**
+	 * The notebook the panel's OWN in-flight transition was latched for, at the click
+	 * that started it (`undefined` before the panel has ever started one). The panel's
+	 * transition flags are panel-wide but its subject is not: a connect issued for one
+	 * notebook says nothing about the next one the user tabs to.
+	 */
+	transitionPath: string | null | undefined;
 	/** The panel's in-flight verb (`''` when idle) - only `'connect'` matters here. */
 	busy: string;
 	/** The server reports a live session. */
 	connected: boolean;
 	/**
-	 * An EXPECTED kernel restart is in flight, from either of the two things that can
-	 * know it: the panel itself, and the server's grace window around the epoch change.
+	 * The PANEL issued an expected kernel restart (a runtime apply) and it has not
+	 * settled yet. Panel-wide, hence subject to ownership.
 	 */
-	expectedRestart: boolean;
+	restarting: boolean;
+	/**
+	 * The SERVER's own grace window around the epoch change, for THIS notebook - which
+	 * is what covers a restart the panel did NOT initiate (the Kernels sidebar,
+	 * `%restart_python`). It arrives on this notebook's status, so it is already
+	 * notebook-scoped and ownership does not apply to it.
+	 */
+	serverRestarting: boolean;
 	/** A runtime toggle/version apply is restarting the kernel. */
 	runtimeApplying: boolean;
 	/**
@@ -70,12 +95,34 @@ export interface DbxPanelState {
 }
 
 /**
+ * Is the panel's own in-flight transition about the notebook it is currently showing?
+ * A transition latched for another notebook may not speak for this one - neither to
+ * hold its view nor to suppress its lost/expired card.
+ */
+export function panelOwnsTransition(i: DbxPanelInputs): boolean {
+	return i.transitionPath === i.notebookPath;
+}
+
+/** The panel-wide flags, silenced when they belong to another notebook. */
+function ownFlags(i: DbxPanelInputs) {
+	const owned = panelOwnsTransition(i);
+	return {
+		connect: owned && i.busy === 'connect',
+		// The server half is already per-notebook, so it survives a panel that moved on.
+		expectedRestart: (owned && i.restarting) || i.serverRestarting,
+		runtimeApplying: owned && i.runtimeApplying,
+		connectOverLive: owned && i.connectOverLive
+	};
+}
+
+/**
  * An expected transition is in flight - a connect/switch, or a kernel restart the panel
  * or the server told us to expect. A runtime toggle is deliberately excluded: it keeps
  * the connected card with its own "restarting" pill.
  */
 export function expectedTransition(i: DbxPanelInputs): boolean {
-	return i.busy === 'connect' || (i.expectedRestart && !i.runtimeApplying);
+	const f = ownFlags(i);
+	return f.connect || (f.expectedRestart && !f.runtimeApplying);
 }
 
 /**
@@ -84,16 +131,23 @@ export function expectedTransition(i: DbxPanelInputs): boolean {
  * kernel restart has momentarily taken `connected` away.
  */
 export function holdsConnectedView(i: DbxPanelInputs): boolean {
-	return i.connected || i.runtimeApplying || i.connectOverLive;
+	const f = ownFlags(i);
+	return i.connected || f.runtimeApplying || f.connectOverLive;
 }
 
 /** The one decision the template renders. */
 export function databricksPanelState(i: DbxPanelInputs): DbxPanelState {
+	const f = ownFlags(i);
 	const transition = expectedTransition(i);
 	const hold = holdsConnectedView(i);
 	// Nothing to hold: the standalone card IS the progression, not a collapse.
 	if (transition && !hold) return { view: 'connecting', connecting: false, restarting: false };
-	if (hold) return { view: 'connected', connecting: transition && !i.runtimeApplying, restarting: i.runtimeApplying };
+	if (hold)
+		return {
+			view: 'connected',
+			connecting: transition && !f.runtimeApplying,
+			restarting: f.runtimeApplying
+		};
 	// No expected transition explains these, so they are the honest state.
 	if (i.expired) return { view: 'expired', connecting: false, restarting: false };
 	if (i.lost) return { view: 'lost', connecting: false, restarting: false };
