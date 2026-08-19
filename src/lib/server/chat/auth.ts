@@ -156,11 +156,19 @@ function accountInfo(parsed: Record<string, unknown>): ChatAccountInfo {
 	};
 }
 
+let testResolution: ChatAuthResolution | null = null;
+
+/** Test seam: pin the resolution (pass null to restore the real probes). */
+export function __setChatAuthForTests(resolution: ChatAuthResolution | null): void {
+	testResolution = resolution;
+}
+
 /**
  * Which credential a chat run uses NOW - the ONE resolution rule (see header),
  * shared by the run path and the sidebar so the two can never disagree.
  */
 export async function resolveChatAuth(): Promise<ChatAuthResolution> {
+	if (testResolution) return testResolution;
 	const slot = selectedChatSlot();
 	if (slot) {
 		const probe = await probeChatAccount(chatSlotDir(slot));

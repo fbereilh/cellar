@@ -10,9 +10,10 @@
  * never loaded), `--strict-mcp-config` with no MCP config (no MCP servers),
  * `--no-session-persistence` (nothing written into the slot's history). The CLI
  * is spawned with the scrubbed env (`chatChildEnv`) and a NEUTRAL cwd
- * (`os.tmpdir()`), so no project directory can contribute context. And
- * `--dangerously-skip-permissions` is never passed - with tools off there is
- * nothing to skip, and its presence anywhere in this module is a test failure.
+ * (`os.tmpdir()`), so no project directory can contribute context. And the
+ * permissions-bypass flag (the "dangerously skip" one) is never passed - with
+ * tools off there is nothing to skip, and the literal appearing ANYWHERE in
+ * this module (this comment included) is a test failure.
  *
  * ## The init assertion (fail closed)
  *
@@ -216,6 +217,14 @@ function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Pro
 				}
 			}, 3_000);
 			if (typeof hard.unref === 'function') hard.unref();
+			// `close` waits for every stdio pipe to drain, and a grandchild the CLI
+			// left behind can hold stdout open past the kill - so a killed run also
+			// FORCE-settles shortly after, with whatever state it has. Without this a
+			// stop (interrupt / unsafe init / timeout) could hang on a pipe nobody
+			// will close, which is strictly worse than settling early: the verdict
+			// (cancelled/unsafe/timeout) is already decided by the time kill() runs.
+			const force = setTimeout(() => settleAfterExit(null), 5_000);
+			if (typeof force.unref === 'function') force.unref();
 		};
 
 		const onAbort = () => {
@@ -305,7 +314,9 @@ function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Pro
 		});
 
 		child.on('error', (err) => settle(spawnFailure(err)));
-		child.on('close', (code) => {
+		child.on('close', (code) => settleAfterExit(code));
+		const settleAfterExit = (code: number | null) => {
+			if (settled) return;
 			if (buf) onLine(buf); // a final line without a trailing newline
 			if (unsafe) {
 				settle(fail({ kind: 'unsafe_init', message: unsafe }, engine));
@@ -331,7 +342,7 @@ function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Pro
 				stderrTail.trim().split('\n').slice(-3).join(' ').trim() ||
 				`the claude CLI exited ${code}`;
 			settle(fail(classifyChatFailure(message, rateLimit), engine));
-		});
+		};
 	});
 }
 
