@@ -11,11 +11,12 @@
  * This is a deliberate, faithful re-render of the notebook MODEL rather than a
  * DOM serialization, so it mirrors exactly what `Cell.svelte` shows: the same
  * markdown-it config (bar the one divergence below), the same output priority
- * (a rich image beats the `text/plain` repr), the same markdown-table-in-text
- * detection, the same ANSI scrub on tracebacks. It intentionally does NOT invent
- * renderings Cellar lacks (e.g. `text/html` DataFrames) — "looks like the
- * notebook does in Cellar" is the contract, so a DataFrame exports as its text
- * repr, exactly as in the app.
+ * (a rich image beats a `text/markdown` payload beats the `text/plain` repr - so
+ * a chat cell's reply exports as prose, not as escaped markup), the same
+ * markdown-table-in-text detection, the same ANSI scrub on tracebacks. It
+ * intentionally does NOT invent renderings Cellar lacks (e.g. `text/html`
+ * DataFrames) — "looks like the notebook does in Cellar" is the contract, so a
+ * DataFrame exports as its text repr, exactly as in the app.
  *
  * ONE deliberate divergence from that mirror: this module is NOT math-aware. The
  * app's authored-prose renderer (`$lib/markdown`) typesets `$…$`/`$$…$$` with
@@ -297,6 +298,17 @@ function renderOutput(o: CellOutput): string {
 			if (imgMime) {
 				return `<img class="output-image" src="${esc(imageDataUrl(imgMime, d[imgMime]))}" alt="cell image output" />`;
 			}
+			// A `text/markdown` payload renders as PROSE, not as escaped source. It is
+			// the whole content of a chat cell (the reply Cellar itself persists under
+			// that mime), so a report that showed it as `**bold**` and `##` inside a
+			// <pre> would be showing markup where the app shows a rendered answer. It
+			// goes through this module's OWN markdown-it - `html:false`, so its output
+			// needs no sanitizer, and no KaTeX, which is this module's documented
+			// divergence from the app (`$…$` stays literal text here). Every other
+			// mime's priority is unchanged.
+			if (d['text/markdown']) {
+				return `<div class="output-markdown cellar-md">${md.render(asText(d['text/markdown']))}</div>`;
+			}
 			if (d['text/plain']) return renderOutputText('result', asText(d['text/plain']));
 			return `<pre class="output-text tone-result">[rich output]</pre>`;
 		}
@@ -577,6 +589,9 @@ pre.code.raw{ color: var(--muted); white-space: pre-wrap; }
 .output-text.tone-result{ color: var(--result); font-weight: 600; border-left-color: color-mix(in oklab, var(--result) 40%, transparent); }
 .output-text.tone-error{ color: var(--error-fg); background: var(--error-bg); border-left-color: var(--error-fg); }
 .output-image{ display:block; max-width:100%; height:auto; padding: 0.4rem 1rem; }
+/* A text/markdown output (a chat cell's reply) reads as prose, laid out like the
+   text outputs beside it rather than like a markdown CELL. */
+.output-markdown{ padding: 0.25rem 1rem 0.35rem 0.85rem; border-left: 2px solid transparent; font-size: 14px; }
 
 .export-table{ overflow-x:auto; padding: 0.4rem 1rem; }
 .export-table table{ border-collapse: collapse; font-size: 12.5px; }

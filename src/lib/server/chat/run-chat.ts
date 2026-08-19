@@ -43,6 +43,17 @@ export interface ChatRunOutcome {
  * document (cells above, minus hidden), stream the reply into `acc`. The caller
  * owns the accumulator lifecycle (flush timer, finish, persist) exactly as for
  * a kernel run.
+ *
+ * The abort controller is registered BEFORE the first await, not just before the
+ * engine call: `interruptKernel`/`restartKernel`/`teardownKernel` stop a chat run
+ * by aborting whatever `abortChatRuns(nb)` finds registered, so any await this
+ * function reaches with nothing registered is a window in which Stop silently
+ * does nothing and the CLI is spawned - and billed - anyway. `resolveChatAuth`
+ * really is such a window: its probe cache lives 5s, so an ordinary run pays a
+ * real `claude auth status` spawn. Registered first, an abort landing there is
+ * observed at the next checkpoint and the run settles `cancelled` before the
+ * engine is ever asked. Registration/unregistration are balanced by the single
+ * `finally` spanning every path.
  */
 export async function executeChatRun({
 	nb,
@@ -55,28 +66,36 @@ export async function executeChatRun({
 	question: string;
 	acc: OutputAccumulator;
 }): Promise<ChatRunOutcome> {
-	const auth = await resolveChatAuth();
-	if (auth.kind === 'none') {
-		const kind: ChatFailureKind = auth.notInstalled ? 'not_installed' : 'not_signed_in';
-		acc.push(chatFailureOutput(chatFailure(kind, '')));
-		return { status: 'error', chatFailure: kind };
-	}
-
-	const { prompt } = buildChatPrompt(listCells(nb), cellId, question);
-	// Over the send ceiling the run is REFUSED before the engine is spawned, with
-	// a message naming the size and what shrinks it - rather than sending a
-	// multi-megabyte prompt whose only feedback is a silently large bill or, past
-	// the model's window, an opaque `api_error` naming nothing actionable. Nothing
-	// is truncated or sampled here (see `transcript.ts`'s bound).
-	const oversize = chatPromptTooLarge(prompt);
-	if (oversize) {
-		const kind: ChatFailureKind = 'transcript_too_large';
-		acc.push(chatFailureOutput(chatFailure(kind, chatPromptTooLargeMessage(oversize))));
-		return { status: 'error', chatFailure: kind };
-	}
 	const ctrl = new AbortController();
 	registerChatRun(nb, ctrl);
 	try {
+		const cancelled = (): ChatRunOutcome => {
+			acc.push(chatFailureOutput(chatFailure('cancelled', 'interrupted')));
+			return { status: 'error', chatFailure: 'cancelled' };
+		};
+		if (ctrl.signal.aborted) return cancelled();
+		const auth = await resolveChatAuth();
+		// A stop that landed while the account was being resolved is the user's
+		// answer to this run: report it as one rather than going on to spend.
+		if (ctrl.signal.aborted) return cancelled();
+		if (auth.kind === 'none') {
+			const kind: ChatFailureKind = auth.notInstalled ? 'not_installed' : 'not_signed_in';
+			acc.push(chatFailureOutput(chatFailure(kind, '')));
+			return { status: 'error', chatFailure: kind };
+		}
+
+		const { prompt } = buildChatPrompt(listCells(nb), cellId, question);
+		// Over the send ceiling the run is REFUSED before the engine is spawned, with
+		// a message naming the size and what shrinks it - rather than sending a
+		// multi-megabyte prompt whose only feedback is a silently large bill or, past
+		// the model's window, an opaque `api_error` naming nothing actionable. Nothing
+		// is truncated or sampled here (see `transcript.ts`'s bound).
+		const oversize = chatPromptTooLarge(prompt);
+		if (oversize) {
+			const kind: ChatFailureKind = 'transcript_too_large';
+			acc.push(chatFailureOutput(chatFailure(kind, chatPromptTooLargeMessage(oversize))));
+			return { status: 'error', chatFailure: kind };
+		}
 		let sawDelta = false;
 		const res = await chatEngine().run({
 			prompt,

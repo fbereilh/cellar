@@ -2417,6 +2417,14 @@ function toBatchRecord(
 }
 
 /**
+ * Why a batch leaves a chat cell alone. One sentence, shared by every batch
+ * record and by the three tool descriptions, so the agent-facing reason cannot
+ * drift from the rule.
+ */
+const CHAT_BATCH_SKIP_NOTE =
+	'chat cell - batch runs skip chat cells: a chat run is a billed model turn that holds this notebook\'s queue slot until it answers. Run it deliberately with run_cell.';
+
+/**
  * Run cells one at a time, in order, each waiting its turn in the kernel queue.
  * Stops at the first run a restart/interrupt cancelled: the rest of the sequence
  * was written against a namespace that no longer exists, so running it would
@@ -2427,6 +2435,13 @@ function toBatchRecord(
  * cell (see `toBatchRecord`) — OK cells as a status line, errored cells with
  * their traceback in full. Any OK cell's full output is still one
  * `get_full_output(id)` call away.
+ *
+ * A chat cell is SKIPPED here rather than run (see `CHAT_BATCH_SKIP_NOTE`), and
+ * says so in its own record: a batch that quietly dropped it would read as one
+ * that ran it. The rule lives in this one function, so `run_all`, `run_cells`
+ * and `run_range` inherit it rather than each re-deriving it - and `run_stale`
+ * inherits it for free (a chat cell's staleness is `n/a`, so it never reaches
+ * the stale id list at all).
  */
 export async function runCells(ids: string[], nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
@@ -2438,9 +2453,23 @@ export async function runCells(ids: string[], nb?: string | null) {
 	const runs: Array<{ r: Record<string, unknown>; cell: CellView | null }> = [];
 	for (const id of ids) {
 		const full = asFullId(target, id);
-		const r = await runCell(full, target, { skipStaleness: true, skipImages: true });
 		const cell = getCell(full, target);
-		if (r) runs.push({ r, cell: cell ?? null });
+		// A CHAT cell is skipped by every batch, and named rather than silently
+		// dropped. It is an nbformat code cell, so the `cell_type === 'code'`
+		// selectors of run_all/run_range pick it up - and running one is not a
+		// kernel execution but a real, BILLED model turn that holds this notebook's
+		// single queue slot for as long as the reply takes (up to the chat
+		// timeout). A routine agent sweep over a notebook must never spend the
+		// user's Claude quota or wedge their queue for minutes per cell as a side
+		// effect of "re-run everything". An EXPLICIT `run_cell` on a chat cell is a
+		// deliberate act and still runs it; only the batch paths refuse.
+		if (cell && isChatCell(cell)) {
+			runs.push({ r: { id: handleFor(target, full), status: 'skipped', note: CHAT_BATCH_SKIP_NOTE }, cell });
+			continue;
+		}
+		const r = await runCell(full, target, { skipStaleness: true, skipImages: true });
+		const after = getCell(full, target);
+		if (r) runs.push({ r, cell: after ?? null });
 		// An interrupt/restart cancelled this queued run: the namespace the rest of
 		// the sequence was written against is gone, so stop. Staleness is still
 		// computed once below over exactly what actually ran.
@@ -2466,7 +2495,8 @@ export async function runCells(ids: string[], nb?: string | null) {
 	return { ran, errored, results };
 }
 
-/** Run every code cell in document order; hidden cells run but are omitted from results. */
+/** Run every code cell in document order; hidden cells run but are omitted from
+ *  results, and chat cells are skipped (named in `results` - see `runCells`). */
 export async function runAll(nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	const ids = listCells(target).filter((c) => c.cell_type === 'code').map((c) => c.id);
@@ -2490,7 +2520,8 @@ export async function runStale(nb?: string | null) {
 	return runCells(ids, target);
 }
 
-/** Run code cells in the inclusive document range from→to. */
+/** Run code cells in the inclusive document range from→to; a chat cell in it is
+ *  skipped and named, like every other batch path (see `runCells`). */
 export async function runRange(fromId: string, toId: string, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	const all = listCells(target);
