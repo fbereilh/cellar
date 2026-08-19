@@ -48,6 +48,7 @@
 		unknownTokenWarning
 	} from '$lib/databricksUploadName';
 	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
+	import { databricksPanelState } from '$lib/databricksPanelState';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -862,6 +863,36 @@
 	let connectingName = $state('');
 	/** Switch-cluster: show the picker again while a session is live. */
 	let switching = $state(false);
+	/**
+	 * A connect was issued over a session that was ALREADY live - i.e. a cluster
+	 * SWITCH rather than a first connect. LATCHED at the click rather than read off
+	 * `connected` each frame, because a switch to an older-DBR cluster makes
+	 * `ensurePinnedConnect` restart the kernel mid-connect, and the status read that
+	 * follows reports the session momentarily lost. That frame is exactly the one
+	 * that must NOT unmount the panel, so the latch (not the live flag) is what
+	 * `holdsConnectedView` keys off (see `$lib/databricksPanelState`). Cleared in
+	 * `connect`'s `finally`, so a connect that FAILS falls straight back to whatever
+	 * the honest state is.
+	 */
+	let connectOverLive = $state(false);
+
+	/**
+	 * Which card the connection area renders, and which face the Cluster card wears.
+	 * The rule itself lives in `$lib/databricksPanelState` - see its header for THE
+	 * FLICKER RULE and why it may not live here (vitest cannot mount this component,
+	 * and e2e runs in neither CI nor the no-mistakes gate).
+	 */
+	const panel = $derived(
+		databricksPanelState({
+			busy,
+			connected,
+			expectedRestart,
+			runtimeApplying,
+			connectOverLive,
+			expired: !!connection.expired,
+			lost: !!connection.lost
+		})
+	);
 
 	// Clusters load whenever the selection is not showing the sign-in button
 	// (`needsAuth`). For a bare host - and for a no-token external-browser profile -
@@ -1013,6 +1044,17 @@
 	async function connect(cluster: DbxCluster) {
 		if (busy) return;
 		busy = 'connect';
+		// Latched BEFORE the await: from here on `connected` may honestly go false
+		// (a re-pin kernel restart), and this is what keeps the panel from unmounting
+		// around that frame. See `holdsConnectedView` in `$lib/databricksPanelState`.
+		connectOverLive = connected;
+		// Collapse the picker on the CLICK, not on the reply. The list has served its
+		// purpose the moment a cluster is chosen, and the card above now names the
+		// target, so leaving it open (disabled) only means the panel jumps at the very
+		// instant the session lands - after a wait that can run to minutes. Closing it
+		// here instead leaves the panel a fixed height for that whole wait. Reopened by
+		// the `catch`, which is where the error box and the retry list belong.
+		switching = false;
 		connectingId = cluster.cluster_id;
 		connectingName = cluster.name;
 		connectError = null;
@@ -1032,7 +1074,6 @@
 			});
 			const body = await res.json();
 			if (!res.ok) throw body;
-			switching = false;
 			await loadStatus();
 			onSessionChange?.();
 			// Connecting binds `spark`/`w` in the LIVE kernel and stops there: it does not
@@ -1042,8 +1083,13 @@
 			// via the Runtime toggle - the only thing that restarts the kernel for it.
 		} catch (err) {
 			connectError = toDbxError(err);
+			// Reopen the picker a successful connect would have left closed: it carries
+			// the one connect-error box, and the list to retry from. Only meaningful over
+			// a live session (the connected card); disconnected, the picker is the card.
+			if (connectOverLive) switching = true;
 		} finally {
 			busy = '';
+			connectOverLive = false;
 			connectingId = '';
 			connectingName = '';
 		}
@@ -1771,8 +1817,18 @@
 		catalogsFor = null;
 	}
 
+	/**
+	 * Keyed on the WORKSPACE, never the cluster - which is what the listing actually
+	 * depends on: `connectionParams()` sends `profile`/`host` and no cluster at all,
+	 * so two clusters in one workspace have byte-identical trees. With `clusterId` in
+	 * the key a cluster SWITCH tore the whole tree down (`nodes`/`openNodes` are
+	 * dropped by `loadCatalogs`), flashed "loading catalogs…" and rebuilt the same
+	 * list - the second contributor to the switch flicker, and it also silently threw
+	 * away every catalog the user had expanded. A real workspace change (picking
+	 * another profile, or a host) still changes the key and still reloads.
+	 */
 	$effect(() => {
-		const key = connected ? `${connection.profile ?? connection.host}:${connection.clusterId}` : null;
+		const key = connected ? (connection.profile ?? connection.host ?? '') : null;
 		if (!key || catalogsFor === key) return;
 		catalogsFor = key;
 		loadCatalogs();
@@ -2909,16 +2965,18 @@
 			{#if needsDefaultProfile && defaultProfile}
 				{@render defaultProfileCard(defaultProfile)}
 			{/if}
-			{#if busy === 'connect' || (expectedRestart && !runtimeApplying)}
-				<!-- Connecting: one calm state in the Cluster card, held until the session
-				     settles - so the panel never flashes the "session lost" card. Shown for a
-				     connect/switch (`busy === 'connect'`) AND for any expected kernel restart
-				     still in flight (`expectedRestart` - this panel's own, or the server's
-				     grace window around a restart triggered elsewhere), EXCEPT a runtime
-				     toggle: that keeps the connected card with its "restarting" pill (the
-				     next branch). Because `expectedRestart` covers the whole window, the
-				     lost/expired branches below are unreachable during it: an expected
-				     restart can never be mistaken for an unexpected loss. -->
+			{#if panel.view === 'connecting'}
+				<!-- Connecting, with NO connected view underneath: a FIRST connect from the
+				     picker, or an expected restart whose session is already gone. There is
+				     nothing to hold, so the standalone card IS the progression (picker →
+				     connecting → connected) rather than a collapse. Shown for a connect
+				     (`busy === 'connect'`) AND for any expected kernel restart still in
+				     flight (`expectedRestart` - this panel's own, or the server's grace
+				     window around a restart triggered elsewhere), EXCEPT a runtime toggle:
+				     that keeps the connected card with its "restarting" pill. Because
+				     the transition covers the whole window, the lost/expired branches
+				     below are unreachable during it: an expected restart can never be
+				     mistaken for an unexpected loss. -->
 				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-connecting">
 					{@render cardLabel('cluster')}
 					<div class="mt-1.5 flex items-center gap-2">
@@ -2930,15 +2988,25 @@
 					{@render hint('Starting the Databricks session. A terminated cluster can take a few minutes.')}
 					{#if connectError}{@render errorBox(connectError, 'databricks-connect-error')}{/if}
 				</div>
-			{:else if connected || runtimeApplying}
+			{:else if panel.view === 'connected'}
 				<!-- Cluster card. Kept mounted through a runtime-toggle restart
-				     (runtimeApplying) so the two-card view never flickers to "lost". -->
+				     (runtimeApplying) AND through a cluster SWITCH (`connectOverLive`), so
+				     the panel never unmounts its cards and springs them back. The
+				     transition is shown IN this card - the badge and the identity row -
+				     while Upload, Runtime and the data browser stay exactly where they
+				     were. -->
 				<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-connected">
 					<div class="flex items-center justify-between gap-2">
 						{@render cardLabel('cluster')}
-						{#if runtimeApplying}
+						{#if panel.restarting}
 							<span class="flex items-center gap-1 text-[10px] uppercase tracking-wide text-base-content/40">
 								<span class="loading loading-spinner loading-xs"></span>restarting
+							</span>
+						{:else if panel.connecting}
+							<!-- The transition takes the badge's own slot, so the header does not
+							     change size. Never `connected`: the new session is not up yet. -->
+							<span class="flex items-center gap-1 text-[10px] uppercase tracking-wide text-base-content/40" data-testid="databricks-connecting-badge">
+								<span class="loading loading-spinner loading-xs"></span>connecting
 							</span>
 						{:else}
 							<span class="badge badge-success badge-xs shrink-0 gap-1" data-testid="databricks-connection-status">
@@ -2946,17 +3014,43 @@
 							</span>
 						{/if}
 					</div>
+					<!-- Identity row. During a switch it names the cluster being connected TO -
+					     that is the informative part of a wait that can run to minutes - in the
+					     same one-line slot, so the row's height never changes. -->
 					<div class="mt-1.5 flex items-center gap-2">
-						<span class="relative flex h-2 w-2 shrink-0" title="connected"><span class="inline-flex h-2 w-2 rounded-full bg-success"></span></span>
-						<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connection.clusterName ?? connection.lost?.clusterName ?? ''}>{connection.clusterName ?? connection.lost?.clusterName ?? ''}</span>
+						{#if panel.connecting}
+							<span class="relative flex h-2 w-2 shrink-0"><span class="inline-flex h-2 w-2 rounded-full bg-warning"></span></span>
+							<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connectingName} data-testid="databricks-connecting-name">
+								{connectingName ? `Connecting to ${connectingName}…` : 'Reconnecting…'}
+							</span>
+						{:else}
+							<span class="relative flex h-2 w-2 shrink-0" title="connected"><span class="inline-flex h-2 w-2 rounded-full bg-success"></span></span>
+							<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connection.clusterName ?? connection.lost?.clusterName ?? ''}>{connection.clusterName ?? connection.lost?.clusterName ?? ''}</span>
+						{/if}
 					</div>
 					{#if connMeta}
 						<p class="mt-1 truncate font-mono text-[11px] text-base-content/50" title={connMeta}>{connMeta}</p>
 					{/if}
-					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/50">
-						<code class="font-mono text-[10px] text-primary">spark</code> and
-						<code class="font-mono text-[10px] text-primary">w</code> are ready in the kernel.
-					</p>
+					<!-- One paragraph slot, two readings. `spark`/`w` are NOT ready mid-connect,
+					     so claiming it would be exactly the assert-more-than-was-verified defect;
+					     the wait's own sentence takes the slot instead. Kept to ONE LINE at the
+					     default sidebar width, like the line it replaces, so the card does not
+					     resize under a wait that can run to minutes - which is why it says only
+					     how long and leaves WHAT to the identity row right above it ("Connecting
+					     to <cluster>…"). The standalone first-connect card has no such
+					     constraint and keeps the fuller sentence. -->
+					{#if panel.connecting}
+						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/50" data-testid="databricks-connecting-hint">
+							A cold cluster can take a few minutes.
+						</p>
+					{:else}
+						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/50">
+							<code class="font-mono text-[10px] text-primary">spark</code> and
+							<code class="font-mono text-[10px] text-primary">w</code> are ready in the kernel.
+						</p>
+					{/if}
+					<!-- No `connectError` here: a failed switch clears the transition and
+					     leaves `switching` set, so the picker below owns the one error box. -->
 					{#if reconnectNote}
 						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/60" data-testid="databricks-reconnect-note">{reconnectNote}</p>
 					{/if}
@@ -2992,7 +3086,7 @@
 
 				<!-- Data browser: subordinate to the two cards above. -->
 				{@render dataBrowser()}
-			{:else if connection.expired}
+			{:else if panel.view === 'expired'}
 				<div class="rounded-lg border border-warning/30 bg-warning/10 p-2.5" data-testid="databricks-expired">
 					<div class="flex items-center justify-between gap-2">
 						{@render cardLabel('cluster')}
@@ -3019,7 +3113,7 @@
 						{@render logoutRow(false)}
 					</div>
 				</div>
-			{:else if connection.lost}
+			{:else if panel.view === 'lost'}
 				<div class="rounded-lg border border-warning/30 bg-warning/10 p-2.5" data-testid="databricks-lost">
 					<div class="flex items-center justify-between gap-2">
 						{@render cardLabel('cluster')}
@@ -3028,7 +3122,7 @@
 						</span>
 					</div>
 					<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/70">
-						The session on <span class="font-mono">{connection.lost.clusterName}</span> ended when the kernel restarted. Reconnect to restore <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code>.
+						The session on <span class="font-mono">{connection.lost?.clusterName}</span> ended when the kernel restarted. Reconnect to restore <code class="font-mono text-[10px]">spark</code> and <code class="font-mono text-[10px]">w</code>.
 					</p>
 					{@render sessionReauthBox()}
 					{@render sdkDbutilsWarning()}
