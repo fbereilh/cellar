@@ -66,11 +66,31 @@ export function chatPromptTooLarge(prompt: string, limit = chatPromptLimitBytes(
 	return bytes > limit ? { bytes, limit } : null;
 }
 
+/**
+ * The two sizes as strings that are never EQUAL. The whole point of the refusal
+ * is to name what is over and by how much, and any fixed precision collides for
+ * a transcript just past the ceiling (601 KB and 600 KB are both "0.6 MB"), so a
+ * message whose only job is to be actionable read as self-contradictory.
+ * Precision grows until the two differ, and exact byte counts are the floor -
+ * `bytes > limit` is this function's precondition, so that always terminates.
+ */
+function distinctSizes(bytes: number, limit: number): { size: string; cap: string } {
+	for (const digits of [1, 2, 3]) {
+		const size = `${(bytes / 1_000_000).toFixed(digits)} MB`;
+		const cap = `${(limit / 1_000_000).toFixed(digits)} MB`;
+		if (size !== cap) return { size, cap };
+	}
+	return {
+		size: `${bytes.toLocaleString('en-US')} bytes`,
+		cap: `${limit.toLocaleString('en-US')} bytes`
+	};
+}
+
 /** The actionable refusal message for an over-budget transcript. */
 export function chatPromptTooLargeMessage({ bytes, limit }: { bytes: number; limit: number }): string {
-	const mb = (n: number) => `${(n / 1_000_000).toFixed(1)} MB`;
+	const { size, cap } = distinctSizes(bytes, limit);
 	return (
-		`This notebook's transcript is ${mb(bytes)}, over the ${mb(limit)} a chat cell sends. ` +
+		`This notebook's transcript is ${size}, over the ${cap} a chat cell sends. ` +
 		'Nothing was sent. Shrink what the chat cell sees: clear the outputs of the heavy cells ' +
 		'(their stored text is what dominates), or hide cells from the agent - a cell marked ' +
 		'hidden_from_agent is left out of the transcript entirely.'

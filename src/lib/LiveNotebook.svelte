@@ -5,7 +5,6 @@
 	import { cellIdOfKey, computeFolding, computeHeadingNumbers, foldSignature, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
-	import { CHAT_RATE_LIMITED } from '$lib/chatCell';
 	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
 	import {
 		CHAT_LANGUAGE,
@@ -1878,7 +1877,7 @@
 	 * same click; the server dedupes authoritatively (`run:duplicate`), because a
 	 * second tab or an agent can ask for the same cell at the same moment.
 	 */
-	async function runCell(id: string, source: string): Promise<{ chatFailure?: string } | undefined> {
+	async function runCell(id: string, source: string): Promise<void> {
 		const cell = findCell(id);
 		if (!cell) return;
 		// Markdown "runs" by rendering client-side (in the Cell) — no kernel.
@@ -1894,9 +1893,6 @@
 		if (runningId === id || queued[id] != null) return;
 		onRunStart?.(path, id);
 		cell.source = source;
-		// A chat run's failure kind, read off the run:end frame so the bulk-run
-		// loop can stop at the first rate-limited chat cell (see runCodeIds).
-		let chatFailure: string | undefined;
 		// The run's own lifecycle, learned from the server: `started` flips on the
 		// `run:start` frame. Everything that mutates this cell's outputs is gated on
 		// it, so a request the server refused (duplicate) or dropped (a restart
@@ -1962,7 +1958,6 @@
 						applyOutputAppend(cell, ev.index, ev.base, ev.keep, ev.chunk);
 					} else if (ev.type === 'run:end') {
 						stampLastRun(cell, ev); // this tab's own user run → its badge
-						if (typeof ev.chatFailure === 'string') chatFailure = ev.chatFailure;
 					}
 					// `run:duplicate` / `run:cancelled` close the stream without a run:start:
 					// the cell keeps its outputs untouched (we only clear on run:start) and
@@ -1987,7 +1982,6 @@
 			onRunEnd?.();
 			scheduleStaleness(); // this cell (and its dependents) may have changed staleness
 		}
-		return chatFailure ? { chatFailure } : undefined;
 	}
 
 	/**
@@ -2018,6 +2012,11 @@
 	// execution order — which is dependency order for these actions (a cell's
 	// upstreams always precede it), so downstream cells run against fresh inputs.
 	//
+	// No CHAT cell reaches this loop: every caller selects through `$lib/runTargets`
+	// (which skips them) or off staleness (where a chat cell reads `n/a`), so a bulk
+	// run cannot spend the user's Claude quota - which is also why there is no
+	// rate-limit stop here. Asking a chat cell is the deliberate per-cell act.
+	//
 	// Awaiting each run is also what keeps a bulk run RELIABLE: at most ONE `/run`
 	// NDJSON stream is ever open, so a bulk run never oversubscribes the browser's
 	// ~6-connection HTTP/1.1 pool. The old "Run all" fired every cell's POST at once
@@ -2038,15 +2037,8 @@
 				if (!cell || cell.cell_type !== 'code') continue;
 				// Use the editor's LIVE text, not the debounced `cell.source`.
 				const src = cellApis[id]?.currentSource?.() ?? cell.source;
-				const res = await runCell(id, src);
+				await runCell(id, src);
 				if (interruptGeneration !== gen) return; // interrupted mid-batch
-				// A rate-limited CHAT cell stops the batch: the limit is account-wide,
-				// so every later chat cell would fail with the same message, and the
-				// stop is what makes the one failure legible instead of N copies.
-				if (res?.chatFailure === CHAT_RATE_LIMITED) {
-					onNotice?.('Run stopped: chat is rate-limited. Wait for the window to reset or switch accounts, then re-run.');
-					return;
-				}
 			}
 		} finally {
 			// In a `finally` so an early return (interrupted mid-batch) or a throw can

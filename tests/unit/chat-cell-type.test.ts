@@ -115,12 +115,13 @@ describe('source guards on the Svelte/client halves', () => {
 		expect(src).toContain('chat-badge');
 		expect(src).toContain("d['text/markdown']");
 		// The renderer is picked by the CELL, not the mime: a chat reply is authored
-		// prose (math on), any other cell's text/markdown is kernel OUTPUT - arbitrary
-		// data, where `display(Markdown('Revenue: $5 vs $1,200'))` must keep its
-		// dollar amounts - so it takes the math-free renderer. Both go through the
-		// shared sanitizer; the two renderers' own behavior is pinned in
-		// markdown-math.test.ts.
-		expect(src).toMatch(/isChat \? renderMarkdown\(md\) : renderOutputMarkdown\(md\)/);
+		// prose (math on) sanitized through the profile that lets nothing in a
+		// MODEL-generated reply fetch on render, while any other cell's text/markdown
+		// is kernel OUTPUT - arbitrary data, where `display(Markdown('Revenue: $5 vs
+		// $1,200'))` must keep its dollar amounts - so it takes the math-free
+		// renderer. Both go through the shared sanitize funnel; the renderers' own
+		// behavior is pinned in markdown-math.test.ts.
+		expect(src).toMatch(/isChat \? renderChatReply\(md\) : renderOutputMarkdown\(md\)/);
 		expect(src).toMatch(/if \(isChat\) return markdown\(\)/); // question edits as prose
 	});
 
@@ -139,12 +140,5 @@ describe('source guards on the Svelte/client halves', () => {
 		expect(panel).toMatch(/signOut\(slot: string\)/);
 		expect(panel).toMatch(/\/api\/chat\/logout/);
 		expect(panel).toContain('JSON.stringify({ slot })');
-	});
-
-	it('the bulk-run stop is wired: runCodeIds stops on CHAT_RATE_LIMITED', () => {
-		const src = read('../../src/lib/LiveNotebook.svelte');
-		expect(src).toContain('CHAT_RATE_LIMITED');
-		const loop = src.slice(src.indexOf('async function runCodeIds'));
-		expect(loop.slice(0, loop.indexOf('function codeIdsInRange'))).toContain('chatFailure === CHAT_RATE_LIMITED');
 	});
 });

@@ -111,14 +111,40 @@ function chatTimeoutMs(): number {
 }
 
 // -- tiny FIFO semaphore ------------------------------------------------------
+//
+// ABORTABLE, for the same reason the run registers its controller before its
+// first await: a stop the user asked for must take effect at every point the run
+// can be waiting, not only the ones after the child exists. A run queued behind
+// `MAX_CONCURRENT` otherwise resolved only when another notebook's chat run
+// ended (up to the chat timeout), holding this notebook's kernel queue slot the
+// whole time with Stop appearing to do nothing.
+//
+// The slot accounting is a HAND-OFF: `release` passes its slot to the next
+// waiter without touching `inFlight`, so an aborted waiter that never received
+// one must simply leave the queue - which is exactly what it does, and why an
+// abort here must not be paired with a `release()`.
 let inFlight = 0;
 const waiters: Array<() => void> = [];
-function acquire(): Promise<void> {
+/** True when a slot was taken (release it), false when the wait was aborted. */
+function acquire(signal: AbortSignal): Promise<boolean> {
+	if (signal.aborted) return Promise.resolve(false);
 	if (inFlight < MAX_CONCURRENT) {
 		inFlight++;
-		return Promise.resolve();
+		return Promise.resolve(true);
 	}
-	return new Promise((resolve) => waiters.push(() => resolve()));
+	return new Promise((resolve) => {
+		const waiter = () => {
+			signal.removeEventListener('abort', onAbort);
+			resolve(true);
+		};
+		const onAbort = () => {
+			const at = waiters.indexOf(waiter);
+			if (at >= 0) waiters.splice(at, 1);
+			resolve(false);
+		};
+		signal.addEventListener('abort', onAbort, { once: true });
+		waiters.push(waiter);
+	});
 }
 function release(): void {
 	const next = waiters.shift();
@@ -167,7 +193,7 @@ export function classifyChatFailure(message: string, rateLimit: RateLimitInfo | 
 
 export const claudeCliEngine: ChatEngine = {
 	async run(args: ChatEngineRunArgs): Promise<ChatEngineResult> {
-		await acquire();
+		if (!(await acquire(args.signal))) return fail({ kind: 'cancelled', message: 'interrupted' }, null);
 		try {
 			return await runOnce(args);
 		} finally {

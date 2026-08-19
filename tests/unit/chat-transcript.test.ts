@@ -152,6 +152,22 @@ describe('the send ceiling', () => {
 		expect(msg).toMatch(/hidden_from_agent/);
 	});
 
+	it('never renders the two figures identically, however close the transcript is', () => {
+		// The whole job of this message is to say what is over and by how much, so a
+		// transcript just past the ceiling must not read "0.6 MB, over the 0.6 MB".
+		// Precision grows until they differ; exact bytes are the floor.
+		for (const bytes of [600_001, 600_050, 604_800, 649_999, 700_000, 1_500_000]) {
+			const msg = chatPromptTooLargeMessage({ bytes, limit: 600_000 });
+			const figures = msg.match(/is (.+?), over the (.+?) a chat cell sends/);
+			expect(figures).not.toBeNull();
+			expect(figures?.[1]).not.toBe(figures?.[2]);
+		}
+		// The pathological case names both exactly rather than rounding them together.
+		const oneByteOver = chatPromptTooLargeMessage({ bytes: 600_001, limit: 600_000 });
+		expect(oneByteOver).toContain('600,001 bytes');
+		expect(oneByteOver).toContain('600,000 bytes');
+	});
+
 	it('the ceiling is overridable, and junk falls back to the default', () => {
 		const saved = process.env.CELLAR_CHAT_MAX_PROMPT_BYTES;
 		try {

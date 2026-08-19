@@ -9,7 +9,7 @@
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
 	import { sql } from '@codemirror/lang-sql';
-	import { renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
+	import { renderChatReply, renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
 	import { EDITOR_THEME } from '$lib/editorTheme';
 	import StaticCode from '$lib/StaticCode.svelte';
 	import type { StaticLang } from '$lib/staticHighlight';
@@ -712,14 +712,16 @@
 				//
 				// WHICH renderer is a property of the CELL, not of the mime: a chat
 				// cell's payload is the model's authored PROSE, where `$x$` means
-				// math, so it takes `renderMarkdown`. Any other cell's is KERNEL
-				// OUTPUT - arbitrary data, where `display(Markdown('Revenue: $5 vs
-				// $1,200'))` must keep its dollar amounts - so it takes
-				// `renderOutputMarkdown` (math off), the same content-class split
-				// `renderTable` above already makes.
+				// math, so it takes `renderChatReply` - the same prose engine as a
+				// markdown cell, sanitized through the profile that lets nothing in
+				// a MODEL-generated reply fetch on render (see `markdown.ts`). Any
+				// other cell's is KERNEL OUTPUT - arbitrary data, where
+				// `display(Markdown('Revenue: $5 vs $1,200'))` must keep its dollar
+				// amounts - so it takes `renderOutputMarkdown` (math off), the same
+				// content-class split `renderTable` above already makes.
 				if (browser && d['text/markdown']) {
 					const md = asText(d['text/markdown']);
-					return { tone: 'result', markdownHtml: isChat ? renderMarkdown(md) : renderOutputMarkdown(md), segments: null };
+					return { tone: 'result', markdownHtml: isChat ? renderChatReply(md) : renderOutputMarkdown(md), segments: null };
 				}
 				if (d['text/plain']) {
 					tone = 'result';

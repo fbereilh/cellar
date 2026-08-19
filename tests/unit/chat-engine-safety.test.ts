@@ -23,10 +23,10 @@
  *   not_signed_in / rate_limited (with resetsAt) / api_error / cancelled.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chatCliArgs, classifyChatFailure, claudeCliEngine, initViolation, CHAT_SYSTEM_PROMPT, CHAT_MODEL } from '../../src/lib/server/chat/claude-cli';
+import { chatCliArgs, classifyChatFailure, claudeCliEngine, initViolation, CHAT_MAX_CONCURRENT, CHAT_SYSTEM_PROMPT, CHAT_MODEL } from '../../src/lib/server/chat/claude-cli';
 import { chatChildEnv, isChatSensitiveEnv } from '../../src/lib/server/chat/env';
 import type { ChatEngineResult } from '../../src/lib/server/chat/engine';
 
@@ -306,16 +306,24 @@ describe('distinct, actionable failure states', () => {
 		// past the kill, so the pipe never closes and the run settles on its own 5s
 		// timer - after which `run.ts` has already finished and persisted the
 		// accumulator, and a late delta would publish a phantom frame for a cell
-		// whose run:end fired. The grandchild deliberately starts emitting only
-		// AFTER that force-settle, so every byte it writes is a post-settle one.
+		// whose run:end fired.
+		//
+		// The grandchild is GATED on a file this test creates only once the run has
+		// settled, and it touches a second file once it has finished writing - so
+		// "after the settle" is established by the test rather than by out-racing a
+		// 5s timer on a machine running the whole suite in parallel forks.
 		const late = `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"after-settle"}}}`;
+		const go = join(OUT, 'late-go.flag');
+		const wrote = join(OUT, 'late-wrote.flag');
+		rmSync(go, { force: true });
+		rmSync(wrote, { force: true });
 		stubClaude(
 			[
 				`cat > /dev/null`,
 				`echo '${SAFE_INIT}'`,
 				`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"before"}}}'`,
-				`(sleep 6; for i in $(seq 1 20); do echo '${late}'; sleep 0.1; done) &`,
-				`sleep 40`
+				`(while [ ! -f "${go}" ]; do sleep 0.05; done; for i in $(seq 1 20); do echo '${late}'; sleep 0.05; done; touch "${wrote}") &`,
+				`sleep 60`
 			].join('\n')
 		);
 		const ctrl = new AbortController();
@@ -325,9 +333,56 @@ describe('distinct, actionable failure states', () => {
 		const res = await p;
 		expect(res.failure?.kind).toBe('cancelled');
 		expect(p.deltas).toEqual(['before']); // what streamed before the stop is kept
-		// Now let the orphaned writer run: its output lands on a settled run.
-		await new Promise((r) => setTimeout(r, 4000));
+
+		// Settled. NOW let the orphaned writer loose, and wait for it to report that
+		// every one of its lines is down the pipe we are still holding open.
+		writeFileSync(go, '');
+		const deadline = Date.now() + 20_000;
+		while (!existsSync(wrote)) {
+			if (Date.now() > deadline) throw new Error('the orphaned writer never finished');
+			await new Promise((r) => setTimeout(r, 50));
+		}
+		await new Promise((r) => setTimeout(r, 300)); // let any delivery land
 		expect(p.deltas).toEqual(['before']);
+	}, 40_000);
+
+	it('an abort while QUEUED behind the concurrency cap is honored immediately', async () => {
+		// A run waiting for a slot must answer Stop then and there: waiting for
+		// another notebook's chat run to end (up to the chat timeout) holds this
+		// notebook's kernel queue slot with Stop appearing to do nothing.
+		stubClaude([`cat > /dev/null`, `echo '${SAFE_INIT}'`, `sleep 60`].join('\n'));
+		const holders = Array.from({ length: CHAT_MAX_CONCURRENT }, () => new AbortController());
+		const running = holders.map((c) => run({ signal: c.signal }));
+		// Let them all take their slots, so the next run can only be queued.
+		await new Promise((r) => setTimeout(r, 300));
+
+		const queued = new AbortController();
+		const waiting = run({ signal: queued.signal });
+		let settled = false;
+		void waiting.then(() => (settled = true));
+		await new Promise((r) => setTimeout(r, 200));
+		expect(settled).toBe(false); // genuinely queued: no slot was free
+
+		const t0 = Date.now();
+		queued.abort();
+		const res = await waiting;
+		// Answered while the three holders are still running, not after one ends.
+		expect(Date.now() - t0).toBeLessThan(3000);
+		expect(res.failure?.kind).toBe('cancelled');
+		expect(waiting.deltas).toEqual([]); // never spawned, so never billed
+
+		// The aborted waiter took no slot, so the cap is intact: release the
+		// holders and a fresh run still gets in.
+		for (const c of holders) c.abort();
+		await Promise.all(running);
+		stubClaude(
+			[
+				`cat > /dev/null`,
+				`echo '${SAFE_INIT}'`,
+				`echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'`
+			].join('\n')
+		);
+		expect((await run()).ok).toBe(true);
 	}, 30_000);
 
 	it('classification itself: the message/info rules', () => {

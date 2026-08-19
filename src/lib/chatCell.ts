@@ -10,9 +10,9 @@
 
 /**
  * The distinct failure states a chat run can end in. Each renders its own
- * actionable message (see `server/chat/failure.ts`); `rate_limited` is the one
- * the bulk-run loop also acts on (stops at the first, instead of failing every
- * later chat cell with the same message).
+ * actionable message (see `server/chat/failure.ts`). No bulk run can produce one:
+ * every batch path skips chat cells, so these only ever come from a deliberate
+ * single-cell run.
  */
 export type ChatFailureKind =
 	| 'not_installed' // the `claude` CLI is missing (spawn ENOENT)
@@ -22,9 +22,6 @@ export type ChatFailureKind =
 	| 'unsafe_init' // the CLI's init event reported tools/MCP/skills present (or never arrived): fail closed
 	| 'transcript_too_large' // the notebook builds a prompt over the send ceiling: refused, nothing sent
 	| 'cancelled'; // interrupted (user interrupt / restart / shutdown)
-
-/** The rate-limit failure kind, named for the one cross-module comparison. */
-export const CHAT_RATE_LIMITED: ChatFailureKind = 'rate_limited';
 
 /**
  * The user-settings key holding the selected Cellar account slot (a name under

