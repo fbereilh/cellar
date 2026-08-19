@@ -58,7 +58,7 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { TEXT_NOTEBOOK_RAW_MESSAGE, isSqlCell, isRawCell, isChatCell, logicalCellType, textNotebookRawCellError } from '../../cellLanguage';
+import { isPyUnsupportedType, isSqlCell, isRawCell, isChatCell, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { isExportCell, canExportCell, exportCellCount } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
@@ -1438,8 +1438,8 @@ export function exportHtml({
  * cell: its imports are in the imports cell, and an empty cell beside them is
  * litter. An explicitly empty source still creates its empty cell.
  *
- * A `raw` spec on a `.py` TEXT notebook throws `RawCellTypeError` for the WHOLE
- * batch before anything is written - `addCell` would throw on it anyway (the doc
+ * A spec of a type a `.py` TEXT notebook cannot hold ('raw', 'chat') throws
+ * `TextNotebookCellTypeError` for the WHOLE batch before anything is written - `addCell` would throw on it anyway (the doc
  * layer owns the rule), but only once routing had already merged the earlier
  * specs' imports into the imports cell and run it, leaving the notebook
  * half-written behind an error. Raised here for the same all-or-nothing reason
@@ -1453,7 +1453,8 @@ export async function addCells(
 	{ routeImports: routeEnabled = true, nb: nbArg }: { routeImports?: boolean; nb?: string | null } = {}
 ) {
 	const nb = nbArg ?? getActiveNotebookPath();
-	if (specs.some((s) => s.cell_type === 'raw') && isPyTextNotebook(nb)) throw textNotebookRawCellError();
+	const refusedSpec = isPyTextNotebook(nb) ? specs.find((s) => isPyUnsupportedType(s.cell_type)) : undefined;
+	if (refusedSpec?.cell_type) throw textNotebookCellTypeError(refusedSpec.cell_type as LogicalCellType);
 	autoCheckpointBeforeAgentAction(nb);
 	const bodies: Array<{ cellType: string; source: string }> = [];
 	const added: string[] = [];
@@ -1718,8 +1719,9 @@ export function moveCell(id: string, dest: MoveDest, nb?: string | null) {
 }
 
 /**
- * MCP `set_cell_type`. A `.py` TEXT notebook REFUSES 'raw' - the doc layer's rule
- * (`assertCanHoldRaw`), looked up here through the SAME `isPyTextNotebook`
+ * MCP `set_cell_type`. A `.py` TEXT notebook REFUSES the types it cannot hold
+ * ('raw', 'chat') - the doc layer's rule
+ * (`assertCanHoldType`), looked up here through the SAME `isPyTextNotebook`
  * predicate the export tools use so the agent gets a refusal NAMING the cause
  * rather than a throw, and so nothing is written: checked BEFORE the pre-action
  * checkpoint, because a refused call changes nothing and a snapshot for it would
@@ -1731,8 +1733,8 @@ export function setType(id: string, type: LogicalCellType, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	id = asFullId(target, id);
 	if (!getCell(id, target)) return { ok: false as const, missing: true as const };
-	if (type === 'raw' && isPyTextNotebook(target))
-		return { ok: false as const, refused: TEXT_NOTEBOOK_RAW_MESSAGE };
+	if (isPyUnsupportedType(type) && isPyTextNotebook(target))
+		return { ok: false as const, refused: textNotebookTypeMessage(type) };
 	autoCheckpointBeforeAgentAction(target);
 	setCellType(id, type, target);
 	return { ok: true as const };

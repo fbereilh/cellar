@@ -19,7 +19,8 @@ export type ChatFailureKind =
 	| 'not_signed_in' // no authenticated account resolved / CLI says not logged in
 	| 'rate_limited' // the subscription's usage window is exhausted
 	| 'api_error' // the CLI reported an API/model failure
-	| 'unsafe_init' // the CLI's init event reported tools/MCP/skills present: fail closed
+	| 'unsafe_init' // the CLI's init event reported tools/MCP/skills present (or never arrived): fail closed
+	| 'transcript_too_large' // the notebook builds a prompt over the send ceiling: refused, nothing sent
 	| 'cancelled'; // interrupted (user interrupt / restart / shutdown)
 
 /** The rate-limit failure kind, named for the one cross-module comparison. */

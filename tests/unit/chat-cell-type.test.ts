@@ -109,12 +109,18 @@ describe('source guards on the Svelte/client halves', () => {
 		}
 	});
 
-	it('Cell.svelte offers the Chat type, renders text/markdown through renderMarkdown, and edits chat as markdown', () => {
+	it('Cell.svelte offers the Chat type, renders text/markdown by CONTENT CLASS, and edits chat as markdown', () => {
 		const src = read('../../src/lib/Cell.svelte');
 		expect(src).toContain("{ v: 'chat', label: 'Chat', hint: 'claude' }");
 		expect(src).toContain('chat-badge');
-		expect(src).toMatch(/markdownHtml: renderMarkdown\(/); // the reply render goes through the shared sanitizer
 		expect(src).toContain("d['text/markdown']");
+		// The renderer is picked by the CELL, not the mime: a chat reply is authored
+		// prose (math on), any other cell's text/markdown is kernel OUTPUT - arbitrary
+		// data, where `display(Markdown('Revenue: $5 vs $1,200'))` must keep its
+		// dollar amounts - so it takes the math-free renderer. Both go through the
+		// shared sanitizer; the two renderers' own behavior is pinned in
+		// markdown-math.test.ts.
+		expect(src).toMatch(/isChat \? renderMarkdown\(md\) : renderOutputMarkdown\(md\)/);
 		expect(src).toMatch(/if \(isChat\) return markdown\(\)/); // question edits as prose
 	});
 

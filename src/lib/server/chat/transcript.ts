@@ -7,7 +7,7 @@
  * measured in the scout report - so the transcript shape is a cost decision, not
  * a style one).
  *
- * Two load-bearing rules:
+ * Three load-bearing rules:
  *
  * 1. **`isHiddenFromAgent` is honored here, through the ONE shared predicate.**
  *    A hidden cell must be provably absent from what is sent - same doctrine as
@@ -21,12 +21,61 @@
  *    order. Cells render in document order; outputs render from their stored
  *    text. A unit test renders the same notebook twice and asserts identical
  *    bytes; keep it true.
+ *
+ * 3. **The built prompt is BOUNDED, and an over-budget notebook is REFUSED - it
+ *    is never sampled, summarized or truncated here.** One cell's outputs are
+ *    capped at 500 KB and a notebook's at 10 MB (`output-accumulator.ts`), so a
+ *    handful of output-heavy cells builds a multi-megabyte prompt that is re-sent
+ *    on every chat run in that notebook: a silently large bill, and past the
+ *    model's context window an opaque engine error naming nothing the user can
+ *    act on. `chatPromptTooLarge` turns that into an honest refusal naming the
+ *    size and the two levers the user already has (hide cells from the agent,
+ *    clear outputs). Choosing WHAT to send instead - selection, summarization,
+ *    per-cell truncation - is a separate, deliberate feature; do not smuggle a
+ *    policy in here, and note that any such policy must keep rule 2 intact.
  */
 
 import { isHiddenFromAgent } from '$lib/agentVisibility';
 import { isChatCell, isSqlCell, logicalCellType } from '$lib/cellLanguage';
 import { asText, stripAnsi } from '$lib/outputText';
 import type { CellOutput } from '$lib/server/types';
+
+/**
+ * The largest prompt (UTF-8 bytes) a chat run will send. ~600 KB is roughly
+ * 150k tokens - well inside the model's window with room for the reply, and
+ * orders of magnitude past any hand-written notebook: what reaches it is stored
+ * OUTPUT (a big `to_string()`, a training log, a traceback), which is exactly
+ * what the refusal tells the user to clear. `CELLAR_CHAT_MAX_PROMPT_BYTES`
+ * overrides it (an unparseable/non-positive value falls back, the
+ * `envMs` convention).
+ */
+export const MAX_CHAT_PROMPT_BYTES = 600_000;
+
+export function chatPromptLimitBytes(): number {
+	const raw = Number(process.env.CELLAR_CHAT_MAX_PROMPT_BYTES);
+	return Number.isFinite(raw) && raw > 0 ? raw : MAX_CHAT_PROMPT_BYTES;
+}
+
+/**
+ * Is this prompt over budget, and by how much? Returns null when it fits, so a
+ * caller reads it as "no refusal". Measured in UTF-8 BYTES (what is actually
+ * sent), never characters.
+ */
+export function chatPromptTooLarge(prompt: string, limit = chatPromptLimitBytes()): { bytes: number; limit: number } | null {
+	const bytes = Buffer.byteLength(prompt, 'utf8');
+	return bytes > limit ? { bytes, limit } : null;
+}
+
+/** The actionable refusal message for an over-budget transcript. */
+export function chatPromptTooLargeMessage({ bytes, limit }: { bytes: number; limit: number }): string {
+	const mb = (n: number) => `${(n / 1_000_000).toFixed(1)} MB`;
+	return (
+		`This notebook's transcript is ${mb(bytes)}, over the ${mb(limit)} a chat cell sends. ` +
+		'Nothing was sent. Shrink what the chat cell sees: clear the outputs of the heavy cells ' +
+		'(their stored text is what dominates), or hide cells from the agent - a cell marked ' +
+		'hidden_from_agent is left out of the transcript entirely.'
+	);
+}
 
 /** The minimal cell shape the builder reads (Cell/CellView are assignable). */
 export interface TranscriptCell {

@@ -14,7 +14,12 @@
  *   `lastRun.chatFailure` rides the published `run:end` so the bulk-run loop
  *   can stop on `rate_limited`;
  * - `abortChatRuns(nb)` reaches a run in flight (the interrupt/restart/teardown
- *   door) and it settles `cancelled`.
+ *   door) and it settles `cancelled`;
+ * - an over-budget transcript is REFUSED before the engine is spawned, with a
+ *   message naming the size, rather than sent and failed opaquely;
+ * - what the run PUBLISHES leaves every client holding exactly the outputs the
+ *   document persisted - including the capped case, whose truncation marker the
+ *   finalize must not orphan.
  */
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -268,5 +273,110 @@ describe('chatReplyOutput (the finalize rule)', () => {
 		// A failure display_data (or any non-stream output) passes through untouched.
 		expect(runchat.chatReplyOutput([{ output_type: 'display_data', data: { 'text/markdown': 'x' }, metadata: {} }])).toBeNull();
 		expect(runchat.chatReplyOutput([{ output_type: 'stream', name: 'stdout', text: '   \n' }])).toBeNull();
+	});
+});
+
+/**
+ * Replay this cell's published frames the way `LiveNotebook.applyOutput` does,
+ * so a test can compare what every open tab ends up holding against what the
+ * document persisted. A finalize that rewrites the outputs ARRAY but republishes
+ * only one index would show up here as a length mismatch - the orphaned element
+ * no reload-less client can ever be rid of.
+ */
+function clientMirror(nb: string, cellId: string): { outputs: Record<string, unknown>[]; stop: () => void } {
+	const outputs: Record<string, unknown>[] = [];
+	const unsub = events.subscribe((ev: Record<string, unknown>) => {
+		if (ev.nb !== nb || ev.cellId !== cellId) return;
+		if (ev.type === 'run:cleared') outputs.length = 0;
+		else if (ev.type === 'run:output') outputs[ev.index as number] = ev.output as Record<string, unknown>;
+		else if (ev.type === 'run:output-append') {
+			const at = outputs[ev.index as number] as { text?: string } | undefined;
+			const prev = at?.text ?? '';
+			if (at) at.text = prev.slice(0, ev.keep as number) + (ev.chunk as string);
+		}
+	});
+	return { outputs, stop: unsub };
+}
+
+describe('an over-budget transcript is refused, not sent', () => {
+	it('nothing reaches the engine, and the message names the size and the levers', async () => {
+		const { nb } = makeNotebook('huge.ipynb');
+		// A single enormous stored output on the cell ABOVE - exactly the shape that
+		// builds a multi-megabyte prompt on every run of this notebook.
+		nbmod.setOutputs('pycell', [{ output_type: 'stream', name: 'stdout', text: 'x'.repeat(700_000) }], nb);
+		const { prompts } = scriptedEngine(async () => {
+			throw new Error('the engine must not be spawned for an over-budget transcript');
+		});
+		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(prompts).toHaveLength(0);
+		expect(res.status).toBe('error');
+		expect(res.lastRun.chatFailure).toBe('transcript_too_large');
+		expect(res.outputs).toHaveLength(1);
+		const md = (res.outputs[0] as { data: Record<string, string> }).data['text/markdown'];
+		expect(md).toContain('Too much to send');
+		expect(md).toMatch(/0\.7 MB, over the 0\.6 MB/);
+		expect(md).toMatch(/clear the outputs/i);
+		expect(md).toContain('hidden_from_agent');
+	});
+
+	it('the same notebook sends fine once the heavy output is cleared', async () => {
+		const { nb } = makeNotebook('huge2.ipynb');
+		nbmod.setOutputs('pycell', [{ output_type: 'stream', name: 'stdout', text: 'x'.repeat(700_000) }], nb);
+		scriptedEngine(async () => ({ ok: true, failure: null, engine: null, replyText: 'ok' }));
+		expect((await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' })).lastRun.chatFailure).toBe(
+			'transcript_too_large'
+		);
+		nbmod.clearOutputs('pycell', nb); // the remedy the message names
+		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(res.status).toBe('ok');
+		expect(res.lastRun.chatFailure).toBeUndefined();
+	});
+});
+
+describe('what the clients hold matches what was persisted', () => {
+	it('an ordinary reply: the finalize replaces the streamed element in place', async () => {
+		const { nb } = makeNotebook('mirror.ipynb');
+		scriptedEngine(async ({ onDelta }) => {
+			onDelta('a ');
+			onDelta('reply');
+			return { ok: true, failure: null, engine: null, replyText: 'a reply' };
+		});
+		const mirror = clientMirror(nb, 'chatcell');
+		try {
+			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+			expect(res.outputs).toHaveLength(1);
+			expect(mirror.outputs).toEqual(res.outputs);
+		} finally {
+			mirror.stop();
+		}
+	});
+
+	it('a CAPPED reply keeps its truncation marker rather than orphaning it on every client', async () => {
+		const { nb } = makeNotebook('capped.ipynb');
+		scriptedEngine(async ({ onDelta }) => {
+			// Past `DEFAULT_CAPS.maxStreamBytes`, so the accumulator trips and appends
+			// its marker as a SECOND element - which the client has already been sent.
+			onDelta('y'.repeat(600_000));
+			onDelta('dropped');
+			return { ok: true, failure: null, engine: null, replyText: null };
+		});
+		const mirror = clientMirror(nb, 'chatcell');
+		try {
+			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+			expect(res.status).toBe('ok');
+			// The marker survived into the persisted document, and every client holds
+			// exactly those outputs - no element left behind at an index the finalize
+			// stopped republishing.
+			expect(res.outputs).toHaveLength(2);
+			expect(res.outputs[1]).toMatchObject({ output_type: 'stream', name: 'stderr' });
+			expect((res.outputs[1] as { text: string }).text).toMatch(/output truncated/);
+			expect(mirror.outputs).toHaveLength(res.outputs.length);
+			expect(mirror.outputs).toEqual(res.outputs);
+			// And what is on disk agrees with both.
+			const disk = JSON.parse(readFileSync(nb, 'utf8'));
+			expect(disk.cells.find((c: { id: string }) => c.id === 'chatcell').outputs).toHaveLength(2);
+		} finally {
+			mirror.stop();
+		}
 	});
 });

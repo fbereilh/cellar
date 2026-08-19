@@ -78,6 +78,12 @@ case "$1 $2" in
   "auth login")
     "\$BROWSER" "https://stub.example/oauth/authorize?client=cellar"
     echo "Paste the code, or visit: https://stub.example/paste"
+    # The epipe slot models a CLI that stops reading stdin while still running
+    # (it consumed the first line, or its own flow moved on): the pipe's read end
+    # is closed under a LIVE child, so a further write raises EPIPE.
+    case "\${CLAUDE_CONFIG_DIR-}" in
+      *epipe*) exec 0<&-; sleep 20; exit 1 ;;
+    esac
     read -r pasted
     if [ "\$pasted" = "goodcode" ]; then
       touch "$marker"
@@ -247,6 +253,48 @@ describe('sign-in lifecycle (server-run browser flow)', () => {
 		);
 		expect(settled?.ok).toBe(false);
 		expect(settled?.error).toContain('Invalid code');
+	}, 15_000);
+
+	it('a write to a login child that stopped reading stdin cannot crash the server', async () => {
+		// EPIPE arrives as an `error` EVENT on the stdin stream; unhandled, Node
+		// throws it out of band and takes down the process carrying every kernel
+		// websocket, the SSE fan-out and the in-process MCP server. Reachable by
+		// re-submitting a corrected code, or by submitting just as the flow moves on.
+		const uncaught: Error[] = [];
+		const onUncaught = (err: Error) => uncaught.push(err);
+		process.on('uncaughtException', onUncaught);
+		try {
+			const s0 = auth.startChatLogin('epipe');
+			await until(
+				() => auth.chatLoginStatus(s0.id),
+				(s) => !!s?.pasteUrl
+			);
+			// The child is alive (still `running`) but its read end is gone, so these
+			// writes are the EPIPE case - repeatedly, as a user retyping would.
+			for (let i = 0; i < 3; i++) auth.submitChatLoginCode(s0.id, 'goodcode');
+			await sleep(600);
+			expect(uncaught).toEqual([]);
+			// The module is still alive and answering afterwards.
+			expect(auth.chatLoginStatus(s0.id)).not.toBeNull();
+			auth.cancelChatLogin(s0.id);
+		} finally {
+			process.off('uncaughtException', onUncaught);
+		}
+	}, 15_000);
+
+	it('a code submitted to an unknown or settled attempt is refused, never written', async () => {
+		expect(auth.submitChatLoginCode('login-does-not-exist', 'goodcode')).toBe(false);
+		const s0 = auth.startChatLogin('fresh4');
+		await until(
+			() => auth.chatLoginStatus(s0.id),
+			(s) => !!s?.pasteUrl
+		);
+		auth.cancelChatLogin(s0.id);
+		await until(
+			() => auth.chatLoginStatus(s0.id),
+			(s) => !!s && !s.running
+		);
+		expect(auth.submitChatLoginCode(s0.id, 'goodcode')).toBe(false);
 	}, 15_000);
 
 	it('cancel kills the attempt and the slot stays as status reports it', async () => {

@@ -27,7 +27,7 @@ import { registerChatRun, unregisterChatRun } from './active';
 import { configDirFor, resolveChatAuth } from './auth';
 import { chatEngine } from './engine';
 import { chatFailure, chatFailureOutput } from './failure';
-import { buildChatPrompt } from './transcript';
+import { buildChatPrompt, chatPromptTooLarge, chatPromptTooLargeMessage } from './transcript';
 
 /** What the chat branch hands back to `executeCellRun` for the lastRun stamp. */
 export interface ChatRunOutcome {
@@ -63,6 +63,17 @@ export async function executeChatRun({
 	}
 
 	const { prompt } = buildChatPrompt(listCells(nb), cellId, question);
+	// Over the send ceiling the run is REFUSED before the engine is spawned, with
+	// a message naming the size and what shrinks it - rather than sending a
+	// multi-megabyte prompt whose only feedback is a silently large bill or, past
+	// the model's window, an opaque `api_error` naming nothing actionable. Nothing
+	// is truncated or sampled here (see `transcript.ts`'s bound).
+	const oversize = chatPromptTooLarge(prompt);
+	if (oversize) {
+		const kind: ChatFailureKind = 'transcript_too_large';
+		acc.push(chatFailureOutput(chatFailure(kind, chatPromptTooLargeMessage(oversize))));
+		return { status: 'error', chatFailure: kind };
+	}
 	const ctrl = new AbortController();
 	registerChatRun(nb, ctrl);
 	try {

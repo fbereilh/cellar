@@ -14,7 +14,11 @@
  *   stream - the design report's measured failure).
  * - An init report with capabilities KILLS the run and fails closed
  *   (`unsafe_init`), delivering not one delta; a missing field fails closed
- *   too ("cannot verify" is not "safe").
+ *   too, and so does a MISSING EVENT ("cannot verify" is not "safe" - an
+ *   assertion that only runs when the report arrives is no assertion at all).
+ * - A delta parsed AFTER the run settled (a grandchild holding stdout open past
+ *   the kill) reaches nobody: the accumulator it would push into is finished
+ *   and persisted.
  * - Each failure shape classifies to its own actionable kind: not_installed /
  *   not_signed_in / rate_limited (with resetsAt) / api_error / cancelled.
  */
@@ -186,6 +190,28 @@ describe('the init assertion fails closed', () => {
 		expect(Date.now() - started).toBeLessThan(8000); // killed, not awaited
 	}, 15_000);
 
+	it('a run that NEVER reports its session fails closed too, delivering no reply', async () => {
+		// The same CLI stream minus the init line - a renamed event, a future
+		// `stream-json` default, a build that stops emitting it. The run "succeeds"
+		// as far as the CLI is concerned, which is exactly why the verdict cannot be
+		// left to whether the report happened to arrive.
+		stubClaude(
+			[
+				`cat > /dev/null`,
+				`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"unverified"}}}'`,
+				`echo '{"type":"result","subtype":"success","is_error":false,"result":"unverified reply"}'`
+			].join('\n')
+		);
+		const p = run();
+		const res = await p;
+		expect(res.ok).toBe(false);
+		expect(res.failure?.kind).toBe('unsafe_init');
+		expect(res.failure?.message).toMatch(/never reported its session/i);
+		expect(res.replyText).toBeNull();
+		// Not one byte of the unverified session's reply reached the cell either.
+		expect(p.deltas).toEqual([]);
+	});
+
 	it('cannot-verify is not safe: missing/non-array fields and non-empty skills all violate', () => {
 		const base = { tools: [], mcp_servers: [], slash_commands: [] };
 		expect(initViolation({ ...base, skills: [] })).toBeNull();
@@ -274,6 +300,35 @@ describe('distinct, actionable failure states', () => {
 		expect(res.failure?.kind).toBe('cancelled');
 		expect(p.deltas).toEqual(['partial']); // what streamed before the stop is kept
 	}, 15_000);
+
+	it('a delta parsed after the run settled reaches nobody', async () => {
+		// The force-settle path the module documents: a GRANDCHILD holds stdout open
+		// past the kill, so the pipe never closes and the run settles on its own 5s
+		// timer - after which `run.ts` has already finished and persisted the
+		// accumulator, and a late delta would publish a phantom frame for a cell
+		// whose run:end fired. The grandchild deliberately starts emitting only
+		// AFTER that force-settle, so every byte it writes is a post-settle one.
+		const late = `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"after-settle"}}}`;
+		stubClaude(
+			[
+				`cat > /dev/null`,
+				`echo '${SAFE_INIT}'`,
+				`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"before"}}}'`,
+				`(sleep 6; for i in $(seq 1 20); do echo '${late}'; sleep 0.1; done) &`,
+				`sleep 40`
+			].join('\n')
+		);
+		const ctrl = new AbortController();
+		const p = run({ signal: ctrl.signal });
+		await new Promise((r) => setTimeout(r, 400));
+		ctrl.abort();
+		const res = await p;
+		expect(res.failure?.kind).toBe('cancelled');
+		expect(p.deltas).toEqual(['before']); // what streamed before the stop is kept
+		// Now let the orphaned writer run: its output lands on a settled run.
+		await new Promise((r) => setTimeout(r, 4000));
+		expect(p.deltas).toEqual(['before']);
+	}, 30_000);
 
 	it('classification itself: the message/info rules', () => {
 		expect(classifyChatFailure('x', { status: 'allowed' }).kind).toBe('api_error');

@@ -46,6 +46,11 @@ function headline(failure: ChatEngineFailure): string {
 				'and its reply discarded. This usually means a claude CLI update changed flag ' +
 				'behavior; report it rather than working around it.'
 			);
+		case 'transcript_too_large':
+			// The engine never ran, so the whole message is Cellar's own: the size and
+			// the two levers that shrink it (see `transcript.ts`'s bound). The detail
+			// line carries it, so the headline must not repeat the numbers.
+			return '**Too much to send.**';
 		case 'cancelled':
 			return '*(interrupted)*';
 		case 'api_error':
@@ -60,7 +65,11 @@ export function chatFailureMarkdown(failure: ChatEngineFailure): string {
 	// The headline already says everything for the states whose message is only
 	// our own classification echo; append detail where it genuinely adds (an API
 	// error's cause, a rate limit's server wording).
-	const wantsDetail = failure.kind === 'api_error' || failure.kind === 'rate_limited' || failure.kind === 'not_signed_in';
+	const wantsDetail =
+		failure.kind === 'api_error' ||
+		failure.kind === 'rate_limited' ||
+		failure.kind === 'not_signed_in' ||
+		failure.kind === 'transcript_too_large';
 	if (wantsDetail && detail && !head.includes(detail)) {
 		return `${head}\n\n> ${detail.replace(/\n/g, '\n> ')}`;
 	}

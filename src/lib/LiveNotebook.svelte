@@ -10,11 +10,13 @@
 	import {
 		CHAT_LANGUAGE,
 		isLogicalCellType,
+		isPyUnsupportedType,
 		languageTagFor,
 		nbCellType,
-		RAW_UNSUPPORTED_REASON,
+		PY_UNSUPPORTED_TYPES,
 		SQL_LANGUAGE,
-		TEXT_NOTEBOOK_RAW_MESSAGE
+		textNotebookTypeMessage,
+		textNotebookTypeReason
 	} from '$lib/cellLanguage';
 	import {
 		applyGesture,
@@ -2155,16 +2157,17 @@
 
 	/**
 	 * Would `cellType` be refused by the server for this notebook? The optimistic
-	 * mirror of the doc layer's `assertCanHoldRaw` - the `clampMoveIndex` pairing -
+	 * mirror of the doc layer's `assertCanHoldType` - the `clampMoveIndex` pairing -
 	 * so a `.py` notebook never renders a conversion the server is about to refuse.
 	 * It SAYS so on the shell's transient status line rather than returning
 	 * silently, because the keyboard paths (`r`, the palette) send no request that
 	 * could fail and disable no control, so a bare return is indistinguishable from
-	 * a dead key. Enforcement stays the server's.
+	 * a dead key. WHICH types are refused is read from `$lib/cellLanguage`, never
+	 * listed again here. Enforcement stays the server's.
 	 */
 	function refuseUnsupportedType(cellType: LogicalCellType): boolean {
-		if (cellType !== 'raw' || !isPy) return false;
-		noticeRawUnsupported();
+		if (!isPy || !isPyUnsupportedType(cellType)) return false;
+		noticeUnsupportedType(cellType);
 		return true;
 	}
 
@@ -2687,13 +2690,14 @@
 	const KEEP_ONE_CELL_REASON = 'would-empty-notebook';
 
 	/**
-	 * Say why a raw conversion the client thought legal came back refused - the same
+	 * Say why a conversion the client thought legal came back refused - the same
 	 * silent-refusal gap `noticeKeepOneCell` closes, for the notebook's OTHER
-	 * write-side rule. The message is the SHARED one the server threw with, so the
-	 * two surfaces cannot describe the refusal differently.
+	 * write-side rule. The message is the SHARED one the server threw with, per
+	 * refused TYPE (a lost raw cell and a lost chat REPLY are different costs), so
+	 * the two surfaces cannot describe the refusal differently.
 	 */
-	function noticeRawUnsupported() {
-		onNotice?.(TEXT_NOTEBOOK_RAW_MESSAGE);
+	function noticeUnsupportedType(cellType: LogicalCellType) {
+		onNotice?.(textNotebookTypeMessage(cellType));
 	}
 
 	/**
@@ -2717,8 +2721,12 @@
 			.json()
 			.then((body) => body?.reason)
 			.catch(() => null);
-		if (reason === KEEP_ONE_CELL_REASON) noticeKeepOneCell();
-		else if (reason === RAW_UNSUPPORTED_REASON) noticeRawUnsupported();
+		if (reason === KEEP_ONE_CELL_REASON) return noticeKeepOneCell();
+		// The refusal codes are per TYPE, so the notice is looked up by matching the
+		// server's code back to the type it belongs to rather than by keeping a
+		// second copy of either the codes or the messages.
+		const refused = PY_UNSUPPORTED_TYPES.find((t) => textNotebookTypeReason(t) === reason);
+		if (refused) noticeUnsupportedType(refused);
 	}
 
 	// Copy/cut take the whole selection, in document order. The clipboard has always
@@ -2751,7 +2759,7 @@
 		// from an .ipynb can be pasted into a `.py` one, which cannot hold it. Refused
 		// for the WHOLE paste rather than by entry: pasting three of five cells and
 		// silently dropping the rest is the degrade this refusal exists to prevent.
-		if (isPy && entries.some((e) => e.cell_type === 'raw')) return noticeRawUnsupported();
+		if (isPy && entries.some((e) => e.cell_type === 'raw')) return noticeUnsupportedType('raw');
 		const i = cells.findIndex((c) => c.id === activeId);
 		// No selection (an empty notebook) → paste at the end.
 		let index = i < 0 ? cells.length : where === 'above' ? i : i + 1;

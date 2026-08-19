@@ -7,9 +7,19 @@
  * 2. The transcript is BYTE-STABLE across runs of an unchanged notebook -
  *    prompt caching keys on an exact prefix (a measured 22.6x cost reduction),
  *    so rendering the same notebook twice must yield identical bytes.
+ * 3. An over-budget notebook is REFUSED with an actionable message, never
+ *    silently sent (a large bill, then an opaque engine error) and never
+ *    truncated or sampled here.
  */
 import { describe, it, expect } from 'vitest';
-import { buildChatPrompt, type TranscriptCell } from '../../src/lib/server/chat/transcript';
+import {
+	buildChatPrompt,
+	chatPromptLimitBytes,
+	chatPromptTooLarge,
+	chatPromptTooLargeMessage,
+	MAX_CHAT_PROMPT_BYTES,
+	type TranscriptCell
+} from '../../src/lib/server/chat/transcript';
 
 const code = (id: string, source: string, outputs: TranscriptCell['outputs'] = [], cellar: Record<string, unknown> = {}): TranscriptCell => ({
 	id,
@@ -108,5 +118,59 @@ describe('byte stability (the prompt-cache prefix)', () => {
 		const fs = await import('node:fs');
 		const src = fs.readFileSync(new URL('../../src/lib/server/chat/transcript.ts', import.meta.url), 'utf8');
 		expect(src).not.toMatch(/Date\.now|new Date|Math\.random/);
+	});
+});
+
+describe('the send ceiling', () => {
+	it('a prompt inside the budget is not refused; one over it is, measured in UTF-8 BYTES', () => {
+		expect(chatPromptTooLarge('hello')).toBeNull();
+		// Exactly at the limit fits; one byte past does not.
+		expect(chatPromptTooLarge('a'.repeat(10), 10)).toBeNull();
+		expect(chatPromptTooLarge('a'.repeat(11), 10)).toEqual({ bytes: 11, limit: 10 });
+		// A multi-byte character counts as its BYTES, not its length.
+		expect('é'.length).toBe(1);
+		expect(chatPromptTooLarge('é'.repeat(6), 10)).toEqual({ bytes: 12, limit: 10 });
+	});
+
+	it('an output-heavy notebook really does trip it, and a normal one never does', () => {
+		const heavy = [
+			code('big', 'df.to_string()', [{ output_type: 'stream', name: 'stdout', text: 'x'.repeat(MAX_CHAT_PROMPT_BYTES) }]),
+			code('chat1', '', [], { language: 'chat' })
+		];
+		expect(chatPromptTooLarge(buildChatPrompt(heavy, 'chat1', 'Summarize.').prompt)).not.toBeNull();
+
+		const normal = [md('m1', '## Setup'), code('c1', 'x = 1', [{ output_type: 'stream', name: 'stdout', text: 'ok\n' }]), code('chat1', '', [], { language: 'chat' })];
+		expect(chatPromptTooLarge(buildChatPrompt(normal, 'chat1', 'What is x?').prompt)).toBeNull();
+	});
+
+	it('the message NAMES the size, the ceiling and both levers that shrink it', () => {
+		const msg = chatPromptTooLargeMessage({ bytes: 2_500_000, limit: 600_000 });
+		expect(msg).toContain('2.5 MB');
+		expect(msg).toContain('0.6 MB');
+		expect(msg).toMatch(/nothing was sent/i);
+		expect(msg).toMatch(/clear the outputs/i);
+		expect(msg).toMatch(/hidden_from_agent/);
+	});
+
+	it('the ceiling is overridable, and junk falls back to the default', () => {
+		const saved = process.env.CELLAR_CHAT_MAX_PROMPT_BYTES;
+		try {
+			process.env.CELLAR_CHAT_MAX_PROMPT_BYTES = '1234';
+			expect(chatPromptLimitBytes()).toBe(1234);
+			for (const junk of ['', 'abc', '0', '-5']) {
+				process.env.CELLAR_CHAT_MAX_PROMPT_BYTES = junk;
+				expect(chatPromptLimitBytes()).toBe(MAX_CHAT_PROMPT_BYTES);
+			}
+		} finally {
+			if (saved === undefined) delete process.env.CELLAR_CHAT_MAX_PROMPT_BYTES;
+			else process.env.CELLAR_CHAT_MAX_PROMPT_BYTES = saved;
+		}
+	});
+
+	it('measuring does not change what is built: the prompt is byte-identical either side of the check', () => {
+		const cells = [code('c1', 'x = 1'), code('chat1', '', [], { language: 'chat' })];
+		const built = buildChatPrompt(cells, 'chat1', 'q');
+		chatPromptTooLarge(built.prompt);
+		expect(buildChatPrompt(cells, 'chat1', 'q').prompt).toBe(built.prompt);
 	});
 });

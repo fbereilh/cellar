@@ -25,6 +25,14 @@
  * future CLI version that renames those fields fails closed too: "cannot
  * verify" is not "safe".
  *
+ * The MISSING event fails closed the same way, and that is the same rule rather
+ * than an extra one: an assertion that only runs when the report arrives is no
+ * assertion at all, so a CLI that renames the event, drops it, or stops emitting
+ * it under some future `stream-json` default would otherwise stream a reply from
+ * a session whose capabilities were never verified. So NO delta is forwarded
+ * before a verified init (the same guard the condemned-session case uses), and a
+ * run that exits successfully having never reported one fails `unsafe_init`.
+ *
  * ## Feed on stdin, close it
  *
  * The prompt is written to stdin and stdin is CLOSED. Passing it as the argv
@@ -188,6 +196,7 @@ function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Pro
 		}
 
 		let engine: string | null = null;
+		let sawInit = false;
 		let unsafe: string | null = null;
 		let aborted = false;
 		let timedOut = false;
@@ -252,6 +261,11 @@ function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Pro
 		// NDJSON line parser (partial lines buffered across chunks).
 		let buf = '';
 		const onLine = (line: string) => {
+			// A settled run owns no accumulator any more: `run.ts` has finished and
+			// persisted it, so a delta parsed after the force-settle (a grandchild
+			// holding stdout open past the kill) would publish a phantom frame for a
+			// cell whose run:end already fired and diverge the in-memory doc from disk.
+			if (settled) return;
 			const trimmed = line.trim();
 			if (!trimmed) return;
 			let ev: unknown;
@@ -265,6 +279,7 @@ function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Pro
 			switch (e.type) {
 				case 'system': {
 					if (e.subtype !== 'init') return;
+					sawInit = true;
 					if (typeof e.claude_code_version === 'string' && e.claude_code_version) {
 						engine = `claude-cli/${e.claude_code_version}`;
 					}
@@ -276,7 +291,11 @@ function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Pro
 					return;
 				}
 				case 'stream_event': {
-					if (unsafe) return; // nothing from a condemned session reaches the cell
+					// Nothing from a condemned - or an UNVERIFIED - session reaches the
+					// cell. The CLI reports init before any delta, so this costs a healthy
+					// run nothing; if that ever stopped being true the run fails closed
+					// below rather than rendering text no assertion covered.
+					if (unsafe || !sawInit) return;
 					const inner = e.event as Record<string, unknown> | undefined;
 					if (inner?.type !== 'content_block_delta') return;
 					const delta = inner.delta as Record<string, unknown> | undefined;
@@ -332,6 +351,13 @@ function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Pro
 			}
 			const isError = result ? result.is_error === true || result.subtype !== 'success' : true;
 			if (!isError && code === 0) {
+				if (!sawInit) {
+					// An otherwise-successful run that never reported its session: the
+					// assertion could not run, so the verdict is the same as a failed one.
+					const message = 'the CLI never reported its session capabilities (no system/init event) - cannot verify the session is bare';
+					settle(fail({ kind: 'unsafe_init', message }, engine));
+					return;
+				}
 				const replyText = typeof result?.result === 'string' ? result.result : null;
 				settle({ ok: true, failure: null, engine, replyText });
 				return;

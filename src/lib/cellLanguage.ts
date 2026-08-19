@@ -111,36 +111,78 @@ export function isLogicalCellTypeName(value: unknown): value is LogicalCellType 
 /** The refusal code a route reports when `raw` was asked for on a `.py` notebook. */
 export const RAW_UNSUPPORTED_REASON = 'raw-in-py-notebook';
 
-/** The one message for that refusal, shared by the server writers and the browser. */
+/** The refusal code a route reports when `chat` was asked for on a `.py` notebook. */
+export const CHAT_UNSUPPORTED_REASON = 'chat-in-py-notebook';
+
+/**
+ * The logical types a `.py` TEXT notebook cannot hold, in ONE list.
+ *
+ * Both fail the same way and for the same reason (see `TextNotebookCellTypeError`
+ * below): such a document is rebuilt from its CELLS on every save by jupytext /
+ * the Databricks converter, which carries neither `cellar` cell metadata nor
+ * outputs - so the declaration lives only in memory and disk holds a plain
+ * `code` cell. The list exists so a SIXTH logical type is added HERE rather than
+ * shipping straight into the same trap, and so no writer keeps a per-type copy
+ * of the rule.
+ */
+export const PY_UNSUPPORTED_TYPES: readonly LogicalCellType[] = ['raw', 'chat'];
+
+/** Can a `.py` TEXT notebook hold this logical type? */
+export function isPyUnsupportedType(cellType: unknown): cellType is LogicalCellType {
+	return typeof cellType === 'string' && (PY_UNSUPPORTED_TYPES as readonly string[]).includes(cellType);
+}
+
+/** The one message for the raw refusal, shared by the server writers and the browser. */
 export const TEXT_NOTEBOOK_RAW_MESSAGE =
 	'A .py notebook cannot hold a raw cell: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and has no raw marker, so the cell would come back after a reload as a RUNNABLE Python cell holding what was meant to be verbatim text. Convert it to .ipynb first.';
 
+/** The same, for a chat cell - whose loss is worse: the REPLY goes with it. */
+export const TEXT_NOTEBOOK_CHAT_MESSAGE =
+	'A .py notebook cannot hold a chat cell: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and carries neither cell metadata nor outputs, so after a reload the cell would be a RUNNABLE Python cell holding English prose and the AI reply would be gone for good (no re-run reproduces it). Convert it to .ipynb first.';
+
+/** The message for one unsupported type. */
+export function textNotebookTypeMessage(cellType: LogicalCellType): string {
+	return cellType === 'chat' ? TEXT_NOTEBOOK_CHAT_MESSAGE : TEXT_NOTEBOOK_RAW_MESSAGE;
+}
+
+/** The refusal code for one unsupported type. */
+export function textNotebookTypeReason(cellType: LogicalCellType): string {
+	return cellType === 'chat' ? CHAT_UNSUPPORTED_REASON : RAW_UNSUPPORTED_REASON;
+}
+
 /**
- * A `raw` cell was asked for on a `.py` TEXT notebook, which cannot hold one.
+ * A logical type a `.py` TEXT notebook cannot hold was asked for (`raw`, `chat`).
  *
  * Such a notebook is written back through jupytext / the Databricks converter,
  * which rebuilds the file from its cells and coerces every `cell_type` to
- * markdown|code (`jupytext.ts`) - and coerces again on read. So the declaration
- * would live only in memory while disk held a `code` cell: after a reload the
- * frontmatter sits in a cell with a Run button, the exact silent degrade a raw
- * cell exists to prevent, and worse from MARKDOWN, whose prose would lose its
- * markers on the way too.
+ * markdown|code (`jupytext.ts`) - and coerces again on read, carrying no
+ * `cellar` metadata and no outputs. So the declaration would live only in memory
+ * while disk held a `code` cell: after a reload the frontmatter sits in a cell
+ * with a Run button (raw), or the question does while its REPLY is gone (chat) -
+ * the exact silent degrade each type exists to prevent, and worse from MARKDOWN,
+ * whose prose would lose its markers on the way too.
  *
  * Refused by name instead, at the doc-layer writers, so no surface can route
  * around it - the `textNotebookRootError` precedent, for the identical
- * rebuilt-from-cells reason. Only `raw`, and only on a `.py` doc: every other
- * conversion, and every raw cell in an `.ipynb`, is untouched.
+ * rebuilt-from-cells reason. Only these types, and only on a `.py` doc: every
+ * other conversion, every raw or chat cell in an `.ipynb`, and CLEARING a type
+ * are all untouched.
  */
-export class RawCellTypeError extends Error {
-	constructor(message = TEXT_NOTEBOOK_RAW_MESSAGE) {
-		super(message);
-		this.name = 'RawCellTypeError';
+export class TextNotebookCellTypeError extends Error {
+	/** The refused logical type, and the route-facing code for it. */
+	readonly cellType: LogicalCellType;
+	readonly reason: string;
+	constructor(cellType: LogicalCellType = 'raw') {
+		super(textNotebookTypeMessage(cellType));
+		this.name = 'TextNotebookCellTypeError';
+		this.cellType = cellType;
+		this.reason = textNotebookTypeReason(cellType);
 	}
 }
 
 /** The refusal above, as a throwable. */
-export function textNotebookRawCellError(): RawCellTypeError {
-	return new RawCellTypeError();
+export function textNotebookCellTypeError(cellType: LogicalCellType): TextNotebookCellTypeError {
+	return new TextNotebookCellTypeError(cellType);
 }
 
 /**

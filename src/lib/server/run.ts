@@ -183,7 +183,15 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 		// applyOutput replaces in place, snapping the live stream to rendered
 		// markdown. Failures pass through untouched: their message is already a
 		// display_data of its own.
-		if (isChat && status === 'ok') {
+		//
+		// NOT when the accumulator tripped a cap: it appended a truncation marker as
+		// a SECOND stream element, and the finalize only republishes index 0 - there
+		// is no retract frame, so folding two elements into one would persist ONE
+		// output while every client still held the marker at index 1, orphaned until
+		// a reload. A capped reply therefore stays as streamed text beside its honest
+		// marker; the client's array and the document agree, which outranks rendering
+		// the markdown for a reply that is already incomplete.
+		if (isChat && status === 'ok' && !acc.wasCapped) {
 			const reply = chatReplyOutput(outputs);
 			if (reply) {
 				outputs = [reply];

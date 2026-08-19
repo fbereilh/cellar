@@ -306,6 +306,15 @@ export function startChatLogin(slot: string): ChatLoginState {
 	if (typeof session.timer.unref === 'function') session.timer.unref();
 	logins.set(id, session);
 
+	// The paste-fallback code is written to this child's stdin (see
+	// `submitChatLoginCode`), and a write to a pipe whose read end has closed
+	// raises EPIPE as an `error` EVENT on the stream: unhandled, Node throws it
+	// and takes down the whole Cellar process (kernel websockets, SSE fan-out and
+	// the in-process MCP server with it). Reachable by re-submitting a corrected
+	// code, or by submitting just as the browser round-trip completes. Same guard
+	// the chat engine's own child carries, for the same reason.
+	child.stdin?.on('error', () => {});
+
 	// stdout only - stdin carries the pasted authorisation code and is never read
 	// back or logged.
 	const onOut = (d: Buffer) => {
@@ -414,8 +423,18 @@ export function chatLoginStatus(id: string): ChatLoginState | null {
  */
 export function submitChatLoginCode(id: string, code: string): boolean {
 	const session = logins.get(id);
-	if (!session || !session.running || !session.child.stdin) return false;
-	session.child.stdin.write(code.trim() + '\n');
+	const stdin = session?.child.stdin;
+	// A closed/destroyed stdin is refused rather than written to: the child
+	// consumed the first line and closed it, or exited between its `close` landing
+	// and this call. The write itself can still fail asynchronously (EPIPE), which
+	// is why `startChatLogin` attaches an `error` listener to this very stream -
+	// unhandled, that event is thrown and takes the whole server process down.
+	if (!session || !session.running || !stdin || stdin.destroyed || !stdin.writable) return false;
+	try {
+		stdin.write(code.trim() + '\n');
+	} catch {
+		return false;
+	}
 	return true;
 }
 

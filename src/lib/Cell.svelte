@@ -23,7 +23,7 @@
 	import { isExportCell } from '$lib/exportRole';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
-	import { isSqlCell, isRawCell, isChatCell, logicalCellType } from '$lib/cellLanguage';
+	import { isSqlCell, isRawCell, isChatCell, isPyUnsupportedType, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
 	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
@@ -705,13 +705,21 @@
 				if (d['text/html']) {
 					return { tone: 'result', html: asText(d['text/html']), segments: null };
 				}
-				// A `text/markdown` payload (a chat cell's reply, or IPython's
-				// `Markdown()` display) renders like a markdown cell - through the
-				// shared, sanitizing `renderMarkdown` - instead of showing raw
+				// A `text/markdown` payload renders like a markdown cell - through the
+				// shared, sanitizing markdown funnel - instead of showing raw
 				// markdown source. Browser-only like the markdown-cell render
 				// (DOMPurify needs a DOM); SSR falls through to the text/plain twin.
+				//
+				// WHICH renderer is a property of the CELL, not of the mime: a chat
+				// cell's payload is the model's authored PROSE, where `$x$` means
+				// math, so it takes `renderMarkdown`. Any other cell's is KERNEL
+				// OUTPUT - arbitrary data, where `display(Markdown('Revenue: $5 vs
+				// $1,200'))` must keep its dollar amounts - so it takes
+				// `renderOutputMarkdown` (math off), the same content-class split
+				// `renderTable` above already makes.
 				if (browser && d['text/markdown']) {
-					return { tone: 'result', markdownHtml: renderMarkdown(asText(d['text/markdown'])), segments: null };
+					const md = asText(d['text/markdown']);
+					return { tone: 'result', markdownHtml: isChat ? renderMarkdown(md) : renderOutputMarkdown(md), segments: null };
 				}
 				if (d['text/plain']) {
 					tone = 'result';
@@ -741,15 +749,18 @@
 	// So this map costs O(changed outputs), not O(all outputs) per frame — the
 	// append-only render that keeps a runaway cell from re-rendering its whole
 	// history each chunk. `renderOutput` is a pure function of its output, so
-	// caching by identity is sound; the WeakMap lets overwritten objects be GC'd.
-	const renderCache = new WeakMap<CellOutput, RenderedOutput>();
+	// caching by identity is sound EXCEPT for the one thing `renderOutput` reads
+	// besides its argument - `isChat`, which decides the markdown renderer above -
+	// so the entry records the mode it was rendered in and a converted cell
+	// (code<->chat keeps its outputs) re-renders instead of serving the other
+	// content class's render. The WeakMap lets overwritten objects be GC'd.
+	const renderCache = new WeakMap<CellOutput, { chat: boolean; rendered: RenderedOutput }>();
 	function renderOutputMemo(o: CellOutput): RenderedOutput {
-		let r = renderCache.get(o);
-		if (r === undefined) {
-			r = renderOutput(o);
-			renderCache.set(o, r);
-		}
-		return r;
+		const hit = renderCache.get(o);
+		if (hit && hit.chat === isChat) return hit.rendered;
+		const rendered = renderOutput(o);
+		renderCache.set(o, { chat: isChat, rendered });
+		return rendered;
 	}
 	const outputs = $derived((cell.outputs || []).map(renderOutputMemo));
 
@@ -978,14 +989,17 @@
 		typeMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
 		typeMenuEl.style.top = r.bottom + 4 + 'px';
 	}
-	// The cell-type menu options (Python / SQL / Markdown / Raw). This menu is the
-	// create-and-convert path for raw - there is deliberately no "+ Raw" insert
-	// button, a once-per-notebook type not being worth a third button on every gap.
+	// The cell-type menu options (Python / SQL / Chat / Markdown / Raw). This menu
+	// is the create-and-convert path for raw and chat - there is deliberately no
+	// "+ Raw" insert button, a once-per-notebook type not being worth a third
+	// button on every gap.
 	//
-	// Raw is DROPPED on a `.py` text notebook: such a document is rebuilt from its
-	// cells on every save and has no raw marker, so the server refuses it
-	// (`assertCanHoldRaw`) - and a notebook that cannot hold a raw cell must not be
-	// offered a control for one.
+	// Raw AND chat are DROPPED on a `.py` text notebook: such a document is rebuilt
+	// from its cells on every save, carrying neither the raw marker nor any
+	// `cellar` metadata or outputs, so the server refuses both (`assertCanHoldType`)
+	// - and a notebook that cannot hold a cell type must not be offered a control
+	// for one. WHICH types those are is read from `$lib/cellLanguage`, so the menu
+	// cannot drift from the writers' rule.
 	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
@@ -993,7 +1007,7 @@
 		{ v: 'markdown', label: 'Markdown', hint: 'text' },
 		{ v: 'raw', label: 'Raw', hint: 'verbatim' }
 	];
-	const typeOptions = $derived(isPy ? ALL_TYPE_OPTIONS.filter((o) => o.v !== 'raw') : ALL_TYPE_OPTIONS);
+	const typeOptions = $derived(isPy ? ALL_TYPE_OPTIONS.filter((o) => !isPyUnsupportedType(o.v)) : ALL_TYPE_OPTIONS);
 	function chooseType(type: LogicalCellType) {
 		typeMenuEl?.hidePopover();
 		if (type !== logicalType) onSetType(cell.id, type);
