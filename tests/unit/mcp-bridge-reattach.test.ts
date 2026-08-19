@@ -90,6 +90,30 @@ function startFakeCellar(
 	let server: Server;
 	const listening = new Promise<number>((resolve) => {
 		server = http.createServer((req, res) => {
+			// EVERY response closes its connection, so a test can never leave the
+			// bridge holding a pooled keep-alive socket to an "instance" it is about
+			// to kill. Undici reuses such a socket and only learns it is dead when
+			// the POST written onto it fails `UND_ERR_SOCKET: other side closed` - a
+			// connection that OPENED and then broke, i.e. the deliberately AMBIGUOUS
+			// case that is never re-sent, rather than either of the two shapes a
+			// restart really presents (a refused connection on a new port, or a live
+			// server answering `-32000` on the same one). Whether that socket is
+			// still pooled milliseconds after the kill is pure platform timing -
+			// macOS had evicted it, Linux on node 20 had not - so with keep-alive on,
+			// each restart test picked at random which contract it was asserting.
+			// A real restart is seconds of idle apart, past both node's 5s
+			// `keepAliveTimeout` and undici's 4s, so the pooled socket is gone; the
+			// tests compress it into one tick, and this restores what that tick
+			// stands for. The ambiguous path keeps its own coverage (the flaky-proxy
+			// tests and the `provesNotDelivered` block below), so nothing is lost.
+			//
+			// Only a response that ENDS here may carry it: a body with no length and
+			// `Connection: close` is close-DELIMITED, so destroying such a socket is
+			// a clean end of body rather than an error - which would silence the very
+			// `onerror` the stream-loss heal is driven by. The two branches that hold
+			// a stream open therefore take it back off (see below), and they never
+			// leave an idle pooled socket anyway: their socket is busy until released.
+			res.setHeader('Connection', 'close');
 			if (req.method === 'GET') {
 				// A bare GET is the liveness probe (`isInstanceAlive`); any answer is proof.
 				res.writeHead(400).end('missing or unknown session');
@@ -110,6 +134,9 @@ function startFakeCellar(
 					const id = randomUUID();
 					sessions.add(id);
 					if (holdInitialize) {
+						// Chunked, not close-delimited: a destroyed socket must read as a
+						// BROKEN stream, which is what the stream-loss heal reacts to.
+						res.removeHeader('Connection');
 						res.writeHead(200, {
 							'content-type': 'text/event-stream',
 							'cache-control': 'no-cache',
@@ -164,6 +191,9 @@ function startFakeCellar(
 				if (msg.method === SLOW) {
 					// Headers now, body later: the POST resolves and the request sits
 					// in flight on the session's stream, like a cell run in progress.
+					// Chunked, not close-delimited, for the same reason as the held
+					// handshake above: killing the instance must break this stream.
+					res.removeHeader('Connection');
 					res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
 					// Node holds the header back until the first write, and the client's
 					// POST does not resolve until it arrives - so flush it now, or the
