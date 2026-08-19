@@ -3107,17 +3107,27 @@
 					{#if connMeta}
 						<p class="mt-1 truncate font-mono text-[11px] text-base-content/50" title={connMeta}>{connMeta}</p>
 					{/if}
-					<!-- One paragraph slot, two readings. `spark`/`w` are NOT ready mid-connect,
-					     so claiming it would be exactly the assert-more-than-was-verified defect;
-					     the wait's own sentence takes the slot instead. Kept to ONE LINE at the
-					     default sidebar width, like the line it replaces, so the card does not
-					     resize under a wait that can run to minutes - which is why it says only
-					     how long and leaves WHAT to the identity row right above it ("Connecting
-					     to <cluster>…"). The standalone first-connect card has no such
-					     constraint and keeps the fuller sentence. -->
+					<!-- One paragraph slot, three readings - one per face, because each knows
+					     something different. `spark`/`w` are NOT ready under EITHER wait: a
+					     connect has not bound them yet, and a runtime apply restarts the kernel,
+					     which clears the namespace until `reconnectAfterKernelRestart` rebuilds
+					     it - so the settled sentence would be the assert-more-than-was-verified
+					     defect on both, and each takes its own instead of one vaguer sentence
+					     covering neither (the cold-cluster hint is the whole reason the
+					     connecting copy exists, and a restart is not waiting on compute).
+					     Every one is kept to ONE LINE at the default sidebar width, like the
+					     line they replace, so the card does not resize under a wait that can run
+					     to minutes - which is why they say only how long, leaving WHAT to the
+					     badge and the identity row right above them ("Connecting to <cluster>…").
+					     The standalone first-connect card has no such constraint and keeps the
+					     fuller sentence. -->
 					{#if panel.connecting}
 						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/50" data-testid="databricks-connecting-hint">
 							A cold cluster can take a few minutes.
+						</p>
+					{:else if panel.restarting}
+						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/50" data-testid="databricks-restarting-hint">
+							The session is rebuilding.
 						</p>
 					{:else}
 						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/50">

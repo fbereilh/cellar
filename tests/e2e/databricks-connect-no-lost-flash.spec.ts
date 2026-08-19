@@ -171,7 +171,7 @@ test.afterAll(async () => {
  */
 function sampleCards(page: Page) {
 	return page.evaluate(async () => {
-		const seen = { lost: false, expired: false, connecting: false, connected: false };
+		const seen = { lost: false, expired: false, connecting: false, connected: false, restartHint: false, claimedReady: false };
 		const deadline = Date.now() + 12000;
 		const vis = (id: string) => {
 			const el = document.querySelector(`[data-testid="${id}"]`) as HTMLElement | null;
@@ -185,6 +185,18 @@ function sampleCards(page: Page) {
 			if (vis('databricks-lost')) seen.lost = true;
 			if (vis('databricks-expired')) seen.expired = true;
 			if (vis('databricks-connecting') || vis('databricks-runtime-applying')) seen.connecting = true;
+			// What the Cluster card SAYS while its runtime-restart face is up. A restart
+			// clears the namespace, so the settled "spark and w are ready" sentence would
+			// contradict the badge four lines above it.
+			if (vis('databricks-restarting-hint')) seen.restartHint = true;
+			if (
+				vis('databricks-runtime-applying') &&
+				(document.querySelector('[data-testid="databricks-connected"]')?.textContent ?? '').includes(
+					'are ready in the kernel'
+				)
+			) {
+				seen.claimedReady = true;
+			}
 			if (vis('databricks-connected') && !vis('databricks-runtime-applying')) {
 				seen.connected = true;
 				connectedRun++;
@@ -288,6 +300,10 @@ test('connect leaves the runtime off (no restart); turning it on restarts withou
 	expect(seen.connected).toBe(true);
 	// A restart-in-progress affordance was shown throughout...
 	expect(seen.connecting).toBe(true);
+	// ...saying what is true of a restart, and never that the session is already live:
+	// the restart clears the namespace until the rebuild lands.
+	expect(seen.restartHint).toBe(true);
+	expect(seen.claimedReady).toBe(false);
 	// ...and the scary "lost"/"expired" card NEVER flashed.
 	expect(seen.lost).toBe(false);
 	expect(seen.expired).toBe(false);
