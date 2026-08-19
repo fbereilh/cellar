@@ -52,6 +52,21 @@ follows directly from that:
 - **The MCP server drives that kernel.** Any client that can reach the MCP
   endpoint can add and run cells, i.e. execute code on your machine. Only
   connect agents you trust to the workspace.
+- **Chat cells send notebook content to Anthropic - only when you run one.**
+  Running a chat cell shells out to your local `claude` CLI with the cells above
+  it (their source and stored output text), minus any marked hidden from AI, plus
+  your question. Nothing is sent by opening, rendering, or saving a notebook, and
+  bulk runs skip chat cells, so egress only ever follows a deliberate run of one.
+  That child is spawned with tools, MCP servers, and slash commands off - asserted
+  against the CLI's own startup report at runtime, killing the run if it ever
+  reports otherwise - so it can read the transcript and answer, nothing else. Its
+  environment is stripped of every `ANTHROPIC*`/`CLAUDE*` variable so an inherited
+  key cannot silently bill or route elsewhere than the account the sidebar shows.
+  The reply comes back **untrusted**: it is rendered as sanitized markdown, never
+  HTML, and an image in any machine-written markdown output is shown as text
+  rather than fetched, so a reply steered by a prompt-injecting cell cannot make
+  your browser (or a reader of an exported report) fire a request carrying
+  notebook data.
 - **Workspace HTML is rendered, but origin-isolated.** Previewing a `.html` file
   from the sidebar (and rich `text/html` cell output) runs the document's scripts
   - a self-contained plot needs them - inside a sandboxed iframe without

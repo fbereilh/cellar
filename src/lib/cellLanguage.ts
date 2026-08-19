@@ -100,7 +100,7 @@ export function isRawCell(cell: LanguageCell): boolean {
 export const LOGICAL_CELL_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'markdown', 'raw', 'chat'];
 
 /**
- * Is `value` one of the four logical cell types? The predicate every entry point
+ * Is `value` one of the logical cell types above? The predicate every entry point
  * that accepts a `cell_type` from a request body validates with, so a malformed
  * value is REFUSED rather than falling through `nbCellType`'s `code` default.
  */

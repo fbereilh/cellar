@@ -24,10 +24,11 @@ export type { ImportChangeStamps };
  * reasoning inverts between the two). */
 export type CellType = 'code' | 'markdown' | 'raw';
 
-/** The logical cell types the UI/agent choose between. `sql` is a `code` cell;
- * `code`/`markdown`/`raw` are nbformat types of their own. Keep `CellType` a
- * SUBSET of this - the clipboard, the undo stack and the insert specs all assign
- * one into the other. */
+/** The logical cell types the UI chooses between (the agent write tools speak
+ * all but `chat`). `sql` and `chat` are `code` cells; `code`/`markdown`/`raw`
+ * are nbformat types of their own. Keep `CellType` a SUBSET of this - the
+ * clipboard, the undo stack and the insert specs all assign one into the
+ * other. */
 export type LogicalCellType = 'code' | 'markdown' | 'sql' | 'raw' | 'chat';
 
 /** Who initiated a run: a human via the UI, or an agent via MCP. */
