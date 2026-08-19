@@ -156,6 +156,15 @@ function ownFlags(i: DbxPanelInputs) {
  * OWNS the work these are the raw flags, byte for byte - which is what keeps the
  * upload confirm's Cancel inert for the whole of its own replace, the invariant that
  * stops a clobber already on the wire from being presented as an aborted one.
+ *
+ * Deliberately NOT applied to the picker, sign-in, install or reconnect controls. NOT
+ * because they sit outside the connected card - the picker really does render inside
+ * it, under `{#if switching}` - but because they already re-guard on the RAW `busy`
+ * (and `connect` on `runtimeApplying` too), so a live-but-declining control is honest
+ * there by the same argument, and silencing the flag for a foreign notebook would only
+ * admit a click the handler is about to refuse anyway. Log out renders inside the card
+ * and stays on the raw flags for a THIRD reason: it is app-wide, so a panel-wide `busy`
+ * genuinely blocks it and disabling it states something true.
  */
 export function ownedTransitionFlags(i: DbxPanelInputs): { busy: string; runtimeApplying: boolean } {
 	return {
@@ -205,6 +214,31 @@ export function connectionMetaLine(i: {
 	]
 		.filter(Boolean)
 		.join(' · ');
+}
+
+/**
+ * Does the Cluster card currently HOLD a transition, so its session-scoped detail rows
+ * keep their last live reading instead of unmounting?
+ *
+ * The `connectionMetaLine` fallback above is one instance of this; the rows beside it
+ * are the rest of it. A kernel restart under either face - the re-pin one mid-switch,
+ * or the one a runtime toggle issues - makes the server report the session lost, and
+ * that payload carries no `expired`, no `runtime.sdkDbutils` verdict and no
+ * `livenessUnverified`. Read straight from it, the default-profile card above the
+ * Cluster card, the SDK-`dbutils` warning inside it and the liveness line all
+ * UNMOUNTED for the length of the restart and sprang back afterwards - the same
+ * collapse-and-restore this module exists to remove, one row at a time instead of one
+ * panel at a time.
+ *
+ * It is not a stale claim: a `connected` view is only ever HELD for a transition this
+ * panel or the server told us to expect (see `holdsConnectedView`), so the reading it
+ * holds was decided against a session that was really live moments ago, and the moment
+ * the transition settles - or falls through to the honest lost/expired card - the rows
+ * are decided afresh against the new payload. A FIRST connect holds nothing, so this
+ * can never turn a row ON for a panel that was silent.
+ */
+export function holdsSessionDetail(panel: DbxPanelState): boolean {
+	return panel.view === 'connected' && (panel.connecting || panel.restarting);
 }
 
 /**

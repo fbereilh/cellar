@@ -50,6 +50,7 @@
 	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
 	import {
 		connectionMetaLine,
+		holdsSessionDetail,
 		databricksPanelState,
 		ownedTransitionFlags,
 		panelOwnsBusy
@@ -379,7 +380,7 @@
 	 * `databricks_runtime` and restarted the kernel onto the stale one. A toggle flips
 	 * the ADVERTISEMENT only; whatever version is stored is the one it applies.
 	 */
-	async function applyRuntime(on: boolean, { writeVersion = false } = {}): Promise<void> {
+	async function applyRuntime(on: boolean, { writeVersion = false } = {}): Promise<string | null> {
 		// Whose restart this is, captured ONCE - the `uploadToWorkspace` idiom - and used
 		// for the latch, the guard and the restart alike. `setUiNow` awaits a real PUT
 		// (two of them for a version edit), and `notebookPath` follows the active tab, so
@@ -403,6 +404,9 @@
 			restarting = true;
 			await onRestartKernel(target);
 		}
+		// Handed back so the settle polls the SAME notebook this restarted, rather than
+		// re-reading a prop that follows the active tab.
+		return target;
 	}
 
 	/**
@@ -428,8 +432,8 @@
 		}
 		runtimeApplying = true;
 		try {
-			await applyRuntime(!runtimeOn);
-			await settleConnection();
+			const target = await applyRuntime(!runtimeOn);
+			await settleConnection(target);
 		} finally {
 			runtimeApplying = false;
 			restarting = false; // definitive cleanup if applyRuntime threw before settleConnection
@@ -466,8 +470,8 @@
 		if (runtimeApplying || busy || !runtimeApplicable) return;
 		runtimeApplying = true;
 		try {
-			await applyRuntime(true);
-			await settleConnection();
+			const target = await applyRuntime(true);
+			await settleConnection(target);
 		} finally {
 			runtimeApplying = false;
 			restarting = false; // definitive cleanup if applyRuntime threw before settleConnection
@@ -495,8 +499,8 @@
 			// Pass the STORED preference, not `true`: under an env override the runtime is
 			// on without the user having opted in, and a version edit must not silently
 			// write an opt-in they never made.
-			await applyRuntime(runtimeOn, { writeVersion: true });
-			await settleConnection();
+			const target = await applyRuntime(runtimeOn, { writeVersion: true });
+			await settleConnection(target);
 		} finally {
 			runtimeApplying = false;
 			restarting = false; // definitive cleanup if applyRuntime threw before settleConnection
@@ -523,13 +527,24 @@
 	 * the restart, cleared here on settle): while it is true the lost/expired cards are
 	 * suppressed in favour of the connecting/connected view, so an unexpected loss and
 	 * an expected restart-in-progress can never be confused.
+	 *
+	 * It polls the notebook `applyRuntime` captured, NOT the live `notebookPath` - the
+	 * same capture-once target, threaded in rather than re-read, because the restart can
+	 * run for many seconds and the panel follows the active tab. Read live, a user who
+	 * tabbed away mid-restart made this settle against the OTHER notebook, returning as
+	 * soon as THAT one read connected and releasing `restarting`/`runtimeApplying` while
+	 * the restarting notebook's session was still rebuilding - the lost-flash, from the
+	 * one direction the latch did not cover. `statusFor` writes the shared `status` only
+	 * while the target is still the notebook on screen (the `uploadToWorkspace` guard),
+	 * so a poll that outlives the panel's attention decides its OWN release without ever
+	 * painting another notebook's session over the one being looked at.
 	 */
-	async function settleConnection(): Promise<void> {
+	async function settleConnection(target: string | null): Promise<void> {
 		const deadline = Date.now() + 15000;
 		try {
 			// eslint-disable-next-line no-constant-condition
 			while (true) {
-				const body = await loadStatus();
+				const body = await statusFor(target);
 				if (body?.connection?.connected) return;
 				if (Date.now() >= deadline) return;
 				await new Promise((r) => setTimeout(r, 400));
@@ -648,16 +663,8 @@
 	const runtimeSdkForeign = $derived(status?.runtime?.sdkDbutils === 'foreign');
 	const profiles = $derived(status?.config?.profiles ?? []);
 	const hasProfiles = $derived(profiles.length > 0);
-	/**
-	 * The default-profile notice, decided by `$lib/databricksDefaultProfile`'s
-	 * `defaultProfileNoticeApplies` - the ONE owner of that rule (which states the
-	 * two halves and why `expired` counts while `lost`/`restarting` does not). Kept
-	 * out of this component deliberately: it is a decision rather than a rendering,
-	 * and only the unit suite runs in CI and in the gate, so a rule living here as an
-	 * expression could be deleted and merge green.
-	 */
+	/** The config file's own verdict on whether a default profile resolves. */
 	const defaultProfile = $derived(status?.config?.defaultProfile);
-	const needsDefaultProfile = $derived(defaultProfileNoticeApplies(defaultProfile, connection));
 	const install = $derived(status?.install ?? { python: null, sdk: false, connect: false });
 	const installed = $derived(!!install.sdk && !!install.connect);
 	/**
@@ -796,12 +803,41 @@
 	// exactly how a connect used to release its "connecting" gate against a leftover
 	// "connected" while the real reconnect was mid-flight, then stick on "lost".
 	async function loadStatus(): Promise<DbxStatus | null> {
+		return statusFor(notebookPath);
+	}
+
+	/** One `/api/databricks` read for ONE notebook. */
+	async function readStatus(path: string | null): Promise<DbxStatus> {
+		const q = path ? `?path=${encodeURIComponent(path)}` : '';
+		const res = await fetch(`/api/databricks${q}`);
+		const body = (await res.json()) as DbxStatus;
+		if (!res.ok) throw new Error((body as { message?: string })?.message || 'failed to read Databricks status');
+		return body;
+	}
+
+	/**
+	 * Read a NAMED notebook's status, applying it to the shared `status` only while that
+	 * notebook is still the one on screen - the `uploadToWorkspace` guard idiom, and the
+	 * reason `settleConnection` can keep polling its own target after the user tabs away
+	 * without painting that target's session over the panel they are now looking at. A
+	 * read for a notebook the panel has already moved off claims no generation either:
+	 * bumping `statusSeq` there would silently discard the live notebook's own in-flight
+	 * reads for the length of a settle, starving the panel on screen of updates.
+	 */
+	async function statusFor(path: string | null): Promise<DbxStatus | null> {
+		if (path !== notebookPath) {
+			try {
+				return await readStatus(path);
+			} catch {
+				return null;
+			}
+		}
 		const seq = ++statusSeq;
 		try {
-			const res = await fetch(`/api/databricks${pathQuery()}`);
-			const body = (await res.json()) as DbxStatus;
-			if (!res.ok) throw new Error((body as { message?: string })?.message || 'failed to read Databricks status');
-			if (seq !== statusSeq) return body; // superseded for `status`, but still a valid read for the caller
+			const body = await readStatus(path);
+			// Superseded, or the panel moved on mid-flight: still a valid read for the
+			// caller, just no longer the newest word on what is being shown.
+			if (seq !== statusSeq || path !== notebookPath) return body;
 			status = body;
 			statusError = '';
 			// Default to DEFAULT, else the first profile - until the user picks one.
@@ -811,7 +847,7 @@
 			}
 			return body;
 		} catch (err) {
-			if (seq === statusSeq) statusError = toDbxError(err).message;
+			if (seq === statusSeq && path === notebookPath) statusError = toDbxError(err).message;
 			return null;
 		}
 	}
@@ -938,17 +974,40 @@
 		lost: !!connection.lost
 	});
 	const panel = $derived(databricksPanelState(panelInputs));
+	/**
+	 * The Cluster card is HOLDING a transition, so the session-scoped detail rows keep
+	 * their last live reading rather than unmounting on a payload that transiently drops
+	 * it. Same rule, same reason and the same ownership as `connectionMetaLine`'s
+	 * workspace fallback - see `holdsSessionDetail` in `$lib/databricksPanelState`.
+	 */
+	const sessionDetailHeld = $derived(holdsSessionDetail(panel));
+	/**
+	 * The default-profile notice, decided by `$lib/databricksDefaultProfile`'s
+	 * `defaultProfileNoticeApplies` - the ONE owner of that rule, which states the two
+	 * halves, why `expired` counts while `lost` does not, and why an OWNED transition
+	 * holds the card rather than letting it unmount mid-restart. Kept out of this
+	 * component deliberately: it is a decision rather than a rendering, and only the
+	 * unit suite runs in CI and in the gate, so a rule living here as an expression
+	 * could be deleted and merge green.
+	 */
+	const needsDefaultProfile = $derived(
+		defaultProfileNoticeApplies(defaultProfile, connection, sessionDetailHeld)
+	);
 
 	/**
 	 * The transition flags the Cluster/Upload/Runtime cards' controls read - the same
 	 * ownership question the view above asks, so the two cannot disagree about whose
 	 * transition it is. The rule and its reasoning live in `$lib/databricksPanelState`.
 	 *
-	 * Deliberately NOT applied to the picker, sign-in, install or reconnect controls:
-	 * those sit outside the connected card family, so the second-connected-notebook
-	 * state this exists for cannot arise there. Log out DOES render inside the connected
-	 * card and stays on the raw flags for a different reason: it is app-wide, so a
-	 * panel-wide `busy` genuinely blocks it and disabling it is the honest reading.
+	 * Deliberately NOT applied to the picker, sign-in, install or reconnect controls.
+	 * NOT because they sit outside the connected card - the picker really does render
+	 * INSIDE it, under `{#if switching}` - but because they already re-guard on the RAW
+	 * `busy` (and `connect` on `runtimeApplying` too), so a live-but-declining control
+	 * is honest there by the same argument this rule rests on, and silencing the flag
+	 * for a foreign notebook would only admit a click the handler is about to refuse.
+	 * Log out DOES render inside the connected card and stays on the raw flags for a
+	 * THIRD reason: it is app-wide, so a panel-wide `busy` genuinely blocks it and
+	 * disabling it is the honest reading.
 	 */
 	const cardFlags = $derived(ownedTransitionFlags(panelInputs));
 	/** Does the in-flight request belong to the notebook on screen? */
@@ -1107,8 +1166,19 @@
 		logoutError = null;
 	}
 
+	/**
+	 * `runtimeApplying` is guarded beside `busy`, and it is not belt-and-braces: the
+	 * picker renders INSIDE the connected card under `{#if switching}`, and the Switch
+	 * button going disabled does not unmount it - so a cluster row was still clickable
+	 * through a runtime-apply kernel restart. The panel then read `{connected,
+	 * restarting}` for the whole connect: the restarting badge, the OLD cluster in the
+	 * identity row instead of "Connecting to <new cluster>…", and "The session is
+	 * rebuilding" where the cold-cluster wait belongs. It also closes the race under
+	 * that display, where the connect POST binds `spark`/`w` into a kernel being torn
+	 * down. The cluster buttons are disabled on the same pair; this is the backstop.
+	 */
 	async function connect(cluster: DbxCluster) {
-		if (busy) return;
+		if (busy || runtimeApplying) return;
 		beginBusy('connect');
 		// Latched BEFORE the await: from here on `connected` may honestly go false
 		// (a re-pin kernel restart), and this is what keeps the panel from unmounting
@@ -2000,8 +2070,18 @@
 	// A single muted "profile · host · spark" line replacing the connected card's
 	// former <dl> grid - shorter and calmer, still complete. The rule (and why the
 	// workspace half falls back) lives in `$lib/databricksPanelState`.
+	//
+	// The same snapshot carries the Cluster card's other SESSION-scoped rows, for the
+	// identical reason and off the identical latch: a kernel restart under either face
+	// makes the server report the session lost, and that payload carries no
+	// `runtime.sdkDbutils` verdict and no `livenessUnverified` either - so read straight
+	// from it those rows unmounted for the length of the restart and sprang back, moving
+	// the cards below them. `holdsSessionDetail` decides WHEN the snapshot is read; this
+	// records it, and only ever while a session really is live.
 	let lastProfile = $state<string | null>(null);
 	let lastHost = $state<string | null>(null);
+	let lastSdkForeign = $state(false);
+	let lastLivenessUnverified = $state(false);
 	// Which notebook that last-known-good half was recorded for. The panel follows the
 	// active tab, so an unscoped fallback rendered ANOTHER workspace's profile and host
 	// under "Connecting to <this notebook's cluster>…".
@@ -2009,15 +2089,29 @@
 	$effect(() => {
 		const profile = connection.profile ?? null;
 		const host = connection.host ?? null;
+		const sdkForeign = runtimeSdkForeign;
+		const unverified = !!connection.livenessUnverified;
 		const path = notebookPath;
 		if (!connected) return;
 		untrack(() => {
 			lastProfile = profile;
 			lastHost = host;
+			lastSdkForeign = sdkForeign;
+			lastLivenessUnverified = unverified;
 			lastMetaPath = path;
 		});
 	});
 	const metaOwned = $derived(lastMetaPath === notebookPath);
+	/** The snapshot is readable: this notebook recorded it, and the card is holding. */
+	const sessionDetailFallback = $derived(sessionDetailHeld && metaOwned);
+	/** The SDK-`dbutils` warning, held through an owned transition (see above). */
+	const showSdkDbutilsWarning = $derived(
+		runtimeSdkForeign || (sessionDetailFallback && lastSdkForeign)
+	);
+	/** The liveness-not-confirmed line, held through an owned transition (see above). */
+	const showLivenessUnverified = $derived(
+		!!connection.livenessUnverified || (sessionDetailFallback && lastLivenessUnverified)
+	);
 	const connMeta = $derived(
 		connectionMetaLine({
 			profile: connection.profile,
@@ -2224,7 +2318,7 @@
   amber is ~2:1 on the light card).
 -->
 {#snippet sdkDbutilsWarning()}
-	{#if runtimeSdkForeign}
+	{#if showSdkDbutilsWarning}
 		<p
 			class="mt-1.5 rounded border border-warning/40 bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-base-content/80"
 			data-testid="databricks-runtime-sdk-warning"
@@ -2708,7 +2802,7 @@
 					<button
 						class="group flex w-full items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-base-300/40 disabled:opacity-50"
 						onclick={() => connect(c)}
-						disabled={!!busy}
+						disabled={!!busy || runtimeApplying}
 						title="Connect 'spark' to {c.name}"
 						data-testid="databricks-cluster"
 					>
@@ -3056,8 +3150,11 @@
 			<!-- Above the Cluster card: it is a precondition of everything below it. It
 			     sits outside the connection branches so ONE copy serves the connected
 			     and expired cards alike, but which branches it appears over is decided
-			     by `needsDefaultProfile` (connected, or expired - never lost/restarting,
-			     which may be a fresh kernel whose DATABRICKS_* env was never scrubbed). -->
+			     by `needsDefaultProfile`: connected, or expired - never lost/restarting,
+			     which may be a fresh kernel whose DATABRICKS_* env was never scrubbed -
+			     PLUS an owned transition, where the card HOLDS its reading rather than
+			     unmounting on the mid-restart payload that carries neither half and
+			     springing back a moment later, moving every card under it. -->
 			{#if needsDefaultProfile && defaultProfile}
 				{@render defaultProfileCard(defaultProfile)}
 			{/if}
@@ -3161,7 +3258,7 @@
 					{#if reconnectNote}
 						<p class="mt-1.5 text-[11px] leading-relaxed text-base-content/60" data-testid="databricks-reconnect-note">{reconnectNote}</p>
 					{/if}
-					{#if connection.livenessUnverified}
+					{#if showLivenessUnverified}
 						<p class="mt-1 text-[11px] leading-relaxed text-base-content/40" data-testid="databricks-unverified">
 							Liveness not confirmed (kernel busy or a transient error) - not a dead session.
 						</p>

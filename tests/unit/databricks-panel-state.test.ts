@@ -5,6 +5,7 @@ import {
 	expectedTransition,
 	connectionMetaLine,
 	holdsConnectedView,
+	holdsSessionDetail,
 	ownedTransitionFlags,
 	panelOwnsBusy,
 	panelOwnsTransition,
@@ -385,6 +386,59 @@ describe('the connection meta line', () => {
 				connecting: false
 			})
 		).toBe('');
+	});
+});
+
+describe('the session-scoped detail rows are HELD through a transition', () => {
+	/**
+	 * Siblings of the meta line above, and the same defect one row at a time: the
+	 * default-profile card over the Cluster card, the SDK-`dbutils` warning inside it
+	 * and the liveness-not-confirmed line all read a payload a kernel restart
+	 * transiently empties, so they unmounted for the length of the restart and sprang
+	 * back afterwards, moving every card below them.
+	 */
+	it('holds under BOTH faces, which meet the same emptied payload', () => {
+		// A cluster switch: the card is connected-with-a-connecting-face.
+		expect(
+			holdsSessionDetail(databricksPanelState({ ...CONNECTED, busy: 'connect', connectOverLive: true }))
+		).toBe(true);
+		// The re-pin restart mid-switch: `connected` has honestly gone false, and this
+		// is the exact frame the rows must survive.
+		expect(
+			holdsSessionDetail(
+				databricksPanelState({ ...IDLE, busy: 'connect', connectOverLive: true, lost: true })
+			)
+		).toBe(true);
+		// A runtime toggle's restart - the sibling face, same payload.
+		expect(
+			holdsSessionDetail(databricksPanelState({ ...IDLE, runtimeApplying: true, restarting: true, lost: true }))
+		).toBe(true);
+	});
+
+	it('holds nothing at rest, on a first connect, or on an honest lost/expired card', () => {
+		expect(holdsSessionDetail(databricksPanelState(CONNECTED))).toBe(false);
+		// Nothing under it to hold, so it can never turn a row ON for a silent panel.
+		expect(holdsSessionDetail(databricksPanelState({ ...IDLE, busy: 'connect' }))).toBe(false);
+		expect(holdsSessionDetail(databricksPanelState({ ...IDLE, expired: true }))).toBe(false);
+		expect(holdsSessionDetail(databricksPanelState({ ...IDLE, lost: true }))).toBe(false);
+		expect(holdsSessionDetail(databricksPanelState(IDLE))).toBe(false);
+	});
+
+	it('does not hold over a notebook whose transition it is not', () => {
+		// The panel follows the active tab: another notebook's switch must not keep this
+		// one's rows on screen any more than it keeps its connected view.
+		expect(
+			holdsSessionDetail(
+				databricksPanelState({
+					...IDLE,
+					busyPath: OTHER,
+					transitionPath: OTHER,
+					busy: 'connect',
+					connectOverLive: true,
+					lost: true
+				})
+			)
+		).toBe(false);
 	});
 });
 

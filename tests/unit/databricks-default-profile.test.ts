@@ -306,6 +306,28 @@ describe('WHERE the notice may appear: defaultProfileNoticeApplies', () => {
 		expect(defaultProfileNoticeApplies(needsOne, { connected: false, restarting: true })).toBe(false);
 	});
 
+	it('HELD through an owned transition, so the card does not unmount mid-restart', () => {
+		// A cluster switch's re-pin restart, and a runtime toggle's restart, both report
+		// the session lost - a payload carrying neither `connected` nor `expired`. Read
+		// without the hold this card vanished for the length of the restart and sprang
+		// back afterwards, moving every card below it in the sidebar. `held` comes from
+		// `holdsSessionDetail`, which already answers the notebook-ownership question,
+		// so another notebook's transition can never reach here.
+		expect(defaultProfileNoticeApplies(needsOne, { connected: false, lost: { clusterName: 'c' } }, true)).toBe(true);
+		expect(defaultProfileNoticeApplies(needsOne, { connected: false, restarting: true }, true)).toBe(true);
+	});
+
+	it('a hold can never make the notice a FALSE NAG', () => {
+		// The verdict still governs: a machine whose default resolves is silent whatever
+		// the panel is holding. And a hold only ever exists over a session that was
+		// really live, so it can only preserve a reading the two halves above already
+		// made - never invent one.
+		expect(defaultProfileNoticeApplies(resolvesFine, { connected: false }, true)).toBe(false);
+		expect(defaultProfileNoticeApplies(undefined, { connected: false }, true)).toBe(false);
+		// And the default is off, so every existing caller reads exactly as before.
+		expect(defaultProfileNoticeApplies(needsOne, { connected: false })).toBe(false);
+	});
+
 	it('claims nothing with no verdict and no connection to read', () => {
 		// An older server payload carries no `defaultProfile`; the panel must stay quiet
 		// rather than throw or guess.
