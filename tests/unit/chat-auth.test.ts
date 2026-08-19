@@ -67,6 +67,12 @@ marker="\${CLAUDE_CONFIG_DIR:+\$CLAUDE_CONFIG_DIR/.stub-authed}"
 marker="\${marker:-\$CELLAR_TEST_AMBIENT}"
 case "$1 $2" in
   "auth status")
+    # A deliberately SLOW probe for one family of slots: the window between the
+    # login child exiting and its settle probe resolving is where a sign-in must
+    # never be observable as a final failure.
+    case "\${CLAUDE_CONFIG_DIR-}" in
+      *slowprobe*) sleep 1 ;;
+    esac
     if [ -f "$marker" ]; then
       echo '{"loggedIn":true,"authMethod":"claude.ai","email":"stub@example.com","subscriptionType":"max"}'
       exit 0
@@ -359,6 +365,60 @@ describe('settled sign-in attempts do not accumulate', () => {
 		}
 		throw new Error('the attempt never settled');
 	}, 15_000);
+
+	it('is never observable as a final failure while its settle probe is still out', async () => {
+		// The regression: `running` means only that the child is alive, and
+		// `settleLogin` clears it synchronously on `close` while the outcome lands
+		// with a real `claude auth status` spawn. The panel renders a view that is
+		// not running and not ok as "Sign-in did not complete" AND stops polling, so
+		// a single observation in that shape is a permanent false failure over a
+		// sign-in that actually succeeded.
+		const s0 = auth.startChatLogin('slowprobe1');
+		await until(
+			() => auth.chatLoginStatus(s0.id),
+			(s) => !!s?.pasteUrl
+		);
+		expect(auth.submitChatLoginCode(s0.id, 'goodcode')).toBe(true);
+		const seen: Array<{ running: boolean; ok: boolean | null }> = [];
+		const settled = await until(
+			() => {
+				const s = auth.chatLoginStatus(s0.id);
+				if (s) seen.push({ running: s.running, ok: s.ok });
+				return s;
+			},
+			// Poll exactly as the panel does - it stops the moment this is true.
+			(s) => !!s && !s.running
+		);
+		expect(seen.some((v) => !v.running && v.ok === null)).toBe(false);
+		expect(settled?.ok).toBe(true);
+		expect(settled?.account?.email).toBe('stub@example.com');
+	}, 20_000);
+
+	it('does not sweep an attempt whose settle probe has not resolved yet', async () => {
+		const saved = process.env.CELLAR_CHAT_LOGIN_RETAIN_MS;
+		process.env.CELLAR_CHAT_LOGIN_RETAIN_MS = '0'; // retain nothing past settle
+		try {
+			const pending = auth.startChatLogin('slowprobe2');
+			await until(
+				() => auth.chatLoginStatus(pending.id),
+				(s) => !!s?.pasteUrl
+			);
+			auth.submitChatLoginCode(pending.id, 'goodcode');
+			await sleep(150); // the child has exited; the slow probe is still out
+			// The sweep runs at the one place the map grows. It must not take an
+			// attempt whose answer nobody could have read yet.
+			const other = auth.startChatLogin('slowprobe3');
+			expect(auth.chatLoginStatus(pending.id)).not.toBeNull();
+			auth.cancelChatLogin(other.id);
+			const settled = await until(
+				() => auth.chatLoginStatus(pending.id),
+				(s) => !!s && !s.running
+			);
+			expect(settled?.ok).toBe(true);
+		} finally {
+			restore('CELLAR_CHAT_LOGIN_RETAIN_MS', saved);
+		}
+	}, 20_000);
 
 	it('drops a SUPERSEDED attempt: a second sign-in for the slot retires the first id', async () => {
 		const first = auth.startChatLogin('prune3');

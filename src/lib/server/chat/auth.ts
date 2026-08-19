@@ -280,16 +280,32 @@ function loginRetainMs(): number {
 	return Number.isFinite(raw) && raw >= 0 ? raw : 60_000;
 }
 
-/** An attempt whose outcome is complete: settled AND its settle probe resolved. */
+/**
+ * An attempt whose outcome is COMPLETE: the child is gone AND its settle probe
+ * resolved. That is a different question from `session.running`, which means only
+ * that the child process is alive, and the gap between them is real: `settleLogin`
+ * clears `running` synchronously on `close` and then resolves ok/account/error
+ * inside a `claude auth status` spawn (~160ms, more on a cold CLI start). So this
+ * predicate - not the raw flag - is the ONE answer to "is this attempt finished",
+ * and every reader of that question asks it: what `loginView` REPORTS, and both
+ * pruning rules. Split, they contradicted each other, since a sign-in reported as
+ * not-running with no outcome yet reads as a final failure.
+ */
 function fullySettled(session: LoginSession): boolean {
 	return !session.running && session.ok !== null;
 }
 
-/** Drop settled attempts nobody is coming back for (rule 3). */
+/**
+ * Drop settled attempts nobody is coming back for (rule 3). Gated on
+ * `fullySettled`, like the read-once rule: an attempt whose probe is still out has
+ * no outcome to have been read, and dropping it there leaves the panel polling an
+ * id the server no longer has - which never resolves, since a missing id is not a
+ * verdict. It cannot leak: every path in the status probe resolves.
+ */
 function sweepSettledLogins(): void {
 	const cutoff = Date.now() - loginRetainMs();
 	for (const [id, s] of [...logins]) {
-		if (s.settledAt !== null && s.settledAt <= cutoff) logins.delete(id);
+		if (fullySettled(s) && s.settledAt !== null && s.settledAt <= cutoff) logins.delete(id);
 	}
 }
 
@@ -451,7 +467,7 @@ function loginView(session: LoginSession): ChatLoginState {
 		slot: session.slot,
 		browserUrl,
 		pasteUrl: session.pasteUrl,
-		running: session.running,
+		running: !fullySettled(session),
 		ok: session.ok,
 		account: session.account,
 		error: session.error

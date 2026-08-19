@@ -22,7 +22,7 @@
  *   finalize must not orphan.
  */
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChatEngine, ChatEngineRunArgs } from '../../src/lib/server/chat/engine';
@@ -154,6 +154,40 @@ describe('a successful chat run', () => {
 		expect(res.status).toBe('ok');
 		expect(res.outputs).toEqual([]);
 	});
+});
+
+describe('a document deleted mid-run', () => {
+	it('keeps flushing without throwing out of the interval, and still refuses to persist', async () => {
+		// Deleting the notebook in the explorer runs `dropDocs` and removes the file
+		// while the chat child is still streaming (SIGTERM does not retract bytes
+		// already in the pipe). Every flush mirrors into the live doc, from a
+		// setInterval and from the child's stdout handler - neither has a caller to
+		// catch a throw, and nothing installs an uncaughtException handler, so it
+		// would take down the process carrying every kernel websocket, the SSE
+		// fan-out and the in-process MCP server.
+		const { nb } = makeNotebook('deleted-mid-run.ipynb');
+		const errors: unknown[] = [];
+		const onError = (e: unknown) => errors.push(e);
+		process.on('uncaughtException', onError);
+		scriptedEngine(async ({ onDelta }) => {
+			onDelta('partial ');
+			nbmod.dropDocs(nb);
+			rmSync(nb);
+			// Let the ~40ms flush timer really fire against the gone document.
+			await new Promise((r) => setTimeout(r, 200));
+			onDelta('more\n');
+			await new Promise((r) => setTimeout(r, 200));
+			return { ok: true, failure: null, engine: 'claude-cli/9.9.9', replyText: 'partial more' };
+		});
+		try {
+			// The PERSIST still throws: that caller genuinely requires a document,
+			// and the run is awaited, so its rejection is handled rather than fatal.
+			await expect(runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' })).rejects.toThrow(/notebook not found/);
+		} finally {
+			process.off('uncaughtException', onError);
+		}
+		expect(errors).toEqual([]);
+	}, 15_000);
 });
 
 describe('failures are distinct, friendly and readable in the cell', () => {

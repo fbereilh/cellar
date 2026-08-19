@@ -282,6 +282,27 @@ function loadDoc(abs: string): NotebookDoc {
 	return doc;
 }
 
+/**
+ * The ALREADY-LOADED document for `nb`, or undefined - it never materialises one,
+ * never seeds the active pointer, and never throws. For a best-effort in-memory
+ * MIRROR, which is what the caller below is: `docFor` loads from disk and throws
+ * `notebook not found` for a document that has been dropped, and the mirror runs
+ * from a flush interval and from the chat child's stdout handler, where a throw is
+ * an uncaught exception that kills the process carrying every kernel websocket,
+ * the SSE fan-out and the in-process MCP server. Loading would be wrong here even
+ * where it succeeds: it would resurrect an entry `dropDocs` deliberately removed.
+ * Callers that genuinely REQUIRE a document (every persist path) keep `docFor`.
+ */
+function liveDoc(nb?: string | null): NotebookDoc | undefined {
+	let abs: string;
+	try {
+		abs = resolveAbs(nb);
+	} catch {
+		return undefined;
+	}
+	return docs.get(abs);
+}
+
 /** The document a request targets: explicit `nb` path, else the active one. */
 function docFor(nb?: string | null): NotebookDoc {
 	const abs = resolveAbs(nb);
@@ -1531,9 +1552,15 @@ export function clearOutputsLive(id: string, nb?: string | null): void {
  * a delta refetches ONCE and genuinely resyncs, rather than reading empty (disk is
  * written once, at run:end via `setOutputs`; the SSE deltas already carry the live
  * update, so no event fires here).
+ *
+ * A document that is GONE (deleted in the explorer, so `dropDocs` retired it, or
+ * renamed out from under a run) is a silent no-op - see `liveDoc`. The run's own
+ * persist still throws for it, which is right: that caller needs a document.
  */
 export function setOutputsLive(id: string, outputs: CellOutput[], nb?: string | null): void {
-	const cell = find(docFor(nb), id);
+	const doc = liveDoc(nb);
+	if (!doc) return;
+	const cell = find(doc, id);
 	if (cell) cell.outputs = outputs;
 }
 
