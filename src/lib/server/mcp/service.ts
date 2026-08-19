@@ -531,6 +531,33 @@ const kernelUnavailable = (cell: CellView, sid: SessionId | null): boolean =>
 	sid == null && cell.metadata?.cellar?.lastRun?.kernel_unavailable === true;
 
 /**
+ * A CHAT cell's own status words. A chat run touches no kernel and stamps no
+ * session epoch, so the vocabulary below - every word of which answers "does
+ * what this cell defined still exist in the kernel?" - has no meaning for it,
+ * and answering in that vocabulary is not merely imprecise but actively
+ * harmful: a just-answered reply came out as `ok_persisted`, which the doctrine
+ * defines as a leftover from a previous session and instructs agents to distrust
+ * and RE-RUN. Re-running a chat cell is a billed, nondeterministic model turn
+ * that overwrites the reply the user may be reading. A flag beside a misleading
+ * label is a trap, so the LABEL changes:
+ *
+ *   ok_chat_reply          this server process ran it and it answered
+ *   error_chat_reply       this server process ran it and the run failed
+ *   chat_reply_persisted   a saved reply carrying no run stamp (i.e. after a reload)
+ *   unrun                  no reply, and no run this process made
+ *
+ * Read off the runtime-only `lastRun` stamp, which is stripped on save - so its
+ * presence IS "this process ran it", exactly as the epoch is for a kernel cell.
+ * `ran_this_session` stays honestly false throughout: no code executed in any
+ * kernel session.
+ */
+function chatRunStatus(cell: CellView): string {
+	const lastRun = cell.metadata?.cellar?.lastRun;
+	if (lastRun) return lastRun.status === 'ok' ? 'ok_chat_reply' : 'error_chat_reply';
+	return (cell.outputs || []).length ? 'chat_reply_persisted' : 'unrun';
+}
+
+/**
  * Per-cell run status, with persisted and live-session execution kept strictly
  * apart — conflating them is what lets an agent build on variables that were
  * never defined this session:
@@ -542,6 +569,10 @@ const kernelUnavailable = (cell: CellView, sid: SessionId | null): boolean =>
  *   ok_persisted              saved outputs from a PREVIOUS session; nothing it defines exists now
  *   error_persisted           saved error output from a PREVIOUS session
  *   error_kernel_unavailable  the kernel could not be reached; this failure is LIVE, not leftover
+ *
+ * A CHAT cell answers in its own vocabulary instead (see `chatRunStatus`): it is
+ * an nbformat code cell, so it reaches this function, but it runs no kernel and
+ * the words above would all assert something about a namespace it never touched.
  *
  * For a cell that ran this session the recorded run status is authoritative — a
  * cell can run successfully and emit no outputs at all (`lp = load()`), which
@@ -559,6 +590,7 @@ const kernelUnavailable = (cell: CellView, sid: SessionId | null): boolean =>
  */
 function runStatus(cell: CellView, sid: SessionId | null): string {
 	if (cell.cell_type !== 'code') return 'n/a';
+	if (isChatCell(cell)) return chatRunStatus(cell);
 	if (ranThisSession(cell, sid)) {
 		return cell.metadata?.cellar?.lastRun?.status === 'ok' ? 'ok_session' : 'error_session';
 	}

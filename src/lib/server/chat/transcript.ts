@@ -36,7 +36,7 @@
  */
 
 import { isHiddenFromAgent } from '$lib/agentVisibility';
-import { isChatCell, isSqlCell, logicalCellType } from '$lib/cellLanguage';
+import { isChatCell, logicalCellType } from '$lib/cellLanguage';
 import { asText, stripAnsi } from '$lib/outputText';
 import type { CellOutput } from '$lib/server/types';
 
@@ -170,7 +170,7 @@ export function buildChatPrompt(
 		// A chat cell's persisted output is its REPLY - label it so the dialog
 		// reads as one; a code/sql cell's outputs are results.
 		const isChat = isChatCell(cell as Parameters<typeof isChatCell>[0]);
-		const hasOutputs = cell.cell_type === 'code' || isSqlCell(cell as Parameters<typeof isSqlCell>[0]);
+		const hasOutputs = cell.cell_type === 'code';
 		if (hasOutputs) {
 			const text = (cell.outputs ?? [])
 				.map(outputText)
