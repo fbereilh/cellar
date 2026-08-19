@@ -4,6 +4,7 @@ import {
 	databricksPanelState,
 	expectedTransition,
 	holdsConnectedView,
+	ownedTransitionFlags,
 	panelOwnsTransition,
 	type DbxPanelInputs
 } from '../../src/lib/databricksPanelState';
@@ -190,6 +191,35 @@ describe('a transition speaks only for the notebook it was latched for', () => {
 		expect(databricksPanelState(serverSide).view).toBe('connecting');
 	});
 
+	/**
+	 * The `disabled` sibling of that rule. Scoping the VIEW alone left a second
+	 * connected notebook's Cluster/Upload/Runtime controls greyed out with nothing
+	 * saying why; they now ask the same ownership question the view does.
+	 */
+	it('hands the cards raw flags for the owner and silenced ones for everyone else', () => {
+		const connecting: DbxPanelInputs = { ...CONNECTED, busy: 'connect', connectOverLive: true };
+		expect(ownedTransitionFlags(connecting)).toEqual({ busy: 'connect', runtimeApplying: false });
+		expect(ownedTransitionFlags({ ...connecting, notebookPath: OTHER })).toEqual({
+			busy: '',
+			runtimeApplying: false
+		});
+
+		const applying: DbxPanelInputs = { ...CONNECTED, runtimeApplying: true, restarting: true };
+		expect(ownedTransitionFlags(applying)).toEqual({ busy: '', runtimeApplying: true });
+		expect(ownedTransitionFlags({ ...applying, notebookPath: OTHER })).toEqual({
+			busy: '',
+			runtimeApplying: false
+		});
+	});
+
+	it('silences the cards for EVERY verb, not just a connect', () => {
+		for (const busy of ['connect', 'disconnect', 'upload', 'reconnect']) {
+			const owner = { ...CONNECTED, busy };
+			expect(ownedTransitionFlags(owner).busy, busy).toBe(busy);
+			expect(ownedTransitionFlags({ ...owner, notebookPath: OTHER }).busy, busy).toBe('');
+		}
+	});
+
 	it('treats a panel that has never started a transition as owning nothing', () => {
 		// `transitionPath` starts `undefined`; a real `notebookPath` is never equal to it.
 		expect(panelOwnsTransition({ ...IDLE, transitionPath: undefined })).toBe(false);
@@ -327,13 +357,21 @@ interface TemplateChain {
 	start: number;
 }
 
+/** Blank a region to spaces, keeping its length (and its newlines) so offsets hold. */
+const blank = (m: string) => m.replace(/[^\n]/g, ' ');
+
 /**
- * The template's `{#if}` chains as a nesting model. HTML comments are blanked first
- * (length-preserving, so offsets still line up): this file's prose mentions block tags
- * like `{#each}`, which are not markup.
+ * The template's `{#if}` chains as a nesting model. Everything that is NOT markup is
+ * blanked first, length-preservingly so offsets still line up: HTML comments AND the
+ * whole `<script>` block, both of which carry prose mentioning block tags like
+ * `{#each}` or `{#if panel.view === '…'}`. Without the second one, documenting the
+ * branch structure in a JSDoc comment would fail this file with an "unclosed {#if}"
+ * that points nowhere near the edit.
  */
 function parseIfChains(src: string): { code: string; chains: TemplateChain[] } {
-	const code = src.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '));
+	const code = src
+		.replace(/<script[\s\S]*?<\/script>/g, blank)
+		.replace(/<!--[\s\S]*?-->/g, blank);
 	const re = /\{#if\s([^}]*)\}|\{:else if\s([^}]*)\}|\{:else\}|\{\/if\}/g;
 	const open: { start: number; arms: { cond: string | null; tagStart: number; bodyStart: number }[] }[] = [];
 	const chains: TemplateChain[] = [];
@@ -380,8 +418,11 @@ const count = (hay: string, needle: string) => hay.split(needle).length - 1;
 
 describe('source guards: the panel really asks the shared rule', () => {
 	it('imports and derives the panel state from the one module', () => {
-		expect(SRC).toMatch(/import \{ databricksPanelState \} from '\$lib\/databricksPanelState'/);
+		expect(SRC).toMatch(/import \{[^}]*\bdatabricksPanelState\b[^}]*\} from '\$lib\/databricksPanelState'/);
 		expect(SRC).toMatch(/const panel = \$derived\(\s*databricksPanelState\(/);
+		// The `disabled` sibling of the same rule - see `ownedTransitionFlags`.
+		expect(SRC).toMatch(/import \{[^}]*\bownedTransitionFlags\b[^}]*\} from '\$lib\/databricksPanelState'/);
+		expect(SRC).toMatch(/\$derived\(ownedTransitionFlags\(/);
 	});
 
 	it('every connection branch is decided by it, not by a re-inlined condition', () => {

@@ -48,7 +48,7 @@
 		unknownTokenWarning
 	} from '$lib/databricksUploadName';
 	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
-	import { databricksPanelState } from '$lib/databricksPanelState';
+	import { databricksPanelState, ownedTransitionFlags } from '$lib/databricksPanelState';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -892,20 +892,30 @@
 	 * FLICKER RULE and why it may not live here (vitest cannot mount this component,
 	 * and e2e runs in neither CI nor the no-mistakes gate).
 	 */
-	const panel = $derived(
-		databricksPanelState({
-			notebookPath,
-			transitionPath,
-			busy,
-			connected,
-			restarting,
-			serverRestarting: !!connection.restarting,
-			runtimeApplying,
-			connectOverLive,
-			expired: !!connection.expired,
-			lost: !!connection.lost
-		})
-	);
+	const panelInputs = $derived({
+		notebookPath,
+		transitionPath,
+		busy,
+		connected,
+		restarting,
+		serverRestarting: !!connection.restarting,
+		runtimeApplying,
+		connectOverLive,
+		expired: !!connection.expired,
+		lost: !!connection.lost
+	});
+	const panel = $derived(databricksPanelState(panelInputs));
+
+	/**
+	 * The transition flags the Cluster/Upload/Runtime cards' controls read - the same
+	 * ownership question the view above asks, so the two cannot disagree about whose
+	 * transition it is. The rule and its reasoning live in `$lib/databricksPanelState`.
+	 *
+	 * Deliberately NOT applied to the picker, sign-in, install, reconnect or log-out
+	 * controls: those sit outside the connected card family (log out is app-wide), so
+	 * the second-connected-notebook state this exists for cannot arise there.
+	 */
+	const cardFlags = $derived(ownedTransitionFlags(panelInputs));
 
 	// Clusters load whenever the selection is not showing the sign-in button
 	// (`needsAuth`). For a bare host - and for a no-token external-browser profile -
@@ -1417,7 +1427,7 @@
 	 * error); with nothing in flight Cancel is live again - before the first click,
 	 * and after a failed replace, so the box is never a dead end.
 	 */
-	const uploadConfirmBusy = $derived(!!busy || runtimeApplying);
+	const uploadConfirmBusy = $derived(!!cardFlags.busy || cardFlags.runtimeApplying);
 
 	/** Drop the previous attempt's feedback: it describes one moment, not a standing state. */
 	function clearUploadFeedback() {
@@ -1862,7 +1872,7 @@
 		const seq = ++catalogsSeq;
 		catalogsLoading = true;
 		catalogsError = null;
-		// A different profile or cluster is a different tree. Drop the expanded
+		// A different profile or host is a different tree. Drop the expanded
 		// children too, or a schema loaded from the previous workspace keeps showing
 		// under a catalog that no longer contains it.
 		nodes = {};
@@ -2744,7 +2754,7 @@
 				class="toggle toggle-xs toggle-success"
 				checked={runtimeEffectiveOn}
 				onchange={toggleRuntime}
-				disabled={runtimeApplying || !!busy || runtimeEnvControlled || !runtimeRestartable}
+				disabled={cardFlags.runtimeApplying || !!cardFlags.busy || runtimeEnvControlled || !runtimeRestartable}
 				data-testid="databricks-runtime-toggle"
 			/>
 			<span>Databricks runtime (<code class="font-mono text-[10px]">dbutils.widgets</code>)</span>
@@ -2764,7 +2774,7 @@
 					onchange={commitVersion}
 					onkeydown={(e) => { if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur(); }}
 					placeholder={DBX_RUNTIME_VERSION_DEFAULT}
-					disabled={runtimeApplying || runtimeVersionEnvControlled || !runtimeRestartable}
+					disabled={cardFlags.runtimeApplying || runtimeVersionEnvControlled || !runtimeRestartable}
 					title={runtimeVersionEnvControlled
 						? 'Set by the CELLAR_DATABRICKS_RUNTIME_VERSION environment variable, which overrides this setting.'
 						: !runtimeRestartable
@@ -2829,11 +2839,11 @@
 		     An env-forced decision is excluded outright (no restart can change it, so the
 		     button would loop forever wiping the namespace); a missing notebook path only
 		     DISABLES it, because there the remedy is simply to open a notebook. -->
-		{#if runtimePending && runtimeKernelStarted && !runtimeEnvControlled && !runtimeApplying}
+		{#if runtimePending && runtimeKernelStarted && !runtimeEnvControlled && !cardFlags.runtimeApplying}
 			<button
 				class="btn btn-outline btn-xs mt-1.5 w-full"
 				onclick={applyPendingRuntime}
-				disabled={!!busy || !runtimeApplicable}
+				disabled={!!cardFlags.busy || !runtimeApplicable}
 				title={runtimeApplicable
 					? "Restart this notebook's kernel so it starts with the Databricks runtime. Variables are cleared."
 					: 'Open a notebook to restart its kernel.'}
@@ -3085,10 +3095,10 @@
 						</p>
 					{/if}
 					<div class="mt-2 flex gap-1.5">
-						<button class="btn btn-outline btn-xs flex-1" onclick={() => { switching = !switching; reconnectNote = ''; }} disabled={!!busy || runtimeApplying} data-testid="databricks-switch">
+						<button class="btn btn-outline btn-xs flex-1" onclick={() => { switching = !switching; reconnectNote = ''; }} disabled={!!cardFlags.busy || cardFlags.runtimeApplying} data-testid="databricks-switch">
 							{switching ? 'Cancel' : 'Switch cluster'}
 						</button>
-						<button class="btn btn-outline btn-xs flex-1" onclick={disconnect} disabled={!!busy || runtimeApplying} data-testid="databricks-disconnect">
+						<button class="btn btn-outline btn-xs flex-1" onclick={disconnect} disabled={!!cardFlags.busy || cardFlags.runtimeApplying} data-testid="databricks-disconnect">
 							{#if busy === 'disconnect'}<span class="loading loading-spinner loading-xs"></span>{:else}Disconnect{/if}
 						</button>
 					</div>

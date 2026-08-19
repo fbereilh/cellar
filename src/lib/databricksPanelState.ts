@@ -116,6 +116,23 @@ function ownFlags(i: DbxPanelInputs) {
 }
 
 /**
+ * The two panel-wide flags as the CARDS' CONTROLS may read them - the `disabled`
+ * sibling of the view rule, asking the same ownership question so the two cannot
+ * disagree about whose transition it is.
+ *
+ * Scoping only the view left a second connected notebook rendering a plain connected
+ * card whose every control was greyed out with nothing saying why. A click there is
+ * safe - `connect`/`disconnect`/`uploadToWorkspace`/`applyRuntime` each re-guard on
+ * `busy`/`runtimeApplying`, so at worst the handler no-ops - and a live control whose
+ * handler declines is honest in a way a mute grey one is not. For the notebook that
+ * DOES own the transition these are the raw flags, byte for byte.
+ */
+export function ownedTransitionFlags(i: DbxPanelInputs): { busy: string; runtimeApplying: boolean } {
+	const owned = panelOwnsTransition(i);
+	return { busy: owned ? i.busy : '', runtimeApplying: owned && i.runtimeApplying };
+}
+
+/**
  * An expected transition is in flight - a connect/switch, or a kernel restart the panel
  * or the server told us to expect. A runtime toggle is deliberately excluded: it keeps
  * the connected card with its own "restarting" pill.
