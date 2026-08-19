@@ -313,6 +313,87 @@ describe('sign-in lifecycle (server-run browser flow)', () => {
 	}, 15_000);
 });
 
+/**
+ * A sign-in attempt is server state holding a ChildProcess reference and its
+ * captured stdout, so the map that tracks them may not grow for the life of the
+ * process. It is only useful while `chatLoginStatus(id)` can still be polled -
+ * the panel polls until the attempt settles and then stops - so the entry goes
+ * once that last read has happened, once a new attempt supersedes it, or once
+ * an abandoned one ages out.
+ */
+describe('settled sign-in attempts do not accumulate', () => {
+	it('hands the settled outcome to its poller ONCE, then forgets it', async () => {
+		const s0 = auth.startChatLogin('prune1');
+		await until(
+			() => auth.chatLoginStatus(s0.id),
+			(s) => !!s?.pasteUrl
+		);
+		auth.submitChatLoginCode(s0.id, 'goodcode');
+		// Poll exactly as the panel does: until the attempt reports settled.
+		const settled = await until(
+			() => auth.chatLoginStatus(s0.id),
+			(s) => !!s && !s.running && s.ok !== null
+		);
+		// The poller gets the whole outcome - that read is the one the panel renders.
+		expect(settled?.ok).toBe(true);
+		expect(settled?.account?.email).toBe('stub@example.com');
+		// ...and the entry is gone, so it cannot pile up behind the panel.
+		expect(auth.chatLoginStatus(s0.id)).toBeNull();
+	}, 15_000);
+
+	it('keeps a settled attempt whose outcome is not complete yet', async () => {
+		// `running` flips false the moment the child closes, but the outcome lands
+		// with the settle probe. Dropping the entry in that window would lose the
+		// very answer the poller is waiting for.
+		const s0 = auth.startChatLogin('prune2');
+		await until(
+			() => auth.chatLoginStatus(s0.id),
+			(s) => !!s?.pasteUrl
+		);
+		auth.cancelChatLogin(s0.id);
+		for (let i = 0; i < 40; i++) {
+			const seen = auth.chatLoginStatus(s0.id);
+			if (seen === null) throw new Error('the attempt was dropped before its outcome was complete');
+			if (!seen.running && seen.ok !== null) return; // complete: the read-once rule may now drop it
+			await sleep(25);
+		}
+		throw new Error('the attempt never settled');
+	}, 15_000);
+
+	it('drops a SUPERSEDED attempt: a second sign-in for the slot retires the first id', async () => {
+		const first = auth.startChatLogin('prune3');
+		await until(
+			() => auth.chatLoginStatus(first.id),
+			(s) => !!s?.pasteUrl
+		);
+		const second = auth.startChatLogin('prune3');
+		expect(second.id).not.toBe(first.id);
+		expect(auth.chatLoginStatus(first.id)).toBeNull();
+		expect(auth.chatLoginStatus(second.id)).not.toBeNull();
+		auth.cancelChatLogin(second.id);
+	}, 15_000);
+
+	it('sweeps an ABANDONED settled attempt (nobody ever polled it) on the next start', async () => {
+		const saved = process.env.CELLAR_CHAT_LOGIN_RETAIN_MS;
+		process.env.CELLAR_CHAT_LOGIN_RETAIN_MS = '0'; // retain nothing past settle
+		try {
+			const abandoned = auth.startChatLogin('prune4');
+			auth.cancelChatLogin(abandoned.id);
+			// Wait for it to settle WITHOUT reading it through chatLoginStatus, which
+			// is what a closed browser leaves behind.
+			await sleep(600);
+			// The next sign-in is the one place the map grows, so it is where the
+			// sweep runs.
+			const next = auth.startChatLogin('prune5');
+			expect(auth.chatLoginStatus(abandoned.id)).toBeNull();
+			expect(auth.chatLoginStatus(next.id)).not.toBeNull();
+			auth.cancelChatLogin(next.id);
+		} finally {
+			restore('CELLAR_CHAT_LOGIN_RETAIN_MS', saved);
+		}
+	}, 15_000);
+});
+
 describe('sign-out is slot-scoped by construction', () => {
 	it('signs the named slot out and the ambient login provably survives', async () => {
 		writeFileSync(AMBIENT_FLAG, ''); // the "terminal login"

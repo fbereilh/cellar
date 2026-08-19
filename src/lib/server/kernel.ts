@@ -30,7 +30,7 @@ import { basename, sep } from 'node:path';
 import { KernelManager, ServerConnection, CommsOverSubshells, KernelAPI } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
-import { abortChatRuns } from './chat/active';
+import { abortChatRuns, abortChatRunsUnder } from './chat/active';
 import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from './notebook';
 import { workspaceRoot } from './fstree';
 import { addProjectRootToPath, injectDatabricksRuntime, databricksRuntimeVersion } from './ui-state';
@@ -1008,10 +1008,15 @@ function stopMemoryPolling(): void {
  * entry (its card drops from the sidebar), unlike `restartKernel` which keeps
  * the process/entry and only clears the namespace. The document and MCP session
  * are untouched; the notebook lazily gets a fresh kernel on its next run.
- * Shutting down a notebook that never started is a no-op.
+ * Shutting down a notebook that never started is a no-op FOR THE KERNEL - but
+ * not for a chat run, which holds no kernel and so is the ordinary state of a
+ * chat-only notebook. Its child is aborted here, ABOVE the early return, exactly
+ * as `interruptKernel` and `restartKernel` do: the abort inside `teardownKernel`
+ * is unreachable from a notebook that never started one.
  */
 export async function shutdownKernel(nbPath?: string | null) {
 	const abs = resolveNb(nbPath);
+	abortChatRuns(abs);
 	const nbKernel = kernels.get(abs);
 	if (!nbKernel) return { status: 'not_started', id: null, session_id: null };
 	await teardownKernel(nbKernel, 'kernel_shutdown');
@@ -1525,9 +1530,16 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
  * notebook nested under it. Deleting a notebook must free its Python process, not
  * just its document (`dropDocs` handles the doc). Idempotent: a path with no live
  * kernel is a no-op, matching `dropDocs`. Returns how many kernels were shut down.
+ *
+ * A chat run under the deleted path is aborted FIRST, before the no-kernel early
+ * return below: it holds no kernel, so the victim scan cannot see it, and the
+ * caller has already `dropDocs`'d the document - leaving the run streaming into
+ * a notebook that no longer exists, at the user's expense and with its next
+ * flush reaching a document `loadDoc` will refuse.
  */
 export async function shutdownKernelsUnder(deletedPath: string): Promise<number> {
 	const deletedAbs = resolveNotebookPath(deletedPath);
+	abortChatRunsUnder(deletedAbs, sep);
 	const prefix = deletedAbs + sep;
 	const victims = [...kernels.values()].filter(
 		(k) => k.nbPath === deletedAbs || k.nbPath.startsWith(prefix)

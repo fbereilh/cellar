@@ -109,6 +109,23 @@ describe('source guards on the Svelte/client halves', () => {
 		}
 	});
 
+	it('LiveNotebook does not report a chat run to the shell kernel counters', () => {
+		// The badge forces {started:true, status:'busy'} while a run is in flight and
+		// `markKernelStarted()` asserts a live kernel optimistically, both on the
+		// premise that a run boots one. A chat run retires that premise, so it must
+		// not fire either - and the two callbacks must stay PAIRED, or the in-flight
+		// count is left standing and the badge reads busy forever.
+		const src = read('../../src/lib/LiveNotebook.svelte');
+		expect(src).toMatch(/const kernelRun = !isChatCell\(cell\)/);
+		expect(src).toMatch(/if \(kernelRun\) onRunStart\?\.\(path, id\)/);
+		expect(src).toMatch(/if \(kernelRun\) onRunEnd\?\.\(\)/);
+		// Neither callback may be reached on an ungated path in `runCell`.
+		const run = src.slice(src.indexOf('async function runCell('));
+		const body = run.slice(0, run.indexOf('\n\tfunction ') > 0 ? run.indexOf('\n\tfunction ') : 8000);
+		expect(body.match(/onRunStart\?\./g) ?? []).toHaveLength(1);
+		expect(body.match(/onRunEnd\?\./g) ?? []).toHaveLength(1);
+	});
+
 	it('Cell.svelte offers the Chat type, renders text/markdown by CONTENT CLASS, and edits chat as markdown', () => {
 		const src = read('../../src/lib/Cell.svelte');
 		expect(src).toContain("{ v: 'chat', label: 'Chat', hint: 'claude' }");

@@ -8,6 +8,7 @@
 	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
 	import {
 		CHAT_LANGUAGE,
+		isChatCell,
 		isLogicalCellType,
 		isPyUnsupportedType,
 		languageTagFor,
@@ -1891,7 +1892,15 @@
 			return;
 		}
 		if (runningId === id || queued[id] != null) return;
-		onRunStart?.(path, id);
+		// A CHAT run is deliberately NOT reported to the shell's kernel counters: it
+		// touches no kernel (no session stamp, staleness n/a), and `onRunStart` is
+		// what makes the navbar badge assert a live BUSY kernel and optimistically
+		// mark one started. Asking a question in a notebook that never booted one
+		// would otherwise read "busy" for the whole reply. The two callbacks stay
+		// PAIRED - skipping the start means skipping the end - so the in-flight
+		// count is never left standing.
+		const kernelRun = !isChatCell(cell);
+		if (kernelRun) onRunStart?.(path, id);
 		cell.source = source;
 		// The run's own lifecycle, learned from the server: `started` flips on the
 		// `run:start` frame. Everything that mutates this cell's outputs is gated on
@@ -1979,7 +1988,7 @@
 			// (here or in another tab), and clearing then would erase a live indicator.
 			// The `=== id` test additionally keeps an overlapping run's spinner alone.
 			if (started && runningId === id) clearRunning();
-			onRunEnd?.();
+			if (kernelRun) onRunEnd?.();
 			scheduleStaleness(); // this cell (and its dependents) may have changed staleness
 		}
 	}

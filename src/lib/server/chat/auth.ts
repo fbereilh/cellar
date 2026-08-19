@@ -249,10 +249,49 @@ interface LoginSession {
 	account: ChatAccountInfo | null;
 	error: string | null;
 	timer: ReturnType<typeof setTimeout>;
+	/** When the attempt stopped running - the clock the retention rule reads. */
+	settledAt: number | null;
 }
 
+/**
+ * Live and recently-settled sign-in attempts.
+ *
+ * An entry is only useful while `chatLoginStatus(id)` can still be polled, so it
+ * is dropped on three rules rather than kept for the life of the process (each
+ * holds a `ChildProcess` reference and its captured stdout):
+ *
+ *  1. READ-ONCE. A fully settled attempt is handed to its poller once and then
+ *     deleted - the panel polls only until the attempt settles, so that read is
+ *     the last one there will ever be.
+ *  2. SUPERSEDED. Starting a second attempt for a slot ends the first, and its
+ *     id is already dead to the caller (which is about to receive the new one).
+ *  3. ABANDONED. A settled attempt nobody ever read (the browser closed
+ *     mid-sign-in) is swept on the next start, past `loginRetainMs()`.
+ *
+ * Rules 2 and 3 run at the ONE place the map grows, so it cannot outgrow the
+ * attempts started since the last start.
+ */
 const logins = new Map<string, LoginSession>();
 let loginSeq = 0;
+
+/** How long a settled-but-unread attempt stays pollable (see rule 3 above). */
+function loginRetainMs(): number {
+	const raw = Number(process.env.CELLAR_CHAT_LOGIN_RETAIN_MS);
+	return Number.isFinite(raw) && raw >= 0 ? raw : 60_000;
+}
+
+/** An attempt whose outcome is complete: settled AND its settle probe resolved. */
+function fullySettled(session: LoginSession): boolean {
+	return !session.running && session.ok !== null;
+}
+
+/** Drop settled attempts nobody is coming back for (rule 3). */
+function sweepSettledLogins(): void {
+	const cutoff = Date.now() - loginRetainMs();
+	for (const [id, s] of [...logins]) {
+		if (s.settledAt !== null && s.settledAt <= cutoff) logins.delete(id);
+	}
+}
 
 /**
  * Start `claude auth login` into a slot (created if missing). The child owns
@@ -265,10 +304,16 @@ export function startChatLogin(slot: string): ChatLoginState {
 	const dir = chatSlotDir(slot); // validates the name
 	mkdirSync(dir, { recursive: true });
 
-	// Cancel a prior half-open login for the same slot rather than racing two.
-	for (const s of logins.values()) {
-		if (s.slot === slot && s.running) endLogin(s, 'superseded by a new sign-in attempt');
+	// Cancel a prior half-open login for the same slot rather than racing two. Its
+	// id is dead to the caller the moment this call returns a new one, so the
+	// entry goes with it (rule 2) - `endLogin` still holds the session it kills.
+	for (const [id, s] of [...logins]) {
+		if (s.slot === slot && s.running) {
+			endLogin(s, 'superseded by a new sign-in attempt');
+			logins.delete(id);
+		}
 	}
+	sweepSettledLogins();
 
 	const tmp = mkdtempSync(join(tmpdir(), 'cellar-chat-login-'));
 	const urlsFile = join(tmp, 'urls.txt');
@@ -301,6 +346,7 @@ export function startChatLogin(slot: string): ChatLoginState {
 		ok: null,
 		account: null,
 		error: null,
+		settledAt: null,
 		timer: setTimeout(() => endLogin(session, 'sign-in timed out'), LOGIN_TIMEOUT_MS)
 	};
 	if (typeof session.timer.unref === 'function') session.timer.unref();
@@ -343,6 +389,7 @@ export function startChatLogin(slot: string): ChatLoginState {
 function settleLogin(session: LoginSession): void {
 	if (!session.running) return;
 	session.running = false;
+	session.settledAt = Date.now();
 	clearTimeout(session.timer);
 	invalidateChatAuthCache();
 	void probeChatAccount(chatSlotDir(session.slot)).then((probe) => {
@@ -411,10 +458,21 @@ function loginView(session: LoginSession): ChatLoginState {
 	};
 }
 
-/** Poll a login attempt. Unknown id = null (the panel treats it as gone). */
+/**
+ * Poll a login attempt. Unknown id = null (the panel treats it as gone).
+ *
+ * A fully settled attempt is returned ONCE and then forgotten (rule 1 above):
+ * the panel stops polling the moment it reads a settled state, so holding the
+ * entry past that read only accumulates dead sessions. An attempt that has
+ * stopped running but whose settle probe has not resolved yet is NOT complete
+ * and is kept, so the outcome the caller is waiting for is never dropped.
+ */
 export function chatLoginStatus(id: string): ChatLoginState | null {
 	const session = logins.get(id);
-	return session ? loginView(session) : null;
+	if (!session) return null;
+	const view = loginView(session);
+	if (fullySettled(session)) logins.delete(id);
+	return view;
 }
 
 /**

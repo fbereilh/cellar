@@ -245,16 +245,76 @@ describe('the stop doors reach a chat run', () => {
 		expect(activemod.abortChatRuns(nb)).toBe(0); // nothing left registered
 	});
 
-	it('kernel.ts calls abortChatRuns from interrupt, restart AND teardown (source guard)', async () => {
+	it('the SHUTDOWN door stops a chat run even with NO kernel to shut down', async () => {
+		// The ordinary state of a chat-only notebook: no kernel was ever started, so
+		// every door that bails on a missing one steps over the run. Reached by
+		// deleting the notebook in the file explorer, which leaves the billed child
+		// streaming into a document that has just been dropped.
+		const { nb } = makeNotebook('shutdown-nokernel.ipynb');
+		const kernelmod = await import('../../src/lib/server/kernel');
+		scriptedEngine(
+			({ signal }) =>
+				new Promise((resolve) => {
+					signal.addEventListener('abort', () =>
+						resolve({ ok: false, failure: { kind: 'cancelled', message: 'interrupted' }, engine: null, replyText: null })
+					);
+				})
+		);
+		const p = runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		await new Promise((r) => setTimeout(r, 50));
+
+		// No kernel exists for this notebook, so the shutdown is a no-op FOR THE
+		// KERNEL - and must still be a real stop for the chat run.
+		expect(await kernelmod.shutdownKernel(nb)).toMatchObject({ status: 'not_started' });
+		const res = await p;
+		expect(res.status).toBe('error');
+		expect((res.outputs[0] as { data: Record<string, string> }).data['text/markdown']).toContain('interrupted');
+		expect(activemod.abortChatRuns(nb)).toBe(0);
+	});
+
+	it('deleting a FOLDER stops the chat runs of the notebooks under it', async () => {
+		const fs = await import('node:fs');
+		fs.mkdirSync(join(WS, 'sub'), { recursive: true });
+		const { nb } = makeNotebook('sub/folder-delete.ipynb');
+		const kernelmod = await import('../../src/lib/server/kernel');
+		scriptedEngine(
+			({ signal }) =>
+				new Promise((resolve) => {
+					signal.addEventListener('abort', () =>
+						resolve({ ok: false, failure: { kind: 'cancelled', message: 'interrupted' }, engine: null, replyText: null })
+					);
+				})
+		);
+		const p = runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		await new Promise((r) => setTimeout(r, 50));
+
+		// The notebook is UNDER the deleted folder, which is the at-or-under rule
+		// `shutdownKernelsUnder` applies to kernels and must apply to chat runs too.
+		expect(await kernelmod.shutdownKernelsUnder('sub')).toBe(0); // no kernels, still a stop
+		const res = await p;
+		expect(res.status).toBe('error');
+		expect(activemod.abortChatRuns(nb)).toBe(0);
+	});
+
+	it('kernel.ts stops chat runs from EVERY door, above each no-kernel early return', async () => {
 		const fs = await import('node:fs');
 		const src = fs.readFileSync(new URL('../../src/lib/server/kernel.ts', import.meta.url), 'utf8');
-		// One occurrence per door; the import line makes four total.
-		const calls = src.match(/abortChatRuns\(/g) ?? [];
-		expect(calls.length).toBeGreaterThanOrEqual(3);
-		for (const fn of ['export async function interruptKernel', 'export async function restartKernel', 'async function teardownKernel']) {
+		for (const fn of [
+			'export async function interruptKernel',
+			'export async function restartKernel',
+			'export async function shutdownKernel',
+			'export async function shutdownKernelsUnder',
+			'async function teardownKernel'
+		]) {
 			const body = src.slice(src.indexOf(fn));
 			const nextFn = body.indexOf('\nexport ', 10);
-			expect(body.slice(0, nextFn > 0 ? nextFn : 4000)).toContain('abortChatRuns(');
+			const fnBody = body.slice(0, nextFn > 0 ? nextFn : 4000);
+			expect(fnBody).toMatch(/abortChatRuns(Under)?\(/);
+			// And BEFORE the early return, which is the whole point: an abort below it
+			// is unreachable for the notebook that needs it most.
+			const abortAt = fnBody.search(/abortChatRuns(Under)?\(/);
+			const bailAt = fnBody.search(/if \(!nbKernel\)|if \(victims\.length === 0\)/);
+			if (bailAt >= 0) expect(abortAt).toBeLessThan(bailAt);
 		}
 	});
 });
