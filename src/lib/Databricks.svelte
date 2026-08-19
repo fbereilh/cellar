@@ -48,7 +48,7 @@
 		unknownTokenWarning
 	} from '$lib/databricksUploadName';
 	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
-	import { databricksPanelState, ownedTransitionFlags } from '$lib/databricksPanelState';
+	import { connectionMetaLine, databricksPanelState, ownedTransitionFlags } from '$lib/databricksPanelState';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -409,8 +409,14 @@
 	 * It flips the ADVERTISEMENT only - no `writeVersion`, so it can never revert a
 	 * version set elsewhere (see `applyRuntime`).
 	 */
-	async function toggleRuntime() {
-		if (runtimeApplying || busy || runtimeEnvControlled || !runtimeRestartable) return;
+	async function toggleRuntime(e: Event) {
+		if (runtimeApplying || busy || runtimeEnvControlled || !runtimeRestartable) {
+			// The checkbox is one-way (`checked={runtimeEffectiveOn}`, no `bind:`), so a
+			// declined click leaves the DOM flipped over a preference that never moved -
+			// the control claiming work it did not do. Put it back before returning.
+			(e.currentTarget as HTMLInputElement).checked = runtimeEffectiveOn;
+			return;
+		}
 		runtimeApplying = true;
 		try {
 			await applyRuntime(!runtimeOn);
@@ -542,6 +548,17 @@
 	let status = $state<DbxStatus | null>(null);
 	let statusError = $state('');
 	let busy = $state(''); // 'connect' | 'disconnect' | 'logout' | 'login' | 'reconnect' | 'install' | 'upload' | ''
+	/**
+	 * The notebook the in-flight request was issued for, latched HERE - at the one
+	 * place `busy` is ever set - so all seven verbs are attributed, not just the two
+	 * that also start a view transition. Read by `ownedTransitionFlags`; kept apart
+	 * from `transitionPath`, which answers the different question the VIEW rule asks.
+	 */
+	let busyPath = $state<string | null | undefined>(undefined);
+	function beginBusy(verb: string) {
+		busy = verb;
+		busyPath = notebookPath;
+	}
 
 	const connection = $derived<DbxConnection>(status?.connection ?? { connected: false });
 	const connected = $derived(!!connection.connected);
@@ -896,6 +913,7 @@
 		notebookPath,
 		transitionPath,
 		busy,
+		busyPath,
 		connected,
 		restarting,
 		serverRestarting: !!connection.restarting,
@@ -1006,7 +1024,7 @@
 	// ---- Sign in (OAuth U2M via the SDK; only reached when auth needs a browser) ----
 	async function signIn() {
 		if (busy) return;
-		busy = 'login';
+		beginBusy('login');
 		authError = null;
 		// A fresh sign-in falsifies the log-out feedback as surely as a selection change
 		// does - and this path never runs `resetSelection`, so it has to drop it itself.
@@ -1066,7 +1084,7 @@
 
 	async function connect(cluster: DbxCluster) {
 		if (busy) return;
-		busy = 'connect';
+		beginBusy('connect');
 		// Latched BEFORE the await: from here on `connected` may honestly go false
 		// (a re-pin kernel restart), and this is what keeps the panel from unmounting
 		// around that frame. See `holdsConnectedView` in `$lib/databricksPanelState`.
@@ -1124,7 +1142,7 @@
 
 	async function disconnect() {
 		if (busy) return;
-		busy = 'disconnect';
+		beginBusy('disconnect');
 		connectError = null;
 		reconnectNote = '';
 		reconnectError = null;
@@ -1618,7 +1636,7 @@
 			}
 			affixes = { prefix: resolved.prefix, postfix: resolved.postfix };
 		}
-		busy = 'upload';
+		beginBusy('upload');
 		const seq = ++uploadSeq;
 		const target = notebookPath;
 		// The previous attempt's outcome is stale the moment a new one starts, but the
@@ -1723,7 +1741,7 @@
 	 */
 	async function logoutDatabricks() {
 		if (busy) return;
-		busy = 'logout';
+		beginBusy('logout');
 		clearLogoutFeedback();
 		clearUploadFeedback();
 		connectError = null;
@@ -1776,7 +1794,7 @@
 	 */
 	async function reconnect() {
 		if (busy) return;
-		busy = 'reconnect';
+		beginBusy('reconnect');
 		reconnectError = null;
 		reconnectNote = '';
 		try {
@@ -1804,7 +1822,7 @@
 
 	async function installDeps() {
 		if (busy) return;
-		busy = 'install';
+		beginBusy('install');
 		installError = null;
 		try {
 			const res = await fetch('/api/databricks/install', {
@@ -1959,22 +1977,28 @@
 	}
 
 	// A single muted "profile · host · spark" line replacing the connected card's
-	// former <dl> grid - shorter and calmer, still complete.
-	//
-	// The DBR is dropped while the card wears its connecting face: it is a property of
-	// the session, so during a switch it is the OUTGOING cluster's runtime rendered
-	// directly under an identity row that already reads "Connecting to <new cluster>…"
-	// - the same stale claim the `spark`/`w`-are-ready line was swapped out to avoid.
-	// The workspace half (profile · host) is what the connect targets and survives, so
-	// the line stays one line and the card keeps its height.
+	// former <dl> grid - shorter and calmer, still complete. The rule (and why the
+	// workspace half falls back) lives in `$lib/databricksPanelState`.
+	let lastProfile = $state<string | null>(null);
+	let lastHost = $state<string | null>(null);
+	$effect(() => {
+		const profile = connection.profile ?? null;
+		const host = connection.host ?? null;
+		if (!connected) return;
+		untrack(() => {
+			lastProfile = profile;
+			lastHost = host;
+		});
+	});
 	const connMeta = $derived(
-		[
-			connection.profile,
-			connection.host ? connection.host.replace(/^https?:\/\//, '') : null,
-			panel.connecting ? null : connection.sparkVersion
-		]
-			.filter(Boolean)
-			.join(' · ')
+		connectionMetaLine({
+			profile: connection.profile,
+			host: connection.host,
+			sparkVersion: connection.sparkVersion,
+			lastProfile,
+			lastHost,
+			connecting: panel.connecting
+		})
 	);
 
 	/** What the user should DO about a failure. The server's own message follows it. */
@@ -3099,7 +3123,7 @@
 							{switching ? 'Cancel' : 'Switch cluster'}
 						</button>
 						<button class="btn btn-outline btn-xs flex-1" onclick={disconnect} disabled={!!cardFlags.busy || cardFlags.runtimeApplying} data-testid="databricks-disconnect">
-							{#if busy === 'disconnect'}<span class="loading loading-spinner loading-xs"></span>{:else}Disconnect{/if}
+							{#if cardFlags.busy === 'disconnect'}<span class="loading loading-spinner loading-xs"></span>{:else}Disconnect{/if}
 						</button>
 					</div>
 					{@render logoutRow(true)}

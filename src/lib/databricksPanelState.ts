@@ -51,6 +51,15 @@ export interface DbxPanelInputs {
 	transitionPath: string | null | undefined;
 	/** The panel's in-flight verb (`''` when idle) - only `'connect'` matters here. */
 	busy: string;
+	/**
+	 * The notebook the in-flight REQUEST was issued for, latched where `busy` is
+	 * assigned (`undefined` while idle). Kept apart from `transitionPath` on purpose:
+	 * only `connect` and `applyRuntime` start a VIEW transition, while all seven verbs
+	 * hold `busy`, so attributing `busy` through `transitionPath` mis-credits the other
+	 * five to whichever notebook last started a transition - or, on a fresh reload, to
+	 * none at all, which silently unlocks the controls a request is holding.
+	 */
+	busyPath: string | null | undefined;
 	/** The server reports a live session. */
 	connected: boolean;
 	/**
@@ -116,20 +125,69 @@ function ownFlags(i: DbxPanelInputs) {
 }
 
 /**
+ * Is the panel's in-flight REQUEST about the notebook on screen? Asked of `busyPath`,
+ * never of `transitionPath`: five of the seven verbs start no view transition at all,
+ * so the two answer different questions and must keep their own latches.
+ */
+export function panelOwnsBusy(i: DbxPanelInputs): boolean {
+	return i.busyPath === i.notebookPath;
+}
+
+/**
  * The two panel-wide flags as the CARDS' CONTROLS may read them - the `disabled`
  * sibling of the view rule, asking the same ownership question so the two cannot
- * disagree about whose transition it is.
+ * disagree about whose work it is.
  *
  * Scoping only the view left a second connected notebook rendering a plain connected
  * card whose every control was greyed out with nothing saying why. A click there is
  * safe - `connect`/`disconnect`/`uploadToWorkspace`/`applyRuntime` each re-guard on
  * `busy`/`runtimeApplying`, so at worst the handler no-ops - and a live control whose
  * handler declines is honest in a way a mute grey one is not. For the notebook that
- * DOES own the transition these are the raw flags, byte for byte.
+ * OWNS the work these are the raw flags, byte for byte - which is what keeps the
+ * upload confirm's Cancel inert for the whole of its own replace, the invariant that
+ * stops a clobber already on the wire from being presented as an aborted one.
  */
 export function ownedTransitionFlags(i: DbxPanelInputs): { busy: string; runtimeApplying: boolean } {
-	const owned = panelOwnsTransition(i);
-	return { busy: owned ? i.busy : '', runtimeApplying: owned && i.runtimeApplying };
+	return {
+		busy: panelOwnsBusy(i) ? i.busy : '',
+		runtimeApplying: panelOwnsTransition(i) && i.runtimeApplying
+	};
+}
+
+/**
+ * The muted `profile · host · spark` line under the Cluster card's identity row.
+ *
+ * The DBR is dropped while the card wears its connecting face: it is a property of the
+ * SESSION, so during a switch it is the OUTGOING cluster's runtime sitting under a row
+ * that already reads "Connecting to <new cluster>…" - the stale claim the
+ * `spark`/`w`-are-ready line was swapped out to avoid.
+ *
+ * The workspace half falls back to the last connection that was really live, because
+ * the payload legitimately drops it: a re-pin kernel restart mid-switch reports the
+ * session lost, and that shape carries no top-level `profile`/`host`. Read straight
+ * from it the line came out EMPTY, its `{#if}` unmounted and the card lost a row
+ * mid-switch - the layout jump this whole task exists to remove, in the one frame the
+ * latch was built for. It is not a stale claim: a switch stays inside one workspace
+ * (`connectionParams()` sends no cluster at all), so it is the same profile and host
+ * the connect is targeting.
+ */
+export function connectionMetaLine(i: {
+	profile?: string | null;
+	host?: string | null;
+	sparkVersion?: string | null;
+	lastProfile?: string | null;
+	lastHost?: string | null;
+	connecting: boolean;
+}): string {
+	const profile = i.profile ?? (i.connecting ? i.lastProfile : null);
+	const host = i.host ?? (i.connecting ? i.lastHost : null);
+	return [
+		profile,
+		host ? host.replace(/^https?:\/\//, '') : null,
+		i.connecting ? null : i.sparkVersion
+	]
+		.filter(Boolean)
+		.join(' · ');
 }
 
 /**

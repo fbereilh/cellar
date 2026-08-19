@@ -3,8 +3,10 @@ import { readFileSync } from 'node:fs';
 import {
 	databricksPanelState,
 	expectedTransition,
+	connectionMetaLine,
 	holdsConnectedView,
 	ownedTransitionFlags,
+	panelOwnsBusy,
 	panelOwnsTransition,
 	type DbxPanelInputs
 } from '../../src/lib/databricksPanelState';
@@ -36,6 +38,7 @@ const IDLE: DbxPanelInputs = {
 	notebookPath: NB,
 	transitionPath: NB,
 	busy: '',
+	busyPath: NB,
 	connected: false,
 	restarting: false,
 	serverRestarting: false,
@@ -212,21 +215,109 @@ describe('a transition speaks only for the notebook it was latched for', () => {
 		});
 	});
 
-	it('silences the cards for EVERY verb, not just a connect', () => {
-		for (const busy of ['connect', 'disconnect', 'upload', 'reconnect']) {
-			const owner = { ...CONNECTED, busy };
+	/**
+	 * Every verb holds `busy`, but only `connect` and `applyRuntime` start a VIEW
+	 * transition - so `busy` is attributed through its OWN latch. Read through
+	 * `transitionPath` instead, the five other verbs were credited to whichever
+	 * notebook last started a transition, or to none at all.
+	 */
+	it('attributes EVERY verb to the notebook that issued it', () => {
+		for (const busy of ['login', 'connect', 'disconnect', 'upload', 'logout', 'reconnect', 'install']) {
+			// Issued here, and no view transition was ever started (a fresh reload).
+			const owner: DbxPanelInputs = { ...CONNECTED, busy, busyPath: NB, transitionPath: undefined };
+			expect(panelOwnsBusy(owner), busy).toBe(true);
 			expect(ownedTransitionFlags(owner).busy, busy).toBe(busy);
-			expect(ownedTransitionFlags({ ...owner, notebookPath: OTHER }).busy, busy).toBe('');
+			// Issued for another notebook: silenced here, whatever the view latch says.
+			expect(ownedTransitionFlags({ ...owner, busyPath: OTHER }).busy, busy).toBe('');
+			expect(ownedTransitionFlags({ ...owner, busyPath: OTHER, transitionPath: NB }).busy, busy).toBe('');
 		}
 	});
 
-	it('treats a panel that has never started a transition as owning nothing', () => {
-		// `transitionPath` starts `undefined`; a real `notebookPath` is never equal to it.
+	/**
+	 * The regression this latch exists for, as its own case: a reload leaves
+	 * `transitionPath` undefined, so a replace in flight on the notebook ON SCREEN
+	 * must still report busy - that is what keeps the upload confirm's Cancel inert
+	 * while the overwrite is on the wire.
+	 */
+	it('reports a replace in flight after a reload, so its Cancel stays inert', () => {
+		const replacing: DbxPanelInputs = {
+			...CONNECTED,
+			busy: 'upload',
+			busyPath: NB,
+			transitionPath: undefined
+		};
+		expect(ownedTransitionFlags(replacing).busy).toBe('upload');
+		// ...and the view is untouched by it: an upload is not a transition.
+		expect(databricksPanelState(replacing).view).toBe('connected');
+		expect(databricksPanelState(replacing).connecting).toBe(false);
+	});
+
+	it('treats a panel that has issued nothing as owning nothing', () => {
+		// Both latches start `undefined`; a real `notebookPath` is never equal to it.
 		expect(panelOwnsTransition({ ...IDLE, transitionPath: undefined })).toBe(false);
-		// A pathless panel (no notebook open) that starts a connect latches `null`, and
-		// that IS its own transition.
+		expect(panelOwnsBusy({ ...IDLE, busyPath: undefined })).toBe(false);
+		// A pathless panel (no notebook open) that starts one latches `null`, and that
+		// IS its own.
 		expect(panelOwnsTransition({ ...IDLE, notebookPath: null, transitionPath: null })).toBe(true);
+		expect(panelOwnsBusy({ ...IDLE, notebookPath: null, busyPath: null })).toBe(true);
 		expect(panelOwnsTransition({ ...IDLE, notebookPath: null, transitionPath: undefined })).toBe(false);
+		expect(panelOwnsBusy({ ...IDLE, notebookPath: null, busyPath: undefined })).toBe(false);
+	});
+});
+
+/**
+ * The Cluster card's muted `profile · host · spark` line. It shares the connecting
+ * face's honesty rule (the DBR belongs to the session, so it yields) and must not
+ * empty out in the one frame the whole task is about - a re-pin kernel restart
+ * mid-switch reports the session lost, and that payload carries no `profile`/`host`.
+ */
+describe('the connection meta line', () => {
+	const LIVE = {
+		profile: 'DEFAULT',
+		host: 'https://dbc-demo.cloud.databricks.com',
+		sparkVersion: '15.4.x-scala2.12',
+		lastProfile: 'DEFAULT',
+		lastHost: 'https://dbc-demo.cloud.databricks.com'
+	};
+
+	it('shows the whole line at rest, scheme stripped', () => {
+		expect(connectionMetaLine({ ...LIVE, connecting: false })).toBe(
+			'DEFAULT · dbc-demo.cloud.databricks.com · 15.4.x-scala2.12'
+		);
+	});
+
+	it('drops the outgoing session`s DBR while connecting', () => {
+		expect(connectionMetaLine({ ...LIVE, connecting: true })).toBe(
+			'DEFAULT · dbc-demo.cloud.databricks.com'
+		);
+	});
+
+	it('never empties mid-switch when the payload drops the workspace half', () => {
+		// The re-pin-restart frame: `connectionStatus()` reports the session lost, with
+		// no top-level profile/host. Empty here unmounts the row and jumps the card.
+		const midRestart = {
+			profile: undefined,
+			host: undefined,
+			sparkVersion: undefined,
+			lastProfile: LIVE.lastProfile,
+			lastHost: LIVE.lastHost,
+			connecting: true
+		};
+		expect(connectionMetaLine(midRestart)).toBe('DEFAULT · dbc-demo.cloud.databricks.com');
+	});
+
+	it('does NOT resurrect a workspace half once the transition is over', () => {
+		// Not connecting: nothing is being held, so the line reports only what is there.
+		expect(
+			connectionMetaLine({
+				profile: undefined,
+				host: undefined,
+				sparkVersion: undefined,
+				lastProfile: LIVE.lastProfile,
+				lastHost: LIVE.lastHost,
+				connecting: false
+			})
+		).toBe('');
 	});
 });
 
@@ -297,6 +388,7 @@ describe('exactly one view, and only the connected one carries a face', () => {
 												notebookPath,
 												transitionPath: NB,
 												busy,
+												busyPath: NB,
 												connected,
 												restarting,
 												serverRestarting,
