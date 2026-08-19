@@ -519,9 +519,23 @@ describe('the Runtime/Cluster cards report the same thing the agent is told', ()
 		expect(PANEL.split('{@render sdkDbutilsWarning()}').length - 1).toBe(4);
 	});
 
-	it('renders only for the OBSERVED foreign state, never for `unknown`', () => {
-		expect(SNIPPET).toContain('{#if runtimeSdkForeign}');
+	it('renders for an OBSERVED or a HELD foreign state, never for `unknown`', () => {
+		// The gate is WIDER than the observed reading alone: a transition that holds the
+		// Cluster card (an owned connect / runtime restart) carries a payload with no
+		// `sdkDbutils` verdict at all, so an observed-only gate unmounted this row for the
+		// length of the restart and sprang it back - the collapse the hold exists to stop.
+		// So it renders for the live verdict OR for the last-known-good one recorded for
+		// THIS notebook while the card holds.
+		expect(SNIPPET).toContain('{#if showSdkDbutilsWarning}');
+		expect(PANEL).toContain(
+			'runtimeSdkForeign || (sessionDetailFallback && lastSdkForeign)'
+		);
+		// Neither term can ever be `unknown`: both trace back to the ONE `=== 'foreign'`
+		// predicate - the held one is recorded FROM the observed one, never from the raw
+		// payload - so widening the gate did not widen what it may claim.
 		expect(PANEL).toContain("status?.runtime?.sdkDbutils === 'foreign'");
+		expect(PANEL).toContain('lastSdkForeign = sdkForeign;');
+		expect(PANEL).toContain('const sdkForeign = runtimeSdkForeign;');
 	});
 
 	it('keeps the warning TINT with readable copy (amber on amber is ~2:1 on the light card)', () => {
