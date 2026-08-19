@@ -31,7 +31,7 @@ import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
 import { canExportCell } from '../exportRole';
 import { resolveInWorkspace } from './fstree';
-import { isLogicalCellType, isPyUnsupportedType, languageTagFor, nbCellType, textNotebookCellTypeError } from '../cellLanguage';
+import { isLogicalCellType, isPyUnsupportedType, languageTagFor, logicalCellType, nbCellType, textNotebookCellTypeError } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
 import { normalizeRootPath, textNotebookRootError } from '../notebookRoot';
@@ -1093,6 +1093,7 @@ export function addCellAt(
 	assertCanHoldType(doc, cellType);
 	const cell = newCell(cellType, source);
 	if (role) cell.metadata.cellar.role = role;
+	assertCanHoldCell(doc, cell);
 	const at = Math.max(0, Math.min(index, doc.cells.length));
 	doc.cells.splice(at, 0, cell);
 	persist(doc);
@@ -1196,9 +1197,32 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
  * that caller's argument. Which types are refused lives in `cellLanguage.ts`, so
  * a sixth logical type is decided there once instead of here per writer. Every
  * other type is unaffected, and an `.ipynb` never reaches the throw.
+ *
+ * The CREATE paths ask it through `assertCanHoldCell` as well, about the cell
+ * they built rather than the type they were asked for - see below.
  */
 function assertCanHoldType(doc: NotebookDoc, cellType: LogicalCellType): void {
 	if (doc.jpFormat && isPyUnsupportedType(cellType)) throw textNotebookCellTypeError(cellType);
+}
+
+/**
+ * The same refusal asked of a BUILT cell rather than of a requested type - what
+ * every CREATE path ends with, because the requested type is not the only thing
+ * that decides what a new cell IS.
+ *
+ * A logical type can be carried by the `cellar` namespace (`chat` and `sql` are
+ * tagged code cells), and `addCell` takes such a namespace from its caller and
+ * seeds it (`seedCellar`, whose `DURABLE_CELLAR_KEYS` includes `language`). So
+ * `cellType:'code'` plus `cellar:{language:'chat'}` passed the type guard and
+ * still produced a chat cell - on a `.py` document, exactly the state the guard
+ * refuses. Asking the cell itself closes that by construction: a caller-supplied
+ * namespace can never produce a cell state the `cellType` argument would have
+ * been refused for, and a sixth logical type carried the same way inherits the
+ * rule instead of needing a check of its own. Called before the cell is spliced
+ * in, so a refusal still writes nothing.
+ */
+function assertCanHoldCell(doc: NotebookDoc, cell: Cell): void {
+	assertCanHoldType(doc, logicalCellType(cell));
 }
 
 /**
@@ -1220,6 +1244,7 @@ export function addCell(
 	assertCanHoldType(doc, cellType);
 	const cell = newCell(cellType, source);
 	seedCellar(doc, cell, cellar);
+	assertCanHoldCell(doc, cell);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
 	if (idx >= 0) doc.cells.splice(idx + 1, 0, cell);
 	else doc.cells.push(cell);

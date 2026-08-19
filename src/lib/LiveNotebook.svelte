@@ -51,7 +51,7 @@
 	import type { ClientEvent } from '$lib/events-client';
 	import type { Folding } from '$lib/headings';
 	import type { StalenessMap } from '$lib/staleness';
-	import { codeIdsAll, codeIdsAbove } from '$lib/runTargets';
+	import { chatSkipNotice, runTargets, runTargetsAbove, type RunTargets } from '$lib/runTargets';
 	import type { ClipboardCell } from '$lib/cellClipboard';
 
 	interface Props {
@@ -2055,14 +2055,25 @@
 		}
 		refreshStaleness();
 	}
-	function codeIdsInRange(from: number, to: number): string[] {
-		return codeIdsAll(cells.slice(from, to));
+	/**
+	 * Drive one bulk selection: run what it selected, and SAY what it left alone.
+	 * `$lib/runTargets` owns which cells a bulk run skips (chat cells - see its
+	 * header); this is the half that has the notice channel, so every bulk action
+	 * reports through here rather than each deciding for itself whether to
+	 * mention the skip.
+	 */
+	function runSelection(sel: RunTargets) {
+		if (sel.chatSkipped.length) onNotice?.(chatSkipNotice(sel.chatSkipped.length));
+		return runCodeIds(sel.ids);
+	}
+	function targetsInRange(from: number, to: number): RunTargets {
+		return runTargets(cells.slice(from, to));
 	}
 	/** Run every code cell above the selected one (exclusive). */
 	function runAbove() {
 		const i = cells.findIndex((c) => c.id === activeId);
 		if (i < 0) return;
-		runCodeIds(codeIdsInRange(0, i));
+		runSelection(targetsInRange(0, i));
 	}
 	/**
 	 * Run every code cell above `id` (exclusive), in document order — the per-cell
@@ -2071,15 +2082,20 @@
 	 * A no-op on the first cell (nothing above).
 	 */
 	function runAboveCell(id: string) {
-		runCodeIds(codeIdsAbove(cells, id));
+		runSelection(runTargetsAbove(cells, id));
 	}
 	/** Run the selected cell and every code cell below it (Jupyter's "run all below"). */
 	function runBelow() {
 		const i = cells.findIndex((c) => c.id === activeId);
 		if (i < 0) return;
-		runCodeIds(codeIdsInRange(i, cells.length));
+		runSelection(targetsInRange(i, cells.length));
 	}
-	/** Run every STALE code cell, in document (dependency) order — clears staleness. */
+	/**
+	 * Run every STALE code cell, in document (dependency) order — clears staleness.
+	 * It needs no chat filter of its own: a chat cell's staleness is `n/a`, so it
+	 * is never in this list (the same reason MCP's `run_stale` inherits the batch
+	 * exclusion for free).
+	 */
 	function runStale() {
 		runCodeIds(cells.filter((c) => staleness[c.id]?.state === 'stale').map((c) => c.id));
 	}
@@ -3474,7 +3490,7 @@
 	// interrupt (`interruptGeneration`) so an interrupt stops the whole batch. Both
 	// the top-of-notebook button and the palette "Run all cells" call this.
 	function runAll() {
-		runCodeIds(codeIdsAll(cells));
+		runSelection(runTargets(cells));
 	}
 
 	// Clear every cell's outputs. Palette "Clear all outputs" and the top toolbar's

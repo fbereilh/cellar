@@ -105,6 +105,32 @@ describe('a .py notebook cannot hold a chat cell', () => {
 		expect(pyIds().length).toBe(before);
 	});
 
+	it('refuses a chat cell SEEDED through the cellar namespace, not just the type argument', () => {
+		// The logical type can ride `cellar.language` instead of the cellType
+		// argument, and `addCell` seeds a caller-supplied namespace - so a
+		// guard that only reads the argument admits exactly the cell it refuses.
+		const before = pyIds().length;
+		const seed = () => nbmod.addCell(null, 'code', PY, null, 'Why did this fail?', { language: 'chat' });
+		expect(seed).toThrow(TextNotebookCellTypeError);
+		expect(seed).toThrow(/\.py notebook cannot hold a chat cell/i);
+		expect(pyIds().length).toBe(before);
+		expect(nbmod.listCells(PY).every((c) => c.metadata?.cellar?.language !== 'chat')).toBe(true);
+		expect(readFileSync(PY, 'utf8')).not.toMatch(/Why did this fail/);
+	});
+
+	it('still seeds every OTHER durable key on a .py notebook (the guard is type-scoped)', () => {
+		const before = pyIds().length;
+		const cell = nbmod.addCell(null, 'code', PY, null, 'select 1', {
+			language: 'sql',
+			hide_input: true,
+			output_scrolled: true
+		});
+		expect(pyIds().length).toBe(before + 1);
+		expect(cell.metadata?.cellar?.language).toBe('sql');
+		expect(cell.metadata?.cellar?.hide_input).toBe(true);
+		expect(cell.metadata?.cellar?.output_scrolled).toBe(true);
+	});
+
 	it('leaves every OTHER conversion allowed, and CLEARING back to code untouched', () => {
 		const id = pyIds()[0];
 		for (const type of ['markdown', 'sql', 'code'] as const) nbmod.setCellType(id, type, PY);
@@ -120,6 +146,21 @@ describe('the REST route reports the chat refusal in the shape the browser resyn
 	beforeAll(async () => {
 		PATCH = (await import('../../src/routes/api/cells/[id]/+server.js')).PATCH as unknown as typeof PATCH;
 		ADD = (await import('../../src/routes/api/cells/+server.js')).POST as unknown as typeof ADD;
+	});
+
+	it('POST refuses a chat cell smuggled in as a seeded cellar namespace', async () => {
+		const before = pyIds().length;
+		const res = await ADD({
+			request: new Request('http://x/api/cells', {
+				method: 'POST',
+				body: JSON.stringify({ cellType: 'code', nb: PY, source: 'q', cellar: { language: 'chat' } })
+			})
+		});
+		expect(res.status).toBe(400);
+		const payload = await res.json();
+		expect(payload.reason).toBe('chat-in-py-notebook');
+		expect(payload.message).toBe(TEXT_NOTEBOOK_CHAT_MESSAGE);
+		expect(pyIds().length).toBe(before);
 	});
 
 	it('PATCH and POST answer 400 carrying the chat reason and the shared message', async () => {
@@ -144,6 +185,13 @@ describe('the REST route reports the chat refusal in the shape the browser resyn
 });
 
 describe('an .ipynb notebook is completely unaffected', () => {
+	it('accepts a chat cell seeded through the cellar namespace (undo-delete restores one)', () => {
+		const cell = nbmod.addCell(null, 'code', IPYNB, null, 'Why?', { language: 'chat' });
+		expect(cell.metadata?.cellar?.language).toBe('chat');
+		const onDisk = JSON.parse(readFileSync(IPYNB, 'utf8')) as { cells: Array<{ metadata?: { cellar?: { language?: string } } }> };
+		expect(onDisk.cells.some((c) => c.metadata?.cellar?.language === 'chat')).toBe(true);
+	});
+
 	it('creates and converts a chat cell, and the tag survives to disk', () => {
 		const created = nbmod.addCell(null, 'chat', IPYNB);
 		expect(created.metadata?.cellar?.language).toBe('chat');
