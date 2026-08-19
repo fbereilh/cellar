@@ -225,9 +225,15 @@ describe('sign-in lifecycle (server-run browser flow)', () => {
 		const state0 = auth.startChatLogin('fresh');
 		expect(state0.running).toBe(true);
 		// The BROWSER stub's captured URL surfaces for the panel to render...
+		// The two URLs arrive through DIFFERENT channels and so land at different
+		// times - `browserUrl` is read back from the stub's file the instant the CLI
+		// invokes it, `pasteUrl` only once that child's stdout reaches us - so a
+		// state carrying one and not the other is a real, observable window (measured:
+		// ~300ms wide here). Waiting on EITHER settles inside it and then asserts the
+		// other, which is the flake; wait for the state both assertions are about.
 		const withUrl = await until(
 			() => auth.chatLoginStatus(state0.id),
-			(s) => !!s && (!!s.browserUrl || !!s.pasteUrl)
+			(s) => !!s && !!s.browserUrl && !!s.pasteUrl
 		);
 		expect(withUrl?.browserUrl).toBe('https://stub.example/oauth/authorize?client=cellar');
 		expect(withUrl?.pasteUrl).toBe('https://stub.example/paste');
