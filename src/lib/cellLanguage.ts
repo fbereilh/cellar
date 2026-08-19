@@ -22,10 +22,24 @@
  * Cellar already wrote to disk (`ipynb.ts` passes a foreign type through
  * verbatim) long before it was a type the UI could choose.
  *
- * This module is the single source of truth for "is this a SQL cell", for the
- * four-way LOGICAL cell type the UI toggle + MCP tools speak (`code` / `sql` /
- * `markdown` / `raw`), and for the ONE mapping back onto nbformat (`nbCellType`),
- * shared by the server and the browser so the two never disagree.
+ * A CHAT cell follows the SQL shape exactly: an nbformat `code` cell tagged
+ * `metadata.cellar.language = 'chat'`, whose source is a QUESTION for the AI and
+ * whose reply is a `display_data` output carrying `text/markdown` (a native
+ * nbformat mime, so plain Jupyter renders the reply too). Two costs are ACCEPTED
+ * and must not be "fixed" later:
+ *   - **A chat reply is nondeterministic, so re-running a chat cell always
+ *     produces a git diff.** Every other cell type re-runs to identical bytes
+ *     (the zero-git-diff doctrine); a model reply cannot, and the alternative -
+ *     not persisting it - would lose the reply on reload and contradict the
+ *     reply-as-output design. The diff is the price of a durable reply.
+ *   - **In plain Jupyter a chat cell is a code cell holding English prose**:
+ *     it renders fine as a document, but running it there raises `SyntaxError` -
+ *     the same interop trade already accepted for SQL cells.
+ *
+ * This module is the single source of truth for "is this a SQL/chat cell", for
+ * the five-way LOGICAL cell type the UI toggle + MCP tools speak (`code` / `sql`
+ * / `markdown` / `raw` / `chat`), and for the ONE mapping back onto nbformat
+ * (`nbCellType`), shared by the server and the browser so the two never disagree.
  */
 
 import type { CellMetadata, CellType, LogicalCellType } from '$lib/server/types';
@@ -40,14 +54,29 @@ type LanguageCell = { cell_type?: string; metadata?: CellMetadata | null } | nul
 /** The `cellar.language` value that marks a code cell as SQL. */
 export const SQL_LANGUAGE = 'sql';
 
-/** The editor language of a code cell: 'sql' when tagged, else 'python'. */
-export function cellLanguage(cell: LanguageCell): 'sql' | 'python' {
-	return cell?.metadata?.cellar?.language === SQL_LANGUAGE ? SQL_LANGUAGE : 'python';
+/** The `cellar.language` value that marks a code cell as an AI chat cell. */
+export const CHAT_LANGUAGE = 'chat';
+
+/** The editor language of a code cell: 'sql'/'chat' when tagged, else 'python'. */
+export function cellLanguage(cell: LanguageCell): 'sql' | 'chat' | 'python' {
+	const tag = cell?.metadata?.cellar?.language;
+	if (tag === SQL_LANGUAGE) return SQL_LANGUAGE;
+	if (tag === CHAT_LANGUAGE) return CHAT_LANGUAGE;
+	return 'python';
 }
 
 /** True for a code cell whose source is SQL (`cellar.language === 'sql'`). */
 export function isSqlCell(cell: LanguageCell): boolean {
 	return cell?.cell_type === 'code' && cellLanguage(cell) === SQL_LANGUAGE;
+}
+
+/**
+ * True for a code cell whose source is a chat QUESTION (`cellar.language ===
+ * 'chat'`). Run through the chat engine (`server/chat/`), never the kernel;
+ * excluded from the Python dataflow probe and from staleness (reports `n/a`).
+ */
+export function isChatCell(cell: LanguageCell): boolean {
+	return cell?.cell_type === 'code' && cellLanguage(cell) === CHAT_LANGUAGE;
 }
 
 /**
@@ -68,7 +97,7 @@ export function isRawCell(cell: LanguageCell): boolean {
  * typo would silently turn a raw cell holding frontmatter into a runnable
  * Python cell.
  */
-export const LOGICAL_CELL_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'markdown', 'raw'];
+export const LOGICAL_CELL_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'markdown', 'raw', 'chat'];
 
 /**
  * Is `value` one of the four logical cell types? The predicate every entry point
@@ -128,7 +157,20 @@ export function textNotebookRawCellError(): RawCellTypeError {
 export function nbCellType(cellType: LogicalCellType): CellType {
 	if (cellType === 'markdown') return 'markdown';
 	if (cellType === 'raw') return 'raw';
-	return 'code';
+	return 'code'; // 'code', 'sql' and 'chat' all share the nbformat code type
+}
+
+/**
+ * The `cellar.language` tag a LOGICAL type carries on disk: 'sql' and 'chat' are
+ * tagged code cells, everything else carries no tag. The ONE tag rule, shared by
+ * the server's `applyCellType`/`newCell`, the `cell:type` event payload, and the
+ * browser's `applyCellTypeLocally` - a per-site `isSql ? 'sql' : null` ternary is
+ * how the chat tag would be dropped by whichever copy was not updated.
+ */
+export function languageTagFor(cellType: LogicalCellType): string | null {
+	if (cellType === 'sql') return SQL_LANGUAGE;
+	if (cellType === 'chat') return CHAT_LANGUAGE;
+	return null;
 }
 
 /**
@@ -143,7 +185,8 @@ export function nbCellType(cellType: LogicalCellType): CellType {
 export function logicalCellType(cell: LanguageCell): LogicalCellType {
 	if (cell?.cell_type === 'markdown') return 'markdown';
 	if (isRawCell(cell)) return 'raw';
-	return isSqlCell(cell) ? 'sql' : 'code';
+	if (isSqlCell(cell)) return 'sql';
+	return isChatCell(cell) ? 'chat' : 'code';
 }
 
 /**

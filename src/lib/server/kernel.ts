@@ -30,6 +30,7 @@ import { basename, sep } from 'node:path';
 import { KernelManager, ServerConnection, CommsOverSubshells, KernelAPI } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue } from './run-queue';
+import { abortChatRuns } from './chat/active';
 import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from './notebook';
 import { workspaceRoot } from './fstree';
 import { addProjectRootToPath, injectDatabricksRuntime, databricksRuntimeVersion } from './ui-state';
@@ -1546,8 +1547,10 @@ export async function shutdownKernelsUnder(deletedPath: string): Promise<number>
 export async function restartKernel(nbPath?: string | null) {
 	const abs = resolveNb(nbPath);
 	// Drop this notebook's pending runs BEFORE the restart is issued, so nothing can
-	// dequeue into the kernel that is about to lose its namespace.
+	// dequeue into the kernel that is about to lose its namespace. A live chat run
+	// (which holds no kernel) is aborted too, before the no-kernel early return.
 	clearRunQueue(abs, 'kernel_restart');
+	abortChatRuns(abs);
 	const nbKernel = kernels.get(abs);
 	if (!nbKernel) return { status: 'not_started', id: null, session_id: null };
 	// Force-abort the ACTIVE run too: `clearRunQueue` drops only pending, so a run
@@ -1617,8 +1620,10 @@ async function teardownKernel(
 	kernels.delete(nbPath);
 	// The process is going away; abort any run awaiting its reply so its slot frees,
 	// then drop pending runs (submitted against a namespace that is about to vanish).
+	// Chat runs hold no kernel but are stopped by the same door.
 	abortActiveRuns(nbKernel, reason);
 	clearRunQueue(nbPath, reason);
+	abortChatRuns(nbPath);
 	const conn = nbKernel.connection;
 	if (conn) {
 		try {
@@ -1795,6 +1800,9 @@ export async function rebindKernel(nbPath?: string | null) {
 export async function interruptKernel(nbPath?: string | null) {
 	const abs = resolveNb(nbPath);
 	clearRunQueue(abs, 'kernel_interrupt');
+	// A chat run holds no kernel, so nothing below can reach it: abort its child
+	// here, BEFORE the no-kernel early return - "stop" must stop a chat cell too.
+	abortChatRuns(abs);
 	const nbKernel = kernels.get(abs);
 	if (!nbKernel) return { status: 'not_started', id: null };
 	const kernel = await nbKernel.startPromise;

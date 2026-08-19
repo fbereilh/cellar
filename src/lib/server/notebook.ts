@@ -31,7 +31,7 @@ import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
 import { canExportCell } from '../exportRole';
 import { resolveInWorkspace } from './fstree';
-import { SQL_LANGUAGE, isLogicalCellType, nbCellType, textNotebookRawCellError } from '../cellLanguage';
+import { isLogicalCellType, languageTagFor, nbCellType, textNotebookRawCellError } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
 import { normalizeRootPath, textNotebookRootError } from '../notebookRoot';
@@ -117,16 +117,17 @@ function starterCell(): Cell {
 }
 
 function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCellar {
-	// 'sql' is a LOGICAL type: an nbformat `code` cell tagged cellar.language='sql'
-	// (see $lib/cellLanguage.js). code/markdown/raw are nbformat types of their
-	// own, and `nbCellType` is the ONE mapping.
-	const isSql = cellType === 'sql';
+	// 'sql'/'chat' are LOGICAL types: an nbformat `code` cell tagged
+	// cellar.language (see $lib/cellLanguage.js, whose `languageTagFor` is the ONE
+	// tag rule). code/markdown/raw are nbformat types of their own, and
+	// `nbCellType` is the ONE mapping.
+	const lang = languageTagFor(cellType);
 	const cell: CellWithCellar = {
 		id: mintId(),
 		cell_type: nbCellType(cellType),
 		source: typeof source === 'string' ? source : '',
 		outputs: [],
-		metadata: { cellar: { extract: false, visible: true, ...(isSql ? { language: SQL_LANGUAGE } : {}) } }
+		metadata: { cellar: { extract: false, visible: true, ...(lang ? { language: lang } : {}) } }
 	};
 	// A cell born WITH a source (paste / split / undo-delete) introduces every
 	// binding it holds right now, so it is stamped here for the same reason
@@ -1246,14 +1247,14 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
 	if (!cell) return;
 	applyCellType(cell, cellType);
 	persist(doc);
-	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: cellType === 'sql' ? SQL_LANGUAGE : null }, originId);
+	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: languageTagFor(cellType) }, originId);
 }
 
 /**
  * The in-place half of a type switch, shared by the single-cell setter and the
  * `setCellTypes` batch so the two can never diverge on the metadata rules: any
  * non-code type (markdown, raw) clears outputs, and anything holding no Python
- * (those two plus SQL) drops the imports role and the nbdev export flag.
+ * (those two plus SQL and chat) drops the imports role and the nbdev export flag.
  *
  * `LiveNotebook.applyCellTypeLocally` is the browser's copy of exactly these
  * rules - `cell:type` carries no metadata, so a client half that skipped one
@@ -1265,7 +1266,7 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
  * fetches `/api/notebooks/staleness`), so there is nothing there to keep in step.
  */
 function applyCellType(cell: Cell, cellType: LogicalCellType): void {
-	const isSql = cellType === 'sql';
+	const lang = languageTagFor(cellType);
 	const wasCode = cell.cell_type === 'code';
 	cell.cell_type = nbCellType(cellType);
 	cell.metadata = cell.metadata ?? {};
@@ -1284,11 +1285,12 @@ function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	if (!wasCode && cell.cell_type === 'code' && !cell.metadata.cellar.importBindings) {
 		setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
 	}
-	if (isSql) cell.metadata.cellar.language = SQL_LANGUAGE;
+	if (lang) cell.metadata.cellar.language = lang;
 	else delete cell.metadata.cellar.language;
 	// A cell the kernel actually executes as Python. Markdown and raw never reach
-	// it at all; SQL reaches it compiled, so it holds no Python either.
-	const runnable = cell.cell_type === 'code' && !isSql;
+	// it at all; SQL reaches it compiled, so it holds no Python either; a CHAT
+	// cell's source is prose the kernel never sees.
+	const runnable = cell.cell_type === 'code' && !lang;
 	// Only a code cell holds outputs - markdown and raw carry none, and
 	// `serialize` would drop them anyway.
 	if (cell.cell_type !== 'code') cell.outputs = [];
@@ -1329,7 +1331,6 @@ export function setCellTypes(
 	// never be left half-retyped - and, because nothing is changed, the caller's
 	// `changed` count can never report a refused cell as converted.
 	assertCanHoldRaw(doc, cellType);
-	const isSql = cellType === 'sql';
 	const changed: Cell[] = [];
 	for (const id of ids) {
 		const cell = find(doc, id);
@@ -1341,7 +1342,7 @@ export function setCellTypes(
 	if (!changed.length) return [];
 	persist(doc);
 	for (const cell of changed) {
-		emit(doc, 'cell:type', { cellId: cell.id, cell_type: cell.cell_type, language: isSql ? SQL_LANGUAGE : null }, originId);
+		emit(doc, 'cell:type', { cellId: cell.id, cell_type: cell.cell_type, language: languageTagFor(cellType) }, originId);
 	}
 	return changed.map((c) => c.id);
 }

@@ -1,0 +1,69 @@
+/**
+ * Cellar - the ChatEngine seam.
+ *
+ * One interface between "run this chat cell" and whatever produces the reply.
+ * Today the one implementation is the claude CLI (`claude-cli.ts`); the seam
+ * exists so a future engine (a direct API client, another CLI) is a second
+ * implementation of THIS interface rather than a second run path - and so unit
+ * tests can drive the whole chat run pipeline (transcript -> accumulator ->
+ * persist -> run:end) against a scripted engine with no CLI installed.
+ *
+ * The engine's contract is deliberately narrow: one prompt in, streamed text
+ * deltas out, one settled result. It knows nothing about notebooks, cells,
+ * accumulators or events - `run-chat.ts` owns that glue.
+ */
+
+import type { ChatFailureKind } from '$lib/chatCell';
+import { claudeCliEngine } from './claude-cli';
+
+/** Arguments for one engine run. */
+export interface ChatEngineRunArgs {
+	/** The full prompt (transcript + question), already built and byte-stable. */
+	prompt: string;
+	/** The slot's `CLAUDE_CONFIG_DIR`, or null for the ambient default login. */
+	configDir: string | null;
+	/** Aborted by interrupt / kernel restart / shutdown; the engine must kill its work. */
+	signal: AbortSignal;
+	/** Streamed reply text, in order, as it is produced. */
+	onDelta: (text: string) => void;
+}
+
+/** Why a run failed, in the shared failure vocabulary plus a human detail line. */
+export interface ChatEngineFailure {
+	kind: ChatFailureKind;
+	/** Engine-reported detail (safe to render; never a credential). */
+	message: string;
+	/** For `rate_limited`: when the window resets (epoch SECONDS), if reported. */
+	resetsAt?: number;
+}
+
+/** One settled engine run. */
+export interface ChatEngineResult {
+	ok: boolean;
+	failure: ChatEngineFailure | null;
+	/** Engine identity for provenance, e.g. `claude-cli/2.1.235` (null if unknown). */
+	engine: string | null;
+	/**
+	 * The full reply text as the engine's own final result reported it - the
+	 * fallback for a run that streamed no deltas; normally the deltas already
+	 * carried every byte of it.
+	 */
+	replyText: string | null;
+}
+
+/** The seam. */
+export interface ChatEngine {
+	run(args: ChatEngineRunArgs): Promise<ChatEngineResult>;
+}
+
+let testEngine: ChatEngine | null = null;
+
+/** The engine chat runs use (the claude CLI, unless a test scripted one). */
+export function chatEngine(): ChatEngine {
+	return testEngine ?? claudeCliEngine;
+}
+
+/** Test seam: script the engine (pass null to restore the real one). */
+export function __setChatEngineForTests(engine: ChatEngine | null): void {
+	testEngine = engine;
+}
