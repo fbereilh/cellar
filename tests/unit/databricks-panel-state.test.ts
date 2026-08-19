@@ -651,7 +651,7 @@ describe('source guards: the panel really asks the shared rule', () => {
 		// seven verbs are covered; the restart keeps its own, so the two cannot collide.
 		for (const [fn, latch] of [
 			['function beginBusy(', 'busyPath = notebookPath'],
-			['async function applyRuntime(', 'transitionPath = notebookPath']
+			['async function applyRuntime(', 'transitionPath = target']
 		]) {
 			const at = SRC.indexOf(fn);
 			expect(at, fn).toBeGreaterThan(-1);
@@ -664,12 +664,37 @@ describe('source guards: the panel really asks the shared rule', () => {
 	});
 
 	/**
+	 * `applyRuntime` awaits one `setUiNow` PUT (two for a version edit) between its latch
+	 * and the restart it issues, and `notebookPath` follows the ACTIVE TAB - so any read
+	 * of the live prop after the capture answers for whichever notebook the user tabbed
+	 * to, restarting that one's kernel while attributing the transition to the one they
+	 * left. The `uploadToWorkspace` idiom is to capture once and never look again, so
+	 * that is what is pinned: past the capture the function names only `target`.
+	 */
+	it('reads the notebook it captured, never the live prop, after its first await', () => {
+		const at = SRC.indexOf('async function applyRuntime(');
+		expect(at).toBeGreaterThan(-1);
+		const body = SRC.slice(at, SRC.indexOf('\n\t}', at));
+		const capture = body.indexOf('const target = notebookPath');
+		expect(capture).toBeGreaterThan(-1);
+		expect(body.indexOf('await ')).toBeGreaterThan(capture);
+		// Comments explain the rule by naming the prop, so only CODE lines are read.
+		const after = body
+			.slice(capture + 'const target = notebookPath'.length)
+			.split('\n')
+			.filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*'))
+			.join('\n');
+		expect(after).not.toContain('notebookPath');
+		expect(after).toContain('onRestartKernel(target)');
+	});
+
+	/**
 	 * Each latch has exactly ONE writer, which is what makes them independent: shared,
 	 * a connect on one notebook inherited a runtime restart still settling on another.
 	 */
 	it('gives each latch a single writer', () => {
 		const writers = (name: string) =>
-			SRC.split('\n').filter((l) => new RegExp(`(?<!let )\\b${name} = `).test(l)).length;
+			SRC.split('\n').filter((l) => new RegExp(`(?<!let )\\b${name} = [^=]`).test(l)).length;
 		expect(writers('transitionPath')).toBe(1);
 		expect(writers('busyPath')).toBe(1);
 	});

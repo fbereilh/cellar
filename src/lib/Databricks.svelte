@@ -380,9 +380,13 @@
 	 * the ADVERTISEMENT only; whatever version is stored is the one it applies.
 	 */
 	async function applyRuntime(on: boolean, { writeVersion = false } = {}): Promise<void> {
-		// Whose restart this is, for the same reason `connect` latches it: the panel
-		// follows the active tab, the restart does not follow with it.
-		transitionPath = notebookPath;
+		// Whose restart this is, captured ONCE - the `uploadToWorkspace` idiom - and used
+		// for the latch, the guard and the restart alike. `setUiNow` awaits a real PUT
+		// (two of them for a version edit), and `notebookPath` follows the active tab, so
+		// re-reading the prop after those awaits restarts whichever notebook the user
+		// tabbed to while attributing the transition to the one they left.
+		const target = notebookPath;
+		transitionPath = target;
 		runtimeOn = on; // optimistic
 		await setUiNow(DBX_RUNTIME_KEY, on);
 		if (writeVersion) {
@@ -392,12 +396,12 @@
 			// the restarted kernel really carries.
 			appliedVersion = v || DBX_RUNTIME_VERSION_DEFAULT;
 		}
-		if (onRestartKernel && notebookPath) {
+		if (onRestartKernel && target) {
 			// Mark the expected-restart window BEFORE issuing it, so the transient
 			// mid-restart "session lost" the epoch bump reports is read as "connecting",
 			// never "lost". `settleConnection` clears it once the session settles.
 			restarting = true;
-			await onRestartKernel(notebookPath);
+			await onRestartKernel(target);
 		}
 	}
 
@@ -434,6 +438,12 @@
 	function onVersionInput(e: Event) {
 		// Reflect + persist as the user types; the actual apply (kernel restart) is
 		// deferred to blur/Enter so a keystroke can't restart the kernel per character.
+		//
+		// Guarded on the RAW panel-wide flags, exactly as `commitVersion` is: this is the
+		// one control in the card family whose edit leaves DURABLE state behind (the
+		// workspace-wide version preference), so a keystroke that lands while an apply it
+		// cannot trigger is in flight would persist a version nothing restarts onto.
+		if (runtimeApplying || busy) return;
 		const v = (e.currentTarget as HTMLInputElement).value.trim();
 		runtimeVersion = v;
 		setUi(DBX_RUNTIME_VERSION_KEY, v === '' ? null : v);
@@ -934,9 +944,11 @@
 	 * ownership question the view above asks, so the two cannot disagree about whose
 	 * transition it is. The rule and its reasoning live in `$lib/databricksPanelState`.
 	 *
-	 * Deliberately NOT applied to the picker, sign-in, install, reconnect or log-out
-	 * controls: those sit outside the connected card family (log out is app-wide), so
-	 * the second-connected-notebook state this exists for cannot arise there.
+	 * Deliberately NOT applied to the picker, sign-in, install or reconnect controls:
+	 * those sit outside the connected card family, so the second-connected-notebook
+	 * state this exists for cannot arise there. Log out DOES render inside the connected
+	 * card and stays on the raw flags for a different reason: it is app-wide, so a
+	 * panel-wide `busy` genuinely blocks it and disabling it is the honest reading.
 	 */
 	const cardFlags = $derived(ownedTransitionFlags(panelInputs));
 	/** Does the in-flight request belong to the notebook on screen? */
@@ -2804,7 +2816,16 @@
 			<!-- Under CELLAR_DATABRICKS_RUNTIME_VERSION the field shows the version really in
 			     force and takes no edits: committing one would restart the kernel - clearing
 			     the namespace - to advertise a value the override discards. Same for a missing
-			     notebook, where the apply-restart is skipped outright. -->
+			     notebook, where the apply-restart is skipped outright.
+
+			     This ONE control keeps the RAW panel-wide flags where its siblings are
+			     notebook-scoped, and the difference is what its edit costs: a button whose
+			     handler declines is a visual no-op, while a keystroke here persists the
+			     workspace-wide version preference and only THEN finds the blur's
+			     `commitVersion` declining, leaving a stored version nothing restarted onto
+			     and no obvious route to apply it. A disabled field claims nothing, so
+			     disabling is the honest reading when the control genuinely cannot do its
+			     work. `onVersionInput` re-guards on the same flags as defence in depth. -->
 			<label class="mt-1.5 flex items-center gap-2 text-[11px] text-base-content/50">
 				<span class="shrink-0">version</span>
 				<input
@@ -2815,7 +2836,7 @@
 					onchange={commitVersion}
 					onkeydown={(e) => { if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur(); }}
 					placeholder={DBX_RUNTIME_VERSION_DEFAULT}
-					disabled={cardFlags.runtimeApplying || runtimeVersionEnvControlled || !runtimeRestartable}
+					disabled={runtimeApplying || !!busy || runtimeVersionEnvControlled || !runtimeRestartable}
 					title={runtimeVersionEnvControlled
 						? 'Set by the CELLAR_DATABRICKS_RUNTIME_VERSION environment variable, which overrides this setting.'
 						: !runtimeRestartable
