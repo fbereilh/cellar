@@ -130,12 +130,12 @@ describe('a transition speaks only for the notebook it was latched for', () => {
 		...CONNECTED,
 		busy: 'connect',
 		connectOverLive: true,
-		transitionPath: NB
+		busyPath: NB
 	};
 
 	it('does not hold a connected view over a notebook with no session of its own', () => {
 		const moved: DbxPanelInputs = { ...switchInFlight, notebookPath: OTHER, connected: false };
-		expect(panelOwnsTransition(moved)).toBe(false);
+		expect(panelOwnsBusy(moved)).toBe(false);
 		expect(holdsConnectedView(moved)).toBe(false);
 		expect(expectedTransition(moved)).toBe(false);
 		expect(databricksPanelState(moved).view).toBe('picker');
@@ -250,6 +250,50 @@ describe('a transition speaks only for the notebook it was latched for', () => {
 		// ...and the view is untouched by it: an upload is not a transition.
 		expect(databricksPanelState(replacing).view).toBe('connected');
 		expect(databricksPanelState(replacing).connecting).toBe(false);
+	});
+
+	/**
+	 * The two latches answer different questions, so they may not be shared. With ONE,
+	 * a connect on B inherited a runtime restart still running on A: B's own connect
+	 * wore the "restarting" badge, and A - having lost the latch - fell back to the
+	 * standalone connecting card or a spurious "lost", i.e. the collapse this module
+	 * exists to prevent, reached from both ends at once.
+	 */
+	it('a connect elsewhere cannot steal an in-flight runtime restart', () => {
+		// A flipped the Runtime toggle: its restart is latched and still settling.
+		const restartOnA = { restarting: true, runtimeApplying: true, transitionPath: NB };
+		// ...and B, whose controls were live because it owns none of that, connects.
+		const connectOnB: DbxPanelInputs = {
+			...CONNECTED,
+			...restartOnA,
+			notebookPath: OTHER,
+			busy: 'connect',
+			busyPath: OTHER,
+			connectOverLive: true
+		};
+		expect(databricksPanelState(connectOnB)).toEqual({
+			view: 'connected',
+			connecting: true,
+			restarting: false
+		});
+
+		// Tabbing back to A mid-restart, with its session momentarily gone: A still owns
+		// its restart, so its card is HELD rather than collapsing to connecting/lost.
+		const backOnA: DbxPanelInputs = {
+			...IDLE,
+			...restartOnA,
+			notebookPath: NB,
+			busy: 'connect',
+			busyPath: OTHER,
+			connectOverLive: true,
+			connected: false,
+			lost: true
+		};
+		expect(databricksPanelState(backOnA)).toEqual({
+			view: 'connected',
+			connecting: false,
+			restarting: true
+		});
 	});
 
 	it('treats a panel that has issued nothing as owning nothing', () => {
@@ -376,7 +420,8 @@ describe('exactly one view, and only the connected one carries a face', () => {
 	it('over every combination of inputs', () => {
 		const bools = [false, true];
 		for (const notebookPath of [NB, OTHER])
-			for (const busy of ['', 'connect', 'disconnect'])
+			for (const busyPath of [NB, OTHER])
+				for (const busy of ['', 'connect', 'disconnect'])
 				for (const connected of bools)
 					for (const restarting of bools)
 						for (const serverRestarting of bools)
@@ -573,18 +618,33 @@ describe('source guards: the panel really asks the shared rule', () => {
 		expect(body).toMatch(/finally \{[\s\S]*connectOverLive = false/);
 	});
 
-	it('latches WHOSE transition it is, at the start of both paths that start one', () => {
-		// Without it, a connect that can run to minutes holds the connected view over
-		// whichever notebook the user tabs to next. See `panelOwnsTransition`.
-		for (const fn of ['async function connect(', 'async function applyRuntime(']) {
+	it('latches WHOSE work it is before the first await, one latch per question', () => {
+		// Without the latch, work that can run to minutes speaks for whichever notebook
+		// the user tabs to next. `busy` is latched at its ONE assignment site so all
+		// seven verbs are covered; the restart keeps its own, so the two cannot collide.
+		for (const [fn, latch] of [
+			['function beginBusy(', 'busyPath = notebookPath'],
+			['async function applyRuntime(', 'transitionPath = notebookPath']
+		]) {
 			const at = SRC.indexOf(fn);
 			expect(at, fn).toBeGreaterThan(-1);
 			const body = SRC.slice(at, SRC.indexOf('\n\t}', at));
-			const latch = body.indexOf('transitionPath = notebookPath');
-			expect(latch, fn).toBeGreaterThan(-1);
+			const set = body.indexOf(latch);
+			expect(set, fn).toBeGreaterThan(-1);
 			const awaited = body.indexOf('await ');
-			if (awaited > -1) expect(awaited, fn).toBeGreaterThan(latch);
+			if (awaited > -1) expect(awaited, fn).toBeGreaterThan(set);
 		}
+	});
+
+	/**
+	 * Each latch has exactly ONE writer, which is what makes them independent: shared,
+	 * a connect on one notebook inherited a runtime restart still settling on another.
+	 */
+	it('gives each latch a single writer', () => {
+		const writers = (name: string) =>
+			SRC.split('\n').filter((l) => new RegExp(`(?<!let )\\b${name} = `).test(l)).length;
+		expect(writers('transitionPath')).toBe(1);
+		expect(writers('busyPath')).toBe(1);
 	});
 });
 

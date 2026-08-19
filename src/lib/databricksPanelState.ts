@@ -43,10 +43,9 @@ export interface DbxPanelInputs {
 	/** The notebook the panel is showing right now (its `notebookPath` prop). */
 	notebookPath: string | null;
 	/**
-	 * The notebook the panel's OWN in-flight transition was latched for, at the click
-	 * that started it (`undefined` before the panel has ever started one). The panel's
-	 * transition flags are panel-wide but its subject is not: a connect issued for one
-	 * notebook says nothing about the next one the user tabs to.
+	 * The notebook the panel's own expected kernel RESTART was latched for (`undefined`
+	 * before it has ever issued one). A restart outlives the request that asked for it,
+	 * so it needs a latch of its own; `busyPath` answers for everything that does not.
 	 */
 	transitionPath: string | null | undefined;
 	/** The panel's in-flight verb (`''` when idle) - only `'connect'` matters here. */
@@ -104,33 +103,44 @@ export interface DbxPanelState {
 }
 
 /**
- * Is the panel's own in-flight transition about the notebook it is currently showing?
- * A transition latched for another notebook may not speak for this one - neither to
- * hold its view nor to suppress its lost/expired card.
+ * Is the RESTART the panel issued about the notebook it is currently showing? Written
+ * only by `applyRuntime`, which cannot run while `busy` is set - so a connect can never
+ * take this latch over from a kernel restart still in flight on another notebook, and
+ * a restart can never take it from a connect.
  */
 export function panelOwnsTransition(i: DbxPanelInputs): boolean {
 	return i.transitionPath === i.notebookPath;
 }
 
-/** The panel-wide flags, silenced when they belong to another notebook. */
-function ownFlags(i: DbxPanelInputs) {
-	const owned = panelOwnsTransition(i);
-	return {
-		connect: owned && i.busy === 'connect',
-		// The server half is already per-notebook, so it survives a panel that moved on.
-		expectedRestart: (owned && i.restarting) || i.serverRestarting,
-		runtimeApplying: owned && i.runtimeApplying,
-		connectOverLive: owned && i.connectOverLive
-	};
-}
-
 /**
  * Is the panel's in-flight REQUEST about the notebook on screen? Asked of `busyPath`,
- * never of `transitionPath`: five of the seven verbs start no view transition at all,
- * so the two answer different questions and must keep their own latches.
+ * which is latched where `busy` is ASSIGNED, so it covers all seven verbs rather than
+ * the one that also starts a restart.
  */
 export function panelOwnsBusy(i: DbxPanelInputs): boolean {
 	return i.busyPath === i.notebookPath;
+}
+
+/**
+ * The panel-wide flags, silenced when they belong to another notebook - each asking the
+ * latch that really answers for it. The connect half lives exactly as long as
+ * `busy === 'connect'`, so `busyPath` is its natural owner; the restart half outlives
+ * every request, so it keeps `transitionPath`. Sharing ONE latch let a connect on B
+ * inherit a runtime restart still running on A - B's own connect then wore the
+ * "restarting" badge over the OLD cluster's name, and A, having lost the latch, fell
+ * back to the standalone connecting card or a spurious "lost": the very collapse this
+ * module exists to prevent, reached from both ends at once.
+ */
+function ownFlags(i: DbxPanelInputs) {
+	const ownsBusy = panelOwnsBusy(i);
+	const ownsRestart = panelOwnsTransition(i);
+	return {
+		connect: ownsBusy && i.busy === 'connect',
+		// The server half is already per-notebook, so it survives a panel that moved on.
+		expectedRestart: (ownsRestart && i.restarting) || i.serverRestarting,
+		runtimeApplying: ownsRestart && i.runtimeApplying,
+		connectOverLive: ownsBusy && i.connectOverLive
+	};
 }
 
 /**

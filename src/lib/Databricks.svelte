@@ -48,7 +48,12 @@
 		unknownTokenWarning
 	} from '$lib/databricksUploadName';
 	import { insertTokenIntoField, tokenField } from '$lib/uploadTokenField';
-	import { connectionMetaLine, databricksPanelState, ownedTransitionFlags } from '$lib/databricksPanelState';
+	import {
+		connectionMetaLine,
+		databricksPanelState,
+		ownedTransitionFlags,
+		panelOwnsBusy
+	} from '$lib/databricksPanelState';
 	import type { SessionId } from '$lib/server/types';
 
 	// ---- Response shapes from src/routes/api/databricks/* --------------------
@@ -934,6 +939,14 @@
 	 * the second-connected-notebook state this exists for cannot arise there.
 	 */
 	const cardFlags = $derived(ownedTransitionFlags(panelInputs));
+	/** Does the in-flight request belong to the notebook on screen? */
+	const busyOwned = $derived(panelOwnsBusy(panelInputs));
+	/**
+	 * The cluster a connect is heading for, but only for the notebook that issued it.
+	 * A different notebook's own connecting face (its server grace window) must read
+	 * "Reconnecting…" rather than name a cluster it is not connecting to.
+	 */
+	const ownedConnectingName = $derived(busyOwned ? connectingName : '');
 
 	// Clusters load whenever the selection is not showing the sign-in button
 	// (`needsAuth`). For a bare host - and for a no-token external-browser profile -
@@ -1089,10 +1102,6 @@
 		// (a re-pin kernel restart), and this is what keeps the panel from unmounting
 		// around that frame. See `holdsConnectedView` in `$lib/databricksPanelState`.
 		connectOverLive = connected;
-		// ...and WHOSE frame it is. A connect can run to minutes, so the user may well
-		// tab to another notebook while it does; that notebook must show its own state,
-		// not this one's held connected view. See `panelOwnsTransition`.
-		transitionPath = notebookPath;
 		// Collapse the picker on the CLICK, not on the reply. The list has served its
 		// purpose the moment a cluster is chosen, and the card above now names the
 		// target, so leaving it open (disabled) only means the panel jumps at the very
@@ -1981,22 +1990,29 @@
 	// workspace half falls back) lives in `$lib/databricksPanelState`.
 	let lastProfile = $state<string | null>(null);
 	let lastHost = $state<string | null>(null);
+	// Which notebook that last-known-good half was recorded for. The panel follows the
+	// active tab, so an unscoped fallback rendered ANOTHER workspace's profile and host
+	// under "Connecting to <this notebook's cluster>…".
+	let lastMetaPath = $state<string | null | undefined>(undefined);
 	$effect(() => {
 		const profile = connection.profile ?? null;
 		const host = connection.host ?? null;
+		const path = notebookPath;
 		if (!connected) return;
 		untrack(() => {
 			lastProfile = profile;
 			lastHost = host;
+			lastMetaPath = path;
 		});
 	});
+	const metaOwned = $derived(lastMetaPath === notebookPath);
 	const connMeta = $derived(
 		connectionMetaLine({
 			profile: connection.profile,
 			host: connection.host,
 			sparkVersion: connection.sparkVersion,
-			lastProfile,
-			lastHost,
+			lastProfile: metaOwned ? lastProfile : null,
+			lastHost: metaOwned ? lastHost : null,
 			connecting: panel.connecting
 		})
 	);
@@ -2494,7 +2510,7 @@
 							disabled={uploadConfirmBusy}
 							data-testid="databricks-upload-replace"
 						>
-							{#if busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Replacing…{:else}Replace{/if}
+							{#if cardFlags.busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Replacing…{:else}Replace{/if}
 						</button>
 					</div>
 				</div>
@@ -2506,7 +2522,7 @@
 					title="Copy this notebook into /Users/<you>/ in the connected Databricks workspace"
 					data-testid="databricks-upload"
 				>
-					{#if busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Uploading…{:else}Upload notebook to workspace{/if}
+					{#if cardFlags.busy === 'upload'}<span class="loading loading-spinner loading-xs"></span>Uploading…{:else}Upload notebook to workspace{/if}
 				</button>
 			{/if}
 		</div>
@@ -3040,8 +3056,8 @@
 					{@render cardLabel('cluster')}
 					<div class="mt-1.5 flex items-center gap-2">
 						<span class="loading loading-spinner loading-xs shrink-0 text-primary"></span>
-						<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connectingName}>
-							{connectingName ? `Connecting to ${connectingName}…` : 'Reconnecting…'}
+						<span class="min-w-0 flex-1 truncate text-sm font-medium" title={ownedConnectingName}>
+							{ownedConnectingName ? `Connecting to ${ownedConnectingName}…` : 'Reconnecting…'}
 						</span>
 					</div>
 					{@render hint('Starting the Databricks session. A terminated cluster can take a few minutes.')}
@@ -3079,8 +3095,8 @@
 					<div class="mt-1.5 flex items-center gap-2">
 						{#if panel.connecting}
 							<span class="relative flex h-2 w-2 shrink-0"><span class="inline-flex h-2 w-2 rounded-full bg-warning"></span></span>
-							<span class="min-w-0 flex-1 truncate text-sm font-medium" title={connectingName} data-testid="databricks-connecting-name">
-								{connectingName ? `Connecting to ${connectingName}…` : 'Reconnecting…'}
+							<span class="min-w-0 flex-1 truncate text-sm font-medium" title={ownedConnectingName} data-testid="databricks-connecting-name">
+								{ownedConnectingName ? `Connecting to ${ownedConnectingName}…` : 'Reconnecting…'}
 							</span>
 						{:else}
 							<span class="relative flex h-2 w-2 shrink-0" title="connected"><span class="inline-flex h-2 w-2 rounded-full bg-success"></span></span>
