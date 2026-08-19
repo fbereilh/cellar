@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { runMcpBridge, NO_INSTANCE_ERROR_CODE, provesNotDelivered } from '../../src/lib/server/mcp-bridge.js';
-import { writeRuntime, clearRuntime } from '../../src/lib/server/runtime.js';
+import { writeRuntime, clearRuntime, isInstanceAlive } from '../../src/lib/server/runtime.js';
 
 /**
  * `cellar mcp` re-attaches across a Cellar restart.
@@ -49,7 +49,8 @@ function startFakeCellar(
 		failStatus = {},
 		failBody = {},
 		holdInitialize = false,
-		holdNotification = false
+		holdNotification = false,
+		parkInitialize = false
 	}: {
 		failStatus?: Record<string, number>;
 		failBody?: Record<string, string>;
@@ -69,6 +70,14 @@ function startFakeCellar(
 		 * upstream error arrives while `reattaching` is still set.
 		 */
 		holdNotification?: boolean;
+		/**
+		 * Never answer `initialize` at ALL - not even headers, so the client's
+		 * `fetch` stays pending. That is the wedged-but-accepting instance: the
+		 * kernel completes the TCP handshake while the app's event loop is blocked,
+		 * so a re-handshake send has nothing to time it out but undici's ~300s
+		 * default.
+		 */
+		parkInitialize?: boolean;
 	} = {}
 ) {
 	const sessions = new Set<string>();
@@ -76,6 +85,7 @@ function startFakeCellar(
 	const held: { id: unknown; res: http.ServerResponse }[] = [];
 	const heldInit: { id: unknown; res: http.ServerResponse }[] = [];
 	const heldNotes: http.ServerResponse[] = [];
+	const parkedInit: http.ServerResponse[] = [];
 	const sockets = new Set<import('node:net').Socket>();
 	let server: Server;
 	const listening = new Promise<number>((resolve) => {
@@ -93,6 +103,10 @@ function startFakeCellar(
 				seen.push({ method: msg.method, sessionId: sid });
 				const isInit = msg.method === 'initialize';
 				if (isInit) {
+					if (parkInitialize) {
+						parkedInit.push(res);
+						return;
+					}
 					const id = randomUUID();
 					sessions.add(id);
 					if (holdInitialize) {
@@ -215,6 +229,7 @@ function startFakeCellar(
 				held.length = 0;
 				heldInit.length = 0;
 				heldNotes.length = 0;
+				parkedInit.length = 0;
 				for (const s of sockets) s.destroy();
 				server.close(() => r());
 			})
@@ -380,7 +395,13 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 	});
 
 	/** Boot the real bridge against `ws`, with only the stdio side faked. */
-	async function startBridge() {
+	async function startBridge(
+		opts: {
+			isAliveFn?: (rt: unknown) => Promise<boolean> | boolean;
+			handshakeTimeoutMs?: number;
+			healConfirmDelayMs?: number;
+		} = {}
+	) {
 		const stdio = fakeStdio();
 		let fatal: number | undefined;
 		// Ids whose POST has RESOLVED upstream, i.e. that are genuinely in flight on
@@ -404,7 +425,11 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 				fatal = code;
 			},
 			// Silence the bridge's stderr diagnostics; the assertions read behavior.
-			log: () => {}
+			log: () => {},
+			// Keep the corroboration re-check quick so a test is not paced by it; the
+			// RULE under test is the number of consecutive readings, not the gap.
+			healConfirmDelayMs: 20,
+			...opts
 		});
 		stopBridge = () => stdio.transport.onclose?.();
 		// Give the initial attach a moment to settle.
@@ -420,6 +445,7 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 			failBody?: Record<string, string>;
 			holdInitialize?: boolean;
 			holdNotification?: boolean;
+			parkInitialize?: boolean;
 		}
 	) {
 		const c = startFakeCellar(port, opts);
@@ -816,6 +842,128 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		// Exactly one response, and it is the only thing that went down.
 		expect(stdio.repliesFor(2)).toHaveLength(1);
 		expect(stdio.sent.length).toBe(sentBefore + 1);
+	});
+
+	it('never tears down a live run because ONE liveness reading timed out', async () => {
+		// The heal's only negative signal is a 1500ms GET timing out, and Cellar's app
+		// process is documented to block its own event loop for longer than that (a
+		// synchronous jupytext persist, a `git blame`, a large notebook
+		// `JSON.stringify`). Acting on a single such reading detached, which ABORTS
+		// the in-flight POST of the very run this module protects: `attach()` re-probed,
+		// found the stall had cleared, and tore the healthy session down.
+		const cellar = await bootCellar();
+		let stalledReadings = 0;
+		const { stdio, inFlight } = await startBridge({
+			isAliveFn: async (rt: unknown) => {
+				if (stalledReadings > 0) {
+					stalledReadings--;
+					return false;
+				}
+				return isInstanceAlive(rt as never);
+			}
+		});
+		await stdio.request(INIT);
+		const sessionsBefore = cellar.sessionCount();
+
+		// A long call is streaming - which is also what puts an id in the heal's own
+		// gate, so this exposure exists exactly while the protected work runs.
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => cellar.heldCount() === 1 && inFlight.has(2));
+
+		// The app stalls for exactly ONE reading, then answers again.
+		stalledReadings = 1;
+		// `notifications/initialized` is answered 202, and the SDK then opens its
+		// standalone GET stream, which this fake refuses - so the heal is driven
+		// without touching the run's own stream, exactly like a proxy blip.
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		await new Promise((r) => setTimeout(r, 500));
+
+		// Uncorroborated, so nothing was disturbed: no re-handshake, no answer.
+		expect(cellar.sessionCount()).toBe(sessionsBefore);
+		expect(stdio.repliesFor(2)).toHaveLength(0);
+		// ...and the run really does finish and deliver its own result.
+		cellar.release();
+		expect(await stdio.awaitReply(2, 8000)).toMatchObject({ result: { echoed: SLOW } });
+		expect(stdio.repliesFor(2)).toHaveLength(1);
+	});
+
+	it('still answers a stranded run once the instance is unreachable CONSECUTIVELY', async () => {
+		// The other direction of the same bar: corroboration must raise the evidence
+		// required, not switch the recovery off. Here the instance never answers
+		// again, so the readings agree and the stranded run is answered rather than
+		// left to hang.
+		const cellar = await bootCellar();
+		let unreachable = false;
+		const { stdio, inFlight } = await startBridge({
+			isAliveFn: async (rt: unknown) => (unreachable ? false : isInstanceAlive(rt as never))
+		});
+		await stdio.request(INIT);
+
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => cellar.heldCount() === 1 && inFlight.has(2));
+
+		unreachable = true;
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+		const lost = (await stdio.awaitReply(2, 8000)).error as { code: number; message: string };
+		expect(lost).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(lost.message).toMatch(/may or may not have been applied/i);
+		expect(stdio.repliesFor(2)).toHaveLength(1);
+	});
+
+	it('needs no corroboration when the record itself says the instance was REPLACED', async () => {
+		// Positive evidence settles it outright - the strike count applies only to
+		// the one signal that cannot tell a stall from a death. Here the liveness
+		// probe would say "alive" every time; the changed pid is what convicts.
+		const cellar = await bootCellar();
+		const { stdio, inFlight } = await startBridge({ isAliveFn: async () => true });
+		await stdio.request(INIT);
+
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => cellar.heldCount() === 1 && inFlight.has(2));
+
+		// Same address, a DIFFERENT instance behind it.
+		const alive = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], { stdio: 'ignore' });
+		running.push({ close: async () => void alive.kill() });
+		writeRuntime(ws, {
+			mcpPort: cellar.port,
+			appPort: cellar.port + 1,
+			jupyterPort: cellar.port + 2,
+			pid: alive.pid
+		});
+
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+		const lost = (await stdio.awaitReply(2, 8000)).error as { code: number; message: string };
+		expect(lost).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(stdio.repliesFor(2)).toHaveLength(1);
+	});
+
+	it('does not park the whole recovery on a wedged instance that never answers', async () => {
+		// The re-handshake sends are `fetch` calls the SDK gives no deadline, so a
+		// wedged-but-accepting instance (TCP completes, the event loop is blocked)
+		// parked them until undici's ~300s default. Parked, `reattaching` never
+		// settles: every relay awaiting it hangs and the stream-loss heal is disabled
+		// for the whole window - minutes past the host timeout this module exists to
+		// avoid. Bounded, the attach settles and recovery keeps cycling.
+		const first = await bootCellar();
+		const { stdio, fatal } = await startBridge({ handshakeTimeoutMs: 200 });
+		await stdio.request(INIT);
+
+		// The replacement accepts connections and answers the liveness GET, but never
+		// answers `initialize` at all.
+		await killCellar(first);
+		const wedged = await bootCellar(0, { parkInitialize: true });
+
+		// The agent's next call must come back promptly rather than hang. 3s is far
+		// under undici's default and far over the injected 200ms bound, so it fails
+		// only if the send is genuinely unbounded.
+		const reply = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, 3000);
+		expect(reply.error).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(wedged.seen.some((m) => m.method === 'initialize')).toBe(true);
+		// The bridge is untouched and still relaying, ready to heal on the next launch.
+		expect(fatal()).toBeUndefined();
+		expect(typeof stdio.transport.onmessage).toBe('function');
 	});
 
 	it('leaves a session alone when the stream dies but the instance is ALIVE', async () => {

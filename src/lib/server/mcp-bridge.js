@@ -64,12 +64,26 @@
  *   - `connection` - nothing answered (`fetch failed`, ECONNREFUSED/ECONNRESET,
  *     socket hang up). Ambiguous: a replaced instance looks like this, but so
  *     does a stale keep-alive socket against a perfectly healthy one. So it is
- *     CONFIRMED first - runtime.json naming a different port, or the recorded
- *     instance not answering - and an unconfirmed blip is retried once on the
- *     SAME session, which a fresh socket satisfies.
+ *     CONFIRMED first - runtime.json naming a different port or pid, or the
+ *     recorded instance not answering - and an unconfirmed blip is retried once
+ *     on the SAME session, which a fresh socket satisfies.
  *   - `other` - a live, session-valid server rejecting THIS message (429, 500,
  *     bad params). Relayed as an error for that request alone: no detach, no
  *     re-handshake, and above all no disturbing the other in-flight requests.
+ *
+ * That confirmation is ONE reader (`instanceVerdict`) with TWO bars, because the
+ * two callers are not equally destructive. `deliver` reaches it only after a send
+ * has already FAILED - independent evidence in its own right - so one reading
+ * decides. The STREAM-LOSS HEAL has no such evidence: it fires on a signal the
+ * SDK itself treats as recoverable, and its only negative signal is a 1500ms GET
+ * timing out, which a healthy Cellar produces whenever it blocks its own event
+ * loop (a synchronous jupytext persist, a `git blame`, a large notebook
+ * `JSON.stringify`). Since acting there DETACHES - aborting the in-flight POST of
+ * the very run this module protects - it demands corroboration: positive evidence
+ * (a moved port, a different pid) or `HEAL_CONFIRM_PROBES` CONSECUTIVE
+ * unreachable readings, the same doctrine `pidReapDecision` and the kernel
+ * watchdog's strike count already apply to destructive verdicts. A single
+ * `present` reading acquits at once.
  *
  * ## Re-SENDING is a second, narrower question, and its answer is ASYMMETRIC
  *
@@ -148,6 +162,53 @@ const stderrLog = (msg) => process.stderr.write(`[cellar mcp] ${msg}\n`);
 
 /** JSON-RPC error code reported when no instance is serving the workspace. */
 export const NO_INSTANCE_ERROR_CODE = -32001;
+
+/**
+ * How many CONSECUTIVE unreachable readings the HEAL path needs before it may
+ * act, when it has no positive evidence of a replacement.
+ *
+ * A re-attach DETACHES, and `detach()` aborts every in-flight POST with it - so
+ * on this path the verdict is destructive and gets the corroboration this repo
+ * already demands of destructive calls (`pidReapDecision`: killing REQUIRES a
+ * positive match; the kernel watchdog's `SUSPECT_STRIKES`). One negative reading
+ * is not enough here, because the only negative signal available is a 1500ms GET
+ * timing out - and Cellar's app process is documented to block its own event
+ * loop for longer than that (a synchronous jupytext `spawnSync` persist, a
+ * `git blame`, a large notebook `JSON.stringify`). The exposure window is
+ * EXACTLY while a long run is streaming (that is what puts an id in
+ * `strandedRequestIds()` at all), i.e. precisely the work this module exists to
+ * protect, so failing toward NOT detaching is the correct direction.
+ *
+ * Deliberately scoped to the heal: `deliver` reaches its verdict only after a
+ * send has already FAILED, which is independent evidence in its own right, so it
+ * keeps asking `instanceGone()` once and is unchanged.
+ *
+ * Stated residual: a stall that outlives every probe still convicts. This raises
+ * the bar from one ~1.5s window to two separated ones, it does not remove the
+ * case - positive evidence (a moved port, a different pid) is the only signal
+ * that settles it outright, and that path is unaffected by the strike count.
+ */
+export const HEAL_CONFIRM_PROBES = 2;
+const HEAL_CONFIRM_DELAY_MS = 250;
+
+/**
+ * A bound on the two RE-HANDSHAKE sends in `attach()`, and on nothing else.
+ *
+ * Those two are `fetch` calls the SDK gives no per-request deadline, so against
+ * a wedged-but-accepting instance - the kernel completes the TCP handshake while
+ * the app's event loop is blocked, the same shape `kernel.ts` documents for the
+ * sidecar - they park until undici's default 300s `headersTimeout`. Parked,
+ * `reattaching` never settles: every `deliver` awaiting it hangs and the
+ * stream-loss heal is disabled for the whole window, which is minutes past the
+ * 60s host timeout this module exists to avoid. Same reasoning as
+ * `probeKernelLiveness`: a probe MUST always settle, or it disarms the recovery
+ * it drives.
+ *
+ * Emphatically NOT applied to relayed sends. A run tool legitimately holds its
+ * POST open for the length of a cell run, so bounding those would abort exactly
+ * the work being protected.
+ */
+export const HANDSHAKE_SEND_TIMEOUT_MS = 10_000;
 
 /** True for a JSON-RPC request (has both an id and a method) - i.e. it expects a reply. */
 export function isRequest(msg) {
@@ -343,7 +404,9 @@ export const LOST_RESULT_MESSAGE =
  *   makeUpstream?: (url: URL) => Transport,
  *   makeStdio?: () => Transport,
  *   onFatal?: (code: number) => any,
- *   log?: (msg: string) => any
+ *   log?: (msg: string) => any,
+ *   handshakeTimeoutMs?: number,
+ *   healConfirmDelayMs?: number
  * }} opts
  */
 export async function runMcpBridge({
@@ -353,7 +416,9 @@ export async function runMcpBridge({
 	makeUpstream = (url) => new StreamableHTTPClientTransport(url),
 	makeStdio = () => new StdioServerTransport(),
 	onFatal = (code) => process.exit(code),
-	log = stderrLog
+	log = stderrLog,
+	handshakeTimeoutMs = HANDSHAKE_SEND_TIMEOUT_MS,
+	healConfirmDelayMs = HEAL_CONFIRM_DELAY_MS
 } = {}) {
 	const rt = readRuntimeFn(workspace);
 	if (!(await isAliveFn(rt))) {
@@ -553,6 +618,24 @@ export async function runMcpBridge({
 	};
 
 	/**
+	 * Send one RE-HANDSHAKE message under a deadline (see
+	 * `HANDSHAKE_SEND_TIMEOUT_MS`). Used for those two messages and nothing else -
+	 * a relayed run must stay unbounded.
+	 */
+	const sendHandshake = (t, msg) => {
+		let timer;
+		return Promise.race([
+			t.send(msg),
+			new Promise((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error(`re-handshake send timed out after ${handshakeTimeoutMs}ms`)),
+					handshakeTimeoutMs
+				);
+			})
+		]).finally(() => clearTimeout(timer));
+	};
+
+	/**
 	 * Attach to whatever instance currently serves the workspace, minting a fresh
 	 * MCP session. Re-reads runtime.json every time, so it follows the instance
 	 * across a restart whatever port it came up on.
@@ -596,7 +679,18 @@ export async function runMcpBridge({
 			// ever answer it. The `pending` re-check covers the opposite case: a reply
 			// delivered inline has already answered the id, so it is not outstanding.
 			ownIds.set(id, forAgent);
-			await t.send({ ...initRequest, id });
+			// A TIMEOUT here is the one send failure that must also CANCEL, not merely
+			// give up: the parked request would otherwise hold its socket for undici's
+			// 300s while `upstream` pointed at a transport carrying no session. This
+			// transport is brand new and carries nothing but these two handshake
+			// messages, so tearing it down destroys no protected work - unlike a
+			// relayed run, which is why the bound stops at these two sends.
+			try {
+				await sendHandshake(t, { ...initRequest, id });
+			} catch (err) {
+				await detach();
+				throw err;
+			}
 			if (forAgent != null && pending.has(forAgent)) handedOff.add(forAgent);
 			// The session is MINTED at this point: the reply above carried the
 			// `Mcp-Session-Id` the transport now holds, and the replay's own result is
@@ -607,8 +701,14 @@ export async function runMcpBridge({
 			// sat attached, and the real result was then dropped as a duplicate. If a
 			// server does refuse later messages for want of it, that refusal arrives on
 			// its own terms and drives recovery through the ordinary classification.
+			// Bounded for the same reason and answered differently: a timeout here may
+			// NOT tear the transport down, because the session is already minted and
+			// the replay's own reply is on its way over it. So the deadline buys
+			// exactly what it is for - the attach settles, `reattaching` clears, and
+			// recovery keeps cycling - at the cost of one socket parked until the
+			// server or undici gives up on it.
 			try {
-				await t.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+				await sendHandshake(t, { jsonrpc: '2.0', method: 'notifications/initialized' });
 			} catch (err) {
 				log(`re-handshake notification failed (${err?.message ?? err}); the session is minted regardless`);
 			}
@@ -682,15 +782,59 @@ export async function runMcpBridge({
 	 * this strengthens the evidence rule rather than loosening it; an instance that
 	 * records no pid falls back to the port-and-liveness signals unchanged.
 	 */
-	const instanceGone = async () => {
+	/**
+	 * ONE evidence reader, THREE verdicts - so the two callers can hold different
+	 * bars against the same reading rather than each keeping a copy of the rule:
+	 *
+	 *   - `replaced`    - POSITIVE evidence: runtime.json is gone, or names a
+	 *                     different mcp PORT, or a different PID. Settles it
+	 *                     outright for either caller.
+	 *   - `unreachable` - the record still names US, and the instance it names did
+	 *                     not answer. That is the only NEGATIVE signal available
+	 *                     here, and it is a 1500ms GET timing out, which a stalled
+	 *                     but perfectly healthy app produces.
+	 *   - `present`     - it answered; nothing is wrong with the session.
+	 *
+	 * A read that THREW is `unreachable`, not `replaced`: it establishes nothing
+	 * about a replacement, so it must not be spent as positive evidence.
+	 *
+	 * @returns {Promise<'replaced' | 'unreachable' | 'present'>}
+	 */
+	const instanceVerdict = async () => {
 		try {
 			const cur = readRuntimeFn(workspace);
-			if (!cur || cur.mcpPort !== attachedPort) return true;
-			if (attachedPid != null && cur.pid != null && cur.pid !== attachedPid) return true;
-			return !(await isAliveFn(cur));
+			if (!cur || cur.mcpPort !== attachedPort) return 'replaced';
+			if (attachedPid != null && cur.pid != null && cur.pid !== attachedPid) return 'replaced';
+			return (await isAliveFn(cur)) ? 'present' : 'unreachable';
 		} catch (err) {
-			log(`could not confirm the instance (${err?.message ?? err}); treating it as gone`);
-			return true;
+			log(`could not confirm the instance (${err?.message ?? err}); treating it as unreachable`);
+			return 'unreachable';
+		}
+	};
+
+	const instanceGone = async () => (await instanceVerdict()) !== 'present';
+
+	/**
+	 * The HEAL path's stricter bar on that same reading.
+	 *
+	 * Positive evidence settles it at once; an `unreachable` reading alone does
+	 * not, and is re-asked until `HEAL_CONFIRM_PROBES` CONSECUTIVE readings agree
+	 * - see that constant for why a single one may not authorise a detach here,
+	 * and why `deliver` (which has a failed send of its own) keeps the one-reading
+	 * rule. A single `present` anywhere in the run acquits immediately: it is
+	 * proof the instance is answering, which outranks any number of timeouts.
+	 */
+	const healConfirmsGone = async () => {
+		for (let reading = 1; ; reading++) {
+			const verdict = await instanceVerdict();
+			if (verdict === 'present') return false;
+			if (verdict === 'replaced') return true;
+			if (reading >= HEAL_CONFIRM_PROBES) {
+				log(`the instance has been unreachable for ${reading} consecutive readings; treating it as gone`);
+				return true;
+			}
+			log('the instance did not answer; re-checking before disturbing the session');
+			await new Promise((r) => setTimeout(r, healConfirmDelayMs));
 		}
 	};
 
@@ -732,11 +876,15 @@ export async function runMcpBridge({
 	 * and the call hung until the host's 60s timeout: exactly the symptom this
 	 * bridge exists to remove, reached through the one door it was not watching.
 	 *
-	 * The doctrine is unchanged, only applied here too. It NEVER re-attaches on the
-	 * error itself - `instanceGone()` is an independent evidence check that needs no
-	 * error message, so it is asked first and a live instance means we do nothing at
-	 * all. That is what keeps a transient SSE blip from tearing down a session with
-	 * long runs streaming on it, which is the cardinal sin this module names.
+	 * The doctrine is unchanged, only applied here too - and held to a HIGHER bar,
+	 * because this path has no failed send behind it. It NEVER re-attaches on the
+	 * error itself: `healConfirmsGone()` is an independent evidence check that needs
+	 * no error message, so it is asked first, a live instance means we do nothing at
+	 * all, and an instance that merely did not ANSWER is re-checked before anything
+	 * is disturbed (see `HEAL_CONFIRM_PROBES`). That is what keeps a transient SSE
+	 * blip - or a Cellar that blocked its own event loop past the 1500ms liveness
+	 * probe - from tearing down a session with long runs streaming on it, which is
+	 * the cardinal sin this module names.
 	 * Nothing is ever RE-SENT here; the ambiguity contract is untouched, and the
 	 * requests are answered with `LOST_RESULT_MESSAGE` - honest about the reply
 	 * being unrecoverable and about the call's own outcome being unknown.
@@ -775,7 +923,10 @@ export async function runMcpBridge({
 			// ask again. Whether the ids are really unanswerable is still decided below,
 			// by `instanceGone()`, and only then swept.
 			if (strandedRequestIds().length === 0) return;
-			if (!(await instanceGone())) return;
+			// The CORROBORATED gate, not the one-reading `instanceGone()` the deliver
+			// path uses: what follows detaches, which aborts the very run streaming on
+			// this session. See `HEAL_CONFIRM_PROBES`.
+			if (!(await healConfirmsGone())) return;
 			await reattach();
 			// Also answered when the re-attach found nothing serving: the evidence is
 			// about the OLD instance, and their replies rode its stream either way.
