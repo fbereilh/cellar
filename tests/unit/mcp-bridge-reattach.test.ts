@@ -1017,6 +1017,76 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		});
 	});
 
+	it('answers a handed-off initialize whose replay stream then DIES with nothing serving', async () => {
+		// The worst shape of all, and the one the hand-off exemption created. The
+		// replay stands in for the agent's `initialize`, so the id is exempt from
+		// every sweep on the strength of "its reply is on the wire" - and when that
+		// wire dies the exemption is simply false. The stream-loss heal used to
+		// subtract handed-off ids from its own gate, so it found nothing to do and
+		// returned without even asking whether the instance was gone; and because
+		// the host BLOCKS on `initialize`, no later message could ever drive the
+		// per-send recovery. The bridge hung for good - and, never exiting, was
+		// never respawned either, which is the whole failure class it exists to
+		// remove.
+		const first = await bootCellar();
+		const { stdio, fatal } = await startBridge();
+		await killCellar(first);
+		// Holds its handshake open, so the hand-off is genuinely outstanding.
+		const second = await bootCellar(0, { holdInitialize: true });
+
+		stdio.post(INIT);
+		await until(() => second.seen.some((m) => m.method === 'initialize'), 8000);
+
+		// The replacement dies before flushing that result, and nothing takes over.
+		await killCellar(second);
+
+		const reply = await stdio.awaitReply(INIT.id, 8000);
+		const err = reply.error as { code: number; message: string };
+		expect(err).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		// Honest, and the same rule as any other stranded request: the result can
+		// never arrive, and whether it was applied is unknown.
+		expect(err.message).toMatch(/may or may not have been applied/i);
+		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
+		// The bridge itself is untouched: it stays alive to heal on the next launch.
+		expect(fatal()).toBeUndefined();
+	});
+
+	it('completes the handshake instead when a replacement DOES come up, with no agent message', async () => {
+		// The other outcome of the same gate. Once the hand-off is no longer allowed
+		// to hide the request, the heal re-attaches - and the fresh replay it puts on
+		// the wire re-claims the id, so the handshake completes rather than being
+		// swept. The agent sends nothing at all between the two.
+		const first = await bootCellar();
+		const { stdio } = await startBridge();
+		await killCellar(first);
+		const second = await bootCellar(0, { holdInitialize: true });
+
+		stdio.post(INIT);
+		await until(() => second.seen.some((m) => m.method === 'initialize'), 8000);
+
+		// A third instance takes over the folder, THEN the replacement dies
+		// mid-handshake - the restart ordering, and the one that leaves something
+		// for the heal to re-attach to.
+		// (`clear: false` so taking the old one down does not also erase the record
+		// of the new one - they all publish this process's pid.)
+		const third = await bootCellar(0, { holdInitialize: true });
+		await killCellar(second, { clear: false });
+		await until(() => third.seen.some((m) => m.method === 'initialize'), 8000);
+		third.releaseInitialize();
+
+		const reply = await stdio.awaitReply(INIT.id, 8000);
+		expect(reply).toMatchObject({ id: INIT.id, result: { protocolVersion: '2025-06-18' } });
+		expect(reply.error).toBeUndefined();
+		// One response for that id - the sweep must not also have answered it.
+		await new Promise((r) => setTimeout(r, 200));
+		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
+		// ...and the session it minted really works.
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		expect(await stdio.request({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, 8000)).toMatchObject({
+			result: { echoed: 'tools/list' }
+		});
+	});
+
 	it('never relays its own re-handshake reply to the agent', async () => {
 		const first = await bootCellar();
 		const { stdio } = await startBridge();

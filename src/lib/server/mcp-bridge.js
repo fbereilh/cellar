@@ -116,7 +116,12 @@
  * failures each failed the other's request AND then retried it, so one id got
  * both an error and a result). A request the recovery has already taken over -
  * answered, or handed off so its replay is on the wire - is exempt from every
- * verdict `deliver` would otherwise reach (`settledByRecovery`).
+ * verdict `deliver` would otherwise reach (`settledByRecovery`). That exemption
+ * is only ever as true as the stream carrying the replay, so it is dropped
+ * wholesale at the top of every `attach()`: a hand-off that outlived its
+ * transport exempted an id from every sweep with nothing left to answer it, and
+ * for the agent's own `initialize` that is a permanent hang, the host having no
+ * next message to send.
  *
  * This is the ONLY place with protocol awareness, and it is kept to the minimum
  * that a re-handshake requires: remember the agent's `initialize` request so it
@@ -437,11 +442,30 @@ export async function runMcpBridge({
 	};
 
 	/**
-	 * Requests whose reply could only ever have come over the CURRENT stream:
-	 * outstanding, not about to be answered by a relay that is still running, and
-	 * not handed off to a replay already on the wire.
+	 * Every outstanding request whose reply would have ridden the CURRENT stream:
+	 * pending, and not about to be answered by a relay that is still running.
+	 *
+	 * A handed-off id IS counted here and is NOT counted by `lostRequestIds`
+	 * below, and that difference is the point. `handedOff` means "a replay of the
+	 * agent's own initialize is on the wire and its reply is coming" - true while
+	 * that stream works, and false the instant it dies, which is precisely when
+	 * this is asked. Subtracting it here made the one request the recovery cares
+	 * most about invisible to its own gate: the agent's handshake was handed off,
+	 * the replacement died before flushing the result, `healAfterStreamLoss` found
+	 * nothing to do and returned without even asking whether the instance was
+	 * gone - and because the host blocks on `initialize`, no later message could
+	 * ever drive `deliver`, so the bridge hung for good without exiting, which is
+	 * the whole failure class it exists to remove.
 	 */
-	const lostRequestIds = () => [...pending].filter((id) => !relaying.has(id) && !handedOff.has(id));
+	const strandedRequestIds = () => [...pending].filter((id) => !relaying.has(id));
+
+	/**
+	 * Requests whose reply can never arrive NOW: stranded, and not handed off to a
+	 * replay already on the wire. The hand-off exemption belongs here and only
+	 * here - a sweep runs after a re-attach has re-registered it, so the id really
+	 * does have a fresh replay outstanding.
+	 */
+	const lostRequestIds = () => strandedRequestIds().filter((id) => !handedOff.has(id));
 
 	/**
 	 * Answer every request whose reply died with the old server. Idempotent through
@@ -512,6 +536,15 @@ export async function runMcpBridge({
 	 * across a restart whatever port it came up on.
 	 */
 	const attach = async () => {
+		// EVERY hand-off dies here, before anything else. `handedOff` claims a replay
+		// is on the wire on the CURRENT upstream, and we only ever get here on
+		// evidence that upstream's session is gone - so the claim is already false,
+		// and left standing it is permanent: it exempts the id from every sweep while
+		// nothing remains to answer it. Cleared BEFORE the liveness check rather than
+		// inside `detach()` so the early return below - nothing is serving the folder,
+		// the case where the id most needs answering - is covered too. A successful
+		// attach re-registers it the moment its own replay is really on the wire.
+		handedOff.clear();
 		const cur = readRuntimeFn(workspace);
 		if (!(await isAliveFn(cur))) return false;
 		await detach();
@@ -696,7 +729,13 @@ export async function runMcpBridge({
 		// live session; and while a re-attach is in flight its own sweep owns these
 		// ids, so a second pass here could answer one the attach is handing off.
 		if (closing || healingStream || reattaching || upstream !== t) return;
-		if (lostRequestIds().length === 0) return;
+		// STRANDED, not LOST: the gate asks what rode this stream, so a handed-off
+		// handshake counts. Asking `lostRequestIds()` here skipped the recovery
+		// entirely whenever the only thing outstanding was that hand-off, and the
+		// host is blocked on `initialize` in exactly that state - nothing would ever
+		// ask again. Whether the ids are really unanswerable is still decided below,
+		// by `instanceGone()`, and only then swept.
+		if (strandedRequestIds().length === 0) return;
 		healingStream = true;
 		try {
 			if (!(await instanceGone())) return;

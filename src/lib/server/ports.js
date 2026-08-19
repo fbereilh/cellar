@@ -49,8 +49,12 @@
  *
  * An explicit `CELLAR_*_PORT` pin always wins - it is a deliberate instruction
  * (Docker publishing, a container port map), and a preference must never quietly
- * outrank it. Otherwise a remembered port is used only when it is BOTH not held
- * by a live registered instance AND actually bindable right now; anything else
+ * outrank it. Otherwise a remembered port is used only when it is not held by a
+ * live registered instance, is bindable right now on the host this role's server
+ * really binds, AND is free on the address the URL we hand the user connects to
+ * (`reachHostsFor`: a wildcard bind and a loopback squatter coexist on macOS, and
+ * the squatter WINS the demux - so "bindable" alone can hand back a port at which
+ * someone else answers). Anything else
  * falls back to a fresh ephemeral port, which is then remembered so the NEXT
  * restart is stable again. A remembered port is never reclaimed from a live
  * instance - Cellar has a painful history of a launch disturbing someone else's
@@ -70,7 +74,7 @@ export const REMEMBERED_PORTS = /** @type {const} */ (['appPort', 'mcpPort']);
 /**
  * @typedef {{ appPort?: number, mcpPort?: number }} PortPrefs
  * @typedef {'pinned' | 'remembered' | 'fresh'} PortSource
- * @typedef {'not-sticky' | 'no-preference' | 'held-by-live-instance' | 'taken-by-this-launch' | 'port-unavailable'} FreshReason
+ * @typedef {'not-sticky' | 'no-preference' | 'held-by-live-instance' | 'taken-by-this-launch' | 'port-unavailable' | 'address-unreachable'} FreshReason
  * @typedef {'held-by-live-instance' | 'taken-by-this-launch'} PortClaim
  * @typedef {{ port: number, source: PortSource, reason?: FreshReason }} PortChoice
  * @typedef {{ launcherPid?: number, appPid?: number, appPort?: number, mcpPort?: number, jupyterPort?: number }} InstanceEntry
@@ -90,6 +94,8 @@ export const MOVE_CAUSE = {
 	'held-by-live-instance': 'another running Cellar instance is using it',
 	'taken-by-this-launch': 'this launch had already taken it for another port',
 	'port-unavailable': 'another process is using it',
+	'address-unreachable':
+		'another process holds the loopback address that URL connects to, so it would answer instead of Cellar',
 	'no-preference': 'it is no longer a usable preference',
 	'not-sticky': 'this launch is isolated'
 };
@@ -328,13 +334,65 @@ export function bindHosts(env = process.env, { dev = false } = {}) {
 	};
 }
 
+/** The wildcard spellings `listen()` accepts, i.e. "every address of this family". */
+const WILDCARD_HOSTS = new Map([
+	['0.0.0.0', '127.0.0.1'],
+	['::', '::1'],
+	['[::]', '::1'],
+	['::0', '::1']
+]);
+
+/**
+ * Addresses that must ALSO be free before a port is usable, beyond the one the
+ * role's server binds.
+ *
+ * "Can we listen here" and "will the URL we print reach us" are two questions,
+ * and a WILDCARD bind is exactly where they diverge. The launcher prints (and
+ * opens) `http://localhost:<appPort>`, adapter-node binds `0.0.0.0`, and on
+ * macOS/BSD a `SO_REUSEADDR` bind of `127.0.0.1:P` and one of `0.0.0.0:P`
+ * coexist - with the MORE SPECIFIC binding winning the demux. So a loopback-only
+ * squatter leaves the wildcard probe answering "free", Cellar takes the port and
+ * starts perfectly well, and every connection to the address the user was handed
+ * lands on the squatter instead. Nothing in the launch fails; the app is simply
+ * not where it says it is.
+ *
+ * That is NEW with remembered ports and is why the check belongs here: the app
+ * port always used to come from `freePort()`, which binds `127.0.0.1`, so a
+ * loopback squatter could never be handed out in the first place.
+ *
+ * The extra address is always the LOOPBACK OF THE FAMILY THE BIND HOST ALREADY
+ * SERVES, which is what makes this safe to require rather than merely prefer: a
+ * machine that can bind the IPv4 wildcard has `127.0.0.1`, and one that can bind
+ * the IPv6 wildcard has `::1`, so this can never veto every port on a machine
+ * that lacks an address family and turn a hijack risk into a launch failure.
+ * A CONCRETE bind host is already the address people connect to, so it adds
+ * nothing - including `--dev`'s `localhost`, which is the very name the printed
+ * URL uses, resolved the same way by the same Node.
+ *
+ * Stated residual, deliberately not chased: with the IPv4-wildcard default Cellar
+ * serves no IPv6 at all, so a squatter on `[::1]:P` would still win an
+ * IPv6-preferring client's first attempt at `http://localhost:P`. Probing `::1`
+ * under an IPv4 bind is the one thing that could refuse every candidate port on
+ * an IPv6-less machine, and the case is unchanged by this feature anyway -
+ * `freePort()` could always hand back a `::1`-squatted port.
+ *
+ * @param {string} bindHost
+ * @returns {string[]}
+ */
+export function reachHostsFor(bindHost) {
+	const loopback = WILDCARD_HOSTS.get(bindHost);
+	return loopback ? [loopback] : [];
+}
+
 /**
  * Decide one port.
  *
  * Pure apart from the three injected effects, so the whole rule is unit-testable
  * without booting a server:
  *   - `canBind(port, host)` - can we actually listen on it right now, asked
- *                             about the host this role's server really binds
+ *                             about the host this role's server really binds,
+ *                             and then about each address in `reachHostsFor` -
+ *                             see there for why a wildcard bind is not enough
  *   - `claimedBy(port)`     - cheap synchronous "who has already claimed this",
  *                             answering `'held-by-live-instance'`,
  *                             `'taken-by-this-launch'` or null. It returns the
@@ -383,6 +441,28 @@ export async function choosePort({
 		return { port: Number(pinned), source: 'pinned' };
 	}
 
+	const reachHosts = reachHostsFor(host);
+
+	/**
+	 * Is `port` unusable for this role right now, and if so why?
+	 *
+	 * Two questions in ONE place so the remembered path and the fresh fallback can
+	 * never answer them differently: can this role's server LISTEN on it (the bind
+	 * host), and would the address people CONNECT to actually reach that server
+	 * (`reachHostsFor` - see there). They fail for different reasons and are
+	 * announced differently, so the answer is the cause rather than a boolean.
+	 *
+	 * @param {number} port
+	 * @returns {Promise<FreshReason | null>} null = usable
+	 */
+	const unusable = async (port) => {
+		if (!(await canBind(port, host))) return 'port-unavailable';
+		for (const reach of reachHosts) {
+			if (!(await canBind(port, reach))) return 'address-unreachable';
+		}
+		return null;
+	};
+
 	/** @param {FreshReason} reason @returns {Promise<PortChoice>} */
 	const fresh = async (reason) => {
 		// Guard the fallback against a port this launch has already claimed for
@@ -399,7 +479,7 @@ export async function choosePort({
 		for (let i = 0; i < FRESH_PORT_ATTEMPTS; i++) {
 			const port = await freePort();
 			if (claimedBy(port)) continue;
-			if (!(await canBind(port, host))) continue;
+			if (await unusable(port)) continue;
 			return { port, source: 'fresh', reason };
 		}
 		// Never hand back a port we KNOW is taken - that is the one outcome this
@@ -407,7 +487,9 @@ export async function choosePort({
 		// racing for one address. Refusing to launch is the honest failure.
 		throw new Error(
 			`could not find a free port after ${FRESH_PORT_ATTEMPTS} attempts - every port offered is already ` +
-				`claimed by a live instance, by another role of this launch, or unbindable on ${host}.`
+				`claimed by a live instance, by another role of this launch, or unusable on ` +
+				[host, ...reachHosts].join(' / ') +
+				'.'
 		);
 	};
 
@@ -428,8 +510,9 @@ export async function choosePort({
 	// window - the port coming back IS the old process exiting.
 	const deadline = Date.now() + Math.max(0, bindGraceMs);
 	for (;;) {
-		if (await canBind(remembered, host)) return { port: remembered, source: 'remembered' };
-		if (Date.now() >= deadline) return fresh('port-unavailable');
+		const why = await unusable(remembered);
+		if (!why) return { port: remembered, source: 'remembered' };
+		if (Date.now() >= deadline) return fresh(why);
 		await sleep(PORT_RETRY_MS);
 	}
 }

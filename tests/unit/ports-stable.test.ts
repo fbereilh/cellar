@@ -23,6 +23,7 @@ import {
 	REMEMBERED_PORTS,
 	PORT_RELEASE_GRACE_MS,
 	bindHosts,
+	reachHostsFor,
 	MOVE_CAUSE
 } from '../../src/lib/server/ports.js';
 
@@ -76,11 +77,26 @@ function scriptedFreePort(...ports: number[]) {
  */
 function probe(...busy: number[]) {
 	const asked: number[] = [];
-	const fn = async (port: number) => {
+	const log: { port: number; host: string }[] = [];
+	const fn = async (port: number, host = '127.0.0.1') => {
 		asked.push(port);
+		log.push({ port, host });
 		return !busy.includes(port);
 	};
-	return Object.assign(fn, { asked, sawPort: (p: number) => asked.includes(p) });
+	return Object.assign(fn, { asked, log, sawPort: (p: number) => asked.includes(p) });
+}
+
+/**
+ * A probe that reports a port busy only on ONE host - the loopback-only squatter
+ * that a wildcard bind probe cannot see (see `reachHostsFor`).
+ */
+function probeOnHost(host: string, ...busy: number[]) {
+	const log: { port: number; host: string }[] = [];
+	const fn = async (port: number, askedHost: string) => {
+		log.push({ port, host: askedHost });
+		return !(askedHost === host && busy.includes(port));
+	};
+	return Object.assign(fn, { log });
 }
 
 /** The claim predicate `resolveWorkspacePorts` builds, for a live instance. */
@@ -150,7 +166,7 @@ describe('choosePort - the stable-port rule', () => {
 		// The launcher's `freePort()` asks the kernel for a free 127.0.0.1 port
 		// while adapter-node binds the wildcard, and on macOS a loopback bind
 		// succeeds against a wildcard holder - so a kernel-assigned port can still
-		// be one the role's own listen() cannot take. One probe per candidate.
+		// be one the role's own listen() cannot take.
 		const canBind = probe(40000);
 		const r = await choosePort({
 			remembered: undefined,
@@ -160,7 +176,84 @@ describe('choosePort - the stable-port rule', () => {
 			freePort: scriptedFreePort(40000, 40001)
 		});
 		expect(r).toEqual({ port: 40001, source: 'fresh', reason: 'no-preference' });
-		expect(canBind.asked).toEqual([40000, 40001]);
+		// The busy candidate is dropped on its bind host without asking anything
+		// else; the one that is taken is then confirmed reachable as well.
+		expect(canBind.log).toEqual([
+			{ port: 40000, host: '0.0.0.0' },
+			{ port: 40001, host: '0.0.0.0' },
+			{ port: 40001, host: '127.0.0.1' }
+		]);
+	});
+
+	it('refuses a remembered port that binds but is not REACHABLE at the printed URL', async () => {
+		// Two different questions, and a WILDCARD bind is where they come apart. The
+		// launcher prints (and opens) http://localhost:<appPort> while adapter-node
+		// binds 0.0.0.0, and on macOS a loopback squatter and a wildcard bind coexist
+		// with the SQUATTER winning the demux - so the port binds perfectly, the app
+		// starts perfectly, and every connection to the address the user was handed
+		// lands somewhere else. Nothing fails; the app is just not where it says.
+		const canBind = probeOnHost('127.0.0.1', 51348);
+		const r = await choosePort({
+			remembered: 51348,
+			sticky: true,
+			host: '0.0.0.0',
+			canBind,
+			claimedBy: () => null,
+			bindGraceMs: 0,
+			freePort: async () => 40000
+		});
+		expect(r).toEqual({ port: 40000, source: 'fresh', reason: 'address-unreachable' });
+		// It really did ask about the bind host first and get a yes there - i.e. the
+		// old rule would have kept this port.
+		expect(canBind.log).toContainEqual({ port: 51348, host: '0.0.0.0' });
+		expect(canBind.log).toContainEqual({ port: 51348, host: '127.0.0.1' });
+	});
+
+	it('asks nothing extra when the bind host is already the address people reach', async () => {
+		// A concrete host is the address people connect to, so there is nothing to
+		// add - and the everyday loopback roles must not pay a second probe.
+		const canBind = probe();
+		const r = await choosePort({
+			remembered: 51348,
+			sticky: true,
+			host: '127.0.0.1',
+			canBind,
+			freePort: async () => 40000
+		});
+		expect(r).toEqual({ port: 51348, source: 'remembered' });
+		expect(canBind.log).toEqual([{ port: 51348, host: '127.0.0.1' }]);
+	});
+
+	it('waits out a reachability conflict too, and keeps the port when it clears', async () => {
+		// The grace is about the previous run letting go, and it must not be scoped
+		// to one of the two questions: a port that comes back on BOTH is still the
+		// address the user was promised.
+		let attempts = 0;
+		const r = await choosePort({
+			remembered: 51348,
+			sticky: true,
+			host: '0.0.0.0',
+			canBind: async (_port: number, host: string) => host !== '127.0.0.1' || ++attempts >= 3,
+			freePort: async () => 40000,
+			sleep: async () => {}
+		});
+		expect(r).toEqual({ port: 51348, source: 'remembered' });
+		expect(attempts).toBe(3);
+	});
+
+	it('steps over a fresh candidate that binds but is not reachable either', async () => {
+		// The same class of bug in the fallback: `freePort()` binds 127.0.0.1, so it
+		// can hand back a port that is free there and squatted on the wildcard, or
+		// (with a wildcard role) one whose loopback address is taken.
+		const canBind = probeOnHost('127.0.0.1', 40000);
+		const r = await choosePort({
+			remembered: undefined,
+			sticky: true,
+			host: '0.0.0.0',
+			canBind,
+			freePort: scriptedFreePort(40000, 40001)
+		});
+		expect(r).toEqual({ port: 40001, source: 'fresh', reason: 'no-preference' });
 	});
 
 	it('refuses to launch rather than hand back a fresh port it cannot bind', async () => {
@@ -648,9 +741,16 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 			}
 		});
 		const hostFor = (port: number) => asked.find((a) => a.port === port)?.host;
+		const hostsFor = (port: number) => asked.filter((a) => a.port === port).map((a) => a.host);
 		expect(hostFor(r.appPort)).toBe('0.0.0.0');
 		expect(hostFor(r.mcpPort)).toBe('127.0.0.1');
 		expect(hostFor(r.jupyterPort)).toBe('127.0.0.1');
+		// ...and the WILDCARD role is additionally asked about the loopback address
+		// the printed URL lands on, which its bind-host probe provably cannot see.
+		// The loopback roles are asked once and once only.
+		expect(hostsFor(r.appPort)).toEqual(['0.0.0.0', '127.0.0.1']);
+		expect(hostsFor(r.mcpPort)).toEqual(['127.0.0.1']);
+		expect(hostsFor(r.jupyterPort)).toEqual(['127.0.0.1']);
 		// ...and the app follows HOST / the MCP server CELLAR_MCP_HOST, so the probe
 		// tracks a server that was told to bind somewhere else.
 		const asked2: { port: number; host: string }[] = [];
@@ -726,23 +826,55 @@ describe('resolveWorkspacePorts - a whole launch, without booting one', () => {
 	describe.skipIf(process.platform !== 'darwin')(
 		'wildcard-vs-loopback overlap (darwin only: BSD SO_REUSEADDR lets these coexist)',
 		() => {
-			it('leaves the app on its remembered port while a loopback-only squatter holds it', async () => {
+			it('gives up the remembered app port to a loopback squatter it could still BIND over', async () => {
+				// The overlap cuts both ways, and this is the side that bites the user.
+				// adapter-node would listen on 0.0.0.0:P perfectly happily beside this
+				// squatter - but the launcher prints and opens http://localhost:P, the
+				// MORE SPECIFIC binding wins the demux, and every one of those
+				// connections reaches the squatter. So a port that binds is not enough:
+				// it must also be free where the URL lands, or the app silently is not
+				// at the address the user was handed.
 				const first = await launch();
-				// Loopback-only squatters. The MCP server binds 127.0.0.1, so its port
-				// is genuinely taken; the app binds the wildcard, so on this platform
-				// its port is genuinely still free - probing both on one host would get
-				// one of them wrong, and getting the APP one wrong hands adapter-node a
-				// port it cannot listen on.
 				const onApp = await listenOn(first.appPort, '127.0.0.1');
+				const notes: string[] = [];
+				try {
+					const second = await launch({ log: (m: string) => notes.push(m) });
+					expect(second.appPort).not.toBe(first.appPort);
+					expect(second.app.source).toBe('fresh');
+					expect(second.app.reason).toBe('address-unreachable');
+					// A genuine, unexpected conflict, so it is announced - and with its
+					// OWN cause: `lsof` would show that port bindable, so "another process
+					// is using it" would send the user looking for something they cannot
+					// find.
+					const said = notes.join('\n');
+					expect(said).toContain(`app port ${first.appPort} was unavailable`);
+					expect(said).toContain(MOVE_CAUSE['address-unreachable']);
+					expect(said).not.toContain(MOVE_CAUSE['port-unavailable']);
+					// The replacement really is reachable at the address that gets printed.
+					const proof = await listenOn(second.appPort, '127.0.0.1');
+					await proof.close();
+				} finally {
+					await onApp.close();
+				}
+				// ...and once the squatter leaves, the folder's own address comes back.
+				writePortPrefs(ws, { appPort: first.appPort });
+				const third = await launch();
+				expect(third.appPort).toBe(first.appPort);
+				expect(third.app.source).toBe('remembered');
+			});
+
+			it('still tells the two roles apart: the MCP port is taken on the host it BINDS', async () => {
+				// The routing must not collapse into "probe everything everywhere". The
+				// MCP server binds 127.0.0.1, so a loopback squatter is a plain
+				// port-unavailable there - a different fact with a different message.
+				const first = await launch();
 				const onMcp = await listenOn(first.mcpPort, '127.0.0.1');
 				try {
 					const second = await launch();
-					expect(second.app.source).toBe('remembered');
-					expect(second.appPort).toBe(first.appPort);
 					expect(second.mcp.source).toBe('fresh');
 					expect(second.mcp.reason).toBe('port-unavailable');
+					expect(second.appPort).toBe(first.appPort);
 				} finally {
-					await onApp.close();
 					await onMcp.close();
 				}
 			});
@@ -1018,5 +1150,38 @@ describe('bindHosts - each role probes the address its own server binds', () => 
 			if (before === undefined) delete process.env.CELLAR_MCP_HOST;
 			else process.env.CELLAR_MCP_HOST = before;
 		}
+	});
+});
+
+describe('reachHostsFor - a wildcard bind is not the address anyone connects to', () => {
+	it('adds the loopback address a wildcard bind actually serves', () => {
+		// The default app role. The URL the launcher prints and opens is
+		// http://localhost:<port>, which for an IPv4-wildcard server lands on
+		// 127.0.0.1 - and a squatter there wins the demux over the wildcard.
+		expect(reachHostsFor('0.0.0.0')).toEqual(['127.0.0.1']);
+		// The IPv6 sibling, in every spelling `listen()` accepts.
+		for (const wildcard of ['::', '[::]', '::0']) {
+			expect(reachHostsFor(wildcard)).toEqual(['::1']);
+		}
+	});
+
+	it('adds NOTHING for a concrete host, which is already where people connect', () => {
+		// Both loopback roles, and `--dev`, whose bind host IS the name the printed
+		// URL uses - resolved the same way by the same Node.
+		for (const host of ['127.0.0.1', 'localhost', '::1', '192.168.1.10']) {
+			expect(reachHostsFor(host)).toEqual([]);
+		}
+		expect(reachHostsFor(bindHosts({}, { dev: true }).app)).toEqual([]);
+		expect(reachHostsFor(bindHosts({}).mcp)).toEqual([]);
+		expect(reachHostsFor(bindHosts({}).jupyter)).toEqual([]);
+	});
+
+	it('never adds an address from a family the bind host does not already serve', () => {
+		// This is what makes the extra probe safe to REQUIRE rather than prefer: a
+		// machine that can bind the IPv4 wildcard has 127.0.0.1 and one that can
+		// bind the IPv6 wildcard has ::1, so it can never veto every candidate port
+		// on a machine lacking a family and turn a hijack risk into a launch failure.
+		expect(reachHostsFor('0.0.0.0')).not.toContain('::1');
+		expect(reachHostsFor('::')).not.toContain('127.0.0.1');
 	});
 });
