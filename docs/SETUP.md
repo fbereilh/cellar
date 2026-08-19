@@ -12,7 +12,8 @@ clone-and-run path for contributors and teammates working from source.
 ## Prerequisites
 
 Cellar has no machine-specific paths baked in: it discovers your home directory,
-its own install location, and free ports at runtime. You only need the toolchain:
+its own install location, and the ports it needs at runtime. You only need the
+toolchain:
 
 | Tool | Version | Notes |
 | --- | --- | --- |
@@ -64,7 +65,9 @@ On this first run Cellar will, with your confirmation on a TTY:
    `ipywidgets` (a soft feature dependency for Databricks-style parameter
    widgets and other interactive widgets - it never prompts, and a failure is a
    quiet no-op rather than an error).
-5. Start the Jupyter sidecar and the app, allocate free ports, and open the browser.
+5. Start the Jupyter sidecar and the app, resolve their ports (an ordinary launch
+   re-uses the app/MCP ports this folder had last time, when they are still
+   free - see [Ports and networking](#ports-and-networking)), and open the browser.
 
 `Ctrl-C` shuts everything down cleanly. `cellar ../other-repo` opens a different
 folder without `cd`-ing. Pass `--yes` (or run under `$CI` / a non-TTY) to
@@ -230,9 +233,10 @@ nothing for another:
 | `claude` (Claude Code) | `<workspace>/.mcp.json` | JSON (`mcpServers`) |
 | `codex` (OpenAI Codex) | `<workspace>/.codex/config.toml` | TOML (`[mcp_servers.cellar]`) |
 
-Because the MCP port is chosen dynamically per run, agents are pointed at the
-**stdio command**, never a fixed URL - so nothing to reconfigure when ports
-change. The equivalent manual step for Claude Code is:
+Because the MCP port belongs to a running instance rather than to the folder's
+config, agents are pointed at the **stdio command**, never a fixed URL - so there
+is nothing to reconfigure when the port changes. The equivalent manual step for
+Claude Code is:
 
 ```sh
 claude mcp add cellar -- cellar mcp
@@ -241,6 +245,18 @@ claude mcp add cellar -- cellar mcp
 `cellar mcp` is a *bridge*, not a standalone server: it attaches to the Cellar
 instance running in that workspace. So a configured harness gets Cellar's tools
 only while `cellar` is running there.
+
+**Restarting Cellar does not mean restarting the agent.** A restart replaces the
+instance and every MCP session with it, but the bridge outlives that: it
+re-attaches to whatever instance serves the folder next and re-does the handshake
+itself, so the agent's next tool call just works - no reconnect, no host
+intervention, whether or not the port moved. If nothing is running in the folder,
+calls fail with a message naming the `cd <workspace> && cellar` that fixes it and
+the bridge keeps waiting, so it heals once Cellar is back (only a bridge that
+finds no instance at *startup* exits, non-zero). A request that was **in flight**
+when the instance went away is answered with an error saying its result can never
+be delivered and that the call may or may not have been applied - deliberately
+never re-sent, since re-sending a write could apply it twice.
 
 ### Which harnesses Cellar manages
 
@@ -554,17 +570,35 @@ stays a human action.
 ## Configuration reference (environment variables)
 
 All of these are optional. **Unset = the standard behavior**; set one only to
-deviate. Ports default to a **free ephemeral port** chosen per run (so concurrent
-`cellar` instances never collide) - pin them only when you need a predictable port
-to publish, e.g. inside a container.
+deviate. Pin a port only when you need a predictable one to publish, e.g. inside a
+container - see [Ports and networking](#ports-and-networking) for what an unset
+port does.
 
 ### Ports and networking
 
+A folder **remembers the ports it got** and asks for them again next launch (in
+the gitignored `<workspace>/.cellar/ports.json`), so the browser tab or bookmark
+you left open still works after a restart. The app and MCP ports are remembered;
+the Jupyter sidecar port is not, since only the launcher and the app ever see it.
+
+A remembered port is a *preference*, re-earned on every launch and never a claim:
+Cellar takes it only when nothing else has it, and **never reclaims it** from
+another running instance - it falls back to a fresh ephemeral port instead, then
+remembers that one so the next restart is stable again. Any such move is printed
+with its cause, so a changed address is never silent. Isolated (`CELLAR_ISOLATED`)
+and `--new` launches exist so concurrent instances cannot collide, so they neither
+read nor write the preference: an unpinned port there is always ephemeral (a pin
+still wins everywhere, which is why the Docker image can publish fixed ports).
+
+An explicit pin always wins, is used verbatim (never probed - it fails loudly at
+`listen()` if it is busy), and is deliberately **not** remembered, so it cannot
+outlive the run that asked for it.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CELLAR_APP_PORT` | free ephemeral | Fix the browser/app port (e.g. to publish it from Docker). |
-| `CELLAR_MCP_PORT` | free ephemeral (fallback `39587`) | Fix the MCP HTTP port. |
-| `CELLAR_JUPYTER_PORT` | free ephemeral | Fix the Jupyter sidecar port. |
+| `CELLAR_APP_PORT` | this folder's last app port, else free ephemeral | Fix the browser/app port (e.g. to publish it from Docker). |
+| `CELLAR_MCP_PORT` | this folder's last MCP port, else free ephemeral (app fallback `39587`) | Fix the MCP HTTP port. |
+| `CELLAR_JUPYTER_PORT` | free ephemeral (never remembered) | Fix the Jupyter sidecar port. |
 | `CELLAR_MCP_HOST` | `127.0.0.1` | Interface the MCP server binds. Set `0.0.0.0` to expose it (containers). |
 | `CELLAR_NO_BROWSER` | unset | `1`/`true`/`yes` skips auto-opening the browser. |
 
@@ -651,9 +685,11 @@ spec files at a time. Install its browser once with `npx playwright install chro
   `npm run build` (or `make run`, which rebuilds only when stale), pass `--dev` for
   the Vite dev server, or set `CELLAR_SKIP_BUILD_CHECK=1` to serve the stale build
   anyway. A packaged install (npm/brew/Docker) never triggers this.
-- **Port already in use** - Cellar picks free ports by default, so this only
-  happens if you pinned `CELLAR_APP_PORT` / `CELLAR_MCP_PORT` / `CELLAR_JUPYTER_PORT`.
-  Unset them to let Cellar choose.
+- **Port already in use** - Cellar yields rather than fights for a port, so this
+  only happens if you pinned `CELLAR_APP_PORT` / `CELLAR_MCP_PORT` /
+  `CELLAR_JUPYTER_PORT`. Unset them to let Cellar choose. A *remembered* port that
+  something else has taken is not an error: Cellar says so, picks a fresh one, and
+  remembers that instead.
 - **An agent doesn't see Cellar's tools** - run `cellar harness list` in the
   project: it shows whether Cellar manages that harness here and whether its
   config registers `cellar` right now. `cellar harness add <name>` fixes both (and
