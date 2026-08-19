@@ -294,19 +294,19 @@
 	// state with its Reconnect button.
 	let restarting = $state(false);
 	/**
-	 * The notebook the panel's OWN in-flight transition (a connect, or the kernel
-	 * restart an `applyRuntime` issues) was latched for. This panel is ONE long-lived
-	 * component whose `notebookPath` follows the active tab while `busy`/`restarting`/
-	 * `runtimeApplying`/`connectOverLive` are panel-wide, so without it a connect that
-	 * can run to MINUTES held the whole connected view over whichever notebook the user
-	 * tabbed to next - one with no session of its own. Same idiom as
-	 * `uploadToWorkspace`'s `const target = notebookPath`; the rule that reads it is
+	 * The notebook the kernel RESTART `applyRuntime` issues was latched for, and only
+	 * that: `applyRuntime` is its SINGLE writer and cannot run while `busy` is set, so
+	 * a connect can never take this latch over from a restart still settling on another
+	 * notebook. `busyPath` answers for everything else, all seven verbs included. This
+	 * panel is ONE long-lived component whose `notebookPath` follows the active tab
+	 * while `restarting`/`runtimeApplying` are panel-wide, so without it a restart that
+	 * runs for minutes spoke for whichever notebook the user tabbed to next. Same idiom
+	 * as `uploadToWorkspace`'s `const target = notebookPath`; the rule that reads it is
 	 * `panelOwnsTransition` in `$lib/databricksPanelState`.
 	 *
-	 * Set at the start of every transition and deliberately NEVER cleared: it is only
-	 * ever consulted while a transition flag is set, and clearing it in a `finally`
-	 * would let a connect settling on notebook A wipe the ownership a runtime apply
-	 * started on B in the meantime.
+	 * Deliberately NEVER cleared: it is only ever consulted while a restart flag is set,
+	 * and clearing it in a `finally` would let a later transition wipe ownership its
+	 * own writer had recorded.
 	 */
 	let transitionPath = $state<string | null | undefined>(undefined);
 	onMount(() => {
@@ -2013,7 +2013,8 @@
 			sparkVersion: connection.sparkVersion,
 			lastProfile: metaOwned ? lastProfile : null,
 			lastHost: metaOwned ? lastHost : null,
-			connecting: panel.connecting
+			connecting: panel.connecting,
+			restarting: panel.restarting
 		})
 	);
 
@@ -2749,7 +2750,7 @@
 	<div class="rounded-lg border border-base-300 bg-base-100 p-2.5" data-testid="databricks-runtime-card">
 		<div class="flex items-center justify-between gap-2">
 			{@render cardLabel('runtime')}
-			{#if runtimeApplying}
+			{#if cardFlags.runtimeApplying}
 				<span class="flex items-center gap-1 text-[10px] text-base-content/40" data-testid="databricks-runtime-applying">
 					<span class="loading loading-spinner loading-xs"></span>restarting…
 				</span>

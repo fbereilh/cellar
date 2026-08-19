@@ -173,13 +173,16 @@ export function ownedTransitionFlags(i: DbxPanelInputs): { busy: string; runtime
  * `spark`/`w`-are-ready line was swapped out to avoid.
  *
  * The workspace half falls back to the last connection that was really live, because
- * the payload legitimately drops it: a re-pin kernel restart mid-switch reports the
- * session lost, and that shape carries no top-level `profile`/`host`. Read straight
- * from it the line came out EMPTY, its `{#if}` unmounted and the card lost a row
- * mid-switch - the layout jump this whole task exists to remove, in the one frame the
- * latch was built for. It is not a stale claim: a switch stays inside one workspace
- * (`connectionParams()` sends no cluster at all), so it is the same profile and host
- * the connect is targeting.
+ * the payload legitimately drops it: a kernel restart under EITHER face - the re-pin
+ * one mid-switch, or the one a runtime toggle issues - reports the session lost, and
+ * that shape carries no top-level `profile`/`host`. Read straight from it the line
+ * came out EMPTY, its `{#if}` unmounted and the card lost a row for the whole restart
+ * - the layout jump this task exists to remove. So the fallback is gated on the card
+ * HOLDING a transition at all, not on the connecting face alone: both faces meet the
+ * identical payload, and covering one would leave the jump on its sibling. It is not
+ * a stale claim either way: a switch stays inside one workspace
+ * (`connectionParams()` sends no cluster at all) and a runtime restart does not change
+ * workspace, so it is the same profile and host the card was already showing.
  */
 export function connectionMetaLine(i: {
 	profile?: string | null;
@@ -188,9 +191,13 @@ export function connectionMetaLine(i: {
 	lastProfile?: string | null;
 	lastHost?: string | null;
 	connecting: boolean;
+	restarting?: boolean;
 }): string {
-	const profile = i.profile ?? (i.connecting ? i.lastProfile : null);
-	const host = i.host ?? (i.connecting ? i.lastHost : null);
+	// The DBR stays scoped to the CONNECTING face: only a switch changes cluster, so
+	// only there is the session's runtime the outgoing one's.
+	const holding = i.connecting || !!i.restarting;
+	const profile = i.profile ?? (holding ? i.lastProfile : null);
+	const host = i.host ?? (holding ? i.lastHost : null);
 	return [
 		profile,
 		host ? host.replace(/^https?:\/\//, '') : null,

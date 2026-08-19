@@ -350,6 +350,29 @@ describe('the connection meta line', () => {
 		expect(connectionMetaLine(midRestart)).toBe('DEFAULT · dbc-demo.cloud.databricks.com');
 	});
 
+	it('holds the row on the RESTART face too, which meets the same payload', () => {
+		// A runtime toggle restarts the kernel, so the status read reports the session
+		// lost with no top-level profile/host - the identical shape, on the sibling
+		// face. Covering only `connecting` left the row unmounting for the whole
+		// restart. A runtime restart does not change workspace, so the fallback is the
+		// same profile and host the card was already showing.
+		const midRuntimeRestart = {
+			profile: undefined,
+			host: undefined,
+			sparkVersion: undefined,
+			lastProfile: LIVE.lastProfile,
+			lastHost: LIVE.lastHost,
+			connecting: false,
+			restarting: true
+		};
+		expect(connectionMetaLine(midRuntimeRestart)).toBe('DEFAULT · dbc-demo.cloud.databricks.com');
+		// The cluster is unchanged by a restart, so its DBR is not the outgoing one's
+		// and is kept whenever the payload still carries it.
+		expect(connectionMetaLine({ ...LIVE, connecting: false, restarting: true })).toBe(
+			'DEFAULT · dbc-demo.cloud.databricks.com · 15.4.x-scala2.12'
+		);
+	});
+
 	it('does NOT resurrect a workspace half once the transition is over', () => {
 		// Not connecting: nothing is being held, so the line reports only what is there.
 		expect(
@@ -422,49 +445,53 @@ describe('exactly one view, and only the connected one carries a face', () => {
 		for (const notebookPath of [NB, OTHER])
 			for (const busyPath of [NB, OTHER])
 				for (const busy of ['', 'connect', 'disconnect'])
-				for (const connected of bools)
-					for (const restarting of bools)
-						for (const serverRestarting of bools)
-							for (const runtimeApplying of bools)
-								for (const connectOverLive of bools)
-									for (const expired of bools)
-										for (const lost of bools) {
-											const i: DbxPanelInputs = {
-												notebookPath,
-												transitionPath: NB,
-												busy,
-												busyPath: NB,
-												connected,
-												restarting,
-												serverRestarting,
-												runtimeApplying,
-												connectOverLive,
-												expired,
-												lost
-											};
-											const s = databricksPanelState(i);
-											const label = JSON.stringify(i);
-											expect(['connecting', 'connected', 'expired', 'lost', 'picker'], label).toContain(s.view);
-											// A face is a state OF the Cluster card, so it can only ever ride the
-											// connected view - a standalone/expired/lost card has no face to wear.
-											if (s.view !== 'connected') {
-												expect(s.connecting, label).toBe(false);
-												expect(s.restarting, label).toBe(false);
+					for (const connected of bools)
+						for (const restarting of bools)
+							for (const serverRestarting of bools)
+								for (const runtimeApplying of bools)
+									for (const connectOverLive of bools)
+										for (const expired of bools)
+											for (const lost of bools) {
+												const i: DbxPanelInputs = {
+													notebookPath,
+													transitionPath: NB,
+													busy,
+													busyPath,
+													connected,
+													restarting,
+													serverRestarting,
+													runtimeApplying,
+													connectOverLive,
+													expired,
+													lost
+												};
+												const s = databricksPanelState(i);
+												const label = JSON.stringify(i);
+												expect(['connecting', 'connected', 'expired', 'lost', 'picker'], label).toContain(s.view);
+												// A face is a state OF the Cluster card, so it can only ever ride the
+												// connected view - a standalone/expired/lost card has no face to wear.
+												if (s.view !== 'connected') {
+													expect(s.connecting, label).toBe(false);
+													expect(s.restarting, label).toBe(false);
+												}
+												// The two faces are mutually exclusive: the header renders one badge slot.
+												expect(s.connecting && s.restarting, label).toBe(false);
+												// A held view is never claimed without something to hold it.
+												if (s.view === 'connected') expect(holdsConnectedView(i), label).toBe(true);
+												// The RESTART half answers to `transitionPath`: a runtime apply latched
+												// elsewhere may never put THIS card into the restarting face.
+												if (!panelOwnsTransition(i)) expect(s.restarting, label).toBe(false);
+												// The CONNECT half answers to `busyPath`. With neither latch ours the
+												// panel contributes nothing of its own, and the only thing that may
+												// still move it is the server's own per-notebook grace window.
+												if (!panelOwnsTransition(i) && !panelOwnsBusy(i)) {
+													expect(holdsConnectedView(i), label).toBe(connected);
+													if (!serverRestarting) {
+														expect(expectedTransition(i), label).toBe(false);
+														expect(s.connecting, label).toBe(false);
+													}
+												}
 											}
-											// The two faces are mutually exclusive: the header renders one badge slot.
-											expect(s.connecting && s.restarting, label).toBe(false);
-											// A held view is never claimed without something to hold it.
-											if (s.view === 'connected') expect(holdsConnectedView(i), label).toBe(true);
-											// A transition owned by ANOTHER notebook contributes nothing: the only
-											// thing that may still move an unowned panel is the server's own
-											// per-notebook grace window.
-											if (!panelOwnsTransition(i) && !serverRestarting) {
-												expect(expectedTransition(i), label).toBe(false);
-												expect(s.restarting, label).toBe(false);
-												expect(s.connecting, label).toBe(false);
-												expect(holdsConnectedView(i), label).toBe(connected);
-											}
-										}
 	});
 });
 
