@@ -11,8 +11,8 @@
  *   DISK), with `session` null (no kernel touched, ran_this_session honestly
  *   false) and never `kernel_unavailable`;
  * - each failure persists a friendly markdown message (never a traceback), and
- *   `lastRun.chatFailure` rides the published `run:end` so the bulk-run loop
- *   can stop on `rate_limited`;
+ *   the failure IS the persisted output, so a reader sees what went wrong
+ *   without a second call;
  * - `abortChatRuns(nb)` reaches a run in flight (the interrupt/restart/teardown
  *   door) and it settles `cancelled`;
  * - an over-budget transcript is REFUSED before the engine is spawned, with a
@@ -136,14 +136,12 @@ describe('a successful chat run', () => {
 			expect(chat.outputs[0].output_type).toBe('display_data');
 			const diskMd = chat.outputs[0].data['text/markdown'];
 			expect((Array.isArray(diskMd) ? diskMd.join('') : diskMd) as string).toBe('The value is **1**.');
-			// lastRun: ok, engine provenance, NO chatFailure - and runtime-only
-			// (stripped from the disk copy just read).
+			// lastRun: ok, and runtime-only (stripped from the disk copy just read).
 			expect(res.lastRun.status).toBe('ok');
-			expect(res.lastRun.chatEngine).toBe('claude-cli/9.9.9');
-			expect(res.lastRun.chatFailure).toBeUndefined();
+			expect(res.lastRun.session).toBeNull();
 			expect(chat.metadata.cellar?.lastRun).toBeUndefined();
 			expect(endEvents).toHaveLength(1);
-			expect(endEvents[0].chatFailure).toBeUndefined();
+			expect(endEvents[0].status).toBe('ok');
 		} finally {
 			unsub();
 		}
@@ -158,8 +156,8 @@ describe('a successful chat run', () => {
 	});
 });
 
-describe('failures are distinct, friendly and legible to the bulk loop', () => {
-	it('rate_limited persists actionable markdown and rides run:end as chatFailure', async () => {
+describe('failures are distinct, friendly and readable in the cell', () => {
+	it('rate_limited persists actionable markdown as the run result', async () => {
 		const { nb } = makeNotebook('limited.ipynb');
 		scriptedEngine(async () => ({
 			ok: false,
@@ -175,8 +173,8 @@ describe('failures are distinct, friendly and legible to the bulk loop', () => {
 			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
 			expect(res.status).toBe('error');
 			expect(res.kernelDown).toBe(false); // a chat failure is never "kernel down"
-			expect(res.lastRun.chatFailure).toBe('rate_limited');
-			expect(endEvents[0].chatFailure).toBe('rate_limited'); // what runCodeIds stops on
+			expect(res.lastRun.status).toBe('error');
+			expect(endEvents[0].status).toBe('error');
 			// A friendly markdown message, not a traceback.
 			expect(res.outputs).toHaveLength(1);
 			expect(res.outputs[0].output_type).toBe('display_data');
@@ -198,13 +196,12 @@ describe('failures are distinct, friendly and legible to the bulk loop', () => {
 			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
 			expect(prompts).toHaveLength(0);
 			expect(res.status).toBe('error');
-			expect(res.lastRun.chatFailure).toBe('not_signed_in');
 			const md = (res.outputs[0] as { data: Record<string, string> }).data['text/markdown'];
 			expect(md).toContain('Not signed in');
 
 			authmod.__setChatAuthForTests({ kind: 'none', notInstalled: true });
 			const res2 = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
-			expect(res2.lastRun.chatFailure).toBe('not_installed');
+			expect(res2.status).toBe('error');
 			const md2 = (res2.outputs[0] as { data: Record<string, string> }).data['text/markdown'];
 			expect(md2).toContain('not installed');
 		} finally {
@@ -243,7 +240,8 @@ describe('the stop doors reach a chat run', () => {
 		expect(activemod.abortChatRuns(nb)).toBe(1);
 		const res = await p;
 		expect(res.status).toBe('error');
-		expect(res.lastRun.chatFailure).toBe('cancelled');
+		const cancelledMd = (res.outputs[0] as { data: Record<string, string> }).data['text/markdown'];
+		expect(cancelledMd).toContain('interrupted');
 		expect(activemod.abortChatRuns(nb)).toBe(0); // nothing left registered
 	});
 
@@ -310,7 +308,6 @@ describe('an over-budget transcript is refused, not sent', () => {
 		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
 		expect(prompts).toHaveLength(0);
 		expect(res.status).toBe('error');
-		expect(res.lastRun.chatFailure).toBe('transcript_too_large');
 		expect(res.outputs).toHaveLength(1);
 		const md = (res.outputs[0] as { data: Record<string, string> }).data['text/markdown'];
 		expect(md).toContain('Too much to send');
@@ -323,13 +320,12 @@ describe('an over-budget transcript is refused, not sent', () => {
 		const { nb } = makeNotebook('huge2.ipynb');
 		nbmod.setOutputs('pycell', [{ output_type: 'stream', name: 'stdout', text: 'x'.repeat(700_000) }], nb);
 		scriptedEngine(async () => ({ ok: true, failure: null, engine: null, replyText: 'ok' }));
-		expect((await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' })).lastRun.chatFailure).toBe(
-			'transcript_too_large'
-		);
+		const refused = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(refused.status).toBe('error');
+		expect((refused.outputs[0] as { data: Record<string, string> }).data['text/markdown']).toContain('Too much to send');
 		nbmod.clearOutputs('pycell', nb); // the remedy the message names
 		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
 		expect(res.status).toBe('ok');
-		expect(res.lastRun.chatFailure).toBeUndefined();
 	});
 });
 

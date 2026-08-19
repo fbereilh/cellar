@@ -118,7 +118,7 @@ describe('a stop landing while the account resolves', () => {
 		expect(turns).toEqual([]);
 		// ...and the run says it was stopped rather than reporting a reply.
 		expect(res.status).toBe('error');
-		expect(res.lastRun.chatFailure).toBe('cancelled');
+		expect(res.lastRun.status).toBe('error');
 		expect(res.outputs).toHaveLength(1);
 		const md = (res.outputs[0] as { data: Record<string, string> }).data['text/markdown'];
 		expect(md).toContain('interrupted');

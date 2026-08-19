@@ -710,15 +710,20 @@
 				// markdown source. Browser-only like the markdown-cell render
 				// (DOMPurify needs a DOM); SSR falls through to the text/plain twin.
 				//
-				// WHICH renderer is a property of the CELL, not of the mime: a chat
-				// cell's payload is the model's authored PROSE, where `$x$` means
-				// math, so it takes `renderChatReply` - the same prose engine as a
-				// markdown cell, sanitized through the profile that lets nothing in
-				// a MODEL-generated reply fetch on render (see `markdown.ts`). Any
-				// other cell's is KERNEL OUTPUT - arbitrary data, where
-				// `display(Markdown('Revenue: $5 vs $1,200'))` must keep its dollar
-				// amounts - so it takes `renderOutputMarkdown` (math off), the same
-				// content-class split `renderTable` above already makes.
+				// BOTH renderers are OUTPUT renderers: nothing in a `text/markdown`
+				// payload fetches on render, whatever the cell's current type. That
+				// rule keys on PROVENANCE - this markdown was emitted by a machine,
+				// never authored by the user - because a cell's logical type is
+				// MUTABLE (retyping a chat cell to code KEEPS its outputs) and a
+				// foreign notebook's metadata is FORGEABLE, so neither could carry
+				// the guarantee. See `$lib/markdownNoFetch`.
+				//
+				// The one thing the CELL still decides is MATH: a chat cell's payload
+				// is the model's PROSE, where `$x$` means math, so it takes
+				// `renderChatReply`. Any other cell's is KERNEL OUTPUT - arbitrary
+				// data, where `display(Markdown('Revenue: $5 vs $1,200'))` must keep
+				// its dollar amounts - so it takes `renderOutputMarkdown` (math off),
+				// the same content-class split `renderTable` above already makes.
 				if (browser && d['text/markdown']) {
 					const md = asText(d['text/markdown']);
 					return { tone: 'result', markdownHtml: isChat ? renderChatReply(md) : renderOutputMarkdown(md), segments: null };
@@ -752,10 +757,12 @@
 	// append-only render that keeps a runaway cell from re-rendering its whole
 	// history each chunk. `renderOutput` is a pure function of its output, so
 	// caching by identity is sound EXCEPT for the one thing `renderOutput` reads
-	// besides its argument - `isChat`, which decides the markdown renderer above -
-	// so the entry records the mode it was rendered in and a converted cell
-	// (code<->chat keeps its outputs) re-renders instead of serving the other
-	// content class's render. The WeakMap lets overwritten objects be GC'd.
+	// besides its argument - `isChat`, which decides whether the markdown renderer
+	// above parses math - so the entry records the mode it was rendered in and a
+	// converted cell (code<->chat keeps its outputs) re-renders instead of serving
+	// the other content class's render. Both modes are no-fetch, so a conversion
+	// can never re-open the image channel either. The WeakMap lets overwritten
+	// objects be GC'd.
 	const renderCache = new WeakMap<CellOutput, { chat: boolean; rendered: RenderedOutput }>();
 	function renderOutputMemo(o: CellOutput): RenderedOutput {
 		const hit = renderCache.get(o);

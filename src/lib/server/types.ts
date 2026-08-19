@@ -54,16 +54,6 @@ export interface LastRun {
 	session: SessionId | null;
 	/** Set when execute() threw before any kernel existed (a live kernel-down failure). */
 	kernel_unavailable?: boolean;
-	/**
-	 * A CHAT run's failure kind ('not_installed' | 'not_signed_in' | 'rate_limited'
-	 * | 'api_error' | 'unsafe_init' | 'cancelled') - absent for kernel runs and for
-	 * a chat run that succeeded. Runtime-only like the rest of `lastRun` (never
-	 * persisted); it rides the `run:end` frame so the bulk-run loop can stop on the
-	 * first rate-limited chat cell instead of failing every one identically.
-	 */
-	chatFailure?: string;
-	/** The chat engine + version a chat run used (e.g. 'claude-cli/2.1.235'). */
-	chatEngine?: string;
 }
 
 /**

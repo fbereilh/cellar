@@ -22,7 +22,7 @@ import { setOutputs, setOutputsLive, setLastRun, clearOutputsLive, getCell } fro
 import { publish } from './events';
 import { isChatCell, isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
-import { executeChatRun, chatReplyOutput, type ChatRunOutcome } from './chat/run-chat';
+import { executeChatRun, chatReplyOutput } from './chat/run-chat';
 import { OutputAccumulator, OUTPUT_FLUSH_MS, type StreamDelta } from './output-accumulator';
 import { registerRunOutputs, unregisterRunOutputs } from './run-output-registry';
 import { noteRunStarted } from './run-queue';
@@ -134,7 +134,6 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	let status = 'ok';
 	let session: SessionId | null = null;
 	let kernelDown = false;
-	let chatOutcome: ChatRunOutcome | null = null;
 	let outputs: CellOutput[];
 	try {
 		try {
@@ -142,8 +141,7 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 				// No kernel, no session epoch: the reply streams from the ChatEngine into
 				// the same accumulator. `session` stays null - a chat run touches no
 				// namespace, so ran_this_session honestly reads false.
-				chatOutcome = await executeChatRun({ nb, cellId, question: source, acc });
-				status = chatOutcome.status;
+				status = (await executeChatRun({ nb, cellId, question: source, acc })).status;
 			} else {
 				const reply = await execute(nb, execSource, (ev) => {
 					if (ev.type === 'output') {
@@ -216,12 +214,7 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 		actor,
 		status,
 		session,
-		...(kernelDown ? { kernel_unavailable: true } : {}),
-		// Chat provenance + failure kind ride the runtime-only stamp (and therefore
-		// run:end), so the bulk-run loop can stop at the first rate-limited chat
-		// cell instead of failing every later one with the same message.
-		...(chatOutcome?.chatFailure ? { chatFailure: chatOutcome.chatFailure } : {}),
-		...(chatOutcome?.chatEngine ? { chatEngine: chatOutcome.chatEngine } : {})
+		...(kernelDown ? { kernel_unavailable: true } : {})
 	};
 	setLastRun(cellId, lastRun, nb);
 	onEvent?.({ type: 'run:end', ...lastRun });

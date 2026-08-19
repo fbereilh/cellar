@@ -29,13 +29,16 @@ import { chatEngine } from './engine';
 import { chatFailure, chatFailureOutput } from './failure';
 import { buildChatPrompt, chatPromptTooLarge, chatPromptTooLargeMessage } from './transcript';
 
-/** What the chat branch hands back to `executeCellRun` for the lastRun stamp. */
+/**
+ * What the chat branch hands back to `executeCellRun`.
+ *
+ * The outcome is the RUN's status and nothing else: the failure itself is
+ * already a persisted output (a friendly markdown message the user reads), so a
+ * second copy of the kind on the run stamp would be write-only state - no bulk
+ * path can produce a chat failure any more, both surfaces skipping chat cells.
+ */
 export interface ChatRunOutcome {
 	status: 'ok' | 'error';
-	/** Set on failure; rides `lastRun.chatFailure` so the bulk-run loop can stop. */
-	chatFailure?: ChatFailureKind;
-	/** Engine provenance (e.g. `claude-cli/2.1.235`) when known. */
-	chatEngine?: string;
 }
 
 /**
@@ -71,7 +74,7 @@ export async function executeChatRun({
 	try {
 		const cancelled = (): ChatRunOutcome => {
 			acc.push(chatFailureOutput(chatFailure('cancelled', 'interrupted')));
-			return { status: 'error', chatFailure: 'cancelled' };
+			return { status: 'error' };
 		};
 		if (ctrl.signal.aborted) return cancelled();
 		const auth = await resolveChatAuth();
@@ -81,7 +84,7 @@ export async function executeChatRun({
 		if (auth.kind === 'none') {
 			const kind: ChatFailureKind = auth.notInstalled ? 'not_installed' : 'not_signed_in';
 			acc.push(chatFailureOutput(chatFailure(kind, '')));
-			return { status: 'error', chatFailure: kind };
+			return { status: 'error' };
 		}
 
 		const { prompt } = buildChatPrompt(listCells(nb), cellId, question);
@@ -94,7 +97,7 @@ export async function executeChatRun({
 		if (oversize) {
 			const kind: ChatFailureKind = 'transcript_too_large';
 			acc.push(chatFailureOutput(chatFailure(kind, chatPromptTooLargeMessage(oversize))));
-			return { status: 'error', chatFailure: kind };
+			return { status: 'error' };
 		}
 		let sawDelta = false;
 		const res = await chatEngine().run({
@@ -113,15 +116,11 @@ export async function executeChatRun({
 			if (!sawDelta && res.replyText) {
 				acc.push({ output_type: 'stream', name: 'stdout', text: res.replyText });
 			}
-			return { status: 'ok', ...(res.engine ? { chatEngine: res.engine } : {}) };
+			return { status: 'ok' };
 		}
 		const failure = res.failure ?? chatFailure('api_error', 'the chat engine failed without a reason');
 		acc.push(chatFailureOutput(failure));
-		return {
-			status: 'error',
-			chatFailure: failure.kind,
-			...(res.engine ? { chatEngine: res.engine } : {})
-		};
+		return { status: 'error' };
 	} finally {
 		unregisterChatRun(nb, ctrl);
 	}

