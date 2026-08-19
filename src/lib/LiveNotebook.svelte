@@ -5,9 +5,12 @@
 	import { cellIdOfKey, computeFolding, computeHeadingNumbers, foldSignature, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
 	import { cellClipboard } from '$lib/cellClipboard';
+	import { CHAT_RATE_LIMITED } from '$lib/chatCell';
 	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
 	import {
+		CHAT_LANGUAGE,
 		isLogicalCellType,
+		languageTagFor,
 		nbCellType,
 		RAW_UNSUPPORTED_REASON,
 		SQL_LANGUAGE,
@@ -1593,7 +1596,9 @@
 						? 'raw'
 						: ev.language === SQL_LANGUAGE
 							? 'sql'
-							: 'code';
+							: ev.language === CHAT_LANGUAGE
+								? 'chat'
+								: 'code';
 			applyCellTypeLocally(ev.cellId, logical);
 		} else if (ev.type === 'cell:cleared') {
 			const cell = findCell(ev.cellId);
@@ -1871,7 +1876,7 @@
 	 * same click; the server dedupes authoritatively (`run:duplicate`), because a
 	 * second tab or an agent can ask for the same cell at the same moment.
 	 */
-	async function runCell(id: string, source: string) {
+	async function runCell(id: string, source: string): Promise<{ chatFailure?: string } | undefined> {
 		const cell = findCell(id);
 		if (!cell) return;
 		// Markdown "runs" by rendering client-side (in the Cell) — no kernel.
@@ -1887,6 +1892,9 @@
 		if (runningId === id || queued[id] != null) return;
 		onRunStart?.(path, id);
 		cell.source = source;
+		// A chat run's failure kind, read off the run:end frame so the bulk-run
+		// loop can stop at the first rate-limited chat cell (see runCodeIds).
+		let chatFailure: string | undefined;
 		// The run's own lifecycle, learned from the server: `started` flips on the
 		// `run:start` frame. Everything that mutates this cell's outputs is gated on
 		// it, so a request the server refused (duplicate) or dropped (a restart
@@ -1952,6 +1960,7 @@
 						applyOutputAppend(cell, ev.index, ev.base, ev.keep, ev.chunk);
 					} else if (ev.type === 'run:end') {
 						stampLastRun(cell, ev); // this tab's own user run → its badge
+						if (typeof ev.chatFailure === 'string') chatFailure = ev.chatFailure;
 					}
 					// `run:duplicate` / `run:cancelled` close the stream without a run:start:
 					// the cell keeps its outputs untouched (we only clear on run:start) and
@@ -1976,6 +1985,7 @@
 			onRunEnd?.();
 			scheduleStaleness(); // this cell (and its dependents) may have changed staleness
 		}
+		return chatFailure ? { chatFailure } : undefined;
 	}
 
 	/**
@@ -2026,8 +2036,15 @@
 				if (!cell || cell.cell_type !== 'code') continue;
 				// Use the editor's LIVE text, not the debounced `cell.source`.
 				const src = cellApis[id]?.currentSource?.() ?? cell.source;
-				await runCell(id, src);
+				const res = await runCell(id, src);
 				if (interruptGeneration !== gen) return; // interrupted mid-batch
+				// A rate-limited CHAT cell stops the batch: the limit is account-wide,
+				// so every later chat cell would fail with the same message, and the
+				// stop is what makes the one failure legible instead of N copies.
+				if (res?.chatFailure === CHAT_RATE_LIMITED) {
+					onNotice?.('Run stopped: chat is rate-limited. Wait for the window to reset or switch accounts, then re-run.');
+					return;
+				}
 			}
 		} finally {
 			// In a `finally` so an early return (interrupted mid-batch) or a throw can
@@ -2112,13 +2129,14 @@
 	function applyCellTypeLocally(id: string, cellType: LogicalCellType) {
 		const cell = findCell(id);
 		if (!cell) return;
-		// 'sql' is a code cell tagged cellar.language='sql' ($lib/cellLanguage.js);
-		// 'code' clears that tag. Reassign metadata (the cell may have had no cellar
-		// namespace) so the SQL/Python grammar switch in Cell.svelte reacts.
-		const isSql = cellType === 'sql';
+		// 'sql'/'chat' are code cells tagged cellar.language ($lib/cellLanguage.js's
+		// `languageTagFor`, the ONE tag rule); 'code' clears the tag. Reassign
+		// metadata (the cell may have had no cellar namespace) so the grammar switch
+		// in Cell.svelte reacts.
+		const lang = languageTagFor(cellType);
 		cell.cell_type = nbCellType(cellType);
 		const cellar = { ...(cell.metadata?.cellar ?? {}) };
-		if (isSql) cellar.language = 'sql';
+		if (lang) cellar.language = lang;
 		else delete cellar.language;
 		// The same drops the server's `applyCellType` makes - neither the imports role
 		// nor the export flag may sit on a cell holding no Python - mirrored here for
@@ -2126,7 +2144,7 @@
 		// half that skipped them would keep drawing the imports/export badge over a
 		// cell the server has already stripped, with no event able to correct it
 		// before reload. `hide_input` is KEPT, exactly as the server keeps it.
-		const runnable = cell.cell_type === 'code' && !isSql;
+		const runnable = cell.cell_type === 'code' && !lang;
 		if (!runnable) {
 			if (cellar.role === IMPORTS_ROLE) delete cellar.role;
 			if (cellar.export) delete cellar.export;

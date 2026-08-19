@@ -42,6 +42,7 @@ import {
 	isValidChatSlotName,
 	type ChatAccountInfo,
 	type ChatAuthResolution,
+	type ChatLoginView,
 	type ChatSlotInfo
 } from '$lib/chatCell';
 import { getUserSettings, setUserSettings } from '$lib/server/user-settings';
@@ -225,20 +226,7 @@ export function selectChatSlot(slot: string | null): void {
 // ---------------------------------------------------------------------------
 
 /** A login attempt's live, renderable state (no secrets - see the header). */
-export interface ChatLoginState {
-	id: string;
-	slot: string;
-	/** The URL the CLI's own loopback flow wants opened (completes with no paste). */
-	browserUrl: string | null;
-	/** The printed fallback URL whose flow ends in a pasted code. */
-	pasteUrl: string | null;
-	/** Still waiting on the child (and the human). */
-	running: boolean;
-	/** Once the child exits: did the slot end up authenticated? */
-	ok: boolean | null;
-	account: ChatAccountInfo | null;
-	error: string | null;
-}
+export type ChatLoginState = ChatLoginView;
 
 interface LoginSession {
 	id: string;

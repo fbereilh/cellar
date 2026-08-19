@@ -73,3 +73,23 @@ export interface ChatAuthResolution {
 	/** True when the `claude` CLI itself could not be found. */
 	notInstalled?: boolean;
 }
+
+/**
+ * One sign-in attempt's renderable state (`/api/chat/login`). URLs to open,
+ * running/settled flags, the account identity once settled - NEVER a
+ * credential: the pasted authorisation code travels the other way (browser ->
+ * child stdin) and is never echoed back or logged.
+ */
+export interface ChatLoginView {
+	id: string;
+	slot: string;
+	/** The URL the CLI's own loopback flow wants opened (completes with no paste). */
+	browserUrl: string | null;
+	/** The printed fallback URL whose flow ends in a pasted code. */
+	pasteUrl: string | null;
+	running: boolean;
+	/** Once settled: did the slot end up authenticated? */
+	ok: boolean | null;
+	account: ChatAccountInfo | null;
+	error: string | null;
+}

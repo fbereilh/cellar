@@ -58,7 +58,7 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { TEXT_NOTEBOOK_RAW_MESSAGE, isSqlCell, isRawCell, logicalCellType, textNotebookRawCellError } from '../../cellLanguage';
+import { TEXT_NOTEBOOK_RAW_MESSAGE, isSqlCell, isRawCell, isChatCell, logicalCellType, textNotebookRawCellError } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { isExportCell, canExportCell, exportCellCount } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
@@ -768,7 +768,7 @@ function readForm(
 	return {
 		id: toHandle(cell.id),
 		type: cell.cell_type,
-		...(isSqlCell(cell) ? { language: 'sql' } : {}),
+		...(isSqlCell(cell) ? { language: 'sql' } : isChatCell(cell) ? { language: 'chat' } : {}),
 		source: cell.source,
 		run_status: runStatus(cell, sid),
 		...staleFields(staleEntry, toHandle),
@@ -880,7 +880,7 @@ export async function getNotebookMap(nb?: string | null) {
 	const leaf = (c: CellView) => ({
 		id: toHandle(c.id),
 		type: c.cell_type,
-		...(isSqlCell(c) ? { language: 'sql' } : {}),
+		...(isSqlCell(c) ? { language: 'sql' } : isChatCell(c) ? { language: 'chat' } : {}),
 		summary: firstLine(c.source),
 		run_status: runStatus(c, sid),
 		...staleFields(stale[c.id], toHandle),

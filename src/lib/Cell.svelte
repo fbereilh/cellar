@@ -23,7 +23,7 @@
 	import { isExportCell } from '$lib/exportRole';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
-	import { isSqlCell, isRawCell, logicalCellType } from '$lib/cellLanguage';
+	import { isSqlCell, isRawCell, isChatCell, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
 	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
@@ -235,6 +235,11 @@
 	// A SQL cell: a code cell tagged cellar.language='sql'. Its source is SQL, run
 	// against `spark` (see server/sql.js); the editor highlights it as SQL.
 	const isSql = $derived(isSqlCell(cell));
+	// A CHAT cell: a code cell tagged cellar.language='chat'. Its source is a
+	// question for the AI, run through the chat engine (server/chat/), never the
+	// kernel; the reply arrives as a markdown display_data output. Runnable like
+	// SQL - the run button IS "ask".
+	const isChat = $derived(isChatCell(cell));
 	// An nbformat `raw` cell: verbatim text Cellar never executes and never renders
 	// (Quarto/nbdev frontmatter, nbconvert directives). It has NO rendered mode -
 	// the deliberate contrast with markdown - so it is always shown as its source.
@@ -249,11 +254,13 @@
 	const typeLabel = $derived(
 		logicalType === 'sql'
 			? 'SQL'
-			: logicalType === 'markdown'
-				? 'markdown'
-				: logicalType === 'raw'
-					? 'raw'
-					: 'python3'
+			: logicalType === 'chat'
+				? 'chat'
+				: logicalType === 'markdown'
+					? 'markdown'
+					: logicalType === 'raw'
+						? 'raw'
+						: 'python3'
 	);
 	// The notebook's designated imports cell: user-choosable, marked in the toolbar
 	// with the "imports" badge, and free to live at any index. Only a Python code
@@ -631,6 +638,8 @@
 		html?: string;
 		/** ipywidgets model id (tqdm bar) — rendered live from the widget store. */
 		widget?: string;
+		/** Sanitized HTML of a `text/markdown` payload (a chat reply). */
+		markdownHtml?: string;
 		segments: TextSegment[] | null;
 	}
 
@@ -695,6 +704,14 @@
 				// runs safely without touching the app.
 				if (d['text/html']) {
 					return { tone: 'result', html: asText(d['text/html']), segments: null };
+				}
+				// A `text/markdown` payload (a chat cell's reply, or IPython's
+				// `Markdown()` display) renders like a markdown cell - through the
+				// shared, sanitizing `renderMarkdown` - instead of showing raw
+				// markdown source. Browser-only like the markdown-cell render
+				// (DOMPurify needs a DOM); SSR falls through to the text/plain twin.
+				if (browser && d['text/markdown']) {
+					return { tone: 'result', markdownHtml: renderMarkdown(asText(d['text/markdown'])), segments: null };
 				}
 				if (d['text/plain']) {
 					tone = 'result';
@@ -972,6 +989,7 @@
 	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
+		{ v: 'chat', label: 'Chat', hint: 'claude' },
 		{ v: 'markdown', label: 'Markdown', hint: 'text' },
 		{ v: 'raw', label: 'Raw', hint: 'verbatim' }
 	];
@@ -1191,19 +1209,24 @@
 	function langFor() {
 		if (cell.cell_type === 'markdown') return markdown();
 		if (isRaw) return [];
+		if (isChat) return markdown(); // a chat question is prose; markdown is its grammar
 		return isSql ? sql() : python();
 	}
 	// The same grammar choice, for the static (no-editor) render. Kept in lockstep
 	// with `langFor` so the read-only view highlights like the editor it precedes.
-	const staticLang = $derived<StaticLang>(isRaw ? 'plain' : isMarkdown ? 'markdown' : isSql ? 'sql' : 'python');
+	const staticLang = $derived<StaticLang>(
+		isRaw ? 'plain' : isMarkdown || isChat ? 'markdown' : isSql ? 'sql' : 'python'
+	);
 
-	// Reconfigure the editor language when the cell type OR its SQL/Python language
-	// toggles; after a manual cell_type toggle, drop into edit mode so the user sees
-	// the source. `isSql` is read so a code↔sql switch re-applies the grammar too.
+	// Reconfigure the editor language when the cell type OR its SQL/chat/Python
+	// language toggles; after a manual cell_type toggle, drop into edit mode so the
+	// user sees the source. `isSql`/`isChat` are read so a code↔sql/chat switch
+	// re-applies the grammar too (cell_type stays 'code' across it).
 	let prevType = cell.cell_type;
 	$effect(() => {
 		const type = cell.cell_type;
 		isSql; // track: code↔sql keeps cell_type 'code' but changes the grammar
+		isChat; // track: code↔chat likewise
 		if (view) view.dispatch({ effects: language.reconfigure(langFor()) });
 		if (type !== prevType) {
 			prevType = type;
@@ -1799,6 +1822,15 @@
 						data-testid="sql-badge">SQL</span
 					>
 				{/if}
+				{#if isChat}
+					<!-- Chat indicator: this cell asks the AI; running it sends the cells
+					     above (minus hidden ones) and streams the reply in as output. -->
+					<span
+						class="badge badge-xs ml-1.5 badge-soft badge-secondary font-medium"
+						title="Chat cell - running it sends the cells above (minus those hidden from AI) to Claude and shows the reply. Re-running always produces a new reply."
+						data-testid="chat-badge">chat</span
+					>
+				{/if}
 				{#if isRaw}
 					<!-- Raw indicator, deliberately NEUTRAL where the SQL badge is tinted:
 					     raw is not an execution mode, it is the absence of one. Without it
@@ -2293,6 +2325,12 @@
 										title={full ? 'Double-click to fit to width' : 'Double-click for full size'}
 										ondblclick={() => toggleFullImage(i)}
 									/>
+								</div>
+							{:else if o.markdownHtml != null}
+								<!-- A chat reply / Markdown() display: rendered prose, same
+								     container class as a rendered markdown cell. -->
+								<div class="cellar-md px-3 py-2 text-sm leading-relaxed" data-testid="output-markdown">
+									{@html o.markdownHtml}
 								</div>
 							{:else if o.segments}
 								{#each o.segments as seg}
