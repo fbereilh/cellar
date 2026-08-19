@@ -48,7 +48,8 @@ function startFakeCellar(
 	{
 		failStatus = {},
 		failBody = {},
-		holdInitialize = false
+		holdInitialize = false,
+		holdNotification = false
 	}: {
 		failStatus?: Record<string, number>;
 		failBody?: Record<string, string>;
@@ -60,12 +61,21 @@ function startFakeCellar(
 		 * which is what a second re-attach then races.
 		 */
 		holdInitialize?: boolean;
+		/**
+		 * Never answer `notifications/initialized` AT ALL - not even headers, so the
+		 * client's `fetch` stays pending. `attach()` sends that notification as its
+		 * last step, so this parks a re-attach mid-flight and lets a test decide
+		 * exactly when the instance dies underneath it: the one window in which an
+		 * upstream error arrives while `reattaching` is still set.
+		 */
+		holdNotification?: boolean;
 	} = {}
 ) {
 	const sessions = new Set<string>();
 	const seen: { method?: string; sessionId?: string }[] = [];
 	const held: { id: unknown; res: http.ServerResponse }[] = [];
 	const heldInit: { id: unknown; res: http.ServerResponse }[] = [];
+	const heldNotes: http.ServerResponse[] = [];
 	const sockets = new Set<import('node:net').Socket>();
 	let server: Server;
 	const listening = new Promise<number>((resolve) => {
@@ -120,6 +130,10 @@ function startFakeCellar(
 				// handshake.
 				const fail = failStatus[msg.method as string];
 				const isNotification = msg.id === undefined || msg.id === null;
+				if (isNotification && holdNotification && msg.method === 'notifications/initialized') {
+					heldNotes.push(res);
+					return;
+				}
 				if (isNotification && fail === undefined) {
 					res.writeHead(202).end();
 					return;
@@ -200,6 +214,7 @@ function startFakeCellar(
 			new Promise<void>((r) => {
 				held.length = 0;
 				heldInit.length = 0;
+				heldNotes.length = 0;
 				for (const s of sockets) s.destroy();
 				server.close(() => r());
 			})
@@ -316,6 +331,22 @@ function startFlakyProxy(targetPort: number) {
 	};
 }
 
+/**
+ * A port nothing is listening on - taken ephemerally and released, so it is a
+ * real address that provably refuses a connection rather than a guess.
+ */
+async function deadPort(): Promise<number> {
+	const srv = http.createServer();
+	const port = await new Promise<number>((resolve) =>
+		srv.listen(0, '127.0.0.1', () => {
+			const a = srv.address();
+			resolve(typeof a === 'object' && a ? a.port : 0);
+		})
+	);
+	await new Promise<void>((r) => srv.close(() => r()));
+	return port;
+}
+
 /** Poll until `fn` is true, so a test never leans on a fixed sleep. */
 async function until(fn: () => boolean, timeoutMs = 3000) {
 	const deadline = Date.now() + timeoutMs;
@@ -384,7 +415,12 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 	/** Bring an "instance" up for `ws` and publish it the way a launch does. */
 	async function bootCellar(
 		port = 0,
-		opts?: { failStatus?: Record<string, number>; failBody?: Record<string, string>; holdInitialize?: boolean }
+		opts?: {
+			failStatus?: Record<string, number>;
+			failBody?: Record<string, string>;
+			holdInitialize?: boolean;
+			holdNotification?: boolean;
+		}
 	) {
 		const c = startFakeCellar(port, opts);
 		const p = await c.listening;
@@ -1013,6 +1049,113 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		expect(reply.error).toBeUndefined();
 		// ...and the session it minted really works.
 		expect(await stdio.request({ jsonrpc: '2.0', id: 12, method: 'tools/list' }, 8000)).toMatchObject({
+			result: { echoed: 'tools/list' }
+		});
+	});
+
+	it('never answers a long run TWICE when its own POST stream outlives the heal', async () => {
+		// AT MOST ONE RESPONSE PER REQUEST ID, on the path that can break it. The
+		// heal answers the ids it believes are stranded, but a re-attach that finds
+		// nothing serving returns BEFORE it detaches - so the old transport stays
+		// fully wired, and a run whose POST stream is still open delivers its real
+		// result afterwards. Relayed unguarded that is a second response for an id
+		// the agent has already been answered on, which is a protocol violation and
+		// tells it a call it was told was lost in fact completed.
+		const cellar = await bootCellar();
+		const { stdio, inFlight } = await startBridge();
+		await stdio.request(INIT);
+
+		// A long call is established: the server holds it, and its POST has resolved.
+		stdio.post({ jsonrpc: '2.0', id: 2, method: SLOW });
+		await until(() => cellar.heldCount() === 1 && inFlight.has(2));
+
+		// The folder now names an instance that is NOT there: `instanceGone()` is
+		// satisfied by the moved port, and the re-attach then finds nothing to
+		// attach to - so the live transport, and the run streaming on it, are left
+		// exactly where they are.
+		const vanished = await deadPort();
+		writeRuntime(ws, { mcpPort: vanished, appPort: vanished + 1, jupyterPort: vanished + 2, pid: process.pid });
+
+		// `notifications/initialized` is answered 202, and the SDK then opens its
+		// standalone GET stream - which this fake refuses - so this is what drives
+		// the stream-loss heal without touching the run's own stream.
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+		const lost = (await stdio.awaitReply(2, 8000)).error as { code: number; message: string };
+		expect(lost).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(lost.message).toMatch(/may or may not have been applied/i);
+
+		// The run finishes on the still-open stream and the server writes its real
+		// result. That must go NOWHERE: the id was answered.
+		cellar.release();
+		await new Promise((r) => setTimeout(r, 300));
+		expect(stdio.repliesFor(2)).toHaveLength(1);
+		expect(stdio.repliesFor(2)[0].error).toBeDefined();
+	});
+
+	it('acts on an upstream error that lands INSIDE an in-flight re-attach', async () => {
+		// `attach()` adopts its new transport before it sends anything, so a
+		// replacement dying mid-handshake reports it while `reattaching` is still
+		// set. Returning there dropped the error for good: the attach's own sweep
+		// skips the id it has just handed off, the relay that triggered it returns
+		// without answering, and - the host being blocked on `initialize` - no later
+		// message can drive the per-send recovery. A permanent hang, and the bridge
+		// never exits, so the host never respawns it either.
+		const first = await bootCellar();
+		const { stdio, fatal } = await startBridge();
+		await killCellar(first);
+
+		// The replacement holds BOTH halves of the re-handshake: the replayed
+		// `initialize` (so the hand-off is genuinely outstanding) and the
+		// `notifications/initialized` that follows it (so `attach()` is parked
+		// mid-flight, which is the window this test exists for).
+		const second = await bootCellar(0, { holdInitialize: true, holdNotification: true });
+
+		stdio.post(INIT);
+		await until(() => second.seen.some((m) => m.method === 'notifications/initialized'), 8000);
+
+		// The instance dies while the attach is still parked: the held handshake
+		// stream breaks (the upstream error) and nothing is left serving the folder.
+		await killCellar(second);
+
+		const reply = await stdio.awaitReply(INIT.id, 8000);
+		const err = reply.error as { code: number; message: string };
+		expect(err).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
+		expect(err.message).toMatch(/may or may not have been applied/i);
+		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
+		// ...and the bridge is untouched, ready to heal on the next launch.
+		expect(fatal()).toBeUndefined();
+	});
+
+	it('completes a handshake handed off mid-attach when a replacement is serving', async () => {
+		// The other outcome of the same window: once the dropped error is acted on,
+		// the heal re-attaches and the fresh replay re-claims the id, so the
+		// handshake COMPLETES rather than being answered with an error - and it is
+		// still answered exactly once.
+		const first = await bootCellar();
+		const { stdio } = await startBridge();
+		await killCellar(first);
+		const second = await bootCellar(0, { holdInitialize: true, holdNotification: true });
+
+		stdio.post(INIT);
+		await until(() => second.seen.some((m) => m.method === 'notifications/initialized'), 8000);
+
+		// A third instance takes the folder over BEFORE the parked one dies, so the
+		// heal has somewhere to go. (`clear: false` because every fake publishes this
+		// process's pid, so clearing would erase the record of the newcomer.)
+		const third = await bootCellar();
+		await killCellar(second, { clear: false });
+
+		const reply = await stdio.awaitReply(INIT.id, 8000);
+		expect(reply).toMatchObject({ id: INIT.id, result: { protocolVersion: '2025-06-18' } });
+		expect(reply.error).toBeUndefined();
+		await new Promise((r) => setTimeout(r, 200));
+		expect(stdio.repliesFor(INIT.id)).toHaveLength(1);
+		expect(third.sessionCount()).toBe(1);
+
+		// ...and the session it minted really works.
+		stdio.post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+		expect(await stdio.request({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, 8000)).toMatchObject({
 			result: { echoed: 'tools/list' }
 		});
 	});

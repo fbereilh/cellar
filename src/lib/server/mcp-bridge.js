@@ -116,7 +116,10 @@
  * failures each failed the other's request AND then retried it, so one id got
  * both an error and a result). A request the recovery has already taken over -
  * answered, or handed off so its replay is on the wire - is exempt from every
- * verdict `deliver` would otherwise reach (`settledByRecovery`). That exemption
+ * verdict `deliver` would otherwise reach (`settledByRecovery`). The relay path
+ * is not the only one that has to hold that line: `wire()` answers downward only
+ * while `pending` still holds the id, so a reply that arrives on a stream the
+ * heal has already given up on is dropped rather than becoming a second response. That exemption
  * is only ever as true as the stream carrying the replay, so it is dropped
  * wholesale at the top of every `attach()`: a hand-off that outlived its
  * transport exempted an id from every sweep with nothing left to answer it, and
@@ -456,8 +459,17 @@ export async function runMcpBridge({
 	 * gone - and because the host blocks on `initialize`, no later message could
 	 * ever drive `deliver`, so the bridge hung for good without exiting, which is
 	 * the whole failure class it exists to remove.
+	 *
+	 * `relaying` exempts an id because that relay will answer it ITSELF - and a
+	 * hand-off is precisely the relay DELEGATING that, so the two exemptions are
+	 * mutually exclusive and a handed-off id counts even while its relay is still
+	 * running. Both are true at once for one whole microtask turn (`attach()`
+	 * registers the hand-off while the relay that triggered it is still awaiting
+	 * the re-attach), which is exactly the turn an error landing inside that
+	 * attach is re-examined in.
 	 */
-	const strandedRequestIds = () => [...pending].filter((id) => !relaying.has(id));
+	const strandedRequestIds = () =>
+		[...pending].filter((id) => !relaying.has(id) || handedOff.has(id));
 
 	/**
 	 * Requests whose reply can never arrive NOW: stranded, and not handed off to a
@@ -513,7 +525,17 @@ export async function runMcpBridge({
 					sendDown({ ...msg, id: forAgent });
 					return;
 				}
-				pending.delete(msg.id);
+				// The delete's own verdict is the guard here too, exactly as in
+				// `failRequest` and in the handed-off branch above - so "at most one
+				// response per request id" holds LITERALLY rather than only where every
+				// caller is well behaved. It is reachable: `attach()` returns false
+				// BEFORE `detach()`, so a re-attach that finds nothing serving leaves
+				// this transport fully wired while the heal answers its stranded ids -
+				// and a long run whose POST stream is still open then delivers its real
+				// result afterwards, which relayed unguarded is a SECOND response for an
+				// id the agent has already been answered on. Nothing legitimate is
+				// dropped: every id that reaches here was put in `pending` by `relayUp`.
+				if (!pending.delete(msg.id)) return;
 			}
 			sendDown(msg);
 		};
@@ -726,18 +748,33 @@ export async function runMcpBridge({
 	let healingStream = false;
 	const healAfterStreamLoss = async (t) => {
 		// A late error from a transport we already replaced says nothing about the
-		// live session; and while a re-attach is in flight its own sweep owns these
-		// ids, so a second pass here could answer one the attach is handing off.
-		if (closing || healingStream || reattaching || upstream !== t) return;
-		// STRANDED, not LOST: the gate asks what rode this stream, so a handed-off
-		// handshake counts. Asking `lostRequestIds()` here skipped the recovery
-		// entirely whenever the only thing outstanding was that hand-off, and the
-		// host is blocked on `initialize` in exactly that state - nothing would ever
-		// ask again. Whether the ids are really unanswerable is still decided below,
-		// by `instanceGone()`, and only then swept.
-		if (strandedRequestIds().length === 0) return;
+		// live session, and two errors on one stream are one recovery.
+		if (closing || healingStream || upstream !== t) return;
 		healingStream = true;
 		try {
+			// A re-attach ALREADY RUNNING is waited out, never a reason to give up on
+			// this error. `attach()` wires and adopts its new transport before it sends
+			// anything, so a replacement dying mid-handshake reports it HERE while
+			// `reattaching` is still set - and returning dropped that error for good:
+			// the attach's own sweep skips the id it has just handed off, the relay
+			// that triggered it returns without answering (`settledByRecovery`), and
+			// with the host blocked on `initialize` no later message can drive
+			// `deliver`. That is the permanent hang this path exists to remove, reached
+			// through the one door it was not watching. Waiting decides nothing on its
+			// own: every check below is re-asked afterwards, and the recovery is still
+			// gated on `instanceGone()`.
+			if (reattaching) await reattaching;
+			// Re-asked, because that attach may have replaced the upstream (in which
+			// case its own sweep has already answered everything answerable) or
+			// answered these ids outright.
+			if (closing || upstream !== t) return;
+			// STRANDED, not LOST: the gate asks what rode this stream, so a handed-off
+			// handshake counts. Asking `lostRequestIds()` here skipped the recovery
+			// entirely whenever the only thing outstanding was that hand-off, and the
+			// host is blocked on `initialize` in exactly that state - nothing would ever
+			// ask again. Whether the ids are really unanswerable is still decided below,
+			// by `instanceGone()`, and only then swept.
+			if (strandedRequestIds().length === 0) return;
 			if (!(await instanceGone())) return;
 			await reattach();
 			// Also answered when the re-attach found nothing serving: the evidence is
