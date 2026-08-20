@@ -254,9 +254,10 @@ describe('the client half (source guards)', () => {
 	it('Cell.svelte renders NO Raw entry in the type menu of a .py notebook', () => {
 		const src = read('Cell.svelte');
 		// The menu iterates the FILTERED list, and the filter drops every type a .py
-		// notebook cannot hold (raw, chat) when isPy - read from the shared rule.
+		// notebook cannot hold (raw, chat) - by ASKING the shared `offersCellType`
+		// rule, whose meaning is executed in `add-chat-cell-controls.test.ts`.
 		expect(src).toMatch(/\{#each typeOptions as opt\}/);
-		expect(src).toMatch(/isPy\s*\?\s*ALL_TYPE_OPTIONS\.filter\(\(o\) => !isPyUnsupportedType\(o\.v\)\)/);
+		expect(src).toMatch(/ALL_TYPE_OPTIONS\.filter\(\(o\) => offersCellType\(o\.v, isPy\)\)/);
 		// The unfiltered list is never rendered directly.
 		expect(src).not.toMatch(/\{#each ALL_TYPE_OPTIONS/);
 	});
@@ -264,7 +265,7 @@ describe('the client half (source guards)', () => {
 	it('LiveNotebook.svelte SAYS why a raw conversion did nothing, on every path that offers one', () => {
 		const src = read('LiveNotebook.svelte');
 		// The optimistic mirror of `assertCanHoldType`, in ONE predicate.
-		expect(src).toMatch(/function refuseUnsupportedType\(cellType: LogicalCellType\): boolean \{[\s\S]*?!isPy \|\| !isPyUnsupportedType\(cellType\)/);
+		expect(src).toMatch(/function refuseUnsupportedType\(cellType: LogicalCellType\): boolean \{[\s\S]*?offersCellType\(cellType, isPy\)/);
 		// The single-cell setter AND the multi-cell batch (`r`, the palette) consult
 		// it - a keystroke that sends no request disables no control, so a silent
 		// return reads as a dead key.

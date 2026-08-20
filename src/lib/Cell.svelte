@@ -23,7 +23,7 @@
 	import { isExportCell } from '$lib/exportRole';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
-	import { isSqlCell, isRawCell, isChatCell, isPyUnsupportedType, logicalCellType } from '$lib/cellLanguage';
+	import { isSqlCell, isRawCell, isChatCell, offersCellType, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
 	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
@@ -999,9 +999,13 @@
 		typeMenuEl.style.top = r.bottom + 4 + 'px';
 	}
 	// The cell-type menu options (Python / SQL / Chat / Markdown / Raw). This menu
-	// is the create-and-convert path for raw and chat - there is deliberately no
-	// "+ Raw" insert button, a once-per-notebook type not being worth a third
-	// button on every gap.
+	// is the ONLY create path for raw - there is deliberately no "+ Raw" insert
+	// button, a once-per-notebook type not being worth a button on every gap. Chat
+	// is different: asking a question recurs through a session the way code and
+	// markdown do, so it IS also creatable directly from the add affordances (the
+	// bottom add row and the hover-between strip in `Notebook.svelte`, both gated
+	// off `$lib/cellLanguage` on a `.py` notebook exactly like `typeOptions`
+	// below). Converting an existing cell stays here for every type.
 	//
 	// Raw AND chat are DROPPED on a `.py` text notebook: such a document is rebuilt
 	// from its cells on every save, carrying neither the raw marker nor any
@@ -1016,7 +1020,7 @@
 		{ v: 'markdown', label: 'Markdown', hint: 'text' },
 		{ v: 'raw', label: 'Raw', hint: 'verbatim' }
 	];
-	const typeOptions = $derived(isPy ? ALL_TYPE_OPTIONS.filter((o) => !isPyUnsupportedType(o.v)) : ALL_TYPE_OPTIONS);
+	const typeOptions = $derived(ALL_TYPE_OPTIONS.filter((o) => offersCellType(o.v, isPy)));
 	function chooseType(type: LogicalCellType) {
 		typeMenuEl?.hidePopover();
 		if (type !== logicalType) onSetType(cell.id, type);
@@ -1970,7 +1974,10 @@
 				{/if}
 				<!-- Insert a fresh code cell directly above / below this one. The per-cell
 				     analogue of the hover-between "+" and the `a`/`b` shortcuts; all three
-				     go through the one positional-insert path. -->
+				     go through the one positional-insert path. Deliberately HARDWIRED to
+				     'code' - these are the one-click fast path, like `a`/`b`; a typed
+				     insert (markdown/chat) lives in the hover-between strip and the bottom
+				     add row, so a type picker here would only slow the frequent action. -->
 				<button class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-base-content/80" onclick={() => onInsertCell('above', cell.id, 'code')} title="Insert cell above (a)" aria-label="Insert cell above" data-testid="cell-insert-above">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16" /><path d="M12 10v9" /><path d="M8 14h8" /></svg>
 				</button>

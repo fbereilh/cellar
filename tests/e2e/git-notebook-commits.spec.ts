@@ -102,15 +102,30 @@ async function makeNotebook(page: Page, rel: string, root?: string): Promise<voi
 	}
 }
 
-/** Open each notebook's tab from the file tree, skipping any already open. */
+/**
+ * Open each notebook's tab from the file tree, skipping any already open.
+ * Retried per notebook: the server-owned tab-session restore lands at
+ * hydration, after the first paint, so a dblclick landing before it is wiped
+ * when the restored tab set replaces the tab it just opened - the documented
+ * settle-before-probe race, and a cold start (first run after a rebuild)
+ * widens the window enough to lose it reliably.
+ */
 async function ensureOpen(page: Page, names: string[]): Promise<void> {
 	for (const nb of names) {
 		const tab = page.getByTestId('tab').filter({ hasText: nb });
-		if ((await tab.count()) > 0) continue;
-		const item = page.getByTestId('tree-file').filter({ hasText: nb });
-		await expect(item).toBeVisible({ timeout: 15_000 });
-		await item.dblclick();
-		await expect(tab).toHaveCount(1);
+		await expect(async () => {
+			if ((await tab.count()) === 0) {
+				const item = page.getByTestId('tree-file').filter({ hasText: nb });
+				await expect(item).toBeVisible({ timeout: 2_000 });
+				await item.dblclick();
+			}
+			await expect(tab).toHaveCount(1, { timeout: 2_000 });
+			// The restore can land AFTER the open was confirmed (observed in a trace
+			// ~600ms post-load on a cold start, replacing the tab array wholesale),
+			// so the tab must be seen to OUTLIVE that window before it is trusted.
+			await page.waitForTimeout(800);
+			await expect(tab).toHaveCount(1, { timeout: 200 });
+		}).toPass({ timeout: 30_000 });
 	}
 }
 
