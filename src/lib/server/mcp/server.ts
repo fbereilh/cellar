@@ -923,4 +923,50 @@ export function startMcpServer() {
 		const shown = host === '0.0.0.0' ? '127.0.0.1' : host;
 		console.log(`[cellar-mcp] MCP agent interface on http://${shown}:${port}/mcp`);
 	});
+
+	releaseOnShutdown(httpServer);
+}
+
+/** The signals adapter-node's own graceful shutdown listens for. */
+export const SHUTDOWN_SIGNALS = ['SIGTERM', 'SIGINT'] as const;
+
+/**
+ * RELEASE THE PORT ON SHUTDOWN. adapter-node's graceful shutdown unbinds only
+ * its OWN listener, and nothing else owned this one - so the app process kept
+ * this socket bound until it finally exited, which on the Ctrl-C path is the
+ * orphan self-exit in `parent-watch.ts`, 5-10s later. That is what made the
+ * remembered MCP port busy on essentially every quick relaunch (`ports.js`
+ * deliberately does not wait it out), so that half of the folder's preference
+ * never converged: each launch moved and then remembered a port that would be
+ * busy again next time. `close()` stops accepting and frees the LISTENING
+ * socket at once, which is all the next launch needs.
+ *
+ * Deliberately NOT `closeAllConnections()`: an established POST is a run
+ * streaming its progress, and killing it here would abort the work more
+ * abruptly than the process exit already will. And deliberately no
+ * `process.exit` - adapter-node owns that, and these listeners stay additive.
+ *
+ * Split out of `startMcpServer` (which cannot be booted in a unit test - it
+ * wires the live notebook document and the kernel into an `McpServer`) so the
+ * behaviour `ports.js` depends on is reachable on its own: `signals` is the
+ * emitter the handlers are registered on, injected so a test can drive a REAL
+ * listening server without touching the process's own signal handling. Returns
+ * an unsubscribe for the same reason.
+ */
+export function releaseOnShutdown(
+	httpServer: Pick<http.Server, 'close'>,
+	signals: Pick<NodeJS.EventEmitter, 'on' | 'off'> = process
+): () => void {
+	let released = false;
+	const release = () => {
+		if (released) return;
+		released = true;
+		try {
+			httpServer.close();
+		} catch {}
+	};
+	for (const sig of SHUTDOWN_SIGNALS) signals.on(sig, release);
+	return () => {
+		for (const sig of SHUTDOWN_SIGNALS) signals.off(sig, release);
+	};
 }

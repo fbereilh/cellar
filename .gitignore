@@ -11,8 +11,9 @@ playwright-report/
 # workspace notebook artifact (created when cellar runs in this folder)
 notebook.ipynb
 
-# ephemeral per-run instance state (live port map for `cellar mcp` discovery +
-# single-instance lock)
+# per-project local state: the live port map for `cellar mcp` discovery and the
+# single-instance lock (both cleared on exit), plus durable per-folder state that
+# is not (remembered ports, checkpoints, UI state, harness allow-list)
 .cellar/
 
 # secrets & local machine state (never commit)
