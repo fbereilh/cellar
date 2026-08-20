@@ -390,8 +390,8 @@ Follow this house style:
 
    EXPORT TARGET is the notebook's nbdev-style module: the .py file the cells
    marked for export are written to (its #|default_exp). Its stored path is
-   measured from a BASE - workspace (the default), notebook (the notebook's own
-   folder), or git (its enclosing repo). get_notebook_map's display block reports
+   measured from a BASE - workspace (what a notebook storing none is measured
+   from), notebook (the notebook's own folder), or git (its enclosing repo). get_notebook_map's display block reports
    export_target = the RESOLVED workspace-relative file, plus export_base and
    export_path (the stored spelling) whenever the base is not workspace, and each
    marked cell as export:true. export_target is null BOTH when unset and when a
@@ -399,7 +399,8 @@ Follow this house style:
    is what tells those two apart. To build a module: set_export_target(path, base)
    names the file (path:null clears it) and set_cell_export(ids, export:true|false)
    marks/unmarks the PYTHON code cells that go in it (markdown/SQL are refused).
-   Pass a path back in the base it was reported under, never the resolved one.
+   Pass a path back in the base it was reported under, never the resolved one; an
+   omitted base keeps the notebook's current one.
    Both persist in metadata; the module is rewritten while a target is set AND a
    cell stays marked - unmark the last one and the old file stays as it was. No
    cell source changes, so never hand-write an #|export comment.
@@ -776,7 +777,7 @@ export function registerTools(server: McpServer) {
 		if ('notCode' in r) return notFound(`cell ${asGiven(r.notCode)} is not a Python code cell (only a Python code cell can be exported to the .py module)`);
 		return notFound(r.missing ? `cell ${asGiven(r.missing)} not found` : 'ids must not be empty');
 	});
-	server.registerTool('set_export_target', { description: 'Set (or clear) your notebook\'s EXPORT TARGET: the `.py` module export-marked cells are written to. `base` = what `path` is measured from: workspace (default), notebook (its folder), git (repo root). path:null or "" clears the SETTING (a `#|default_exp` directive written in a cell is NOT). The `.py` is rewritten while a cell stays marked (set_cell_export); module.regenerated:false = that write FAILED. Refused: a path resolving outside the workspace or not `.py` (the module is WRITTEN there), git with no repo, a `.py` text notebook. Returns export_target, the RESOLVED workspace-relative path (directive included, flagged export_target_source) + export_base/export_path for non-workspace bases.', inputSchema: { path: z.string().nullable(), base: z.enum(['workspace', 'notebook', 'git']).optional(), ...notebookParam } }, async ({ path, base, notebook }, extra: ToolExtra) => {
+	server.registerTool('set_export_target', { description: 'Set (or clear) your notebook\'s EXPORT TARGET: the `.py` module export-marked cells go to. `base` = what `path` is measured from: workspace, notebook (its folder), git (repo root); OMIT it to KEEP the stored base (workspace when none). path:null or "" clears the SETTING (a `#|default_exp` directive written in a cell is NOT). Rewritten while a cell stays marked (set_cell_export); module.regenerated:false = that write FAILED. Refused: a path outside the workspace or not `.py` (the module is WRITTEN there), git with no repo, a `.py` text notebook. Returns export_target (RESOLVED workspace-relative; a directive flagged export_target_source) + export_base/export_path for non-workspace bases.', inputSchema: { path: z.string().nullable(), base: z.enum(['workspace', 'notebook', 'git']).optional(), ...notebookParam } }, async ({ path, base, notebook }, extra: ToolExtra) => {
 		const r = svc.setExportTarget(path, targetOf(extra, notebook), base);
 		if ('refused' in r) return notFound(pyNotebookRefusal('an export target cannot be stored'));
 		if ('invalid' in r) return notFound(`refused: ${r.invalid} - the export target must be a .py path that resolves inside the workspace`);

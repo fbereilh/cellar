@@ -3,8 +3,7 @@ import {
 	InvalidExportTargetError,
 	setExportTarget,
 	setExportBase,
-	exportTargetInfo,
-	getExportTarget,
+	getExportTargetState,
 	exportPy,
 	isPyTextNotebook
 } from '$lib/server/notebook';
@@ -80,18 +79,17 @@ export async function POST({ request }) {
  * through `error()`, whose body is a bare `{message}`: without the state the tab
  * would have to remember one. One shared shape for both write ops - the reply
  * contract is identical, only the mutation differs.
+ *
+ * It reads that state through the doc layer's OWN `getExportTargetState`, never a
+ * second copy: a refusal is the only thing that can correct the tab's field and
+ * base select, so a route-local rule reading the base differently from the setter
+ * would answer a refusal and a success with two different readings of one
+ * document.
  */
 function applyTargetWrite(body, write) {
 	const held = () => {
 		try {
-			const info = exportTargetInfo(body.path);
-			const stored = getExportTarget(body.path);
-			return {
-				target: stored,
-				base: info && info.source === 'metadata' ? info.base : 'workspace',
-				resolved: info && info.ok ? info.target : null,
-				resolveError: info && !info.ok ? info.error : null
-			};
+			return getExportTargetState(body.path);
 		} catch {
 			return { target: null, base: 'workspace', resolved: null, resolveError: null };
 		}

@@ -377,6 +377,77 @@ describe('re-expressing with setExportBase', () => {
 	});
 });
 
+describe('an OMITTED base keeps the one the document stores', () => {
+	// A caller echoing a reported path back without repeating the base must not
+	// silently re-anchor it: that would delete `export_base` from the COMMITTED
+	// .ipynb and relocate the generated module, leaving the old file behind. Only
+	// an explicit value moves the base.
+	it('keeps a stored notebook base, so the path stays notebook-relative', () => {
+		const nb = nbmod.createNotebook('sub/nb-inherit.ipynb').path;
+		nbmod.setExportTarget('helpers.py', nb, undefined, 'notebook');
+		expect(diskCellar(nb)).toMatchObject({ export_target: 'helpers.py', export_base: 'notebook' });
+
+		const state = nbmod.setExportTarget('other.py', nb);
+		expect(state).toEqual({
+			target: 'other.py',
+			base: 'notebook',
+			resolved: 'sub/other.py',
+			resolveError: null
+		});
+		expect(diskCellar(nb)).toMatchObject({ export_target: 'other.py', export_base: 'notebook' });
+	});
+
+	it('keeps a stored git base too', () => {
+		const nb = nbmod.createNotebook('nb-inherit-git.ipynb').path;
+		nbmod.setExportTarget('analysis/lib/g1.py', nb, undefined, 'git');
+		expect(diskCellar(nb).export_base).toBe('git');
+
+		const state = nbmod.setExportTarget('analysis/lib/g2.py', nb);
+		expect(state).toMatchObject({ base: 'git', target: 'analysis/lib/g2.py', resolved: 'lib/g2.py' });
+	});
+
+	// The legacy shape is what this must not disturb: an absent key already means
+	// workspace, so an omitted base inherits workspace and mints nothing.
+	it('mints NO base key for a notebook that stores none (the legacy shape is byte-identical)', () => {
+		const abs = writeIpynb('inherit-legacy.ipynb', { export_target: 'lib/legacy2.py' });
+		const state = nbmod.setExportTarget('lib/legacy3.py', 'inherit-legacy.ipynb');
+		expect(state).toEqual({
+			target: 'lib/legacy3.py',
+			base: 'workspace',
+			resolved: 'lib/legacy3.py',
+			resolveError: null
+		});
+		const cellar = diskCellar(abs);
+		expect(cellar.export_target).toBe('lib/legacy3.py');
+		expect('export_base' in cellar).toBe(false);
+	});
+
+	// An EXPLICIT base still applies as given - including explicit workspace, which
+	// is the only way to move a target back to the legacy spelling through this setter.
+	it('an explicit workspace base still re-anchors, and deletes the key', () => {
+		const nb = nbmod.createNotebook('sub/nb-explicit-ws.ipynb').path;
+		nbmod.setExportTarget('helpers.py', nb, undefined, 'notebook');
+		const state = nbmod.setExportTarget('sub/helpers.py', nb, undefined, 'workspace');
+		expect(state).toMatchObject({ base: 'workspace', target: 'sub/helpers.py', resolved: 'sub/helpers.py' });
+		expect('export_base' in diskCellar(nb)).toBe(false);
+	});
+
+	// The inherited value goes through the SAME check as an explicit one, so an
+	// unknown stored base cannot be smuggled past it and rebuild the trap below.
+	it('refuses an INHERITED unknown base, naming clearing as the repair', () => {
+		writeIpynb('inherit-unknown.ipynb', { export_target: 'x.py', export_base: 'weird' });
+		expect(() => nbmod.setExportTarget('y.py', 'inherit-unknown.ipynb')).toThrow(
+			/clear the export target/
+		);
+		// And the repair still works, exactly as for an explicit unknown base.
+		expect(nbmod.setExportTarget('', 'inherit-unknown.ipynb').target).toBeNull();
+		expect(nbmod.setExportTarget('y.py', 'inherit-unknown.ipynb')).toMatchObject({
+			base: 'workspace',
+			target: 'y.py'
+		});
+	});
+});
+
 describe('clearing is the universal repair (an unresolvable base is never a dead end)', () => {
 	// The tab keeps NO copy of server state: it seeds its base select from the
 	// stored value and sends that value back with every path commit. So a notebook

@@ -2528,9 +2528,19 @@
 		// The base + resolution travel WITH the held target on every reply, so a
 		// refusal puts the select back beside the input (and the resolution display
 		// can never describe a target the field no longer shows).
+		//
+		// The BASE is adopted only when the document really HOLDS a target: a base is a
+		// fact about a stored target, so with none stored the reply's `workspace` says
+		// nothing, while the select is holding a client-local pre-choice that has not
+		// been persisted yet (a base alone is meaningless server-side, so it rides up
+		// with the first path commit). Adopting it there discarded that choice on any
+		// REFUSED first commit - a missing `.py`, an escaping path - and the corrected
+		// retype then silently stored the path workspace-relative, a different file for
+		// a notebook in a subdirectory. The resolution is null in that case anyway, so
+		// it is adopted either way and a stale display can never survive.
 		const adoptHeldMeta = () => {
 			if (!knowsHeld) return;
-			exportBase = typeof body!.base === 'string' ? (body!.base as string) : 'workspace';
+			if (held !== null) exportBase = typeof body!.base === 'string' ? (body!.base as string) : 'workspace';
 			exportResolved = (body!.resolved ?? null) as string | null;
 			exportResolveError = (body!.resolveError ?? null) as string | null;
 		};

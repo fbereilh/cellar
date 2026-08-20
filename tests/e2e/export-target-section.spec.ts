@@ -84,10 +84,20 @@ async function firstCellId(api: APIRequestContext, nb: string): Promise<string> 
 
 async function openDefaultNotebook(page: Page): Promise<void> {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await settleDefaultNotebook(page);
+}
+
+/**
+ * Settle before probing: the shell paints either the empty state or an
+ * already-open notebook (the openNotebook-helper rule from AGENTS.md), so a bare
+ * `cell` probe reports the button invisible, turns the click into a no-op and then
+ * times out for 30s on a notebook nothing ever opened. Needed after a RELOAD as
+ * much as after a goto - the tab session decides which of the two is painted, so
+ * probing the cell alone is a race whichever way the page was entered.
+ */
+async function settleDefaultNotebook(page: Page): Promise<void> {
 	const openBtn = page.getByTestId('empty-open-notebook');
 	const cell = page.getByTestId('cell').first();
-	// Settle before probing: the shell paints either the empty state or an
-	// already-open notebook (the openNotebook-helper rule from AGENTS.md).
 	await expect(openBtn.or(cell)).toBeVisible();
 	if (await openBtn.isVisible()) await openBtn.click();
 	await expect(cell).toBeVisible();
@@ -152,7 +162,7 @@ test('a fresh notebook offers the section; a (base, path) choice writes the modu
 
 	// REOPEN: both halves of the choice come back.
 	await page.reload();
-	await expect(page.getByTestId('cell').first()).toBeVisible();
+	await settleDefaultNotebook(page);
 	await expect(page.getByTestId('export-base-select')).toHaveValue('notebook');
 	await expect(page.getByTestId('export-target-input')).toHaveValue('mods/frombook.py');
 	await expect(page.getByTestId('export-resolved')).toHaveText('→ mods/frombook.py');
@@ -256,7 +266,11 @@ test('the Settings toggle reveals the root bar on a rootless notebook, and persi
 		})
 		.toBe(true);
 	await page.reload();
-	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+	// Same settle rule, with the `:visible` cell locator this test needs (several
+	// notebooks are mounted by now, and a hidden one must not answer for the page).
+	await expect(
+		page.getByTestId('empty-open-notebook').or(page.locator('[data-testid="cell"]:visible').first())
+	).toBeVisible();
 	await page.locator('[data-testid="tree-file"][data-path="notebook.ipynb"]').click();
 	await expect(page.locator('[data-testid="root-bar"]:visible')).toBeVisible();
 
@@ -265,4 +279,49 @@ test('the Settings toggle reveals the root bar on a rootless notebook, and persi
 	await page.getByTestId('settings-show-code-root').click();
 	await closeSettings(page);
 	await expect(page.locator('[data-testid="root-bar"]:visible')).toHaveCount(0);
+});
+
+/**
+ * A base chosen BEFORE any path is client-local (a base alone is meaningless
+ * server-side, so it rides up with the first path commit). That makes a REFUSED
+ * first commit the one moment it can be lost: the reply reports the state the
+ * document holds, and with nothing stored that base is a meaningless `workspace`.
+ * Adopting it there snapped the select back, and the corrected retype then stored
+ * the path under a base the user never chose - a DIFFERENT file, with only the
+ * select having flickered to say so.
+ *
+ * Driven with the `git` base, whose root is the PARENT of this workspace, so the
+ * two spellings genuinely name two different files from one typed path.
+ */
+test('a refused first commit keeps the base the user chose, so the retype lands the file they picked', async ({
+	page,
+	request
+}) => {
+	const nb = await makeNotebook(request, 'prechoice.ipynb');
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator('[data-testid="tree-file"][data-path="prechoice.ipynb"]').click();
+	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+
+	const select = page.locator('[data-testid="export-base-select"]:visible');
+	const input = page.locator('[data-testid="export-target-input"]:visible');
+	await expect(input).toHaveValue('');
+	await select.selectOption('git');
+
+	// Refused: not a `.py` module. Nothing is stored, so the reply's base says
+	// nothing about this notebook - and the pre-choice is the only copy there is.
+	await input.fill('analysis/helpers');
+	await input.press('Enter');
+	await expect(select).toHaveValue('git');
+	expect('export_target' in diskCellar(nb)).toBe(false);
+
+	// The corrected retype lands under the base that was chosen: from the git root,
+	// `analysis/helpers.py` IS this workspace's `helpers.py`. Read as workspace it
+	// would have been `analysis/helpers.py` inside the workspace - another file.
+	await input.fill('analysis/helpers.py');
+	await input.press('Enter');
+	await expect(page.locator('[data-testid="export-resolved"]:visible')).toHaveText('→ helpers.py');
+	await expect.poll(() => diskCellar(nb)).toMatchObject({
+		export_target: 'analysis/helpers.py',
+		export_base: 'git'
+	});
 });

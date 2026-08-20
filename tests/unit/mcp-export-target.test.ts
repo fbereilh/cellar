@@ -16,7 +16,7 @@
  * kernel or subprocess is involved.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -66,6 +66,7 @@ let events: typeof import('../../src/lib/server/events');
 
 beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-mcp-export-target-'));
+	mkdirSync(join(WS, 'sub'), { recursive: true });
 	process.env.CELLAR_WORKSPACE = WS;
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
@@ -255,6 +256,95 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 		expect(res.status).toBe(400);
 		expect(nbmod.getExportTarget(target)).toBe(null);
 		expect(py.writes).toEqual([]);
+	});
+
+	/**
+	 * The AGENT surface of the base-inheritance rule: an omitted `base` keeps the
+	 * one the document stores, so echoing a reported path back cannot silently
+	 * re-anchor it - which would drop `export_base` from the committed .ipynb and
+	 * move the generated module, leaving the old file behind.
+	 */
+	it('set_export_target with no base keeps the notebook\'s stored base', async () => {
+		svc.useNotebook('sessInherit', 'sub/inherit.ipynb');
+		const nb = svc.targetFor('sessInherit');
+		expect(svc.setExportTarget('helpers.py', nb, 'notebook')).toMatchObject({
+			export_target: 'sub/helpers.py',
+			export_base: 'notebook',
+			export_path: 'helpers.py'
+		});
+
+		// The reported path handed back WITHOUT a base: the base survives, and the
+		// module stays the same file rather than moving to the workspace root.
+		expect(svc.setExportTarget('helpers.py', nb)).toMatchObject({
+			export_target: 'sub/helpers.py',
+			export_base: 'notebook',
+			export_path: 'helpers.py'
+		});
+		expect(nbmod.getExportTargetState(nb)).toMatchObject({ base: 'notebook', target: 'helpers.py' });
+
+		// An EXPLICIT base still re-anchors, workspace included.
+		expect(svc.setExportTarget('sub/helpers.py', nb, 'workspace')).toEqual({
+			export_target: 'sub/helpers.py'
+		});
+		expect(nbmod.getExportTargetState(nb).base).toBe('workspace');
+	});
+
+	/**
+	 * A notebook that stores no base is the legacy shape, and an omitted base must
+	 * leave it exactly that: workspace-relative, with no key minted.
+	 */
+	it('mints no base key for a notebook that stores none', () => {
+		svc.useNotebook('sessLegacyBase', 'legacy-base.ipynb');
+		const nb = svc.targetFor('sessLegacyBase');
+		expect(svc.setExportTarget('lib/legacy.py', nb)).toEqual({ export_target: 'lib/legacy.py' });
+		const cellar = JSON.parse(readFileSync(nb, 'utf8')).metadata.cellar;
+		expect(cellar.export_target).toBe('lib/legacy.py');
+		expect('export_base' in cellar).toBe(false);
+	});
+
+	/**
+	 * The route's refusal reply is the ONLY thing that can correct the tab's field
+	 * and base select, so it must describe the document by the SAME rule the setter
+	 * reports it by. A second, route-local reading of the base answered a refusal
+	 * and a success with two different readings of one document - they diverge for a
+	 * document carrying `export_base` with no `export_target` (a hand edit), where
+	 * the route resolved nothing and fell back to `workspace` while the setter reads
+	 * the key that is really there.
+	 */
+	it('a refusal and a success describe one document by ONE rule', async () => {
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const post = POST as unknown as (e: { request: Request }) => Promise<Response>;
+		const rel = 'sub/one-rule.ipynb';
+		writeFileSync(
+			nbmod.resolveNotebookPath(rel),
+			JSON.stringify({
+				cells: [{ id: 'aaaa1111', cell_type: 'code', source: ['x = 1'], metadata: {}, outputs: [], execution_count: null }],
+				metadata: { cellar: { export_base: 'notebook' } },
+				nbformat: 4,
+				nbformat_minor: 5
+			})
+		);
+
+		const refused = await post({
+			request: new Request('http://x/api/notebooks/export-py', {
+				method: 'POST',
+				body: JSON.stringify({ op: 'set-target', target: 'nope', base: 'notebook', path: rel })
+			})
+		});
+		expect(refused.status).toBe(400);
+		const refusedBody = (await refused.json()) as Record<string, unknown>;
+
+		// The SAME reading the doc layer reports, and the same one the success path
+		// answers with a moment later.
+		expect(refusedBody.base).toBe(nbmod.getExportTargetState(rel).base);
+		const ok = await post({
+			request: new Request('http://x/api/notebooks/export-py', {
+				method: 'POST',
+				body: JSON.stringify({ op: 'set-target', target: 'kept.py', base: 'notebook', path: rel })
+			})
+		});
+		expect(ok.status).toBe(200);
+		expect(((await ok.json()) as Record<string, unknown>).base).toBe(refusedBody.base);
 	});
 
 	it('the UI route also refuses a target that is not a .py module', async () => {

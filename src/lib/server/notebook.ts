@@ -957,7 +957,13 @@ export class InvalidExportTargetError extends Error {
  * so every caller gets it - keeps the notebook portable. An absolute path
  * OUTSIDE the workspace is still refused by `resolveInWorkspace`, unchanged.
  *
- * THE BASE (`$lib/exportTarget`): `workspace` is the default and is never
+ * THE BASE (`$lib/exportTarget`): OMITTING it KEEPS the base the document
+ * already stores, so a caller echoing a path back without repeating the base
+ * can never silently re-anchor it - which would delete `export_base` from the
+ * committed `.ipynb` and relocate the generated module, leaving the old file
+ * behind. Only an EXPLICIT value changes the base, `workspace` included. The
+ * legacy shape is untouched by that: a pre-base notebook stores no key, so an
+ * omitted base inherits `workspace` and nothing is minted. `workspace` is never
  * persisted - the `export_base` key is DELETED for it, because ABSENCE of the
  * key is what a pre-base notebook stores and must permanently mean
  * workspace-relative; writing an explicit `workspace` would mint a second
@@ -972,7 +978,9 @@ export class InvalidExportTargetError extends Error {
  * (`cd repo/analysis && cellar`) is fine exactly as far as the resolved module
  * still lands inside the workspace. A notebook with no enclosing repository
  * refuses the `git` base by name (first-class state, not an exception), and an
- * unknown base value is refused rather than silently read as workspace.
+ * unknown base value is refused rather than silently read as workspace -
+ * INHERITED as much as explicit, so an omitted base cannot smuggle an unknown
+ * stored one past the check and rebuild the unrepairable trap below.
  *
  * CLEARING (null/'') is exempt from all of that and deletes BOTH keys whatever
  * the base says, because it can only remove state, never strand it (the
@@ -1001,7 +1009,7 @@ export function setExportTarget(
 ): ExportTargetState {
 	const doc = docFor(nb);
 	const raw = (target ?? '').trim();
-	const wanted = (base ?? '').trim() || 'workspace';
+	const wanted = (base ?? '').trim() || readExportBase(doc);
 	let stored = '';
 	// The base is checked only where a target is really STORED under it: a clear
 	// stores none, and must stay possible whatever the document says the base is.
@@ -1053,6 +1061,17 @@ export interface ExportTargetState {
 	resolved: string | null;
 	/** Why a configured target cannot resolve, else null. */
 	resolveError: string | null;
+}
+
+/**
+ * The stored state for a notebook BY PATH - the one rule every reply describes a
+ * document by, so the refusal path and the success path can never answer with
+ * two different readings of one document (the UI route's 400 is the only thing
+ * that can correct the tab's field and select, so a second copy there would put
+ * them back to a base the setter does not agree with).
+ */
+export function getExportTargetState(nb?: string | null): ExportTargetState {
+	return exportTargetState(docFor(nb));
 }
 
 function exportTargetState(doc: NotebookDoc): ExportTargetState {
