@@ -37,6 +37,8 @@
 	import type { Folding } from '$lib/headings';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import { isBlameUnavailable, activeBlameFor, type BlameReport } from '$lib/blame';
+	import { reorderTabs as reorderTabList } from '$lib/tabReorder';
+	import { tabDomId, tabPanelDomId } from '$lib/tabIds';
 
 	/** Kind of an open tab: the canonical notebook, an opened `.ipynb`/`.py`, a rendered image, or a text file. */
 	type TabKind = 'notebook' | 'ipynb' | 'image' | 'file';
@@ -49,6 +51,17 @@
 		closable: boolean;
 		dirty: boolean;
 		preview: boolean;
+		/**
+		 * The order this tab was OPENED in, which is what the hidden panes below are
+		 * rendered in - deliberately not the strip order, which the user reorders by
+		 * dragging. Pane order is invisible (every pane but the active one is
+		 * `hidden`), and keeping it fixed is what makes a reorder free: Svelte's
+		 * keyed `{#each}` MOVES a reordered pane's DOM node, and moving an
+		 * `<iframe>` RELOADS it - so deriving pane order from the strip would blank
+		 * and re-fetch every rich `text/html` output and every `.html` preview in
+		 * every open tab, as a side effect of dragging a tab.
+		 */
+		seq: number;
 	}
 	/** A tab-impacting workspace change reported up from the sidebar file tree. */
 	interface FsChange {
@@ -378,9 +391,12 @@
 	let tabs = $state<Tab[]>([]);
 	let activeTabId = $state<string | null>(null);
 	let tabsRestored = $state(false);
-	const fileTabs = $derived(tabs.filter((t) => t.kind === 'file'));
-	const imageTabs = $derived(tabs.filter((t) => t.kind === 'image'));
-	const ipynbTabs = $derived(tabs.filter((t) => t.kind === 'ipynb'));
+	// Panes are rendered in OPEN order (`seq`), never strip order - see `Tab.seq`.
+	const paneOrder = (kind: TabKind) =>
+		tabs.filter((t) => t.kind === kind).sort((a, b) => a.seq - b.seq);
+	const fileTabs = $derived(paneOrder('file'));
+	const imageTabs = $derived(paneOrder('image'));
+	const ipynbTabs = $derived(paneOrder('ipynb'));
 	const notebookOpen = $derived(tabs.some((t) => t.kind === 'notebook'));
 	const activeTab = $derived(tabs.find((t) => t.id === activeTabId) ?? null);
 	const activeFilePath = $derived(activeTab && activeTab.kind !== 'notebook' ? activeTab.path : null);
@@ -438,6 +454,25 @@
 			else if (Object.keys(rs.queued).length > 0) out[t.id] = 'queued';
 		}
 		return out;
+	});
+
+	// The notebook the jump-to-running-cell SHORTCUT acts on. The tab strip's run
+	// spinner is a control inside a tab and is deliberately out of the document's
+	// Tab order (the roving-tabindex pattern), so the keyboard reaches this through
+	// a declared chord instead - and a chord fires with nothing focused, so it has
+	// to pick its own target rather than read one off the focus.
+	//
+	// The VIEWED notebook wins when it is busy (the everyday case: you are watching
+	// it run and want to be taken back to the cell), else the first running one,
+	// else the first queued one. Null when nothing is busy at all, and the shortcut
+	// then leaves the keystroke alone rather than swallowing it.
+	const jumpTargetTabId = $derived.by<string | null>(() => {
+		if (activeTabId && tabRunState[activeTabId]) return activeTabId;
+		return (
+			tabs.find((t) => tabRunState[t.id] === 'running')?.id ??
+			tabs.find((t) => tabRunState[t.id] === 'queued')?.id ??
+			null
+		);
 	});
 
 	// Git blame shown in the bottom status bar. A FileTab reports its cursor line's
@@ -561,11 +596,24 @@
 		pyKindCache.set(path, kind);
 		return kind;
 	}
+	let tabSeq = 0; // monotonic open counter; stamps `Tab.seq` so pane order never moves
 	function makeTab(path: string, preview: boolean, kind?: TabKind): Tab {
+		const seq = tabSeq++;
 		if (path === canonicalNotebookRel) {
-			return { id: 'notebook', kind: 'notebook', title: notebookName, path, closable: true, dirty: false, preview };
+			return { id: 'notebook', kind: 'notebook', title: notebookName, path, closable: true, dirty: false, preview, seq };
 		}
-		return { id: 'file:' + path, kind: kind ?? baseKindFor(path), title: path.split('/').pop() ?? path, path, closable: true, dirty: false, preview };
+		return { id: 'file:' + path, kind: kind ?? baseKindFor(path), title: path.split('/').pop() ?? path, path, closable: true, dirty: false, preview, seq };
+	}
+
+	/**
+	 * Move a tab to insertion slot `insertAt` in the strip (the pointer drop and
+	 * the keyboard step both land here). The active tab is untouched by
+	 * construction - only the array's order changes, never `activeTabId` - and a
+	 * drop back onto the tab's own position returns the SAME array, so it writes
+	 * nothing and the session-memory `$effect` never fires.
+	 */
+	function reorderTabs(id: string, insertAt: number) {
+		tabs = reorderTabList(tabs, id, insertAt);
 	}
 
 	function selectTab(id: string) {
@@ -720,6 +768,7 @@
 				if (isPyPath(np) && (t.kind === 'ipynb' || t.kind === 'file')) pyKindCache.set(np, t.kind);
 				const nt = makeTab(np, t.preview, t.kind === 'notebook' ? undefined : t.kind);
 				nt.dirty = t.dirty;
+				nt.seq = t.seq; // a rename must not shuffle the hidden panes (see `Tab.seq`)
 				if (activeTabId === t.id) nextActive = nt.id;
 				return nt;
 			});
@@ -1452,6 +1501,23 @@
 				openFindBar();
 				return;
 			}
+			// Jump to the running cell, from anywhere. Shell-level for the reason the
+			// registry entry gives: the spinner that does this by pointer lives inside
+			// a tab and is out of the Tab order, and this must fire with no tab and no
+			// notebook focused. It reaches the SAME `jumpToRunningCell` the spinner
+			// click does rather than a second implementation, so the tab switch, the
+			// `tick` and the notebook's own reveal/scroll conventions are identical.
+			// With nothing running there is no target, and the keystroke is not ours:
+			// it falls through untouched. A modal owns the keyboard while up.
+			if (bindsFor('jump-to-running-cell').includes(chord)) {
+				if (document.querySelector('.modal-open')) return;
+				const target = jumpTargetTabId;
+				if (!target) return;
+				e.preventDefault();
+				e.stopPropagation();
+				jumpToRunningCell(target);
+				return;
+			}
 			if (!bindsFor('command-palette').includes(chord)) return;
 			if (!paletteOpen && document.querySelector('.modal-open')) return; // another modal owns the keyboard
 			e.preventDefault();
@@ -1522,6 +1588,7 @@
 		onJumpToRunningCell={jumpToRunningCell}
 		onCloseTab={closeTab}
 		onPromoteTab={promoteTab}
+		onReorderTabs={reorderTabs}
 		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
 		onConsolidateImports={consolidateImports}
 		onExportPy={exportPy}
@@ -1612,7 +1679,12 @@
 			     just hidden. The default notebook and opened `.ipynb` files use the
 			     same live component; each persists to its own file. -->
 			{#if notebookOpen}
-				<div class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}">
+				<div
+					class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}"
+					role="tabpanel"
+					id={tabPanelDomId('notebook')}
+					aria-labelledby={tabDomId('notebook')}
+				>
 					<LiveNotebook
 						path={canonicalNotebookRel}
 						virtualize={effectiveVirtualize}
@@ -1640,7 +1712,12 @@
 			{/if}
 
 			{#each ipynbTabs as tab (tab.id)}
-				<div class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}">
+				<div
+					class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}"
+					role="tabpanel"
+					id={tabPanelDomId(tab.id)}
+					aria-labelledby={tabDomId(tab.id)}
+				>
 					<LiveNotebook
 						path={tab.path}
 						virtualize={effectiveVirtualize}
@@ -1668,7 +1745,12 @@
 			{/each}
 
 			{#each fileTabs as tab (tab.id)}
-				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
+				<div
+					class="h-full {activeTabId === tab.id ? '' : 'hidden'}"
+					role="tabpanel"
+					id={tabPanelDomId(tab.id)}
+					aria-labelledby={tabDomId(tab.id)}
+				>
 					<FileTab
 						path={tab.path}
 						onDirty={onFileDirty}
@@ -1680,7 +1762,12 @@
 			{/each}
 
 			{#each imageTabs as tab (tab.id)}
-				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
+				<div
+					class="h-full {activeTabId === tab.id ? '' : 'hidden'}"
+					role="tabpanel"
+					id={tabPanelDomId(tab.id)}
+					aria-labelledby={tabDomId(tab.id)}
+				>
 					<ImageTab path={tab.path} />
 				</div>
 			{/each}
