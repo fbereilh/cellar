@@ -516,3 +516,67 @@ test('a hidden root bar costs no root read, and the toggle populates the picker'
 	await expect(page.locator('[data-testid="root-bar"]:visible')).toHaveCount(0);
 	await expectCodeRootPref(page, false);
 });
+
+/**
+ * A failed PERSIST is not a refusal, and the base select's write must say so the
+ * way the path commit already does. `setExportBase` validates before it mutates,
+ * so a 500 carrying `writeFailed` means the document HOLDS the re-expressed
+ * target under the new base and only the save failed - and that reply carries no
+ * `message`, so a client deciding by the message alone denied a change the select
+ * was visibly showing and blamed a server that had answered.
+ *
+ * The disk failure is injected at the reply rather than by breaking the real
+ * workspace: what is under test is which of the route's two 5xx-shaped outcomes
+ * the tab reports, not the filesystem.
+ */
+test('a base change the server accepted but could not save says exactly that', async ({
+	page,
+	request
+}) => {
+	const nb = await makeNotebook(request, 'diskbase.ipynb');
+	const target = await request.post(`${baseURL}/api/notebooks/export-py`, {
+		data: { op: 'set-target', target: 'lib/diskbase.py', path: nb }
+	});
+	expect(target.ok(), await target.text()).toBeTruthy();
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator(`[data-testid="tree-file"][data-path="${nb}"]`).click();
+	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+
+	const select = page.locator('[data-testid="export-base-select"]:visible');
+	const input = page.locator('[data-testid="export-target-input"]:visible');
+	await expect(select).toHaveValue('workspace');
+	await expect(input).toHaveValue('lib/diskbase.py');
+
+	// The route's own failed-write shape: the held state is the NEW one, and there
+	// is no `message` field at all.
+	await page.route('**/api/notebooks/export-py', async (route) => {
+		if (route.request().postDataJSON()?.op !== 'set-base') return route.continue();
+		await route.fulfill({
+			status: 500,
+			json: {
+				ok: false,
+				writeFailed: 'ENOSPC: no space left on device, write',
+				target: 'diskbase_mod.py',
+				base: 'notebook',
+				resolved: 'diskbase_mod.py',
+				resolveError: null
+			}
+		});
+	});
+	await select.selectOption('notebook');
+
+	// Read the toast ONCE (it self-dismisses), then assert the whole sentence: the
+	// absence of the unreachable wording is half the point, and a locator that has
+	// since gone would not answer for it.
+	const notice = page.getByTestId('app-notice');
+	await expect(notice).toContainText('accepted but not saved');
+	const said = (await notice.innerText()).trim();
+	expect(said).toContain('ENOSPC');
+	expect(said).not.toContain('could not be reached');
+	expect(said).not.toContain('not changed');
+	// The change the notice describes is the one on screen: the select and the
+	// input keep the state the document holds.
+	await expect(select).toHaveValue('notebook');
+	await expect(input).toHaveValue('diskbase_mod.py');
+});

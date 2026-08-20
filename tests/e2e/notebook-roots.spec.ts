@@ -229,35 +229,25 @@ test('a notebook with no declared root renders no root control, even with roots 
 }) => {
 	// The bar is hidden by default (the Settings "Show the code root bar"
 	// preference is off, and this notebook declares no root). The STRONGER half of
-	// that promise is that nothing workspace-side may open it: this workspace
-	// really has `roots/` checkouts, and the option-list response is even forced
-	// to a POPULATED list - a merely available root is not a declared one, so the
-	// notebook still renders no root chrome at all.
+	// that promise is now true BY CONSTRUCTION rather than by what a reply happens
+	// to contain: the option list is fetched only once the bar can be SEEN, so this
+	// workspace's real `roots/` checkouts cannot reach a notebook that declares
+	// nothing - the page never even asks. That is why there is no forced-populated
+	// response here to prove it against; a request that is never issued is a
+	// stronger statement than one whose answer is ignored.
 	await request.post(`${baseURL}/api/notebooks/root`, { data: { root: '', path: 'notebook.ipynb' } });
-	await page.route('**/api/notebooks/root?*', (route) =>
-		route.fulfill({
-			json: {
-				ok: true,
-				root: null,
-				roots: [
-					{
-						path: 'roots/baseline',
-						absolute: join(workspace, 'roots', 'baseline'),
-						exists: true,
-						branch: 'baseline',
-						commit: null,
-						declared: false,
-						notebooks: [],
-						source: 'convention',
-						external: false
-					}
-				]
-			}
-		})
-	);
+	const rootReads: (string | null)[] = [];
+	page.on('request', (r) => {
+		const u = new URL(r.url());
+		if (r.method() === 'GET' && u.pathname === '/api/notebooks/root')
+			rootReads.push(u.searchParams.get('path'));
+	});
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
 	await expect(page.getByTestId('root-bar')).toHaveCount(0);
+	// Filtered to this notebook: another restored tab that DOES declare a root
+	// legitimately reads, and that is not what this test is about.
+	expect(rootReads.filter((p) => p === 'notebook.ipynb')).toEqual([]);
 });
 
 test('a REFUSED root leaves the picker showing the root the notebook still runs at', async ({

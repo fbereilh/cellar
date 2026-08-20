@@ -749,6 +749,52 @@ describe('a refused path and a failed write are told apart', () => {
 		expect(commitFn).not.toMatch(/status >= 500/);
 		expect(commitFn).toMatch(/body\?\.writeFailed/);
 	});
+
+	it('a failed BASE write answers the same way, and carries no message to fall back on', async () => {
+		// The re-expression is the OTHER write this route serves, and it mutates before
+		// it persists too - so the same split applies. What makes reading `message`
+		// alone actively wrong here is that this reply has none: a client that decides
+		// by the message denies a change the document really took and blames a server
+		// that answered.
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const post = POST as unknown as (e: { request: Request }) => Promise<Response>;
+		svc.useNotebook('sessDiskBase', 'sub/disk-base.ipynb');
+		const nb = svc.targetFor('sessDiskBase');
+		await svc.addCells([{ cell_type: 'code', source: 'v = 1' }], null, { nb, routeImports: false });
+
+		const call = (payload: Record<string, unknown>) =>
+			post({
+				request: new Request('http://x/api/notebooks/export-py', {
+					method: 'POST',
+					body: JSON.stringify({ path: 'sub/disk-base.ipynb', ...payload })
+				})
+			});
+
+		expect((await call({ op: 'set-target', target: 'lib/disk-base.py' })).status).toBe(200);
+
+		disk.failFor = 'disk-base.ipynb';
+		let res: Response;
+		try {
+			res = await call({ op: 'set-base', base: 'notebook' });
+		} finally {
+			disk.failFor = null;
+		}
+		expect(res.status).toBe(500);
+		const body = (await res.json()) as Record<string, unknown>;
+		expect(body).toMatchObject({
+			ok: false,
+			writeFailed: expect.stringMatching(/ENOSPC/),
+			// The document HOLDS the re-expressed target under the new base - the select
+			// and the input keep it, and the next successful save writes it.
+			base: 'notebook',
+			target: '../lib/disk-base.py'
+		});
+		expect(body).not.toHaveProperty('message');
+		expect(nbmod.getExportTargetState(nb)).toMatchObject({
+			base: 'notebook',
+			target: '../lib/disk-base.py'
+		});
+	});
 });
 
 /**

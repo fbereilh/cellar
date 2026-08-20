@@ -2711,8 +2711,21 @@
 				exportResolveError = (body.resolveError ?? null) as string | null;
 			}
 			if (!res?.ok) {
-				const message = body && typeof body.message === 'string' ? body.message : null;
-				onNotice?.(`Export base not changed${message ? `: ${message}` : ': the server could not be reached.'}`);
+				// The SAME split as `commitExportTarget`, decided by the FLAG the route sets
+				// and never by the status code: `writeFailed` is NOT a refusal - the setter
+				// validates before it mutates, so the document already HOLDS the new base
+				// (which is why the block above adopted it) and only the persist failed.
+				// Reported as "not changed", the notice denied a change the select was
+				// visibly showing and blamed an unreachable server that had in fact
+				// answered. The unreachable wording is reserved for a reply that landed no
+				// verdict we can read.
+				const failure = typeof body?.writeFailed === 'string' ? body.writeFailed : null;
+				const message = typeof body?.message === 'string' ? body.message : null;
+				if (failure) onNotice?.(`Export base accepted but not saved: ${failure}`);
+				else
+					onNotice?.(
+						`Export base not changed${message ? `: ${message}` : ': the server could not be reached.'}`
+					);
 			}
 		} finally {
 			// Settling the busy flag is what lets Notebook.svelte's select resync to the
