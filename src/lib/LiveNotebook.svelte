@@ -28,6 +28,7 @@
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
 	import { exportCellCount } from '$lib/exportRole';
+	import { isExportBase } from '$lib/exportTarget';
 	import { splitInheritedCellar } from '$lib/splitCell';
 	import { agentConfigNotice, type WorkspaceRootOption } from '$lib/notebookRoot';
 	import { createSearchCache } from '$lib/search';
@@ -230,11 +231,12 @@
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
 	// imports from (null = the workspace root, the default and today's behavior).
 	// Mirrors `notebook.metadata.cellar.root`, kept live via the `notebook:root` SSE
-	// event. `availableRoots` is the workspace's `roots/` directories, fetched on
-	// mount and whenever the root changes — when both are empty the notebook renders
-	// no root control at all, so a workspace that never adopts roots looks exactly
-	// as before. `isPy` is a `.py` text notebook, which stores no notebook metadata
-	// and therefore cannot hold a root at all (the server refuses one).
+	// event. `availableRoots` is the workspace's code roots, fetched the first time
+	// the root BAR can be seen (`rootBarVisible` below) and whenever the root
+	// changes - when both are empty the notebook renders no root control at all, so
+	// a workspace that never adopts roots looks exactly as before. `isPy` is a `.py`
+	// text notebook, which stores no notebook metadata and therefore cannot hold a
+	// root at all (the server refuses one).
 	let root = $state<string | null>(null);
 	let isPy = $state(false);
 	let availableRoots = $state<WorkspaceRootOption[]>([]);
@@ -252,11 +254,34 @@
 		if (root !== null) rootSeen = true;
 	});
 	// Generation guard for the root list (the statusSeq / kernelReqSeq convention):
-	// a mount fetch and a `notebook:root` fetch are unordered, so only the NEWEST
+	// a reveal fetch and a `notebook:root` fetch are unordered, so only the NEWEST
 	// one may apply — an older reply landing last would restore a stale list, and
 	// with it a "missing on disk" banner for a root that has since come back.
 	let rootsSeq = 0;
 	let rootsFetched = false;
+	// Whether the root bar is on screen at all - the SAME inputs as
+	// `Notebook.svelte`'s `showRootBar`, which is what this must track: the list it
+	// gates decides only whether that bar's PICKER is offered, so fetching it for a
+	// bar nobody can see buys nothing. And it is not free: the route reads `roots/`,
+	// every live notebook's declaration and `git worktree list` (a blocking
+	// `spawnSync`, plus a `resolveRootDir` per candidate) on the process carrying the
+	// kernel websockets and the SSE fan-out. Once the bar became opt-in chrome that
+	// was a read per notebook OPEN in the DEFAULT configuration, for a control the
+	// default configuration never renders.
+	const rootBarVisible = $derived(!isPy && (showCodeRoot || root !== null || rootSeen));
+	// ONE fetch per component, the first time the bar can be seen: at mount when it
+	// already is (a declared root, or the Settings preference on) and otherwise the
+	// moment the preference reveals it, with no reload. `fetching` holds it back
+	// until `load()` has settled `isPy`/`root`, so a `.py` notebook opened with the
+	// preference on is never probed on the pre-load defaults. `rootsFetched` is a
+	// plain `let`, so this writes nothing reactive: it is the once-guard the mount
+	// fetch used, shared with the `notebook:root` refetch so a root change and this
+	// reveal can never both spawn the same read.
+	$effect(() => {
+		if (fetching || rootsFetched || !rootBarVisible) return;
+		rootsFetched = true;
+		void loadRoots();
+	});
 	let rootFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 	/** How long the root bar keeps reporting the outcome of a root change. */
 	const ROOT_FEEDBACK_MS = 8000;
@@ -1460,15 +1485,13 @@
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			root = body.notebook.root ?? null; // code root (kernel cwd + sys.path)
 			isPy = !!body.notebook.isPy; // a `.py` text notebook holds no root at all
-			// ONCE, not on every load: `load()` is also the reconnect / seq-gap /
-			// output-append resync backstop, and the root list costs a git read per root
-			// on the process carrying the kernel websockets and the SSE fan-out. It only
-			// decides whether a picker is OFFERED, never what runs, and a genuine change
-			// arrives on `notebook:root`. Detached, so the cells render immediately.
-			if (!rootsFetched && !isPy) {
-				rootsFetched = true;
-				void loadRoots();
-			}
+			// The root list is NOT fetched here: it is gated on the root bar being
+			// visible at all (the `rootBarVisible` effect above), which also covers the
+			// preference revealing the bar later. Fetching on every load would be wrong
+			// twice over - `load()` is also the reconnect / seq-gap / output-append
+			// resync backstop, and the list only decides whether a picker is OFFERED,
+			// never what runs; a genuine change arrives on `notebook:root`.
+
 			// A notebook always has a selected cell (command mode acts on it), so
 			// j/k and the rest work the moment the notebook opens. A refetch can also
 			// have removed cells out from under a multi-selection, so prune it to what
@@ -2538,9 +2561,20 @@
 		// retype then silently stored the path workspace-relative, a different file for
 		// a notebook in a subdirectory. The resolution is null in that case anyway, so
 		// it is adopted either way and a stale display can never survive.
+		//
+		// THE ONE EXCEPTION is a locally-held value that is not a legal base at all:
+		// only the DOCUMENT can have put one there (a hand-edited `export_base`, shown
+		// unmatched by the select rather than masquerading as workspace), never the
+		// select, so it is no user pre-choice to protect - and keeping it made the
+		// documented repair LOOP. Clearing the target deletes both keys and answers
+		// `held:null`, so the guard held the dead base; the very next path commit then
+		// sent it again and was refused with "clear the export target to reset the
+		// base, then set the path again" - the advice just followed. Adopting the
+		// reply there is what makes that repair terminate.
 		const adoptHeldMeta = () => {
 			if (!knowsHeld) return;
-			if (held !== null) exportBase = typeof body!.base === 'string' ? (body!.base as string) : 'workspace';
+			if (held !== null || !isExportBase(exportBase))
+				exportBase = typeof body!.base === 'string' ? (body!.base as string) : 'workspace';
 			exportResolved = (body!.resolved ?? null) as string | null;
 			exportResolveError = (body!.resolveError ?? null) as string | null;
 		};
@@ -2621,16 +2655,38 @@
 	 * committed a new path, or another tab's / an agent's event landed) - the same
 	 * `superseded` rule as `commitExportTarget`, against the field rather than any
 	 * remembered baseline.
+	 *
+	 * An in-flight PATH commit is AWAITED first, the `exportPy` rule and for the same
+	 * reason: clicking (or tabbing into) the select blurs the target input, which
+	 * fires its `change`, so both writes address one document at once. Whichever
+	 * reply landed first won, and the other was discarded by the `superseded` guard,
+	 * leaving the tab showing a (path, base) pair the server does not hold until a
+	 * reload - and with NO stored target it was worse: this function read the
+	 * OPTIMISTIC path, took the re-express branch, and the server's honest no-op
+	 * (`target:null, base:'workspace'`) was adopted over both the typed path and the
+	 * client-local base pre-choice, the very loss the `adoptHeldMeta` held-guard
+	 * exists to prevent. The commit is CONSUMED by the wait: it drops itself from
+	 * `exportTargetCommit` the moment it settles, so a concurrent `exportPy` can
+	 * never re-handle it - and it is deliberately not nulled UP FRONT, which would
+	 * instead let an export clicked during this wait skip the commit it must await.
+	 * Both branch conditions are then re-read against the SETTLED value: the commit's
+	 * own reply may have adopted a base, stored a path, or put both back.
 	 */
 	async function setExportBaseValue(base: string) {
 		if (base === exportBase) return;
-		if (!exportTarget) {
-			exportBase = base;
-			return;
-		}
-		const before = exportTarget;
 		exportBaseBusy = true;
 		try {
+			const pending = exportTargetCommit;
+			if (pending) await pending.catch(() => null);
+			if (base === exportBase) return; // the commit's reply already landed this base
+			if (!exportTarget) {
+				// Nothing stored (never was, or the commit was refused): the base is a
+				// fact ABOUT a stored target, so the choice stays client-local and rides
+				// up with the first path commit.
+				exportBase = base;
+				return;
+			}
+			const before = exportTarget;
 			const res = await fetch('/api/notebooks/export-py', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
@@ -2644,8 +2700,13 @@
 				: null;
 			if (exportTarget !== before) return; // superseded: a newer value owns the field
 			if (body && 'target' in body) {
-				exportTarget = (body.target ?? null) as string | null;
-				exportBase = typeof body.base === 'string' ? body.base : 'workspace';
+				const held = (body.target ?? null) as string | null;
+				exportTarget = held;
+				// The same held-guard as `commitExportTarget`: with no target held the
+				// reply's base describes nothing, so the PICK stands as the client-local
+				// pre-choice (what the no-target branch above does) rather than snapping
+				// the select back to a base the document does not record.
+				exportBase = held !== null ? (typeof body.base === 'string' ? body.base : 'workspace') : base;
 				exportResolved = (body.resolved ?? null) as string | null;
 				exportResolveError = (body.resolveError ?? null) as string | null;
 			}

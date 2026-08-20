@@ -109,6 +109,22 @@ async function openSettings(page: Page): Promise<void> {
 	await expect(page.getByTestId('settings-modal')).toBeVisible();
 }
 
+/**
+ * Wait until the SERVER holds the code-root preference, not just the tab: the UI
+ * store PUTs on a debounce, so a test that flips it and ends leaves the write in
+ * flight and the NEXT test's page is seeded from the stale value - which is a
+ * cross-test leak, since this preference decides whether the root bar renders at
+ * all. Asserting the persistence, never the debounce window.
+ */
+async function expectCodeRootPref(page: Page, value: boolean): Promise<void> {
+	await expect
+		.poll(async () => {
+			const res = await page.request.get(`${baseURL}/api/ui-state`);
+			return ((await res.json()) as Record<string, unknown>)['cellar-show-code-root'] === true;
+		})
+		.toBe(value);
+}
+
 async function closeSettings(page: Page): Promise<void> {
 	await page.getByTestId('settings-close').click();
 	await expect(page.getByTestId('settings-modal')).toHaveCount(0);
@@ -259,12 +275,7 @@ test('the Settings toggle reveals the root bar on a rootless notebook, and persi
 	// The preference is server-held UI state, so it survives a reload - but the
 	// client store PUTs on a debounce, so wait for the server to really hold it
 	// before reloading (asserting the persistence, not the debounce window).
-	await expect
-		.poll(async () => {
-			const res = await page.request.get(`${baseURL}/api/ui-state`);
-			return ((await res.json()) as Record<string, unknown>)['cellar-show-code-root'];
-		})
-		.toBe(true);
+	await expectCodeRootPref(page, true);
 	await page.reload();
 	// Same settle rule, with the `:visible` cell locator this test needs (several
 	// notebooks are mounted by now, and a hidden one must not answer for the page).
@@ -274,11 +285,13 @@ test('the Settings toggle reveals the root bar on a rootless notebook, and persi
 	await page.locator('[data-testid="tree-file"][data-path="notebook.ipynb"]').click();
 	await expect(page.locator('[data-testid="root-bar"]:visible')).toBeVisible();
 
-	// Off again: the bar leaves (this notebook still declares no root).
+	// Off again: the bar leaves (this notebook still declares no root). Waited out
+	// on the SERVER too, so the next test's page is not seeded from a stale `true`.
 	await openSettings(page);
 	await page.getByTestId('settings-show-code-root').click();
 	await closeSettings(page);
 	await expect(page.locator('[data-testid="root-bar"]:visible')).toHaveCount(0);
+	await expectCodeRootPref(page, false);
 });
 
 /**
@@ -324,4 +337,182 @@ test('a refused first commit keeps the base the user chose, so the retype lands 
 		export_target: 'analysis/helpers.py',
 		export_base: 'git'
 	});
+});
+
+/**
+ * The base select and the target input write to ONE document, and clicking (or
+ * tabbing into) the select BLURS the input - which fires its `change`. So the
+ * everyday "type the path, then pick the base" gesture puts both writes on the
+ * wire at once, and whichever reply landed first won while the other was thrown
+ * away by the `superseded` guard.
+ *
+ * The set-target reply is HELD here so the interleaving is deterministic rather
+ * than a race: the server then sees set-base FIRST, over a document that holds no
+ * target - an honest no-op reporting `{target:null, base:'workspace'}`. Adopted,
+ * that emptied the field the user had just typed into AND discarded the base they
+ * had just picked, while the notebook on disk really did hold the path. The base
+ * change must instead WAIT for the path commit and re-express what was stored.
+ */
+test('picking a base right after typing a path waits for the path commit', async ({
+	page,
+	request
+}) => {
+	const nb = await makeNotebook(request, 'ordering.ipynb');
+	await page.route('**/api/notebooks/export-py', async (route) => {
+		if (route.request().postDataJSON()?.op === 'set-target')
+			await new Promise((r) => setTimeout(r, 700));
+		await route.continue();
+	});
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator('[data-testid="tree-file"][data-path="ordering.ipynb"]').click();
+	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+
+	const select = page.locator('[data-testid="export-base-select"]:visible');
+	const input = page.locator('[data-testid="export-target-input"]:visible');
+	await expect(input).toHaveValue('');
+	await expect(select).toHaveValue('workspace');
+
+	// Type the path, then reach for the select. Reaching for it BLURS the input,
+	// which is what fires its `change` and puts the path commit on the wire - so
+	// the blur is issued explicitly here, because Playwright's synthetic
+	// `selectOption` moves no focus and would never produce it.
+	await input.fill('ordering_mod.py');
+	await input.blur();
+	await select.selectOption('git');
+
+	// Both halves survive: the path is stored, then RE-EXPRESSED under the base
+	// that was picked (the git root is this workspace's PARENT, so the same file
+	// gains its repo-relative spelling).
+	await expect(input).toHaveValue('analysis/ordering_mod.py');
+	await expect(select).toHaveValue('git');
+	await expect(page.locator('[data-testid="export-resolved"]:visible')).toHaveText(
+		'→ ordering_mod.py'
+	);
+	await expect.poll(() => diskCellar(nb)).toMatchObject({
+		export_target: 'analysis/ordering_mod.py',
+		export_base: 'git'
+	});
+});
+
+/**
+ * A hand-edited `export_base` the resolver does not know is SHOWN unmatched by
+ * the select (never masquerading as workspace) and refuses to resolve, and every
+ * refusal names the same repair: clear the target, then set the path again.
+ *
+ * That repair used to LOOP. Clearing deletes both keys and answers with no target
+ * held, and the base is adopted only when one IS - so the tab kept the dead base
+ * and sent it with the very next path commit, which was refused with the advice
+ * just followed. The clear must leave the tab able to set a path again.
+ */
+test('the documented repair for an unknown hand-edited base terminates', async ({ page }) => {
+	// Written straight to disk, never through the API: the point is a base no
+	// setter would ever store, on a document the server has not yet loaded.
+	const rel = 'weirdbase.ipynb';
+	writeFileSync(
+		join(workspace, rel),
+		JSON.stringify(
+			{
+				cells: [
+					{
+						cell_type: 'code',
+						execution_count: null,
+						id: 'aaaaaaaa',
+						metadata: {},
+						outputs: [],
+						source: ['x = 1']
+					}
+				],
+				metadata: {
+					cellar: { export_target: 'mod.py', export_base: 'weird' },
+					kernelspec: { display_name: 'python3', language: 'python', name: 'python3' }
+				},
+				nbformat: 4,
+				nbformat_minor: 5
+			},
+			null,
+			1
+		)
+	);
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator(`[data-testid="tree-file"][data-path="${rel}"]`).click();
+	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+
+	const select = page.locator('[data-testid="export-base-select"]:visible');
+	const input = page.locator('[data-testid="export-target-input"]:visible');
+	await expect(input).toHaveValue('mod.py');
+	// Unmatched, not workspace: no option carries this value, so the select shows none.
+	await expect(select).toHaveValue('');
+	await expect(page.locator('[data-testid="export-resolve-error"]:visible')).toContainText(
+		'unknown export base'
+	);
+
+	// The repair, step one: clearing is allowed under ANY stored base and deletes
+	// both keys.
+	await input.fill('');
+	await input.press('Enter');
+	await expect.poll(() => 'export_target' in diskCellar(rel)).toBe(false);
+	expect('export_base' in diskCellar(rel)).toBe(false);
+
+	// Step two: setting the path again LANDS, rather than being refused for the
+	// base that is no longer there.
+	await input.fill('mod.py');
+	await input.press('Enter');
+	await expect.poll(() => diskCellar(rel)).toMatchObject({ export_target: 'mod.py' });
+	expect('export_base' in diskCellar(rel)).toBe(false);
+	await expect(select).toHaveValue('workspace');
+	await expect(page.locator('[data-testid="export-resolve-error"]:visible')).toHaveCount(0);
+});
+
+/**
+ * The root list costs a `git worktree list` (a blocking `spawnSync`) plus a
+ * resolve per candidate, on the process carrying the kernel websockets and the
+ * SSE fan-out - and it decides only whether the root bar's PICKER is offered. Now
+ * that the bar is opt-in chrome, the default configuration must not pay for it on
+ * every notebook open; flipping the preference on must still populate the picker
+ * with no reload.
+ *
+ * Counted by exact pathname and filtered to THIS notebook: other restored tabs
+ * are mounted too, and one of them declares a root, so it legitimately reads.
+ */
+test('a hidden root bar costs no root read, and the toggle populates the picker', async ({
+	page,
+	request
+}) => {
+	const rel = 'quiet.ipynb';
+	await makeNotebook(request, rel);
+	const reads: (string | null)[] = [];
+	page.on('request', (r) => {
+		const u = new URL(r.url());
+		if (r.method() === 'GET' && u.pathname === '/api/notebooks/root')
+			reads.push(u.searchParams.get('path'));
+	});
+	const readsFor = () => reads.filter((p) => p === rel).length;
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator(`[data-testid="tree-file"][data-path="${rel}"]`).click();
+	// The export bar is unconditional, so its arrival proves this notebook loaded.
+	await expect(page.locator('[data-testid="export-bar"]:visible')).toBeVisible();
+	await expect(page.locator('[data-testid="root-bar"]:visible')).toHaveCount(0);
+	expect(readsFor()).toBe(0);
+
+	await openSettings(page);
+	const toggle = page.getByTestId('settings-show-code-root');
+	await expect(toggle).not.toBeChecked();
+	await toggle.click();
+	await closeSettings(page);
+
+	// Revealed, and POPULATED - the workspace really has a `roots/pr-1` worktree,
+	// and no reload happened.
+	const select = page.locator('[data-testid="root-select"]:visible');
+	await expect(select).toBeVisible();
+	await expect(select).toContainText('roots/pr-1');
+	expect(readsFor()).toBe(1);
+
+	// Leave the preference as this file found it, durably.
+	await openSettings(page);
+	await page.getByTestId('settings-show-code-root').click();
+	await closeSettings(page);
+	await expect(page.locator('[data-testid="root-bar"]:visible')).toHaveCount(0);
+	await expectCodeRootPref(page, false);
 });
