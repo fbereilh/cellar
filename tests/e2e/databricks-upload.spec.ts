@@ -144,6 +144,11 @@ async function mockUpload(
  */
 async function openNotebook(page: Page): Promise<void> {
 	const openBtn = page.getByTestId('empty-open-notebook');
+	// Settle on whichever the shell paints - the empty state, or a notebook that is
+	// already open - BEFORE probing. Probed earlier, a slow first paint reports the
+	// button invisible, the click becomes a no-op, and the wait below then times out
+	// on a notebook nothing ever opened (a real flake under `workers: 2`).
+	await expect(openBtn.or(page.locator('[data-testid="cell"]:visible').first())).toBeVisible();
 	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
 	const tab = page.locator('[data-testid="tab"][data-tab-id="notebook"]');
 	if ((await tab.count()) > 0 && (await tab.getAttribute('data-active')) !== 'true') await tab.click();

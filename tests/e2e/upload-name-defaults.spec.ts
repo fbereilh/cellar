@@ -144,6 +144,11 @@ async function openProject(page: Page, url: string): Promise<void> {
 	touched.add(url);
 	await page.goto(url);
 	const openBtn = page.getByTestId('empty-open-notebook');
+	// Settle on whichever the shell paints - the empty state, or a notebook that is
+	// already open - BEFORE probing. Probed earlier, a slow first paint reports the
+	// button invisible, the click becomes a no-op, and the wait below then times out
+	// on a notebook nothing ever opened (a real flake under `workers: 2`).
+	await expect(openBtn.or(page.locator('[data-testid="cell"]:visible').first())).toBeVisible();
 	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
 }

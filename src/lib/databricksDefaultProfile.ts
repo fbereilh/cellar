@@ -244,13 +244,28 @@ export interface DefaultProfileConnection {
  * while the card explaining it went missing. A lost/restarting session is the
  * opposite: a kernel restart gives a FRESH process which inherits the shell's
  * `DATABRICKS_*` again, so the premise does not hold and the notice stays silent.
+ *
+ * `held` is the third input and it is a LAYOUT fact rather than a new premise: the
+ * Databricks panel is HOLDING its connected view through a transition it expects (a
+ * cluster switch, a runtime-toggle restart) - `holdsSessionDetail` in
+ * [[databricksPanelState]], which already applies the notebook-ownership question, so
+ * another notebook's transition can never reach here. Mid-restart the payload drops
+ * BOTH halves above, so read without it this card unmounted for the length of the
+ * restart and sprang back afterwards, moving everything below it in the sidebar - the
+ * jump the flicker fix exists to remove. It cannot make the notice a false nag: the
+ * connected view is only ever held over a session that was really live moments ago,
+ * so the reading it holds is one of the two halves above, decided against that
+ * session; the moment the transition settles the verdict is taken afresh, and a FIRST
+ * connect holds nothing at all. Which profile the machine defaults to is a property of
+ * `~/.databrickscfg`, and neither a switch nor a restart writes it.
  */
 export function defaultProfileNoticeApplies(
 	verdict: DefaultProfileVerdict | null | undefined,
-	connection: DefaultProfileConnection | null | undefined
+	connection: DefaultProfileConnection | null | undefined,
+	held = false
 ): boolean {
 	if (verdict?.needsDefault !== true) return false;
-	return !!connection?.connected || connection?.expired === true;
+	return !!connection?.connected || connection?.expired === true || held;
 }
 
 /**

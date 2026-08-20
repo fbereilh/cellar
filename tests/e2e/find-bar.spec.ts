@@ -108,6 +108,11 @@ async function open(page: Page, virtualize = false): Promise<void> {
 	await page.goto(`${baseURL}/${q}`);
 	// A fresh tab-session starts in the empty state; open the seeded notebook.
 	const openBtn = page.getByTestId('empty-open-notebook');
+	// Settle on whichever the shell paints - the empty state, or a notebook that is
+	// already open - BEFORE probing. Probed earlier, a slow first paint reports the
+	// button invisible, the click becomes a no-op, and the wait below then times out
+	// on a notebook nothing ever opened (a real flake under `workers: 2`).
+	await expect(openBtn.or(page.getByTestId('cell').first())).toBeVisible();
 	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
 	await expect(page.getByTestId('cell').first()).toBeVisible({ timeout: 30_000 });
 }
