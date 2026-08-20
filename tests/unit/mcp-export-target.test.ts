@@ -16,7 +16,7 @@
  * kernel or subprocess is involved.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -66,6 +66,7 @@ let events: typeof import('../../src/lib/server/events');
 
 beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-mcp-export-target-'));
+	mkdirSync(join(WS, 'sub'), { recursive: true });
 	process.env.CELLAR_WORKSPACE = WS;
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
@@ -257,6 +258,95 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 		expect(py.writes).toEqual([]);
 	});
 
+	/**
+	 * The AGENT surface of the base-inheritance rule: an omitted `base` keeps the
+	 * one the document stores, so echoing a reported path back cannot silently
+	 * re-anchor it - which would drop `export_base` from the committed .ipynb and
+	 * move the generated module, leaving the old file behind.
+	 */
+	it('set_export_target with no base keeps the notebook\'s stored base', async () => {
+		svc.useNotebook('sessInherit', 'sub/inherit.ipynb');
+		const nb = svc.targetFor('sessInherit');
+		expect(svc.setExportTarget('helpers.py', nb, 'notebook')).toMatchObject({
+			export_target: 'sub/helpers.py',
+			export_base: 'notebook',
+			export_path: 'helpers.py'
+		});
+
+		// The reported path handed back WITHOUT a base: the base survives, and the
+		// module stays the same file rather than moving to the workspace root.
+		expect(svc.setExportTarget('helpers.py', nb)).toMatchObject({
+			export_target: 'sub/helpers.py',
+			export_base: 'notebook',
+			export_path: 'helpers.py'
+		});
+		expect(nbmod.getExportTargetState(nb)).toMatchObject({ base: 'notebook', target: 'helpers.py' });
+
+		// An EXPLICIT base still re-anchors, workspace included.
+		expect(svc.setExportTarget('sub/helpers.py', nb, 'workspace')).toEqual({
+			export_target: 'sub/helpers.py'
+		});
+		expect(nbmod.getExportTargetState(nb).base).toBe('workspace');
+	});
+
+	/**
+	 * A notebook that stores no base is the legacy shape, and an omitted base must
+	 * leave it exactly that: workspace-relative, with no key minted.
+	 */
+	it('mints no base key for a notebook that stores none', () => {
+		svc.useNotebook('sessLegacyBase', 'legacy-base.ipynb');
+		const nb = svc.targetFor('sessLegacyBase');
+		expect(svc.setExportTarget('lib/legacy.py', nb)).toEqual({ export_target: 'lib/legacy.py' });
+		const cellar = JSON.parse(readFileSync(nb, 'utf8')).metadata.cellar;
+		expect(cellar.export_target).toBe('lib/legacy.py');
+		expect('export_base' in cellar).toBe(false);
+	});
+
+	/**
+	 * The route's refusal reply is the ONLY thing that can correct the tab's field
+	 * and base select, so it must describe the document by the SAME rule the setter
+	 * reports it by. A second, route-local reading of the base answered a refusal
+	 * and a success with two different readings of one document - they diverge for a
+	 * document carrying `export_base` with no `export_target` (a hand edit), where
+	 * the route resolved nothing and fell back to `workspace` while the setter reads
+	 * the key that is really there.
+	 */
+	it('a refusal and a success describe one document by ONE rule', async () => {
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const post = POST as unknown as (e: { request: Request }) => Promise<Response>;
+		const rel = 'sub/one-rule.ipynb';
+		writeFileSync(
+			nbmod.resolveNotebookPath(rel),
+			JSON.stringify({
+				cells: [{ id: 'aaaa1111', cell_type: 'code', source: ['x = 1'], metadata: {}, outputs: [], execution_count: null }],
+				metadata: { cellar: { export_base: 'notebook' } },
+				nbformat: 4,
+				nbformat_minor: 5
+			})
+		);
+
+		const refused = await post({
+			request: new Request('http://x/api/notebooks/export-py', {
+				method: 'POST',
+				body: JSON.stringify({ op: 'set-target', target: 'nope', base: 'notebook', path: rel })
+			})
+		});
+		expect(refused.status).toBe(400);
+		const refusedBody = (await refused.json()) as Record<string, unknown>;
+
+		// The SAME reading the doc layer reports, and the same one the success path
+		// answers with a moment later.
+		expect(refusedBody.base).toBe(nbmod.getExportTargetState(rel).base);
+		const ok = await post({
+			request: new Request('http://x/api/notebooks/export-py', {
+				method: 'POST',
+				body: JSON.stringify({ op: 'set-target', target: 'kept.py', base: 'notebook', path: rel })
+			})
+		});
+		expect(ok.status).toBe(200);
+		expect(((await ok.json()) as Record<string, unknown>).base).toBe(refusedBody.base);
+	});
+
 	it('the UI route also refuses a target that is not a .py module', async () => {
 		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
 		const nb = svc.targetFor('sessRoutePy');
@@ -293,7 +383,13 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 				})
 			});
 
-		expect(await (await call('lib/held.py')).json()).toEqual({ ok: true, target: 'lib/held.py' });
+		expect(await (await call('lib/held.py')).json()).toEqual({
+			ok: true,
+			target: 'lib/held.py',
+			base: 'workspace',
+			resolved: 'lib/held.py',
+			resolveError: null
+		});
 		// Refused, and the reply names the target still in force - so the field reverts to
 		// what the server really holds rather than to whatever it last remembered.
 		const refused = await call('src/app.ts');
@@ -331,7 +427,13 @@ describe('the stored value is what is reported back', () => {
 				})
 			})
 		});
-		expect(await res.json()).toEqual({ ok: true, target: 'lib/stored.py' });
+		expect(await res.json()).toEqual({
+			ok: true,
+			target: 'lib/stored.py',
+			base: 'workspace',
+			resolved: 'lib/stored.py',
+			resolveError: null
+		});
 		expect(nbmod.getExportTarget(nb)).toBe('lib/stored.py');
 	});
 
@@ -343,7 +445,13 @@ describe('the stored value is what is reported back', () => {
 				body: JSON.stringify({ op: 'set-target', target: '  ', path: 'stored-target.ipynb' })
 			})
 		});
-		expect(await res.json()).toEqual({ ok: true, target: null });
+		expect(await res.json()).toEqual({
+			ok: true,
+			target: null,
+			base: 'workspace',
+			resolved: null,
+			resolveError: null
+		});
 		expect(nbmod.getExportTarget(svc.targetFor('sessStored'))).toBeNull();
 	});
 
@@ -640,6 +748,144 @@ describe('a refused path and a failed write are told apart', () => {
 		// the other door.
 		expect(commitFn).not.toMatch(/status >= 500/);
 		expect(commitFn).toMatch(/body\?\.writeFailed/);
+	});
+
+	it('a failed BASE write answers the same way, and carries no message to fall back on', async () => {
+		// The re-expression is the OTHER write this route serves, and it mutates before
+		// it persists too - so the same split applies. What makes reading `message`
+		// alone actively wrong here is that this reply has none: a client that decides
+		// by the message denies a change the document really took and blames a server
+		// that answered.
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const post = POST as unknown as (e: { request: Request }) => Promise<Response>;
+		svc.useNotebook('sessDiskBase', 'sub/disk-base.ipynb');
+		const nb = svc.targetFor('sessDiskBase');
+		await svc.addCells([{ cell_type: 'code', source: 'v = 1' }], null, { nb, routeImports: false });
+
+		const call = (payload: Record<string, unknown>) =>
+			post({
+				request: new Request('http://x/api/notebooks/export-py', {
+					method: 'POST',
+					body: JSON.stringify({ path: 'sub/disk-base.ipynb', ...payload })
+				})
+			});
+
+		expect((await call({ op: 'set-target', target: 'lib/disk-base.py' })).status).toBe(200);
+
+		disk.failFor = 'disk-base.ipynb';
+		let res: Response;
+		try {
+			res = await call({ op: 'set-base', base: 'notebook' });
+		} finally {
+			disk.failFor = null;
+		}
+		expect(res.status).toBe(500);
+		const body = (await res.json()) as Record<string, unknown>;
+		expect(body).toMatchObject({
+			ok: false,
+			writeFailed: expect.stringMatching(/ENOSPC/),
+			// The document HOLDS the re-expressed target under the new base - the select
+			// and the input keep it, and the next successful save writes it.
+			base: 'notebook',
+			target: '../lib/disk-base.py'
+		});
+		expect(body).not.toHaveProperty('message');
+		expect(nbmod.getExportTargetState(nb)).toMatchObject({
+			base: 'notebook',
+			target: '../lib/disk-base.py'
+		});
+
+		// The client half of THIS rule, pinned the way its sibling above is: e2e is
+		// absent from CI and from the no-mistakes gate, so a regression in the base
+		// write's wording would otherwise merge green.
+		const live = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
+		const baseFn = live.slice(
+			live.indexOf('async function setExportBaseValue'),
+			live.indexOf('async function exportPy')
+		);
+		expect(baseFn, 'setExportBaseValue should still exist').not.toBe('');
+		// Decided by the FLAG, never the status code, and worded as an acceptance...
+		expect(baseFn).toMatch(/body\?\.writeFailed/);
+		expect(baseFn).toMatch(/accepted but not saved/);
+		expect(baseFn).not.toMatch(/status >= 500/);
+		// ...while the unreachable wording survives for a reply that landed no verdict.
+		expect(baseFn).toMatch(/could not be reached/);
+	});
+
+	it('a malformed field is a clean refusal, never an accepted-but-unsaved write', async () => {
+		// `body` is untyped JSON and both fields reach a `.trim()` in the setter, so a
+		// non-string used to throw a bare TypeError - not the typed refusal - and the
+		// route answered 500 `writeFailed` over a document nothing had mutated. Since
+		// `exportPy` deliberately does not abort on `writeFailed`, a later export then
+		// ran against the OLD target and reported success.
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const post = POST as unknown as (e: { request: Request }) => Promise<Response>;
+		svc.useNotebook('sessBadField', 'bad-field.ipynb');
+		const nb = svc.targetFor('sessBadField');
+		await svc.addCells([{ cell_type: 'code', source: 'v = 1' }], null, { nb, routeImports: false });
+
+		const call = (payload: Record<string, unknown>) =>
+			post({
+				request: new Request('http://x/api/notebooks/export-py', {
+					method: 'POST',
+					body: JSON.stringify({ path: 'bad-field.ipynb', ...payload })
+				})
+			});
+
+		expect((await call({ op: 'set-target', target: 'lib/keep.py' })).status).toBe(200);
+
+		for (const payload of [
+			{ op: 'set-target', target: 'lib/other.py', base: 5 },
+			{ op: 'set-target', target: 'lib/other.py', base: true },
+			{ op: 'set-target', target: 7 },
+			{ op: 'set-target', target: ['lib/other.py'] },
+			{ op: 'set-base', base: { git: true } }
+		]) {
+			const label = JSON.stringify(payload);
+			const res = await call(payload);
+			expect(res.status, label).toBe(400);
+			const refused = (await res.json()) as Record<string, unknown>;
+			expect(refused, label).not.toHaveProperty('writeFailed');
+			expect(refused.message, label).toEqual(expect.any(String));
+		}
+
+		// Nothing was mutated by any of them: the refusal describes the document the
+		// notebook still holds, which is what the tab's field and select go back to.
+		expect(nbmod.getExportTargetState(nb)).toMatchObject({
+			target: 'lib/keep.py',
+			base: 'workspace'
+		});
+	});
+
+	it('an OMITTED field keeps its meaning, so the guard refuses only a malformed one', async () => {
+		// The other half of the boundary rule, and the reason a non-string may not be
+		// coerced: absence is MEANINGFUL on both fields - `base` inherits the stored
+		// one, `target` clears - so coercing a malformed value to null would silently
+		// perform one of those instead of refusing.
+		const { POST } = await import('../../src/routes/api/notebooks/export-py/+server.js');
+		const post = POST as unknown as (e: { request: Request }) => Promise<Response>;
+		svc.useNotebook('sessOmit', 'sub/omit-field.ipynb');
+		const nb = svc.targetFor('sessOmit');
+		await svc.addCells([{ cell_type: 'code', source: 'v = 1' }], null, { nb, routeImports: false });
+
+		const call = (payload: Record<string, unknown>) =>
+			post({
+				request: new Request('http://x/api/notebooks/export-py', {
+					method: 'POST',
+					body: JSON.stringify({ path: 'sub/omit-field.ipynb', ...payload })
+				})
+			});
+
+		expect((await call({ op: 'set-target', target: 'helpers.py', base: 'notebook' })).status).toBe(200);
+		// Omitted base: the stored `notebook` base is INHERITED, not reset to workspace.
+		expect((await call({ op: 'set-target', target: 'other.py' })).status).toBe(200);
+		expect(nbmod.getExportTargetState(nb)).toMatchObject({
+			target: 'other.py',
+			base: 'notebook'
+		});
+		// Omitted target: still a CLEAR, which deletes both keys under any base.
+		expect((await call({ op: 'set-target' })).status).toBe(200);
+		expect(nbmod.getExportTargetState(nb)).toMatchObject({ target: null, base: 'workspace' });
 	});
 });
 

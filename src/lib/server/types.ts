@@ -159,9 +159,24 @@ export interface NotebookView {
 	 * nbdev-style export target (`.py` module path), or null when unset. The STORED
 	 * setting (what the target input edits), not the EFFECTIVE target the exporter
 	 * resolves - a `#|default_exp` directive written in a cell is absent here; see
-	 * `effectiveExportTarget` for that.
+	 * `exportTargetInfo` (`resolveExportTarget`) for that.
 	 */
 	exportTarget: string | null;
+	/**
+	 * The base `exportTarget` is measured from: `workspace` (an absent
+	 * `export_base` - the legacy default), `notebook`, or `git`. Reported
+	 * verbatim, so an unknown hand-edited value reaches the select unmatched
+	 * rather than masquerading as `workspace` (see `readExportBase`).
+	 */
+	exportBase: string;
+	/**
+	 * The workspace-relative path the EFFECTIVE target (a `#|default_exp`
+	 * directive included) resolves to, or null when none is configured or it
+	 * cannot resolve. What the importability warning is decided from.
+	 */
+	exportResolved: string | null;
+	/** Why a CONFIGURED target cannot resolve (base `git` with no repo, an escape, an unknown base), else null. */
+	exportResolveError: string | null;
 	/**
 	 * Declared code root: the workspace-relative directory this notebook's KERNEL
 	 * resolves code from (cwd + `sys.path`), or null for the workspace root.
@@ -191,12 +206,21 @@ export interface KernelSpec {
 /** Notebook-level `cellar` metadata namespace (round-trips through clean-on-save). */
 export interface NotebookCellarNamespace {
 	/**
-	 * nbdev-style export target: a workspace-relative `.py` module path. Always
-	 * STORED relative, whatever a caller passed - `setExportTarget` validates the
-	 * path (inside the workspace, and a `.py` file, since the exporter WRITES it)
-	 * and normalizes it there, so the committed `.ipynb` stays portable.
+	 * nbdev-style export target: a `.py` module path, relative to the recorded
+	 * `export_base` (workspace-relative when that key is absent - the permanent
+	 * legacy meaning). Always STORED relative to its base, whatever a caller
+	 * passed - `setExportTarget` validates the path (resolving inside the
+	 * workspace, and a `.py` file, since the exporter WRITES it) and normalizes
+	 * it there, so the committed `.ipynb` stays portable.
 	 */
 	export_target?: string;
+	/**
+	 * The base `export_target` is measured from: `notebook` (the notebook's own
+	 * folder) or `git` (the notebook's enclosing repository). ABSENT means
+	 * workspace-relative - the pre-base shape, never migrated and never written
+	 * as an explicit `workspace` - so legacy notebooks resolve unchanged forever.
+	 */
+	export_base?: string;
 	/**
 	 * Code root: the workspace-relative directory this notebook's kernel runs in
 	 * and imports from. Absent = the workspace root. See `$lib/notebookRoot`.

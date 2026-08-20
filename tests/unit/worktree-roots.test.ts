@@ -474,18 +474,26 @@ describe('the app-wide path guard is NOT what changed', () => {
 		expect(route).toMatch(/enclosesWorkspace\(w\.path[,)]/);
 	});
 
-	it('SOURCE GUARD: the root bar is not opened by a merely DETECTED worktree', () => {
-		// The chrome promise: "a workspace that never adopts roots renders exactly what
-		// it always did". `git worktree list` is populated by work that has nothing to
-		// do with Cellar (a worktree-per-task agent workflow, a PR checkout), so keying
-		// the bar off `rootOptions.length` put a picker on every notebook of every
-		// multi-worktree repo. Detected worktrees still POPULATE the picker whenever it
-		// is shown, and the sidebar's WORKTREES block is the discovery surface, so
-		// nothing became unreachable. A source guard because vitest runs without the
+	it('SOURCE GUARD: the root bar is opt-in and never opened by workspace-side state', () => {
+		// The chrome promise, now stronger: "a workspace that never adopts roots
+		// renders exactly what it always did". The bar is gated on the viewer's
+		// Settings preference (`rootSectionEnabled`), the one exception being a
+		// notebook whose root IS declared (`root !== null`, plus the session latch
+		// that keeps the bar mounted through clearing it) - a set root is never
+		// hidden, since the bar is the UI that explains a kernel running somewhere
+		// other than the workspace. Nothing about the WORKSPACE (detected worktrees,
+		// a roots/ dir, other notebooks' declarations) may open it: `git worktree
+		// list` is populated by work that has nothing to do with Cellar, and keying
+		// the bar off the option list once put a picker on every notebook of every
+		// multi-worktree repo. A source guard because vitest runs without the
 		// SvelteKit plugin and this component cannot be mounted here.
 		const src = readFileSync(new URL('../../src/lib/Notebook.svelte', import.meta.url), 'utf8');
-		expect(src).toMatch(/rootsInUse = \$derived\(rootOptions\.some\(\(o\) => o\.source !== 'worktree'\)\)/);
-		expect(src).toMatch(/showRootBar = \$derived\(rootsInUse && !isPy\)/);
+		expect(src).toMatch(
+			/showRootBar = \$derived\(\s*!isPy && \(rootSectionEnabled \|\| root !== null \|\| rootDeclaredThisSession\)\s*\)/
+		);
+		// The old workspace-derived gate must stay gone - reintroducing it reopens
+		// the picker-on-every-notebook regression through the other door.
+		expect(src).not.toMatch(/rootsInUse/);
 	});
 });
 

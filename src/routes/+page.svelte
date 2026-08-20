@@ -347,6 +347,20 @@
 	// on - with it off all cells are already mounted, so `printing` changes nothing.
 	let printing = $state(false);
 	const effectiveVirtualize = $derived(virtualizeCells && !printing);
+	// Code root bar visibility - a per-VIEWER display preference about the shell
+	// (the windowed-rendering pattern: one `$state` here, persisted once through
+	// the UI-state store, threaded to Settings and to every LiveNotebook), never
+	// notebook metadata. Default OFF: roots are a specialist workflow, and the bar
+	// is standing chrome on every notebook. Turning it off can never hide a root
+	// that is actually SET - a notebook with a declared root (or one declared
+	// earlier this session) always shows the bar; that rule lives with the bar, in
+	// `Notebook.svelte`'s `showRootBar`.
+	const SHOW_CODE_ROOT_KEY = 'cellar-show-code-root';
+	let showCodeRoot = $state(getUi<unknown>(SHOW_CODE_ROOT_KEY, false) === true);
+	function toggleShowCodeRoot() {
+		showCodeRoot = !showCodeRoot;
+		setUi(SHOW_CODE_ROOT_KEY, showCodeRoot);
+	}
 	const mcp = data.mcp;
 	// Soft cap on live kernels; past it the Kernels sidebar warns (warn-only).
 	const maxKernels = data.maxKernels ?? 8;
@@ -1688,6 +1702,7 @@
 					<LiveNotebook
 						path={canonicalNotebookRel}
 						virtualize={effectiveVirtualize}
+						showCodeRoot={showCodeRoot}
 						active={activeTabId === 'notebook'}
 						follow={followRunningCell}
 						gitRefresh={fsRefreshSignal}
@@ -1721,6 +1736,7 @@
 					<LiveNotebook
 						path={tab.path}
 						virtualize={effectiveVirtualize}
+						showCodeRoot={showCodeRoot}
 						active={activeTabId === tab.id}
 						follow={followRunningCell}
 						gitRefresh={fsRefreshSignal}
@@ -1894,9 +1910,11 @@
 	{theme}
 	{virtualizeCells}
 	{virtualizeForced}
+	{showCodeRoot}
 	onClose={() => (settingsOpen = false)}
 	onSetTheme={applyTheme}
 	onToggleVirtualizeCells={toggleVirtualizeCells}
+	onToggleShowCodeRoot={toggleShowCodeRoot}
 	onVenvRebound={() => {
 		// New interpreter → every live kernel was torn down, so the namespace is empty.
 		// Drop the stale rows through the generation-bumping wipe: a probe in flight

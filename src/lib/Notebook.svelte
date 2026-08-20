@@ -8,6 +8,7 @@
 	import type { CellHighlight } from '$lib/searchHighlight';
 	import type { CollapsedRecord } from '$lib/cellCollapse';
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
+	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
 	import {
 		planWindow,
 		pinnedCellIds,
@@ -103,6 +104,20 @@
 		onSetExportTarget?: (target: string, opts?: { keepalive?: boolean }) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
 		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
+		/** What the stored export path is measured from (`$lib/exportTarget`);
+		 *  `workspace` for the absent-key legacy default. */
+		exportBase?: string;
+		/** The WORKSPACE-relative path the effective target resolves to, or null. */
+		exportResolved?: string | null;
+		/** Why a CONFIGURED target cannot resolve (a `git` base outside any repo, a
+		 *  path resolving outside the workspace, an unknown hand-edited base), else
+		 *  null. Shown in the export section: a target in this state generates
+		 *  nothing on every save, and silence would read as configured-and-working. */
+		exportResolveError?: string | null;
+		/** True while a base re-expression is in flight (the base select is disabled). */
+		exportBaseBusy?: boolean;
+		/** Re-express the stored target under a new base (or record a pre-target choice). */
+		onSetExportBase?: (base: string) => void;
 		/** This notebook's declared code root (kernel cwd + sys.path), or null for the workspace. */
 		root?: string | null;
 		/** True for a `.py` text notebook, which stores no notebook metadata (no root
@@ -117,6 +132,14 @@
 		rootFeedback?: string;
 		/** Declare (or clear, with '') the notebook's code root. */
 		onSetRoot?: (root: string) => void;
+		/** The Settings "Show code root bar" preference: offer the root bar even with
+		 *  no root declared. A notebook with a DECLARED root always shows the bar
+		 *  regardless - see `showRootBar`. */
+		rootSectionEnabled?: boolean;
+		/** A root was declared at some point THIS SESSION (LiveNotebook's latch), so
+		 *  the bar - and the feedback for the clear the user just performed - does not
+		 *  vanish mid-interaction the moment `root` goes back to null. */
+		rootDeclaredThisSession?: boolean;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
 		hideAllCode?: boolean;
@@ -202,12 +225,19 @@
 		exportCount = 0,
 		onSetExportTarget,
 		onExportPy,
+		exportBase = 'workspace',
+		exportResolved = null,
+		exportResolveError = null,
+		exportBaseBusy = false,
+		onSetExportBase,
 		root = null,
 		isPy = false,
 		availableRoots = [],
 		rootBusy = false,
 		rootFeedback = '',
 		onSetRoot,
+		rootSectionEnabled = false,
+		rootDeclaredThisSession = false,
 		onSetScrolled,
 		hideAllCode = false,
 		onSetHideInput,
@@ -466,13 +496,43 @@
 	};
 	const removedLabel = (n: number): string => `${n} ${n === 1 ? 'cell' : 'cells'} removed`;
 
-	// ---- nbdev-style export header bar ---------------------------------------
-	// A slim bar at the top of the notebook to set the `.py` target and export on
-	// demand. Shown only once the feature is in use (a target is set OR at least
-	// one cell is marked), so it stays unobtrusive otherwise.
+	// ---- nbdev-style export section ------------------------------------------
+	// A slim section at the top of the notebook (directly below the code-root bar)
+	// to pick the export BASE, set the target `.py` path, and export on demand.
+	// ALWAYS present on a real notebook - a target has to be settable BEFORE any
+	// cell is marked, which is exactly the state a use-it gate hid it in - and
+	// styled as neutral standing chrome rather than a call to action. Hidden only
+	// on a `.py` text notebook, which stores no notebook metadata: the server
+	// refuses a target there, so offering the control would show a setting that
+	// does nothing (the same rule as the root picker's absence).
 	let exportFeedback = $state('');
 	let exporting = $state(false);
-	const showExportBar = $derived(!!exportTarget || exportCount > 0);
+	const showExportBar = $derived(!isPy);
+	// The base select is DRIVEN by `exportBase`, never by the click (the
+	// `selectedRoot` idiom below): with a stored target a base change is applied
+	// non-optimistically - the server RE-EXPRESSES the same file under the new
+	// spelling, and can REFUSE (a `git` base with no enclosing repository) - so
+	// the control resyncs to what the document holds the moment the attempt
+	// settles, whichever way it went. With no stored target the choice is
+	// local-only (nothing to re-express) and rides up with the first path commit.
+	let selectedExportBase = $state('workspace');
+	$effect(() => {
+		const settled = exportBase;
+		if (exportBaseBusy) return;
+		selectedExportBase = settled;
+	});
+	function onExportBaseSelect(e: Event) {
+		onSetExportBase?.((e.currentTarget as HTMLSelectElement).value);
+	}
+	// The one trap a SUCCESSFUL export can still leave: the module lands outside
+	// the notebook's declared code root, so the kernel - whose imports resolve
+	// from that root - cannot `import` what was just written. The rule is pure and
+	// shared (`$lib/exportTarget`), computed from the RESOLVED workspace-relative
+	// path so it is exact whatever base expressed it, and null whenever it does
+	// not apply - no target, no declared root, or the module sits under the root -
+	// so the everyday case pays no chrome (the root bar's kernel-restart warning
+	// is the model: accurate, and only where it applies).
+	const importWarning = $derived(exportImportWarning(exportResolved, root));
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 	// Whether THIS notebook's kernel is executing or has work waiting — gates
@@ -488,12 +548,13 @@
 	const hasOutputs = $derived(cells.some((c) => (c.outputs?.length ?? 0) > 0));
 
 	// ---- code-root bar --------------------------------------------------------
-	// Shown only when the workspace actually has roots (a `roots/` directory), or
-	// some notebook already declares one — see `rootsInUse` below. A workspace that
-	// never adopts roots therefore renders exactly what it always did — the feature
-	// costs it no chrome. The picker always offers the notebook's CURRENT root even
-	// when its directory is gone, so a broken declaration is visible and clearable
-	// rather than silently absent.
+	// Hidden by default; shown by the Settings preference, or - the invariant -
+	// whenever this notebook actually HAS (or had, this session) a declared root:
+	// see `showRootBar` below. A workspace that never adopts roots therefore
+	// renders exactly what it always did - the feature costs it no chrome. The
+	// picker always offers the notebook's CURRENT root even when its directory is
+	// gone, so a broken declaration is visible and clearable rather than silently
+	// absent.
 	const rootOptions = $derived.by(() => {
 		const opts = availableRoots.map((r) => ({ ...r }));
 		if (root && !opts.some((o) => o.path === root)) {
@@ -520,20 +581,28 @@
 	});
 	// A `.py` (jupytext / Databricks source) notebook is written back from its cells
 	// alone, so it stores no notebook metadata and could not keep a root across a
-	// reload — the server REFUSES one there. No control is offered, so the picker
+	// reload - the server REFUSES one there. No control is offered, so the picker
 	// being absent and the declaration being refused say the same thing.
-	// The bar appears only once roots are IN USE here: a `roots/` directory exists,
-	// or some notebook declares one. A merely DETECTED worktree does not open it —
-	// `git worktree list` is populated by work that has nothing to do with Cellar
-	// (a worktree-per-task agent workflow, a PR checkout), so keying the bar off it
-	// put new chrome on every notebook of every multi-worktree repo, which is the
-	// "a workspace that never adopts roots renders exactly what it always did"
-	// promise dropped. Detected worktrees still POPULATE the picker whenever it is
-	// shown, so "offered by default" is untouched; the sidebar's WORKTREES block is
-	// the discovery surface for a workspace that has not adopted one yet, so
+	// Otherwise the bar is OPT-IN chrome, hidden by default behind the Settings
+	// "Show code root bar" preference (`rootSectionEnabled`) - roots are a
+	// specialist workflow, and this replaced the old roots-in-use gate (a `roots/`
+	// directory, or some notebook declaring one), which put standing chrome on
+	// every notebook of a workspace the moment anything adopted roots. It keeps
+	// that gate's promise a fortiori: a merely detected worktree - or now even an
+	// adopted `roots/` directory - adds no chrome to a notebook that declares
+	// nothing; the sidebar's WORKTREES block stays the discovery surface, so
 	// nothing becomes unreachable.
-	const rootsInUse = $derived(rootOptions.some((o) => o.source !== 'worktree'));
-	const showRootBar = $derived(rootsInUse && !isPy);
+	// THE EXCEPTION IS THE INVARIANT: a notebook whose root IS declared (a missing-
+	// on-disk one included - that state NEEDS its explanation most) always shows
+	// the bar, whatever the preference says - hiding it would leave the kernel
+	// running in a directory nothing on screen explains or can clear. The session
+	// latch (`rootDeclaredThisSession`) extends that through the clear itself:
+	// without it, clearing a root snapped `root` to null and vanished the whole bar
+	// - with the feedback line for the very click the user just made - and hid the
+	// picker they may be about to use again.
+	const showRootBar = $derived(
+		!isPy && (rootSectionEnabled || root !== null || rootDeclaredThisSession)
+	);
 	// Whether the add affordances (the bottom add row + the hover-between strip)
 	// may offer a CHAT cell: a `.py` text notebook cannot hold one (the server's
 	// `assertCanHoldType` refuses it), and a control that offers a type the
@@ -845,10 +914,12 @@
 		</div>
 		{#if showRootBar}
 			<!-- Code root: the directory THIS notebook's kernel runs in and imports from
-			     (normally a git worktree under `roots/`). Rendered only where the
-			     workspace has roots, so a workspace that never adopts them is untouched.
-			     Deliberately quieter than the export bar: it is a property of the
-			     notebook, not an action, and changing it costs the user their kernel. -->
+			     (normally a git worktree under `roots/`). WHEN it is rendered is
+			     `showRootBar`'s rule and is stated there - opt-in chrome, with an
+			     actually-declared root as the standing exception - so it is not
+			     restated here. Deliberately quieter than the export bar: it is a
+			     property of the notebook, not an action, and changing it costs the
+			     user their kernel. -->
 			<div
 				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-100 px-3 py-2 text-sm"
 				data-testid="root-bar"
@@ -894,17 +965,32 @@
 			</div>
 		{/if}
 		{#if showExportBar}
-			<!-- nbdev-style export: the notebook-level target `.py` module + a manual
-			     "Export to .py" button. Appears once any cell is marked for export or a
-			     target is set; the module also regenerates automatically on save. -->
+			<!-- nbdev-style export: pick the BASE the path is measured from, name the
+			     target `.py` module, export on demand. Always present (directly below
+			     the code-root bar) so a target can be set BEFORE any cell is marked;
+			     the module also regenerates automatically on save while a cell stays
+			     marked. Root-bar-neutral styling: standing chrome, not a call to
+			     action. -->
 			<div
-				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-primary/25 bg-primary/5 px-3 py-2 text-sm"
+				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-100 px-3 py-2 text-sm"
 				data-testid="export-bar"
 			>
-				<span class="flex items-center gap-1.5 font-medium text-primary">
+				<span class="flex items-center gap-1.5 font-medium text-base-content/70">
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
 					Export to
 				</span>
+				<select
+					class="select select-bordered select-xs w-auto pr-7"
+					bind:value={selectedExportBase}
+					onchange={onExportBaseSelect}
+					disabled={exportBaseBusy}
+					data-testid="export-base-select"
+					aria-label="What the export path is measured from"
+				>
+					{#each EXPORT_BASES as b (b)}
+						<option value={b}>from {EXPORT_BASE_LABELS[b]}</option>
+					{/each}
+				</select>
 				<input
 					bind:this={exportTargetEl}
 					type="text"
@@ -926,6 +1012,26 @@
 				>
 					{exporting ? 'Exporting…' : 'Export to .py'}
 				</button>
+				{#if exportResolveError}
+					<!-- A CONFIGURED target that resolves to no writable file: the module is
+					     not being generated, and silence here would read as working. The
+					     warning tint rides the ICON, not the copy (`text-warning` body copy
+					     fails contrast on the light theme - the GitNotebooks rule). -->
+					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-resolve-error">
+						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{exportResolveError}
+					</span>
+				{:else if importWarning}
+					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-import-warning">
+						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{importWarning}
+					</span>
+				{:else if exportResolved && exportBase !== 'workspace'}
+					<!-- A non-workspace base makes the typed path indirect, so say which
+					     workspace file it names (under the workspace base they are the same
+					     string, and the echo would be noise). -->
+					<span class="font-mono text-xs text-base-content/55" data-testid="export-resolved">→ {exportResolved}</span>
+				{/if}
 				{#if exportFeedback}
 					<span class="text-xs text-base-content/70" data-testid="export-feedback">{exportFeedback}</span>
 				{/if}

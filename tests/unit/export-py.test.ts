@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { topLevelNames, generateModule, resolveTarget } from '../../src/lib/server/export-py';
+import { topLevelNames, generateModule, resolveExportTarget } from '../../src/lib/server/export-py';
 import type { NotebookDoc } from '../../src/lib/server/types';
 
 describe('topLevelNames', () => {
@@ -49,20 +49,25 @@ describe('generateModule', () => {
 	});
 });
 
-describe('resolveTarget', () => {
+describe('resolveExportTarget', () => {
 	const doc = (over: Partial<NotebookDoc>): NotebookDoc => ({ path: '/ws/n.ipynb', cells: [], ...over });
 
 	it('prefers the explicit notebook-level target', () => {
-		expect(resolveTarget(doc({ metadata: { cellar: { export_target: 'utils.py' } } }))).toBe('utils.py');
+		expect(resolveExportTarget(doc({ metadata: { cellar: { export_target: 'utils.py' } } }))).toMatchObject({
+			ok: true,
+			base: 'workspace',
+			source: 'metadata',
+			target: 'utils.py'
+		});
 	});
 
 	it('honors a #|default_exp directive and maps dotted modules to a path', () => {
 		const d = doc({ cells: [{ id: '1', cell_type: 'code', source: '#|default_exp pkg.utils\nX = 1' }] });
-		expect(resolveTarget(d)).toBe('pkg/utils.py');
+		expect(resolveExportTarget(d)).toMatchObject({ ok: true, source: 'default_exp', target: 'pkg/utils.py' });
 	});
 
 	it('returns null when neither is present', () => {
-		expect(resolveTarget(doc({}))).toBeNull();
+		expect(resolveExportTarget(doc({}))).toBeNull();
 	});
 
 	it('refuses cheaply, running no regex over a notebook that mentions no directive', () => {
@@ -75,7 +80,7 @@ describe('resolveTarget', () => {
 		const cells = Array.from({ length: 40 }, (_, i) => ({ id: `c${i}`, cell_type: 'code' as const, source }));
 		const spy = vi.spyOn(String.prototype, 'match');
 		try {
-			expect(resolveTarget(doc({ cells }))).toBeNull();
+			expect(resolveExportTarget(doc({ cells }))).toBeNull();
 			expect(spy).not.toHaveBeenCalled();
 		} finally {
 			spy.mockRestore();
@@ -83,6 +88,6 @@ describe('resolveTarget', () => {
 
 		// ...and the guard never costs a real directive its match.
 		const withDirective = doc({ cells: [{ id: 'a', cell_type: 'code', source: `${source}#|default_exp lib.cheap` }] });
-		expect(resolveTarget(withDirective)).toBe('lib/cheap.py');
+		expect(resolveExportTarget(withDirective)).toMatchObject({ ok: true, target: 'lib/cheap.py' });
 	});
 });
