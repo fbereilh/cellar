@@ -32,12 +32,13 @@ export function hydrateUserSettings(initial: unknown): void {
  * Current value for `key`, or `fallback` if unset / before hydration.
  *
  * MODULE-PRIVATE, deliberately. The store is untyped JSON, so `fallback` states the
- * expected shape but proves nothing about what is really there - and every value
- * this store holds today ends up in a NAME. Exporting the untyped read beside the
- * guarded one left the rule below as documentation a caller had to remember; keeping
- * it in here makes `getUserSettingText` the only way in, so there is nothing to
- * remember. A future caller that genuinely needs a non-text setting exports its own
- * guarded accessor beside that one, rather than reopening this.
+ * expected shape but proves nothing about what is really there - and what this store
+ * holds ends up somewhere a wrong shape is expensive: a NAME the app renders and
+ * uploads under, or a CAPABILITY a chat run is granted. Exporting the untyped read
+ * beside the guarded ones left that rule as documentation a caller had to remember;
+ * keeping it in here makes the guarded accessors below the only way in, so there is
+ * nothing to remember. A future caller whose setting fits neither shape exports its
+ * own guarded accessor beside them, rather than reopening this.
  */
 function getUserSetting<T>(key: string, fallback: T): T {
 	return store.get(key, fallback);
@@ -46,8 +47,9 @@ function getUserSetting<T>(key: string, fallback: T): T {
 /**
  * A setting read as TEXT, with anything that is not a string degrading to `''`.
  *
- * The ONE read this module offers, and the reason it is shared rather than a
- * `typeof` check at each surface. This store is untyped JSON on disk and
+ * The read for every setting that becomes TEXT (`getUserSettingFlag` below is its one
+ * sibling), and the reason it is shared rather than a `typeof` check at each
+ * surface. This store is untyped JSON on disk and
  * `/api/user-settings` accepts any JSON value, so a hand-edited
  * `~/.cellar/settings.json` (or a PUT) can put a number where a prefix belongs - and
  * the consumers hand it straight to `expandDateTokens`, whose `text.replace` then
