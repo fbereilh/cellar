@@ -324,6 +324,11 @@ async function openFromTree(page: Page, path: string, opened: Locator): Promise<
 	await expect(async () => {
 		await page.locator(`[data-testid="tree-file"][data-path="${path}"]`).click();
 		await expect(opened).toBeVisible({ timeout: 2_000 });
+		// The restore can land AFTER the open was confirmed (observed in a trace
+		// ~600ms post-load on a cold start, replacing the tab array wholesale), so
+		// the opened notebook must be seen to OUTLIVE that window.
+		await page.waitForTimeout(800);
+		await expect(opened).toBeVisible({ timeout: 200 });
 	}).toPass({ timeout: 30_000 });
 }
 
