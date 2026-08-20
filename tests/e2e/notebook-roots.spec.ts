@@ -1,4 +1,4 @@
-import { test, expect, type APIRequestContext } from '@playwright/test';
+import { test, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
@@ -98,6 +98,21 @@ async function makeNotebook(api: APIRequestContext, rel: string, root?: string):
 	return rel;
 }
 
+/**
+ * Open the default notebook from the empty state if it is showing. Settle on
+ * whichever the shell paints FIRST - the empty state, or a notebook the
+ * server-owned tab session (written by an earlier page test in this file)
+ * already restored - before probing; a bare `empty-open-notebook` click waits
+ * out the whole test timeout whenever the restore wins, which is a race on the
+ * debounced tab-session write (the documented `openNotebook` settle rule).
+ */
+async function openNotebook(page: Page): Promise<void> {
+	const openBtn = page.getByTestId('empty-open-notebook');
+	await expect(openBtn.or(page.getByTestId('cell').first())).toBeVisible();
+	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
+	await expect(page.getByTestId('cell').first()).toBeVisible();
+}
+
 /** Add a code cell, run it, and return its concatenated stdout. */
 async function runCode(api: APIRequestContext, nb: string, source: string): Promise<string> {
 	const added = await api.post(`${baseURL}/api/cells`, { data: { cellType: 'code', nb, source } });
@@ -173,8 +188,7 @@ test('the notebook shows a Code root picker labelled with each root’s branch',
 	// The default notebook, so the shell's empty state opens it in one click.
 	await makeNotebook(request, 'notebook.ipynb', 'roots/baseline');
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await page.getByTestId('empty-open-notebook').click();
-	await expect(page.getByTestId('cell').first()).toBeVisible();
+	await openNotebook(page);
 
 	const bar = page.getByTestId('root-bar');
 	await expect(bar).toBeVisible();
@@ -210,8 +224,7 @@ test('a workspace with no roots renders no root control at all', async ({ page, 
 		route.fulfill({ json: { ok: true, root: null, roots: [] } })
 	);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await page.getByTestId('empty-open-notebook').click();
-	await expect(page.getByTestId('cell').first()).toBeVisible();
+	await openNotebook(page);
 	await expect(page.getByTestId('root-bar')).toHaveCount(0);
 });
 
@@ -230,8 +243,7 @@ test('a REFUSED root leaves the picker showing the root the notebook still runs 
 		data: { root: 'roots/baseline', path: 'notebook.ipynb' }
 	});
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await page.getByTestId('empty-open-notebook').click();
-	await expect(page.getByTestId('cell').first()).toBeVisible();
+	await openNotebook(page);
 
 	const select = page.getByTestId('root-select');
 	await expect(select).toHaveValue('roots/baseline');
