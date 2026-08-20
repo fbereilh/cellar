@@ -436,7 +436,7 @@ describe('the generated module follows the marks', () => {
 	it('reports a `#|default_exp` directive target, and warns about its module too', async () => {
 		const { target, code } = await makeNotebook('module-directive.ipynb');
 		// The nbdev-native spelling: no notebook-level setting, the target lives in a
-		// cell. `resolveTarget` honors it, so the marks DO build a module - reading the
+		// cell. `resolveExportTarget` honors it, so the marks DO build a module - reading the
 		// metadata alone reported `export_target:null` ("my marks land nowhere") and,
 		// because the warning short-circuits on a null target, silenced it entirely.
 		nbmod.setSource(svc.resolveRef(target, code[1]), '#|default_exp lib.directive', target);

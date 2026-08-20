@@ -910,12 +910,6 @@ export function exportTargetInfo(nb?: string | null): ResolvedExportTarget | nul
 	return resolveExportTarget(docFor(nb));
 }
 
-/** The workspace-relative path `exportTargetInfo` resolves to, or null. */
-export function effectiveExportTarget(nb?: string | null): string | null {
-	const info = resolveExportTarget(docFor(nb));
-	return info && info.ok ? info.target : null;
-}
-
 /**
  * The path itself was REFUSED - it escapes the workspace, or does not name a `.py`
  * module. Typed (the `CellRefError` precedent) because `setExportTarget` validates
@@ -980,6 +974,12 @@ export class InvalidExportTargetError extends Error {
  * refuses the `git` base by name (first-class state, not an exception), and an
  * unknown base value is refused rather than silently read as workspace.
  *
+ * CLEARING (null/'') is exempt from all of that and deletes BOTH keys whatever
+ * the base says, because it can only remove state, never strand it (the
+ * `setNotebookRoot` rule). It is therefore the universal repair for a document
+ * that cannot resolve at all - an unknown hand-edited base, or a `git` base
+ * whose repository has gone - and every refusal above names it.
+ *
  * It RETURNS the stored state (`exportTargetState` - target, base, and the
  * resolution the exporter would use), not what it was handed, so a caller
  * reports what the document holds: normalizing without reporting it left the UI
@@ -1002,12 +1002,14 @@ export function setExportTarget(
 	const doc = docFor(nb);
 	const raw = (target ?? '').trim();
 	const wanted = (base ?? '').trim() || 'workspace';
-	if (!isExportBase(wanted))
-		throw new InvalidExportTargetError(
-			`unknown export base ${JSON.stringify(wanted)}: expected "workspace", "notebook" or "git"`
-		);
 	let stored = '';
+	// The base is checked only where a target is really STORED under it: a clear
+	// stores none, and must stay possible whatever the document says the base is.
 	if (raw) {
+		if (!isExportBase(wanted))
+			throw new InvalidExportTargetError(
+				`unknown export base ${JSON.stringify(wanted)}: expected "workspace", "notebook" or "git" - clear the export target to reset the base, then set the path again`
+			);
 		if (!/\.py$/i.test(raw))
 			throw new InvalidExportTargetError(
 				`export target ${raw} is not a .py file: the generated module is written to this path, so it must name a .py module`
@@ -1075,7 +1077,7 @@ function exportBaseDir(doc: NotebookDoc, base: ExportBase): string {
 		const root = gitRootOf(dirname(doc.path));
 		if (!root)
 			throw new InvalidExportTargetError(
-				'this notebook is not inside a git repository, so a git-root-relative export target cannot resolve - pick another base, or initialize a repository'
+				'this notebook is not inside a git repository, so a git-root-relative export target cannot resolve - clear the export target and set the path again under another base, or initialize a repository'
 			);
 		return root;
 	}
@@ -1089,7 +1091,8 @@ function exportBaseDir(doc: NotebookDoc, base: ExportBase): string {
  * text against the new base (silently retargeting a different file) would be
  * the one thing a base switch must never do. The current stored target is
  * resolved to its absolute file (refusing when it cannot resolve - a file we
- * cannot locate cannot be re-expressed; retype the path instead) and stored
+ * cannot locate cannot be re-expressed; clear the target and set the path again
+ * under the new base, which is the repair every refusal here names) and stored
  * relative to the new base, through the same containment guard as the setter.
  *
  * With NO stored target there is nothing to re-express and nothing to persist:
@@ -1113,7 +1116,7 @@ export function setExportBase(base: string, nb?: string | null, originId?: strin
 	const info = resolveExportTarget(doc);
 	if (!info || !info.ok || info.source !== 'metadata')
 		throw new InvalidExportTargetError(
-			`the current export target cannot be re-expressed: ${info && !info.ok ? info.error : 'no stored target resolves'} - set the path again under the new base instead`
+			`the current export target cannot be re-expressed: ${info && !info.ok ? info.error : 'no stored target resolves'} - clear the export target, then set the path again under the new base`
 		);
 	const baseDir = exportBaseDir(doc, wanted); // refuses `git` with no repository
 	doc.metadata = doc.metadata ?? {};

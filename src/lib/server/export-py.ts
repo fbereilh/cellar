@@ -260,16 +260,6 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
 }
 
 /**
- * The workspace-relative path a configured target RESOLVES to, or null when no
- * target is configured OR it cannot resolve. Callers that must tell those two
- * nulls apart (the exporter, the agent fields) use `resolveExportTarget`.
- */
-export function resolveTarget(doc: NotebookDoc): string | null {
-	const r = resolveExportTarget(doc);
-	return r && r.ok ? r.target : null;
-}
-
-/**
  * Generate the `.py` module for a notebook document. Writes only when a target is
  * configured AND at least one code cell is marked for export AND the generated
  * text differs from what is already on disk (so an unchanged re-export touches

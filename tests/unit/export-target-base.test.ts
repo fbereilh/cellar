@@ -377,6 +377,59 @@ describe('re-expressing with setExportBase', () => {
 	});
 });
 
+describe('clearing is the universal repair (an unresolvable base is never a dead end)', () => {
+	// The tab keeps NO copy of server state: it seeds its base select from the
+	// stored value and sends that value back with every path commit. So a notebook
+	// carrying a base nothing can resolve - a hand edit, or a `git` base whose
+	// repository has gone - is only repairable if CLEARING is exempt from base
+	// validation: re-expression cannot help (the file cannot be located) and
+	// retyping the path under the stored base is refused, so a refused clear leaves
+	// a target silently generating no module on every save with no in-app way out.
+	it('clears a target stored under an UNKNOWN hand-edited base, deleting both keys', () => {
+		const abs = writeIpynb('repair-unknown.ipynb', { export_target: 'x.py', export_base: 'weird' });
+		// The state the user is stuck in: configured, shown, and unresolvable.
+		expect(nbmod.exportTargetInfo('repair-unknown.ipynb')).toMatchObject({ ok: false, base: 'weird' });
+
+		// The tab's own commit shape - the HELD base rides back with the clear.
+		const state = nbmod.setExportTarget('', 'repair-unknown.ipynb', undefined, 'weird');
+		expect(state).toEqual({ target: null, base: 'workspace', resolved: null, resolveError: null });
+		const cellar = diskCellar(abs);
+		expect('export_target' in cellar).toBe(false);
+		expect('export_base' in cellar).toBe(false);
+
+		// ...and the notebook is usable again immediately afterwards.
+		expect(nbmod.setExportTarget('lib/repaired.py', 'repair-unknown.ipynb').target).toBe('lib/repaired.py');
+	});
+
+	it('a null clear works the same way, whatever base the caller names', () => {
+		const abs = writeIpynb('repair-null.ipynb', { export_target: 'x.py', export_base: 'weird' });
+		expect(nbmod.setExportTarget(null, 'repair-null.ipynb', undefined, 'weird').target).toBeNull();
+		expect(diskCellar(abs)).toEqual({});
+	});
+
+	it('an unknown base is still refused for a real STORE, and never coerced to workspace', () => {
+		const nb = nbmod.createNotebook('repair-store.ipynb').path;
+		expect(() => nbmod.setExportTarget('x.py', nb, undefined, 'weird')).toThrow(
+			nbmod.InvalidExportTargetError
+		);
+		expect(diskCellar(nb).export_target).toBeUndefined();
+		expect(diskCellar(nb).export_base).toBeUndefined();
+	});
+
+	it('both remaining refusals on that path NAME clearing as the repair', () => {
+		writeIpynb('repair-messages.ipynb', { export_target: 'x.py', export_base: 'weird' });
+		// Retyping the path (the tab sends the stored base back with every commit).
+		expect(() => nbmod.setExportTarget('y.py', 'repair-messages.ipynb', undefined, 'weird')).toThrow(
+			/clear the export target/
+		);
+		// Switching base: re-expression is impossible here, so the message must point
+		// at the clear - not at setting the path again, which is what fails above.
+		expect(() => nbmod.setExportBase('workspace', 'repair-messages.ipynb')).toThrow(
+			/clear the export target/
+		);
+	});
+});
+
 describe('exportImportWarning (the importability rule)', () => {
 	it('is silent with no code root, or with the module under the root', () => {
 		const { exportImportWarning } = exportTargetLib;

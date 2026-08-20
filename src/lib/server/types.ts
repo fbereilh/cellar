@@ -159,7 +159,7 @@ export interface NotebookView {
 	 * nbdev-style export target (`.py` module path), or null when unset. The STORED
 	 * setting (what the target input edits), not the EFFECTIVE target the exporter
 	 * resolves - a `#|default_exp` directive written in a cell is absent here; see
-	 * `effectiveExportTarget` for that.
+	 * `exportTargetInfo` (`resolveExportTarget`) for that.
 	 */
 	exportTarget: string | null;
 	/**
