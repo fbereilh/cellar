@@ -8,6 +8,10 @@
  * an explicit user opt-in, web search and NOTHING wider: `--tools <allowlist>`
  * (`""` by default - no tools; `WebSearch` when the run opted in - search is
  * mediated, so it is deliberately NOT WebFetch or any fetch-shaped tool),
+ * `--allowedTools <allowlist>` on the SEARCH shape ONLY (see below - `--tools`
+ * alone makes the tool exist but leaves the CALL permission-gated, so the
+ * opt-in would be inert; the default shape passes neither flag and is
+ * byte-for-byte the pre-settings argv),
  * `--disable-slash-commands`, `--setting-sources ""` (the user's/project's
  * CLAUDE.md, settings.json hooks, allowedTools etc. are never loaded),
  * `--strict-mcp-config` with no MCP config (no MCP servers),
@@ -21,6 +25,23 @@
  * "dangerously skip" one) is never passed - a read-only search tool needs no
  * permission skipped, and the literal appearing ANYWHERE in this module (this
  * comment included) is a test failure.
+ *
+ * ## `--tools` REQUESTS a tool; `--allowedTools` GRANTS the call
+ *
+ * Measured against claude 2.1.237: with `--tools WebSearch` alone the session
+ * LISTS the tool (so `system/init` reports it and the allowlist assertion below
+ * passes), but in non-interactive `-p` mode the CALL is still permission-gated
+ * - the model calls WebSearch and the CLI answers `Claude requested permissions
+ * to use WebSearch, but you haven't granted it yet.`, so the opt-in is INERT
+ * and the reply a user sees is a dead end Cellar offers no way out of (and not
+ * the `unsafe_init` path any copy explains). The identical argv plus
+ * `--allowedTools WebSearch` performs the search and returns cited results, so
+ * the search shape passes BOTH flags - and both from the SAME
+ * `chatToolAllowlist(webSearch)` the init assertion reads, one source for
+ * request, grant and assertion, so the grant can never name a tool the run did
+ * not request and then assert. An EMPTY `--allowedTools` is never passed: the
+ * default shape omits the flag entirely, which is what keeps its argv
+ * byte-for-byte the pre-settings one.
  *
  * ## The init assertion (fail closed, EXACT allowlist - never a relaxation)
  *
@@ -145,10 +166,18 @@ export interface ChatCliOptions {
  */
 export function chatCliArgs(opts: ChatCliOptions = {}): string[] {
 	const webSearch = opts.webSearch === true;
+	const allowlist = chatToolAllowlist(webSearch);
+	const tools = allowlist.join(',');
 	return [
 		'-p',
 		'--tools',
-		chatToolAllowlist(webSearch).join(','),
+		tools,
+		// The GRANT (see the header): `--tools` alone leaves the call
+		// permission-gated in `-p` mode, so without this the opt-in is inert. Same
+		// allowlist as the request and the assertion - never a wider set - and
+		// omitted entirely (not passed empty) when there is nothing to grant, which
+		// is what keeps the default argv byte-for-byte the pre-settings one.
+		...(allowlist.length > 0 ? ['--allowedTools', tools] : []),
 		'--disable-slash-commands',
 		'--setting-sources',
 		'',

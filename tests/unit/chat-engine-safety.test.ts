@@ -146,23 +146,54 @@ describe('the frozen flag set', () => {
 			'--system-prompt',
 			CHAT_SYSTEM_PROMPT
 		]);
+		// The GRANT flag belongs to the search shape ONLY: a default run has no tool
+		// to grant, so it must not carry the flag at all (nor an empty value).
+		expect(chatCliArgs()).not.toContain('--allowedTools');
 		expect(CHAT_MODEL_DEFAULT).toBe('sonnet');
 		const src = readFileSync(new URL('../../src/lib/server/chat/claude-cli.ts', import.meta.url), 'utf8');
 		expect(src).not.toContain('dangerously-skip-permissions');
 	});
 
-	it('the search-on argv widens EXACTLY the tools value and the system prompt, nothing else', () => {
+	it('the search-on argv widens EXACTLY the tools value, the GRANT and the system prompt, nothing else', () => {
 		const base = chatCliArgs();
 		const search = chatCliArgs({ webSearch: true, model: 'opus' });
+		// Pinned whole, against literals like the default shape: `--tools` REQUESTS
+		// the tool and `--allowedTools` GRANTS the call (without it claude 2.1.237
+		// answers the model's WebSearch call "you haven't granted it yet" in `-p`
+		// mode, i.e. the opt-in is inert), and the grant names exactly the requested
+		// tool - never a wider set.
+		expect(search).toEqual([
+			'-p',
+			'--tools',
+			'WebSearch',
+			'--allowedTools',
+			'WebSearch',
+			'--disable-slash-commands',
+			'--setting-sources',
+			'',
+			'--strict-mcp-config',
+			'--no-session-persistence',
+			'--model',
+			'opus',
+			'--include-partial-messages',
+			'--output-format',
+			'stream-json',
+			'--verbose',
+			'--system-prompt',
+			CHAT_SYSTEM_PROMPT_WEB_SEARCH
+		]);
 		expect(search[search.indexOf('--tools') + 1]).toBe(WEB_SEARCH_TOOL);
-		expect(search[search.indexOf('--model') + 1]).toBe('opus');
-		expect(search[search.indexOf('--system-prompt') + 1]).toBe(CHAT_SYSTEM_PROMPT_WEB_SEARCH);
+		expect(search[search.indexOf('--allowedTools') + 1]).toBe(WEB_SEARCH_TOOL);
 		// Every OTHER position is identical to the default argv - the safety flags
 		// (--disable-slash-commands, --setting-sources '', --strict-mcp-config,
 		// --no-session-persistence) never move with the capability shape.
+		const withoutGrant = (args: string[]) => {
+			const at = args.indexOf('--allowedTools');
+			return at < 0 ? args : [...args.slice(0, at), ...args.slice(at + 2)];
+		};
 		const scrub = (args: string[]) =>
 			args.map((a, i) => (['--tools', '--model', '--system-prompt'].includes(args[i - 1] ?? '') ? '<varies>' : a));
-		expect(scrub(search)).toEqual(scrub(base));
+		expect(scrub(withoutGrant(search))).toEqual(scrub(base));
 		// The prompt sent must be TRUE for the capability: only the bare prompt may
 		// claim the session cannot browse.
 		expect(CHAT_SYSTEM_PROMPT).toContain('no tools');
