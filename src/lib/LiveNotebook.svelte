@@ -10,9 +10,9 @@
 		CHAT_LANGUAGE,
 		isChatCell,
 		isLogicalCellType,
-		isPyUnsupportedType,
 		languageTagFor,
 		nbCellType,
+		offersCellType,
 		PY_UNSUPPORTED_TYPES,
 		SQL_LANGUAGE,
 		textNotebookTypeMessage,
@@ -2193,7 +2193,7 @@
 	 * listed again here. Enforcement stays the server's.
 	 */
 	function refuseUnsupportedType(cellType: LogicalCellType): boolean {
-		if (!isPy || !isPyUnsupportedType(cellType)) return false;
+		if (offersCellType(cellType, isPy)) return false;
 		noticeUnsupportedType(cellType);
 		return true;
 	}

@@ -132,6 +132,27 @@ export function isPyUnsupportedType(cellType: unknown): cellType is LogicalCellT
 	return typeof cellType === 'string' && (PY_UNSUPPORTED_TYPES as readonly string[]).includes(cellType);
 }
 
+/**
+ * May a UI surface OFFER this logical type for a notebook of this format? The ONE
+ * rule behind every create/convert control - the cell-type menu's `typeOptions`
+ * filter, the add affordances' chat gate (`Notebook.svelte`'s bottom add row +
+ * hover-between strip), and `LiveNotebook`'s optimistic `refuseUnsupportedType` -
+ * so no control can ever offer a type the doc layer's `assertCanHoldType` is
+ * about to refuse.
+ *
+ * It is a FUNCTION rather than the same expression written out per surface for
+ * the reason this whole module exists: three inlined copies of
+ * `!isPy || !isPyUnsupportedType(t)` agreed only by coincidence, and - living in
+ * a Svelte template - could be pinned only by READING SOURCE, so the rule's
+ * meaning had no executable test. Here the truth table is a real one.
+ *
+ * Enforcement stays the SERVER's: this is the optimistic mirror (the
+ * `clampMoveIndex` pairing), never the authority.
+ */
+export function offersCellType(cellType: LogicalCellType, isPy: boolean): boolean {
+	return !isPy || !isPyUnsupportedType(cellType);
+}
+
 /** The one message for the raw refusal, shared by the server writers and the browser. */
 export const TEXT_NOTEBOOK_RAW_MESSAGE =
 	'A .py notebook cannot hold a raw cell: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and has no raw marker, so the cell would come back after a reload as a RUNNABLE Python cell holding what was meant to be verbatim text. Convert it to .ipynb first.';

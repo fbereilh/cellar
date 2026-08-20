@@ -1,7 +1,7 @@
 <script lang="ts">
 	import Cell from '$lib/Cell.svelte';
 	import type { LogicalCellType } from '$lib/server/types';
-	import { isPyUnsupportedType } from '$lib/cellLanguage';
+	import { offersCellType } from '$lib/cellLanguage';
 	import type { CellActivation, KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
@@ -538,9 +538,10 @@
 	// may offer a CHAT cell: a `.py` text notebook cannot hold one (the server's
 	// `assertCanHoldType` refuses it), and a control that offers a type the
 	// document cannot store is the exact drift the type menu's `typeOptions`
-	// filter exists to prevent. WHICH types a `.py` refuses is read from
-	// `$lib/cellLanguage` - never a second copy of the list here.
-	const offerChatCell = $derived(!isPy || !isPyUnsupportedType('chat'));
+	// filter exists to prevent. The rule is ASKED, never restated: `offersCellType`
+	// in `$lib/cellLanguage` is the one both filters and `LiveNotebook`'s
+	// optimistic refusal go through.
+	const offerChatCell = $derived(offersCellType('chat', isPy));
 	const currentRootOption = $derived(rootOptions.find((o) => o.path === root) ?? null);
 	// The select is DRIVEN by `root`, never by the click: the change is applied
 	// non-optimistically and can be REFUSED (the picker deliberately offers a
