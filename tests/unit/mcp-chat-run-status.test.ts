@@ -33,6 +33,7 @@ let authmod: typeof import('../../src/lib/server/chat/auth');
 beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-chat-status-'));
 	process.env.CELLAR_WORKSPACE = WS;
+	process.env.CELLAR_USER_SETTINGS = join(WS, 'user-settings.json');
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
 	runmod = await import('../../src/lib/server/run');

@@ -42,10 +42,16 @@ function headline(failure: ChatEngineFailure): string {
 		case 'unsafe_init':
 			return (
 				'**Chat refused to run.** The Claude CLI session reported capabilities that do ' +
-				'not match what this run allows (tools beyond its allowlist, MCP servers or ' +
-				'slash commands - or no report at all), so the run was stopped and its reply ' +
-				'discarded. This usually means a claude CLI update changed flag behavior; ' +
-				'report it rather than working around it.'
+				'not match what this run requested, so the run was stopped and its reply ' +
+				'discarded.\n\n' +
+				'If the session was **missing** a tool this run requested, the CLI or the ' +
+				'signed-in account does not grant it - web search is the usual case (an older ' +
+				'`claude` CLI, or an org/plan with search disabled, reports no tools at all). ' +
+				'Turn **Allow web search** off under **Chat cells** in Settings and re-run.\n\n' +
+				'Otherwise the session reported MORE than this run allows (tools beyond its ' +
+				'allowlist, MCP servers or slash commands - or no report at all). That usually ' +
+				'means a claude CLI update changed flag behavior; report it rather than working ' +
+				'around it.'
 			);
 		case 'transcript_too_large':
 			// The engine never ran, so the whole message is Cellar's own: the size and
