@@ -1,6 +1,6 @@
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
@@ -384,10 +384,23 @@ test('the gap strip and the bottom add row create a CHAT cell - no type menu inv
 		expect(cellar[0].language).toBeUndefined();
 	}).toPass({ timeout: 15_000 });
 
-	// The tag survives to DISK through clean-on-save: a reload renders both chat
-	// badges again from the reopened file.
+	// The tag survives to DISK through clean-on-save: the persisted `.ipynb`
+	// carries `cellar.language: 'chat'` on exactly the two created cells.
+	await expect(async () => {
+		const doc = JSON.parse(readFileSync(join(workspace, nb), 'utf8')) as {
+			cells: { metadata?: { cellar?: { language?: string } } }[];
+		};
+		expect(doc.cells.length).toBe(4);
+		expect(doc.cells[1].metadata?.cellar?.language).toBe('chat');
+		expect(doc.cells[3].metadata?.cellar?.language).toBe('chat');
+		expect(doc.cells[0].metadata?.cellar?.language).toBeUndefined();
+	}).toPass({ timeout: 15_000 });
+
+	// And a reload renders both chat badges again from the reopened file. The tab
+	// session's debounced write can race the reload, so the notebook is re-opened
+	// from the tree rather than trusted to restore (the chat-cell.spec pattern).
 	await page.reload();
-	await expect(page.locator(`[data-testid="cell"][data-cell-id="${CHAT_C2}"]`)).toBeVisible({ timeout: 30_000 });
+	await openFromTree(page, nb, page.locator(`[data-testid="cell"][data-cell-id="${CHAT_C2}"]`));
 	await expect(cells.nth(1).getByTestId('chat-badge')).toBeVisible();
 	await expect(cells.nth(3).getByTestId('chat-badge')).toBeVisible();
 });
