@@ -83,6 +83,38 @@ export function setUserSetting(key: string, value: unknown): void {
 	for (const fn of listeners) fn();
 }
 
+/**
+ * Like `setUserSetting`, but PUTs IMMEDIATELY and resolves once the write is
+ * acknowledged - the `setUiNow` rule (`$lib/uiState`), applied to this store for
+ * the same reason: a preference the SERVER re-reads during a LATER user action
+ * must be durable before that action can run, and the debounced path leaves a
+ * ~300ms window in which it is not.
+ *
+ * The chat-cell settings are exactly that shape. `run-chat.ts` reads them off
+ * `getUserSettings()` when a chat cell RUNS, so unchecking "Allow web search"
+ * and running a cell inside the debounce window would still spawn the child with
+ * `--tools`/`--allowedTools WebSearch` and put notebook-derived queries on the
+ * wire after the user opted out - the exact outcome the toggle exists to
+ * prevent. The model key is the same shape at a lesser cost (one run billed to
+ * the wrong model), and rides the same write so the two cannot diverge.
+ *
+ * This write supersedes any value the debounced path had queued for the same
+ * key. A no-op off the browser. A failed persist leaves the caller's optimistic
+ * local state in place, so the pane still shows the user's choice and the next
+ * write retries it.
+ *
+ * Subscribers are notified SYNCHRONOUSLY, as `setUserSetting` notifies them:
+ * `store.setNow` updates the local cache before it ever touches the network, so
+ * holding the notification until the ack would leave every long-lived reader
+ * showing the old value for the length of the round trip - or for good, if the
+ * PUT hangs.
+ */
+export function setUserSettingNow(key: string, value: unknown): Promise<void> {
+	const written = store.setNow(key, value);
+	for (const fn of listeners) fn();
+	return written;
+}
+
 const listeners = new Set<() => void>();
 
 /**

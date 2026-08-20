@@ -4,7 +4,7 @@
 	// (view + rebind).
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
-	import { getUserSettingFlag, getUserSettingText, setUserSetting } from '$lib/userSettings';
+	import { getUserSettingFlag, getUserSettingText, setUserSetting, setUserSettingNow } from '$lib/userSettings';
 	import { CHAT_MODEL_KEY, CHAT_MODELS, CHAT_WEB_SEARCH_KEY, normalizeChatModel } from '$lib/chatCell';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import {
@@ -226,18 +226,28 @@
 		chatWebSearch = getUserSettingFlag(CHAT_WEB_SEARCH_KEY);
 	});
 
+	// Both write through `setUserSettingNow`, NEVER the debounced `setUserSetting`:
+	// the server re-reads these keys during a LATER user action (`run-chat.ts`
+	// reads them off `getUserSettings()` when a chat cell RUNS), which is the
+	// `setUiNow` rule the Databricks runtime toggle already follows. Debounced,
+	// unchecking "Allow web search" and immediately running a chat cell still
+	// spawned the child with `--tools`/`--allowedTools WebSearch` - the opt-out
+	// silently not taking effect for the very next run is the one outcome this
+	// toggle exists to prevent. Neither is awaited: the local `$state` above is
+	// the optimistic view and a failed PUT leaves the user's choice on screen.
+
 	function setChatModel(id: string) {
 		// The select's options are the closed CHAT_MODELS list, but the gate runs
 		// anyway - the value stored is always one the argv builder accepts.
 		chatModel = normalizeChatModel(id);
-		setUserSetting(CHAT_MODEL_KEY, chatModel);
+		void setUserSettingNow(CHAT_MODEL_KEY, chatModel);
 	}
 
 	function toggleChatWebSearch() {
 		chatWebSearch = !chatWebSearch;
 		// OFF deletes the key rather than storing `false`: absent = the default =
 		// today's bare session, so a store that was never opted in carries nothing.
-		setUserSetting(CHAT_WEB_SEARCH_KEY, chatWebSearch ? true : null);
+		void setUserSettingNow(CHAT_WEB_SEARCH_KEY, chatWebSearch ? true : null);
 	}
 
 	// ---- Keyboard shortcuts --------------------------------------------------

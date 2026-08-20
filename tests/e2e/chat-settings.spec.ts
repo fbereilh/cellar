@@ -26,11 +26,15 @@ import { CHAT_MODEL_KEY, CHAT_MODEL_DEFAULT, CHAT_WEB_SEARCH_KEY } from '../../s
  *   - turning it back OFF DELETES the key rather than storing `false` - absent is
  *     the default, so an opted-out store is byte-identical to a fresh one;
  *   - the model select stores the chosen id from the closed `CHAT_MODELS` list;
- *   - and a reload shows the pane what the store holds, so what a person reads
+ *   - a reload shows the pane what the store holds, so what a person reads
  *     back is what the next run would use. (This pins the OUTCOME, not the
  *     seed-on-open mechanism behind it: the SSR-seeded client cache means a
  *     construction-time read would pass here too - the reason the seed waits for
  *     `open` is the pre-hydration empty store, which this level cannot observe.)
+ *   - and the opt-OUT is on the wire before the client debounce could have
+ *     fired, because the server re-reads these keys when a chat cell RUNS - so
+ *     a debounced write leaves a window in which the next run is still granted
+ *     the capability the user just turned off.
  *
  * `CELLAR_USER_SETTINGS` is redirected into the throwaway workspace by the shared
  * harness, so this spec can never rewrite the settings of whoever ran the suite.
@@ -146,5 +150,92 @@ test('turning search back off DELETES the key: an opted-out store matches a fres
 		.toBe(false);
 	// The model is an explicit selection and stays; only the flag is absent-by-default.
 	expect((await serverSettings(page))[CHAT_MODEL_KEY]).toBe('opus');
+	await closeSettings(page);
+});
+
+/**
+ * The debounced client write is `FLUSH_DEBOUNCE_MS` (300ms, `$lib/clientStore`)
+ * away from the server, so it cannot be what carries a CAPABILITY opt-out: the
+ * server re-reads these keys when a chat cell RUNS, and a run started inside
+ * that window would still have been granted `--tools`/`--allowedTools
+ * WebSearch` after the user turned search off. The immediate write
+ * (`setUserSettingNow`, the `setUiNow` rule the Databricks runtime toggle
+ * already follows) is what closes it.
+ *
+ * Observed as the outbound PUT rather than by racing a read: the write carrying
+ * the deletion must be ISSUED sooner than the debounce timer could possibly have
+ * fired, which is a hard floor the debounced path can never beat.
+ *
+ * The interval is measured ENTIRELY IN THE PAGE, and that is what makes a 300ms
+ * budget a real discriminator rather than a flake: the mark and the click happen
+ * in one synchronous browser turn, so no Playwright round trip, worker
+ * contention or event-loop stall can be mistaken for the debounce. `fetch` is
+ * the platform API the store calls, wrapped here only to timestamp the request
+ * it makes - the request itself, and the store, are untouched.
+ *
+ * Runs LAST because the spec is serial and shares one store: it opts in, then
+ * out, leaving search off exactly as the test above does.
+ */
+const FLUSH_DEBOUNCE_MS = 300;
+
+interface OptOutProbe {
+	__cellarOptOutMark?: number;
+	__cellarOptOutDelay?: number;
+}
+
+test('the web-search opt-out reaches the server without waiting out the debounce', async ({ page }) => {
+	await page.goto(baseURL);
+	await openSettings(page);
+
+	// Opt IN first, and let it settle, so the toggle below is a real opt-OUT
+	// over a store that really holds `true`.
+	await page.getByTestId('settings-chat-web-search').click();
+	await expect
+		.poll(async () => (await serverSettings(page))[CHAT_WEB_SEARCH_KEY], { timeout: 10_000 })
+		.toBe(true);
+
+	// Timestamp the opt-out PUT relative to the click that caused it. The opt-out
+	// is the write that DELETES the key (a stored `false` would not be an
+	// opted-out store - see the test above).
+	await page.evaluate((key: string) => {
+		const probe = window as unknown as OptOutProbe;
+		const realFetch = window.fetch.bind(window);
+		window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+			try {
+				const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+				if (init?.method === 'PUT' && url.includes('/api/user-settings') && probe.__cellarOptOutDelay === undefined) {
+					const body = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
+					if (key in body && body[key] === null && probe.__cellarOptOutMark !== undefined) {
+						probe.__cellarOptOutDelay = performance.now() - probe.__cellarOptOutMark;
+					}
+				}
+			} catch {
+				/* the measurement may never disturb the write */
+			}
+			return realFetch(input, init);
+		}) as typeof window.fetch;
+	}, CHAT_WEB_SEARCH_KEY);
+
+	// Mark and click in ONE browser turn - nothing between them to measure.
+	await page.evaluate(() => {
+		const probe = window as unknown as OptOutProbe;
+		probe.__cellarOptOutMark = performance.now();
+		document.querySelector<HTMLElement>('[data-testid="settings-chat-web-search"]')?.click();
+	});
+
+	await expect(page.getByTestId('settings-chat-web-search')).not.toBeChecked();
+
+	const delay = await page.evaluate(() => (window as unknown as OptOutProbe).__cellarOptOutDelay);
+	// Issued at all...
+	expect(delay).not.toBeUndefined();
+	// ...and strictly inside the debounce floor: the debounced path schedules its
+	// flush FLUSH_DEBOUNCE_MS after the click, so it could never land here.
+	expect(delay as number).toBeLessThan(FLUSH_DEBOUNCE_MS);
+
+	// The write it carried is the one the server ends up holding.
+	await expect
+		.poll(async () => CHAT_WEB_SEARCH_KEY in (await serverSettings(page)), { timeout: 10_000 })
+		.toBe(false);
+
 	await closeSettings(page);
 });
