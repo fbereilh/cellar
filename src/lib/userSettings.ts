@@ -13,10 +13,14 @@
  * be scoped to one dynamic port - the very thing a cross-project setting must
  * outlive.
  *
- * What it holds is a DEFAULT, and only ever that. The per-project store answers
- * for a project that has an answer; this answers for a project that has never been
- * asked. Readers seed from it, never override with it - see the `getUi` /
- * `getUserSettingText` pairing at the Databricks affix fields.
+ * Where a setting ALSO exists per project, what this holds is a DEFAULT and only
+ * ever that: the per-project store answers for a project that has an answer, this
+ * answers for a project that has never been asked, and readers seed from it rather
+ * than override with it - see the `getUi` / `getUserSettingText` pairing at the
+ * Databricks affix fields. A setting that is about the PERSON and has no
+ * per-project counterpart (the chat model and web-search opt-in) is the live value
+ * instead, read straight off this store by the server when a chat cell runs -
+ * which is why those two write through `setUserSettingNow` below.
  */
 
 import { createClientStore } from '$lib/clientStore';
