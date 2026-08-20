@@ -424,6 +424,58 @@ test('the strip reorders from the keyboard, and a single-tab strip is inert', as
 	expect(await activeTab(page)).toBe(tabId('bravo.txt'));
 });
 
+test('the strip is a real tablist: arrows move focus without switching files', async ({ page }) => {
+	test.setTimeout(120_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await resetStrip(page);
+
+	const at = (i: number) => page.locator('[data-testid="tab"]').nth(i);
+	const focused = () => page.evaluate(() => (document.activeElement as HTMLElement)?.dataset?.tabId ?? null);
+	const order = await tabOrder(page);
+	const activeBefore = await activeTab(page);
+
+	await at(0).focus();
+	// Manual activation: browsing the strip must never switch the file under you.
+	await page.keyboard.press('ArrowRight');
+	expect(await focused()).toBe(order[1]);
+	await page.keyboard.press('End');
+	expect(await focused()).toBe(order[order.length - 1]);
+	await page.keyboard.press('Home');
+	expect(await focused()).toBe(order[0]);
+	await page.keyboard.press('ArrowLeft'); // wraps, as the tablist pattern expects
+	expect(await focused()).toBe(order[order.length - 1]);
+	expect(await activeTab(page)).toBe(activeBefore);
+	expect(await tabOrder(page)).toEqual(order);
+
+	// Each tab names the pane it controls, and that pane names it back - the half of
+	// the pattern that makes `role="tab"` mean something to assistive tech.
+	const activeId = (await activeTab(page))!;
+	const tab = page.locator(`[data-testid="tab"][data-tab-id="${activeId}"]`);
+	const panelId = await tab.getAttribute('aria-controls');
+	expect(panelId).toBeTruthy();
+	// An attribute selector, not `#id`: the id carries `:` and `/`, and `CSS.escape`
+	// is a browser global that does not exist in this Node test process.
+	const panel = page.locator(`[id="${panelId}"]`);
+	await expect(panel).toHaveAttribute('role', 'tabpanel');
+	await expect(panel).toHaveAttribute('aria-labelledby', (await tab.getAttribute('id'))!);
+	await expect(tab).toHaveAttribute('aria-selected', 'true');
+});
+
+test('a double-click still promotes a preview tab', async ({ page }) => {
+	test.setTimeout(120_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await resetStrip(page);
+
+	// Single-click a tree file → a transient preview tab. Double-clicking the TAB
+	// promotes it, which is two press/release pairs with no movement between them -
+	// so it is also a check that the drag gesture never eats an ordinary dblclick.
+	await page.locator(`[data-testid="tree-file"][data-path="${HTML_FILE}"]`).click();
+	const preview = page.locator(`[data-testid="tab"][data-tab-id="${tabId(HTML_FILE)}"]`);
+	await expect(preview).toHaveAttribute('data-preview', 'true');
+	await preview.dblclick();
+	await expect(preview).not.toHaveAttribute('data-preview', 'true');
+});
+
 test('a wrapped, multi-row strip drops onto the row the pointer is on', async ({ page }) => {
 	test.setTimeout(180_000);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);

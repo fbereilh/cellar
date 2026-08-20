@@ -3,7 +3,8 @@
 	import { kernelBadgeClass, kernelStatusLabel, formatMemory } from '$lib/kernelBadge';
 	import type { KernelInfo } from '$lib/kernelBadge';
 	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte';
-	import { dropIndexAt, exceedsDragThreshold, landingIndex, type TabBox } from '$lib/tabReorder';
+	import { dropIndexAt, exceedsDragThreshold, landingIndex, stepSlot, type TabBox } from '$lib/tabReorder';
+	import { tabDomId, tabPanelDomId } from '$lib/tabIds';
 	import { tick } from 'svelte';
 
 	// The tab fields the navbar renders. The shell (+page) holds richer tab
@@ -300,24 +301,49 @@
 	 * is structural: the event target IS the tab, so these chords can only fire
 	 * while a tab has focus and can never shadow a notebook binding.
 	 */
+	/** Put focus on a tab by id (it may have just moved in the DOM). */
+	function focusTab(id: string | undefined) {
+		if (!id) return;
+		document.querySelector<HTMLElement>(`[data-testid="tab"][data-tab-id="${CSS.escape(id)}"]`)?.focus();
+	}
+
 	async function onTabKeydown(e: KeyboardEvent, id: string, index: number) {
 		if (e.key === 'Enter' || e.key === ' ') {
 			e.preventDefault();
 			onSelectTab(id);
 			return;
 		}
+		// Arrow/Home/End move FOCUS along the strip without selecting - the tablist
+		// pattern's manual-activation form, so browsing the tabs with the keyboard
+		// never switches files by accident. Bare keys only: the reorder chords below
+		// are the same arrows with modifiers.
+		const bare = !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
+		if (bare && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
+			e.preventDefault();
+			const n = tabs.length;
+			const to =
+				e.key === 'Home'
+					? 0
+					: e.key === 'End'
+						? n - 1
+						: e.key === 'ArrowLeft'
+							? (index - 1 + n) % n
+							: (index + 1) % n;
+			focusTab(tabs[to]?.id);
+			return;
+		}
 		const chord = chordFromEvent(e);
 		if (!chord) return;
-		// A step of one place, expressed as an insertion slot: one BEFORE the tab's
-		// left neighbour, or one AFTER its right one. Out-of-range slots are clamped
-		// by `reorderTabs` onto the tab's own position, so a step off either end is
-		// an honest no-op rather than a wrap-around.
+		// A step of one place, expressed as an INSERTION SLOT so it reaches the
+		// document through the same `reorderTabs` the pointer drop does. An
+		// out-of-range slot is clamped by that function onto the tab's own position,
+		// so a step off either end is an honest no-op rather than a wrap-around.
 		const left = bindingsFor('move-tab-left').includes(chord);
 		const right = bindingsFor('move-tab-right').includes(chord);
 		if (!left && !right) return;
 		e.preventDefault();
 		e.stopPropagation();
-		const slot = left ? index - 1 : index + 2;
+		const slot = stepSlot(index, left ? -1 : 1);
 		const landed = landingIndex(index, Math.max(0, Math.min(tabs.length, slot)));
 		if (landed === index) {
 			moveAnnouncement = `${tabs[index]?.title ?? 'Tab'} is already ${left ? 'first' : 'last'}`;
@@ -327,7 +353,7 @@
 		// Svelte's keyed each MOVES the node, which drops focus, so put it back on
 		// the tab the user is still steering.
 		await tick();
-		document.querySelector<HTMLElement>(`[data-testid="tab"][data-tab-id="${CSS.escape(id)}"]`)?.focus();
+		focusTab(id);
 		moveAnnouncement = `${tabs[landed]?.title ?? 'Tab'} moved to position ${landed + 1} of ${tabs.length}`;
 	}
 </script>
@@ -595,6 +621,8 @@
 				data-dragging={dragging || undefined}
 				role="tab"
 				tabindex="0"
+				id={tabDomId(tab.id)}
+				aria-controls={tabPanelDomId(tab.id)}
 				aria-selected={tab.id === activeTabId}
 				aria-label="{tab.title}, tab {i + 1} of {tabs.length}"
 				onpointerdown={(e) => onTabPointerDown(e, tab.id)}

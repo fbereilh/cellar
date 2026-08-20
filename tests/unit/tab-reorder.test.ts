@@ -15,8 +15,8 @@ import {
 	dropIndexAt,
 	exceedsDragThreshold,
 	landingIndex,
-	moveTabBy,
 	reorderTabs,
+	stepSlot,
 	type TabBox
 } from '$lib/tabReorder';
 
@@ -204,30 +204,38 @@ describe('landingIndex', () => {
 	});
 });
 
-describe('moveTabBy - the keyboard step', () => {
+describe('stepSlot - the keyboard step', () => {
 	const four = tabs('a', 'b', 'c', 'd');
+	/** An independent oracle: swap two adjacent entries. */
+	const swapped = (ids: string[], i: number, j: number) => {
+		const out = ids.slice();
+		[out[i], out[j]] = [out[j], out[i]];
+		return out;
+	};
 
-	it('steps one place in either direction', () => {
-		expect(idsOf(moveTabBy(four, 'c', -1))).toEqual(['a', 'c', 'b', 'd']);
-		expect(idsOf(moveTabBy(four, 'c', 1))).toEqual(['a', 'b', 'd', 'c']);
+	it('names the slot that swaps the tab with the neighbour in that direction', () => {
+		const ids = idsOf(four);
+		for (let i = 0; i < four.length; i++) {
+			const id = four[i].id;
+			expect(idsOf(reorderTabs(four, id, stepSlot(i, -1)))).toEqual(
+				i === 0 ? ids : swapped(ids, i, i - 1)
+			);
+			expect(idsOf(reorderTabs(four, id, stepSlot(i, 1)))).toEqual(
+				i === four.length - 1 ? ids : swapped(ids, i, i + 1)
+			);
+		}
 	});
 
 	it('is inert at either end, so holding the key writes nothing', () => {
-		expect(moveTabBy(four, 'a', -1)).toBe(four);
-		expect(moveTabBy(four, 'd', 1)).toBe(four);
+		// Same reference back: a step off the strip must not churn state.
+		expect(reorderTabs(four, 'a', stepSlot(0, -1))).toBe(four);
+		expect(reorderTabs(four, 'd', stepSlot(3, 1))).toBe(four);
 	});
 
-	it('no-ops for an unknown id', () => {
-		expect(moveTabBy(four, 'nope', 1)).toBe(four);
-	});
-
-	it('agrees with reorderTabs about what one step means', () => {
-		// The component expresses a keyboard step as an insertion slot so both
-		// gestures come through ONE seam; the two must not disagree.
-		for (let i = 0; i < four.length; i++) {
-			const id = four[i].id;
-			expect(idsOf(reorderTabs(four, id, i - 1))).toEqual(idsOf(moveTabBy(four, id, -1)));
-			expect(idsOf(reorderTabs(four, id, i + 2))).toEqual(idsOf(moveTabBy(four, id, 1)));
-		}
+	it('steps RIGHT past the neighbour, not onto it', () => {
+		// The off-by-one this helper exists to name: the tab is still in the array
+		// when the slot is chosen, so `index + 1` would be its own position.
+		expect(stepSlot(2, 1)).toBe(4);
+		expect(stepSlot(2, -1)).toBe(1);
 	});
 });

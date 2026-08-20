@@ -38,6 +38,7 @@
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import { isBlameUnavailable, activeBlameFor, type BlameReport } from '$lib/blame';
 	import { reorderTabs as reorderTabList } from '$lib/tabReorder';
+	import { tabDomId, tabPanelDomId } from '$lib/tabIds';
 
 	/** Kind of an open tab: the canonical notebook, an opened `.ipynb`/`.py`, a rendered image, or a text file. */
 	type TabKind = 'notebook' | 'ipynb' | 'image' | 'file';
@@ -1642,7 +1643,12 @@
 			     just hidden. The default notebook and opened `.ipynb` files use the
 			     same live component; each persists to its own file. -->
 			{#if notebookOpen}
-				<div class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}">
+				<div
+					class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}"
+					role="tabpanel"
+					id={tabPanelDomId('notebook')}
+					aria-labelledby={tabDomId('notebook')}
+				>
 					<LiveNotebook
 						path={canonicalNotebookRel}
 						virtualize={effectiveVirtualize}
@@ -1670,7 +1676,12 @@
 			{/if}
 
 			{#each ipynbTabs as tab (tab.id)}
-				<div class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}">
+				<div
+					class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}"
+					role="tabpanel"
+					id={tabPanelDomId(tab.id)}
+					aria-labelledby={tabDomId(tab.id)}
+				>
 					<LiveNotebook
 						path={tab.path}
 						virtualize={effectiveVirtualize}
@@ -1698,7 +1709,12 @@
 			{/each}
 
 			{#each fileTabs as tab (tab.id)}
-				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
+				<div
+					class="h-full {activeTabId === tab.id ? '' : 'hidden'}"
+					role="tabpanel"
+					id={tabPanelDomId(tab.id)}
+					aria-labelledby={tabDomId(tab.id)}
+				>
 					<FileTab
 						path={tab.path}
 						onDirty={onFileDirty}
@@ -1710,7 +1726,12 @@
 			{/each}
 
 			{#each imageTabs as tab (tab.id)}
-				<div class="h-full {activeTabId === tab.id ? '' : 'hidden'}">
+				<div
+					class="h-full {activeTabId === tab.id ? '' : 'hidden'}"
+					role="tabpanel"
+					id={tabPanelDomId(tab.id)}
+					aria-labelledby={tabDomId(tab.id)}
+				>
 					<ImageTab path={tab.path} />
 				</div>
 			{/each}

@@ -133,17 +133,16 @@ export function reorderTabs<T extends { id: string }>(tabs: T[], id: string, ins
 }
 
 /**
- * `tabs` with `id` stepped `delta` places (the keyboard reorder). Returns `tabs`
- * unchanged when the id is unknown or the step would leave the strip, so holding
- * the shortcut against either end is inert rather than a stream of no-op writes.
+ * The insertion slot that steps the tab at `index` one place left (`-1`) or right
+ * (`+1`) - how the keyboard reorder is expressed, so it reaches the document
+ * through the same `reorderTabs` the pointer drop does rather than a second rule.
+ *
+ * Stepping RIGHT is `index + 2`, not `index + 1`: the tab is still in the array
+ * when the slot is named, so landing after its right-hand neighbour means the slot
+ * beyond it. Out-of-range slots need no clamping here - `reorderTabs` clamps them
+ * onto the tab's own position, which is exactly the no-op a step off either end
+ * should be.
  */
-export function moveTabBy<T extends { id: string }>(tabs: T[], id: string, delta: number): T[] {
-	const from = tabs.findIndex((t) => t.id === id);
-	if (from < 0) return tabs;
-	const to = from + delta;
-	if (to < 0 || to >= tabs.length) return tabs;
-	const next = tabs.slice();
-	const [moved] = next.splice(from, 1);
-	next.splice(to, 0, moved);
-	return next;
+export function stepSlot(index: number, dir: -1 | 1): number {
+	return dir === -1 ? index - 1 : index + 2;
 }
