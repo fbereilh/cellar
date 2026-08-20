@@ -1455,12 +1455,19 @@
 			clearRunning();
 			lastSeq = null; // reconnect refetches once here; don't also trip the seq-gap check
 			// `queued` is NOT reset: the queue lives on the server and outlives this
-			// refetch. Apply any snapshot that arrived before we knew our absolute id.
-			if (pendingQueueEvent) {
-				const ev = pendingQueueEvent;
-				pendingQueueEvent = null;
-				applyQueueEvent(ev);
-			}
+			// refetch. Then RE-APPLY the latest queue snapshot, so a run the server
+			// still holds gets its `runningId` back after the wipe above. This must be
+			// the RETAINED snapshot, never a consumed one-shot: on a page reload the
+			// mount load can resolve BEFORE the SSE stream opens, so `sse:open`
+			// triggers this second load - and the connect-seeded `queue:changed`
+			// lands (and is applied) while that load is in flight. A one-shot pending
+			// was long consumed by then, so the `clearRunning()` above erased the
+			// running cell for the rest of the run (the kernel badge stayed busy - it
+			// rides `kernel:status`, which nothing wipes) until the next genuine
+			// queue change, i.e. `run:end`. Re-applying is always safe: the snapshot
+			// is the server's full statement, and a newer one overwrites this one the
+			// moment it arrives.
+			if (lastQueueEvent) applyQueueEvent(lastQueueEvent);
 			refreshStaleness();
 		} catch (err) {
 			loadError = String((err as Error)?.message ?? err);
@@ -1642,14 +1649,17 @@
 	// The kernel's queue, rebroadcast in full on every change (and replayed to us
 	// on subscribe / SSE connect). Keep only this notebook's entries, but preserve
 	// their GLOBAL position so the badge tells the truth about how many runs are
-	// ahead. A snapshot that lands before `load()` has told us our absolute id is
-	// held, not dropped: it may be the only one until the queue next changes.
-	let pendingQueueEvent: QueueChangedEvent | null = null;
+	// ahead. The latest snapshot is RETAINED (each one is the server's full
+	// statement, so keeping only the newest is always right): a snapshot that
+	// lands before `load()` has told us our absolute id is applied at the end of
+	// that load, and every LATER load re-applies it too - `load()` wipes
+	// `runningId` as its stale-state backstop, so without the re-apply a refetch
+	// racing a live run (a reload's `sse:open` backstop load, a seq-gap refetch,
+	// a checkpoint restore) erased the running cell until the queue next changed.
+	let lastQueueEvent: QueueChangedEvent | null = null;
 	function applyQueueEvent(ev: QueueChangedEvent) {
-		if (!canonicalId) {
-			pendingQueueEvent = ev;
-			return;
-		}
+		lastQueueEvent = ev;
+		if (!canonicalId) return;
 		const next: Record<string, number> = {};
 		for (const item of ev.queue ?? []) {
 			if (item.nb === canonicalId) next[item.cellId] = item.position;
