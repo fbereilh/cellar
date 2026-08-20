@@ -61,8 +61,19 @@ import {
 export async function POST({ request }) {
 	const body = await request.json().catch(() => ({}));
 	try {
-		if (body.op === 'set-target') return applyTargetWrite(body, () => setExportTarget(body.target ?? null, body.path, body.originId, body.base ?? null));
-		if (body.op === 'set-base') return applyTargetWrite(body, () => setExportBase(String(body.base ?? ''), body.path, body.originId));
+		if (body.op === 'set-target')
+			return applyTargetWrite(body, () =>
+				setExportTarget(
+					optionalText(body.target, 'target'),
+					body.path,
+					body.originId,
+					optionalText(body.base, 'base')
+				)
+			);
+		if (body.op === 'set-base')
+			return applyTargetWrite(body, () =>
+				setExportBase(optionalText(body.base, 'base') ?? '', body.path, body.originId)
+			);
 		if (body.op === 'export') {
 			return json({ ok: true, ...exportPy(body.path) });
 		}
@@ -70,6 +81,35 @@ export async function POST({ request }) {
 	} catch (err) {
 		throw error(400, String(err?.message ?? err));
 	}
+}
+
+/**
+ * A request field as a string, or null when it is ABSENT.
+ *
+ * `body` is untyped JSON and both fields reach a `.trim()` in the setter, so a
+ * boolean/number/object survived `??` and threw a bare `TypeError` - which is NOT
+ * an `InvalidExportTargetError`, so `applyTargetWrite` took the FAILED-WRITE
+ * branch and answered 500 `{writeFailed, ...}` over a document nothing had
+ * mutated. The tab then reported a malformed request as "accepted but not saved"
+ * and, because `exportPy` deliberately does not abort on `writeFailed`, a later
+ * export ran against the OLD target and called it a success: exactly the false
+ * acceptance that flag exists to prevent.
+ *
+ * A PRESENT non-string is therefore REFUSED, never coerced - `target` would
+ * coerce to a CLEAR (deleting both keys on malformed input) and `base` to a
+ * silent inherit, and a direct API caller has no field on screen to notice the
+ * repair in (the `affixText` rule, for the same reason). ABSENT keeps its
+ * meaning: clearing for `target`, inheriting the stored base for `base`. Thrown
+ * as the typed refusal so the reply is the ordinary 400 + held state every other
+ * refusal answers with.
+ */
+function optionalText(v, field) {
+	if (v === undefined || v === null) return null;
+	if (typeof v !== 'string')
+		throw new InvalidExportTargetError(
+			`${field} must be a string, got ${Array.isArray(v) ? 'array' : typeof v}`
+		);
+	return v;
 }
 
 /**
