@@ -1,6 +1,7 @@
 <script lang="ts">
 	import Cell from '$lib/Cell.svelte';
-	import type { CellType, LogicalCellType } from '$lib/server/types';
+	import type { LogicalCellType } from '$lib/server/types';
+	import { isPyUnsupportedType } from '$lib/cellLanguage';
 	import type { CellActivation, KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
@@ -156,9 +157,9 @@
 		 *  alongside `activeId` so an edited cell scrolled far out of the window keeps
 		 *  its CodeMirror cursor/undo until it blurs. */
 		focusedId?: string | null;
-		onAddCell: (afterId: string | undefined, cellType: CellType) => void;
+		onAddCell: (afterId: string | undefined, cellType: LogicalCellType) => void;
 		/** Insert a fresh `cellType` cell above/below `targetId`, then select+focus it. */
-		onInsertCell: (where: 'above' | 'below', targetId: string, cellType: CellType) => void;
+		onInsertCell: (where: 'above' | 'below', targetId: string, cellType: LogicalCellType) => void;
 	}
 
 	// The shell owns the cell array + all cell operations (so the sidebar's
@@ -533,6 +534,13 @@
 	// nothing becomes unreachable.
 	const rootsInUse = $derived(rootOptions.some((o) => o.source !== 'worktree'));
 	const showRootBar = $derived(rootsInUse && !isPy);
+	// Whether the add affordances (the bottom add row + the hover-between strip)
+	// may offer a CHAT cell: a `.py` text notebook cannot hold one (the server's
+	// `assertCanHoldType` refuses it), and a control that offers a type the
+	// document cannot store is the exact drift the type menu's `typeOptions`
+	// filter exists to prevent. WHICH types a `.py` refuses is read from
+	// `$lib/cellLanguage` - never a second copy of the list here.
+	const offerChatCell = $derived(!isPy || !isPyUnsupportedType('chat'));
 	const currentRootOption = $derived(rootOptions.find((o) => o.path === root) ?? null);
 	// The select is DRIVEN by `root`, never by the click: the change is applied
 	// non-optimistically and can be REFUSED (the picker deliberately offers a
@@ -616,10 +624,14 @@
 </script>
 
 <!-- Hover-between insert control (VS Code style): a thin strip living in the gap
-     above a cell that, on hover, reveals "+ Code" / "+ Markdown" buttons. Clicking
-     inserts a fresh cell at that position (above `targetId`), reusing the one
-     positional-insert path. Rendered per gap, so it covers above the first cell
-     and between every pair; the always-visible append bar covers the very end. -->
+     above a cell that, on hover, reveals "+ Code" / "+ Markdown" / "+ Chat"
+     buttons. Clicking inserts a fresh cell at that position (above `targetId`),
+     reusing the one positional-insert path. Rendered per gap, so it covers above
+     the first cell and between every pair; the always-visible append bar covers
+     the very end. Code stays first and one click, so the common case pays nothing
+     for the chat button; Chat is withheld on a `.py` notebook (`offerChatCell`),
+     which cannot hold one. Raw stays menu-only - see `ALL_TYPE_OPTIONS` in
+     `Cell.svelte`. -->
 {#snippet insertControls(where: 'above' | 'below', targetId: string | undefined)}
 	{#if targetId}
 		<div class="pointer-events-none absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-primary/25 opacity-0 transition-opacity group-hover/ins:opacity-100"></div>
@@ -642,6 +654,18 @@
 				<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
 				Markdown
 			</button>
+			{#if offerChatCell}
+				<!-- `secondary` is chat's hue everywhere (the chat badge) - keep them agreeing. -->
+				<button
+					class="btn btn-secondary btn-xs h-5 min-h-0 gap-1 px-2 shadow-sm"
+					onclick={() => onInsertCell(where, targetId, 'chat')}
+					data-testid="insert-chat"
+					title="Insert a chat cell here - running it asks Claude about the cells above"
+				>
+					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+					Chat
+				</button>
+			{/if}
 		</div>
 	{/if}
 {/snippet}
@@ -942,6 +966,17 @@
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
 				Markdown
 			</button>
+			{#if offerChatCell}
+				<button
+					class="btn btn-ghost btn-sm gap-1"
+					onclick={() => onAddCell(cells.at(-1)?.id, 'chat')}
+					data-testid="add-chat"
+					title="Add a chat cell - running it asks Claude about the cells above"
+				>
+					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+					Chat
+				</button>
+			{/if}
 		</div>
 	</div>
 </div>

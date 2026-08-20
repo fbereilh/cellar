@@ -2645,9 +2645,12 @@
 		};
 	}
 
-	/** What an insert re-materializes: a cell's type, source and `cellar` metadata. */
+	/** What an insert re-materializes: a cell's type, source and `cellar` metadata.
+	 *  The type is LOGICAL (the add route's vocabulary): paste/undo feed it the
+	 *  nbformat type + the tagged `cellar` namespace, while a typed insert (the
+	 *  hover-between strip / bottom add row) names `sql`/`chat` directly. */
 	interface InsertSpec {
-		cell_type: CellType;
+		cell_type: LogicalCellType;
 		source: string;
 		cellar?: CellarNamespace;
 	}
@@ -3122,7 +3125,7 @@
 	// real text and the cell's real metadata.
 	async function addCell(
 		afterId: string | null | undefined,
-		cellType: CellType = 'code',
+		cellType: LogicalCellType = 'code',
 		source = '',
 		cellar?: CellarNamespace
 	): Promise<UICell> {
@@ -3363,7 +3366,7 @@
 	 * ids stay stable and the cell participates in run/dataflow/staleness like
 	 * any other. With no target (empty selection) it appends.
 	 */
-	async function insertCell(where: 'above' | 'below', targetId: string | null = activeId, cellType: CellType = 'code') {
+	async function insertCell(where: 'above' | 'below', targetId: string | null = activeId, cellType: LogicalCellType = 'code') {
 		const i = targetId ? cells.findIndex((c) => c.id === targetId) : -1;
 		const index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
 		const created = await insertCellAt(index, { cell_type: cellType, source: '' });

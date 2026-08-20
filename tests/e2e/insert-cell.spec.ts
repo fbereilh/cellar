@@ -1,6 +1,6 @@
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
@@ -11,9 +11,15 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  * Jupyter command-mode `a`/`b` keyboard shortcuts. Also guards the mode gating:
  * `a`/`b` type characters while editing, never insert cells.
  *
- * SPLIT-CELL is the third way a cell appears between two others, and the last
- * test covers what only a real browser can: that the notebook hands the created
- * half the ORIGINAL cell's identity. The rule itself (which `cellar` keys ride
+ * The last two tests cover the TYPED create paths: a CHAT cell created from the
+ * gap strip and from the bottom add row (never through the type menu), and both
+ * chat controls ABSENT on a `.py` notebook - which cannot hold one - while its
+ * Code/Markdown controls keep working. The gating rule itself is source-guarded
+ * in `tests/unit/add-chat-cell-controls.test.ts` (e2e is absent from CI).
+ *
+ * SPLIT-CELL is the third way a cell appears between two others, and the
+ * split test covers what only a real browser can: that the notebook hands the
+ * created half the ORIGINAL cell's identity. The rule itself (which `cellar` keys ride
  * along, and why the imports role and the export flag do not) is unit-tested in
  * `tests/unit/split-cell.test.ts`; what is checked here is the WIRING, since a
  * split that forgot to pass the namespace turned a SQL cell's lower half into a
@@ -282,4 +288,115 @@ test('split-cell hands the created half the cell it came out of - language yes, 
 		expect(after[upper].cellar.export).toBe(true);
 		expect(after[upper + 1].cellar.export).toBeUndefined();
 	}).toPass({ timeout: 15_000 });
+});
+
+/** Every cell's `cellar` namespace for notebook `nb`, in document order, from the SERVER model. */
+async function serverCellarOf(page: Page, nb: string): Promise<Record<string, unknown>[]> {
+	return page.evaluate(async (path) => {
+		const res = await fetch(`/api/notebooks?path=${encodeURIComponent(path)}`);
+		const body = await res.json();
+		return (body.notebook.cells as { metadata?: { cellar?: Record<string, unknown> } }[]).map(
+			(c) => c.metadata?.cellar ?? {}
+		);
+	}, nb);
+}
+
+const CHAT_C1 = 'c11e0001-0000-4000-8000-000000000001';
+const CHAT_C2 = 'c11e0002-0000-4000-8000-000000000002';
+
+test('the gap strip and the bottom add row create a CHAT cell - no type menu involved', async ({ page }) => {
+	// A notebook of this test's own, so the default notebook's accumulated cells
+	// never shift what "the gap above the second cell" addresses.
+	const nb = 'chat-create.ipynb';
+	writeFileSync(
+		join(workspace, nb),
+		JSON.stringify(
+			{
+				cells: [CHAT_C1, CHAT_C2].map((id, i) => ({
+					cell_type: 'code',
+					id,
+					metadata: {},
+					source: [`x${i} = ${i}`],
+					outputs: [],
+					execution_count: null
+				})),
+				metadata: { kernelspec: { display_name: 'python3', language: 'python', name: 'python3' } },
+				nbformat: 4,
+				nbformat_minor: 5
+			},
+			null,
+			1
+		)
+	);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator(`[data-testid="tree-file"][data-path="${nb}"]`).click();
+	await expect(page.locator(`[data-testid="cell"][data-cell-id="${CHAT_C2}"]`)).toBeVisible({ timeout: 30_000 });
+	const cells = page.getByTestId('cell');
+	await expect(cells).toHaveCount(2);
+
+	// --- Gap strip: the hover-between control above cell 2 inserts a chat cell. ---
+	// Scope the gap to CHAT_C2's own row wrapper, never an ordinal over every gap.
+	const gapAboveC2 = page
+		.locator(`[data-testid="cell"][data-cell-id="${CHAT_C2}"]`)
+		.locator('..')
+		.getByTestId('insert-between');
+	await gapAboveC2.hover();
+	await gapAboveC2.getByTestId('insert-chat').click();
+	await expect(cells).toHaveCount(3);
+	// The new cell landed BETWEEN the two, and IS a chat cell (the badge is the
+	// user-facing identity; the tag is asserted on the server model below).
+	await expect(cells.nth(1).getByTestId('chat-badge')).toBeVisible();
+
+	// --- Bottom add row: the labelled Chat button appends a chat cell. ---
+	await page.getByTestId('add-chat').click();
+	await expect(cells).toHaveCount(4);
+	await expect(cells.nth(3).getByTestId('chat-badge')).toBeVisible();
+
+	// Both persisted as TAGGED code cells (`cellar.language`), the same shape the
+	// type menu writes - one create path, not a second kind of chat cell.
+	await expect(async () => {
+		const cellar = await serverCellarOf(page, nb);
+		expect(cellar.length).toBe(4);
+		expect(cellar[1].language).toBe('chat');
+		expect(cellar[3].language).toBe('chat');
+		expect(cellar[0].language).toBeUndefined();
+	}).toPass({ timeout: 15_000 });
+
+	// The tag survives to DISK through clean-on-save: a reload renders both chat
+	// badges again from the reopened file.
+	await page.reload();
+	await expect(page.locator(`[data-testid="cell"][data-cell-id="${CHAT_C2}"]`)).toBeVisible({ timeout: 30_000 });
+	await expect(cells.nth(1).getByTestId('chat-badge')).toBeVisible();
+	await expect(cells.nth(3).getByTestId('chat-badge')).toBeVisible();
+});
+
+test('a .py notebook offers NO chat add control, while Code and Markdown stay', async ({ page }) => {
+	// Databricks source format: read through the helper's pure-text converter, so
+	// this needs no jupytext install. Such a document cannot HOLD a chat cell
+	// (`assertCanHoldType`), so a control offering one must not render at all.
+	writeFileSync(
+		join(workspace, 'dbx_nb.py'),
+		'# Databricks notebook source\nprint(1)\n\n# COMMAND ----------\n\nprint(2)\n'
+	);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator('[data-testid="tree-file"][data-path="dbx_nb.py"]').click();
+	const cells = page.getByTestId('cell');
+	await expect(cells).toHaveCount(2, { timeout: 30_000 });
+
+	// Bottom add row: Code and Markdown render, Chat does not.
+	await expect(page.getByTestId('add-cell')).toBeVisible();
+	await expect(page.getByTestId('add-markdown')).toBeVisible();
+	await expect(page.getByTestId('add-chat')).toHaveCount(0);
+
+	// Gap strip: hovering reveals Code/Markdown, and no Chat button exists.
+	const gap = cells.nth(1).locator('..').getByTestId('insert-between');
+	await gap.hover();
+	await expect(gap.getByTestId('insert-code')).toBeVisible();
+	await expect(gap.getByTestId('insert-markdown')).toBeVisible();
+	await expect(gap.getByTestId('insert-chat')).toHaveCount(0);
+
+	// The withheld control is a REFUSAL mirror, not a broken row: inserting a code
+	// cell from this same gap still works on a .py notebook.
+	await gap.getByTestId('insert-code').click();
+	await expect(cells).toHaveCount(3);
 });
