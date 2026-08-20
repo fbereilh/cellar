@@ -30,6 +30,7 @@
  * the server setter, the MCP surface and the UI select, so the three cannot
  * drift) and the importability rule the export section renders.
  */
+import { classifyRootPath, type RootShape } from './notebookRoot';
 
 /** Where an export target's path is measured from. */
 export type ExportBase = 'workspace' | 'notebook' | 'git';
@@ -70,17 +71,32 @@ export const EXPORT_BASE_LABELS: Record<ExportBase, string> = {
  *  - no resolved target, or no declared root → null. With the default root the
  *    kernel runs at the workspace root, and a workspace-contained module is
  *    always under it - the everyday case costs no chrome.
- *  - an EXTERNAL root (`../…` or absolute - the same declaration-shape test the
- *    root picker's stand-in uses) can never contain a workspace file: a root
- *    that ENCLOSES the workspace is refused at admission (`enclosesWorkspace`),
- *    so the module is provably outside the kernel's import scope → warn.
+ *  - a root that is not workspace-relative can never contain a workspace file: a
+ *    root that ENCLOSES the workspace is refused at admission
+ *    (`enclosesWorkspace`), so the module is provably outside the kernel's
+ *    import scope → warn.
  *  - an in-workspace root contains the module iff the resolved path sits under
  *    it → warn otherwise.
+ *
+ * WHICH of those a declaration is comes from `classifyRootPath`, the one
+ * browser-safe owner of that rule, never a local prefix test: the repo already
+ * carries source guards against re-deriving it after two copies disagreed. A
+ * declaration that owner REFUSES outright (a `~` path, which Cellar never
+ * expands) is not a usable in-workspace root either, so it warns like any other
+ * root that cannot contain the module - a throw here would take down the whole
+ * notebook render tree, which mounts no error boundary.
  */
 export function exportImportWarning(resolved: string | null, root: string | null): string | null {
 	if (!resolved || !root) return null;
-	const external = root.startsWith('../') || root.startsWith('/') || root === '..';
-	const under = !external && (resolved === root || resolved.startsWith(root + '/'));
+	let shape: RootShape;
+	try {
+		shape = classifyRootPath(root);
+	} catch {
+		shape = { kind: 'outside', raw: root };
+	}
+	if (shape.kind === 'none') return null;
+	const under =
+		shape.kind === 'inside' && (resolved === shape.rel || resolved.startsWith(shape.rel + '/'));
 	if (under) return null;
 	return `the module lands outside the code root (${root}), so this notebook's kernel cannot import it - import resolves from the code root`;
 }

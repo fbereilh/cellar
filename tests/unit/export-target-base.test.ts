@@ -450,4 +450,23 @@ describe('exportImportWarning (the importability rule)', () => {
 		const { exportImportWarning } = exportTargetLib;
 		expect(exportImportWarning('roots/pr10/x.py', 'roots/pr1')).toMatch(/cannot import/);
 	});
+
+	it('asks the one root-shape owner, so a canonicalizable declaration still matches', () => {
+		const { exportImportWarning } = exportTargetLib;
+		// `classifyRootPath` unifies separators and drops `.` segments, so these are
+		// the SAME root as `roots/pr1` and must not warn.
+		expect(exportImportWarning('roots/pr1/lib/x.py', './roots/pr1')).toBeNull();
+		expect(exportImportWarning('roots/pr1/lib/x.py', 'roots/pr1/')).toBeNull();
+		// `.` IS the workspace root, i.e. no declaration at all.
+		expect(exportImportWarning('lib/x.py', '.')).toBeNull();
+	});
+
+	it('never throws on a declaration the shape owner REFUSES, and warns instead', () => {
+		const { exportImportWarning } = exportTargetLib;
+		// A hand-edited `~` root reaches the browser verbatim (`readRoot` returns an
+		// unnormalizable value as-is) and this runs inside a render-time $derived, which
+		// mounts no error boundary - so a throw here would blank the whole notebook.
+		expect(() => exportImportWarning('lib/x.py', '~/elsewhere')).not.toThrow();
+		expect(exportImportWarning('lib/x.py', '~/elsewhere')).toMatch(/cannot import/);
+	});
 });

@@ -1977,8 +1977,37 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		cells: marked,
 		count: marked.length,
 		...where,
-		...moduleWarning(target, where.export_target, wrote)
+		...moduleWarning(target, where, wrote)
 	};
+}
+
+/** What every export tool reports about WHERE the marks land. */
+interface ExportTargetFields {
+	/** The RESOLVED workspace-relative module, or null (unset, or unresolvable). */
+	export_target: string | null;
+	/** The stored base, present only when it is not the `workspace` default. */
+	export_base?: string;
+	/** The STORED spelling, measured from `export_base`. Present with it. */
+	export_path?: string;
+	/** Why a CONFIGURED target cannot resolve - the other reading of a null target. */
+	export_target_error?: string;
+	/** Marks a target that came from a cell directive rather than the setting. */
+	export_target_source?: 'default_exp';
+}
+
+/**
+ * The arguments that would re-set THIS target, in the namespace `set_export_target`
+ * reads them - never the resolved path, which is a different namespace once a base
+ * is in play. Passing the resolved path back under a `notebook`/`git` base resolves
+ * it a second time against that base and names a DIFFERENT file; passing it with no
+ * base silently rewrites the notebook's persisted base to `workspace` and drops
+ * `export_base` from the committed `.ipynb`. So an instruction must name the pair.
+ */
+function setExportTargetArgs(where: ExportTargetFields): string {
+	const stored = where.export_path ?? where.export_target;
+	return where.export_base && where.export_base !== 'workspace'
+		? `path "${stored}" and base "${where.export_base}"`
+		: `path "${stored}"`;
 }
 
 /**
@@ -2010,7 +2039,7 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
  * being read as the notebook SETTING: a directive lives in a cell, so
  * `set_export_target(null)` cannot clear it.
  */
-function exportTargetFields(nb?: string | null) {
+function exportTargetFields(nb?: string | null): ExportTargetFields {
 	const info = exportTargetInfo(nb);
 	if (!info) return { export_target: null as string | null };
 	const sourceFlag =
@@ -2106,7 +2135,8 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * clobber guard exists to protect - so the "left on disk" wording is reserved for
  * a file Cellar really generated; anything else reads as no module of ours.
  */
-function moduleWarning(target: string, exportTarget: string | null, wrote: boolean) {
+function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean) {
+	const exportTarget = where.export_target;
 	const failed = moduleFailure(target, exportTarget);
 	if ('module' in failed) return failed;
 	if (!exportTarget) return {};
@@ -2115,7 +2145,7 @@ function moduleWarning(target: string, exportTarget: string | null, wrote: boole
 		return {
 			module: {
 				regenerated: false as const,
-				reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - edit a marked cell, or re-call set_export_target with the same path, to write it`
+				reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - edit a marked cell, or re-call set_export_target with ${setExportTargetArgs(where)}, to write it`
 			}
 		};
 	}

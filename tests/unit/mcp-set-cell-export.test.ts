@@ -696,6 +696,63 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 	});
 
 	/**
+	 * The remedy that branch names must be EXECUTABLE, i.e. expressed in the namespace
+	 * `set_export_target` reads its `path` in. `export_target` is the RESOLVED
+	 * workspace-relative module while the setter measures `path` from `base`, so once
+	 * a notebook uses a non-workspace base the two are different namespaces: passing
+	 * the resolved path back under the reported base resolves it a SECOND time and
+	 * names a different file, and passing it with no base silently rewrites the
+	 * notebook's persisted base to `workspace`. The advice therefore names the stored
+	 * spelling together with its base - and this test follows it literally.
+	 */
+	it('names a remedy in the base it was reported under, and following it lands the same file', async () => {
+		mkdirSync(join(WS, 'sub'), { recursive: true });
+		const { target, code } = await makeNotebook('sub/module-base.ipynb');
+		svc.setExportTarget('helpers.py', target, 'notebook');
+		expect(svc.setCellExport([code[0]], true, target).ok).toBe(true);
+
+		// The stored spelling and the resolved module really are different strings.
+		const where = svc.setCellExport([code[0]], true, target);
+		expect(where).toMatchObject({ export_target: 'sub/helpers.py', export_base: 'notebook', export_path: 'helpers.py' });
+		expect(readFileSync(join(WS, 'sub/helpers.py'), 'utf8')).toContain('def one():');
+
+		unlinkSync(join(WS, 'sub/helpers.py'));
+		const after = svc.setCellExport([code[0]], true, target);
+		const reason = after.ok ? (after.module?.reason ?? '') : '';
+		expect(reason).toContain('wrote none');
+		// The arguments to pass back, not the resolved path, which would name
+		// sub/sub/helpers.py under this same base.
+		expect(reason).toContain('path "helpers.py"');
+		expect(reason).toContain('base "notebook"');
+		expect(reason).not.toContain('path "sub/helpers.py"');
+
+		// Following it restores the module at the SAME file, and leaves the notebook's
+		// persisted base untouched - the committed .ipynb keeps its spelling.
+		svc.setExportTarget('helpers.py', target, 'notebook');
+		expect(readFileSync(join(WS, 'sub/helpers.py'), 'utf8')).toContain('def one():');
+		expect(existsSync(join(WS, 'sub/sub/helpers.py'))).toBe(false);
+		const cellar = JSON.parse(readFileSync(target, 'utf8')).metadata.cellar;
+		expect(cellar).toMatchObject({ export_target: 'helpers.py', export_base: 'notebook' });
+	});
+
+	/**
+	 * A workspace-base notebook is the legacy shape and its remedy stays a bare path:
+	 * `export_base`/`export_path` are absent from the payload there, so naming a base
+	 * would name a field the agent cannot read back.
+	 */
+	it('names no base for the workspace default', async () => {
+		const { target, code } = await makeNotebook('module-ws-base.ipynb');
+		svc.setExportTarget('lib/ws.py', target);
+		expect(svc.setCellExport([code[0]], true, target).ok).toBe(true);
+		unlinkSync(join(WS, 'lib/ws.py'));
+
+		const after = svc.setCellExport([code[0]], true, target);
+		const reason = after.ok ? (after.module?.reason ?? '') : '';
+		expect(reason).toContain('path "lib/ws.py"');
+		expect(reason).not.toContain('base "');
+	});
+
+	/**
 	 * `exportPy` writes without going through `persist`, so it never refreshed the
 	 * record `autoExportPy` keeps. Left standing, a failure the user then FIXED and
 	 * resolved with the manual button was still reported by the next idempotent
