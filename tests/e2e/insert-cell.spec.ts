@@ -304,6 +304,29 @@ async function serverCellarOf(page: Page, nb: string): Promise<Record<string, un
 const CHAT_C1 = 'c11e0001-0000-4000-8000-000000000001';
 const CHAT_C2 = 'c11e0002-0000-4000-8000-000000000002';
 
+/**
+ * The ACTIVE pane's nodes only. The tab session is server-owned `.cellar/`
+ * state, so a fresh context still restores every notebook earlier tests opened,
+ * all kept mounted-but-hidden - an unscoped `getByTestId` counts (and, under
+ * strict mode, refuses to click through) the hidden panes' copies too.
+ */
+function vis(page: Page, testId: string): Locator {
+	return page.locator(`[data-testid="${testId}"]:visible`);
+}
+
+/**
+ * Open `path` from the file tree and wait for `opened` to show. Retried,
+ * because the server-owned tab-session restore lands at hydration, after the
+ * first paint - a click landing before it is wiped when the restored tab set
+ * replaces the preview tab it just opened.
+ */
+async function openFromTree(page: Page, path: string, opened: Locator): Promise<void> {
+	await expect(async () => {
+		await page.locator(`[data-testid="tree-file"][data-path="${path}"]`).click();
+		await expect(opened).toBeVisible({ timeout: 2_000 });
+	}).toPass({ timeout: 30_000 });
+}
+
 test('the gap strip and the bottom add row create a CHAT cell - no type menu involved', async ({ page }) => {
 	// A notebook of this test's own, so the default notebook's accumulated cells
 	// never shift what "the gap above the second cell" addresses.
@@ -329,9 +352,8 @@ test('the gap strip and the bottom add row create a CHAT cell - no type menu inv
 		)
 	);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await page.locator(`[data-testid="tree-file"][data-path="${nb}"]`).click();
-	await expect(page.locator(`[data-testid="cell"][data-cell-id="${CHAT_C2}"]`)).toBeVisible({ timeout: 30_000 });
-	const cells = page.getByTestId('cell');
+	await openFromTree(page, nb, page.locator(`[data-testid="cell"][data-cell-id="${CHAT_C2}"]`));
+	const cells = vis(page, 'cell');
 	await expect(cells).toHaveCount(2);
 
 	// --- Gap strip: the hover-between control above cell 2 inserts a chat cell. ---
@@ -348,7 +370,7 @@ test('the gap strip and the bottom add row create a CHAT cell - no type menu inv
 	await expect(cells.nth(1).getByTestId('chat-badge')).toBeVisible();
 
 	// --- Bottom add row: the labelled Chat button appends a chat cell. ---
-	await page.getByTestId('add-chat').click();
+	await vis(page, 'add-chat').click();
 	await expect(cells).toHaveCount(4);
 	await expect(cells.nth(3).getByTestId('chat-badge')).toBeVisible();
 
@@ -379,14 +401,18 @@ test('a .py notebook offers NO chat add control, while Code and Markdown stay', 
 		'# Databricks notebook source\nprint(1)\n\n# COMMAND ----------\n\nprint(2)\n'
 	);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await page.locator('[data-testid="tree-file"][data-path="dbx_nb.py"]').click();
-	const cells = page.getByTestId('cell');
-	await expect(cells).toHaveCount(2, { timeout: 30_000 });
+	const cells = vis(page, 'cell');
+	// `print(1)` appears in no other notebook, so it is the "dbx really opened"
+	// signal (a bare visible-cell count is satisfied by the restored .ipynb tab).
+	await openFromTree(page, 'dbx_nb.py', cells.filter({ hasText: 'print(1)' }).first());
+	await expect(cells).toHaveCount(2);
 
-	// Bottom add row: Code and Markdown render, Chat does not.
-	await expect(page.getByTestId('add-cell')).toBeVisible();
-	await expect(page.getByTestId('add-markdown')).toBeVisible();
-	await expect(page.getByTestId('add-chat')).toHaveCount(0);
+	// Bottom add row: Code and Markdown render, Chat does not (visible-scoped:
+	// a hidden .ipynb pane restored from the server tab session HAS the button,
+	// and counting it would pass this test against a broken gate).
+	await expect(vis(page, 'add-cell')).toBeVisible();
+	await expect(vis(page, 'add-markdown')).toBeVisible();
+	await expect(vis(page, 'add-chat')).toHaveCount(0);
 
 	// Gap strip: hovering reveals Code/Markdown, and no Chat button exists.
 	const gap = cells.nth(1).locator('..').getByTestId('insert-between');
