@@ -87,7 +87,7 @@ import { currentSessionId } from './kernel';
 import { listCells } from './notebook';
 import { projectPython } from './databricks';
 import { computeStaleness } from '../staleness';
-import { isSqlCell } from '../cellLanguage';
+import { isChatCell, isSqlCell } from '../cellLanguage';
 import { hasAutoreloadMagic, normalizeForAnalysis } from './magics';
 import { parseSqlCell } from './sql';
 import { importBindingNames } from './importBindings';
@@ -672,8 +672,12 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 	// SYNTHETIC contribution instead (below): their run really does bind names in the
 	// kernel, so the graph must see those defines or a Python cell reading a SQL
 	// result gets no upstream edge and never goes stale when the query is edited.
+	// CHAT cells are code cells on disk but their source is English prose - it must
+	// never reach the Python probe (a guaranteed parse failure, and prose defines
+	// nothing). Unlike SQL they bind NO kernel names either, so there is no
+	// synthetic contribution: a chat cell simply has no dataflow at all.
 	const sql = cells.filter((c) => c.cell_type === 'code' && isSqlCell(c));
-	const code = cells.filter((c) => c.cell_type === 'code' && !isSqlCell(c));
+	const code = cells.filter((c) => c.cell_type === 'code' && !isSqlCell(c) && !isChatCell(c));
 	// `%autoreload` is a KERNEL-GLOBAL setting, so its effect on the import-binding
 	// exemption is notebook-wide, not cell-local: with it armed, re-running `import
 	// mymod` re-imports a changed module instead of handing back the `sys.modules`

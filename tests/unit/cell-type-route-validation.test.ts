@@ -83,7 +83,10 @@ describe('PATCH /api/cells/[id] - cell_type vocabulary', () => {
 			expect(res.status).toBe(200);
 			expect(await res.json()).toEqual({ ok: true });
 		}
-		expect(typesOf(nb)).toEqual(['raw', 'raw']);
+		// The loop leaves the cell as the LAST vocabulary entry ('chat', an
+		// nbformat code cell tagged cellar.language='chat').
+		expect(typesOf(nb)).toEqual(['raw', 'code']);
+		expect(nbmod.listCells(nb)[1].metadata?.cellar?.language).toBe('chat');
 	});
 
 	it('still applies the other fields when cell_type is absent', async () => {
@@ -135,8 +138,8 @@ describe('POST /api/cells - cellType vocabulary', () => {
 });
 
 describe('the vocabulary itself', () => {
-	it('is exactly the four logical types, and rejects everything else', () => {
-		expect([...LOGICAL_CELL_TYPES].sort()).toEqual(['code', 'markdown', 'raw', 'sql']);
+	it('is exactly the five logical types, and rejects everything else', () => {
+		expect([...LOGICAL_CELL_TYPES].sort()).toEqual(['chat', 'code', 'markdown', 'raw', 'sql']);
 		for (const t of LOGICAL_CELL_TYPES) expect(isLogicalCellTypeName(t)).toBe(true);
 		for (const bad of [...BAD_TYPES, null, undefined]) expect(isLogicalCellTypeName(bad)).toBe(false);
 	});

@@ -7,11 +7,16 @@
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
 	import {
+		CHAT_LANGUAGE,
+		isChatCell,
 		isLogicalCellType,
+		isPyUnsupportedType,
+		languageTagFor,
 		nbCellType,
-		RAW_UNSUPPORTED_REASON,
+		PY_UNSUPPORTED_TYPES,
 		SQL_LANGUAGE,
-		TEXT_NOTEBOOK_RAW_MESSAGE
+		textNotebookTypeMessage,
+		textNotebookTypeReason
 	} from '$lib/cellLanguage';
 	import {
 		applyGesture,
@@ -46,7 +51,7 @@
 	import type { ClientEvent } from '$lib/events-client';
 	import type { Folding } from '$lib/headings';
 	import type { StalenessMap } from '$lib/staleness';
-	import { codeIdsAll, codeIdsAbove } from '$lib/runTargets';
+	import { chatSkipNotice, runTargets, runTargetsAbove, type RunTargets } from '$lib/runTargets';
 	import type { ClipboardCell } from '$lib/cellClipboard';
 
 	interface Props {
@@ -1593,7 +1598,9 @@
 						? 'raw'
 						: ev.language === SQL_LANGUAGE
 							? 'sql'
-							: 'code';
+							: ev.language === CHAT_LANGUAGE
+								? 'chat'
+								: 'code';
 			applyCellTypeLocally(ev.cellId, logical);
 		} else if (ev.type === 'cell:cleared') {
 			const cell = findCell(ev.cellId);
@@ -1871,7 +1878,7 @@
 	 * same click; the server dedupes authoritatively (`run:duplicate`), because a
 	 * second tab or an agent can ask for the same cell at the same moment.
 	 */
-	async function runCell(id: string, source: string) {
+	async function runCell(id: string, source: string): Promise<void> {
 		const cell = findCell(id);
 		if (!cell) return;
 		// Markdown "runs" by rendering client-side (in the Cell) — no kernel.
@@ -1885,7 +1892,15 @@
 			return;
 		}
 		if (runningId === id || queued[id] != null) return;
-		onRunStart?.(path, id);
+		// A CHAT run is deliberately NOT reported to the shell's kernel counters: it
+		// touches no kernel (no session stamp, staleness n/a), and `onRunStart` is
+		// what makes the navbar badge assert a live BUSY kernel and optimistically
+		// mark one started. Asking a question in a notebook that never booted one
+		// would otherwise read "busy" for the whole reply. The two callbacks stay
+		// PAIRED - skipping the start means skipping the end - so the in-flight
+		// count is never left standing.
+		const kernelRun = !isChatCell(cell);
+		if (kernelRun) onRunStart?.(path, id);
 		cell.source = source;
 		// The run's own lifecycle, learned from the server: `started` flips on the
 		// `run:start` frame. Everything that mutates this cell's outputs is gated on
@@ -1973,7 +1988,7 @@
 			// (here or in another tab), and clearing then would erase a live indicator.
 			// The `=== id` test additionally keeps an overlapping run's spinner alone.
 			if (started && runningId === id) clearRunning();
-			onRunEnd?.();
+			if (kernelRun) onRunEnd?.();
 			scheduleStaleness(); // this cell (and its dependents) may have changed staleness
 		}
 	}
@@ -2006,6 +2021,11 @@
 	// execution order — which is dependency order for these actions (a cell's
 	// upstreams always precede it), so downstream cells run against fresh inputs.
 	//
+	// No CHAT cell reaches this loop: every caller selects through `$lib/runTargets`
+	// (which skips them) or off staleness (where a chat cell reads `n/a`), so a bulk
+	// run cannot spend the user's Claude quota - which is also why there is no
+	// rate-limit stop here. Asking a chat cell is the deliberate per-cell act.
+	//
 	// Awaiting each run is also what keeps a bulk run RELIABLE: at most ONE `/run`
 	// NDJSON stream is ever open, so a bulk run never oversubscribes the browser's
 	// ~6-connection HTTP/1.1 pool. The old "Run all" fired every cell's POST at once
@@ -2036,14 +2056,25 @@
 		}
 		refreshStaleness();
 	}
-	function codeIdsInRange(from: number, to: number): string[] {
-		return codeIdsAll(cells.slice(from, to));
+	/**
+	 * Drive one bulk selection: run what it selected, and SAY what it left alone.
+	 * `$lib/runTargets` owns which cells a bulk run skips (chat cells - see its
+	 * header); this is the half that has the notice channel, so every bulk action
+	 * reports through here rather than each deciding for itself whether to
+	 * mention the skip.
+	 */
+	function runSelection(sel: RunTargets) {
+		if (sel.chatSkipped.length) onNotice?.(chatSkipNotice(sel.chatSkipped.length));
+		return runCodeIds(sel.ids);
+	}
+	function targetsInRange(from: number, to: number): RunTargets {
+		return runTargets(cells.slice(from, to));
 	}
 	/** Run every code cell above the selected one (exclusive). */
 	function runAbove() {
 		const i = cells.findIndex((c) => c.id === activeId);
 		if (i < 0) return;
-		runCodeIds(codeIdsInRange(0, i));
+		runSelection(targetsInRange(0, i));
 	}
 	/**
 	 * Run every code cell above `id` (exclusive), in document order — the per-cell
@@ -2052,15 +2083,20 @@
 	 * A no-op on the first cell (nothing above).
 	 */
 	function runAboveCell(id: string) {
-		runCodeIds(codeIdsAbove(cells, id));
+		runSelection(runTargetsAbove(cells, id));
 	}
 	/** Run the selected cell and every code cell below it (Jupyter's "run all below"). */
 	function runBelow() {
 		const i = cells.findIndex((c) => c.id === activeId);
 		if (i < 0) return;
-		runCodeIds(codeIdsInRange(i, cells.length));
+		runSelection(targetsInRange(i, cells.length));
 	}
-	/** Run every STALE code cell, in document (dependency) order — clears staleness. */
+	/**
+	 * Run every STALE code cell, in document (dependency) order — clears staleness.
+	 * It needs no chat filter of its own: a chat cell's staleness is `n/a`, so it
+	 * is never in this list (the same reason MCP's `run_stale` inherits the batch
+	 * exclusion for free).
+	 */
 	function runStale() {
 		runCodeIds(cells.filter((c) => staleness[c.id]?.state === 'stale').map((c) => c.id));
 	}
@@ -2112,13 +2148,14 @@
 	function applyCellTypeLocally(id: string, cellType: LogicalCellType) {
 		const cell = findCell(id);
 		if (!cell) return;
-		// 'sql' is a code cell tagged cellar.language='sql' ($lib/cellLanguage.js);
-		// 'code' clears that tag. Reassign metadata (the cell may have had no cellar
-		// namespace) so the SQL/Python grammar switch in Cell.svelte reacts.
-		const isSql = cellType === 'sql';
+		// 'sql'/'chat' are code cells tagged cellar.language ($lib/cellLanguage.js's
+		// `languageTagFor`, the ONE tag rule); 'code' clears the tag. Reassign
+		// metadata (the cell may have had no cellar namespace) so the grammar switch
+		// in Cell.svelte reacts.
+		const lang = languageTagFor(cellType);
 		cell.cell_type = nbCellType(cellType);
 		const cellar = { ...(cell.metadata?.cellar ?? {}) };
-		if (isSql) cellar.language = 'sql';
+		if (lang) cellar.language = lang;
 		else delete cellar.language;
 		// The same drops the server's `applyCellType` makes - neither the imports role
 		// nor the export flag may sit on a cell holding no Python - mirrored here for
@@ -2126,7 +2163,7 @@
 		// half that skipped them would keep drawing the imports/export badge over a
 		// cell the server has already stripped, with no event able to correct it
 		// before reload. `hide_input` is KEPT, exactly as the server keeps it.
-		const runnable = cell.cell_type === 'code' && !isSql;
+		const runnable = cell.cell_type === 'code' && !lang;
 		if (!runnable) {
 			if (cellar.role === IMPORTS_ROLE) delete cellar.role;
 			if (cellar.export) delete cellar.export;
@@ -2137,16 +2174,17 @@
 
 	/**
 	 * Would `cellType` be refused by the server for this notebook? The optimistic
-	 * mirror of the doc layer's `assertCanHoldRaw` - the `clampMoveIndex` pairing -
+	 * mirror of the doc layer's `assertCanHoldType` - the `clampMoveIndex` pairing -
 	 * so a `.py` notebook never renders a conversion the server is about to refuse.
 	 * It SAYS so on the shell's transient status line rather than returning
 	 * silently, because the keyboard paths (`r`, the palette) send no request that
 	 * could fail and disable no control, so a bare return is indistinguishable from
-	 * a dead key. Enforcement stays the server's.
+	 * a dead key. WHICH types are refused is read from `$lib/cellLanguage`, never
+	 * listed again here. Enforcement stays the server's.
 	 */
 	function refuseUnsupportedType(cellType: LogicalCellType): boolean {
-		if (cellType !== 'raw' || !isPy) return false;
-		noticeRawUnsupported();
+		if (!isPy || !isPyUnsupportedType(cellType)) return false;
+		noticeUnsupportedType(cellType);
 		return true;
 	}
 
@@ -2669,13 +2707,14 @@
 	const KEEP_ONE_CELL_REASON = 'would-empty-notebook';
 
 	/**
-	 * Say why a raw conversion the client thought legal came back refused - the same
+	 * Say why a conversion the client thought legal came back refused - the same
 	 * silent-refusal gap `noticeKeepOneCell` closes, for the notebook's OTHER
-	 * write-side rule. The message is the SHARED one the server threw with, so the
-	 * two surfaces cannot describe the refusal differently.
+	 * write-side rule. The message is the SHARED one the server threw with, per
+	 * refused TYPE (a lost raw cell and a lost chat REPLY are different costs), so
+	 * the two surfaces cannot describe the refusal differently.
 	 */
-	function noticeRawUnsupported() {
-		onNotice?.(TEXT_NOTEBOOK_RAW_MESSAGE);
+	function noticeUnsupportedType(cellType: LogicalCellType) {
+		onNotice?.(textNotebookTypeMessage(cellType));
 	}
 
 	/**
@@ -2699,8 +2738,12 @@
 			.json()
 			.then((body) => body?.reason)
 			.catch(() => null);
-		if (reason === KEEP_ONE_CELL_REASON) noticeKeepOneCell();
-		else if (reason === RAW_UNSUPPORTED_REASON) noticeRawUnsupported();
+		if (reason === KEEP_ONE_CELL_REASON) return noticeKeepOneCell();
+		// The refusal codes are per TYPE, so the notice is looked up by matching the
+		// server's code back to the type it belongs to rather than by keeping a
+		// second copy of either the codes or the messages.
+		const refused = PY_UNSUPPORTED_TYPES.find((t) => textNotebookTypeReason(t) === reason);
+		if (refused) noticeUnsupportedType(refused);
 	}
 
 	// Copy/cut take the whole selection, in document order. The clipboard has always
@@ -2733,7 +2776,7 @@
 		// from an .ipynb can be pasted into a `.py` one, which cannot hold it. Refused
 		// for the WHOLE paste rather than by entry: pasting three of five cells and
 		// silently dropping the rest is the degrade this refusal exists to prevent.
-		if (isPy && entries.some((e) => e.cell_type === 'raw')) return noticeRawUnsupported();
+		if (isPy && entries.some((e) => e.cell_type === 'raw')) return noticeUnsupportedType('raw');
 		const i = cells.findIndex((c) => c.id === activeId);
 		// No selection (an empty notebook) → paste at the end.
 		let index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
@@ -3448,7 +3491,7 @@
 	// interrupt (`interruptGeneration`) so an interrupt stops the whole batch. Both
 	// the top-of-notebook button and the palette "Run all cells" call this.
 	function runAll() {
-		runCodeIds(codeIdsAll(cells));
+		runSelection(runTargets(cells));
 	}
 
 	// Clear every cell's outputs. Palette "Clear all outputs" and the top toolbar's

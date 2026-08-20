@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import { deleteCells, moveCells, setCellTypes } from '$lib/server/notebook';
-import { RAW_UNSUPPORTED_REASON, RawCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
+import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
 
 /**
  * Bulk cell operations over a multi-cell SELECTION — one request, one document
@@ -51,8 +51,8 @@ export async function POST({ request }) {
 		try {
 			return json({ ok: true, changed: setCellTypes(list, cellType, nb, originId) });
 		} catch (err) {
-			if (err instanceof RawCellTypeError)
-				return json({ ok: false, reason: RAW_UNSUPPORTED_REASON, message: err.message }, { status: 400 });
+			if (err instanceof TextNotebookCellTypeError)
+				return json({ ok: false, reason: err.reason, message: err.message }, { status: 400 });
 			throw err;
 		}
 	}

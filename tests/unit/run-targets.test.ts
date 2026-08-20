@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { codeIdsAll, codeIdsAbove, type RunTargetCell } from '../../src/lib/runTargets';
+import {
+	chatSkipNotice,
+	codeIdsAll,
+	codeIdsAbove,
+	runTargets,
+	runTargetsAbove,
+	type RunTargetCell
+} from '../../src/lib/runTargets';
 
 const nb: RunTargetCell[] = [
 	{ id: 'a', cell_type: 'markdown' },
@@ -52,5 +59,70 @@ describe('codeIdsAbove', () => {
 			{ id: 'target', cell_type: 'code' }
 		];
 		expect(codeIdsAbove(nb3, 'target')).toEqual([]);
+	});
+});
+
+/**
+ * A CHAT cell is an nbformat code cell tagged `cellar.language='chat'`, so the
+ * plain type test selected it - and running one is a billed model turn holding
+ * the notebook's queue slot, not a kernel execution. A bulk run leaves it alone
+ * and REPORTS it; a SQL cell (the other tagged code cell) still runs, since it
+ * really is a kernel execution.
+ */
+const chat = (id: string): RunTargetCell => ({ id, cell_type: 'code', metadata: { cellar: { language: 'chat' } } });
+const sql = (id: string): RunTargetCell => ({ id, cell_type: 'code', metadata: { cellar: { language: 'sql' } } });
+
+const mixed: RunTargetCell[] = [
+	{ id: 'md', cell_type: 'markdown' },
+	{ id: 'py1', cell_type: 'code' },
+	chat('chat1'),
+	sql('sql1'),
+	{ id: 'py2', cell_type: 'code' },
+	chat('chat2'),
+	{ id: 'rawc', cell_type: 'raw' }
+];
+
+describe('a bulk run skips chat cells and reports them', () => {
+	it('partitions: python and SQL run, chat is skipped and named', () => {
+		expect(runTargets(mixed)).toEqual({
+			ids: ['py1', 'sql1', 'py2'],
+			chatSkipped: ['chat1', 'chat2']
+		});
+	});
+
+	it('the id-only halves agree with the partition, so no caller can disagree', () => {
+		expect(codeIdsAll(mixed)).toEqual(runTargets(mixed).ids);
+		expect(codeIdsAll(mixed)).not.toContain('chat1');
+		expect(codeIdsAbove(mixed, 'py2')).toEqual(runTargetsAbove(mixed, 'py2').ids);
+	});
+
+	it('Run above reports only the chat cells ABOVE the target', () => {
+		// Above 'py2' (index 4): md, py1, chat1, sql1.
+		expect(runTargetsAbove(mixed, 'py2')).toEqual({ ids: ['py1', 'sql1'], chatSkipped: ['chat1'] });
+		// Above the first cell: nothing at all, so nothing to report.
+		expect(runTargetsAbove(mixed, 'md')).toEqual({ ids: [], chatSkipped: [] });
+		expect(runTargetsAbove(mixed, 'nope')).toEqual({ ids: [], chatSkipped: [] });
+	});
+
+	it('a notebook with no chat cell reports nothing (an ordinary run is unchanged)', () => {
+		expect(runTargets(nb)).toEqual({ ids: ['b', 'd', 'e'], chatSkipped: [] });
+	});
+
+	it('a batch of nothing BUT chat cells runs nothing and says why', () => {
+		const sel = runTargets([chat('c1'), chat('c2')]);
+		expect(sel.ids).toEqual([]);
+		expect(sel.chatSkipped).toEqual(['c1', 'c2']);
+	});
+});
+
+describe('the notice a skip is reported through', () => {
+	it('names the count, agrees in number, and points at the deliberate route', () => {
+		expect(chatSkipNotice(1)).toContain('1 chat cell');
+		expect(chatSkipNotice(1)).not.toContain('1 chat cells');
+		expect(chatSkipNotice(3)).toContain('3 chat cells');
+		for (const n of [1, 3]) {
+			expect(chatSkipNotice(n)).toMatch(/run/i);
+			expect(chatSkipNotice(n)).toMatch(/Run button/);
+		}
 	});
 });

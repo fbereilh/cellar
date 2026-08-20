@@ -588,6 +588,15 @@ to publish, e.g. inside a container.
 | `CELLAR_MCP_SESSION_IDLE_MS` | `1800000` (30 min) | Reap an idle MCP session after this long. |
 | `CELLAR_MCP_REAPER_INTERVAL_MS` | `300000` (5 min) | How often the MCP session reaper runs. |
 
+### Chat cells
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CELLAR_CHAT_TIMEOUT_MS` | `300000` (ms, = 5 min) | Wall-clock bound on one chat run before its `claude` child is killed. |
+| `CELLAR_CHAT_MAX_PROMPT_BYTES` | `600000` (~600 KB) | Largest transcript a chat run will send. Over it the run is **refused** (never truncated), naming the size and the two levers - clear outputs, or hide cells from AI. |
+| `CELLAR_CHAT_SLOTS` | `~/.cellar/claude` | Directory holding Cellar's own Claude account slots (each is a `CLAUDE_CONFIG_DIR`). Point it elsewhere to keep a test run away from your real accounts. |
+| `CELLAR_CHAT_LOGIN_RETAIN_MS` | `60000` (ms, = 60s) | How long a finished-but-unread sign-in attempt stays pollable before it is swept. |
+
 ### Advanced / rarely set
 
 | Variable | Default | Purpose |
@@ -800,14 +809,17 @@ spec files at a time. Install its browser once with `npx playwright install chro
   the output formats it belongs to. Change it back from the type label at the right of its
   toolbar, the command palette (*Change cell(s) to code*), or `y`/`m`/`r` in command mode
   (`r` is the chord that makes a cell raw in the first place).
-- **A cell will not become raw: "A .py notebook cannot hold a raw cell"** - a jupytext /
-  Databricks-source notebook is rebuilt from its cells on every save and the format has no
-  raw marker, so the declaration would be gone after a reload and the text would come back
-  in a **runnable** Python cell. Cellar refuses it instead - in the type menu (where Raw
-  isn't offered), on the `r` chord, and for an agent's `add_cell` / `set_cell_type`.
-  Convert the notebook to `.ipynb` (app menu → **Convert to .ipynb**) if you need one. The
-  same limit applies in the other direction: **Save as .py** writes a raw cell out as code,
-  so a Quarto notebook exported that way loses its frontmatter cell's type.
+- **A cell will not become raw or chat: "A .py notebook cannot hold a raw cell" / "...a chat
+  cell"** - a jupytext / Databricks-source notebook is rebuilt from its cells on every save,
+  and the format carries no raw marker and no cell metadata or outputs. So the declaration
+  would be gone after a reload: raw text would come back in a **runnable** Python cell, and a
+  chat cell would come back as runnable prose with its AI reply gone for good (no re-run
+  reproduces one). Cellar refuses both instead - in the type menu (where neither is offered)
+  and on the `r` chord; an agent's `add_cell` / `set_cell_type` is refused for raw, and cannot
+  ask for a chat cell at all (no agent write tool takes `chat`). Convert the notebook to
+  `.ipynb` (app menu → **Convert to .ipynb**) if you need one. The same limit applies to raw
+  in the other direction: **Save as .py** writes a raw cell out as code, so a Quarto notebook
+  exported that way loses its frontmatter cell's type.
 - **Find matched a cell but nothing is highlighted in it** - the match is inside a cell
   whose content is currently hidden - a cell collapsed to its header row, or a source
   match in a cell whose code is hidden by report view. Those matches are still counted,

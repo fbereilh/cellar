@@ -9,7 +9,7 @@
 	import { python } from '@codemirror/lang-python';
 	import { markdown } from '@codemirror/lang-markdown';
 	import { sql } from '@codemirror/lang-sql';
-	import { renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
+	import { renderChatReply, renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
 	import { EDITOR_THEME } from '$lib/editorTheme';
 	import StaticCode from '$lib/StaticCode.svelte';
 	import type { StaticLang } from '$lib/staticHighlight';
@@ -23,7 +23,7 @@
 	import { isExportCell } from '$lib/exportRole';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
-	import { isSqlCell, isRawCell, logicalCellType } from '$lib/cellLanguage';
+	import { isSqlCell, isRawCell, isChatCell, isPyUnsupportedType, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
 	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
@@ -235,6 +235,11 @@
 	// A SQL cell: a code cell tagged cellar.language='sql'. Its source is SQL, run
 	// against `spark` (see server/sql.js); the editor highlights it as SQL.
 	const isSql = $derived(isSqlCell(cell));
+	// A CHAT cell: a code cell tagged cellar.language='chat'. Its source is a
+	// question for the AI, run through the chat engine (server/chat/), never the
+	// kernel; the reply arrives as a markdown display_data output. Runnable like
+	// SQL - the run button IS "ask".
+	const isChat = $derived(isChatCell(cell));
 	// An nbformat `raw` cell: verbatim text Cellar never executes and never renders
 	// (Quarto/nbdev frontmatter, nbconvert directives). It has NO rendered mode -
 	// the deliberate contrast with markdown - so it is always shown as its source.
@@ -249,11 +254,13 @@
 	const typeLabel = $derived(
 		logicalType === 'sql'
 			? 'SQL'
-			: logicalType === 'markdown'
-				? 'markdown'
-				: logicalType === 'raw'
-					? 'raw'
-					: 'python3'
+			: logicalType === 'chat'
+				? 'chat'
+				: logicalType === 'markdown'
+					? 'markdown'
+					: logicalType === 'raw'
+						? 'raw'
+						: 'python3'
 	);
 	// The notebook's designated imports cell: user-choosable, marked in the toolbar
 	// with the "imports" badge, and free to live at any index. Only a Python code
@@ -631,6 +638,8 @@
 		html?: string;
 		/** ipywidgets model id (tqdm bar) — rendered live from the widget store. */
 		widget?: string;
+		/** Sanitized HTML of a `text/markdown` payload (a chat reply). */
+		markdownHtml?: string;
 		segments: TextSegment[] | null;
 	}
 
@@ -696,6 +705,29 @@
 				if (d['text/html']) {
 					return { tone: 'result', html: asText(d['text/html']), segments: null };
 				}
+				// A `text/markdown` payload renders like a markdown cell - through the
+				// shared, sanitizing markdown funnel - instead of showing raw
+				// markdown source. Browser-only like the markdown-cell render
+				// (DOMPurify needs a DOM); SSR falls through to the text/plain twin.
+				//
+				// BOTH renderers are OUTPUT renderers: nothing in a `text/markdown`
+				// payload fetches on render, whatever the cell's current type. That
+				// rule keys on PROVENANCE - this markdown was emitted by a machine,
+				// never authored by the user - because a cell's logical type is
+				// MUTABLE (retyping a chat cell to code KEEPS its outputs) and a
+				// foreign notebook's metadata is FORGEABLE, so neither could carry
+				// the guarantee. See `$lib/markdownNoFetch`.
+				//
+				// The one thing the CELL still decides is MATH: a chat cell's payload
+				// is the model's PROSE, where `$x$` means math, so it takes
+				// `renderChatReply`. Any other cell's is KERNEL OUTPUT - arbitrary
+				// data, where `display(Markdown('Revenue: $5 vs $1,200'))` must keep
+				// its dollar amounts - so it takes `renderOutputMarkdown` (math off),
+				// the same content-class split `renderTable` above already makes.
+				if (browser && d['text/markdown']) {
+					const md = asText(d['text/markdown']);
+					return { tone: 'result', markdownHtml: isChat ? renderChatReply(md) : renderOutputMarkdown(md), segments: null };
+				}
 				if (d['text/plain']) {
 					tone = 'result';
 					text = asText(d['text/plain']);
@@ -724,15 +756,20 @@
 	// So this map costs O(changed outputs), not O(all outputs) per frame — the
 	// append-only render that keeps a runaway cell from re-rendering its whole
 	// history each chunk. `renderOutput` is a pure function of its output, so
-	// caching by identity is sound; the WeakMap lets overwritten objects be GC'd.
-	const renderCache = new WeakMap<CellOutput, RenderedOutput>();
+	// caching by identity is sound EXCEPT for the one thing `renderOutput` reads
+	// besides its argument - `isChat`, which decides whether the markdown renderer
+	// above parses math - so the entry records the mode it was rendered in and a
+	// converted cell (code<->chat keeps its outputs) re-renders instead of serving
+	// the other content class's render. Both modes are no-fetch, so a conversion
+	// can never re-open the image channel either. The WeakMap lets overwritten
+	// objects be GC'd.
+	const renderCache = new WeakMap<CellOutput, { chat: boolean; rendered: RenderedOutput }>();
 	function renderOutputMemo(o: CellOutput): RenderedOutput {
-		let r = renderCache.get(o);
-		if (r === undefined) {
-			r = renderOutput(o);
-			renderCache.set(o, r);
-		}
-		return r;
+		const hit = renderCache.get(o);
+		if (hit && hit.chat === isChat) return hit.rendered;
+		const rendered = renderOutput(o);
+		renderCache.set(o, { chat: isChat, rendered });
+		return rendered;
 	}
 	const outputs = $derived((cell.outputs || []).map(renderOutputMemo));
 
@@ -961,21 +998,25 @@
 		typeMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
 		typeMenuEl.style.top = r.bottom + 4 + 'px';
 	}
-	// The cell-type menu options (Python / SQL / Markdown / Raw). This menu is the
-	// create-and-convert path for raw - there is deliberately no "+ Raw" insert
-	// button, a once-per-notebook type not being worth a third button on every gap.
+	// The cell-type menu options (Python / SQL / Chat / Markdown / Raw). This menu
+	// is the create-and-convert path for raw and chat - there is deliberately no
+	// "+ Raw" insert button, a once-per-notebook type not being worth a third
+	// button on every gap.
 	//
-	// Raw is DROPPED on a `.py` text notebook: such a document is rebuilt from its
-	// cells on every save and has no raw marker, so the server refuses it
-	// (`assertCanHoldRaw`) - and a notebook that cannot hold a raw cell must not be
-	// offered a control for one.
+	// Raw AND chat are DROPPED on a `.py` text notebook: such a document is rebuilt
+	// from its cells on every save, carrying neither the raw marker nor any
+	// `cellar` metadata or outputs, so the server refuses both (`assertCanHoldType`)
+	// - and a notebook that cannot hold a cell type must not be offered a control
+	// for one. WHICH types those are is read from `$lib/cellLanguage`, so the menu
+	// cannot drift from the writers' rule.
 	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
+		{ v: 'chat', label: 'Chat', hint: 'claude' },
 		{ v: 'markdown', label: 'Markdown', hint: 'text' },
 		{ v: 'raw', label: 'Raw', hint: 'verbatim' }
 	];
-	const typeOptions = $derived(isPy ? ALL_TYPE_OPTIONS.filter((o) => o.v !== 'raw') : ALL_TYPE_OPTIONS);
+	const typeOptions = $derived(isPy ? ALL_TYPE_OPTIONS.filter((o) => !isPyUnsupportedType(o.v)) : ALL_TYPE_OPTIONS);
 	function chooseType(type: LogicalCellType) {
 		typeMenuEl?.hidePopover();
 		if (type !== logicalType) onSetType(cell.id, type);
@@ -1191,19 +1232,24 @@
 	function langFor() {
 		if (cell.cell_type === 'markdown') return markdown();
 		if (isRaw) return [];
+		if (isChat) return markdown(); // a chat question is prose; markdown is its grammar
 		return isSql ? sql() : python();
 	}
 	// The same grammar choice, for the static (no-editor) render. Kept in lockstep
 	// with `langFor` so the read-only view highlights like the editor it precedes.
-	const staticLang = $derived<StaticLang>(isRaw ? 'plain' : isMarkdown ? 'markdown' : isSql ? 'sql' : 'python');
+	const staticLang = $derived<StaticLang>(
+		isRaw ? 'plain' : isMarkdown || isChat ? 'markdown' : isSql ? 'sql' : 'python'
+	);
 
-	// Reconfigure the editor language when the cell type OR its SQL/Python language
-	// toggles; after a manual cell_type toggle, drop into edit mode so the user sees
-	// the source. `isSql` is read so a code↔sql switch re-applies the grammar too.
+	// Reconfigure the editor language when the cell type OR its SQL/chat/Python
+	// language toggles; after a manual cell_type toggle, drop into edit mode so the
+	// user sees the source. `isSql`/`isChat` are read so a code↔sql/chat switch
+	// re-applies the grammar too (cell_type stays 'code' across it).
 	let prevType = cell.cell_type;
 	$effect(() => {
 		const type = cell.cell_type;
 		isSql; // track: code↔sql keeps cell_type 'code' but changes the grammar
+		isChat; // track: code↔chat likewise
 		if (view) view.dispatch({ effects: language.reconfigure(langFor()) });
 		if (type !== prevType) {
 			prevType = type;
@@ -1799,6 +1845,15 @@
 						data-testid="sql-badge">SQL</span
 					>
 				{/if}
+				{#if isChat}
+					<!-- Chat indicator: this cell asks the AI; running it sends the cells
+					     above (minus hidden ones) and streams the reply in as output. -->
+					<span
+						class="badge badge-xs ml-1.5 badge-soft badge-secondary font-medium"
+						title="Chat cell - running it sends the cells above (minus those hidden from AI) to Claude and shows the reply. Re-running always produces a new reply."
+						data-testid="chat-badge">chat</span
+					>
+				{/if}
 				{#if isRaw}
 					<!-- Raw indicator, deliberately NEUTRAL where the SQL badge is tinted:
 					     raw is not an execution mode, it is the absence of one. Without it
@@ -2042,7 +2097,7 @@
 							bind:this={typeBtnEl}
 							class="btn btn-ghost btn-xs flex h-5 min-h-0 items-center gap-0.5 px-1.5 font-mono text-[11px] font-normal text-base-content/40 hover:text-base-content/80"
 							onclick={openTypeMenu}
-							title="Change cell type (Python · SQL · Markdown · Raw)"
+							title="Change cell type (Python · SQL · Chat · Markdown · Raw)"
 							data-testid="type-toggle"
 						>
 							{typeLabel}
@@ -2293,6 +2348,12 @@
 										title={full ? 'Double-click to fit to width' : 'Double-click for full size'}
 										ondblclick={() => toggleFullImage(i)}
 									/>
+								</div>
+							{:else if o.markdownHtml != null}
+								<!-- A chat reply / Markdown() display: rendered prose, same
+								     container class as a rendered markdown cell. -->
+								<div class="cellar-md px-3 py-2 text-sm leading-relaxed" data-testid="output-markdown">
+									{@html o.markdownHtml}
 								</div>
 							{:else if o.segments}
 								{#each o.segments as seg}

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -142,6 +142,37 @@ describe('setOutputsLive keeps the live doc current without persisting', () => {
 		expect(nb.getCell(cell.id, path)?.outputs).toEqual(outputs);
 		// But nothing was persisted: disk is untouched until run:end (setOutputs).
 		expect(readFileSync(abs, 'utf8')).toBe(before);
+	});
+
+	it('is a silent no-op once the document is dropped and its file deleted', () => {
+		// It is a best-effort MIRROR reached from a flush interval and from the chat
+		// child's stdout handler, where a throw is an uncaught exception that kills
+		// the process carrying every kernel websocket and the SSE fan-out. Deleting
+		// a notebook in the explorer drops the doc and removes the file, and output
+		// already in flight keeps arriving.
+		const path = 'dropped-live.ipynb';
+		nb.createNotebook(path);
+		const cell = nb.listCells(path)[0];
+		const abs = join(WS, path);
+		nb.dropDocs(path);
+		rmSync(abs);
+
+		expect(() => nb.setOutputsLive(cell.id, [{ output_type: 'stream' as const, name: 'stdout', text: 'late' }], path)).not.toThrow();
+		// ...and it did not resurrect the entry `dropDocs` deliberately removed.
+		expect(() => nb.listCells(path)).toThrow(/notebook not found/);
+	});
+
+	it('does not resurrect a document that was dropped while its file survives', () => {
+		// The rename shape: `rekeyDocs` retires the old key, so a load would rebuild
+		// a doc from disk that nobody owns and stream this run's output into it.
+		const path = 'dropped-live-2.ipynb';
+		nb.createNotebook(path);
+		const cell = nb.listCells(path)[0];
+		nb.dropDocs(path);
+
+		nb.setOutputsLive(cell.id, [{ output_type: 'stream' as const, name: 'stdout', text: 'late' }], path);
+		// Reading it back LOADS it fresh from disk, which never held the mirror.
+		expect(nb.getCell(cell.id, path)?.outputs).toEqual([]);
 	});
 });
 

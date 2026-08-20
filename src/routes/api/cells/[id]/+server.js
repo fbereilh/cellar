@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setHideInput } from '$lib/server/notebook';
-import { RAW_UNSUPPORTED_REASON, RawCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
+import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
 
 /** Edit a cell's source, type ('code' | 'sql' | 'markdown' | 'raw'), imports-cell
  *  role, and/or its output-scroll choice in notebook `nb` (body field;
@@ -28,8 +28,8 @@ export async function PATCH({ params, request }) {
 		try {
 			setCellType(params.id, body.cell_type, body.nb, body.originId);
 		} catch (err) {
-			if (err instanceof RawCellTypeError)
-				return json({ ok: false, reason: RAW_UNSUPPORTED_REASON, message: err.message }, { status: 400 });
+			if (err instanceof TextNotebookCellTypeError)
+				return json({ ok: false, reason: err.reason, message: err.message }, { status: 400 });
 			throw err;
 		}
 	}

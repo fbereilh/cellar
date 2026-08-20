@@ -10,7 +10,7 @@
  * MARKDOWN, whose prose would lose its markers on the way too.
  *
  * The rule therefore lives at EVERY doc-layer WRITER that can put `raw` into a
- * document (`assertCanHoldRaw`: the two that convert a cell and the two that
+ * document (`assertCanHoldType`: the two that convert a cell and the two that
  * create one), so the type menu, the `r` chord, the bulk route, the REST routes
  * and every MCP add / convert tool are covered by ONE rule rather than by a check
  * each could forget.
@@ -25,7 +25,7 @@ import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TEXT_NOTEBOOK_RAW_MESSAGE, RawCellTypeError } from '../../src/lib/cellLanguage';
+import { TEXT_NOTEBOOK_RAW_MESSAGE, TextNotebookCellTypeError } from '../../src/lib/cellLanguage';
 
 const PY_BYTES = '# Databricks notebook source\nprint(1)\n\n# COMMAND ----------\n\nprint(2)\n';
 
@@ -76,7 +76,7 @@ beforeAll(async () => {
 describe('a .py notebook cannot hold a raw cell', () => {
 	it('REFUSES setCellType(raw), naming the cause — and writes nothing', () => {
 		const id = pyIds()[0];
-		expect(() => nbmod.setCellType(id, 'raw', PY)).toThrow(RawCellTypeError);
+		expect(() => nbmod.setCellType(id, 'raw', PY)).toThrow(TextNotebookCellTypeError);
 		expect(() => nbmod.setCellType(id, 'raw', PY)).toThrow(/\.py notebook cannot hold a raw cell/i);
 		// The message states the REAL cause (rebuilt from its cells) and the fix.
 		expect(() => nbmod.setCellType(id, 'raw', PY)).toThrow(/rebuilt from its CELLS/);
@@ -106,7 +106,7 @@ describe('a .py notebook cannot hold a raw cell', () => {
 
 	it('refuses a BULK retype for the whole batch — nothing is converted', () => {
 		const ids = pyIds();
-		expect(() => nbmod.setCellTypes(ids, 'raw', PY)).toThrow(RawCellTypeError);
+		expect(() => nbmod.setCellTypes(ids, 'raw', PY)).toThrow(TextNotebookCellTypeError);
 		// Not one cell half-retyped, and no `changed` list a client could read as a
 		// legitimate skip.
 		expect(nbmod.listCells(PY).map((c) => c.cell_type)).toEqual(['code', 'code']);
@@ -114,7 +114,7 @@ describe('a .py notebook cannot hold a raw cell', () => {
 
 	it('refuses CREATING one (addCell), so the add path cannot route around the convert path', () => {
 		const before = pyIds().length;
-		expect(() => nbmod.addCell(null, 'raw', PY)).toThrow(RawCellTypeError);
+		expect(() => nbmod.addCell(null, 'raw', PY)).toThrow(TextNotebookCellTypeError);
 		expect(pyIds().length).toBe(before);
 		// The types it CAN hold still add.
 		nbmod.addCell(null, 'markdown', PY);
@@ -123,10 +123,10 @@ describe('a .py notebook cannot hold a raw cell', () => {
 
 	it('refuses the OTHER creator too (addCellAt), so the guard holds by construction', () => {
 		// Its only caller passes 'code' today, so this is unreachable in practice - but
-		// `assertCanHoldRaw` claims to sit at every writer, and a second creator that
+		// `assertCanHoldType` claims to sit at every writer, and a second creator that
 		// merely happens not to be asked for raw is not that claim.
 		const before = pyIds().length;
-		expect(() => nbmod.addCellAt(0, 'raw', PY)).toThrow(RawCellTypeError);
+		expect(() => nbmod.addCellAt(0, 'raw', PY)).toThrow(TextNotebookCellTypeError);
 		expect(pyIds().length).toBe(before);
 		nbmod.addCellAt(0, 'code', PY);
 		expect(pyIds().length).toBe(before + 1);
@@ -158,7 +158,7 @@ describe('the MCP surface reports the refusal instead of a bare ok', () => {
 		const before = pyIds();
 		await expect(
 			svc.addCells([{ cell_type: 'code', source: 'x = 1' }, { cell_type: 'raw', source: '---\ntitle: t\n---' }], null, { nb: PY })
-		).rejects.toThrow(RawCellTypeError);
+		).rejects.toThrow(TextNotebookCellTypeError);
 		// All-or-nothing: the leading code spec did not land either.
 		expect(pyIds()).toEqual(before);
 	});
@@ -253,26 +253,27 @@ describe('the client half (source guards)', () => {
 
 	it('Cell.svelte renders NO Raw entry in the type menu of a .py notebook', () => {
 		const src = read('Cell.svelte');
-		// The menu iterates the FILTERED list, and the filter drops raw when isPy.
+		// The menu iterates the FILTERED list, and the filter drops every type a .py
+		// notebook cannot hold (raw, chat) when isPy - read from the shared rule.
 		expect(src).toMatch(/\{#each typeOptions as opt\}/);
-		expect(src).toMatch(/isPy\s*\?\s*ALL_TYPE_OPTIONS\.filter\(\(o\) => o\.v !== 'raw'\)/);
+		expect(src).toMatch(/isPy\s*\?\s*ALL_TYPE_OPTIONS\.filter\(\(o\) => !isPyUnsupportedType\(o\.v\)\)/);
 		// The unfiltered list is never rendered directly.
 		expect(src).not.toMatch(/\{#each ALL_TYPE_OPTIONS/);
 	});
 
 	it('LiveNotebook.svelte SAYS why a raw conversion did nothing, on every path that offers one', () => {
 		const src = read('LiveNotebook.svelte');
-		// The optimistic mirror of `assertCanHoldRaw`, in ONE predicate.
-		expect(src).toMatch(/function refuseUnsupportedType\(cellType: LogicalCellType\): boolean \{[\s\S]*?cellType !== 'raw' \|\| !isPy/);
+		// The optimistic mirror of `assertCanHoldType`, in ONE predicate.
+		expect(src).toMatch(/function refuseUnsupportedType\(cellType: LogicalCellType\): boolean \{[\s\S]*?!isPy \|\| !isPyUnsupportedType\(cellType\)/);
 		// The single-cell setter AND the multi-cell batch (`r`, the palette) consult
 		// it - a keystroke that sends no request disables no control, so a silent
 		// return reads as a dead key.
 		expect(src).toMatch(/async function setType\(id: string, cellType: LogicalCellType\) \{\s*\n\s*if \(refuseUnsupportedType\(cellType\)\) return;/);
 		expect(src).toMatch(/if \(refuseUnsupportedType\(cellType\)\) return;\s*\n\s*\/\/ A cell already of the target type/);
-		expect(src).toMatch(/if \(isPy && entries\.some\(\(e\) => e\.cell_type === 'raw'\)\) return noticeRawUnsupported\(\)/);
+		expect(src).toMatch(/if \(isPy && entries\.some\(\(e\) => e\.cell_type === 'raw'\)\) return noticeUnsupportedType\('raw'\)/);
 		// And a refusal this tab did not predict is still surfaced + resynced: the
 		// route emits no `cell:type`, and this tab would echo-suppress it anyway.
-		expect(src).toMatch(/reason === RAW_UNSUPPORTED_REASON\) noticeRawUnsupported\(\)/);
+		expect(src).toMatch(/PY_UNSUPPORTED_TYPES\.find\(\(t\) => textNotebookTypeReason\(t\) === reason\)[\s\S]*?noticeUnsupportedType\(refused\)/);
 		expect(src).toMatch(/if \(!res \|\| !res\.ok\) \{\s*\n\s*await noticeRefusal\(res\);\s*\n\s*await load\(\);/);
 	});
 });
@@ -286,7 +287,7 @@ describe('NO path can leave a .py notebook holding a degraded raw cell', () => {
 			() => nbmod.addCell(id, 'raw', PY),
 			() => nbmod.addCellAt(0, 'raw', PY)
 		]) {
-			expect(write).toThrow(RawCellTypeError);
+			expect(write).toThrow(TextNotebookCellTypeError);
 		}
 		expect(nbmod.listCells(PY).every((c) => c.cell_type !== 'raw')).toBe(true);
 		expect(readFileSync(PY, 'utf8')).not.toMatch(/raw/i);

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, setContext } from 'svelte';
 	import Databricks from '$lib/Databricks.svelte';
+	import ChatPanel from '$lib/ChatPanel.svelte';
 	import Environment from '$lib/Environment.svelte';
 	import Checkpoints from '$lib/Checkpoints.svelte';
 	import GitNotebooks from '$lib/GitNotebooks.svelte';
@@ -180,7 +181,7 @@
 	// Which foldable sections are open. All start expanded (agent panel collapsed),
 	// then overridden by the persisted state on mount.
 	const OPEN_KEY = 'cellar-sidebar-open';
-	let open = $state<Record<string, boolean>>({ files: true, git: false, kernels: true, databricks: false, environment: false, agent: false, outline: true, history: false, vars: true, search: false });
+	let open = $state<Record<string, boolean>>({ files: true, git: false, kernels: true, databricks: false, chat: false, environment: false, agent: false, outline: true, history: false, vars: true, search: false });
 	function toggle(k: string) {
 		open[k] = !open[k];
 		persist(OPEN_KEY, open);
@@ -194,6 +195,14 @@
 	});
 	// Databricks component handle (bind:this) for the header's refresh button.
 	let databricksComp = $state<{ refresh: () => void } | null>(null);
+
+	// Same lazy-mount latch for the Chat panel: its status read spawns `claude
+	// auth status` per account slot, which a user who never opens it never pays.
+	let chatMounted = $state(false);
+	let chatComp = $state<{ refresh: () => void } | null>(null);
+	$effect(() => {
+		if (open.chat) chatMounted = true;
+	});
 
 	// Same lazy-mount latch for the Environment panel: it spawns a python
 	// subprocess to list packages, so a user who never opens it never pays for it.
@@ -1096,6 +1105,23 @@
 	{/if}
 {/snippet}
 
+{#snippet chatSection()}
+	<div class="flex items-center">
+		{@render header('chat', 'Chat', 'section-chat')}
+		{#if chatMounted}
+			{@render refreshBtn(() => chatComp?.refresh?.(), 'Refresh chat account status')}
+		{/if}
+	</div>
+	<!-- Mounted lazily on first open, then kept mounted (hidden) so collapsing the
+	     section does not throw away a sign-in attempt in progress. Until then it
+	     costs nothing: its status read spawns `claude auth status` per slot. -->
+	{#if chatMounted}
+		<div class:hidden={!open.chat}>
+			<ChatPanel bind:this={chatComp} visible={open.chat} />
+		</div>
+	{/if}
+{/snippet}
+
 {#snippet environmentSection()}
 	<div class="flex items-center">
 		{@render header('environment', 'Environment', 'section-environment')}
@@ -1521,6 +1547,7 @@
 	{:else if key === 'git'}{@render gitSection()}
 	{:else if key === 'kernels'}{@render kernelsSection()}
 	{:else if key === 'databricks'}{@render databricksSection()}
+	{:else if key === 'chat'}{@render chatSection()}
 	{:else if key === 'environment'}{@render environmentSection()}
 	{:else if key === 'agent'}{@render agentSection()}
 	{:else if key === 'outline'}{@render outlineSection()}

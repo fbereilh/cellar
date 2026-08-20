@@ -31,7 +31,7 @@ import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
 import { canExportCell } from '../exportRole';
 import { resolveInWorkspace } from './fstree';
-import { SQL_LANGUAGE, isLogicalCellType, nbCellType, textNotebookRawCellError } from '../cellLanguage';
+import { isLogicalCellType, isPyUnsupportedType, languageTagFor, logicalCellType, nbCellType, textNotebookCellTypeError } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
 import { normalizeRootPath, textNotebookRootError } from '../notebookRoot';
@@ -117,16 +117,17 @@ function starterCell(): Cell {
 }
 
 function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCellar {
-	// 'sql' is a LOGICAL type: an nbformat `code` cell tagged cellar.language='sql'
-	// (see $lib/cellLanguage.js). code/markdown/raw are nbformat types of their
-	// own, and `nbCellType` is the ONE mapping.
-	const isSql = cellType === 'sql';
+	// 'sql'/'chat' are LOGICAL types: an nbformat `code` cell tagged
+	// cellar.language (see $lib/cellLanguage.js, whose `languageTagFor` is the ONE
+	// tag rule). code/markdown/raw are nbformat types of their own, and
+	// `nbCellType` is the ONE mapping.
+	const lang = languageTagFor(cellType);
 	const cell: CellWithCellar = {
 		id: mintId(),
 		cell_type: nbCellType(cellType),
 		source: typeof source === 'string' ? source : '',
 		outputs: [],
-		metadata: { cellar: { extract: false, visible: true, ...(isSql ? { language: SQL_LANGUAGE } : {}) } }
+		metadata: { cellar: { extract: false, visible: true, ...(lang ? { language: lang } : {}) } }
 	};
 	// A cell born WITH a source (paste / split / undo-delete) introduces every
 	// binding it holds right now, so it is stamped here for the same reason
@@ -279,6 +280,27 @@ function loadDoc(abs: string): NotebookDoc {
 		throw new Error('notebook not found: ' + abs);
 	}
 	return doc;
+}
+
+/**
+ * The ALREADY-LOADED document for `nb`, or undefined - it never materialises one,
+ * never seeds the active pointer, and never throws. For a best-effort in-memory
+ * MIRROR, which is what the caller below is: `docFor` loads from disk and throws
+ * `notebook not found` for a document that has been dropped, and the mirror runs
+ * from a flush interval and from the chat child's stdout handler, where a throw is
+ * an uncaught exception that kills the process carrying every kernel websocket,
+ * the SSE fan-out and the in-process MCP server. Loading would be wrong here even
+ * where it succeeds: it would resurrect an entry `dropDocs` deliberately removed.
+ * Callers that genuinely REQUIRE a document (every persist path) keep `docFor`.
+ */
+function liveDoc(nb?: string | null): NotebookDoc | undefined {
+	let abs: string;
+	try {
+		abs = resolveAbs(nb);
+	} catch {
+		return undefined;
+	}
+	return docs.get(abs);
 }
 
 /** The document a request targets: explicit `nb` path, else the active one. */
@@ -1089,9 +1111,10 @@ export function addCellAt(
 	role?: string | null
 ): Cell {
 	const doc = docFor(nb);
-	assertCanHoldRaw(doc, cellType);
+	assertCanHoldType(doc, cellType);
 	const cell = newCell(cellType, source);
 	if (role) cell.metadata.cellar.role = role;
+	assertCanHoldCell(doc, cell);
 	const at = Math.max(0, Math.min(index, doc.cells.length));
 	doc.cells.splice(at, 0, cell);
 	persist(doc);
@@ -1176,24 +1199,51 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
 }
 
 /**
- * Refuse `raw` on a `.py` TEXT notebook, BEFORE anything is written.
+ * Refuse a type a `.py` TEXT notebook cannot hold (`PY_UNSUPPORTED_TYPES`:
+ * `raw`, `chat`), BEFORE anything is written.
  *
  * `persist` writes such a document back through jupytext / the Databricks
  * converter, which rebuilds it from its cells and coerces every `cell_type` to
- * markdown|code - so a raw cell would live only in memory and come back from
- * disk as a runnable Python cell (see `textNotebookRawCellError`, which owns the
- * reasoning and the message). The guard sits at EVERY doc-layer writer that can
- * put `raw` into a document - the two that CONVERT a cell (`setCellType`,
- * `setCellTypes`) and the two that CREATE one (`addCell`, `addCellAt`) - so every
- * surface offering a raw cell (the type menu, the `r` chord, the bulk route, MCP
- * `set_cell_type` / `add_cell` / `add_cells` / `add_and_run`) is covered by this
- * ONE rule rather than by a check each of them could forget. `addCellAt`'s only
- * caller passes 'code' today, so it is guarded to make the claim true by
- * construction rather than by that caller's argument. Every other type is
- * unaffected, and an `.ipynb` never reaches the throw.
+ * markdown|code, carrying no `cellar` metadata and no outputs - so a raw cell
+ * would live only in memory and come back from disk as a runnable Python cell,
+ * and a chat cell would come back the same way with its REPLY gone (see
+ * `textNotebookCellTypeError`, which owns the reasoning and the messages). The
+ * guard sits at EVERY doc-layer writer that can put such a type into a document
+ * - the two that CONVERT a cell (`setCellType`, `setCellTypes`) and the two that
+ * CREATE one (`addCell`, `addCellAt`) - so every surface offering one (the type
+ * menu, the `r` chord, the bulk route, MCP `set_cell_type` / `add_cell` /
+ * `add_cells` / `add_and_run`) is covered by this ONE rule rather than by a
+ * check each of them could forget. `addCellAt`'s only caller passes 'code'
+ * today, so it is guarded to make the claim true by construction rather than by
+ * that caller's argument. Which types are refused lives in `cellLanguage.ts`, so
+ * a sixth logical type is decided there once instead of here per writer. Every
+ * other type is unaffected, and an `.ipynb` never reaches the throw.
+ *
+ * The CREATE paths ask it through `assertCanHoldCell` as well, about the cell
+ * they built rather than the type they were asked for - see below.
  */
-function assertCanHoldRaw(doc: NotebookDoc, cellType: LogicalCellType): void {
-	if (cellType === 'raw' && doc.jpFormat) throw textNotebookRawCellError();
+function assertCanHoldType(doc: NotebookDoc, cellType: LogicalCellType): void {
+	if (doc.jpFormat && isPyUnsupportedType(cellType)) throw textNotebookCellTypeError(cellType);
+}
+
+/**
+ * The same refusal asked of a BUILT cell rather than of a requested type - what
+ * every CREATE path ends with, because the requested type is not the only thing
+ * that decides what a new cell IS.
+ *
+ * A logical type can be carried by the `cellar` namespace (`chat` and `sql` are
+ * tagged code cells), and `addCell` takes such a namespace from its caller and
+ * seeds it (`seedCellar`, whose `DURABLE_CELLAR_KEYS` includes `language`). So
+ * `cellType:'code'` plus `cellar:{language:'chat'}` passed the type guard and
+ * still produced a chat cell - on a `.py` document, exactly the state the guard
+ * refuses. Asking the cell itself closes that by construction: a caller-supplied
+ * namespace can never produce a cell state the `cellType` argument would have
+ * been refused for, and a sixth logical type carried the same way inherits the
+ * rule instead of needing a check of its own. Called before the cell is spliced
+ * in, so a refusal still writes nothing.
+ */
+function assertCanHoldCell(doc: NotebookDoc, cell: Cell): void {
+	assertCanHoldType(doc, logicalCellType(cell));
 }
 
 /**
@@ -1212,9 +1262,10 @@ export function addCell(
 	cellar?: unknown
 ): Cell {
 	const doc = docFor(nb);
-	assertCanHoldRaw(doc, cellType);
+	assertCanHoldType(doc, cellType);
 	const cell = newCell(cellType, source);
 	seedCellar(doc, cell, cellar);
+	assertCanHoldCell(doc, cell);
 	const idx = afterId ? doc.cells.findIndex((c) => c.id === afterId) : -1;
 	if (idx >= 0) doc.cells.splice(idx + 1, 0, cell);
 	else doc.cells.push(cell);
@@ -1236,24 +1287,24 @@ export function addCell(
  * The `cell:type` event carries the new `language` so live sync updates the
  * editor's syntax highlighting (SQL ↔ Python) without a reload.
  *
- * A `.py` text notebook REFUSES 'raw' here - see `assertCanHoldRaw`; every other
+ * A `.py` text notebook REFUSES 'raw'/'chat' here - see `assertCanHoldType`; every other
  * conversion stays allowed on one.
  */
 export function setCellType(id: string, cellType: LogicalCellType, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
-	assertCanHoldRaw(doc, cellType);
+	assertCanHoldType(doc, cellType);
 	const cell = find(doc, id);
 	if (!cell) return;
 	applyCellType(cell, cellType);
 	persist(doc);
-	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: cellType === 'sql' ? SQL_LANGUAGE : null }, originId);
+	emit(doc, 'cell:type', { cellId: id, cell_type: cell.cell_type, language: languageTagFor(cellType) }, originId);
 }
 
 /**
  * The in-place half of a type switch, shared by the single-cell setter and the
  * `setCellTypes` batch so the two can never diverge on the metadata rules: any
  * non-code type (markdown, raw) clears outputs, and anything holding no Python
- * (those two plus SQL) drops the imports role and the nbdev export flag.
+ * (those two plus SQL and chat) drops the imports role and the nbdev export flag.
  *
  * `LiveNotebook.applyCellTypeLocally` is the browser's copy of exactly these
  * rules - `cell:type` carries no metadata, so a client half that skipped one
@@ -1265,7 +1316,7 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
  * fetches `/api/notebooks/staleness`), so there is nothing there to keep in step.
  */
 function applyCellType(cell: Cell, cellType: LogicalCellType): void {
-	const isSql = cellType === 'sql';
+	const lang = languageTagFor(cellType);
 	const wasCode = cell.cell_type === 'code';
 	cell.cell_type = nbCellType(cellType);
 	cell.metadata = cell.metadata ?? {};
@@ -1284,11 +1335,12 @@ function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	if (!wasCode && cell.cell_type === 'code' && !cell.metadata.cellar.importBindings) {
 		setImportBindings(cell.metadata.cellar, foldImportChange('', cell.source, undefined, Date.now()), null);
 	}
-	if (isSql) cell.metadata.cellar.language = SQL_LANGUAGE;
+	if (lang) cell.metadata.cellar.language = lang;
 	else delete cell.metadata.cellar.language;
 	// A cell the kernel actually executes as Python. Markdown and raw never reach
-	// it at all; SQL reaches it compiled, so it holds no Python either.
-	const runnable = cell.cell_type === 'code' && !isSql;
+	// it at all; SQL reaches it compiled, so it holds no Python either; a CHAT
+	// cell's source is prose the kernel never sees.
+	const runnable = cell.cell_type === 'code' && !lang;
 	// Only a code cell holds outputs - markdown and raw carry none, and
 	// `serialize` would drop them anyway.
 	if (cell.cell_type !== 'code') cell.outputs = [];
@@ -1328,8 +1380,7 @@ export function setCellTypes(
 	// Refused for the WHOLE batch before the first write, so a `.py` notebook can
 	// never be left half-retyped - and, because nothing is changed, the caller's
 	// `changed` count can never report a refused cell as converted.
-	assertCanHoldRaw(doc, cellType);
-	const isSql = cellType === 'sql';
+	assertCanHoldType(doc, cellType);
 	const changed: Cell[] = [];
 	for (const id of ids) {
 		const cell = find(doc, id);
@@ -1341,7 +1392,7 @@ export function setCellTypes(
 	if (!changed.length) return [];
 	persist(doc);
 	for (const cell of changed) {
-		emit(doc, 'cell:type', { cellId: cell.id, cell_type: cell.cell_type, language: isSql ? SQL_LANGUAGE : null }, originId);
+		emit(doc, 'cell:type', { cellId: cell.id, cell_type: cell.cell_type, language: languageTagFor(cellType) }, originId);
 	}
 	return changed.map((c) => c.id);
 }
@@ -1501,9 +1552,15 @@ export function clearOutputsLive(id: string, nb?: string | null): void {
  * a delta refetches ONCE and genuinely resyncs, rather than reading empty (disk is
  * written once, at run:end via `setOutputs`; the SSE deltas already carry the live
  * update, so no event fires here).
+ *
+ * A document that is GONE (deleted in the explorer, so `dropDocs` retired it, or
+ * renamed out from under a run) is a silent no-op - see `liveDoc`. The run's own
+ * persist still throws for it, which is right: that caller needs a document.
  */
 export function setOutputsLive(id: string, outputs: CellOutput[], nb?: string | null): void {
-	const cell = find(docFor(nb), id);
+	const doc = liveDoc(nb);
+	if (!doc) return;
+	const cell = find(doc, id);
 	if (cell) cell.outputs = outputs;
 }
 

@@ -37,11 +37,30 @@ import {
 	resolveNotebookPath
 } from './notebook';
 import { IMPORTS_ROLE, isImportsCell } from '../importsRole';
+import { logicalCellType } from '../cellLanguage';
 import { extractTopLevelImports, mergeImportSources, isImportsOnly, hasTopLevelImports } from './imports';
 import { isCellMagicCell } from './magics';
 import { enqueueRun, queuePosition, RunCancelled } from './run-queue';
 import { executeCellRun, clearOutputsForQueue } from './run';
 import type { Actor, Cell, CellView, CellOutput, SessionId } from './types';
+
+/**
+ * A cell whose source really is PYTHON, which is what every import operation
+ * here reads and writes.
+ *
+ * Deliberately the LOGICAL type, never the nbformat `cell_type === 'code'`
+ * shorthand: `sql` and `chat` cells are nbformat code cells too, so that
+ * shorthand handed a SQL query - and a chat cell's ENGLISH PROSE, which
+ * routinely quotes code - to the Python import tokenizer. A parseable
+ * `import pandas as pd` line inside a question would then be LIFTED out of the
+ * user's prose into the imports cell and run, and a first cell that happened to
+ * be imports-only prose could be ADOPTED as the imports cell. Same rule as
+ * `dataflow.ts`/`staleness.ts`, which exclude those cells from the Python probe
+ * for the same reason.
+ */
+function isPythonCodeCell(cell: Cell | CellView): boolean {
+	return logicalCellType(cell) === 'code';
+}
 
 /** The imports cell's run outcome: a run result, or a non-executing status when
  * the kernel queue refused (duplicate/running) or dropped (cancelled) the ticket. */
@@ -102,7 +121,7 @@ export function ensureImportsCell(nb?: string | null, originId?: string | null):
 	if (existing) return getCell(existing.id, nb)!;
 
 	const first = cells[0];
-	if (first && first.cell_type === 'code' && isImportsOnly(first.source)) {
+	if (first && isPythonCodeCell(first) && isImportsOnly(first.source)) {
 		setCellRole(first.id, IMPORTS_ROLE, nb, originId);
 		return getCell(first.id, nb)!;
 	}
@@ -218,14 +237,14 @@ export async function consolidateImports(
 	// Resolve the imports cell FIRST so it is excluded from its own sweep, then
 	// plan every edit before touching the document (planning over a mutating array
 	// is how a sweep silently skips cells).
-	const adoptable = !existing && cells[0]?.cell_type === 'code' && isImportsOnly(cells[0].source);
+	const adoptable = !existing && !!cells[0] && isPythonCodeCell(cells[0]) && isImportsOnly(cells[0].source);
 	const importsSourceCell = existing ?? (adoptable ? cells[0] : null);
 
 	const collected: string[] = [];
 	const edits: { id: string; source: string }[] = [];
 	const removals: string[] = [];
 	for (const cell of cells) {
-		if (cell.cell_type !== 'code' || cell.id === importsSourceCell?.id) continue;
+		if (!isPythonCodeCell(cell) || cell.id === importsSourceCell?.id) continue;
 		if (isCellMagicCell(cell.source)) continue; // never sweep a cell magic's body
 		const { statements, source, changed } = extractTopLevelImports(cell.source);
 		if (!changed) continue;

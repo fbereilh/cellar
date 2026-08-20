@@ -106,6 +106,7 @@
 
 import type { Cell, ImportChangeStamps, LastRun, SessionId } from '$lib/server/types';
 import { buildDefinerGraph, type Dataflow } from '$lib/symbolGraph';
+import { isChatCell } from '$lib/cellLanguage';
 
 export type { Dataflow };
 
@@ -218,8 +219,12 @@ export function computeStaleness(
 	// The graph is over CODE cells only. The definer graph (per name, the
 	// document-ordered defining cells; each use's nearest preceding definer) is
 	// built by `$lib/symbolGraph`, so the exact same rule backs the MCP find_symbol
-	// tool — one definition, no drift.
-	const codeCells = cells.filter((c) => c.cell_type === 'code');
+	// tool — one definition, no drift. CHAT cells are code cells on disk but bind
+	// nothing and read nothing the graph can see (their "inputs" are prose), so
+	// they are excluded here and fall to the n/a loop below - a chat reply is
+	// nondeterministic, and a staleness verdict over it would claim a re-run
+	// restores something no re-run can.
+	const codeCells = cells.filter((c) => c.cell_type === 'code' && !isChatCell(c));
 	const { definerBefore, edgeNames } = buildDefinerGraph(codeCells, df);
 	const importDefines = codeCells.map((c) => new Set(df[c.id]?.imports ?? []));
 

@@ -16,6 +16,9 @@ export const DEFAULT_SECTION_ORDER: readonly string[] = Object.freeze([
 	'git',
 	'kernels',
 	'databricks',
+	// Under Databricks with the other connection-shaped sections: which Claude
+	// account answers chat cells, and the sign-in/out/switch controls.
+	'chat',
 	'environment',
 	'agent',
 	'outline',

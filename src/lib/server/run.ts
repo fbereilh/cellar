@@ -20,8 +20,9 @@
 import { execute } from './kernel';
 import { setOutputs, setOutputsLive, setLastRun, clearOutputsLive, getCell } from './notebook';
 import { publish } from './events';
-import { isSqlCell } from '../cellLanguage';
+import { isChatCell, isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
+import { executeChatRun, chatReplyOutput } from './chat/run-chat';
 import { OutputAccumulator, OUTPUT_FLUSH_MS, type StreamDelta } from './output-accumulator';
 import { registerRunOutputs, unregisterRunOutputs } from './run-output-registry';
 import { noteRunStarted } from './run-queue';
@@ -85,7 +86,11 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// A SQL cell stores raw SQL but the kernel is Python: compile it to the
 	// `spark.sql(...)` wrapper at run time (source on disk stays SQL). Everything
 	// downstream - persist, stamp, broadcast - is identical to a code cell.
+	// A CHAT cell never reaches the kernel at all: its source is a question the
+	// ChatEngine answers (see chat/run-chat.ts), streamed through this same
+	// accumulator so the wire, persist and clear behavior stay identical.
 	const cell = getCell(cellId, nb);
+	const isChat = isChatCell(cell);
 	const execSource = isSqlCell(cell) ? sqlToPython(source) : source;
 
 	// Bound + coalesce the run's output across all three consumers (persist, SSE
@@ -132,17 +137,24 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	let outputs: CellOutput[];
 	try {
 		try {
-			const reply = await execute(nb, execSource, (ev) => {
-				if (ev.type === 'output') {
-					acc.push(ev.output);
-				} else if (ev.type === 'kernel') {
-					session = ev.session;
-					onEvent?.(ev);
-				} else {
-					onEvent?.(ev);
-				}
-			});
-			status = reply?.status ?? 'ok';
+			if (isChat) {
+				// No kernel, no session epoch: the reply streams from the ChatEngine into
+				// the same accumulator. `session` stays null - a chat run touches no
+				// namespace, so ran_this_session honestly reads false.
+				status = (await executeChatRun({ nb, cellId, question: source, acc })).status;
+			} else {
+				const reply = await execute(nb, execSource, (ev) => {
+					if (ev.type === 'output') {
+						acc.push(ev.output);
+					} else if (ev.type === 'kernel') {
+						session = ev.session;
+						onEvent?.(ev);
+					} else {
+						onEvent?.(ev);
+					}
+				});
+				status = reply?.status ?? 'ok';
+			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			acc.push({
@@ -154,12 +166,37 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 			status = 'error';
 			// execute() threw before it ever had a kernel in hand, so there is no session
 			// to stamp: this failure is the run the caller just asked for, not a leftover.
-			if (session === null) kernelDown = true;
+			// A chat run never has a kernel, so its failures are never "kernel down".
+			if (session === null && !isChat) kernelDown = true;
 		} finally {
 			clearInterval(flushTimer);
 		}
 		// Flush the tail + finalize the truncation marker; this is the array we persist.
 		outputs = acc.finish();
+
+		// A SUCCESSFUL chat run finalizes its streamed text into ONE markdown
+		// display_data (built from the accumulator's SURVIVING text, so a mid-run
+		// clear truncates the reply exactly as it truncates a kernel cell's output)
+		// and re-emits it as a full frame at the same stable index - the client's
+		// applyOutput replaces in place, snapping the live stream to rendered
+		// markdown. Failures pass through untouched: their message is already a
+		// display_data of its own.
+		//
+		// NOT when the accumulator tripped a cap: it appended a truncation marker as
+		// a SECOND stream element, and the finalize only republishes index 0 - there
+		// is no retract frame, so folding two elements into one would persist ONE
+		// output while every client still held the marker at index 1, orphaned until
+		// a reload. A capped reply therefore stays as streamed text beside its honest
+		// marker; the client's array and the document agree, which outranks rendering
+		// the markdown for a reply that is already incomplete.
+		if (isChat && status === 'ok' && !acc.wasCapped) {
+			const reply = chatReplyOutput(outputs);
+			if (reply) {
+				outputs = [reply];
+				publish({ type: 'run:output', nb, cellId, output: reply, index: 0, originId });
+				onEvent?.({ type: 'output', output: reply, index: 0 });
+			}
+		}
 
 		// A notebook is "loaded in the kernel" iff it has a live kernel entry, which the
 		// manager tracks directly — no separate marking step. A kernel-down run (session

@@ -22,10 +22,24 @@
  * Cellar already wrote to disk (`ipynb.ts` passes a foreign type through
  * verbatim) long before it was a type the UI could choose.
  *
- * This module is the single source of truth for "is this a SQL cell", for the
- * four-way LOGICAL cell type the UI toggle + MCP tools speak (`code` / `sql` /
- * `markdown` / `raw`), and for the ONE mapping back onto nbformat (`nbCellType`),
- * shared by the server and the browser so the two never disagree.
+ * A CHAT cell follows the SQL shape exactly: an nbformat `code` cell tagged
+ * `metadata.cellar.language = 'chat'`, whose source is a QUESTION for the AI and
+ * whose reply is a `display_data` output carrying `text/markdown` (a native
+ * nbformat mime, so plain Jupyter renders the reply too). Two costs are ACCEPTED
+ * and must not be "fixed" later:
+ *   - **A chat reply is nondeterministic, so re-running a chat cell always
+ *     produces a git diff.** Every other cell type re-runs to identical bytes
+ *     (the zero-git-diff doctrine); a model reply cannot, and the alternative -
+ *     not persisting it - would lose the reply on reload and contradict the
+ *     reply-as-output design. The diff is the price of a durable reply.
+ *   - **In plain Jupyter a chat cell is a code cell holding English prose**:
+ *     it renders fine as a document, but running it there raises `SyntaxError` -
+ *     the same interop trade already accepted for SQL cells.
+ *
+ * This module is the single source of truth for "is this a SQL/chat cell", for
+ * the five-way LOGICAL cell type the UI toggle + MCP tools speak (`code` / `sql`
+ * / `markdown` / `raw` / `chat`), and for the ONE mapping back onto nbformat
+ * (`nbCellType`), shared by the server and the browser so the two never disagree.
  */
 
 import type { CellMetadata, CellType, LogicalCellType } from '$lib/server/types';
@@ -40,14 +54,29 @@ type LanguageCell = { cell_type?: string; metadata?: CellMetadata | null } | nul
 /** The `cellar.language` value that marks a code cell as SQL. */
 export const SQL_LANGUAGE = 'sql';
 
-/** The editor language of a code cell: 'sql' when tagged, else 'python'. */
-export function cellLanguage(cell: LanguageCell): 'sql' | 'python' {
-	return cell?.metadata?.cellar?.language === SQL_LANGUAGE ? SQL_LANGUAGE : 'python';
+/** The `cellar.language` value that marks a code cell as an AI chat cell. */
+export const CHAT_LANGUAGE = 'chat';
+
+/** The editor language of a code cell: 'sql'/'chat' when tagged, else 'python'. */
+export function cellLanguage(cell: LanguageCell): 'sql' | 'chat' | 'python' {
+	const tag = cell?.metadata?.cellar?.language;
+	if (tag === SQL_LANGUAGE) return SQL_LANGUAGE;
+	if (tag === CHAT_LANGUAGE) return CHAT_LANGUAGE;
+	return 'python';
 }
 
 /** True for a code cell whose source is SQL (`cellar.language === 'sql'`). */
 export function isSqlCell(cell: LanguageCell): boolean {
 	return cell?.cell_type === 'code' && cellLanguage(cell) === SQL_LANGUAGE;
+}
+
+/**
+ * True for a code cell whose source is a chat QUESTION (`cellar.language ===
+ * 'chat'`). Run through the chat engine (`server/chat/`), never the kernel;
+ * excluded from the Python dataflow probe and from staleness (reports `n/a`).
+ */
+export function isChatCell(cell: LanguageCell): boolean {
+	return cell?.cell_type === 'code' && cellLanguage(cell) === CHAT_LANGUAGE;
 }
 
 /**
@@ -68,10 +97,10 @@ export function isRawCell(cell: LanguageCell): boolean {
  * typo would silently turn a raw cell holding frontmatter into a runnable
  * Python cell.
  */
-export const LOGICAL_CELL_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'markdown', 'raw'];
+export const LOGICAL_CELL_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'markdown', 'raw', 'chat'];
 
 /**
- * Is `value` one of the four logical cell types? The predicate every entry point
+ * Is `value` one of the logical cell types above? The predicate every entry point
  * that accepts a `cell_type` from a request body validates with, so a malformed
  * value is REFUSED rather than falling through `nbCellType`'s `code` default.
  */
@@ -82,36 +111,78 @@ export function isLogicalCellTypeName(value: unknown): value is LogicalCellType 
 /** The refusal code a route reports when `raw` was asked for on a `.py` notebook. */
 export const RAW_UNSUPPORTED_REASON = 'raw-in-py-notebook';
 
-/** The one message for that refusal, shared by the server writers and the browser. */
+/** The refusal code a route reports when `chat` was asked for on a `.py` notebook. */
+export const CHAT_UNSUPPORTED_REASON = 'chat-in-py-notebook';
+
+/**
+ * The logical types a `.py` TEXT notebook cannot hold, in ONE list.
+ *
+ * Both fail the same way and for the same reason (see `TextNotebookCellTypeError`
+ * below): such a document is rebuilt from its CELLS on every save by jupytext /
+ * the Databricks converter, which carries neither `cellar` cell metadata nor
+ * outputs - so the declaration lives only in memory and disk holds a plain
+ * `code` cell. The list exists so a SIXTH logical type is added HERE rather than
+ * shipping straight into the same trap, and so no writer keeps a per-type copy
+ * of the rule.
+ */
+export const PY_UNSUPPORTED_TYPES: readonly LogicalCellType[] = ['raw', 'chat'];
+
+/** Can a `.py` TEXT notebook hold this logical type? */
+export function isPyUnsupportedType(cellType: unknown): cellType is LogicalCellType {
+	return typeof cellType === 'string' && (PY_UNSUPPORTED_TYPES as readonly string[]).includes(cellType);
+}
+
+/** The one message for the raw refusal, shared by the server writers and the browser. */
 export const TEXT_NOTEBOOK_RAW_MESSAGE =
 	'A .py notebook cannot hold a raw cell: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and has no raw marker, so the cell would come back after a reload as a RUNNABLE Python cell holding what was meant to be verbatim text. Convert it to .ipynb first.';
 
+/** The same, for a chat cell - whose loss is worse: the REPLY goes with it. */
+export const TEXT_NOTEBOOK_CHAT_MESSAGE =
+	'A .py notebook cannot hold a chat cell: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and carries neither cell metadata nor outputs, so after a reload the cell would be a RUNNABLE Python cell holding English prose and the AI reply would be gone for good (no re-run reproduces it). Convert it to .ipynb first.';
+
+/** The message for one unsupported type. */
+export function textNotebookTypeMessage(cellType: LogicalCellType): string {
+	return cellType === 'chat' ? TEXT_NOTEBOOK_CHAT_MESSAGE : TEXT_NOTEBOOK_RAW_MESSAGE;
+}
+
+/** The refusal code for one unsupported type. */
+export function textNotebookTypeReason(cellType: LogicalCellType): string {
+	return cellType === 'chat' ? CHAT_UNSUPPORTED_REASON : RAW_UNSUPPORTED_REASON;
+}
+
 /**
- * A `raw` cell was asked for on a `.py` TEXT notebook, which cannot hold one.
+ * A logical type a `.py` TEXT notebook cannot hold was asked for (`raw`, `chat`).
  *
  * Such a notebook is written back through jupytext / the Databricks converter,
  * which rebuilds the file from its cells and coerces every `cell_type` to
- * markdown|code (`jupytext.ts`) - and coerces again on read. So the declaration
- * would live only in memory while disk held a `code` cell: after a reload the
- * frontmatter sits in a cell with a Run button, the exact silent degrade a raw
- * cell exists to prevent, and worse from MARKDOWN, whose prose would lose its
- * markers on the way too.
+ * markdown|code (`jupytext.ts`) - and coerces again on read, carrying no
+ * `cellar` metadata and no outputs. So the declaration would live only in memory
+ * while disk held a `code` cell: after a reload the frontmatter sits in a cell
+ * with a Run button (raw), or the question does while its REPLY is gone (chat) -
+ * the exact silent degrade each type exists to prevent, and worse from MARKDOWN,
+ * whose prose would lose its markers on the way too.
  *
  * Refused by name instead, at the doc-layer writers, so no surface can route
  * around it - the `textNotebookRootError` precedent, for the identical
- * rebuilt-from-cells reason. Only `raw`, and only on a `.py` doc: every other
- * conversion, and every raw cell in an `.ipynb`, is untouched.
+ * rebuilt-from-cells reason. Only these types, and only on a `.py` doc: every
+ * other conversion, every raw or chat cell in an `.ipynb`, and CLEARING a type
+ * are all untouched.
  */
-export class RawCellTypeError extends Error {
-	constructor(message = TEXT_NOTEBOOK_RAW_MESSAGE) {
-		super(message);
-		this.name = 'RawCellTypeError';
+export class TextNotebookCellTypeError extends Error {
+	/** The refused logical type, and the route-facing code for it. */
+	readonly cellType: LogicalCellType;
+	readonly reason: string;
+	constructor(cellType: LogicalCellType = 'raw') {
+		super(textNotebookTypeMessage(cellType));
+		this.name = 'TextNotebookCellTypeError';
+		this.cellType = cellType;
+		this.reason = textNotebookTypeReason(cellType);
 	}
 }
 
 /** The refusal above, as a throwable. */
-export function textNotebookRawCellError(): RawCellTypeError {
-	return new RawCellTypeError();
+export function textNotebookCellTypeError(cellType: LogicalCellType): TextNotebookCellTypeError {
+	return new TextNotebookCellTypeError(cellType);
 }
 
 /**
@@ -128,7 +199,20 @@ export function textNotebookRawCellError(): RawCellTypeError {
 export function nbCellType(cellType: LogicalCellType): CellType {
 	if (cellType === 'markdown') return 'markdown';
 	if (cellType === 'raw') return 'raw';
-	return 'code';
+	return 'code'; // 'code', 'sql' and 'chat' all share the nbformat code type
+}
+
+/**
+ * The `cellar.language` tag a LOGICAL type carries on disk: 'sql' and 'chat' are
+ * tagged code cells, everything else carries no tag. The ONE tag rule, shared by
+ * the server's `applyCellType`/`newCell`, the `cell:type` event payload, and the
+ * browser's `applyCellTypeLocally` - a per-site `isSql ? 'sql' : null` ternary is
+ * how the chat tag would be dropped by whichever copy was not updated.
+ */
+export function languageTagFor(cellType: LogicalCellType): string | null {
+	if (cellType === 'sql') return SQL_LANGUAGE;
+	if (cellType === 'chat') return CHAT_LANGUAGE;
+	return null;
 }
 
 /**
@@ -143,7 +227,8 @@ export function nbCellType(cellType: LogicalCellType): CellType {
 export function logicalCellType(cell: LanguageCell): LogicalCellType {
 	if (cell?.cell_type === 'markdown') return 'markdown';
 	if (isRawCell(cell)) return 'raw';
-	return isSqlCell(cell) ? 'sql' : 'code';
+	if (isSqlCell(cell)) return 'sql';
+	return isChatCell(cell) ? 'chat' : 'code';
 }
 
 /**

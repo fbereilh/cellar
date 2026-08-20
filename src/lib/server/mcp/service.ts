@@ -58,7 +58,7 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { TEXT_NOTEBOOK_RAW_MESSAGE, isSqlCell, isRawCell, logicalCellType, textNotebookRawCellError } from '../../cellLanguage';
+import { isPyUnsupportedType, isSqlCell, isRawCell, isChatCell, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { isExportCell, canExportCell, exportCellCount } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
@@ -531,6 +531,33 @@ const kernelUnavailable = (cell: CellView, sid: SessionId | null): boolean =>
 	sid == null && cell.metadata?.cellar?.lastRun?.kernel_unavailable === true;
 
 /**
+ * A CHAT cell's own status words. A chat run touches no kernel and stamps no
+ * session epoch, so the vocabulary below - every word of which answers "does
+ * what this cell defined still exist in the kernel?" - has no meaning for it,
+ * and answering in that vocabulary is not merely imprecise but actively
+ * harmful: a just-answered reply came out as `ok_persisted`, which the doctrine
+ * defines as a leftover from a previous session and instructs agents to distrust
+ * and RE-RUN. Re-running a chat cell is a billed, nondeterministic model turn
+ * that overwrites the reply the user may be reading. A flag beside a misleading
+ * label is a trap, so the LABEL changes:
+ *
+ *   ok_chat_reply          this server process ran it and it answered
+ *   error_chat_reply       this server process ran it and the run failed
+ *   chat_reply_persisted   a saved reply carrying no run stamp (i.e. after a reload)
+ *   unrun                  no reply, and no run this process made
+ *
+ * Read off the runtime-only `lastRun` stamp, which is stripped on save - so its
+ * presence IS "this process ran it", exactly as the epoch is for a kernel cell.
+ * `ran_this_session` stays honestly false throughout: no code executed in any
+ * kernel session.
+ */
+function chatRunStatus(cell: CellView): string {
+	const lastRun = cell.metadata?.cellar?.lastRun;
+	if (lastRun) return lastRun.status === 'ok' ? 'ok_chat_reply' : 'error_chat_reply';
+	return (cell.outputs || []).length ? 'chat_reply_persisted' : 'unrun';
+}
+
+/**
  * Per-cell run status, with persisted and live-session execution kept strictly
  * apart — conflating them is what lets an agent build on variables that were
  * never defined this session:
@@ -542,6 +569,10 @@ const kernelUnavailable = (cell: CellView, sid: SessionId | null): boolean =>
  *   ok_persisted              saved outputs from a PREVIOUS session; nothing it defines exists now
  *   error_persisted           saved error output from a PREVIOUS session
  *   error_kernel_unavailable  the kernel could not be reached; this failure is LIVE, not leftover
+ *
+ * A CHAT cell answers in its own vocabulary instead (see `chatRunStatus`): it is
+ * an nbformat code cell, so it reaches this function, but it runs no kernel and
+ * the words above would all assert something about a namespace it never touched.
  *
  * For a cell that ran this session the recorded run status is authoritative — a
  * cell can run successfully and emit no outputs at all (`lp = load()`), which
@@ -559,6 +590,7 @@ const kernelUnavailable = (cell: CellView, sid: SessionId | null): boolean =>
  */
 function runStatus(cell: CellView, sid: SessionId | null): string {
 	if (cell.cell_type !== 'code') return 'n/a';
+	if (isChatCell(cell)) return chatRunStatus(cell);
 	if (ranThisSession(cell, sid)) {
 		return cell.metadata?.cellar?.lastRun?.status === 'ok' ? 'ok_session' : 'error_session';
 	}
@@ -768,7 +800,7 @@ function readForm(
 	return {
 		id: toHandle(cell.id),
 		type: cell.cell_type,
-		...(isSqlCell(cell) ? { language: 'sql' } : {}),
+		...(isSqlCell(cell) ? { language: 'sql' } : isChatCell(cell) ? { language: 'chat' } : {}),
 		source: cell.source,
 		run_status: runStatus(cell, sid),
 		...staleFields(staleEntry, toHandle),
@@ -880,7 +912,7 @@ export async function getNotebookMap(nb?: string | null) {
 	const leaf = (c: CellView) => ({
 		id: toHandle(c.id),
 		type: c.cell_type,
-		...(isSqlCell(c) ? { language: 'sql' } : {}),
+		...(isSqlCell(c) ? { language: 'sql' } : isChatCell(c) ? { language: 'chat' } : {}),
 		summary: firstLine(c.source),
 		run_status: runStatus(c, sid),
 		...staleFields(stale[c.id], toHandle),
@@ -1438,8 +1470,8 @@ export function exportHtml({
  * cell: its imports are in the imports cell, and an empty cell beside them is
  * litter. An explicitly empty source still creates its empty cell.
  *
- * A `raw` spec on a `.py` TEXT notebook throws `RawCellTypeError` for the WHOLE
- * batch before anything is written - `addCell` would throw on it anyway (the doc
+ * A spec of a type a `.py` TEXT notebook cannot hold ('raw', 'chat') throws
+ * `TextNotebookCellTypeError` for the WHOLE batch before anything is written - `addCell` would throw on it anyway (the doc
  * layer owns the rule), but only once routing had already merged the earlier
  * specs' imports into the imports cell and run it, leaving the notebook
  * half-written behind an error. Raised here for the same all-or-nothing reason
@@ -1453,7 +1485,8 @@ export async function addCells(
 	{ routeImports: routeEnabled = true, nb: nbArg }: { routeImports?: boolean; nb?: string | null } = {}
 ) {
 	const nb = nbArg ?? getActiveNotebookPath();
-	if (specs.some((s) => s.cell_type === 'raw') && isPyTextNotebook(nb)) throw textNotebookRawCellError();
+	const refusedSpec = isPyTextNotebook(nb) ? specs.find((s) => isPyUnsupportedType(s.cell_type)) : undefined;
+	if (refusedSpec?.cell_type) throw textNotebookCellTypeError(refusedSpec.cell_type as LogicalCellType);
 	autoCheckpointBeforeAgentAction(nb);
 	const bodies: Array<{ cellType: string; source: string }> = [];
 	const added: string[] = [];
@@ -1718,8 +1751,9 @@ export function moveCell(id: string, dest: MoveDest, nb?: string | null) {
 }
 
 /**
- * MCP `set_cell_type`. A `.py` TEXT notebook REFUSES 'raw' - the doc layer's rule
- * (`assertCanHoldRaw`), looked up here through the SAME `isPyTextNotebook`
+ * MCP `set_cell_type`. A `.py` TEXT notebook REFUSES the types it cannot hold
+ * ('raw', 'chat') - the doc layer's rule
+ * (`assertCanHoldType`), looked up here through the SAME `isPyTextNotebook`
  * predicate the export tools use so the agent gets a refusal NAMING the cause
  * rather than a throw, and so nothing is written: checked BEFORE the pre-action
  * checkpoint, because a refused call changes nothing and a snapshot for it would
@@ -1731,8 +1765,8 @@ export function setType(id: string, type: LogicalCellType, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	id = asFullId(target, id);
 	if (!getCell(id, target)) return { ok: false as const, missing: true as const };
-	if (type === 'raw' && isPyTextNotebook(target))
-		return { ok: false as const, refused: TEXT_NOTEBOOK_RAW_MESSAGE };
+	if (isPyUnsupportedType(type) && isPyTextNotebook(target))
+		return { ok: false as const, refused: textNotebookTypeMessage(type) };
 	autoCheckpointBeforeAgentAction(target);
 	setCellType(id, type, target);
 	return { ok: true as const };
@@ -2415,6 +2449,14 @@ function toBatchRecord(
 }
 
 /**
+ * Why a batch leaves a chat cell alone. One sentence, shared by every batch
+ * record and by the three tool descriptions, so the agent-facing reason cannot
+ * drift from the rule.
+ */
+const CHAT_BATCH_SKIP_NOTE =
+	'chat cell - batch runs skip chat cells: a chat run is a billed model turn that holds this notebook\'s queue slot until it answers. Run it deliberately with run_cell.';
+
+/**
  * Run cells one at a time, in order, each waiting its turn in the kernel queue.
  * Stops at the first run a restart/interrupt cancelled: the rest of the sequence
  * was written against a namespace that no longer exists, so running it would
@@ -2425,6 +2467,13 @@ function toBatchRecord(
  * cell (see `toBatchRecord`) — OK cells as a status line, errored cells with
  * their traceback in full. Any OK cell's full output is still one
  * `get_full_output(id)` call away.
+ *
+ * A chat cell is SKIPPED here rather than run (see `CHAT_BATCH_SKIP_NOTE`), and
+ * says so in its own record: a batch that quietly dropped it would read as one
+ * that ran it. The rule lives in this one function, so `run_all`, `run_cells`
+ * and `run_range` inherit it rather than each re-deriving it - and `run_stale`
+ * inherits it for free (a chat cell's staleness is `n/a`, so it never reaches
+ * the stale id list at all).
  */
 export async function runCells(ids: string[], nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
@@ -2436,9 +2485,23 @@ export async function runCells(ids: string[], nb?: string | null) {
 	const runs: Array<{ r: Record<string, unknown>; cell: CellView | null }> = [];
 	for (const id of ids) {
 		const full = asFullId(target, id);
-		const r = await runCell(full, target, { skipStaleness: true, skipImages: true });
 		const cell = getCell(full, target);
-		if (r) runs.push({ r, cell: cell ?? null });
+		// A CHAT cell is skipped by every batch, and named rather than silently
+		// dropped. It is an nbformat code cell, so the `cell_type === 'code'`
+		// selectors of run_all/run_range pick it up - and running one is not a
+		// kernel execution but a real, BILLED model turn that holds this notebook's
+		// single queue slot for as long as the reply takes (up to the chat
+		// timeout). A routine agent sweep over a notebook must never spend the
+		// user's Claude quota or wedge their queue for minutes per cell as a side
+		// effect of "re-run everything". An EXPLICIT `run_cell` on a chat cell is a
+		// deliberate act and still runs it; only the batch paths refuse.
+		if (cell && isChatCell(cell)) {
+			runs.push({ r: { id: handleFor(target, full), status: 'skipped', note: CHAT_BATCH_SKIP_NOTE }, cell });
+			continue;
+		}
+		const r = await runCell(full, target, { skipStaleness: true, skipImages: true });
+		const after = getCell(full, target);
+		if (r) runs.push({ r, cell: after ?? null });
 		// An interrupt/restart cancelled this queued run: the namespace the rest of
 		// the sequence was written against is gone, so stop. Staleness is still
 		// computed once below over exactly what actually ran.
@@ -2464,7 +2527,8 @@ export async function runCells(ids: string[], nb?: string | null) {
 	return { ran, errored, results };
 }
 
-/** Run every code cell in document order; hidden cells run but are omitted from results. */
+/** Run every code cell in document order; hidden cells run but are omitted from
+ *  results, and chat cells are skipped (named in `results` - see `runCells`). */
 export async function runAll(nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	const ids = listCells(target).filter((c) => c.cell_type === 'code').map((c) => c.id);
@@ -2488,7 +2552,8 @@ export async function runStale(nb?: string | null) {
 	return runCells(ids, target);
 }
 
-/** Run code cells in the inclusive document range from→to. */
+/** Run code cells in the inclusive document range from→to; a chat cell in it is
+ *  skipped and named, like every other batch path (see `runCells`). */
 export async function runRange(fromId: string, toId: string, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	const all = listCells(target);
