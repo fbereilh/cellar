@@ -18,7 +18,7 @@
  * regenerated on edit/run/reorder. Cell ids only need to be unique within a
  * single document (two open notebooks may legitimately share an id).
  */
-import { join, resolve, isAbsolute, relative, sep } from 'node:path';
+import { dirname, join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { readNotebook, deserialize, writeNotebook, serialize, stringify } from './ipynb';
@@ -28,8 +28,10 @@ import { cancelRun } from './run-queue';
 import { truncateActiveRunOutputs } from './run-output-registry';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
-import { exportNotebookToPy, resolveTarget, type ExportResult } from './export-py';
+import { exportNotebookToPy, resolveExportTarget, type ExportResult, type ResolvedExportTarget } from './export-py';
 import { canExportCell } from '../exportRole';
+import { isExportBase, type ExportBase } from '../exportTarget';
+import { gitRootOf } from './git';
 import { resolveInWorkspace } from './fstree';
 import { isLogicalCellType, isPyUnsupportedType, languageTagFor, logicalCellType, nbCellType, textNotebookCellTypeError } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
@@ -339,11 +341,48 @@ export function getNotebook(nb?: string | null): NotebookView {
 		path: doc.path,
 		cells: doc.cells.map(cellView),
 		exportTarget: typeof t === 'string' && t.trim() ? t.trim() : null,
+		...exportTargetView(doc),
 		root: readRoot(doc),
 		isPy: !!doc.jpFormat,
 		headerNumbering: readHeaderNumbering(doc),
 		hideAllCode: !!doc.metadata?.cellar?.hide_all_code
 	};
+}
+
+/**
+ * The export-target fields the BROWSER (and the set-target/set-base replies)
+ * carry beside the stored `exportTarget` path: the recorded base (`readExportBase`
+ * - the raw metadata value, so an unknown hand-edited base is SHOWN unmatched by
+ * the select rather than silently rendered as workspace), and the resolution the
+ * exporter would use - the workspace-relative `exportResolved` the importability
+ * warning is decided from, or the `exportResolveError` naming why a configured
+ * target cannot resolve. Resolution covers the EFFECTIVE target (`#|default_exp`
+ * directives included), matching where the module really lands.
+ */
+function exportTargetView(doc: NotebookDoc): {
+	exportBase: string;
+	exportResolved: string | null;
+	exportResolveError: string | null;
+} {
+	const info = resolveExportTarget(doc);
+	return {
+		exportBase: readExportBase(doc),
+		exportResolved: info && info.ok ? info.target : null,
+		exportResolveError: info && !info.ok ? info.error : null
+	};
+}
+
+/**
+ * The recorded export base, verbatim: the trimmed `metadata.cellar.export_base`,
+ * or `workspace` when absent/empty - absence permanently means workspace-relative
+ * (the pre-base legacy shape). Deliberately NOT validated here, per the
+ * `getNotebookRoot` precedent: an unknown hand-edited value reads as its raw self
+ * so the resolver refuses it BY NAME, rather than this getter silently answering
+ * "workspace" while the exporter refuses to write.
+ */
+function readExportBase(doc: NotebookDoc): string {
+	const raw = doc.metadata?.cellar?.export_base;
+	return typeof raw === 'string' && raw.trim() ? raw.trim() : 'workspace';
 }
 
 /**
@@ -854,18 +893,27 @@ export function getExportTarget(nb?: string | null): string | null {
 }
 
 /**
- * The target the EXPORTER will actually write to: the notebook-level
- * `export_target`, or — when there is none — a `#|default_exp <module>` directive
- * in any code cell (nbdev's own spelling). This is `resolveTarget`'s rule REUSED,
+ * The target the EXPORTER will actually write to, resolved through its base:
+ * the notebook-level `export_target` + `export_base`, or - when there is none -
+ * a `#|default_exp <module>` directive in any code cell (nbdev's own spelling,
+ * always workspace-relative). This is `resolveExportTarget`'s rule REUSED,
  * never a second copy, so a caller reporting where the marks land can never
- * disagree with where they go.
+ * disagree with where they go. Null when nothing is configured - a configured
+ * target that cannot RESOLVE is its own `ok:false` shape, kept distinct so it
+ * is never read as "no target" (see `ResolvedExportTarget`).
  *
  * `getExportTarget` above stays the metadata-only reader (what `setExportTarget`
  * stores and clears); the two are deliberately separate, because a directive
  * lives in a cell and no notebook-level setter can clear it.
  */
+export function exportTargetInfo(nb?: string | null): ResolvedExportTarget | null {
+	return resolveExportTarget(docFor(nb));
+}
+
+/** The workspace-relative path `exportTargetInfo` resolves to, or null. */
 export function effectiveExportTarget(nb?: string | null): string | null {
-	return resolveTarget(docFor(nb));
+	const info = resolveExportTarget(docFor(nb));
+	return info && info.ok ? info.target : null;
 }
 
 /**
@@ -905,21 +953,39 @@ export class InvalidExportTargetError extends Error {
  * second half of that guard - it refuses to overwrite a file it did not generate -
  * because a `#|default_exp` directive reaches it without passing here.
  *
- * What is STORED is the workspace-RELATIVE form, whatever was passed: this value
- * lands in the committed `.ipynb`, and `resolveInWorkspace` accepts an absolute
- * path that happens to resolve inside THIS workspace - so an absolute target
- * stored verbatim contradicted every description of the field and, on any other
- * checkout, threw from `autoExportPy` (best-effort, so the record is silent) and
- * the module simply never regenerated again for that clone. Normalizing here -
- * the one place the target is validated and stored, so every caller gets it -
- * keeps the notebook portable. An absolute path OUTSIDE the workspace is still
- * refused by `resolveInWorkspace`, unchanged.
+ * What is STORED is the form RELATIVE TO THE CHOSEN BASE, whatever was passed:
+ * this value lands in the committed `.ipynb`, and each base's resolution accepts
+ * an absolute path that happens to resolve inside THIS workspace - so an
+ * absolute target stored verbatim contradicted every description of the field
+ * and, on any other checkout, threw from `autoExportPy` (best-effort, so the
+ * record is silent) and the module simply never regenerated again for that
+ * clone. Normalizing here - the one place the target is validated and stored,
+ * so every caller gets it - keeps the notebook portable. An absolute path
+ * OUTSIDE the workspace is still refused by `resolveInWorkspace`, unchanged.
  *
- * It RETURNS the value it stored, not the one it was handed, so a caller reports
- * what the document holds: normalizing without reporting it left the UI route
- * answering with the raw absolute path, which the tab then recorded as its
- * baseline and kept in the input while the server held the relative form - and
- * the `notebook:export-target` event that would have corrected it is
+ * THE BASE (`$lib/exportTarget`): `workspace` is the default and is never
+ * persisted - the `export_base` key is DELETED for it, because ABSENCE of the
+ * key is what a pre-base notebook stores and must permanently mean
+ * workspace-relative; writing an explicit `workspace` would mint a second
+ * spelling of the legacy state and churn files that never asked. `notebook`
+ * stores the path relative to the notebook's own folder; `git` relative to the
+ * notebook's enclosing repository (`gitRootOf` - the NOTEBOOK's repo, found by
+ * walking up from its directory; deliberately not the code root, which may be
+ * an external worktree and governs the kernel, not this file). A base changes
+ * how the path is EXPRESSED, never what may be written: every base's resolution
+ * runs through the SAME `resolveInWorkspace` guard, so a notebook-relative or
+ * git-root-relative path is no escape hatch - a `git` root ABOVE the workspace
+ * (`cd repo/analysis && cellar`) is fine exactly as far as the resolved module
+ * still lands inside the workspace. A notebook with no enclosing repository
+ * refuses the `git` base by name (first-class state, not an exception), and an
+ * unknown base value is refused rather than silently read as workspace.
+ *
+ * It RETURNS the stored state (`exportTargetState` - target, base, and the
+ * resolution the exporter would use), not what it was handed, so a caller
+ * reports what the document holds: normalizing without reporting it left the UI
+ * route answering with the raw absolute path, which the tab then recorded as
+ * its baseline and kept in the input while the server held the relative form -
+ * and the `notebook:export-target` event that would have corrected it is
  * echo-suppressed in the initiating tab.
  *
  * Every REFUSAL of the path itself is thrown as an `InvalidExportTargetError`,
@@ -930,31 +996,135 @@ export class InvalidExportTargetError extends Error {
 export function setExportTarget(
 	target: string | null,
 	nb?: string | null,
-	originId?: string | null
-): string | null {
+	originId?: string | null,
+	base?: string | null
+): ExportTargetState {
 	const doc = docFor(nb);
 	const raw = (target ?? '').trim();
+	const wanted = (base ?? '').trim() || 'workspace';
+	if (!isExportBase(wanted))
+		throw new InvalidExportTargetError(
+			`unknown export base ${JSON.stringify(wanted)}: expected "workspace", "notebook" or "git"`
+		);
 	let stored = '';
 	if (raw) {
-		let abs: string;
-		try {
-			abs = resolveInWorkspace(raw); // throws when the path escapes the workspace
-		} catch (err) {
-			throw new InvalidExportTargetError(String((err as Error)?.message ?? err));
-		}
 		if (!/\.py$/i.test(raw))
 			throw new InvalidExportTargetError(
 				`export target ${raw} is not a .py file: the generated module is written to this path, so it must name a .py module`
 			);
-		stored = relative(resolve(workspace()), abs).split(sep).join('/');
+		const baseDir = exportBaseDir(doc, wanted); // refuses `git` with no repository
+		let abs: string;
+		try {
+			// `resolve` keeps an absolute input absolute, so pasting one still works;
+			// the SAME containment guard then decides, whatever the base.
+			abs = resolveInWorkspace(resolve(baseDir, raw));
+		} catch (err) {
+			throw new InvalidExportTargetError(
+				wanted === 'workspace'
+					? String((err as Error)?.message ?? err)
+					: `export target ${raw} (relative to the ${wanted === 'git' ? "notebook's git root" : "notebook's folder"}) resolves outside the workspace - the module can only be written inside the workspace`
+			);
+		}
+		stored = relative(baseDir, abs).split(sep).join('/');
 	}
 	doc.metadata = doc.metadata ?? {};
 	doc.metadata.cellar = doc.metadata.cellar ?? {};
 	if (stored) doc.metadata.cellar.export_target = stored;
 	else delete doc.metadata.cellar.export_target;
+	// The base is a fact ABOUT a stored target: cleared with it, and never stored
+	// as an explicit `workspace` (absence is the one spelling of the default).
+	if (stored && wanted !== 'workspace') doc.metadata.cellar.export_base = wanted;
+	else delete doc.metadata.cellar.export_base;
 	persist(doc);
-	emit(doc, 'notebook:export-target', { target: stored || null }, originId);
-	return stored || null;
+	const state = exportTargetState(doc);
+	emit(doc, 'notebook:export-target', { ...state }, originId);
+	return state;
+}
+
+/** What a set-target/set-base caller reports back: the stored form + its resolution. */
+export interface ExportTargetState {
+	/** The stored `export_target` (relative to `base`), or null when unset. */
+	target: string | null;
+	/** The recorded base (`workspace` for the absent-key legacy default). */
+	base: string;
+	/** Workspace-relative resolution of the EFFECTIVE target, or null. */
+	resolved: string | null;
+	/** Why a configured target cannot resolve, else null. */
+	resolveError: string | null;
+}
+
+function exportTargetState(doc: NotebookDoc): ExportTargetState {
+	const t = doc.metadata?.cellar?.export_target;
+	const info = resolveExportTarget(doc);
+	return {
+		target: typeof t === 'string' && t.trim() ? t.trim() : null,
+		base: readExportBase(doc),
+		resolved: info && info.ok ? info.target : null,
+		resolveError: info && !info.ok ? info.error : null
+	};
+}
+
+/**
+ * The directory a base measures from, for this doc. Throws the same typed
+ * refusal as the path checks for a `git` base with no enclosing repository, so
+ * every caller (the setter above, the re-expression below) refuses identically.
+ */
+function exportBaseDir(doc: NotebookDoc, base: ExportBase): string {
+	if (base === 'notebook') return dirname(doc.path);
+	if (base === 'git') {
+		const root = gitRootOf(dirname(doc.path));
+		if (!root)
+			throw new InvalidExportTargetError(
+				'this notebook is not inside a git repository, so a git-root-relative export target cannot resolve - pick another base, or initialize a repository'
+			);
+		return root;
+	}
+	return resolve(workspace());
+}
+
+/**
+ * RE-EXPRESS the stored export target under a different base: the SAME file,
+ * a new spelling. This is what the export section's base select does - picking
+ * a base is a statement about how the path reads, so reinterpreting the typed
+ * text against the new base (silently retargeting a different file) would be
+ * the one thing a base switch must never do. The current stored target is
+ * resolved to its absolute file (refusing when it cannot resolve - a file we
+ * cannot locate cannot be re-expressed; retype the path instead) and stored
+ * relative to the new base, through the same containment guard as the setter.
+ *
+ * With NO stored target there is nothing to re-express and nothing to persist:
+ * a base alone is meaningless (`export_base` is a fact about a stored target),
+ * so the call is an honest no-op reporting the current state - the UI keeps a
+ * pre-target base choice client-side and sends it with the first path commit.
+ * A no-op also covers re-picking the current base. Refusals are typed
+ * (`InvalidExportTargetError`) exactly like the setter's, and the same
+ * `persist`-throw distinction applies.
+ */
+export function setExportBase(base: string, nb?: string | null, originId?: string | null): ExportTargetState {
+	const doc = docFor(nb);
+	const wanted = (base ?? '').trim();
+	if (!isExportBase(wanted))
+		throw new InvalidExportTargetError(
+			`unknown export base ${JSON.stringify(wanted)}: expected "workspace", "notebook" or "git"`
+		);
+	const t = doc.metadata?.cellar?.export_target;
+	if (!(typeof t === 'string' && t.trim())) return exportTargetState(doc);
+	if (wanted === readExportBase(doc)) return exportTargetState(doc);
+	const info = resolveExportTarget(doc);
+	if (!info || !info.ok || info.source !== 'metadata')
+		throw new InvalidExportTargetError(
+			`the current export target cannot be re-expressed: ${info && !info.ok ? info.error : 'no stored target resolves'} - set the path again under the new base instead`
+		);
+	const baseDir = exportBaseDir(doc, wanted); // refuses `git` with no repository
+	doc.metadata = doc.metadata ?? {};
+	doc.metadata.cellar = doc.metadata.cellar ?? {};
+	doc.metadata.cellar.export_target = relative(baseDir, info.abs).split(sep).join('/');
+	if (wanted !== 'workspace') doc.metadata.cellar.export_base = wanted;
+	else delete doc.metadata.cellar.export_base;
+	persist(doc);
+	const state = exportTargetState(doc);
+	emit(doc, 'notebook:export-target', { ...state }, originId);
+	return state;
 }
 
 /** The notebook's enabled heading-numbering levels (unique, 1-6, ascending). */

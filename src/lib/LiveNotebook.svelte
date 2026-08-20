@@ -68,6 +68,10 @@
 		 *  `$lib/virtualizePref`. The prop itself keeps defaulting to false so a
 		 *  standalone mount (tests, any future embedder) renders every cell. */
 		virtualize?: boolean;
+		/** The Settings "Show code root bar" preference (per viewer, persisted by the
+		 *  shell through the UI-state store). OFF hides the root bar only while this
+		 *  notebook has no declared root - a declared one always shows it. */
+		showCodeRoot?: boolean;
 		onCellsChange?: (path: string, cells: UICell[]) => void;
 		/** (path, foldedIds, folding): the sidebar Outline renders from this. */
 		onFoldsChange?: (path: string, foldedIds: Set<string>, folding: Folding) => void;
@@ -127,7 +131,7 @@
 		| { type: 'cell:cleared'; cellId: string }
 		| { type: 'cell:rendered'; cellId: string }
 		| { type: 'cell:edited'; cellId: string; source: string }
-		| { type: 'notebook:export-target'; target: string | null }
+		| { type: 'notebook:export-target'; target: string | null; base?: string; resolved?: string | null; resolveError?: string | null }
 		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
 		| { type: 'notebook:hide-all-code'; hidden: boolean };
@@ -169,6 +173,7 @@
 		follow = true,
 		gitRefresh = 0,
 		virtualize = false,
+		showCodeRoot = false,
 		onCellsChange,
 		onFoldsChange,
 		onNumberingChange,
@@ -205,10 +210,23 @@
 	// nbdev-style export: the notebook's `.py` module target + how many cells are
 	// marked for export. `exportTarget` mirrors `notebook.metadata.cellar.export_target`
 	// (loaded on mount, kept live via the `notebook:export-target` SSE event); the
-	// count derives from the live cell flags. Rendered as a header bar at the top of
-	// the notebook (Notebook.svelte) once either is set.
+	// count derives from the live cell flags. Rendered as an always-present section
+	// at the top of the notebook (Notebook.svelte), directly below the root bar.
 	let exportTarget = $state<string | null>(null);
 	const exportCount = $derived(exportCellCount(cells));
+	// The stored target's BASE (`$lib/exportTarget`: workspace / notebook / git;
+	// `workspace` = the absent-key legacy default) plus the server's resolution of
+	// the effective target - the workspace-relative file the module IS, or why a
+	// configured target cannot resolve. All three ride every set-target/set-base
+	// reply and the `notebook:export-target` event, so like `exportTarget` the tab
+	// keeps no derivation of its own. With NO stored target `exportBase` is a
+	// local-only pre-choice: it is sent with the first path commit, since a base
+	// alone is meaningless server-side (`export_base` is a fact about a stored
+	// target).
+	let exportBase = $state<string>('workspace');
+	let exportResolved = $state<string | null>(null);
+	let exportResolveError = $state<string | null>(null);
+	let exportBaseBusy = $state(false);
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
 	// imports from (null = the workspace root, the default and today's behavior).
 	// Mirrors `notebook.metadata.cellar.root`, kept live via the `notebook:root` SSE
@@ -222,6 +240,17 @@
 	let availableRoots = $state<WorkspaceRootOption[]>([]);
 	let rootBusy = $state(false);
 	let rootFeedback = $state('');
+	// The root bar's SESSION LATCH: once this notebook has been seen with a
+	// declared root, the bar stays for the life of this component - even after the
+	// root is cleared, and whatever the Settings preference says - so the clear's
+	// own feedback line (and the picker the user may be about to use again) cannot
+	// vanish under the very click that produced them. It lives HERE, not in
+	// Notebook.svelte, because every `load()` refetch destroys that component
+	// (`{:else if fetching}`), which would reset a latch kept there mid-session.
+	let rootSeen = $state(false);
+	$effect(() => {
+		if (root !== null) rootSeen = true;
+	});
 	// Generation guard for the root list (the statusSeq / kernelReqSeq convention):
 	// a mount fetch and a `notebook:root` fetch are unordered, so only the NEWEST
 	// one may apply — an older reply landing last would restore a stale list, and
@@ -1424,6 +1453,9 @@
 			cells = body.notebook.cells;
 			canonicalId = body.notebook.path; // the absolute id SSE events are tagged with
 			exportTarget = body.notebook.exportTarget ?? null; // nbdev export target
+			exportBase = body.notebook.exportBase ?? 'workspace'; // what that path is measured from
+			exportResolved = body.notebook.exportResolved ?? null; // its workspace-relative resolution
+			exportResolveError = body.notebook.exportResolveError ?? null; // or why it cannot resolve
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			root = body.notebook.root ?? null; // code root (kernel cwd + sys.path)
@@ -1548,6 +1580,13 @@
 				cell.metadata = { ...(cell.metadata ?? {}), cellar };
 			}
 		} else if (ev.type === 'notebook:export-target') {
+			// The event carries the whole stored state (base + resolution beside the
+			// target), so an agent's or another tab's change lands as one consistent
+			// snapshot. `exportTarget` is assigned LAST - the source guard in
+			// `mcp-export-target.test.ts` pins this branch as ending with it.
+			exportBase = ev.base ?? 'workspace';
+			exportResolved = ev.resolved ?? null;
+			exportResolveError = ev.resolveError ?? null;
 			exportTarget = ev.target;
 		} else if (ev.type === 'notebook:root') {
 			// The code root changed in another tab or from an agent (this tab's own
@@ -2461,7 +2500,10 @@
 		const res = await fetch('/api/notebooks/export-py', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ op: 'set-target', target: raw, path, originId }),
+			// `base` rides every path commit: with no stored target the select's choice
+			// is client-local (a base alone is meaningless server-side), so this is the
+			// moment it becomes real.
+			body: JSON.stringify({ op: 'set-target', target: raw, base: exportBase, path, originId }),
 			// Only from the unload flush: the request must outlive the page, and this body
 			// is one path, far under the ~64KB a keepalive body is capped at.
 			keepalive
@@ -2483,6 +2525,15 @@
 		if (exportTarget !== next) return 'superseded';
 		const knowsHeld = !!body && 'target' in body;
 		const held = knowsHeld ? ((body!.target ?? null) as string | null) : null;
+		// The base + resolution travel WITH the held target on every reply, so a
+		// refusal puts the select back beside the input (and the resolution display
+		// can never describe a target the field no longer shows).
+		const adoptHeldMeta = () => {
+			if (!knowsHeld) return;
+			exportBase = typeof body!.base === 'string' ? (body!.base as string) : 'workspace';
+			exportResolved = (body!.resolved ?? null) as string | null;
+			exportResolveError = (body!.resolveError ?? null) as string | null;
+		};
 		if (res?.ok) {
 			// What the server STORED, not what we sent: `setExportTarget` normalizes an
 			// absolute in-workspace path to its relative form, and this tab echo-suppresses
@@ -2490,6 +2541,7 @@
 			// showing a path the document does not hold. An unreadable body keeps what was
 			// sent (the pre-normalization behavior).
 			if (knowsHeld) exportTarget = held;
+			adoptHeldMeta();
 			return 'committed';
 		}
 		const failure = typeof body?.writeFailed === 'string' ? body.writeFailed : null;
@@ -2501,11 +2553,13 @@
 			// is why `held` is the NEW path here and the field keeps it. Saying it was not set
 			// was a "fix the path" remedy for a problem that did not occur.
 			if (knowsHeld) exportTarget = held;
+			adoptHeldMeta();
 			onNotice?.(`Export target accepted but not saved: ${failure}`);
 			return 'writeFailed';
 		}
 		if (knowsHeld) {
 			exportTarget = held;
+			adoptHeldMeta();
 			onNotice?.(`Export target not set${message ? `: ${message}` : '.'}`);
 			return 'refused';
 		}
@@ -2536,6 +2590,64 @@
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ levels, path, originId })
 		}).catch(() => {});
+	}
+
+	/**
+	 * Pick what the export path is measured from (`$lib/exportTarget`'s bases).
+	 *
+	 * Two regimes, split on whether a target is STORED. With none, the choice is
+	 * LOCAL: `export_base` is a fact about a stored target, so there is nothing to
+	 * persist - the choice rides up with the first path commit (`commitExportTarget`
+	 * sends `base`), which is what lets a user pick the base BEFORE typing the path.
+	 * With a stored target the server RE-EXPRESSES it: the same file, spelled
+	 * relative to the new base - never a reinterpretation of the typed text, which
+	 * would silently retarget a different file. That write is NON-optimistic (the
+	 * `setRootValue` idiom): it can be refused (a `git` base with no enclosing
+	 * repository, a stored target that no longer resolves), and every reply carries
+	 * the state the document holds, which is simply adopted - so a refusal snaps the
+	 * select back and says why on the notice channel.
+	 *
+	 * A reply is dropped when the TARGET moved while it was in flight (the user
+	 * committed a new path, or another tab's / an agent's event landed) - the same
+	 * `superseded` rule as `commitExportTarget`, against the field rather than any
+	 * remembered baseline.
+	 */
+	async function setExportBaseValue(base: string) {
+		if (base === exportBase) return;
+		if (!exportTarget) {
+			exportBase = base;
+			return;
+		}
+		const before = exportTarget;
+		exportBaseBusy = true;
+		try {
+			const res = await fetch('/api/notebooks/export-py', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ op: 'set-base', base, path, originId })
+			}).catch(() => null);
+			const body = res
+				? await res
+						.json()
+						.then((b) => (b && typeof b === 'object' ? (b as Record<string, unknown>) : null))
+						.catch(() => null)
+				: null;
+			if (exportTarget !== before) return; // superseded: a newer value owns the field
+			if (body && 'target' in body) {
+				exportTarget = (body.target ?? null) as string | null;
+				exportBase = typeof body.base === 'string' ? body.base : 'workspace';
+				exportResolved = (body.resolved ?? null) as string | null;
+				exportResolveError = (body.resolveError ?? null) as string | null;
+			}
+			if (!res?.ok) {
+				const message = body && typeof body.message === 'string' ? body.message : null;
+				onNotice?.(`Export base not changed${message ? `: ${message}` : ': the server could not be reached.'}`);
+			}
+		} finally {
+			// Settling the busy flag is what lets Notebook.svelte's select resync to the
+			// base the document really holds, whichever way the attempt went.
+			exportBaseBusy = false;
+		}
 	}
 
 	/**
@@ -3677,12 +3789,19 @@
 			exportCount={exportCount}
 			onSetExportTarget={setExportTargetValue}
 			onExportPy={exportPy}
+			exportBase={exportBase}
+			exportResolved={exportResolved}
+			exportResolveError={exportResolveError}
+			exportBaseBusy={exportBaseBusy}
+			onSetExportBase={setExportBaseValue}
 			root={root}
 			isPy={isPy}
 			availableRoots={availableRoots}
 			rootBusy={rootBusy}
 			rootFeedback={rootFeedback}
 			onSetRoot={setRootValue}
+			rootSectionEnabled={showCodeRoot}
+			rootDeclaredThisSession={rootSeen}
 			onSetScrolled={setScrolled}
 			hideAllCode={hideAllCode}
 			onSetHideInput={setHideInput}

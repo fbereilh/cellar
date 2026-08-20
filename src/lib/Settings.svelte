@@ -32,9 +32,18 @@
 		virtualizeCells?: boolean;
 		/** A `?virtualize=` URL param decided it: show the state, but lock the control. */
 		virtualizeForced?: boolean;
+		/**
+		 * Code root bar visibility - the same shell-owned, threaded-in shape as
+		 * `virtualizeCells` (one `$state` in `+page.svelte`, one persisted key), so
+		 * this control cannot drift from what the notebooks render. Per VIEWER, not
+		 * per notebook: it is a display choice about the shell, and a notebook with a
+		 * root actually DECLARED shows the bar regardless of it.
+		 */
+		showCodeRoot?: boolean;
 		onClose?: () => void;
 		onSetTheme: (id: string) => void;
 		onToggleVirtualizeCells?: () => void;
+		onToggleShowCodeRoot?: () => void;
 		onVenvRebound?: () => void;
 	}
 	let {
@@ -42,9 +51,11 @@
 		theme,
 		virtualizeCells = true,
 		virtualizeForced = false,
+		showCodeRoot = false,
 		onClose,
 		onSetTheme,
 		onToggleVirtualizeCells,
+		onToggleShowCodeRoot,
 		onVenvRebound
 	}: Props = $props();
 
@@ -451,6 +462,30 @@
 							(windowed rendering {virtualizeCells ? 'on' : 'off'}); reload without it to change this.
 						</p>
 					{/if}
+				</div>
+
+				<div class="divider my-1"></div>
+
+				<!-- Code root bar. Hidden by default (roots are a specialist workflow);
+				     this opt-in shows the bar on every notebook. The copy states the one
+				     exception up front, because it is the invariant that makes the default
+				     safe: a notebook whose root IS declared always shows the bar. -->
+				<div data-testid="show-code-root-control">
+					<label class="flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Show the code root bar</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={showCodeRoot}
+							onchange={() => onToggleShowCodeRoot?.()}
+							data-testid="settings-show-code-root"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						Show the bar for choosing the directory a notebook's kernel runs in (a git worktree under
+						<span class="font-mono">roots/</span>, or a sibling checkout). Off, the bar appears only on a
+						notebook that actually has a code root declared - a set root is never hidden.
+					</p>
 				</div>
 
 				<div class="divider my-1"></div>

@@ -19,7 +19,7 @@
  */
 import { execFile, spawnSync } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { workspaceRoot, resolveInWorkspace } from './fstree';
 import { MAX_FILE_BYTES } from '$lib/server/limits.js';
 
@@ -764,6 +764,41 @@ function parseWorktreePorcelain(out: string): GitWorktree[] {
 		else if (line === 'prunable' || line.startsWith('prunable ')) cur.prunable = true;
 	}
 	return list;
+}
+
+/**
+ * The git root ENCLOSING a directory: the nearest ancestor (the directory
+ * itself included) holding a `.git` entry, or null when none does - a
+ * first-class "not inside a repository" answer, never a throw. Backs the
+ * export target's `git` base (`export-py.ts`), which needs the top of the
+ * working tree the NOTEBOOK lives in.
+ *
+ * A `.git` FILE counts alongside a `.git` directory: a linked worktree (and a
+ * submodule) marks its top level with a pointer file, and that top level is
+ * exactly the "git root" a repo-relative path should be measured from - the
+ * same both-shapes rule `build-freshness.js`'s `isSourceCheckout` applies.
+ *
+ * SYNC and spawn-free on purpose: it is called from the synchronous export
+ * setter/resolver (`setExportTarget`, `resolveExportTarget`), so it must not
+ * thread async through them, and a `statSync` per ancestor level is far cheaper
+ * than a `git rev-parse` subprocess. The walk is LEXICAL (no realpath), like
+ * every path this app binds and persists - the two-namespace rule: the result
+ * is used as the base `relative()` measures against, so it must live in the
+ * same namespace as the notebook path it was derived from.
+ */
+export function gitRootOf(absDir: string): string | null {
+	let dir = absDir;
+	for (;;) {
+		try {
+			statSync(join(dir, '.git')); // a directory OR a worktree/submodule pointer file
+			return dir;
+		} catch {
+			/* keep walking up */
+		}
+		const parent = dirname(dir);
+		if (parent === dir) return null; // filesystem root reached
+		dir = parent;
+	}
 }
 
 /** The honest "this directory is not a git checkout" answer. */

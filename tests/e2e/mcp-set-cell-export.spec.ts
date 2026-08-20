@@ -133,8 +133,11 @@ test('an agent names a target, marks cells, and a real .py module appears - the 
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await page.getByText('analysis.ipynb').first().dblclick();
 	await expect(page.getByRole('heading', { name: 'Circle analysis' })).toBeVisible();
-	// Nothing marked, no target: the export bar is not offered at all.
-	await expect(page.getByTestId('export-bar')).toHaveCount(0);
+	// Nothing marked, no target: the export bar is PRESENT but unconfigured - it
+	// is now the always-visible section a target is set in BEFORE marking cells.
+	await expect(page.getByTestId('export-bar')).toBeVisible();
+	await expect(page.getByTestId('export-target-input')).toHaveValue('');
+	await expect(page.getByTestId('export-count')).toHaveText('0 cells marked');
 	await shot(page, '01-before-no-export.png');
 
 	// --- the agent's read: it can SEE there is no target and no marks ----------

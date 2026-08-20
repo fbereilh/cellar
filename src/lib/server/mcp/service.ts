@@ -29,8 +29,7 @@ import {
 	setExportTarget as setExportTargetDoc,
 	InvalidExportTargetError,
 	setCellExports as setCellExportsDoc,
-	getExportTarget,
-	effectiveExportTarget,
+	exportTargetInfo,
 	isPyTextNotebook,
 	lastExportError,
 	getActiveNotebookPath,
@@ -1810,12 +1809,21 @@ export function setReportView(enabled: boolean, nb?: string | null) {
 
 /**
  * MCP `set_export_target`. The notebook-level nbdev-style `#|default_exp` target:
- * the workspace-relative `.py` module the cells marked `cellar.export` are written
- * to. Setting it (or clearing it with null/'') persists in the allowlisted
- * `cellar` namespace so it round-trips through clean-on-save, and `persist`
- * regenerates the module as a side effect (auto-on-save) exactly like the UI's
- * target input. Returns the resulting `export_target` (the trimmed path, or null
- * when cleared); `get_notebook_map`'s `display` block reports the same value.
+ * the `.py` module the cells marked `cellar.export` are written to. Setting it
+ * (or clearing it with null/'') persists in the allowlisted `cellar` namespace so
+ * it round-trips through clean-on-save, and `persist` regenerates the module as a
+ * side effect (auto-on-save) exactly like the UI's target input. Returns the
+ * resulting `export_target` (the RESOLVED workspace-relative path, or null when
+ * cleared); `get_notebook_map`'s `display` block reports the same value.
+ *
+ * `base` names what the path is measured FROM - `workspace` (the default, and
+ * the only shape that existed before bases; an omitted `base` means it, so a
+ * pre-base caller is byte-identical), `notebook` (the notebook's own folder) or
+ * `git` (the notebook's enclosing repository). The doc layer validates it and
+ * refuses an unknown value or a `git` base with no repository as `invalid`
+ * (typed, so it takes the same branch as a bad path); a non-workspace base rides
+ * back as `export_base` + `export_path` beside the resolved `export_target`, so
+ * the workspace reply shape is unchanged and pays nothing.
  *
  * Unlike the pure display setters this one DOES have a side effect (it drives the
  * generated `.py`), but it changes no cell source, so like them it takes no
@@ -1854,11 +1862,15 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * targeted any more" - a directive lives in a cell, so no notebook-level setter
  * can clear it.
  */
-export function setExportTarget(target: string | null | undefined, nb?: string | null) {
+export function setExportTarget(
+	target: string | null | undefined,
+	nb?: string | null,
+	base?: string | null
+) {
 	const nbTarget = nb ?? getActiveNotebookPath();
 	if (isPyTextNotebook(nbTarget)) return { ok: false as const, refused: 'py-notebook' as const };
 	try {
-		setExportTargetDoc(target ?? null, nbTarget);
+		setExportTargetDoc(target ?? null, nbTarget, undefined, base ?? null);
 	} catch (err) {
 		// A path that escapes the workspace is refused where it is SET, not stored to
 		// generate nothing on every later save (see `setExportTarget` in notebook.ts).
@@ -1971,8 +1983,9 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 
 /**
  * WHERE the marks land, reported the way the EXPORTER resolves it
- * (`effectiveExportTarget` = `resolveTarget`): the notebook-level
- * `export_target`, else a `#|default_exp` directive in a cell.
+ * (`exportTargetInfo` = `resolveExportTarget`): the notebook-level
+ * `export_target` resolved through its `export_base`, else a `#|default_exp`
+ * directive in a cell.
  *
  * Reading the notebook metadata alone was wrong in both directions on a
  * directive-targeted notebook (the nbdev-native spelling): the marks really do
@@ -1981,17 +1994,39 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
  * unmarking the last cell there warned nothing, which is precisely the case the
  * warning exists for.
  *
+ * `export_target` is always the RESOLVED workspace-relative path (what the
+ * module IS, wherever the marks are measured from), so every consumer that only
+ * asks "where do the marks land" is untouched by bases. The stored spelling
+ * rides beside it as `export_base` + `export_path` ONLY for a non-workspace
+ * base, so a legacy notebook's reply is byte-identical (the `module`/`undo`
+ * conditional shape). A target that is CONFIGURED but cannot resolve (a `git`
+ * base outside any repository, a path resolving outside the workspace, an
+ * unknown hand-edited base) reports `export_target:null` - honest: no module is
+ * being written - plus `export_target_error` with the stored form, so the state
+ * is never mistaken for "nothing configured".
+ *
  * `export_target_source` is present ONLY for the directive case, so an ordinary
- * call pays no tokens for it (the `module`/`undo` conditional shape) - and it is
- * what keeps the reported target from being read as the notebook SETTING: a
- * directive lives in a cell, so `set_export_target(null)` cannot clear it.
+ * call pays no tokens for it - and it is what keeps the reported target from
+ * being read as the notebook SETTING: a directive lives in a cell, so
+ * `set_export_target(null)` cannot clear it.
  */
 function exportTargetFields(nb?: string | null) {
-	const target = effectiveExportTarget(nb);
-	const fromDirective = target != null && target !== getExportTarget(nb);
+	const info = exportTargetInfo(nb);
+	if (!info) return { export_target: null as string | null };
+	const sourceFlag =
+		info.source === 'default_exp' ? { export_target_source: 'default_exp' as const } : {};
+	if (!info.ok)
+		return {
+			export_target: null as string | null,
+			export_base: info.base,
+			export_path: info.path,
+			export_target_error: info.error,
+			...sourceFlag
+		};
 	return {
-		export_target: target,
-		...(fromDirective ? { export_target_source: 'default_exp' as const } : {})
+		export_target: info.target as string | null,
+		...(info.base !== 'workspace' ? { export_base: info.base, export_path: info.path } : {}),
+		...sourceFlag
 	};
 }
 

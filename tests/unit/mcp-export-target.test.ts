@@ -293,7 +293,13 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 				})
 			});
 
-		expect(await (await call('lib/held.py')).json()).toEqual({ ok: true, target: 'lib/held.py' });
+		expect(await (await call('lib/held.py')).json()).toEqual({
+			ok: true,
+			target: 'lib/held.py',
+			base: 'workspace',
+			resolved: 'lib/held.py',
+			resolveError: null
+		});
 		// Refused, and the reply names the target still in force - so the field reverts to
 		// what the server really holds rather than to whatever it last remembered.
 		const refused = await call('src/app.ts');
@@ -331,7 +337,13 @@ describe('the stored value is what is reported back', () => {
 				})
 			})
 		});
-		expect(await res.json()).toEqual({ ok: true, target: 'lib/stored.py' });
+		expect(await res.json()).toEqual({
+			ok: true,
+			target: 'lib/stored.py',
+			base: 'workspace',
+			resolved: 'lib/stored.py',
+			resolveError: null
+		});
 		expect(nbmod.getExportTarget(nb)).toBe('lib/stored.py');
 	});
 
@@ -343,7 +355,13 @@ describe('the stored value is what is reported back', () => {
 				body: JSON.stringify({ op: 'set-target', target: '  ', path: 'stored-target.ipynb' })
 			})
 		});
-		expect(await res.json()).toEqual({ ok: true, target: null });
+		expect(await res.json()).toEqual({
+			ok: true,
+			target: null,
+			base: 'workspace',
+			resolved: null,
+			resolveError: null
+		});
 		expect(nbmod.getExportTarget(svc.targetFor('sessStored'))).toBeNull();
 	});
 
