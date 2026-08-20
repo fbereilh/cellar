@@ -153,6 +153,31 @@
 	/** Announced to assistive tech after a KEYBOARD move, which has no visual drag to watch. */
 	let moveAnnouncement = $state('');
 
+	// ---- Roving tabindex ----------------------------------------------------
+	//
+	// The tablist pattern makes the whole strip exactly ONE Tab stop: one tab is
+	// tabbable and every other is reachable from it with the arrows. So the
+	// document's Tab order stays proportional to what the strip MEANS (one control
+	// - "which file am I looking at") rather than growing by one stop per open
+	// file, with the per-tab close buttons doubling it again.
+	//
+	// It follows the FOCUSED tab rather than the selected one, so tabbing away and
+	// back returns to where the user was; it falls back to the selected tab, and
+	// then to the first, so the strip always has exactly one stop even before it
+	// has ever been focused.
+	let focusedTabId = $state<string | null>(null);
+	const rovingTabId = $derived.by(() => {
+		const present = (id: string | null) => id != null && tabs.some((t) => t.id === id);
+		if (present(focusedTabId)) return focusedTabId;
+		if (present(activeTabId)) return activeTabId;
+		return tabs[0]?.id ?? null;
+	});
+	// A closed tab must not leave a pointer behind: reopened later it would claim
+	// the roving stop over the tab the user is actually looking at.
+	$effect(() => {
+		if (focusedTabId != null && !tabs.some((t) => t.id === focusedTabId)) focusedTabId = null;
+	});
+
 	/**
 	 * The strip's laid-out geometry, in document order, snapshotted when a drag
 	 * begins. Snapshotted rather than re-measured per move because the dragged tab
@@ -199,6 +224,14 @@
 
 	function onPointerMove(e: PointerEvent) {
 		if (!press || e.pointerId !== press.pointerId) return;
+		// A cancelled gesture stays cancelled for the REST of its life. Escape clears
+		// `dragId` but deliberately leaves the gesture running (so the release is still
+		// ours to swallow), and the threshold below is measured from the ORIGINAL press
+		// point - which the pointer is by then far away from - so without this the very
+		// next move re-crossed it and restarted a drag the user had just abandoned:
+		// the tab lifted again, the indicator came back, and the drop then silently did
+		// nothing.
+		if (press.cancelled) return;
 		const dx = e.clientX - press.x;
 		const dy = e.clientY - press.y;
 		if (!dragId) {
@@ -330,6 +363,24 @@
 							? (index - 1 + n) % n
 							: (index + 1) % n;
 			focusTab(tabs[to]?.id);
+			return;
+		}
+		// Delete/Backspace close the focused tab. The close button is inside the tab
+		// and is NOT in the document's Tab order (that is what the roving tabindex
+		// buys), so this is the keyboard's only route to it - without it the pattern
+		// would have made closing a tab pointer-only.
+		if (bare && (e.key === 'Delete' || e.key === 'Backspace')) {
+			e.preventDefault();
+			if (!tabs[index]?.closable) return;
+			// Land on the tab that takes the closed one's SLOT, else the one before it.
+			// Assigned before the close so the roving stop leaves the dying tab with it;
+			// closing the last tab leaves nothing to focus, and nothing pointing at a
+			// node that is gone either.
+			const next = tabs[index + 1]?.id ?? tabs[index - 1]?.id ?? null;
+			focusedTabId = next;
+			onCloseTab(id);
+			await tick();
+			focusTab(next ?? undefined);
 			return;
 		}
 		const chord = chordFromEvent(e);
@@ -620,11 +671,12 @@
 				data-run-state={runState || undefined}
 				data-dragging={dragging || undefined}
 				role="tab"
-				tabindex="0"
+				tabindex={tab.id === rovingTabId ? 0 : -1}
 				id={tabDomId(tab.id)}
 				aria-controls={tabPanelDomId(tab.id)}
 				aria-selected={tab.id === activeTabId}
 				aria-label="{tab.title}, tab {i + 1} of {tabs.length}"
+				onfocusin={() => (focusedTabId = tab.id)}
 				onpointerdown={(e) => onTabPointerDown(e, tab.id)}
 				onkeydown={(e) => onTabKeydown(e, tab.id, i)}
 				onclick={() => onSelectTab(tab.id)}
@@ -647,6 +699,7 @@
 						aria-label="Jump to running cell"
 						data-testid="tab-jump-running"
 						data-tab-nodrag
+						tabindex={-1}
 						onclick={(e) => {
 							e.stopPropagation();
 							onJumpToRunningCell?.(tab.id);
@@ -678,6 +731,7 @@
 						aria-label="Close tab"
 						data-testid="tab-close"
 						data-tab-nodrag
+						tabindex={-1}
 					>
 						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg>
 					</button>

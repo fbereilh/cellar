@@ -30,6 +30,13 @@ let baseURL = '';
 
 const FILES = ['alpha.txt', 'bravo.txt', 'charlie.txt', 'delta.txt'];
 const HTML_FILE = 'report.html';
+/**
+ * An ORDINARY filename that is awkward for a DOM id: a tab id is
+ * `file:<workspace path>`, an HTML `id` may not contain ASCII whitespace, and
+ * `aria-controls`/`aria-labelledby` are IDREF LISTS - so a space here once split
+ * the value into two tokens, neither of which resolved.
+ */
+const ODD_FILE = 'my notes (draft).txt';
 const tabId = (name: string) => 'file:' + name;
 
 /** The tab ids in strip (DOM) order - the thing every assertion here is about. */
@@ -124,6 +131,7 @@ test.beforeAll(async () => {
 	workspace = mkdtempSync(join(tmpdir(), 'cellar-tab-reorder-'));
 	for (const name of FILES) writeFileSync(join(workspace, name), `contents of ${name}\n`);
 	writeFileSync(join(workspace, HTML_FILE), '<!doctype html><title>report</title><p>hello</p>\n');
+	writeFileSync(join(workspace, ODD_FILE), `contents of ${ODD_FILE}\n`);
 	const booted = await bootCellar(workspace);
 	launcher = booted.proc;
 	baseURL = booted.url;
@@ -252,6 +260,21 @@ test('the drop indicator names the slot the tab will land in, and Escape abandon
 	await page.keyboard.press('Escape');
 	await expect(indicator).toHaveCount(0);
 	await expect(page.locator('[data-testid="tab"][data-dragging="true"]')).toHaveCount(0);
+
+	// AND IT STAYS ABANDONED FOR THE REST OF THE GESTURE. The button is still down,
+	// and the drag threshold is measured from the ORIGINAL press point - which the
+	// pointer is now far away from - so a handler that only checks `dragId` re-crosses
+	// it on the very next move and silently RESTARTS the drag the user just called off:
+	// the tab lifts again, the indicator comes back, and the drop then does nothing.
+	// Releasing straight after Escape cannot see that; moving further can.
+	await page.mouse.move(charlie.x + charlieBox.width, charlie.y, { steps: 6 });
+	await page.mouse.move(charlie.x + charlieBox.width * 2, charlie.y + 6, { steps: 6 });
+	await expect(indicator).toHaveCount(0);
+	await expect(page.locator('[data-testid="tab"][data-dragging="true"]')).toHaveCount(0);
+	expect(await lifted.evaluate((el) => getComputedStyle(el).transform)).toBe('none');
+	expect(await tabOrder(page)).toEqual(before);
+	expect(await activeTab(page)).toBe(activeBefore);
+
 	await page.mouse.up();
 	await page.waitForTimeout(150);
 	expect(await tabOrder(page)).toEqual(before);
@@ -459,6 +482,147 @@ test('the strip is a real tablist: arrows move focus without switching files', a
 	await expect(panel).toHaveAttribute('role', 'tabpanel');
 	await expect(panel).toHaveAttribute('aria-labelledby', (await tab.getAttribute('id'))!);
 	await expect(tab).toHaveAttribute('aria-selected', 'true');
+});
+
+test('the whole strip is exactly ONE Tab stop, and the stop follows focus', async ({ page }) => {
+	test.setTimeout(120_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await resetStrip(page);
+
+	const focusedTabId = () =>
+		page.evaluate(() => (document.activeElement as HTMLElement)?.dataset?.tabId ?? null);
+	const focusedTestId = () =>
+		page.evaluate(() => (document.activeElement as HTMLElement)?.dataset?.testid ?? null);
+
+	// Walk the document's own Tab order from the control BEFORE the strip. The
+	// tablist pattern makes the strip one stop however many files are open: without
+	// a roving tabindex this trail holds a stop per tab, plus one per close button.
+	await page.getByTestId('toggle-sidebar').focus();
+	const trail: { testid: string | null; tabId: string | null }[] = [];
+	for (let i = 0; i < 12; i++) {
+		await page.keyboard.press('Tab');
+		const step = { testid: await focusedTestId(), tabId: await focusedTabId() };
+		trail.push(step);
+		// Stop as soon as we have entered the strip and left it again.
+		if (trail.some((t) => t.testid === 'tab') && step.testid !== 'tab') break;
+	}
+	expect(trail.filter((t) => t.testid === 'tab')).toHaveLength(1);
+	expect(
+		trail.filter((t) => t.testid === 'tab-close' || t.testid === 'tab-jump-running')
+	).toHaveLength(0);
+	// The one stop is the selected tab, so tabbing in lands on the file you are looking at.
+	expect(trail.find((t) => t.testid === 'tab')!.tabId).toBe(await activeTab(page));
+
+	// And the stop FOLLOWS focus: browse to another tab with the arrows, leave the
+	// strip, come back, and focus returns where it was rather than to the selected
+	// tab (or, without roving at all, to whichever tab happens to sit last in the DOM).
+	await page.locator('[data-testid="tab"]').first().focus();
+	await page.keyboard.press('ArrowRight');
+	const parked = await focusedTabId();
+	expect(parked).toBe((await tabOrder(page))[1]);
+	await page.keyboard.press('Tab');
+	expect(await focusedTabId()).not.toBe(parked);
+	await page.keyboard.press('Shift+Tab');
+	expect(await focusedTabId()).toBe(parked);
+	// Browsing still never switched the file.
+	expect(await activeTab(page)).toBe(tabId('delta.txt'));
+});
+
+test('Delete and Backspace close the focused tab, and focus lands on a neighbour', async ({
+	page
+}) => {
+	test.setTimeout(120_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await resetStrip(page);
+
+	const focusedTabId = () =>
+		page.evaluate(() => (document.activeElement as HTMLElement)?.dataset?.tabId ?? null);
+	const tabAt = (i: number) => page.locator('[data-testid="tab"]').nth(i);
+
+	// The close button is no longer in the document's Tab order (the roving tabindex
+	// is what buys the single stop above), so this is the keyboard's route to it.
+	await tabAt(1).focus(); // bravo
+	await page.keyboard.press('Delete');
+	await expect
+		.poll(() => tabOrder(page))
+		.toEqual(['alpha.txt', 'charlie.txt', 'delta.txt'].map(tabId));
+	// Focus lands on the tab that took the closed one's SLOT.
+	await expect.poll(focusedTabId).toBe(tabId('charlie.txt'));
+	// Closing a tab beside the active one leaves the active one alone.
+	expect(await activeTab(page)).toBe(tabId('delta.txt'));
+
+	await page.keyboard.press('Backspace');
+	await expect.poll(() => tabOrder(page)).toEqual(['alpha.txt', 'delta.txt'].map(tabId));
+	await expect.poll(focusedTabId).toBe(tabId('delta.txt'));
+
+	// No tab takes the LAST slot, so focus falls back to the one before it.
+	await page.keyboard.press('Delete');
+	await expect.poll(() => tabOrder(page)).toEqual([tabId('alpha.txt')]);
+	await expect.poll(focusedTabId).toBe(tabId('alpha.txt'));
+
+	// Closing the last one leaves nothing focus-orphaned: focus is not stranded on a
+	// node the strip no longer has.
+	await page.keyboard.press('Delete');
+	await expect(page.locator('[data-testid="tab"]')).toHaveCount(0);
+	expect(
+		await page.evaluate(() => {
+			const el = document.activeElement as HTMLElement | null;
+			return { attached: el ? el.isConnected : false, tabId: el?.dataset?.tabId ?? null };
+		})
+	).toEqual({ attached: true, tabId: null });
+});
+
+test('a filename with a space still names the pane it controls', async ({ page }) => {
+	test.setTimeout(120_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await resetStrip(page);
+
+	// A tab id is `file:<workspace path>`, so an ordinary filename with a space once
+	// produced `id="tabpanel:file:my notes (draft).txt"`: invalid HTML, and - because
+	// `aria-controls`/`aria-labelledby` are IDREF LISTS - a value that parses as two
+	// tokens, NEITHER of which resolves. The tab silently lost the pane it controls
+	// and the pane lost its accessible name, for exactly those files.
+	await page.locator(`[data-testid="tree-file"][data-path="${ODD_FILE}"]`).dblclick();
+	const tab = page.locator(`[data-testid="tab"][data-tab-id="${tabId(ODD_FILE)}"]`);
+	await expect(tab).toBeVisible();
+
+	const domId = (await tab.getAttribute('id'))!;
+	const panelId = (await tab.getAttribute('aria-controls'))!;
+	expect(domId).not.toMatch(/[\t\n\f\r ]/);
+	expect(panelId).not.toMatch(/[\t\n\f\r ]/);
+
+	// An attribute selector, not `#id`: these ids carry `:`, `/` and `%`, and
+	// `CSS.escape` is a browser global that does not exist in this Node test process.
+	const panel = page.locator(`[id="${panelId}"]`);
+	await expect(panel).toHaveCount(1);
+	await expect(panel).toHaveAttribute('role', 'tabpanel');
+	await expect(panel).toHaveAttribute('aria-labelledby', domId);
+
+	// Resolved the way assistive tech resolves an IDREF list - by splitting on
+	// whitespace and looking each token up - which is the step the raw id failed.
+	expect(
+		await page.evaluate(([t, p]) => {
+			const ids = (el: Element | null, attr: string) =>
+				(el?.getAttribute(attr) ?? '')
+					.split(/[\t\n\f\r ]+/)
+					.filter(Boolean)
+					.map((token) => document.getElementById(token));
+			const tabEl = document.getElementById(t);
+			const panelEl = document.getElementById(p);
+			return {
+				controls: ids(tabEl, 'aria-controls').filter((n) => n === panelEl).length,
+				labelledBy: ids(panelEl, 'aria-labelledby').filter((n) => n === tabEl).length
+			};
+		}, [domId, panelId])
+	).toEqual({ controls: 1, labelledBy: 1 });
+
+	// The tab is still an ordinary tab: it selects, and it reorders.
+	await tab.click();
+	await expect.poll(() => activeTab(page)).toBe(tabId(ODD_FILE));
+	const first = await centreOf(page, (await tabOrder(page))[0]);
+	await dragTabTo(page, tabId(ODD_FILE), first.x - 200, first.y);
+	await expect.poll(async () => (await tabOrder(page))[0]).toBe(tabId(ODD_FILE));
+	expect(await activeTab(page)).toBe(tabId(ODD_FILE));
 });
 
 test('a double-click still promotes a preview tab', async ({ page }) => {
