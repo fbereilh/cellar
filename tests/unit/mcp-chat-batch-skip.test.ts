@@ -35,6 +35,7 @@ let turns: string[];
 beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-chat-batch-'));
 	process.env.CELLAR_WORKSPACE = WS;
+	process.env.CELLAR_USER_SETTINGS = join(WS, 'user-settings.json');
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
 	enginemod = await import('../../src/lib/server/chat/engine');

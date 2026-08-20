@@ -4,26 +4,58 @@
  * ## The frozen flag set is the safety boundary - treat it like the sandbox
  * ## attribute in HtmlPreview: one word wide, pinned by a unit test.
  *
- * `chatCliArgs()` disables every capability except "answer this text":
- * `--tools ""` (no tools), `--disable-slash-commands`, `--setting-sources ""`
- * (the user's/project's CLAUDE.md, settings.json hooks, allowedTools etc. are
- * never loaded), `--strict-mcp-config` with no MCP config (no MCP servers),
+ * `chatCliArgs()` disables every capability except "answer this text" plus, on
+ * an explicit user opt-in, web search and NOTHING wider: `--tools <allowlist>`
+ * (`""` by default - no tools; `WebSearch` when the run opted in - search is
+ * mediated, so it is deliberately NOT WebFetch or any fetch-shaped tool),
+ * `--allowedTools <allowlist>` on the SEARCH shape ONLY (see below - `--tools`
+ * alone makes the tool exist but leaves the CALL permission-gated, so the
+ * opt-in would be inert; the default shape passes neither flag and is
+ * byte-for-byte the pre-settings argv),
+ * `--disable-slash-commands`, `--setting-sources ""` (the user's/project's
+ * CLAUDE.md, settings.json hooks, allowedTools etc. are never loaded),
+ * `--strict-mcp-config` with no MCP config (no MCP servers),
  * `--no-session-persistence` (nothing written into the slot's history). The CLI
  * is spawned with the scrubbed env (`chatChildEnv`) and a NEUTRAL cwd
- * (`os.tmpdir()`), so no project directory can contribute context. And the
- * permissions-bypass flag (the "dangerously skip" one) is never passed - with
- * tools off there is nothing to skip, and the literal appearing ANYWHERE in
- * this module (this comment included) is a test failure.
+ * (`os.tmpdir()`), so no project directory can contribute context. The model is
+ * a user setting, but NO user text reaches argv: the stored value is constrained
+ * to `$lib/chatCell`'s closed `CHAT_MODELS` list (`normalizeChatModel`, applied
+ * HERE as well as at the settings read, so no caller can route around it) and
+ * anything else falls back to the default. And the permissions-bypass flag (the
+ * "dangerously skip" one) is never passed - a read-only search tool needs no
+ * permission skipped, and the literal appearing ANYWHERE in this module (this
+ * comment included) is a test failure.
  *
- * ## The init assertion (fail closed)
+ * ## `--tools` REQUESTS a tool; `--allowedTools` GRANTS the call
+ *
+ * Measured against claude 2.1.237: with `--tools WebSearch` alone the session
+ * LISTS the tool (so `system/init` reports it and the allowlist assertion below
+ * passes), but in non-interactive `-p` mode the CALL is still permission-gated
+ * - the model calls WebSearch and the CLI answers `Claude requested permissions
+ * to use WebSearch, but you haven't granted it yet.`, so the opt-in is INERT
+ * and the reply a user sees is a dead end Cellar offers no way out of (and not
+ * the `unsafe_init` path any copy explains). The identical argv plus
+ * `--allowedTools WebSearch` performs the search and returns cited results, so
+ * the search shape passes BOTH flags - and both from the SAME
+ * `chatToolAllowlist(webSearch)` the init assertion reads, one source for
+ * request, grant and assertion, so the grant can never name a tool the run did
+ * not request and then assert. An EMPTY `--allowedTools` is never passed: the
+ * default shape omits the flag entirely, which is what keeps its argv
+ * byte-for-byte the pre-settings one.
+ *
+ * ## The init assertion (fail closed, EXACT allowlist - never a relaxation)
  *
  * Flags are a REQUEST; the CLI's own `system/init` event is the REPORT of what
- * the session actually got. Every run asserts that report - `tools`,
- * `mcp_servers` and `slash_commands` all present and empty (`skills` empty when
- * present) - and a violation KILLS the child and fails the run `unsafe_init`
- * rather than rendering a reply produced by a session with capabilities. A
- * future CLI version that renames those fields fails closed too: "cannot
- * verify" is not "safe".
+ * the session actually got. Every run asserts that report against the tool set
+ * THAT RUN requested, exactly: `tools` must equal the allowlist (`[]` for a
+ * default run - byte-for-byte today's guarantee; `['WebSearch']` for a
+ * search-on run - a report carrying any tool the run did not request, or
+ * missing one it did, is the same verdict), and `mcp_servers` and
+ * `slash_commands` stay asserted empty on EVERY path (`skills` empty when
+ * present). A violation KILLS the child and fails the run `unsafe_init` rather
+ * than rendering a reply produced by a session whose capabilities do not match
+ * the request. A future CLI version that renames those fields fails closed
+ * too: "cannot verify" is not "safe".
  *
  * The MISSING event fails closed the same way, and that is the same rule rather
  * than an extra one: an assertion that only runs when the report arrives is no
@@ -43,6 +75,9 @@
  * ## the unit fixtures)
  *
  *   {type:'system',subtype:'init',tools:[],mcp_servers:[],slash_commands:[],skills:[],claude_code_version,...}
+ *   (with `--tools WebSearch`, claude 2.1.237 reports tools:["WebSearch"] - exactly
+ *   the requested tool and nothing else; probed rather than assumed, and committed
+ *   as the SEARCH_INIT fixture beside SAFE_INIT in the unit test)
  *   {type:'stream_event',event:{type:'content_block_delta',delta:{type:'text_delta',text:'...'}}}
  *   {type:'rate_limit_event',rate_limit_info:{status:'allowed'|...,resetsAt:<epoch-sec>,...}}
  *   {type:'result',subtype:'success',is_error:false,result:'...',...}
@@ -54,16 +89,39 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
+import { normalizeChatModel } from '$lib/chatCell';
 import { chatChildEnv, CLAUDE_BIN } from './env';
 import type { ChatEngine, ChatEngineFailure, ChatEngineResult, ChatEngineRunArgs } from './engine';
 
-/** The model chat cells use (a settled decision, not yet a setting). */
-export const CHAT_MODEL = 'sonnet';
+/**
+ * The one tool a search-on run requests, spelled exactly as the CLI reports it
+ * in `system/init` (probed against claude 2.1.237: `--tools WebSearch` reports
+ * `tools:["WebSearch"]`, nothing else). Search ONLY - never WebFetch: search is
+ * mediated, arbitrary URL fetching is not.
+ */
+export const WEB_SEARCH_TOOL = 'WebSearch';
 
 /**
- * The fixed system prompt. FROZEN deliberately: it is part of the cached prompt
- * prefix (see transcript.ts's byte-stability rule), so nothing time-varying or
- * per-run may be interpolated into it.
+ * The tool allowlist for one run - what the argv REQUESTS and what the init
+ * assertion then requires the CLI to have REPORTED, from ONE function so the
+ * two can never drift. `[]` is the default bare session.
+ */
+export function chatToolAllowlist(webSearch: boolean): readonly string[] {
+	return webSearch ? [WEB_SEARCH_TOOL] : [];
+}
+
+/**
+ * The fixed system prompts, one per capability shape. Each is FROZEN
+ * deliberately: the prompt is part of the cached prompt prefix (see
+ * transcript.ts's byte-stability rule), so nothing time-varying or per-run may
+ * be interpolated into either. TWO variants rather than one templated string,
+ * because the prompt must be TRUE for the capability the run actually has - the
+ * bare prompt's "you cannot browse" is false for a search-on run, and a model
+ * told it cannot browse while holding a search tool is a bad state - while a
+ * single interpolated prompt would make byte-stability a property of the
+ * interpolation instead of the constant. Flipping the setting changes which
+ * frozen prefix is sent (one cache miss), which is inherent to changing the
+ * capability; within a shape every run stays byte-stable.
  */
 export const CHAT_SYSTEM_PROMPT = [
 	'You are the AI assistant inside Cellar, a data notebook. The user message is',
@@ -75,29 +133,64 @@ export const CHAT_SYSTEM_PROMPT = [
 	'need, say what to run.'
 ].join(' ');
 
+/** The search-on variant: same framing, capability sentence accurate for it. */
+export const CHAT_SYSTEM_PROMPT_WEB_SEARCH = [
+	'You are the AI assistant inside Cellar, a data notebook. The user message is',
+	'the notebook so far, rendered as labelled blocks: [cell <id> · <kind>] holds',
+	"a cell's source, [cell <id> · output] its result, [cell <id> · reply] an",
+	'earlier answer of yours, and [question] is what to answer now. Answer in',
+	'concise markdown. Your only tool is web search - use it when the question',
+	'needs current or external information, and say when a claim comes from a',
+	'search result. You cannot run code or read files - never claim to have done',
+	'so; when the notebook lacks what you would need, say what to run.'
+].join(' ');
+
+/** Which frozen prompt a run sends - decided by the same flag as the allowlist. */
+export function chatSystemPrompt(webSearch: boolean): string {
+	return webSearch ? CHAT_SYSTEM_PROMPT_WEB_SEARCH : CHAT_SYSTEM_PROMPT;
+}
+
+/** The per-run capability inputs `chatCliArgs` accepts (all optional = today's bare run). */
+export interface ChatCliOptions {
+	/** Untrusted: constrained through `normalizeChatModel` before touching argv. */
+	model?: unknown;
+	/** Only a literal `true` widens the session to web search. */
+	webSearch?: boolean;
+}
+
 /**
  * The frozen argv (everything but the binary). A FUNCTION returning a fresh
  * array so no caller can mutate the shared safety boundary; the unit test pins
- * the exact contents.
+ * the exact contents of both capability shapes, and `chatCliArgs()` with no
+ * arguments is byte-for-byte the pre-settings argv.
  */
-export function chatCliArgs(): string[] {
+export function chatCliArgs(opts: ChatCliOptions = {}): string[] {
+	const webSearch = opts.webSearch === true;
+	const allowlist = chatToolAllowlist(webSearch);
+	const tools = allowlist.join(',');
 	return [
 		'-p',
 		'--tools',
-		'',
+		tools,
+		// The GRANT (see the header): `--tools` alone leaves the call
+		// permission-gated in `-p` mode, so without this the opt-in is inert. Same
+		// allowlist as the request and the assertion - never a wider set - and
+		// omitted entirely (not passed empty) when there is nothing to grant, which
+		// is what keeps the default argv byte-for-byte the pre-settings one.
+		...(allowlist.length > 0 ? ['--allowedTools', tools] : []),
 		'--disable-slash-commands',
 		'--setting-sources',
 		'',
 		'--strict-mcp-config',
 		'--no-session-persistence',
 		'--model',
-		CHAT_MODEL,
+		normalizeChatModel(opts.model),
 		'--include-partial-messages',
 		'--output-format',
 		'stream-json',
 		'--verbose',
 		'--system-prompt',
-		CHAT_SYSTEM_PROMPT
+		chatSystemPrompt(webSearch)
 	];
 }
 
@@ -155,11 +248,25 @@ function release(): void {
 // -- init assertion -----------------------------------------------------------
 
 /**
- * Why an init report is unsafe/unverifiable, or null when it proves a bare
- * session. Exported for the unit test (fail-closed in BOTH directions).
+ * Why an init report is unsafe/unverifiable, or null when it proves a session
+ * holding EXACTLY `expectedTools` and nothing else. An ALLOWLIST check, never a
+ * relaxation: the reported `tools` must equal the requested set - a tool the
+ * run did not request is a capability no assertion covered, and a requested
+ * tool the CLI did not grant means the (frozen, capability-accurate) system
+ * prompt no longer describes the session - both are the same fail-closed
+ * verdict. The default `[]` keeps the bare path's guarantee byte-for-byte:
+ * `tools` exactly empty. `mcp_servers`/`slash_commands` are asserted empty on
+ * every path (`skills` empty when present). Exported for the unit test
+ * (fail-closed in BOTH directions).
  */
-export function initViolation(init: Record<string, unknown>): string | null {
-	for (const key of ['tools', 'mcp_servers', 'slash_commands'] as const) {
+export function initViolation(init: Record<string, unknown>, expectedTools: readonly string[] = []): string | null {
+	const tools = init.tools;
+	if (!Array.isArray(tools)) return `the CLI's init event did not report tools - cannot verify the session's capabilities`;
+	const extra = tools.filter((t) => !expectedTools.includes(t as string));
+	if (extra.length > 0) return `the CLI session has tools enabled that this run did not request (${extra.map(String).join(', ')})`;
+	const missing = expectedTools.filter((t) => !tools.includes(t));
+	if (missing.length > 0) return `the CLI session is missing tools this run requested (${missing.join(', ')}) - the report does not match the request`;
+	for (const key of ['mcp_servers', 'slash_commands'] as const) {
 		const v = init[key];
 		if (!Array.isArray(v)) return `the CLI's init event did not report ${key} - cannot verify the session is bare`;
 		if (v.length > 0) return `the CLI session has ${key} enabled (${v.length})`;
@@ -202,16 +309,22 @@ export const claudeCliEngine: ChatEngine = {
 	}
 };
 
-function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Promise<ChatEngineResult> {
+function runOnce({ prompt, configDir, model, webSearch, signal, onDelta }: ChatEngineRunArgs): Promise<ChatEngineResult> {
 	return new Promise((resolve) => {
 		if (signal.aborted) {
 			resolve(fail({ kind: 'cancelled', message: 'interrupted' }, null));
 			return;
 		}
 
+		// One flag decides BOTH what the argv requests and what the init assertion
+		// requires the CLI to have reported - reading it once here is what makes
+		// "the report must equal the request" structural rather than two rules.
+		const search = webSearch === true;
+		const expectedTools = chatToolAllowlist(search);
+
 		let child: ChildProcess;
 		try {
-			child = spawn(CLAUDE_BIN, chatCliArgs(), {
+			child = spawn(CLAUDE_BIN, chatCliArgs({ model, webSearch: search }), {
 				env: chatChildEnv(configDir),
 				cwd: tmpdir(),
 				stdio: ['pipe', 'pipe', 'pipe']
@@ -309,7 +422,7 @@ function runOnce({ prompt, configDir, signal, onDelta }: ChatEngineRunArgs): Pro
 					if (typeof e.claude_code_version === 'string' && e.claude_code_version) {
 						engine = `claude-cli/${e.claude_code_version}`;
 					}
-					const violation = initViolation(e);
+					const violation = initViolation(e, expectedTools);
 					if (violation) {
 						unsafe = violation;
 						kill(); // fail closed: never render a reply from a capable session

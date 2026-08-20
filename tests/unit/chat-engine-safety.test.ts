@@ -26,7 +26,19 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chatCliArgs, classifyChatFailure, claudeCliEngine, initViolation, CHAT_MAX_CONCURRENT, CHAT_SYSTEM_PROMPT, CHAT_MODEL } from '../../src/lib/server/chat/claude-cli';
+import {
+	chatCliArgs,
+	chatSystemPrompt,
+	chatToolAllowlist,
+	classifyChatFailure,
+	claudeCliEngine,
+	initViolation,
+	CHAT_MAX_CONCURRENT,
+	CHAT_SYSTEM_PROMPT,
+	CHAT_SYSTEM_PROMPT_WEB_SEARCH,
+	WEB_SEARCH_TOOL
+} from '../../src/lib/server/chat/claude-cli';
+import { CHAT_MODEL_DEFAULT, normalizeChatModel } from '../../src/lib/chatCell';
 import { chatChildEnv, isChatSensitiveEnv } from '../../src/lib/server/chat/env';
 import type { ChatEngineResult } from '../../src/lib/server/chat/engine';
 
@@ -46,17 +58,37 @@ const SAFE_INIT = JSON.stringify({
 	model: 'claude-sonnet-stub'
 });
 
+// The search-on init shape as the REAL CLI reports it - probed against claude
+// 2.1.237 (2026-08-20): `--tools WebSearch` reports tools:["WebSearch"], exactly
+// the requested tool, with mcp_servers/slash_commands/skills still empty.
+// Committed the way SAFE_INIT commits the bare shape, so the assertion is pinned
+// against what the CLI actually says rather than an assumed name.
+const SEARCH_INIT = JSON.stringify({
+	type: 'system',
+	subtype: 'init',
+	tools: ['WebSearch'],
+	mcp_servers: [],
+	slash_commands: [],
+	skills: [],
+	claude_code_version: '9.9.9-stub',
+	model: 'claude-sonnet-stub'
+});
+
 /** Install a stub `claude` whose body is `script` (sh). */
 function stubClaude(script: string) {
 	writeFileSync(join(BIN, 'claude'), `#!/bin/sh\n${script}\n`);
 	chmodSync(join(BIN, 'claude'), 0o755);
 }
 
-function run(overrides: { configDir?: string | null; signal?: AbortSignal } = {}): Promise<ChatEngineResult> & { deltas: string[] } {
+function run(
+	overrides: { configDir?: string | null; signal?: AbortSignal; model?: string; webSearch?: boolean } = {}
+): Promise<ChatEngineResult> & { deltas: string[] } {
 	const deltas: string[] = [];
 	const p = claudeCliEngine.run({
 		prompt: 'hello transcript\n',
 		configDir: overrides.configDir ?? null,
+		model: overrides.model,
+		webSearch: overrides.webSearch,
 		signal: overrides.signal ?? new AbortController().signal,
 		onDelta: (t) => deltas.push(t)
 	}) as Promise<ChatEngineResult> & { deltas: string[] };
@@ -92,7 +124,10 @@ afterAll(() => {
 });
 
 describe('the frozen flag set', () => {
-	it('is exactly the chat-only argv, and the module never names the permissions bypass', async () => {
+	it('the DEFAULT argv is byte-for-byte the pre-settings chat-only argv, and the module never names the permissions bypass', async () => {
+		// Pinned against LITERALS ('' for tools, 'sonnet' for the model), not the
+		// constants that produce them: the whole claim is that an install that never
+		// touched the new settings runs exactly what it ran before they existed.
 		expect(chatCliArgs()).toEqual([
 			'-p',
 			'--tools',
@@ -103,7 +138,7 @@ describe('the frozen flag set', () => {
 			'--strict-mcp-config',
 			'--no-session-persistence',
 			'--model',
-			CHAT_MODEL,
+			'sonnet',
 			'--include-partial-messages',
 			'--output-format',
 			'stream-json',
@@ -111,8 +146,84 @@ describe('the frozen flag set', () => {
 			'--system-prompt',
 			CHAT_SYSTEM_PROMPT
 		]);
+		// The GRANT flag belongs to the search shape ONLY: a default run has no tool
+		// to grant, so it must not carry the flag at all (nor an empty value).
+		expect(chatCliArgs()).not.toContain('--allowedTools');
+		expect(CHAT_MODEL_DEFAULT).toBe('sonnet');
 		const src = readFileSync(new URL('../../src/lib/server/chat/claude-cli.ts', import.meta.url), 'utf8');
 		expect(src).not.toContain('dangerously-skip-permissions');
+	});
+
+	it('the search-on argv widens EXACTLY the tools value, the GRANT and the system prompt, nothing else', () => {
+		const base = chatCliArgs();
+		const search = chatCliArgs({ webSearch: true, model: 'opus' });
+		// Pinned whole, against literals like the default shape: `--tools` REQUESTS
+		// the tool and `--allowedTools` GRANTS the call (without it claude 2.1.237
+		// answers the model's WebSearch call "you haven't granted it yet" in `-p`
+		// mode, i.e. the opt-in is inert), and the grant names exactly the requested
+		// tool - never a wider set.
+		expect(search).toEqual([
+			'-p',
+			'--tools',
+			'WebSearch',
+			'--allowedTools',
+			'WebSearch',
+			'--disable-slash-commands',
+			'--setting-sources',
+			'',
+			'--strict-mcp-config',
+			'--no-session-persistence',
+			'--model',
+			'opus',
+			'--include-partial-messages',
+			'--output-format',
+			'stream-json',
+			'--verbose',
+			'--system-prompt',
+			CHAT_SYSTEM_PROMPT_WEB_SEARCH
+		]);
+		expect(search[search.indexOf('--tools') + 1]).toBe(WEB_SEARCH_TOOL);
+		expect(search[search.indexOf('--allowedTools') + 1]).toBe(WEB_SEARCH_TOOL);
+		// Every OTHER position is identical to the default argv - the safety flags
+		// (--disable-slash-commands, --setting-sources '', --strict-mcp-config,
+		// --no-session-persistence) never move with the capability shape.
+		const withoutGrant = (args: string[]) => {
+			const at = args.indexOf('--allowedTools');
+			return at < 0 ? args : [...args.slice(0, at), ...args.slice(at + 2)];
+		};
+		const scrub = (args: string[]) =>
+			args.map((a, i) => (['--tools', '--model', '--system-prompt'].includes(args[i - 1] ?? '') ? '<varies>' : a));
+		expect(scrub(withoutGrant(search))).toEqual(scrub(base));
+		// The prompt sent must be TRUE for the capability: only the bare prompt may
+		// claim the session cannot browse.
+		expect(CHAT_SYSTEM_PROMPT).toContain('no tools');
+		expect(CHAT_SYSTEM_PROMPT_WEB_SEARCH).not.toContain('cannot run code, read files, or browse');
+		expect(CHAT_SYSTEM_PROMPT_WEB_SEARCH).toContain('web search');
+		expect(chatSystemPrompt(false)).toBe(CHAT_SYSTEM_PROMPT);
+		expect(chatSystemPrompt(true)).toBe(CHAT_SYSTEM_PROMPT_WEB_SEARCH);
+		// One rule for request and assertion: the argv's tools value IS the allowlist.
+		expect(chatToolAllowlist(false)).toEqual([]);
+		expect(chatToolAllowlist(true)).toEqual([WEB_SEARCH_TOOL]);
+	});
+
+	it('an unknown or non-string model can never reach argv: it falls back to the default', () => {
+		for (const bad of [
+			'--dangerously-skip-nothing', // flag-shaped text a hand-edited store could hold
+			'sonnet; rm -rf /',
+			'claude-fable-5', // full names are not on the closed list - aliases only
+			'SONNET', // the list is exact, not case-folded
+			'',
+			42,
+			{ id: 'opus' },
+			null,
+			undefined
+		]) {
+			expect(normalizeChatModel(bad)).toBe(CHAT_MODEL_DEFAULT);
+			expect(chatCliArgs({ model: bad })[chatCliArgs().indexOf('--model') + 1]).toBe(CHAT_MODEL_DEFAULT);
+		}
+		for (const good of ['haiku', 'sonnet', 'opus', 'fable']) {
+			expect(normalizeChatModel(good)).toBe(good);
+		}
 	});
 
 	it('the child RECEIVES that argv, the prompt on STDIN, and a scrubbed env', async () => {
@@ -222,6 +333,95 @@ describe('the init assertion fails closed', () => {
 		expect(initViolation({ ...base, skills: ['s'] })).toMatch(/skills/);
 		expect(initViolation({ mcp_servers: [], slash_commands: [] })).toMatch(/tools/); // missing
 		expect(initViolation({ ...base, tools: 'none' })).toMatch(/tools/); // not an array
+	});
+
+	it('the assertion is an EXACT allowlist, never a relaxation - both capability shapes, both directions', () => {
+		const base = { mcp_servers: [], slash_commands: [], skills: [] };
+		const allow = chatToolAllowlist(true);
+		// The search-on session must hold exactly what it requested…
+		expect(initViolation({ ...base, tools: [WEB_SEARCH_TOOL] }, allow)).toBeNull();
+		// …never MORE (not "contains", not "non-empty": one unrequested tool beside
+		// the requested one is still a violation)…
+		expect(initViolation({ ...base, tools: [WEB_SEARCH_TOOL, 'Bash'] }, allow)).toMatch(/Bash/);
+		expect(initViolation({ ...base, tools: ['Bash'] }, allow)).toMatch(/Bash/);
+		// …and never LESS: a session missing the requested tool does not match the
+		// request (the frozen search prompt would describe a capability it lacks).
+		expect(initViolation({ ...base, tools: [] }, allow)).toMatch(/missing/);
+		// The DEFAULT path's guarantee does not weaken by one byte: no expectedTools
+		// argument means exactly-empty, so a session holding the search tool nobody
+		// requested is condemned there too.
+		expect(initViolation({ ...base, tools: [WEB_SEARCH_TOOL] })).toMatch(/tools/);
+		// mcp_servers / slash_commands / skills stay asserted empty on the search
+		// path exactly as on the bare one.
+		expect(initViolation({ ...base, tools: [WEB_SEARCH_TOOL], mcp_servers: [{}] }, allow)).toMatch(/mcp_servers/);
+		expect(initViolation({ ...base, tools: [WEB_SEARCH_TOOL], slash_commands: ['/x'] }, allow)).toMatch(/slash_commands/);
+		expect(initViolation({ ...base, tools: [WEB_SEARCH_TOOL], skills: ['s'] }, allow)).toMatch(/skills/);
+		// Cannot-verify is still not safe with an allowlist in hand.
+		expect(initViolation({ mcp_servers: [], slash_commands: [] }, allow)).toMatch(/tools/);
+	});
+
+	it('a search-on run against the CLI-probed init succeeds, and the child received the search argv', async () => {
+		const argvFile = join(OUT, 'argv-search.txt');
+		stubClaude(
+			[
+				`for a in "$@"; do printf '%s\\n' "$a"; done > "${argvFile}"`,
+				`cat > /dev/null`,
+				`echo '${SEARCH_INIT}'`,
+				`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"found"}}}'`,
+				`echo '{"type":"result","subtype":"success","is_error":false,"result":"found"}'`
+			].join('\n')
+		);
+		const p = run({ webSearch: true, model: 'opus' });
+		const res = await p;
+		expect(res.ok).toBe(true);
+		expect(p.deltas).toEqual(['found']);
+		expect(readFileSync(argvFile, 'utf8')).toBe(chatCliArgs({ webSearch: true, model: 'opus' }).join('\n') + '\n');
+	});
+
+	it('an unrequested capability kills the run on the DEFAULT path: the search tool nobody asked for', async () => {
+		// The same SEARCH_INIT that a search-on run accepts - reported to a run that
+		// requested nothing - is a condemned session: the default path still asserts
+		// exactly-empty.
+		stubClaude(
+			[
+				`cat > /dev/null`,
+				`echo '${SEARCH_INIT}'`,
+				`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"leak"}}}'`,
+				`echo '{"type":"result","subtype":"success","is_error":false,"result":"leak"}'`
+			].join('\n')
+		);
+		const p = run();
+		const res = await p;
+		expect(res.ok).toBe(false);
+		expect(res.failure?.kind).toBe('unsafe_init');
+		expect(res.failure?.message).toContain(WEB_SEARCH_TOOL);
+		expect(p.deltas).toEqual([]);
+	});
+
+	it('an unrequested capability kills the run on the SEARCH path too: one extra tool beside the requested one', async () => {
+		const overInit = JSON.stringify({
+			type: 'system',
+			subtype: 'init',
+			tools: ['WebSearch', 'Bash'],
+			mcp_servers: [],
+			slash_commands: [],
+			skills: [],
+			claude_code_version: '9.9.9-stub'
+		});
+		stubClaude(
+			[
+				`cat > /dev/null`,
+				`echo '${overInit}'`,
+				`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"leak"}}}'`,
+				`echo '{"type":"result","subtype":"success","is_error":false,"result":"leak"}'`
+			].join('\n')
+		);
+		const p = run({ webSearch: true });
+		const res = await p;
+		expect(res.ok).toBe(false);
+		expect(res.failure?.kind).toBe('unsafe_init');
+		expect(res.failure?.message).toContain('Bash');
+		expect(p.deltas).toEqual([]);
 	});
 });
 

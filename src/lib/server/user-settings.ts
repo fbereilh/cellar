@@ -19,11 +19,15 @@
  * mechanism itself is literally shared (`json-store.ts`) rather than mirrored,
  * and this module is only a PATH plus the keys that belong at it.
  *
- * **What belongs here is a DEFAULT, never the live value.** The per-project store
- * stays authoritative for a project that has an answer of its own; this supplies
- * the answer for a project that has never been asked. Keeping that direction fixed
- * is what stops a global preference silently rewriting settings the user made
- * per project - the reader's job is to seed, never to override.
+ * **Where a setting ALSO exists per project, what belongs here is a DEFAULT,
+ * never the live value.** The per-project store stays authoritative for a project
+ * that has an answer of its own; this supplies the answer for a project that has
+ * never been asked. Keeping that direction fixed is what stops a global preference
+ * silently rewriting settings the user made per project - the reader's job is to
+ * seed, never to override. A setting with no per-project counterpart, because it
+ * is about the PERSON rather than the project (the chat account slot, and the chat
+ * model and web-search opt-in the engine reads at run time), IS the live value and
+ * is read straight off this store.
  *
  * `~/.cellar/` is outside every checkout, so nothing here can show up as a git diff.
  */

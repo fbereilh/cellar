@@ -57,11 +57,21 @@ follows directly from that:
   it (their source and stored output text), minus any marked hidden from AI, plus
   your question. Nothing is sent by opening, rendering, or saving a notebook, and
   bulk runs skip chat cells, so egress only ever follows a deliberate run of one.
-  That child is spawned with tools, MCP servers, and slash commands off - asserted
-  against the CLI's own startup report at runtime, killing the run if it ever
-  reports otherwise - so it can read the transcript and answer, nothing else. Its
-  environment is stripped of every `ANTHROPIC*`/`CLAUDE*` variable so an inherited
-  key cannot silently bill or route elsewhere than the account the sidebar shows.
+  That child is spawned with MCP servers and slash commands off and, by default,
+  no tools at all - so it can read the transcript and answer, nothing else. Every
+  run checks the CLI's own startup report against exactly the capabilities that
+  run asked for and kills it on any mismatch, in either direction: a session
+  reporting anything the run did not request, and a session missing something it
+  did, both stop the run and discard its reply. The one capability you can add is
+  **Settings → Chat cells → Allow web search** (off until you turn it on, and
+  per-user rather than per-project): with it on a reply may also run web searches,
+  which means search queries derived from your notebook's content reach the search
+  service. It is search only - never arbitrary URL fetching, code execution, or
+  file access - and it widens nothing else here: MCP servers and slash commands
+  stay off, and the same startup check still runs, now requiring exactly that one
+  tool. The child's environment is stripped of every `ANTHROPIC*`/`CLAUDE*`
+  variable so an inherited key cannot silently bill or route elsewhere than the
+  account the sidebar shows.
   The reply comes back **untrusted**: it is rendered as sanitized markdown, never
   HTML, and an image in any machine-written markdown output is shown as text
   rather than fetched, so a reply steered by a prompt-injecting cell cannot make

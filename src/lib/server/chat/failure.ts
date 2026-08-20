@@ -41,10 +41,17 @@ function headline(failure: ChatEngineFailure): string {
 		}
 		case 'unsafe_init':
 			return (
-				'**Chat refused to run.** The Claude CLI session reported tools, MCP servers or ' +
-				'slash commands enabled - chat cells never allow those, so the run was stopped ' +
-				'and its reply discarded. This usually means a claude CLI update changed flag ' +
-				'behavior; report it rather than working around it.'
+				'**Chat refused to run.** The Claude CLI session reported capabilities that do ' +
+				'not match what this run requested, so the run was stopped and its reply ' +
+				'discarded.\n\n' +
+				'Usually the session reported MORE than this run allows (tools beyond its ' +
+				'allowlist, MCP servers or slash commands - or no report at all). That means a ' +
+				'claude CLI update changed flag behavior; report it rather than working around it.\n\n' +
+				'If instead the report is **missing** a tool this run requested - only reachable ' +
+				'with **Allow web search** on, when the CLI or the signed-in account does not ' +
+				'grant it (an older `claude` CLI, or an org/plan with search disabled, reports no ' +
+				'tools at all) - turn **Allow web search** off under **Chat cells** in Settings ' +
+				'and re-run.'
 			);
 		case 'transcript_too_large':
 			// The engine never ran, so the whole message is Cellar's own: the size and
@@ -64,11 +71,13 @@ export function chatFailureMarkdown(failure: ChatEngineFailure): string {
 	const detail = failure.message?.trim();
 	// The headline already says everything for the states whose message is only
 	// our own classification echo; append detail where it genuinely adds (an API
-	// error's cause, a rate limit's server wording).
+	// error's cause, a rate limit's server wording, the init assertion's own
+	// verdict - which of the headline's two cases actually fired).
 	const wantsDetail =
 		failure.kind === 'api_error' ||
 		failure.kind === 'rate_limited' ||
 		failure.kind === 'not_signed_in' ||
+		failure.kind === 'unsafe_init' ||
 		failure.kind === 'transcript_too_large';
 	if (wantsDetail && detail && !head.includes(detail)) {
 		return `${head}\n\n> ${detail.replace(/\n/g, '\n> ')}`;
