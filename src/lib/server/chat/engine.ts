@@ -22,6 +22,20 @@ export interface ChatEngineRunArgs {
 	prompt: string;
 	/** The slot's `CLAUDE_CONFIG_DIR`, or null for the ambient default login. */
 	configDir: string | null;
+	/**
+	 * The model to run - a `$lib/chatCell` `CHAT_MODELS` id. The caller reads it
+	 * from user settings through `normalizeChatModel`, and the claude engine
+	 * re-normalizes through the SAME function before the value can reach argv, so
+	 * an arbitrary string here cannot inject a flag value. Absent = the default.
+	 */
+	model?: string;
+	/**
+	 * May this run search the web? Default (absent/false) = today's bare session:
+	 * the engine requests NO tools and asserts the CLI reported none. `true`
+	 * requests web search ONLY, and the engine asserts the reported tool set is
+	 * exactly that - search is mediated; arbitrary URL fetch stays off.
+	 */
+	webSearch?: boolean;
 	/** Aborted by interrupt / kernel restart / shutdown; the engine must kill its work. */
 	signal: AbortSignal;
 	/** Streamed reply text, in order, as it is produced. */

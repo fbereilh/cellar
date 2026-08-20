@@ -26,6 +26,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChatEngine, ChatEngineRunArgs } from '../../src/lib/server/chat/engine';
+import { CHAT_MODEL_DEFAULT, CHAT_MODEL_KEY, CHAT_WEB_SEARCH_KEY } from '../../src/lib/chatCell';
 
 let WS: string;
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -35,10 +36,16 @@ let enginemod: typeof import('../../src/lib/server/chat/engine');
 let authmod: typeof import('../../src/lib/server/chat/auth');
 let activemod: typeof import('../../src/lib/server/chat/active');
 let events: typeof import('../../src/lib/server/events');
+let settingsmod: typeof import('../../src/lib/server/user-settings');
 
 beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-chat-run-'));
 	process.env.CELLAR_WORKSPACE = WS;
+	// The run glue reads the person-scoped settings store (chat model / web
+	// search); point it at a throwaway file so this suite never reads the
+	// developer's real ~/.cellar/settings.json - and so the threading tests below
+	// can write to it.
+	process.env.CELLAR_USER_SETTINGS = join(WS, 'user-settings.json');
 	nbmod = await import('../../src/lib/server/notebook');
 	runmod = await import('../../src/lib/server/run');
 	runchat = await import('../../src/lib/server/chat/run-chat');
@@ -46,12 +53,16 @@ beforeAll(async () => {
 	authmod = await import('../../src/lib/server/chat/auth');
 	activemod = await import('../../src/lib/server/chat/active');
 	events = await import('../../src/lib/server/events');
+	settingsmod = await import('../../src/lib/server/user-settings');
+	settingsmod.__resetUserSettingsCache();
 	authmod.__setChatAuthForTests({ kind: 'slot', slot: 'test', account: { loggedIn: true, email: 't@example.com' } });
 });
 
 afterEach(() => {
 	enginemod.__setChatEngineForTests(null);
 	activemod.__resetChatRuns();
+	// Undo whatever a threading test wrote, so key absence stays each test's default.
+	settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null });
 });
 
 /** A notebook: python cell / hidden cell / chat cell. */
@@ -468,5 +479,51 @@ describe('what the clients hold matches what was persisted', () => {
 		} finally {
 			mirror.stop();
 		}
+	});
+});
+
+describe('the engine capability settings are read from the user store and gated', () => {
+	/** Script the engine and capture the FULL args each run received. */
+	function capturingEngine(): { args: ChatEngineRunArgs[] } {
+		const args: ChatEngineRunArgs[] = [];
+		enginemod.__setChatEngineForTests({
+			async run(a) {
+				args.push(a);
+				return { ok: true, failure: null, engine: null, replyText: 'ok' };
+			}
+		});
+		return { args };
+	}
+
+	it('absent keys thread the defaults: the model chat always ran, web search off', async () => {
+		const { nb } = makeNotebook('settings-default.ipynb');
+		const { args } = capturingEngine();
+		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(res.status).toBe('ok');
+		expect(args).toHaveLength(1);
+		expect(args[0].model).toBe(CHAT_MODEL_DEFAULT);
+		expect(args[0].webSearch).toBe(false);
+	});
+
+	it('a stored model and an explicit web-search opt-in reach the engine', async () => {
+		settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: 'opus', [CHAT_WEB_SEARCH_KEY]: true });
+		const { nb } = makeNotebook('settings-on.ipynb');
+		const { args } = capturingEngine();
+		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(res.status).toBe('ok');
+		expect(args[0].model).toBe('opus');
+		expect(args[0].webSearch).toBe(true);
+	});
+
+	it('hand-edited junk is gated BEFORE the seam: unknown model falls back, truthy-not-true search stays off', async () => {
+		// What a hand-edited ~/.cellar/settings.json can hold: flag-shaped text where
+		// a model id belongs, and the string "true" where the boolean opt-in belongs.
+		settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: '--dangerously-injected', [CHAT_WEB_SEARCH_KEY]: 'true' });
+		const { nb } = makeNotebook('settings-junk.ipynb');
+		const { args } = capturingEngine();
+		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(res.status).toBe('ok');
+		expect(args[0].model).toBe(CHAT_MODEL_DEFAULT);
+		expect(args[0].webSearch).toBe(false);
 	});
 });

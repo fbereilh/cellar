@@ -4,7 +4,8 @@
 	// (view + rebind).
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
-	import { getUserSettingText, setUserSetting } from '$lib/userSettings';
+	import { getUserSettingFlag, getUserSettingText, setUserSetting } from '$lib/userSettings';
+	import { CHAT_MODEL_KEY, CHAT_MODELS, CHAT_WEB_SEARCH_KEY, normalizeChatModel } from '$lib/chatCell';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import {
 		UPLOAD_DATE_TOKENS,
@@ -203,6 +204,40 @@
 			token,
 			(value) => setUploadDefault(which, value)
 		);
+	}
+
+	// ---- Chat cells (model + web search) --------------------------------------
+	// Person-scoped like the account slot beside them in the same `~/.cellar/`
+	// store: which model a reply bills, and whether a reply may search the web,
+	// are about the person's subscription and their data-egress choice, not about
+	// any one project. Seeded when the modal first opens (the upload-defaults
+	// hydration rule: this component is mounted for the life of the shell, so a
+	// construction-time read would latch the pre-hydration empty store). Reads go
+	// through the shared gates (`normalizeChatModel`, the strict `=== true` flag
+	// read), so this pane and the server can never disagree about what the
+	// untyped store means.
+	let chatModel = $state(normalizeChatModel(undefined));
+	let chatWebSearch = $state(false);
+	let chatHydrated = false;
+	$effect(() => {
+		if (!open || chatHydrated) return;
+		chatHydrated = true;
+		chatModel = normalizeChatModel(getUserSettingText(CHAT_MODEL_KEY));
+		chatWebSearch = getUserSettingFlag(CHAT_WEB_SEARCH_KEY);
+	});
+
+	function setChatModel(id: string) {
+		// The select's options are the closed CHAT_MODELS list, but the gate runs
+		// anyway - the value stored is always one the argv builder accepts.
+		chatModel = normalizeChatModel(id);
+		setUserSetting(CHAT_MODEL_KEY, chatModel);
+	}
+
+	function toggleChatWebSearch() {
+		chatWebSearch = !chatWebSearch;
+		// OFF deletes the key rather than storing `false`: absent = the default =
+		// today's bare session, so a store that was never opted in carries nothing.
+		setUserSetting(CHAT_WEB_SEARCH_KEY, chatWebSearch ? true : null);
 	}
 
 	// ---- Keyboard shortcuts --------------------------------------------------
@@ -523,6 +558,51 @@
 							</button>
 						{/each}
 					</div>
+				</div>
+
+				<div class="divider my-1"></div>
+
+				<!-- Chat cells. Person-level like the upload defaults above: the model a
+				     reply bills and the web-search opt-in follow the person across
+				     projects. The toggle's copy states what turning it on actually
+				     grants (search only) and what it sends (queries derived from the
+				     notebook), because this is the control that decides whether
+				     notebook-derived text can reach an external service. -->
+				<div data-testid="chat-settings-control">
+					<div class="mb-1 text-sm font-medium">Chat cells</div>
+					<label class="flex items-center justify-between gap-4">
+						<span class="text-xs text-base-content/60">Model</span>
+						<select
+							class="select select-sm w-40 font-mono text-xs"
+							value={chatModel}
+							onchange={(e) => setChatModel((e.currentTarget as HTMLSelectElement).value)}
+							data-testid="settings-chat-model"
+						>
+							{#each CHAT_MODELS as m (m.id)}
+								<option value={m.id}>{m.label}</option>
+							{/each}
+						</select>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						The Claude model chat cells reply with. Applies from the next run; which models your
+						account can use depends on its subscription.
+					</p>
+					<label class="mt-3 flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Allow web search</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={chatWebSearch}
+							onchange={toggleChatWebSearch}
+							data-testid="settings-chat-web-search"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						Off, a chat cell answers from the notebook alone, with every tool disabled. On, a reply
+						may also run web searches - search only: it still cannot fetch arbitrary URLs, run code,
+						or read files. Search queries are derived from your notebook's content, so text from the
+						notebook can reach the search service.
+					</p>
 				</div>
 
 				<div class="divider my-1"></div>

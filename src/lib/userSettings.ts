@@ -61,6 +61,20 @@ export function getUserSettingText(key: string): string {
 	return typeof value === 'string' ? value : '';
 }
 
+/**
+ * A setting read as a strict opt-in FLAG: only a literal stored `true` is true.
+ *
+ * The guarded accessor for the non-text settings (the module comment above names
+ * this as the extension path). Strictness is the point, not a convenience: the
+ * flags read through this gate CAPABILITY (chat web search), so a hand-edited
+ * `"true"`, `1`, or `{}` in the untyped store must read as OFF - the same
+ * `=== true` rule the server side applies (`chatWebSearchEnabled`), so the two
+ * sides cannot disagree about what the store says.
+ */
+export function getUserSettingFlag(key: string): boolean {
+	return getUserSetting<unknown>(key, false) === true;
+}
+
 /** Set `key` to `value` (pass `null` to delete) and schedule a server write. */
 export function setUserSetting(key: string, value: unknown): void {
 	store.set(key, value);

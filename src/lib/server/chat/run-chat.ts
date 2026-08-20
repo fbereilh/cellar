@@ -21,8 +21,9 @@
 import { listCells } from '../notebook';
 import type { OutputAccumulator } from '../output-accumulator';
 import type { CellOutput } from '../types';
-import type { ChatFailureKind } from '$lib/chatCell';
+import { CHAT_MODEL_KEY, CHAT_WEB_SEARCH_KEY, chatWebSearchEnabled, normalizeChatModel, type ChatFailureKind } from '$lib/chatCell';
 import { asText } from '$lib/outputText';
+import { getUserSettings } from '$lib/server/user-settings';
 import { registerChatRun, unregisterChatRun } from './active';
 import { configDirFor, resolveChatAuth } from './auth';
 import { chatEngine } from './engine';
@@ -100,9 +101,18 @@ export async function executeChatRun({
 			return { status: 'error' };
 		}
 		let sawDelta = false;
+		// The engine's capability inputs, read from the person-scoped store at run
+		// time (the `auth.ts` CHAT_SLOT_KEY pattern) through the shared gates: the
+		// model is constrained to the known set BEFORE it rides the seam (and the
+		// engine re-normalizes - no path to argv skips the gate), and web search is
+		// on only for a literal stored `true`, so absent keys are exactly the
+		// pre-settings behavior.
+		const settings = getUserSettings();
 		const res = await chatEngine().run({
 			prompt,
 			configDir: configDirFor(auth),
+			model: normalizeChatModel(settings[CHAT_MODEL_KEY]),
+			webSearch: chatWebSearchEnabled(settings[CHAT_WEB_SEARCH_KEY]),
 			signal: ctrl.signal,
 			onDelta: (text) => {
 				if (!text) return;

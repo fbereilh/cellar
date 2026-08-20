@@ -33,6 +33,60 @@ export type ChatFailureKind =
 export const CHAT_SLOT_KEY = 'cellar-chat-claude-slot';
 
 /**
+ * The user-settings key holding the chat model (a `CHAT_MODELS` id). In the
+ * SAME person-scoped store as the account slot, for the same reason: which
+ * model a reply bills is about the person's subscription, not about any one
+ * project. Absent/unknown reads as `CHAT_MODEL_DEFAULT`, so an install that
+ * never touched it behaves exactly as before the setting existed.
+ */
+export const CHAT_MODEL_KEY = 'cellar-chat-model';
+
+/**
+ * The user-settings key for the web-search opt-in. Only a literal `true` turns
+ * it on (`chatWebSearchEnabled`), so a fresh install, an upgraded install and
+ * any hand-edited junk in the store all get today's bare, tool-less session.
+ */
+export const CHAT_WEB_SEARCH_KEY = 'cellar-chat-web-search';
+
+/** The model chat cells run when the user never chose one. */
+export const CHAT_MODEL_DEFAULT = 'sonnet';
+
+/**
+ * The KNOWN model choices - CLI aliases, each verified against the installed
+ * CLI (claude 2.1.237 resolves haiku/sonnet/opus/fable in its `system/init`
+ * `model` field). A closed list on purpose: the chosen id is interpolated into
+ * the engine's argv, so the value space must be these literals and nothing
+ * else - `normalizeChatModel` is the one gate.
+ */
+export const CHAT_MODELS: readonly { id: string; label: string }[] = [
+	{ id: 'haiku', label: 'Haiku' },
+	{ id: 'sonnet', label: 'Sonnet' },
+	{ id: 'opus', label: 'Opus' },
+	{ id: 'fable', label: 'Fable' }
+];
+
+/**
+ * Constrain a stored model value to the known set, falling back to the default
+ * on anything else. This is a SECURITY rule, not preference hygiene: the store
+ * is untyped JSON anyone can hand-edit, and the value ends up in the claude
+ * CLI's argv - so an arbitrary string must never survive this function. Both
+ * the settings reader and the argv builder call it, so no caller order can
+ * route around it.
+ */
+export function normalizeChatModel(value: unknown): string {
+	return typeof value === 'string' && CHAT_MODELS.some((m) => m.id === value) ? value : CHAT_MODEL_DEFAULT;
+}
+
+/**
+ * Is web search ON for chat runs? Only an explicit stored `true` counts (the
+ * `databricksRuntimeEnabled` `=== true` precedent): default OFF, and no
+ * truthy junk in the untyped store can widen a session's capabilities.
+ */
+export function chatWebSearchEnabled(value: unknown): boolean {
+	return value === true;
+}
+
+/**
  * Is `name` a legal account-slot name? A slot name becomes a DIRECTORY segment
  * under `~/.cellar/claude/`, so this is a security rule, not cosmetics: the
  * first character must be alphanumeric (which alone rules out `.`/`..` and

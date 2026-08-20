@@ -45,6 +45,10 @@ let turns: string[];
 beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-chat-abort-'));
 	process.env.CELLAR_WORKSPACE = WS;
+	// The run glue reads the person-scoped settings store (chat model / web
+	// search); point it at a throwaway file so this suite never reads the
+	// developer's real ~/.cellar/settings.json.
+	process.env.CELLAR_USER_SETTINGS = join(WS, 'user-settings.json');
 	nbmod = await import('../../src/lib/server/notebook');
 	runmod = await import('../../src/lib/server/run');
 	enginemod = await import('../../src/lib/server/chat/engine');
