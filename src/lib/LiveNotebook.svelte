@@ -233,8 +233,8 @@
 	// Mirrors `notebook.metadata.cellar.root`, kept live via the `notebook:root` SSE
 	// event. `availableRoots` is the workspace's code roots, fetched the first time
 	// the root BAR can be seen (`rootBarVisible` below) and whenever the root
-	// changes - when both are empty the notebook renders no root control at all, so
-	// a workspace that never adopts roots looks exactly as before. `isPy` is a `.py`
+	// changes - it decides only what that bar's PICKER offers, never whether the bar
+	// is shown, which is `Notebook.svelte`'s `showRootBar` rule. `isPy` is a `.py`
 	// text notebook, which stores no notebook metadata and therefore cannot hold a
 	// root at all (the server refuses one).
 	let root = $state<string | null>(null);

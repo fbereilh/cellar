@@ -136,14 +136,16 @@ stores the `../`-relative form, so the notebook stays portable to any machine
 that reproduces the layout. Everything below applies to roots inside and outside
 the workspace alike.
 
-The bar only appears once roots are in use here - the conventional `roots/`
-directory has something in it, or some notebook already declares a root - so a
-workspace that never adopts roots gains
-no new UI, even in a repo with worktrees of its own. Detected worktrees still fill
-the picker whenever it is shown, and the sidebar's **Worktrees** block is where you
-find them before then. Both lists are read when the notebook opens (and the sidebar
-block when it refreshes), so reload the tab if you created the worktree after
-opening it.
+The bar is hidden by default - **Settings → Show the code root bar** turns it on -
+so a workspace that never adopts roots gains no new UI, even in a repo with
+worktrees of its own. The one exception is what makes that default safe: a notebook
+that actually declares a root always shows the bar, a root missing on disk
+included, so a kernel is never running somewhere nothing on screen explains or can
+clear. Until you turn it on, the sidebar's **Worktrees** block is where you find
+your worktrees, and it needs no toggle. Detected worktrees fill the picker whenever
+the bar is shown; that list is read the first time the bar becomes visible, so
+flipping the toggle populates it with no reload, but reload the tab if you created
+the worktree after the bar was already up (the sidebar block refreshes on its own).
 
 A root moves exactly two things: the kernel process's working directory and the
 entry Cellar adds to its `sys.path`. Everything else stays workspace-wide - the

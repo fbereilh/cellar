@@ -914,10 +914,12 @@
 		</div>
 		{#if showRootBar}
 			<!-- Code root: the directory THIS notebook's kernel runs in and imports from
-			     (normally a git worktree under `roots/`). Rendered only where the
-			     workspace has roots, so a workspace that never adopts them is untouched.
-			     Deliberately quieter than the export bar: it is a property of the
-			     notebook, not an action, and changing it costs the user their kernel. -->
+			     (normally a git worktree under `roots/`). WHEN it is rendered is
+			     `showRootBar`'s rule and is stated there - opt-in chrome, with an
+			     actually-declared root as the standing exception - so it is not
+			     restated here. Deliberately quieter than the export bar: it is a
+			     property of the notebook, not an action, and changing it costs the
+			     user their kernel. -->
 			<div
 				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-100 px-3 py-2 text-sm"
 				data-testid="root-bar"
