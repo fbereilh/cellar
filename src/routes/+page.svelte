@@ -456,6 +456,25 @@
 		return out;
 	});
 
+	// The notebook the jump-to-running-cell SHORTCUT acts on. The tab strip's run
+	// spinner is a control inside a tab and is deliberately out of the document's
+	// Tab order (the roving-tabindex pattern), so the keyboard reaches this through
+	// a declared chord instead - and a chord fires with nothing focused, so it has
+	// to pick its own target rather than read one off the focus.
+	//
+	// The VIEWED notebook wins when it is busy (the everyday case: you are watching
+	// it run and want to be taken back to the cell), else the first running one,
+	// else the first queued one. Null when nothing is busy at all, and the shortcut
+	// then leaves the keystroke alone rather than swallowing it.
+	const jumpTargetTabId = $derived.by<string | null>(() => {
+		if (activeTabId && tabRunState[activeTabId]) return activeTabId;
+		return (
+			tabs.find((t) => tabRunState[t.id] === 'running')?.id ??
+			tabs.find((t) => tabRunState[t.id] === 'queued')?.id ??
+			null
+		);
+	});
+
 	// Git blame shown in the bottom status bar. A FileTab reports its cursor line's
 	// record; a LiveNotebook reports its FOCUSED CELL's record (per-cell blame) — both
 	// through the same `handleBlame`, keyed by workspace path. The footer reads the
@@ -1480,6 +1499,23 @@
 				e.preventDefault();
 				e.stopPropagation();
 				openFindBar();
+				return;
+			}
+			// Jump to the running cell, from anywhere. Shell-level for the reason the
+			// registry entry gives: the spinner that does this by pointer lives inside
+			// a tab and is out of the Tab order, and this must fire with no tab and no
+			// notebook focused. It reaches the SAME `jumpToRunningCell` the spinner
+			// click does rather than a second implementation, so the tab switch, the
+			// `tick` and the notebook's own reveal/scroll conventions are identical.
+			// With nothing running there is no target, and the keystroke is not ours:
+			// it falls through untouched. A modal owns the keyboard while up.
+			if (bindsFor('jump-to-running-cell').includes(chord)) {
+				if (document.querySelector('.modal-open')) return;
+				const target = jumpTargetTabId;
+				if (!target) return;
+				e.preventDefault();
+				e.stopPropagation();
+				jumpToRunningCell(target);
 				return;
 			}
 			if (!bindsFor('command-palette').includes(chord)) return;

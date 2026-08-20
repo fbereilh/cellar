@@ -3,7 +3,7 @@
 	import { kernelBadgeClass, kernelStatusLabel, formatMemory } from '$lib/kernelBadge';
 	import type { KernelInfo } from '$lib/kernelBadge';
 	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte';
-	import { dropIndexAt, exceedsDragThreshold, landingIndex, stepSlot, type TabBox } from '$lib/tabReorder';
+	import { dropTargetAt, exceedsDragThreshold, landingIndex, stepSlot, type DropTarget, type TabBox } from '$lib/tabReorder';
 	import { tabDomId, tabPanelDomId } from '$lib/tabIds';
 	import { tick } from 'svelte';
 
@@ -143,11 +143,14 @@
 		x: number;
 		y: number;
 		boxes: TabBox[] | null;
+		/** The tab this pointer was CAPTURED on, so the capture is released with the gesture. */
+		captured: Element | null;
 		/** Escape was pressed: abandon the move AND the click the release would make. */
 		cancelled?: boolean;
 	} | null = null;
 	let dragId = $state<string | null>(null);
-	let dropIndex = $state<number | null>(null);
+	/** Where the drag would land: the slot AND the exact edge, on the exact ROW, that says so. */
+	let drop = $state<DropTarget | null>(null);
 	let dragDx = $state(0);
 	let dragDy = $state(0);
 	/** Announced to assistive tech after a KEYBOARD move, which has no visual drag to watch. */
@@ -194,9 +197,19 @@
 	}
 
 	function endDrag() {
+		// Give the pointer back before the gesture is forgotten - the element is on
+		// `press`, so there is nothing left afterwards that could name it.
+		if (press?.captured) {
+			try {
+				if (press.captured.hasPointerCapture(press.pointerId))
+					press.captured.releasePointerCapture(press.pointerId);
+			} catch {
+				/* the pointer is already gone; nothing to hand back */
+			}
+		}
 		press = null;
 		dragId = null;
-		dropIndex = null;
+		drop = null;
 		dragDx = 0;
 		dragDy = 0;
 		window.removeEventListener('pointermove', onPointerMove);
@@ -244,14 +257,16 @@
 		}
 		dragDx = dx;
 		dragDy = dy;
-		dropIndex = dropIndexAt(press.boxes ?? [], e.clientX, e.clientY);
+		drop = dropTargetAt(press.boxes ?? [], e.clientX, e.clientY);
 	}
 
 	function onPointerUp(e: PointerEvent) {
-		if (press && e.pointerId !== press.pointerId) return;
-		const cancelled = press?.cancelled === true;
-		const id = dragId;
-		const slot = dropIndex;
+		if (!press || e.pointerId !== press.pointerId) return;
+		const cancelled = press.cancelled === true;
+		// Only a drag started by THIS press may settle here. A drag belonging to an
+		// earlier gesture is not this release's to apply - see `onTabPointerDown`.
+		const id = dragId === press.id ? dragId : null;
+		const slot = id == null ? null : (drop?.index ?? null);
 		endDrag();
 		// An abandoned drag must not select the file it was released over either -
 		// which is why Escape leaves the gesture RUNNING (flagged) rather than tearing
@@ -263,8 +278,8 @@
 	}
 
 	function onPointerCancel(e: PointerEvent) {
-		if (press && e.pointerId !== press.pointerId) return;
-		const dragged = dragId != null || press?.cancelled === true;
+		if (!press || e.pointerId !== press.pointerId) return;
+		const dragged = dragId != null || press.cancelled === true;
 		endDrag();
 		if (dragged) swallowNextClick();
 	}
@@ -280,7 +295,7 @@
 		e.stopPropagation();
 		press.cancelled = true;
 		dragId = null;
-		dropIndex = null;
+		drop = null;
 		dragDx = 0;
 		dragDy = 0;
 		window.removeEventListener('keydown', onDragKeydown, true);
@@ -294,7 +309,31 @@
 		// A control inside a draggable surface stays a control: a press on the
 		// close or jump-to-running button must never begin a tab drag.
 		if ((e.target as Element | null)?.closest('[data-tab-nodrag]')) return;
-		press = { id, pointerId: e.pointerId, x: e.clientX, y: e.clientY, boxes: null };
+		// A GESTURE MAY NEVER OUTLIVE ITS OWN RELEASE. A `pointerup` that never
+		// reaches this document leaves the drag standing, and the next ordinary tab
+		// click then SETTLES that stale drag: an unrelated tab jumps and the click
+		// that should have selected a file is swallowed instead. It is a reachable
+		// state, not a theoretical one - this app is full of sandboxed `srcdoc`
+		// iframes (every rich `text/html` cell output, every `.html` preview) and a
+		// release inside one is delivered to the frame, not here.
+		//
+		// Two independent defences, because neither covers the other's case. The
+		// capture is the real fix: the pointer is ours for the whole gesture
+		// whatever it is released over, so `pointerup` always comes back (and a
+		// pointer the browser takes away arrives as `pointercancel`, which ends the
+		// gesture too). Abandoning any gesture still standing is the backstop for a
+		// pointer that could never be captured - a synthetic one, or a browser that
+		// refused - and it is what makes the invariant hold BY STATE rather than by
+		// trusting the release to arrive.
+		endDrag();
+		press = { id, pointerId: e.pointerId, x: e.clientX, y: e.clientY, boxes: null, captured: null };
+		const tab = e.currentTarget as Element | null;
+		try {
+			tab?.setPointerCapture(e.pointerId);
+			press.captured = tab;
+		} catch {
+			/* no such active pointer (a synthetic one): the reset above still holds the invariant */
+		}
 		window.addEventListener('pointermove', onPointerMove);
 		window.addEventListener('pointerup', onPointerUp);
 		window.addEventListener('pointercancel', onPointerCancel);
@@ -621,23 +660,6 @@
 	</div>
 
 	<!--
-		The insertion marker: where the dragged tab will land. Zero-width IN FLOW (the
-		bar is absolutely positioned), so revealing it never shifts the tabs it sits
-		between - an indicator that pushes the strip around as you drag is exactly the
-		mush this has to avoid. `z-30` puts it above the LIFTED tab (`z-20`), which
-		necessarily floats under the pointer and so would otherwise hide the very
-		answer it is being asked for; the caps are what stop the bar reading as a text
-		caret where it crosses the dragged tab's label.
-	-->
-	{#snippet dropMarker(index: number)}
-		<div class="relative z-30 w-0 self-stretch" aria-hidden="true" data-testid="tab-drop-indicator" data-drop-index={index}>
-			<span class="absolute inset-y-1 -left-[1.5px] w-[3px] rounded-full bg-primary shadow-[0_0_7px_var(--color-primary)]"></span>
-			<span class="absolute -top-px -left-[3.5px] h-[7px] w-[7px] rotate-45 rounded-[1.5px] bg-primary"></span>
-			<span class="absolute -bottom-px -left-[3.5px] h-[7px] w-[7px] rotate-45 rounded-[1.5px] bg-primary"></span>
-		</div>
-	{/snippet}
-
-	<!--
 		Tab bar: wraps onto additional rows when the open tabs overflow, and its
 		tabs are reorderable by dragging one to a new slot (see `$lib/tabReorder`).
 
@@ -647,7 +669,8 @@
 		start of one; the tab itself is what follows the pointer (a `translate`),
 		rather than the browser's washed-out drag image; and the drop indicator is
 		drawn from a layout snapshot we own, so it names an exact slot on the
-		exact row - which a wrapped, multi-row strip needs.
+		exact row - which a wrapped, multi-row strip needs. The marker itself is
+		rendered OUT OF FLOW, just below this strip.
 	-->
 	<div
 		bind:this={stripEl}
@@ -660,7 +683,6 @@
 		{#each tabs as tab, i (tab.id)}
 			{@const runState = tabRunState[tab.id]}
 			{@const dragging = dragId === tab.id}
-			{#if dropIndex === i}{@render dropMarker(i)}{/if}
 			<div
 				class={tabClass(tab.id)}
 				style={dragging ? `transform: translate(${dragDx}px, ${dragDy}px)` : undefined}
@@ -737,9 +759,41 @@
 					</button>
 				{/if}
 			</div>
-			{#if dropIndex === tabs.length && i === tabs.length - 1}{@render dropMarker(tabs.length)}{/if}
 		{/each}
 	</div>
+
+	<!--
+		The insertion marker: where the dragged tab will land.
+
+		OUT OF FLOW (`fixed`, from the drag's own layout snapshot), which is what lets
+		it name a slot at the START of a row. As an in-flow, zero-width flex item
+		rendered before tab `index` it could not: a zero-hypothetical-size item always
+		fits the line it is being collected onto, so at a wrap boundary it stayed on
+		the PRECEDING row and pointed at the end of the row above the one the pointer
+		was on - the two places one insertion index describes. Out of flow it is also
+		still true that revealing it shifts nothing, which is the property the in-flow
+		zero width was there for; `pointer-events-none` keeps it from ever becoming a
+		hit-test target, since it is drawn exactly where the pointer is heading.
+
+		`z-30` puts it above the LIFTED tab (`z-20`), which necessarily floats under
+		the pointer and so would otherwise hide the very answer it is being asked for;
+		the caps are what stop the bar reading as a text caret where it crosses the
+		dragged tab's label.
+	-->
+	{#if drop?.marker}
+		<div
+			class="pointer-events-none fixed z-30 w-[3px]"
+			style="left: {drop.marker.x - 1.5}px; top: {drop.marker.top}px; height: {drop.marker.bottom -
+				drop.marker.top}px"
+			aria-hidden="true"
+			data-testid="tab-drop-indicator"
+			data-drop-index={drop.index}
+		>
+			<span class="absolute inset-x-0 inset-y-1 rounded-full bg-primary shadow-[0_0_7px_var(--color-primary)]"></span>
+			<span class="absolute -top-px -left-[2px] h-[7px] w-[7px] rotate-45 rounded-[1.5px] bg-primary"></span>
+			<span class="absolute -bottom-px -left-[2px] h-[7px] w-[7px] rotate-45 rounded-[1.5px] bg-primary"></span>
+		</div>
+	{/if}
 
 	<!-- A keyboard reorder has no drag to watch, so its outcome is spoken instead. -->
 	<span class="sr-only" role="status" aria-live="polite" data-testid="tab-move-announcement">{moveAnnouncement}</span>

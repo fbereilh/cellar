@@ -6,8 +6,16 @@ import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
 
 /**
- * End-to-end proof of "click a notebook tab's run spinner to jump to its running
- * cell". Two notebooks are open as tabs; notebook A runs a cell out-of-band while
+ * End-to-end proof of "jump to the running cell" - by POINTER (the tab's run
+ * spinner) and by KEYBOARD (the registry's `jump-to-running-cell` chord).
+ *
+ * The keyboard half is not a nicety: the spinner is a control INSIDE a tab, and
+ * the strip's roving tabindex deliberately keeps it out of the document's Tab
+ * order, so a declared chord is the keyboard's only route to the feature - and it
+ * has to fire with NOTHING focused, which is why it is dispatched by the shell's
+ * window handler rather than from a focused tab the way the reorder chords are.
+ *
+ * Two notebooks are open as tabs; notebook A runs a cell out-of-band while
  * the user is VIEWING notebook B. Clicking A's tab spinner must:
  *   A. activate notebook A (switch the viewed tab), and
  *   B. scroll A's running cell into view.
@@ -91,6 +99,39 @@ async function docCellCount(page: Page, nb: string): Promise<number> {
 		const body = await res.json();
 		return body?.notebook?.cells?.length ?? -1;
 	}, nb);
+}
+
+
+/**
+ * Notebook A open and VIEWED. Idempotent: the tab session is PERSISTED per
+ * workspace, so a later test inherits whatever the previous one left - and after
+ * a failure Playwright restarts the worker into a brand-new workspace, where
+ * nothing is open at all. Both have to work.
+ *
+ * The empty-state probe SETTLES before it asks (`empty.or(tabA)`): the shell
+ * paints either the empty state or an already-open notebook, and probing before
+ * either arrives reports the button invisible and turns the click into a no-op.
+ */
+async function openNotebookA(page: Page): Promise<void> {
+	const tabA = page.locator('[data-testid="tab"][data-tab-id="notebook"]');
+	const empty = page.getByTestId('empty-open-notebook');
+	await expect(empty.or(tabA)).toBeVisible({ timeout: 30_000 });
+	if (await empty.isVisible()) await empty.click();
+	await expect(tabA).toBeVisible({ timeout: 30_000 });
+	await tabA.getByText('notebook.ipynb').click();
+	await expect(tabA).toHaveAttribute('data-active', 'true');
+	await expect.poll(() => page.getByTestId('cell').count(), { timeout: 30_000 }).toBeGreaterThan(0);
+}
+
+/** Notebook B open and VIEWED (so A's later run is a BACKGROUND run). Idempotent. */
+async function openAndViewB(page: Page): Promise<void> {
+	const tabB = page.locator('[data-testid="tab"][data-tab-id="file:other.ipynb"]');
+	if ((await tabB.count()) === 0) {
+		await page.getByTestId('tree-file').filter({ hasText: 'other.ipynb' }).dblclick();
+	}
+	await expect(tabB).toBeVisible({ timeout: 30_000 });
+	await tabB.getByText('other.ipynb').click();
+	await expect(tabB).toHaveAttribute('data-active', 'true');
 }
 
 test.beforeAll(async () => {
@@ -188,4 +229,56 @@ test('tab run spinner: click jumps to (and switches to) the running notebook, fo
 	await tabB.getByText('other.ipynb').click();
 	await expect(tabB).toHaveAttribute('data-active', 'true');
 	await expect(tabA).toHaveAttribute('data-active', 'false');
+});
+
+test('the keyboard reaches jump-to-running-cell with nothing focused, and Settings lists it', async ({
+	page
+}) => {
+	test.setTimeout(180_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openNotebookA(page);
+
+	const tabA = page.locator('[data-testid="tab"][data-tab-id="notebook"]');
+	const jumpBtnA = tabA.getByTestId('tab-jump-running');
+	const runningBarA = (id: string) => page.locator(`[data-cell-id="${id}"] [data-testid="running-bar"]`);
+
+	// Warm A's kernel while A is still the VIEWED notebook (its running bar is only
+	// observable there - a background notebook's pane is `display:none`), so the
+	// cold host-venv boot does not eat the short window in which the background run
+	// below is observable.
+	await runCellOutOfBand(page, 'notebook.ipynb', 'viewed-cell-00', 1);
+	await expect(runningBarA('viewed-cell-00')).toBeVisible({ timeout: 60_000 });
+	await expect(runningBarA('viewed-cell-00')).toBeHidden({ timeout: 30_000 });
+
+	await openAndViewB(page);
+
+	// Run a cell deep in A while VIEWING B, exactly as the spinner test does.
+	await runCellOutOfBand(page, 'notebook.ipynb', 'viewed-cell-24', 8);
+	await expect(jumpBtnA).toBeVisible({ timeout: 20_000 });
+
+	// NOTHING is focused - not a tab, not a cell, not the spinner (which is out of
+	// the Tab order by design). The chord has to work from here or the feature is
+	// pointer-only for a keyboard user.
+	await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur?.());
+	expect(await page.evaluate(() => document.activeElement?.tagName ?? '')).toBe('BODY');
+
+	await page.keyboard.press('ControlOrMeta+Shift+Enter');
+
+	// Same outcome as the spinner click: switch to A, and scroll its running cell in.
+	await expect(tabA).toHaveAttribute('data-active', 'true');
+	await expect(runningBarA('viewed-cell-24')).toBeVisible();
+	await expect.poll(async () => visibleNotebookScrollTop(page), { timeout: 10_000 }).toBeGreaterThan(400);
+	await page.screenshot({ path: join(EVIDENCE, '4-keyboard-jump-to-running-cell.png') });
+	await expect(runningBarA('viewed-cell-24')).toBeHidden({ timeout: 40_000 }); // settle
+
+	// The chord is DECLARED in the registry, so Settings lists it and it can be
+	// rebound like any other - that is where this app documents its keys, and it is
+	// what makes the keyboard route discoverable rather than folklore.
+	await page.getByTestId('app-menu').click();
+	await page.getByTestId('open-settings').click();
+	const row = page.locator('[data-testid="shortcut-row"][data-shortcut-id="jump-to-running-cell"]');
+	await expect(row).toHaveCount(1);
+	await expect(row.getByTestId('shortcut-key').first()).toBeVisible();
+	await expect(page.getByTestId('shortcuts-conflict-warning')).toHaveCount(0);
+	await page.getByTestId('settings-close').click();
 });

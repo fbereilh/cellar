@@ -13,6 +13,7 @@ import { describe, it, expect } from 'vitest';
 import {
 	DRAG_THRESHOLD_PX,
 	dropIndexAt,
+	dropTargetAt,
 	exceedsDragThreshold,
 	landingIndex,
 	reorderTabs,
@@ -130,6 +131,65 @@ describe('dropIndexAt - a wrapped, multi-row strip', () => {
 			{ id: 'b', left: 100, right: 200, top: 0.4, bottom: 30.4 }
 		];
 		expect(dropIndexAt(jittery, 150, 15)).toBe(2);
+	});
+});
+
+describe('dropTargetAt - where the marker is DRAWN', () => {
+	// Row 0: t0 t1 t2 (y 0..30). Row 1: t3 t4 (y 30..60).
+	const boxes: TabBox[] = [...oneRow(3, 0), ...oneRow(2, 30).map((b, i) => ({ ...b, id: 't' + (3 + i) }))];
+
+	it('draws at the START of a row when the drop starts that row', () => {
+		// The pointer is on row 1, left of everything on it. The slot is 3, and the
+		// place that says so is the LEFT edge of t3 - on row 1.
+		const target = dropTargetAt(boxes, -9000, 45);
+		expect(target.index).toBe(3);
+		expect(target.marker).toEqual({ x: boxes[3].left, top: 30, bottom: 60 });
+	});
+
+	it('draws at the END of a row when the drop ends that row', () => {
+		// SAME slot (3) reached from row 0 - and it must NOT be the same marker.
+		// One insertion index, two places; the row the pointer resolved onto is the
+		// only thing that tells them apart, which is why the marker is returned from
+		// the hit test rather than derived from the index afterwards.
+		const target = dropTargetAt(boxes, 9000, 15);
+		expect(target.index).toBe(3);
+		expect(target.marker).toEqual({ x: boxes[2].right, top: 0, bottom: 30 });
+	});
+
+	it('never spans more than the row it belongs to', () => {
+		// Whatever the pointer does, the marker's height is one row's, so it can
+		// never read as a bar drawn across the whole header.
+		for (const [x, y] of [
+			[-500, -500],
+			[150, 15],
+			[250, 45],
+			[9000, 9000]
+		] as const) {
+			const { marker } = dropTargetAt(boxes, x, y);
+			expect(marker!.bottom - marker!.top).toBe(30);
+		}
+	});
+
+	it('draws between two tabs of one row at the gap between them', () => {
+		const target = dropTargetAt(boxes, 150, 15); // row 0, past t1's midpoint
+		expect(target.index).toBe(2);
+		expect(target.marker).toEqual({ x: boxes[1].right, top: 0, bottom: 30 });
+	});
+
+	it('has nothing to draw for an empty strip', () => {
+		expect(dropTargetAt([], 10, 10)).toEqual({ index: 0, marker: null });
+	});
+
+	it('agrees with dropIndexAt, which is the same rule with the marker dropped', () => {
+		for (const [x, y] of [
+			[-9000, 45],
+			[9000, 15],
+			[150, 15],
+			[250, 59],
+			[50, -400]
+		] as const) {
+			expect(dropIndexAt(boxes, x, y)).toBe(dropTargetAt(boxes, x, y).index);
+		}
 	});
 });
 

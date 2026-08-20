@@ -247,12 +247,9 @@ test('the drop indicator names the slot the tab will land in, and Escape abandon
 	expect(lift.alpha).toBe(1);
 	expect(lift.opacity).toBe(1);
 
-	// The marker belongs to ONE row: its box matches the tab it is drawn against, so
-	// on a wrapped strip it can never read as a bar across the whole header.
-	const markerBox = (await indicator.boundingBox())!;
-	const neighbourBox = (await page.locator('[data-testid="tab"]').nth(3).boundingBox())!;
-	expect(Math.round(markerBox.y)).toBe(Math.round(neighbourBox.y));
-	expect(Math.round(markerBox.height)).toBe(Math.round(neighbourBox.height));
+	// WHERE it is drawn is a question only a WRAPPED strip can ask - one insertion
+	// index describes two different places once the strip has more than one row -
+	// so it is pinned in the multi-row test below, not here.
 
 	// Escape abandons: the indicator goes, the tab drops back into its slot,
 	// nothing moves, and the release that follows must not select the tab either.
@@ -279,6 +276,85 @@ test('the drop indicator names the slot the tab will land in, and Escape abandon
 	await page.waitForTimeout(150);
 	expect(await tabOrder(page)).toEqual(before);
 	expect(await activeTab(page)).toBe(activeBefore);
+});
+
+test('a drag whose release never reaches this document cannot hijack the next click', async ({
+	page
+}) => {
+	test.setTimeout(120_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await resetStrip(page);
+
+	const before = await tabOrder(page);
+
+	// Start a real drag, then take the pointer away WITHOUT a release this document
+	// ever sees. Not a contrivance: the app is full of sandboxed `srcdoc` iframes
+	// (every rich `text/html` cell output, every `.html` preview) and a pointer
+	// released inside one is delivered to the FRAME, so the gesture is left standing
+	// here with its window listeners still attached.
+	//
+	// Dispatched rather than driven by `page.mouse`, for two reasons that are the
+	// point of the test rather than a convenience: a lost release cannot be produced
+	// by a mouse the harness fully controls, and a still-standing gesture goes on
+	// following every real pointer move - it drags the lifted tab under the pointer,
+	// so any later `page.mouse` gesture is intercepted by it. Synthetic events also
+	// deny the component its pointer capture (there is no active pointer to capture),
+	// so what this pins is the STATE hygiene half: a gesture still standing is
+	// abandoned by the next press rather than settled by the next release.
+	const fire = async (id: string, kinds: string[], dx = 0, dy = 0) =>
+		page.evaluate(
+			({ id, kinds, dx, dy }) => {
+				const tab = document.querySelector(`[data-testid="tab"][data-tab-id="${id}"]`)!;
+				const r = tab.getBoundingClientRect();
+				const base = {
+					bubbles: true,
+					cancelable: true,
+					composed: true,
+					pointerId: 1,
+					pointerType: 'mouse',
+					isPrimary: true,
+					button: 0,
+					buttons: 1,
+					clientX: r.left + r.width / 2 + dx,
+					clientY: r.top + r.height / 2 + dy
+				};
+				for (const kind of kinds) {
+					const ev =
+						kind === 'click'
+							? new MouseEvent('click', base)
+							: new PointerEvent(kind, base);
+					(kind.startsWith('pointermove') ? window : tab).dispatchEvent(ev);
+				}
+			},
+			{ id, kinds, dx, dy }
+		);
+
+	await fire(tabId('alpha.txt'), ['pointerdown']);
+	// Well past the threshold, and well away from the strip.
+	await fire(tabId('alpha.txt'), ['pointermove'], 40, 40);
+	await fire(tabId('alpha.txt'), ['pointermove'], 220, 300);
+
+	// The drag really is in flight - otherwise the rest of this proves nothing.
+	await expect(page.locator('[data-testid="tab"][data-dragging="true"]')).toHaveCount(1);
+	await expect(page.getByTestId('tab-drop-indicator')).toHaveCount(1);
+
+	// ...and now an ORDINARY press-release-click on a DIFFERENT tab. It must select
+	// that tab and move nothing: the abandoned gesture is not this release's to
+	// settle. Left standing, it settled HERE instead - alpha jumped to wherever the
+	// dead drag had last pointed, and the click that should have switched files was
+	// swallowed as if it were the end of a drag.
+	await fire(tabId('bravo.txt'), ['pointerdown', 'pointerup', 'click']);
+	expect(await tabOrder(page)).toEqual(before);
+	await expect.poll(() => activeTab(page)).toBe(tabId('bravo.txt'));
+	// And the gesture is gone with it: no lifted tab, no indicator left on screen.
+	await expect(page.locator('[data-testid="tab"][data-dragging="true"]')).toHaveCount(0);
+	await expect(page.getByTestId('tab-drop-indicator')).toHaveCount(0);
+
+	// Finally, the strip is left genuinely usable by a REAL pointer - the state this
+	// is all in aid of.
+	await page.locator(`[data-testid="tab"][data-tab-id="${tabId('charlie.txt')}"]`).click();
+	await expect.poll(() => activeTab(page)).toBe(tabId('charlie.txt'));
+	expect(await tabOrder(page)).toEqual(before);
 });
 
 test('dropping a tab back where it started changes nothing', async ({ page }) => {
@@ -673,9 +749,40 @@ test('a wrapped, multi-row strip drops onto the row the pointer is on', async ({
 	const nowRows = await stripRows(page);
 	const bottomRow = nowRows[nowRows.length - 1];
 	const headBox = (await page.locator(`[data-testid="tab"][data-tab-id="${bottomRow[0]}"]`).boundingBox())!;
+	const topRowBox = (await page.locator(`[data-testid="tab"][data-tab-id="${nowRows[0][0]}"]`).boundingBox())!;
 	const fromTop = nowRows[0][0];
-	await dragTabTo(page, fromTop, headBox.x + 2, headBox.y + headBox.height / 2);
+
+	// THE MARKER MUST NAME THE ROW THE POINTER IS ON. This is the assertion a
+	// single-row strip cannot make: at a WRAP BOUNDARY the end of one row and the
+	// start of the next are the SAME insertion index, so the slot alone does not say
+	// which of the two places is meant - and a marker rendered as a zero-width
+	// element in flow BEFORE that tab cannot draw the row-start one at all, because
+	// a zero-size flex item always fits the line it is being collected onto and so
+	// stays on the row ABOVE. That is what this catches: it once pointed at the end
+	// of a row the pointer had already left.
+	//
+	// Held open mid-drag (down, move, measure, up) - a completed drag has no marker
+	// left to look at.
+	const secondTop = await centreOf(page, nowRows[0][1] ?? fromTop);
+	await page.mouse.move(secondTop.x, secondTop.y);
+	await page.mouse.down();
+	await page.mouse.move(headBox.x + 2, headBox.y + headBox.height / 2, { steps: 10 });
+
+	const indicator = page.getByTestId('tab-drop-indicator');
+	await expect(indicator).toHaveCount(1);
+	const markerBox = (await indicator.boundingBox())!;
+	expect(Math.round(markerBox.y)).toBe(Math.round(headBox.y)); // on the BOTTOM row...
+	expect(Math.round(markerBox.y)).not.toBe(Math.round(topRowBox.y)); // ...and provably not the top one
+	expect(Math.round(markerBox.height)).toBe(Math.round(headBox.height)); // spanning that row and no more
+	// ...drawn at that row's LEFT EDGE, not trailing off the end of the row above.
+	expect(Math.abs(markerBox.x + markerBox.width / 2 - headBox.x)).toBeLessThanOrEqual(3);
+	await page.mouse.up();
+
+	// And the drop lands where the marker said it would.
 	await expect
-		.poll(async () => (await tabOrder(page)).indexOf(fromTop))
-		.toBe((await tabOrder(page)).indexOf(bottomRow[0]) - 1);
+		.poll(async () => {
+			const order = await tabOrder(page);
+			return order.indexOf(nowRows[0][1] ?? fromTop) === order.indexOf(bottomRow[0]) - 1;
+		})
+		.toBe(true);
 });
