@@ -171,7 +171,10 @@ test('tab run spinner: click jumps to (and switches to) the running notebook, fo
 	await page.mouse.click(400, 400);
 
 	// View B again, run A deep, jump — with follow OFF, only the explicit jump scrolls.
-	await tabB.locator('button', { hasText: 'other.ipynb' }).click();
+	// The title is a span inside the tab (the tab itself is the `role="tab"` click
+	// target since tabs became draggable), so clicking it is the ordinary,
+	// non-spinner tab click this phase is about.
+	await tabB.getByText('other.ipynb').click();
 	await expect(tabB).toHaveAttribute('data-active', 'true');
 	await runCellOutOfBand(page, 'notebook.ipynb', 'viewed-cell-27', 6);
 	await expect(jumpBtnA).toBeVisible({ timeout: 20_000 });
@@ -182,7 +185,7 @@ test('tab run spinner: click jumps to (and switches to) the running notebook, fo
 	await expect(runningBarA('viewed-cell-27')).toBeHidden({ timeout: 30_000 }); // settle
 
 	// ---- Phase 3: a normal (non-spinner) tab click still just selects the tab. ----
-	await tabB.locator('button', { hasText: 'other.ipynb' }).click();
+	await tabB.getByText('other.ipynb').click();
 	await expect(tabB).toHaveAttribute('data-active', 'true');
 	await expect(tabA).toHaveAttribute('data-active', 'false');
 });

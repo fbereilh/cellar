@@ -6,6 +6,14 @@
 // actually does. Nothing else may bind a notebook key: adding a shortcut means
 // adding a registry entry plus an action in LiveNotebook's `actions` map.
 //
+// A few SHELL-level chords are declared here too and dispatched elsewhere,
+// because they must fire with no notebook focused: `command-palette`,
+// `save-notebook` and `open-find` from `+page.svelte`'s window handler, and
+// `move-tab-left`/`move-tab-right` from the focused tab in `Navbar.svelte`.
+// They are still declared HERE so Settings lists and rebinds them like any other
+// shortcut - the registry stays the one source of truth even where the
+// dispatcher is not LiveNotebook's.
+//
 // Modes mirror Jupyter:
 //   'edit'    - the cell's CodeMirror editor has focus; you are typing.
 //   'command' - a cell is selected but not focused; keystrokes are commands.
@@ -88,6 +96,27 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		mode: 'global',
 		category: 'Application',
 		description: 'Find in notebook (floating find bar)'
+	},
+	{
+		// Reorder the open-file tab strip without a pointer. Dispatched by
+		// `Navbar.svelte` from the FOCUSED TAB's own keydown, not by a window
+		// handler: the gate is then structural - the event target IS the tab - so
+		// these chords can only fire while a tab has focus and can never shadow a
+		// notebook binding. Deliberately the horizontal echo of `move-cell-up`/
+		// `move-cell-down`, so `Mod-Shift-<arrow>` reads as "move the focused
+		// thing" everywhere in the app.
+		id: 'move-tab-left',
+		keys: ['Mod-Shift-ArrowLeft'],
+		mode: 'global',
+		category: 'Application',
+		description: 'Move the focused tab one place left'
+	},
+	{
+		id: 'move-tab-right',
+		keys: ['Mod-Shift-ArrowRight'],
+		mode: 'global',
+		category: 'Application',
+		description: 'Move the focused tab one place right'
 	},
 
 	// ---- Modes -------------------------------------------------------------

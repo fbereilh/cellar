@@ -2,6 +2,9 @@
 	import { iconSvg } from '$lib/fileIcons';
 	import { kernelBadgeClass, kernelStatusLabel, formatMemory } from '$lib/kernelBadge';
 	import type { KernelInfo } from '$lib/kernelBadge';
+	import { shortcuts, chordFromEvent } from '$lib/shortcuts.svelte';
+	import { dropIndexAt, exceedsDragThreshold, landingIndex, type TabBox } from '$lib/tabReorder';
+	import { tick } from 'svelte';
 
 	// The tab fields the navbar renders. The shell (+page) holds richer tab
 	// objects (path/kind/…); structural typing lets it pass those here.
@@ -47,6 +50,14 @@
 		onJumpToRunningCell?: (id: string) => void;
 		onCloseTab: (id: string) => void;
 		onPromoteTab?: (id: string) => void;
+		/**
+		 * Move tab `id` to insertion slot `insertAt` (0 = before the first tab,
+		 * `tabs.length` = after the last). The shell owns the array and applies
+		 * `$lib/tabReorder`'s `reorderTabs`, which no-ops when the slot is one the
+		 * tab already occupies - so both the pointer drop and the keyboard step
+		 * come through this ONE seam rather than each editing the order its own way.
+		 */
+		onReorderTabs?: (id: string, insertAt: number) => void;
 		onToggleSidebar: () => void;
 		onConsolidateImports: () => void;
 		onExportPy: () => void;
@@ -90,6 +101,7 @@
 		onJumpToRunningCell,
 		onCloseTab,
 		onPromoteTab,
+		onReorderTabs,
 		onToggleSidebar,
 		onConsolidateImports,
 		onExportPy,
@@ -113,6 +125,211 @@
 	const kernelBadge = $derived(kernelBadgeClass(kernelInfo));
 	// Live resident memory of the active kernel; null (hidden) when no kernel / unread.
 	const kernelMemory = $derived(kernelInfo?.started ? formatMemory(kernelInfo.memoryRss) : null);
+
+	// ---- Tab reordering (drag + keyboard) -----------------------------------
+	//
+	// A press on a tab is AMBIGUOUS until it moves: it may be a click (switch to
+	// that file), a click on one of the tab's own controls, or the start of a
+	// drag. `press` holds that undecided state; only travel past
+	// `DRAG_THRESHOLD_PX` promotes it to a drag, at which point `dragId` is set.
+	// Below the threshold nothing happens at all, so click-to-switch and
+	// close-tab behave exactly as they did before tabs became draggable.
+	let stripEl: HTMLElement | null = $state(null);
+	let press: {
+		id: string;
+		/** Only the pointer that started the gesture drives it (a second finger does not). */
+		pointerId: number;
+		x: number;
+		y: number;
+		boxes: TabBox[] | null;
+		/** Escape was pressed: abandon the move AND the click the release would make. */
+		cancelled?: boolean;
+	} | null = null;
+	let dragId = $state<string | null>(null);
+	let dropIndex = $state<number | null>(null);
+	let dragDx = $state(0);
+	let dragDy = $state(0);
+	/** Announced to assistive tech after a KEYBOARD move, which has no visual drag to watch. */
+	let moveAnnouncement = $state('');
+
+	/**
+	 * The strip's laid-out geometry, in document order, snapshotted when a drag
+	 * begins. Snapshotted rather than re-measured per move because the dragged tab
+	 * is `translate`d away from its slot - it still occupies its original box in
+	 * LAYOUT (which is what hit-testing needs), but its live rect no longer
+	 * reports it. Nothing else reflows during a drag: the drop indicator is
+	 * zero-width, so the snapshot stays true for the whole gesture.
+	 */
+	function snapshotTabBoxes(strip: Element): TabBox[] {
+		return [...strip.querySelectorAll<HTMLElement>('[data-testid="tab"]')].map((el) => {
+			const r = el.getBoundingClientRect();
+			return { id: el.dataset.tabId ?? '', left: r.left, right: r.right, top: r.top, bottom: r.bottom };
+		});
+	}
+
+	function endDrag() {
+		press = null;
+		dragId = null;
+		dropIndex = null;
+		dragDx = 0;
+		dragDy = 0;
+		window.removeEventListener('pointermove', onPointerMove);
+		window.removeEventListener('pointerup', onPointerUp);
+		window.removeEventListener('pointercancel', onPointerCancel);
+		window.removeEventListener('keydown', onDragKeydown, true);
+	}
+
+	/**
+	 * Swallow the `click` the browser is about to synthesise from this pointerup.
+	 * Without it a drag would also select the file it dropped - the one thing
+	 * reordering must never do as a side effect. Registered in the capture phase
+	 * so it beats the tab's own handler, and torn down on a macrotask: the
+	 * synthesised click is dispatched in the same turn as the pointerup, so a
+	 * `setTimeout(0)` always runs after it and can never eat a later, real click.
+	 */
+	function swallowNextClick() {
+		const swallow = (ev: MouseEvent) => {
+			ev.preventDefault();
+			ev.stopPropagation();
+		};
+		window.addEventListener('click', swallow, true);
+		setTimeout(() => window.removeEventListener('click', swallow, true), 0);
+	}
+
+	function onPointerMove(e: PointerEvent) {
+		if (!press || e.pointerId !== press.pointerId) return;
+		const dx = e.clientX - press.x;
+		const dy = e.clientY - press.y;
+		if (!dragId) {
+			if (!exceedsDragThreshold(dx, dy)) return;
+			// Measured only once the press has become a drag, so an ordinary click on
+			// a tab still costs no forced layout.
+			press.boxes = stripEl ? snapshotTabBoxes(stripEl) : [];
+			dragId = press.id;
+			window.addEventListener('keydown', onDragKeydown, true);
+		}
+		dragDx = dx;
+		dragDy = dy;
+		dropIndex = dropIndexAt(press.boxes ?? [], e.clientX, e.clientY);
+	}
+
+	function onPointerUp(e: PointerEvent) {
+		if (press && e.pointerId !== press.pointerId) return;
+		const cancelled = press?.cancelled === true;
+		const id = dragId;
+		const slot = dropIndex;
+		endDrag();
+		// An abandoned drag must not select the file it was released over either -
+		// which is why Escape leaves the gesture RUNNING (flagged) rather than tearing
+		// it down: the release is still ours to swallow.
+		if (cancelled) return swallowNextClick();
+		if (id == null || slot == null) return; // never crossed the threshold: an ordinary click
+		swallowNextClick();
+		onReorderTabs?.(id, slot);
+	}
+
+	function onPointerCancel(e: PointerEvent) {
+		if (press && e.pointerId !== press.pointerId) return;
+		const dragged = dragId != null || press?.cancelled === true;
+		endDrag();
+		if (dragged) swallowNextClick();
+	}
+
+	/**
+	 * Escape abandons a drag in flight: the tab snaps back to its slot, nothing is
+	 * written, and the pointer listeners STAY so the eventual release is swallowed
+	 * rather than landing as a plain click on the tab.
+	 */
+	function onDragKeydown(e: KeyboardEvent) {
+		if (e.key !== 'Escape' || !press) return;
+		e.preventDefault();
+		e.stopPropagation();
+		press.cancelled = true;
+		dragId = null;
+		dropIndex = null;
+		dragDx = 0;
+		dragDy = 0;
+		window.removeEventListener('keydown', onDragKeydown, true);
+	}
+
+	// A gesture must not outlive the strip: drop the window listeners on teardown.
+	$effect(() => () => endDrag());
+
+	function onTabPointerDown(e: PointerEvent, id: string) {
+		if (e.button !== 0) return; // a context-menu / auxiliary press is not a drag
+		// A control inside a draggable surface stays a control: a press on the
+		// close or jump-to-running button must never begin a tab drag.
+		if ((e.target as Element | null)?.closest('[data-tab-nodrag]')) return;
+		press = { id, pointerId: e.pointerId, x: e.clientX, y: e.clientY, boxes: null };
+		window.addEventListener('pointermove', onPointerMove);
+		window.addEventListener('pointerup', onPointerUp);
+		window.addEventListener('pointercancel', onPointerCancel);
+	}
+
+	/**
+	 * A tab's classes, decided in ONE place so the states cannot fight.
+	 *
+	 * The background in particular MUST be a single choice rather than layered
+	 * utilities: `hover:bg-base-200/50` out-specifies a plain `bg-base-200`, so a
+	 * lifted tab - which is by definition under the pointer, and therefore hovered
+	 * - rendered at 50% alpha and let the tabs it was floating over read straight
+	 * through it. The hover tint is also dropped from EVERY tab while a drag is in
+	 * flight: mid-drag the drop indicator should be the only thing on the strip
+	 * saying where the tab is going.
+	 */
+	function tabClass(id: string): string {
+		const active = id === activeTabId;
+		const dragging = dragId === id;
+		const base =
+			'group flex max-w-[220px] shrink-0 select-none items-center gap-1.5 border-b border-r border-base-300 px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary';
+		const tone = active || dragging ? 'bg-base-200 text-base-content' : 'bg-base-100 text-base-content/60';
+		const hover = dragId || active ? '' : 'hover:bg-base-200/50';
+		const lift = dragging ? 'relative z-20 cursor-grabbing rounded-sm shadow-lg ring-1 ring-primary/60' : 'cursor-grab';
+		return `${base} ${tone} ${hover} ${lift}`;
+	}
+
+	const bindingsFor = (id: string) => shortcuts.list.find((s) => s.id === id)?.keys ?? [];
+
+	/**
+	 * Keyboard handling for a focused tab: Enter/Space selects it, and the
+	 * registry's `move-tab-left` / `move-tab-right` bindings reorder it - so
+	 * reordering is reachable with no pointer, and is listed (and rebindable) in
+	 * Settings beside every other shortcut.
+	 *
+	 * Dispatched HERE rather than in the shell's global handler because the gate
+	 * is structural: the event target IS the tab, so these chords can only fire
+	 * while a tab has focus and can never shadow a notebook binding.
+	 */
+	async function onTabKeydown(e: KeyboardEvent, id: string, index: number) {
+		if (e.key === 'Enter' || e.key === ' ') {
+			e.preventDefault();
+			onSelectTab(id);
+			return;
+		}
+		const chord = chordFromEvent(e);
+		if (!chord) return;
+		// A step of one place, expressed as an insertion slot: one BEFORE the tab's
+		// left neighbour, or one AFTER its right one. Out-of-range slots are clamped
+		// by `reorderTabs` onto the tab's own position, so a step off either end is
+		// an honest no-op rather than a wrap-around.
+		const left = bindingsFor('move-tab-left').includes(chord);
+		const right = bindingsFor('move-tab-right').includes(chord);
+		if (!left && !right) return;
+		e.preventDefault();
+		e.stopPropagation();
+		const slot = left ? index - 1 : index + 2;
+		const landed = landingIndex(index, Math.max(0, Math.min(tabs.length, slot)));
+		if (landed === index) {
+			moveAnnouncement = `${tabs[index]?.title ?? 'Tab'} is already ${left ? 'first' : 'last'}`;
+			return;
+		}
+		onReorderTabs?.(id, slot);
+		// Svelte's keyed each MOVES the node, which drops focus, so put it back on
+		// the tab the user is still steering.
+		await tick();
+		document.querySelector<HTMLElement>(`[data-testid="tab"][data-tab-id="${CSS.escape(id)}"]`)?.focus();
+		moveAnnouncement = `${tabs[landed]?.title ?? 'Tab'} moved to position ${landed + 1} of ${tabs.length}`;
+	}
 </script>
 
 <header class="flex min-h-11 items-stretch border-b border-base-300 bg-base-100 text-base-content" data-testid="navbar">
@@ -326,17 +543,63 @@
 		</div>
 	</div>
 
-	<!-- Tab bar: wraps onto additional rows when the open tabs overflow. -->
-	<div class="flex min-w-0 flex-1 flex-wrap content-start items-stretch" data-testid="tabbar">
-		{#each tabs as tab (tab.id)}
+	<!--
+		The insertion marker: where the dragged tab will land. Zero-width IN FLOW (the
+		bar is absolutely positioned), so revealing it never shifts the tabs it sits
+		between - an indicator that pushes the strip around as you drag is exactly the
+		mush this has to avoid. `z-30` puts it above the LIFTED tab (`z-20`), which
+		necessarily floats under the pointer and so would otherwise hide the very
+		answer it is being asked for; the caps are what stop the bar reading as a text
+		caret where it crosses the dragged tab's label.
+	-->
+	{#snippet dropMarker(index: number)}
+		<div class="relative z-30 w-0 self-stretch" aria-hidden="true" data-testid="tab-drop-indicator" data-drop-index={index}>
+			<span class="absolute inset-y-1 -left-[1.5px] w-[3px] rounded-full bg-primary shadow-[0_0_7px_var(--color-primary)]"></span>
+			<span class="absolute -top-px -left-[3.5px] h-[7px] w-[7px] rotate-45 rounded-[1.5px] bg-primary"></span>
+			<span class="absolute -bottom-px -left-[3.5px] h-[7px] w-[7px] rotate-45 rounded-[1.5px] bg-primary"></span>
+		</div>
+	{/snippet}
+
+	<!--
+		Tab bar: wraps onto additional rows when the open tabs overflow, and its
+		tabs are reorderable by dragging one to a new slot (see `$lib/tabReorder`).
+
+		The drag is POINTER-driven, not HTML5 drag-and-drop. Three things follow
+		from that and are the reason for the choice: the press only becomes a drag
+		past `DRAG_THRESHOLD_PX`, so an ordinary click is never misread as the
+		start of one; the tab itself is what follows the pointer (a `translate`),
+		rather than the browser's washed-out drag image; and the drop indicator is
+		drawn from a layout snapshot we own, so it names an exact slot on the
+		exact row - which a wrapped, multi-row strip needs.
+	-->
+	<div
+		bind:this={stripEl}
+		class="flex min-w-0 flex-1 flex-wrap content-start items-stretch {dragId ? 'cursor-grabbing select-none' : ''}"
+		data-testid="tabbar"
+		role="tablist"
+		aria-label="Open files"
+		aria-orientation="horizontal"
+	>
+		{#each tabs as tab, i (tab.id)}
 			{@const runState = tabRunState[tab.id]}
+			{@const dragging = dragId === tab.id}
+			{#if dropIndex === i}{@render dropMarker(i)}{/if}
 			<div
-				class="group flex max-w-[220px] shrink-0 items-center gap-1.5 border-b border-r border-base-300 px-3 text-sm {tab.id === activeTabId ? 'bg-base-200 text-base-content' : 'bg-base-100 text-base-content/60 hover:bg-base-200/50'}"
+				class={tabClass(tab.id)}
+				style={dragging ? `transform: translate(${dragDx}px, ${dragDy}px)` : undefined}
 				data-testid="tab"
 				data-tab-id={tab.id}
 				data-active={tab.id === activeTabId}
 				data-preview={tab.preview || undefined}
 				data-run-state={runState || undefined}
+				data-dragging={dragging || undefined}
+				role="tab"
+				tabindex="0"
+				aria-selected={tab.id === activeTabId}
+				aria-label="{tab.title}, tab {i + 1} of {tabs.length}"
+				onpointerdown={(e) => onTabPointerDown(e, tab.id)}
+				onkeydown={(e) => onTabKeydown(e, tab.id, i)}
+				onclick={() => onSelectTab(tab.id)}
 				ondblclick={() => tab.preview && onPromoteTab?.(tab.id)}
 			>
 				<!-- While this notebook is executing/queueing a cell, the icon slot shows a
@@ -346,7 +609,8 @@
 				     cell (activating the tab first if it isn't the viewed one), while a
 				     click anywhere else on the tab still just selects it. The click is
 				     stopped from bubbling so a spinner-click is never an ambiguous tab
-				     select. -->
+				     select, and `data-tab-nodrag` keeps a press on it out of the drag
+				     gesture - a control inside a draggable surface must stay a control. -->
 				{#if runState}
 					<button
 						type="button"
@@ -354,6 +618,7 @@
 						title="Jump to running cell"
 						aria-label="Jump to running cell"
 						data-testid="tab-jump-running"
+						data-tab-nodrag
 						onclick={(e) => {
 							e.stopPropagation();
 							onJumpToRunningCell?.(tab.id);
@@ -365,32 +630,37 @@
 							<span class="h-1.5 w-1.5 animate-pulse rounded-full bg-warning/70" data-testid="tab-queued"></span>
 						{/if}
 					</button>
+				{:else}
+					<span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+						{@html iconSvg(tab.title, { dir: false })}
+					</span>
 				{/if}
-				<button class="flex min-w-0 items-center gap-1.5 py-2" onclick={() => onSelectTab(tab.id)}>
-					{#if !runState}
-						<span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
-							{@html iconSvg(tab.title, { dir: false })}
-						</span>
-					{/if}
-					<span class="truncate {tab.preview ? 'italic' : ''}">{tab.title}</span>
-				</button>
+				<span class="truncate py-2 {tab.preview ? 'italic' : ''}">{tab.title}</span>
 				{#if tab.dirty}
 					<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-warning" title="Unsaved changes" data-testid="tab-dirty"></span>
 				{/if}
 				{#if tab.closable}
 					<button
 						class="btn btn-ghost btn-xs btn-square h-4 min-h-0 w-4 opacity-40 hover:opacity-100"
-						onclick={() => onCloseTab(tab.id)}
+						onclick={(e) => {
+							e.stopPropagation();
+							onCloseTab(tab.id);
+						}}
 						title="Close tab"
 						aria-label="Close tab"
 						data-testid="tab-close"
+						data-tab-nodrag
 					>
 						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg>
 					</button>
 				{/if}
 			</div>
+			{#if dropIndex === tabs.length && i === tabs.length - 1}{@render dropMarker(tabs.length)}{/if}
 		{/each}
 	</div>
+
+	<!-- A keyboard reorder has no drag to watch, so its outcome is spoken instead. -->
+	<span class="sr-only" role="status" aria-live="polite" data-testid="tab-move-announcement">{moveAnnouncement}</span>
 
 	<!-- Right cluster: kernel status + live resident memory -->
 	<div class="flex items-center gap-2 border-l border-base-300 px-3 text-xs text-base-content/60">
