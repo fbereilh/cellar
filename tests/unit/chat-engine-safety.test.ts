@@ -549,6 +549,32 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 		}
 	});
 
+	it('ONE source: for every shape, the argv\'s request and grant ARE the policy the assertion reads', () => {
+		// The invariant this whole design turns on, made executable rather than left
+		// as a comment: request, grant and assertion must be one decision. Two
+		// independently-computed lists would not throw - they would silently grant a
+		// capability nothing asserted, or assert one nothing granted.
+		for (const caps of [{}, { webSearch: true }, { readRoot: WS }, { webSearch: true, readRoot: WS }]) {
+			const policy = chatToolPolicy(caps);
+			const args = chatCliArgs(caps);
+			// `--tools` REQUESTS exactly the policy's tools...
+			expect(args[args.indexOf('--tools') + 1]).toBe(policy.tools.join(','));
+			// ...`--allowedTools` GRANTS exactly the policy's grants, and is absent
+			// (never empty) when there is nothing to grant...
+			const at = args.indexOf('--allowedTools');
+			if (policy.grants.length === 0) expect(at).toBe(-1);
+			else expect(args[at + 1]).toBe(policy.grants.join(','));
+			// ...the prompt is the one THAT policy selects...
+			expect(promptOf(args)).toBe(chatSystemPrompt(policy));
+			// ...and every granted rule names a tool the run actually requested, so a
+			// grant can never reach a capability the assertion does not cover.
+			for (const grant of policy.grants) {
+				const name = grant.replace(/\(.*$/, '');
+				expect(policy.tools).toContain(name);
+			}
+		}
+	});
+
 	it('the module never requests a WRITE-shaped or executing tool, and never WebFetch', () => {
 		// The capability ceiling, asserted at the source: a chat cell learns from the
 		// workspace, it does not edit it or run things in it.
