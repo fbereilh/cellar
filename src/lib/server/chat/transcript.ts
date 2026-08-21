@@ -14,6 +14,19 @@
  *    the MCP read surface, same predicate, so one flag means one thing
  *    everywhere: "this cell is not shown to AI".
  *
+ *    **Its SCOPE, stated precisely, because a reads-on run has file reach.** The
+ *    filter below bounds the TRANSCRIPT; on its own that would leave a hidden
+ *    cell one `Read('<ws>/notebook.ipynb')` away, since the notebook file (and
+ *    `.cellar/checkpoints.json`, which snapshots cells WITH outputs) sits inside
+ *    the confinement root. So the two halves are paired: this filter bounds what
+ *    is SENT, and `server/chat/claude-cli.ts`'s `denialPatterns` denies the
+ *    current notebook and `.cellar/` at the tool layer on EVERY reads-on run,
+ *    never optionally. Together a hidden cell in THIS notebook stays unreachable,
+ *    which is also what keeps `chatPromptTooLargeMessage`'s "hide cells from the
+ *    agent" remedy honest. The honest residual: a hidden cell in a DIFFERENT
+ *    notebook is reachable when the person turns the other-notebooks option on -
+ *    which is what that option, defaulting OFF, exists to decide.
+ *
  * 2. **The transcript is BYTE-STABLE across runs of an unchanged notebook.**
  *    Prompt caching keys on an exact prefix and is what makes a long notebook
  *    affordable (a measured 22.6x cost reduction on a warm re-run) - so nothing

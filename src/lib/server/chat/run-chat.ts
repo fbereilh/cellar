@@ -24,7 +24,17 @@ import { workspaceRoot } from '../fstree';
 import { listCells } from '../notebook';
 import type { OutputAccumulator } from '../output-accumulator';
 import type { CellOutput } from '../types';
-import { CHAT_MODEL_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, chatWebSearchEnabled, chatWorkspaceReadsEnabled, normalizeChatModel, type ChatFailureKind } from '$lib/chatCell';
+import {
+	CHAT_MODEL_KEY,
+	CHAT_OTHER_NOTEBOOKS_KEY,
+	CHAT_WEB_SEARCH_KEY,
+	CHAT_WORKSPACE_READS_KEY,
+	chatOtherNotebooksEnabled,
+	chatWebSearchEnabled,
+	chatWorkspaceReadsEnabled,
+	normalizeChatModel,
+	type ChatFailureKind
+} from '$lib/chatCell';
 import { asText } from '$lib/outputText';
 import { getUserSettings } from '$lib/server/user-settings';
 import { registerChatRun, unregisterChatRun } from './active';
@@ -109,10 +119,12 @@ export async function executeChatRun({
 		// model is constrained to the known set BEFORE it rides the seam (and the
 		// engine re-normalizes - no path to argv skips the gate), and each capability
 		// is on only for a literal stored `true`, so absent keys are exactly the
-		// pre-settings behavior. The two opt-ins are read from SEPARATE keys and
-		// composed here rather than in the store: they widen the session in
-		// different directions (an outbound query channel vs. local file reach), so
-		// neither may arrive as a side effect of the other.
+		// pre-settings behavior. The opt-ins are read from SEPARATE keys and composed
+		// here rather than in the store: web search and workspace reads widen the
+		// session in different directions (an outbound query channel vs. local file
+		// reach), so neither may arrive as a side effect of the other, while the
+		// other-notebooks key only ever NARROWS the read grant and is inert unless
+		// reads are already on.
 		const settings = getUserSettings();
 		const res = await chatEngine().run({
 			prompt,
@@ -120,6 +132,13 @@ export async function executeChatRun({
 			model: normalizeChatModel(settings[CHAT_MODEL_KEY]),
 			webSearch: chatWebSearchEnabled(settings[CHAT_WEB_SEARCH_KEY]),
 			readRoot: chatWorkspaceReadsEnabled(settings[CHAT_WORKSPACE_READS_KEY]) ? chatReadableWorkspace() : null,
+			// The notebook this run is answering in, so the engine can DENY it: the
+			// model already holds it as a fresher, hidden-cell-filtered transcript, so
+			// reading the file could only add a stale copy and the cells the user
+			// deliberately withheld. `nb` is the resolved absolute path the whole run
+			// pipeline is keyed by, which is exactly what the deny rule needs.
+			notebookPath: nb,
+			otherNotebooks: chatOtherNotebooksEnabled(settings[CHAT_OTHER_NOTEBOOKS_KEY]),
 			signal: ctrl.signal,
 			onDelta: (text) => {
 				if (!text) return;

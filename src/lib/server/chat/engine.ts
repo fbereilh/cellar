@@ -46,6 +46,22 @@ export interface ChatEngineRunArgs {
 	 * no file reach anywhere else in Cellar.
 	 */
 	readRoot?: string | null;
+	/**
+	 * The ABSOLUTE path of the notebook this run answers in. REQUIRED, not
+	 * optional: with reads on the engine DENIES this file (the model already holds
+	 * the notebook as a fresher, hidden-cell-filtered transcript, so reading it
+	 * could only add a stale copy and the cells the user withheld), and a run that
+	 * cannot name it gets no file tools at all rather than an unbounded grant.
+	 * Pass null only where there is genuinely no notebook - that too is read-less.
+	 */
+	notebookPath: string | null;
+	/**
+	 * May OTHER notebooks in the workspace be read? Only a literal `true` opens
+	 * them; absent/false additionally denies every `*.ipynb` there, so a reply
+	 * still reads `.py`, `.md` and data files. The notebook named above and
+	 * Cellar's own `.cellar/` state stay denied either way.
+	 */
+	otherNotebooks?: boolean;
 	/** Aborted by interrupt / kernel restart / shutdown; the engine must kill its work. */
 	signal: AbortSignal;
 	/** Streamed reply text, in order, as it is produced. */

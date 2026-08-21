@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
-import { CHAT_MODEL_KEY, CHAT_MODEL_DEFAULT, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
+import { CHAT_MODEL_KEY, CHAT_MODEL_DEFAULT, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
 
 /**
  * E2E for the **Chat cells** section of the Settings pane - the human surface of
@@ -99,12 +99,15 @@ test('a never-touched install carries neither key, and the pane shows the shippe
 	await expect(page.getByTestId('settings-chat-model')).toHaveValue(CHAT_MODEL_DEFAULT);
 	await expect(page.getByTestId('settings-chat-web-search')).not.toBeChecked();
 	await expect(page.getByTestId('settings-chat-workspace-reads')).not.toBeChecked();
+	await expect(page.getByTestId('settings-chat-other-notebooks')).not.toBeChecked();
 
 	const before = await serverSettings(page);
 	expect(before[CHAT_MODEL_KEY]).toBeUndefined();
 	expect(before[CHAT_WEB_SEARCH_KEY]).toBeUndefined();
 	// The reads key too: an upgraded install grants no file reach until asked.
 	expect(before[CHAT_WORKSPACE_READS_KEY]).toBeUndefined();
+	// ...and other notebooks stay denied until asked for separately.
+	expect(before[CHAT_OTHER_NOTEBOOKS_KEY]).toBeUndefined();
 
 	await page.getByTestId('chat-settings-control').screenshot({
 		path: test.info().outputPath('chat-settings-default.png')
@@ -193,6 +196,34 @@ test('the workspace-reads opt-in stores a literal true, and leaves web search al
 	await closeSettings(page);
 });
 
+test('the other-notebooks opt-in is its own key, and does not widen the other two', async ({ page }) => {
+	await page.goto(baseURL);
+	await openSettings(page);
+
+	// Reads are ON at this point and search is OFF, so this is a real independence
+	// check: the narrowing this toggle lifts is a THIRD decision, and neither of
+	// the two capabilities beside it may arrive as a side effect of taking it.
+	await expect(page.getByTestId('settings-chat-workspace-reads')).toBeChecked();
+	await expect(page.getByTestId('settings-chat-other-notebooks')).not.toBeChecked();
+	await page.getByTestId('settings-chat-other-notebooks').click();
+	await expect(page.getByTestId('settings-chat-other-notebooks')).toBeChecked();
+
+	await expect
+		.poll(async () => (await serverSettings(page))[CHAT_OTHER_NOTEBOOKS_KEY], { timeout: 10_000 })
+		.toBe(true);
+	expect(CHAT_WEB_SEARCH_KEY in (await serverSettings(page))).toBe(false);
+	expect((await serverSettings(page))[CHAT_WORKSPACE_READS_KEY]).toBe(true);
+
+	// Off again deletes it, so an opted-out store is byte-identical to a fresh one
+	// - the same rule as its two neighbours, and it must hold for the key whose
+	// default is what keeps other people's hidden cells out of a reply.
+	await page.getByTestId('settings-chat-other-notebooks').click();
+	await expect
+		.poll(async () => CHAT_OTHER_NOTEBOOKS_KEY in (await serverSettings(page)), { timeout: 10_000 })
+		.toBe(false);
+	await closeSettings(page);
+});
+
 test('a reload re-hydrates the reads toggle, and turning it off DELETES its key', async ({ page }) => {
 	await page.goto(baseURL);
 	await openSettings(page);
@@ -242,10 +273,11 @@ interface OptOutProbe {
 
 /**
  * One capability's opt-out, timed against the debounce floor. Parameterized
- * because the guarantee is a property of the HANDLER, not of the pane: the two
- * toggles write different keys through different functions, so proving it for
- * web search says nothing about workspace reads - and reads is the one whose
- * debounced window would leave the next run still holding a file grant.
+ * because the guarantee is a property of the HANDLER, not of the pane: each
+ * toggle writes its own key through its own function, so proving it for web
+ * search says nothing about workspace reads or about other notebooks - and those
+ * two are the ones whose debounced window would leave the next run still holding
+ * a file grant, or still able to read notebooks the person just closed off.
  */
 async function assertOptOutBeatsDebounce(page: Page, key: string, testId: string): Promise<void> {
 	await openSettings(page);
@@ -309,4 +341,13 @@ test('the web-search opt-out reaches the server without waiting out the debounce
 test('the workspace-reads opt-out reaches the server without waiting out the debounce', async ({ page }) => {
 	await page.goto(baseURL);
 	await assertOptOutBeatsDebounce(page, CHAT_WORKSPACE_READS_KEY, 'settings-chat-workspace-reads');
+});
+
+test('the other-notebooks opt-out reaches the server without waiting out the debounce', async ({ page }) => {
+	// The same floor for the third key, because the guarantee is a property of the
+	// HANDLER: this one decides whether the next run may read OTHER people's
+	// notebooks - including the cells their authors hid - so an opt-out sitting in
+	// a debounce window is the same class of defect as the two beside it.
+	await page.goto(baseURL);
+	await assertOptOutBeatsDebounce(page, CHAT_OTHER_NOTEBOOKS_KEY, 'settings-chat-other-notebooks');
 });

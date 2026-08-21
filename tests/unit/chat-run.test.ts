@@ -26,7 +26,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { ChatEngine, ChatEngineRunArgs } from '../../src/lib/server/chat/engine';
-import { CHAT_MODEL_DEFAULT, CHAT_MODEL_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
+import { CHAT_MODEL_DEFAULT, CHAT_MODEL_KEY, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
 
 let WS: string;
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -62,7 +62,7 @@ afterEach(() => {
 	enginemod.__setChatEngineForTests(null);
 	activemod.__resetChatRuns();
 	// Undo whatever a threading test wrote, so key absence stays each test's default.
-	settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null, [CHAT_WORKSPACE_READS_KEY]: null });
+	settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null, [CHAT_WORKSPACE_READS_KEY]: null, [CHAT_OTHER_NOTEBOOKS_KEY]: null });
 });
 
 /** A notebook: python cell / hidden cell / chat cell. */
@@ -530,6 +530,45 @@ describe('the engine capability settings are read from the user store and gated'
 		// and grants no file reach anywhere else, so it must not be the answer here.
 		expect(args[0].readRoot).toBe(resolve(WS));
 		// ...and reads do not drag search along either.
+		expect(args[0].webSearch).toBe(false);
+	});
+
+	it('the notebook being answered in reaches the engine so it can be DENIED, whatever the settings say', async () => {
+		// Reads-on grants the workspace, and the notebook lives in it - so the engine
+		// has to be told WHICH file to take back, or a single Read would hand back
+		// the cells the transcript filter deliberately withheld. It is threaded on
+		// EVERY run, not only reads-on ones, because the engine (not this layer)
+		// owns when a denial is emitted.
+		const { nb } = makeNotebook('settings-notebook-path.ipynb');
+		const { args } = capturingEngine();
+		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(res.status).toBe('ok');
+		expect(args[0].notebookPath).toBe(nb);
+	});
+
+	it('other notebooks are denied unless explicitly opted in - and the opt-in is its own key', async () => {
+		// Default OFF, and a literal `true` is the only thing that opens them: this
+		// key only ever NARROWS the read grant, so junk in the untyped store must
+		// leave the narrower state in force.
+		const { nb } = makeNotebook('settings-other-nb.ipynb');
+		for (const [stored, expected] of [
+			[undefined, false],
+			['true', false],
+			[1, false],
+			[true, true]
+		] as const) {
+			settingsmod.setUserSettings(stored === undefined ? { [CHAT_WORKSPACE_READS_KEY]: true } : { [CHAT_WORKSPACE_READS_KEY]: true, [CHAT_OTHER_NOTEBOOKS_KEY]: stored });
+			const { args } = capturingEngine();
+			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+			expect(res.status).toBe('ok');
+			expect(args[0].otherNotebooks === true).toBe(expected);
+		}
+		// And it does not drag the other two capabilities along, in either direction:
+		// on its own it grants no file reach at all, so it can only ever narrow one.
+		settingsmod.setUserSettings({ [CHAT_WORKSPACE_READS_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null, [CHAT_OTHER_NOTEBOOKS_KEY]: true });
+		const { args } = capturingEngine();
+		await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(args[0].readRoot ?? null).toBeNull();
 		expect(args[0].webSearch).toBe(false);
 	});
 

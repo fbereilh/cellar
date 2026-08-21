@@ -60,6 +60,22 @@ export const CHAT_WEB_SEARCH_KEY = 'cellar-chat-web-search';
  */
 export const CHAT_WORKSPACE_READS_KEY = 'cellar-chat-workspace-reads';
 
+/**
+ * The user-settings key for the read-OTHER-notebooks opt-in, a NARROWING of the
+ * workspace-reads grant rather than a capability of its own. Only a literal
+ * `true` turns it on (`chatOtherNotebooksEnabled`), the same `=== true` gate as
+ * its two neighbours and for the same reason.
+ *
+ * Its own key, deliberately: with workspace reads on, a reply would otherwise
+ * reach every OTHER notebook's `.ipynb` - including the cells their authors
+ * marked `hidden_from_agent` - as a side effect of asking to read code. Default
+ * OFF denies every `*.ipynb` in the workspace, so `.py`, `.md` and data files
+ * still read. The notebook being chatted in is denied whatever this says: the
+ * model already holds it as a fresher transcript (see `server/chat/claude-cli.ts`
+ * `denialPatterns`).
+ */
+export const CHAT_OTHER_NOTEBOOKS_KEY = 'cellar-chat-other-notebooks';
+
 /** The model chat cells run when the user never chose one. */
 export const CHAT_MODEL_DEFAULT = 'sonnet';
 
@@ -109,6 +125,19 @@ export function chatWebSearchEnabled(value: unknown): boolean {
  * read-less (see `server/chat/claude-cli.ts`'s `chatToolPolicy`).
  */
 export function chatWorkspaceReadsEnabled(value: unknown): boolean {
+	return value === true;
+}
+
+/**
+ * May a chat run read OTHER notebooks in the workspace? Only an explicit stored
+ * `true` counts - the same `=== true` gate as its neighbours.
+ *
+ * Read only where workspace reads are already on: it never GRANTS reach, it only
+ * declines to take some back. The CURRENT notebook is denied whatever this
+ * returns, so a `true` here can never expose the notebook the question was asked
+ * in.
+ */
+export function chatOtherNotebooksEnabled(value: unknown): boolean {
 	return value === true;
 }
 

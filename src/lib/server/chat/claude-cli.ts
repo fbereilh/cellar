@@ -13,6 +13,9 @@
  * capability shapes ONLY (see below - `--tools` alone makes the tool exist but
  * leaves the CALL permission-gated, so an opt-in would be inert; the default
  * shape passes neither flag and is byte-for-byte the pre-settings argv),
+ * `--disallowedTools <rules>` on the reads shape ONLY (the current notebook,
+ * Cellar's `.cellar/` state, and by default every other notebook - see the
+ * denial section below),
  * `--disable-slash-commands`, `--setting-sources ""` (the user's/project's
  * CLAUDE.md, settings.json hooks, allowedTools etc. are never loaded),
  * `--strict-mcp-config` with no MCP config (no MCP servers),
@@ -80,18 +83,22 @@
  *     flag's "comma or space-separated" parsing split the value - kept working
  *     inside and kept refusing outside. The value is not split within one argv
  *     element.
- *   - CHARACTERS MEANINGFUL TO THE RULE GRAMMAR WERE MEASURED ONE BY ONE, and
- *     they land in THREE different places - so the doc names the members, never
- *     a class: `* ? [ ] { }` WIDEN the grant (`<root>/ws[ab]` yielded a rule the
- *     matcher glob-INTERPRETED, reading `<root>/wsa/secret.txt` in a SIBLING
- *     directory); `\` BREAKS child startup (with `<root>/ws\a` really on disk
- *     the CLI refused to launch, rc=1, "Can't access working directory");
- *     `(` and `)` are SAFE in BOTH the spaced and the ADJACENT form
+ *   - CHARACTERS MEANINGFUL TO THE RULE GRAMMAR WERE DRIVEN ONE BY ONE, and the
+ *     results land in FOUR different places - so the doc names the members,
+ *     never a class: `* ? [ ] { }` WIDEN the grant (`<root>/ws[ab]` yielded a
+ *     rule the matcher glob-INTERPRETED, reading `<root>/wsa/secret.txt` in a
+ *     SIBLING directory); `\` BREAKS child startup (with `<root>/ws\a` really
+ *     on disk the CLI refused to launch, rc=1, "Can't access working
+ *     directory"); `(` and `)` are SAFE in BOTH the spaced and the ADJACENT form
  *     (`<root>/ws (2)` and `<root>/report(2)` each read inside and still refused
- *     outside - no extglob behaviour - so ordinary names like
- *     `~/Projects/analysis (2)` keep working). `chatReadRoot` REFUSES the first
- *     two groups (see `UNCONFINABLE_ROOT_CHARS`) rather than escaping them,
- *     escape semantics being unmeasured.
+ *     outside), so ordinary names like `~/Projects/analysis (2)` keep working;
+ *     and the extglob-shaped `@(`, `+(`, `!(` were each driven against a
+ *     workspace with the sibling an extglob would have covered and were INERT
+ *     (sibling refused, inside read fine). `chatReadRoot` refuses the first two
+ *     groups because they were measured to FAIL, and the extglob prefixes as a
+ *     DURABLE PRECAUTION - extglob being off is an unstated detail of the CLI's
+ *     matcher a future version could flip - never because they were measured to
+ *     leak. Refused rather than escaped, escape semantics being unmeasured.
  *   - The child WRITES NOTHING into that cwd: with the shipped flags
  *     (`--no-session-persistence`, `--setting-sources ""`) a successful
  *     reads-on run left the workspace directory tree byte-identical, so moving
@@ -104,10 +111,35 @@
  * stays workspace-scoped, through `resolveInWorkspace`). Reads follow that rule
  * rather than inventing a second answer.
  *
+ * ## The grant says WHERE; the denial says what stays unreadable there
+ *
+ * A grant over the workspace would otherwise hand back, through the file
+ * system, exactly what the transcript deliberately withholds: the notebook file
+ * carries every cell the user marked `hidden_from_agent`, and
+ * `<root>/.cellar/checkpoints.json` carries full cell snapshots including
+ * outputs. So a reads-on run also passes `--disallowedTools`, built by the SAME
+ * `chatToolPolicy` and enumerated in `denialPatterns`: the CURRENT notebook by
+ * its actual path (always, whatever its extension), `<root>/.cellar/` whole,
+ * and - unless the person opted other notebooks in - every `*.ipynb` in the
+ * workspace. Measured against claude 2.1.238: a deny rule BEATS the allow rule
+ * for a path inside the granted root, a sibling file in that root still reads,
+ * and the denial is enforced per file by the tools themselves (a Grep over the
+ * granted directory for the denied file's content found nothing, and a recursive
+ * Glob for every `.ipynb` under it listed nothing), which is what makes it bound
+ * Grep and Glob and not only Read.
+ *
+ * Denying the current notebook is an ANSWER-QUALITY decision as much as a
+ * privacy one - the model already holds it as a curated, FRESH transcript, so
+ * reading the file could only add a stale copy, the hidden cells, and a second
+ * conflicting view of the thing it is looking at. The rationale sits in full at
+ * `denialPatterns`.
+ *
  * Fail-closed all the way down: `chatToolPolicy` refuses any root it cannot
  * confine (non-string, empty, relative, non-POSIX, or carrying one of
- * `UNCONFINABLE_ROOT_CHARS`) and yields a READ-LESS policy, so the failure mode
- * of every unknown is today's tool-less session.
+ * `UNCONFINABLE_ROOT_CHARS`/`EXTGLOB_PREFIX`) and yields a READ-LESS policy, so
+ * the failure mode of every unknown is today's tool-less session - and it
+ * requires a deniable notebook path by the same rule, so there is no way to
+ * reach a granted read whose notebook denial was skipped.
  * And because the frozen system prompt is chosen from that same policy, a run
  * that ends up read-less is also told it cannot read.
  *
@@ -206,6 +238,22 @@ export interface ChatCapabilities {
 	 * cannot confine yields a read-less policy rather than an unconfined one.
 	 */
 	readRoot?: string | null;
+	/**
+	 * The ABSOLUTE path of the notebook this run is answering in - ALWAYS denied
+	 * when reads are on (see `denialPatterns` rule 1), whatever its extension.
+	 *
+	 * Reads need BOTH this and `readRoot`: without a notebook to deny there is no
+	 * way to keep the always-denied promise, so `chatToolPolicy` yields a
+	 * read-less policy rather than an unbounded one. That is what makes the
+	 * promise structural instead of a discipline every caller has to remember.
+	 */
+	notebookPath?: string | null;
+	/**
+	 * May OTHER notebooks in the workspace be read? Only a literal `true` opens
+	 * them (the person-scoped opt-in); the CURRENT notebook stays denied either
+	 * way, as does `<root>/.cellar/`.
+	 */
+	otherNotebooks?: boolean;
 }
 
 /**
@@ -225,6 +273,12 @@ export interface ChatToolPolicy {
 	readonly tools: readonly string[];
 	/** What `--allowedTools` grants (path-scoped for the read tools). */
 	readonly grants: readonly string[];
+	/**
+	 * What `--disallowedTools` takes back INSIDE that grant - the current
+	 * notebook, `<root>/.cellar/`, and (unless opted out of) every other
+	 * `*.ipynb`. Empty whenever reads are off, so the default argv is unchanged.
+	 */
+	readonly denials: readonly string[];
 	/** The confinement root reads were granted under, or null when reads are off. */
 	readonly readRoot: string | null;
 	/** Whether web search was granted (decides the frozen prompt with `readRoot`). */
@@ -232,10 +286,10 @@ export interface ChatToolPolicy {
 }
 
 /**
- * Characters a root may not contain, because with one of them present the root
- * is no longer confinable - each MEASURED against claude 2.1.238, and the
- * measurements land in three different places, which is why this set is exactly
- * these seven characters rather than "punctuation" or "glob-ish":
+ * Characters a path may not contain if it is to become a LITERAL rule - each
+ * DRIVEN against claude 2.1.238, and the results land in three different places,
+ * which is why this set is exactly these seven characters rather than
+ * "punctuation" or "glob-ish":
  *
  *   - `* ? [ ] { }` WIDEN THE GRANT, a real confinement escape. A workspace at
  *     `<root>/ws[ab]` produced `Read(//<root>/ws[ab]/**)`, which the matcher
@@ -247,82 +301,186 @@ export interface ChatToolPolicy {
  *     does not exist`. Passed through, that surfaces to the user as an opaque
  *     `api_error` on a run they asked to read files; refused, they get a
  *     coherent read-less run whose frozen prompt truthfully says it cannot read.
- *   - `(` and `)` are SAFE and deliberately NOT refused, measured in BOTH the
- *     spaced and the ADJACENT form (the two are a different question, since only
- *     the adjacent one could be an extglob): `<root>/ws (2)` and
- *     `<root>/report(2)` each produced a rule that read its own file and still
- *     REFUSED a path outside it - so no extglob behaviour, and neither the
- *     inner parens nor an `@(`/`+(`/`!(`-shaped neighbour terminates the rule.
- *     `~/Projects/analysis (2)` is an entirely ordinary directory name and must
- *     keep working.
+ *   - `(` and `)` are SAFE and deliberately NOT refused, driven in BOTH the
+ *     spaced and the ADJACENT form (a different question each, since only the
+ *     adjacent one could be an extglob): `<root>/ws (2)` and `<root>/report(2)`
+ *     each produced a rule that read its own file and still REFUSED a path
+ *     outside it. `~/Projects/analysis (2)` and `report(2)` are entirely
+ *     ordinary directory names and must keep working, so a bare `@`, `+` or `!`
+ *     anywhere in a path stays allowed too (`my@notes`, `c++`, `important!`).
+ *
+ * `EXTGLOB_PREFIX` is the one refusal here that is NOT a measured leak, and the
+ * distinction matters: `@(`, `+(` and `!(` were each driven against a real
+ * workspace with a sibling the extglob would have covered (`runs@(a|b)` beside
+ * `runsa`, `data!(old)` beside `dataX`, `logs+(x)` beside `logsx`) and all three
+ * were INERT - the sibling was refused and the inside read still worked, i.e.
+ * extglob is off in this engine. They are refused anyway as a DURABLE
+ * PRECAUTION: extglob being disabled is an unstated implementation detail of the
+ * CLI's matcher that a future version could flip, and this module fails closed
+ * on grammar it cannot depend on. Do not restate this as a measured leak - it
+ * was measured NOT to leak.
  *
  * The refused characters are refused rather than escaped, on this module's
  * standing fail-closed doctrine: the matcher's escape semantics are UNMEASURED,
  * and a wrong escape reopens the hole while looking fixed. Such directory names
  * are rare, and the degradation stays coherent - a read-less run is also TOLD it
  * cannot read. Do not widen this set by analogy: every member is here because it
- * was measured to fail, and every non-member (parens) because it was measured
- * not to.
+ * was driven, and every non-member because it was driven too.
  */
 const UNCONFINABLE_ROOT_CHARS = /[*?[\]{}\\]/;
 
+/** The extglob-shaped two-character prefix - see `UNCONFINABLE_ROOT_CHARS`. */
+const EXTGLOB_PREFIX = /[@+!]\(/;
+
 /**
- * The confinement root, normalized, or null when this value cannot be confined.
+ * An absolute path this module can express as a LITERAL permission rule,
+ * normalized - or null when it cannot.
+ *
+ * ONE rule for both sides of the policy: the confinement ROOT a grant is scoped
+ * to, and the paths a DENIAL names. They ask the same question (can this path be
+ * spelled so the matcher treats every character of it literally) and answering it
+ * twice is how the two would drift into disagreeing about which paths are safe.
  *
  * Fails CLOSED on everything it is not sure of, because the alternative to a
- * confined read is an unconfined one: a non-string, an empty string, a relative
- * path, anything that does not normalize to a POSIX-absolute path, and anything
- * carrying one of `UNCONFINABLE_ROOT_CHARS` (measured either to widen the grant
- * onto sibling directories or to stop the child launching) all yield null
- * (= reads off). The POSIX check is not incidental - the `//` rule prefix below
- * is the CLI's absolute-path spelling and was measured on POSIX only, so a
- * Windows-style root is refused rather than turned into a rule whose matching
- * behaviour nobody here has established.
+ * confined read is an unconfined one, and the alternative to a literal denial is
+ * a denial that silently misses its target: a non-string, an empty string, a
+ * relative path, anything that does not normalize to a POSIX-absolute path, and
+ * anything carrying one of `UNCONFINABLE_ROOT_CHARS` or an `EXTGLOB_PREFIX` all
+ * yield null (= reads off). The POSIX check is not incidental - the `//` rule
+ * prefix below is the CLI's absolute-path spelling and was measured on POSIX
+ * only, so a Windows-style path is refused rather than turned into a rule whose
+ * matching behaviour nobody here has established.
  */
-export function chatReadRoot(value: unknown): string | null {
+function literalRulePath(value: unknown): string | null {
 	if (typeof value !== 'string' || !value.startsWith('/')) return null;
 	const abs = resolve(value);
 	if (!abs.startsWith('/')) return null;
-	return UNCONFINABLE_ROOT_CHARS.test(abs) ? null : abs;
+	if (UNCONFINABLE_ROOT_CHARS.test(abs) || EXTGLOB_PREFIX.test(abs)) return null;
+	return abs;
+}
+
+/**
+ * The confinement root, normalized, or null when this value cannot be confined.
+ * The root half of `literalRulePath` - see there for what is refused and why.
+ */
+export function chatReadRoot(value: unknown): string | null {
+	return literalRulePath(value);
+}
+
+/**
+ * `//<path-without-leading-slash>` - the CLI's own spelling of an absolute path
+ * inside a permission rule. Every path reaching here passed `literalRulePath`,
+ * so every character of it is matched literally.
+ */
+function rulePath(abs: string): string {
+	return `//${abs.replace(/^\/+/, '')}`;
 }
 
 /**
  * The `--allowedTools` path pattern confining a read tool to `root`.
  *
- * `//<path-without-leading-slash>/**` is the CLI's own spelling of an absolute
- * path in a permission rule. Measured against claude 2.1.238 (see the module
- * header's confinement section): it admits the root itself, every nested file
- * and dotfiles, and refuses everything outside it. The root reaching here is
- * metacharacter-free by construction (`chatReadRoot` refused the rest), so
- * every remaining character in it is matched literally.
+ * Measured against claude 2.1.238 (see the module header's confinement section):
+ * the `/**` suffix admits the root itself, every nested file and dotfiles, and
+ * refuses everything outside it.
  */
 function readGrantPattern(root: string): string {
-	return `//${root.replace(/^\/+/, '')}/**`;
+	return `${rulePath(root)}/**`;
+}
+
+/** Cellar's own per-project state directory, denied whole (see `denialPatterns`). */
+const CELLAR_STATE_DIR = '.cellar';
+
+/**
+ * The paths a reads-on run DENIES inside its own confinement root.
+ *
+ * The grant says where a reply may read; this says what stays unreadable there,
+ * and both come out of the one policy below so a widened grant cannot quietly
+ * outrun its denials. Measured against claude 2.1.238: a `--disallowedTools`
+ * rule BEATS the allow rule for a path inside the granted root (the CLI answers
+ * `is_error: true` with "File is in a directory that is denied by your
+ * permission settings"), a sibling file in the same root still reads fine, and
+ * the denial is enforced PER FILE by the tools themselves rather than only on
+ * the tool's path argument - a Grep over the granted directory for the denied
+ * file's content returned "No matches found" and a recursive Glob for every
+ * `.ipynb` under it returned "No files found". That last is what makes denying a
+ * file actually bound Grep and Glob and not just Read, which is why every rule
+ * below is emitted for EACH read tool: each can surface content independently.
+ *
+ * Three rules, in order:
+ *
+ *   1. **The CURRENT notebook, always, by its ACTUAL path** - never optional,
+ *      never behind a setting, and never an `.ipynb` PATTERN, because a jupytext
+ *      `.py` notebook is the current notebook too. This is an ANSWER-QUALITY
+ *      rule as much as a privacy one: the model is already handed this notebook
+ *      as a curated, FRESH transcript, so a file read of it can only add (a) a
+ *      STALE copy, the editor's autosave being debounced, (b) the cells the user
+ *      deliberately marked `hidden_from_agent`, and (c) a second, conflicting
+ *      view of the very thing it is looking at. There is no case where reading
+ *      it beats the transcript it already holds - and denying it is what keeps
+ *      `transcript.ts`'s rule 1 ("a hidden cell is provably absent from what is
+ *      sent") true once a run has file reach at all.
+ *   2. **`<root>/.cellar/` whole**, Cellar's own per-project state. The artifact
+ *      that matters there is `checkpoints.json`, which stores full cell
+ *      snapshots INCLUDING outputs and hidden cells - the same content rule 1
+ *      denies, reachable through a back door. It is denied as a DIRECTORY rather
+ *      than as that one file: everything under it is Cellar runtime state the
+ *      model needs none of, and a directory rule covers whatever is added there
+ *      later instead of silently going stale. (There is deliberately no
+ *      "outputs sidecar" rule - no such file exists in this codebase; the
+ *      notebook itself and this checkpoint store are the only two artifacts
+ *      carrying cell content, and both are covered here.)
+ *   3. **Every `*.ipynb` in the workspace**, unless the person opted OTHER
+ *      notebooks in. Off (the default) the reply still reads `.py`, `.md` and
+ *      data files - everything except notebooks; on, other notebooks open up
+ *      while rules 1 and 2 stand either way. Both a top-level and a nested form
+ *      are emitted rather than relying on a leading globstar matching zero
+ *      directories, which is engine-dependent and would silently leave the
+ *      workspace's top-level notebooks readable.
+ */
+function denialPatterns(root: string, notebookPath: string, otherNotebooks: boolean): string[] {
+	const patterns = [rulePath(notebookPath), `${rulePath(root)}/${CELLAR_STATE_DIR}/**`];
+	if (!otherNotebooks) patterns.push(`${rulePath(root)}/*.ipynb`, `${rulePath(root)}/**/*.ipynb`);
+	return patterns;
 }
 
 /**
  * The tool policy for one run - the ONE source feeding `--tools`,
- * `--allowedTools`, the `system/init` assertion, the frozen system prompt and
- * the child's cwd. `{}` is the default bare session: no tools, no grants.
+ * `--allowedTools`, `--disallowedTools`, the `system/init` assertion, the frozen
+ * system prompt and the child's cwd. `{}` is the default bare session: no tools,
+ * no grants, no denials.
+ *
+ * Reads require a confinable ROOT and a deniable NOTEBOOK PATH together. Either
+ * one missing or unexpressible yields a read-less policy, which is what makes
+ * "the current notebook is always denied" true by construction rather than by
+ * every caller remembering to pass it: there is no way to reach a granted read
+ * whose notebook denial was skipped.
  */
 export function chatToolPolicy(caps: ChatCapabilities = {}): ChatToolPolicy {
 	const webSearch = caps.webSearch === true;
-	const readRoot = chatReadRoot(caps.readRoot);
+	const root = chatReadRoot(caps.readRoot);
+	const notebookPath = literalRulePath(caps.notebookPath);
+	const readRoot = root !== null && notebookPath !== null ? root : null;
 	const tools: string[] = [];
 	const grants: string[] = [];
+	const denials: string[] = [];
 	if (webSearch) {
 		tools.push(WEB_SEARCH_TOOL);
 		// Search takes no path scope: it has no path to scope.
 		grants.push(WEB_SEARCH_TOOL);
 	}
-	if (readRoot) {
+	if (readRoot && notebookPath) {
 		const pattern = readGrantPattern(readRoot);
+		const denied = denialPatterns(readRoot, notebookPath, caps.otherNotebooks === true);
 		for (const tool of READ_TOOLS) {
 			tools.push(tool);
 			grants.push(`${tool}(${pattern})`);
+			// Every denial is emitted for EVERY read tool: each can surface a file's
+			// content independently, so a rule missing from one of them is that file
+			// readable through the other two.
+			for (const path of denied) denials.push(`${tool}(${path})`);
 		}
 	}
-	return { tools, grants, readRoot, webSearch };
+	return { tools, grants, denials, readRoot, webSearch };
 }
 
 /**
@@ -359,6 +517,8 @@ const READS_SENTENCE: readonly string[] = [
 	'You can read files in the notebook\'s own workspace with Read, Glob and Grep,',
 	'and only there - paths outside it are refused, so do not try. Use them to',
 	'ground your answer in the real code, and say which file a claim came from.',
+	'The notebook you are answering in is not readable as a file: you already have',
+	'it above, fresher than any copy on disk, so do not go looking for it.',
 	'You cannot write or edit files and cannot run code - never claim to have done',
 	'so; when something needs running, say what to run.'
 ];
@@ -435,6 +595,13 @@ export function chatCliArgs(opts: ChatCliOptions = {}): string[] {
 		// is not split inside one argv element. Pinned by the injection case in
 		// `tests/unit/chat-engine-safety.test.ts`.
 		...(policy.grants.length > 0 ? ['--allowedTools', policy.grants.join(',')] : []),
+		// The DENIAL (see `denialPatterns`): what the grant above may NOT reach
+		// inside its own root. Measured to BEAT the allow rule for a path inside
+		// it, and enforced per file by the tools rather than only on their path
+		// argument. Same shape rules as the grant - one comma-joined argv element,
+		// derived from the SAME policy, and omitted entirely rather than passed
+		// empty, which is what keeps the read-less argv byte-for-byte unchanged.
+		...(policy.denials.length > 0 ? ['--disallowedTools', policy.denials.join(',')] : []),
 		'--disable-slash-commands',
 		'--setting-sources',
 		'',
@@ -582,7 +749,7 @@ export const claudeCliEngine: ChatEngine = {
 	}
 };
 
-function runOnce({ prompt, configDir, model, webSearch, readRoot, signal, onDelta }: ChatEngineRunArgs): Promise<ChatEngineResult> {
+function runOnce({ prompt, configDir, model, webSearch, readRoot, notebookPath, otherNotebooks, signal, onDelta }: ChatEngineRunArgs): Promise<ChatEngineResult> {
 	return new Promise((settleRun) => {
 		if (signal.aborted) {
 			settleRun(fail({ kind: 'cancelled', message: 'interrupted' }, null));
@@ -594,7 +761,7 @@ function runOnce({ prompt, configDir, model, webSearch, readRoot, signal, onDelt
 		// the CLI to have reported - derived once here, which is what makes "the
 		// report must equal the request" structural rather than several rules that
 		// happen to agree.
-		const policy = chatToolPolicy({ webSearch, readRoot });
+		const policy = chatToolPolicy({ webSearch, readRoot, notebookPath, otherNotebooks });
 		const expectedTools = policy.tools;
 
 		// Hoisted so BOTH spawn-failure paths can ask whether the cwd is still
@@ -604,7 +771,7 @@ function runOnce({ prompt, configDir, model, webSearch, readRoot, signal, onDelt
 
 		let child: ChildProcess;
 		try {
-			child = spawn(CLAUDE_BIN, chatCliArgs({ model, webSearch, readRoot }), {
+			child = spawn(CLAUDE_BIN, chatCliArgs({ model, webSearch, readRoot, notebookPath, otherNotebooks }), {
 				env: chatChildEnv(configDir),
 				cwd,
 				stdio: ['pipe', 'pipe', 'pipe']

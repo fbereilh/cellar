@@ -5,7 +5,7 @@
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
 	import { getUserSettingFlag, getUserSettingText, setUserSetting, setUserSettingNow } from '$lib/userSettings';
-	import { CHAT_MODEL_KEY, CHAT_MODELS, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, normalizeChatModel } from '$lib/chatCell';
+	import { CHAT_MODEL_KEY, CHAT_MODELS, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, normalizeChatModel } from '$lib/chatCell';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import {
 		UPLOAD_DATE_TOKENS,
@@ -230,6 +230,7 @@
 	let chatModel = $state(normalizeChatModel(undefined));
 	let chatWebSearch = $state(false);
 	let chatWorkspaceReads = $state(false);
+	let chatOtherNotebooks = $state(false);
 	let chatHydrated = false;
 	$effect(() => {
 		if (!open || chatHydrated) return;
@@ -237,6 +238,7 @@
 		chatModel = normalizeChatModel(getUserSettingText(CHAT_MODEL_KEY));
 		chatWebSearch = getUserSettingFlag(CHAT_WEB_SEARCH_KEY);
 		chatWorkspaceReads = getUserSettingFlag(CHAT_WORKSPACE_READS_KEY);
+		chatOtherNotebooks = getUserSettingFlag(CHAT_OTHER_NOTEBOOKS_KEY);
 	});
 
 	// Both write through `setUserSettingNow`, NEVER the debounced `setUserSetting`:
@@ -272,6 +274,17 @@
 	function toggleChatWorkspaceReads() {
 		chatWorkspaceReads = !chatWorkspaceReads;
 		void setUserSettingNow(CHAT_WORKSPACE_READS_KEY, chatWorkspaceReads ? true : null);
+	}
+
+	// A NARROWING of the read grant, not a capability of its own - inert while
+	// reads are off, and it can never expose the notebook being chatted in, which
+	// the engine denies whatever this says. Its own key and its own handler for
+	// the same reason as its neighbours, and the same `setUserSettingNow` rule:
+	// the server re-reads it when a chat cell RUNS, so an opt-OUT left sitting in
+	// a debounce window would let the very next run still reach other notebooks.
+	function toggleChatOtherNotebooks() {
+		chatOtherNotebooks = !chatOtherNotebooks;
+		void setUserSettingNow(CHAT_OTHER_NOTEBOOKS_KEY, chatOtherNotebooks ? true : null);
 	}
 
 	// ---- Keyboard shortcuts --------------------------------------------------
@@ -677,8 +690,28 @@
 						On, a reply may browse and search the files in this workspace to answer about your code
 						(read, glob and grep). Reads are confined to the workspace folder: paths outside it are
 						refused, including through <code>..</code> or a symlink. It is read-only - a chat cell
-						still cannot write or edit files, or run code. Turn it off if the workspace holds
-						secrets you would rather a reply could not read, especially with web search also on.
+						still cannot write or edit files, or run code. The notebook you are chatting in is
+						never readable as a file - the reply already has it as a fresher transcript, with the
+						cells you hid from the agent left out - and neither is Cellar's own
+						<code>.cellar</code> folder. Turn it off if the workspace holds secrets you would
+						rather a reply could not read, especially with web search also on.
+					</p>
+					<label class="mt-3 flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Allow reading other notebooks</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={chatOtherNotebooks}
+							onchange={toggleChatOtherNotebooks}
+							data-testid="settings-chat-other-notebooks"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						Only applies while workspace reads are on. Off, the other <code>.ipynb</code> files in
+						this workspace are not readable either, so a reply still reads <code>.py</code>,
+						<code>.md</code> and data files but no notebook. On, it may read them - including any
+						cells their authors hid from the agent. The notebook you are chatting in stays
+						unreadable either way.
 					</p>
 				</div>
 

@@ -175,6 +175,9 @@ test('a search-on run survives the shipped engine end to end: the real session p
 		prompt: SEARCH_QUESTION,
 		configDir: null,
 		webSearch: true,
+		// A search-only run reads nothing, so there is no notebook to deny - stated
+		// rather than omitted, since the seam requires it.
+		notebookPath: null,
 		signal: new AbortController().signal,
 		onDelta: (t) => deltas.push(t)
 	});

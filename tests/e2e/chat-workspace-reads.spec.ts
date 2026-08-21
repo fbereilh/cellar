@@ -40,6 +40,20 @@ import { chatChildEnv, CLAUDE_BIN } from '../../src/lib/server/chat/env';
  * such a root outright and that half is pinned in the unit suite, there being
  * no confined session left to drive here.
  *
+ * ## The DENIAL layer gets the same treatment
+ *
+ * A grant over the workspace would otherwise hand back through the filesystem
+ * exactly what the transcript withholds - the notebook file carries the cells
+ * marked `hidden_from_agent`, and `.cellar/checkpoints.json` snapshots cells with
+ * their outputs - so a reads-on run also passes `--disallowedTools`. The fixture
+ * therefore plants a real notebook, a second notebook and a checkpoint store,
+ * each with its own marker, and the tests drive all three read tools at the
+ * denied paths: the deny is enforced PER FILE by the tools, so a Grep over the
+ * granted directory and a recursive Glob for notebooks must not name it either.
+ * That half has its OWN control (`without the deny rules that same notebook IS
+ * readable`), for the same reason as the grant's: a refusal that the model or
+ * the CLI would have produced anyway proves nothing.
+ *
  * ## The control test is the point
  *
  * The headline test alone could pass for the wrong reason. `unscoped grants are
@@ -71,6 +85,12 @@ const PERMISSION_DENIAL = /requested permissions to read from/i;
 const INSIDE_MARKER = 'INSIDE_MARKER_ALPHA7';
 const OUTSIDE_SECRET = 'OUTSIDE_SECRET_ZULU9';
 const CANARY_VALUE = 'GRAPEFRUIT';
+/** Stands in for a `hidden_from_agent` cell's source inside the CURRENT notebook. */
+const NOTEBOOK_SECRET = 'NOTEBOOK_SECRET_TANGO4';
+/** The same, inside a SECOND notebook - the one the opt-in decides. */
+const OTHER_NOTEBOOK_SECRET = 'OTHER_NOTEBOOK_SECRET_SIERRA2';
+/** Inside `.cellar/checkpoints.json`, which snapshots cells WITH their outputs. */
+const CHECKPOINT_SECRET = 'CHECKPOINT_SECRET_ROMEO6';
 
 const REAL_TURN_TIMEOUT_MS = 180_000;
 
@@ -97,8 +117,8 @@ const PROBE_MODEL = 'haiku';
  * element - the tool request, the GRANT with its path patterns, the cwd - is the
  * product's own, because those are the mechanism under test.
  */
-function probeArgs(readRoot: string): string[] {
-	const args = chatCliArgs({ readRoot, model: PROBE_MODEL });
+function probeArgs(fx: Fixture, otherNotebooks = false): string[] {
+	const args = chatCliArgs({ readRoot: fx.ws, notebookPath: fx.notebook, otherNotebooks, model: PROBE_MODEL });
 	const at = args.indexOf('--system-prompt');
 	args[at + 1] = 'You are a test probe. Do exactly what the user asks using your tools, attempting every step even if you expect it to fail, and report what happened. Be terse.';
 	return args;
@@ -182,6 +202,14 @@ interface Fixture {
 	traversal: string;
 	/** `<ws>/link-out/secret.txt` - lexically inside the pattern, target outside. */
 	linked: string;
+	/** The notebook this run answers in - denied on EVERY reads-on run. */
+	notebook: string;
+	/** A SECOND notebook - readable only with the other-notebooks opt-in on. */
+	otherNotebook: string;
+	/** `<ws>/.cellar/checkpoints.json` - cell snapshots WITH outputs, denied whole. */
+	checkpoints: string;
+	/** An ordinary source file, readable throughout - the not-broken control. */
+	helper: string;
 }
 
 /**
@@ -213,6 +241,21 @@ function makeFixture(dirName = 'workspace'): Fixture {
 	// `unsafe_init` while fixtures without this file passed. Fail-closed, so not a
 	// leak - but the feature would be broken for all users and no test could see it.
 	writeFileSync(join(ws, '.mcp.json'), JSON.stringify({ mcpServers: { cellar: { command: 'cellar', args: ['mcp'] } } }, null, 2) + '\n');
+	// The three artifacts the DENIAL layer exists for, each carrying its own marker
+	// so a leak names itself. The notebook cells stand in for a `hidden_from_agent`
+	// cell: the transcript filter leaves such a cell out of what is SENT, and
+	// without a tool-layer denial one Read of this file would hand it straight back.
+	const notebook = join(ws, 'analysis.ipynb');
+	writeFileSync(notebook, notebookJson(NOTEBOOK_SECRET));
+	const otherNotebook = join(ws, 'sub', 'other.ipynb');
+	writeFileSync(otherNotebook, notebookJson(OTHER_NOTEBOOK_SECRET));
+	mkdirSync(join(ws, '.cellar'), { recursive: true });
+	const checkpoints = join(ws, '.cellar', 'checkpoints.json');
+	writeFileSync(checkpoints, JSON.stringify({ 'analysis.ipynb': [{ cells: [{ source: CHECKPOINT_SECRET }] }] }, null, 2) + '\n');
+	// An ordinary source file: the denial must bound notebooks and Cellar state, not
+	// the feature. If this stops reading, the fix broke what it was protecting.
+	const helper = join(ws, 'helper.py');
+	writeFileSync(helper, `# helper ${INSIDE_MARKER}\ndef go():\n    return 1\n`);
 	const outside = join(root, 'outside');
 	mkdirSync(outside, { recursive: true });
 	const secret = join(outside, 'secret.txt');
@@ -235,8 +278,28 @@ function makeFixture(dirName = 'workspace'): Fixture {
 		inside: join(absWs, 'inside.txt'),
 		secret,
 		traversal: `${absWs}/../outside/secret.txt`,
-		linked: `${absWs}/link-out/secret.txt`
+		linked: `${absWs}/link-out/secret.txt`,
+		notebook: resolve(notebook),
+		otherNotebook: resolve(otherNotebook),
+		checkpoints: resolve(checkpoints),
+		helper: resolve(helper)
 	};
+}
+
+/** A minimal but REAL nbformat document carrying `marker` in a cell's source. */
+function notebookJson(marker: string): string {
+	return (
+		JSON.stringify(
+			{
+				cells: [{ cell_type: 'code', id: 'a1', source: [`# ${marker}\n`], outputs: [], execution_count: null, metadata: {} }],
+				metadata: {},
+				nbformat: 4,
+				nbformat_minor: 5
+			},
+			null,
+			1
+		) + '\n'
+	);
 }
 
 /** Every tool_result that mentions the outside path, and whether any leaked it. */
@@ -270,9 +333,9 @@ test('the shipped reads-on argv CONFINES: files inside the workspace are readabl
 	const fx = makeFixture();
 	try {
 		// The argv and cwd under test are the product's own, not hand-written ones.
-		const policy = chatToolPolicy({ readRoot: fx.ws });
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook });
 		const run = await runRealCli(
-			probeArgs(fx.ws),
+			probeArgs(fx),
 			chatCliCwd(policy),
 			`Do both, reporting each outcome: (1) Read the file ${fx.inside} and print the marker word it contains. (2) Read the file ${fx.secret} and print the marker word it contains.\n`
 		);
@@ -297,19 +360,56 @@ test('the shipped reads-on argv CONFINES: files inside the workspace are readabl
 	}
 });
 
-test('GREP is confined too - the tool that returns file CONTENT, not just names', async () => {
+test('GREP is confined AND functional - the tool that returns file CONTENT, not just names', async () => {
 	test.setTimeout(REAL_TURN_TIMEOUT_MS);
 	const fx = makeFixture();
 	try {
-		const policy = chatToolPolicy({ readRoot: fx.ws });
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook });
 		const run = await runRealCli(
-			probeArgs(fx.ws),
+			probeArgs(fx),
 			chatCliCwd(policy),
-			`Make exactly one Grep tool call, with pattern set to "api_key", path set to ${join(fx.root, 'outside')}, and output_mode set to "content". Then report the tool's exact result, whether it succeeded or failed.\n`
+			`Make exactly two Grep tool calls with output_mode set to "content", reporting each tool's exact result whether it succeeded or failed. (1) pattern "${INSIDE_MARKER}", path ${fx.ws}. (2) pattern "api_key", path ${join(fx.root, 'outside')}.\n`
 		);
 		// Scoping Read while leaving Grep bare would leak the same bytes through a
 		// different door, so this asserts the same refusal for the content-returning tool.
 		expect(run.toolResults.some((r) => PERMISSION_DENIAL.test(r))).toBe(true);
+		expect(leaked(run)).toBe(false);
+		// ...and it WORKS inside. Without this half the refusal above is
+		// indistinguishable from a rule form the CLI does not honour for Grep at
+		// all - under which every Grep call is denied, this test still passes, and
+		// the product ships a tool that always fails while the frozen prompt says it
+		// works. Asserting the MATCH CONTENT (not merely "no error") is what proves
+		// the content-returning mode really came back.
+		expect(run.toolUses).toContain('Grep');
+		expect(run.toolResults.join('\n')).toContain(INSIDE_MARKER);
+	} finally {
+		rmSync(fx.root, { recursive: true, force: true });
+	}
+});
+
+test('GLOB is confined AND functional - the tool that enumerates file NAMES', async () => {
+	test.setTimeout(REAL_TURN_TIMEOUT_MS);
+	// The third granted tool, and the one with no coverage at all until now: a rule
+	// form the CLI did not honour for Glob would deny every call, and nothing else
+	// in this file would notice. Both directions, for the same reason Grep gets
+	// both: the refusal alone cannot tell confinement from a dead tool.
+	const fx = makeFixture();
+	try {
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook });
+		const run = await runRealCli(
+			probeArgs(fx),
+			chatCliCwd(policy),
+			`Make exactly two Glob tool calls, reporting each tool's exact result whether it succeeded or failed. (1) pattern "**/*.py", path ${fx.ws}. (2) pattern "**/*.txt", path ${join(fx.root, 'outside')}.\n`
+		);
+		expect(run.toolUses).toContain('Glob');
+		// INSIDE: the workspace's own `.py` files really are enumerated.
+		const results = run.toolResults.join('\n');
+		expect(results).toContain('nested.py');
+		// OUTSIDE: refused, and no outside path was enumerated either - a Glob leaks
+		// names rather than content, so the absence of the secret's FILENAME is the
+		// leak assertion that fits this tool.
+		expect(run.toolResults.some((r) => PERMISSION_DENIAL.test(r))).toBe(true);
+		expect(results).not.toContain(join(fx.root, 'outside', 'secret.txt'));
 		expect(leaked(run)).toBe(false);
 	} finally {
 		rmSync(fx.root, { recursive: true, force: true });
@@ -325,9 +425,9 @@ test('a `..` path that RESOLVES outside is refused - the matcher normalizes befo
 	// make ("paths outside it are refused, including through `..` or a symlink").
 	const fx = makeFixture();
 	try {
-		const policy = chatToolPolicy({ readRoot: fx.ws });
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook });
 		const run = await runRealCli(
-			probeArgs(fx.ws),
+			probeArgs(fx),
 			chatCliCwd(policy),
 			`Read the file ${fx.traversal} - use that exact path string, do not simplify it - and print the marker word it contains.\n`
 		);
@@ -354,9 +454,9 @@ test('a path through an in-workspace SYMLINK pointing outside is refused - the l
 	// deliberately not the path the message names.
 	const fx = makeFixture();
 	try {
-		const policy = chatToolPolicy({ readRoot: fx.ws });
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook });
 		const run = await runRealCli(
-			probeArgs(fx.ws),
+			probeArgs(fx),
 			chatCliCwd(policy),
 			`Read the file ${fx.linked} and print the marker word it contains.\n`
 		);
@@ -375,7 +475,7 @@ test('CONTROL: unscoped grants are NOT confined - the path pattern is what does 
 		// removed: same tools, same grant flag, same cwd inside the workspace. If
 		// this run ALSO refused, the headline test would prove nothing about the
 		// patterns - so the difference between the two runs IS the evidence.
-		const mutated = probeArgs(fx.ws);
+		const mutated = probeArgs(fx);
 		const at = mutated.indexOf('--allowedTools');
 		mutated[at + 1] = READ_TOOLS.join(',');
 
@@ -399,9 +499,9 @@ test('a workspace path that could SPLIT the grant list does not widen it', async
 	// binary can answer what it does with such a value.
 	const fx = makeFixture('ws,Read,x my space');
 	try {
-		const policy = chatToolPolicy({ readRoot: fx.ws });
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook });
 		const run = await runRealCli(
-			probeArgs(fx.ws),
+			probeArgs(fx),
 			chatCliCwd(policy),
 			`Do both: (1) Read the file ${fx.inside} and print the marker word it contains. (2) Read the file ${fx.secret} and print the marker word it contains.\n`
 		);
@@ -426,14 +526,125 @@ test('moving the cwd into the workspace does not load its CLAUDE.md into the ses
 	// because it is a property of the CLI that a future version could change.
 	const fx = makeFixture();
 	try {
-		const policy = chatToolPolicy({ readRoot: fx.ws });
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook });
 		const run = await runRealCli(
-			chatCliArgs({ readRoot: fx.ws, model: PROBE_MODEL }),
+			chatCliArgs({ readRoot: fx.ws, notebookPath: fx.notebook, model: PROBE_MODEL }),
 			chatCliCwd(policy),
 			'[question] Without using any tool, state what CONTEXT_CANARY equals, or say UNKNOWN if you have no information about it.\n'
 		);
 		expect(run.reply).not.toContain(CANARY_VALUE);
 		expect(run.reply).not.toContain('PWNED');
+	} finally {
+		rmSync(fx.root, { recursive: true, force: true });
+	}
+});
+
+/** The CLI's own answer when a granted path is taken back by a deny rule. */
+const DENY_REFUSAL = /denied by your permission settings|requested permissions to read from/i;
+
+test('the CURRENT notebook is DENIED inside its own workspace - for Read, and out of Grep and Glob results', async () => {
+	test.setTimeout(REAL_TURN_TIMEOUT_MS);
+	// The grant covers the workspace, and the notebook lives in it - so without the
+	// deny layer one Read hands back every cell the transcript filter deliberately
+	// withheld. The marker planted in that notebook stands in for exactly such a
+	// cell. All three tools are driven in ONE run because the measured property is
+	// that the deny is enforced PER FILE by the tools themselves rather than only
+	// on a tool's path argument: a Grep over the granted DIRECTORY and a Glob for
+	// `**/*.ipynb` never name the file at all, which is what makes denying it bound
+	// Grep and Glob and not merely Read.
+	const fx = makeFixture();
+	try {
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook });
+		const run = await runRealCli(
+			probeArgs(fx),
+			chatCliCwd(policy),
+			`Do all three, reporting each tool's exact result whether it succeeded or failed. (1) Read the file ${fx.notebook}. (2) Grep with pattern "${NOTEBOOK_SECRET}", path ${fx.ws}, output_mode "content". (3) Glob with pattern "**/*.ipynb", path ${fx.ws}.\n`
+		);
+		expect(run.toolResults.some((r) => DENY_REFUSAL.test(r))).toBe(true);
+		// The CONTENT may not come back through any of the three, reply included.
+		expect(`${run.toolResults.join('\n')}\n${run.reply}`).not.toContain(NOTEBOOK_SECRET);
+		// Nor may its NAME come back through the enumerating tool. Asserted over the
+		// tool RESULTS only, deliberately not the reply: the prompt names the file,
+		// so the model repeating it while reporting what happened is expected and
+		// says nothing about what the tools returned.
+		expect(run.toolResults.join('\n')).not.toContain('analysis.ipynb');
+	} finally {
+		rmSync(fx.root, { recursive: true, force: true });
+	}
+});
+
+test('CONTROL: without the deny rules that same notebook IS readable - the denial is what does the work', async () => {
+	test.setTimeout(REAL_TURN_TIMEOUT_MS);
+	// The sibling of the unscoped-grants control above, and load-bearing for the
+	// same reason: the test above could pass because the model declined, or because
+	// the CLI refuses `.ipynb` for reasons of its own. This run is the shipped argv
+	// with ONLY `--disallowedTools` removed - same grant, same cwd, same prompt -
+	// and it asserts the notebook IS read. The difference between the two runs IS
+	// the evidence that the deny rules are load-bearing.
+	const fx = makeFixture();
+	try {
+		const mutated = probeArgs(fx);
+		const at = mutated.indexOf('--disallowedTools');
+		expect(at).toBeGreaterThan(-1);
+		mutated.splice(at, 2);
+
+		const run = await runRealCli(mutated, fx.ws, `Read the file ${fx.notebook} and print the marker word it contains.\n`);
+		expect(run.toolUses).toContain('Read');
+		expect(`${run.toolResults.join('\n')}\n${run.reply}`).toContain(NOTEBOOK_SECRET);
+	} finally {
+		rmSync(fx.root, { recursive: true, force: true });
+	}
+});
+
+test("Cellar's own .cellar state is denied, while an ordinary source file in the same workspace still reads", async () => {
+	test.setTimeout(REAL_TURN_TIMEOUT_MS);
+	// `.cellar/checkpoints.json` snapshots cells WITH their outputs, so it is the
+	// same content the notebook rule denies reached through a back door - hence a
+	// DIRECTORY rule rather than one file. The second half is the not-broken
+	// control: a denial that also blocked ordinary code would have taken the
+	// feature away rather than bounded it.
+	const fx = makeFixture();
+	try {
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook });
+		const run = await runRealCli(
+			probeArgs(fx),
+			chatCliCwd(policy),
+			`Do both, reporting each tool's exact result whether it succeeded or failed. (1) Read the file ${fx.checkpoints}. (2) Read the file ${fx.helper}.\n`
+		);
+		expect(run.toolResults.some((r) => DENY_REFUSAL.test(r))).toBe(true);
+		const seen = `${run.toolResults.join('\n')}\n${run.reply}`;
+		expect(seen).not.toContain(CHECKPOINT_SECRET);
+		// ...and the workspace's real code is still readable.
+		expect(seen).toContain(INSIDE_MARKER);
+	} finally {
+		rmSync(fx.root, { recursive: true, force: true });
+	}
+});
+
+test('other notebooks: denied by default, opened by the opt-in - while the CURRENT one stays denied either way', async () => {
+	test.setTimeout(REAL_TURN_TIMEOUT_MS);
+	const fx = makeFixture();
+	try {
+		const cwd = chatCliCwd(chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook }));
+		// OFF (the default): every `*.ipynb` in the workspace is denied, so a reply
+		// still reads `.py`/`.md`/data files and no notebook.
+		const off = await runRealCli(probeArgs(fx), cwd, `Read the file ${fx.otherNotebook} and print the marker word it contains.\n`);
+		expect(off.toolResults.some((r) => DENY_REFUSAL.test(r))).toBe(true);
+		expect(`${off.toolResults.join('\n')}\n${off.reply}`).not.toContain(OTHER_NOTEBOOK_SECRET);
+
+		// ON: the OTHER notebook opens...
+		const on = await runRealCli(
+			probeArgs(fx, true),
+			cwd,
+			`Do both, reporting each tool's exact result whether it succeeded or failed. (1) Read the file ${fx.otherNotebook}. (2) Read the file ${fx.notebook}.\n`
+		);
+		const seen = `${on.toolResults.join('\n')}\n${on.reply}`;
+		expect(seen).toContain(OTHER_NOTEBOOK_SECRET);
+		// ...and the CURRENT notebook does NOT. That is the invariant this setting
+		// may not reach: the model already holds this notebook as a fresher
+		// transcript, with the cells the user hid left out of it.
+		expect(on.toolResults.some((r) => DENY_REFUSAL.test(r))).toBe(true);
+		expect(seen).not.toContain(NOTEBOOK_SECRET);
 	} finally {
 		rmSync(fx.root, { recursive: true, force: true });
 	}
@@ -454,6 +665,7 @@ test('a reads-on run survives the shipped engine end to end: the real session pa
 			configDir: null,
 			model: PROBE_MODEL,
 			readRoot: fx.ws,
+			notebookPath: fx.notebook,
 			signal: new AbortController().signal,
 			onDelta: (t) => deltas.push(t)
 		});
