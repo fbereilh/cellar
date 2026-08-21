@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { chatCliArgs, chatToolAllowlist, claudeCliEngine, initViolation } from '../../src/lib/server/chat/claude-cli';
+import { chatCliArgs, chatToolPolicy, claudeCliEngine, initViolation } from '../../src/lib/server/chat/claude-cli';
 import { chatChildEnv, CLAUDE_BIN } from '../../src/lib/server/chat/env';
 
 /**
@@ -147,7 +147,7 @@ test('the shipped search-on argv GRANTS the call: the CLI runs the search instea
 	// The real init report still satisfies the shipped exact-allowlist
 	// assertion - granting the call may not widen what the session holds.
 	expect(init).not.toBeNull();
-	expect(initViolation(init as Record<string, unknown>, chatToolAllowlist(true))).toBeNull();
+	expect(initViolation(init as Record<string, unknown>, chatToolPolicy({ webSearch: true }).tools)).toBeNull();
 
 	// The question forced a search attempt...
 	expect(toolUses).toContain('WebSearch');

@@ -36,6 +36,16 @@ export interface ChatEngineRunArgs {
 	 * exactly that - search is mediated; arbitrary URL fetch stays off.
 	 */
 	webSearch?: boolean;
+	/**
+	 * May this run READ files, and where? Absent/null = no file tools at all
+	 * (today's bare session). A non-null value is the ABSOLUTE directory reads are
+	 * confined to - the claude engine turns it into path-scoped `--allowedTools`
+	 * rules and refuses (read-less) anything it cannot confine, so this is a
+	 * confinement root and never a mere hint. The caller passes the WORKSPACE, not
+	 * a notebook code root: a code root may sit outside the workspace and grants
+	 * no file reach anywhere else in Cellar.
+	 */
+	readRoot?: string | null;
 	/** Aborted by interrupt / kernel restart / shutdown; the engine must kill its work. */
 	signal: AbortSignal;
 	/** Streamed reply text, in order, as it is produced. */

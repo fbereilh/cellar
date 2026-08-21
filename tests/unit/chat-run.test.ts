@@ -24,9 +24,9 @@
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { ChatEngine, ChatEngineRunArgs } from '../../src/lib/server/chat/engine';
-import { CHAT_MODEL_DEFAULT, CHAT_MODEL_KEY, CHAT_WEB_SEARCH_KEY } from '../../src/lib/chatCell';
+import { CHAT_MODEL_DEFAULT, CHAT_MODEL_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
 
 let WS: string;
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -62,7 +62,7 @@ afterEach(() => {
 	enginemod.__setChatEngineForTests(null);
 	activemod.__resetChatRuns();
 	// Undo whatever a threading test wrote, so key absence stays each test's default.
-	settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null });
+	settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null, [CHAT_WORKSPACE_READS_KEY]: null });
 });
 
 /** A notebook: python cell / hidden cell / chat cell. */
@@ -503,6 +503,8 @@ describe('the engine capability settings are read from the user store and gated'
 		expect(args).toHaveLength(1);
 		expect(args[0].model).toBe(CHAT_MODEL_DEFAULT);
 		expect(args[0].webSearch).toBe(false);
+		// No file reach either: an upgraded install grants none until asked.
+		expect(args[0].readRoot ?? null).toBeNull();
 	});
 
 	it('a stored model and an explicit web-search opt-in reach the engine', async () => {
@@ -513,17 +515,39 @@ describe('the engine capability settings are read from the user store and gated'
 		expect(res.status).toBe('ok');
 		expect(args[0].model).toBe('opus');
 		expect(args[0].webSearch).toBe(true);
+		// Search does NOT drag reads along: separate keys, separate capabilities.
+		expect(args[0].readRoot ?? null).toBeNull();
+	});
+
+	it('the reads opt-in threads the WORKSPACE as the confinement root - not the notebook, not a code root', async () => {
+		settingsmod.setUserSettings({ [CHAT_WORKSPACE_READS_KEY]: true });
+		const { nb } = makeNotebook('settings-reads.ipynb');
+		const { args } = capturingEngine();
+		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(res.status).toBe('ok');
+		// The workspace root itself, resolved - the same directory every other file
+		// surface in Cellar is scoped to. A code root may sit OUTSIDE the workspace
+		// and grants no file reach anywhere else, so it must not be the answer here.
+		expect(args[0].readRoot).toBe(resolve(WS));
+		// ...and reads do not drag search along either.
+		expect(args[0].webSearch).toBe(false);
 	});
 
 	it('hand-edited junk is gated BEFORE the seam: unknown model falls back, truthy-not-true search stays off', async () => {
 		// What a hand-edited ~/.cellar/settings.json can hold: flag-shaped text where
 		// a model id belongs, and the string "true" where the boolean opt-in belongs.
-		settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: '--dangerously-injected', [CHAT_WEB_SEARCH_KEY]: 'true' });
+		settingsmod.setUserSettings({
+			[CHAT_MODEL_KEY]: '--dangerously-injected',
+			[CHAT_WEB_SEARCH_KEY]: 'true',
+			[CHAT_WORKSPACE_READS_KEY]: 1
+		});
 		const { nb } = makeNotebook('settings-junk.ipynb');
 		const { args } = capturingEngine();
 		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
 		expect(res.status).toBe('ok');
 		expect(args[0].model).toBe(CHAT_MODEL_DEFAULT);
 		expect(args[0].webSearch).toBe(false);
+		// A truthy-not-true reads value grants no file reach: `=== true` or nothing.
+		expect(args[0].readRoot ?? null).toBeNull();
 	});
 });

@@ -5,13 +5,14 @@
  * ## attribute in HtmlPreview: one word wide, pinned by a unit test.
  *
  * `chatCliArgs()` disables every capability except "answer this text" plus, on
- * an explicit user opt-in, web search and NOTHING wider: `--tools <allowlist>`
- * (`""` by default - no tools; `WebSearch` when the run opted in - search is
- * mediated, so it is deliberately NOT WebFetch or any fetch-shaped tool),
- * `--allowedTools <allowlist>` on the SEARCH shape ONLY (see below - `--tools`
- * alone makes the tool exist but leaves the CALL permission-gated, so the
- * opt-in would be inert; the default shape passes neither flag and is
- * byte-for-byte the pre-settings argv),
+ * explicit user opt-ins, web search and workspace-confined file READS and
+ * NOTHING wider: `--tools <names>` (`""` by default - no tools; `WebSearch`
+ * when the run opted in - search is mediated, so it is deliberately NOT
+ * WebFetch or any fetch-shaped tool; `Read,Glob,Grep` when reads are on -
+ * read-only, so never `Write`/`Edit`/`Bash`), `--allowedTools <rules>` on the
+ * capability shapes ONLY (see below - `--tools` alone makes the tool exist but
+ * leaves the CALL permission-gated, so an opt-in would be inert; the default
+ * shape passes neither flag and is byte-for-byte the pre-settings argv),
  * `--disable-slash-commands`, `--setting-sources ""` (the user's/project's
  * CLAUDE.md, settings.json hooks, allowedTools etc. are never loaded),
  * `--strict-mcp-config` with no MCP config (no MCP servers),
@@ -43,14 +44,64 @@
  * default shape omits the flag entirely, which is what keeps its argv
  * byte-for-byte the pre-settings one.
  *
+ * ## Workspace reads are CONFINED BY PATH-SCOPED GRANTS, and nothing else
+ *
+ * A chat cell's prompt is partly notebook CONTENT, and web search is an outbound
+ * channel, so unconfined reads would put `.env` files, credentials and keys one
+ * prompt away from an exfiltration path. Confinement is therefore the feature,
+ * not a nicety attached to it - and it is enforced by the GRANT PATTERN, which
+ * is the one mechanism measured to work. Probed against claude 2.1.238
+ * (2026-08-21), every case driven end to end through a real `-p` run:
+ *
+ *   - A BARE `--allowedTools Read,Glob,Grep` grant is NOT confined by anything,
+ *     the child's cwd included: from a cwd inside the workspace, an absolute
+ *     path to a file outside it was READ, and an unscoped `Grep` returned the
+ *     matching LINE CONTENT of a file outside it. So the cwd is never the
+ *     confinement mechanism, and a grant must never be spelled bare.
+ *   - A PATH-SCOPED grant (`Read(//abs/root/**)`, likewise `Glob`/`Grep`)
+ *     refuses everything outside the root: the CLI answers the call with
+ *     `is_error: true` and "requested permissions to read from <path>, but you
+ *     haven't granted it yet", i.e. an ungranted call is DENIED in `-p` mode
+ *     rather than prompting. Every read tool must carry its own pattern -
+ *     scoping `Read` while leaving `Grep` bare leaks file content through Grep.
+ *   - Inside the root everything still works: nested directories, dotfiles, the
+ *     root path itself as an explicit `path` argument, and the tools' default
+ *     (no `path`) behaviour, which is why reads-on moves the cwd there.
+ *   - The escapes are closed by the CLI's own matcher, not by us: an absolute
+ *     path containing `..` that resolves outside is refused (the refusal names
+ *     the RESOLVED path, so matching happens after normalization), and an
+ *     absolute path through a symlink that leaves the root is refused too
+ *     (Glob does not follow such a link at all).
+ *   - A workspace path containing a space, a comma, and even the adversarial
+ *     segment `,Read,` - which would inject a BARE unscoped `Read` grant if the
+ *     flag's "comma or space-separated" parsing split the value - kept working
+ *     inside and kept refusing outside. The value is not split within one argv
+ *     element.
+ *
+ * The root is the WORKSPACE, deliberately not a notebook's code root: a code
+ * root may be an external git worktree, and Cellar's standing rule is that such
+ * a root grants a kernel cwd and not one byte of file reach (every file surface
+ * stays workspace-scoped, through `resolveInWorkspace`). Reads follow that rule
+ * rather than inventing a second answer.
+ *
+ * Fail-closed all the way down: `chatToolPolicy` refuses any root it cannot
+ * confine (non-string, empty, relative, non-POSIX) and yields a READ-LESS
+ * policy, so the failure mode of every unknown is today's tool-less session.
+ * And because the frozen system prompt is chosen from that same policy, a run
+ * that ends up read-less is also told it cannot read.
+ *
  * ## The init assertion (fail closed, EXACT allowlist - never a relaxation)
  *
  * Flags are a REQUEST; the CLI's own `system/init` event is the REPORT of what
  * the session actually got. Every run asserts that report against the tool set
- * THAT RUN requested, exactly: `tools` must equal the allowlist (`[]` for a
+ * THAT RUN requested, exactly: `tools` must equal the requested SET (`[]` for a
  * default run - byte-for-byte today's guarantee; `['WebSearch']` for a
- * search-on run - a report carrying any tool the run did not request, or
- * missing one it did, is the same verdict), and `mcp_servers` and
+ * search-on run; the read tools for a reads-on run - a report carrying any tool
+ * the run did not request, or missing one it did, is the same verdict). It is a
+ * SET comparison because the CLI reports its own order (a `Read,Glob,Grep`
+ * request comes back `["Glob","Grep","Read"]`), and it compares bare NAMES
+ * because that is what `system/init` reports - the path scope lives in the
+ * grant, which is why the two are derived together. `mcp_servers` and
  * `slash_commands` stay asserted empty on EVERY path (`skills` empty when
  * present). A violation KILLS the child and fails the run `unsafe_init` rather
  * than rendering a reply produced by a session whose capabilities do not match
@@ -89,6 +140,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
 import { normalizeChatModel } from '$lib/chatCell';
 import { chatChildEnv, CLAUDE_BIN } from './env';
 import type { ChatEngine, ChatEngineFailure, ChatEngineResult, ChatEngineRunArgs } from './engine';
@@ -102,82 +154,218 @@ import type { ChatEngine, ChatEngineFailure, ChatEngineResult, ChatEngineRunArgs
 export const WEB_SEARCH_TOOL = 'WebSearch';
 
 /**
- * The tool allowlist for one run - what the argv REQUESTS and what the init
- * assertion then requires the CLI to have REPORTED, from ONE function so the
- * two can never drift. `[]` is the default bare session.
+ * The read tools a workspace-reads run requests, spelled exactly as the CLI
+ * reports them in `system/init`. Probed against claude 2.1.238: `--tools
+ * Read,Glob,Grep` reports `tools:["Glob","Grep","Read"]` - the same SET, in the
+ * CLI's own order, which is why the init assertion compares sets and never
+ * array order.
+ *
+ * READ-ONLY, and deliberately not one tool wider: no `Write`/`Edit` (a chat cell
+ * is a place to learn about code, not a second editor beside the notebook), no
+ * `Bash` (which is arbitrary execution and would make every path rule below
+ * decorative), and never `WebFetch`.
  */
-export function chatToolAllowlist(webSearch: boolean): readonly string[] {
-	return webSearch ? [WEB_SEARCH_TOOL] : [];
+export const READ_TOOLS: readonly string[] = ['Read', 'Glob', 'Grep'];
+
+/** The per-run capabilities a policy is derived from. */
+export interface ChatCapabilities {
+	/** Only a literal `true` widens the session to web search. */
+	webSearch?: boolean;
+	/**
+	 * The ABSOLUTE directory workspace reads are confined to, or null/absent for
+	 * no reads at all. `chatToolPolicy` re-validates it (see there): anything it
+	 * cannot confine yields a read-less policy rather than an unconfined one.
+	 */
+	readRoot?: string | null;
+}
+
+/**
+ * One run's tool decision: the bare tool NAMES and the GRANT rules, from one
+ * function so request, grant and assertion can never drift.
+ *
+ * The two lists are not the same strings and that is the whole point of keeping
+ * them together. `--tools` and the `system/init` assertion speak bare NAMES
+ * (`Read`); `--allowedTools` speaks permission RULES, and for the read tools
+ * those rules carry a path pattern (`Read(//abs/path/**)`) - which is what makes
+ * the reads confined rather than a licence to read the filesystem. Derived
+ * side by side, a grant can never name a tool the run did not request and then
+ * assert, and a scoped tool can never be granted unscoped by accident.
+ */
+export interface ChatToolPolicy {
+	/** What `--tools` requests AND what `system/init` must report, exactly. */
+	readonly tools: readonly string[];
+	/** What `--allowedTools` grants (path-scoped for the read tools). */
+	readonly grants: readonly string[];
+	/** The confinement root reads were granted under, or null when reads are off. */
+	readonly readRoot: string | null;
+	/** Whether web search was granted (decides the frozen prompt with `readRoot`). */
+	readonly webSearch: boolean;
+}
+
+/**
+ * The confinement root, normalized, or null when this value cannot be confined.
+ *
+ * Fails CLOSED on everything it is not sure of, because the alternative to a
+ * confined read is an unconfined one: a non-string, an empty string, a relative
+ * path, and anything that does not normalize to a POSIX-absolute path all yield
+ * null (= reads off). The POSIX check is not incidental - the `//` rule prefix
+ * below is the CLI's absolute-path spelling and was measured on POSIX only, so
+ * a Windows-style root is refused rather than turned into a rule whose matching
+ * behaviour nobody here has established.
+ */
+export function chatReadRoot(value: unknown): string | null {
+	if (typeof value !== 'string' || !value.startsWith('/')) return null;
+	const abs = resolve(value);
+	return abs.startsWith('/') ? abs : null;
+}
+
+/**
+ * The `--allowedTools` path pattern confining a read tool to `root`.
+ *
+ * `//<path-without-leading-slash>/**` is the CLI's own spelling of an absolute
+ * path in a permission rule. Measured against claude 2.1.238 (see the module
+ * header's confinement section): it admits the root itself, every nested file
+ * and dotfiles, and refuses everything outside it.
+ */
+function readGrantPattern(root: string): string {
+	return `//${root.replace(/^\/+/, '')}/**`;
+}
+
+/**
+ * The tool policy for one run - the ONE source feeding `--tools`,
+ * `--allowedTools`, the `system/init` assertion, the frozen system prompt and
+ * the child's cwd. `{}` is the default bare session: no tools, no grants.
+ */
+export function chatToolPolicy(caps: ChatCapabilities = {}): ChatToolPolicy {
+	const webSearch = caps.webSearch === true;
+	const readRoot = chatReadRoot(caps.readRoot);
+	const tools: string[] = [];
+	const grants: string[] = [];
+	if (webSearch) {
+		tools.push(WEB_SEARCH_TOOL);
+		// Search takes no path scope: it has no path to scope.
+		grants.push(WEB_SEARCH_TOOL);
+	}
+	if (readRoot) {
+		const pattern = readGrantPattern(readRoot);
+		for (const tool of READ_TOOLS) {
+			tools.push(tool);
+			grants.push(`${tool}(${pattern})`);
+		}
+	}
+	return { tools, grants, readRoot, webSearch };
 }
 
 /**
  * The fixed system prompts, one per capability shape. Each is FROZEN
  * deliberately: the prompt is part of the cached prompt prefix (see
  * transcript.ts's byte-stability rule), so nothing time-varying or per-run may
- * be interpolated into either. TWO variants rather than one templated string,
- * because the prompt must be TRUE for the capability the run actually has - the
- * bare prompt's "you cannot browse" is false for a search-on run, and a model
- * told it cannot browse while holding a search tool is a bad state - while a
- * single interpolated prompt would make byte-stability a property of the
- * interpolation instead of the constant. Flipping the setting changes which
- * frozen prefix is sent (one cache miss), which is inherent to changing the
- * capability; within a shape every run stays byte-stable.
+ * be interpolated into any of them.
+ *
+ * FOUR variants rather than one templated string, because the prompt must be
+ * TRUE for the capability the run actually has - the bare prompt's "you cannot
+ * read files" is false for a reads-on run, and a model told it cannot read while
+ * holding `Read` is a bad state - while a single interpolated prompt would make
+ * byte-stability a property of the interpolation instead of the constants. Note
+ * what the composition below is and is not: the shared framing is spread from a
+ * module-scope array of LITERALS and joined once at module load, so each export
+ * is a fixed string. No per-run value may ever enter - emphatically NOT the
+ * confinement root, which differs per install and would make every run's prefix
+ * a cache miss while leaking the path into the model's context.
+ *
+ * Flipping a setting changes which frozen prefix is sent (one cache miss), which
+ * is inherent to changing the capability; within a shape every run stays
+ * byte-stable.
  */
-export const CHAT_SYSTEM_PROMPT = [
+const PROMPT_FRAMING: readonly string[] = [
 	'You are the AI assistant inside Cellar, a data notebook. The user message is',
 	'the notebook so far, rendered as labelled blocks: [cell <id> · <kind>] holds',
 	"a cell's source, [cell <id> · output] its result, [cell <id> · reply] an",
 	'earlier answer of yours, and [question] is what to answer now. Answer in',
-	'concise markdown. You have no tools and cannot run code, read files, or',
+	'concise markdown.'
+];
+
+/** The claim every reads-on shape makes about its file reach, verbatim. */
+const READS_SENTENCE: readonly string[] = [
+	'You can read files in the notebook\'s own workspace with Read, Glob and Grep,',
+	'and only there - paths outside it are refused, so do not try. Use them to',
+	'ground your answer in the real code, and say which file a claim came from.',
+	'You cannot write or edit files and cannot run code - never claim to have done',
+	'so; when something needs running, say what to run.'
+];
+
+export const CHAT_SYSTEM_PROMPT = [
+	...PROMPT_FRAMING,
+	'You have no tools and cannot run code, read files, or',
 	'browse - never claim to have done so; when the notebook lacks what you would',
 	'need, say what to run.'
 ].join(' ');
 
 /** The search-on variant: same framing, capability sentence accurate for it. */
 export const CHAT_SYSTEM_PROMPT_WEB_SEARCH = [
-	'You are the AI assistant inside Cellar, a data notebook. The user message is',
-	'the notebook so far, rendered as labelled blocks: [cell <id> · <kind>] holds',
-	"a cell's source, [cell <id> · output] its result, [cell <id> · reply] an",
-	'earlier answer of yours, and [question] is what to answer now. Answer in',
-	'concise markdown. Your only tool is web search - use it when the question',
+	...PROMPT_FRAMING,
+	'Your only tool is web search - use it when the question',
 	'needs current or external information, and say when a claim comes from a',
 	'search result. You cannot run code or read files - never claim to have done',
 	'so; when the notebook lacks what you would need, say what to run.'
 ].join(' ');
 
-/** Which frozen prompt a run sends - decided by the same flag as the allowlist. */
-export function chatSystemPrompt(webSearch: boolean): string {
-	return webSearch ? CHAT_SYSTEM_PROMPT_WEB_SEARCH : CHAT_SYSTEM_PROMPT;
+/** The reads-on variant: file reach, no search. */
+export const CHAT_SYSTEM_PROMPT_READS = [...PROMPT_FRAMING, ...READS_SENTENCE, 'You cannot browse the web.'].join(' ');
+
+/** Both capabilities. */
+export const CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH = [
+	...PROMPT_FRAMING,
+	...READS_SENTENCE,
+	'You can also search the web when the question needs current or external',
+	'information; say when a claim comes from a search result.'
+].join(' ');
+
+/**
+ * Which frozen prompt a run sends - decided by the SAME policy that decides the
+ * argv, so the prompt can never describe a capability shape the run does not
+ * have.
+ */
+export function chatSystemPrompt(policy: ChatToolPolicy): string {
+	if (policy.readRoot && policy.webSearch) return CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH;
+	if (policy.readRoot) return CHAT_SYSTEM_PROMPT_READS;
+	if (policy.webSearch) return CHAT_SYSTEM_PROMPT_WEB_SEARCH;
+	return CHAT_SYSTEM_PROMPT;
 }
 
-/** The per-run capability inputs `chatCliArgs` accepts (all optional = today's bare run). */
-export interface ChatCliOptions {
+/** The per-run inputs `chatCliArgs` accepts (all optional = today's bare run). */
+export interface ChatCliOptions extends ChatCapabilities {
 	/** Untrusted: constrained through `normalizeChatModel` before touching argv. */
 	model?: unknown;
-	/** Only a literal `true` widens the session to web search. */
-	webSearch?: boolean;
 }
 
 /**
  * The frozen argv (everything but the binary). A FUNCTION returning a fresh
  * array so no caller can mutate the shared safety boundary; the unit test pins
- * the exact contents of both capability shapes, and `chatCliArgs()` with no
+ * the exact contents of all four capability shapes, and `chatCliArgs()` with no
  * arguments is byte-for-byte the pre-settings argv.
  */
 export function chatCliArgs(opts: ChatCliOptions = {}): string[] {
-	const webSearch = opts.webSearch === true;
-	const allowlist = chatToolAllowlist(webSearch);
-	const tools = allowlist.join(',');
+	const policy = chatToolPolicy(opts);
 	return [
 		'-p',
 		'--tools',
-		tools,
+		policy.tools.join(','),
 		// The GRANT (see the header): `--tools` alone leaves the call
-		// permission-gated in `-p` mode, so without this the opt-in is inert. Same
-		// allowlist as the request and the assertion - never a wider set - and
-		// omitted entirely (not passed empty) when there is nothing to grant, which
-		// is what keeps the default argv byte-for-byte the pre-settings one.
-		...(allowlist.length > 0 ? ['--allowedTools', tools] : []),
+		// permission-gated in `-p` mode, so without this the opt-in is inert. Derived
+		// from the SAME policy as the request and the assertion - never a wider set -
+		// and omitted entirely (not passed empty) when there is nothing to grant,
+		// which is what keeps the default argv byte-for-byte the pre-settings one.
+		//
+		// ONE argv element, comma-joined, exactly as the search shape has always
+		// passed it. The read rules embed a filesystem path, so the flag's
+		// "comma or space-separated" parsing is a real question: measured against
+		// claude 2.1.238 with a workspace path containing a space, a comma, and the
+		// adversarial segment `,Read,` (which would inject a BARE unscoped `Read`
+		// grant if the value were split), confinement held in every case - the value
+		// is not split inside one argv element. Pinned by the injection case in
+		// `tests/unit/chat-engine-safety.test.ts`.
+		...(policy.grants.length > 0 ? ['--allowedTools', policy.grants.join(',')] : []),
 		'--disable-slash-commands',
 		'--setting-sources',
 		'',
@@ -190,8 +378,24 @@ export function chatCliArgs(opts: ChatCliOptions = {}): string[] {
 		'stream-json',
 		'--verbose',
 		'--system-prompt',
-		chatSystemPrompt(webSearch)
+		chatSystemPrompt(policy)
 	];
+}
+
+/**
+ * The cwd one run's child is spawned in: the confinement root when reads are on,
+ * else the NEUTRAL `os.tmpdir()` today's runs use.
+ *
+ * Reads-on has to move the cwd there - the tools resolve relative paths against
+ * it and default to it when given no `path`, which is how a reply reaches the
+ * workspace at all - and that is a real change worth stating: the child's cwd is
+ * then a directory of the user's. What it does NOT do is widen the grant, which
+ * is the path rules' job and not the cwd's: measured, a cwd inside the workspace
+ * with an unscoped `Read` grant still read files anywhere on disk, so the cwd is
+ * never the confinement mechanism.
+ */
+export function chatCliCwd(policy: ChatToolPolicy): string {
+	return policy.readRoot ?? tmpdir();
 }
 
 /** How many chat children may run at once, across all notebooks. */
@@ -309,28 +513,30 @@ export const claudeCliEngine: ChatEngine = {
 	}
 };
 
-function runOnce({ prompt, configDir, model, webSearch, signal, onDelta }: ChatEngineRunArgs): Promise<ChatEngineResult> {
-	return new Promise((resolve) => {
+function runOnce({ prompt, configDir, model, webSearch, readRoot, signal, onDelta }: ChatEngineRunArgs): Promise<ChatEngineResult> {
+	return new Promise((settleRun) => {
 		if (signal.aborted) {
-			resolve(fail({ kind: 'cancelled', message: 'interrupted' }, null));
+			settleRun(fail({ kind: 'cancelled', message: 'interrupted' }, null));
 			return;
 		}
 
-		// One flag decides BOTH what the argv requests and what the init assertion
-		// requires the CLI to have reported - reading it once here is what makes
-		// "the report must equal the request" structural rather than two rules.
-		const search = webSearch === true;
-		const expectedTools = chatToolAllowlist(search);
+		// ONE policy decides what the argv requests, what it grants, which frozen
+		// prompt is sent, where the child runs, and what the init assertion requires
+		// the CLI to have reported - derived once here, which is what makes "the
+		// report must equal the request" structural rather than several rules that
+		// happen to agree.
+		const policy = chatToolPolicy({ webSearch, readRoot });
+		const expectedTools = policy.tools;
 
 		let child: ChildProcess;
 		try {
-			child = spawn(CLAUDE_BIN, chatCliArgs({ model, webSearch: search }), {
+			child = spawn(CLAUDE_BIN, chatCliArgs({ model, webSearch, readRoot }), {
 				env: chatChildEnv(configDir),
-				cwd: tmpdir(),
+				cwd: chatCliCwd(policy),
 				stdio: ['pipe', 'pipe', 'pipe']
 			});
 		} catch (err) {
-			resolve(spawnFailure(err));
+			settleRun(spawnFailure(err));
 			return;
 		}
 
@@ -348,7 +554,7 @@ function runOnce({ prompt, configDir, model, webSearch, signal, onDelta }: ChatE
 			if (settled) return;
 			settled = true;
 			cleanup();
-			resolve(value);
+			settleRun(value);
 		};
 
 		const kill = () => {

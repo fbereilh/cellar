@@ -48,6 +48,18 @@ export const CHAT_MODEL_KEY = 'cellar-chat-model';
  */
 export const CHAT_WEB_SEARCH_KEY = 'cellar-chat-web-search';
 
+/**
+ * The user-settings key for the workspace-reads opt-in. Only a literal `true`
+ * turns it on (`chatWorkspaceReadsEnabled`), exactly like the web-search key
+ * beside it: a fresh install, an upgraded install and any hand-edited junk in
+ * the untyped store all get today's bare, tool-less session.
+ *
+ * It is a SEPARATE key from web search on purpose - the two widen the session in
+ * different directions (an outbound query channel vs. local file reach), so a
+ * person who wants one must not be given the other as a side effect.
+ */
+export const CHAT_WORKSPACE_READS_KEY = 'cellar-chat-workspace-reads';
+
 /** The model chat cells run when the user never chose one. */
 export const CHAT_MODEL_DEFAULT = 'sonnet';
 
@@ -83,6 +95,20 @@ export function normalizeChatModel(value: unknown): string {
  * truthy junk in the untyped store can widen a session's capabilities.
  */
 export function chatWebSearchEnabled(value: unknown): boolean {
+	return value === true;
+}
+
+/**
+ * May chat runs read the workspace (`Read`/`Glob`/`Grep`)? Only an explicit
+ * stored `true` counts - the same `=== true` gate as web search, for the same
+ * reason: the store is untyped JSON anyone can hand-edit, and this value decides
+ * whether a chat child gets file reach at all.
+ *
+ * ON is only ever HALF the decision: the engine additionally confines the grant
+ * to one absolute directory, and a run whose root cannot be established stays
+ * read-less (see `server/chat/claude-cli.ts`'s `chatToolPolicy`).
+ */
+export function chatWorkspaceReadsEnabled(value: unknown): boolean {
 	return value === true;
 }
 

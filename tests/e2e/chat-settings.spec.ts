@@ -4,11 +4,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
-import { CHAT_MODEL_KEY, CHAT_MODEL_DEFAULT, CHAT_WEB_SEARCH_KEY } from '../../src/lib/chatCell';
+import { CHAT_MODEL_KEY, CHAT_MODEL_DEFAULT, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
 
 /**
  * E2E for the **Chat cells** section of the Settings pane - the human surface of
- * the chat engine's two capability settings (model, and the web-search opt-in).
+ * the chat engine's capability settings (model, the web-search opt-in, and the
+ * workspace-reads opt-in).
  *
  * The unit suite proves what the ENGINE does with those settings (`chat-run` for
  * the threading, `chat-engine-safety` for the argv and the init allowlist); what
@@ -31,10 +32,17 @@ import { CHAT_MODEL_KEY, CHAT_MODEL_DEFAULT, CHAT_WEB_SEARCH_KEY } from '../../s
  *     seed-on-open mechanism behind it: the SSR-seeded client cache means a
  *     construction-time read would pass here too - the reason the seed waits for
  *     `open` is the pre-hydration empty store, which this level cannot observe.)
- *   - and the opt-OUT is on the wire before the client debounce could have
+ *   - each opt-OUT is on the wire before the client debounce could have
  *     fired, because the server re-reads these keys when a chat cell RUNS - so
  *     a debounced write leaves a window in which the next run is still granted
- *     the capability the user just turned off.
+ *     the capability the user just turned off. Asserted for BOTH capabilities:
+ *     they are separate keys written by separate handlers, so the guarantee is
+ *     not inherited by the second one from the first;
+ *   - and the two opt-ins are INDEPENDENT: each stores and deletes its own key
+ *     without touching the other. They widen the session in different directions
+ *     (an outbound query channel vs. local file reach), so wanting one must never
+ *     hand over the other - and a single shared "capabilities" flag is exactly
+ *     the shortcut this asserts against.
  *
  * `CELLAR_USER_SETTINGS` is redirected into the throwaway workspace by the shared
  * harness, so this spec can never rewrite the settings of whoever ran the suite.
@@ -90,10 +98,13 @@ test('a never-touched install carries neither key, and the pane shows the shippe
 
 	await expect(page.getByTestId('settings-chat-model')).toHaveValue(CHAT_MODEL_DEFAULT);
 	await expect(page.getByTestId('settings-chat-web-search')).not.toBeChecked();
+	await expect(page.getByTestId('settings-chat-workspace-reads')).not.toBeChecked();
 
 	const before = await serverSettings(page);
 	expect(before[CHAT_MODEL_KEY]).toBeUndefined();
 	expect(before[CHAT_WEB_SEARCH_KEY]).toBeUndefined();
+	// The reads key too: an upgraded install grants no file reach until asked.
+	expect(before[CHAT_WORKSPACE_READS_KEY]).toBeUndefined();
 
 	await page.getByTestId('chat-settings-control').screenshot({
 		path: test.info().outputPath('chat-settings-default.png')
@@ -153,12 +164,58 @@ test('turning search back off DELETES the key: an opted-out store matches a fres
 	await closeSettings(page);
 });
 
+test('the workspace-reads opt-in stores a literal true, and leaves web search alone', async ({ page }) => {
+	await page.goto(baseURL);
+	await openSettings(page);
+
+	// Search is OFF at this point (the test above turned it back off), which is
+	// what makes this a real independence check rather than a coincidence.
+	await expect(page.getByTestId('settings-chat-web-search')).not.toBeChecked();
+	await page.getByTestId('settings-chat-workspace-reads').click();
+	await expect(page.getByTestId('settings-chat-workspace-reads')).toBeChecked();
+
+	// Only a literal boolean `true` widens a session (`chatWorkspaceReadsEnabled`
+	// accepts nothing else), so a `"true"` string here would silently leave reads off.
+	await expect
+		.poll(async () => (await serverSettings(page))[CHAT_WORKSPACE_READS_KEY], { timeout: 10_000 })
+		.toBe(true);
+	// ...and the OTHER capability was not handed over as a side effect.
+	expect(CHAT_WEB_SEARCH_KEY in (await serverSettings(page))).toBe(false);
+	await expect(page.getByTestId('settings-chat-web-search')).not.toBeChecked();
+
+	await page.getByTestId('chat-settings-control').screenshot({
+		path: test.info().outputPath('chat-settings-reads-on.png')
+	});
+	await test.info().attach('chat-settings-reads-on', {
+		path: test.info().outputPath('chat-settings-reads-on.png'),
+		contentType: 'image/png'
+	});
+	await closeSettings(page);
+});
+
+test('a reload re-hydrates the reads toggle, and turning it off DELETES its key', async ({ page }) => {
+	await page.goto(baseURL);
+	await openSettings(page);
+
+	// What a person reads back after a reload is what the next run would use.
+	await expect(page.getByTestId('settings-chat-workspace-reads')).toBeChecked();
+
+	await page.getByTestId('settings-chat-workspace-reads').click();
+	await expect(page.getByTestId('settings-chat-workspace-reads')).not.toBeChecked();
+	// Absent, not `false`: an opted-out store is byte-identical to a fresh one.
+	await expect
+		.poll(async () => CHAT_WORKSPACE_READS_KEY in (await serverSettings(page)), { timeout: 10_000 })
+		.toBe(false);
+	await closeSettings(page);
+});
+
 /**
  * The debounced client write is `FLUSH_DEBOUNCE_MS` (300ms, `$lib/clientStore`)
  * away from the server, so it cannot be what carries a CAPABILITY opt-out: the
  * server re-reads these keys when a chat cell RUNS, and a run started inside
- * that window would still have been granted `--tools`/`--allowedTools
- * WebSearch` after the user turned search off. The immediate write
+ * that window would still have been granted the `--tools`/`--allowedTools`
+ * capability the user just turned off - `WebSearch`, or the workspace read
+ * grants. The immediate write
  * (`setUserSettingNow`, the `setUiNow` rule the Databricks runtime toggle
  * already follows) is what closes it.
  *
@@ -173,8 +230,8 @@ test('turning search back off DELETES the key: an opted-out store matches a fres
  * the platform API the store calls, wrapped here only to timestamp the request
  * it makes - the request itself, and the store, are untouched.
  *
- * Runs LAST because the spec is serial and shares one store: it opts in, then
- * out, leaving search off exactly as the test above does.
+ * Run LAST because the spec is serial and shares one store: each opts in, then
+ * out, leaving both capabilities off exactly as the tests above do.
  */
 const FLUSH_DEBOUNCE_MS = 300;
 
@@ -183,29 +240,35 @@ interface OptOutProbe {
 	__cellarOptOutDelay?: number;
 }
 
-test('the web-search opt-out reaches the server without waiting out the debounce', async ({ page }) => {
-	await page.goto(baseURL);
+/**
+ * One capability's opt-out, timed against the debounce floor. Parameterized
+ * because the guarantee is a property of the HANDLER, not of the pane: the two
+ * toggles write different keys through different functions, so proving it for
+ * web search says nothing about workspace reads - and reads is the one whose
+ * debounced window would leave the next run still holding a file grant.
+ */
+async function assertOptOutBeatsDebounce(page: Page, key: string, testId: string): Promise<void> {
 	await openSettings(page);
 
 	// Opt IN first, and let it settle, so the toggle below is a real opt-OUT
 	// over a store that really holds `true`.
-	await page.getByTestId('settings-chat-web-search').click();
-	await expect
-		.poll(async () => (await serverSettings(page))[CHAT_WEB_SEARCH_KEY], { timeout: 10_000 })
-		.toBe(true);
+	await page.getByTestId(testId).click();
+	await expect.poll(async () => (await serverSettings(page))[key], { timeout: 10_000 }).toBe(true);
 
 	// Timestamp the opt-out PUT relative to the click that caused it. The opt-out
 	// is the write that DELETES the key (a stored `false` would not be an
-	// opted-out store - see the test above).
-	await page.evaluate((key: string) => {
+	// opted-out store - see the tests above).
+	await page.evaluate((k: string) => {
 		const probe = window as unknown as OptOutProbe;
+		probe.__cellarOptOutMark = undefined;
+		probe.__cellarOptOutDelay = undefined;
 		const realFetch = window.fetch.bind(window);
 		window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
 			try {
 				const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
 				if (init?.method === 'PUT' && url.includes('/api/user-settings') && probe.__cellarOptOutDelay === undefined) {
 					const body = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
-					if (key in body && body[key] === null && probe.__cellarOptOutMark !== undefined) {
+					if (k in body && body[k] === null && probe.__cellarOptOutMark !== undefined) {
 						probe.__cellarOptOutDelay = performance.now() - probe.__cellarOptOutMark;
 					}
 				}
@@ -214,16 +277,16 @@ test('the web-search opt-out reaches the server without waiting out the debounce
 			}
 			return realFetch(input, init);
 		}) as typeof window.fetch;
-	}, CHAT_WEB_SEARCH_KEY);
+	}, key);
 
 	// Mark and click in ONE browser turn - nothing between them to measure.
-	await page.evaluate(() => {
+	await page.evaluate((t: string) => {
 		const probe = window as unknown as OptOutProbe;
 		probe.__cellarOptOutMark = performance.now();
-		document.querySelector<HTMLElement>('[data-testid="settings-chat-web-search"]')?.click();
-	});
+		document.querySelector<HTMLElement>(`[data-testid="${t}"]`)?.click();
+	}, testId);
 
-	await expect(page.getByTestId('settings-chat-web-search')).not.toBeChecked();
+	await expect(page.getByTestId(testId)).not.toBeChecked();
 
 	const delay = await page.evaluate(() => (window as unknown as OptOutProbe).__cellarOptOutDelay);
 	// Issued at all...
@@ -233,9 +296,17 @@ test('the web-search opt-out reaches the server without waiting out the debounce
 	expect(delay as number).toBeLessThan(FLUSH_DEBOUNCE_MS);
 
 	// The write it carried is the one the server ends up holding.
-	await expect
-		.poll(async () => CHAT_WEB_SEARCH_KEY in (await serverSettings(page)), { timeout: 10_000 })
-		.toBe(false);
+	await expect.poll(async () => key in (await serverSettings(page)), { timeout: 10_000 }).toBe(false);
 
 	await closeSettings(page);
+}
+
+test('the web-search opt-out reaches the server without waiting out the debounce', async ({ page }) => {
+	await page.goto(baseURL);
+	await assertOptOutBeatsDebounce(page, CHAT_WEB_SEARCH_KEY, 'settings-chat-web-search');
+});
+
+test('the workspace-reads opt-out reaches the server without waiting out the debounce', async ({ page }) => {
+	await page.goto(baseURL);
+	await assertOptOutBeatsDebounce(page, CHAT_WORKSPACE_READS_KEY, 'settings-chat-workspace-reads');
 });

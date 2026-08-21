@@ -5,7 +5,7 @@
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
 	import { getUserSettingFlag, getUserSettingText, setUserSetting, setUserSettingNow } from '$lib/userSettings';
-	import { CHAT_MODEL_KEY, CHAT_MODELS, CHAT_WEB_SEARCH_KEY, normalizeChatModel } from '$lib/chatCell';
+	import { CHAT_MODEL_KEY, CHAT_MODELS, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, normalizeChatModel } from '$lib/chatCell';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import {
 		UPLOAD_DATE_TOKENS,
@@ -217,11 +217,11 @@
 		);
 	}
 
-	// ---- Chat cells (model + web search) --------------------------------------
+	// ---- Chat cells (model + web search + workspace reads) --------------------
 	// Person-scoped like the account slot beside them in the same `~/.cellar/`
-	// store: which model a reply bills, and whether a reply may search the web,
-	// are about the person's subscription and their data-egress choice, not about
-	// any one project. Seeded when the modal first opens (the upload-defaults
+	// store: which model a reply bills, whether a reply may search the web, and
+	// whether it may read this machine's files are about the person's
+	// subscription and their data/egress choices, not about any one project. Seeded when the modal first opens (the upload-defaults
 	// hydration rule: this component is mounted for the life of the shell, so a
 	// construction-time read would latch the pre-hydration empty store). Reads go
 	// through the shared gates (`normalizeChatModel`, the strict `=== true` flag
@@ -229,12 +229,14 @@
 	// untyped store means.
 	let chatModel = $state(normalizeChatModel(undefined));
 	let chatWebSearch = $state(false);
+	let chatWorkspaceReads = $state(false);
 	let chatHydrated = false;
 	$effect(() => {
 		if (!open || chatHydrated) return;
 		chatHydrated = true;
 		chatModel = normalizeChatModel(getUserSettingText(CHAT_MODEL_KEY));
 		chatWebSearch = getUserSettingFlag(CHAT_WEB_SEARCH_KEY);
+		chatWorkspaceReads = getUserSettingFlag(CHAT_WORKSPACE_READS_KEY);
 	});
 
 	// Both write through `setUserSettingNow`, NEVER the debounced `setUserSetting`:
@@ -259,6 +261,17 @@
 		// OFF deletes the key rather than storing `false`: absent = the default =
 		// today's bare session, so a store that was never opted in carries nothing.
 		void setUserSettingNow(CHAT_WEB_SEARCH_KEY, chatWebSearch ? true : null);
+	}
+
+	// Its own key and its own toggle, never a mode shared with web search: the two
+	// widen the session in different directions (an outbound query channel vs.
+	// local file reach), so wanting one must not hand over the other. Same
+	// `setUserSettingNow` rule for the same security reason - the server re-reads
+	// this key when a chat cell RUNS, so an opt-OUT still sitting in a debounce
+	// window would let the very next run keep its file grant.
+	function toggleChatWorkspaceReads() {
+		chatWorkspaceReads = !chatWorkspaceReads;
+		void setUserSettingNow(CHAT_WORKSPACE_READS_KEY, chatWorkspaceReads ? true : null);
 	}
 
 	// ---- Keyboard shortcuts --------------------------------------------------
@@ -608,11 +621,14 @@
 				<div class="divider my-1"></div>
 
 				<!-- Chat cells. Person-level like the upload defaults above: the model a
-				     reply bills and the web-search opt-in follow the person across
-				     projects. The toggle's copy states what turning it on actually
-				     grants (search only) and what it sends (queries derived from the
-				     notebook), because this is the control that decides whether
-				     notebook-derived text can reach an external service. -->
+				     reply bills and the two capability opt-ins follow the person across
+				     projects. Each toggle's copy states what turning it on actually
+				     grants and what it costs - search only, queries derived from the
+				     notebook; reads confined to this workspace and read-only - because
+				     these are the controls deciding whether notebook-derived text can
+				     reach an external service and whether a reply can read local
+				     files. They are kept SEPARATE (see the handlers): the two widen
+				     the session in different directions. -->
 				<div data-testid="chat-settings-control">
 					<div class="mb-1 text-sm font-medium">Chat cells</div>
 					<label class="flex items-center justify-between gap-4">
@@ -647,6 +663,23 @@
 						may also run web searches - search only: it still cannot fetch arbitrary URLs, run code,
 						or read files. Search queries are derived from your notebook's content, so text from the
 						notebook can reach the search service.
+					</p>
+					<label class="mt-3 flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Allow reading workspace files</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={chatWorkspaceReads}
+							onchange={toggleChatWorkspaceReads}
+							data-testid="settings-chat-workspace-reads"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						On, a reply may browse and search the files in this workspace to answer about your code
+						(read, glob and grep). Reads are confined to the workspace folder: paths outside it are
+						refused, including through <code>..</code> or a symlink. It is read-only - a chat cell
+						still cannot write or edit files, or run code. Turn it off if the workspace holds
+						secrets you would rather a reply could not read, especially with web search also on.
 					</p>
 				</div>
 
