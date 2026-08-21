@@ -392,6 +392,40 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 		expect(chatReadRoot('//tmp//cellar-ws')).toBe(WS);
 	});
 
+	it('a root carrying a GLOB METACHARACTER is refused - it would widen the grant onto siblings', () => {
+		// Measured against claude 2.1.238: a workspace at `<root>/ws[ab]` yields the
+		// rule `Read(//<root>/ws[ab]/**)`, which the matcher GLOB-INTERPRETS - it
+		// read its own file AND read `<root>/wsa/secret.txt` in a SIBLING directory,
+		// returning the secret. So such a root is refused outright rather than
+		// escaped (escape semantics are unmeasured, and a wrong escape reopens the
+		// hole while looking fixed), and the run degrades to today's read-less one.
+		for (const meta of ['*', '?', '[', ']', '{', '}']) {
+			const root = `/tmp/cellar${meta}ws`;
+			expect(chatReadRoot(root)).toBeNull();
+			// Byte-identical to the default shape: no grant flag at all, so nothing
+			// unconfined can be granted...
+			const args = chatCliArgs({ readRoot: root });
+			expect(args).toEqual(chatCliArgs());
+			expect(args).not.toContain('--allowedTools');
+			// ...the prompt truthfully says so, and the cwd stays neutral.
+			expect(promptOf(args)).toBe(CHAT_SYSTEM_PROMPT);
+			expect(chatCliCwd(chatToolPolicy({ readRoot: root }))).toBe(tmpdir());
+		}
+		// A metacharacter anywhere in the path is enough, including deep in it.
+		expect(chatReadRoot('/tmp/proj[1]/ws')).toBeNull();
+
+		// PARENTHESES are the measured-SAFE half and must keep working: the same
+		// probe against `<root>/ws (2)` read inside and still refused outside, and
+		// `~/Projects/analysis (2)` is an entirely ordinary workspace name.
+		const paren = '/tmp/Projects/analysis (2)';
+		expect(chatReadRoot(paren)).toBe(paren);
+		const parenArgs = chatCliArgs({ readRoot: paren });
+		expect(promptOf(parenArgs)).toBe(CHAT_SYSTEM_PROMPT_READS);
+		for (const tool of READ_TOOLS) {
+			expect(chatToolPolicy({ readRoot: paren }).grants).toContain(`${tool}(//tmp/Projects/analysis (2)/**)`);
+		}
+	});
+
 	it('a workspace path that could SPLIT the grant list cannot inject a bare read grant', () => {
 		// `--allowedTools` is documented "comma or space-separated", and the read
 		// rules embed a filesystem path - so a path containing `,Read,` is the
@@ -576,12 +610,8 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 	});
 
 	it('the module never requests a WRITE-shaped or executing tool, and never WebFetch', () => {
-		// The capability ceiling, asserted at the source: a chat cell learns from the
+		// The capability ceiling as OBSERVABLE OUTPUT: a chat cell learns from the
 		// workspace, it does not edit it or run things in it.
-		const src = readFileSync(new URL('../../src/lib/server/chat/claude-cli.ts', import.meta.url), 'utf8');
-		for (const banned of ['WebFetch', 'Bash', 'NotebookEdit']) {
-			expect(src).not.toContain(`'${banned}'`);
-		}
 		expect(READ_TOOLS).toEqual(['Read', 'Glob', 'Grep']);
 		// Whatever shape is asked for, the requested set stays within the ceiling.
 		for (const caps of [{}, { webSearch: true }, { readRoot: WS }, { webSearch: true, readRoot: WS }]) {

@@ -68,15 +68,32 @@
  *     root path itself as an explicit `path` argument, and the tools' default
  *     (no `path`) behaviour, which is why reads-on moves the cwd there.
  *   - The escapes are closed by the CLI's own matcher, not by us: an absolute
- *     path containing `..` that resolves outside is refused (the refusal names
- *     the RESOLVED path, so matching happens after normalization), and an
- *     absolute path through a symlink that leaves the root is refused too
- *     (Glob does not follow such a link at all).
+ *     path containing `..` that resolves outside is refused, and the refusal
+ *     names the RESOLVED path, which is what shows matching happens after
+ *     normalization rather than lexically; and an absolute path through an
+ *     in-workspace symlink whose target is outside is refused too, even though
+ *     it is LEXICALLY inside the pattern (that refusal names the path as
+ *     given, so the link is resolved for the decision and not for the message).
+ *     Both pinned against the real binary in `chat-workspace-reads.spec.ts`.
  *   - A workspace path containing a space, a comma, and even the adversarial
  *     segment `,Read,` - which would inject a BARE unscoped `Read` grant if the
  *     flag's "comma or space-separated" parsing split the value - kept working
  *     inside and kept refusing outside. The value is not split within one argv
  *     element.
+ *   - CHARACTERS MEANINGFUL TO THE RULE GRAMMAR SPLIT INTO TWO CASES, and only
+ *     one of them is safe: PARENTHESES in the root are fine (`<root>/ws (2)`
+ *     read inside and still refused outside - so ordinary names like
+ *     `~/Projects/analysis (2)` keep working), while a GLOB METACHARACTER is a
+ *     real ESCAPE - `<root>/ws[ab]` yielded a rule the matcher
+ *     glob-INTERPRETED, reading `<root>/wsa/secret.txt` in a SIBLING directory.
+ *     So `chatReadRoot` REFUSES a root carrying `* ? [ ] { }` (see
+ *     `GLOB_METACHARACTERS`) rather than escaping it, escape semantics being
+ *     unmeasured.
+ *   - The child WRITES NOTHING into that cwd: with the shipped flags
+ *     (`--no-session-persistence`, `--setting-sources ""`) a successful
+ *     reads-on run left the workspace directory tree byte-identical, so moving
+ *     the cwd there does not dirty the user's checkout. Pinned by the same spec,
+ *     because it is a property of the CLI a future version could change.
  *
  * The root is the WORKSPACE, deliberately not a notebook's code root: a code
  * root may be an external git worktree, and Cellar's standing rule is that such
@@ -85,8 +102,9 @@
  * rather than inventing a second answer.
  *
  * Fail-closed all the way down: `chatToolPolicy` refuses any root it cannot
- * confine (non-string, empty, relative, non-POSIX) and yields a READ-LESS
- * policy, so the failure mode of every unknown is today's tool-less session.
+ * confine (non-string, empty, relative, non-POSIX, or carrying a glob
+ * metacharacter) and yields a READ-LESS policy, so the failure mode of every
+ * unknown is today's tool-less session.
  * And because the frozen system prompt is chosen from that same policy, a run
  * that ends up read-less is also told it cannot read.
  *
@@ -203,20 +221,50 @@ export interface ChatToolPolicy {
 }
 
 /**
+ * Glob metacharacters, which the rule's path pattern INTERPRETS rather than
+ * matching literally - so a root carrying one cannot be confined by it.
+ *
+ * The two halves of "characters meaningful to the rule grammar" measured
+ * DIFFERENTLY against claude 2.1.238, which is why this set is exactly these
+ * six and not "punctuation":
+ *
+ *   - PARENTHESES are SAFE, and deliberately NOT refused. A workspace at
+ *     `<root>/ws (2)` produced the rule `Read(//<root>/ws (2)/**)`, read its own
+ *     file, and still REFUSED a path outside it - so the inner parens do not
+ *     terminate the rule. `~/Projects/analysis (2)` is an entirely ordinary
+ *     directory name and must keep working.
+ *   - GLOB METACHARACTERS are NOT, and this is a real confinement ESCAPE. A
+ *     workspace at `<root>/ws[ab]` produced `Read(//<root>/ws[ab]/**)`, which
+ *     the matcher glob-INTERPRETED: it read its own file AND read
+ *     `<root>/wsa/secret.txt` in a SIBLING directory, returning the secret. A
+ *     directory name carrying one of these therefore WIDENS the grant onto
+ *     paths outside the workspace.
+ *
+ * Refused rather than escaped, on this module's standing fail-closed doctrine:
+ * the matcher's escape semantics are UNMEASURED, and a wrong escape reopens the
+ * hole while looking fixed. Such directory names are rare, and the degradation
+ * stays coherent - a read-less run is also TOLD it cannot read.
+ */
+const GLOB_METACHARACTERS = /[*?[\]{}]/;
+
+/**
  * The confinement root, normalized, or null when this value cannot be confined.
  *
  * Fails CLOSED on everything it is not sure of, because the alternative to a
  * confined read is an unconfined one: a non-string, an empty string, a relative
- * path, and anything that does not normalize to a POSIX-absolute path all yield
- * null (= reads off). The POSIX check is not incidental - the `//` rule prefix
- * below is the CLI's absolute-path spelling and was measured on POSIX only, so
- * a Windows-style root is refused rather than turned into a rule whose matching
- * behaviour nobody here has established.
+ * path, anything that does not normalize to a POSIX-absolute path, and anything
+ * carrying a GLOB METACHARACTER (see `GLOB_METACHARACTERS` - measured to widen
+ * the grant onto sibling directories) all yield null (= reads off). The POSIX
+ * check is not incidental - the `//` rule prefix below is the CLI's
+ * absolute-path spelling and was measured on POSIX only, so a Windows-style
+ * root is refused rather than turned into a rule whose matching behaviour
+ * nobody here has established.
  */
 export function chatReadRoot(value: unknown): string | null {
 	if (typeof value !== 'string' || !value.startsWith('/')) return null;
 	const abs = resolve(value);
-	return abs.startsWith('/') ? abs : null;
+	if (!abs.startsWith('/')) return null;
+	return GLOB_METACHARACTERS.test(abs) ? null : abs;
 }
 
 /**
@@ -225,7 +273,9 @@ export function chatReadRoot(value: unknown): string | null {
  * `//<path-without-leading-slash>/**` is the CLI's own spelling of an absolute
  * path in a permission rule. Measured against claude 2.1.238 (see the module
  * header's confinement section): it admits the root itself, every nested file
- * and dotfiles, and refuses everything outside it.
+ * and dotfiles, and refuses everything outside it. The root reaching here is
+ * metacharacter-free by construction (`chatReadRoot` refused the rest), so
+ * every remaining character in it is matched literally.
  */
 function readGrantPattern(root: string): string {
 	return `//${root.replace(/^\/+/, '')}/**`;
