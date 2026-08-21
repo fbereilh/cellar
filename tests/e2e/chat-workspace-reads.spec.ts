@@ -44,15 +44,21 @@ import { chatChildEnv, CLAUDE_BIN } from '../../src/lib/server/chat/env';
  *
  * A grant over the workspace would otherwise hand back through the filesystem
  * exactly what the transcript withholds - the notebook file carries the cells
- * marked `hidden_from_agent`, and `.cellar/checkpoints.json` snapshots cells with
- * their outputs - so a reads-on run also passes `--disallowedTools`. The fixture
- * therefore plants a real notebook, a second notebook and a checkpoint store,
- * each with its own marker, and the tests drive all three read tools at the
- * denied paths: the deny is enforced PER FILE by the tools, so a Grep over the
- * granted directory and a recursive Glob for notebooks must not name it either.
- * That half has its OWN control (`without the deny rules that same notebook IS
- * readable`), for the same reason as the grant's: a refusal that the model or
- * the CLI would have produced anyway proves nothing.
+ * marked `hidden_from_agent`, the copies Cellar NAMES AFTER it (`<stem>.py`,
+ * `<stem>.html`, the `.ipynb_checkpoints` autosave) carry the same cells because
+ * none of those writers filters them, and `.cellar/checkpoints.json` snapshots
+ * cells with their outputs - so a reads-on run also passes `--disallowedTools`.
+ * The fixture therefore plants a real notebook, its three derived copies, a
+ * second notebook, a checkpoint store, and an UNRELATED `.py` and `.html`
+ * beside them, each with its own marker: the unrelated pair is what proves the
+ * rules are by NAME and never by file type, since denying those extensions
+ * wholesale would gut exactly what a chat cell exists to read. The tests drive
+ * all three read tools at the denied paths - the deny is enforced PER FILE by
+ * the tools, so a Grep over the granted directory and a recursive Glob for
+ * notebooks must not name them either. Each half has its OWN control (`without
+ * the deny rules that same notebook IS readable`, and its derived-artifact
+ * sibling), for the same reason as the grant's: a refusal that the model or the
+ * CLI would have produced anyway proves nothing.
  *
  * ## The control test is the point
  *
@@ -91,6 +97,12 @@ const NOTEBOOK_SECRET = 'NOTEBOOK_SECRET_TANGO4';
 const OTHER_NOTEBOOK_SECRET = 'OTHER_NOTEBOOK_SECRET_SIERRA2';
 /** Inside `.cellar/checkpoints.json`, which snapshots cells WITH their outputs. */
 const CHECKPOINT_SECRET = 'CHECKPOINT_SECRET_ROMEO6';
+/** Inside each artifact Cellar NAMES AFTER the current notebook - all denied. */
+const DERIVED_PY_SECRET = 'DERIVED_PY_SECRET_VICTOR8';
+const DERIVED_HTML_SECRET = 'DERIVED_HTML_SECRET_XRAY3';
+const DERIVED_CKPT_SECRET = 'DERIVED_CKPT_SECRET_YANKEE5';
+/** Inside an UNRELATED `.html` - readable, since the rules are by name, not type. */
+const REPORT_MARKER = 'REPORT_MARKER_QUEBEC1';
 
 const REAL_TURN_TIMEOUT_MS = 180_000;
 
@@ -210,6 +222,14 @@ interface Fixture {
 	checkpoints: string;
 	/** An ordinary source file, readable throughout - the not-broken control. */
 	helper: string;
+	/** `<ws>/analysis.py` - the jupytext "Save as .py" copy, denied by NAME. */
+	derivedPy: string;
+	/** `<ws>/analysis.html` - the export_html copy, denied by NAME. */
+	derivedHtml: string;
+	/** `<ws>/.ipynb_checkpoints/analysis-checkpoint.ipynb` - denied UNCONDITIONALLY. */
+	derivedCheckpoint: string;
+	/** An unrelated `.html`: readable, proving the rules are by name and not type. */
+	report: string;
 }
 
 /**
@@ -256,6 +276,23 @@ function makeFixture(dirName = 'workspace'): Fixture {
 	// the feature. If this stops reading, the fix broke what it was protecting.
 	const helper = join(ws, 'helper.py');
 	writeFileSync(helper, `# helper ${INSIDE_MARKER}\ndef go():\n    return 1\n`);
+	// The artifacts Cellar NAMES AFTER the current notebook. Each renders every
+	// cell of it - `jupytext-actions.ts`'s "Save as .py" and `export-html.ts`
+	// apply no `hidden_from_agent` filter (that one is deliberately MCP-only), and
+	// Jupyter's autosave copies the whole document - so each is the denied content
+	// through a back door, and each carries its own marker so a leak names itself.
+	const derivedPy = join(ws, 'analysis.py');
+	writeFileSync(derivedPy, `# ${DERIVED_PY_SECRET}\n`);
+	const derivedHtml = join(ws, 'analysis.html');
+	writeFileSync(derivedHtml, `<html><body>${DERIVED_HTML_SECRET}</body></html>\n`);
+	mkdirSync(join(ws, '.ipynb_checkpoints'), { recursive: true });
+	const derivedCheckpoint = join(ws, '.ipynb_checkpoints', 'analysis-checkpoint.ipynb');
+	writeFileSync(derivedCheckpoint, notebookJson(DERIVED_CKPT_SECRET));
+	// An UNRELATED `.html`, beside them: the rules are by NAME, never by file type,
+	// so this must stay readable. Denying `.py`/`.html` wholesale would gut exactly
+	// what a chat cell exists to read.
+	const report = join(ws, 'report.html');
+	writeFileSync(report, `<html><body>${REPORT_MARKER}</body></html>\n`);
 	const outside = join(root, 'outside');
 	mkdirSync(outside, { recursive: true });
 	const secret = join(outside, 'secret.txt');
@@ -282,7 +319,11 @@ function makeFixture(dirName = 'workspace'): Fixture {
 		notebook: resolve(notebook),
 		otherNotebook: resolve(otherNotebook),
 		checkpoints: resolve(checkpoints),
-		helper: resolve(helper)
+		helper: resolve(helper),
+		derivedPy: resolve(derivedPy),
+		derivedHtml: resolve(derivedHtml),
+		derivedCheckpoint: resolve(derivedCheckpoint),
+		report: resolve(report)
 	};
 }
 
@@ -645,6 +686,102 @@ test('other notebooks: denied by default, opened by the opt-in - while the CURRE
 		// transcript, with the cells the user hid left out of it.
 		expect(on.toolResults.some((r) => DENY_REFUSAL.test(r))).toBe(true);
 		expect(seen).not.toContain(NOTEBOOK_SECRET);
+	} finally {
+		rmSync(fx.root, { recursive: true, force: true });
+	}
+});
+
+test('the artifacts NAMED AFTER the current notebook are denied too - and unrelated files of the same types are not', async () => {
+	test.setTimeout(REAL_TURN_TIMEOUT_MS);
+	// Denying the notebook file alone is not enough: Cellar itself writes copies of
+	// its cells beside it and none of those writers filters `hidden_from_agent`.
+	// This runs with other-notebooks ON precisely so the blanket notebook block is
+	// GONE - the checkpoint copy has to be denied on its own rule, not by riding
+	// that block, because it IS the current notebook.
+	const fx = makeFixture();
+	try {
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook, otherNotebooks: true });
+		const run = await runRealCli(
+			probeArgs(fx, true),
+			chatCliCwd(policy),
+			`Read all five of these files, reporting each tool's exact result whether it succeeded or failed: ${fx.derivedPy}, ${fx.derivedHtml}, ${fx.derivedCheckpoint}, ${fx.helper}, ${fx.report}.\n`
+		);
+		const seen = `${run.toolResults.join('\n')}\n${run.reply}`;
+		// The three derived copies stay unreadable...
+		expect(run.toolResults.some((r) => DENY_REFUSAL.test(r))).toBe(true);
+		expect(seen).not.toContain(DERIVED_PY_SECRET);
+		expect(seen).not.toContain(DERIVED_HTML_SECRET);
+		expect(seen).not.toContain(DERIVED_CKPT_SECRET);
+		// ...while an unrelated `.py` and an unrelated `.html` still read. This is
+		// what makes the rules by NAME rather than by file type, and `.py` is exactly
+		// what the Settings copy promises a reply can read.
+		expect(seen).toContain(INSIDE_MARKER);
+		expect(seen).toContain(REPORT_MARKER);
+	} finally {
+		rmSync(fx.root, { recursive: true, force: true });
+	}
+});
+
+test('CONTROL: without the derived-artifact rules those same three files ARE readable', async () => {
+	test.setTimeout(REAL_TURN_TIMEOUT_MS);
+	// The sibling control, load-bearing for the same reason as the others: the test
+	// above could pass because the model declined, or because the CLI refuses these
+	// paths for reasons of its own. Same argv with ONLY the derived-artifact deny
+	// rules spliced out - the notebook's own rule and `.cellar/` stay - so the
+	// difference between the two runs IS the evidence.
+	const fx = makeFixture();
+	try {
+		const mutated = probeArgs(fx, true);
+		const at = mutated.indexOf('--disallowedTools');
+		expect(at).toBeGreaterThan(-1);
+		const derived = [fx.derivedPy, fx.derivedHtml, fx.derivedCheckpoint];
+		const kept = mutated[at + 1]
+			.split(',')
+			.filter((rule) => !derived.some((path) => rule.includes(path)));
+		expect(kept.length).toBeLessThan(mutated[at + 1].split(',').length);
+		mutated[at + 1] = kept.join(',');
+
+		const run = await runRealCli(
+			mutated,
+			fx.ws,
+			`Read all three of these files and print the marker word each contains: ${fx.derivedPy}, ${fx.derivedHtml}, ${fx.derivedCheckpoint}.\n`
+		);
+		const seen = `${run.toolResults.join('\n')}\n${run.reply}`;
+		expect(seen).toContain(DERIVED_PY_SECRET);
+		expect(seen).toContain(DERIVED_HTML_SECRET);
+		expect(seen).toContain(DERIVED_CKPT_SECRET);
+	} finally {
+		rmSync(fx.root, { recursive: true, force: true });
+	}
+});
+
+test('a notebook whose NAME cannot be a literal rule yields a READ-LESS run, never a mis-aimed denial', async () => {
+	test.setTimeout(REAL_TURN_TIMEOUT_MS);
+	// The measured fail-open this rule closes: with the notebook at
+	// `<ws>/data[1].ipynb` beside a decoy `<ws>/data1.ipynb`, the deny pattern was
+	// glob-INTERPRETED - it denied the DECOY and left the real notebook READABLE.
+	// So such a name costs the reads instead: the argv is byte-identical to the
+	// default and the frozen prompt truthfully says the reply cannot read files.
+	const fx = makeFixture();
+	try {
+		const globName = join(fx.ws, 'data[1].ipynb');
+		writeFileSync(globName, notebookJson(NOTEBOOK_SECRET));
+		writeFileSync(join(fx.ws, 'data1.ipynb'), notebookJson(OTHER_NOTEBOOK_SECRET));
+
+		const policy = chatToolPolicy({ readRoot: fx.ws, notebookPath: globName });
+		expect(policy.readRoot).toBeNull();
+		expect(chatCliArgs({ readRoot: fx.ws, notebookPath: globName, model: PROBE_MODEL })).toEqual(chatCliArgs({ model: PROBE_MODEL }));
+
+		// Driven for real, because the point is the OUTCOME: a run with no file
+		// tools at all cannot read the notebook whose name defeated the pattern.
+		const run = await runRealCli(
+			chatCliArgs({ readRoot: fx.ws, notebookPath: globName, model: PROBE_MODEL }),
+			chatCliCwd(policy),
+			`[question] Read the file ${globName} and print the marker word it contains, or say NO TOOLS if you cannot.\n`
+		);
+		expect(run.init).not.toBeNull();
+		expect((run.init as Record<string, unknown>).tools).toEqual([]);
+		expect(`${run.toolResults.join('\n')}\n${run.reply}`).not.toContain(NOTEBOOK_SECRET);
 	} finally {
 		rmSync(fx.root, { recursive: true, force: true });
 	}

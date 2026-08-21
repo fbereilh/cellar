@@ -37,6 +37,7 @@ import {
 	chatCliArgs,
 	chatCliCwd,
 	chatReadRoot,
+	literalRulePath,
 	chatSystemPrompt,
 	chatToolPolicy,
 	classifyChatFailure,
@@ -121,10 +122,28 @@ const WS_RULE = '//tmp/cellar-ws/**';
  * than derived from the module under test.
  */
 const NB = '/tmp/cellar-ws/analysis.ipynb';
-/** The deny patterns a reads-on run over `WS`/`NB` builds, in order. */
-const NB_DENY = '//tmp/cellar-ws/analysis.ipynb';
+/**
+ * The deny patterns a reads-on run over `WS`/`NB` builds, in order. The notebook
+ * group is the file itself PLUS the artifacts Cellar names after it - each of
+ * those writers renders every cell, hidden ones included - deduped, so the
+ * `.ipynb` derivation of an `.ipynb` notebook collapses into its own path.
+ */
+const NB_DENY = [
+	'//tmp/cellar-ws/analysis.ipynb',
+	'//tmp/cellar-ws/analysis.py',
+	'//tmp/cellar-ws/analysis.html',
+	'//tmp/cellar-ws/.ipynb_checkpoints/analysis-checkpoint.ipynb'
+];
 const CELLAR_DENY = '//tmp/cellar-ws/.cellar/**';
 const IPYNB_DENY = ['//tmp/cellar-ws/*.ipynb', '//tmp/cellar-ws/**/*.ipynb'];
+/** Every deny rule one shape emits, in the order the policy builds them. */
+function denyRules(notebooks: readonly string[], blanket: boolean): string[] {
+	return READ_TOOLS.flatMap((t) => [
+		...notebooks.map((d) => `${t}(${d})`),
+		`${t}(${CELLAR_DENY})`,
+		...(blanket ? IPYNB_DENY.map((d) => `${t}(${d})`) : [])
+	]);
+}
 
 /** Install a stub `claude` whose body is `script` (sh). */
 function stubClaude(script: string) {
@@ -356,9 +375,7 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 			'--allowedTools',
 			`Read(${WS_RULE}),Glob(${WS_RULE}),Grep(${WS_RULE})`,
 			'--disallowedTools',
-			[...READ_TOOLS]
-				.map((t) => [`${t}(${NB_DENY})`, `${t}(${CELLAR_DENY})`, ...IPYNB_DENY.map((d) => `${t}(${d})`)].join(','))
-				.join(','),
+			denyRules(NB_DENY, true).join(','),
 			'--disable-slash-commands',
 			'--setting-sources',
 			'',
@@ -527,17 +544,17 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 		// surface a file's content independently - a rule missing from one of them
 		// is that file readable through the other two.
 		const off = chatToolPolicy({ readRoot: WS, notebookPath: NB });
-		expect(off.denials).toEqual(
-			READ_TOOLS.flatMap((t) => [`${t}(${NB_DENY})`, `${t}(${CELLAR_DENY})`, ...IPYNB_DENY.map((d) => `${t}(${d})`)])
-		);
+		expect(off.denials).toEqual(denyRules(NB_DENY, true));
 
-		// The opt-in opens OTHER notebooks and nothing else: the current notebook and
-		// Cellar's own state stay denied, which is the invariant the setting may not
-		// reach.
+		// The opt-in opens OTHER notebooks and nothing else: the current notebook,
+		// the artifacts named after it and Cellar's own state stay denied, which is
+		// the invariant the setting may not reach. The checkpoint copy IS the current
+		// notebook, so it must survive here rather than merely riding the blanket
+		// notebook block that this shape drops.
 		const on = chatToolPolicy({ readRoot: WS, notebookPath: NB, otherNotebooks: true });
-		expect(on.denials).toEqual(READ_TOOLS.flatMap((t) => [`${t}(${NB_DENY})`, `${t}(${CELLAR_DENY})`]));
+		expect(on.denials).toEqual(denyRules(NB_DENY, false));
 		for (const tool of READ_TOOLS) {
-			expect(on.denials).toContain(`${tool}(${NB_DENY})`);
+			for (const d of NB_DENY) expect(on.denials).toContain(`${tool}(${d})`);
 			expect(on.denials).toContain(`${tool}(${CELLAR_DENY})`);
 			for (const d of IPYNB_DENY) expect(on.denials).not.toContain(`${tool}(${d})`);
 		}
@@ -547,9 +564,28 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 
 		// A jupytext `.py` notebook is the current notebook too, so the rule is its
 		// ACTUAL path and never an `.ipynb` pattern - the case the extension-shaped
-		// rules below would silently miss.
+		// rules below would silently miss. Its derived set is the mirror image: the
+		// `.ipynb` convert output is the sibling here, and the file itself is not
+		// covered by the blanket notebook block at all.
 		const py = chatToolPolicy({ readRoot: WS, notebookPath: '/tmp/cellar-ws/analysis.py', otherNotebooks: true });
-		for (const tool of READ_TOOLS) expect(py.denials).toContain(`${tool}(//tmp/cellar-ws/analysis.py)`);
+		expect(py.denials).toEqual(denyRules(['//tmp/cellar-ws/analysis.py', '//tmp/cellar-ws/analysis.ipynb', '//tmp/cellar-ws/analysis.html', '//tmp/cellar-ws/.ipynb_checkpoints/analysis-checkpoint.ipynb'], false));
+
+		// The derived rules are BY NAME, never by file TYPE: an unrelated `.py` or
+		// `.html` in the same workspace stays readable, which is the whole feature -
+		// `.py` is exactly what the Settings copy promises a reply can read.
+		for (const rule of on.denials) {
+			expect(rule).not.toContain('helper.py');
+			expect(rule).not.toContain('report.html');
+		}
+
+		// A notebook in a SUBDIRECTORY derives its siblings beside itself, not at the
+		// workspace root - a rule built from the basename alone would deny the wrong
+		// directory and leave the real copies readable.
+		const nested = chatToolPolicy({ readRoot: WS, notebookPath: '/tmp/cellar-ws/sub/deep.ipynb', otherNotebooks: true });
+		for (const tool of READ_TOOLS) {
+			expect(nested.denials).toContain(`${tool}(//tmp/cellar-ws/sub/deep.html)`);
+			expect(nested.denials).toContain(`${tool}(//tmp/cellar-ws/sub/.ipynb_checkpoints/deep-checkpoint.ipynb)`);
+		}
 
 		// Both notebook forms are emitted rather than trusting `**/` to match zero
 		// directories, which is engine-dependent: relying on it would leave the
@@ -558,6 +594,52 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 			expect(off.denials).toContain(`${tool}(//tmp/cellar-ws/*.ipynb)`);
 			expect(off.denials).toContain(`${tool}(//tmp/cellar-ws/**/*.ipynb)`);
 		}
+	});
+
+	it('ONE predicate answers "can this path be a literal rule" for the root AND every denial target', () => {
+		// The root and the denial targets ask the same question - can this path be
+		// spelled so the matcher treats every character literally - and answering it
+		// twice is how the two drift into disagreeing about which paths are safe.
+		for (const bad of [null, undefined, '', '   ', 'relative/dir', 'C:\\Users\\me', 42, {}, '/tmp/ws[ab]', '/tmp/ws*', '/tmp/ws?', '/tmp/ws{a}', '/tmp/ws\\a', '/tmp/runs@(a|b)', '/tmp/data!(old)', '/tmp/logs+(x)']) {
+			expect(literalRulePath(bad as never)).toBeNull();
+			expect(chatReadRoot(bad as never)).toBeNull();
+		}
+		for (const ok of ['/tmp/cellar-ws', '/tmp/Projects/analysis (2)', '/tmp/Projects/report(2)', '/tmp/my@notes', '/tmp/c++', '/tmp/important!']) {
+			expect(literalRulePath(ok)).toBe(ok);
+			expect(chatReadRoot(ok)).toBe(ok);
+		}
+		// It NORMALIZES, so one directory yields one rule whichever spelling arrives.
+		expect(literalRulePath('/tmp/cellar-ws/sub/..')).toBe(WS);
+	});
+
+	it('an un-patternable NOTEBOOK name costs the reads, not the guarantee', () => {
+		// A MEASURED fail-open, not a theoretical one: with the notebook at
+		// `<ws>/data[1].ipynb` beside a decoy `<ws>/data1.ipynb`, the deny pattern was
+		// glob-INTERPRETED - it denied the DECOY and left the real current notebook
+		// READABLE, so "the current notebook is always denied" was silently false.
+		// The root is perfectly confinable in every case here, so what is being
+		// pinned is that the NOTEBOOK's own name can veto the reads.
+		for (const nb of ['/tmp/cellar-ws/data[1].ipynb', '/tmp/cellar-ws/v*.ipynb', '/tmp/cellar-ws/q?.ipynb', '/tmp/cellar-ws/a{b}.ipynb', '/tmp/cellar-ws/back\\slash.ipynb', '/tmp/cellar-ws/runs@(a|b).ipynb', '/tmp/cellar-ws/deep[1]/nb.ipynb']) {
+			const policy = chatToolPolicy({ readRoot: WS, notebookPath: nb });
+			expect(policy.readRoot).toBeNull();
+			expect(policy.tools).toEqual([]);
+			expect(policy.grants).toEqual([]);
+			expect(policy.denials).toEqual([]);
+			// Byte-identical to the default shape, neutral cwd, read-less prompt: the
+			// degradation stays coherent rather than shipping a grant whose denial
+			// points at the wrong file.
+			const args = chatCliArgs({ readRoot: WS, notebookPath: nb });
+			expect(args).toEqual(chatCliArgs());
+			expect(args).not.toContain('--allowedTools');
+			expect(args).not.toContain('--disallowedTools');
+			expect(promptOf(args)).toBe(CHAT_SYSTEM_PROMPT);
+			expect(chatCliCwd(policy)).toBe(tmpdir());
+		}
+		// Web search is a separate capability and survives: only the file half is
+		// withheld.
+		const searchOnly = chatToolPolicy({ webSearch: true, readRoot: WS, notebookPath: '/tmp/cellar-ws/data[1].ipynb' });
+		expect(searchOnly.tools).toEqual([WEB_SEARCH_TOOL]);
+		expect(searchOnly.denials).toEqual([]);
 	});
 
 	it('the denial rides ONE argv element and is omitted, never empty, when reads are off', () => {

@@ -19,13 +19,25 @@
  *    cell one `Read('<ws>/notebook.ipynb')` away, since the notebook file (and
  *    `.cellar/checkpoints.json`, which snapshots cells WITH outputs) sits inside
  *    the confinement root. So the two halves are paired: this filter bounds what
- *    is SENT, and `server/chat/claude-cli.ts`'s `denialPatterns` denies the
- *    current notebook and `.cellar/` at the tool layer on EVERY reads-on run,
- *    never optionally. Together a hidden cell in THIS notebook stays unreachable,
- *    which is also what keeps `chatPromptTooLargeMessage`'s "hide cells from the
- *    agent" remedy honest. The honest residual: a hidden cell in a DIFFERENT
- *    notebook is reachable when the person turns the other-notebooks option on -
- *    which is what that option, defaulting OFF, exists to decide.
+ *    is SENT, and `server/chat/claude-cli.ts`'s `denialPatterns` denies, at the
+ *    tool layer on EVERY reads-on run and never optionally, the current notebook,
+ *    the artifacts Cellar names after it (`<stem>.py`, `<stem>.html`, the
+ *    `.ipynb_checkpoints` copy - none of those writers filters hidden cells), and
+ *    `.cellar/` whole.
+ *
+ *    **The claim that supports, exactly, and its two residuals.** What holds is
+ *    the narrow statement: a hidden cell in THIS notebook is unreachable through
+ *    the notebook file, the copies named after it, and the checkpoint store -
+ *    which is what keeps `chatPromptTooLargeMessage`'s "hide cells from the
+ *    agent" remedy honest. It is NOT a general "hidden cells cannot be read".
+ *    Two residuals, both stated rather than glossed: (a) a hidden cell in a
+ *    DIFFERENT notebook is reachable when the person turns the other-notebooks
+ *    option on, which is what that option, defaulting OFF, exists to decide; and
+ *    (b) a derived artifact written to a NON-DEFAULT path is invisible to a
+ *    by-name rule - specifically MCP `export_html` called with an explicit
+ *    `path`, and an nbdev export module at a configured
+ *    `metadata.cellar.export_target`, neither of which is derivable from the
+ *    notebook's name.
  *
  * 2. **The transcript is BYTE-STABLE across runs of an unchanged notebook.**
  *    Prompt caching keys on an exact prefix and is what makes a long notebook

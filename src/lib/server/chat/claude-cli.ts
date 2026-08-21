@@ -41,9 +41,11 @@
  * the `unsafe_init` path any copy explains). The identical argv plus
  * `--allowedTools WebSearch` performs the search and returns cited results, so
  * the search shape passes BOTH flags - and both from the SAME
- * `chatToolAllowlist(webSearch)` the init assertion reads, one source for
- * request, grant and assertion, so the grant can never name a tool the run did
- * not request and then assert. An EMPTY `--allowedTools` is never passed: the
+ * `chatToolPolicy(caps)` the init assertion reads. That ONE policy decides the
+ * request, the grant, the DENIAL, the init assertion, the frozen prompt and the
+ * child's cwd, so the grant can never name a tool the run did not request and
+ * then assert, nor outrun the denials taken back from inside it. An EMPTY
+ * `--allowedTools` is never passed: the
  * default shape omits the flag entirely, which is what keeps its argv
  * byte-for-byte the pre-settings one.
  *
@@ -115,24 +117,27 @@
  *
  * A grant over the workspace would otherwise hand back, through the file
  * system, exactly what the transcript deliberately withholds: the notebook file
- * carries every cell the user marked `hidden_from_agent`, and
- * `<root>/.cellar/checkpoints.json` carries full cell snapshots including
- * outputs. So a reads-on run also passes `--disallowedTools`, built by the SAME
- * `chatToolPolicy` and enumerated in `denialPatterns`: the CURRENT notebook by
- * its actual path (always, whatever its extension), `<root>/.cellar/` whole,
- * and - unless the person opted other notebooks in - every `*.ipynb` in the
- * workspace. Measured against claude 2.1.238: a deny rule BEATS the allow rule
- * for a path inside the granted root, a sibling file in that root still reads,
- * and the denial is enforced per file by the tools themselves (a Grep over the
- * granted directory for the denied file's content found nothing, and a recursive
- * Glob for every `.ipynb` under it listed nothing), which is what makes it bound
- * Grep and Glob and not only Read.
+ * carries every cell the user marked `hidden_from_agent`, and so do the copies
+ * Cellar itself writes beside it (`<stem>.py`, `<stem>.html`,
+ * `.ipynb_checkpoints/<stem>-checkpoint.ipynb`) and
+ * `<root>/.cellar/checkpoints.json`. So a reads-on run also passes
+ * `--disallowedTools`, built by the SAME `chatToolPolicy` and enumerated in
+ * `denialPatterns`: the CURRENT notebook and the artifacts named after it
+ * (always, whatever its extension), `<root>/.cellar/` whole, and - unless the
+ * person opted other notebooks in - every notebook in the workspace. Measured
+ * against claude 2.1.238: a deny rule BEATS the allow rule for a path inside
+ * the granted root, a sibling file in that root still reads, and the denial is
+ * enforced per file by the tools themselves (a Grep over the granted directory
+ * for the denied file's content found nothing, and a recursive Glob for every
+ * `.ipynb` under it listed nothing), which is what makes it bound Grep and Glob
+ * and not only Read.
  *
  * Denying the current notebook is an ANSWER-QUALITY decision as much as a
  * privacy one - the model already holds it as a curated, FRESH transcript, so
  * reading the file could only add a stale copy, the hidden cells, and a second
- * conflicting view of the thing it is looking at. The rationale sits in full at
- * `denialPatterns`.
+ * conflicting view of the thing it is looking at. The rationale, the by-NAME
+ * (never by file type) shape of the derived-artifact rules, and the two
+ * residuals this layer does NOT cover all sit in full at `denialPatterns`.
  *
  * Fail-closed all the way down: `chatToolPolicy` refuses any root it cannot
  * confine (non-string, empty, relative, non-POSIX, or carrying one of
@@ -201,7 +206,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { normalizeChatModel } from '$lib/chatCell';
 import { chatChildEnv, CLAUDE_BIN } from './env';
 import type { ChatEngine, ChatEngineFailure, ChatEngineResult, ChatEngineRunArgs } from './engine';
@@ -351,7 +356,7 @@ const EXTGLOB_PREFIX = /[@+!]\(/;
  * only, so a Windows-style path is refused rather than turned into a rule whose
  * matching behaviour nobody here has established.
  */
-function literalRulePath(value: unknown): string | null {
+export function literalRulePath(value: unknown): string | null {
 	if (typeof value !== 'string' || !value.startsWith('/')) return null;
 	const abs = resolve(value);
 	if (!abs.startsWith('/')) return null;
@@ -390,6 +395,65 @@ function readGrantPattern(root: string): string {
 /** Cellar's own per-project state directory, denied whole (see `denialPatterns`). */
 const CELLAR_STATE_DIR = '.cellar';
 
+/** Jupyter's own autosave copy directory, beside the notebook it copies. */
+const JUPYTER_CHECKPOINT_DIR = '.ipynb_checkpoints';
+
+/**
+ * The current notebook's own path plus every artifact DERIVED FROM ITS NAME that
+ * carries the same cells - or null when any of them cannot be expressed as a
+ * literal rule.
+ *
+ * Denying the notebook file alone is not enough, because Cellar itself writes
+ * copies of those cells beside it and NONE of those writers filters
+ * `hidden_from_agent`: `jupytext-actions.ts`'s "Save as .py" renders every cell
+ * into `<stem>.py`, `export-html.ts` renders every cell AND its outputs into
+ * `<stem>.html` (that filter is deliberately MCP-only), `convertPyToIpynb`
+ * writes `<stem>.ipynb`, and Jupyter's own autosave copies the whole document
+ * into `.ipynb_checkpoints/<stem>-checkpoint.ipynb`. Each is the denied content
+ * reachable through a back door.
+ *
+ * BY NAME, never by file TYPE, and that is the whole shape of this rule: `.py`
+ * is exactly what a chat cell exists to read and what the Settings copy promises
+ * stays readable, so denying those extensions wholesale would gut the feature to
+ * close a leak that only ever involves the notebook's OWN name. Driven end to
+ * end against claude 2.1.238: with these rules and no blanket notebook block,
+ * the four named artifacts came back unreadable while a sibling `helper.py`, a
+ * sibling `report.html` and another notebook all still read.
+ *
+ * The checkpoint copy is denied UNCONDITIONALLY rather than riding the
+ * by-default notebook block - it IS the current notebook, so the
+ * other-notebooks opt-in must not open it.
+ *
+ * Returns NULL rather than a partial list when any target is un-patternable, and
+ * the caller turns that into a READ-LESS run: a deny pattern the matcher would
+ * glob-interpret does not merely miss, it matches the WRONG file. Measured
+ * against claude 2.1.238 with the notebook at `<ws>/data[1].ipynb` beside a decoy
+ * `<ws>/data1.ipynb`: the rule denied the DECOY and left the real notebook
+ * READABLE - "the current notebook is always denied" silently false. So reads
+ * are granted only where the notebook can PROVABLY be denied; an un-patternable
+ * name costs the reads, never the guarantee. (`literalRulePath` already refuses
+ * such a notebook path outright, so this is the same rule applied to the derived
+ * names as well, keeping the invariant structural if the derivation ever grows.)
+ */
+function deniableNotebookPaths(notebookPath: string): string[] | null {
+	const dir = dirname(notebookPath);
+	const stem = basename(notebookPath).replace(/\.(ipynb|py)$/i, '');
+	const targets = [
+		notebookPath,
+		join(dir, `${stem}.py`),
+		join(dir, `${stem}.ipynb`),
+		join(dir, `${stem}.html`),
+		join(dir, JUPYTER_CHECKPOINT_DIR, `${stem}-checkpoint.ipynb`)
+	];
+	const safe: string[] = [];
+	for (const target of targets) {
+		const literal = literalRulePath(target);
+		if (literal === null) return null;
+		if (!safe.includes(literal)) safe.push(literal);
+	}
+	return safe;
+}
+
 /**
  * The paths a reads-on run DENIES inside its own confinement root.
  *
@@ -408,37 +472,48 @@ const CELLAR_STATE_DIR = '.cellar';
  *
  * Three rules, in order:
  *
- *   1. **The CURRENT notebook, always, by its ACTUAL path** - never optional,
- *      never behind a setting, and never an `.ipynb` PATTERN, because a jupytext
- *      `.py` notebook is the current notebook too. This is an ANSWER-QUALITY
- *      rule as much as a privacy one: the model is already handed this notebook
- *      as a curated, FRESH transcript, so a file read of it can only add (a) a
- *      STALE copy, the editor's autosave being debounced, (b) the cells the user
- *      deliberately marked `hidden_from_agent`, and (c) a second, conflicting
- *      view of the very thing it is looking at. There is no case where reading
- *      it beats the transcript it already holds - and denying it is what keeps
- *      `transcript.ts`'s rule 1 ("a hidden cell is provably absent from what is
- *      sent") true once a run has file reach at all.
+ *   1. **The CURRENT notebook and the artifacts named after it**, always - never
+ *      optional, never behind a setting, and never an `.ipynb` PATTERN, because a
+ *      jupytext `.py` notebook is the current notebook too. The set is built by
+ *      `deniableNotebookPaths`; see there for why the derived copies are in it
+ *      and why the list is by NAME rather than by file type. This is an
+ *      ANSWER-QUALITY rule as much as a privacy one: the model is already handed
+ *      this notebook as a curated, FRESH transcript, so a file read of it can
+ *      only add (a) a STALE copy, the editor's autosave being debounced, (b) the
+ *      cells the user deliberately marked `hidden_from_agent`, and (c) a second,
+ *      conflicting view of the very thing it is looking at. There is no case
+ *      where reading it beats the transcript it already holds.
  *   2. **`<root>/.cellar/` whole**, Cellar's own per-project state. The artifact
  *      that matters there is `checkpoints.json`, which stores full cell
  *      snapshots INCLUDING outputs and hidden cells - the same content rule 1
  *      denies, reachable through a back door. It is denied as a DIRECTORY rather
  *      than as that one file: everything under it is Cellar runtime state the
  *      model needs none of, and a directory rule covers whatever is added there
- *      later instead of silently going stale. (There is deliberately no
- *      "outputs sidecar" rule - no such file exists in this codebase; the
- *      notebook itself and this checkpoint store are the only two artifacts
- *      carrying cell content, and both are covered here.)
- *   3. **Every `*.ipynb` in the workspace**, unless the person opted OTHER
+ *      later instead of silently going stale.
+ *   3. **Every notebook in the workspace**, unless the person opted OTHER
  *      notebooks in. Off (the default) the reply still reads `.py`, `.md` and
  *      data files - everything except notebooks; on, other notebooks open up
  *      while rules 1 and 2 stand either way. Both a top-level and a nested form
  *      are emitted rather than relying on a leading globstar matching zero
  *      directories, which is engine-dependent and would silently leave the
  *      workspace's top-level notebooks readable.
+ *
+ * WHAT THIS DOES NOT COVER, stated rather than glossed, because the layer's
+ * whole justification is that a hidden cell stays out of reach. Two residuals:
+ *
+ *   (a) A hidden cell in a DIFFERENT notebook, once the other-notebooks option
+ *       is ON. That is exactly what the option decides, and it defaults OFF.
+ *   (b) A derived artifact written to a NON-DEFAULT path, which a by-name rule
+ *       cannot see: MCP `export_html` called with an explicit `path`, and an
+ *       nbdev export module at a configured `metadata.cellar.export_target`.
+ *       Neither is derivable from the notebook's name, so neither is denied.
+ *
+ * So the claim this layer supports is the narrow one: a hidden cell in THIS
+ * notebook is unreachable through the notebook file, the copies Cellar names
+ * after it, and the checkpoint store. Do not restate it more widely.
  */
-function denialPatterns(root: string, notebookPath: string, otherNotebooks: boolean): string[] {
-	const patterns = [rulePath(notebookPath), `${rulePath(root)}/${CELLAR_STATE_DIR}/**`];
+function denialPatterns(root: string, notebookTargets: readonly string[], otherNotebooks: boolean): string[] {
+	const patterns = [...notebookTargets.map(rulePath), `${rulePath(root)}/${CELLAR_STATE_DIR}/**`];
 	if (!otherNotebooks) patterns.push(`${rulePath(root)}/*.ipynb`, `${rulePath(root)}/**/*.ipynb`);
 	return patterns;
 }
@@ -449,17 +524,23 @@ function denialPatterns(root: string, notebookPath: string, otherNotebooks: bool
  * system prompt and the child's cwd. `{}` is the default bare session: no tools,
  * no grants, no denials.
  *
- * Reads require a confinable ROOT and a deniable NOTEBOOK PATH together. Either
- * one missing or unexpressible yields a read-less policy, which is what makes
- * "the current notebook is always denied" true by construction rather than by
- * every caller remembering to pass it: there is no way to reach a granted read
- * whose notebook denial was skipped.
+ * Reads require a confinable ROOT and a deniable NOTEBOOK PATH together - and
+ * "deniable" means the notebook AND every artifact named after it can each be
+ * spelled as a literal rule. Either half missing or unexpressible yields a
+ * read-less policy, which is what makes "the current notebook is always denied"
+ * true by construction rather than by every caller remembering to pass it: there
+ * is no way to reach a granted read whose notebook denial was skipped, and none
+ * whose denial pattern the matcher would glob-interpret onto some other file.
  */
 export function chatToolPolicy(caps: ChatCapabilities = {}): ChatToolPolicy {
 	const webSearch = caps.webSearch === true;
 	const root = chatReadRoot(caps.readRoot);
 	const notebookPath = literalRulePath(caps.notebookPath);
-	const readRoot = root !== null && notebookPath !== null ? root : null;
+	// Every path the run must be able to DENY, resolved before any grant is
+	// built: null here (an un-patternable notebook name) costs the reads, so a
+	// granted read whose notebook denial silently missed is unreachable.
+	const notebookTargets = notebookPath === null ? null : deniableNotebookPaths(notebookPath);
+	const readRoot = root !== null && notebookTargets !== null ? root : null;
 	const tools: string[] = [];
 	const grants: string[] = [];
 	const denials: string[] = [];
@@ -468,9 +549,9 @@ export function chatToolPolicy(caps: ChatCapabilities = {}): ChatToolPolicy {
 		// Search takes no path scope: it has no path to scope.
 		grants.push(WEB_SEARCH_TOOL);
 	}
-	if (readRoot && notebookPath) {
+	if (readRoot && notebookTargets) {
 		const pattern = readGrantPattern(readRoot);
-		const denied = denialPatterns(readRoot, notebookPath, caps.otherNotebooks === true);
+		const denied = denialPatterns(readRoot, notebookTargets, caps.otherNotebooks === true);
 		for (const tool of READ_TOOLS) {
 			tools.push(tool);
 			grants.push(`${tool}(${pattern})`);
