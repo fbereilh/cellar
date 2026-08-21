@@ -80,15 +80,18 @@
  *     flag's "comma or space-separated" parsing split the value - kept working
  *     inside and kept refusing outside. The value is not split within one argv
  *     element.
- *   - CHARACTERS MEANINGFUL TO THE RULE GRAMMAR SPLIT INTO TWO CASES, and only
- *     one of them is safe: PARENTHESES in the root are fine (`<root>/ws (2)`
- *     read inside and still refused outside - so ordinary names like
- *     `~/Projects/analysis (2)` keep working), while a GLOB METACHARACTER is a
- *     real ESCAPE - `<root>/ws[ab]` yielded a rule the matcher
- *     glob-INTERPRETED, reading `<root>/wsa/secret.txt` in a SIBLING directory.
- *     So `chatReadRoot` REFUSES a root carrying `* ? [ ] { }` (see
- *     `GLOB_METACHARACTERS`) rather than escaping it, escape semantics being
- *     unmeasured.
+ *   - CHARACTERS MEANINGFUL TO THE RULE GRAMMAR WERE MEASURED ONE BY ONE, and
+ *     they land in THREE different places - so the doc names the members, never
+ *     a class: `* ? [ ] { }` WIDEN the grant (`<root>/ws[ab]` yielded a rule the
+ *     matcher glob-INTERPRETED, reading `<root>/wsa/secret.txt` in a SIBLING
+ *     directory); `\` BREAKS child startup (with `<root>/ws\a` really on disk
+ *     the CLI refused to launch, rc=1, "Can't access working directory");
+ *     `(` and `)` are SAFE in BOTH the spaced and the ADJACENT form
+ *     (`<root>/ws (2)` and `<root>/report(2)` each read inside and still refused
+ *     outside - no extglob behaviour - so ordinary names like
+ *     `~/Projects/analysis (2)` keep working). `chatReadRoot` REFUSES the first
+ *     two groups (see `UNCONFINABLE_ROOT_CHARS`) rather than escaping them,
+ *     escape semantics being unmeasured.
  *   - The child WRITES NOTHING into that cwd: with the shipped flags
  *     (`--no-session-persistence`, `--setting-sources ""`) a successful
  *     reads-on run left the workspace directory tree byte-identical, so moving
@@ -102,11 +105,18 @@
  * rather than inventing a second answer.
  *
  * Fail-closed all the way down: `chatToolPolicy` refuses any root it cannot
- * confine (non-string, empty, relative, non-POSIX, or carrying a glob
- * metacharacter) and yields a READ-LESS policy, so the failure mode of every
- * unknown is today's tool-less session.
+ * confine (non-string, empty, relative, non-POSIX, or carrying one of
+ * `UNCONFINABLE_ROOT_CHARS`) and yields a READ-LESS policy, so the failure mode
+ * of every unknown is today's tool-less session.
  * And because the frozen system prompt is chosen from that same policy, a run
  * that ends up read-less is also told it cannot read.
+ *
+ * The one thing reads-on adds that a policy cannot decide is a cwd that may
+ * VANISH: `run-chat.ts` checks the workspace exists, but a delete landing between
+ * that check and the spawn raises the SAME `ENOENT` a missing `claude` binary
+ * does - and node reports the two IDENTICALLY (measured on node 22: `path` and
+ * `syscall` name the COMMAND either way), so `spawnFailure` discriminates on the
+ * cwd itself rather than on the error's fields.
  *
  * ## The init assertion (fail closed, EXACT allowlist - never a relaxation)
  *
@@ -157,6 +167,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { normalizeChatModel } from '$lib/chatCell';
@@ -221,31 +232,39 @@ export interface ChatToolPolicy {
 }
 
 /**
- * Glob metacharacters, which the rule's path pattern INTERPRETS rather than
- * matching literally - so a root carrying one cannot be confined by it.
+ * Characters a root may not contain, because with one of them present the root
+ * is no longer confinable - each MEASURED against claude 2.1.238, and the
+ * measurements land in three different places, which is why this set is exactly
+ * these seven characters rather than "punctuation" or "glob-ish":
  *
- * The two halves of "characters meaningful to the rule grammar" measured
- * DIFFERENTLY against claude 2.1.238, which is why this set is exactly these
- * six and not "punctuation":
+ *   - `* ? [ ] { }` WIDEN THE GRANT, a real confinement escape. A workspace at
+ *     `<root>/ws[ab]` produced `Read(//<root>/ws[ab]/**)`, which the matcher
+ *     glob-INTERPRETED: it read its own file AND read `<root>/wsa/secret.txt`
+ *     in a SIBLING directory, returning the secret.
+ *   - `\` BREAKS CHILD STARTUP, which is worse than it looks. With a real
+ *     directory `<root>/ws\a` on disk, the CLI refused to launch at all: rc=1,
+ *     stderr `Can't access working directory <root>/ws\a: Path "<root>/ws\a"
+ *     does not exist`. Passed through, that surfaces to the user as an opaque
+ *     `api_error` on a run they asked to read files; refused, they get a
+ *     coherent read-less run whose frozen prompt truthfully says it cannot read.
+ *   - `(` and `)` are SAFE and deliberately NOT refused, measured in BOTH the
+ *     spaced and the ADJACENT form (the two are a different question, since only
+ *     the adjacent one could be an extglob): `<root>/ws (2)` and
+ *     `<root>/report(2)` each produced a rule that read its own file and still
+ *     REFUSED a path outside it - so no extglob behaviour, and neither the
+ *     inner parens nor an `@(`/`+(`/`!(`-shaped neighbour terminates the rule.
+ *     `~/Projects/analysis (2)` is an entirely ordinary directory name and must
+ *     keep working.
  *
- *   - PARENTHESES are SAFE, and deliberately NOT refused. A workspace at
- *     `<root>/ws (2)` produced the rule `Read(//<root>/ws (2)/**)`, read its own
- *     file, and still REFUSED a path outside it - so the inner parens do not
- *     terminate the rule. `~/Projects/analysis (2)` is an entirely ordinary
- *     directory name and must keep working.
- *   - GLOB METACHARACTERS are NOT, and this is a real confinement ESCAPE. A
- *     workspace at `<root>/ws[ab]` produced `Read(//<root>/ws[ab]/**)`, which
- *     the matcher glob-INTERPRETED: it read its own file AND read
- *     `<root>/wsa/secret.txt` in a SIBLING directory, returning the secret. A
- *     directory name carrying one of these therefore WIDENS the grant onto
- *     paths outside the workspace.
- *
- * Refused rather than escaped, on this module's standing fail-closed doctrine:
- * the matcher's escape semantics are UNMEASURED, and a wrong escape reopens the
- * hole while looking fixed. Such directory names are rare, and the degradation
- * stays coherent - a read-less run is also TOLD it cannot read.
+ * The refused characters are refused rather than escaped, on this module's
+ * standing fail-closed doctrine: the matcher's escape semantics are UNMEASURED,
+ * and a wrong escape reopens the hole while looking fixed. Such directory names
+ * are rare, and the degradation stays coherent - a read-less run is also TOLD it
+ * cannot read. Do not widen this set by analogy: every member is here because it
+ * was measured to fail, and every non-member (parens) because it was measured
+ * not to.
  */
-const GLOB_METACHARACTERS = /[*?[\]{}]/;
+const UNCONFINABLE_ROOT_CHARS = /[*?[\]{}\\]/;
 
 /**
  * The confinement root, normalized, or null when this value cannot be confined.
@@ -253,18 +272,18 @@ const GLOB_METACHARACTERS = /[*?[\]{}]/;
  * Fails CLOSED on everything it is not sure of, because the alternative to a
  * confined read is an unconfined one: a non-string, an empty string, a relative
  * path, anything that does not normalize to a POSIX-absolute path, and anything
- * carrying a GLOB METACHARACTER (see `GLOB_METACHARACTERS` - measured to widen
- * the grant onto sibling directories) all yield null (= reads off). The POSIX
- * check is not incidental - the `//` rule prefix below is the CLI's
- * absolute-path spelling and was measured on POSIX only, so a Windows-style
- * root is refused rather than turned into a rule whose matching behaviour
- * nobody here has established.
+ * carrying one of `UNCONFINABLE_ROOT_CHARS` (measured either to widen the grant
+ * onto sibling directories or to stop the child launching) all yield null
+ * (= reads off). The POSIX check is not incidental - the `//` rule prefix below
+ * is the CLI's absolute-path spelling and was measured on POSIX only, so a
+ * Windows-style root is refused rather than turned into a rule whose matching
+ * behaviour nobody here has established.
  */
 export function chatReadRoot(value: unknown): string | null {
 	if (typeof value !== 'string' || !value.startsWith('/')) return null;
 	const abs = resolve(value);
 	if (!abs.startsWith('/')) return null;
-	return GLOB_METACHARACTERS.test(abs) ? null : abs;
+	return UNCONFINABLE_ROOT_CHARS.test(abs) ? null : abs;
 }
 
 /**
@@ -578,15 +597,20 @@ function runOnce({ prompt, configDir, model, webSearch, readRoot, signal, onDelt
 		const policy = chatToolPolicy({ webSearch, readRoot });
 		const expectedTools = policy.tools;
 
+		// Hoisted so BOTH spawn-failure paths can ask whether the cwd is still
+		// there: reads-on points it at a directory of the user's, which can vanish
+		// between `chatReadableWorkspace()`'s check and this spawn.
+		const cwd = chatCliCwd(policy);
+
 		let child: ChildProcess;
 		try {
 			child = spawn(CLAUDE_BIN, chatCliArgs({ model, webSearch, readRoot }), {
 				env: chatChildEnv(configDir),
-				cwd: chatCliCwd(policy),
+				cwd,
 				stdio: ['pipe', 'pipe', 'pipe']
 			});
 		} catch (err) {
-			settleRun(spawnFailure(err));
+			settleRun(spawnFailure(err, cwd));
 			return;
 		}
 
@@ -727,7 +751,7 @@ function runOnce({ prompt, configDir, model, webSearch, readRoot, signal, onDelt
 			stderrTail = (stderrTail + d.toString()).slice(-2000);
 		});
 
-		child.on('error', (err) => settle(spawnFailure(err)));
+		child.on('error', (err) => settle(spawnFailure(err, cwd)));
 		child.on('close', (code) => settleAfterExit(code));
 		const settleAfterExit = (code: number | null) => {
 			if (settled) return;
@@ -771,9 +795,22 @@ function fail(failure: ChatEngineFailure, engine: string | null): ChatEngineResu
 	return { ok: false, failure, engine, replyText: null };
 }
 
-function spawnFailure(err: unknown): ChatEngineResult {
+function spawnFailure(err: unknown, cwd: string): ChatEngineResult {
 	const code = (err as NodeJS.ErrnoException)?.code;
 	if (code === 'ENOENT') {
+		// A missing cwd and a missing BINARY are both ENOENT, and node reports them
+		// IDENTICALLY - measured on node 22: spawning a real binary into a missing
+		// cwd still yields `path: '<command>'` and `syscall: 'spawn <command>'`,
+		// byte for byte what a missing binary yields. So `err.path`/`err.syscall`
+		// cannot tell them apart and the only discriminator is the cwd itself,
+		// asked HERE rather than before the spawn - the point is precisely that it
+		// went away in between (reads-on runs the child in a directory of the
+		// user's, which a delete or an unmount can take out from under us). Telling
+		// someone to install a CLI they already have is a dead end, the same class
+		// of defect as a remedy naming a setting that is already off.
+		if (!existsSync(cwd)) {
+			return fail({ kind: 'api_error', message: `the workspace directory is no longer available (${cwd})` }, null);
+		}
 		return fail({ kind: 'not_installed', message: 'the `claude` CLI was not found on PATH' }, null);
 	}
 	return fail({ kind: 'api_error', message: String(err) }, null);

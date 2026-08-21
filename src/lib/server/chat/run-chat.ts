@@ -155,9 +155,13 @@ export async function executeChatRun({
  *
  * A root that is not an existing directory yields null (= reads off) rather than
  * being passed on: the engine spawns the child WITH this as its cwd, so a
- * missing one would surface as an opaque spawn ENOENT, and a read-less run is the
+ * missing one would surface as a spawn ENOENT, and a read-less run is the
  * safe degradation - the frozen prompt is chosen from the same policy, so such a
  * run is also TOLD it cannot read rather than being left to discover it.
+ *
+ * It cannot close the race, only narrow it - the directory can still go away
+ * between this check and the spawn - so `spawnFailure` re-asks there and names
+ * the workspace instead of blaming a CLI that is installed.
  */
 function chatReadableWorkspace(): string | null {
 	try {

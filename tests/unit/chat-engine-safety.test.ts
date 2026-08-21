@@ -51,8 +51,9 @@ import {
 	WEB_SEARCH_TOOL
 } from '../../src/lib/server/chat/claude-cli';
 import { CHAT_MODEL_DEFAULT, normalizeChatModel } from '../../src/lib/chatCell';
+import { chatFailureMarkdown } from '../../src/lib/server/chat/failure';
 import { chatChildEnv, isChatSensitiveEnv } from '../../src/lib/server/chat/env';
-import type { ChatEngineResult } from '../../src/lib/server/chat/engine';
+import type { ChatEngineFailure, ChatEngineResult } from '../../src/lib/server/chat/engine';
 
 let BIN: string; // temp dir holding the stub `claude`, prepended to PATH
 let OUT: string; // scratch the stubs dump argv/env/stdin into
@@ -392,15 +393,22 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 		expect(chatReadRoot('//tmp//cellar-ws')).toBe(WS);
 	});
 
-	it('a root carrying a GLOB METACHARACTER is refused - it would widen the grant onto siblings', () => {
-		// Measured against claude 2.1.238: a workspace at `<root>/ws[ab]` yields the
-		// rule `Read(//<root>/ws[ab]/**)`, which the matcher GLOB-INTERPRETS - it
-		// read its own file AND read `<root>/wsa/secret.txt` in a SIBLING directory,
-		// returning the secret. So such a root is refused outright rather than
-		// escaped (escape semantics are unmeasured, and a wrong escape reopens the
-		// hole while looking fixed), and the run degrades to today's read-less one.
-		for (const meta of ['*', '?', '[', ']', '{', '}']) {
-			const root = `/tmp/cellar${meta}ws`;
+	it('a root carrying an UNCONFINABLE character is refused - each member measured, never a class', () => {
+		// Three MEASUREMENTS against claude 2.1.238, landing in three places - which
+		// is why the refused set is exactly these seven characters:
+		//   `* ? [ ] { }` WIDEN the grant. `<root>/ws[ab]` yields the rule
+		//     `Read(//<root>/ws[ab]/**)`, which the matcher GLOB-INTERPRETS - it read
+		//     its own file AND read `<root>/wsa/secret.txt` in a SIBLING directory,
+		//     returning the secret.
+		//   `\` BREAKS CHILD STARTUP. With a real directory `<root>/ws\a` on disk
+		//     the CLI refused to launch at all (rc=1, "Can't access working
+		//     directory"), which today surfaces as an opaque `api_error` on a run the
+		//     user asked to read files.
+		// Both are refused outright rather than escaped (escape semantics are
+		// unmeasured, and a wrong escape reopens the hole while looking fixed), so
+		// the run degrades to today's read-less one.
+		for (const bad of ['*', '?', '[', ']', '{', '}', '\\']) {
+			const root = `/tmp/cellar${bad}ws`;
 			expect(chatReadRoot(root)).toBeNull();
 			// Byte-identical to the default shape: no grant flag at all, so nothing
 			// unconfined can be granted...
@@ -411,18 +419,21 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 			expect(promptOf(args)).toBe(CHAT_SYSTEM_PROMPT);
 			expect(chatCliCwd(chatToolPolicy({ readRoot: root }))).toBe(tmpdir());
 		}
-		// A metacharacter anywhere in the path is enough, including deep in it.
+		// One anywhere in the path is enough, including deep in it.
 		expect(chatReadRoot('/tmp/proj[1]/ws')).toBeNull();
+		expect(chatReadRoot('/tmp/proj\\1/ws')).toBeNull();
 
-		// PARENTHESES are the measured-SAFE half and must keep working: the same
-		// probe against `<root>/ws (2)` read inside and still refused outside, and
+		// PARENTHESES are the measured-SAFE third case and must keep working, in
+		// BOTH forms - they are a different question, since only the ADJACENT one
+		// could be an extglob (`@(`/`+(`/`!(`). Measured, `<root>/ws (2)` and
+		// `<root>/report(2)` each read inside and still refused outside, and
 		// `~/Projects/analysis (2)` is an entirely ordinary workspace name.
-		const paren = '/tmp/Projects/analysis (2)';
-		expect(chatReadRoot(paren)).toBe(paren);
-		const parenArgs = chatCliArgs({ readRoot: paren });
-		expect(promptOf(parenArgs)).toBe(CHAT_SYSTEM_PROMPT_READS);
-		for (const tool of READ_TOOLS) {
-			expect(chatToolPolicy({ readRoot: paren }).grants).toContain(`${tool}(//tmp/Projects/analysis (2)/**)`);
+		for (const paren of ['/tmp/Projects/analysis (2)', '/tmp/Projects/report(2)']) {
+			expect(chatReadRoot(paren)).toBe(paren);
+			expect(promptOf(chatCliArgs({ readRoot: paren }))).toBe(CHAT_SYSTEM_PROMPT_READS);
+			for (const tool of READ_TOOLS) {
+				expect(chatToolPolicy({ readRoot: paren }).grants).toContain(`${tool}(/${paren}/**)`);
+			}
 		}
 	});
 
@@ -618,6 +629,69 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 			for (const tool of chatToolPolicy(caps).tools) {
 				expect([WEB_SEARCH_TOOL, ...READ_TOOLS]).toContain(tool);
 			}
+		}
+	});
+});
+
+describe('a failure names a remedy the user can actually reach', () => {
+	it('the MISSING-tool unsafe_init is rendered without blaming one capability', async () => {
+		// Reachable from EITHER capability now: a CLI or account that does not grant
+		// a requested tool reports fewer tools than the run asked for. Driven end to
+		// end - a READS-on run against a session reporting no tools - because the
+		// point is the copy the user is left holding, and attributing it to web
+		// search sends someone whose search toggle is already off to turn it off.
+		const noTools = JSON.stringify({ type: 'system', subtype: 'init', tools: [], mcp_servers: [], slash_commands: [], skills: [], claude_code_version: '9.9.9-stub' });
+		stubClaude([`cat > /dev/null`, `echo '${noTools}'`, `echo '{"type":"result","subtype":"success","is_error":false,"result":"hi"}'`].join('\n'));
+		// The root must EXIST: the engine spawns the child with it as cwd.
+		const ws = mkdtempSync(join(tmpdir(), 'cellar-chat-ws-'));
+		let res: ChatEngineResult;
+		try {
+			res = await run({ readRoot: ws });
+		} finally {
+			rmSync(ws, { recursive: true, force: true });
+		}
+		expect(res.ok).toBe(false);
+		expect(res.failure?.kind).toBe('unsafe_init');
+		expect(res.failure?.message).toMatch(/missing/i);
+
+		const md = chatFailureMarkdown(res.failure as ChatEngineFailure);
+		// It points at the group that holds every capability, and never singles out
+		// a toggle this run may have had OFF.
+		expect(md).toContain('Chat cells');
+		expect(md).not.toMatch(/turn \*\*Allow web search\*\* off/i);
+		// It still says what happened: the run was refused, not answered.
+		expect(md).toMatch(/refused to run/i);
+	});
+
+	it('a vanished workspace is not reported as a missing CLI', async () => {
+		// Reads-on spawns the child WITH the workspace as its cwd, so a directory
+		// deleted between `chatReadableWorkspace()`'s check and the spawn makes node
+		// raise ENOENT - the SAME code, and (measured) the same `path`/`syscall`, as
+		// a missing binary. Blaming the CLI there tells the user to install
+		// something they already have.
+		const gone = join(tmpdir(), 'cellar-chat-vanished-workspace-xyz');
+		rmSync(gone, { recursive: true, force: true });
+		stubClaude(`echo '{"type":"result","subtype":"success","is_error":false,"result":"hi"}'`);
+		const res = await run({ readRoot: gone });
+		expect(res.ok).toBe(false);
+		expect(res.failure?.kind).toBe('api_error');
+		expect(res.failure?.message).toContain(gone);
+		expect(res.failure?.message).not.toMatch(/PATH/);
+
+		// ...while a genuinely absent binary still reports itself, over the very
+		// same ENOENT - the two must not be collapsed in either direction. PATH is
+		// narrowed to the stub dir for this half, or a developer machine with the
+		// real `claude` installed would simply run it and prove nothing.
+		const withStub = process.env.PATH;
+		rmSync(join(BIN, 'claude'), { force: true });
+		process.env.PATH = BIN;
+		try {
+			const missing = await run();
+			expect(missing.failure?.kind).toBe('not_installed');
+			expect(missing.failure?.message).toMatch(/not found on PATH/);
+		} finally {
+			process.env.PATH = withStub;
+			stubClaude(`echo '{"type":"result","subtype":"success","is_error":false,"result":"hi"}'`);
 		}
 	});
 });

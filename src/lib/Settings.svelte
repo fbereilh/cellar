@@ -659,10 +659,9 @@
 						/>
 					</label>
 					<p class="mt-1 text-xs text-base-content/50">
-						Off, a chat cell answers from the notebook alone, with every tool disabled. On, a reply
-						may also run web searches - search only: it still cannot fetch arbitrary URLs, run code,
-						or read files. Search queries are derived from your notebook's content, so text from the
-						notebook can reach the search service.
+						Off, a chat cell runs no web searches. On, a reply may run them - search only: it
+						still cannot fetch arbitrary URLs or run code. Search queries are derived from your
+						notebook's content, so text from the notebook can reach the search service.
 					</p>
 					<label class="mt-3 flex cursor-pointer items-center justify-between gap-4">
 						<span class="text-sm font-medium">Allow reading workspace files</span>
