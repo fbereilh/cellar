@@ -358,6 +358,21 @@ export class OutputAccumulator {
 		return this.outputs;
 	}
 
+	/**
+	 * Whether nothing at all is held right now - no committed output AND no
+	 * buffered stream text. A pure read.
+	 *
+	 * `outputs.length === 0` alone is NOT this question: stream text is buffered in
+	 * `pending` and only materializes into `outputs` at the next flush tick, so the
+	 * array is legitimately empty for the first ~40ms of a perfectly ordinary run.
+	 * A caller that keeps its own bookkeeping about what it has emitted (`run-chat`
+	 * tracks the JOIN between blocks) needs to know when `reset()` invalidated it,
+	 * and only the two together answer that.
+	 */
+	get isEmpty(): boolean {
+		return this.outputs.length === 0 && this.pending === null;
+	}
+
 	get wasCapped(): boolean {
 		return this.capped;
 	}

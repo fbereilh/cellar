@@ -30,16 +30,47 @@
  * Widening this list means deciding, per field, that the value is a TARGET (a
  * query, a path, a pattern) and not a payload.
  *
- * ## Paths are workspace-relative, and an outside path is NAMED but not PRINTED
+ * ## Paths are workspace-relative, in EITHER of the workspace's two SPELLINGS
  *
  * An absolute path inside the workspace is noise and leaks the user's directory
  * layout into a notebook that may be shared, so it is made relative through the
- * one shared `toWorkspaceRel` rule. A path that resolves OUTSIDE the workspace
- * renders as `outside the workspace` with no path at all: it closes the leak
- * completely, and it costs no provenance, because every shipped read shape
- * confines reads to the workspace, so an outside path is a call the CLI DENIES -
- * the line carries `(failed)` beside it and the reader learns what happened
- * without the notebook carrying a stranger's directory layout.
+ * one shared `toWorkspaceRel` rule. But WHICH root a path is measured against is
+ * not one string. The engine confines the child to - and cwds it into - the
+ * CANONICAL spelling of the workspace (`claude-cli.ts` realpaths the root,
+ * because its deny rules only bind in that namespace), while `CELLAR_WORKSPACE`
+ * holds the LEXICAL one, and on macOS every `/tmp` and `/var/folders` workspace
+ * differs between the two (`/tmp` -> `/private/tmp`). So the model forms its
+ * absolute paths in the canonical spelling, and a lexical-only containment test
+ * reported an ordinary in-workspace read as `outside the workspace` - the exact
+ * opposite of what this feature exists to say, and with no `(failed)` marker
+ * beside it, since the call had SUCCEEDED.
+ *
+ * The workspace therefore arrives as a `ChatWorkspaceRef` that may carry several
+ * spellings, and a path inside ANY of them is inside. That cannot widen what is
+ * called inside: the spellings are spellings of ONE directory, so accepting
+ * either only ever admits a genuinely in-workspace path.
+ *
+ * The TOOL PATH is never realpath'd - only the ROOT is, once per run, by
+ * `run-chat.ts`. The path may not exist at all (a read of a missing file is
+ * exactly the failed-read case this must still render), and realpathing one side
+ * of a prefix containment test is the trap documented at length for worktree
+ * roots ("VERIFY by realpath, BIND and PERSIST lexically"). This module stays
+ * purely lexical and touches no filesystem.
+ *
+ * A path that IS the workspace root renders as `.`, never as an outside path.
+ * `toWorkspaceRel` answers null for both, but they are very different facts, and
+ * a `Grep`/`Glob` whose `path` is the root is a granted, supported call - the
+ * read grant admits the root itself as an explicit argument - so reporting it as
+ * outside is a false claim about a search that ran squarely inside. `.` is also
+ * what the relative branch already answers for that same directory, so one
+ * spelling carries one meaning.
+ *
+ * A path that resolves OUTSIDE every spelling renders as `outside the workspace`
+ * with no path at all: it closes the leak completely, and it costs no provenance,
+ * because every shipped read shape confines reads to the workspace, so an outside
+ * path is a call the CLI DENIES - the line carries `(failed)` beside it and the
+ * reader learns what happened without the notebook carrying a stranger's
+ * directory layout.
  *
  * ## The rendered line
  *
@@ -123,21 +154,53 @@ export const OUTSIDE_WORKSPACE = 'outside the workspace';
 const MAX_TARGET_CHARS = 120;
 
 /**
+ * The workspace a rendered path is measured against: one spelling, or several.
+ *
+ * Several, because the lexical and canonical spellings of one workspace are both
+ * in play (see the module header) - a path inside ANY of them is inside.
+ */
+export type ChatWorkspaceRef = string | readonly string[];
+
+/** The spellings of `ref`, in the order they are tried. */
+function workspaceSpellings(ref: ChatWorkspaceRef): readonly string[] {
+	if (typeof ref === 'string') return [ref];
+	return ref.filter((r): r is string => typeof r === 'string' && r !== '');
+}
+
+/**
+ * Trailing separators are not part of a directory's identity, so `<ws>/` and
+ * `<ws>` are the same place. `|| path` keeps a root of `/` intact.
+ */
+function trimTrailingSep(path: string): string {
+	return path.replace(/[/\\]+$/, '') || path;
+}
+
+/**
  * Render a path for the line: workspace-relative when it is inside the
- * workspace, and `OUTSIDE_WORKSPACE` when it is not.
+ * workspace, `.` when it IS the workspace, and `OUTSIDE_WORKSPACE` when it is
+ * neither.
  *
  * Absolute paths go through the shared `toWorkspaceRel` (boundary-aware, so a
  * sibling directory sharing the workspace's name as a prefix is not read as
- * inside it). A RELATIVE path is already workspace-relative - the read shapes
- * run the child with the workspace as its cwd - so it is only normalized, and
- * one that climbs out with `..` is treated as outside. Purely lexical: this
- * touches no filesystem, so it is a pure function of its two arguments.
+ * inside it), once per spelling, taking the first that resolves. That helper
+ * answers null both for an outside path and for the root ITSELF, so the root is
+ * tested for separately and rendered `.` - collapsing the two would report a
+ * search of the workspace root as a search outside it. A RELATIVE path is
+ * already workspace-relative - the read shapes run the child with the workspace
+ * as its cwd - so it is only normalized, and one that climbs out with `..` is
+ * treated as outside. Purely lexical: this touches no filesystem, so it is a
+ * pure function of its two arguments.
  */
-function relativePath(value: string, workspace: string): string {
+function relativePath(value: string, workspace: ChatWorkspaceRef): string {
 	const isAbs = value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
 	if (isAbs) {
-		const rel = toWorkspaceRel(workspace, value);
-		return rel ?? OUTSIDE_WORKSPACE;
+		const target = trimTrailingSep(value);
+		for (const root of workspaceSpellings(workspace)) {
+			const rel = toWorkspaceRel(root, value);
+			if (rel !== null) return rel;
+			if (trimTrailingSep(root) === target) return '.';
+		}
+		return OUTSIDE_WORKSPACE;
 	}
 	const parts: string[] = [];
 	for (const seg of value.split(/[/\\]+/)) {
@@ -162,7 +225,7 @@ function oneLine(value: string): string {
  * The target text for a call, or null when there is none to show (an
  * unrecognized tool, or a known one whose fields are absent or not strings).
  */
-export function toolCallTarget(call: ChatToolCall, workspace: string): string | null {
+export function toolCallTarget(call: ChatToolCall, workspace: ChatWorkspaceRef): string | null {
 	const fields = TOOL_TARGETS[call.name];
 	if (!fields) return null;
 	const parts: string[] = [];
@@ -200,7 +263,7 @@ function outcomeSuffix(outcome: ChatToolOutcome): string {
  * The markdown for one call, WITHOUT the leading `> ` (the caller owns how
  * consecutive lines join - see `run-chat.ts`). Never contains a newline.
  */
-export function toolCallLine(call: ChatToolCall, workspace: string): string {
+export function toolCallLine(call: ChatToolCall, workspace: ChatWorkspaceRef): string {
 	const name = oneLine(call.name) || 'tool';
 	const target = toolCallTarget(call, workspace);
 	const signature = target === null ? name : `${name}(${target})`;

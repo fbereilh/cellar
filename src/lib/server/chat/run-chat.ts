@@ -57,7 +57,7 @@
  * runs that depend on it, and the accumulator's own byte cap is the backstop.
  */
 
-import { statSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { workspaceRoot } from '../fstree';
 import { listCells } from '../notebook';
@@ -163,6 +163,20 @@ export async function executeChatRun({
 		// its own newline, and an unconditional `\n\n` after it left a stray blank
 		// line in the persisted markdown and in the live (plain-text) view.
 		let trailingNewlines = 0;
+		// A mid-run "clear outputs" (the toolbar clear-all, which deliberately reaches
+		// an in-flight cell through `truncateActiveRunOutputs`) resets the accumulator
+		// out from under this run, and these two locals would otherwise carry the
+		// pre-clear state across it: the next annotation would open the FRESH buffer
+		// with a bare `\` join line, or the next reply delta with `gap()`'s blank
+		// lines, and that stray join is what gets persisted. So a separator is only
+		// ever emitted after asking the accumulator whether there is anything left to
+		// join TO - a pure read, never a mutation, and never a notification channel on
+		// the accumulator for one caller's bookkeeping.
+		const syncJoinState = () => {
+			if (!acc.isEmpty) return;
+			last = 'none';
+			trailingNewlines = 0;
+		};
 		const emit = (text: string) => {
 			if (!text) return;
 			acc.push({ output_type: 'stream', name: 'stdout', text });
@@ -172,6 +186,7 @@ export async function executeChatRun({
 		/** The newlines still needed for a blank line between blocks. */
 		const gap = () => '\n'.repeat(Math.max(0, 2 - trailingNewlines));
 		const pushText = (text: string) => {
+			syncJoinState();
 			// A blockquote lazily swallows the line under it, so reply text resuming
 			// after an annotation needs a blank line or it becomes part of it.
 			if (last === 'tool') emit(gap());
@@ -179,6 +194,7 @@ export async function executeChatRun({
 			last = 'text';
 		};
 		const pushToolLine = (line: string) => {
+			syncJoinState();
 			if (last === 'text') emit(gap());
 			// A backslash hard break keeps consecutive annotations in ONE blockquote,
 			// one per rendered line; a bare newline would run them together, since the
@@ -188,11 +204,12 @@ export async function executeChatRun({
 			last = 'tool';
 		};
 		// The reference frame every rendered path is made relative to, read ONCE per
-		// run. `resolve()`d exactly as `chatReadableWorkspace` resolves it, so the
-		// root a line measures against is the SAME string the child was CONFINED to
-		// - the two answering different questions about one path is how a plainly
-		// in-workspace file would come out as `outside the workspace`.
-		const workspace = resolve(workspaceRoot());
+		// run and carrying BOTH spellings of the workspace - see
+		// `chatWorkspaceSpellings`. The child forms its absolute paths in the
+		// CANONICAL one (that is its cwd), so measuring against the lexical root
+		// alone is how a plainly in-workspace file came out as `outside the
+		// workspace`.
+		const workspace = chatWorkspaceSpellings();
 		// The engine's capability inputs, read from the person-scoped store at run
 		// time (the `auth.ts` CHAT_SLOT_KEY pattern) through the shared gates: the
 		// model is constrained to the known set BEFORE it rides the seam (and the
@@ -273,6 +290,36 @@ export async function executeChatRun({
  * between this check and the spawn - so `spawnFailure` re-asks there and names
  * the workspace instead of blaming a CLI that is installed.
  */
+/**
+ * The workspace in every spelling a tool path may arrive in: the LEXICAL root
+ * (what `CELLAR_WORKSPACE` holds, `resolve()`d) and, when it differs, its
+ * CANONICAL one.
+ *
+ * Both are needed because the two halves of a reads-on run live in different
+ * namespaces: `chatReadableWorkspace` hands the engine the lexical root, and the
+ * engine then CANONICALISES it (`claude-cli.ts` realpaths the confinement root so
+ * its deny rules bind) and makes that the child's cwd - so every absolute path
+ * the model forms comes back canonical, while this process's own idea of the
+ * workspace stays lexical. On macOS they differ for every `/tmp` and
+ * `/var/folders` workspace, i.e. for real users and for the e2e harness alike.
+ *
+ * Only the ROOT is resolved, and only here, once per run: it is a directory that
+ * exists, whereas a tool path may name a file that does not (a failed read is
+ * exactly the case the lines must still render), and realpathing one side of a
+ * prefix containment test is the trap the worktree-roots rule documents at
+ * length. A `realpathSync` that throws falls back to the lexical spelling -
+ * measuring against one real spelling beats measuring against none.
+ */
+function chatWorkspaceSpellings(): readonly string[] {
+	const lexical = resolve(workspaceRoot());
+	try {
+		const canonical = realpathSync(lexical);
+		return canonical === lexical ? [lexical] : [lexical, canonical];
+	} catch {
+		return [lexical];
+	}
+}
+
 function chatReadableWorkspace(): string | null {
 	try {
 		const root = resolve(workspaceRoot());

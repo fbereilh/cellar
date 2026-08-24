@@ -35,7 +35,7 @@
  *   single markdown output and survives a round trip through the .ipynb on disk.
  */
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import MarkdownIt from 'markdown-it';
@@ -173,6 +173,32 @@ describe('what a line may say', () => {
 			expect(target).toBe(OUTSIDE_WORKSPACE);
 			expect(toolCallLine(call('Read', { file_path: path }), '/ws')).not.toContain('passwd');
 		}
+	});
+
+	it('renders a path that IS the workspace root as `.`, never as outside it', () => {
+		// The read grant admits the root ITSELF as an explicit `path` argument, so
+		// this is a granted call that ran squarely inside the workspace - and `.` is
+		// already what the relative branch answers for that same directory.
+		expect(toolCallTarget(call('Grep', { pattern: 'load', path: '/ws' }), '/ws')).toBe('load, .');
+		expect(toolCallTarget(call('Grep', { pattern: 'load', path: '.' }), '/ws')).toBe('load, .');
+		// A trailing separator is not part of a directory's identity, on either side.
+		expect(toolCallTarget(call('Glob', { pattern: '*.py', path: '/ws/' }), '/ws')).toBe('*.py, .');
+		expect(toolCallTarget(call('Glob', { pattern: '*.py', path: '/ws' }), '/ws/')).toBe('*.py, .');
+		// And in EITHER spelling of a two-spelling workspace.
+		expect(toolCallTarget(call('Grep', { pattern: 'load', path: '/private/ws' }), ['/ws', '/private/ws'])).toBe(
+			'load, .'
+		);
+	});
+
+	it('accepts a path in EITHER spelling of the workspace', () => {
+		// The child forms its paths in the CANONICAL spelling (its cwd), while this
+		// process holds the LEXICAL one - two spellings of ONE directory.
+		const roots = ['/ws', '/private/ws'];
+		expect(toolCallTarget(call('Read', { file_path: '/private/ws/src/a.py' }), roots)).toBe('src/a.py');
+		expect(toolCallTarget(call('Read', { file_path: '/ws/src/a.py' }), roots)).toBe('src/a.py');
+		// Accepting either spelling admits nothing that is not genuinely inside.
+		expect(toolCallTarget(call('Read', { file_path: '/etc/passwd' }), roots)).toBe(OUTSIDE_WORKSPACE);
+		expect(toolCallTarget(call('Read', { file_path: '/private/ws2/x.py' }), roots)).toBe(OUTSIDE_WORKSPACE);
 	});
 
 	it('does not read a sibling directory sharing the workspace’s name as inside it', () => {
@@ -571,6 +597,48 @@ describe('the run glue', () => {
 		expect(await replyMarkdown(nb)).toBe('> `WebSearch(node)` *(failed)*');
 	});
 
+	it('does not open a CLEARED buffer with a stray join line', async () => {
+		// The toolbar's clear-all deliberately reaches an in-flight cell
+		// (`truncateActiveRunOutputs`), so the accumulator is reset out from under
+		// this run. The join bookkeeping must notice there is nothing left to join
+		// TO, or the fresh buffer opens with a bare `\` line that then persists.
+		const nb = makeNotebook('clear-then-tool.ipynb');
+		const { truncateActiveRunOutputs } = await import('../../src/lib/server/run-output-registry');
+		let cleared = false;
+		enginemod.__setChatEngineForTests({
+			async run({ onDelta, onToolCall }) {
+				onDelta('Before the clear.\n');
+				onToolCall?.({ name: 'Read', input: { file_path: 'src/a.py' }, outcome: 'ok' });
+				cleared = truncateActiveRunOutputs(nb, 'chatcell');
+				onToolCall?.({ name: 'Glob', input: { pattern: '*.py' }, outcome: 'ok' });
+				onDelta('After.');
+				return { ok: true, failure: null, engine: null, replyText: null };
+			}
+		});
+		const md0 = await replyMarkdown(nb);
+		expect(cleared).toBe(true); // the clear really landed on this run
+		expect(md0).toBe('> `Glob(*.py)`\n\nAfter.');
+		expect(md0.startsWith('\\')).toBe(false);
+		expect(md.render(md0)).toContain('<blockquote>'); // and it is still an annotation
+	});
+
+	it('does not open a CLEARED buffer with blank lines when the reply resumes', async () => {
+		const nb = makeNotebook('clear-then-text.ipynb');
+		const { truncateActiveRunOutputs } = await import('../../src/lib/server/run-output-registry');
+		let cleared = false;
+		enginemod.__setChatEngineForTests({
+			async run({ onDelta, onToolCall }) {
+				onToolCall?.({ name: 'Read', input: { file_path: 'src/a.py' }, outcome: 'ok' });
+				cleared = truncateActiveRunOutputs(nb, 'chatcell');
+				onDelta('After.');
+				return { ok: true, failure: null, engine: null, replyText: null };
+			}
+		});
+		const md0 = await replyMarkdown(nb);
+		expect(cleared).toBe(true);
+		expect(md0).toBe('After.');
+	});
+
 	it('a run that calls no tool is byte-for-byte what it was before', async () => {
 		const nb = makeNotebook('notools.ipynb');
 		enginemod.__setChatEngineForTests({
@@ -581,5 +649,132 @@ describe('the run glue', () => {
 			}
 		});
 		expect(await replyMarkdown(nb)).toBe('The value is **1**.');
+	});
+});
+
+// -- the reference frame, when the workspace has two spellings ---------------
+
+/**
+ * The frame a line measures against must be the frame the CHILD produced its
+ * paths in. The engine confines the child to - and cwds it into - the CANONICAL
+ * spelling of the workspace, while `CELLAR_WORKSPACE` holds the LEXICAL one, and
+ * a test whose two spellings coincide cannot see the difference (which is why
+ * this shipped measuring against the lexical root alone: on macOS every `/tmp`
+ * and `/var/folders` workspace differs, so an ordinary in-workspace read came
+ * out as `outside the workspace`, with no `(failed)` marker beside it because
+ * the call had succeeded).
+ *
+ * So this workspace is a real SYMLINK to a real directory: the two spellings
+ * differ on every platform, and that is asserted rather than assumed.
+ */
+describe('the reference frame a run measures paths against', () => {
+	let LINK: string; // the workspace as the launcher was pointed at it
+	let REAL: string; // the directory it actually names
+	let CANONICAL: string; // what the child's cwd - and its absolute paths - use
+	let holder: string;
+	let savedWs: string | undefined;
+	let nbmod: typeof import('../../src/lib/server/notebook');
+	let runmod: typeof import('../../src/lib/server/run');
+	let enginemod: typeof import('../../src/lib/server/chat/engine');
+	let authmod: typeof import('../../src/lib/server/chat/auth');
+	let activemod: typeof import('../../src/lib/server/chat/active');
+
+	beforeAll(async () => {
+		savedWs = process.env.CELLAR_WORKSPACE;
+		holder = mkdtempSync(join(tmpdir(), 'cellar-ws-link-'));
+		REAL = mkdtempSync(join(tmpdir(), 'cellar-ws-real-'));
+		LINK = join(holder, 'ws');
+		symlinkSync(REAL, LINK, 'dir');
+		CANONICAL = realpathSync(LINK);
+		process.env.CELLAR_WORKSPACE = LINK;
+		nbmod = await import('../../src/lib/server/notebook');
+		runmod = await import('../../src/lib/server/run');
+		enginemod = await import('../../src/lib/server/chat/engine');
+		authmod = await import('../../src/lib/server/chat/auth');
+		activemod = await import('../../src/lib/server/chat/active');
+		authmod.__setChatAuthForTests({ kind: 'slot', slot: 'test', account: { loggedIn: true } });
+	});
+	afterAll(() => {
+		process.env.CELLAR_WORKSPACE = savedWs;
+		rmSync(holder, { recursive: true, force: true });
+		rmSync(REAL, { recursive: true, force: true });
+	});
+	afterEach(() => {
+		enginemod.__setChatEngineForTests(null);
+		activemod.__resetChatRuns();
+	});
+
+	function makeNb(name: string): string {
+		const nb = join(LINK, name);
+		writeFileSync(
+			nb,
+			JSON.stringify({
+				cells: [
+					{
+						cell_type: 'code',
+						source: ['ask'],
+						metadata: { cellar: { language: 'chat' } },
+						outputs: [],
+						execution_count: null,
+						id: 'chatcell'
+					}
+				],
+				metadata: {},
+				nbformat: 4,
+				nbformat_minor: 5
+			})
+		);
+		nbmod.listCells(nb);
+		return nb;
+	}
+
+	async function replyFor(nb: string, filePath: string): Promise<string> {
+		enginemod.__setChatEngineForTests({
+			async run({ onDelta, onToolCall }) {
+				onToolCall?.({ name: 'Read', input: { file_path: filePath }, outcome: 'ok' });
+				onDelta('It defines `f`.');
+				return { ok: true, failure: null, engine: null, replyText: null };
+			}
+		});
+		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'ask' });
+		expect(res.status).toBe('ok');
+		const out = res.outputs[0] as { data: Record<string, string> };
+		return out.data['text/markdown'];
+	}
+
+	it('has two genuinely different spellings, or it proves nothing', () => {
+		expect(CANONICAL).not.toBe(LINK);
+		expect(realpathSync(join(LINK, '.'))).toBe(CANONICAL);
+	});
+
+	it('renders a CANONICAL-spelling in-workspace path as workspace-relative', async () => {
+		// What the CLI really hands the model: its cwd is the canonical root, so the
+		// absolute paths it forms are canonical too.
+		const md0 = await replyFor(makeNb('canonical.ipynb'), join(CANONICAL, 'src/a.py'));
+		expect(md0).toBe('> `Read(src/a.py)`\n\nIt defines `f`.');
+		expect(md0).not.toContain(OUTSIDE_WORKSPACE);
+		expect(md0).not.toContain(CANONICAL); // and the layout is still not leaked
+	});
+
+	it('renders a LEXICAL-spelling in-workspace path as workspace-relative', async () => {
+		const md0 = await replyFor(makeNb('lexical.ipynb'), join(LINK, 'src/a.py'));
+		expect(md0).toBe('> `Read(src/a.py)`\n\nIt defines `f`.');
+	});
+
+	it('renders the workspace ROOT itself as `.` in either spelling', async () => {
+		expect(await replyFor(makeNb('root-canonical.ipynb'), CANONICAL)).toContain('`Read(.)`');
+		expect(await replyFor(makeNb('root-lexical.ipynb'), `${LINK}/`)).toContain('`Read(.)`');
+	});
+
+	it('still NAMES a genuinely outside path rather than printing it', async () => {
+		const md0 = await replyFor(makeNb('outside.ipynb'), '/etc/passwd');
+		expect(md0).toContain(`\`Read(${OUTSIDE_WORKSPACE})\``);
+		expect(md0).not.toContain('passwd');
+	});
+
+	it('does not read a sibling of the canonical root as inside the workspace', async () => {
+		const md0 = await replyFor(makeNb('sibling.ipynb'), `${CANONICAL}2/x.py`);
+		expect(md0).toContain(`\`Read(${OUTSIDE_WORKSPACE})\``);
+		expect(md0).not.toContain('x.py');
 	});
 });
