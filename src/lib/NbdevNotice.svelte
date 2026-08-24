@@ -57,19 +57,26 @@
 		}
 	}
 
+	// The mount read is deliberately SKIPPED: SSR already delivered this state, so
+	// re-asking on every page load would spend a walk-up and a TOML scan for a
+	// feature that applies to almost no workspace. Only a CHANGE re-reads.
+	let seeded = false;
 	$effect(() => {
 		fsRefreshSignal; // track
+		if (!seeded) {
+			seeded = true;
+			return;
+		}
 		reload();
 	});
 
 	$effect(() => {
 		const onFocus = () => reload();
 		window.addEventListener('focus', onFocus);
-		return () => {
-			window.removeEventListener('focus', onFocus);
-			clearTimeout(copyTimer);
-		};
+		return () => window.removeEventListener('focus', onFocus);
 	});
+
+	$effect(() => () => clearTimeout(copyTimer));
 
 	async function protect() {
 		if (busy) return;

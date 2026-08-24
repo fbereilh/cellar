@@ -126,10 +126,13 @@ type Located = { path: string; text: string; doc: ReturnType<typeof parseTomlDoc
  * `_has_nbdev`, which returns False for anything it cannot read.
  */
 function classifyPyproject(path: string): NbdevState | Located | 'skip' {
-	const { text, error } = readText(path);
-	if (text === null) {
-		return { kind: 'unreadable', path, reason: error ?? 'could not be read' };
-	}
+	const { text } = readText(path);
+	// A file we cannot open at all gives no evidence that this is nbdev's project,
+	// so it is SKIPPED rather than reported - exactly what nbdev's own `_has_nbdev`
+	// does with a read it cannot make. Reporting it would nag a user whose broken
+	// `pyproject.toml` has nothing to do with nbdev. The failure that DOES matter is
+	// at write time, where `protectCellarMetadata` reports it and changes nothing.
+	if (text === null) return 'skip';
 	const doc = parseTomlDoc(text);
 	if (doc.malformed) {
 		if (!PYPROJECT_NBDEV_SIGNAL.test(text)) return 'skip';

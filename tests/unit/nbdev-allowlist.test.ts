@@ -129,6 +129,26 @@ describe('detectNbdev', () => {
 		expect(detectNbdev(WS)).toMatchObject({ kind: 'unreadable', path: PY() });
 	});
 
+	// A broken pyproject that never mentions nbdev is none of Cellar's business -
+	// exactly what nbdev's own `_has_nbdev` concludes, since it swallows the parse
+	// error and walks on.
+	it('says nothing about an unparseable pyproject that is not nbdev’s', () => {
+		write(PY(), '[project]\nname = "demo\n');
+		expect(detectNbdev(WS)).toEqual({ kind: 'none' });
+	});
+
+	// No evidence it is nbdev's at all, so silence rather than a nag. The failure
+	// that matters is at WRITE time, where it is reported and nothing is changed.
+	it('says nothing about a pyproject it cannot open', () => {
+		write(PY(), BASE);
+		chmodSync(PY(), 0o000);
+		try {
+			expect(detectNbdev(WS)).toEqual({ kind: 'none' });
+		} finally {
+			chmodSync(PY(), 0o600);
+		}
+	});
+
 	// Deliberately narrower than nbdev, which raises on ANY settings.ini it meets
 	// while looking for a project: a bare `settings.ini` is an ordinary configparser
 	// filename, and telling a user who never touched nbdev that their project is
