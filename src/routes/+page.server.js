@@ -4,6 +4,7 @@ import { harnessState, isHarnessAllowed, mcpJsonHarnessNames, mcpConfigDisabled 
 import { getUiState } from '$lib/server/ui-state';
 import { getUserSettings } from '$lib/server/user-settings';
 import { parseMaxKernels } from '$lib/kernelCap';
+import { detectNbdev } from '$lib/server/nbdev';
 
 /**
  * The two INDEPENDENT facts the "Connect an agent" panel needs about Claude Code,
@@ -70,6 +71,11 @@ export function load() {
 		// sibling of `uiState`, delivered the same way and for the same reason. It holds
 		// DEFAULTS a project inherits only when it has no answer of its own.
 		userSettings: getUserSettings(),
+		// Is this an nbdev project whose `pyproject.toml` lets nbdev's cleanup erase
+		// Cellar's `metadata.cellar` namespace? Detect-and-offer only: the sidebar
+		// says what is at risk and what the remedy is, and writes nothing until the
+		// user asks. `detectNbdev` never throws, so SSR is safe.
+		nbdev: detectNbdev(),
 		mcp: {
 			port: mcpPort,
 			url: `http://127.0.0.1:${mcpPort}/mcp`,
