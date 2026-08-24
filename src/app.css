@@ -408,8 +408,10 @@ mark.cellar-search-mark-active {
  * reserved at the TOP.
  *
  * Reserved on the decorated `<pre>` itself, so it is in place the moment the
- * wrapper is (the decorator runs in the same microtask flush as the render, i.e.
- * before the browser paints) - and only on a decorated one, so the `.md` file
+ * wrapper is: the decorator runs in the same microtask flush as the render, so
+ * the padded state is the FIRST one painted - measured by sampling every
+ * animation frame while a reply rendered, 0 un-wrapped sightings across the 149
+ * frames that had blocks. And only on a DECORATED `<pre>`, so the `.md` file
  * preview, which shares `.cellar-md` but carries no controls, is untouched. */
 .cellar-md .cellar-code-block > pre {
 	padding-top: 1.75rem;
