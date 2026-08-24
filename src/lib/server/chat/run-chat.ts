@@ -16,6 +16,39 @@
  * The finalize reads the accumulator's SURVIVING text, so a mid-run "clear
  * outputs" behaves exactly as it does for a kernel cell: pre-clear reply text
  * is gone for good, only what streamed after the clear persists.
+ *
+ * ## Tool-activity lines ride the SAME stream as the reply
+ *
+ * A tool call the model makes is annotated with one compact line (`tool-lines.ts`
+ * owns what it may say), pushed into the accumulator as markdown text between
+ * the reply deltas either side of it. That is the whole mechanism, and it is
+ * chosen for what it makes free rather than for tidiness: the lines stream in
+ * order through the rail every tab already understands, fold into the ONE
+ * finalized markdown output, and therefore persist, round-trip through the
+ * `.ipynb` and reach the HTML export with no second path anywhere. (Cellar's
+ * `.py` notebook formats carry no outputs at all, so neither the reply nor its
+ * lines reach them - nothing to decide there.)
+ *
+ * Emitting them as their own OUTPUT elements was the alternative and it does not
+ * work: the finalize collapses to `outputs = [reply]` and republishes index 0,
+ * with no retract frame for anything else - the same reason a capped run skips
+ * the finalize entirely - so tool outputs would either be orphaned on every
+ * client or block the finalize and leave the whole reply as unrendered
+ * monospace text.
+ *
+ * `pushText`/`pushToolLine` own the JOINS, and they are load-bearing rather than
+ * cosmetic. A blockquote swallows the line that follows it (markdown's lazy
+ * continuation), so resumed reply text must be separated by a blank line or it
+ * becomes part of the annotation. And consecutive lines join with a backslash
+ * hard break so a burst of calls renders as ONE dim block of short lines rather
+ * than a stack of separately-bordered ones; the engine renders `breaks: false`,
+ * so a bare newline there would run them together on one line instead.
+ *
+ * Every call is shown, none is summarised away: a harness shows every call, the
+ * file paths ARE the provenance a chatty run most needs, each line is bounded to
+ * one short line, and a tall output is already contracted to a scroll box by the
+ * scrollable-outputs rule - so a cap would only lose provenance for exactly the
+ * runs that depend on it, and the accumulator's own byte cap is the backstop.
  */
 
 import { statSync } from 'node:fs';
@@ -24,6 +57,7 @@ import { workspaceRoot } from '../fstree';
 import { listCells } from '../notebook';
 import type { OutputAccumulator } from '../output-accumulator';
 import type { CellOutput } from '../types';
+import { toolCallLine } from './tool-lines';
 import {
 	CHAT_MODEL_KEY,
 	CHAT_OTHER_NOTEBOOKS_KEY,
@@ -114,6 +148,30 @@ export async function executeChatRun({
 			return { status: 'error' };
 		}
 		let sawDelta = false;
+		// What the accumulator last received, so the two pushers below can put the
+		// right JOIN between them (see the header). `none` is the very start, where
+		// no separator belongs at all.
+		let last: 'none' | 'text' | 'tool' = 'none';
+		const emit = (text: string) => acc.push({ output_type: 'stream', name: 'stdout', text });
+		const pushText = (text: string) => {
+			// A blockquote lazily swallows the line under it, so reply text resuming
+			// after an annotation needs a blank line or it becomes part of it.
+			if (last === 'tool') emit('\n\n');
+			emit(text);
+			last = 'text';
+		};
+		const pushToolLine = (line: string) => {
+			if (last === 'text') emit('\n\n');
+			// A backslash hard break keeps consecutive annotations in ONE blockquote,
+			// one per rendered line; a bare newline would run them together, since the
+			// reply engine renders with `breaks: false`.
+			else if (last === 'tool') emit('\\\n');
+			emit(`> ${line}`);
+			last = 'tool';
+		};
+		// The workspace is read ONCE per run: it is the root every rendered path is
+		// made relative to, and it cannot move mid-run.
+		const workspace = workspaceRoot();
 		// The engine's capability inputs, read from the person-scoped store at run
 		// time (the `auth.ts` CHAT_SLOT_KEY pattern) through the shared gates: the
 		// model is constrained to the known set BEFORE it rides the seam (and the
@@ -143,14 +201,26 @@ export async function executeChatRun({
 			onDelta: (text) => {
 				if (!text) return;
 				sawDelta = true;
-				acc.push({ output_type: 'stream', name: 'stdout', text });
+				pushText(text);
+			},
+			onToolCall: (call) => {
+				// One line per call, at the moment its outcome is known, so it lands
+				// between the reply text either side of it rather than being batched at
+				// the end. `toolCallLine` is a pure function of the CALL - a result
+				// string has no path here.
+				//
+				// Deliberately does NOT set `sawDelta`: that flag means the reply TEXT
+				// streamed, and it is what decides whether the engine's own final
+				// `replyText` still has to be landed. A tool line satisfying it would
+				// drop the entire reply of a CLI build that streams no text deltas.
+				pushToolLine(toolCallLine(call, workspace));
 			}
 		});
 		if (res.ok) {
 			// A run that streamed nothing but reported a reply (defensive: a CLI
 			// build without partial messages) still lands its text.
 			if (!sawDelta && res.replyText) {
-				acc.push({ output_type: 'stream', name: 'stdout', text: res.replyText });
+				pushText(res.replyText);
 			}
 			return { status: 'ok' };
 		}

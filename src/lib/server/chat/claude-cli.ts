@@ -197,6 +197,11 @@
  *   the requested tool and nothing else; probed rather than assumed, and committed
  *   as the SEARCH_INIT fixture beside SAFE_INIT in the unit test)
  *   {type:'stream_event',event:{type:'content_block_delta',delta:{type:'text_delta',text:'...'}}}
+ *   {type:'assistant',message:{content:[{type:'tool_use',id,name,input},...]}}
+ *   {type:'user',message:{content:[{type:'tool_result',tool_use_id,is_error?,content},...]}}
+ *   (the tool-activity pair, probed against claude 2.1.241 and committed verbatim
+ *   as tests/unit/fixtures/chat-cli-*.ndjson; `ChatToolTracker` pairs them and
+ *   reads NOTHING off a result but its id and `is_error` - see tool-lines.ts)
  *   {type:'rate_limit_event',rate_limit_info:{status:'allowed'|...,resetsAt:<epoch-sec>,...}}
  *   {type:'result',subtype:'success',is_error:false,result:'...',...}
  *
@@ -212,6 +217,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { normalizeChatModel } from '$lib/chatCell';
 import { chatChildEnv, CLAUDE_BIN } from './env';
 import type { ChatEngine, ChatEngineFailure, ChatEngineResult, ChatEngineRunArgs } from './engine';
+import { ChatToolTracker } from './tool-lines';
 
 /**
  * The one tool a search-on run requests, spelled exactly as the CLI reports it
@@ -1080,7 +1086,18 @@ export const claudeCliEngine: ChatEngine = {
 	}
 };
 
-function runOnce({ prompt, configDir, model, webSearch, readRoot, notebookPath, otherNotebooks, signal, onDelta }: ChatEngineRunArgs): Promise<ChatEngineResult> {
+function runOnce({
+	prompt,
+	configDir,
+	model,
+	webSearch,
+	readRoot,
+	notebookPath,
+	otherNotebooks,
+	signal,
+	onDelta,
+	onToolCall
+}: ChatEngineRunArgs): Promise<ChatEngineResult> {
 	return new Promise((settleRun) => {
 		if (signal.aborted) {
 			settleRun(fail({ kind: 'cancelled', message: 'interrupted' }, null));
@@ -1123,10 +1140,20 @@ function runOnce({ prompt, configDir, model, webSearch, readRoot, notebookPath, 
 		let rateLimit: RateLimitInfo | null = null;
 		let stderrTail = '';
 		let settled = false;
+		// Pairs tool_use blocks with the tool_result blocks answering them; reports
+		// each call once, and at settle reports any the run never got a result for.
+		const tools = new ChatToolTracker();
 
 		const settle = (value: ChatEngineResult) => {
 			if (settled) return;
 			settled = true;
+			// A call whose result never arrived (a stop or a timeout landing while the
+			// search/read itself ran) is still reported, once, so the reply does not
+			// silently omit a tool that ran. Held to the same `unsafe` gate as every
+			// other report from this session.
+			if (!unsafe) {
+				for (const call of tools.flush()) onToolCall?.(call);
+			}
 			cleanup();
 			settleRun(value);
 		};
@@ -1219,6 +1246,17 @@ function runOnce({ prompt, configDir, model, webSearch, readRoot, notebookPath, 
 					if (inner?.type !== 'content_block_delta') return;
 					const delta = inner.delta as Record<string, unknown> | undefined;
 					if (delta?.type === 'text_delta' && typeof delta.text === 'string') onDelta(delta.text);
+					return;
+				}
+				case 'assistant':
+				case 'user': {
+					// Tool activity. Same gate as a delta: a condemned or unverified
+					// session reports nothing, because a tool line is a claim about what
+					// the run did and an unverified session cannot support one. The
+					// tracker reads `is_error` off a result and DISCARDS its content -
+					// see tool-lines.ts.
+					if (unsafe || !sawInit) return;
+					for (const call of tools.observe(e)) onToolCall?.(call);
 					return;
 				}
 				case 'rate_limit_event': {
