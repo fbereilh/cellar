@@ -219,10 +219,37 @@ function emitJson(value: unknown, depth: number, out: string[]): boolean {
  * because Cellar wrote `cell_type, id, metadata, source, outputs, execution_count`
  * where everything else writes them alphabetically.
  *
- * The output is byte-identical to `json.dumps(obj, sort_keys=True, indent=1,
- * ensure_ascii=False)` for every JSON value a notebook can hold - including an
- * object keyed by numeric strings, which is why this writes the text itself
- * instead of leaning on a `JSON.stringify` replacer (see `emitJson`).
+ * WHAT IS AND IS NOT BYTE-IDENTICAL TO PYTHON, stated exactly, because the whole
+ * point of this change is that a notebook touched by both writers stops churning
+ * and a wider claim would send the next person hunting a regression that is not
+ * here. KEY ORDER - the property that was churning 100% of the lines - matches
+ * unconditionally and recursively, an object keyed by numeric strings included,
+ * which is why this writes the text itself instead of leaning on a
+ * `JSON.stringify` replacer (see `emitJson`). So do string escaping and unicode
+ * (`ensure_ascii=False`'s literal characters), the 1-space indent, the trailing
+ * newline, array order, and empty containers.
+ *
+ * NUMBER FORMATTING is the one stated residual: primitives go through
+ * `JSON.stringify`, so numbers are spelled by ECMAScript's rule, not Python's
+ * `repr`. Measured divergences, and whether an alternating Cellar/Jupyter save
+ * settles them:
+ *   - CONVERGES after Cellar's first save (Python re-reads Cellar's spelling and
+ *     keeps it, so this folds into the one-time reformat below): an integral float
+ *     `1.0` -> `1`, a negative zero `-0.0` -> `0`, a value written in exponent form
+ *     that is integral `1e16` -> `10000000000000000`.
+ *   - ALTERNATES forever, one line per such number: a float the two writers spell
+ *     with different notation, because JS goes exponential below `1e-6` while
+ *     Python does so below `1e-4` (`1e-5` -> JS `0.00001`, Python `1e-05`), or with
+ *     a differently padded exponent, Python zero-padding a single digit (`1e-7` ->
+ *     JS `1e-7`, Python `1e-07`; two digits and longer already agree).
+ * This is NOT fixable here and is deliberately not chased: `JSON.parse` erases the
+ * source lexeme (`1.0` is already the number 1 by the time this sees it), so
+ * matching Python would mean reimplementing its float `repr` - a large, risky
+ * change for a cosmetic one, both spellings being valid JSON. Cellar's OWN
+ * determinism and idempotence are unaffected: this emitter is a pure function of
+ * the value it is handed. Separately and upstream of this function, `JSON.parse`
+ * also rounds an integer past 2^53 (pre-existing, true of every read/write cycle
+ * Cellar has ever done, and not a property of the emitter).
  *
  * ONE-TIME COST: this reformats every existing notebook on its next save - a pure
  * key reordering with no semantic change, moving the file toward the ecosystem

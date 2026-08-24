@@ -51,6 +51,19 @@ function pythonWrites(obj: unknown): string {
 	);
 }
 
+/**
+ * What python writes when it re-reads RAW JSON TEXT - the on-disk path, and the
+ * only way to observe a number whose source lexeme `JSON.stringify` would erase
+ * before python ever saw it (`1.0` is already the number 1 in JS).
+ */
+function pythonRewrites(text: string): string {
+	return execFileSync(
+		'python3',
+		['-c', 'import json,sys; print(json.dumps(json.loads(sys.stdin.read()), sort_keys=True, indent=1, ensure_ascii=False))'],
+		{ input: text, encoding: 'utf8' }
+	);
+}
+
 describe('stringify — sorted keys (the ecosystem convention)', () => {
 	it('sorts keys recursively, through arrays and nested objects', () => {
 		const out = stringify({ z: 1, a: { d: 4, b: [{ y: 1, x: 2 }] } });
@@ -123,11 +136,25 @@ describe('stringify — sorted keys (the ecosystem convention)', () => {
 	// any ordinary payload (`display(JSON({"2020": …}))`, a `to_dict()` over an
 	// integer index), so the residual would keep churning the very files sorting
 	// exists to stop churning.
-	it.skipIf(!HAS_PY)('sorts numeric-string keys AS STRINGS, exactly as python does', () => {
+	// UNGATED ON PURPOSE. This is the entire reason `emitJson` exists rather than a
+	// `JSON.stringify` replacer, so it must be asserted everywhere the unit suite
+	// runs - which is CI and the no-mistakes gate. Behind `skipIf(!HAS_PY)` a
+	// python-less machine reported green with the rule unasserted.
+	it('sorts numeric-string keys AS STRINGS, not in JS property order', () => {
 		const nb = { '10': 1, '2': 2, a: 3 };
-		expect(stringify(nb)).toBe(pythonWrites(nb));
-		// Spelled out, so the intent survives a rewrite of the harness above.
+		// A replacer emits `2, 10, a` here; python (and this) emit `10, 2, a`.
 		expect(stringify(nb)).toBe(['{', ' "10": 1,', ' "2": 2,', ' "a": 3', '}', ''].join('\n'));
+	});
+
+	// UNGATED for the same reason: the code-point rule is what makes an above-BMP
+	// key land where python puts it, and JS's default `.sort()` gets it backwards.
+	it('sorts keys ABOVE the BMP by code point, not by UTF-16 code unit', () => {
+		const nb = { '\u{1F600}': 1, '\uFFFD': 2, a: 3 };
+		// Code points: a (U+0061) < U+FFFD < U+1F600. By code UNIT the surrogate
+		// pair (0xD83D…) would sort BEFORE U+FFFD, i.e. the opposite.
+		expect(stringify(nb)).toBe(
+			['{', ' "a": 3,', ' "\uFFFD": 2,', ' "\u{1F600}": 1', '}', ''].join('\n')
+		);
 	});
 
 	it.skipIf(!HAS_PY)('matches python on a nested OUTPUT payload keyed by numeric strings', () => {
@@ -178,11 +205,67 @@ describe('stringify — sorted keys (the ecosystem convention)', () => {
 		expect(stringify(nb)).toBe(pythonWrites(nb));
 	});
 
-	it.skipIf(!HAS_PY)('sorts keys ABOVE the BMP by code point, as python does', () => {
-		// UTF-16 code-unit order (JS's default `.sort()`) puts a surrogate pair BEFORE
-		// U+E000-U+FFFF; python compares code points, which is the opposite.
-		const nb = { '\u{1F600}': 1, '\uFFFD': 2, a: 3 };
-		expect(stringify(nb)).toBe(pythonWrites(nb));
+	it.skipIf(!HAS_PY)('agrees with python on above-BMP key order', () => {
+		expect(stringify({ '\u{1F600}': 1, '\uFFFD': 2, a: 3 })).toBe(
+			pythonWrites({ '\u{1F600}': 1, '\uFFFD': 2, a: 3 })
+		);
+	});
+
+	it.skipIf(!HAS_PY)('agrees with python on numeric-string key order', () => {
+		expect(stringify({ '10': 1, '2': 2, a: 3 })).toBe(pythonWrites({ '10': 1, '2': 2, a: 3 }));
+	});
+});
+
+/**
+ * NUMBER FORMATTING — the ONE stated divergence from python, pinned as
+ * known-and-accepted so it cannot silently change meaning later.
+ *
+ * `emitJson` delegates primitives to `JSON.stringify`, so numbers are spelled by
+ * ECMAScript's rule rather than python's `repr`. Chasing byte-equality would mean
+ * reimplementing that `repr` - a large, risky change for a cosmetic difference
+ * between two valid JSON spellings, and impossible from the value alone anyway
+ * (`JSON.parse` erases `1.0` to the number 1 before this is reached). What these
+ * pin instead is the BOUND: which spellings settle after one save and which keep
+ * flipping, so a future reader measuring residual churn is not sent hunting an
+ * emitter regression that is not there.
+ */
+describe('number formatting — the stated residual', () => {
+	it('spells numbers by the ECMAScript rule, deterministically', () => {
+		// The source lexeme is already gone by the time `stringify` sees the value.
+		expect(stringify(JSON.parse('{"a": 1.0}'))).toBe(['{', ' "a": 1', '}', ''].join('\n'));
+		expect(stringify(JSON.parse('{"a": -0.0}'))).toBe(['{', ' "a": 0', '}', ''].join('\n'));
+		expect(stringify(JSON.parse('{"a": 1e16}'))).toBe(['{', ' "a": 10000000000000000', '}', ''].join('\n'));
+		expect(stringify({ a: 1e-5 })).toBe(['{', ' "a": 0.00001', '}', ''].join('\n'));
+		expect(stringify({ a: 1e-7 })).toBe(['{', ' "a": 1e-7', '}', ''].join('\n'));
+		// Cellar's own contract is untouched: a pure function of the value handed in.
+		for (const v of [1.0, -0.0, 1e16, 1e-5, 1e-7]) {
+			const once = stringify({ a: v });
+			expect(stringify({ a: v })).toBe(once);
+			expect(stringify(JSON.parse(once))).toBe(once);
+		}
+	});
+
+	it.skipIf(!HAS_PY)('CONVERGES with python after one save for an integral float, a negative zero and an integral exponent', () => {
+		// Cellar writes its spelling once; python re-reads THAT and keeps it, so these
+		// fold into the one-time reformat sorted keys already cause.
+		for (const raw of ['{"a": 1.0}', '{"a": -0.0}', '{"a": 1e16}']) {
+			const cellar = stringify(JSON.parse(raw));
+			expect(cellar).not.toBe(pythonRewrites(raw)); // they differ on the first save…
+			expect(pythonRewrites(cellar)).toBe(cellar); // …and agree from then on.
+		}
+	});
+
+	it.skipIf(!HAS_PY)('ALTERNATES with python forever for a float the two writers spell differently', () => {
+		// JS goes exponential below 1e-6, python below 1e-4; and python zero-pads a
+		// single-digit exponent. Both flip back and forth on alternating saves.
+		for (const value of [1e-5, 1e-7]) {
+			const cellar = stringify({ a: value });
+			const py = pythonRewrites(cellar);
+			expect(py).not.toBe(cellar);
+			expect(stringify(JSON.parse(py))).toBe(cellar); // back to Cellar's spelling
+		}
+		// Two-digit and longer exponents already agree, so the flip is bounded.
+		expect(pythonRewrites(stringify({ a: 1e-10 }))).toBe(stringify({ a: 1e-10 }));
 	});
 });
 
