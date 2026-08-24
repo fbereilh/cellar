@@ -62,16 +62,31 @@ follows directly from that:
   run checks the CLI's own startup report against exactly the capabilities that
   run asked for and kills it on any mismatch, in either direction: a session
   reporting anything the run did not request, and a session missing something it
-  did, both stop the run and discard its reply. The one capability you can add is
-  **Settings → Chat cells → Allow web search** (off until you turn it on, and
-  per-user rather than per-project): with it on a reply may also run web searches,
-  which means search queries derived from your notebook's content reach the search
-  service. It is search only - never arbitrary URL fetching, code execution, or
-  file access - and it widens nothing else here: MCP servers and slash commands
-  stay off, and the same startup check still runs, now requiring exactly that one
-  tool. The child's environment is stripped of every `ANTHROPIC*`/`CLAUDE*`
-  variable so an inherited key cannot silently bill or route elsewhere than the
-  account the sidebar shows.
+  did, both stop the run and discard its reply. The capabilities you can add live
+  under **Settings → Chat cells**, each off until you turn it on and per-user
+  rather than per-project, and each widening the session in one direction only:
+  **Allow web search** lets a reply run web searches, so search queries derived
+  from your notebook's content reach the search service - search only, never
+  arbitrary URL fetching; **Allow reading workspace files** lets a reply read,
+  glob and grep files, and is **confined to the workspace folder** by a
+  path-scoped permission grant, so a path outside it is refused by the CLI itself,
+  including one reaching out through `..` or a symlink. Reading is read-only:
+  never writing, editing, or running code. The notebook you are chatting in is
+  never readable as a file, and neither are the copies Cellar writes beside it
+  under its own name (its "Save as .py", its exported `.html`, its checkpoint
+  copy) nor Cellar's own `.cellar` folder, which holds snapshots of your cells -
+  so the cells you hid from AI are not reachable through any of those. An export
+  you deliberately wrote elsewhere is an ordinary workspace file and reads like
+  one. The workspace's other `.ipynb` notebooks stay unreadable too unless you
+  separately turn on **Allow reading other notebooks** (their exported copies, and
+  any jupytext `.py` notebook, are ordinary workspace files either way); if you
+  keep secrets in the workspace, leave reads off, especially with web search also
+  on.
+  Nothing else widens: MCP servers and slash commands stay off, no settings files
+  are loaded from disk, and the same startup check still runs, now requiring
+  exactly the capabilities that run asked for. The child's environment is stripped
+  of every `ANTHROPIC*`/`CLAUDE*` variable so an inherited key cannot silently
+  bill or route elsewhere than the account the sidebar shows.
   The reply comes back **untrusted**: it is rendered as sanitized markdown, never
   HTML, and an image in any machine-written markdown output is shown as text
   rather than fetched, so a reply steered by a prompt-injecting cell cannot make

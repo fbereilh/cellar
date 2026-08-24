@@ -14,4 +14,3 @@ export async function GET({ url }) {
 	const [resolution, slots] = await Promise.all([resolveChatAuth(), listChatSlots()]);
 	return json({ resolution, slots });
 }
-
