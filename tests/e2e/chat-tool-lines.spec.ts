@@ -36,6 +36,9 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
 const CHAT_ID = 'chatcell0';
 const QUESTION = 'What is the current stable Node.js?';
 const FIXTURE = join(import.meta.dirname, '..', 'unit', 'fixtures', 'chat-cli-websearch.ndjson');
+const FILE_FIXTURE = join(import.meta.dirname, '..', 'unit', 'fixtures', 'chat-cli-file-tools.ndjson');
+/** The workspace the file-tools capture ran in - its absolute paths are rooted there. */
+const FILE_FIXTURE_WS = '/tmp/cellar-chat-tools-probe';
 
 /** The search the fixture really made - what the first line must name. */
 const REAL_QUERY = 'Node.js current stable version';
@@ -54,6 +57,10 @@ const RESULT_ONLY = ['v26.5.1', 'Direct Links', 'RisingStack Engineering', 'npm 
 let launcher: ChildProcess | null = null;
 let workspace = '';
 let baseURL = '';
+/** A SECOND instance, with workspace READS on rather than web search. */
+let readsLauncher: ChildProcess | null = null;
+let readsWorkspace = '';
+let readsURL = '';
 
 const cellBy = (page: Page, id: string) => page.locator(`[data-testid="cell"][data-cell-id="${id}"]`);
 
@@ -70,8 +77,8 @@ function watchErrors(page: Page): string[] {
 const mimeText = (v: unknown) => (Array.isArray(v) ? v.join('') : typeof v === 'string' ? v : '');
 
 /** The chat cell's persisted markdown, straight off disk. */
-function diskReply(name: string): string {
-	const doc = JSON.parse(readFileSync(join(workspace, name), 'utf8')) as { cells: Record<string, unknown>[] };
+function diskReply(name: string, ws = workspace): string {
+	const doc = JSON.parse(readFileSync(join(ws, name), 'utf8')) as { cells: Record<string, unknown>[] };
 	const cell = doc.cells.find((c) => c.id === CHAT_ID) as { outputs?: Record<string, unknown>[] } | undefined;
 	const out = cell?.outputs?.[0]?.data as Record<string, unknown> | undefined;
 	return mimeText(out?.['text/markdown']);
@@ -167,9 +174,81 @@ function installStubClaude(ws: string): void {
 	chmodSync(bin, 0o755);
 }
 
-function seedNotebook(name: string): void {
+/**
+ * The file-tools capture, re-rooted at THIS run's workspace.
+ *
+ * The events are the real ones and the substitution is one directory string for
+ * another - which is the whole point: the capture's `Read` calls carry ABSOLUTE
+ * paths, so re-rooting them is what lets the browser prove the workspace-relative
+ * rendering on real input instead of a hand-written path. One synthesized read of
+ * `/etc/passwd` is appended, because a path OUTSIDE the workspace is the other
+ * half of that rule and no in-workspace capture can contain one.
+ */
+function fileStubStream(ws: string): string {
+	const real = readFileSync(FILE_FIXTURE, 'utf8').split('\n').filter((l) => l.trim());
+	expectIndex(real.findIndex((l) => l.includes(FILE_FIXTURE_WS)), 'the file fixture carries absolute paths');
+	const rerooted = real.map((l) => l.split(FILE_FIXTURE_WS).join(ws));
+	const resultAt = rerooted.findIndex((l) => l.includes('"type":"result"'));
+	expectIndex(resultAt, 'the file fixture ends with a result');
+	const outside = [
+		JSON.stringify({
+			type: 'assistant',
+			message: { content: [{ type: 'tool_use', id: 'toolu_stub_outside', name: 'Read', input: { file_path: '/etc/passwd' } }] }
+		}),
+		JSON.stringify({
+			type: 'user',
+			message: {
+				content: [
+					{
+						tool_use_id: 'toolu_stub_outside',
+						type: 'tool_result',
+						is_error: true,
+						content: 'Claude requested permissions to read from /etc/passwd, but you have not granted it yet.'
+					}
+				]
+			}
+		})
+	];
+	return [...rerooted.slice(0, resultAt), ...outside, ...rerooted.slice(resultAt)].join('\n');
+}
+
+/** The stub for the READS shape: its init must report exactly the read tools. */
+function installReadsStubClaude(ws: string): void {
+	const shim = join(ws, '.shim');
+	mkdirSync(shim, { recursive: true });
+	const stream = join(ws, 'stub-stream.ndjson');
+	writeFileSync(stream, `${fileStubStream(ws)}\n`);
+	const init = JSON.stringify({
+		type: 'system',
+		subtype: 'init',
+		tools: ['Read', 'Glob', 'Grep'],
+		mcp_servers: [],
+		slash_commands: [],
+		skills: [],
+		claude_code_version: '2.1.241-stub'
+	});
+	const bin = join(shim, 'claude');
 	writeFileSync(
-		join(workspace, name),
+		bin,
+		[
+			'#!/bin/sh',
+			'if [ "$1" = "auth" ]; then',
+			`  echo '{"loggedIn":true,"authMethod":"claude.ai","email":"stub@example.com"}'`,
+			'  exit 0',
+			'fi',
+			'cat > /dev/null',
+			`echo '${init}'`,
+			`cat '${stream}'`,
+			'exit 0',
+			''
+		].join('\n')
+	);
+	chmodSync(bin, 0o755);
+}
+
+function seedNotebook(name: string, ws = workspace): void {
+	writeFileSync(
+		join(ws, name),
 		JSON.stringify(
 			{
 				cells: [
@@ -192,9 +271,9 @@ function seedNotebook(name: string): void {
 	);
 }
 
-async function openFresh(page: Page, name: string): Promise<string> {
-	seedNotebook(name);
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+async function openFresh(page: Page, name: string, ws = workspace, url = baseURL): Promise<string> {
+	seedNotebook(name, ws);
+	await page.goto(`${url}/?ws=${encodeURIComponent(ws)}`);
 	await page.locator(`[data-testid="tree-file"][data-path="${name}"]`).click();
 	await expect(cellBy(page, CHAT_ID)).toBeVisible({ timeout: 30_000 });
 	return name;
@@ -211,14 +290,30 @@ test.beforeAll(async () => {
 	const booted = await bootCellar(workspace, { CELLAR_CHAT_SLOTS: join(workspace, 'chat-slots') });
 	launcher = booted.proc;
 	baseURL = booted.url;
+
+	// The reads shape gets its OWN instance: the capability is a person-scoped
+	// setting the engine reads at run time, and the stub's init has to report the
+	// tool set THAT run requests, so one workspace cannot serve both.
+	readsWorkspace = mkdtempSync(join(tmpdir(), 'cellar-tool-lines-reads-'));
+	installReadsStubClaude(readsWorkspace);
+	mkdirSync(join(readsWorkspace, '.cellar'), { recursive: true });
+	writeFileSync(
+		join(readsWorkspace, '.cellar', 'user-settings.json'),
+		JSON.stringify({ 'cellar-chat-workspace-reads': true })
+	);
+	const bootedReads = await bootCellar(readsWorkspace, { CELLAR_CHAT_SLOTS: join(readsWorkspace, 'chat-slots') });
+	readsLauncher = bootedReads.proc;
+	readsURL = bootedReads.url;
 });
 
 test.afterAll(() => {
-	if (launcher) killCellar(launcher);
+	for (const proc of [launcher, readsLauncher]) if (proc) killCellar(proc);
 	launcher = null;
-	if (workspace && existsSync(workspace)) {
+	readsLauncher = null;
+	for (const ws of [workspace, readsWorkspace]) {
+		if (!ws || !existsSync(ws)) continue;
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			rmSync(ws, { recursive: true, force: true });
 		} catch {
 			/* best effort */
 		}
@@ -319,6 +414,54 @@ test('the annotations are subordinate to the answer, and survive a reload', asyn
 	await expect(reopened).toContainText('(failed)');
 	await expect(reopened).toContainText(`WebSearch(${LATE_QUERY})`);
 	await expect(reopened.locator('blockquote')).toHaveCount(2);
+
+	expect(errors).toEqual([]);
+});
+
+test('a workspace read shows the tool and the workspace-relative path, and never an outside one', async ({ page }) => {
+	test.setTimeout(180_000);
+	const errors = watchErrors(page);
+	const nb = await openFresh(page, 'reads.ipynb', readsWorkspace, readsURL);
+	const chat = cellBy(page, CHAT_ID);
+	await chat.getByTestId('run').click();
+
+	const reply = chat.getByTestId('output-markdown');
+	await expect(reply).toBeVisible({ timeout: 120_000 });
+	await expect(reply).toContainText('Read(src/lib/loader.py)', { timeout: 60_000 });
+
+	const rendered = await reply.innerText();
+	// The capture's calls carried ABSOLUTE paths under this workspace; every one
+	// reads workspace-relative, and the absolute prefix appears nowhere.
+	expect(rendered).toContain('Read(src/lib/loader.py)');
+	expect(rendered).toContain('Read(src/lib/missing.py)');
+	expect(rendered).toContain('Glob(**/*.csv)');
+	expect(rendered).toContain('Grep(load, src)');
+	expect(rendered).not.toContain(readsWorkspace);
+	expect(rendered).not.toContain('/private/');
+
+	// The failed read is marked, the successful one is not.
+	const lines = rendered.split('\n');
+	expect(lines.find((l) => l.includes('Read(src/lib/missing.py)')) ?? '').toContain('(failed)');
+	expect(lines.find((l) => l.includes('Read(src/lib/loader.py)')) ?? '').not.toContain('(failed)');
+
+	// A path OUTSIDE the workspace is NAMED, never printed - and it is the one
+	// the CLI refused, so it also carries the failed marker.
+	const outsideLine = lines.find((l) => l.includes('outside the workspace')) ?? '';
+	expect(outsideLine).toContain('Read(outside the workspace)');
+	expect(outsideLine).toContain('(failed)');
+	expect(rendered).not.toContain('passwd');
+
+	// And no result content, in the page or the file - a read's result is the
+	// user's own file content, which is exactly what must not land in a notebook.
+	const pageText = await page.locator('body').innerText();
+	for (const token of ['def load_sales', 'return 42', 'current working directory', 'granted it yet']) {
+		expect(pageText).not.toContain(token);
+	}
+	await expect.poll(() => diskReply(nb, readsWorkspace), { timeout: 30_000 }).toContain('Read(src/lib/loader.py)');
+	const saved = diskReply(nb, readsWorkspace);
+	expect(saved).not.toContain(readsWorkspace);
+	expect(saved).not.toContain('passwd');
+	expect(saved).toContain('outside the workspace');
 
 	expect(errors).toEqual([]);
 });

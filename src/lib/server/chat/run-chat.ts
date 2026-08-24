@@ -187,9 +187,12 @@ export async function executeChatRun({
 			emit(`> ${line}`);
 			last = 'tool';
 		};
-		// The workspace is read ONCE per run: it is the root every rendered path is
-		// made relative to, and it cannot move mid-run.
-		const workspace = workspaceRoot();
+		// The reference frame every rendered path is made relative to, read ONCE per
+		// run. `resolve()`d exactly as `chatReadableWorkspace` resolves it, so the
+		// root a line measures against is the SAME string the child was CONFINED to
+		// - the two answering different questions about one path is how a plainly
+		// in-workspace file would come out as `outside the workspace`.
+		const workspace = resolve(workspaceRoot());
 		// The engine's capability inputs, read from the person-scoped store at run
 		// time (the `auth.ts` CHAT_SLOT_KEY pattern) through the shared gates: the
 		// model is constrained to the known set BEFORE it rides the seam (and the
