@@ -18,6 +18,7 @@
     "src/lib/server/venv.js",
     "src/lib/server/build-freshness.js",
     "src/lib/server/harness.js",
+		"src/lib/server/toml.js",
     "src/lib/server/write-file-atomic.js",
     "src/lib/server/runtime.js",
     "src/lib/server/mcp-bridge.js",
