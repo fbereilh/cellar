@@ -351,3 +351,48 @@ test('the other-notebooks opt-out reaches the server without waiting out the deb
 	await page.goto(baseURL);
 	await assertOptOutBeatsDebounce(page, CHAT_OTHER_NOTEBOOKS_KEY, 'settings-chat-other-notebooks');
 });
+
+/**
+ * The DETECT + REPORT half (the `sdkDbutils` precedent): an un-patternable
+ * workspace path or notebook NAME makes workspace reads fail closed, and without
+ * a report that fallback is silent - the toggle still renders on and its copy
+ * still promises the reply may browse the workspace, while only the model is
+ * told otherwise, so the person meets a reply that merely seems broken.
+ *
+ * The verdict itself and both its causes are pinned in
+ * `tests/unit/chat-reads-availability.test.ts` against the real route; what only
+ * a browser can show is that the pane RENDERS it, and renders nothing when there
+ * is nothing to say. The notebook cause is used here because it is the one that
+ * varies within a single workspace - reads off for this notebook, fine for the
+ * one beside it - which is exactly why the sentence has to name which notebook.
+ *
+ * Runs LAST: it creates and focuses a notebook, changing the workspace the
+ * serial tests above share.
+ */
+test('an un-patternable notebook name is REPORTED at the toggle, naming that notebook', async ({ page }) => {
+	await page.goto(baseURL);
+	await openSettings(page);
+	// Nothing to say on the healthy default notebook - a report here would be a
+	// false alarm sending someone after a problem they do not have.
+	await expect(page.getByTestId('settings-chat-reads-unavailable')).toHaveCount(0);
+	await closeSettings(page);
+
+	// Create and focus a notebook whose name cannot be spelled as a literal
+	// permission rule (`{` is a glob metacharacter). The page is already open, so
+	// the server's `notebook:opened` reaches it and the shell focuses that tab -
+	// which is what makes it the notebook the pane reports about.
+	const created = await page.request.post(`${baseURL}/api/notebooks`, {
+		data: { path: 'run{1}.ipynb', create: true }
+	});
+	expect(created.ok()).toBe(true);
+	await expect(page.getByRole('tab', { name: /run\{1\}/ })).toBeVisible({ timeout: 15_000 });
+
+	await openSettings(page);
+	const notice = page.getByTestId('settings-chat-reads-unavailable');
+	await expect(notice).toBeVisible();
+	// It must name the notebook: the verdict is per notebook, so an unqualified
+	// "reads are off" would be wrong about the workspace as a whole.
+	await expect(notice).toContainText('run{1}.ipynb');
+	await expect(notice).toContainText(/other notebooks in this workspace are unaffected/i);
+	await closeSettings(page);
+});

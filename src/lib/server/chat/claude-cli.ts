@@ -124,7 +124,7 @@
  * `--disallowedTools`, built by the SAME `chatToolPolicy` and enumerated in
  * `denialPatterns`: the CURRENT notebook and the artifacts named after it
  * (always, whatever its extension), `<root>/.cellar/` whole, and - unless the
- * person opted other notebooks in - every notebook in the workspace. Measured
+ * person opted other notebooks in - every `.ipynb` FILE in the workspace. Measured
  * against claude 2.1.238: a deny rule BEATS the allow rule for a path inside
  * the granted root, a sibling file in that root still reads, and the denial is
  * enforced per file by the tools themselves (a Grep over the granted directory
@@ -454,6 +454,39 @@ function deniableNotebookPaths(notebookPath: string): string[] | null {
 	return safe;
 }
 
+/** Which half of the reads precondition a workspace/notebook pair fails. */
+export type ChatReadsBlockedCause = 'workspace' | 'notebook';
+
+/**
+ * Why a reads-on run would silently come back READ-LESS, or null when reads can
+ * really be granted - the DETECT half of the Settings pane's report.
+ *
+ * The fail-closed fallbacks above are deliberate, but on their own they are
+ * SILENT: the toggle still renders on and the copy still promises the reply may
+ * browse the workspace, while the only report goes to the MODEL through the
+ * frozen prompt, so the person meets a reply that merely seems broken. This is
+ * the same DETECT + REPORT shape the Databricks card already applies to a
+ * silently-inert capability (`sdkDbutils`).
+ *
+ * The two causes are reported SEPARATELY because they differ in scope and in
+ * remedy: a `workspace` verdict means no notebook in this workspace can have
+ * reads, while a `notebook` verdict is about THAT notebook's own name and its
+ * derived artifacts - reads keep working in the notebook beside it, so a report
+ * that did not say which is at fault would be wrong about the workspace as a
+ * whole. Order matters: the workspace is checked first, since an unusable root
+ * makes the notebook question moot.
+ *
+ * It answers from the SAME `chatReadRoot`/`literalRulePath`/`deniableNotebookPaths`
+ * the policy uses - never a second copy of the character rule, so the pane can
+ * never promise (or deny) something the engine would decide differently.
+ */
+export function chatReadsBlockedCause(readRoot: unknown, notebookPath: unknown): ChatReadsBlockedCause | null {
+	if (chatReadRoot(readRoot) === null) return 'workspace';
+	const literal = literalRulePath(notebookPath);
+	if (literal === null || deniableNotebookPaths(literal) === null) return 'notebook';
+	return null;
+}
+
 /**
  * The paths a reads-on run DENIES inside its own confinement root.
  *
@@ -490,10 +523,14 @@ function deniableNotebookPaths(notebookPath: string): string[] | null {
  *      than as that one file: everything under it is Cellar runtime state the
  *      model needs none of, and a directory rule covers whatever is added there
  *      later instead of silently going stale.
- *   3. **Every notebook in the workspace**, unless the person opted OTHER
+ *   3. **Every `.ipynb` FILE in the workspace**, unless the person opted OTHER
  *      notebooks in. Off (the default) the reply still reads `.py`, `.md` and
- *      data files - everything except notebooks; on, other notebooks open up
- *      while rules 1 and 2 stand either way. Both a top-level and a nested form
+ *      data files; on, other notebooks open up while rules 1 and 2 stand either
+ *      way. This is an `.ipynb` rule and nothing wider - see residual (c): it is
+ *      deliberately NOT extended to `.py`/`.html` by type, which would deny
+ *      exactly what this feature exists to read, and the by-NAME derivation of
+ *      rule 1 is built from the CURRENT notebook's stem alone. Both a top-level
+ *      and a nested form
  *      are emitted rather than relying on a leading globstar matching zero
  *      directories, which is engine-dependent and would silently leave the
  *      workspace's top-level notebooks readable.
@@ -507,10 +544,25 @@ function deniableNotebookPaths(notebookPath: string): string[] | null {
  *       cannot see: MCP `export_html` called with an explicit `path`, and an
  *       nbdev export module at a configured `metadata.cellar.export_target`.
  *       Neither is derivable from the notebook's name, so neither is denied.
+ *   (c) ANOTHER notebook's DEFAULT-PATH exports, and any jupytext `.py`
+ *       notebook - readable whether the other-notebooks option is on or OFF.
+ *       Rule 3 blocks `.ipynb` files; rule 1's by-name derivation covers only
+ *       the CURRENT notebook's stem. So `<other>.py` (its "Save as .py") and
+ *       `<other>.html` (its `export_html`) stay readable, and since neither
+ *       `export-html.ts` nor `jupytext-actions.ts` filters hidden cells, such a
+ *       file carries every cell of that notebook including the hidden ones,
+ *       plus outputs. A jupytext `.py` notebook is the same case with no
+ *       `.ipynb` to block at all. Widening rule 3 to those file TYPES is
+ *       deliberately rejected: it would deny exactly what a reads-on reply
+ *       exists to read, and `.py` is what the Settings copy promises stays
+ *       readable.
  *
- * So the claim this layer supports is the narrow one: a hidden cell in THIS
- * notebook is unreachable through the notebook file, the copies Cellar names
- * after it, and the checkpoint store. Do not restate it more widely.
+ * So the claim this layer supports is the narrow one, and it is about THIS
+ * notebook: a hidden cell in the CURRENT notebook is unreachable through the
+ * notebook file, the copies Cellar names after it, and the checkpoint store.
+ * That guarantee is by-name and complete. The other-notebooks block is the
+ * WEAKER, separate statement in rule 3 - `.ipynb` files only - and the two must
+ * not be restated as one, nor either of them more widely.
  */
 function denialPatterns(root: string, notebookTargets: readonly string[], otherNotebooks: boolean): string[] {
 	const patterns = [...notebookTargets.map(rulePath), `${rulePath(root)}/${CELLAR_STATE_DIR}/**`];

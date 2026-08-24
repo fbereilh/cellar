@@ -23,6 +23,13 @@
 		open: boolean;
 		theme: string;
 		/**
+		 * The notebook the shell is showing, workspace-relative, or null. Threaded
+		 * in (not re-read) so the chat reads-availability report below can name
+		 * WHICH notebook is at fault: that verdict is per notebook, so reads can be
+		 * unavailable here while working in the notebook beside it.
+		 */
+		activeNotebookPath?: string | null;
+		/**
 		 * Windowed rendering. This is the SAME shell state the navbar View-menu
 		 * toggle reads and writes (`+page.svelte`, persisted once through
 		 * `VIRTUALIZE_PREF_KEY` in `$lib/virtualizePref`) - deliberately threaded in
@@ -56,7 +63,8 @@
 		onSetTheme,
 		onToggleVirtualizeCells,
 		onToggleShowCodeRoot,
-		onVenvRebound
+		onVenvRebound,
+		activeNotebookPath = null
 	}: Props = $props();
 
 	const THEMES = [
@@ -239,6 +247,48 @@
 		chatWebSearch = getUserSettingFlag(CHAT_WEB_SEARCH_KEY);
 		chatWorkspaceReads = getUserSettingFlag(CHAT_WORKSPACE_READS_KEY);
 		chatOtherNotebooks = getUserSettingFlag(CHAT_OTHER_NOTEBOOKS_KEY);
+	});
+
+	// DETECT + REPORT (the `sdkDbutils` precedent): workspace reads fail CLOSED on a
+	// workspace path or notebook name Cellar cannot express as a literal permission
+	// rule, and that fallback is otherwise SILENT - the toggle stays on and the copy
+	// below still promises reads, while only the model is told otherwise, so the
+	// person meets a reply that merely seems broken. The verdict is the server's
+	// (it depends on the workspace root and the notebook path) and comes from the
+	// SAME predicate the engine applies, so this pane can never promise what a run
+	// would refuse. Re-fetched when the active notebook changes, because the
+	// notebook half is per notebook.
+	let chatReads = $state<{ available: boolean; cause: string | null; notebook?: string } | null>(null);
+	$effect(() => {
+		if (!open) return;
+		const nb = activeNotebookPath;
+		let dropped = false;
+		const qs = nb ? `?notebook=${encodeURIComponent(nb)}` : '';
+		void fetch(`/api/chat/status${qs}`)
+			.then((r) => (r.ok ? r.json() : null))
+			.then((body) => {
+				if (dropped) return;
+				chatReads = body?.reads ?? null;
+			})
+			.catch(() => {
+				// A failed probe reports NOTHING rather than claiming reads are broken:
+				// over-reporting would send a user chasing a problem they do not have.
+				if (!dropped) chatReads = null;
+			});
+		return () => {
+			dropped = true;
+		};
+	});
+
+	// The one sentence the report renders, naming which half is at fault - the two
+	// differ in scope and remedy, so a single "reads are off" would be wrong about
+	// the workspace whenever it is really one notebook's name.
+	const chatReadsNotice = $derived.by(() => {
+		if (!chatReads || chatReads.available || !chatReads.cause) return null;
+		if (chatReads.cause === 'workspace')
+			return "Reads cannot be enabled in this workspace: its folder path contains a character Cellar cannot express as a safe permission rule, so it refuses rather than granting reads it could not confine. Renaming the folder restores it.";
+		const name = chatReads.notebook ? ` (${chatReads.notebook})` : '';
+		return `Reads cannot be enabled for the notebook you are in${name}: its name contains a character Cellar cannot express as a safe permission rule, so it refuses rather than granting reads whose confinement it could not prove. Other notebooks in this workspace are unaffected; renaming this one restores it.`;
 	});
 
 	// Both write through `setUserSettingNow`, NEVER the debounced `setUserSetting`:
@@ -696,6 +746,20 @@
 						<code>.cellar</code> folder. Turn it off if the workspace holds secrets you would
 						rather a reply could not read, especially with web search also on.
 					</p>
+					{#if chatReadsNotice}
+						<!-- DETECT + REPORT: without this the fail-closed fallback is silent -
+						     the toggle above still reads on and the copy still promises reads,
+						     while only the model is told otherwise. Warning ICON plus
+						     base-content copy, per the contrast doctrine (amber body text on
+						     the light card measures ~2:1). -->
+						<p
+							class="mt-1 flex gap-1.5 text-xs text-base-content/70"
+							data-testid="settings-chat-reads-unavailable"
+						>
+							<span class="text-warning" aria-hidden="true">&#9888;</span>
+							<span>{chatReadsNotice}</span>
+						</p>
+					{/if}
 					<label class="mt-3 flex cursor-pointer items-center justify-between gap-4">
 						<span class="text-sm font-medium">Allow reading other notebooks</span>
 						<input
@@ -709,9 +773,12 @@
 					<p class="mt-1 text-xs text-base-content/50">
 						Only applies while workspace reads are on. Off, the other <code>.ipynb</code> files in
 						this workspace are not readable either, so a reply still reads <code>.py</code>,
-						<code>.md</code> and data files but no notebook. On, it may read them - including any
-						cells their authors hid from the agent. The notebook you are chatting in stays
-						unreadable either way.
+						<code>.md</code> and data files. On, it may read them - including any cells their
+						authors hid from the agent. The notebook you are chatting in stays unreadable
+						either way. This covers <code>.ipynb</code> files: another notebook's exported
+						copies (its "Save as .py" and its exported <code>.html</code>, which are ordinary
+						workspace files) and any jupytext <code>.py</code> notebook stay readable whether
+						this is on or off.
 					</p>
 				</div>
 

@@ -1907,6 +1907,7 @@
 
 <Settings
 	open={settingsOpen}
+	{activeNotebookPath}
 	{theme}
 	{virtualizeCells}
 	{virtualizeForced}

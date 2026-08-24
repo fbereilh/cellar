@@ -30,14 +30,21 @@
  *    the notebook file, the copies named after it, and the checkpoint store -
  *    which is what keeps `chatPromptTooLargeMessage`'s "hide cells from the
  *    agent" remedy honest. It is NOT a general "hidden cells cannot be read".
- *    Two residuals, both stated rather than glossed: (a) a hidden cell in a
- *    DIFFERENT notebook is reachable when the person turns the other-notebooks
- *    option on, which is what that option, defaulting OFF, exists to decide; and
- *    (b) a derived artifact written to a NON-DEFAULT path is invisible to a
- *    by-name rule - specifically MCP `export_html` called with an explicit
- *    `path`, and an nbdev export module at a configured
+ *    Three residuals, all stated rather than glossed: (a) a hidden cell in a
+ *    DIFFERENT notebook's `.ipynb` is reachable when the person turns the
+ *    other-notebooks option on, which is what that option, defaulting OFF,
+ *    exists to decide; (b) a derived artifact written to a NON-DEFAULT path is
+ *    invisible to a by-name rule - specifically MCP `export_html` called with an
+ *    explicit `path`, and an nbdev export module at a configured
  *    `metadata.cellar.export_target`, neither of which is derivable from the
- *    notebook's name.
+ *    notebook's name; and (c) ANOTHER notebook's DEFAULT-PATH exports, plus any
+ *    jupytext `.py` notebook, are readable whether that option is on or OFF -
+ *    the other-notebooks block covers `.ipynb` files, while the by-name
+ *    derivation is built from the CURRENT notebook's stem alone, so `<other>.py`
+ *    and `<other>.html` stay readable and carry every cell of that notebook
+ *    (neither writer filters hidden cells). Widening the block to those file
+ *    types is deliberately rejected - it would deny what a reads-on reply exists
+ *    to read.
  *
  * 2. **The transcript is BYTE-STABLE across runs of an unchanged notebook.**
  *    Prompt caching keys on an exact prefix and is what makes a long notebook
