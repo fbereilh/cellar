@@ -35,6 +35,13 @@
 	import type { SearchCache } from '$lib/search';
 	import { buildCellHighlights, type SearchHighlightState } from '$lib/searchHighlight';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
+	import {
+		EXTRACT_TESTID,
+		flashExtracted,
+		readCodeBlock,
+		targetCodeBlock,
+		type ExtractedCodeBlock
+	} from '$lib/codeBlockExtract';
 	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
@@ -2899,6 +2906,84 @@
 		return created.id;
 	}
 
+	// ---- Extract a rendered code block into a cell ---------------------------
+	/**
+	 * Where the NEXT block extracted from `sourceId` lands, per source cell.
+	 *
+	 * Without it, extracting three blocks top-to-bottom - each "directly below the
+	 * chat cell" - stacks them in REVERSE. So each extraction remembers the cell it
+	 * created and the next one goes after THAT, giving the reading order of the
+	 * reply. It is a fact about a run of extractions rather than about the
+	 * document, so it lives here (in the notebook, which survives a windowed
+	 * unmount of the cell) and is deliberately NOT persisted: after a reload the
+	 * anchor is simply the source cell again, which is the honest default.
+	 *
+	 * Self-healing rather than trusted - the user may have deleted the anchor,
+	 * moved it above the source cell, or moved the source cell past it - so
+	 * {@link extractAnchor} re-derives it from the CURRENT order every time and
+	 * falls back to the source cell whenever it no longer makes sense.
+	 */
+	const extractAnchors = new Map<string, string>();
+
+	/** The cell a new extraction is inserted after: the last one still sitting below `sourceId`. */
+	function extractAnchor(sourceId: string): string {
+		const from = cells.findIndex((c) => c.id === sourceId);
+		const last = extractAnchors.get(sourceId);
+		const at = last ? cells.findIndex((c) => c.id === last) : -1;
+		return at > from ? (last as string) : sourceId;
+	}
+
+	/**
+	 * Create a cell below `sourceId` holding `block`'s code, with the type its
+	 * fence asked for. The ONE extraction path: the control on the block and the
+	 * keyboard chord both land here, and both read the block through the same
+	 * `$lib/codeBlockExtract` rule, so neither can produce a cell the other would
+	 * not.
+	 *
+	 * FOCUS AND SELECTION ARE DELIBERATELY UNTOUCHED - the `insertAndRunCode`
+	 * precedent, for the same reason. The user is READING a reply; the extraction
+	 * is a side action taken with the pointer resting on a block, and moving the
+	 * selection would move DOM focus with it (the keyboard dispatcher reads a
+	 * keystroke's mode off the focused element), yanking them out of the prose and
+	 * scrolling the viewport away from the block they were reading. The new cell
+	 * lands immediately below the source cell, where it is already in view or one
+	 * scroll away, and focus stays on the control - so extracting the next block is
+	 * one Tab or one hover away.
+	 *
+	 * The types a fence can ask for are `code`/`sql`/`markdown`, which EVERY
+	 * notebook format can hold, so there is no `refuseUnsupportedType` gate here:
+	 * `chat` and `raw` are unreachable by construction (see `fenceCellType`).
+	 */
+	async function extractCodeBlock(sourceId: string, block: ExtractedCodeBlock) {
+		if (!findCell(sourceId)) return;
+		const created = await addCell(extractAnchor(sourceId), block.cellType, block.source);
+		extractAnchors.set(sourceId, created.id);
+		return created;
+	}
+
+	/**
+	 * The KEYBOARD route. It resolves its own target from the DOM - the block under
+	 * the pointer, else the one holding focus (`targetCodeBlock` owns that rule and
+	 * why hover wins) - because a chord fired while reading has no other way to
+	 * name one of several blocks in a reply.
+	 *
+	 * With no block in play it SAYS so on the shell's transient line rather than
+	 * returning "not handled": the chord carries a modifier, so letting it bubble
+	 * reaches nothing useful, and a modified chord that silently does nothing is
+	 * indistinguishable from an unbound one.
+	 */
+	function extractHoveredCodeBlock() {
+		const el = targetCodeBlock(rootEl);
+		const block = readCodeBlock(el);
+		const sourceId = (el?.closest('[data-cell-id]') as HTMLElement | null)?.dataset.cellId;
+		if (!block || !sourceId) {
+			onNotice?.('Hover a code block in a rendered reply or markdown cell, then press the shortcut to extract it.');
+			return;
+		}
+		void extractCodeBlock(sourceId, block);
+		flashExtracted(el?.querySelector(`[data-testid="${EXTRACT_TESTID}"]`));
+	}
+
 	/**
 	 * Say WHY nothing happened when the non-empty invariant refused a delete/cut.
 	 *
@@ -3683,6 +3768,7 @@
 		'paste-below': () => pasteCells('below'),
 		'paste-above': () => pasteCells('above'),
 		'split-cell': () => splitActiveCell(),
+		'extract-code-block': () => extractHoveredCodeBlock(),
 		...Object.fromEntries([1, 2, 3, 4, 5, 6].map((level) => [`heading-${level}`, () => setHeadingLevel(level)]))
 	};
 
@@ -3896,6 +3982,7 @@
 			onSetCellCollapsed={setCellCollapsed}
 			rawEdits={rawEdits}
 			onSetRawEdit={setRawEdit}
+			onExtractCode={extractCodeBlock}
 			onActivate={activateCell}
 			onRegister={registerCell}
 			onEditorFocus={onEditorFocus}

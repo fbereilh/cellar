@@ -383,6 +383,17 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		category: 'Editing',
 		description: 'Split the cell at the cursor'
 	},
+	{
+		// `global`, not `command`: the block it acts on is the one under the POINTER
+		// (see `$lib/codeBlockExtract`), which is just as likely while the caret sits
+		// in another cell's editor as it is with a cell merely selected. A modified
+		// chord, so it is no typing hazard in edit mode either.
+		id: 'extract-code-block',
+		keys: ['Mod-Shift-e'],
+		mode: 'global',
+		category: 'Editing',
+		description: 'Extract the hovered code block into a new cell below'
+	},
 
 	// ---- Headings ----------------------------------------------------------
 	// One command per level, so each is rebindable on its own and the registry

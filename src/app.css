@@ -383,6 +383,62 @@ mark.cellar-search-mark-active {
 	background: none;
 	padding: 0;
 }
+
+/* --- Extract a code block into a cell ---------------------------------------
+ * The control `$lib/codeBlockExtract` hangs on every rendered code block (a chat
+ * reply's, a markdown cell's, a `display(Markdown(...))` payload's). The wrapper
+ * exists only to position it: it sets no border, padding or overflow, so the
+ * `<pre>`'s own margins still collapse through it and wrapping a block changes
+ * nothing about the surrounding rhythm.
+ *
+ * ABSOLUTE, so appearing costs no reflow - the block never moves, whether the
+ * control is showing or not - and hover-only, so the code is unobscured for as
+ * long as it is being READ. It sits over the `<pre>`'s own top-right padding and
+ * carries a solid surface, so on the rare wide first line it reads as a control
+ * on top of code rather than as code. */
+.cellar-md .cellar-code-block {
+	position: relative;
+}
+.cellar-md .cellar-code-extract {
+	position: absolute;
+	top: 0.3rem;
+	right: 0.3rem;
+	z-index: 1;
+	opacity: 0;
+	transition: opacity 120ms ease;
+	background-color: var(--color-base-300);
+	border-color: color-mix(in oklab, var(--color-base-content) 12%, transparent);
+	color: color-mix(in oklab, var(--color-base-content) 60%, transparent);
+	box-shadow: 0 1px 2px rgb(0 0 0 / 0.12);
+}
+.cellar-md .cellar-code-block:hover .cellar-code-extract,
+.cellar-md .cellar-code-extract:focus-visible,
+.cellar-md .cellar-code-extract[data-extracted] {
+	opacity: 1;
+}
+.cellar-md .cellar-code-block:hover .cellar-code-extract:hover {
+	color: var(--color-base-content);
+}
+/* A pointer-less device can never hover, so the control would be unreachable by
+ * its only reveal - and the keyboard chord it would fall back on has no hover to
+ * resolve either. Shown outright there, quietly. */
+@media (hover: none) {
+	.cellar-md .cellar-code-extract {
+		opacity: 0.55;
+	}
+}
+/* The confirmation: the check replaces the arrow for a moment (`data-extracted`,
+ * set by `flashExtracted`), exactly as the cell toolbar's copy buttons confirm.
+ * Both glyphs are built into the button so this is a pure class swap - see the
+ * module for why. */
+.cellar-md .cellar-code-extract [data-icon='done'],
+.cellar-md .cellar-code-extract[data-extracted] [data-icon='extract'] {
+	display: none;
+}
+.cellar-md .cellar-code-extract[data-extracted] [data-icon='done'] {
+	display: inline;
+	color: var(--color-success);
+}
 .cellar-md blockquote {
 	border-left: 3px solid var(--color-base-300);
 	padding-left: 1em;

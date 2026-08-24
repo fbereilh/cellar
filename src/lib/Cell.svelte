@@ -30,6 +30,14 @@
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
 	import { matchesCellId } from '$lib/search';
 	import { copyOutputText, hasCopyableOutput } from '$lib/copyCell';
+	import {
+		CODE_BLOCK_ATTR,
+		EXTRACT_TESTID,
+		decorateCodeBlocks,
+		flashExtracted,
+		readCodeBlock,
+		type ExtractedCodeBlock
+	} from '$lib/codeBlockExtract';
 	import { setSurfaceRanges, clearSurface, buildTextRanges, allocSurfaceKey } from '$lib/domHighlight';
 	import { isMac } from '$lib/shortcuts.svelte';
 	import { pointerIntent } from '$lib/cellSelection';
@@ -114,6 +122,10 @@
 		 *  by the notebook, like `editorCollapsed`, so it survives a windowed unmount. */
 		rawEdit?: boolean;
 		onSetRawEdit?: (id: string, raw: boolean) => void;
+		/** Lift a rendered code block out of this cell's prose into a new cell below.
+		 *  Fired by the control the decorator hangs on each block; the KEYBOARD route
+		 *  reaches the same notebook function directly (see `$lib/codeBlockExtract`). */
+		onExtractCode?: (id: string, block: ExtractedCodeBlock) => void;
 		onActivate?: (id: string, gesture?: CellActivation) => void;
 		/** Find-in-page query (Search P4); empty when the find bar is closed / this
 		 *  notebook isn't the searched one. Non-empty drives in-place highlighting. */
@@ -173,6 +185,7 @@
 		onSetCellCollapsed,
 		rawEdit = false,
 		onSetRawEdit,
+		onExtractCode,
 		onActivate,
 		searchQuery = '',
 		searchCaseSensitive = false,
@@ -1595,6 +1608,63 @@
 		}
 	}
 
+	// ---- Extract a rendered code block into a cell ---------------------------
+	// Every `.cellar-md` this cell renders - a chat reply, a `display(Markdown())`
+	// payload, and this cell's own rendered markdown - gets an extract control on
+	// each of its code blocks. The rule lives in `$lib/codeBlockExtract`; this is
+	// only the wiring, so the button route and the keyboard route (which resolves
+	// its target in `LiveNotebook`) can never read a block differently.
+	//
+	// Decoration is imperative rather than emitted by the markdown renderer for two
+	// reasons stated in that module: a control baked into the HTML STRING would also
+	// appear in the `.md` file preview, which shares the engine but has no notebook
+	// to extract into, and it would widen what the OUTPUT sanitizer must pass for a
+	// control the model's own markdown must never be able to forge.
+	//
+	// It is DECLARED BEFORE the highlight effect below, and that order is
+	// load-bearing: effects run in declaration order and both apply after the same
+	// `tick`, so the blocks are wrapped before find-in-page walks them for Ranges.
+	// The wrap moves the `<pre>` without recreating any of its descendants, so a
+	// Range that already points into a block survives it either way.
+	$effect(() => {
+		// The same deps the highlight effect tracks for "what is shown", minus the
+		// search inputs (which change no markup). A collapse DROPS the rendered
+		// markdown via `{#if}`, so re-expanding needs a fresh pass.
+		void segments;
+		void outputs;
+		void isMarkdown;
+		void mode;
+		void codeHidden;
+		void cellCollapsed;
+		if (!browser) return;
+		let cancelled = false;
+		tick().then(() => {
+			if (cancelled) return;
+			for (const md of cardEl?.querySelectorAll('.cellar-md') ?? []) decorateCodeBlocks(md);
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	// One delegated listener rather than a listener per injected control: the
+	// controls are created and discarded with the rendered markdown, so anything
+	// bound to them individually would have to be unbound again on every re-render.
+	// The card already exempts `button` from its selection gesture
+	// (`onCardPointerDown`), so a click here never also moves the selection - and
+	// `stopPropagation` keeps it clear of the rendered-markdown block's own
+	// double-click-to-edit.
+	function onCardClick(e: MouseEvent) {
+		const btn = (e.target as HTMLElement | null)?.closest?.(`[data-testid="${EXTRACT_TESTID}"]`);
+		if (!btn) return;
+		e.preventDefault();
+		e.stopPropagation();
+		const block = readCodeBlock(btn.closest(`[${CODE_BLOCK_ATTR}]`));
+		if (!block) return;
+		onExtractCode?.(cell.id, block);
+		flashExtracted(btn);
+	}
+
 	// Drive highlighting. Reads every dep that changes WHAT is shown (so a surface
 	// swap - editor built, markdown render/edit, code hidden, outputs streaming,
 	// source edited - re-paints), then applies after a tick so the DOM reflects the
@@ -1663,6 +1733,7 @@
 	role="presentation"
 	onfocusin={() => onActivate?.(cell.id, { fromFocus: true })}
 	onpointerdown={onCardPointerDown}
+	onclick={onCardClick}
 >
 	<!-- Left accent bar (VS Code / Jupyter style); no layout shift. The running
 	     accent deliberately outranks the selection accent and uses `warning` (the
