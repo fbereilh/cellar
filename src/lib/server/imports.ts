@@ -155,8 +155,17 @@ export function logicalLines(source: string): LogicalLine[] {
 	return out;
 }
 
-/** Drop comments and fold line continuations out of a logical line's text. */
-function stripComments(text: string): string {
+/**
+ * Drop comments and fold line continuations out of a logical line's text, leaving
+ * only its CODE. String literals survive verbatim (a `#` inside one is data).
+ *
+ * Exported so any caller that must reason about a logical line's code - rather
+ * than the bytes the user typed - asks THIS scanner instead of writing a second
+ * one. `export-py.ts` needs it to tell a semicolon-JOINED statement from a `;`
+ * that merely sits in a trailing comment; getting that wrong silently skipped a
+ * `__future__` hoist and emitted a module Python refuses to compile.
+ */
+export function stripComments(text: string): string {
 	let out = '';
 	let k = 0;
 	while (k < text.length) {

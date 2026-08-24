@@ -25,7 +25,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, basename, relative, resolve, sep } from 'node:path';
 import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
-import { logicalLines } from './imports';
+import { logicalLines, stripComments } from './imports';
 import { isExportCell } from '../exportRole';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import type { Cell, NotebookDoc } from './types';
@@ -128,9 +128,12 @@ const FUTURE_RE = /^from\s+__future__\s+import\s+\S/;
  * nested scope is never a logical line at indent 0, and a bracket-continued import
  * is ONE logical line, so it moves whole.
  *
- * Known limit (documented, not handled): a semicolon-joined statement
+ * Known limit (documented, not handled): a semicolon-JOINED statement
  * (`from __future__ import annotations; x = 1`) is left in place rather than
- * hoisted with a rider that would be reordered with it.
+ * hoisted with a rider that would be reordered with it. That test runs over the
+ * line's CODE (`stripComments`), never its raw bytes: a `;` sitting in a trailing
+ * comment joins nothing, and reading it as a joined statement silently skipped the
+ * hoist and emitted the very uncompilable module this exists to prevent.
  *
  * Returns the deduped hoisted statements and the sources with them spliced out.
  */
@@ -142,24 +145,56 @@ function liftFutureImports(sources: string[]): { future: string[]; body: string[
 		const cuts: Array<[number, number]> = [];
 		for (const line of logicalLines(src)) {
 			if (line.indent !== 0) continue; // only a module-level future statement moves
-			const text = line.raw.trim();
-			if (!FUTURE_RE.test(text) || text.includes(';')) continue;
-			if (!seen.has(text)) {
-				seen.add(text);
-				future.push(text);
+			// The CODE of the line: comments dropped, continuations folded, strings kept.
+			const code = stripComments(line.raw).replace(/\s+/g, ' ').trim();
+			if (!FUTURE_RE.test(code) || code.includes(';')) continue;
+			if (!seen.has(code)) {
+				seen.add(code); // dedupe on the code, so a trailing comment is not a new statement
+				future.push(line.raw.replace(/\s+$/, '')); // hoisted verbatim, comment and all
 			}
 			cuts.push([line.start, line.end]);
 		}
 		if (!cuts.length) return src;
-		let out = '';
-		let at = 0;
-		for (const [s, e] of cuts) {
-			out += src.slice(at, s);
-			at = e;
-		}
-		return out + src.slice(at);
+		return spliceLines(src, cuts);
 	});
 	return { future, body };
+}
+
+/**
+ * Cut `[start, end)` spans out of `src` and tidy the seams they leave behind.
+ *
+ * Removing a whole line leaves the newlines that closed around it, so a naive
+ * splice turns "future import, blank line, code" into a residue that OPENS with a
+ * blank line - which `generateModule` then joins with its own blank-line separator
+ * and emits a double blank line, contradicting its documented "single blank line
+ * between blocks, no incidental whitespace" contract. So each seam's newline run
+ * collapses to at most one blank line, and any blank lines the cuts left at the
+ * very top of the cell go entirely.
+ *
+ * Seams are tidied RIGHT TO LEFT and only ever by removing characters at or after
+ * the seam, so an earlier seam's recorded offset is never invalidated (the same
+ * rule `extractTopLevelImports` follows for the same reason).
+ */
+function spliceLines(src: string, cuts: Array<[number, number]>): string {
+	let out = '';
+	const seams: number[] = [];
+	let at = 0;
+	for (const [s, e] of cuts) {
+		out += src.slice(at, s);
+		seams.push(out.length);
+		at = e;
+	}
+	out += src.slice(at);
+	for (let i = seams.length - 1; i >= 0; i--) {
+		const p = seams[i];
+		let before = 0;
+		while (p - before - 1 >= 0 && out[p - before - 1] === '\n') before++;
+		let after = 0;
+		while (p + after < out.length && out[p + after] === '\n') after++;
+		const excess = before + after - 2;
+		if (excess > 0) out = out.slice(0, p) + '\n'.repeat(Math.max(0, after - excess)) + out.slice(p + after);
+	}
+	return out.replace(/^(?:[ \t]*\n)+/, ''); // no leading blank lines where a cut was
 }
 
 /**

@@ -134,6 +134,47 @@ describe('generateModule — hoisting module-level __future__ imports', () => {
 		expect(out.indexOf('__all__')).toBeLessThan(out.indexOf(src));
 	});
 
+	it('HOISTS one whose trailing COMMENT contains a semicolon', () => {
+		// The `;` guard is about a semicolon-JOINED statement; a `;` inside a comment
+		// joins nothing. Reading the raw bytes instead of the CODE silently skipped the
+		// hoist and emitted the uncompilable layout this whole feature removes.
+		const out = expy.generateModule(['from __future__ import annotations # keep; please\nX = 1'], 'demo.ipynb');
+		expect(out.indexOf('from __future__ import annotations')).toBeLessThan(out.indexOf('__all__'));
+		expect(out.indexOf('__all__')).toBeLessThan(out.indexOf('X = 1'));
+		// It moves verbatim, comment and all.
+		expect(out).toContain('from __future__ import annotations # keep; please');
+	});
+
+	it('does not double-count a statement that differs only by its comment', () => {
+		const out = expy.generateModule([
+			'from __future__ import annotations',
+			'from __future__ import annotations  # again\nY = 2'
+		], 'demo.ipynb');
+		expect(out.match(/from __future__ import annotations/g)).toHaveLength(1);
+	});
+
+	it('leaves no double blank line where a hoisted import was followed by one', () => {
+		const out = expy.generateModule(['from __future__ import annotations\n\nimport os\nX = 1'], 'demo.ipynb');
+		// generateModule's contract: single blank line between blocks, no incidental
+		// whitespace. A naive splice left the residue OPENING with a blank line.
+		expect(out).not.toMatch(/\n\n\n/);
+		expect(out).toContain("__all__ = ['X']\n\nimport os\nX = 1\n");
+	});
+
+	it('collapses the seam a hoist leaves in the MIDDLE of a cell', () => {
+		const out = expy.generateModule(['X = 1\n\nfrom __future__ import annotations\n\nY = 2'], 'demo.ipynb');
+		expect(out).not.toMatch(/\n\n\n/);
+		expect(out).toContain('X = 1\n\nY = 2');
+	});
+
+	it('leaves consecutive hoisted imports no blank residue at the top', () => {
+		const out = expy.generateModule([
+			'from __future__ import annotations\n\nfrom __future__ import division\n\nZ = 3'
+		], 'demo.ipynb');
+		expect(out).not.toMatch(/\n\n\n/);
+		expect(out).toContain("__all__ = ['Z']\n\nZ = 3\n");
+	});
+
 	it('leaves a module with no future import byte-identical to before', () => {
 		const out = expy.generateModule(['import os\n\ndef h(): return 1'], 'demo.ipynb');
 		expect(out).toBe(
@@ -175,6 +216,17 @@ describe.skipIf(!HAS_PY)('the exported module really COMPILES (python3; skipped 
 		} as never);
 		expect(res.written).toBe(true);
 		expect(pythonVerdict(readFileSync(join(WS, res.target!), 'utf8')).compiles).toBe(true);
+	});
+
+	it('compiles when the future import carries a semicolon in its comment', () => {
+		const res = expy.exportNotebookToPy({
+			...(docWith(['from __future__ import annotations # keep; please\nimport os', 'def f(x: int) -> str:\n    return str(x)']) as any),
+			metadata: { cellar: { export_target: 'out/comment.py' } }
+		} as never);
+		expect(res.written).toBe(true);
+		const v = pythonVerdict(readFileSync(join(WS, res.target!), 'utf8'));
+		expect(v.error).toBe('');
+		expect(v.compiles).toBe(true);
 	});
 
 	it('compiles a module with no future import at all (no regression)', () => {

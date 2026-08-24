@@ -115,6 +115,75 @@ describe('stringify — sorted keys (the ecosystem convention)', () => {
 		expect(stringify(nb)).toBe(pythonWrites(nb));
 		expect(stringify(nb)).toContain('日本語');
 	});
+
+	// NUMERIC-STRING KEYS. The JS spec fixes the property order of any object -
+	// canonical array-index keys come FIRST, ascending NUMERICALLY - so a
+	// `JSON.stringify` replacer that inserts keys sorted as strings STILL emitted
+	// `2, 10, a` where python writes `10, 2, a`. Such keys reach a notebook through
+	// any ordinary payload (`display(JSON({"2020": …}))`, a `to_dict()` over an
+	// integer index), so the residual would keep churning the very files sorting
+	// exists to stop churning.
+	it.skipIf(!HAS_PY)('sorts numeric-string keys AS STRINGS, exactly as python does', () => {
+		const nb = { '10': 1, '2': 2, a: 3 };
+		expect(stringify(nb)).toBe(pythonWrites(nb));
+		// Spelled out, so the intent survives a rewrite of the harness above.
+		expect(stringify(nb)).toBe(['{', ' "10": 1,', ' "2": 2,', ' "a": 3', '}', ''].join('\n'));
+	});
+
+	it.skipIf(!HAS_PY)('matches python on a nested OUTPUT payload keyed by numeric strings', () => {
+		// The realistic shape: an execute_result bundle whose JSON mime holds an
+		// integer-indexed frame, mixed with ordinary keys at every level.
+		const nb = {
+			cells: [
+				{
+					cell_type: 'code',
+					id: 'c1',
+					execution_count: 3,
+					metadata: {},
+					source: ['df.to_dict()'],
+					outputs: [
+						{
+							output_type: 'execute_result',
+							execution_count: 3,
+							metadata: {},
+							data: {
+								'application/json': {
+									'100': { '2': 'b', '10': 'a', name: 'x' },
+									'2': { '30': 'c', '4': 'd' },
+									'11': [3, 1, 2],
+									total: 3
+								},
+								'text/plain': ["{'100': …}"]
+							}
+						}
+					]
+				}
+			],
+			metadata: { kernelspec: { name: 'python3', display_name: 'python3', language: 'python' } },
+			nbformat: 4,
+			nbformat_minor: 5
+		};
+		expect(stringify(nb)).toBe(pythonWrites(nb));
+	});
+
+	it('stays deterministic and idempotent over numeric-string keys', () => {
+		const nb = { '10': { '3': 1, '20': 2 }, '2': [1, 2], a: 3 };
+		const once = stringify(nb);
+		expect(stringify(nb)).toBe(once);
+		expect(stringify(JSON.parse(once))).toBe(once);
+	});
+
+	it.skipIf(!HAS_PY)('matches python on empty containers and every JSON scalar', () => {
+		const nb = { obj: {}, arr: [], t: true, f: false, n: null, i: 7, s: 'x\ty\u0001' };
+		expect(stringify(nb)).toBe(pythonWrites(nb));
+	});
+
+	it.skipIf(!HAS_PY)('sorts keys ABOVE the BMP by code point, as python does', () => {
+		// UTF-16 code-unit order (JS's default `.sort()`) puts a surrogate pair BEFORE
+		// U+E000-U+FFFF; python compares code points, which is the opposite.
+		const nb = { '\u{1F600}': 1, '\uFFFD': 2, a: 3 };
+		expect(stringify(nb)).toBe(pythonWrites(nb));
+	});
 });
 
 describe('metadata allowlists — foreign keys the ecosystem defines', () => {
