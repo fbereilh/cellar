@@ -1,12 +1,19 @@
 import { json } from '@sveltejs/kit';
-import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setHideInput } from '$lib/server/notebook';
+import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setHideInput, setVisibility } from '$lib/server/notebook';
 import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
 
 /** Edit a cell's source, type ('code' | 'sql' | 'markdown' | 'raw'), imports-cell
- *  role, and/or its output-scroll choice in notebook `nb` (body field;
+ *  role, agent visibility, and/or its output-scroll choice in notebook `nb` (body field;
  *  workspace-relative path, defaults to the active notebook). `role` is 'imports'
  *  to designate this cell the notebook's imports cell (clearing any other) or null
  *  to un-designate; `setCellRole` enforces the one-imports-cell-per-notebook rule.
+ *  `hiddenFromAgent` withholds the cell from every agent surface (the same flag
+ *  MCP's `set_cell_visibility` writes) and applies to EVERY cell type, so unlike
+ *  `export`/`hideInput` it is not gated on the cell being code. It is also the one
+ *  field here whose write is REPORTED rather than assumed: it is a withholding
+ *  control applied optimistically in the browser, so answering `{ok:true}` for a
+ *  cell the document does not have would leave the row claiming a concealment that
+ *  never happened.
  *
  *  `cell_type` is VALIDATED against `$lib/cellLanguage`'s vocabulary — the same one
  *  the bulk and add routes use — rather than coerced: `nbCellType` maps anything it
@@ -38,6 +45,28 @@ export async function PATCH({ params, request }) {
 	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
 	if ('export' in body) setCellExport(params.id, !!body.export, body.nb, body.originId);
 	if ('hideInput' in body) setHideInput(params.id, body.hideInput, body.nb, body.originId);
+	// SCOPED to `hiddenFromAgent` deliberately: the sibling setters above discard
+	// their boolean too, and widening them is a separate change. This one is
+	// different because it is a WITHHOLDING control - the client applies it
+	// optimistically, so a swallowed refusal leaves the row claiming the cell is
+	// hidden from every agent surface while the document still hands it to each of
+	// them. `setVisibility` reports false only for a cell that does not exist (a
+	// no-op still reports true), so this cannot fire on an ordinary re-set.
+	//
+	// It can also THROW: the notebook write can fail (a read-only checkout, ENOSPC,
+	// EACCES on the `.ipynb`), and it rolls its own in-memory change back before
+	// rethrowing so the agent surface is never left more permissive than what the
+	// client is about to report. That is a stated outcome of this field rather than
+	// an incidental 500 with a stack trace, so it is reported in this handler's own
+	// refusal shape - and, like the 404 above, scoped to `hiddenFromAgent` alone.
+	if ('hiddenFromAgent' in body) {
+		try {
+			if (!setVisibility(params.id, !!body.hiddenFromAgent, body.nb, body.originId))
+				return json({ ok: false, reason: 'no-such-cell' }, { status: 404 });
+		} catch (err) {
+			return json({ ok: false, reason: 'write-failed', message: String(err?.message ?? err) }, { status: 500 });
+		}
+	}
 	return json({ ok: true });
 }
 

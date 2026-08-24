@@ -30,6 +30,7 @@ import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveExportTarget, type ExportResult, type ResolvedExportTarget } from './export-py';
 import { canExportCell } from '../exportRole';
+import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
 import { resolveInWorkspace } from './fstree';
@@ -646,15 +647,90 @@ export function getCell(id: string, nb?: string | null): CellView | null {
 	return { id: c.id, cell_type: c.cell_type, source: c.source, outputs: c.outputs ?? [], metadata: c.metadata ?? {} };
 }
 
-/** Set the agent-visibility flag in the allowlisted `cellar` namespace. */
-export function setVisibility(id: string, hidden: boolean, nb?: string | null): boolean {
+/**
+ * Set the agent-visibility flag in the allowlisted `cellar` namespace, so it
+ * round-trips through clean-on-save. Applies to EVERY cell type - the flag is
+ * honored in every agent map, read, search, section and result, and a markdown
+ * cell's prose is as much a thing to withhold as a code cell's source, so unlike
+ * `setCellExport`/`setHideInput` there is no cell-type gate.
+ *
+ * SHOWING deletes the key rather than storing `false` (the `setCellExports`
+ * rule): `isHiddenFromAgent` is strictly `=== true`, so absent and `false` read
+ * identically, and storing the default would put a line in the user's committed
+ * `.ipynb` for a cell that is in the state every cell starts in. It deletes the
+ * key it WROTE - a pre-existing explicit `false` (what `set_cell_visibility(id,
+ * false)` stored before this change, or a hand edit) already reads as visible, so
+ * the change check below returns early and leaves it exactly as it is, which is
+ * inert under that same strictly-`=== true` reading and is self-healed by any
+ * hide-then-show round trip. Cleaning it was considered and NOT done: a "show"
+ * would then sometimes write and sometimes not, a subtler rule than the change
+ * detection it would complicate, for a shape nothing can observe.
+ *
+ * Only a real CHANGE writes or emits, so re-setting the value a cell already
+ * carries costs no `.ipynb` write and no event (zero git diff, no mtime churn) -
+ * which is also what keeps an optimistic UI toggle from echoing itself back.
+ *
+ * The persist is guarded on `jpFormat` like `setCellExports`: a `.py` text
+ * notebook carries no cellar cell metadata, so the write would spend a blocking
+ * jupytext `spawnSync` producing byte-identical output while silently losing the
+ * very flag it was asked to store. The event still fires, so open tabs update
+ * either way and the flag holds for the session (the same in-session-only limit
+ * every per-cell `cellar` flag has on a `.py` notebook). That branch runs no
+ * persist, so it has no failure path and the rollback below cannot apply to it.
+ *
+ * THE INVARIANT: no path may leave the agent surface MORE PERMISSIVE than what
+ * the user is being told. The in-memory doc IS the agent surface - every MCP
+ * read/search/section and every chat transcript reads it through `docFor` - so a
+ * mutation that lands there before a `persist` that then THROWS (a read-only
+ * checkout, ENOSPC, EACCES on the `.ipynb`) has already revoked a concealment
+ * while the caller is about to report the write as failed. On a SHOW that is the
+ * dangerous direction: the browser reverts the row and says the cell is still
+ * hidden while the running app hands it to every agent read. So the write is
+ * ROLLED BACK on failure and the error is rethrown, which keeps the caller's
+ * existing "it was not saved" copy TRUE rather than needing it reworded.
+ *
+ * RESTORE-ON-FAILURE rather than persist-first, deliberately: `persist`
+ * serializes the LIVE doc and there is no "persist this candidate value" form,
+ * so persisting first would mean deep-cloning the whole notebook on every
+ * toggle - costly, and a shape no other setter here uses. The rollback puts back
+ * the EXACT prior shape, because key-ABSENT and an explicit `false` are
+ * different states elsewhere in this flow, and it restores THAT KEY (plus any
+ * namespace this call itself created) alone, so a concurrent change to another
+ * `cellar` key is not clobbered. The `emit` sits after the persist, so the
+ * rethrow reaches the caller before any event is published: a failed write
+ * announces nothing, because nothing changed.
+ */
+export function setVisibility(id: string, hidden: boolean, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return false;
-	cell.metadata = cell.metadata ?? {};
-	cell.metadata.cellar = cell.metadata.cellar ?? {};
-	cell.metadata.cellar.hidden_from_agent = !!hidden;
-	persist(doc);
+	if (isHiddenFromAgent(cell) === !!hidden) return true;
+	const hadMetadata = !!cell.metadata;
+	const hadCellar = !!cell.metadata?.cellar;
+	const hadKey = !!cell.metadata?.cellar && 'hidden_from_agent' in cell.metadata.cellar;
+	const was = cell.metadata?.cellar?.hidden_from_agent;
+	if (hidden) {
+		cell.metadata = cell.metadata ?? {};
+		cell.metadata.cellar = cell.metadata.cellar ?? {};
+		cell.metadata.cellar.hidden_from_agent = true;
+	} else {
+		delete cell.metadata?.cellar?.hidden_from_agent;
+	}
+	try {
+		if (!doc.jpFormat) persist(doc);
+	} catch (err) {
+		if (hadKey) {
+			cell.metadata = cell.metadata ?? {};
+			cell.metadata.cellar = cell.metadata.cellar ?? {};
+			cell.metadata.cellar.hidden_from_agent = was;
+		} else {
+			delete cell.metadata?.cellar?.hidden_from_agent;
+			if (!hadCellar) delete cell.metadata?.cellar;
+			if (!hadMetadata) delete cell.metadata;
+		}
+		throw err;
+	}
+	emit(doc, 'cell:visibility', { cellId: id, hidden: !!hidden }, originId);
 	return true;
 }
 

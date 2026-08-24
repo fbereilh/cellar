@@ -270,7 +270,9 @@ test('split-cell hands the created half the cell it came out of - language yes, 
 	const exportCell = cells.last();
 	const exportId = (await exportCell.getAttribute('data-cell-id')) ?? '';
 	await patchCell(page, exportId, { export: true });
-	await expect(exportCell.getByTestId('export-badge')).toBeVisible();
+	// the export toggle in the row IS the marker now - the separate badge that
+	// said the same thing is gone (tests/unit/cell-row-toggles.test.ts)
+	await expect(exportCell.getByTestId('toggle-export')).toHaveAttribute('aria-pressed', 'true');
 
 	await typeTwoLines(page, exportCell, 'a = 1', 'b = 2');
 	await page.keyboard.press('Home');

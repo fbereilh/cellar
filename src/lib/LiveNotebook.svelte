@@ -133,6 +133,7 @@
 		| { type: 'cell:role'; cellId: string; role?: string | null }
 		| { type: 'cell:export'; cellId: string; exported: boolean }
 		| { type: 'cell:hide-input'; cellId: string; hidden: boolean | null }
+		| { type: 'cell:visibility'; cellId: string; hidden: boolean }
 		| { type: 'cell:deleted'; cellId: string }
 		| { type: 'cell:moved'; cellId: string; toIndex: number }
 		| { type: 'cell:type'; cellId: string; cell_type: CellType; language?: string | null }
@@ -1509,6 +1510,16 @@
 			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
 			loadCellCollapsed(); // restore this notebook's fully collapsed cells (runtime-only)
 			pruneCollapsedToCells(); // drop entries for cells deleted while we were away
+			// A load RE-ESTABLISHES server truth for every cell at once, so it supersedes
+			// every in-flight local write - which is exactly what the hide-from-agent
+			// revert's generation guard must see. Clearing (rather than bumping per cell)
+			// is what makes that true: `cells` is replaced wholesale here, so a write that
+			// predates this load must neither revert nor claim anything. Without it the
+			// guard misses this carrier entirely - a notebook:restored, an sse:open
+			// reconnect or a seq-gap refetch would leave the pre-load generation intact,
+			// so a failing hide would revert over the server's own newer state and the
+			// notice would assert the OPPOSITE of what the document holds.
+			agentVisibilitySeq.clear();
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
@@ -1609,6 +1620,13 @@
 				else cellar.hide_input = !!ev.hidden;
 				cell.metadata = { ...(cell.metadata ?? {}), cellar };
 			}
+		} else if (ev.type === 'cell:visibility') {
+			// A cell was hidden from (or shown to) the agent surface. Reassign metadata
+			// for reactivity (the cell may have had no `cellar` namespace). SHOWING
+			// deletes the key rather than storing `false`, mirroring the server's own
+			// rule, so an optimistic apply and a reload cannot disagree about the shape
+			// of a visible cell's metadata.
+			applyHiddenFromAgentLocally(ev.cellId, ev.hidden);
 		} else if (ev.type === 'notebook:export-target') {
 			// The event carries the whole stored state (base + resolution beside the
 			// target), so an agent's or another tab's change lands as one consistent
@@ -2347,6 +2365,218 @@
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ hideInput: hidden, nb: path, originId })
 		}).catch(() => {});
+	}
+
+	/**
+	 * Hide (or show) a cell on the AGENT surface (`cellar.hidden_from_agent`) - a
+	 * withholding choice that survives clean-on-save. Applied optimistically here
+	 * (reassign metadata so the toggle reacts) and persisted server-side. Applies to
+	 * EVERY cell type, so unlike `setExport`/`setHideInput` there is no code-cell
+	 * gate; the source and the output are untouched and the cell still runs.
+	 *
+	 * SHOWING deletes the key rather than storing `false`, matching the server's own
+	 * rule, so the optimistic shape and the persisted shape agree.
+	 *
+	 * It deliberately does NOT follow `setExport`/`setHideInput`'s fire-and-forget
+	 * convention, and that divergence is the point rather than an inconsistency to
+	 * harmonise away: those two are PREFERENCES whose failure is cosmetic, while
+	 * this one is a WITHHOLDING control whose failure is a false claim of
+	 * concealment - a row reading "hidden from AI agents" over a document that still
+	 * hands the cell to every agent read, chat transcript and MCP tool. A refetch
+	 * eventually corrects it (an SSE drop, a seq gap), which makes the window rare,
+	 * not honest. So the outcome is READ - and read as the SAME three-way split
+	 * `commitExportTarget` already uses in this file (`VisibilityCommit` mirrors
+	 * `TargetCommit`), rather than as a boolean, because "the server refused" and
+	 * "we never heard back" are different facts and only one of them licenses a
+	 * claim about the cell's disclosure state:
+	 *
+	 * - `committed`   the server stored it
+	 * - `refused`     the server REJECTED it (no such cell); the flag goes back and
+	 *                 the notice SAYS what is true
+	 * - `writeFailed` the notebook write failed, and `setVisibility` ROLLED ITS OWN
+	 *                 change back before rethrowing, so the document holds the prior
+	 *                 value and the same definite copy is true
+	 * - `unreachable` the request landed no verdict we can read; CLAIM NOTHING
+	 * - `superseded`  another writer owns the cell: touch nothing, say nothing
+	 *
+	 * `unreachable` is the one that must not revert, and it is the whole reason this
+	 * is not a boolean. A rejected fetch does NOT mean the write did not happen: the
+	 * reachable path is a SHOW the server applied and persisted whose response was
+	 * lost on the way back (the connection dropped - a second `cellar` launch in this
+	 * folder reaps the running instance, `cellar cleanup`, a transient socket error).
+	 * The document then holds the cell VISIBLE, so REVERTING IS WHAT MANUFACTURES THE
+	 * DIVERGENCE - and telling the user the cell is still hidden asserts a
+	 * concealment that was just revoked, the exact failure this control exists to
+	 * prevent. So the flag is left as applied, the notice says only that the change
+	 * could not be CONFIRMED, and the normal refetch paths settle it; there is
+	 * deliberately no bespoke `load()` here.
+	 *
+	 * A verdict is READABLE only when the reply carries this route's own
+	 * `{ok:false, reason}` shape. Anything else - a rejected fetch, a proxy 502/503,
+	 * an HTML error page - is `unreachable`, exactly as the sibling decides it.
+	 *
+	 * The revert is SUPERSEDE-SAFE by GENERATION (`agentVisibilitySeq`, the per-cell
+	 * `pinSeq` shape and the `exportTargetCommit`/`statusSeq` reasoning), never by
+	 * comparing the cell's VALUE against what we wrote: an SSE `cell:visibility`, a
+	 * `load()` refetch or another local flip may have landed while the request was in
+	 * flight, and a value test cannot tell "the cell still holds what WE wrote" from
+	 * "someone else just wrote the same value" - so an agent hiding the cell during
+	 * our own failed hide read as ours, was reverted, and the row then claimed the
+	 * OPPOSITE of what the server holds. A superseded write therefore does nothing at
+	 * all: no revert, and no notice either, because another writer owns the cell and
+	 * anything we said would describe a state we no longer own. When it does fire it
+	 * restores THAT KEY alone rather than a whole metadata snapshot, which would
+	 * clobber a concurrent change to the export flag one control along.
+	 *
+	 * The network write is SERIALIZED PER CELL (`agentVisibilityWrites`): two rapid
+	 * flips of one toggle issue two PATCHes of the same field to the same URL, and
+	 * if they settle out of order the server ends on the FIRST click's value while
+	 * the row shows the second's - silently, since both responses are `ok` (no
+	 * revert, no notice) and both `cell:visibility` echoes carry this tab's
+	 * `originId` (both suppressed). In the dangerous direction the row reads "hidden
+	 * from AI agents" over a document that hands the cell to every agent surface. The
+	 * window is small; the direction is what makes it worth closing here.
+	 *
+	 * Scoped to this control ALONE, and deliberately not extended to `setExport` /
+	 * `setHideInput`: those are preferences whose worst case is a stale display,
+	 * while this is the disclosure control - doing it there too is worth deciding
+	 * separately rather than inheriting from here.
+	 *
+	 * Only the FETCH is serialized: the optimistic apply stays immediate, or the row
+	 * would stop responding to a click while a request is in flight. That ordering is
+	 * safe BECAUSE of the generation guard above - the second click's optimistic
+	 * apply bumps the generation, so when the first write's turn comes and it fails,
+	 * its revert sees itself superseded and does nothing. The two are one mechanism;
+	 * do not "simplify" either half without the other.
+	 */
+	async function setHiddenFromAgent(id: string, hidden: boolean): Promise<VisibilityCommit> {
+		const before = findCell(id)?.metadata?.cellar ?? {};
+		const had = 'hidden_from_agent' in before;
+		const was = before.hidden_from_agent;
+		applyHiddenFromAgentLocally(id, hidden);
+		const seq = agentVisibilitySeq.get(id);
+		const prior = agentVisibilityWrites.get(id);
+		const run = (async (): Promise<VisibilityCommit> => {
+			if (prior) await prior;
+			const res = await fetch(`/api/cells/${id}`, {
+				method: 'PATCH',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ hiddenFromAgent: hidden, nb: path, originId })
+			}).catch(() => null);
+			if (res?.ok) return 'committed';
+			// Read ONCE, and only this route's own refusal shape counts as a verdict.
+			const body = res
+				? await res
+						.json()
+						.then((b) => (b && typeof b === 'object' ? (b as Record<string, unknown>) : null))
+						.catch(() => null)
+				: null;
+			const reason = typeof body?.reason === 'string' ? body.reason : null;
+			if (agentVisibilitySeq.get(id) !== seq) return 'superseded';
+			if (!reason) {
+				onNotice?.(
+					'That cell was not confirmed changed - the server did not answer. Reload to see whether it is hidden from AI agents.'
+				);
+				return 'unreachable';
+			}
+			const now = findCell(id);
+			if (now) {
+				const cellar = { ...(now.metadata?.cellar ?? {}) };
+				if (had) cellar.hidden_from_agent = was;
+				else delete cellar.hidden_from_agent;
+				now.metadata = { ...(now.metadata ?? {}), cellar };
+				bumpAgentVisibilitySeq(id);
+			}
+			onNotice?.(
+				hidden
+					? 'That cell is still VISIBLE to AI agents - hiding it was not saved.'
+					: 'That cell is still HIDDEN from AI agents - showing it was not saved.'
+			);
+			return reason === 'write-failed' ? 'writeFailed' : 'refused';
+		})();
+		agentVisibilityWrites.set(id, run);
+		try {
+			return await run;
+		} finally {
+			// drop the entry once this cell's chain has drained, the way the server's
+			// own `withPathLock` does, so the map never grows with the session
+			if (agentVisibilityWrites.get(id) === run) agentVisibilityWrites.delete(id);
+		}
+	}
+
+	/**
+	 * What became of an agent-visibility write - the `TargetCommit` shape, member for
+	 * member, because the two answer the same question and a second vocabulary for it
+	 * is how one of them quietly loses a case. See `setHiddenFromAgent`'s header for
+	 * what each outcome licenses; the one that matters is that `unreachable` claims
+	 * NOTHING about the cell's disclosure state.
+	 */
+	type VisibilityCommit = 'committed' | 'refused' | 'unreachable' | 'writeFailed' | 'superseded';
+
+	/**
+	 * One in-flight agent-visibility write per cell - the tail-chain that makes two
+	 * rapid flips of one toggle land in the order they were clicked. A cell's entry
+	 * is deleted when its chain drains (see `setHiddenFromAgent`), so this holds only
+	 * writes that are actually outstanding.
+	 */
+	const agentVisibilityWrites = new Map<string, Promise<VisibilityCommit>>();
+
+	/**
+	 * Per-cell ownership of the agent-visibility flag - the `pinSeq` shape, and what
+	 * makes `setHiddenFromAgent`'s revert a real generation guard rather than a value
+	 * test. Bumped by every LOCAL write of `hidden_from_agent` (the optimistic apply,
+	 * the revert) and by every APPLIED `cell:visibility`, so a failed write can tell
+	 * whether it still owns the cell. Transient and never persisted: it describes who
+	 * wrote last in THIS tab's session, not anything the `.ipynb` records. Entries are
+	 * not pruned on delete, but only because there is nothing to gain (one Map entry
+	 * per toggled cell): pruning would be SAFE here, unlike under `pinSeq`'s per-cell
+	 * counting, since the single monotonic counter below means a removed entry's next
+	 * bump yields a strictly larger, never-before-issued token that no captured token
+	 * can match. `load()` relies on exactly that when it clears the map wholesale.
+	 *
+	 * The token is drawn from ONE monotonically increasing counter for the life of
+	 * this component, so it is globally unique and the map is per-cell only in WHICH
+	 * cell a token names - never in how the token is counted. That is what makes
+	 * `load()`'s wholesale `clear()` safe: minted per cell as `(current ?? 0) + 1`, a
+	 * cleared map re-issues `1` to the very next write, colliding with the token an
+	 * in-flight write already captured whenever that write was the cell's first - the
+	 * common case, not an exotic one. The failed write then read as still owning a
+	 * cell another writer had taken, reverted over the server's newer value and
+	 * announced the OPPOSITE of what the document holds: exactly the false-concealment
+	 * claim this guard exists to prevent, reached through the one carrier that
+	 * supersedes every in-flight write at once.
+	 */
+	let agentVisibilityWrite = 0;
+	const agentVisibilitySeq = new Map<string, number>();
+	function bumpAgentVisibilitySeq(id: string) {
+		agentVisibilitySeq.set(id, ++agentVisibilityWrite);
+	}
+
+	/**
+	 * Write the agent-visibility flag onto the local cell in its CANONICAL shape, the
+	 * ONE place that shape lives on this side: the optimistic apply and the SSE
+	 * handler must both DELETE the key on show (the server's own rule), or an
+	 * optimistic flip and a reload disagree about what a visible cell's metadata
+	 * looks like. Metadata is reassigned so the toggle reacts even for a cell that
+	 * had no `cellar` namespace.
+	 *
+	 * The failed-write revert in `setHiddenFromAgent` deliberately does NOT come
+	 * through here and must not be "unified" into it: this writes the canonical shape
+	 * (set `true`, or delete the key), while a revert restores a SNAPSHOT - which may
+	 * be the one shape this writer never emits, a pre-existing explicit `false`.
+	 * Widening this to take a restore value would make it express a legacy shape it
+	 * otherwise never needs; unifying the two would silently lose the ability to
+	 * restore that shape at all. It bumps the same generation, so ownership is
+	 * tracked for all three writes either way.
+	 */
+	function applyHiddenFromAgentLocally(id: string, hidden: boolean) {
+		const cell = findCell(id);
+		if (!cell) return;
+		const cellar = { ...(cell.metadata?.cellar ?? {}) };
+		if (hidden) cellar.hidden_from_agent = true;
+		else delete cellar.hidden_from_agent;
+		cell.metadata = { ...(cell.metadata ?? {}), cellar };
+		bumpAgentVisibilitySeq(id);
 	}
 
 	/**
@@ -4036,6 +4266,7 @@
 			onSetScrolled={setScrolled}
 			hideAllCode={hideAllCode}
 			onSetHideInput={setHideInput}
+			onSetHiddenFromAgent={setHiddenFromAgent}
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}
 			cellCollapsed={cellCollapsed}
