@@ -391,20 +391,39 @@ mark.cellar-search-mark-active {
  * `<pre>`'s own margins still collapse through it and wrapping a block changes
  * nothing about the surrounding rhythm.
  *
- * ABSOLUTE, so appearing costs no reflow - the block never moves, whether the
- * control is showing or not - and hover-only, so the code is unobscured for as
- * long as it is being READ. It sits over the `<pre>`'s own top-right padding and
- * carries a solid surface, so on the rare wide first line it reads as a control
- * on top of code rather than as code. */
+ * Two requirements shape the whole block below - the control may never obscure
+ * the code, and it may never move the block. So it is ABSOLUTE (nothing reflows
+ * as it brightens) and it lives in a strip reserved at the TOP of the `<pre>`
+ * (nothing is ever underneath it - see that rule). Both hold at every hover
+ * state and every horizontal scroll offset. */
 .cellar-md .cellar-code-block {
 	position: relative;
 }
+/* The control's own strip, and it is what makes "never obscures the code" TRUE
+ * rather than nearly true. An overlay in the corner covers whatever sits under it
+ * - which for a block whose first line reaches the right edge is code, and a
+ * `padding-right` cannot help, because the box scrolls horizontally and the
+ * control does not: at any scroll offset something is under it. Vertical space is
+ * the one axis horizontal scrolling cannot move content along, so the strip is
+ * reserved at the TOP.
+ *
+ * Reserved on the decorated `<pre>` itself, so it is in place the moment the
+ * wrapper is (the decorator runs in the same microtask flush as the render, i.e.
+ * before the browser paints) - and only on a decorated one, so the `.md` file
+ * preview, which shares `.cellar-md` but carries no controls, is untouched. */
+.cellar-md .cellar-code-block > pre {
+	padding-top: 1.75rem;
+}
 .cellar-md .cellar-code-extract {
 	position: absolute;
-	top: 0.3rem;
-	right: 0.3rem;
+	top: 0.2rem;
+	right: 0.4rem;
 	z-index: 1;
-	opacity: 0;
+	/* Quiet at rest rather than hidden. The strip above is reserved either way, so
+	 * hiding it outright would leave an unexplained gap and make the feature
+	 * findable only by accident - and the affordance it belongs to (the cell
+	 * toolbar's copy buttons) is always visible too, at a comparable weight. */
+	opacity: 0.4;
 	transition: opacity 120ms ease;
 	background-color: var(--color-base-300);
 	border-color: color-mix(in oklab, var(--color-base-content) 12%, transparent);
@@ -418,14 +437,6 @@ mark.cellar-search-mark-active {
 }
 .cellar-md .cellar-code-block:hover .cellar-code-extract:hover {
 	color: var(--color-base-content);
-}
-/* A pointer-less device can never hover, so the control would be unreachable by
- * its only reveal - and the keyboard chord it would fall back on has no hover to
- * resolve either. Shown outright there, quietly. */
-@media (hover: none) {
-	.cellar-md .cellar-code-extract {
-		opacity: 0.55;
-	}
 }
 /* The confirmation: the check replaces the arrow for a moment (`data-extracted`,
  * set by `flashExtracted`), exactly as the cell toolbar's copy buttons confirm.

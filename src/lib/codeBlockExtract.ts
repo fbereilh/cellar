@@ -220,7 +220,11 @@ function buildIcon(doc: Document, name: 'extract' | 'done'): SVGSVGElement {
 	return svg;
 }
 
-/** The control itself: icon-only, revealed when the block is hovered or it is focused. */
+/**
+ * The control itself: icon-only, quiet at rest and full-strength on hover/focus.
+ * It sits in a strip `app.css` reserves at the top of the block, so it covers no
+ * code at any scroll offset and the block never moves as it brightens.
+ */
 function buildExtractButton(doc: Document, block: ExtractedCodeBlock | null): HTMLButtonElement {
 	const label = extractLabel(block?.cellType ?? 'code');
 	const btn = doc.createElement('button');

@@ -30,7 +30,10 @@ const MD_ID = 'mdcell0000';
 
 /** The three blocks the seeded reply carries, and the cells they must produce. */
 const PY_BLOCK = 'import pandas as pd\ndf = pd.read_csv("sales.csv")\ndf.head()';
-const SQL_BLOCK = 'select region, sum(amount) as total\nfrom sales\ngroup by region';
+// Deliberately ONE very long line: it is what makes the overlap test meaningful,
+// since a corner overlay covers code only where a line reaches the right edge.
+const SQL_BLOCK =
+	"select region, channel, segment, quarter, sum(amount) as total, count(id) as n, avg(amount) as avg_amount from sales group by region, channel, segment, quarter";
 /** A markdown block that also contains a FENCE - nothing may re-read those markers. */
 const MD_BLOCK = ['# Notes', '', 'Run it like this:', '', '```python', 'print("hi")', '```', '', 'Watch `a < b` and "&amp;".'].join('\n');
 
@@ -172,8 +175,8 @@ test('the BUTTON creates a cell whose source is byte-identical, typed by the fen
 	test.setTimeout(120_000);
 	const nb = await openFresh(page, 'extract-button.ipynb');
 
-	// Hover-revealed, and appearing moves nothing: the control is out of flow, so
-	// the block it belongs to is exactly where it was.
+	// Brightening on hover moves nothing: the control is out of flow, so the block
+	// it belongs to is exactly where it was.
 	const before = await blocks(page).nth(PY_AT).boundingBox();
 	await blocks(page).nth(PY_AT).hover();
 	await expect(extractBtn(page, PY_AT)).toBeVisible();
@@ -186,6 +189,33 @@ test('the BUTTON creates a cell whose source is byte-identical, typed by the fen
 	expect(typeOf(cell)).toBe('code');
 	// It landed directly below the cell it came from.
 	expect(idsOf(nb)).toEqual([MD_ID, CHAT_ID, cell.id]);
+});
+
+test('the control covers no code, at rest, hovered, or scrolled to the end', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openFresh(page, 'extract-overlap.ipynb');
+
+	// The WIDE block: its single line is far longer than the box, so it is the one
+	// a corner overlay would cover - and `padding-right` could not save it, since
+	// the box scrolls under a control that does not.
+	const block = blocks(page).nth(SQL_AT);
+	const btn = block.getByTestId('extract-code');
+	const code = block.locator('pre > code');
+
+	const overlaps = async () => {
+		const [b, c] = [await btn.boundingBox(), await code.boundingBox()];
+		if (!b || !c) throw new Error('missing box');
+		return b.x < c.x + c.width && c.x < b.x + b.width && b.y < c.y + c.height && c.y < b.y + b.height;
+	};
+
+	expect(await overlaps(), 'at rest').toBe(false);
+	await block.hover();
+	await expect(btn).toBeVisible();
+	expect(await overlaps(), 'hovered').toBe(false);
+	// Scrolled to the very end, so the LAST characters of the longest line sit at
+	// the right edge - where the control is.
+	await block.locator('pre').evaluate((el) => (el.scrollLeft = el.scrollWidth));
+	expect(await overlaps(), 'scrolled to the end').toBe(false);
 });
 
 test('the SHORTCUT extracts the HOVERED block, with the same source and type', async ({ page }) => {
