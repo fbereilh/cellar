@@ -152,16 +152,28 @@ export async function executeChatRun({
 		// right JOIN between them (see the header). `none` is the very start, where
 		// no separator belongs at all.
 		let last: 'none' | 'text' | 'tool' = 'none';
-		const emit = (text: string) => acc.push({ output_type: 'stream', name: 'stdout', text });
+		// Trailing newlines of everything emitted so far, so a separator TOPS UP to a
+		// blank line instead of always adding one. A reply delta routinely ends with
+		// its own newline, and an unconditional `\n\n` after it left a stray blank
+		// line in the persisted markdown and in the live (plain-text) view.
+		let trailingNewlines = 0;
+		const emit = (text: string) => {
+			if (!text) return;
+			acc.push({ output_type: 'stream', name: 'stdout', text });
+			const tail = /\n*$/.exec(text)?.[0].length ?? 0;
+			trailingNewlines = tail === text.length ? trailingNewlines + tail : tail;
+		};
+		/** The newlines still needed for a blank line between blocks. */
+		const gap = () => '\n'.repeat(Math.max(0, 2 - trailingNewlines));
 		const pushText = (text: string) => {
 			// A blockquote lazily swallows the line under it, so reply text resuming
 			// after an annotation needs a blank line or it becomes part of it.
-			if (last === 'tool') emit('\n\n');
+			if (last === 'tool') emit(gap());
 			emit(text);
 			last = 'text';
 		};
 		const pushToolLine = (line: string) => {
-			if (last === 'text') emit('\n\n');
+			if (last === 'text') emit(gap());
 			// A backslash hard break keeps consecutive annotations in ONE blockquote,
 			// one per rendered line; a bare newline would run them together, since the
 			// reply engine renders with `breaks: false`.
