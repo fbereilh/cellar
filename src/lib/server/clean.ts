@@ -51,10 +51,10 @@ import type { CellMetadata } from './types';
  * preservation.
  *
  * This does NOT relax deny-by-default: it is a fixed, named list, and a key
- * outside it is still dropped. nbdev's own extra keys (`solveit`, `solveit_ai`)
- * are NOT here - nbdev keeps those only because its `pyproject.toml` opts in via
- * `allowed_cell_metadata_keys`, i.e. they are project config, not an ecosystem
- * standard. Reading that config is deliberately out of scope here.
+ * outside it is still dropped. `solveit_ai` - the cell-scope sibling of the
+ * `solveit` key `ALLOWED_NB_METADATA` does carry - is deliberately NOT here: it
+ * appears in nbdev's `pyproject.toml` but in none of its notebooks, so unlike
+ * `solveit` no measured churn turns on it. See that list for the general rule.
  */
 export const ALLOWED_CELL_METADATA = ['cellar', 'nbdev', 'hide_input'];
 /**
@@ -90,10 +90,23 @@ export const ALLOWED_RAW_CELL_METADATA = ['raw_mimetype', 'format'];
  * `metadata.cellar` - so this can only preserve what JupyterLab already put on
  * disk, never manufacture a diff of its own. `language_info` is still dropped.
  *
+ * `solveit` is the one entry that is NOT from nbdev's base list: nbdev keeps it
+ * only because its own `pyproject.toml` opts in via `allowed_metadata_keys`, so
+ * nbdev's DEFAULT strips it exactly as an unwidened Cellar did. It is carried
+ * anyway because it is the same act as the five keys above - preserve another
+ * tool's metadata rather than destroy it - and because it is the whole remaining
+ * churn when Cellar saves nbdev's own repository (8 notebooks; see
+ * `tests/unit/nbdev-roundtrip.test.ts`). Reading a project's
+ * `allowed_metadata_keys` is the general form of this and is deliberately out of
+ * scope; until then a key that shows up in the wild is added here by name.
+ *
  * Like the cell list, this is a fixed named list, not a relaxation of
- * deny-by-default; see there for why nbdev's `solveit` is deliberately absent.
+ * deny-by-default: a key outside it is still dropped. NOTE the deliberate
+ * asymmetry with the cell list, which does NOT carry solveit's cell-scope sibling
+ * `solveit_ai` - that key appears in nbdev's project config but in none of its
+ * notebooks, so nothing measurable turns on it and it was not added blind.
  */
-export const ALLOWED_NB_METADATA = ['kernelspec', 'cellar', 'nbdev', 'jupytext', 'widgets', 'doc', 'jekyll'];
+export const ALLOWED_NB_METADATA = ['kernelspec', 'cellar', 'nbdev', 'jupytext', 'widgets', 'doc', 'jekyll', 'solveit'];
 
 const ADDRESS_RE = /(<[^<>]*?) at 0x[0-9a-fA-F]+(?=[>\s])/g;
 

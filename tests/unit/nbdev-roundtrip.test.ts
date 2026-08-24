@@ -13,13 +13,14 @@
  * Cellar's real save pipeline — the exact calls `writeNotebook` makes:
  *
  *   before:  31 files changed, 2278 insertions(+), 2350 deletions(-)
- *   after:    8 files changed,    8 insertions(+),   78 deletions(-)
+ *   after:   ZERO — `git status --porcelain` empty across all 33
  *
- * and the generated library was unchanged in both cases. The residual 86 lines are
- * `metadata.solveit` alone, a key nbdev's OWN default also strips (it survives in
- * nbdev's repo only because nbdev's `pyproject.toml` opts in via
- * `allowed_metadata_keys`) — so Cellar now matches nbdev's default behavior. That
- * is asserted below rather than left as prose.
+ * with the generated library unchanged in both cases (`nbdev-export` afterwards
+ * moves only `nbdev/__init__.py`, which the PRISTINE tree moves too).
+ *
+ * Getting to zero took two independent fixes and BOTH are asserted below: the
+ * sorted-key writer (which was 100% of the byte churn) and the widened allowlists
+ * (which were 100% of the semantic loss).
  *
  * The byte-level claim is checked AGAINST PYTHON'S OWN WRITER rather than by
  * eyeballing key order: "the keys are sorted" is a much weaker statement than
@@ -130,7 +131,8 @@ describe('metadata allowlists — foreign keys the ecosystem defines', () => {
 				doc: { title: 'x' },
 				jekyll: { layout: 'p' },
 				language_info: { name: 'python', version: '3.11.4' },
-				solveit: { ver: 2 }
+				solveit: { ver: 2 },
+				colab: { provenance: [] }
 			},
 			cells: [
 				{
@@ -156,8 +158,17 @@ describe('metadata allowlists — foreign keys the ecosystem defines', () => {
 
 	it('preserves the rest of nbdev\'s base notebook keys, and still drops language_info', () => {
 		const cleaned: any = cleanNotebook(nbdevNotebook());
-		expect(Object.keys(cleaned.metadata).sort()).toEqual(['doc', 'jekyll', 'jupytext', 'kernelspec', 'nbdev', 'widgets']);
+		expect(Object.keys(cleaned.metadata).sort()).toEqual(['doc', 'jekyll', 'jupytext', 'kernelspec', 'nbdev', 'solveit', 'widgets']);
 		expect(cleaned.metadata.language_info).toBeUndefined();
+	});
+
+	it('preserves `solveit` — the whole residual churn on nbdev\'s own repository', () => {
+		// NOT from nbdev's base list: nbdev keeps it only via `allowed_metadata_keys`
+		// in its own pyproject.toml, so nbdev's DEFAULT strips it. Carried anyway,
+		// because it is the same act as the five keys beside it and it is 100% of what
+		// a Cellar save otherwise still destroyed in nbdev's own 33 notebooks.
+		const cleaned: any = cleanNotebook(nbdevNotebook());
+		expect(cleaned.metadata.solveit).toEqual({ ver: 2 });
 	});
 
 	it('preserves a cell\'s bare hide_input (Jupyter\'s key, distinct from cellar.hide_input)', () => {
@@ -166,14 +177,15 @@ describe('metadata allowlists — foreign keys the ecosystem defines', () => {
 	});
 
 	it('still denies by default — a key outside the named lists is dropped in both scopes', () => {
-		// The lists are FIXED and NAMED, not a relaxation of the policy. `solveit` /
-		// `solveit_ai` are nbdev's own PROJECT config (`allowed_*_metadata_keys` in its
-		// pyproject.toml), not an ecosystem standard, so Cellar drops them - which is
-		// exactly what nbdev's own default does too.
+		// The lists are FIXED and NAMED, not a relaxation of the policy: widening them
+		// is an explicit, per-key act.
 		const cleaned: any = cleanNotebook(nbdevNotebook());
-		expect(cleaned.metadata.solveit).toBeUndefined();
-		expect(cleaned.cells[0].metadata.solveit_ai).toBeUndefined();
+		expect(cleaned.metadata.colab).toBeUndefined();
 		expect(cleaned.cells[0].metadata.collapsed).toBeUndefined();
+		// The deliberate asymmetry: `solveit_ai` is solveit's CELL-scope sibling and is
+		// NOT carried - it is in nbdev's project config but in none of its notebooks,
+		// so unlike `solveit` no measured churn turns on it.
+		expect(cleaned.cells[0].metadata.solveit_ai).toBeUndefined();
 	});
 
 	it('matches nbdev\'s CURRENT base allowlists exactly, plus Cellar\'s own keys', () => {
@@ -184,8 +196,9 @@ describe('metadata allowlists — foreign keys the ecosystem defines', () => {
 		const NBDEV_CELL = ['hide_input', 'nbdev'];
 		for (const k of NBDEV_NB) expect(ALLOWED_NB_METADATA).toContain(k);
 		for (const k of NBDEV_CELL) expect(ALLOWED_CELL_METADATA).toContain(k);
-		// Cellar adds only its own namespace on top - nothing else crept in.
-		expect([...ALLOWED_NB_METADATA].sort()).toEqual([...NBDEV_NB, 'cellar'].sort());
+		// On top of nbdev's base lists, Cellar adds ONLY its own namespace and the one
+		// deliberate extra (`solveit`) - nothing else crept in.
+		expect([...ALLOWED_NB_METADATA].sort()).toEqual([...NBDEV_NB, 'cellar', 'solveit'].sort());
 		expect([...ALLOWED_CELL_METADATA].sort()).toEqual([...NBDEV_CELL, 'cellar'].sort());
 	});
 

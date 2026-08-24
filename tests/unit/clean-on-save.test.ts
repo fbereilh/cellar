@@ -29,8 +29,10 @@ function messyNotebook(): any {
 			// An ecosystem key that must SURVIVE (nbdev's own base allowlist carries it,
 			// and Cellar never writes one, so keeping it can only preserve JupyterLab's).
 			widgets: { 'application/vnd.jupyter.widget-state+json': { state: {} } },
+			// Another tool's namespace, preserved rather than destroyed.
+			solveit: { ver: 2 },
 			// A foreign key outside every allowlist: deny-by-default still drops it.
-			solveit: { ver: 2 }
+			colab: { provenance: [] }
 		},
 		cells: [
 			{
@@ -104,16 +106,17 @@ describe('cleanNotebook — correctness', () => {
 
 	it('enforces the notebook-metadata allowlist (drops language_info, keeps the ecosystem keys)', () => {
 		const cleaned = cleanNotebook(messyNotebook());
-		expect(Object.keys(cleaned.metadata).sort()).toEqual(['kernelspec', 'widgets']);
+		expect(Object.keys(cleaned.metadata).sort()).toEqual(['kernelspec', 'solveit', 'widgets']);
 		// Per-machine, and still dropped.
 		expect((cleaned.metadata as any).language_info).toBeUndefined();
 		// Deny-by-default is intact: the list is a fixed set of NAMED keys, not a
-		// relaxation, so a foreign key is still dropped.
-		expect((cleaned.metadata as any).solveit).toBeUndefined();
+		// relaxation, so a key outside it is still dropped.
+		expect((cleaned.metadata as any).colab).toBeUndefined();
 		// The allowlist is Cellar's two keys plus nbdev's ENTIRE base notebook list
-		// (`nbdev/clean.py`), so a notebook Cellar saves is not silently damaged.
+		// (`nbdev/clean.py`) plus `solveit`, so a notebook Cellar saves is not
+		// silently damaged.
 		expect([...ALLOWED_NB_METADATA].sort()).toEqual(
-			['cellar', 'doc', 'jekyll', 'jupytext', 'kernelspec', 'nbdev', 'widgets'].sort()
+			['cellar', 'doc', 'jekyll', 'jupytext', 'kernelspec', 'nbdev', 'solveit', 'widgets'].sort()
 		);
 	});
 
