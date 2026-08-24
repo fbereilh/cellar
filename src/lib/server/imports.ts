@@ -191,8 +191,18 @@ export function stripComments(text: string): string {
 	return out;
 }
 
-/** Split on top-level `;` (never inside brackets). Import statements hold no strings. */
-function splitSimpleStatements(code: string): string[] {
+/**
+ * Split on top-level `;` (never inside brackets), dropping empty parts - so a BARE
+ * TRAILING semicolon yields one statement, not two. Import statements hold no
+ * strings, so this does not need the string awareness `logicalLines` has.
+ *
+ * Exported so a caller that must tell a genuinely JOINED statement from a bare
+ * trailing `;` asks THIS splitter rather than a second `includes(';')` scan.
+ * `export-py.ts` needs exactly that: refusing to hoist a `__future__` import over a
+ * trailing semicolon closed nothing (there is no rider to reorder) and left the
+ * uncompilable module the hoist exists to remove.
+ */
+export function splitSimpleStatements(code: string): string[] {
 	const parts: string[] = [];
 	let depth = 0;
 	let cur = '';

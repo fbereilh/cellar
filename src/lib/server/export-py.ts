@@ -25,7 +25,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, basename, relative, resolve, sep } from 'node:path';
 import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
-import { logicalLines, stripComments } from './imports';
+import { logicalLines, stripComments, splitSimpleStatements } from './imports';
 import { isExportCell } from '../exportRole';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import type { Cell, NotebookDoc } from './types';
@@ -104,8 +104,15 @@ function renderAll(names: string[]): string {
 	return `__all__ = [${names.map((n) => `'${n}'`).join(', ')}]`;
 }
 
-/** A module-level `from __future__ import …` statement, as a whole logical line. */
-const FUTURE_RE = /^from\s+__future__\s+import\s+\S/;
+/**
+ * A module-level `from __future__ import …` statement, as a whole logical line.
+ *
+ * The tail is `\b`, NOT `\s+\S`: `from __future__ import(annotations)` needs no
+ * space before the parenthesis and Python compiles it, so requiring one left that
+ * spelling unhoisted and emitted the uncompilable module this exists to remove.
+ * A word boundary still rejects `from __future__ importannotations`.
+ */
+const FUTURE_RE = /^from\s+__future__\s+import\b/;
 
 /**
  * Lift every module-level `from __future__ import …` out of the exported sources.
@@ -128,12 +135,23 @@ const FUTURE_RE = /^from\s+__future__\s+import\s+\S/;
  * nested scope is never a logical line at indent 0, and a bracket-continued import
  * is ONE logical line, so it moves whole.
  *
- * Known limit (documented, not handled): a semicolon-JOINED statement
- * (`from __future__ import annotations; x = 1`) is left in place rather than
- * hoisted with a rider that would be reordered with it. That test runs over the
- * line's CODE (`stripComments`), never its raw bytes: a `;` sitting in a trailing
- * comment joins nothing, and reading it as a joined statement silently skipped the
- * hoist and emitted the very uncompilable module this exists to prevent.
+ * WHAT THE `;` RULE IS, and it is a rule about JOINING, not about the character.
+ * The line's CODE is split by `splitSimpleStatements` (`imports.ts`, the one
+ * top-level `;` splitter - never a second `includes(';')` scan), and only a line
+ * that really carries a SECOND statement is left alone. So a bare trailing
+ * semicolon (`from __future__ import annotations;`) IS hoisted - there is no rider
+ * to reorder, so refusing it closed nothing and emitted the uncompilable module
+ * this exists to remove - and so is a `;` sitting in a trailing comment, which
+ * `stripComments` has already dropped before the split.
+ *
+ * KNOWN LIMIT, with its CONSEQUENCE stated rather than only its rule: a genuinely
+ * semicolon-JOINED statement (`from __future__ import annotations; x = 1`) is
+ * still left in place, because hoisting it would reorder its rider and relocating
+ * a user's code is out of scope. The consequence is that such a cell STILL yields
+ * a module Python refuses to compile while `exportNotebookToPy` reports
+ * `written: true` - i.e. this class is narrowed, not closed. Pinned as
+ * known-and-accepted by a `compile()` case in `export-py-future.test.ts`, so
+ * closing it later forces this wording to be updated.
  *
  * Returns the deduped hoisted statements and the sources with them spliced out.
  */
@@ -147,9 +165,10 @@ function liftFutureImports(sources: string[]): { future: string[]; body: string[
 			if (line.indent !== 0) continue; // only a module-level future statement moves
 			// The CODE of the line: comments dropped, continuations folded, strings kept.
 			const code = stripComments(line.raw).replace(/\s+/g, ' ').trim();
-			if (!FUTURE_RE.test(code) || code.includes(';')) continue;
-			if (!seen.has(code)) {
-				seen.add(code); // dedupe on the code, so a trailing comment is not a new statement
+			const parts = splitSimpleStatements(code);
+			if (parts.length !== 1 || !FUTURE_RE.test(parts[0])) continue;
+			if (!seen.has(parts[0])) {
+				seen.add(parts[0]); // dedupe on the statement, so a comment or a trailing `;` is not a new one
 				future.push(line.raw.replace(/\s+$/, '')); // hoisted verbatim, comment and all
 			}
 			cuts.push([line.start, line.end]);

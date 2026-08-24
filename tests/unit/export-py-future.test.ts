@@ -130,8 +130,39 @@ describe('generateModule — hoisting module-level __future__ imports', () => {
 	it('leaves a semicolon-joined statement alone (the documented limit)', () => {
 		const src = 'from __future__ import annotations; x = 1';
 		const out = expy.generateModule([src], 'demo.ipynb');
-		// Not hoisted - hoisting would reorder the rider with it.
+		// Not hoisted - hoisting would reorder the rider with it, and relocating a
+		// user's code is out of scope. The CONSEQUENCE is asserted below, against real
+		// python: this class is narrowed, NOT closed.
 		expect(out.indexOf('__all__')).toBeLessThan(out.indexOf(src));
+	});
+
+	it('HOISTS a BARE trailing semicolon - there is no rider to reorder', () => {
+		const out = expy.generateModule(['from __future__ import annotations;\nX = 1'], 'demo.ipynb');
+		expect(out.indexOf('from __future__ import annotations')).toBeLessThan(out.indexOf('__all__'));
+		expect(out.indexOf('__all__')).toBeLessThan(out.indexOf('X = 1'));
+	});
+
+	it('HOISTS the no-space-before-parenthesis spelling', () => {
+		// `from __future__ import(annotations)` needs no space and python compiles it,
+		// so requiring `\s+\S` after `import` left it unhoisted.
+		const out = expy.generateModule(['from __future__ import(annotations)\nX = 1'], 'demo.ipynb');
+		expect(out.indexOf('from __future__ import(annotations)')).toBeLessThan(out.indexOf('__all__'));
+		expect(out.indexOf('__all__')).toBeLessThan(out.indexOf('X = 1'));
+	});
+
+	it('still refuses a run-together `importannotations`', () => {
+		const src = 'from __future__ importannotations\nX = 1';
+		const out = expy.generateModule([src], 'demo.ipynb');
+		// Not a future statement at all (and not valid python); nothing is hoisted.
+		expect(out.indexOf('__all__')).toBeLessThan(out.indexOf('importannotations'));
+	});
+
+	it('dedupes a statement that differs only by a trailing semicolon', () => {
+		const out = expy.generateModule(
+			['from __future__ import annotations', 'from __future__ import annotations;\nY = 2'],
+			'demo.ipynb'
+		);
+		expect(out.match(/from __future__ import annotations/g)).toHaveLength(1);
 	});
 
 	it('HOISTS one whose trailing COMMENT contains a semicolon', () => {
@@ -227,6 +258,44 @@ describe.skipIf(!HAS_PY)('the exported module really COMPILES (python3; skipped 
 		const v = pythonVerdict(readFileSync(join(WS, res.target!), 'utf8'));
 		expect(v.error).toBe('');
 		expect(v.compiles).toBe(true);
+	});
+
+	it('compiles when the future import carries a BARE trailing semicolon', () => {
+		const res = expy.exportNotebookToPy({
+			...(docWith(['from __future__ import annotations;\nimport os', 'def f(x: int) -> str:\n    return str(x)']) as any),
+			metadata: { cellar: { export_target: 'out/baresemi.py' } }
+		} as never);
+		expect(res.written).toBe(true);
+		const v = pythonVerdict(readFileSync(join(WS, res.target!), 'utf8'));
+		expect(v.error).toBe('');
+		expect(v.compiles).toBe(true);
+	});
+
+	it('compiles the no-space-before-parenthesis spelling', () => {
+		const res = expy.exportNotebookToPy({
+			...(docWith(['from __future__ import(annotations)\nimport os', 'def f(x: int) -> str:\n    return str(x)']) as any),
+			metadata: { cellar: { export_target: 'out/paren.py' } }
+		} as never);
+		expect(res.written).toBe(true);
+		const v = pythonVerdict(readFileSync(join(WS, res.target!), 'utf8'));
+		expect(v.error).toBe('');
+		expect(v.compiles).toBe(true);
+	});
+
+	it('PINS the semicolon-JOINED limit: still uncompilable, still written:true', () => {
+		// The docstring records this as a known, accepted limit. Assert the CONSEQUENCE
+		// so it is pinned rather than merely described - and so that closing it later
+		// FAILS here and forces the wording in `export-py.ts` to be updated.
+		const src = 'from __future__ import annotations; x = 1';
+		expect(pythonVerdict(src).compiles).toBe(true); // the CELL itself is legal python
+		const res = expy.exportNotebookToPy({
+			...(docWith([src, 'def f(y): return y']) as any),
+			metadata: { cellar: { export_target: 'out/joined.py' } }
+		} as never);
+		expect(res.written).toBe(true);
+		const v = pythonVerdict(readFileSync(join(WS, res.target!), 'utf8'));
+		expect(v.compiles).toBe(false);
+		expect(v.error).toContain('__future__');
 	});
 
 	it('compiles a module with no future import at all (no regression)', () => {
