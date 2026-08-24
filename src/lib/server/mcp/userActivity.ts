@@ -115,6 +115,12 @@ type Kind = 'deleted' | 'added' | 'retyped' | 'edited' | 'moved' | 'restored';
  * where it lives, and get_notebook_map reports them on demand), and runs (a
  * user's re-run does move the live namespace, but reporting it well needs
  * compression the digest does not have yet - kernel_state stays the live truth).
+ *
+ * `cell:visibility` is excluded for a STRONGER reason than any of those, and
+ * must stay out: reporting "the user hid cell X" would name the very cell
+ * `hidden_from_agent` withholds, disclosing both that it exists and its handle -
+ * the invariant the whole filter below exists for, defeated by the announcement
+ * rather than by a read. Do not add it here.
  */
 const KIND_OF: Readonly<Record<string, Kind>> = {
 	'cell:deleted': 'deleted',
