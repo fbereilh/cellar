@@ -688,11 +688,13 @@ describe('the PATCH route accepts the new field', () => {
 describe('the client half', () => {
 	const live = src('lib/LiveNotebook.svelte');
 
-	// WHY SOURCE: the optimistic apply, its revert and the event handler must all
-	// DELETE the key on show, matching the server - else a toggle-off and a reload
-	// disagree about the shape of a visible cell's metadata. They reach ONE local
-	// writer, which is what makes that true by construction rather than by three
-	// copies happening to agree.
+	// WHY SOURCE: the optimistic apply and the event handler must both DELETE the
+	// key on show, matching the server - else a toggle-off and a reload disagree
+	// about the shape of a visible cell's metadata. They reach ONE local writer,
+	// which is what makes that true by construction rather than by two copies
+	// happening to agree. The failed-write revert deliberately does NOT come through
+	// it (it restores a snapshot, which may be a pre-existing explicit `false` the
+	// canonical writer never emits), so it is not named here.
 	it('optimistic apply and the SSE handler go through one local writer', () => {
 		expect(code(live)).toContain('function applyHiddenFromAgentLocally(id: string, hidden: boolean)');
 		const writer = code(live).slice(code(live).indexOf('function applyHiddenFromAgentLocally'));
@@ -715,7 +717,7 @@ describe('the client half', () => {
 		const all = code(live);
 		const from = all.indexOf('async function setHiddenFromAgent');
 		expect(from, 'expected setHiddenFromAgent').toBeGreaterThan(0);
-		const body = all.slice(from, all.indexOf('function applyHiddenFromAgentLocally', from));
+		const body = all.slice(from, all.indexOf('\n\t/**', from));
 		expect(body).toMatch(/onNotice\?\.\(/);
 		// both directions state the cell's REAL disclosure state, not "request failed"
 		expect(body).toContain('still VISIBLE to AI agents');

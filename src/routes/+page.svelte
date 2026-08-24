@@ -910,7 +910,7 @@
 		// ("it is not a Cellar-generated module", a non-.py or escaping target).
 		if (!r) return;
 		if (r.reason === 'no-target') showNotice('Set a target .py path at the top of the notebook first.');
-		else if (r.reason === 'no-cells') showNotice('No cells are marked for export - use a cell’s ⋮ menu.');
+		else if (r.reason === 'no-cells') showNotice('No cells are marked for export - use the export toggle in a cell’s toolbar.');
 		else {
 			fsRefreshSignal++; // a new/updated .py on disk → refresh the tree + git decorations
 			showNotice(`Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`);

@@ -28,7 +28,6 @@
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
 	import { exportCellCount } from '$lib/exportRole';
-	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isExportBase } from '$lib/exportTarget';
 	import { splitInheritedCellar } from '$lib/splitCell';
 	import { agentConfigNotice, type WorkspaceRootOption } from '$lib/notebookRoot';
@@ -2372,30 +2371,39 @@
 	 * that landed no verdict at all - the flag goes back and the shell's existing
 	 * transient notice channel SAYS what is true.
 	 *
-	 * The revert is SUPERSEDE-SAFE (the `exportTargetCommit`/`statusSeq` reasoning):
-	 * an SSE `cell:visibility`, a `load()` refetch or another local flip may have
-	 * landed while the request was in flight, so it only fires while the cell still
-	 * reads what we optimistically wrote, and it restores THAT KEY alone rather than
-	 * a whole metadata snapshot, which would clobber a concurrent change to the
-	 * export flag one control along.
+	 * The revert is SUPERSEDE-SAFE by GENERATION (`agentVisibilitySeq`, the per-cell
+	 * `pinSeq` shape and the `exportTargetCommit`/`statusSeq` reasoning), never by
+	 * comparing the cell's VALUE against what we wrote: an SSE `cell:visibility`, a
+	 * `load()` refetch or another local flip may have landed while the request was in
+	 * flight, and a value test cannot tell "the cell still holds what WE wrote" from
+	 * "someone else just wrote the same value" - so an agent hiding the cell during
+	 * our own failed hide read as ours, was reverted, and the row then claimed the
+	 * OPPOSITE of what the server holds. A superseded write therefore does nothing at
+	 * all: no revert, and no notice either, because another writer owns the cell and
+	 * anything we said would describe a state we no longer own. When it does fire it
+	 * restores THAT KEY alone rather than a whole metadata snapshot, which would
+	 * clobber a concurrent change to the export flag one control along.
 	 */
 	async function setHiddenFromAgent(id: string, hidden: boolean) {
 		const before = findCell(id)?.metadata?.cellar ?? {};
 		const had = 'hidden_from_agent' in before;
 		const was = before.hidden_from_agent;
 		applyHiddenFromAgentLocally(id, hidden);
+		const seq = agentVisibilitySeq.get(id);
 		const res = await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ hiddenFromAgent: hidden, nb: path, originId })
 		}).catch(() => null);
 		if (res?.ok) return;
+		if (agentVisibilitySeq.get(id) !== seq) return;
 		const now = findCell(id);
-		if (now && isHiddenFromAgent(now) === hidden) {
+		if (now) {
 			const cellar = { ...(now.metadata?.cellar ?? {}) };
 			if (had) cellar.hidden_from_agent = was;
 			else delete cellar.hidden_from_agent;
 			now.metadata = { ...(now.metadata ?? {}), cellar };
+			bumpAgentVisibilitySeq(id);
 		}
 		onNotice?.(
 			hidden
@@ -2405,11 +2413,36 @@
 	}
 
 	/**
-	 * Write the agent-visibility flag onto the local cell, the ONE place that shape
-	 * lives on this side: the optimistic apply, its revert and the SSE handler must
-	 * all DELETE the key on show (the server's own rule), or an optimistic flip and a
-	 * reload disagree about what a visible cell's metadata looks like. Metadata is
-	 * reassigned so the toggle reacts even for a cell that had no `cellar` namespace.
+	 * Per-cell ownership of the agent-visibility flag - the `pinSeq` shape, and what
+	 * makes `setHiddenFromAgent`'s revert a real generation guard rather than a value
+	 * test. Bumped by every LOCAL write of `hidden_from_agent` (the optimistic apply,
+	 * the revert) and by every APPLIED `cell:visibility`, so a failed write can tell
+	 * whether it still owns the cell. Transient and never persisted: it describes who
+	 * wrote last in THIS tab's session, not anything the `.ipynb` records. Entries
+	 * are deliberately not pruned on delete, for `pinSeq`'s own reason - a deletion
+	 * would let a stale generation match a fresh one.
+	 */
+	const agentVisibilitySeq = new Map<string, number>();
+	function bumpAgentVisibilitySeq(id: string) {
+		agentVisibilitySeq.set(id, (agentVisibilitySeq.get(id) ?? 0) + 1);
+	}
+
+	/**
+	 * Write the agent-visibility flag onto the local cell in its CANONICAL shape, the
+	 * ONE place that shape lives on this side: the optimistic apply and the SSE
+	 * handler must both DELETE the key on show (the server's own rule), or an
+	 * optimistic flip and a reload disagree about what a visible cell's metadata
+	 * looks like. Metadata is reassigned so the toggle reacts even for a cell that
+	 * had no `cellar` namespace.
+	 *
+	 * The failed-write revert in `setHiddenFromAgent` deliberately does NOT come
+	 * through here and must not be "unified" into it: this writes the canonical shape
+	 * (set `true`, or delete the key), while a revert restores a SNAPSHOT - which may
+	 * be the one shape this writer never emits, a pre-existing explicit `false`.
+	 * Widening this to take a restore value would make it express a legacy shape it
+	 * otherwise never needs; unifying the two would silently lose the ability to
+	 * restore that shape at all. It bumps the same generation, so ownership is
+	 * tracked for all three writes either way.
 	 */
 	function applyHiddenFromAgentLocally(id: string, hidden: boolean) {
 		const cell = findCell(id);
@@ -2418,6 +2451,7 @@
 		if (hidden) cellar.hidden_from_agent = true;
 		else delete cellar.hidden_from_agent;
 		cell.metadata = { ...(cell.metadata ?? {}), cellar };
+		bumpAgentVisibilitySeq(id);
 	}
 
 	/**

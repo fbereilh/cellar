@@ -362,6 +362,60 @@ test('a hide that does not save reverts and says the cell is still visible', asy
 	await expect.poll(() => 'hidden_from_agent' in diskCellar(CODE)).toBe(false);
 });
 
+test('a failed hide that another writer superseded neither reverts nor claims anything', async ({
+	page,
+	request
+}) => {
+	await openNotebook(page);
+	const cell = cellEl(page, MD);
+	const toggle = cell.getByTestId('toggle-agent-hidden');
+	await setToggle(cell, 'toggle-agent-hidden', false);
+
+	// HOLD this page's write open, so the window in which another writer can take
+	// the cell is a real interleaving rather than a race we hope to hit.
+	let release: (() => Promise<void>) | null = null;
+	await page.route('**/api/cells/**', async (route) => {
+		const req = route.request();
+		if (req.method() === 'PATCH' && (req.postData() ?? '').includes('hiddenFromAgent') && !release) {
+			release = () =>
+				route.fulfill({ status: 500, contentType: 'application/json', body: '{"ok":false}' });
+			return;
+		}
+		await route.continue();
+	});
+
+	try {
+		await toggle.click();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		await expect.poll(() => release !== null).toBe(true);
+
+		// An agent (or another tab) hides the SAME cell while our write is in flight.
+		// This goes through Playwright's own request context, so `page.route` does not
+		// intercept it, and the foreign originId means the page applies the resulting
+		// cell:visibility rather than echo-suppressing it.
+		const res = await request.patch(`${baseURL}/api/cells/${MD}`, {
+			data: { hiddenFromAgent: true, nb: NB, originId: 'other-tab' }
+		});
+		expect(res.ok()).toBe(true);
+		await expect.poll(() => diskCellar(MD).hidden_from_agent, { timeout: 15_000 }).toBe(true);
+
+		// only now does OUR write fail
+		await release!();
+
+		// The cell is hidden and the server says so, so nothing may put it back or
+		// announce otherwise. Value-equality could not see this - the current value
+		// equals what we wrote, so it reverted and said the cell was still visible.
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		await expect(page.getByTestId('app-notice')).toHaveCount(0);
+		expect(diskCellar(MD).hidden_from_agent).toBe(true);
+	} finally {
+		await page.unroute('**/api/cells/**');
+	}
+
+	await setToggle(cell, 'toggle-agent-hidden', false);
+	await expect.poll(() => 'hidden_from_agent' in diskCellar(MD)).toBe(false);
+});
+
 test('every control stays reachable inside the card when the row is narrow', async ({ page }) => {
 	await openNotebook(page);
 	const cell = cellEl(page, CODE);
