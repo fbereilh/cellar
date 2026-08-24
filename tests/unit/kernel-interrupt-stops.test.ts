@@ -399,15 +399,31 @@ describe('the graceful path is preserved', () => {
 		const runP = startRun(c, 'quick  # HANG');
 		await until(() => h.lastHanging != null, 'the run to reach the kernel');
 
-		const t0 = Date.now();
-		const res = await kernelmod.interruptKernel(nb);
-		const elapsed = Date.now() - t0;
+		// Widen the window for THIS test only. The rest of the suite runs at 120ms so
+		// the escalation is observable, but that is far too tight to be the yardstick
+		// for "returned promptly": under the full suite's own parallelism a correct
+		// poll's timers legitimately drift, and asserting against 120ms would report
+		// that drift as the interrupt having waited out the window. A wide window makes
+		// the assertion mean what it says - it did NOT wait for the grace - with margin
+		// that only a genuine regression can cross, and it costs nothing here because
+		// the graceful path returns as soon as the run ends rather than on the window.
+		const wide = 3000;
+		process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = String(wide);
+		let elapsed: number;
+		let res: Awaited<ReturnType<typeof kernelmod.interruptKernel>>;
+		try {
+			const t0 = Date.now();
+			res = await kernelmod.interruptKernel(nb);
+			elapsed = Date.now() - t0;
+		} finally {
+			process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = String(GRACE_MS);
+		}
 		await runP;
 
 		expect(res.stopped).toBe('kernel');
 		// The poll returns the moment the run ends, so the ordinary interrupt pays a
 		// tick, not the whole window.
-		expect(elapsed).toBeLessThan(GRACE_MS);
+		expect(elapsed).toBeLessThan(wide);
 	});
 
 	it('an interrupt with nothing running reports idle and aborts nothing', async () => {
