@@ -1871,16 +1871,17 @@
 							: "Mark for export to the notebook's .py module"}
 						aria-label="Export this cell to the notebook's .py module"
 						data-testid="toggle-export"
-						data-on={isExport ? 'true' : undefined}
 					>
 						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
 					</button>
 				{/if}
 				<!-- Withhold this cell from every agent surface. The sparkle is Cellar's own
-				     agent glyph (the `run-actor` badge uses it) struck through when hidden, and
-				     `secondary` is the hue this app already spends on the agent - so the ON
-				     state reads as "the AI cannot see this" rather than as a second copy of the
-				     menu's hide-CODE eye, which is a different feature and keeps its own glyph.
+				     agent glyph (the `run-actor` badge uses it), struck through when hidden - so
+				     the ON state reads as "the AI cannot see this" rather than as a second copy
+				     of the menu's hide-CODE eye, which is a different feature and keeps its own
+				     glyph. The hue is a DEDICATED token rather than `secondary`, the app's agent
+				     colour: `dim` resolves that to hue 35.4 against `error`'s 33.8, so a filled
+				     pill would read as danger beside the delete button (see `app.css`).
 				     UNGATED: every cell type can be withheld. -->
 				<button
 					class="btn btn-ghost btn-xs btn-square {agentHidden
@@ -1893,7 +1894,6 @@
 						: 'Visible to AI agents - click to hide it from them'}
 					aria-label="Hide this cell from AI agents"
 					data-testid="toggle-agent-hidden"
-					data-on={agentHidden ? 'true' : undefined}
 				>
 					<!-- The strike is drawn TWICE, the under-stroke in the card's own colour,
 					     so it cuts a visible gap through the sparkle instead of merging with
