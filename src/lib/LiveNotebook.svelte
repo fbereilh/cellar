@@ -2377,9 +2377,36 @@
 	 * concealment - a row reading "hidden from AI agents" over a document that still
 	 * hands the cell to every agent read, chat transcript and MCP tool. A refetch
 	 * eventually corrects it (an SSE drop, a seq gap), which makes the window rare,
-	 * not honest. So the outcome is READ: on any failure - a refusal, or a request
-	 * that landed no verdict at all - the flag goes back and the shell's existing
-	 * transient notice channel SAYS what is true.
+	 * not honest. So the outcome is READ - and read as the SAME three-way split
+	 * `commitExportTarget` already uses in this file (`VisibilityCommit` mirrors
+	 * `TargetCommit`), rather than as a boolean, because "the server refused" and
+	 * "we never heard back" are different facts and only one of them licenses a
+	 * claim about the cell's disclosure state:
+	 *
+	 * - `committed`   the server stored it
+	 * - `refused`     the server REJECTED it (no such cell); the flag goes back and
+	 *                 the notice SAYS what is true
+	 * - `writeFailed` the notebook write failed, and `setVisibility` ROLLED ITS OWN
+	 *                 change back before rethrowing, so the document holds the prior
+	 *                 value and the same definite copy is true
+	 * - `unreachable` the request landed no verdict we can read; CLAIM NOTHING
+	 * - `superseded`  another writer owns the cell: touch nothing, say nothing
+	 *
+	 * `unreachable` is the one that must not revert, and it is the whole reason this
+	 * is not a boolean. A rejected fetch does NOT mean the write did not happen: the
+	 * reachable path is a SHOW the server applied and persisted whose response was
+	 * lost on the way back (the connection dropped - a second `cellar` launch in this
+	 * folder reaps the running instance, `cellar cleanup`, a transient socket error).
+	 * The document then holds the cell VISIBLE, so REVERTING IS WHAT MANUFACTURES THE
+	 * DIVERGENCE - and telling the user the cell is still hidden asserts a
+	 * concealment that was just revoked, the exact failure this control exists to
+	 * prevent. So the flag is left as applied, the notice says only that the change
+	 * could not be CONFIRMED, and the normal refetch paths settle it; there is
+	 * deliberately no bespoke `load()` here.
+	 *
+	 * A verdict is READABLE only when the reply carries this route's own
+	 * `{ok:false, reason}` shape. Anything else - a rejected fetch, a proxy 502/503,
+	 * an HTML error page - is `unreachable`, exactly as the sibling decides it.
 	 *
 	 * The revert is SUPERSEDE-SAFE by GENERATION (`agentVisibilitySeq`, the per-cell
 	 * `pinSeq` shape and the `exportTargetCommit`/`statusSeq` reasoning), never by
@@ -2415,22 +2442,36 @@
 	 * its revert sees itself superseded and does nothing. The two are one mechanism;
 	 * do not "simplify" either half without the other.
 	 */
-	async function setHiddenFromAgent(id: string, hidden: boolean) {
+	async function setHiddenFromAgent(id: string, hidden: boolean): Promise<VisibilityCommit> {
 		const before = findCell(id)?.metadata?.cellar ?? {};
 		const had = 'hidden_from_agent' in before;
 		const was = before.hidden_from_agent;
 		applyHiddenFromAgentLocally(id, hidden);
 		const seq = agentVisibilitySeq.get(id);
 		const prior = agentVisibilityWrites.get(id);
-		const run = (async () => {
+		const run = (async (): Promise<VisibilityCommit> => {
 			if (prior) await prior;
 			const res = await fetch(`/api/cells/${id}`, {
 				method: 'PATCH',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ hiddenFromAgent: hidden, nb: path, originId })
 			}).catch(() => null);
-			if (res?.ok) return;
-			if (agentVisibilitySeq.get(id) !== seq) return;
+			if (res?.ok) return 'committed';
+			// Read ONCE, and only this route's own refusal shape counts as a verdict.
+			const body = res
+				? await res
+						.json()
+						.then((b) => (b && typeof b === 'object' ? (b as Record<string, unknown>) : null))
+						.catch(() => null)
+				: null;
+			const reason = typeof body?.reason === 'string' ? body.reason : null;
+			if (agentVisibilitySeq.get(id) !== seq) return 'superseded';
+			if (!reason) {
+				onNotice?.(
+					'That cell was not confirmed changed - the server did not answer. Reload to see whether it is hidden from AI agents.'
+				);
+				return 'unreachable';
+			}
 			const now = findCell(id);
 			if (now) {
 				const cellar = { ...(now.metadata?.cellar ?? {}) };
@@ -2444,10 +2485,11 @@
 					? 'That cell is still VISIBLE to AI agents - hiding it was not saved.'
 					: 'That cell is still HIDDEN from AI agents - showing it was not saved.'
 			);
+			return reason === 'write-failed' ? 'writeFailed' : 'refused';
 		})();
 		agentVisibilityWrites.set(id, run);
 		try {
-			await run;
+			return await run;
 		} finally {
 			// drop the entry once this cell's chain has drained, the way the server's
 			// own `withPathLock` does, so the map never grows with the session
@@ -2456,12 +2498,21 @@
 	}
 
 	/**
+	 * What became of an agent-visibility write - the `TargetCommit` shape, member for
+	 * member, because the two answer the same question and a second vocabulary for it
+	 * is how one of them quietly loses a case. See `setHiddenFromAgent`'s header for
+	 * what each outcome licenses; the one that matters is that `unreachable` claims
+	 * NOTHING about the cell's disclosure state.
+	 */
+	type VisibilityCommit = 'committed' | 'refused' | 'unreachable' | 'writeFailed' | 'superseded';
+
+	/**
 	 * One in-flight agent-visibility write per cell - the tail-chain that makes two
 	 * rapid flips of one toggle land in the order they were clicked. A cell's entry
 	 * is deleted when its chain drains (see `setHiddenFromAgent`), so this holds only
 	 * writes that are actually outstanding.
 	 */
-	const agentVisibilityWrites = new Map<string, Promise<void>>();
+	const agentVisibilityWrites = new Map<string, Promise<VisibilityCommit>>();
 
 	/**
 	 * Per-cell ownership of the agent-visibility flag - the `pinSeq` shape, and what
@@ -2469,9 +2520,12 @@
 	 * test. Bumped by every LOCAL write of `hidden_from_agent` (the optimistic apply,
 	 * the revert) and by every APPLIED `cell:visibility`, so a failed write can tell
 	 * whether it still owns the cell. Transient and never persisted: it describes who
-	 * wrote last in THIS tab's session, not anything the `.ipynb` records. Entries
-	 * are deliberately not pruned on delete, for `pinSeq`'s own reason - a deletion
-	 * would let a stale generation match a fresh one.
+	 * wrote last in THIS tab's session, not anything the `.ipynb` records. Entries are
+	 * not pruned on delete, but only because there is nothing to gain (one Map entry
+	 * per toggled cell): pruning would be SAFE here, unlike under `pinSeq`'s per-cell
+	 * counting, since the single monotonic counter below means a removed entry's next
+	 * bump yields a strictly larger, never-before-issued token that no captured token
+	 * can match. `load()` relies on exactly that when it clears the map wholesale.
 	 *
 	 * The token is drawn from ONE monotonically increasing counter for the life of
 	 * this component, so it is globally unique and the map is per-cell only in WHICH

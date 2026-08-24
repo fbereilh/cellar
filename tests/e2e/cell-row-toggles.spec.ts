@@ -336,7 +336,7 @@ test('a hide that does not save reverts and says the cell is still visible', asy
 	await page.route('**/api/cells/**', async (route) => {
 		const req = route.request();
 		if (req.method() === 'PATCH' && (req.postData() ?? '').includes('hiddenFromAgent')) {
-			await route.fulfill({ status: 500, contentType: 'application/json', body: '{"ok":false}' });
+			await route.fulfill({ status: 500, contentType: 'application/json', body: '{"ok":false,"reason":"write-failed"}' });
 			return;
 		}
 		await route.continue();
@@ -378,7 +378,7 @@ test('a failed hide that another writer superseded neither reverts nor claims an
 		const req = route.request();
 		if (req.method() === 'PATCH' && (req.postData() ?? '').includes('hiddenFromAgent') && !release) {
 			release = () =>
-				route.fulfill({ status: 500, contentType: 'application/json', body: '{"ok":false}' });
+				route.fulfill({ status: 500, contentType: 'application/json', body: '{"ok":false,"reason":"write-failed"}' });
 			return;
 		}
 		await route.continue();
@@ -495,7 +495,7 @@ test('a failed hide superseded across a load() refetch still claims nothing', as
 		const req = route.request();
 		if (req.method() === 'PATCH' && (req.postData() ?? '').includes('hiddenFromAgent') && !release) {
 			release = () =>
-				route.fulfill({ status: 500, contentType: 'application/json', body: '{"ok":false}' });
+				route.fulfill({ status: 500, contentType: 'application/json', body: '{"ok":false,"reason":"write-failed"}' });
 			return;
 		}
 		await route.continue();
@@ -602,6 +602,55 @@ test('two rapid flips of one toggle land in the order they were clicked', async 
 		// The row says visible; the document must too.
 		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
 		expect('hidden_from_agent' in diskCellar(SQL)).toBe(false);
+	} finally {
+		await page.unroute('**/api/cells/**');
+	}
+});
+
+test('a show the server APPLIED whose response is lost claims nothing', async ({ page }) => {
+	// A rejected fetch is NOT a refusal. The reachable path is a SHOW the server
+	// applied and persisted whose response never made it back (the connection
+	// dropped), so the document already hands the cell to every agent surface -
+	// reverting the row there is what MANUFACTURES the divergence, and saying the
+	// cell is still hidden asserts a concealment that was just revoked. So the
+	// unreachable outcome claims nothing, exactly as `commitExportTarget` already
+	// decides it for the sibling field.
+	await openNotebook(page);
+	const cell = cellEl(page, CODE);
+	const toggle = cell.getByTestId('toggle-agent-hidden');
+	await setToggle(cell, 'toggle-agent-hidden', true);
+	await expect.poll(() => diskCellar(CODE).hidden_from_agent).toBe(true);
+
+	// The server really HANDLES the request (`route.fetch` sends it, and the replayed
+	// body carries this tab's originId, so the resulting cell:visibility is
+	// echo-suppressed and nothing else can correct the row) - only the PAGE's own
+	// fetch is then made to reject.
+	let applied = false;
+	await page.route('**/api/cells/**', async (route) => {
+		const req = route.request();
+		if (req.method() === 'PATCH' && (req.postData() ?? '').includes('hiddenFromAgent')) {
+			await route.fetch();
+			applied = true;
+			await route.abort('connectionreset');
+			return;
+		}
+		await route.continue();
+	});
+
+	try {
+		await toggle.click(); // show
+		await expect.poll(() => applied, { timeout: 15_000 }).toBe(true);
+		// the server really did apply it
+		await expect.poll(() => 'hidden_from_agent' in diskCellar(CODE), { timeout: 15_000 }).toBe(false);
+		await page.waitForTimeout(400); // the handler microtask that would revert
+
+		// so the row must not go back, and nothing may claim the cell is concealed
+		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+		const notice = page.getByTestId('app-notice');
+		const said = (await notice.count()) ? ((await notice.textContent()) ?? '') : '';
+		expect(said).not.toContain('still HIDDEN');
+		expect(said).not.toContain('still VISIBLE');
+		expect('hidden_from_agent' in diskCellar(CODE)).toBe(false);
 	} finally {
 		await page.unroute('**/api/cells/**');
 	}
