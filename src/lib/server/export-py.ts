@@ -25,7 +25,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, basename, relative, resolve, sep } from 'node:path';
 import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
-import { logicalLines } from './imports';
+import { logicalLines, stripComments, splitSimpleStatements } from './imports';
 import { isExportCell } from '../exportRole';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import type { Cell, NotebookDoc } from './types';
@@ -105,15 +105,147 @@ function renderAll(names: string[]): string {
 }
 
 /**
+ * A module-level `from __future__ import …` statement, as a whole logical line.
+ *
+ * The tail is `\b`, NOT `\s+\S`: `from __future__ import(annotations)` needs no
+ * space before the parenthesis and Python compiles it, so requiring one left that
+ * spelling unhoisted and emitted the uncompilable module this exists to remove.
+ * A word boundary still rejects `from __future__ importannotations`.
+ */
+const FUTURE_RE = /^from\s+__future__\s+import\b/;
+
+/**
+ * Lift every module-level `from __future__ import …` out of the exported sources.
+ *
+ * Python requires a future statement to precede every other statement in the
+ * module, but `generateModule` emits `__all__` first — so an exported cell
+ * carrying one produced a module **Python refuses to compile** while the export
+ * reported `written: true`. Cellar's own imports-cell renderer deliberately puts
+ * `__future__` first inside that cell (`imports.ts`), so marking the imports cell
+ * for export is the likeliest way to hit it.
+ *
+ * Hoisting is unconditionally semantics-preserving here: a future statement is a
+ * compile-time directive whose effect is the whole module, and the `indent !== 0`
+ * filter means only genuinely module-level ones move. That makes this STRICTLY
+ * more correct than nbdev's own `_last_future` (`maker.py`), which hoists whole
+ * CELLS up to the last one containing a future import — so nbdev still emits an
+ * uncompilable module when a future import trails real code, where this does not.
+ *
+ * `logicalLines` is what makes it safe: a `from __future__ …` inside a string or a
+ * nested scope is never a logical line at indent 0, and a bracket-continued import
+ * is ONE logical line, so it moves whole.
+ *
+ * WHAT THE `;` RULE IS, and it is a rule about JOINING, not about the character.
+ * The line's CODE is split by `splitSimpleStatements` (`imports.ts`, the one
+ * top-level `;` splitter - never a second `includes(';')` scan), and only a line
+ * that really carries a SECOND statement is left alone. So a bare trailing
+ * semicolon (`from __future__ import annotations;`) IS hoisted - there is no rider
+ * to reorder, so refusing it closed nothing and emitted the uncompilable module
+ * this exists to remove - and so is a `;` sitting in a trailing comment, which
+ * `stripComments` has already dropped before the split.
+ *
+ * KNOWN LIMIT, with its CONSEQUENCE stated rather than only its rule: a genuinely
+ * semicolon-JOINED statement (`from __future__ import annotations; x = 1`) is
+ * still left in place, because hoisting it would reorder its rider and relocating
+ * a user's code is out of scope. The consequence is that such a cell STILL yields
+ * a module Python refuses to compile while `exportNotebookToPy` reports
+ * `written: true` - i.e. this class is narrowed, not closed. Pinned as
+ * known-and-accepted by a `compile()` case in `export-py-future.test.ts`, so
+ * closing it later forces this wording to be updated.
+ *
+ * Returns the deduped hoisted statements and the sources with them spliced out.
+ */
+function liftFutureImports(sources: string[]): { future: string[]; body: string[] } {
+	const future: string[] = [];
+	const seen = new Set<string>();
+	const body = sources.map((src) => {
+		if (!src.includes('__future__')) return src; // cheap pre-check; the common case
+		const cuts: Array<[number, number]> = [];
+		for (const line of logicalLines(src)) {
+			if (line.indent !== 0) continue; // only a module-level future statement moves
+			// The CODE of the line: comments dropped, continuations folded, strings kept.
+			const code = stripComments(line.raw).replace(/\s+/g, ' ').trim();
+			const parts = splitSimpleStatements(code);
+			if (parts.length !== 1 || !FUTURE_RE.test(parts[0])) continue;
+			if (!seen.has(parts[0])) {
+				seen.add(parts[0]); // dedupe on the statement, so a comment or a trailing `;` is not a new one
+				future.push(line.raw.replace(/\s+$/, '')); // hoisted verbatim, comment and all
+			}
+			cuts.push([line.start, line.end]);
+		}
+		if (!cuts.length) return src;
+		return spliceLines(src, cuts);
+	});
+	return { future, body };
+}
+
+/**
+ * Cut `[start, end)` spans out of `src` and tidy the seams they leave behind.
+ *
+ * Removing a whole line leaves the newlines that closed around it, so a naive
+ * splice turns "future import, blank line, code" into a residue that OPENS with a
+ * blank line - which `generateModule` then joins with its own blank-line separator
+ * and emits a double blank line, contradicting its documented "single blank line
+ * between blocks, no incidental whitespace" contract. Two passes address that, and
+ * both are deliberately narrower than "normalize the blank lines", because the
+ * newlines a cut did NOT create are the user's own text.
+ *
+ * Seams are tidied RIGHT TO LEFT and only ever by removing characters at or after
+ * the seam, so an earlier seam's recorded offset is never invalidated (the same
+ * rule `extractTopLevelImports` follows for the same reason). That is exactly why
+ * the collapse is one-sided and its LIMIT is stated rather than glossed: only the
+ * newline run FOLLOWING a seam can be shortened, so a seam whose PRECEDING run was
+ * already more than one blank line keeps it (`A = 1\n\n\n\n<cut>\nB = 2` stays
+ * `A = 1\n\n\n\nB = 2`). What it does guarantee is the case this exists for: a cut
+ * whose own newline lands next to at most one authored blank line contributes none
+ * of its own.
+ *
+ * The leading strip is likewise blunt and unconditional once ANY cut landed: it
+ * removes every blank line at the top of the residue, including ones the user wrote
+ * that no cut produced. Kept that way because it is the shape that actually occurs
+ * (a `__future__` import is legal only at the top of a module, so a cut is almost
+ * always the thing that opened the gap) and because leading blank lines carry no
+ * meaning at module level. Both residuals are cosmetic only - the contracts that
+ * matter (deterministic, idempotent, byte-identical re-export, and the future block
+ * landing above `__all__`) are unaffected either way.
+ */
+function spliceLines(src: string, cuts: Array<[number, number]>): string {
+	let out = '';
+	const seams: number[] = [];
+	let at = 0;
+	for (const [s, e] of cuts) {
+		out += src.slice(at, s);
+		seams.push(out.length);
+		at = e;
+	}
+	out += src.slice(at);
+	for (let i = seams.length - 1; i >= 0; i--) {
+		const p = seams[i];
+		let before = 0;
+		while (p - before - 1 >= 0 && out[p - before - 1] === '\n') before++;
+		let after = 0;
+		while (p + after < out.length && out[p + after] === '\n') after++;
+		const excess = before + after - 2;
+		if (excess > 0) out = out.slice(0, p) + '\n'.repeat(Math.max(0, after - excess)) + out.slice(p + after);
+	}
+	return out.replace(/^(?:[ \t]*\n)+/, ''); // every leading blank line goes, once any cut landed
+}
+
+/**
  * Build the full module text from the exported cells (already filtered + in
  * document order). Deterministic: a trailing newline, single blank line between
  * blocks, no incidental whitespace, so re-exporting identical content is a
  * byte-for-byte no-op.
+ *
+ * Module-level `__future__` imports are hoisted above `__all__` (see
+ * `liftFutureImports`); a comment is the only thing Python allows before one, and
+ * the header is comments, so the emitted order compiles.
  */
 export function generateModule(exportedSources: string[], sourceName: string): string {
+	const { future, body: bodySources } = liftFutureImports(exportedSources);
 	const allNames: string[] = [];
 	const seen = new Set<string>();
-	for (const src of exportedSources) {
+	for (const src of bodySources) {
 		for (const n of topLevelNames(src)) {
 			if (!seen.has(n)) {
 				seen.add(n);
@@ -121,8 +253,10 @@ export function generateModule(exportedSources: string[], sourceName: string): s
 			}
 		}
 	}
-	const blocks: string[] = [`${HEADER}\n# Source notebook: ${sourceName}`, renderAll(allNames)];
-	for (const src of exportedSources) {
+	const blocks: string[] = [`${HEADER}\n# Source notebook: ${sourceName}`];
+	if (future.length) blocks.push(future.join('\n'));
+	blocks.push(renderAll(allNames));
+	for (const src of bodySources) {
 		const trimmed = src.replace(/\s+$/, ''); // drop trailing blank lines within a cell
 		if (trimmed) blocks.push(trimmed);
 	}

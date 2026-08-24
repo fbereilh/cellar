@@ -107,7 +107,12 @@ export interface CellarNamespace {
 	[key: string]: unknown;
 }
 
-/** Cell metadata. The `cellar` namespace is the only key kept through a clean. */
+/**
+ * Cell metadata. A clean keeps only the named allowlist in `clean.ts`
+ * (`ALLOWED_CELL_METADATA`: Cellar's own `cellar` namespace plus nbdev's base cell
+ * keys `nbdev` and `hide_input`, and on a `raw` cell additionally
+ * `ALLOWED_RAW_CELL_METADATA`); everything else is dropped.
+ */
 export interface CellMetadata {
 	cellar?: CellarNamespace;
 	[key: string]: unknown;
@@ -236,7 +241,11 @@ export interface NotebookCellarNamespace {
 	[key: string]: unknown;
 }
 
-/** nbformat notebook metadata (only `kernelspec`/`cellar` survive a clean). */
+/**
+ * nbformat notebook metadata. A clean keeps only the named allowlist in `clean.ts`
+ * (`ALLOWED_NB_METADATA`, which carries Cellar's own keys alongside the foreign
+ * ones the ecosystem defines); everything else is dropped.
+ */
 export interface NotebookMetadata {
 	kernelspec?: KernelSpec;
 	cellar?: NotebookCellarNamespace;

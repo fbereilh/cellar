@@ -1,18 +1,20 @@
 /**
  * Cellar — clean-on-save field policy.
  *
- * A direct port of nbdev v2's `clean_nb` field policy (see
+ * Originally a port of nbdev v2's `clean_nb` field policy (see
  * data/nbdev-study-n8/report.md §1 and spec §3), implemented in Cellar's own
  * save pipeline (Cellar sits in nbdev's Jupyter-save-hook seat). The goal is a
- * git-friendly `.ipynb`: identical re-runs produce no diff.
+ * git-friendly `.ipynb`: identical re-runs produce no diff. nbdev is now 3.3.x and
+ * its policy has moved on; the allowlists below track its CURRENT base lists, and
+ * each notes where Cellar still diverges and why.
  *
  * Rules (KEEPS outputs by default):
  *  - null every `execution_count` (cell level + inside each output)
- *  - strip all cell metadata except the allowlisted `cellar` namespace
+ *  - strip all cell metadata outside `ALLOWED_CELL_METADATA`
  *  - drop runtime-only `cellar` run metadata (`lastRun`, `editedAt`,
  *    `importBindings`)
- *  - strip all notebook metadata except `kernelspec` (+ `cellar` if present);
- *    this drops `language_info` and the volatile `widgets` state
+ *  - strip all notebook metadata outside `ALLOWED_NB_METADATA`; this drops
+ *    `language_info`
  *  - normalize `kernelspec.display_name` → `kernelspec.name`
  *  - scrub memory-address reprs (`<foo at 0x…>` → `<foo>`) in text/stream output
  *
@@ -32,8 +34,29 @@
 
 import type { CellMetadata } from './types';
 
-/** Cell-metadata keys preserved through a clean. Everything else is dropped. */
-export const ALLOWED_CELL_METADATA = ['cellar'];
+/**
+ * Cell-metadata keys preserved through a clean. Everything else is dropped.
+ *
+ * `cellar` is Cellar's own namespace; `nbdev` and `hide_input` are nbdev's ENTIRE
+ * base cell allowlist (`nbdev/clean.py`: `cell_metadata_keys = {"hide_input",
+ * "nbdev"}`), carried so a notebook Cellar saves is not silently damaged.
+ *
+ * `nbdev` is load-bearing, not cosmetic: since nbdev 3.3.0 a cell's directives may
+ * live in `metadata.nbdev` (`{"export": "true"}` is exactly `#| export`), so
+ * dropping it made a Cellar save SILENTLY fatal to such a notebook - `nbdev-export`
+ * afterwards generated nothing, exit 0, no warning.
+ *
+ * `hide_input` is Jupyter's/nbdev's own key and is DISTINCT from Cellar's
+ * `cellar.hide_input`; no Cellar code reads the bare key, so this is pure
+ * preservation.
+ *
+ * This does NOT relax deny-by-default: it is a fixed, named list, and a key
+ * outside it is still dropped. `solveit_ai` - the cell-scope sibling of the
+ * `solveit` key `ALLOWED_NB_METADATA` does carry - is deliberately NOT here: it
+ * appears in nbdev's `pyproject.toml` but in none of its notebooks, so unlike
+ * `solveit` no measured churn turns on it. See that list for the general rule.
+ */
+export const ALLOWED_CELL_METADATA = ['cellar', 'nbdev', 'hide_input'];
 /**
  * The extra cell-metadata keys a `raw` cell keeps, ON TOP of the allowlist above
  * and ONLY for `cell_type === 'raw'`.
@@ -50,8 +73,40 @@ export const ALLOWED_CELL_METADATA = ['cellar'];
  * belongs here only if nbformat defines it ON a raw cell.
  */
 export const ALLOWED_RAW_CELL_METADATA = ['raw_mimetype', 'format'];
-/** Notebook-metadata keys preserved through a clean. */
-export const ALLOWED_NB_METADATA = ['kernelspec', 'cellar'];
+/**
+ * Notebook-metadata keys preserved through a clean.
+ *
+ * `kernelspec` + `cellar` are Cellar's own; `nbdev, jupytext, widgets, doc, jekyll`
+ * are nbdev's ENTIRE base notebook allowlist (`nbdev/clean.py`: `metadata_keys =
+ * {"kernelspec", "jekyll", "jupytext", "doc", "widgets", "nbdev"}`). Preserving
+ * foreign notebook metadata is strictly better than destroying it, nbdev or not -
+ * it also stops a Cellar save breaking a `jupytext` pairing.
+ *
+ * `widgets` REVERSES an earlier deliberate drop, and the reason that drop existed
+ * does not apply to this key: the ipywidgets churn Cellar guards against is the
+ * per-output `WIDGET_VIEW_MIME` blob (a fresh UUID every run), which is stripped
+ * BELOW and stays stripped. Notebook-level `metadata.widgets` is the saved
+ * widget-STATE blob, and Cellar never writes one - it only ever writes into
+ * `metadata.cellar` - so this can only preserve what JupyterLab already put on
+ * disk, never manufacture a diff of its own. `language_info` is still dropped.
+ *
+ * `solveit` is the one entry that is NOT from nbdev's base list: nbdev keeps it
+ * only because its own `pyproject.toml` opts in via `allowed_metadata_keys`, so
+ * nbdev's DEFAULT strips it exactly as an unwidened Cellar did. It is carried
+ * anyway because it is the same act as the five keys above - preserve another
+ * tool's metadata rather than destroy it - and because it is the whole remaining
+ * churn when Cellar saves nbdev's own repository (8 notebooks; see
+ * `tests/unit/nbdev-roundtrip.test.ts`). Reading a project's
+ * `allowed_metadata_keys` is the general form of this and is deliberately out of
+ * scope; until then a key that shows up in the wild is added here by name.
+ *
+ * Like the cell list, this is a fixed named list, not a relaxation of
+ * deny-by-default: a key outside it is still dropped. NOTE the deliberate
+ * asymmetry with the cell list, which does NOT carry solveit's cell-scope sibling
+ * `solveit_ai` - that key appears in nbdev's project config but in none of its
+ * notebooks, so nothing measurable turns on it and it was not added blind.
+ */
+export const ALLOWED_NB_METADATA = ['kernelspec', 'cellar', 'nbdev', 'jupytext', 'widgets', 'doc', 'jekyll', 'solveit'];
 
 const ADDRESS_RE = /(<[^<>]*?) at 0x[0-9a-fA-F]+(?=[>\s])/g;
 

@@ -26,7 +26,8 @@
  *
  * State is per kernel session and purely runtime: cleared on every session
  * change (a fresh namespace has no widgets), never persisted to the `.ipynb`
- * (clean.ts strips the volatile widget output + the `metadata.widgets` blob).
+ * (clean.ts strips the volatile widget OUTPUT; the notebook-level
+ * `metadata.widgets` state blob is preserved, but Cellar never writes one).
  * Binary comm buffers are ignored — tqdm's widget state is all JSON.
  *
  * With one kernel PER notebook, every model records the absolute path of the

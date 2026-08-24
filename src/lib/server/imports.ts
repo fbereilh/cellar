@@ -155,8 +155,17 @@ export function logicalLines(source: string): LogicalLine[] {
 	return out;
 }
 
-/** Drop comments and fold line continuations out of a logical line's text. */
-function stripComments(text: string): string {
+/**
+ * Drop comments and fold line continuations out of a logical line's text, leaving
+ * only its CODE. String literals survive verbatim (a `#` inside one is data).
+ *
+ * Exported so any caller that must reason about a logical line's code - rather
+ * than the bytes the user typed - asks THIS scanner instead of writing a second
+ * one. `export-py.ts` needs it to tell a semicolon-JOINED statement from a `;`
+ * that merely sits in a trailing comment; getting that wrong silently skipped a
+ * `__future__` hoist and emitted a module Python refuses to compile.
+ */
+export function stripComments(text: string): string {
 	let out = '';
 	let k = 0;
 	while (k < text.length) {
@@ -182,8 +191,18 @@ function stripComments(text: string): string {
 	return out;
 }
 
-/** Split on top-level `;` (never inside brackets). Import statements hold no strings. */
-function splitSimpleStatements(code: string): string[] {
+/**
+ * Split on top-level `;` (never inside brackets), dropping empty parts - so a BARE
+ * TRAILING semicolon yields one statement, not two. Import statements hold no
+ * strings, so this does not need the string awareness `logicalLines` has.
+ *
+ * Exported so a caller that must tell a genuinely JOINED statement from a bare
+ * trailing `;` asks THIS splitter rather than a second `includes(';')` scan.
+ * `export-py.ts` needs exactly that: refusing to hoist a `__future__` import over a
+ * trailing semicolon closed nothing (there is no rider to reorder) and left the
+ * uncompilable module the hoist exists to remove.
+ */
+export function splitSimpleStatements(code: string): string[] {
 	const parts: string[] = [];
 	let depth = 0;
 	let cur = '';
