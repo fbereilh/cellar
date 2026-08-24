@@ -2990,8 +2990,8 @@
 			return;
 		}
 		// Confirm on the block's own control, so the chord and a click leave the same
-		// mark - and only once the cell really landed, so a refused add shows its
-		// reason rather than a check contradicting it.
+		// mark - and only once the cell really landed, so a refused add never leaves
+		// a check (nor the permanent "click again") over a cell that was not created.
 		if (await extractCodeBlock(sourceId, block)) flashExtracted(el?.querySelector(`[data-testid="${EXTRACT_TESTID}"]`));
 	}
 
