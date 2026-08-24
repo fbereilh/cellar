@@ -3010,10 +3010,21 @@
 	 * why hover wins) - because a chord fired while reading has no other way to
 	 * name one of several blocks in a reply.
 	 *
-	 * With no block in play it SAYS so on the shell's transient line rather than
-	 * returning "not handled": the chord carries a modifier, so letting it bubble
-	 * reaches nothing useful, and a modified chord that silently does nothing is
-	 * indistinguishable from an unbound one.
+	 * BOTH registry entries run THIS ONE action - the primary command-mode `e` and
+	 * the global `Mod-Shift-e` - which is what keeps the two routes resolving the
+	 * same hovered-then-focused target. It is also why there is no per-route "not
+	 * handled" opt-out: returning false is a property of the action, not of the
+	 * chord that reached it, so declining would decline for both. Declining buys
+	 * nothing either way - the key reaches nothing useful in either mode - and a
+	 * control that silently does nothing is the outcome being avoided. So with no
+	 * block in play it SAYS so on the shell's transient line, which is also what
+	 * teaches the feature.
+	 *
+	 * ACCEPTED CONSEQUENCE, stated because it changes what an unbound key used to
+	 * do: this is `async`, so it always returns a Promise and the dispatcher's
+	 * `=== false` check never fires - the keystroke is consumed unconditionally.
+	 * A stray `e` in command mode with no block hovered therefore now shows that
+	 * notice, where before this binding existed `e` was unbound and did nothing.
 	 */
 	async function extractHoveredCodeBlock() {
 		const el = targetCodeBlock(rootEl);

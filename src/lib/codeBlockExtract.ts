@@ -311,13 +311,18 @@ export function decorateCodeBlocks(root: ParentNode | null | undefined): number 
  * cell the user may since have edited, moved or deleted - and a control that
  * silently does nothing is the one outcome to avoid.
  *
- * STATED RESIDUAL: the renamed control lives on the button, which windowing
- * discards when the cell scrolls far out of the window - so coming back, the
- * block offers to extract again as if for the first time. Accepted rather than
- * lifted into the notebook (where per-cell state that must outlive a scroll
- * belongs): a durable record would need a stable per-BLOCK key, which only the
- * block's own content can supply, and it would buy a label - while the fact it
- * reports is already on screen as the extracted cell sitting below.
+ * STATED RESIDUAL: that name lives on the button {@link decorateCodeBlocks}
+ * appends, so ANY re-render of the rendered markdown rebuilds it and the block
+ * offers to extract again as if for the first time. Windowing a scrolled-away
+ * cell out is only one instance and not the everyday one - a heading FOLD drops
+ * the body via `{#if}`, a full-cell collapse drops the whole container, and an
+ * in-place `{@html}` swap from a remote or agent edit replaces the fragment;
+ * each of those resets the label. Only the label: the extracted CELL is a
+ * document mutation and is durable regardless. Accepted rather than lifted into
+ * the notebook (where per-cell state that must outlive a re-render belongs): a
+ * durable record would need a stable per-BLOCK key, which only the block's own
+ * content can supply, and it would buy a label - while the fact it reports is
+ * already on screen as the extracted cell sitting below.
  */
 export function flashExtracted(btn: Element | null | undefined, ms = 1200): void {
 	if (!btn || typeof btn.setAttribute !== 'function') return;
