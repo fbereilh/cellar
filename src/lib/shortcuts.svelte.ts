@@ -314,6 +314,24 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		category: 'Structure',
 		description: 'Change the selected cell(s) to raw'
 	},
+	{
+		// The fourth member of the change-type family, and the one with no Jupyter
+		// chord to inherit: a chat cell is Cellar's own kind, so the key is a
+		// judgement rather than a convention.
+		//
+		// `t` is the only letter of "chat" still free in command mode - `c` is
+		// copy-cell, `h` is fold-section and `a` is insert-above - so it is the one
+		// mnemonic choice left. It is also unbound in Jupyter's own command mode
+		// (which claims `f`, `i i`, `o`, `p`, `q`, `s` and `0 0` among the letters
+		// Cellar has not taken), so taking it forecloses no future parity binding -
+		// which is exactly why the other free letters, mnemonic for nothing here,
+		// are the worse pick.
+		id: 'to-chat',
+		keys: ['t'],
+		mode: 'command',
+		category: 'Structure',
+		description: 'Change the selected cell(s) to chat'
+	},
 
 	// ---- Editing -----------------------------------------------------------
 	{

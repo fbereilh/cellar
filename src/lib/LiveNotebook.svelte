@@ -3674,6 +3674,7 @@
 		'to-markdown': () => setTypeSelection('markdown'),
 		'to-code': () => setTypeSelection('code'),
 		'to-raw': () => setTypeSelection('raw'),
+		'to-chat': () => setTypeSelection('chat'),
 		'run-insert-below': () => runAndInsertBelow(),
 		'delete-cell': () => deleteSelection(),
 		'undo-delete': () => undoDelete(),
