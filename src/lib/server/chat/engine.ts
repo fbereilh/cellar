@@ -15,6 +15,7 @@
 
 import type { ChatFailureKind } from '$lib/chatCell';
 import { claudeCliEngine } from './claude-cli';
+import type { ChatToolCall } from './tool-lines';
 
 /** Arguments for one engine run. */
 export interface ChatEngineRunArgs {
@@ -66,6 +67,19 @@ export interface ChatEngineRunArgs {
 	signal: AbortSignal;
 	/** Streamed reply text, in order, as it is produced. */
 	onDelta: (text: string) => void;
+	/**
+	 * One tool call the model made, reported ONCE and in the order the engine
+	 * learned its outcome - so a caller can annotate the reply in stream order
+	 * rather than batching at the end. It carries the call (name + parsed input)
+	 * and how it ended, NEVER the result: a `tool_result` is the model's input,
+	 * which can be enormous and, for a file read, is the user's own file content.
+	 * See `tool-lines.ts` for what may be rendered off it.
+	 *
+	 * Held to the SAME gate as `onDelta`: nothing from an unverified or condemned
+	 * session is reported, because a tool line is a claim about what the run did
+	 * and a session whose capabilities were never verified cannot support one.
+	 */
+	onToolCall?: (call: ChatToolCall) => void;
 }
 
 /** Why a run failed, in the shared failure vocabulary plus a human detail line. */

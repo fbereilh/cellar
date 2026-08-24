@@ -1,3 +1,4 @@
+import { expect, type Page } from '@playwright/test';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -111,4 +112,34 @@ export function killCellar(proc: ChildProcess): void {
 			/* already gone */
 		}
 	}
+}
+
+/**
+ * Expand a sidebar section, CONVERGING rather than toggling once.
+ *
+ * A section's open/closed state lives in the SERVER-owned UI store, so it
+ * survives into the next test and the next page - and the restore lands at
+ * HYDRATION, after the first paint. A helper that reads visibility once and
+ * clicks on that reading therefore has a real race: with the stored state
+ * CLOSED and the check landing pre-hydration, the click opens the section
+ * locally and hydration then closes it again, after which the single
+ * `toBeVisible()` waits out its whole timeout on a panel nothing will reopen.
+ * Load does not cause that - it only widens the window, which is why these
+ * surfaced as "unrelated flakes" in busy full runs (`databricks-two-card-redesign`
+ * and `git-notebook-commits` are named in AGENTS.md for exactly this).
+ *
+ * So click only while the panel is REALLY closed, retried until it is visibly
+ * open, whatever state this page inherited. Fourteen specs call this; THIRTEEN of
+ * them had hand-rolled copies of the racy shape and were converted, and the
+ * fourteenth is `chat-cell.spec.ts`, which had already worked out this fix in
+ * place and was folded in, so there is exactly one copy.
+ */
+export async function openSidebarSection(page: Page, section: string, body: string, timeout = 30_000): Promise<void> {
+	const header = page.getByTestId(`section-${section}`);
+	await expect(header).toBeVisible({ timeout });
+	const panel = page.getByTestId(body);
+	await expect(async () => {
+		if (!(await panel.isVisible().catch(() => false))) await header.click();
+		await expect(panel).toBeVisible({ timeout: 1_000 });
+	}).toPass({ timeout });
 }

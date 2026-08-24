@@ -3,7 +3,7 @@ import { spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
 
 /**
  * Chat cells against the REAL claude CLI - the one layer that proves the whole
@@ -148,20 +148,10 @@ async function openFresh(page: Page, name: string): Promise<string> {
 	return name;
 }
 
-/**
- * Expand the sidebar CHAT section. The open/closed state persists in the
- * SERVER-owned UI store, so a prior test's open can survive into this one - a
- * blind toggle then CLOSES it - and the restore lands at hydration, after the
- * first paint. So converge: click only while the panel is really closed,
- * retried until it is visibly open, whatever state this page inherited.
- */
+/** Expand the sidebar CHAT section (`openSidebarSection` owns the converge rule). */
 async function openChatSection(page: Page): Promise<void> {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	const body = page.getByTestId('chat-body');
-	await expect(async () => {
-		if (!(await body.isVisible())) await page.getByTestId('section-chat').click();
-		await expect(body).toBeVisible({ timeout: 1_000 });
-	}).toPass({ timeout: 30_000 });
+	await openSidebarSection(page, 'chat', 'chat-body');
 }
 
 test.beforeAll(async () => {

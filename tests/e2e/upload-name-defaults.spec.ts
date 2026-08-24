@@ -3,7 +3,7 @@ import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
 import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
 
 /**
@@ -154,10 +154,7 @@ async function openProject(page: Page, url: string): Promise<void> {
 }
 
 async function openDatabricksSection(page: Page): Promise<void> {
-	const header = page.getByTestId('section-databricks');
-	await expect(header).toBeVisible();
-	if (!(await page.getByTestId('databricks-body').isVisible().catch(() => false))) await header.click();
-	await expect(page.getByTestId('databricks-body')).toBeVisible();
+	await openSidebarSection(page, 'databricks', 'databricks-body');
 }
 
 async function openSettings(page: Page): Promise<void> {

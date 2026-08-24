@@ -3,7 +3,7 @@ import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
 
 /**
  * The reported defect, in a real browser: "when i change dbx clusters there is a
@@ -128,10 +128,7 @@ async function openNotebook(page: Page): Promise<void> {
 }
 
 async function openDatabricksSection(page: Page): Promise<void> {
-	const header = page.getByTestId('section-databricks');
-	await expect(header).toBeVisible();
-	if (!(await page.getByTestId('databricks-body').isVisible().catch(() => false))) await header.click();
-	await expect(page.getByTestId('databricks-body')).toBeVisible();
+	await openSidebarSection(page, 'databricks', 'databricks-body');
 }
 
 /** Rendered height of the whole Databricks panel, rounded to a whole pixel. */

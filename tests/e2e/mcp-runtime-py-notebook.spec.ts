@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, openSidebarSection } from './harness';
 
 /**
  * The agent-facing Databricks-runtime surface and `.py` notebook pinning, over the
@@ -322,10 +322,7 @@ test('the sidebar Runtime toggle re-seeds after an AGENT writes the preference',
 	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
 	await expect(page.getByTestId('cell').first()).toBeVisible();
 
-	const header = page.getByTestId('section-databricks');
-	await expect(header).toBeVisible();
-	if (!(await page.getByTestId('databricks-body').isVisible().catch(() => false))) await header.click();
-	await expect(page.getByTestId('databricks-body')).toBeVisible();
+	await openSidebarSection(page, 'databricks', 'databricks-body');
 
 	const toggle = page.getByTestId('databricks-runtime-toggle');
 	await expect(toggle).toBeVisible();

@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
 
 /**
  * E2E for the sidebar's Git section: several notebooks, several checkouts,
@@ -131,10 +131,7 @@ async function ensureOpen(page: Page, names: string[]): Promise<void> {
 
 /** Open the Git section (it ships collapsed) and wait for its body. */
 async function openGitSection(page: Page): Promise<void> {
-	if (!(await page.getByTestId('git-body').isVisible().catch(() => false))) {
-		await page.getByTestId('section-git').click();
-	}
-	await expect(page.getByTestId('git-body')).toBeVisible();
+	await openSidebarSection(page, 'git', 'git-body');
 }
 
 /** The Git row for one notebook. */

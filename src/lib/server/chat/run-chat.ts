@@ -16,14 +16,54 @@
  * The finalize reads the accumulator's SURVIVING text, so a mid-run "clear
  * outputs" behaves exactly as it does for a kernel cell: pre-clear reply text
  * is gone for good, only what streamed after the clear persists.
+ *
+ * ## Tool-activity lines ride the SAME stream as the reply
+ *
+ * A tool call the model makes is annotated with one compact line (`tool-lines.ts`
+ * owns what it may say), pushed into the accumulator as markdown text between
+ * the reply deltas either side of it. That is the whole mechanism, and it is
+ * chosen for what it makes free rather than for tidiness: the lines stream in
+ * order through the rail every tab already understands, fold into the ONE
+ * finalized markdown output, and therefore persist, round-trip through the
+ * `.ipynb` and reach the HTML export with no second path anywhere. (Cellar's
+ * `.py` notebook formats carry no outputs at all, so neither the reply nor its
+ * lines reach them - nothing to decide there.)
+ *
+ * Emitting them as their own OUTPUT elements was the alternative and it does not
+ * work: the finalize collapses to `outputs = [reply]` and republishes index 0,
+ * with no retract frame for anything else - the same reason a capped run skips
+ * the finalize entirely - so tool outputs would either be orphaned on every
+ * client or block the finalize and leave the whole reply as unrendered
+ * monospace text.
+ *
+ * `pushText`/`pushToolLine` own the JOINS, and they are load-bearing rather than
+ * cosmetic. A blockquote swallows the line that follows it (markdown's lazy
+ * continuation), so resumed reply text must be separated by a blank line or it
+ * becomes part of the annotation. And consecutive lines join with a BACKSLASH
+ * hard break so a burst of calls renders as ONE dim block of short lines rather
+ * than a stack of separately-bordered ones (which is what keeps a chatty run
+ * from burying a short answer under a column of separate quotes); the engine
+ * renders `breaks: false`, so a bare newline there would run them together on
+ * one line instead. Markdown's OTHER hard break - two trailing spaces - is
+ * measurably WRONG here and must not replace it: the accumulator runs its
+ * terminal reducer over any buffer holding an escape sequence, and that reducer
+ * RIGHT-TRIMS every line, so a reply that merely mentions an ANSI code would
+ * silently collapse every annotation onto one line. A backslash survives it.
+ *
+ * Every call is shown, none is summarised away: a harness shows every call, the
+ * file paths ARE the provenance a chatty run most needs, each line is bounded to
+ * one short line, and a tall output is already contracted to a scroll box by the
+ * scrollable-outputs rule - so a cap would only lose provenance for exactly the
+ * runs that depend on it, and the accumulator's own byte cap is the backstop.
  */
 
-import { statSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { workspaceRoot } from '../fstree';
 import { listCells } from '../notebook';
 import type { OutputAccumulator } from '../output-accumulator';
 import type { CellOutput } from '../types';
+import { toolCallLine } from './tool-lines';
 import {
 	CHAT_MODEL_KEY,
 	CHAT_OTHER_NOTEBOOKS_KEY,
@@ -114,6 +154,62 @@ export async function executeChatRun({
 			return { status: 'error' };
 		}
 		let sawDelta = false;
+		// What the accumulator last received, so the two pushers below can put the
+		// right JOIN between them (see the header). `none` is the very start, where
+		// no separator belongs at all.
+		let last: 'none' | 'text' | 'tool' = 'none';
+		// Trailing newlines of everything emitted so far, so a separator TOPS UP to a
+		// blank line instead of always adding one. A reply delta routinely ends with
+		// its own newline, and an unconditional `\n\n` after it left a stray blank
+		// line in the persisted markdown and in the live (plain-text) view.
+		let trailingNewlines = 0;
+		// A mid-run "clear outputs" (the toolbar clear-all, which deliberately reaches
+		// an in-flight cell through `truncateActiveRunOutputs`) resets the accumulator
+		// out from under this run, and these two locals would otherwise carry the
+		// pre-clear state across it: the next annotation would open the FRESH buffer
+		// with a bare `\` join line, or the next reply delta with `gap()`'s blank
+		// lines, and that stray join is what gets persisted. So a separator is only
+		// ever emitted after asking the accumulator whether there is anything left to
+		// join TO - a pure read, never a mutation, and never a notification channel on
+		// the accumulator for one caller's bookkeeping.
+		const syncJoinState = () => {
+			if (!acc.isEmpty) return;
+			last = 'none';
+			trailingNewlines = 0;
+		};
+		const emit = (text: string) => {
+			if (!text) return;
+			acc.push({ output_type: 'stream', name: 'stdout', text });
+			const tail = /\n*$/.exec(text)?.[0].length ?? 0;
+			trailingNewlines = tail === text.length ? trailingNewlines + tail : tail;
+		};
+		/** The newlines still needed for a blank line between blocks. */
+		const gap = () => '\n'.repeat(Math.max(0, 2 - trailingNewlines));
+		const pushText = (text: string) => {
+			syncJoinState();
+			// A blockquote lazily swallows the line under it, so reply text resuming
+			// after an annotation needs a blank line or it becomes part of it.
+			if (last === 'tool') emit(gap());
+			emit(text);
+			last = 'text';
+		};
+		const pushToolLine = (line: string) => {
+			syncJoinState();
+			if (last === 'text') emit(gap());
+			// A backslash hard break keeps consecutive annotations in ONE blockquote,
+			// one per rendered line; a bare newline would run them together, since the
+			// reply engine renders with `breaks: false`.
+			else if (last === 'tool') emit('\\\n');
+			emit(`> ${line}`);
+			last = 'tool';
+		};
+		// The reference frame every rendered path is made relative to, read ONCE per
+		// run and carrying BOTH spellings of the workspace - see
+		// `chatWorkspaceSpellings`. The child forms its absolute paths in the
+		// CANONICAL one (that is its cwd), so measuring against the lexical root
+		// alone is how a plainly in-workspace file came out as `outside the
+		// workspace`.
+		const workspace = chatWorkspaceSpellings();
 		// The engine's capability inputs, read from the person-scoped store at run
 		// time (the `auth.ts` CHAT_SLOT_KEY pattern) through the shared gates: the
 		// model is constrained to the known set BEFORE it rides the seam (and the
@@ -143,14 +239,26 @@ export async function executeChatRun({
 			onDelta: (text) => {
 				if (!text) return;
 				sawDelta = true;
-				acc.push({ output_type: 'stream', name: 'stdout', text });
+				pushText(text);
+			},
+			onToolCall: (call) => {
+				// One line per call, at the moment its outcome is known, so it lands
+				// between the reply text either side of it rather than being batched at
+				// the end. `toolCallLine` is a pure function of the CALL - a result
+				// string has no path here.
+				//
+				// Deliberately does NOT set `sawDelta`: that flag means the reply TEXT
+				// streamed, and it is what decides whether the engine's own final
+				// `replyText` still has to be landed. A tool line satisfying it would
+				// drop the entire reply of a CLI build that streams no text deltas.
+				pushToolLine(toolCallLine(call, workspace));
 			}
 		});
 		if (res.ok) {
 			// A run that streamed nothing but reported a reply (defensive: a CLI
 			// build without partial messages) still lands its text.
 			if (!sawDelta && res.replyText) {
-				acc.push({ output_type: 'stream', name: 'stdout', text: res.replyText });
+				pushText(res.replyText);
 			}
 			return { status: 'ok' };
 		}
@@ -159,6 +267,36 @@ export async function executeChatRun({
 		return { status: 'error' };
 	} finally {
 		unregisterChatRun(nb, ctrl);
+	}
+}
+
+/**
+ * The workspace in every spelling a tool path may arrive in: the LEXICAL root
+ * (what `CELLAR_WORKSPACE` holds, `resolve()`d) and, when it differs, its
+ * CANONICAL one.
+ *
+ * Both are needed because the two halves of a reads-on run live in different
+ * namespaces: `chatReadableWorkspace` hands the engine the lexical root, and the
+ * engine then CANONICALISES it (`claude-cli.ts` realpaths the confinement root so
+ * its deny rules bind) and makes that the child's cwd - so every absolute path
+ * the model forms comes back canonical, while this process's own idea of the
+ * workspace stays lexical. On macOS they differ for every `/tmp` and
+ * `/var/folders` workspace, i.e. for real users and for the e2e harness alike.
+ *
+ * Only the ROOT is resolved, and only here, once per run: it is a directory that
+ * exists, whereas a tool path may name a file that does not (a failed read is
+ * exactly the case the lines must still render), and realpathing one side of a
+ * prefix containment test is the trap the worktree-roots rule documents at
+ * length. A `realpathSync` that throws falls back to the lexical spelling -
+ * measuring against one real spelling beats measuring against none.
+ */
+function chatWorkspaceSpellings(): readonly string[] {
+	const lexical = resolve(workspaceRoot());
+	try {
+		const canonical = realpathSync(lexical);
+		return canonical === lexical ? [lexical] : [lexical, canonical];
+	} catch {
+		return [lexical];
 	}
 }
 

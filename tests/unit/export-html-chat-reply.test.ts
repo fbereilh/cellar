@@ -179,3 +179,59 @@ describe('every other output priority is unchanged', () => {
 		expect(html).toContain('0  1  2');
 	});
 });
+
+describe('the tool-activity lines reach the export', () => {
+	// The lines are markdown in the reply itself (see `chat/run-chat.ts`), so the
+	// export needs no code of its own - which is exactly why it needs a test: a
+	// shared report is where provenance matters MOST, and nothing else here would
+	// notice if the export stopped rendering them as the app does.
+	const REPLY_WITH_TOOLS =
+		'Let me check.\n\n' +
+		'> `Read(src/lib/loader.py)`\\\n' +
+		'> `Read(src/lib/missing.py)` *(failed)*\\\n' +
+		'> `Glob(**/*.csv)`\n\n' +
+		'It defines `load`.';
+
+	it('renders them as ONE subordinate block, one call per line', () => {
+		const html = render(chatCell(REPLY_WITH_TOOLS));
+		expect(html.match(/<blockquote>/g)).toHaveLength(1);
+		expect(html).toContain('<code>Read(src/lib/loader.py)</code>');
+		// The hard break survives this engine too (it is `breaks: false`, like the
+		// app's), so three calls read as three lines rather than running together.
+		const quote = html.slice(html.indexOf('<blockquote>'), html.indexOf('</blockquote>'));
+		expect(quote.match(/<br>/g)).toHaveLength(2);
+	});
+
+	it('keeps a failed call distinguishable, and the glob literal', () => {
+		const html = render(chatCell(REPLY_WITH_TOOLS));
+		expect(html).toContain('<em>(failed)</em>');
+		expect(html).toContain('<code>Glob(**/*.csv)</code>');
+		expect(html).not.toContain('<em>Glob'); // the asterisks never opened emphasis
+	});
+
+	it('styles the block as secondary text, and does not swallow the reply', () => {
+		const html = render(chatCell(REPLY_WITH_TOOLS));
+		// The export's own stylesheet already dims a blockquote (muted ink, left
+		// rule), which is what makes these annotations subordinate with no new CSS.
+		// Asserted INSIDE that rule's own body: the exported document declares
+		// `color: var(--muted)` in four other rules, so a document-wide check would
+		// pass with the very declaration this pins deleted.
+		const selector = '.cellar-md blockquote{';
+		const ruleStart = html.indexOf(selector);
+		expect(ruleStart).toBeGreaterThan(-1);
+		const rule = html.slice(ruleStart + selector.length, html.indexOf('}', ruleStart));
+		expect(rule).toContain('color: var(--muted)');
+		expect(rule).toMatch(/border-left:\s*\d+px solid var\(--border\)/);
+		// The prose either side of the block is outside it.
+		expect(html).toContain('<p>Let me check.</p>');
+		expect(html).toContain('<p>It defines <code>load</code>.</p>');
+	});
+
+	it('shows them in REPORT view too, where the code is hidden', () => {
+		// Report view drops the input; the reply - annotations included - is the
+		// whole artifact, so the provenance must survive it.
+		const html = render(chatCell(REPLY_WITH_TOOLS), true);
+		expect(html).toContain('<code>Read(src/lib/loader.py)</code>');
+		expect(html).toContain('<em>(failed)</em>');
+	});
+});

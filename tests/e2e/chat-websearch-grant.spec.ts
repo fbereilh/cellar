@@ -1,8 +1,9 @@
 import { test, expect } from '@playwright/test';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { chatCliArgs, chatToolPolicy, claudeCliEngine, initViolation } from '../../src/lib/server/chat/claude-cli';
+import { chatCliArgs, chatToolPolicy, claudeCliEngine, initViolation, WEB_SEARCH_TOOL } from '../../src/lib/server/chat/claude-cli';
 import { chatChildEnv, CLAUDE_BIN } from '../../src/lib/server/chat/env';
+import { toolCallLine, type ChatToolCall } from '../../src/lib/server/chat/tool-lines';
 
 /**
  * The web-search opt-in against the REAL claude CLI - the one layer that can
@@ -171,6 +172,7 @@ test('a search-on run survives the shipped engine end to end: the real session p
 	test.setTimeout(REAL_TURN_TIMEOUT_MS);
 
 	const deltas: string[] = [];
+	const calls: ChatToolCall[] = [];
 	const res = await claudeCliEngine.run({
 		prompt: SEARCH_QUESTION,
 		configDir: null,
@@ -179,10 +181,27 @@ test('a search-on run survives the shipped engine end to end: the real session p
 		// rather than omitted, since the seam requires it.
 		notebookPath: null,
 		signal: new AbortController().signal,
-		onDelta: (t) => deltas.push(t)
+		onDelta: (t) => deltas.push(t),
+		onToolCall: (c) => calls.push(c)
 	});
 
 	expect(res.failure).toBeNull();
 	expect(res.ok).toBe(true);
 	expect((res.replyText ?? deltas.join('')).trim().length).toBeGreaterThan(0);
+
+	// The tool-activity report, against the LIVE event shapes. Everything else
+	// about it is pinned in the unit suite off a committed capture, which is
+	// precisely what can go stale silently when a CLI update renames a field or
+	// moves a block - so the one thing this asserts is that the shapes the
+	// tracker pairs are still the shapes the CLI emits. It leans on the same
+	// reliability the test above already leans on: this question makes the CLI
+	// search (asserted there, unconditionally, off the raw stream).
+	expect(calls.map((c) => c.name)).toContain(WEB_SEARCH_TOOL);
+	const search = calls.find((c) => c.name === WEB_SEARCH_TOOL) as ChatToolCall;
+	expect(search.outcome).toBe('ok');
+	// A real query really reached the line, and the line is what a reader gets.
+	const line = toolCallLine(search, tmpdir());
+	expect(line).toMatch(/^`WebSearch\(.+\)`$/);
+	// And the result stayed out of it - the real payload this time, not a fixture.
+	expect(line.toLowerCase()).not.toContain('web search results');
 });
