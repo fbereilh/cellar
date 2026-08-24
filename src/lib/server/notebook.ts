@@ -657,7 +657,14 @@ export function getCell(id: string, nb?: string | null): CellView | null {
  * SHOWING deletes the key rather than storing `false` (the `setCellExports`
  * rule): `isHiddenFromAgent` is strictly `=== true`, so absent and `false` read
  * identically, and storing the default would put a line in the user's committed
- * `.ipynb` for a cell that is in the state every cell starts in.
+ * `.ipynb` for a cell that is in the state every cell starts in. It deletes the
+ * key it WROTE - a pre-existing explicit `false` (what `set_cell_visibility(id,
+ * false)` stored before this change, or a hand edit) already reads as visible, so
+ * the change check below returns early and leaves it exactly as it is, which is
+ * inert under that same strictly-`=== true` reading and is self-healed by any
+ * hide-then-show round trip. Cleaning it was considered and NOT done: a "show"
+ * would then sometimes write and sometimes not, a subtler rule than the change
+ * detection it would complicate, for a shape nothing can observe.
  *
  * Only a real CHANGE writes or emits, so re-setting the value a cell already
  * carries costs no `.ipynb` write and no event (zero git diff, no mtime churn) -

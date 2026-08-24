@@ -282,6 +282,105 @@ function toggleButtonTag(s: string, marker: string): string {
 	return tag;
 }
 
+/** The value of `name="..."` in `tag`, brace-aware so a `{expr}` cannot end it. */
+function attributeValue(tag: string, name: string, label: string): string {
+	const at = tag.indexOf(`${name}="`);
+	expect(at, `${label}: expected a ${name}="..." attribute`).toBeGreaterThanOrEqual(0);
+	const start = at + name.length + 2;
+	let braces = 0;
+	let js = '';
+	let end = -1;
+	for (let i = start; i < tag.length && end < 0; i++) {
+		const c = tag[i];
+		if (js) {
+			if (c === '\\') i++;
+			else if (c === js) js = '';
+		} else if (braces > 0) {
+			if (c === '"' || c === "'" || c === '`') js = c;
+			else if (c === '{') braces++;
+			else if (c === '}') braces--;
+		} else if (c === '{') {
+			braces = 1;
+		} else if (c === '"') {
+			end = i;
+		}
+	}
+	expect(end, `${label}: ${name}="..." never closed`).toBeGreaterThan(start - 1);
+	return tag.slice(start, end);
+}
+
+/**
+ * A `class="<static> {state ? 'on' : 'off'}"` attribute split into its three
+ * parts.
+ *
+ * It PARSES rather than scanning with one regex: both branches carry Tailwind
+ * variant colons (`hover:`) and the ternary's own separator is a `:`, so a
+ * pattern like `/\?[^:]*\b(px-|h-)/` can never reach past the first `hover:` -
+ * it caught a geometry class only at the HEAD of the ON branch and missed the
+ * tail, anything after a variant, and the whole OFF branch. Throws rather than
+ * returning a partial answer if the ternary is not in the expected shape.
+ */
+function stateClassParts(
+	tag: string,
+	label: string
+): { staticPrefix: string; whenOn: string; whenOff: string } {
+	const value = attributeValue(tag, 'class', label);
+	const brace = value.indexOf('{');
+	expect(brace, `${label}: expected a {state ? on : off} class expression`).toBeGreaterThan(0);
+	const close = value.lastIndexOf('}');
+	expect(close, `${label}: the class expression never closes`).toBeGreaterThan(brace);
+	const expr = value.slice(brace + 1, close);
+
+	const branches: string[] = [];
+	let qmark = -1;
+	let colon = -1;
+	for (let i = 0; i < expr.length; i++) {
+		const c = expr[i];
+		if (c === "'" || c === '"' || c === '`') {
+			let j = i + 1;
+			for (; j < expr.length && expr[j] !== c; j++) if (expr[j] === '\\') j++;
+			expect(j, `${label}: unterminated string in the class expression`).toBeLessThan(expr.length);
+			branches.push(expr.slice(i + 1, j));
+			if (branches.length === 1)
+				expect(qmark, `${label}: expected the ON branch after a "?"`).toBeGreaterThanOrEqual(0);
+			if (branches.length === 2)
+				expect(colon, `${label}: expected the OFF branch after a ":"`).toBeGreaterThan(qmark);
+			i = j;
+		} else if (c === '?' && qmark < 0) qmark = i;
+		else if (c === ':' && qmark >= 0 && colon < 0) colon = i;
+	}
+	expect(branches, `${label}: expected exactly two branch strings`).toHaveLength(2);
+	return { staticPrefix: value.slice(0, brace), whenOn: branches[0], whenOff: branches[1] };
+}
+
+/** Class names that change a control's BOX. Whole-token, so `text-base-content/60`
+ *  (a colour) is never confused with `text-base` (a size). Colour utilities are
+ *  deliberately absent: a state-dependent colour is the POINT of these ternaries. */
+const GEOMETRY_EXACT = new Set([
+	'btn-xs', 'btn-sm', 'btn-md', 'btn-lg', 'btn-square', 'btn-circle', 'btn-wide', 'btn-block',
+	'text-xs', 'text-sm', 'text-base', 'text-lg', 'text-xl'
+]);
+const GEOMETRY_PREFIXES = [
+	'p-', 'px-', 'py-', 'pt-', 'pb-', 'pl-', 'pr-', 'ps-', 'pe-',
+	'm-', 'mx-', 'my-', 'mt-', 'mb-', 'ml-', 'mr-', 'ms-', 'me-',
+	'h-', 'w-', 'size-', 'min-w-', 'max-w-', 'min-h-', 'max-h-',
+	'gap-', 'space-x-', 'space-y-', 'leading-'
+];
+
+/**
+ * Every geometry-changing class in `branch`, wherever it sits. Tailwind variants
+ * are stripped first, so `hover:bg-accent/25` is measured as `bg-accent/25` and a
+ * variant is never mistaken for geometry; arbitrary values (`bg-(--token)`) carry
+ * no leading `word:` and so pass through untouched.
+ */
+function geometryTokens(branch: string): string[] {
+	return branch
+		.split(/\s+/)
+		.filter(Boolean)
+		.map((t) => t.replace(/^!/, '').replace(/^(?:[\w-]+:)+/, ''))
+		.filter((u) => GEOMETRY_EXACT.has(u) || GEOMETRY_PREFIXES.some((pre) => u.startsWith(pre)));
+}
+
 describe('the source-guard helper itself', () => {
 	// The defect this replaced: the terminator was a hardcoded `'\n\t\t\t\t>'`, so
 	// for a button nested one level deeper it ran past that button's own `>` and
@@ -329,6 +428,60 @@ describe('the source-guard helper itself', () => {
 		const noState = nested.replace('aria-pressed={a}\n', '');
 		expect(() => toggleButtonTag(noState, 'data-testid="deep"')).toThrow();
 	});
+
+	// The geometry guard's own defect: a regex anchored on `?` and blocked by
+	// `[^:]*` caught a size class only at the HEAD of the ON branch, because both
+	// branches carry `hover:` variants and the ternary separator is itself a `:`.
+	const ON = 'bg-accent/15 text-accent hover:bg-accent/25';
+	const OFF = 'text-base-content/60 hover:text-base-content/90';
+	const classTag = (on: string, off: string) =>
+		[
+			'<button',
+			'\tclass="btn btn-ghost btn-xs btn-square {isExport',
+			`\t\t? '${on}'`,
+			`\t\t: '${off}'}"`,
+			'\taria-pressed={isExport}',
+			'\tdata-testid="c"',
+			'>'
+		].join('\n');
+
+	it('splits the class attribute into its static prefix and both branches', () => {
+		const cls = stateClassParts(classTag(ON, OFF), 'unmutated');
+		expect(cls.staticPrefix).toContain('btn btn-ghost btn-xs btn-square');
+		expect(cls.whenOn).toBe(ON);
+		expect(cls.whenOff).toBe(OFF);
+	});
+
+	it('finds a geometry class ANYWHERE in either branch', () => {
+		const mutations: Array<[string, string, string]> = [
+			['head of the ON branch', `px-2 ${ON}`, OFF],
+			['tail of the ON branch', `${ON} px-2`, OFF],
+			['after a hover: variant', `${ON} h-6 w-6`, OFF],
+			['inside the OFF branch', ON, `px-2 ${OFF}`],
+			['an arbitrary-value branch', 'bg-(--cellar-agent-hidden-soft) hover:bg-(--x) py-1', OFF]
+		];
+		for (const [where, on, off] of mutations) {
+			const cls = stateClassParts(classTag(on, off), where);
+			const found = [...geometryTokens(cls.whenOn), ...geometryTokens(cls.whenOff)];
+			expect(found, where).not.toEqual([]);
+		}
+	});
+
+	it('reads a variant or a colour as neither geometry nor a branch separator', () => {
+		const cls = stateClassParts(classTag(ON, OFF), 'unmutated');
+		expect(geometryTokens(cls.whenOn)).toEqual([]);
+		expect(geometryTokens(cls.whenOff)).toEqual([]);
+		// `text-base-content/60` is a colour; only the exact `text-base` is a size
+		expect(geometryTokens('text-base-content/60 hover:text-base-content/90')).toEqual([]);
+		expect(geometryTokens('bg-(--cellar-agent-hidden-soft) hover:bg-(--cellar-agent-hidden-strong)')).toEqual([]);
+		expect(geometryTokens('text-base')).toEqual(['text-base']);
+	});
+
+	it('fails loudly on a class attribute it cannot parse', () => {
+		expect(() => stateClassParts(classTag(ON, OFF).replace("? '", "'"), 'no ?')).toThrow();
+		expect(() => stateClassParts('<button class="btn btn-xs" data-testid="c">', 'no ternary')).toThrow();
+		expect(() => stateClassParts(classTag(ON, OFF).replace(`${OFF}'`, OFF), 'unterminated')).toThrow();
+	});
 });
 
 describe('the wiring the browser ships (source guards - see the file header)', () => {
@@ -369,11 +522,11 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 	// sit OUTSIDE the state conditional, so only colour can move.
 	it('both toggles keep identical geometry in both states', () => {
 		for (const t of ['toggle-export', 'toggle-agent-hidden']) {
-			const btn = toggleButtonTag(cell, `data-testid="${t}"`);
-			const cls = btn.slice(btn.indexOf('class="'), btn.indexOf('}"') + 2);
+			const cls = stateClassParts(toggleButtonTag(cell, `data-testid="${t}"`), t);
 			// the sizing classes are unconditional; only the colour half is a ternary
-			expect(cls.slice(0, cls.indexOf('{')), t).toContain('btn btn-ghost btn-xs btn-square');
-			expect(cls, t).not.toMatch(/\?[^:]*\b(btn-sm|btn-md|px-|py-|h-|w-|gap-)/);
+			expect(cls.staticPrefix, t).toContain('btn btn-ghost btn-xs btn-square');
+			expect(geometryTokens(cls.whenOn), `${t}: the ON branch`).toEqual([]);
+			expect(geometryTokens(cls.whenOff), `${t}: the OFF branch`).toEqual([]);
 		}
 	});
 
