@@ -32,6 +32,7 @@ import {
 	exportTargetInfo,
 	isPyTextNotebook,
 	lastExportError,
+	exportHazardsFor,
 	getActiveNotebookPath,
 	resolveNotebookPath,
 	workspaceRelative,
@@ -2104,6 +2105,16 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * the previously exported symbols on disk where an `import` still resolves them -
  * or the call WROTE NOTHING and no module is on disk.
  *
+ * A FOURTH case is reported through the same field but says the opposite thing, so
+ * it carries its own key (`warning`, never `reason`): the module IS on disk as the
+ * marks describe it and CANNOT BE IMPORTED, because a marked cell holds a construct
+ * that makes the assembled module uncompilable (`$lib/exportHazard`). Without it an
+ * agent marking such a cell got a clean result for a module whose every symbol is
+ * unreachable, and would only find out at the eventual `import`. It is a POSITIVE
+ * finding about a construct that was DETECTED - the class of module that fails
+ * `compile` is wider - so an absent `warning` means "none of the checks fired",
+ * never "this module compiles"; `$lib/exportHazard` states the measured boundary.
+ *
  * That third case is what `wrote` is for. `lastExportError` is doc state this
  * process may never have written: an idempotent call (every addressed cell already
  * at the requested value) skips the persist entirely, so on a freshly opened doc -
@@ -2141,20 +2152,44 @@ function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean
 	if ('module' in failed) return failed;
 	if (!exportTarget) return {};
 	if (exportCellCount(listCells(target))) {
-		if (wrote || generatedModuleExists(exportTarget)) return {};
-		return {
-			module: {
-				regenerated: false as const,
-				reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - edit a marked cell, or re-call set_export_target with ${setExportTargetArgs(where)}, to write it`
-			}
-		};
+		if (!(wrote || generatedModuleExists(exportTarget)))
+			return {
+				module: {
+					regenerated: false as const,
+					reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - edit a marked cell, or re-call set_export_target with ${setExportTargetArgs(where)}, to write it`,
+					warning: undefined
+				}
+			};
+		// The module IS on disk as the marks describe it, and CANNOT BE IMPORTED:
+		// a marked cell carries a construct that makes it uncompilable. Reported
+		// under `warning`, never `reason`, because the two say opposite things about
+		// the same file - `reason` explains a module that was NOT written, this
+		// explains one that WAS and is broken - and an agent that acted on the wrong
+		// one would either re-export a file that is already there or stop believing
+		// the file exists. `regenerated: true` is the same claim the empty return
+		// makes: the file matches the marks (see the `wrote || exists` gate above).
+		const hazards = exportHazardsFor(target);
+		if (hazards.length)
+			return {
+				// `reason: undefined` is declared, not omitted, so the two variants stay a
+				// DISCRIMINATED union that every reader can still probe by key without
+				// narrowing first - the discriminant is `regenerated`, and the keys say
+				// which question was answered.
+				module: {
+					regenerated: true as const,
+					reason: undefined,
+					warning: `${exportTarget} was written, but ${hazards[0].message}`
+				}
+			};
+		return {};
 	}
 	return {
 		module: {
 			regenerated: false as const,
 			reason: generatedModuleExists(exportTarget)
 				? `no cell is marked for export, so ${exportTarget} was left on disk exactly as it was - remove it by hand if it should be gone`
-				: `no cell is marked for export, so no module was generated at ${exportTarget}`
+				: `no cell is marked for export, so no module was generated at ${exportTarget}`,
+			warning: undefined
 		}
 	};
 }

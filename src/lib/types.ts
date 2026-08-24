@@ -9,6 +9,7 @@
  */
 
 import type { Cell } from '$lib/server/types';
+import type { ExportHazard } from './exportHazard';
 import type { Match } from '$lib/search';
 import type { SelectionGesture } from '$lib/cellSelection';
 
@@ -89,6 +90,13 @@ export interface ExportPyResult {
 	target: string | null;
 	count: number;
 	reason?: 'no-target' | 'no-cells' | 'unchanged';
+	/**
+	 * Constructs in the marked cells that make the generated module uncompilable
+	 * (`$lib/exportHazard`). Present and non-empty means the module was written and
+	 * will NOT import, so no surface may report this export as a plain success.
+	 * Empty means none of the checks fired - never that the module compiles.
+	 */
+	hazards?: ExportHazard[];
 }
 
 /**
