@@ -3813,7 +3813,11 @@
 		'paste-below': () => pasteCells('below'),
 		'paste-above': () => pasteCells('above'),
 		'split-cell': () => splitActiveCell(),
+		// One action, both registry entries: the command-mode `e` and the global
+		// `Mod-Shift-e` resolve their target the same way (hover, then focus), so a
+		// Firefox user - whose Ctrl+Shift+E the browser keeps - hovers and presses `e`.
 		'extract-code-block': () => extractHoveredCodeBlock(),
+		'extract-code-block-anywhere': () => extractHoveredCodeBlock(),
 		...Object.fromEntries([1, 2, 3, 4, 5, 6].map((level) => [`heading-${level}`, () => setHeadingLevel(level)]))
 	};
 

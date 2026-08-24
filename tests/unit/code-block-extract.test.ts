@@ -170,7 +170,7 @@ describe('every notebook markdown surface is covered', () => {
 });
 
 describe('decoration', () => {
-	it('wraps every block, keeps document order, and hangs one control on each', () => {
+	it('marks every block, keeps document order, and hangs one control on each', () => {
 		const host = rendered([fence('python', 'a = 1'), 'prose', fence('sql', 'select 2'), fence('', 'plain')].join('\n\n'));
 		const blocks = Array.from(host.querySelectorAll(`[${CODE_BLOCK_ATTR}]`));
 		expect(blocks).toHaveLength(3);
@@ -184,12 +184,12 @@ describe('decoration', () => {
 	it('is IDEMPOTENT - a second pass adds nothing and moves nothing', () => {
 		const host = rendered(fence('python', 'a = 1'));
 		const pre = host.querySelector('pre');
-		const wrap = host.querySelector(`[${CODE_BLOCK_ATTR}]`);
+		const parent = pre?.parentElement;
 		expect(decorateCodeBlocks(host)).toBe(0);
 		expect(host.querySelectorAll(`[${CODE_BLOCK_ATTR}]`)).toHaveLength(1);
 		expect(host.querySelectorAll(`[data-testid="${EXTRACT_TESTID}"]`)).toHaveLength(1);
 		expect(host.querySelector('pre')).toBe(pre);
-		expect(pre?.parentElement).toBe(wrap);
+		expect(pre?.parentElement).toBe(parent);
 	});
 
 	it('reports 0 for prose with no code, and for no root at all', () => {
@@ -224,11 +224,88 @@ describe('decoration', () => {
 	});
 });
 
+/**
+ * Decoration must leave the RENDERED FRAGMENT alone as a sibling chain, because
+ * the fragment is not ours: `{@html}` put it there and reclaims it by node
+ * identity and sibling position. Svelte records the first and last top-level node
+ * it inserted (`assign_nodes`) and, on the next in-place swap, walks `nextSibling`
+ * from one to the other removing each (`remove_effect_dom`) - so a decorator that
+ * lifts a top-level node out of that chain leaves the walk stranded inside
+ * whatever it was lifted into, and every node after it survives into the next
+ * render.
+ *
+ * `removeFragment` below is that walk, in the same five lines Svelte spends on it.
+ * It is modelled rather than imported because the function is not part of any
+ * public export of `svelte`; what it does is nonetheless a contract this module
+ * has to hold against ANY such renderer, so it is asserted directly rather than
+ * left to whether one particular Svelte code path happens to spare us today (each
+ * `{@html}` in `Cell.svelte` is currently the only child of its container, which
+ * takes an `innerHTML =` path that clears everything - a property one added
+ * sibling away from changing, and one this module cannot see).
+ */
+describe('the rendered fragment survives decoration as a sibling chain', () => {
+	/** Remove the fragment `[start..end]` the way `{@html}` teardown does. */
+	function removeFragment(start: ChildNode | null, end: ChildNode | null): void {
+		let node = start;
+		while (node !== null) {
+			const next: ChildNode | null = node === end ? null : node.nextSibling;
+			node.remove();
+			node = next;
+		}
+	}
+
+	/** A container holding `src` exactly as `{@html}` inserts it, then decorated. */
+	function fragment(src: string) {
+		const host = document.createElement('div');
+		host.className = 'cellar-md';
+		document.body.appendChild(host);
+		host.innerHTML = renderChatReply(src);
+		// The boundary is recorded BEFORE decoration, which is the whole point: the
+		// renderer took it when it inserted the fragment, and never revisits it.
+		const start = host.firstChild;
+		const end = host.lastChild;
+		const before = Array.from(host.childNodes);
+		decorateCodeBlocks(host);
+		return { host, start, end, before };
+	}
+
+	it('leaves the top-level nodes the SAME nodes, in the same order', () => {
+		const { host, before } = fragment([fence('python', 'a = 1'), 'Some prose after it.'].join('\n\n'));
+		expect(Array.from(host.childNodes)).toEqual(before);
+		// And the block really was decorated - otherwise this passes vacuously.
+		expect(host.querySelectorAll(`[data-testid="${EXTRACT_TESTID}"]`)).toHaveLength(1);
+	});
+
+	it('a fragment BEGINNING with a code block still tears down completely', () => {
+		// The reachable shape: a reply (or a markdown cell body) that opens with a
+		// fence. Re-parenting the leading `<pre>` strands the walk inside the wrapper,
+		// so the prose after it survives and duplicates against the next render.
+		const { host, start, end } = fragment([fence('python', 'a = 1'), 'Some prose after it.'].join('\n\n'));
+		removeFragment(start, end);
+		expect(host.innerHTML).toBe('');
+	});
+
+	it('a fragment that IS one code block still tears down completely', () => {
+		// `start === end === the <pre>`, so the walk removes exactly one node: a
+		// wrapper would be left behind with a dead extract control inside it, once per
+		// in-place re-render.
+		const { host, start, end } = fragment(fence('python', 'a = 1'));
+		removeFragment(start, end);
+		expect(host.innerHTML).toBe('');
+	});
+
+	it('a fragment ENDING with a code block still tears down completely', () => {
+		const { host, start, end } = fragment(['Some prose first.', fence('sql', 'select 1')].join('\n\n'));
+		removeFragment(start, end);
+		expect(host.innerHTML).toBe('');
+	});
+});
+
 describe('reading a block from anywhere inside it', () => {
-	it('answers the same for the wrapper, the pre, the code and the control', () => {
+	it('answers the same for the pre, the code and the control', () => {
 		const host = rendered(fence('python', 'a = 1'));
-		const wrap = host.querySelector(`[${CODE_BLOCK_ATTR}]`)!;
-		for (const el of [wrap, wrap.querySelector('pre')!, wrap.querySelector('code')!, wrap.querySelector('button')!]) {
+		const block = host.querySelector(`[${CODE_BLOCK_ATTR}]`)!;
+		for (const el of [block, block.querySelector('code')!, block.querySelector('button')!]) {
 			expect(readCodeBlock(el)?.source).toBe('a = 1');
 		}
 	});
@@ -310,44 +387,72 @@ function stubMatches(el: Element, selectors: string[]): void {
 	el.matches = (sel: string) => (selectors.includes(sel) ? true : real(sel));
 }
 
-describe('the shortcut is a first-class registry entry', () => {
-	// Registered rather than hard-wired, so Settings lists and rebinds it like every
-	// other binding - a keyboard route this app does not list is one nobody finds.
-	const entry = DEFAULT_SHORTCUTS.find((x) => x.id === 'extract-code-block');
+describe('BOTH keyboard routes are first-class registry entries', () => {
+	// Registered rather than hard-wired, so Settings lists and rebinds them like
+	// every other binding - a keyboard route this app does not list is one nobody
+	// finds. TWO entries because a binding carries a single `mode` and these differ:
+	// the primary bare `e` in command mode, and `Mod-Shift-e` anywhere.
+	//
+	// The command-mode one is not a convenience: `Mod-Shift-e` is Ctrl+Shift+E on
+	// Windows/Linux, which Firefox binds to the Network Monitor, and a devtools
+	// chord is not cancellable by page JS - so without it a Firefox user has no
+	// keyboard route at all.
+	const entryOf = (id: string) => DEFAULT_SHORTCUTS.find((x) => x.id === id);
+	const command = entryOf('extract-code-block');
+	const anywhere = entryOf('extract-code-block-anywhere');
+	const both = () => [command!, anywhere!];
 
-	it('is declared with a listable category and description', () => {
-		expect(entry).toBeDefined();
-		expect(entry!.keys).toEqual(['Mod-Shift-e']);
-		// `global`: the block it acts on is the one under the POINTER, which is just
-		// as likely while the caret sits in another cell's editor.
-		expect(entry!.mode).toBe('global');
-		// Settings renders only the categories in CATEGORIES, so one outside that
-		// list would silently not appear at all.
-		expect(CATEGORIES).toContain(entry!.category);
-		expect(entry!.description.length).toBeGreaterThan(0);
+	it('declares the command-mode route on the bare letter `e`', () => {
+		expect(command).toBeDefined();
+		expect(command!.keys).toEqual(['e']);
+		expect(command!.mode).toBe('command');
 	});
 
-	it('collides with no other binding in an overlapping mode', () => {
+	it('declares the anywhere route on `Mod-Shift-e`, active in edit mode too', () => {
+		expect(anywhere).toBeDefined();
+		expect(anywhere!.keys).toEqual(['Mod-Shift-e']);
+		expect(anywhere!.mode).toBe('global');
+	});
+
+	it('gives each a listable category and its own description', () => {
+		for (const e of both()) {
+			// Settings renders only the categories in CATEGORIES, so one outside that
+			// list would silently not appear at all.
+			expect(CATEGORIES).toContain(e.category);
+			expect(e.description.length).toBeGreaterThan(0);
+		}
+		// Distinguishable rows: two identically-worded ones would read as a duplicate.
+		expect(command!.description).not.toBe(anywhere!.description);
+	});
+
+	it('neither collides with any other binding in an overlapping mode', () => {
 		// A collision does not error - it SHADOWS, and whichever entry `lookup`
 		// reaches first wins. That is silent, so it is asserted rather than assumed.
-		const clashes = DEFAULT_SHORTCUTS.filter(
-			(other) =>
-				other.id !== entry!.id &&
-				modesOverlap(entry!.mode, other.mode) &&
-				other.keys.some((k) => entry!.keys.some((mine) => bindingsCollide(mine, k)))
-		);
-		expect(clashes.map((c) => c.id)).toEqual([]);
-		expect(shortcuts.conflicts.has('extract-code-block')).toBe(false);
+		// The two are checked against EACH OTHER too: `command` and `global` overlap.
+		for (const e of both()) {
+			const clashes = DEFAULT_SHORTCUTS.filter(
+				(other) =>
+					other.id !== e.id &&
+					modesOverlap(e.mode, other.mode) &&
+					other.keys.some((k) => e.keys.some((mine) => bindingsCollide(mine, k)))
+			);
+			expect(clashes.map((c) => c.id)).toEqual([]);
+			expect(shortcuts.conflicts.has(e.id)).toBe(false);
+		}
 	});
 
-	it('is no typing hazard, despite being active in edit mode', () => {
-		// A bare printable chord bound outside command mode makes that character
-		// untypable in every cell; a modified chord cannot.
-		expect(typingHazards(entry!)).toEqual([]);
+	it('neither is a typing hazard', () => {
+		// A bare printable chord bound OUTSIDE command mode makes that character
+		// untypable in every cell. `e` is safe because command mode is exactly where
+		// bare letters belong; `Mod-Shift-e` is safe because it carries modifiers.
+		for (const e of both()) expect(typingHazards(e)).toEqual([]);
 	});
 
-	it('resolves in BOTH modes, which is what `global` has to mean here', () => {
-		expect(shortcuts.lookup('command', 'Mod-Shift-e')?.id).toBe('extract-code-block');
-		expect(shortcuts.lookup('edit', 'Mod-Shift-e')?.id).toBe('extract-code-block');
+	it('each resolves in the mode it claims', () => {
+		expect(shortcuts.lookup('command', 'e')?.id).toBe('extract-code-block');
+		// `e` must stay typable: it is bound in command mode only.
+		expect(shortcuts.lookup('edit', 'e')).toBeUndefined();
+		expect(shortcuts.lookup('command', 'Mod-Shift-e')?.id).toBe('extract-code-block-anywhere');
+		expect(shortcuts.lookup('edit', 'Mod-Shift-e')?.id).toBe('extract-code-block-anywhere');
 	});
 });

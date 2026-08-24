@@ -46,14 +46,16 @@
 import type { LogicalCellType } from '$lib/server/types';
 
 /**
- * Marks a decorated block wrapper. An ATTRIBUTE rather than a class because it is
- * the contract two files share - `Cell.svelte` decorates, `LiveNotebook.svelte`
- * resolves the shortcut's target against it - while the class beside it is
- * styling only, and a styling class is the kind of thing a redesign renames.
+ * Marks a decorated block - set on the `<pre>` ITSELF (see
+ * {@link decorateCodeBlocks} for why nothing is ever re-parented). An ATTRIBUTE
+ * rather than a class because it is the contract two files share -
+ * `Cell.svelte` decorates, `LiveNotebook.svelte` resolves the shortcut's target
+ * against it - while the class beside it is styling only, and a styling class is
+ * the kind of thing a redesign renames.
  */
 export const CODE_BLOCK_ATTR = 'data-cellar-code-block';
 
-/** The wrapper's styling hook (`.cellar-code-block` in `app.css`). */
+/** The decorated `<pre>`'s styling hook (`.cellar-code-block` in `app.css`). */
 export const CODE_BLOCK_CLASS = 'cellar-code-block';
 
 /** The extract control's test id, shared by the decorator and both test suites. */
@@ -132,7 +134,7 @@ export interface ExtractedCodeBlock {
 }
 
 /**
- * Read a decorated block - the wrapper itself, or anything inside it - as the
+ * Read a decorated block - the `<pre>` itself, or anything inside it - as the
  * cell it would become. Null when the element holds no `<pre><code>`, so a
  * caller does nothing rather than creating an empty cell.
  */
@@ -222,8 +224,8 @@ function buildIcon(doc: Document, name: 'extract' | 'done'): SVGSVGElement {
 
 /**
  * The control itself: icon-only, quiet at rest and full-strength on hover/focus.
- * It sits in a strip `app.css` reserves at the top of the block, so it covers no
- * code at any scroll offset and the block never moves as it brightens.
+ * It sits in a strip `app.css` reserves at the top of the `<pre>`, so it covers
+ * no code at any scroll offset and the block never moves as it brightens.
  */
 function buildExtractButton(doc: Document, block: ExtractedCodeBlock | null): HTMLButtonElement {
 	const label = extractLabel(block?.cellType ?? 'code');
@@ -239,13 +241,37 @@ function buildExtractButton(doc: Document, block: ExtractedCodeBlock | null): HT
 }
 
 /**
- * Wrap every undecorated `<pre><code>` under `root` and hang an extract control
- * on it. Returns how many blocks it decorated, which is what makes it testable
- * without a snapshot of the markup.
+ * Decorate every undecorated `<pre><code>` under `root` with an extract control.
+ * Returns how many blocks it decorated, which is what makes it testable without
+ * a snapshot of the markup.
  *
- * IDEMPOTENT: a block already inside a wrapper is skipped, so re-running after an
- * unrelated re-render neither duplicates a control nor moves a `<pre>` that is
- * already where it belongs.
+ * IT MOVES NO NODE, and that is the load-bearing property rather than an
+ * implementation detail. The markup this walks is a FRAGMENT some renderer put
+ * there - here Svelte's `{@html}` - and such a renderer tracks its fragment by
+ * the identity and sibling position of the TOP-LEVEL nodes it inserted: Svelte
+ * records the first and last of them and, on the next in-place swap, tears the
+ * fragment down by walking `nextSibling` from one to the other and removing each
+ * (`remove_effect_dom`). An earlier version put a wrapper `<div>` where the
+ * `<pre>` was and moved the `<pre>` inside it, which takes the `<pre>` out of
+ * that sibling chain: the walk then descends into the wrapper, removes the
+ * `<pre>` and the control, and STOPS - orphaning the empty wrapper and every
+ * remaining sibling of the old fragment, which accumulate beside the new render.
+ *
+ * Svelte happens to spare Cellar today, because each `{@html}` in `Cell.svelte`
+ * is the only child of its container and so takes the `innerHTML =` path that
+ * clears everything; that is one added sibling away from not being true, and it
+ * is not a property this module can see or assert. So the decoration is
+ * expressed as something no fragment renderer can be broken by: the `<pre>`
+ * keeps its identity, its parent and its siblings, and gains only an attribute,
+ * a class and one appended child. It also means a find-in-page Range already
+ * pointing into the block is untouched, rather than merely surviving a move.
+ *
+ * The horizontal scroll moves with it, onto the `<code>` (`app.css`), so the
+ * `<pre>` can host the absolutely-positioned control without it scrolling away -
+ * a `<button>` is phrasing content, so it is legal there.
+ *
+ * IDEMPOTENT: an already-decorated `<pre>` is skipped, so re-running after an
+ * unrelated re-render neither duplicates a control nor touches a block again.
  *
  * The control carries NO TEXT NODE - the glyph is an inline SVG and the name
  * rides `aria-label`. That is load-bearing rather than a style choice: find-in-
@@ -260,16 +286,10 @@ export function decorateCodeBlocks(root: ParentNode | null | undefined): number 
 	let decorated = 0;
 	for (const code of Array.from(root.querySelectorAll('pre > code'))) {
 		const pre = code.parentElement;
-		if (!pre || pre.parentElement?.hasAttribute?.(CODE_BLOCK_ATTR)) continue;
-		const wrap = doc.createElement('div');
-		wrap.setAttribute(CODE_BLOCK_ATTR, '');
-		wrap.className = CODE_BLOCK_CLASS;
-		// Put the wrapper where the `<pre>` was, then move the `<pre>` into it. The
-		// `<pre>`'s own descendants are never recreated, so a find-in-page Range
-		// already pointing into this block survives the move.
-		pre.replaceWith(wrap);
-		wrap.appendChild(pre);
-		wrap.appendChild(buildExtractButton(doc, readCodeBlock(wrap)));
+		if (!pre || pre.hasAttribute(CODE_BLOCK_ATTR)) continue;
+		pre.setAttribute(CODE_BLOCK_ATTR, '');
+		pre.classList.add(CODE_BLOCK_CLASS);
+		pre.appendChild(buildExtractButton(doc, readCodeBlock(pre)));
 		decorated++;
 	}
 	return decorated;

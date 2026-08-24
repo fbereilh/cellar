@@ -384,15 +384,35 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		description: 'Split the cell at the cursor'
 	},
 	{
-		// `global`, not `command`: the block it acts on is the one under the POINTER
-		// (see `$lib/codeBlockExtract`), which is just as likely while the caret sits
-		// in another cell's editor as it is with a cell merely selected. A modified
-		// chord, so it is no typing hazard in edit mode either.
+		// TWO entries, one action, deliberately - a binding carries a single `mode`
+		// and these differ, so this cannot be one entry with two chords.
+		//
+		// This is the PRIMARY route: a bare letter in command mode, which is where
+		// the user's hands are while READING a reply and hovering a block. It also
+		// has to exist because its sibling below is unreachable in one browser -
+		// `Mod-Shift-e` is Ctrl+Shift+E on Windows/Linux, which Firefox binds to the
+		// Network Monitor, and a devtools chord is not cancellable by page JS. `e` is
+		// free in command mode and prefixes no sequence (`d d` is the only one).
 		id: 'extract-code-block',
+		keys: ['e'],
+		mode: 'command',
+		category: 'Editing',
+		description: 'Extract the hovered code block into a new cell below'
+	},
+	{
+		// The same action, reachable while the caret is inside a cell's EDITOR - the
+		// block it acts on is the one under the POINTER (see `$lib/codeBlockExtract`),
+		// which is just as likely while typing elsewhere as with a cell merely
+		// selected. Modified, so it is no typing hazard in edit mode.
+		//
+		// Deliberately NOT `Mod-Alt-e`: Option+e is the acute-accent dead key on
+		// macOS, the primary platform, and `typingHazards` would not catch it (it only
+		// asks whether a chord carries a modifier at all).
+		id: 'extract-code-block-anywhere',
 		keys: ['Mod-Shift-e'],
 		mode: 'global',
 		category: 'Editing',
-		description: 'Extract the hovered code block into a new cell below'
+		description: 'Extract the hovered code block, also while typing in a cell'
 	},
 
 	// ---- Headings ----------------------------------------------------------

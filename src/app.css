@@ -386,35 +386,49 @@ mark.cellar-search-mark-active {
 
 /* --- Extract a code block into a cell ---------------------------------------
  * The control `$lib/codeBlockExtract` hangs on every rendered code block (a chat
- * reply's, a markdown cell's, a `display(Markdown(...))` payload's). The wrapper
- * exists only to position it: it sets no border, padding or overflow, so the
- * `<pre>`'s own margins still collapse through it and wrapping a block changes
- * nothing about the surrounding rhythm.
+ * reply's, a markdown cell's, a `display(Markdown(...))` payload's). The block
+ * IS the `<pre>` - the decorator wraps nothing and moves nothing, because those
+ * nodes belong to a `{@html}` fragment whose teardown walks them by identity and
+ * sibling position (see `decorateCodeBlocks`). So this file has to make an
+ * existing `<pre>` host an absolutely-positioned child, which is the one thing
+ * the rules below arrange.
  *
- * Two requirements shape the whole block below - the control may never obscure
- * the code, and it may never move the block. So it is ABSOLUTE (nothing reflows
- * as it brightens) and it lives in a strip reserved at the TOP of the `<pre>`
- * (nothing is ever underneath it - see that rule). Both hold at every hover
- * state and every horizontal scroll offset. */
-.cellar-md .cellar-code-block {
-	position: relative;
-}
-/* The control's own strip, and it is what makes "never obscures the code" TRUE
- * rather than nearly true. An overlay in the corner covers whatever sits under it
- * - which for a block whose first line reaches the right edge is code, and a
- * `padding-right` cannot help, because the box scrolls horizontally and the
- * control does not: at any scroll offset something is under it. Vertical space is
- * the one axis horizontal scrolling cannot move content along, so the strip is
- * reserved at the TOP.
+ * Two requirements shape all of them - the control may never obscure the code,
+ * and it may never move the block. So it is ABSOLUTE (nothing reflows as it
+ * brightens) and it lives in a strip reserved at the TOP of the `<pre>` (nothing
+ * is ever underneath it - see that rule). Both hold at every hover state and
+ * every horizontal scroll offset. */
+/* `padding-top` is the control's own strip, and it is what makes "never obscures
+ * the code" TRUE rather than nearly true. An overlay in the corner covers
+ * whatever sits under it - which for a block whose first line reaches the right
+ * edge is code, and a `padding-right` cannot help, because the box scrolls
+ * horizontally and the control does not: at any scroll offset something is under
+ * it. Vertical space is the one axis horizontal scrolling cannot move content
+ * along, so the strip is reserved at the TOP.
  *
- * Reserved on the decorated `<pre>` itself, so it is in place the moment the
- * wrapper is: the decorator runs in the same microtask flush as the render, so
+ * It sits on the decorated `<pre>` itself, so it is in place the moment the
+ * attribute is: the decorator runs in the same microtask flush as the render, so
  * the padded state is the FIRST one painted - measured by sampling every
- * animation frame while a reply rendered, 0 un-wrapped sightings across the 149
+ * animation frame while a reply rendered, 0 un-decorated sightings across the 149
  * frames that had blocks. And only on a DECORATED `<pre>`, so the `.md` file
  * preview, which shares `.cellar-md` but carries no controls, is untouched. */
-.cellar-md .cellar-code-block > pre {
+.cellar-md pre.cellar-code-block {
+	position: relative;
 	padding-top: 1.75rem;
+	/* The SCROLLER moves inward, onto the `<code>` below. An absolutely-positioned
+	 * child of a scroll container scrolls WITH the content, so left on the `<pre>`
+	 * the control would slide off the block the moment a long line was scrolled -
+	 * the very case the reserved strip exists for. `visible` on both axes, since a
+	 * single-axis `visible` beside a non-`visible` one computes back to `auto`. */
+	overflow: visible;
+}
+/* Where the horizontal scroll lives now that the `<pre>` hosts the control. A
+ * `<code>` is inline by default, so it has to become a block box before it can
+ * scroll; nothing else about the block changes, and the `.md` file preview keeps
+ * `.cellar-md pre`'s own `overflow-x` because this rule needs the decoration. */
+.cellar-md pre.cellar-code-block > code {
+	display: block;
+	overflow-x: auto;
 }
 .cellar-md .cellar-code-extract {
 	position: absolute;

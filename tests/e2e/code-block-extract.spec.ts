@@ -4,15 +4,18 @@ import { mkdtempSync, existsSync, rmSync, writeFileSync, readFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { paneMetric } from './notebook-scroll';
 
 /**
  * Lifting a rendered code block into a real cell, in the REAL browser.
  *
- * Both routes - the control on the block and the `Mod-Shift-E` chord - are
- * exercised here, and only here, because both depend on things no unit test can
- * stand in for: the control is injected into `{@html}` output after a Svelte
- * `tick`, and the chord resolves its target through the live `:hover` /
- * `:focus-within` pseudo-classes (jsdom implements neither).
+ * All three routes - the control on the block, the command-mode `e`, and the
+ * `Mod-Shift-E` chord that also fires while the caret is in an editor - are
+ * exercised here, and only here, because all of them depend on things no unit
+ * test can stand in for: the control is injected into `{@html}` output after a
+ * Svelte `tick`, and the chords resolve their target through the live `:hover` /
+ * `:focus-within` pseudo-classes (jsdom implements neither) and their MODE off
+ * the focused element.
  *
  * Every assertion about what was CREATED reads the notebook off DISK rather than
  * the DOM. The shipped default windows cells out of the DOM, so a count or an
@@ -145,11 +148,26 @@ async function openFresh(page: Page, name: string): Promise<string> {
  * 1, 2 and 3.
  */
 const blocks = (page: Page) => page.locator('[data-cellar-code-block]');
+
 const MD_CELL_BLOCK_AT = 0;
 const PY_AT = 1;
 const SQL_AT = 2;
 const MD_AT = 3;
 const extractBtn = (page: Page, i: number) => blocks(page).nth(i).getByTestId('extract-code');
+
+/**
+ * Make `id` the active cell, landing the press in the rendered container's own
+ * PADDING. A plain `.click()` takes the element's centre, which in these cells is
+ * inside a code block - and the extract control sits in that block's top strip -
+ * so a positioned press is what keeps "which cell is active" the only thing the
+ * test is arranging.
+ */
+async function activate(page: Page, id: string): Promise<void> {
+	await page
+		.locator(`[data-testid="cell"][data-cell-id="${id}"]`)
+		.getByTestId('markdown-rendered')
+		.click({ position: { x: 5, y: 4 } });
+}
 
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available - E2E is local-only');
@@ -198,9 +216,11 @@ test('the control covers no code, at rest, hovered, or scrolled to the end', asy
 	// The WIDE block: its single line is far longer than the box, so it is the one
 	// a corner overlay would cover - and `padding-right` could not save it, since
 	// the box scrolls under a control that does not.
+	// The block IS the `<pre>` (nothing is wrapped - see `decorateCodeBlocks`), and
+	// the `<code>` inside it is the horizontal SCROLLER.
 	const block = blocks(page).nth(SQL_AT);
 	const btn = block.getByTestId('extract-code');
-	const code = block.locator('pre > code');
+	const code = block.locator('code');
 
 	const overlaps = async () => {
 		const [b, c] = [await btn.boundingBox(), await code.boundingBox()];
@@ -213,9 +233,17 @@ test('the control covers no code, at rest, hovered, or scrolled to the end', asy
 	await expect(btn).toBeVisible();
 	expect(await overlaps(), 'hovered').toBe(false);
 	// Scrolled to the very end, so the LAST characters of the longest line sit at
-	// the right edge - where the control is.
-	await block.locator('pre').evaluate((el) => (el.scrollLeft = el.scrollWidth));
+	// the right edge - where the control is. The scroll really moved (it is the
+	// premise of the assertion), and the control did NOT move with it: it is
+	// positioned against the `<pre>`, which is not the scroll container.
+	const btnBefore = await btn.boundingBox();
+	const scrolled = await code.evaluate((el) => {
+		el.scrollLeft = el.scrollWidth;
+		return el.scrollLeft;
+	});
+	expect(scrolled, 'the block scrolls horizontally').toBeGreaterThan(0);
 	expect(await overlaps(), 'scrolled to the end').toBe(false);
+	expect(await btn.boundingBox()).toEqual(btnBefore);
 });
 
 test('the SHORTCUT extracts the HOVERED block, with the same source and type', async ({ page }) => {
@@ -467,22 +495,107 @@ test('a REFUSED add confirms NOTHING - no check, and no "click again"', async ({
 	await expect(extractBtn(page, PY_AT)).not.toHaveAttribute('data-extracted', 'true');
 });
 
-test('extraction steals no focus and moves no selection', async ({ page }) => {
+// The two routes differ HERE and nowhere else, so both are pinned - and each
+// starts from a DIFFERENT cell being active than the one holding the block. The
+// earlier version of this test made the chat cell active first and then clicked
+// that same cell's control, which asserts nothing: the cell it expects to stay
+// active is the one a click would have activated anyway.
+test('the BUTTON route activates the clicked cell, and keeps the reader in place', async ({ page }) => {
 	test.setTimeout(120_000);
-	const nb = await openFresh(page, 'extract-focus.ipynb');
+	const nb = await openFresh(page, 'extract-focus-button.ipynb');
 
+	// Start with the OTHER cell active, so "the chat cell is active afterwards" can
+	// only be the click's doing.
 	const chat = page.locator(`[data-testid="cell"][data-cell-id="${CHAT_ID}"]`);
-	await chat.click();
-	await expect(chat).toHaveAttribute('data-active', 'true');
+	const md = page.locator(`[data-testid="cell"][data-cell-id="${MD_ID}"]`);
+	await activate(page, MD_ID);
+	await expect(md).toHaveAttribute('data-active', 'true');
+	const scrollTop = await paneMetric(page, 'scrollTop');
 
 	await blocks(page).nth(PY_AT).hover();
 	await extractBtn(page, PY_AT).click();
 	await settled(nb, 1);
 
-	// The user is READING. The cell they were on stays the active one, nothing else
-	// became active, and the reply did not scroll away under them.
+	// The control is a plain `<button>` inside the cell, and `onCardPointerDown`
+	// exempts one only from its extend/toggle branch - so a plain press activates
+	// the cell it sits in, exactly as any other in-cell control does. Stated rather
+	// than special-cased: what extraction actually promises is that the reader keeps
+	// their place, and it does - no scroll, and no editor.
 	await expect(chat).toHaveAttribute('data-active', 'true');
 	await expect(page.locator('[data-testid="cell"][data-active="true"]')).toHaveCount(1);
+	expect(await paneMetric(page, 'scrollTop')).toBe(scrollTop);
+	await expect(md.getByTestId('markdown-rendered')).toBeVisible();
+});
+
+test('the KEYBOARD route moves neither the selection nor focus', async ({ page }) => {
+	test.setTimeout(120_000);
+	const nb = await openFresh(page, 'extract-focus-keyboard.ipynb');
+
+	// This is the invariant that really distinguishes the routes: the chord acts on
+	// the block under the POINTER while the ACTIVE cell is a different one, and it
+	// must leave that cell active and that element focused.
+	const md = page.locator(`[data-testid="cell"][data-cell-id="${MD_ID}"]`);
+	await activate(page, MD_ID);
+	await expect(md).toHaveAttribute('data-active', 'true');
+	const focusedBefore = await page.evaluate(() => document.activeElement?.getAttribute('data-cell-id') ?? null);
+
+	await blocks(page).nth(PY_AT).hover();
+	await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Shift+e' : 'Control+Shift+e');
+
+	const [cell] = await settled(nb, 1);
+	expect(sourceOf(cell)).toBe(PY_BLOCK);
+	await expect(md).toHaveAttribute('data-active', 'true');
+	await expect(page.locator('[data-testid="cell"][data-active="true"]')).toHaveCount(1);
+	expect(await page.evaluate(() => document.activeElement?.getAttribute('data-cell-id') ?? null)).toBe(focusedBefore);
+});
+
+test('the PRIMARY chord is the bare `e` in command mode', async ({ page }) => {
+	test.setTimeout(120_000);
+	const nb = await openFresh(page, 'extract-bare-e.ipynb');
+
+	// `Mod-Shift-e` is Ctrl+Shift+E on Windows/Linux, which Firefox hands to its
+	// Network Monitor and page JS cannot cancel - so this is the route that has to
+	// work everywhere. Command mode: a cell is selected, no editor has the caret.
+	const md = page.locator(`[data-testid="cell"][data-cell-id="${MD_ID}"]`);
+	await activate(page, MD_ID);
+	await expect(md).toHaveAttribute('data-active', 'true');
+
+	await blocks(page).nth(SQL_AT).hover();
+	await page.keyboard.press('e');
+
+	const [cell] = await settled(nb, 1);
+	expect(sourceOf(cell)).toBe(SQL_BLOCK);
+	expect(typeOf(cell)).toBe('sql');
+	// Same route, same promise: it acted on the hovered block without moving the
+	// selection off the cell the user was on.
+	await expect(md).toHaveAttribute('data-active', 'true');
+});
+
+test('a bare `e` typed INSIDE an editor stays a character', async ({ page }) => {
+	test.setTimeout(120_000);
+	const nb = await openFresh(page, 'extract-bare-e-typing.ipynb');
+
+	// The command-mode binding must not make `e` untypable: it is declared
+	// `mode:'command'` precisely so edit mode never sees it, and the dispatcher
+	// reads a keystroke's mode off the focused element. This is the strong version -
+	// the caret is in an editor AND a code block is under the pointer, so only the
+	// mode gate can tell the two routes apart.
+	const md = page.locator(`[data-testid="cell"][data-cell-id="${MD_ID}"]`);
+	// Into the container's own padding, deliberately: its centre may land on a code
+	// block, whose extract control is exempted from the double-click-to-edit rule.
+	await md.getByTestId('markdown-rendered').dblclick({ position: { x: 5, y: 4 } });
+	const editor = md.locator('.cm-content');
+	await expect(editor).toBeVisible();
+	await editor.click();
+	// Scoped to the CHAT cell: the markdown cell's own block left the DOM when it
+	// entered edit mode, so a page-wide index would have shifted under us.
+	await page.locator(`[data-cell-id="${CHAT_ID}"] [data-cellar-code-block]`).first().hover();
+	await page.keyboard.type('eee');
+
+	await expect(editor).toContainText('eee');
+	// Give an extraction the same chance to land that `settled` would.
+	await page.waitForTimeout(1500);
+	expect(created(nb)).toHaveLength(0);
 });
 
 test('the shortcut is listed in Settings, and the cell copy controls still work', async ({ page }) => {
@@ -514,9 +627,19 @@ test('the shortcut is listed in Settings, and the cell copy controls still work'
 
 	await page.getByTestId('app-menu').click();
 	await page.getByTestId('open-settings').click();
+	// BOTH routes are listed, and distinguishably: the primary command-mode `e` and
+	// the `Mod-Shift-e` that also fires while the caret is in a cell's editor. A
+	// route this pane does not list is one nobody finds.
 	const row = page.locator('[data-shortcut-id="extract-code-block"]');
 	await expect(row).toBeVisible();
 	await expect(row).toContainText('Extract the hovered code block into a new cell below');
+	await expect(row).toContainText('Command mode');
 	// Rendered like every other binding, so it is rebindable from here too.
 	await expect(row.locator('kbd').first()).toBeVisible();
+
+	const anywhere = page.locator('[data-shortcut-id="extract-code-block-anywhere"]');
+	await expect(anywhere).toBeVisible();
+	await expect(anywhere).toContainText('Extract the hovered code block, also while typing in a cell');
+	await expect(anywhere).toContainText('Anywhere');
+	await expect(anywhere.locator('kbd').first()).toBeVisible();
 });

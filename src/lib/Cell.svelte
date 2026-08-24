@@ -1623,9 +1623,11 @@
 	//
 	// It is DECLARED BEFORE the highlight effect below, and that order is
 	// load-bearing: effects run in declaration order and both apply after the same
-	// `tick`, so the blocks are wrapped before find-in-page walks them for Ranges.
-	// The wrap moves the `<pre>` without recreating any of its descendants, so a
-	// Range that already points into a block survives it either way.
+	// `tick`, so the blocks are decorated before find-in-page walks them for Ranges.
+	// Decoration moves no node at all - the `<pre>` gains an attribute, a class and
+	// one appended `<button>` - so a Range that already points into a block is
+	// untouched either way (and the `{@html}` fragment this runs over stays intact
+	// as a sibling chain, which is the reason for that rule; see the module).
 	$effect(() => {
 		// The same deps the highlight effect tracks for "what is shown", minus the
 		// search inputs (which change no markup). A collapse DROPS the rendered
@@ -1677,8 +1679,18 @@
 	// One delegated listener rather than a listener per injected control: the
 	// controls are created and discarded with the rendered markdown, so anything
 	// bound to them individually would have to be unbound again on every re-render.
-	// The card already exempts `button` from its selection gesture
-	// (`onCardPointerDown`), so a click here never also moves the selection.
+	//
+	// WHAT A CLICK HERE DOES TO THE SELECTION, stated exactly, because the two
+	// routes are NOT equivalent and reading them as equivalent is how the claim went
+	// wrong: `onCardPointerDown` exempts `button` only from its EXTEND/TOGGLE branch,
+	// so a plain left press falls through to `onActivate?.(cell.id)` and this cell
+	// becomes the active one, collapsing a multi-selection onto it - exactly as
+	// clicking any other in-cell control does, and deliberately not special-cased
+	// here (exempting `button` from the plain branch would change activation for
+	// every control in every cell). The KEYBOARD route touches neither selection nor
+	// focus. What BOTH routes guarantee is the thing extraction actually promises:
+	// nothing scrolls, and the cell never enters its editor, so the reader keeps
+	// their place either way.
 	//
 	// `stopPropagation` here covers the CLICK and nothing else: `dblclick` and
 	// `keydown` are separate events, so the rendered-markdown container's own
@@ -1723,6 +1735,13 @@
 		// Ranges stay valid - but both still clear here while collapsed, which is why
 		// this dep may not be "simplified" away.)
 		void cellCollapsed;
+		// The same failure one level finer, and PRE-EXISTING: an OUTER fold hides a
+		// heading's BODY inside a cell that is still partly visible, and that body is
+		// dropped by `{#if}` too - so unfolding re-creates it as fresh DOM and detaches
+		// the Ranges this cell registered into it. Nothing else moves on a fold toggle,
+		// so without this a re-expanded section painted no highlights while the find
+		// bar still counted its match.
+		void segHidden;
 		void outputs;
 		void liveSource;
 		// The id chip swaps its text to "copied!" for ~1s, detaching the nodes an id
