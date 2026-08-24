@@ -129,9 +129,10 @@ export function killCellar(proc: ChildProcess): void {
  * and `git-notebook-commits` are named in AGENTS.md for exactly this).
  *
  * So click only while the panel is REALLY closed, retried until it is visibly
- * open, whatever state this page inherited. Nine specs had hand-rolled copies of
- * the racy shape; `chat-cell.spec.ts` had already worked out this fix in place,
- * and this is that rule with one home.
+ * open, whatever state this page inherited. Fourteen specs call this; THIRTEEN of
+ * them had hand-rolled copies of the racy shape and were converted, and the
+ * fourteenth is `chat-cell.spec.ts`, which had already worked out this fix in
+ * place and was folded in, so there is exactly one copy.
  */
 export async function openSidebarSection(page: Page, section: string, body: string, timeout = 30_000): Promise<void> {
 	const header = page.getByTestId(`section-${section}`);

@@ -72,6 +72,25 @@
  * reader learns what happened without the notebook carrying a stranger's
  * directory layout.
  *
+ * A PATTERN is path-shaped too, and an ABSOLUTE one is held to that exact rule -
+ * relativized, or NAMED. `Glob`'s `pattern` IS a path pattern and may legitimately
+ * be written absolute (`/Users/me/proj/**` + `/*.py`), which is the same leak
+ * through a differently-named field, in its worst shape: such a pattern points
+ * outside the confinement root, so the CLI DENIES the call, and printing it would
+ * write the directory layout into the reply, persist it to the `.ipynb` and carry
+ * it into the HTML export precisely when the security boundary did its job. One
+ * convention for every path-shaped value, never a second one for patterns.
+ *
+ * A RELATIVE pattern is left VERBATIM, and that asymmetry is deliberate rather
+ * than an omission. It is already workspace-relative (the read shapes cwd the
+ * child at the root), and a `Grep` pattern is a REGEX, so putting it through the
+ * `.`/`..` segment normalization a relative PATH gets would silently corrupt it:
+ * a pattern of exactly `..` - the regex "any two characters" - would normalize to
+ * `outside the workspace`, a false claim about a search that never named a path
+ * at all, and `a/./b` would quietly lose its `.` segment. Naming an outside path
+ * is required; inventing an outside claim about a regex is the same class of
+ * false statement this section exists to prevent.
+ *
  * ## The rendered line
  *
  * A one-line blockquote holding a call signature in a code span:
@@ -124,23 +143,54 @@ export interface ChatToolCall {
 }
 
 /**
+ * What a rendered field's value IS, which is what decides how it is rendered:
+ *
+ * - `content` - not a path at all (a search query). Shown verbatim.
+ * - `path`    - a filesystem path. Absolute: relativized or NAMED. Relative:
+ *               normalized (so `src/sub/../a.py` reads `src/a.py`, and one that
+ *               climbs out of the workspace is NAMED).
+ * - `pattern` - a path PATTERN (`Glob`) or a regex over content (`Grep`), which
+ *               share one field name. Absolute: relativized or NAMED, exactly
+ *               like a path, because that is where the leak is. Relative: left
+ *               VERBATIM, because normalizing a regex corrupts it (see the
+ *               module header's `..` case).
+ */
+type TargetKind = 'content' | 'path' | 'pattern';
+
+/** One renderable input field, and the kind of value it holds. */
+interface TargetField {
+	readonly field: string;
+	readonly kind: TargetKind;
+}
+
+/**
  * Per tool, the input fields that may be RENDERED, in order: `[primary,
  * secondary?]`. An ALLOWLIST - a tool absent from this map renders its name and
  * nothing else, so a tool added to the engine later cannot leak an input shape
  * nobody decided was a target.
  *
+ * Each field carries its KIND rather than being cross-referenced against a
+ * separate set of path-shaped names: a second list is one a new field can miss
+ * by mere omission, and missing it defaults to printing the value verbatim,
+ * which is the leaking direction. Declared here, adding a field forces the
+ * path-vs-content decision at the point of adding it - the same allowlist
+ * doctrine this module already applies to tools.
+ *
  * `path` rides along for `Glob`/`Grep` because a pattern without the directory it
  * ran in is not provenance - `load` says nothing, `load in src` does.
  */
-const TOOL_TARGETS: Record<string, readonly string[]> = {
-	WebSearch: ['query'],
-	Read: ['file_path'],
-	Glob: ['pattern', 'path'],
-	Grep: ['pattern', 'path']
+const TOOL_TARGETS: Record<string, readonly TargetField[]> = {
+	WebSearch: [{ field: 'query', kind: 'content' }],
+	Read: [{ field: 'file_path', kind: 'path' }],
+	Glob: [
+		{ field: 'pattern', kind: 'pattern' },
+		{ field: 'path', kind: 'path' }
+	],
+	Grep: [
+		{ field: 'pattern', kind: 'pattern' },
+		{ field: 'path', kind: 'path' }
+	]
 };
-
-/** Input fields whose value is a FILE PATH (made workspace-relative). */
-const PATH_FIELDS = new Set(['file_path', 'path']);
 
 /** What an out-of-workspace path renders as - never the path itself. */
 export const OUTSIDE_WORKSPACE = 'outside the workspace';
@@ -175,33 +225,44 @@ function trimTrailingSep(path: string): string {
 	return path.replace(/[/\\]+$/, '') || path;
 }
 
+/** Whether `value` names a location from the filesystem root (POSIX or Windows). */
+function isAbsolutePath(value: string): boolean {
+	return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
+}
+
 /**
- * Render a path for the line: workspace-relative when it is inside the
- * workspace, `.` when it IS the workspace, and `OUTSIDE_WORKSPACE` when it is
- * neither.
+ * An ABSOLUTE path or pattern, rendered against the workspace: workspace-relative
+ * when it is inside, `.` when it IS the workspace, `OUTSIDE_WORKSPACE` otherwise.
+ * This branch is the leak, so EVERY path-shaped field goes through it.
  *
- * Absolute paths go through the shared `toWorkspaceRel` (boundary-aware, so a
- * sibling directory sharing the workspace's name as a prefix is not read as
- * inside it), once per spelling, taking the first that resolves. That helper
- * answers null both for an outside path and for the root ITSELF, so the root is
- * tested for separately and rendered `.` - collapsing the two would report a
- * search of the workspace root as a search outside it. A RELATIVE path is
- * already workspace-relative - the read shapes run the child with the workspace
- * as its cwd - so it is only normalized, and one that climbs out with `..` is
- * treated as outside. Purely lexical: this touches no filesystem, so it is a
+ * It runs the shared `toWorkspaceRel` (boundary-aware, so a sibling directory
+ * sharing the workspace's name as a prefix is not read as inside it) once per
+ * spelling, taking the first that resolves. That helper answers null both for an
+ * outside path and for the root ITSELF, so the root is tested for separately and
+ * rendered `.` - collapsing the two would report a search of the workspace root
+ * as a search outside it. Purely lexical: it touches no filesystem, so it is a
  * pure function of its two arguments.
  */
-function relativePath(value: string, workspace: ChatWorkspaceRef): string {
-	const isAbs = value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
-	if (isAbs) {
-		const target = trimTrailingSep(value);
-		for (const root of workspaceSpellings(workspace)) {
-			const rel = toWorkspaceRel(root, value);
-			if (rel !== null) return rel;
-			if (trimTrailingSep(root) === target) return '.';
-		}
-		return OUTSIDE_WORKSPACE;
+function absoluteAgainstWorkspace(value: string, workspace: ChatWorkspaceRef): string {
+	const target = trimTrailingSep(value);
+	for (const root of workspaceSpellings(workspace)) {
+		const rel = toWorkspaceRel(root, value);
+		if (rel !== null) return rel;
+		if (trimTrailingSep(root) === target) return '.';
 	}
+	return OUTSIDE_WORKSPACE;
+}
+
+/**
+ * A RELATIVE path, normalized: `./src/./a.py` and `src/sub/../a.py` both name
+ * `src/a.py`, and one that climbs out with `..` is treated as outside. It is
+ * already measured from the workspace - the read shapes run the child with the
+ * workspace as its cwd - so nothing else is done to it.
+ *
+ * This is applied to a `path` field ONLY, never to a `pattern`: see the module
+ * header for why normalizing a `Grep` regex would make it lie.
+ */
+function normalizeRelativePath(value: string): string {
 	const parts: string[] = [];
 	for (const seg of value.split(/[/\\]+/)) {
 		if (!seg || seg === '.') continue;
@@ -213,6 +274,13 @@ function relativePath(value: string, workspace: ChatWorkspaceRef): string {
 		parts.push(seg);
 	}
 	return parts.join('/') || '.';
+}
+
+/** Render one field's value according to its declared kind (see `TargetKind`). */
+function renderField(value: string, kind: TargetKind, workspace: ChatWorkspaceRef): string {
+	if (kind === 'content') return value;
+	if (isAbsolutePath(value)) return absoluteAgainstWorkspace(value, workspace);
+	return kind === 'pattern' ? value : normalizeRelativePath(value);
 }
 
 /** Collapse whitespace and bound the length; a target is one line, always. */
@@ -229,10 +297,10 @@ export function toolCallTarget(call: ChatToolCall, workspace: ChatWorkspaceRef):
 	const fields = TOOL_TARGETS[call.name];
 	if (!fields) return null;
 	const parts: string[] = [];
-	for (const field of fields) {
+	for (const { field, kind } of fields) {
 		const raw = call.input?.[field];
 		if (typeof raw !== 'string' || !raw.trim()) continue;
-		parts.push(oneLine(PATH_FIELDS.has(field) ? relativePath(raw.trim(), workspace) : raw));
+		parts.push(oneLine(renderField(raw.trim(), kind, workspace)));
 	}
 	if (parts.length === 0) return null;
 	return parts.join(', ');

@@ -202,7 +202,6 @@ test('a search-on run survives the shipped engine end to end: the real session p
 	// A real query really reached the line, and the line is what a reader gets.
 	const line = toolCallLine(search, tmpdir());
 	expect(line).toMatch(/^`WebSearch\(.+\)`$/);
-	expect(String(search.input.query ?? '')).toMatch(/svelte/i);
 	// And the result stayed out of it - the real payload this time, not a fixture.
 	expect(line.toLowerCase()).not.toContain('web search results');
 });

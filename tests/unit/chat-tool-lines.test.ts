@@ -211,6 +211,71 @@ describe('what a line may say', () => {
 		expect(toolCallTarget(call('Read', { file_path: 'src/sub/../a.py' }), '/ws')).toBe('src/a.py');
 	});
 
+	it('NAMES an absolute out-of-workspace glob PATTERN instead of printing it', () => {
+		// The worst shape of the leak: such a pattern points outside the confinement
+		// root, so the CLI DENIES the call - and printing it would write the user's
+		// directory layout into the reply, the `.ipynb` and the HTML export exactly
+		// when the security boundary did its job.
+		const denied: ChatToolCall = {
+			name: 'Glob',
+			input: { pattern: '/Users/felipe/secrets/**/*.py' },
+			outcome: 'failed'
+		};
+		expect(toolCallTarget(denied, '/ws')).toBe(OUTSIDE_WORKSPACE);
+		const line = toolCallLine(denied, '/ws');
+		expect(line).toBe(`\`Glob(${OUTSIDE_WORKSPACE})\` *(failed)*`);
+		// Not merely "different": no absolute path survives anywhere in the line.
+		expect(line).not.toContain('/Users/felipe/secrets');
+		expect(line).not.toContain('felipe');
+		expect(line).not.toMatch(/[`(\s]\//);
+	});
+
+	it('NAMES an absolute out-of-workspace grep pattern and its path', () => {
+		const denied: ChatToolCall = {
+			name: 'Grep',
+			input: { pattern: '/Users/felipe/secrets/*.env', path: '/Users/felipe/secrets' },
+			outcome: 'failed'
+		};
+		expect(toolCallTarget(denied, '/ws')).toBe(`${OUTSIDE_WORKSPACE}, ${OUTSIDE_WORKSPACE}`);
+		const line = toolCallLine(denied, '/ws');
+		expect(line).not.toContain('felipe');
+		expect(line).not.toMatch(/[`(\s]\//);
+	});
+
+	it('makes an absolute IN-workspace pattern relative, in EITHER spelling', () => {
+		const roots = ['/ws', '/private/ws'];
+		expect(toolCallTarget(call('Glob', { pattern: '/ws/src/**/*.py' }), roots)).toBe('src/**/*.py');
+		expect(toolCallTarget(call('Glob', { pattern: '/private/ws/src/**/*.py' }), roots)).toBe('src/**/*.py');
+		expect(toolCallTarget(call('Grep', { pattern: '/ws/src/*.env', path: '/private/ws/src' }), roots)).toBe(
+			'src/*.env, src'
+		);
+	});
+
+	it('leaves a RELATIVE grep pattern verbatim, so a regex is never rewritten', () => {
+		// A `Grep` pattern is a REGEX. `..` means "any two characters"; normalized as
+		// a path it would render the false claim `outside the workspace` about a
+		// search that never named a path at all, and `a/./b` would lose its `.`.
+		expect(toolCallTarget(call('Grep', { pattern: '..' }), '/ws')).toBe('..');
+		expect(toolCallTarget(call('Grep', { pattern: 'a/./b' }), '/ws')).toBe('a/./b');
+		expect(toolCallTarget(call('Grep', { pattern: '../..' }), '/ws')).toBe('../..');
+		expect(toolCallLine(call('Grep', { pattern: '..' }), '/ws')).not.toContain(OUTSIDE_WORKSPACE);
+		// A relative glob pattern is likewise kept exactly as the model wrote it.
+		expect(toolCallTarget(call('Glob', { pattern: './src/**/*.py' }), '/ws')).toBe('./src/**/*.py');
+		// A relative PATH is still normalized - the asymmetry is per FIELD KIND.
+		expect(toolCallTarget(call('Grep', { pattern: '..', path: './src/./sub' }), '/ws')).toBe('.., src/sub');
+		expect(toolCallTarget(call('Grep', { pattern: '..', path: '../out' }), '/ws')).toBe(
+			`.., ${OUTSIDE_WORKSPACE}`
+		);
+	});
+
+	it('still bounds a long absolute pattern that it relativizes', () => {
+		const long = `/ws/${'d/'.repeat(200)}*.py`;
+		const line = toolCallLine(call('Glob', { pattern: long }), '/ws');
+		expect(line.length).toBeLessThan(200);
+		expect(line).toContain('…');
+		expect(line).not.toContain('/ws/');
+	});
+
 	it('renders an unrecognized tool’s NAME and none of its input', () => {
 		const write = call('Write', { file_path: '/ws/out.txt', content: 'SENSITIVE PAYLOAD' });
 		expect(toolCallTarget(write, '/ws')).toBeNull();
