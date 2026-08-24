@@ -28,6 +28,7 @@
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
 	import { exportCellCount } from '$lib/exportRole';
+	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isExportBase } from '$lib/exportTarget';
 	import { splitInheritedCellar } from '$lib/splitCell';
 	import { agentConfigNotice, type WorkspaceRootOption } from '$lib/notebookRoot';
@@ -1609,13 +1610,7 @@
 			// deletes the key rather than storing `false`, mirroring the server's own
 			// rule, so an optimistic apply and a reload cannot disagree about the shape
 			// of a visible cell's metadata.
-			const cell = findCell(ev.cellId);
-			if (cell) {
-				const cellar = { ...(cell.metadata?.cellar ?? {}) };
-				if (ev.hidden) cellar.hidden_from_agent = true;
-				else delete cellar.hidden_from_agent;
-				cell.metadata = { ...(cell.metadata ?? {}), cellar };
-			}
+			applyHiddenFromAgentLocally(ev.cellId, ev.hidden);
 		} else if (ev.type === 'notebook:export-target') {
 			// The event carries the whole stored state (base + resolution beside the
 			// target), so an agent's or another tab's change lands as one consistent
@@ -2365,20 +2360,64 @@
 	 *
 	 * SHOWING deletes the key rather than storing `false`, matching the server's own
 	 * rule, so the optimistic shape and the persisted shape agree.
+	 *
+	 * It deliberately does NOT follow `setExport`/`setHideInput`'s fire-and-forget
+	 * convention, and that divergence is the point rather than an inconsistency to
+	 * harmonise away: those two are PREFERENCES whose failure is cosmetic, while
+	 * this one is a WITHHOLDING control whose failure is a false claim of
+	 * concealment - a row reading "hidden from AI agents" over a document that still
+	 * hands the cell to every agent read, chat transcript and MCP tool. A refetch
+	 * eventually corrects it (an SSE drop, a seq gap), which makes the window rare,
+	 * not honest. So the outcome is READ: on any failure - a refusal, or a request
+	 * that landed no verdict at all - the flag goes back and the shell's existing
+	 * transient notice channel SAYS what is true.
+	 *
+	 * The revert is SUPERSEDE-SAFE (the `exportTargetCommit`/`statusSeq` reasoning):
+	 * an SSE `cell:visibility`, a `load()` refetch or another local flip may have
+	 * landed while the request was in flight, so it only fires while the cell still
+	 * reads what we optimistically wrote, and it restores THAT KEY alone rather than
+	 * a whole metadata snapshot, which would clobber a concurrent change to the
+	 * export flag one control along.
 	 */
 	async function setHiddenFromAgent(id: string, hidden: boolean) {
-		const cell = findCell(id);
-		if (cell) {
-			const cellar = { ...(cell.metadata?.cellar ?? {}) };
-			if (hidden) cellar.hidden_from_agent = true;
-			else delete cellar.hidden_from_agent;
-			cell.metadata = { ...(cell.metadata ?? {}), cellar };
-		}
-		await fetch(`/api/cells/${id}`, {
+		const before = findCell(id)?.metadata?.cellar ?? {};
+		const had = 'hidden_from_agent' in before;
+		const was = before.hidden_from_agent;
+		applyHiddenFromAgentLocally(id, hidden);
+		const res = await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ hiddenFromAgent: hidden, nb: path, originId })
-		}).catch(() => {});
+		}).catch(() => null);
+		if (res?.ok) return;
+		const now = findCell(id);
+		if (now && isHiddenFromAgent(now) === hidden) {
+			const cellar = { ...(now.metadata?.cellar ?? {}) };
+			if (had) cellar.hidden_from_agent = was;
+			else delete cellar.hidden_from_agent;
+			now.metadata = { ...(now.metadata ?? {}), cellar };
+		}
+		onNotice?.(
+			hidden
+				? 'That cell is still VISIBLE to AI agents - hiding it was not saved.'
+				: 'That cell is still HIDDEN from AI agents - showing it was not saved.'
+		);
+	}
+
+	/**
+	 * Write the agent-visibility flag onto the local cell, the ONE place that shape
+	 * lives on this side: the optimistic apply, its revert and the SSE handler must
+	 * all DELETE the key on show (the server's own rule), or an optimistic flip and a
+	 * reload disagree about what a visible cell's metadata looks like. Metadata is
+	 * reassigned so the toggle reacts even for a cell that had no `cellar` namespace.
+	 */
+	function applyHiddenFromAgentLocally(id: string, hidden: boolean) {
+		const cell = findCell(id);
+		if (!cell) return;
+		const cellar = { ...(cell.metadata?.cellar ?? {}) };
+		if (hidden) cellar.hidden_from_agent = true;
+		else delete cellar.hidden_from_agent;
+		cell.metadata = { ...(cell.metadata ?? {}), cellar };
 	}
 
 	/**

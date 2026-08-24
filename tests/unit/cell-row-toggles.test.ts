@@ -25,6 +25,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync as read } from 'node:fs';
 import { isHiddenFromAgent } from '../../src/lib/agentVisibility';
+import { canExportCell } from '../../src/lib/exportRole';
+import { logicalCellType } from '../../src/lib/cellLanguage';
 
 const PY_BYTES = '# Databricks notebook source\nprint(1)\n\n# COMMAND ----------\n\nprint(2)\n';
 
@@ -52,6 +54,7 @@ vi.mock('../../src/lib/server/jupytext', async () => {
 
 let nbmod: typeof import('../../src/lib/server/notebook');
 let events: typeof import('../../src/lib/server/events');
+let PATCH: (evt: { params: { id: string }; request: Request }) => Promise<Response>;
 let NB: string;
 let PY: string;
 
@@ -75,6 +78,7 @@ beforeAll(async () => {
 	writeFileSync(PY, PY_BYTES);
 	nbmod = await import('../../src/lib/server/notebook');
 	events = await import('../../src/lib/server/events');
+	PATCH = (await import('../../src/routes/api/cells/[id]/+server.js')).PATCH as unknown as typeof PATCH;
 	NB = nbmod.createNotebook('nb.ipynb').path;
 });
 
@@ -176,6 +180,52 @@ describe('the cell:visibility event', () => {
 		nbmod.setVisibility(id, true, NB);
 		const evs = await captured(() => nbmod.setVisibility(id, false, NB));
 		expect(evs.find((e) => e.type === 'cell:visibility')).toMatchObject({ cellId: id, hidden: false });
+	});
+});
+
+describe('the export toggle asks the SAME eligibility rule its setter does', () => {
+	// The gate used to be `canBeImports` (`logicalCellType(cell) === 'code'`), which
+	// maps anything it does not recognize onto `code` - and `deserialize` passes a
+	// FOREIGN nbformat `cell_type` through verbatim. So an externally-authored
+	// notebook carrying one rendered a toggle whose `aria-pressed` could never move
+	// (`isExportCell` is the strict rule) and whose setter always skipped it: a
+	// permanently dead always-visible control, exactly what a gate exists to avoid.
+	const foreign = { cell_type: 'heading', metadata: {} };
+
+	it('the two rules really do diverge on a foreign cell_type', () => {
+		expect(logicalCellType(foreign)).toBe('code'); // the loose rule admits it
+		expect(canExportCell(foreign)).toBe(false); // the eligibility rule does not
+	});
+
+	it('and the SETTER skips such a cell, so a toggle over it could never move', () => {
+		// written straight to disk, never through `createNotebook`, which would seed a
+		// default code cell and cache that doc ahead of this file
+		const nb = join(process.env.CELLAR_WORKSPACE as string, 'foreign.ipynb');
+		writeFileSync(
+			nb,
+			JSON.stringify({
+				cells: [{ cell_type: 'heading', id: 'headingcell', source: ['# Title'], metadata: {} }],
+				metadata: {},
+				nbformat: 4,
+				nbformat_minor: 5
+			})
+		);
+		const id = nbmod.listCells(nb)[0].id;
+		expect(nbmod.listCells(nb)[0].cell_type).toBe('heading'); // passed through verbatim
+		nbmod.setCellExport(id, true, nb);
+		expect(nbmod.listCells(nb)[0].metadata?.cellar?.export).toBeUndefined();
+	});
+
+	it('agrees with the setter for every type the row can render', () => {
+		for (const type of ['code', 'markdown', 'sql', 'raw', 'chat'] as const) {
+			const id = cellOf(type);
+			const cell = () => nbmod.listCells(NB).find((c) => c.id === id);
+			const eligible = canExportCell(cell());
+			expect(eligible, `${type} eligible`).toBe(type === 'code');
+			nbmod.setCellExport(id, true, NB);
+			expect(cell()?.metadata?.cellar?.export === true, `${type} marked`).toBe(eligible);
+			if (eligible) nbmod.setCellExport(id, false, NB);
+		}
 	});
 });
 
@@ -512,8 +562,12 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 
 	// WHY SOURCE: an always-visible control that can never apply is worse than one
 	// behind a menu, so export is GATED and hide-from-agent deliberately is not.
-	it('export is gated on a Python code cell; hide-from-agent is ungated', () => {
-		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual(['{#if canBeImports}']);
+	// WHICH rule the gate asks is checked BEHAVIOURALLY above; what only source can
+	// say is that the rendered gate is that derived rather than a second, looser one.
+	it('export is gated on the export eligibility rule; hide-from-agent is ungated', () => {
+		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual(['{#if canExport}']);
+		expect(cell).toContain('const canExport = $derived(canExportCell(cell));');
+		expect(cell).toContain("import { canExportCell, isExportCell } from '$lib/exportRole'");
 		expect(openGates(cell, 'data-testid="toggle-agent-hidden"')).toEqual([]);
 	});
 
@@ -563,26 +617,112 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 });
 
 describe('the PATCH route accepts the new field', () => {
-	// One writer, so the UI toggle and MCP's set_cell_visibility cannot drift.
-	it('routes hiddenFromAgent to setVisibility with the originId', () => {
-		const route = read(new URL('../../src/routes/api/cells/[id]/+server.js', import.meta.url), 'utf8');
-		expect(route).toMatch(
-			/if \('hiddenFromAgent' in body\) setVisibility\(params\.id, !!body\.hiddenFromAgent, body\.nb, body\.originId\)/
-		);
+	const patch = (id: string, body: unknown) =>
+		PATCH({
+			params: { id },
+			request: new Request(`http://x/api/cells/${id}`, { method: 'PATCH', body: JSON.stringify(body) })
+		});
+
+	// One writer, so the UI toggle and MCP's set_cell_visibility cannot drift - and
+	// the route reaches it with the caller's originId, which is what lets the tab
+	// that flipped the toggle suppress its own echo.
+	it('routes hiddenFromAgent to setVisibility with the originId', async () => {
+		const id = cellOf('markdown');
+		const evs: Ev[] = [];
+		const off = events.subscribe((e) => evs.push(e as Ev));
+		let res: Response;
+		try {
+			res = await patch(id, { hiddenFromAgent: true, nb: NB, originId: 'tab-7' });
+		} finally {
+			off();
+		}
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true });
+		expect(isHiddenFromAgent(nbmod.listCells(NB).find((c) => c.id === id))).toBe(true);
+		expect(evs.find((e) => e.type === 'cell:visibility')).toMatchObject({
+			cellId: id,
+			hidden: true,
+			nb: NB,
+			originId: 'tab-7'
+		});
+	});
+
+	// The body's value is COERCED (`!!`), so a truthy/falsy JSON value still lands
+	// as the boolean the flag is read as (`isHiddenFromAgent` is strictly === true).
+	it('shows the cell again, deleting the key rather than storing false', async () => {
+		const id = cellOf('code');
+		await patch(id, { hiddenFromAgent: true, nb: NB });
+		const res = await patch(id, { hiddenFromAgent: false, nb: NB });
+		expect(res.status).toBe(200);
+		const cellar = nbmod.listCells(NB).find((c) => c.id === id)?.metadata?.cellar ?? {};
+		expect('hidden_from_agent' in cellar).toBe(false);
+	});
+
+	// The WITHHOLDING half: this is the one field in the handler whose write is
+	// reported rather than assumed. A `{ok:true}` for a cell the document does not
+	// have would leave the row claiming a concealment that never happened, and the
+	// client cannot read a verdict the server refuses to send.
+	it('REFUSES a cell the document does not have, rather than reporting success', async () => {
+		const evs: Ev[] = [];
+		const off = events.subscribe((e) => evs.push(e as Ev));
+		let res: Response;
+		try {
+			res = await patch('no-such-cell', { hiddenFromAgent: true, nb: NB });
+		} finally {
+			off();
+		}
+		expect(res.status).toBe(404);
+		expect(await res.json()).toEqual({ ok: false, reason: 'no-such-cell' });
+		expect(evs).toEqual([]);
+	});
+
+	// Scoped deliberately: the sibling setters still report `{ok:true}` whatever
+	// their own boolean said, so this refusal cannot start firing for them.
+	it('leaves the sibling fields reporting as they did', async () => {
+		const res = await patch('no-such-cell', { export: true, nb: NB });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true });
 	});
 });
 
 describe('the client half', () => {
 	const live = src('lib/LiveNotebook.svelte');
 
-	// WHY SOURCE: the optimistic apply and the event handler must both DELETE the
-	// key on show, matching the server - else a toggle-off and a reload disagree
-	// about the shape of a visible cell's metadata.
-	it('optimistic apply and the SSE handler both delete the key on show', () => {
+	// WHY SOURCE: the optimistic apply, its revert and the event handler must all
+	// DELETE the key on show, matching the server - else a toggle-off and a reload
+	// disagree about the shape of a visible cell's metadata. They reach ONE local
+	// writer, which is what makes that true by construction rather than by three
+	// copies happening to agree.
+	it('optimistic apply and the SSE handler go through one local writer', () => {
+		expect(code(live)).toContain('function applyHiddenFromAgentLocally(id: string, hidden: boolean)');
+		const writer = code(live).slice(code(live).indexOf('function applyHiddenFromAgentLocally'));
+		expect(writer.slice(0, 400)).toContain('delete cellar.hidden_from_agent');
 		const setter = live.slice(live.indexOf('async function setHiddenFromAgent'));
-		expect(setter.slice(0, 600)).toContain('delete cellar.hidden_from_agent');
+		expect(setter.slice(0, 900)).toContain('applyHiddenFromAgentLocally(id, hidden)');
 		const handler = live.slice(live.indexOf("ev.type === 'cell:visibility'"));
-		expect(handler.slice(0, 600)).toContain('delete cellar.hidden_from_agent');
+		expect(handler.slice(0, 600)).toContain('applyHiddenFromAgentLocally(ev.cellId, ev.hidden)');
+	});
+
+	// WHY SOURCE: the WITHHOLDING divergence. `setExport`/`setHideInput` are
+	// PREFERENCES and swallow their outcome; this one may not - a failed write that
+	// leaves the toggle pressed is a false claim of concealment. The rendered
+	// consequence (revert + notice + an unchanged .ipynb) is asserted in the e2e.
+	it('reads the outcome, reverts supersede-safely and says what is true', () => {
+		const all = code(live);
+		const from = all.indexOf('async function setHiddenFromAgent');
+		const body = all.slice(from, all.indexOf('function applyHiddenFromAgentLocally', from));
+		expect(from, 'expected setHiddenFromAgent').toBeGreaterThan(0);
+		// no fire-and-forget: the outcome is read, and a network rejection lands in
+		// the same branch as a refusal rather than being swallowed
+		expect(body).toContain('.catch(() => null)');
+		expect(body).not.toContain('.catch(() => {})');
+		expect(body).toContain('if (res?.ok) return;');
+		// the revert only fires while the cell still reads what we wrote
+		expect(body).toContain('isHiddenFromAgent(now) === hidden');
+		// and it states the TRUTH, on the shell's one transient notice channel
+		expect(body).toMatch(/onNotice\?\.\(/);
+		expect(body).toContain('still VISIBLE to AI agents');
+		expect(body).toContain('still HIDDEN from AI agents');
 	});
 
 	it('is threaded to the renderer', () => {

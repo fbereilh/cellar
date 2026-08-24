@@ -9,7 +9,11 @@ import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLangu
  *  to un-designate; `setCellRole` enforces the one-imports-cell-per-notebook rule.
  *  `hiddenFromAgent` withholds the cell from every agent surface (the same flag
  *  MCP's `set_cell_visibility` writes) and applies to EVERY cell type, so unlike
- *  `export`/`hideInput` it is not gated on the cell being code.
+ *  `export`/`hideInput` it is not gated on the cell being code. It is also the one
+ *  field here whose write is REPORTED rather than assumed: it is a withholding
+ *  control applied optimistically in the browser, so answering `{ok:true}` for a
+ *  cell the document does not have would leave the row claiming a concealment that
+ *  never happened.
  *
  *  `cell_type` is VALIDATED against `$lib/cellLanguage`'s vocabulary — the same one
  *  the bulk and add routes use — rather than coerced: `nbCellType` maps anything it
@@ -41,7 +45,15 @@ export async function PATCH({ params, request }) {
 	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
 	if ('export' in body) setCellExport(params.id, !!body.export, body.nb, body.originId);
 	if ('hideInput' in body) setHideInput(params.id, body.hideInput, body.nb, body.originId);
-	if ('hiddenFromAgent' in body) setVisibility(params.id, !!body.hiddenFromAgent, body.nb, body.originId);
+	// SCOPED to `hiddenFromAgent` deliberately: the sibling setters above discard
+	// their boolean too, and widening them is a separate change. This one is
+	// different because it is a WITHHOLDING control - the client applies it
+	// optimistically, so a swallowed refusal leaves the row claiming the cell is
+	// hidden from every agent surface while the document still hands it to each of
+	// them. `setVisibility` reports false only for a cell that does not exist (a
+	// no-op still reports true), so this cannot fire on an ordinary re-set.
+	if ('hiddenFromAgent' in body && !setVisibility(params.id, !!body.hiddenFromAgent, body.nb, body.originId))
+		return json({ ok: false, reason: 'no-such-cell' }, { status: 404 });
 	return json({ ok: true });
 }
 

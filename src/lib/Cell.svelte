@@ -20,7 +20,7 @@
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
-	import { isExportCell } from '$lib/exportRole';
+	import { canExportCell, isExportCell } from '$lib/exportRole';
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
@@ -271,9 +271,14 @@
 	const isImports = $derived(isImportsCell(cell));
 	const canBeImports = $derived(logicalType === 'code');
 	// nbdev-style export: this code cell is written to the notebook's `.py` module.
-	// Only a plain Python code cell can be, so its row toggle rides the same
-	// `canBeImports` gate - an always-visible control that can never apply is worse
-	// than one behind a menu, which is why it is GATED rather than disabled.
+	// The row toggle asks `canExportCell` - the SAME eligibility rule the setters and
+	// `isExportCell` ask - rather than re-deriving one: `canBeImports` is
+	// `logicalCellType(cell) === 'code'`, which maps a FOREIGN nbformat `cell_type`
+	// (`deserialize` passes one through verbatim) onto `code`, while `canExportCell`
+	// is the strict test, so such a cell got a toggle whose `aria-pressed` could
+	// never move and whose setter always skipped it. An always-visible control that
+	// can never apply is worse than one behind a menu, so it is GATED, not disabled.
+	const canExport = $derived(canExportCell(cell));
 	const isExport = $derived(isExportCell(cell));
 	// Withheld from every agent surface (`cellar.hidden_from_agent`, the shared
 	// predicate MCP filters every read through). Deliberately UNGATED: unlike export
@@ -1854,12 +1859,13 @@
 				     the other end of the row. The export marker used to be a separate `badge`
 				     here saying what this toggle now says; two controls for one fact meant the
 				     row RE-LAID OUT on every mark, so they are one control. -->
-				{#if canBeImports}
+				{#if canExport}
 					<!-- nbdev-style export. Gated on a plain Python code cell (`canExportCell`
-					     is the rule; a markdown/SQL/raw cell has no module source), so the
-					     control is ABSENT where it cannot apply rather than permanently
-					     disabled. Presence follows the cell TYPE, never the flag, so toggling
-					     can never add or remove it. -->
+					     is the rule, asked directly; a markdown/SQL/raw cell - or one carrying
+					     a foreign nbformat `cell_type` - has no module source), so the control
+					     is ABSENT where it cannot apply rather than permanently disabled.
+					     Presence follows the cell TYPE, never the flag, so toggling can never
+					     add or remove it. -->
 					<button
 						class="btn btn-ghost btn-xs btn-square {isExport
 							? 'bg-accent/15 text-accent hover:bg-accent/25'

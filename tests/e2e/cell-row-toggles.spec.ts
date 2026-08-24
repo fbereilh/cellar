@@ -324,6 +324,44 @@ test('a second tab sees a flip made in the first', async ({ page, context }) => 
 	await other.close();
 });
 
+test('a hide that does not save reverts and says the cell is still visible', async ({ page }) => {
+	await openNotebook(page);
+	const cell = cellEl(page, CODE);
+	await setToggle(cell, 'toggle-agent-hidden', false);
+	const before = JSON.stringify(diskCellar(CODE));
+
+	// Fail ONLY this write. Hiding a cell from agents is a WITHHOLDING control, so
+	// unlike its preference-shaped neighbours a swallowed failure would leave the
+	// row claiming a concealment the document never took.
+	await page.route('**/api/cells/**', async (route) => {
+		const req = route.request();
+		if (req.method() === 'PATCH' && (req.postData() ?? '').includes('hiddenFromAgent')) {
+			await route.fulfill({ status: 500, contentType: 'application/json', body: '{"ok":false}' });
+			return;
+		}
+		await route.continue();
+	});
+
+	try {
+		await cell.getByTestId('toggle-agent-hidden').click();
+		// it goes back, rather than sitting pressed over a cell agents can still read
+		await expect(cell.getByTestId('toggle-agent-hidden')).toHaveAttribute('aria-pressed', 'false');
+		// and SAYS what is true, on the shell's own transient notice line (asserted
+		// first - it self-dismisses after NOTICE_TIMEOUT_MS)
+		await expect(page.getByTestId('app-notice')).toContainText('still VISIBLE to AI agents');
+		// nothing reached the .ipynb
+		expect(JSON.stringify(diskCellar(CODE))).toBe(before);
+	} finally {
+		await page.unroute('**/api/cells/**');
+	}
+
+	// and the very next flip, unblocked, still works - the failure left no residue
+	await setToggle(cell, 'toggle-agent-hidden', true);
+	await expect.poll(() => diskCellar(CODE).hidden_from_agent).toBe(true);
+	await setToggle(cell, 'toggle-agent-hidden', false);
+	await expect.poll(() => 'hidden_from_agent' in diskCellar(CODE)).toBe(false);
+});
+
 test('every control stays reachable inside the card when the row is narrow', async ({ page }) => {
 	await openNotebook(page);
 	const cell = cellEl(page, CODE);
