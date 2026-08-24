@@ -126,6 +126,7 @@
 		| { type: 'cell:role'; cellId: string; role?: string | null }
 		| { type: 'cell:export'; cellId: string; exported: boolean }
 		| { type: 'cell:hide-input'; cellId: string; hidden: boolean | null }
+		| { type: 'cell:visibility'; cellId: string; hidden: boolean }
 		| { type: 'cell:deleted'; cellId: string }
 		| { type: 'cell:moved'; cellId: string; toIndex: number }
 		| { type: 'cell:type'; cellId: string; cell_type: CellType; language?: string | null }
@@ -1602,6 +1603,19 @@
 				else cellar.hide_input = !!ev.hidden;
 				cell.metadata = { ...(cell.metadata ?? {}), cellar };
 			}
+		} else if (ev.type === 'cell:visibility') {
+			// A cell was hidden from (or shown to) the agent surface. Reassign metadata
+			// for reactivity (the cell may have had no `cellar` namespace). SHOWING
+			// deletes the key rather than storing `false`, mirroring the server's own
+			// rule, so an optimistic apply and a reload cannot disagree about the shape
+			// of a visible cell's metadata.
+			const cell = findCell(ev.cellId);
+			if (cell) {
+				const cellar = { ...(cell.metadata?.cellar ?? {}) };
+				if (ev.hidden) cellar.hidden_from_agent = true;
+				else delete cellar.hidden_from_agent;
+				cell.metadata = { ...(cell.metadata ?? {}), cellar };
+			}
 		} else if (ev.type === 'notebook:export-target') {
 			// The event carries the whole stored state (base + resolution beside the
 			// target), so an agent's or another tab's change lands as one consistent
@@ -2339,6 +2353,31 @@
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ hideInput: hidden, nb: path, originId })
+		}).catch(() => {});
+	}
+
+	/**
+	 * Hide (or show) a cell on the AGENT surface (`cellar.hidden_from_agent`) - a
+	 * withholding choice that survives clean-on-save. Applied optimistically here
+	 * (reassign metadata so the toggle reacts) and persisted server-side. Applies to
+	 * EVERY cell type, so unlike `setExport`/`setHideInput` there is no code-cell
+	 * gate; the source and the output are untouched and the cell still runs.
+	 *
+	 * SHOWING deletes the key rather than storing `false`, matching the server's own
+	 * rule, so the optimistic shape and the persisted shape agree.
+	 */
+	async function setHiddenFromAgent(id: string, hidden: boolean) {
+		const cell = findCell(id);
+		if (cell) {
+			const cellar = { ...(cell.metadata?.cellar ?? {}) };
+			if (hidden) cellar.hidden_from_agent = true;
+			else delete cellar.hidden_from_agent;
+			cell.metadata = { ...(cell.metadata ?? {}), cellar };
+		}
+		await fetch(`/api/cells/${id}`, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ hiddenFromAgent: hidden, nb: path, originId })
 		}).catch(() => {});
 	}
 
@@ -3890,6 +3929,7 @@
 			onSetScrolled={setScrolled}
 			hideAllCode={hideAllCode}
 			onSetHideInput={setHideInput}
+			onSetHiddenFromAgent={setHiddenFromAgent}
 			editorCollapsed={editorCollapsed}
 			onSetEditorCollapsed={setEditorCollapsed}
 			cellCollapsed={cellCollapsed}

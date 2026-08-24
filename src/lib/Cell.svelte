@@ -21,6 +21,7 @@
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
 	import { isExportCell } from '$lib/exportRole';
+	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
 	import { isSqlCell, isRawCell, isChatCell, offersCellType, logicalCellType } from '$lib/cellLanguage';
@@ -95,6 +96,7 @@
 		onSetRole: (id: string, role: string | null) => void;
 		/** Mark this code cell for nbdev-style `.py` export, or unmark it. */
 		onSetExport?: (id: string, exported: boolean) => void;
+		onSetHiddenFromAgent?: (id: string, hidden: boolean) => void;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
 		hideAllCode?: boolean;
@@ -163,6 +165,7 @@
 		onSetType,
 		onSetRole,
 		onSetExport,
+		onSetHiddenFromAgent,
 		onSetScrolled,
 		hideAllCode = false,
 		isPy = false,
@@ -268,9 +271,16 @@
 	const isImports = $derived(isImportsCell(cell));
 	const canBeImports = $derived(logicalType === 'code');
 	// nbdev-style export: this code cell is written to the notebook's `.py` module.
-	// Only a plain Python code cell can be, so the toggle rides the same `canBeImports`
-	// gate (code cells only) as the cell-actions menu it lives in.
+	// Only a plain Python code cell can be, so its row toggle rides the same
+	// `canBeImports` gate - an always-visible control that can never apply is worse
+	// than one behind a menu, which is why it is GATED rather than disabled.
 	const isExport = $derived(isExportCell(cell));
+	// Withheld from every agent surface (`cellar.hidden_from_agent`, the shared
+	// predicate MCP filters every read through). Deliberately UNGATED: unlike export
+	// and hide-code this applies to every cell type - a markdown cell's prose is as
+	// much a thing to withhold as a code cell's source - so the row toggle sits
+	// outside the `isRunnable` run of controls that precedes it.
+	const agentHidden = $derived(isHiddenFromAgent(cell));
 
 	// A remote (agent / other-tab) source edit that arrived while the user was
 	// editing this cell, held until they choose to load it (the affordance below).
@@ -1026,7 +1036,7 @@
 		if (type !== logicalType) onSetType(cell.id, type);
 	}
 
-	// The cell-actions ("⋮") menu — currently the imports-cell mark/unmark toggle.
+	// The cell-actions ("⋮") menu — the imports-cell and hide-code toggles.
 	// A popover in the top layer, like the type menu, so the card's overflow never
 	// clips it. Positioned under its trigger on open.
 	let roleMenuEl = $state<HTMLElement | null>(null);
@@ -1043,9 +1053,13 @@
 		roleMenuEl?.hidePopover();
 		onSetRole(cell.id, isImports ? null : 'imports');
 	}
+	// The two ROW toggles. No `hidePopover` - unlike their neighbours in the "⋮"
+	// menu these are in the row itself, so there is no popover to dismiss.
 	function toggleExport() {
-		roleMenuEl?.hidePopover();
 		onSetExport?.(cell.id, !isExport);
+	}
+	function toggleAgentHidden() {
+		onSetHiddenFromAgent?.(cell.id, !agentHidden);
 	}
 
 	function currentSource() {
@@ -1817,6 +1831,66 @@
 						{/if}
 					</button>
 				{/if}
+				<!-- Two STATE toggles, deliberately in the row rather than the "⋮" menu and
+				     given the copy buttons' exact treatment (`btn-ghost btn-xs btn-square`, a
+				     3.5-unit icon): both are reached repeatedly while working, so a menu open
+				     per flip is the whole cost being removed. Unlike the copy buttons they are
+				     TOGGLES, so the state has to be readable without hovering - each one tints
+				     and takes a soft background when ON, and carries `aria-pressed`.
+				     Geometry is IDENTICAL in both states (only colour moves), which is what
+				     keeps a flip from shifting the badges, the cell id and the run meta that
+				     follow it - the same no-shift rule the reserved elapsed-clock box keeps at
+				     the other end of the row. The export marker used to be a separate `badge`
+				     here saying what this toggle now says; two controls for one fact meant the
+				     row RE-LAID OUT on every mark, so they are one control. -->
+				{#if canBeImports}
+					<!-- nbdev-style export. Gated on a plain Python code cell (`canExportCell`
+					     is the rule; a markdown/SQL/raw cell has no module source), so the
+					     control is ABSENT where it cannot apply rather than permanently
+					     disabled. Presence follows the cell TYPE, never the flag, so toggling
+					     can never add or remove it. -->
+					<button
+						class="btn btn-ghost btn-xs btn-square {isExport
+							? 'bg-accent/15 text-accent hover:bg-accent/25'
+							: 'text-base-content/60 hover:text-base-content/90'}"
+						onclick={toggleExport}
+						aria-pressed={isExport}
+						title={isExport
+							? "Exported to the notebook's .py module - click to unmark"
+							: "Mark for export to the notebook's .py module"}
+						aria-label="Export this cell to the notebook's .py module"
+						data-testid="toggle-export"
+						data-on={isExport ? 'true' : undefined}
+					>
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+					</button>
+				{/if}
+				<!-- Withhold this cell from every agent surface. The sparkle is Cellar's own
+				     agent glyph (the `run-actor` badge uses it) struck through when hidden, and
+				     `secondary` is the hue this app already spends on the agent - so the ON
+				     state reads as "the AI cannot see this" rather than as a second copy of the
+				     menu's hide-CODE eye, which is a different feature and keeps its own glyph.
+				     UNGATED: every cell type can be withheld. -->
+				<button
+					class="btn btn-ghost btn-xs btn-square {agentHidden
+						? 'bg-secondary/15 text-secondary hover:bg-secondary/25'
+						: 'text-base-content/60 hover:text-base-content/90'}"
+					onclick={toggleAgentHidden}
+					aria-pressed={agentHidden}
+					title={agentHidden
+						? 'Hidden from AI agents - click to let them see it'
+						: 'Visible to AI agents - click to hide it from them'}
+					aria-label="Hide this cell from AI agents"
+					data-testid="toggle-agent-hidden"
+					data-on={agentHidden ? 'true' : undefined}
+				>
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+						<path d="M12 5 13.4 9.6 18 11l-4.6 1.4L12 17l-1.4-4.6L6 11l4.6-1.4z" />
+						{#if agentHidden}
+							<path d="m3 3 18 18" />
+						{/if}
+					</svg>
+				</button>
 				{#if isImports}
 					<!-- The visual marker that THIS is the notebook's imports cell — a pin
 					     glyph + label, no longer tied to the cell's position. -->
@@ -1827,18 +1901,6 @@
 					>
 						<svg class="h-2.5 w-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>
 						imports
-					</span>
-				{/if}
-				{#if isExport}
-					<!-- Export marker: this code cell is written to the notebook's `.py`
-					     module (nbdev's `#|export`). -->
-					<span
-						class="badge badge-xs ml-1.5 flex items-center gap-1 badge-soft badge-accent font-medium"
-						title="Exported to the notebook's .py module. Set the target and re-export from the bar at the top; the module also regenerates on save."
-						data-testid="export-badge"
-					>
-						<svg class="h-2.5 w-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
-						export
 					</span>
 				{/if}
 				{#if isSql}
@@ -1993,7 +2055,12 @@
 				</button>
 				{#if isRunnable}
 					<!-- Cell-actions menu: hide/show this code cell's input, and (for a plain
-					     Python code cell) designate it the imports cell or mark it for export. -->
+					     Python code cell) designate it the imports cell. Export and
+					     hide-from-agent are NOT duplicated here - both are toggles reached
+					     repeatedly, so they live in the row itself; leaving a copy behind would
+					     be two controls for one fact. What stays is what is reached rarely
+					     (designating the imports cell) or is already a whole-notebook default
+					     with a per-cell override (hide code). -->
 					<button
 						bind:this={roleBtnEl}
 						class="btn btn-ghost btn-xs btn-square {isImports || codeHidden ? 'text-primary' : 'text-base-content/50 hover:text-base-content/80'}"
@@ -2035,14 +2102,6 @@
 							>
 								<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>
 								<span>{isImports ? 'Unmark as imports cell' : 'Mark as imports cell'}</span>
-							</button>
-							<button
-								class="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-base-200 {isExport ? 'text-base-content' : 'text-accent'}"
-								onclick={toggleExport}
-								data-testid="toggle-export"
-							>
-								<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
-								<span>{isExport ? 'Unmark for export' : 'Mark for export to .py'}</span>
 							</button>
 							{/if}
 						</div>

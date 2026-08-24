@@ -30,6 +30,7 @@ import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
 import { exportNotebookToPy, resolveExportTarget, type ExportResult, type ResolvedExportTarget } from './export-py';
 import { canExportCell } from '../exportRole';
+import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
 import { resolveInWorkspace } from './fstree';
@@ -646,15 +647,43 @@ export function getCell(id: string, nb?: string | null): CellView | null {
 	return { id: c.id, cell_type: c.cell_type, source: c.source, outputs: c.outputs ?? [], metadata: c.metadata ?? {} };
 }
 
-/** Set the agent-visibility flag in the allowlisted `cellar` namespace. */
-export function setVisibility(id: string, hidden: boolean, nb?: string | null): boolean {
+/**
+ * Set the agent-visibility flag in the allowlisted `cellar` namespace, so it
+ * round-trips through clean-on-save. Applies to EVERY cell type - the flag is
+ * honored in every agent map, read, search, section and result, and a markdown
+ * cell's prose is as much a thing to withhold as a code cell's source, so unlike
+ * `setCellExport`/`setHideInput` there is no cell-type gate.
+ *
+ * SHOWING deletes the key rather than storing `false` (the `setCellExports`
+ * rule): `isHiddenFromAgent` is strictly `=== true`, so absent and `false` read
+ * identically, and storing the default would put a line in the user's committed
+ * `.ipynb` for a cell that is in the state every cell starts in.
+ *
+ * Only a real CHANGE writes or emits, so re-setting the value a cell already
+ * carries costs no `.ipynb` write and no event (zero git diff, no mtime churn) -
+ * which is also what keeps an optimistic UI toggle from echoing itself back.
+ *
+ * The persist is guarded on `jpFormat` like `setCellExports`: a `.py` text
+ * notebook carries no cellar cell metadata, so the write would spend a blocking
+ * jupytext `spawnSync` producing byte-identical output while silently losing the
+ * very flag it was asked to store. The event still fires, so open tabs update
+ * either way and the flag holds for the session (the same in-session-only limit
+ * every per-cell `cellar` flag has on a `.py` notebook).
+ */
+export function setVisibility(id: string, hidden: boolean, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return false;
-	cell.metadata = cell.metadata ?? {};
-	cell.metadata.cellar = cell.metadata.cellar ?? {};
-	cell.metadata.cellar.hidden_from_agent = !!hidden;
-	persist(doc);
+	if (isHiddenFromAgent(cell) === !!hidden) return true;
+	if (hidden) {
+		cell.metadata = cell.metadata ?? {};
+		cell.metadata.cellar = cell.metadata.cellar ?? {};
+		cell.metadata.cellar.hidden_from_agent = true;
+	} else {
+		delete cell.metadata?.cellar?.hidden_from_agent;
+	}
+	if (!doc.jpFormat) persist(doc);
+	emit(doc, 'cell:visibility', { cellId: id, hidden: !!hidden }, originId);
 	return true;
 }
 

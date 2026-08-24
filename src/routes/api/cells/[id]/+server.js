@@ -1,12 +1,15 @@
 import { json } from '@sveltejs/kit';
-import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setHideInput } from '$lib/server/notebook';
+import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setHideInput, setVisibility } from '$lib/server/notebook';
 import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
 
 /** Edit a cell's source, type ('code' | 'sql' | 'markdown' | 'raw'), imports-cell
- *  role, and/or its output-scroll choice in notebook `nb` (body field;
+ *  role, agent visibility, and/or its output-scroll choice in notebook `nb` (body field;
  *  workspace-relative path, defaults to the active notebook). `role` is 'imports'
  *  to designate this cell the notebook's imports cell (clearing any other) or null
  *  to un-designate; `setCellRole` enforces the one-imports-cell-per-notebook rule.
+ *  `hiddenFromAgent` withholds the cell from every agent surface (the same flag
+ *  MCP's `set_cell_visibility` writes) and applies to EVERY cell type, so unlike
+ *  `export`/`hideInput` it is not gated on the cell being code.
  *
  *  `cell_type` is VALIDATED against `$lib/cellLanguage`'s vocabulary — the same one
  *  the bulk and add routes use — rather than coerced: `nbCellType` maps anything it
@@ -38,6 +41,7 @@ export async function PATCH({ params, request }) {
 	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
 	if ('export' in body) setCellExport(params.id, !!body.export, body.nb, body.originId);
 	if ('hideInput' in body) setHideInput(params.id, body.hideInput, body.nb, body.originId);
+	if ('hiddenFromAgent' in body) setVisibility(params.id, !!body.hiddenFromAgent, body.nb, body.originId);
 	return json({ ok: true });
 }
 

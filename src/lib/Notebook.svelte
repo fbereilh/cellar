@@ -145,6 +145,7 @@
 		hideAllCode?: boolean;
 		/** Hide (or show) a code cell's input in place. */
 		onSetHideInput?: (id: string, hidden: boolean) => void;
+		onSetHiddenFromAgent?: (id: string, hidden: boolean) => void;
 		/** cell id → explicit code-editor collapse choice (runtime-only) */
 		editorCollapsed?: Record<string, boolean | undefined>;
 		onSetEditorCollapsed?: (id: string, collapsed: boolean) => void;
@@ -241,6 +242,7 @@
 		onSetScrolled,
 		hideAllCode = false,
 		onSetHideInput,
+		onSetHiddenFromAgent,
 		editorCollapsed = {},
 		onSetEditorCollapsed,
 		cellCollapsed = {},
@@ -831,6 +833,7 @@
 			{hideAllCode}
 			{isPy}
 			onSetHideInput={onSetHideInput}
+			onSetHiddenFromAgent={onSetHiddenFromAgent}
 			editorCollapsed={editorCollapsed[cell.id]}
 			onSetEditorCollapsed={onSetEditorCollapsed}
 			cellCollapsed={!!cellCollapsed[cell.id]}
