@@ -160,7 +160,10 @@ describe('kernel manager (per notebook)', () => {
 		vi.mocked(clearRunQueue).mockClear();
 		const C = '/ws/c.ipynb';
 		const info = await interruptKernel(C);
-		expect(info).toEqual({ status: 'not_started', id: null });
+		// `stopped` reports what the call actually stopped; with no kernel there was
+		// nothing to signal, and saying so is what keeps the field trustworthy on the
+		// path that DOES stop something (see kernel-interrupt-stops.test.ts).
+		expect(info).toEqual({ status: 'not_started', id: null, stopped: 'no_kernel' });
 		expect(clearRunQueue).toHaveBeenCalledWith(C, 'kernel_interrupt');
 		expect(h.startNew).not.toHaveBeenCalled(); // never force-boots a kernel
 	});
