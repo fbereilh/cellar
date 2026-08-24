@@ -44,7 +44,12 @@
  *    and `<other>.html` stay readable and carry every cell of that notebook
  *    (neither writer filters hidden cells). Widening the block to those file
  *    types is deliberately rejected - it would deny what a reads-on reply exists
- *    to read.
+ *    to read. And (d) on a SYMLINKED root a prompt-injected LEXICAL absolute path
+ *    can still evade Grep: the policy is built in the canonical namespace and
+ *    denies both spellings, but the CLI's deny binds only when the path the tool
+ *    is handed shares the rule's namespace while its grant binds across both.
+ *    That is an ACCEPTED residual - the alternative was refusing reads for every
+ *    `/tmp` and `/var` workspace - and it cannot be closed from outside the CLI.
  *
  * 2. **The transcript is BYTE-STABLE across runs of an unchanged notebook.**
  *    Prompt caching keys on an exact prefix and is what makes a long notebook

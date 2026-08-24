@@ -204,7 +204,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { normalizeChatModel } from '$lib/chatCell';
@@ -454,8 +454,84 @@ function deniableNotebookPaths(notebookPath: string): string[] | null {
 	return safe;
 }
 
+/**
+ * The CANONICAL spelling of `abs` - symlinks resolved - or `abs` unchanged when
+ * it cannot be resolved (it does not exist yet, or the walk is refused).
+ *
+ * ## Why the whole policy is built in the canonical namespace
+ *
+ * A path and its realpath are TWO SPELLINGS of one file, and the CLI's permission
+ * layer does not treat them alike. Measured against claude 2.1.238 on a workspace
+ * whose path traverses a symlink - on macOS `/var` and `/tmp` are symlinks into
+ * `/private`, so this is every `mkdtemp` workspace and any workspace under
+ * `/tmp`, not a corner case:
+ *
+ *   - policy built LEXICALLY, the model searching the lexical path: `Read` of the
+ *     current notebook was DENIED, but `Grep` over the granted directory RETURNED
+ *     ITS CONTENT - exactly the hidden-cell content rule 1 exists to withhold.
+ *   - policy built CANONICALLY, the model searching the canonical path: bound.
+ *     No leak, through any of the three tools.
+ *   - policy built canonically, the model searching the LEXICAL path: leaks again.
+ *
+ * So the GRANT binds across both spellings while the DENY binds only when the
+ * path the tool is handed sits in the same namespace as the rule - a fail-open
+ * asymmetry, and one we cannot repair from outside the CLI. What we CAN do is
+ * never be in the mismatched situation: canonicalising the root makes the child's
+ * cwd canonical, so the tools' default path and every relative path the model
+ * forms are canonical too, and the deny binds.
+ */
+function canonicalPath(abs: string): string {
+	try {
+		return realpathSync(abs);
+	} catch {
+		return abs;
+	}
+}
+
 /** Which half of the reads precondition a workspace/notebook pair fails. */
 export type ChatReadsBlockedCause = 'workspace' | 'notebook';
+
+/**
+ * WHY a path cannot be spelled as a literal rule - the two kinds are kept apart
+ * in the VERDICT, not merely in the copy that renders it, because they have
+ * different remedies and only one of them has a remedy at all:
+ *
+ *   - `character`: one path SEGMENT carries a refused character, so the segment
+ *     is nameable and renaming that thing genuinely fixes it.
+ *   - `platform`: the path is not POSIX-absolute at all. The `//` rule prefix
+ *     was measured on POSIX only, so on Windows EVERY path fails this way, for a
+ *     structural reason no rename can touch. A "rename the folder" remedy there
+ *     can never work, and this module's own doctrine is that a remedy naming
+ *     something the user cannot act on is worse than no remedy.
+ */
+export type ChatPathRefusal = { kind: 'platform' } | { kind: 'character'; segment: string };
+
+/** Why `value` cannot be spelled as a literal rule, or null when it can. */
+export function chatPathRefusal(value: unknown): ChatPathRefusal | null {
+	if (typeof value !== 'string' || !value.startsWith('/')) return { kind: 'platform' };
+	const abs = resolve(value);
+	if (!abs.startsWith('/')) return { kind: 'platform' };
+	// Name the FIRST offending segment rather than the whole path: the copy has to
+	// point at one thing to rename, and an ancestor directory is as likely to be
+	// the culprit as the leaf (a `<ws>/sub[x]/analysis.ipynb` notebook is refused
+	// for the DIRECTORY's sake, so "rename this notebook" would be useless advice).
+	for (const segment of abs.split('/')) {
+		if (segment && (UNCONFINABLE_ROOT_CHARS.test(segment) || EXTGLOB_PREFIX.test(segment))) {
+			return { kind: 'character', segment };
+		}
+	}
+	return null;
+}
+
+/** One reads-availability verdict: which half failed, why, and at which segment. */
+export interface ChatReadsBlocked {
+	cause: ChatReadsBlockedCause;
+	kind: ChatPathRefusal['kind'];
+	/** The offending path segment - present only for a `character` refusal. */
+	segment?: string;
+	/** True when the offending segment IS the notebook's own file name. */
+	isNotebookName?: boolean;
+}
 
 /**
  * Why a reads-on run would silently come back READ-LESS, or null when reads can
@@ -468,22 +544,34 @@ export type ChatReadsBlockedCause = 'workspace' | 'notebook';
  * the same DETECT + REPORT shape the Databricks card already applies to a
  * silently-inert capability (`sdkDbutils`).
  *
- * The two causes are reported SEPARATELY because they differ in scope and in
- * remedy: a `workspace` verdict means no notebook in this workspace can have
- * reads, while a `notebook` verdict is about THAT notebook's own name and its
- * derived artifacts - reads keep working in the notebook beside it, so a report
- * that did not say which is at fault would be wrong about the workspace as a
- * whole. Order matters: the workspace is checked first, since an unusable root
- * makes the notebook question moot.
+ * It reports MORE than a cause, because a report can only name what the verdict
+ * identified: the offending SEGMENT and the KIND of refusal ride along, so the
+ * copy can point at the right thing to rename - or, for a `platform` refusal,
+ * offer no rename at all. Guessing that the notebook's own file name is at fault
+ * is wrong on a reachable path: an un-patternable ancestor DIRECTORY raises the
+ * notebook cause too.
  *
- * It answers from the SAME `chatReadRoot`/`literalRulePath`/`deniableNotebookPaths`
- * the policy uses - never a second copy of the character rule, so the pane can
- * never promise (or deny) something the engine would decide differently.
+ * The two CAUSES are reported separately because they differ in scope: a
+ * `workspace` verdict means no notebook here can have reads, while a `notebook`
+ * verdict is about THAT notebook - reads keep working in the one beside it. The
+ * workspace is checked first, since an unusable root makes the rest moot.
+ *
+ * It answers from the SAME character rule the policy uses (`chatPathRefusal`
+ * shares `UNCONFINABLE_ROOT_CHARS`/`EXTGLOB_PREFIX` with `literalRulePath`), so
+ * the pane can never promise - or deny - what the engine would decide otherwise.
  */
-export function chatReadsBlockedCause(readRoot: unknown, notebookPath: unknown): ChatReadsBlockedCause | null {
-	if (chatReadRoot(readRoot) === null) return 'workspace';
+export function chatReadsBlockedCause(readRoot: unknown, notebookPath: unknown): ChatReadsBlocked | null {
+	const rootRefusal = chatPathRefusal(readRoot);
+	if (rootRefusal) return { cause: 'workspace', ...rootRefusal };
+	if (typeof notebookPath !== 'string') return { cause: 'notebook', kind: 'platform' };
+	const own = chatPathRefusal(notebookPath);
+	if (own) return { cause: 'notebook', ...own, ...(own.kind === 'character' ? { isNotebookName: own.segment === basename(resolve(notebookPath)) } : {}) };
+	// The notebook itself is spellable; one of the names DERIVED from it may not
+	// be, and a denial that cannot be spelled for every artifact costs the reads.
 	const literal = literalRulePath(notebookPath);
-	if (literal === null || deniableNotebookPaths(literal) === null) return 'notebook';
+	if (literal === null || deniableNotebookPaths(literal) === null) {
+		return { cause: 'notebook', kind: 'character', segment: basename(literal ?? resolve(notebookPath)), isNotebookName: true };
+	}
 	return null;
 }
 
@@ -544,6 +632,19 @@ export function chatReadsBlockedCause(readRoot: unknown, notebookPath: unknown):
  *       cannot see: MCP `export_html` called with an explicit `path`, and an
  *       nbdev export module at a configured `metadata.cellar.export_target`.
  *       Neither is derivable from the notebook's name, so neither is denied.
+ *   (d) A prompt-injected LEXICAL absolute path on a SYMLINKED root can still
+ *       evade Grep. The whole policy is built in the canonical namespace so the
+ *       child's cwd is canonical and every path the model forms itself is too
+ *       (see `canonicalPath`), and the lexical spelling is denied as well - but
+ *       measured, the deny binds only when the path the TOOL IS HANDED shares the
+ *       rule's namespace, while the GRANT binds across both. So a workspace file
+ *       whose content tells the model to Grep the `/var/...` spelling of a root
+ *       Cellar canonicalised to `/private/var/...` can still reach the current
+ *       notebook's cells. That is squarely this feature's threat model and it is
+ *       an ACCEPTED, DELIBERATE residual, not an oversight: the alternative on
+ *       the table was refusing reads outright for every non-canonical workspace
+ *       path - every `/tmp` and `/var` workspace - which was judged not worth the
+ *       functionality. It cannot be closed from outside the CLI.
  *   (c) ANOTHER notebook's DEFAULT-PATH exports, and any jupytext `.py`
  *       notebook - readable whether the other-notebooks option is on or OFF.
  *       Rule 3 blocks `.ipynb` files; rule 1's by-name derivation covers only
@@ -558,7 +659,7 @@ export function chatReadsBlockedCause(readRoot: unknown, notebookPath: unknown):
  *       readable.
  *
  * So the claim this layer supports is the narrow one, and it is about THIS
- * notebook: a hidden cell in the CURRENT notebook is unreachable through the
+ * notebook, on a root whose canonical spelling is the one in play: a hidden cell in the CURRENT notebook is unreachable through the
  * notebook file, the copies Cellar names after it, and the checkpoint store.
  * That guarantee is by-name and complete. The other-notebooks block is the
  * WEAKER, separate statement in rule 3 - `.ipynb` files only - and the two must
@@ -586,8 +687,20 @@ function denialPatterns(root: string, notebookTargets: readonly string[], otherN
  */
 export function chatToolPolicy(caps: ChatCapabilities = {}): ChatToolPolicy {
 	const webSearch = caps.webSearch === true;
-	const root = chatReadRoot(caps.readRoot);
-	const notebookPath = literalRulePath(caps.notebookPath);
+	// CANONICALISE BEFORE VALIDATING, so the refusal rules apply to the spelling
+	// actually emitted: the whole policy - cwd, grant and denials - is built in the
+	// canonical namespace, because the deny only binds there (see `canonicalPath`).
+	// VALIDATE FIRST, canonicalise second, then re-validate. The order is
+	// load-bearing: `realpathSync` resolves a RELATIVE path against the process's
+	// own cwd, so canonicalising an unvalidated value turns `'relative/dir'` - which
+	// must be REFUSED - into a real absolute path and grants reads over whatever
+	// Cellar happens to be running in. Re-validating the canonical form matters too:
+	// the resolved spelling is what gets emitted, so it is the spelling the refused
+	// characters must be checked against.
+	const lexicalRoot = chatReadRoot(caps.readRoot);
+	const root = lexicalRoot === null ? null : chatReadRoot(canonicalPath(lexicalRoot));
+	const lexicalNotebook = literalRulePath(caps.notebookPath);
+	const notebookPath = lexicalNotebook === null ? null : literalRulePath(canonicalPath(lexicalNotebook));
 	// Every path the run must be able to DENY, resolved before any grant is
 	// built: null here (an un-patternable notebook name) costs the reads, so a
 	// granted read whose notebook denial silently missed is unreachable.
@@ -603,7 +716,16 @@ export function chatToolPolicy(caps: ChatCapabilities = {}): ChatToolPolicy {
 	}
 	if (readRoot && notebookTargets) {
 		const pattern = readGrantPattern(readRoot);
-		const denied = denialPatterns(readRoot, notebookTargets, caps.otherNotebooks === true);
+		// BELT AND BRACES (3): also deny the LEXICAL spelling wherever it differs
+		// from the canonical one. Measured insufficient on its own - a lexical
+		// search path leaks whatever is in the deny list - so it is not the fix;
+		// canonicalising the root is. It costs nothing and closes the case where a
+		// tool is handed the other spelling of a path we already deny.
+		const lexicalTargets = lexicalNotebook === null ? [] : (deniableNotebookPaths(lexicalNotebook) ?? []);
+		const denied = [
+			...denialPatterns(readRoot, notebookTargets, caps.otherNotebooks === true),
+			...denialPatterns(lexicalRoot ?? readRoot, lexicalTargets, caps.otherNotebooks === true)
+		].filter((p, i, all) => all.indexOf(p) === i);
 		for (const tool of READ_TOOLS) {
 			tools.push(tool);
 			grants.push(`${tool}(${pattern})`);

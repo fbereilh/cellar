@@ -253,42 +253,67 @@
 	// workspace path or notebook name Cellar cannot express as a literal permission
 	// rule, and that fallback is otherwise SILENT - the toggle stays on and the copy
 	// below still promises reads, while only the model is told otherwise, so the
-	// person meets a reply that merely seems broken. The verdict is the server's
-	// (it depends on the workspace root and the notebook path) and comes from the
-	// SAME predicate the engine applies, so this pane can never promise what a run
-	// would refuse. Re-fetched when the active notebook changes, because the
-	// notebook half is per notebook.
-	let chatReads = $state<{ available: boolean; cause: string | null; notebook?: string } | null>(null);
+	// person meets a reply that merely seems broken.
+	//
+	// Served by its OWN route (`/api/chat/reads`), never `/api/chat/status`: that
+	// one awaits `claude auth status` spawns, so riding it made opening this modal
+	// spawn the CLI for everyone - including users who never touch chat cells - and
+	// put the notice behind authentication latency. This verdict is a pure function
+	// of two path strings and spawns nothing. It comes from the SAME character rule
+	// the engine applies, so the pane can never promise what a run would refuse.
+	interface ReadsVerdict {
+		available: boolean;
+		blocked?: { cause: string; kind: string; segment?: string; isNotebookName?: boolean };
+		notebook?: string;
+	}
+	let chatReads = $state<ReadsVerdict | null>(null);
+	// Generation guard (the `statusSeq`/`kernelReqSeq` convention): the active
+	// notebook can change while a read is in flight, and this notice NAMES a
+	// notebook - a late reply landing over a newer one would assert the wrong thing
+	// about a healthy notebook, the exact dishonesty this surface exists to remove.
+	let readsSeq = 0;
 	$effect(() => {
 		if (!open) return;
 		const nb = activeNotebookPath;
-		let dropped = false;
+		const seq = ++readsSeq;
+		// CLEARED before the request, not merely overwritten after it: until the new
+		// verdict lands there is nothing true to say, and holding the PREVIOUS one
+		// would keep a sentence naming another notebook on screen.
+		chatReads = null;
 		const qs = nb ? `?notebook=${encodeURIComponent(nb)}` : '';
-		void fetch(`/api/chat/status${qs}`)
+		void fetch(`/api/chat/reads${qs}`)
 			.then((r) => (r.ok ? r.json() : null))
 			.then((body) => {
-				if (dropped) return;
-				chatReads = body?.reads ?? null;
+				if (seq !== readsSeq) return;
+				chatReads = body ?? null;
 			})
 			.catch(() => {
 				// A failed probe reports NOTHING rather than claiming reads are broken:
-				// over-reporting would send a user chasing a problem they do not have.
-				if (!dropped) chatReads = null;
+				// over-reporting would send someone chasing a problem they do not have.
+				if (seq === readsSeq) chatReads = null;
 			});
-		return () => {
-			dropped = true;
-		};
 	});
 
-	// The one sentence the report renders, naming which half is at fault - the two
-	// differ in scope and remedy, so a single "reads are off" would be wrong about
-	// the workspace whenever it is really one notebook's name.
+	// The sentence the report renders. Every branch states only what was actually
+	// established, and offers a remedy ONLY where one can work - this module's own
+	// doctrine is that a remedy the user cannot act on is worse than none.
 	const chatReadsNotice = $derived.by(() => {
-		if (!chatReads || chatReads.available || !chatReads.cause) return null;
-		if (chatReads.cause === 'workspace')
-			return "Reads cannot be enabled in this workspace: its folder path contains a character Cellar cannot express as a safe permission rule, so it refuses rather than granting reads it could not confine. Renaming the folder restores it.";
-		const name = chatReads.notebook ? ` (${chatReads.notebook})` : '';
-		return `Reads cannot be enabled for the notebook you are in${name}: its name contains a character Cellar cannot express as a safe permission rule, so it refuses rather than granting reads whose confinement it could not prove. Other notebooks in this workspace are unaffected; renaming this one restores it.`;
+		const blocked = chatReads && !chatReads.available ? chatReads.blocked : null;
+		if (!blocked) return null;
+		// STRUCTURAL: the `//` rule prefix is POSIX-only, so on Windows every path
+		// fails this way. No rename can fix it, so none is offered.
+		if (blocked.kind !== 'character')
+			return 'Workspace reads are not available on this platform: Cellar can only express these permission rules for POSIX paths, so it refuses rather than granting reads it could not confine.';
+		const seg = blocked.segment ? ` ("${blocked.segment}")` : '';
+		if (blocked.cause === 'workspace')
+			return `Reads cannot be enabled in this workspace: a folder in its path${seg} contains a character Cellar cannot express as a safe permission rule, so it refuses rather than granting reads it could not confine. Renaming that folder restores it.`;
+		// The notebook cause fires for the notebook's OWN name or for an ancestor
+		// directory inside the workspace - naming the wrong one would send the person
+		// to rename something that cannot help.
+		const what = blocked.isNotebookName ? 'this notebook' : 'that folder';
+		const where = blocked.isNotebookName ? 'its name' : `a folder in its path${seg}`;
+		const named = chatReads?.notebook ? ` (${chatReads.notebook})` : '';
+		return `Reads cannot be enabled for the notebook you are in${named}: ${where} contains a character Cellar cannot express as a safe permission rule, so it refuses rather than granting reads whose confinement it could not prove. Other notebooks in this workspace are unaffected; renaming ${what} restores it.`;
 	});
 
 	// Both write through `setUserSettingNow`, NEVER the debounced `setUserSetting`:

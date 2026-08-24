@@ -30,7 +30,7 @@
  *   not_signed_in / rate_limited (with resetsAt) / api_error / cancelled.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -657,6 +657,39 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 		// Every rule in it is SCOPED: a bare tool name in the deny list would deny
 		// the tool outright and silently kill the feature.
 		for (const rule of value.split(',')) expect(rule).toMatch(/^(Read|Glob|Grep)\(\/\//);
+	});
+
+	it('canonicalises the root, and VALIDATES BEFORE it does - a relative root stays refused', () => {
+		// The whole policy is built in the canonical namespace because the CLI's deny
+		// only binds there (see `canonicalPath`). The ordering is the trap: realpath
+		// resolves a RELATIVE path against the process's own cwd, so canonicalising
+		// before validating turns a value that must be REFUSED into a real absolute
+		// path and grants reads over whatever directory Cellar is running in.
+		for (const bad of ['relative/dir', './x', '..', '']) {
+			expect(chatCliArgs({ readRoot: bad, notebookPath: `${WS}/analysis.ipynb` })).toEqual(chatCliArgs());
+		}
+		// A real symlinked root IS canonicalised, and every emitted rule - grant,
+		// cwd and denials - is in that one namespace.
+		const link = join(OUT, 'ws-link');
+		const real = mkdtempSync(join(tmpdir(), 'cellar-canon-real-'));
+		try {
+			rmSync(link, { force: true });
+			symlinkSync(real, link);
+			const nb = join(link, 'analysis.ipynb');
+			writeFileSync(join(real, 'analysis.ipynb'), '{}');
+			const policy = chatToolPolicy({ readRoot: link, notebookPath: nb });
+			const canonical = realpathSync(real);
+			expect(policy.readRoot).toBe(canonical);
+			expect(chatCliCwd(policy)).toBe(canonical);
+			expect(policy.grants.every((g) => g.includes(canonical))).toBe(true);
+			// Belt and braces: the LEXICAL spelling is denied too, so a tool handed
+			// the other spelling of an already-denied path still refuses.
+			expect(policy.denials.some((d) => d.includes(`//${canonical.replace(/^\/+/, '')}/analysis.ipynb`))).toBe(true);
+			expect(policy.denials.some((d) => d.includes(`//${link.replace(/^\/+/, '')}/analysis.ipynb`))).toBe(true);
+		} finally {
+			rmSync(link, { force: true });
+			rmSync(real, { recursive: true, force: true });
+		}
 	});
 
 	it('a workspace path that could SPLIT the grant list cannot inject a bare read grant', () => {
