@@ -540,15 +540,6 @@ export class KernelExecuteAborted extends Error {
 }
 
 /**
- * Force-abort every run currently awaiting `nbKernel`'s reply. Each aborted run's
- * `execute()` disposes its future and throws `KernelExecuteAborted`, so the run's
- * OWNER releases its queue slot through its existing `finally` — no second release
- * path. Called from restart / autorestart / teardown, whose kernel change destroys
- * the namespace the awaited reply belonged to (the reply may now never arrive).
- * `clearRunQueue` drops only PENDING runs; this covers the ACTIVE one, so a manual
- * restart actually rescues a wedged run.
- */
-/**
  * The sentence a force-aborted run reports, keyed by the reason it was aborted for.
  *
  * Each reason knows a DIFFERENT thing, and saying more than that is the defect this
@@ -569,10 +560,24 @@ function abortMessage(reason: string): string {
 	return 'Run aborted: the kernel was restarted.';
 }
 
-function abortActiveRuns(nbKernel: NotebookKernel, reason: string): void {
-	if (nbKernel.activeRuns.size === 0) return;
-	const runs = [...nbKernel.activeRuns];
-	nbKernel.activeRuns.clear();
+/**
+ * Force-abort every run currently awaiting `nbKernel`'s reply. Each aborted run's
+ * `execute()` disposes its future and throws `KernelExecuteAborted`, so the run's
+ * OWNER releases its queue slot through its existing `finally` — no second release
+ * path. Called from restart / autorestart / teardown, whose kernel change destroys
+ * the namespace the awaited reply belonged to (the reply may now never arrive).
+ * `clearRunQueue` drops only PENDING runs; this covers the ACTIVE one, so a manual
+ * restart actually rescues a wedged run.
+ *
+ * `only` narrows it to a specific set of runs, still-registered members only. A
+ * restart/teardown legitimately wants EVERY run (its kernel change invalidates them
+ * all), so that stays the default; an INTERRUPT owns only the runs that were live
+ * when it was signalled (see `settleAfterInterrupt`).
+ */
+function abortActiveRuns(nbKernel: NotebookKernel, reason: string, only?: readonly ActiveRun[]): void {
+	const runs = (only ?? [...nbKernel.activeRuns]).filter((run) => nbKernel.activeRuns.has(run));
+	if (runs.length === 0) return;
+	for (const run of runs) nbKernel.activeRuns.delete(run);
 	for (const run of runs) {
 		try {
 			run.abort(reason);
@@ -1923,23 +1928,33 @@ export async function interruptKernel(nbPath?: string | null) {
  * grace window, and it returns THE MOMENT the set empties, so the overwhelming
  * majority of interrupts — every ordinary python cell — pay one tick, not 5s.
  *
+ * The watched set is SNAPSHOTTED before the wait: this interrupt owns the runs that
+ * were live when it was signalled, and nothing else. A run that STARTS during the
+ * grace window is deliberately not this interrupt's to kill - force-aborting it
+ * would destroy work the user never asked to stop and would also report `forced`
+ * for an interrupt whose own run surrendered perfectly. The internal exec-lock
+ * holder (a Databricks CONNECT_CODE execute) IS in that snapshot and must stay
+ * there: settling it is what unwedges a notebook parked behind it.
+ *
  * `idle` = nothing was running (an interrupt with no live run is not a failure).
  * `kernel` = the kernel ended the run itself, the graceful path.
  * `forced` = it did not, so Cellar stopped waiting; the caller must not report that
  * as the kernel having stopped.
  */
 async function settleAfterInterrupt(nbKernel: NotebookKernel): Promise<'idle' | 'kernel' | 'forced'> {
-	if (nbKernel.activeRuns.size === 0) return 'idle';
+	const watched = [...nbKernel.activeRuns];
+	if (watched.length === 0) return 'idle';
+	const pending = () => watched.some((run) => nbKernel.activeRuns.has(run));
 	const deadline = Date.now() + interruptGraceMs();
-	while (nbKernel.activeRuns.size > 0 && Date.now() < deadline) {
+	while (pending() && Date.now() < deadline) {
 		await new Promise((r) => setTimeout(r, INTERRUPT_POLL_MS));
 	}
-	if (nbKernel.activeRuns.size === 0) return 'kernel';
+	if (!pending()) return 'kernel';
 	logWarn(
 		'kernel',
 		`interrupt on ${nbKernel.nbPath}: kernel did not end the run within ${interruptGraceMs()}ms; force-settling it`
 	);
-	abortActiveRuns(nbKernel, INTERRUPT_ABORT_REASON);
+	abortActiveRuns(nbKernel, INTERRUPT_ABORT_REASON, watched);
 	return 'forced';
 }
 
@@ -2260,6 +2275,11 @@ export async function execute(
 		onEvent({ type: 'kernel', id: kernel.id, session });
 		future = kernel.requestExecute({ code, stop_on_error: false });
 	} catch (err) {
+		// Drop the abort handle: this run is over, and a handle left behind would make
+		// `settleAfterInterrupt` see a run that can never end, so every LATER interrupt
+		// on this kernel would report `forced` and force-abort runs that were fine.
+		settled = true;
+		nbKernel.activeRuns.delete(run);
 		// Undo the just-applied user-run bookkeeping too.
 		if (!internal) {
 			nbKernel.userRuns -= 1;

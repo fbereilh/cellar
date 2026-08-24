@@ -92,6 +92,9 @@ const h = vi.hoisted(() => {
 				// A silent blocking cell that never replies on its own - the shape of a
 				// Spark query. A test ends it via h.lastHanging, or the fake's interrupt
 				// does when `h.kernelObeysInterrupt` is set.
+				// A send that fails before any future exists - a dead/dying kernel. The run
+				// is over before it ever ran, so it must leave no abort handle behind.
+				if (code.includes('# THROW')) throw new Error('requestExecute failed');
 				if (code.includes('# HANG')) {
 					const f = makeFuture();
 					f.code = code;
@@ -367,6 +370,53 @@ describe('F2: the cell never reached the kernel (parked on the exec lock)', () =
 
 		expect(h.maxLive).toBe(1);
 		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+	});
+});
+
+describe('an interrupt settles exactly the runs it signalled', () => {
+	it('leaves a run that STARTS during the grace window alone', async () => {
+		const nb = abs();
+		const c = newCell('stuck  # HANG');
+		const runP = startRun(c, 'stuck  # HANG');
+		await until(() => h.lastHanging != null, 'the run to reach the kernel');
+		const signalled = h.lastKernel!.interrupt.mock.calls.length;
+
+		const interruptP = kernelmod.interruptKernel(nb);
+		// Past this point the interrupt has signalled and snapshotted what it owns.
+		await until(() => h.lastKernel!.interrupt.mock.calls.length > signalled, 'the kernel to be signalled');
+
+		// A LATER execute - the shape of a Databricks status poll firing mid-window.
+		// It parks behind the stuck run, so it is live in `activeRuns` at the deadline.
+		const laterP = kernelmod.execute(nb, 'later = 1', () => {});
+
+		const res = await interruptP;
+		const run = await runP;
+		expect(res.stopped).toBe('forced');
+		expect(run.status).toBe('error');
+
+		// THE REGRESSION: aborting whatever happened to be registered AT THE DEADLINE
+		// killed this one too - work nobody asked to stop, settled with a message about
+		// an interrupt it was never the subject of.
+		const reply = await laterP;
+		expect(reply.status).toBe('ok');
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+	});
+
+	it('a send that throws leaves no abort handle, so a later interrupt still reports idle', async () => {
+		const nb = abs();
+		// Warm the kernel first so the failing send is the only thing this test adds.
+		await kernelmod.execute(nb, 'warm2 = 1', () => {});
+		await expect(kernelmod.execute(nb, 'boom  # THROW', () => {})).rejects.toThrow(/requestExecute failed/);
+
+		// THE REGRESSION: that run's handle stayed in `activeRuns` forever, so every
+		// LATER interrupt on this kernel saw a run that can never end - reporting
+		// `forced` (and force-aborting runs that were fine) with nothing running at all.
+		const res = await kernelmod.interruptKernel(nb);
+		expect(res.stopped).toBe('idle');
+
+		// And the kernel is still usable: the failed send released the exec lock.
+		const reply = await kernelmod.execute(nb, 'after = 1', () => {});
+		expect(reply.status).toBe('ok');
 	});
 });
 
