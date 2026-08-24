@@ -171,6 +171,14 @@ interface NotebookKernel {
  */
 interface ActiveRun {
 	abort: (reason: string) => void;
+	/**
+	 * Set the moment this run is ended by an ABORT rather than by the kernel's own
+	 * reply. `settleAfterInterrupt` cannot tell those apart from the run merely
+	 * leaving `activeRuns`, so without it a second, overlapping interrupt would
+	 * report `stopped:'kernel'` - a clean kernel surrender - for a run the first one
+	 * force-aborted.
+	 */
+	aborted?: boolean;
 }
 
 /** One shared KernelManager hosts every notebook's kernel (N kernels, one host). */
@@ -540,15 +548,22 @@ export class KernelExecuteAborted extends Error {
 }
 
 /**
- * The sentence a force-aborted run reports, keyed by the reason it was aborted for.
+ * The sentence a force-aborted run reports, in the THREE families the abort reasons
+ * fall into. Each knows a different thing, and saying more than that is the defect
+ * this repo keeps retiring (the watchdog's old "no activity for 900s"):
  *
- * Each reason knows a DIFFERENT thing, and saying more than that is the defect this
- * repo keeps retiring (the watchdog's old "no activity for 900s"). A restart or a
- * teardown really did destroy the namespace the awaited reply belonged to, so those
- * may say so. An INTERRUPT may not: the kernel was signalled and did not surrender
- * within the grace window, so what we know is that Cellar stopped waiting - the code
- * may well still be executing up there - and the message says exactly that, plus the
- * one action that is guaranteed to end it.
+ *   - INTERRUPT (`interrupt_unresponsive`): the kernel was signalled and did not
+ *     surrender within the grace window, so all we know is that Cellar stopped
+ *     waiting - the code may well still be executing up there. It says exactly that,
+ *     plus the one action guaranteed to end it, and may NOT claim a stop or a
+ *     restart it never observed.
+ *   - RESTART (`kernel_restart`, `kernel_autorestart`): the kernel really was
+ *     restarted, so the awaited reply belongs to a namespace that is gone.
+ *   - TEARDOWN (everything else: `kernel_shutdown`, `kernel_culled`,
+ *     `notebook_deleted`, `kernel_gone`, `kernel_rebind`, `kernel_restart_failed`):
+ *     the kernel this run was waiting on is gone. That is ALL they establish in
+ *     common - a cull, a delete and a proven-dead process are not restarts - so the
+ *     sentence names no cause beyond it.
  */
 function abortMessage(reason: string): string {
 	if (reason === INTERRUPT_ABORT_REASON) {
@@ -557,7 +572,10 @@ function abortMessage(reason: string): string {
 			'The kernel may still be executing this code - restart it to be certain.'
 		);
 	}
-	return 'Run aborted: the kernel was restarted.';
+	if (reason === 'kernel_restart' || reason === 'kernel_autorestart') {
+		return 'Run aborted: the kernel was restarted.';
+	}
+	return 'Run aborted: the kernel this run was waiting on is gone.';
 }
 
 /**
@@ -1924,9 +1942,10 @@ export async function interruptKernel(nbPath?: string | null) {
  *
  * Polls rather than awaiting the runs themselves: `activeRuns` holds abort handles,
  * not promises, and a run parked on the exec lock is registered before it has a
- * future to await at all. The poll is cheap (a Set size read) and bounded by the
- * grace window, and it returns THE MOMENT the set empties, so the overwhelming
- * majority of interrupts — every ordinary python cell — pay one tick, not 5s.
+ * future to await at all. The poll is a cheap membership test over the SNAPSHOT
+ * below, bounded by the grace window, and it returns THE MOMENT the last watched
+ * run leaves the set, so the overwhelming majority of interrupts — every ordinary
+ * python cell — pay one tick, not 5s.
  *
  * The watched set is SNAPSHOTTED before the wait: this interrupt owns the runs that
  * were live when it was signalled, and nothing else. A run that STARTS during the
@@ -1935,6 +1954,11 @@ export async function interruptKernel(nbPath?: string | null) {
  * for an interrupt whose own run surrendered perfectly. The internal exec-lock
  * holder (a Databricks CONNECT_CODE execute) IS in that snapshot and must stay
  * there: settling it is what unwedges a notebook parked behind it.
+ *
+ * Leaving the set is NOT by itself a kernel surrender, so the verdict also reads
+ * `ActiveRun.aborted`: a concurrent interrupt, restart or watchdog conviction can
+ * empty the snapshot without the kernel having answered, and reporting that as
+ * `kernel` would be exactly the stop-we-did-not-observe this path exists to refuse.
  *
  * `idle` = nothing was running (an interrupt with no live run is not a failure).
  * `kernel` = the kernel ended the run itself, the graceful path.
@@ -1949,7 +1973,7 @@ async function settleAfterInterrupt(nbKernel: NotebookKernel): Promise<'idle' | 
 	while (pending() && Date.now() < deadline) {
 		await new Promise((r) => setTimeout(r, INTERRUPT_POLL_MS));
 	}
-	if (!pending()) return 'kernel';
+	if (!pending()) return watched.some((run) => run.aborted) ? 'forced' : 'kernel';
 	logWarn(
 		'kernel',
 		`interrupt on ${nbKernel.nbPath}: kernel did not end the run within ${interruptGraceMs()}ms; force-settling it`
@@ -2228,6 +2252,7 @@ export async function execute(
 	const triggerAbort = (err: Error) => {
 		if (settled || aborted) return;
 		aborted = true;
+		run.aborted = true;
 		abortReject?.(err);
 	};
 	const run: ActiveRun = {

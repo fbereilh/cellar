@@ -137,7 +137,13 @@ const h = vi.hoisted(() => {
 
 	return {
 		makeFakeKernel,
-		startNew: vi.fn(async () => makeFakeKernel()),
+		startNew: vi.fn(async () => {
+			// A sidecar that cannot be reached at all - the ONE thing `kernel_unavailable`
+			// is allowed to mean. `execute()` throws before it ever has a kernel in hand.
+			if (h.startFails) throw new Error('sidecar unreachable');
+			return makeFakeKernel();
+		}),
+		startFails: false,
 		lastKernel: null as ReturnType<typeof makeFakeKernel> | null,
 		lastHanging: null as ReturnType<typeof makeFuture> | null,
 		hanging: [] as ReturnType<typeof makeFuture>[],
@@ -238,6 +244,7 @@ beforeEach(() => {
 	// returns before this test's run has reached the kernel at all.
 	h.lastHanging = null;
 	h.kernelObeysInterrupt = false;
+	h.startFails = false;
 	h.maxLive = h.live; // measure only what THIS test puts on the wire
 	h.probe = () => ({ execution_state: 'busy' });
 	if (h.lastKernel) h.lastKernel.connectionStatus = 'connected';
@@ -370,6 +377,107 @@ describe('F2: the cell never reached the kernel (parked on the exec lock)', () =
 
 		expect(h.maxLive).toBe(1);
 		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+	});
+});
+
+describe("a force-settled run is not reported as a kernel that could not be reached", () => {
+	it('an aborted PARKED run (F2) carries no kernel_unavailable', async () => {
+		const nb = abs();
+		// The lock holder, so the user's run parks and never reaches the kernel - the
+		// shape whose `execute()` throws with the session epoch still unstamped.
+		const holderP = kernelmod.execute(nb, 'HOLDER  # HANG', () => {}, { internal: true }).catch(() => {});
+		await until(() => h.lastHanging != null, 'the holder to take the kernel');
+
+		const c = newCell('df.show()  # HANG');
+		const userP = startRun(c, 'df.show()  # HANG');
+		await until(() => queue.queueStateFor(nb).running?.cellId === c, 'the user run to hold the slot');
+
+		await kernelmod.interruptKernel(nb);
+		const run = await userP;
+		await holderP;
+
+		expect(run.status).toBe('error');
+		// THE REGRESSION: the run threw with `session` null (the `kernel` event is emitted
+		// only after the exec lock, and this run never got there), so the kernel-down
+		// inference fired - asserting an unreachable kernel over one that was alive and
+		// busy, and dropping the cell into `error_persisted`, which agents are told to
+		// distrust as leftover from a previous session.
+		expect(run.kernelDown).toBe(false);
+		expect(run.lastRun.kernel_unavailable).toBeUndefined();
+		expect(nbmod.getCell(c, nb)?.metadata?.cellar?.lastRun?.kernel_unavailable).toBeUndefined();
+	});
+
+	it('a genuinely unreachable sidecar still reports kernel_unavailable', async () => {
+		const nb = abs();
+		await kernelmod.shutdownKernel(nb);
+		h.startFails = true;
+		const c = newCell('x = 1');
+		const run = await startRun(c, 'x = 1');
+		expect(run.status).toBe('error');
+		expect(run.kernelDown).toBe(true);
+		expect(run.lastRun.kernel_unavailable).toBe(true);
+	});
+});
+
+describe('a force-abort is never reported as a kernel surrender', () => {
+	it('a SECOND overlapping interrupt does not claim the kernel stopped', async () => {
+		const nb = abs();
+		const c = newCell('stuck  # HANG');
+		const runP = startRun(c, 'stuck  # HANG');
+		await until(() => h.lastHanging != null, 'the run to reach the kernel');
+
+		// The cell reads RUNNING for the whole grace window, so a user clicking stop
+		// twice - or a stop click plus an agent's interrupt_kernel - is ordinary.
+		const [first, second] = await Promise.all([kernelmod.interruptKernel(nb), kernelmod.interruptKernel(nb)]);
+		const run = await runP;
+
+		expect(run.status).toBe('error');
+		// THE REGRESSION: the loser inferred `kernel` purely from the watched run having
+		// LEFT activeRuns, which the winner's force-abort had just done - so it reported
+		// a clean kernel stop for a run nothing ever stopped.
+		expect(first.stopped).toBe('forced');
+		expect(second.stopped).toBe('forced');
+	});
+
+	it('a kernel that DOES answer still reports a genuine surrender', async () => {
+		const nb = abs();
+		h.kernelObeysInterrupt = true;
+		const c = newCell('sleep  # HANG');
+		const runP = startRun(c, 'sleep  # HANG');
+		await until(() => h.lastHanging != null, 'the run to reach the kernel');
+		const res = await kernelmod.interruptKernel(nb);
+		await runP;
+		expect(res.stopped).toBe('kernel');
+	});
+});
+
+describe('an abort message names only what its reason establishes', () => {
+	it('a SHUTDOWN says the kernel is gone, never that it was restarted', async () => {
+		const nb = abs();
+		const c = newCell('long  # HANG');
+		const runP = startRun(c, 'long  # HANG');
+		await until(() => h.lastHanging != null, 'the run to reach the kernel');
+
+		await kernelmod.shutdownKernel(nb);
+		const run = await runP;
+
+		const evalue = String(soleError(run.outputs).evalue);
+		expect(evalue).toMatch(/kernel this run was waiting on is gone/i);
+		// A shutdown, a cull and a notebook delete are not restarts; claiming one is the
+		// same assert-more-than-was-observed defect the interrupt message exists to end.
+		expect(evalue).not.toMatch(/was restarted/i);
+	});
+
+	it('a RESTART still says the kernel was restarted', async () => {
+		const nb = abs();
+		const c = newCell('long2  # HANG');
+		const runP = startRun(c, 'long2  # HANG');
+		await until(() => h.lastHanging != null, 'the run to reach the kernel');
+
+		await kernelmod.restartKernel(nb);
+		const run = await runP;
+
+		expect(String(soleError(run.outputs).evalue)).toBe('Run aborted: the kernel was restarted.');
 	});
 });
 
