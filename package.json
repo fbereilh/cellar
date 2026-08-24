@@ -24,6 +24,7 @@
     "src/lib/server/mcp-bridge.js",
     "src/lib/server/selfupdate.js",
     "src/lib/server/instances.js",
+    "src/lib/server/cleanup-plan.js",
     "src/lib/server/ports.js"
   ],
   "engines": {

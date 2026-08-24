@@ -30,9 +30,16 @@
  *                                   in place; `--strip` also removes it).
  *   cellar ls                       list known cellar instances (registry +
  *                                   untracked orphans) with liveness.
- *   cellar cleanup [--all] [-y]     reap dead/orphaned instances (launcher gone,
- *                                   app still listening); --all also stops every
- *                                   live instance across all workspaces.
+ *   cellar cleanup [options]        reap dead/orphaned instances (launcher gone,
+ *                                   app still listening) — anywhere, at every
+ *                                   scope. `--all` additionally stops LIVE
+ *                                   instances serving THIS workspace;
+ *                                   `--all-workspaces` stops live instances in
+ *                                   ANY workspace and needs an explicit typed
+ *                                   confirmation (`-y` cannot supply it), because
+ *                                   that is somebody's running session. See
+ *                                   src/lib/server/cleanup-plan.js for the rule.
+ *                                   `--dry-run` prints the plan and stops nothing.
  *
  * Flags:
  *   --help / -h                 print this usage message and exit
@@ -144,6 +151,7 @@ import {
 	scanUntrackedCellarProcesses,
 	isIsolatedEnv
 } from '../src/lib/server/instances.js';
+import { CONFIRM_PHRASE, planCleanup, workspaceKey } from '../src/lib/server/cleanup-plan.js';
 import { resolveWorkspacePorts } from '../src/lib/server/ports.js';
 import { buildFreshness, stalenessReason, SKIP_ENV } from '../src/lib/server/build-freshness.js';
 
@@ -586,7 +594,7 @@ Usage:
   cellar mcp [options]        stdio <-> HTTP MCP bridge for the running instance
   cellar harness <cmd>        configure an AI coding agent to use Cellar's tools
   cellar ls                   list known cellar instances with liveness
-  cellar cleanup [options]    reap dead / orphaned instances
+  cellar cleanup [options]    reap dead / orphaned instances (see Cleanup options)
 
 Subcommands:
   mcp        zero-config agent connection: bridge stdio to the live instance
@@ -598,7 +606,8 @@ Subcommands:
                              every start. Merges; never clobbers existing config.
              remove <name…>  stop managing one (--strip also removes its entry)
   ls         list registered + untracked cellar instances and whether each is alive
-  cleanup    reap dead/orphaned instances; --all also stops every live instance
+  cleanup    reap dead/orphaned instances anywhere; stopping a LIVE instance is
+             opt-in and scoped to a workspace (see Cleanup options below)
 
 Options:
   --help, -h              print this usage message and exit
@@ -612,6 +621,20 @@ Options:
   --no-mcp-config         do not write/merge <workspace>/.mcp.json
   --new / --force         start a second instance in a folder that already has one
 
+Cleanup options (cellar cleanup …):
+  (no flags)              reap dead + orphaned instances only; never stops a live one
+  --all                   also stop LIVE instances serving THIS workspace
+  --all-workspaces        also stop LIVE instances in ANY workspace. Someone else
+                          may be working in them, so this needs an explicit
+                          confirmation: type "stop-all-workspaces" when asked,
+                          or pass --confirm=stop-all-workspaces to script it.
+                          --yes / -y / CI / a piped stdin do NOT satisfy it.
+  --confirm=<phrase>      supply that confirmation non-interactively
+  --dry-run               print exactly what would be stopped, then exit
+  --workspace <dir>, -w   treat <dir> as "this workspace" (default: cwd)
+  --yes, -y               skip the y/N prompt for the routine (non-cross-workspace)
+                          stops only
+
 Environment:
   CELLAR_ISOLATED=1       run isolated (no global registry, no reaping) — for
                           CI / automated launches (applies to every launch; a
@@ -621,7 +644,11 @@ Examples:
   cellar                    start Cellar in the current directory
   cellar ../other-repo      start Cellar scoped to another repo
   cellar harness add codex  point Codex at Cellar's MCP server for this project
-  cellar --update           update Cellar to the latest version`);
+  cellar --update           update Cellar to the latest version
+  cellar cleanup            reap dead/orphaned instances (safe; touches no live one)
+  cellar cleanup --all      also stop the live instance in this folder
+  cellar cleanup --dry-run --all-workspaces
+                            show every live instance cleanup could stop, stop none`);
 }
 
 async function listInstancesCommand() {
@@ -646,61 +673,175 @@ async function listInstancesCommand() {
 	}
 }
 
+/**
+ * Prompt for a literal phrase (not y/N). Resolves the trimmed answer, or null
+ * when stdin gives no answer at all. Deliberately distinct from `promptYesNo`:
+ * a phrase is what makes the cross-workspace kill unreachable by a stray `-y`.
+ */
+function promptPhrase(question) {
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	return new Promise((res) => {
+		let settled = false;
+		const finish = (v) => {
+			if (settled) return;
+			settled = true;
+			rl.close();
+			res(v);
+		};
+		rl.on('close', () => finish(null));
+		rl.on('error', () => finish(null));
+		rl.question(question, (ans) => finish(String(ans ?? '').trim()));
+	});
+}
+
+/** One printable line describing a registry entry in the cleanup plan. */
+function planLine(e) {
+	const state = e.launcherAlive ? 'live  ' : 'orphan';
+	return `  ${state} launcher=${e.launcherPid} app=${e.appPid ?? '?'} appPort=${e.appPort ?? '?'} age=${fmtAge(e.startedAt)} ${e.workspace ?? '(workspace unknown)'}`;
+}
+
+/**
+ * `cellar cleanup` — reap dead / orphaned instances, and (only when asked)
+ * stop live ones.
+ *
+ * The scope rule and the reasoning behind it live in
+ * `src/lib/server/cleanup-plan.js`; this function is the CLI around it: parse
+ * flags, gather facts, print the plan, obtain the right kind of consent, act.
+ *
+ * Two consent levels, because they are not the same question:
+ *   - stopping orphans, or a live instance in THIS workspace, is routine
+ *     housekeeping → an ordinary y/N, auto-approved by `-y`/`CI`/a non-TTY;
+ *   - stopping a live instance in ANOTHER workspace is taking someone else's
+ *     running session → the literal `CONFIRM_PHRASE`, which none of those
+ *     auto-approvals can supply. That is the whole fix: `-y` used to be enough,
+ *     and a non-TTY stdin was enough with no flag at all.
+ */
 async function cleanupCommand(flags) {
-	const all = flags.includes('--all');
-	const yes = flags.includes('--yes') || flags.includes('-y') || !!process.env.CI || !process.stdin.isTTY;
-	const log = (m) => console.log(m);
-
-	// 1) Prune fully-dead registry entries (no live process at all).
-	const pruned = await pruneDeadInstances({ log });
-	if (pruned.length) console.log(`[cellar] pruned ${pruned.length} dead registry entr(ies).`);
-
-	// 2) Decide what to reap.
-	const entries = await Promise.all(listInstances().map(annotateInstance));
-	const orphanRegistered = entries.filter((e) => !e.launcherAlive && (e.appAlive || e.appResponds));
-	const liveRegistered = entries.filter((e) => e.launcherAlive);
-	const untracked = scanUntrackedCellarProcesses();
-	// Untracked orphans = reparented to init (ppid 1); safe — no launcher owns them.
-	const untrackedOrphans = untracked.filter((u) => u.ppid === 1);
-	const untrackedOther = untracked.filter((u) => u.ppid !== 1);
-
-	const toReap = [...orphanRegistered];
-	const toKillPids = untrackedOrphans.map((u) => u.pid);
-	if (all) {
-		toReap.push(...liveRegistered);
-		toKillPids.push(...untrackedOther.map((u) => u.pid));
+	const KNOWN = new Set(['--all', '--all-workspaces', '--dry-run', '--yes', '-y', '--workspace', '-w']);
+	// Reject typos rather than silently falling through to a different scope: this
+	// command stops processes, so an argument it does not understand must stop it.
+	for (let i = 0; i < flags.length; i++) {
+		const tok = flags[i];
+		if (tok === '--workspace' || tok === '-w') {
+			i++;
+			continue;
+		}
+		if (tok.startsWith('--confirm=')) continue;
+		if (tok.startsWith('-') && !KNOWN.has(tok)) {
+			console.error(`[cellar] unknown flag for cleanup: ${tok}`);
+			console.error('[cellar] run "cellar --help" for the cleanup options.');
+			return 1;
+		}
 	}
 
-	if (toReap.length === 0 && toKillPids.length === 0) {
+	const wsIdx = flags.findIndex((a) => a === '--workspace' || a === '-w');
+	const wsArg = wsIdx !== -1 ? flags[wsIdx + 1] : undefined;
+	const here = workspaceKey(wsArg || process.cwd());
+
+	const everywhere = flags.includes('--all-workspaces');
+	const scope = everywhere ? 'everywhere' : flags.includes('--all') ? 'workspace' : 'orphans';
+	const dryRun = flags.includes('--dry-run');
+	const yes = flags.includes('--yes') || flags.includes('-y') || !!process.env.CI || !process.stdin.isTTY;
+	const confirmFlag = flags.find((a) => a.startsWith('--confirm='))?.slice('--confirm='.length);
+	const log = (m) => console.log(m);
+
+	// 1) Prune fully-dead registry entries (no live process at all). Bookkeeping
+	//    only — nothing is signalled — so it runs at every scope, dry run aside.
+	if (!dryRun) {
+		const pruned = await pruneDeadInstances({ log });
+		if (pruned.length) console.log(`[cellar] pruned ${pruned.length} dead registry entr(ies).`);
+	}
+
+	// 2) Gather facts, then decide (the decision is pure and unit-tested).
+	const entries = await Promise.all(listInstances().map(annotateInstance));
+	const plan = planCleanup({ entries, untracked: scanUntrackedCellarProcesses(), workspace: here, scope });
+
+	console.log(`[cellar] workspace: ${here || '(unknown)'}`);
+
+	if (plan.reap.length === 0 && plan.killPids.length === 0) {
 		console.log(
-			all
-				? '[cellar] no cellar instances to stop.'
-				: '[cellar] nothing to reap (no orphaned instances). Pass --all to also stop live instances.'
+			scope === 'orphans'
+				? '[cellar] nothing to reap (no dead or orphaned instances).'
+				: '[cellar] nothing to stop.'
 		);
+		reportSkipped(plan);
 		return 0;
 	}
 
-	console.log('[cellar] will stop:');
-	for (const e of toReap)
-		console.log(`  ${e.launcherAlive ? 'live  ' : 'orphan'} launcher=${e.launcherPid} app=${e.appPid ?? '?'} ${e.workspace ?? ''}`);
-	for (const u of untrackedOrphans) console.log(`  orphan pid=${u.pid} (untracked)  ${u.command}`);
-	if (all) for (const u of untrackedOther) console.log(`  proc   pid=${u.pid} (untracked)  ${u.command}`);
+	// 3) Show what would die, always, before anything can die — including under
+	//    -y and under a dry run.
+	console.log(dryRun ? '[cellar] would stop:' : '[cellar] will stop:');
+	for (const e of plan.reap) console.log(planLine(e));
+	for (const u of plan.untrackedOrphans) console.log(`  orphan pid=${u.pid} (untracked)  ${u.command}`);
+	if (scope === 'everywhere')
+		for (const u of plan.untrackedLive) console.log(`  live   pid=${u.pid} (untracked, workspace unknown)  ${u.command}`);
 
-	if (!yes && !(await promptYesNo('[cellar] Stop these? [y/N] '))) {
+	if (dryRun) {
+		console.log('[cellar] dry run — nothing was stopped.');
+		reportSkipped(plan);
+		return 0;
+	}
+
+	// 4) Consent. A plan that reaches another workspace's live session needs the
+	//    phrase; anything else takes the ordinary y/N.
+	if (plan.crossWorkspace) {
+		const supplied = confirmFlag ?? (process.stdin.isTTY ? await promptPhrase(`[cellar] This stops LIVE cellar sessions in other workspaces (running kernels and unsaved state will be lost).\n[cellar] Type "${CONFIRM_PHRASE}" to proceed: `) : null);
+		if (supplied !== CONFIRM_PHRASE) {
+			console.error(
+				supplied == null
+					? `[cellar] refusing: stopping other workspaces' live sessions needs an explicit confirmation.\n[cellar] Re-run with: cellar cleanup --all-workspaces --confirm=${CONFIRM_PHRASE}`
+					: `[cellar] aborted (confirmation did not match "${CONFIRM_PHRASE}").`
+			);
+			return 1;
+		}
+	} else if (!yes && !(await promptYesNo('[cellar] Stop these? [y/N] '))) {
 		console.log('[cellar] aborted.');
 		return 1;
 	}
 
-	for (const e of toReap) {
+	for (const e of plan.reap) {
 		console.log(`[cellar] stopping launcher ${e.launcherPid} …`);
 		await reapInstance(e, { log, reason: 'cleanup' });
 	}
-	for (const pid of toKillPids) {
+	for (const pid of plan.killPids) {
 		console.log(`[cellar] killing pid ${pid} …`);
 		await killPid(pid);
 	}
 	console.log('[cellar] cleanup done.');
+	reportSkipped(plan);
 	return 0;
+}
+
+/**
+ * Say what was deliberately left running, and how to reach it.
+ *
+ * Silence here would make the narrowed `--all` look like it had stopped
+ * everything, which is the failure this whole change is about — the old command
+ * was dangerous precisely because its blast radius was invisible. Printed only
+ * when something really was skipped, so an ordinary tidy stays quiet.
+ */
+function reportSkipped(plan) {
+	const here = plan.skippedHere.length;
+	const elsewhere = plan.skippedElsewhere.length + plan.skippedUntracked.length;
+	if (!here && !elsewhere) return;
+
+	const line = (e) =>
+		`  live   launcher=${e.launcherPid} appPort=${e.appPort ?? '?'} ${e.workspace ?? '(workspace unknown)'}`;
+
+	if (here) {
+		console.log(`[cellar] left running in this workspace: ${here}`);
+		for (const e of plan.skippedHere) console.log(line(e));
+		console.log('[cellar]   stop these with: cellar cleanup --all');
+	}
+	if (elsewhere) {
+		console.log(`[cellar] left running elsewhere: ${elsewhere} (someone may be working in them)`);
+		for (const e of plan.skippedElsewhere) console.log(line(e));
+		for (const u of plan.skippedUntracked)
+			console.log(`  live   pid=${u.pid} (untracked, workspace unknown)  ${u.command}`);
+		console.log(
+			`[cellar]   stop these too with: cellar cleanup --all-workspaces --confirm=${CONFIRM_PHRASE}`
+		);
+	}
 }
 
 // ---- `cellar harness …` ---------------------------------------------------
