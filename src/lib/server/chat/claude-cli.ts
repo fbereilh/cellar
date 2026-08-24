@@ -44,7 +44,9 @@
  * `chatToolPolicy(caps)` the init assertion reads. That ONE policy decides the
  * request, the grant, the DENIAL, the init assertion, the frozen prompt and the
  * child's cwd, so the grant can never name a tool the run did not request and
- * then assert, nor outrun the denials taken back from inside it. An EMPTY
+ * then assert, nor outrun the denials taken back from inside it. ONE per run,
+ * literally: `runOnce` derives it and THREADS it into `chatCliArgs`, because the
+ * policy reads the filesystem and a second derivation is a second reading. An EMPTY
  * `--allowedTools` is never passed: the
  * default shape omits the flag entirely, which is what keeps its argv
  * byte-for-byte the pre-settings one.
@@ -523,6 +525,54 @@ export function chatPathRefusal(value: unknown): ChatPathRefusal | null {
 	return null;
 }
 
+/**
+ * One path put through the WHOLE confinement question, in the one order that is
+ * correct - or the refusal, naming the spelling that actually failed.
+ *
+ * validate -> canonicalise -> RE-validate, and both halves of the answer come
+ * out of here so no caller repeats the sequence. That is not tidiness: the
+ * engine (`chatToolPolicy`) and the Settings verdict (`chatReadsBlockedCause`)
+ * must agree about every path, and they drifted the moment one of them
+ * canonicalised and the other did not - a workspace whose LEXICAL path is clean
+ * but whose realpath carries a refused character had the pane promising reads
+ * while every run silently fell back to read-less, which is exactly the silent
+ * capability gap the DETECT half exists to remove.
+ *
+ * The ORDER is load-bearing and there is a test pinning it: `realpathSync`
+ * resolves a RELATIVE path against the process's own cwd, so canonicalising an
+ * unvalidated value turns `'relative/dir'` - which must be REFUSED - into a real
+ * absolute path and grants reads over whatever directory Cellar is running in.
+ * Re-validating the canonical form matters just as much: that spelling is what
+ * gets EMITTED into the rules, so it is the spelling the refused characters have
+ * to be checked against.
+ *
+ * `refused` carries the normalized spelling whose segments were rejected, so a
+ * caller reporting the failure names something the person can act on rather than
+ * a segment of the other spelling.
+ */
+type ChatPathConfinement =
+	| { ok: true; lexical: string; canonical: string }
+	| { ok: false; refusal: ChatPathRefusal; refused: string | null };
+
+function confineRulePath(value: unknown): ChatPathConfinement {
+	const lexicalRefusal = chatPathRefusal(value);
+	const lexical = literalRulePath(value);
+	if (lexicalRefusal !== null || lexical === null) {
+		return {
+			ok: false,
+			refusal: lexicalRefusal ?? { kind: 'platform' },
+			refused: typeof value === 'string' && value.startsWith('/') ? resolve(value) : null
+		};
+	}
+	const resolved = canonicalPath(lexical);
+	const canonicalRefusal = chatPathRefusal(resolved);
+	const canonical = literalRulePath(resolved);
+	if (canonicalRefusal !== null || canonical === null) {
+		return { ok: false, refusal: canonicalRefusal ?? { kind: 'platform' }, refused: resolved };
+	}
+	return { ok: true, lexical, canonical };
+}
+
 /** One reads-availability verdict: which half failed, why, and at which segment. */
 export interface ChatReadsBlocked {
 	cause: ChatReadsBlockedCause;
@@ -556,21 +606,27 @@ export interface ChatReadsBlocked {
  * verdict is about THAT notebook - reads keep working in the one beside it. The
  * workspace is checked first, since an unusable root makes the rest moot.
  *
- * It answers from the SAME character rule the policy uses (`chatPathRefusal`
- * shares `UNCONFINABLE_ROOT_CHARS`/`EXTGLOB_PREFIX` with `literalRulePath`), so
- * the pane can never promise - or deny - what the engine would decide otherwise.
+ * It answers by running each path through `confineRulePath` - the SAME helper,
+ * in the same order, that `chatToolPolicy` builds its rules from - so the pane
+ * can never promise, or deny, what the engine would decide otherwise. Sharing
+ * that step rather than repeating its three checks is the point: the two did
+ * drift once, when only the engine learned to canonicalise.
  */
 export function chatReadsBlockedCause(readRoot: unknown, notebookPath: unknown): ChatReadsBlocked | null {
-	const rootRefusal = chatPathRefusal(readRoot);
-	if (rootRefusal) return { cause: 'workspace', ...rootRefusal };
-	if (typeof notebookPath !== 'string') return { cause: 'notebook', kind: 'platform' };
-	const own = chatPathRefusal(notebookPath);
-	if (own) return { cause: 'notebook', ...own, ...(own.kind === 'character' ? { isNotebookName: own.segment === basename(resolve(notebookPath)) } : {}) };
+	const root = confineRulePath(readRoot);
+	if (!root.ok) return { cause: 'workspace', ...root.refusal };
+	const own = confineRulePath(notebookPath);
+	if (!own.ok) {
+		// Name the notebook against the spelling that ACTUALLY failed, which may be
+		// the canonical one - a segment of the other spelling is not something the
+		// person can find, let alone rename.
+		const isNotebookName = own.refusal.kind === 'character' && own.refused !== null && own.refusal.segment === basename(own.refused);
+		return { cause: 'notebook', ...own.refusal, ...(own.refusal.kind === 'character' ? { isNotebookName } : {}) };
+	}
 	// The notebook itself is spellable; one of the names DERIVED from it may not
 	// be, and a denial that cannot be spelled for every artifact costs the reads.
-	const literal = literalRulePath(notebookPath);
-	if (literal === null || deniableNotebookPaths(literal) === null) {
-		return { cause: 'notebook', kind: 'character', segment: basename(literal ?? resolve(notebookPath)), isNotebookName: true };
+	if (deniableNotebookPaths(own.canonical) === null) {
+		return { cause: 'notebook', kind: 'character', segment: basename(own.canonical), isNotebookName: true };
 	}
 	return null;
 }
@@ -687,20 +743,17 @@ function denialPatterns(root: string, notebookTargets: readonly string[], otherN
  */
 export function chatToolPolicy(caps: ChatCapabilities = {}): ChatToolPolicy {
 	const webSearch = caps.webSearch === true;
-	// CANONICALISE BEFORE VALIDATING, so the refusal rules apply to the spelling
-	// actually emitted: the whole policy - cwd, grant and denials - is built in the
-	// canonical namespace, because the deny only binds there (see `canonicalPath`).
-	// VALIDATE FIRST, canonicalise second, then re-validate. The order is
-	// load-bearing: `realpathSync` resolves a RELATIVE path against the process's
-	// own cwd, so canonicalising an unvalidated value turns `'relative/dir'` - which
-	// must be REFUSED - into a real absolute path and grants reads over whatever
-	// Cellar happens to be running in. Re-validating the canonical form matters too:
-	// the resolved spelling is what gets emitted, so it is the spelling the refused
-	// characters must be checked against.
-	const lexicalRoot = chatReadRoot(caps.readRoot);
-	const root = lexicalRoot === null ? null : chatReadRoot(canonicalPath(lexicalRoot));
-	const lexicalNotebook = literalRulePath(caps.notebookPath);
-	const notebookPath = lexicalNotebook === null ? null : literalRulePath(canonicalPath(lexicalNotebook));
+	// The whole policy - cwd, grant and denials - is built in the CANONICAL
+	// namespace, because the deny only binds there (see `canonicalPath`). Both
+	// paths go through `confineRulePath`, which owns the validate -> canonicalise
+	// -> re-validate order AND is what the Settings verdict answers from, so the
+	// pane and the engine cannot reach different conclusions about a path.
+	const rootConfinement = confineRulePath(caps.readRoot);
+	const notebookConfinement = confineRulePath(caps.notebookPath);
+	const lexicalRoot = rootConfinement.ok ? rootConfinement.lexical : null;
+	const root = rootConfinement.ok ? rootConfinement.canonical : null;
+	const lexicalNotebook = notebookConfinement.ok ? notebookConfinement.lexical : null;
+	const notebookPath = notebookConfinement.ok ? notebookConfinement.canonical : null;
 	// Every path the run must be able to DENY, resolved before any grant is
 	// built: null here (an un-patternable notebook name) costs the reads, so a
 	// granted read whose notebook denial silently missed is unreachable.
@@ -821,6 +874,17 @@ export function chatSystemPrompt(policy: ChatToolPolicy): string {
 export interface ChatCliOptions extends ChatCapabilities {
 	/** Untrusted: constrained through `normalizeChatModel` before touching argv. */
 	model?: unknown;
+	/**
+	 * The policy ALREADY derived for this run. The engine passes it so one run
+	 * derives exactly once: the policy reads the filesystem (`canonicalPath`), so
+	 * a second derivation is a second reading, and the two could disagree if the
+	 * workspace or notebook realpath moved between them - the argv would then
+	 * request no read tools while the init assertion still expected three, failing
+	 * the run `unsafe_init` for a reason nothing could explain to the user. Omit it
+	 * and one is derived from the capabilities, which is what every test and every
+	 * caps-passing caller does.
+	 */
+	policy?: ChatToolPolicy;
 }
 
 /**
@@ -830,7 +894,7 @@ export interface ChatCliOptions extends ChatCapabilities {
  * arguments is byte-for-byte the pre-settings argv.
  */
 export function chatCliArgs(opts: ChatCliOptions = {}): string[] {
-	const policy = chatToolPolicy(opts);
+	const policy = opts.policy ?? chatToolPolicy(opts);
 	return [
 		'-p',
 		'--tools',
@@ -1011,11 +1075,13 @@ function runOnce({ prompt, configDir, model, webSearch, readRoot, notebookPath, 
 			return;
 		}
 
-		// ONE policy decides what the argv requests, what it grants, which frozen
-		// prompt is sent, where the child runs, and what the init assertion requires
-		// the CLI to have reported - derived once here, which is what makes "the
-		// report must equal the request" structural rather than several rules that
-		// happen to agree.
+		// ONE policy decides what the argv requests, what it grants, what it denies,
+		// which frozen prompt is sent, where the child runs, and what the init
+		// assertion requires the CLI to have reported - derived once here and
+		// THREADED into the argv builder, which is what makes "the report must equal
+		// the request" structural rather than two derivations that happen to agree.
+		// It reads the filesystem (`canonicalPath`), so deriving it twice really can
+		// answer twice.
 		const policy = chatToolPolicy({ webSearch, readRoot, notebookPath, otherNotebooks });
 		const expectedTools = policy.tools;
 
@@ -1026,7 +1092,7 @@ function runOnce({ prompt, configDir, model, webSearch, readRoot, notebookPath, 
 
 		let child: ChildProcess;
 		try {
-			child = spawn(CLAUDE_BIN, chatCliArgs({ model, webSearch, readRoot, notebookPath, otherNotebooks }), {
+			child = spawn(CLAUDE_BIN, chatCliArgs({ model, policy }), {
 				env: chatChildEnv(configDir),
 				cwd,
 				stdio: ['pipe', 'pipe', 'pipe']

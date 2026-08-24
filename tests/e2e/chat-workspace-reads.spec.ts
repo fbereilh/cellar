@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { chatCliArgs, chatCliCwd, chatToolPolicy, claudeCliEngine, initViolation, READ_TOOLS } from '../../src/lib/server/chat/claude-cli';
@@ -373,6 +373,26 @@ function treeOf(dir: string): string[] {
 	};
 	walk(dir);
 	return out;
+}
+
+/**
+ * Does `dir`'s volume resolve a case-VARIANT spelling to the same file?
+ *
+ * Measured on the fixture's own volume rather than inferred from the platform:
+ * macOS defaults to case-insensitive APFS but a case-SENSITIVE volume is a
+ * supported format there, and `$TMPDIR` can sit on either. Written and probed,
+ * so the answer is about the filesystem the test is actually running on.
+ */
+function volumeIsCaseInsensitive(dir: string): boolean {
+	const probe = join(dir, 'cellar-case-probe.tmp');
+	try {
+		writeFileSync(probe, 'x');
+		return statSync(join(dir, 'CELLAR-CASE-PROBE.TMP'), { throwIfNoEntry: false }) !== undefined;
+	} catch {
+		return false;
+	} finally {
+		rmSync(probe, { force: true });
+	}
 }
 
 test.beforeAll(() => {
@@ -853,19 +873,34 @@ test('the current-notebook denial survives a CASE-VARIANT spelling on a case-ins
 	test.setTimeout(REAL_TURN_TIMEOUT_MS);
 	const fx = makeFixture();
 	try {
+		// The case-variant spelling only NAMES the current notebook where the volume
+		// is case-insensitive. On a case-SENSITIVE one (case-sensitive APFS, or
+		// Linux) `ANALYSIS.ipynb` is simply a file that does not exist, the read
+		// fails for a mundane reason, and the assertions below would pass having
+		// proved nothing about the matcher - a green run certifying nothing, which
+		// is worse than no test. So probe the fixture's own volume and skip with the
+		// reason NAMED, this repo's convention for an environment-dependent case.
+		const insensitive = volumeIsCaseInsensitive(fx.ws);
+		test.skip(!insensitive, 'the fixture volume is CASE-SENSITIVE, so a case-variant spelling names no file and the deny rule is not exercised');
+
 		// other-notebooks ON, so the blanket `*.ipynb` rules are dropped and the
 		// exact-case literal rules are the ONLY thing denying the current notebook.
-		// On a case-insensitive volume (macOS/Windows default) a case-variant
-		// spelling resolves to the SAME file, so if the matcher neither case-folds
-		// nor canonicalises, this read returns the cells the transcript withheld.
+		// A case-variant spelling resolves to the SAME file here, so if the matcher
+		// neither case-folds nor canonicalises, this read returns the cells the
+		// transcript withheld.
 		const upper = join(fx.ws, 'ANALYSIS.ipynb');
 		const run = await runRealCli(
 			probeArgs(fx, true),
 			chatCliCwd(chatToolPolicy({ readRoot: fx.ws, notebookPath: fx.notebook, otherNotebooks: true })),
-			`Read the file ${upper} and print its content. If that fails, say exactly FAILED and stop.\n`
+			`Do both, reporting each outcome: (1) Read the file ${upper} and print its content. (2) Read the file ${fx.helper} and print its content.\n`
 		);
 		expect(run.toolResults.join('\n')).not.toContain(NOTEBOOK_SECRET);
 		expect(run.reply).not.toContain(NOTEBOOK_SECRET);
+		// CONTROL, and it is mandatory for the same reason as its dot-directory
+		// sibling's: without it a future change that denied EVERYTHING - or a run
+		// where the model read nothing at all - would satisfy the assertions above
+		// and prove nothing.
+		expect(run.toolResults.join('\n')).toContain(INSIDE_MARKER);
 	} finally {
 		rmSync(fx.root, { recursive: true, force: true });
 	}

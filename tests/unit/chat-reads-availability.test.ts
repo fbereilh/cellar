@@ -24,12 +24,14 @@
  *    would refuse (or vice versa) is the defect this exists to prevent.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chatPathRefusal, chatReadsBlockedCause, chatToolPolicy } from '../../src/lib/server/chat/claude-cli';
 
 let WS: string;
+/** A real tree whose LEXICAL paths are clean and whose REALPATHS are not. */
+let LINKS: string;
 let route: typeof import('../../src/routes/api/chat/reads/+server.js');
 const savedWorkspace = process.env.CELLAR_WORKSPACE;
 
@@ -53,6 +55,21 @@ beforeAll(async () => {
 	writeFileSync(join(WS, 'run{1}.ipynb'), '{"cells":[],"nbformat":4,"nbformat_minor":5}\n');
 	mkdirSync(join(WS, 'sub[x]'), { recursive: true });
 	writeFileSync(join(WS, 'sub[x]', 'nested.ipynb'), '{"cells":[],"nbformat":4,"nbformat_minor":5}\n');
+
+	// The DIVERGENCE fixture: paths whose lexical spelling is clean and whose
+	// realpath is not. `bin/cellar.js` sets `CELLAR_WORKSPACE` with a lexical
+	// `resolve()`, so `cellar -w ~/work/current` where `current` links to
+	// `~/Projects/proj[2]` produces exactly this - real symlinks, because the whole
+	// question is what `realpathSync` returns.
+	LINKS = mkdtempSync(join(tmpdir(), 'cellar-reads-links-'));
+	mkdirSync(join(LINKS, 'proj[2]'), { recursive: true });
+	writeFileSync(join(LINKS, 'proj[2]', 'analysis.ipynb'), '{"cells":[],"nbformat":4,"nbformat_minor":5}\n');
+	symlinkSync(join(LINKS, 'proj[2]'), join(LINKS, 'current'), 'dir');
+	mkdirSync(join(LINKS, 'plain'), { recursive: true });
+	writeFileSync(join(LINKS, 'plain', 'weird{1}.ipynb'), '{"cells":[],"nbformat":4,"nbformat_minor":5}\n');
+	writeFileSync(join(LINKS, 'plain', 'ordinary.ipynb'), '{"cells":[],"nbformat":4,"nbformat_minor":5}\n');
+	symlinkSync(join(LINKS, 'plain', 'weird{1}.ipynb'), join(LINKS, 'plain', 'clean.ipynb'));
+
 	route = await import('../../src/routes/api/chat/reads/+server.js');
 });
 
@@ -60,6 +77,7 @@ afterAll(() => {
 	if (savedWorkspace === undefined) delete process.env.CELLAR_WORKSPACE;
 	else process.env.CELLAR_WORKSPACE = savedWorkspace;
 	rmSync(WS, { recursive: true, force: true });
+	rmSync(LINKS, { recursive: true, force: true });
 });
 
 describe('the reads-availability verdict', () => {
@@ -109,6 +127,47 @@ describe('the reads-availability verdict', () => {
 		// ...while a refused character names the one segment at fault.
 		expect(chatPathRefusal('/tmp/ok/analysis [2024]/x.ipynb')).toEqual({ kind: 'character', segment: 'analysis [2024]' });
 		expect(chatPathRefusal('/tmp/ok/plain.ipynb')).toBeNull();
+	});
+
+	it('answers for the CANONICAL spelling, so a symlinked workspace cannot report available while every run is read-less', () => {
+		// The engine builds every rule in the canonical namespace, so a workspace
+		// whose lexical path is clean but whose REALPATH carries a refused character
+		// is read-less. A verdict that answered from the lexical path alone reported
+		// `available` over exactly that run - the silent capability gap this pane
+		// exists to remove, reintroduced through the canonical door. Asserted
+		// TOGETHER, because agreeing is the whole claim.
+		const root = join(LINKS, 'current');
+		const nb = join(root, 'analysis.ipynb');
+		expect(chatToolPolicy({ readRoot: root, notebookPath: nb }).readRoot).toBeNull();
+		expect(chatToolPolicy({ readRoot: root, notebookPath: nb }).grants).toEqual([]);
+		const v = chatReadsBlockedCause(root, nb);
+		expect(v?.cause).toBe('workspace');
+		// It names the segment of the spelling that ACTUALLY fails, so the copy
+		// points at something the person can find and rename.
+		expect(v?.segment).toBe('proj[2]');
+	});
+
+	it('blames the NOTEBOOK when only its realpath is unpatternable, and names the real file', () => {
+		const root = join(LINKS, 'plain');
+		const nb = join(root, 'clean.ipynb');
+		expect(chatToolPolicy({ readRoot: root, notebookPath: nb }).readRoot).toBeNull();
+		const v = chatReadsBlockedCause(root, nb);
+		expect(v?.cause).toBe('notebook');
+		expect(v?.segment).toBe('weird{1}.ipynb');
+		expect(v?.isNotebookName).toBe(true);
+		// The sibling that is clean in BOTH spellings still gets reads - the
+		// refusal is about this notebook, not about the workspace.
+		const ok = join(root, 'ordinary.ipynb');
+		expect(chatReadsBlockedCause(root, ok)).toBeNull();
+		expect(chatToolPolicy({ readRoot: root, notebookPath: ok }).readRoot).not.toBeNull();
+	});
+
+	it('still REFUSES a relative root, which canonicalising first would have turned into reads over the process cwd', () => {
+		// The order inside the shared helper is load-bearing: `realpathSync` resolves
+		// a relative path against the process's own cwd, so validating only AFTER
+		// canonicalising grants reads over whatever directory Cellar runs in.
+		expect(chatReadsBlockedCause('relative/dir', 'relative/dir/a.ipynb')).toEqual({ cause: 'workspace', kind: 'platform' });
+		expect(chatToolPolicy({ readRoot: 'relative/dir', notebookPath: 'relative/dir/a.ipynb' }).readRoot).toBeNull();
 	});
 
 	it('agrees with what the ENGINE does, in both directions', () => {
