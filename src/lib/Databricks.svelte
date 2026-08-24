@@ -2142,6 +2142,7 @@
 		version_mismatch: 'databricks-connect is newer than the cluster’s runtime. Cellar re-pins a matching client automatically on your next connect - just click the cluster again.',
 		read_failed: 'Spark could not read that table.',
 		kernel_unavailable: 'Cellar could not reach the Python kernel. Restart Cellar, then connect again.',
+		operation_aborted: 'This did not finish because the kernel run it was using was stopped - an interrupt, a restart, or a kernel that went away. Nothing is wrong with your credentials or the cluster; try again once the kernel is free.',
 		busy: 'Another Databricks operation is still running.',
 		workspace_conflict: 'Something that is not a notebook already occupies that path in your workspace. Nothing was uploaded.',
 		notebook_too_large: 'This notebook is too large for a Databricks workspace import. Run “Clear all outputs” from the command palette, then upload again - the outputs are what make it this large.'

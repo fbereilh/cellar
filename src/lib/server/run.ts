@@ -17,7 +17,7 @@
  *   try { return await executeCellRun({ nb, cellId, actor, source: ticket.source() }); }
  *   finally { ticket.done(); }
  */
-import { execute } from './kernel';
+import { execute, KernelExecuteAborted } from './kernel';
 import { setOutputs, setOutputsLive, setLastRun, clearOutputsLive, getCell } from './notebook';
 import { publish } from './events';
 import { isChatCell, isSqlCell } from '../cellLanguage';
@@ -164,10 +164,16 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 				traceback: [message]
 			});
 			status = 'error';
-			// execute() threw before it ever had a kernel in hand, so there is no session
-			// to stamp: this failure is the run the caller just asked for, not a leftover.
-			// A chat run never has a kernel, so its failures are never "kernel down".
-			if (session === null && !isChat) kernelDown = true;
+			// `kernelDown` means one thing only: execute() threw before it ever had a kernel
+			// in hand (the sidecar was unreachable), which is why the absent session epoch
+			// stands in for it. A chat run never has a kernel, so its failures are never
+			// "kernel down" - and neither is an ABORT: a run force-settled while parked on
+			// the exec lock (F2) also throws with no session, but the kernel it was queued
+			// behind was demonstrably alive and busy. Reporting that as kernel_unavailable
+			// asserts an unreachable kernel that was never observed, and drops the cell into
+			// `error_persisted` - the label agents are told to distrust as a leftover from a
+			// previous session, for a run that was aborted seconds ago.
+			if (session === null && !isChat && !(err instanceof KernelExecuteAborted)) kernelDown = true;
 		} finally {
 			clearInterval(flushTimer);
 		}

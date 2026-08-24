@@ -614,6 +614,9 @@ outlive the run that asked for it.
 | `CELLAR_KERNEL_IDLE_TIMEOUT_MS` | `30000` (ms, = 30s) | Per-run watchdog: how often a silent running cell has its kernel probed for liveness. **Not a deadline** - a silent cell whose kernel probes healthy runs indefinitely, and only the probe's verdict aborts a run: the kernel is gone from the Jupyter server or reports itself dead (aborts on the first probe), or the kernel's reply can no longer reach us on 3 consecutive probes (the websocket has given up reconnecting, or it is connected yet the kernel is not executing our cell). A probe that fails or times out, and a websocket that is still reconnecting, are inconclusive: the watchdog just probes again - unless the websocket has ALSO given up, which is corroborated proof the kernel is unreachable by any route and aborts on 3 consecutive such probes. `0` disables the per-run watchdog entirely (a genuinely wedged kernel then frees its slot only on manual Restart); a positive value overrides the probe interval. Distinct from the culler above. |
 | `CELLAR_KERNEL_PROBE_TIMEOUT_MS` | `10000` (ms, = 10s) | How long one liveness probe (a localhost `GET /api/kernels/<id>`, normally ~3-5ms) may take before it is abandoned as inconclusive. An abandoned probe does not abort a run on its own; the watchdog just probes again (unless the websocket has also given up - see above). |
 | `CELLAR_KERNEL_RECONNECT_TIMEOUT_MS` | `15000` (ms, = 15s) | How long a dead-socket self-heal (rebuild the kernel websocket without restarting the process or clearing its namespace, after the watchdog convicts a `disconnected` socket) may take before it is abandoned. A timeout is non-fatal: the reconnect keeps trying in the background and a later run retries, so nothing is lost. |
+| `CELLAR_KERNEL_INTERRUPT_GRACE_MS` | `5000` (ms, = 5s) | How long **Stop** (a running cell's stop button, the sidebar's Interrupt, or an agent's `interrupt_kernel`) waits for the interrupted run to actually end before it force-settles it and frees the notebook. Re-checked every 25ms, so a cell that surrenders - almost all of them - is reported stopped at once instead of waiting out the window. A force-settle does **not** restart the kernel: your variables are intact, but the kernel may still be running that code (the cell's output says so, and names Restart as the certain escape). Non-positive values fall back to the default, so the escalation cannot be switched off by a typo. |
+| `CELLAR_KERNEL_INTERRUPT_SIGNAL_TIMEOUT_MS` | `5000` (ms, = 5s) | How long the interrupt request itself (a localhost POST to the Jupyter sidecar) may take before it is cancelled and Cellar stops waiting for it. Never additive with the grace window: an interrupt that could not be delivered means the kernel was never asked, so the run is force-settled straight away. |
+| `CELLAR_KERNEL_INTERRUPT_START_TIMEOUT_MS` | `5000` (ms, = 5s) | How long an interrupt waits for a kernel that is still **starting** before it frees the run without signalling it (the start is left to finish; a later run picks it up). Same rule as above - nothing was asked, so the grace window is skipped. |
 | `CELLAR_MAX_KERNELS` | `8` | Soft cap: shows a warn-only banner past N live kernels (never blocks a run). `0` disables the warning. |
 | `CELLAR_KERNEL_MEMORY_POLL_MS` | `4000` (ms, = 4s) | How often each live kernel's resident memory (RSS) is measured host-side (via `ps`) and re-broadcast to the UI. The timer is unref'd and self-stops when no kernel remains; a value is only re-published when the whole-MiB figure changes. |
 
@@ -718,6 +721,16 @@ spec files at a time. Install its browser once with `npx playwright install chro
   however long it runs. Restart the kernel from the sidebar's Kernels section, and
   see `CELLAR_KERNEL_IDLE_TIMEOUT_MS` above - set it to `0` to disable the per-run
   watchdog entirely if you hit a false abort.
+- **A run stopped with "the kernel did not respond to the interrupt in time"**
+  (or **"Cellar could not deliver the interrupt"**) - you pressed Stop and the kernel
+  either did not surrender within the grace window or could not be reached at all, so
+  Cellar stopped waiting and freed the notebook. Your variables are intact and the
+  notebook runs again, but the kernel **may still be executing that code** - Cellar
+  never restarts it behind your back, since that would clear the namespace - so a
+  following run can queue behind it inside Jupyter. Restart the kernel from the
+  sidebar's Kernels section if you need to be certain it stopped. An agent sees the
+  same distinction: `interrupt_kernel` reports `forced` (or `forced_no_signal`)
+  rather than `kernel`. See `CELLAR_KERNEL_INTERRUPT_GRACE_MS` above.
 - **A notebook will not run: "Notebook root ... does not exist in this workspace"** -
   it declares a [code root](#code-roots-several-checkouts-one-instance) whose
   directory is gone or misspelled (a worktree you removed, or a hand-edited

@@ -104,7 +104,8 @@ import {
 	kernelStatus,
 	restartKernel,
 	refreshKernelConnection,
-	liveDatabricksRuntime
+	liveDatabricksRuntime,
+	KernelExecuteAborted
 } from './kernel';
 import { queueStateFor } from './run-queue';
 import {
@@ -1168,6 +1169,11 @@ export function statusFor(code: string): number {
 		case 'reconnect_failed':
 		case 'workspace_conflict':
 		case 'runtime_env_forced':
+		// The kernel run this op was riding was stopped (an interrupt, a restart, a
+		// teardown). A state conflict, deliberately NOT `kernel_unavailable`'s 503:
+		// nothing observed an unreachable kernel, and the remedy is to try again
+		// rather than to restart Cellar.
+		case 'operation_aborted':
 			return 409;
 		case 'sdk_missing':
 		case 'connect_missing':
@@ -2625,11 +2631,32 @@ async function runInKernel(nb: string, code: string): Promise<{ result: ProbeRes
 			{ internal: true }
 		);
 	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		// An ABORT is not an unreachable sidecar, and telling the user their kernel
+		// could not be reached when it was demonstrably alive is the same
+		// assert-more-than-was-observed defect `run.ts` retired for the run path.
+		// It is routinely reachable now: an interrupt's escalation deliberately
+		// force-settles the internal CONNECT_CODE execute that holds the exec lock -
+		// settling that holder is what unwedges a notebook parked behind it - and a
+		// restart, a teardown and a proven-dead watchdog verdict land here too. So it
+		// is told apart by TYPE (never by matching the message) and reported as what
+		// it is: the operation did not finish because its kernel run was stopped. The
+		// abort carries its OWN sentence, keyed by the reason that established it, so
+		// the specific cause rides along rather than being guessed at here.
+		//
+		// Logged as INFO, not an error: on the commonest path this is the user
+		// pressing stop, which is an outcome rather than a fault.
+		if (err instanceof KernelExecuteAborted) {
+			logInfo('databricks', `Databricks op stopped before it finished (${err.reason}): ${detail}`);
+			throw new DatabricksError(
+				'operation_aborted',
+				`the Databricks operation was stopped before it finished. ${detail}`
+			);
+		}
 		// `execute()` threw before the code ever ran: the Jupyter sidecar is
 		// unreachable. That is a Cellar problem, not a Databricks one, and saying so
 		// is the difference between the user restarting Cellar and them re-checking a
 		// token that was never the issue.
-		const detail = err instanceof Error ? err.message : String(err);
 		logError('databricks', `kernel unreachable during Databricks op: ${detail}`);
 		throw new DatabricksError('kernel_unavailable', `the Python kernel could not be reached: ${detail}`);
 	}
@@ -3643,8 +3670,18 @@ async function clusterState(sel: Selection, clusterId: string): Promise<string |
  * throws.
  */
 async function throwReconnectFailure(nb: string, target: ReconnectTarget, prefix: string): Promise<never> {
-	const preserved = profileReauthVerdict(stateFor(nb).reconnectError);
+	const recorded = stateFor(nb).reconnectError;
+	const preserved = profileReauthVerdict(recorded);
 	if (preserved) throw preserved;
+	// An ABORTED attempt is the second verdict that already describes ITSELF exactly:
+	// this reconnect's own kernel run was stopped (an interrupt, a restart, a
+	// teardown), which is a fact the attempt established rather than one guessed from
+	// here. It also outranks the cluster probe for the same reason the one above
+	// does - the cluster was never the cause, so paying for that probe would only
+	// delay a generic "reconnect from the sidebar" over a stop the user just asked
+	// for. `reconnectSession` clears the field at entry, so this can only ever belong
+	// to THIS attempt.
+	if (recorded instanceof DatabricksError && recorded.code === 'operation_aborted') throw recorded;
 	const state = await clusterState(target.sel, target.clusterId);
 	if (state && DOWN_CLUSTER_STATES.has(state.toUpperCase())) {
 		throw new DatabricksError(

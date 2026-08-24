@@ -14,7 +14,7 @@ const h = vi.hoisted(() => {
 	let seq = 0;
 	function makeFakeKernel() {
 		seq += 1;
-		return {
+		const k = {
 			id: `kernel-${seq}`,
 			name: 'python3',
 			status: 'idle' as const,
@@ -29,11 +29,23 @@ const h = vi.hoisted(() => {
 			interrupt: vi.fn(async () => {}),
 			shutdown: vi.fn(async () => {})
 		};
+		h.kernels.push(k);
+		return k;
 	}
 	return {
 		startNew: vi.fn(async () => makeFakeKernel()),
 		dispose: vi.fn(),
-		activeNb: '/ws/a.ipynb'
+		activeNb: '/ws/a.ipynb',
+		// The interrupt REST POST. `interruptKernel` sends it through KernelAPI with a
+		// cancellable signal rather than `kernel.interrupt()`, so a kernel this mock does
+		// not answer for would read as an UNDELIVERABLE signal and quietly stop
+		// exercising the delivery path this suite is asserting.
+		kernels: [] as { id: string; interrupt: ReturnType<typeof vi.fn> }[],
+		interruptKernel: vi.fn(async (id: string) => {
+			const k = h.kernels.find((entry) => entry.id === id);
+			if (!k) throw new Error(`no such kernel: ${id}`);
+			await k.interrupt();
+		})
 	};
 });
 
@@ -43,7 +55,8 @@ vi.mock('@jupyterlab/services', () => ({
 		startNew = h.startNew;
 		dispose = h.dispose;
 	},
-	ServerConnection: { makeSettings: (o: unknown) => o }
+	ServerConnection: { makeSettings: (o: unknown) => o },
+	KernelAPI: { interruptKernel: h.interruptKernel }
 }));
 
 vi.mock('../../src/lib/server/notebook', () => ({
@@ -160,7 +173,10 @@ describe('kernel manager (per notebook)', () => {
 		vi.mocked(clearRunQueue).mockClear();
 		const C = '/ws/c.ipynb';
 		const info = await interruptKernel(C);
-		expect(info).toEqual({ status: 'not_started', id: null });
+		// `stopped` reports what the call actually stopped; with no kernel there was
+		// nothing to signal, and saying so is what keeps the field trustworthy on the
+		// path that DOES stop something (see kernel-interrupt-stops.test.ts).
+		expect(info).toEqual({ status: 'not_started', id: null, stopped: 'no_kernel' });
 		expect(clearRunQueue).toHaveBeenCalledWith(C, 'kernel_interrupt');
 		expect(h.startNew).not.toHaveBeenCalled(); // never force-boots a kernel
 	});

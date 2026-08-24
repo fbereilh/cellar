@@ -171,6 +171,14 @@ interface NotebookKernel {
  */
 interface ActiveRun {
 	abort: (reason: string) => void;
+	/**
+	 * Set the moment this run is ended by an ABORT rather than by the kernel's own
+	 * reply. `settleAfterInterrupt` cannot tell those apart from the run merely
+	 * leaving `activeRuns`, so without it a second, overlapping interrupt would
+	 * report `stopped:'kernel'` - a clean kernel surrender - for a run the first one
+	 * force-aborted.
+	 */
+	aborted?: boolean;
 }
 
 /** One shared KernelManager hosts every notebook's kernel (N kernels, one host). */
@@ -322,6 +330,108 @@ function probeTimeoutMs(): number {
 const DEFAULT_RECONNECT_TIMEOUT_MS = 15 * 1000;
 function reconnectTimeoutMs(): number {
 	return envMs('CELLAR_KERNEL_RECONNECT_TIMEOUT_MS', DEFAULT_RECONNECT_TIMEOUT_MS);
+}
+
+/**
+ * The reason a run force-aborted because the kernel ignored an interrupt carries.
+ * Distinct from the restart/teardown reasons because it means something different -
+ * the namespace is INTACT and the code may still be running (see `abortMessage`).
+ */
+const INTERRUPT_ABORT_REASON = 'interrupt_unresponsive';
+
+/**
+ * The sibling reason for a run force-aborted because the interrupt could not even be
+ * DELIVERED - the sidecar refused the POST, or black-holed it until `signalInterrupt`
+ * gave up, or the kernel was still starting (`awaitKernelStart`) so there was nothing
+ * to POST to. It is kept apart from `INTERRUPT_ABORT_REASON` because the two know
+ * different things: that one means the kernel was asked and did not surrender, this
+ * one means it was never asked at all. Telling the user the kernel ignored a request
+ * we never managed to send is the same assert-more-than-was-observed defect the whole
+ * interrupt path exists to retire.
+ */
+const INTERRUPT_UNDELIVERED_REASON = 'interrupt_undelivered';
+
+/**
+ * How long the interrupt REST POST may take before Cellar stops waiting for it and
+ * escalates without it.
+ *
+ * `fetch` has no default request timeout and the shared manager's settings carry no
+ * signal, so an unbounded `interrupt()` against a black-holed sidecar (HTTP wedged
+ * while the TCP socket stays up - the state `probeFailureVerdict` contemplates) never
+ * returns, and with it the whole force-settle escalation, the `/api/kernel/interrupt`
+ * route and the MCP tool. That is the very defect class this file fixed for the
+ * liveness probe ("the probe MUST always settle"), so it takes the same treatment: an
+ * `AbortSignal` threaded through `makeSettings` and raced against this bound, so the
+ * hung request is CANCELLED rather than merely ignored.
+ *
+ * Its own knob, deliberately not the probe's: a probe is a background read, while
+ * this is the user holding down "stop". Sized to be far below the point where the
+ * button reads as broken - and it is never additive with the grace window, since an
+ * undelivered signal gives the kernel nothing to answer and so skips the wait
+ * entirely. Override with `CELLAR_KERNEL_INTERRUPT_SIGNAL_TIMEOUT_MS`.
+ */
+const DEFAULT_INTERRUPT_SIGNAL_TIMEOUT_MS = 5000;
+function interruptSignalTimeoutMs(): number {
+	return envMs('CELLAR_KERNEL_INTERRUPT_SIGNAL_TIMEOUT_MS', DEFAULT_INTERRUPT_SIGNAL_TIMEOUT_MS);
+}
+
+/**
+ * How long `interruptKernel` waits for a kernel that is still STARTING before it
+ * escalates without one.
+ *
+ * The sibling of the signal bound above, and there for the identical reason: a
+ * cached `startPromise` is `mgr.startNew` (an unbounded `fetch`) followed by
+ * `initKernel`'s injections (an unbounded `await future.done`), so awaiting it
+ * outright put the whole promise back behind an operation that can fail or hang -
+ * the very defect class this path exists to close. Against a black-holed sidecar the
+ * user's run parks in `getKernel` holding the queue's `running` slot with `run:start`
+ * already emitted (the cell reads RUNNING) while `/api/kernel/interrupt` and the MCP
+ * tool never return at all.
+ *
+ * Its OWN knob, deliberately not the signal's: that one bounds a single localhost
+ * POST, while this bounds a process spawn plus its startup injections, which is a
+ * different operation with a different natural cost. Unlike the signal, the wait is
+ * ABANDONED rather than cancelled - a start is work we still want to finish, and a
+ * later run picks up the same promise - and it is never additive with the other two
+ * bounds: giving up here means the kernel was never signalled, so the grace window is
+ * skipped exactly as an undeliverable signal skips it. `envMs` rejects non-positive
+ * values, so the escalation cannot be typo'd off. Override with
+ * `CELLAR_KERNEL_INTERRUPT_START_TIMEOUT_MS`.
+ */
+const DEFAULT_INTERRUPT_START_TIMEOUT_MS = 5000;
+function interruptStartTimeoutMs(): number {
+	return envMs('CELLAR_KERNEL_INTERRUPT_START_TIMEOUT_MS', DEFAULT_INTERRUPT_START_TIMEOUT_MS);
+}
+
+/**
+ * How long `interruptKernel` waits for the interrupted run to actually END before it
+ * force-settles it.
+ *
+ * Interrupt is an EXPLICIT "stop" from the user, which is what makes escalating here
+ * right where the idle watchdog's abort-on-silence was wrong: the watchdog acts on a
+ * kernel that has merely gone quiet - a healthy 3-hour Spark job looks exactly like a
+ * dead one - so killing there destroys work nobody asked to kill. Here the user asked.
+ *
+ * Sized off what a surrender actually costs, measured against a real kernel: an
+ * ordinary python `time.sleep` raises KeyboardInterrupt ~100ms after the signal, and a
+ * blocking Spark Connect gRPC call unwinds in ~2s. 5s leaves room for a cell whose
+ * `finally` does real cleanup while still being far below the point where a user
+ * concludes the button is broken. Being wrong is not symmetric: too SHORT costs the
+ * output of a run that was about to stop cleanly, too LONG re-opens the bug. Override
+ * with `CELLAR_KERNEL_INTERRUPT_GRACE_MS`; `envMs` rejects non-positive values, so the
+ * escalation cannot be switched off by a typo - the promise is not optional.
+ */
+const DEFAULT_INTERRUPT_GRACE_MS = 5000;
+
+/**
+ * How often the grace window re-reads whether the run has ended. Small enough that a
+ * cell which surrenders promptly - the overwhelming majority - is reported stopped
+ * essentially at once rather than waiting out a coarse tick.
+ */
+const INTERRUPT_POLL_MS = 25;
+
+function interruptGraceMs(): number {
+	return envMs('CELLAR_KERNEL_INTERRUPT_GRACE_MS', DEFAULT_INTERRUPT_GRACE_MS);
 }
 
 /**
@@ -485,12 +595,18 @@ async function probeKernelLiveness(
 }
 
 /**
- * Thrown by `execute()` when a run is aborted before its reply arrives: either the
- * idle watchdog tripped (`reason: 'idle_watchdog'`) or a restart/autorestart/
- * teardown force-aborted the active future (`reason: 'kernel_restart'` etc.). The
- * caller (`executeCellRun`) catches it and turns it into an error output; because
- * `execute()` returns control to the caller, the owner's `finally` releases the
- * queue slot — unwedging the notebook.
+ * Thrown by `execute()` when a run is aborted before its reply arrives. Three
+ * families reach it, and they establish different things (see `abortMessage`):
+ * the idle watchdog tripped (`reason: 'idle_watchdog'`); a restart/autorestart/
+ * teardown force-aborted the active future (`'kernel_restart'` etc.); or an
+ * INTERRUPT escalated, either because the kernel was signalled and did not
+ * surrender (`'interrupt_unresponsive'`) or because the signal could not be
+ * delivered at all (`'interrupt_undelivered'`) - neither of which is a restart or
+ * an observed stop, so the kernel and its namespace may both still be there.
+ * The caller (`executeCellRun`) catches it and turns it into an error output;
+ * because `execute()` returns control to the caller, the owner's `finally`
+ * releases the queue slot — unwedging the notebook. It also means the kernel WAS
+ * in hand, so `run.ts` excludes it from the kernel-unavailable inference.
  */
 export class KernelExecuteAborted extends Error {
 	reason: string;
@@ -502,6 +618,46 @@ export class KernelExecuteAborted extends Error {
 }
 
 /**
+ * The sentence a force-aborted run reports, in the THREE families the abort reasons
+ * fall into. Each knows a different thing, and saying more than that is the defect
+ * this repo keeps retiring (the watchdog's old "no activity for 900s"):
+ *
+ *   - INTERRUPT, in two shapes that must not be conflated. `interrupt_unresponsive`:
+ *     the kernel WAS signalled and did not surrender within the grace window.
+ *     `interrupt_undelivered`: the signal never reached it, so it was never asked -
+ *     saying it "did not respond" there is a claim about a request that was never
+ *     made. Both know only that Cellar stopped waiting and that the code may well
+ *     still be executing up there, so both say exactly that plus the one action
+ *     guaranteed to end it, and neither may claim a stop or a restart it never
+ *     observed.
+ *   - RESTART (`kernel_restart`, `kernel_autorestart`): the kernel really was
+ *     restarted, so the awaited reply belongs to a namespace that is gone.
+ *   - TEARDOWN (everything else: `kernel_shutdown`, `kernel_culled`,
+ *     `notebook_deleted`, `kernel_gone`, `kernel_rebind`, `kernel_restart_failed`):
+ *     the kernel this run was waiting on is gone. That is ALL they establish in
+ *     common - a cull, a delete and a proven-dead process are not restarts - so the
+ *     sentence names no cause beyond it.
+ */
+function abortMessage(reason: string): string {
+	if (reason === INTERRUPT_ABORT_REASON) {
+		return (
+			'Run stopped: the kernel did not respond to the interrupt in time, so Cellar stopped waiting for it. ' +
+			'The kernel may still be executing this code - restart it to be certain.'
+		);
+	}
+	if (reason === INTERRUPT_UNDELIVERED_REASON) {
+		return (
+			'Run stopped: Cellar could not deliver the interrupt to the kernel, so it stopped waiting for this run. ' +
+			'The kernel may still be executing this code - restart it to be certain.'
+		);
+	}
+	if (reason === 'kernel_restart' || reason === 'kernel_autorestart') {
+		return 'Run aborted: the kernel was restarted.';
+	}
+	return 'Run aborted: the kernel this run was waiting on is gone.';
+}
+
+/**
  * Force-abort every run currently awaiting `nbKernel`'s reply. Each aborted run's
  * `execute()` disposes its future and throws `KernelExecuteAborted`, so the run's
  * OWNER releases its queue slot through its existing `finally` — no second release
@@ -509,11 +665,16 @@ export class KernelExecuteAborted extends Error {
  * the namespace the awaited reply belonged to (the reply may now never arrive).
  * `clearRunQueue` drops only PENDING runs; this covers the ACTIVE one, so a manual
  * restart actually rescues a wedged run.
+ *
+ * `only` narrows it to a specific set of runs, still-registered members only. A
+ * restart/teardown legitimately wants EVERY run (its kernel change invalidates them
+ * all), so that stays the default; an INTERRUPT owns only the runs that were live
+ * when it was signalled (see `settleAfterInterrupt`).
  */
-function abortActiveRuns(nbKernel: NotebookKernel, reason: string): void {
-	if (nbKernel.activeRuns.size === 0) return;
-	const runs = [...nbKernel.activeRuns];
-	nbKernel.activeRuns.clear();
+function abortActiveRuns(nbKernel: NotebookKernel, reason: string, only?: readonly ActiveRun[]): void {
+	const runs = (only ?? [...nbKernel.activeRuns]).filter((run) => nbKernel.activeRuns.has(run));
+	if (runs.length === 0) return;
+	for (const run of runs) nbKernel.activeRuns.delete(run);
 	for (const run of runs) {
 		try {
 			run.abort(reason);
@@ -1804,23 +1965,257 @@ export async function rebindKernel(nbPath?: string | null) {
 }
 
 /**
- * Interrupt notebook `nbPath`'s running kernel (SIGINT equivalent). Also drops
- * that notebook's pending run queue: "stop" must mean stop, not "stop this cell
- * and start the next one" — and jupyter aborts its own queued execute requests on
- * an interrupt anyway. Other notebooks are untouched.
+ * Interrupt notebook `nbPath`'s running kernel and STOP its runs. Other notebooks
+ * are untouched.
+ *
+ * "Stop means stop" is a promise, and signalling the kernel alone does not keep it.
+ * SIGINT is a REQUEST: python raises KeyboardInterrupt at the next bytecode
+ * boundary, which an ordinary cell obeys in milliseconds — but the run only ends
+ * when the kernel sends its `execute_reply`, and there are ordinary ways for that
+ * never to happen. The old implementation signalled, returned `ok`, and never
+ * checked, so in exactly those cases the cell went on reading "running" forever
+ * while the tool reported success — the worst of both.
+ *
+ * So this escalates, in three steps:
+ *   1. drop the PENDING queue (stop must not mean "stop this cell and start the
+ *      next one"; jupyter aborts its own queued execute requests anyway);
+ *   2. send the interrupt - BEST-EFFORT and BOUNDED (`signalInterrupt`) - and give the
+ *      kernel `interruptGraceMs()` to actually end the run: the graceful path, and the
+ *      one that fires for almost every cell. A signal that cannot be delivered is a
+ *      reason to escalate SOONER, never a reason to skip the escalation: gating step 3
+ *      behind it would put the whole promise back behind an operation that can fail or
+ *      hang, which is the defect class this function exists to close. That rule binds
+ *      EVERY step on the way there, so REACHING the kernel is bounded too
+ *      (`awaitKernelStart`): a cached `startPromise` is an unbounded `fetch` plus
+ *      unbounded startup injections, and awaiting it outright put the same promise
+ *      back behind the same shape one line earlier;
+ *   3. if the run is still going, FORCE-SETTLE it (`abortActiveRuns`), which frees
+ *      the queue slot through the run owner's own `finally` — the single release
+ *      path a restart already uses — so the notebook is usable again.
+ *
+ * Step 3 is honest rather than silent: the aborted run's output says the kernel did
+ * not respond and may still be executing (see `abortMessage`), and the result's
+ * `stopped` field reports WHICH of them happened — `kernel` (it surrendered),
+ * `forced` (it was asked and did not, so Cellar stopped waiting), `forced_no_signal`
+ * (the same, except the interrupt was never delivered - the POST failed or was
+ * abandoned, or the kernel was still starting so there was nothing to POST to),
+ * `chat` (a chat run, which holds no kernel, was aborted), `idle` (nothing was
+ * running) or `no_kernel` — so a caller, the MCP tool included, can say so instead of
+ * claiming a stop, or a request, it did not observe.
+ * What it does NOT do is restart the kernel: that would destroy a namespace the user
+ * never asked to lose, and the message names it as the guaranteed escape.
  */
 export async function interruptKernel(nbPath?: string | null) {
 	const abs = resolveNb(nbPath);
 	clearRunQueue(abs, 'kernel_interrupt');
 	// A chat run holds no kernel, so nothing below can reach it: abort its child
 	// here, BEFORE the no-kernel early return - "stop" must stop a chat cell too.
-	abortChatRuns(abs);
+	// It settles through its own abort, not through `activeRuns`, so it is counted
+	// separately: reporting a stopped chat run as `idle` would understate what the
+	// call actually did, which is the same over/under-claiming this fix exists to end.
+	const chatAborted = abortChatRuns(abs) > 0;
 	const nbKernel = kernels.get(abs);
-	if (!nbKernel) return { status: 'not_started', id: null };
-	const kernel = await nbKernel.startPromise;
-	await kernel.interrupt();
+	if (!nbKernel) {
+		return { status: 'not_started', id: null, stopped: chatAborted ? ('chat' as const) : ('no_kernel' as const) };
+	}
+	// The snapshot this interrupt owns, taken in TWO reads that are both load-bearing.
+	//
+	// The first is BEFORE the signal, and before the start wait - i.e. before anything
+	// that can block or fail. Before the signal because that is awaited, so a cell that
+	// surrenders promptly (the overwhelming majority) can already be out of
+	// `activeRuns` by the time it returns, and a set read afterwards would report that
+	// clean stop as `idle` ("nothing was running"). Before the start wait because THAT
+	// can time out, and a set read only afterwards would be lost entirely on a kernel
+	// whose start never resolves - the whole point of bounding it.
+	//
+	// The second FOLDS IN whatever registered while we reached the kernel, and without
+	// it the F2 headline case regresses: a run's owner claims the queue's `running`
+	// slot and emits `run:start` (so the cell reads RUNNING) and only registers its
+	// abort handle a microtask later, once `getKernel` resolves. Such a run WAS live
+	// when the user asked - it is exactly the parked run this whole path exists to
+	// settle - so reading only at entry would leave it un-aborted and report `idle`
+	// over a cell still showing RUNNING. Folding in is a no-op when the start really
+	// did hang, since a run cannot register while `getKernel` is still pending.
+	const watched = [...nbKernel.activeRuns];
+	const kernel = await awaitKernelStart(nbKernel);
+	for (const run of nbKernel.activeRuns) if (!watched.includes(run)) watched.push(run);
+	// No kernel in hand means nothing was asked, so the escalation runs at once under
+	// the undelivered reason - the same honest verdict a signal that could not be
+	// delivered earns, and for the same reason: the request was never made.
+	const signalled = kernel ? await signalInterrupt(kernel) : false;
+	const settled = await settleAfterInterrupt(nbKernel, watched, signalled);
+	// A chat run really was stopped, so `idle` (nothing was running) would be false.
+	const stopped = settled === 'idle' && chatAborted ? ('chat' as const) : settled;
 	publishKernelStatus();
-	return { status: kernel.status, id: kernel.id };
+	// Report the connection this notebook HAS, which is a fact even while the start is
+	// still in flight (`getKernel` binds it before the injections run) - and `starting`
+	// when it has not got that far, the same convention `listKernels` uses for a
+	// booting kernel's card. Never blocks: reading the resolved kernel is what the
+	// bound above exists to avoid.
+	const conn = kernel ?? nbKernel.connection;
+	return { status: conn?.status ?? ('starting' as const), id: conn?.id ?? null, stopped };
+}
+
+/**
+ * Wait for a notebook's kernel to finish starting, BOUNDED and BEST-EFFORT: resolves
+ * the connection when the start settles in time, `null` when it does not or when it
+ * FAILED, and NEVER throws.
+ *
+ * Both halves matter, and they are the two ways `startPromise` breaks the promise.
+ * It can HANG - `mgr.startNew` is an unbounded `fetch` and `initKernel`'s injections
+ * are an unbounded `await future.done` - so awaiting it outright made the whole
+ * escalation, the route and the MCP tool reachable only when the sidecar was healthy.
+ * And it can REJECT (a sidecar that refused the start), which propagated straight out
+ * of `interruptKernel`, skipping the escalation entirely. Neither may decide whether
+ * "stop" is honoured: the caller escalates on a verdict instead of being handed an
+ * exception, or nothing at all.
+ *
+ * The wait is ABANDONED, not cancelled - deliberately unlike `signalInterrupt`, whose
+ * hung POST holds a socket for nothing. A start is work that should still finish (a
+ * later run awaits the same promise), and there is no signal threaded into `startNew`
+ * to cancel it with. `getKernel` already attaches its own `.catch`, so abandoning the
+ * race can never surface an unhandled rejection.
+ */
+async function awaitKernelStart(nbKernel: NotebookKernel): Promise<KernelConnection | null> {
+	const timeoutMs = interruptStartTimeoutMs();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const timedOut = new Promise<null>((resolve) => {
+			timer = setTimeout(() => {
+				logWarn(
+					'kernel',
+					`interrupt on ${nbKernel.nbPath}: the kernel was still starting after ${timeoutMs}ms; escalating without signalling it`
+				);
+				resolve(null);
+			}, timeoutMs);
+			// Like every other timer here, this must never keep the Node process alive.
+			timer.unref?.();
+		});
+		return await Promise.race([nbKernel.startPromise, timedOut]);
+	} catch (err) {
+		logWarn(
+			'kernel',
+			`interrupt on ${nbKernel.nbPath}: the kernel never started (${(err as Error)?.message ?? err}); escalating without signalling it`
+		);
+		return null;
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+/**
+ * Ask the kernel to interrupt, BOUNDED and BEST-EFFORT: resolves `true` when the
+ * request was delivered and `false` when it could not be, and NEVER throws.
+ *
+ * Both halves are load-bearing. @jupyterlab's `KernelConnection.interrupt()` rejects
+ * outright for a kernel it believes is dead and for any failed REST POST, and that
+ * POST is unbounded, so `await`ing it directly made the entire force-settle
+ * escalation reachable only when the sidecar was healthy - precisely the "the promise
+ * is gated behind an operation that can fail or hang" shape being fixed. Here the
+ * request goes through `KernelAPI` with an `AbortSignal` threaded via `makeSettings`
+ * and raced against `interruptSignalTimeoutMs()`, so a black-holed sidecar has its
+ * socket CANCELLED rather than held, and every failure is reported as a verdict the
+ * caller escalates on instead of an exception that skips the escalation.
+ *
+ * A kernel the connection already knows is dead is reported undelivered WITHOUT a
+ * POST: that is what @jupyterlab's own guard establishes, and it is true - you cannot
+ * deliver a signal to a dead kernel.
+ */
+async function signalInterrupt(kernel: KernelConnection): Promise<boolean> {
+	if (kernel.status === 'dead') {
+		logWarn('kernel', `interrupt not delivered to ${kernel.id}: the kernel is dead; escalating without it`);
+		return false;
+	}
+	const controller = new AbortController();
+	const timeoutMs = interruptSignalTimeoutMs();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const timedOut = new Promise<false>((resolve) => {
+			timer = setTimeout(() => {
+				controller.abort();
+				logWarn(
+					'kernel',
+					`interrupt to ${kernel.id} was not answered within ${timeoutMs}ms; cancelled it and escalating without it`
+				);
+				resolve(false);
+			}, timeoutMs);
+			// Like every other timer here, this must never keep the Node process alive.
+			timer.unref?.();
+		});
+		return await Promise.race([
+			KernelAPI.interruptKernel(kernel.id, makeSettings(controller.signal)).then(() => true),
+			timedOut
+		]);
+	} catch (err) {
+		logWarn(
+			'kernel',
+			`interrupt to ${kernel.id} failed (${(err as Error)?.message ?? err}); escalating without it`
+		);
+		return false;
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+/**
+ * Wait out the interrupt grace window, then force-settle whatever is still running.
+ *
+ * Polls rather than awaiting the runs themselves: `activeRuns` holds abort handles,
+ * not promises, and a run parked on the exec lock is registered before it has a
+ * future to await at all. The poll is a cheap membership test over the SNAPSHOT
+ * below, bounded by the grace window, and it returns THE MOMENT the last watched
+ * run leaves the set, so the overwhelming majority of interrupts — every ordinary
+ * python cell — pay one tick, not 5s.
+ *
+ * `watched` is the caller's snapshot, taken before the signal: this interrupt owns
+ * the runs that were live when the user asked, and nothing else. A run that STARTS
+ * after that is deliberately not this interrupt's to kill - force-aborting it would
+ * destroy work the user never asked to stop and would also report `forced` for an
+ * interrupt whose own run surrendered perfectly. The internal exec-lock holder (a
+ * Databricks CONNECT_CODE execute) IS in that snapshot and must stay there: settling
+ * it is what unwedges a notebook parked behind it.
+ *
+ * Leaving the set is NOT by itself a kernel surrender, so the verdict also reads
+ * `ActiveRun.aborted`: a concurrent interrupt, restart or watchdog conviction can
+ * empty the snapshot without the kernel having answered, and reporting that as
+ * `kernel` would be exactly the stop-we-did-not-observe this path exists to refuse.
+ *
+ * `signalled` says whether the request actually reached the kernel - false when the
+ * POST failed or was abandoned, and equally when the kernel was still starting so
+ * there was nothing to POST to. When it did NOT there is no surrender to wait for -
+ * nothing was asked - so the grace window is skipped and the escalation runs at once,
+ * under its own reason and its own verdict. The `!pending()` check still runs first,
+ * so a run that ended on its own in the meantime is reported for what it is rather
+ * than force-aborted.
+ *
+ * `idle` = nothing was running (an interrupt with no live run is not a failure).
+ * `kernel` = the kernel ended the run itself, the graceful path.
+ * `forced` = it was asked and did not, so Cellar stopped waiting; the caller must not
+ * report that as the kernel having stopped.
+ * `forced_no_signal` = the same stop, except the interrupt was never delivered, so the
+ * caller must not report the kernel as having been asked at all.
+ */
+async function settleAfterInterrupt(
+	nbKernel: NotebookKernel,
+	watched: readonly ActiveRun[],
+	signalled: boolean
+): Promise<'idle' | 'kernel' | 'forced' | 'forced_no_signal'> {
+	if (watched.length === 0) return 'idle';
+	const pending = () => watched.some((run) => nbKernel.activeRuns.has(run));
+	const graceMs = signalled ? interruptGraceMs() : 0;
+	const deadline = Date.now() + graceMs;
+	while (pending() && Date.now() < deadline) {
+		await new Promise((r) => setTimeout(r, INTERRUPT_POLL_MS));
+	}
+	if (!pending()) return watched.some((run) => run.aborted) ? 'forced' : 'kernel';
+	logWarn(
+		'kernel',
+		signalled
+			? `interrupt on ${nbKernel.nbPath}: kernel did not end the run within ${graceMs}ms; force-settling it`
+			: `interrupt on ${nbKernel.nbPath}: the signal could not be delivered; force-settling the run without it`
+	);
+	abortActiveRuns(nbKernel, signalled ? INTERRUPT_ABORT_REASON : INTERRUPT_UNDELIVERED_REASON, watched);
+	return signalled ? 'forced' : 'forced_no_signal';
 }
 
 /**
@@ -1989,19 +2384,27 @@ export function currentSessionId(nbPath?: string | null): SessionId | null {
 }
 
 /**
- * Acquire this kernel's execute lock, resolving to a `release` the caller MUST
- * invoke (in a `finally`) once its `requestExecute` has fully settled. It appends
- * to `nbKernel.execChain` so callers line up FIFO: each awaits the previous run's
- * completion before it may put its own `requestExecute` on the wire. The read of
- * the current tail and the install of the new one are synchronous (no `await`
- * between them), so JS's single-threaded turn makes the swap atomic — two callers
- * that arrive "at once" still serialize, the second chaining behind the first's
- * release rather than both proceeding off the same predecessor. This is what keeps
- * a queued cell run and an internal inspector probe from ever having two executes
- * in flight on one kernel — the collision that wedges a run's `future.done`. See
- * `NotebookKernel.execChain`.
+ * CLAIM this kernel's place in the execute queue, WITHOUT waiting for it.
+ *
+ * Returns `ready` (resolves when it is our turn) and `release` (hands the chain to
+ * the next caller). It appends to `nbKernel.execChain` so callers line up FIFO. The
+ * read of the current tail and the install of the new one are synchronous (no
+ * `await` between them), so JS's single-threaded turn makes the swap atomic — two
+ * callers that arrive "at once" still serialize, the second chaining behind the
+ * first's release rather than both proceeding off the same predecessor. This is what
+ * keeps a queued cell run and an internal inspector probe from ever having two
+ * executes in flight on one kernel — the collision that wedges a run's
+ * `future.done`. See `NotebookKernel.execChain`.
+ *
+ * THE SPLIT IS LOAD-BEARING, and replacing it with a single `await acquire()` is the
+ * bug it was written to fix. The chain node is installed SYNCHRONOUSLY, so a caller
+ * that walks away from an `await` it cannot cancel leaves that node in place with
+ * `release` unreachable — every later execute on the kernel then waits forever. By
+ * handing `release` back BEFORE the wait, a caller may race `ready` against its own
+ * abort and STILL hand the chain on (see `execute()`), which is what makes a run
+ * abortable while it is parked here rather than only once it holds the kernel.
  */
-async function acquireExecLock(nbKernel: NotebookKernel): Promise<() => void> {
+function beginExecLock(nbKernel: NotebookKernel): { ready: Promise<void>; release: () => void } {
 	const prev = nbKernel.execChain;
 	let release!: () => void;
 	nbKernel.execChain = new Promise<void>((resolve) => {
@@ -2009,7 +2412,17 @@ async function acquireExecLock(nbKernel: NotebookKernel): Promise<() => void> {
 	});
 	// A predecessor's chain never rejects (release only ever resolves), but guard
 	// anyway so one caller's odd state can never poison the whole kernel's chain.
-	await prev.catch(() => {});
+	return { ready: prev.catch(() => {}), release };
+}
+
+/**
+ * `beginExecLock` for a caller that has nothing to cancel: wait for our turn and
+ * resolve to the `release` it must invoke in a `finally`. Used by the silent
+ * startup/re-injection execs, which carry no abort handle of their own.
+ */
+async function acquireExecLock(nbKernel: NotebookKernel): Promise<() => void> {
+	const { ready, release } = beginExecLock(nbKernel);
+	await ready;
 	return release;
 }
 
@@ -2047,14 +2460,65 @@ export async function execute(
 		kernel = await getKernel(abs);
 	}
 	const nbKernel = kernels.get(abs)!;
-	// Serialize behind any other execute on THIS kernel (queued cell run OR internal
-	// probe) so two `requestExecute` are never on the wire at once — the collision
-	// that makes @jupyterlab mis-pair the interleaved idle/reply and wedges a run's
-	// `future.done` forever (see NotebookKernel.execChain). Released in the `finally`.
-	// Acquired before reading `session`/incrementing so those reflect the state at the
-	// moment this run actually reaches the kernel (a restart during the wait bumps the
-	// epoch), not the moment it queued.
-	const releaseExec = await acquireExecLock(nbKernel);
+
+	// --- Abort handle, live from BEFORE the exec-lock wait --------------------
+	// A run must be abortable for its WHOLE lifetime, not only once it holds the
+	// kernel. Registered after the lock (which is where it used to live), a run
+	// PARKED on `execChain` was reachable by nothing: it is no longer in the run
+	// queue's `pending` (its owner already dequeued it, so `clearRunQueue` cannot
+	// see it) and not yet in `activeRuns` (so `abortActiveRuns` cannot either),
+	// while it IS the queue's `running` entry and has already emitted `run:start` —
+	// so the cell showed RUNNING and neither interrupt nor restart could settle it.
+	// That is reachable in one ordinary sequence, and it is why the bug reads as
+	// Spark-specific: a Databricks session failure fires `autoReconnect` →
+	// `CONNECT_CODE` as an INTERNAL execute, which legitimately holds this lock for
+	// MINUTES while a cold cluster starts; the user, seeing their session break,
+	// re-runs their cell, and it parks here behind that connect. Only Databricks
+	// work runs kernel ops that long, so only a Spark notebook meets it routinely.
+	let settled = false;
+	let aborted = false;
+	let abortReject: ((err: Error) => void) | null = null;
+	const abortRace = new Promise<never>((_, reject) => {
+		abortReject = reject;
+	});
+	// Swallow the race's own late rejection: after the run settles normally the
+	// promise never rejects, and while it is live the `await`s below handle it — this
+	// only marks it handled so a post-settle no-op can never surface unhandled.
+	abortRace.catch(() => {});
+	const triggerAbort = (err: Error) => {
+		if (settled || aborted) return;
+		aborted = true;
+		run.aborted = true;
+		abortReject?.(err);
+	};
+	const run: ActiveRun = {
+		abort: (reason) => triggerAbort(new KernelExecuteAborted(abortMessage(reason), reason))
+	};
+	nbKernel.activeRuns.add(run);
+
+	// CLAIM our place in the execute queue, then wait for it — racing the wait
+	// against our own abort. Two `requestExecute` on one kernel make @jupyterlab
+	// mis-pair the interleaved idle/reply and wedge a run's `future.done` forever
+	// (see NotebookKernel.execChain), so the ordering itself is not negotiable; what
+	// this buys is that waiting for it is CANCELLABLE.
+	const { ready: execReady, release: releaseExec } = beginExecLock(nbKernel);
+	try {
+		await Promise.race([execReady, abortRace]);
+	} catch (err) {
+		// Aborted while parked: this run is over before it ever reached the kernel.
+		settled = true;
+		nbKernel.activeRuns.delete(run);
+		// Hand the chain on only once our PREDECESSOR has really finished. Releasing
+		// now would let our successor put its `requestExecute` on the wire alongside
+		// the predecessor's — the exact collision the lock exists to prevent. The
+		// caller does not wait for that: it gets its rejection immediately, so the
+		// queue slot frees and the cell stops reading "running" at once.
+		void execReady.then(releaseExec, releaseExec);
+		throw err;
+	}
+	// Read AFTER the wait so it reflects the state at the moment this run actually
+	// reaches the kernel (a restart during the wait bumps the epoch), not the moment
+	// it queued.
 	const session = nbKernel.sessionId;
 
 	let future: Kernel.IShellFuture<KernelMessage.IExecuteRequestMsg, KernelMessage.IExecuteReplyMsg>;
@@ -2072,6 +2536,11 @@ export async function execute(
 		onEvent({ type: 'kernel', id: kernel.id, session });
 		future = kernel.requestExecute({ code, stop_on_error: false });
 	} catch (err) {
+		// Drop the abort handle: this run is over, and a handle left behind would make
+		// `settleAfterInterrupt` see a run that can never end, so every LATER interrupt
+		// on this kernel would report `forced` and force-abort runs that were fine.
+		settled = true;
+		nbKernel.activeRuns.delete(run);
 		// Undo the just-applied user-run bookkeeping too.
 		if (!internal) {
 			nbKernel.userRuns -= 1;
@@ -2095,26 +2564,11 @@ export async function execute(
 	// Either trigger rejects the race; `execute()` then disposes the future and
 	// throws `KernelExecuteAborted`, and the caller's `finally` releases the slot.
 	const idleMs = kernelIdleTimeoutMs();
-	let settled = false;
-	let aborted = false;
 	let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
 	let suspectStrikes = 0;
 	// The in-flight probe's controller, so the run's teardown can cancel a hung request
 	// instead of leaving it holding a socket for the rest of the probe timeout.
 	let probeController: AbortController | undefined;
-	let abortReject: ((err: Error) => void) | null = null;
-	const abortRace = new Promise<never>((_, reject) => {
-		abortReject = reject;
-	});
-	// Swallow the race's own late rejection: after the run settles normally the
-	// promise never rejects, and while it is live the `await` below handles it — this
-	// only marks it handled so a post-settle no-op can never surface unhandled.
-	abortRace.catch(() => {});
-	const triggerAbort = (err: Error) => {
-		if (settled || aborted) return;
-		aborted = true;
-		abortReject?.(err);
-	};
 	const armWatchdog = () => {
 		if (settled || aborted) return;
 		// A disabled watchdog (CELLAR_KERNEL_IDLE_TIMEOUT_MS=0) never arms a timer, so it
@@ -2196,10 +2650,6 @@ export async function execute(
 		suspectStrikes = 0;
 		armWatchdog();
 	};
-	const run: ActiveRun = {
-		abort: (reason) => triggerAbort(new KernelExecuteAborted('Run aborted: the kernel was restarted.', reason))
-	};
-	nbKernel.activeRuns.add(run);
 	resetWatchdog(); // arm before any traffic can arrive
 	// A reply or stdin request on any channel is kernel activity: reset the watchdog.
 	future.onReply = () => resetWatchdog();
