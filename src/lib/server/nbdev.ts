@@ -41,6 +41,13 @@
  *   change without risking the rest of a file that is none of Cellar's business.
  *   A refusal names the two lines so the user can add them by hand - which
  *   works whatever the shape.
+ * - **The one accepted formatting cost.** An edit replaces whole physical LINES,
+ *   so an allowlist written across several lines is re-rendered on one (and a
+ *   comment sitting INSIDE that array goes with it). It is scoped to the single
+ *   key whose value is CHANGING - a key that already says `cellar` is left
+ *   byte-identical, trailing comment and all - and it is the same property the
+ *   sibling Codex writer in `harness.js` has. Pinned by test so the collapse is a
+ *   decision rather than a surprise.
  *
  * No nbdev dependency, no Python, no subprocess: detection is a walk-up plus the
  * shared TOML scanner (`toml.js`), exactly as `harness.js` reads a Codex config.
