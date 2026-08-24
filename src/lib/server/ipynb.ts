@@ -3,8 +3,10 @@
  *
  * Bridges Cellar's canonical in-memory document (cells with string `source`)
  * and a real nbformat 4.5 notebook on disk. Serialization is deterministic
- * (fixed key order, stable formatting) and runs the clean-on-save policy, so
- * an identical re-run produces a byte-identical file (no git diff).
+ * (keys sorted recursively, 1-space indent, trailing newline - the ecosystem's
+ * own layout; see `stringify` for what is and is not byte-identical to python's
+ * `json.dumps`) and runs the clean-on-save policy, so an identical re-run
+ * produces a byte-identical file (no git diff).
  */
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
