@@ -213,8 +213,15 @@ describe('the tool-activity lines reach the export', () => {
 		const html = render(chatCell(REPLY_WITH_TOOLS));
 		// The export's own stylesheet already dims a blockquote (muted ink, left
 		// rule), which is what makes these annotations subordinate with no new CSS.
-		expect(html).toContain('.cellar-md blockquote{');
-		expect(html).toContain('color: var(--muted)');
+		// Asserted INSIDE that rule's own body: the exported document declares
+		// `color: var(--muted)` in four other rules, so a document-wide check would
+		// pass with the very declaration this pins deleted.
+		const selector = '.cellar-md blockquote{';
+		const ruleStart = html.indexOf(selector);
+		expect(ruleStart).toBeGreaterThan(-1);
+		const rule = html.slice(ruleStart + selector.length, html.indexOf('}', ruleStart));
+		expect(rule).toContain('color: var(--muted)');
+		expect(rule).toMatch(/border-left:\s*\d+px solid var\(--border\)/);
 		// The prose either side of the block is outside it.
 		expect(html).toContain('<p>Let me check.</p>');
 		expect(html).toContain('<p>It defines <code>load</code>.</p>');

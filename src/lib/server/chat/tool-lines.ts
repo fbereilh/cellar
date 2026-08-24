@@ -119,7 +119,12 @@
  * backtick run longer than any inside the target, which is what makes that
  * immunity hold for a target containing backticks too.
  *
- * ## KNOWN, ACCEPTED limitation: an unterminated code fence swallows the line
+ * The `>` and the `\` are raw markdown, so they ARE briefly visible while the
+ * run streams (the live view shows raw text; only the finalize renders it). On a
+ * run that settles `ok` that is transient - but on a failed or cancelled one it
+ * is permanent, which is limitation 2 below rather than a passing detail.
+ *
+ * ## KNOWN, ACCEPTED limitation 1: an unterminated code fence swallows the line
  *
  * These lines are markdown in the same stream as the reply, which is what makes
  * them persist, round-trip and export with it for free (see `run-chat.ts`). The
@@ -131,6 +136,38 @@
  * plainly visible while the run streams - the live view shows raw text, and only
  * the finalize renders markdown. Closing the fence ourselves would corrupt the
  * user's code block, which is worse.
+ *
+ * ## KNOWN, ACCEPTED limitation 2: a FAILED or CANCELLED run keeps them RAW
+ *
+ * On a run that FAILS (`api_error`, `rate_limited`, `unsafe_init`,
+ * `transcript_too_large`, `not_signed_in`, `not_installed`) or is CANCELLED (the
+ * user pressing Stop, an interrupt, a kernel restart or shutdown, the run timing
+ * out), the annotation SYNTAX is what persists. `run.ts`'s finalize is gated on
+ * `status === 'ok'`, so those paths leave the outputs as
+ * `[stream(reply + tool lines), display_data(failure)]` and the stream element
+ * renders as PLAIN TEXT rather than as markdown: the reader sees the leading
+ * `>`, the backticks around the call signature, the trailing `\` hard break
+ * between consecutive lines, and `*(failed)*` / `*(no result)*` as literal
+ * asterisks - permanently, not for the length of the run.
+ *
+ * Accepted, for three reasons. It is PARTLY PRE-EXISTING: a failed run already
+ * persisted its partial reply as raw markdown before this feature, so the
+ * model's own `**bold**` and `##` already showed literally on that path. The
+ * `*(no result)*` line being there AT ALL is the feature working as intended -
+ * on a Stop it is exactly the provenance this exists to give, that a tool ran
+ * and never came back - so only its RENDERING is ever at issue, never its
+ * presence. And it is the ONE path where the syntax is visible for good, which
+ * is precisely why it is written down rather than left to be discovered.
+ *
+ * The eventual fix is to finalize the surviving stream text into markdown BEFORE
+ * appending the failure `display_data`; a follow-up is filed. It is out of scope
+ * here because it changes the persisted shape of EVERY failed chat run (two
+ * `display_data` where there were a `stream` and a `display_data`) and touches
+ * the same no-retract-frame reasoning that makes a capped run skip the finalize,
+ * so it needs its own test pass. EXPLICITLY REJECTED, so nobody re-proposes it:
+ * stripping the `\` hard break on the failure path alone. A joining rule that
+ * differs by OUTCOME is a second convention to maintain forever, bought for a
+ * cosmetic gain on a path that is already degraded.
  */
 
 import { toWorkspaceRel } from '$lib/workspacePath';
