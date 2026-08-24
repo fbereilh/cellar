@@ -157,7 +157,7 @@
 		rawEdits?: Record<string, boolean | undefined>;
 		onSetRawEdit?: (id: string, raw: boolean) => void;
 		/** Lift a rendered code block out of a cell's prose into a new cell below it. */
-		onExtractCode?: (id: string, block: ExtractedCodeBlock) => void;
+		onExtractCode?: (id: string, block: ExtractedCodeBlock) => Promise<boolean>;
 		onActivate?: (id: string, gesture?: CellActivation) => void;
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		onEditorFocus?: (id: string) => void;

@@ -125,7 +125,7 @@
 		/** Lift a rendered code block out of this cell's prose into a new cell below.
 		 *  Fired by the control the decorator hangs on each block; the KEYBOARD route
 		 *  reaches the same notebook function directly (see `$lib/codeBlockExtract`). */
-		onExtractCode?: (id: string, block: ExtractedCodeBlock) => void;
+		onExtractCode?: (id: string, block: ExtractedCodeBlock) => Promise<boolean>;
 		onActivate?: (id: string, gesture?: CellActivation) => void;
 		/** Find-in-page query (Search P4); empty when the find bar is closed / this
 		 *  notebook isn't the searched one. Non-empty drives in-place highlighting. */
@@ -1654,15 +1654,19 @@
 	// (`onCardPointerDown`), so a click here never also moves the selection - and
 	// `stopPropagation` keeps it clear of the rendered-markdown block's own
 	// double-click-to-edit.
-	function onCardClick(e: MouseEvent) {
+	async function onCardClick(e: MouseEvent) {
 		const btn = (e.target as HTMLElement | null)?.closest?.(`[data-testid="${EXTRACT_TESTID}"]`);
 		if (!btn) return;
 		e.preventDefault();
 		e.stopPropagation();
 		const block = readCodeBlock(btn.closest(`[${CODE_BLOCK_ATTR}]`));
 		if (!block) return;
-		onExtractCode?.(cell.id, block);
-		flashExtracted(btn);
+		// Confirm only once the cell really landed. A refused add resyncs the model,
+		// so an optimistic check would sit on a control whose cell is not there - and
+		// would then RENAME it to "click again for another cell", which is a claim
+		// about a cell that was never created. The round trip is a few ms, so the
+		// confirmation still reads as immediate.
+		if (await onExtractCode?.(cell.id, block)) flashExtracted(btn);
 	}
 
 	// Drive highlighting. Reads every dep that changes WHAT is shown (so a surface

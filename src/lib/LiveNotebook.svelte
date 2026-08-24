@@ -2954,11 +2954,20 @@
 	 * notebook format can hold, so there is no `refuseUnsupportedType` gate here:
 	 * `chat` and `raw` are unreachable by construction (see `fenceCellType`).
 	 */
-	async function extractCodeBlock(sourceId: string, block: ExtractedCodeBlock) {
-		if (!findCell(sourceId)) return;
-		const created = await addCell(extractAnchor(sourceId), block.cellType, block.source);
-		extractAnchors.set(sourceId, created.id);
-		return created;
+	async function extractCodeBlock(sourceId: string, block: ExtractedCodeBlock): Promise<boolean> {
+		if (!findCell(sourceId)) return false;
+		try {
+			const created = await addCell(extractAnchor(sourceId), block.cellType, block.source);
+			extractAnchors.set(sourceId, created.id);
+			return true;
+		} catch {
+			// `addCell` has already resynced the model (and named the reason, for the
+			// refusal codes `noticeRefusal` knows). The rejection is caught HERE rather
+			// than left to the caller because both routes are fire-and-forget event
+			// handlers, where an escaping rejection is an unhandled one - and reporting
+			// FALSE is what keeps the control from confirming a cell that never landed.
+			return false;
+		}
 	}
 
 	/**
@@ -2972,7 +2981,7 @@
 	 * reaches nothing useful, and a modified chord that silently does nothing is
 	 * indistinguishable from an unbound one.
 	 */
-	function extractHoveredCodeBlock() {
+	async function extractHoveredCodeBlock() {
 		const el = targetCodeBlock(rootEl);
 		const block = readCodeBlock(el);
 		const sourceId = (el?.closest('[data-cell-id]') as HTMLElement | null)?.dataset.cellId;
@@ -2980,8 +2989,10 @@
 			onNotice?.('Hover a code block in a rendered reply or markdown cell, then press the shortcut to extract it.');
 			return;
 		}
-		void extractCodeBlock(sourceId, block);
-		flashExtracted(el?.querySelector(`[data-testid="${EXTRACT_TESTID}"]`));
+		// Confirm on the block's own control, so the chord and a click leave the same
+		// mark - and only once the cell really landed, so a refused add shows its
+		// reason rather than a check contradicting it.
+		if (await extractCodeBlock(sourceId, block)) flashExtracted(el?.querySelector(`[data-testid="${EXTRACT_TESTID}"]`));
 	}
 
 	/**

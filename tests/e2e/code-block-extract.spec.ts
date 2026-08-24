@@ -336,6 +336,29 @@ test('a repeat inserts AGAIN, and the control says so before the second click', 
 	expect(cells.map(sourceOf)).toEqual([PY_BLOCK, PY_BLOCK]);
 });
 
+test('a REFUSED add confirms NOTHING - no check, and no "click again"', async ({ page }) => {
+	test.setTimeout(120_000);
+	const nb = await openFresh(page, 'extract-refused.ipynb');
+
+	// The control must never claim a cell that did not land. An optimistic check
+	// would also RENAME the control to "click again for another cell" - a permanent
+	// claim about a cell that was never created.
+	await page.route('**/api/cells', (route) =>
+		route.request().method() === 'POST'
+			? route.fulfill({ status: 400, contentType: 'application/json', body: JSON.stringify({ ok: false, reason: 'bad-cell-type', message: 'nope' }) })
+			: route.continue()
+	);
+
+	await blocks(page).nth(PY_AT).hover();
+	await extractBtn(page, PY_AT).click();
+
+	// The refused add resyncs the model, so the reply re-renders and the control is
+	// rebuilt - wait for that to settle, then assert it is still an OFFER.
+	await expect.poll(() => created(nb).length, { timeout: 10_000 }).toBe(0);
+	await expect(extractBtn(page, PY_AT)).toHaveAttribute('aria-label', 'Extract to a new code cell below');
+	await expect(extractBtn(page, PY_AT)).not.toHaveAttribute('data-extracted', 'true');
+});
+
 test('extraction steals no focus and moves no selection', async ({ page }) => {
 	test.setTimeout(120_000);
 	const nb = await openFresh(page, 'extract-focus.ipynb');
