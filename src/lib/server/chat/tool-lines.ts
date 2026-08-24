@@ -81,24 +81,38 @@
  * and carry it into the HTML export precisely when the security boundary did its
  * job.
  *
- * A RELATIVE glob pattern is left VERBATIM, and that asymmetry is deliberate
- * rather than an omission. It is already workspace-relative (the read shapes cwd
- * the child at the root), and a glob is not a path, so putting it through the
+ * A RELATIVE glob pattern is left VERBATIM - it is already workspace-relative
+ * (the read shapes cwd the child at the root), and running it through the
  * `.`/`..` segment normalization a relative PATH gets would silently rewrite a
- * legal pattern: `src/../lib/*.py` would be collapsed, and a bare `..` would
- * become an outside claim about a search that never named a path at all.
+ * legal pattern, collapsing `src/../lib/*.py` to `lib/*.py`. WITH ONE EXCEPTION:
+ * a pattern whose LEADING segment is `..` is an ESCAPE, and it is NAMED like any
+ * other outside path. `pattern` is a Glob-only kind, so a `..` here really is a
+ * traversal and not a regex quantifier; the child's cwd IS the confinement root,
+ * so `../../Users/<name>/secrets/**` resolves outside, is DENIED, and printing it
+ * would leak a username and two levels of layout in exactly the shape - and at
+ * exactly the moment - the absolute rule above exists to prevent. Only a LEADING
+ * escape is named, so an INTERIOR `..` is untouched and no legal glob is
+ * rewritten; the `..` must be a whole SEGMENT, so `..foo/` and `...` are ordinary
+ * patterns and stay verbatim.
  *
  * `Grep`'s pattern, though, is CONTENT and is rendered VERBATIM like a search
  * query - it is NOT path-shaped, and treating it as one was a false claim in the
- * other direction. A `Grep` pattern is a REGEX over file CONTENT, and a regex
- * that merely STARTS WITH A SLASH is not a path: `/api/v1/users`, a
- * `/usr/bin/env` shebang, a slash-delimited regex are all everyday queries, and
- * measured against the workspace each one resolves outside it and rendered
- * `Grep(outside the workspace)` - with NO `(failed)` marker, because the search
- * ran squarely INSIDE and succeeded. That is the same false claim this section
- * exists to remove, produced from the opposite side. Nothing is lost by exempting
- * it: `Grep`'s leak vector is its `path` field, which is path-shaped and always
- * was, so its `pattern` carries no directory to leak.
+ * other direction. A `Grep` pattern is a REGEX over file CONTENT rather than a
+ * path expression, and a regex that merely STARTS WITH A SLASH is not a path:
+ * `/api/v1/users`, a `/usr/bin/env` shebang, a slash-delimited regex are all
+ * everyday queries, and measured against the workspace each one resolved outside
+ * it and rendered `Grep(outside the workspace)` - with NO `(failed)` marker,
+ * because the search ran squarely INSIDE and succeeded. That is the same false
+ * claim this section exists to remove, produced from the opposite side.
+ *
+ * STATED RESIDUAL, since this module's rule is to say only what was verified: a
+ * `Grep` pattern is model-authored text and MAY contain a path literal (the model
+ * reads a file naming `/Users/<name>/data`, then greps for that string), which is
+ * then printed as written into the reply, the `.ipynb` and the export. That is
+ * the same class of exposure a `WebSearch` query already carries, and there is no
+ * fix for it that does not reintroduce the worse false claim above - so it is
+ * accepted and recorded rather than claimed away. `Grep`'s `path` field is its
+ * path-shaped one, and that one IS measured.
  *
  * ## The rendered line
  *
@@ -201,9 +215,9 @@ export interface ChatToolCall {
  *               climbs out of the workspace is NAMED).
  * - `pattern` - a path PATTERN (`Glob`). Absolute: relativized or NAMED, exactly
  *               like a path, because that is where the leak is. Relative: left
- *               VERBATIM, because a glob is not a path and normalizing rewrites
- *               it (`src/../lib/*.py` would be collapsed, a bare `..` would
- *               become an outside claim).
+ *               VERBATIM, because normalizing rewrites a legal glob
+ *               (`src/../lib/*.py` would be collapsed) - EXCEPT a leading `..`
+ *               segment, which is an escape and is NAMED.
  */
 type TargetKind = 'content' | 'path' | 'pattern';
 
@@ -228,10 +242,19 @@ interface TargetField {
  *
  * `path` rides along for `Glob`/`Grep` because a pattern without the directory it
  * ran in is not provenance - `load` says nothing, `load in src` does. It is also
- * `Grep`'s only path-shaped field, which is what makes rendering its `pattern`
- * verbatim cost no provenance and leak no directory.
+ * `Grep`'s only path-shaped field, which is what carries the directory its
+ * `pattern` is not measured for.
+ *
+ * A NULL-PROTOTYPE map, so the allowlist behaves as one for EVERY name: read off
+ * an object literal, a tool called `toString`/`constructor`/`valueOf` resolves to
+ * an INHERITED value and `__proto__` to an object - all truthy, so the
+ * unrecognized-tool guard passes and iterating them throws. That throw would
+ * escape through `onToolCall` into the child's unwrapped stdout listener and take
+ * down the process carrying every kernel websocket, the SSE fan-out and the
+ * in-process MCP server, so the formatter is hardened here exactly as the tracker
+ * below already is against an unfamiliar shape.
  */
-const TOOL_TARGETS: Record<string, readonly TargetField[]> = {
+const TOOL_TARGETS: Record<string, readonly TargetField[]> = Object.assign(Object.create(null), {
 	WebSearch: [{ field: 'query', kind: 'content' }],
 	Read: [{ field: 'file_path', kind: 'path' }],
 	Glob: [
@@ -242,7 +265,7 @@ const TOOL_TARGETS: Record<string, readonly TargetField[]> = {
 		{ field: 'pattern', kind: 'content' },
 		{ field: 'path', kind: 'path' }
 	]
-};
+});
 
 /** What an out-of-workspace path renders as - never the path itself. */
 export const OUTSIDE_WORKSPACE = 'outside the workspace';
@@ -329,10 +352,18 @@ function normalizeRelativePath(value: string): string {
 }
 
 /** Render one field's value according to its declared kind (see `TargetKind`). */
+function escapesWorkspace(value: string): boolean {
+	const segments = value.split(/[/\\]+/);
+	let i = 0;
+	while (i < segments.length && (segments[i] === '' || segments[i] === '.')) i += 1;
+	return segments[i] === '..';
+}
+
 function renderField(value: string, kind: TargetKind, workspace: ChatWorkspaceRef): string {
 	if (kind === 'content') return value;
 	if (isAbsolutePath(value)) return absoluteAgainstWorkspace(value, workspace);
-	return kind === 'pattern' ? value : normalizeRelativePath(value);
+	if (kind !== 'pattern') return normalizeRelativePath(value);
+	return escapesWorkspace(value) ? OUTSIDE_WORKSPACE : value;
 }
 
 /** Collapse whitespace and bound the length; a target is one line, always. */
@@ -347,7 +378,7 @@ function oneLine(value: string): string {
  */
 export function toolCallTarget(call: ChatToolCall, workspace: ChatWorkspaceRef): string | null {
 	const fields = TOOL_TARGETS[call.name];
-	if (!fields) return null;
+	if (!Array.isArray(fields)) return null;
 	const parts: string[] = [];
 	for (const { field, kind } of fields) {
 		const raw = call.input?.[field];

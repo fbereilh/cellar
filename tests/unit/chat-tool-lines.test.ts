@@ -261,11 +261,11 @@ describe('what a line may say', () => {
 		expect(toolCallTarget(call('Grep', { pattern: 'a/./b' }), '/ws')).toBe('a/./b');
 		expect(toolCallTarget(call('Grep', { pattern: '../..' }), '/ws')).toBe('../..');
 		expect(toolCallLine(call('Grep', { pattern: '..' }), '/ws')).not.toContain(OUTSIDE_WORKSPACE);
-		// A relative glob pattern is likewise kept exactly as the model wrote it - a
-		// glob is not a path, so normalizing would rewrite a legal pattern.
+		// A relative glob pattern is likewise kept exactly as the model wrote it -
+		// normalizing would rewrite a legal pattern. The one Glob exception is a
+		// LEADING `..`, which is a real traversal there and is NAMED (see below).
 		expect(toolCallTarget(call('Glob', { pattern: './src/**/*.py' }), '/ws')).toBe('./src/**/*.py');
 		expect(toolCallTarget(call('Glob', { pattern: 'src/../lib/*.py' }), '/ws')).toBe('src/../lib/*.py');
-		expect(toolCallTarget(call('Glob', { pattern: '..' }), '/ws')).toBe('..');
 		// A relative PATH is still normalized - the asymmetry is per FIELD KIND.
 		expect(toolCallTarget(call('Grep', { pattern: '..', path: './src/./sub' }), '/ws')).toBe('.., src/sub');
 		expect(toolCallTarget(call('Grep', { pattern: '..', path: '../out' }), '/ws')).toBe(
@@ -306,6 +306,48 @@ describe('what a line may say', () => {
 		expect(line.length).toBeLessThan(200);
 		expect(line).toContain('…');
 		expect(line).not.toContain('/ws/');
+	});
+
+	it('LEAK: NAMES a relative glob pattern that CLIMBS OUT of the workspace', () => {
+		// The child's cwd IS the confinement root, so a leading `..` resolves outside
+		// and the call is DENIED - and printing it would leak a username and two
+		// levels of layout into the reply, the committed `.ipynb` and the export at
+		// exactly the moment the security boundary did its job.
+		const denied: ChatToolCall = {
+			name: 'Glob',
+			input: { pattern: '../../Users/someone/secrets/**' },
+			outcome: 'failed'
+		};
+		expect(toolCallTarget(denied, '/ws')).toBe(OUTSIDE_WORKSPACE);
+		const line = toolCallLine(denied, '/ws');
+		expect(line).toBe(`\`Glob(${OUTSIDE_WORKSPACE})\` *(failed)*`);
+		expect(line).not.toContain('secrets');
+		expect(line).not.toContain('Users');
+		expect(line).not.toContain('..');
+		// A leading `./` before the escape is the same escape.
+		expect(toolCallTarget(call('Glob', { pattern: './../out/*.py' }), '/ws')).toBe(OUTSIDE_WORKSPACE);
+		expect(toolCallTarget(call('Glob', { pattern: '../*.py' }), '/ws')).toBe(OUTSIDE_WORKSPACE);
+	});
+
+	it('names ONLY a LEADING `..` segment, so no legal glob is rewritten', () => {
+		// Interior `..` is untouched - collapsing it would rewrite a pattern we have
+		// no business rewriting - and `..` must be a whole SEGMENT.
+		expect(toolCallTarget(call('Glob', { pattern: 'src/../lib/*.py' }), '/ws')).toBe('src/../lib/*.py');
+		expect(toolCallTarget(call('Glob', { pattern: '..foo/*.py' }), '/ws')).toBe('..foo/*.py');
+		expect(toolCallTarget(call('Glob', { pattern: '.../*.py' }), '/ws')).toBe('.../*.py');
+		expect(toolCallTarget(call('Glob', { pattern: '..' }), '/ws')).toBe(OUTSIDE_WORKSPACE);
+	});
+
+	it('falls through the allowlist for a tool named after an Object.prototype key', () => {
+		// Read off an object literal these resolve to INHERITED values - all truthy,
+		// so the unrecognized-tool guard passed and iterating them threw, escaping
+		// into the child's unwrapped stdout listener and taking the process with it.
+		for (const name of ['toString', 'constructor', 'valueOf', '__proto__', 'hasOwnProperty']) {
+			const rogue = call(name, { file_path: '/ws/src/a.py', pattern: '**/*.py', content: 'SECRET' });
+			expect(() => toolCallTarget(rogue, '/ws')).not.toThrow();
+			expect(toolCallTarget(rogue, '/ws')).toBeNull();
+			expect(toolCallLine(rogue, '/ws')).toBe(`\`${name}\``);
+		}
 	});
 
 	it('renders an unrecognized tool’s NAME and none of its input', () => {
