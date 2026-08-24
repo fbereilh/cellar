@@ -451,6 +451,106 @@ test('a failed hide that another writer superseded neither reverts nor claims an
 	await expect.poll(() => 'hidden_from_agent' in diskCellar(MD)).toBe(false);
 });
 
+test('a failed hide superseded across a load() refetch still claims nothing', async ({
+	page,
+	request
+}) => {
+	// The generation guard's THIRD carrier: `load()` replaces `cells` wholesale, so it
+	// supersedes every in-flight local write at once and clears the ownership map
+	// rather than bumping per cell. That clear is what made the token minting
+	// load-bearing - counted per cell as `(current ?? 0) + 1`, a cleared map re-issues
+	// the SAME token to the next write, so a failing write that was the cell's first
+	// (the ordinary case) read as still owning a cell another writer had taken. This
+	// drives that exact interleaving through a REAL carrier: a checkpoint restore
+	// publishes `notebook:restored`, which every tab refetches on.
+	//
+	// VERIFIED BY MUTATION: minting the token per cell again -
+	// `agentVisibilitySeq.set(id, (agentVisibilitySeq.get(id) ?? 0) + 1)` - fails the
+	// final assertions with aria-pressed "false" and a notice claiming the cell is
+	// still hidden, over a document that holds it hidden. It passes with the single
+	// monotonic counter restored.
+
+	// Normalize through the SERVER, never a click: the collision needs OUR click to be
+	// this cell's first local write in this component's life, and a click would spend
+	// that first token on the setup.
+	await request.patch(`${baseURL}/api/cells/${RAW}`, {
+		data: { hiddenFromAgent: false, nb: NB, originId: 'other-tab' }
+	});
+	await openNotebook(page); // a fresh component, so the ownership map starts empty
+	const cell = cellEl(page, RAW);
+	const toggle = cell.getByTestId('toggle-agent-hidden');
+	await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+
+	// The state the restore below returns to - taken with the notebook exactly as this
+	// test found it, so the restore also leaves it that way.
+	const created = await request.post(`${baseURL}/api/checkpoints`, {
+		data: { path: NB, action: 'create', label: 'aba-guard' }
+	});
+	expect(created.ok()).toBe(true);
+	const checkpointId = (await created.json()).created.id as string;
+
+	let release: (() => Promise<void>) | null = null;
+	await page.route('**/api/cells/**', async (route) => {
+		const req = route.request();
+		if (req.method() === 'PATCH' && (req.postData() ?? '').includes('hiddenFromAgent') && !release) {
+			release = () =>
+				route.fulfill({ status: 500, contentType: 'application/json', body: '{"ok":false}' });
+			return;
+		}
+		await route.continue();
+	});
+
+	try {
+		await toggle.click();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		await expect.poll(() => release !== null).toBe(true);
+
+		// Now the carrier. Waiting for the toggle to fall BACK to "false" is what makes
+		// the interleaving deterministic rather than hoped-for: only `load()` can undo
+		// the optimistic hide (it replaces `cells` with the checkpoint's visible RAW
+		// cell), so observing it proves the refetch landed and therefore that the map
+		// was cleared. Sequencing matters - a foreign event applied BEFORE the clear
+		// mints a distinct token even under the broken form, and the bug would hide.
+		const restored = await request.post(`${baseURL}/api/checkpoints`, {
+			data: { path: NB, action: 'restore', id: checkpointId, originId: 'other-tab' }
+		});
+		expect(restored.ok()).toBe(true);
+		await expect(toggle).toHaveAttribute('aria-pressed', 'false', { timeout: 15_000 });
+
+		// An agent (or another tab) takes the cell while our write is still in flight.
+		// Its arrival is directly observable here - the restore put the toggle back to
+		// "false", so it flipping to "true" IS the event being applied - which is why
+		// this needs none of the marker-cell indirection its sibling test does.
+		const foreign = await request.patch(`${baseURL}/api/cells/${RAW}`, {
+			data: { hiddenFromAgent: true, nb: NB, originId: 'other-tab' }
+		});
+		expect(foreign.ok()).toBe(true);
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true', { timeout: 15_000 });
+
+		// Only now does OUR write fail. `route.fulfill` resolves when the response is
+		// dispatched, not when the page's fetch has settled, and both assertions below
+		// already hold at t=0 - so without waiting for the page to receive the 500 they
+		// would pass on their first poll whatever the code did.
+		const failed = page.waitForResponse(
+			(r) => r.url().includes(`/api/cells/${RAW}`) && r.request().method() === 'PATCH'
+		);
+		await release!();
+		await failed;
+		await page.waitForTimeout(300); // the handler microtask that would revert
+
+		// The document holds the cell HIDDEN, so nothing may show it or say otherwise.
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		await expect(page.getByTestId('app-notice')).toHaveCount(0);
+		expect(diskCellar(RAW).hidden_from_agent).toBe(true);
+	} finally {
+		await page.unroute('**/api/cells/**');
+	}
+
+	// leave the shared notebook as found
+	await setToggle(cell, 'toggle-agent-hidden', false);
+	await expect.poll(() => 'hidden_from_agent' in diskCellar(RAW)).toBe(false);
+});
+
 test('every control stays reachable inside the card when the row is narrow', async ({ page }) => {
 	await openNotebook(page);
 	const cell = cellEl(page, CODE);

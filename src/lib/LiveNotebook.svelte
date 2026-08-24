@@ -2431,10 +2431,23 @@
 	 * wrote last in THIS tab's session, not anything the `.ipynb` records. Entries
 	 * are deliberately not pruned on delete, for `pinSeq`'s own reason - a deletion
 	 * would let a stale generation match a fresh one.
+	 *
+	 * The token is drawn from ONE monotonically increasing counter for the life of
+	 * this component, so it is globally unique and the map is per-cell only in WHICH
+	 * cell a token names - never in how the token is counted. That is what makes
+	 * `load()`'s wholesale `clear()` safe: minted per cell as `(current ?? 0) + 1`, a
+	 * cleared map re-issues `1` to the very next write, colliding with the token an
+	 * in-flight write already captured whenever that write was the cell's first - the
+	 * common case, not an exotic one. The failed write then read as still owning a
+	 * cell another writer had taken, reverted over the server's newer value and
+	 * announced the OPPOSITE of what the document holds: exactly the false-concealment
+	 * claim this guard exists to prevent, reached through the one carrier that
+	 * supersedes every in-flight write at once.
 	 */
+	let agentVisibilityWrite = 0;
 	const agentVisibilitySeq = new Map<string, number>();
 	function bumpAgentVisibilitySeq(id: string) {
-		agentVisibilitySeq.set(id, (agentVisibilitySeq.get(id) ?? 0) + 1);
+		agentVisibilitySeq.set(id, ++agentVisibilityWrite);
 	}
 
 	/**
