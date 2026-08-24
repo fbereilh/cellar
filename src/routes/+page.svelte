@@ -1647,6 +1647,7 @@
 					{activeFilePath}
 					{activeNotebookPath}
 					{fsRefreshSignal}
+					nbdev={data.nbdev}
 					onRefreshVars={refreshVariables}
 					onRefreshKernel={refreshKernel}
 					onInterruptKernel={interruptKernel}

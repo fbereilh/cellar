@@ -50,13 +50,13 @@
  * `bin/cellar.js` can import it exactly like `venv.js`/`runtime.js`; it is in
  * `package.json` `files` for the same reason).
  *
- * Being text-surgical means the scanner IS the safety property: it has to know
- * what is structure and what is a value, in both directions - an open
- * multi-line string AND an open bracket (see `parseTomlDoc`). Every structural
- * decision reads a string-masked copy of the line, never the raw text, because
- * getting this wrong does not surface as a parse error; it surfaces as a config
- * that quietly lost a key, gained a duplicate one, or had text rewritten inside
- * the user's own string while the real key kept its stale value.
+ * Being text-surgical means the SCANNER is the safety property - and it does not
+ * live here: `./toml.js` owns it, shared with the nbdev `pyproject.toml` writer
+ * so the two can never come to read one file differently. Its header owns the
+ * value-vs-structure rules (an open multi-line string AND an open bracket; every
+ * structural decision read off a string-masked line) and what getting them wrong
+ * costs, which is never a parse error - it is a config that quietly lost a key,
+ * gained a duplicate one, or had text rewritten inside the user's own string.
  *
  * ## The running-cellar dependency
  *
@@ -70,6 +70,17 @@
 import { join } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { writeFileAtomic } from './write-file-atomic.js';
+import {
+	appendTomlTable,
+	editTable,
+	findTable,
+	otherFormLine,
+	parseStringArray,
+	parseTomlDoc,
+	readAssignment,
+	samePath,
+	unquote
+} from './toml.js';
 
 /**
  * @typedef {Object} HarnessResult
@@ -415,349 +426,6 @@ function tomlBlock(args) {
 	return [`[${TOML_TABLE.join('.')}]`, ...tomlKeys(args).map((k) => k.text)];
 }
 
-/**
- * Walk one line, tracking TOML string state so structural characters inside a
- * string or a comment are never mistaken for syntax.
- *
- * `state` carries an OPEN multi-line string delimiter (`"""` / `'''`) across
- * lines — the reason a naive line scan cannot be trusted: a multi-line string
- * may contain text that looks exactly like a `[table]` header. Returns the
- * index where a real comment starts (or null), the state to carry forward,
- * `malformed` for an unterminated single-line string (a file we must not edit),
- * and `masked`.
- *
- * `masked` is the same line with every string span AND the comment blanked to
- * spaces, same length, so an index into one indexes the other. It is what makes
- * "is this character structure?" answerable by a plain scan: every structural
- * decision downstream (a `[`/`]` depth count, the `=` that opens a value) reads
- * `masked`, never the raw text - counting a `[` that lives inside a string is
- * exactly how a value's span used to run away and swallow the keys after it.
- */
-function scanLine(line, state) {
-	let i = 0;
-	// Code UNITS, not code points: every index here comes from `indexOf`/a `[i]`
-	// walk over `line`, so a surrogate pair must not shift `masked` out of step.
-	const chars = line.split('');
-	const blank = (from, to) => {
-		for (let k = Math.max(0, from); k < to && k < chars.length; k++) chars[k] = ' ';
-	};
-	const out = (commentAt, nextState, malformed) => ({
-		commentAt,
-		state: nextState,
-		malformed,
-		masked: chars.join('')
-	});
-	if (state) {
-		const idx = line.indexOf(state);
-		if (idx === -1) {
-			blank(0, line.length);
-			return out(null, state, false);
-		}
-		blank(0, idx + state.length);
-		i = idx + state.length;
-		state = null;
-	}
-	while (i < line.length) {
-		const c = line[i];
-		if (c === '#') {
-			blank(i, line.length);
-			return out(i, state, false);
-		}
-		if (c === '"' || c === "'") {
-			const triple = line.slice(i, i + 3);
-			if (triple === '"""' || triple === "'''") {
-				const close = line.indexOf(triple, i + 3);
-				if (close === -1) {
-					blank(i, line.length);
-					return out(null, triple, false);
-				}
-				blank(i, close + 3);
-				i = close + 3;
-				continue;
-			}
-			let j = i + 1;
-			let closed = false;
-			while (j < line.length) {
-				if (c === '"' && line[j] === '\\') {
-					j += 2;
-					continue;
-				}
-				if (line[j] === c) {
-					closed = true;
-					break;
-				}
-				j++;
-			}
-			if (!closed) {
-				blank(i, line.length);
-				return out(null, state, true);
-			}
-			blank(i, j + 1);
-			i = j + 1;
-			continue;
-		}
-		i++;
-	}
-	return out(null, state, false);
-}
-
-/** Net `[` minus `]` over already-masked code - structure only, never a string. */
-function bracketDelta(masked) {
-	let d = 0;
-	for (const c of masked) {
-		if (c === '[') d++;
-		else if (c === ']') d--;
-	}
-	return d;
-}
-
-/** Strip a quoted TOML key/value token to its text; plain tokens pass through. */
-function unquote(tok) {
-	const t = tok.trim();
-	if (t.length >= 2 && ((t[0] === '"' && t.at(-1) === '"') || (t[0] === "'" && t.at(-1) === "'"))) {
-		const inner = t.slice(1, -1);
-		return t[0] === '"' ? inner.replace(/\\(.)/g, '$1') : inner;
-	}
-	return t;
-}
-
-/** Split a dotted TOML key path on `.` outside quotes, or null if malformed. */
-function splitDotted(text) {
-	const parts = [];
-	let cur = '';
-	let quote = null;
-	for (let i = 0; i < text.length; i++) {
-		const c = text[i];
-		if (quote) {
-			cur += c;
-			if (c === '\\' && quote === '"') {
-				if (i + 1 < text.length) cur += text[++i];
-				continue;
-			}
-			if (c === quote) quote = null;
-			continue;
-		}
-		if (c === '"' || c === "'") {
-			quote = c;
-			cur += c;
-			continue;
-		}
-		if (c === '.') {
-			parts.push(cur);
-			cur = '';
-			continue;
-		}
-		cur += c;
-	}
-	if (quote) return null;
-	parts.push(cur);
-	const out = parts.map((p) => unquote(p));
-	return out.every((p) => p.length > 0) ? out : null;
-}
-
-/**
- * Parse a `[table]` / `[[array.of.tables]]` header from a comment-stripped
- * line. Returns `{ key, isArray }`, null when the line is not a header, or
- * `'malformed'` when it opens like one but does not close cleanly.
- */
-function parseTableHeader(code) {
-	const t = code.trim();
-	if (!t.startsWith('[')) return null;
-	const isArray = t.startsWith('[[');
-	const open = isArray ? 2 : 1;
-	// Find the closing bracket(s) outside any quoted key segment.
-	let quote = null;
-	let end = -1;
-	for (let i = open; i < t.length; i++) {
-		const c = t[i];
-		if (quote) {
-			if (c === '\\' && quote === '"') {
-				i++;
-				continue;
-			}
-			if (c === quote) quote = null;
-			continue;
-		}
-		if (c === '"' || c === "'") {
-			quote = c;
-			continue;
-		}
-		if (c === ']') {
-			end = i;
-			break;
-		}
-	}
-	if (end === -1) return 'malformed';
-	const close = isArray ? t.slice(end, end + 2) : t.slice(end, end + 1);
-	if (close !== (isArray ? ']]' : ']')) return 'malformed';
-	if (t.slice(end + close.length).trim() !== '') return 'malformed';
-	const key = splitDotted(t.slice(open, end).trim());
-	return key ? { key, isArray } : 'malformed';
-}
-
-/** Parse a `key = …` / `a.b.c = …` line's key path, or null if it is not one. */
-function parseKeyPath(code) {
-	let quote = null;
-	for (let i = 0; i < code.length; i++) {
-		const c = code[i];
-		if (quote) {
-			if (c === '\\' && quote === '"') {
-				i++;
-				continue;
-			}
-			if (c === quote) quote = null;
-			continue;
-		}
-		if (c === '"' || c === "'") {
-			quote = c;
-			continue;
-		}
-		if (c === '=') {
-			const raw = code.slice(0, i).trim();
-			return raw ? splitDotted(raw) : null;
-		}
-	}
-	return null;
-}
-
-/**
- * Structural scan of a TOML document: every table span, and every key with the
- * table it belongs to AND the span of its value. `malformed` means we could not
- * read it with confidence, and the caller must refuse to edit rather than guess.
- *
- * The scan is the ONE place that decides what is structure and what is a value,
- * and it must track BOTH kinds of continuation to do so - an open multi-line
- * string, and an open bracket. Anything inside either is data: `[1, 2]` as an
- * element of a multi-line array is not a table header, and a `command = "…"` line
- * inside a `"""…"""` block is not an assignment. Reading those as structure is
- * not a cosmetic mistake - it truncated the enclosing table's span (so a key that
- * IS present read as missing and got inserted a second time, i.e. invalid TOML)
- * and it aimed a rewrite at text inside the user's own string while leaving the
- * real key untouched. So a key is recorded with `valueFrom`/`last` here, once,
- * rather than re-scanned later by whoever wants to read it.
- */
-/**
- * The line ending a file predominantly uses. The writer preserves every line it
- * does not touch verbatim, so this decides only what an INSERTED line ends with:
- * emitting LF into a CRLF config left mixed endings, turning a two-line edit into
- * a diff over the whole file - the opposite of what this writer promises.
- */
-function dominantEol(text) {
-	const crlf = (text.match(/\r\n/g) ?? []).length;
-	const lf = (text.match(/\n/g) ?? []).length - crlf;
-	return crlf > lf ? '\r\n' : '\n';
-}
-
-function parseTomlDoc(text) {
-	const lines = text.split('\n');
-	// Lines keep their own terminator bytes (a CRLF file's lines each end in '\r'),
-	// so an untouched line rejoins byte-identically. Only the lines this writer
-	// INSERTS need to be told which ending to wear - see `eol`.
-	const eol = dominantEol(text);
-	const codes = [];
-	const tables = [];
-	const keys = [];
-	let state = null;
-	let malformed = false;
-	let depth = 0;
-	/** The key whose value is still open across lines; its `last` closes it. */
-	let pending = null;
-	let current = { key: [], isArray: false, start: 0, end: lines.length };
-	for (let i = 0; i < lines.length; i++) {
-		const r = scanLine(lines[i], state);
-		if (r.malformed) malformed = true;
-		const wasOpen = state !== null;
-		state = r.state;
-		const code = r.commentAt == null ? lines[i] : lines[i].slice(0, r.commentAt);
-		const maskedCode = r.commentAt == null ? r.masked : r.masked.slice(0, r.commentAt);
-		codes.push(code);
-		// Was this line's start already inside a multi-line value? Decide BEFORE
-		// folding this line's own brackets in, or a value's closing line would look
-		// like structure.
-		const inValue = depth > 0;
-		depth += bracketDelta(maskedCode);
-		if (depth < 0) {
-			// More `]` than `[`: we are not reading this file correctly.
-			malformed = true;
-			depth = 0;
-		}
-		// A value is closed once neither kind of continuation is open - a bracket
-		// depth back at 0 AND no multi-line string still running.
-		if (pending && depth === 0 && state === null) {
-			pending.last = i;
-			pending = null;
-		}
-		// A line that continues — or closes — an open multi-line string carries no
-		// structure we need: a table header is never legal there, and the tail after
-		// a closing delimiter can only finish a value. Skip it conservatively.
-		if (wasOpen || inValue) continue;
-		if (code.trim() === '') continue;
-		const hdr = parseTableHeader(code);
-		if (hdr === 'malformed') {
-			malformed = true;
-			continue;
-		}
-		if (hdr) {
-			current.end = i;
-			tables.push(current);
-			current = { key: hdr.key, isArray: hdr.isArray, start: i, end: lines.length };
-			continue;
-		}
-		const path = parseKeyPath(code);
-		if (path) {
-			// The `=` is located on the MASKED line, so a quoted key containing one
-			// (`"a=b" = 1`) cannot be mistaken for the assignment.
-			const eq = maskedCode.indexOf('=');
-			const entry = { table: current.key, path, line: i, valueFrom: eq + 1, last: i };
-			keys.push(entry);
-			if (depth > 0 || state) pending = entry;
-		}
-	}
-	tables.push(current);
-	// An unterminated multi-line string, or a value whose brackets never closed:
-	// either way the tail of this file is not what we think it is.
-	if (state || depth !== 0 || pending) malformed = true;
-	return { lines, codes, tables, keys, malformed, eol };
-}
-
-const samePath = (a, b) => a.length === b.length && a.every((s, i) => s === b[i]);
-
-/** Parse a bracketed TOML array of strings, or null when it is anything else. */
-function parseStringArray(text) {
-	const t = text.trim();
-	if (!t.startsWith('[') || !t.endsWith(']')) return null;
-	const inner = t.slice(1, -1).trim();
-	if (inner === '') return [];
-	const out = [];
-	for (const part of inner.split(',')) {
-		const p = part.trim();
-		if (p === '') continue;
-		if (!/^(".*"|'.*')$/s.test(p)) return null;
-		out.push(unquote(p));
-	}
-	return out;
-}
-
-/**
- * Read a `key = value` assignment out of a table, using the span `parseTomlDoc`
- * already resolved (so a value continuing onto later lines - `args = [\n "mcp"\n]`
- * - is joined, and text that merely LOOKS like this key inside a multi-line
- * string is not a candidate at all: it was never recorded as a key).
- */
-function readAssignment(doc, table, key) {
-	const entry = doc.keys.find(
-		(k) =>
-			k.line > table.start &&
-			k.line < table.end &&
-			samePath(k.table, table.key) &&
-			k.path.length === 1 &&
-			k.path[0] === key
-	);
-	if (!entry) return null;
-	let value = doc.codes[entry.line].slice(entry.valueFrom);
-	for (let i = entry.line + 1; i <= entry.last; i++) value += '\n' + doc.codes[i];
-	return { first: entry.line, last: entry.last, value: value.trim() };
-}
 
 /**
  * Classify what a Codex config already says about the cellar MCP server:
@@ -770,21 +438,16 @@ function readAssignment(doc, table, key) {
 function codexState(text) {
 	const doc = parseTomlDoc(text);
 	if (doc.malformed) return { kind: 'malformed', doc };
-	const table = doc.tables.find((t) => !t.isArray && samePath(t.key, TOML_TABLE));
+	const table = findTable(doc, TOML_TABLE);
 	if (table) return { kind: 'table', doc, table };
-	for (const k of doc.keys) {
-		const full = [...k.table, ...k.path];
-		// Either this key IS (or is under) `mcp_servers.cellar` - an inline table or a
-		// dotted key - or it is a PREFIX of it, i.e. `mcp_servers` itself assigned as a
-		// value (`mcp_servers = { cellar = … }`). The prefix case has to refuse too:
-		// TOML forbids extending an inline table, so appending `[mcp_servers.cellar]`
-		// under it would leave the whole file unparseable, taking every other setting
-		// and every other MCP server down with it.
-		const shared = Math.min(full.length, TOML_TABLE.length);
-		if (samePath(full.slice(0, shared), TOML_TABLE.slice(0, shared))) {
-			return { kind: 'other-form', doc, line: k.line };
-		}
-	}
+	// Either a key IS (or is under) `mcp_servers.cellar` - an inline table or a
+	// dotted key - or it is a PREFIX of it, i.e. `mcp_servers` itself assigned as a
+	// value (`mcp_servers = { cellar = … }`). Both refuse: we detect them so we
+	// never write a DUPLICATE, and TOML forbids extending an inline table, so
+	// appending `[mcp_servers.cellar]` under one would leave the whole file
+	// unparseable, taking every other setting and every other MCP server with it.
+	const line = otherFormLine(doc, TOML_TABLE);
+	if (line !== null) return { kind: 'other-form', doc, line };
 	return { kind: 'absent', doc };
 }
 
@@ -798,39 +461,14 @@ function tableMatches(doc, table, args = SERVER_ARGS) {
 
 /** Rewrite `command`/`args` inside the existing table, leaving all else intact. */
 function rewriteTable(doc, table, args) {
-	const lines = [...doc.lines];
-	// An inserted line wears the file's own ending; `lines` are joined with '\n'
-	// and each already carries its own '\r', so untouched lines are byte-identical.
-	const nl = (text) => (doc.eol === '\r\n' ? text + '\r' : text);
-	// Replace from the bottom up so an earlier edit cannot shift a later index.
-	const edits = tomlKeys(args).map((spec) => ({ ...spec, found: readAssignment(doc, table, spec.key) }));
-	for (const e of [...edits].sort((a, b) => (b.found?.first ?? -1) - (a.found?.first ?? -1))) {
-		// A key whose value already says what Cellar would write is LEFT ALONE. The
-		// splice replaces whole physical lines, so rewriting it would destroy that
-		// line's own trailing comment (and its spacing) to change nothing - the
-		// byte-preservation this writer exists for, applied per key rather than per
-		// table.
-		if (e.found && !e.matches(e.found.value)) {
-			lines.splice(e.found.first, e.found.last - e.found.first + 1, nl(e.text));
-		}
-	}
-	// A table missing a key entirely (hand-written, or Cellar's shape changed):
-	// insert right after the header so the table stays self-describing.
-	const missing = edits.filter((e) => !e.found).map((e) => nl(e.text));
-	if (missing.length) lines.splice(table.start + 1, 0, ...missing);
-	return lines.join('\n');
-}
-
-/**
- * Append the canonical table, separated by exactly one blank line, in the file's
- * own line ending (an LF block appended to a CRLF config is a whole-file diff).
- */
-function appendTable(text, args) {
-	const eol = dominantEol(text);
-	let body = text;
-	if (body !== '' && !body.endsWith('\n')) body += eol;
-	if (body.trim() !== '' && !body.endsWith(eol + eol)) body += eol;
-	return body + tomlBlock(args).join(eol) + eol;
+	// A key whose value already says what Cellar would write is LEFT ALONE (`text:
+	// null`) rather than spliced to change nothing - `editTable` owns why.
+	const edits = tomlKeys(args).map((spec) => {
+		const found = readAssignment(doc, table, spec.key);
+		if (!found) return { replace: null, text: spec.text };
+		return { replace: found, text: spec.matches(found.value) ? null : spec.text };
+	});
+	return editTable(doc, table, edits);
 }
 
 /**
@@ -876,7 +514,7 @@ function writeTomlConfig(file, args, preserveExisting) {
 		next = rewriteTable(state.doc, state.table, args);
 		status = 'updated';
 	} else {
-		next = appendTable(existing, args);
+		next = appendTomlTable(existing, tomlBlock(args));
 		status = 'wrote';
 	}
 	if (next === existing) return { status: 'already', message: 'already configured' };

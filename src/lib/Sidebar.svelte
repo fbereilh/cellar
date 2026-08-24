@@ -5,6 +5,7 @@
 	import Environment from '$lib/Environment.svelte';
 	import Checkpoints from '$lib/Checkpoints.svelte';
 	import GitNotebooks from '$lib/GitNotebooks.svelte';
+	import NbdevNotice from '$lib/NbdevNotice.svelte';
 	import FileTreeNode from '$lib/FileTreeNode.svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import { kernelStatusLabel, kernelDotClass, formatMemory } from '$lib/kernelBadge';
@@ -25,6 +26,7 @@
 	import type { TreeNode } from '$lib/server/fstree';
 	import type { GitStatusLetter } from '$lib/server/git';
 	import type { KernelInfo, KernelCard } from '$lib/kernelBadge';
+	import type { NbdevState } from '$lib/nbdev';
 	import type { CellarFileOps, FileClipboard, NewEntry, FileDescriptor } from '$lib/fileOps';
 	import type { NotebookRef } from '$lib/types';
 
@@ -121,6 +123,8 @@
 		onOpenFindBar?: () => void;
 		onFsChange?: (change: FsChange) => void;
 		activeNotebookPath?: string | null;
+		/** SSR-seeded nbdev project state - see `$lib/nbdev`. */
+		nbdev?: NbdevState;
 	}
 
 	let {
@@ -172,6 +176,7 @@
 		onScrollToCell,
 		onOpenFindBar,
 		onFsChange,
+		nbdev = { kind: 'none' },
 		// The active notebook (workspace-relative path, or null). Drives the History
 		// (checkpoints) panel, which is per-notebook.
 		activeNotebookPath = null
@@ -1559,6 +1564,11 @@
 
 <aside class="flex h-full w-full flex-col overflow-hidden bg-base-200 text-base-content" data-testid="sidebar">
 	<div class="flex-1 overflow-y-auto">
+		<!-- Above the sections, not inside one: the nbdev hazard is a fact about the
+		     WORKSPACE rather than about any notebook or panel, and a warning behind a
+		     collapsed section is a warning nobody reads. Renders nothing at all unless
+		     it applies, so a project that is not nbdev's pays no chrome. -->
+		<NbdevNotice initial={nbdev} {fsRefreshSignal} />
 		{#each sectionOrder as key (key)}
 			<section
 				class="relative border-b border-base-300 {dragKey === key ? 'opacity-40' : ''}"
