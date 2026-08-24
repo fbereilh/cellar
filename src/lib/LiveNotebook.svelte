@@ -3232,7 +3232,7 @@
 		scheduleStaleness(); // reordering changes the preceding-definer graph
 	}
 
-	/** Change every selected cell's type in one action (`m` / `y` / `r` / the palette). */
+	/** Change every selected cell's type in one action (`m` / `y` / `r` / `t` / the palette). */
 	async function setTypeSelection(cellType: LogicalCellType) {
 		const ids = selectionTargets();
 		if (ids.length <= 1) {
@@ -3674,6 +3674,7 @@
 		'to-markdown': () => setTypeSelection('markdown'),
 		'to-code': () => setTypeSelection('code'),
 		'to-raw': () => setTypeSelection('raw'),
+		'to-chat': () => setTypeSelection('chat'),
 		'run-insert-below': () => runAndInsertBelow(),
 		'delete-cell': () => deleteSelection(),
 		'undo-delete': () => undoDelete(),
