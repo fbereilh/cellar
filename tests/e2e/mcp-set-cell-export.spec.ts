@@ -173,7 +173,7 @@ test('an agent names a target, marks cells, and a real .py module appears - the 
 	}
 
 	// --- 4. the human's open page reflects it live, no reload ------------------
-	await expect(page.getByTestId('export-badge')).toHaveCount(2);
+	await expect(page.locator('[data-testid="toggle-export"][aria-pressed="true"]')).toHaveCount(2);
 	await expect(page.getByTestId('export-count')).toHaveText(/2 cells marked/);
 	await expect(page.getByTestId('export-target-input')).toHaveValue('lib/circles.py');
 	await shot(page, '02-after-agent-marked.png');
