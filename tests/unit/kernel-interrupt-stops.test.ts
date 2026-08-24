@@ -146,9 +146,23 @@ const h = vi.hoisted(() => {
 			// A sidecar that cannot be reached at all - the ONE thing `kernel_unavailable`
 			// is allowed to mean. `execute()` throws before it ever has a kernel in hand.
 			if (h.startFails) throw new Error('sidecar unreachable');
+			// A start that never answers on its own: `mgr.startNew` is an unbounded
+			// `fetch`, so a black-holed sidecar parks here indefinitely. The test decides
+			// when (and how) it ends, which is what proves the interrupt's bound is real
+			// rather than incidental.
+			if (h.startHangs) {
+				return await new Promise<ReturnType<typeof makeFakeKernel>>((resolve, reject) => {
+					h.releaseStart = (action) =>
+						action === 'reject'
+							? reject(new Error('the sidecar refused the start'))
+							: resolve(makeFakeKernel());
+				});
+			}
 			return makeFakeKernel();
 		}),
 		startFails: false,
+		startHangs: false,
+		releaseStart: null as null | ((action: 'resolve' | 'reject') => void),
 		lastKernel: null as ReturnType<typeof makeFakeKernel> | null,
 		lastHanging: null as ReturnType<typeof makeFuture> | null,
 		hanging: [] as ReturnType<typeof makeFuture>[],
@@ -219,6 +233,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const GRACE_MS = 120;
 /** The bound on the interrupt REST POST, likewise mirrored from the env below. */
 const SIGNAL_TIMEOUT_MS = 80;
+/** The bound on waiting for a kernel that is still starting, likewise mirrored. */
+const START_TIMEOUT_MS = 80;
 
 function newCell(source: string): string {
 	return nbmod.addCell(null, 'code', abs(), null, source).id;
@@ -255,6 +271,7 @@ beforeAll(async () => {
 	process.env.CELLAR_KERNEL_IDLE_TIMEOUT_MS = '60000';
 	process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = String(GRACE_MS);
 	process.env.CELLAR_KERNEL_INTERRUPT_SIGNAL_TIMEOUT_MS = String(SIGNAL_TIMEOUT_MS);
+	process.env.CELLAR_KERNEL_INTERRUPT_START_TIMEOUT_MS = String(START_TIMEOUT_MS);
 	nbmod = await import('../../src/lib/server/notebook');
 	queue = await import('../../src/lib/server/run-queue');
 	runmod = await import('../../src/lib/server/run');
@@ -271,6 +288,8 @@ beforeEach(() => {
 	h.lastHanging = null;
 	h.kernelObeysInterrupt = false;
 	h.startFails = false;
+	h.startHangs = false;
+	h.releaseStart = null;
 	h.interruptSignalFails = false;
 	h.maxLive = h.live; // measure only what THIS test puts on the wire
 	h.probe = () => ({ execution_state: 'busy' });
@@ -464,6 +483,92 @@ describe('the escalation does not depend on the signal that is failing', () => {
 		const res = await kernelmod.interruptKernel(nb);
 		// A failed signal is not, by itself, something stopped.
 		expect(res.stopped).toBe('idle');
+	});
+});
+
+/**
+ * The same rule one step earlier: REACHING the kernel is an unbounded operation too.
+ * A cached `startPromise` is `mgr.startNew` (an unbounded `fetch`) followed by
+ * `initKernel`'s injections (an unbounded `await future.done`), so awaiting it
+ * outright put the whole promise back behind exactly the shape the signal bound was
+ * added to close - and worse, because nothing downstream even ran: the route and the
+ * MCP tool never returned at all.
+ *
+ * Each case gets its OWN notebook: a kernel that is still starting is a fact about a
+ * fresh Map entry, and the suite's main notebook has a warm kernel whose
+ * `startPromise` is long since resolved.
+ */
+describe('reaching the kernel is bounded too', () => {
+	/** Park a run on a notebook whose kernel start is being held open. */
+	function parkRunOnStartingKernel(nbName: string) {
+		const nb = nbmod.resolveNotebookPath(nbName);
+		nbmod.createNotebook(nbName, null, { focus: false });
+		h.startHangs = true;
+		const cellId = nbmod.addCell(null, 'code', nb, null, 'x = 1').id;
+		const ticket = queue.enqueueRun({ nb, cellId, actor: 'user', source: 'x = 1' });
+		if (ticket.duplicate) throw new Error('unreachable: fresh ticket expected');
+		const runP = ticket
+			.wait()
+			.then(() =>
+				runmod
+					.executeCellRun({ nb, cellId, actor: 'user', source: 'x = 1' })
+					.finally(() => ticket.done())
+			);
+		return { nb, cellId, runP };
+	}
+
+	it('a kernel that never finishes STARTING does not hang the interrupt', async () => {
+		const { nb, cellId, runP } = parkRunOnStartingKernel('interrupt-starting.ipynb');
+		await until(() => queue.queueStateFor(nb).running?.cellId === cellId, 'the run to hold the slot');
+		await until(() => h.releaseStart != null, 'the kernel start to be requested');
+
+		const started = Date.now();
+		// THE REGRESSION: `await nbKernel.startPromise` was unbounded, so this never
+		// returned - `/api/kernel/interrupt` and the MCP tool hung forever while the
+		// cell read RUNNING.
+		const res = await kernelmod.interruptKernel(nb);
+		expect(Date.now() - started).toBeLessThan(START_TIMEOUT_MS + SIGNAL_TIMEOUT_MS + GRACE_MS);
+
+		// HONESTY: it never reached a kernel, so it reports only what it can see - a
+		// booting one, with no id and nothing of ours running IN it. It may not claim
+		// `forced`/`forced_no_signal`, which assert a run this call force-settled: a run
+		// registers its abort handle only once `getKernel` has resolved, so there was
+		// nothing here to settle. (Stated residual: that parked run keeps the queue slot
+		// until the start settles on its own - it is reachable by no abort path, which
+		// is a fact about `execute()`'s entry, not something this bound can repair.)
+		expect(res.status).toBe('starting');
+		expect(res.id).toBe(null);
+		expect(res.stopped).toBe('idle');
+
+		// Abandoning the wait broke nothing: the start still completes (it is work we
+		// want finished, which is why it is abandoned rather than cancelled) and the run
+		// parked on it runs and frees the slot.
+		h.releaseStart!('resolve');
+		const run = await runP;
+		expect(run.status).toBe('ok');
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+	});
+
+	it('a start that REJECTS is escalated on, never thrown out of the interrupt', async () => {
+		const { nb, cellId, runP } = parkRunOnStartingKernel('interrupt-start-fails.ipynb');
+		await until(() => queue.queueStateFor(nb).running?.cellId === cellId, 'the run to hold the slot');
+		await until(() => h.releaseStart != null, 'the kernel start to be requested');
+
+		// The other half of "can fail or hang": a sidecar that refuses the start. That
+		// rejection propagated straight out of `interruptKernel`, so the caller got an
+		// exception instead of a verdict and the escalation was skipped entirely.
+		const interruptP = kernelmod.interruptKernel(nb);
+		await sleep(10);
+		h.releaseStart!('reject');
+
+		const res = await interruptP;
+		expect(res.stopped).toBe('idle');
+		expect(res.id).toBe(null);
+
+		// The run's own owner still frees its slot through its existing `finally`.
+		const run = await runP;
+		expect(run.status).toBe('error');
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
 	});
 });
 
