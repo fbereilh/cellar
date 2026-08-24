@@ -859,6 +859,12 @@ spec files at a time. Install its browser once with `npx playwright install chro
   `.ipynb` (app menu → **Convert to .ipynb**) if you need one. The same limit applies to raw
   in the other direction: **Save as .py** writes a raw cell out as code, so a Quarto notebook
   exported that way loses its frontmatter cell's type.
+- **A stopped or failed chat reply shows `>`, backticks and `*asterisks*` above the
+  answer** - when you press Stop, or the reply cannot finish (a rate limit, a timeout, a
+  sign-in problem), the lines recording which tools the reply used keep the punctuation
+  they are written with - a leading `>`, backticks around each call, a stray `\` - instead
+  of the tidy dimmed lines a finished reply shows. Only their appearance differs: those
+  lines and the part of the answer that arrived are all there, and nothing was lost.
 - **Find matched a cell but nothing is highlighted in it** - the match is inside a cell
   whose content is currently hidden - a cell collapsed to its header row, or a source
   match in a cell whose code is hidden by report view. Those matches are still counted,
