@@ -104,16 +104,79 @@ function renderAll(names: string[]): string {
 	return `__all__ = [${names.map((n) => `'${n}'`).join(', ')}]`;
 }
 
+/** A module-level `from __future__ import …` statement, as a whole logical line. */
+const FUTURE_RE = /^from\s+__future__\s+import\s+\S/;
+
+/**
+ * Lift every module-level `from __future__ import …` out of the exported sources.
+ *
+ * Python requires a future statement to precede every other statement in the
+ * module, but `generateModule` emits `__all__` first — so an exported cell
+ * carrying one produced a module **Python refuses to compile** while the export
+ * reported `written: true`. Cellar's own imports-cell renderer deliberately puts
+ * `__future__` first inside that cell (`imports.ts`), so marking the imports cell
+ * for export is the likeliest way to hit it.
+ *
+ * Hoisting is unconditionally semantics-preserving here: a future statement is a
+ * compile-time directive whose effect is the whole module, and the `indent !== 0`
+ * filter means only genuinely module-level ones move. That makes this STRICTLY
+ * more correct than nbdev's own `_last_future` (`maker.py`), which hoists whole
+ * CELLS up to the last one containing a future import — so nbdev still emits an
+ * uncompilable module when a future import trails real code, where this does not.
+ *
+ * `logicalLines` is what makes it safe: a `from __future__ …` inside a string or a
+ * nested scope is never a logical line at indent 0, and a bracket-continued import
+ * is ONE logical line, so it moves whole.
+ *
+ * Known limit (documented, not handled): a semicolon-joined statement
+ * (`from __future__ import annotations; x = 1`) is left in place rather than
+ * hoisted with a rider that would be reordered with it.
+ *
+ * Returns the deduped hoisted statements and the sources with them spliced out.
+ */
+function liftFutureImports(sources: string[]): { future: string[]; body: string[] } {
+	const future: string[] = [];
+	const seen = new Set<string>();
+	const body = sources.map((src) => {
+		if (!src.includes('__future__')) return src; // cheap pre-check; the common case
+		const cuts: Array<[number, number]> = [];
+		for (const line of logicalLines(src)) {
+			if (line.indent !== 0) continue; // only a module-level future statement moves
+			const text = line.raw.trim();
+			if (!FUTURE_RE.test(text) || text.includes(';')) continue;
+			if (!seen.has(text)) {
+				seen.add(text);
+				future.push(text);
+			}
+			cuts.push([line.start, line.end]);
+		}
+		if (!cuts.length) return src;
+		let out = '';
+		let at = 0;
+		for (const [s, e] of cuts) {
+			out += src.slice(at, s);
+			at = e;
+		}
+		return out + src.slice(at);
+	});
+	return { future, body };
+}
+
 /**
  * Build the full module text from the exported cells (already filtered + in
  * document order). Deterministic: a trailing newline, single blank line between
  * blocks, no incidental whitespace, so re-exporting identical content is a
  * byte-for-byte no-op.
+ *
+ * Module-level `__future__` imports are hoisted above `__all__` (see
+ * `liftFutureImports`); a comment is the only thing Python allows before one, and
+ * the header is comments, so the emitted order compiles.
  */
 export function generateModule(exportedSources: string[], sourceName: string): string {
+	const { future, body: bodySources } = liftFutureImports(exportedSources);
 	const allNames: string[] = [];
 	const seen = new Set<string>();
-	for (const src of exportedSources) {
+	for (const src of bodySources) {
 		for (const n of topLevelNames(src)) {
 			if (!seen.has(n)) {
 				seen.add(n);
@@ -121,8 +184,10 @@ export function generateModule(exportedSources: string[], sourceName: string): s
 			}
 		}
 	}
-	const blocks: string[] = [`${HEADER}\n# Source notebook: ${sourceName}`, renderAll(allNames)];
-	for (const src of exportedSources) {
+	const blocks: string[] = [`${HEADER}\n# Source notebook: ${sourceName}`];
+	if (future.length) blocks.push(future.join('\n'));
+	blocks.push(renderAll(allNames));
+	for (const src of bodySources) {
 		const trimmed = src.replace(/\s+$/, ''); // drop trailing blank lines within a cell
 		if (trimmed) blocks.push(trimmed);
 	}

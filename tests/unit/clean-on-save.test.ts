@@ -24,9 +24,13 @@ function messyNotebook(): any {
 		nbformat_minor: 5,
 		metadata: {
 			kernelspec: { name: 'python3', display_name: 'Python 3 (ipykernel)', language: 'python' },
-			// Volatile / per-machine metadata that MUST be dropped.
+			// Per-machine metadata that MUST be dropped.
 			language_info: { name: 'python', version: '3.11.4', mimetype: 'text/x-python' },
-			widgets: { 'application/vnd.jupyter.widget-state+json': { state: {} } }
+			// An ecosystem key that must SURVIVE (nbdev's own base allowlist carries it,
+			// and Cellar never writes one, so keeping it can only preserve JupyterLab's).
+			widgets: { 'application/vnd.jupyter.widget-state+json': { state: {} } },
+			// A foreign key outside every allowlist: deny-by-default still drops it.
+			solveit: { ver: 2 }
 		},
 		cells: [
 			{
@@ -98,21 +102,30 @@ describe('cleanNotebook — correctness', () => {
 		expect(outputs[2].data['application/vnd.cellar.dataframe+json']).toBeUndefined();
 	});
 
-	it('enforces the notebook-metadata allowlist (drops language_info + widgets)', () => {
+	it('enforces the notebook-metadata allowlist (drops language_info, keeps the ecosystem keys)', () => {
 		const cleaned = cleanNotebook(messyNotebook());
-		expect(Object.keys(cleaned.metadata).sort()).toEqual(['kernelspec']);
+		expect(Object.keys(cleaned.metadata).sort()).toEqual(['kernelspec', 'widgets']);
+		// Per-machine, and still dropped.
 		expect((cleaned.metadata as any).language_info).toBeUndefined();
-		expect((cleaned.metadata as any).widgets).toBeUndefined();
-		expect(ALLOWED_NB_METADATA).toContain('kernelspec');
+		// Deny-by-default is intact: the list is a fixed set of NAMED keys, not a
+		// relaxation, so a foreign key is still dropped.
+		expect((cleaned.metadata as any).solveit).toBeUndefined();
+		// The allowlist is Cellar's two keys plus nbdev's ENTIRE base notebook list
+		// (`nbdev/clean.py`), so a notebook Cellar saves is not silently damaged.
+		expect([...ALLOWED_NB_METADATA].sort()).toEqual(
+			['cellar', 'doc', 'jekyll', 'jupytext', 'kernelspec', 'nbdev', 'widgets'].sort()
+		);
 	});
 
-	it('enforces the cell-metadata allowlist (keeps only the cellar namespace)', () => {
+	it('enforces the cell-metadata allowlist (cellar + nbdev\'s base cell keys)', () => {
 		const cleaned = cleanNotebook(messyNotebook());
 		const md = (cleaned.cells[0] as any).metadata;
+		// The fixture carries only `cellar`, so only `cellar` survives - an allowlisted
+		// key is KEPT WHEN PRESENT, never synthesized.
 		expect(Object.keys(md)).toEqual(['cellar']);
 		expect(md.collapsed).toBeUndefined();
 		expect(md.trusted).toBeUndefined();
-		expect(ALLOWED_CELL_METADATA).toEqual(['cellar']);
+		expect([...ALLOWED_CELL_METADATA].sort()).toEqual(['cellar', 'hide_input', 'nbdev'].sort());
 	});
 
 	it('strips runtime-only cellar keys (lastRun, editedAt, importBindings) but keeps durable ones', () => {

@@ -100,9 +100,52 @@ export function deserialize(nb: {
 	return { cells, metadata: nb.metadata ?? defaultMetadata() };
 }
 
-/** Deterministic JSON text for an nbformat object (1-space indent, trailing \n). */
+/**
+ * `JSON.stringify` replacer that emits every object's keys in sorted order.
+ *
+ * Returning a fresh object whose keys were inserted in sorted order is what makes
+ * this recursive for free: `JSON.stringify` serializes the REPLACEMENT in its own
+ * insertion order and then calls the replacer again for each of ITS values, so a
+ * nested object is sorted by the same rule without this function recursing.
+ *
+ * Cost is one small wrapper object plus an O(k log k) key sort per OBJECT node.
+ * The multi-MB payloads a notebook carries (base64 image data, stream text) are
+ * strings, which the replacer returns by reference and never copies - so this
+ * does not undo `clean.ts`'s no-deep-clone rule, and `JSON.stringify` was already
+ * walking every node.
+ */
+function sortedKeysReplacer(_key: string, value: unknown): unknown {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
+	const src = value as Record<string, unknown>;
+	const out: Record<string, unknown> = {};
+	for (const k of Object.keys(src).sort()) out[k] = src[k];
+	return out;
+}
+
+/**
+ * Deterministic JSON text for an nbformat object: keys SORTED, 1-space indent,
+ * trailing `\n`.
+ *
+ * Sorted keys are the ECOSYSTEM's convention, not an nbdev concession: `nbformat`
+ * - the reference writer behind JupyterLab, Jupyter Notebook, nbconvert and
+ * papermill - writes `sort_keys=True, indent=1`, and fastcore/nbdev's own writer
+ * (`fastcore/nbio.py`) writes `sort_keys=True, indent=1, ensure_ascii=False` plus a
+ * trailing newline. Emitting insertion order instead made Cellar the odd one out:
+ * ANY notebook touched by both Cellar and Jupyter churned 100% of its lines,
+ * because Cellar wrote `cell_type, id, metadata, source, outputs, execution_count`
+ * where everything else writes them alphabetically.
+ *
+ * `JSON.stringify` already agrees with Python's `ensure_ascii=False` on unicode
+ * (both emit literal characters), so `sort_keys` was the entire remaining
+ * difference. Key order is by UTF-16 code unit vs Python's code point; those
+ * differ only above the BMP, and notebook/metadata keys are ASCII.
+ *
+ * ONE-TIME COST: this reformats every existing notebook on its next save - a pure
+ * key reordering with no semantic change, moving the file toward the ecosystem
+ * norm rather than away from it.
+ */
 export function stringify(nb: unknown): string {
-	return JSON.stringify(nb, null, 1) + '\n';
+	return JSON.stringify(nb, sortedKeysReplacer, 1) + '\n';
 }
 
 export function readNotebook(path: string): NbNotebook | null {

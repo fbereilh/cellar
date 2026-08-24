@@ -243,7 +243,7 @@ describe('git caches + -L blame scoping', () => {
 	it('maps a cell to the exact physical file lines of its source', () => {
 		writeNotebook(join(dir, NB), {
 			path: NB,
-			cells: [cell('cell-a', 'a = 1\naa = 2', bigOutput(30)), cell('cell-b', 'b = 1')]
+			cells: [cell('cell-a', 'a = 1\naa = 2', bigOutput(30)), cell('cell-b', 'b = 1', bigOutput(30))]
 		});
 		const text = readFileSync(join(dir, NB), 'utf8');
 		const map = cellSourceLines(text);
@@ -258,9 +258,13 @@ describe('git caches + -L blame scoping', () => {
 		expect(fileLines[la2 - 1]).toContain('aa = 2');
 		const [lb] = map!.get('cell-b')!;
 		expect(fileLines[lb - 1]).toContain('b = 1');
-		// cell-b's source sits well AFTER cell-a's output block: many output lines lie
-		// between the two source ranges, proving output lines are not conflated with
-		// source (and are exactly what `-L` scoping skips).
+		// Many output lines lie between the two source ranges, proving output lines are
+		// not conflated with source (and are exactly what `-L` scoping skips). BOTH
+		// cells carry a fat output deliberately, so this holds whichever side of
+		// `source` the writer puts `outputs` on: `stringify` sorts keys (the
+		// ecosystem's `sort_keys=True`), which orders a cell
+		// `cell_type, execution_count, id, metadata, outputs, source` - so a fat output
+		// on cell-a alone now sits BEFORE its own source rather than between the two.
 		expect(lb - la2).toBeGreaterThan(30);
 	});
 });
