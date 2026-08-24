@@ -189,8 +189,7 @@ describe('converting a multi-cell selection to chat (setCellTypes, the bulk path
 
 	it('keeps the source, and keeps outputs (chat shares the nbformat code type)', () => {
 		const { nb, ids } = makeNotebook('keep.ipynb', 1);
-		const out = [{ output_type: 'stream', name: 'stdout', text: 'hi\n' }];
-		nbmod.setOutputs(ids[0], out, nb);
+		nbmod.setOutputs(ids[0], [{ output_type: 'stream', name: 'stdout', text: 'hi\n' }], nb);
 		nbmod.setCellTypes([ids[0]], 'chat', nb);
 		const cell = nbmod.listCells(nb)[0];
 		expect(cell.source).toBe('a = 0');
