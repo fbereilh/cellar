@@ -397,19 +397,51 @@ test('a failed hide that another writer superseded neither reverts nor claims an
 			data: { hiddenFromAgent: true, nb: NB, originId: 'other-tab' }
 		});
 		expect(res.ok()).toBe(true);
-		await expect.poll(() => diskCellar(MD).hidden_from_agent, { timeout: 15_000 }).toBe(true);
 
-		// only now does OUR write fail
+		// Proving the PAGE applied that event is the whole hinge of this test, and a
+		// disk poll cannot do it: `setVisibility` persists BEFORE it emits, so a true
+		// read on disk says only that the SERVER wrote. Instead write a SECOND foreign
+		// change to a DIFFERENT cell and wait for THAT toggle to render: SSE for one
+		// notebook is ordered into the one subscriber, so observing the second event
+		// proves the first was already applied - and it is the first that bumps the
+		// generation this test is about.
+		const marker = await request.patch(`${baseURL}/api/cells/${CODE}`, {
+			data: { hiddenFromAgent: true, nb: NB, originId: 'other-tab' }
+		});
+		expect(marker.ok()).toBe(true);
+		await expect(cellEl(page, CODE).getByTestId('toggle-agent-hidden')).toHaveAttribute(
+			'aria-pressed',
+			'true',
+			{ timeout: 15_000 }
+		);
+
+		// only now does OUR write fail. `route.fulfill` resolves when the response is
+		// DISPATCHED, not when the page's fetch has settled and the revert has run, and
+		// both assertions below already hold at t=0 - so without waiting for the page to
+		// receive the 500 they would pass on their first poll whatever the code did.
+		const failed = page.waitForResponse(
+			(r) => r.url().includes(`/api/cells/${MD}`) && r.request().method() === 'PATCH'
+		);
 		await release!();
+		await failed;
+		await page.waitForTimeout(300); // the handler microtask that would revert
 
 		// The cell is hidden and the server says so, so nothing may put it back or
-		// announce otherwise. Value-equality could not see this - the current value
-		// equals what we wrote, so it reverted and said the cell was still visible.
+		// announce otherwise. VERIFIED to fail under the value-equality form this
+		// replaced (the current value equals what we wrote, so it reverted and said the
+		// cell was still visible) - that is what makes these assertions load-bearing
+		// rather than decorative, and why the synchronization above is not optional.
 		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 		await expect(page.getByTestId('app-notice')).toHaveCount(0);
 		expect(diskCellar(MD).hidden_from_agent).toBe(true);
 	} finally {
 		await page.unroute('**/api/cells/**');
+		// leave the shared notebook as found - the marker cell belongs to other tests
+		await request
+			.patch(`${baseURL}/api/cells/${CODE}`, {
+				data: { hiddenFromAgent: false, nb: NB, originId: 'other-tab' }
+			})
+			.catch(() => {});
 	}
 
 	await setToggle(cell, 'toggle-agent-hidden', false);

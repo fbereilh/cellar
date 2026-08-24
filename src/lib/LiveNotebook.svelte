@@ -1503,6 +1503,16 @@
 			loadEditorCollapsed(); // restore this notebook's collapsed code editors (runtime-only)
 			loadCellCollapsed(); // restore this notebook's fully collapsed cells (runtime-only)
 			pruneCollapsedToCells(); // drop entries for cells deleted while we were away
+			// A load RE-ESTABLISHES server truth for every cell at once, so it supersedes
+			// every in-flight local write - which is exactly what the hide-from-agent
+			// revert's generation guard must see. Clearing (rather than bumping per cell)
+			// is what makes that true: `cells` is replaced wholesale here, so a write that
+			// predates this load must neither revert nor claim anything. Without it the
+			// guard misses this carrier entirely - a notebook:restored, an sse:open
+			// reconnect or a seq-gap refetch would leave the pre-load generation intact,
+			// so a failing hide would revert over the server's own newer state and the
+			// notice would assert the OPPOSITE of what the document holds.
+			agentVisibilitySeq.clear();
 			// This refetch is the correctness backstop (reconnect / seq gap): the
 			// freshly loaded cells carry authoritative outputs, so drop any stale live
 			// run state. Otherwise a lost run:end (tab disconnected while an agent run
