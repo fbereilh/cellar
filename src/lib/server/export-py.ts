@@ -167,13 +167,28 @@ function liftFutureImports(sources: string[]): { future: string[]; body: string[
  * splice turns "future import, blank line, code" into a residue that OPENS with a
  * blank line - which `generateModule` then joins with its own blank-line separator
  * and emits a double blank line, contradicting its documented "single blank line
- * between blocks, no incidental whitespace" contract. So each seam's newline run
- * collapses to at most one blank line, and any blank lines the cuts left at the
- * very top of the cell go entirely.
+ * between blocks, no incidental whitespace" contract. Two passes address that, and
+ * both are deliberately narrower than "normalize the blank lines", because the
+ * newlines a cut did NOT create are the user's own text.
  *
  * Seams are tidied RIGHT TO LEFT and only ever by removing characters at or after
  * the seam, so an earlier seam's recorded offset is never invalidated (the same
- * rule `extractTopLevelImports` follows for the same reason).
+ * rule `extractTopLevelImports` follows for the same reason). That is exactly why
+ * the collapse is one-sided and its LIMIT is stated rather than glossed: only the
+ * newline run FOLLOWING a seam can be shortened, so a seam whose PRECEDING run was
+ * already more than one blank line keeps it (`A = 1\n\n\n\n<cut>\nB = 2` stays
+ * `A = 1\n\n\n\nB = 2`). What it does guarantee is the case this exists for: a cut
+ * whose own newline lands next to at most one authored blank line contributes none
+ * of its own.
+ *
+ * The leading strip is likewise blunt and unconditional once ANY cut landed: it
+ * removes every blank line at the top of the residue, including ones the user wrote
+ * that no cut produced. Kept that way because it is the shape that actually occurs
+ * (a `__future__` import is legal only at the top of a module, so a cut is almost
+ * always the thing that opened the gap) and because leading blank lines carry no
+ * meaning at module level. Both residuals are cosmetic only - the contracts that
+ * matter (deterministic, idempotent, byte-identical re-export, and the future block
+ * landing above `__all__`) are unaffected either way.
  */
 function spliceLines(src: string, cuts: Array<[number, number]>): string {
 	let out = '';
@@ -194,7 +209,7 @@ function spliceLines(src: string, cuts: Array<[number, number]>): string {
 		const excess = before + after - 2;
 		if (excess > 0) out = out.slice(0, p) + '\n'.repeat(Math.max(0, after - excess)) + out.slice(p + after);
 	}
-	return out.replace(/^(?:[ \t]*\n)+/, ''); // no leading blank lines where a cut was
+	return out.replace(/^(?:[ \t]*\n)+/, ''); // every leading blank line goes, once any cut landed
 }
 
 /**

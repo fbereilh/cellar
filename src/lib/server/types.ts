@@ -241,7 +241,11 @@ export interface NotebookCellarNamespace {
 	[key: string]: unknown;
 }
 
-/** nbformat notebook metadata (only `kernelspec`/`cellar` survive a clean). */
+/**
+ * nbformat notebook metadata. A clean keeps only the named allowlist in `clean.ts`
+ * (`ALLOWED_NB_METADATA`, which carries Cellar's own keys alongside the foreign
+ * ones the ecosystem defines); everything else is dropped.
+ */
 export interface NotebookMetadata {
 	kernelspec?: KernelSpec;
 	cellar?: NotebookCellarNamespace;
