@@ -2088,7 +2088,8 @@ function moduleFailure(target: string, exportTarget: string | null) {
 	return {
 		module: {
 			regenerated: false as const,
-			reason: `the module could not be written${exportTarget ? ` to ${exportTarget}` : ''}: ${failure}`
+			reason: `the module could not be written${exportTarget ? ` to ${exportTarget}` : ''}: ${failure}`,
+			warning: undefined
 		}
 	};
 }
