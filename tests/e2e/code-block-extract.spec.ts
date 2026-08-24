@@ -255,6 +255,37 @@ test('the shortcut acts on the hovered block, not on whichever was extracted las
 	expect(cells.map(sourceOf)).toEqual([PY_BLOCK, SQL_BLOCK]);
 });
 
+test('with NO pointer over any block, FOCUS is what the chord acts on', async ({ page }) => {
+	test.setTimeout(120_000);
+	const nb = await openFresh(page, 'extract-focus-route.ipynb');
+
+	// The keyboard-only route. Nothing is hovered, so `targetCodeBlock` falls back
+	// to `:focus-within` - which jsdom cannot evaluate, so this is the only level
+	// that proves the fallback is reachable rather than merely written.
+	await page.mouse.move(2, 2);
+	await extractBtn(page, SQL_AT).focus();
+	await expect(extractBtn(page, SQL_AT)).toBeFocused();
+	await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Shift+e' : 'Control+Shift+e');
+
+	const [cell] = await settled(nb, 1);
+	expect(sourceOf(cell)).toBe(SQL_BLOCK);
+	expect(typeOf(cell)).toBe('sql');
+});
+
+test('the control is reachable and activatable by keyboard alone', async ({ page }) => {
+	test.setTimeout(120_000);
+	const nb = await openFresh(page, 'extract-keyboard.ipynb');
+
+	// It is a real <button>, so it takes focus and its native activation keys - the
+	// route that does not depend on the chord at all.
+	await page.mouse.move(2, 2);
+	await extractBtn(page, PY_AT).focus();
+	await page.keyboard.press('Enter');
+
+	const [cell] = await settled(nb, 1);
+	expect(sourceOf(cell)).toBe(PY_BLOCK);
+});
+
 test('a block containing BACKTICKS and MARKDOWN survives intact, as a markdown cell', async ({ page }) => {
 	test.setTimeout(120_000);
 	const nb = await openFresh(page, 'extract-backticks.ipynb');
