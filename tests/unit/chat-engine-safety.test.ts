@@ -12,6 +12,13 @@
  *   isolation is one word wide, so it is asserted from inside the child.
  * - The prompt arrives on STDIN (the argv positional stalls and corrupts the
  *   stream - the design report's measured failure).
+ * - Workspace READS are confined by the GRANT, not by the cwd: every read tool
+ *   is granted with its path pattern and never bare, a root that cannot be
+ *   confined yields a read-less run, and each of the four capability shapes gets
+ *   the frozen prompt that is TRUE for it (no per-run value, the confinement
+ *   root included, ever enters one). The CLI's own half of that - that a scoped
+ *   grant really refuses outside paths while a bare one does not - is measured
+ *   against the real binary in `tests/e2e/chat-workspace-reads.spec.ts`.
  * - An init report with capabilities KILLS the run and fails closed
  *   (`unsafe_init`), delivering not one delta; a missing field fails closed
  *   too, and so does a MISSING EVENT ("cannot verify" is not "safe" - an
@@ -23,24 +30,31 @@
  *   not_signed_in / rate_limited (with resetsAt) / api_error / cancelled.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
 	chatCliArgs,
+	chatCliCwd,
+	chatReadRoot,
+	literalRulePath,
 	chatSystemPrompt,
-	chatToolAllowlist,
+	chatToolPolicy,
 	classifyChatFailure,
 	claudeCliEngine,
 	initViolation,
 	CHAT_MAX_CONCURRENT,
 	CHAT_SYSTEM_PROMPT,
+	CHAT_SYSTEM_PROMPT_READS,
+	CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH,
 	CHAT_SYSTEM_PROMPT_WEB_SEARCH,
+	READ_TOOLS,
 	WEB_SEARCH_TOOL
 } from '../../src/lib/server/chat/claude-cli';
 import { CHAT_MODEL_DEFAULT, normalizeChatModel } from '../../src/lib/chatCell';
+import { chatFailureMarkdown } from '../../src/lib/server/chat/failure';
 import { chatChildEnv, isChatSensitiveEnv } from '../../src/lib/server/chat/env';
-import type { ChatEngineResult } from '../../src/lib/server/chat/engine';
+import type { ChatEngineFailure, ChatEngineResult } from '../../src/lib/server/chat/engine';
 
 let BIN: string; // temp dir holding the stub `claude`, prepended to PATH
 let OUT: string; // scratch the stubs dump argv/env/stdin into
@@ -74,6 +88,63 @@ const SEARCH_INIT = JSON.stringify({
 	model: 'claude-sonnet-stub'
 });
 
+// The reads-on init shape as the REAL CLI reports it - probed against claude
+// 2.1.238 (2026-08-21): `--tools Read,Glob,Grep` reports the same SET back in
+// the CLI's OWN order, which is why the assertion compares sets and never array
+// order. Note what is NOT here: the path scope. `system/init` reports bare tool
+// NAMES, so the confinement lives entirely in the `--allowedTools` rules - which
+// is exactly why request and grant are derived from one policy.
+const READS_INIT = JSON.stringify({
+	type: 'system',
+	subtype: 'init',
+	tools: ['Glob', 'Grep', 'Read'],
+	mcp_servers: [],
+	slash_commands: [],
+	skills: [],
+	claude_code_version: '9.9.9-stub',
+	model: 'claude-sonnet-stub'
+});
+
+/** The `--system-prompt` value of a given argv - read off the SAME array, since
+ *  the optional `--allowedTools` pair shifts every index after it. */
+function promptOf(args: string[]): string {
+	return args[args.indexOf('--system-prompt') + 1];
+}
+
+/** A representative absolute workspace root for the argv-shape assertions. */
+const WS = '/tmp/cellar-ws';
+/** The grant pattern the module builds for `WS` - spelled out, not derived. */
+const WS_RULE = '//tmp/cellar-ws/**';
+/**
+ * The notebook a run is answering in. Reads need BOTH a root and this, so every
+ * reads-on shape below passes it; it is also what the run DENIES (rule 1 of
+ * `denialPatterns`), which is why the deny rules are spelled out here too rather
+ * than derived from the module under test.
+ */
+const NB = '/tmp/cellar-ws/analysis.ipynb';
+/**
+ * The deny patterns a reads-on run over `WS`/`NB` builds, in order. The notebook
+ * group is the file itself PLUS the artifacts Cellar names after it - each of
+ * those writers renders every cell, hidden ones included - deduped, so the
+ * `.ipynb` derivation of an `.ipynb` notebook collapses into its own path.
+ */
+const NB_DENY = [
+	'//tmp/cellar-ws/analysis.ipynb',
+	'//tmp/cellar-ws/analysis.py',
+	'//tmp/cellar-ws/analysis.html',
+	'//tmp/cellar-ws/.ipynb_checkpoints/analysis-checkpoint.ipynb'
+];
+const CELLAR_DENY = '//tmp/cellar-ws/.cellar/**';
+const IPYNB_DENY = ['//tmp/cellar-ws/*.ipynb', '//tmp/cellar-ws/**/*.ipynb'];
+/** Every deny rule one shape emits, in the order the policy builds them. */
+function denyRules(notebooks: readonly string[], blanket: boolean): string[] {
+	return READ_TOOLS.flatMap((t) => [
+		...notebooks.map((d) => `${t}(${d})`),
+		`${t}(${CELLAR_DENY})`,
+		...(blanket ? IPYNB_DENY.map((d) => `${t}(${d})`) : [])
+	]);
+}
+
 /** Install a stub `claude` whose body is `script` (sh). */
 function stubClaude(script: string) {
 	writeFileSync(join(BIN, 'claude'), `#!/bin/sh\n${script}\n`);
@@ -81,7 +152,15 @@ function stubClaude(script: string) {
 }
 
 function run(
-	overrides: { configDir?: string | null; signal?: AbortSignal; model?: string; webSearch?: boolean } = {}
+	overrides: {
+		configDir?: string | null;
+		signal?: AbortSignal;
+		model?: string;
+		webSearch?: boolean;
+		readRoot?: string | null;
+		notebookPath?: string | null;
+		otherNotebooks?: boolean;
+	} = {}
 ): Promise<ChatEngineResult> & { deltas: string[] } {
 	const deltas: string[] = [];
 	const p = claudeCliEngine.run({
@@ -89,6 +168,12 @@ function run(
 		configDir: overrides.configDir ?? null,
 		model: overrides.model,
 		webSearch: overrides.webSearch,
+		readRoot: overrides.readRoot,
+		// Defaulted, not omitted: reads need a notebook to deny, so a `readRoot`
+		// override with no notebook would silently produce a READ-LESS run and every
+		// reads assertion below would pass for the wrong reason.
+		notebookPath: overrides.notebookPath === undefined ? NB : overrides.notebookPath,
+		otherNotebooks: overrides.otherNotebooks,
 		signal: overrides.signal ?? new AbortController().signal,
 		onDelta: (t) => deltas.push(t)
 	}) as Promise<ChatEngineResult> & { deltas: string[] };
@@ -199,11 +284,13 @@ describe('the frozen flag set', () => {
 		expect(CHAT_SYSTEM_PROMPT).toContain('no tools');
 		expect(CHAT_SYSTEM_PROMPT_WEB_SEARCH).not.toContain('cannot run code, read files, or browse');
 		expect(CHAT_SYSTEM_PROMPT_WEB_SEARCH).toContain('web search');
-		expect(chatSystemPrompt(false)).toBe(CHAT_SYSTEM_PROMPT);
-		expect(chatSystemPrompt(true)).toBe(CHAT_SYSTEM_PROMPT_WEB_SEARCH);
-		// One rule for request and assertion: the argv's tools value IS the allowlist.
-		expect(chatToolAllowlist(false)).toEqual([]);
-		expect(chatToolAllowlist(true)).toEqual([WEB_SEARCH_TOOL]);
+		expect(chatSystemPrompt(chatToolPolicy())).toBe(CHAT_SYSTEM_PROMPT);
+		expect(chatSystemPrompt(chatToolPolicy({ webSearch: true }))).toBe(CHAT_SYSTEM_PROMPT_WEB_SEARCH);
+		// One rule for request, grant and assertion: the argv's values ARE the policy.
+		expect(chatToolPolicy().tools).toEqual([]);
+		expect(chatToolPolicy().grants).toEqual([]);
+		expect(chatToolPolicy({ webSearch: true }).tools).toEqual([WEB_SEARCH_TOOL]);
+		expect(chatToolPolicy({ webSearch: true }).grants).toEqual([WEB_SEARCH_TOOL]);
 	});
 
 	it('an unknown or non-string model can never reach argv: it falls back to the default', () => {
@@ -278,6 +365,606 @@ describe('the frozen flag set', () => {
 	});
 });
 
+describe('workspace reads are CONFINED, and confinement is the grant', () => {
+	it('the reads-on argv requests bare NAMES and grants PATH-SCOPED rules - never a bare read grant', () => {
+		const args = chatCliArgs({ readRoot: WS, notebookPath: NB });
+		expect(args).toEqual([
+			'-p',
+			'--tools',
+			'Read,Glob,Grep',
+			'--allowedTools',
+			`Read(${WS_RULE}),Glob(${WS_RULE}),Grep(${WS_RULE})`,
+			'--disallowedTools',
+			denyRules(NB_DENY, true).join(','),
+			'--disable-slash-commands',
+			'--setting-sources',
+			'',
+			'--strict-mcp-config',
+			'--no-session-persistence',
+			'--model',
+			'sonnet',
+			'--include-partial-messages',
+			'--output-format',
+			'stream-json',
+			'--verbose',
+			'--system-prompt',
+			CHAT_SYSTEM_PROMPT_READS
+		]);
+		// THE defect this whole feature turns on, asserted directly: measured against
+		// claude 2.1.238, a BARE `Read`/`Grep` grant reads and greps files anywhere on
+		// disk from a cwd inside the workspace - so not one granted read tool may
+		// appear unscoped. Every read grant must carry its pattern.
+		const grants = args[args.indexOf('--allowedTools') + 1].split(',');
+		for (const tool of READ_TOOLS) {
+			expect(grants).not.toContain(tool);
+			expect(grants).toContain(`${tool}(${WS_RULE})`);
+		}
+		// Search takes no path scope (it has no path), and the two capabilities
+		// compose without either losing its own shape.
+		const both = chatToolPolicy({ webSearch: true, readRoot: WS, notebookPath: NB });
+		expect(both.grants).toEqual([WEB_SEARCH_TOOL, `Read(${WS_RULE})`, `Glob(${WS_RULE})`, `Grep(${WS_RULE})`]);
+		expect(both.tools).toEqual([WEB_SEARCH_TOOL, ...READ_TOOLS]);
+		expect(promptOf(chatCliArgs({ webSearch: true, readRoot: WS, notebookPath: NB }))).toBe(CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH);
+	});
+
+	it('every OTHER argv position is unchanged by the reads shape - the safety flags never move', () => {
+		const drop = (args: string[], flag: string) => {
+			const at = args.indexOf(flag);
+			return at < 0 ? args : [...args.slice(0, at), ...args.slice(at + 2)];
+		};
+		const scrub = (args: string[]) => {
+			const bare = drop(drop(args, '--allowedTools'), '--disallowedTools');
+			return bare.map((a, i) => (['--tools', '--model', '--system-prompt'].includes(bare[i - 1] ?? '') ? '<varies>' : a));
+		};
+		expect(scrub(chatCliArgs({ readRoot: WS, notebookPath: NB }))).toEqual(scrub(chatCliArgs()));
+		expect(scrub(chatCliArgs({ readRoot: WS, webSearch: true, notebookPath: NB }))).toEqual(scrub(chatCliArgs()));
+	});
+
+	it('a root that cannot be confined yields a READ-LESS run, never an unconfined one', () => {
+		// Fail closed on every shape the setting or a hand-edited store can produce.
+		// The POSIX check is deliberate: the `//` rule prefix is the CLI's
+		// absolute-path spelling and was measured on POSIX only, so a Windows-style
+		// root is refused rather than turned into a rule of unknown behaviour.
+		for (const bad of [null, undefined, '', '   ', 'relative/dir', './x', '..', 'C:\\Users\\me', 42, {}, ['/tmp']]) {
+			expect(chatReadRoot(bad)).toBeNull();
+			const args = chatCliArgs({ readRoot: bad as never, notebookPath: NB });
+			expect(args).toEqual(chatCliArgs());
+			expect(args).not.toContain('--allowedTools');
+		}
+		// ...and a read-less run is also TOLD it cannot read: the prompt is chosen
+		// from the same policy, so it can never claim a capability that was refused.
+		expect(promptOf(chatCliArgs({ readRoot: 'relative/dir', notebookPath: NB }))).toBe(CHAT_SYSTEM_PROMPT);
+		// A good root normalizes (trailing slash, `..`, doubled separators) before
+		// it becomes a pattern, so one directory always yields one rule.
+		expect(chatReadRoot('/tmp/cellar-ws/')).toBe(WS);
+		expect(chatReadRoot('/tmp/cellar-ws/sub/..')).toBe(WS);
+		expect(chatReadRoot('//tmp//cellar-ws')).toBe(WS);
+	});
+
+	it('a root carrying an UNCONFINABLE character is refused - each member driven, never a class', () => {
+		// Three MEASUREMENTS against claude 2.1.238, landing in three places - which
+		// is why the refused character set is exactly these seven:
+		//   `* ? [ ] { }` WIDEN the grant. `<root>/ws[ab]` yields the rule
+		//     `Read(//<root>/ws[ab]/**)`, which the matcher GLOB-INTERPRETS - it read
+		//     its own file AND read `<root>/wsa/secret.txt` in a SIBLING directory,
+		//     returning the secret.
+		//   `\` BREAKS CHILD STARTUP. With a real directory `<root>/ws\a` on disk
+		//     the CLI refused to launch at all (rc=1, "Can't access working
+		//     directory"), which today surfaces as an opaque `api_error` on a run the
+		//     user asked to read files.
+		// Both are refused outright rather than escaped (escape semantics are
+		// unmeasured, and a wrong escape reopens the hole while looking fixed), so
+		// the run degrades to today's read-less one.
+		for (const bad of ['*', '?', '[', ']', '{', '}', '\\']) {
+			const root = `/tmp/cellar${bad}ws`;
+			expect(chatReadRoot(root)).toBeNull();
+			// Byte-identical to the default shape: no grant flag at all, so nothing
+			// unconfined can be granted...
+			const args = chatCliArgs({ readRoot: root, notebookPath: NB });
+			expect(args).toEqual(chatCliArgs());
+			expect(args).not.toContain('--allowedTools');
+			// ...the prompt truthfully says so, and the cwd stays neutral.
+			expect(promptOf(args)).toBe(CHAT_SYSTEM_PROMPT);
+			expect(chatCliCwd(chatToolPolicy({ readRoot: root, notebookPath: NB }))).toBe(tmpdir());
+		}
+		// One anywhere in the path is enough, including deep in it.
+		expect(chatReadRoot('/tmp/proj[1]/ws')).toBeNull();
+		expect(chatReadRoot('/tmp/proj\\1/ws')).toBeNull();
+
+		// PARENTHESES are the driven-SAFE third case and must keep working, in BOTH
+		// forms - a different question each, since only the ADJACENT one could be an
+		// extglob. Driven, `<root>/ws (2)` and `<root>/report(2)` each read inside
+		// and still refused outside; `~/Projects/analysis (2)` and `report(2)` are
+		// entirely ordinary workspace names.
+		for (const paren of ['/tmp/Projects/analysis (2)', '/tmp/Projects/report(2)']) {
+			expect(chatReadRoot(paren)).toBe(paren);
+			expect(promptOf(chatCliArgs({ readRoot: paren, notebookPath: NB }))).toBe(CHAT_SYSTEM_PROMPT_READS);
+			for (const tool of READ_TOOLS) {
+				expect(chatToolPolicy({ readRoot: paren, notebookPath: NB }).grants).toContain(`${tool}(/${paren}/**)`);
+			}
+		}
+	});
+
+	it('an EXTGLOB-shaped root is refused as a precaution, while a bare @/+/! still works', () => {
+		// The one refusal here that is NOT a measured leak, and the distinction is
+		// the point. All three forms were DRIVEN against claude 2.1.238 with the
+		// sibling an extglob would have covered - `runs@(a|b)` beside `runsa`,
+		// `data!(old)` beside `dataX`, `logs+(x)` beside `logsx` - and all three were
+		// INERT: the sibling was refused and the inside read still worked, i.e.
+		// extglob is off in this engine. They are refused anyway as a DURABLE
+		// PRECAUTION, because that is an unstated detail of the CLI's matcher a
+		// future version could flip and this module fails closed on grammar it
+		// cannot depend on. Do not rewrite this as "measured to leak"; it was
+		// measured NOT to.
+		for (const root of ['/tmp/runs@(a|b)', '/tmp/data!(old)', '/tmp/logs+(x)', '/tmp/proj/@(x)/ws']) {
+			expect(chatReadRoot(root)).toBeNull();
+			const args = chatCliArgs({ readRoot: root, notebookPath: NB });
+			expect(args).toEqual(chatCliArgs());
+			expect(args).not.toContain('--allowedTools');
+			expect(args).not.toContain('--disallowedTools');
+			expect(promptOf(args)).toBe(CHAT_SYSTEM_PROMPT);
+			expect(chatCliCwd(chatToolPolicy({ readRoot: root, notebookPath: NB }))).toBe(tmpdir());
+		}
+		// It is a two-character SEQUENCE test, not a character set: these characters
+		// are ordinary in directory names and refusing them outright would take the
+		// feature away from perfectly confinable workspaces.
+		for (const ok of ['/tmp/my@notes', '/tmp/c++', '/tmp/important!', '/tmp/a(b)@c']) {
+			expect(chatReadRoot(ok)).toBe(ok);
+			expect(chatToolPolicy({ readRoot: ok, notebookPath: NB }).grants).toContain(`Read(/${ok}/**)`);
+		}
+	});
+
+	it('reads need a DENIABLE notebook path too - without one the run is read-less, not unbounded', () => {
+		// The always-denied promise (rule 1 of `denialPatterns`) is only keepable
+		// when the run can name the notebook, so the policy refuses to grant reads
+		// without one. That is what makes the promise structural: there is no
+		// reachable state with a granted read and no notebook denial.
+		for (const bad of [null, undefined, '', 'relative/nb.ipynb', '/tmp/cellar-ws/nb[1].ipynb', '/tmp/cellar-ws/@(nb).ipynb', 42, {}]) {
+			const policy = chatToolPolicy({ readRoot: WS, notebookPath: bad as never });
+			expect(policy.readRoot).toBeNull();
+			expect(policy.tools).toEqual([]);
+			expect(policy.grants).toEqual([]);
+			expect(policy.denials).toEqual([]);
+			const args = chatCliArgs({ readRoot: WS, notebookPath: bad as never });
+			expect(args).toEqual(chatCliArgs());
+			expect(promptOf(args)).toBe(CHAT_SYSTEM_PROMPT);
+			expect(chatCliCwd(policy)).toBe(tmpdir());
+		}
+		// Web search is a separate capability and is NOT collateral damage: a run
+		// that cannot deny its notebook still searches, it just gets no file tools.
+		const searchOnly = chatToolPolicy({ webSearch: true, readRoot: WS, notebookPath: null });
+		expect(searchOnly.tools).toEqual([WEB_SEARCH_TOOL]);
+		expect(searchOnly.denials).toEqual([]);
+		expect(promptOf(chatCliArgs({ webSearch: true, readRoot: WS, notebookPath: null }))).toBe(CHAT_SYSTEM_PROMPT_WEB_SEARCH);
+	});
+
+	it('a reads-on run DENIES the current notebook, .cellar/ and (by default) every other notebook', () => {
+		// The grant says where a reply may read; these say what stays unreadable
+		// inside it. Every rule is emitted for EVERY read tool because each can
+		// surface a file's content independently - a rule missing from one of them
+		// is that file readable through the other two.
+		const off = chatToolPolicy({ readRoot: WS, notebookPath: NB });
+		expect(off.denials).toEqual(denyRules(NB_DENY, true));
+
+		// The opt-in opens OTHER notebooks and nothing else: the current notebook,
+		// the artifacts named after it and Cellar's own state stay denied, which is
+		// the invariant the setting may not reach. The checkpoint copy IS the current
+		// notebook, so it must survive here rather than merely riding the blanket
+		// notebook block that this shape drops.
+		const on = chatToolPolicy({ readRoot: WS, notebookPath: NB, otherNotebooks: true });
+		expect(on.denials).toEqual(denyRules(NB_DENY, false));
+		for (const tool of READ_TOOLS) {
+			for (const d of NB_DENY) expect(on.denials).toContain(`${tool}(${d})`);
+			expect(on.denials).toContain(`${tool}(${CELLAR_DENY})`);
+			for (const d of IPYNB_DENY) expect(on.denials).not.toContain(`${tool}(${d})`);
+		}
+		// The grant is untouched by the setting - it only ever takes reach back.
+		expect(on.grants).toEqual(off.grants);
+		expect(on.tools).toEqual(off.tools);
+
+		// A jupytext `.py` notebook is the current notebook too, so the rule is its
+		// ACTUAL path and never an `.ipynb` pattern - the case the extension-shaped
+		// rules below would silently miss. Its derived set is the mirror image: the
+		// `.ipynb` convert output is the sibling here, and the file itself is not
+		// covered by the blanket notebook block at all.
+		const py = chatToolPolicy({ readRoot: WS, notebookPath: '/tmp/cellar-ws/analysis.py', otherNotebooks: true });
+		expect(py.denials).toEqual(denyRules(['//tmp/cellar-ws/analysis.py', '//tmp/cellar-ws/analysis.ipynb', '//tmp/cellar-ws/analysis.html', '//tmp/cellar-ws/.ipynb_checkpoints/analysis-checkpoint.ipynb'], false));
+
+		// The derived rules are BY NAME, never by file TYPE: an unrelated `.py` or
+		// `.html` in the same workspace stays readable, which is the whole feature -
+		// `.py` is exactly what the Settings copy promises a reply can read.
+		for (const rule of on.denials) {
+			expect(rule).not.toContain('helper.py');
+			expect(rule).not.toContain('report.html');
+		}
+
+		// A notebook in a SUBDIRECTORY derives its siblings beside itself, not at the
+		// workspace root - a rule built from the basename alone would deny the wrong
+		// directory and leave the real copies readable.
+		const nested = chatToolPolicy({ readRoot: WS, notebookPath: '/tmp/cellar-ws/sub/deep.ipynb', otherNotebooks: true });
+		for (const tool of READ_TOOLS) {
+			expect(nested.denials).toContain(`${tool}(//tmp/cellar-ws/sub/deep.html)`);
+			expect(nested.denials).toContain(`${tool}(//tmp/cellar-ws/sub/.ipynb_checkpoints/deep-checkpoint.ipynb)`);
+		}
+
+		// Both notebook forms are emitted rather than trusting `**/` to match zero
+		// directories, which is engine-dependent: relying on it would leave the
+		// workspace's TOP-LEVEL notebooks readable.
+		for (const tool of READ_TOOLS) {
+			expect(off.denials).toContain(`${tool}(//tmp/cellar-ws/*.ipynb)`);
+			expect(off.denials).toContain(`${tool}(//tmp/cellar-ws/**/*.ipynb)`);
+		}
+	});
+
+	it('ONE predicate answers "can this path be a literal rule" for the root AND every denial target', () => {
+		// The root and the denial targets ask the same question - can this path be
+		// spelled so the matcher treats every character literally - and answering it
+		// twice is how the two drift into disagreeing about which paths are safe.
+		for (const bad of [null, undefined, '', '   ', 'relative/dir', 'C:\\Users\\me', 42, {}, '/tmp/ws[ab]', '/tmp/ws*', '/tmp/ws?', '/tmp/ws{a}', '/tmp/ws\\a', '/tmp/runs@(a|b)', '/tmp/data!(old)', '/tmp/logs+(x)']) {
+			expect(literalRulePath(bad as never)).toBeNull();
+			expect(chatReadRoot(bad as never)).toBeNull();
+		}
+		for (const ok of ['/tmp/cellar-ws', '/tmp/Projects/analysis (2)', '/tmp/Projects/report(2)', '/tmp/my@notes', '/tmp/c++', '/tmp/important!']) {
+			expect(literalRulePath(ok)).toBe(ok);
+			expect(chatReadRoot(ok)).toBe(ok);
+		}
+		// It NORMALIZES, so one directory yields one rule whichever spelling arrives.
+		expect(literalRulePath('/tmp/cellar-ws/sub/..')).toBe(WS);
+	});
+
+	it('an un-patternable NOTEBOOK name costs the reads, not the guarantee', () => {
+		// A MEASURED fail-open, not a theoretical one: with the notebook at
+		// `<ws>/data[1].ipynb` beside a decoy `<ws>/data1.ipynb`, the deny pattern was
+		// glob-INTERPRETED - it denied the DECOY and left the real current notebook
+		// READABLE, so "the current notebook is always denied" was silently false.
+		// The root is perfectly confinable in every case here, so what is being
+		// pinned is that the NOTEBOOK's own name can veto the reads.
+		for (const nb of ['/tmp/cellar-ws/data[1].ipynb', '/tmp/cellar-ws/v*.ipynb', '/tmp/cellar-ws/q?.ipynb', '/tmp/cellar-ws/a{b}.ipynb', '/tmp/cellar-ws/back\\slash.ipynb', '/tmp/cellar-ws/runs@(a|b).ipynb', '/tmp/cellar-ws/deep[1]/nb.ipynb']) {
+			const policy = chatToolPolicy({ readRoot: WS, notebookPath: nb });
+			expect(policy.readRoot).toBeNull();
+			expect(policy.tools).toEqual([]);
+			expect(policy.grants).toEqual([]);
+			expect(policy.denials).toEqual([]);
+			// Byte-identical to the default shape, neutral cwd, read-less prompt: the
+			// degradation stays coherent rather than shipping a grant whose denial
+			// points at the wrong file.
+			const args = chatCliArgs({ readRoot: WS, notebookPath: nb });
+			expect(args).toEqual(chatCliArgs());
+			expect(args).not.toContain('--allowedTools');
+			expect(args).not.toContain('--disallowedTools');
+			expect(promptOf(args)).toBe(CHAT_SYSTEM_PROMPT);
+			expect(chatCliCwd(policy)).toBe(tmpdir());
+		}
+		// Web search is a separate capability and survives: only the file half is
+		// withheld.
+		const searchOnly = chatToolPolicy({ webSearch: true, readRoot: WS, notebookPath: '/tmp/cellar-ws/data[1].ipynb' });
+		expect(searchOnly.tools).toEqual([WEB_SEARCH_TOOL]);
+		expect(searchOnly.denials).toEqual([]);
+	});
+
+	it('the denial rides ONE argv element and is omitted, never empty, when reads are off', () => {
+		// Same shape rules as the grant beside it. Omitted rather than passed empty
+		// is what keeps the read-less argv byte-for-byte the pre-settings one.
+		for (const caps of [{}, { webSearch: true }]) {
+			expect(chatCliArgs(caps)).not.toContain('--disallowedTools');
+		}
+		const args = chatCliArgs({ readRoot: WS, notebookPath: NB });
+		const at = args.indexOf('--disallowedTools');
+		expect(at).toBeGreaterThan(-1);
+		expect(args.filter((a) => a === '--disallowedTools')).toHaveLength(1);
+		const value = args[at + 1];
+		expect(value.length).toBeGreaterThan(0);
+		// Every rule in it is SCOPED: a bare tool name in the deny list would deny
+		// the tool outright and silently kill the feature.
+		for (const rule of value.split(',')) expect(rule).toMatch(/^(Read|Glob|Grep)\(\/\//);
+	});
+
+	it('canonicalises the root, and VALIDATES BEFORE it does - a relative root stays refused', () => {
+		// The whole policy is built in the canonical namespace because the CLI's deny
+		// only binds there (see `canonicalPath`). The ordering is the trap: realpath
+		// resolves a RELATIVE path against the process's own cwd, so canonicalising
+		// before validating turns a value that must be REFUSED into a real absolute
+		// path and grants reads over whatever directory Cellar is running in.
+		for (const bad of ['relative/dir', './x', '..', '']) {
+			expect(chatCliArgs({ readRoot: bad, notebookPath: `${WS}/analysis.ipynb` })).toEqual(chatCliArgs());
+		}
+		// A real symlinked root IS canonicalised, and every emitted rule - grant,
+		// cwd and denials - is in that one namespace.
+		const link = join(OUT, 'ws-link');
+		const real = mkdtempSync(join(tmpdir(), 'cellar-canon-real-'));
+		try {
+			rmSync(link, { force: true });
+			symlinkSync(real, link);
+			const nb = join(link, 'analysis.ipynb');
+			writeFileSync(join(real, 'analysis.ipynb'), '{}');
+			const policy = chatToolPolicy({ readRoot: link, notebookPath: nb });
+			const canonical = realpathSync(real);
+			expect(policy.readRoot).toBe(canonical);
+			expect(chatCliCwd(policy)).toBe(canonical);
+			expect(policy.grants.every((g) => g.includes(canonical))).toBe(true);
+			// Belt and braces: the LEXICAL spelling is denied too, so a tool handed
+			// the other spelling of an already-denied path still refuses.
+			expect(policy.denials.some((d) => d.includes(`//${canonical.replace(/^\/+/, '')}/analysis.ipynb`))).toBe(true);
+			expect(policy.denials.some((d) => d.includes(`//${link.replace(/^\/+/, '')}/analysis.ipynb`))).toBe(true);
+		} finally {
+			rmSync(link, { force: true });
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
+	it('a workspace path that could SPLIT the grant list cannot inject a bare read grant', () => {
+		// `--allowedTools` is documented "comma or space-separated", and the read
+		// rules embed a filesystem path - so a path containing `,Read,` is the
+		// adversarial case: were the value split, a BARE `Read` would be granted and
+		// the confinement would silently evaporate. Measured against claude 2.1.238
+		// the value is NOT split inside one argv element (an outside read stayed
+		// refused from exactly such a workspace); this pins OUR half - the grant is
+		// one argv element, and every read grant in it still carries its pattern.
+		const nasty = '/tmp/ws,Read,x/my ws,with space';
+		const args = chatCliArgs({ readRoot: nasty, notebookPath: NB });
+		const at = args.indexOf('--allowedTools');
+		expect(at).toBeGreaterThan(-1);
+		const grant = args[at + 1];
+		// ONE argv element carries the whole grant (never one element per rule, and
+		// never a stray element the CLI would read as a separate bare tool name).
+		expect(args[at + 2]).toBe('--disallowedTools');
+		expect(args[at + 4]).toBe('--disable-slash-commands');
+		for (const tool of READ_TOOLS) {
+			expect(grant).toContain(`${tool}(//tmp/ws,Read,x/my ws,with space/**)`);
+		}
+		// The DENIAL embeds the same path and answers the same question: split, it
+		// would fall apart into fragments the CLI reads as bare tool names, denying
+		// the tools outright and silently killing the feature.
+		const deny = args[args.indexOf('--disallowedTools') + 1];
+		for (const tool of READ_TOOLS) {
+			expect(deny).toContain(`${tool}(//tmp/ws,Read,x/my ws,with space/.cellar/**)`);
+			expect(deny).not.toBe(tool);
+		}
+		// What THIS side controls, asserted exactly: the policy never emits a bare
+		// grant, whatever the root looks like. (A fragment scan of the joined string
+		// would be meaningless here - `Read` appears in the path itself, which is
+		// precisely why the CLI's non-splitting had to be measured rather than
+		// reasoned about; that half is pinned against the real binary in
+		// `tests/e2e/chat-workspace-reads.spec.ts`.)
+		const nastyPolicy = chatToolPolicy({ readRoot: nasty, notebookPath: NB });
+		for (const g of nastyPolicy.grants) {
+			expect(READ_TOOLS).not.toContain(g);
+			expect(g).toMatch(/\(\/\/.*\/\*\*\)$/);
+		}
+		for (const d of nastyPolicy.denials) {
+			expect(READ_TOOLS).not.toContain(d);
+			expect(d).toMatch(/^(Read|Glob|Grep)\(\/\/.*\)$/);
+		}
+	});
+
+	it('the child runs IN the confinement root when reads are on, and in the neutral tmpdir otherwise', () => {
+		// Reads-on has to move the cwd: the tools resolve relative paths against it
+		// and default to it with no `path`. It is NOT the confinement mechanism -
+		// measured, a cwd inside the workspace with a bare grant still read outside -
+		// so the cwd moving and the grant being scoped are two separate claims.
+		expect(chatCliCwd(chatToolPolicy({ readRoot: WS, notebookPath: NB }))).toBe(WS);
+		expect(chatCliCwd(chatToolPolicy())).toBe(tmpdir());
+		expect(chatCliCwd(chatToolPolicy({ webSearch: true }))).toBe(tmpdir());
+		expect(chatCliCwd(chatToolPolicy({ readRoot: 'relative/dir', notebookPath: NB }))).toBe(tmpdir());
+	});
+
+	it('each of the four frozen prompts is TRUE for its own shape, and none carries a per-run value', () => {
+		const prompts = {
+			bare: CHAT_SYSTEM_PROMPT,
+			search: CHAT_SYSTEM_PROMPT_WEB_SEARCH,
+			reads: CHAT_SYSTEM_PROMPT_READS,
+			both: CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH
+		};
+		// The policy picks the prompt, so a shape can never be described by another's.
+		expect(chatSystemPrompt(chatToolPolicy())).toBe(prompts.bare);
+		expect(chatSystemPrompt(chatToolPolicy({ webSearch: true }))).toBe(prompts.search);
+		expect(chatSystemPrompt(chatToolPolicy({ readRoot: WS, notebookPath: NB }))).toBe(prompts.reads);
+		expect(chatSystemPrompt(chatToolPolicy({ readRoot: WS, webSearch: true, notebookPath: NB }))).toBe(prompts.both);
+		expect(new Set(Object.values(prompts)).size).toBe(4);
+
+		// No prompt may claim "no tools" while the shape HOLDS tools - the specific
+		// falsehood this feature would otherwise introduce.
+		expect(prompts.bare).toContain('no tools');
+		for (const p of [prompts.search, prompts.reads, prompts.both]) expect(p).not.toContain('no tools');
+		// A reads-on shape may not say it cannot read files; a reads-off one must.
+		for (const p of [prompts.bare, prompts.search]) expect(p).toMatch(/cannot run code or read files|cannot run code, read files/);
+		for (const p of [prompts.reads, prompts.both]) {
+			expect(p).not.toMatch(/cannot .*read files/);
+			expect(p).toMatch(/Read, Glob and Grep/);
+			expect(p).toMatch(/only there|refused/); // the confinement is stated, not implied
+			expect(p).toMatch(/cannot write or edit files/); // read-only is stated
+		}
+		// Browsing: claimed only where granted.
+		expect(prompts.reads).toMatch(/cannot browse/);
+		for (const p of [prompts.search, prompts.both]) expect(p).toMatch(/search/i);
+
+		// BYTE-STABILITY: the prompt is the cached prefix, so it must be a constant
+		// per shape - no per-run value, and emphatically not the confinement root
+		// (which differs per install, would miss the cache every run, and would leak
+		// the path into the model's context).
+		for (const root of ['/tmp/cellar-ws', '/some/other/workspace']) {
+			const prompt = promptOf(chatCliArgs({ readRoot: root, notebookPath: NB }));
+			expect(prompt).toBe(prompts.reads);
+			expect(prompt).not.toContain(root);
+		}
+	});
+
+	it('the assertion covers the reads shapes too - both directions, on the CLI-probed init', async () => {
+		const base = { mcp_servers: [], slash_commands: [], skills: [] };
+		const reads = chatToolPolicy({ readRoot: WS, notebookPath: NB }).tools;
+		// The CLI reports its OWN order, so the comparison is a SET comparison.
+		expect(initViolation({ ...base, tools: ['Glob', 'Grep', 'Read'] }, reads)).toBeNull();
+		// Never MORE...
+		expect(initViolation({ ...base, tools: [...READ_TOOLS, 'Bash'] }, reads)).toMatch(/Bash/);
+		// ...and never LESS (a missing tool means the frozen prompt over-claims).
+		expect(initViolation({ ...base, tools: ['Read', 'Glob'] }, reads)).toMatch(/missing/);
+		// The DEFAULT path still condemns a session holding read tools nobody asked for.
+		expect(initViolation({ ...base, tools: ['Read'] })).toMatch(/Read/);
+		// The SEARCH path condemns them too: capabilities do not pool across shapes.
+		expect(initViolation({ ...base, tools: [WEB_SEARCH_TOOL, 'Read'] }, chatToolPolicy({ webSearch: true }).tools)).toMatch(/Read/);
+		// And the both-on shape asserts exactly the union.
+		const both = chatToolPolicy({ webSearch: true, readRoot: WS, notebookPath: NB }).tools;
+		expect(initViolation({ ...base, tools: ['Glob', 'Grep', 'Read', WEB_SEARCH_TOOL] }, both)).toBeNull();
+		expect(initViolation({ ...base, tools: [...READ_TOOLS] }, both)).toMatch(/missing/);
+	});
+
+	it('a reads-on run against the CLI-probed init succeeds, and the child received the scoped argv', async () => {
+		const argvFile = join(OUT, 'argv-reads.txt');
+		stubClaude(
+			[
+				`for a in "$@"; do printf '%s\\n' "$a"; done > "${argvFile}"`,
+				`cat > /dev/null`,
+				`echo '${READS_INIT}'`,
+				`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"read it"}}}'`,
+				`echo '{"type":"result","subtype":"success","is_error":false,"result":"read it"}'`
+			].join('\n')
+		);
+		// The root must EXIST: the engine spawns the child with it as cwd.
+		const ws = mkdtempSync(join(tmpdir(), 'cellar-chat-ws-'));
+		try {
+			const p = run({ readRoot: ws, notebookPath: NB });
+			const res = await p;
+			expect(res.ok).toBe(true);
+			expect(p.deltas).toEqual(['read it']);
+			expect(readFileSync(argvFile, 'utf8')).toBe(chatCliArgs({ readRoot: ws, notebookPath: NB }).join('\n') + '\n');
+		} finally {
+			rmSync(ws, { recursive: true, force: true });
+		}
+	});
+
+	it('an unrequested read tool kills a reads-on run: one extra tool beside the requested three', async () => {
+		const overInit = JSON.stringify({
+			type: 'system',
+			subtype: 'init',
+			tools: ['Glob', 'Grep', 'Read', 'Write'],
+			mcp_servers: [],
+			slash_commands: [],
+			skills: [],
+			claude_code_version: '9.9.9-stub'
+		});
+		stubClaude(
+			[
+				`cat > /dev/null`,
+				`echo '${overInit}'`,
+				`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"leak"}}}'`,
+				`echo '{"type":"result","subtype":"success","is_error":false,"result":"leak"}'`
+			].join('\n')
+		);
+		const ws = mkdtempSync(join(tmpdir(), 'cellar-chat-ws-'));
+		try {
+			const p = run({ readRoot: ws, notebookPath: NB });
+			const res = await p;
+			expect(res.ok).toBe(false);
+			expect(res.failure?.kind).toBe('unsafe_init');
+			expect(res.failure?.message).toContain('Write');
+			expect(p.deltas).toEqual([]);
+		} finally {
+			rmSync(ws, { recursive: true, force: true });
+		}
+	});
+
+	it('ONE source: for every shape, the argv\'s request and grant ARE the policy the assertion reads', () => {
+		// The invariant this whole design turns on, made executable rather than left
+		// as a comment: request, grant and assertion must be one decision. Two
+		// independently-computed lists would not throw - they would silently grant a
+		// capability nothing asserted, or assert one nothing granted.
+		for (const caps of [{}, { webSearch: true }, { readRoot: WS, notebookPath: NB }, { webSearch: true, readRoot: WS, notebookPath: NB }]) {
+			const policy = chatToolPolicy(caps);
+			const args = chatCliArgs(caps);
+			// `--tools` REQUESTS exactly the policy's tools...
+			expect(args[args.indexOf('--tools') + 1]).toBe(policy.tools.join(','));
+			// ...`--allowedTools` GRANTS exactly the policy's grants, and is absent
+			// (never empty) when there is nothing to grant...
+			const at = args.indexOf('--allowedTools');
+			if (policy.grants.length === 0) expect(at).toBe(-1);
+			else expect(args[at + 1]).toBe(policy.grants.join(','));
+			// ...the prompt is the one THAT policy selects...
+			expect(promptOf(args)).toBe(chatSystemPrompt(policy));
+			// ...and every granted rule names a tool the run actually requested, so a
+			// grant can never reach a capability the assertion does not cover.
+			for (const grant of policy.grants) {
+				const name = grant.replace(/\(.*$/, '');
+				expect(policy.tools).toContain(name);
+			}
+		}
+	});
+
+	it('the module never requests a WRITE-shaped or executing tool, and never WebFetch', () => {
+		// The capability ceiling as OBSERVABLE OUTPUT: a chat cell learns from the
+		// workspace, it does not edit it or run things in it.
+		expect(READ_TOOLS).toEqual(['Read', 'Glob', 'Grep']);
+		// Whatever shape is asked for, the requested set stays within the ceiling.
+		for (const caps of [{}, { webSearch: true }, { readRoot: WS, notebookPath: NB }, { webSearch: true, readRoot: WS, notebookPath: NB }]) {
+			for (const tool of chatToolPolicy(caps).tools) {
+				expect([WEB_SEARCH_TOOL, ...READ_TOOLS]).toContain(tool);
+			}
+		}
+	});
+});
+
+describe('a failure names a remedy the user can actually reach', () => {
+	it('the MISSING-tool unsafe_init is rendered without blaming one capability', async () => {
+		// Reachable from EITHER capability now: a CLI or account that does not grant
+		// a requested tool reports fewer tools than the run asked for. Driven end to
+		// end - a READS-on run against a session reporting no tools - because the
+		// point is the copy the user is left holding, and attributing it to web
+		// search sends someone whose search toggle is already off to turn it off.
+		const noTools = JSON.stringify({ type: 'system', subtype: 'init', tools: [], mcp_servers: [], slash_commands: [], skills: [], claude_code_version: '9.9.9-stub' });
+		stubClaude([`cat > /dev/null`, `echo '${noTools}'`, `echo '{"type":"result","subtype":"success","is_error":false,"result":"hi"}'`].join('\n'));
+		// The root must EXIST: the engine spawns the child with it as cwd.
+		const ws = mkdtempSync(join(tmpdir(), 'cellar-chat-ws-'));
+		let res: ChatEngineResult;
+		try {
+			res = await run({ readRoot: ws, notebookPath: NB });
+		} finally {
+			rmSync(ws, { recursive: true, force: true });
+		}
+		expect(res.ok).toBe(false);
+		expect(res.failure?.kind).toBe('unsafe_init');
+		expect(res.failure?.message).toMatch(/missing/i);
+
+		const md = chatFailureMarkdown(res.failure as ChatEngineFailure);
+		// It points at the group that holds every capability, and never singles out
+		// a toggle this run may have had OFF.
+		expect(md).toContain('Chat cells');
+		expect(md).not.toMatch(/turn \*\*Allow web search\*\* off/i);
+		// It still says what happened: the run was refused, not answered.
+		expect(md).toMatch(/refused to run/i);
+	});
+
+	it('a vanished workspace is not reported as a missing CLI', async () => {
+		// Reads-on spawns the child WITH the workspace as its cwd, so a directory
+		// deleted between `chatReadableWorkspace()`'s check and the spawn makes node
+		// raise ENOENT - the SAME code, and (measured) the same `path`/`syscall`, as
+		// a missing binary. Blaming the CLI there tells the user to install
+		// something they already have.
+		const gone = join(tmpdir(), 'cellar-chat-vanished-workspace-xyz');
+		rmSync(gone, { recursive: true, force: true });
+		stubClaude(`echo '{"type":"result","subtype":"success","is_error":false,"result":"hi"}'`);
+		const res = await run({ readRoot: gone, notebookPath: NB });
+		expect(res.ok).toBe(false);
+		expect(res.failure?.kind).toBe('api_error');
+		expect(res.failure?.message).toContain(gone);
+		expect(res.failure?.message).not.toMatch(/PATH/);
+
+		// ...while a genuinely absent binary still reports itself, over the very
+		// same ENOENT - the two must not be collapsed in either direction. PATH is
+		// narrowed to the stub dir for this half, or a developer machine with the
+		// real `claude` installed would simply run it and prove nothing.
+		const withStub = process.env.PATH;
+		rmSync(join(BIN, 'claude'), { force: true });
+		process.env.PATH = BIN;
+		try {
+			const missing = await run();
+			expect(missing.failure?.kind).toBe('not_installed');
+			expect(missing.failure?.message).toMatch(/not found on PATH/);
+		} finally {
+			process.env.PATH = withStub;
+			stubClaude(`echo '{"type":"result","subtype":"success","is_error":false,"result":"hi"}'`);
+		}
+	});
+});
+
 describe('the init assertion fails closed', () => {
 	it('a capable session is killed: unsafe_init, zero deltas delivered', async () => {
 		const badInit = JSON.stringify({ type: 'system', subtype: 'init', tools: ['Bash'], mcp_servers: [], slash_commands: [], skills: [], claude_code_version: '9.9.9-stub' });
@@ -337,7 +1024,7 @@ describe('the init assertion fails closed', () => {
 
 	it('the assertion is an EXACT allowlist, never a relaxation - both capability shapes, both directions', () => {
 		const base = { mcp_servers: [], slash_commands: [], skills: [] };
-		const allow = chatToolAllowlist(true);
+		const allow = chatToolPolicy({ webSearch: true }).tools;
 		// The search-on session must hold exactly what it requested…
 		expect(initViolation({ ...base, tools: [WEB_SEARCH_TOOL] }, allow)).toBeNull();
 		// …never MORE (not "contains", not "non-empty": one unrequested tool beside

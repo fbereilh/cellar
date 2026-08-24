@@ -5,7 +5,7 @@
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
 	import { getUserSettingFlag, getUserSettingText, setUserSetting, setUserSettingNow } from '$lib/userSettings';
-	import { CHAT_MODEL_KEY, CHAT_MODELS, CHAT_WEB_SEARCH_KEY, normalizeChatModel } from '$lib/chatCell';
+	import { CHAT_MODEL_KEY, CHAT_MODELS, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, normalizeChatModel } from '$lib/chatCell';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import {
 		UPLOAD_DATE_TOKENS,
@@ -22,6 +22,13 @@
 	interface Props {
 		open: boolean;
 		theme: string;
+		/**
+		 * The notebook the shell is showing, workspace-relative, or null. Threaded
+		 * in (not re-read) so the chat reads-availability report below can name
+		 * WHICH notebook is at fault: that verdict is per notebook, so reads can be
+		 * unavailable here while working in the notebook beside it.
+		 */
+		activeNotebookPath?: string | null;
 		/**
 		 * Windowed rendering. This is the SAME shell state the navbar View-menu
 		 * toggle reads and writes (`+page.svelte`, persisted once through
@@ -56,7 +63,8 @@
 		onSetTheme,
 		onToggleVirtualizeCells,
 		onToggleShowCodeRoot,
-		onVenvRebound
+		onVenvRebound,
+		activeNotebookPath = null
 	}: Props = $props();
 
 	const THEMES = [
@@ -217,11 +225,11 @@
 		);
 	}
 
-	// ---- Chat cells (model + web search) --------------------------------------
+	// ---- Chat cells (model + web search + workspace reads) --------------------
 	// Person-scoped like the account slot beside them in the same `~/.cellar/`
-	// store: which model a reply bills, and whether a reply may search the web,
-	// are about the person's subscription and their data-egress choice, not about
-	// any one project. Seeded when the modal first opens (the upload-defaults
+	// store: which model a reply bills, whether a reply may search the web, and
+	// whether it may read this machine's files are about the person's
+	// subscription and their data/egress choices, not about any one project. Seeded when the modal first opens (the upload-defaults
 	// hydration rule: this component is mounted for the life of the shell, so a
 	// construction-time read would latch the pre-hydration empty store). Reads go
 	// through the shared gates (`normalizeChatModel`, the strict `=== true` flag
@@ -229,12 +237,83 @@
 	// untyped store means.
 	let chatModel = $state(normalizeChatModel(undefined));
 	let chatWebSearch = $state(false);
+	let chatWorkspaceReads = $state(false);
+	let chatOtherNotebooks = $state(false);
 	let chatHydrated = false;
 	$effect(() => {
 		if (!open || chatHydrated) return;
 		chatHydrated = true;
 		chatModel = normalizeChatModel(getUserSettingText(CHAT_MODEL_KEY));
 		chatWebSearch = getUserSettingFlag(CHAT_WEB_SEARCH_KEY);
+		chatWorkspaceReads = getUserSettingFlag(CHAT_WORKSPACE_READS_KEY);
+		chatOtherNotebooks = getUserSettingFlag(CHAT_OTHER_NOTEBOOKS_KEY);
+	});
+
+	// DETECT + REPORT (the `sdkDbutils` precedent): workspace reads fail CLOSED on a
+	// workspace path or notebook name Cellar cannot express as a literal permission
+	// rule, and that fallback is otherwise SILENT - the toggle stays on and the copy
+	// below still promises reads, while only the model is told otherwise, so the
+	// person meets a reply that merely seems broken.
+	//
+	// Served by its OWN route (`/api/chat/reads`), never `/api/chat/status`: that
+	// one awaits `claude auth status` spawns, so riding it made opening this modal
+	// spawn the CLI for everyone - including users who never touch chat cells - and
+	// put the notice behind authentication latency. This verdict is a pure function
+	// of two path strings and spawns nothing. It comes from the SAME character rule
+	// the engine applies, so the pane can never promise what a run would refuse.
+	interface ReadsVerdict {
+		available: boolean;
+		blocked?: { cause: string; kind: string; segment?: string; isNotebookName?: boolean };
+		notebook?: string;
+	}
+	let chatReads = $state<ReadsVerdict | null>(null);
+	// Generation guard (the `statusSeq`/`kernelReqSeq` convention): the active
+	// notebook can change while a read is in flight, and this notice NAMES a
+	// notebook - a late reply landing over a newer one would assert the wrong thing
+	// about a healthy notebook, the exact dishonesty this surface exists to remove.
+	let readsSeq = 0;
+	$effect(() => {
+		if (!open) return;
+		const nb = activeNotebookPath;
+		const seq = ++readsSeq;
+		// CLEARED before the request, not merely overwritten after it: until the new
+		// verdict lands there is nothing true to say, and holding the PREVIOUS one
+		// would keep a sentence naming another notebook on screen.
+		chatReads = null;
+		const qs = nb ? `?notebook=${encodeURIComponent(nb)}` : '';
+		void fetch(`/api/chat/reads${qs}`)
+			.then((r) => (r.ok ? r.json() : null))
+			.then((body) => {
+				if (seq !== readsSeq) return;
+				chatReads = body ?? null;
+			})
+			.catch(() => {
+				// A failed probe reports NOTHING rather than claiming reads are broken:
+				// over-reporting would send someone chasing a problem they do not have.
+				if (seq === readsSeq) chatReads = null;
+			});
+	});
+
+	// The sentence the report renders. Every branch states only what was actually
+	// established, and offers a remedy ONLY where one can work - this module's own
+	// doctrine is that a remedy the user cannot act on is worse than none.
+	const chatReadsNotice = $derived.by(() => {
+		const blocked = chatReads && !chatReads.available ? chatReads.blocked : null;
+		if (!blocked) return null;
+		// STRUCTURAL: the `//` rule prefix is POSIX-only, so on Windows every path
+		// fails this way. No rename can fix it, so none is offered.
+		if (blocked.kind !== 'character')
+			return 'Workspace reads are not available on this platform: Cellar can only express these permission rules for POSIX paths, so it refuses rather than granting reads it could not confine.';
+		const seg = blocked.segment ? ` ("${blocked.segment}")` : '';
+		if (blocked.cause === 'workspace')
+			return `Reads cannot be enabled in this workspace: a folder in its path${seg} contains a character Cellar cannot express as a safe permission rule, so it refuses rather than granting reads it could not confine. Renaming that folder restores it.`;
+		// The notebook cause fires for the notebook's OWN name or for an ancestor
+		// directory inside the workspace - naming the wrong one would send the person
+		// to rename something that cannot help.
+		const what = blocked.isNotebookName ? 'this notebook' : 'that folder';
+		const where = blocked.isNotebookName ? 'its name' : `a folder in its path${seg}`;
+		const named = chatReads?.notebook ? ` (${chatReads.notebook})` : '';
+		return `Reads cannot be enabled for the notebook you are in${named}: ${where} contains a character Cellar cannot express as a safe permission rule, so it refuses rather than granting reads whose confinement it could not prove. Other notebooks in this workspace are unaffected; renaming ${what} restores it.`;
 	});
 
 	// Both write through `setUserSettingNow`, NEVER the debounced `setUserSetting`:
@@ -259,6 +338,28 @@
 		// OFF deletes the key rather than storing `false`: absent = the default =
 		// today's bare session, so a store that was never opted in carries nothing.
 		void setUserSettingNow(CHAT_WEB_SEARCH_KEY, chatWebSearch ? true : null);
+	}
+
+	// Its own key and its own toggle, never a mode shared with web search: the two
+	// widen the session in different directions (an outbound query channel vs.
+	// local file reach), so wanting one must not hand over the other. Same
+	// `setUserSettingNow` rule for the same security reason - the server re-reads
+	// this key when a chat cell RUNS, so an opt-OUT still sitting in a debounce
+	// window would let the very next run keep its file grant.
+	function toggleChatWorkspaceReads() {
+		chatWorkspaceReads = !chatWorkspaceReads;
+		void setUserSettingNow(CHAT_WORKSPACE_READS_KEY, chatWorkspaceReads ? true : null);
+	}
+
+	// A NARROWING of the read grant, not a capability of its own - inert while
+	// reads are off, and it can never expose the notebook being chatted in, which
+	// the engine denies whatever this says. Its own key and its own handler for
+	// the same reason as its neighbours, and the same `setUserSettingNow` rule:
+	// the server re-reads it when a chat cell RUNS, so an opt-OUT left sitting in
+	// a debounce window would let the very next run still reach other notebooks.
+	function toggleChatOtherNotebooks() {
+		chatOtherNotebooks = !chatOtherNotebooks;
+		void setUserSettingNow(CHAT_OTHER_NOTEBOOKS_KEY, chatOtherNotebooks ? true : null);
 	}
 
 	// ---- Keyboard shortcuts --------------------------------------------------
@@ -608,11 +709,14 @@
 				<div class="divider my-1"></div>
 
 				<!-- Chat cells. Person-level like the upload defaults above: the model a
-				     reply bills and the web-search opt-in follow the person across
-				     projects. The toggle's copy states what turning it on actually
-				     grants (search only) and what it sends (queries derived from the
-				     notebook), because this is the control that decides whether
-				     notebook-derived text can reach an external service. -->
+				     reply bills and the two capability opt-ins follow the person across
+				     projects. Each toggle's copy states what turning it on actually
+				     grants and what it costs - search only, queries derived from the
+				     notebook; reads confined to this workspace and read-only - because
+				     these are the controls deciding whether notebook-derived text can
+				     reach an external service and whether a reply can read local
+				     files. They are kept SEPARATE (see the handlers): the two widen
+				     the session in different directions. -->
 				<div data-testid="chat-settings-control">
 					<div class="mb-1 text-sm font-medium">Chat cells</div>
 					<label class="flex items-center justify-between gap-4">
@@ -643,10 +747,63 @@
 						/>
 					</label>
 					<p class="mt-1 text-xs text-base-content/50">
-						Off, a chat cell answers from the notebook alone, with every tool disabled. On, a reply
-						may also run web searches - search only: it still cannot fetch arbitrary URLs, run code,
-						or read files. Search queries are derived from your notebook's content, so text from the
-						notebook can reach the search service.
+						Off, a chat cell runs no web searches. On, a reply may run them - search only: it
+						still cannot fetch arbitrary URLs or run code. Search queries are derived from your
+						notebook's content, so text from the notebook can reach the search service.
+					</p>
+					<label class="mt-3 flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Allow reading workspace files</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={chatWorkspaceReads}
+							onchange={toggleChatWorkspaceReads}
+							data-testid="settings-chat-workspace-reads"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						On, a reply may browse and search the files in this workspace to answer about your code
+						(read, glob and grep). Reads are confined to the workspace folder: paths outside it are
+						refused, including through <code>..</code> or a symlink. It is read-only - a chat cell
+						still cannot write or edit files, or run code. The notebook you are chatting in is
+						never readable as a file - the reply already has it as a fresher transcript, with the
+						cells you hid from the agent left out - and neither is Cellar's own
+						<code>.cellar</code> folder. Turn it off if the workspace holds secrets you would
+						rather a reply could not read, especially with web search also on.
+					</p>
+					{#if chatReadsNotice}
+						<!-- DETECT + REPORT: without this the fail-closed fallback is silent -
+						     the toggle above still reads on and the copy still promises reads,
+						     while only the model is told otherwise. Warning ICON plus
+						     base-content copy, per the contrast doctrine (amber body text on
+						     the light card measures ~2:1). -->
+						<p
+							class="mt-1 flex gap-1.5 text-xs text-base-content/70"
+							data-testid="settings-chat-reads-unavailable"
+						>
+							<span class="text-warning" aria-hidden="true">&#9888;</span>
+							<span>{chatReadsNotice}</span>
+						</p>
+					{/if}
+					<label class="mt-3 flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Allow reading other notebooks</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={chatOtherNotebooks}
+							onchange={toggleChatOtherNotebooks}
+							data-testid="settings-chat-other-notebooks"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						Only applies while workspace reads are on. Off, the other <code>.ipynb</code> files in
+						this workspace are not readable either, so a reply still reads <code>.py</code>,
+						<code>.md</code> and data files. On, it may read them - including any cells their
+						authors hid from the agent. The notebook you are chatting in stays unreadable
+						either way. This covers <code>.ipynb</code> files: another notebook's exported
+						copies (its "Save as .py" and its exported <code>.html</code>, which are ordinary
+						workspace files) and any jupytext <code>.py</code> notebook stay readable whether
+						this is on or off.
 					</p>
 				</div>
 

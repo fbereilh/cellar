@@ -14,6 +14,43 @@
  *    the MCP read surface, same predicate, so one flag means one thing
  *    everywhere: "this cell is not shown to AI".
  *
+ *    **Its SCOPE, stated precisely, because a reads-on run has file reach.** The
+ *    filter below bounds the TRANSCRIPT; on its own that would leave a hidden
+ *    cell one `Read('<ws>/notebook.ipynb')` away, since the notebook file (and
+ *    `.cellar/checkpoints.json`, which snapshots cells WITH outputs) sits inside
+ *    the confinement root. So the two halves are paired: this filter bounds what
+ *    is SENT, and `server/chat/claude-cli.ts`'s `denialPatterns` denies, at the
+ *    tool layer on EVERY reads-on run and never optionally, the current notebook,
+ *    the artifacts Cellar names after it (`<stem>.py`, `<stem>.html`, the
+ *    `.ipynb_checkpoints` copy - none of those writers filters hidden cells), and
+ *    `.cellar/` whole.
+ *
+ *    **The claim that supports, exactly, and its two residuals.** What holds is
+ *    the narrow statement: a hidden cell in THIS notebook is unreachable through
+ *    the notebook file, the copies named after it, and the checkpoint store -
+ *    which is what keeps `chatPromptTooLargeMessage`'s "hide cells from the
+ *    agent" remedy honest. It is NOT a general "hidden cells cannot be read".
+ *    Three residuals, all stated rather than glossed: (a) a hidden cell in a
+ *    DIFFERENT notebook's `.ipynb` is reachable when the person turns the
+ *    other-notebooks option on, which is what that option, defaulting OFF,
+ *    exists to decide; (b) a derived artifact written to a NON-DEFAULT path is
+ *    invisible to a by-name rule - specifically MCP `export_html` called with an
+ *    explicit `path`, and an nbdev export module at a configured
+ *    `metadata.cellar.export_target`, neither of which is derivable from the
+ *    notebook's name; and (c) ANOTHER notebook's DEFAULT-PATH exports, plus any
+ *    jupytext `.py` notebook, are readable whether that option is on or OFF -
+ *    the other-notebooks block covers `.ipynb` files, while the by-name
+ *    derivation is built from the CURRENT notebook's stem alone, so `<other>.py`
+ *    and `<other>.html` stay readable and carry every cell of that notebook
+ *    (neither writer filters hidden cells). Widening the block to those file
+ *    types is deliberately rejected - it would deny what a reads-on reply exists
+ *    to read. And (d) on a SYMLINKED root a prompt-injected LEXICAL absolute path
+ *    can still evade Grep: the policy is built in the canonical namespace and
+ *    denies both spellings, but the CLI's deny binds only when the path the tool
+ *    is handed shares the rule's namespace while its grant binds across both.
+ *    That is an ACCEPTED residual - the alternative was refusing reads for every
+ *    `/tmp` and `/var` workspace - and it cannot be closed from outside the CLI.
+ *
  * 2. **The transcript is BYTE-STABLE across runs of an unchanged notebook.**
  *    Prompt caching keys on an exact prefix and is what makes a long notebook
  *    affordable (a measured 22.6x cost reduction on a warm re-run) - so nothing

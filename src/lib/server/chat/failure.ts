@@ -47,11 +47,11 @@ function headline(failure: ChatEngineFailure): string {
 				'Usually the session reported MORE than this run allows (tools beyond its ' +
 				'allowlist, MCP servers or slash commands - or no report at all). That means a ' +
 				'claude CLI update changed flag behavior; report it rather than working around it.\n\n' +
-				'If instead the report is **missing** a tool this run requested - only reachable ' +
-				'with **Allow web search** on, when the CLI or the signed-in account does not ' +
-				'grant it (an older `claude` CLI, or an org/plan with search disabled, reports no ' +
-				'tools at all) - turn **Allow web search** off under **Chat cells** in Settings ' +
-				'and re-run.'
+				'If instead the report is **missing** a tool this run requested, the CLI or the ' +
+				'signed-in account does not grant that tool (an older `claude` CLI, or an ' +
+				'org/plan with it disabled). That is reachable from any chat capability you ' +
+				'have enabled, so turn the capabilities off under **Chat cells** in Settings - ' +
+				'a chat cell with none of them runs no tools at all - and re-run.'
 			);
 		case 'transcript_too_large':
 			// The engine never ran, so the whole message is Cellar's own: the size and

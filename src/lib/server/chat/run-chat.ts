@@ -18,10 +18,23 @@
  * is gone for good, only what streamed after the clear persists.
  */
 
+import { statSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { workspaceRoot } from '../fstree';
 import { listCells } from '../notebook';
 import type { OutputAccumulator } from '../output-accumulator';
 import type { CellOutput } from '../types';
-import { CHAT_MODEL_KEY, CHAT_WEB_SEARCH_KEY, chatWebSearchEnabled, normalizeChatModel, type ChatFailureKind } from '$lib/chatCell';
+import {
+	CHAT_MODEL_KEY,
+	CHAT_OTHER_NOTEBOOKS_KEY,
+	CHAT_WEB_SEARCH_KEY,
+	CHAT_WORKSPACE_READS_KEY,
+	chatOtherNotebooksEnabled,
+	chatWebSearchEnabled,
+	chatWorkspaceReadsEnabled,
+	normalizeChatModel,
+	type ChatFailureKind
+} from '$lib/chatCell';
 import { asText } from '$lib/outputText';
 import { getUserSettings } from '$lib/server/user-settings';
 import { registerChatRun, unregisterChatRun } from './active';
@@ -104,15 +117,28 @@ export async function executeChatRun({
 		// The engine's capability inputs, read from the person-scoped store at run
 		// time (the `auth.ts` CHAT_SLOT_KEY pattern) through the shared gates: the
 		// model is constrained to the known set BEFORE it rides the seam (and the
-		// engine re-normalizes - no path to argv skips the gate), and web search is
-		// on only for a literal stored `true`, so absent keys are exactly the
-		// pre-settings behavior.
+		// engine re-normalizes - no path to argv skips the gate), and each capability
+		// is on only for a literal stored `true`, so absent keys are exactly the
+		// pre-settings behavior. The opt-ins are read from SEPARATE keys and composed
+		// here rather than in the store: web search and workspace reads widen the
+		// session in different directions (an outbound query channel vs. local file
+		// reach), so neither may arrive as a side effect of the other, while the
+		// other-notebooks key only ever NARROWS the read grant and is inert unless
+		// reads are already on.
 		const settings = getUserSettings();
 		const res = await chatEngine().run({
 			prompt,
 			configDir: configDirFor(auth),
 			model: normalizeChatModel(settings[CHAT_MODEL_KEY]),
 			webSearch: chatWebSearchEnabled(settings[CHAT_WEB_SEARCH_KEY]),
+			readRoot: chatWorkspaceReadsEnabled(settings[CHAT_WORKSPACE_READS_KEY]) ? chatReadableWorkspace() : null,
+			// The notebook this run is answering in, so the engine can DENY it: the
+			// model already holds it as a fresher, hidden-cell-filtered transcript, so
+			// reading the file could only add a stale copy and the cells the user
+			// deliberately withheld. `nb` is the resolved absolute path the whole run
+			// pipeline is keyed by, which is exactly what the deny rule needs.
+			notebookPath: nb,
+			otherNotebooks: chatOtherNotebooksEnabled(settings[CHAT_OTHER_NOTEBOOKS_KEY]),
 			signal: ctrl.signal,
 			onDelta: (text) => {
 				if (!text) return;
@@ -133,6 +159,35 @@ export async function executeChatRun({
 		return { status: 'error' };
 	} finally {
 		unregisterChatRun(nb, ctrl);
+	}
+}
+
+/**
+ * The directory a reads-on chat run is confined to: the WORKSPACE, or null when
+ * it cannot be established.
+ *
+ * The workspace and NOT the notebook's code root, deliberately - a code root may
+ * be an external git worktree, and Cellar's standing rule is that such a root
+ * grants a kernel cwd and not one byte of file reach, every file surface staying
+ * workspace-scoped. Reads follow that rule rather than inventing a second answer
+ * to "which directory may this notebook see".
+ *
+ * A root that is not an existing directory yields null (= reads off) rather than
+ * being passed on: the engine spawns the child WITH this as its cwd, so a
+ * missing one would surface as a spawn ENOENT, and a read-less run is the
+ * safe degradation - the frozen prompt is chosen from the same policy, so such a
+ * run is also TOLD it cannot read rather than being left to discover it.
+ *
+ * It cannot close the race, only narrow it - the directory can still go away
+ * between this check and the spawn - so `spawnFailure` re-asks there and names
+ * the workspace instead of blaming a CLI that is installed.
+ */
+function chatReadableWorkspace(): string | null {
+	try {
+		const root = resolve(workspaceRoot());
+		return statSync(root).isDirectory() ? root : null;
+	} catch {
+		return null;
 	}
 }
 

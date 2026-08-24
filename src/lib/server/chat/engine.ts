@@ -36,6 +36,32 @@ export interface ChatEngineRunArgs {
 	 * exactly that - search is mediated; arbitrary URL fetch stays off.
 	 */
 	webSearch?: boolean;
+	/**
+	 * May this run READ files, and where? Absent/null = no file tools at all
+	 * (today's bare session). A non-null value is the ABSOLUTE directory reads are
+	 * confined to - the claude engine turns it into path-scoped `--allowedTools`
+	 * rules and refuses (read-less) anything it cannot confine, so this is a
+	 * confinement root and never a mere hint. The caller passes the WORKSPACE, not
+	 * a notebook code root: a code root may sit outside the workspace and grants
+	 * no file reach anywhere else in Cellar.
+	 */
+	readRoot?: string | null;
+	/**
+	 * The ABSOLUTE path of the notebook this run answers in. REQUIRED, not
+	 * optional: with reads on the engine DENIES this file (the model already holds
+	 * the notebook as a fresher, hidden-cell-filtered transcript, so reading it
+	 * could only add a stale copy and the cells the user withheld), and a run that
+	 * cannot name it gets no file tools at all rather than an unbounded grant.
+	 * Pass null only where there is genuinely no notebook - that too is read-less.
+	 */
+	notebookPath: string | null;
+	/**
+	 * May OTHER notebooks in the workspace be read? Only a literal `true` opens
+	 * them; absent/false additionally denies every `*.ipynb` there, so a reply
+	 * still reads `.py`, `.md` and data files. The notebook named above and
+	 * Cellar's own `.cellar/` state stay denied either way.
+	 */
+	otherNotebooks?: boolean;
 	/** Aborted by interrupt / kernel restart / shutdown; the engine must kill its work. */
 	signal: AbortSignal;
 	/** Streamed reply text, in order, as it is produced. */
