@@ -1884,7 +1884,11 @@ export function setExportTarget(
 		return { ok: false as const, writeFailed: String((err as Error)?.message ?? err) };
 	}
 	const where = exportTargetFields(nbTarget);
-	return { ...where, ...moduleFailure(nbTarget, where.export_target) };
+	// A failed write and an unimportable module are mutually exclusive (a failure
+	// means nothing was written), so the failure is asked first and the hazard only
+	// where there is a module to be about.
+	const failed = moduleFailure(nbTarget, where.export_target);
+	return { ...where, ...('module' in failed ? failed : moduleHazard(nbTarget, where.export_target)) };
 }
 
 /**
@@ -2095,6 +2099,43 @@ function moduleFailure(target: string, exportTarget: string | null) {
 }
 
 /**
+ * The module IS on disk as the marks describe it, and CANNOT BE IMPORTED: a marked
+ * cell holds a construct that makes the assembled module uncompilable
+ * (`$lib/exportHazard`). Empty whenever nothing is detected.
+ *
+ * Reported under `warning`, never `reason`, because the two say opposite things
+ * about the same file - `reason` explains a module that was NOT written, this
+ * explains one that WAS and is broken - and an agent acting on the wrong one would
+ * either re-export a file that is already there or stop believing it exists.
+ *
+ * Shared by BOTH export write tools, like `moduleFailure` and for the same reason:
+ * both REGENERATE the module, so both can produce this file, and one place to read
+ * what happened to it beats two that can drift. The "nothing is marked" case is
+ * the one that stays `setCellExport`-only (see `moduleWarning`); a hazard is a
+ * surprise on either path, never a restatement of what the caller just did.
+ *
+ * Needs no `wrote`/exists gate of its own: with nothing marked there are no
+ * hazards, so it is silent in exactly the case where no module was written.
+ */
+function moduleHazard(target: string, exportTarget: string | null) {
+	if (!exportTarget) return {};
+	const hazards = exportHazardsFor(target);
+	if (!hazards.length) return {};
+	return {
+		// `reason: undefined` is declared, not omitted, so the two variants stay a
+		// DISCRIMINATED union that every reader can still probe by key without
+		// narrowing first - the discriminant is `regenerated`, and the keys say
+		// which question was answered. `regenerated: true` is the same claim
+		// `moduleWarning`'s empty return makes: the file matches the marks.
+		module: {
+			regenerated: true as const,
+			reason: undefined,
+			warning: `${exportTarget} was written, but ${hazards[0].message}`
+		}
+	};
+}
+
+/**
  * The honesty half of `setCellExport`: report when the call left the generated
  * module UNREGENERATED, through the one `module` field. Present ONLY then, so an
  * ordinary call pays no tokens for it - the `undo` field on `clearOutputs` is the
@@ -2106,16 +2147,6 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * the previously exported symbols on disk where an `import` still resolves them -
  * or the call WROTE NOTHING and no module is on disk.
  *
- * A FOURTH case is reported through the same field but says the opposite thing, so
- * it carries its own key (`warning`, never `reason`): the module IS on disk as the
- * marks describe it and CANNOT BE IMPORTED, because a marked cell holds a construct
- * that makes the assembled module uncompilable (`$lib/exportHazard`). Without it an
- * agent marking such a cell got a clean result for a module whose every symbol is
- * unreachable, and would only find out at the eventual `import`. It is a POSITIVE
- * finding about a construct that was DETECTED - the class of module that fails
- * `compile` is wider - so an absent `warning` means "none of the checks fired",
- * never "this module compiles"; `$lib/exportHazard` states the measured boundary.
- *
  * That third case is what `wrote` is for. `lastExportError` is doc state this
  * process may never have written: an idempotent call (every addressed cell already
  * at the requested value) skips the persist entirely, so on a freshly opened doc -
@@ -2125,6 +2156,16 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * already covered: it either succeeded, so the module is there, or it threw, which
  * `moduleFailure` reports - so only the no-write path consults the disk, and it
  * decides from what is actually there rather than from a record nobody wrote.
+ *
+ * A FOURTH case is reported through the same field but says the opposite thing, so
+ * it carries its own key (`warning`, never `reason`): the module IS on disk as the
+ * marks describe it and CANNOT BE IMPORTED, because a marked cell holds a construct
+ * that makes the assembled module uncompilable (`$lib/exportHazard`). Without it an
+ * agent marking such a cell got a clean result for a module whose every symbol is
+ * unreachable, and would only find out at the eventual `import`. It is a POSITIVE
+ * finding about a construct that was DETECTED - the class of module that fails
+ * `compile` is wider - so an absent `warning` means "none of the checks fired",
+ * never "this module compiles"; `$lib/exportHazard` states the measured boundary.
  *
  * That second case is deliberately NOT reported by `setExportTarget`, which shares
  * only `moduleFailure`: naming a target before marking anything is the normal
@@ -2161,28 +2202,9 @@ function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean
 					warning: undefined
 				}
 			};
-		// The module IS on disk as the marks describe it, and CANNOT BE IMPORTED:
-		// a marked cell carries a construct that makes it uncompilable. Reported
-		// under `warning`, never `reason`, because the two say opposite things about
-		// the same file - `reason` explains a module that was NOT written, this
-		// explains one that WAS and is broken - and an agent that acted on the wrong
-		// one would either re-export a file that is already there or stop believing
-		// the file exists. `regenerated: true` is the same claim the empty return
-		// makes: the file matches the marks (see the `wrote || exists` gate above).
-		const hazards = exportHazardsFor(target);
-		if (hazards.length)
-			return {
-				// `reason: undefined` is declared, not omitted, so the two variants stay a
-				// DISCRIMINATED union that every reader can still probe by key without
-				// narrowing first - the discriminant is `regenerated`, and the keys say
-				// which question was answered.
-				module: {
-					regenerated: true as const,
-					reason: undefined,
-					warning: `${exportTarget} was written, but ${hazards[0].message}`
-				}
-			};
-		return {};
+		// The module matches the marks (the gate above) - so the remaining question is
+		// whether it can be IMPORTED.
+		return moduleHazard(target, exportTarget);
 	}
 	return {
 		module: {

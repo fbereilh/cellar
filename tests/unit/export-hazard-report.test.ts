@@ -187,6 +187,25 @@ describe('the agent surface', () => {
 		expect(r.ok && r.module?.reason).toBeUndefined();
 	});
 
+	it('set_export_target reports it too - it regenerates the same module', async () => {
+		// The target is often named AFTER the cells are marked, so this path can be the
+		// one that first writes the broken module. Reporting on only one of the two
+		// export write tools would leave that agent with a clean result.
+		const target = abs('agent-target.ipynb');
+		svc.useNotebook('sess-agent-target', 'agent-target.ipynb');
+		const { ids } = await svc.addCells([{ cell_type: 'code', source: JOINED }], null, {
+			nb: target,
+			routeImports: false
+		});
+		nbmod.setCellExports([svc.resolveRef(target, ids[0])], true, target);
+
+		// The success shape carries no `ok` - it is the target fields plus, only when
+		// there is something to say, `module`.
+		const r = svc.setExportTarget('out/agent-target.py', target) as { module?: { warning?: string } };
+		expect(r.module?.warning).toContain('will not import');
+		expect(r.module?.warning).toContain('out/agent-target.py');
+	});
+
 	it('says nothing at all for a healthy export', async () => {
 		const target = abs('agent-clean.ipynb');
 		svc.useNotebook('sess-agent-clean', 'agent-clean.ipynb');
