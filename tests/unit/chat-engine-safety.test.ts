@@ -284,6 +284,20 @@ describe('the frozen flag set', () => {
 		expect(CHAT_SYSTEM_PROMPT).toContain('no tools');
 		expect(CHAT_SYSTEM_PROMPT_WEB_SEARCH).not.toContain('cannot run code, read files, or browse');
 		expect(CHAT_SYSTEM_PROMPT_WEB_SEARCH).toContain('web search');
+		// EVERY shape requires a language-TAGGED fence. It rides the SHARED framing
+		// because it is capability-INDEPENDENT - a fact about the reply's FORMAT, and
+		// every shape's reply is read by the same notebook - so it is asserted over
+		// all four rather than over the two that happen to be in view here. It is a
+		// product contract, not style advice: a rendered code block is lifted straight
+		// into a cell (`$lib/codeBlockExtract`) and the fence tag picks that cell's
+		// TYPE, so an untagged block silently becomes a Python cell and an unfenced
+		// one gets no control at all.
+		for (const prompt of [CHAT_SYSTEM_PROMPT, CHAT_SYSTEM_PROMPT_WEB_SEARCH, CHAT_SYSTEM_PROMPT_READS, CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH]) {
+			expect(prompt).toContain('ALWAYS put code in a fenced block tagged with its language');
+			expect(prompt).toContain('```python');
+			expect(prompt).toContain('```sql');
+			expect(prompt).toContain('```markdown');
+		}
 		expect(chatSystemPrompt(chatToolPolicy())).toBe(CHAT_SYSTEM_PROMPT);
 		expect(chatSystemPrompt(chatToolPolicy({ webSearch: true }))).toBe(CHAT_SYSTEM_PROMPT_WEB_SEARCH);
 		// One rule for request, grant and assertion: the argv's values ARE the policy.

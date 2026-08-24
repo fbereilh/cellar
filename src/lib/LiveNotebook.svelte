@@ -35,6 +35,13 @@
 	import type { SearchCache } from '$lib/search';
 	import { buildCellHighlights, type SearchHighlightState } from '$lib/searchHighlight';
 	import { shortcuts, chordFromEvent, SEQUENCE_TIMEOUT_MS } from '$lib/shortcuts.svelte';
+	import {
+		EXTRACT_TESTID,
+		flashExtracted,
+		readCodeBlock,
+		targetCodeBlock,
+		type ExtractedCodeBlock
+	} from '$lib/codeBlockExtract';
 	import { applyWidgetEvent, isWidgetEvent } from '$lib/widgetStore.svelte';
 	import type { ShortcutMode, EffectiveShortcut } from '$lib/shortcuts.svelte';
 	import { getUi, setUi } from '$lib/uiState';
@@ -2899,6 +2906,140 @@
 		return created.id;
 	}
 
+	// ---- Extract a rendered code block into a cell ---------------------------
+	/**
+	 * Where the NEXT block extracted from `sourceId` lands, per source cell.
+	 *
+	 * Without it, extracting three blocks top-to-bottom - each "directly below the
+	 * chat cell" - stacks them in REVERSE. So each extraction remembers the cell it
+	 * created and the next one goes after THAT, giving the reading order of the
+	 * reply. It is a fact about a run of extractions rather than about the
+	 * document, so it lives here (in the notebook, which survives a windowed
+	 * unmount of the cell) and is deliberately NOT persisted: after a reload the
+	 * anchor is simply the source cell again, which is the honest default.
+	 *
+	 * Self-healing rather than trusted - the user may have deleted the anchor,
+	 * moved it above the source cell, or moved the source cell past it - so
+	 * {@link extractAnchor} re-derives it from the CURRENT order every time and
+	 * falls back to the source cell whenever it no longer makes sense.
+	 */
+	const extractAnchors = new Map<string, string>();
+
+	/** The cell a new extraction is inserted after: the last one still sitting below `sourceId`. */
+	function extractAnchor(sourceId: string): string {
+		const from = cells.findIndex((c) => c.id === sourceId);
+		const last = extractAnchors.get(sourceId);
+		const at = last ? cells.findIndex((c) => c.id === last) : -1;
+		return at > from ? (last as string) : sourceId;
+	}
+
+	/**
+	 * One extraction at a time PER SOURCE CELL, so reading the anchor above and
+	 * recording the cell it produced is ONE critical section.
+	 *
+	 * The anchor resolves before the `await` and is recorded after it, so two clicks
+	 * issued inside a single round trip - easy to do, since that trip includes a
+	 * synchronous fsync'd `.ipynb` persist - both resolved to the source cell and
+	 * both inserted directly after it, landing block A then block B as
+	 * `[source, B, A]`: exactly the reversal the anchor exists to prevent. Serializing
+	 * is the `withPathLock` shape, tail-chained per source cell and dropped when the
+	 * chain drains so the map never grows; two DIFFERENT source cells still run in
+	 * parallel, because the anchor they contend for is per source cell too.
+	 */
+	const extractChains = new Map<string, Promise<unknown>>();
+
+	function withExtractLock<T>(sourceId: string, fn: () => Promise<T>): Promise<T> {
+		const prev = extractChains.get(sourceId) ?? Promise.resolve();
+		const run = prev.then(fn);
+		const tail = run.then(
+			() => {},
+			() => {}
+		);
+		extractChains.set(sourceId, tail);
+		tail.then(() => {
+			if (extractChains.get(sourceId) === tail) extractChains.delete(sourceId);
+		});
+		return run;
+	}
+
+	/**
+	 * Create a cell below `sourceId` holding `block`'s code, with the type its
+	 * fence asked for. The ONE extraction path: the control on the block and the
+	 * keyboard chord both land here, and both read the block through the same
+	 * `$lib/codeBlockExtract` rule, so neither can produce a cell the other would
+	 * not.
+	 *
+	 * FOCUS AND SELECTION ARE DELIBERATELY UNTOUCHED - the `insertAndRunCode`
+	 * precedent, for the same reason. The user is READING a reply; the extraction
+	 * is a side action taken with the pointer resting on a block, and moving the
+	 * selection would move DOM focus with it (the keyboard dispatcher reads a
+	 * keystroke's mode off the focused element), yanking them out of the prose and
+	 * scrolling the viewport away from the block they were reading. The new cell
+	 * lands immediately below the source cell, where it is already in view or one
+	 * scroll away, and focus stays on the control - so extracting the next block is
+	 * one Tab or one hover away.
+	 *
+	 * The types a fence can ask for are `code`/`sql`/`markdown`, which EVERY
+	 * notebook format can hold, so there is no `refuseUnsupportedType` gate here:
+	 * `chat` and `raw` are unreachable by construction (see `fenceCellType`).
+	 */
+	async function extractCodeBlock(sourceId: string, block: ExtractedCodeBlock): Promise<boolean> {
+		// The whole read-modify-write of the anchor runs inside the lock, the
+		// still-there check included: a preceding extraction resyncs the model, so
+		// both questions have to be asked against the order this insert will use.
+		return withExtractLock(sourceId, async () => {
+			if (!findCell(sourceId)) return false;
+			try {
+				const created = await addCell(extractAnchor(sourceId), block.cellType, block.source);
+				extractAnchors.set(sourceId, created.id);
+				return true;
+			} catch {
+				// `addCell` has already resynced the model (and named the reason, for the
+				// refusal codes `noticeRefusal` knows). The rejection is caught HERE rather
+				// than left to the caller because both routes are fire-and-forget event
+				// handlers, where an escaping rejection is an unhandled one - and reporting
+				// FALSE is what keeps the control from confirming a cell that never landed.
+				return false;
+			}
+		});
+	}
+
+	/**
+	 * The KEYBOARD route. It resolves its own target from the DOM - the block under
+	 * the pointer, else the one holding focus (`targetCodeBlock` owns that rule and
+	 * why hover wins) - because a chord fired while reading has no other way to
+	 * name one of several blocks in a reply.
+	 *
+	 * BOTH registry entries run THIS ONE action - the primary command-mode `e` and
+	 * the global `Mod-Shift-e` - which is what keeps the two routes resolving the
+	 * same hovered-then-focused target. It is also why there is no per-route "not
+	 * handled" opt-out: returning false is a property of the action, not of the
+	 * chord that reached it, so declining would decline for both. Declining buys
+	 * nothing either way - the key reaches nothing useful in either mode - and a
+	 * control that silently does nothing is the outcome being avoided. So with no
+	 * block in play it SAYS so on the shell's transient line, which is also what
+	 * teaches the feature.
+	 *
+	 * ACCEPTED CONSEQUENCE, stated because it changes what an unbound key used to
+	 * do: this is `async`, so it always returns a Promise and the dispatcher's
+	 * `=== false` check never fires - the keystroke is consumed unconditionally.
+	 * A stray `e` in command mode with no block hovered therefore now shows that
+	 * notice, where before this binding existed `e` was unbound and did nothing.
+	 */
+	async function extractHoveredCodeBlock() {
+		const el = targetCodeBlock(rootEl);
+		const block = readCodeBlock(el);
+		const sourceId = (el?.closest('[data-cell-id]') as HTMLElement | null)?.dataset.cellId;
+		if (!block || !sourceId) {
+			onNotice?.('Hover a code block in a rendered reply or markdown cell, then press the shortcut to extract it.');
+			return;
+		}
+		// Confirm on the block's own control, so the chord and a click leave the same
+		// mark - and only once the cell really landed, so a refused add never leaves
+		// a check (nor the permanent "click again") over a cell that was not created.
+		if (await extractCodeBlock(sourceId, block)) flashExtracted(el?.querySelector(`[data-testid="${EXTRACT_TESTID}"]`));
+	}
+
 	/**
 	 * Say WHY nothing happened when the non-empty invariant refused a delete/cut.
 	 *
@@ -3683,6 +3824,11 @@
 		'paste-below': () => pasteCells('below'),
 		'paste-above': () => pasteCells('above'),
 		'split-cell': () => splitActiveCell(),
+		// One action, both registry entries: the command-mode `e` and the global
+		// `Mod-Shift-e` resolve their target the same way (hover, then focus), so a
+		// Firefox user - whose Ctrl+Shift+E the browser keeps - hovers and presses `e`.
+		'extract-code-block': () => extractHoveredCodeBlock(),
+		'extract-code-block-anywhere': () => extractHoveredCodeBlock(),
 		...Object.fromEntries([1, 2, 3, 4, 5, 6].map((level) => [`heading-${level}`, () => setHeadingLevel(level)]))
 	};
 
@@ -3896,6 +4042,7 @@
 			onSetCellCollapsed={setCellCollapsed}
 			rawEdits={rawEdits}
 			onSetRawEdit={setRawEdit}
+			onExtractCode={extractCodeBlock}
 			onActivate={activateCell}
 			onRegister={registerCell}
 			onEditorFocus={onEditorFocus}

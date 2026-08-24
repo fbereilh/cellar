@@ -30,6 +30,14 @@
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
 	import { matchesCellId } from '$lib/search';
 	import { copyOutputText, hasCopyableOutput } from '$lib/copyCell';
+	import {
+		CODE_BLOCK_ATTR,
+		EXTRACT_TESTID,
+		decorateCodeBlocks,
+		flashExtracted,
+		readCodeBlock,
+		type ExtractedCodeBlock
+	} from '$lib/codeBlockExtract';
 	import { setSurfaceRanges, clearSurface, buildTextRanges, allocSurfaceKey } from '$lib/domHighlight';
 	import { isMac } from '$lib/shortcuts.svelte';
 	import { pointerIntent } from '$lib/cellSelection';
@@ -114,6 +122,10 @@
 		 *  by the notebook, like `editorCollapsed`, so it survives a windowed unmount. */
 		rawEdit?: boolean;
 		onSetRawEdit?: (id: string, raw: boolean) => void;
+		/** Lift a rendered code block out of this cell's prose into a new cell below.
+		 *  Fired by the control the decorator hangs on each block; the KEYBOARD route
+		 *  reaches the same notebook function directly (see `$lib/codeBlockExtract`). */
+		onExtractCode?: (id: string, block: ExtractedCodeBlock) => Promise<boolean>;
 		onActivate?: (id: string, gesture?: CellActivation) => void;
 		/** Find-in-page query (Search P4); empty when the find bar is closed / this
 		 *  notebook isn't the searched one. Non-empty drives in-place highlighting. */
@@ -173,6 +185,7 @@
 		onSetCellCollapsed,
 		rawEdit = false,
 		onSetRawEdit,
+		onExtractCode,
 		onActivate,
 		searchQuery = '',
 		searchCaseSensitive = false,
@@ -1595,6 +1608,109 @@
 		}
 	}
 
+	// ---- Extract a rendered code block into a cell ---------------------------
+	// Every `.cellar-md` this cell renders - a chat reply, a `display(Markdown())`
+	// payload, and this cell's own rendered markdown - gets an extract control on
+	// each of its code blocks. The rule lives in `$lib/codeBlockExtract`; this is
+	// only the wiring, so the button route and the keyboard route (which resolves
+	// its target in `LiveNotebook`) can never read a block differently.
+	//
+	// Decoration is imperative rather than emitted by the markdown renderer for two
+	// reasons stated in that module: a control baked into the HTML STRING would also
+	// appear in the `.md` file preview, which shares the engine but has no notebook
+	// to extract into, and it would widen what the OUTPUT sanitizer must pass for a
+	// control the model's own markdown must never be able to forge.
+	//
+	// It is DECLARED BEFORE the highlight effect below, and that order is
+	// load-bearing: effects run in declaration order and both apply after the same
+	// `tick`, so the blocks are decorated before find-in-page walks them for Ranges.
+	// Decoration moves no node at all - the `<pre>` gains an attribute, a class and
+	// one appended `<button>` - so a Range that already points into a block is
+	// untouched either way (and the `{@html}` fragment this runs over stays intact
+	// as a sibling chain, which is the reason for that rule; see the module).
+	$effect(() => {
+		// The same deps the highlight effect tracks for "what is shown", minus the
+		// search inputs (which change no markup). A collapse DROPS the rendered
+		// markdown via `{#if}`, so re-expanding needs a fresh pass.
+		void segments;
+		void outputs;
+		void isMarkdown;
+		void mode;
+		void codeHidden;
+		void cellCollapsed;
+		// Tracked for the same reason as `cellCollapsed`, one level finer: an OUTER
+		// fold hides a heading's BODY inside a cell that is still partly visible, and
+		// that body is dropped by `{#if}` too - so unfolding re-creates the `{@html}`
+		// content as fresh, undecorated DOM. Nothing else moves on a fold toggle
+		// (`segments` reads only the source and the heading numbers), so without this
+		// the block came back with no control at all.
+		void segHidden;
+		if (!browser) return;
+		let cancelled = false;
+		tick().then(() => {
+			if (cancelled) return;
+			for (const md of cardEl?.querySelectorAll('.cellar-md') ?? []) decorateCodeBlocks(md);
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	// A rendered markdown cell is `role="button"` and enters raw source editing on a
+	// double-click or on Enter, and Cellar's OWN chrome lives inside it - the fold
+	// chevrons, and the extract control `decorateCodeBlocks` hangs on every code
+	// block - so activating one of those bubbles out and flips the cell into the
+	// editor, moving DOM focus into CodeMirror. That is exactly what extraction
+	// promises not to do, and BOTH events have to be guarded: `stopPropagation` on a
+	// `click` suppresses neither, and Enter on a focused control is the documented
+	// no-pointer route to extract.
+	//
+	// A `<button>` inside this container can only ever be ours: `renderMarkdown` runs
+	// markdown-it with `html:false` behind DOMPurify, so authored prose cannot carry
+	// one. That is what makes the test exact rather than a heuristic over the user's
+	// own content - double-clicking the prose, or the code block's body, still edits.
+	const fromRenderedControl = (e: Event) => !!(e.target as HTMLElement | null)?.closest?.('button');
+
+	function enterEditFromRendered(e: Event) {
+		if (fromRenderedControl(e)) return;
+		enterEdit();
+	}
+
+	// One delegated listener rather than a listener per injected control: the
+	// controls are created and discarded with the rendered markdown, so anything
+	// bound to them individually would have to be unbound again on every re-render.
+	//
+	// WHAT A CLICK HERE DOES TO THE SELECTION, stated exactly, because the two
+	// routes are NOT equivalent and reading them as equivalent is how the claim went
+	// wrong: `onCardPointerDown` exempts `button` only from its EXTEND/TOGGLE branch,
+	// so a plain left press falls through to `onActivate?.(cell.id)` and this cell
+	// becomes the active one, collapsing a multi-selection onto it - exactly as
+	// clicking any other in-cell control does, and deliberately not special-cased
+	// here (exempting `button` from the plain branch would change activation for
+	// every control in every cell). The KEYBOARD route touches neither selection nor
+	// focus. What BOTH routes guarantee is the thing extraction actually promises:
+	// nothing scrolls, and the cell never enters its editor, so the reader keeps
+	// their place either way.
+	//
+	// `stopPropagation` here covers the CLICK and nothing else: `dblclick` and
+	// `keydown` are separate events, so the rendered-markdown container's own
+	// double-click-and-Enter-to-edit is held off by `fromRenderedControl` above, not
+	// by this.
+	async function onCardClick(e: MouseEvent) {
+		const btn = (e.target as HTMLElement | null)?.closest?.(`[data-testid="${EXTRACT_TESTID}"]`);
+		if (!btn) return;
+		e.preventDefault();
+		e.stopPropagation();
+		const block = readCodeBlock(btn.closest(`[${CODE_BLOCK_ATTR}]`));
+		if (!block) return;
+		// Confirm only once the cell really landed. A refused add resyncs the model,
+		// so an optimistic check would sit on a control whose cell is not there - and
+		// would then RENAME it to "click again for another cell", which is a claim
+		// about a cell that was never created. The round trip is a few ms, so the
+		// confirmation still reads as immediate.
+		if (await onExtractCode?.(cell.id, block)) flashExtracted(btn);
+	}
+
 	// Drive highlighting. Reads every dep that changes WHAT is shown (so a surface
 	// swap - editor built, markdown render/edit, code hidden, outputs streaming,
 	// source edited - re-paints), then applies after a tick so the DOM reflects the
@@ -1619,6 +1735,13 @@
 		// Ranges stay valid - but both still clear here while collapsed, which is why
 		// this dep may not be "simplified" away.)
 		void cellCollapsed;
+		// The same failure one level finer, and PRE-EXISTING: an OUTER fold hides a
+		// heading's BODY inside a cell that is still partly visible, and that body is
+		// dropped by `{#if}` too - so unfolding re-creates it as fresh DOM and detaches
+		// the Ranges this cell registered into it. Nothing else moves on a fold toggle,
+		// so without this a re-expanded section painted no highlights while the find
+		// bar still counted its match.
+		void segHidden;
 		void outputs;
 		void liveSource;
 		// The id chip swaps its text to "copied!" for ~1s, detaching the nodes an id
@@ -1663,6 +1786,7 @@
 	role="presentation"
 	onfocusin={() => onActivate?.(cell.id, { fromFocus: true })}
 	onpointerdown={onCardPointerDown}
+	onclick={onCardClick}
 >
 	<!-- Left accent bar (VS Code / Jupyter style); no layout shift. The running
 	     accent deliberately outranks the selection accent and uses `warning` (the
@@ -2163,8 +2287,8 @@
 				role="button"
 				tabindex="0"
 				title="Double-click to edit"
-				ondblclick={enterEdit}
-				onkeydown={(e) => (e.key === 'Enter' ? enterEdit() : null)}
+				ondblclick={enterEditFromRendered}
+				onkeydown={(e) => (e.key === 'Enter' ? enterEditFromRendered(e) : null)}
 			>
 				{#if hasMarkdown}
 					{#each segments as seg (seg.index)}

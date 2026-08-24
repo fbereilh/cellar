@@ -7,6 +7,7 @@
 	import type { CellChangeStatus } from '$lib/gitdiff';
 	import type { CellHighlight } from '$lib/searchHighlight';
 	import type { CollapsedRecord } from '$lib/cellCollapse';
+	import type { ExtractedCodeBlock } from '$lib/codeBlockExtract';
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
 	import {
@@ -155,6 +156,8 @@
 		/** cell id → this markdown cell is open for raw source editing (runtime-only) */
 		rawEdits?: Record<string, boolean | undefined>;
 		onSetRawEdit?: (id: string, raw: boolean) => void;
+		/** Lift a rendered code block out of a cell's prose into a new cell below it. */
+		onExtractCode?: (id: string, block: ExtractedCodeBlock) => Promise<boolean>;
 		onActivate?: (id: string, gesture?: CellActivation) => void;
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		onEditorFocus?: (id: string) => void;
@@ -247,6 +250,7 @@
 		onSetCellCollapsed,
 		rawEdits = {},
 		onSetRawEdit,
+		onExtractCode,
 		onActivate,
 		onRegister,
 		onEditorFocus,
@@ -837,6 +841,7 @@
 			onSetCellCollapsed={onSetCellCollapsed}
 			rawEdit={rawEdits[cell.id] ?? false}
 			onSetRawEdit={onSetRawEdit}
+			onExtractCode={onExtractCode}
 			onActivate={onActivate}
 			{searchQuery}
 			{searchCaseSensitive}

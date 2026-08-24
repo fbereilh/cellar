@@ -811,13 +811,25 @@ export function chatToolPolicy(caps: ChatCapabilities = {}): ChatToolPolicy {
  * Flipping a setting changes which frozen prefix is sent (one cache miss), which
  * is inherent to changing the capability; within a shape every run stays
  * byte-stable.
+ *
+ * The fenced-code requirement lives in the SHARED framing rather than per shape,
+ * because it is capability-INDEPENDENT: it is about the reply's FORMAT, and every
+ * shape's reply is read by the same notebook. It is a product contract rather
+ * than style advice - a rendered code block can be lifted straight into a cell
+ * (`$lib/codeBlockExtract`) and the fence's language tag is what picks that
+ * cell's TYPE, so an untagged block silently becomes a Python cell and an
+ * unfenced snippet gets no control at all. The model already fences most of the
+ * time; stating it as a requirement is what makes the affordance reliably there.
  */
 const PROMPT_FRAMING: readonly string[] = [
 	'You are the AI assistant inside Cellar, a data notebook. The user message is',
 	'the notebook so far, rendered as labelled blocks: [cell <id> · <kind>] holds',
 	"a cell's source, [cell <id> · output] its result, [cell <id> · reply] an",
 	'earlier answer of yours, and [question] is what to answer now. Answer in',
-	'concise markdown.'
+	'concise markdown. ALWAYS put code in a fenced block tagged with its language',
+	'(```python, ```sql, ```markdown, ```bash): the user lifts a fenced block',
+	"straight into a notebook cell and the tag picks that cell's type, so an",
+	'untagged or unfenced snippet lands as the wrong kind of cell.'
 ];
 
 /** The claim every reads-on shape makes about its file reach, verbatim. */
