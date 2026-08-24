@@ -194,6 +194,21 @@ describe('protectCellarMetadata', () => {
 		expect(read(PY())).toContain('allowed_cell_metadata_keys = ["cellar"]');
 	});
 
+	// A value spanning several lines is read whole and re-rendered as ONE line - the
+	// splice replaces whole physical lines, which is the same property the sibling
+	// Codex writer has. That is the one formatting cost, and it is scoped to the key
+	// being CHANGED: everything else, this key included once it says `cellar`, is
+	// byte-identical. Pinned so the collapse is a decision rather than a surprise.
+	it('merges a multi-line array, re-rendering that ONE key on a single line', () => {
+		write(PY(), BASE + 'allowed_metadata_keys = [\n  "solveit",\n  "jupytext",\n]\n\n[tool.ruff]\nline-length = 100\n');
+		protectCellarMetadata(WS);
+		const after = read(PY());
+		expect(after).toContain('allowed_metadata_keys = ["solveit", "jupytext", "cellar"]');
+		expect(after).not.toContain('  "jupytext",');
+		// The neighbouring table is untouched.
+		expect(after).toContain('[tool.ruff]\nline-length = 100');
+	});
+
 	it('leaves a key that already says cellar byte-identical, comment and all', () => {
 		write(PY(), BASE + 'allowed_metadata_keys = ["cellar"]  # set by hand\n');
 		protectCellarMetadata(WS);
