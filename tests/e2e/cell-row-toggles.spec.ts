@@ -427,10 +427,13 @@ test('a failed hide that another writer superseded neither reverts nor claims an
 		await page.waitForTimeout(300); // the handler microtask that would revert
 
 		// The cell is hidden and the server says so, so nothing may put it back or
-		// announce otherwise. VERIFIED to fail under the value-equality form this
-		// replaced (the current value equals what we wrote, so it reverted and said the
-		// cell was still visible) - that is what makes these assertions load-bearing
-		// rather than decorative, and why the synchronization above is not optional.
+		// announce otherwise. VERIFIED BY MUTATION to fail under the value-equality
+		// form this replaced: swapping the generation check back for "current value
+		// === what we wrote" makes this exact assertion report aria-pressed "false" -
+		// the revert fires and the notice claims the cell is still visible. That is
+		// what makes these assertions load-bearing rather than decorative, and why the
+		// synchronization above is not optional: without it they pass on their first
+		// poll, before the page has even received the 500.
 		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 		await expect(page.getByTestId('app-notice')).toHaveCount(0);
 		expect(diskCellar(MD).hidden_from_agent).toBe(true);
