@@ -184,15 +184,32 @@ test('`t` types a character in EDIT mode - it never converts while you are typin
 
 	// Click INTO the editor: that is what puts the dispatcher in edit mode, and it
 	// is the only way to stage this - the mode is read off the focused element.
-	await cellBy(page, IDS[0]).locator('.cm-content').click();
-	await expect(cellBy(page, IDS[0]).locator('.cm-editor.cm-focused')).toBeVisible({ timeout: 10_000 });
+	// The click on `editor-scroll` also BUILDS the lazy editor, which does not exist
+	// until a cell is edited.
+	const cell = cellBy(page, IDS[0]);
+	await cell.getByTestId('editor-scroll').click();
+	const editor = cell.locator('.cm-content');
+	await expect(editor).toBeVisible({ timeout: 10_000 });
+	await editor.click();
+	// The notebook's own mode readout, which is what the dispatcher branches on.
+	await expect(cell.getByTestId('cell-mode')).toHaveAttribute('data-mode', 'edit');
 
 	await page.keyboard.press('End');
 	await page.keyboard.type('tt');
+	await expect(editor).toContainText('a = 0tt');
 
-	// The characters landed in the cell, and the cell is still code.
+	// The characters landed in the cell, persisted, and the cell is still code -
+	// the keystroke typed rather than converting.
 	await expect.poll(() => diskSource(nb, 0), { timeout: 20_000 }).toBe('a = 0tt');
 	expect(diskTypes(nb)).toEqual(['code', 'code', 'code', 'code']);
+
+	// Escape back to COMMAND mode and the very same key converts, which is what
+	// makes the assertion above about the MODE rather than about a dead binding.
+	await page.keyboard.press('Escape');
+	await expect(cell.getByTestId('cell-mode')).toHaveAttribute('data-mode', 'command');
+	await page.keyboard.press('t');
+	await expect.poll(() => diskTypes(nb), { timeout: 20_000 }).toEqual(['chat', 'code', 'code', 'code']);
+	expect(diskSource(nb, 0)).toBe('a = 0tt');
 });
 
 test('`z` after a conversion changes nothing - the undo stack is deletes only', async ({ page }) => {
