@@ -82,6 +82,13 @@ follows directly from that:
   any jupytext `.py` notebook, are ordinary workspace files either way); if you
   keep secrets in the workspace, leave reads off, especially with web search also
   on.
+  Whichever you enable, the reply is annotated with one line per tool call - the
+  tool's name and its target (a search query, or a path made relative to the
+  workspace; one resolving outside it is named, never printed) - and nothing is
+  read off a call's *result* but whether it errored, so file contents a reply
+  consulted are never written into the notebook or an exported report. The
+  target itself is model-authored text shown as written, so a search query or
+  grep pattern the model chose is recorded with the reply.
   Nothing else widens: MCP servers and slash commands stay off, no settings files
   are loaded from disk, and the same startup check still runs, now requiring
   exactly the capabilities that run asked for. The child's environment is stripped
