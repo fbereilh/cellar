@@ -321,11 +321,11 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		//
 		// `t` is the only letter of "chat" still free in command mode - `c` is
 		// copy-cell, `h` is fold-section and `a` is insert-above - so it is the one
-		// mnemonic choice left. It is also unbound in Jupyter's own command mode
-		// (which claims `f`, `i i`, `o`, `p`, `q`, `s` and `0 0` among the letters
-		// Cellar has not taken), so taking it forecloses no future parity binding -
-		// which is exactly why the other free letters, mnemonic for nothing here,
-		// are the worse pick.
+		// mnemonic choice left. It is also unbound in Jupyter's own command mode,
+		// which DOES claim several of the letters Cellar has not taken (`f`,
+		// `i i`, `o`, `q`, `s`, `0 0`), so taking `t` forecloses no future parity
+		// binding - which is exactly why the other free letters, mnemonic for
+		// nothing here, are the worse pick.
 		id: 'to-chat',
 		keys: ['t'],
 		mode: 'command',
