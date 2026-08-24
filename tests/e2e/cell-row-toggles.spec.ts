@@ -70,15 +70,24 @@ const onDisk = () =>
 	};
 const diskCellar = (id: string) => onDisk().cells.find((c) => c.id === id)?.metadata?.cellar ?? {};
 
-async function openNotebook(page: Page): Promise<void> {
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	// the shell paints either the empty state or an already-open notebook, so
-	// settle on whichever arrives before probing
+/**
+ * SETTLE before probing: the shell paints either the empty state or an
+ * already-open notebook, and probing before either arrives reports the button
+ * invisible, turns the click into a no-op, and then times out on a notebook
+ * nothing ever opened. Needed after a RELOAD as much as after the first goto -
+ * which is how this file first failed, under full-suite load only.
+ */
+async function settleNotebook(page: Page): Promise<void> {
 	const emptyBtn = page.getByTestId('empty-open-notebook');
 	const firstCell = page.getByTestId('cell').first();
 	await expect(emptyBtn.or(firstCell).first()).toBeVisible({ timeout: 30_000 });
 	if (await emptyBtn.isVisible()) await emptyBtn.click();
 	await expect(firstCell).toBeVisible({ timeout: 30_000 });
+}
+
+async function openNotebook(page: Page): Promise<void> {
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await settleNotebook(page);
 }
 
 /** Every cell renders its own "⋮" popover, so ask how many are actually OPEN. */
@@ -173,6 +182,7 @@ test('each flip reaches the .ipynb and survives a reload', async ({ page }) => {
 	await expect.poll(() => 'hidden_from_agent' in diskCellar(CODE)).toBe(false);
 
 	await page.reload();
+	await settleNotebook(page);
 	await expect(cellEl(page, CODE).getByTestId('toggle-export')).toHaveAttribute('aria-pressed', 'false');
 	await expect(cellEl(page, CODE).getByTestId('toggle-agent-hidden')).toHaveAttribute('aria-pressed', 'false');
 });
