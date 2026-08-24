@@ -43,6 +43,13 @@
  *     is a separate feature; the point of this paragraph is that the next
  *     reader knows the boundary was measured rather than assumed.
  *
+ * The two classes are not quite disjoint at one edge, and detection deliberately
+ * spills over it: a joined line whose `__future__` import comes SECOND
+ * (`x = 1; from __future__ import annotations`) is PRE-EXISTING - it does not
+ * compile standalone either - and is still reported, because the hoist declines
+ * it for the same reason and saying so beats the silence it used to get. Over-
+ * reporting toward honesty is the safe direction; under-reporting is the defect.
+ *
  * So: a reported hazard means "this specific thing is wrong". No hazard means
  * "none of the things Cellar checks for is wrong", never "the module compiles".
  */
