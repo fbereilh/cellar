@@ -16,6 +16,7 @@
 // markers, the second only if nothing re-renders the extracted text.
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { DEFAULT_SHORTCUTS, CATEGORIES, bindingsCollide, modesOverlap, shortcuts, typingHazards } from '$lib/shortcuts.svelte';
 import { renderChatReply, renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
 import {
 	CODE_BLOCK_ATTR,
@@ -308,3 +309,45 @@ function stubMatches(el: Element, selectors: string[]): void {
 	const real = el.matches.bind(el);
 	el.matches = (sel: string) => (selectors.includes(sel) ? true : real(sel));
 }
+
+describe('the shortcut is a first-class registry entry', () => {
+	// Registered rather than hard-wired, so Settings lists and rebinds it like every
+	// other binding - a keyboard route this app does not list is one nobody finds.
+	const entry = DEFAULT_SHORTCUTS.find((x) => x.id === 'extract-code-block');
+
+	it('is declared with a listable category and description', () => {
+		expect(entry).toBeDefined();
+		expect(entry!.keys).toEqual(['Mod-Shift-e']);
+		// `global`: the block it acts on is the one under the POINTER, which is just
+		// as likely while the caret sits in another cell's editor.
+		expect(entry!.mode).toBe('global');
+		// Settings renders only the categories in CATEGORIES, so one outside that
+		// list would silently not appear at all.
+		expect(CATEGORIES).toContain(entry!.category);
+		expect(entry!.description.length).toBeGreaterThan(0);
+	});
+
+	it('collides with no other binding in an overlapping mode', () => {
+		// A collision does not error - it SHADOWS, and whichever entry `lookup`
+		// reaches first wins. That is silent, so it is asserted rather than assumed.
+		const clashes = DEFAULT_SHORTCUTS.filter(
+			(other) =>
+				other.id !== entry!.id &&
+				modesOverlap(entry!.mode, other.mode) &&
+				other.keys.some((k) => entry!.keys.some((mine) => bindingsCollide(mine, k)))
+		);
+		expect(clashes.map((c) => c.id)).toEqual([]);
+		expect(shortcuts.conflicts.has('extract-code-block')).toBe(false);
+	});
+
+	it('is no typing hazard, despite being active in edit mode', () => {
+		// A bare printable chord bound outside command mode makes that character
+		// untypable in every cell; a modified chord cannot.
+		expect(typingHazards(entry!)).toEqual([]);
+	});
+
+	it('resolves in BOTH modes, which is what `global` has to mean here', () => {
+		expect(shortcuts.lookup('command', 'Mod-Shift-e')?.id).toBe('extract-code-block');
+		expect(shortcuts.lookup('edit', 'Mod-Shift-e')?.id).toBe('extract-code-block');
+	});
+});
