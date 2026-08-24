@@ -39,10 +39,16 @@
  * `pushText`/`pushToolLine` own the JOINS, and they are load-bearing rather than
  * cosmetic. A blockquote swallows the line that follows it (markdown's lazy
  * continuation), so resumed reply text must be separated by a blank line or it
- * becomes part of the annotation. And consecutive lines join with a backslash
+ * becomes part of the annotation. And consecutive lines join with a BACKSLASH
  * hard break so a burst of calls renders as ONE dim block of short lines rather
- * than a stack of separately-bordered ones; the engine renders `breaks: false`,
- * so a bare newline there would run them together on one line instead.
+ * than a stack of separately-bordered ones (which is what keeps a chatty run
+ * from burying a short answer under a column of separate quotes); the engine
+ * renders `breaks: false`, so a bare newline there would run them together on
+ * one line instead. Markdown's OTHER hard break - two trailing spaces - is
+ * measurably WRONG here and must not replace it: the accumulator runs its
+ * terminal reducer over any buffer holding an escape sequence, and that reducer
+ * RIGHT-TRIMS every line, so a reply that merely mentions an ANSI code would
+ * silently collapse every annotation onto one line. A backslash survives it.
  *
  * Every call is shown, none is summarised away: a harness shows every call, the
  * file paths ARE the provenance a chatty run most needs, each line is bounded to
