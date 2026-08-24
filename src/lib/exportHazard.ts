@@ -76,12 +76,22 @@ export function quoteStatement(raw: string): string {
  * out of scope for an export (`liftFutureImports` makes the same call for the
  * same reason). Saying so is what keeps this from reading as a Cellar bug the
  * user should wait out.
+ *
+ * It OPENS with the offending line and carries no lead of its own, so it reads
+ * standalone in the export bar AND composes after each surface's own lead
+ * ("Wrote utils.py, but `...` keeps a __future__ import ..."). A lead baked in
+ * here would either read wrong beside one of them or have to be duplicated in
+ * all three, which is how one wording becomes three.
+ *
+ * Backticks fence the QUOTED LINE only - it holds spaces and a semicolon, so it
+ * needs delimiting - and not the word `__future__`, which would render as
+ * literal punctuation in the plain-text surfaces for no gain.
  */
 export function futureImportHazardMessage(statement: string): string {
 	return (
-		`this module will not import: \`${statement}\` keeps a \`__future__\` import on the same line as another statement. ` +
-		'Python accepts a `__future__` import only before every other statement, and Cellar will not split a line to move one - ' +
-		'put the `__future__` import on a line of its own.'
+		`\`${statement}\` keeps a __future__ import on the same line as another statement, so the module will not import: ` +
+		'Python accepts one only before every other statement, and Cellar will not split a line to move it. ' +
+		'Put the __future__ import on a line of its own.'
 	);
 }
 
