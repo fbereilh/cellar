@@ -115,6 +115,11 @@ const h = vi.hoisted(() => {
 			 * does obey, which must keep taking the graceful path.
 			 */
 			interrupt: vi.fn(async () => {
+				// The seam is path-INDEPENDENT: whichever call the production code makes to
+				// signal, a failing sidecar fails it the same way. Without this the "never
+				// resolves" case could only ever be driven through one of them.
+				if (h.interruptSignalFails === 'hang') return new Promise<void>(() => {});
+				if (h.interruptSignalFails) throw new Error('Kernel is dead');
 				if (!h.kernelObeysInterrupt) return;
 				for (const f of h.hanging.splice(0)) {
 					f.onIOPub?.({
@@ -157,6 +162,24 @@ const h = vi.hoisted(() => {
 		getKernelModel: vi.fn(async () => {
 			h.probeCalls += 1;
 			return h.probe();
+		}),
+		// `POST /api/kernels/<id>/interrupt` - the REAL delivery path, so the two ways
+		// it can fail the caller are drivable: it REJECTS (a dead kernel, a refused or
+		// failed POST) and it never resolves (a black-holed sidecar that accepts the
+		// connection and then says nothing). Neither may stop the escalation.
+		interruptSignalFails: false as boolean | 'hang',
+		interruptKernel: vi.fn(async (_id: string, settings?: { init?: { signal?: AbortSignal } }) => {
+			if (h.interruptSignalFails === 'hang') {
+				// Settle only when the caller CANCELS, so a test that never cancels hangs -
+				// which is what proves the bound is real rather than incidental.
+				const signal = settings?.init?.signal;
+				await new Promise<void>((_, reject) => {
+					signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+				});
+				return;
+			}
+			if (h.interruptSignalFails) throw new Error('Kernel is dead');
+			await h.lastKernel?.interrupt();
 		})
 	};
 });
@@ -173,7 +196,7 @@ vi.mock('@jupyterlab/services', () => ({
 	},
 	ServerConnection: { makeSettings: (o: unknown) => o },
 	CommsOverSubshells: { Disabled: 'disabled' },
-	KernelAPI: { getKernelModel: h.getKernelModel }
+	KernelAPI: { getKernelModel: h.getKernelModel, interruptKernel: h.interruptKernel }
 }));
 
 vi.mock('../../src/lib/server/logs', () => ({
@@ -194,6 +217,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** The grace window this suite runs with, mirrored from the env below. */
 const GRACE_MS = 120;
+/** The bound on the interrupt REST POST, likewise mirrored from the env below. */
+const SIGNAL_TIMEOUT_MS = 80;
 
 function newCell(source: string): string {
 	return nbmod.addCell(null, 'code', abs(), null, source).id;
@@ -229,6 +254,7 @@ beforeAll(async () => {
 	// be what rescues these runs - if it were, the tests would pass without the fix.
 	process.env.CELLAR_KERNEL_IDLE_TIMEOUT_MS = '60000';
 	process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = String(GRACE_MS);
+	process.env.CELLAR_KERNEL_INTERRUPT_SIGNAL_TIMEOUT_MS = String(SIGNAL_TIMEOUT_MS);
 	nbmod = await import('../../src/lib/server/notebook');
 	queue = await import('../../src/lib/server/run-queue');
 	runmod = await import('../../src/lib/server/run');
@@ -245,6 +271,7 @@ beforeEach(() => {
 	h.lastHanging = null;
 	h.kernelObeysInterrupt = false;
 	h.startFails = false;
+	h.interruptSignalFails = false;
 	h.maxLive = h.live; // measure only what THIS test puts on the wire
 	h.probe = () => ({ execution_state: 'busy' });
 	if (h.lastKernel) h.lastKernel.connectionStatus = 'connected';
@@ -377,6 +404,66 @@ describe('F2: the cell never reached the kernel (parked on the exec lock)', () =
 
 		expect(h.maxLive).toBe(1);
 		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+	});
+});
+
+describe('the escalation does not depend on the signal that is failing', () => {
+	it('a signal that THROWS still ends the run and frees the slot', async () => {
+		const nb = abs();
+		const c = newCell('stuck  # HANG');
+		const runP = startRun(c, 'stuck  # HANG');
+		await until(() => h.lastHanging != null, 'the run to reach the kernel');
+		// @jupyterlab rejects outright for a kernel it believes is dead, and for any
+		// failed REST POST.
+		h.interruptSignalFails = true;
+
+		// THE REGRESSION: `await kernel.interrupt()` gated the whole escalation, so this
+		// rejected out of interruptKernel and the run was never force-settled - the cell
+		// read RUNNING forever while the UI's bare catch showed nothing.
+		const res = await kernelmod.interruptKernel(nb);
+		const run = await runP;
+
+		expect(res.stopped).toBe('forced_no_signal');
+		expect(run.status).toBe('error');
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+
+		// HONESTY: the kernel was never asked, so the message may not say it failed to
+		// answer - that is a claim about a request that was never sent.
+		const evalue = String(soleError(run.outputs).evalue);
+		expect(evalue).toMatch(/could not deliver the interrupt/i);
+		expect(evalue).toMatch(/may still be executing/i);
+		expect(evalue).not.toMatch(/did not respond/i);
+	});
+
+	it('a signal that never resolves is cancelled, and the run still ends', async () => {
+		const nb = abs();
+		const c = newCell('wedged  # HANG');
+		const runP = startRun(c, 'wedged  # HANG');
+		await until(() => h.lastHanging != null, 'the run to reach the kernel');
+		// A black-holed sidecar: it accepts the connection and then says nothing. The
+		// fake settles only on CANCEL, so this hangs forever unless the bound is real.
+		h.interruptSignalFails = 'hang';
+
+		const started = Date.now();
+		const res = await kernelmod.interruptKernel(nb);
+		const run = await runP;
+
+		expect(res.stopped).toBe('forced_no_signal');
+		expect(run.status).toBe('error');
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+		// Bounded by the signal timeout, and NOT additive with the grace window: nothing
+		// was asked, so there is no surrender to wait for.
+		expect(Date.now() - started).toBeLessThan(SIGNAL_TIMEOUT_MS + GRACE_MS);
+		expect(String(soleError(run.outputs).evalue)).toMatch(/could not deliver the interrupt/i);
+	});
+
+	it('an undeliverable signal with nothing running still reports idle', async () => {
+		const nb = abs();
+		await kernelmod.execute(nb, 'warm3 = 1', () => {});
+		h.interruptSignalFails = true;
+		const res = await kernelmod.interruptKernel(nb);
+		// A failed signal is not, by itself, something stopped.
+		expect(res.stopped).toBe('idle');
 	});
 });
 
