@@ -52,8 +52,21 @@ export async function PATCH({ params, request }) {
 	// hidden from every agent surface while the document still hands it to each of
 	// them. `setVisibility` reports false only for a cell that does not exist (a
 	// no-op still reports true), so this cannot fire on an ordinary re-set.
-	if ('hiddenFromAgent' in body && !setVisibility(params.id, !!body.hiddenFromAgent, body.nb, body.originId))
-		return json({ ok: false, reason: 'no-such-cell' }, { status: 404 });
+	//
+	// It can also THROW: the notebook write can fail (a read-only checkout, ENOSPC,
+	// EACCES on the `.ipynb`), and it rolls its own in-memory change back before
+	// rethrowing so the agent surface is never left more permissive than what the
+	// client is about to report. That is a stated outcome of this field rather than
+	// an incidental 500 with a stack trace, so it is reported in this handler's own
+	// refusal shape - and, like the 404 above, scoped to `hiddenFromAgent` alone.
+	if ('hiddenFromAgent' in body) {
+		try {
+			if (!setVisibility(params.id, !!body.hiddenFromAgent, body.nb, body.originId))
+				return json({ ok: false, reason: 'no-such-cell' }, { status: 404 });
+		} catch (err) {
+			return json({ ok: false, reason: 'write-failed', message: String(err?.message ?? err) }, { status: 500 });
+		}
+	}
 	return json({ ok: true });
 }
 

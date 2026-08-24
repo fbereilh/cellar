@@ -2393,6 +2393,27 @@
 	 * anything we said would describe a state we no longer own. When it does fire it
 	 * restores THAT KEY alone rather than a whole metadata snapshot, which would
 	 * clobber a concurrent change to the export flag one control along.
+	 *
+	 * The network write is SERIALIZED PER CELL (`agentVisibilityWrites`): two rapid
+	 * flips of one toggle issue two PATCHes of the same field to the same URL, and
+	 * if they settle out of order the server ends on the FIRST click's value while
+	 * the row shows the second's - silently, since both responses are `ok` (no
+	 * revert, no notice) and both `cell:visibility` echoes carry this tab's
+	 * `originId` (both suppressed). In the dangerous direction the row reads "hidden
+	 * from AI agents" over a document that hands the cell to every agent surface. The
+	 * window is small; the direction is what makes it worth closing here.
+	 *
+	 * Scoped to this control ALONE, and deliberately not extended to `setExport` /
+	 * `setHideInput`: those are preferences whose worst case is a stale display,
+	 * while this is the disclosure control - doing it there too is worth deciding
+	 * separately rather than inheriting from here.
+	 *
+	 * Only the FETCH is serialized: the optimistic apply stays immediate, or the row
+	 * would stop responding to a click while a request is in flight. That ordering is
+	 * safe BECAUSE of the generation guard above - the second click's optimistic
+	 * apply bumps the generation, so when the first write's turn comes and it fails,
+	 * its revert sees itself superseded and does nothing. The two are one mechanism;
+	 * do not "simplify" either half without the other.
 	 */
 	async function setHiddenFromAgent(id: string, hidden: boolean) {
 		const before = findCell(id)?.metadata?.cellar ?? {};
@@ -2400,27 +2421,47 @@
 		const was = before.hidden_from_agent;
 		applyHiddenFromAgentLocally(id, hidden);
 		const seq = agentVisibilitySeq.get(id);
-		const res = await fetch(`/api/cells/${id}`, {
-			method: 'PATCH',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ hiddenFromAgent: hidden, nb: path, originId })
-		}).catch(() => null);
-		if (res?.ok) return;
-		if (agentVisibilitySeq.get(id) !== seq) return;
-		const now = findCell(id);
-		if (now) {
-			const cellar = { ...(now.metadata?.cellar ?? {}) };
-			if (had) cellar.hidden_from_agent = was;
-			else delete cellar.hidden_from_agent;
-			now.metadata = { ...(now.metadata ?? {}), cellar };
-			bumpAgentVisibilitySeq(id);
+		const prior = agentVisibilityWrites.get(id);
+		const run = (async () => {
+			if (prior) await prior;
+			const res = await fetch(`/api/cells/${id}`, {
+				method: 'PATCH',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ hiddenFromAgent: hidden, nb: path, originId })
+			}).catch(() => null);
+			if (res?.ok) return;
+			if (agentVisibilitySeq.get(id) !== seq) return;
+			const now = findCell(id);
+			if (now) {
+				const cellar = { ...(now.metadata?.cellar ?? {}) };
+				if (had) cellar.hidden_from_agent = was;
+				else delete cellar.hidden_from_agent;
+				now.metadata = { ...(now.metadata ?? {}), cellar };
+				bumpAgentVisibilitySeq(id);
+			}
+			onNotice?.(
+				hidden
+					? 'That cell is still VISIBLE to AI agents - hiding it was not saved.'
+					: 'That cell is still HIDDEN from AI agents - showing it was not saved.'
+			);
+		})();
+		agentVisibilityWrites.set(id, run);
+		try {
+			await run;
+		} finally {
+			// drop the entry once this cell's chain has drained, the way the server's
+			// own `withPathLock` does, so the map never grows with the session
+			if (agentVisibilityWrites.get(id) === run) agentVisibilityWrites.delete(id);
 		}
-		onNotice?.(
-			hidden
-				? 'That cell is still VISIBLE to AI agents - hiding it was not saved.'
-				: 'That cell is still HIDDEN from AI agents - showing it was not saved.'
-		);
 	}
+
+	/**
+	 * One in-flight agent-visibility write per cell - the tail-chain that makes two
+	 * rapid flips of one toggle land in the order they were clicked. A cell's entry
+	 * is deleted when its chain drains (see `setHiddenFromAgent`), so this holds only
+	 * writes that are actually outstanding.
+	 */
+	const agentVisibilityWrites = new Map<string, Promise<void>>();
 
 	/**
 	 * Per-cell ownership of the agent-visibility flag - the `pinSeq` shape, and what

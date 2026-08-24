@@ -20,7 +20,7 @@
  * never what a rule MEANS.
  */
 import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync as read } from 'node:fs';
@@ -54,7 +54,9 @@ vi.mock('../../src/lib/server/jupytext', async () => {
 
 let nbmod: typeof import('../../src/lib/server/notebook');
 let events: typeof import('../../src/lib/server/events');
+let svc: typeof import('../../src/lib/server/mcp/service');
 let PATCH: (evt: { params: { id: string }; request: Request }) => Promise<Response>;
+let WS: string;
 let NB: string;
 let PY: string;
 
@@ -72,12 +74,13 @@ async function captured(fn: () => void): Promise<Ev[]> {
 }
 
 beforeAll(async () => {
-	const ws = mkdtempSync(join(tmpdir(), 'cellar-row-toggles-'));
-	process.env.CELLAR_WORKSPACE = ws;
-	PY = join(ws, 'dbx.py');
+	WS = mkdtempSync(join(tmpdir(), 'cellar-row-toggles-'));
+	process.env.CELLAR_WORKSPACE = WS;
+	PY = join(WS, 'dbx.py');
 	writeFileSync(PY, PY_BYTES);
 	nbmod = await import('../../src/lib/server/notebook');
 	events = await import('../../src/lib/server/events');
+	svc = await import('../../src/lib/server/mcp/service');
 	PATCH = (await import('../../src/routes/api/cells/[id]/+server.js')).PATCH as unknown as typeof PATCH;
 	NB = nbmod.createNotebook('nb.ipynb').path;
 });
@@ -180,6 +183,89 @@ describe('the cell:visibility event', () => {
 		nbmod.setVisibility(id, true, NB);
 		const evs = await captured(() => nbmod.setVisibility(id, false, NB));
 		expect(evs.find((e) => e.type === 'cell:visibility')).toMatchObject({ cellId: id, hidden: false });
+	});
+});
+
+/**
+ * A write that FAILS may never leave the agent surface more permissive than what
+ * the caller is about to be told.
+ *
+ * `setVisibility` mutates the in-memory doc and only then persists - and the
+ * in-memory doc IS the agent surface, since every MCP read/search/section reads
+ * it through `docFor`. So a `persist` that throws used to leave a SHOW already
+ * applied to every agent read while the route 500'd and the browser reverted the
+ * row and announced the cell was still hidden: actively asserting a concealment
+ * that had just been revoked, which is worse than the silent failure this whole
+ * control was built to remove.
+ *
+ * The fault injected here is the one `writeNotebook` cannot repair: it calls
+ * `mkdirSync(dirname, {recursive:true})`, so a merely MISSING directory is
+ * recreated and the write succeeds - the notebook's own parent has to exist as a
+ * FILE. That is a real filesystem failure rather than a stubbed writer, and it
+ * does not depend on the uid the suite runs as.
+ */
+describe('a failed write never leaves the agent surface more permissive', () => {
+	/** A notebook of its own whose parent directory can be turned into a file. */
+	function faultable(dir: string, source: string): { nb: string; id: string; break: () => void } {
+		const nb = nbmod.createNotebook(`${dir}/nb.ipynb`).path;
+		const id = nbmod.addCell(null, 'code', nb, null, source).id;
+		return {
+			nb,
+			id,
+			break: () => {
+				rmSync(join(WS, dir), { recursive: true, force: true });
+				writeFileSync(join(WS, dir), 'not a directory');
+			}
+		};
+	}
+
+	it('rolls a failed SHOW back, so the cell is still withheld from every agent read', async () => {
+		const { nb, id, break: breakWrite } = faultable('faulty-show', 'MARKER_SHOW = 1');
+		nbmod.setVisibility(id, true, nb);
+		// the agent surface really is withholding it before the failure
+		expect(svc.searchCells('MARKER_SHOW', 'input', nb)).toEqual([]);
+		breakWrite();
+
+		const evs = await captured(() => {
+			expect(() => nbmod.setVisibility(id, false, nb)).toThrow();
+		});
+
+		// nothing was announced, because nothing changed
+		expect(evs.filter((e) => e.type === 'cell:visibility')).toEqual([]);
+		// the flag
+		expect(isHiddenFromAgent(nbmod.getCell(id, nb))).toBe(true);
+		expect(isHiddenFromAgent(nbmod.listCells(nb).find((c) => c.id === id))).toBe(true);
+		// and the SURFACE the flag exists to control - what the invariant is about
+		expect(svc.searchCells('MARKER_SHOW', 'input', nb)).toEqual([]);
+	});
+
+	it('rolls a failed HIDE back to the EXACT prior shape, minting no stray namespace', async () => {
+		const { nb, id, break: breakWrite } = faultable('faulty-hide', 'MARKER_HIDE = 1');
+		const before = JSON.stringify(nbmod.getCell(id, nb)?.metadata ?? {});
+		breakWrite();
+
+		const evs = await captured(() => {
+			expect(() => nbmod.setVisibility(id, true, nb)).toThrow();
+		});
+
+		expect(evs.filter((e) => e.type === 'cell:visibility')).toEqual([]);
+		// key-ABSENT and an explicit `false` are different states elsewhere in this
+		// flow, so the rollback is compared as a whole rather than through the
+		// strictly-`=== true` reading that cannot tell them apart
+		expect(JSON.stringify(nbmod.getCell(id, nb)?.metadata ?? {})).toBe(before);
+		expect(svc.searchCells('MARKER_HIDE', 'input', nb).length).toBeGreaterThan(0);
+	});
+
+	it('leaves a pre-existing explicit false exactly as it was', async () => {
+		const { nb, id, break: breakWrite } = faultable('faulty-explicit', 'MARKER_FALSE = 1');
+		const cell = nbmod.listCells(nb).find((c) => c.id === id);
+		(cell!.metadata!.cellar as Record<string, unknown>).hidden_from_agent = false;
+		breakWrite();
+
+		expect(() => nbmod.setVisibility(id, true, nb)).toThrow();
+		const cellar = (nbmod.getCell(id, nb)?.metadata?.cellar ?? {}) as Record<string, unknown>;
+		expect('hidden_from_agent' in cellar).toBe(true);
+		expect(cellar.hidden_from_agent).toBe(false);
 	});
 });
 
@@ -674,6 +760,33 @@ describe('the PATCH route accepts the new field', () => {
 		expect(res.status).toBe(404);
 		expect(await res.json()).toEqual({ ok: false, reason: 'no-such-cell' });
 		expect(evs).toEqual([]);
+	});
+
+	// The other way this field can refuse: `setVisibility` now THROWS when the
+	// notebook write fails, having rolled its own change back first. A stack trace
+	// escaping as an incidental 500 would be a verdict the client can only guess at,
+	// so it is reported in this handler's own refusal shape - and the cell is still
+	// withheld, which is the invariant the rollback exists for.
+	it('REPORTS a failed notebook write, and the cell stays withheld', async () => {
+		const nb = nbmod.createNotebook('faulty-route/nb.ipynb').path;
+		const id = nbmod.addCell(null, 'code', nb, null, 'MARKER_ROUTE = 1').id;
+		nbmod.setVisibility(id, true, nb);
+		rmSync(join(WS, 'faulty-route'), { recursive: true, force: true });
+		writeFileSync(join(WS, 'faulty-route'), 'not a directory');
+
+		const evs: Ev[] = [];
+		const off = events.subscribe((e) => evs.push(e as Ev));
+		let res: Response;
+		try {
+			res = await patch(id, { hiddenFromAgent: false, nb });
+		} finally {
+			off();
+		}
+		expect(res.status).toBe(500);
+		expect(await res.json()).toMatchObject({ ok: false, reason: 'write-failed' });
+		expect(evs.filter((e) => e.type === 'cell:visibility')).toEqual([]);
+		expect(isHiddenFromAgent(nbmod.getCell(id, nb))).toBe(true);
+		expect(svc.searchCells('MARKER_ROUTE', 'input', nb)).toEqual([]);
 	});
 
 	// Scoped deliberately: the sibling setters still report `{ok:true}` whatever

@@ -466,9 +466,10 @@ test('a failed hide superseded across a load() refetch still claims nothing', as
 	//
 	// VERIFIED BY MUTATION: minting the token per cell again -
 	// `agentVisibilitySeq.set(id, (agentVisibilitySeq.get(id) ?? 0) + 1)` - fails the
-	// final assertions with aria-pressed "false" and a notice claiming the cell is
-	// still hidden, over a document that holds it hidden. It passes with the single
-	// monotonic counter restored.
+	// final assertions with aria-pressed "false". The write that fails here is a
+	// HIDE, so the notice that comes with it is "That cell is still VISIBLE to AI
+	// agents - hiding it was not saved", over a document that holds it HIDDEN. It
+	// passes with the single monotonic counter restored.
 
 	// Normalize through the SERVER, never a click: the collision needs OUR click to be
 	// this cell's first local write in this component's life, and a click would spend
@@ -549,6 +550,61 @@ test('a failed hide superseded across a load() refetch still claims nothing', as
 	// leave the shared notebook as found
 	await setToggle(cell, 'toggle-agent-hidden', false);
 	await expect.poll(() => 'hidden_from_agent' in diskCellar(RAW)).toBe(false);
+});
+
+test('two rapid flips of one toggle land in the order they were clicked', async ({ page }) => {
+	// Two flips of the SAME cell are two PATCHes of the same field to the same URL.
+	// Unserialized, if they settle out of order the server ends on the FIRST click's
+	// value while the row shows the SECOND's - and silently, since both responses are
+	// ok (no revert, no notice) and both `cell:visibility` echoes carry this tab's
+	// originId (both suppressed). This is the disclosure control, so the row and the
+	// document may not diverge even in a small window.
+	//
+	// The fault is injected at DELIVERY, not at the response: the first PATCH is held
+	// in the route handler for a second and a half before it is continued, so without
+	// client-side chaining the second request reaches the server first and the server
+	// settles on the first click's value. With the chaining the second fetch is not
+	// issued until the first has settled, so the order cannot invert.
+	await openNotebook(page);
+	const cell = cellEl(page, SQL);
+	const toggle = cell.getByTestId('toggle-agent-hidden');
+	await setToggle(cell, 'toggle-agent-hidden', false);
+
+	let sent = 0;
+	let settled = 0;
+	page.on('response', (r) => {
+		if (r.url().includes(`/api/cells/${SQL}`) && r.request().method() === 'PATCH') settled++;
+	});
+	await page.route('**/api/cells/**', async (route) => {
+		const req = route.request();
+		if (req.method() === 'PATCH' && (req.postData() ?? '').includes('hiddenFromAgent')) {
+			sent++;
+			if (sent === 1) await new Promise((r) => setTimeout(r, 1500));
+		}
+		await route.continue();
+	});
+
+	try {
+		await toggle.click(); // hide
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		await toggle.click(); // and immediately show again
+
+		// The optimistic apply must stay IMMEDIATE - serializing the fetch must not
+		// serialize the row. Asserted while the first write is demonstrably still in
+		// flight, which is the only window where putting the apply behind the await
+		// would show.
+		expect(settled).toBeLessThan(2);
+		expect(await toggle.getAttribute('aria-pressed')).toBe('false');
+
+		await expect.poll(() => settled, { timeout: 20_000 }).toBe(2);
+		await page.waitForTimeout(300);
+
+		// The row says visible; the document must too.
+		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+		expect('hidden_from_agent' in diskCellar(SQL)).toBe(false);
+	} finally {
+		await page.unroute('**/api/cells/**');
+	}
 });
 
 test('every control stays reachable inside the card when the row is narrow', async ({ page }) => {

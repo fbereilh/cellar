@@ -675,13 +675,40 @@ export function getCell(id: string, nb?: string | null): CellView | null {
  * jupytext `spawnSync` producing byte-identical output while silently losing the
  * very flag it was asked to store. The event still fires, so open tabs update
  * either way and the flag holds for the session (the same in-session-only limit
- * every per-cell `cellar` flag has on a `.py` notebook).
+ * every per-cell `cellar` flag has on a `.py` notebook). That branch runs no
+ * persist, so it has no failure path and the rollback below cannot apply to it.
+ *
+ * THE INVARIANT: no path may leave the agent surface MORE PERMISSIVE than what
+ * the user is being told. The in-memory doc IS the agent surface - every MCP
+ * read/search/section and every chat transcript reads it through `docFor` - so a
+ * mutation that lands there before a `persist` that then THROWS (a read-only
+ * checkout, ENOSPC, EACCES on the `.ipynb`) has already revoked a concealment
+ * while the caller is about to report the write as failed. On a SHOW that is the
+ * dangerous direction: the browser reverts the row and says the cell is still
+ * hidden while the running app hands it to every agent read. So the write is
+ * ROLLED BACK on failure and the error is rethrown, which keeps the caller's
+ * existing "it was not saved" copy TRUE rather than needing it reworded.
+ *
+ * RESTORE-ON-FAILURE rather than persist-first, deliberately: `persist`
+ * serializes the LIVE doc and there is no "persist this candidate value" form,
+ * so persisting first would mean deep-cloning the whole notebook on every
+ * toggle - costly, and a shape no other setter here uses. The rollback puts back
+ * the EXACT prior shape, because key-ABSENT and an explicit `false` are
+ * different states elsewhere in this flow, and it restores THAT KEY (plus any
+ * namespace this call itself created) alone, so a concurrent change to another
+ * `cellar` key is not clobbered. The `emit` sits after the persist, so the
+ * rethrow reaches the caller before any event is published: a failed write
+ * announces nothing, because nothing changed.
  */
 export function setVisibility(id: string, hidden: boolean, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return false;
 	if (isHiddenFromAgent(cell) === !!hidden) return true;
+	const hadMetadata = !!cell.metadata;
+	const hadCellar = !!cell.metadata?.cellar;
+	const hadKey = !!cell.metadata?.cellar && 'hidden_from_agent' in cell.metadata.cellar;
+	const was = cell.metadata?.cellar?.hidden_from_agent;
 	if (hidden) {
 		cell.metadata = cell.metadata ?? {};
 		cell.metadata.cellar = cell.metadata.cellar ?? {};
@@ -689,7 +716,20 @@ export function setVisibility(id: string, hidden: boolean, nb?: string | null, o
 	} else {
 		delete cell.metadata?.cellar?.hidden_from_agent;
 	}
-	if (!doc.jpFormat) persist(doc);
+	try {
+		if (!doc.jpFormat) persist(doc);
+	} catch (err) {
+		if (hadKey) {
+			cell.metadata = cell.metadata ?? {};
+			cell.metadata.cellar = cell.metadata.cellar ?? {};
+			cell.metadata.cellar.hidden_from_agent = was;
+		} else {
+			delete cell.metadata?.cellar?.hidden_from_agent;
+			if (!hadCellar) delete cell.metadata?.cellar;
+			if (!hadMetadata) delete cell.metadata;
+		}
+		throw err;
+	}
 	emit(doc, 'cell:visibility', { cellId: id, hidden: !!hidden }, originId);
 	return true;
 }
