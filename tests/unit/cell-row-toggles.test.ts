@@ -703,24 +703,21 @@ describe('the client half', () => {
 		expect(handler.slice(0, 600)).toContain('applyHiddenFromAgentLocally(ev.cellId, ev.hidden)');
 	});
 
-	// WHY SOURCE: the WITHHOLDING divergence. `setExport`/`setHideInput` are
-	// PREFERENCES and swallow their outcome; this one may not - a failed write that
-	// leaves the toggle pressed is a false claim of concealment. The rendered
-	// consequence (revert + notice + an unchanged .ipynb) is asserted in the e2e.
-	it('reads the outcome, reverts supersede-safely and says what is true', () => {
+	// WHY SOURCE: WHICH surface a failed withhold reports on, and WHAT it says.
+	// The shell's transient line is single and nonce-keyed, so a second surface
+	// would silently replace this message; and the wording is the point - "request
+	// failed" leaves the reader unable to tell whether the cell is concealed. What
+	// actually HAPPENS on a failed write (the toggle reverting, the notice showing,
+	// an unchanged .ipynb) is asserted against a real browser in
+	// `tests/e2e/cell-row-toggles.spec.ts` - deliberately not restated as tokens
+	// here, which would pin a spelling a behaviour-preserving refactor may change.
+	it('reports a failed withhold on the ONE notice channel, saying what is true', () => {
 		const all = code(live);
 		const from = all.indexOf('async function setHiddenFromAgent');
-		const body = all.slice(from, all.indexOf('function applyHiddenFromAgentLocally', from));
 		expect(from, 'expected setHiddenFromAgent').toBeGreaterThan(0);
-		// no fire-and-forget: the outcome is read, and a network rejection lands in
-		// the same branch as a refusal rather than being swallowed
-		expect(body).toContain('.catch(() => null)');
-		expect(body).not.toContain('.catch(() => {})');
-		expect(body).toContain('if (res?.ok) return;');
-		// the revert only fires while the cell still reads what we wrote
-		expect(body).toContain('isHiddenFromAgent(now) === hidden');
-		// and it states the TRUTH, on the shell's one transient notice channel
+		const body = all.slice(from, all.indexOf('function applyHiddenFromAgentLocally', from));
 		expect(body).toMatch(/onNotice\?\.\(/);
+		// both directions state the cell's REAL disclosure state, not "request failed"
 		expect(body).toContain('still VISIBLE to AI agents');
 		expect(body).toContain('still HIDDEN from AI agents');
 	});
