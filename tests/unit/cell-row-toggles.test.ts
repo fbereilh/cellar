@@ -225,14 +225,111 @@ function code(s: string): string {
 	return s.replace(/<!--[\s\S]*?-->/g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
 }
 
-/** The `<button ...>` element containing `marker`, from its `<button` to its `>`. */
-function buttonAround(s: string, marker: string): string {
+/**
+ * The index of the `>` closing the opening tag that starts at `open`, or -1.
+ *
+ * It SCANS rather than guessing an indent: a terminator like `'\n\t\t\t\t>'`
+ * encodes a nesting depth, so it silently runs past a button nested one level
+ * deeper (as the export one is, inside `{#if canBeImports}`) and returns a slice
+ * spanning the NEXT control - which made every assertion over it vacuous.
+ * A `>` only terminates outside an HTML attribute value and outside a Svelte
+ * `{expression}` (and the JS strings within one), so all three are tracked.
+ */
+function openingTagEnd(s: string, open: number, name = 'button'): number {
+	let attr = ''; // the HTML attribute quote we are inside, '' if none
+	let braces = 0; // depth of the Svelte {expression} we are inside
+	let js = ''; // the string quote inside that expression, '' if none
+	for (let i = open + name.length + 1; i < s.length; i++) {
+		const c = s[i];
+		if (js) {
+			if (c === '\\') i++;
+			else if (c === js) js = '';
+		} else if (braces > 0) {
+			if (c === '"' || c === "'" || c === '`') js = c;
+			else if (c === '{') braces++;
+			else if (c === '}') braces--;
+		} else if (c === '{') {
+			braces = 1; // Svelte interpolates inside a quoted attribute too
+		} else if (attr) {
+			if (c === attr) attr = '';
+		} else if (c === '"' || c === "'") {
+			attr = c;
+		} else if (c === '>') {
+			return i;
+		} else if (c === '<') {
+			return -1; // a new tag opened before this one closed
+		}
+	}
+	return -1;
+}
+
+/**
+ * The opening tag of the toggle button containing `marker`, `<button` to `>`.
+ * Self-checking: exactly one `data-testid=` and one `aria-pressed=` must fall
+ * inside it, so an overrun into a sibling control fails HERE rather than
+ * silently satisfying whichever guard reads the slice next.
+ */
+function toggleButtonTag(s: string, marker: string): string {
 	const at = s.indexOf(marker);
 	expect(at, `expected to find ${marker}`).toBeGreaterThanOrEqual(0);
 	const open = s.lastIndexOf('<button', at);
 	expect(open, `expected a <button> before ${marker}`).toBeGreaterThanOrEqual(0);
-	return s.slice(open, s.indexOf('\n\t\t\t\t>', at));
+	const end = openingTagEnd(s, open);
+	expect(end, `expected the <button> opening tag around ${marker} to close`).toBeGreaterThan(at);
+	const tag = s.slice(open, end + 1);
+	expect(tag.match(/data-testid=/g), `${marker}: one control per tag`).toHaveLength(1);
+	expect(tag.match(/aria-pressed=/g), `${marker}: one aria-pressed per tag`).toHaveLength(1);
+	return tag;
 }
+
+describe('the source-guard helper itself', () => {
+	// The defect this replaced: the terminator was a hardcoded `'\n\t\t\t\t>'`, so
+	// for a button nested one level deeper it ran past that button's own `>` and
+	// returned a slice spanning the NEXT control - which silently satisfied every
+	// assertion read off it.
+	const nested = [
+		'<div>',
+		'\t\t\t\t{#if gate}',
+		'\t\t\t\t\t<button',
+		'\t\t\t\t\t\taria-pressed={a}',
+		'\t\t\t\t\t\tdata-testid="deep"',
+		'\t\t\t\t\t>',
+		'\t\t\t\t\t</button>',
+		'\t\t\t\t{/if}',
+		'\t\t\t\t<button',
+		'\t\t\t\t\taria-pressed={b}',
+		'\t\t\t\t\tdata-testid="shallow"',
+		'\t\t\t\t>',
+		'\t\t\t\t</button>',
+		'</div>'
+	].join('\n');
+
+	it("stops at the deeper button's own `>`, not at a shallower sibling's", () => {
+		const tag = toggleButtonTag(nested, 'data-testid="deep"');
+		expect(tag).toContain('data-testid="deep"');
+		expect(tag).not.toContain('data-testid="shallow"');
+		expect(tag.endsWith('>')).toBe(true);
+	});
+
+	it('a `>` inside an attribute value or a {expression} does not terminate the tag', () => {
+		const tricky = [
+			'<button',
+			'\ttitle="a > b, the notebook\'s own"',
+			"\tclass=\"x {on ? 'p>q' : 'r'}\"",
+			'\taria-pressed={on}',
+			'\tdata-testid="tricky"',
+			'>'
+		].join('\n');
+		expect(toggleButtonTag(tricky, 'data-testid="tricky"')).toBe(tricky);
+	});
+
+	it('fails loudly rather than handing back a wrong-sized slice', () => {
+		const unclosed = '<button aria-pressed={a} data-testid="x"';
+		expect(() => toggleButtonTag(unclosed, 'data-testid="x"')).toThrow();
+		const noState = nested.replace('aria-pressed={a}\n', '');
+		expect(() => toggleButtonTag(noState, 'data-testid="deep"')).toThrow();
+	});
+});
 
 describe('the wiring the browser ships (source guards - see the file header)', () => {
 	const cell = src('lib/Cell.svelte');
@@ -272,7 +369,7 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 	// sit OUTSIDE the state conditional, so only colour can move.
 	it('both toggles keep identical geometry in both states', () => {
 		for (const t of ['toggle-export', 'toggle-agent-hidden']) {
-			const btn = buttonAround(cell, `data-testid="${t}"`);
+			const btn = toggleButtonTag(cell, `data-testid="${t}"`);
 			const cls = btn.slice(btn.indexOf('class="'), btn.indexOf('}"') + 2);
 			// the sizing classes are unconditional; only the colour half is a ternary
 			expect(cls.slice(0, cls.indexOf('{')), t).toContain('btn btn-ghost btn-xs btn-square');
@@ -287,7 +384,7 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 			['toggle-export', 'aria-label="Export this cell to the notebook\'s .py module"'],
 			['toggle-agent-hidden', 'aria-label="Hide this cell from AI agents"']
 		]) {
-			const btn = buttonAround(cell, `data-testid="${t}"`);
+			const btn = toggleButtonTag(cell, `data-testid="${t}"`);
 			expect(btn, t).toMatch(/aria-pressed=\{/);
 			expect(btn, t).toContain(name);
 		}
