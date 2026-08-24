@@ -1708,8 +1708,19 @@
 		     click on its empty space expands - the disclosure convention. -->
 		<!-- svelte-ignore a11y_click_events_have_key_events -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<!-- `flex-wrap` is the row's only concession to a narrow card, and it costs
+		     NOTHING above the width where it is needed: the two groups are one flex
+		     line until they genuinely do not fit, and only then does the right-hand
+		     group drop to a second line (`ml-auto` keeps it right-aligned there, which
+		     `justify-between` alone cannot do for a lone item on a line). Without it
+		     the card's `overflow-hidden` CLIPS whatever runs past its edge, so the
+		     controls at the right end - delete, the type toggle - become unreachable
+		     rather than merely cramped. Measured with the sidebar open, that started
+		     at a ~730px viewport BEFORE the two row toggles below and ~780px after
+		     them, so wrapping both absorbs their 50px and fixes the pre-existing
+		     clipping. -->
 		<div
-			class="flex items-center justify-between px-2 py-1 {cellCollapsed ? 'cursor-pointer' : 'border-b border-base-300'}"
+			class="flex flex-wrap items-center justify-between gap-y-1 px-2 py-1 {cellCollapsed ? 'cursor-pointer' : 'border-b border-base-300'}"
 			onclick={onHeaderClick}
 		>
 			<div class="flex items-center gap-0.5">
@@ -1873,7 +1884,7 @@
 				     UNGATED: every cell type can be withheld. -->
 				<button
 					class="btn btn-ghost btn-xs btn-square {agentHidden
-						? 'bg-secondary/15 text-secondary hover:bg-secondary/25'
+						? 'bg-(--cellar-agent-hidden-soft) text-(--cellar-agent-hidden) hover:bg-(--cellar-agent-hidden-strong)'
 						: 'text-base-content/60 hover:text-base-content/90'}"
 					onclick={toggleAgentHidden}
 					aria-pressed={agentHidden}
@@ -1884,10 +1895,16 @@
 					data-testid="toggle-agent-hidden"
 					data-on={agentHidden ? 'true' : undefined}
 				>
+					<!-- The strike is drawn TWICE, the under-stroke in the card's own colour,
+					     so it cuts a visible gap through the sparkle instead of merging with
+					     it. Measured at 4x against five alternatives: a bare line over this
+					     shape reads as a dense asterisk, because a 4-point star's concave
+					     vertices sit ON the diagonal the strike runs along. -->
 					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-						<path d="M12 5 13.4 9.6 18 11l-4.6 1.4L12 17l-1.4-4.6L6 11l4.6-1.4z" />
+						<path d="M12 4 14.12 9.88 20 12l-5.88 2.12L12 20l-2.12-5.88L4 12l5.88-2.12Z" />
 						{#if agentHidden}
-							<path d="m3 3 18 18" />
+							<path d="M3.4 3.4 20.6 20.6" stroke="var(--cellar-surface-cell)" stroke-width="4.6" />
+							<path d="M3.4 3.4 20.6 20.6" />
 						{/if}
 					</svg>
 				</button>
@@ -2015,7 +2032,7 @@
 					{collapsePreview}
 				</span>
 			{/if}
-			<div class="flex items-center gap-1">
+			<div class="ml-auto flex items-center gap-1">
 				<!-- Mode indicator for the selected cell: pencil = edit, dot = command. -->
 
 				{#if active}

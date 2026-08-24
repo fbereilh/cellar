@@ -122,6 +122,30 @@
 	--cellar-stale: light-dark(#b45309, #f0b429);
 	--cellar-stale-soft: light-dark(#b4530918, #f0b42920);
 
+	/* --- Hidden from the agent ----------------------------------------------
+	 * The ON state of the cell row's hide-from-agent toggle. A DEDICATED pair for
+	 * the same reason staleness and the git decorations have one: every daisyUI
+	 * semantic token is either spoken for in this very row or unstable across
+	 * themes. `secondary` is the app's agent hue and would be the obvious pick,
+	 * but `dim` resolves it to hue 35.4 against `error`'s 33.8 - 1.6 apart - so a
+	 * filled pill would read as danger beside the red delete button two controls
+	 * along. `accent` is the export toggle's, immediately to its left; `info` is
+	 * the SQL badge / user actor / command-mode hue; `primary` is imports and the
+	 * selection ring; `warning` is running and queued; `success` is run and edit.
+	 * Blue is the one slot left, and the trade it makes is deliberate: it buys the
+	 * most separation from `accent` (~47), which is the pill IMMEDIATELY beside it
+	 * and the only adjacency that can be misread, at the cost of sitting nearer
+	 * `info` (~22 in light) - which never appears as an adjacent icon pill (the SQL
+	 * badge is text, and a SQL cell carries no export toggle; the user actor and
+	 * the command-mode indicator are text in the other half of the row). Compared
+	 * against indigo and teal in both schemes at render size before choosing.
+	 * `-soft` is the pill fill, `-strong` its hover - both applied as Tailwind
+	 * utilities, so they win over `.btn-ghost:hover` the way the row's other
+	 * colour overrides do. */
+	--cellar-agent-hidden: light-dark(#1d4ed8, #93c5fd);
+	--cellar-agent-hidden-soft: light-dark(#1d4ed818, #93c5fd20);
+	--cellar-agent-hidden-strong: light-dark(#1d4ed829, #93c5fd33);
+
 	/* --- Notebook surfaces --------------------------------------------------
 	 * Three distinct planes. In light themes the page is the *greyest* plane and
 	 * every plane above it gets lighter: a grey page, a white cell card, a faintly
