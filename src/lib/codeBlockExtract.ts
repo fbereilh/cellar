@@ -290,6 +290,14 @@ export function decorateCodeBlocks(root: ParentNode | null | undefined): number 
  * cell is one `dd` away, whereas a no-op would have to explain itself against a
  * cell the user may since have edited, moved or deleted - and a control that
  * silently does nothing is the one outcome to avoid.
+ *
+ * STATED RESIDUAL: the renamed control lives on the button, which windowing
+ * discards when the cell scrolls far out of the window - so coming back, the
+ * block offers to extract again as if for the first time. Accepted rather than
+ * lifted into the notebook (where per-cell state that must outlive a scroll
+ * belongs): a durable record would need a stable per-BLOCK key, which only the
+ * block's own content can supply, and it would buy a label - while the fact it
+ * reports is already on screen as the extracted cell sitting below.
  */
 export function flashExtracted(btn: Element | null | undefined, ms = 1200): void {
 	if (!btn || typeof btn.setAttribute !== 'function') return;
