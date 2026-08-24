@@ -287,7 +287,7 @@ function fakeStdio() {
 		/** Deliver a message without waiting, so several can be in flight at once. */
 		post: (msg: Record<string, unknown>) => t.onmessage?.(msg),
 		/** Deliver a message from the "agent" and wait for the reply it expects. */
-		async request(msg: Record<string, unknown>, timeoutMs = 3000) {
+		async request(msg: Record<string, unknown>, timeoutMs = POLL_MS) {
 			const before = sent.length;
 			t.onmessage?.(msg);
 			const deadline = Date.now() + timeoutMs;
@@ -299,7 +299,7 @@ function fakeStdio() {
 			throw new Error(`no reply for id ${String(msg.id)} within ${timeoutMs}ms`);
 		},
 		/** Wait for a reply to an id posted earlier. */
-		async awaitReply(id: unknown, timeoutMs = 3000) {
+		async awaitReply(id: unknown, timeoutMs = POLL_MS) {
 			const deadline = Date.now() + timeoutMs;
 			while (Date.now() < deadline) {
 				const reply = sent.find((m) => m.id === id);
@@ -310,6 +310,23 @@ function fakeStdio() {
 		}
 	};
 }
+
+/**
+ * The ceiling every poll-until helper below waits to, and it is deliberately far
+ * above what any of them needs on a quiet machine.
+ *
+ * They are POLL loops - each returns the instant its condition holds - so the
+ * ceiling costs nothing when things work and only decides how long a genuinely
+ * stuck bridge takes to FAIL. At 3s it was instead deciding something else: this
+ * file drives a real HTTP server, a real `StreamableHTTPClientTransport` and real
+ * reconnect handshakes, and the suite runs ~180 files across `cpus - 1` forks that
+ * each spawn again, so a correct-but-contended handshake legitimately spent more
+ * than 3s and the file failed on full runs while passing in isolation - the same
+ * harness arithmetic `vitest.config.ts` records for its 30s default, one layer in.
+ * Kept under the 30s vitest budget so a real hang still surfaces as this file's
+ * own error rather than as an opaque suite timeout.
+ */
+const POLL_MS = 15_000;
 
 /**
  * A pass-through in front of a fake Cellar that can drop ONE POST by destroying
@@ -393,7 +410,7 @@ async function deadPort(): Promise<number> {
 }
 
 /** Poll until `fn` is true, so a test never leans on a fixed sleep. */
-async function until(fn: () => boolean, timeoutMs = 3000) {
+async function until(fn: () => boolean, timeoutMs = POLL_MS) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (fn()) return;
@@ -988,7 +1005,7 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		// The agent's next call must come back promptly rather than hang. 3s is far
 		// under undici's default and far over the injected 200ms bound, so it fails
 		// only if the send is genuinely unbounded.
-		const reply = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, 3000);
+		const reply = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, POLL_MS);
 		expect(reply.error).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
 		expect(wedged.seen.some((m) => m.method === 'initialize')).toBe(true);
 		// The bridge is untouched and still relaying, ready to heal on the next launch.
