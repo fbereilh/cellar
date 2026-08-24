@@ -50,13 +50,13 @@
  * `bin/cellar.js` can import it exactly like `venv.js`/`runtime.js`; it is in
  * `package.json` `files` for the same reason).
  *
- * Being text-surgical means the scanner IS the safety property: it has to know
- * what is structure and what is a value, in both directions - an open
- * multi-line string AND an open bracket (see `parseTomlDoc`). Every structural
- * decision reads a string-masked copy of the line, never the raw text, because
- * getting this wrong does not surface as a parse error; it surfaces as a config
- * that quietly lost a key, gained a duplicate one, or had text rewritten inside
- * the user's own string while the real key kept its stale value.
+ * Being text-surgical means the SCANNER is the safety property - and it does not
+ * live here: `./toml.js` owns it, shared with the nbdev `pyproject.toml` writer
+ * so the two can never come to read one file differently. Its header owns the
+ * value-vs-structure rules (an open multi-line string AND an open bracket; every
+ * structural decision read off a string-masked line) and what getting them wrong
+ * costs, which is never a parse error - it is a config that quietly lost a key,
+ * gained a duplicate one, or had text rewritten inside the user's own string.
  *
  * ## The running-cellar dependency
  *
