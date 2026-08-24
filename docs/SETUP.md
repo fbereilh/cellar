@@ -854,7 +854,7 @@ spec files at a time. Install its browser once with `npx playwright install chro
   chat cell would come back as runnable prose with its AI reply gone for good (no re-run
   reproduces one). Cellar refuses both instead - in the type menu (where neither is offered),
   in the notebook's add controls (which withhold the **Chat** button there), and on the `r`
-  chord; an agent's `add_cell` / `set_cell_type` is refused for raw, and cannot
+  and `t` chords; an agent's `add_cell` / `set_cell_type` is refused for raw, and cannot
   ask for a chat cell at all (no agent write tool takes `chat`). Convert the notebook to
   `.ipynb` (app menu → **Convert to .ipynb**) if you need one. The same limit applies to raw
   in the other direction: **Save as .py** writes a raw cell out as code, so a Quarto notebook
