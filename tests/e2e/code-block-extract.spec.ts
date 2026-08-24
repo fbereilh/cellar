@@ -286,6 +286,83 @@ test('the control is reachable and activatable by keyboard alone', async ({ page
 	expect(sourceOf(cell)).toBe(PY_BLOCK);
 });
 
+test('activating the control in a MARKDOWN CELL never drops it into edit mode', async ({ page }) => {
+	test.setTimeout(120_000);
+	const nb = await openFresh(page, 'extract-mdcell-noedit.ipynb');
+
+	// The rendered-markdown container is `role="button"` with its own
+	// double-click-and-Enter-to-edit, and the control is a DESCENDANT of it - so both
+	// of those events bubble out of the control. Neither may flip the cell into raw
+	// source editing and move DOM focus into CodeMirror: extraction is a side action
+	// taken while READING, and the chat cell (whose container carries no such
+	// handlers) cannot show this.
+	const rendered = page.locator(`[data-testid="cell"][data-cell-id="${MD_ID}"]`).getByTestId('markdown-rendered');
+	await expect(rendered).toBeVisible();
+
+	// The keyboard route: focus the control and press Enter, exactly as the
+	// no-pointer test above does.
+	await page.mouse.move(2, 2);
+	await extractBtn(page, MD_CELL_BLOCK_AT).focus();
+	await page.keyboard.press('Enter');
+	expect(sourceOf((await settled(nb, 1))[0])).toBe(MD_CELL_BLOCK);
+	await expect(rendered).toBeVisible();
+
+	// And the pointer route: a double-click is two clicks plus a `dblclick`, so it
+	// extracts twice and must still leave the cell rendered.
+	await extractBtn(page, MD_CELL_BLOCK_AT).dblclick();
+	expect((await settled(nb, 3)).map(sourceOf)).toEqual([MD_CELL_BLOCK, MD_CELL_BLOCK, MD_CELL_BLOCK]);
+	await expect(rendered).toBeVisible();
+});
+
+test('a folded heading gives its code block back with a working control', async ({ page }) => {
+	test.setTimeout(120_000);
+	const nb = await openFresh(page, 'extract-fold.ipynb');
+
+	// Folding `## Setup` hides that heading's BODY inside a cell that stays visible,
+	// and the body is dropped from the DOM by `{#if}` - so unfolding re-creates the
+	// rendered markdown as fresh, UNDECORATED nodes. Nothing else about the cell
+	// moves, so the decoration has to be watching the fold itself.
+	const chevron = page.locator(`[data-testid="fold-toggle"][data-fold-key="${MD_ID}"]`);
+	const mdBlocks = page.locator(`[data-cell-id="${MD_ID}"] [data-cellar-code-block]`);
+	await chevron.click();
+	await expect(mdBlocks).toHaveCount(0);
+	await chevron.click();
+	await expect(mdBlocks).toHaveCount(1);
+	await expect(mdBlocks.getByTestId('extract-code')).toHaveCount(1);
+
+	await blocks(page).nth(MD_CELL_BLOCK_AT).hover();
+	await extractBtn(page, MD_CELL_BLOCK_AT).click();
+
+	const [cell] = await settled(nb, 1);
+	expect(sourceOf(cell)).toBe(MD_CELL_BLOCK);
+	expect(idsOf(nb)).toEqual([MD_ID, cell.id, CHAT_ID]);
+});
+
+test('two extractions issued inside ONE round trip still land in reading order', async ({ page }) => {
+	test.setTimeout(120_000);
+	const nb = await openFresh(page, 'extract-concurrent.ipynb');
+
+	// Hold every add long enough that the second click is issued while the first is
+	// still in flight. That window is real - the round trip includes a synchronous
+	// fsync'd `.ipynb` persist - but too short to hit by hand, and inside it both
+	// extractions used to resolve the anchor to the chat cell and insert directly
+	// after it, landing python-then-sql as [chat, sql, python].
+	await page.route('**/api/cells', async (route) => {
+		if (route.request().method() !== 'POST') return route.continue();
+		await new Promise((r) => setTimeout(r, 700));
+		await route.continue();
+	});
+
+	await blocks(page).nth(PY_AT).hover();
+	await extractBtn(page, PY_AT).click();
+	await blocks(page).nth(SQL_AT).hover();
+	await extractBtn(page, SQL_AT).click();
+
+	const cells = await settled(nb, 2);
+	expect(cells.map(sourceOf)).toEqual([PY_BLOCK, SQL_BLOCK]);
+	expect(cells.map(typeOf)).toEqual(['code', 'sql']);
+});
+
 test('a block containing BACKTICKS and MARKDOWN survives intact, as a markdown cell', async ({ page }) => {
 	test.setTimeout(120_000);
 	const nb = await openFresh(page, 'extract-backticks.ipynb');

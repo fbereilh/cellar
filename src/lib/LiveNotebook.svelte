@@ -2934,6 +2934,35 @@
 	}
 
 	/**
+	 * One extraction at a time PER SOURCE CELL, so reading the anchor above and
+	 * recording the cell it produced is ONE critical section.
+	 *
+	 * The anchor resolves before the `await` and is recorded after it, so two clicks
+	 * issued inside a single round trip - easy to do, since that trip includes a
+	 * synchronous fsync'd `.ipynb` persist - both resolved to the source cell and
+	 * both inserted directly after it, landing block A then block B as
+	 * `[source, B, A]`: exactly the reversal the anchor exists to prevent. Serializing
+	 * is the `withPathLock` shape, tail-chained per source cell and dropped when the
+	 * chain drains so the map never grows; two DIFFERENT source cells still run in
+	 * parallel, because the anchor they contend for is per source cell too.
+	 */
+	const extractChains = new Map<string, Promise<unknown>>();
+
+	function withExtractLock<T>(sourceId: string, fn: () => Promise<T>): Promise<T> {
+		const prev = extractChains.get(sourceId) ?? Promise.resolve();
+		const run = prev.then(fn);
+		const tail = run.then(
+			() => {},
+			() => {}
+		);
+		extractChains.set(sourceId, tail);
+		tail.then(() => {
+			if (extractChains.get(sourceId) === tail) extractChains.delete(sourceId);
+		});
+		return run;
+	}
+
+	/**
 	 * Create a cell below `sourceId` holding `block`'s code, with the type its
 	 * fence asked for. The ONE extraction path: the control on the block and the
 	 * keyboard chord both land here, and both read the block through the same
@@ -2955,19 +2984,24 @@
 	 * `chat` and `raw` are unreachable by construction (see `fenceCellType`).
 	 */
 	async function extractCodeBlock(sourceId: string, block: ExtractedCodeBlock): Promise<boolean> {
-		if (!findCell(sourceId)) return false;
-		try {
-			const created = await addCell(extractAnchor(sourceId), block.cellType, block.source);
-			extractAnchors.set(sourceId, created.id);
-			return true;
-		} catch {
-			// `addCell` has already resynced the model (and named the reason, for the
-			// refusal codes `noticeRefusal` knows). The rejection is caught HERE rather
-			// than left to the caller because both routes are fire-and-forget event
-			// handlers, where an escaping rejection is an unhandled one - and reporting
-			// FALSE is what keeps the control from confirming a cell that never landed.
-			return false;
-		}
+		// The whole read-modify-write of the anchor runs inside the lock, the
+		// still-there check included: a preceding extraction resyncs the model, so
+		// both questions have to be asked against the order this insert will use.
+		return withExtractLock(sourceId, async () => {
+			if (!findCell(sourceId)) return false;
+			try {
+				const created = await addCell(extractAnchor(sourceId), block.cellType, block.source);
+				extractAnchors.set(sourceId, created.id);
+				return true;
+			} catch {
+				// `addCell` has already resynced the model (and named the reason, for the
+				// refusal codes `noticeRefusal` knows). The rejection is caught HERE rather
+				// than left to the caller because both routes are fire-and-forget event
+				// handlers, where an escaping rejection is an unhandled one - and reporting
+				// FALSE is what keeps the control from confirming a cell that never landed.
+				return false;
+			}
+		});
 	}
 
 	/**

@@ -1636,6 +1636,13 @@
 		void mode;
 		void codeHidden;
 		void cellCollapsed;
+		// Tracked for the same reason as `cellCollapsed`, one level finer: an OUTER
+		// fold hides a heading's BODY inside a cell that is still partly visible, and
+		// that body is dropped by `{#if}` too - so unfolding re-creates the `{@html}`
+		// content as fresh, undecorated DOM. Nothing else moves on a fold toggle
+		// (`segments` reads only the source and the heading numbers), so without this
+		// the block came back with no control at all.
+		void segHidden;
 		if (!browser) return;
 		let cancelled = false;
 		tick().then(() => {
@@ -1647,13 +1654,36 @@
 		};
 	});
 
+	// A rendered markdown cell is `role="button"` and enters raw source editing on a
+	// double-click or on Enter, and Cellar's OWN chrome lives inside it - the fold
+	// chevrons, and the extract control `decorateCodeBlocks` hangs on every code
+	// block - so activating one of those bubbles out and flips the cell into the
+	// editor, moving DOM focus into CodeMirror. That is exactly what extraction
+	// promises not to do, and BOTH events have to be guarded: `stopPropagation` on a
+	// `click` suppresses neither, and Enter on a focused control is the documented
+	// no-pointer route to extract.
+	//
+	// A `<button>` inside this container can only ever be ours: `renderMarkdown` runs
+	// markdown-it with `html:false` behind DOMPurify, so authored prose cannot carry
+	// one. That is what makes the test exact rather than a heuristic over the user's
+	// own content - double-clicking the prose, or the code block's body, still edits.
+	const fromRenderedControl = (e: Event) => !!(e.target as HTMLElement | null)?.closest?.('button');
+
+	function enterEditFromRendered(e: Event) {
+		if (fromRenderedControl(e)) return;
+		enterEdit();
+	}
+
 	// One delegated listener rather than a listener per injected control: the
 	// controls are created and discarded with the rendered markdown, so anything
 	// bound to them individually would have to be unbound again on every re-render.
 	// The card already exempts `button` from its selection gesture
-	// (`onCardPointerDown`), so a click here never also moves the selection - and
-	// `stopPropagation` keeps it clear of the rendered-markdown block's own
-	// double-click-to-edit.
+	// (`onCardPointerDown`), so a click here never also moves the selection.
+	//
+	// `stopPropagation` here covers the CLICK and nothing else: `dblclick` and
+	// `keydown` are separate events, so the rendered-markdown container's own
+	// double-click-and-Enter-to-edit is held off by `fromRenderedControl` above, not
+	// by this.
 	async function onCardClick(e: MouseEvent) {
 		const btn = (e.target as HTMLElement | null)?.closest?.(`[data-testid="${EXTRACT_TESTID}"]`);
 		if (!btn) return;
@@ -2238,8 +2268,8 @@
 				role="button"
 				tabindex="0"
 				title="Double-click to edit"
-				ondblclick={enterEdit}
-				onkeydown={(e) => (e.key === 'Enter' ? enterEdit() : null)}
+				ondblclick={enterEditFromRendered}
+				onkeydown={(e) => (e.key === 'Enter' ? enterEditFromRendered(e) : null)}
 			>
 				{#if hasMarkdown}
 					{#each segments as seg (seg.index)}

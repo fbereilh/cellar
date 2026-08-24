@@ -424,21 +424,29 @@ mark.cellar-search-mark-active {
 	/* Quiet at rest rather than hidden. The strip above is reserved either way, so
 	 * hiding it outright would leave an unexplained gap and make the feature
 	 * findable only by accident - and the affordance it belongs to (the cell
-	 * toolbar's copy buttons) is always visible too, at a comparable weight. */
+	 * toolbar's copy buttons) is always visible too, at a comparable weight.
+	 *
+	 * `opacity` alone carries that quietness, and the colour stays at FULL strength.
+	 * The two used to compound - 0.4 on the button multiplying a 60% colour - which
+	 * was an accident rather than a decision and landed the glyph near 0.24, below
+	 * the level this codebase has already set for a quiet control (the markdown
+	 * fold chevron sits at `text-base-content/40` with no multiplier), i.e. working
+	 * against this control's own reason for being visible at rest. One alpha, at the
+	 * established weight; re-tuning it for the code surface it sits on would be a
+	 * deliberate follow-up with a stated number. */
 	opacity: 0.4;
 	transition: opacity 120ms ease;
 	background-color: var(--color-base-300);
 	border-color: color-mix(in oklab, var(--color-base-content) 12%, transparent);
-	color: color-mix(in oklab, var(--color-base-content) 60%, transparent);
+	color: var(--color-base-content);
 	box-shadow: 0 1px 2px rgb(0 0 0 / 0.12);
 }
+/* Full strength on hover, on keyboard focus, and while confirming - the colour is
+ * already there, so these only lift the one alpha. */
 .cellar-md .cellar-code-block:hover .cellar-code-extract,
 .cellar-md .cellar-code-extract:focus-visible,
 .cellar-md .cellar-code-extract[data-extracted] {
 	opacity: 1;
-}
-.cellar-md .cellar-code-block:hover .cellar-code-extract:hover {
-	color: var(--color-base-content);
 }
 /* The confirmation: the check replaces the arrow for a moment (`data-extracted`,
  * set by `flashExtracted`), exactly as the cell toolbar's copy buttons confirm.
