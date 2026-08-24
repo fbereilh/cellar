@@ -1151,8 +1151,18 @@ function runOnce({
 			// search/read itself ran) is still reported, once, so the reply does not
 			// silently omit a tool that ran. Held to the same `unsafe` gate as every
 			// other report from this session.
+			//
+			// Guarded because this is the ONE notification on the settle path: a throw
+			// out of a caller's callback here would skip `resolve` and leave the run's
+			// promise pending FOREVER, wedging that notebook's queue slot - strictly
+			// worse than any wrong answer, the same rule the kernel watchdog's probe
+			// follows. A run that cannot report its last calls still settles.
 			if (!unsafe) {
-				for (const call of tools.flush()) onToolCall?.(call);
+				try {
+					for (const call of tools.flush()) onToolCall?.(call);
+				} catch (err) {
+					console.error('[cellar-chat] reporting the final tool calls failed:', err);
+				}
 			}
 			cleanup();
 			settleRun(value);

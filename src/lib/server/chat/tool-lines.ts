@@ -114,7 +114,12 @@ const PATH_FIELDS = new Set(['file_path', 'path']);
 /** What an out-of-workspace path renders as - never the path itself. */
 export const OUTSIDE_WORKSPACE = 'outside the workspace';
 
-/** One target's rendered length ceiling; a long query/path is elided, not dropped. */
+/**
+ * Rendered length ceiling per FIELD (so a two-field `Grep` line can reach twice
+ * this). A long query or path is elided with an ellipsis, never dropped: the
+ * point is that the reader can see WHAT was consulted, and a bound that hid it
+ * would defeat the feature to save characters.
+ */
 const MAX_TARGET_CHARS = 120;
 
 /**
