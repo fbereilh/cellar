@@ -72,24 +72,33 @@
  * reader learns what happened without the notebook carrying a stranger's
  * directory layout.
  *
- * A PATTERN is path-shaped too, and an ABSOLUTE one is held to that exact rule -
- * relativized, or NAMED. `Glob`'s `pattern` IS a path pattern and may legitimately
- * be written absolute (`/Users/me/proj/**` + `/*.py`), which is the same leak
- * through a differently-named field, in its worst shape: such a pattern points
- * outside the confinement root, so the CLI DENIES the call, and printing it would
- * write the directory layout into the reply, persist it to the `.ipynb` and carry
- * it into the HTML export precisely when the security boundary did its job. One
- * convention for every path-shaped value, never a second one for patterns.
+ * `Glob`'s PATTERN is path-shaped too, and an ABSOLUTE one is held to that exact
+ * rule - relativized, or NAMED. A glob pattern IS a path pattern and may
+ * legitimately be written absolute (`/Users/me/proj/**` + `/*.py`), which is the
+ * same leak through a differently-named field, in its worst shape: such a pattern
+ * points outside the confinement root, so the CLI DENIES the call, and printing
+ * it would write the directory layout into the reply, persist it to the `.ipynb`
+ * and carry it into the HTML export precisely when the security boundary did its
+ * job.
  *
- * A RELATIVE pattern is left VERBATIM, and that asymmetry is deliberate rather
- * than an omission. It is already workspace-relative (the read shapes cwd the
- * child at the root), and a `Grep` pattern is a REGEX, so putting it through the
- * `.`/`..` segment normalization a relative PATH gets would silently corrupt it:
- * a pattern of exactly `..` - the regex "any two characters" - would normalize to
- * `outside the workspace`, a false claim about a search that never named a path
- * at all, and `a/./b` would quietly lose its `.` segment. Naming an outside path
- * is required; inventing an outside claim about a regex is the same class of
- * false statement this section exists to prevent.
+ * A RELATIVE glob pattern is left VERBATIM, and that asymmetry is deliberate
+ * rather than an omission. It is already workspace-relative (the read shapes cwd
+ * the child at the root), and a glob is not a path, so putting it through the
+ * `.`/`..` segment normalization a relative PATH gets would silently rewrite a
+ * legal pattern: `src/../lib/*.py` would be collapsed, and a bare `..` would
+ * become an outside claim about a search that never named a path at all.
+ *
+ * `Grep`'s pattern, though, is CONTENT and is rendered VERBATIM like a search
+ * query - it is NOT path-shaped, and treating it as one was a false claim in the
+ * other direction. A `Grep` pattern is a REGEX over file CONTENT, and a regex
+ * that merely STARTS WITH A SLASH is not a path: `/api/v1/users`, a
+ * `/usr/bin/env` shebang, a slash-delimited regex are all everyday queries, and
+ * measured against the workspace each one resolves outside it and rendered
+ * `Grep(outside the workspace)` - with NO `(failed)` marker, because the search
+ * ran squarely INSIDE and succeeded. That is the same false claim this section
+ * exists to remove, produced from the opposite side. Nothing is lost by exempting
+ * it: `Grep`'s leak vector is its `path` field, which is path-shaped and always
+ * was, so its `pattern` carries no directory to leak.
  *
  * ## The rendered line
  *
@@ -145,15 +154,19 @@ export interface ChatToolCall {
 /**
  * What a rendered field's value IS, which is what decides how it is rendered:
  *
- * - `content` - not a path at all (a search query). Shown verbatim.
+ * - `content` - not a path at all: a search query, or a `Grep` regex over file
+ *               CONTENT. Shown verbatim. A regex that merely starts with `/`
+ *               (`/api/v1/users`) is NOT a path, so measuring one against the
+ *               workspace reports a successful in-workspace search as an outside
+ *               one - see the module header.
  * - `path`    - a filesystem path. Absolute: relativized or NAMED. Relative:
  *               normalized (so `src/sub/../a.py` reads `src/a.py`, and one that
  *               climbs out of the workspace is NAMED).
- * - `pattern` - a path PATTERN (`Glob`) or a regex over content (`Grep`), which
- *               share one field name. Absolute: relativized or NAMED, exactly
+ * - `pattern` - a path PATTERN (`Glob`). Absolute: relativized or NAMED, exactly
  *               like a path, because that is where the leak is. Relative: left
- *               VERBATIM, because normalizing a regex corrupts it (see the
- *               module header's `..` case).
+ *               VERBATIM, because a glob is not a path and normalizing rewrites
+ *               it (`src/../lib/*.py` would be collapsed, a bare `..` would
+ *               become an outside claim).
  */
 type TargetKind = 'content' | 'path' | 'pattern';
 
@@ -177,7 +190,9 @@ interface TargetField {
  * doctrine this module already applies to tools.
  *
  * `path` rides along for `Glob`/`Grep` because a pattern without the directory it
- * ran in is not provenance - `load` says nothing, `load in src` does.
+ * ran in is not provenance - `load` says nothing, `load in src` does. It is also
+ * `Grep`'s only path-shaped field, which is what makes rendering its `pattern`
+ * verbatim cost no provenance and leak no directory.
  */
 const TOOL_TARGETS: Record<string, readonly TargetField[]> = {
 	WebSearch: [{ field: 'query', kind: 'content' }],
@@ -187,7 +202,7 @@ const TOOL_TARGETS: Record<string, readonly TargetField[]> = {
 		{ field: 'path', kind: 'path' }
 	],
 	Grep: [
-		{ field: 'pattern', kind: 'pattern' },
+		{ field: 'pattern', kind: 'content' },
 		{ field: 'path', kind: 'path' }
 	]
 };
@@ -260,7 +275,7 @@ function absoluteAgainstWorkspace(value: string, workspace: ChatWorkspaceRef): s
  * workspace as its cwd - so nothing else is done to it.
  *
  * This is applied to a `path` field ONLY, never to a `pattern`: see the module
- * header for why normalizing a `Grep` regex would make it lie.
+ * header for why normalizing a glob would rewrite a legal pattern.
  */
 function normalizeRelativePath(value: string): string {
 	const parts: string[] = [];

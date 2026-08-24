@@ -230,13 +230,15 @@ describe('what a line may say', () => {
 		expect(line).not.toMatch(/[`(\s]\//);
 	});
 
-	it('NAMES an absolute out-of-workspace grep pattern and its path', () => {
+	it('NAMES a grep’s out-of-workspace PATH rather than printing it', () => {
+		// `path` is `Grep`'s path-shaped field, and the only one that can leak a
+		// directory - its `pattern` is a regex and is rendered verbatim.
 		const denied: ChatToolCall = {
 			name: 'Grep',
-			input: { pattern: '/Users/felipe/secrets/*.env', path: '/Users/felipe/secrets' },
+			input: { pattern: 'AWS_SECRET', path: '/Users/felipe/secrets' },
 			outcome: 'failed'
 		};
-		expect(toolCallTarget(denied, '/ws')).toBe(`${OUTSIDE_WORKSPACE}, ${OUTSIDE_WORKSPACE}`);
+		expect(toolCallTarget(denied, '/ws')).toBe(`AWS_SECRET, ${OUTSIDE_WORKSPACE}`);
 		const line = toolCallLine(denied, '/ws');
 		expect(line).not.toContain('felipe');
 		expect(line).not.toMatch(/[`(\s]\//);
@@ -246,25 +248,55 @@ describe('what a line may say', () => {
 		const roots = ['/ws', '/private/ws'];
 		expect(toolCallTarget(call('Glob', { pattern: '/ws/src/**/*.py' }), roots)).toBe('src/**/*.py');
 		expect(toolCallTarget(call('Glob', { pattern: '/private/ws/src/**/*.py' }), roots)).toBe('src/**/*.py');
-		expect(toolCallTarget(call('Grep', { pattern: '/ws/src/*.env', path: '/private/ws/src' }), roots)).toBe(
+		expect(toolCallTarget(call('Glob', { pattern: '/private/ws/src/*.env', path: '/ws/src' }), roots)).toBe(
 			'src/*.env, src'
 		);
 	});
 
-	it('leaves a RELATIVE grep pattern verbatim, so a regex is never rewritten', () => {
-		// A `Grep` pattern is a REGEX. `..` means "any two characters"; normalized as
-		// a path it would render the false claim `outside the workspace` about a
-		// search that never named a path at all, and `a/./b` would lose its `.`.
+	it('renders a grep pattern VERBATIM: it is a regex over content, not a path', () => {
+		// A `Grep` pattern is a REGEX. `..` means "any two characters"; measured as a
+		// path it would render the false claim `outside the workspace` about a search
+		// that never named a path at all, and `a/./b` would lose its `.`.
 		expect(toolCallTarget(call('Grep', { pattern: '..' }), '/ws')).toBe('..');
 		expect(toolCallTarget(call('Grep', { pattern: 'a/./b' }), '/ws')).toBe('a/./b');
 		expect(toolCallTarget(call('Grep', { pattern: '../..' }), '/ws')).toBe('../..');
 		expect(toolCallLine(call('Grep', { pattern: '..' }), '/ws')).not.toContain(OUTSIDE_WORKSPACE);
-		// A relative glob pattern is likewise kept exactly as the model wrote it.
+		// A relative glob pattern is likewise kept exactly as the model wrote it - a
+		// glob is not a path, so normalizing would rewrite a legal pattern.
 		expect(toolCallTarget(call('Glob', { pattern: './src/**/*.py' }), '/ws')).toBe('./src/**/*.py');
+		expect(toolCallTarget(call('Glob', { pattern: 'src/../lib/*.py' }), '/ws')).toBe('src/../lib/*.py');
+		expect(toolCallTarget(call('Glob', { pattern: '..' }), '/ws')).toBe('..');
 		// A relative PATH is still normalized - the asymmetry is per FIELD KIND.
 		expect(toolCallTarget(call('Grep', { pattern: '..', path: './src/./sub' }), '/ws')).toBe('.., src/sub');
 		expect(toolCallTarget(call('Grep', { pattern: '..', path: '../out' }), '/ws')).toBe(
 			`.., ${OUTSIDE_WORKSPACE}`
+		);
+	});
+
+	it('CORRECTED DECISION: a grep pattern starting with `/` is a regex, never an outside path', () => {
+		// Pinning a decision that was reversed deliberately - do not re-flip
+		// `Grep.pattern` to a path kind. A regex that merely BEGINS WITH A SLASH is
+		// not a path: measured against the workspace it resolves outside it, so the
+		// line claimed `Grep(outside the workspace)` for a search that ran squarely
+		// INSIDE and SUCCEEDED - and with no `(failed)` marker to hint otherwise.
+		for (const pattern of ['/api/v1/users', '/usr/bin/env', '/etc/hosts']) {
+			const target = toolCallTarget(call('Grep', { pattern }), '/ws');
+			expect(target).toBe(pattern);
+			const line = toolCallLine(call('Grep', { pattern }), '/ws');
+			expect(line).toBe(`\`Grep(${pattern})\``);
+			expect(line).not.toContain(OUTSIDE_WORKSPACE);
+		}
+		// Its `path` sibling is what carries a directory, and stays path-shaped.
+		expect(toolCallTarget(call('Grep', { pattern: '/api/v1/users', path: '/ws/src' }), '/ws')).toBe(
+			'/api/v1/users, src'
+		);
+		expect(toolCallTarget(call('Grep', { pattern: '/api/v1/users', path: '/etc' }), '/ws')).toBe(
+			`/api/v1/users, ${OUTSIDE_WORKSPACE}`
+		);
+		// In either workspace spelling, and for a call that succeeded.
+		const roots = ['/ws', '/private/ws'];
+		expect(toolCallTarget(call('Grep', { pattern: '/api/v1/users', path: '/private/ws/src' }), roots)).toBe(
+			'/api/v1/users, src'
 		);
 	});
 

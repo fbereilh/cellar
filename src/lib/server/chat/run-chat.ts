@@ -271,26 +271,6 @@ export async function executeChatRun({
 }
 
 /**
- * The directory a reads-on chat run is confined to: the WORKSPACE, or null when
- * it cannot be established.
- *
- * The workspace and NOT the notebook's code root, deliberately - a code root may
- * be an external git worktree, and Cellar's standing rule is that such a root
- * grants a kernel cwd and not one byte of file reach, every file surface staying
- * workspace-scoped. Reads follow that rule rather than inventing a second answer
- * to "which directory may this notebook see".
- *
- * A root that is not an existing directory yields null (= reads off) rather than
- * being passed on: the engine spawns the child WITH this as its cwd, so a
- * missing one would surface as a spawn ENOENT, and a read-less run is the
- * safe degradation - the frozen prompt is chosen from the same policy, so such a
- * run is also TOLD it cannot read rather than being left to discover it.
- *
- * It cannot close the race, only narrow it - the directory can still go away
- * between this check and the spawn - so `spawnFailure` re-asks there and names
- * the workspace instead of blaming a CLI that is installed.
- */
-/**
  * The workspace in every spelling a tool path may arrive in: the LEXICAL root
  * (what `CELLAR_WORKSPACE` holds, `resolve()`d) and, when it differs, its
  * CANONICAL one.
@@ -320,6 +300,26 @@ function chatWorkspaceSpellings(): readonly string[] {
 	}
 }
 
+/**
+ * The directory a reads-on chat run is confined to: the WORKSPACE, or null when
+ * it cannot be established.
+ *
+ * The workspace and NOT the notebook's code root, deliberately - a code root may
+ * be an external git worktree, and Cellar's standing rule is that such a root
+ * grants a kernel cwd and not one byte of file reach, every file surface staying
+ * workspace-scoped. Reads follow that rule rather than inventing a second answer
+ * to "which directory may this notebook see".
+ *
+ * A root that is not an existing directory yields null (= reads off) rather than
+ * being passed on: the engine spawns the child WITH this as its cwd, so a
+ * missing one would surface as a spawn ENOENT, and a read-less run is the
+ * safe degradation - the frozen prompt is chosen from the same policy, so such a
+ * run is also TOLD it cannot read rather than being left to discover it.
+ *
+ * It cannot close the race, only narrow it - the directory can still go away
+ * between this check and the spawn - so `spawnFailure` re-asks there and names
+ * the workspace instead of blaming a CLI that is installed.
+ */
 function chatReadableWorkspace(): string | null {
 	try {
 		const root = resolve(workspaceRoot());
