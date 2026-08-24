@@ -785,7 +785,13 @@ async function cleanupCommand(flags) {
 	// 4) Consent. A plan that reaches another workspace's live session needs the
 	//    phrase; anything else takes the ordinary y/N.
 	if (plan.crossWorkspace) {
-		const supplied = confirmFlag ?? (process.stdin.isTTY ? await promptPhrase(`[cellar] This stops LIVE cellar sessions in other workspaces (running kernels and unsaved state will be lost).\n[cellar] Type "${CONFIRM_PHRASE}" to proceed: `) : null);
+		const ask =
+			`[cellar] This stops LIVE cellar sessions in other workspaces ` +
+			`(running kernels and unsaved state will be lost).\n` +
+			`[cellar] Type "${CONFIRM_PHRASE}" to proceed: `;
+		// A non-TTY gets no prompt and no benefit of the doubt: it must have said so
+		// on the command line. `-y` is deliberately not consulted here.
+		const supplied = confirmFlag ?? (process.stdin.isTTY ? await promptPhrase(ask) : null);
 		if (supplied !== CONFIRM_PHRASE) {
 			console.error(
 				supplied == null
