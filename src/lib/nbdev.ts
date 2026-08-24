@@ -73,9 +73,10 @@ const AT_RISK =
 	"strips every notebook and cell metadata key it does not recognise, so Cellar's export target, report view, header numbering and per-cell export marks are silently erased";
 
 /** Which tools run that cleanup, stated as what the user installed rather than as internals. */
-const WHO_CLEANS = "nbdev's cleanup (`nbdev-clean`, and the Jupyter save hook `nbdev-install-hooks` installs)";
+const WHO_CLEANS =
+	"nbdev's cleanup (nbdev-clean, and the Jupyter save hook nbdev-install-hooks installs)";
 
-const BY_HAND = `add these lines to \`[${NBDEV_TABLE.join('.')}]\` by hand`;
+const BY_HAND = `add these lines to [${NBDEV_TABLE.join('.')}] by hand`;
 
 /**
  * The notice for a state, or `null` when there is nothing worth saying.
@@ -99,7 +100,7 @@ export function nbdevNotice(state: NbdevState): NbdevNotice | null {
 		case 'other-form':
 			return {
 				title: "nbdev will erase Cellar's notebook settings",
-				body: `This is an nbdev project. ${WHO_CLEANS} ${AT_RISK}. Its \`${NBDEV_TABLE.join('.')}\` is not a plain table (line ${state.line}), so Cellar will not edit it rather than risk the rest of the file.`,
+				body: `This is an nbdev project. ${WHO_CLEANS} ${AT_RISK}. Its ${NBDEV_TABLE.join('.')} is not a plain table (line ${state.line}), so Cellar will not edit it rather than risk the rest of the file.`,
 				path: state.path,
 				canWrite: false,
 				hint: BY_HAND
@@ -107,10 +108,10 @@ export function nbdevNotice(state: NbdevState): NbdevNotice | null {
 		case 'unwritable-value':
 			return {
 				title: "nbdev will erase Cellar's notebook settings",
-				body: `This is an nbdev project. ${WHO_CLEANS} ${AT_RISK}. \`${state.key}\` (line ${state.line}) is not a plain list of strings, so Cellar will not rewrite it.`,
+				body: `This is an nbdev project. ${WHO_CLEANS} ${AT_RISK}. ${state.key} (line ${state.line}) is not a plain list of strings, so Cellar will not rewrite it.`,
 				path: state.path,
 				canWrite: false,
-				hint: `set \`${state.key}\` to a list that includes "${CELLAR_METADATA_KEY}"`
+				hint: `set ${state.key} to a list that includes "${CELLAR_METADATA_KEY}"`
 			};
 		case 'unreadable':
 			return {
@@ -123,10 +124,11 @@ export function nbdevNotice(state: NbdevState): NbdevNotice | null {
 		case 'legacy-settings-ini':
 			return {
 				title: 'nbdev will refuse to run here',
-				body: 'nbdev 3.0.0 moved its config into `pyproject.toml` and now raises on a leftover `settings.ini` rather than warning. Until it is migrated, nbdev cannot run - and Cellar cannot protect its notebook settings from nbdev’s cleanup either.',
+				body:
+					'nbdev 3.0.0 moved its config into pyproject.toml and now raises on a leftover settings.ini rather than warning. Until it is migrated nbdev cannot run, and Cellar cannot protect its notebook settings from nbdev\'s cleanup either.',
 				path: state.path,
 				canWrite: false,
-				hint: 'migrate it with `nbdev-migrate-config`'
+				hint: 'migrate it with nbdev-migrate-config'
 			};
 	}
 }

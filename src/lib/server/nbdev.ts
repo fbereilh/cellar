@@ -211,15 +211,19 @@ export function detectNbdev(workspace: string = safeWorkspace()): NbdevState {
 	for (const dir of dirs) {
 		const path = join(dir, 'pyproject.toml');
 		if (!isFile(path)) continue;
-		let verdict: NbdevState | Located | 'skip';
+		// Wrapped WHOLE, `stateOf` included: this runs during SSR of every page load,
+		// so an unexpected throw would 500 the app for a feature almost no workspace
+		// uses. A file that cannot be classified is skipped, exactly as nbdev's own
+		// `_has_nbdev` skips one it cannot read.
+		let verdict: NbdevState | 'skip';
 		try {
-			verdict = classifyPyproject(path);
+			const found = classifyPyproject(path);
+			verdict = found === 'skip' ? 'skip' : 'kind' in found ? found : stateOf(found);
 		} catch {
 			verdict = 'skip';
 		}
 		if (verdict === 'skip') continue;
-		if ('kind' in verdict) return verdict;
-		return stateOf(verdict);
+		return verdict;
 	}
 	// Only now, exactly as nbdev orders it: a `settings.ini` matters solely when no
 	// `[tool.nbdev]` pyproject was found, because that is when nbdev raises.
