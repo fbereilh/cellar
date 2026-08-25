@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { processStartTime, registerInstance, readInstance } from '../../src/lib/server/instances';
+import { processStartTime, registerInstance, readInstance, unregisterInstance } from '../../src/lib/server/instances';
 import { pidAlive } from '../../src/lib/server/runtime';
 import { CONFIRM_PHRASE } from '../../src/lib/server/cleanup-plan';
 
@@ -273,6 +273,32 @@ describe('cellar cleanup — scope + consent', () => {
 		expect(pidAlive(theirs!)).toBe(true);
 	});
 
+	it('REGRESSION: refuses a repeated --workspace instead of silently taking the first', async () => {
+		// First-wins silently discards a directory the user typed, so a corrected
+		// typo left on the line — or a wrapper appending `-w` to args that already
+		// carry one — stopped wsMine's live session while wsTheirs, the one actually
+		// meant, was reported as merely "left running elsewhere".
+		const r = cleanup(['-w', wsMine, '-w', wsTheirs, '--all', '-y']);
+		await sleep(200);
+		expect(r.status).toBe(1);
+		expect(r.stderr).toContain(wsMine); // names BOTH, so the conflict is visible
+		expect(r.stderr).toContain(wsTheirs);
+		// The assertion that fails today: `--all` resolved to wsMine and stopped it.
+		expect(pidAlive(mine!)).toBe(true);
+		expect(pidAlive(theirs!)).toBe(true);
+	});
+
+	it('accepts a repeated BOOLEAN flag — the refusal is scoped, not blanket', async () => {
+		// `--all --all` discards no value the user typed, so changing nothing is the
+		// honest outcome; over-refusing is its own annoyance. It must behave exactly
+		// like a single `--all`.
+		const r = cleanup(['--all', '--all', '-y', '--workspace', wsMine]);
+		await sleep(200);
+		expect(r.status).toBe(0);
+		expect(pidAlive(mine!)).toBe(false); // this workspace: asked for, stopped
+		expect(pidAlive(theirs!)).toBe(true); // the other: never mine to stop
+	});
+
 	it('a refused invocation prunes nothing and signals nothing', async () => {
 		// The refusal must land before pruneDeadInstances and before any reap, so a
 		// mistyped command leaves the registry and every process exactly as it was.
@@ -284,6 +310,16 @@ describe('cellar cleanup — scope + consent', () => {
 			workspace: wsTheirs,
 			startedAt: Date.now()
 		});
+		// A FULLY dead entry — no live launcher, no live app, no port to answer — is
+		// the only shape `pruneDeadInstances` really unregisters, so it is what makes
+		// the "prunes nothing" half of this test mean anything. (The orphan above has
+		// a live appPid, so the prune would skip it either way.)
+		registerInstance({
+			launcherPid: 2147480004,
+			appPid: 2147480005,
+			workspace: wsTheirs,
+			startedAt: Date.now()
+		});
 		try {
 			const r = cleanup([wsTheirs, '-y']);
 			await sleep(300);
@@ -291,8 +327,10 @@ describe('cellar cleanup — scope + consent', () => {
 			// Even the always-safe orphan tidy is withheld: nothing ran at all.
 			expect(pidAlive(orphanPid)).toBe(true);
 			expect(readInstance(2147480003)).not.toBeNull();
+			expect(readInstance(2147480004)).not.toBeNull();
 		} finally {
 			killVictim(orphanPid);
+			unregisterInstance(2147480004);
 		}
 	});
 

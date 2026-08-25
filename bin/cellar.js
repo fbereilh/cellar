@@ -722,6 +722,126 @@ function callerDir() {
 }
 
 /**
+ * Parse `cellar cleanup`'s arguments in ONE pass into a typed result, refusing
+ * anything unexpected.
+ *
+ * REFUSE-DON'T-GUESS is the whole rule here, and it is not fussiness: this
+ * command stops processes, so every way an argument can be silently
+ * reinterpreted is a way to stop the WRONG workspace — its live launcher, its
+ * kernel, its unsaved state — while the user believes they named another one,
+ * and under `-y` it proceeds without ever saying so. That is the exact failure
+ * this whole change exists to end, so it is refused wherever it can appear:
+ *
+ *   - a POSITIONAL is refused, never accepted as a workspace and never ignored.
+ *     `cellar cleanup <path> --all` used to drop the path and reap the caller's
+ *     cwd. Accepting a path is a deliberate design decision with its own scoping
+ *     and confirmation questions, and inferring it from a bug report is how a
+ *     second version of this incident gets built; `-w <dir>` / `--workspace
+ *     <dir>` is the supported way to name another workspace.
+ *   - a MISSING or FLAG-SHAPED `-w` value is refused. It used to be swallowed as
+ *     a path while the flag it ate still selected a scope.
+ *   - a REPEATED `-w` is refused rather than first-wins. A corrected typo left on
+ *     the line, or a wrapper appending `-w` to args that already carry one, would
+ *     otherwise stop the first directory while the one the user actually meant is
+ *     reported as merely "left running elsewhere".
+ *
+ * Parsing and reading the values are ONE pass on purpose: they used to be a
+ * validation loop followed by a `findIndex`, and the gap between them — the two
+ * disagreeing about which token is a value — was itself the `-w` bug.
+ *
+ * A repeated BOOLEAN flag (`--all --all`, `-y -y`) is deliberately fine: it
+ * discards no value the user typed, so changing nothing is the honest outcome.
+ * The class refused here is "a value you typed was silently dropped", not
+ * "an argument appears twice".
+ *
+ * @param {string[]} flags
+ * @returns {{ok:true, all:boolean, allWorkspaces:boolean, dryRun:boolean, yes:boolean,
+ *            workspace:string|undefined, confirm:string|undefined}
+ *          | {ok:false, errors:string[]}}
+ */
+function parseCleanupArgs(flags) {
+	// Declared HERE, not at module scope: `cellar cleanup` is dispatched near the
+	// top of this file, long before a module-level `const` further down would have
+	// initialised, so one there is in the temporal dead zone for this very command.
+	//
+	// Every argument the command accepts, as DATA rather than as a chain of special
+	// cases. Three near-identical holes were found in that chain one at a time (an
+	// ignored positional, `-w` swallowing the flag after it, a repeated `-w`
+	// discarding a directory the user typed), so the policy is now structural:
+	// anything not described here is refused.
+	const BOOLEAN_FLAGS = new Map([
+		['--all', 'all'],
+		['--all-workspaces', 'allWorkspaces'],
+		['--dry-run', 'dryRun'],
+		['--yes', 'yes'],
+		['-y', 'yes']
+	]);
+	const WORKSPACE_FLAGS = new Set(['--workspace', '-w']);
+	const CONFIRM_PREFIX = '--confirm=';
+	const HELP_HINT = '[cellar] run "cellar --help" for the cleanup options.';
+
+	/** @returns {{ok:false, errors:string[]}} */
+	const refuse = (/** @type {string[]} */ ...lines) => ({ ok: /** @type {const} */ (false), errors: [...lines, HELP_HINT] });
+
+	const out = {
+		ok: /** @type {const} */ (true),
+		all: false,
+		allWorkspaces: false,
+		dryRun: false,
+		yes: false,
+		/** @type {string|undefined} */ workspace: undefined,
+		/** @type {string|undefined} */ confirm: undefined
+	};
+
+	for (let i = 0; i < flags.length; i++) {
+		const tok = flags[i];
+
+		const boolKey = BOOLEAN_FLAGS.get(tok);
+		if (boolKey) {
+			out[/** @type {'all'|'allWorkspaces'|'dryRun'|'yes'} */ (boolKey)] = true;
+			continue;
+		}
+
+		if (WORKSPACE_FLAGS.has(tok)) {
+			const val = flags[++i];
+			if (val === undefined) return refuse(`[cellar] ${tok} needs a directory, but none was given.`);
+			if (val.startsWith('-')) return refuse(`[cellar] ${tok} needs a directory, but got the flag: ${val}`);
+			if (out.workspace !== undefined)
+				return refuse(
+					`[cellar] ${tok} was given more than once: ${out.workspace} and ${val}`,
+					'[cellar] cleanup stops processes, so it will not guess which one you meant — pass it exactly once.'
+				);
+			out.workspace = val;
+			continue;
+		}
+
+		if (tok.startsWith(CONFIRM_PREFIX)) {
+			const val = tok.slice(CONFIRM_PREFIX.length);
+			// Deliberately does NOT echo the values: one of them may be the
+			// confirmation phrase, which this command prints only where the wider
+			// scope has already been chosen. Naming the flag is enough to act on.
+			if (out.confirm !== undefined && out.confirm !== val)
+				return refuse(
+					'[cellar] --confirm was given more than once, with different values.',
+					'[cellar] pass it exactly once, so there is no doubt which confirmation you meant.'
+				);
+			out.confirm = val;
+			continue;
+		}
+
+		if (!tok.startsWith('-'))
+			return refuse(
+				`[cellar] unexpected argument for cleanup: ${tok}`,
+				'[cellar] cleanup takes no positional path — use "-w <dir>" / "--workspace <dir>" to point it at another workspace.'
+			);
+
+		return refuse(`[cellar] unknown flag for cleanup: ${tok}`);
+	}
+
+	return out;
+}
+
+/**
  * `cellar cleanup` — reap dead / orphaned instances, and (only when asked)
  * stop live ones.
  *
@@ -738,71 +858,19 @@ function callerDir() {
  *     and a non-TTY stdin was enough with no flag at all.
  */
 async function cleanupCommand(flags) {
-	const KNOWN = new Set(['--all', '--all-workspaces', '--dry-run', '--yes', '-y', '--workspace', '-w']);
-	const helpHint = '[cellar] run "cellar --help" for the cleanup options.';
-	// ONE pass that both validates and reads `--workspace`'s value, so the two can
-	// never disagree about which token is a value. They used to be separate passes
-	// (a validation loop, then a `findIndex`), and that gap was itself the bug:
-	// `cellar cleanup -w --all-workspaces` swallowed the flag as a path while
-	// `flags.includes(…)` still selected the everywhere scope.
-	//
-	// Reject typos rather than silently falling through to a different scope: this
-	// command stops processes, so an argument it does not understand must stop it —
-	// and that rule covers a POSITIONAL too, which is why one is REFUSED rather
-	// than accepted as a workspace or quietly ignored. `cellar cleanup <path> --all`
-	// dropping the path and acting on the caller's cwd is this whole change's own
-	// failure mode wearing different clothes: the user believes they are operating
-	// on one workspace while the tool operates on another, and under `-y` it
-	// proceeds without ever saying so. Accepting a path is a deliberate design
-	// decision with its own scoping and confirmation questions, and inferring it
-	// from a bug report is how a second version of this incident gets built.
-	// `-w <dir>` / `--workspace <dir>` is the supported way to name another
-	// workspace.
-	let wsArg;
-	for (let i = 0; i < flags.length; i++) {
-		const tok = flags[i];
-		if (tok === '--workspace' || tok === '-w') {
-			const val = flags[i + 1];
-			// A missing or flag-shaped value is the same silently-wrong-target class:
-			// it would be resolved as a path while the flag it ate still selects a
-			// scope.
-			if (val === undefined) {
-				console.error(`[cellar] ${tok} needs a directory, but none was given.`);
-				console.error(helpHint);
-				return 1;
-			}
-			if (val.startsWith('-')) {
-				console.error(`[cellar] ${tok} needs a directory, but got the flag: ${val}`);
-				console.error(helpHint);
-				return 1;
-			}
-			if (wsArg === undefined) wsArg = val;
-			i++;
-			continue;
-		}
-		if (tok.startsWith('--confirm=')) continue;
-		if (!tok.startsWith('-')) {
-			console.error(`[cellar] unexpected argument for cleanup: ${tok}`);
-			console.error(
-				'[cellar] cleanup takes no positional path — use "-w <dir>" / "--workspace <dir>" to point it at another workspace.'
-			);
-			console.error(helpHint);
-			return 1;
-		}
-		if (!KNOWN.has(tok)) {
-			console.error(`[cellar] unknown flag for cleanup: ${tok}`);
-			console.error(helpHint);
-			return 1;
-		}
+	// Refuse before anything is gathered, pruned or signalled, so a mistyped
+	// command leaves the registry and every process exactly as it was.
+	const args = parseCleanupArgs(flags);
+	if (!args.ok) {
+		for (const line of args.errors) console.error(line);
+		return 1;
 	}
 
-	const here = workspaceKey(wsArg || callerDir());
-
-	const everywhere = flags.includes('--all-workspaces');
-	const scope = everywhere ? 'everywhere' : flags.includes('--all') ? 'workspace' : 'orphans';
-	const dryRun = flags.includes('--dry-run');
-	const yes = flags.includes('--yes') || flags.includes('-y') || !!process.env.CI || !process.stdin.isTTY;
-	const confirmFlag = flags.find((a) => a.startsWith('--confirm='))?.slice('--confirm='.length);
+	const here = workspaceKey(args.workspace || callerDir());
+	const scope = args.allWorkspaces ? 'everywhere' : args.all ? 'workspace' : 'orphans';
+	const dryRun = args.dryRun;
+	const yes = args.yes || !!process.env.CI || !process.stdin.isTTY;
+	const confirmFlag = args.confirm;
 	const log = (m) => console.log(m);
 
 	// 1) Prune fully-dead registry entries (no live process at all). Bookkeeping
