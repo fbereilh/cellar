@@ -238,6 +238,64 @@ describe('cellar cleanup — scope + consent', () => {
 		expect(pidAlive(mine!)).toBe(true);
 	});
 
+	it('REGRESSION: refuses a positional path instead of acting on the caller\u2019s cwd', async () => {
+		// `cellar cleanup <path> --all` used to DROP the path and reap the caller's
+		// own workspace — the user asks to tidy one folder and the tool stops the
+		// live session in another, which is this whole change's failure mode wearing
+		// different clothes. Refused, not "made to work": accepting a path is its own
+		// design decision, and `-w <dir>` already names another workspace.
+		const r = cleanup([wsTheirs, '--all', '-y']);
+		await sleep(200);
+		expect(r.status).toBe(1);
+		expect(r.stderr).toContain(wsTheirs); // names the offending argument verbatim
+		expect(r.stderr).toMatch(/--workspace|-w /); // …and the supported alternative
+		// The assertion that fails today: `--all` used to resolve to the caller's cwd
+		// and stop ITS live instance while the named workspace went untouched.
+		expect(pidAlive(mine!)).toBe(true);
+		expect(pidAlive(theirs!)).toBe(true);
+	});
+
+	it('REGRESSION: refuses --workspace when the next token is a flag, not a directory', async () => {
+		// `-w` used to swallow the following token unconditionally, so this both
+		// consumed `--all-workspaces` as a path AND selected the everywhere scope.
+		const r = cleanup(['-w', '--all-workspaces']);
+		await sleep(200);
+		expect(r.status).toBe(1);
+		expect(r.stderr).toContain('--all-workspaces'); // names what it ate
+		// The assertions that fail today: the flag used to be RESOLVED as a directory
+		// (`<cwd>/--all-workspaces`), against which every live instance read as
+		// somebody else's, so the command went on to gather facts and print a whole
+		// cross-workspace plan before the phrase gate happened to stop it. It must
+		// refuse up front instead, so the flag never becomes a path at all.
+		expect(r.stdout).not.toMatch(/workspace:/);
+		expect(r.stdout).not.toMatch(/will stop/i);
+		expect(pidAlive(mine!)).toBe(true);
+		expect(pidAlive(theirs!)).toBe(true);
+	});
+
+	it('a refused invocation prunes nothing and signals nothing', async () => {
+		// The refusal must land before pruneDeadInstances and before any reap, so a
+		// mistyped command leaves the registry and every process exactly as it was.
+		const orphanPid = await spawnVictim();
+		registerInstance({
+			launcherPid: 2147480003, // launcher "gone" → its app is a reapable orphan
+			appPid: orphanPid,
+			appStart: processStartTime(orphanPid)!,
+			workspace: wsTheirs,
+			startedAt: Date.now()
+		});
+		try {
+			const r = cleanup([wsTheirs, '-y']);
+			await sleep(300);
+			expect(r.status).toBe(1);
+			// Even the always-safe orphan tidy is withheld: nothing ran at all.
+			expect(pidAlive(orphanPid)).toBe(true);
+			expect(readInstance(2147480003)).not.toBeNull();
+		} finally {
+			killVictim(orphanPid);
+		}
+	});
+
 	it('still reaps an orphan in ANOTHER workspace with no flags at all', async () => {
 		// The tidy case must stay a one-word command, or the safe default is one
 		// nobody uses. An orphan — launcher gone, child still running — belongs to

@@ -739,24 +739,63 @@ function callerDir() {
  */
 async function cleanupCommand(flags) {
 	const KNOWN = new Set(['--all', '--all-workspaces', '--dry-run', '--yes', '-y', '--workspace', '-w']);
+	const helpHint = '[cellar] run "cellar --help" for the cleanup options.';
+	// ONE pass that both validates and reads `--workspace`'s value, so the two can
+	// never disagree about which token is a value. They used to be separate passes
+	// (a validation loop, then a `findIndex`), and that gap was itself the bug:
+	// `cellar cleanup -w --all-workspaces` swallowed the flag as a path while
+	// `flags.includes(…)` still selected the everywhere scope.
+	//
 	// Reject typos rather than silently falling through to a different scope: this
-	// command stops processes, so an argument it does not understand must stop it.
+	// command stops processes, so an argument it does not understand must stop it —
+	// and that rule covers a POSITIONAL too, which is why one is REFUSED rather
+	// than accepted as a workspace or quietly ignored. `cellar cleanup <path> --all`
+	// dropping the path and acting on the caller's cwd is this whole change's own
+	// failure mode wearing different clothes: the user believes they are operating
+	// on one workspace while the tool operates on another, and under `-y` it
+	// proceeds without ever saying so. Accepting a path is a deliberate design
+	// decision with its own scoping and confirmation questions, and inferring it
+	// from a bug report is how a second version of this incident gets built.
+	// `-w <dir>` / `--workspace <dir>` is the supported way to name another
+	// workspace.
+	let wsArg;
 	for (let i = 0; i < flags.length; i++) {
 		const tok = flags[i];
 		if (tok === '--workspace' || tok === '-w') {
+			const val = flags[i + 1];
+			// A missing or flag-shaped value is the same silently-wrong-target class:
+			// it would be resolved as a path while the flag it ate still selects a
+			// scope.
+			if (val === undefined) {
+				console.error(`[cellar] ${tok} needs a directory, but none was given.`);
+				console.error(helpHint);
+				return 1;
+			}
+			if (val.startsWith('-')) {
+				console.error(`[cellar] ${tok} needs a directory, but got the flag: ${val}`);
+				console.error(helpHint);
+				return 1;
+			}
+			if (wsArg === undefined) wsArg = val;
 			i++;
 			continue;
 		}
 		if (tok.startsWith('--confirm=')) continue;
-		if (tok.startsWith('-') && !KNOWN.has(tok)) {
+		if (!tok.startsWith('-')) {
+			console.error(`[cellar] unexpected argument for cleanup: ${tok}`);
+			console.error(
+				'[cellar] cleanup takes no positional path — use "-w <dir>" / "--workspace <dir>" to point it at another workspace.'
+			);
+			console.error(helpHint);
+			return 1;
+		}
+		if (!KNOWN.has(tok)) {
 			console.error(`[cellar] unknown flag for cleanup: ${tok}`);
-			console.error('[cellar] run "cellar --help" for the cleanup options.');
+			console.error(helpHint);
 			return 1;
 		}
 	}
 
-	const wsIdx = flags.findIndex((a) => a === '--workspace' || a === '-w');
-	const wsArg = wsIdx !== -1 ? flags[wsIdx + 1] : undefined;
 	const here = workspaceKey(wsArg || callerDir());
 
 	const everywhere = flags.includes('--all-workspaces');
