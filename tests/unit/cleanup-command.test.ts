@@ -288,6 +288,35 @@ describe('cellar cleanup — scope + consent', () => {
 		expect(pidAlive(theirs!)).toBe(true);
 	});
 
+	it('REGRESSION: refuses an EMPTY --workspace value instead of falling back to the cwd', async () => {
+		// `cellar cleanup -w "$WS" --all -y` with `$WS` unset reaches the CLI as an
+		// empty string. It used to pass every guard and then be discarded by a `||`,
+		// so `--all` resolved to whatever folder the script was sitting in and
+		// stopped THAT one's live session while the named workspace went untouched.
+		const r = cleanup(['-w', '', '--all', '-y']);
+		await sleep(200);
+		expect(r.status).toBe(1);
+		expect(r.stderr).toContain('-w'); // names the flag
+		expect(r.stderr).toMatch(/empty/i); // …and what was wrong with its value
+		// The assertion that fails today: the caller's own cwd (wsMine) was stopped.
+		expect(pidAlive(mine!)).toBe(true);
+		expect(pidAlive(theirs!)).toBe(true);
+	});
+
+	it('refuses a space-separated --confirm by naming the attached form, not as unknown', async () => {
+		// `--help` documents `--confirm`, and the sibling `--workspace <dir>` on this
+		// same command IS space-separated, so the spelling is a natural mistake — on
+		// the one path reached only after deliberately choosing the wider scope.
+		// Refusing it as an "unknown flag" denied a flag that exists.
+		const r = cleanup(['--all-workspaces', '--confirm', CONFIRM_PHRASE]);
+		await sleep(200);
+		expect(r.status).toBe(1);
+		expect(r.stderr).toContain('--confirm=<phrase>');
+		expect(r.stderr).not.toMatch(/unknown flag/i);
+		expect(pidAlive(mine!)).toBe(true);
+		expect(pidAlive(theirs!)).toBe(true);
+	});
+
 	it('accepts a repeated BOOLEAN flag — the refusal is scoped, not blanket', async () => {
 		// `--all --all` discards no value the user typed, so changing nothing is the
 		// honest outcome; over-refusing is its own annoyance. It must behave exactly

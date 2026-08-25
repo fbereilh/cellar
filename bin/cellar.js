@@ -806,6 +806,10 @@ function parseCleanupArgs(flags) {
 			const val = flags[++i];
 			if (val === undefined) return refuse(`[cellar] ${tok} needs a directory, but none was given.`);
 			if (val.startsWith('-')) return refuse(`[cellar] ${tok} needs a directory, but got the flag: ${val}`);
+			// An EMPTY value is the same class: `cellar cleanup -w "$WS" --all -y`
+			// with `$WS` unset would otherwise fall back to whatever folder the
+			// script happened to be sitting in and stop THAT one's live session.
+			if (val === '') return refuse(`[cellar] ${tok} needs a directory, but got an empty value.`);
 			if (out.workspace !== undefined)
 				return refuse(
 					`[cellar] ${tok} was given more than once: ${out.workspace} and ${val}`,
@@ -828,6 +832,15 @@ function parseCleanupArgs(flags) {
 			out.confirm = val;
 			continue;
 		}
+
+		// Attached-only, and the space-separated spelling is REFUSED rather than
+		// accepted: consuming the next token as a value would reopen the missing /
+		// flag-shaped / repeated questions this parser just closed. It earns its own
+		// message because `--help` documents the flag, so falling through to
+		// "unknown flag" would deny a flag that exists — on the one path a caller
+		// reaches only after deliberately choosing the wider scope.
+		if (tok === '--confirm')
+			return refuse(`[cellar] --confirm needs its value attached: ${CONFIRM_PREFIX}<phrase>`);
 
 		if (!tok.startsWith('-'))
 			return refuse(
@@ -866,7 +879,10 @@ async function cleanupCommand(flags) {
 		return 1;
 	}
 
-	const here = workspaceKey(args.workspace || callerDir());
+	// `??`, not `||`: the parser refuses an empty `-w` value, so a workspace that is
+	// PRESENT is always a usable directory string and `undefined` means exactly "no
+	// -w was given". A `||` here would silently paper over an empty one instead.
+	const here = workspaceKey(args.workspace ?? callerDir());
 	const scope = args.allWorkspaces ? 'everywhere' : args.all ? 'workspace' : 'orphans';
 	const dryRun = args.dryRun;
 	const yes = args.yes || !!process.env.CI || !process.stdin.isTTY;

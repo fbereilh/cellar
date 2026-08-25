@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, symlinkSync, realpathSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, mkdirSync, symlinkSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { planCleanup, workspaceKey, CONFIRM_PHRASE } from '../../src/lib/server/cleanup-plan';
 
 /**
@@ -193,6 +195,44 @@ describe('planCleanup — untracked processes', () => {
 		const plan = planCleanup({ untracked: [liveProc], workspace: here, scope: 'everywhere' });
 		expect(plan.killPids).toEqual([liveProc.pid]);
 		expect(plan.crossWorkspace).toBe(true);
+	});
+});
+
+describe('workspaceKey never throws', () => {
+	it('survives a DELETED working directory for a relative path', () => {
+		// The whole point of this module is surviving a workspace that has gone away,
+		// and `resolve` consults process.cwd() for a RELATIVE path, so a fallback
+		// that re-ran it threw straight back out — reintroducing, through the `-w`
+		// door, the very crash `cellar cleanup` was fixed for.
+		//
+		// Driven in a CHILD process: this one must not delete its own cwd, and there
+		// is no other way to observe a removed working directory.
+		const repo = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+		const mod = pathToFileURL(join(repo, 'src/lib/server/cleanup-plan.js')).href;
+		// The runner is a FILE, and it lives OUTSIDE the directory being deleted:
+		// `node --input-type=module -e` derives the eval's base URL from the cwd and
+		// so dies on its own before any of our code runs, which would make this test
+		// pass for the wrong reason. An absolute entry path needs no cwd.
+		const gone = mkdtempSync(join(tmpdir(), 'cellar-gone-cwd-'));
+		const runnerDir = mkdtempSync(join(tmpdir(), 'cellar-gone-runner-'));
+		const runner = join(runnerDir, 'probe.mjs');
+		writeFileSync(
+			runner,
+			`import { workspaceKey } from ${JSON.stringify(mod)};\nconsole.log(JSON.stringify(workspaceKey('../sibling')));\n`
+		);
+		try {
+			const r = spawnSync(
+				'/bin/sh',
+				['-c', 'cd "$1" && rmdir "$1" && exec "$2" "$3"', 'sh', gone, process.execPath, runner],
+				{ encoding: 'utf8' }
+			);
+			expect(r.stderr).not.toMatch(/uv_cwd|ENOENT/);
+			expect(r.status).toBe(0);
+			expect(JSON.parse(r.stdout.trim())).toBe('../sibling');
+		} finally {
+			rmSync(gone, { recursive: true, force: true });
+			rmSync(runnerDir, { recursive: true, force: true });
+		}
 	});
 });
 

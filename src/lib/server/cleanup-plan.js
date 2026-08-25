@@ -93,11 +93,20 @@ export const CONFIRM_PHRASE = 'stop-all-workspaces';
  */
 export function workspaceKey(p) {
 	if (!p || typeof p !== 'string') return '';
-	let out;
+	// Upgraded in place rather than recomputed in a fallback, so no failing call is
+	// ever repeated: `resolve` consults `process.cwd()` for a RELATIVE path and
+	// THROWS once the working directory has been removed — the very case this
+	// module exists to survive — so a catch that re-ran it threw straight back out
+	// and falsified the never-throws contract above. `out` keeps the furthest it
+	// got: the realpath, else the resolved path, else the raw string. The last of
+	// those can only under-reach (two spellings of one directory read as two),
+	// which is the safe direction documented above.
+	let out = p;
 	try {
-		out = realpathSync(resolve(p));
-	} catch {
 		out = resolve(p);
+		out = realpathSync(out);
+	} catch {
+		// keep whatever `out` has already reached
 	}
 	// Keep a bare root ('/'), strip a trailing separator anywhere else.
 	while (out.length > 1 && out.endsWith(sep)) out = out.slice(0, -1);
