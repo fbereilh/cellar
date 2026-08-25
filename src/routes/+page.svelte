@@ -741,21 +741,50 @@
 			openFilePermanent(path);
 			return;
 		}
+		const refuse = (why: string) =>
+			showNotice(
+				`Cannot open ${path}: ${why}. Its kernel is still running - shut it down from the Kernels list if the notebook is gone.`
+			);
+		const unreachable = (err: unknown) =>
+			// No verdict at all - claim nothing about the notebook, only that we could
+			// not ask. (The `unreachable` stance the file-tab and Databricks paths take.)
+			showNotice(`Could not reach Cellar to open ${path}: ${(err as Error)?.message ?? err}`);
+
+		// THE CANONICAL NOTEBOOK IS THE ONE PATH WHERE "loadable" IS TOO BROAD.
+		// `loadDoc` MATERIALISES a starter document for it when the file is missing
+		// (that is what lets an empty workspace render a shell at all), so the load
+		// below answers 200 for a canonical notebook that has been renamed away -
+		// and would mint a tab holding one empty cell under the old name, whose
+		// first run writes `notebook.ipynb` back to disk under the very name the
+		// user renamed. So this path additionally requires the FILE, asked before
+		// the load so the click cannot even leave a starter document behind.
+		// The narrowing is real and only here: a canonical notebook whose file was
+		// deleted OUTSIDE Cellar is refused too, where a non-canonical one still
+		// opens from its live in-memory document.
+		if (path === canonicalNotebookRel) {
+			let st: Response;
+			try {
+				st = await fetch(`/api/fs/file/stat?path=${encodeURIComponent(path)}`);
+			} catch (err) {
+				unreachable(err);
+				return;
+			}
+			if (!st.ok) {
+				refuse('notebook not found');
+				return;
+			}
+		}
+
 		let res: Response;
 		try {
 			res = await fetch(`/api/notebooks?path=${encodeURIComponent(path)}`);
 		} catch (err) {
-			// No verdict at all - claim nothing about the notebook, only that we could
-			// not ask. (The `unreachable` stance the file-tab and Databricks paths take.)
-			showNotice(`Could not reach Cellar to open ${path}: ${(err as Error)?.message ?? err}`);
+			unreachable(err);
 			return;
 		}
 		if (!res.ok) {
 			const body = await res.json().catch(() => null);
-			const why = typeof body?.message === 'string' ? body.message : `HTTP ${res.status}`;
-			showNotice(
-				`Cannot open ${path}: ${why}. Its kernel is still running - shut it down from the Kernels list if the notebook is gone.`
-			);
+			refuse(typeof body?.message === 'string' ? body.message : `HTTP ${res.status}`);
 			return;
 		}
 		// The check answered "this IS a live notebook", so seed the `.py` kind cache

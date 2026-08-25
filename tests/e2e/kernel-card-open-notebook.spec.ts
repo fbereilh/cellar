@@ -311,6 +311,62 @@ test('a card whose file moved out from under its kernel reports it and mints no 
 });
 
 /**
+ * The CANONICAL notebook's stale card is refused like any other - and the reason
+ * it needs its own test is that it is the one path where the pre-flight's chosen
+ * predicate is too generous.
+ *
+ * `loadDoc` MATERIALISES a starter document for the canonical path when the file
+ * is missing (that is what lets an empty workspace render a shell), so a plain
+ * "can the server load this?" answers YES for a canonical notebook that has been
+ * renamed away. What that produced was not merely a confusing tab: it held one
+ * empty cell under the old name, and running a cell in it wrote `notebook.ipynb`
+ * back to disk under exactly the name the user had renamed. So the file is
+ * asserted on the REAL FILESYSTEM here, not through the UI - the UI is what was
+ * lying.
+ */
+test('the canonical notebook, renamed out from under its kernel, is refused and re-creates no file', async ({
+	page
+}) => {
+	test.setTimeout(240_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.getByTestId('tree-file').filter({ hasText: 'notebook.ipynb' }).first().dblclick();
+	await bootKernel(page, 'notebook.ipynb', 'main-cell-00', 'main_var = 0');
+	await closeTab(page, 'notebook.ipynb');
+	await openKernels(page);
+	await expect(card(page, 'notebook.ipynb')).toBeVisible({ timeout: 30_000 });
+
+	// Same rename path as the non-canonical case above: it rekeys the live
+	// document and leaves the kernel registered under the OLD path.
+	await page.evaluate(async () => {
+		await fetch('/api/fs/op', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ op: 'rename', path: 'notebook.ipynb', name: 'main-moved.ipynb' })
+		});
+	});
+	await expect.poll(() => existsSync(join(workspace, 'notebook.ipynb')), { timeout: 15_000 }).toBe(false);
+	await openKernels(page);
+	const stale = card(page, 'notebook.ipynb').getByTestId('kernel-notebook');
+	await expect(stale).toBeVisible({ timeout: 30_000 });
+
+	const tabsBefore = (await tabTitles(page)).length;
+	// Counted as a DELTA, not against zero: this spec shares one workspace and one
+	// restored tab session, so an earlier test's renamed-away notebook can already
+	// be rendering one.
+	const errorsBefore = await page.getByTestId('notebook-load-error').count();
+	await stale.click();
+	// The harm first: a tab minted here would hold one empty starter cell under a
+	// name the user renamed away, and the first run in it writes the file back.
+	await page.waitForTimeout(1_000);
+	expect((await tabTitles(page)).length).toBe(tabsBefore);
+	expect(await page.getByTestId('notebook-load-error').count()).toBe(errorsBefore);
+	expect(existsSync(join(workspace, 'notebook.ipynb'))).toBe(false);
+	// …and it SAYS so rather than failing silently.
+	await expect(page.getByTestId('app-notice')).toBeVisible({ timeout: 15_000 });
+	await expect(page.getByTestId('app-notice')).toContainText('notebook.ipynb');
+});
+
+/**
  * AT REST the control cluster must not participate in hit-testing.
  *
  * It is `absolute ... opacity-0`, and `opacity: 0` hides a box without stopping
@@ -401,29 +457,6 @@ for (const theme of ['dim', 'cellar-light'] as const) {
 			await openKernels(page);
 		}
 
-		// While the cluster is still INVISIBLE it must not be hit-testable either -
-		// a mouse click hovers before it lands, so a `:hover`-flipped
-		// `pointer-events` would hand that click to an icon nobody can see yet.
-		// Both readings come from ONE synchronous evaluate, so they describe the
-		// same instant; on a machine slow enough for the reveal to have started the
-		// check is vacuous rather than flaky, which is why the settled states above
-		// carry the load.
-		const open = card(page, 'epsilon.ipynb');
-		const openChip = (await open.getByTestId('kernel-memory').boundingBox())!;
-		await page.mouse.move(openChip.x + openChip.width / 2, openChip.y + openChip.height / 2);
-		const midReveal = await open.evaluate((el) => {
-			const c = el.querySelector('[data-testid="kernel-controls"]')!;
-			const r = el.getBoundingClientRect();
-			const hit = document.elementFromPoint(r.right - 40, r.top + r.height / 2) as HTMLElement | null;
-			return {
-				opacity: getComputedStyle(c).opacity,
-				hit: hit?.closest<HTMLElement>('[data-testid]')?.dataset.testid ?? null
-			};
-		});
-		if (midReveal.opacity === '0') {
-			expect(midReveal.hit).not.toMatch(/^kernel-(interrupt|wipe-vars|restart|shutdown|controls)$/);
-		}
-
 		// The reveal is untouched: hovering makes every control hit-testable, and one
 		// of them really acts. (`group-hover` keys off the ROW, which a child
 		// declining pointer events cannot affect.)
@@ -447,6 +480,57 @@ for (const theme of ['dim', 'cellar-light'] as const) {
 		const session = await sessionIdFor(page, 'epsilon.ipynb');
 		await row.getByTestId('kernel-restart').click();
 		await expect.poll(() => sessionIdFor(page, 'epsilon.ipynb'), { timeout: 60_000 }).not.toBe(session);
+	});
+}
+
+/**
+ * A control is clickable THE INSTANT the pointer lands on the row.
+ *
+ * The regression this pins is the mirror of the at-rest one above. Putting
+ * `pointer-events` on the opacity transition made it flip at the transition's
+ * MIDPOINT, so the icons were drawn from 75ms and inert until 150ms; a click in
+ * that window fell through to the name button under them and OPENED THE NOTEBOOK
+ * instead of restarting the kernel. Nothing about the CSS is read here - the
+ * pointer is driven for real with no settle time, and what is asserted is which
+ * action happened: the kernel's session epoch moved, and no tab appeared.
+ */
+for (const theme of ['dim', 'cellar-light'] as const) {
+	test(`a control clicked the moment the row is hovered acts on the kernel (${theme})`, async ({
+		page
+	}) => {
+		test.setTimeout(240_000);
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await page.getByTestId('tree-file').filter({ hasText: 'epsilon.ipynb' }).first().dblclick();
+		await bootKernel(page, 'epsilon.ipynb', 'epsilon-cell-00', 'epsilon_var = 5');
+		await openKernels(page);
+		await page.evaluate((t) => {
+			document.documentElement.dataset.theme = t;
+		}, theme);
+
+		const row = card(page, 'epsilon.ipynb');
+		const restart = row.getByTestId('kernel-restart');
+		await expect(row.getByTestId('kernel-memory')).toBeVisible({ timeout: 30_000 });
+
+		// Measure the target while the row is at REST and the pointer is elsewhere,
+		// so the click below is one uninterrupted move-and-press - exactly what a
+		// user does, and what the dead window swallowed.
+		await page.mouse.move(0, 0);
+		await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+		await expect
+			.poll(() => row.getByTestId('kernel-controls').evaluate((el) => getComputedStyle(el).opacity))
+			.toBe('0');
+		const target = (await restart.boundingBox())!;
+
+		const session = await sessionIdFor(page, 'epsilon.ipynb');
+		const tabsBefore = (await tabTitles(page)).length;
+		await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2);
+		await page.mouse.down();
+		await page.mouse.up();
+
+		// The CONTROL acted…
+		await expect.poll(() => sessionIdFor(page, 'epsilon.ipynb'), { timeout: 60_000 }).not.toBe(session);
+		// …and the name button under it did not: no tab was opened by that click.
+		expect((await tabTitles(page)).length).toBe(tabsBefore);
 	});
 }
 

@@ -927,8 +927,11 @@
 			     one hands off to the other rather than overlapping (the VS Code
 			     explorer rule: a row's metadata yields to its actions on hover). The
 			     handoff is SEQUENCED so the two are never both visible: the chip
-			     fades out over 75ms with the controls delayed by exactly that, and on
-			     the way back the chip waits out the controls' own 150ms fade. Its
+			     goes at once on the way in, and on the way back waits out the
+			     controls' own 150ms fade. It is a HARD CUT rather than a fade
+			     precisely so the controls need no incoming delay to clear it - a
+			     delay there is what would leave them drawn-but-inert (or, worse,
+			     inert-but-clickable) for a window after the pointer lands. Its
 			     BOX never moves - only its opacity - so nothing reflows. Only while
 			     the controls are the tail state: the "not started" chip, the acting
 			     spinner and the wipe confirm are all in FLOW, so they push the chip
@@ -943,7 +946,7 @@
 			{#if cardMemory(card)}
 				<span
 					class="shrink-0 tabular-nums text-[11px] text-base-content/40 {hoverControls
-						? 'transition-opacity delay-150 duration-75 group-hover:opacity-0 group-hover:delay-0 group-focus-within:opacity-0 group-focus-within:delay-0'
+						? 'transition-opacity delay-150 duration-0 group-hover:opacity-0 group-hover:delay-0 group-focus-within:opacity-0 group-focus-within:delay-0'
 						: ''}"
 					title="Kernel resident memory (RSS)"
 					data-testid="kernel-memory"
@@ -982,31 +985,30 @@
 			     in flow it reserved 102px of a 239px row permanently, which at the
 			     default sidebar width left the notebook name a couple of characters.
 			     The name button reserves the matching room while these are up and the
-			     memory chip yields to them by opacity (both above), so nothing here
-			     covers something still on screen, and nothing reflows. The incoming
-			     delay is what keeps the two apart: the chip is gone before these
-			     appear, and these are gone before it comes back.
+			     memory chip yields to them by a hard cut (both above), so nothing here
+			     covers something still on screen, and nothing reflows.
 			     `pointer-events-none` AT REST IS LOAD-BEARING, not tidiness: `opacity:
 			     0` hides a box but does not stop it hit-testing, and as a positioned
 			     later sibling this one is hit-tested ABOVE the name button it is drawn
 			     over - so without it an at-rest click on the tail of a long name, or
 			     on the RSS figure, landed on Restart or Shut down, neither of which
 			     asks for confirmation.
-			     IT IS TRANSITIONED, NOT FLIPPED ON `:hover`, and that is the half
-			     that is easy to get wrong: a mouse click necessarily hovers first, so
-			     switching it on with `:hover` hands the click to an icon that is still
-			     invisible - the same misfire one moment later. `transition-discrete`
-			     puts `pointer-events` on the SAME transition as the opacity, so it
-			     turns on halfway through the reveal and off halfway through the fade:
-			     hit-testable only while visible. A browser without
-			     `transition-behavior` simply flips it on hover, which is still
-			     strictly better than an always-live overlay.
+			     BUT THE FLIP BACK MAY NOT BE DELAYED, and putting `pointer-events` on
+			     the opacity transition (`transition-discrete`) is how that goes wrong:
+			     a discrete property flips at the MIDPOINT, so the icons were drawn
+			     from 75ms and inert until 150ms, and a click in that window fell
+			     through to the name button and OPENED THE NOTEBOOK instead of acting
+			     on the kernel. It is therefore an ordinary `:hover`/`:focus-within`
+			     flip, immediate in both directions - and what keeps that from handing
+			     a click to an icon nobody can see yet is that the reveal itself now
+			     starts at once (no incoming delay, the chip having already cut away),
+			     so drawn and clickable begin together.
 			     None of this can cost the reveal: `group-hover` keys off the ROW's
 			     `:hover`, which a child declining pointer events does not affect (the
 			     pointer simply reaches the row underneath), and focusability is
 			     untouched, so the keyboard route is unchanged. -->
 			<div
-				class="pointer-events-none absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-[opacity,pointer-events] transition-discrete delay-0 duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-hover:delay-75 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-focus-within:delay-75"
+				class="pointer-events-none absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity delay-0 duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
 				data-testid="kernel-controls"
 			>
 				<button
