@@ -337,13 +337,88 @@ test('the canonical notebook, renamed out from under its kernel, is refused and 
 	// be rendering one.
 	const errorsBefore = await page.getByTestId('notebook-load-error').count();
 	await stale.click();
-	// The harm first: a tab minted here would hold one empty starter cell under a
+	// The notice FIRST, and immediately: `showNotice` arms a NOTICE_TIMEOUT_MS
+	// (6s) auto-dismiss, so once it has been taken down no `timeout` can recover
+	// it - a wait placed after the checks below is a countdown, not a retry.
+	await expect(page.getByTestId('app-notice')).toBeVisible({ timeout: 15_000 });
+	await expect(page.getByTestId('app-notice')).toContainText('notebook.ipynb');
+	// Then the harm: a tab minted here would hold one empty starter cell under a
 	// name the user renamed away, and the first run in it writes the file back.
 	await page.waitForTimeout(1_000);
 	expect((await tabTitles(page)).length).toBe(tabsBefore);
 	expect(await page.getByTestId('notebook-load-error').count()).toBe(errorsBefore);
 	expect(existsSync(join(workspace, 'notebook.ipynb'))).toBe(false);
-	// …and it SAYS so rather than failing silently.
+});
+
+/**
+ * A reply that is NOT the route's own error shape is not a verdict about the
+ * notebook, so nothing may be claimed about it.
+ *
+ * `GET /api/notebooks` produces a verdict only as its own `error(400, …)` - a
+ * JSON body carrying a string `message`. A proxy 502/503, an HTML error page or
+ * a 404 from a mismatched route never reached the handler. Read as a refusal,
+ * those told the user "Its kernel is still running - shut it down from the
+ * Kernels list if the notebook is gone", i.e. advised tearing down the process
+ * holding the namespace this whole action exists to give back, over a question
+ * the server never answered.
+ *
+ * Asserted on what the USER READS, not on which branch ran.
+ */
+test('a reply that is not the route’s own error shape claims nothing and advises no shutdown', async ({
+	page
+}) => {
+	test.setTimeout(240_000);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.getByTestId('tree-file').filter({ hasText: 'gamma.ipynb' }).first().dblclick();
+	await bootKernel(page, 'gamma.ipynb', 'gamma-cell-00', 'gamma_var = 3');
+	await closeTab(page, 'gamma.ipynb');
+	await openKernels(page);
+	const gamma = card(page, 'gamma.ipynb').getByTestId('kernel-notebook');
+	await expect(gamma).toBeVisible({ timeout: 30_000 });
+
+	// ONE interception whose reply is switched below, so both shapes travel the
+	// exact same code path. Matched on the PARSED url and scoped to this
+	// notebook's own pre-flight, so no other open tab's load is disturbed - and
+	// by predicate rather than glob, since `?` is not a wildcard here.
+	let reply: { status: number; contentType: string; body: string } = {
+		// A gateway that never reached the app: right status class, wrong shape.
+		status: 502,
+		contentType: 'text/html',
+		body: '<html><body><h1>502 Bad Gateway</h1></body></html>'
+	};
+	await page.route(
+		(url) => url.pathname === '/api/notebooks' && url.searchParams.get('path') === 'gamma.ipynb',
+		(route) => route.fulfill(reply)
+	);
+
+	const tabsBefore = (await tabTitles(page)).length;
+	await gamma.click();
 	await expect(page.getByTestId('app-notice')).toBeVisible({ timeout: 15_000 });
-	await expect(page.getByTestId('app-notice')).toContainText('notebook.ipynb');
+	const notice = (await page.getByTestId('app-notice').textContent()) ?? '';
+	expect(notice).toContain('gamma.ipynb');
+	// The remedy that must NOT be offered - nothing established the notebook is gone.
+	expect(notice).not.toMatch(/shut it down/i);
+	expect(notice).not.toMatch(/Kernels list/i);
+	// …and it opens nothing, because it still does not know the notebook is loadable.
+	await page.waitForTimeout(1_000);
+	expect((await tabTitles(page)).length).toBe(tabsBefore);
+	expect((await tabTitles(page)).filter((t) => t.includes('gamma.ipynb')).length).toBe(0);
+
+	// The kernel it declined to advise shutting down is untouched.
+	expect(await kernelIdFor(page, 'gamma.ipynb')).toBeTruthy();
+
+	// CONTROL: with the route answering its OWN 400 shape the refusal - remedy and
+	// all - is still exactly what it was, so the assertions above turn on the SHAPE
+	// of the reply and not on the notice having lost its wording.
+	reply = {
+		status: 400,
+		contentType: 'application/json',
+		body: JSON.stringify({ message: 'notebook not found: /somewhere/gamma.ipynb' })
+	};
+	await gamma.click();
+	await expect(page.getByTestId('app-notice')).toContainText('shut it down', { timeout: 15_000 });
+	const refusal = (await page.getByTestId('app-notice').textContent()) ?? '';
+	expect(refusal).toContain('not found');
+	expect(refusal).not.toContain('/somewhere/');
+	expect((await tabTitles(page)).length).toBe(tabsBefore);
 });

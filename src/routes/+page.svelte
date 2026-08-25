@@ -742,14 +742,29 @@
 			openFilePermanent(path);
 			return;
 		}
+		// A REFUSAL is a claim the SERVER made about this notebook, and it names a
+		// remedy that tears down the very kernel this action exists to give back -
+		// so it may only be said when the server actually answered about it.
 		const refuse = (why: string) =>
 			showNotice(
 				`Cannot open ${path}: ${why}. Its kernel is still running - shut it down from the Kernels list if the notebook is gone.`
 			);
+		// NO VERDICT: claim nothing about the notebook, name no remedy, mint no tab.
+		// We still do not know whether it is loadable. (The `unreachable` stance the
+		// file-tab and Databricks paths take, applied to every non-answer.)
+		const noVerdict = (why: string) => showNotice(`Could not open ${path}: ${why}.`);
 		const unreachable = (err: unknown) =>
-			// No verdict at all - claim nothing about the notebook, only that we could
-			// not ask. (The `unreachable` stance the file-tab and Databricks paths take.)
-			showNotice(`Could not reach Cellar to open ${path}: ${(err as Error)?.message ?? err}`);
+			noVerdict(`could not reach Cellar (${(err as Error)?.message ?? err})`);
+		// Both pre-flight routes answer a verdict ONLY as their own `error(400, …)`
+		// shape - a JSON body carrying a string `message`. Anything else (a proxy
+		// 502/503, an HTML error page, a 404 from a mismatched route) never reached
+		// the handler, so it says nothing about the notebook. One helper for both,
+		// so a third pre-flight cannot re-derive the rule differently.
+		const verdictReason = async (r: Response): Promise<string | null> => {
+			if (r.status !== 400) return null;
+			const body = await r.json().catch(() => null);
+			return typeof body?.message === 'string' ? body.message : null;
+		};
 
 		// THE CANONICAL NOTEBOOK IS THE ONE PATH WHERE "loadable" IS TOO BROAD.
 		// `loadDoc` MATERIALISES a starter document for it when the file is missing
@@ -771,6 +786,12 @@
 				return;
 			}
 			if (!st.ok) {
+				// The stat's own reason names an absolute path and nothing else, so the
+				// verdict is reported as the flat fact rather than forwarded.
+				if ((await verdictReason(st)) === null) {
+					noVerdict(`Cellar did not answer (HTTP ${st.status})`);
+					return;
+				}
 				refuse('notebook not found');
 				return;
 			}
@@ -784,14 +805,17 @@
 			return;
 		}
 		if (!res.ok) {
-			const body = await res.json().catch(() => null);
+			const reason = await verdictReason(res);
+			if (reason === null) {
+				noVerdict(`Cellar did not answer (HTTP ${res.status})`);
+				return;
+			}
 			// The server's own reason, with any ABSOLUTE path stripped out: `loadDoc`
 			// throws `'notebook not found: ' + abs`, and every other surface in this UI
 			// addresses a notebook workspace-relative (the `refuse` template above
 			// already names it that way). Same rule GitNotebooks' `unreadable` follows;
 			// here the explanation is worth keeping, so only the path goes.
-			const raw = typeof body?.message === 'string' ? reasonWithoutServerPath(body.message) : '';
-			refuse(raw || `HTTP ${res.status}`);
+			refuse(reasonWithoutServerPath(reason) || 'the notebook could not be loaded');
 			return;
 		}
 		// The check answered "this IS a live notebook", so seed the `.py` kind cache
