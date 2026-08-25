@@ -116,6 +116,15 @@
 		onOpenFile: (path: string) => void;
 		onOpenFilePermanent: (path: string) => void;
 		onFocusNotebook?: (id: string) => void;
+		/**
+		 * Open (or surface) a notebook by workspace-relative path - the Kernels
+		 * section's row action. Deliberately path-keyed rather than tab-id keyed
+		 * like `onFocusNotebook`: a kernel card exists for a notebook whose tab was
+		 * CLOSED (its kernel is still alive and holding its namespace), which has no
+		 * tab id to focus, and the whole point of the action is to give that kernel
+		 * its notebook back.
+		 */
+		onOpenNotebook?: (path: string) => void;
 		activeFilePath?: string | null;
 		fsRefreshSignal?: number;
 		onScrollToCell: (cellId: string, key?: string) => void;
@@ -171,6 +180,7 @@
 		onOpenFile,
 		onOpenFilePermanent,
 		onFocusNotebook,
+		onOpenNotebook,
 		activeFilePath = null,
 		fsRefreshSignal = 0,
 		onScrollToCell,
@@ -232,6 +242,18 @@
 	// Past the soft cap, each kernel being a full Python process (100s of MB with
 	// pandas/pyspark) adds up — warn (never block). `maxKernels <= 0` disables it.
 	const kernelsOverCap = $derived(isOverKernelCap(kernelCount, maxKernels));
+
+	/**
+	 * How loud a kernel card's notebook name reads. Three tones, in the order the
+	 * row's own states go: an open notebook with a live kernel is ordinary text; an
+	 * open one that has never run is the quietest (there is no process behind it);
+	 * one whose tab is CLOSED sits between the two - its kernel is alive and its
+	 * name is a real click target, so it must not read as disabled.
+	 */
+	function nameToneFor(card: KernelCard): string {
+		if (!card.open) return 'text-base-content/70';
+		return card.hasKernel ? '' : 'text-base-content/50';
+	}
 	// How many live kernels are executing right now — surfaced in the header so a
 	// user managing many agents sees at a glance which/how many are working.
 	const busyCount = $derived(kernelCards.filter((c) => c.hasKernel && c.info.status === 'busy').length);
@@ -829,15 +851,20 @@
 
 <!-- One compact kernel row: a single notebook's kernel, dense enough that 10+
      stay scannable. A leading status dot (pulses when busy) + the notebook name
-     (focuses its tab when open) + hover/focus-revealed Interrupt / Restart
-     (=wipe namespace) / Shut down (=free the process) icon buttons, each acting
-     only on THIS notebook. A row exists for every open notebook (an unrun one
-     reads "not started") and every live kernel whose tab was closed. -->
+     (opens the notebook - surfacing its tab when it already has one) +
+     hover/focus-revealed Interrupt / Restart (=wipe namespace) / Shut down
+     (=free the process) icon buttons, each acting only on THIS notebook. A row
+     exists for every open notebook (an unrun one reads "not started") and every
+     live kernel whose tab was closed. -->
 {#snippet kernelRow(card: KernelCard)}
 	{@const acting = actingPaths.has(card.path)}
 	{@const busy = card.info.status === 'busy'}
+	<!-- The hover/focus-revealed control cluster is the ONLY tail state that is out
+	     of flow (see it below); `hoverControls` is true exactly when it is the one
+	     showing, and is what pairs the row's reserved gutter with it. -->
+	{@const hoverControls = card.hasKernel && !acting && confirmWipePath !== card.path}
 	<div
-		class="group flex items-center gap-2 rounded-md px-2 py-1 hover:bg-base-300/40 {busy ? 'bg-warning/5' : ''}"
+		class="group relative flex items-center gap-2 rounded-md px-2 py-1 hover:bg-base-300/40 {busy ? 'bg-warning/5' : ''}"
 		data-testid="kernel-card"
 		data-nb-path={card.path}
 	>
@@ -847,35 +874,57 @@
 			{#if busy}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
 			<span class="relative inline-flex h-2 w-2 rounded-full {kernelDotClass(card.info)}"></span>
 		</span>
-		{#if card.open}
+		<!-- Name + memory share the row's flexible space, and share the gutter the
+		     out-of-flow controls need while they are revealed: the `pr` is applied on
+		     HOVER/FOCUS only, so at rest the name has the whole row (in flow the
+		     invisible control slot reserved 102px of a 239px row, which at the
+		     default 256px sidebar left a closed card's name one character) and while
+		     the controls are up it is exactly as wide as it always was. A padding
+		     change re-truncates clipped text; it moves no sibling, so the controls
+		     never shift. -->
+		<div
+			class="flex min-w-0 flex-1 items-center gap-2 {hoverControls
+				? 'group-hover:pr-[6.75rem] group-focus-within:pr-[6.75rem]'
+				: ''}"
+		>
+			<!-- THE CLICK TARGET IS THE NAME, NOT THE ROW — deliberately. The row also
+			     carries four icon buttons, one of them destructive behind a two-step
+			     confirm, so a row-level handler would have to be a `role="button"` div
+			     with `stopPropagation` on every control (fragile: a control added later
+			     silently inherits the open action), or an outer <button> wrapping them
+			     (invalid markup, and a confusing tab order). The name button is
+			     `flex-1`, so it already spans the row minus the controls — the same
+			     shape (and the same testid) the OPEN card has always had, now extended
+			     to the closed one, which was an inert <span> and so reachable by
+			     neither mouse nor keyboard. One handler for both states:
+			     `onOpenNotebook` surfaces an already-open tab and opens a closed one,
+			     so the row never duplicates a notebook and never reloads the one you
+			     are already looking at. The accessible name is explicit because the
+			     visible text is only a filename; the tooltip carries the full PATH,
+			     which is what tells two same-named notebooks apart. -->
 			<button
 				class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary"
-				onclick={() => onFocusNotebook?.(card.id)}
-				title="Focus {card.name} — {kernelStatusLabel(card.info)}"
+				onclick={() => onOpenNotebook?.(card.path)}
+				title="{card.open ? 'Focus' : 'Open'} {card.path} — {card.open
+					? kernelStatusLabel(card.info)
+					: 'kernel running, tab closed'}"
+				aria-label="{card.open ? 'Focus' : 'Open'} notebook {card.name}"
 				data-testid="kernel-notebook"
 			>
-				<span class="min-w-0 truncate {busy ? 'font-medium' : ''} {card.hasKernel ? '' : 'text-base-content/50'}">{card.name}</span>
+				<span class="min-w-0 truncate {busy ? 'font-medium' : ''} {nameToneFor(card)}">{card.name}</span>
 				{#if card.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
+				{#if !card.open}<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>{/if}
 			</button>
-		{:else}
-			<span
-				class="flex min-w-0 flex-1 items-center gap-1.5 text-sm text-base-content/70"
-				title="{card.name} — kernel running, tab closed"
-				data-testid="kernel-notebook"
-			>
-				<span class="min-w-0 truncate {busy ? 'font-medium' : ''}">{card.name}</span>
-				<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>
-			</span>
-		{/if}
-		{#if cardMemory(card)}
-			<span
-				class="shrink-0 tabular-nums text-[11px] text-base-content/40"
-				title="Kernel resident memory (RSS)"
-				data-testid="kernel-memory"
-			>
-				{cardMemory(card)}
-			</span>
-		{/if}
+			{#if cardMemory(card)}
+				<span
+					class="shrink-0 tabular-nums text-[11px] text-base-content/40"
+					title="Kernel resident memory (RSS)"
+					data-testid="kernel-memory"
+				>
+					{cardMemory(card)}
+				</span>
+			{/if}
+		</div>
 		{#if !card.hasKernel}
 			<!-- Open but never run: no process to control, just a muted state hint. -->
 			<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30" data-testid="kernel-not-started">not started</span>
@@ -902,9 +951,13 @@
 			</div>
 		{:else}
 			<!-- Uncluttered at rest, full control on interaction: reveal on row hover or
-			     keyboard focus. The slot keeps layout width stable (no reflow). -->
+			     keyboard focus. OUT OF FLOW, so an invisible slot cannot eat the row:
+			     in flow it reserved 102px of a 239px row permanently, which at the
+			     default sidebar width left the notebook name a couple of characters.
+			     The name/memory pair reserves the matching gutter while these are up
+			     (above), so nothing overlaps and nothing reflows. -->
 			<div
-				class="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
+				class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
 				data-testid="kernel-controls"
 			>
 				<button

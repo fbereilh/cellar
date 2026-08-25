@@ -51,7 +51,8 @@ export interface KernelListEntry {
  * A Kernels-sidebar card: one per notebook that either has a live kernel OR is
  * open in a tab. `info` drives the status badge (`kernelBadgeClass`); `open`/
  * `active` come from the tab set so a card can focus its tab and dot the focused
- * notebook. `hasKernel` gates the Interrupt/Restart/Shut-down controls.
+ * notebook. `hasKernel` gates the Interrupt/Restart/Shut-down controls, and the
+ * card's NAME is its own click target - it opens (or surfaces) `path`.
  */
 export interface KernelCard {
 	/** Tab id when open, else the notebook path. */
@@ -63,6 +64,28 @@ export interface KernelCard {
 	active: boolean;
 	hasKernel: boolean;
 	info: KernelInfo;
+}
+
+/**
+ * What a Kernels card CALLS its notebook.
+ *
+ * A card exists for a notebook whose TAB WAS CLOSED (its kernel is still alive
+ * and holding the namespace), and that card has no tab to borrow a title from.
+ * The obvious fallback - `KernelListEntry.name` - is the KERNELSPEC name, which
+ * is `python3` for every kernel Cellar starts, so it labelled every tab-closed
+ * card `python3`: a name identifying no notebook at all, on exactly the card
+ * whose one job is to open one.
+ *
+ * So the fallback is the path's BASENAME, which is what a tab is titled with
+ * (`makeTab`) - a card and its tab therefore read alike. The full path is not
+ * used because it does not fit a dense 256px row; it rides the row's tooltip
+ * instead, which is what tells two same-named notebooks in different folders
+ * apart. A path with no basename (empty, or a trailing separator) falls back to
+ * the path itself rather than to an empty label.
+ */
+export function kernelCardName(path: string, tabTitle?: string | null): string {
+	if (tabTitle) return tabTitle;
+	return path.split('/').pop() || path;
 }
 
 export function kernelStatusLabel(info: KernelInfo | null | undefined): string {
