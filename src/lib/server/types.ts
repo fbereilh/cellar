@@ -13,6 +13,7 @@
  */
 
 import type { ImportChangeStamps } from './importBindings';
+import type { ExportHazard } from '../exportHazard';
 
 export type { ImportChangeStamps };
 
@@ -153,6 +154,19 @@ export interface NotebookDoc {
 	 * `notebook.ts`'s `autoExportPy` - best-effort must not mean silent.
 	 */
 	lastExportError?: string | null;
+	/**
+	 * Runtime-only (never serialized): the compile hazards last BROADCAST for this
+	 * doc, joined into one comparison key. Held ONLY so `publishExportHazards` can
+	 * tell a change from a no-op - the hazards themselves are always recomputed
+	 * fresh, so nothing ever reads a stale value out of this.
+	 *
+	 * ABSENT means nothing has been broadcast YET, which is NOT the same as having
+	 * broadcast no hazards (`''`) - a doc loaded from disk already holding one
+	 * seeds the browser through `getNotebook` without ever publishing. Compare
+	 * strictly; coercing the sentinel swallows the event that CLEARS such a
+	 * hazard.
+	 */
+	lastExportHazardKey?: string;
 }
 
 /** Serializable notebook view for the browser (SSR + REST). */
@@ -182,6 +196,16 @@ export interface NotebookView {
 	exportResolved: string | null;
 	/** Why a CONFIGURED target cannot resolve (base `git` with no repo, an escape, an unknown base), else null. */
 	exportResolveError: string | null;
+	/**
+	 * Constructs in the marked cells that make the generated module uncompilable
+	 * (`$lib/exportHazard`) - what the export bar's standing warning renders.
+	 * Empty on every ordinary notebook, and empty when no target is configured.
+	 *
+	 * A POSITIVE finding, never a compile verdict: the class of module that fails
+	 * `compile` is wider than what is detected, so an empty list means "none of the
+	 * things Cellar checks for", never "this module compiles".
+	 */
+	exportHazards: ExportHazard[];
 	/**
 	 * Declared code root: the workspace-relative directory this notebook's KERNEL
 	 * resolves code from (cwd + `sys.path`), or null for the workspace root.

@@ -28,6 +28,7 @@ import { gitRootOf } from './git';
 import { logicalLines, stripComments, splitSimpleStatements } from './imports';
 import { isExportCell } from '../exportRole';
 import { isExportBase, type ExportBase } from '../exportTarget';
+import { futureImportJoinedHazard, type ExportHazard } from '../exportHazard';
 import type { Cell, NotebookDoc } from './types';
 
 /** The header stamped at the top of every generated module. */
@@ -46,6 +47,20 @@ export interface ExportResult {
 	count: number;
 	/** why nothing was written, when `written` is false. */
 	reason?: 'no-target' | 'no-cells' | 'unchanged';
+	/**
+	 * Constructs in the marked cells that make the generated module uncompilable
+	 * (`$lib/exportHazard`). Empty on every ordinary export, and empty for
+	 * `no-target`/`no-cells`, where no module describes those cells at all.
+	 *
+	 * Carried on `unchanged` too, and that is the point rather than an edge case:
+	 * the broken module is still ON DISK, so a re-export that writes nothing must
+	 * not report the plain success the first one was corrected out of.
+	 *
+	 * A POSITIVE finding, never a compile verdict - the class is wider than what
+	 * is detected. `$lib/exportHazard`'s header states the measured boundary; no
+	 * caller may word an empty list as "the module compiles".
+	 */
+	hazards: ExportHazard[];
 }
 
 /**
@@ -144,19 +159,33 @@ const FUTURE_RE = /^from\s+__future__\s+import\b/;
  * this exists to remove - and so is a `;` sitting in a trailing comment, which
  * `stripComments` has already dropped before the split.
  *
- * KNOWN LIMIT, with its CONSEQUENCE stated rather than only its rule: a genuinely
- * semicolon-JOINED statement (`from __future__ import annotations; x = 1`) is
- * still left in place, because hoisting it would reorder its rider and relocating
- * a user's code is out of scope. The consequence is that such a cell STILL yields
- * a module Python refuses to compile while `exportNotebookToPy` reports
- * `written: true` - i.e. this class is narrowed, not closed. Pinned as
- * known-and-accepted by a `compile()` case in `export-py-future.test.ts`, so
- * closing it later forces this wording to be updated.
+ * A genuinely semicolon-JOINED statement (`from __future__ import annotations;
+ * x = 1`) is still left in place, because hoisting it would reorder the statement
+ * riding with it and relocating a user's code is out of scope for an export. What
+ * is NOT left in place is the report: such a line is recorded as a HAZARD
+ * (`$lib/exportHazard`), rides out on `ExportResult.hazards`, and every surface
+ * that reports the export says so instead of plain success. The module really is
+ * still written - see `exportNotebookToPy`'s header for why writing beats
+ * refusing here - and it really will not import, and the user is told which line
+ * to change. Detecting is done HERE, in the same walk that decides the hoist, so
+ * the hoist rule and the hazard rule cannot drift into disagreeing about which
+ * lines Cellar declines to move.
  *
- * Returns the deduped hoisted statements and the sources with them spliced out.
+ * The hazard fires on a joined line carrying a `__future__` import in ANY
+ * position, not only first: `x = 1; from __future__ import annotations` does not
+ * compile even standalone, so a module built from it cannot either, and reporting
+ * it is strictly better than the silence it used to get.
+ *
+ * Returns the deduped hoisted statements, the sources with them spliced out, and
+ * the hazards found on the way.
  */
-function liftFutureImports(sources: string[]): { future: string[]; body: string[] } {
+function liftFutureImports(sources: string[]): {
+	future: string[];
+	body: string[];
+	hazards: ExportHazard[];
+} {
 	const future: string[] = [];
+	const hazards: ExportHazard[] = [];
 	const seen = new Set<string>();
 	const body = sources.map((src) => {
 		if (!src.includes('__future__')) return src; // cheap pre-check; the common case
@@ -166,7 +195,16 @@ function liftFutureImports(sources: string[]): { future: string[]; body: string[
 			// The CODE of the line: comments dropped, continuations folded, strings kept.
 			const code = stripComments(line.raw).replace(/\s+/g, ' ').trim();
 			const parts = splitSimpleStatements(code);
-			if (parts.length !== 1 || !FUTURE_RE.test(parts[0])) continue;
+			if (parts.length !== 1) {
+				// A line carrying a second statement: never hoisted, and - when one of
+				// those statements IS a future import - never reported as a clean export.
+				// Quoted back from `line.raw` (what the user TYPED, trailing comment and
+				// all) rather than from `code`, so the message names a line they can find
+				// on screen; `quoteStatement` folds and bounds it.
+				if (parts.some((part) => FUTURE_RE.test(part))) hazards.push(futureImportJoinedHazard(line.raw));
+				continue;
+			}
+			if (!FUTURE_RE.test(parts[0])) continue;
 			if (!seen.has(parts[0])) {
 				seen.add(parts[0]); // dedupe on the statement, so a comment or a trailing `;` is not a new one
 				future.push(line.raw.replace(/\s+$/, '')); // hoisted verbatim, comment and all
@@ -176,7 +214,45 @@ function liftFutureImports(sources: string[]): { future: string[]; body: string[
 		if (!cuts.length) return src;
 		return spliceLines(src, cuts);
 	});
-	return { future, body };
+	return { future, body, hazards };
+}
+
+/**
+ * Every compile hazard in a set of exported sources - the ONE rule, shared by the
+ * exporter, the notebook view the export bar renders, and the agent surface, so
+ * none of them can describe the same module differently.
+ *
+ * It runs `liftFutureImports` rather than a second scan of its own: the hazard is
+ * defined as "a line the hoist declines to move", which only the hoist can answer.
+ * The discarded body is the cost of that, and it is trivial - a pure walk behind a
+ * `__future__` substring pre-check, over marked cells only.
+ */
+export function exportHazards(sources: string[]): ExportHazard[] {
+	return liftFutureImports(sources).hazards;
+}
+
+/**
+ * A DOCUMENT's compile hazards: what the module its marks describe would carry.
+ *
+ * Gated on a target being CONFIGURED, because a hazard is a statement about a
+ * module - with no target there is no module for it to be about, and warning
+ * there would be noise on a notebook that exports nothing. A target that cannot
+ * RESOLVE is deliberately not gated out: the marks still describe that module,
+ * and the surfaces order the two warnings themselves.
+ *
+ * `resolved` is an optional already-resolved target, so a caller that has one in
+ * hand (`exportTargetView`, which resolves for its own fields) does not pay a
+ * second resolution - the `canonicalWorkspace()` optional-argument idiom. A lone
+ * call resolves once, itself.
+ */
+export function docExportHazards(
+	doc: NotebookDoc,
+	resolved: ResolvedExportTarget | null = resolveExportTarget(doc)
+): ExportHazard[] {
+	if (!resolved) return [];
+	const exported = doc.cells.filter((c: Cell) => isExportCell(c)).map((c) => c.source);
+	if (!exported.length) return [];
+	return exportHazards(exported);
 }
 
 /**
@@ -419,10 +495,32 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
  * (`touch utils.py`, or the explorer's "New file") before naming the target is an
  * ordinary workflow, and refusing it stopped the module regenerating on every
  * later save through a path no UI surface reads.
+ *
+ * A module the marked cells make UNCOMPILABLE is WRITTEN, and REPORTED
+ * (`ExportResult.hazards`) - it is never a refusal, and the choice is deliberate:
+ *
+ *   1. A refusal degrades SILENTLY on the path that matters. This runs on every
+ *      save (`autoExportPy`), which is best-effort by design - a throw is recorded
+ *      on the doc and that record has no UI home. Refusing would leave the
+ *      PREVIOUS, compilable module on disk, quietly stale, while the notebook
+ *      moved on: the user's edits would simply appear to have no effect. A module
+ *      that fails `import` with Python's own `SyntaxError` naming `__future__` is
+ *      loud; a stale one that imports fine is the more deceptive outcome.
+ *   2. It punishes the wrong scope. The hazard is one line in one cell, and the
+ *      module may hold a dozen other exported cells; discarding all of them for it
+ *      breaks the module/notebook lockstep every other guard here protects.
+ *   3. The defect was the REPORT, not the write - Cellar saying "written" about a
+ *      file that cannot be imported. Fixing the report closes it; refusing the
+ *      write is a second, larger behavior change answering a different question.
+ *
+ * The hazards ride on EVERY result that describes a module (`written` and
+ * `unchanged` alike - an unchanged re-export leaves the broken bytes on disk), and
+ * they are a POSITIVE finding, never a compile verdict: see `$lib/exportHazard`
+ * for the measured boundary of what is and is not detected.
  */
 export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	const info = resolveExportTarget(doc);
-	if (!info) return { written: false, target: null, count: 0, reason: 'no-target' };
+	if (!info) return { written: false, target: null, count: 0, reason: 'no-target', hazards: [] };
 
 	// The nothing-to-do contract holds even over an unresolvable target: with no
 	// cell marked there is nothing to write anywhere, so the honest answer is
@@ -430,7 +528,10 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	// never going to be written.
 	const exported = doc.cells.filter((c: Cell) => isExportCell(c)).map((c) => c.source);
 	if (!exported.length)
-		return { written: false, target: info.ok ? info.target : info.path, count: 0, reason: 'no-cells' };
+		return { written: false, target: info.ok ? info.target : info.path, count: 0, reason: 'no-cells', hazards: [] };
+	// Computed once, from the sources this call is about to assemble, and attached
+	// to whichever result it returns below.
+	const hazards = exportHazards(exported);
 	// A configured-but-unresolvable target (base `git` with no repository, a path
 	// resolving outside the workspace, an unknown base) is a real error the manual
 	// button surfaces and auto-on-save records - exactly where the old
@@ -452,7 +553,7 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 		const existing = safeRead(abs);
 		// Idempotent: skip the write when the file already holds identical bytes.
 		if (existing === text) {
-			return { written: false, target, count: exported.length, reason: 'unchanged' };
+			return { written: false, target, count: exported.length, reason: 'unchanged', hazards };
 		}
 		if (existing === null)
 			throw new Error(
@@ -465,7 +566,7 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	}
 	mkdirSync(dirname(abs), { recursive: true });
 	writeFileSync(abs, text);
-	return { written: true, target, count: exported.length };
+	return { written: true, target, count: exported.length, hazards };
 }
 
 /**

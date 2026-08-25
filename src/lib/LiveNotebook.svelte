@@ -29,6 +29,8 @@
 	} from '$lib/cellSelection';
 	import { exportCellCount } from '$lib/exportRole';
 	import { isExportBase } from '$lib/exportTarget';
+	import type { ExportHazard } from '$lib/exportHazard';
+	import type { ExportPyResult } from '$lib/types';
 	import { splitInheritedCellar } from '$lib/splitCell';
 	import { agentConfigNotice, type WorkspaceRootOption } from '$lib/notebookRoot';
 	import { createSearchCache } from '$lib/search';
@@ -141,6 +143,7 @@
 		| { type: 'cell:rendered'; cellId: string }
 		| { type: 'cell:edited'; cellId: string; source: string }
 		| { type: 'notebook:export-target'; target: string | null; base?: string; resolved?: string | null; resolveError?: string | null }
+		| { type: 'notebook:export-hazards'; hazards?: ExportHazard[] }
 		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
 		| { type: 'notebook:hide-all-code'; hidden: boolean };
@@ -235,6 +238,14 @@
 	let exportBase = $state<string>('workspace');
 	let exportResolved = $state<string | null>(null);
 	let exportResolveError = $state<string | null>(null);
+	// Constructs in the MARKED cells that make the generated module uncompilable
+	// (`$lib/exportHazard`). Server-derived like the three fields above - the rule
+	// needs the Python line tokenizer, which is server-only - seeded on load and
+	// kept live by the `notebook:export-hazards` event, which the server publishes
+	// only when the set CHANGES. That push is what gives the auto-on-save export a
+	// UI home: the module regenerates on every save, so a hazard appears the moment
+	// a cell is marked or edited into one, nowhere near the manual export button.
+	let exportHazards = $state<ExportHazard[]>([]);
 	let exportBaseBusy = $state(false);
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
 	// imports from (null = the workspace root, the default and today's behavior).
@@ -1489,6 +1500,7 @@
 			exportBase = body.notebook.exportBase ?? 'workspace'; // what that path is measured from
 			exportResolved = body.notebook.exportResolved ?? null; // its workspace-relative resolution
 			exportResolveError = body.notebook.exportResolveError ?? null; // or why it cannot resolve
+			exportHazards = body.notebook.exportHazards ?? []; // why the generated module would not import
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			root = body.notebook.root ?? null; // code root (kernel cwd + sys.path)
@@ -1636,6 +1648,11 @@
 			exportResolved = ev.resolved ?? null;
 			exportResolveError = ev.resolveError ?? null;
 			exportTarget = ev.target;
+		} else if (ev.type === 'notebook:export-hazards') {
+			// DERIVED state, not an echo: the server publishes it whenever the marked
+			// cells' hazards change (on any save, and after a manual export), with no
+			// `originId`, so every tab - the one that just typed included - renders it.
+			exportHazards = (ev.hazards ?? []) as ExportHazard[];
 		} else if (ev.type === 'notebook:root') {
 			// The code root changed in another tab or from an agent (this tab's own
 			// change is echo-suppressed by originId and refreshes the list itself). The
@@ -1928,6 +1945,7 @@
 			if (
 				pe.type?.startsWith('cell:') ||
 				pe.type === 'notebook:export-target' ||
+				pe.type === 'notebook:export-hazards' ||
 				pe.type === 'notebook:header-numbering' ||
 				pe.type === 'notebook:hide-all-code' ||
 				pe.type === 'notebook:root'
@@ -3011,7 +3029,7 @@
 			});
 			const body = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(body?.message || 'export failed');
-			return body as { written: boolean; target: string | null; count: number; reason?: 'no-target' | 'no-cells' | 'unchanged' };
+			return body as ExportPyResult;
 		} catch (err) {
 			onNotice?.(`Export failed: ${(err as Error)?.message || 'export failed'}`);
 			return null;
@@ -4253,6 +4271,7 @@
 			exportBase={exportBase}
 			exportResolved={exportResolved}
 			exportResolveError={exportResolveError}
+			exportHazards={exportHazards}
 			exportBaseBusy={exportBaseBusy}
 			onSetExportBase={setExportBaseValue}
 			root={root}

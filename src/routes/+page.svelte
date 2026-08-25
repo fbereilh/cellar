@@ -913,7 +913,12 @@
 		else if (r.reason === 'no-cells') showNotice('No cells are marked for export - use the export toggle in a cell’s toolbar.');
 		else {
 			fsRefreshSignal++; // a new/updated .py on disk → refresh the tree + git decorations
-			showNotice(`Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`);
+			// A module that was written but cannot be imported may NOT be reported as a
+			// plain success. The hazard carries the server's own full sentence (what is
+			// wrong and what to change), so it REPLACES the success line rather than
+			// riding after it - this channel shows one message at a time.
+			if (r.hazards?.length) showNotice(`Wrote ${r.target}, but ${r.hazards[0].message}`);
+			else showNotice(`Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`);
 		}
 	}
 

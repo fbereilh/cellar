@@ -580,3 +580,60 @@ test('a base change the server accepted but could not save says exactly that', a
 	await expect(select).toHaveValue('notebook');
 	await expect(input).toHaveValue('diskbase_mod.py');
 });
+
+/**
+ * The compile-hazard warning, in a real browser.
+ *
+ * Cellar writes a module whose `from __future__ import ...` shares a line with
+ * another statement - it cannot hoist that line without reordering the statement
+ * riding with it - so the module does not compile. The fix is that no surface
+ * calls that a success, and the surface that MATTERS is the standing one: the
+ * module regenerates on every save, so the warning has to arrive with no reload
+ * and no click, or the auto-on-save path is exactly as silent as before.
+ */
+test('a module that will not import says so in the bar, live, and clears when fixed', async ({
+	page,
+	request
+}) => {
+	const nb = await makeNotebook(request, 'hazard.ipynb');
+	const cellId = await firstCellId(request, nb);
+	const target = await request.post(`${baseURL}/api/notebooks/export-py`, {
+		data: { op: 'set-target', target: 'lib/hazard.py', path: nb }
+	});
+	expect(target.ok(), await target.text()).toBeTruthy();
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator(`[data-testid="tree-file"][data-path="${nb}"]`).click();
+	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+
+	// Nothing marked yet: no module, so nothing to warn about.
+	const hazard = page.locator('[data-testid="export-hazard"]:visible');
+	await expect(hazard).toHaveCount(0);
+
+	// Mark a cell holding the construct, from OUTSIDE this tab (an agent, or the
+	// user's own save). The bar must learn about it through the live push.
+	const patched = await request.patch(`${baseURL}/api/cells/${cellId}`, {
+		data: { source: 'from __future__ import annotations; x = 1', export: true, nb }
+	});
+	expect(patched.ok(), await patched.text()).toBeTruthy();
+
+	await expect(hazard).toBeVisible();
+	await expect(hazard).toContainText('will not import');
+	await expect(hazard).toContainText('line of its own');
+	// The module really was written - refusing would have left nothing to explain.
+	await expect.poll(() => existsSync(join(workspace, 'lib', 'hazard.py'))).toBe(true);
+
+	// The manual export reports it too, rather than "Exported 1 cell → ...".
+	await page.locator('[data-testid="export-run"]:visible').click();
+	const feedback = page.locator('[data-testid="export-feedback"]:visible');
+	await expect(feedback).toContainText('will not import');
+	await expect(feedback).not.toContainText('Exported 1 cell');
+
+	// Fixing the cell clears the warning, with no reload: a warning that only ever
+	// appears is one nobody can act on.
+	const fixed = await request.patch(`${baseURL}/api/cells/${cellId}`, {
+		data: { source: 'from __future__ import annotations\nx = 1', nb }
+	});
+	expect(fixed.ok(), await fixed.text()).toBeTruthy();
+	await expect(hazard).toHaveCount(0);
+});

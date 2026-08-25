@@ -28,7 +28,14 @@ import { cancelRun } from './run-queue';
 import { truncateActiveRunOutputs } from './run-output-registry';
 import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
-import { exportNotebookToPy, resolveExportTarget, type ExportResult, type ResolvedExportTarget } from './export-py';
+import {
+	exportNotebookToPy,
+	resolveExportTarget,
+	docExportHazards,
+	type ExportResult,
+	type ResolvedExportTarget
+} from './export-py';
+import type { ExportHazard } from '../exportHazard';
 import { canExportCell } from '../exportRole';
 import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
@@ -233,6 +240,48 @@ function autoExportPy(doc: NotebookDoc): void {
 	} catch (err) {
 		doc.lastExportError = String((err as Error)?.message ?? err);
 	}
+	publishExportHazards(doc);
+}
+
+/**
+ * Give the auto-on-save export a UI HOME for its compile hazards: broadcast them
+ * when - and only when - they CHANGE.
+ *
+ * The module regenerates on every save, so a hazard appears the moment a cell is
+ * marked or edited into one, and the user is nowhere near the manual export
+ * button when that happens. Recomputing in `getNotebook` alone would leave the
+ * export bar stale until the next `load()` (a reconnect, a seq gap, a restore) -
+ * i.e. usually never - so the change is pushed like any other structural fact.
+ *
+ * Cheap by construction: computed behind a `__future__` substring pre-check over
+ * MARKED cells only, and compared before publishing, so an ordinary notebook's
+ * every-keystroke autosave emits nothing at all. The event carries no `originId`
+ * on purpose - this is DERIVED state, not an echo of one tab's action, so every
+ * tab (the initiating one included) must render it.
+ *
+ * Deliberately NOT folded into `notebook:export-target`: that event is about the
+ * target, this is about the marked cells' content, and they move independently.
+ *
+ * The comparison is STRICT against the raw field and may never coerce the
+ * `undefined` sentinel to `''`: a doc that has NEVER broadcast is not a doc whose
+ * last broadcast carried no hazards. `loadDoc` never persists, so a notebook that
+ * arrives from disk ALREADY holding a hazard seeds the browser with it through
+ * `getNotebook` -> `exportTargetView` while this field is still unset - and
+ * coerced, the user's FIX (the first persist since load) compared `''` against
+ * `''`, returned here, and left the bar asserting a module will not import after
+ * it had been repaired. The cost of the strict test is exactly ONE extra
+ * empty-hazards event per document lifetime; the change-only rule above exists to
+ * spare an event per KEYSTROKE, not per document. Seeding the key from
+ * `getNotebook` instead is the WRONG repair - that is a READ, served to SSR and
+ * to the agent surface with no browser attached, so it would suppress the event
+ * for a client that never received the seed.
+ */
+function publishExportHazards(doc: NotebookDoc): void {
+	const hazards = docExportHazards(doc);
+	const key = hazards.map((h) => h.message).join('\u0000');
+	if (key === doc.lastExportHazardKey) return;
+	doc.lastExportHazardKey = key;
+	emit(doc, 'notebook:export-hazards', { hazards });
 }
 
 /**
@@ -359,17 +408,26 @@ export function getNotebook(nb?: string | null): NotebookView {
  * warning is decided from, or the `exportResolveError` naming why a configured
  * target cannot resolve. Resolution covers the EFFECTIVE target (`#|default_exp`
  * directives included), matching where the module really lands.
+ *
+ * It also carries `exportHazards`: constructs in the marked cells that make the
+ * generated module uncompilable (`$lib/exportHazard`). Computed FRESH from the
+ * document rather than read back from the last export, so a tab that loads a
+ * notebook it has never saved still sees what its marks describe - and so the
+ * export bar's standing warning cannot lag behind the marks by one save.
  */
 function exportTargetView(doc: NotebookDoc): {
 	exportBase: string;
 	exportResolved: string | null;
 	exportResolveError: string | null;
+	exportHazards: ExportHazard[];
 } {
 	const info = resolveExportTarget(doc);
 	return {
 		exportBase: readExportBase(doc),
 		exportResolved: info && info.ok ? info.target : null,
-		exportResolveError: info && !info.ok ? info.error : null
+		exportResolveError: info && !info.ok ? info.error : null,
+		// The SAME `info` is threaded in rather than resolved a second time here.
+		exportHazards: docExportHazards(doc, info)
 	};
 }
 
@@ -1361,7 +1419,27 @@ export function exportPy(nb?: string | null): ExportResult {
 	} catch (err) {
 		doc.lastExportError = String((err as Error)?.message ?? err);
 		throw err;
+	} finally {
+		// This path writes the module WITHOUT going through `persist`, so it owes the
+		// same broadcast - in a `finally`, because a throw here still leaves the marks
+		// (and therefore the hazards) exactly as this call found them, and a bar left
+		// describing an older set is the staleness the push exists to remove.
+		publishExportHazards(doc);
 	}
+}
+
+/**
+ * The compile hazards the marks of this notebook currently describe
+ * (`$lib/exportHazard`), for callers outside the browser view - the agent surface
+ * reads it to report a module it regenerated but that will not import.
+ *
+ * Computed FRESH, deliberately, rather than read back from the last export: the
+ * agent tools' own `module` field is already careful to say what is TRUE OF DISK
+ * rather than what this call caused, and a fresh read cannot go stale on a doc
+ * whose idempotent call skipped the persist.
+ */
+export function exportHazardsFor(nb?: string | null): ExportHazard[] {
+	return docExportHazards(docFor(nb));
 }
 
 /**

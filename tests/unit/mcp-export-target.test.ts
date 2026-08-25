@@ -155,9 +155,13 @@ describe('set_export_target', () => {
 		// reported), the refusals this path can hit, and the flag that tells a clearable
 		// SETTING from a non-clearable cell directive.
 		expect(line).toMatch(/clears the SETTING/);
-		expect(line).toMatch(/#\|default_exp` directive written in a cell is NOT/);
+		expect(line).toMatch(/#\|default_exp` directive in a cell is NOT/);
 		expect(line).toMatch(/while a cell stays marked/);
-		expect(line).toMatch(/module\.regenerated:false/);
+		// The `module` field reports TWO things and the description must name both: a
+		// write that failed, and a module that was written and will not import.
+		expect(line).toMatch(/module/);
+		expect(line).toMatch(/failed/);
+		expect(line).toMatch(/will not import/);
 		expect(line).toMatch(/outside the workspace/);
 		expect(line).toMatch(/text notebook/);
 		expect(line).toMatch(/export_target_source/);

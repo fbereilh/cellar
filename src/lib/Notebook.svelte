@@ -10,6 +10,8 @@
 	import type { ExtractedCodeBlock } from '$lib/codeBlockExtract';
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
+	import type { ExportHazard } from '$lib/exportHazard';
+	import type { ExportPyResult } from '$lib/types';
 	import {
 		planWindow,
 		pinnedCellIds,
@@ -104,7 +106,7 @@
 		 */
 		onSetExportTarget?: (target: string, opts?: { keepalive?: boolean }) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
-		onExportPy?: () => Promise<{ written: boolean; target: string | null; count: number; reason?: string } | null>;
+		onExportPy?: () => Promise<ExportPyResult | null>;
 		/** What the stored export path is measured from (`$lib/exportTarget`);
 		 *  `workspace` for the absent-key legacy default. */
 		exportBase?: string;
@@ -115,6 +117,15 @@
 		 *  null. Shown in the export section: a target in this state generates
 		 *  nothing on every save, and silence would read as configured-and-working. */
 		exportResolveError?: string | null;
+		/** Constructs in the MARKED cells that make the generated module uncompilable
+		 *  (`$lib/exportHazard`). Rendered as a standing warning: the module IS written,
+		 *  so the export cannot report plain success, and the auto-on-save path has no
+		 *  other surface to say it on. Empty on every ordinary notebook.
+		 *
+		 *  A POSITIVE finding, never a compile verdict - the detected class is narrower
+		 *  than "a module that fails `compile`" - so the copy names the construct it
+		 *  found and no surface may word an empty list as "this module compiles". */
+		exportHazards?: ExportHazard[];
 		/** True while a base re-expression is in flight (the base select is disabled). */
 		exportBaseBusy?: boolean;
 		/** Re-express the stored target under a new base (or record a pre-target choice). */
@@ -232,6 +243,7 @@
 		exportBase = 'workspace',
 		exportResolved = null,
 		exportResolveError = null,
+		exportHazards = [],
 		exportBaseBusy = false,
 		onSetExportBase,
 		root = null,
@@ -695,6 +707,12 @@
 		if (!r) return;
 		if (r.reason === 'no-target') exportFeedback = 'Set a target .py path first.';
 		else if (r.reason === 'no-cells') exportFeedback = 'No cells are marked for export.';
+		// A module that was written but cannot be imported may NOT report plain
+		// success. The standing warning below already carries the full sentence
+		// (this reply and it come from one server-side rule), so the feedback says
+		// what happened and points at it rather than repeating it in the same bar.
+		else if (r.hazards?.length)
+			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but it will not import - see the warning.`;
 		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
 	}
 </script>
@@ -1028,6 +1046,15 @@
 					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-resolve-error">
 						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
 						{exportResolveError}
+					</span>
+				{:else if exportHazards.length}
+					<!-- The module WAS written and will not import. Ranked above the
+					     code-root warning: that one says the kernel cannot reach the
+					     module, this says nothing can. Below `exportResolveError`,
+					     which means no module was written at all. -->
+					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-hazard">
+						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{exportHazards[0].message}
 					</span>
 				{:else if importWarning}
 					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-import-warning">

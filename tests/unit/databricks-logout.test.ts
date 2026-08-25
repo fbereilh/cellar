@@ -304,7 +304,17 @@ describe.skipIf(!python)(`logout purges only what Cellar cached${python ? '' : `
 		const status = await dbx.getStatus();
 		expect(status.signedInHosts).toEqual([]);
 		// Two real SDK subprocesses (one per signed-in workspace) plus the seeds.
-	}, 30_000);
+		//
+		// The allowance is 90s, not the suite default: this is the heaviest test in the
+		// suite (a real `databricks-sdk` python spawn PER signed-in workspace, on top of
+		// the sign-ins and the seeds), and it was MEASURED at ~28.5s alone against a 30s
+		// ceiling - so under the suite's own `cpus - 1` fork contention it timed out on
+		// every full run while passing in isolation, on the base commit as much as on
+		// any branch. That is harness arithmetic, not a defect in `logout()`, and the
+		// same reasoning `vitest.config.ts` records for the 30s default: a genuinely
+		// hung purge still fails, it just no longer fails for being scheduled next to
+		// the rest of the suite.
+	}, 90_000);
 
 	/**
 	 * A derivation MISS must not read as "already clean". The cache key has drifted

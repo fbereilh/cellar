@@ -88,6 +88,21 @@ describe('the sweep rewrites python cells and nothing else', () => {
 		expect(res.added).toEqual(['import os']);
 	});
 
+	it('never alters a STRING RIDER while lifting the import off its line', async () => {
+		// A regression, and a corruption one: the sweep rebuilds the residual with
+		// `kept.join('; ')`, so while the top-level `;` splitter was not string-aware
+		// `import os; sep = "a;b"` came apart into `sep = "a` and `b"` and the cell was
+		// written back as `sep = "a; b"` - a structural edit that was only supposed to
+		// lift the import out, silently changing the user's DATA. The import must still
+		// be lifted; only the rider must survive byte-for-byte.
+		const nb = makeNotebook('rider.ipynb', [{ source: 'import os; sep = "a;b"\nprint(sep)' }]);
+		const res = await imports.consolidateImports(nb);
+		expect(res.changed).toBe(true);
+		const by = Object.fromEntries(nbmod.listCells(nb).map((c) => [c.id, c]));
+		expect(by.cell0.source).toBe('sep = "a;b"\nprint(sep)');
+		expect(res.added).toEqual(['import os']);
+	});
+
 	it('a chat cell that is nothing but an import line is never ADOPTED as the imports cell', async () => {
 		const nb = makeNotebook('adopt.ipynb', [
 			{ source: 'import pandas as pd', cellar: { language: 'chat' } },

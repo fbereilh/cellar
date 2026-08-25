@@ -931,7 +931,13 @@ describe('the tool registration', () => {
 		// writes nothing, so an unqualified "regenerates immediately" is false exactly
 		// where an agent most needs the truth.
 		expect(line).not.toMatch(/[Rr]egenerates the `\.py` immediately/);
-		expect(line).toMatch(/module\.regenerated:false/);
+		// ...and the `module` field must name BOTH things it reports: a module that was
+		// not written, and one that WAS and cannot be imported. Pinned as two claims
+		// rather than as the old `module.regenerated:false` literal, which named only
+		// the first and so could not have caught the second going missing.
+		expect(line).toMatch(/module/);
+		expect(line).toMatch(/NOT written/);
+		expect(line).toMatch(/will not import/);
 		// `cells` names the ADDRESSED cells, which on export:false are the ones NOT
 		// in the module, so the description has to say which direction it means.
 		expect(line).toMatch(/REQUESTED value/);
