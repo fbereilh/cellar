@@ -2167,11 +2167,13 @@ function moduleHazard(target: string, exportTarget: string | null) {
  * `compile` is wider - so an absent `warning` means "none of the checks fired",
  * never "this module compiles"; `$lib/exportHazard` states the measured boundary.
  *
- * That second case is deliberately NOT reported by `setExportTarget`, which shares
- * only `moduleFailure`: naming a target before marking anything is the normal
- * first step of the export flow, so "no cell is marked" there states back what the
- * caller just did rather than a surprise. Here it IS the surprise - this tool's
- * whole subject is which cells are in the module.
+ * That second case - and ONLY that case - is deliberately NOT reported by
+ * `setExportTarget`, which shares `moduleFailure` and `moduleHazard` but not this:
+ * naming a target before marking anything is the normal first step of the export
+ * flow, so "no cell is marked" there states back what the caller just did rather
+ * than a surprise. Here it IS the surprise - this tool's whole subject is which
+ * cells are in the module. Do not read the narrow exclusion as covering the
+ * hazard, which BOTH write tools report.
  *
  * The reason may only state what was VERIFIED, which is what takes the
  * `generatedModuleExists` check: the gate is "a target, and nothing marked", which

@@ -208,9 +208,16 @@ export function stripComments(text: string): string {
  * `stripComments` keeps string bodies verbatim, so a `;` inside a literal used to
  * split the statement around it - `DOC = "a; from __future__ import annotations b"`
  * came apart into two "statements", the second matching `FUTURE_RE`, and the export
- * then warned that a module which compiles perfectly would not import. For the
- * import lines this splitter was first written for the awareness is inert (they
- * hold no strings), so no existing caller's answer moves.
+ * then warned that a module which compiles perfectly would not import.
+ *
+ * It is NOT inert for the caller this splitter was first written for either, and
+ * saying so would UNDER-claim it: `extractTopLevelImports` feeds any indent-0
+ * logical line matching /^(import|from)\s/, which may carry a rider after a `;`,
+ * and it rebuilds the residual with `kept.join('; ')`. So a consolidate over
+ * `import os; sep = "a;b"` used to split the rider into `sep = "a` and `b"` and
+ * write the cell back as `sep = "a; b"` - the user's STRING DATA silently altered
+ * by a structural edit that was only supposed to lift the import out. The string
+ * awareness fixes that too; a line that genuinely holds no string is unaffected.
  */
 export function splitSimpleStatements(code: string): string[] {
 	const parts: string[] = [];

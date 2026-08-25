@@ -11,6 +11,7 @@
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
+	import type { ExportPyResult } from '$lib/types';
 	import {
 		planWindow,
 		pinnedCellIds,
@@ -105,13 +106,7 @@
 		 */
 		onSetExportTarget?: (target: string, opts?: { keepalive?: boolean }) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
-		onExportPy?: () => Promise<{
-			written: boolean;
-			target: string | null;
-			count: number;
-			reason?: string;
-			hazards?: ExportHazard[];
-		} | null>;
+		onExportPy?: () => Promise<ExportPyResult | null>;
 		/** What the stored export path is measured from (`$lib/exportTarget`);
 		 *  `workspace` for the absent-key legacy default. */
 		exportBase?: string;
