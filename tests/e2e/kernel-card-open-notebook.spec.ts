@@ -24,7 +24,10 @@ import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './
  *   4. the per-kernel controls still work and are not triggered by the open
  *      action - and opening does not disturb the kernel;
  *   5. a card whose file was moved out from under its live kernel REPORTS that
- *      and mints no tab.
+ *      and mints no tab;
+ *   6. the row's LAYOUT holds while the controls reveal - the RSS chip does not
+ *      move, it and the controls are never both on screen, the name still gets
+ *      the whole row at rest, and the control cluster sits exactly where it did.
  *
  * Boots the REAL launcher, so it SKIPS without the kernel runtime.
  */
@@ -275,3 +278,119 @@ test('a card whose file moved out from under its kernel reports it and mints no 
 	expect((await tabTitles(page)).length).toBe(tabsBefore);
 	await expect(page.getByTestId('notebook-load-error')).toHaveCount(0);
 });
+
+/**
+ * The row's right slot is SHARED: the RSS chip holds it at rest, the four
+ * controls take it on hover. Both of the ways that can go wrong were real
+ * defects here, one of them shipped in this very change:
+ *   - the controls IN FLOW reserved 102px of a 239px row permanently, so a
+ *     closed card's name got about one character at the default sidebar width;
+ *   - taking them out of flow and reserving the gutter on the name+memory
+ *     WRAPPER shifted the chip ~108px on every hover, and since the padding
+ *     change is instant while the controls fade, the chip slid back under the
+ *     still-fading icons on the way out.
+ * So the invariants are measured, not asserted in prose. Geometry here is
+ * theme-independent by design, which is exactly why both themes are checked - a
+ * token that quietly carried a size would show up as a difference.
+ */
+for (const theme of ['dim', 'cellar-light'] as const) {
+	test(`the row's layout holds while the controls reveal (${theme})`, async ({ page }) => {
+		test.setTimeout(240_000);
+		await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+		await page.getByTestId('tree-file').filter({ hasText: 'alpha.ipynb' }).first().dblclick();
+		await bootKernel(page, 'alpha.ipynb', 'alpha-cell-00', 'alpha_var = 1');
+		await closeTab(page, 'alpha.ipynb');
+		await openKernels(page);
+		await page.evaluate((t) => {
+			document.documentElement.dataset.theme = t;
+		}, theme);
+
+		const row = card(page, 'alpha.ipynb');
+		const chip = row.getByTestId('kernel-memory');
+		const controls = row.getByTestId('kernel-controls');
+		const name = row.getByTestId('kernel-notebook');
+		const opacity = (l: typeof chip) => l.evaluate((el) => getComputedStyle(el).opacity);
+		// The name button's CONTENT edge - what the text is actually allowed to reach.
+		// Its border box is `flex-1` and so cannot move; the gutter lives inside it.
+		const nameContentRight = () =>
+			name.evaluate((el) => el.getBoundingClientRect().right - parseFloat(getComputedStyle(el).paddingRight));
+		await expect(chip).toBeVisible({ timeout: 30_000 });
+
+		// Park the pointer and the caret off the row, so "at rest" really is: the
+		// controls reveal on `:focus-within` as well as `:hover`.
+		await page.mouse.move(0, 0);
+		await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+		await expect.poll(() => opacity(controls)).toBe('0');
+		const restRow = (await row.boundingBox())!;
+		const restChip = (await chip.boundingBox())!;
+		const restName = (await name.boundingBox())!;
+		const restNameRight = await nameContentRight();
+		expect(await opacity(chip)).toBe('1');
+		// At rest the name owns the row - nothing invisible reserves a slot in front
+		// of it. (In flow the control cluster left it ~20px at this sidebar width.)
+		expect(restName.width).toBeGreaterThan(120);
+		expect(await name.evaluate((el) => getComputedStyle(el).paddingRight)).toBe('0px');
+		expect(restNameRight).toBeCloseTo(restChip.x - 8, 0);
+
+		// --- revealed ---
+		await row.hover();
+		await expect.poll(() => opacity(controls)).toBe('1');
+		const hotChip = (await chip.boundingBox())!;
+		// THE headline invariant: the chip's box is identical across the reveal.
+		expect(hotChip.x).toBeCloseTo(restChip.x, 1);
+		expect(hotChip.y).toBeCloseTo(restChip.y, 1);
+		expect(hotChip.width).toBeCloseTo(restChip.width, 1);
+		// …and it is not merely un-moved but OUT of the way, never drawn under the
+		// icons that have taken its slot.
+		expect(await opacity(chip)).toBe('0');
+
+		// The row does not grow, the name button's own box does not move (the gutter
+		// is inside it, which is what keeps the chip still), and the controls sit
+		// exactly where they did: right edge 8px in, vertically centred.
+		const hotRow = (await row.boundingBox())!;
+		expect(hotRow.height).toBeCloseTo(restRow.height, 1);
+		const hotName = (await name.boundingBox())!;
+		expect(hotName.x).toBeCloseTo(restName.x, 1);
+		expect(hotName.width).toBeCloseTo(restName.width, 1);
+		const ctrl = (await controls.boundingBox())!;
+		expect(hotRow.x + hotRow.width - (ctrl.x + ctrl.width)).toBeCloseTo(8, 0);
+		expect(ctrl.y + ctrl.height / 2).toBeCloseTo(hotRow.y + hotRow.height / 2, 0);
+		// What DOES yield is the name's text, which re-truncates clear of the icons.
+		expect(await nameContentRight()).toBeLessThanOrEqual(ctrl.x + 1);
+		expect(restNameRight - (await nameContentRight())).toBeGreaterThan(90);
+
+		// The handoff is SEQUENCED, so the two are never both on screen mid-fade -
+		// each waits out the other's transition. Read off the browser's own resolved
+		// timing rather than sampled frames, which would be a race.
+		const ms = (v: string) => (v.endsWith('ms') ? parseFloat(v) : parseFloat(v) * 1000);
+		const hot = await row.evaluate((el) => {
+			const cs = (sel: string) => getComputedStyle(el.querySelector(`[data-testid="${sel}"]`)!);
+			return {
+				chipDelay: cs('kernel-memory').transitionDelay,
+				chipDuration: cs('kernel-memory').transitionDuration,
+				controlsDelay: cs('kernel-controls').transitionDelay
+			};
+		});
+		// Hovered: the controls wait at least as long as the chip takes to leave.
+		expect(ms(hot.chipDelay)).toBe(0);
+		expect(ms(hot.controlsDelay)).toBeGreaterThanOrEqual(ms(hot.chipDuration));
+
+		// --- back to rest ---
+		await page.mouse.move(0, 0);
+		await expect.poll(() => opacity(controls)).toBe('0');
+		const cold = await row.evaluate((el) => {
+			const cs = (sel: string) => getComputedStyle(el.querySelector(`[data-testid="${sel}"]`)!);
+			return {
+				chipDelay: cs('kernel-memory').transitionDelay,
+				controlsDuration: cs('kernel-controls').transitionDuration
+			};
+		});
+		// At rest: the chip waits at least as long as the controls take to leave.
+		expect(ms(cold.chipDelay)).toBeGreaterThanOrEqual(ms(cold.controlsDuration));
+		// …and it comes all the way back, in the same place.
+		await expect.poll(() => opacity(chip)).toBe('1');
+		const backChip = (await chip.boundingBox())!;
+		expect(backChip.x).toBeCloseTo(restChip.x, 1);
+		expect(backChip.width).toBeCloseTo(restChip.width, 1);
+	});
+}

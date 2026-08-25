@@ -534,7 +534,9 @@
 	//      shows a "not started" card you can watch start on first run.
 	// So shutting down a non-active notebook's kernel drops its card (nothing left
 	// to control), while the notebook you are looking at always has a card. A tab is
-	// matched by path to carry `open` (focus its tab) + `active` (dot it).
+	// matched by path to carry `open` (which only changes what the row CALLS the
+	// action - "Focus" vs "Open") + `active` (dot it); every action a card offers
+	// is addressed by its `path`, so it carries no tab id.
 	const notebookTabFor = (p: string) =>
 		tabs.find((t) => (t.kind === 'notebook' || t.kind === 'ipynb') && t.path === p);
 	// What a card CALLS its notebook - the rule (and why it is not the kernel's own
@@ -545,7 +547,6 @@
 		for (const k of kernels) {
 			const tab = notebookTabFor(k.path);
 			byPath.set(k.path, {
-				id: tab?.id ?? k.path,
 				path: k.path,
 				name: cardName(k.path),
 				open: !!tab,
@@ -564,7 +565,6 @@
 		if (activeNotebookPath && !byPath.has(activeNotebookPath)) {
 			const tab = notebookTabFor(activeNotebookPath);
 			byPath.set(activeNotebookPath, {
-				id: tab?.id ?? activeNotebookPath,
 				path: activeNotebookPath,
 				name: cardName(activeNotebookPath),
 				open: !!tab,

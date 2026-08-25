@@ -49,15 +49,15 @@ export interface KernelListEntry {
 
 /**
  * A Kernels-sidebar card: one per notebook that either has a live kernel OR is
- * open in a tab. `info` drives the status badge (`kernelBadgeClass`); `open`/
- * `active` come from the tab set so a card can focus its tab and dot the focused
- * notebook. `hasKernel` gates the Interrupt/Restart/Shut-down controls, and the
- * card's NAME is its own click target - it opens (or surfaces) `path`.
+ * open in a tab. `info` drives the status badge (`kernelBadgeClass`); `open`
+ * says whether a tab already exists (it only changes what the row CALLS the
+ * action - "Focus" vs "Open") and `active` dots the focused notebook.
+ * `hasKernel` gates the Interrupt/Restart/Shut-down controls. Everything the
+ * card ACTS on is addressed by `path`: the per-kernel controls, and the card's
+ * NAME, which is its own click target and opens (or surfaces) that notebook.
  */
 export interface KernelCard {
-	/** Tab id when open, else the notebook path. */
-	id: string;
-	/** Workspace-relative notebook path (target for the per-kernel controls). */
+	/** Workspace-relative notebook path — the target of every action on the card. */
 	path: string;
 	name: string;
 	open: boolean;

@@ -1,23 +1,34 @@
 /**
  * A Kernels-sidebar card opens its notebook.
  *
- * TWO layers, because they can prove different things. `kernelCardName` is pure
- * and is EXECUTED here - it is the rule that was silently wrong (every card
- * whose tab was closed read `python3`, the kernelspec name, rather than naming
- * a notebook at all). The rest are SOURCE GUARDS: vitest runs without the
- * SvelteKit plugin (`vitest.config.ts`), so neither `Sidebar.svelte` nor
- * `+page.svelte` can be mounted here, and they can only witness that the wiring
- * is DECLARED. The behavioural proof - a click and a keypress really opening the
- * notebook, an already-open one surfaced rather than duplicated, the per-kernel
- * controls unaffected, and a card whose file is gone reporting instead of
- * minting a broken tab - is `tests/e2e/kernel-card-open-notebook.spec.ts`
- * against a real kernel. The guards stay in the unit suite only because e2e runs
- * in neither CI nor the no-mistakes gate, so without them these invariants could
- * regress and merge green.
+ * TWO layers, and they do NOT prove the same thing - read which is which before
+ * trusting either.
  *
- * Deliberately narrow: markup SHAPE (which is what an accessible name and a
- * valid tab order rest on) and which function a handler reaches - never the text
- * of a class list or a tooltip, which break on a reword and pass on dead code.
+ * BEHAVIOUR (the first describe): `kernelCardName` is pure and is EXECUTED here.
+ * It is the rule that was silently wrong - every card whose tab was closed read
+ * `python3`, the kernelspec name, naming no notebook at all - and this is
+ * genuine coverage of it.
+ *
+ * SOURCE SHAPE (every other describe, and each is named so): these READ the
+ * component source. vitest runs without the SvelteKit plugin
+ * (`vitest.config.ts`), so neither `Sidebar.svelte` nor `+page.svelte` can be
+ * mounted here and nothing below can be clicked, focused or rendered. They
+ * witness only that the wiring is DECLARED. They therefore PASS against code
+ * that is never reached, and they can FAIL on a refactor that preserves the
+ * behaviour exactly (extracting a URL into a helper, renaming a local).
+ *
+ * The behavioural proof - a click and a keypress really opening the notebook, an
+ * already-open one surfaced rather than duplicated, the per-kernel controls
+ * unaffected, and a card whose file is gone reporting instead of minting a
+ * broken tab - is `tests/e2e/kernel-card-open-notebook.spec.ts` against a real
+ * kernel. That spec runs in NEITHER CI nor the no-mistakes gate (both run the
+ * vitest suite only), which is the entire reason the shape guards exist: without
+ * them these invariants could be deleted and merge green with no signal at all.
+ *
+ * Deliberately narrow for that reason: markup SHAPE (which is what an accessible
+ * name and a valid tab order rest on) and which function a handler reaches -
+ * never the text of a class list or a tooltip, which break on a reword and pass
+ * on dead code just the same.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -57,7 +68,7 @@ describe('kernelCardName - what a card calls its notebook', () => {
 	});
 });
 
-describe('the kernel row is a real control that opens its notebook', () => {
+describe('SOURCE-SHAPE GUARD: the kernel row declares a real control that opens its notebook', () => {
 	const row = kernelRowSource();
 
 	it('names the notebook with ONE element, a <button>, in both open and closed states', () => {
@@ -110,7 +121,7 @@ describe('the kernel row is a real control that opens its notebook', () => {
 	});
 });
 
-describe('the shell wires the row to the file tree’s own open path', () => {
+describe('SOURCE-SHAPE GUARD: the shell declares the row’s route through the file tree’s open path', () => {
 	it('hands the Sidebar an onOpenNotebook handler', () => {
 		expect(SHELL).toContain('onOpenNotebook={openKernelNotebook}');
 	});
@@ -123,6 +134,13 @@ describe('the shell wires the row to the file tree’s own open path', () => {
 		// It must ASK before minting a tab: a card can outlive its file (a rename
 		// rekeys the document and leaves the kernel registered at the old path), and
 		// opening blind leaves an error-only tab.
+		//
+		// These two witness that the pre-flight and the report are WRITTEN, nothing
+		// more: neither runs the handler, so both pass against a branch that can
+		// never be reached, and moving the URL into a helper or renaming the notice
+		// fails them without changing what a user sees. That the stale card really
+		// reports the server's own reason and mints no tab is asserted for real by
+		// `tests/e2e/kernel-card-open-notebook.spec.ts` (not run in CI or the gate).
 		expect(body).toContain('/api/notebooks?path=');
 		expect(body).toMatch(/showNotice\(/);
 	});
@@ -131,6 +149,12 @@ describe('the shell wires the row to the file tree’s own open path', () => {
 		const start = SHELL.indexOf('const kernelCards =');
 		expect(start).toBeGreaterThan(-1);
 		const body = SHELL.slice(start, SHELL.indexOf('\n\tfunction tabIdFor(', start));
+		// The rule ITSELF is executed by the `kernelCardName` describe above; this
+		// only witnesses that BOTH card-construction branches are declared to call
+		// it (the closed-card branch is the one that read `python3`). It is source
+		// text, so it survives a rename of the `cardName` alias no better than it
+		// would survive the branch becoming unreachable. The rendered label is
+		// asserted against a real closed card in the e2e spec named above.
 		expect(body).not.toMatch(/name:\s*tab\?\.title\s*\|\|\s*k\.name/);
 		expect(body.match(/name: cardName\(/g)?.length).toBe(2);
 	});

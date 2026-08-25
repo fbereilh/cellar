@@ -861,7 +861,8 @@
 	{@const busy = card.info.status === 'busy'}
 	<!-- The hover/focus-revealed control cluster is the ONLY tail state that is out
 	     of flow (see it below); `hoverControls` is true exactly when it is the one
-	     showing, and is what pairs the row's reserved gutter with it. -->
+	     showing, and is what arms the two things that make room for it - the name
+	     button's reserved gutter and the memory chip's opacity handoff. -->
 	{@const hoverControls = card.hasKernel && !acting && confirmWipePath !== card.path}
 	<div
 		class="group relative flex items-center gap-2 rounded-md px-2 py-1 hover:bg-base-300/40 {busy ? 'bg-warning/5' : ''}"
@@ -874,19 +875,19 @@
 			{#if busy}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
 			<span class="relative inline-flex h-2 w-2 rounded-full {kernelDotClass(card.info)}"></span>
 		</span>
-		<!-- Name + memory share the row's flexible space, and share the gutter the
-		     out-of-flow controls need while they are revealed: the `pr` is applied on
-		     HOVER/FOCUS only, so at rest the name has the whole row (in flow the
-		     invisible control slot reserved 102px of a 239px row, which at the
-		     default 256px sidebar left a closed card's name one character) and while
-		     the controls are up it is exactly as wide as it always was. A padding
-		     change re-truncates clipped text; it moves no sibling, so the controls
-		     never shift. -->
-		<div
-			class="flex min-w-0 flex-1 items-center gap-2 {hoverControls
-				? 'group-hover:pr-[6.75rem] group-focus-within:pr-[6.75rem]'
-				: ''}"
-		>
+		<!-- Name + memory share the row's flexible space. The gutter the out-of-flow
+		     controls need is reserved on the NAME BUTTON, not on this wrapper, and
+		     that placement is the whole point: the button is `flex-1`, so its OUTER
+		     width is its share of the free space and its own padding cannot change
+		     it - only the text inside re-truncates. On the wrapper the same padding
+		     shifted the memory chip ~108px on every hover-in/out, and because the
+		     padding change is instant while the controls fade (~150ms) the chip slid
+		     back UNDER the still-fading icons on the way out. So: the chip's box
+		     never moves, and it is instead handed off to the controls by opacity
+		     (below). At rest the name still has the whole row - in flow the invisible
+		     control slot reserved 102px of a 239px row, which at the default 256px
+		     sidebar left a closed card's name one character. -->
+		<div class="flex min-w-0 flex-1 items-center gap-2">
 			<!-- THE CLICK TARGET IS THE NAME, NOT THE ROW — deliberately. The row also
 			     carries four icon buttons, one of them destructive behind a two-step
 			     confirm, so a row-level handler would have to be a `role="button"` div
@@ -903,7 +904,9 @@
 			     visible text is only a filename; the tooltip carries the full PATH,
 			     which is what tells two same-named notebooks apart. -->
 			<button
-				class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary"
+				class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary {hoverControls
+					? 'group-hover:pr-[6.75rem] group-focus-within:pr-[6.75rem]'
+					: ''}"
 				onclick={() => onOpenNotebook?.(card.path)}
 				title="{card.open ? 'Focus' : 'Open'} {card.path} — {card.open
 					? kernelStatusLabel(card.info)
@@ -915,9 +918,21 @@
 				{#if card.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
 				{#if !card.open}<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>{/if}
 			</button>
+			<!-- The RSS figure and the control cluster share the row's right slot, so
+			     one hands off to the other rather than overlapping (the VS Code
+			     explorer rule: a row's metadata yields to its actions on hover). The
+			     handoff is SEQUENCED so the two are never both visible: the chip
+			     fades out over 75ms with the controls delayed by exactly that, and on
+			     the way back the chip waits out the controls' own 150ms fade. Its
+			     BOX never moves - only its opacity - so nothing reflows. Only while
+			     the controls are the tail state: the "not started" chip, the acting
+			     spinner and the wipe confirm are all in FLOW, so they push the chip
+			     left instead of covering it and it stays fully visible. -->
 			{#if cardMemory(card)}
 				<span
-					class="shrink-0 tabular-nums text-[11px] text-base-content/40"
+					class="shrink-0 tabular-nums text-[11px] text-base-content/40 {hoverControls
+						? 'transition-opacity delay-150 duration-75 group-hover:opacity-0 group-hover:delay-0 group-focus-within:opacity-0 group-focus-within:delay-0'
+						: ''}"
 					title="Kernel resident memory (RSS)"
 					data-testid="kernel-memory"
 				>
@@ -954,10 +969,13 @@
 			     keyboard focus. OUT OF FLOW, so an invisible slot cannot eat the row:
 			     in flow it reserved 102px of a 239px row permanently, which at the
 			     default sidebar width left the notebook name a couple of characters.
-			     The name/memory pair reserves the matching gutter while these are up
-			     (above), so nothing overlaps and nothing reflows. -->
+			     The NAME BUTTON reserves the matching gutter while these are up and
+			     the memory chip yields to them by opacity (both above), so nothing
+			     here ever covers something still on screen, and nothing reflows. The
+			     incoming delay is what keeps the two apart: the chip is gone before
+			     these appear, and these are gone before it comes back. -->
 			<div
-				class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
+				class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity delay-0 duration-150 group-hover:opacity-100 group-hover:delay-75 group-focus-within:opacity-100 group-focus-within:delay-75"
 				data-testid="kernel-controls"
 			>
 				<button
