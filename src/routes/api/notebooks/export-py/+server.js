@@ -32,8 +32,12 @@ import {
  *   tab keeps a pre-target base choice locally. Same reply shape, same refusal
  *   split as set-target.
  * POST { op:'export', path?, originId? }             → regenerate the module now
- *   and return `{ written, target, count, reason? }`. A no-op (no target / no
- *   marked cells) reports its `reason` rather than erroring.
+ *   and return `{ written, target, count, reason?, hazards }`. A no-op (no
+ *   target / no marked cells) reports its `reason` rather than erroring.
+ *   `hazards` (`$lib/exportHazard`) names constructs in the marked cells that
+ *   make the written module uncompilable, so the caller cannot report a plain
+ *   success for a file that will not import; it rides on `unchanged` too, and
+ *   an empty list means none of the checks fired, never "the module compiles".
  *
  * `path` is the workspace-relative notebook (defaults to the active one).
  *
