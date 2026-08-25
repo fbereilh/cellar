@@ -261,11 +261,25 @@ function autoExportPy(doc: NotebookDoc): void {
  *
  * Deliberately NOT folded into `notebook:export-target`: that event is about the
  * target, this is about the marked cells' content, and they move independently.
+ *
+ * The comparison is STRICT against the raw field and may never coerce the
+ * `undefined` sentinel to `''`: a doc that has NEVER broadcast is not a doc whose
+ * last broadcast carried no hazards. `loadDoc` never persists, so a notebook that
+ * arrives from disk ALREADY holding a hazard seeds the browser with it through
+ * `getNotebook` -> `exportTargetView` while this field is still unset - and
+ * coerced, the user's FIX (the first persist since load) compared `''` against
+ * `''`, returned here, and left the bar asserting a module will not import after
+ * it had been repaired. The cost of the strict test is exactly ONE extra
+ * empty-hazards event per document lifetime; the change-only rule above exists to
+ * spare an event per KEYSTROKE, not per document. Seeding the key from
+ * `getNotebook` instead is the WRONG repair - that is a READ, served to SSR and
+ * to the agent surface with no browser attached, so it would suppress the event
+ * for a client that never received the seed.
  */
 function publishExportHazards(doc: NotebookDoc): void {
 	const hazards = docExportHazards(doc);
 	const key = hazards.map((h) => h.message).join('\u0000');
-	if (key === (doc.lastExportHazardKey ?? '')) return;
+	if (key === doc.lastExportHazardKey) return;
 	doc.lastExportHazardKey = key;
 	emit(doc, 'notebook:export-hazards', { hazards });
 }

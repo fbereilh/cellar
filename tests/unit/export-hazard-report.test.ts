@@ -12,12 +12,13 @@
  * `export-py-future.test.ts` owns the DETECTION (with `compile()`, and its
  * measured boundary). This file owns the WIRING: the notebook view the export bar
  * renders, the live push that gives the auto-on-save path a UI home at all, the
- * manual export result, and the agent surface - plus source guards on the two
- * Svelte halves, which vitest cannot mount (it runs without the SvelteKit plugin)
- * and which e2e is deliberately absent from CI and the no-mistakes gate for.
+ * manual export result, and the agent surface - plus SOURCE-SHAPE guards on the
+ * two Svelte halves, which prove only that the markup has the expected shape (see
+ * that block's own header; their behaviour lives in
+ * `tests/e2e/export-target-section.spec.ts`).
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -136,6 +137,47 @@ describe('the live push - the auto-on-save export finally has a UI home', () => 
 		expect(stable).toEqual([]);
 	});
 
+	it('clears a hazard the notebook arrived from disk with, without a reload', async () => {
+		// The regression: `loadDoc` never persists, so a notebook OPENED on a hazard has
+		// broadcast nothing yet. Its browser seed comes from `getNotebook`, and the
+		// user's FIX is then the first persist since load. Compared with the unset key
+		// coerced to `''`, that save looked like a no-op and published nothing, so the
+		// bar went on saying the module will not import after it had been repaired.
+		// The existing case above cannot see this: it CREATES the hazard first, so the
+		// clearing save always follows a publish that recorded the key.
+		const name = 'reopened.ipynb';
+		writeFileSync(
+			join(WS, name),
+			JSON.stringify({
+				cells: [
+					{
+						cell_type: 'code',
+						source: [JOINED],
+						metadata: { cellar: { export: true } },
+						outputs: [],
+						execution_count: null,
+						id: 'joined-cell'
+					}
+				],
+				metadata: { cellar: { export_target: 'out/reopened.py' } },
+				nbformat: 4,
+				nbformat_minor: 5
+			})
+		);
+		const target = abs(name);
+
+		// The seed the export bar renders on load - no save has happened yet.
+		expect(nbmod.getNotebook(target).exportHazards).toHaveLength(1);
+
+		const cleared = await captured(() => {
+			nbmod.setSource('joined-cell', 'from __future__ import annotations\nx = 1', target);
+		});
+		expect(cleared).toHaveLength(1);
+		expect(cleared[0].nb).toBe(target);
+		expect(cleared[0].hazards).toEqual([]);
+		expect(nbmod.getNotebook(target).exportHazards).toEqual([]);
+	});
+
 	it('carries no originId, so the tab that typed renders it too', async () => {
 		// DERIVED state, not an echo of one tab's action: an `originId` here would be
 		// echo-suppressed by exactly the tab that just created the hazard.
@@ -219,10 +261,30 @@ describe('the agent surface', () => {
 	});
 });
 
-describe('the two Svelte halves (source guards - vitest cannot mount them)', () => {
+/**
+ * SOURCE-SHAPE guards - NOT behavioural coverage.
+ *
+ * These read component text and assert that the expected markup and branches are
+ * PRESENT and in the expected order. They prove SHAPE and nothing more: an
+ * inverted `{:else if}` condition, a branch that can never be reached, or a
+ * wrongly-derived value would all still pass, and a reformat would fail them for
+ * no defect at all.
+ *
+ * They are kept because they are the only CI-VISIBLE evidence these surfaces
+ * exist: vitest here runs without the SvelteKit plugin, so the components cannot
+ * be mounted, and Playwright e2e is deliberately absent from both CI and the
+ * no-mistakes gate - so a rule left only as a template expression could be
+ * deleted and merge green. Same precedent as `defaultProfileNoticeApplies` and
+ * `databricks-upload-card.test.ts`.
+ *
+ * The BEHAVIOUR of every rule below is exercised by
+ * `tests/e2e/export-target-section.spec.ts`, in its test "a module that will not
+ * import says so in the bar, live, and clears when fixed".
+ */
+describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 	const read = (rel: string) => readFileSync(new URL(`../../src/${rel}`, import.meta.url), 'utf8');
 
-	it('the export bar renders the hazard, ranked below an unresolvable target', () => {
+	it('the export bar markup carries the hazard arm, ordered below an unresolvable target', () => {
 		const src = read('lib/Notebook.svelte');
 		expect(src).toContain('data-testid="export-hazard"');
 		expect(src).toContain('exportHazards[0].message');
@@ -234,7 +296,7 @@ describe('the two Svelte halves (source guards - vitest cannot mount them)', () 
 		expect(chain.indexOf('exportHazards.length')).toBeLessThan(chain.indexOf('importWarning'));
 	});
 
-	it('neither manual-export surface reports a broken module as a plain success', () => {
+	it('both manual-export surfaces branch on hazards ahead of the success wording', () => {
 		// `doExport`'s feedback line and the shell's notice are the two places a manual
 		// export is spoken. Both branch on hazards BEFORE the success wording.
 		const nb = read('lib/Notebook.svelte');
@@ -248,7 +310,7 @@ describe('the two Svelte halves (source guards - vitest cannot mount them)', () 
 		expect(notice.indexOf('r.hazards?.length')).toBeLessThan(notice.indexOf('showNotice(`Exported'));
 	});
 
-	it('LiveNotebook seeds the hazards on load AND applies the live event', () => {
+	it('LiveNotebook mentions the load seed and the live event in its dispatcher', () => {
 		const src = read('lib/LiveNotebook.svelte');
 		expect(src).toContain('body.notebook.exportHazards');
 		expect(src).toContain("ev.type === 'notebook:export-hazards'");

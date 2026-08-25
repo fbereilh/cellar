@@ -159,6 +159,12 @@ export interface NotebookDoc {
 	 * doc, joined into one comparison key. Held ONLY so `publishExportHazards` can
 	 * tell a change from a no-op - the hazards themselves are always recomputed
 	 * fresh, so nothing ever reads a stale value out of this.
+	 *
+	 * ABSENT means nothing has been broadcast YET, which is NOT the same as having
+	 * broadcast no hazards (`''`) - a doc loaded from disk already holding one
+	 * seeds the browser through `getNotebook` without ever publishing. Compare
+	 * strictly; coercing the sentinel swallows the event that CLEARS such a
+	 * hazard.
 	 */
 	lastExportHazardKey?: string;
 }
