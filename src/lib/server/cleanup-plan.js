@@ -7,6 +7,34 @@
  * flags at all, silently killed a live notebook session (kernel, namespace, hours
  * of work) in a folder the caller had never opened. Observed, not theoretical.
  *
+ * ---- Why this change is larger than the bug that was reported --------------
+ *
+ * That eviction turned out to be ONE SYMPTOM of a broader pattern in this
+ * command: a value the user typed is silently discarded or silently reinterpreted,
+ * so the tool operates on a different workspace from the one the user believes
+ * they named — and under `-y` it proceeds without ever saying so. Five further
+ * instances were found and closed while fixing the reported one:
+ *
+ *   - an unrecognised POSITIONAL was silently dropped, so `cellar cleanup <path>
+ *     --all` reaped the caller's own cwd instead of the path they named;
+ *   - a REPEATED `-w` was silently first-wins, so a corrected typo left on the
+ *     line stopped the first directory and reported the second as "elsewhere";
+ *   - an EMPTY `-w` value fell through to the caller's cwd, so an unset `$WS` in
+ *     a wrapper script stopped whatever folder the script was sitting in;
+ *   - a `-w` NAMING NOTHING (a typo, or a regular file) made `--all` a silent
+ *     no-op while the workspace actually meant kept running;
+ *   - and running `--all` from a SUBDIRECTORY of your own project misfiled your
+ *     OWN live instance as somebody else's, then offered the cross-workspace flag
+ *     as the remedy — training the user to reach for the wide hammer to clean
+ *     their own project, when the wide hammer is what destroyed a live session.
+ *     A safety mechanism whose failure mode is teaching people to bypass it is
+ *     worse than none.
+ *
+ * The first four are refused up front (see `parseCleanupArgs` in bin/cellar.js);
+ * the last is fixed here, by `resolveCallerWorkspace`. The policy for this whole
+ * command is now REFUSE-DON'T-GUESS: anything unexpected stops it, before
+ * anything is pruned or signalled.
+ *
  * The policy is a pure decision so it can be unit-tested without processes: the
  * launcher gathers facts (registry entries + a `ps` scan), this decides what may
  * die, and only then does anything get signalled.
@@ -42,6 +70,13 @@
  * safe use of realpath — and it is required, because the registry records the
  * path as it was resolved at launch while cleanup resolves the caller's cwd, and
  * on macOS every `/tmp` and `/var/folders` workspace has two spellings.
+ *
+ * CONTAINMENT enters at exactly ONE point and it is a different question:
+ * `resolveCallerWorkspace` answers "which workspace am I standing in", by walking
+ * UP from the caller's directory to the deepest registered workspace containing
+ * it. The per-entry comparison in `planCleanup` stays an IDENTITY test against
+ * that resolved answer — so containment can widen which directory counts as
+ * "mine", and can never widen which ENTRIES a given directory reaches.
  *
  * A comparison that FAILS (unreadable path, a workspace since deleted) falls back
  * to the lexical string. That fails in the safe direction by construction: two
@@ -111,6 +146,53 @@ export function workspaceKey(p) {
 	// Keep a bare root ('/'), strip a trailing separator anywhere else.
 	while (out.length > 1 && out.endsWith(sep)) out = out.slice(0, -1);
 	return out;
+}
+
+/**
+ * Is `dir` inside `ws` (or the same directory)? Boundary-safe: a sibling that
+ * merely shares a name prefix (`/tmp/projX` vs `/tmp/proj`) is NOT inside.
+ *
+ * Both sides must already be canonical keys (`workspaceKey`). Realpathing one
+ * side of a prefix test and not the other is the trap this repo's worktree-roots
+ * guidance warns about: the two spellings of a `/tmp` path would never share a
+ * prefix, so containment would silently never fire.
+ *
+ * @param {string} dir
+ * @param {string} ws
+ */
+function isInside(dir, ws) {
+	return ws !== '' && (dir === ws || dir.startsWith(ws + sep));
+}
+
+/**
+ * Which workspace is the caller standing in?
+ *
+ * Running `cellar cleanup --all` from `~/proj/notebooks` rather than `~/proj` is
+ * ordinary, and an identity-only answer misfiled the caller's OWN live instance
+ * as somebody else's — then pointed them at `--all-workspaces`, the phrase-gated
+ * cross-workspace flag, to clean their own project. Teaching the wide hammer for
+ * a routine task is the worst possible failure mode for this feature, since the
+ * wide hammer is what destroyed a live session.
+ *
+ * So the caller's workspace is the DEEPEST registered workspace that IS the
+ * caller's directory or an ANCESTOR of it, else the caller's directory unchanged.
+ * Deepest-wins is what keeps a nested project from over-reaching: standing in
+ * `/proj/a/b` with both `/proj` and `/proj/a` registered resolves to `/proj/a`,
+ * so `/proj`'s instance stays elsewhere. It walks UP only, never down — a
+ * workspace nested INSIDE the caller's directory is a different project, not
+ * theirs to stop.
+ *
+ * @param {string} callerKey canonical key of the directory the command runs in
+ * @param {Iterable<string>} workspaceKeys canonical keys of registered workspaces
+ * @returns {string} the canonical key of the workspace the caller is in
+ */
+export function resolveCallerWorkspace(callerKey, workspaceKeys = []) {
+	if (!callerKey) return '';
+	let best = '';
+	for (const ws of workspaceKeys) {
+		if (isInside(callerKey, ws) && ws.length > best.length) best = ws;
+	}
+	return best || callerKey;
 }
 
 /**

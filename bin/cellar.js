@@ -93,7 +93,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline';
@@ -151,7 +151,7 @@ import {
 	scanUntrackedCellarProcesses,
 	isIsolatedEnv
 } from '../src/lib/server/instances.js';
-import { CONFIRM_PHRASE, planCleanup, workspaceKey } from '../src/lib/server/cleanup-plan.js';
+import { CONFIRM_PHRASE, planCleanup, resolveCallerWorkspace, workspaceKey } from '../src/lib/server/cleanup-plan.js';
 import { resolveWorkspacePorts } from '../src/lib/server/ports.js';
 import { buildFreshness, stalenessReason, SKIP_ENV } from '../src/lib/server/build-freshness.js';
 
@@ -759,6 +759,15 @@ function callerDir() {
  *            workspace:string|undefined, confirm:string|undefined}
  *          | {ok:false, errors:string[]}}
  */
+/** Does this path name an existing directory? Never throws. */
+function isExistingDir(p) {
+	try {
+		return statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
 function parseCleanupArgs(flags) {
 	// Declared HERE, not at module scope: `cellar cleanup` is dispatched near the
 	// top of this file, long before a module-level `const` further down would have
@@ -810,6 +819,20 @@ function parseCleanupArgs(flags) {
 			// with `$WS` unset would otherwise fall back to whatever folder the
 			// script happened to be sitting in and stop THAT one's live session.
 			if (val === '') return refuse(`[cellar] ${tok} needs a directory, but got an empty value.`);
+			// A value that NAMES NOTHING is refused too, and the silence there is
+			// total: a typo would make `--all` stop nothing at all while the
+			// workspace the user meant keeps running and they walk away believing it
+			// was cleaned. No nearest-match guessing — this command stops processes.
+			//
+			// Scoped to the caller-supplied target ONLY. `workspaceKey`'s lexical
+			// fallback must stay for REGISTRY entries: the registry deliberately
+			// outlives a deleted workspace so deleted-worktree orphans stay reapable,
+			// and such an entry still needs a key. Do not "restore" a fallback here.
+			// Accepted cost: `-w <deleted dir>` no longer scopes a cleanup — bare
+			// `cellar cleanup` already reaps orphans at every tier regardless of
+			// workspace, and `reapVanishedWorkspaces` covers it on the next launch.
+			if (!isExistingDir(val))
+				return refuse(`[cellar] ${tok} names no directory: ${val}`);
 			if (out.workspace !== undefined)
 				return refuse(
 					`[cellar] ${tok} was given more than once: ${out.workspace} and ${val}`,
@@ -882,7 +905,7 @@ async function cleanupCommand(flags) {
 	// `??`, not `||`: the parser refuses an empty `-w` value, so a workspace that is
 	// PRESENT is always a usable directory string and `undefined` means exactly "no
 	// -w was given". A `||` here would silently paper over an empty one instead.
-	const here = workspaceKey(args.workspace ?? callerDir());
+	const callerKey = workspaceKey(args.workspace ?? callerDir());
 	const scope = args.allWorkspaces ? 'everywhere' : args.all ? 'workspace' : 'orphans';
 	const dryRun = args.dryRun;
 	const yes = args.yes || !!process.env.CI || !process.stdin.isTTY;
@@ -898,9 +921,17 @@ async function cleanupCommand(flags) {
 
 	// 2) Gather facts, then decide (the decision is pure and unit-tested).
 	const entries = await Promise.all(listInstances().map(annotateInstance));
+	// Standing in a SUBDIRECTORY of your own project still means you are in that
+	// project, so the caller's directory is resolved UP to the workspace that
+	// contains it before anything is classified. Without this, `--all` run from
+	// `~/proj/notebooks` reported `~/proj`'s own session as somebody else's and
+	// offered the cross-workspace flag to reach it.
+	const here = resolveCallerWorkspace(callerKey, entries.map((e) => workspaceKey(e.workspace)));
 	const plan = planCleanup({ entries, untracked: scanUntrackedCellarProcesses(), workspace: here, scope });
 
-	console.log(`[cellar] workspace: ${here || '(unknown)'}`);
+	console.log(
+		`[cellar] workspace: ${here || '(unknown)'}` + (here && here !== callerKey ? ` (you are in ${callerKey})` : '')
+	);
 
 	if (plan.reap.length === 0 && plan.killPids.length === 0) {
 		console.log(

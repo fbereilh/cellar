@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, mkdirSync, symlinkSync, realpathSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { planCleanup, workspaceKey, CONFIRM_PHRASE } from '../../src/lib/server/cleanup-plan';
+import { planCleanup, resolveCallerWorkspace, workspaceKey, CONFIRM_PHRASE } from '../../src/lib/server/cleanup-plan';
 
 /**
  * `cellar cleanup --all` must not be able to stop a live session in a workspace
@@ -195,6 +195,62 @@ describe('planCleanup — untracked processes', () => {
 		const plan = planCleanup({ untracked: [liveProc], workspace: here, scope: 'everywhere' });
 		expect(plan.killPids).toEqual([liveProc.pid]);
 		expect(plan.crossWorkspace).toBe(true);
+	});
+});
+
+describe('the caller is in their own workspace even from a subdirectory', () => {
+	// Identity-only, this misfiled the caller's OWN live instance as somebody
+	// else's and then offered `--all-workspaces` — the phrase-gated cross-workspace
+	// flag — as the way to reach it. Teaching the wide hammer for a routine tidy is
+	// the worst failure mode this feature can have.
+	const live = (workspace: string) => ({ launcherPid: 1, launcherAlive: true, workspace });
+
+	it('REGRESSION: --all from a subdirectory reaps the workspace that contains it', () => {
+		const proj = mkdtempSync(join(tmpdir(), 'cellar-proj-'));
+		const sub = join(proj, 'notebooks');
+		mkdirSync(sub);
+		try {
+			const entry = live(proj);
+			const here = resolveCallerWorkspace(workspaceKey(sub), [workspaceKey(proj)]);
+			const plan = planCleanup({ entries: [entry], workspace: here, scope: 'workspace' });
+			expect(plan.reap).toEqual([entry]);
+			expect(plan.skippedElsewhere).toEqual([]);
+		} finally {
+			rmSync(proj, { recursive: true, force: true });
+		}
+	});
+
+	it('resolves to the DEEPEST registered ancestor, so a nested project keeps its own', () => {
+		// /proj and /proj/a both registered, caller in /proj/a/b/c -> /proj/a.
+		const here = resolveCallerWorkspace('/proj/a/b/c', ['/proj', '/proj/a']);
+		expect(here).toBe('/proj/a');
+		const outer = { launcherPid: 1, launcherAlive: true, workspace: '/proj' };
+		const inner = { launcherPid: 2, launcherAlive: true, workspace: '/proj/a' };
+		const plan = planCleanup({ entries: [outer, inner], workspace: here, scope: 'workspace' });
+		expect(plan.reap).toEqual([inner]);
+		expect(plan.skippedElsewhere).toEqual([outer]);
+	});
+
+	it('walks UP only — a workspace nested inside the caller is a different project', () => {
+		expect(resolveCallerWorkspace('/proj', ['/proj/nested'])).toBe('/proj');
+		const nested = { launcherPid: 1, launcherAlive: true, workspace: '/proj/nested' };
+		const plan = planCleanup({ entries: [nested], workspace: '/proj', scope: 'workspace' });
+		expect(plan.reap).toEqual([]);
+		expect(plan.skippedElsewhere).toEqual([nested]);
+	});
+
+	it('is boundary-safe: a sibling sharing a name prefix is not an ancestor', () => {
+		expect(resolveCallerWorkspace('/tmp/projX', ['/tmp/proj'])).toBe('/tmp/projX');
+	});
+
+	it('leaves the caller directory alone when no registered workspace contains it', () => {
+		expect(resolveCallerWorkspace('/tmp/proj/notebooks', ['/somewhere/else'])).toBe('/tmp/proj/notebooks');
+		expect(resolveCallerWorkspace('/tmp/proj', [])).toBe('/tmp/proj');
+		expect(resolveCallerWorkspace('', ['/tmp/proj'])).toBe('');
+	});
+
+	it('an exactly-registered caller directory stays itself', () => {
+		expect(resolveCallerWorkspace('/tmp/proj', ['/tmp', '/tmp/proj'])).toBe('/tmp/proj');
 	});
 });
 

@@ -317,6 +317,73 @@ describe('cellar cleanup — scope + consent', () => {
 		expect(pidAlive(theirs!)).toBe(true);
 	});
 
+	it('REGRESSION: --all from a SUBDIRECTORY stops this workspace, not "elsewhere"', async () => {
+		// Running the tidy from `~/proj/notebooks` rather than `~/proj` is ordinary.
+		// It used to report the caller's OWN live session as somebody else's and
+		// point at the cross-workspace flag to reach it.
+		const sub = join(wsMine, 'notebooks');
+		mkdirSync(sub, { recursive: true });
+		const r = spawnSync(process.execPath, [CLI, 'cleanup', '--all', '-y'], {
+			encoding: 'utf8',
+			cwd: sub,
+			input: '',
+			env: { ...process.env, HOME: home, PATH: `${shim}:${process.env.PATH}`, CI: '' }
+		});
+		await sleep(300);
+		expect(r.status).toBe(0);
+		expect(pidAlive(mine!)).toBe(false); // mine: recognised as mine, stopped
+		expect(pidAlive(theirs!)).toBe(true); // theirs: still never mine to stop
+	});
+
+	it('REGRESSION: refuses a --workspace that names no directory', async () => {
+		// A typo used to make `--all` a silent no-op: the key matched no entry, so
+		// nothing was stopped and the workspace actually meant kept running while
+		// the caller walked away believing it had been cleaned.
+		const missing = join(wsMine, 'no-such-dir-here');
+		const r = cleanup(['-w', missing, '--all', '-y']);
+		await sleep(200);
+		expect(r.status).toBe(1);
+		expect(r.stderr).toContain(missing);
+		expect(pidAlive(mine!)).toBe(true);
+		expect(pidAlive(theirs!)).toBe(true);
+	});
+
+	it('refuses a --workspace pointing at a regular file', async () => {
+		const file = join(wsMine, 'not-a-dir.txt');
+		writeFileSync(file, 'x');
+		const r = cleanup(['-w', file, '--all', '-y']);
+		await sleep(200);
+		expect(r.status).toBe(1);
+		expect(r.stderr).toContain(file);
+		expect(pidAlive(mine!)).toBe(true);
+		expect(pidAlive(theirs!)).toBe(true);
+	});
+
+	it('still reaps an orphan whose workspace directory is GONE', async () => {
+		// The `-w` refusal above must not reach the ENTRY side: the registry
+		// deliberately outlives a deleted workspace so a deleted worktree's orphans
+		// stay reapable, which is the case that produces them in the first place.
+		const vanished = mkdtempSync(join(tmpdir(), 'cellar-ws-vanished-'));
+		const orphanPid = await spawnVictim();
+		registerInstance({
+			launcherPid: 2147480006, // launcher "gone" → its app is a reapable orphan
+			appPid: orphanPid,
+			appStart: processStartTime(orphanPid)!,
+			workspace: vanished,
+			startedAt: Date.now()
+		});
+		rmSync(vanished, { recursive: true, force: true });
+		try {
+			const r = cleanup(['-y']);
+			await sleep(300);
+			expect(r.status).toBe(0);
+			expect(pidAlive(orphanPid)).toBe(false);
+			expect(readInstance(2147480006)).toBeNull();
+		} finally {
+			killVictim(orphanPid);
+		}
+	});
+
 	it('accepts a repeated BOOLEAN flag — the refusal is scoped, not blanket', async () => {
 		// `--all --all` discards no value the user typed, so changing nothing is the
 		// honest outcome; over-refusing is its own annoyance. It must behave exactly
