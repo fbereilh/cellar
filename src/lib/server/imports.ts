@@ -192,29 +192,49 @@ export function stripComments(text: string): string {
 }
 
 /**
- * Split on top-level `;` (never inside brackets), dropping empty parts - so a BARE
- * TRAILING semicolon yields one statement, not two. Import statements hold no
- * strings, so this does not need the string awareness `logicalLines` has.
+ * Split on top-level `;` - never inside brackets, and never inside a STRING -
+ * dropping empty parts, so a BARE TRAILING semicolon yields one statement, not two.
  *
  * Exported so a caller that must tell a genuinely JOINED statement from a bare
  * trailing `;` asks THIS splitter rather than a second `includes(';')` scan.
  * `export-py.ts` needs exactly that: refusing to hoist a `__future__` import over a
  * trailing semicolon closed nothing (there is no rider to reorder) and left the
  * uncompilable module the hoist exists to remove.
+ *
+ * The string awareness is `skipString`, the same helper `logicalLines` and
+ * `stripComments` scan with, so all three agree on where a literal begins and ends
+ * (all four quote forms, prefixes and escapes included). It is NOT optional and it
+ * is not only for tidiness: a caller feeds this ARBITRARY exported-cell source, and
+ * `stripComments` keeps string bodies verbatim, so a `;` inside a literal used to
+ * split the statement around it - `DOC = "a; from __future__ import annotations b"`
+ * came apart into two "statements", the second matching `FUTURE_RE`, and the export
+ * then warned that a module which compiles perfectly would not import. For the
+ * import lines this splitter was first written for the awareness is inert (they
+ * hold no strings), so no existing caller's answer moves.
  */
 export function splitSimpleStatements(code: string): string[] {
 	const parts: string[] = [];
 	let depth = 0;
 	let cur = '';
-	for (const ch of code) {
+	let k = 0;
+	while (k < code.length) {
+		const ch = code[k];
+		if (ch === '"' || ch === "'") {
+			const e = skipString(code, k);
+			cur += code.slice(k, e);
+			k = e;
+			continue;
+		}
 		if (OPEN.includes(ch)) depth++;
 		else if (CLOSE.includes(ch) && depth > 0) depth--;
 		if (ch === ';' && depth === 0) {
 			parts.push(cur);
 			cur = '';
+			k++;
 			continue;
 		}
 		cur += ch;
+		k++;
 	}
 	parts.push(cur);
 	return parts.map((p) => p.trim()).filter(Boolean);

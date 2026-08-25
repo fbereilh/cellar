@@ -179,6 +179,40 @@ describe('generateModule — hoisting module-level __future__ imports', () => {
 		expect(expy.exportHazards(['a = 1; b = 2'])).toEqual([]);
 	});
 
+	it('reports NOTHING for a `;` that sits INSIDE a string literal', () => {
+		// The splitter behind this check is fed ARBITRARY exported-cell source, and
+		// `stripComments` keeps string bodies verbatim - so a `;` inside a literal used
+		// to split the statement around it and the trailing fragment matched
+		// `FUTURE_RE`. That warned "the module will not import" about a module that
+		// compiles, which is the false-claim class this feature exists to remove with
+		// the sign flipped, and unclearable except by editing a perfectly valid string.
+		expect(expy.exportHazards(['DOC = "run it; from __future__ import annotations is not allowed here"'])).toEqual([]);
+		expect(expy.exportHazards(["DOC = 'a; from __future__ import annotations b'"])).toEqual([]);
+		// Same root cause on a longer logical line: the `;` merely falls BEFORE the
+		// future-import text rather than after it, which is all the committed
+		// triple-quoted case above happened to avoid.
+		expect(expy.exportHazards(['S = """hold on; from __future__ import annotations later"""'])).toEqual([]);
+		expect(expy.exportHazards(['S = """line one\nhold on; from __future__ import annotations later\n"""'])).toEqual([]);
+	});
+
+	it('still reports the genuinely JOINED line - the string fix narrows, never disables', () => {
+		expect(expy.exportHazards(['from __future__ import annotations; x = 1'])).toHaveLength(1);
+		// ...even when a string sits on the same line, so the awareness cannot be read
+		// as "any line holding a quote is exempt".
+		expect(expy.exportHazards(['from __future__ import annotations; x = "a;b"'])).toHaveLength(1);
+	});
+
+	it('HOISTS unchanged around a string holding a semicolon', () => {
+		// The hoist path was never harmed by the mis-split (`parts.length !== 1` only
+		// meant "do not hoist", which was already right), so the fix must not move it:
+		// the future import still lifts and the string cell is emitted untouched.
+		const inString = 'X = "a;b"';
+		const out = expy.generateModule(['from __future__ import annotations\nY = 1', inString], 'demo.ipynb');
+		expect(out.indexOf('from __future__ import annotations')).toBeLessThan(out.indexOf('__all__'));
+		expect(out).toContain(inString);
+		expect(expy.exportHazards([inString])).toEqual([]);
+	});
+
 	it('HOISTS a BARE trailing semicolon - there is no rider to reorder', () => {
 		const out = expy.generateModule(['from __future__ import annotations;\nX = 1'], 'demo.ipynb');
 		expect(out.indexOf('from __future__ import annotations')).toBeLessThan(out.indexOf('__all__'));
@@ -290,6 +324,26 @@ describe.skipIf(!HAS_PY)('the exported module really COMPILES (python3; skipped 
 		} as never);
 		expect(res.written).toBe(true);
 		expect(pythonVerdict(readFileSync(join(WS, res.target!), 'utf8')).compiles).toBe(true);
+	});
+
+	it('compiles a cell whose STRING holds a `;` and future-import text, and reports no hazard', () => {
+		// The two halves of the same claim, driven together: the module python really
+		// does compile, and the export really does say nothing about it. Asserting the
+		// empty hazards alone would not show the warning had been FALSE.
+		const sources = [
+			'DOC = "run it; from __future__ import annotations is not allowed here"',
+			'S = """hold on; from __future__ import annotations later"""',
+			'def f(x): return x'
+		];
+		const res = expy.exportNotebookToPy({
+			...(docWith(sources) as any),
+			metadata: { cellar: { export_target: 'out/string-semicolon.py' } }
+		} as never);
+		expect(res.written).toBe(true);
+		expect(res.hazards).toEqual([]);
+		const v = pythonVerdict(readFileSync(join(WS, res.target!), 'utf8'));
+		expect(v.error).toBe('');
+		expect(v.compiles).toBe(true);
 	});
 
 	it('compiles when the future import carries a semicolon in its comment', () => {

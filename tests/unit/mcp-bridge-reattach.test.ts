@@ -325,6 +325,10 @@ function fakeStdio() {
  * harness arithmetic `vitest.config.ts` records for its 30s default, one layer in.
  * Kept under the 30s vitest budget so a real hang still surfaces as this file's
  * own error rather than as an opaque suite timeout.
+ *
+ * SCOPE: the poll-until helpers ONLY. A call site whose timeout IS the assertion -
+ * the wedged-instance case below, which proves the re-handshake send is BOUNDED -
+ * must keep its own explicit, tight number, or a partially-regressed bound passes.
  */
 const POLL_MS = 15_000;
 
@@ -1005,7 +1009,7 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		// The agent's next call must come back promptly rather than hang. 3s is far
 		// under undici's default and far over the injected 200ms bound, so it fails
 		// only if the send is genuinely unbounded.
-		const reply = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, POLL_MS);
+		const reply = await stdio.request({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, 3000);
 		expect(reply.error).toMatchObject({ code: NO_INSTANCE_ERROR_CODE });
 		expect(wedged.seen.some((m) => m.method === 'initialize')).toBe(true);
 		// The bridge is untouched and still relaying, ready to heal on the next launch.
