@@ -631,7 +631,7 @@ Cleanup options (cellar cleanup …):
                           --yes / -y / CI / a piped stdin do NOT satisfy it.
   --confirm=<phrase>      supply that confirmation non-interactively
   --dry-run               print exactly what would be stopped, then exit
-  --workspace <dir>, -w   treat <dir> as "this workspace" (default: cwd)
+  --workspace <dir>, -w   treat <dir> as "this workspace" (default: cwd's project)
   --yes, -y               skip the y/N prompt for the routine (non-cross-workspace)
                           stops only
 
