@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { runMcpBridge, NO_INSTANCE_ERROR_CODE, provesNotDelivered } from '../../src/lib/server/mcp-bridge.js';
-import { writeRuntime, clearRuntime, isInstanceAlive } from '../../src/lib/server/runtime.js';
+import { writeRuntime, clearRuntime, pidAlive } from '../../src/lib/server/runtime.js';
 
 /**
  * `cellar mcp` re-attaches across a Cellar restart.
@@ -269,11 +269,17 @@ function startFakeCellar(
 /** The agent-facing half: lets a test inject messages and read what came back. */
 function fakeStdio() {
 	const sent: Record<string, unknown>[] = [];
+	// `runMcpBridge` starts its stdio transport as the LAST step of coming up, and
+	// only once the startup `attach()` has succeeded - so this flag is the exact
+	// moment the bridge is ready to relay. See `startBridge`, which waits for it.
+	let started = false;
 	const t = {
 		onmessage: undefined as ((m: unknown) => void) | undefined,
 		onerror: undefined as ((e: Error) => void) | undefined,
 		onclose: undefined as (() => void) | undefined,
-		start: async () => {},
+		start: async () => {
+			started = true;
+		},
 		close: async () => {},
 		send: async (m: Record<string, unknown>) => {
 			sent.push(m);
@@ -282,6 +288,8 @@ function fakeStdio() {
 	return {
 		transport: t,
 		sent,
+		/** True once the bridge has finished coming up and started this transport. */
+		started: () => started,
 		/** Everything the bridge has sent down for one id - the count is the point. */
 		repliesFor: (id: unknown) => sent.filter((m) => m.id === id),
 		/** Deliver a message without waiting, so several can be in flight at once. */
@@ -413,6 +421,44 @@ async function deadPort(): Promise<number> {
 	return port;
 }
 
+/**
+ * The liveness probe the bridge is given here: `isInstanceAlive` with its
+ * STOPWATCH taken out, and nothing else changed.
+ *
+ * That stopwatch is a FLAKE, and it is the bridge's own branch selector. The real
+ * probe aborts its GET after 1500ms of WALL CLOCK and reports the abort as "not
+ * alive" - but every fake instance, every proxy and the bridge itself share this
+ * worker's ONE event loop, and the unit suite forks per CPU with each fork
+ * spawning again, so under full-suite load that budget expires for an instance
+ * that was listening the whole time (measured: a single probe here taking 392ms
+ * on a contended run, an order of magnitude over its quiet-machine cost). Nothing
+ * about a timer is the contract under test, but the answer decides which branch
+ * the bridge takes, so the lie landed as a different assertion failure depending
+ * on where it struck - a startup `attach()` giving up (`onFatal(1)`), `deliver`'s
+ * one-reading `instanceGone()` minting a second session against a live instance,
+ * or the heal's corroborated gate convicting one.
+ *
+ * Untimed, the same GET answers on the SIGNAL instead: a served port responds, an
+ * unbound one refuses at once (every port here is one or the other), and a
+ * contended worker makes the verdict LATE rather than WRONG - which the poll-until
+ * helpers already absorb. The request, and therefore the latency shape the
+ * concurrent-relay cases interleave against, is unchanged.
+ */
+async function probeInstance(rt: unknown): Promise<boolean> {
+	const r = rt as { mcpPort?: number; pid?: number } | null | undefined;
+	if (!r || !r.mcpPort) return false;
+	// The pid half of the real rule is kept as-is: a test that swaps in a
+	// genuinely-alive pid leans on it (the same-port replacement case).
+	if (!pidAlive(r.pid)) return false;
+	try {
+		// Any answer is proof, exactly as in `mcpPortResponds`.
+		await fetch(`http://127.0.0.1:${r.mcpPort}/mcp`, { method: 'GET' });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /** Poll until `fn` is true, so a test never leans on a fixed sleep. */
 async function until(fn: () => boolean, timeoutMs = POLL_MS) {
 	const deadline = Date.now() + timeoutMs;
@@ -477,14 +523,28 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 			},
 			// Silence the bridge's stderr diagnostics; the assertions read behavior.
 			log: () => {},
+			// See `probeInstance`: the real probe's own 1500ms wall clock is what
+			// made this file shed a different test per contended run. A test whose
+			// SUBJECT is a particular verdict still scripts its own, below.
+			isAliveFn: (rt: unknown) => probeInstance(rt),
 			// Keep the corroboration re-check quick so a test is not paced by it; the
 			// RULE under test is the number of consecutive readings, not the gap.
 			healConfirmDelayMs: 20,
 			...opts
 		});
 		stopBridge = () => stdio.transport.onclose?.();
-		// Give the initial attach a moment to settle.
-		await new Promise((r) => setTimeout(r, 50));
+		// WAIT FOR THE SIGNAL, never a fixed delay. This used to sleep 50ms for the
+		// startup attach - but `runMcpBridge` awaits its liveness probe BEFORE it
+		// wires `stdio.onmessage`, and `fakeStdio.post`/`request` drop a message
+		// silently while that is undefined. On a contended machine that probe alone
+		// took hundreds of milliseconds, so the very first `stdio.request(INIT)`
+		// vanished and the test then waited out its whole poll budget - "no reply
+		// for id 1 within 15000ms", the shape this file shed under full-suite load.
+		// `start()` is the bridge's last step of coming up, so it is the honest
+		// readiness signal; `fatal` is the other terminal outcome, and waiting for
+		// either means a startup that genuinely fails still reports as itself
+		// rather than hanging here.
+		await until(() => stdio.started() || fatal !== undefined);
 		return { stdio, done, fatal: () => fatal, inFlight };
 	}
 
@@ -910,7 +970,7 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 					stalledReadings--;
 					return false;
 				}
-				return isInstanceAlive(rt as never);
+				return probeInstance(rt);
 			}
 		});
 		await stdio.request(INIT);
@@ -946,7 +1006,7 @@ describe('cellar mcp bridge - surviving a Cellar restart', () => {
 		const cellar = await bootCellar();
 		let unreachable = false;
 		const { stdio, inFlight } = await startBridge({
-			isAliveFn: async (rt: unknown) => (unreachable ? false : isInstanceAlive(rt as never))
+			isAliveFn: async (rt: unknown) => (unreachable ? false : probeInstance(rt))
 		});
 		await stdio.request(INIT);
 

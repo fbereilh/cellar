@@ -35,6 +35,8 @@
 	import type { SearchCache } from '$lib/search';
 	import type { SearchHighlightState } from '$lib/searchHighlight';
 	import type { Folding } from '$lib/headings';
+	import { kernelCardName } from '$lib/kernelBadge';
+	import { reasonWithoutServerPath } from '$lib/serverMessage';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import { isBlameUnavailable, activeBlameFor, type BlameReport } from '$lib/blame';
 	import { reorderTabs as reorderTabList } from '$lib/tabReorder';
@@ -533,17 +535,21 @@
 	//      shows a "not started" card you can watch start on first run.
 	// So shutting down a non-active notebook's kernel drops its card (nothing left
 	// to control), while the notebook you are looking at always has a card. A tab is
-	// matched by path to carry `open` (focus its tab) + `active` (dot it).
+	// matched by path to carry `open` (which only changes what the row CALLS the
+	// action - "Focus" vs "Open") + `active` (dot it); every action a card offers
+	// is addressed by its `path`, so it carries no tab id.
 	const notebookTabFor = (p: string) =>
 		tabs.find((t) => (t.kind === 'notebook' || t.kind === 'ipynb') && t.path === p);
+	// What a card CALLS its notebook - the rule (and why it is not the kernel's own
+	// name) lives in `$lib/kernelBadge`.
+	const cardName = (p: string) => kernelCardName(p, notebookTabFor(p)?.title);
 	const kernelCards = $derived.by<KernelCard[]>(() => {
 		const byPath = new Map<string, KernelCard>();
 		for (const k of kernels) {
 			const tab = notebookTabFor(k.path);
 			byPath.set(k.path, {
-				id: tab?.id ?? k.path,
 				path: k.path,
-				name: tab?.title || k.name,
+				name: cardName(k.path),
 				open: !!tab,
 				active: k.path === activeNotebookPath,
 				hasKernel: true,
@@ -560,9 +566,8 @@
 		if (activeNotebookPath && !byPath.has(activeNotebookPath)) {
 			const tab = notebookTabFor(activeNotebookPath);
 			byPath.set(activeNotebookPath, {
-				id: tab?.id ?? activeNotebookPath,
 				path: activeNotebookPath,
-				name: tab?.title || activeNotebookPath,
+				name: cardName(activeNotebookPath),
 				open: !!tab,
 				active: true,
 				hasKernel: false,
@@ -708,6 +713,117 @@
 			if (!tabs.find((t) => t.id === id)) tabs = [...tabs, makeTab(path, false, kind)];
 		}
 		if (!tabs.some((t) => t.id === activeTabId)) activeTabId = id;
+	}
+
+	// A Kernels-sidebar card's row action: show me the notebook this kernel belongs
+	// to. It routes to `openFilePermanent`, the SAME path the file tree's
+	// double-click uses, rather than a second open implementation - so an already
+	// open tab is promoted out of preview and focused (never duplicated), and one
+	// that is already active is a no-op: assigning the identical `activeTabId`
+	// changes nothing, so nothing reloads.
+	//
+	// The one thing this adds is a PRE-FLIGHT for the stale card. A kernel card can
+	// outlive its file: `POST /api/fs/op` shuts a kernel down only on DELETE, so a
+	// RENAME or MOVE rekeys the live document (`rekeyDocs`) and leaves the kernel
+	// registered under the old path - a card naming a notebook that can no longer
+	// be loaded. Minting a tab for it would leave an error-only tab the user has to
+	// close, so we ask the server whether the notebook can load at all first.
+	//
+	// `GET /api/notebooks` is exactly the right predicate, and the reason it is not
+	// a cheap `stat` is that "loadable" is broader than "on disk": a notebook whose
+	// file was removed OUTSIDE Cellar still has its live in-memory document (a
+	// closed tab does not drop it), and that document is the user's unsaved state -
+	// refusing to open it would strand exactly what they need to get back. The cost
+	// is one extra load of a notebook the tab is about to load anyway, paid only on
+	// a deliberate click on a card with no tab; it also warms the document cache, so
+	// the tab's own load is a `docs` hit with no disk read.
+	async function openKernelNotebook(path: string) {
+		if (tabs.find((t) => t.id === tabIdFor(path))) {
+			openFilePermanent(path);
+			return;
+		}
+		// A REFUSAL is a claim the SERVER made about this notebook, and it names a
+		// remedy that tears down the very kernel this action exists to give back -
+		// so it may only be said when the server actually answered about it.
+		const refuse = (why: string) =>
+			showNotice(
+				`Cannot open ${path}: ${why}. Its kernel is still running - shut it down from the Kernels list if the notebook is gone.`
+			);
+		// NO VERDICT: claim nothing about the notebook, name no remedy, mint no tab.
+		// We still do not know whether it is loadable. (The `unreachable` stance the
+		// file-tab and Databricks paths take, applied to every non-answer.)
+		const noVerdict = (why: string) => showNotice(`Could not open ${path}: ${why}.`);
+		const unreachable = (err: unknown) =>
+			noVerdict(`could not reach Cellar (${(err as Error)?.message ?? err})`);
+		// Both pre-flight routes answer a verdict ONLY as their own `error(400, …)`
+		// shape - a JSON body carrying a string `message`. Anything else (a proxy
+		// 502/503, an HTML error page, a 404 from a mismatched route) never reached
+		// the handler, so it says nothing about the notebook. One helper for both,
+		// so a third pre-flight cannot re-derive the rule differently.
+		const verdictReason = async (r: Response): Promise<string | null> => {
+			if (r.status !== 400) return null;
+			const body = await r.json().catch(() => null);
+			return typeof body?.message === 'string' ? body.message : null;
+		};
+
+		// THE CANONICAL NOTEBOOK IS THE ONE PATH WHERE "loadable" IS TOO BROAD.
+		// `loadDoc` MATERIALISES a starter document for it when the file is missing
+		// (that is what lets an empty workspace render a shell at all), so the load
+		// below answers 200 for a canonical notebook that has been renamed away -
+		// and would mint a tab holding one empty cell under the old name, whose
+		// first run writes `notebook.ipynb` back to disk under the very name the
+		// user renamed. So this path additionally requires the FILE, asked before
+		// the load so the click cannot even leave a starter document behind.
+		// The narrowing is real and only here: a canonical notebook whose file was
+		// deleted OUTSIDE Cellar is refused too, where a non-canonical one still
+		// opens from its live in-memory document.
+		if (path === canonicalNotebookRel) {
+			let st: Response;
+			try {
+				st = await fetch(`/api/fs/file/stat?path=${encodeURIComponent(path)}`);
+			} catch (err) {
+				unreachable(err);
+				return;
+			}
+			if (!st.ok) {
+				// The stat's own reason names an absolute path and nothing else, so the
+				// verdict is reported as the flat fact rather than forwarded.
+				if ((await verdictReason(st)) === null) {
+					noVerdict(`Cellar did not answer (HTTP ${st.status})`);
+					return;
+				}
+				refuse('notebook not found');
+				return;
+			}
+		}
+
+		let res: Response;
+		try {
+			res = await fetch(`/api/notebooks?path=${encodeURIComponent(path)}`);
+		} catch (err) {
+			unreachable(err);
+			return;
+		}
+		if (!res.ok) {
+			const reason = await verdictReason(res);
+			if (reason === null) {
+				noVerdict(`Cellar did not answer (HTTP ${res.status})`);
+				return;
+			}
+			// The server's own reason, with any ABSOLUTE path stripped out: `loadDoc`
+			// throws `'notebook not found: ' + abs`, and every other surface in this UI
+			// addresses a notebook workspace-relative (the `refuse` template above
+			// already names it that way). Same rule GitNotebooks' `unreadable` follows;
+			// here the explanation is worth keeping, so only the path goes.
+			refuse(reasonWithoutServerPath(reason) || 'the notebook could not be loaded');
+			return;
+		}
+		// The check answered "this IS a live notebook", so seed the `.py` kind cache
+		// with that verdict: `resolveTabKind`'s own jupytext probe READS the file, so
+		// a `.py` whose document is in memory but whose file is gone would otherwise
+		// fall back to a text tab - a broken tab of a different shape.
+		if (isPyPath(path)) pyKindCache.set(path, 'ipynb');
+		openFilePermanent(path);
 	}
 
 	function promoteTab(id: string) {
@@ -1664,6 +1780,7 @@
 					onOpenFile={openFile}
 					onOpenFilePermanent={openFilePermanent}
 					onFocusNotebook={selectTab}
+					onOpenNotebook={openKernelNotebook}
 					onScrollToCell={scrollToCell}
 					onOpenFindBar={openFindBar}
 					onFsChange={handleFsChange}
