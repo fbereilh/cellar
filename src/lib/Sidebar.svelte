@@ -875,16 +875,21 @@
 			{#if busy}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
 			<span class="relative inline-flex h-2 w-2 rounded-full {kernelDotClass(card.info)}"></span>
 		</span>
-		<!-- Name + memory share the row's flexible space. The gutter the out-of-flow
-		     controls need is reserved on the NAME BUTTON, not on this wrapper, and
-		     that placement is the whole point: the button is `flex-1`, so its OUTER
-		     width is its share of the free space and its own padding cannot change
-		     it - only the text inside re-truncates. On the wrapper the same padding
-		     shifted the memory chip ~108px on every hover-in/out, and because the
-		     padding change is instant while the controls fade (~150ms) the chip slid
-		     back UNDER the still-fading icons on the way out. So: the chip's box
-		     never moves, and it is instead handed off to the controls by opacity
-		     (below). At rest the name still has the whole row - in flow the invisible
+		<!-- Name + memory share the row's flexible space. The room the out-of-flow
+		     controls need is reserved INSIDE the name button, by an empty `::after`
+		     flex item that appears only while they are up - never as padding on this
+		     wrapper and never as padding on the button, and that is the whole point:
+		     both of those move the memory chip. On the wrapper the gutter shifted it
+		     ~108px at every width. On the button it is subtler and bites only on a
+		     narrow sidebar: `box-sizing: border-box` floors a flex item's used size
+		     at padding+border, so once the button's share of the row drops under the
+		     108px gutter the button stops shrinking and pushes the `shrink-0` chip
+		     right (below a sidebar of roughly 210px, inside the resizer's 180-560px
+		     range). A spacer that lives in the button's OWN content layout has no
+		     such floor: the button's outer width is its share of the free space and
+		     nothing inside it can change that, so the chip's box is where it is
+		     whatever the width. At rest the spacer is `display:none`, so it costs
+		     neither width nor a flex gap and the name has the whole row - in flow the
 		     control slot reserved 102px of a 239px row, which at the default 256px
 		     sidebar left a closed card's name one character. -->
 		<div class="flex min-w-0 flex-1 items-center gap-2">
@@ -904,8 +909,8 @@
 			     visible text is only a filename; the tooltip carries the full PATH,
 			     which is what tells two same-named notebooks apart. -->
 			<button
-				class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary {hoverControls
-					? 'group-hover:pr-[6.75rem] group-focus-within:pr-[6.75rem]'
+				class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary after:hidden after:shrink-0 after:basis-[6.75rem] after:content-[''] {hoverControls
+					? 'group-hover:after:block group-focus-within:after:block'
 					: ''}"
 				onclick={() => onOpenNotebook?.(card.path)}
 				title="{card.open ? 'Focus' : 'Open'} {card.path} — {card.open
@@ -927,7 +932,14 @@
 			     BOX never moves - only its opacity - so nothing reflows. Only while
 			     the controls are the tail state: the "not started" chip, the acting
 			     spinner and the wipe confirm are all in FLOW, so they push the chip
-			     left instead of covering it and it stays fully visible. -->
+			     left instead of covering it and it stays fully visible.
+			     STATED RESIDUAL, at the narrow end of the resizer only: the reserved
+			     room is `shrink-0`, so once the button is narrower than the gutter it
+			     overflows the button rather than moving anything, and what is left of
+			     the name (and, on a closed card, the `closed` chip) can sit partly
+			     under the icons instead of truncating clear of them - measured from
+			     about a 210px sidebar down. Pre-existing at those widths and strictly
+			     better than the padding it replaced, which ALSO moved the chip. -->
 			{#if cardMemory(card)}
 				<span
 					class="shrink-0 tabular-nums text-[11px] text-base-content/40 {hoverControls
@@ -969,13 +981,32 @@
 			     keyboard focus. OUT OF FLOW, so an invisible slot cannot eat the row:
 			     in flow it reserved 102px of a 239px row permanently, which at the
 			     default sidebar width left the notebook name a couple of characters.
-			     The NAME BUTTON reserves the matching gutter while these are up and
-			     the memory chip yields to them by opacity (both above), so nothing
-			     here ever covers something still on screen, and nothing reflows. The
-			     incoming delay is what keeps the two apart: the chip is gone before
-			     these appear, and these are gone before it comes back. -->
+			     The name button reserves the matching room while these are up and the
+			     memory chip yields to them by opacity (both above), so nothing here
+			     covers something still on screen, and nothing reflows. The incoming
+			     delay is what keeps the two apart: the chip is gone before these
+			     appear, and these are gone before it comes back.
+			     `pointer-events-none` AT REST IS LOAD-BEARING, not tidiness: `opacity:
+			     0` hides a box but does not stop it hit-testing, and as a positioned
+			     later sibling this one is hit-tested ABOVE the name button it is drawn
+			     over - so without it an at-rest click on the tail of a long name, or
+			     on the RSS figure, landed on Restart or Shut down, neither of which
+			     asks for confirmation.
+			     IT IS TRANSITIONED, NOT FLIPPED ON `:hover`, and that is the half
+			     that is easy to get wrong: a mouse click necessarily hovers first, so
+			     switching it on with `:hover` hands the click to an icon that is still
+			     invisible - the same misfire one moment later. `transition-discrete`
+			     puts `pointer-events` on the SAME transition as the opacity, so it
+			     turns on halfway through the reveal and off halfway through the fade:
+			     hit-testable only while visible. A browser without
+			     `transition-behavior` simply flips it on hover, which is still
+			     strictly better than an always-live overlay.
+			     None of this can cost the reveal: `group-hover` keys off the ROW's
+			     `:hover`, which a child declining pointer events does not affect (the
+			     pointer simply reaches the row underneath), and focusability is
+			     untouched, so the keyboard route is unchanged. -->
 			<div
-				class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity delay-0 duration-150 group-hover:opacity-100 group-hover:delay-75 group-focus-within:opacity-100 group-focus-within:delay-75"
+				class="pointer-events-none absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-[opacity,pointer-events] transition-discrete delay-0 duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-hover:delay-75 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-focus-within:delay-75"
 				data-testid="kernel-controls"
 			>
 				<button
