@@ -701,6 +701,27 @@ function planLine(e) {
 }
 
 /**
+ * The directory the command is being run in, or '' when there is no longer one.
+ *
+ * `process.cwd()` THROWS (ENOENT / uv_cwd) once the working directory has been
+ * removed — and a deleted worktree is precisely the case that PRODUCES the
+ * orphans cleanup exists to reap (the registry lives in `$HOME` so it survives
+ * the workspace going away). So this must not be the thing that stops the tidy.
+ *
+ * '' is the right fallback and the only safe one: `planCleanup` guards on
+ * `workspace !== ''`, so an unknown caller directory leaves `liveHere` empty —
+ * orphans are still reaped everywhere, and `--all` becomes inert rather than
+ * reaching for a live session it cannot show belongs to the caller.
+ */
+function callerDir() {
+	try {
+		return process.cwd();
+	} catch {
+		return '';
+	}
+}
+
+/**
  * `cellar cleanup` — reap dead / orphaned instances, and (only when asked)
  * stop live ones.
  *
@@ -736,7 +757,7 @@ async function cleanupCommand(flags) {
 
 	const wsIdx = flags.findIndex((a) => a === '--workspace' || a === '-w');
 	const wsArg = wsIdx !== -1 ? flags[wsIdx + 1] : undefined;
-	const here = workspaceKey(wsArg || process.cwd());
+	const here = workspaceKey(wsArg || callerDir());
 
 	const everywhere = flags.includes('--all-workspaces');
 	const scope = everywhere ? 'everywhere' : flags.includes('--all') ? 'workspace' : 'orphans';
@@ -819,12 +840,22 @@ async function cleanupCommand(flags) {
 }
 
 /**
- * Say what was deliberately left running, and how to reach it.
+ * Say what was deliberately left running, and name the FLAG that would reach it.
  *
  * Silence here would make the narrowed `--all` look like it had stopped
  * everything, which is the failure this whole change is about — the old command
  * was dangerous precisely because its blast radius was invisible. Printed only
  * when something really was skipped, so an ordinary tidy stays quiet.
+ *
+ * The flag, and never `CONFIRM_PHRASE`: this is the ROUTINE output of the SAFE
+ * forms (`cellar cleanup`, `cellar cleanup --all`), and handing the
+ * deliberate-intent token to someone who did not ask for the wider scope defeats
+ * the whole mechanism — the original incident was an agent tidying its own
+ * leftovers, and printing it a copy-pasteable command to repeat it would have our
+ * own tool supplying the proof of intent. A confirmation phrase you are given
+ * unprompted is not a confirmation. Discoverability already lives where it
+ * belongs: `--help` documents the phrase, and the refusal hands it over on the
+ * one path that has already chosen the wider scope.
  */
 function reportSkipped(plan) {
 	const here = plan.skippedHere.length;
@@ -844,9 +875,7 @@ function reportSkipped(plan) {
 		for (const e of plan.skippedElsewhere) console.log(line(e));
 		for (const u of plan.skippedUntracked)
 			console.log(`  live   pid=${u.pid} (untracked, workspace unknown)  ${u.command}`);
-		console.log(
-			`[cellar]   stop these too with: cellar cleanup --all-workspaces --confirm=${CONFIRM_PHRASE}`
-		);
+		console.log('[cellar]   reaching these needs the wider scope: cellar cleanup --all-workspaces');
 	}
 }
 

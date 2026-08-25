@@ -197,12 +197,11 @@ describe('planCleanup — untracked processes', () => {
 });
 
 describe('CONFIRM_PHRASE', () => {
-	it('is a phrase no auto-approval can produce', () => {
-		// The point of a phrase over y/N: --yes / -y / CI=1 / a piped stdin all mean
-		// "don't ask me about the routine thing", and none of them can spell this.
+	it('is the exact literal the help text and docs hand out', () => {
+		// A contract pin: `--help`, the refusal message and docs/SETUP.md all spell
+		// this out, so it may not drift silently. That no auto-approval can SUPPLY
+		// it is a property of the command, pinned against the real CLI in
+		// cleanup-command.test.ts (`-y` / `CI=1` do NOT unlock --all-workspaces).
 		expect(CONFIRM_PHRASE).toBe('stop-all-workspaces');
-		for (const auto of ['y', 'yes', 'Y', 'YES', 'true', '1', '']) {
-			expect(auto).not.toBe(CONFIRM_PHRASE);
-		}
 	});
 });

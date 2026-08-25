@@ -150,6 +150,12 @@ describe('cellar cleanup — scope + consent', () => {
 		// dangerous precisely because its blast radius was invisible.
 		expect(r.stdout).toMatch(/left running elsewhere/i);
 		expect(r.stdout).toContain(wsTheirs);
+		// It names the FLAG that would reach them, and never the phrase. This IS the
+		// incident's own shape — an agent tidying its leftovers — so printing it a
+		// ready-to-run cross-workspace command would have our own tool supplying the
+		// deliberate intent the phrase exists to demand.
+		expect(r.stdout).toMatch(/cellar cleanup --all-workspaces/);
+		expect(r.stdout).not.toContain(CONFIRM_PHRASE);
 	});
 
 	it('REGRESSION: a plain --all (no -y, non-TTY) cannot reach the other workspace', async () => {
@@ -168,8 +174,9 @@ describe('cellar cleanup — scope + consent', () => {
 		expect(pidAlive(theirs!)).toBe(true);
 		expect(r.status).toBe(0);
 		// …and it points at the flag that WOULD stop the caller's own instance,
-		// so the safe tier stays discoverable.
+		// so the safe tier stays discoverable — still without the phrase.
 		expect(r.stdout).toMatch(/cellar cleanup --all\b/);
+		expect(r.stdout).not.toContain(CONFIRM_PHRASE);
 	});
 
 	it('REGRESSION: -y does NOT unlock --all-workspaces', async () => {
@@ -254,6 +261,46 @@ describe('cellar cleanup — scope + consent', () => {
 			expect(pidAlive(theirs!)).toBe(true);
 		} finally {
 			killVictim(orphanPid);
+		}
+	});
+
+	it('REGRESSION: still tidies when the working directory has been deleted', async () => {
+		// A removed worktree is exactly what leaves orphans behind — the registry
+		// lives in $HOME so it outlives the folder — and `process.cwd()` throws
+		// there, so cleanup died with an unhandled ENOENT before printing anything.
+		// The one situation that PRODUCES orphans was the one that could not reap
+		// them.
+		const gone = mkdtempSync(join(tmpdir(), 'cellar-ws-gone-'));
+		const orphanPid = await spawnVictim();
+		registerInstance({
+			launcherPid: 2147480002, // launcher "gone" → its app is an orphan
+			appPid: orphanPid,
+			appStart: processStartTime(orphanPid)!,
+			workspace: wsTheirs,
+			startedAt: Date.now()
+		});
+		try {
+			// Node cannot be SPAWNED into a missing directory, it has to inherit one:
+			// delete the cwd out from under a live shell, then exec the CLI in it.
+			const r = spawnSync(
+				'/bin/sh',
+				['-c', 'cd "$1" && rmdir "$1" && exec "$2" "$3" cleanup -y', 'sh', gone, process.execPath, CLI],
+				{
+					encoding: 'utf8',
+					input: '',
+					env: { ...process.env, HOME: home, PATH: `${shim}:${process.env.PATH}`, CI: '' }
+				}
+			);
+			await sleep(300);
+			expect(r.stderr).not.toMatch(/uv_cwd|ENOENT/);
+			expect(r.status).toBe(0);
+			expect(pidAlive(orphanPid)).toBe(false);
+			// …and an unknowable cwd claims nothing: neither live instance is touched.
+			expect(pidAlive(mine!)).toBe(true);
+			expect(pidAlive(theirs!)).toBe(true);
+		} finally {
+			killVictim(orphanPid);
+			rmSync(gone, { recursive: true, force: true });
 		}
 	});
 });
