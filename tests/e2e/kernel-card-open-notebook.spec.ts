@@ -265,9 +265,12 @@ test('a card whose file moved out from under its kernel reports it and mints no 
 
 	const tabsBefore = (await tabTitles(page)).length;
 	await stale.click();
-	// It SAYS so, on the shell's transient status line…
+	// It SAYS so, on the shell's transient status line - and says WHY, which is the
+	// server's own reason rather than a bare status code (the path alone would pass
+	// against a message that told the user nothing).
 	await expect(page.getByTestId('app-notice')).toBeVisible({ timeout: 15_000 });
 	await expect(page.getByTestId('app-notice')).toContainText('beta.ipynb');
+	await expect(page.getByTestId('app-notice')).toContainText('not found');
 	// …and leaves no tab behind - not even one rendering a load error.
 	expect((await tabTitles(page)).length).toBe(tabsBefore);
 	await expect(page.getByTestId('notebook-load-error')).toHaveCount(0);
