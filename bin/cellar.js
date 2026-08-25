@@ -30,9 +30,16 @@
  *                                   in place; `--strip` also removes it).
  *   cellar ls                       list known cellar instances (registry +
  *                                   untracked orphans) with liveness.
- *   cellar cleanup [--all] [-y]     reap dead/orphaned instances (launcher gone,
- *                                   app still listening); --all also stops every
- *                                   live instance across all workspaces.
+ *   cellar cleanup [options]        reap dead/orphaned instances (launcher gone,
+ *                                   app still listening) — anywhere, at every
+ *                                   scope. `--all` additionally stops LIVE
+ *                                   instances serving THIS workspace;
+ *                                   `--all-workspaces` stops live instances in
+ *                                   ANY workspace and needs an explicit typed
+ *                                   confirmation (`-y` cannot supply it), because
+ *                                   that is somebody's running session. See
+ *                                   src/lib/server/cleanup-plan.js for the rule.
+ *                                   `--dry-run` prints the plan and stops nothing.
  *
  * Flags:
  *   --help / -h                 print this usage message and exit
@@ -86,7 +93,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline';
@@ -144,6 +151,7 @@ import {
 	scanUntrackedCellarProcesses,
 	isIsolatedEnv
 } from '../src/lib/server/instances.js';
+import { CONFIRM_PHRASE, planCleanup, resolveCallerWorkspace, workspaceKey } from '../src/lib/server/cleanup-plan.js';
 import { resolveWorkspacePorts } from '../src/lib/server/ports.js';
 import { buildFreshness, stalenessReason, SKIP_ENV } from '../src/lib/server/build-freshness.js';
 
@@ -586,7 +594,7 @@ Usage:
   cellar mcp [options]        stdio <-> HTTP MCP bridge for the running instance
   cellar harness <cmd>        configure an AI coding agent to use Cellar's tools
   cellar ls                   list known cellar instances with liveness
-  cellar cleanup [options]    reap dead / orphaned instances
+  cellar cleanup [options]    reap dead / orphaned instances (see Cleanup options)
 
 Subcommands:
   mcp        zero-config agent connection: bridge stdio to the live instance
@@ -598,7 +606,8 @@ Subcommands:
                              every start. Merges; never clobbers existing config.
              remove <name…>  stop managing one (--strip also removes its entry)
   ls         list registered + untracked cellar instances and whether each is alive
-  cleanup    reap dead/orphaned instances; --all also stops every live instance
+  cleanup    reap dead/orphaned instances anywhere; stopping a LIVE instance is
+             opt-in and scoped to a workspace (see Cleanup options below)
 
 Options:
   --help, -h              print this usage message and exit
@@ -612,6 +621,20 @@ Options:
   --no-mcp-config         do not write/merge <workspace>/.mcp.json
   --new / --force         start a second instance in a folder that already has one
 
+Cleanup options (cellar cleanup …):
+  (no flags)              reap dead + orphaned instances only; never stops a live one
+  --all                   also stop LIVE instances serving THIS workspace
+  --all-workspaces        also stop LIVE instances in ANY workspace. Someone else
+                          may be working in them, so this needs an explicit
+                          confirmation: type "stop-all-workspaces" when asked,
+                          or pass --confirm=stop-all-workspaces to script it.
+                          --yes / -y / CI / a piped stdin do NOT satisfy it.
+  --confirm=<phrase>      supply that confirmation non-interactively
+  --dry-run               print exactly what would be stopped, then exit
+  --workspace <dir>, -w   treat <dir> as "this workspace" (default: cwd's project)
+  --yes, -y               skip the y/N prompt for the routine (non-cross-workspace)
+                          stops only
+
 Environment:
   CELLAR_ISOLATED=1       run isolated (no global registry, no reaping) — for
                           CI / automated launches (applies to every launch; a
@@ -621,7 +644,11 @@ Examples:
   cellar                    start Cellar in the current directory
   cellar ../other-repo      start Cellar scoped to another repo
   cellar harness add codex  point Codex at Cellar's MCP server for this project
-  cellar --update           update Cellar to the latest version`);
+  cellar --update           update Cellar to the latest version
+  cellar cleanup            reap dead/orphaned instances (safe; touches no live one)
+  cellar cleanup --all      also stop the live instance in this folder
+  cellar cleanup --dry-run --all-workspaces
+                            show every live instance cleanup could stop, stop none`);
 }
 
 async function listInstancesCommand() {
@@ -646,61 +673,364 @@ async function listInstancesCommand() {
 	}
 }
 
-async function cleanupCommand(flags) {
-	const all = flags.includes('--all');
-	const yes = flags.includes('--yes') || flags.includes('-y') || !!process.env.CI || !process.stdin.isTTY;
-	const log = (m) => console.log(m);
+/**
+ * Prompt for a literal phrase (not y/N). Resolves the trimmed answer, or null
+ * when stdin gives no answer at all. Deliberately distinct from `promptYesNo`:
+ * a phrase is what makes the cross-workspace kill unreachable by a stray `-y`.
+ */
+function promptPhrase(question) {
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	return new Promise((res) => {
+		let settled = false;
+		const finish = (v) => {
+			if (settled) return;
+			settled = true;
+			rl.close();
+			res(v);
+		};
+		rl.on('close', () => finish(null));
+		rl.on('error', () => finish(null));
+		rl.question(question, (ans) => finish(String(ans ?? '').trim()));
+	});
+}
 
-	// 1) Prune fully-dead registry entries (no live process at all).
-	const pruned = await pruneDeadInstances({ log });
-	if (pruned.length) console.log(`[cellar] pruned ${pruned.length} dead registry entr(ies).`);
+/** One printable line describing a registry entry in the cleanup plan. */
+function planLine(e) {
+	const state = e.launcherAlive ? 'live  ' : 'orphan';
+	return `  ${state} launcher=${e.launcherPid} app=${e.appPid ?? '?'} appPort=${e.appPort ?? '?'} age=${fmtAge(e.startedAt)} ${e.workspace ?? '(workspace unknown)'}`;
+}
 
-	// 2) Decide what to reap.
-	const entries = await Promise.all(listInstances().map(annotateInstance));
-	const orphanRegistered = entries.filter((e) => !e.launcherAlive && (e.appAlive || e.appResponds));
-	const liveRegistered = entries.filter((e) => e.launcherAlive);
-	const untracked = scanUntrackedCellarProcesses();
-	// Untracked orphans = reparented to init (ppid 1); safe — no launcher owns them.
-	const untrackedOrphans = untracked.filter((u) => u.ppid === 1);
-	const untrackedOther = untracked.filter((u) => u.ppid !== 1);
+/**
+ * The directory the command is being run in, or '' when there is no longer one.
+ *
+ * `process.cwd()` THROWS (ENOENT / uv_cwd) once the working directory has been
+ * removed — and a deleted worktree is precisely the case that PRODUCES the
+ * orphans cleanup exists to reap (the registry lives in `$HOME` so it survives
+ * the workspace going away). So this must not be the thing that stops the tidy.
+ *
+ * '' is the right fallback and the only safe one: `planCleanup` guards on
+ * `workspace !== ''`, so an unknown caller directory leaves `liveHere` empty —
+ * orphans are still reaped everywhere, and `--all` becomes inert rather than
+ * reaching for a live session it cannot show belongs to the caller.
+ */
+function callerDir() {
+	try {
+		return process.cwd();
+	} catch {
+		return '';
+	}
+}
 
-	const toReap = [...orphanRegistered];
-	const toKillPids = untrackedOrphans.map((u) => u.pid);
-	if (all) {
-		toReap.push(...liveRegistered);
-		toKillPids.push(...untrackedOther.map((u) => u.pid));
+/**
+ * Parse `cellar cleanup`'s arguments in ONE pass into a typed result, refusing
+ * anything unexpected.
+ *
+ * REFUSE-DON'T-GUESS is the whole rule here, and it is not fussiness: this
+ * command stops processes, so every way an argument can be silently
+ * reinterpreted is a way to stop the WRONG workspace — its live launcher, its
+ * kernel, its unsaved state — while the user believes they named another one,
+ * and under `-y` it proceeds without ever saying so. That is the exact failure
+ * this whole change exists to end, so it is refused wherever it can appear:
+ *
+ *   - a POSITIONAL is refused, never accepted as a workspace and never ignored.
+ *     `cellar cleanup <path> --all` used to drop the path and reap the caller's
+ *     cwd. Accepting a path is a deliberate design decision with its own scoping
+ *     and confirmation questions, and inferring it from a bug report is how a
+ *     second version of this incident gets built; `-w <dir>` / `--workspace
+ *     <dir>` is the supported way to name another workspace.
+ *   - a MISSING or FLAG-SHAPED `-w` value is refused. It used to be swallowed as
+ *     a path while the flag it ate still selected a scope.
+ *   - a REPEATED `-w` is refused rather than first-wins. A corrected typo left on
+ *     the line, or a wrapper appending `-w` to args that already carry one, would
+ *     otherwise stop the first directory while the one the user actually meant is
+ *     reported as merely "left running elsewhere".
+ *
+ * Parsing and reading the values are ONE pass on purpose: they used to be a
+ * validation loop followed by a `findIndex`, and the gap between them — the two
+ * disagreeing about which token is a value — was itself the `-w` bug.
+ *
+ * A repeated BOOLEAN flag (`--all --all`, `-y -y`) is deliberately fine: it
+ * discards no value the user typed, so changing nothing is the honest outcome.
+ * The class refused here is "a value you typed was silently dropped", not
+ * "an argument appears twice".
+ *
+ * @param {string[]} flags
+ * @returns {{ok:true, all:boolean, allWorkspaces:boolean, dryRun:boolean, yes:boolean,
+ *            workspace:string|undefined, confirm:string|undefined}
+ *          | {ok:false, errors:string[]}}
+ */
+/** Does this path name an existing directory? Never throws. */
+function isExistingDir(p) {
+	try {
+		return statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+function parseCleanupArgs(flags) {
+	// Declared HERE, not at module scope: `cellar cleanup` is dispatched near the
+	// top of this file, long before a module-level `const` further down would have
+	// initialised, so one there is in the temporal dead zone for this very command.
+	//
+	// Every argument the command accepts, as DATA rather than as a chain of special
+	// cases. Three near-identical holes were found in that chain one at a time (an
+	// ignored positional, `-w` swallowing the flag after it, a repeated `-w`
+	// discarding a directory the user typed), so the policy is now structural:
+	// anything not described here is refused.
+	const BOOLEAN_FLAGS = new Map([
+		['--all', 'all'],
+		['--all-workspaces', 'allWorkspaces'],
+		['--dry-run', 'dryRun'],
+		['--yes', 'yes'],
+		['-y', 'yes']
+	]);
+	const WORKSPACE_FLAGS = new Set(['--workspace', '-w']);
+	const CONFIRM_PREFIX = '--confirm=';
+	const HELP_HINT = '[cellar] run "cellar --help" for the cleanup options.';
+
+	/** @returns {{ok:false, errors:string[]}} */
+	const refuse = (/** @type {string[]} */ ...lines) => ({ ok: /** @type {const} */ (false), errors: [...lines, HELP_HINT] });
+
+	const out = {
+		ok: /** @type {const} */ (true),
+		all: false,
+		allWorkspaces: false,
+		dryRun: false,
+		yes: false,
+		/** @type {string|undefined} */ workspace: undefined,
+		/** @type {string|undefined} */ confirm: undefined
+	};
+
+	for (let i = 0; i < flags.length; i++) {
+		const tok = flags[i];
+
+		const boolKey = BOOLEAN_FLAGS.get(tok);
+		if (boolKey) {
+			out[/** @type {'all'|'allWorkspaces'|'dryRun'|'yes'} */ (boolKey)] = true;
+			continue;
+		}
+
+		if (WORKSPACE_FLAGS.has(tok)) {
+			const val = flags[++i];
+			if (val === undefined) return refuse(`[cellar] ${tok} needs a directory, but none was given.`);
+			if (val.startsWith('-')) return refuse(`[cellar] ${tok} needs a directory, but got the flag: ${val}`);
+			// An EMPTY value is the same class: `cellar cleanup -w "$WS" --all -y`
+			// with `$WS` unset would otherwise fall back to whatever folder the
+			// script happened to be sitting in and stop THAT one's live session.
+			if (val === '') return refuse(`[cellar] ${tok} needs a directory, but got an empty value.`);
+			// A value that NAMES NOTHING is refused too, and the silence there is
+			// total: a typo would make `--all` stop nothing at all while the
+			// workspace the user meant keeps running and they walk away believing it
+			// was cleaned. No nearest-match guessing — this command stops processes.
+			//
+			// Scoped to the caller-supplied target ONLY. `workspaceKey`'s lexical
+			// fallback must stay for REGISTRY entries: the registry deliberately
+			// outlives a deleted workspace so deleted-worktree orphans stay reapable,
+			// and such an entry still needs a key. Do not "restore" a fallback here.
+			// Accepted cost: `-w <deleted dir>` no longer scopes a cleanup — bare
+			// `cellar cleanup` already reaps orphans at every tier regardless of
+			// workspace, and `reapVanishedWorkspaces` covers it on the next launch.
+			if (!isExistingDir(val))
+				return refuse(`[cellar] ${tok} names no directory: ${val}`);
+			if (out.workspace !== undefined)
+				return refuse(
+					`[cellar] ${tok} was given more than once: ${out.workspace} and ${val}`,
+					'[cellar] cleanup stops processes, so it will not guess which one you meant — pass it exactly once.'
+				);
+			out.workspace = val;
+			continue;
+		}
+
+		if (tok.startsWith(CONFIRM_PREFIX)) {
+			const val = tok.slice(CONFIRM_PREFIX.length);
+			// Deliberately does NOT echo the values: one of them may be the
+			// confirmation phrase, which this command prints only where the wider
+			// scope has already been chosen. Naming the flag is enough to act on.
+			if (out.confirm !== undefined && out.confirm !== val)
+				return refuse(
+					'[cellar] --confirm was given more than once, with different values.',
+					'[cellar] pass it exactly once, so there is no doubt which confirmation you meant.'
+				);
+			out.confirm = val;
+			continue;
+		}
+
+		// Attached-only, and the space-separated spelling is REFUSED rather than
+		// accepted: consuming the next token as a value would reopen the missing /
+		// flag-shaped / repeated questions this parser just closed. It earns its own
+		// message because `--help` documents the flag, so falling through to
+		// "unknown flag" would deny a flag that exists — on the one path a caller
+		// reaches only after deliberately choosing the wider scope.
+		if (tok === '--confirm')
+			return refuse(`[cellar] --confirm needs its value attached: ${CONFIRM_PREFIX}<phrase>`);
+
+		if (!tok.startsWith('-'))
+			return refuse(
+				`[cellar] unexpected argument for cleanup: ${tok}`,
+				'[cellar] cleanup takes no positional path — use "-w <dir>" / "--workspace <dir>" to point it at another workspace.'
+			);
+
+		return refuse(`[cellar] unknown flag for cleanup: ${tok}`);
 	}
 
-	if (toReap.length === 0 && toKillPids.length === 0) {
+	return out;
+}
+
+/**
+ * `cellar cleanup` — reap dead / orphaned instances, and (only when asked)
+ * stop live ones.
+ *
+ * The scope rule and the reasoning behind it live in
+ * `src/lib/server/cleanup-plan.js`; this function is the CLI around it: parse
+ * flags, gather facts, print the plan, obtain the right kind of consent, act.
+ *
+ * Two consent levels, because they are not the same question:
+ *   - stopping orphans, or a live instance in THIS workspace, is routine
+ *     housekeeping → an ordinary y/N, auto-approved by `-y`/`CI`/a non-TTY;
+ *   - stopping a live instance in ANOTHER workspace is taking someone else's
+ *     running session → the literal `CONFIRM_PHRASE`, which none of those
+ *     auto-approvals can supply. That is the whole fix: `-y` used to be enough,
+ *     and a non-TTY stdin was enough with no flag at all.
+ */
+async function cleanupCommand(flags) {
+	// Refuse before anything is gathered, pruned or signalled, so a mistyped
+	// command leaves the registry and every process exactly as it was.
+	const args = parseCleanupArgs(flags);
+	if (!args.ok) {
+		for (const line of args.errors) console.error(line);
+		return 1;
+	}
+
+	// `??`, not `||`: the parser refuses an empty `-w` value, so a workspace that is
+	// PRESENT is always a usable directory string and `undefined` means exactly "no
+	// -w was given". A `||` here would silently paper over an empty one instead.
+	const callerKey = workspaceKey(args.workspace ?? callerDir());
+	const scope = args.allWorkspaces ? 'everywhere' : args.all ? 'workspace' : 'orphans';
+	const dryRun = args.dryRun;
+	const yes = args.yes || !!process.env.CI || !process.stdin.isTTY;
+	const confirmFlag = args.confirm;
+	const log = (m) => console.log(m);
+
+	// 1) Prune fully-dead registry entries (no live process at all). Bookkeeping
+	//    only — nothing is signalled — so it runs at every scope, dry run aside.
+	if (!dryRun) {
+		const pruned = await pruneDeadInstances({ log });
+		if (pruned.length) console.log(`[cellar] pruned ${pruned.length} dead registry entr(ies).`);
+	}
+
+	// 2) Gather facts, then decide (the decision is pure and unit-tested).
+	const entries = await Promise.all(listInstances().map(annotateInstance));
+	// Standing in a SUBDIRECTORY of your own project still means you are in that
+	// project, so the caller's directory is resolved UP to the workspace that
+	// contains it before anything is classified. Without this, `--all` run from
+	// `~/proj/notebooks` reported `~/proj`'s own session as somebody else's and
+	// offered the cross-workspace flag to reach it.
+	const here = resolveCallerWorkspace(callerKey, entries.map((e) => workspaceKey(e.workspace)));
+	const plan = planCleanup({ entries, untracked: scanUntrackedCellarProcesses(), workspace: here, scope });
+
+	console.log(
+		`[cellar] workspace: ${here || '(unknown)'}` + (here && here !== callerKey ? ` (you are in ${callerKey})` : '')
+	);
+
+	if (plan.reap.length === 0 && plan.killPids.length === 0) {
 		console.log(
-			all
-				? '[cellar] no cellar instances to stop.'
-				: '[cellar] nothing to reap (no orphaned instances). Pass --all to also stop live instances.'
+			scope === 'orphans'
+				? '[cellar] nothing to reap (no dead or orphaned instances).'
+				: '[cellar] nothing to stop.'
 		);
+		reportSkipped(plan);
 		return 0;
 	}
 
-	console.log('[cellar] will stop:');
-	for (const e of toReap)
-		console.log(`  ${e.launcherAlive ? 'live  ' : 'orphan'} launcher=${e.launcherPid} app=${e.appPid ?? '?'} ${e.workspace ?? ''}`);
-	for (const u of untrackedOrphans) console.log(`  orphan pid=${u.pid} (untracked)  ${u.command}`);
-	if (all) for (const u of untrackedOther) console.log(`  proc   pid=${u.pid} (untracked)  ${u.command}`);
+	// 3) Show what would die, always, before anything can die — including under
+	//    -y and under a dry run.
+	console.log(dryRun ? '[cellar] would stop:' : '[cellar] will stop:');
+	for (const e of plan.reap) console.log(planLine(e));
+	for (const u of plan.untrackedOrphans) console.log(`  orphan pid=${u.pid} (untracked)  ${u.command}`);
+	if (scope === 'everywhere')
+		for (const u of plan.untrackedLive) console.log(`  live   pid=${u.pid} (untracked, workspace unknown)  ${u.command}`);
 
-	if (!yes && !(await promptYesNo('[cellar] Stop these? [y/N] '))) {
+	if (dryRun) {
+		console.log('[cellar] dry run — nothing was stopped.');
+		reportSkipped(plan);
+		return 0;
+	}
+
+	// 4) Consent. A plan that reaches another workspace's live session needs the
+	//    phrase; anything else takes the ordinary y/N.
+	if (plan.crossWorkspace) {
+		const ask =
+			`[cellar] This stops LIVE cellar sessions in other workspaces ` +
+			`(running kernels and unsaved state will be lost).\n` +
+			`[cellar] Type "${CONFIRM_PHRASE}" to proceed: `;
+		// A non-TTY gets no prompt and no benefit of the doubt: it must have said so
+		// on the command line. `-y` is deliberately not consulted here.
+		const supplied = confirmFlag ?? (process.stdin.isTTY ? await promptPhrase(ask) : null);
+		if (supplied !== CONFIRM_PHRASE) {
+			console.error(
+				supplied == null
+					? `[cellar] refusing: stopping other workspaces' live sessions needs an explicit confirmation.\n[cellar] Re-run with: cellar cleanup --all-workspaces --confirm=${CONFIRM_PHRASE}`
+					: `[cellar] aborted (confirmation did not match "${CONFIRM_PHRASE}").`
+			);
+			return 1;
+		}
+	} else if (!yes && !(await promptYesNo('[cellar] Stop these? [y/N] '))) {
 		console.log('[cellar] aborted.');
 		return 1;
 	}
 
-	for (const e of toReap) {
+	for (const e of plan.reap) {
 		console.log(`[cellar] stopping launcher ${e.launcherPid} …`);
 		await reapInstance(e, { log, reason: 'cleanup' });
 	}
-	for (const pid of toKillPids) {
+	for (const pid of plan.killPids) {
 		console.log(`[cellar] killing pid ${pid} …`);
 		await killPid(pid);
 	}
 	console.log('[cellar] cleanup done.');
+	reportSkipped(plan);
 	return 0;
+}
+
+/**
+ * Say what was deliberately left running, and name the FLAG that would reach it.
+ *
+ * Silence here would make the narrowed `--all` look like it had stopped
+ * everything, which is the failure this whole change is about — the old command
+ * was dangerous precisely because its blast radius was invisible. Printed only
+ * when something really was skipped, so an ordinary tidy stays quiet.
+ *
+ * The flag, and never `CONFIRM_PHRASE`: this is the ROUTINE output of the SAFE
+ * forms (`cellar cleanup`, `cellar cleanup --all`), and handing the
+ * deliberate-intent token to someone who did not ask for the wider scope defeats
+ * the whole mechanism — the original incident was an agent tidying its own
+ * leftovers, and printing it a copy-pasteable command to repeat it would have our
+ * own tool supplying the proof of intent. A confirmation phrase you are given
+ * unprompted is not a confirmation. Discoverability already lives where it
+ * belongs: `--help` documents the phrase, and the refusal hands it over on the
+ * one path that has already chosen the wider scope.
+ */
+function reportSkipped(plan) {
+	const here = plan.skippedHere.length;
+	const elsewhere = plan.skippedElsewhere.length + plan.skippedUntracked.length;
+	if (!here && !elsewhere) return;
+
+	const line = (e) =>
+		`  live   launcher=${e.launcherPid} appPort=${e.appPort ?? '?'} ${e.workspace ?? '(workspace unknown)'}`;
+
+	if (here) {
+		console.log(`[cellar] left running in this workspace: ${here}`);
+		for (const e of plan.skippedHere) console.log(line(e));
+		console.log('[cellar]   stop these with: cellar cleanup --all');
+	}
+	if (elsewhere) {
+		console.log(`[cellar] left running elsewhere: ${elsewhere} (someone may be working in them)`);
+		for (const e of plan.skippedElsewhere) console.log(line(e));
+		for (const u of plan.skippedUntracked)
+			console.log(`  live   pid=${u.pid} (untracked, workspace unknown)  ${u.command}`);
+		console.log('[cellar]   reaching these needs the wider scope: cellar cleanup --all-workspaces');
+	}
 }
 
 // ---- `cellar harness …` ---------------------------------------------------

@@ -712,8 +712,14 @@ spec files at a time. Install its browser once with `npx playwright install chro
   mcp` bridges to a live instance and does not start one. For Codex, also approve
   the project when it asks - it ignores project config for an untrusted folder.
 - **A stale/duplicate instance in a folder** - `cellar ls` lists instances,
-  `cellar cleanup` reaps orphans (`--all` stops every live one). A relaunch in a
-  folder takes over its previous instance automatically.
+  `cellar cleanup` reaps dead and orphaned ones anywhere and never touches a live
+  session. Add `--all` to also stop the live instance **in the project you are in**
+  (a subfolder counts - it resolves up to the project the instance serves);
+  `--all-workspaces` reaches live instances in *other* projects too, and asks you to
+  type `stop-all-workspaces` first (or pass `--confirm=stop-all-workspaces`), since
+  someone may be working in them - `-y` deliberately does not unlock it. Use
+  `--dry-run` to see exactly what would be stopped without stopping anything. A
+  relaunch in a folder takes over its previous instance automatically.
 - **A run aborted with "Restart the kernel to recover"** - the per-run watchdog
   aborts only when a probe proves the kernel can no longer answer: it is gone from
   the Jupyter server, reports itself dead, or its reply cannot reach us. A slow,
