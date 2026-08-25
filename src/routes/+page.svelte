@@ -36,6 +36,7 @@
 	import type { SearchHighlightState } from '$lib/searchHighlight';
 	import type { Folding } from '$lib/headings';
 	import { kernelCardName } from '$lib/kernelBadge';
+	import { reasonWithoutServerPath } from '$lib/serverMessage';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import { isBlameUnavailable, activeBlameFor, type BlameReport } from '$lib/blame';
 	import { reorderTabs as reorderTabList } from '$lib/tabReorder';
@@ -784,7 +785,13 @@
 		}
 		if (!res.ok) {
 			const body = await res.json().catch(() => null);
-			refuse(typeof body?.message === 'string' ? body.message : `HTTP ${res.status}`);
+			// The server's own reason, with any ABSOLUTE path stripped out: `loadDoc`
+			// throws `'notebook not found: ' + abs`, and every other surface in this UI
+			// addresses a notebook workspace-relative (the `refuse` template above
+			// already names it that way). Same rule GitNotebooks' `unreadable` follows;
+			// here the explanation is worth keeping, so only the path goes.
+			const raw = typeof body?.message === 'string' ? reasonWithoutServerPath(body.message) : '';
+			refuse(raw || `HTTP ${res.status}`);
 			return;
 		}
 		// The check answered "this IS a live notebook", so seed the `.py` kind cache

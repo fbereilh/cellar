@@ -859,13 +859,8 @@
 {#snippet kernelRow(card: KernelCard)}
 	{@const acting = actingPaths.has(card.path)}
 	{@const busy = card.info.status === 'busy'}
-	<!-- The hover/focus-revealed control cluster is the ONLY tail state that is out
-	     of flow (see it below); `hoverControls` is true exactly when it is the one
-	     showing, and is what arms the two things that make room for it - the name
-	     button's reserved gutter and the memory chip's opacity handoff. -->
-	{@const hoverControls = card.hasKernel && !acting && confirmWipePath !== card.path}
 	<div
-		class="group relative flex items-center gap-2 rounded-md px-2 py-1 hover:bg-base-300/40 {busy ? 'bg-warning/5' : ''}"
+		class="group flex items-center gap-2 rounded-md px-2 py-1 hover:bg-base-300/40 {busy ? 'bg-warning/5' : ''}"
 		data-testid="kernel-card"
 		data-nb-path={card.path}
 	>
@@ -875,86 +870,42 @@
 			{#if busy}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
 			<span class="relative inline-flex h-2 w-2 rounded-full {kernelDotClass(card.info)}"></span>
 		</span>
-		<!-- Name + memory share the row's flexible space. The room the out-of-flow
-		     controls need is reserved INSIDE the name button, by an empty `::after`
-		     flex item that appears only while they are up - never as padding on this
-		     wrapper and never as padding on the button, and that is the whole point:
-		     both of those move the memory chip. On the wrapper the gutter shifted it
-		     ~108px at every width. On the button it is subtler and bites only on a
-		     narrow sidebar: `box-sizing: border-box` floors a flex item's used size
-		     at padding+border, so once the button's share of the row drops under the
-		     108px gutter the button stops shrinking and pushes the `shrink-0` chip
-		     right (below a sidebar of roughly 210px, inside the resizer's 180-560px
-		     range). A spacer that lives in the button's OWN content layout has no
-		     such floor: the button's outer width is its share of the free space and
-		     nothing inside it can change that, so the chip's box is where it is
-		     whatever the width. At rest the spacer is `display:none`, so it costs
-		     neither width nor a flex gap and the name has the whole row - in flow the
-		     control slot reserved 102px of a 239px row, which at the default 256px
-		     sidebar left a closed card's name one character. -->
-		<div class="flex min-w-0 flex-1 items-center gap-2">
-			<!-- THE CLICK TARGET IS THE NAME, NOT THE ROW — deliberately. The row also
-			     carries four icon buttons, one of them destructive behind a two-step
-			     confirm, so a row-level handler would have to be a `role="button"` div
-			     with `stopPropagation` on every control (fragile: a control added later
-			     silently inherits the open action), or an outer <button> wrapping them
-			     (invalid markup, and a confusing tab order). The name button is
-			     `flex-1`, so it already spans the row minus the controls — the same
-			     shape (and the same testid) the OPEN card has always had, now extended
-			     to the closed one, which was an inert <span> and so reachable by
-			     neither mouse nor keyboard. One handler for both states:
-			     `onOpenNotebook` surfaces an already-open tab and opens a closed one,
-			     so the row never duplicates a notebook and never reloads the one you
-			     are already looking at. The accessible name is explicit because the
-			     visible text is only a filename; the tooltip carries the full PATH,
-			     which is what tells two same-named notebooks apart. -->
-			<button
-				class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary after:hidden after:shrink-0 after:basis-[6.75rem] after:content-[''] {hoverControls
-					? 'group-hover:after:block group-focus-within:after:block'
-					: ''}"
-				onclick={() => onOpenNotebook?.(card.path)}
-				title="{card.open ? 'Focus' : 'Open'} {card.path} — {card.open
-					? kernelStatusLabel(card.info)
-					: 'kernel running, tab closed'}"
-				aria-label="{card.open ? 'Focus' : 'Open'} notebook {card.name}"
-				data-testid="kernel-notebook"
+		<!-- THE CLICK TARGET IS THE NAME, NOT THE ROW — deliberately. The row also
+		     carries four icon buttons, one of them destructive behind a two-step
+		     confirm, so a row-level handler would have to be a `role="button"` div
+		     with `stopPropagation` on every control (fragile: a control added later
+		     silently inherits the open action), or an outer <button> wrapping them
+		     (invalid markup, and a confusing tab order). The name button is `flex-1`,
+		     so it already spans the row minus the controls — the same shape (and the
+		     same testid) the OPEN card has always had, now extended to the closed one,
+		     which was an inert <span> and so reachable by neither mouse nor keyboard.
+		     One handler for both states: `onOpenNotebook` surfaces an already-open tab
+		     and opens a closed one, so the row never duplicates a notebook and never
+		     reloads the one you are already looking at. The accessible name is
+		     explicit because the visible text is only a filename; the tooltip carries
+		     the full PATH, which is what tells two same-named notebooks apart. -->
+		<button
+			class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary"
+			onclick={() => onOpenNotebook?.(card.path)}
+			title="{card.open ? 'Focus' : 'Open'} {card.path} — {card.open
+				? kernelStatusLabel(card.info)
+				: 'kernel running, tab closed'}"
+			aria-label="{card.open ? 'Focus' : 'Open'} notebook {card.name}"
+			data-testid="kernel-notebook"
+		>
+			<span class="min-w-0 truncate {busy ? 'font-medium' : ''} {nameToneFor(card)}">{card.name}</span>
+			{#if card.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
+			{#if !card.open}<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>{/if}
+		</button>
+		{#if cardMemory(card)}
+			<span
+				class="shrink-0 tabular-nums text-[11px] text-base-content/40"
+				title="Kernel resident memory (RSS)"
+				data-testid="kernel-memory"
 			>
-				<span class="min-w-0 truncate {busy ? 'font-medium' : ''} {nameToneFor(card)}">{card.name}</span>
-				{#if card.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
-				{#if !card.open}<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>{/if}
-			</button>
-			<!-- The RSS figure and the control cluster share the row's right slot, so
-			     one hands off to the other rather than overlapping (the VS Code
-			     explorer rule: a row's metadata yields to its actions on hover). The
-			     handoff is SEQUENCED so the two are never both visible: the chip
-			     goes at once on the way in, and on the way back waits out the
-			     controls' own 150ms fade. It is a HARD CUT rather than a fade
-			     precisely so the controls need no incoming delay to clear it - a
-			     delay there is what would leave them drawn-but-inert (or, worse,
-			     inert-but-clickable) for a window after the pointer lands. Its
-			     BOX never moves - only its opacity - so nothing reflows. Only while
-			     the controls are the tail state: the "not started" chip, the acting
-			     spinner and the wipe confirm are all in FLOW, so they push the chip
-			     left instead of covering it and it stays fully visible.
-			     STATED RESIDUAL, at the narrow end of the resizer only: the reserved
-			     room is `shrink-0`, so once the button is narrower than the gutter it
-			     overflows the button rather than moving anything, and what is left of
-			     the name (and, on a closed card, the `closed` chip) can sit partly
-			     under the icons instead of truncating clear of them - measured from
-			     about a 210px sidebar down. Pre-existing at those widths and strictly
-			     better than the padding it replaced, which ALSO moved the chip. -->
-			{#if cardMemory(card)}
-				<span
-					class="shrink-0 tabular-nums text-[11px] text-base-content/40 {hoverControls
-						? 'transition-opacity delay-150 duration-0 group-hover:opacity-0 group-hover:delay-0 group-focus-within:opacity-0 group-focus-within:delay-0'
-						: ''}"
-					title="Kernel resident memory (RSS)"
-					data-testid="kernel-memory"
-				>
-					{cardMemory(card)}
-				</span>
-			{/if}
-		</div>
+				{cardMemory(card)}
+			</span>
+		{/if}
 		{#if !card.hasKernel}
 			<!-- Open but never run: no process to control, just a muted state hint. -->
 			<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30" data-testid="kernel-not-started">not started</span>
@@ -981,34 +932,9 @@
 			</div>
 		{:else}
 			<!-- Uncluttered at rest, full control on interaction: reveal on row hover or
-			     keyboard focus. OUT OF FLOW, so an invisible slot cannot eat the row:
-			     in flow it reserved 102px of a 239px row permanently, which at the
-			     default sidebar width left the notebook name a couple of characters.
-			     The name button reserves the matching room while these are up and the
-			     memory chip yields to them by a hard cut (both above), so nothing here
-			     covers something still on screen, and nothing reflows.
-			     `pointer-events-none` AT REST IS LOAD-BEARING, not tidiness: `opacity:
-			     0` hides a box but does not stop it hit-testing, and as a positioned
-			     later sibling this one is hit-tested ABOVE the name button it is drawn
-			     over - so without it an at-rest click on the tail of a long name, or
-			     on the RSS figure, landed on Restart or Shut down, neither of which
-			     asks for confirmation.
-			     BUT THE FLIP BACK MAY NOT BE DELAYED, and putting `pointer-events` on
-			     the opacity transition (`transition-discrete`) is how that goes wrong:
-			     a discrete property flips at the MIDPOINT, so the icons were drawn
-			     from 75ms and inert until 150ms, and a click in that window fell
-			     through to the name button and OPENED THE NOTEBOOK instead of acting
-			     on the kernel. It is therefore an ordinary `:hover`/`:focus-within`
-			     flip, immediate in both directions - and what keeps that from handing
-			     a click to an icon nobody can see yet is that the reveal itself now
-			     starts at once (no incoming delay, the chip having already cut away),
-			     so drawn and clickable begin together.
-			     None of this can cost the reveal: `group-hover` keys off the ROW's
-			     `:hover`, which a child declining pointer events does not affect (the
-			     pointer simply reaches the row underneath), and focusability is
-			     untouched, so the keyboard route is unchanged. -->
+			     keyboard focus. The slot keeps layout width stable (no reflow). -->
 			<div
-				class="pointer-events-none absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity delay-0 duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
+				class="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
 				data-testid="kernel-controls"
 			>
 				<button
