@@ -20,17 +20,17 @@ export type { ImportChangeStamps };
 // --- cells + notebook document --------------------------------------------
 
 /** nbformat cell type as stored on disk. All THREE nbformat 4.5 types are real
- * Cellar types; `sql` is a logical Cellar type that maps onto a `code` cell
- * tagged `cellar.language = 'sql'` (see `$lib/cellLanguage` for why the
- * reasoning inverts between the two). */
+ * Cellar types; `sql`, `chat` and `mojo` are logical Cellar types that map onto a
+ * `code` cell tagged `cellar.language` (see `$lib/cellLanguage` for why the
+ * reasoning inverts between those and `raw`). */
 export type CellType = 'code' | 'markdown' | 'raw';
 
 /** The logical cell types the UI chooses between (the agent write tools speak
- * all but `chat`). `sql` and `chat` are `code` cells; `code`/`markdown`/`raw`
- * are nbformat types of their own. Keep `CellType` a SUBSET of this - the
- * clipboard, the undo stack and the insert specs all assign one into the
- * other. */
-export type LogicalCellType = 'code' | 'markdown' | 'sql' | 'raw' | 'chat';
+ * all but `chat`). `sql`, `chat` and `mojo` are `code` cells;
+ * `code`/`markdown`/`raw` are nbformat types of their own. Keep `CellType` a
+ * SUBSET of this - the clipboard, the undo stack and the insert specs all assign
+ * one into the other. */
+export type LogicalCellType = 'code' | 'markdown' | 'sql' | 'raw' | 'chat' | 'mojo';
 
 /** Who initiated a run: a human via the UI, or an agent via MCP. */
 export type Actor = 'user' | 'agent';
@@ -79,7 +79,7 @@ export interface CellarNamespace {
 	 * only - the cell's source is never touched and it still runs.
 	 */
 	hide_input?: boolean;
-	/** Logical cell language, e.g. 'sql'. Absent = Python. */
+	/** Logical cell language ('sql' | 'chat' | 'mojo'). Absent = Python. */
 	language?: string;
 	/** Cell role, e.g. the pinned imports cell ('imports'). */
 	role?: string | null;

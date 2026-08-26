@@ -58,7 +58,7 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { isPyUnsupportedType, isSqlCell, isRawCell, isChatCell, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
+import { isPyUnsupportedType, isSqlCell, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import { isExportCell, canExportCell, exportCellCount } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
@@ -790,6 +790,22 @@ function staleFields(
 	return out;
 }
 
+/**
+ * The `language` field an agent-facing cell projection carries: the `cellar.language`
+ * tag for a tagged code cell (`sql`, `chat`, `mojo`), and NOTHING for a plain code,
+ * markdown or raw cell - whose type field already says what they are.
+ *
+ * Read through `languageTagFor` rather than as a ternary per projection: the two
+ * projections that report it (`readForm` and `getNotebookMap`'s `leaf`) each carried
+ * their own copy, so a new tagged language landed on the agent surface as an
+ * untagged `code` cell in whichever one was not updated - and an agent that cannot
+ * see a cell is Mojo will write Python into it.
+ */
+function languageField(cell: CellView): { language?: string } {
+	const tag = languageTagFor(logicalCellType(cell));
+	return tag ? { language: tag } : {};
+}
+
 function readForm(
 	cell: CellView,
 	cap = READ_CAP,
@@ -800,7 +816,7 @@ function readForm(
 	return {
 		id: toHandle(cell.id),
 		type: cell.cell_type,
-		...(isSqlCell(cell) ? { language: 'sql' } : isChatCell(cell) ? { language: 'chat' } : {}),
+		...languageField(cell),
 		source: cell.source,
 		run_status: runStatus(cell, sid),
 		...staleFields(staleEntry, toHandle),
@@ -912,7 +928,7 @@ export async function getNotebookMap(nb?: string | null) {
 	const leaf = (c: CellView) => ({
 		id: toHandle(c.id),
 		type: c.cell_type,
-		...(isSqlCell(c) ? { language: 'sql' } : isChatCell(c) ? { language: 'chat' } : {}),
+		...languageField(c),
 		summary: firstLine(c.source),
 		run_status: runStatus(c, sid),
 		...staleFields(stale[c.id], toHandle),
@@ -1523,8 +1539,9 @@ export async function editCell(id: string, source: string, { routeImports: route
 	if (!cell) return null;
 	autoCheckpointBeforeAgentAction(nb);
 	// A SQL cell is a `code` cell on disk, but its source is SQL - never route
-	// "imports" out of it, and the same holds for a raw cell's verbatim text. Pass
-	// the LOGICAL type so routeOne's `!== 'code'` guard skips both.
+	// "imports" out of it, and the same holds for a mojo cell's Mojo source and a
+	// raw cell's verbatim text. Pass the LOGICAL type so routeOne's `!== 'code'`
+	// guard skips all three.
 	const logicalType = logicalCellType(cell);
 	const routed = routeOne(source, nb, { routeEnabled, cellType: logicalType, skipCellId: id });
 	setSource(id, routed ? routed.source : source, nb);

@@ -17,11 +17,12 @@
  *   try { return await executeCellRun({ nb, cellId, actor, source: ticket.source() }); }
  *   finally { ticket.done(); }
  */
-import { execute, KernelExecuteAborted } from './kernel';
+import { execute, ensureMojoMagic, KernelExecuteAborted } from './kernel';
 import { setOutputs, setOutputsLive, setLastRun, clearOutputsLive, getCell } from './notebook';
 import { publish } from './events';
-import { isChatCell, isSqlCell } from '../cellLanguage';
+import { isChatCell, isMojoCell, isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
+import { mojoMissingOutput, mojoToCellSource, type MojoSetup } from './mojo';
 import { executeChatRun, chatReplyOutput } from './chat/run-chat';
 import { OutputAccumulator, OUTPUT_FLUSH_MS, type StreamDelta } from './output-accumulator';
 import { registerRunOutputs, unregisterRunOutputs } from './run-output-registry';
@@ -89,9 +90,31 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// A CHAT cell never reaches the kernel at all: its source is a question the
 	// ChatEngine answers (see chat/run-chat.ts), streamed through this same
 	// accumulator so the wire, persist and clear behavior stay identical.
+	// A MOJO cell stores bare Mojo and compiles to the `%%mojo` cell magic, which
+	// exists only after `import mojo.notebook` has run in this session - so the run
+	// is preceded by a lazy, once-per-session setup (see mojo.ts for why it is not
+	// an `initKernel` injection). A setup that did not take is reported as the
+	// cell's OWN error output below, carrying the install command, rather than
+	// letting IPython answer with `UsageError: Cell magic function %%mojo not
+	// found`, which says nothing about the toolchain.
 	const cell = getCell(cellId, nb);
 	const isChat = isChatCell(cell);
-	const execSource = isSqlCell(cell) ? sqlToPython(source) : source;
+	const isMojo = isMojoCell(cell);
+	// NULL means NO VERDICT - the kernel could not be reached, or the bounded setup
+	// did not settle in time. Either way we fall through to `execute()`, which owns
+	// the run watchdog and reports honestly (`kernel_unavailable` where that is what
+	// happened): claiming a missing TOOLCHAIN on a reading that observed nothing
+	// would name a cause nobody saw, and would send the user installing 534 MB they
+	// may already have.
+	let mojoSetup: MojoSetup | null = null;
+	if (isMojo) {
+		try {
+			mojoSetup = await ensureMojoMagic(nb);
+		} catch {
+			/* no verdict; see above */
+		}
+	}
+	const execSource = isSqlCell(cell) ? sqlToPython(source) : isMojo ? mojoToCellSource(source) : source;
 
 	// Bound + coalesce the run's output across all three consumers (persist, SSE
 	// broadcast, this caller's stream). The accumulator merges consecutive
@@ -137,7 +160,17 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	let outputs: CellOutput[];
 	try {
 		try {
-			if (isChat) {
+			if (mojoSetup && !mojoSetup.ready) {
+				// The toolchain is absent (or the probe could not answer). The kernel is
+				// alive - `ensureMojoMagic` started it and ran a probe in it - so this run
+				// really did happen in `mojoSetup.session`'s namespace and is stamped with
+				// it: reporting no session would drop the cell into `error_persisted`, the
+				// label agents are told to distrust as a leftover from a previous session,
+				// for a failure raised seconds ago.
+				session = mojoSetup.session ?? null;
+				acc.push(mojoMissingOutput(mojoSetup));
+				status = 'error';
+			} else if (isChat) {
 				// No kernel, no session epoch: the reply streams from the ChatEngine into
 				// the same accumulator. `session` stays null - a chat run touches no
 				// namespace, so ran_this_session honestly reads false.

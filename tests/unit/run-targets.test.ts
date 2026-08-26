@@ -126,3 +126,28 @@ describe('the notice a skip is reported through', () => {
 		}
 	});
 });
+
+describe('a mojo cell is a RUNNABLE cell, so a bulk run includes it', () => {
+	// Deliberately unlike chat: a Mojo run costs a `mojo run` subprocess, not a
+	// billed model turn, and re-running it is deterministic. So Run all / Run above
+	// execute it exactly as they execute a SQL or Python cell, and it is never
+	// reported as skipped.
+	const mojoCell = (id: string) => ({ id, cell_type: 'code', metadata: { cellar: { language: 'mojo' } } });
+
+	it('runTargets includes it and skips nothing', () => {
+		const cells = [
+			{ id: 'py', cell_type: 'code', metadata: {} },
+			mojoCell('mj'),
+			{ id: 'md', cell_type: 'markdown', metadata: {} },
+			{ id: 'ch', cell_type: 'code', metadata: { cellar: { language: 'chat' } } }
+		];
+		const out = runTargets(cells as never);
+		expect(out.ids).toEqual(['py', 'mj']);
+		expect(out.chatSkipped).toEqual(['ch']);
+	});
+
+	it('runTargetsAbove includes it', () => {
+		const cells = [mojoCell('mj'), { id: 'py', cell_type: 'code', metadata: {} }];
+		expect(runTargetsAbove(cells as never, 'py').ids).toEqual(['mj']);
+	});
+});
