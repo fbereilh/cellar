@@ -83,6 +83,11 @@ const settle = (page: Page) =>
 /** Open the seeded notebook: a first-ever visit has no persisted tabs, so it starts empty. */
 async function openNotebook(page: Page): Promise<void> {
 	const empty = page.getByTestId('empty-open-notebook');
+	// Settle before probing: the shell paints either the empty state or an already
+	// open notebook, and reading `isVisible()` before either arrives reports the
+	// button invisible, turns the click into a no-op, and then times out for 30s on
+	// a notebook nothing ever opened (see the openNotebook rule in AGENTS.md).
+	await expect(empty.or(page.getByTestId('cell').first())).toBeVisible({ timeout: 30_000 });
 	if (await empty.isVisible().catch(() => false)) await empty.click();
 }
 
