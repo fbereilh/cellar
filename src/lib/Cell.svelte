@@ -2336,7 +2336,7 @@
 							bind:this={typeBtnEl}
 							class="btn btn-ghost btn-xs flex h-5 min-h-0 items-center gap-0.5 px-1.5 font-mono text-[11px] font-normal text-base-content/40 hover:text-base-content/80"
 							onclick={openTypeMenu}
-							title="Change cell type (Python · SQL · Chat · Markdown · Raw)"
+							title="Change cell type (Python · SQL · Mojo · Chat · Markdown · Raw)"
 							data-testid="type-toggle"
 						>
 							{typeLabel}
