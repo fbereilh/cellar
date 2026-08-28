@@ -2252,10 +2252,10 @@
 	function applyCellTypeLocally(id: string, cellType: LogicalCellType) {
 		const cell = findCell(id);
 		if (!cell) return;
-		// 'sql'/'chat' are code cells tagged cellar.language ($lib/cellLanguage.js's
-		// `languageTagFor`, the ONE tag rule); 'code' clears the tag. Reassign
-		// metadata (the cell may have had no cellar namespace) so the grammar switch
-		// in Cell.svelte reacts.
+		// 'sql'/'chat'/'mojo' are code cells tagged cellar.language
+		// ($lib/cellLanguage.js's `languageTagFor`, the ONE tag rule); 'code' clears
+		// the tag. Reassign metadata (the cell may have had no cellar namespace) so
+		// the grammar switch in Cell.svelte reacts.
 		const lang = languageTagFor(cellType);
 		cell.cell_type = nbCellType(cellType);
 		const cellar = { ...(cell.metadata?.cellar ?? {}) };

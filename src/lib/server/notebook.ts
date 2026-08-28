@@ -127,7 +127,7 @@ function starterCell(): Cell {
 }
 
 function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCellar {
-	// 'sql'/'chat' are LOGICAL types: an nbformat `code` cell tagged
+	// 'sql'/'chat'/'mojo' are LOGICAL types: an nbformat `code` cell tagged
 	// cellar.language (see $lib/cellLanguage.js, whose `languageTagFor` is the ONE
 	// tag rule). code/markdown/raw are nbformat types of their own, and
 	// `nbCellType` is the ONE mapping.
@@ -1653,7 +1653,8 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
  * The in-place half of a type switch, shared by the single-cell setter and the
  * `setCellTypes` batch so the two can never diverge on the metadata rules: any
  * non-code type (markdown, raw) clears outputs, and anything holding no Python
- * (those two plus SQL and chat) drops the imports role and the nbdev export flag.
+ * (those two plus SQL, Mojo and chat) drops the imports role and the nbdev export
+ * flag.
  *
  * `LiveNotebook.applyCellTypeLocally` is the browser's copy of exactly these
  * rules - `cell:type` carries no metadata, so a client half that skipped one
