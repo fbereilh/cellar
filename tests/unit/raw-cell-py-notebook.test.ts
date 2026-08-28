@@ -25,7 +25,19 @@ import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TEXT_NOTEBOOK_RAW_MESSAGE, TextNotebookCellTypeError } from '../../src/lib/cellLanguage';
+import {
+	CHAT_UNSUPPORTED_REASON,
+	MOJO_UNSUPPORTED_REASON,
+	PY_UNSUPPORTED_TYPES,
+	RAW_UNSUPPORTED_REASON,
+	TEXT_NOTEBOOK_CHAT_MESSAGE,
+	TEXT_NOTEBOOK_MOJO_MESSAGE,
+	TEXT_NOTEBOOK_RAW_MESSAGE,
+	TextNotebookCellTypeError,
+	textNotebookTypeForReason,
+	textNotebookTypeMessage,
+	textNotebookTypeReason
+} from '../../src/lib/cellLanguage';
 
 const PY_BYTES = '# Databricks notebook source\nprint(1)\n\n# COMMAND ----------\n\nprint(2)\n';
 
@@ -248,6 +260,44 @@ describe('an .ipynb notebook is completely unaffected', () => {
  * CI and the gate - each of these rules is one expression wide, and losing it
  * silently puts back a control that offers a conversion the server refuses.
  */
+/**
+ * The refusal COPY is per type, and the mapping runs both ways.
+ *
+ * Every unsupported type must carry its own message and its own route-facing
+ * code - a type falling back to the RAW copy is the silent mislabel the copy
+ * record exists to prevent (it reports a lost raw cell for a lost chat REPLY),
+ * and the client resolves the server's code back to a type to pick the notice,
+ * so a code that resolved to the wrong type would say the wrong thing.
+ */
+describe('every unsupported type has its OWN message and refusal code, both ways', () => {
+	it('no type falls back to the raw copy, and the codes are distinct', () => {
+		expect([...PY_UNSUPPORTED_TYPES].sort()).toEqual(['chat', 'mojo', 'raw']);
+		const messages = PY_UNSUPPORTED_TYPES.map((t) => textNotebookTypeMessage(t));
+		const reasons = PY_UNSUPPORTED_TYPES.map((t) => textNotebookTypeReason(t));
+		expect(new Set(messages).size).toBe(PY_UNSUPPORTED_TYPES.length);
+		expect(new Set(reasons).size).toBe(PY_UNSUPPORTED_TYPES.length);
+		expect(textNotebookTypeMessage('raw')).toBe(TEXT_NOTEBOOK_RAW_MESSAGE);
+		expect(textNotebookTypeMessage('chat')).toBe(TEXT_NOTEBOOK_CHAT_MESSAGE);
+		expect(textNotebookTypeMessage('mojo')).toBe(TEXT_NOTEBOOK_MOJO_MESSAGE);
+		expect(textNotebookTypeReason('raw')).toBe(RAW_UNSUPPORTED_REASON);
+		expect(textNotebookTypeReason('chat')).toBe(CHAT_UNSUPPORTED_REASON);
+		expect(textNotebookTypeReason('mojo')).toBe(MOJO_UNSUPPORTED_REASON);
+	});
+
+	it('a refusal code resolves back to the type it was reported for, and nothing else does', () => {
+		for (const t of PY_UNSUPPORTED_TYPES) expect(textNotebookTypeForReason(textNotebookTypeReason(t))).toBe(t);
+		// The error a writer really throws carries the code the client resolves.
+		for (const t of PY_UNSUPPORTED_TYPES) {
+			const err = new TextNotebookCellTypeError(t);
+			expect(textNotebookTypeForReason(err.reason)).toBe(t);
+			expect(err.message).toBe(textNotebookTypeMessage(t));
+		}
+		// A code that is not one of ours names NO type - never the first entry.
+		for (const other of ['would-empty-notebook', 'bad-cell-type', '', 'raw-in-py', undefined, null, 7])
+			expect(textNotebookTypeForReason(other)).toBeNull();
+	});
+});
+
 describe('the client half (source guards)', () => {
 	const read = (rel: string) => readFileSync(new URL(`../../src/lib/${rel}`, import.meta.url), 'utf8');
 
@@ -274,7 +324,10 @@ describe('the client half (source guards)', () => {
 		expect(src).toMatch(/if \(isPy && entries\.some\(\(e\) => e\.cell_type === 'raw'\)\) return noticeUnsupportedType\('raw'\)/);
 		// And a refusal this tab did not predict is still surfaced + resynced: the
 		// route emits no `cell:type`, and this tab would echo-suppress it anyway.
-		expect(src).toMatch(/PY_UNSUPPORTED_TYPES\.find\(\(t\) => textNotebookTypeReason\(t\) === reason\)[\s\S]*?noticeUnsupportedType\(refused\)/);
+		// The type is resolved through the SHARED resolver (whose meaning is
+		// executed just above), never by a second copy of the codes here.
+		expect(src).toMatch(/textNotebookTypeForReason\(reason\)[\s\S]*?noticeUnsupportedType\(refused\)/);
+		expect(src).not.toMatch(/PY_UNSUPPORTED_TYPES/);
 		expect(src).toMatch(/if \(!res \|\| !res\.ok\) \{\s*\n\s*await noticeRefusal\(res\);\s*\n\s*await load\(\);/);
 	});
 });

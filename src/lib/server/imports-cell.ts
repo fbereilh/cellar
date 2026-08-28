@@ -37,30 +37,12 @@ import {
 	resolveNotebookPath
 } from './notebook';
 import { IMPORTS_ROLE, isImportsCell } from '../importsRole';
-import { logicalCellType } from '../cellLanguage';
+import { isPythonCodeCell } from '../cellLanguage';
 import { extractTopLevelImports, mergeImportSources, isImportsOnly, hasTopLevelImports } from './imports';
 import { isCellMagicCell } from './magics';
 import { enqueueRun, queuePosition, RunCancelled } from './run-queue';
 import { executeCellRun, clearOutputsForQueue } from './run';
 import type { Actor, Cell, CellView, CellOutput, SessionId } from './types';
-
-/**
- * A cell whose source really is PYTHON, which is what every import operation
- * here reads and writes.
- *
- * Deliberately the LOGICAL type, never the nbformat `cell_type === 'code'`
- * shorthand: `sql` and `chat` cells are nbformat code cells too, so that
- * shorthand handed a SQL query - and a chat cell's ENGLISH PROSE, which
- * routinely quotes code - to the Python import tokenizer. A parseable
- * `import pandas as pd` line inside a question would then be LIFTED out of the
- * user's prose into the imports cell and run, and a first cell that happened to
- * be imports-only prose could be ADOPTED as the imports cell. Same rule as
- * `dataflow.ts`/`staleness.ts`, which exclude those cells from the Python probe
- * for the same reason.
- */
-function isPythonCodeCell(cell: Cell | CellView): boolean {
-	return logicalCellType(cell) === 'code';
-}
 
 /** The imports cell's run outcome: a run result, or a non-executing status when
  * the kernel queue refused (duplicate/running) or dropped (cancelled) the ticket. */

@@ -24,7 +24,7 @@
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
-	import { isSqlCell, isRawCell, isChatCell, offersCellType, logicalCellType } from '$lib/cellLanguage';
+	import { isSqlCell, isRawCell, isChatCell, isMojoCell, offersCellType, logicalCellType } from '$lib/cellLanguage';
 	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
 	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
@@ -108,7 +108,8 @@
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
 		hideAllCode?: boolean;
-		/** This is a `.py` TEXT notebook, which cannot hold a raw cell (see `typeOptions`). */
+		/** This is a `.py` TEXT notebook, which cannot hold a raw, Mojo or chat cell
+		 *  (WHICH types those are is `$lib/cellLanguage`'s; see `typeOptions`). */
 		isPy?: boolean;
 		/** Hide (or show) this code cell's input in place. */
 		onSetHideInput?: (id: string, hidden: boolean) => void;
@@ -256,28 +257,32 @@
 	// kernel; the reply arrives as a markdown display_data output. Runnable like
 	// SQL - the run button IS "ask".
 	const isChat = $derived(isChatCell(cell));
+	// A MOJO cell: a code cell tagged cellar.language='mojo'. Its source is Mojo,
+	// compiled to a `%%mojo` cell magic at run time and executed by the PYTHON
+	// kernel (Modular ships no Mojo kernel - see server/mojo.ts). Runnable like SQL;
+	// its Python-only affordances (export, imports role, staleness) are HIDDEN, each
+	// by the shared rule that already excludes it rather than by a check here.
+	const isMojo = $derived(isMojoCell(cell));
 	// An nbformat `raw` cell: verbatim text Cellar never executes and never renders
 	// (Quarto/nbdev frontmatter, nbconvert directives). It has NO rendered mode -
 	// the deliberate contrast with markdown - so it is always shown as its source.
 	const isRaw = $derived(isRawCell(cell));
-	// A cell the kernel executes: python or sql, never markdown or raw. Every
+	// A cell the kernel executes: python, sql or mojo, never markdown or raw. Every
 	// execution-shaped affordance below gates on THIS, not on `!isMarkdown` - that
 	// shorthand is what rendered a Run button on a raw cell and posted YAML
 	// frontmatter to Python.
 	const isRunnable = $derived(!isMarkdown && !isRaw);
-	// The logical cell type the type menu speaks: 'code' | 'sql' | 'markdown' | 'raw'.
+	// The logical cell type the type menu speaks: code | sql | mojo | chat | markdown | raw.
 	const logicalType = $derived(logicalCellType(cell));
-	const typeLabel = $derived(
-		logicalType === 'sql'
-			? 'SQL'
-			: logicalType === 'chat'
-				? 'chat'
-				: logicalType === 'markdown'
-					? 'markdown'
-					: logicalType === 'raw'
-						? 'raw'
-						: 'python3'
-	);
+	const TYPE_LABELS: Record<LogicalCellType, string> = {
+		sql: 'SQL',
+		chat: 'chat',
+		mojo: 'mojo',
+		markdown: 'markdown',
+		raw: 'raw',
+		code: 'python3'
+	};
+	const typeLabel = $derived(TYPE_LABELS[logicalType] ?? 'python3');
 	// The notebook's designated imports cell: user-choosable, marked in the toolbar
 	// with the "imports" badge, and free to live at any index. Only a Python code
 	// cell can hold the role, so the mark action is offered only when `canBeImports`.
@@ -1013,7 +1018,7 @@
 		error: 'text-error border-error bg-error/10'
 	};
 
-	// ---- Cell-type menu (Python / SQL / Markdown) ---------------------------
+	// ---- Cell-type menu (Python / SQL / Mojo / Chat / Markdown / Raw) -------
 	// A native popover so the menu renders in the top layer, unclipped by the
 	// card's `overflow-hidden`. Positioned under its trigger button on open.
 	let typeMenuEl = $state<HTMLElement | null>(null);
@@ -1026,24 +1031,27 @@
 		typeMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
 		typeMenuEl.style.top = r.bottom + 4 + 'px';
 	}
-	// The cell-type menu options (Python / SQL / Chat / Markdown / Raw). This menu
-	// is the ONLY create path for raw - there is deliberately no "+ Raw" insert
-	// button, a once-per-notebook type not being worth a button on every gap. Chat
+	// The cell-type menu options (Python / SQL / Mojo / Chat / Markdown / Raw). This
+	// menu is the ONLY create path for raw AND for mojo - there is deliberately no
+	// "+ Raw" or "+ Mojo" insert button, neither being worth a button on every gap
+	// (raw is once-per-notebook; a second mojo cell comes for free from the
+	// language a plain "+ Code" insertion INHERITS - see `$lib/cellInherit`). Chat
 	// is different: asking a question recurs through a session the way code and
 	// markdown do, so it IS also creatable directly from the add affordances (the
 	// bottom add row and the hover-between strip in `Notebook.svelte`, both gated
 	// off `$lib/cellLanguage` on a `.py` notebook exactly like `typeOptions`
 	// below). Converting an existing cell stays here for every type.
 	//
-	// Raw AND chat are DROPPED on a `.py` text notebook: such a document is rebuilt
-	// from its cells on every save, carrying neither the raw marker nor any
-	// `cellar` metadata or outputs, so the server refuses both (`assertCanHoldType`)
-	// - and a notebook that cannot hold a cell type must not be offered a control
-	// for one. WHICH types those are is read from `$lib/cellLanguage`, so the menu
-	// cannot drift from the writers' rule.
+	// Raw, mojo AND chat are DROPPED on a `.py` text notebook: such a document is
+	// rebuilt from its cells on every save, carrying neither the raw marker nor any
+	// `cellar` metadata or outputs, so the server refuses all three
+	// (`assertCanHoldType`) - and a notebook that cannot hold a cell type must not
+	// be offered a control for one. WHICH types those are is read from
+	// `$lib/cellLanguage`, so the menu cannot drift from the writers' rule.
 	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
+		{ v: 'mojo', label: 'Mojo', hint: '%%mojo' },
 		{ v: 'chat', label: 'Chat', hint: 'claude' },
 		{ v: 'markdown', label: 'Markdown', hint: 'text' },
 		{ v: 'raw', label: 'Raw', hint: 'verbatim' }
@@ -1265,14 +1273,20 @@
 	// tokens, so nothing resolves the `--cellar-cm-tok-*` properties and the source
 	// renders in the theme's base ink. (`Compartment.reconfigure` accepts any
 	// Extension, an empty array included.)
+	// Mojo takes the PYTHON grammar deliberately, and that is not a shortcut: the
+	// Mojo kernel's own `language_info` specifies `pygments_lexer: python` and
+	// `codemirror_mode: python`, i.e. Modular itself says to highlight Mojo with the
+	// Python mode. Do not "fix" this to plain text; a real Mojo grammar is only worth
+	// it if the syntaxes drift far enough apart to matter.
 	function langFor() {
 		if (cell.cell_type === 'markdown') return markdown();
 		if (isRaw) return [];
 		if (isChat) return markdown(); // a chat question is prose; markdown is its grammar
-		return isSql ? sql() : python();
+		return isSql ? sql() : python(); // mojo: python(), per Mojo's own language_info
 	}
 	// The same grammar choice, for the static (no-editor) render. Kept in lockstep
-	// with `langFor` so the read-only view highlights like the editor it precedes.
+	// with `langFor` so the read-only view highlights like the editor it precedes -
+	// mojo falls through to 'python' there for the reason stated above `langFor`.
 	const staticLang = $derived<StaticLang>(
 		isRaw ? 'plain' : isMarkdown || isChat ? 'markdown' : isSql ? 'sql' : 'python'
 	);
@@ -1280,7 +1294,10 @@
 	// Reconfigure the editor language when the cell type OR its SQL/chat/Python
 	// language toggles; after a manual cell_type toggle, drop into edit mode so the
 	// user sees the source. `isSql`/`isChat` are read so a code↔sql/chat switch
-	// re-applies the grammar too (cell_type stays 'code' across it).
+	// re-applies the grammar too (cell_type stays 'code' across it). `isMojo` is
+	// deliberately NOT tracked: mojo takes the same python() grammar as code, so a
+	// code↔mojo switch changes nothing to reconfigure, and sql↔mojo already flips
+	// `isSql`. A tracked dep that can never change the answer is a needless dispatch.
 	let prevType = cell.cell_type;
 	$effect(() => {
 		const type = cell.cell_type;
@@ -2067,6 +2084,18 @@
 						data-testid="chat-badge">chat</span
 					>
 				{/if}
+				{#if isMojo}
+					<!-- Mojo indicator. Tinted like SQL and chat - it IS an execution mode -
+					     and its tooltip carries the one thing a Mojo user must know, because
+					     it is Modular's semantics rather than anything Cellar chose: each
+					     `%%mojo` cell is a fresh `mojo run` subprocess, so nothing survives
+					     from one Mojo cell to the next. -->
+					<span
+						class="badge badge-xs ml-1.5 badge-soft badge-accent font-medium"
+						title="Mojo cell - compiled to a %%mojo cell magic and run by `mojo run` in a subprocess. Each Mojo cell is a COMPLETE program (it needs its own `def main():`); no variables, imports or definitions carry over from one Mojo cell to the next."
+						data-testid="mojo-badge">mojo</span
+					>
+				{/if}
 				{#if isRaw}
 					<!-- Raw indicator, deliberately NEUTRAL where the SQL badge is tinted:
 					     raw is not an execution mode, it is the absence of one. Without it
@@ -2310,7 +2339,7 @@
 							bind:this={typeBtnEl}
 							class="btn btn-ghost btn-xs flex h-5 min-h-0 items-center gap-0.5 px-1.5 font-mono text-[11px] font-normal text-base-content/40 hover:text-base-content/80"
 							onclick={openTypeMenu}
-							title="Change cell type (Python · SQL · Chat · Markdown · Raw)"
+							title="Change cell type (Python · SQL · Mojo · Chat · Markdown · Raw)"
 							data-testid="type-toggle"
 						>
 							{typeLabel}

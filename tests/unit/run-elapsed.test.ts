@@ -175,9 +175,20 @@ describe('the run start on the queue snapshot', () => {
 	// The broadcast case below mocks the event bus. Undoing that from a trailing
 	// statement in the test body only runs on the happy path, so ONE genuine failure
 	// there leaked the mock into every later test in the file and reported six
-	// failures for one defect. Teardown belongs in a hook that always runs.
+	// failures for one defect. Teardown belongs in a hook that always runs - but it
+	// must undo only a mock that was really taken: `doMock`/`doUnmock` are QUEUED and
+	// vitest applies the whole pending batch in ONE `Promise.all`, each entry
+	// awaiting its own path resolution first, so their apply order is not the order
+	// they were queued in. An unmock queued after a test that never mocked would sit
+	// in the same batch as the mock below and, landing second, leave the REAL bus in
+	// place - the case would then observe no broadcast at all. The flag is set BEFORE
+	// the mock, so a throw anywhere after it still cleans up.
+	let mockedEvents = false;
 	afterEach(() => {
-		vi.doUnmock('../../src/lib/server/events');
+		if (mockedEvents) {
+			mockedEvents = false;
+			vi.doUnmock('../../src/lib/server/events');
+		}
 		vi.resetModules();
 	});
 
@@ -215,6 +226,7 @@ describe('the run start on the queue snapshot', () => {
 		// appears until the queue happens to change again (possibly never).
 		vi.resetModules();
 		const seen: unknown[] = [];
+		mockedEvents = true;
 		vi.doMock('../../src/lib/server/events', () => ({
 			publishGlobal: (ev: unknown) => seen.push(ev),
 			publish: () => {}
@@ -296,10 +308,20 @@ describe('the run reports its own start (run.ts)', () => {
 		vi.spyOn(Date, 'now').mockImplementation(() => clock);
 	});
 
+	// Deliberately NO `vi.doUnmock` for the two paths `load()` re-mocks: every test
+	// here goes through `load()`, which re-registers both before it imports anything,
+	// and `vi.doMock` on a path replaces its registry entry AND drops the cached
+	// factory result - so an unmock buys nothing and is not merely redundant, it is a
+	// RACE. Vitest queues `doMock`/`doUnmock` and applies the whole pending batch in
+	// ONE `Promise.all`, each entry awaiting its own path resolution first, so their
+	// apply order is not the order they were queued in. An unmock left pending from
+	// this hook lands in the SAME batch as the next test's re-mock of that path, and
+	// applied second it leaves the module UNMOCKED: the run then executes against the
+	// REAL kernel, the fake `execute` never runs, and the case below reads an
+	// `undefined` queue snapshot for a start the run really did stamp. Only a test
+	// PRECEDED by this hook is exposed, which is why it surfaced on the last one.
 	afterEach(() => {
 		vi.restoreAllMocks();
-		vi.doUnmock('../../src/lib/server/kernel');
-		vi.doUnmock('../../src/lib/server/notebook');
 		vi.resetModules();
 	});
 

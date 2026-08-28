@@ -127,7 +127,7 @@ function starterCell(): Cell {
 }
 
 function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCellar {
-	// 'sql'/'chat' are LOGICAL types: an nbformat `code` cell tagged
+	// 'sql'/'chat'/'mojo' are LOGICAL types: an nbformat `code` cell tagged
 	// cellar.language (see $lib/cellLanguage.js, whose `languageTagFor` is the ONE
 	// tag rule). code/markdown/raw are nbformat types of their own, and
 	// `nbCellType` is the ONE mapping.
@@ -1546,13 +1546,14 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
 
 /**
  * Refuse a type a `.py` TEXT notebook cannot hold (`PY_UNSUPPORTED_TYPES`:
- * `raw`, `chat`), BEFORE anything is written.
+ * `raw`, `chat`, `mojo`), BEFORE anything is written.
  *
  * `persist` writes such a document back through jupytext / the Databricks
  * converter, which rebuilds it from its cells and coerces every `cell_type` to
  * markdown|code, carrying no `cellar` metadata and no outputs - so a raw cell
  * would live only in memory and come back from disk as a runnable Python cell,
- * and a chat cell would come back the same way with its REPLY gone (see
+ * a chat cell would come back the same way with its REPLY gone, and a mojo cell
+ * would come back as a Python cell holding Mojo source (see
  * `textNotebookCellTypeError`, which owns the reasoning and the messages). The
  * guard sits at EVERY doc-layer writer that can put such a type into a document
  * - the two that CONVERT a cell (`setCellType`, `setCellTypes`) and the two that
@@ -1562,7 +1563,7 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
  * check each of them could forget. `addCellAt`'s only caller passes 'code'
  * today, so it is guarded to make the claim true by construction rather than by
  * that caller's argument. Which types are refused lives in `cellLanguage.ts`, so
- * a sixth logical type is decided there once instead of here per writer. Every
+ * a seventh logical type is decided there once instead of here per writer. Every
  * other type is unaffected, and an `.ipynb` never reaches the throw.
  *
  * The CREATE paths ask it through `assertCanHoldCell` as well, about the cell
@@ -1584,9 +1585,9 @@ function assertCanHoldType(doc: NotebookDoc, cellType: LogicalCellType): void {
  * still produced a chat cell - on a `.py` document, exactly the state the guard
  * refuses. Asking the cell itself closes that by construction: a caller-supplied
  * namespace can never produce a cell state the `cellType` argument would have
- * been refused for, and a sixth logical type carried the same way inherits the
- * rule instead of needing a check of its own. Called before the cell is spliced
- * in, so a refusal still writes nothing.
+ * been refused for, and a seventh logical type carried the same way inherits the
+ * rule instead of needing a check of its own (`mojo` landed under it with no
+ * edit). Called before the cell is spliced in, so a refusal still writes nothing.
  */
 function assertCanHoldCell(doc: NotebookDoc, cell: Cell): void {
 	assertCanHoldType(doc, logicalCellType(cell));
@@ -1621,20 +1622,22 @@ export function addCell(
 }
 
 /**
- * Switch a cell's LOGICAL type between 'code', 'sql', and 'markdown'. 'sql' is a
- * code cell tagged `cellar.language = 'sql'` ($lib/cellLanguage.js), so it shares
- * the nbformat `code` type on disk; 'code' clears that tag back to Python.
+ * Switch a cell's LOGICAL type ('code' | 'sql' | 'mojo' | 'chat' | 'markdown' |
+ * 'raw'). 'sql', 'mojo' and 'chat' are code cells tagged `cellar.language`
+ * ($lib/cellLanguage.js's `languageTagFor`, the ONE tag rule), so they share the
+ * nbformat `code` type on disk; 'code' clears that tag back to Python.
  *
  * Markdown cells carry no outputs - nor the imports role: a markdown cell cannot
  * run, so leaving the designation on one would strand every future routed import
- * in a cell the kernel never sees. A SQL cell likewise can't hold Python imports,
- * so converting to SQL drops the imports role too.
+ * in a cell the kernel never sees. A SQL, Mojo or chat cell likewise can't hold
+ * Python imports, so converting to one of those drops the imports role too.
  *
  * The `cell:type` event carries the new `language` so live sync updates the
- * editor's syntax highlighting (SQL ↔ Python) without a reload.
+ * editor's syntax highlighting (SQL ↔ Python) without a reload; the browser
+ * rebuilds the logical type from that pair through `logicalTypeFor`.
  *
- * A `.py` text notebook REFUSES 'raw'/'chat' here - see `assertCanHoldType`; every other
- * conversion stays allowed on one.
+ * A `.py` text notebook REFUSES 'raw'/'chat'/'mojo' here - see `assertCanHoldType`;
+ * every other conversion stays allowed on one.
  */
 export function setCellType(id: string, cellType: LogicalCellType, nb?: string | null, originId?: string | null): void {
 	const doc = docFor(nb);
@@ -1650,7 +1653,8 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
  * The in-place half of a type switch, shared by the single-cell setter and the
  * `setCellTypes` batch so the two can never diverge on the metadata rules: any
  * non-code type (markdown, raw) clears outputs, and anything holding no Python
- * (those two plus SQL and chat) drops the imports role and the nbdev export flag.
+ * (those two plus SQL, Mojo and chat) drops the imports role and the nbdev export
+ * flag.
  *
  * `LiveNotebook.applyCellTypeLocally` is the browser's copy of exactly these
  * rules - `cell:type` carries no metadata, so a client half that skipped one
@@ -1683,16 +1687,18 @@ function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	}
 	if (lang) cell.metadata.cellar.language = lang;
 	else delete cell.metadata.cellar.language;
-	// A cell the kernel actually executes as Python. Markdown and raw never reach
-	// it at all; SQL reaches it compiled, so it holds no Python either; a CHAT
-	// cell's source is prose the kernel never sees.
+	// A cell the kernel actually executes as Python - i.e. an UNTAGGED code cell,
+	// which is why `!lang` is the whole test. Markdown and raw never reach the
+	// kernel at all; SQL and Mojo reach it compiled (to `spark.sql(...)` and to a
+	// `%%mojo` magic), so neither holds Python; a CHAT cell's source is prose the
+	// kernel never sees.
 	const runnable = cell.cell_type === 'code' && !lang;
 	// Only a code cell holds outputs - markdown and raw carry none, and
 	// `serialize` would drop them anyway.
 	if (cell.cell_type !== 'code') cell.outputs = [];
 	// Neither the imports role nor the nbdev export flag may sit on a cell holding
-	// no Python: the kernel never sees a markdown or raw cell, and a SQL cell's
-	// source is not Python.
+	// no Python: the kernel never sees a markdown or raw cell, and a SQL, Mojo or
+	// chat cell's source is not Python.
 	if (!runnable && cell.metadata.cellar.role === IMPORTS_ROLE) delete cell.metadata.cellar.role;
 	if (!runnable && cell.metadata.cellar.export) delete cell.metadata.cellar.export;
 	// `hide_input` is deliberately KEPT: `$lib/hideInput` reads it only for a code

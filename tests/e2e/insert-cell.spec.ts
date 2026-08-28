@@ -269,6 +269,13 @@ test('split-cell hands the created half the cell it came out of - language yes, 
 	await expect(cells).toHaveCount(beforeExport + 1);
 	const exportCell = cells.last();
 	const exportId = (await exportCell.getAttribute('data-cell-id')) ?? '';
+	// The type is STATED, not assumed: "+ Code" inherits the language of the code
+	// cell above it (`$lib/cellInherit`), and the cells above are the SQL halves this
+	// test just split - so the new cell is SQL until it is told otherwise, and a SQL
+	// cell carries no export flag at all. Setting it first is what keeps THIS test
+	// about split-cell rather than about the insertion default.
+	await patchCell(page, exportId, { cell_type: 'code' });
+	await expect(exportCell.getByTestId('type-toggle')).toHaveText(/python/i);
 	await patchCell(page, exportId, { export: true });
 	// the export toggle in the row IS the marker now - the separate badge that
 	// said the same thing is gone (tests/unit/cell-row-toggles.test.ts)

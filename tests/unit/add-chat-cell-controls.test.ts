@@ -91,15 +91,16 @@ describe('offersCellType - the one rule every create control asks', () => {
 		}
 	});
 
-	it('withholds chat (and raw) on a .py notebook, and offers the rest', () => {
+	it('withholds chat (and raw, and mojo) on a .py notebook, and offers the rest', () => {
 		expect(offersCellType('chat', true)).toBe(false);
 		expect(offersCellType('raw', true)).toBe(false);
+		expect(offersCellType('mojo', true)).toBe(false);
 		for (const type of ['code', 'sql', 'markdown'] as const) {
 			expect(offersCellType(type, true), `offersCellType('${type}', isPy=true)`).toBe(true);
 		}
 	});
 
-	it('withholds EXACTLY the types the shared list names, so a sixth type is added once', () => {
+	it('withholds EXACTLY the types the shared list names, so a seventh type is added once', () => {
 		const withheld = LOGICAL_CELL_TYPES.filter((type) => !offersCellType(type, true));
 		expect([...withheld].sort()).toEqual([...PY_UNSUPPORTED_TYPES].sort());
 	});

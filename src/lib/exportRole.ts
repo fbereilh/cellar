@@ -37,6 +37,13 @@ type ExportCell = { cell_type?: string; metadata?: CellMetadata | null } | null 
  * `isExportCell` is built from, rather than each re-deriving it from
  * `isLogicalCellType` and agreeing only by coincidence. A cell can then never be
  * marked into a state the exporter ignores.
+ *
+ * It is the SAME test as `$lib/cellLanguage`'s `isPythonCodeCell`, under its own
+ * name because it is also the export eligibility rule - which is why a MOJO cell
+ * was excluded here the day the type landed, with no edit: stated positively, a
+ * new tagged language is out of the nbdev module by construction. That matters,
+ * because the generated `.py` is a file nbdev COMMITS TO GIT, so admitting a
+ * non-Python body writes invalid Python into the repository.
  */
 export function canExportCell(cell: ExportCell): boolean {
 	return isLogicalCellType(cell, 'code');

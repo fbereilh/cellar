@@ -133,8 +133,8 @@
 		/** This notebook's declared code root (kernel cwd + sys.path), or null for the workspace. */
 		root?: string | null;
 		/** True for a `.py` text notebook, which stores no notebook metadata (no root
-		 *  picker) and, being rebuilt from its cells on save, cannot hold a raw cell
-		 *  (no Raw entry in a cell's type menu). */
+		 *  picker) and, being rebuilt from its cells on save, cannot hold a raw, Mojo
+		 *  or chat cell (no Raw/Mojo/Chat entry in a cell's type menu). */
 		isPy?: boolean;
 		/** The workspace's code roots — an empty list renders no root control at all. */
 		availableRoots?: WorkspaceRootOption[];
@@ -724,8 +724,10 @@
      the first cell and between every pair; the always-visible append bar covers
      the very end. Code stays first and one click, so the common case pays nothing
      for the chat button; Chat is withheld on a `.py` notebook (`offerChatCell`),
-     which cannot hold one. Raw stays menu-only - see `ALL_TYPE_OPTIONS` in
-     `Cell.svelte`. -->
+     which cannot hold one. Raw and Mojo stay menu-only - see `ALL_TYPE_OPTIONS` in
+     `Cell.svelte`. "+ Code" is not hardwired to Python either: `LiveNotebook`
+     resolves it through `$lib/cellInherit`, so it takes the language of the code
+     cell above. -->
 {#snippet insertControls(where: 'above' | 'below', targetId: string | undefined)}
 	{#if targetId}
 		<div class="pointer-events-none absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-primary/25 opacity-0 transition-opacity group-hover/ins:opacity-100"></div>

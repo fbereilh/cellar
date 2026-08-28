@@ -181,6 +181,32 @@ function run(
 	return p;
 }
 
+/**
+ * Wait until the run has actually DELIVERED `n` deltas, bounded and loud.
+ *
+ * A fixed sleep here is a race: the wait has to cover spawning the shell stub,
+ * its echoes, and the engine parsing and forwarding the delta, which under this
+ * suite's parallel forks (and, measured, even in isolation) can exceed any
+ * constant worth hardcoding - and losing that race silently turns "what
+ * streamed before the stop is kept" into an empty array. Gating on the
+ * condition itself is deterministic, and mirrors how the settle test below
+ * establishes "after the settle" with a flag file rather than out-racing a
+ * timer.
+ */
+async function waitForDeltas(
+	p: { deltas: string[] },
+	n = 1,
+	timeoutMs = 10_000
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (p.deltas.length < n) {
+		if (Date.now() > deadline) {
+			throw new Error(`the run delivered ${p.deltas.length} delta(s), expected ${n}, in ${timeoutMs}ms`);
+		}
+		await new Promise((r) => setTimeout(r, 10));
+	}
+}
+
 beforeAll(() => {
 	BIN = mkdtempSync(join(tmpdir(), 'cellar-chat-stub-'));
 	OUT = mkdtempSync(join(tmpdir(), 'cellar-chat-out-'));
@@ -1194,8 +1220,8 @@ describe('distinct, actionable failure states', () => {
 		);
 		const ctrl = new AbortController();
 		const p = run({ signal: ctrl.signal });
-		// Give the child a beat to emit the first delta, then interrupt.
-		await new Promise((r) => setTimeout(r, 400));
+		// Interrupt only once the first delta has really been delivered.
+		await waitForDeltas(p);
 		ctrl.abort();
 		const res = await p;
 		expect(res.failure?.kind).toBe('cancelled');
@@ -1229,7 +1255,7 @@ describe('distinct, actionable failure states', () => {
 		);
 		const ctrl = new AbortController();
 		const p = run({ signal: ctrl.signal });
-		await new Promise((r) => setTimeout(r, 400));
+		await waitForDeltas(p);
 		ctrl.abort();
 		const res = await p;
 		expect(res.failure?.kind).toBe('cancelled');

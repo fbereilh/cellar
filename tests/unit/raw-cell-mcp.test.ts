@@ -163,7 +163,7 @@ describe('the tool schemas', () => {
 	// description bound.
 	it('offers raw in every cell_type enum, and says so in the doctrine', () => {
 		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
-		const enums = src.match(/z\.enum\(\['code', 'sql', 'markdown'[^)]*\)/g) ?? [];
+		const enums = src.match(/z\.enum\(\['code', 'sql', [^)]*\)/g) ?? [];
 		expect(enums.length).toBe(4);
 		for (const e of enums) expect(e).toContain("'raw'");
 		// The doctrine clause an agent reads before it ever calls one of them.

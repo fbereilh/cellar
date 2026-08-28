@@ -106,7 +106,7 @@
 
 import type { Cell, ImportChangeStamps, LastRun, SessionId } from '$lib/server/types';
 import { buildDefinerGraph, type Dataflow } from '$lib/symbolGraph';
-import { isChatCell } from '$lib/cellLanguage';
+import { hasPythonDataflow } from '$lib/cellLanguage';
 
 export type { Dataflow };
 
@@ -223,8 +223,17 @@ export function computeStaleness(
 	// nothing and read nothing the graph can see (their "inputs" are prose), so
 	// they are excluded here and fall to the n/a loop below - a chat reply is
 	// nondeterministic, and a staleness verdict over it would claim a re-run
-	// restores something no re-run can.
-	const codeCells = cells.filter((c) => c.cell_type === 'code' && !isChatCell(c));
+	// restores something no re-run can. MOJO cells are excluded for the sibling
+	// reason: each one is a whole program compiled to a `%%mojo` magic that runs in
+	// a SUBPROCESS, so it binds nothing any later cell can read and a fresh/stale
+	// verdict over it would be a claim about state that never existed.
+	//
+	// `hasPythonDataflow` is the ONE predicate for that (`$lib/cellLanguage`), and it
+	// is deliberately WIDER than `isPythonCodeCell`: a SQL cell's source is not
+	// Python, but `sql.ts` compiles it to a wrapper that really does bind `_sql_df`
+	// in the kernel namespace, so it MUST stay in the graph or a Python cell reading
+	// a SQL result would never go stale when the query is edited.
+	const codeCells = cells.filter(hasPythonDataflow);
 	const { definerBefore, edgeNames } = buildDefinerGraph(codeCells, df);
 	const importDefines = codeCells.map((c) => new Set(df[c.id]?.imports ?? []));
 

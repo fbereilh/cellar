@@ -87,7 +87,7 @@ import { currentSessionId } from './kernel';
 import { listCells } from './notebook';
 import { projectPython } from './databricks';
 import { computeStaleness } from '../staleness';
-import { isChatCell, isSqlCell } from '../cellLanguage';
+import { isPythonCodeCell, isSqlCell } from '../cellLanguage';
 import { hasAutoreloadMagic, normalizeForAnalysis } from './magics';
 import { parseSqlCell } from './sql';
 import { importBindingNames } from './importBindings';
@@ -675,9 +675,19 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 	// CHAT cells are code cells on disk but their source is English prose - it must
 	// never reach the Python probe (a guaranteed parse failure, and prose defines
 	// nothing). Unlike SQL they bind NO kernel names either, so there is no
-	// synthetic contribution: a chat cell simply has no dataflow at all.
-	const sql = cells.filter((c) => c.cell_type === 'code' && isSqlCell(c));
-	const code = cells.filter((c) => c.cell_type === 'code' && !isSqlCell(c) && !isChatCell(c));
+	// synthetic contribution: a chat cell simply has no dataflow at all. MOJO cells
+	// are the same shape for a different reason: `mojo.ts` compiles them to a
+	// `%%mojo` magic that runs a SUBPROCESS whose namespace dies with the cell, so
+	// even a `def main()` binds nothing that outlives it.
+	//
+	// The Python bucket is `isPythonCodeCell` - stated POSITIVELY rather than as the
+	// `!isSqlCell(c) && !isChatCell(c)` chain it replaced, so a new tagged language
+	// is out of the probe by construction instead of by remembering a fourth `&&`.
+	// Measured on real Mojo, that omission is not benign: the probe reads
+	// `def main(): print(...)` as Python and reports `defines=['main']`, a wholly
+	// fabricated edge, and the batch still says ok - so it is CACHED as authoritative.
+	const sql = cells.filter(isSqlCell);
+	const code = cells.filter(isPythonCodeCell);
 	// `%autoreload` is a KERNEL-GLOBAL setting, so its effect on the import-binding
 	// exemption is notebook-wide, not cell-local: with it armed, re-running `import
 	// mymod` re-imports a changed module instead of handing back the `sys.modules`

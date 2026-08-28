@@ -36,10 +36,36 @@
  *     it renders fine as a document, but running it there raises `SyntaxError` -
  *     the same interop trade already accepted for SQL cells.
  *
- * This module is the single source of truth for "is this a SQL/chat cell", for
- * the five-way LOGICAL cell type the UI toggle + MCP tools speak (`code` / `sql`
- * / `markdown` / `raw` / `chat`), and for the ONE mapping back onto nbformat
- * (`nbCellType`), shared by the server and the browser so the two never disagree.
+ * A MOJO cell is the SQL shape again, with one difference that decides its whole
+ * design: the kernel is a PYTHON kernel and Modular ships NO Mojo Jupyter kernel,
+ * so a Mojo cell runs the only way Modular supports - `import mojo.notebook`
+ * registers a `%%mojo` CELL MAGIC, and the magic writes the body to a temp file,
+ * `mojo run`s it in a subprocess and prints its stdout. `server/mojo.ts` compiles
+ * a mojo cell to that magic at RUN time exactly as `server/sql.ts` compiles SQL to
+ * `spark.sql(...)`; the source on disk stays bare Mojo. Two costs are ACCEPTED and
+ * must not be "fixed" later:
+ *   - **NO state persists between Mojo cells.** Each `%%mojo` cell is a fresh temp
+ *     file and a fresh `mojo run`, so Modular's own docs say every Mojo cell must
+ *     be a complete program with a `main()`. That is Modular's semantics, not a
+ *     Cellar defect; Cellar states it (the badge tooltip) rather than faking
+ *     continuity.
+ *   - **In plain Jupyter a mojo cell is a code cell holding Mojo source**: it
+ *     renders fine, and running it there raises `SyntaxError` - the same interop
+ *     trade already accepted for SQL and chat cells.
+ *
+ * This module is the single source of truth for "is this a SQL/chat/mojo cell", for
+ * the six-way LOGICAL cell type the UI toggle + MCP tools speak (`code` / `sql`
+ * / `mojo` / `markdown` / `raw` / `chat`), and for the ONE mapping back onto
+ * nbformat (`nbCellType`), shared by the server and the browser so the two never
+ * disagree.
+ *
+ * IT ALSO OWNS THE TWO "WHOSE SOURCE IS PYTHON" PREDICATES every Python-semantics
+ * engine asks (`isPythonCodeCell`, `hasPythonDataflow`). They are stated
+ * POSITIVELY - a language is in the set only by being named - so a SEVENTH
+ * language is excluded from the dataflow probe, the staleness graph, the imports
+ * sweep and the nbdev export BY CONSTRUCTION rather than by four new
+ * `&& !isWhateverCell(c)` clauses that a future language would have to remember
+ * to add in four places.
  */
 
 import type { CellMetadata, CellType, LogicalCellType } from '$lib/server/types';
@@ -57,11 +83,15 @@ export const SQL_LANGUAGE = 'sql';
 /** The `cellar.language` value that marks a code cell as an AI chat cell. */
 export const CHAT_LANGUAGE = 'chat';
 
-/** The editor language of a code cell: 'sql'/'chat' when tagged, else 'python'. */
-export function cellLanguage(cell: LanguageCell): 'sql' | 'chat' | 'python' {
+/** The `cellar.language` value that marks a code cell as Mojo (see the header). */
+export const MOJO_LANGUAGE = 'mojo';
+
+/** The editor language of a code cell: the tag when it carries one, else 'python'. */
+export function cellLanguage(cell: LanguageCell): 'sql' | 'chat' | 'mojo' | 'python' {
 	const tag = cell?.metadata?.cellar?.language;
 	if (tag === SQL_LANGUAGE) return SQL_LANGUAGE;
 	if (tag === CHAT_LANGUAGE) return CHAT_LANGUAGE;
+	if (tag === MOJO_LANGUAGE) return MOJO_LANGUAGE;
 	return 'python';
 }
 
@@ -80,6 +110,16 @@ export function isChatCell(cell: LanguageCell): boolean {
 }
 
 /**
+ * True for a code cell whose source is MOJO (`cellar.language === 'mojo'`).
+ * Compiled to a `%%mojo` cell magic at run time (`server/mojo.ts`) and run by the
+ * ordinary PYTHON kernel; excluded from every Python-semantics engine by
+ * `isPythonCodeCell` / `hasPythonDataflow` below.
+ */
+export function isMojoCell(cell: LanguageCell): boolean {
+	return cell?.cell_type === 'code' && cellLanguage(cell) === MOJO_LANGUAGE;
+}
+
+/**
  * True for an nbformat `raw` cell: verbatim text Cellar never executes and never
  * renders (frontmatter for Quarto/nbdev, directives for nbconvert). The ONE
  * predicate, so no surface hand-writes `cell.cell_type === 'raw'`.
@@ -89,15 +129,16 @@ export function isRawCell(cell: LanguageCell): boolean {
 }
 
 /**
- * The four LOGICAL cell types the UI toggle, the REST routes and the MCP
+ * The six LOGICAL cell types the UI toggle, the REST routes and the MCP
  * `cell_type` argument speak. The ONE vocabulary: a route that hand-maintained
- * its own copy would keep accepting three while the others accept four (this
- * list grew by one when `raw` landed), and an out-of-vocabulary value is not
+ * its own copy would keep accepting three while the others accept six (this
+ * list grew by one when `raw` landed, and again for `chat` and `mojo`), and an
+ * out-of-vocabulary value is not
  * inert - `nbCellType` maps anything it does not recognize onto `code`, so a
  * typo would silently turn a raw cell holding frontmatter into a runnable
  * Python cell.
  */
-export const LOGICAL_CELL_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'markdown', 'raw', 'chat'];
+export const LOGICAL_CELL_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'mojo', 'markdown', 'raw', 'chat'];
 
 /**
  * Is `value` one of the logical cell types above? The predicate every entry point
@@ -114,21 +155,29 @@ export const RAW_UNSUPPORTED_REASON = 'raw-in-py-notebook';
 /** The refusal code a route reports when `chat` was asked for on a `.py` notebook. */
 export const CHAT_UNSUPPORTED_REASON = 'chat-in-py-notebook';
 
+/** The refusal code a route reports when `mojo` was asked for on a `.py` notebook. */
+export const MOJO_UNSUPPORTED_REASON = 'mojo-in-py-notebook';
+
 /**
- * The logical types a `.py` TEXT notebook cannot hold, in ONE list.
+ * The logical types a `.py` TEXT notebook cannot hold, named ONCE.
  *
- * Both fail the same way and for the same reason (see `TextNotebookCellTypeError`
- * below): such a document is rebuilt from its CELLS on every save by jupytext /
- * the Databricks converter, which carries neither `cellar` cell metadata nor
- * outputs - so the declaration lives only in memory and disk holds a plain
- * `code` cell. The list exists so a SIXTH logical type is added HERE rather than
- * shipping straight into the same trap, and so no writer keeps a per-type copy
- * of the rule.
+ * All three fail the same way and for the same reason (see
+ * `TextNotebookCellTypeError` below): such a document is rebuilt from its CELLS
+ * on every save by jupytext / the Databricks converter, which carries neither
+ * `cellar` cell metadata nor outputs - so the declaration lives only in memory
+ * and disk holds a plain `code` cell. The union exists so a SEVENTH logical type
+ * is added HERE rather than shipping straight into the same trap, and so no
+ * writer keeps a per-type copy of the rule.
+ *
+ * It is the UNION rather than a list because everything else about the rule is
+ * DERIVED from it: `PY_UNSUPPORTED_COPY` is a `Record` over it (so a member with
+ * no message and no refusal code does not compile) and `PY_UNSUPPORTED_TYPES` is
+ * that record's keys (so the list cannot fall behind either).
  */
-export const PY_UNSUPPORTED_TYPES: readonly LogicalCellType[] = ['raw', 'chat'];
+export type PyUnsupportedType = Extract<LogicalCellType, 'raw' | 'chat' | 'mojo'>;
 
 /** Can a `.py` TEXT notebook hold this logical type? */
-export function isPyUnsupportedType(cellType: unknown): cellType is LogicalCellType {
+export function isPyUnsupportedType(cellType: unknown): cellType is PyUnsupportedType {
 	return typeof cellType === 'string' && (PY_UNSUPPORTED_TYPES as readonly string[]).includes(cellType);
 }
 
@@ -161,33 +210,95 @@ export const TEXT_NOTEBOOK_RAW_MESSAGE =
 export const TEXT_NOTEBOOK_CHAT_MESSAGE =
 	'A .py notebook cannot hold a chat cell: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and carries neither cell metadata nor outputs, so after a reload the cell would be a RUNNABLE Python cell holding English prose and the AI reply would be gone for good (no re-run reproduces it). Convert it to .ipynb first.';
 
+/** The same, for a mojo cell: the `cellar.language` tag is what makes it Mojo. */
+export const TEXT_NOTEBOOK_MOJO_MESSAGE =
+	'A .py notebook cannot hold a Mojo cell: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and carries no cell metadata, so the `mojo` tag would be lost and after a reload the cell would be a RUNNABLE Python cell holding Mojo source. Convert it to .ipynb first.';
+
+/**
+ * Message + refusal code per unsupported type, in ONE record rather than a pair
+ * of ternaries: with two types a `x === 'chat' ? … : …` reads as exhaustive, and
+ * with a third it SILENTLY reports the raw message for a mojo refusal.
+ *
+ * Keyed over `PyUnsupportedType` rather than `string`, which is what makes the
+ * next addition a compile-time obligation rather than a claim: a member added to
+ * the union with no copy is a missing-property error here, and a key added here
+ * that is not in the union is an excess-property error - so neither half can be
+ * forgotten, and neither can silently fall back to the RAW message and the RAW
+ * refusal code, which is exactly the failure the record replaced the ternaries to
+ * prevent.
+ */
+const PY_UNSUPPORTED_COPY: Record<PyUnsupportedType, { message: string; reason: string }> = {
+	raw: { message: TEXT_NOTEBOOK_RAW_MESSAGE, reason: RAW_UNSUPPORTED_REASON },
+	chat: { message: TEXT_NOTEBOOK_CHAT_MESSAGE, reason: CHAT_UNSUPPORTED_REASON },
+	mojo: { message: TEXT_NOTEBOOK_MOJO_MESSAGE, reason: MOJO_UNSUPPORTED_REASON }
+};
+
+/**
+ * The unsupported types as a list, DERIVED from the record above so it cannot
+ * list a type the copy does not cover (nor miss one the copy does).
+ */
+export const PY_UNSUPPORTED_TYPES: readonly PyUnsupportedType[] = Object.keys(PY_UNSUPPORTED_COPY) as PyUnsupportedType[];
+
+/**
+ * The copy for a type. A type the `.py` rule does not refuse has none, so it can
+ * only be a caller asking about a type it never refused - answered with the raw
+ * copy as before. It can no longer mean "this unsupported type has no entry",
+ * which the `Record` above now makes unrepresentable.
+ */
+function pyUnsupportedCopy(cellType: LogicalCellType): { message: string; reason: string } {
+	return isPyUnsupportedType(cellType) ? PY_UNSUPPORTED_COPY[cellType] : PY_UNSUPPORTED_COPY.raw;
+}
+
 /** The message for one unsupported type. */
 export function textNotebookTypeMessage(cellType: LogicalCellType): string {
-	return cellType === 'chat' ? TEXT_NOTEBOOK_CHAT_MESSAGE : TEXT_NOTEBOOK_RAW_MESSAGE;
+	return pyUnsupportedCopy(cellType).message;
 }
 
 /** The refusal code for one unsupported type. */
 export function textNotebookTypeReason(cellType: LogicalCellType): string {
-	return cellType === 'chat' ? CHAT_UNSUPPORTED_REASON : RAW_UNSUPPORTED_REASON;
+	return pyUnsupportedCopy(cellType).reason;
+}
+
+/** The reverse of `textNotebookTypeReason`, built from the same record. */
+const PY_UNSUPPORTED_BY_REASON: ReadonlyMap<string, PyUnsupportedType> = new Map(
+	PY_UNSUPPORTED_TYPES.map((t) => [PY_UNSUPPORTED_COPY[t].reason, t] as const)
+);
+
+/**
+ * Which type a route's refusal code names, or null when the code is not one of
+ * ours - so a client can say WHY a conversion it thought legal came back refused
+ * without keeping a second copy of the codes.
+ *
+ * A DIRECT lookup keyed by the code, never a scan of `PY_UNSUPPORTED_TYPES`
+ * matching each type's reason in turn: a scan answers with the FIRST type whose
+ * reason matches, so it names the right type only for as long as every type has
+ * a distinct one - which is a property of the copy record, not of the scan. Read
+ * off that record instead, the two cannot disagree.
+ */
+export function textNotebookTypeForReason(reason: unknown): PyUnsupportedType | null {
+	if (typeof reason !== 'string') return null;
+	return PY_UNSUPPORTED_BY_REASON.get(reason) ?? null;
 }
 
 /**
- * A logical type a `.py` TEXT notebook cannot hold was asked for (`raw`, `chat`).
+ * A logical type a `.py` TEXT notebook cannot hold was asked for (`raw`, `chat`,
+ * `mojo`).
  *
  * Such a notebook is written back through jupytext / the Databricks converter,
  * which rebuilds the file from its cells and coerces every `cell_type` to
  * markdown|code (`jupytext.ts`) - and coerces again on read, carrying no
  * `cellar` metadata and no outputs. So the declaration would live only in memory
  * while disk held a `code` cell: after a reload the frontmatter sits in a cell
- * with a Run button (raw), or the question does while its REPLY is gone (chat) -
- * the exact silent degrade each type exists to prevent, and worse from MARKDOWN,
- * whose prose would lose its markers on the way too.
+ * with a Run button (raw), the question does while its REPLY is gone (chat), or
+ * Mojo source does and is handed to Python (mojo) - the exact silent degrade each
+ * type exists to prevent, and worse from MARKDOWN, whose prose would lose its
+ * markers on the way too.
  *
  * Refused by name instead, at the doc-layer writers, so no surface can route
  * around it - the `textNotebookRootError` precedent, for the identical
  * rebuilt-from-cells reason. Only these types, and only on a `.py` doc: every
- * other conversion, every raw or chat cell in an `.ipynb`, and CLEARING a type
- * are all untouched.
+ * other conversion, every raw, chat or mojo cell in an `.ipynb`, and CLEARING a
+ * type are all untouched.
  */
 export class TextNotebookCellTypeError extends Error {
 	/** The refused logical type, and the route-facing code for it. */
@@ -220,19 +331,20 @@ export function textNotebookCellTypeError(cellType: LogicalCellType): TextNotebo
 export function nbCellType(cellType: LogicalCellType): CellType {
 	if (cellType === 'markdown') return 'markdown';
 	if (cellType === 'raw') return 'raw';
-	return 'code'; // 'code', 'sql' and 'chat' all share the nbformat code type
+	return 'code'; // 'code', 'sql', 'chat' and 'mojo' all share the nbformat code type
 }
 
 /**
- * The `cellar.language` tag a LOGICAL type carries on disk: 'sql' and 'chat' are
- * tagged code cells, everything else carries no tag. The ONE tag rule, shared by
- * the server's `applyCellType`/`newCell`, the `cell:type` event payload, and the
- * browser's `applyCellTypeLocally` - a per-site `isSql ? 'sql' : null` ternary is
- * how the chat tag would be dropped by whichever copy was not updated.
+ * The `cellar.language` tag a LOGICAL type carries on disk: 'sql', 'chat' and
+ * 'mojo' are tagged code cells, everything else carries no tag. The ONE tag rule,
+ * shared by the server's `applyCellType`/`newCell`, the `cell:type` event payload,
+ * and the browser's `applyCellTypeLocally` - a per-site `isSql ? 'sql' : null`
+ * ternary is how the chat tag would be dropped by whichever copy was not updated.
  */
 export function languageTagFor(cellType: LogicalCellType): string | null {
 	if (cellType === 'sql') return SQL_LANGUAGE;
 	if (cellType === 'chat') return CHAT_LANGUAGE;
+	if (cellType === 'mojo') return MOJO_LANGUAGE;
 	return null;
 }
 
@@ -249,7 +361,36 @@ export function logicalCellType(cell: LanguageCell): LogicalCellType {
 	if (cell?.cell_type === 'markdown') return 'markdown';
 	if (isRawCell(cell)) return 'raw';
 	if (isSqlCell(cell)) return 'sql';
-	return isChatCell(cell) ? 'chat' : 'code';
+	if (isChatCell(cell)) return 'chat';
+	return isMojoCell(cell) ? 'mojo' : 'code';
+}
+
+/**
+ * The INVERSE of `nbCellType` + `languageTagFor`: the logical type an nbformat
+ * `cell_type` plus a `cellar.language` tag describe.
+ *
+ * The `cell:type` SSE event carries exactly that pair (and no metadata), so the
+ * browser has to reconstruct the logical type from it. Doing that with a hand-
+ * written ternary chain is how a new tagged language silently lands on the client
+ * as a plain `code` cell - visibly the wrong grammar, wrong badge, and (because
+ * `applyCellTypeLocally` re-derives the tag from what it is given) the tag stripped
+ * from the local model until a reload. Expressed here, the forward and reverse
+ * mappings are edited together.
+ *
+ * An UNRECOGNIZED tag reads as `code` rather than throwing: it can only arrive from
+ * a hand-edited notebook or a newer Cellar, and a code cell is what such a cell
+ * already is on disk.
+ */
+export function logicalTypeFor(
+	nbType: string | null | undefined,
+	language: string | null | undefined
+): LogicalCellType {
+	if (nbType === 'markdown') return 'markdown';
+	if (nbType === 'raw') return 'raw';
+	if (language === SQL_LANGUAGE) return 'sql';
+	if (language === CHAT_LANGUAGE) return 'chat';
+	if (language === MOJO_LANGUAGE) return 'mojo';
+	return 'code';
 }
 
 /**
@@ -268,4 +409,56 @@ export function logicalCellType(cell: LanguageCell): LogicalCellType {
  */
 export function isLogicalCellType(cell: LanguageCell, cellType: LogicalCellType): boolean {
 	return cell?.cell_type === nbCellType(cellType) && logicalCellType(cell) === cellType;
+}
+
+/**
+ * Does this cell's SOURCE hold module-level PYTHON? The ONE rule every
+ * Python-semantics engine asks before touching a cell: the `ast`/`symtable`
+ * dataflow probe (`server/dataflow.ts`), the imports sweep and agent import
+ * routing (`server/imports-cell.ts`), and the nbdev export
+ * (`exportRole.ts`'s `canExportCell`, which is this same test under its own
+ * name because it is also the export ELIGIBILITY rule).
+ *
+ * Stated POSITIVELY - `isLogicalCellType(cell, 'code')` - and that is the whole
+ * point. Written as the negations it replaced (`cell_type === 'code' &&
+ * !isSqlCell(c) && !isChatCell(c)`), every new tagged language costs one more
+ * `&&` in every engine, and the engine whose clause was forgotten silently hands
+ * non-Python source to a Python parser. Measured on real Mojo: the probe reads
+ * `def main(): print(...)` as Python and reports `defines=['main']` - a wholly
+ * fabricated dependency edge - while the imports sweep LIFTS `from std.time
+ * import sleep` out of the cell into the Python imports cell and RUNS it,
+ * breaking both halves at once. Positively stated, `mojo` was never in the set.
+ *
+ * Deliberately the STRICT `isLogicalCellType`, not `logicalCellType(cell) ===
+ * 'code'`: the loose form maps a FOREIGN nbformat `cell_type` (`ipynb.ts` passes
+ * one through verbatim) onto `code`, so an externally-authored cell Cellar
+ * cannot identify would be parsed and rewritten as Python.
+ */
+export function isPythonCodeCell(cell: LanguageCell): boolean {
+	return isLogicalCellType(cell, 'code');
+}
+
+/**
+ * Does this cell participate in the notebook's Python DATAFLOW graph - i.e. can
+ * running it bind a name later Python cells read?
+ *
+ * A superset of `isPythonCodeCell` by exactly one member: a SQL cell's source is
+ * not Python, but `server/sql.ts` compiles it to a `spark.sql(...)` wrapper that
+ * really does bind `_sql_df` (and the `-- >> name` binding) in the kernel
+ * namespace, so `dataflow.ts` gives it a SYNTHETIC contribution and the graph
+ * must keep it - a Python cell reading a SQL result has to go stale when the
+ * query is edited.
+ *
+ * Everything else is out, and each for its own reason rather than by a shared
+ * accident: a CHAT cell's source is prose and its reply binds nothing; a MOJO
+ * cell runs in a `mojo run` SUBPROCESS whose entire namespace dies with it, so
+ * even `def main()` binds nothing that outlives the cell; markdown and raw never
+ * reach the kernel at all.
+ *
+ * `staleness.ts` asks this to pick the cells the definer graph is built over;
+ * every cell it excludes falls to that module's `n/a` verdict, which is why a
+ * mojo cell shows no staleness chip without any chip-level special case.
+ */
+export function hasPythonDataflow(cell: LanguageCell): boolean {
+	return isPythonCodeCell(cell) || isSqlCell(cell);
 }

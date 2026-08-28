@@ -37,6 +37,7 @@ import { addProjectRootToPath, injectDatabricksRuntime, databricksRuntimeVersion
 import { projectRootAddCode, projectRootRemoveCode } from './projectRoot';
 import { notebookRoot } from './notebookRoot';
 import { databricksRuntimeEnvCode } from './databricksRuntime';
+import { MOJO_SETUP_CODE, parseMojoSetup, type MojoSetup } from './mojo';
 import { CONTROL_COMM_TARGET, RESTART_MAGIC_CODE, controlOp } from './controlMagic';
 import { WIDGETS_SHIM_CODE } from './widgetsShim';
 import { publish, publishGlobal } from './events';
@@ -111,6 +112,20 @@ interface NotebookKernel {
 	 * runtime the running kernel does not advertise.
 	 */
 	databricksRuntime: string | null;
+	/**
+	 * The `%%mojo` cell magic's registration in THIS session, once a mojo cell has
+	 * asked for it (`ensureMojoMagic`), or null while nothing has. Session-scoped
+	 * like `databricksRuntime`, and reset by `beginSession`, because the magic is
+	 * registered by an `import mojo.notebook` in the namespace a restart destroys.
+	 *
+	 * Only a READY setup is remembered. A failed one is deliberately re-probed on
+	 * every mojo run: the whole point of the missing-toolchain message is that the
+	 * user runs `uv pip install max` and tries again, and a memoized failure would
+	 * make Cellar go on refusing a toolchain that is now installed until the kernel
+	 * is restarted - i.e. the instruction would appear not to work. The re-probe is
+	 * an `ImportError` on a name Python already knows is absent, which is cheap.
+	 */
+	mojoSetup: MojoSetup | null;
 	/**
 	 * How many USER (non-internal) runs are currently executing on this kernel.
 	 * Gates the status broadcast: a busy/idle flip is fanned out to the Kernels
@@ -316,6 +331,18 @@ function envMs(name: string, fallback: number): number {
 
 function probeTimeoutMs(): number {
 	return envMs('CELLAR_KERNEL_PROBE_TIMEOUT_MS', DEFAULT_PROBE_TIMEOUT_MS);
+}
+
+/**
+ * How long the once-per-session Mojo magic registration (`ensureMojoMagic`) may take
+ * before the run gives up waiting for a verdict and falls through to `execute()`.
+ * Generous against the 3-25 ms the import really costs, and short of anything a user
+ * would sit through. Override with `CELLAR_MOJO_SETUP_TIMEOUT_MS`.
+ */
+const DEFAULT_MOJO_SETUP_TIMEOUT_MS = 30 * 1000;
+
+function mojoSetupTimeoutMs(): number {
+	return envMs('CELLAR_MOJO_SETUP_TIMEOUT_MS', DEFAULT_MOJO_SETUP_TIMEOUT_MS);
 }
 
 /**
@@ -757,6 +784,9 @@ function beginSession(nbKernel: NotebookKernel): void {
 	// A fresh namespace advertises nothing until `initKernel` decides again: the env
 	// is set by an injected snippet, so it dies with the namespace that held it.
 	nbKernel.databricksRuntime = null;
+	// The %%mojo magic lives in the namespace too (`import mojo.notebook` registers
+	// it), so a new session has none until a mojo cell asks for it again.
+	nbKernel.mojoSetup = null;
 	// A fresh namespace has no widgets: drop this kernel's progress/interactive
 	// models and forget their comms so a send can never target a dead model.
 	const commIds = [...nbKernel.widgetComms.keys()];
@@ -1409,15 +1439,54 @@ async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): P
 /**
  * Run `code` silently and return what it printed to stdout (trimmed).
  *
- * The sibling of `runSilent` for the one startup step whose ANSWER matters rather
- * than only its effect. Same exec-lock discipline — two `requestExecute` in
- * flight on one kernel wedge a run's `future.done` — and the same best-effort
- * stance on the lock; unlike `runSilent` it does NOT swallow failures, because a
- * probe that could not run must not read as a probe that agreed.
+ * The sibling of `runSilent` for the steps whose ANSWER matters rather than only
+ * their effect. Same exec-lock discipline — two `requestExecute` in flight on one
+ * kernel wedge a run's `future.done` — and the same best-effort stance on the
+ * lock; unlike `runSilent` it does NOT swallow failures, because a probe that
+ * could not run must not read as a probe that agreed.
+ *
+ * `timeoutMs` bounds the wait and returns `null` when it elapses — for a caller
+ * that sits IN FRONT OF a user run and therefore must not be able to hang it (see
+ * `ensureMojoMagic`). It bounds BOTH waits, not only the kernel's reply: the exec
+ * lock is taken through `beginExecLock` so the wait FOR OUR TURN is raced against
+ * the same bound. Bounding only `future.done` left the whole point unmet — a
+ * predecessor that holds the lock for minutes (a Databricks `CONNECT_CODE` on a
+ * cold cluster) parked the caller here, in front of a run that has already emitted
+ * `run:start` and is registered with no abort path yet, which is exactly the wedge
+ * the bound exists to prevent. Giving up hands the chain on only once the
+ * PREDECESSOR finishes (`execute()`'s rule), so no successor can put a second
+ * `requestExecute` on the wire beside it. The default 0 keeps the unbounded
+ * behaviour for the startup callers, whose kernel is freshly built and whose
+ * answer nothing is waiting on.
+ *
+ * It is ONE WALL-CLOCK BUDGET for the whole call, started before the lock wait and
+ * reused for the reply — never a fresh `delay(timeoutMs)` per race, which spent the
+ * bound TWICE and made the real worst case ~2x what the knob advertises (a
+ * predecessor holding the lock for nearly the whole window followed by a silent
+ * kernel). That window is precisely the un-abortable state this exists to close, so
+ * the advertised bound and the reachable one have to be the same number.
  */
-async function runCapture(kernel: KernelConnection, code: string): Promise<string> {
+async function runCapture(
+	kernel: KernelConnection,
+	code: string,
+	{ timeoutMs = 0 }: { timeoutMs?: number } = {}
+): Promise<string | null> {
+	// The single budget: started HERE, before anything can wait, and awaited by both
+	// races below so the two together can never exceed `timeoutMs`.
+	const budget = timeoutMs > 0 ? delay(timeoutMs).then(() => false as const) : null;
 	const nbKernel = nbKernelForConnection(kernel);
-	const release = nbKernel ? await acquireExecLock(nbKernel) : null;
+	const lock = nbKernel ? beginExecLock(nbKernel) : null;
+	if (lock) {
+		if (budget) {
+			const ourTurn = await Promise.race([lock.ready.then(() => true as const), budget]);
+			if (!ourTurn) {
+				void lock.ready.then(lock.release, lock.release);
+				return null;
+			}
+		} else {
+			await lock.ready;
+		}
+	}
 	try {
 		const future = kernel.requestExecute({ code, silent: true, store_history: false, stop_on_error: false });
 		let out = '';
@@ -1425,11 +1494,36 @@ async function runCapture(kernel: KernelConnection, code: string): Promise<strin
 			const content = msg.content as { name?: string; text?: string };
 			if (msg.header.msg_type === 'stream' && content?.name === 'stdout') out += content.text ?? '';
 		};
-		await future.done;
+		// A bounded caller gets a settled answer OR null, and never a held lock: on
+		// timeout the future is DISPOSED here rather than merely abandoned, which is
+		// what lets the `finally` release the per-kernel exec lock. Abandoning it
+		// instead would leave the lock held for as long as the kernel stays silent, so
+		// the very next `execute()` would park behind it - i.e. the caller's bound
+		// would buy nothing. Disposing drops a reply that may still arrive, which is
+		// the right trade for a SILENT probe and is what `execute()`'s own watchdog
+		// abort already does. `timeoutMs = 0` (the default) keeps the original
+		// unbounded behaviour for the startup callers, whose kernel is freshly built.
+		if (budget) {
+			const settled = await Promise.race([future.done.then(() => true as const), budget]);
+			if (!settled) {
+				future.dispose();
+				return null;
+			}
+		} else {
+			await future.done;
+		}
 		return out.trim();
 	} finally {
-		release?.();
+		lock?.release();
 	}
+}
+
+/** `setTimeout` as a promise, unref'd so a pending bound can never hold the process open. */
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		const t = setTimeout(resolve, ms);
+		if (typeof t.unref === 'function') t.unref();
+	});
 }
 
 /**
@@ -1461,7 +1555,7 @@ async function verifyKernelCwd(nbKernel: NotebookKernel, kernel: KernelConnectio
 	const expected = realpathOrSelf(nbKernel.codeRoot);
 	let actual = '';
 	try {
-		actual = await runCapture(kernel, 'import os as _c_os\nprint(_c_os.path.realpath(_c_os.getcwd()))\ndel _c_os');
+		actual = (await runCapture(kernel, 'import os as _c_os\nprint(_c_os.path.realpath(_c_os.getcwd()))\ndel _c_os')) ?? '';
 	} catch {
 		// The probe itself failed to run; see the header — silence is not disagreement.
 		return;
@@ -1535,6 +1629,7 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		codeRoot: root?.dir ?? workspaceRoot(),
 		codeRootKind: root?.kind ?? null,
 		databricksRuntime: null,
+		mojoSetup: null,
 		userRuns: 0,
 		statusHandler: null,
 		widgetComms: new Map(),
@@ -2375,6 +2470,83 @@ export function liveDatabricksRuntime(nbPath?: string | null): {
 	const nbKernel = kernels.get(resolveNb(nbPath));
 	if (!nbKernel || !nbKernel.connection) return { started: false, version: null };
 	return { started: true, version: nbKernel.databricksRuntime };
+}
+
+/**
+ * Make the `%%mojo` cell magic available in `nbPath`'s kernel, and report whether
+ * it took. Called once per SESSION by `run.ts`, immediately before a mojo cell's
+ * run (see `mojo.ts` for why this is lazy rather than an `initKernel` injection).
+ *
+ * Runs through `runCapture` - a SILENT, INTERNAL execute holding the same exec
+ * lock every other execute takes - so it never appears in the notebook, never
+ * counts toward `execs_this_session`, and can never put a second `requestExecute`
+ * on the wire beside the run it precedes.
+ *
+ * STARTS the kernel if none is running, deliberately: the caller is about to run a
+ * cell in it anyway, so the alternative (report "not ready" for a kernel that has
+ * simply not booted) would tell the user their toolchain is missing when it is not.
+ *
+ * ONLY a ready result is remembered (see `NotebookKernel.mojoSetup`). A probe that
+ * ANSWERED is reported as it answered - a `ready: false` there is an OBSERVED
+ * absence, and reporting it is what replaces IPython's opaque `UsageError: Cell
+ * magic function %%mojo not found` with an actionable install instruction. A probe
+ * that could not run AT ALL - it timed out, or it threw - observed nothing about
+ * the toolchain, so it is NO VERDICT (`null`) and never an absence.
+ */
+export async function ensureMojoMagic(nbPath?: string | null): Promise<MojoSetup | null> {
+	const abs = resolveNb(nbPath);
+	const kernel = await getKernel(abs);
+	const nbKernel = kernels.get(abs);
+	if (nbKernel?.mojoSetup?.ready) return nbKernel.mojoSetup;
+	// Sampled BEFORE the probe, not around the await: an autorestart landing mid-probe
+	// bumps the live epoch, and stamping the NEW one would claim this probe ran in a
+	// namespace it never touched. Reading the old one instead makes the run read as
+	// not-this-session, which is the conservative direction `lastRun` already takes.
+	const session = nbKernel?.sessionId ?? null;
+	// BOUNDED, because `runCapture` awaits `future.done` with no watchdog of its own:
+	// unbounded, a silent kernel would hang the run BEFORE `execute()` - i.e. before
+	// the idle watchdog that exists to free exactly that queue slot - and before the
+	// run registers its `ActiveRun`, so no abort path could see it either. Bounding it
+	// costs nothing real: the probe is one round-trip, and `import mojo.notebook`
+	// measured 3-25 ms against real max 26.5.0 (it pulls in argparse/tempfile and
+	// IPython's magic decorator, not the MAX engine).
+	//
+	// `runCapture` DISPOSES the timed-out future rather than abandoning it, so the
+	// per-kernel exec lock is released and the `execute()` this run falls through to
+	// is not parked behind a probe nobody is waiting for any more. That bound covers
+	// the wait for the lock ITSELF as well as the kernel's reply, so a predecessor
+	// holding it for minutes cannot park this probe either.
+	//
+	// A probe that THREW takes the same NO-VERDICT exit as one that timed out, and
+	// deliberately so: both observed nothing about the toolchain, so neither may
+	// claim it is absent nor send the user after a 534 MB install they may already
+	// have. The run falls through to `execute()`, which owns the watchdog and
+	// reports honestly. A probe INTERRUPTED mid-import reaches that same exit from
+	// the other side - it reports its own no-verdict on the marker line.
+	let out: string | null;
+	try {
+		out = await runCapture(kernel, MOJO_SETUP_CODE, { timeoutMs: mojoSetupTimeoutMs() });
+	} catch {
+		return null;
+	}
+	// NO VERDICT, never "the toolchain is missing". That is also the right answer for
+	// the one legitimate slow case - a Databricks `CONNECT_CODE` holding the exec
+	// lock for minutes on a cold cluster - which now reaches this exit rather than
+	// parking un-abortably in front of the run.
+	if (out === null) return null;
+	// The probe's OWN no-verdict: it ran, but what stopped it (a Stop the user
+	// pressed while this cell held the queue slot, above all) says nothing about the
+	// toolchain, so it takes the same exit as a timeout rather than reporting an
+	// absence nobody observed. See `MOJO_SETUP_CODE`'s exception split.
+	const parsed = parseMojoSetup(out);
+	if (parsed === null) return null;
+	const setup: MojoSetup = { ...parsed, session };
+	// Memoized only while it still describes the LIVE session: `beginSession` clears
+	// the memo, and a write racing a restart would put a dead namespace's verdict back.
+	// Only a READY verdict is kept - a failure must be re-probed, because the whole
+	// point of the instruction is that the user installs `max` and runs the cell again.
+	if (setup.ready && nbKernel && nbKernel.sessionId === session) nbKernel.mojoSetup = setup;
+	return setup;
 }
 
 /** The epoch a run should be stamped with for notebook `nbPath`, or null when its kernel is not running. */

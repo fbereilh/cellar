@@ -7,16 +7,14 @@
 	import { cellClipboard } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
 	import {
-		CHAT_LANGUAGE,
 		isChatCell,
 		isLogicalCellType,
 		languageTagFor,
+		logicalTypeFor,
 		nbCellType,
 		offersCellType,
-		PY_UNSUPPORTED_TYPES,
-		SQL_LANGUAGE,
-		textNotebookTypeMessage,
-		textNotebookTypeReason
+		textNotebookTypeForReason,
+		textNotebookTypeMessage
 	} from '$lib/cellLanguage';
 	import {
 		applyGesture,
@@ -32,6 +30,7 @@
 	import type { ExportHazard } from '$lib/exportHazard';
 	import type { ExportPyResult } from '$lib/types';
 	import { splitInheritedCellar } from '$lib/splitCell';
+	import { inheritedCodeType, inheritedCodeTypeAfter } from '$lib/cellInherit';
 	import { agentConfigNotice, type WorkspaceRootOption } from '$lib/notebookRoot';
 	import { createSearchCache } from '$lib/search';
 	import type { SearchCache } from '$lib/search';
@@ -1702,17 +1701,7 @@
 			// others left behind - which is exactly what happened here, leaving this tab
 			// drawing the imports/export badge over a cell the server had stripped, with
 			// no further event able to correct it before a reload.
-			const logical: LogicalCellType =
-				ev.cell_type === 'markdown'
-					? 'markdown'
-					: ev.cell_type === 'raw'
-						? 'raw'
-						: ev.language === SQL_LANGUAGE
-							? 'sql'
-							: ev.language === CHAT_LANGUAGE
-								? 'chat'
-								: 'code';
-			applyCellTypeLocally(ev.cellId, logical);
+			applyCellTypeLocally(ev.cellId, logicalTypeFor(ev.cell_type, ev.language));
 		} else if (ev.type === 'cell:cleared') {
 			const cell = findCell(ev.cellId);
 			if (cell) cell.outputs = [];
@@ -2263,10 +2252,10 @@
 	function applyCellTypeLocally(id: string, cellType: LogicalCellType) {
 		const cell = findCell(id);
 		if (!cell) return;
-		// 'sql'/'chat' are code cells tagged cellar.language ($lib/cellLanguage.js's
-		// `languageTagFor`, the ONE tag rule); 'code' clears the tag. Reassign
-		// metadata (the cell may have had no cellar namespace) so the grammar switch
-		// in Cell.svelte reacts.
+		// 'sql'/'chat'/'mojo' are code cells tagged cellar.language
+		// ($lib/cellLanguage.js's `languageTagFor`, the ONE tag rule); 'code' clears
+		// the tag. Reassign metadata (the cell may have had no cellar namespace) so
+		// the grammar switch in Cell.svelte reacts.
 		const lang = languageTagFor(cellType);
 		cell.cell_type = nbCellType(cellType);
 		const cellar = { ...(cell.metadata?.cellar ?? {}) };
@@ -3098,12 +3087,35 @@
 
 	/** What an insert re-materializes: a cell's type, source and `cellar` metadata.
 	 *  The type is LOGICAL (the add route's vocabulary): paste/undo feed it the
-	 *  nbformat type + the tagged `cellar` namespace, while a typed insert (the
-	 *  hover-between strip / bottom add row) names `sql`/`chat` directly. */
+	 *  nbformat type + the tagged `cellar` namespace, an add affordance that NAMES a
+	 *  type (`markdown`/`chat`) passes it through, and a plain `code` request is
+	 *  RESOLVED first through `codeTypeAt`/`codeTypeAfter` - so it may arrive here as
+	 *  `sql` or `mojo` (see `$lib/cellInherit`). */
 	interface InsertSpec {
 		cell_type: LogicalCellType;
 		source: string;
 		cellar?: CellarNamespace;
+	}
+
+	/**
+	 * The logical type a plain "add a code cell" GESTURE should create, given where
+	 * the new cell lands. `$lib/cellInherit` owns the rule (nearest preceding code
+	 * cell wins, prose is skipped, chat is never inherited); these two are only the
+	 * wiring, so every human insertion path asks ONE question of ONE rule.
+	 *
+	 * Applied only where the caller asked for the UNTYPED `code` - a button that
+	 * NAMES `markdown`/`chat`, a paste, a split, an extracted fence and the
+	 * Databricks table preview all state their type and must keep it.
+	 */
+	function codeTypeAt(index: number): LogicalCellType {
+		return inheritedCodeType(cells, index);
+	}
+	function codeTypeAfter(afterId: string | null | undefined): LogicalCellType {
+		return inheritedCodeTypeAfter(cells, afterId);
+	}
+	/** `addCell` for the bottom add row: a plain `code` request inherits, a named type does not. */
+	function addCellFromRow(afterId: string | null | undefined, cellType: LogicalCellType = 'code') {
+		return addCell(afterId, cellType === 'code' ? codeTypeAfter(afterId) : cellType);
 	}
 
 	/**
@@ -3148,6 +3160,9 @@
 	 * caret is nowhere near. So we scroll it into view and leave the selection be.
 	 */
 	async function insertAndRunCode(source: string) {
+		// Deliberately NOT `codeTypeAt` (see `$lib/cellInherit`): this appends
+		// `spark.read.table(...).toPandas()`, which IS Python, to whatever notebook is
+		// open. Inheriting would compile a Python snippet as SQL or hand it to `mojo run`.
 		const created = await insertCellAt(cells.length, { cell_type: 'code', source });
 		await scrollCellIntoView(created.id);
 		await runCell(created.id, source);
@@ -3229,7 +3244,9 @@
 	 *
 	 * The types a fence can ask for are `code`/`sql`/`markdown`, which EVERY
 	 * notebook format can hold, so there is no `refuseUnsupportedType` gate here:
-	 * `chat` and `raw` are unreachable by construction (see `fenceCellType`).
+	 * `chat`, `raw` and `mojo` - i.e. exactly the types a `.py` notebook refuses -
+	 * are all unreachable, `mojo` because no fence tag maps onto it (see
+	 * `fenceCellType`, whose header owns that decision).
 	 */
 	async function extractCodeBlock(sourceId: string, block: ExtractedCodeBlock): Promise<boolean> {
 		// The whole read-modify-write of the anchor runs inside the lock, the
@@ -3337,10 +3354,12 @@
 			.then((body) => body?.reason)
 			.catch(() => null);
 		if (reason === KEEP_ONE_CELL_REASON) return noticeKeepOneCell();
-		// The refusal codes are per TYPE, so the notice is looked up by matching the
+		// The refusal codes are per TYPE, so the notice is looked up by resolving the
 		// server's code back to the type it belongs to rather than by keeping a
-		// second copy of either the codes or the messages.
-		const refused = PY_UNSUPPORTED_TYPES.find((t) => textNotebookTypeReason(t) === reason);
+		// second copy of either the codes or the messages. Resolved DIRECTLY, off
+		// the same record the codes come from, so the notice can never name a type
+		// other than the one the server refused.
+		const refused = textNotebookTypeForReason(reason);
 		if (refused) noticeUnsupportedType(refused);
 	}
 
@@ -3752,7 +3771,7 @@
 		const i = cells.findIndex((c) => c.id === id);
 		let nextId: string | null = i >= 0 && i < cells.length - 1 ? cells[i + 1].id : null;
 		if (!nextId) {
-			const created = await addCell(id);
+			const created = await addCell(id, codeTypeAfter(id));
 			nextId = created.id;
 		}
 		if (!focusNext) {
@@ -3954,7 +3973,10 @@
 	async function insertCell(where: 'above' | 'below', targetId: string | null = activeId, cellType: LogicalCellType = 'code') {
 		const i = targetId ? cells.findIndex((c) => c.id === targetId) : -1;
 		const index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
-		const created = await insertCellAt(index, { cell_type: cellType, source: '' });
+		// A plain code insertion takes the language of the code cell above it (see
+		// `codeTypeAt`); a caller that NAMED markdown/chat keeps what it asked for.
+		const type = cellType === 'code' ? codeTypeAt(index) : cellType;
+		const created = await insertCellAt(index, { cell_type: type, source: '' });
 		await selectAndFocus(created.id);
 		return created;
 	}
@@ -3975,7 +3997,7 @@
 		const id = activeId;
 		if (!id) return;
 		apiOf(id)?.run(false); // fire; the insert shouldn't wait for the kernel
-		const created = await addCell(id);
+		const created = await addCell(id, codeTypeAfter(id));
 		await selectAndAct(created.id, (api) => api?.enterEdit());
 	}
 
@@ -4302,7 +4324,7 @@
 			searchWholeWord={searchHighlight?.wholeWord ?? false}
 			searchRegex={searchHighlight?.regex ?? false}
 			{cellHighlights}
-			onAddCell={addCell}
+			onAddCell={addCellFromRow}
 			onInsertCell={insertCell}
 		/>
 	</div>

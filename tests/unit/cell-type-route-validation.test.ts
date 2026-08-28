@@ -138,8 +138,8 @@ describe('POST /api/cells - cellType vocabulary', () => {
 });
 
 describe('the vocabulary itself', () => {
-	it('is exactly the five logical types, and rejects everything else', () => {
-		expect([...LOGICAL_CELL_TYPES].sort()).toEqual(['chat', 'code', 'markdown', 'raw', 'sql']);
+	it('is exactly the six logical types, and rejects everything else', () => {
+		expect([...LOGICAL_CELL_TYPES].sort()).toEqual(['chat', 'code', 'markdown', 'mojo', 'raw', 'sql']);
 		for (const t of LOGICAL_CELL_TYPES) expect(isLogicalCellTypeName(t)).toBe(true);
 		for (const bad of [...BAD_TYPES, null, undefined]) expect(isLogicalCellTypeName(bad)).toBe(false);
 	});
