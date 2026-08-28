@@ -225,6 +225,48 @@ describe('a directive-marked cell cannot be unmarked from Cellar', () => {
 		expect(nbmod.listCells(NB).map((c) => role.isExportCell(c))).toEqual([true, true]);
 	});
 
+	it('does NOT claim to own an INELIGIBLE cell, so a stale flag there still clears', () => {
+		// The refusal is a claim about `isExportCell`, which is eligibility-gated: on a
+		// markdown/SQL/raw cell the exporter ignores the `#| export` line entirely, so
+		// such a cell is NOT exported and reporting the directive as owning it would
+		// refuse to clear a flag a hand-edited `.ipynb` really does carry - telling the
+		// caller the cell is in a module it was never in.
+		const MD = 'mmmmmmmm-1111-4111-8111-111111111111';
+		const SQL = 'ssssssss-2222-4222-8222-222222222222';
+		const RAW = 'rrrrrrrr-3333-4333-8333-333333333333';
+		writeNb(NB, [
+			{ id: MD, type: 'markdown', source: '#| export\nprose', cellar: { export: true } },
+			{ id: SQL, source: '#| export\nselect 1', cellar: { language: 'sql', export: true } },
+			{ id: RAW, type: 'raw', source: '#| export\nfrontmatter', cellar: { export: true } }
+		]);
+		// None of them is exported in the first place - the shared identity says so.
+		expect(nbmod.listCells(NB).map((c) => role.isExportCell(c))).toEqual([false, false, false]);
+
+		// The doc setter unmarks each rather than refusing...
+		expect(nbmod.setCellExport(MD, false, NB)).toEqual({ ok: true });
+		// ...the batch setter reports it as genuinely CHANGED (it cleared the flag)...
+		expect(nbmod.setCellExports([SQL], false, NB)).toEqual([SQL]);
+		// ...and MCP unmarks rather than reporting the handle as directive-owned.
+		expect(svc.setCellExport([RAW], false, NB)).toMatchObject({ ok: true, count: 1 });
+
+		// Every stale flag is gone from the document.
+		expect(nbmod.listCells(NB).map((c) => c.metadata?.cellar?.export)).toEqual([
+			undefined,
+			undefined,
+			undefined
+		]);
+	});
+
+	it('an ineligible cell with the directive still cannot be MARKED', () => {
+		// The other half of the same gate: unmarking one is honest bookkeeping, marking
+		// one is a lie the exporter would ignore, so it is refused exactly as before.
+		const MD = 'mmmmmmmm-4444-4444-8444-444444444444';
+		writeNb(NB, [{ id: MD, type: 'markdown', source: '#| export\nprose' }]);
+		expect(nbmod.setCellExport(MD, true, NB)).toEqual({ ok: false, reason: 'not-code' });
+		expect(svc.setCellExport([MD], true, NB)).toEqual({ ok: false, notCode: MD });
+		expect(nbmod.listCells(NB)[0].metadata?.cellar?.export).toBeUndefined();
+	});
+
 	it('MCP still MARKS a batch containing one, since marking is already satisfied', () => {
 		writeNb(NB, [
 			{ id: 'aaaaaaaa-1111-4111-8111-111111111111', source: '#| export\ndef d(): pass' },

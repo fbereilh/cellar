@@ -20,7 +20,7 @@ is what keeps it honest, and it already caught one rule that reasoning got backw
 | Concern | Module |
 |---|---|
 | The `#\|` scanner (both directives, one rule) | `src/lib/nbdevDirectives.ts` (pure, browser-safe) |
-| Is this cell export-marked? | `src/lib/exportRole.ts` - `isExportCell`, `hasExportDirective` |
+| Is this cell export-marked? | `src/lib/exportRole.ts` - `isExportCell`, `exportDirectiveOwnsCell` |
 | Where does a `#\|default_exp` module land? | `src/lib/server/export-py.ts` - `storedExportTarget` / `directiveBase` |
 | nbdev's `lib_path` | `src/lib/server/nbdev.ts` - `nbdevLibPath` |
 | Refusals | `notebook.ts` `setCellExport`, the `PATCH /api/cells/[id]` route, MCP `set_cell_export` |

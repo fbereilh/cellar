@@ -25,7 +25,7 @@
 		selectionAfterRemoval,
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
-	import { exportCellCount, hasExportDirective, isExportCell } from '$lib/exportRole';
+	import { exportCellCount, exportDirectiveOwnsCell, isExportCell } from '$lib/exportRole';
 	import { isExportBase } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
 	import type { ExportPyResult } from '$lib/types';
@@ -2440,6 +2440,10 @@
 		}).catch(() => {});
 	}
 
+	/** The one sentence every export-directive refusal says, whichever half refused. */
+	const EXPORT_DIRECTIVE_NOTICE =
+		'That cell is marked for export by an "#| export" line in its own source - remove that line to stop exporting it.';
+
 	/**
 	 * Mark (or unmark) a code cell for nbdev-style export to the `.py` module.
 	 * Applied optimistically here (reassign metadata so the badge/menu react) and
@@ -2465,17 +2469,21 @@
 		// A cell whose SOURCE carries nbdev's `#| export` is marked by that line, and
 		// Cellar never writes a directive - so clearing the metadata half would leave
 		// the cell exported with the toggle bouncing straight back to ON. Refused here
-		// as well as on the server (which still refuses for anything that routes around
-		// this tab), and SAID on the shell's transient notice line rather than silently
-		// doing nothing: the `refuseUnsupportedType` shape, for its reason - a click
-		// that appears to do nothing reads as a bug. Nothing is applied and nothing is
-		// sent, so there is no optimistic state to revert.
-		if (!exported && hasExportDirective(cell)) {
-			onNotice?.(
-				'That cell is marked for export by an "#| export" line in its own source - remove that line to stop exporting it.'
-			);
+		// as well as on the server, and SAID on the shell's transient notice line rather
+		// than silently doing nothing: the `refuseUnsupportedType` shape, for its reason
+		// - a click that appears to do nothing reads as a bug. Nothing is applied and
+		// nothing is sent, so there is no optimistic state to revert.
+		//
+		// This is the OPTIMISTIC MIRROR, which spares the round trip; it cannot be the
+		// whole rule, because it reads `cell.source` and that value is deliberately NOT
+		// refreshed for a MOUNTED cell whose remote edit is stashed behind the "changed
+		// on server" banner. In that window the directive is on the server's copy and
+		// not on ours, so the server's own refusal below is what keeps the promise.
+		if (!exported && exportDirectiveOwnsCell(cell)) {
+			onNotice?.(EXPORT_DIRECTIVE_NOTICE);
 			return;
 		}
+		const before = cell ? { ...(cell.metadata?.cellar ?? {}) } : null;
 		if (cell) {
 			const cellar = { ...(cell.metadata?.cellar ?? {}) };
 			if (exported) cellar.export = true;
@@ -2484,11 +2492,30 @@
 		}
 		if ((await settleCellEdits(moduleSourceIds(exported ? [id] : []))).includes('failed'))
 			onNotice?.(unsavedExportEditNotice('proceeding'));
-		await fetch(`/api/cells/${id}`, {
+		const res = await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ export: exported, nb: path, originId })
-		}).catch(() => {});
+		}).catch(() => null);
+		if (!res || res.ok) return;
+		// The SERVER-AUTHORITATIVE backstop for the refusal this tab could not predict.
+		// Decided from the route's OWN refusal shape, never from the status alone: a
+		// proxy 502/503 or an HTML error page landed no verdict, and claiming one would
+		// put the toggle back ON over a cell nothing said is exported.
+		const reason = await res
+			.json()
+			.then((b) => (b as { reason?: string } | null)?.reason ?? null)
+			.catch(() => null);
+		if (reason !== 'export-directive-owns-cell') return;
+		const c = findCell(id);
+		if (c) {
+			// Restore the ON state rather than the pre-click metadata: the cell IS
+			// exported (that is what the server just said), and our copy of its source is
+			// too stale to show it through the directive half - so the metadata half is
+			// the only way left to keep the row honest. Nothing is persisted by this.
+			c.metadata = { ...(c.metadata ?? {}), cellar: { ...(before ?? c.metadata?.cellar ?? {}), export: true } };
+		}
+		onNotice?.(EXPORT_DIRECTIVE_NOTICE);
 	}
 
 	/**

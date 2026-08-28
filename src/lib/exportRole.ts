@@ -93,6 +93,25 @@ export function hasExportDirective(cell: ExportCell): boolean {
 }
 
 /**
+ * Does this cell's own SOURCE own its export mark - i.e. is the cell exported
+ * BECAUSE of a `#| export` line Cellar may never write and so may never remove?
+ *
+ * This is the refusal rule, and it is deliberately `canExportCell(cell) &&
+ * hasExportDirective(cell)` in ONE place rather than that pair repeated at each
+ * refusing site. The two halves must be the same eligibility the MARK rule applies,
+ * because a refusal is a claim about `isExportCell`: a markdown/SQL/raw cell whose
+ * source happens to open with `#| export` is NOT exported (the exporter ignores it
+ * entirely), so reporting the directive as owning it would refuse to clear a stale
+ * flag and tell the caller a cell is in a module it was never in. Every refusing
+ * surface asks this - the doc setter, its batch form, the PATCH route through them,
+ * MCP's `set_cell_export`, and the row toggle - so the client and the server cannot
+ * drift about which cells the source owns.
+ */
+export function exportDirectiveOwnsCell(cell: ExportCell): boolean {
+	return canExportCell(cell) && hasExportDirective(cell);
+}
+
+/**
  * Is this cell marked for export to the `.py` module? Eligible (`canExportCell`)
  * AND marked - by Cellar's own `metadata.cellar.export` flag, or by nbdev's
  * `#| export` directive in the source.
@@ -119,11 +138,13 @@ export function hasExportDirective(cell: ExportCell): boolean {
  * `metadata.cellar` is the namespace clean-on-save preserves byte-for-byte - the
  * whole reason this flag lives there. So a cell the DIRECTIVE marks cannot be
  * unmarked from Cellar at all: `setCellExports` refuses it and the row toggle shows
- * ON and DISABLED, naming the source line as the lever (the Databricks Runtime
- * card's env-forced treatment, for the same reason - a control that silently
- * changes nothing is worse than one that says who holds it). Clearing the metadata
- * half instead would leave the cell exported with the toggle bouncing back to ON,
- * which is exactly the lie this is written to avoid.
+ * ON while staying LIVE rather than going `disabled` - a disabled button gets no
+ * pointer events, so its `title` could never be hovered and the one thing the user
+ * needs (which line to remove) would be unreachable. Clicking it declines on the
+ * shell's notice line instead, the same live-control-that-explains-itself stance the
+ * Databricks card takes. Clearing the metadata half instead would leave the cell
+ * exported with the toggle bouncing back to ON, which is exactly the lie this is
+ * written to avoid.
  *
  * Being the one identity every surface reads (`export-py.ts` builds the module
  * from it, `Cell.svelte` draws the badge from it, the agent map reports it),

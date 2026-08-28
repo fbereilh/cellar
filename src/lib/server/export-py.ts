@@ -392,7 +392,12 @@ function storedExportTarget(
 	}
 	for (const c of doc.cells) {
 		if (c.cell_type !== 'code' || !c.source.includes('default_exp')) continue;
-		const mod = nbdevDirective(c.source, 'default_exp')?.trim();
+		// The scanner reports the RAW remainder of the directive line, because that is
+		// what fastcore's own value is (a trailing `# comment` is kept, verified by the
+		// committed differential). A module NAME is one token, so it is bounded HERE
+		// rather than in the shared scanner - unbounded, `#| default_exp core # note`
+		// resolved to a file literally called `core # note.py`.
+		const mod = nbdevDirective(c.source, 'default_exp')?.trim().split(/\s+/)[0];
 		if (!mod) continue;
 		// nbdev writes a dotted module path (`pkg.utils`); map it to a file path.
 		const rel = mod.endsWith('.py') ? mod : mod.replace(/\./g, '/') + '.py';

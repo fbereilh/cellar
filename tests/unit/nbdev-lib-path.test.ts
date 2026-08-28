@@ -253,6 +253,22 @@ describe('outside an nbdev project nothing changes', () => {
 		});
 	});
 
+	it('a trailing comment on the directive line is not part of the module name', () => {
+		// fastcore's directive VALUE is the raw remainder of the line, so it keeps a
+		// trailing `# note` (the committed differential fixture pins that). A module
+		// name is one token, so the target must stop at the first whitespace - taken
+		// whole it named a file literally called `core # note.py`.
+		directiveNb('core # the module we export to');
+		expect(nbmod.exportTargetInfo(NB)).toMatchObject({
+			ok: true,
+			base: 'workspace',
+			source: 'default_exp',
+			target: 'core.py'
+		});
+		expect(nbmod.exportPy(NB)).toMatchObject({ written: true, target: 'core.py' });
+		expect(readFileSync(join(WS, 'core.py'), 'utf8')).toContain('def marked()');
+	});
+
 	it('a plain pyproject with no [tool.nbdev] is not an nbdev project', () => {
 		pyproject('[project]\nname = "plain"\n[tool.ruff]\nline-length = 100\n');
 		directiveNb('core');

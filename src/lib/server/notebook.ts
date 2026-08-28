@@ -36,7 +36,7 @@ import {
 	type ResolvedExportTarget
 } from './export-py';
 import type { ExportHazard } from '../exportHazard';
-import { canExportCell, hasExportDirective } from '../exportRole';
+import { canExportCell, exportDirectiveOwnsCell } from '../exportRole';
 import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
@@ -980,6 +980,12 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
 }
 
 /**
+ * Why a `setCellExport` call did not take. `not-code` is the pre-existing
+ * eligibility refusal, `export-directive-owns-cell` the one this rule adds.
+ */
+export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directive-owns-cell';
+
+/**
  * Mark (or unmark) a code cell for nbdev-style export in the allowlisted `cellar`
  * namespace, so the flag round-trips through clean-on-save. Only a code cell can
  * carry it (a markdown/SQL cell has no module source). Choosing what is IN the
@@ -994,12 +1000,6 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
  * the wrong one. `not-code` is marking a non-Python cell, which `isExportCell`
  * would ignore anyway.
  */
-/**
- * Why a `setCellExport` call did not take. `not-code` is the pre-existing
- * eligibility refusal, `export-directive-owns-cell` the one this rule adds.
- */
-export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directive-owns-cell';
-
 export function setCellExport(
 	id: string,
 	exported: boolean,
@@ -1013,7 +1013,7 @@ export function setCellExport(
 	// The source owns the mark (see `setCellExports`). A MARK request is already
 	// satisfied - the cell really is exported - so it is an honest no-op; an UNMARK
 	// is refused, because nothing Cellar may write would take the mark away.
-	if (hasExportDirective(cell))
+	if (exportDirectiveOwnsCell(cell))
 		return exported ? { ok: true } : { ok: false, reason: 'export-directive-owns-cell' };
 	setCellExports([id], exported, nb, originId);
 	return { ok: true };
@@ -1070,7 +1070,12 @@ export function setCellExports(
 		// the surfaces are written to avoid. Skipped in both directions, and REPORTED as
 		// a refusal by every caller (`setCellExport` above, the PATCH route, MCP's
 		// `set_cell_export`) rather than answered with a success that changed nothing.
-		if (hasExportDirective(cell)) continue;
+		//
+		// Asked through `exportDirectiveOwnsCell`, which is the ELIGIBILITY-gated rule
+		// `isExportCell` itself applies: on a markdown/SQL/raw cell the exporter ignores
+		// the directive entirely, so such a cell is NOT exported and skipping it here
+		// would refuse to clear a stale hand-edited flag it really does carry.
+		if (exportDirectiveOwnsCell(cell)) continue;
 		if (exported) {
 			if (!canExportCell(cell) || marked) continue;
 			cell.metadata = cell.metadata ?? {};

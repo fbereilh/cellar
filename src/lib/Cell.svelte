@@ -21,7 +21,7 @@
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
-	import { canExportCell, isExportCell, hasExportDirective } from '$lib/exportRole';
+	import { canExportCell, isExportCell, exportDirectiveOwnsCell } from '$lib/exportRole';
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
@@ -312,7 +312,7 @@
 	// every state (the state is `aria-pressed`'s job - a label that moves announces
 	// the same fact twice), and a browser exposes `title` as the accessible
 	// DESCRIPTION beside that name, which is exactly the right split for a reason.
-	const exportByDirective = $derived(canExport && hasExportDirective(cell));
+	const exportByDirective = $derived(exportDirectiveOwnsCell(cell));
 	// Withheld from every agent surface (`cellar.hidden_from_agent`, the shared
 	// predicate MCP filters every read through). Deliberately UNGATED: unlike export
 	// and hide-code this applies to every cell type - a markdown cell's prose is as

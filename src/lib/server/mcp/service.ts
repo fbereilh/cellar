@@ -60,7 +60,7 @@ import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isPyUnsupportedType, isSqlCell, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
-import { isExportCell, canExportCell, exportCellCount, hasExportDirective } from '../../exportRole';
+import { isExportCell, canExportCell, exportCellCount, exportDirectiveOwnsCell } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
@@ -1994,7 +1994,12 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		// all-or-nothing like its siblings - a batch that cannot fully take must not
 		// half-apply. MARKING such a cell is fine: it is already exported, so the call
 		// is satisfied and `setCellExportsDoc` simply writes nothing for it.
-		if (!exported && hasExportDirective(cell)) return { ok: false as const, exportDirective: ref };
+		//
+		// `exportDirectiveOwnsCell` is the ELIGIBILITY-gated rule `isExportCell` itself
+		// applies, so an INELIGIBLE cell (markdown/SQL/raw) whose source merely opens
+		// with `#| export` is not reported as directive-owned: the exporter ignores it,
+		// so it is not exported and unmarking it still clears a stale flag.
+		if (!exported && exportDirectiveOwnsCell(cell)) return { ok: false as const, exportDirective: ref };
 		seen.add(id);
 		full.push(id);
 	}

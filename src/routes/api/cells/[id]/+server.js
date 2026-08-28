@@ -23,11 +23,12 @@ import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLangu
  *  bulk route reports its own refusals, so the caller can resync instead of
  *  rendering a conversion the document never took.
  *
- *  Both refusals are settled BEFORE any other field is written, so a refused PATCH
- *  applies NOTHING: every caller today sends a single field, but a body carrying
- *  `source` alongside a rejected `cell_type` would otherwise have persisted the
- *  source and dropped the fields after it. `setCellType` throws before it mutates,
- *  so it is the writer's own rule that decides here — not a second copy of it. */
+ *  All three refusals are settled BEFORE any other field is written, so a refused
+ *  PATCH applies NOTHING: every caller today sends a single field, but a body
+ *  carrying `source` alongside a rejected `cell_type` or `export` would otherwise
+ *  have persisted the source and dropped the fields after it. `setCellType` throws
+ *  before it mutates and `setCellExport` refuses before it writes, so it is each
+ *  writer's own rule that decides here — not a second copy of it. */
 export async function PATCH({ params, request }) {
 	const body = await request.json();
 	if (body.cell_type != null) {
@@ -40,26 +41,26 @@ export async function PATCH({ params, request }) {
 			throw err;
 		}
 	}
-	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
-	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
-	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
-	// REPORTED, unlike its `role`/`scrolled`/`hideInput` siblings, and for the one
-	// case that can refuse: a cell whose SOURCE carries nbdev's `#| export` cannot be
-	// unmarked from Cellar (the directive keeps it exported and Cellar never writes
-	// one), so answering `{ok:true}` would leave the row showing an unticked toggle
-	// over a cell the exporter still writes. The client reverts and says why.
-	// ONE of `export`'s refusals is reported, and the scope is deliberate: the
-	// `no-such-cell` and `not-code` outcomes stay silent exactly as they always were
-	// (widening the sibling setters is a separate change - see `hiddenFromAgent`
-	// below). What cannot stay silent is a cell whose SOURCE carries nbdev's
-	// `#| export`: the directive keeps it exported and Cellar never writes one, so
-	// there is no metadata to clear and `{ok:true}` would leave the row showing an
-	// unticked toggle over a cell the exporter still writes.
+	// REPORTED, unlike its `source`/`role`/`scrolled`/`hideInput` siblings, and for
+	// exactly ONE of its refusals - the scope is deliberate: `no-such-cell` and
+	// `not-code` stay silent exactly as they always were (widening the sibling setters
+	// is a separate change - see `hiddenFromAgent` below). What cannot stay silent is
+	// a cell whose SOURCE carries nbdev's `#| export`: the directive keeps it exported
+	// and Cellar never writes one, so there is no metadata to clear and `{ok:true}`
+	// would leave the row showing an unticked toggle over a cell the exporter still
+	// writes. The client reverts and says why.
+	//
+	// It sits with `cell_type` ABOVE every other field so the handler's pre-write
+	// invariant stays literally true: `setCellExport` decides its refusal before it
+	// writes anything, so a refused PATCH persists none of the body.
 	if ('export' in body) {
 		const r = setCellExport(params.id, !!body.export, body.nb, body.originId);
 		if (!r.ok && r.reason === 'export-directive-owns-cell')
 			return json({ ok: false, reason: r.reason }, { status: 409 });
 	}
+	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
+	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
+	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
 	if ('hideInput' in body) setHideInput(params.id, body.hideInput, body.nb, body.originId);
 	// SCOPED to `hiddenFromAgent` deliberately: the sibling setters above discard
 	// their boolean too, and widening them is a separate change. This one is

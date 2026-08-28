@@ -146,6 +146,56 @@ test('the module really contains the directive-marked cell, and not the plain on
 	}).toPass({ timeout: 15_000 });
 });
 
+test('a refusal this tab could not predict still puts the toggle back, and says why', async ({ page }) => {
+	// The one window the optimistic client-side guard cannot cover: it reads
+	// `cell.source`, which is deliberately NOT refreshed for a MOUNTED cell whose
+	// remote edit is stashed behind the "changed on server" banner. So the directive
+	// is on the SERVER's copy of the cell and not on ours, the guard passes, the
+	// PATCH goes out and the server refuses it - and an unread refusal would leave
+	// the row showing an unticked toggle over a cell the exporter still writes, which
+	// is precisely the lie this whole feature exists to prevent.
+	await openNotebook(page);
+	const cell = cellEl(page, PLAIN);
+	const toggle = cell.getByTestId('toggle-export');
+
+	// Mark it the ordinary way, so a click is an UNMARK (the only refusable direction).
+	await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+	await toggle.click();
+	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+	// Put the caret in its editor: that is what makes the next remote edit STASH
+	// rather than apply, leaving this tab's copy of the source stale.
+	await cell.getByTestId('editor-scroll').click();
+	await expect(cell.locator('.cm-content')).toBeVisible({ timeout: 10_000 });
+	await cell.locator('.cm-content').click();
+
+	// Another writer (an agent / another tab) adds the directive to the SOURCE.
+	await page.evaluate(
+		({ nb, id }) =>
+			fetch(`/api/cells/${id}`, {
+				method: 'PATCH',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ nb, source: '#| export\ndef not_exported():\n    return 3\n' })
+			}).then(() => undefined),
+		{ nb: NB, id: PLAIN }
+	);
+	await expect(cell.getByTestId('remote-changed')).toBeVisible({ timeout: 15_000 });
+
+	// Now unmark. The client cannot see the directive, so it really does send this.
+	await toggle.click();
+	await expect(page.getByTestId('app-notice')).toContainText('#| export');
+	// Reverted: the cell IS exported, so the row must say so.
+	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+	// ...and the server agrees - the mark was never cleared on disk.
+	await expect(async () => {
+		expect(sourceOnDisk(PLAIN)).toContain('#| export');
+	}).toPass({ timeout: 15_000 });
+	await page.reload();
+	await openNotebook(page);
+	await expect(cellEl(page, PLAIN).getByTestId('toggle-export')).toHaveAttribute('aria-pressed', 'true');
+});
+
 test('a metadata-marked cell still unmarks normally', async ({ page }) => {
 	await openNotebook(page);
 	const meta = cellEl(page, META).getByTestId('toggle-export');
