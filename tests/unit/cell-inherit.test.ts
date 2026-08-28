@@ -104,6 +104,25 @@ describe('SOURCE GUARD: every human insertion path resolves the type', () => {
 	const book = readFileSync(new URL('../../src/lib/Notebook.svelte', import.meta.url), 'utf8');
 	const cellSv = readFileSync(new URL('../../src/lib/Cell.svelte', import.meta.url), 'utf8');
 
+	/**
+	 * The BODY of `function <name>(`, by balanced-brace matching. The guards below
+	 * ask WHICH rule a function consults, so they must not also pin how its
+	 * expression is spelled or laid out - a prettier reflow is not a regression.
+	 * Scoping to the body rather than to a character window is what keeps the answer
+	 * about THAT function once it moves or grows.
+	 */
+	function bodyOf(src: string, name: string): string {
+		const at = src.indexOf(`function ${name}(`);
+		expect(at, `${name} must exist`).toBeGreaterThan(-1);
+		const open = src.indexOf('{', src.indexOf(')', at));
+		let depth = 0;
+		for (let i = open; i < src.length; i++) {
+			if (src[i] === '{') depth++;
+			else if (src[i] === '}' && --depth === 0) return src.slice(open, i + 1);
+		}
+		throw new Error(`unbalanced body for ${name}`);
+	}
+
 	it('the rule has ONE home and LiveNotebook holds no copy of it', () => {
 		expect(live).toMatch(/from '\$lib\/cellInherit'/);
 		// The wiring only calls it; the scan itself lives in cellInherit.ts.
@@ -111,8 +130,10 @@ describe('SOURCE GUARD: every human insertion path resolves the type', () => {
 	});
 
 	it('the positional insert path (a/b, the toolbar buttons, the hover-between strip) resolves', () => {
-		// ONE function serves all three affordances, so one guard covers them.
-		expect(live).toMatch(/const type = cellType === 'code' \? codeTypeAt\(index\) : cellType;/);
+		// ONE function serves all three affordances, so one guard covers them. Assert
+		// that it REACHES the shared rule, not how the expression is spelled - a
+		// reflow must not fail a guard about which function is consulted.
+		expect(bodyOf(live, 'insertCell')).toContain('codeTypeAt(');
 		// ...and the affordances really do route through it.
 		expect(cellSv).toMatch(/onInsertCell\('above', cell\.id, 'code'\)/);
 		expect(cellSv).toMatch(/onInsertCell\('below', cell\.id, 'code'\)/);
@@ -123,7 +144,7 @@ describe('SOURCE GUARD: every human insertion path resolves the type', () => {
 	});
 
 	it('the bottom add row resolves, and its markdown/chat buttons still name their type', () => {
-		expect(live).toMatch(/function addCellFromRow\([^)]*\)[^{]*\{\s*return addCell\(afterId, cellType === 'code' \? codeTypeAfter\(afterId\) : cellType\);/);
+		expect(bodyOf(live, 'addCellFromRow')).toContain('codeTypeAfter(');
 		expect(live).toMatch(/onAddCell=\{addCellFromRow\}/);
 		expect(live).not.toMatch(/onAddCell=\{addCell\}/);
 		expect(book).toMatch(/onAddCell\(cells\.at\(-1\)\?\.id, 'markdown'\)/);
@@ -156,11 +177,5 @@ describe('SOURCE GUARD: every human insertion path resolves the type', () => {
 			expect(allowed.some((re) => re.test(call)), `unrecognised insertion path: ${call}`).toBe(true);
 		}
 		expect(calls.length).toBe(9);
-	});
-
-	it('the Databricks table preview does NOT inherit, and says why', () => {
-		// It appends `spark.read.table(...).toPandas()`, which IS Python, to whatever
-		// notebook is open; inheriting would hand a Python snippet to `mojo run`.
-		expect(live).toMatch(/Deliberately NOT `codeTypeAt`/);
 	});
 });

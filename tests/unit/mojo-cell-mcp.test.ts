@@ -15,10 +15,9 @@
  * agent is actually billed for.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { readFileSync, mkdtempSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
@@ -48,8 +47,9 @@ const bodyOf = (r: CallResult) =>
 		.join('\n');
 
 async function connect(sessionId: string) {
-	const server = new McpServer({ name: 'cellar-test', version: '0.0.0' });
-	srv.registerTools(server);
+	// The SHIPPED factory, so the instructions and schemas asserted below are the
+	// ones an agent is really delivered at connect.
+	const server = srv.createCellarMcpServer();
 	const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 	(serverTransport as { sessionId?: string }).sessionId = sessionId;
 	const client = new Client({ name: 'test-agent', version: '0.0.0' });
@@ -112,25 +112,55 @@ describe('an agent can create a mojo cell and SEE that a cell is Mojo', () => {
 });
 
 describe('the schemas and the doctrine an agent is billed for', () => {
-	const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
+	/** Every `cell_type` enum in the EMITTED JSON Schema an agent is handed. */
+	function cellTypeEnums(schema: unknown, found: string[][] = []): string[][] {
+		if (!schema || typeof schema !== 'object') return found;
+		const node = schema as Record<string, unknown>;
+		if (Array.isArray(node.enum) && node.enum.every((v) => typeof v === 'string')) found.push(node.enum as string[]);
+		for (const v of Object.values(node)) {
+			if (Array.isArray(v)) v.forEach((e) => cellTypeEnums(e, found));
+			else if (v && typeof v === 'object') cellTypeEnums(v, found);
+		}
+		return found;
+	}
 
-	it('offers mojo in EVERY cell_type enum - three of four is a silent hole', () => {
-		const enums = src.match(/z\.enum\(\['code', 'sql', [^)]*\)/g) ?? [];
-		expect(enums.length).toBe(4);
-		for (const e of enums) expect(e).toContain("'mojo'");
+	it('offers mojo in EVERY cell_type enum - three of four is a silent hole', async () => {
+		const client = await connect('s-enums');
+		const tools = (await client.listTools()).tools;
+		// The four WRITE tools that let an agent name a cell type.
+		const writers = ['add_cell', 'add_cells', 'add_and_run', 'set_cell_type'];
+		const seen: string[] = [];
+		for (const name of writers) {
+			const tool = tools.find((t) => t.name === name);
+			expect(tool, `${name} must be registered`).toBeTruthy();
+			const enums = cellTypeEnums(tool!.inputSchema).filter((e) => e.includes('code') && e.includes('markdown'));
+			expect(enums.length, `${name} must expose one cell_type enum`).toBe(1);
+			seen.push(name);
+			// The type is offered...
+			expect(enums[0], `${name} must offer mojo`).toContain('mojo');
+			// ...while `chat` stays withheld: a billed model turn is the human's call.
+			expect(enums[0], `${name} must NOT offer chat`).not.toContain('chat');
+		}
+		expect(seen.length).toBe(4);
 	});
 
-	it('states the no-state-between-cells rule BEFORE any tool schema is read', () => {
+	it('states the no-state-between-cells rule BEFORE any tool schema is read', async () => {
 		// An agent that does not know this writes a define/use pair across two Mojo
-		// cells and cannot understand why the second one fails to compile.
-		expect(src).toContain('12. EVERY MOJO CELL IS A SEPARATE PROGRAM.');
-		expect(src).toMatch(/NOTHING carries from one Mojo cell to the next/);
-		expect(src).toMatch(/complete program with its\s+\*?\s*own/);
+		// cells and cannot understand why the second one fails to compile. Read off
+		// the instructions the SERVER really delivered at connect, which the SDK hands
+		// the client before any tool is listed.
+		const client = await connect('s-doctrine');
+		// The clause is hard-wrapped, so read it as the prose it is rather than as
+		// the lines it happens to be laid out on.
+		const instructions = (client.getInstructions() ?? '').replace(/\s+/g, ' ');
+		expect(instructions).toContain('12. EVERY MOJO CELL IS A SEPARATE PROGRAM.');
+		expect(instructions).toContain('NOTHING carries from one Mojo cell to the next');
+		expect(instructions).toContain('complete program with its own');
 		// And the two facts about what a Mojo cell is NOT.
-		expect(src).toMatch(/never\s+\*?\s*shows a staleness verdict/);
-		expect(src).toMatch(/cannot be exported to/);
+		expect(instructions).toContain('never shows a staleness verdict');
+		expect(instructions).toContain('cannot be exported to');
 		// Detect-and-instruct reaches the agent too: it must relay the command.
-		expect(src).toMatch(/Cellar never installs it for the user/);
+		expect(instructions).toContain('Cellar never installs it for the user');
 	});
 
 	it('the tool descriptions name mojo, so an agent can find the type at all', async () => {

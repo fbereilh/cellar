@@ -14,10 +14,11 @@
  *
  * Three properties, and the middle one is the subtle one:
  *   1. a READY setup dispatches the compiled `%%mojo` source to the kernel;
- *   2. a setup that never settles yields NO VERDICT and the run FALLS THROUGH to
- *      `execute()` - it must never be reported as a missing toolchain, because that
- *      would name a cause nothing observed and send the user after a 534 MB install
- *      they may already have;
+ *   2. a setup that CANNOT ANSWER - it never settles, it never gets its turn on the
+ *      per-kernel exec lock, or it throws - yields NO VERDICT and the run FALLS
+ *      THROUGH to `execute()`; it must never be reported as a missing toolchain,
+ *      because that would name a cause nothing observed and send the user after a
+ *      534 MB install they may already have;
  *   3. a NOT-READY setup reports the install instruction and never touches the
  *      kernel with an unregistered magic.
  *
@@ -32,6 +33,8 @@ import { MOJO_MAGIC_HEADER, MOJO_SETUP_MARKER } from '../../src/lib/server/mojo'
 
 const h = vi.hoisted(() => {
 	let seq = 0;
+	/** Code the fake kernel accepts and NEVER answers, so its caller keeps the exec lock. */
+	const HOLD_CODE = '__cellar_test_hold_exec_lock__';
 	function makeFuture() {
 		let resolveDone: (v: { content: { status: string; execution_count: number } }) => void = () => {};
 		const f = {
@@ -65,6 +68,7 @@ const h = vi.hoisted(() => {
 				// decides what this kernel does with it.
 				if (code.includes(MOJO_SETUP_MARKER)) {
 					h.setupRuns += 1;
+					if (h.setupMode === 'throw') throw new Error('kernel connection is dead');
 					const f = makeFuture();
 					if (h.setupMode === 'hang') {
 						h.hangingSetup = f; // never resolves until a test says so
@@ -82,6 +86,9 @@ const h = vi.hoisted(() => {
 				}
 				h.executed.push(code);
 				const f = makeFuture();
+				// A predecessor that takes the per-kernel exec lock and never lets go -
+				// the shape a Databricks CONNECT_CODE has on a cold cluster.
+				if (code === h.HOLD_CODE) return f;
 				queueMicrotask(() => f._resolve('ok'));
 				return f;
 			},
@@ -97,10 +104,11 @@ const h = vi.hoisted(() => {
 
 	return {
 		makeFakeKernel,
+		HOLD_CODE,
 		startNew: vi.fn(async () => makeFakeKernel()),
 		lastKernel: null as ReturnType<typeof makeFakeKernel> | null,
 		hangingSetup: null as ReturnType<typeof makeFuture> | null,
-		setupMode: 'ready' as 'ready' | 'missing' | 'hang',
+		setupMode: 'ready' as 'ready' | 'missing' | 'hang' | 'throw',
 		setupRuns: 0,
 		/** Every non-setup code string the kernel was asked to execute. */
 		executed: [] as string[]
@@ -119,7 +127,10 @@ vi.mock('@jupyterlab/services', () => ({
 	},
 	ServerConnection: { makeSettings: (o: unknown) => o },
 	CommsOverSubshells: { Disabled: 'disabled' },
-	KernelAPI: { getKernelModel: vi.fn(async () => ({ execution_state: 'busy' })) }
+	KernelAPI: {
+		getKernelModel: vi.fn(async () => ({ execution_state: 'busy' })),
+		interruptKernel: vi.fn(async () => {})
+	}
 }));
 
 vi.mock('../../src/lib/server/logs', () => ({ logInfo: vi.fn(), logWarn: vi.fn(), logError: vi.fn() }));
@@ -152,6 +163,7 @@ beforeAll(async () => {
 	process.env.CELLAR_WORKSPACE = WS;
 	process.env.CELLAR_MOJO_SETUP_TIMEOUT_MS = '120'; // tiny bound so a hang is observable
 	process.env.CELLAR_KERNEL_IDLE_TIMEOUT_MS = '0'; // the watchdog is a different test's subject
+	process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = '60'; // a parked run never surrenders; do not wait 5s for it
 	nbmod = await import('../../src/lib/server/notebook');
 	queue = await import('../../src/lib/server/run-queue');
 	runmod = await import('../../src/lib/server/run');
@@ -199,7 +211,7 @@ describe('a READY setup dispatches the compiled magic', () => {
 	});
 });
 
-describe('THE WEDGE GUARD: a setup that never settles must not hang the run', () => {
+describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', () => {
 	it('gives up on the bound, falls through to execute(), and FREES the queue slot', async () => {
 		h.setupMode = 'hang';
 		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
@@ -220,6 +232,48 @@ describe('THE WEDGE GUARD: a setup that never settles must not hang the run', ()
 		h.hangingSetup?._resolve('ok');
 		const next = nbmod.addCell(null, 'code', abs(), null, 'y = 2').id;
 		await expect(runViaOwner(next, 'y = 2')).resolves.toMatchObject({ status: 'ok' });
+	});
+
+	it('gives up when parked on the EXEC LOCK, so the run reaches execute() and Stop can settle it', async () => {
+		// The lock is taken BEFORE the probe's own request, so bounding only the reply
+		// left this shape un-bounded: the probe parked here in front of a run that has
+		// already emitted `run:start` and holds the queue's `running` slot while being
+		// in neither `pending` nor `activeRuns` - reachable by no abort path at all.
+		// Post-fix the probe gives up on the same bound, the run falls through to
+		// `execute()`, which registers its `ActiveRun`, and the user's Stop reaches it.
+		const holder = kernelmod.execute(abs(), h.HOLD_CODE, () => {}, { internal: true }).catch(() => {});
+		await vi.waitFor(() => expect(h.executed).toContain(h.HOLD_CODE));
+
+		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const run = runViaOwner(id, MOJO_SOURCE);
+		// Long enough for the probe's 120ms bound to elapse and the run to register.
+		await new Promise((r) => setTimeout(r, 400));
+
+		const interrupted = await kernelmod.interruptKernel(abs());
+		// The parked run was VISIBLE to the interrupt - it is what `forced` reports.
+		expect(interrupted.stopped).toBe('forced');
+		// And Stop really stopped it: the cell ends in error and the compiled magic was
+		// never dispatched. Parked in the probe it was invisible to this call, and the
+		// cell went on to run once the holder was cleared - a run nobody could cancel.
+		const res = await run;
+		expect(res.status).toBe('error');
+		expect(h.executed.every((c) => !c.includes(MOJO_MAGIC_HEADER))).toBe(true);
+		await holder;
+	});
+
+	it('a probe that THROWS is NO VERDICT too, never a missing toolchain', async () => {
+		// A dead connection / a restart landing mid-probe makes `requestExecute` throw.
+		// That observed NOTHING about the toolchain, so it must take the SAME exit the
+		// timeout takes rather than prescribing a 534 MB install for a cause nobody saw.
+		h.setupMode = 'throw';
+		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const res = await runViaOwner(id, MOJO_SOURCE);
+		const text = JSON.stringify(res.outputs);
+		expect(text).not.toContain('uv pip install max');
+		expect(text).not.toContain('MojoToolchainMissing');
+		// It fell through to `execute()`, which owns the outcome.
+		expect(h.executed.some((c) => c.startsWith(MOJO_MAGIC_HEADER))).toBe(true);
+		expect(res.status).toBe('ok');
 	});
 });
 

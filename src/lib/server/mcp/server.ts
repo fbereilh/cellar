@@ -832,6 +832,19 @@ export function registerTools(server: McpServer) {
 	}));
 }
 
+/**
+ * The ONE way a Cellar MCP server is built: the house-style `instructions` an agent
+ * receives at connect, plus every tool registration. `startMcpServer` mints one per
+ * session through this, and a test drives the same factory over an in-memory
+ * transport - so the instructions and schemas it asserts are the ones an agent is
+ * really delivered rather than a second, hand-assembled server that could drift.
+ */
+export function createCellarMcpServer(): McpServer {
+	const server = new McpServer({ name: 'cellar', version: '0.1.0' }, { instructions: INSTRUCTIONS });
+	registerTools(server);
+	return server;
+}
+
 /** Read and JSON-parse a Node request body. */
 function readBody(req: IncomingMessage): Promise<unknown> {
 	return new Promise((resolve, reject) => {
@@ -895,8 +908,7 @@ export function startMcpServer() {
 				if (sid && existing) sessions.touch(sid); // keep an active session from being reaped
 				let transport = existing?.transport;
 				if (!transport && isInitializeRequest(body)) {
-					const server = new McpServer({ name: 'cellar', version: '0.1.0' }, { instructions: INSTRUCTIONS });
-					registerTools(server);
+					const server = createCellarMcpServer();
 					const created: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
 						sessionIdGenerator: () => randomUUID(),
 						onsessioninitialized: (id: string) => {

@@ -1447,8 +1447,17 @@ async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): P
  *
  * `timeoutMs` bounds the wait and returns `null` when it elapses — for a caller
  * that sits IN FRONT OF a user run and therefore must not be able to hang it (see
- * `ensureMojoMagic`). The default 0 keeps the unbounded behaviour for the startup
- * callers, whose kernel is freshly built and whose answer nothing is waiting on.
+ * `ensureMojoMagic`). It bounds BOTH waits, not only the kernel's reply: the exec
+ * lock is taken through `beginExecLock` so the wait FOR OUR TURN is raced against
+ * the same bound. Bounding only `future.done` left the whole point unmet — a
+ * predecessor that holds the lock for minutes (a Databricks `CONNECT_CODE` on a
+ * cold cluster) parked the caller here, in front of a run that has already emitted
+ * `run:start` and is registered with no abort path yet, which is exactly the wedge
+ * the bound exists to prevent. Giving up hands the chain on only once the
+ * PREDECESSOR finishes (`execute()`'s rule), so no successor can put a second
+ * `requestExecute` on the wire beside it. The default 0 keeps the unbounded
+ * behaviour for the startup callers, whose kernel is freshly built and whose
+ * answer nothing is waiting on.
  */
 async function runCapture(
 	kernel: KernelConnection,
@@ -1456,7 +1465,18 @@ async function runCapture(
 	{ timeoutMs = 0 }: { timeoutMs?: number } = {}
 ): Promise<string | null> {
 	const nbKernel = nbKernelForConnection(kernel);
-	const release = nbKernel ? await acquireExecLock(nbKernel) : null;
+	const lock = nbKernel ? beginExecLock(nbKernel) : null;
+	if (lock) {
+		if (timeoutMs > 0) {
+			const ourTurn = await Promise.race([lock.ready.then(() => true), delay(timeoutMs).then(() => false)]);
+			if (!ourTurn) {
+				void lock.ready.then(lock.release, lock.release);
+				return null;
+			}
+		} else {
+			await lock.ready;
+		}
+	}
 	try {
 		const future = kernel.requestExecute({ code, silent: true, store_history: false, stop_on_error: false });
 		let out = '';
@@ -1484,7 +1504,7 @@ async function runCapture(
 		}
 		return out.trim();
 	} finally {
-		release?.();
+		lock?.release();
 	}
 }
 
@@ -2456,11 +2476,12 @@ export function liveDatabricksRuntime(nbPath?: string | null): {
  * cell in it anyway, so the alternative (report "not ready" for a kernel that has
  * simply not booted) would tell the user their toolchain is missing when it is not.
  *
- * ONLY a ready result is remembered (see `NotebookKernel.mojoSetup`), and a probe
- * that could not run at all is reported NOT ready with its own reason - "we could
- * not tell" must never read as "the toolchain is there", because the cost of that
- * mistake is IPython's opaque `UsageError: Cell magic function %%mojo not found`
- * in place of an actionable install instruction.
+ * ONLY a ready result is remembered (see `NotebookKernel.mojoSetup`). A probe that
+ * ANSWERED is reported as it answered - a `ready: false` there is an OBSERVED
+ * absence, and reporting it is what replaces IPython's opaque `UsageError: Cell
+ * magic function %%mojo not found` with an actionable install instruction. A probe
+ * that could not run AT ALL - it timed out, or it threw - observed nothing about
+ * the toolchain, so it is NO VERDICT (`null`) and never an absence.
  */
 export async function ensureMojoMagic(nbPath?: string | null): Promise<MojoSetup | null> {
 	const abs = resolveNb(nbPath);
@@ -2482,19 +2503,25 @@ export async function ensureMojoMagic(nbPath?: string | null): Promise<MojoSetup
 	//
 	// `runCapture` DISPOSES the timed-out future rather than abandoning it, so the
 	// per-kernel exec lock is released and the `execute()` this run falls through to
-	// is not parked behind a probe nobody is waiting for any more.
+	// is not parked behind a probe nobody is waiting for any more. That bound covers
+	// the wait for the lock ITSELF as well as the kernel's reply, so a predecessor
+	// holding it for minutes cannot park this probe either.
+	//
+	// A probe that THREW takes the same NO-VERDICT exit as one that timed out, and
+	// deliberately so: both observed nothing about the toolchain, so neither may
+	// claim it is absent nor send the user after a 534 MB install they may already
+	// have. The run falls through to `execute()`, which owns the watchdog and
+	// reports honestly.
 	let out: string | null;
 	try {
 		out = await runCapture(kernel, MOJO_SETUP_CODE, { timeoutMs: mojoSetupTimeoutMs() });
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		return { ready: false, session, detail: `the Mojo setup probe could not run: ${message}` };
+	} catch {
+		return null;
 	}
-	// NO VERDICT, never "the toolchain is missing": the run falls through to
-	// `execute()`, which owns the watchdog and reports honestly. That is also the
-	// right answer for the one legitimate slow case - a Databricks `CONNECT_CODE`
-	// holding the exec lock for minutes on a cold cluster - where `execute()` parks
-	// on the same lock and IS abortable.
+	// NO VERDICT, never "the toolchain is missing". That is also the right answer for
+	// the one legitimate slow case - a Databricks `CONNECT_CODE` holding the exec
+	// lock for minutes on a cold cluster - which now reaches this exit rather than
+	// parking un-abortably in front of the run.
 	if (out === null) return null;
 	const setup: MojoSetup = { ...parseMojoSetup(out), session };
 	// Memoized only while it still describes the LIVE session: `beginSession` clears

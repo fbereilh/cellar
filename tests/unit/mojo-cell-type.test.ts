@@ -321,10 +321,30 @@ describe('the exclusions are shaped so the NEXT language inherits them', () => {
 	});
 
 	it('each engine reaches the shared predicate rather than re-deriving one', () => {
-		expect(read('server/dataflow.ts')).toMatch(/cells\.filter\(isPythonCodeCell\)/);
-		expect(read('staleness.ts')).toMatch(/cells\.filter\(hasPythonDataflow\)/);
-		expect(read('server/imports-cell.ts')).toMatch(/import \{ isPythonCodeCell \} from '\.\.\/cellLanguage'/);
-		expect(read('exportRole.ts')).toMatch(/return isLogicalCellType\(cell, 'code'\)/);
+		// WHICH predicate an engine consults, not how the call is spelled: a
+		// behaviour-preserving `filter((c) => isPythonCodeCell(c))` must still pass.
+		// Each must both IMPORT the shared rule from cellLanguage and USE it.
+		const shared: Array<[string, string]> = [
+			['server/dataflow.ts', 'isPythonCodeCell'],
+			['staleness.ts', 'hasPythonDataflow'],
+			['server/imports-cell.ts', 'isPythonCodeCell'],
+			// The same test as `isPythonCodeCell`, under exportRole's own name for it.
+			['exportRole.ts', 'isLogicalCellType']
+		];
+		for (const [f, predicate] of shared) {
+			const src = read(f);
+			expect(src, `${f} must import ${predicate} from cellLanguage`).toMatch(
+				new RegExp(`import \\{[^}]*\\b${predicate}\\b[^}]*\\} from '[^']*cellLanguage'`)
+			);
+			// CALLED somewhere other than the import line - a mention in a comment is
+			// not a use, and this guard exists precisely to catch a rule that drifted.
+			const uses = src
+				.split('\n')
+				.filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+				.filter((l) => !l.includes('cellLanguage'))
+				.filter((l) => l.includes(`${predicate}(`) || l.includes(`filter(${predicate})`));
+			expect(uses.length, `${f} must USE ${predicate}`).toBeGreaterThan(0);
+		}
 	});
 
 	it('imports-cell keeps NO local copy of the rule', () => {

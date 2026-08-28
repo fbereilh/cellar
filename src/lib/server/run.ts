@@ -161,7 +161,9 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	try {
 		try {
 			if (mojoSetup && !mojoSetup.ready) {
-				// The toolchain is absent (or the probe could not answer). The kernel is
+				// The probe ANSWERED, and it answered that the toolchain is absent - a
+				// probe that could not answer is NO VERDICT (null) and never lands here,
+				// so this branch never asserts an absence nobody observed. The kernel is
 				// alive - `ensureMojoMagic` started it and ran a probe in it - so this run
 				// really did happen in `mojoSetup.session`'s namespace and is stamped with
 				// it: reporting no session would drop the cell into `error_persisted`, the
