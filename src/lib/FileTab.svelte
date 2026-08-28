@@ -11,6 +11,7 @@
 	import { StreamLanguage } from '@codemirror/language';
 	import { toml as tomlMode } from '@codemirror/legacy-modes/mode/toml';
 	import { EDITOR_THEME } from '$lib/editorTheme';
+	import { directiveCommentHighlight } from '$lib/directiveComment';
 	import { gitGutterExtension, setGitBaseline } from '$lib/gitGutter';
 	import MarkdownView from '$lib/MarkdownView.svelte';
 	import HtmlPreview from '$lib/HtmlPreview.svelte';
@@ -199,7 +200,11 @@
 	// toggle must also get markdown highlighting in Source mode.
 	function langFor(p: string): Extension {
 		const q = p.toLowerCase();
-		if (q.endsWith('.py')) return python();
+		// A jupytext `.py` notebook carries nbdev/Quarto `#|` directives in its cell
+		// bodies, so the python branch gets that highlight too - scoped here rather
+		// than in `EDITOR_THEME`, which every other kind below shares and where `#|`
+		// carries no such meaning. See `directiveComment.ts`.
+		if (q.endsWith('.py')) return [python(), directiveCommentHighlight];
 		if (q.endsWith('.md') || q.endsWith('.markdown')) return markdown();
 		if (q.endsWith('.json') || q.endsWith('.ipynb')) return jsonLang();
 		if (q.endsWith('.yml') || q.endsWith('.yaml')) return yamlLang();

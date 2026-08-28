@@ -21,6 +21,7 @@ import { pythonLanguage } from '@codemirror/lang-python';
 import { markdownLanguage } from '@codemirror/lang-markdown';
 import { StandardSQL } from '@codemirror/lang-sql';
 import { cellarHighlightStyle } from '$lib/editorTheme';
+import { DIRECTIVE_CLASS, directiveCommentRanges } from '$lib/directiveComment';
 
 /** 'plain' = no grammar at all: an nbformat `raw` cell, whose source is verbatim
  *  text for a downstream tool and not a language to guess at. It matches the
@@ -88,6 +89,22 @@ export function highlightLines(source: string, lang: StaticLang): string[] {
 	} catch {
 		return plainLines(source);
 	}
+	// nbdev/Quarto `#|` directive comments, so the static render marks them exactly
+	// as the live editor's decoration plugin does (both call the same rule). Only
+	// for Python — `#|` is a directive in the nbdev/Quarto ecosystem, not in SQL or
+	// markdown, so decorating a `#` comment there would invent a class that does not
+	// exist. See `directiveComment.ts`.
+	const directives = lang === 'python' ? directiveCommentRanges(source, tree) : [];
+	let di = 0;
+	// True when the highlighted range `[from, to)` lies inside a directive comment.
+	// Ranges arrive in document order from `highlightTree`, as do `directives`, so
+	// this walks the list once rather than searching it per token.
+	const inDirective = (from: number, to: number): boolean => {
+		while (di < directives.length && directives[di].to <= from) di++;
+		const d = directives[di];
+		return d != null && from >= d.from && to <= d.to;
+	};
+
 	const lines: string[] = [''];
 	let pos = 0;
 	// Append `text` (optionally wrapped in `cls`), splitting it across line
@@ -103,7 +120,7 @@ export function highlightLines(source: string, lang: StaticLang): string[] {
 	};
 	highlightTree(tree, cellarHighlightStyle, (from, to, cls) => {
 		if (from > pos) emit(source.slice(pos, from), null); // untokenized gap
-		emit(source.slice(from, to), cls);
+		emit(source.slice(from, to), inDirective(from, to) ? `${cls} ${DIRECTIVE_CLASS}` : cls);
 		pos = to;
 	});
 	if (pos < source.length) emit(source.slice(pos), null);
