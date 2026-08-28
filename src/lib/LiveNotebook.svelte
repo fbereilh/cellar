@@ -3087,8 +3087,10 @@
 
 	/** What an insert re-materializes: a cell's type, source and `cellar` metadata.
 	 *  The type is LOGICAL (the add route's vocabulary): paste/undo feed it the
-	 *  nbformat type + the tagged `cellar` namespace, while a typed insert (the
-	 *  hover-between strip / bottom add row) names `sql`/`chat` directly. */
+	 *  nbformat type + the tagged `cellar` namespace, an add affordance that NAMES a
+	 *  type (`markdown`/`chat`) passes it through, and a plain `code` request is
+	 *  RESOLVED first through `codeTypeAt`/`codeTypeAfter` - so it may arrive here as
+	 *  `sql` or `mojo` (see `$lib/cellInherit`). */
 	interface InsertSpec {
 		cell_type: LogicalCellType;
 		source: string;
@@ -3242,7 +3244,9 @@
 	 *
 	 * The types a fence can ask for are `code`/`sql`/`markdown`, which EVERY
 	 * notebook format can hold, so there is no `refuseUnsupportedType` gate here:
-	 * `chat` and `raw` are unreachable by construction (see `fenceCellType`).
+	 * `chat`, `raw` and `mojo` - i.e. exactly the types a `.py` notebook refuses -
+	 * are all unreachable, `mojo` because no fence tag maps onto it (see
+	 * `fenceCellType`, whose header owns that decision).
 	 */
 	async function extractCodeBlock(sourceId: string, block: ExtractedCodeBlock): Promise<boolean> {
 		// The whole read-modify-write of the anchor runs inside the lock, the

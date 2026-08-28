@@ -108,7 +108,8 @@
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
 		hideAllCode?: boolean;
-		/** This is a `.py` TEXT notebook, which cannot hold a raw cell (see `typeOptions`). */
+		/** This is a `.py` TEXT notebook, which cannot hold a raw, Mojo or chat cell
+		 *  (WHICH types those are is `$lib/cellLanguage`'s; see `typeOptions`). */
 		isPy?: boolean;
 		/** Hide (or show) this code cell's input in place. */
 		onSetHideInput?: (id: string, hidden: boolean) => void;
@@ -1017,7 +1018,7 @@
 		error: 'text-error border-error bg-error/10'
 	};
 
-	// ---- Cell-type menu (Python / SQL / Markdown) ---------------------------
+	// ---- Cell-type menu (Python / SQL / Mojo / Chat / Markdown / Raw) -------
 	// A native popover so the menu renders in the top layer, unclipped by the
 	// card's `overflow-hidden`. Positioned under its trigger button on open.
 	let typeMenuEl = $state<HTMLElement | null>(null);
@@ -1030,21 +1031,23 @@
 		typeMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
 		typeMenuEl.style.top = r.bottom + 4 + 'px';
 	}
-	// The cell-type menu options (Python / SQL / Chat / Markdown / Raw). This menu
-	// is the ONLY create path for raw - there is deliberately no "+ Raw" insert
-	// button, a once-per-notebook type not being worth a button on every gap. Chat
+	// The cell-type menu options (Python / SQL / Mojo / Chat / Markdown / Raw). This
+	// menu is the ONLY create path for raw AND for mojo - there is deliberately no
+	// "+ Raw" or "+ Mojo" insert button, neither being worth a button on every gap
+	// (raw is once-per-notebook; a second mojo cell comes for free from the
+	// language a plain "+ Code" insertion INHERITS - see `$lib/cellInherit`). Chat
 	// is different: asking a question recurs through a session the way code and
 	// markdown do, so it IS also creatable directly from the add affordances (the
 	// bottom add row and the hover-between strip in `Notebook.svelte`, both gated
 	// off `$lib/cellLanguage` on a `.py` notebook exactly like `typeOptions`
 	// below). Converting an existing cell stays here for every type.
 	//
-	// Raw AND chat are DROPPED on a `.py` text notebook: such a document is rebuilt
-	// from its cells on every save, carrying neither the raw marker nor any
-	// `cellar` metadata or outputs, so the server refuses both (`assertCanHoldType`)
-	// - and a notebook that cannot hold a cell type must not be offered a control
-	// for one. WHICH types those are is read from `$lib/cellLanguage`, so the menu
-	// cannot drift from the writers' rule.
+	// Raw, mojo AND chat are DROPPED on a `.py` text notebook: such a document is
+	// rebuilt from its cells on every save, carrying neither the raw marker nor any
+	// `cellar` metadata or outputs, so the server refuses all three
+	// (`assertCanHoldType`) - and a notebook that cannot hold a cell type must not
+	// be offered a control for one. WHICH types those are is read from
+	// `$lib/cellLanguage`, so the menu cannot drift from the writers' rule.
 	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },

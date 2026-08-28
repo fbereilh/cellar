@@ -1486,14 +1486,15 @@ export function exportHtml({
  * cell: its imports are in the imports cell, and an empty cell beside them is
  * litter. An explicitly empty source still creates its empty cell.
  *
- * A spec of a type a `.py` TEXT notebook cannot hold ('raw', 'chat') throws
- * `TextNotebookCellTypeError` for the WHOLE batch before anything is written - `addCell` would throw on it anyway (the doc
- * layer owns the rule), but only once routing had already merged the earlier
- * specs' imports into the imports cell and run it, leaving the notebook
- * half-written behind an error. Raised here for the same all-or-nothing reason
- * `setCellExport` resolves its whole batch first, and before the pre-action
- * checkpoint, since a refused call changes nothing. The tool handlers turn it
- * into a refusal naming the cause.
+ * A spec of a type a `.py` TEXT notebook cannot hold ('raw', 'chat', 'mojo')
+ * throws `TextNotebookCellTypeError` for the WHOLE batch before anything is
+ * written - `addCell` would throw on it anyway (the doc layer owns the rule),
+ * but only once routing had already merged the earlier specs' imports into the
+ * imports cell and run it, leaving the notebook half-written behind an error.
+ * Raised here for the same all-or-nothing reason `setCellExport` resolves its
+ * whole batch first, and before the pre-action checkpoint, since a refused
+ * call changes nothing. The tool handlers turn it into a refusal naming the
+ * cause.
  */
 export async function addCells(
 	specs: Array<{ cell_type?: string; source?: string }>,
@@ -1769,14 +1770,14 @@ export function moveCell(id: string, dest: MoveDest, nb?: string | null) {
 
 /**
  * MCP `set_cell_type`. A `.py` TEXT notebook REFUSES the types it cannot hold
- * ('raw', 'chat') - the doc layer's rule
- * (`assertCanHoldType`), looked up here through the SAME `isPyTextNotebook`
- * predicate the export tools use so the agent gets a refusal NAMING the cause
- * rather than a throw, and so nothing is written: checked BEFORE the pre-action
- * checkpoint, because a refused call changes nothing and a snapshot for it would
- * spend the throttle slot the next real mutation is owed (`removeCells`'
- * precedent). Every other conversion is unaffected on a `.py` notebook, and an
- * `.ipynb` never reaches the check.
+ * ('raw', 'chat', 'mojo') - the doc layer's rule (`assertCanHoldType`), looked
+ * up here through the SAME `isPyTextNotebook` predicate the export tools use
+ * so the agent gets a refusal NAMING the cause rather than a throw, and so
+ * nothing is written: checked BEFORE the pre-action checkpoint, because a
+ * refused call changes nothing and a snapshot for it would spend the throttle
+ * slot the next real mutation is owed (`removeCells`' precedent). Every other
+ * conversion is unaffected on a `.py` notebook, and an `.ipynb` never reaches
+ * the check.
  */
 export function setType(id: string, type: LogicalCellType, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();

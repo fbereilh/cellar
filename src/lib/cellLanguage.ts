@@ -289,15 +289,16 @@ export function textNotebookTypeForReason(reason: unknown): PyUnsupportedType | 
  * markdown|code (`jupytext.ts`) - and coerces again on read, carrying no
  * `cellar` metadata and no outputs. So the declaration would live only in memory
  * while disk held a `code` cell: after a reload the frontmatter sits in a cell
- * with a Run button (raw), or the question does while its REPLY is gone (chat) -
- * the exact silent degrade each type exists to prevent, and worse from MARKDOWN,
- * whose prose would lose its markers on the way too.
+ * with a Run button (raw), the question does while its REPLY is gone (chat), or
+ * Mojo source does and is handed to Python (mojo) - the exact silent degrade each
+ * type exists to prevent, and worse from MARKDOWN, whose prose would lose its
+ * markers on the way too.
  *
  * Refused by name instead, at the doc-layer writers, so no surface can route
  * around it - the `textNotebookRootError` precedent, for the identical
  * rebuilt-from-cells reason. Only these types, and only on a `.py` doc: every
- * other conversion, every raw or chat cell in an `.ipynb`, and CLEARING a type
- * are all untouched.
+ * other conversion, every raw, chat or mojo cell in an `.ipynb`, and CLEARING a
+ * type are all untouched.
  */
 export class TextNotebookCellTypeError extends Error {
 	/** The refused logical type, and the route-facing code for it. */
@@ -334,11 +335,11 @@ export function nbCellType(cellType: LogicalCellType): CellType {
 }
 
 /**
- * The `cellar.language` tag a LOGICAL type carries on disk: 'sql' and 'chat' are
- * tagged code cells, everything else carries no tag. The ONE tag rule, shared by
- * the server's `applyCellType`/`newCell`, the `cell:type` event payload, and the
- * browser's `applyCellTypeLocally` - a per-site `isSql ? 'sql' : null` ternary is
- * how the chat tag would be dropped by whichever copy was not updated.
+ * The `cellar.language` tag a LOGICAL type carries on disk: 'sql', 'chat' and
+ * 'mojo' are tagged code cells, everything else carries no tag. The ONE tag rule,
+ * shared by the server's `applyCellType`/`newCell`, the `cell:type` event payload,
+ * and the browser's `applyCellTypeLocally` - a per-site `isSql ? 'sql' : null`
+ * ternary is how the chat tag would be dropped by whichever copy was not updated.
  */
 export function languageTagFor(cellType: LogicalCellType): string | null {
 	if (cellType === 'sql') return SQL_LANGUAGE;
