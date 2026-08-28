@@ -62,6 +62,7 @@ import {
 	otherFormLine,
 	parseStringArray,
 	parseTomlDoc,
+	parseTomlString,
 	readAssignment
 } from './toml.js';
 import { workspaceRoot } from './fstree';
@@ -123,6 +124,9 @@ const SETTINGS_INI_SIGNALS = /^\s*(lib_name|lib_path|nbs_path|doc_path|nbdev_\w+
  * itself just skips such a file (`_has_nbdev` swallows the parse error).
  */
 const PYPROJECT_NBDEV_SIGNAL = /nbdev/;
+
+/** PEP 621's own table, read only for the `lib_path` fallback (`[project].name`). */
+const PROJECT_TABLE = ['project'];
 
 type Located = { path: string; text: string; doc: ReturnType<typeof parseTomlDoc> };
 
@@ -234,6 +238,146 @@ export function detectNbdev(workspace: string = safeWorkspace()): NbdevState {
 		if (text !== null && SETTINGS_INI_SIGNALS.test(text)) return { kind: 'legacy-settings-ini', path };
 	}
 	return { kind: 'none' };
+}
+
+/**
+ * Where nbdev would write a `#| default_exp` module: the project's `lib_path`,
+ * absolute. Null when this is not an nbdev project at all.
+ *
+ * ## Why Cellar needs it
+ *
+ * nbdev's `default_exp` names a DOTTED MODULE, measured from `lib_path`, not a
+ * path measured from anywhere Cellar knows. Cellar honoured the directive but
+ * resolved it workspace-relative, so opening a real nbdev notebook and marking a
+ * cell wrote a stray module at the workspace root instead of into the library
+ * (scout report section 5.2). Honouring the directive that decides WHERE while
+ * ignoring the config that decides the ROOT is worse than not honouring it: the
+ * target resolves plausibly and writes to the wrong file.
+ *
+ * ## The rule, measured against nbdev 3.3.13 (`nbdev/config.py` `ConfigToml`)
+ *
+ * `lib_path` is `[tool.nbdev].lib_path` when present, else `[project].name` with
+ * `-` replaced by `_`; either way it is resolved against the DIRECTORY HOLDING THE
+ * `pyproject.toml`, and an absent/empty project name degenerates to that directory
+ * itself. All four cases were driven through real nbdev rather than remembered.
+ *
+ * ## Refusing rather than guessing
+ *
+ * `ok:false` means this IS an nbdev project whose `lib_path` cannot be read with
+ * confidence - a `[tool.nbdev]` in a form the line-based scanner will not touch (an
+ * inline table, a dotted key), a `pyproject.toml` that is not valid TOML, or a
+ * `lib_path` that is not a plain single-line string. The caller must NOT fall back
+ * to workspace-relative there: that is exactly the wrong-file write above. It
+ * refuses the target instead, and the escape hatch is already there and untouched -
+ * an explicit `metadata.cellar.export_target` never consults any of this.
+ *
+ * ## Cost
+ *
+ * Only a notebook carrying a `#| default_exp` directive ever asks, so an ordinary
+ * Cellar notebook pays nothing. For those that do, the answer is cached on a short
+ * TTL (`listWorktreesAt`'s tier, and for its reason: a `pyproject.toml` edit must
+ * show up promptly, while a burst of resolutions - the agent map resolves per read
+ * - must not each walk the ancestors and re-parse TOML on the process carrying the
+ * kernel websockets and the SSE fan-out). Deliberately not memoized for the process
+ * lifetime the way `preflight` is: repo identity does not change, a project's
+ * `lib_path` can.
+ *
+ * STATED LIMIT: nbdev also merges a USER-level `~/.config/nbdev/config.toml` under
+ * the project's `[tool.nbdev]`, so a user who sets `lib_path` there and omits it
+ * from the project would get a different answer from nbdev than from Cellar. Not
+ * modelled: reading the user's XDG config is outside this, project config wins
+ * wherever it is present, and the failure is visible (the module lands in the
+ * project-derived directory) rather than silent.
+ */
+export type NbdevLibPath =
+	| { ok: true; libPath: string; configPath: string }
+	| { ok: false; configPath: string; reason: string };
+
+const LIB_PATH_TTL_MS = 2000;
+let libPathCache: { workspace: string; at: number; value: NbdevLibPath | null } | null = null;
+
+export function nbdevLibPath(workspace: string = safeWorkspace()): NbdevLibPath | null {
+	const now = Date.now();
+	if (libPathCache && libPathCache.workspace === workspace && now - libPathCache.at < LIB_PATH_TTL_MS)
+		return libPathCache.value;
+	const value = readNbdevLibPath(workspace);
+	libPathCache = { workspace, at: now, value };
+	return value;
+}
+
+/** Drop the `lib_path` cache. For tests, and for a write that moves the config. */
+export function invalidateNbdevLibPath(): void {
+	libPathCache = null;
+}
+
+function readNbdevLibPath(workspace: string): NbdevLibPath | null {
+	if (!workspace) return null;
+	let dirs: string[];
+	try {
+		dirs = ancestors(workspace);
+	} catch {
+		return null;
+	}
+	for (const dir of dirs) {
+		const path = join(dir, 'pyproject.toml');
+		if (!isFile(path)) continue;
+		// Wrapped whole for the reason `detectNbdev` is: this rides `getNotebook`, so
+		// an unexpected throw would take down a read rather than a feature.
+		let verdict: NbdevLibPath | 'skip';
+		try {
+			verdict = libPathFrom(path);
+		} catch {
+			verdict = { ok: false, configPath: path, reason: 'it could not be read' };
+		}
+		if (verdict === 'skip') continue;
+		return verdict;
+	}
+	return null;
+}
+
+/** Read one candidate `pyproject.toml`, or `'skip'` when it is not nbdev's. */
+function libPathFrom(path: string): NbdevLibPath | 'skip' {
+	const { text } = readText(path);
+	if (text === null) return 'skip'; // no evidence this is nbdev's project - `_has_nbdev`'s own stance
+	const doc = parseTomlDoc(text);
+	if (doc.malformed) {
+		if (!PYPROJECT_NBDEV_SIGNAL.test(text)) return 'skip';
+		return { ok: false, configPath: path, reason: 'it could not be read as TOML with confidence' };
+	}
+	const table = findTable(doc, NBDEV_TABLE);
+	if (!table) {
+		const line = otherFormLine(doc, NBDEV_TABLE);
+		if (line === null) return 'skip';
+		return {
+			ok: false,
+			configPath: path,
+			reason: `its ${NBDEV_TABLE.join('.')} is not a plain table (line ${line + 1})`
+		};
+	}
+	const dir = dirname(path);
+	const assigned = readAssignment(doc, table, 'lib_path');
+	if (assigned) {
+		const value = parseTomlString(assigned.value);
+		if (value === null || !value.trim())
+			return {
+				ok: false,
+				configPath: path,
+				reason: `its lib_path (line ${assigned.first + 1}) is not a plain string`
+			};
+		return { ok: true, libPath: resolve(dir, value.trim()), configPath: path };
+	}
+	// nbdev's fallback: the project name with `-` folded to `_`. An absent or empty
+	// name degenerates to the config directory itself, which is what nbdev does.
+	const project = findTable(doc, PROJECT_TABLE);
+	const nameAssigned = project ? readAssignment(doc, project, 'name') : null;
+	const name = nameAssigned ? parseTomlString(nameAssigned.value) : null;
+	if (nameAssigned && name === null)
+		return {
+			ok: false,
+			configPath: path,
+			reason: `it sets no lib_path, and its project name (line ${nameAssigned.first + 1}) is not a plain string`
+		};
+	return { ok: true, libPath: resolve(dir, (name ?? '').trim().replace(/-/g, '_')), configPath: path };
 }
 
 function safeWorkspace(): string {

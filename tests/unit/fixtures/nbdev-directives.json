@@ -1,0 +1,197 @@
+[
+{
+"source": "#| export\ndef a(): pass",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#|export\nx=1",
+"export": "",
+"default_exp": null
+},
+{
+"source": "# | export\nx=1",
+"export": "",
+"default_exp": null
+},
+{
+"source": "   #| export\nx=1",
+"export": "",
+"default_exp": null
+},
+{
+"source": "\t#| export\nx=1",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#| export: true\nx=1",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#| export other\nx=1",
+"export": "other",
+"default_exp": null
+},
+{
+"source": "#| exporti\nx=1",
+"export": null,
+"default_exp": null
+},
+{
+"source": "#| exports\nx=1",
+"export": null,
+"default_exp": null
+},
+{
+"source": "#| exportd\nx=1",
+"export": null,
+"default_exp": null
+},
+{
+"source": "#| exportx\nx=1",
+"export": null,
+"default_exp": null
+},
+{
+"source": "#| EXPORT\nx=1",
+"export": null,
+"default_exp": null
+},
+{
+"source": "x = 1\n#| export",
+"export": null,
+"default_exp": null
+},
+{
+"source": "# note\n#| export",
+"export": null,
+"default_exp": null
+},
+{
+"source": "s = '''\n#| export\n'''",
+"export": null,
+"default_exp": null
+},
+{
+"source": "\n\n#| export",
+"export": "",
+"default_exp": null
+},
+{
+"source": "%%time\n#| export",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#| hide\n#| export",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#|\n#| export",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#| export",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#| export   ",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#| export\r\nx=1",
+"export": "",
+"default_exp": null
+},
+{
+"source": "",
+"export": null,
+"default_exp": null
+},
+{
+"source": "def a(): pass",
+"export": null,
+"default_exp": null
+},
+{
+"source": "#| default_exp core",
+"export": null,
+"default_exp": "core"
+},
+{
+"source": "#|default_exp pkg.utils\nimport os",
+"export": null,
+"default_exp": "pkg.utils"
+},
+{
+"source": "#| default_exp:core",
+"export": null,
+"default_exp": "core"
+},
+{
+"source": "#| default_exp   core   ",
+"export": null,
+"default_exp": "core"
+},
+{
+"source": "#| default_exp first\n#| default_exp second",
+"export": null,
+"default_exp": "second"
+},
+{
+"source": "%%time\n\n#| hide\n#| default_exp core\n#| export\nimport os",
+"export": "",
+"default_exp": "core"
+},
+{
+"source": "#| export\n#| default_exp core",
+"export": "",
+"default_exp": "core"
+},
+{
+"source": "   \n#| export",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#|  export",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#| export:true",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#|export:false",
+"export": "false",
+"default_exp": null
+},
+{
+"source": "# |  default_exp  a.b.c ",
+"export": null,
+"default_exp": "a.b.c"
+},
+{
+"source": "#| eval: false\n#| export",
+"export": "",
+"default_exp": null
+},
+{
+"source": "#| export # trailing",
+"export": "# trailing",
+"default_exp": null
+},
+{
+"source": "x=1\n\n#| export",
+"export": null,
+"default_exp": null
+}
+]

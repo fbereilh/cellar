@@ -25,7 +25,7 @@
 		selectionAfterRemoval,
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
-	import { exportCellCount, isExportCell } from '$lib/exportRole';
+	import { exportCellCount, hasExportDirective, isExportCell } from '$lib/exportRole';
 	import { isExportBase } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
 	import type { ExportPyResult } from '$lib/types';
@@ -2462,6 +2462,20 @@
 	 */
 	async function setExport(id: string, exported: boolean) {
 		const cell = findCell(id);
+		// A cell whose SOURCE carries nbdev's `#| export` is marked by that line, and
+		// Cellar never writes a directive - so clearing the metadata half would leave
+		// the cell exported with the toggle bouncing straight back to ON. Refused here
+		// as well as on the server (which still refuses for anything that routes around
+		// this tab), and SAID on the shell's transient notice line rather than silently
+		// doing nothing: the `refuseUnsupportedType` shape, for its reason - a click
+		// that appears to do nothing reads as a bug. Nothing is applied and nothing is
+		// sent, so there is no optimistic state to revert.
+		if (!exported && hasExportDirective(cell)) {
+			onNotice?.(
+				'That cell is marked for export by an "#| export" line in its own source - remove that line to stop exporting it.'
+			);
+			return;
+		}
 		if (cell) {
 			const cellar = { ...(cell.metadata?.cellar ?? {}) };
 			if (exported) cellar.export = true;

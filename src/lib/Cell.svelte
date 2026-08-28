@@ -21,7 +21,7 @@
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
-	import { canExportCell, isExportCell } from '$lib/exportRole';
+	import { canExportCell, isExportCell, hasExportDirective } from '$lib/exportRole';
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
@@ -299,6 +299,20 @@
 	// can never apply is worse than one behind a menu, so it is GATED, not disabled.
 	const canExport = $derived(canExportCell(cell));
 	const isExport = $derived(isExportCell(cell));
+	// Marked by nbdev's `#| export` in the cell's own SOURCE rather than by
+	// `metadata.cellar.export`. The toggle then shows ON (it IS exported - showing an
+	// unticked control over a cell the exporter writes is the lie this exists to
+	// avoid) and stays LIVE rather than going `disabled`: a disabled button gets no
+	// pointer events, so its `title` can never be hovered and the one thing the user
+	// needs - which line to remove - would be unreachable. Clicking it declines on the
+	// shell's notice line instead (`LiveNotebook.setExport`), which is the same
+	// live-control-that-explains-itself stance the Databricks card takes.
+	//
+	// The explanation rides `title`, NOT `aria-label`: the label stays STABLE across
+	// every state (the state is `aria-pressed`'s job - a label that moves announces
+	// the same fact twice), and a browser exposes `title` as the accessible
+	// DESCRIPTION beside that name, which is exactly the right split for a reason.
+	const exportByDirective = $derived(canExport && hasExportDirective(cell));
 	// Withheld from every agent surface (`cellar.hidden_from_agent`, the shared
 	// predicate MCP filters every read through). Deliberately UNGATED: unlike export
 	// and hide-code this applies to every cell type - a markdown cell's prose is as
@@ -2018,10 +2032,13 @@
 							: 'text-base-content/60 hover:text-base-content/90'}"
 						onclick={toggleExport}
 						aria-pressed={isExport}
-						title={isExport
-							? "Exported to the notebook's .py module - click to unmark"
-							: "Mark for export to the notebook's .py module"}
+						title={exportByDirective
+							? 'Exported by the "#| export" line in this cell - remove that line to stop exporting it'
+							: isExport
+								? "Exported to the notebook's .py module - click to unmark"
+								: "Mark for export to the notebook's .py module"}
 						aria-label="Export this cell to the notebook's .py module"
+						data-directive-export={exportByDirective ? 'true' : undefined}
 						data-testid="toggle-export"
 					>
 						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>

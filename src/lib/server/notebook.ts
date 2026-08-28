@@ -36,7 +36,7 @@ import {
 	type ResolvedExportTarget
 } from './export-py';
 import type { ExportHazard } from '../exportHazard';
-import { canExportCell } from '../exportRole';
+import { canExportCell, hasExportDirective } from '../exportRole';
 import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
@@ -988,16 +988,35 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
  *
  * This IS `setCellExports` of one - one implementation, one rule - so the UI's
  * per-cell toggle and MCP's batch tool cannot drift about what marking means.
- * Returns whether the cell now carries the requested value (false = there is no
- * such cell, or marking a non-Python one, which `isExportCell` would ignore).
+ * Reports whether the cell now carries the requested value, and WHY when it does
+ * not - a plain boolean could not tell "no such cell" from "the source's `#| export`
+ * keeps it exported", and the PATCH route has to say which, or a refusal reads as
+ * the wrong one. `not-code` is marking a non-Python cell, which `isExportCell`
+ * would ignore anyway.
  */
-export function setCellExport(id: string, exported: boolean, nb?: string | null, originId?: string | null): boolean {
+/**
+ * Why a `setCellExport` call did not take. `not-code` is the pre-existing
+ * eligibility refusal, `export-directive-owns-cell` the one this rule adds.
+ */
+export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directive-owns-cell';
+
+export function setCellExport(
+	id: string,
+	exported: boolean,
+	nb?: string | null,
+	originId?: string | null
+): { ok: true } | { ok: false; reason: SetCellExportRefusal } {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
-	if (!cell) return false;
-	if (exported && !canExportCell(cell)) return false;
+	if (!cell) return { ok: false, reason: 'no-such-cell' };
+	if (exported && !canExportCell(cell)) return { ok: false, reason: 'not-code' };
+	// The source owns the mark (see `setCellExports`). A MARK request is already
+	// satisfied - the cell really is exported - so it is an honest no-op; an UNMARK
+	// is refused, because nothing Cellar may write would take the mark away.
+	if (hasExportDirective(cell))
+		return exported ? { ok: true } : { ok: false, reason: 'export-directive-owns-cell' };
 	setCellExports([id], exported, nb, originId);
-	return true;
+	return { ok: true };
 }
 
 /**
@@ -1042,6 +1061,16 @@ export function setCellExports(
 		const cell = find(doc, id);
 		if (!cell) continue;
 		const marked = cell.metadata?.cellar?.export === true;
+		// nbdev's `#| export` in the SOURCE marks this cell, and Cellar never writes a
+		// directive (source is code the kernel runs and git diffs; the flag lives in
+		// `metadata.cellar` precisely because clean-on-save preserves it byte-for-byte).
+		// So neither direction has anything honest to write here: the cell is already
+		// exported, and CLEARING the metadata half would not unmark it - it would leave
+		// the cell exported with the toggle bouncing straight back to ON, the exact lie
+		// the surfaces are written to avoid. Skipped in both directions, and REPORTED as
+		// a refusal by every caller (`setCellExport` above, the PATCH route, MCP's
+		// `set_cell_export`) rather than answered with a success that changed nothing.
+		if (hasExportDirective(cell)) continue;
 		if (exported) {
 			if (!canExportCell(cell) || marked) continue;
 			cell.metadata = cell.metadata ?? {};

@@ -86,8 +86,18 @@ describe('resolveExportTarget', () => {
 			spy.mockRestore();
 		}
 
-		// ...and the guard never costs a real directive its match.
-		const withDirective = doc({ cells: [{ id: 'a', cell_type: 'code', source: `${source}#|default_exp lib.cheap` }] });
+		// ...and the guard never costs a real directive its match. A REAL directive is
+		// one nbdev would read: in the cell's LEADING block. The scan reads nbdev's own
+		// rule now (`$lib/nbdevDirectives`), which is also what bounds its cost - the
+		// block ends at the first ordinary line, so a 400-line cell costs one line.
+		const withDirective = doc({ cells: [{ id: 'a', cell_type: 'code', source: `#|default_exp lib.cheap\n${source}` }] });
 		expect(resolveExportTarget(withDirective)).toMatchObject({ ok: true, target: 'lib/cheap.py' });
+
+		// ...and a `#|default_exp` sitting AFTER code is not a directive to nbdev, so
+		// it must not be one here either. Honouring it was the "half-speaks nbdev"
+		// defect: a target resolved from text nbdev ignores, written to a file nbdev
+		// would never write (scout report section 5.2).
+		const afterCode = doc({ cells: [{ id: 'a', cell_type: 'code', source: `${source}#|default_exp lib.cheap` }] });
+		expect(resolveExportTarget(afterCode)).toBeNull();
 	});
 });

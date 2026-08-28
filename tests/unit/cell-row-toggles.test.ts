@@ -653,7 +653,9 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 	it('export is gated on the export eligibility rule; hide-from-agent is ungated', () => {
 		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual(['{#if canExport}']);
 		expect(cell).toContain('const canExport = $derived(canExportCell(cell));');
-		expect(cell).toContain("import { canExportCell, isExportCell } from '$lib/exportRole'");
+		// `hasExportDirective` rides along because the row must show ON for a cell
+		// nbdev's `#| export` marks - the same shared module, never a local re-derivation.
+		expect(cell).toContain("import { canExportCell, isExportCell, hasExportDirective } from '$lib/exportRole'");
 		expect(openGates(cell, 'data-testid="toggle-agent-hidden"')).toEqual([]);
 	});
 

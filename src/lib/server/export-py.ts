@@ -27,6 +27,8 @@ import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
 import { logicalLines, stripComments, splitSimpleStatements } from './imports';
 import { isExportCell } from '../exportRole';
+import { nbdevDirective } from '../nbdevDirectives';
+import { nbdevLibPath } from './nbdev';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { futureImportJoinedHazard, type ExportHazard } from '../exportHazard';
 import type { Cell, NotebookDoc } from './types';
@@ -359,11 +361,18 @@ export type ResolvedExportTarget =
  * or a `#|default_exp <module>` directive found in any cell (nbdev familiarity;
  * the UI field is the primary mechanism). Returns null when neither is present.
  *
- * A directive target is ALWAYS workspace-relative - nbdev's own dotted-module
- * spelling - and never reads `export_base`, which is a property of the
+ * A directive target never reads `export_base`, which is a property of the
  * notebook-level SETTING alone: a directive lives in a cell, so pairing it with
  * notebook-level base metadata would make one cell's text mean different files
- * depending on a setting no setter can see from the cell.
+ * depending on a setting no setter can see from the cell. Its root is nbdev's
+ * own - the project's `lib_path` where there is one, else the workspace, exactly
+ * as before (see `directiveBase`).
+ *
+ * The directive is read through the SHARED `$lib/nbdevDirectives` scanner, which
+ * applies nbdev's real rule (leading block only), not a `/m` regex over the whole
+ * source: a `#|default_exp` sitting after code, after a plain comment, or inside a
+ * triple-quoted string is NOT a directive to nbdev, so honouring it was the
+ * "half-speaks nbdev" defect - a target resolved from text nbdev ignores.
  *
  * The directive scan is guarded by a `includes('default_exp')` substring test
  * (`dataframeHtml.ts`'s `/dataframe/i` pre-check, same reason): this is the ONE
@@ -374,7 +383,7 @@ export type ResolvedExportTarget =
  */
 function storedExportTarget(
 	doc: NotebookDoc
-): { path: string; base: string; source: 'metadata' | 'default_exp' } | null {
+): { path: string; base: string; source: 'metadata' | 'default_exp'; error?: string } | null {
 	const explicit = doc.metadata?.cellar?.export_target;
 	if (typeof explicit === 'string' && explicit.trim()) {
 		const rawBase = doc.metadata?.cellar?.export_base;
@@ -383,14 +392,73 @@ function storedExportTarget(
 	}
 	for (const c of doc.cells) {
 		if (c.cell_type !== 'code' || !c.source.includes('default_exp')) continue;
-		const m = c.source.match(/^\s*#\s*\|\s*default_exp\s+([^\s#]+)/m);
-		if (m) {
-			// nbdev writes a dotted module path (`pkg.utils`); map it to a file path.
-			const mod = m[1].trim();
-			return { path: mod.endsWith('.py') ? mod : mod.replace(/\./g, '/') + '.py', base: 'workspace', source: 'default_exp' };
-		}
+		const mod = nbdevDirective(c.source, 'default_exp')?.trim();
+		if (!mod) continue;
+		// nbdev writes a dotted module path (`pkg.utils`); map it to a file path.
+		const rel = mod.endsWith('.py') ? mod : mod.replace(/\./g, '/') + '.py';
+		return { ...directiveBase(rel), source: 'default_exp' };
 	}
 	return null;
+}
+
+/**
+ * The stored FORM for a `#|default_exp` module file, measured from the right root.
+ *
+ * In an nbdev project that root is the project's `lib_path`, so the reported path
+ * is the module RE-EXPRESSED workspace-relative and the base stays `workspace` -
+ * which keeps the type's own invariant literally true (`path` measured from `base`
+ * yields `target`), keeps every consumer correct without widening the persisted
+ * `ExportBase` vocabulary the UI select is built from, and leaves the name `nbdev`
+ * free for the fourth PERSISTED base the scout report's section 6.1 proposes. The
+ * derivation is the same KIND this branch always did - a dotted module is not a
+ * stored path either - just measured from the root nbdev actually uses.
+ *
+ * Outside an nbdev project the answer is byte-for-byte what it always was:
+ * workspace-relative, no filesystem work beyond the detection, so every existing
+ * non-nbdev notebook writes exactly where it did.
+ *
+ * A lib_path that cannot be READ carries the refusal out as `error` rather than
+ * degrading - see `nbdevLibPath`. A lib_path OUTSIDE the workspace needs no special
+ * case: the re-expression comes back with `../`, and `resolveExportTarget`'s
+ * existing containment guard refuses it with the message it already has.
+ */
+function directiveBase(rel: string): { path: string; base: string; error?: string } {
+	let lib: ReturnType<typeof nbdevLibPath>;
+	try {
+		lib = nbdevLibPath();
+	} catch {
+		lib = null; // detection must never break a read; fall back to today's behavior
+	}
+	if (!lib) return { path: rel, base: 'workspace' };
+	if (!lib.ok)
+		return {
+			path: rel,
+			base: 'workspace',
+			error: `this is an nbdev project (${lib.configPath}), so #|default_exp ${rel.replace(/\.py$/, '').replace(/\//g, '.')} names a module under its lib_path - but ${lib.reason}, so Cellar cannot tell where that module belongs. Set an explicit export target instead, or fix the config.`
+		};
+	let ws: string;
+	try {
+		ws = resolve(workspaceRoot());
+	} catch {
+		return { path: rel, base: 'workspace' };
+	}
+	const inWorkspace = relative(ws, resolve(lib.libPath, rel)).split(sep).join('/');
+	try {
+		resolveInWorkspace(inWorkspace);
+	} catch {
+		// The COMMON real nbdev layout: Cellar opened in `nbs/` while `lib_path` is a
+		// sibling, so the module belongs OUTSIDE the workspace. Refusing is the
+		// containment rule holding, and it is strictly better than the pre-fix stray
+		// `nbs/core.py` nbdev knows nothing about - but the generic guard's "path
+		// escapes workspace" says nothing a user can act on, so this names the layout
+		// and both ways out.
+		return {
+			path: inWorkspace,
+			base: 'workspace',
+			error: `#|default_exp ${rel.replace(/\.py$/, '').replace(/\//g, '.')} names a module in this nbdev project's lib_path (${lib.libPath}), which is OUTSIDE the workspace Cellar is serving - a module can only be written inside it. Open Cellar at the project root (${dirname(lib.configPath)}) instead, or set an explicit export target inside the workspace.`
+		};
+	}
+	return { path: inWorkspace, base: 'workspace' };
 }
 
 /**
@@ -420,6 +488,11 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
 	const stored = storedExportTarget(doc);
 	if (!stored) return null;
 	const { path, base, source } = stored;
+	// A directive whose ROOT could not be determined (an nbdev project Cellar cannot
+	// read `lib_path` from). Refuse rather than degrade to workspace-relative: that
+	// is the stray-module-at-the-workspace-root write this whole branch exists to
+	// stop. An explicit `export_target` is unaffected and is the escape hatch.
+	if (stored.error) return { ok: false, base, path, source, error: stored.error };
 	if (!isExportBase(base)) {
 		return {
 			ok: false,
