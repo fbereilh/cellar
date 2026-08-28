@@ -37,10 +37,12 @@
  * cell - which is what a notebook user wants for a `bash` or `json` block anyway
  * (they add the `!` or the magic themselves). `chat` and `raw` are deliberately
  * unreachable: a fence cannot express a question for the model, and no fence tag
- * means "verbatim text for a downstream tool". That is also what keeps this
- * feature clear of `PY_UNSUPPORTED_TYPES` - the three types it can produce are
- * exactly the three EVERY notebook can hold, `.py` included, so no extraction
- * can be refused for its type.
+ * means "verbatim text for a downstream tool". `mojo` is unreachable too, though
+ * only because no fence tag maps onto it - a fence tagged `mojo` extracts as an
+ * ordinary code cell. Those three ARE `PY_UNSUPPORTED_TYPES`, which is what keeps
+ * this feature clear of it: the three types it can produce are exactly the three
+ * EVERY notebook can hold, `.py` included, so no extraction can be refused for
+ * its type.
  */
 
 import type { LogicalCellType } from '$lib/server/types';

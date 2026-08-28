@@ -617,6 +617,7 @@ outlive the run that asked for it.
 | `CELLAR_KERNEL_INTERRUPT_GRACE_MS` | `5000` (ms, = 5s) | How long **Stop** (a running cell's stop button, the sidebar's Interrupt, or an agent's `interrupt_kernel`) waits for the interrupted run to actually end before it force-settles it and frees the notebook. Re-checked every 25ms, so a cell that surrenders - almost all of them - is reported stopped at once instead of waiting out the window. A force-settle does **not** restart the kernel: your variables are intact, but the kernel may still be running that code (the cell's output says so, and names Restart as the certain escape). Non-positive values fall back to the default, so the escalation cannot be switched off by a typo. |
 | `CELLAR_KERNEL_INTERRUPT_SIGNAL_TIMEOUT_MS` | `5000` (ms, = 5s) | How long the interrupt request itself (a localhost POST to the Jupyter sidecar) may take before it is cancelled and Cellar stops waiting for it. Never additive with the grace window: an interrupt that could not be delivered means the kernel was never asked, so the run is force-settled straight away. |
 | `CELLAR_KERNEL_INTERRUPT_START_TIMEOUT_MS` | `5000` (ms, = 5s) | How long an interrupt waits for a kernel that is still **starting** before it frees the run without signalling it (the start is left to finish; a later run picks it up). Same rule as above - nothing was asked, so the grace window is skipped. |
+| `CELLAR_MOJO_SETUP_TIMEOUT_MS` | `30000` (ms, = 30s) | How long the once-per-session Mojo setup probe (a silent `import mojo.notebook` in the kernel, which registers the `%%mojo` magic a Mojo cell runs through) may take before the run stops waiting for a verdict. Timing out is **no verdict**, never "the toolchain is missing": the run falls through to the ordinary kernel path and the run watchdog above reports what really happened. Only a probe that answers can report the toolchain absent. |
 | `CELLAR_MAX_KERNELS` | `8` | Soft cap: shows a warn-only banner past N live kernels (never blocks a run). `0` disables the warning. |
 | `CELLAR_KERNEL_MEMORY_POLL_MS` | `4000` (ms, = 4s) | How often each live kernel's resident memory (RSS) is measured host-side (via `ps`) and re-broadcast to the UI. The timer is unref'd and self-stops when no kernel remains; a value is only re-published when the whole-MiB figure changes. |
 
@@ -866,15 +867,16 @@ spec files at a time. Install its browser once with `npx playwright install chro
   the output formats it belongs to. Change it back from the type label at the right of its
   toolbar, the command palette (*Change cell(s) to code*), or `y`/`m`/`r` in command mode
   (`r` is the chord that makes a cell raw in the first place).
-- **A cell will not become raw or chat: "A .py notebook cannot hold a raw cell" / "...a chat
-  cell"** - a jupytext / Databricks-source notebook is rebuilt from its cells on every save,
-  and the format carries no raw marker and no cell metadata or outputs. So the declaration
-  would be gone after a reload: raw text would come back in a **runnable** Python cell, and a
-  chat cell would come back as runnable prose with its AI reply gone for good (no re-run
-  reproduces one). Cellar refuses both instead - in the type menu (where neither is offered),
-  in the notebook's add controls (which withhold the **Chat** button there), and on the `r`
-  and `t` chords; an agent's `add_cell` / `set_cell_type` is refused for raw, and cannot
-  ask for a chat cell at all (no agent write tool takes `chat`). Convert the notebook to
+- **A cell will not become raw, Mojo or chat: "A .py notebook cannot hold a raw cell" /
+  "...a Mojo cell" / "...a chat cell"** - a jupytext / Databricks-source notebook is rebuilt
+  from its cells on every save, and the format carries no raw marker and no cell metadata or
+  outputs. So the declaration would be gone after a reload: raw text would come back in a
+  **runnable** Python cell, Mojo source would come back in one too, and a chat cell would come
+  back as runnable prose with its AI reply gone for good (no re-run reproduces one). Cellar
+  refuses all three instead - in the type menu (where none of them is offered), in the
+  notebook's add controls (which withhold the **Chat** button there), and on the `r`
+  and `t` chords; an agent's `add_cell` / `set_cell_type` is refused for raw and Mojo, and
+  cannot ask for a chat cell at all (no agent write tool takes `chat`). Convert the notebook to
   `.ipynb` (app menu → **Convert to .ipynb**) if you need one. The same limit applies to raw
   in the other direction: **Save as .py** writes a raw cell out as code, so a Quarto notebook
   exported that way loses its frontmatter cell's type.
