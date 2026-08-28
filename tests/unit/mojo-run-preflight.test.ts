@@ -278,9 +278,19 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 		//
 		// Both waits are made to bite: a predecessor holds the lock for most of the
 		// budget, and the probe then never answers. One budget ⇒ ~BOUND; two ⇒
-		// ~HOLD + BOUND. The threshold sits between them.
-		const BOUND = 400;
-		const HOLD = 340;
+		// ~HOLD + BOUND. The threshold sits between them, at BOUND + HOLD/2.
+		//
+		// The constants are LARGE ON PURPOSE - do not tidy them back down. What
+		// discriminates is the RATIO, so any pair works in principle, but the slack
+		// either side is HOLD/2 in absolute milliseconds, and this suite runs in a
+		// fork pool where timers drift by hundreds of ms under load (AGENTS.md
+		// records a measured 28.5s against a 30s ceiling in `databricks-logout`).
+		// At 800/680 the correct path lands at ~800ms against a 1140ms threshold and
+		// the two-budget bug at ~1480ms, so there is ~340ms of slack on both sides
+		// for ~0.8s of runtime; halving them halves the slack without buying back
+		// anything but that.
+		const BOUND = 800;
+		const HOLD = 680;
 		const prev = process.env.CELLAR_MOJO_SETUP_TIMEOUT_MS;
 		process.env.CELLAR_MOJO_SETUP_TIMEOUT_MS = String(BOUND);
 		try {
