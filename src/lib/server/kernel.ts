@@ -2521,7 +2521,8 @@ export async function ensureMojoMagic(nbPath?: string | null): Promise<MojoSetup
 	// deliberately so: both observed nothing about the toolchain, so neither may
 	// claim it is absent nor send the user after a 534 MB install they may already
 	// have. The run falls through to `execute()`, which owns the watchdog and
-	// reports honestly.
+	// reports honestly. A probe INTERRUPTED mid-import reaches that same exit from
+	// the other side - it reports its own no-verdict on the marker line.
 	let out: string | null;
 	try {
 		out = await runCapture(kernel, MOJO_SETUP_CODE, { timeoutMs: mojoSetupTimeoutMs() });
@@ -2533,7 +2534,13 @@ export async function ensureMojoMagic(nbPath?: string | null): Promise<MojoSetup
 	// lock for minutes on a cold cluster - which now reaches this exit rather than
 	// parking un-abortably in front of the run.
 	if (out === null) return null;
-	const setup: MojoSetup = { ...parseMojoSetup(out), session };
+	// The probe's OWN no-verdict: it ran, but what stopped it (a Stop the user
+	// pressed while this cell held the queue slot, above all) says nothing about the
+	// toolchain, so it takes the same exit as a timeout rather than reporting an
+	// absence nobody observed. See `MOJO_SETUP_CODE`'s exception split.
+	const parsed = parseMojoSetup(out);
+	if (parsed === null) return null;
+	const setup: MojoSetup = { ...parsed, session };
 	// Memoized only while it still describes the LIVE session: `beginSession` clears
 	// the memo, and a write racing a restart would put a dead namespace's verdict back.
 	// Only a READY verdict is kept - a failure must be re-probed, because the whole

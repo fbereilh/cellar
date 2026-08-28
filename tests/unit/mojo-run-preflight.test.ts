@@ -15,8 +15,9 @@
  * Three properties, and the middle one is the subtle one:
  *   1. a READY setup dispatches the compiled `%%mojo` source to the kernel;
  *   2. a setup that CANNOT ANSWER - it never settles, it never gets its turn on the
- *      per-kernel exec lock, or it throws - yields NO VERDICT and the run FALLS
- *      THROUGH to `execute()`; it must never be reported as a missing toolchain,
+ *      per-kernel exec lock, it throws, or the user's Stop interrupts it mid-import
+ *      - yields NO VERDICT and the run FALLS THROUGH to `execute()`; it must never
+ *      be reported as a missing toolchain,
  *      because that would name a cause nothing observed and send the user after a
  *      534 MB install they may already have;
  *   3. a NOT-READY setup reports the install instruction and never touches the
@@ -29,7 +30,7 @@ import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MOJO_MAGIC_HEADER, MOJO_SETUP_MARKER } from '../../src/lib/server/mojo';
+import { MOJO_MAGIC_HEADER, MOJO_SETUP_MARKER, MOJO_SETUP_NO_VERDICT_KEY } from '../../src/lib/server/mojo';
 
 const h = vi.hoisted(() => {
 	let seq = 0;
@@ -77,7 +78,9 @@ const h = vi.hoisted(() => {
 					const payload =
 						h.setupMode === 'ready'
 							? `${MOJO_SETUP_MARKER} {"ready": true, "version": "26.5.0"}`
-							: `${MOJO_SETUP_MARKER} {"ready": false, "detail": "ModuleNotFoundError: No module named 'mojo'"}`;
+							: h.setupMode === 'interrupted'
+								? `${MOJO_SETUP_MARKER} {"ready": false, "${MOJO_SETUP_NO_VERDICT_KEY}": true, "detail": "KeyboardInterrupt: "}`
+								: `${MOJO_SETUP_MARKER} {"ready": false, "detail": "ModuleNotFoundError: No module named 'mojo'"}`;
 					queueMicrotask(() => {
 						f.onIOPub?.({ header: { msg_type: 'stream' }, parent_header: {}, content: { name: 'stdout', text: payload + '\n' } });
 						f._resolve('ok');
@@ -113,7 +116,7 @@ const h = vi.hoisted(() => {
 		lastKernel: null as ReturnType<typeof makeFakeKernel> | null,
 		hangingSetup: null as ReturnType<typeof makeFuture> | null,
 		holdFuture: null as ReturnType<typeof makeFuture> | null,
-		setupMode: 'ready' as 'ready' | 'missing' | 'hang' | 'throw',
+		setupMode: 'ready' as 'ready' | 'missing' | 'interrupted' | 'hang' | 'throw',
 		setupRuns: 0,
 		/** Every non-setup code string the kernel was asked to execute. */
 		executed: [] as string[]
@@ -332,6 +335,28 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 		// It fell through to `execute()`, which owns the outcome.
 		expect(h.executed.some((c) => c.startsWith(MOJO_MAGIC_HEADER))).toBe(true);
 		expect(res.status).toBe('ok');
+	});
+
+	it('a probe INTERRUPTED mid-import is NO VERDICT, so Stop never reads as a missing toolchain', async () => {
+		// The probe runs while this cell already holds the queue's `running` slot and
+		// has emitted `run:start`, so the user can press Stop; `interruptKernel` signals
+		// the kernel unconditionally and the KeyboardInterrupt lands inside the import.
+		// Reported as `ready:false` it rendered `MojoToolchainMissing` and prescribed a
+		// 534 MB install for a cell the user simply cancelled. The probe now says NO
+		// VERDICT on its own marker line, which takes the timeout's exit.
+		h.setupMode = 'interrupted';
+		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const res = await runViaOwner(id, MOJO_SOURCE);
+		const text = JSON.stringify(res.outputs);
+		expect(text).not.toContain('uv pip install max');
+		expect(text).not.toContain('MojoToolchainMissing');
+		expect(h.executed.some((c) => c.startsWith(MOJO_MAGIC_HEADER))).toBe(true);
+		expect(res.status).toBe('ok');
+		// And nothing was memoized, so the next run re-probes rather than inheriting a
+		// verdict that was never reached.
+		h.setupMode = 'ready';
+		await runViaOwner(id, MOJO_SOURCE);
+		expect(h.setupRuns).toBe(2);
 	});
 });
 

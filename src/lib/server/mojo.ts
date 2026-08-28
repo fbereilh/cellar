@@ -67,6 +67,15 @@ export const MOJO_INSTALL_COMMAND = `uv pip install ${MOJO_PACKAGE}`;
 export const MOJO_SETUP_MARKER = '__CELLAR_MOJO__';
 
 /**
+ * The field the probe sets on its one marker line to say it reached NO VERDICT -
+ * it ran, but what stopped it says nothing about whether the toolchain is there.
+ * `parseMojoSetup` turns it into `null`, the same no-verdict `ensureMojoMagic`
+ * returns for a timed-out or throwing probe, so the run falls through to
+ * `execute()` instead of prescribing a 534 MB install for a cause nobody saw.
+ */
+export const MOJO_SETUP_NO_VERDICT_KEY = 'no_verdict';
+
+/**
  * Compile a mojo cell's source into what the kernel is sent: the `%%mojo` cell
  * magic with the Mojo source as its body. Returns '' for an empty cell (nothing
  * to run), so an empty mojo cell is the no-op an empty Python cell is.
@@ -131,8 +140,19 @@ export interface MojoSetup {
  * Run through `runCapture` as a SILENT, INTERNAL execute (never a queued run), so
  * it neither appears in the notebook nor counts toward `execs_this_session`. It
  * prints exactly ONE marker line and never raises - the `databricks.ts` PROBE
- * convention - so an ImportError, a broken install and a working one are all one
- * parse rather than three code paths.
+ * convention - so every outcome is one parse rather than three code paths.
+ *
+ * THE EXCEPTION SPLIT IS THE HONESTY RULE, not tidiness. Only `ImportError` (and
+ * so `ModuleNotFoundError`) is an OBSERVED ABSENCE: the import ran and Python said
+ * the package is not there, which is the one reading that may prescribe a 534 MB
+ * `uv pip install max`. EVERYTHING else - `KeyboardInterrupt` above all - is NO
+ * VERDICT and says so on the same line. That matters because the probe runs inside
+ * a cell that has already emitted `run:start` and holds the queue's `running` slot,
+ * so the user can press Stop while it is executing; `interruptKernel` signals the
+ * kernel unconditionally, the KeyboardInterrupt lands HERE, and a blanket
+ * `except BaseException` reported the stop as a missing toolchain - an actionable
+ * but wrong 534 MB instruction for a cell the user simply cancelled. A no-verdict
+ * falls through to `execute()`, which owns the watchdog and reports honestly.
  *
  * `importlib.invalidate_caches()` first is load-bearing: the common recovery from
  * a missing toolchain is `uv pip install max` INTO THE VENV THIS KERNEL IS ALREADY
@@ -157,7 +177,14 @@ def _cellar_mojo_setup():
             out["version"] = str(_version("${MOJO_PACKAGE}"))
         except Exception:
             pass
+    except ImportError as e:
+        # OBSERVED absence: the import ran and Python answered that it is not there.
+        out["detail"] = f"{type(e).__name__}: {e}"
     except BaseException as e:
+        # Observed NOTHING about the toolchain (a KeyboardInterrupt from the user's
+        # Stop, a SystemExit, anything else): report no verdict rather than an
+        # absence, and still never raise out of the probe.
+        out["${MOJO_SETUP_NO_VERDICT_KEY}"] = True
         out["detail"] = f"{type(e).__name__}: {e}"
     print("${MOJO_SETUP_MARKER} " + json.dumps(out))
 
@@ -168,19 +195,28 @@ finally:
 `.trim();
 
 /**
- * Read the probe's one marker line. Anything unparseable is NOT ready and says so
- * - the fail-closed direction, since the only cost of a false negative is an
- * instruction the user can ignore, while a false positive sends `%%mojo` to a
- * kernel that has no such magic and returns IPython's opaque `UsageError`.
+ * Read the probe's one marker line, or NULL when the probe reached no verdict.
+ *
+ * `null` is the same no-verdict `ensureMojoMagic` returns for a probe that timed
+ * out or threw, and it is what the probe's non-`ImportError` branch reports: the
+ * probe ran, but what stopped it (a Stop the user pressed, above all) says nothing
+ * about the toolchain, so it may not claim one is missing.
+ *
+ * Anything UNPARSEABLE is different and stays NOT ready - the fail-closed
+ * direction, since the only cost of a false negative is an instruction the user
+ * can ignore, while a false positive sends `%%mojo` to a kernel that has no such
+ * magic and returns IPython's opaque `UsageError`.
  */
-export function parseMojoSetup(stdout: string | null | undefined): MojoSetup {
+export function parseMojoSetup(stdout: string | null | undefined): MojoSetup | null {
 	const line = String(stdout ?? '')
 		.split('\n')
 		.reverse()
 		.find((l) => l.trimStart().startsWith(MOJO_SETUP_MARKER));
 	if (!line) return { ready: false, detail: 'the Mojo setup probe produced no output' };
 	try {
-		const parsed = JSON.parse(line.trimStart().slice(MOJO_SETUP_MARKER.length)) as Partial<MojoSetup>;
+		const parsed = JSON.parse(line.trimStart().slice(MOJO_SETUP_MARKER.length)) as Partial<MojoSetup> &
+			Record<string, unknown>;
+		if (parsed?.[MOJO_SETUP_NO_VERDICT_KEY] === true) return null;
 		if (parsed?.ready !== true) {
 			return { ready: false, ...(typeof parsed?.detail === 'string' ? { detail: parsed.detail } : {}) };
 		}

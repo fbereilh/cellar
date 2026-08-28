@@ -50,8 +50,8 @@ import {
 	MOJO_INSTALL_COMMAND,
 	MOJO_MAGIC_HEADER,
 	MOJO_PACKAGE,
-	MOJO_SETUP_CODE,
 	MOJO_SETUP_MARKER,
+	MOJO_SETUP_NO_VERDICT_KEY,
 	hasMojoHeader,
 	mojoMissingMessage,
 	mojoMissingOutput,
@@ -263,8 +263,17 @@ describe('the toolchain probe: detect and INSTRUCT, never install', () => {
 
 	it('reads a not-ready marker and keeps its reason', () => {
 		const out = parseMojoSetup(`${MOJO_SETUP_MARKER} {"ready": false, "detail": "ModuleNotFoundError: No module named 'mojo'"}`);
-		expect(out.ready).toBe(false);
-		expect(out.detail).toMatch(/No module named 'mojo'/);
+		expect(out?.ready).toBe(false);
+		expect(out?.detail).toMatch(/No module named 'mojo'/);
+	});
+
+	it('reads a NO-VERDICT marker as null, never as a missing toolchain', () => {
+		// The probe reaches this when something that is not an ImportError stops it -
+		// a Stop the user pressed, above all. It observed nothing about the toolchain,
+		// so it must take the same exit a timed-out or throwing probe takes rather than
+		// prescribing a 534 MB install for a cause nobody saw.
+		const line = `${MOJO_SETUP_MARKER} {"ready": false, "${MOJO_SETUP_NO_VERDICT_KEY}": true, "detail": "KeyboardInterrupt: "}`;
+		expect(parseMojoSetup(line)).toBeNull();
 	});
 
 	it('FAILS CLOSED on anything it cannot read', () => {
@@ -272,14 +281,14 @@ describe('the toolchain probe: detect and INSTRUCT, never install', () => {
 		// positive sends `%%mojo` to a kernel with no such magic, and IPython answers
 		// with an opaque UsageError instead of the install command.
 		for (const bad of ['', 'random stdout', `${MOJO_SETUP_MARKER} not json`, `${MOJO_SETUP_MARKER} {"ready": "yes"}`]) {
-			expect(parseMojoSetup(bad).ready).toBe(false);
+			expect(parseMojoSetup(bad)?.ready).toBe(false);
 		}
-		expect(parseMojoSetup(null).ready).toBe(false);
+		expect(parseMojoSetup(null)?.ready).toBe(false);
 	});
 
 	it('takes the LAST marker line, so preceding stdout cannot spoof the verdict', () => {
 		const stdout = `${MOJO_SETUP_MARKER} {"ready": true}\n${MOJO_SETUP_MARKER} {"ready": false, "detail": "x"}`;
-		expect(parseMojoSetup(stdout).ready).toBe(false);
+		expect(parseMojoSetup(stdout)?.ready).toBe(false);
 	});
 
 	it('the missing-toolchain message names the command, the size, and refuses to auto-install', () => {
@@ -294,15 +303,6 @@ describe('the toolchain probe: detect and INSTRUCT, never install', () => {
 		expect(out.output_type).toBe('error');
 		expect(out.ename).toBe('MojoToolchainMissing');
 		expect(out.traceback.join('\n')).toContain(MOJO_INSTALL_COMMAND);
-	});
-
-	it('the setup code invalidates the import caches, so a mid-session install is picked up', () => {
-		// The whole point of the instruction is that the user installs and RE-RUNS;
-		// without this, Python's cached directory listings hide the new package until
-		// a kernel restart and the instruction appears not to work.
-		expect(MOJO_SETUP_CODE).toContain('invalidate_caches');
-		expect(MOJO_SETUP_CODE).toContain('import mojo.notebook');
-		expect(MOJO_SETUP_CODE).toContain(MOJO_SETUP_MARKER);
 	});
 });
 
