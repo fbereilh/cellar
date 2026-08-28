@@ -159,20 +159,25 @@ export const CHAT_UNSUPPORTED_REASON = 'chat-in-py-notebook';
 export const MOJO_UNSUPPORTED_REASON = 'mojo-in-py-notebook';
 
 /**
- * The logical types a `.py` TEXT notebook cannot hold, in ONE list.
+ * The logical types a `.py` TEXT notebook cannot hold, named ONCE.
  *
  * All three fail the same way and for the same reason (see
  * `TextNotebookCellTypeError` below): such a document is rebuilt from its CELLS
  * on every save by jupytext / the Databricks converter, which carries neither
  * `cellar` cell metadata nor outputs - so the declaration lives only in memory
- * and disk holds a plain `code` cell. The list exists so a SEVENTH logical type
+ * and disk holds a plain `code` cell. The union exists so a SEVENTH logical type
  * is added HERE rather than shipping straight into the same trap, and so no
  * writer keeps a per-type copy of the rule.
+ *
+ * It is the UNION rather than a list because everything else about the rule is
+ * DERIVED from it: `PY_UNSUPPORTED_COPY` is a `Record` over it (so a member with
+ * no message and no refusal code does not compile) and `PY_UNSUPPORTED_TYPES` is
+ * that record's keys (so the list cannot fall behind either).
  */
-export const PY_UNSUPPORTED_TYPES: readonly LogicalCellType[] = ['raw', 'chat', 'mojo'];
+export type PyUnsupportedType = Extract<LogicalCellType, 'raw' | 'chat' | 'mojo'>;
 
 /** Can a `.py` TEXT notebook hold this logical type? */
-export function isPyUnsupportedType(cellType: unknown): cellType is LogicalCellType {
+export function isPyUnsupportedType(cellType: unknown): cellType is PyUnsupportedType {
 	return typeof cellType === 'string' && (PY_UNSUPPORTED_TYPES as readonly string[]).includes(cellType);
 }
 
@@ -212,23 +217,67 @@ export const TEXT_NOTEBOOK_MOJO_MESSAGE =
 /**
  * Message + refusal code per unsupported type, in ONE record rather than a pair
  * of ternaries: with two types a `x === 'chat' ? … : …` reads as exhaustive, and
- * with a third it SILENTLY reports the raw message for a mojo refusal. A record
- * keyed by the type makes the next addition a compile-time obligation instead.
+ * with a third it SILENTLY reports the raw message for a mojo refusal.
+ *
+ * Keyed over `PyUnsupportedType` rather than `string`, which is what makes the
+ * next addition a compile-time obligation rather than a claim: a member added to
+ * the union with no copy is a missing-property error here, and a key added here
+ * that is not in the union is an excess-property error - so neither half can be
+ * forgotten, and neither can silently fall back to the RAW message and the RAW
+ * refusal code, which is exactly the failure the record replaced the ternaries to
+ * prevent.
  */
-const PY_UNSUPPORTED_COPY: Record<string, { message: string; reason: string }> = {
+const PY_UNSUPPORTED_COPY: Record<PyUnsupportedType, { message: string; reason: string }> = {
 	raw: { message: TEXT_NOTEBOOK_RAW_MESSAGE, reason: RAW_UNSUPPORTED_REASON },
 	chat: { message: TEXT_NOTEBOOK_CHAT_MESSAGE, reason: CHAT_UNSUPPORTED_REASON },
 	mojo: { message: TEXT_NOTEBOOK_MOJO_MESSAGE, reason: MOJO_UNSUPPORTED_REASON }
 };
 
+/**
+ * The unsupported types as a list, DERIVED from the record above so it cannot
+ * list a type the copy does not cover (nor miss one the copy does).
+ */
+export const PY_UNSUPPORTED_TYPES: readonly PyUnsupportedType[] = Object.keys(PY_UNSUPPORTED_COPY) as PyUnsupportedType[];
+
+/**
+ * The copy for a type. A type the `.py` rule does not refuse has none, so it can
+ * only be a caller asking about a type it never refused - answered with the raw
+ * copy as before. It can no longer mean "this unsupported type has no entry",
+ * which the `Record` above now makes unrepresentable.
+ */
+function pyUnsupportedCopy(cellType: LogicalCellType): { message: string; reason: string } {
+	return isPyUnsupportedType(cellType) ? PY_UNSUPPORTED_COPY[cellType] : PY_UNSUPPORTED_COPY.raw;
+}
+
 /** The message for one unsupported type. */
 export function textNotebookTypeMessage(cellType: LogicalCellType): string {
-	return PY_UNSUPPORTED_COPY[cellType]?.message ?? TEXT_NOTEBOOK_RAW_MESSAGE;
+	return pyUnsupportedCopy(cellType).message;
 }
 
 /** The refusal code for one unsupported type. */
 export function textNotebookTypeReason(cellType: LogicalCellType): string {
-	return PY_UNSUPPORTED_COPY[cellType]?.reason ?? RAW_UNSUPPORTED_REASON;
+	return pyUnsupportedCopy(cellType).reason;
+}
+
+/** The reverse of `textNotebookTypeReason`, built from the same record. */
+const PY_UNSUPPORTED_BY_REASON: ReadonlyMap<string, PyUnsupportedType> = new Map(
+	PY_UNSUPPORTED_TYPES.map((t) => [PY_UNSUPPORTED_COPY[t].reason, t] as const)
+);
+
+/**
+ * Which type a route's refusal code names, or null when the code is not one of
+ * ours - so a client can say WHY a conversion it thought legal came back refused
+ * without keeping a second copy of the codes.
+ *
+ * A DIRECT lookup keyed by the code, never a scan of `PY_UNSUPPORTED_TYPES`
+ * matching each type's reason in turn: a scan answers with the FIRST type whose
+ * reason matches, so it names the right type only for as long as every type has
+ * a distinct one - which is a property of the copy record, not of the scan. Read
+ * off that record instead, the two cannot disagree.
+ */
+export function textNotebookTypeForReason(reason: unknown): PyUnsupportedType | null {
+	if (typeof reason !== 'string') return null;
+	return PY_UNSUPPORTED_BY_REASON.get(reason) ?? null;
 }
 
 /**

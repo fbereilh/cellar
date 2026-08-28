@@ -1458,17 +1458,27 @@ async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): P
  * `requestExecute` on the wire beside it. The default 0 keeps the unbounded
  * behaviour for the startup callers, whose kernel is freshly built and whose
  * answer nothing is waiting on.
+ *
+ * It is ONE WALL-CLOCK BUDGET for the whole call, started before the lock wait and
+ * reused for the reply — never a fresh `delay(timeoutMs)` per race, which spent the
+ * bound TWICE and made the real worst case ~2x what the knob advertises (a
+ * predecessor holding the lock for nearly the whole window followed by a silent
+ * kernel). That window is precisely the un-abortable state this exists to close, so
+ * the advertised bound and the reachable one have to be the same number.
  */
 async function runCapture(
 	kernel: KernelConnection,
 	code: string,
 	{ timeoutMs = 0 }: { timeoutMs?: number } = {}
 ): Promise<string | null> {
+	// The single budget: started HERE, before anything can wait, and awaited by both
+	// races below so the two together can never exceed `timeoutMs`.
+	const budget = timeoutMs > 0 ? delay(timeoutMs).then(() => false as const) : null;
 	const nbKernel = nbKernelForConnection(kernel);
 	const lock = nbKernel ? beginExecLock(nbKernel) : null;
 	if (lock) {
-		if (timeoutMs > 0) {
-			const ourTurn = await Promise.race([lock.ready.then(() => true), delay(timeoutMs).then(() => false)]);
+		if (budget) {
+			const ourTurn = await Promise.race([lock.ready.then(() => true as const), budget]);
 			if (!ourTurn) {
 				void lock.ready.then(lock.release, lock.release);
 				return null;
@@ -1493,8 +1503,8 @@ async function runCapture(
 		// the right trade for a SILENT probe and is what `execute()`'s own watchdog
 		// abort already does. `timeoutMs = 0` (the default) keeps the original
 		// unbounded behaviour for the startup callers, whose kernel is freshly built.
-		if (timeoutMs > 0) {
-			const settled = await Promise.race([future.done.then(() => true), delay(timeoutMs).then(() => false)]);
+		if (budget) {
+			const settled = await Promise.race([future.done.then(() => true as const), budget]);
 			if (!settled) {
 				future.dispose();
 				return null;

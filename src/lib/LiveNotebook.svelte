@@ -13,9 +13,8 @@
 		logicalTypeFor,
 		nbCellType,
 		offersCellType,
-		PY_UNSUPPORTED_TYPES,
-		textNotebookTypeMessage,
-		textNotebookTypeReason
+		textNotebookTypeForReason,
+		textNotebookTypeMessage
 	} from '$lib/cellLanguage';
 	import {
 		applyGesture,
@@ -3351,10 +3350,12 @@
 			.then((body) => body?.reason)
 			.catch(() => null);
 		if (reason === KEEP_ONE_CELL_REASON) return noticeKeepOneCell();
-		// The refusal codes are per TYPE, so the notice is looked up by matching the
+		// The refusal codes are per TYPE, so the notice is looked up by resolving the
 		// server's code back to the type it belongs to rather than by keeping a
-		// second copy of either the codes or the messages.
-		const refused = PY_UNSUPPORTED_TYPES.find((t) => textNotebookTypeReason(t) === reason);
+		// second copy of either the codes or the messages. Resolved DIRECTLY, off
+		// the same record the codes come from, so the notice can never name a type
+		// other than the one the server refused.
+		const refused = textNotebookTypeForReason(reason);
 		if (refused) noticeUnsupportedType(refused);
 	}
 

@@ -86,9 +86,13 @@ const h = vi.hoisted(() => {
 				}
 				h.executed.push(code);
 				const f = makeFuture();
-				// A predecessor that takes the per-kernel exec lock and never lets go -
-				// the shape a Databricks CONNECT_CODE has on a cold cluster.
-				if (code === h.HOLD_CODE) return f;
+				// A predecessor that takes the per-kernel exec lock and holds it - the
+				// shape a Databricks CONNECT_CODE has on a cold cluster. Kept on `h` so a
+				// test can hand the lock over part-way through the probe's budget.
+				if (code === h.HOLD_CODE) {
+					h.holdFuture = f;
+					return f;
+				}
 				queueMicrotask(() => f._resolve('ok'));
 				return f;
 			},
@@ -108,6 +112,7 @@ const h = vi.hoisted(() => {
 		startNew: vi.fn(async () => makeFakeKernel()),
 		lastKernel: null as ReturnType<typeof makeFakeKernel> | null,
 		hangingSetup: null as ReturnType<typeof makeFuture> | null,
+		holdFuture: null as ReturnType<typeof makeFuture> | null,
 		setupMode: 'ready' as 'ready' | 'missing' | 'hang' | 'throw',
 		setupRuns: 0,
 		/** Every non-setup code string the kernel was asked to execute. */
@@ -177,6 +182,7 @@ beforeEach(async () => {
 	h.setupRuns = 0;
 	h.executed.length = 0;
 	h.hangingSetup = null;
+	h.holdFuture = null;
 	await kernelmod.shutdownKernel(abs()); // a fresh session per test, so the memo is clear
 });
 
@@ -259,6 +265,48 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 		expect(res.status).toBe('error');
 		expect(h.executed.every((c) => !c.includes(MOJO_MAGIC_HEADER))).toBe(true);
 		await holder;
+	});
+
+	it('spends ONE budget for the whole pre-flight, not one per wait', async () => {
+		// The bound covers two waits - our turn on the exec lock, then the kernel's
+		// reply - and a fresh `delay(timeoutMs)` per wait spent it TWICE, so the
+		// reachable worst case was ~2x what `CELLAR_MOJO_SETUP_TIMEOUT_MS` advertises.
+		// That is the whole point of the bound: the window is un-abortable (the run has
+		// emitted `run:start` and holds the queue's `running` slot while being in
+		// neither `pending` nor `activeRuns`), so the advertised number and the
+		// reachable one have to be the same.
+		//
+		// Both waits are made to bite: a predecessor holds the lock for most of the
+		// budget, and the probe then never answers. One budget ⇒ ~BOUND; two ⇒
+		// ~HOLD + BOUND. The threshold sits between them.
+		const BOUND = 400;
+		const HOLD = 340;
+		const prev = process.env.CELLAR_MOJO_SETUP_TIMEOUT_MS;
+		process.env.CELLAR_MOJO_SETUP_TIMEOUT_MS = String(BOUND);
+		try {
+			h.setupMode = 'hang';
+			const holder = kernelmod.execute(abs(), h.HOLD_CODE, () => {}, { internal: true }).catch(() => {});
+			await vi.waitFor(() => expect(h.executed).toContain(h.HOLD_CODE));
+			// Hand the lock over part-way through the budget, so the probe wins its turn
+			// and then waits on a kernel that never replies.
+			setTimeout(() => h.holdFuture?._resolve('ok'), HOLD);
+
+			const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+			const started = Date.now();
+			const res = await runViaOwner(id, MOJO_SOURCE);
+			const elapsed = Date.now() - started;
+
+			expect(elapsed).toBeLessThan(BOUND + HOLD / 2);
+			// It still fell through honestly: the compiled magic reached the kernel and
+			// nothing claimed a toolchain nobody observed.
+			expect(res.status).toBe('ok');
+			expect(h.executed.some((c) => c.startsWith(MOJO_MAGIC_HEADER))).toBe(true);
+			expect(JSON.stringify(res.outputs)).not.toContain('uv pip install max');
+			await holder;
+		} finally {
+			process.env.CELLAR_MOJO_SETUP_TIMEOUT_MS = prev;
+			h.hangingSetup?._resolve('ok');
+		}
 	});
 
 	it('a probe that THROWS is NO VERDICT too, never a missing toolchain', async () => {
