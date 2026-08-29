@@ -25,7 +25,7 @@
 		selectionAfterRemoval,
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
-	import { exportCellCount, exportDirectiveOwnsCell, isExportCell } from '$lib/exportRole';
+	import { exportCellCount, exportDirectiveOwnsCell, exportMarkedTwice, isExportCell } from '$lib/exportRole';
 	import { isExportBase } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
 	import type { ExportPyResult } from '$lib/types';
@@ -2440,9 +2440,20 @@
 		}).catch(() => {});
 	}
 
-	/** The one sentence every export-directive refusal says, whichever half refused. */
-	const EXPORT_DIRECTIVE_NOTICE =
-		'That cell is marked for export by an "#| export" line in its own source - remove that line to stop exporting it.';
+	/**
+	 * What an export-directive refusal SAYS, whichever half refused - and it is
+	 * conditional because the remedy is. With only the directive marking the cell,
+	 * removing that line really does stop the export. With Cellar's own flag set too
+	 * (`exportMarkedTwice`, the shared rule the toggle's title and MCP branch on as
+	 * well), it does NOT: the flag still marks the cell and the exporter still writes
+	 * it, so the sentence has to name both marks rather than promise an outcome one
+	 * of them does not produce.
+	 */
+	function exportDirectiveNotice(cell: UICell | null | undefined): string {
+		return exportMarkedTwice(cell)
+			? 'That cell is marked for export twice - by an "#| export" line in its own source AND by Cellar\'s own flag. Remove that line, then unmark it here to clear the flag.'
+			: 'That cell is marked for export by an "#| export" line in its own source - remove that line to stop exporting it.';
+	}
 
 	/**
 	 * Mark (or unmark) a code cell for nbdev-style export to the `.py` module.
@@ -2480,10 +2491,17 @@
 		// on server" banner. In that window the directive is on the server's copy and
 		// not on ours, so the server's own refusal below is what keeps the promise.
 		if (!exported && exportDirectiveOwnsCell(cell)) {
-			onNotice?.(EXPORT_DIRECTIVE_NOTICE);
+			onNotice?.(exportDirectiveNotice(cell));
 			return;
 		}
-		const before = cell ? { ...(cell.metadata?.cellar ?? {}) } : null;
+		// Only whether THIS key was there, and what it held - never a snapshot of the
+		// whole `cellar` namespace, which is the rule `setHiddenFromAgent` already
+		// follows one control along: an SSE `cell:role`/`cell:hide-input`/
+		// `cell:visibility`, or a `load()` refetch, can rewrite that namespace while
+		// the request is in flight, and putting a pre-click copy back would silently
+		// undo a disclosure-shaped change this write never touched.
+		const hadExport = cell ? 'export' in (cell.metadata?.cellar ?? {}) : false;
+		const wasExport = cell?.metadata?.cellar?.export;
 		if (cell) {
 			const cellar = { ...(cell.metadata?.cellar ?? {}) };
 			if (exported) cellar.export = true;
@@ -2507,15 +2525,16 @@
 			.then((b) => (b as { reason?: string } | null)?.reason ?? null)
 			.catch(() => null);
 		if (reason !== 'export-directive-owns-cell') return;
+		// Looked up AGAIN, because a `load()` refetch replaces `cells` and the object
+		// the click read may no longer be the one on screen.
 		const c = findCell(id);
 		if (c) {
-			// Restore the ON state rather than the pre-click metadata: the cell IS
-			// exported (that is what the server just said), and our copy of its source is
-			// too stale to show it through the directive half - so the metadata half is
-			// the only way left to keep the row honest. Nothing is persisted by this.
-			c.metadata = { ...(c.metadata ?? {}), cellar: { ...(before ?? c.metadata?.cellar ?? {}), export: true } };
+			const cellar = { ...(c.metadata?.cellar ?? {}) };
+			if (hadExport) cellar.export = wasExport;
+			else delete cellar.export;
+			c.metadata = { ...(c.metadata ?? {}), cellar };
 		}
-		onNotice?.(EXPORT_DIRECTIVE_NOTICE);
+		onNotice?.(exportDirectiveNotice(c));
 	}
 
 	/**

@@ -181,11 +181,51 @@ test('a refusal this tab could not predict still puts the toggle back, and says 
 	);
 	await expect(cell.getByTestId('remote-changed')).toBeVisible({ timeout: 15_000 });
 
+	// HOLD the export PATCH open, so a concurrent write to this same cell's `cellar`
+	// namespace can land inside the window the revert runs after. The revert owns the
+	// `export` key and nothing else; putting a pre-click SNAPSHOT of the namespace
+	// back would silently undo that other change.
+	let releaseExport: () => void = () => {};
+	const held = new Promise<void>((resolve) => (releaseExport = resolve));
+	await page.route(`**/api/cells/${PLAIN}`, async (route) => {
+		let body: Record<string, unknown> | null = null;
+		try {
+			body = route.request().postDataJSON() as Record<string, unknown> | null;
+		} catch {
+			body = null;
+		}
+		if (body && 'export' in body) await held;
+		await route.continue();
+	});
+
 	// Now unmark. The client cannot see the directive, so it really does send this.
+	const agentHidden = cell.getByTestId('toggle-agent-hidden');
+	await expect(agentHidden).toHaveAttribute('aria-pressed', 'false');
 	await toggle.click();
-	await expect(page.getByTestId('app-notice')).toContainText('#| export');
+
+	// ...and while it is in flight, an agent withholds the cell from every agent
+	// surface - a DIFFERENT key in the same namespace, applied to this tab over SSE.
+	await page.evaluate(
+		({ nb, id }) =>
+			fetch(`/api/cells/${id}`, {
+				method: 'PATCH',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ nb, hiddenFromAgent: true })
+			}).then(() => undefined),
+		{ nb: NB, id: PLAIN }
+	);
+	await expect(agentHidden).toHaveAttribute('aria-pressed', 'true', { timeout: 15_000 });
+
+	releaseExport();
+	// The cell is marked TWICE here (Cellar's flag, then the directive), so the notice
+	// must not promise that removing the line alone stops the export.
+	await expect(page.getByTestId('app-notice')).toContainText('marked for export twice');
 	// Reverted: the cell IS exported, so the row must say so.
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+	// ...and the revert put back ONLY the key it owns: the disclosure-shaped change
+	// that landed mid-flight survives it.
+	await expect(agentHidden).toHaveAttribute('aria-pressed', 'true');
+	await page.unroute(`**/api/cells/${PLAIN}`);
 
 	// ...and the server agrees - the mark was never cleared on disk.
 	await expect(async () => {

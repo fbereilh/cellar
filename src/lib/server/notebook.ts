@@ -1118,8 +1118,11 @@ export function getExportTarget(nb?: string | null): string | null {
 /**
  * The target the EXPORTER will actually write to, resolved through its base:
  * the notebook-level `export_target` + `export_base`, or - when there is none -
- * a `#|default_exp <module>` directive in any code cell (nbdev's own spelling,
- * always workspace-relative). This is `resolveExportTarget`'s rule REUSED,
+ * a `#|default_exp <module>` directive read from a code cell's LEADING BLOCK
+ * (nbdev's own spelling and nbdev's own scanning rule). Such a target is measured
+ * from the project's `lib_path` in an nbdev project and merely RE-EXPRESSED
+ * workspace-relative for reporting; `docs/design/nbdev-export-directives.md` is the
+ * durable record of both halves. This is `resolveExportTarget`'s rule REUSED,
  * never a second copy, so a caller reporting where the marks land can never
  * disagree with where they go. Null when nothing is configured - a configured
  * target that cannot RESOLVE is its own `ok:false` shape, kept distinct so it

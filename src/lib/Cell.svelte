@@ -21,7 +21,7 @@
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
-	import { canExportCell, isExportCell, exportDirectiveOwnsCell } from '$lib/exportRole';
+	import { canExportCell, isExportCell, exportDirectiveOwnsCell, exportMarkedTwice } from '$lib/exportRole';
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
@@ -313,6 +313,11 @@
 	// the same fact twice), and a browser exposes `title` as the accessible
 	// DESCRIPTION beside that name, which is exactly the right split for a reason.
 	const exportByDirective = $derived(exportDirectiveOwnsCell(cell));
+	// ...and marked by Cellar's own flag AS WELL, in which case the title may not
+	// promise that removing the line stops the export: the flag would still mark it.
+	// The shared rule (`exportMarkedTwice`) is what keeps this tooltip, the shell's
+	// refusal notice and MCP's saying the same true thing about the same cell.
+	const exportMarkedBoth = $derived(exportMarkedTwice(cell));
 	// Withheld from every agent surface (`cellar.hidden_from_agent`, the shared
 	// predicate MCP filters every read through). Deliberately UNGATED: unlike export
 	// and hide-code this applies to every cell type - a markdown cell's prose is as
@@ -2032,11 +2037,13 @@
 							: 'text-base-content/60 hover:text-base-content/90'}"
 						onclick={toggleExport}
 						aria-pressed={isExport}
-						title={exportByDirective
-							? 'Exported by the "#| export" line in this cell - remove that line to stop exporting it'
-							: isExport
-								? "Exported to the notebook's .py module - click to unmark"
-								: "Mark for export to the notebook's .py module"}
+						title={exportMarkedBoth
+							? 'Exported twice - by the "#| export" line in this cell AND by Cellar\'s own flag. Remove that line, then unmark it here to clear the flag'
+							: exportByDirective
+								? 'Exported by the "#| export" line in this cell - remove that line to stop exporting it'
+								: isExport
+									? "Exported to the notebook's .py module - click to unmark"
+									: "Mark for export to the notebook's .py module"}
 						aria-label="Export this cell to the notebook's .py module"
 						data-directive-export={exportByDirective ? 'true' : undefined}
 						data-testid="toggle-export"

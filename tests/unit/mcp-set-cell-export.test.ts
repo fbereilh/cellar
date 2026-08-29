@@ -962,6 +962,49 @@ describe('at the wire: the tool is really callable', () => {
 		expect(body(bad)).toContain(`cell ${short} is not a Python code cell`);
 	});
 
+	it('tells a doubly-marked cell apart from a directive-only one, and promises neither wrongly', async () => {
+		// A cell marked in Cellar that LATER acquires nbdev's `#| export` is marked
+		// twice, and `setCellExports` skips a directive-owned cell in both directions -
+		// so the flag cannot be cleared either and "remove that line to stop exporting
+		// it" is FALSE there: with the line gone the flag still marks it. The refusal
+		// has to say which state it is in, or the tool promises an outcome it does not
+		// produce - in a feature whose premise is that no surface lies about what is
+		// exported. Built in the reachable order (flag first, directive after).
+		const rel = 'wire-twice.ipynb';
+		const { target, code } = await makeNotebook(rel);
+		const client = await connect();
+		const onlyId = svc.resolveRef(target, code[0]);
+		const bothId = svc.resolveRef(target, code[1]);
+		nbmod.setSource(onlyId, '#| export\ndef one():\n    return 1', target);
+		nbmod.setCellExports([bothId], true, target);
+		nbmod.setSource(bothId, '#| export\ndef two():\n    return 2', target);
+		expect(marked(target, code[1])).toBe(true);
+		expect(marked(target, code[0])).toBe(false);
+
+		const call = async (handle: string) =>
+			(await client.callTool({
+				name: 'set_cell_export',
+				arguments: { ids: [handle], export: false, notebook: rel }
+			})) as CallResult;
+
+		const only = await call(code[0]);
+		expect(only.isError).toBe(true);
+		expect(body(only)).toContain('remove that line from the cell (edit_cell) to stop exporting it');
+		expect(body(only)).not.toContain('TWICE');
+
+		const both = await call(code[1]);
+		expect(both.isError).toBe(true);
+		expect(body(both)).toContain('marked TWICE');
+		expect(body(both)).toContain('will not stop the export');
+		// The load-bearing half: it must NOT hand back the directive-only remedy, which
+		// claims removing the line alone is enough.
+		expect(body(both)).not.toContain('remove that line from the cell (edit_cell) to stop exporting it');
+
+		// Both refusals are still refusals: neither cell changed.
+		expect(marked(target, code[1])).toBe(true);
+		expect(marked(target, code[0])).toBe(false);
+	});
+
 	it('refuses a .py text notebook by naming the cause, not as a missing cell', async () => {
 		const rel = 'wire-text.py';
 		const target = abs(rel);

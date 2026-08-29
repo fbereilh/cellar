@@ -112,6 +112,29 @@ export function exportDirectiveOwnsCell(cell: ExportCell): boolean {
 }
 
 /**
+ * Is this cell marked for export TWICE - by a `#| export` line in its source AND
+ * by Cellar's own `metadata.cellar.export` flag?
+ *
+ * Reachable and ordinary: mark a cell in Cellar, then let nbdev's directive arrive
+ * on its source (an agent edit, a pull, a hand edit). It exists because it is what
+ * every refusal SENTENCE turns on. `setCellExports` skips a directive-owned cell in
+ * BOTH directions - a decision that stands - so in this state the flag cannot be
+ * cleared either, and "remove that line to stop exporting it" is FALSE: with the
+ * line gone the flag still marks the cell, the toggle still reads ON, and the
+ * exporter still writes it. A feature whose premise is that the UI must never lie
+ * about what will be exported cannot ship that sentence in this state.
+ *
+ * So the CONDITION lives here, once, and the three surfaces that carry the sentence
+ * each branch on it in their own voice - the shell notice (`LiveNotebook.setExport`),
+ * the row toggle's `title` (`Cell.svelte`), and MCP `set_cell_export`'s refusal,
+ * which is handed the answer on its refusal record so the server half asks the same
+ * question rather than re-deriving it.
+ */
+export function exportMarkedTwice(cell: ExportCell): boolean {
+	return exportDirectiveOwnsCell(cell) && cell?.metadata?.cellar?.export === true;
+}
+
+/**
  * Is this cell marked for export to the `.py` module? Eligible (`canExportCell`)
  * AND marked - by Cellar's own `metadata.cellar.export` flag, or by nbdev's
  * `#| export` directive in the source.

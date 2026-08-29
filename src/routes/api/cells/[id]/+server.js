@@ -23,12 +23,18 @@ import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLangu
  *  bulk route reports its own refusals, so the caller can resync instead of
  *  rendering a conversion the document never took.
  *
- *  All three refusals are settled BEFORE any other field is written, so a refused
- *  PATCH applies NOTHING: every caller today sends a single field, but a body
- *  carrying `source` alongside a rejected `cell_type` or `export` would otherwise
- *  have persisted the source and dropped the fields after it. `setCellType` throws
- *  before it mutates and `setCellExport` refuses before it writes, so it is each
- *  writer's own rule that decides here — not a second copy of it. */
+ *  ORDER, stated precisely rather than as a blanket "a refused PATCH applies
+ *  nothing", because that is not literally true and the shape that would make it
+ *  true is the wrong one. Each refusal is settled before every field BELOW it:
+ *  `cell_type` is first and `setCellType` throws before it mutates, so a rejected
+ *  type persists nothing at all; `export` is next and `setCellExport` decides its
+ *  refusal before it writes, so a 409 there persists none of the fields after it
+ *  (`source`, `scrolled`, `role`, `hideInput`, `hiddenFromAgent`). What it does NOT
+ *  undo is a `cell_type` in the SAME body that already succeeded — `setCellType`
+ *  writes and persists on success, and it must stay first, since a type change is
+ *  exactly what can make a cell ineligible for the field below it. No shipped
+ *  caller sends both. Either way it is each writer's own rule that decides here —
+ *  never a second copy of it. */
 export async function PATCH({ params, request }) {
 	const body = await request.json();
 	if (body.cell_type != null) {
@@ -50,9 +56,8 @@ export async function PATCH({ params, request }) {
 	// would leave the row showing an unticked toggle over a cell the exporter still
 	// writes. The client reverts and says why.
 	//
-	// It sits with `cell_type` ABOVE every other field so the handler's pre-write
-	// invariant stays literally true: `setCellExport` decides its refusal before it
-	// writes anything, so a refused PATCH persists none of the body.
+	// It sits directly under `cell_type` and above every other field for the ordering
+	// reason the header states.
 	if ('export' in body) {
 		const r = setCellExport(params.id, !!body.export, body.nb, body.originId);
 		if (!r.ok && r.reason === 'export-directive-owns-cell')

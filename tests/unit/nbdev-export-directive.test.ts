@@ -220,9 +220,50 @@ describe('a directive-marked cell cannot be unmarked from Cellar', () => {
 			false,
 			NB
 		);
-		expect(r).toEqual({ ok: false, exportDirective: 'aaaaaaaa-1111-4111-8111-111111111111' });
+		expect(r).toEqual({
+			ok: false,
+			exportDirective: 'aaaaaaaa-1111-4111-8111-111111111111',
+			alsoFlagged: false
+		});
 		// All-or-nothing: the sibling in the same batch was NOT unmarked.
 		expect(nbmod.listCells(NB).map((c) => role.isExportCell(c))).toEqual([true, true]);
+	});
+
+	it('reports a DOUBLY-marked cell as such, so no surface promises the line alone is enough', () => {
+		// Reachable and ordinary: marked in Cellar first, then nbdev's directive arrives
+		// on the source. `setCellExports` skips a directive-owned cell in BOTH
+		// directions - upheld - so the flag survives here too, and "remove that line to
+		// stop exporting it" would be false: the flag would still mark the cell, the
+		// toggle would still read ON and the exporter would still write it. The one
+		// shared rule every surface's sentence branches on has to see the difference.
+		const ONLY = 'aaaaaaaa-5555-4555-8555-555555555555';
+		const BOTH = 'bbbbbbbb-6666-4666-8666-666666666666';
+		writeNb(NB, [
+			{ id: ONLY, source: '#| export\ndef d(): pass' },
+			{ id: BOTH, source: '#| export\ndef b(): pass', cellar: { export: true } }
+		]);
+		const [only, both] = nbmod.listCells(NB);
+		expect(role.exportDirectiveOwnsCell(only)).toBe(true);
+		expect(role.exportMarkedTwice(only)).toBe(false);
+		expect(role.exportMarkedTwice(both)).toBe(true);
+
+		// The refusal carries it, so the agent surface asks the shared rule rather than
+		// re-deriving one - and both are still refusals that write nothing.
+		expect(svc.setCellExport([ONLY], false, NB)).toEqual({
+			ok: false,
+			exportDirective: ONLY,
+			alsoFlagged: false
+		});
+		expect(svc.setCellExport([BOTH], false, NB)).toEqual({
+			ok: false,
+			exportDirective: BOTH,
+			alsoFlagged: true
+		});
+		expect(nbmod.setCellExport(BOTH, false, NB)).toEqual({
+			ok: false,
+			reason: 'export-directive-owns-cell'
+		});
+		expect(nbmod.listCells(NB)[1].metadata?.cellar?.export).toBe(true);
 	});
 
 	it('does NOT claim to own an INELIGIBLE cell, so a stale flag there still clears', () => {

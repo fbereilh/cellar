@@ -60,7 +60,7 @@ import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isPyUnsupportedType, isSqlCell, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
-import { isExportCell, canExportCell, exportCellCount, exportDirectiveOwnsCell } from '../../exportRole';
+import { isExportCell, canExportCell, exportCellCount, exportDirectiveOwnsCell, exportMarkedTwice } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
@@ -1999,7 +1999,14 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		// applies, so an INELIGIBLE cell (markdown/SQL/raw) whose source merely opens
 		// with `#| export` is not reported as directive-owned: the exporter ignores it,
 		// so it is not exported and unmarking it still clears a stale flag.
-		if (!exported && exportDirectiveOwnsCell(cell)) return { ok: false as const, exportDirective: ref };
+		//
+		// `alsoFlagged` rides along because the REMEDY differs: with Cellar's own flag
+		// set too the cell is marked twice and removing the line alone does not stop
+		// the export, so the tool's sentence may not promise that it does. Answered by
+		// the shared `exportMarkedTwice` rather than re-derived in `server.ts`, so the
+		// agent surface and the two human ones cannot say different things.
+		if (!exported && exportDirectiveOwnsCell(cell))
+			return { ok: false as const, exportDirective: ref, alsoFlagged: exportMarkedTwice(cell) };
 		seen.add(id);
 		full.push(id);
 	}

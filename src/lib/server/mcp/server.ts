@@ -801,10 +801,14 @@ export function registerTools(server: McpServer) {
 		// The one refusal that is not about the cell TYPE: nbdev's `#| export` in the
 		// source marks it, and Cellar never writes a directive, so there is no metadata
 		// this tool could clear that would take the mark away. Name the line to edit
-		// rather than report a change the notebook did not take.
+		// rather than report a change the notebook did not take - and, when the cell
+		// carries Cellar's own flag AS WELL (`alsoFlagged`), do not promise that
+		// removing the line alone stops the export, because the flag would still mark it.
 		if ('exportDirective' in r)
 			return notFound(
-				`cell ${asGiven(r.exportDirective)} is marked by an nbdev \`#| export\` directive in its own source, not by metadata, so it cannot be unmarked here - remove that line from the cell (edit_cell) to stop exporting it`
+				r.alsoFlagged
+					? `cell ${asGiven(r.exportDirective)} is marked TWICE - by an nbdev \`#| export\` directive in its own source AND by metadata - so removing the line alone will not stop the export: remove it (edit_cell), then call this again to clear the flag`
+					: `cell ${asGiven(r.exportDirective)} is marked by an nbdev \`#| export\` directive in its own source, not by metadata, so it cannot be unmarked here - remove that line from the cell (edit_cell) to stop exporting it`
 			);
 		return notFound(r.missing ? `cell ${asGiven(r.missing)} not found` : 'ids must not be empty');
 	});
