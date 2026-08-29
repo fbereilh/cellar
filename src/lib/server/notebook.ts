@@ -36,7 +36,7 @@ import {
 	type ResolvedExportTarget
 } from './export-py';
 import type { ExportHazard } from '../exportHazard';
-import { canExportCell, exportDirectiveOwnsCell } from '../exportRole';
+import { canExportCell, exportDirectiveOwnsCell, exportMarkedTwice } from '../exportRole';
 import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
@@ -986,6 +986,25 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
 export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directive-owns-cell';
 
 /**
+ * A refused `setCellExport`, and - for the directive case - whether Cellar's own
+ * flag marks the cell TOO (`exportMarkedTwice`), because the two states have
+ * different REMEDIES and only the server can tell them apart.
+ *
+ * The client reaches its own refusal only when it believed the cell was NOT
+ * directive-owned, which by construction means the source it holds is the stale
+ * copy that made it wrong - so it cannot derive this, and a local guess would emit
+ * the single-mark sentence ("remove that line to stop exporting it") over a cell
+ * where removing the line changes nothing. So the answer travels OUT of here, is
+ * put in the 409 body by the PATCH route, and is preferred over any client
+ * derivation. MCP's `set_cell_export` carries the same fact under the same name.
+ */
+export interface SetCellExportResult {
+	ok: boolean;
+	reason?: SetCellExportRefusal;
+	alsoFlagged?: boolean;
+}
+
+/**
  * Mark (or unmark) a code cell for nbdev-style export in the allowlisted `cellar`
  * namespace, so the flag round-trips through clean-on-save. Only a code cell can
  * carry it (a markdown/SQL cell has no module source). Choosing what is IN the
@@ -1005,7 +1024,7 @@ export function setCellExport(
 	exported: boolean,
 	nb?: string | null,
 	originId?: string | null
-): { ok: true } | { ok: false; reason: SetCellExportRefusal } {
+): { ok: true } | { ok: false; reason: SetCellExportRefusal; alsoFlagged?: boolean } {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return { ok: false, reason: 'no-such-cell' };
@@ -1013,8 +1032,13 @@ export function setCellExport(
 	// The source owns the mark (see `setCellExports`). A MARK request is already
 	// satisfied - the cell really is exported - so it is an honest no-op; an UNMARK
 	// is refused, because nothing Cellar may write would take the mark away.
+	//
+	// `alsoFlagged` rides the refusal because the REMEDY differs and only this side
+	// can see it - see `SetCellExportResult`.
 	if (exportDirectiveOwnsCell(cell))
-		return exported ? { ok: true } : { ok: false, reason: 'export-directive-owns-cell' };
+		return exported
+			? { ok: true }
+			: { ok: false, reason: 'export-directive-owns-cell', alsoFlagged: exportMarkedTwice(cell) };
 	setCellExports([id], exported, nb, originId);
 	return { ok: true };
 }

@@ -198,9 +198,22 @@ test('a refusal this tab could not predict still puts the toggle back, and says 
 		await route.continue();
 	});
 
-	// Now unmark. The client cannot see the directive, so it really does send this.
+	// Its own precondition, not one an earlier test in this serial file happens to
+	// leave behind: the concurrent change below has to be a CHANGE, so start from
+	// shown. A no-op write emits nothing and simply leaves it shown.
 	const agentHidden = cell.getByTestId('toggle-agent-hidden');
-	await expect(agentHidden).toHaveAttribute('aria-pressed', 'false');
+	await page.evaluate(
+		({ nb, id }) =>
+			fetch(`/api/cells/${id}`, {
+				method: 'PATCH',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ nb, hiddenFromAgent: false })
+			}).then(() => undefined),
+		{ nb: NB, id: PLAIN }
+	);
+	await expect(agentHidden).toHaveAttribute('aria-pressed', 'false', { timeout: 15_000 });
+
+	// Now unmark. The client cannot see the directive, so it really does send this.
 	await toggle.click();
 
 	// ...and while it is in flight, an agent withholds the cell from every agent

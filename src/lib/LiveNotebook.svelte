@@ -2443,14 +2443,22 @@
 	/**
 	 * What an export-directive refusal SAYS, whichever half refused - and it is
 	 * conditional because the remedy is. With only the directive marking the cell,
-	 * removing that line really does stop the export. With Cellar's own flag set too
-	 * (`exportMarkedTwice`, the shared rule the toggle's title and MCP branch on as
-	 * well), it does NOT: the flag still marks the cell and the exporter still writes
-	 * it, so the sentence has to name both marks rather than promise an outcome one
-	 * of them does not produce.
+	 * removing that line really does stop the export. With Cellar's own flag set too,
+	 * it does NOT: the flag still marks the cell and the exporter still writes it, so
+	 * the sentence has to name both marks rather than promise an outcome one of them
+	 * does not produce.
+	 *
+	 * It takes the ANSWER, never the cell, because the two callers know it in
+	 * different ways and only one of them can look it up. The optimistic mirror
+	 * asks `exportMarkedTwice` on the cell it can see, which is sound there - nothing
+	 * has contradicted that reading. The server backstop must use the flag the 409
+	 * carried, because it is reached only when this tab's copy of the source was
+	 * WRONG about the directive, and that same copy is what a local derivation would
+	 * read: it would answer "not marked twice" for every refusal, delivering the
+	 * single-mark remedy exactly where it is false.
 	 */
-	function exportDirectiveNotice(cell: UICell | null | undefined): string {
-		return exportMarkedTwice(cell)
+	function exportDirectiveNotice(markedTwice: boolean): string {
+		return markedTwice
 			? 'That cell is marked for export twice - by an "#| export" line in its own source AND by Cellar\'s own flag. Remove that line, then unmark it here to clear the flag.'
 			: 'That cell is marked for export by an "#| export" line in its own source - remove that line to stop exporting it.';
 	}
@@ -2491,7 +2499,7 @@
 		// on server" banner. In that window the directive is on the server's copy and
 		// not on ours, so the server's own refusal below is what keeps the promise.
 		if (!exported && exportDirectiveOwnsCell(cell)) {
-			onNotice?.(exportDirectiveNotice(cell));
+			onNotice?.(exportDirectiveNotice(exportMarkedTwice(cell)));
 			return;
 		}
 		// Only whether THIS key was there, and what it held - never a snapshot of the
@@ -2520,11 +2528,11 @@
 		// Decided from the route's OWN refusal shape, never from the status alone: a
 		// proxy 502/503 or an HTML error page landed no verdict, and claiming one would
 		// put the toggle back ON over a cell nothing said is exported.
-		const reason = await res
+		const verdict = await res
 			.json()
-			.then((b) => (b as { reason?: string } | null)?.reason ?? null)
+			.then((b) => (b as { reason?: string; alsoFlagged?: boolean } | null) ?? null)
 			.catch(() => null);
-		if (reason !== 'export-directive-owns-cell') return;
+		if (verdict?.reason !== 'export-directive-owns-cell') return;
 		// Looked up AGAIN, because a `load()` refetch replaces `cells` and the object
 		// the click read may no longer be the one on screen.
 		const c = findCell(id);
@@ -2534,7 +2542,7 @@
 			else delete cellar.export;
 			c.metadata = { ...(c.metadata ?? {}), cellar };
 		}
-		onNotice?.(exportDirectiveNotice(c));
+		onNotice?.(exportDirectiveNotice(verdict.alsoFlagged === true));
 	}
 
 	/**

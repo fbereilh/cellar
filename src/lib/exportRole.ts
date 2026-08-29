@@ -15,7 +15,7 @@
 
 import type { CellMetadata } from '$lib/server/types';
 import { isLogicalCellType } from '$lib/cellLanguage';
-import { nbdevDirective } from '$lib/nbdevDirectives';
+import { hasBareNbdevDirective } from '$lib/nbdevDirectives';
 
 /** The minimal cell shape this rule reads (Cell/CellView are assignable). */
 type ExportCell =
@@ -89,7 +89,7 @@ export function canExportCell(cell: ExportCell): boolean {
  * guard in `export-py.ts` is what stops it damaging an existing nbdev module.
  */
 export function hasExportDirective(cell: ExportCell): boolean {
-	return nbdevDirective(cell?.source, 'export') === '';
+	return hasBareNbdevDirective(cell?.source, 'export');
 }
 
 /**

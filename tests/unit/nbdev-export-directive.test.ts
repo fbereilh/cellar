@@ -171,7 +171,8 @@ describe('a directive-marked cell cannot be unmarked from Cellar', () => {
 		const before = readFileSync(abs, 'utf8');
 		expect(nbmod.setCellExport('a', false, NB)).toEqual({
 			ok: false,
-			reason: 'export-directive-owns-cell'
+			reason: 'export-directive-owns-cell',
+			alsoFlagged: false
 		});
 		expect(readFileSync(abs, 'utf8')).toBe(before);
 		expect(role.isExportCell(nbmod.listCells(NB)[0])).toBe(true);
@@ -201,7 +202,11 @@ describe('a directive-marked cell cannot be unmarked from Cellar', () => {
 		]);
 		const refused = await patch('a', { export: false, nb: NB });
 		expect(refused.status).toBe(409);
-		expect(await refused.json()).toEqual({ ok: false, reason: 'export-directive-owns-cell' });
+		expect(await refused.json()).toEqual({
+			ok: false,
+			reason: 'export-directive-owns-cell',
+			alsoFlagged: false
+		});
 
 		// The scope stays exactly where it was: a missing cell and an ineligible one are
 		// still silent, because widening the sibling setters is a separate change.
@@ -261,9 +266,43 @@ describe('a directive-marked cell cannot be unmarked from Cellar', () => {
 		});
 		expect(nbmod.setCellExport(BOTH, false, NB)).toEqual({
 			ok: false,
-			reason: 'export-directive-owns-cell'
+			reason: 'export-directive-owns-cell',
+			alsoFlagged: true
 		});
 		expect(nbmod.listCells(NB)[1].metadata?.cellar?.export).toBe(true);
+	});
+
+	it('puts WHICH remedy applies in the 409 body, because the client cannot derive it', () => {
+		// The browser only sends this unmark once it believed the cell was NOT
+		// directive-owned, so the source it holds is the stale copy that made it wrong -
+		// deriving "marked twice" from that copy answers FALSE for every refusal and
+		// delivers "remove that line to stop exporting it" over a cell where removing
+		// the line changes nothing. The server can see both marks, so it says which.
+		const ONLY = 'aaaaaaaa-7777-4777-8777-777777777777';
+		const BOTH = 'bbbbbbbb-8888-4888-8888-888888888888';
+		writeNb(NB, [
+			{ id: ONLY, source: '#| export\ndef d(): pass' },
+			{ id: BOTH, source: '#| export\ndef b(): pass', cellar: { export: true } }
+		]);
+
+		return Promise.all([patch(ONLY, { export: false, nb: NB }), patch(BOTH, { export: false, nb: NB })]).then(
+			async ([one, two]) => {
+				expect(one.status).toBe(409);
+				expect(await one.json()).toEqual({
+					ok: false,
+					reason: 'export-directive-owns-cell',
+					alsoFlagged: false
+				});
+				expect(two.status).toBe(409);
+				expect(await two.json()).toEqual({
+					ok: false,
+					reason: 'export-directive-owns-cell',
+					alsoFlagged: true
+				});
+				// Both are still refusals: neither mark was cleared.
+				expect(nbmod.listCells(NB).map((c) => c.metadata?.cellar?.export)).toEqual([undefined, true]);
+			}
+		);
 	});
 
 	it('does NOT claim to own an INELIGIBLE cell, so a stale flag there still clears', () => {

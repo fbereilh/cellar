@@ -56,12 +56,17 @@ export async function PATCH({ params, request }) {
 	// would leave the row showing an unticked toggle over a cell the exporter still
 	// writes. The client reverts and says why.
 	//
+	// `alsoFlagged` travels WITH the reason because the remedy differs and the client
+	// cannot work it out: it only sends this once it believed the cell was NOT
+	// directive-owned, so the source it would inspect is the stale copy that made it
+	// wrong. See `SetCellExportResult`.
+	//
 	// It sits directly under `cell_type` and above every other field for the ordering
 	// reason the header states.
 	if ('export' in body) {
 		const r = setCellExport(params.id, !!body.export, body.nb, body.originId);
 		if (!r.ok && r.reason === 'export-directive-owns-cell')
-			return json({ ok: false, reason: r.reason }, { status: 409 });
+			return json({ ok: false, reason: r.reason, alsoFlagged: !!r.alsoFlagged }, { status: 409 });
 	}
 	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
 	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
