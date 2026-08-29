@@ -2,6 +2,21 @@ import { describe, it, expect, vi } from 'vitest';
 import { topLevelNames, generateModule, resolveExportTarget } from '../../src/lib/server/export-py';
 import type { NotebookDoc } from '../../src/lib/server/types';
 
+// The REAL scanner, counted at the module boundary `export-py.ts` calls it through -
+// which is what makes "resolves cheaply" an observation rather than an assertion
+// about an implementation detail. Behaviour is untouched: every call delegates.
+const scanner = vi.hoisted(() => ({ calls: 0 }));
+vi.mock('../../src/lib/nbdevDirectives', async (importOriginal) => {
+	const real = await importOriginal<typeof import('../../src/lib/nbdevDirectives')>();
+	return {
+		...real,
+		nbdevDirective: (source: string | null | undefined, name: string) => {
+			scanner.calls++;
+			return real.nbdevDirective(source, name);
+		}
+	};
+});
+
 describe('topLevelNames', () => {
 	it('collects top-level def / class / assignments, skips private + nested', () => {
 		const src = [
@@ -70,28 +85,35 @@ describe('resolveExportTarget', () => {
 		expect(resolveExportTarget(doc({}))).toBeNull();
 	});
 
-	it('refuses cheaply, running no regex over a notebook that mentions no directive', () => {
+	it('refuses cheaply, never reaching the scanner for a notebook that mentions no directive', () => {
 		// This is the ONE resolution rule the exporter and `get_notebook_map` share,
 		// and the map short-circuits only when a notebook-level target IS set - so the
 		// COMMON case (no export configured at all) resolves on every call of the most
-		// frequently used agent read tool. It must cost a substring test, not a
-		// multiline regex over every code cell's full source.
+		// frequently used agent read tool. It must cost a substring test per cell, not
+		// a scan of every code cell's source.
+		//
+		// Observed at the scanner's own module boundary, so deleting the
+		// `includes('default_exp')` pre-check FAILS this: the walk would then be entered
+		// once per cell. (The per-CELL `#| export` read has no such guard and is right
+		// not to - see `nbdevDirectives.ts`'s Cost section for the measurement; that
+		// predicate answers one cell from its first line, while this one must clear
+		// every cell of the document before it can conclude "no target".)
 		const source = 'x = 1\ndf = load()\n'.repeat(200);
 		const cells = Array.from({ length: 40 }, (_, i) => ({ id: `c${i}`, cell_type: 'code' as const, source }));
-		const spy = vi.spyOn(String.prototype, 'match');
-		try {
-			expect(resolveExportTarget(doc({ cells }))).toBeNull();
-			expect(spy).not.toHaveBeenCalled();
-		} finally {
-			spy.mockRestore();
-		}
+		scanner.calls = 0;
+		expect(resolveExportTarget(doc({ cells }))).toBeNull();
+		expect(scanner.calls).toBe(0);
 
 		// ...and the guard never costs a real directive its match. A REAL directive is
 		// one nbdev would read: in the cell's LEADING block. The scan reads nbdev's own
 		// rule now (`$lib/nbdevDirectives`), which is also what bounds its cost - the
 		// block ends at the first ordinary line, so a 400-line cell costs one line.
 		const withDirective = doc({ cells: [{ id: 'a', cell_type: 'code', source: `#|default_exp lib.cheap\n${source}` }] });
+		scanner.calls = 0;
 		expect(resolveExportTarget(withDirective)).toMatchObject({ ok: true, target: 'lib/cheap.py' });
+		// The counter is not vacuous in the other direction either: the scanner IS the
+		// thing that answers once a cell mentions the directive.
+		expect(scanner.calls).toBe(1);
 
 		// ...and a `#|default_exp` sitting AFTER code is not a directive to nbdev, so
 		// it must not be one here either. Honouring it was the "half-speaks nbdev"
