@@ -12,14 +12,18 @@
 //  2. That the LIVE editor and the STATIC no-editor render agree on the same
 //     source. They are separate code paths sharing one rule; the whole point is
 //     that a directive does not change appearance when the lazy editor is summoned.
-//  3. The wiring and the colour, which are one expression wide each and so get
-//     source guards (vitest deliberately runs without the SvelteKit plugin, so no
-//     component here can be mounted, and the CSS cascade is only observable in a
-//     real browser).
+//  3. That the rule reads only the text it needs, which is what lets the editor
+//     plugin - it rebuilds on scroll, not only on edit - hand over its document
+//     instead of a whole-document copy.
+//
+// The one-expression-wide wiring gets narrow, formatting-tolerant source guards at
+// the end: vitest deliberately runs without the SvelteKit plugin, so no component
+// here can be mounted, and the CSS cascade is only observable in a real browser
+// (`tests/e2e/directive-comment-highlight.spec.ts` answers both for real).
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { EditorState } from '@codemirror/state';
+import { EditorState, Text } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { python, pythonLanguage } from '@codemirror/lang-python';
 import { DIRECTIVE_CLASS, directiveCommentRanges, directiveCommentHighlight } from '$lib/directiveComment';
@@ -217,40 +221,106 @@ describe('the two render paths agree', () => {
 	}
 });
 
-describe('wiring and colour (source guards)', () => {
+describe('wiring and scope', () => {
+	// vitest deliberately runs without the SvelteKit plugin, so neither component can
+	// be mounted here and the CSS cascade is only observable in a real browser - both
+	// are asserted for real by `tests/e2e/directive-comment-highlight.spec.ts`. What
+	// is left is one-expression-wide wiring, kept deliberately FORMATTING-TOLERANT: a
+	// prettier reflow, a rename or an equivalent refactor must not fail the suite
+	// while the behaviour is unchanged.
 	const read = (p: string) => readFileSync(join(process.cwd(), p), 'utf8');
+	const mentions = (src: string) => src.split('directiveCommentHighlight').length - 1;
 
-	it('defines the directive colour for both schemes, beside the other tokens', () => {
-		const css = read('src/app.css');
-		expect(css).toMatch(/--cellar-cm-tok-directive:\s*light-dark\(#[0-9a-f]{6},\s*#[0-9a-f]{6}\);/);
+	it('reaches both Python-family editor surfaces', () => {
+		// Import + use, in each.
+		expect(mentions(read('src/lib/Cell.svelte'))).toBeGreaterThanOrEqual(2);
+		expect(mentions(read('src/lib/FileTab.svelte'))).toBeGreaterThanOrEqual(2);
 	});
 
-	it('applies it under a TWO-class selector in both code surfaces', () => {
-		// One class would tie the result to stylesheet insertion order against the
-		// highlight style's own generated comment class; two classes win outright.
-		const css = read('src/app.css');
-		expect(css).toContain(`.cm-content .${DIRECTIVE_CLASS}`);
-		// The editor NESTS the token span inside the mark, so without this the
-		// directive keeps painting comment grey (see the editor test above).
-		expect(css).toContain(`.cm-content .${DIRECTIVE_CLASS} span`);
-		expect(css).toContain(`.cm-static-content .${DIRECTIVE_CLASS}`);
-		expect(css).toMatch(
-			new RegExp(`\\.cm-static-content \\.${DIRECTIVE_CLASS}\\s*\\{[^}]*--cellar-cm-tok-directive`)
-		);
-	});
-
-	it('adds the editor plugin beside python() only — never to sql/markdown or globally', () => {
-		const cell = read('src/lib/Cell.svelte');
-		expect(cell).toContain('[python(), directiveCommentHighlight]');
-		// Not in the shared theme every language gets.
+	it('never reaches the shared theme every language gets', () => {
+		// The scope claim: `#|` carries no directive meaning in SQL, markdown, YAML or
+		// TOML, so the plugin must stay beside `python()` and out of `EDITOR_THEME`.
+		// The static half of that scope IS behavioural, above.
 		expect(read('src/lib/editorTheme.ts')).not.toContain('directiveComment');
-		const fileTab = read('src/lib/FileTab.svelte');
-		expect(fileTab).toContain("q.endsWith('.py')) return [python(), directiveCommentHighlight]");
 	});
 
-	it('keeps no allowlist of recognised directive names', () => {
-		// The recorded decision, guarded: adding one would make an unrecognised but
-		// valid nbdev directive read as a dead comment.
-		expect(read('src/lib/directiveComment.ts')).not.toContain('default_exp\'');
+	it('paints the editor through the DESCENDANT selector', () => {
+		// The non-obvious one, and the reason it is pinned at all: CodeMirror's mark
+		// decoration WRAPS the token span rather than merging classes (see the editor
+		// test above), and a child's own `color` beats anything inherited from an
+		// ancestor whatever the specificity - so without this the editor silently keeps
+		// painting comment grey while the static render looks correct. That the cascade
+		// then really lands is a browser question, answered by the e2e spec.
+		expect(read('src/app.css')).toContain(`.cm-content .${DIRECTIVE_CLASS} span`);
+	});
+});
+
+describe('the rule reads only what it needs', () => {
+	// The editor plugin rebuilds on SCROLL as well as on edit and hands over
+	// `view.state.doc` rather than a materialised string, so the rule must never read
+	// the whole document. Asserted through the public text seam.
+	function countingSource(source: string) {
+		let read = 0;
+		return {
+			read: () => read,
+			doc: {
+				length: source.length,
+				sliceString(from: number, to: number) {
+					read += to - from;
+					return source.slice(from, to);
+				}
+			}
+		};
+	}
+
+	it('agrees with the plain-string call shape', () => {
+		// One rule, two callers: the static path passes the source it already holds,
+		// the editor passes its `Text`. They must not answer differently.
+		const src = '#| default_exp a\nx = 1  #| trailing\ndef f():\n    #| hide\n    pass';
+		const tree = pythonLanguage.parser.parse(src);
+		const { doc } = countingSource(src);
+		expect(directiveCommentRanges(doc, tree)).toEqual(directiveCommentRanges(src, tree));
+	});
+
+	it('slices a tiny fraction of a large document for one visible window', () => {
+		const body = Array.from({ length: 2000 }, (_, i) => `value_${i} = ${i}  # ordinary`).join('\n');
+		const src = `${body}\n#| export\n`;
+		expect(src.length).toBeGreaterThan(40_000);
+		const tree = pythonLanguage.parser.parse(src);
+		const { doc, read } = countingSource(src);
+		const found = directiveCommentRanges(doc, tree, src.length - 40, src.length);
+		expect(found.map((r) => src.slice(r.from, r.to))).toEqual(['#| export']);
+		expect(read()).toBeLessThan(1_000);
+	});
+
+	it('does not materialise the document when the editor rebuilds', () => {
+		// The regression the seam exists for, at the surface that pays it.
+		const parent = document.createElement('div');
+		document.body.appendChild(parent);
+		const view = new EditorView({
+			parent,
+			state: EditorState.create({
+				doc: '#| export\nx = 1',
+				extensions: [python(), directiveCommentHighlight]
+			})
+		});
+		const real = Text.prototype.toString;
+		let calls = 0;
+		Text.prototype.toString = function (this: Text) {
+			calls++;
+			return real.call(this);
+		};
+		try {
+			view.dispatch({ changes: { from: 15, insert: '\n#| hide' } });
+			expect([...parent.querySelectorAll(`.${DIRECTIVE_CLASS}`)].map((n) => n.textContent)).toEqual([
+				'#| export',
+				'#| hide'
+			]);
+			expect(calls).toBe(0);
+		} finally {
+			Text.prototype.toString = real;
+			view.destroy();
+			parent.remove();
+		}
 	});
 });

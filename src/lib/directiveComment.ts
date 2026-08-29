@@ -69,12 +69,47 @@ export interface DirectiveRange {
 	to: number;
 }
 
-/** True when only whitespace separates `pos` from the start of its line. */
-function atLineStart(source: string, pos: number): boolean {
-	for (let i = pos - 1; i >= 0; i--) {
-		const ch = source[i];
-		if (ch === '\n') return true;
-		if (ch !== ' ' && ch !== '\t' && ch !== '\r') return false;
+/**
+ * The whole of the text access the rule needs: a random-access slice and a length.
+ * A plain `string` is accepted too, which is what the static path passes (it holds
+ * the source already), and CodeMirror's own `Text` satisfies this STRUCTURALLY —
+ * so the editor plugin hands over `view.state.doc` and never materialises the
+ * document. That matters because the plugin rebuilds on SCROLL as well as on edit:
+ * a whole-document `toString()` there would copy a multi-MB `.py` per viewport
+ * change, on the process that also carries the kernel websockets and the SSE
+ * fan-out. Both render paths still call ONE rule, which is the agreement
+ * `staticHighlight.ts` exists to keep.
+ */
+export interface DirectiveTextSource {
+	readonly length: number;
+	sliceString(from: number, to: number): string;
+}
+
+function textSource(source: string | DirectiveTextSource): DirectiveTextSource {
+	return typeof source === 'string'
+		? { length: source.length, sliceString: (from, to) => source.slice(from, to) }
+		: source;
+}
+
+/** How much text the backward line-start scan reads per step. */
+const SCAN_CHUNK = 64;
+
+/**
+ * True when only whitespace separates `pos` from the start of its line. Read
+ * backwards in small chunks and stopped by the first non-blank character, so an
+ * ordinary trailing comment costs one short slice however long its line is.
+ */
+function atLineStart(doc: DirectiveTextSource, pos: number): boolean {
+	let end = pos;
+	while (end > 0) {
+		const start = Math.max(0, end - SCAN_CHUNK);
+		const text = doc.sliceString(start, end);
+		for (let i = text.length - 1; i >= 0; i--) {
+			const ch = text[i];
+			if (ch === '\n') return true;
+			if (ch !== ' ' && ch !== '\t' && ch !== '\r') return false;
+		}
+		end = start;
 	}
 	return true; // reached the start of the document
 }
@@ -85,24 +120,29 @@ function atLineStart(source: string, pos: number): boolean {
  * parse of `source`: a range is emitted only for a node the grammar itself calls a
  * `Comment`, which is what keeps `#|` inside a string from being decorated.
  *
+ * `source` is a plain string or any {@link DirectiveTextSource}; only each comment
+ * token's own text and the blanks back to its line start are ever read, so a caller
+ * holding a large document need not materialise it.
+ *
  * Pure and DOM-free — the editor plugin and the static renderer share it.
  */
 export function directiveCommentRanges(
-	source: string,
+	source: string | DirectiveTextSource,
 	tree: Tree,
 	from = 0,
-	to = source.length
+	to?: number
 ): DirectiveRange[] {
+	const doc = textSource(source);
 	const out: DirectiveRange[] = [];
 	tree.iterate({
 		from,
-		to,
+		to: to ?? doc.length,
 		enter(node) {
 			// Grammar-agnostic: Python calls it `Comment`, other grammars `LineComment`.
 			if (!node.name.endsWith('Comment')) return;
-			const text = source.slice(node.from, node.to);
+			const text = doc.sliceString(node.from, node.to);
 			if (!DIRECTIVE_OPENER.test(text)) return;
-			if (!atLineStart(source, node.from)) return; // a TRAILING comment is not a directive
+			if (!atLineStart(doc, node.from)) return; // a TRAILING comment is not a directive
 			out.push({ from: node.from, to: node.to });
 		}
 	});
@@ -136,7 +176,10 @@ export const directiveCommentHighlight = ViewPlugin.fromClass(
 		}
 		build(view: EditorView): DecorationSet {
 			const builder = new RangeSetBuilder<Decoration>();
-			const source = view.state.doc.toString();
+			// The doc is handed over as-is, never materialised with `toString()`: this
+			// runs on SCROLL as well as on edit, and the rule reads only each comment
+			// token plus the blanks before it.
+			const doc = view.state.doc;
 			const tree = syntaxTree(view.state);
 			// Visible ranges only, and they arrive sorted — which is what the builder
 			// requires, and what keeps this off the whole document on every update.
@@ -145,7 +188,7 @@ export const directiveCommentHighlight = ViewPlugin.fromClass(
 			// `lastEnd` drops the repeat (directive ranges never overlap each other).
 			let lastEnd = -1;
 			for (const { from, to } of view.visibleRanges)
-				for (const r of directiveCommentRanges(source, tree, from, to)) {
+				for (const r of directiveCommentRanges(doc, tree, from, to)) {
 					if (r.from < lastEnd) continue;
 					builder.add(r.from, r.to, directiveMark);
 					lastEnd = r.to;

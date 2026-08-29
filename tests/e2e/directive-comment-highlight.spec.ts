@@ -27,6 +27,9 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
 
 const NB = 'directives.ipynb';
 const CELL = 'directive0';
+// The last three lines are what makes the collision check below mean something:
+// they put a KEYWORD and a FUNCTION name on screen, and `tok-keyword`/`tok-meta`
+// are the palette's nearest neighbours to the directive's magenta.
 const SOURCE = [
 	'#| default_exp training\n',
 	'#| some-future-directive\n',
@@ -34,8 +37,14 @@ const SOURCE = [
 	'x = 1  #| not a directive, it trails code\n',
 	's = """\n',
 	'#| not a directive, it is string content\n',
-	'"""\n'
+	'"""\n',
+	'import os\n',
+	'def scale(n):\n',
+	'    return os.sep * n\n'
 ];
+
+/** CIE76 ΔE below which two token colours read as the same colour. */
+const MIN_TOKEN_DISTANCE = 20;
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
@@ -56,18 +65,45 @@ async function colourOf(scope: Locator, prefix: string): Promise<string> {
 	}, prefix);
 }
 
+/** The linear-light RGB channels of an `rgb(...)` string. */
+function channels(s: string): [number, number, number] {
+	const [r, g, b] = s.match(/\d+(\.\d+)?/g)!.slice(0, 3).map(Number);
+	const c = (v: number) => {
+		const n = v / 255;
+		return n <= 0.03928 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
+	};
+	return [c(r), c(g), c(b)];
+}
+
 /** WCAG relative-luminance contrast between two `rgb(...)` strings. */
 function contrast(a: string, b: string): number {
 	const lum = (s: string) => {
-		const [r, g, bl] = s.match(/\d+(\.\d+)?/g)!.slice(0, 3).map(Number);
-		const c = (v: number) => {
-			const n = v / 255;
-			return n <= 0.03928 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
-		};
-		return 0.2126 * c(r) + 0.7152 * c(g) + 0.0722 * c(bl);
+		const [r, g, b] = channels(s);
+		return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 	};
 	const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p);
 	return (x + 0.05) / (y + 0.05);
+}
+
+/**
+ * CIE76 ΔE between two `rgb(...)` strings - a PERCEPTUAL distance, which is the
+ * right question for "do these two read as the same colour". Luminance contrast is
+ * not: a cyan operator and a pink directive can share a luminance while being
+ * maximally distinct in hue, so a contrast floor would reject colours nobody could
+ * confuse. ~2.3 is the just-noticeable difference; the palette's nearest pair here
+ * measures ~28.
+ */
+function distance(a: string, b: string): number {
+	const lab = (s: string) => {
+		const [r, g, b] = channels(s);
+		const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+		const x = f((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047);
+		const y = f(0.2126 * r + 0.7152 * g + 0.0722 * b);
+		const z = f((0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883);
+		return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
+	};
+	const [p, q] = [lab(a), lab(b)];
+	return Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
 }
 
 async function setTheme(page: Page, id: 'dim' | 'cellar-light') {
@@ -157,18 +193,24 @@ for (const theme of ['dim', 'cellar-light'] as const) {
 		// rather than a shade of the same one.
 		expect(contrast(directive, comment)).toBeGreaterThan(1.2);
 
-		// It must not collide with any OTHER colour on this line's neighbours.
+		// It must not COLLIDE with any other token colour this render puts on screen -
+		// the fixture carries a comment, a name, an operator, a number, a string, a
+		// keyword and a function name, so the palette's nearest neighbours are among them.
 		const others = await staticCode.evaluate((root: HTMLElement) => {
 			const seen = new Set<string>();
 			for (const n of root.querySelectorAll('span'))
 				if (n.children.length === 0) seen.add(getComputedStyle(n as HTMLElement).color);
 			return [...seen];
 		});
-		// `directive` is one of them; every other distinct colour must differ from it,
-		// which is trivially true - the real check is that it is not the ONLY colour,
-		// i.e. the render did highlight, and that comment/keyword sit apart from it.
-		expect(others.length).toBeGreaterThan(1);
 		expect(others).toContain(directive);
+		expect(others.length).toBeGreaterThan(1); // the render really did highlight
+		for (const other of others) {
+			if (other === directive) continue;
+			expect(
+				distance(directive, other),
+				`directive ${directive} vs ${other}`
+			).toBeGreaterThan(MIN_TOKEN_DISTANCE);
+		}
 
 		// --- the LIVE editor, summoned by clicking in -----------------------------
 		await cell(page).getByTestId('static-code').click();
