@@ -5,13 +5,13 @@
       <stop offset="1" stop-color="#9050b4"/>
     </linearGradient>
   </defs>
-  <rect x="1" y="1" width="30" height="30" rx="7.5" fill="url(#tile)"/>
+  <rect width="32" height="32" rx="7" fill="url(#tile)"/>
   <g fill="#f7f3fa">
     <!-- bowl -->
-    <path d="M9 7h14c0 6.2-2.9 9.7-7 9.7S9 13.2 9 7Z"/>
+    <path d="M4.6 4.4h22.8L17.7 19.4h-3.4Z"/>
     <!-- stem -->
-    <rect x="14.8" y="16" width="2.4" height="7.4" rx="0.4"/>
+    <rect x="14.2" y="18.4" width="3.6" height="6.6" rx="0.6"/>
     <!-- base -->
-    <rect x="10.5" y="23" width="11" height="2.4" rx="1.2"/>
+    <rect x="7.4" y="24.4" width="17.2" height="3.4" rx="1.7"/>
   </g>
 </svg>
