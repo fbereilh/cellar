@@ -2217,22 +2217,67 @@
 		await Promise.all(Object.values(cellApis).map((a) => a.flush?.() ?? Promise.resolve()));
 	}
 
+	/**
+	 * How an in-flight cell-source PATCH ended, for the one caller that has to know:
+	 * the manual export, which writes the module from the source the SERVER holds.
+	 *
+	 * - `committed`  the server took the new source
+	 * - `failed`     it did not (unreachable, or a refusal), so the server still
+	 *                holds the PREVIOUS source
+	 */
+	type EditCommit = 'committed' | 'failed';
+	/**
+	 * The IN-FLIGHT source writes, keyed by cell, so the manual export can wait for
+	 * them to land - the `exportTargetCommit` treatment, for the sibling half of the
+	 * same blur-then-click hazard.
+	 *
+	 * Pressing "Export to .py" blurs the editor, and `Cell.svelte`'s blur handler
+	 * flushes the pending edit fire-and-forget; the export POST then went out on its
+	 * own connection and could be serviced FIRST, writing the module from the
+	 * pre-edit source and reporting "Exported N cells" over it. Nothing healed that
+	 * afterwards once an ordinary save stopped re-exporting, so the export has to
+	 * await the write it raced.
+	 *
+	 * Keyed by cell rather than kept as one promise because several cells can be in
+	 * flight at once (a Cmd/Ctrl+S flush, an unload flush), and each entry DROPS
+	 * ITSELF the moment it settles - the `exportTargetCommit` rule - so a write that
+	 * has already landed can never gate a later export.
+	 */
+	const cellEditCommits = new Map<string, Promise<EditCommit>>();
+
 	async function editCell(id: string, source: string, { keepalive = false }: { keepalive?: boolean } = {}) {
 		const cell = findCell(id);
 		if (cell) cell.source = source;
+		const commit = commitCellEdit(id, source, keepalive);
+		cellEditCommits.set(id, commit);
+		const drop = () => {
+			if (cellEditCommits.get(id) === commit) cellEditCommits.delete(id);
+		};
+		commit.then(drop, drop);
+		await commit;
+		// The edit stamped `editedAt` server-side, so this cell (and everything that
+		// uses its names) may now be stale — recompute from the server's view.
+		scheduleStaleness();
+	}
+
+	/**
+	 * The PATCH itself, split out so its outcome is a value the export can read.
+	 * It never rejects: a rejected write has always been swallowed here (an
+	 * autosave has no surface to report on), and the export is the one caller that
+	 * needs to know, so it reads `failed` rather than an exception.
+	 */
+	async function commitCellEdit(id: string, source: string, keepalive: boolean): Promise<EditCommit> {
 		// Only the page-unload flush opts into `keepalive`: the browser caps the
 		// combined keepalive body at ~64KB and rejects past it, so normal
 		// (page-alive) autosaves stay plain fetch. `.catch` keeps a rejected PATCH
 		// from surfacing as an unhandled rejection either way.
-		await fetch(`/api/cells/${id}`, {
+		const res = await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ source, nb: path, originId }),
 			keepalive
-		}).catch(() => {});
-		// The edit stamped `editedAt` server-side, so this cell (and everything that
-		// uses its names) may now be stale — recompute from the server's view.
-		scheduleStaleness();
+		}).catch(() => null);
+		return res?.ok ? 'committed' : 'failed';
 	}
 
 	async function clearCell(id: string) {
@@ -3003,6 +3048,19 @@
 	 * Cellar-generated module", a non-`.py` or escaping target) exist for their
 	 * actionable message, and a generic "Export failed." names no cause - reported
 	 * through the same transient notice channel as every other refused write here.
+	 *
+	 * THE IN-FLIGHT CELL SOURCES ARE AWAITED FOR THE SAME REASON, and they are the
+	 * half that matters most: the click blurs the EDITOR too, so `Cell.svelte`'s
+	 * blur handler flushes the pending edit fire-and-forget, and the export POST
+	 * went out on its own connection where the server could service it FIRST -
+	 * writing the module from the pre-edit source and reporting "Exported N cells"
+	 * over it. An ordinary save used to re-export and heal that; nothing does now,
+	 * so the export must wait for the write it raced. Awaited, never re-flushed:
+	 * `flushEdit` has already advanced `savedSource`, so a second flush is a no-op
+	 * and the only thing that can be waited on is the promise that PATCH is riding.
+	 * An edit that did NOT land aborts WITH a message rather than exporting a module
+	 * the notebook has moved past - a silent abort would be a dead button, and a
+	 * silent export would be the confident-looking lie this wait exists to remove.
 	 */
 	async function exportPy() {
 		// Consumed, so one refusal cannot abort two exports (the field has been put back
@@ -3011,6 +3069,21 @@
 		exportTargetCommit = null;
 		const outcome = pending ? await pending.catch(() => null) : null;
 		if (outcome === 'refused' || outcome === 'unreachable') return null;
+		// The same wait for the CELL SOURCES: the click blurred the editor, so its
+		// pending edit is on the wire fire-and-forget, and the export reads what the
+		// server holds. Awaited, not flushed - `Cell.svelte`'s blur handler already
+		// ran `flushEdit` and advanced `savedSource`, so a second flush is a no-op;
+		// the promise to wait for is the one that PATCH is already riding.
+		const edits = await Promise.all([...cellEditCommits.values()]).catch(() => ['failed' as const]);
+		if (edits.includes('failed')) {
+			// Aborting SILENTLY would make the button a dead control, and exporting on
+			// would write the module from the source the server still holds and report
+			// success over it - the confident-looking lie this whole wait exists to
+			// remove. The notice channel is single and nonce-keyed, so an export result
+			// posted afterwards would replace this reason: say it, and stop.
+			onNotice?.('Export skipped: a cell edit could not be saved, so the module would not match the notebook.');
+			return null;
+		}
 		try {
 			const res = await fetch('/api/notebooks/export-py', {
 				method: 'POST',

@@ -232,9 +232,9 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 		py.writes.length = 0;
 
 		// Such a doc is written through jupytext (which stores no cellar metadata) and
-		// `autoExportPy` skips it, so a target set here survives neither a reload nor a
-		// regeneration. Accepting it while set_cell_export refuses would leave an agent
-		// holding a target for a module that can never be built.
+		// `regenerateExportModule` skips it, so a target set here survives neither a
+		// reload nor a regeneration. Accepting it while set_cell_export refuses would
+		// leave an agent holding a target for a module that can never be built.
 		expect(svc.setExportTarget('lib/text.py', target)).toEqual({ ok: false, refused: 'py-notebook' });
 		expect(nbmod.getExportTarget(target)).toBe(null);
 		expect(py.writes).toEqual([]);

@@ -1,11 +1,12 @@
 /**
  * MCP `set_cell_export`: choosing WHICH cells become the nbdev-style `.py` module.
  *
- * `set_export_target` already let an agent name the module and cellar already
- * regenerated it on every save, but `metadata.cellar.export` - the flag that says
- * which cells go IN it - was settable only in the UI, so the agent-side export
- * flow had no middle. This is that half, in `delete_cells`' shape: batch,
- * handle-addressed, all-or-nothing.
+ * `set_export_target` already let an agent name the module, but
+ * `metadata.cellar.export` - the flag that says which cells go IN it - was
+ * settable only in the UI, so the agent-side export flow had no middle. This is
+ * that half, in `delete_cells`' shape: batch, handle-addressed, all-or-nothing.
+ * Marking is also one of the three EXPLICIT actions that WRITE the module (an
+ * ordinary save does not - see `tests/unit/export-explicit-only.test.ts`).
  *
  * The contracts worth pinning are the ones a wrong guess would silently break:
  * only a CODE cell can be marked (marking a markdown cell would record a flag
@@ -312,7 +313,7 @@ describe('a .py text notebook is refused up front', () => {
 		exp.calls = 0;
 
 		// A `.py` notebook carries no cellar cell metadata, so the flag could never be
-		// stored and `autoExportPy` generates no module - persisting would only spend a
+		// stored and `regenerateExportModule` skips it - persisting would only spend a
 		// blocking jupytext rewrite to produce byte-identical bytes while claiming a
 		// mark that does not exist.
 		const r = svc.setCellExport([cells[0].id], true, target);
@@ -504,11 +505,12 @@ describe('the generated module follows the marks', () => {
 describe('a regeneration that FAILED is reported, never read as a success', () => {
 	/**
 	 * The other half of the honesty contract, and the one an agent cannot see any
-	 * other way: `autoExportPy` swallows the throw so a bad target can never break
-	 * the notebook save, and `module` is CONDITIONAL - so its absence is what says
-	 * the module was written. A target whose parent is a FILE (the same shape as an
-	 * EACCES or an ENOSPC) leaves the module unwritten; there is no MCP export tool
-	 * through which the agent could ever learn that.
+	 * other way: the regeneration these two tools drive swallows the throw so a bad
+	 * target can never cost the notebook write the same call just made, and `module`
+	 * is CONDITIONAL - so its absence is what says the module was written. A target
+	 * whose parent is a FILE (the same shape as an EACCES or an ENOSPC) leaves the
+	 * module unwritten; there is no MCP export tool through which the agent could
+	 * ever learn that.
 	 */
 	it('says the module could not be written, and names why', async () => {
 		const { target, code } = await makeNotebook('module-unwritable.ipynb');
@@ -569,8 +571,8 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 	 * The stored value lands in the COMMITTED `.ipynb`, and `resolveInWorkspace`
 	 * accepts an absolute path that happens to resolve inside THIS workspace - so
 	 * stored verbatim it contradicted every description of the field and, on another
-	 * checkout, threw from the best-effort auto-export, silently ending regeneration
-	 * for that clone. It is normalized to the relative form it is documented as.
+	 * checkout, threw from the best-effort regeneration, silently ending it for that
+	 * clone. It is normalized to the relative form it is documented as.
 	 */
 	it('stores an absolute in-workspace target in its workspace-relative form', async () => {
 		const { target, code } = await makeNotebook('target-absolute.ipynb');
@@ -667,15 +669,20 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 		expect(nbmod.lastExportError(target)).toBe(null);
 
 		// Re-marking an already-marked cell changes nothing, so nothing persists and
-		// nothing regenerates - only the disk can answer whether the module is there.
+		// nothing regenerates. The module is still there, so what it must NOT say is
+		// that it is missing - and what it must not do is stay silent, which under the
+		// conditional contract would vouch for a file this call never wrote.
 		const still = svc.setCellExport([code[0]], true, target);
-		expect(still.ok && 'module' in still).toBe(false);
+		expect(still.ok ? still.module : null).toMatchObject({ regenerated: false });
+		expect(still.ok ? still.module?.reason : '').toContain('lib/gone.py');
+		expect(still.ok ? still.module?.reason : '').not.toContain('no Cellar-generated module');
 
 		unlinkSync(join(WS, 'lib/gone.py'));
 		const after = svc.setCellExport([code[0]], true, target);
 		expect(after.ok ? after.module : null).toMatchObject({ regenerated: false });
 		expect(after.ok ? after.module?.reason : '').toContain('lib/gone.py');
 		expect(after.ok ? after.module?.reason : '').toContain('wrote none');
+		expect(after.ok ? after.module?.reason : '').toContain('no Cellar-generated module');
 		// It reports STATE, never a claim that these marks were dropped.
 		expect(after.ok ? after.module?.reason : '').not.toContain('no cell is marked');
 
@@ -693,6 +700,58 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 		const wrote = svc.setCellExport([code[1]], true, target);
 		expect(wrote.ok && 'module' in wrote).toBe(false);
 		expect(readFileSync(join(WS, 'lib/gone.py'), 'utf8')).toContain('def two():');
+	});
+
+	/**
+	 * THE REGRESSION an explicit export introduced, and the one an agent cannot see
+	 * any other way. `module` is CONDITIONAL, so its ABSENCE is the claim that the
+	 * file on disk holds these marks - and that was only ever true because every
+	 * save re-exported. It no longer does, so: mark a cell (the module lands holding
+	 * S1) -> EDIT that cell to S2 (the notebook is persisted, the module is not) ->
+	 * re-mark it (idempotent, so nothing is written). Silent, that answer vouches
+	 * for a module assembled from a source the user has since replaced.
+	 *
+	 * The honest report is what this call KNOWS - that it wrote nothing, and that
+	 * the file may therefore predate the current sources - never that it IS stale,
+	 * which nothing here measures, and never `moduleFailure`'s claim that a write
+	 * was ATTEMPTED and threw.
+	 */
+	it('never vouches for a module written before the marked cell was edited', async () => {
+		const { target, code } = await makeNotebook('module-stale.ipynb');
+		svc.setExportTarget('lib/stale.py', target);
+		expect(svc.setCellExport([code[0]], true, target).ok).toBe(true);
+		const py = join(WS, 'lib/stale.py');
+		expect(readFileSync(py, 'utf8')).toContain('def one():');
+
+		// The edit an ordinary save used to re-export. It does not any more - this is
+		// the doc-layer writer every UI edit lands on, persist included.
+		nbmod.setSource(svc.resolveRef(target, code[0]), 'def one():\n    return 99', target);
+		expect(readFileSync(py, 'utf8')).toContain('return 1');
+		expect(readFileSync(py, 'utf8')).not.toContain('return 99');
+
+		const again = svc.setCellExport([code[0]], true, target);
+		expect(again.ok && 'module' in again).toBe(true);
+		const reason = again.ok ? (again.module?.reason ?? '') : '';
+		expect(again.ok ? again.module : null).toMatchObject({ regenerated: false });
+		expect(reason).toContain('lib/stale.py');
+		expect(reason).toContain('wrote nothing');
+		expect(reason).toContain('may predate the current cell sources');
+		// It reports what it VERIFIED. It never claims the write was attempted and
+		// failed (that is `moduleFailure`), nor that the module is definitely stale.
+		expect(nbmod.lastExportError(target)).toBe(null);
+		expect(reason).not.toContain('could not be written');
+		expect(reason).not.toContain('will not import');
+		expect(again.ok ? again.module?.warning : 'x').toBeUndefined();
+
+		// And following the remedy really does bring the module back in step.
+		expect(reason).toContain('set_export_target');
+		svc.setExportTarget('lib/stale.py', target);
+		expect(readFileSync(py, 'utf8')).toContain('return 99');
+
+		// A call that really WRITES stays silent - the honesty field is only ever the
+		// cost of a call that changed nothing.
+		const wrote = svc.setCellExport([code[1]], true, target);
+		expect(wrote.ok && 'module' in wrote).toBe(false);
 	});
 
 	/**
@@ -754,9 +813,10 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 
 	/**
 	 * `exportPy` writes without going through `persist`, so it never refreshed the
-	 * record `autoExportPy` keeps. Left standing, a failure the user then FIXED and
-	 * resolved with the manual button was still reported by the next idempotent
-	 * `set_cell_export` - which skips the persist that would have cleared it.
+	 * record `regenerateExportModule` keeps. Left standing, a failure the user then
+	 * FIXED and resolved with the manual button was still reported by the next
+	 * idempotent `set_cell_export` - which skips the regeneration that would have
+	 * cleared it.
 	 */
 	it('a successful manual export clears a recorded failure', async () => {
 		const { target, code } = await makeNotebook('manual-clears.ipynb');
@@ -770,9 +830,14 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 		expect(nbmod.exportPy(target)).toMatchObject({ written: true });
 		expect(nbmod.lastExportError(target)).toBe(null);
 		// An idempotent call (already marked) persists nothing, so it can only read
-		// the record back - and it must no longer claim a failure that is over.
+		// the record back - and it must no longer claim a failure that is over. What
+		// it still says is the honest no-write fact, which is a different claim: the
+		// module is there, this call did not write it.
 		const again = svc.setCellExport([code[0]], true, target);
-		expect(again.ok && 'module' in again).toBe(false);
+		const reason = again.ok ? (again.module?.reason ?? '') : '';
+		expect(reason).not.toContain('could not be written');
+		expect(reason).not.toContain('not a directory');
+		expect(reason).toContain('wrote nothing');
 	});
 
 	/**

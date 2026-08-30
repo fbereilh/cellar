@@ -2135,8 +2135,15 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * the one that stays `setCellExport`-only (see `moduleWarning`); a hazard is a
  * surprise on either path, never a restatement of what the caller just did.
  *
- * Needs no `wrote`/exists gate of its own: with nothing marked there are no
- * hazards, so it is silent in exactly the case where no module was written.
+ * "WAS WRITTEN" IS A CLAIM, so this is only ever reached where a write really
+ * happened: `setExportTarget` always regenerates, and `moduleWarning` calls it
+ * only on its `wrote` branch. A call that wrote nothing says so instead - the
+ * hazards are computed from the MARKS, which are no longer necessarily what is on
+ * disk now that an ordinary save does not export, so asserting them ABOUT that
+ * file would describe a module this call never wrote.
+ *
+ * Needs no exists gate of its own: with nothing marked there are no hazards, so
+ * it is silent in exactly the case where no module was written.
  */
 function moduleHazard(target: string, exportTarget: string | null) {
 	if (!exportTarget) return {};
@@ -2166,17 +2173,28 @@ function moduleHazard(target: string, exportTarget: string | null) {
  * or NOTHING IS MARKED - `exportNotebookToPy` returns early with `no-cells`, so it
  * neither rewrites nor removes the file, and unmarking the last marked cell leaves
  * the previously exported symbols on disk where an `import` still resolves them -
- * or the call WROTE NOTHING and no module is on disk.
+ * or the call WROTE NOTHING, which is what `wrote` is for.
  *
- * That third case is what `wrote` is for. `lastExportError` is doc state this
- * process may never have written: an idempotent call (every addressed cell already
- * at the requested value) skips the persist entirely, so on a freshly opened doc -
- * after a restart, with the module since deleted or replaced outside Cellar - the
- * record is null, no field is emitted, and under the conditional contract that
- * absence reads as a module that WAS regenerated. A call that really did write is
- * already covered: it either succeeded, so the module is there, or it threw, which
- * `moduleFailure` reports - so only the no-write path consults the disk, and it
- * decides from what is actually there rather than from a record nobody wrote.
+ * THAT THIRD CASE IS REPORTED WHETHER OR NOT A MODULE IS ON DISK, and only the
+ * reason differs. An ABSENT `module` field says the file matches the marks, and
+ * that held solely because every save re-exported. It no longer does, so a
+ * re-mark of an already-marked cell - which persists nothing and regenerates
+ * nothing - would otherwise vouch for a module assembled from sources the user has
+ * since edited. The two spellings state what is KNOWN and nothing beyond it: with
+ * no module of ours there, that there is none; with one there, that it is whatever
+ * the last export left and may predate the current cell sources. Neither asserts
+ * the file IS stale - this call cannot see that - and neither is folded into
+ * `moduleFailure`, which means something else entirely (nothing was written
+ * BECAUSE the write threw). Both name the one call an agent has that always
+ * regenerates, which is also what INSTRUCTIONS clause 5 tells it.
+ *
+ * `lastExportError` cannot stand in for any of it: it is doc state this process
+ * may never have written, so on a freshly opened doc - after a restart, with the
+ * module since deleted or replaced outside Cellar - the record is null. A call
+ * that really did write is already covered: it either succeeded, so the module is
+ * there and holds these marks, or it threw, which `moduleFailure` reports - so
+ * only the no-write path consults the disk, and it decides from what is actually
+ * there rather than from a record nobody wrote.
  *
  * A FOURTH case is reported through the same field but says the opposite thing, so
  * it carries its own key (`warning`, never `reason`): the module IS on disk as the
@@ -2217,17 +2235,23 @@ function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean
 	if ('module' in failed) return failed;
 	if (!exportTarget) return {};
 	if (exportCellCount(listCells(target))) {
-		if (!(wrote || generatedModuleExists(exportTarget)))
-			return {
-				module: {
-					regenerated: false as const,
-					reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - re-call set_export_target with ${setExportTargetArgs(where)} to write it (that call always regenerates; editing a cell does not)`,
-					warning: undefined
-				}
-			};
-		// The module matches the marks (the gate above) - so the remaining question is
-		// whether it can be IMPORTED.
-		return moduleHazard(target, exportTarget);
+		// A call that really WROTE assembled the module from the sources these marks
+		// name, so the file matches them and the remaining question is whether it can
+		// be IMPORTED. A call that wrote NOTHING knows only that: since an ordinary
+		// save no longer exports, whatever is on disk may predate the current cell
+		// sources, and an absent `module` field would claim the opposite.
+		if (wrote) return moduleHazard(target, exportTarget);
+		const remedy = (verb: string) =>
+			`re-call set_export_target with ${setExportTargetArgs(where)} to ${verb} it (that call always regenerates; editing a cell does not)`;
+		return {
+			module: {
+				regenerated: false as const,
+				reason: generatedModuleExists(exportTarget)
+					? `this call wrote nothing (the addressed cells already carried the requested value), so ${exportTarget} is whatever the last export left there and may predate the current cell sources - ${remedy('rewrite')}`
+					: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - ${remedy('write')}`,
+				warning: undefined
+			}
+		};
 	}
 	return {
 		module: {
