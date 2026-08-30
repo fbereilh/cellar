@@ -344,6 +344,22 @@ export function parseStringArray(text) {
 }
 
 /**
+ * A single-line quoted TOML string value, or null for anything else.
+ *
+ * The refusing sibling of `parseStringArray`, and refusing is the contract: a
+ * multi-line triple-quoted value, an array, an inline table, a number or a bare
+ * token is a legal TOML value this reader will not guess at, and a caller that
+ * cannot read a value must say so rather than substitute one. `unquote` handles
+ * both the basic and the literal quoting forms.
+ */
+export function parseTomlString(text) {
+	const t = text.trim();
+	if (t.startsWith('"""') || t.startsWith("'''")) return null;
+	if (!/^(".*"|'.*')$/s.test(t)) return null;
+	return unquote(t);
+}
+
+/**
  * Read a `key = value` assignment out of a table, using the span `parseTomlDoc`
  * already resolved (so a value continuing onto later lines - `args = [\n "mcp"\n]`
  * - is joined, and text that merely LOOKS like this key inside a multi-line

@@ -1,0 +1,288 @@
+# nbdev export directives: what Cellar reads, and where a directive target lands
+
+**Status:** SHIPPED.
+**Scope:** the NARROW slice the captain authorized on 2026-08-28 - Cellar reads nbdev's
+`#| export` directive as a source of a cell's export mark, and resolves a `#|default_exp`
+target through the project's `lib_path`. Everything else in the nbdev convergence menu was
+explicitly excluded; see §5.
+
+Background: `firstmate/data/cellar-nbdev-compat-scout/report.md` (§2.2, §2.3, §5.2, §6.1)
+is the investigation this implements. It is not repeated here.
+
+Measured against **nbdev 3.3.13 / fastcore 2.2.16**. Every claim below was driven through
+the real library, not remembered - the differential in `tests/unit/nbdev-directives.test.ts`
+is what keeps it honest, and it already caught one rule that reasoning got backwards.
+
+---
+
+## 1. Where the code is
+
+| Concern | Module |
+|---|---|
+| The `#\|` scanner (both directives, one rule) | `src/lib/nbdevDirectives.ts` (pure, browser-safe) |
+| Is this cell export-marked? | `src/lib/exportRole.ts` - `isExportCell`, `exportDirectiveOwnsCell` |
+| Where does a `#\|default_exp` module land? | `src/lib/server/export-py.ts` - `storedExportTarget` / `directiveBase` |
+| nbdev's `lib_path` | `src/lib/server/nbdev.ts` - `nbdevLibPath` |
+| Refusals | `notebook.ts` `setCellExport`, the `PATCH /api/cells/[id]` route, MCP `set_cell_export` |
+
+Tests: `nbdev-directives` (the scanner + the differential), `nbdev-export-directive` (the
+mark, end to end through the real doc layer / exporter / agent surface),
+`nbdev-lib-path` (both resolution paths), `tests/e2e/nbdev-export-directive.spec.ts` (the
+browser-only honesty claim).
+
+---
+
+## 2. What counts as a directive
+
+nbdev reads directives from the **leading block** of a cell: the run of lines at the top
+that are `#|` lines, cell magics (`%%time`) or blank. The block ends at the first ordinary
+line - **a plain `# comment` ends it too**. So none of these is a directive to nbdev:
+
+```python
+x = 1
+#| export          # after code: the block already ended
+
+# a note
+#| export          # after a plain comment: same
+
+s = '''
+#| export          # inside a string: the assignment ended the block
+'''
+```
+
+Cellar's previous `#|default_exp` scan was a `/m` regex over the whole source and honoured
+all three. That is the shape of the §5.2 defect: **a target resolved from text nbdev
+ignores, written to a file nbdev would never write.** Honouring half of nbdev is worse than
+honouring none.
+
+Other measured rules: the prefix is `\s*#\s*\|` (so `#|export`, `#| export`, `# | export`,
+indented with spaces or a tab, CRLF); the name runs to the first whitespace or colon; the
+literal value `true` normalizes to bare, so `#| export` and `#| export: true` are the same
+thing; names are **case-sensitive**; and a repeated name is **LAST**-wins (nbdev builds a
+dict over the block, so a later line overwrites an earlier one - the obvious first-wins
+guess is wrong, and the differential is what caught it).
+
+**The narrowing is REPORTED, not silent.** The rule stays nbdev's - what nbdev ignores,
+Cellar ignores - but a notebook whose `#|default_exp` sat after code (which the old `/m`
+regex honoured) used to generate a committed module and now generates none, and with no
+target AND no error the export bar reads exactly like a notebook that never configured one
+while the module on disk quietly goes stale. So when nothing at all resolves and a
+`#|default_exp` line exists OUTSIDE its cell's leading block, that is reported through the
+EXISTING `exportResolveError` channel (`nbdevDirectiveOutsideBlock` +
+`misplacedDefaultExpError`), naming the line, that nbdev ignores it there too, and both ways
+out. No new surface, and no leniency in the RULE: the detection runs ONLY on the no-target
+fallback, behind the same `includes('default_exp')` guard, and only for a cell that already
+yielded no usable directive - so a notebook that resolves normally, and the far commoner one
+with no export configured at all, pay nothing.
+
+Two further rules keep that report honest rather than nagging:
+
+**It speaks only when a cell is MARKED.** The harm is a module the marks describe landing
+nowhere; a notebook that marks nothing never asked for one, so a tutorial DEMONSTRATING
+nbdev's directives - or a `#|default_exp` quoted inside a docstring - gets silence rather
+than a standing sentence on the always-visible export bar asserting "no module is being
+generated". Under-reporting is the safe direction for a notice (`server/nbdev.ts` states the
+same for the sibling nbdev warning), and one users learn to ignore protects nothing. The gate
+is on the REPORT only - the leading-block rule is untouched.
+
+**It refreshes on the source edit it prescribes.** `exportResolved`/`exportResolveError` were
+written only by `load()` and by `notebook:export-target`, which only the setters emit - so
+moving the line to the top of its cell left the message standing until a reload, i.e. the fix
+read as having failed. The per-persist push now carries the RESOLUTION alongside the hazards
+(`publishExportDerived` -> `notebook:export-derived`), on ONE event: both are derived from the
+same document by the same resolve, and two channels carrying overlapping derived state is how
+the halves come to disagree. It deliberately carries no `target`/`base` - those are the stored
+setting, and their `notebook:export-target` event is `originId`-suppressed precisely so the
+tab that typed a value is not fighting its own echo mid-edit.
+
+---
+
+## 3. The mark: which source wins, and why the question has no answer to argue about
+
+nbdev's rule is comments-beat-metadata (`fastcore/nbio.py` `_directives_get`). Cellar's is
+metadata-first. Those look like they must be reconciled. **For this flag they do not**,
+because neither source can express a NEGATION:
+
+- nbdev's `#| export` is presence-only. There is no "not exported" directive.
+- Cellar's flag is presence-only too: `setCellExports` DELETES the key rather than storing
+  `false`, and `isExportCell` is a strict `=== true`, so an absent flag and a hand-edited
+  `false` already read alike.
+
+With no way to say "no", comments-win, metadata-win and union are the **same function** on
+the values that can occur. A cell is exported if either says so. That is what made this
+settleable without a product call: the disagreement the two designs appear to have is not
+reachable.
+
+### 3.1 Marking stays metadata-only - the decision that IS a decision
+
+Toggling export in Cellar **never writes a `#|` line into the user's source.** Source is
+code the kernel runs and git diffs; the whole reason the flag lives in `metadata.cellar` is
+that clean-on-save preserves that namespace byte-for-byte.
+
+The consequence is that a directive-marked cell **cannot be unmarked from Cellar**, and
+every surface says so rather than reporting a change the notebook did not take:
+
+- `setCellExport` returns `{ok:false, reason:'export-directive-owns-cell'}`.
+- `PATCH /api/cells/[id]` answers 409 with that reason. Its siblings (`no-such-cell`,
+  `not-code`) stay silent exactly as before - widening those is a separate change.
+- MCP `set_cell_export` refuses all-or-nothing, naming the handle the agent supplied and
+  the line to remove.
+- The row toggle shows **ON** (an unticked control over a cell the exporter writes is the
+  lie this exists to avoid) and stays **live** rather than `disabled`: a disabled button
+  gets no pointer events, so its `title` could never be hovered and the one thing the user
+  needs - which line to remove - would be unreachable. Clicking declines on the shell's
+  notice line. Same live-control-that-explains-itself stance the Databricks card takes.
+
+**The remedy is CONDITIONAL, because "remove that line" is not always true.** A cell can
+carry BOTH marks (mark it in Cellar, then let the directive arrive on its source - an agent
+edit, a pull, a hand edit). `setCellExports` skips a directive-owned cell in BOTH
+directions, so in that state the flag cannot be cleared either and removing the line alone
+still leaves the cell exported. The condition lives ONCE, in `exportRole.ts`'s
+`exportMarkedTwice`, and the three surfaces that carry the sentence each branch on it in
+their own voice. The server hands the answer to the client ON the refusal (`alsoFlagged`)
+rather than letting it re-derive one: a tab only sends the call because it believed the cell
+was not directive-owned, so the source it would inspect is the stale copy that made it
+wrong.
+
+Clearing the metadata half instead would leave the cell exported with the toggle bouncing
+straight back to ON. MARKING a directive-marked cell is an honest no-op: it is already
+exported, so the call is satisfied and nothing is written.
+
+The explanation rides `title`, not `aria-label`: the label stays STABLE across states (the
+state is `aria-pressed`'s job), and a browser exposes `title` as the accessible DESCRIPTION
+beside that name.
+
+---
+
+## 4. `#|default_exp` and `lib_path`
+
+nbdev's `default_exp` names a **dotted module measured from `lib_path`** - not a path
+measured from anywhere Cellar knows. Cellar resolved it workspace-relative, so opening
+nbdev's own `nbs/api/04_export.ipynb` and marking a cell wrote a stray `export.py` at the
+workspace root while the project's real module is `nbdev/export.py`.
+
+The rule, measured: `lib_path` is `[tool.nbdev].lib_path` when present, else
+`[project].name` with `-` folded to `_`; either way it is resolved against the **directory
+holding the `pyproject.toml`**, and an absent project name degenerates to that directory.
+
+`directiveBase` re-expresses the module workspace-relative and keeps the reported base as
+`workspace`. That is deliberate: it keeps `ResolvedExportTarget`'s own invariant literally
+true (`path` measured from `base` yields `target`), keeps every consumer correct - the MCP
+remedy string included - without widening the persisted `ExportBase` vocabulary the UI
+select is built from, and **leaves the name `nbdev` free for the fourth persisted base**
+scout §6.1 proposes. The derivation is the same kind this branch always did (a dotted
+module is not a stored path either), just measured from the root nbdev actually uses.
+
+**Outside an nbdev project nothing changes.** A directive target stays workspace-relative,
+byte for byte, so no existing notebook moves. That is asserted as a positive, not implied.
+
+**Refusing rather than degrading.** An nbdev project whose `lib_path` cannot be read with
+confidence (an inline `[tool.nbdev]`, unparseable TOML, a non-string value) makes the
+directive target UNRESOLVABLE rather than workspace-relative - falling back is the
+wrong-file write above. The escape hatch is untouched: an explicit
+`metadata.cellar.export_target` never consults any of this.
+
+A `lib_path` OUTSIDE the workspace is refused by the existing containment guard - and that
+is the COMMON real nbdev layout, not an edge case: opening Cellar in `nbs/` while
+`lib_path` is a sibling puts the module outside the tree Cellar serves. Refusing is
+strictly better than the pre-fix stray `nbs/core.py` nbdev knows nothing about, but the
+guard's own "path escapes workspace" is nothing a user can act on, so the refusal names the
+layout and both ways out (open Cellar at the project root, or set an explicit target).
+Opening Cellar AT the project root - where `pyproject.toml` is - is the case that works,
+and it was verified side by side against real `nb_export`: same file, same cells, same
+`__all__`.
+
+**Cost.** Only a notebook carrying a `#|default_exp` directive ever asks, so an ordinary
+Cellar notebook pays nothing. For those that do, the answer is cached on a short TTL
+(`listWorktreesAt`'s tier, for its reason). Deliberately not memoized for the process
+lifetime the way `preflight` is: repo identity does not change, a project's `lib_path` can.
+
+**Stated limit:** nbdev also merges a user-level `~/.config/nbdev/config.toml` under the
+project's `[tool.nbdev]`. Not modelled - project config wins wherever it is present, and
+the failure is visible rather than silent.
+
+---
+
+## 5. What is deliberately NOT read, and what that costs
+
+Only a **bare** `#| export`, and only that exact name.
+
+| Directive | nbdev's module behaviour (measured) | Cellar |
+|---|---|---|
+| `export` | module code + `__all__` | **read as a mark** |
+| `exports` | module code + `__all__` - *identical for the module*; differs only in docs rendering | not read |
+| `exporti` | module code, NOT in `__all__` | not read |
+| `exportd` | docstring, not module code | not read |
+| `export <module>` | a SECOND module beside the `default_exp` one | not read |
+
+`exporti` and `exportd` genuinely cannot be expressed by a single boolean, and a wrong
+guess writes an unwanted public name or a markdown blob into a file that is committed to
+git. A valued `#| export other` names a module Cellar's one-target-per-notebook model
+cannot express, so reading it as a mark would be the §5.2 wrong-file write reached from
+the cell side.
+
+**`exports` is the one worth flagging back.** The captain's exclusion rested on "Cellar's
+single boolean cannot express them", and for `exports` that premise is FALSE as measured -
+it is module-identical to `export`, so recognising it is a one-line change needing no new
+modelling. It is left unread because the increment's scope names it; widening it is a
+decision, not an oversight.
+
+**The cost, stated plainly:** a module Cellar generates for such a notebook omits those
+cells, so a marked cell calling an `exporti` helper yields a module that raises
+`NameError` on import. That is not a regression - Cellar saw ZERO nbdev marks before - but
+it is a real limit. The clobber guard in `export-py.ts` (refusing to overwrite a file that
+does not start with Cellar's header) is what stops it damaging an existing nbdev module.
+
+### 5.0 Opening an ESTABLISHED nbdev repo writes nothing, and that is an outcome
+
+Reading `#| export` as a mark changed what happens on an export in nbdev's own
+repositories, and the consequence is worth stating because it is the feature's primary use
+case. Before, such a notebook had a `#|default_exp` TARGET but zero marked cells, so
+`exportNotebookToPy` returned `no-cells` and never reached the write. Now the marks are
+real, so every export reaches it - and the module already on disk carries **nbdev's**
+header, not Cellar's, so the clobber guard declines.
+
+The guard itself is unchanged: **Cellar never overwrites a file it did not generate.** What
+changed is how that refusal is REPORTED. It is a first-class not-written outcome
+(`ExportResult.reason === 'foreign-module'`) rather than a throw, because the refusal is the
+STEADY STATE of such a repository rather than a fault: every export reaches it, so as an
+error it answered the Export button with a failure and set `doc.lastExportError` on the two
+BEST-EFFORT explicit callers (`setExportTarget`, `setCellExports`) - a channel only MCP's
+`moduleFailure` reads, so an agent saw a fault and a human saw nothing at all. As an
+outcome, no error is recorded, the manual Export button still says why nothing was written,
+and MCP's `module.reason` - on BOTH export write tools, through one shared helper, since
+either can trigger the regeneration - names the same cause and the same two remedies (point
+the target at a path Cellar owns, or remove that file). An EMPTY file at the target is still
+overwritten, and a file that cannot be READ is still an error - neither was verified as
+foreign.
+
+A hazard may not speak over it either. It describes the module these marks make - and MCP's
+`moduleHazard` says outright that the target WAS written - so over a write the guard
+declined it describes a file that does not and will not exist. The foreign-module
+question is therefore asked BEFORE the hazard, and the precedence is expressed ONCE, in
+`docExportHazards`, which the export bar (through `exportTargetView`) and MCP's
+`moduleHazard` (through `exportHazardsFor`) both read. It costs a file read only once there
+IS a hazard to suppress, so the ordinary `getNotebook` / persist path is untouched.
+
+The steady state is therefore: Cellar reads such a notebook correctly (the marks, the
+target under `lib_path`) and writes nothing into the library, which is the safe direction.
+Regenerating nbdev's own modules is not in this slice. Export-on-every-save was the deeper
+problem this refusal used to expose; it was filed as its own change and has since landed
+(the module is written by an explicit action and never by a save), so the refusal is now
+reached only when someone ASKS for an export - which is exactly the caller that can be told
+about it. Nothing here changed that cadence.
+
+### 5.1 Known cosmetic divergence: the directive line survives into the module
+
+nbdev STRIPS directives from an exported cell's source (`remove_directives`); Cellar emits
+each marked cell's source VERBATIM, so a generated module carries the `#| export` line as a
+leading comment. Verified side by side against real nbdev on the same project: the two agree
+on the FILE, on WHICH cells, and on `__all__` (`topLevelNames` ignores the comment) - only
+the emitted body differs, and it differs by design already (header, cell markers,
+docstring; scout §6.3 argues byte-equality is the wrong goal). It is a comment in valid
+Python, and stripping source is a change to what the exporter EMITS rather than to what it
+reads, so it is recorded rather than done here.
+
+Also out of this slice, per the captain: the docs-pipeline directives (`hide`, `hide_line`,
+`echo`, `output`, `code-fold`, `eval: false`, `exec_doc`, `filter_stream`); mirroring
+Cellar metadata into `metadata.nbdev`; and adopting nbdev's exporter or tooling.

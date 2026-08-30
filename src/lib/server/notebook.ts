@@ -36,7 +36,7 @@ import {
 	type ResolvedExportTarget
 } from './export-py';
 import type { ExportHazard } from '../exportHazard';
-import { canExportCell } from '../exportRole';
+import { canExportCell, exportDirectiveOwnsCell, exportMarkedTwice } from '../exportRole';
 import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
@@ -212,14 +212,15 @@ function setImportBindings(
  * A SAVE WRITES THE NOTEBOOK AND NOTHING ELSE. It deliberately does NOT
  * regenerate the nbdev-style `.py` module: that is `regenerateExportModule`, and
  * only the three EXPLICIT export-flow actions call it (see its header). What it
- * does still owe the export surfaces is the HAZARD broadcast, because a hazard is
- * a fact about the marked CELLS - which a save is exactly what changes - not
- * about the file on disk (see `publishExportHazards`).
+ * does still owe the export surfaces is the DERIVED broadcast - the target's
+ * resolution and the marks' compile hazards - because both are facts about the
+ * document, which a save is exactly what changes, not about the file on disk
+ * (see `publishExportDerived`).
  */
 function persist(doc: NotebookDoc): void {
 	if (doc.jpFormat) writePyNotebook(doc.path, doc.cells, doc.jpFormat);
 	else writeNotebook(doc.path, doc);
-	publishExportHazards(doc);
+	publishExportDerived(doc);
 }
 
 /**
@@ -275,7 +276,8 @@ function regenerateExportModule(doc: NotebookDoc): void {
 }
 
 /**
- * Broadcast the export's compile hazards when - and only when - they CHANGE.
+ * Broadcast everything the export DERIVES - the target's RESOLUTION and the marks'
+ * compile HAZARDS - when, and only when, they CHANGE.
  *
  * A HAZARD IS A FACT ABOUT THE MARKED CELLS, NOT ABOUT THE FILE ON DISK:
  * `docExportHazards` reads the document, never the module, so it answers "the
@@ -283,45 +285,65 @@ function regenerateExportModule(doc: NotebookDoc): void {
  * exported yet. That is why it is still published from `persist` now that the
  * export itself is EXPLICIT (`regenerateExportModule`): a save is exactly what
  * creates a hazard - editing a marked cell, or marking a cell that already holds
- * one - and the warning is worth more BEFORE the user exports than after.
- * Recomputing in `getNotebook` alone would leave the export bar stale until the
- * next `load()` (a reconnect, a seq gap, a restore) - i.e. usually never - so the
- * change is pushed like any other structural fact.
+ * one - and the warning is worth more BEFORE the user exports than after. The
+ * RESOLUTION is the same kind of fact and moves the same way, under the user's
+ * hands and nowhere near the export button: it moves the moment a `#|default_exp`
+ * line is added, removed, or shifted into (or out of) its cell's leading directive
+ * block, with no setter involved. Recomputing in `getNotebook` alone would leave
+ * the export bar stale until the next `load()` (a reconnect, a seq gap, a restore)
+ * - i.e. usually never - so the change is pushed like any other structural fact.
  *
- * The surfaces must therefore word it as a claim about what an export WOULD
- * produce, never as "the module was written and will not import": under explicit
- * export there may be no such file yet. `$lib/exportHazard`'s own message already
- * says "the module will not import", which reads correctly either way.
+ * The surfaces must therefore word the hazard as a claim about what an export
+ * WOULD produce, never as "the module was written and will not import": under
+ * explicit export there may be no such file yet. `$lib/exportHazard`'s own message
+ * already says "the module will not import", which reads correctly either way.
  *
- * Cheap by construction: computed behind a `__future__` substring pre-check over
- * MARKED cells only, and compared before publishing, so an ordinary notebook's
- * every-keystroke autosave emits nothing at all. The event carries no `originId`
- * on purpose - this is DERIVED state, not an echo of one tab's action, so every
- * tab (the initiating one included) must render it.
+ * BOTH halves ride ONE push, and that is the point rather than a convenience. They
+ * are derived from the same document by the same resolve, they are rendered by the
+ * same bar in a fixed precedence (an unresolvable target outranks a hazard), and
+ * two events carrying overlapping derived state is exactly how the two halves come
+ * to describe one notebook differently. The resolve is computed ONCE here and
+ * threaded into `docExportHazards`, so folding the resolution in costs nothing -
+ * that function resolved for itself before.
  *
- * Deliberately NOT folded into `notebook:export-target`: that event is about the
- * target, this is about the marked cells' content, and they move independently.
+ * It carries only what is DERIVED, never the STORED `export_target`/`export_base`:
+ * those change solely through `setExportTarget`/`setExportBase`, which emit
+ * `notebook:export-target` WITH an `originId` so the tab that typed the value is
+ * not fighting its own echo mid-edit. Putting them here too would arrive
+ * un-suppressed inside that setter's own persist and clobber a field the user may
+ * have typed on since. The two events are therefore disjoint: stored settings
+ * there, derived readings here.
+ *
+ * Cheap by construction: the hazard half is computed behind a `__future__`
+ * substring pre-check over MARKED cells only, and the whole state is compared
+ * before publishing, so an ordinary notebook's every-keystroke autosave emits
+ * nothing at all. The event carries no `originId` on purpose - this is DERIVED
+ * state, not an echo of one tab's action, so every tab (the initiating one
+ * included) must render it.
  *
  * The comparison is STRICT against the raw field and may never coerce the
  * `undefined` sentinel to `''`: a doc that has NEVER broadcast is not a doc whose
- * last broadcast carried no hazards. `loadDoc` never persists, so a notebook that
- * arrives from disk ALREADY holding a hazard seeds the browser with it through
- * `getNotebook` -> `exportTargetView` while this field is still unset - and
- * coerced, the user's FIX (the first persist since load) compared `''` against
- * `''`, returned here, and left the bar asserting a module will not import after
- * it had been repaired. The cost of the strict test is exactly ONE extra
- * empty-hazards event per document lifetime; the change-only rule above exists to
- * spare an event per KEYSTROKE, not per document. Seeding the key from
- * `getNotebook` instead is the WRONG repair - that is a READ, served to SSR and
- * to the agent surface with no browser attached, so it would suppress the event
- * for a client that never received the seed.
+ * last broadcast carried nothing. `loadDoc` never persists, so a notebook that
+ * arrives from disk ALREADY holding a hazard (or an unresolvable target) seeds the
+ * browser with it through `getNotebook` -> `exportTargetView` while this field is
+ * still unset - and coerced, the user's FIX (the first persist since load)
+ * compared `''` against `''`, returned here, and left the bar asserting a module
+ * will not import after it had been repaired. The cost of the strict test is
+ * exactly ONE extra empty event per document lifetime; the change-only rule above
+ * exists to spare an event per KEYSTROKE, not per document. Seeding the key from
+ * `getNotebook` instead is the WRONG repair - that is a READ, served to SSR and to
+ * the agent surface with no browser attached, so it would suppress the event for a
+ * client that never received the seed.
  */
-function publishExportHazards(doc: NotebookDoc): void {
-	const hazards = docExportHazards(doc);
-	const key = hazards.map((h) => h.message).join('\u0000');
-	if (key === doc.lastExportHazardKey) return;
-	doc.lastExportHazardKey = key;
-	emit(doc, 'notebook:export-hazards', { hazards });
+function publishExportDerived(doc: NotebookDoc): void {
+	const info = resolveExportTarget(doc);
+	const resolved = info && info.ok ? info.target : null;
+	const resolveError = info && !info.ok ? info.error : null;
+	const hazards = docExportHazards(doc, info);
+	const key = [resolved ?? '', resolveError ?? '', ...hazards.map((h) => h.message)].join('\u0000');
+	if (key === doc.lastExportDerivedKey) return;
+	doc.lastExportDerivedKey = key;
+	emit(doc, 'notebook:export-derived', { resolved, resolveError, hazards });
 }
 
 /**
@@ -980,6 +1002,29 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
 }
 
 /**
+ * Why a `setCellExport` call did not take. `not-code` is the pre-existing
+ * eligibility refusal, `export-directive-owns-cell` the one this rule adds.
+ */
+export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directive-owns-cell';
+
+/**
+ * A refused `setCellExport`, and - for the directive case - whether Cellar's own
+ * flag marks the cell TOO (`exportMarkedTwice`), because the two states have
+ * different REMEDIES and only the server can tell them apart.
+ *
+ * The client reaches its own refusal only when it believed the cell was NOT
+ * directive-owned, which by construction means the source it holds is the stale
+ * copy that made it wrong - so it cannot derive this, and a local guess would emit
+ * the single-mark sentence ("remove that line to stop exporting it") over a cell
+ * where removing the line changes nothing. So the answer travels OUT of here, is
+ * put in the 409 body by the PATCH route, and is preferred over any client
+ * derivation. MCP's `set_cell_export` carries the same fact under the same name.
+ */
+export type SetCellExportResult =
+	| { ok: true }
+	| { ok: false; reason: SetCellExportRefusal; alsoFlagged?: boolean };
+
+/**
  * Mark (or unmark) a code cell for nbdev-style export in the allowlisted `cellar`
  * namespace, so the flag round-trips through clean-on-save. Only a code cell can
  * carry it (a markdown/SQL cell has no module source). Choosing what is IN the
@@ -988,16 +1033,34 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
  *
  * This IS `setCellExports` of one - one implementation, one rule - so the UI's
  * per-cell toggle and MCP's batch tool cannot drift about what marking means.
- * Returns whether the cell now carries the requested value (false = there is no
- * such cell, or marking a non-Python one, which `isExportCell` would ignore).
+ * Reports whether the cell now carries the requested value, and WHY when it does
+ * not - a plain boolean could not tell "no such cell" from "the source's `#| export`
+ * keeps it exported", and the PATCH route has to say which, or a refusal reads as
+ * the wrong one. `not-code` is marking a non-Python cell, which `isExportCell`
+ * would ignore anyway.
  */
-export function setCellExport(id: string, exported: boolean, nb?: string | null, originId?: string | null): boolean {
+export function setCellExport(
+	id: string,
+	exported: boolean,
+	nb?: string | null,
+	originId?: string | null
+): SetCellExportResult {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
-	if (!cell) return false;
-	if (exported && !canExportCell(cell)) return false;
+	if (!cell) return { ok: false, reason: 'no-such-cell' };
+	if (exported && !canExportCell(cell)) return { ok: false, reason: 'not-code' };
+	// The source owns the mark (see `setCellExports`). A MARK request is already
+	// satisfied - the cell really is exported - so it is an honest no-op; an UNMARK
+	// is refused, because nothing Cellar may write would take the mark away.
+	//
+	// `alsoFlagged` rides the refusal because the REMEDY differs and only this side
+	// can see it - see `SetCellExportResult`.
+	if (exportDirectiveOwnsCell(cell))
+		return exported
+			? { ok: true }
+			: { ok: false, reason: 'export-directive-owns-cell', alsoFlagged: exportMarkedTwice(cell) };
 	setCellExports([id], exported, nb, originId);
-	return true;
+	return { ok: true };
 }
 
 /**
@@ -1042,6 +1105,21 @@ export function setCellExports(
 		const cell = find(doc, id);
 		if (!cell) continue;
 		const marked = cell.metadata?.cellar?.export === true;
+		// nbdev's `#| export` in the SOURCE marks this cell, and Cellar never writes a
+		// directive (source is code the kernel runs and git diffs; the flag lives in
+		// `metadata.cellar` precisely because clean-on-save preserves it byte-for-byte).
+		// So neither direction has anything honest to write here: the cell is already
+		// exported, and CLEARING the metadata half would not unmark it - it would leave
+		// the cell exported with the toggle bouncing straight back to ON, the exact lie
+		// the surfaces are written to avoid. Skipped in both directions, and REPORTED as
+		// a refusal by every caller (`setCellExport` above, the PATCH route, MCP's
+		// `set_cell_export`) rather than answered with a success that changed nothing.
+		//
+		// Asked through `exportDirectiveOwnsCell`, which is the ELIGIBILITY-gated rule
+		// `isExportCell` itself applies: on a markdown/SQL/raw cell the exporter ignores
+		// the directive entirely, so such a cell is NOT exported and skipping it here
+		// would refuse to clear a stale hand-edited flag it really does carry.
+		if (exportDirectiveOwnsCell(cell)) continue;
 		if (exported) {
 			if (!canExportCell(cell) || marked) continue;
 			cell.metadata = cell.metadata ?? {};
@@ -1084,8 +1162,11 @@ export function getExportTarget(nb?: string | null): string | null {
 /**
  * The target the EXPORTER will actually write to, resolved through its base:
  * the notebook-level `export_target` + `export_base`, or - when there is none -
- * a `#|default_exp <module>` directive in any code cell (nbdev's own spelling,
- * always workspace-relative). This is `resolveExportTarget`'s rule REUSED,
+ * a `#|default_exp <module>` directive read from a code cell's LEADING BLOCK
+ * (nbdev's own spelling and nbdev's own scanning rule). Such a target is measured
+ * from the project's `lib_path` in an nbdev project and merely RE-EXPRESSED
+ * workspace-relative for reporting; `docs/design/nbdev-export-directives.md` is the
+ * durable record of both halves. This is `resolveExportTarget`'s rule REUSED,
  * never a second copy, so a caller reporting where the marks land can never
  * disagree with where they go. Null when nothing is configured - a configured
  * target that cannot RESOLVE is its own `ok:false` shape, kept distinct so it
@@ -1494,9 +1575,9 @@ export function exportPy(nb?: string | null): ExportResult {
 	} finally {
 		// This path writes the module WITHOUT going through `persist`, so it owes the
 		// same broadcast - in a `finally`, because a throw here still leaves the marks
-		// (and therefore the hazards) exactly as this call found them, and a bar left
-		// describing an older set is the staleness the push exists to remove.
-		publishExportHazards(doc);
+		// (and therefore the derived state) exactly as this call found them, and a bar
+		// left describing an older reading is the staleness the push exists to remove.
+		publishExportDerived(doc);
 	}
 }
 

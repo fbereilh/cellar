@@ -166,8 +166,14 @@ describe('each of the three EXPLICIT actions still writes it', () => {
 describe('an established nbdev repository - the case that made export explicit', () => {
 	/**
 	 * The target names a module some other tool generated, so Cellar's clobber
-	 * guard refuses it. That refusal is right; what was wrong was WHEN it happened
+	 * guard declines it. That refusal is right; what was wrong was WHEN it happened
 	 * and WHERE it went.
+	 *
+	 * It is a first-class not-written OUTCOME (`reason:'foreign-module'`), not a
+	 * throw: with nbdev's `#| export` directive read as a mark, every notebook in
+	 * such a repo HAS marks, so as an error it would record `lastExportError`
+	 * forever on the two best-effort callers and answer the button with a failure -
+	 * for a file no export of Cellar's could ever legitimately write.
 	 */
 	async function nbdevRepo(name: string) {
 		const setup = await exportingNotebook(name, 'E = 1', { mark: false });
@@ -178,11 +184,13 @@ describe('an established nbdev repository - the case that made export explicit',
 
 	it('a SAVE no longer reaches for it: the file is untouched and no failure is recorded', async () => {
 		const { nb, cell, mod } = await nbdevRepo('nbdev-save.ipynb');
-		nbmod.setCellExports([cell], true, nb); // explicit, so this one DOES try - and is refused
-		expect(nbmod.lastExportError(nb)).toMatch(/not a Cellar-generated module/);
+		nbmod.setCellExports([cell], true, nb); // explicit, so this one DOES try - and is declined
+		// Declined as an OUTCOME, so nothing lands in the record only the agent
+		// surface reads. The tools report it from `ExportResult.reason` instead.
+		expect(nbmod.lastExportError(nb)).toBe(null);
 
-		// The point is that a SAVE neither retries the refused write nor re-records it
-		// - which is what used to happen on every keystroke, invisibly.
+		// The point is that a SAVE does not reach for the module at all - which is
+		// what used to happen on every keystroke, invisibly.
 		const before = readFileSync(modulePath(mod), 'utf8');
 		nbmod.setSource(cell, 'E = 2', nb);
 		nbmod.setSource(cell, 'E = 3', nb);
@@ -193,11 +201,14 @@ describe('an established nbdev repository - the case that made export explicit',
 		const { nb, cell, mod } = await nbdevRepo('nbdev-explicit.ipynb');
 		nbmod.setCellExports([cell], true, nb);
 
-		// `exportPy` THROWS rather than recording, so the route answers 400 and the
-		// message lands on the notice channel of the click. That is the whole point of
-		// making the export explicit: the refusal now has an obvious home.
-		expect(() => nbmod.exportPy(nb)).toThrow(/refusing to overwrite/);
-		expect(() => nbmod.exportPy(nb)).toThrow(/not a Cellar-generated module/);
+		// `exportPy` returns the refusal rather than a plain success, so the click
+		// that asked gets a named reason on its notice channel and the button never
+		// reads as a dead control. That is the whole point of making the export
+		// explicit: the refusal has an obvious home.
+		const res = nbmod.exportPy(nb);
+		expect(res.written).toBe(false);
+		expect(res.reason).toBe('foreign-module');
+		expect(res.target).toBe(mod);
 		// ...and the user's own file is intact.
 		expect(readFileSync(modulePath(mod), 'utf8')).toContain('def existing():');
 	});
@@ -239,7 +250,7 @@ describe('hazards still reach the bar on a SAVE, even though a save does not exp
 	async function captured(fn: () => Promise<void> | void) {
 		const seen: Array<{ nb: string; hazards: unknown[] }> = [];
 		const off = events.subscribe((e: Record<string, unknown>) => {
-			if (e.type === 'notebook:export-hazards') seen.push(e as never);
+			if (e.type === 'notebook:export-derived') seen.push(e as never);
 		});
 		try {
 			await fn();

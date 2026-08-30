@@ -25,7 +25,7 @@
 		selectionAfterRemoval,
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
-	import { exportCellCount, isExportCell } from '$lib/exportRole';
+	import { exportCellCount, exportDirectiveOwnsCell, exportMarkedTwice, isExportCell } from '$lib/exportRole';
 	import { isExportBase } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
 	import type { ExportPyResult } from '$lib/types';
@@ -142,7 +142,12 @@
 		| { type: 'cell:rendered'; cellId: string }
 		| { type: 'cell:edited'; cellId: string; source: string }
 		| { type: 'notebook:export-target'; target: string | null; base?: string; resolved?: string | null; resolveError?: string | null }
-		| { type: 'notebook:export-hazards'; hazards?: ExportHazard[] }
+		| {
+				type: 'notebook:export-derived';
+				hazards?: ExportHazard[];
+				resolved?: string | null;
+				resolveError?: string | null;
+		  }
 		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
 		| { type: 'notebook:hide-all-code'; hidden: boolean };
@@ -240,11 +245,13 @@
 	// Constructs in the MARKED cells that make the generated module uncompilable
 	// (`$lib/exportHazard`). Server-derived like the three fields above - the rule
 	// needs the Python line tokenizer, which is server-only - seeded on load and
-	// kept live by the `notebook:export-hazards` event, which the server publishes
-	// only when the set CHANGES. A hazard is a fact about the marked CELLS, so a
-	// SAVE is what creates one (editing a marked cell, or marking a cell that
-	// already holds one) even though a save no longer exports; the push is what
-	// lets the bar warn BEFORE the user presses Export.
+	// kept live, TOGETHER WITH `exportResolved`/`exportResolveError`, by the
+	// `notebook:export-derived` event, which the server publishes only when that
+	// state CHANGES. Both are facts about the DOCUMENT rather than about the file
+	// on disk, so a SAVE is what moves them - editing a marked cell, marking one
+	// that already holds a hazard, or editing a `#|default_exp` line - even though
+	// a save no longer exports; the push is what lets the bar say so BEFORE the
+	// user presses Export.
 	let exportHazards = $state<ExportHazard[]>([]);
 	let exportBaseBusy = $state(false);
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
@@ -1648,10 +1655,17 @@
 			exportResolved = ev.resolved ?? null;
 			exportResolveError = ev.resolveError ?? null;
 			exportTarget = ev.target;
-		} else if (ev.type === 'notebook:export-hazards') {
-			// DERIVED state, not an echo: the server publishes it whenever the marked
-			// cells' hazards change (on any save, and after a manual export), with no
-			// `originId`, so every tab - the one that just typed included - renders it.
+		} else if (ev.type === 'notebook:export-derived') {
+			// DERIVED state, not an echo: the server publishes it whenever what the
+			// marks and the target RESOLVE TO changes (on any save, and after a manual
+			// export), with no `originId`, so every tab - the one that just typed
+			// included - renders it. It carries no `target`/`base`: those are the
+			// STORED setting, owned by `notebook:export-target`, whose `originId` echo
+			// suppression is what keeps this push from clobbering a field mid-edit.
+			// Without this the misplaced-`#|default_exp` message survived the very
+			// source edit that fixed it, until a reload.
+			exportResolved = ev.resolved ?? null;
+			exportResolveError = ev.resolveError ?? null;
 			exportHazards = (ev.hazards ?? []) as ExportHazard[];
 		} else if (ev.type === 'notebook:root') {
 			// The code root changed in another tab or from an agent (this tab's own
@@ -1935,7 +1949,7 @@
 			if (
 				pe.type?.startsWith('cell:') ||
 				pe.type === 'notebook:export-target' ||
-				pe.type === 'notebook:export-hazards' ||
+				pe.type === 'notebook:export-derived' ||
 				pe.type === 'notebook:header-numbering' ||
 				pe.type === 'notebook:hide-all-code' ||
 				pe.type === 'notebook:root'
@@ -2441,6 +2455,29 @@
 	}
 
 	/**
+	 * What an export-directive refusal SAYS, whichever half refused - and it is
+	 * conditional because the remedy is. With only the directive marking the cell,
+	 * removing that line really does stop the export. With Cellar's own flag set too,
+	 * it does NOT: the flag still marks the cell and the exporter still writes it, so
+	 * the sentence has to name both marks rather than promise an outcome one of them
+	 * does not produce.
+	 *
+	 * It takes the ANSWER, never the cell, because the two callers know it in
+	 * different ways and only one of them can look it up. The optimistic mirror
+	 * asks `exportMarkedTwice` on the cell it can see, which is sound there - nothing
+	 * has contradicted that reading. The server backstop must use the flag the 409
+	 * carried, because it is reached only when this tab's copy of the source was
+	 * WRONG about the directive, and that same copy is what a local derivation would
+	 * read: it would answer "not marked twice" for every refusal, delivering the
+	 * single-mark remedy exactly where it is false.
+	 */
+	function exportDirectiveNotice(markedTwice: boolean): string {
+		return markedTwice
+			? 'That cell is marked for export twice - by an "#| export" line in its own source AND by Cellar\'s own flag. Remove that line, then unmark it here to clear the flag.'
+			: 'That cell is marked for export by an "#| export" line in its own source - remove that line to stop exporting it.';
+	}
+
+	/**
 	 * Mark (or unmark) a code cell for nbdev-style export to the `.py` module.
 	 * Applied optimistically here (reassign metadata so the badge/menu react) and
 	 * persisted server-side, which ALSO regenerates the module - not because a save
@@ -2462,6 +2499,31 @@
 	 */
 	async function setExport(id: string, exported: boolean) {
 		const cell = findCell(id);
+		// A cell whose SOURCE carries nbdev's `#| export` is marked by that line, and
+		// Cellar never writes a directive - so clearing the metadata half would leave
+		// the cell exported with the toggle bouncing straight back to ON. Refused here
+		// as well as on the server, and SAID on the shell's transient notice line rather
+		// than silently doing nothing: the `refuseUnsupportedType` shape, for its reason
+		// - a click that appears to do nothing reads as a bug. Nothing is applied and
+		// nothing is sent, so there is no optimistic state to revert.
+		//
+		// This is the OPTIMISTIC MIRROR, which spares the round trip; it cannot be the
+		// whole rule, because it reads `cell.source` and that value is deliberately NOT
+		// refreshed for a MOUNTED cell whose remote edit is stashed behind the "changed
+		// on server" banner. In that window the directive is on the server's copy and
+		// not on ours, so the server's own refusal below is what keeps the promise.
+		if (!exported && exportDirectiveOwnsCell(cell)) {
+			onNotice?.(exportDirectiveNotice(exportMarkedTwice(cell)));
+			return;
+		}
+		// Only whether THIS key was there, and what it held - never a snapshot of the
+		// whole `cellar` namespace, which is the rule `setHiddenFromAgent` already
+		// follows one control along: an SSE `cell:role`/`cell:hide-input`/
+		// `cell:visibility`, or a `load()` refetch, can rewrite that namespace while
+		// the request is in flight, and putting a pre-click copy back would silently
+		// undo a disclosure-shaped change this write never touched.
+		const hadExport = cell ? 'export' in (cell.metadata?.cellar ?? {}) : false;
+		const wasExport = cell?.metadata?.cellar?.export;
 		if (cell) {
 			const cellar = { ...(cell.metadata?.cellar ?? {}) };
 			if (exported) cellar.export = true;
@@ -2470,11 +2532,31 @@
 		}
 		if ((await settleCellEdits(moduleSourceIds(exported ? [id] : []))).includes('failed'))
 			onNotice?.(unsavedExportEditNotice('proceeding'));
-		await fetch(`/api/cells/${id}`, {
+		const res = await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ export: exported, nb: path, originId })
-		}).catch(() => {});
+		}).catch(() => null);
+		if (!res || res.ok) return;
+		// The SERVER-AUTHORITATIVE backstop for the refusal this tab could not predict.
+		// Decided from the route's OWN refusal shape, never from the status alone: a
+		// proxy 502/503 or an HTML error page landed no verdict, and claiming one would
+		// put the toggle back ON over a cell nothing said is exported.
+		const verdict = await res
+			.json()
+			.then((b) => (b as { reason?: string; alsoFlagged?: boolean } | null) ?? null)
+			.catch(() => null);
+		if (verdict?.reason !== 'export-directive-owns-cell') return;
+		// Looked up AGAIN, because a `load()` refetch replaces `cells` and the object
+		// the click read may no longer be the one on screen.
+		const c = findCell(id);
+		if (c) {
+			const cellar = { ...(c.metadata?.cellar ?? {}) };
+			if (hadExport) cellar.export = wasExport;
+			else delete cellar.export;
+			c.metadata = { ...(c.metadata ?? {}), cellar };
+		}
+		onNotice?.(exportDirectiveNotice(verdict.alsoFlagged === true));
 	}
 
 	/**

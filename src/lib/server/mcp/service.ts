@@ -53,14 +53,14 @@ import { consolidateImports, routeImports, runImportsCell } from '../imports-cel
 import { buildTree, resolveInWorkspace, workspaceRoot } from '../fstree';
 import { isPyPath, isPyNotebookFile } from '../jupytext';
 import { buildNotebookHtml, exportFilename } from '../export-html';
-import { generatedModuleExists } from '../export-py';
+import { generatedModuleExists, foreignModuleAt } from '../export-py';
 import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isPyUnsupportedType, isSqlCell, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
-import { isExportCell, canExportCell, exportCellCount } from '../../exportRole';
+import { isExportCell, canExportCell, exportCellCount, exportDirectiveOwnsCell, exportMarkedTwice } from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
@@ -1903,11 +1903,17 @@ export function setExportTarget(
 		return { ok: false as const, writeFailed: String((err as Error)?.message ?? err) };
 	}
 	const where = exportTargetFields(nbTarget);
-	// A failed write and an unimportable module are mutually exclusive (a failure
-	// means nothing was written), so the failure is asked first and the hazard only
-	// where there is a module to be about.
+	// Three mutually exclusive things can be true of the module this persist just
+	// tried to regenerate, and each rules out the ones after it: the write FAILED, a
+	// file Cellar did not generate OCCUPIES the target so the clobber guard declined,
+	// or a module really is there and cannot be IMPORTED. All three go through the
+	// same helpers `set_cell_export` uses - the two tools are a pair and must
+	// describe one document identically, never with a second copy of the sentence.
 	const failed = moduleFailure(nbTarget, where.export_target);
-	return { ...where, ...('module' in failed ? failed : moduleHazard(nbTarget, where.export_target)) };
+	if ('module' in failed) return { ...where, ...failed };
+	const foreign = moduleForeign(nbTarget, where.export_target);
+	if ('module' in foreign) return { ...where, ...foreign };
+	return { ...where, ...moduleHazard(nbTarget, where.export_target) };
 }
 
 /**
@@ -1988,6 +1994,25 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		if (!cell || isHidden(cell)) return { ok: false as const, missing: ref };
 		// Checked for the WHOLE batch before the first write - see all-or-nothing.
 		if (exported && !canExportCell(cell)) return { ok: false as const, notCode: ref };
+		// A cell whose SOURCE carries nbdev's `#| export` cannot be UNMARKED here:
+		// Cellar never writes a directive, so clearing the metadata half would leave
+		// the cell exported while the result claimed it was not. Reported by name, and
+		// all-or-nothing like its siblings - a batch that cannot fully take must not
+		// half-apply. MARKING such a cell is fine: it is already exported, so the call
+		// is satisfied and `setCellExportsDoc` simply writes nothing for it.
+		//
+		// `exportDirectiveOwnsCell` is the ELIGIBILITY-gated rule `isExportCell` itself
+		// applies, so an INELIGIBLE cell (markdown/SQL/raw) whose source merely opens
+		// with `#| export` is not reported as directive-owned: the exporter ignores it,
+		// so it is not exported and unmarking it still clears a stale flag.
+		//
+		// `alsoFlagged` rides along because the REMEDY differs: with Cellar's own flag
+		// set too the cell is marked twice and removing the line alone does not stop
+		// the export, so the tool's sentence may not promise that it does. Answered by
+		// the shared `exportMarkedTwice` rather than re-derived in `server.ts`, so the
+		// agent surface and the two human ones cannot say different things.
+		if (!exported && exportDirectiveOwnsCell(cell))
+			return { ok: false as const, exportDirective: ref, alsoFlagged: exportMarkedTwice(cell) };
 		seen.add(id);
 		full.push(id);
 	}
@@ -2120,6 +2145,37 @@ function moduleFailure(target: string, exportTarget: string | null) {
 }
 
 /**
+ * A file Cellar did NOT generate occupies the target, so the clobber guard
+ * declined and nothing was written (`ExportResult.reason === 'foreign-module'`).
+ *
+ * Shared by BOTH export write tools, like `moduleFailure` and `moduleHazard` and
+ * for a sharper version of the same reason: that refusal is an OUTCOME rather than
+ * a throw, so it sets no `lastExportError` and `moduleFailure` cannot see it. A
+ * tool that does not ask this question emits no `module` field at all, which under
+ * the conditional contract says the module WAS regenerated - the silent success
+ * this whole field exists to prevent, so both tools must ask, through one helper
+ * that describes the one document identically.
+ *
+ * Gated on a cell being marked, because that is what makes it a REFUSAL: with
+ * nothing marked `exportNotebookToPy` returns `no-cells` before it ever reaches the
+ * write, so a foreign file at the target was never declined and saying it was
+ * "left untouched" would describe an attempt that did not happen.
+ *
+ * Asked BEFORE `moduleHazard`, which would otherwise claim `<target> was written`
+ * about a write that never landed.
+ */
+function moduleForeign(target: string, exportTarget: string | null) {
+	if (!exportTarget || !exportCellCount(listCells(target)) || !foreignModuleAt(exportTarget)) return {};
+	return {
+		module: {
+			regenerated: false as const,
+			reason: `${exportTarget} was not generated by Cellar, so it was left untouched and no module describes these marks - Cellar never overwrites a file it did not write; re-call set_export_target with a path it owns, or delete that file`,
+			warning: undefined
+		}
+	};
+}
+
+/**
  * The module IS on disk as the marks describe it, and CANNOT BE IMPORTED: a marked
  * cell holds a construct that makes the assembled module uncompilable
  * (`$lib/exportHazard`). Empty whenever nothing is detected.
@@ -2235,6 +2291,13 @@ function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean
 	if ('module' in failed) return failed;
 	if (!exportTarget) return {};
 	if (exportCellCount(listCells(target))) {
+		// Asked FIRST, because every branch below describes a module a later export
+		// could write, and here none ever can: a file Cellar did not generate occupies
+		// the target, so the clobber guard declines it and re-calling `set_export_target`
+		// - the remedy those branches name - re-enters the same refusal forever. The
+		// remedy is to move the target or remove that file.
+		const foreign = moduleForeign(target, exportTarget);
+		if ('module' in foreign) return foreign;
 		// A call that really WROTE assembled the module from the sources these marks
 		// name, so the file matches them and the remaining question is whether it can
 		// be IMPORTED. A call that wrote NOTHING knows only that: since an ordinary

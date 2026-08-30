@@ -2,6 +2,21 @@ import { describe, it, expect, vi } from 'vitest';
 import { topLevelNames, generateModule, resolveExportTarget } from '../../src/lib/server/export-py';
 import type { NotebookDoc } from '../../src/lib/server/types';
 
+// The REAL scanner, counted at the module boundary `export-py.ts` calls it through -
+// which is what makes "resolves cheaply" an observation rather than an assertion
+// about an implementation detail. Behaviour is untouched: every call delegates.
+const scanner = vi.hoisted(() => ({ calls: 0 }));
+vi.mock('../../src/lib/nbdevDirectives', async (importOriginal) => {
+	const real = await importOriginal<typeof import('../../src/lib/nbdevDirectives')>();
+	return {
+		...real,
+		nbdevDirective: (source: string | null | undefined, name: string) => {
+			scanner.calls++;
+			return real.nbdevDirective(source, name);
+		}
+	};
+});
+
 describe('topLevelNames', () => {
 	it('collects top-level def / class / assignments, skips private + nested', () => {
 		const src = [
@@ -70,24 +85,141 @@ describe('resolveExportTarget', () => {
 		expect(resolveExportTarget(doc({}))).toBeNull();
 	});
 
-	it('refuses cheaply, running no regex over a notebook that mentions no directive', () => {
+	it('refuses cheaply, never reaching the scanner for a notebook that mentions no directive', () => {
 		// This is the ONE resolution rule the exporter and `get_notebook_map` share,
 		// and the map short-circuits only when a notebook-level target IS set - so the
 		// COMMON case (no export configured at all) resolves on every call of the most
-		// frequently used agent read tool. It must cost a substring test, not a
-		// multiline regex over every code cell's full source.
+		// frequently used agent read tool. It must cost a substring test per cell, not
+		// a scan of every code cell's source.
+		//
+		// Observed at the scanner's own module boundary, so deleting the
+		// `includes('default_exp')` pre-check FAILS this: the walk would then be entered
+		// once per cell. (The per-CELL `#| export` read has no such guard and is right
+		// not to - see `nbdevDirectives.ts`'s Cost section for the measurement; that
+		// predicate answers one cell from its first line, while this one must clear
+		// every cell of the document before it can conclude "no target".)
 		const source = 'x = 1\ndf = load()\n'.repeat(200);
 		const cells = Array.from({ length: 40 }, (_, i) => ({ id: `c${i}`, cell_type: 'code' as const, source }));
-		const spy = vi.spyOn(String.prototype, 'match');
-		try {
-			expect(resolveExportTarget(doc({ cells }))).toBeNull();
-			expect(spy).not.toHaveBeenCalled();
-		} finally {
-			spy.mockRestore();
-		}
+		scanner.calls = 0;
+		expect(resolveExportTarget(doc({ cells }))).toBeNull();
+		expect(scanner.calls).toBe(0);
 
-		// ...and the guard never costs a real directive its match.
-		const withDirective = doc({ cells: [{ id: 'a', cell_type: 'code', source: `${source}#|default_exp lib.cheap` }] });
+		// ...and the guard never costs a real directive its match. A REAL directive is
+		// one nbdev would read: in the cell's LEADING block. The scan reads nbdev's own
+		// rule now (`$lib/nbdevDirectives`), which is also what bounds its cost - the
+		// block ends at the first ordinary line, so a 400-line cell costs one line.
+		const withDirective = doc({ cells: [{ id: 'a', cell_type: 'code', source: `#|default_exp lib.cheap\n${source}` }] });
+		scanner.calls = 0;
 		expect(resolveExportTarget(withDirective)).toMatchObject({ ok: true, target: 'lib/cheap.py' });
+		// The counter is not vacuous in the other direction either: the scanner IS the
+		// thing that answers once a cell mentions the directive.
+		expect(scanner.calls).toBe(1);
+
+		// ...and a `#|default_exp` sitting AFTER code is not a directive to nbdev, so
+		// it must not be one here either. Honouring it was the "half-speaks nbdev"
+		// defect: a target resolved from text nbdev ignores, written to a file nbdev
+		// would never write (scout report section 5.2). It resolves to NO module -
+		// but it is reported, not dropped in silence (below).
+		const afterCode = doc({
+			cells: [
+				{ id: 'a', cell_type: 'code', source: `${source}#|default_exp lib.cheap` },
+				{ id: 'm', cell_type: 'code', source: 'X = 1', metadata: { cellar: { export: true } } }
+			]
+		});
+		expect(resolveExportTarget(afterCode)).toMatchObject({ ok: false, source: 'default_exp' });
+	});
+});
+
+/**
+ * A `#|default_exp` line nbdev IGNORES must not vanish silently.
+ *
+ * The rule is unchanged and stays nbdev's (leading block only) - the previous scan
+ * was a `/m` regex over the whole source and DID honour such a line, so a notebook
+ * that used to generate a committed module now generates none. With no target and
+ * no error the export bar reads exactly like a notebook that never configured one,
+ * while the module on disk quietly goes stale, so the ignored line is reported
+ * through the SAME `exportResolveError` an unresolvable target already uses.
+ */
+describe('a `#|default_exp` outside the leading block is REPORTED, not silently dropped', () => {
+	const doc = (over: Partial<NotebookDoc>): NotebookDoc => ({ path: '/ws/n.ipynb', cells: [], ...over });
+	/** A marked cell, so the notebook really does describe a module. */
+	const MARKED = { id: 'marked', cell_type: 'code' as const, source: 'X = 1', metadata: { cellar: { export: true } } };
+	const misplaced = (src: string) =>
+		resolveExportTarget(doc({ cells: [{ id: 'a', cell_type: 'code', source: src }, MARKED] }));
+
+	for (const [src, why] of [
+		['x = 1\n#|default_exp core', 'after code'],
+		['# a note\n#| default_exp core', 'after a plain comment'],
+		["s = '''\n#| default_exp core\n'''", 'inside a triple-quoted string']
+	] as Array<[string, string]>)
+		it(`names the cause for a directive ${why}`, () => {
+			const info = misplaced(src);
+			expect(info).toMatchObject({ ok: false, source: 'default_exp' });
+			const error = (info as { error: string }).error;
+			// The three things a user can act on: WHICH line, that nbdev ignores it there
+			// too (so "fix Cellar" is not the answer), and both ways out.
+			expect(error).toContain('core');
+			expect(error).toContain('LEADING directive block');
+			expect(error).toContain('nbdev ignores');
+			expect(error).toMatch(/top of its cell/);
+			expect(error).toMatch(/explicit export target/);
+		});
+
+	it('says nothing for a directive nbdev really does read', () => {
+		expect(misplaced('#| default_exp core\nx = 1')).toMatchObject({ ok: true, target: 'core.py' });
+	});
+
+	it('says nothing for a notebook that merely mentions the word', () => {
+		expect(misplaced('default_exp = 3\nprint(default_exp)')).toBeNull();
+		expect(misplaced('x = 1\n# a note about default_exp')).toBeNull();
+	});
+
+	it('says NOTHING when the notebook marks no cell - it never asked for a module', () => {
+		// The harm this report exists for is a module the MARKS describe landing
+		// nowhere. A notebook demonstrating nbdev's directives, or quoting one in a
+		// docstring, asked for no module at all - and a standing sentence on the
+		// always-visible export bar claiming "no module is being generated" about one
+		// nobody wanted is the false nag `server/nbdev.ts` warns against.
+		const unmarked = doc({ cells: [{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp core' }] });
+		expect(resolveExportTarget(unmarked)).toBeNull();
+		// Marking one cell is the whole difference: the same document now speaks.
+		expect(resolveExportTarget(doc({ cells: [...unmarked.cells, MARKED] }))).toMatchObject({
+			ok: false,
+			source: 'default_exp'
+		});
+	});
+
+	it('counts an nbdev `#| export` DIRECTIVE as a mark, not only the metadata flag', () => {
+		// The gate asks the shared `isExportCell`, so a genuine nbdev notebook - which
+		// carries no `metadata.cellar.export` at all - is exactly the one that must be
+		// heard, and it is the notebook whose committed module goes stale.
+		const d = doc({
+			cells: [
+				{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp core' },
+				{ id: 'b', cell_type: 'code', source: '#| export\ndef f(): pass' }
+			]
+		});
+		expect(resolveExportTarget(d)).toMatchObject({ ok: false, source: 'default_exp' });
+	});
+
+	it('never speaks over a target that DOES resolve, wherever the stray line sits', () => {
+		// A real target elsewhere in the notebook wins: the report exists only for the
+		// case where nothing at all resolved.
+		const d = doc({
+			cells: [
+				{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp stray' },
+				{ id: 'b', cell_type: 'code', source: '#|default_exp real\ny = 2' },
+				MARKED
+			]
+		});
+		expect(resolveExportTarget(d)).toMatchObject({ ok: true, target: 'real.py' });
+	});
+
+	it('is outranked by an explicit notebook-level target', () => {
+		const d = doc({
+			metadata: { cellar: { export_target: 'utils.py' } },
+			cells: [{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp stray' }, MARKED]
+		});
+		expect(resolveExportTarget(d)).toMatchObject({ ok: true, source: 'metadata', target: 'utils.py' });
 	});
 });

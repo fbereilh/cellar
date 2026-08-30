@@ -653,7 +653,6 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 	it('export is gated on the export eligibility rule; hide-from-agent is ungated', () => {
 		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual(['{#if canExport}']);
 		expect(cell).toContain('const canExport = $derived(canExportCell(cell));');
-		expect(cell).toContain("import { canExportCell, isExportCell } from '$lib/exportRole'");
 		expect(openGates(cell, 'data-testid="toggle-agent-hidden"')).toEqual([]);
 	});
 

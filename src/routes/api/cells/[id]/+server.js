@@ -23,11 +23,18 @@ import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLangu
  *  bulk route reports its own refusals, so the caller can resync instead of
  *  rendering a conversion the document never took.
  *
- *  Both refusals are settled BEFORE any other field is written, so a refused PATCH
- *  applies NOTHING: every caller today sends a single field, but a body carrying
- *  `source` alongside a rejected `cell_type` would otherwise have persisted the
- *  source and dropped the fields after it. `setCellType` throws before it mutates,
- *  so it is the writer's own rule that decides here — not a second copy of it. */
+ *  ORDER, stated precisely rather than as a blanket "a refused PATCH applies
+ *  nothing", because that is not literally true and the shape that would make it
+ *  true is the wrong one. Each refusal is settled before every field BELOW it:
+ *  `cell_type` is first and `setCellType` throws before it mutates, so a rejected
+ *  type persists nothing at all; `export` is next and `setCellExport` decides its
+ *  refusal before it writes, so a 409 there persists none of the fields after it
+ *  (`source`, `scrolled`, `role`, `hideInput`, `hiddenFromAgent`). What it does NOT
+ *  undo is a `cell_type` in the SAME body that already succeeded — `setCellType`
+ *  writes and persists on success, and it must stay first, since a type change is
+ *  exactly what can make a cell ineligible for the field below it. No shipped
+ *  caller sends both. Either way it is each writer's own rule that decides here —
+ *  never a second copy of it. */
 export async function PATCH({ params, request }) {
 	const body = await request.json();
 	if (body.cell_type != null) {
@@ -40,10 +47,30 @@ export async function PATCH({ params, request }) {
 			throw err;
 		}
 	}
+	// REPORTED, unlike its `source`/`role`/`scrolled`/`hideInput` siblings, and for
+	// exactly ONE of its refusals - the scope is deliberate: `no-such-cell` and
+	// `not-code` stay silent exactly as they always were (widening the sibling setters
+	// is a separate change - see `hiddenFromAgent` below). What cannot stay silent is
+	// a cell whose SOURCE carries nbdev's `#| export`: the directive keeps it exported
+	// and Cellar never writes one, so there is no metadata to clear and `{ok:true}`
+	// would leave the row showing an unticked toggle over a cell the exporter still
+	// writes. The client reverts and says why.
+	//
+	// `alsoFlagged` travels WITH the reason because the remedy differs and the client
+	// cannot work it out: it only sends this once it believed the cell was NOT
+	// directive-owned, so the source it would inspect is the stale copy that made it
+	// wrong. See `SetCellExportResult`.
+	//
+	// It sits directly under `cell_type` and above every other field for the ordering
+	// reason the header states.
+	if ('export' in body) {
+		const r = setCellExport(params.id, !!body.export, body.nb, body.originId);
+		if (!r.ok && r.reason === 'export-directive-owns-cell')
+			return json({ ok: false, reason: r.reason, alsoFlagged: !!r.alsoFlagged }, { status: 409 });
+	}
 	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
 	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
 	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
-	if ('export' in body) setCellExport(params.id, !!body.export, body.nb, body.originId);
 	if ('hideInput' in body) setHideInput(params.id, body.hideInput, body.nb, body.originId);
 	// SCOPED to `hiddenFromAgent` deliberately: the sibling setters above discard
 	// their boolean too, and widening them is a separate change. This one is

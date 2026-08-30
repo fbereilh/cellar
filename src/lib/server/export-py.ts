@@ -27,6 +27,8 @@ import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
 import { logicalLines, stripComments, splitSimpleStatements } from './imports';
 import { isExportCell } from '../exportRole';
+import { nbdevDirective, nbdevDirectiveOutsideBlock } from '../nbdevDirectives';
+import { nbdevLibPath } from './nbdev';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { futureImportJoinedHazard, type ExportHazard } from '../exportHazard';
 import type { Cell, NotebookDoc } from './types';
@@ -45,8 +47,16 @@ export interface ExportResult {
 	target: string | null;
 	/** number of cells exported. */
 	count: number;
-	/** why nothing was written, when `written` is false. */
-	reason?: 'no-target' | 'no-cells' | 'unchanged';
+	/**
+	 * why nothing was written, when `written` is false.
+	 *
+	 * `foreign-module` is the clobber guard declining: a file Cellar did not generate
+	 * already occupies the target, so there is nothing it may legitimately write. It
+	 * is an OUTCOME rather than an error because it is the STEADY STATE of an
+	 * established nbdev repo - the library module carries nbdev's own header, and
+	 * every save would otherwise raise and leave `lastExportError` set forever.
+	 */
+	reason?: 'no-target' | 'no-cells' | 'unchanged' | 'foreign-module';
 	/**
 	 * Constructs in the marked cells that make the generated module uncompilable
 	 * (`$lib/exportHazard`). Empty on every ordinary export, and empty for
@@ -54,7 +64,9 @@ export interface ExportResult {
 	 *
 	 * Carried on `unchanged` too, and that is the point rather than an edge case:
 	 * the broken module is still ON DISK, so a re-export that writes nothing must
-	 * not report the plain success the first one was corrected out of.
+	 * not report the plain success the first one was corrected out of. Empty for
+	 * `foreign-module` for the SAME reason as `no-cells`: the file at the target is
+	 * not one Cellar wrote, so nothing on disk describes these marks.
 	 *
 	 * A POSITIVE finding, never a compile verdict - the class is wider than what
 	 * is detected. `$lib/exportHazard`'s header states the measured boundary; no
@@ -252,7 +264,23 @@ export function docExportHazards(
 	if (!resolved) return [];
 	const exported = doc.cells.filter((c: Cell) => isExportCell(c)).map((c) => c.source);
 	if (!exported.length) return [];
-	return exportHazards(exported);
+	const hazards = exportHazards(exported);
+	// The foreign-module question is asked LAST in code and FIRST in meaning: over a
+	// target the clobber guard declines there is no module of ours and never will be,
+	// so a hazard sentence describes a file that cannot exist - MCP's `moduleHazard`
+	// says outright that `<target>` WAS written, and the export bar's own claim about
+	// the module these marks describe is equally beside the point when no export can
+	// land. Ordering it here is what keeps that bar and `moduleHazard` (which reads
+	// this same function through `exportHazardsFor`) from describing one document
+	// differently - the drift the shared-rule convention exists to prevent.
+	// `exportNotebookToPy` already zeroes its own hazards on that branch, for the
+	// same reason.
+	//
+	// Asked only once there IS a hazard to suppress, so the file read costs nothing
+	// on the ordinary `getNotebook` / persist path.
+	if (!hazards.length) return [];
+	if (resolved.ok && foreignModuleAt(resolved.target)) return [];
+	return hazards;
 }
 
 /**
@@ -359,38 +387,162 @@ export type ResolvedExportTarget =
  * or a `#|default_exp <module>` directive found in any cell (nbdev familiarity;
  * the UI field is the primary mechanism). Returns null when neither is present.
  *
- * A directive target is ALWAYS workspace-relative - nbdev's own dotted-module
- * spelling - and never reads `export_base`, which is a property of the
+ * A directive target never reads `export_base`, which is a property of the
  * notebook-level SETTING alone: a directive lives in a cell, so pairing it with
  * notebook-level base metadata would make one cell's text mean different files
- * depending on a setting no setter can see from the cell.
+ * depending on a setting no setter can see from the cell. Its root is nbdev's
+ * own - the project's `lib_path` where there is one, else the workspace, exactly
+ * as before (see `directiveBase`).
+ *
+ * The directive is read through the SHARED `$lib/nbdevDirectives` scanner, which
+ * applies nbdev's real rule (leading block only), not a `/m` regex over the whole
+ * source: a `#|default_exp` sitting after code, after a plain comment, or inside a
+ * triple-quoted string is NOT a directive to nbdev, so honouring it was the
+ * "half-speaks nbdev" defect - a target resolved from text nbdev ignores.
  *
  * The directive scan is guarded by a `includes('default_exp')` substring test
  * (`dataframeHtml.ts`'s `/dataframe/i` pre-check, same reason): this is the ONE
  * resolution rule the exporter AND the agent map read, and the map short-circuits
  * only when a notebook-level target IS set — so the COMMON case, a notebook with
- * no export configured at all, would otherwise run a multiline regex over every
- * code cell's full source on the most frequently called agent read tool.
+ * no export configured at all, would otherwise run the shared scanner over every
+ * code cell on the most frequently called agent read tool.
+ *
+ * The guard belongs HERE and deliberately NOT inside the scanner, which carries
+ * none: this caller sweeps EVERY cell before it may conclude "no target", so a
+ * cheap per-cell reject pays for itself. `nbdevDirectives.ts`'s header has the
+ * measurement and the other half of that reasoning.
  */
 function storedExportTarget(
 	doc: NotebookDoc
-): { path: string; base: string; source: 'metadata' | 'default_exp' } | null {
+): { path: string; base: string; source: 'metadata' | 'default_exp'; error?: string } | null {
 	const explicit = doc.metadata?.cellar?.export_target;
 	if (typeof explicit === 'string' && explicit.trim()) {
 		const rawBase = doc.metadata?.cellar?.export_base;
 		const base = typeof rawBase === 'string' && rawBase.trim() ? rawBase.trim() : 'workspace';
 		return { path: explicit.trim(), base, source: 'metadata' };
 	}
+	// The value of a `#|default_exp` line this document carries that nbdev IGNORES
+	// (it sits outside its cell's leading directive block). Recorded lazily, INSIDE
+	// the loop that is already here, so the ordinary paths - a target that resolves,
+	// and the far commoner notebook with no export configured at all - pay nothing
+	// for it: it is read only for a cell that already passed the `includes` guard
+	// AND produced no usable directive.
+	let ignored: string | null = null;
 	for (const c of doc.cells) {
 		if (c.cell_type !== 'code' || !c.source.includes('default_exp')) continue;
-		const m = c.source.match(/^\s*#\s*\|\s*default_exp\s+([^\s#]+)/m);
-		if (m) {
-			// nbdev writes a dotted module path (`pkg.utils`); map it to a file path.
-			const mod = m[1].trim();
-			return { path: mod.endsWith('.py') ? mod : mod.replace(/\./g, '/') + '.py', base: 'workspace', source: 'default_exp' };
+		// The scanner reports the RAW remainder of the directive line, because that is
+		// what fastcore's own value is (a trailing `# comment` is kept, verified by the
+		// committed differential). A module NAME is one token, so it is bounded HERE
+		// rather than in the shared scanner - unbounded, `#| default_exp core # note`
+		// resolved to a file literally called `core # note.py`.
+		const mod = nbdevDirective(c.source, 'default_exp')?.trim().split(/\s+/)[0];
+		if (!mod) {
+			if (ignored === null) ignored = nbdevDirectiveOutsideBlock(c.source, 'default_exp');
+			continue;
 		}
+		// nbdev writes a dotted module path (`pkg.utils`); map it to a file path.
+		const rel = mod.endsWith('.py') ? mod : mod.replace(/\./g, '/') + '.py';
+		return { ...directiveBase(rel), source: 'default_exp' };
 	}
+	// Nothing resolved, and the notebook holds a `#|default_exp` line nbdev ignores.
+	// The RULE is untouched (it stays ignored); what changes is that the drop stops
+	// being SILENT - see `misplacedDefaultExpError` for the harm, and for why the
+	// report needs a MARKED cell before it may speak.
+	if (ignored !== null && doc.cells.some((c: Cell) => isExportCell(c)))
+		return { path: '', base: 'workspace', source: 'default_exp', error: misplacedDefaultExpError(ignored) };
 	return null;
+}
+
+/**
+ * Why a `#|default_exp` line this notebook carries generates no module.
+ *
+ * Reading it would be the "half-speaks nbdev" defect (a target resolved from text
+ * nbdev ignores, written to a file nbdev would never write), so the leading-block
+ * rule stands. But the previous scan was a `/m` regex over the whole source and DID
+ * honour such a line, so a notebook that used to generate a committed module now
+ * generates none - and with no error and no target the export bar reads exactly
+ * like a notebook that never configured one, while the module on disk quietly goes
+ * stale. So the ignored line is reported through the EXISTING `exportResolveError`
+ * channel: same field, same surfaces, no new UI.
+ *
+ * It names the CAUSE (the line is not in its cell's leading directive block), that
+ * nbdev ignores it there too (so "fixing" Cellar is not the answer), and both ways
+ * out.
+ *
+ * NARROWED to a notebook with at least one export-MARKED cell, because that is the
+ * whole of the harm: the marks describe a module, and it is now landing nowhere.
+ * Without that gate the message is standing chrome on the always-visible export bar
+ * of a notebook that never asked for a module at all - a tutorial DEMONSTRATING
+ * nbdev's directives, or a line quoted inside a docstring - asserting "no module is
+ * being generated" about one nobody wanted. Under-reporting is the safe direction
+ * for a notice (`server/nbdev.ts` says so for the sibling nbdev warning), and a
+ * notice users learn to ignore protects nothing. The gate belongs to the REPORT
+ * alone: the leading-block RULE is not widened or weakened by it, and a marked
+ * notebook still resolves to nothing exactly as it did.
+ */
+function misplacedDefaultExpError(value: string): string {
+	const mod = value.trim().split(/\s+/)[0];
+	return `#|default_exp${mod ? ` ${mod}` : ''} is not in its cell's LEADING directive block - it sits after code, after a plain comment, or inside a string, and nbdev ignores a directive there, so Cellar does too: no module is being generated. Move the line to the very top of its cell (above any code or plain comment), or set an explicit export target instead.`;
+}
+
+/**
+ * The stored FORM for a `#|default_exp` module file, measured from the right root.
+ *
+ * In an nbdev project that root is the project's `lib_path`, so the reported path
+ * is the module RE-EXPRESSED workspace-relative and the base stays `workspace` -
+ * which keeps the type's own invariant literally true (`path` measured from `base`
+ * yields `target`), keeps every consumer correct without widening the persisted
+ * `ExportBase` vocabulary the UI select is built from, and leaves the name `nbdev`
+ * free for the fourth PERSISTED base the scout report's section 6.1 proposes. The
+ * derivation is the same KIND this branch always did - a dotted module is not a
+ * stored path either - just measured from the root nbdev actually uses.
+ *
+ * Outside an nbdev project the answer is byte-for-byte what it always was:
+ * workspace-relative, no filesystem work beyond the detection, so every existing
+ * non-nbdev notebook writes exactly where it did.
+ *
+ * A lib_path that cannot be READ carries the refusal out as `error` rather than
+ * degrading - see `nbdevLibPath`. A lib_path OUTSIDE the workspace needs no special
+ * case: the re-expression comes back with `../`, and `resolveExportTarget`'s
+ * existing containment guard refuses it with the message it already has.
+ */
+function directiveBase(rel: string): { path: string; base: string; error?: string } {
+	let lib: ReturnType<typeof nbdevLibPath>;
+	try {
+		lib = nbdevLibPath();
+	} catch {
+		lib = null; // detection must never break a read; fall back to today's behavior
+	}
+	if (!lib) return { path: rel, base: 'workspace' };
+	if (!lib.ok)
+		return {
+			path: rel,
+			base: 'workspace',
+			error: `this is an nbdev project (${lib.configPath}), so #|default_exp ${rel.replace(/\.py$/, '').replace(/\//g, '.')} names a module under its lib_path - but ${lib.reason}, so Cellar cannot tell where that module belongs. Set an explicit export target instead, or fix the config.`
+		};
+	let ws: string;
+	try {
+		ws = resolve(workspaceRoot());
+	} catch {
+		return { path: rel, base: 'workspace' };
+	}
+	const inWorkspace = relative(ws, resolve(lib.libPath, rel)).split(sep).join('/');
+	try {
+		resolveInWorkspace(inWorkspace);
+	} catch {
+		// The COMMON real nbdev layout: Cellar opened in `nbs/` while `lib_path` is a
+		// sibling, so the module belongs OUTSIDE the workspace. Refusing is the
+		// containment rule holding, and it is strictly better than the pre-fix stray
+		// `nbs/core.py` nbdev knows nothing about - but the generic guard's "path
+		// escapes workspace" says nothing a user can act on, so this names the layout
+		// and both ways out.
+		return {
+			path: inWorkspace,
+			base: 'workspace',
+			error: `#|default_exp ${rel.replace(/\.py$/, '').replace(/\//g, '.')} names a module in this nbdev project's lib_path (${lib.libPath}), which is OUTSIDE the workspace Cellar is serving - a module can only be written inside it. Open Cellar at the project root (${dirname(lib.configPath)}) instead, or set an explicit export target inside the workspace.`
+		};
+	}
+	return { path: inWorkspace, base: 'workspace' };
 }
 
 /**
@@ -420,6 +572,11 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
 	const stored = storedExportTarget(doc);
 	if (!stored) return null;
 	const { path, base, source } = stored;
+	// A directive whose ROOT could not be determined (an nbdev project Cellar cannot
+	// read `lib_path` from). Refuse rather than degrade to workspace-relative: that
+	// is the stray-module-at-the-workspace-root write this whole branch exists to
+	// stop. An explicit `export_target` is unaffected and is the escape hatch.
+	if (stored.error) return { ok: false, base, path, source, error: stored.error };
 	if (!isExportBase(base)) {
 		return {
 			ok: false,
@@ -489,12 +646,19 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
  * directive resolves straight to a path here without passing that setter, and a
  * `.py` path may perfectly well be a hand-written module. Every generated module
  * opens with `HEADER`, so testing the file already on disk for it rejects nothing
- * Cellar wrote. The refusal throws, which the manual button surfaces directly and
- * the two consequential callers record as `lastExportError` (never breaking the
- * notebook write). This is the case that made the export EXPLICIT in the first
- * place: in an established nbdev repository the target names a module nbdev
- * generated, so while every save regenerated, every save hit this refusal and
- * recorded it where no human surface reads it.
+ * Cellar wrote.
+ *
+ * The two shapes that guard refuses are DIFFERENT FACTS and are reported
+ * differently, which is the point rather than an inconsistency:
+ *
+ *   - a file PROVABLY not ours (it has content and does not open with `HEADER`)
+ *     returns `{written:false, reason:'foreign-module'}` and records NOTHING. It is
+ *     an outcome, not an error: it is the steady state of an established nbdev repo,
+ *     whose module carries nbdev's own header, so there is nothing Cellar could
+ *     legitimately write there and no export ever will.
+ *   - a file that cannot be READ was verified as nothing at all, so it still THROWS
+ *     - the manual button surfaces that directly and the two consequential callers
+ *     record it as `lastExportError` (never breaking the notebook write).
  *
  * An EMPTY file (zero bytes, or whitespace only) is overwritten, not refused: the
  * guard exists to protect CONTENT, and there is none. Pre-creating the module
@@ -566,10 +730,16 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 			throw new Error(
 				`refusing to overwrite ${target}: it exists but could not be read, so it cannot be verified as a Cellar-generated module`
 			);
-		if (!isGeneratedModule(existing) && existing.trim() !== '')
-			throw new Error(
-				`refusing to overwrite ${target}: it is not a Cellar-generated module (it does not begin with "${HEADER}") - point the export target at a path Cellar owns, or delete that file`
-			);
+		// The clobber guard, UNCHANGED in what it refuses: Cellar never overwrites a
+		// file it did not generate. Only the REPORTING changed - this is a
+		// not-written OUTCOME rather than a throw, because it is the ordinary state
+		// of an established nbdev repo (the module carries nbdev's own header, and
+		// reading `#| export` means every notebook there HAS marks, so every export
+		// reaches this branch): as an error it answered the button with a failure and
+		// left `lastExportError` set on the two best-effort callers - a channel no
+		// human surface reads - for a notebook nothing was wrong with.
+		if (isForeignModuleText(existing))
+			return { written: false, target, count: exported.length, reason: 'foreign-module', hazards: [] };
 	}
 	mkdirSync(dirname(abs), { recursive: true });
 	writeFileSync(abs, text);
@@ -601,6 +771,30 @@ export function generatedModuleExists(target: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Does a file Cellar did NOT generate occupy this workspace-relative target?
+ *
+ * The reporting half of the clobber guard, so the write site's refusal and every
+ * caller that has to EXPLAIN it read one rule rather than two that can drift. An
+ * EMPTY file is not foreign - the write site overwrites it (pre-creating the module
+ * with `touch` is an ordinary workflow), so saying otherwise would explain a refusal
+ * that never happened. A file we cannot READ is not foreign either: it was not
+ * verified as anything, and that case is still an error at the write site.
+ */
+export function foreignModuleAt(target: string): boolean {
+	try {
+		const existing = safeRead(resolveInWorkspace(target));
+		return existing !== null && isForeignModuleText(existing);
+	} catch {
+		return false;
+	}
+}
+
+/** Is this file text something OTHER than a module Cellar generated? */
+function isForeignModuleText(text: string): boolean {
+	return text.trim() !== '' && !isGeneratedModule(text);
 }
 
 /**
